@@ -11,6 +11,9 @@ resolver = "3"
 [dependencies]
 zpaq_rs = {path = "./zpaq_rs"}
 rayon = "*"
+num_cpus = "*"
+once_cell = "*"
+
 
 [[bench]]
 name = "par"
