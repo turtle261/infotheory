@@ -1,0 +1,9 @@
+# .cargo/config.toml
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+# Needed for `lto = "fat"` in this workspace: GNU ld.bfd can't consume Rust's
+# linker-plugin LTO objects, but lld can.
+linker = "clang"
+rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]

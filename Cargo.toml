@@ -1,0 +1,29 @@
+[package]
+name = "infotheory"
+version = "0.1.0"
+edition = "2024"
+license = "AGPLv3"
+
+[workspace]
+members = [".", "zpaq_rs"]
+resolver = "3"
+
+[dependencies]
+zpaq_rs = {path = "./zpaq_rs"}
+
+[[bench]]
+name = "compression_benchmark"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+debug = true
