@@ -2,7 +2,7 @@
 name = "infotheory"
 version = "0.1.0"
 edition = "2024"
-license = "AGPLv3"
+license = "Apache-2.0"
 
 [workspace]
 members = [".", "zpaq_rs"]
@@ -10,9 +10,10 @@ resolver = "3"
 
 [dependencies]
 zpaq_rs = {path = "./zpaq_rs"}
+rayon = "*"
 
 [[bench]]
-name = "compression_benchmark"
+name = "par"
 harness = false
 
 [profile.release]
