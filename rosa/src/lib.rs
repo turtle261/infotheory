@@ -712,79 +712,8 @@ impl RngStream {
     }
 }
 
-fn utf8_decode_lossy(bytes: &[u8]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(bytes.len().max(1));
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let c = bytes[i];
-        let mut v: u32 = 0xFFFD;
-        let mut adv = 1usize;
-        if c < 0x80 {
-            v = c as u32;
-            adv = 1;
-        } else if (c & 0xE0) == 0xC0 && i + 1 < bytes.len() {
-            let c1 = bytes[i + 1];
-            if (c1 & 0xC0) == 0x80 {
-                v = (((c & 0x1F) as u32) << 6) | ((c1 & 0x3F) as u32);
-                if v < 0x80 {
-                    v = 0xFFFD;
-                }
-                adv = 2;
-            }
-        } else if (c & 0xF0) == 0xE0 && i + 2 < bytes.len() {
-            let c1 = bytes[i + 1];
-            let c2 = bytes[i + 2];
-            if (c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80 {
-                v = (((c & 0x0F) as u32) << 12)
-                    | (((c1 & 0x3F) as u32) << 6)
-                    | ((c2 & 0x3F) as u32);
-                if v < 0x800 || (v >= 0xD800 && v <= 0xDFFF) {
-                    v = 0xFFFD;
-                }
-                adv = 3;
-            }
-        } else if (c & 0xF8) == 0xF0 && i + 3 < bytes.len() {
-            let c1 = bytes[i + 1];
-            let c2 = bytes[i + 2];
-            let c3 = bytes[i + 3];
-            if (c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80 && (c3 & 0xC0) == 0x80 {
-                v = (((c & 0x07) as u32) << 18)
-                    | (((c1 & 0x3F) as u32) << 12)
-                    | (((c2 & 0x3F) as u32) << 6)
-                    | ((c3 & 0x3F) as u32);
-                if v < 0x10000 || v > 0x10FFFF {
-                    v = 0xFFFD;
-                }
-                adv = 4;
-            }
-        }
-        out.push(v);
-        i += adv;
-    }
-    out
-}
-
-fn utf8_encode(cp: &[u32]) -> String {
-    let mut out = Vec::with_capacity(cp.len() * 4 + 1);
-    for &c in cp {
-        if c <= 0x7F {
-            out.push(c as u8);
-        } else if c <= 0x7FF {
-            out.push((0xC0 | (c >> 6)) as u8);
-            out.push((0x80 | (c & 0x3F)) as u8);
-        } else if c <= 0xFFFF {
-            out.push((0xE0 | (c >> 12)) as u8);
-            out.push((0x80 | ((c >> 6) & 0x3F)) as u8);
-            out.push((0x80 | (c & 0x3F)) as u8);
-        } else {
-            out.push((0xF0 | (c >> 18)) as u8);
-            out.push((0x80 | ((c >> 12) & 0x3F)) as u8);
-            out.push((0x80 | ((c >> 6) & 0x3F)) as u8);
-            out.push((0x80 | (c & 0x3F)) as u8);
-        }
-    }
-    unsafe { String::from_utf8_unchecked(out) }
-}
+// Helper for debugging/printing byte sequences if needed, but and
+// utf8_decode_lossy/utf8_encode are now removed as we follow byte-wise rules.
 
 #[derive(Default)]
 struct SampleScratch {
@@ -842,31 +771,18 @@ impl RosaPlus {
             return;
         }
 
-        if !self.use_eot && s.is_ascii() {
-            if self.sam.text.is_empty() {
-                self.sam = Sam::new(s.len());
-            }
-            for &b in s {
-                self.sam.feed(b as u32);
-            }
-            self.sam.mark_boundary();
-            self.lm_built = false;
-            return;
+        if self.sam.text.is_empty() {
+            self.sam = Sam::new(s.len());
         }
 
-        let mut cp = utf8_decode_lossy(s);
+        for &b in s {
+            self.sam.feed(b as u32);
+        }
+
         if self.use_eot {
-            if cp.last().copied() != Some(self.eot) {
-                cp.push(self.eot);
-            }
+            self.sam.feed(self.eot);
         }
 
-        if self.sam.text.is_empty() && !cp.is_empty() {
-            self.sam = Sam::new(cp.len());
-        }
-        for ch in cp {
-            self.sam.feed(ch);
-        }
         self.sam.mark_boundary();
         self.lm_built = false;
     }
@@ -972,22 +888,15 @@ impl RosaPlus {
         self.lm.alphabet[sym]
     }
 
-    pub fn generate(&mut self, prompt: &[u8], steps: i32) -> Option<String> {
+    pub fn generate(&mut self, prompt: &[u8], steps: i32) -> Option<Vec<u8>> {
         if !self.lm_built {
             return None;
         }
         let steps = steps.max(0) as usize;
 
         let mut v = 0i32;
-        if prompt.is_ascii() {
-            for &b in prompt {
-                v = self.sam.advance(v, b as u32);
-            }
-        } else {
-            let p_cp = utf8_decode_lossy(prompt);
-            for ch in p_cp {
-                v = self.sam.advance(v, ch);
-            }
+        for &b in prompt {
+            v = self.sam.advance(v, b as u32);
         }
 
         let mut out: Vec<u32> = Vec::with_capacity(steps);
@@ -1001,8 +910,7 @@ impl RosaPlus {
                     self.max_order
                 };
                 self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
-                let s = self.sample(0.5, 0.9, 50);
-                ch = Some(s);
+                ch = Some(self.sample(0.7, 0.9, 0));
             }
             let ch = ch.unwrap();
             out.push(ch);
@@ -1012,7 +920,7 @@ impl RosaPlus {
             v = self.sam.advance(v, ch);
         }
 
-        Some(utf8_encode(&out))
+        Some(out.iter().map(|&c| c as u8).collect())
     }
 
     // ========== Entropy Estimation API ==========
@@ -1027,15 +935,8 @@ impl RosaPlus {
 
         // Advance through context to get SAM state
         let mut v = 0i32;
-        if context.is_ascii() {
-            for &b in context {
-                v = self.sam.advance(v, b as u32);
-            }
-        } else {
-            let cp = utf8_decode_lossy(context);
-            for ch in cp {
-                v = self.sam.advance(v, ch);
-            }
+        for &b in context {
+            v = self.sam.advance(v, b as u32);
         }
 
         // Get probability distribution at this state
@@ -1063,22 +964,13 @@ impl RosaPlus {
     /// This uses a chunk-based prequential approach (training on past chunks to score the current one)
     /// to eliminate the "in-sample bias" present in simple plugin estimators.
     /// Complexity: O(N * Chunks) where Chunks is small (default 16).
-    pub fn entropy_rate(&mut self, data: &[u8]) -> f64 {
-        if data.is_empty() {
+    pub fn predictive_entropy_rate(&mut self, data: &[u8]) -> f64 {
+        if data.len() < 2 {
             return 0.0;
         }
 
-        let cps = if data.is_ascii() {
-            data.iter().map(|&b| b as u32).collect::<Vec<_>>()
-        } else {
-            utf8_decode_lossy(data)
-        };
+        let cps: Vec<u32> = data.iter().map(|&b| b as u32).collect();
 
-        if cps.len() < 2 {
-            return 0.0;
-        }
-
-        // Reset/Clear and perform predictive estimation
         self.sam = Sam::new(cps.len());
         self.lm_built = false;
 
@@ -1178,11 +1070,7 @@ impl RosaPlus {
         if !self.lm_built {
             return 0.0;
         }
-        let cps = if data.is_ascii() {
-            data.iter().map(|&b| b as u32).collect::<Vec<_>>()
-        } else {
-            utf8_decode_lossy(data)
-        };
+        let cps: Vec<u32> = data.iter().map(|&b| b as u32).collect();
         self.cross_entropy_cps(&cps)
     }
 

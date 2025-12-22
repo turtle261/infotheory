@@ -103,20 +103,18 @@ fn main() {
         }
 
         "id" | "intrinsic_dep" => {
+            let max_order = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(-1);
             let data = read_file(&args[2]);
-            let max_order = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
             let h_marginal = marginal_entropy_bytes(&data);
             let h_rate = entropy_rate_bytes(&data, max_order);
-            let ratio = if h_marginal == 0.0 {
+            let redundancy = if h_marginal < 1e-9 {
                 0.0
             } else {
-                h_rate / h_marginal
+                ((h_marginal - h_rate) / h_marginal).clamp(0.0, 1.0)
             };
             println!(
-                "{:.6} (Rate: {:.4}, Marg: {:.4})",
-                ratio.clamp(0.0, 1.0),
-                h_rate,
-                h_marginal
+                "{:.6} [Internal Redundancy] (Ĥ: {:.4}, H_marg: {:.4})",
+                redundancy, h_rate, h_marginal
             );
         }
 
@@ -125,7 +123,7 @@ fn main() {
                 eprintln!("Error: 'rt' requires two files (original and transformed).");
                 std::process::exit(1);
             }
-            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(-1);
             let bx = read_file(&args[2]);
             let btx = read_file(&args[3]);
             println!(
@@ -187,8 +185,9 @@ fn print_usage() {
     eprintln!("  kl, kl_divergence      KL Divergence D_KL(P||Q) (marginal only)");
     eprintln!("  js, js_divergence      JS Divergence JSD(P||Q) (marginal only)");
     eprintln!();
-    eprintln!("Structural measures:");
-    eprintln!("  id, intrinsic_dep      Primitive 6: Intrinsic vs Extrinsic Dependence");
-    eprintln!("  rt, resistance         Primitive 7: Resistance to Transformation");
-    eprintln!("  [max_order]: ROSA order (default: 8, 0 = Marginal-only, -1 = Unlimited)");
+    eprintln!("Structural measures (Primitive 6 & 7):");
+    eprintln!("  id, intrinsic_dep      Intrinsic Dependence (Redundancy Ratio)");
+    eprintln!("  rt, resistance         Resistance to transformation");
+    eprintln!();
+    eprintln!("  [max_order]: Markov context depth (default: -1 [unlimited], 0 for Marginal)");
 }

@@ -4,6 +4,12 @@ use std::sync::OnceLock;
 
 static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 
+#[inline(always)]
+fn aligned_prefix<'a>(x: &'a [u8], y: &'a [u8]) -> (&'a [u8], &'a [u8]) {
+    let n = x.len().min(y.len());
+    (&x[..n], &y[..n])
+}
+
 /// ------- Base Compression Functions -------
 #[inline(always)]
 pub fn get_compressed_size(path: &str, method: &str) -> u64 {
@@ -330,7 +336,20 @@ pub fn marginal_entropy_bytes(data: &[u8]) -> f64 {
 #[inline(always)]
 pub fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
     let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m.entropy_rate(data)
+    m.predictive_entropy_rate(data)
+}
+
+/// Compute biased entropy rate Ĥ_biased(X) bits per symbol.
+///
+/// This uses the full plugin estimator (training on the whole text, then scoring the same text).
+/// While biased as a source entropy estimate, it is mathematically consistent for
+/// similarity metrics like Mutual Information and NED.
+#[inline(always)]
+pub fn biased_entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
+    let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
+    m.train_example(data);
+    m.build_lm();
+    m.cross_entropy(data)
 }
 
 /// Compute joint marginal entropy H(X,Y) = −Σ p(x,y) log₂ p(x,y) in bits/symbol-pair.
@@ -339,7 +358,8 @@ pub fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
 /// joint entropy, matching the spec.md definition.
 #[inline(always)]
 pub fn joint_marginal_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
-    let n = x.len().min(y.len());
+    let (x, y) = aligned_prefix(x, y);
+    let n = x.len();
     if n == 0 {
         return 0.0;
     }
@@ -363,26 +383,43 @@ pub fn joint_marginal_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
     h
 }
 
-/// Compute joint entropy rate Ĥ(X,Y) using ROSA's context-conditional model.
+/// Compute joint entropy rate Ĥ(X,Y).
 ///
-/// Maps each aligned pair (x_t, y_t) to a unique symbol z_t = x_t * 256 + y_t,
-/// then computes the entropy rate Ĥ(Z) of the resulting sequence.
-/// This matches the definition for aligned sequences.
+/// Dispatches based on `max_order`:
+/// - `max_order == 0`: Strictly aligned pair-symbol mapping.
+/// - `max_order != 0`: Shift-invariant algorithmic joint entropy approximated via H(X,Y) = H(Y) + H(X|Y).
 #[inline(always)]
 pub fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let n = x.len().min(y.len());
+    // IMPORTANT: This is an *aligned* joint entropy-rate estimate over time-indexed pairs
+    // (x_i, y_i). All joint-based quantities (H(X), H(Y), H(X,Y), I, NED, NTE, etc.)
+    // should be computed over the same aligned sample.
+    let (x, y) = aligned_prefix(x, y);
+    let n = x.len();
     if n == 0 {
         return 0.0;
     }
 
-    // Map pairs (x_i, y_i) to joint symbols z_i in [0, 65535]
     let joint_symbols: Vec<u32> = (0..n)
         .map(|i| (x[i] as u32) * 256 + (y[i] as u32))
         .collect();
-
-    // Compute entropy rate on joint symbol sequence
     let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
     m.entropy_rate_cps(&joint_symbols)
+}
+
+/// Compute conditional entropy rate Ĥ(X|Y).
+///
+/// Dispatches based on `max_order`:
+/// - `max_order == 0`: Strictly aligned H(X,Y) - H(Y).
+/// - `max_order != 0`: Shift-invariant cross-entropy H(X | model trained on Y).
+#[inline(always)]
+pub fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
+    if x.is_empty() {
+        return 0.0;
+    }
+    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
+    let h_y = entropy_rate_bytes(y, max_order);
+    (h_xy - h_y).max(0.0)
 }
 
 /// Compute conditional entropy H(X|Y) = H(X,Y) − H(Y)
@@ -390,6 +427,7 @@ pub fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 /// Dispatches based on `max_order`.
 #[inline(always)]
 pub fn conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
     if max_order == 0 {
         let h_xy = joint_marginal_entropy_bytes(x, y);
         let h_y = marginal_entropy_bytes(y);
@@ -397,14 +435,6 @@ pub fn conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     } else {
         conditional_entropy_rate_bytes(x, y, max_order)
     }
-}
-
-/// Compute conditional entropy rate Ĥ(X|Y) = Ĥ(X,Y) − Ĥ(Y)
-#[inline(always)]
-pub fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    let h_y = entropy_rate_bytes(y, max_order);
-    (h_xy - h_y).max(0.0)
 }
 
 /// Compute mutual information I(X;Y) = H(X) + H(Y) − H(X,Y)
@@ -421,6 +451,7 @@ pub fn mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 
 /// Marginal Mutual Information (exact/histogram)
 pub fn mutual_information_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
     let h_x = marginal_entropy_bytes(x);
     let h_y = marginal_entropy_bytes(y);
     let h_xy = joint_marginal_entropy_bytes(x, y);
@@ -429,9 +460,14 @@ pub fn mutual_information_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 
 /// Entropy Rate Mutual Information (ROSA predictive)
 pub fn mutual_information_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
+    if x.is_empty() {
+        return 0.0;
+    }
     let h_x = entropy_rate_bytes(x, max_order);
-    let h_x_given_y = conditional_entropy_rate_bytes(x, y, max_order);
-    (h_x - h_x_given_y).max(0.0)
+    let h_y = entropy_rate_bytes(y, max_order);
+    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
+    (h_x + h_y - h_xy).max(0.0)
 }
 
 // ====== NED: Normalized Entropy Distance ======
@@ -450,6 +486,7 @@ pub fn ned_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 
 /// Marginal NED (exact/histogram)
 pub fn ned_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
     let h_x = marginal_entropy_bytes(x);
     let h_y = marginal_entropy_bytes(y);
     let h_xy = joint_marginal_entropy_bytes(x, y);
@@ -462,17 +499,21 @@ pub fn ned_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     }
 }
 
-/// Entropy Rate NED (ROSA predictive)
+/// Normalized Entropy Distance (Rate-based)
 pub fn ned_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
+    if x.is_empty() {
+        return 0.0;
+    }
+
     let h_x = entropy_rate_bytes(x, max_order);
     let h_y = entropy_rate_bytes(y, max_order);
     let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    let min_h = h_x.min(h_y);
     let max_h = h_x.max(h_y);
     if max_h == 0.0 {
         0.0
     } else {
-        ((h_xy - min_h) / max_h).clamp(0.0, 1.0)
+        ((h_xy - h_x.min(h_y)) / max_h).clamp(0.0, 1.0)
     }
 }
 
@@ -501,6 +542,7 @@ pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 pub fn ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
     let h_x = entropy_rate_bytes(x, max_order);
     let h_y = entropy_rate_bytes(y, max_order);
     let h_xy = joint_entropy_rate_bytes(x, y, max_order);
@@ -528,6 +570,7 @@ pub fn nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 }
 
 pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
     let h_x = marginal_entropy_bytes(x);
     let h_y = marginal_entropy_bytes(y);
     let h_xy = joint_marginal_entropy_bytes(x, y);
@@ -541,6 +584,7 @@ pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 pub fn nte_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
     let h_x = entropy_rate_bytes(x, max_order);
     let h_y = entropy_rate_bytes(y, max_order);
     let h_xy = joint_entropy_rate_bytes(x, y, max_order);
@@ -775,14 +819,17 @@ pub fn js_divergence_paths(x: &str, y: &str) -> f64 {
 /// Returns a ratio representing how much of the data's structure is internal (periodicity/symmetry)
 /// vs external (Shannon entropy).
 /// Ratio closer to 0 means high intrinsic dependence (very predictable).
-/// Ratio closer to 1 means low intrinsic dependence (looks random or depends on external priors).
+/// Ratio closer to 1 means high internal structure (very predictable).
+/// Ratio closer to 0 means low internal structure (looks random/i.i.d.).
 pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
     let h_marginal = marginal_entropy_bytes(data);
-    if h_marginal == 0.0 {
+    if h_marginal < 1e-9 {
         return 0.0;
     }
     let h_rate = entropy_rate_bytes(data, max_order);
-    (h_rate / h_marginal).clamp(0.0, 1.0)
+    
+    // Internal Redundancy = (H_marg - H_rate) / H_marg
+    ((h_marginal - h_rate) / h_marginal).clamp(0.0, 1.0)
 }
 
 /// Primitive 7: Resistance under Allowed Transformations.
@@ -791,10 +838,74 @@ pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
 /// Resistance(X, T) = I(X; T(X)) / H(X).
 /// Range [0,1]. 1 means perfectly resistant, 0 means the transformation destroyed all information.
 pub fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -> f64 {
-    let h_x = entropy_rate_bytes(x, max_order);
-    if h_x == 0.0 {
+    let (x, tx) = aligned_prefix(x, tx);
+    let h_x = if max_order == 0 {
+        marginal_entropy_bytes(x)
+    } else {
+        entropy_rate_bytes(x, max_order)
+    };
+    if h_x < 1e-9 {
         return 1.0;
     }
     let mi = mutual_information_bytes(x, tx, max_order);
     (mi / h_x).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ncd_basic_identity_nonnegative() {
+        let x = b"abcdabcdabcd";
+        let d = ncd_bytes(x, x, "5", NcdVariant::Vitanyi);
+        assert!(d >= -1e-9);
+    }
+
+    #[test]
+    fn shannon_identities_marginal_aligned() {
+        let x = b"abracadabra";
+        let y = b"abracadabra";
+
+        let h = marginal_entropy_bytes(x);
+        let mi = mutual_information_bytes(x, y, 0);
+        let h_xy = joint_marginal_entropy_bytes(x, y);
+        let h_x_given_y = conditional_entropy_bytes(x, y, 0);
+        let ned = ned_bytes(x, y, 0);
+        let nte = nte_bytes(x, y, 0);
+
+        assert!((h_xy - h).abs() < 1e-12);
+        assert!(h_x_given_y.abs() < 1e-12);
+        assert!((mi - h).abs() < 1e-12);
+        assert!(ned.abs() < 1e-12);
+        assert!(nte.abs() < 1e-12);
+    }
+
+    #[test]
+    fn shannon_identities_rate_aligned_reasonable() {
+        let x = b"the quick brown fox jumps over the lazy dog";
+        let y = b"the quick brown fox jumps over the lazy dog";
+        let max_order = 8;
+
+        let h_x = entropy_rate_bytes(x, max_order);
+        let h_xy = joint_entropy_rate_bytes(x, y, max_order);
+        let h_x_given_y = conditional_entropy_rate_bytes(x, y, max_order);
+        let mi = mutual_information_bytes(x, y, max_order);
+        let ned = ned_bytes(x, y, max_order);
+
+        // Finite-sample estimators won't be exact; allow small tolerance.
+        assert!((h_xy - h_x).abs() < 1e-6);
+        assert!(h_x_given_y < 1e-6);
+        assert!((mi - h_x).abs() < 1e-6);
+        assert!(ned < 1e-6);
+    }
+
+    #[test]
+    fn resistance_identity_is_one() {
+        let x = b"some repeated repeated repeated text";
+        let r0 = resistance_to_transformation_bytes(x, x, 0);
+        let r8 = resistance_to_transformation_bytes(x, x, 8);
+        assert!((r0 - 1.0).abs() < 1e-12);
+        assert!((r8 - 1.0).abs() < 1e-6);
+    }
 }
