@@ -559,6 +559,9 @@ pub fn ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 /// NTE(X,Y) = VI(X,Y) / max(H(X), H(Y))
 /// where VI = H(X|Y) + H(Y|X) = 2·H(X,Y) - H(X) - H(Y)
 ///
+/// Note: VI can be as large as 2·max(H(X), H(Y)) (e.g., independent equal-entropy
+/// sources), so NTE is in [0, 2]. Values near 0 indicate near-identity; values
+/// near 1+ indicate substantial effort/transform cost.
 /// Dispatches based on `max_order`.
 #[inline(always)]
 pub fn nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
@@ -814,20 +817,21 @@ pub fn js_divergence_paths(x: &str, y: &str) -> f64 {
 
 // ====== Primitives 6 & 7 ======
 
-/// Primitive 6: Intrinsic vs Extrinsic Dependence.
+/// Primitive 6: Intrinsic Dependence (Redundancy Ratio).
 ///
-/// Returns a ratio representing how much of the data's structure is internal (periodicity/symmetry)
-/// vs external (Shannon entropy).
-/// Ratio closer to 0 means high intrinsic dependence (very predictable).
-/// Ratio closer to 1 means high internal structure (very predictable).
-/// Ratio closer to 0 means low internal structure (looks random/i.i.d.).
+/// Measures how much structure is intrinsic to the sample, relative to its
+/// own marginal entropy baseline. Uses:
+///   R = (H_marginal - H_rate) / H_marginal, clamped to [0,1].
+/// Interpretation:
+///   - R → 0 : data is close to i.i.d./max-entropy (little intrinsic structure; highly extrinsically explainable by priors).
+///   - R → 1 : data is highly predictable from its own past (strong intrinsic dependence; e.g., periodic strings like 010101...).
 pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
     let h_marginal = marginal_entropy_bytes(data);
     if h_marginal < 1e-9 {
         return 0.0;
     }
     let h_rate = entropy_rate_bytes(data, max_order);
-    
+
     // Internal Redundancy = (H_marg - H_rate) / H_marg
     ((h_marginal - h_rate) / h_marginal).clamp(0.0, 1.0)
 }
@@ -836,7 +840,8 @@ pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
 ///
 /// Measures how much information is preserved after a transformation T is applied to X.
 /// Resistance(X, T) = I(X; T(X)) / H(X).
-/// Range [0,1]. 1 means perfectly resistant, 0 means the transformation destroyed all information.
+/// Range [0,1] (with guard for H(X)=0). 1 means perfectly resistant, 0 means
+/// the transformation destroyed all information. Assumes X and T(X) are aligned.
 pub fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -> f64 {
     let (x, tx) = aligned_prefix(x, tx);
     let h_x = if max_order == 0 {
@@ -845,7 +850,8 @@ pub fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -
         entropy_rate_bytes(x, max_order)
     };
     if h_x < 1e-9 {
-        return 1.0;
+        // If X has zero entropy, there is no information to preserve; define resistance as 0.
+        return 0.0;
     }
     let mi = mutual_information_bytes(x, tx, max_order);
     (mi / h_x).clamp(0.0, 1.0)
