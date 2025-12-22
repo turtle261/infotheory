@@ -293,7 +293,37 @@ pub fn ncd_matrix_paths(paths: &[&str], method: &str, variant: NcdVariant) -> Ve
 // These use ROSA's Witten-Bell language model to estimate entropy
 // and compute information-theoretic distances.
 
+/// Compute marginal (Shannon) entropy H(X) = −Σ p(x) log₂ p(x) in bits/symbol.
+///
+/// This is the simple first-order entropy from the byte histogram,
+/// NOT the context-conditional entropy rate from a language model.
+#[inline(always)]
+pub fn marginal_entropy_bytes(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    
+    let mut counts = [0u64; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    
+    let n = data.len() as f64;
+    let mut h = 0.0f64;
+    for i in 0..256 {
+        if counts[i] > 0 {
+            let p = counts[i] as f64 / n;
+            h -= p * p.log2();
+        }
+    }
+    h
+}
+
 /// Compute entropy rate Ĥ(X) in bits/symbol using ROSA LM.
+///
+/// This uses ROSA's context-conditional Witten-Bell model to estimate
+/// the entropy rate, which accounts for sequential dependencies.
+/// For i.i.d. data, this should approximately equal marginal_entropy_bytes.
 ///
 /// `max_order`: Maximum context order for the suffix automaton LM.
 /// A value of -1 means unlimited context.
@@ -303,51 +333,76 @@ pub fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
     m.entropy_rate(data)
 }
 
-/// Compute joint entropy rate Ĥ(X,Y) using pair-as-symbol encoding.
+/// Compute joint marginal entropy H(X,Y) = −Σ p(x,y) log₂ p(x,y) in bits/symbol-pair.
+///
+/// Uses a direct histogram of (x_i, y_i) pairs. This is the exact first-order
+/// joint entropy, matching the spec.md definition.
+#[inline(always)]
+pub fn joint_marginal_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let n = x.len().min(y.len());
+    if n == 0 {
+        return 0.0;
+    }
+    
+    // Count pair occurrences using a HashMap for (x, y) pairs
+    // There are up to 65536 possible pairs, so we can use a flat array
+    let mut counts = vec![0u64; 256 * 256];
+    for i in 0..n {
+        let pair_idx = (x[i] as usize) * 256 + (y[i] as usize);
+        counts[pair_idx] += 1;
+    }
+    
+    let n_f64 = n as f64;
+    let mut h = 0.0f64;
+    for &c in &counts {
+        if c > 0 {
+            let p = c as f64 / n_f64;
+            h -= p * p.log2();
+        }
+    }
+    h
+}
+
+/// Compute joint entropy rate Ĥ(X,Y) using ROSA's context-conditional model.
 ///
 /// Maps each aligned pair (x_t, y_t) to a unique symbol z_t, then computes
-/// Ĥ(X,Y) = −(1/N) Σ log₂ p̂(z_t | context)
+/// Ĥ(X,Y) = −(1/N) Σ log₂ p̂(z_t | context).
 ///
-/// Requires `x` and `y` to have the same length. If lengths differ,
-/// truncates to the shorter length.
-///
-/// This is the information-theoretically correct approach:
-/// H(X,Y) = entropy rate of the joint process {(X_t, Y_t)}.
+/// This uses the optimized `entropy_rate_cps` to process joint symbols directly.
 #[inline(always)]
 pub fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     let n = x.len().min(y.len());
     if n < 2 {
-        // For single symbols, joint entropy = sum of marginals (assuming independence)
-        // This is an upper bound; for correlated data it's an approximation
-        return entropy_rate_bytes(x, max_order) + entropy_rate_bytes(y, max_order);
+        return marginal_entropy_bytes(x) + marginal_entropy_bytes(y);
     }
 
-    // Map each byte pair (x, y) to a unique Unicode codepoint in the supplementary plane.
-    // Codepoint = 0x10000 + x * 256 + y, giving range [0x10000, 0x1FFFF].
-    // This is bijective and survives utf8_decode_lossy without distortion.
-    // Each codepoint encodes to exactly 4 UTF-8 bytes.
-    let mut joint_seq = Vec::with_capacity(n * 4);
+    // Map each byte pair (x, y) to a unique Unicode codepoint.
+    // Range [0x10000, 0x1FFFF].
+    let mut joint_seq = Vec::with_capacity(n);
     for i in 0..n {
         let pair_code = 0x10000u32 + (x[i] as u32) * 256 + (y[i] as u32);
-        // Encode as 4-byte UTF-8: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-        joint_seq.push((0xF0 | (pair_code >> 18)) as u8);
-        joint_seq.push((0x80 | ((pair_code >> 12) & 0x3F)) as u8);
-        joint_seq.push((0x80 | ((pair_code >> 6) & 0x3F)) as u8);
-        joint_seq.push((0x80 | (pair_code & 0x3F)) as u8);
+        joint_seq.push(pair_code);
     }
 
-    // Train ROSA on the joint sequence and compute entropy rate
     let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    let h_joint_bits_per_codepoint = m.entropy_rate(&joint_seq);
+    m.entropy_rate_cps(&joint_seq)
+}
 
-    // entropy_rate returns bits per codepoint (each pair = one codepoint)
-    // so this directly gives H(X,Y) in bits per symbol-pair
-    h_joint_bits_per_codepoint
+/// Compute conditional entropy H(X|Y) = H(X,Y) − H(Y)
+///
+/// Dispatches based on `max_order`.
+#[inline(always)]
+pub fn conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    if max_order == 0 {
+        let h_xy = joint_marginal_entropy_bytes(x, y);
+        let h_y = marginal_entropy_bytes(y);
+        (h_xy - h_y).max(0.0)
+    } else {
+        conditional_entropy_rate_bytes(x, y, max_order)
+    }
 }
 
 /// Compute conditional entropy rate Ĥ(X|Y) = Ĥ(X,Y) − Ĥ(Y)
-///
-/// Uses the chain rule of entropy. Clamps result to non-negative.
 #[inline(always)]
 pub fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     let h_xy = joint_entropy_rate_bytes(x, y, max_order);
@@ -355,137 +410,181 @@ pub fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64
     (h_xy - h_y).max(0.0)
 }
 
-/// Compute mutual information Î(X;Y) = Ĥ(X) + Ĥ(Y) − Ĥ(X,Y)
+/// Compute mutual information I(X;Y) = H(X) + H(Y) − H(X,Y)
+///
+/// Dispatches based on `max_order`. If 0, uses marginals; else uses rates.
 #[inline(always)]
 pub fn mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    if max_order == 0 {
+        mutual_information_marg_bytes(x, y)
+    } else {
+        mutual_information_rate_bytes(x, y, max_order)
+    }
+}
+
+/// Marginal Mutual Information (exact/histogram)
+pub fn mutual_information_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let h_x = marginal_entropy_bytes(x);
+    let h_y = marginal_entropy_bytes(y);
+    let h_xy = joint_marginal_entropy_bytes(x, y);
+    (h_x + h_y - h_xy).max(0.0)
+}
+
+/// Entropy Rate Mutual Information (ROSA predictive)
+pub fn mutual_information_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     let h_x = entropy_rate_bytes(x, max_order);
     let h_y = entropy_rate_bytes(y, max_order);
     let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    (h_x + h_y - h_xy).max(0.0) // Clamp to non-negative
+    (h_x + h_y - h_xy).max(0.0)
 }
 
 // ====== NED: Normalized Entropy Distance ======
 
-/// NED(X,Y) = (Ĥ(X,Y) - min(Ĥ(X), Ĥ(Y))) / max(Ĥ(X), Ĥ(Y))
+/// NED(X,Y) = (H(X,Y) - min(H(X), H(Y))) / max(H(X), H(Y))
 ///
-/// Measures fraction of larger variable's uncertainty remaining after observing the other.
-/// Range: [0, 1]. 0 = perfectly redundant, 1 = independent.
+/// Dispatches based on `max_order`. If 0, uses marginals; else uses rates.
 #[inline(always)]
 pub fn ned_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let h_x = entropy_rate_bytes(x, max_order);
-    let h_y = entropy_rate_bytes(y, max_order);
-    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    
-    let min_h = h_x.min(h_y);
-    let max_h = h_x.max(h_y);
-    
-    if max_h == 0.0 {
-        0.0
+    if max_order == 0 {
+        ned_marg_bytes(x, y)
     } else {
-        ((h_xy - min_h) / max_h).clamp(0.0, 1.0)
+        ned_rate_bytes(x, y, max_order)
     }
 }
 
-/// NED_cons(X,Y) = (Ĥ(X,Y) - min(Ĥ(X), Ĥ(Y))) / Ĥ(X,Y)
-///
-/// Conservative variant using joint entropy as denominator.
-#[inline(always)]
-pub fn ned_cons_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+/// Marginal NED (exact/histogram)
+pub fn ned_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let h_x = marginal_entropy_bytes(x);
+    let h_y = marginal_entropy_bytes(y);
+    let h_xy = joint_marginal_entropy_bytes(x, y);
+    let min_h = h_x.min(h_y);
+    let max_h = h_x.max(h_y);
+    if max_h == 0.0 { 0.0 } else { ((h_xy - min_h) / max_h).clamp(0.0, 1.0) }
+}
+
+/// Entropy Rate NED (ROSA predictive)
+pub fn ned_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     let h_x = entropy_rate_bytes(x, max_order);
     let h_y = entropy_rate_bytes(y, max_order);
     let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    
     let min_h = h_x.min(h_y);
-    
-    if h_xy == 0.0 {
-        0.0
+    let max_h = h_x.max(h_y);
+    if max_h == 0.0 { 0.0 } else { ((h_xy - min_h) / max_h).clamp(0.0, 1.0) }
+}
+
+/// NED_cons(X,Y) = (H(X,Y) - min(H(X), H(Y))) / H(X,Y)
+///
+/// Conservative variant. Dispatches based on `max_order`.
+#[inline(always)]
+pub fn ned_cons_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    if max_order == 0 {
+        ned_cons_marg_bytes(x, y)
     } else {
-        ((h_xy - min_h) / h_xy).clamp(0.0, 1.0)
+        ned_cons_rate_bytes(x, y, max_order)
     }
+}
+
+pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let h_x = marginal_entropy_bytes(x);
+    let h_y = marginal_entropy_bytes(y);
+    let h_xy = joint_marginal_entropy_bytes(x, y);
+    let min_h = h_x.min(h_y);
+    if h_xy == 0.0 { 0.0 } else { ((h_xy - min_h) / h_xy).clamp(0.0, 1.0) }
+}
+
+pub fn ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    let h_x = entropy_rate_bytes(x, max_order);
+    let h_y = entropy_rate_bytes(y, max_order);
+    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
+    let min_h = h_x.min(h_y);
+    if h_xy == 0.0 { 0.0 } else { ((h_xy - min_h) / h_xy).clamp(0.0, 1.0) }
 }
 
 // ====== NTE: Normalized Transform Effort (Variation of Information) ======
 
-/// NTE(X,Y) = VI(X,Y) / max(Ĥ(X), Ĥ(Y))
+/// NTE(X,Y) = VI(X,Y) / max(H(X), H(Y))
 /// where VI = H(X|Y) + H(Y|X) = 2·H(X,Y) - H(X) - H(Y)
 ///
-/// Measures total effort to transform X into Y and vice versa.
-/// Range: [0, 2]. 0 = identical, 2 = completely different.
+/// Dispatches based on `max_order`.
 #[inline(always)]
 pub fn nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    if max_order == 0 {
+        nte_marg_bytes(x, y)
+    } else {
+        nte_rate_bytes(x, y, max_order)
+    }
+}
+
+pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let h_x = marginal_entropy_bytes(x);
+    let h_y = marginal_entropy_bytes(y);
+    let h_xy = joint_marginal_entropy_bytes(x, y);
+    let vi = 2.0 * h_xy - h_x - h_y;
+    let max_h = h_x.max(h_y);
+    if max_h == 0.0 { 0.0 } else { (vi / max_h).max(0.0) }
+}
+
+pub fn nte_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     let h_x = entropy_rate_bytes(x, max_order);
     let h_y = entropy_rate_bytes(y, max_order);
     let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    
     let vi = 2.0 * h_xy - h_x - h_y;
     let max_h = h_x.max(h_y);
-    
-    if max_h == 0.0 {
-        0.0
-    } else {
-        (vi / max_h).max(0.0)
-    }
+    if max_h == 0.0 { 0.0 } else { (vi / max_h).max(0.0) }
 }
 
 // ====== TVD: Total Variation Distance ======
 
+/// Compute marginal byte histogram p(i) = count(i) / N for i ∈ [0, 255]
+#[inline(always)]
+fn byte_histogram(data: &[u8]) -> [f64; 256] {
+    let mut counts = [0u64; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    let n = data.len() as f64;
+    let mut probs = [0.0f64; 256];
+    if n > 0.0 {
+        for i in 0..256 {
+            probs[i] = counts[i] as f64 / n;
+        }
+    }
+    probs
+}
+
 /// TVD_marg(X,Y) = (1/2) Σᵢ |p_X(i) - p_Y(i)|
 ///
-/// Total Variation Distance over marginal distributions.
+/// Total Variation Distance over marginal byte distributions.
 /// True metric on probability space. Range: [0, 1].
+/// 0 = identical distributions, 1 = completely disjoint support.
 #[inline(always)]
-pub fn tvd_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    // Build marginal distributions
-    let mut m_x = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m_x.train_example(x);
-    m_x.build_lm();
-    let dist_x: std::collections::HashMap<u32, f64> = m_x.marginal_distribution().into_iter().collect();
+pub fn tvd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
+    let p_x = byte_histogram(x);
+    let p_y = byte_histogram(y);
     
-    let mut m_y = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m_y.train_example(y);
-    m_y.build_lm();
-    let dist_y: std::collections::HashMap<u32, f64> = m_y.marginal_distribution().into_iter().collect();
-    
-    // Collect all symbols
-    let mut all_symbols: std::collections::HashSet<u32> = dist_x.keys().copied().collect();
-    all_symbols.extend(dist_y.keys().copied());
-    
-    // Compute TVD
-    let mut tvd = 0.0f64;
-    for sym in all_symbols {
-        let p_x = dist_x.get(&sym).copied().unwrap_or(0.0);
-        let p_y = dist_y.get(&sym).copied().unwrap_or(0.0);
-        tvd += (p_x - p_y).abs();
+    let mut sum = 0.0f64;
+    for i in 0..256 {
+        sum += (p_x[i] - p_y[i]).abs();
     }
     
-    (tvd / 2.0).clamp(0.0, 1.0)
+    (sum / 2.0).clamp(0.0, 1.0)
 }
 
 // ====== NHD: Normalized Hellinger Distance ======
 
 /// NHD(X,Y) = sqrt(1 - BC(X,Y)) where BC = Σᵢ sqrt(p_X(i) · p_Y(i))
 ///
-/// Normalized Hellinger Distance over marginal distributions.
+/// Normalized Hellinger Distance over marginal byte distributions.
 /// True metric. Range: [0, 1]. 0 = identical, 1 = disjoint support.
 #[inline(always)]
-pub fn nhd_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    // Build marginal distributions
-    let mut m_x = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m_x.train_example(x);
-    m_x.build_lm();
-    let dist_x: std::collections::HashMap<u32, f64> = m_x.marginal_distribution().into_iter().collect();
+pub fn nhd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
+    let p_x = byte_histogram(x);
+    let p_y = byte_histogram(y);
     
-    let mut m_y = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m_y.train_example(y);
-    m_y.build_lm();
-    let dist_y: std::collections::HashMap<u32, f64> = m_y.marginal_distribution().into_iter().collect();
-    
-    // Collect all symbols present in both
+    // Bhattacharyya coefficient: BC = Σᵢ sqrt(p_X(i) · p_Y(i))
     let mut bc = 0.0f64;
-    for (sym, p_x) in &dist_x {
-        if let Some(&p_y) = dist_y.get(sym) {
-            bc += (p_x * p_y).sqrt();
-        }
+    for i in 0..256 {
+        bc += (p_x[i] * p_y[i]).sqrt();
     }
     
     // NHD = sqrt(1 - BC)
@@ -528,4 +627,22 @@ pub fn nhd_paths(x: &str, y: &str, max_order: i64) -> f64 {
         || std::fs::read(y).expect("failed to read y"),
     );
     nhd_bytes(&bx, &by, max_order)
+}
+
+/// Mutual Information for files.
+pub fn mutual_information_paths(x: &str, y: &str, max_order: i64) -> f64 {
+    let (bx, by) = rayon::join(
+        || std::fs::read(x).expect("failed to read x"),
+        || std::fs::read(y).expect("failed to read y"),
+    );
+    mutual_information_bytes(&bx, &by, max_order)
+}
+
+/// Conditional Entropy for files.
+pub fn conditional_entropy_paths(x: &str, y: &str, max_order: i64) -> f64 {
+    let (bx, by) = rayon::join(
+        || std::fs::read(x).expect("failed to read x"),
+        || std::fs::read(y).expect("failed to read y"),
+    );
+    conditional_entropy_bytes(&bx, &by, max_order)
 }

@@ -33,6 +33,7 @@ struct Sam {
     last: i32,
 
     text: Vec<u32>,
+    text_states: Vec<i32>,
     boundary_after: Vec<u8>,
 }
 
@@ -43,6 +44,7 @@ impl Sam {
             ed: Vec::new(),
             last: 0,
             text: Vec::new(),
+            text_states: Vec::new(),
             boundary_after: Vec::new(),
         };
 
@@ -64,6 +66,7 @@ impl Sam {
         s.st.reserve(st_cap);
         s.ed.reserve(ed_cap);
         s.text.reserve(text_cap);
+        s.text_states.reserve(text_cap);
         s.boundary_after.reserve(text_cap);
 
         let mut root = SamState::default();
@@ -73,6 +76,7 @@ impl Sam {
         root.small_n = 0;
         root.head = -1;
         s.st.push(root);
+        s.text_states.push(0); // Root state for empty context
         s
     }
 
@@ -196,6 +200,7 @@ impl Sam {
         }
 
         self.last = r;
+        self.text_states.push(r);
     }
 
     fn mark_boundary(&mut self) {
@@ -530,6 +535,63 @@ impl LM {
                 ni = node.next;
             }
         }
+    }
+
+    /// Efficient pointwise probability Estimation of a single symbol.
+    /// Avoids allocating and writing to a dense distribution array.
+    fn prob_for_sym(&self, sam: &Sam, max_order: i64, v: i32, sym_idx: i32) -> f64 {
+        if sym_idx < 0 {
+             return 1.0 / (self.alpha_n.max(1) as f64);
+        }
+        let sym_idx = sym_idx as u32;
+        let mut p_accum = 0.0f64;
+        let mut residual = 1.0f64;
+        let mut u = v;
+        
+        while u != -1 {
+            if !(max_order >= 0 && (sam.st[u as usize].len as i64) > max_order) {
+                let n = self.ls[u as usize].total_n;
+                let t = self.ls[u as usize].types_t;
+                if n > 0 {
+                    let lam = if t > 0 {
+                        (n as f64) / ((n + (t as u64)) as f64)
+                    } else {
+                        1.0
+                    };
+                    
+                    // Total probability mass from this state
+                    let scale = residual * lam;
+                    
+                    // Probability of specifically sym_idx in this state
+                    let mut count_for_sym = 0u64;
+                    let mut ni = self.ls[u as usize].head;
+                    while ni != -1 {
+                        let node = self.nodes[ni as usize];
+                        if node.sym_idx == sym_idx {
+                            count_for_sym = node.cnt;
+                            break;
+                        }
+                        ni = node.next;
+                    }
+                    
+                    if count_for_sym > 0 {
+                        p_accum += scale * (count_for_sym as f64 / n as f64);
+                    }
+                    
+                    residual *= 1.0 - lam;
+                }
+            }
+            u = sam.st[u as usize].link;
+        }
+
+        if self.total_uni > 0 && residual > 0.0 {
+            let p_uni = self.unigram[sym_idx as usize] as f64 / self.total_uni as f64;
+            p_accum += residual * p_uni;
+        } else if residual > 0.0 {
+            p_accum += residual * (1.0 / self.alpha_n.max(1) as f64);
+        }
+        
+        p_accum.clamp(1e-12, 1.0)
     }
 
     fn probs_for_state(&self, sam: &Sam, max_order: i64, v: i32, out: &mut [f64]) {
@@ -967,22 +1029,16 @@ impl RosaPlus {
         result
     }
 
-    /// Compute the entropy rate (bits per symbol) of the given data.
+    /// Compute the unbiased predictive entropy rate (bits per symbol) of the given data.
     /// 
-    /// This trains the model on the data and computes cross-entropy:
-    /// Ĥ(X) = −(1/N) Σ log₂ p̂(x_t | context_t)
-    /// 
-    /// Returns bits per symbol (log base 2).
+    /// This uses a chunk-based prequential approach (training on past chunks to score the current one)
+    /// to eliminate the "in-sample bias" present in simple plugin estimators.
+    /// Complexity: O(N * Chunks) where Chunks is small (default 16).
     pub fn entropy_rate(&mut self, data: &[u8]) -> f64 {
         if data.is_empty() {
             return 0.0;
         }
 
-        // Train on the data
-        self.train_example(data);
-        self.build_lm();
-
-        // Decode to codepoints
         let cps = if data.is_ascii() {
             data.iter().map(|&b| b as u32).collect::<Vec<_>>()
         } else {
@@ -992,40 +1048,110 @@ impl RosaPlus {
         if cps.len() < 2 {
             return 0.0;
         }
+        
+        // Reset/Clear and perform predictive estimation
+        self.sam = Sam::new(cps.len());
+        self.lm_built = false;
 
-        // Compute cross-entropy: −(1/N) Σ log₂ p̂(x_t | context_t)
-        let mo = if self.max_order < 0 { -1 } else { self.max_order };
-        self.dist.resize(self.lm.alpha_n as usize, 0.0);
-
-        let mut v = 0i32;
+        let num_chunks = 16;
+        let chunk_size = (cps.len() + num_chunks - 1) / num_chunks;
+        
         let mut total_log_prob = 0.0f64;
         let mut count = 0usize;
 
-        for t in 0..(cps.len() - 1) {
-            let ch = cps[t];
-            v = self.sam.advance(v, ch);
-
-            // Get distribution at current state
-            self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
-
-            // Find probability of next symbol
-            let next_ch = cps[t + 1];
-            let sym_idx = self.lm.find_sym(next_ch);
-            if sym_idx >= 0 {
-                let p = self.dist[sym_idx as usize];
-                if p > 0.0 {
+        for i in 0..num_chunks {
+            let start = i * chunk_size;
+            let end = ((i + 1) * chunk_size).min(cps.len());
+            if start >= end { break; }
+            
+            let chunk = &cps[start..end];
+            
+            if i > 0 {
+                self.build_lm();
+                // Context state at the start of this chunk is the last state of the previous chunk.
+                // text_states[start] is the state reached after feeding symbols 0..start-1.
+                let mut v = self.sam.text_states[start];
+                
+                for &ch in chunk {
+                    let sym_idx = self.lm.find_sym(ch);
+                    let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
                     total_log_prob += p.log2();
                     count += 1;
+                    
+                    // Advance context
+                    v = self.sam.advance(v, ch);
                 }
             }
+            
+            // Incremental training (adds to self.sam.text and updates structure)
+            for &ch in chunk {
+                self.sam.feed(ch);
+            }
         }
-
+        
         if count == 0 {
-            return 0.0;
+             // Fallback if data is too small for chunking
+             self.build_lm();
+             self.entropy_rate_plugin_cps(&cps)
+        } else {
+            -total_log_prob / (count as f64)
         }
+    }
 
-        // Return entropy rate in bits/symbol (negated because log of probability is negative)
-        -total_log_prob / (count as f64)
+    /// Optimized entry point for already-decoded codepoints (used for joint entropy).
+    pub fn entropy_rate_cps(&mut self, cps: &[u32]) -> f64 {
+        if cps.len() < 2 { return 0.0; }
+        
+        self.sam = Sam::new(cps.len());
+        self.lm_built = false;
+
+        let num_chunks = 16;
+        let chunk_size = (cps.len() + num_chunks - 1) / num_chunks;
+        let mut total_log_prob = 0.0f64;
+        let mut count = 0usize;
+
+        for i in 0..num_chunks {
+            let start = i * chunk_size;
+            let end = ((i + 1) * chunk_size).min(cps.len());
+            if start >= end { break; }
+            let chunk = &cps[start..end];
+            if i > 0 {
+                self.build_lm();
+                let mut v = self.sam.text_states[start];
+                for &ch in chunk {
+                    let sym_idx = self.lm.find_sym(ch);
+                    let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
+                    total_log_prob += p.log2();
+                    count += 1;
+                    v = self.sam.advance(v, ch);
+                }
+            }
+            for &ch in chunk {
+                self.sam.feed(ch);
+            }
+        }
+        
+        if count == 0 {
+            self.build_lm();
+            self.entropy_rate_plugin_cps(cps)
+        } else {
+            -total_log_prob / (count as f64)
+        }
+    }
+
+    fn entropy_rate_plugin_cps(&mut self, cps: &[u32]) -> f64 {
+        let mut v = 0i32;
+        let mut total_log_prob = 0.0f64;
+        let mut count = 0usize;
+        for t in 0..(cps.len() - 1) {
+            v = self.sam.advance(v, cps[t]);
+            let next_ch = cps[t + 1];
+            let sym_idx = self.lm.find_sym(next_ch);
+            let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
+            total_log_prob += p.log2();
+            count += 1;
+        }
+        if count == 0 { 0.0 } else { -total_log_prob / (count as f64) }
     }
 
     /// Returns the marginal (unigram) distribution over the training data.

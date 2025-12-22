@@ -58,25 +58,38 @@ fn main() {
             println!("{}", nhd_paths(file1, file2, max_order));
         }
         "entropy" | "h" => {
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let data = std::fs::read(file1).expect("failed to read file");
+            if max_order == 0 {
+                println!("{}", marginal_entropy_bytes(&data));
+            } else {
+                println!("{}", entropy_rate_bytes(&data, max_order));
+            }
+        }
+        "entropy_rate" | "h_rate" => {
             let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
             let data = std::fs::read(file1).expect("failed to read file");
-            println!("H(X) = {}", entropy_rate_bytes(&data, max_order));
+            println!("{}", entropy_rate_bytes(&data, max_order));
         }
         "joint_entropy" | "h_xy" => {
-            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             let (bx, by) = rayon::join(
                 || std::fs::read(file1).expect("failed to read file1"),
                 || std::fs::read(file2).expect("failed to read file2"),
             );
-            println!("H(X,Y) = {}", joint_entropy_rate_bytes(&bx, &by, max_order));
+            if max_order == 0 {
+                println!("{}", joint_marginal_entropy_bytes(&bx, &by));
+            } else {
+                println!("{}", joint_entropy_rate_bytes(&bx, &by, max_order));
+            }
         }
         "mi" | "mutual_info" => {
-            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
-            let (bx, by) = rayon::join(
-                || std::fs::read(file1).expect("failed to read file1"),
-                || std::fs::read(file2).expect("failed to read file2"),
-            );
-            println!("I(X;Y) = {}", mutual_information_bytes(&bx, &by, max_order));
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+            println!("{}", mutual_information_paths(file1, file2, max_order));
+        }
+        "ce" | "conditional_entropy" => {
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+            println!("{}", conditional_entropy_paths(file1, file2, max_order));
         }
         
         _ => {
@@ -96,14 +109,18 @@ fn print_usage() {
     eprintln!("  ncd_sym_cons           Symmetric NCD Conservative");
     eprintln!("  [method]: ZPAQ method (default: \"5\"), e.g. \"1\", \"5\", \"x4.3ci1\"");
     eprintln!();
-    eprintln!("Entropy-based (via ROSA):");
+    eprintln!("Entropy-based (dispatch: max_order=0 for Marginal, !=0 for Rate):");
     eprintln!("  ned                    Normalized Entropy Distance");
     eprintln!("  ned_cons               NED Conservative");
     eprintln!("  nte                    Normalized Transform Effort (VI)");
-    eprintln!("  tvd                    Total Variation Distance");
-    eprintln!("  nhd                    Normalized Hellinger Distance");
-    eprintln!("  entropy, h             Entropy rate H(X) (uses file1 only)");
-    eprintln!("  joint_entropy, h_xy    Joint entropy H(X,Y)");
-    eprintln!("  mi, mutual_info        Mutual information I(X;Y)");
-    eprintln!("  [max_order]: ROSA max context order (default: 8, -1 = unlimited)");
+    eprintln!("  tvd                    Total Variation Distance (Marginal only)");
+    eprintln!("  nhd                    Normalized Hellinger Distance (Marginal only)");
+    eprintln!();
+    eprintln!("Information measures:");
+    eprintln!("  entropy, h             Shannon entropy H(X) (marginal if no order)");
+    eprintln!("  entropy_rate, h_rate   Unbiased predictive entropy rate (ROSA)");
+    eprintln!("  joint_entropy, h_xy    Joint entropy H(X,Y) (uses max_order if provided)");
+    eprintln!("  mi, mutual_info        Mutual info I(X;Y) (uses max_order if provided)");
+    eprintln!("  ce, conditional_entropy Conditional entropy H(X|Y) (uses max_order if provided)");
+    eprintln!("  [max_order]: ROSA order (default: 8, 0 = Marginal-only, -1 = Unlimited)");
 }
