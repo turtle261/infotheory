@@ -49,9 +49,11 @@ pub struct AES_CTR {
 pub const RUST_CALLBACK_ERROR: c_int = -2;
 
 pub type GetFn = Option<unsafe extern "C" fn(ctx: *mut c_void) -> c_int>;
-pub type ReadFn = Option<unsafe extern "C" fn(ctx: *mut c_void, buf: *mut c_char, n: c_int) -> c_int>;
+pub type ReadFn =
+    Option<unsafe extern "C" fn(ctx: *mut c_void, buf: *mut c_char, n: c_int) -> c_int>;
 pub type PutFn = Option<unsafe extern "C" fn(ctx: *mut c_void, c: c_int) -> c_int>;
-pub type WriteFn = Option<unsafe extern "C" fn(ctx: *mut c_void, buf: *const c_char, n: c_int) -> c_int>;
+pub type WriteFn =
+    Option<unsafe extern "C" fn(ctx: *mut c_void, buf: *const c_char, n: c_int) -> c_int>;
 
 #[link(name = "zpaq_rs_ffi", kind = "static")]
 unsafe extern "C" {
@@ -88,15 +90,15 @@ unsafe extern "C" {
         dosha1: c_int,
         out_size: *mut u64,
     ) -> c_int;
-        pub fn zpaq_compress_size_parallel(
-            in_: *mut RustReader,
-            method: *const ::std::os::raw::c_char,
-            filename: *const ::std::os::raw::c_char,
-            comment: *const ::std::os::raw::c_char,
-            dosha1: ::std::os::raw::c_int,
-            threads: ::std::os::raw::c_int,
-            out_size: *mut u64,
-        ) -> ::std::os::raw::c_int;
+    pub fn zpaq_compress_size_parallel(
+        in_: *mut RustReader,
+        method: *const ::std::os::raw::c_char,
+        filename: *const ::std::os::raw::c_char,
+        comment: *const ::std::os::raw::c_char,
+        dosha1: ::std::os::raw::c_int,
+        threads: ::std::os::raw::c_int,
+        out_size: *mut u64,
+    ) -> ::std::os::raw::c_int;
     pub fn zpaq_decompress_size(input: *mut RustReader, out_size: *mut u64) -> c_int;
 
     // JIDAC (zpaq.cpp) convenience
@@ -125,8 +127,16 @@ unsafe extern "C" {
     pub fn zpaq_compressor_start_block_level(c: *mut Compressor, level: c_int) -> c_int;
     pub fn zpaq_compressor_start_block_hcomp(c: *mut Compressor, hcomp: *const c_char) -> c_int;
     pub fn zpaq_compressor_set_verify(c: *mut Compressor, verify: c_int) -> c_int;
-    pub fn zpaq_compressor_start_segment(c: *mut Compressor, filename: *const c_char, comment: *const c_char) -> c_int;
-    pub fn zpaq_compressor_post_process(c: *mut Compressor, pcomp: *const c_char, len: c_int) -> c_int;
+    pub fn zpaq_compressor_start_segment(
+        c: *mut Compressor,
+        filename: *const c_char,
+        comment: *const c_char,
+    ) -> c_int;
+    pub fn zpaq_compressor_post_process(
+        c: *mut Compressor,
+        pcomp: *const c_char,
+        len: c_int,
+    ) -> c_int;
     pub fn zpaq_compressor_compress(c: *mut Compressor, n: c_int) -> c_int;
     pub fn zpaq_compressor_end_segment(c: *mut Compressor, sha1_or_null: *const c_uchar) -> c_int;
     pub fn zpaq_compressor_end_segment_checksum(
@@ -144,8 +154,14 @@ unsafe extern "C" {
     pub fn zpaq_decompresser_free(d: *mut Decompresser);
     pub fn zpaq_decompresser_set_input(d: *mut Decompresser, input: *mut RustReader) -> c_int;
     pub fn zpaq_decompresser_find_block(d: *mut Decompresser, mem_out: *mut c_double) -> c_int;
-    pub fn zpaq_decompresser_find_filename(d: *mut Decompresser, filename_out: *mut RustWriter) -> c_int;
-    pub fn zpaq_decompresser_read_comment(d: *mut Decompresser, comment_out: *mut RustWriter) -> c_int;
+    pub fn zpaq_decompresser_find_filename(
+        d: *mut Decompresser,
+        filename_out: *mut RustWriter,
+    ) -> c_int;
+    pub fn zpaq_decompresser_read_comment(
+        d: *mut Decompresser,
+        comment_out: *mut RustWriter,
+    ) -> c_int;
     pub fn zpaq_decompresser_set_output(d: *mut Decompresser, out: *mut RustWriter) -> c_int;
     pub fn zpaq_decompresser_decompress(d: *mut Decompresser, n: c_int) -> c_int;
     pub fn zpaq_decompresser_read_segment_end(d: *mut Decompresser, out_21: *mut c_uchar) -> c_int;
@@ -170,7 +186,12 @@ unsafe extern "C" {
     // AES CTR and utilities
     pub fn zpaq_aes_ctr_new(key: *const c_char, keylen: c_int, iv: *const c_char) -> *mut AES_CTR;
     pub fn zpaq_aes_ctr_free(a: *mut AES_CTR);
-    pub fn zpaq_aes_ctr_encrypt_slice(a: *mut AES_CTR, buf: *mut c_char, n: c_int, offset: c_ulonglong) -> c_int;
+    pub fn zpaq_aes_ctr_encrypt_slice(
+        a: *mut AES_CTR,
+        buf: *mut c_char,
+        n: c_int,
+        offset: c_ulonglong,
+    ) -> c_int;
     pub fn zpaq_aes_ctr_encrypt_block(
         a: *mut AES_CTR,
         s0: c_uint,
@@ -180,7 +201,11 @@ unsafe extern "C" {
         out_ct16: *mut c_uchar,
     ) -> c_int;
 
-    pub fn zpaq_stretch_key(out32: *mut c_uchar, key32: *const c_uchar, salt32: *const c_uchar) -> c_int;
+    pub fn zpaq_stretch_key(
+        out32: *mut c_uchar,
+        key32: *const c_uchar,
+        salt32: *const c_uchar,
+    ) -> c_int;
     pub fn zpaq_random(buf: *mut c_uchar, n: c_int) -> c_int;
     pub fn zpaq_to_u16(p: *const c_char) -> u16;
 }

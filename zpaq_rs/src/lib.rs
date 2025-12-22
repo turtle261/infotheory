@@ -99,7 +99,11 @@ struct WriteCtx<W: Write + Send> {
     writer: W,
 }
 
-unsafe extern "C" fn read_cb<R: Read + Send>(ctx: *mut std::os::raw::c_void, buf: *mut c_char, n: c_int) -> c_int {
+unsafe extern "C" fn read_cb<R: Read + Send>(
+    ctx: *mut std::os::raw::c_void,
+    buf: *mut c_char,
+    n: c_int,
+) -> c_int {
     unsafe {
         let ctx = &mut *(ctx as *mut ReadCtx<R>);
         let slice = slice::from_raw_parts_mut(buf as *mut u8, n as usize);
@@ -113,7 +117,11 @@ unsafe extern "C" fn read_cb<R: Read + Send>(ctx: *mut std::os::raw::c_void, buf
     }
 }
 
-unsafe extern "C" fn write_cb<W: Write + Send>(ctx: *mut std::os::raw::c_void, buf: *const c_char, n: c_int) -> c_int {
+unsafe extern "C" fn write_cb<W: Write + Send>(
+    ctx: *mut std::os::raw::c_void,
+    buf: *const c_char,
+    n: c_int,
+) -> c_int {
     unsafe {
         let ctx = &mut *(ctx as *mut WriteCtx<W>);
         let slice = slice::from_raw_parts(buf as *const u8, n as usize);
@@ -157,7 +165,9 @@ impl<R: Read + Send> FfiReader<R> {
         let ctx = Box::into_raw(Box::new(ReadCtx { reader }));
         let raw = unsafe { sys::zpaq_reader_new(ctx as *mut _, None, Some(read_cb::<R>)) };
         if raw.is_null() {
-            unsafe { drop(Box::from_raw(ctx)); }
+            unsafe {
+                drop(Box::from_raw(ctx));
+            }
             return Err(err_from_last());
         }
         Ok(Self { raw, ctx })
@@ -181,9 +191,12 @@ struct FfiWriter<W: Write + Send> {
 impl<W: Write + Send> FfiWriter<W> {
     fn new(writer: W) -> Result<Self> {
         let ctx = Box::into_raw(Box::new(WriteCtx { writer }));
-        let raw = unsafe { sys::zpaq_writer_new(ctx as *mut _, Some(put_cb::<W>), Some(write_cb::<W>)) };
+        let raw =
+            unsafe { sys::zpaq_writer_new(ctx as *mut _, Some(put_cb::<W>), Some(write_cb::<W>)) };
         if raw.is_null() {
-            unsafe { drop(Box::from_raw(ctx)); }
+            unsafe {
+                drop(Box::from_raw(ctx));
+            }
             return Err(err_from_last());
         }
         Ok(Self { raw, ctx })
@@ -249,8 +262,14 @@ pub fn compress_size_stream<R: Read + Send>(
         sys::zpaq_compress_size(
             reader.raw,
             method_c.as_ptr(),
-            filename_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
-            comment_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
+            filename_c
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
+            comment_c
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
             1,
             &mut out_size as *mut u64,
         )
@@ -288,8 +307,14 @@ pub fn compress_size_stream_parallel<R: Read + Send>(
         sys::zpaq_compress_size_parallel(
             reader.raw,
             method_c.as_ptr(),
-            filename_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
-            comment_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
+            filename_c
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
+            comment_c
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
             1,
             threads as i32,
             &mut out_size as *mut u64,
@@ -382,8 +407,14 @@ pub fn compress_stream<R: Read + Send, W: Write + Send>(
             reader.raw,
             writer.raw,
             method_c.as_ptr(),
-            filename_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
-            comment_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
+            filename_c
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
+            comment_c
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null()),
             1,
         )
     };
@@ -482,7 +513,9 @@ mod tests {
             b"".to_vec(),
             b"hello zpaq".to_vec(),
             (0..1024).map(|i| (i * 31 % 251) as u8).collect(),
-            (0..20_000).map(|i| (i * 1315423911u64 as usize % 256) as u8).collect(),
+            (0..20_000)
+                .map(|i| (i * 1315423911u64 as usize % 256) as u8)
+                .collect(),
         ]
     }
 
@@ -545,7 +578,14 @@ mod tests {
 
     #[test]
     fn nul_in_method_errors() {
-        let err = compress_stream(std::io::Cursor::new(b"hello"), Vec::<u8>::new(), "a\0b", None, None).unwrap_err();
+        let err = compress_stream(
+            std::io::Cursor::new(b"hello"),
+            Vec::<u8>::new(),
+            "a\0b",
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ZpaqError::NulInString));
     }
 
