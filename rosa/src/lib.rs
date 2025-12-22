@@ -1,5 +1,4 @@
-//! # ROSA: Rapid Order-Shift Algorithm
-//!
+//! # ROSA: Rapid Online Suffix Automaton
 //! A high-performance predictive language model for entropy rate estimation.
 //!
 //! ROSA uses a **Suffix Automaton** (SAM) to efficiently find the longest matching context
