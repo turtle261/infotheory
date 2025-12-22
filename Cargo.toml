@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace]
-members = [".", "zpaq_rs"]
+members = [".", "zpaq_rs", "rosa"]
 resolver = "3"
 
 [dependencies]

@@ -7,7 +7,7 @@ NCD_sym_cons(x,y) = [ ( min(C(xy), C(yx)) - min(C(x), C(y)) ) / min(C(xy), C(yx)
 NCD_cons(x,y) = [ ( C(xy) - min(C(x), C(y)) ) / C(xy) ]
 
 
-2. NED
+2. NED  - Normalized Entropy Distance
 
 # NED measures the fraction of the larger variable’s uncertainty that remains after observing the smaller one.
 # If you need to know “How much of the information in the more complex variable is not explained by the simpler one?”
