@@ -10,6 +10,7 @@ resolver = "3"
 
 [dependencies]
 zpaq_rs = {path = "./zpaq_rs"}
+rosaplus = {path = "./rosa"}
 rayon = "*"
 num_cpus = "*"
 once_cell = "*"

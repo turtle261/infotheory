@@ -924,7 +924,145 @@ impl RosaPlus {
             v = self.sam.advance(v, ch);
         }
 
+
         Some(utf8_encode(&out))
+    }
+
+    // ========== Entropy Estimation API ==========
+
+    /// Returns the probability distribution for the next symbol given a context.
+    /// Output: Vec of (codepoint, probability) pairs, sorted by codepoint.
+    /// Builds the LM if not already built.
+    pub fn get_distribution(&mut self, context: &[u8]) -> Vec<(u32, f64)> {
+        if !self.lm_built {
+            self.build_lm();
+        }
+
+        // Advance through context to get SAM state
+        let mut v = 0i32;
+        if context.is_ascii() {
+            for &b in context {
+                v = self.sam.advance(v, b as u32);
+            }
+        } else {
+            let cp = utf8_decode_lossy(context);
+            for ch in cp {
+                v = self.sam.advance(v, ch);
+            }
+        }
+
+        // Get probability distribution at this state
+        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        self.dist.resize(self.lm.alpha_n as usize, 0.0);
+        self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
+
+        // Build output as (codepoint, probability) pairs
+        let mut result = Vec::with_capacity(self.lm.alpha_n as usize);
+        for i in 0..(self.lm.alpha_n as usize) {
+            if self.dist[i] > 0.0 {
+                result.push((self.lm.alphabet[i], self.dist[i]));
+            }
+        }
+        result.sort_by_key(|&(cp, _)| cp);
+        result
+    }
+
+    /// Compute the entropy rate (bits per symbol) of the given data.
+    /// 
+    /// This trains the model on the data and computes cross-entropy:
+    /// Ĥ(X) = −(1/N) Σ log₂ p̂(x_t | context_t)
+    /// 
+    /// Returns bits per symbol (log base 2).
+    pub fn entropy_rate(&mut self, data: &[u8]) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
+
+        // Train on the data
+        self.train_example(data);
+        self.build_lm();
+
+        // Decode to codepoints
+        let cps = if data.is_ascii() {
+            data.iter().map(|&b| b as u32).collect::<Vec<_>>()
+        } else {
+            utf8_decode_lossy(data)
+        };
+
+        if cps.len() < 2 {
+            return 0.0;
+        }
+
+        // Compute cross-entropy: −(1/N) Σ log₂ p̂(x_t | context_t)
+        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        self.dist.resize(self.lm.alpha_n as usize, 0.0);
+
+        let mut v = 0i32;
+        let mut total_log_prob = 0.0f64;
+        let mut count = 0usize;
+
+        for t in 0..(cps.len() - 1) {
+            let ch = cps[t];
+            v = self.sam.advance(v, ch);
+
+            // Get distribution at current state
+            self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
+
+            // Find probability of next symbol
+            let next_ch = cps[t + 1];
+            let sym_idx = self.lm.find_sym(next_ch);
+            if sym_idx >= 0 {
+                let p = self.dist[sym_idx as usize];
+                if p > 0.0 {
+                    total_log_prob += p.log2();
+                    count += 1;
+                }
+            }
+        }
+
+        if count == 0 {
+            return 0.0;
+        }
+
+        // Return entropy rate in bits/symbol (negated because log of probability is negative)
+        -total_log_prob / (count as f64)
+    }
+
+    /// Returns the marginal (unigram) distribution over the training data.
+    /// Output: Vec of (codepoint, probability) pairs, sorted by codepoint.
+    pub fn marginal_distribution(&self) -> Vec<(u32, f64)> {
+        if self.lm.total_uni == 0 {
+            return Vec::new();
+        }
+
+        let inv = 1.0 / (self.lm.total_uni as f64);
+        let mut result = Vec::with_capacity(self.lm.alpha_n as usize);
+        for i in 0..(self.lm.alpha_n as usize) {
+            let p = (self.lm.unigram[i] as f64) * inv;
+            if p > 0.0 {
+                result.push((self.lm.alphabet[i], p));
+            }
+        }
+        result.sort_by_key(|&(cp, _)| cp);
+        result
+    }
+
+    /// Compute the marginal entropy H(X) from the unigram distribution.
+    /// Returns bits per symbol.
+    pub fn marginal_entropy(&self) -> f64 {
+        if self.lm.total_uni == 0 {
+            return 0.0;
+        }
+
+        let inv = 1.0 / (self.lm.total_uni as f64);
+        let mut h = 0.0f64;
+        for i in 0..(self.lm.alpha_n as usize) {
+            let p = (self.lm.unigram[i] as f64) * inv;
+            if p > 0.0 {
+                h -= p * p.log2();
+            }
+        }
+        h
     }
 
     pub fn save(&self, path: &str) -> std::io::Result<()> {
