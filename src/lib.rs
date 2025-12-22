@@ -365,28 +365,24 @@ pub fn joint_marginal_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
 
 /// Compute joint entropy rate Ĥ(X,Y) using ROSA's context-conditional model.
 ///
-/// Maps each aligned pair (x_t, y_t) to a unique symbol z_t, then computes
-/// Ĥ(X,Y) = −(1/N) Σ log₂ p̂(z_t | context).
-///
-/// This uses the optimized `entropy_rate_cps` to process joint symbols directly.
+/// Maps each aligned pair (x_t, y_t) to a unique symbol z_t = x_t * 256 + y_t,
+/// then computes the entropy rate Ĥ(Z) of the resulting sequence.
+/// This matches the definition for aligned sequences.
 #[inline(always)]
 pub fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    if x.is_empty() {
-        return entropy_rate_bytes(y, max_order);
-    }
-    if y.is_empty() {
-        return entropy_rate_bytes(x, max_order);
+    let n = x.len().min(y.len());
+    if n == 0 {
+        return 0.0;
     }
 
-    // H(X,Y) = H(X) + H(Y|X)
-    // We average two ways to ensure symmetry: (H(X) + H(Y|X) + H(Y) + H(X|Y)) / 2
-    let h_x = entropy_rate_bytes(x, max_order);
-    let h_y_given_x = conditional_entropy_rate_bytes(y, x, max_order);
+    // Map pairs (x_i, y_i) to joint symbols z_i in [0, 65535]
+    let joint_symbols: Vec<u32> = (0..n)
+        .map(|i| (x[i] as u32) * 256 + (y[i] as u32))
+        .collect();
 
-    let h_y = entropy_rate_bytes(y, max_order);
-    let h_x_given_y = conditional_entropy_rate_bytes(x, y, max_order);
-
-    ((h_x + h_y_given_x) + (h_y + h_x_given_y)) / 2.0
+    // Compute entropy rate on joint symbol sequence
+    let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
+    m.entropy_rate_cps(&joint_symbols)
 }
 
 /// Compute conditional entropy H(X|Y) = H(X,Y) − H(Y)
@@ -406,11 +402,9 @@ pub fn conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 /// Compute conditional entropy rate Ĥ(X|Y) = Ĥ(X,Y) − Ĥ(Y)
 #[inline(always)]
 pub fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    // Alternatively, just H(X|Y) = cross_entropy(X | model_trained_on_Y)
-    let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m.train_example(y);
-    m.build_lm();
-    m.cross_entropy(x)
+    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
+    let h_y = entropy_rate_bytes(y, max_order);
+    (h_xy - h_y).max(0.0)
 }
 
 /// Compute mutual information I(X;Y) = H(X) + H(Y) − H(X,Y)
@@ -617,6 +611,80 @@ pub fn nhd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
     (1.0 - bc).max(0.0).sqrt()
 }
 
+// ====== Other Information-Theoretic Measures ======
+
+/// Compute cross-entropy H(P,Q) = -Σ p(x) log q(x)
+///
+/// Dispatches based on `max_order`.
+pub fn cross_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    if max_order == 0 {
+        let p_x = byte_histogram(x);
+        let p_y = byte_histogram(y);
+        let mut h = 0.0f64;
+        for i in 0..256 {
+            if p_x[i] > 0.0 {
+                // If y has no support where x does, cross-entropy is effectively infinite
+                // but we clamp p_y to a small epsilon for stability.
+                let q_y = p_y[i].max(1e-12);
+                h -= p_x[i] * q_y.log2();
+            }
+        }
+        h
+    } else {
+        cross_entropy_rate_bytes(x, y, max_order)
+    }
+}
+
+/// Compute cross-entropy rate using ROSA.
+/// Training model on Y and evaluating probability of X.
+pub fn cross_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
+    m.train_example(y);
+    m.build_lm();
+    m.cross_entropy(x)
+}
+
+/// Kullback-Leibler Divergence D_KL(P || Q) = Σ p(x) log(p(x) / q(x))
+///
+/// Marginal only. Measure of how one probability distribution is different from a second.
+pub fn d_kl_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let p_x = byte_histogram(x);
+    let p_y = byte_histogram(y);
+    let mut d_kl = 0.0f64;
+    for i in 0..256 {
+        if p_x[i] > 0.0 {
+            let q_y = p_y[i].max(1e-12);
+            d_kl += p_x[i] * (p_x[i] / q_y).log2();
+        }
+    }
+    d_kl.max(0.0)
+}
+
+/// Jensen-Shannon Divergence JSD(P || Q) = 1/2 D_KL(P || M) + 1/2 D_KL(Q || M)
+/// where M = 1/2 (P + Q)
+///
+/// Marginal only. Symmetrized and smoothed version of KL divergence. Range [0,1].
+pub fn js_div_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let p_x = byte_histogram(x);
+    let p_y = byte_histogram(y);
+    let mut m = [0.0f64; 256];
+    for i in 0..256 {
+        m[i] = 0.5 * (p_x[i] + p_y[i]);
+    }
+
+    let mut kl_pm = 0.0f64;
+    let mut kl_qm = 0.0f64;
+    for i in 0..256 {
+        if p_x[i] > 0.0 {
+            kl_pm += p_x[i] * (p_x[i] / m[i]).log2();
+        }
+        if p_y[i] > 0.0 {
+            kl_qm += p_y[i] * (p_y[i] / m[i]).log2();
+        }
+    }
+    (0.5 * kl_pm + 0.5 * kl_qm).max(0.0)
+}
+
 // ====== Path-based convenience wrappers ======
 
 /// NED for files.
@@ -671,4 +739,62 @@ pub fn conditional_entropy_paths(x: &str, y: &str, max_order: i64) -> f64 {
         || std::fs::read(y).expect("failed to read y"),
     );
     conditional_entropy_bytes(&bx, &by, max_order)
+}
+
+/// Cross-Entropy for files.
+pub fn cross_entropy_paths(x: &str, y: &str, max_order: i64) -> f64 {
+    let (bx, by) = rayon::join(
+        || std::fs::read(x).expect("failed to read x"),
+        || std::fs::read(y).expect("failed to read y"),
+    );
+    cross_entropy_bytes(&bx, &by, max_order)
+}
+
+/// KL Divergence for files.
+pub fn kl_divergence_paths(x: &str, y: &str) -> f64 {
+    let (bx, by) = rayon::join(
+        || std::fs::read(x).expect("failed to read x"),
+        || std::fs::read(y).expect("failed to read y"),
+    );
+    d_kl_bytes(&bx, &by)
+}
+
+/// Jensen-Shannon Divergence for files.
+pub fn js_divergence_paths(x: &str, y: &str) -> f64 {
+    let (bx, by) = rayon::join(
+        || std::fs::read(x).expect("failed to read x"),
+        || std::fs::read(y).expect("failed to read y"),
+    );
+    js_div_bytes(&bx, &by)
+}
+
+// ====== Primitives 6 & 7 ======
+
+/// Primitive 6: Intrinsic vs Extrinsic Dependence.
+/// 
+/// Returns a ratio representing how much of the data's structure is internal (periodicity/symmetry)
+/// vs external (Shannon entropy).
+/// Ratio closer to 0 means high intrinsic dependence (very predictable).
+/// Ratio closer to 1 means low intrinsic dependence (looks random or depends on external priors).
+pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
+    let h_marginal = marginal_entropy_bytes(data);
+    if h_marginal == 0.0 {
+        return 0.0;
+    }
+    let h_rate = entropy_rate_bytes(data, max_order);
+    (h_rate / h_marginal).clamp(0.0, 1.0)
+}
+
+/// Primitive 7: Resistance under Allowed Transformations.
+/// 
+/// Measures how much information is preserved after a transformation T is applied to X.
+/// Resistance(X, T) = I(X; T(X)) / H(X).
+/// Range [0,1]. 1 means perfectly resistant, 0 means the transformation destroyed all information.
+pub fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -> f64 {
+    let h_x = entropy_rate_bytes(x, max_order);
+    if h_x == 0.0 {
+        return 1.0;
+    }
+    let mi = mutual_information_bytes(x, tx, max_order);
+    (mi / h_x).clamp(0.0, 1.0)
 }

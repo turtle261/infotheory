@@ -91,6 +91,29 @@ fn main() {
             let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             println!("{}", conditional_entropy_paths(file1, file2, max_order));
         }
+        "xe" | "cross_entropy" => {
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+            println!("{}", cross_entropy_paths(file1, file2, max_order));
+        }
+        "kl" | "kl_divergence" => {
+            println!("{}", kl_divergence_paths(file1, file2));
+        }
+        "js" | "js_divergence" => {
+            println!("{}", js_divergence_paths(file1, file2));
+        }
+        "id" | "intrinsic_dep" => {
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let bx = std::fs::read(file1).expect("failed to read file");
+            println!("{}", intrinsic_dependence_bytes(&bx, max_order));
+        }
+        "rt" | "resistance" => {
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let (bx, btx) = rayon::join(
+                || std::fs::read(file1).expect("failed to read file1"),
+                || std::fs::read(file2).expect("failed to read file2"),
+            );
+            println!("{}", resistance_to_transformation_bytes(&bx, &btx, max_order));
+        }
 
         _ => {
             eprintln!("Unknown primitive: {}", primitive);
@@ -122,5 +145,12 @@ fn print_usage() {
     eprintln!("  joint_entropy, h_xy    Joint entropy H(X,Y) (uses max_order if provided)");
     eprintln!("  mi, mutual_info        Mutual info I(X;Y) (uses max_order if provided)");
     eprintln!("  ce, conditional_entropy Conditional entropy H(X|Y) (uses max_order if provided)");
+    eprintln!("  xe, cross_entropy      Cross-entropy H(P,Q)");
+    eprintln!("  kl, kl_divergence      KL Divergence D_KL(P||Q) (marginal only)");
+    eprintln!("  js, js_divergence      JS Divergence JSD(P||Q) (marginal only)");
+    eprintln!();
+    eprintln!("Structural measures:");
+    eprintln!("  id, intrinsic_dep      Primitive 6: Intrinsic vs Extrinsic Dependence");
+    eprintln!("  rt, resistance         Primitive 7: Resistance to Transformation");
     eprintln!("  [max_order]: ROSA order (default: 8, 0 = Marginal-only, -1 = Unlimited)");
 }
