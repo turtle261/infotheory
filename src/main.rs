@@ -23,7 +23,22 @@ fn main() {
 
     match primitive.as_str() {
         // Entropy-based primitives
-        "ned" | "nte" | "tvd" | "nhd" | "mi" | "mutual_info" | "ce" | "conditional_entropy" | "xe" | "cross_entropy" | "joint_entropy" | "h_xy" | "kl" | "kl_divergence" | "js" | "js_divergence" => {
+        "ned"
+        | "nte"
+        | "tvd"
+        | "nhd"
+        | "mi"
+        | "mutual_info"
+        | "ce"
+        | "conditional_entropy"
+        | "xe"
+        | "cross_entropy"
+        | "joint_entropy"
+        | "h_xy"
+        | "kl"
+        | "kl_divergence"
+        | "js"
+        | "js_divergence" => {
             if args.len() < 4 {
                 eprintln!("Error: '{}' requires two files.", primitive);
                 std::process::exit(1);
@@ -37,9 +52,15 @@ fn main() {
                 "nte" => println!("{}", nte_paths(file1, file2, max_order)),
                 "tvd" => println!("{}", tvd_paths(file1, file2, max_order)),
                 "nhd" => println!("{}", nhd_paths(file1, file2, max_order)),
-                "mi" | "mutual_info" => println!("{}", mutual_information_paths(file1, file2, max_order)),
-                "ce" | "conditional_entropy" => println!("{}", conditional_entropy_paths(file1, file2, max_order)),
-                "xe" | "cross_entropy" => println!("{}", cross_entropy_paths(file1, file2, max_order)),
+                "mi" | "mutual_info" => {
+                    println!("{}", mutual_information_paths(file1, file2, max_order))
+                }
+                "ce" | "conditional_entropy" => {
+                    println!("{}", conditional_entropy_paths(file1, file2, max_order))
+                }
+                "xe" | "cross_entropy" => {
+                    println!("{}", cross_entropy_paths(file1, file2, max_order))
+                }
                 "kl" | "kl_divergence" => println!("{}", kl_divergence_paths(file1, file2)),
                 "js" | "js_divergence" => println!("{}", js_divergence_paths(file1, file2)),
                 "joint_entropy" | "h_xy" => {
@@ -69,8 +90,11 @@ fn main() {
         "entropy" | "h" | "entropy_rate" | "h_rate" => {
             let data = read_file(&args[2]);
             let default_order = if primitive.contains("rate") { 8 } else { 0 };
-            let max_order = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(default_order);
-            
+            let max_order = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default_order);
+
             if max_order == 0 && !primitive.contains("rate") {
                 println!("{}", marginal_entropy_bytes(&data));
             } else {
@@ -83,8 +107,17 @@ fn main() {
             let max_order = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
             let h_marginal = marginal_entropy_bytes(&data);
             let h_rate = entropy_rate_bytes(&data, max_order);
-            let ratio = if h_marginal == 0.0 { 0.0 } else { h_rate / h_marginal };
-            println!("{:.6} (Rate: {:.4}, Marg: {:.4})", ratio.clamp(0.0, 1.0), h_rate, h_marginal);
+            let ratio = if h_marginal == 0.0 {
+                0.0
+            } else {
+                h_rate / h_marginal
+            };
+            println!(
+                "{:.6} (Rate: {:.4}, Marg: {:.4})",
+                ratio.clamp(0.0, 1.0),
+                h_rate,
+                h_marginal
+            );
         }
 
         "rt" | "resistance" => {
@@ -95,7 +128,10 @@ fn main() {
             let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
             let bx = read_file(&args[2]);
             let btx = read_file(&args[3]);
-            println!("{}", resistance_to_transformation_bytes(&bx, &btx, max_order));
+            println!(
+                "{}",
+                resistance_to_transformation_bytes(&bx, &btx, max_order)
+            );
         }
 
         "ncd" | "ncd_vitanyi" | "ncd_sym" | "ncd_sym_vitanyi" | "ncd_cons" | "ncd_sym_cons" => {
@@ -108,7 +144,9 @@ fn main() {
             let method = args.get(4).map(|s| s.as_str()).unwrap_or("5");
             match primitive.as_str() {
                 "ncd" | "ncd_vitanyi" => println!("{}", ncd_vitanyi(file1, file2, method)),
-                "ncd_sym" | "ncd_sym_vitanyi" => println!("{}", ncd_sym_vitanyi(file1, file2, method)),
+                "ncd_sym" | "ncd_sym_vitanyi" => {
+                    println!("{}", ncd_sym_vitanyi(file1, file2, method))
+                }
                 "ncd_cons" => println!("{}", ncd_cons(file1, file2, method)),
                 "ncd_sym_cons" => println!("{}", ncd_sym_cons(file1, file2, method)),
                 _ => unreachable!(),

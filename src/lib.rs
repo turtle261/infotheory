@@ -771,7 +771,7 @@ pub fn js_divergence_paths(x: &str, y: &str) -> f64 {
 // ====== Primitives 6 & 7 ======
 
 /// Primitive 6: Intrinsic vs Extrinsic Dependence.
-/// 
+///
 /// Returns a ratio representing how much of the data's structure is internal (periodicity/symmetry)
 /// vs external (Shannon entropy).
 /// Ratio closer to 0 means high intrinsic dependence (very predictable).
@@ -786,7 +786,7 @@ pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
 }
 
 /// Primitive 7: Resistance under Allowed Transformations.
-/// 
+///
 /// Measures how much information is preserved after a transformation T is applied to X.
 /// Resistance(X, T) = I(X; T(X)) / H(X).
 /// Range [0,1]. 1 means perfectly resistant, 0 means the transformation destroyed all information.
