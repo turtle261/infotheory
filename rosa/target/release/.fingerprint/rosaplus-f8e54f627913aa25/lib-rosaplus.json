@@ -1,1 +1,0 @@
-{"rustc":12013579709055016942,"features":"[]","declared_features":"[]","target":9714479823254797440,"profile":3592778941406178886,"path":10763286916239946207,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"release/.fingerprint/rosaplus-f8e54f627913aa25/dep-lib-rosaplus","checksum":false}}],"rustflags":["-C","target-cpu=native"],"config":2069994364910194474,"compile_kind":0}
