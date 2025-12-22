@@ -1,3 +1,19 @@
+//! # ROSA: Rapid Order-Shift Algorithm
+//!
+//! A high-performance predictive language model for entropy rate estimation.
+//!
+//! ROSA uses a **Suffix Automaton** (SAM) to efficiently find the longest matching context
+//! for each symbol in a sequence. It then applies **Witten-Bell smoothing** to estimate
+//! the conditional probability `P(x_t | x_{<t})`.
+//!
+//! This allows for accurate estimation of:
+//! *   Entropy Rate `Ĥ(X)`
+//! *   Cross-Entropy Rate `Ĥ(P, Q)`
+//! *   Joint Entropy Rate `Ĥ(X, Y)` (via aligned pair symbols)
+//!
+//! The implementation is optimized for speed and memory efficiency, using a compact
+//! graph representation for the automaton.
+
 #![allow(clippy::needless_range_loop)]
 
 use std::fs::File;

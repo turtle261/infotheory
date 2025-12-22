@@ -1,3 +1,17 @@
+//! # InfoTheory CLI
+//!
+//! Command-line interface for the `infotheory` library.
+//! Provides access to compression-based (NCD) and entropy-based (Shannon, ROSA)
+//! estimators for files.
+//!
+//! ## Usage
+//!
+//! ```bash
+//! infotheory <primitive> <file1> <file2> [method/max_order]
+//! ```
+//!
+//! See `print_usage` for details on supported primitives.
+
 use infotheory::*;
 use std::env;
 

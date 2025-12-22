@@ -1,3 +1,75 @@
+//! # InfoTheory: Information Theoretic Estimators & Metrics
+//!
+//! This crate provides a comprehensive suite of information-theoretic primitives for
+//! quantifying complexity, dependence, and similarity between data sequences.
+//!
+//! It implements two primary classes of estimators:
+//! 1.  **Compression-based (Kolmogorov Complexity)**: Using the ZPAQ compression algorithm to estimate
+//!     Normalized Compression Distance (NCD).
+//! 2.  **Entropy-based (Shannon Information)**: Using both exact marginal histograms (for i.i.d. data)
+//!     and the ROSA (Rapid Order-Shift Algorithm) predictive language model (for sequential data)
+//!     to estimate Entropy, Mutual Information, and related distances.
+//!
+//! ## Mathematical Primitives
+//!
+//! The library implements the following core measures. For sequential data, "Rate" variants
+//! use the ROSA model to estimate `Ĥ(X)` (entropy rate), while "Marginal" variants
+//! treat data as a bag-of-bytes (i.i.d.) and compute `H(X)` from histograms.
+//!
+//! ### 1. Normalized Compression Distance (NCD)
+//! Approximates the Normalized Information Distance (NID) using a compressor `C`.
+//!
+//! `NCD(x,y) = (C(xy) - min(C(x), C(y))) / max(C(x), C(y))`
+//!
+//! ### 2. Normalized Entropy Distance (NED)
+//! An entropic analogue to NCD, defined using Shannon entropy `H`.
+//!
+//! `NED(X,Y) = (H(X,Y) - min(H(X), H(Y))) / max(H(X), H(Y))`
+//!
+//! ### 3. Normalized Transform Effort (NTE)
+//! Based on the Variation of Information (VI), normalized by the maximum entropy.
+//!
+//! `NTE(X,Y) = (H(X|Y) + H(Y|X)) / max(H(X), H(Y)) = (2H(X,Y) - H(X) - H(Y)) / max(H(X), H(Y))`
+//!
+//! ### 4. Mutual Information (MI)
+//! Measures the amount of information obtained about one random variable by observing another.
+//!
+//! `I(X;Y) = H(X) + H(Y) - H(X,Y)`
+//!
+//! ### 5. Divergences & Distances
+//! *   **Total Variation Distance (TVD)**: `δ(P,Q) = 0.5 * Σ |P(x) - Q(x)|`
+//! *   **Normalized Hellinger Distance (NHD)**: `sqrt(1 - Σ sqrt(P(x)Q(x)))`
+//! *   **Kullback-Leibler Divergence (KL)**: `D_KL(P||Q) = Σ P(x) log(P(x)/Q(x))`
+//! *   **Jensen-Shannon Divergence (JSD)**: Symmetrized and smoothed KL divergence.
+//!
+//! ### 6. Intrinsic Dependence (ID)
+//! Measures the redundancy within a sequence, comparing marginal entropy to entropy rate.
+//!
+//! `ID(X) = (H_marginal(X) - H_rate(X)) / H_marginal(X)`
+//!
+//! ### 7. Resistance to Transformation
+//! Quantifies how much information is preserved after a transformation `T` is applied.
+//!
+//! `R(X, T) = I(X; T(X)) / H(X)`
+//!
+//! ## Usage
+//!
+//! ```rust
+//! use infotheory::{ncd_vitanyi, mutual_information_bytes, NcdVariant};
+//!
+//! let x = b"some data sequence";
+//! let y = b"another data sequence";
+//!
+//! // Compression-based distance
+//! let ncd = ncd_vitanyi("file1.txt", "file2.txt", "5");
+//!
+//! // Entropy-based mutual information (Marginal / i.i.d.)
+//! let mi_marg = mutual_information_bytes(x, y, 0);
+//!
+//! // Entropy-based mutual information (Rate / Sequential, max_order=8)
+//! let mi_rate = mutual_information_bytes(x, y, 8);
+//! ```
+
 use rayon::prelude::*;
 
 use std::sync::OnceLock;
@@ -105,17 +177,32 @@ pub fn get_compressed_sizes_from_paths(paths: &[&str], method: &str) -> Vec<u64>
     }
 }
 
-/// ----- NCD ------
-
+/// ------- NCD (Normalized Compression Distance) ------
+///
+/// NCD is a parameter-free similarity metric based on Kolmogorov complexity.
+/// Since Kolmogorov complexity `K(x)` is uncomputable, we approximate it using
+/// the compressed size `C(x)` provided by a real-world compressor (here, ZPAQ).
+///
+/// The general form is:
+/// `NCD(x,y) = (C(xy) - min(C(x), C(y))) / max(C(x), C(y))`
+///
+/// Different variants handle normalization and symmetry differently.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NcdVariant {
-    /// NCD_vitanyi(x,y) = (C(xy) - min(C(x), C(y))) / max(C(x), C(y))
+    /// Standard Vitanyi NCD:
+    /// `NCD(x,y) = (C(xy) - min(C(x), C(y))) / max(C(x), C(y))`
+    /// Note: `C(xy)` denotes compressing the concatenation of x and y.
     Vitanyi,
-    /// NCD_sym_vitanyi(x,y) = (min(C(xy), C(yx)) - min(C(x), C(y))) / max(C(x), C(y))
+    /// Symmetric Vitanyi NCD:
+    /// `NCD_sym(x,y) = (min(C(xy), C(yx)) - min(C(x), C(y))) / max(C(x), C(y))`
+    /// Takes the best compression of `xy` or `yx` to ensure symmetry even if the compressor is not symmetric.
     SymVitanyi,
-    /// NCD_cons(x,y) = (C(xy) - min(C(x), C(y))) / C(xy)
+    /// Conservative NCD:
+    /// `NCD_cons(x,y) = (C(xy) - min(C(x), C(y))) / C(xy)`
+    /// Normalizes by the joint compressed size instead of the max marginal.
     Cons,
-    /// NCD_sym_cons(x,y) = (min(C(xy), C(yx)) - min(C(x), C(y))) / min(C(xy), C(yx))
+    /// Symmetric Conservative NCD:
+    /// `NCD_sym_cons(x,y) = (min(C(xy), C(yx)) - min(C(x), C(y))) / min(C(xy), C(yx))`
     SymCons,
 }
 
@@ -325,14 +412,20 @@ pub fn marginal_entropy_bytes(data: &[u8]) -> f64 {
     h
 }
 
-/// Compute entropy rate Ĥ(X) in bits/symbol using ROSA LM.
+/// Compute entropy rate `Ĥ(X)` in bits/symbol using ROSA LM.
 ///
 /// This uses ROSA's context-conditional Witten-Bell model to estimate
 /// the entropy rate, which accounts for sequential dependencies.
-/// For i.i.d. data, this should approximately equal marginal_entropy_bytes.
 ///
-/// `max_order`: Maximum context order for the suffix automaton LM.
-/// A value of -1 means unlimited context.
+/// The estimator is **prequential** (predictive sequential): it sums the negative log-probability
+/// of each symbol `x_t` given its past context `x_{<t}`, estimated from the model trained on `x_{<t}`.
+///
+/// `Ĥ(X) = -1/N * Σ log2 P(x_t | x_{t-k}^{t-1})`
+///
+/// For i.i.d. data, this should approximately equal `marginal_entropy_bytes`.
+///
+/// * `max_order`: Maximum context order for the suffix automaton LM.
+///   A value of -1 means unlimited context (bounded only by memory/sequence length).
 #[inline(always)]
 pub fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
     let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
@@ -383,16 +476,19 @@ pub fn joint_marginal_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
     h
 }
 
-/// Compute joint entropy rate Ĥ(X,Y).
+/// Compute joint entropy rate `Ĥ(X,Y)`.
 ///
 /// Dispatches based on `max_order`:
-/// - `max_order == 0`: Strictly aligned pair-symbol mapping.
-/// - `max_order != 0`: Shift-invariant algorithmic joint entropy approximated via H(X,Y) = H(Y) + H(X|Y).
+/// - `max_order == 0`: Strictly aligned pair-symbol mapping (Marginal Joint Entropy).
+///   Treats `(x_i, y_i)` as a single symbol in a product alphabet `Σ_X × Σ_Y`.
+/// - `max_order != 0`: Shift-invariant algorithmic joint entropy approximated via ROSA.
+///   Constructs a sequence of pair-symbols and estimates the entropy rate of that sequence.
+///
+/// **Note**: This is an *aligned* joint entropy-rate estimate over time-indexed pairs
+/// `(x_i, y_i)`. All joint-based quantities (`H(X)`, `H(Y)`, `H(X,Y)`, `I`, NED, NTE, etc.)
+/// should be computed over the same aligned sample.
 #[inline(always)]
 pub fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    // IMPORTANT: This is an *aligned* joint entropy-rate estimate over time-indexed pairs
-    // (x_i, y_i). All joint-based quantities (H(X), H(Y), H(X,Y), I, NED, NTE, etc.)
-    // should be computed over the same aligned sample.
     let (x, y) = aligned_prefix(x, y);
     let n = x.len();
     if n == 0 {
@@ -406,11 +502,13 @@ pub fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     m.entropy_rate_cps(&joint_symbols)
 }
 
-/// Compute conditional entropy rate Ĥ(X|Y).
+/// Compute conditional entropy rate `Ĥ(X|Y)`.
 ///
 /// Dispatches based on `max_order`:
-/// - `max_order == 0`: Strictly aligned H(X,Y) - H(Y).
-/// - `max_order != 0`: Shift-invariant cross-entropy H(X | model trained on Y).
+/// - `max_order == 0`: Strictly aligned `H(X,Y) - H(Y)` using marginals.
+/// - `max_order != 0`: Chain rule definition `Ĥ(X|Y) = Ĥ(X,Y) - Ĥ(Y)`.
+///
+/// Note: This relies on the identity `H(X|Y) = H(X,Y) - H(Y)`.
 #[inline(always)]
 pub fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     let (x, y) = aligned_prefix(x, y);
@@ -437,9 +535,11 @@ pub fn conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     }
 }
 
-/// Compute mutual information I(X;Y) = H(X) + H(Y) − H(X,Y)
+/// Compute mutual information `I(X;Y) = H(X) + H(Y) - H(X,Y)`.
 ///
 /// Dispatches based on `max_order`. If 0, uses marginals; else uses rates.
+///
+/// `I(X;Y) = Σ p(x,y) log(p(x,y) / (p(x)p(y)))`
 #[inline(always)]
 pub fn mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     if max_order == 0 {
@@ -471,10 +571,16 @@ pub fn mutual_information_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 
 }
 
 // ====== NED: Normalized Entropy Distance ======
+//
+// A metric distance based on the overlap of information between two variables.
 
 /// NED(X,Y) = (H(X,Y) - min(H(X), H(Y))) / max(H(X), H(Y))
 ///
 /// Dispatches based on `max_order`. If 0, uses marginals; else uses rates.
+///
+/// Range: [0, 1].
+/// * 0: Identity (X determines Y and Y determines X).
+/// * 1: Independence (X and Y share no information).
 #[inline(always)]
 pub fn ned_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     if max_order == 0 {
@@ -557,11 +663,16 @@ pub fn ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 // ====== NTE: Normalized Transform Effort (Variation of Information) ======
 
 /// NTE(X,Y) = VI(X,Y) / max(H(X), H(Y))
-/// where VI = H(X|Y) + H(Y|X) = 2·H(X,Y) - H(X) - H(Y)
+/// where `VI(X,Y) = H(X|Y) + H(Y|X) = 2H(X,Y) - H(X) - H(Y)`.
 ///
-/// Note: VI can be as large as 2·max(H(X), H(Y)) (e.g., independent equal-entropy
-/// sources), so NTE is in [0, 2]. Values near 0 indicate near-identity; values
-/// near 1+ indicate substantial effort/transform cost.
+/// Represents the "effort" required to transform X into Y (and vice versa) relative
+/// to their complexity.
+///
+/// Note: VI can be as large as `H(X) + H(Y)`. If `H(X) ≈ H(Y)`, then VI can be `≈ 2 max(H(X), H(Y))`.
+/// Thus, NTE is in [0, 2].
+/// * Values near 0 indicate near-identity.
+/// * Values near 1+ indicate substantial effort/transform cost (e.g. independence).
+///
 /// Dispatches based on `max_order`.
 #[inline(always)]
 pub fn nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
@@ -710,7 +821,7 @@ pub fn d_kl_bytes(x: &[u8], y: &[u8]) -> f64 {
 /// Jensen-Shannon Divergence JSD(P || Q) = 1/2 D_KL(P || M) + 1/2 D_KL(Q || M)
 /// where M = 1/2 (P + Q)
 ///
-/// Marginal only. Symmetrized and smoothed version of KL divergence. Range [0,1].
+/// Marginal only. Symmetrized and smoothed version of KL divergence. Range `[0,1]`.
 pub fn js_div_bytes(x: &[u8], y: &[u8]) -> f64 {
     let p_x = byte_histogram(x);
     let p_y = byte_histogram(y);
@@ -820,11 +931,15 @@ pub fn js_divergence_paths(x: &str, y: &str) -> f64 {
 /// Primitive 6: Intrinsic Dependence (Redundancy Ratio).
 ///
 /// Measures how much structure is intrinsic to the sample, relative to its
-/// own marginal entropy baseline. Uses:
-///   R = (H_marginal - H_rate) / H_marginal, clamped to [0,1].
+/// own marginal entropy baseline.
+///
+/// `R = (H_marginal - H_rate) / H_marginal`
+///
+/// Clamped to `[0,1]`.
+///
 /// Interpretation:
-///   - R → 0 : data is close to i.i.d./max-entropy (little intrinsic structure; highly extrinsically explainable by priors).
-///   - R → 1 : data is highly predictable from its own past (strong intrinsic dependence; e.g., periodic strings like 010101...).
+///   - `R → 0`: Data is close to i.i.d./max-entropy (little intrinsic structure; highly extrinsically explainable by priors).
+///   - `R → 1`: Data is highly predictable from its own past (strong intrinsic dependence; e.g., periodic strings like 010101...).
 pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
     let h_marginal = marginal_entropy_bytes(data);
     if h_marginal < 1e-9 {
@@ -838,10 +953,15 @@ pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
 
 /// Primitive 7: Resistance under Allowed Transformations.
 ///
-/// Measures how much information is preserved after a transformation T is applied to X.
-/// Resistance(X, T) = I(X; T(X)) / H(X).
-/// Range [0,1] (with guard for H(X)=0). 1 means perfectly resistant, 0 means
-/// the transformation destroyed all information. Assumes X and T(X) are aligned.
+/// Measures how much information is preserved after a transformation `T` is applied to `X`.
+///
+/// `Resistance(X, T) = I(X; T(X)) / H(X)`
+///
+/// Range `[0,1]` (with guard for `H(X)=0`).
+/// * 1 means perfectly resistant (identity transformation).
+/// * 0 means the transformation destroyed all information (e.g. mapping everything to a constant).
+///
+/// Assumes X and T(X) are aligned.
 pub fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -> f64 {
     let (x, tx) = aligned_prefix(x, tx);
     let h_x = if max_order == 0 {
