@@ -3,7 +3,7 @@ use std::env;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() < 4 {
         print_usage();
         return;
@@ -31,14 +31,14 @@ fn main() {
             let method = args.get(4).map(|s| s.as_str()).unwrap_or("5");
             println!("{}", ncd_sym_cons(file1, file2, method));
         }
-        
+
         // Entropy-based primitives (ROSA-based)
         "ned" => {
-            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             println!("{}", ned_paths(file1, file2, max_order));
         }
         "ned_cons" => {
-            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             let (bx, by) = rayon::join(
                 || std::fs::read(file1).expect("failed to read file1"),
                 || std::fs::read(file2).expect("failed to read file2"),
@@ -46,15 +46,15 @@ fn main() {
             println!("{}", ned_cons_bytes(&bx, &by, max_order));
         }
         "nte" => {
-            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             println!("{}", nte_paths(file1, file2, max_order));
         }
         "tvd" => {
-            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             println!("{}", tvd_paths(file1, file2, max_order));
         }
         "nhd" => {
-            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+            let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             println!("{}", nhd_paths(file1, file2, max_order));
         }
         "entropy" | "h" => {
@@ -91,7 +91,7 @@ fn main() {
             let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             println!("{}", conditional_entropy_paths(file1, file2, max_order));
         }
-        
+
         _ => {
             eprintln!("Unknown primitive: {}", primitive);
             print_usage();

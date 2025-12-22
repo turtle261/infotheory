@@ -16,7 +16,10 @@ fn main() {
         }
     };
 
-    println!("Using training data file from ROSAPLUS_EX_PATH: {}", file_path);
+    println!(
+        "Using training data file from ROSAPLUS_EX_PATH: {}",
+        file_path
+    );
 
     let mut f = match File::open(&file_path) {
         Ok(f) => f,

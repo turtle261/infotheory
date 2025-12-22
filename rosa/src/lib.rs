@@ -275,7 +275,10 @@ impl Sam {
             let i = st.endpos;
             let j = i + 1;
             if st.len > 0 && j >= 0 && (j as usize) < self.text.len() {
-                if i >= 0 && (i as usize) < self.boundary_after.len() && self.boundary_after[i as usize] != 0 {
+                if i >= 0
+                    && (i as usize) < self.boundary_after.len()
+                    && self.boundary_after[i as usize] != 0
+                {
                     u = st.link;
                     continue;
                 }
@@ -456,7 +459,14 @@ impl LM {
     }
 
     fn build_counts(&mut self, sam: &Sam, max_order: i64) {
-        self.ls = vec![LmState { head: -1, last_node: -1, ..LmState::default() }; sam.st.len()];
+        self.ls = vec![
+            LmState {
+                head: -1,
+                last_node: -1,
+                ..LmState::default()
+            };
+            sam.st.len()
+        ];
         self.nodes.clear();
 
         let mut seg_start = 0usize;
@@ -541,13 +551,13 @@ impl LM {
     /// Avoids allocating and writing to a dense distribution array.
     fn prob_for_sym(&self, sam: &Sam, max_order: i64, v: i32, sym_idx: i32) -> f64 {
         if sym_idx < 0 {
-             return 1.0 / (self.alpha_n.max(1) as f64);
+            return 1.0 / (self.alpha_n.max(1) as f64);
         }
         let sym_idx = sym_idx as u32;
         let mut p_accum = 0.0f64;
         let mut residual = 1.0f64;
         let mut u = v;
-        
+
         while u != -1 {
             if !(max_order >= 0 && (sam.st[u as usize].len as i64) > max_order) {
                 let n = self.ls[u as usize].total_n;
@@ -558,10 +568,10 @@ impl LM {
                     } else {
                         1.0
                     };
-                    
+
                     // Total probability mass from this state
                     let scale = residual * lam;
-                    
+
                     // Probability of specifically sym_idx in this state
                     let mut count_for_sym = 0u64;
                     let mut ni = self.ls[u as usize].head;
@@ -573,11 +583,11 @@ impl LM {
                         }
                         ni = node.next;
                     }
-                    
+
                     if count_for_sym > 0 {
                         p_accum += scale * (count_for_sym as f64 / n as f64);
                     }
-                    
+
                     residual *= 1.0 - lam;
                 }
             }
@@ -590,7 +600,7 @@ impl LM {
         } else if residual > 0.0 {
             p_accum += residual * (1.0 / self.alpha_n.max(1) as f64);
         }
-        
+
         p_accum.clamp(1e-12, 1.0)
     }
 
@@ -656,7 +666,11 @@ struct RngStream {
 
 impl RngStream {
     fn new(seed: u64) -> Self {
-        let mut r = RngStream { buf: Vec::new(), pos: 0, xs: 88172645463325252u64 };
+        let mut r = RngStream {
+            buf: Vec::new(),
+            pos: 0,
+            xs: 88172645463325252u64,
+        };
         if let Ok(path) = std::env::var("ROSAPLUS_RNG_PATH") {
             if !path.is_empty() {
                 if let Ok(mut f) = File::open(path) {
@@ -861,7 +875,11 @@ impl RosaPlus {
         self.sam.finalize_endpos();
         self.lm = LM::default();
         self.lm.build_alphabet(&self.sam);
-        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        let mo = if self.max_order < 0 {
+            -1
+        } else {
+            self.max_order
+        };
         self.lm.build_counts(&self.sam, mo);
         self.lm_built = true;
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
@@ -911,7 +929,11 @@ impl RosaPlus {
             n = if cut > 0 { cut } else { 1 };
         }
 
-        let temperature = if temperature <= 0.0 { 1e-6 } else { temperature };
+        let temperature = if temperature <= 0.0 {
+            1e-6
+        } else {
+            temperature
+        };
 
         self.scratch.ensure(alpha_n, n);
         let mut maxlog = -1e300f64;
@@ -973,7 +995,11 @@ impl RosaPlus {
         for _ in 0..steps {
             let mut ch = self.sam.predict_det(v);
             if ch.is_none() {
-                let mo = if self.max_order < 0 { -1 } else { self.max_order };
+                let mo = if self.max_order < 0 {
+                    -1
+                } else {
+                    self.max_order
+                };
                 self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
                 let s = self.sample(0.5, 0.9, 50);
                 ch = Some(s);
@@ -985,7 +1011,6 @@ impl RosaPlus {
             }
             v = self.sam.advance(v, ch);
         }
-
 
         Some(utf8_encode(&out))
     }
@@ -1014,7 +1039,11 @@ impl RosaPlus {
         }
 
         // Get probability distribution at this state
-        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        let mo = if self.max_order < 0 {
+            -1
+        } else {
+            self.max_order
+        };
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
         self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
 
@@ -1030,7 +1059,7 @@ impl RosaPlus {
     }
 
     /// Compute the unbiased predictive entropy rate (bits per symbol) of the given data.
-    /// 
+    ///
     /// This uses a chunk-based prequential approach (training on past chunks to score the current one)
     /// to eliminate the "in-sample bias" present in simple plugin estimators.
     /// Complexity: O(N * Chunks) where Chunks is small (default 16).
@@ -1048,51 +1077,53 @@ impl RosaPlus {
         if cps.len() < 2 {
             return 0.0;
         }
-        
+
         // Reset/Clear and perform predictive estimation
         self.sam = Sam::new(cps.len());
         self.lm_built = false;
 
         let num_chunks = 16;
         let chunk_size = (cps.len() + num_chunks - 1) / num_chunks;
-        
+
         let mut total_log_prob = 0.0f64;
         let mut count = 0usize;
 
         for i in 0..num_chunks {
             let start = i * chunk_size;
             let end = ((i + 1) * chunk_size).min(cps.len());
-            if start >= end { break; }
-            
+            if start >= end {
+                break;
+            }
+
             let chunk = &cps[start..end];
-            
+
             if i > 0 {
                 self.build_lm();
                 // Context state at the start of this chunk is the last state of the previous chunk.
                 // text_states[start] is the state reached after feeding symbols 0..start-1.
                 let mut v = self.sam.text_states[start];
-                
+
                 for &ch in chunk {
                     let sym_idx = self.lm.find_sym(ch);
                     let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
                     total_log_prob += p.log2();
                     count += 1;
-                    
+
                     // Advance context
                     v = self.sam.advance(v, ch);
                 }
             }
-            
+
             // Incremental training (adds to self.sam.text and updates structure)
             for &ch in chunk {
                 self.sam.feed(ch);
             }
         }
-        
+
         if count == 0 {
-             // Fallback if data is too small for chunking
-             self.build_lm();
-             self.entropy_rate_plugin_cps(&cps)
+            // Fallback if data is too small for chunking
+            self.build_lm();
+            self.entropy_rate_plugin_cps(&cps)
         } else {
             -total_log_prob / (count as f64)
         }
@@ -1100,8 +1131,10 @@ impl RosaPlus {
 
     /// Optimized entry point for already-decoded codepoints (used for joint entropy).
     pub fn entropy_rate_cps(&mut self, cps: &[u32]) -> f64 {
-        if cps.len() < 2 { return 0.0; }
-        
+        if cps.len() < 2 {
+            return 0.0;
+        }
+
         self.sam = Sam::new(cps.len());
         self.lm_built = false;
 
@@ -1113,7 +1146,9 @@ impl RosaPlus {
         for i in 0..num_chunks {
             let start = i * chunk_size;
             let end = ((i + 1) * chunk_size).min(cps.len());
-            if start >= end { break; }
+            if start >= end {
+                break;
+            }
             let chunk = &cps[start..end];
             if i > 0 {
                 self.build_lm();
@@ -1130,13 +1165,40 @@ impl RosaPlus {
                 self.sam.feed(ch);
             }
         }
-        
+
         if count == 0 {
             self.build_lm();
             self.entropy_rate_plugin_cps(cps)
         } else {
             -total_log_prob / (count as f64)
         }
+    }
+
+    pub fn cross_entropy(&self, data: &[u8]) -> f64 {
+        if !self.lm_built {
+            return 0.0;
+        }
+        let cps = if data.is_ascii() {
+            data.iter().map(|&b| b as u32).collect::<Vec<_>>()
+        } else {
+            utf8_decode_lossy(data)
+        };
+        self.cross_entropy_cps(&cps)
+    }
+
+    pub fn cross_entropy_cps(&self, data: &[u32]) -> f64 {
+        if !self.lm_built || data.is_empty() {
+            return 0.0;
+        }
+        let mut total_log_prob = 0.0f64;
+        let mut v = 0i32;
+        for &ch in data {
+            let sym_idx = self.lm.find_sym(ch);
+            let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
+            total_log_prob += p.log2();
+            v = self.sam.advance(v, ch);
+        }
+        -total_log_prob / (data.len() as f64)
     }
 
     fn entropy_rate_plugin_cps(&mut self, cps: &[u32]) -> f64 {
@@ -1151,7 +1213,11 @@ impl RosaPlus {
             total_log_prob += p.log2();
             count += 1;
         }
-        if count == 0 { 0.0 } else { -total_log_prob / (count as f64) }
+        if count == 0 {
+            0.0
+        } else {
+            -total_log_prob / (count as f64)
+        }
     }
 
     /// Returns the marginal (unigram) distribution over the training data.
@@ -1193,7 +1259,10 @@ impl RosaPlus {
 
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         if !self.lm_built {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "LM not built"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "LM not built",
+            ));
         }
         let mut f = File::create(path)?;
         f.write_all(MAGIC)?;
@@ -1255,7 +1324,10 @@ impl RosaPlus {
         let mut magic = vec![0u8; MAGIC.len()];
         f.read_exact(&mut magic)?;
         if magic != MAGIC {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad magic"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad magic",
+            ));
         }
 
         let mut b8 = [0u8; 8];
@@ -1296,7 +1368,10 @@ impl RosaPlus {
             f.read_exact(&mut b4)?;
             let sn = u32::from_le_bytes(b4) as usize;
             if sn > SAM_SMALL_MAX {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad small_n"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad small_n",
+                ));
             }
             m.sam.st[i].small_n = sn as u8;
             for k in 0..sn {
@@ -1335,7 +1410,14 @@ impl RosaPlus {
         m.lm.total_uni = total_uni;
         m.lm.alphabet.resize(alpha_n, 0);
         m.lm.unigram.resize(alpha_n, 0);
-        m.lm.ls = vec![LmState { head: -1, last_node: -1, ..LmState::default() }; st_n];
+        m.lm.ls = vec![
+            LmState {
+                head: -1,
+                last_node: -1,
+                ..LmState::default()
+            };
+            st_n
+        ];
         m.lm.nodes.resize(nodes_n, CountNode::default());
 
         for i in 0..alpha_n {
