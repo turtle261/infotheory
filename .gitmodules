@@ -1,0 +1,3 @@
+[submodule "rwkvzip"]
+	path = rwkvzip
+	url = admi@10.0.0.58:~/repos/rwkvzip
