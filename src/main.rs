@@ -23,6 +23,8 @@ use infotheory::*;
 use std::env;
 use std::io::{self, BufRead, Write};
 
+mod search;
+
 fn read_file(path: &str) -> Vec<u8> {
     match std::fs::read(path) {
         Ok(data) => data,
@@ -617,6 +619,16 @@ fn main() {
             }
         }
 
+        "search" => {
+            if args.len() < 4 {
+                eprintln!("Error: 'search' requires query and target path.");
+                std::process::exit(1);
+            }
+            let query = &args[2];
+            let target = &args[3];
+            search::run_search(query, target);
+        }
+
         _ => {
             eprintln!("Unknown primitive: {}", primitive);
             print_usage();
@@ -626,6 +638,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!("Usage: infotheory <primitive> <file1> <file2> [method/max_order]");
+    eprintln!("       infotheory search <query> <target_path>");
     eprintln!();
     eprintln!("=== BATCH JSON MODE (for programmatic use) ===");
     eprintln!("  infotheory batch        Read JSON lines from stdin, write results to stdout");

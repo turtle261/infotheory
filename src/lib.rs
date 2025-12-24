@@ -7,7 +7,7 @@
 //! 1.  **Compression-based (Kolmogorov Complexity)**: Using the ZPAQ compression algorithm to estimate
 //!     Normalized Compression Distance (NCD).
 //! 2.  **Entropy-based (Shannon Information)**: Using both exact marginal histograms (for i.i.d. data)
-//!     and the ROSA (Rapid Order-Shift Algorithm) predictive language model (for sequential data)
+//!     and the ROSA (Rapid Online Suffix Automaton) predictive language model (for sequential data)
 //!     to estimate Entropy, Mutual Information, and related distances.
 //!
 //! ## Mathematical Primitives
