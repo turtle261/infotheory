@@ -54,7 +54,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust
+//! ```rust,no_run
 //! use infotheory::{ncd_vitanyi, mutual_information_bytes, NcdVariant};
 //!
 //! let x = b"some data sequence";

@@ -626,7 +626,109 @@ fn main() {
             }
             let query = &args[2];
             let target = &args[3];
-            search::run_search(query, target);
+
+            // Preserve the legacy behavior (and avoid extra parsing work) when no flags are given.
+            if args.len() == 4 {
+                search::run_search(query, target);
+                return;
+            }
+
+            // Optional flags (keep dependency-free parsing):
+            //   --level snippet|file
+            //   --prior <path>
+            //   --stage2-prior full|off|summarize
+            //   --max-order <i64>
+            //   --top-k <usize>
+            //   --method <zpaq_method>
+            let mut opts = search::SearchOptions::default();
+            let mut i = 4usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--level" | "--granularity" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --level requires a value (snippet|file)");
+                            std::process::exit(1);
+                        });
+                        opts.granularity = match v.as_str() {
+                            "snippet" => search::SearchGranularity::Snippet,
+                            "file" => search::SearchGranularity::File,
+                            _ => {
+                                eprintln!("Error: invalid --level '{}'; expected snippet|file", v);
+                                std::process::exit(1);
+                            }
+                        };
+                    }
+                    "--prior" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --prior requires a path (file or directory)");
+                            std::process::exit(1);
+                        });
+                        opts.universal_prior = Some(v.clone());
+                    }
+                    "--stage2-prior" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --stage2-prior requires a value (full|off|summarize)");
+                            std::process::exit(1);
+                        });
+                        opts.stage2_prior_mode = match v.as_str() {
+                            "full" => search::Stage2PriorMode::UsePrior,
+                            "off" | "none" | "false" => search::Stage2PriorMode::NoPrior,
+                            "summarize" | "summary" => search::Stage2PriorMode::SummarizePrior,
+                            _ => {
+                                eprintln!("Error: invalid --stage2-prior '{}'; expected full|off|summarize", v);
+                                std::process::exit(1);
+                            }
+                        };
+                    }
+                    "--max-order" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --max-order requires an integer");
+                            std::process::exit(1);
+                        });
+                        opts.max_order = v.parse().unwrap_or_else(|_| {
+                            eprintln!("Error: invalid --max-order '{}'", v);
+                            std::process::exit(1);
+                        });
+                    }
+                    "--top-k" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --top-k requires an integer");
+                            std::process::exit(1);
+                        });
+                        opts.top_k = v.parse().unwrap_or_else(|_| {
+                            eprintln!("Error: invalid --top-k '{}'", v);
+                            std::process::exit(1);
+                        });
+                    }
+                    "--method" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --method requires a value (e.g. '5')");
+                            std::process::exit(1);
+                        });
+                        opts.zpaq_method = v.clone();
+                    }
+                    other => {
+                        eprintln!("Error: unknown search flag '{}'", other);
+                        std::process::exit(1);
+                    }
+                }
+                i += 1;
+            }
+
+            if opts.stage2_prior_mode == search::Stage2PriorMode::SummarizePrior
+                && opts.universal_prior.is_none()
+            {
+                eprintln!("Error: --stage2-prior summarize requires --prior");
+                std::process::exit(1);
+            }
+
+            search::run_search_with_options(query, target, &opts);
         }
 
         _ => {
@@ -638,7 +740,8 @@ fn main() {
 
 fn print_usage() {
     eprintln!("Usage: infotheory <primitive> <file1> <file2> [method/max_order]");
-    eprintln!("       infotheory search <query> <target_path>");
+    eprintln!("       infotheory search <query> <target_path> [--level snippet|file] [--prior <path>] [--stage2-prior full|off|summarize]");
+    eprintln!("                              [--max-order <i64>] [--top-k <n>] [--method <zpaq_method>]");
     eprintln!();
     eprintln!("=== BATCH JSON MODE (for programmatic use) ===");
     eprintln!("  infotheory batch        Read JSON lines from stdin, write results to stdout");

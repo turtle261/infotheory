@@ -16,7 +16,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 const SAM_SMALL_MAX: usize = 4;
 const MAGIC: &[u8] = b"rosa_pb_v3\0";
@@ -41,7 +41,7 @@ struct SamEdge {
     next: i32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Sam {
     st: Vec<SamState>,
     ed: Vec<SamEdge>,
@@ -322,6 +322,7 @@ struct CountNode {
     next: i32,
 }
 
+#[derive(Clone)]
 struct LM {
     alphabet: Vec<u32>,
     unigram: Vec<u64>,
@@ -672,7 +673,7 @@ impl LM {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RngStream {
     buf: Vec<u8>,
     pos: usize,
@@ -730,7 +731,7 @@ impl RngStream {
 // Helper for debugging/printing byte sequences if needed, but and
 // utf8_decode_lossy/utf8_encode are now removed as we follow byte-wise rules.
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SampleScratch {
     idx: Vec<u32>,
     logits: Vec<f64>,
@@ -749,6 +750,7 @@ impl SampleScratch {
     }
 }
 
+#[derive(Clone)]
 pub struct RosaPlus {
     max_order: i64,
     use_eot: bool,
@@ -762,6 +764,20 @@ pub struct RosaPlus {
     rng: RngStream,
     scratch: SampleScratch,
     dist: Vec<f64>,
+}
+
+/// A lightweight snapshot of the append-only internal SAM buffers.
+///
+/// Restoring to a checkpoint is O(1) (via truncation) and is meant to support
+/// repeated evaluation of different continuations from the same base training state.
+#[derive(Clone, Copy, Debug)]
+pub struct RosaCheckpoint {
+    sam_st_len: usize,
+    sam_ed_len: usize,
+    sam_text_len: usize,
+    sam_text_states_len: usize,
+    sam_boundary_after_len: usize,
+    sam_last: i32,
 }
 
 impl RosaPlus {
@@ -814,6 +830,80 @@ impl RosaPlus {
         self.lm.build_counts(&self.sam, mo);
         self.lm_built = true;
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
+    }
+
+    /// Build the language model without mutating SAM `endpos`.
+    ///
+    /// This is useful when you want to reuse a trained SAM as a stable base state
+    /// (e.g. universal-prior conditioning) and need cheap checkpoint/restore via truncation.
+    ///
+    /// Note: entropy/cross-entropy estimation does not require `endpos` finalization.
+    pub fn build_lm_no_finalize_endpos(&mut self) {
+        self.lm = LM::default();
+        self.lm.build_alphabet(&self.sam);
+        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        self.lm.build_counts(&self.sam, mo);
+        self.lm_built = true;
+        self.dist.resize(self.lm.alpha_n as usize, 0.0);
+    }
+
+    /// Ensure the LM is built (without mutating SAM endpos).
+    #[inline(always)]
+    pub fn ensure_lm_built_no_finalize_endpos(&mut self) {
+        if !self.lm_built {
+            self.build_lm_no_finalize_endpos();
+        }
+    }
+
+    /// Create a new model that shares the same trained SAM state but resets LM-related buffers.
+    ///
+    /// This is substantially cheaper than cloning the full `RosaPlus` (which includes LM counts,
+    /// node tables, and distribution buffers) and is safe for workflows that want to start from
+    /// a fixed base training text (e.g. a universal prior) and then add candidate-specific text.
+    pub fn fork_from_sam(&self) -> Self {
+        Self {
+            max_order: self.max_order,
+            use_eot: self.use_eot,
+            eot: self.eot,
+            seed: self.seed,
+
+            sam: self.sam.clone(),
+            lm: LM::default(),
+            lm_built: false,
+
+            rng: RngStream::new(self.seed),
+            scratch: SampleScratch::default(),
+            dist: Vec::new(),
+        }
+    }
+
+    /// A checkpoint that allows restoring the ROSA model back to a previous trained state
+    /// by truncating append-only internal buffers.
+    ///
+    /// Intended for workflows that repeatedly evaluate different continuations from the same base
+    /// training text (e.g. universal-prior conditioned scoring).
+    pub fn checkpoint(&self) -> RosaCheckpoint {
+        RosaCheckpoint {
+            sam_st_len: self.sam.st.len(),
+            sam_ed_len: self.sam.ed.len(),
+            sam_text_len: self.sam.text.len(),
+            sam_text_states_len: self.sam.text_states.len(),
+            sam_boundary_after_len: self.sam.boundary_after.len(),
+            sam_last: self.sam.last,
+        }
+    }
+
+    /// Restore the model to a previously captured checkpoint.
+    ///
+    /// This invalidates the LM; callers should rebuild it before scoring.
+    pub fn restore(&mut self, ck: &RosaCheckpoint) {
+        self.sam.st.truncate(ck.sam_st_len);
+        self.sam.ed.truncate(ck.sam_ed_len);
+        self.sam.text.truncate(ck.sam_text_len);
+        self.sam.text_states.truncate(ck.sam_text_states_len);
+        self.sam.boundary_after.truncate(ck.sam_boundary_after_len);
+        self.sam.last = ck.sam_last;
+        self.lm_built = false;
     }
 
     #[inline(always)]
@@ -1167,7 +1257,7 @@ impl RosaPlus {
                 "LM not built",
             ));
         }
-        let mut f = File::create(path)?;
+        let mut f = BufWriter::new(File::create(path)?);
         f.write_all(MAGIC)?;
         f.write_all(&self.max_order.to_le_bytes())?;
         f.write_all(&(self.use_eot as i32).to_le_bytes())?;
@@ -1219,11 +1309,12 @@ impl RosaPlus {
             f.write_all(&n.cnt.to_le_bytes())?;
             f.write_all(&n.next.to_le_bytes())?;
         }
+        f.flush()?;
         Ok(())
     }
 
     pub fn load(path: &str) -> std::io::Result<Self> {
-        let mut f = File::open(path)?;
+        let mut f = BufReader::new(File::open(path)?);
         let mut magic = vec![0u8; MAGIC.len()];
         f.read_exact(&mut magic)?;
         if magic != MAGIC {
