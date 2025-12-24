@@ -164,25 +164,30 @@ fn stage1_filter_with_universal_prior(
     // Training the prior using snippet-level windows would duplicate overlapping content
     // and explode runtime. We *always* train/load the prior at file granularity.
     let mut base = load_or_train_prior_model(prior_path, opts);
+    // For true conditional updates we require the fixed 256-byte alphabet LM.
+    // This ensures symbol indices remain stable across incremental updates.
     base.ensure_lm_built_no_finalize_endpos();
 
     // Precompute query codepoints once (cross_entropy() would allocate this per call).
     let query_cps: Vec<u32> = query_bytes.iter().map(|&b| b as u32).collect();
     let h_u_q = base.cross_entropy_cps(&query_cps);
 
-    // Stage-1 scoring relative to the prior baseline:
-    // score(x) = H_U(q) - H_x(q)
-    // (how much better the candidate model predicts q than the universal background)
+    // True conditional update:
+    // score(x) = H_U(q) - H_{U+x}(q)
+    // by applying a reversible candidate update to the *full* prior model.
     candidates
         .into_par_iter()
-        .map(|mut snippet| {
-            let mut m = RosaPlus::new(opts.max_order, false, 0, 42);
-            m.train_example(&snippet.content);
-            m.ensure_lm_built_no_finalize_endpos();
-            let h_x_q = m.cross_entropy_cps(&query_cps);
-            snippet.score = h_u_q - h_x_q;
-            snippet
-        })
+        .map_init(
+            || base.clone(),
+            |m, mut snippet| {
+                let mut tx = m.begin_tx();
+                m.train_example_tx(&mut tx, &snippet.content);
+                let h_ux_q = m.cross_entropy_cps(&query_cps);
+                m.rollback_tx(tx);
+                snippet.score = h_u_q - h_ux_q;
+                snippet
+            },
+        )
         .collect()
 }
 
@@ -316,7 +321,7 @@ fn prior_cache_path(prior_path: &str, max_order: i64) -> Option<PathBuf> {
 
     let mut hasher = DefaultHasher::new();
     // Cache format/version (bump when training or serialization semantics change).
-    (2u32).hash(&mut hasher);
+    (4u32).hash(&mut hasher);
     prior_path.hash(&mut hasher);
     max_order.hash(&mut hasher);
     // file-granularity is baked into the cache key (we always use it for prior training)
@@ -332,7 +337,12 @@ fn load_or_train_prior_model(prior_path: &str, opts: &SearchOptions) -> RosaPlus
             let _ = fs::create_dir_all(parent);
         }
         if cache_path.exists() {
-            if let Ok(m) = RosaPlus::load(cache_path.to_string_lossy().as_ref()) {
+            if let Ok(mut m) = RosaPlus::load(cache_path.to_string_lossy().as_ref()) {
+                // Ensure fixed 256-byte alphabet LM for incremental conditional updates.
+                if m.lm_alpha_n() != 256 {
+                    m.build_lm_full_bytes_no_finalize_endpos();
+                    let _ = m.save(cache_path.to_string_lossy().as_ref());
+                }
                 return m;
             }
         }
@@ -340,8 +350,8 @@ fn load_or_train_prior_model(prior_path: &str, opts: &SearchOptions) -> RosaPlus
         // Train + save.
         let mut m = RosaPlus::new(opts.max_order, false, 0, 42);
         train_rosa_on_corpus(&mut m, prior_path, SearchGranularity::File);
-        // Build LM once so the saved model is the full state.
-        m.build_lm_no_finalize_endpos();
+        // Build a fixed-byte alphabet LM once so the saved model is the full state.
+        m.build_lm_full_bytes_no_finalize_endpos();
         let _ = m.save(cache_path.to_string_lossy().as_ref());
         return m;
     }

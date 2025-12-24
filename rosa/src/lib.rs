@@ -19,7 +19,13 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
 const SAM_SMALL_MAX: usize = 4;
-const MAGIC: &[u8] = b"rosa_pb_v3\0";
+// NOTE: bump when on-disk format changes.
+// v4 adds serialization of `sam.last` and `sam.text_states` (required for reversible conditional updates).
+const MAGIC: &[u8] = b"rosa_pb_v4\0";
+
+// This crate is used byte-wise by infotheory; for fast incremental conditional updates we
+// support an optional fixed 256-byte alphabet LM build/update path.
+const BYTE_ALPHA_N: usize = 256;
 
 #[derive(Clone, Copy, Default)]
 struct SamState {
@@ -303,6 +309,192 @@ impl Sam {
         }
         None
     }
+
+    // ===== Transactional (undo-log) support =====
+    fn begin_tx(&self) -> SamTx {
+        SamTx {
+            old_last: self.last,
+            old_text_len: self.text.len(),
+            old_text_states_len: self.text_states.len(),
+            old_boundary_len: self.boundary_after.len(),
+            old_st_len: self.st.len(),
+            old_ed_len: self.ed.len(),
+            st_changes: Vec::new(),
+            ed_changes: Vec::new(),
+        }
+    }
+
+    fn rollback_tx(&mut self, tx: SamTx) {
+        // Restore mutated entries (reverse order is fine even with duplicates).
+        for (idx, old) in tx.ed_changes.into_iter().rev() {
+            if idx < self.ed.len() {
+                self.ed[idx] = old;
+            }
+        }
+        for (idx, old) in tx.st_changes.into_iter().rev() {
+            if idx < self.st.len() {
+                self.st[idx] = old;
+            }
+        }
+
+        self.st.truncate(tx.old_st_len);
+        self.ed.truncate(tx.old_ed_len);
+        self.text.truncate(tx.old_text_len);
+        self.text_states.truncate(tx.old_text_states_len);
+        self.boundary_after.truncate(tx.old_boundary_len);
+        self.last = tx.old_last;
+    }
+
+    #[inline(always)]
+    fn record_state_change(&self, tx: &mut SamTx, idx: usize) {
+        // Duplicates are OK; rollback applies in reverse.
+        tx.st_changes.push((idx, self.st[idx]));
+    }
+
+    #[inline(always)]
+    fn record_edge_change(&self, tx: &mut SamTx, idx: usize) {
+        tx.ed_changes.push((idx, self.ed[idx]));
+    }
+
+    #[inline(always)]
+    fn add_edge_tx(&mut self, tx: &mut SamTx, v: i32, ch: u32, to: i32) {
+        let idx = self.ed.len() as i32;
+        let head = self.st[v as usize].head;
+        self.ed.push(SamEdge { ch, to, next: head });
+        self.record_state_change(tx, v as usize);
+        self.st[v as usize].head = idx;
+    }
+
+    #[inline(always)]
+    fn add_edge_absent_tx(&mut self, tx: &mut SamTx, v: i32, ch: u32, to: i32) {
+        let v_usize = v as usize;
+        let small_n = self.st[v_usize].small_n as usize;
+        if small_n < SAM_SMALL_MAX {
+            let i = small_n;
+            self.record_state_change(tx, v_usize);
+            let st = &mut self.st[v_usize];
+            st.small_ch[i] = ch;
+            st.small_to[i] = to;
+            st.small_n += 1;
+        } else {
+            self.add_edge_tx(tx, v, ch, to);
+        }
+    }
+
+    #[inline(always)]
+    fn replace_edge_to_tx(&mut self, tx: &mut SamTx, v: i32, ch: u32, old_to: i32, new_to: i32) -> bool {
+        // small edges
+        {
+            let st = &self.st[v as usize];
+            for i in 0..(st.small_n as usize) {
+                if st.small_ch[i] == ch && st.small_to[i] == old_to {
+                    self.record_state_change(tx, v as usize);
+                    self.st[v as usize].small_to[i] = new_to;
+                    return true;
+                }
+            }
+        }
+        // overflow edges
+        let mut ei = self.st[v as usize].head;
+        while ei != -1 {
+            let eidx = ei as usize;
+            let e = self.ed[eidx];
+            if e.ch == ch && e.to == old_to {
+                self.record_edge_change(tx, eidx);
+                self.ed[eidx].to = new_to;
+                return true;
+            }
+            ei = e.next;
+        }
+        false
+    }
+
+    fn clone_overflow_edges_tx(&mut self, tx: &mut SamTx, src: i32, dst: i32) {
+        self.record_state_change(tx, dst as usize);
+        self.st[dst as usize].head = -1;
+        let mut ei = self.st[src as usize].head;
+        while ei != -1 {
+            let e = self.ed[ei as usize];
+            self.add_edge_tx(tx, dst, e.ch, e.to);
+            ei = e.next;
+        }
+    }
+
+    fn feed_tx(&mut self, tx: &mut SamTx, ch: u32) {
+        let i = self.text.len() as i32;
+        self.text.push(ch);
+        self.boundary_after.push(0);
+
+        let g = self.last;
+        let r = self.st.len() as i32;
+        let mut st_r = SamState::default();
+        st_r.link = 0;
+        st_r.len = self.st[g as usize].len + 1;
+        st_r.endpos = i;
+        st_r.small_n = 0;
+        st_r.head = -1;
+        self.st.push(st_r);
+
+        let mut p = g;
+        let mut q;
+        while p != -1 {
+            q = self.get_edge(p, ch);
+            if q != -1 {
+                break;
+            }
+            self.add_edge_absent_tx(tx, p, ch, r);
+            p = self.st[p as usize].link;
+        }
+
+        if p == -1 {
+            // link of r is in newly appended state; safe.
+            self.st[r as usize].link = 0;
+        } else {
+            q = self.get_edge(p, ch);
+            if self.st[p as usize].len + 1 == self.st[q as usize].len {
+                self.st[r as usize].link = q;
+            } else {
+                let u = self.st.len() as i32;
+                let mut st_u = self.st[q as usize];
+                st_u.len = self.st[p as usize].len + 1;
+                self.st.push(st_u);
+                self.clone_overflow_edges_tx(tx, q, u);
+                while p != -1 && self.replace_edge_to_tx(tx, p, ch, q, u) {
+                    p = self.st[p as usize].link;
+                }
+                // q is an existing state; record before mutation.
+                self.record_state_change(tx, q as usize);
+                self.st[q as usize].link = u;
+                self.st[r as usize].link = u;
+            }
+        }
+
+        self.last = r;
+        self.text_states.push(r);
+    }
+
+    fn mark_boundary_tx(&mut self, tx: &mut SamTx) {
+        if !self.text.is_empty() {
+            // boundary_after is truncated on rollback, so no need to log.
+            let i = self.text.len() - 1;
+            self.boundary_after[i] = 1;
+        }
+        // last is restored on rollback.
+        self.last = 0;
+        let _ = tx;
+    }
+}
+
+#[derive(Clone)]
+struct SamTx {
+    old_last: i32,
+    old_text_len: usize,
+    old_text_states_len: usize,
+    old_boundary_len: usize,
+    old_st_len: usize,
+    old_ed_len: usize,
+    st_changes: Vec<(usize, SamState)>,
+    ed_changes: Vec<(usize, SamEdge)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -671,6 +863,62 @@ impl LM {
             }
         }
     }
+
+    #[inline(always)]
+    fn inc_tx(&mut self, tx: &mut LmTx, state: u32, sym_idx: u32, add: u64) {
+        let si = state as usize;
+        // record old LmState
+        tx.ls_changes.push((si, self.ls[si]));
+
+        let ls = &mut self.ls[si];
+        let last = ls.last_node;
+        if last != -1 && self.nodes[last as usize].sym_idx == sym_idx {
+            let ni = last as usize;
+            tx.node_changes.push((ni, self.nodes[ni]));
+            self.nodes[ni].cnt += add;
+            ls.total_n += add;
+            return;
+        }
+
+        let mut ni = ls.head;
+        while ni != -1 {
+            let idx = ni as usize;
+            if self.nodes[idx].sym_idx == sym_idx {
+                tx.node_changes.push((idx, self.nodes[idx]));
+                self.nodes[idx].cnt += add;
+                ls.total_n += add;
+                ls.last_node = ni;
+                ls.last_sym = sym_idx;
+                return;
+            }
+            ni = self.nodes[idx].next;
+        }
+
+        // New node
+        let idx = self.nodes.len() as i32;
+        tx.old_nodes_len = tx.old_nodes_len.min(self.nodes.len());
+        self.nodes.push(CountNode {
+            sym_idx,
+            cnt: add,
+            next: ls.head,
+        });
+        ls.head = idx;
+        ls.total_n += add;
+        ls.types_t += 1;
+        ls.last_node = idx;
+        ls.last_sym = sym_idx;
+    }
+}
+
+#[derive(Clone)]
+struct LmTx {
+    old_ls_len: usize,
+    old_nodes_len: usize,
+    ls_changes: Vec<(usize, LmState)>,
+    node_changes: Vec<(usize, CountNode)>,
+    // unigram delta for bytes
+    uni_delta: [u64; BYTE_ALPHA_N],
+    total_uni_add: u64,
 }
 
 #[derive(Clone, Default)]
@@ -780,6 +1028,15 @@ pub struct RosaCheckpoint {
     sam_last: i32,
 }
 
+/// Transaction object used to roll back a temporary conditional update.
+#[derive(Clone)]
+pub struct RosaTx {
+    sam: SamTx,
+    lm: LmTx,
+    seg_start: usize,
+    seg_len: usize,
+}
+
 impl RosaPlus {
     pub fn new(max_order: i64, use_eot: bool, eot_char: u8, seed: u64) -> Self {
         let sam = Sam::new(0);
@@ -847,11 +1104,185 @@ impl RosaPlus {
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
     }
 
+    /// Build an LM with a fixed byte alphabet of size 256.
+    ///
+    /// This avoids alphabet growth issues and enables fast incremental updates.
+    pub fn build_lm_full_bytes_no_finalize_endpos(&mut self) {
+        // Fixed alphabet
+        self.lm = LM::default();
+        self.lm.has_byte_map = true;
+        self.lm.alpha_n = BYTE_ALPHA_N as u32;
+        self.lm.alphabet = (0..BYTE_ALPHA_N as u32).collect();
+        self.lm.byte_map = [-1; 256];
+        for i in 0..256 {
+            self.lm.byte_map[i] = i as i16;
+        }
+
+        // Unigram counts
+        let mut counts = [0u64; 256];
+        for &v in &self.sam.text {
+            if v < 256 {
+                counts[v as usize] += 1;
+            }
+        }
+        self.lm.unigram = counts.to_vec();
+        self.lm.total_uni = counts.iter().sum();
+        if self.lm.total_uni == 0 {
+            self.lm.unigram[b'\n' as usize] = 1;
+            self.lm.total_uni = 1;
+        }
+
+        // Counts
+        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        self.lm.build_counts(&self.sam, mo);
+        self.lm_built = true;
+        self.dist.resize(BYTE_ALPHA_N, 0.0);
+    }
+
+    /// Begin a reversible conditional update transaction.
+    pub fn begin_tx(&mut self) -> RosaTx {
+        let sam_tx = self.sam.begin_tx();
+        let lm_tx = LmTx {
+            old_ls_len: self.lm.ls.len(),
+            old_nodes_len: self.lm.nodes.len(),
+            ls_changes: Vec::new(),
+            node_changes: Vec::new(),
+            uni_delta: [0u64; BYTE_ALPHA_N],
+            total_uni_add: 0,
+        };
+        RosaTx {
+            sam: sam_tx,
+            lm: lm_tx,
+            seg_start: self.sam.text.len(),
+            seg_len: 0,
+        }
+    }
+
+    /// Apply a training example and update LM counts incrementally (byte alphabet must be full 256).
+    pub fn train_example_tx(&mut self, tx: &mut RosaTx, s: &[u8]) {
+        if s.is_empty() {
+            return;
+        }
+
+        // Ensure LS has entries for current states.
+        if self.lm.ls.len() < self.sam.st.len() {
+            self.lm.ls.resize(
+                self.sam.st.len(),
+                LmState {
+                    head: -1,
+                    last_node: -1,
+                    ..LmState::default()
+                },
+            );
+        }
+
+        // Feed all bytes (SAM structure changes are logged).
+        for &b in s {
+            self.sam.feed_tx(&mut tx.sam, b as u32);
+            tx.lm.uni_delta[b as usize] += 1;
+            tx.lm.total_uni_add += 1;
+        }
+        self.sam.mark_boundary_tx(&mut tx.sam);
+
+        // LM must be built for scoring; we keep it built and update counts incrementally.
+        // Extend ls for any new SAM states created by feeding.
+        if self.lm.ls.len() < self.sam.st.len() {
+            self.lm.ls.resize(
+                self.sam.st.len(),
+                LmState {
+                    head: -1,
+                    last_node: -1,
+                    ..LmState::default()
+                },
+            );
+        }
+
+        // Update unigram counts (fixed 256 alphabet assumed).
+        for i in 0..256 {
+            if tx.lm.uni_delta[i] != 0 {
+                self.lm.unigram[i] += tx.lm.uni_delta[i];
+            }
+        }
+        self.lm.total_uni += tx.lm.total_uni_add;
+
+        // Update conditional counts for the new segment only.
+        let seg_start = tx.seg_start;
+        let seg_end = self.sam.text.len();
+        tx.seg_len = seg_end - seg_start;
+        if tx.seg_len >= 2 {
+            let mo = if self.max_order < 0 { -1 } else { self.max_order };
+            for i in seg_start..(seg_end - 1) {
+                // ctx state after consuming sam.text[i] within its segment
+                let mut ctx = self.sam.text_states[i + 1];
+                if mo >= 0 {
+                    while ctx != -1 && (self.sam.st[ctx as usize].len as i64) > mo {
+                        ctx = self.sam.st[ctx as usize].link;
+                    }
+                    if ctx == -1 {
+                        ctx = 0;
+                    }
+                }
+                let nxt = self.sam.text[i + 1];
+                let si = self.lm.find_sym(nxt);
+                if si >= 0 {
+                    let mut u = ctx;
+                    while u != -1 {
+                        self.lm.inc_tx(&mut tx.lm, u as u32, si as u32, 1);
+                        u = self.sam.st[u as usize].link;
+                    }
+                }
+            }
+        }
+
+        self.lm_built = true;
+    }
+
+    /// Roll back a transaction, restoring the model to the exact state at begin_tx.
+    pub fn rollback_tx(&mut self, tx: RosaTx) {
+        // Restore LM changes
+        // Unigram rollback
+        if self.lm.unigram.len() >= BYTE_ALPHA_N {
+            for i in 0..BYTE_ALPHA_N {
+                let d = tx.lm.uni_delta[i];
+                if d != 0 {
+                    self.lm.unigram[i] = self.lm.unigram[i].saturating_sub(d);
+                }
+            }
+            self.lm.total_uni = self.lm.total_uni.saturating_sub(tx.lm.total_uni_add);
+        }
+
+        for (idx, old) in tx.lm.node_changes.into_iter().rev() {
+            if idx < self.lm.nodes.len() {
+                self.lm.nodes[idx] = old;
+            }
+        }
+        for (idx, old) in tx.lm.ls_changes.into_iter().rev() {
+            if idx < self.lm.ls.len() {
+                self.lm.ls[idx] = old;
+            }
+        }
+        self.lm.nodes.truncate(tx.lm.old_nodes_len);
+        self.lm.ls.truncate(tx.lm.old_ls_len);
+
+        // Restore SAM
+        self.sam.rollback_tx(tx.sam);
+        // lm_built remains true if it was true before; safe to keep true.
+    }
+
     /// Ensure the LM is built (without mutating SAM endpos).
     #[inline(always)]
     pub fn ensure_lm_built_no_finalize_endpos(&mut self) {
         if !self.lm_built {
             self.build_lm_no_finalize_endpos();
+        }
+    }
+
+    /// Current LM alphabet size (0 if LM not built).
+    pub fn lm_alpha_n(&self) -> usize {
+        if !self.lm_built {
+            0
+        } else {
+            self.lm.alpha_n as usize
         }
     }
 
@@ -1257,6 +1688,15 @@ impl RosaPlus {
                 "LM not built",
             ));
         }
+
+        // Transactional conditional updates require a valid prefix-state trace.
+        // If this invariant is violated, the loaded model would be unusable.
+        if self.sam.text_states.len() != self.sam.text.len() + 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "SAM text_states mismatch (expected text.len()+1)",
+            ));
+        }
         let mut f = BufWriter::new(File::create(path)?);
         f.write_all(MAGIC)?;
         f.write_all(&self.max_order.to_le_bytes())?;
@@ -1288,6 +1728,13 @@ impl RosaPlus {
             f.write_all(&t.to_le_bytes())?;
         }
         f.write_all(&self.sam.boundary_after)?;
+
+        // Persist SAM cursor + prefix trace.
+        f.write_all(&self.sam.last.to_le_bytes())?;
+        f.write_all(&(self.sam.text_states.len() as u32).to_le_bytes())?;
+        for &ts in &self.sam.text_states {
+            f.write_all(&ts.to_le_bytes())?;
+        }
 
         // LM
         f.write_all(&self.lm.alpha_n.to_le_bytes())?;
@@ -1390,6 +1837,36 @@ impl RosaPlus {
             m.sam.text[i] = u32::from_le_bytes(b4);
         }
         f.read_exact(&mut m.sam.boundary_after)?;
+
+        // SAM cursor + prefix trace.
+        f.read_exact(&mut b4)?;
+        m.sam.last = i32::from_le_bytes(b4);
+        f.read_exact(&mut b4)?;
+        let text_states_n = u32::from_le_bytes(b4) as usize;
+        if text_states_n != text_n + 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad text_states len",
+            ));
+        }
+        m.sam.text_states.resize(text_states_n, 0);
+        for i in 0..text_states_n {
+            f.read_exact(&mut b4)?;
+            let v = i32::from_le_bytes(b4);
+            if v < 0 || (v as usize) >= st_n {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad text_states entry",
+                ));
+            }
+            m.sam.text_states[i] = v;
+        }
+        if m.sam.last < 0 || (m.sam.last as usize) >= st_n {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad sam.last",
+            ));
+        }
 
         // LM
         f.read_exact(&mut b4)?;
