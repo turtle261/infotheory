@@ -73,8 +73,164 @@
 use rayon::prelude::*;
 
 use std::sync::OnceLock;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 static NUM_THREADS: OnceLock<usize> = OnceLock::new();
+
+thread_local! {
+    static RWKV_TLS: RefCell<HashMap<usize, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
+}
+
+fn mutual_information_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
+    if x.is_empty() {
+        return 0.0;
+    }
+    let h_x = entropy_rate_backend(x, max_order, backend);
+    let h_y = entropy_rate_backend(y, max_order, backend);
+    let h_xy = joint_entropy_rate_backend(x, y, max_order, backend);
+    (h_x + h_y - h_xy).max(0.0)
+}
+
+fn ned_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
+    if x.is_empty() {
+        return 0.0;
+    }
+    let h_x = entropy_rate_backend(x, max_order, backend);
+    let h_y = entropy_rate_backend(y, max_order, backend);
+    let h_xy = joint_entropy_rate_backend(x, y, max_order, backend);
+    let min_h = h_x.min(h_y);
+    let max_h = h_x.max(h_y);
+    if max_h == 0.0 {
+        0.0
+    } else {
+        ((h_xy - min_h) / max_h).clamp(0.0, 1.0)
+    }
+}
+
+fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
+    if x.is_empty() {
+        return 0.0;
+    }
+    let h_x = entropy_rate_backend(x, max_order, backend);
+    let h_y = entropy_rate_backend(y, max_order, backend);
+    let h_xy = joint_entropy_rate_backend(x, y, max_order, backend);
+    let max_h = h_x.max(h_y);
+    if max_h == 0.0 {
+        0.0
+    } else {
+        let vi = (h_xy - h_x).max(0.0) + (h_xy - h_y).max(0.0);
+        (vi / max_h).clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Clone)]
+pub enum RateBackend {
+    RosaPlus,
+    Rwkv7 { model: Arc<rwkvzip::Model> },
+}
+
+#[derive(Clone)]
+pub enum NcdBackend {
+    Zpaq { method: String },
+    Rwkv7 { model: Arc<rwkvzip::Model>, coder: rwkvzip::CoderType },
+}
+
+#[derive(Clone)]
+pub struct InfotheoryCtx {
+    pub rate_backend: RateBackend,
+    pub ncd_backend: NcdBackend,
+}
+
+impl InfotheoryCtx {
+    pub fn new(rate_backend: RateBackend, ncd_backend: NcdBackend) -> Self {
+        Self { rate_backend, ncd_backend }
+    }
+
+    pub fn with_zpaq(method: impl Into<String>) -> Self {
+        Self {
+            rate_backend: RateBackend::RosaPlus,
+            ncd_backend: NcdBackend::Zpaq { method: method.into() },
+        }
+    }
+
+    pub fn compress_size(&self, data: &[u8]) -> u64 {
+        compress_size_backend(data, &self.ncd_backend)
+    }
+
+    pub fn compress_size_chain(&self, parts: &[&[u8]]) -> u64 {
+        compress_size_chain_backend(parts, &self.ncd_backend)
+    }
+
+    pub fn entropy_rate_bytes(&self, data: &[u8], max_order: i64) -> f64 {
+        entropy_rate_backend(data, max_order, &self.rate_backend)
+    }
+
+    pub fn biased_entropy_rate_bytes(&self, data: &[u8], max_order: i64) -> f64 {
+        biased_entropy_rate_backend(data, max_order, &self.rate_backend)
+    }
+
+    pub fn cross_entropy_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        cross_entropy_rate_backend(x, y, max_order, &self.rate_backend)
+    }
+
+    pub fn joint_entropy_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        let (x, y) = aligned_prefix(x, y);
+        if x.is_empty() {
+            return 0.0;
+        }
+        joint_entropy_rate_backend(x, y, max_order, &self.rate_backend)
+    }
+
+    pub fn cross_entropy_conditional_chain(&self, prefix_parts: &[&[u8]], data: &[u8]) -> f64 {
+        match &self.rate_backend {
+            RateBackend::RosaPlus => {
+                let mut prefix = Vec::new();
+                let total: usize = prefix_parts.iter().map(|p| p.len()).sum();
+                prefix.reserve(total);
+                for p in prefix_parts {
+                    prefix.extend_from_slice(p);
+                }
+                cross_entropy_rate_backend(data, &prefix, -1, &RateBackend::RosaPlus)
+            }
+            RateBackend::Rwkv7 { model } => {
+                with_rwkv_tls(model, |c| c.cross_entropy_conditional_chain(prefix_parts, data).unwrap_or(0.0))
+            }
+        }
+    }
+
+    pub fn ncd_bytes(&self, x: &[u8], y: &[u8], variant: NcdVariant) -> f64 {
+        ncd_bytes_backend(x, y, &self.ncd_backend, variant)
+    }
+
+    pub fn mutual_information_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        mutual_information_rate_backend(x, y, max_order, &self.rate_backend)
+    }
+
+    pub fn ned_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        if max_order == 0 {
+            ned_marg_bytes(x, y)
+        } else {
+            ned_rate_backend(x, y, max_order, &self.rate_backend)
+        }
+    }
+
+    pub fn nte_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        if max_order == 0 {
+            nte_marg_bytes(x, y)
+        } else {
+            nte_rate_backend(x, y, max_order, &self.rate_backend)
+        }
+    }
+}
+
+pub fn load_rwkv7_model_from_path(path: &str) -> Arc<rwkvzip::Model> {
+    rwkvzip::Compressor::load_model(path).expect("failed to load RWKV7 model")
+}
 
 #[inline(always)]
 fn aligned_prefix<'a>(x: &'a [u8], y: &'a [u8]) -> (&'a [u8], &'a [u8]) {
@@ -88,6 +244,122 @@ pub fn get_compressed_size(path: &str, method: &str) -> u64 {
     // Convert Input file to Vec<u8>, and reference that (compress_size only takes &[u8] input), and pass method.
     // Will panic if file does not exist, so it must be prevalidated.
     zpaq_rs::compress_size(&std::fs::read(path).unwrap(), method).unwrap()
+}
+
+fn with_rwkv_tls<R>(model: &Arc<rwkvzip::Model>, f: impl FnOnce(&mut rwkvzip::Compressor) -> R) -> R {
+    let key = Arc::as_ptr(model) as usize;
+    RWKV_TLS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let comp = map
+            .entry(key)
+            .or_insert_with(|| rwkvzip::Compressor::new_from_model(model.clone()));
+        f(comp)
+    })
+}
+
+struct SliceChainReader<'a> {
+    parts: &'a [&'a [u8]],
+    i: usize,
+    off: usize,
+}
+
+impl<'a> SliceChainReader<'a> {
+    fn new(parts: &'a [&'a [u8]]) -> Self {
+        Self { parts, i: 0, off: 0 }
+    }
+}
+
+impl<'a> std::io::Read for SliceChainReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.i < self.parts.len() {
+            let p = self.parts[self.i];
+            if self.off >= p.len() {
+                self.i += 1;
+                self.off = 0;
+                continue;
+            }
+            let n = (p.len() - self.off).min(buf.len());
+            buf[..n].copy_from_slice(&p[self.off..self.off + n]);
+            self.off += n;
+            return Ok(n);
+        }
+        Ok(0)
+    }
+}
+
+fn compress_size_chain_backend(parts: &[&[u8]], backend: &NcdBackend) -> u64 {
+    match backend {
+        NcdBackend::Zpaq { method } => {
+            let r = SliceChainReader::new(parts);
+            zpaq_rs::compress_size_stream(r, method.as_str(), None, None).unwrap_or(0)
+        }
+        NcdBackend::Rwkv7 { model, coder } => {
+            with_rwkv_tls(model, |c| c.compress_size_chain(parts, *coder).unwrap_or(0))
+        }
+    }
+}
+
+fn compress_size_backend(data: &[u8], backend: &NcdBackend) -> u64 {
+    match backend {
+        NcdBackend::Zpaq { method } => zpaq_rs::compress_size(data, method.as_str()).unwrap_or(0),
+        NcdBackend::Rwkv7 { model, coder } => {
+            with_rwkv_tls(model, |c| c.compress_size(data, *coder).unwrap_or(0))
+        }
+    }
+}
+
+fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+    match backend {
+        RateBackend::RosaPlus => {
+            let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
+            m.predictive_entropy_rate(data)
+        }
+        RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0)),
+    }
+}
+
+fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+    match backend {
+        RateBackend::RosaPlus => {
+            let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
+            m.train_example(data);
+            m.build_lm();
+            m.cross_entropy(data)
+        }
+        RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0)),
+    }
+}
+
+fn cross_entropy_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+    match backend {
+        RateBackend::RosaPlus => {
+            let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
+            m.train_example(y);
+            m.build_lm();
+            m.cross_entropy(x)
+        }
+        RateBackend::Rwkv7 { model } => {
+            with_rwkv_tls(model, |c| c.cross_entropy_conditional(y, x).unwrap_or(0.0))
+        }
+    }
+}
+
+fn joint_entropy_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+    match backend {
+        RateBackend::RosaPlus => {
+            let joint_symbols: Vec<u32> = (0..x.len())
+                .map(|i| (x[i] as u32) * 256 + (y[i] as u32))
+                .collect();
+            let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
+            m.entropy_rate_cps(&joint_symbols)
+        }
+        RateBackend::Rwkv7 { model } => {
+            with_rwkv_tls(model, |c| c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0))
+        }
+    }
 }
 #[inline(always)]
 pub fn get_compressed_size_parallel(path: &str, method: &str, threads: usize) -> u64 {
@@ -208,7 +480,7 @@ pub enum NcdVariant {
 
 #[inline(always)]
 fn compress_size_bytes(data: &[u8], method: &str) -> u64 {
-    zpaq_rs::compress_size(data, method).unwrap()
+    zpaq_rs::compress_size(data, method).unwrap_or(0)
 }
 
 #[inline(always)]
@@ -249,23 +521,17 @@ fn ncd_from_sizes(cx: u64, cy: u64, cxy: u64, cyx: Option<u64>, variant: NcdVari
 
 #[inline(always)]
 pub fn ncd_bytes(x: &[u8], y: &[u8], method: &str, variant: NcdVariant) -> f64 {
-    let (cx, cy) = rayon::join(
-        || compress_size_bytes(x, method),
-        || compress_size_bytes(y, method),
-    );
+    let backend = NcdBackend::Zpaq { method: method.to_string() };
+    ncd_bytes_backend(x, y, &backend, variant)
+}
 
-    let mut buf = Vec::with_capacity(x.len() + y.len());
-    buf.extend_from_slice(x);
-    buf.extend_from_slice(y);
-    let cxy = compress_size_bytes(&buf, method);
+pub fn ncd_bytes_backend(x: &[u8], y: &[u8], backend: &NcdBackend, variant: NcdVariant) -> f64 {
+    let (cx, cy) = rayon::join(|| compress_size_backend(x, backend), || compress_size_backend(y, backend));
+
+    let cxy = compress_size_chain_backend(&[x, y], backend);
 
     let cyx = match variant {
-        NcdVariant::SymVitanyi | NcdVariant::SymCons => {
-            buf.clear();
-            buf.extend_from_slice(y);
-            buf.extend_from_slice(x);
-            Some(compress_size_bytes(&buf, method))
-        }
+        NcdVariant::SymVitanyi | NcdVariant::SymCons => Some(compress_size_chain_backend(&[y, x], backend)),
         _ => None,
     };
 
@@ -279,6 +545,14 @@ pub fn ncd_paths(x: &str, y: &str, method: &str, variant: NcdVariant) -> f64 {
         || std::fs::read(y).expect("failed to read y"),
     );
     ncd_bytes(&bx, &by, method, variant)
+}
+
+pub fn ncd_paths_backend(x: &str, y: &str, backend: &NcdBackend, variant: NcdVariant) -> f64 {
+    let (bx, by) = rayon::join(
+        || std::fs::read(x).expect("failed to read x"),
+        || std::fs::read(y).expect("failed to read y"),
+    );
+    ncd_bytes_backend(&bx, &by, backend, variant)
 }
 
 /// Back-compat convenience wrappers (operate on file paths).
@@ -428,8 +702,7 @@ pub fn marginal_entropy_bytes(data: &[u8]) -> f64 {
 ///   A value of -1 means unlimited context (bounded only by memory/sequence length).
 #[inline(always)]
 pub fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
-    let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m.predictive_entropy_rate(data)
+    entropy_rate_backend(data, max_order, &RateBackend::RosaPlus)
 }
 
 /// Compute biased entropy rate Ĥ_biased(X) bits per symbol.
@@ -439,10 +712,7 @@ pub fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
 /// similarity metrics like Mutual Information and NED.
 #[inline(always)]
 pub fn biased_entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
-    let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m.train_example(data);
-    m.build_lm();
-    m.cross_entropy(data)
+    biased_entropy_rate_backend(data, max_order, &RateBackend::RosaPlus)
 }
 
 /// Compute joint marginal entropy H(X,Y) = −Σ p(x,y) log₂ p(x,y) in bits/symbol-pair.
@@ -494,12 +764,7 @@ pub fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     if n == 0 {
         return 0.0;
     }
-
-    let joint_symbols: Vec<u32> = (0..n)
-        .map(|i| (x[i] as u32) * 256 + (y[i] as u32))
-        .collect();
-    let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m.entropy_rate_cps(&joint_symbols)
+    joint_entropy_rate_backend(x, y, max_order, &RateBackend::RosaPlus)
 }
 
 /// Compute conditional entropy rate `Ĥ(X|Y)`.
@@ -796,10 +1061,7 @@ pub fn cross_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 /// Compute cross-entropy rate using ROSA.
 /// Training model on Y and evaluating probability of X.
 pub fn cross_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-    m.train_example(y);
-    m.build_lm();
-    m.cross_entropy(x)
+    cross_entropy_rate_backend(x, y, max_order, &RateBackend::RosaPlus)
 }
 
 /// Kullback-Leibler Divergence D_KL(P || Q) = Σ p(x) log(p(x) / q(x))

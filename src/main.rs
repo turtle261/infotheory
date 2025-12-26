@@ -25,6 +25,63 @@ use std::io::{self, BufRead, Write};
 
 mod search;
 
+fn rwkv7_model_path_from_env() -> String {
+    env::var("RWKV7_MODEL_PATH").unwrap_or_else(|_| {
+        eprintln!("Error: RWKV7_MODEL_PATH env var must be set when using rwkv7 backends");
+        std::process::exit(1);
+    })
+}
+
+fn parse_rate_backend(v: &str) -> Option<&'static str> {
+    match v {
+        "rosaplus" | "rosa" => Some("rosaplus"),
+        "rwkv7" | "rwkv" => Some("rwkv7"),
+        _ => None,
+    }
+}
+
+fn parse_ncd_backend(v: &str) -> Option<&'static str> {
+    match v {
+        "zpaq" => Some("zpaq"),
+        "rwkv7" | "rwkv" => Some("rwkv7"),
+        _ => None,
+    }
+}
+
+fn parse_rwkv7_coder(v: &str) -> Option<rwkvzip::CoderType> {
+    match v {
+        "ac" | "AC" => Some(rwkvzip::CoderType::AC),
+        "rans" | "RANS" | "rANS" => Some(rwkvzip::CoderType::RANS),
+        _ => None,
+    }
+}
+
+fn build_ctx(rate_backend: &str, ncd_backend: &str, method: Option<&str>) -> InfotheoryCtx {
+    let rate_backend = match rate_backend {
+        "rwkv7" => {
+            let p = rwkv7_model_path_from_env();
+            let model = load_rwkv7_model_from_path(&p);
+            RateBackend::Rwkv7 { model }
+        }
+        _ => RateBackend::RosaPlus,
+    };
+
+    let ncd_backend = match ncd_backend {
+        "rwkv7" => {
+            let p = rwkv7_model_path_from_env();
+            let model = load_rwkv7_model_from_path(&p);
+            let coder = method.and_then(parse_rwkv7_coder).unwrap_or(rwkvzip::CoderType::AC);
+            NcdBackend::Rwkv7 { model, coder }
+        }
+        _ => {
+            let m = method.unwrap_or("5").to_string();
+            NcdBackend::Zpaq { method: m }
+        }
+    };
+
+    InfotheoryCtx::new(rate_backend, ncd_backend)
+}
+
 fn read_file(path: &str) -> Vec<u8> {
     match std::fs::read(path) {
         Ok(data) => data,
@@ -515,13 +572,71 @@ fn main() {
             let file2 = &args[3];
             let max_order = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
 
+            let mut rate_backend = "rosaplus";
+            let mut ncd_backend = "zpaq";
+            let mut method: Option<&str> = None;
+            let mut i = 5usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--rate-backend" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --rate-backend requires a value (rwkv7|rosaplus)");
+                            std::process::exit(1);
+                        });
+                        rate_backend = parse_rate_backend(v).unwrap_or_else(|| {
+                            eprintln!("Error: invalid --rate-backend '{}'", v);
+                            std::process::exit(1);
+                        });
+                    }
+                    "--ncd-backend" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --ncd-backend requires a value (rwkv7|zpaq)");
+                            std::process::exit(1);
+                        });
+                        ncd_backend = parse_ncd_backend(v).unwrap_or_else(|| {
+                            eprintln!("Error: invalid --ncd-backend '{}'", v);
+                            std::process::exit(1);
+                        });
+                    }
+                    "--method" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --method requires a value");
+                            std::process::exit(1);
+                        });
+                        method = Some(v.as_str());
+                    }
+                    other => {
+                        eprintln!("Error: unknown flag '{}'", other);
+                        print_usage();
+                        std::process::exit(1);
+                    }
+                }
+                i += 1;
+            }
+
+            let ctx = build_ctx(rate_backend, ncd_backend, method);
+
             match primitive.as_str() {
-                "ned" => println!("{}", ned_paths(file1, file2, max_order)),
-                "nte" => println!("{}", nte_paths(file1, file2, max_order)),
+                "ned" => {
+                    let (bx, by) = rayon::join(|| read_file(file1), || read_file(file2));
+                    println!("{}", ctx.ned_bytes(&bx, &by, max_order))
+                }
+                "nte" => {
+                    let (bx, by) = rayon::join(|| read_file(file1), || read_file(file2));
+                    println!("{}", ctx.nte_bytes(&bx, &by, max_order))
+                }
                 "tvd" => println!("{}", tvd_paths(file1, file2, max_order)),
                 "nhd" => println!("{}", nhd_paths(file1, file2, max_order)),
                 "mi" | "mutual_info" => {
-                    println!("{}", mutual_information_paths(file1, file2, max_order))
+                    let (bx, by) = rayon::join(|| read_file(file1), || read_file(file2));
+                    if max_order == 0 {
+                        println!("{}", mutual_information_bytes(&bx, &by, 0));
+                    } else {
+                        println!("{}", ctx.mutual_information_rate_bytes(&bx, &by, max_order));
+                    }
                 }
                 "ce" | "conditional_entropy" => {
                     println!("{}", conditional_entropy_paths(file1, file2, max_order))
@@ -532,12 +647,11 @@ fn main() {
                 "kl" | "kl_divergence" => println!("{}", kl_divergence_paths(file1, file2)),
                 "js" | "js_divergence" => println!("{}", js_divergence_paths(file1, file2)),
                 "joint_entropy" | "h_xy" => {
-                    let bx = read_file(file1);
-                    let by = read_file(file2);
+                    let (bx, by) = rayon::join(|| read_file(file1), || read_file(file2));
                     if max_order == 0 {
                         println!("{}", joint_marginal_entropy_bytes(&bx, &by));
                     } else {
-                        println!("{}", joint_entropy_rate_bytes(&bx, &by, max_order));
+                        println!("{}", ctx.joint_entropy_rate_bytes(&bx, &by, max_order));
                     }
                 }
                 _ => unreachable!(),
@@ -607,14 +721,49 @@ fn main() {
             }
             let file1 = &args[2];
             let file2 = &args[3];
-            let method = args.get(4).map(|s| s.as_str()).unwrap_or("5");
-            match primitive.as_str() {
-                "ncd" | "ncd_vitanyi" => println!("{}", ncd_vitanyi(file1, file2, method)),
-                "ncd_sym" | "ncd_sym_vitanyi" => {
-                    println!("{}", ncd_sym_vitanyi(file1, file2, method))
+            let mut ncd_backend = "zpaq";
+            let mut method: Option<&str> = args.get(4).map(|s| s.as_str());
+            let mut i = 5usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--ncd-backend" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --ncd-backend requires a value (rwkv7|zpaq)");
+                            std::process::exit(1);
+                        });
+                        ncd_backend = parse_ncd_backend(v).unwrap_or_else(|| {
+                            eprintln!("Error: invalid --ncd-backend '{}'", v);
+                            std::process::exit(1);
+                        });
+                    }
+                    "--method" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --method requires a value");
+                            std::process::exit(1);
+                        });
+                        method = Some(v.as_str());
+                    }
+                    other => {
+                        eprintln!("Error: unknown flag '{}'", other);
+                        print_usage();
+                        std::process::exit(1);
+                    }
                 }
-                "ncd_cons" => println!("{}", ncd_cons(file1, file2, method)),
-                "ncd_sym_cons" => println!("{}", ncd_sym_cons(file1, file2, method)),
+                i += 1;
+            }
+
+            let ctx = build_ctx("rosaplus", ncd_backend, method);
+            match primitive.as_str() {
+                "ncd" | "ncd_vitanyi" => {
+                    println!("{}", ncd_paths_backend(file1, file2, &ctx.ncd_backend, NcdVariant::Vitanyi))
+                }
+                "ncd_sym" | "ncd_sym_vitanyi" => {
+                    println!("{}", ncd_paths_backend(file1, file2, &ctx.ncd_backend, NcdVariant::SymVitanyi))
+                }
+                "ncd_cons" => println!("{}", ncd_paths_backend(file1, file2, &ctx.ncd_backend, NcdVariant::Cons)),
+                "ncd_sym_cons" => println!("{}", ncd_paths_backend(file1, file2, &ctx.ncd_backend, NcdVariant::SymCons)),
                 _ => unreachable!(),
             }
         }
@@ -633,15 +782,10 @@ fn main() {
                 return;
             }
 
-            // Optional flags (keep dependency-free parsing):
-            //   --level snippet|file
-            //   --prior <path>
-            //   --stage2-prior full|off|summarize
-            //   --max-order <i64>
-            //   --top-k <usize>
-            //   --method <zpaq_method>
-            //   --stage0-frac <f64>
             let mut opts = search::SearchOptions::default();
+            let mut rate_backend = "rosaplus";
+            let mut ncd_backend = "zpaq";
+            let mut method: Option<&str> = None;
             let mut i = 4usize;
             while i < args.len() {
                 match args[i].as_str() {
@@ -709,10 +853,10 @@ fn main() {
                     "--method" => {
                         i += 1;
                         let v = args.get(i).unwrap_or_else(|| {
-                            eprintln!("Error: --method requires a value (e.g. '5')");
+                            eprintln!("Error: --method requires a value");
                             std::process::exit(1);
                         });
-                        opts.zpaq_method = v.clone();
+                        method = Some(v.as_str());
                     }
                     "--stage0-frac" => {
                         i += 1;
@@ -725,6 +869,28 @@ fn main() {
                             std::process::exit(1);
                         });
                     }
+                    "--rate-backend" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --rate-backend requires a value (rwkv7|rosaplus)");
+                            std::process::exit(1);
+                        });
+                        rate_backend = parse_rate_backend(v).unwrap_or_else(|| {
+                            eprintln!("Error: invalid --rate-backend '{}'", v);
+                            std::process::exit(1);
+                        });
+                    }
+                    "--ncd-backend" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --ncd-backend requires a value (rwkv7|zpaq)");
+                            std::process::exit(1);
+                        });
+                        ncd_backend = parse_ncd_backend(v).unwrap_or_else(|| {
+                            eprintln!("Error: invalid --ncd-backend '{}'", v);
+                            std::process::exit(1);
+                        });
+                    }
                     other => {
                         eprintln!("Error: unknown search flag '{}'", other);
                         print_usage();
@@ -733,6 +899,8 @@ fn main() {
                 }
                 i += 1;
             }
+
+            opts.ctx = build_ctx(rate_backend, ncd_backend, method);
 
             if opts.stage2_prior_mode == search::Stage2PriorMode::SummarizePrior
                 && opts.universal_prior.is_none()
@@ -754,7 +922,7 @@ fn main() {
 fn print_usage() {
     eprintln!("Usage: infotheory <primitive> <file1> <file2> [method/max_order]");
     eprintln!("       infotheory search <query> <target_path> [--level snippet|file] [--prior <path>] [--stage2-prior full|off|summarize]");
-    eprintln!("                              [--max-order <i64>] [--top-k <n>] [--method <zpaq_method>] [--stage0-frac <f64>]");
+    eprintln!("                              [--max-order <i64>] [--top-k <n>] [--method <method>] [--stage0-frac <f64>]");
     eprintln!();
     eprintln!("=== BATCH JSON MODE (for programmatic use) ===");
     eprintln!("  infotheory batch        Read JSON lines from stdin, write results to stdout");

@@ -1,10 +1,9 @@
-use infotheory::{cross_entropy_bytes, cross_entropy_rate_bytes, entropy_rate_bytes, marginal_entropy_bytes};
+use infotheory::{cross_entropy_bytes, marginal_entropy_bytes, InfotheoryCtx, RateBackend};
 use rayon::prelude::*;
 use rosaplus::RosaPlus;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -81,7 +80,7 @@ pub enum Stage2PriorMode {
     SummarizePrior,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SearchOptions {
     pub granularity: SearchGranularity,
     /// Universal prior corpus path (file or directory). If set:
@@ -92,7 +91,7 @@ pub struct SearchOptions {
     pub max_order: i64,
     pub top_k: usize,
     pub stage0_keep_frac: f64,
-    pub zpaq_method: String,
+    pub ctx: InfotheoryCtx,
 }
 
 impl Default for SearchOptions {
@@ -104,7 +103,7 @@ impl Default for SearchOptions {
             max_order: 8,
             top_k: 50,
             stage0_keep_frac: 0.2,
-            zpaq_method: "5".to_string(),
+            ctx: InfotheoryCtx::with_zpaq("5"),
         }
     }
 }
@@ -206,12 +205,14 @@ fn resolve_query_bytes(query: &str) -> Vec<u8> {
 }
 
 fn stage1_filter_no_prior(query_bytes: &[u8], candidates: Vec<Snippet>, opts: &SearchOptions) -> Vec<Snippet> {
-    let h_q = entropy_rate_bytes(query_bytes, opts.max_order);
+    let h_q = opts.ctx.entropy_rate_bytes(query_bytes, opts.max_order);
 
     let scored: Vec<Snippet> = candidates
         .into_par_iter()
         .map(|mut snippet| {
-            let h_q_x = cross_entropy_rate_bytes(query_bytes, &snippet.content, opts.max_order);
+            let h_q_x = opts
+                .ctx
+                .cross_entropy_rate_bytes(query_bytes, &snippet.content, opts.max_order);
             snippet.score = h_q - h_q_x;
             snippet
         })
@@ -227,6 +228,24 @@ fn stage1_filter_with_universal_prior(
     candidates: Vec<Snippet>,
     opts: &SearchOptions,
 ) -> Vec<Snippet> {
+    if !matches!(opts.ctx.rate_backend, RateBackend::RosaPlus) {
+        let prior_prefix = corpus_bytes(prior_path, SearchGranularity::File);
+        let h_u_q = opts
+            .ctx
+            .cross_entropy_conditional_chain(&[prior_prefix.as_slice()], query_bytes);
+        return candidates
+            .into_par_iter()
+            .map(|mut snippet| {
+                let h_ux_q = opts.ctx.cross_entropy_conditional_chain(
+                    &[prior_prefix.as_slice(), snippet.content.as_slice()],
+                    query_bytes,
+                );
+                snippet.score = h_u_q - h_ux_q;
+                snippet
+            })
+            .collect();
+    }
+
     // PERFORMANCE NOTE:
     // Training the prior using snippet-level windows would duplicate overlapping content
     // and explode runtime. We *always* train/load the prior at file granularity.
@@ -311,45 +330,29 @@ fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &
         (Some(prior_path), Stage2PriorMode::SummarizePrior) => Some(summarize_prior_for_query(query_bytes, prior_path, opts)),
     };
 
-    let method = opts.zpaq_method.as_str();
-
     let cq = if let Some(prefix) = prior_prefix.as_deref() {
-        let r = Cursor::new(prefix)
-            .chain(Cursor::new(query_bytes));
-        zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(0)
+        opts.ctx.compress_size_chain(&[prefix, query_bytes])
     } else {
-        zpaq_rs::compress_size_stream(Cursor::new(query_bytes), method, None, None).unwrap_or(0)
+        opts.ctx.compress_size_chain(&[query_bytes])
     };
 
     top_candidates.par_iter_mut().for_each(|snippet| {
         let cx = if let Some(prefix) = prior_prefix.as_deref() {
-            let r = Cursor::new(prefix)
-                .chain(Cursor::new(snippet.content.as_slice()));
-            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(0)
+            opts.ctx.compress_size_chain(&[prefix, snippet.content.as_slice()])
         } else {
-            zpaq_rs::compress_size_stream(Cursor::new(snippet.content.as_slice()), method, None, None).unwrap_or(0)
+            opts.ctx.compress_size_chain(&[snippet.content.as_slice()])
         };
 
         let c1 = if let Some(prefix) = prior_prefix.as_deref() {
-            let r = Cursor::new(prefix)
-                .chain(Cursor::new(snippet.content.as_slice()))
-                .chain(Cursor::new(query_bytes));
-            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+            opts.ctx.compress_size_chain(&[prefix, snippet.content.as_slice(), query_bytes])
         } else {
-            let r = Cursor::new(snippet.content.as_slice())
-                .chain(Cursor::new(query_bytes));
-            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+            opts.ctx.compress_size_chain(&[snippet.content.as_slice(), query_bytes])
         };
 
         let c2 = if let Some(prefix) = prior_prefix.as_deref() {
-            let r = Cursor::new(prefix)
-                .chain(Cursor::new(query_bytes))
-                .chain(Cursor::new(snippet.content.as_slice()));
-            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+            opts.ctx.compress_size_chain(&[prefix, query_bytes, snippet.content.as_slice()])
         } else {
-            let r = Cursor::new(query_bytes)
-                .chain(Cursor::new(snippet.content.as_slice()));
-            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+            opts.ctx.compress_size_chain(&[query_bytes, snippet.content.as_slice()])
         };
 
         let c_joint = c1.min(c2);
@@ -369,23 +372,14 @@ fn summarize_prior_for_query(query_bytes: &[u8], prior_path: &str, opts: &Search
         return Vec::new();
     }
 
-    let method = opts.zpaq_method.as_str();
-    let cq = zpaq_rs::compress_size_stream(Cursor::new(query_bytes), method, None, None).unwrap_or(0);
+    let cq = opts.ctx.compress_size_chain(&[query_bytes]);
 
     let mut best: Option<(f64, Vec<u8>)> = None;
     for c in candidates {
-        let cx = zpaq_rs::compress_size_stream(Cursor::new(c.content.as_slice()), method, None, None).unwrap_or(0);
+        let cx = opts.ctx.compress_size_chain(&[c.content.as_slice()]);
 
-        let cxq = {
-            let r = Cursor::new(c.content.as_slice())
-                .chain(Cursor::new(query_bytes));
-            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
-        };
-        let cqx = {
-            let r = Cursor::new(query_bytes)
-                .chain(Cursor::new(c.content.as_slice()));
-            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
-        };
+        let cxq = opts.ctx.compress_size_chain(&[c.content.as_slice(), query_bytes]);
+        let cqx = opts.ctx.compress_size_chain(&[query_bytes, c.content.as_slice()]);
         let c_joint = cxq.min(cqx);
         if c_joint == u64::MAX {
             continue;
@@ -397,7 +391,7 @@ fn summarize_prior_for_query(query_bytes: &[u8], prior_path: &str, opts: &Search
         let is_better = match &best {
             None => true,
             Some((best_k, best_bytes)) => {
-                let best_cx = zpaq_rs::compress_size(best_bytes, method).unwrap_or(0) as f64;
+                let best_cx = opts.ctx.compress_size(best_bytes) as f64;
                 (candidate_key.0, candidate_key.1) < (*best_k, best_cx)
             }
         };

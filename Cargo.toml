@@ -11,6 +11,7 @@ resolver = "3"
 [dependencies]
 zpaq_rs = {path = "./zpaq_rs"}
 rosaplus = {path = "./rosa"}
+rwkvzip = {path = "./rwkvzip", default-features = false}
 rayon = "*"
 num_cpus = "*"
 once_cell = "*"
