@@ -1,10 +1,10 @@
-use infotheory::{cross_entropy_rate_bytes, entropy_rate_bytes};
+use infotheory::{cross_entropy_bytes, cross_entropy_rate_bytes, entropy_rate_bytes, marginal_entropy_bytes};
 use rayon::prelude::*;
 use rosaplus::RosaPlus;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -14,6 +14,55 @@ pub struct Snippet {
     pub end_line: usize,
     pub content: Vec<u8>,
     pub score: f64, 
+}
+
+fn stage0_prefilter(
+    query_bytes: &[u8],
+    mut candidates: Vec<Snippet>,
+    opts: &SearchOptions,
+    debug: bool,
+) -> Vec<Snippet> {
+    let n = candidates.len();
+    if n == 0 {
+        return candidates;
+    }
+
+    let frac = opts.stage0_keep_frac.clamp(0.0, 1.0);
+    if frac >= 1.0 {
+        return candidates;
+    }
+
+    // Option A: Unigram (i.i.d.) likelihood-gain proxy.
+    // score0(x) = H0(Q) - H0(Q|X)
+    // where H0(Q|X) is computed as cross-entropy of Q under X's unigram model.
+    let h0_q = marginal_entropy_bytes(query_bytes);
+    candidates.par_iter_mut().for_each(|s| {
+        let h0_q_x = cross_entropy_bytes(query_bytes, &s.content, 0);
+        s.score = h0_q - h0_q_x;
+    });
+
+    let mut keep = ((n as f64) * frac).ceil() as usize;
+    keep = keep.max(opts.top_k).min(n);
+    if keep < n {
+        let nth = keep.saturating_sub(1);
+        candidates.select_nth_unstable_by(nth, |a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(keep);
+    }
+
+    if debug {
+        println!(
+            "Stage-0 prefilter kept {}/{} candidates (frac={:.4})",
+            candidates.len(),
+            n,
+            frac
+        );
+    }
+
+    candidates
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -42,6 +91,7 @@ pub struct SearchOptions {
     pub stage2_prior_mode: Stage2PriorMode,
     pub max_order: i64,
     pub top_k: usize,
+    pub stage0_keep_frac: f64,
     pub zpaq_method: String,
 }
 
@@ -53,6 +103,7 @@ impl Default for SearchOptions {
             stage2_prior_mode: Stage2PriorMode::UsePrior,
             max_order: 8,
             top_k: 50,
+            stage0_keep_frac: 0.2,
             zpaq_method: "5".to_string(),
         }
     }
@@ -85,6 +136,12 @@ pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOpti
         eprintln!("No accessible files found in target '{}'.", target_path);
         return;
     }
+
+    let candidates = stage0_prefilter(query_bytes.as_slice(), candidates, opts, debug);
+    if candidates.is_empty() {
+        eprintln!("No candidates remain after Stage-0 prefilter.");
+        return;
+    }
     if debug {
         println!("Found {} candidates. Filtering...", candidates.len());
     }
@@ -96,14 +153,24 @@ pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOpti
         stage1_filter_no_prior(&query_bytes, candidates, opts)
     };
 
+    let top_k_size = opts.top_k.min(scored_candidates.len());
+    if top_k_size < scored_candidates.len() {
+        let nth = top_k_size.saturating_sub(1);
+        scored_candidates.select_nth_unstable_by(nth, |a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored_candidates.truncate(top_k_size);
+    }
+
     scored_candidates.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let top_k_size = opts.top_k.min(scored_candidates.len());
-    let top_candidates = &mut scored_candidates[0..top_k_size];
+    let top_candidates = &mut scored_candidates[..top_k_size];
     if debug {
         println!("Reranking top {} candidates with Kolmogorov Mutual Information...", top_k_size);
     }
@@ -167,6 +234,8 @@ fn stage1_filter_with_universal_prior(
     // For true conditional updates we require the fixed 256-byte alphabet LM.
     // This ensures symbol indices remain stable across incremental updates.
     base.ensure_lm_built_no_finalize_endpos();
+    // Reduce the cost of cloning `base` per worker.
+    base.shrink_aux_buffers();
 
     // Precompute query codepoints once (cross_entropy() would allocate this per call).
     let query_cps: Vec<u32> = query_bytes.iter().map(|&b| b as u32).collect();
@@ -175,20 +244,63 @@ fn stage1_filter_with_universal_prior(
     // True conditional update:
     // score(x) = H_U(q) - H_{U+x}(q)
     // by applying a reversible candidate update to the *full* prior model.
-    candidates
-        .into_par_iter()
-        .map_init(
-            || base.clone(),
-            |m, mut snippet| {
-                let mut tx = m.begin_tx();
-                m.train_example_tx(&mut tx, &snippet.content);
-                let h_ux_q = m.cross_entropy_cps(&query_cps);
-                m.rollback_tx(tx);
-                snippet.score = h_u_q - h_ux_q;
-                snippet
-            },
-        )
-        .collect()
+    //
+    // MEMORY NOTE:
+    // `map_init(|| base.clone(), ...)` clones the model once per Rayon worker.
+    // For large priors this can blow up RSS. We cap worker count based on an estimate
+    // of model bytes and best-effort available memory (Linux).
+    let model_bytes = base.estimated_size_bytes().max(1);
+    let threads = memory_aware_threads(model_bytes);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("failed to build rayon pool");
+
+    pool.install(|| {
+        candidates
+            .into_par_iter()
+            .map_init(
+                || base.clone(),
+                |m, mut snippet| {
+                    let mut tx = m.begin_tx();
+                    m.train_example_tx(&mut tx, &snippet.content);
+                    let h_ux_q = m.cross_entropy_cps(&query_cps);
+                    m.rollback_tx(tx);
+                    snippet.score = h_u_q - h_ux_q;
+                    snippet
+                },
+            )
+            .collect()
+    })
+}
+
+fn memory_aware_threads(model_bytes: usize) -> usize {
+    let hw = num_cpus::get().max(1);
+    let avail = linux_mem_available_bytes().unwrap_or(0);
+    if avail == 0 {
+        return hw;
+    }
+
+    // Heuristic: allow up to 25% of available memory for (worker clones + overhead).
+    let budget = (avail / 4).max(model_bytes as u64);
+    let max_by_mem = (budget / (model_bytes as u64)).max(1) as usize;
+    hw.min(max_by_mem).max(1)
+}
+
+fn linux_mem_available_bytes() -> Option<u64> {
+    // Linux-only best-effort. If parsing fails, fall back to unconstrained.
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.is_empty() {
+                return None;
+            }
+            let kb: u64 = parts[0].parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
 }
 
 fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &SearchOptions) {
@@ -202,47 +314,44 @@ fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &
     let method = opts.zpaq_method.as_str();
 
     let cq = if let Some(prefix) = prior_prefix.as_deref() {
-        let mut pq = Vec::with_capacity(prefix.len() + query_bytes.len());
-        pq.extend_from_slice(prefix);
-        pq.extend_from_slice(query_bytes);
-        zpaq_rs::compress_size(&pq, method).unwrap_or(0)
+        let r = Cursor::new(prefix)
+            .chain(Cursor::new(query_bytes));
+        zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(0)
     } else {
-        zpaq_rs::compress_size(query_bytes, method).unwrap_or(0)
+        zpaq_rs::compress_size_stream(Cursor::new(query_bytes), method, None, None).unwrap_or(0)
     };
 
     top_candidates.par_iter_mut().for_each(|snippet| {
-        let (cx, joint1, joint2) = if let Some(prefix) = prior_prefix.as_deref() {
-            let mut px = Vec::with_capacity(prefix.len() + snippet.content.len());
-            px.extend_from_slice(prefix);
-            px.extend_from_slice(&snippet.content);
-
-            let mut j1 = Vec::with_capacity(prefix.len() + snippet.content.len() + query_bytes.len());
-            j1.extend_from_slice(prefix);
-            j1.extend_from_slice(&snippet.content);
-            j1.extend_from_slice(query_bytes);
-
-            let mut j2 = Vec::with_capacity(prefix.len() + snippet.content.len() + query_bytes.len());
-            j2.extend_from_slice(prefix);
-            j2.extend_from_slice(query_bytes);
-            j2.extend_from_slice(&snippet.content);
-
-            (zpaq_rs::compress_size(&px, method).unwrap_or(0), j1, j2)
+        let cx = if let Some(prefix) = prior_prefix.as_deref() {
+            let r = Cursor::new(prefix)
+                .chain(Cursor::new(snippet.content.as_slice()));
+            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(0)
         } else {
-            let mut j1 = Vec::with_capacity(snippet.content.len() + query_bytes.len());
-            j1.extend_from_slice(&snippet.content);
-            j1.extend_from_slice(query_bytes);
-
-            let mut j2 = Vec::with_capacity(snippet.content.len() + query_bytes.len());
-            j2.extend_from_slice(query_bytes);
-            j2.extend_from_slice(&snippet.content);
-
-            (zpaq_rs::compress_size(&snippet.content, method).unwrap_or(0), j1, j2)
+            zpaq_rs::compress_size_stream(Cursor::new(snippet.content.as_slice()), method, None, None).unwrap_or(0)
         };
 
-        let (c1, c2) = rayon::join(
-            || zpaq_rs::compress_size(&joint1, method).unwrap_or(u64::MAX),
-            || zpaq_rs::compress_size(&joint2, method).unwrap_or(u64::MAX),
-        );
+        let c1 = if let Some(prefix) = prior_prefix.as_deref() {
+            let r = Cursor::new(prefix)
+                .chain(Cursor::new(snippet.content.as_slice()))
+                .chain(Cursor::new(query_bytes));
+            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+        } else {
+            let r = Cursor::new(snippet.content.as_slice())
+                .chain(Cursor::new(query_bytes));
+            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+        };
+
+        let c2 = if let Some(prefix) = prior_prefix.as_deref() {
+            let r = Cursor::new(prefix)
+                .chain(Cursor::new(query_bytes))
+                .chain(Cursor::new(snippet.content.as_slice()));
+            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+        } else {
+            let r = Cursor::new(query_bytes)
+                .chain(Cursor::new(snippet.content.as_slice()));
+            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+        };
+
         let c_joint = c1.min(c2);
         snippet.score = if c_joint == u64::MAX {
             0.0
@@ -261,23 +370,22 @@ fn summarize_prior_for_query(query_bytes: &[u8], prior_path: &str, opts: &Search
     }
 
     let method = opts.zpaq_method.as_str();
-    let cq = zpaq_rs::compress_size(query_bytes, method).unwrap_or(0);
+    let cq = zpaq_rs::compress_size_stream(Cursor::new(query_bytes), method, None, None).unwrap_or(0);
 
     let mut best: Option<(f64, Vec<u8>)> = None;
     for c in candidates {
-        let cx = zpaq_rs::compress_size(&c.content, method).unwrap_or(0);
+        let cx = zpaq_rs::compress_size_stream(Cursor::new(c.content.as_slice()), method, None, None).unwrap_or(0);
 
-        let mut xq = Vec::with_capacity(c.content.len() + query_bytes.len());
-        xq.extend_from_slice(&c.content);
-        xq.extend_from_slice(query_bytes);
-        let mut qx = Vec::with_capacity(c.content.len() + query_bytes.len());
-        qx.extend_from_slice(query_bytes);
-        qx.extend_from_slice(&c.content);
-
-        let (cxq, cqx) = rayon::join(
-            || zpaq_rs::compress_size(&xq, method).unwrap_or(u64::MAX),
-            || zpaq_rs::compress_size(&qx, method).unwrap_or(u64::MAX),
-        );
+        let cxq = {
+            let r = Cursor::new(c.content.as_slice())
+                .chain(Cursor::new(query_bytes));
+            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+        };
+        let cqx = {
+            let r = Cursor::new(query_bytes)
+                .chain(Cursor::new(c.content.as_slice()));
+            zpaq_rs::compress_size_stream(r, method, None, None).unwrap_or(u64::MAX)
+        };
         let c_joint = cxq.min(cqx);
         if c_joint == u64::MAX {
             continue;
@@ -440,34 +548,53 @@ fn file_to_candidates(path: &Path, granularity: SearchGranularity) -> Vec<Snippe
             }
         }
         SearchGranularity::Snippet => {
-            if let Ok(file) = fs::File::open(path) {
-                let reader = io::BufReader::new(file);
-                let lines: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-
-                if lines.is_empty() {
+            if let Ok(bytes) = fs::read(path) {
+                if bytes.is_empty() {
                     return snippets;
                 }
 
-                let window = 50;
-                let stride = 20;
+                let window = 50usize;
+                let stride = 20usize;
 
-                let mut i = 0;
-                while i < lines.len() {
-                    let end = (i + window).min(lines.len());
-                    let chunk_lines = &lines[i..end];
-                    let content = chunk_lines.join("\n").into_bytes();
+                let mut line_starts: Vec<usize> = Vec::new();
+                line_starts.push(0);
+                for (i, &b) in bytes.iter().enumerate() {
+                    if b == b'\n' {
+                        let next = i + 1;
+                        if next < bytes.len() {
+                            line_starts.push(next);
+                        }
+                    }
+                }
 
-                    if content.len() > 50 {
-                        snippets.push(Snippet {
-                            path: path.to_path_buf(),
-                            start_line: i + 1,
-                            end_line: end,
-                            content,
-                            score: 0.0,
-                        });
+                if line_starts.is_empty() {
+                    return snippets;
+                }
+
+                let mut i = 0usize;
+                while i < line_starts.len() {
+                    let end = (i + window).min(line_starts.len());
+                    let start_b = line_starts[i];
+                    let end_b = if end >= line_starts.len() {
+                        bytes.len()
+                    } else {
+                        line_starts[end]
+                    };
+
+                    if end_b > start_b {
+                        let content = bytes[start_b..end_b].to_vec();
+                        if content.len() > 50 {
+                            snippets.push(Snippet {
+                                path: path.to_path_buf(),
+                                start_line: i + 1,
+                                end_line: end,
+                                content,
+                                score: 0.0,
+                            });
+                        }
                     }
 
-                    if end == lines.len() {
+                    if end == line_starts.len() {
                         break;
                     }
                     i += stride;

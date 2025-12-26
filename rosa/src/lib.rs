@@ -27,17 +27,112 @@ const MAGIC: &[u8] = b"rosa_pb_v4\0";
 // support an optional fixed 256-byte alphabet LM build/update path.
 const BYTE_ALPHA_N: usize = 256;
 
+#[inline(always)]
+fn write_u32_slice_le<W: Write>(w: &mut W, xs: &[u32]) -> std::io::Result<()> {
+    if cfg!(target_endian = "little") {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(xs.as_ptr() as *const u8, xs.len().saturating_mul(4))
+        };
+        w.write_all(bytes)
+    } else {
+        for &x in xs {
+            w.write_all(&x.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn write_i32_slice_le<W: Write>(w: &mut W, xs: &[i32]) -> std::io::Result<()> {
+    if cfg!(target_endian = "little") {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(xs.as_ptr() as *const u8, xs.len().saturating_mul(4))
+        };
+        w.write_all(bytes)
+    } else {
+        for &x in xs {
+            w.write_all(&x.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn write_u64_slice_le<W: Write>(w: &mut W, xs: &[u64]) -> std::io::Result<()> {
+    if cfg!(target_endian = "little") {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(xs.as_ptr() as *const u8, xs.len().saturating_mul(8))
+        };
+        w.write_all(bytes)
+    } else {
+        for &x in xs {
+            w.write_all(&x.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn read_u32_slice_le<R: Read>(r: &mut R, xs: &mut [u32]) -> std::io::Result<()> {
+    if cfg!(target_endian = "little") {
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(xs.as_mut_ptr() as *mut u8, xs.len().saturating_mul(4))
+        };
+        r.read_exact(bytes)
+    } else {
+        let mut b4 = [0u8; 4];
+        for x in xs {
+            r.read_exact(&mut b4)?;
+            *x = u32::from_le_bytes(b4);
+        }
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn read_i32_slice_le<R: Read>(r: &mut R, xs: &mut [i32]) -> std::io::Result<()> {
+    if cfg!(target_endian = "little") {
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(xs.as_mut_ptr() as *mut u8, xs.len().saturating_mul(4))
+        };
+        r.read_exact(bytes)
+    } else {
+        let mut b4 = [0u8; 4];
+        for x in xs {
+            r.read_exact(&mut b4)?;
+            *x = i32::from_le_bytes(b4);
+        }
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn read_u64_slice_le<R: Read>(r: &mut R, xs: &mut [u64]) -> std::io::Result<()> {
+    if cfg!(target_endian = "little") {
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(xs.as_mut_ptr() as *mut u8, xs.len().saturating_mul(8))
+        };
+        r.read_exact(bytes)
+    } else {
+        let mut b8 = [0u8; 8];
+        for x in xs {
+            r.read_exact(&mut b8)?;
+            *x = u64::from_le_bytes(b8);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct SamState {
     link: i32,
     len: i32,
     endpos: i32,
+    head: i32,
 
-    small_n: u8,
     small_ch: [u32; SAM_SMALL_MAX],
     small_to: [i32; SAM_SMALL_MAX],
-
-    head: i32,
+    small_n: u8,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1286,6 +1381,39 @@ impl RosaPlus {
         }
     }
 
+    pub fn estimated_size_bytes(&self) -> usize {
+        use std::mem::size_of;
+
+        let mut n = 0usize;
+
+        n = n.saturating_add(self.sam.st.len().saturating_mul(size_of::<SamState>()));
+        n = n.saturating_add(self.sam.ed.len().saturating_mul(size_of::<SamEdge>()));
+        n = n.saturating_add(self.sam.text.len().saturating_mul(size_of::<u32>()));
+        n = n.saturating_add(self.sam.text_states.len().saturating_mul(size_of::<i32>()));
+        n = n.saturating_add(self.sam.boundary_after.len().saturating_mul(size_of::<u8>()));
+
+        n = n.saturating_add(self.lm.alphabet.len().saturating_mul(size_of::<u32>()));
+        n = n.saturating_add(self.lm.unigram.len().saturating_mul(size_of::<u64>()));
+        n = n.saturating_add(self.lm.ls.len().saturating_mul(size_of::<LmState>()));
+        n = n.saturating_add(self.lm.nodes.len().saturating_mul(size_of::<CountNode>()));
+
+        n = n.saturating_add(self.dist.len().saturating_mul(size_of::<f64>()));
+        n = n.saturating_add(self.scratch.idx.len().saturating_mul(size_of::<u32>()));
+        n = n.saturating_add(self.scratch.logits.len().saturating_mul(size_of::<f64>()));
+        n = n.saturating_add(self.scratch.exps.len().saturating_mul(size_of::<f64>()));
+        n = n.saturating_add(self.rng.buf.len().saturating_mul(size_of::<u8>()));
+
+        n
+    }
+
+    pub fn shrink_aux_buffers(&mut self) {
+        self.dist.shrink_to_fit();
+        self.scratch.idx.shrink_to_fit();
+        self.scratch.logits.shrink_to_fit();
+        self.scratch.exps.shrink_to_fit();
+        self.rng.buf.shrink_to_fit();
+    }
+
     /// Create a new model that shares the same trained SAM state but resets LM-related buffers.
     ///
     /// This is substantially cheaper than cloning the full `RosaPlus` (which includes LM counts,
@@ -1505,25 +1633,23 @@ impl RosaPlus {
             return 0.0;
         }
 
-        let cps: Vec<u32> = data.iter().map(|&b| b as u32).collect();
-
-        self.sam = Sam::new(cps.len());
+        self.sam = Sam::new(data.len());
         self.lm_built = false;
 
         let num_chunks = 16;
-        let chunk_size = (cps.len() + num_chunks - 1) / num_chunks;
+        let chunk_size = (data.len() + num_chunks - 1) / num_chunks;
 
         let mut total_log_prob = 0.0f64;
         let mut count = 0usize;
 
         for i in 0..num_chunks {
             let start = i * chunk_size;
-            let end = ((i + 1) * chunk_size).min(cps.len());
+            let end = ((i + 1) * chunk_size).min(data.len());
             if start >= end {
                 break;
             }
 
-            let chunk = &cps[start..end];
+            let chunk = &data[start..end];
 
             if i > 0 {
                 self.build_lm();
@@ -1531,7 +1657,8 @@ impl RosaPlus {
                 // text_states[start] is the state reached after feeding symbols 0..start-1.
                 let mut v = self.sam.text_states[start];
 
-                for &ch in chunk {
+                for &b in chunk {
+                    let ch = b as u32;
                     let sym_idx = self.lm.find_sym(ch);
                     let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
                     total_log_prob += p.log2();
@@ -1543,21 +1670,20 @@ impl RosaPlus {
             }
 
             // Incremental training (adds to self.sam.text and updates structure)
-            for &ch in chunk {
-                self.sam.feed(ch);
+            for &b in chunk {
+                self.sam.feed(b as u32);
             }
         }
 
         if count == 0 {
             // Fallback if data is too small for chunking
             self.build_lm();
-            self.entropy_rate_plugin_cps(&cps)
+            self.entropy_rate_plugin_bytes(data)
         } else {
             -total_log_prob / (count as f64)
         }
     }
 
-    /// Optimized entry point for already-decoded codepoints (used for joint entropy).
     pub fn entropy_rate_cps(&mut self, cps: &[u32]) -> f64 {
         if cps.len() < 2 {
             return 0.0;
@@ -1602,12 +1728,39 @@ impl RosaPlus {
         }
     }
 
+    fn entropy_rate_plugin_bytes(&mut self, data: &[u8]) -> f64 {
+        let mut v = 0i32;
+        let mut total_log_prob = 0.0f64;
+        let mut count = 0usize;
+        for t in 0..(data.len() - 1) {
+            v = self.sam.advance(v, data[t] as u32);
+            let next_ch = data[t + 1] as u32;
+            let sym_idx = self.lm.find_sym(next_ch);
+            let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
+            total_log_prob += p.log2();
+            count += 1;
+        }
+        if count == 0 {
+            0.0
+        } else {
+            -total_log_prob / (count as f64)
+        }
+    }
+
     pub fn cross_entropy(&self, data: &[u8]) -> f64 {
-        if !self.lm_built {
+        if !self.lm_built || data.is_empty() {
             return 0.0;
         }
-        let cps: Vec<u32> = data.iter().map(|&b| b as u32).collect();
-        self.cross_entropy_cps(&cps)
+        let mut total_log_prob = 0.0f64;
+        let mut v = 0i32;
+        for &b in data {
+            let ch = b as u32;
+            let sym_idx = self.lm.find_sym(ch);
+            let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
+            total_log_prob += p.log2();
+            v = self.sam.advance(v, ch);
+        }
+        -total_log_prob / (data.len() as f64)
     }
 
     pub fn cross_entropy_cps(&self, data: &[u32]) -> f64 {
@@ -1697,7 +1850,7 @@ impl RosaPlus {
                 "SAM text_states mismatch (expected text.len()+1)",
             ));
         }
-        let mut f = BufWriter::new(File::create(path)?);
+        let mut f = BufWriter::with_capacity(1024 * 1024, File::create(path)?);
         f.write_all(MAGIC)?;
         f.write_all(&self.max_order.to_le_bytes())?;
         f.write_all(&(self.use_eot as i32).to_le_bytes())?;
@@ -1724,28 +1877,20 @@ impl RosaPlus {
             f.write_all(&e.to.to_le_bytes())?;
             f.write_all(&e.next.to_le_bytes())?;
         }
-        for &t in &self.sam.text {
-            f.write_all(&t.to_le_bytes())?;
-        }
+        write_u32_slice_le(&mut f, &self.sam.text)?;
         f.write_all(&self.sam.boundary_after)?;
 
         // Persist SAM cursor + prefix trace.
         f.write_all(&self.sam.last.to_le_bytes())?;
         f.write_all(&(self.sam.text_states.len() as u32).to_le_bytes())?;
-        for &ts in &self.sam.text_states {
-            f.write_all(&ts.to_le_bytes())?;
-        }
+        write_i32_slice_le(&mut f, &self.sam.text_states)?;
 
         // LM
         f.write_all(&self.lm.alpha_n.to_le_bytes())?;
         f.write_all(&self.lm.total_uni.to_le_bytes())?;
         f.write_all(&(self.lm.nodes.len() as u32).to_le_bytes())?;
-        for &a in &self.lm.alphabet {
-            f.write_all(&a.to_le_bytes())?;
-        }
-        for &u in &self.lm.unigram {
-            f.write_all(&u.to_le_bytes())?;
-        }
+        write_u32_slice_le(&mut f, &self.lm.alphabet)?;
+        write_u64_slice_le(&mut f, &self.lm.unigram)?;
         for ls in &self.lm.ls {
             f.write_all(&ls.head.to_le_bytes())?;
             f.write_all(&ls.total_n.to_le_bytes())?;
@@ -1761,7 +1906,7 @@ impl RosaPlus {
     }
 
     pub fn load(path: &str) -> std::io::Result<Self> {
-        let mut f = BufReader::new(File::open(path)?);
+        let mut f = BufReader::with_capacity(1024 * 1024, File::open(path)?);
         let mut magic = vec![0u8; MAGIC.len()];
         f.read_exact(&mut magic)?;
         if magic != MAGIC {
@@ -1832,10 +1977,7 @@ impl RosaPlus {
             f.read_exact(&mut b4)?;
             m.sam.ed[i].next = i32::from_le_bytes(b4);
         }
-        for i in 0..text_n {
-            f.read_exact(&mut b4)?;
-            m.sam.text[i] = u32::from_le_bytes(b4);
-        }
+        read_u32_slice_le(&mut f, &mut m.sam.text)?;
         f.read_exact(&mut m.sam.boundary_after)?;
 
         // SAM cursor + prefix trace.
@@ -1850,16 +1992,14 @@ impl RosaPlus {
             ));
         }
         m.sam.text_states.resize(text_states_n, 0);
-        for i in 0..text_states_n {
-            f.read_exact(&mut b4)?;
-            let v = i32::from_le_bytes(b4);
+        read_i32_slice_le(&mut f, &mut m.sam.text_states)?;
+        for &v in &m.sam.text_states {
             if v < 0 || (v as usize) >= st_n {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "bad text_states entry",
                 ));
             }
-            m.sam.text_states[i] = v;
         }
         if m.sam.last < 0 || (m.sam.last as usize) >= st_n {
             return Err(std::io::Error::new(
@@ -1891,14 +2031,8 @@ impl RosaPlus {
         ];
         m.lm.nodes.resize(nodes_n, CountNode::default());
 
-        for i in 0..alpha_n {
-            f.read_exact(&mut b4)?;
-            m.lm.alphabet[i] = u32::from_le_bytes(b4);
-        }
-        for i in 0..alpha_n {
-            f.read_exact(&mut b8)?;
-            m.lm.unigram[i] = u64::from_le_bytes(b8);
-        }
+        read_u32_slice_le(&mut f, &mut m.lm.alphabet)?;
+        read_u64_slice_le(&mut f, &mut m.lm.unigram)?;
         for i in 0..st_n {
             f.read_exact(&mut b4)?;
             m.lm.ls[i].head = i32::from_le_bytes(b4);

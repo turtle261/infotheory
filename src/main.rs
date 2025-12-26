@@ -640,6 +640,7 @@ fn main() {
             //   --max-order <i64>
             //   --top-k <usize>
             //   --method <zpaq_method>
+            //   --stage0-frac <f64>
             let mut opts = search::SearchOptions::default();
             let mut i = 4usize;
             while i < args.len() {
@@ -713,8 +714,20 @@ fn main() {
                         });
                         opts.zpaq_method = v.clone();
                     }
+                    "--stage0-frac" => {
+                        i += 1;
+                        let v = args.get(i).unwrap_or_else(|| {
+                            eprintln!("Error: --stage0-frac requires a float in [0,1]");
+                            std::process::exit(1);
+                        });
+                        opts.stage0_keep_frac = v.parse().unwrap_or_else(|_| {
+                            eprintln!("Error: invalid --stage0-frac '{}'", v);
+                            std::process::exit(1);
+                        });
+                    }
                     other => {
                         eprintln!("Error: unknown search flag '{}'", other);
+                        print_usage();
                         std::process::exit(1);
                     }
                 }
@@ -741,7 +754,7 @@ fn main() {
 fn print_usage() {
     eprintln!("Usage: infotheory <primitive> <file1> <file2> [method/max_order]");
     eprintln!("       infotheory search <query> <target_path> [--level snippet|file] [--prior <path>] [--stage2-prior full|off|summarize]");
-    eprintln!("                              [--max-order <i64>] [--top-k <n>] [--method <zpaq_method>]");
+    eprintln!("                              [--max-order <i64>] [--top-k <n>] [--method <zpaq_method>] [--stage0-frac <f64>]");
     eprintln!();
     eprintln!("=== BATCH JSON MODE (for programmatic use) ===");
     eprintln!("  infotheory batch        Read JSON lines from stdin, write results to stdout");
