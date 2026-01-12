@@ -20,8 +20,12 @@
 //! See `print_usage` for details on supported primitives.
 
 use infotheory::*;
+use infotheory::aixi::agent::{Agent, AgentConfig};
+use infotheory::aixi::environment::{Environment, CoinFlip, CtwTest, ExtendedTiger, TicTacToe, BiasedRockPaperScissor, KuhnPoker};
 use std::env;
 use std::io::{self, BufRead, Write};
+use std::fs::File;
+use std::io::Read;
 
 mod search;
 
@@ -525,6 +529,71 @@ fn run_batch_mode() {
     }
 }
 
+/// Run AIXI agent mode
+fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
+    let mut file = File::open(config_path).map_err(|e| anyhow::anyhow!("Failed to open config '{}': {}", config_path, e))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    
+    let v: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse JSON in '{}': {}", config_path, e))?;
+    
+    let config = AgentConfig {
+        algorithm: v["algorithm"].as_str().unwrap_or("ctw").to_string(),
+        ct_depth: v["ct_depth"].as_u64().unwrap_or(20) as usize,
+        agent_horizon: v["agent_horizon"].as_u64().unwrap_or(3) as usize,
+        observation_bits: v["observation_bits"].as_u64().unwrap_or(1) as usize,
+        reward_bits: v["reward_bits"].as_u64().unwrap_or(1) as usize,
+        agent_actions: v["agent_actions"].as_u64().unwrap_or(2) as usize,
+        num_simulations: v["num_simulations"].as_u64().unwrap_or(50) as usize,
+        exploration_exploitation_ratio: v["exploration_exploitation_ratio"].as_f64().unwrap_or(1.4),
+        rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
+        rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
+    };
+    
+    let env_name = v["environment"].as_str().unwrap_or("coin-flip");
+    
+    let mut env: Box<dyn Environment> = match env_name {
+        "coin-flip" => Box::new(CoinFlip::new(0.9)), // Default p=0.9
+        "ctw-test" | "ctwtest" => Box::new(CtwTest::new()),
+        "extended-tiger" => Box::new(ExtendedTiger::new()),
+        "tictactoe" => Box::new(TicTacToe::new()),
+        "biased-rock-paper-scissor" => Box::new(BiasedRockPaperScissor::new()),
+        "kuhn-poker" => Box::new(KuhnPoker::new()),
+        _ => return Err(anyhow::anyhow!("Unknown environment: {}", env_name)),
+    };
+    
+    let mut agent = Agent::new(config);
+    println!("Agent initialized with {} algorithm for {} environment.", v["algorithm"].as_str().unwrap_or("ctw"), env_name);
+    
+    let cycles = v["terminate-lifetime"].as_u64().unwrap_or(20) as usize;
+    let mut total_reward = 0;
+    let mut prev_action = 0;
+    
+    // Initial percept
+    let mut obs = env.get_observation();
+    let mut rew = env.get_reward();
+    
+    for t in 0..cycles {
+        println!("Cycle {}: Obs={}, Rew={}", t, obs, rew);
+        agent.model_update_percept(obs, rew);
+        total_reward += rew;
+        
+        let action = agent.get_planned_action(obs, rew, prev_action);
+        println!("Cycle {}: Planned Action={}", t, action);
+        
+        agent.model_update_action_external(action);
+        
+        env.perform_action(action);
+        obs = env.get_observation();
+        rew = env.get_reward();
+        prev_action = action;
+    }
+    
+    println!("Total Reward: {}", total_reward);
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -912,6 +981,17 @@ fn main() {
             search::run_search_with_options(query, target, &opts);
         }
 
+        "aixi" => {
+            if args.len() < 3 {
+                eprintln!("Error: 'aixi' requires a config.json path.");
+                std::process::exit(1);
+            }
+            if let Err(e) = run_aixi_mode(&args[2]) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+
         _ => {
             eprintln!("Unknown primitive: {}", primitive);
             print_usage();
@@ -921,6 +1001,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!("Usage: infotheory <primitive> <file1> <file2> [method/max_order]");
+    eprintln!("       infotheory aixi <config.json>");
     eprintln!("       infotheory search <query> <target_path> [--level snippet|file] [--prior <path>] [--stage2-prior full|off|summarize]");
     eprintln!("                              [--max-order <i64>] [--top-k <n>] [--method <method>] [--stage0-frac <f64>]");
     eprintln!();

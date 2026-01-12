@@ -2072,6 +2072,16 @@ impl RosaPlus {
         m.dist.resize(alpha_n, 0.0);
         Ok(m)
     }
+
+    pub fn prob_for_last(&mut self, sym: u32) -> f64 {
+        if !self.lm_built {
+            self.build_lm();
+        }
+        let v = self.sam.last;
+        let sym_idx = self.lm.find_sym(sym);
+        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        self.lm.prob_for_sym(&self.sam, mo, v, sym_idx)
+    }
 }
 
 #[cfg(test)]

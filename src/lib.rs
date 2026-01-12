@@ -70,6 +70,10 @@
 //! let mi_rate = mutual_information_bytes(x, y, 8);
 //! ```
 
+
+pub mod aixi;
+pub mod ctw;
+
 use rayon::prelude::*;
 
 use std::sync::OnceLock;
@@ -83,11 +87,14 @@ thread_local! {
     static RWKV_TLS: RefCell<HashMap<usize, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
 }
 
+
 fn mutual_information_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     if x.is_empty() {
         return 0.0;
     }
+    // For CTW, we might want a special aligned implementation?
+    // Using standard formula for now.
     let h_x = entropy_rate_backend(x, max_order, backend);
     let h_y = entropy_rate_backend(y, max_order, backend);
     let h_xy = joint_entropy_rate_backend(x, y, max_order, backend);
@@ -132,6 +139,7 @@ fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -
 pub enum RateBackend {
     RosaPlus,
     Rwkv7 { model: Arc<rwkvzip::Model> },
+    Ctw { depth: usize },
 }
 
 #[derive(Clone)]
@@ -200,6 +208,7 @@ impl InfotheoryCtx {
             RateBackend::Rwkv7 { model } => {
                 with_rwkv_tls(model, |c| c.cross_entropy_conditional_chain(prefix_parts, data).unwrap_or(0.0))
             }
+            RateBackend::Ctw { .. } => 0.0, // TODO: Implement chain for CTW
         }
     }
 
@@ -318,6 +327,19 @@ fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f
             m.predictive_entropy_rate(data)
         }
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0)),
+        RateBackend::Ctw { depth } => {
+            let mut tree = crate::ctw::ContextTree::new(*depth);
+            for &b in data {
+                for i in (0..8).rev() {
+                   tree.update(((b >> i) & 1) == 1);
+                }
+            }
+            // Log block prob (ln)
+            let ln_p = tree.get_log_block_probability();
+            // bits = -log2(P) = -ln(P) / ln(2)
+            let bits = -ln_p / std::f64::consts::LN_2;
+            bits / (data.len() as f64) // bits per byte
+        }
     }
 }
 
@@ -330,6 +352,7 @@ fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBacken
             m.cross_entropy(data)
         }
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0)),
+        RateBackend::Ctw { .. } => entropy_rate_backend(data, max_order, backend), // CTW is online, so biased=prequential
     }
 }
 
@@ -343,6 +366,25 @@ fn cross_entropy_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &Rate
         }
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| c.cross_entropy_conditional(y, x).unwrap_or(0.0))
+        }
+        RateBackend::Ctw { depth } => {
+             let mut tree = crate::ctw::ContextTree::new(*depth);
+             // Train on y
+             for &b in y {
+                for i in (0..8).rev() { tree.update(((b >> i) & 1) == 1); }
+             }
+             let log_p_y = tree.get_log_block_probability();
+             // Train on x
+             for &b in x {
+                for i in (0..8).rev() { tree.update(((b >> i) & 1) == 1); }
+             }
+             let log_p_yx = tree.get_log_block_probability();
+             
+             // Cross entropy?
+             // -log P(x|y) = -(log P(y,x) - log P(y))
+             let log_p_x_given_y = log_p_yx - log_p_y;
+             let bits = -log_p_x_given_y / std::f64::consts::LN_2;
+             bits / (x.len() as f64)
         }
     }
 }
@@ -358,6 +400,25 @@ fn joint_entropy_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &Rate
         }
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0))
+        }
+        RateBackend::Ctw { depth } => {
+             // Interleaved? Or pair symbols?
+             // CTW is binary. Aligned pair = 16 bits? or 2 bits?
+             // x[i] (8 bits), y[i] (8 bits).
+             // Interleaving bits: x_0, y_0, x_1, y_1...
+             // This is good for joint entropy.
+             let mut tree = crate::ctw::ContextTree::new(*depth);
+             for k in 0..x.len() {
+                 let bx = x[k];
+                 let by = y[k];
+                 for i in (0..8).rev() {
+                    tree.update(((bx >> i) & 1) == 1);
+                    tree.update(((by >> i) & 1) == 1);
+                 }
+             }
+             let ln_p = tree.get_log_block_probability();
+             let bits = -ln_p / std::f64::consts::LN_2;
+             bits / (x.len() as f64) // bits per pair
         }
     }
 }
