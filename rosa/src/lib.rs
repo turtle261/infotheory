@@ -477,7 +477,14 @@ impl Sam {
     }
 
     #[inline(always)]
-    fn replace_edge_to_tx(&mut self, tx: &mut SamTx, v: i32, ch: u32, old_to: i32, new_to: i32) -> bool {
+    fn replace_edge_to_tx(
+        &mut self,
+        tx: &mut SamTx,
+        v: i32,
+        ch: u32,
+        old_to: i32,
+        new_to: i32,
+    ) -> bool {
         // small edges
         {
             let st = &self.st[v as usize];
@@ -1193,7 +1200,11 @@ impl RosaPlus {
     pub fn build_lm_no_finalize_endpos(&mut self) {
         self.lm = LM::default();
         self.lm.build_alphabet(&self.sam);
-        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        let mo = if self.max_order < 0 {
+            -1
+        } else {
+            self.max_order
+        };
         self.lm.build_counts(&self.sam, mo);
         self.lm_built = true;
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
@@ -1228,7 +1239,11 @@ impl RosaPlus {
         }
 
         // Counts
-        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        let mo = if self.max_order < 0 {
+            -1
+        } else {
+            self.max_order
+        };
         self.lm.build_counts(&self.sam, mo);
         self.lm_built = true;
         self.dist.resize(BYTE_ALPHA_N, 0.0);
@@ -1305,7 +1320,11 @@ impl RosaPlus {
         let seg_end = self.sam.text.len();
         tx.seg_len = seg_end - seg_start;
         if tx.seg_len >= 2 {
-            let mo = if self.max_order < 0 { -1 } else { self.max_order };
+            let mo = if self.max_order < 0 {
+                -1
+            } else {
+                self.max_order
+            };
             for i in seg_start..(seg_end - 1) {
                 // ctx state after consuming sam.text[i] within its segment
                 let mut ctx = self.sam.text_states[i + 1];
@@ -1390,7 +1409,12 @@ impl RosaPlus {
         n = n.saturating_add(self.sam.ed.len().saturating_mul(size_of::<SamEdge>()));
         n = n.saturating_add(self.sam.text.len().saturating_mul(size_of::<u32>()));
         n = n.saturating_add(self.sam.text_states.len().saturating_mul(size_of::<i32>()));
-        n = n.saturating_add(self.sam.boundary_after.len().saturating_mul(size_of::<u8>()));
+        n = n.saturating_add(
+            self.sam
+                .boundary_after
+                .len()
+                .saturating_mul(size_of::<u8>()),
+        );
 
         n = n.saturating_add(self.lm.alphabet.len().saturating_mul(size_of::<u32>()));
         n = n.saturating_add(self.lm.unigram.len().saturating_mul(size_of::<u64>()));
@@ -2079,7 +2103,11 @@ impl RosaPlus {
         }
         let v = self.sam.last;
         let sym_idx = self.lm.find_sym(sym);
-        let mo = if self.max_order < 0 { -1 } else { self.max_order };
+        let mo = if self.max_order < 0 {
+            -1
+        } else {
+            self.max_order
+        };
         self.lm.prob_for_sym(&self.sam, mo, v, sym_idx)
     }
 }

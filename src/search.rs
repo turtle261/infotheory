@@ -1,4 +1,4 @@
-use infotheory::{cross_entropy_bytes, marginal_entropy_bytes, InfotheoryCtx, RateBackend};
+use infotheory::{InfotheoryCtx, RateBackend, cross_entropy_bytes, marginal_entropy_bytes};
 use rayon::prelude::*;
 use rosaplus::RosaPlus;
 use std::collections::hash_map::DefaultHasher;
@@ -12,7 +12,7 @@ pub struct Snippet {
     pub start_line: usize,
     pub end_line: usize,
     pub content: Vec<u8>,
-    pub score: f64, 
+    pub score: f64,
 }
 
 fn stage0_prefilter(
@@ -171,7 +171,10 @@ pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOpti
 
     let top_candidates = &mut scored_candidates[..top_k_size];
     if debug {
-        println!("Reranking top {} candidates with Kolmogorov Mutual Information...", top_k_size);
+        println!(
+            "Reranking top {} candidates with Kolmogorov Mutual Information...",
+            top_k_size
+        );
     }
 
     // Stage 2: Rerank
@@ -184,7 +187,12 @@ pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOpti
 
     for (i, snippet) in top_candidates.iter().take(5).enumerate() {
         if debug {
-            println!("Rank {}: Score={:.6}, Path={}", i + 1, snippet.score, snippet.path.display());
+            println!(
+                "Rank {}: Score={:.6}, Path={}",
+                i + 1,
+                snippet.score,
+                snippet.path.display()
+            );
         }
         println!(
             "sed -n '{},{}p' {}",
@@ -204,15 +212,19 @@ fn resolve_query_bytes(query: &str) -> Vec<u8> {
     }
 }
 
-fn stage1_filter_no_prior(query_bytes: &[u8], candidates: Vec<Snippet>, opts: &SearchOptions) -> Vec<Snippet> {
+fn stage1_filter_no_prior(
+    query_bytes: &[u8],
+    candidates: Vec<Snippet>,
+    opts: &SearchOptions,
+) -> Vec<Snippet> {
     let h_q = opts.ctx.entropy_rate_bytes(query_bytes, opts.max_order);
 
     let scored: Vec<Snippet> = candidates
         .into_par_iter()
         .map(|mut snippet| {
-            let h_q_x = opts
-                .ctx
-                .cross_entropy_rate_bytes(query_bytes, &snippet.content, opts.max_order);
+            let h_q_x =
+                opts.ctx
+                    .cross_entropy_rate_bytes(query_bytes, &snippet.content, opts.max_order);
             snippet.score = h_q - h_q_x;
             snippet
         })
@@ -323,12 +335,17 @@ fn linux_mem_available_bytes() -> Option<u64> {
 }
 
 fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &SearchOptions) {
-    let prior_prefix: Option<Vec<u8>> = match (opts.universal_prior.as_deref(), opts.stage2_prior_mode) {
-        (None, _) => None,
-        (Some(_), Stage2PriorMode::NoPrior) => None,
-        (Some(prior_path), Stage2PriorMode::UsePrior) => Some(corpus_bytes(prior_path, SearchGranularity::File)),
-        (Some(prior_path), Stage2PriorMode::SummarizePrior) => Some(summarize_prior_for_query(query_bytes, prior_path, opts)),
-    };
+    let prior_prefix: Option<Vec<u8>> =
+        match (opts.universal_prior.as_deref(), opts.stage2_prior_mode) {
+            (None, _) => None,
+            (Some(_), Stage2PriorMode::NoPrior) => None,
+            (Some(prior_path), Stage2PriorMode::UsePrior) => {
+                Some(corpus_bytes(prior_path, SearchGranularity::File))
+            }
+            (Some(prior_path), Stage2PriorMode::SummarizePrior) => {
+                Some(summarize_prior_for_query(query_bytes, prior_path, opts))
+            }
+        };
 
     let cq = if let Some(prefix) = prior_prefix.as_deref() {
         opts.ctx.compress_size_chain(&[prefix, query_bytes])
@@ -338,21 +355,26 @@ fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &
 
     top_candidates.par_iter_mut().for_each(|snippet| {
         let cx = if let Some(prefix) = prior_prefix.as_deref() {
-            opts.ctx.compress_size_chain(&[prefix, snippet.content.as_slice()])
+            opts.ctx
+                .compress_size_chain(&[prefix, snippet.content.as_slice()])
         } else {
             opts.ctx.compress_size_chain(&[snippet.content.as_slice()])
         };
 
         let c1 = if let Some(prefix) = prior_prefix.as_deref() {
-            opts.ctx.compress_size_chain(&[prefix, snippet.content.as_slice(), query_bytes])
+            opts.ctx
+                .compress_size_chain(&[prefix, snippet.content.as_slice(), query_bytes])
         } else {
-            opts.ctx.compress_size_chain(&[snippet.content.as_slice(), query_bytes])
+            opts.ctx
+                .compress_size_chain(&[snippet.content.as_slice(), query_bytes])
         };
 
         let c2 = if let Some(prefix) = prior_prefix.as_deref() {
-            opts.ctx.compress_size_chain(&[prefix, query_bytes, snippet.content.as_slice()])
+            opts.ctx
+                .compress_size_chain(&[prefix, query_bytes, snippet.content.as_slice()])
         } else {
-            opts.ctx.compress_size_chain(&[query_bytes, snippet.content.as_slice()])
+            opts.ctx
+                .compress_size_chain(&[query_bytes, snippet.content.as_slice()])
         };
 
         let c_joint = c1.min(c2);
@@ -364,7 +386,11 @@ fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &
     });
 }
 
-fn summarize_prior_for_query(query_bytes: &[u8], prior_path: &str, opts: &SearchOptions) -> Vec<u8> {
+fn summarize_prior_for_query(
+    query_bytes: &[u8],
+    prior_path: &str,
+    opts: &SearchOptions,
+) -> Vec<u8> {
     // Prior-less search inside the prior corpus itself.
     // We approximate K(q|x) via conditional compression: min(C(xq),C(qx)) - C(x), and select the MIN.
     let candidates = collect_candidates(prior_path, opts.granularity);
@@ -378,8 +404,12 @@ fn summarize_prior_for_query(query_bytes: &[u8], prior_path: &str, opts: &Search
     for c in candidates {
         let cx = opts.ctx.compress_size_chain(&[c.content.as_slice()]);
 
-        let cxq = opts.ctx.compress_size_chain(&[c.content.as_slice(), query_bytes]);
-        let cqx = opts.ctx.compress_size_chain(&[query_bytes, c.content.as_slice()]);
+        let cxq = opts
+            .ctx
+            .compress_size_chain(&[c.content.as_slice(), query_bytes]);
+        let cqx = opts
+            .ctx
+            .compress_size_chain(&[query_bytes, c.content.as_slice()]);
         let c_joint = cxq.min(cqx);
         if c_joint == u64::MAX {
             continue;
@@ -481,7 +511,7 @@ fn corpus_bytes(corpus_path: &str, granularity: SearchGranularity) -> Vec<u8> {
 fn collect_candidates(target: &str, granularity: SearchGranularity) -> Vec<Snippet> {
     let mut snippets = Vec::new();
     let path = Path::new(target);
-    
+
     if path.exists() {
         if path.is_file() {
             snippets.extend(file_to_candidates(path, granularity));
@@ -489,7 +519,7 @@ fn collect_candidates(target: &str, granularity: SearchGranularity) -> Vec<Snipp
             visit_dirs(path, &mut snippets, granularity);
         }
     }
-    
+
     snippets
 }
 
@@ -516,11 +546,14 @@ fn visit_dirs(dir: &Path, snippets: &mut Vec<Snippet>, granularity: SearchGranul
 
 fn file_to_candidates(path: &Path, granularity: SearchGranularity) -> Vec<Snippet> {
     let mut snippets = Vec::new();
-    
+
     // Only process text files
     if let Some(ext) = path.extension() {
         let ext_str = ext.to_string_lossy();
-        if matches!(ext_str.as_ref(), "o" | "a" | "so" | "dll" | "exe" | "bin" | "png" | "jpg" | "zip" | "gz") {
+        if matches!(
+            ext_str.as_ref(),
+            "o" | "a" | "so" | "dll" | "exe" | "bin" | "png" | "jpg" | "zip" | "gz"
+        ) {
             return snippets;
         }
     }

@@ -1,13 +1,13 @@
 //! Standard benchmark environments for AIXI.
 //!
-//! This module provides a set of environments for testing and evaluating 
-//! AIXI agents. Each environment implements the `Environment` trait, 
+//! This module provides a set of environments for testing and evaluating
+//! AIXI agents. Each environment implements the `Environment` trait,
 //! providing a consistent interface for interaction.
 
-use crate::aixi::common::{Action, PerceptVal, Reward, RandomGenerator};
+use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 
 /// Interface for an agent's environment.
-/// 
+///
 /// An environment consumes actions from the agent and produces percepts
 /// (observations and rewards) in response.
 pub trait Environment {
@@ -22,7 +22,7 @@ pub trait Environment {
 
     /// Returns true if the environment has reached a terminal state.
     fn is_finished(&self) -> bool;
-    
+
     /// Returns the number of bits used to encode observations in this environment.
     fn get_observation_bits(&self) -> usize;
 
@@ -31,7 +31,7 @@ pub trait Environment {
 
     /// Returns the number of bits required to represent all possible actions.
     fn get_action_bits(&self) -> usize;
-    
+
     /// Returns the total number of valid actions available.
     fn get_num_actions(&self) -> usize {
         1 << self.get_action_bits()
@@ -41,7 +41,7 @@ pub trait Environment {
     fn max_reward(&self) -> Reward {
         (1 << self.get_reward_bits()) - 1
     }
-    
+
     /// Returns the minimum possible reward value in this environment.
     fn min_reward(&self) -> Reward {
         0
@@ -49,8 +49,8 @@ pub trait Environment {
 }
 
 /// A simple biased coin flip environment.
-/// 
-/// The agent predicts the outcome of a coin flip. Correct predictions 
+///
+/// The agent predicts the outcome of a coin flip. Correct predictions
 /// result in a reward of 1, otherwise 0.
 pub struct CoinFlip {
     /// Probability of the coin landing heads (1).
@@ -76,7 +76,7 @@ impl CoinFlip {
         env.gen_next();
         env
     }
-    
+
     fn gen_next(&mut self) {
         self.obs = if self.rng.gen_bool(self.p) { 1 } else { 0 };
     }
@@ -87,18 +87,30 @@ impl Environment for CoinFlip {
         self.gen_next();
         self.rew = if action == self.obs { 1 } else { 0 };
     }
-    
-    fn get_observation(&self) -> PerceptVal { self.obs }
-    fn get_reward(&self) -> Reward { self.rew }
-    fn is_finished(&self) -> bool { false }
-    
-    fn get_observation_bits(&self) -> usize { 1 }
-    fn get_reward_bits(&self) -> usize { 1 }
-    fn get_action_bits(&self) -> usize { 1 }
+
+    fn get_observation(&self) -> PerceptVal {
+        self.obs
+    }
+    fn get_reward(&self) -> Reward {
+        self.rew
+    }
+    fn is_finished(&self) -> bool {
+        false
+    }
+
+    fn get_observation_bits(&self) -> usize {
+        1
+    }
+    fn get_reward_bits(&self) -> usize {
+        1
+    }
+    fn get_action_bits(&self) -> usize {
+        1
+    }
 }
 
 /// A synthetic environment for testing CTW performance.
-/// 
+///
 /// Generates a deterministic sequence designed to be perfectly
 /// predictable by a sufficiently deep Context Tree.
 pub struct CtwTest {
@@ -132,18 +144,30 @@ impl Environment for CtwTest {
         self.last_action = action;
         self.cycle += 1;
     }
-    
-    fn get_observation(&self) -> PerceptVal { self.obs }
-    fn get_reward(&self) -> Reward { self.rew }
-    fn is_finished(&self) -> bool { false }
-    
-    fn get_observation_bits(&self) -> usize { 1 }
-    fn get_reward_bits(&self) -> usize { 1 }
-    fn get_action_bits(&self) -> usize { 1 }
+
+    fn get_observation(&self) -> PerceptVal {
+        self.obs
+    }
+    fn get_reward(&self) -> Reward {
+        self.rew
+    }
+    fn is_finished(&self) -> bool {
+        false
+    }
+
+    fn get_observation_bits(&self) -> usize {
+        1
+    }
+    fn get_reward_bits(&self) -> usize {
+        1
+    }
+    fn get_action_bits(&self) -> usize {
+        1
+    }
 }
 
 /// A Rock-Paper-Scissors environment with a biased opponent.
-/// 
+///
 /// The opponent plays randomly unless it wins a round, in which case
 /// it repeats its winning action.
 pub struct BiasedRockPaperScissor {
@@ -175,16 +199,23 @@ impl Environment for BiasedRockPaperScissor {
             self.opponent_last_round_action
         } else {
             let r = self.rng.gen_f64();
-            if r < 1.0/3.0 { 0 } else if r < 2.0/3.0 { 1 } else { 2 }
+            if r < 1.0 / 3.0 {
+                0
+            } else if r < 2.0 / 3.0 {
+                1
+            } else {
+                2
+            }
         };
 
         // Determine Outcome
         if opponent_action == action {
             self.rew = 1; // Draw
             self.opponent_won_last_round = false;
-        } else if (opponent_action == 0 && action == 1) || 
-                  (opponent_action == 1 && action == 2) || 
-                  (opponent_action == 2 && action == 0) {
+        } else if (opponent_action == 0 && action == 1)
+            || (opponent_action == 1 && action == 2)
+            || (opponent_action == 2 && action == 0)
+        {
             self.rew = 2; // Win
             self.opponent_won_last_round = false;
         } else {
@@ -195,18 +226,32 @@ impl Environment for BiasedRockPaperScissor {
         self.obs = opponent_action as PerceptVal;
     }
 
-    fn get_observation(&self) -> PerceptVal { self.obs }
-    fn get_reward(&self) -> Reward { self.rew }
-    fn is_finished(&self) -> bool { false }
+    fn get_observation(&self) -> PerceptVal {
+        self.obs
+    }
+    fn get_reward(&self) -> Reward {
+        self.rew
+    }
+    fn is_finished(&self) -> bool {
+        false
+    }
 
-    fn get_observation_bits(&self) -> usize { 2 }
-    fn get_reward_bits(&self) -> usize { 2 }
-    fn get_action_bits(&self) -> usize { 2 }
-    fn get_num_actions(&self) -> usize { 3 }
+    fn get_observation_bits(&self) -> usize {
+        2
+    }
+    fn get_reward_bits(&self) -> usize {
+        2
+    }
+    fn get_action_bits(&self) -> usize {
+        2
+    }
+    fn get_num_actions(&self) -> usize {
+        3
+    }
 }
 
 /// A more complex version of the classic Tiger problem.
-/// 
+///
 /// Includes states for sitting and standing, with different rewards
 /// and transition probabilities.
 pub struct ExtendedTiger {
@@ -245,7 +290,8 @@ impl Environment for ExtendedTiger {
     fn perform_action(&mut self, action: Action) {
         // Actions: 0: Stand, 1: Listen, 2: Open 1, 3: Open 2
         match action {
-            0 => { // Stand
+            0 => {
+                // Stand
                 if self.state == 1 {
                     self.rew = 90;
                 } else {
@@ -255,16 +301,22 @@ impl Environment for ExtendedTiger {
                         self.obs += 4;
                     }
                 }
-            },
-            1 => { // Listen
+            }
+            1 => {
+                // Listen
                 if self.state == 1 || self.obs != 0 {
                     self.rew = 90;
                 } else {
-                    self.obs = if self.rng.gen_bool(0.85) { self.tiger_door as PerceptVal } else { self.gold_door as PerceptVal };
+                    self.obs = if self.rng.gen_bool(0.85) {
+                        self.tiger_door as PerceptVal
+                    } else {
+                        self.gold_door as PerceptVal
+                    };
                     self.rew = 99;
                 }
-            },
-            2 => { // Open 1
+            }
+            2 => {
+                // Open 1
                 if self.state == 0 {
                     self.rew = 90;
                 } else {
@@ -273,8 +325,9 @@ impl Environment for ExtendedTiger {
                     self.state = 0;
                     self.reset_doors();
                 }
-            },
-            3 => { // Open 2
+            }
+            3 => {
+                // Open 2
                 if self.state == 0 {
                     self.rew = 90;
                 } else {
@@ -283,21 +336,35 @@ impl Environment for ExtendedTiger {
                     self.state = 0;
                     self.reset_doors();
                 }
-            },
+            }
             _ => {
                 self.rew = 0;
             }
         }
     }
 
-    fn get_observation(&self) -> PerceptVal { self.obs }
-    fn get_reward(&self) -> Reward { self.rew }
-    fn is_finished(&self) -> bool { false }
+    fn get_observation(&self) -> PerceptVal {
+        self.obs
+    }
+    fn get_reward(&self) -> Reward {
+        self.rew
+    }
+    fn is_finished(&self) -> bool {
+        false
+    }
 
-    fn get_observation_bits(&self) -> usize { 3 }
-    fn get_reward_bits(&self) -> usize { 7 } 
-    fn get_action_bits(&self) -> usize { 2 }
-    fn get_num_actions(&self) -> usize { 4 }
+    fn get_observation_bits(&self) -> usize {
+        3
+    }
+    fn get_reward_bits(&self) -> usize {
+        7
+    }
+    fn get_action_bits(&self) -> usize {
+        2
+    }
+    fn get_num_actions(&self) -> usize {
+        4
+    }
 }
 
 /// A standard Tic-Tac-Toe environment against a random opponent.
@@ -332,11 +399,16 @@ impl TicTacToe {
     fn check_win(&self, player: i8) -> bool {
         let b = self.board;
         let wins = [
-            (0,1,2), (3,4,5), (6,7,8), // Rows
-            (0,3,6), (1,4,7), (2,5,8), // Cols
-            (0,4,8), (2,4,6)           // Diags
+            (0, 1, 2),
+            (3, 4, 5),
+            (6, 7, 8), // Rows
+            (0, 3, 6),
+            (1, 4, 7),
+            (2, 5, 8), // Cols
+            (0, 4, 8),
+            (2, 4, 6), // Diags
         ];
-        for &(x,y,z) in &wins {
+        for &(x, y, z) in &wins {
             if b[x] == player && b[y] == player && b[z] == player {
                 return true;
             }
@@ -348,9 +420,9 @@ impl TicTacToe {
 impl Environment for TicTacToe {
     fn perform_action(&mut self, action: Action) {
         if action >= 9 {
-             self.rew = 0;
-             self.obs = self.state as PerceptVal;
-             return;
+            self.rew = 0;
+            self.obs = self.state as PerceptVal;
+            return;
         }
 
         if self.board[action as usize] != 0 {
@@ -358,9 +430,9 @@ impl Environment for TicTacToe {
             self.rew = 0;
         } else {
             // Agent move (1)
-            self.state += 1 << (2 * action); 
+            self.state += 1 << (2 * action);
             self.board[action as usize] = 1;
-            
+
             // Remove from open
             if let Some(pos) = self.open_squares.iter().position(|&x| x == action as usize) {
                 self.open_squares.remove(pos);
@@ -378,22 +450,22 @@ impl Environment for TicTacToe {
                 self.rew = 4;
             } else {
                 // Opponent move (-1, mapped to 2 in base-4)
-                
+
                 // Shuffle open squares
                 let n = self.open_squares.len();
                 if n > 0 {
                     let idx = self.rng.gen_range(n);
                     let opponent_move = self.open_squares[idx];
-                    
+
                     self.state += 2 << (2 * opponent_move);
                     self.board[opponent_move] = -1;
-                    
+
                     self.open_squares.remove(idx);
 
                     if self.check_win(-1) {
-                         // Opponent won
-                         self.reset_game();
-                         self.rew = 1;
+                        // Opponent won
+                        self.reset_game();
+                        self.rew = 1;
                     } else if self.open_squares.is_empty() {
                         self.reset_game();
                         self.rew = 4;
@@ -404,18 +476,32 @@ impl Environment for TicTacToe {
         self.obs = self.state as PerceptVal;
     }
 
-    fn get_observation(&self) -> PerceptVal { self.obs }
-    fn get_reward(&self) -> Reward { self.rew }
-    fn is_finished(&self) -> bool { false } 
+    fn get_observation(&self) -> PerceptVal {
+        self.obs
+    }
+    fn get_reward(&self) -> Reward {
+        self.rew
+    }
+    fn is_finished(&self) -> bool {
+        false
+    }
 
-    fn get_observation_bits(&self) -> usize { 18 } // 9 squares * 2 bits
-    fn get_reward_bits(&self) -> usize { 4 } 
-    fn get_action_bits(&self) -> usize { 4 }
-    fn get_num_actions(&self) -> usize { 9 }
+    fn get_observation_bits(&self) -> usize {
+        18
+    } // 9 squares * 2 bits
+    fn get_reward_bits(&self) -> usize {
+        4
+    }
+    fn get_action_bits(&self) -> usize {
+        4
+    }
+    fn get_num_actions(&self) -> usize {
+        9
+    }
 }
 
 /// A 2-player imperfect information game: Kuhn Poker.
-/// 
+///
 /// The agent plays against a Nash-optimized opponent in a simplified
 /// 3-card poker game.
 pub struct KuhnPoker {
@@ -450,7 +536,13 @@ impl KuhnPoker {
 
     fn reset_game(&mut self) {
         let r = self.rng.gen_f64();
-        self.opponent_card = if r < 1.0/3.0 { 2 } else if self.rng.gen_bool(0.5) { 1 } else { 0 };
+        self.opponent_card = if r < 1.0 / 3.0 {
+            2
+        } else if self.rng.gen_bool(0.5) {
+            1
+        } else {
+            0
+        };
 
         // Agent card: one of the remaining
         let k = if self.rng.gen_bool(0.5) { 1 } else { 2 };
@@ -461,14 +553,21 @@ impl KuhnPoker {
 
         // Opponent action (Nash)
         self.alpha = self.rng.gen_f64() / 3.0; // alpha in [0, 1/3]
-        
+
         // Opponent logic matching C++
-        self.opponent_action = if self.opponent_card == 0 { // Jack
-             if self.rng.gen_bool(self.alpha) { 1 } else { 0 }
-        } else if self.opponent_card == 1 { // Queen
-             0 // Always check
-        } else { // King
-             if self.rng.gen_bool(3.0 * self.alpha) { 1 } else { 0 }
+        self.opponent_action = if self.opponent_card == 0 {
+            // Jack
+            if self.rng.gen_bool(self.alpha) { 1 } else { 0 }
+        } else if self.opponent_card == 1 {
+            // Queen
+            0 // Always check
+        } else {
+            // King
+            if self.rng.gen_bool(3.0 * self.alpha) {
+                1
+            } else {
+                0
+            }
         };
 
         if self.opponent_action == 1 {
@@ -495,21 +594,34 @@ impl Environment for KuhnPoker {
             if self.agent_card > self.opponent_card {
                 self.rew = 2 + self.chips_in_play as u64;
             } else {
-                self.rew = if self.agent_chips <= 2 { (2 - self.agent_chips) as u64 } else { 0 };
+                self.rew = if self.agent_chips <= 2 {
+                    (2 - self.agent_chips) as u64
+                } else {
+                    0
+                };
             }
             self.reset_game();
-        } else if opponent_bets && !agent_bets { // Opponent bet, Agent fold
-            self.rew = if self.agent_chips <= 2 { (2 - self.agent_chips) as u64 } else { 0 };
+        } else if opponent_bets && !agent_bets {
+            // Opponent bet, Agent fold
+            self.rew = if self.agent_chips <= 2 {
+                (2 - self.agent_chips) as u64
+            } else {
+                0
+            };
             self.reset_game();
-        } else { 
+        } else {
             // Opponent passed, Agent bet. Opponent decision.
-            let call = self.rng.gen_bool(self.alpha + 1.0/3.0);
+            let call = self.rng.gen_bool(self.alpha + 1.0 / 3.0);
             if call {
                 self.chips_in_play += 1;
                 if self.agent_card > self.opponent_card {
                     self.rew = 2 + self.chips_in_play as u64;
                 } else {
-                    self.rew = if self.agent_chips <= 2 { (2 - self.agent_chips) as u64 } else { 0 };
+                    self.rew = if self.agent_chips <= 2 {
+                        (2 - self.agent_chips) as u64
+                    } else {
+                        0
+                    };
                 }
             } else {
                 // Opponent folds
@@ -519,12 +631,26 @@ impl Environment for KuhnPoker {
         }
     }
 
-    fn get_observation(&self) -> PerceptVal { self.obs }
-    fn get_reward(&self) -> Reward { self.rew }
-    fn is_finished(&self) -> bool { false }
+    fn get_observation(&self) -> PerceptVal {
+        self.obs
+    }
+    fn get_reward(&self) -> Reward {
+        self.rew
+    }
+    fn is_finished(&self) -> bool {
+        false
+    }
 
-    fn get_observation_bits(&self) -> usize { 4 }
-    fn get_reward_bits(&self) -> usize { 4 }
-    fn get_action_bits(&self) -> usize { 1 } // 0 or 1
-    fn get_num_actions(&self) -> usize { 2 }
+    fn get_observation_bits(&self) -> usize {
+        4
+    }
+    fn get_reward_bits(&self) -> usize {
+        4
+    }
+    fn get_action_bits(&self) -> usize {
+        1
+    } // 0 or 1
+    fn get_num_actions(&self) -> usize {
+        2
+    }
 }

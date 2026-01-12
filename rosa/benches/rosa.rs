@@ -49,8 +49,16 @@ fn main() {
     println!("train_time_ms={:.3}", t_train.as_secs_f64() * 1e3);
     println!("build_time_ms={:.3}", t_build.as_secs_f64() * 1e3);
     println!("estimated_model_bytes={}", est_bytes);
-    println!("score_time_ms={:.3} cross_entropy={:.6}", t_score.as_secs_f64() * 1e3, ce);
+    println!(
+        "score_time_ms={:.3} cross_entropy={:.6}",
+        t_score.as_secs_f64() * 1e3,
+        ce
+    );
     println!("save_time_ms={:.3}", t_save.as_secs_f64() * 1e3);
     println!("load_time_ms={:.3}", t_load.as_secs_f64() * 1e3);
-    println!("score2_time_ms={:.3} cross_entropy2={:.6}", t_score2.as_secs_f64() * 1e3, ce2);
+    println!(
+        "score2_time_ms={:.3} cross_entropy2={:.6}",
+        t_score2.as_secs_f64() * 1e3,
+        ce2
+    );
 }

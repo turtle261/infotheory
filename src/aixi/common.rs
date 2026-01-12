@@ -16,7 +16,7 @@ pub type Reward = u64;
 pub type PerceptVal = u64;
 
 /// A high-performance random number generator using the XorShift64* algorithm.
-/// 
+///
 /// This generator is seeded using `zpaq_rs::random_bytes` to avoid external dependencies
 /// like the `rand` crate while maintaining cryptographic-grade entropy for the seed.
 pub struct RandomGenerator {
@@ -34,7 +34,7 @@ impl RandomGenerator {
         let state = if seed == 0 { 0xCAFEBABEDEADBEEF } else { seed };
         Self { state }
     }
-    
+
     /// Generates the next pseudo-random `u64`.
     pub fn next_u64(&mut self) -> u64 {
         // xorshift64*
@@ -45,18 +45,20 @@ impl RandomGenerator {
         self.state = x;
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
-    
+
     /// Generates a pseudo-random `usize` in the range `[0, end)`.
     pub fn gen_range(&mut self, end: usize) -> usize {
-        if end == 0 { return 0; }
+        if end == 0 {
+            return 0;
+        }
         (self.next_u64() % (end as u64)) as usize
     }
-    
+
     /// Generates a boolean value with probability `p` of being `true`.
     pub fn gen_bool(&mut self, p: f64) -> bool {
         self.gen_f64() < p
     }
-    
+
     /// Generates a pseudo-random `f64` in the range `[0, 1)`.
     pub fn gen_f64(&mut self) -> f64 {
         // 53 bits
@@ -66,7 +68,7 @@ impl RandomGenerator {
 }
 
 /// Encodes a numeric value into its bit representation and appends it to a `SymbolList`.
-/// 
+///
 /// Bits are appended in least-significant-bit first order.
 pub fn encode(symlist: &mut SymbolList, mut value: u64, bits: usize) {
     for _ in 0..bits {
@@ -76,7 +78,7 @@ pub fn encode(symlist: &mut SymbolList, mut value: u64, bits: usize) {
 }
 
 /// Decodes a numeric value from its bit representation.
-/// 
+///
 /// Expects bits to be in least-significant-bit first order.
 pub fn decode(symlist: &[Symbol], bits: usize) -> u64 {
     assert!(bits <= symlist.len());
