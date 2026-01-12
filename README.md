@@ -1,111 +1,96 @@
 # InfoTheory
 
-A high-performance Rust crate for Information Theoretic Estimators and Metrics.
+A high-performance, versatile Rust crate for **Information Theoretic Primitives**, **Sequential Metrics**, and **Autonomous Agents**.
 
-This library provides a comprehensive suite of tools for quantifying complexity, dependence, and similarity between data sequences using both **Compression-based** (Kolmogorov Complexity) and **Entropy-based** (Shannon Information) approaches.
+`infotheory` provides a unified framework for quantifying complexity, dependence, and similarity between data sequences. It bridges classical Shannon entropy with algorithmic information theory (Kolmogorov Complexity), supported by multiple predictive backends.
 
-## Features
+## 🚀 Key Features
 
-*   **NCD (Normalized Compression Distance)**: Uses ZPAQ compression to estimate information distance.
-*   **Entropy & Mutual Information**:
-    *   **Marginal**: Exact calculation for i.i.d. data (histograms).
-    *   **Rate**: Predictive entropy rate estimation using ROSA (Suffix Automaton + Witten-Bell smoothing) for sequential data.
-*   **Advanced Metrics**:
-    *   **NED**: Normalized Entropy Distance.
-    *   **NTE**: Normalized Transform Effort (Variation of Information).
-    *   **TVD**: Total Variation Distance.
-    *   **NHD**: Normalized Hellinger Distance.
-    *   **KL / JS Divergence**: Kullback-Leibler and Jensen-Shannon divergences.
-*   **Structural Primitives**:
-    *   **Intrinsic Dependence**: Measures internal redundancy/predictability.
-    *   **Resistance**: Measures information preservation under transformation.
+### 1. Unified Information Estimation
+Estimate core measures using both **Marginal** (distribution-based) and **Rate** (predictive-based) approaches:
+- **NCD (Normalized Compression Distance)**: Approximates information distance using real-world compressors (ZPAQ).
+- **MI (Mutual Information)**: Quantifies shared information between sequences.
+- **NED (Normalized Entropy Distance)**: A metric distance based on mutual information.
+- **NTE (Normalized Transform Effort)**: Variation of Information (VI).
+- **Intrinsic Dependence**: Redundancy Ratio.
+- **Resistance**: Information preservation under noise/transform.
 
-## Installation
+### 2. Multi-Backend Predictive Engine
+Switch between different modeling paradigms seamlessly:
+- **ROSA (Suffix Automaton)**: Default backend. Extremely fast online learning with Witten-Bell smoothing.
+- **CTW (Context Tree Weighting)**: Historically standard for AIXI. Accurate bit-level Bayesian model (KT-estimator).
+- **RWKV (Neural Network)**: Modern neural sequence prediction (requires CUDA).
 
-Add this to your `Cargo.toml`:
+### 3. Integrated MC-AIXI Agent
+Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent. Unlike traditional implementations restricted to CTW, this agent is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, or RWKV) for universal reinforcement learning.
+
+---
+
+## 🛠 Installation
+
+Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-infotheory = { path = "." } # Or git repository
+infotheory = { path = "." }
 ```
 
-## CLI Usage
+---
 
-The crate includes a binary for command-line usage.
+## 💻 CLI Usage
 
+The `infotheory` binary provides a powerful interface for file analysis.
+
+### Information Theoretic Primitives
 ```bash
-# Build the binary
-cargo build --release
+# Calculate Mutual Information (ROSA backend, order 8)
+./infotheory mi file1.txt file2.txt 8
 
-# Run NCD between two files
-./target/release/infotheory ncd file1.bin file2.bin
+# Use CTW backend for NTE (Normalized Transform Effort)
+./infotheory nte file1.txt file2.txt --rate-backend ctw
 
-# Calculate Mutual Information (Marginal / i.i.d.)
-./target/release/infotheory mi file1.bin file2.bin 0
-
-# Calculate Mutual Information (Entropy Rate, max_order=8)
-./target/release/infotheory mi file1.bin file2.bin 8
-
-# Calculate Intrinsic Dependence
-./target/release/infotheory id file1.bin
+# Calculate NCD with custom ZPAQ method
+./infotheory ncd file1.txt file2.txt 5
 ```
 
-### Supported Primitives
+### AIXI Agent Mode
+```bash
+# Run the AIXI agent using config-specified backend
+./infotheory aixi conf/kuhn_poker.json
+```
 
-| Command | Description |
-|---------|-------------|
-| `ncd` | Normalized Compression Distance (Vitanyi) |
-| `ncd_sym` | Symmetric NCD |
-| `ned` | Normalized Entropy Distance |
-| `nte` | Normalized Transform Effort |
-| `mi` | Mutual Information |
-| `entropy` | Shannon Entropy (Marginal or Rate) |
-| `kl` | KL Divergence |
-| `js` | JS Divergence |
-| `id` | Intrinsic Dependence |
-| `rt` | Resistance to Transformation |
+---
 
-## Library Usage
+## 🦀 Library Usage
 
 ```rust
-use infotheory::{ncd_vitanyi, mutual_information_bytes};
+use infotheory::*;
 
-fn main() {
-    let x = b"hello world hello world";
-    let y = b"hello world hello earth";
+// Entropy rate of a sequence (uses ROSA by default)
+let h = entropy_rate_bytes(data, 8);
 
-    // Compression-based distance
-    // Note: NCD functions typically take file paths, but byte-based variants exist.
-    // let d = ncd_vitanyi("path/to/x", "path/to/y", "5");
-
-    // Mutual Information (Marginal)
-    let mi = mutual_information_bytes(x, y, 0);
-    println!("MI (Marginal): {}", mi);
-
-    // Mutual Information (Rate, context order 4)
-    let mi_rate = mutual_information_bytes(x, y, 4);
-    println!("MI (Rate): {}", mi_rate);
-}
+// Switch the entire thread to use CTW for all subsequent calls
+set_default_ctx(InfotheoryCtx::new(
+    RateBackend::Ctw { depth: 32 },
+    NcdBackend::default()
+));
 ```
 
-## Mathematical Details
+---
 
-### Compression-Based (NCD)
-Approximates Kolmogorov complexity `K(x)` using compressed size `C(x)`.
+## 📊 Supported Primitives
 
-```
-NCD(x,y) = (C(xy) - min(C(x), C(y))) / max(C(x), C(y))
-```
+| Command | Description | Domain |
+| :--- | :--- | :--- |
+| `ncd` | Normalized Compression Distance | Compression |
+| `ned` | Normalized Entropy Distance | Shannon |
+| `nte` | Variation of Information | Shannon |
+| `mi`  | Mutual Information | Shannon |
+| `id`  | Internal Redundancy | Algorithmic |
+| `rt`  | Resistance to Transform | Algorithmic |
 
-### Entropy-Based (ROSA)
-For sequential data, we estimate the entropy rate `Ĥ(X)` using a predictive model (ROSA) that builds a Suffix Automaton and applies Witten-Bell smoothing.
+---
 
-```
-Ĥ(X) = -1/N * Σ log P(x_t | x_{<t})
-```
+## 📄 License
 
-This allows accurate estimation of Mutual Information and other metrics even for non-i.i.d. sources (e.g., text, code, DNA).
-
-
-## TODO
- Levin Search
+Apache License, Version 2.0.

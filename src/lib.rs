@@ -87,8 +87,48 @@ thread_local! {
     static RWKV_TLS: RefCell<HashMap<usize, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
 }
 
+impl Default for RateBackend {
+    fn default() -> Self {
+        RateBackend::RosaPlus
+    }
+}
 
-fn mutual_information_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+impl Default for NcdBackend {
+    fn default() -> Self {
+        NcdBackend::Zpaq { method: "5".to_string() }
+    }
+}
+
+impl Default for InfotheoryCtx {
+    fn default() -> Self {
+        Self {
+            rate_backend: RateBackend::default(),
+            ncd_backend: NcdBackend::default(),
+        }
+    }
+}
+
+thread_local! {
+    static DEFAULT_CTX: RefCell<InfotheoryCtx> = RefCell::new(InfotheoryCtx::default());
+}
+
+/// Returns the current default information theory context for the thread.
+pub fn get_default_ctx() -> InfotheoryCtx {
+    DEFAULT_CTX.with(|ctx| ctx.borrow().clone())
+}
+
+/// Sets the default information theory context for the thread.
+pub fn set_default_ctx(ctx: InfotheoryCtx) {
+    DEFAULT_CTX.with(|c| *c.borrow_mut() = ctx);
+}
+
+#[inline(always)]
+fn with_default_ctx<R>(f: impl FnOnce(&InfotheoryCtx) -> R) -> R {
+    DEFAULT_CTX.with(|ctx| f(&*ctx.borrow()))
+}
+
+
+pub fn mutual_information_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     if x.is_empty() {
         return 0.0;
@@ -101,7 +141,7 @@ fn mutual_information_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: 
     (h_x + h_y - h_xy).max(0.0)
 }
 
-fn ned_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+pub fn ned_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     if x.is_empty() {
         return 0.0;
@@ -118,7 +158,7 @@ fn ned_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -
     }
 }
 
-fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     if x.is_empty() {
         return 0.0;
@@ -186,12 +226,39 @@ impl InfotheoryCtx {
         cross_entropy_rate_backend(x, y, max_order, &self.rate_backend)
     }
 
+    pub fn cross_entropy_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        if max_order == 0 {
+            let p_x = byte_histogram(x);
+            let p_y = byte_histogram(y);
+            let mut h = 0.0f64;
+            for i in 0..256 {
+                if p_x[i] > 0.0 {
+                    let q_y = p_y[i].max(1e-12);
+                    h -= p_x[i] * q_y.log2();
+                }
+            }
+            h
+        } else {
+            self.cross_entropy_rate_bytes(x, y, max_order)
+        }
+    }
+
     pub fn joint_entropy_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         let (x, y) = aligned_prefix(x, y);
         if x.is_empty() {
             return 0.0;
         }
         joint_entropy_rate_backend(x, y, max_order, &self.rate_backend)
+    }
+
+    pub fn conditional_entropy_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        let (x, y) = aligned_prefix(x, y);
+        if x.is_empty() {
+            return 0.0;
+        }
+        let h_xy = self.joint_entropy_rate_bytes(x, y, max_order);
+        let h_y = self.entropy_rate_bytes(y, max_order);
+        (h_xy - h_y).max(0.0)
     }
 
     pub fn cross_entropy_conditional_chain(&self, prefix_parts: &[&[u8]], data: &[u8]) -> f64 {
@@ -208,7 +275,30 @@ impl InfotheoryCtx {
             RateBackend::Rwkv7 { model } => {
                 with_rwkv_tls(model, |c| c.cross_entropy_conditional_chain(prefix_parts, data).unwrap_or(0.0))
             }
-            RateBackend::Ctw { .. } => 0.0, // TODO: Implement chain for CTW
+            RateBackend::Ctw { depth } => {
+                let mut tree = crate::ctw::ContextTree::new(*depth);
+                // Train on prefix parts
+                for &part in prefix_parts {
+                    for &b in part {
+                        for i in (0..8).rev() {
+                           tree.update(((b >> i) & 1) == 1);
+                        }
+                    }
+                }
+                let log_p_prefix = tree.get_log_block_probability();
+                // Score data (update and track additional log-prob)
+                for &b in data {
+                    for i in (0..8).rev() {
+                       tree.update(((b >> i) & 1) == 1);
+                    }
+                }
+                let log_p_joint = tree.get_log_block_probability();
+                
+                // Cross entropy = -log P(data | prefix) = -(log P(prefix, data) - log P(prefix))
+                let log_p_cond = log_p_joint - log_p_prefix;
+                let bits = -log_p_cond / std::f64::consts::LN_2;
+                bits / (data.len() as f64)
+            }
         }
     }
 
@@ -220,6 +310,27 @@ impl InfotheoryCtx {
         mutual_information_rate_backend(x, y, max_order, &self.rate_backend)
     }
 
+    pub fn mutual_information_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        if max_order == 0 {
+            mutual_information_marg_bytes(x, y)
+        } else {
+            self.mutual_information_rate_bytes(x, y, max_order)
+        }
+    }
+
+    pub fn conditional_entropy_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        let (x, y) = aligned_prefix(x, y);
+        if max_order == 0 {
+            let h_xy = joint_marginal_entropy_bytes(x, y);
+            let h_y = marginal_entropy_bytes(y);
+            (h_xy - h_y).max(0.0)
+        } else {
+            let h_xy = self.joint_entropy_rate_bytes(x, y, max_order);
+            let h_y = self.entropy_rate_bytes(y, max_order);
+            (h_xy - h_y).max(0.0)
+        }
+    }
+
     pub fn ned_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         if max_order == 0 {
             ned_marg_bytes(x, y)
@@ -228,12 +339,42 @@ impl InfotheoryCtx {
         }
     }
 
+    pub fn ned_cons_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+        let (x, y) = aligned_prefix(x, y);
+        let (h_x, h_y, h_xy) = if max_order == 0 {
+            (marginal_entropy_bytes(x), marginal_entropy_bytes(y), joint_marginal_entropy_bytes(x, y))
+        } else {
+            (self.entropy_rate_bytes(x, max_order), self.entropy_rate_bytes(y, max_order), self.joint_entropy_rate_bytes(x, y, max_order))
+        };
+        let min_h = h_x.min(h_y);
+        if h_xy == 0.0 { 0.0 } else { ((h_xy - min_h) / h_xy).clamp(0.0, 1.0) }
+    }
+
     pub fn nte_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         if max_order == 0 {
             nte_marg_bytes(x, y)
         } else {
             nte_rate_backend(x, y, max_order, &self.rate_backend)
         }
+    }
+
+    pub fn intrinsic_dependence_bytes(&self, data: &[u8], max_order: i64) -> f64 {
+        let h_marginal = marginal_entropy_bytes(data);
+        if h_marginal < 1e-9 { return 0.0; }
+        let h_rate = self.entropy_rate_bytes(data, max_order);
+        ((h_marginal - h_rate) / h_marginal).clamp(0.0, 1.0)
+    }
+
+    pub fn resistance_to_transformation_bytes(&self, x: &[u8], tx: &[u8], max_order: i64) -> f64 {
+        let (x, tx) = aligned_prefix(x, tx);
+        let h_x = if max_order == 0 {
+            marginal_entropy_bytes(x)
+        } else {
+            self.entropy_rate_bytes(x, max_order)
+        };
+        if h_x < 1e-9 { return 0.0; }
+        let mi = self.mutual_information_bytes(x, tx, max_order);
+        (mi / h_x).clamp(0.0, 1.0)
     }
 }
 
@@ -299,7 +440,7 @@ impl<'a> std::io::Read for SliceChainReader<'a> {
     }
 }
 
-fn compress_size_chain_backend(parts: &[&[u8]], backend: &NcdBackend) -> u64 {
+pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &NcdBackend) -> u64 {
     match backend {
         NcdBackend::Zpaq { method } => {
             let r = SliceChainReader::new(parts);
@@ -311,7 +452,7 @@ fn compress_size_chain_backend(parts: &[&[u8]], backend: &NcdBackend) -> u64 {
     }
 }
 
-fn compress_size_backend(data: &[u8], backend: &NcdBackend) -> u64 {
+pub fn compress_size_backend(data: &[u8], backend: &NcdBackend) -> u64 {
     match backend {
         NcdBackend::Zpaq { method } => zpaq_rs::compress_size(data, method.as_str()).unwrap_or(0),
         NcdBackend::Rwkv7 { model, coder } => {
@@ -320,7 +461,7 @@ fn compress_size_backend(data: &[u8], backend: &NcdBackend) -> u64 {
     }
 }
 
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
         RateBackend::RosaPlus => {
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
@@ -343,7 +484,7 @@ fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f
     }
 }
 
-fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
         RateBackend::RosaPlus => {
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
@@ -356,7 +497,7 @@ fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBacken
     }
 }
 
-fn cross_entropy_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+pub fn cross_entropy_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
         RateBackend::RosaPlus => {
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
@@ -389,7 +530,7 @@ fn cross_entropy_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &Rate
     }
 }
 
-fn joint_entropy_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+pub fn joint_entropy_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
         RateBackend::RosaPlus => {
             let joint_symbols: Vec<u32> = (0..x.len())
@@ -586,6 +727,12 @@ pub fn ncd_bytes(x: &[u8], y: &[u8], method: &str, variant: NcdVariant) -> f64 {
     ncd_bytes_backend(x, y, &backend, variant)
 }
 
+/// NCD with bytes using the default context.
+#[inline(always)]
+pub fn ncd_bytes_default(x: &[u8], y: &[u8], variant: NcdVariant) -> f64 {
+    with_default_ctx(|ctx| ctx.ncd_bytes(x, y, variant))
+}
+
 pub fn ncd_bytes_backend(x: &[u8], y: &[u8], backend: &NcdBackend, variant: NcdVariant) -> f64 {
     let (cx, cy) = rayon::join(|| compress_size_backend(x, backend), || compress_size_backend(y, backend));
 
@@ -763,7 +910,7 @@ pub fn marginal_entropy_bytes(data: &[u8]) -> f64 {
 ///   A value of -1 means unlimited context (bounded only by memory/sequence length).
 #[inline(always)]
 pub fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
-    entropy_rate_backend(data, max_order, &RateBackend::RosaPlus)
+    with_default_ctx(|ctx| ctx.entropy_rate_bytes(data, max_order))
 }
 
 /// Compute biased entropy rate Ĥ_biased(X) bits per symbol.
@@ -773,7 +920,7 @@ pub fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
 /// similarity metrics like Mutual Information and NED.
 #[inline(always)]
 pub fn biased_entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
-    biased_entropy_rate_backend(data, max_order, &RateBackend::RosaPlus)
+    with_default_ctx(|ctx| ctx.biased_entropy_rate_bytes(data, max_order))
 }
 
 /// Compute joint marginal entropy H(X,Y) = −Σ p(x,y) log₂ p(x,y) in bits/symbol-pair.
@@ -820,12 +967,7 @@ pub fn joint_marginal_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
 /// should be computed over the same aligned sample.
 #[inline(always)]
 pub fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let (x, y) = aligned_prefix(x, y);
-    let n = x.len();
-    if n == 0 {
-        return 0.0;
-    }
-    joint_entropy_rate_backend(x, y, max_order, &RateBackend::RosaPlus)
+    with_default_ctx(|ctx| ctx.joint_entropy_rate_bytes(x, y, max_order))
 }
 
 /// Compute conditional entropy rate `Ĥ(X|Y)`.
@@ -837,13 +979,7 @@ pub fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 /// Note: This relies on the identity `H(X|Y) = H(X,Y) - H(Y)`.
 #[inline(always)]
 pub fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let (x, y) = aligned_prefix(x, y);
-    if x.is_empty() {
-        return 0.0;
-    }
-    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    let h_y = entropy_rate_bytes(y, max_order);
-    (h_xy - h_y).max(0.0)
+    with_default_ctx(|ctx| ctx.conditional_entropy_rate_bytes(x, y, max_order))
 }
 
 /// Compute conditional entropy H(X|Y) = H(X,Y) − H(Y)
@@ -851,14 +987,7 @@ pub fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64
 /// Dispatches based on `max_order`.
 #[inline(always)]
 pub fn conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let (x, y) = aligned_prefix(x, y);
-    if max_order == 0 {
-        let h_xy = joint_marginal_entropy_bytes(x, y);
-        let h_y = marginal_entropy_bytes(y);
-        (h_xy - h_y).max(0.0)
-    } else {
-        conditional_entropy_rate_bytes(x, y, max_order)
-    }
+    with_default_ctx(|ctx| ctx.conditional_entropy_bytes(x, y, max_order))
 }
 
 /// Compute mutual information `I(X;Y) = H(X) + H(Y) - H(X,Y)`.
@@ -868,11 +997,7 @@ pub fn conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 /// `I(X;Y) = Σ p(x,y) log(p(x,y) / (p(x)p(y)))`
 #[inline(always)]
 pub fn mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    if max_order == 0 {
-        mutual_information_marg_bytes(x, y)
-    } else {
-        mutual_information_rate_bytes(x, y, max_order)
-    }
+    with_default_ctx(|ctx| ctx.mutual_information_bytes(x, y, max_order))
 }
 
 /// Marginal Mutual Information (exact/histogram)
@@ -885,15 +1010,9 @@ pub fn mutual_information_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 /// Entropy Rate Mutual Information (ROSA predictive)
+#[inline(always)]
 pub fn mutual_information_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let (x, y) = aligned_prefix(x, y);
-    if x.is_empty() {
-        return 0.0;
-    }
-    let h_x = entropy_rate_bytes(x, max_order);
-    let h_y = entropy_rate_bytes(y, max_order);
-    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    (h_x + h_y - h_xy).max(0.0)
+    with_default_ctx(|ctx| ctx.mutual_information_rate_bytes(x, y, max_order))
 }
 
 // ====== NED: Normalized Entropy Distance ======
@@ -909,11 +1028,7 @@ pub fn mutual_information_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 
 /// * 1: Independence (X and Y share no information).
 #[inline(always)]
 pub fn ned_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    if max_order == 0 {
-        ned_marg_bytes(x, y)
-    } else {
-        ned_rate_bytes(x, y, max_order)
-    }
+    with_default_ctx(|ctx| ctx.ned_bytes(x, y, max_order))
 }
 
 /// Marginal NED (exact/histogram)
@@ -932,21 +1047,9 @@ pub fn ned_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 /// Normalized Entropy Distance (Rate-based)
+#[inline(always)]
 pub fn ned_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let (x, y) = aligned_prefix(x, y);
-    if x.is_empty() {
-        return 0.0;
-    }
-
-    let h_x = entropy_rate_bytes(x, max_order);
-    let h_y = entropy_rate_bytes(y, max_order);
-    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    let max_h = h_x.max(h_y);
-    if max_h == 0.0 {
-        0.0
-    } else {
-        ((h_xy - h_x.min(h_y)) / max_h).clamp(0.0, 1.0)
-    }
+    with_default_ctx(|ctx| ctx.ned_bytes(x, y, max_order))
 }
 
 /// NED_cons(X,Y) = (H(X,Y) - min(H(X), H(Y))) / H(X,Y)
@@ -954,11 +1057,7 @@ pub fn ned_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 /// Conservative variant. Dispatches based on `max_order`.
 #[inline(always)]
 pub fn ned_cons_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    if max_order == 0 {
-        ned_cons_marg_bytes(x, y)
-    } else {
-        ned_cons_rate_bytes(x, y, max_order)
-    }
+    with_default_ctx(|ctx| ctx.ned_cons_bytes(x, y, max_order))
 }
 
 pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
@@ -973,17 +1072,9 @@ pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     }
 }
 
+#[inline(always)]
 pub fn ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let (x, y) = aligned_prefix(x, y);
-    let h_x = entropy_rate_bytes(x, max_order);
-    let h_y = entropy_rate_bytes(y, max_order);
-    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    let min_h = h_x.min(h_y);
-    if h_xy == 0.0 {
-        0.0
-    } else {
-        ((h_xy - min_h) / h_xy).clamp(0.0, 1.0)
-    }
+    with_default_ctx(|ctx| ctx.ned_cons_bytes(x, y, max_order))
 }
 
 // ====== NTE: Normalized Transform Effort (Variation of Information) ======
@@ -1002,11 +1093,7 @@ pub fn ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 /// Dispatches based on `max_order`.
 #[inline(always)]
 pub fn nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    if max_order == 0 {
-        nte_marg_bytes(x, y)
-    } else {
-        nte_rate_bytes(x, y, max_order)
-    }
+    with_default_ctx(|ctx| ctx.nte_bytes(x, y, max_order))
 }
 
 pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
@@ -1023,18 +1110,9 @@ pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     }
 }
 
+#[inline(always)]
 pub fn nte_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let (x, y) = aligned_prefix(x, y);
-    let h_x = entropy_rate_bytes(x, max_order);
-    let h_y = entropy_rate_bytes(y, max_order);
-    let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-    let vi = 2.0 * h_xy - h_x - h_y;
-    let max_h = h_x.max(h_y);
-    if max_h == 0.0 {
-        0.0
-    } else {
-        (vi / max_h).max(0.0)
-    }
+    with_default_ctx(|ctx| ctx.nte_bytes(x, y, max_order))
 }
 
 // ====== TVD: Total Variation Distance ======
@@ -1100,29 +1178,16 @@ pub fn nhd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
 /// Compute cross-entropy H(P,Q) = -Σ p(x) log q(x)
 ///
 /// Dispatches based on `max_order`.
+#[inline(always)]
 pub fn cross_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    if max_order == 0 {
-        let p_x = byte_histogram(x);
-        let p_y = byte_histogram(y);
-        let mut h = 0.0f64;
-        for i in 0..256 {
-            if p_x[i] > 0.0 {
-                // If y has no support where x does, cross-entropy is effectively infinite
-                // but we clamp p_y to a small epsilon for stability.
-                let q_y = p_y[i].max(1e-12);
-                h -= p_x[i] * q_y.log2();
-            }
-        }
-        h
-    } else {
-        cross_entropy_rate_bytes(x, y, max_order)
-    }
+    with_default_ctx(|ctx| ctx.cross_entropy_bytes(x, y, max_order))
 }
 
 /// Compute cross-entropy rate using ROSA.
 /// Training model on Y and evaluating probability of X.
+#[inline(always)]
 pub fn cross_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    cross_entropy_rate_backend(x, y, max_order, &RateBackend::RosaPlus)
+    with_default_ctx(|ctx| ctx.cross_entropy_rate_bytes(x, y, max_order))
 }
 
 /// Kullback-Leibler Divergence D_KL(P || Q) = Σ p(x) log(p(x) / q(x))
@@ -1263,15 +1328,9 @@ pub fn js_divergence_paths(x: &str, y: &str) -> f64 {
 /// Interpretation:
 ///   - `R → 0`: Data is close to i.i.d./max-entropy (little intrinsic structure; highly extrinsically explainable by priors).
 ///   - `R → 1`: Data is highly predictable from its own past (strong intrinsic dependence; e.g., periodic strings like 010101...).
+#[inline(always)]
 pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
-    let h_marginal = marginal_entropy_bytes(data);
-    if h_marginal < 1e-9 {
-        return 0.0;
-    }
-    let h_rate = entropy_rate_bytes(data, max_order);
-
-    // Internal Redundancy = (H_marg - H_rate) / H_marg
-    ((h_marginal - h_rate) / h_marginal).clamp(0.0, 1.0)
+    with_default_ctx(|ctx| ctx.intrinsic_dependence_bytes(data, max_order))
 }
 
 /// Primitive 7: Resistance under Allowed Transformations.
@@ -1285,19 +1344,9 @@ pub fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
 /// * 0 means the transformation destroyed all information (e.g. mapping everything to a constant).
 ///
 /// Assumes X and T(X) are aligned.
+#[inline(always)]
 pub fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -> f64 {
-    let (x, tx) = aligned_prefix(x, tx);
-    let h_x = if max_order == 0 {
-        marginal_entropy_bytes(x)
-    } else {
-        entropy_rate_bytes(x, max_order)
-    };
-    if h_x < 1e-9 {
-        // If X has zero entropy, there is no information to preserve; define resistance as 0.
-        return 0.0;
-    }
-    let mi = mutual_information_bytes(x, tx, max_order);
-    (mi / h_x).clamp(0.0, 1.0)
+    with_default_ctx(|ctx| ctx.resistance_to_transformation_bytes(x, tx, max_order))
 }
 
 #[cfg(test)]
@@ -1356,5 +1405,29 @@ mod tests {
         let r8 = resistance_to_transformation_bytes(x, x, 8);
         assert!((r0 - 1.0).abs() < 1e-12);
         assert!((r8 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn backend_switching_test() {
+        let x = b"hello world context";
+        
+        // Default is RosaPlus
+        let h_rosa = entropy_rate_bytes(x, 8);
+        
+        // Switch to CTW
+        set_default_ctx(InfotheoryCtx::new(
+            RateBackend::Ctw { depth: 16 },
+            NcdBackend::default()
+        ));
+        
+        let h_ctw = entropy_rate_bytes(x, 8);
+        
+        // They should generally be different, but most importantly, CTW worked
+        assert!(h_ctw > 0.0);
+        
+        // Reset to default
+        set_default_ctx(InfotheoryCtx::default());
+        let h_rosa_back = entropy_rate_bytes(x, 8);
+        assert!((h_rosa - h_rosa_back).abs() < 1e-12);
     }
 }

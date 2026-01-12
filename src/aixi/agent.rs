@@ -33,7 +33,7 @@ pub struct AgentConfig {
     pub rosa_max_order: Option<i64>,
 }
 
-/// A complete MC-AIXI-CTW agent.
+/// A complete MC-AIXI agent.
 /// 
 /// The agent maintains an internal world model and a planning tree. It can
 /// be used for both live interaction with an environment and for 

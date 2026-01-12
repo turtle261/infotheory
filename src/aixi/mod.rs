@@ -1,4 +1,4 @@
-//! MC-AIXI-CTW Implementation
+//! MC-AIXI Implementation
 //!
 //! This module contains an implementation of the Monte Carlo AIXI algorithm
 //! using various predictive models (CTW, ROSA, RWKV) as backends.
