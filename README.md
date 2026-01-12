@@ -105,3 +105,7 @@ For sequential data, we estimate the entropy rate `Ĥ(X)` using a predictive mod
 ```
 
 This allows accurate estimation of Mutual Information and other metrics even for non-i.i.d. sources (e.g., text, code, DNA).
+
+
+## TODO
+ Levin Search
