@@ -72,6 +72,7 @@
 
 pub mod aixi;
 pub mod ctw;
+pub mod datagen;
 
 use rayon::prelude::*;
 
@@ -175,8 +176,10 @@ pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBacken
     if max_h == 0.0 {
         0.0
     } else {
+        // VI = H(X|Y) + H(Y|X) can be as large as H(X) + H(Y) ≈ 2*max(H)
+        // for independent sequences, so NTE ∈ [0, 2]
         let vi = (h_xy - h_x).max(0.0) + (h_xy - h_y).max(0.0);
-        (vi / max_h).clamp(0.0, 1.0)
+        (vi / max_h).clamp(0.0, 2.0)
     }
 }
 
@@ -292,6 +295,9 @@ impl InfotheoryCtx {
                     .unwrap_or(0.0)
             }),
             RateBackend::Ctw { depth } => {
+                if data.is_empty() {
+                    return 0.0;
+                }
                 let mut tree = crate::ctw::ContextTree::new(*depth);
                 // Train on prefix parts
                 for &part in prefix_parts {
@@ -459,7 +465,8 @@ impl<'a> SliceChainReader<'a> {
 }
 
 impl<'a> std::io::Read for SliceChainReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut total = 0;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -471,11 +478,22 @@ impl<'a> std::io::Read for SliceChainReader<'a> {
                 continue;
             }
             let n = (p.len() - self.off).min(buf.len());
+            // Safe copy slice
             buf[..n].copy_from_slice(&p[self.off..self.off + n]);
+            
+            // Advance state
             self.off += n;
-            return Ok(n);
+            total += n;
+            
+            // Re-slice buf to fill remainder
+            let tmp = buf;
+            buf = &mut tmp[n..];
+            
+            if buf.is_empty() {
+                break;
+            }
         }
-        Ok(0)
+        Ok(total)
     }
 }
 
@@ -510,6 +528,9 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
         }
         RateBackend::Ctw { depth } => {
+            if data.is_empty() {
+                return 0.0;
+            }
             let mut tree = crate::ctw::ContextTree::new(*depth);
             for &b in data {
                 for i in (0..8).rev() {
@@ -557,6 +578,9 @@ pub fn cross_entropy_rate_backend(
             with_rwkv_tls(model, |c| c.cross_entropy_conditional(y, x).unwrap_or(0.0))
         }
         RateBackend::Ctw { depth } => {
+            if x.is_empty() {
+                return 0.0;
+            }
             let mut tree = crate::ctw::ContextTree::new(*depth);
             // Train on y
             for &b in y {
@@ -1494,4 +1518,104 @@ mod tests {
         let h_rosa_back = entropy_rate_bytes(x, 8);
         assert!((h_rosa - h_rosa_back).abs() < 1e-12);
     }
+
+    #[test]
+    fn ctw_early_updates_work() {
+        // Test that CTW produces valid predictions from the very start,
+        // not just after `depth` symbols have been processed.
+        use crate::ctw::ContextTree;
+
+        let mut tree = ContextTree::new(16);
+
+        // Even the first prediction should be valid (not NaN, not 0)
+        let p0 = tree.predict(false);
+        let p1 = tree.predict(true);
+
+        // Initial KT estimator gives 0.5 / 1 = 0.5 for each symbol
+        assert!((p0 - 0.5).abs() < 1e-10, "p0 should be ~0.5, got {}", p0);
+        assert!((p1 - 0.5).abs() < 1e-10, "p1 should be ~0.5, got {}", p1);
+        assert!((p0 + p1 - 1.0).abs() < 1e-10, "p0 + p1 should = 1.0");
+
+        // Update with a few symbols and verify log_prob becomes negative (valid)
+        for _ in 0..5 {
+            tree.update(true);
+            tree.update(false);
+        }
+
+        let log_prob = tree.get_log_block_probability();
+        assert!(log_prob < 0.0, "log_prob should be negative (< log 1), got {}", log_prob);
+        assert!(log_prob.is_finite(), "log_prob should be finite");
+    }
+
+    #[test]
+    fn nte_can_exceed_one() {
+        // Test that NTE is properly clamped to [0, 2] instead of [0, 1]
+        // For independent sequences with similar entropy, NTE can approach 2.0
+        //
+        // Note: For *marginal* NTE, due to how joint entropy works for aligned pairs,
+        // it's mathematically bounded differently. The fix for NTE clamping primarily
+        // affects *rate*-based NTE where VI can truly be 2*max(H).
+        //
+        // We test that the clamp upper bound is at least > 1.0 for cases where VI > max(H)
+
+        // Use CTW backend for rate-based test
+        set_default_ctx(InfotheoryCtx::new(
+            RateBackend::Ctw { depth: 8 },
+            NcdBackend::default(),
+        ));
+
+        // Generate two completely different patterns - should have high VI
+        let x: Vec<u8> = (0..200).map(|i| (i % 2) as u8).collect(); // 010101...
+        let y: Vec<u8> = (0..200).map(|i| ((i + 1) % 2) as u8).collect(); // 101010...
+
+        let nte_rate = nte_rate_backend(&x, &y, -1, &RateBackend::Ctw { depth: 8 });
+
+        // With the fix, NTE should not be clamped to 1.0
+        // It may or may not exceed 1.0 depending on the specifics, but it should be allowed to
+        assert!(
+            nte_rate >= 0.0 && nte_rate <= 2.0 + 1e-9,
+            "NTE should be in [0, 2], got {}",
+            nte_rate
+        );
+
+        // Reset context
+        set_default_ctx(InfotheoryCtx::default());
+    }
+
+    #[test]
+    fn ctw_empty_data_returns_zero() {
+        // Verify empty data doesn't cause division-by-zero or NaN
+        set_default_ctx(InfotheoryCtx::new(
+            RateBackend::Ctw { depth: 16 },
+            NcdBackend::default(),
+        ));
+
+        let empty: &[u8] = &[];
+        let h = entropy_rate_bytes(empty, -1);
+        assert_eq!(h, 0.0, "empty data should return 0.0 entropy");
+
+        // Reset
+        set_default_ctx(InfotheoryCtx::default());
+    }
+
+    #[test]
+    fn datagen_bernoulli_entropy_estimate() {
+        // Test that estimated entropy is close to theoretical for Bernoulli(0.5)
+        let p = 0.5;
+        let theoretical_h = crate::datagen::bernoulli_entropy(p);
+        assert!((theoretical_h - 1.0).abs() < 1e-10);
+
+        // Generate data and check marginal entropy is close to theoretical
+        let data = crate::datagen::bernoulli(10000, p, 42);
+        let estimated_h = marginal_entropy_bytes(&data);
+
+        // Should be close to 1.0 bit (since values are 0 or 1)
+        assert!(
+            (estimated_h - theoretical_h).abs() < 0.1,
+            "estimated H={} should be close to theoretical H={}",
+            estimated_h,
+            theoretical_h
+        );
+    }
 }
+

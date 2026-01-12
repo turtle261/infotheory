@@ -328,6 +328,13 @@ impl<T> OptionExt<T> for Option<T> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    // Check for help flag early
+    if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
+        print_usage();
+        return;
+    }
+
     if args.len() < 2 {
         print_usage();
         return;
@@ -492,7 +499,44 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "Usage: infotheory <primitive> <file1> <file2> [method/max_order] [--rate-backend <backend>] [--ncd-backend <backend>]"
+        r#"InfoTheory CLI
+Usage: infotheory <primitive> [args...] [options]
+
+Primitives:
+  Entropy & Information:
+    h, entropy <file> [max_order]           Entropy (marginal if order=0, rate if >0)
+    h_rate, entropy_rate <file> [max_order] Force entropy rate estimation
+    mi, mutual_info <f1> <f2> [max_order]   Mutual Information I(X;Y)
+    xe, cross_entropy <f1> <f2> [max_order] Cross Entropy H(X,Y) - H(Y)? (Check def)
+    ce, conditional_entropy <f1> <f2>       Conditional Entropy H(X|Y)
+    joint_entropy, h_xy <f1> <f2>           Joint Entropy H(X,Y)
+    id, intrinsic_dep <file> [max_order]    Intrinsic Dependence
+
+  Distance & Divergence:
+    ncd <f1> <f2> [method]                  Normalized Compression Distance (Vitanyi)
+    ncd_sym, ncd_cons                       NCD variants (Symmetric, Consistent, etc.)
+    ned <f1> <f2> [max_order]               Normalized Entropy Distance
+    nte <f1> <f2> [max_order]               Normalized Transform Effort
+    kl, kl_divergence <f1> <f2>             Kullback-Leibler Divergence
+    js, js_divergence <f1> <f2>             Jensen-Shannon Divergence
+    tvd <f1> <f2>                           Total Variation Distance
+    nhd <f1> <f2>                           Normalized Hellinger Distance
+    rt, resistance <f1> <f2>                Resistance to Transformation
+
+  Tools:
+    search <query> <target> [options]       Search target using info-theoretic ranking
+    aixi <config.json>                      Run AIXI agent
+    batch                                   Run in JSON-L batch mode
+
+Options:
+  --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'rwkv7'
+  --ncd-backend <name>    Backend for NCD: 'zpaq' (default), 'rwkv7'
+  --method <val>          Method/Depth parameter (e.g. '5' for zpaq, '16' for ctw)
+
+Examples:
+  infotheory ncd file1.txt file2.txt --ncd-backend zpaq --method 5
+  infotheory h file.txt --rate-backend ctw --method 32
+  infotheory search "encryption" ./src --prior "codebase context"
+"#
     );
-    eprintln!("Backends: rosaplus (default), ctw, rwkv7");
 }

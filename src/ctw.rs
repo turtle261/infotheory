@@ -156,13 +156,14 @@ impl ContextTree {
     }
 
     /// Updates the tree with a new symbol.
+    ///
+    /// Uses shorter contexts when history length is less than `max_depth`,
+    /// ensuring valid updates from the very first symbol.
     pub fn update(&mut self, sym: Symbol) {
-        if self.history.len() >= self.max_depth {
-            let history_len = self.history.len();
-            let context = &self.history[history_len - self.max_depth..];
-
-            Self::update_node(&mut self.root, context, sym, false, 0);
-        }
+        let history_len = self.history.len();
+        let ctx_len = history_len.min(self.max_depth);
+        let context = &self.history[history_len - ctx_len..];
+        Self::update_node(&mut self.root, context, sym, false, 0);
         self.history.push(sym);
     }
 
@@ -201,25 +202,15 @@ impl ContextTree {
     }
 
     /// Reverts the tree to its state before the last `update`.
+    ///
+    /// This undoes the effect of the most recent symbol update, using
+    /// the same context-length logic as `update()`.
     pub fn revert(&mut self) {
-        if self.history.len() < self.max_depth + 1 {
-            if self.history.len() > self.max_depth {
-                let last_sym = *self.history.last().unwrap();
-                self.history.pop();
-
-                let history_len = self.history.len();
-                let context = &self.history[history_len - self.max_depth..];
-                Self::update_node(&mut self.root, context, last_sym, true, 0);
-            } else {
-                self.history.pop();
-            }
-        } else {
-            let last_sym = *self.history.last().unwrap();
-            self.history.pop();
-            let history_len = self.history.len();
-            let context = &self.history[history_len - self.max_depth..];
-            Self::update_node(&mut self.root, context, last_sym, true, 0);
-        }
+        let Some(last_sym) = self.history.pop() else { return; };
+        let history_len = self.history.len();
+        let ctx_len = history_len.min(self.max_depth);
+        let context = &self.history[history_len - ctx_len..];
+        Self::update_node(&mut self.root, context, last_sym, true, 0);
     }
 
     /// Removes the last symbol from history.
