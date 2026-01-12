@@ -160,12 +160,19 @@ impl ContextTree {
     /// Uses shorter contexts when history length is less than `max_depth`,
     /// ensuring valid updates from the very first symbol.
     pub fn update(&mut self, sym: Symbol) {
+        // Pad context with zeros to ensure fixed tree depth
+        let mut context = vec![false; self.max_depth];
         let history_len = self.history.len();
-        let ctx_len = history_len.min(self.max_depth);
-        let context = &self.history[history_len - ctx_len..];
-        Self::update_node(&mut self.root, context, sym, false, 0);
+        let copy_len = history_len.min(self.max_depth);
+        if copy_len > 0 {
+            context[self.max_depth - copy_len..].copy_from_slice(&self.history[history_len - copy_len..]);
+        }
+        
+        Self::update_node(&mut self.root, &context, sym, false, 0);
         self.history.push(sym);
     }
+    
+    // ...
 
     fn update_node(
         node: &mut CtNode,
@@ -196,21 +203,25 @@ impl ContextTree {
         revert && node.visits() == 0
     }
 
+    // ...
+
     /// Appends symbols to the history without updating the tree.
     pub fn update_history(&mut self, symbols: &[Symbol]) {
         self.history.extend_from_slice(symbols);
     }
 
-    /// Reverts the tree to its state before the last `update`.
-    ///
-    /// This undoes the effect of the most recent symbol update, using
-    /// the same context-length logic as `update()`.
     pub fn revert(&mut self) {
         let Some(last_sym) = self.history.pop() else { return; };
+        
+        // Use same padded context logic
+        let mut context = vec![false; self.max_depth];
         let history_len = self.history.len();
-        let ctx_len = history_len.min(self.max_depth);
-        let context = &self.history[history_len - ctx_len..];
-        Self::update_node(&mut self.root, context, last_sym, true, 0);
+        let copy_len = history_len.min(self.max_depth);
+        if copy_len > 0 {
+            context[self.max_depth - copy_len..].copy_from_slice(&self.history[history_len - copy_len..]);
+        }
+        
+        Self::update_node(&mut self.root, &context, last_sym, true, 0);
     }
 
     /// Removes the last symbol from history.

@@ -169,8 +169,57 @@ pub fn identical_pair(n: usize, seed: u64) -> (Vec<u8>, Vec<u8>) {
 /// Generate two independent random sequences (for testing independence properties).
 ///
 /// MI(X,Y) ≈ 0, NED(X,Y) ≈ 1, NTE(X,Y) ≈ 2 (for similar entropies)
+/// Generate two independent random sequences (for testing independence properties).
+///
+/// MI(X,Y) ≈ 0, NED(X,Y) ≈ 1, NTE(X,Y) ≈ 2 (for similar entropies)
 pub fn independent_pair(n: usize, seed1: u64, seed2: u64) -> (Vec<u8>, Vec<u8>) {
     (uniform_random(n, seed1), uniform_random(n, seed2))
+}
+
+/// Generate three sequences X, Y, Z where Z = X XOR Y.
+///
+/// X, Y are independent uniform random bits.
+/// Information content: I(X;Z)=0, I(Y;Z)=0, but I(X,Y;Z) > 0.
+/// This forms a classic example where pairwise independence does not imply mutual independence.
+pub fn xor_pair(n: usize, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let x = bernoulli(n, 0.5, seed);
+    let y = bernoulli(n, 0.5, seed.wrapping_add(1337));
+    let z: Vec<u8> = x.iter().zip(y.iter()).map(|(&a, &b)| a ^ b).collect();
+    (x, y, z)
+}
+
+/// Generate a Binary Symmetric Channel (BSC) output.
+///
+/// Input X is uniform random bits. Y is X with bits flipped with probability `flip_prob`.
+/// Theoretical MI: 1 - H(flip_prob).
+pub fn noisy_channel(n: usize, flip_prob: f64, seed: u64) -> (Vec<u8>, Vec<u8>) {
+    let x = bernoulli(n, 0.5, seed);
+    let noise = bernoulli(n, flip_prob, seed.wrapping_add(9999));
+    let y: Vec<u8> = x.iter().zip(noise.iter()).map(|(&a, &b)| a ^ b).collect();
+    (x, y)
+}
+
+/// Generate a functionally dependent pair Y = f(X).
+///
+/// X is uniform random bytes. Y is a deterministic transformation of X.
+/// I(X;Y) = H(Y). H(Y|X) = 0.
+///
+/// `f` maps a byte to a byte.
+pub fn deterministic_func<F>(n: usize, seed: u64, f: F) -> (Vec<u8>, Vec<u8>)
+where
+    F: Fn(u8) -> u8,
+{
+    let x = uniform_random(n, seed);
+    let y: Vec<u8> = x.iter().map(|&b| f(b)).collect();
+    (x, y)
+}
+
+/// Generate a highly compressible string (repeating pattern).
+///
+/// Rate-based entropy should approach 0.
+pub fn highly_compressible(n: usize, period: usize) -> Vec<u8> {
+    let pattern: Vec<u8> = (0..period).map(|i| (i % 256) as u8).collect();
+    periodic(n, &pattern)
 }
 
 #[cfg(test)]
