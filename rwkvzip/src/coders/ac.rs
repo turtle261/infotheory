@@ -1,0 +1,668 @@
+//! Arithmetic Coder implementation for rwkvzip.
+//!
+//! This implements a binary arithmetic coder with 32-bit precision, optimized for
+//! neural network probability distributions. The implementation is mathematically
+//! rigorous to ensure lossless compression.
+//!
+//! # Information-Theoretic Properties
+//!
+//! - Uses base-2 arithmetic for bitstream output
+//! - 32-bit precision prevents underflow for typical neural network distributions
+//! - Integer CDF quantization uses 30-bit total (2^30) to minimize quantization error
+//! - Probability floor ensures no symbol has zero probability (critical for lossless)
+
+use std::io::Write;
+
+/// Total count for CDF quantization (2^30 for high precision)
+pub const CDF_TOTAL: u32 = 1 << 30;
+
+/// Arithmetic coder precision in bits
+const PRECISION: u32 = 32;
+
+/// Base for arithmetic coding (binary)
+const BASE: u64 = 2;
+
+/// Returns the minimum probability floor for symbols.
+/// P_MIN = 2 * 2^(-(PRECISION-2)) = 2^(-(PRECISION-3)) = 2^(-29)
+#[inline]
+pub fn p_min() -> f64 {
+    // 2.0 * 2.0^(-(32-2)) = 2^(-29) ≈ 1.86e-9
+    2.0f64.powi(-(PRECISION as i32 - 3))
+}
+
+/// Compute softmax PDF with probability floor.
+///
+/// # Arguments
+/// * `logits` - Raw logits from the model
+/// * `vocab_size` - Size of the vocabulary (256 for byte-level)
+///
+/// # Returns
+/// Probability distribution with floor applied, normalized to sum to 1.
+pub fn softmax_pdf_floor(logits: &[f32], vocab_size: usize) -> Vec<f64> {
+    let mut result = vec![0f64; vocab_size];
+    softmax_pdf_floor_inplace(logits, vocab_size, &mut result);
+    result
+}
+
+pub fn softmax_pdf_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64]) {
+    debug_assert!(pdf_out.len() >= vocab_size);
+
+    let max = logits
+        .iter()
+        .take(vocab_size)
+        .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
+    let mut sum = 0.0f64;
+    for i in 0..vocab_size {
+        let e = ((logits[i] - max) as f64).exp();
+        pdf_out[i] = e;
+        sum += e;
+    }
+
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for i in 0..vocab_size {
+            pdf_out[i] *= inv;
+        }
+    } else {
+        let inv = 1.0 / (vocab_size.max(1) as f64);
+        for i in 0..vocab_size {
+            pdf_out[i] = inv;
+        }
+    }
+}
+
+/// In-place version of softmax_pdf_floor to avoid allocations.
+///
+/// # Arguments
+/// * `logits` - Raw logits from the model
+/// * `vocab_size` - Size of the vocabulary
+/// * `pdf_out` - Pre-allocated buffer for output PDF (length >= vocab_size)
+pub fn softmax_pdf_floor_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64]) {
+    // Fast path for vocab_size=256 with AVX2
+    #[cfg(target_arch = "x86_64")]
+    if vocab_size == 256 {
+        unsafe { softmax_pdf_floor_avx2(logits, pdf_out) };
+        return;
+    }
+
+    let p_min_val = p_min();
+
+    // Find max for numerical stability
+    let max = logits
+        .iter()
+        .take(vocab_size)
+        .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
+    // Compute exp(x - max) and sum (reuse pdf_out as temp buffer)
+    let mut sum = 0.0f64;
+    for i in 0..vocab_size {
+        let e = ((logits[i] - max) as f64).exp();
+        pdf_out[i] = e;
+        sum += e;
+    }
+
+    // Normalize and apply floor
+    for i in 0..vocab_size {
+        pdf_out[i] = (pdf_out[i] / sum).max(p_min_val);
+    }
+
+    // Re-normalize after floor application
+    let norm: f64 = pdf_out[..vocab_size].iter().sum();
+    for i in 0..vocab_size {
+        pdf_out[i] /= norm;
+    }
+}
+
+/// AVX2-optimized softmax with probability floor for vocab_size=256.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softmax_pdf_floor_avx2(logits: &[f32], pdf_out: &mut [f64]) {
+    use std::arch::x86_64::*;
+
+    const N: usize = 256;
+    let p_min_val = p_min();
+
+    // Find max using AVX2
+    let mut max_v = _mm256_set1_ps(f32::NEG_INFINITY);
+    for i in (0..N).step_by(8) {
+        let v = _mm256_loadu_ps(logits.as_ptr().add(i));
+        max_v = _mm256_max_ps(max_v, v);
+    }
+    // Horizontal max reduction
+    let hi = _mm256_extractf128_ps(max_v, 1);
+    let lo = _mm256_castps256_ps128(max_v);
+    let max128 = _mm_max_ps(hi, lo);
+    let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+    let max32 = _mm_max_ss(max64, _mm_shuffle_ps(max64, max64, 0x55));
+    let max = _mm_cvtss_f32(max32);
+    let max_v = _mm256_set1_ps(max);
+
+    // Compute exp(x - max) and sum
+    // Use f32 for exp computation, convert to f64 for accumulation
+    let mut sum0 = _mm256_setzero_pd();
+    let mut sum1 = _mm256_setzero_pd();
+    for i in (0..N).step_by(8) {
+        let v = _mm256_loadu_ps(logits.as_ptr().add(i));
+        let centered = _mm256_sub_ps(v, max_v);
+        let exp_vals = exp256_ps_fast(centered);
+
+        // Convert f32 to f64 using AVX2: 8 floats -> 2x4 doubles
+        let lo4 = _mm256_castps256_ps128(exp_vals);
+        let hi4 = _mm256_extractf128_ps(exp_vals, 1);
+        let d_lo = _mm256_cvtps_pd(lo4);
+        let d_hi = _mm256_cvtps_pd(hi4);
+
+        // Store and accumulate
+        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i), d_lo);
+        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i + 4), d_hi);
+        sum0 = _mm256_add_pd(sum0, d_lo);
+        sum1 = _mm256_add_pd(sum1, d_hi);
+    }
+
+    // Horizontal sum of sum0 and sum1
+    let sum01 = _mm256_add_pd(sum0, sum1);
+    let hi128 = _mm256_extractf128_pd(sum01, 1);
+    let lo128 = _mm256_castpd256_pd128(sum01);
+    let sum2 = _mm_add_pd(hi128, lo128);
+    let sum1_v = _mm_unpackhi_pd(sum2, sum2);
+    let sum_v = _mm_add_sd(sum2, sum1_v);
+    let sum = _mm_cvtsd_f64(sum_v);
+
+    // Normalize and apply floor
+    let inv_sum = 1.0 / sum;
+    let p_min_v = _mm256_set1_pd(p_min_val);
+    let inv_sum_v = _mm256_set1_pd(inv_sum);
+
+    let mut new_sum0 = _mm256_setzero_pd();
+    let mut new_sum1 = _mm256_setzero_pd();
+    for i in (0..N).step_by(8) {
+        let v0 = _mm256_loadu_pd(pdf_out.as_ptr().add(i));
+        let v1 = _mm256_loadu_pd(pdf_out.as_ptr().add(i + 4));
+        let normed0 = _mm256_mul_pd(v0, inv_sum_v);
+        let normed1 = _mm256_mul_pd(v1, inv_sum_v);
+        let floored0 = _mm256_max_pd(normed0, p_min_v);
+        let floored1 = _mm256_max_pd(normed1, p_min_v);
+        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i), floored0);
+        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i + 4), floored1);
+        new_sum0 = _mm256_add_pd(new_sum0, floored0);
+        new_sum1 = _mm256_add_pd(new_sum1, floored1);
+    }
+
+    // Horizontal sum for new_sum
+    let ns01 = _mm256_add_pd(new_sum0, new_sum1);
+    let ns_hi = _mm256_extractf128_pd(ns01, 1);
+    let ns_lo = _mm256_castpd256_pd128(ns01);
+    let ns2 = _mm_add_pd(ns_hi, ns_lo);
+    let ns1 = _mm_unpackhi_pd(ns2, ns2);
+    let ns_v = _mm_add_sd(ns2, ns1);
+    let new_sum = _mm_cvtsd_f64(ns_v);
+
+    // Re-normalize
+    let inv_norm = 1.0 / new_sum;
+    let inv_norm_v = _mm256_set1_pd(inv_norm);
+    for i in (0..N).step_by(8) {
+        let v0 = _mm256_loadu_pd(pdf_out.as_ptr().add(i));
+        let v1 = _mm256_loadu_pd(pdf_out.as_ptr().add(i + 4));
+        let result0 = _mm256_mul_pd(v0, inv_norm_v);
+        let result1 = _mm256_mul_pd(v1, inv_norm_v);
+        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i), result0);
+        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i + 4), result1);
+    }
+}
+
+/// Fast exp approximation for f32 (AVX2).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn exp256_ps_fast(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+
+    // Clamp to avoid overflow/underflow
+    let x = _mm256_max_ps(
+        _mm256_min_ps(x, _mm256_set1_ps(88.0)),
+        _mm256_set1_ps(-88.0),
+    );
+
+    // exp(x) = 2^(x * log2(e))
+    let log2e = _mm256_set1_ps(1.442695041);
+    let fx = _mm256_mul_ps(x, log2e);
+
+    // Split into integer and fractional parts
+    let fx_floor = _mm256_floor_ps(fx);
+    let f = _mm256_sub_ps(fx, fx_floor);
+
+    // Polynomial approximation for 2^f where f in [0, 1]
+    // 2^f ≈ 1 + f*(0.693147 + f*(0.240226 + f*0.0558))
+    let c0 = _mm256_set1_ps(1.0);
+    let c1 = _mm256_set1_ps(0.693147180559945);
+    let c2 = _mm256_set1_ps(0.240226506959101);
+    let c3 = _mm256_set1_ps(0.0558263180532956);
+
+    let poly = _mm256_fmadd_ps(f, c3, c2);
+    let poly = _mm256_fmadd_ps(f, poly, c1);
+    let poly = _mm256_fmadd_ps(f, poly, c0);
+
+    // Scale by 2^n using float bit manipulation
+    let n = _mm256_cvtps_epi32(fx_floor);
+    let n = _mm256_add_epi32(n, _mm256_set1_epi32(127)); // Add exponent bias
+    let n = _mm256_slli_epi32(n, 23); // Shift to exponent position
+    let pow2n = _mm256_castsi256_ps(n);
+
+    _mm256_mul_ps(poly, pow2n)
+}
+
+/// Compute softmax PDF without floor (for entropy calculation).
+pub fn softmax_pdf(logits: &[f32], vocab_size: usize) -> Vec<f64> {
+    let max = logits
+        .iter()
+        .take(vocab_size)
+        .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
+    let mut exps = vec![0f64; vocab_size];
+    let mut sum = 0.0f64;
+    for i in 0..vocab_size {
+        let e = ((logits[i] - max) as f64).exp();
+        exps[i] = e;
+        sum += e;
+    }
+
+    if sum <= 0.0 {
+        // Uniform distribution fallback
+        let uniform = 1.0 / (vocab_size as f64);
+        return vec![uniform; vocab_size];
+    }
+
+    let mut pdf = vec![0f64; vocab_size];
+    for i in 0..vocab_size {
+        pdf[i] = exps[i] / sum;
+    }
+    pdf
+}
+
+/// Quantize probability distribution to integer CDF.
+///
+/// The CDF is constructed to be monotonically non-decreasing with:
+/// - `cdf[0] = 0`
+/// - `cdf[vocab_size] = CDF_TOTAL`
+///
+/// # Arguments
+/// * `pdf` - Probability distribution (must sum to ~1.0)
+///
+/// # Returns
+/// Integer CDF with length vocab_size + 1
+pub fn quantize_pdf_to_cdf(pdf: &[f64]) -> Vec<u32> {
+    let mut cdf = vec![0u32; pdf.len() + 1];
+    quantize_pdf_to_cdf_inplace(pdf, &mut cdf);
+    cdf
+}
+
+/// Quantize PDF to integer CDF using a reusable output buffer.
+///
+/// `cdf_out` must have length at least `pdf.len() + 1`.
+#[inline]
+pub fn quantize_pdf_to_cdf_inplace(pdf: &[f64], cdf_out: &mut [u32]) {
+    let n = pdf.len();
+    debug_assert!(cdf_out.len() >= n + 1, "cdf buffer too small");
+
+    unsafe {
+        *cdf_out.get_unchecked_mut(0) = 0;
+        let scale = CDF_TOTAL as f64;
+        let mut acc = 0.0f64;
+        let mut prev = 0u32;
+
+        for i in 0..n {
+            acc += *pdf.get_unchecked(i);
+            let v = (acc * scale) as u32;
+            let v = v.max(prev);
+            *cdf_out.get_unchecked_mut(i + 1) = v;
+            prev = v;
+        }
+        *cdf_out.get_unchecked_mut(n) = CDF_TOTAL;
+    }
+}
+
+/// Binary arithmetic encoder.
+pub struct ArithmeticEncoder<W: Write> {
+    b_to_pm1: u64,
+    b_to_pm2: u64,
+    mask: u64,
+    low: u64,
+    high: u64,
+    carry_run: u64,
+    out: W,
+    bit_buffer: u8,
+    bit_count: u8,
+    bytes_out: u64,
+}
+
+impl<W: Write> ArithmeticEncoder<W> {
+    /// Create a new arithmetic encoder.
+    pub fn new(out: W) -> Self {
+        let b_to_pm1 = BASE.pow(PRECISION - 1);
+        let b_to_pm2 = BASE.pow(PRECISION - 2);
+        let mask = BASE.pow(PRECISION) - 1;
+        Self {
+            b_to_pm1,
+            b_to_pm2,
+            mask,
+            low: 0,
+            high: mask,
+            carry_run: 0,
+            out,
+            bit_buffer: 0,
+            bit_count: 0,
+            bytes_out: 0,
+        }
+    }
+
+    #[inline]
+    fn write_byte(&mut self, byte: u8) -> anyhow::Result<()> {
+        self.out.write_all(&[byte])?;
+        self.bytes_out += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn put_bit_internal(&mut self, bit: u8) -> anyhow::Result<()> {
+        self.bit_buffer = (self.bit_buffer << 1) | (bit & 1);
+        self.bit_count += 1;
+        if self.bit_count == 8 {
+            let b = self.bit_buffer;
+            self.write_byte(b)?;
+            self.bit_buffer = 0;
+            self.bit_count = 0;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn put_bit(&mut self, bit: u8) -> anyhow::Result<()> {
+        self.put_bit_internal(bit)?;
+        while self.carry_run > 0 {
+            self.put_bit_internal((!bit) & 1)?;
+            self.carry_run -= 1;
+        }
+        Ok(())
+    }
+
+    /// Encode a symbol using integer CDF bounds.
+    ///
+    /// # Arguments
+    /// * `c_lo` - Lower CDF bound (cumulative probability before symbol)
+    /// * `c_hi` - Upper CDF bound (cumulative probability including symbol)
+    /// * `total` - Total CDF range (should be CDF_TOTAL)
+    pub fn encode_counts(&mut self, c_lo: u64, c_hi: u64, total: u64) -> anyhow::Result<()> {
+        let range = (self.high - self.low + 1) as u128;
+        let total_u = total as u128;
+        let c_lo_u = c_lo as u128;
+        let c_hi_u = c_hi as u128;
+        let low_u = self.low as u128;
+
+        let new_low = low_u + (range * c_lo_u) / total_u;
+        let new_high = low_u + (range * c_hi_u) / total_u - 1;
+
+        self.low = (new_low & (self.mask as u128)) as u64;
+        self.high = (new_high & (self.mask as u128)) as u64;
+
+        loop {
+            if self.high < self.b_to_pm1 {
+                self.put_bit(0)?;
+            } else if self.low >= self.b_to_pm1 {
+                self.put_bit(1)?;
+                self.low -= self.b_to_pm1;
+                self.high -= self.b_to_pm1;
+            } else if self.low >= self.b_to_pm2 && self.high < self.b_to_pm2 * 3 {
+                self.carry_run += 1;
+                self.low -= self.b_to_pm2;
+                self.high -= self.b_to_pm2;
+            } else {
+                break;
+            }
+            self.low = (self.low << 1) & self.mask;
+            self.high = ((self.high << 1) & self.mask) | 1;
+        }
+        Ok(())
+    }
+
+    /// Encode a symbol given its PDF and symbol index.
+    ///
+    /// This is a convenience method that quantizes the PDF to CDF internally.
+    pub fn encode_symbol(&mut self, pdf: &[f64], sym: usize) -> anyhow::Result<()> {
+        let cdf = quantize_pdf_to_cdf(pdf);
+        let c_lo = cdf[sym] as u64;
+        let c_hi = cdf[sym + 1] as u64;
+        self.encode_counts(c_lo, c_hi, CDF_TOTAL as u64)
+    }
+
+    /// Finish encoding and flush remaining bits.
+    ///
+    /// Returns the underlying writer.
+    pub fn finish(mut self) -> anyhow::Result<W> {
+        self.carry_run += 1;
+        if self.low < self.b_to_pm2 {
+            self.put_bit(0)?;
+        } else {
+            self.put_bit(1)?;
+        }
+        // Pad remaining bits
+        if self.bit_count > 0 {
+            let remaining = 8 - self.bit_count;
+            for _ in 0..remaining {
+                self.put_bit_internal(0)?;
+            }
+        }
+        Ok(self.out)
+    }
+
+    /// Get the number of bytes written so far.
+    #[inline]
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_out
+    }
+}
+
+/// Binary arithmetic decoder.
+pub struct ArithmeticDecoder<'a> {
+    b_to_pm1: u64,
+    b_to_pm2: u64,
+    mask: u64,
+    low: u64,
+    high: u64,
+    code: u64,
+    input: &'a [u8],
+    byte_pos: usize,
+    bit_pos: u8,
+}
+
+impl<'a> ArithmeticDecoder<'a> {
+    /// Create a new arithmetic decoder from input bytes.
+    pub fn new(input: &'a [u8]) -> anyhow::Result<Self> {
+        let b_to_pm1 = BASE.pow(PRECISION - 1);
+        let b_to_pm2 = BASE.pow(PRECISION - 2);
+        let mask = BASE.pow(PRECISION) - 1;
+
+        let mut s = Self {
+            b_to_pm1,
+            b_to_pm2,
+            mask,
+            low: 0,
+            high: mask,
+            code: 0,
+            input,
+            byte_pos: 0,
+            bit_pos: 0,
+        };
+
+        // Initialize code register with first PRECISION bits
+        for _ in 0..PRECISION {
+            s.code = (s.code << 1) | (s.get_bit().unwrap_or(1) as u64);
+        }
+
+        Ok(s)
+    }
+
+    #[inline]
+    fn get_bit(&mut self) -> Option<u8> {
+        if self.byte_pos >= self.input.len() {
+            return None;
+        }
+        let byte = self.input[self.byte_pos];
+        let bit = (byte >> (7 - self.bit_pos)) & 1;
+        self.bit_pos += 1;
+        if self.bit_pos >= 8 {
+            self.bit_pos = 0;
+            self.byte_pos += 1;
+        }
+        Some(bit)
+    }
+
+    /// Decode a symbol using integer CDF.
+    ///
+    /// # Arguments
+    /// * `cdf` - Cumulative distribution function (length = vocab_size + 1)
+    /// * `total` - Total CDF range (should be CDF_TOTAL)
+    ///
+    /// # Returns
+    /// The decoded symbol index.
+    pub fn decode_symbol_counts(&mut self, cdf: &[u32], total: u32) -> anyhow::Result<usize> {
+        let total_u = total as u64;
+        let range = self.high - self.low + 1;
+        let value =
+            (((self.code - self.low + 1) as u128 * (total_u as u128)) - 1) / (range as u128);
+        let value_u = value as u32;
+
+        // Binary search for symbol `s` with `cdf[s] <= value < cdf[s+1]`
+        let mut lo = 0usize;
+        let mut hi = cdf.len() - 1;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if cdf[mid] <= value_u {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let s = lo;
+        let c_lo = cdf[s] as u64;
+        let c_hi = cdf[s + 1] as u64;
+
+        // Update range
+        let range = (self.high - self.low + 1) as u128;
+        let low_u = self.low as u128;
+        let total_u128 = total as u128;
+        let new_low = low_u + (range * (c_lo as u128)) / total_u128;
+        let new_high = low_u + (range * (c_hi as u128)) / total_u128 - 1;
+
+        self.low = new_low as u64;
+        self.high = new_high as u64;
+
+        // Renormalize
+        loop {
+            if self.high < self.b_to_pm1 {
+                // nothing
+            } else if self.low >= self.b_to_pm1 {
+                self.low -= self.b_to_pm1;
+                self.high -= self.b_to_pm1;
+                self.code -= self.b_to_pm1;
+            } else if self.low >= self.b_to_pm2 && self.high < self.b_to_pm2 * 3 {
+                self.low -= self.b_to_pm2;
+                self.high -= self.b_to_pm2;
+                self.code -= self.b_to_pm2;
+            } else {
+                break;
+            }
+            self.low = (self.low << 1) & self.mask;
+            self.high = ((self.high << 1) & self.mask) | 1;
+            self.code = ((self.code << 1) & self.mask) | (self.get_bit().unwrap_or(1) as u64);
+        }
+
+        Ok(s)
+    }
+
+    /// Decode a symbol given a PDF.
+    ///
+    /// This is a convenience method that quantizes the PDF to CDF internally.
+    pub fn decode_symbol(&mut self, pdf: &[f64]) -> anyhow::Result<usize> {
+        let cdf = quantize_pdf_to_cdf(pdf);
+        self.decode_symbol_counts(&cdf, CDF_TOTAL)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_roundtrip_uniform() {
+        // Test with uniform distribution
+        let pdf = vec![0.25, 0.25, 0.25, 0.25];
+        let symbols = vec![0, 1, 2, 3, 0, 1, 2, 3];
+
+        // Encode
+        let mut buf = Vec::new();
+        let mut enc = ArithmeticEncoder::new(&mut buf);
+        for &s in &symbols {
+            enc.encode_symbol(&pdf, s).unwrap();
+        }
+        let buf = enc.finish().unwrap().to_vec();
+
+        // Decode
+        let mut dec = ArithmeticDecoder::new(&buf).unwrap();
+        for &expected in &symbols {
+            let got = dec.decode_symbol(&pdf).unwrap();
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_skewed() {
+        // Test with skewed distribution
+        let pdf = vec![0.7, 0.2, 0.05, 0.05];
+        let symbols = vec![0, 0, 0, 1, 0, 2, 0, 3, 0, 0];
+
+        // Encode
+        let mut buf = Vec::new();
+        let mut enc = ArithmeticEncoder::new(&mut buf);
+        for &s in &symbols {
+            enc.encode_symbol(&pdf, s).unwrap();
+        }
+        let buf = enc.finish().unwrap().to_vec();
+
+        // Decode
+        let mut dec = ArithmeticDecoder::new(&buf).unwrap();
+        for &expected in &symbols {
+            let got = dec.decode_symbol(&pdf).unwrap();
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn test_softmax_pdf_floor() {
+        let logits = vec![1.0f32, 2.0, 3.0, 4.0];
+        let pdf = softmax_pdf_floor(&logits, 4);
+
+        // Check sum is ~1
+        let sum: f64 = pdf.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-10);
+
+        // Check all probabilities are >= floor
+        let p_min_val = p_min();
+        for &p in &pdf {
+            assert!(p >= p_min_val);
+        }
+    }
+
+    #[test]
+    fn test_cdf_monotonic() {
+        let pdf = vec![0.1, 0.2, 0.3, 0.4];
+        let cdf = quantize_pdf_to_cdf(&pdf);
+
+        assert_eq!(cdf[0], 0);
+        assert_eq!(cdf[4], CDF_TOTAL);
+
+        // Check monotonicity
+        for i in 1..cdf.len() {
+            assert!(cdf[i] >= cdf[i - 1]);
+        }
+    }
+}

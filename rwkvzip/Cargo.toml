@@ -1,0 +1,66 @@
+[package]
+name = "rwkvzip"
+version = "0.1.0"
+edition = "2021"
+authors = ["Noah Cashin <noahc959@icloud.com>"]
+license = "Apache-2.0"
+description = "High-performance RWKV7-based byte-level lossless compressor for haswell+ x86_64 CPUs."
+keywords = ["compression", "rwkv", "neural", "lossless"]
+categories = ["compression", "command-line-utilities"]
+
+[lib]
+name = "rwkvzip"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rwkvzip"
+path = "src/main.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[features]
+# Training requires libtorch via the `tch` crate. This is enabled by default to
+# satisfy the end-to-end `rwkvzip train` workflow.
+default = ["training"]
+training = ["dep:tch", "dep:rand", "dep:rand_chacha", "dep:memmap2"]
+# CUDA WKV kernel (auto-detected by build.rs, do not enable manually)
+cuda_wkv = []
+
+[dependencies]
+ahash = "0.8.12"
+anyhow = "1.0.100"
+crc32fast = "1.5.0"
+rayon = "1.11"  # For parallel CPU WKV
+serde_json = "1.0.149"  # For safetensors header parsing
+
+# Training stack (optional)
+tch = { version = "0.16", optional = true, features = ["download-libtorch"] }
+rand = { version = "0.8", optional = true }
+rand_chacha = { version = "0.3", optional = true }
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+once_cell = "1.19"
+
+
+
+[[bench]]
+name = "compression"
+harness = false
+
+[[bench]]
+name = "coders"
+harness = false
+
+[[bench]]
+name = "forward"
+harness = false
