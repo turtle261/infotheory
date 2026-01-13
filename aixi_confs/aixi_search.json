@@ -1,0 +1,29 @@
+{
+    "algorithm": "ctw",
+    "environment": "external",
+    "ct_depth": 32,
+    "agent_horizon": 6,
+    "observation_bits": 64,
+    "reward_bits": 8,
+    "agent_actions": 5,
+    "num_simulations": 150,
+    "exploration_exploitation_ratio": 1.4,
+    "terminate-lifetime": 30,
+    "external_config": {
+        "command": "/bin/bash",
+        "args": [
+            "--norc",
+            "--noprofile"
+        ],
+        "actions": [
+            "ls -F",
+            "ls src/",
+            "cat src/main.rs",
+            "grep -i 'ai' src/main.rs",
+            "echo 'Scanning complete.'"
+        ],
+        "reward_pattern": "run_aixi_mode",
+        "step_cost": 1,
+        "verbose": false
+    }
+}

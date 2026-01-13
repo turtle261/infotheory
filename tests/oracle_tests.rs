@@ -2,8 +2,7 @@ use infotheory::datagen;
 use infotheory::axioms;
 use infotheory::{
     marginal_entropy_bytes, mutual_information_bytes, ncd_bytes_backend, 
-    ncd_bytes, NcdBackend, NcdVariant, entropy_rate_backend, RateBackend,
-    joint_entropy_rate_bytes, conditional_entropy_rate_bytes
+    NcdBackend, NcdVariant, entropy_rate_backend, RateBackend
 };
 
 const TOLERANCE_ENTROPY: f64 = 0.1;

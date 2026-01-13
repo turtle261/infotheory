@@ -1,0 +1,28 @@
+{
+    "algorithm": "ctw",
+    "environment": "external",
+    "ct_depth": 64,
+    "agent_horizon": 16,
+    "observation_bits": 64,
+    "reward_bits": 8,
+    "agent_actions": 4,
+    "num_simulations": 300,
+    "exploration_exploitation_ratio": 1.414,
+    "terminate-lifetime": 120,
+    "external_config": {
+        "command": "/bin/bash",
+        "args": [
+            "--norc",
+            "--noprofile"
+        ],
+        "actions": [
+            "touch .lvl1 && echo 'L1_ACTIVE'",
+            "[ -f .lvl1 ] && touch .lvl2 && echo 'L2_ACTIVE' || echo 'FAIL_L1'",
+            "[ -f .lvl2 ] && echo 'ULTRA_SECRET_REACHED' || echo 'FAIL_L2'",
+            "rm -f .lvl1 .lvl2 && echo 'RESET'"
+        ],
+        "reward_pattern": "ULTRA_SECRET_REACHED",
+        "step_cost": 1,
+        "verbose": true
+    }
+}

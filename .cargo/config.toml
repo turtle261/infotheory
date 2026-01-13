@@ -1,9 +1,28 @@
 # .cargo/config.toml
 [build]
 rustflags = ["-C", "target-cpu=native"]
+rustdocflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]
 
-[target.x86_64-unknown-linux-gnu]
-# Needed for `lto = "fat"` in this workspace: GNU ld.bfd can't consume Rust's
-# linker-plugin LTO objects, but lld can.
+#[target.x86_64-unknown-linux-gnu]
+## Needed for `lto = "fat"` in this workspace: GNU ld.bfd can't consume Rust's
+## linker-plugin LTO objects, but lld can.
+#linker = "clang"
+#rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]
+
+
+
+[target.'cfg(unix)']
 linker = "clang"
-rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]
+rustflags = [
+  "-C", "target-cpu=native",
+  "-C", "link-arg=-fuse-ld=lld",
+]
+
+
+# NetBSD will almost certainly not work with LTO. Modify Cargo.toml's profile.release section appropriately (comment/remove the lto line)
+# NetBSD: if you dont have clang/clang++, remove the linker line below, which will work correctly (read the other comments around here)
+[target.x86_64-unknown-netbsd]
+linker = "clang" # can be gcc on NetBSD, but set the `CXX` env var to `gcc` if you get any errors there (i.e. if clang++ is installed, zpaq_rs will use it, which may cause issues. It may be needed to ALSO set `CARGO_FEATURE_NOJIT` environment variable to true, and potentially remove the build.flag_if_supported("-flto") line in zpaq_rs/build.rs. 
+rustflags = [
+  "-C", "target-cpu=native",
+]
