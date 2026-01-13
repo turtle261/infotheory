@@ -72,11 +72,14 @@ impl CtNode {
             self.log_prob_kt += self.log_kt_mul(sym);
             self.symbol_count[sym_idx] += 1;
         } else {
-            if self.symbol_count[sym_idx] == 0 {
+            let total = self.symbol_count[0] + self.symbol_count[1];
+            if self.symbol_count[sym_idx] == 0 || total == 0 {
                 return;
             }
+            let numerator = (self.symbol_count[sym_idx] as f64 - 0.5).ln();
+            let denominator = (total as f64).ln();
+            self.log_prob_kt -= numerator - denominator;
             self.symbol_count[sym_idx] -= 1;
-            self.log_prob_kt -= self.log_kt_mul(sym);
         }
     }
 
@@ -130,6 +133,7 @@ impl CtNode {
 }
 
 /// A Context Tree for binary sequence prediction.
+#[derive(Clone)]
 pub struct ContextTree {
     /// Root node of the tree.
     root: Box<CtNode>,
