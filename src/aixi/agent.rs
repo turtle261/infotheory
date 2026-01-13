@@ -105,6 +105,19 @@ impl Agent {
         }
     }
 
+    fn clone_for_simulation(&self, seed: u64) -> Self {
+        Self {
+            model: self.model.boxed_clone(),
+            planner: None,
+            config: self.config.clone(),
+            age: self.age,
+            total_reward: self.total_reward,
+            action_bits: self.action_bits,
+            is_last_update_percept: self.is_last_update_percept,
+            rng: self.rng.fork_with(seed),
+        }
+    }
+
     /// Resets the agent's interaction statistics.
     pub fn reset(&mut self) {
         self.age = 0;
@@ -218,5 +231,9 @@ impl AgentSimulator for Agent {
                 self.model.pop_history();
             }
         }
+    }
+
+    fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn AgentSimulator> {
+        Box::new(self.clone_for_simulation(seed))
     }
 }
