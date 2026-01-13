@@ -137,6 +137,8 @@ pub struct ContextTree {
     history: Vec<Symbol>,
     /// Maximum depth of the context tree.
     max_depth: usize,
+    /// Reusable buffer for constructing padded contexts.
+    context_buf: Vec<Symbol>,
 }
 
 impl ContextTree {
@@ -146,6 +148,7 @@ impl ContextTree {
             root: Box::new(CtNode::new()),
             history: Vec::new(),
             max_depth: depth,
+            context_buf: vec![false; depth],
         }
     }
 
@@ -153,6 +156,7 @@ impl ContextTree {
     pub fn clear(&mut self) {
         self.history.clear();
         self.root = Box::new(CtNode::new());
+        self.context_buf.fill(false);
     }
 
     /// Updates the tree with a new symbol.
@@ -160,16 +164,23 @@ impl ContextTree {
     /// Uses shorter contexts when history length is less than `max_depth`,
     /// ensuring valid updates from the very first symbol.
     pub fn update(&mut self, sym: Symbol) {
-        // Pad context with zeros to ensure fixed tree depth
-        let mut context = vec![false; self.max_depth];
-        let history_len = self.history.len();
-        let copy_len = history_len.min(self.max_depth);
+        // Pad context with zeros to ensure fixed tree depth.
+        let ContextTree {
+            root,
+            history,
+            max_depth,
+            context_buf,
+        } = self;
+        context_buf.fill(false);
+        let history_len = history.len();
+        let copy_len = history_len.min(*max_depth);
         if copy_len > 0 {
-            context[self.max_depth - copy_len..].copy_from_slice(&self.history[history_len - copy_len..]);
+            context_buf[*max_depth - copy_len..]
+                .copy_from_slice(&history[history_len - copy_len..]);
         }
-        
-        Self::update_node(&mut self.root, &context, sym, false, 0);
-        self.history.push(sym);
+
+        Self::update_node(root, context_buf, sym, false, 0);
+        history.push(sym);
     }
     
     // ...
@@ -190,7 +201,13 @@ impl ContextTree {
 
         let child_sym = context[max_depth - 1 - depth];
 
-        let kill_child = {
+        let kill_child = if revert {
+            if let Some(child) = node.child_mut(child_sym) {
+                Self::update_node(child, context, sym, revert, depth + 1)
+            } else {
+                false
+            }
+        } else {
             let child = node.ensure_child(child_sym);
             Self::update_node(child, context, sym, revert, depth + 1)
         };
@@ -211,17 +228,24 @@ impl ContextTree {
     }
 
     pub fn revert(&mut self) {
-        let Some(last_sym) = self.history.pop() else { return; };
-        
-        // Use same padded context logic
-        let mut context = vec![false; self.max_depth];
-        let history_len = self.history.len();
-        let copy_len = history_len.min(self.max_depth);
+        let ContextTree {
+            root,
+            history,
+            max_depth,
+            context_buf,
+        } = self;
+        let Some(last_sym) = history.pop() else { return; };
+
+        // Use same padded context logic.
+        context_buf.fill(false);
+        let history_len = history.len();
+        let copy_len = history_len.min(*max_depth);
         if copy_len > 0 {
-            context[self.max_depth - copy_len..].copy_from_slice(&self.history[history_len - copy_len..]);
+            context_buf[*max_depth - copy_len..]
+                .copy_from_slice(&history[history_len - copy_len..]);
         }
-        
-        Self::update_node(&mut self.root, &context, last_sym, true, 0);
+
+        Self::update_node(root, context_buf, last_sym, true, 0);
     }
 
     /// Removes the last symbol from history.
