@@ -2,12 +2,29 @@ use std::env;
 use std::process::Command;
 
 fn exe_exists(name: &str) -> bool {
-    Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {name} >/dev/null 2>&1"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        Command::new("sh")
+            .arg("-lc")
+            .arg(format!("command -v {name} >/dev/null 2>&1"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    
+    #[cfg(windows)]
+    {
+        Command::new("where")
+            .arg(name)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+    
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
 }
 
 fn main() {
@@ -35,8 +52,9 @@ fn main() {
         .file("zpaq/libzpaq.cpp")
         .file("zpaq/zpaq.cpp")
         .file("zpaq_rs_ffi.cpp")
-        // zpaq.cpp contains a `main()`. Rename it so it can be linked into this library.
+        // zpaq.cpp contains a `main()` (or `wmain()` on Windows). Rename it so it can be linked into this library.
         .define("main", "zpaq_cli_main")
+        .define("wmain", "zpaq_cli_main")
         .flag_if_supported("-std=c++17")
         .flag_if_supported("-fvisibility=hidden")
         .flag_if_supported("-fPIC")
@@ -45,8 +63,11 @@ fn main() {
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-null-pointer-subtraction")
         .flag_if_supported("-Wno-unused-const-variable")
-        .define("unix", None)
         .define("NDEBUG", None);
+    
+    // Only define unix on UNIX systems (not on Windows)
+    #[cfg(unix)]
+    build.define("unix", None);
 
     if env::var_os("CARGO_FEATURE_NOJIT").is_some() {
         build.define("NOJIT", None);
@@ -58,10 +79,16 @@ fn main() {
     // Try to enable LTO for the C++ objects in release-like profiles.
     // Cross-language LTO (Rust <-> C++) is toolchain-dependent; this at least
     // enables LTO within the C++ compilation unit(s) when supported.
+    // Note: On Windows with clang++ + MSVC linker, -flto produces LLVM IR
+    // which lib.exe can't handle, so we skip LTO on Windows.
     let profile = env::var("PROFILE").unwrap_or_default();
-    if profile == "release" || profile == "bench" {
+    if (profile == "release" || profile == "bench") && !cfg!(windows) {
         build.flag_if_supported("-flto");
     }
 
     build.compile("zpaq_rs_ffi");
+    
+    // On Windows, zpaq needs advapi32 for CryptoAPI (CryptAcquireContext, etc.)
+    #[cfg(windows)]
+    println!("cargo:rustc-link-lib=advapi32");
 }

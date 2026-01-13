@@ -15,10 +15,69 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <unistd.h>
 
-// Provided by zpaq.cpp (we compile it with -Dmain=zpaq_cli_main)
-int zpaq_cli_main(int argc, const char** argv);
+// Platform-specific headers for file descriptor operations
+#ifdef _WIN32
+    #include <io.h>      // for _dup, _dup2, _close, _fileno
+    #include <windows.h> // for LPWSTR
+    #define dup _dup
+    #define dup2 _dup2
+    #define close _close
+    #define fileno _fileno
+    #define DEV_NULL "NUL"
+    
+    // On Windows, wmain signature uses LPWSTR*
+    // This is renamed to zpaq_cli_main via preprocessor
+    int zpaq_cli_main(int argc, LPWSTR* argv);
+    
+    // Helper to convert UTF-8 to wide string
+    static std::wstring utf8_to_wide(const char* utf8) {
+        if (!utf8) return std::wstring();
+        int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+        if (len == 0) return std::wstring();
+        std::wstring result(len - 1, 0);
+        MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &result[0], len);
+        return result;
+    }
+    
+    // Wrapper to call zpaq_cli_main with char** arguments
+    static int zpaq_cli_main_wrapper(int argc, const char** argv) {
+        std::vector<std::wstring> wargs;
+        std::vector<LPWSTR> wargv;
+        wargs.reserve(argc);
+        wargv.reserve(argc);
+        
+        for (int i = 0; i < argc; ++i) {
+            wargs.push_back(utf8_to_wide(argv[i]));
+            wargv.push_back(&wargs.back()[0]);
+        }
+        
+        return zpaq_cli_main(argc, wargv.data());
+    }
+    
+    #define zpaq_cli_main zpaq_cli_main_wrapper
+#else
+    #include <unistd.h>  // for dup, dup2, close
+    #define DEV_NULL "/dev/null"
+    
+    // On UNIX, main signature uses const char**
+    // This is renamed to zpaq_cli_main via preprocessor
+    int zpaq_cli_main(int argc, const char** argv);
+#endif
+
+// memrchr is a GNU extension not available on Windows
+#ifdef _WIN32
+static inline const void* memrchr(const void* s, int c, size_t n) {
+    if (!s || n == 0) return nullptr;
+    const unsigned char* p = static_cast<const unsigned char*>(s) + n;
+    const unsigned char ch = static_cast<unsigned char>(c);
+    while (p > s) {
+        --p;
+        if (*p == ch) return p;
+    }
+    return nullptr;
+}
+#endif
 
 namespace {
 
@@ -444,7 +503,7 @@ int zpaq_jidac_add_archive_size_file(const char* path, const char* method, int t
     // Capture stderr; discard stdout.
     // Note: open_memstream() has no file descriptor, so we use tmpfile().
     FILE* err_stream = tmpfile();
-    FILE* out_stream = fopen("/dev/null", "w");
+    FILE* out_stream = fopen(DEV_NULL, "w");
     if (!err_stream || !out_stream) {
       if (err_stream) fclose(err_stream);
       if (out_stream) fclose(out_stream);
