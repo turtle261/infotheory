@@ -1,11 +1,5 @@
 # InfoTheory
 
-A high-performance, versatile Rust crate for **Information Theoretic Primitives**, **Sequential Metrics**, and **Autonomous Agents**.
-
-`infotheory` provides a unified framework for quantifying complexity, dependence, and similarity between data sequences. It bridges classical Shannon entropy with algorithmic information theory (Kolmogorov Complexity), supported by multiple predictive backends.
-
-## 🚀 Key Features
-
 ### 1. Unified Information Estimation
 Estimate core measures using both **Marginal** (distribution-based) and **Rate** (predictive-based) approaches:
 - **NCD (Normalized Compression Distance)**: Approximates information distance using real-world compressors (ZPAQ).
@@ -17,23 +11,50 @@ Estimate core measures using both **Marginal** (distribution-based) and **Rate**
 
 ### 2. Multi-Backend Predictive Engine
 Switch between different modeling paradigms seamlessly:
-- **ROSA (Suffix Automaton)**: Default backend. Extremely fast online learning with Witten-Bell smoothing.
+- **ROSA (Suffix Automaton + Witten Bell aka "RosaPlus" or "Rosa+")**: A statistical LM. Default backend. Extremely fast online learning with Witten-Bell smoothing. Highly optimized for x86_64, memory tuned, parallelized, and with disk-caching.
 - **CTW (Context Tree Weighting)**: Historically standard for AIXI. Accurate bit-level Bayesian model (KT-estimator).
-- **RWKV (Neural Network)**: Modern neural sequence prediction (requires CUDA).
+- **RWKV (Neural Network)**: Highly optimized x86_64 RWKV7 LLM CPU inference kernel, and training (requires CUDA only for training).
 
 ### 3. Integrated MC-AIXI Agent
-Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent. Unlike traditional implementations restricted to CTW, this agent is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, or RWKV) for universal reinforcement learning.
+Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, or RWKV) for universal reinforcement learning.
+As of my knowledge, this is the *first* real AIXI approximation that can be used for universal reinforcement learning, due to the libraries design of allowing any rate backend to be used rather than merely CTW. I am not aware of any other implementations of AIXI that are not merely CTW (Which performs poorly on non-Markovian tasks, and is not universal).
+
+Provided, our library full includes native RWKV7 Model Training (Hybrid CPU/GPU) -- and a native optimized CPU inference Kernel(which will be faster than GPU for all but huge models). Training REQUIRES CUDA, but you can bring your own model instead. CPU Inference is explicitly SIMD optimized, for x86_64 -- so: non x86_64 architectures will be slower or perhaps not work at all for RWKV -- same goes for really old x86_64 without FMA/AVX2.
+Therefore, you can use a trained RWKV7 model as a rate backend/"World Model" for MC-AIXI. Meaning, you can get information inside the Agent's mind before it ever makes a decision or plan. You can train the model on agent output, etc. 
 
 ---
 
-## 🛠 Installation
+## 🛠 Compilation & Installation
+### Compiling Infotheory
+X86_64 Linux TLDR: Install Rust, Clang, and do `cargo build --release`. That's all.
+Infotheory is tested on x86_64 architecture only. It should work on other architectures, but I have not tested it yet.
+It is known to work with the Following OS's:
+- **Linux**: Install Rust via Rustup, and install clang++ and lld from your distribution's package manager.
+- **FreeBSD**: `pkg install rust`
+- **OpenBSD**: `pkg_add rust`
+- **NetBSD**\*: `pkg_add rust clang lld` 
 
-Add to your `Cargo.toml`:
+* NetBSD will need manual configuration to get this compiling, but is tested to work. Read the comments in the netbsd section of.cargo/.config.toml in this repository. TLDR: LTO breaks it on NetBSD, so disable it.
+
+NOTE for NetBSD, OpenBSD, non-x86_64, and potentially other systems:
+If your Kernel enforces W^X protection (as NetBSD and OpenBSD do), you will need to set the environment variable `CARGO_FEATURE_NOJIT` equal to something, such as "true". This is very important, as ZPAQ will fail at **runtime** otherwise.
+If you are not using x86_64, ZPAQ JIT will also not work, and should be disabled.
+You will get innacurate NCD results otherwise. JIT should work fine on Linux(x86_64!), and you should not set the env variable there--enjoy the better performance.
+
+
+if using as a CLI:
+0. Install dependencies as noted above.
+1. Use git to clone the repository (recursively) -- configure as needed for your platform (x86_64 Linux, FreeBSD will work by default)
+2. Run `cargo build --release` and the infotheory CLI will be present at `./target/release/infotheory`.
+
+if using as a library:
+Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-infotheory = { path = "." }
+infotheory = { path = "." } # Or git or whatever, you know rust.
 ```
+
 
 ---
 
