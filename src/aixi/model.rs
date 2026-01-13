@@ -13,7 +13,7 @@ use std::sync::Arc;
 ///
 /// A predictor must be able to update its internal state based on observed symbols,
 /// revert its state for Monte Carlo simulations, and provide probabilities for
-pub trait Predictor {
+pub trait Predictor: Send + Sync {
     /// Incorporates a new symbol into the model's training history.
     fn update(&mut self, sym: bool);
 
@@ -41,6 +41,9 @@ pub trait Predictor {
 
     /// Returns a human-readable name of the predictive model.
     fn model_name(&self) -> String;
+
+    /// Creates a boxed clone of this predictor.
+    fn boxed_clone(&self) -> Box<dyn Predictor>;
 }
 
 /// A predictor using the Context Tree Weighting (CTW) algorithm.
@@ -81,6 +84,12 @@ impl Predictor for CtwPredictor {
 
     fn model_name(&self) -> String {
         format!("CTW(d={})", self.tree.depth())
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(Self {
+            tree: self.tree.clone(),
+        })
     }
 }
 
@@ -131,6 +140,13 @@ impl Predictor for RosaPredictor {
 
     fn model_name(&self) -> String {
         "ROSA".to_string()
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(Self {
+            model: self.model.clone(),
+            history: self.history.clone(),
+        })
     }
 }
 
@@ -196,5 +212,12 @@ impl Predictor for RwkvPredictor {
 
     fn model_name(&self) -> String {
         "RWKV".to_string()
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(Self {
+            compressor: self.compressor.clone(),
+            history: self.history.clone(),
+        })
     }
 }

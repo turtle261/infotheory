@@ -19,6 +19,7 @@ pub type PerceptVal = u64;
 ///
 /// This generator is seeded using `zpaq_rs::random_bytes` to avoid external dependencies
 /// like the `rand` crate while maintaining cryptographic-grade entropy for the seed.
+#[derive(Clone, Copy)]
 pub struct RandomGenerator {
     state: u64,
 }
@@ -64,6 +65,25 @@ impl RandomGenerator {
         // 53 bits
         let v = self.next_u64() >> 11;
         (v as f64) * (1.0 / 9007199254740992.0)
+    }
+
+    /// Forks the RNG state with a salt, returning an independent generator.
+    pub fn fork_with(&self, salt: u64) -> Self {
+        let mixed = Self::splitmix64(self.state ^ salt ^ 0x9E3779B97F4A7C15);
+        let state = if mixed == 0 {
+            0xCAFEBABEDEADBEEF
+        } else {
+            mixed
+        };
+        Self { state }
+    }
+
+    fn splitmix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
     }
 }
 

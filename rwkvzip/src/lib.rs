@@ -244,6 +244,18 @@ pub struct Compressor {
     pub rans_freq_buffer: Vec<i64>,
 }
 
+impl Clone for Compressor {
+    fn clone(&self) -> Self {
+        let mut cloned = Self::new_from_model(self.model.clone());
+        cloned.state = self.state.clone();
+        cloned.pdf_buffer.clone_from(&self.pdf_buffer);
+        cloned.cdf_buffer_ac.clone_from(&self.cdf_buffer_ac);
+        cloned.cdf_buffer_rans.clone_from(&self.cdf_buffer_rans);
+        cloned.rans_freq_buffer.clone_from(&self.rans_freq_buffer);
+        cloned
+    }
+}
+
 impl Compressor {
     /// Create a new compressor with the given model.
     ///
