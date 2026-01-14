@@ -7,10 +7,10 @@
   "reward_bits": 2,
   "agent_actions": 3,
   "reward_offset": 1,
-  "num_simulations": 500,
-  "exploration_exploitation_ratio": 1.4,
+  "num_simulations": 100,
+  "exploration_exploitation_ratio": 0.5,
   "explore_epsilon": 0.999,
   "explore_gamma": 0.99999,
-  "learn_cycles": 10000,
-  "eval_cycles": 100
+  "learn_cycles": 15000,
+  "eval_cycles": 200
 }

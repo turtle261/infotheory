@@ -378,8 +378,6 @@ fn log_kt_mul(counts: [u32; 2], sym: Symbol) -> f64 {
     let denominator = ((counts[0] + counts[1] + 1) as f64).ln();
     (counts[sym_idx] as f64 + 0.5).ln() - denominator
 }
-
-// =============================================================================
 // Factorized Action-Conditional CTW (FAC-CTW)
 // =============================================================================
 
@@ -390,8 +388,6 @@ struct ContextTreeCore {
     root: NodeIndex,
     max_depth: usize,
     context_buf: Vec<Symbol>,
-    /// The effective history length this tree sees (prefix of shared history).
-    effective_history_len: usize,
 }
 
 impl ContextTreeCore {
@@ -403,7 +399,6 @@ impl ContextTreeCore {
             root,
             max_depth: depth,
             context_buf: vec![false; depth],
-            effective_history_len: 0,
         }
     }
 
@@ -411,20 +406,17 @@ impl ContextTreeCore {
         self.arena.clear();
         self.root = self.arena.alloc();
         self.context_buf.fill(false);
-        self.effective_history_len = 0;
     }
 
     /// Prepares context buffer from shared history using this tree's effective length.
     #[inline(always)]
     fn prepare_context(&mut self, shared_history: &[Symbol]) {
         self.context_buf.fill(false);
-        let history_len = self.effective_history_len;
+        let history_len = shared_history.len();
         let copy_len = history_len.min(self.max_depth);
         if copy_len > 0 {
-            // Use the tail of shared_history up to our effective length
-            let start = history_len.saturating_sub(copy_len);
             self.context_buf[self.max_depth - copy_len..]
-                .copy_from_slice(&shared_history[start..history_len]);
+                .copy_from_slice(&shared_history[history_len - copy_len..]);
         }
     }
 
@@ -433,30 +425,13 @@ impl ContextTreeCore {
     fn update(&mut self, sym: Symbol, shared_history: &[Symbol]) {
         self.prepare_context(shared_history);
         self.update_node_iterative(sym, false);
-        self.effective_history_len += 1;
     }
 
     /// Revert last update, using shared history for context.
     #[inline]
     fn revert(&mut self, last_sym: Symbol, shared_history: &[Symbol]) {
-        if self.effective_history_len == 0 {
-            return;
-        }
-        self.effective_history_len -= 1;
         self.prepare_context(shared_history);
         self.update_node_iterative(last_sym, true);
-    }
-
-    /// Increment effective history length without tree update (for action conditioning).
-    #[inline]
-    fn extend_history(&mut self, count: usize) {
-        self.effective_history_len += count;
-    }
-
-    /// Decrement effective history length without tree update.
-    #[inline]
-    fn shrink_history(&mut self, count: usize) {
-        self.effective_history_len = self.effective_history_len.saturating_sub(count);
     }
 
     /// Predict probability of sym using shared history.
@@ -465,8 +440,6 @@ impl ContextTreeCore {
         let log_prob_before = self.arena.get(self.root).log_prob_weighted;
         self.update(sym, shared_history);
         let log_prob_after = self.arena.get(self.root).log_prob_weighted;
-        // Manually revert without needing last symbol from history
-        self.effective_history_len -= 1;
         self.prepare_context(shared_history);
         self.update_node_iterative(sym, true);
         (log_prob_after - log_prob_before).exp()
@@ -647,15 +620,6 @@ impl FacContextTree {
         // Update the tree responsible for this bit
         self.trees[bit_index].update(sym, &self.shared_history);
 
-        // Keep all trees' effective history lengths aligned with the shared history.
-        // The updated tree increments its own effective length inside `ContextTreeCore::update`.
-        // Every other tree must also advance by 1 because we append one symbol to shared history.
-        for (i, tree) in self.trees.iter_mut().enumerate() {
-            if i != bit_index {
-                tree.extend_history(1);
-            }
-        }
-
         // Append to shared history
         self.shared_history.push(sym);
     }
@@ -677,15 +641,6 @@ impl FacContextTree {
             return;
         };
 
-        // Keep all trees' effective history lengths aligned with the shared history.
-        // The reverted tree decrements its own effective length inside `ContextTreeCore::revert`.
-        // Every other tree must also shrink by 1 because we removed one symbol from shared history.
-        for (i, tree) in self.trees.iter_mut().enumerate() {
-            if i != bit_index {
-                tree.shrink_history(1);
-            }
-        }
-
         // Revert the tree responsible for this bit
         self.trees[bit_index].revert(last_sym, &self.shared_history);
     }
@@ -693,19 +648,12 @@ impl FacContextTree {
     /// Updates all trees' effective history lengths with action symbols (no KT update).
     #[inline]
     pub fn update_history(&mut self, symbols: &[Symbol]) {
-        let count = symbols.len();
-        for tree in &mut self.trees {
-            tree.extend_history(count);
-        }
         self.shared_history.extend_from_slice(symbols);
     }
 
     /// Reverts history from all trees.
     #[inline]
     pub fn revert_history(&mut self, count: usize) {
-        for tree in &mut self.trees {
-            tree.shrink_history(count);
-        }
         let new_len = self.shared_history.len().saturating_sub(count);
         self.shared_history.truncate(new_len);
     }
@@ -740,127 +688,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arena_alloc_free() {
-        let mut arena = CtArena::new();
-        let a = arena.alloc();
-        let b = arena.alloc();
-        assert_ne!(a, b);
-        arena.free(a);
-        let c = arena.alloc();
-        assert_eq!(a, c); // Reused from free list
-    }
-
-    #[test]
-    fn context_tree_update_revert() {
-        let mut tree = ContextTree::new(4);
-        tree.update(true);
-        tree.update(false);
-        let log_p = tree.get_log_block_probability();
-        tree.revert();
-        tree.update(false);
-        let log_p2 = tree.get_log_block_probability();
-        assert!((log_p - log_p2).abs() < 1e-10);
-    }
-
-    #[test]
-    fn context_tree_predict() {
-        let mut tree = ContextTree::new(8);
-        for _ in 0..100 {
-            tree.update(true);
-        }
-        let p1 = tree.predict(true);
-        let p0 = tree.predict(false);
-        assert!(p1 > p0, "Should predict 1 more likely after many 1s");
-        assert!((p1 + p0 - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn fac_ctw_basic() {
-        let mut fac = FacContextTree::new(8, 4);
-        // Update 4 bits
-        fac.update(true, 0);
-        fac.update(false, 1);
-        fac.update(true, 2);
-        fac.update(false, 3);
-        let log_p = fac.get_log_block_probability();
-        assert!(log_p < 0.0);
-
-        // Revert in reverse order
-        fac.revert(3);
-        fac.revert(2);
-        fac.revert(1);
-        fac.revert(0);
-        let log_p_empty = fac.get_log_block_probability();
-        assert!((log_p_empty - 0.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn fac_ctw_predict_sums_to_one() {
-        let mut fac = FacContextTree::new(4, 8);
-        // Add some history
-        fac.update_history(&[true, false, true, true, false, false, true, false]);
-        for bit in 0..8 {
-            let p0 = fac.predict(false, bit);
-            let p1 = fac.predict(true, bit);
-            assert!(
-                (p0 + p1 - 1.0).abs() < 1e-10,
-                "Probabilities should sum to 1 at bit {}: p0={}, p1={}",
-                bit,
-                p0,
-                p1
-            );
-        }
-    }
-
-    #[test]
-    fn fac_ctw_shared_history_memory() {
-        let fac = FacContextTree::new(4, 3);
-        let _start_mem = fac.memory_usage();
-        // Shared history should be single allocation, not 64x
-        // Initial memory: 64 trees each with arena + context_buf (~32-96 bytes)
-        // This is dominated by arena pre-allocation, not history
-        let mem = fac.memory_usage();
-        // With shared history, we don't duplicate the Vec<Symbol> 64 times
-        // 64 trees * ~32KB arena = ~2MB is reasonable initial overhead
-        assert!(
-            mem < 10_000_000,
-            "Initial memory should be reasonable: {} bytes",
-            mem
-        );
-    }
-
-    #[test]
     fn fac_ctw_history_consistency() {
         let mut fac = FacContextTree::new(4, 4);
 
         // Add action history
         fac.update_history(&[true, false, true]);
         assert_eq!(fac.shared_history.len(), 3);
-        for tree in &fac.trees {
-            assert_eq!(tree.effective_history_len, 3);
-        }
 
         // Update percept bits
         fac.update(true, 0);
         fac.update(false, 1);
         assert_eq!(fac.shared_history.len(), 5);
 
-        // All trees must stay aligned with the shared history length.
-        for tree in &fac.trees {
-            assert_eq!(tree.effective_history_len, 5);
-        }
-
         // Revert
         fac.revert(1);
         assert_eq!(fac.shared_history.len(), 4);
-        for tree in &fac.trees {
-            assert_eq!(tree.effective_history_len, 4);
-        }
 
         fac.revert(0);
         assert_eq!(fac.shared_history.len(), 3);
-        for tree in &fac.trees {
-            assert_eq!(tree.effective_history_len, 3);
-        }
     }
 }

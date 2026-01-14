@@ -23,6 +23,10 @@ anyhow = "1.0.100"
 name = "par"
 harness = false
 
+[[bench]]
+name = "aixi"
+harness = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
