@@ -10,7 +10,7 @@ pub type SymbolList = Vec<Symbol>;
 pub type Action = u64;
 
 /// Represents a reward received by the agent from the environment.
-pub type Reward = u64;
+pub type Reward = i64;
 
 /// A generic value for a percept component (either an observation or a reward).
 pub type PerceptVal = u64;
@@ -90,22 +90,60 @@ impl RandomGenerator {
 /// Encodes a numeric value into its bit representation and appends it to a `SymbolList`.
 ///
 /// Bits are appended in least-significant-bit first order.
-pub fn encode(symlist: &mut SymbolList, mut value: u64, bits: usize) {
+pub fn encode(symlist: &mut SymbolList, value: u64, bits: usize) {
+    let mut v = value;
     for _ in 0..bits {
-        symlist.push((value & 1) == 1);
-        value >>= 1;
+        symlist.push((v & 1) == 1);
+        v >>= 1;
     }
 }
 
+/// Encodes a signed reward value into its bit representation.
+pub fn encode_reward(symlist: &mut SymbolList, value: i64, bits: usize) {
+    let mut v = value as u64;
+    for _ in 0..bits {
+        symlist.push((v & 1) == 1);
+        v >>= 1;
+    }
+}
+
+pub fn encode_reward_offset(symlist: &mut SymbolList, value: i64, bits: usize, offset: i64) {
+    let shifted = (value + offset) as u64;
+    encode(symlist, shifted, bits);
+}
+
 /// Decodes a numeric value from its bit representation.
-///
-/// Expects bits to be in least-significant-bit first order.
 pub fn decode(symlist: &[Symbol], bits: usize) -> u64 {
+    if bits == 0 {
+        return 0;
+    }
     assert!(bits <= symlist.len());
-    let mut value = 0;
+    let mut value = 0u64;
     for i in 0..bits {
         let sym = symlist[symlist.len() - 1 - i];
         value = (value << 1) + (if sym { 1 } else { 0 });
     }
     value
+}
+
+/// Decodes a signed reward value from its bit representation.
+pub fn decode_reward(symlist: &[Symbol], bits: usize) -> i64 {
+    if bits == 0 {
+        return 0;
+    }
+    let v = decode(symlist, bits);
+    if bits < 64 && (v & (1 << (bits - 1))) != 0 {
+        // Sign bit set, perform two's complement sign extension
+        (v | (!0u64 << bits)) as i64
+    } else {
+        v as i64
+    }
+}
+
+pub fn decode_reward_offset(symlist: &[Symbol], bits: usize, offset: i64) -> i64 {
+    if bits == 0 {
+        return 0;
+    }
+    let v = decode(symlist, bits) as i64;
+    v - offset
 }

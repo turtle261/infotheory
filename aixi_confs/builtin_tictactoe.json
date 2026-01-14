@@ -1,0 +1,16 @@
+{
+    "environment": "tictactoe",
+    "algorithm": "fac-ctw",
+    "ct_depth": 64,
+    "agent_horizon": 9,
+    "observation_bits": 18,
+    "reward_bits": 3,
+    "agent_actions": 9,
+    "reward_offset": 3,
+    "num_simulations": 500,
+    "exploration_exploitation_ratio": 1.4,
+    "explore_epsilon": 0.9999,
+    "explore_gamma": 0.999999,
+    "learn_cycles": 500000,
+    "eval_cycles": 5000
+}

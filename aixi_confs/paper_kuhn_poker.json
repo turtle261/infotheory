@@ -1,0 +1,16 @@
+{
+  "environment": "kuhn-poker",
+  "algorithm": "fac-ctw",
+  "ct_depth": 42,
+  "agent_horizon": 2,
+  "observation_bits": 4,
+  "reward_bits": 3,
+  "agent_actions": 2,
+  "reward_offset": 2,
+  "num_simulations": 500,
+  "exploration_exploitation_ratio": 1.4,
+  "explore_epsilon": 0.99,
+  "explore_gamma": 0.9999,
+  "learn_cycles": 50000,
+  "eval_cycles": 5000
+}

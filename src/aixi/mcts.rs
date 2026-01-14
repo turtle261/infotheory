@@ -32,6 +32,13 @@ pub trait AgentSimulator: Send + Sync {
     /// Returns the minimum possible reward value.
     fn min_reward(&self) -> Reward;
 
+    /// Returns the reward offset used to ensure encoded rewards are non-negative.
+    ///
+    /// Paper-compatible encoding uses unsigned reward bits and shifts rewards by an offset.
+    fn reward_offset(&self) -> i64 {
+        0
+    }
+
     /// Returns the exploration-exploitation constant (often denoted as C).
     fn get_explore_exploit_ratio(&self) -> f64 {
         1.0
@@ -60,10 +67,25 @@ pub trait AgentSimulator: Send + Sync {
     /// Creates a boxed clone of this simulator, re-seeding any RNG state.
     fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn AgentSimulator>;
 
+    /// Normalizes a reward value to [0, 1] based on the agent's range and horizon.
+    fn norm_reward(&self, reward: f64) -> f64 {
+        let min = self.min_reward() as f64;
+        let max = self.max_reward() as f64;
+        let h = self.horizon() as f64;
+        let range = (max - min) * h;
+        if range.abs() < 1e-9 {
+            0.5
+        } else {
+            (reward - (min * h)) / range
+        }
+    }
+
     /// Helper to generate both an observation and a reward.
     fn gen_percepts_and_update(&mut self) -> (PerceptVal, Reward) {
         let obs = self.gen_percept_and_update(self.get_num_observation_bits());
-        let rew = self.gen_percept_and_update(self.get_num_reward_bits());
+        let rew_bits = self.get_num_reward_bits();
+        let rew_u = self.gen_percept_and_update(rew_bits);
+        let rew = (rew_u as i64) - self.reward_offset();
         (obs, rew)
     }
 }
@@ -203,11 +225,8 @@ impl SearchNode {
             let mut best_val = -f64::INFINITY;
             let mut best_action = 0;
             let log_visits = (self.visits as f64).ln().max(0.0);
-            let range = (agent.max_reward() - agent.min_reward()) as f64;
-            let norm = 1.0 / (horizon as f64 * range).max(1e-9);
-
             for (&a, child) in &self.children {
-                let exploit = child.expectation() * norm;
+                let exploit = agent.norm_reward(child.expectation());
                 let explore = if child.visits > 0 {
                     c * (log_visits / child.visits as f64).sqrt()
                 } else {
@@ -241,10 +260,11 @@ impl SearchNode {
         let reward;
         if self.is_chance_node {
             let obs = agent.gen_percept_and_update(agent.get_num_observation_bits());
-            let rew = agent.gen_percept_and_update(agent.get_num_reward_bits());
+            let rew_u = agent.gen_percept_and_update(agent.get_num_reward_bits());
+            let rew = (rew_u as i64) - agent.reward_offset();
 
             let obs_bits = agent.get_num_observation_bits();
-            let key = obs + (rew << obs_bits);
+            let key = obs + (rew_u << obs_bits);
 
             let child = self
                 .children
@@ -300,7 +320,7 @@ impl SearchTree {
         &mut self,
         agent: &mut dyn AgentSimulator,
         prev_obs: u64,
-        prev_rew: u64,
+        prev_rew: Reward,
         prev_act: u64,
         samples: usize,
     ) -> Action {
@@ -352,7 +372,7 @@ impl SearchTree {
         &mut self,
         agent: &mut dyn AgentSimulator,
         prev_obs: u64,
-        prev_rew: u64,
+        prev_rew: Reward,
         prev_act: u64,
     ) {
         if self.root.is_none() {
@@ -365,7 +385,9 @@ impl SearchTree {
         // Find chance child (prev_act)
         if let Some(mut chance_child) = old_root.children.remove(&prev_act) {
             let obs_bits = agent.get_num_observation_bits();
-            let key = prev_obs + (prev_rew << obs_bits);
+            let offset = agent.reward_offset();
+            let key_rew_u = (prev_rew + offset) as u64;
+            let key = prev_obs + (key_rew_u << obs_bits);
 
             if let Some(action_child) = chance_child.children.remove(&key) {
                 self.root = Some(action_child);

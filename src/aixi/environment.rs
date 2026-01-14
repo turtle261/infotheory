@@ -41,12 +41,16 @@ pub trait Environment {
 
     /// Returns the maximum possible reward value in this environment.
     fn max_reward(&self) -> Reward {
-        (1 << self.get_reward_bits()) - 1
+        let bits = self.get_reward_bits();
+        if bits == 0 { return 0; }
+        (1 << (bits - 1)) - 1
     }
 
     /// Returns the minimum possible reward value in this environment.
     fn min_reward(&self) -> Reward {
-        0
+        let bits = self.get_reward_bits();
+        if bits == 0 { return 0; }
+        -(1 << (bits - 1))
     }
 }
 
@@ -106,6 +110,14 @@ impl Environment for CoinFlip {
     fn get_reward_bits(&self) -> usize {
         1
     }
+
+    fn min_reward(&self) -> Reward {
+        0
+    }
+
+    fn max_reward(&self) -> Reward {
+        1
+    }
     fn get_action_bits(&self) -> usize {
         1
     }
@@ -163,6 +175,14 @@ impl Environment for CtwTest {
     fn get_reward_bits(&self) -> usize {
         1
     }
+
+    fn min_reward(&self) -> Reward {
+        0
+    }
+
+    fn max_reward(&self) -> Reward {
+        1
+    }
     fn get_action_bits(&self) -> usize {
         1
     }
@@ -212,16 +232,16 @@ impl Environment for BiasedRockPaperScissor {
 
         // Determine Outcome
         if opponent_action == action {
-            self.rew = 1; // Draw
+            self.rew = 0; // Draw
             self.opponent_won_last_round = false;
         } else if (opponent_action == 0 && action == 1)
             || (opponent_action == 1 && action == 2)
             || (opponent_action == 2 && action == 0)
         {
-            self.rew = 2; // Win
+            self.rew = 1; // Win
             self.opponent_won_last_round = false;
         } else {
-            self.rew = 0; // Loss
+            self.rew = -1; // Loss
             self.opponent_won_last_round = true;
             self.opponent_last_round_action = opponent_action;
         }
@@ -243,6 +263,14 @@ impl Environment for BiasedRockPaperScissor {
     }
     fn get_reward_bits(&self) -> usize {
         2
+    }
+
+    fn min_reward(&self) -> Reward {
+        -1
+    }
+
+    fn max_reward(&self) -> Reward {
+        1
     }
     fn get_action_bits(&self) -> usize {
         2
@@ -295,10 +323,10 @@ impl Environment for ExtendedTiger {
             0 => {
                 // Stand
                 if self.state == 1 {
-                    self.rew = 90;
+                    self.rew = -1;
                 } else {
                     self.state = 1;
-                    self.rew = 99;
+                    self.rew = -1;
                     if self.obs < 4 {
                         self.obs += 4;
                     }
@@ -307,22 +335,23 @@ impl Environment for ExtendedTiger {
             1 => {
                 // Listen
                 if self.state == 1 || self.obs != 0 {
-                    self.rew = 90;
+                    self.rew = -1;
+                    self.obs = 0;
                 } else {
                     self.obs = if self.rng.gen_bool(0.85) {
                         self.tiger_door as PerceptVal
                     } else {
                         self.gold_door as PerceptVal
                     };
-                    self.rew = 99;
+                    self.rew = -1;
                 }
             }
             2 => {
                 // Open 1
                 if self.state == 0 {
-                    self.rew = 90;
+                    self.rew = -100;
                 } else {
-                    self.rew = if self.gold_door == 1 { 130 } else { 0 };
+                    self.rew = if self.gold_door == 1 { 30 } else { -100 };
                     self.obs = 0;
                     self.state = 0;
                     self.reset_doors();
@@ -331,16 +360,16 @@ impl Environment for ExtendedTiger {
             3 => {
                 // Open 2
                 if self.state == 0 {
-                    self.rew = 90;
+                    self.rew = -100;
                 } else {
-                    self.rew = if self.gold_door == 2 { 130 } else { 0 };
+                    self.rew = if self.gold_door == 2 { 30 } else { -100 };
                     self.obs = 0;
                     self.state = 0;
                     self.reset_doors();
                 }
             }
             _ => {
-                self.rew = 0;
+                self.rew = -100;
             }
         }
     }
@@ -359,7 +388,15 @@ impl Environment for ExtendedTiger {
         3
     }
     fn get_reward_bits(&self) -> usize {
-        7
+        8
+    }
+
+    fn min_reward(&self) -> Reward {
+        -100
+    }
+
+    fn max_reward(&self) -> Reward {
+        30
     }
     fn get_action_bits(&self) -> usize {
         2
@@ -422,14 +459,14 @@ impl TicTacToe {
 impl Environment for TicTacToe {
     fn perform_action(&mut self, action: Action) {
         if action >= 9 {
-            self.rew = 0;
+            self.rew = -3;
             self.obs = self.state as PerceptVal;
             return;
         }
 
         if self.board[action as usize] != 0 {
             // Illegal move
-            self.rew = 0;
+            self.rew = -3;
         } else {
             // Agent move (1)
             self.state += 1 << (2 * action);
@@ -440,16 +477,16 @@ impl Environment for TicTacToe {
                 self.open_squares.remove(pos);
             }
 
-            self.rew = 3;
+            self.rew = 0;
 
             if self.check_win(1) {
                 // Agent won
                 self.reset_game();
-                self.rew = 5;
+                self.rew = 2;
             } else if self.open_squares.is_empty() {
                 // Draw
                 self.reset_game();
-                self.rew = 4;
+                self.rew = 1;
             } else {
                 // Opponent move (-1, mapped to 2 in base-4)
 
@@ -467,10 +504,10 @@ impl Environment for TicTacToe {
                     if self.check_win(-1) {
                         // Opponent won
                         self.reset_game();
-                        self.rew = 1;
+                        self.rew = -2;
                     } else if self.open_squares.is_empty() {
                         self.reset_game();
-                        self.rew = 4;
+                        self.rew = 1;
                     }
                 }
             }
@@ -492,7 +529,13 @@ impl Environment for TicTacToe {
         18
     } // 9 squares * 2 bits
     fn get_reward_bits(&self) -> usize {
-        4
+        3
+    }
+    fn min_reward(&self) -> Reward {
+        -3
+    }
+    fn max_reward(&self) -> Reward {
+        2
     }
     fn get_action_bits(&self) -> usize {
         4
@@ -594,22 +637,14 @@ impl Environment for KuhnPoker {
         if opponent_bets == agent_bets {
             // Showdown
             if self.agent_card > self.opponent_card {
-                self.rew = 2 + self.chips_in_play as u64;
+                self.rew = self.chips_in_play as i64;
             } else {
-                self.rew = if self.agent_chips <= 2 {
-                    (2 - self.agent_chips) as u64
-                } else {
-                    0
-                };
+                self.rew = -(self.agent_chips as i64);
             }
             self.reset_game();
         } else if opponent_bets && !agent_bets {
             // Opponent bet, Agent fold
-            self.rew = if self.agent_chips <= 2 {
-                (2 - self.agent_chips) as u64
-            } else {
-                0
-            };
+            self.rew = -(self.agent_chips as i64);
             self.reset_game();
         } else {
             // Opponent passed, Agent bet. Opponent decision.
@@ -617,17 +652,13 @@ impl Environment for KuhnPoker {
             if call {
                 self.chips_in_play += 1;
                 if self.agent_card > self.opponent_card {
-                    self.rew = 2 + self.chips_in_play as u64;
+                    self.rew = self.chips_in_play as i64;
                 } else {
-                    self.rew = if self.agent_chips <= 2 {
-                        (2 - self.agent_chips) as u64
-                    } else {
-                        0
-                    };
+                    self.rew = -(self.agent_chips as i64);
                 }
             } else {
                 // Opponent folds
-                self.rew = 2 + self.chips_in_play as u64;
+                self.rew = self.chips_in_play as i64;
             }
             self.reset_game();
         }
@@ -647,6 +678,14 @@ impl Environment for KuhnPoker {
         4
     }
     fn get_reward_bits(&self) -> usize {
+        3
+    }
+
+    fn min_reward(&self) -> Reward {
+        -2
+    }
+
+    fn max_reward(&self) -> Reward {
         4
     }
     fn get_action_bits(&self) -> usize {
@@ -789,7 +828,7 @@ impl Environment for ProcessEnvironment {
         }
 
         // Apply step cost (saturating at 0)
-        self.rew = base_rew.saturating_sub(self.step_cost);
+        self.rew = base_rew.saturating_sub(self.step_cost as i64);
 
         if self.debug_mode {
             eprintln!(

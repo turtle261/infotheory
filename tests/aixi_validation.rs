@@ -165,6 +165,9 @@ fn agent_solves_ctw_test_environment() {
         agent_actions: 2,
         num_simulations: 200, // Increased from 50
         exploration_exploitation_ratio: 2.0,
+        min_reward: 0,
+        max_reward: 1,
+        reward_offset: 0,
         rwkv_model_path: None,
         rosa_max_order: None,
     };
@@ -198,6 +201,9 @@ fn agent_regret_sublinear_coinflip() {
         agent_actions: 2,
         num_simulations: 100, // Increased from 20
         exploration_exploitation_ratio: 1.0,
+        min_reward: 0,
+        max_reward: 1,
+        reward_offset: 0,
         rwkv_model_path: None,
         rosa_max_order: None,
     };

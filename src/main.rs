@@ -30,6 +30,7 @@
 //! See `print_usage` for details on supported primitives.
 
 use infotheory::aixi::agent::{Agent, AgentConfig};
+use infotheory::aixi::common::RandomGenerator;
 use infotheory::aixi::environment::{
     BiasedRockPaperScissor, CoinFlip, CtwTest, Environment, ExtendedTiger, KuhnPoker,
     ProcessEnvironment, TicTacToe,
@@ -583,19 +584,6 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     file.read_to_string(&mut content)?;
     let v: serde_json::Value = serde_json::from_str(&content)?;
 
-    let config = AgentConfig {
-        algorithm: v["algorithm"].as_str().unwrap_or("ctw").to_string(),
-        ct_depth: v["ct_depth"].as_u64().unwrap_or(20) as usize,
-        agent_horizon: v["agent_horizon"].as_u64().unwrap_or(3) as usize,
-        observation_bits: v["observation_bits"].as_u64().unwrap_or(1) as usize,
-        reward_bits: v["reward_bits"].as_u64().unwrap_or(1) as usize,
-        agent_actions: v["agent_actions"].as_u64().unwrap_or(2) as usize,
-        num_simulations: v["num_simulations"].as_u64().unwrap_or(50) as usize,
-        exploration_exploitation_ratio: v["exploration_exploitation_ratio"].as_f64().unwrap_or(1.4),
-        rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
-        rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
-    };
-
     let env_name = v["environment"].as_str().unwrap_or("coin-flip");
     let mut env: Box<dyn Environment> = match env_name {
         "coin-flip" => Box::new(CoinFlip::new(0.9)),
@@ -623,18 +611,55 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             let step_cost = ext["step_cost"].as_u64().unwrap_or(1);
             let debug_mode = ext["verbose"].as_bool().unwrap_or(false);
 
+            let observation_bits = v["observation_bits"].as_u64().unwrap_or(1) as usize;
+            let reward_bits = v["reward_bits"].as_u64().unwrap_or(1) as usize;
+
             Box::new(ProcessEnvironment::new(
                 cmd,
                 &args,
                 actions,
-                config.observation_bits,
-                config.reward_bits,
+                observation_bits,
+                reward_bits,
                 pattern,
                 step_cost,
                 debug_mode,
             )?)
         }
         _ => return Err(anyhow::anyhow!("Unknown environment: {}", env_name)),
+    };
+
+    let observation_bits = v["observation_bits"]
+        .as_u64()
+        .map(|n| n as usize)
+        .unwrap_or_else(|| env.get_observation_bits());
+    let reward_bits = v["reward_bits"]
+        .as_u64()
+        .map(|n| n as usize)
+        .unwrap_or_else(|| env.get_reward_bits());
+    let agent_actions = v["agent_actions"]
+        .as_u64()
+        .map(|n| n as usize)
+        .unwrap_or_else(|| env.get_num_actions());
+    let min_reward = env.min_reward();
+    let max_reward = env.max_reward();
+    let reward_offset = v["reward_offset"]
+        .as_i64()
+        .unwrap_or_else(|| (-min_reward).max(0));
+
+    let config = AgentConfig {
+        algorithm: v["algorithm"].as_str().unwrap_or("ctw").to_string(),
+        ct_depth: v["ct_depth"].as_u64().unwrap_or(20) as usize,
+        agent_horizon: v["agent_horizon"].as_u64().unwrap_or(3) as usize,
+        observation_bits,
+        reward_bits,
+        agent_actions,
+        num_simulations: v["num_simulations"].as_u64().unwrap_or(50) as usize,
+        exploration_exploitation_ratio: v["exploration_exploitation_ratio"].as_f64().unwrap_or(1.4),
+        min_reward,
+        max_reward,
+        reward_offset,
+        rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
+        rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
     };
 
     let mut agent = Agent::new(config);
@@ -644,17 +669,41 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         env_name
     );
 
+    let learn_cycles = v["learn_cycles"].as_u64().map(|n| n as usize);
+    let eval_cycles = v["eval_cycles"].as_u64().map(|n| n as usize);
     let cycles = v["terminate-lifetime"].as_u64().unwrap_or(20) as usize;
+
+    let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
+        (Some(l), Some(e)) => (l, e),
+        (Some(l), None) => (l, 0usize),
+        (None, Some(e)) => (cycles, e),
+        (None, None) => (cycles, 0usize),
+    };
+
     let mut total_reward = 0;
     let mut prev_action = 0;
     let mut obs = env.get_observation();
     let mut rew = env.get_reward();
 
-    for t in 0..cycles {
+    let explore_epsilon = v["explore_epsilon"].as_f64().unwrap_or(0.0);
+    let explore_gamma = v["explore_gamma"].as_f64().unwrap_or(1.0);
+    let mut explore_rng = RandomGenerator::new();
+
+    for t in 0..learn_cycles {
         println!("Cycle {}: Obs={}, Rew={}", t, obs, rew);
         agent.model_update_percept(obs, rew);
         total_reward += rew;
-        let action = agent.get_planned_action(obs, rew, prev_action);
+
+        let explore_p = if explore_epsilon > 0.0 {
+            explore_epsilon * explore_gamma.powi(t as i32)
+        } else {
+            0.0
+        };
+        let action = if explore_p > 0.0 && explore_rng.gen_bool(explore_p.min(1.0)) {
+            explore_rng.gen_range(agent_actions) as u64
+        } else {
+            agent.get_planned_action(obs, rew, prev_action)
+        };
         println!("Cycle {}: Planned Action={}", t, action);
         agent.model_update_action_external(action);
         env.perform_action(action);
@@ -662,6 +711,29 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         rew = env.get_reward();
         prev_action = action;
     }
+
+    if eval_cycles > 0 {
+        let mut eval_total_reward: i64 = 0;
+        for t in 0..eval_cycles {
+            let step = learn_cycles + t;
+            println!("Cycle {}: Obs={}, Rew={}", step, obs, rew);
+            agent.model_update_percept(obs, rew);
+            eval_total_reward += rew;
+
+            let action = agent.get_planned_action(obs, rew, prev_action);
+            println!("Cycle {}: Planned Action={}", step, action);
+            agent.model_update_action_external(action);
+            env.perform_action(action);
+            obs = env.get_observation();
+            rew = env.get_reward();
+            prev_action = action;
+        }
+
+        let avg = (eval_total_reward as f64) / (eval_cycles as f64);
+        println!("Eval Total Reward: {}", eval_total_reward);
+        println!("Eval Average Reward per Cycle: {:.6}", avg);
+    }
+
     println!("Total Reward: {}", total_reward);
     Ok(())
 }

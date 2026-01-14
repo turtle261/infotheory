@@ -27,6 +27,14 @@ pub struct AgentConfig {
     pub num_simulations: usize,
     /// Constant governing exploration vs exploitation in UCT.
     pub exploration_exploitation_ratio: f64,
+    /// Minimum possible instantaneous reward in the environment.
+    pub min_reward: Reward,
+    /// Maximum possible instantaneous reward in the environment.
+    pub max_reward: Reward,
+    /// Reward offset applied before encoding rewards as unsigned bits.
+    ///
+    /// Paper-compatible encoding shifts rewards by an offset so all encoded values are non-negative.
+    pub reward_offset: Reward,
     /// Path to the RWKV model weights (if using "rwkv").
     pub rwkv_model_path: Option<String>,
     /// Maximum Markov order for the ROSA model (if using "rosa").
@@ -151,7 +159,12 @@ impl Agent {
     pub fn model_update_percept(&mut self, observation: PerceptVal, reward: Reward) {
         let mut percept_syms = Vec::new();
         encode(&mut percept_syms, observation, self.config.observation_bits);
-        encode(&mut percept_syms, reward, self.config.reward_bits);
+        crate::aixi::common::encode_reward_offset(
+            &mut percept_syms,
+            reward,
+            self.config.reward_bits,
+            self.config.reward_offset,
+        );
 
         for &sym in &percept_syms {
             self.model.update(sym);
@@ -185,11 +198,15 @@ impl AgentSimulator for Agent {
     }
 
     fn max_reward(&self) -> Reward {
-        (1 << self.config.reward_bits) - 1
+        self.config.max_reward
     }
 
     fn min_reward(&self) -> Reward {
-        0
+        self.config.min_reward
+    }
+
+    fn reward_offset(&self) -> i64 {
+        self.config.reward_offset
     }
 
     fn get_explore_exploit_ratio(&self) -> f64 {
