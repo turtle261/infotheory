@@ -58,7 +58,7 @@ init_if_needed() {
     esac
 
     echo 0  > "$fixed_file"
-    echo 70 > "$health_file"
+    echo 7000 > "$health_file"
     echo 50 > "$power_file"
   fi
 }
@@ -98,7 +98,7 @@ tick_dynamics() {
   decay=$((decay + noise))
 
   health=$((health - decay))
-  health="$(clamp "$health" 0 100)"
+  health="$(clamp "$health" 0 1000)"
 
   # power naturally drifts down a bit: -2..-4
   power=$((power - 2 - $(rng_mod 3)))
@@ -151,7 +151,7 @@ do_reroute_power() {
   if [[ "$surge" == "0" ]]; then
     health="$(read_int "$health_file" health)"
     health=$((health - 8))
-    health="$(clamp "$health" 0 100)"
+    health="$(clamp "$health" 0 1000)"
     echo "$health" > "$health_file"
     echo "EVENT power_surge=-8"
   else
@@ -174,14 +174,14 @@ do_repair() {
 
   if [[ "$target" == "$fault" ]]; then
     echo 1 > "$fixed_file"
-    health=$((health + 10))
-    health="$(clamp "$health" 0 100)"
+    health=$((health + 1000))
+    health="$(clamp "$health" 0 1000)"
     echo "$health" > "$health_file"
     echo "EVENT repair_${target}=SUCCESS"
   else
     # wrong repair damages health a lot
-    health=$((health - 18))
-    health="$(clamp "$health" 0 100)"
+    health=$((health - 2))
+    health="$(clamp "$health" 0 1000)"
     echo "$health" > "$health_file"
     echo "EVENT repair_${target}=FAIL"
   fi
