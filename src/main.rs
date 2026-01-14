@@ -53,6 +53,7 @@ fn parse_rate_backend(v: &str) -> Option<&'static str> {
         "rosaplus" | "rosa" => Some("rosaplus"),
         "rwkv7" | "rwkv" => Some("rwkv7"),
         "ctw" => Some("ctw"),
+        "fac-ctw" | "facctw" => Some("fac-ctw"),
         _ => None,
     }
 }
@@ -87,6 +88,18 @@ fn build_ctx(rate_backend: &str, ncd_backend: &str, method: Option<&str>) -> Inf
                 20
             };
             RateBackend::Ctw { depth }
+        }
+        "fac-ctw" => {
+            let depth = if let Some(m) = method {
+                m.parse::<usize>().unwrap_or(20)
+            } else {
+                20
+            };
+            RateBackend::FacCtw {
+                base_depth: depth,
+                num_percept_bits: 8, // Default for byte-oriented CLI
+                encoding_bits: 8,    // Default for byte-oriented CLI
+            }
         }
         _ => RateBackend::RosaPlus,
     };
@@ -933,7 +946,7 @@ Primitives:
     batch                                   Run in JSON-L batch mode
 
 Options:
-  --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'rwkv7'
+  --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'fac-ctw', 'rwkv7'
   --ncd-backend <name>    Backend for NCD: 'zpaq' (default), 'rwkv7'
   --method <val>          Method/Depth parameter (e.g. '5' for zpaq, '16' for ctw)
 
