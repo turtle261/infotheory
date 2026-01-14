@@ -14,17 +14,17 @@ fn main() {
             // Try platform-specific default paths
             #[cfg(unix)]
             let default_paths = vec!["/opt/cuda", "/usr/local/cuda"];
-            
+
             #[cfg(windows)]
             let default_paths: Vec<&str> = vec![
                 "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.0",
                 "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8",
                 "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.0",
             ];
-            
+
             #[cfg(not(any(unix, windows)))]
             let default_paths: Vec<&str> = vec![];
-            
+
             let mut found = false;
             for path in default_paths {
                 if std::path::Path::new(path).exists() {
@@ -33,7 +33,7 @@ fn main() {
                     break;
                 }
             }
-            
+
             if !found {
                 println!("cargo:warning=CUDA toolkit not found, WKV kernel will use fallback");
             }
@@ -46,17 +46,17 @@ fn build_cuda_kernel(cuda_path: &str) {
     // CUDA library path differs between platforms
     #[cfg(unix)]
     let cuda_lib = format!("{}/lib64", cuda_path);
-    
+
     #[cfg(windows)]
     let cuda_lib = format!("{}\\lib\\x64", cuda_path);
-    
+
     #[cfg(not(any(unix, windows)))]
     let cuda_lib = format!("{}/lib", cuda_path);
 
     // Find nvcc (platform-specific path separator)
     #[cfg(unix)]
     let nvcc = format!("{}/bin/nvcc", cuda_path);
-    
+
     #[cfg(windows)]
     let nvcc = format!("{}\\bin\\nvcc.exe", cuda_path);
     if !std::path::Path::new(&nvcc).exists() {
@@ -97,42 +97,36 @@ fn build_cuda_kernel(cuda_path: &str) {
         };
         (Some("-ccbin"), Some(gcc14))
     };
-    
+
     #[cfg(windows)]
     let (ccbin_flag, ccbin_value): (Option<&str>, Option<&str>) = {
         // On Windows, nvcc uses MSVC by default, so we don't need to specify -ccbin
         (None, None)
     };
-    
+
     #[cfg(not(any(unix, windows)))]
     let (ccbin_flag, ccbin_value): (Option<&str>, Option<&str>) = (None, None);
 
     // Compile inference kernel
     let mut nvcc_cmd = std::process::Command::new(&nvcc);
-    nvcc_cmd.args([
-        "-c",
-        kernel_src,
-        "-o",
-        &obj_file,
-        "-O3",
-    ]);
-    
+    nvcc_cmd.args(["-c", kernel_src, "-o", &obj_file, "-O3"]);
+
     // Add platform-specific compiler options
     #[cfg(unix)]
     nvcc_cmd.args(["--compiler-options", "-fPIC"]);
-    
+
     // Add ccbin if specified (UNIX only)
     if let (Some(flag), Some(value)) = (ccbin_flag, ccbin_value) {
         nvcc_cmd.args([flag, value]);
     }
-    
+
     nvcc_cmd.args([
         "-D_N_=64", // Head dimension
         "-gencode",
         "arch=compute_61,code=sm_61",  // Pascal (P2000)
         "-Wno-deprecated-gpu-targets", // Suppress old arch warning
     ]);
-    
+
     let compile_status = nvcc_cmd.status();
 
     let compile_ok = match &compile_status {
@@ -146,23 +140,17 @@ fn build_cuda_kernel(cuda_path: &str) {
     // Compile training kernel with checkpointing
     let train_compile_ok = if std::path::Path::new(train_kernel_src).exists() {
         let mut train_cmd = std::process::Command::new(&nvcc);
-        train_cmd.args([
-            "-c",
-            train_kernel_src,
-            "-o",
-            &train_obj_file,
-            "-O3",
-        ]);
-        
+        train_cmd.args(["-c", train_kernel_src, "-o", &train_obj_file, "-O3"]);
+
         // Add platform-specific compiler options
         #[cfg(unix)]
         train_cmd.args(["--compiler-options", "-fPIC"]);
-        
+
         // Add ccbin if specified (UNIX only)
         if let (Some(flag), Some(value)) = (ccbin_flag, ccbin_value) {
             train_cmd.args([flag, value]);
         }
-        
+
         train_cmd.args([
             "-D_N_=64",
             "-D_CHUNK_LEN_=32", // Checkpoint every 32 timesteps
@@ -170,7 +158,7 @@ fn build_cuda_kernel(cuda_path: &str) {
             "arch=compute_61,code=sm_61",
             "-Wno-deprecated-gpu-targets",
         ]);
-        
+
         let train_status = train_cmd.status();
 
         match train_status {
@@ -202,26 +190,28 @@ fn build_cuda_kernel(cuda_path: &str) {
             }
             std::process::Command::new("ar").args(&ar_args).status()
         };
-        
+
         #[cfg(windows)]
         let ar_result = {
             // On Windows, use lib.exe (MSVC's librarian)
-            let mut lib_args = vec![
-                format!("/OUT:{}", lib_file),
-                "/NOLOGO".to_string(),
-            ];
+            let mut lib_args = vec![format!("/OUT:{}", lib_file), "/NOLOGO".to_string()];
             if compile_ok {
                 lib_args.push(obj_file.clone());
             }
             if train_compile_ok {
                 lib_args.push(train_obj_file.clone());
             }
-            std::process::Command::new("lib.exe").args(&lib_args).status()
+            std::process::Command::new("lib.exe")
+                .args(&lib_args)
+                .status()
         };
-        
+
         #[cfg(not(any(unix, windows)))]
         let ar_result: std::io::Result<std::process::ExitStatus> = {
-            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Unsupported platform"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Unsupported platform",
+            ))
         };
 
         match ar_result {

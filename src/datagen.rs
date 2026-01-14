@@ -60,7 +60,9 @@ impl Xorshift64 {
 /// Vector of n bytes, each being 0 or 1.
 pub fn bernoulli(n: usize, p: f64, seed: u64) -> Vec<u8> {
     let mut rng = Xorshift64::new(seed);
-    (0..n).map(|_| if rng.next_f64() < p { 1 } else { 0 }).collect()
+    (0..n)
+        .map(|_| if rng.next_f64() < p { 1 } else { 0 })
+        .collect()
 }
 
 /// Theoretical entropy for a Bernoulli(p) source in bits.
@@ -276,6 +278,10 @@ mod tests {
         // For p00 = p11 = 1.0 (always stay same state), entropy rate = 0
         // because no transitions ever happen
         let h = markov_1_binary_entropy_rate(1.0, 1.0);
-        assert!(h.abs() < 1e-10, "deterministic chain should have H=0, got {}", h);
+        assert!(
+            h.abs() < 1e-10,
+            "deterministic chain should have H=0, got {}",
+            h
+        );
     }
 }

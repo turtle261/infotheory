@@ -792,7 +792,10 @@ impl Environment for ProcessEnvironment {
         self.rew = base_rew.saturating_sub(self.step_cost);
 
         if self.debug_mode {
-            eprintln!("[AIXI Env] ExitCode: {}, Obs: {}, Rew: {}", exit_code, self.obs, self.rew);
+            eprintln!(
+                "[AIXI Env] ExitCode: {}, Obs: {}, Rew: {}",
+                exit_code, self.obs, self.rew
+            );
         }
     }
 

@@ -804,7 +804,10 @@ mod tests {
             let p1 = fac.predict(true, bit);
             assert!(
                 (p0 + p1 - 1.0).abs() < 1e-10,
-                "Probabilities should sum to 1 at bit {}: p0={}, p1={}", bit, p0, p1
+                "Probabilities should sum to 1 at bit {}: p0={}, p1={}",
+                bit,
+                p0,
+                p1
             );
         }
     }
@@ -819,37 +822,41 @@ mod tests {
         let mem = fac.memory_usage();
         // With shared history, we don't duplicate the Vec<Symbol> 64 times
         // 64 trees * ~32KB arena = ~2MB is reasonable initial overhead
-        assert!(mem < 10_000_000, "Initial memory should be reasonable: {} bytes", mem);
+        assert!(
+            mem < 10_000_000,
+            "Initial memory should be reasonable: {} bytes",
+            mem
+        );
     }
 
     #[test]
     fn fac_ctw_history_consistency() {
         let mut fac = FacContextTree::new(4, 4);
-        
+
         // Add action history
         fac.update_history(&[true, false, true]);
         assert_eq!(fac.shared_history.len(), 3);
         for tree in &fac.trees {
             assert_eq!(tree.effective_history_len, 3);
         }
-        
+
         // Update percept bits
         fac.update(true, 0);
         fac.update(false, 1);
         assert_eq!(fac.shared_history.len(), 5);
-        
+
         // All trees must stay aligned with the shared history length.
         for tree in &fac.trees {
             assert_eq!(tree.effective_history_len, 5);
         }
-        
+
         // Revert
         fac.revert(1);
         assert_eq!(fac.shared_history.len(), 4);
         for tree in &fac.trees {
             assert_eq!(tree.effective_history_len, 4);
         }
-        
+
         fac.revert(0);
         assert_eq!(fac.shared_history.len(), 3);
         for tree in &fac.trees {

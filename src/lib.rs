@@ -71,8 +71,8 @@
 //! ```
 
 pub mod aixi;
-pub mod ctw;
 pub mod axioms;
+pub mod ctw;
 pub mod datagen;
 
 use rayon::prelude::*;
@@ -187,9 +187,13 @@ pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBacken
 #[derive(Clone)]
 pub enum RateBackend {
     RosaPlus,
-    Rwkv7 { model: Arc<rwkvzip::Model> },
+    Rwkv7 {
+        model: Arc<rwkvzip::Model>,
+    },
     /// Action-Conditional CTW (single context tree).
-    Ctw { depth: usize },
+    Ctw {
+        depth: usize,
+    },
     /// Factorized Action-Conditional CTW (k trees for k-bit percepts).
     FacCtw {
         base_depth: usize,
@@ -248,13 +252,20 @@ impl InfotheoryCtx {
         biased_entropy_rate_backend(data, max_order, &self.rate_backend)
     }
 
-    pub fn cross_entropy_rate_bytes(&self, test_data: &[u8], train_data: &[u8], max_order: i64) -> f64 {
+    pub fn cross_entropy_rate_bytes(
+        &self,
+        test_data: &[u8],
+        train_data: &[u8],
+        max_order: i64,
+    ) -> f64 {
         cross_entropy_rate_backend(test_data, train_data, max_order, &self.rate_backend)
     }
 
     pub fn cross_entropy_bytes(&self, test_data: &[u8], train_data: &[u8], max_order: i64) -> f64 {
         if max_order == 0 {
-            if test_data.is_empty() { return 0.0; }
+            if test_data.is_empty() {
+                return 0.0;
+            }
             let p_x = byte_histogram(test_data);
             let p_y = byte_histogram(train_data);
             let mut h = 0.0f64;
@@ -517,15 +528,15 @@ impl<'a> std::io::Read for SliceChainReader<'a> {
             let n = (p.len() - self.off).min(buf.len());
             // Safe copy slice
             buf[..n].copy_from_slice(&p[self.off..self.off + n]);
-            
+
             // Advance state
             self.off += n;
             total += n;
-            
+
             // Re-slice buf to fill remainder
             let tmp = buf;
             buf = &mut tmp[n..];
-            
+
             if buf.is_empty() {
                 break;
             }
@@ -708,9 +719,9 @@ pub fn joint_entropy_rate_backend(
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
             m.entropy_rate_cps(&joint_symbols)
         }
-        RateBackend::Rwkv7 { model } => {
-            with_rwkv_tls(model, |c| c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0))
-        }
+        RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
+            c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
+        }),
         RateBackend::Ctw { depth } => {
             // NOTE: CTW interleaves bits: x_0, y_0, x_1, y_1...
             // This estimates the joint entropy H(X,Y) by modeling the sequence
@@ -1693,7 +1704,11 @@ mod tests {
         }
 
         let log_prob = tree.get_log_block_probability();
-        assert!(log_prob < 0.0, "log_prob should be negative (< log 1), got {}", log_prob);
+        assert!(
+            log_prob < 0.0,
+            "log_prob should be negative (< log 1), got {}",
+            log_prob
+        );
         assert!(log_prob.is_finite(), "log_prob should be finite");
     }
 
@@ -1768,4 +1783,3 @@ mod tests {
         );
     }
 }
-

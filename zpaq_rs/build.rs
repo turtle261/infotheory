@@ -11,7 +11,7 @@ fn exe_exists(name: &str) -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    
+
     #[cfg(windows)]
     {
         Command::new("where")
@@ -20,7 +20,7 @@ fn exe_exists(name: &str) -> bool {
             .map(|output| output.status.success())
             .unwrap_or(false)
     }
-    
+
     #[cfg(not(any(unix, windows)))]
     {
         false
@@ -64,7 +64,7 @@ fn main() {
         .flag_if_supported("-Wno-null-pointer-subtraction")
         .flag_if_supported("-Wno-unused-const-variable")
         .define("NDEBUG", None);
-    
+
     // Only define unix on UNIX systems (not on Windows)
     #[cfg(unix)]
     build.define("unix", None);
@@ -87,7 +87,7 @@ fn main() {
     }
 
     build.compile("zpaq_rs_ffi");
-    
+
     // On Windows, zpaq needs advapi32 for CryptoAPI (CryptAcquireContext, etc.)
     #[cfg(windows)]
     println!("cargo:rustc-link-lib=advapi32");

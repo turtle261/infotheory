@@ -143,20 +143,20 @@ fn rosa_distance(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     if x.is_empty() || y.is_empty() {
         return 1.0;
     }
-    
+
     // Self-entropy rates (biased/plugin estimator for consistency)
     let h_x_x = biased_entropy_rate_bytes(x, max_order);
     let h_y_y = biased_entropy_rate_bytes(y, max_order);
-    
+
     // Cross-entropy rates
     let h_y_x = cross_entropy_rate_bytes(x, y, max_order); // score x under model trained on y
     let h_x_y = cross_entropy_rate_bytes(y, x, max_order); // score y under model trained on x
-    
+
     // Avoid division by zero
     if h_x_x < 1e-9 || h_y_y < 1e-9 {
         return 1.0;
     }
-    
+
     let d = 0.5 * (h_y_x / h_x_x + h_x_y / h_y_y) - 1.0;
     d.clamp(0.0, 1.0)
 }
@@ -168,42 +168,42 @@ fn process_json_line(line: &str) -> String {
     if line.is_empty() {
         return r#"{"error":"empty input"}"#.to_string();
     }
-    
+
     // Extract operation type
     let op = extract_json_string(line, "op").unwrap_or_default();
-    
+
     match op.as_str() {
         "metrics" => {
             // Single text metrics: H0, H_rate, ID
             let text = extract_json_string(line, "text").unwrap_or_default();
             let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
             let data = text.as_bytes();
-            
+
             if data.is_empty() {
                 return r#"{"error":"empty text"}"#.to_string();
             }
-            
+
             let h0 = marginal_entropy_bytes(data);
             let h_rate = entropy_rate_bytes(data, max_order);
             let id = if h0 < 1e-9 { 0.0 } else { ((h0 - h_rate) / h0).clamp(0.0, 1.0) };
-            
+
             format!(
                 r#"{{"h0":{:.6},"h_rate":{:.6},"id":{:.6},"len":{}}}"#,
                 h0, h_rate, id, data.len()
             )
         }
-        
+
         "metrics_file" => {
             // File-based metrics
             let path = extract_json_string(line, "path").unwrap_or_default();
             let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
-            
+
             match std::fs::read(&path) {
                 Ok(data) => {
                     let h0 = marginal_entropy_bytes(&data);
                     let h_rate = entropy_rate_bytes(&data, max_order);
                     let id = if h0 < 1e-9 { 0.0 } else { ((h0 - h_rate) / h0).clamp(0.0, 1.0) };
-                    
+
                     format!(
                         r#"{{"h0":{:.6},"h_rate":{:.6},"id":{:.6},"len":{}}}"#,
                         h0, h_rate, id, data.len()
@@ -212,89 +212,87 @@ fn process_json_line(line: &str) -> String {
                 Err(e) => format!(r#"{{"error":"failed to read file: {}"}}"#, e),
             }
         }
-        
+
         "ncd" => {
             // NCD between two texts
             let text1 = extract_json_string(line, "text1").unwrap_or_default();
             let text2 = extract_json_string(line, "text2").unwrap_or_default();
             let method = extract_json_string(line, "method").unwrap_or_else(|| "5".to_string());
             let variant = extract_json_string(line, "variant").unwrap_or_else(|| "vitanyi".to_string());
-            
+
             let x = text1.as_bytes();
             let y = text2.as_bytes();
-            
+
             if x.is_empty() || y.is_empty() {
                 return r#"{"error":"empty text(s)"}"#.to_string();
             }
-            
+
             let ncd_variant = match variant.as_str() {
                 "sym" | "sym_vitanyi" => NcdVariant::SymVitanyi,
                 "cons" => NcdVariant::Cons,
                 "sym_cons" => NcdVariant::SymCons,
                 _ => NcdVariant::Vitanyi,
             };
-            
+
             let ncd = ncd_bytes(x, y, &method, ncd_variant);
             format!(r#"{{"ncd":{:.6}}}"#, ncd)
         }
-        
         "ncd_files" => {
             // NCD between two files
             let path1 = extract_json_string(line, "path1").unwrap_or_default();
             let path2 = extract_json_string(line, "path2").unwrap_or_default();
             let method = extract_json_string(line, "method").unwrap_or_else(|| "5".to_string());
             let variant = extract_json_string(line, "variant").unwrap_or_else(|| "vitanyi".to_string());
-            
+
             let ncd_variant = match variant.as_str() {
                 "sym" | "sym_vitanyi" => NcdVariant::SymVitanyi,
                 "cons" => NcdVariant::Cons,
                 "sym_cons" => NcdVariant::SymCons,
                 _ => NcdVariant::Vitanyi,
             };
-            
+
             let ncd = ncd_paths(&path1, &path2, &method, ncd_variant);
             format!(r#"{{"ncd":{:.6}}}"#, ncd)
         }
-        
+
         "rosa_dist" => {
             // ROSA-based distance (faster than NCD)
             let text1 = extract_json_string(line, "text1").unwrap_or_default();
             let text2 = extract_json_string(line, "text2").unwrap_or_default();
             let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
-            
+
             let x = text1.as_bytes();
             let y = text2.as_bytes();
-            
+
             if x.is_empty() || y.is_empty() {
                 return r#"{"error":"empty text(s)"}"#.to_string();
             }
-            
+
             let dist = rosa_distance(x, y, max_order);
             format!(r#"{{"rosa_dist":{:.6}}}"#, dist)
         }
-        
+
         "cross_entropy" => {
             // Cross-entropy H_y(x) - score x under model trained on y
             let text_x = extract_json_string(line, "text_x").unwrap_or_default();
             let text_y = extract_json_string(line, "text_y").unwrap_or_default();
             let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
-            
+
             let x = text_x.as_bytes();
             let y = text_y.as_bytes();
-            
+
             if x.is_empty() || y.is_empty() {
                 return r#"{"error":"empty text(s)"}"#.to_string();
             }
-            
+
             let xe = cross_entropy_rate_bytes(x, y, max_order);
             format!(r#"{{"cross_entropy":{:.6}}}"#, xe)
         }
-        
         "batch_metrics" => {
             // Batch metrics for multiple texts
             let texts = extract_json_array(line, "texts");
             let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
-            
+
             let results: Vec<String> = texts.iter().map(|text| {
                 let data = text.as_bytes();
                 if data.is_empty() {
@@ -309,44 +307,43 @@ fn process_json_line(line: &str) -> String {
                     )
                 }
             }).collect();
-            
+
             format!(r#"{{"results":[{}]}}"#, results.join(","))
         }
-        
+
         "ncd_matrix" => {
             // NCD matrix for multiple texts (for diversity/clustering)
             let texts = extract_json_array(line, "texts");
             let method = extract_json_string(line, "method").unwrap_or_else(|| "5".to_string());
             let variant = extract_json_string(line, "variant").unwrap_or_else(|| "vitanyi".to_string());
-            
+
             let ncd_variant = match variant.as_str() {
                 "sym" | "sym_vitanyi" => NcdVariant::SymVitanyi,
                 "cons" => NcdVariant::Cons,
                 "sym_cons" => NcdVariant::SymCons,
                 _ => NcdVariant::Vitanyi,
             };
-            
+
             let datas: Vec<Vec<u8>> = texts.iter().map(|t| t.as_bytes().to_vec()).collect();
             let matrix = ncd_matrix_bytes(&datas, &method, ncd_variant);
             let n = datas.len();
-            
+
             // Format as row-major array of arrays
             let rows: Vec<String> = (0..n).map(|i| {
                 let row: Vec<String> = (0..n).map(|j| format!("{:.6}", matrix[i * n + j])).collect();
                 format!("[{}]", row.join(","))
             }).collect();
-            
+
             format!(r#"{{"matrix":[{}],"n":{}}}"#, rows.join(","), n)
         }
-        
         "rosa_matrix" => {
             // ROSA distance matrix (faster than NCD matrix)
             let texts = extract_json_array(line, "texts");
             let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
-            
+
             let n = texts.len();
             let datas: Vec<&[u8]> = texts.iter().map(|t| t.as_bytes()).collect();
-            
+
             // Compute matrix (symmetric)
             let mut matrix = vec![0.0f64; n * n];
             for i in 0..n {
@@ -360,16 +357,15 @@ fn process_json_line(line: &str) -> String {
                     matrix[j * n + i] = d;
                 }
             }
-            
+
             // Format as row-major array of arrays
             let rows: Vec<String> = (0..n).map(|i| {
                 let row: Vec<String> = (0..n).map(|j| format!("{:.6}", matrix[i * n + j])).collect();
                 format!("[{}]", row.join(","))
             }).collect();
-            
+
             format!(r#"{{"matrix":[{}],"n":{}}}"#, rows.join(","), n)
         }
-        
         "spam_check" => {
             // Quick spam/quality check for a single text
             let text = extract_json_string(line, "text").unwrap_or_default();
@@ -377,36 +373,34 @@ fn process_json_line(line: &str) -> String {
             let h_rate_threshold = extract_json_f64(line, "h_rate_min").unwrap_or(0.5);
             let id_threshold = extract_json_f64(line, "id_max").unwrap_or(0.95);
             let min_len = extract_json_i64(line, "min_len").unwrap_or(10) as usize;
-            
+
             let data = text.as_bytes();
             let len = data.len();
-            
+
             if len < min_len {
                 return format!(r#"{{"pass":false,"reason":"too_short","len":{}}}"#, len);
             }
-            
+
             let h0 = marginal_entropy_bytes(data);
             if h0 < h0_threshold {
                 return format!(r#"{{"pass":false,"reason":"low_entropy","h0":{:.4}}}"#, h0);
             }
-            
+
             let h_rate = entropy_rate_bytes(data, -1);
             if h_rate < h_rate_threshold {
                 return format!(r#"{{"pass":false,"reason":"low_entropy_rate","h_rate":{:.4}}}"#, h_rate);
             }
-            
+
             let id = if h0 < 1e-9 { 0.0 } else { ((h0 - h_rate) / h0).clamp(0.0, 1.0) };
             if id > id_threshold {
                 return format!(r#"{{"pass":false,"reason":"high_redundancy","id":{:.4}}}"#, id);
             }
-            
+
             format!(r#"{{"pass":true,"h0":{:.4},"h_rate":{:.4},"id":{:.4},"len":{}}}"#, h0, h_rate, id, len)
         }
-        
         "help" => {
             r#"{"ops":["metrics","metrics_file","ncd","ncd_files","rosa_dist","cross_entropy","batch_metrics","ncd_matrix","rosa_matrix","spam_check"]}"#.to_string()
         }
-        
         _ => {
             format!(r#"{{"error":"unknown op: {}"}}"#, op)
         }
@@ -420,24 +414,24 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
         let rest = &json[start + pattern.len()..];
         // Optimized scanning for quote
         if let Some(start_quote) = rest.find('"') {
-             let rest = &rest[start_quote+1..];
-             let mut end = 0;
-             let mut escaped = false;
-             for (i, c) in rest.char_indices() {
-                 if escaped {
-                     escaped = false;
-                     continue;
-                 }
-                 if c == '\\' {
-                     escaped = true;
-                     continue;
-                 }
-                 if c == '"' {
-                     end = i;
-                     break;
-                 }
-             }
-             return Some(unescape_json_string(&rest[..end]));
+            let rest = &rest[start_quote + 1..];
+            let mut end = 0;
+            let mut escaped = false;
+            for (i, c) in rest.char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if c == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if c == '"' {
+                    end = i;
+                    break;
+                }
+            }
+            return Some(unescape_json_string(&rest[..end]));
         }
     }
     None
@@ -451,7 +445,9 @@ fn extract_json_i64(json: &str, key: &str) -> Option<i64> {
         // Skip potential whitespace/quotes if any (though standard JSON number doesn't have quotes)
         // Adjust for simple numeric find
         let rest = rest.trim_start_matches(|c| c == ':' || c == ' ' || c == '"');
-        let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(rest.len());
         // Simple trim in case we consumed quotes incorrectly?
         // Let's assume valid JSON input
         return rest[..end].parse().ok();
@@ -465,7 +461,9 @@ fn extract_json_f64(json: &str, key: &str) -> Option<f64> {
     if let Some(start) = json.find(&pattern) {
         let rest = &json[start + pattern.len()..];
         let rest = rest.trim_start_matches(|c| c == ':' || c == ' ' || c == '"');
-        let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-' && c != '.').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '-' && c != '.')
+            .unwrap_or(rest.len());
         return rest[..end].parse().ok();
     }
     None
@@ -498,7 +496,7 @@ fn extract_json_array(json: &str, key: &str) -> Vec<String> {
         let mut in_string = false;
         let mut escaped = false;
         let mut current = String::new();
-        
+
         for c in array_content.chars() {
             if escaped {
                 current.push(c);
@@ -536,12 +534,29 @@ fn unescape_json_string(s: &str) -> String {
         if c == '\\' {
             if let Some(&next) = chars.peek() {
                 match next {
-                    'n' => { result.push('\n'); chars.next(); }
-                    'r' => { result.push('\r'); chars.next(); }
-                    't' => { result.push('\t'); chars.next(); }
-                    '"' => { result.push('"'); chars.next(); }
-                    '\\' => { result.push('\\'); chars.next(); }
-                    _ => { result.push(c); }
+                    'n' => {
+                        result.push('\n');
+                        chars.next();
+                    }
+                    'r' => {
+                        result.push('\r');
+                        chars.next();
+                    }
+                    't' => {
+                        result.push('\t');
+                        chars.next();
+                    }
+                    '"' => {
+                        result.push('"');
+                        chars.next();
+                    }
+                    '\\' => {
+                        result.push('\\');
+                        chars.next();
+                    }
+                    _ => {
+                        result.push(c);
+                    }
                 }
             } else {
                 result.push(c);
@@ -713,7 +728,9 @@ fn search_command(args: &[String]) {
                 if let Some(v) = args.get(i) {
                     stage2_prior_mode = match v.as_str() {
                         "none" | "no-prior" => Some(search::Stage2PriorMode::NoPrior),
-                        "summarize" | "summarize-prior" => Some(search::Stage2PriorMode::SummarizePrior),
+                        "summarize" | "summarize-prior" => {
+                            Some(search::Stage2PriorMode::SummarizePrior)
+                        }
                         "use" | "use-prior" | _ => Some(search::Stage2PriorMode::UsePrior),
                     };
                 }

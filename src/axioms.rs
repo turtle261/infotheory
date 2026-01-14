@@ -28,7 +28,13 @@ where
 }
 
 /// Verify triangle inequality: d(x,z) ≤ d(x,y) + d(y,z).
-pub fn verify_triangle_inequality<F>(metric: F, x: &[u8], y: &[u8], z: &[u8], tolerance: f64) -> bool
+pub fn verify_triangle_inequality<F>(
+    metric: F,
+    x: &[u8],
+    y: &[u8],
+    z: &[u8],
+    tolerance: f64,
+) -> bool
 where
     F: Fn(&[u8], &[u8]) -> f64,
 {
@@ -113,7 +119,7 @@ where
     let h_xy = joint(x, y);
     let h_x = marginal(x);
     let h_y_given_x = conditional(y, x);
-    
+
     (h_xy - (h_x + h_y_given_x)).abs() <= tolerance
 }
 
@@ -123,7 +129,7 @@ where
 
 /// Verify NCD range: 0 ≤ NCD ≤ 1+epsilon.
 ///
-/// NCD theoretically can slightly exceed 1 due to compression overhead, so we allow 
+/// NCD theoretically can slightly exceed 1 due to compression overhead, so we allow
 /// a small margin or just check it's not egregiously large. Usually NCD <= 1.1 is safe.
 pub fn verify_ncd_bounds<F>(ncd: F, x: &[u8], y: &[u8]) -> bool
 where
