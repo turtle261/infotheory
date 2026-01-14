@@ -5,7 +5,7 @@
 
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward, decode, encode};
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
-use crate::aixi::model::{CtwPredictor, Predictor, RosaPredictor, RwkvPredictor};
+use crate::aixi::model::{CtwPredictor, FacCtwPredictor, Predictor, RosaPredictor, RwkvPredictor};
 use crate::load_rwkv7_model_from_path;
 
 /// Configuration parameters for an AIXI agent.
@@ -77,7 +77,13 @@ impl Agent {
         }
 
         let model: Box<dyn Predictor> = match config.algorithm.as_str() {
-            "ctw" | "ctw-context-tree" => Box::new(CtwPredictor::new(config.ct_depth)),
+            // FAC-CTW is the default and recommended CTW variant per the paper
+            "ctw" | "fac-ctw" => {
+                let percept_bits = config.observation_bits + config.reward_bits;
+                Box::new(FacCtwPredictor::new(config.ct_depth, percept_bits))
+            }
+            // AC-CTW is the legacy single-tree variant
+            "ac-ctw" | "ctw-context-tree" => Box::new(CtwPredictor::new(config.ct_depth)),
             "rosa" => {
                 let max_order = config.rosa_max_order.unwrap_or(20);
                 Box::new(RosaPredictor::new(max_order))
