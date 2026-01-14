@@ -647,9 +647,13 @@ impl FacContextTree {
         // Update the tree responsible for this bit
         self.trees[bit_index].update(sym, &self.shared_history);
 
-        // Extend effective history length of all subsequent trees
-        for tree in self.trees.iter_mut().skip(bit_index + 1) {
-            tree.extend_history(1);
+        // Keep all trees' effective history lengths aligned with the shared history.
+        // The updated tree increments its own effective length inside `ContextTreeCore::update`.
+        // Every other tree must also advance by 1 because we append one symbol to shared history.
+        for (i, tree) in self.trees.iter_mut().enumerate() {
+            if i != bit_index {
+                tree.extend_history(1);
+            }
         }
 
         // Append to shared history
@@ -673,9 +677,13 @@ impl FacContextTree {
             return;
         };
 
-        // Shrink effective history length of all subsequent trees
-        for tree in self.trees.iter_mut().skip(bit_index + 1) {
-            tree.shrink_history(1);
+        // Keep all trees' effective history lengths aligned with the shared history.
+        // The reverted tree decrements its own effective length inside `ContextTreeCore::revert`.
+        // Every other tree must also shrink by 1 because we removed one symbol from shared history.
+        for (i, tree) in self.trees.iter_mut().enumerate() {
+            if i != bit_index {
+                tree.shrink_history(1);
+            }
         }
 
         // Revert the tree responsible for this bit
@@ -803,7 +811,8 @@ mod tests {
 
     #[test]
     fn fac_ctw_shared_history_memory() {
-        let fac = FacContextTree::new(32, 64);
+        let fac = FacContextTree::new(4, 3);
+        let _start_mem = fac.memory_usage();
         // Shared history should be single allocation, not 64x
         // Initial memory: 64 trees each with arena + context_buf (~32-96 bytes)
         // This is dominated by arena pre-allocation, not history
@@ -820,25 +829,31 @@ mod tests {
         // Add action history
         fac.update_history(&[true, false, true]);
         assert_eq!(fac.shared_history.len(), 3);
+        for tree in &fac.trees {
+            assert_eq!(tree.effective_history_len, 3);
+        }
         
         // Update percept bits
         fac.update(true, 0);
         fac.update(false, 1);
         assert_eq!(fac.shared_history.len(), 5);
         
-        // Each tree i should have effective_history_len = 3 + updates seen
-        assert_eq!(fac.trees[0].effective_history_len, 4); // saw 1 update
-        assert_eq!(fac.trees[1].effective_history_len, 5); // saw 2 updates
-        assert_eq!(fac.trees[2].effective_history_len, 5); // got extended
-        assert_eq!(fac.trees[3].effective_history_len, 5); // got extended
+        // All trees must stay aligned with the shared history length.
+        for tree in &fac.trees {
+            assert_eq!(tree.effective_history_len, 5);
+        }
         
         // Revert
         fac.revert(1);
         assert_eq!(fac.shared_history.len(), 4);
-        assert_eq!(fac.trees[1].effective_history_len, 4);
+        for tree in &fac.trees {
+            assert_eq!(tree.effective_history_len, 4);
+        }
         
         fac.revert(0);
         assert_eq!(fac.shared_history.len(), 3);
-        assert_eq!(fac.trees[0].effective_history_len, 3);
+        for tree in &fac.trees {
+            assert_eq!(tree.effective_history_len, 3);
+        }
     }
 }
