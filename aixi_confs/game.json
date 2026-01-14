@@ -1,0 +1,27 @@
+{
+  "algorithm": "rosa",
+  "environment": "external",
+  "agent_horizon": 12,
+  "rosa_max_order": -1,
+  "observation_bits": 64,
+  "reward_bits": 8,
+  "agent_actions": 6,
+  "num_simulations": 5000,
+  "exploration_exploitation_ratio": 1.141,
+  "terminate-lifetime": 500,
+  "external_config": {
+    "command": "/usr/local/bin/bash",
+    "args": ["--norc", "--noprofile"],
+    "actions": [
+      "bash sim/step.sh scan",
+      "bash sim/step.sh reroute_power",
+      "bash sim/step.sh repair_A",
+      "bash sim/step.sh repair_B",
+      "bash sim/step.sh repair_C",
+      "bash sim/step.sh commit"
+    ],
+    "reward_pattern": "MISSION_SUCCESS",
+    "step_cost": 2,
+    "verbose": true
+  }
+}

@@ -5,6 +5,7 @@
 //! by simulating future interactions with a world model.
 
 use crate::aixi::common::{Action, PerceptVal, Reward};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Interface for an agent that can be simulated during MCTS.
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 /// This trait allows the MCTS algorithm to interact with an agent
 /// (like `Agent` in `agent.rs`) to perform "imagined" actions and
 /// receive "imagined" percepts during planning.
-pub trait AgentSimulator {
+pub trait AgentSimulator: Send + Sync {
     /// Returns the number of possible actions the agent can perform.
     fn get_num_actions(&self) -> usize;
 
@@ -51,6 +52,14 @@ pub trait AgentSimulator {
     /// Generates a random `f64` in `[0, 1)`.
     fn gen_f64(&mut self) -> f64;
 
+    /// Creates a boxed clone of this simulator for parallel search.
+    fn boxed_clone(&self) -> Box<dyn AgentSimulator> {
+        self.boxed_clone_with_seed(0)
+    }
+
+    /// Creates a boxed clone of this simulator, re-seeding any RNG state.
+    fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn AgentSimulator>;
+
     /// Helper to generate both an observation and a reward.
     fn gen_percepts_and_update(&mut self) -> (PerceptVal, Reward) {
         let obs = self.gen_percept_and_update(self.get_num_observation_bits());
@@ -63,6 +72,7 @@ pub trait AgentSimulator {
 ///
 /// Nodes can be either OR-nodes (representing an agent choice) or
 /// chance nodes (representing an environment response).
+#[derive(Clone)]
 pub struct SearchNode {
     /// Number of times this node has been visited during search.
     visits: u32,
@@ -111,6 +121,60 @@ impl SearchNode {
 
     fn expectation(&self) -> f64 {
         self.mean
+    }
+
+    fn apply_delta(&mut self, base: &SearchNode, updated: &SearchNode) {
+        if self.is_chance_node != base.is_chance_node
+            || self.is_chance_node != updated.is_chance_node
+        {
+            return;
+        }
+
+        let base_visits = base.visits as f64;
+        let updated_visits = updated.visits as f64;
+        if updated_visits < base_visits {
+            return;
+        }
+
+        let delta_visits = updated.visits - base.visits;
+        if delta_visits > 0 {
+            let base_sum = base.mean * base_visits;
+            let updated_sum = updated.mean * updated_visits;
+            let delta_sum = updated_sum - base_sum;
+            let total_visits = self.visits + delta_visits;
+            let total_sum = self.mean * (self.visits as f64) + delta_sum;
+            self.visits = total_visits;
+            self.mean = if total_visits > 0 {
+                total_sum / (total_visits as f64)
+            } else {
+                0.0
+            };
+        }
+
+        for (key, updated_child) in &updated.children {
+            if let Some(base_child) = base.children.get(key) {
+                if let Some(self_child) = self.children.get_mut(key) {
+                    self_child.apply_delta(base_child, updated_child);
+                } else {
+                    let mut child = SearchNode::new(updated_child.is_chance_node);
+                    child.apply_delta(
+                        &SearchNode::new(updated_child.is_chance_node),
+                        updated_child,
+                    );
+                    self.children.insert(*key, child);
+                }
+            } else if let Some(self_child) = self.children.get_mut(key) {
+                let empty = SearchNode::new(updated_child.is_chance_node);
+                self_child.apply_delta(&empty, updated_child);
+            } else {
+                let mut child = SearchNode::new(updated_child.is_chance_node);
+                child.apply_delta(
+                    &SearchNode::new(updated_child.is_chance_node),
+                    updated_child,
+                );
+                self.children.insert(*key, child);
+            }
+        }
     }
 
     /// Selects an action to explore, potentially creating a new child node.
@@ -244,9 +308,40 @@ impl SearchTree {
 
         let root = self.root.as_mut().unwrap();
         let h = agent.horizon();
+        let threads = rayon::current_num_threads().max(1);
+        if samples < 2 || threads < 2 {
+            for _ in 0..samples {
+                root.sample(agent, h, h);
+            }
+            return root.best_action(agent);
+        }
 
-        for _ in 0..samples {
-            root.sample(agent, h, h);
+        let workers = threads.min(samples);
+        let base = samples / workers;
+        let extra = samples % workers;
+        let snapshot = root.clone();
+
+        let mut agents = Vec::with_capacity(workers);
+        for i in 0..workers {
+            let seed = agent.gen_f64().to_bits() ^ (i as u64);
+            agents.push(agent.boxed_clone_with_seed(seed));
+        }
+
+        let results: Vec<SearchNode> = agents
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, mut local_agent)| {
+                let mut local_root = snapshot.clone();
+                let iterations = base + usize::from(i < extra);
+                for _ in 0..iterations {
+                    local_root.sample(local_agent.as_mut(), h, h);
+                }
+                local_root
+            })
+            .collect();
+
+        for local in &results {
+            root.apply_delta(&snapshot, local);
         }
 
         root.best_action(agent)

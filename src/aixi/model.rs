@@ -4,7 +4,7 @@
 //! for learning from history and predicting future symbols. Different implementations
 //! provide different complexity vs performance trade-offs.
 
-use crate::ctw::ContextTree;
+use crate::ctw::{ContextTree, FacContextTree};
 use rosaplus::{RosaPlus, RosaTx};
 use rwkvzip::{Compressor, Model, State};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 ///
 /// A predictor must be able to update its internal state based on observed symbols,
 /// revert its state for Monte Carlo simulations, and provide probabilities for
-pub trait Predictor {
+pub trait Predictor: Send + Sync {
     /// Incorporates a new symbol into the model's training history.
     fn update(&mut self, sym: bool);
 
@@ -41,12 +41,15 @@ pub trait Predictor {
 
     /// Returns a human-readable name of the predictive model.
     fn model_name(&self) -> String;
+
+    /// Creates a boxed clone of this predictor.
+    fn boxed_clone(&self) -> Box<dyn Predictor>;
 }
 
-/// A predictor using the Context Tree Weighting (CTW) algorithm.
+/// A predictor using the Action-Conditional CTW algorithm.
 ///
-/// CTW is the classic model used in MC-AIXI, providing efficient
-/// probability estimation for binary sequences.
+/// AC-CTW uses a single context tree for all bits in sequence.
+/// For better type information exploitation, use `FacCtwPredictor`.
 pub struct CtwPredictor {
     tree: ContextTree,
 }
@@ -80,7 +83,83 @@ impl Predictor for CtwPredictor {
     }
 
     fn model_name(&self) -> String {
-        format!("CTW(d={})", self.tree.depth())
+        format!("AC-CTW(d={})", self.tree.depth())
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(Self {
+            tree: self.tree.clone(),
+        })
+    }
+}
+
+/// A predictor using the Factorized Action-Conditional CTW (FAC-CTW) algorithm.
+///
+/// FAC-CTW uses k separate context trees (one per percept bit) with overlapping
+/// context depths D+i-1 for bit i. This enables better exploitation of type
+/// information within percepts, as described in Veness et al. (2011) Section 5.
+///
+/// This is the recommended CTW variant for MC-AIXI agents.
+pub struct FacCtwPredictor {
+    tree: FacContextTree,
+    /// Current bit index within a percept (cycles 0..num_bits).
+    current_bit: usize,
+    /// Total number of percept bits (k).
+    num_bits: usize,
+}
+
+impl FacCtwPredictor {
+    /// Creates a new `FacCtwPredictor`.
+    ///
+    /// - `base_depth`: Context depth D for the first bit's tree
+    /// - `num_percept_bits`: Total bits per percept (observation_bits + reward_bits)
+    pub fn new(base_depth: usize, num_percept_bits: usize) -> Self {
+        Self {
+            tree: FacContextTree::new(base_depth, num_percept_bits),
+            current_bit: 0,
+            num_bits: num_percept_bits,
+        }
+    }
+}
+
+impl Predictor for FacCtwPredictor {
+    fn update(&mut self, sym: bool) {
+        self.tree.update(sym, self.current_bit);
+        self.current_bit = (self.current_bit + 1) % self.num_bits;
+    }
+
+    fn update_history(&mut self, sym: bool) {
+        self.tree.update_history(&[sym]);
+    }
+
+    fn revert(&mut self) {
+        // Revert to previous bit index
+        self.current_bit = if self.current_bit == 0 {
+            self.num_bits - 1
+        } else {
+            self.current_bit - 1
+        };
+        self.tree.revert(self.current_bit);
+    }
+
+    fn pop_history(&mut self) {
+        self.tree.revert_history(1);
+    }
+
+    fn predict_prob(&mut self, sym: bool) -> f64 {
+        self.tree.predict(sym, self.current_bit)
+    }
+
+    fn model_name(&self) -> String {
+        format!("FAC-CTW(D={}, k={})", self.tree.base_depth(), self.num_bits)
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(Self {
+            tree: self.tree.clone(),
+            current_bit: self.current_bit,
+            num_bits: self.num_bits,
+        })
     }
 }
 
@@ -131,6 +210,13 @@ impl Predictor for RosaPredictor {
 
     fn model_name(&self) -> String {
         "ROSA".to_string()
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(Self {
+            model: self.model.clone(),
+            history: self.history.clone(),
+        })
     }
 }
 
@@ -196,5 +282,12 @@ impl Predictor for RwkvPredictor {
 
     fn model_name(&self) -> String {
         "RWKV".to_string()
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(Self {
+            compressor: self.compressor.clone(),
+            history: self.history.clone(),
+        })
     }
 }
