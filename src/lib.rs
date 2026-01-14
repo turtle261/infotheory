@@ -191,7 +191,11 @@ pub enum RateBackend {
     /// Action-Conditional CTW (single context tree).
     Ctw { depth: usize },
     /// Factorized Action-Conditional CTW (k trees for k-bit percepts).
-    FacCtw { base_depth: usize, num_bits: usize },
+    FacCtw {
+        base_depth: usize,
+        num_percept_bits: usize,
+        encoding_bits: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -244,14 +248,15 @@ impl InfotheoryCtx {
         biased_entropy_rate_backend(data, max_order, &self.rate_backend)
     }
 
-    pub fn cross_entropy_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
-        cross_entropy_rate_backend(x, y, max_order, &self.rate_backend)
+    pub fn cross_entropy_rate_bytes(&self, test_data: &[u8], train_data: &[u8], max_order: i64) -> f64 {
+        cross_entropy_rate_backend(test_data, train_data, max_order, &self.rate_backend)
     }
 
-    pub fn cross_entropy_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    pub fn cross_entropy_bytes(&self, test_data: &[u8], train_data: &[u8], max_order: i64) -> f64 {
         if max_order == 0 {
-            let p_x = byte_histogram(x);
-            let p_y = byte_histogram(y);
+            if test_data.is_empty() { return 0.0; }
+            let p_x = byte_histogram(test_data);
+            let p_y = byte_histogram(train_data);
             let mut h = 0.0f64;
             for i in 0..256 {
                 if p_x[i] > 0.0 {
@@ -261,7 +266,7 @@ impl InfotheoryCtx {
             }
             h
         } else {
-            self.cross_entropy_rate_bytes(x, y, max_order)
+            self.cross_entropy_rate_bytes(test_data, train_data, max_order)
         }
     }
 
@@ -321,25 +326,31 @@ impl InfotheoryCtx {
                 let bits = -log_p_cond / std::f64::consts::LN_2;
                 bits / (data.len() as f64)
             }
-            RateBackend::FacCtw { base_depth, num_bits } => {
+            RateBackend::FacCtw {
+                base_depth,
+                num_percept_bits: _,
+                encoding_bits,
+            } => {
                 if data.is_empty() {
                     return 0.0;
                 }
-                let bits_per_byte = (*num_bits).min(8);
+                let bits_per_byte = (*encoding_bits).min(8).max(1);
                 let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
                 for &part in prefix_parts {
                     for &b in part {
-                        for i in (0..bits_per_byte).rev() {
-                            let bit_idx = bits_per_byte - 1 - i;
-                            fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+                        // Fix Issue 1: LSB-first
+                        for i in 0..bits_per_byte {
+                            let bit_idx = i;
+                            // b >> i gets the i-th bit (0 is LSB)
+                            fac.update(((b >> i) & 1) == 1, bit_idx);
                         }
                     }
                 }
                 let log_p_prefix = fac.get_log_block_probability();
                 for &b in data {
-                    for i in (0..bits_per_byte).rev() {
-                        let bit_idx = bits_per_byte - 1 - i;
-                        fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+                    for i in 0..bits_per_byte {
+                        let bit_idx = i;
+                        fac.update(((b >> i) & 1) == 1, bit_idx);
                     }
                 }
                 let log_p_joint = fac.get_log_block_probability();
@@ -567,16 +578,20 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             let bits = -ln_p / std::f64::consts::LN_2;
             bits / (data.len() as f64)
         }
-        RateBackend::FacCtw { base_depth, num_bits } => {
+        RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits: _,
+            encoding_bits,
+        } => {
             if data.is_empty() {
                 return 0.0;
             }
-            let bits_per_byte = (*num_bits).min(8);
+            let bits_per_byte = (*encoding_bits).min(8).max(1);
             let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
             for &b in data {
-                for i in (0..bits_per_byte).rev() {
-                    let bit_idx = bits_per_byte - 1 - i;
-                    fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+                for i in 0..bits_per_byte {
+                    let bit_idx = i;
+                    fac.update(((b >> i) & 1) == 1, bit_idx);
                 }
             }
             let ln_p = fac.get_log_block_probability();
@@ -604,34 +619,40 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
     }
 }
 
+/// Cross-entropy H_{train}(test) - score test_data under model trained on train_data.
 pub fn cross_entropy_rate_backend(
-    x: &[u8],
-    y: &[u8],
+    test_data: &[u8],
+    train_data: &[u8],
     max_order: i64,
     backend: &RateBackend,
 ) -> f64 {
     match backend {
         RateBackend::RosaPlus => {
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-            m.train_example(y);
+            m.train_example(train_data);
             m.build_lm();
-            m.cross_entropy(x)
+            m.cross_entropy(test_data)
         }
         RateBackend::Rwkv7 { model } => {
-            with_rwkv_tls(model, |c| c.cross_entropy_conditional(y, x).unwrap_or(0.0))
+            with_rwkv_tls(model, |c| {
+                // Inverted args fix: (prefix, target) -> (train, test)
+                // This estimates H_{train}(test)
+                c.cross_entropy_conditional(train_data, test_data)
+                    .unwrap_or(0.0)
+            })
         }
         RateBackend::Ctw { depth } => {
-            if x.is_empty() {
+            if test_data.is_empty() {
                 return 0.0;
             }
             let mut tree = crate::ctw::ContextTree::new(*depth);
-            for &b in y {
+            for &b in train_data {
                 for i in (0..8).rev() {
                     tree.update(((b >> i) & 1) == 1);
                 }
             }
             let log_p_y = tree.get_log_block_probability();
-            for &b in x {
+            for &b in test_data {
                 for i in (0..8).rev() {
                     tree.update(((b >> i) & 1) == 1);
                 }
@@ -639,31 +660,36 @@ pub fn cross_entropy_rate_backend(
             let log_p_yx = tree.get_log_block_probability();
             let log_p_x_given_y = log_p_yx - log_p_y;
             let bits = -log_p_x_given_y / std::f64::consts::LN_2;
-            bits / (x.len() as f64)
+            bits / (test_data.len() as f64)
         }
-        RateBackend::FacCtw { base_depth, num_bits } => {
-            if x.is_empty() {
+        RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits: _,
+            encoding_bits,
+        } => {
+            if test_data.is_empty() {
                 return 0.0;
             }
-            let bits_per_byte = (*num_bits).min(8);
+            let bits_per_byte = (*encoding_bits).min(8).max(1);
             let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
-            for &b in y {
-                for i in (0..bits_per_byte).rev() {
-                    let bit_idx = bits_per_byte - 1 - i;
-                    fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+            for &b in train_data {
+                for i in 0..bits_per_byte {
+                    let bit_idx = i;
+                    fac.update(((b >> i) & 1) == 1, bit_idx);
                 }
             }
+
             let log_p_y = fac.get_log_block_probability();
-            for &b in x {
-                for i in (0..bits_per_byte).rev() {
-                    let bit_idx = bits_per_byte - 1 - i;
-                    fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+            for &b in test_data {
+                for i in 0..bits_per_byte {
+                    let bit_idx = i;
+                    fac.update(((b >> i) & 1) == 1, bit_idx);
                 }
             }
             let log_p_yx = fac.get_log_block_probability();
             let log_p_x_given_y = log_p_yx - log_p_y;
             let bits = -log_p_x_given_y / std::f64::consts::LN_2;
-            bits / (x.len() as f64)
+            bits / (test_data.len() as f64)
         }
     }
 }
@@ -682,11 +708,15 @@ pub fn joint_entropy_rate_backend(
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
             m.entropy_rate_cps(&joint_symbols)
         }
-        RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
-            c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
-        }),
+        RateBackend::Rwkv7 { model } => {
+            with_rwkv_tls(model, |c| c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0))
+        }
         RateBackend::Ctw { depth } => {
-            // Interleave bits: x_0, y_0, x_1, y_1...
+            // NOTE: CTW interleaves bits: x_0, y_0, x_1, y_1...
+            // This estimates the joint entropy H(X,Y) by modeling the sequence
+            // of alternating bits. This is a fine-grained joint model but
+            // theoretically consistent for estimating joint entropy rate.
+            // ROSA uses 16-bit joint symbols (x << 8 | y). Both are valid.
             let mut tree = crate::ctw::ContextTree::new(*depth);
             for k in 0..x.len() {
                 let bx = x[k];
@@ -700,18 +730,26 @@ pub fn joint_entropy_rate_backend(
             let bits = -ln_p / std::f64::consts::LN_2;
             bits / (x.len() as f64)
         }
-        RateBackend::FacCtw { base_depth, num_bits } => {
-            // Joint: interleave x and y bits, use 2*num_bits trees
-            let bits_per_byte = (*num_bits).min(8);
+        RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits: _,
+            encoding_bits,
+        } => {
+            // Joint: interleave x and y bits, use 2*encoding_bits trees
+            let bits_per_byte = (*encoding_bits).min(8).max(1);
             let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte * 2);
             for k in 0..x.len() {
                 let bx = x[k];
                 let by = y[k];
-                for i in (0..bits_per_byte).rev() {
-                    let bit_idx_x = (bits_per_byte - 1 - i) * 2;
+                for i in 0..bits_per_byte {
+                    // Tree structure:
+                    // bits_per_byte trees for X, bits_per_byte trees for Y.
+                    // But we interleave them in the "joint" sense.
+                    // Here we map bit i of X to tree 2*i, bit i of Y to tree 2*i + 1
+                    let bit_idx_x = i * 2;
                     let bit_idx_y = bit_idx_x + 1;
-                    fac.update(((bx >> (7 - (bits_per_byte - 1 - i))) & 1) == 1, bit_idx_x);
-                    fac.update(((by >> (7 - (bits_per_byte - 1 - i))) & 1) == 1, bit_idx_y);
+                    fac.update(((bx >> i) & 1) == 1, bit_idx_x);
+                    fac.update(((by >> i) & 1) == 1, bit_idx_y);
                 }
             }
             let ln_p = fac.get_log_block_probability();
@@ -1270,7 +1308,7 @@ pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     if max_h == 0.0 {
         0.0
     } else {
-        (vi / max_h).max(0.0)
+        (vi / max_h).clamp(0.0, 2.0)
     }
 }
 
@@ -1290,10 +1328,11 @@ fn byte_histogram(data: &[u8]) -> [f64; 256] {
     }
     let n = data.len() as f64;
     let mut probs = [0.0f64; 256];
-    if n > 0.0 {
-        for i in 0..256 {
-            probs[i] = counts[i] as f64 / n;
-        }
+    if n == 0.0 {
+        return probs;
+    }
+    for i in 0..256 {
+        probs[i] = counts[i] as f64 / n;
     }
     probs
 }
@@ -1305,6 +1344,9 @@ fn byte_histogram(data: &[u8]) -> [f64; 256] {
 /// 0 = identical distributions, 1 = completely disjoint support.
 #[inline(always)]
 pub fn tvd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
+    if x.is_empty() || y.is_empty() {
+        return 0.0;
+    }
     let p_x = byte_histogram(x);
     let p_y = byte_histogram(y);
 
@@ -1324,6 +1366,9 @@ pub fn tvd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
 /// True metric. Range: [0, 1]. 0 = identical, 1 = disjoint support.
 #[inline(always)]
 pub fn nhd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
+    if x.is_empty() || y.is_empty() {
+        return 0.0;
+    }
     let p_x = byte_histogram(x);
     let p_y = byte_histogram(y);
 
@@ -1339,25 +1384,28 @@ pub fn nhd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
 
 // ====== Other Information-Theoretic Measures ======
 
-/// Compute cross-entropy H(P,Q) = -Σ p(x) log q(x)
+/// Compute cross-entropy H_{train}(test) - score test_data under model trained on train_data.
 ///
 /// Dispatches based on `max_order`.
 #[inline(always)]
-pub fn cross_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    with_default_ctx(|ctx| ctx.cross_entropy_bytes(x, y, max_order))
+pub fn cross_entropy_bytes(test_data: &[u8], train_data: &[u8], max_order: i64) -> f64 {
+    with_default_ctx(|ctx| ctx.cross_entropy_bytes(test_data, train_data, max_order))
 }
 
-/// Compute cross-entropy rate using ROSA.
-/// Training model on Y and evaluating probability of X.
+/// Compute cross-entropy rate using ROSA/CTW/RWKV.
+/// Training model on `train_data` and evaluating probability of `test_data`.
 #[inline(always)]
-pub fn cross_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    with_default_ctx(|ctx| ctx.cross_entropy_rate_bytes(x, y, max_order))
+pub fn cross_entropy_rate_bytes(test_data: &[u8], train_data: &[u8], max_order: i64) -> f64 {
+    with_default_ctx(|ctx| ctx.cross_entropy_rate_bytes(test_data, train_data, max_order))
 }
 
 /// Kullback-Leibler Divergence D_KL(P || Q) = Σ p(x) log(p(x) / q(x))
 ///
 /// Marginal only. Measure of how one probability distribution is different from a second.
 pub fn d_kl_bytes(x: &[u8], y: &[u8]) -> f64 {
+    if x.is_empty() || y.is_empty() {
+        return 0.0;
+    }
     let p_x = byte_histogram(x);
     let p_y = byte_histogram(y);
     let mut d_kl = 0.0f64;
@@ -1375,6 +1423,9 @@ pub fn d_kl_bytes(x: &[u8], y: &[u8]) -> f64 {
 ///
 /// Marginal only. Symmetrized and smoothed version of KL divergence. Range `[0,1]`.
 pub fn js_div_bytes(x: &[u8], y: &[u8]) -> f64 {
+    if x.is_empty() || y.is_empty() {
+        return 0.0;
+    }
     let p_x = byte_histogram(x);
     let p_y = byte_histogram(y);
     let mut m = [0.0f64; 256];
@@ -1569,6 +1620,29 @@ mod tests {
         let r8 = resistance_to_transformation_bytes(x, x, 8);
         assert!((r0 - 1.0).abs() < 1e-12);
         assert!((r8 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn marginal_metrics_empty_inputs_are_zero() {
+        let empty: &[u8] = &[];
+        let x = b"abc";
+
+        assert_eq!(tvd_bytes(empty, x, 0), 0.0);
+        assert_eq!(tvd_bytes(x, empty, 0), 0.0);
+        assert_eq!(nhd_bytes(empty, x, 0), 0.0);
+        assert_eq!(nhd_bytes(x, empty, 0), 0.0);
+        assert_eq!(d_kl_bytes(empty, x), 0.0);
+        assert_eq!(d_kl_bytes(x, empty), 0.0);
+        assert_eq!(js_div_bytes(empty, x), 0.0);
+        assert_eq!(js_div_bytes(x, empty), 0.0);
+    }
+
+    #[test]
+    fn marginal_cross_entropy_empty_test_is_zero() {
+        let empty: &[u8] = &[];
+        let y = b"abc";
+        let ctx = InfotheoryCtx::with_zpaq("5");
+        assert_eq!(ctx.cross_entropy_bytes(empty, y, 0), 0.0);
     }
 
     #[test]
