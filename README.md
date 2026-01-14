@@ -11,7 +11,7 @@ Estimate core measures using both **Marginal** (distribution-based) and **Rate**
 
 ### 2. Multi-Backend Predictive Engine
 Switch between different modeling paradigms seamlessly:
-- **ROSA (Suffix Automaton + Witten Bell aka "RosaPlus" or "Rosa+")**: A statistical LM. Default backend. Extremely fast online learning with Witten-Bell smoothing. Highly optimized for x86_64, memory tuned, parallelized, and with disk-caching.
+- **ROSA+ (Rapid Online Suffix Automaton + Witten Bell)**: A statistical LM. Default backend. Extremely fast online learning. Highly optimized for x86_64, memory tuned, parallelized, and with disk-caching.
 - **CTW (Context Tree Weighting)**: Historically standard for AIXI. Accurate bit-level Bayesian model (KT-estimator).
 - **RWKV (Neural Network)**: Highly optimized x86_64 RWKV7 LLM CPU inference kernel, and training (requires CUDA only for training).
 
