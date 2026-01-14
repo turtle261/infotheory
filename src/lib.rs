@@ -188,7 +188,10 @@ pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBacken
 pub enum RateBackend {
     RosaPlus,
     Rwkv7 { model: Arc<rwkvzip::Model> },
+    /// Action-Conditional CTW (single context tree).
     Ctw { depth: usize },
+    /// Factorized Action-Conditional CTW (k trees for k-bit percepts).
+    FacCtw { base_depth: usize, num_bits: usize },
 }
 
 #[derive(Clone)]
@@ -300,7 +303,6 @@ impl InfotheoryCtx {
                     return 0.0;
                 }
                 let mut tree = crate::ctw::ContextTree::new(*depth);
-                // Train on prefix parts
                 for &part in prefix_parts {
                     for &b in part {
                         for i in (0..8).rev() {
@@ -309,15 +311,38 @@ impl InfotheoryCtx {
                     }
                 }
                 let log_p_prefix = tree.get_log_block_probability();
-                // Score data (update and track additional log-prob)
                 for &b in data {
                     for i in (0..8).rev() {
                         tree.update(((b >> i) & 1) == 1);
                     }
                 }
                 let log_p_joint = tree.get_log_block_probability();
-
-                // Cross entropy = -log P(data | prefix) = -(log P(prefix, data) - log P(prefix))
+                let log_p_cond = log_p_joint - log_p_prefix;
+                let bits = -log_p_cond / std::f64::consts::LN_2;
+                bits / (data.len() as f64)
+            }
+            RateBackend::FacCtw { base_depth, num_bits } => {
+                if data.is_empty() {
+                    return 0.0;
+                }
+                let bits_per_byte = (*num_bits).min(8);
+                let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
+                for &part in prefix_parts {
+                    for &b in part {
+                        for i in (0..bits_per_byte).rev() {
+                            let bit_idx = bits_per_byte - 1 - i;
+                            fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+                        }
+                    }
+                }
+                let log_p_prefix = fac.get_log_block_probability();
+                for &b in data {
+                    for i in (0..bits_per_byte).rev() {
+                        let bit_idx = bits_per_byte - 1 - i;
+                        fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+                    }
+                }
+                let log_p_joint = fac.get_log_block_probability();
                 let log_p_cond = log_p_joint - log_p_prefix;
                 let bits = -log_p_cond / std::f64::consts::LN_2;
                 bits / (data.len() as f64)
@@ -538,11 +563,25 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
                     tree.update(((b >> i) & 1) == 1);
                 }
             }
-            // Log block prob (ln)
             let ln_p = tree.get_log_block_probability();
-            // bits = -log2(P) = -ln(P) / ln(2)
             let bits = -ln_p / std::f64::consts::LN_2;
-            bits / (data.len() as f64) // bits per byte
+            bits / (data.len() as f64)
+        }
+        RateBackend::FacCtw { base_depth, num_bits } => {
+            if data.is_empty() {
+                return 0.0;
+            }
+            let bits_per_byte = (*num_bits).min(8);
+            let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
+            for &b in data {
+                for i in (0..bits_per_byte).rev() {
+                    let bit_idx = bits_per_byte - 1 - i;
+                    fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+                }
+            }
+            let ln_p = fac.get_log_block_probability();
+            let bits = -ln_p / std::f64::consts::LN_2;
+            bits / (data.len() as f64)
         }
     }
 }
@@ -558,7 +597,10 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
         }
-        RateBackend::Ctw { .. } => entropy_rate_backend(data, max_order, backend), // CTW is online, so biased=prequential
+        RateBackend::Ctw { .. } | RateBackend::FacCtw { .. } => {
+            // CTW/FAC-CTW are online, so biased=prequential
+            entropy_rate_backend(data, max_order, backend)
+        }
     }
 }
 
@@ -583,23 +625,42 @@ pub fn cross_entropy_rate_backend(
                 return 0.0;
             }
             let mut tree = crate::ctw::ContextTree::new(*depth);
-            // Train on y
             for &b in y {
                 for i in (0..8).rev() {
                     tree.update(((b >> i) & 1) == 1);
                 }
             }
             let log_p_y = tree.get_log_block_probability();
-            // Train on x
             for &b in x {
                 for i in (0..8).rev() {
                     tree.update(((b >> i) & 1) == 1);
                 }
             }
             let log_p_yx = tree.get_log_block_probability();
-
-            // Cross entropy?
-            // -log P(x|y) = -(log P(y,x) - log P(y))
+            let log_p_x_given_y = log_p_yx - log_p_y;
+            let bits = -log_p_x_given_y / std::f64::consts::LN_2;
+            bits / (x.len() as f64)
+        }
+        RateBackend::FacCtw { base_depth, num_bits } => {
+            if x.is_empty() {
+                return 0.0;
+            }
+            let bits_per_byte = (*num_bits).min(8);
+            let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
+            for &b in y {
+                for i in (0..bits_per_byte).rev() {
+                    let bit_idx = bits_per_byte - 1 - i;
+                    fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+                }
+            }
+            let log_p_y = fac.get_log_block_probability();
+            for &b in x {
+                for i in (0..bits_per_byte).rev() {
+                    let bit_idx = bits_per_byte - 1 - i;
+                    fac.update(((b >> (7 - bit_idx)) & 1) == 1, bit_idx);
+                }
+            }
+            let log_p_yx = fac.get_log_block_probability();
             let log_p_x_given_y = log_p_yx - log_p_y;
             let bits = -log_p_x_given_y / std::f64::consts::LN_2;
             bits / (x.len() as f64)
@@ -625,11 +686,7 @@ pub fn joint_entropy_rate_backend(
             c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
         }),
         RateBackend::Ctw { depth } => {
-            // Interleaved? Or pair symbols?
-            // CTW is binary. Aligned pair = 16 bits? or 2 bits?
-            // x[i] (8 bits), y[i] (8 bits).
-            // Interleaving bits: x_0, y_0, x_1, y_1...
-            // This is good for joint entropy.
+            // Interleave bits: x_0, y_0, x_1, y_1...
             let mut tree = crate::ctw::ContextTree::new(*depth);
             for k in 0..x.len() {
                 let bx = x[k];
@@ -641,7 +698,25 @@ pub fn joint_entropy_rate_backend(
             }
             let ln_p = tree.get_log_block_probability();
             let bits = -ln_p / std::f64::consts::LN_2;
-            bits / (x.len() as f64) // bits per pair
+            bits / (x.len() as f64)
+        }
+        RateBackend::FacCtw { base_depth, num_bits } => {
+            // Joint: interleave x and y bits, use 2*num_bits trees
+            let bits_per_byte = (*num_bits).min(8);
+            let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte * 2);
+            for k in 0..x.len() {
+                let bx = x[k];
+                let by = y[k];
+                for i in (0..bits_per_byte).rev() {
+                    let bit_idx_x = (bits_per_byte - 1 - i) * 2;
+                    let bit_idx_y = bit_idx_x + 1;
+                    fac.update(((bx >> (7 - (bits_per_byte - 1 - i))) & 1) == 1, bit_idx_x);
+                    fac.update(((by >> (7 - (bits_per_byte - 1 - i))) & 1) == 1, bit_idx_y);
+                }
+            }
+            let ln_p = fac.get_log_block_probability();
+            let bits = -ln_p / std::f64::consts::LN_2;
+            bits / (x.len() as f64)
         }
     }
 }

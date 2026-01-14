@@ -1,6 +1,7 @@
 # .cargo/config.toml
 [build]
 rustflags = ["-C", "target-cpu=native"]
+rustdocflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"] # Commment if doctest fails
 
 #[target.x86_64-unknown-linux-gnu]
 ## Needed for `lto = "fat"` in this workspace: GNU ld.bfd can't consume Rust's
@@ -16,7 +17,6 @@ rustflags = [
   "-C", "target-cpu=native",
   "-C", "link-arg=-fuse-ld=lld",
 ]
-rustdocflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]
 
 [target.'cfg(windows)']
 rustflags = ["-C", "target-cpu=native"]
