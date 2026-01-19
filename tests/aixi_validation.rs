@@ -136,11 +136,12 @@ fn run_agent_env<T: Environment>(agent: &mut Agent, mut env: T, cycles: usize) -
 
         env.perform_action(action);
 
-        let obs = env.get_observation();
+        let obs_stream = env.drain_observations();
+        let obs = agent.observation_key_from_stream(&obs_stream);
         let rew = env.get_reward();
 
-        // Update model with observed percept
-        agent.model_update_percept(obs, rew);
+        // Update model with observed percept stream
+        agent.model_update_percept_stream(&obs_stream, rew);
 
         total_reward += rew as f64;
         prev_obs = obs;
@@ -161,10 +162,13 @@ fn agent_solves_ctw_test_environment() {
         ct_depth: 8,
         agent_horizon: 8, // Increased from 4
         observation_bits: 1,
+        observation_stream_len: 1,
+        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::First,
         reward_bits: 1,
         agent_actions: 2,
         num_simulations: 200, // Increased from 50
         exploration_exploitation_ratio: 2.0,
+        discount_gamma: 1.0,
         min_reward: 0,
         max_reward: 1,
         reward_offset: 0,
@@ -197,10 +201,13 @@ fn agent_regret_sublinear_coinflip() {
         ct_depth: 4,
         agent_horizon: 4, // Increased from 2
         observation_bits: 1,
+        observation_stream_len: 1,
+        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::First,
         reward_bits: 1,
         agent_actions: 2,
         num_simulations: 100, // Increased from 20
         exploration_exploitation_ratio: 1.0,
+        discount_gamma: 1.0,
         min_reward: 0,
         max_reward: 1,
         reward_offset: 0,

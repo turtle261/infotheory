@@ -2,29 +2,37 @@ use infotheory::aixi::agent::{Agent, AgentConfig};
 use infotheory::aixi::environment::{BiasedRockPaperScissor, Environment};
 use std::time::{Duration, Instant};
 
-fn bench_agent(mut agent: Agent, mut env: Box<dyn Environment>, cycles: usize, warmup: usize) -> Duration {
+fn bench_agent(
+    mut agent: Agent,
+    mut env: Box<dyn Environment>,
+    cycles: usize,
+    warmup: usize,
+) -> Duration {
     let mut prev_action = 0u64;
-    let mut obs = env.get_observation();
+    let mut obs_stream = env.drain_observations();
+    let mut obs = agent.observation_key_from_stream(&obs_stream);
     let mut rew = env.get_reward();
 
     // Warmup
     for _ in 0..warmup {
-        agent.model_update_percept(obs, rew);
+        agent.model_update_percept_stream(&obs_stream, rew);
         let action = agent.get_planned_action(obs, rew, prev_action);
         agent.model_update_action_external(action);
         env.perform_action(action);
-        obs = env.get_observation();
+        obs_stream = env.drain_observations();
+        obs = agent.observation_key_from_stream(&obs_stream);
         rew = env.get_reward();
         prev_action = action;
     }
 
     let now = Instant::now();
     for _ in 0..cycles {
-        agent.model_update_percept(obs, rew);
+        agent.model_update_percept_stream(&obs_stream, rew);
         let action = agent.get_planned_action(obs, rew, prev_action);
         agent.model_update_action_external(action);
         env.perform_action(action);
-        obs = env.get_observation();
+        obs_stream = env.drain_observations();
+        obs = agent.observation_key_from_stream(&obs_stream);
         rew = env.get_reward();
         prev_action = action;
     }
@@ -46,10 +54,13 @@ fn main() {
         ct_depth: 32,
         agent_horizon: 5,
         observation_bits: 2,
+        observation_stream_len: 1,
+        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::First,
         reward_bits: 2,
         agent_actions: 3,
         num_simulations: 400,
         exploration_exploitation_ratio: 1.4,
+        discount_gamma: 1.0,
         min_reward: -1,
         max_reward: 1,
         reward_offset: 1,

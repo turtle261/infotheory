@@ -15,6 +15,44 @@ pub type Reward = i64;
 /// A generic value for a percept component (either an observation or a reward).
 pub type PerceptVal = u64;
 
+/// Strategy for mapping an observation stream into a single percept key for tree search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationKeyMode {
+    /// Use the first observation symbol as the key.
+    First,
+    /// Use the last observation symbol as the key.
+    Last,
+    /// Hash the entire observation stream into a single key.
+    StreamHash,
+}
+
+/// Compute a percept key from an observation stream.
+pub fn observation_key_from_stream(
+    mode: ObservationKeyMode,
+    observations: &[PerceptVal],
+    observation_bits: usize,
+) -> PerceptVal {
+    match mode {
+        ObservationKeyMode::First => observations.first().copied().unwrap_or(0),
+        ObservationKeyMode::Last => observations.last().copied().unwrap_or(0),
+        ObservationKeyMode::StreamHash => {
+            let mask = if observation_bits >= 64 {
+                u64::MAX
+            } else if observation_bits == 0 {
+                0
+            } else {
+                (1u64 << observation_bits) - 1
+            };
+            let mut h = 0u64;
+            for &obs in observations {
+                let v = obs & mask;
+                h = h.rotate_left(7) ^ v;
+            }
+            h
+        }
+    }
+}
+
 /// A high-performance random number generator using the XorShift64* algorithm.
 ///
 /// This generator is seeded using `zpaq_rs::random_bytes` to avoid external dependencies

@@ -4,7 +4,9 @@
 //! confidence bounds applied to trees (UCT) approach to select actions
 //! by simulating future interactions with a world model.
 
-use crate::aixi::common::{Action, PerceptVal, Reward};
+use crate::aixi::common::{
+    Action, ObservationKeyMode, PerceptVal, Reward, observation_key_from_stream,
+};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -19,6 +21,16 @@ pub trait AgentSimulator: Send + Sync {
 
     /// Returns the bit-width used to encode observations.
     fn get_num_observation_bits(&self) -> usize;
+
+    /// Returns the number of observation symbols per action.
+    fn observation_stream_len(&self) -> usize {
+        1
+    }
+
+    /// Returns the observation key mode for search-tree branching.
+    fn observation_key_mode(&self) -> ObservationKeyMode {
+        ObservationKeyMode::First
+    }
 
     /// Returns the bit-width used to encode rewards.
     fn get_num_reward_bits(&self) -> usize;
@@ -41,6 +53,11 @@ pub trait AgentSimulator: Send + Sync {
 
     /// Returns the exploration-exploitation constant (often denoted as C).
     fn get_explore_exploit_ratio(&self) -> f64 {
+        1.0
+    }
+
+    /// Returns the discount factor for future rewards.
+    fn discount_gamma(&self) -> f64 {
         1.0
     }
 
@@ -72,7 +89,12 @@ pub trait AgentSimulator: Send + Sync {
         let min = self.min_reward() as f64;
         let max = self.max_reward() as f64;
         let h = self.horizon() as f64;
-        let range = (max - min) * h;
+        let gamma = self.discount_gamma().clamp(0.0, 1.0);
+        let range = if (gamma - 1.0).abs() < 1e-9 {
+            (max - min) * h
+        } else {
+            (max - min) * ((1.0 - gamma.powi(h as i32)) / (1.0 - gamma))
+        };
         if range.abs() < 1e-9 {
             0.5
         } else {
@@ -80,13 +102,34 @@ pub trait AgentSimulator: Send + Sync {
         }
     }
 
-    /// Helper to generate both an observation and a reward.
+    /// Helper to generate a percept stream, update the model, and return a search key + reward.
     fn gen_percepts_and_update(&mut self) -> (PerceptVal, Reward) {
-        let obs = self.gen_percept_and_update(self.get_num_observation_bits());
+        let obs_bits = self.get_num_observation_bits();
+        let obs_len = self.observation_stream_len().max(1);
+        let mut observations = Vec::with_capacity(obs_len);
+        for _ in 0..obs_len {
+            observations.push(self.gen_percept_and_update(obs_bits));
+        }
+
+        let obs_key = observation_key_from_stream(self.observation_key_mode(), &observations, obs_bits);
         let rew_bits = self.get_num_reward_bits();
         let rew_u = self.gen_percept_and_update(rew_bits);
         let rew = (rew_u as i64) - self.reward_offset();
-        (obs, rew)
+        (self.percept_key(obs_key, rew_u), rew)
+    }
+
+    /// Combines observation and reward into a single search-tree key.
+    fn percept_key(&self, obs_key: PerceptVal, rew_u: u64) -> u64 {
+        let obs_bits = self.get_num_observation_bits();
+        let rew_bits = self.get_num_reward_bits();
+        let can_pack = self.observation_stream_len() == 1
+            && matches!(self.observation_key_mode(), ObservationKeyMode::First | ObservationKeyMode::Last)
+            && obs_bits + rew_bits <= 63;
+        if can_pack {
+            obs_key + (rew_u << obs_bits)
+        } else {
+            obs_key.rotate_left(17) ^ rew_u.wrapping_mul(0x9E3779B97F4A7C15)
+        }
     }
 }
 
@@ -203,7 +246,7 @@ impl SearchNode {
     fn select_action(
         &mut self,
         agent: &mut dyn AgentSimulator,
-        horizon: usize,
+        _horizon: usize,
     ) -> (&mut SearchNode, Action) {
         let num_actions = agent.get_num_actions();
 
@@ -259,18 +302,12 @@ impl SearchNode {
 
         let reward;
         if self.is_chance_node {
-            let obs = agent.gen_percept_and_update(agent.get_num_observation_bits());
-            let rew_u = agent.gen_percept_and_update(agent.get_num_reward_bits());
-            let rew = (rew_u as i64) - agent.reward_offset();
-
-            let obs_bits = agent.get_num_observation_bits();
-            let key = obs + (rew_u << obs_bits);
-
+            let (key, rew) = agent.gen_percepts_and_update();
             let child = self
                 .children
                 .entry(key)
                 .or_insert_with(|| SearchNode::new(false));
-            reward = (rew as f64) + child.sample(agent, horizon - 1, total_horizon);
+            reward = (rew as f64) + agent.discount_gamma() * child.sample(agent, horizon - 1, total_horizon);
         } else if self.visits == 0 {
             reward = Self::playout(agent, horizon, total_horizon);
         } else {
@@ -289,12 +326,15 @@ impl SearchNode {
     fn playout(agent: &mut dyn AgentSimulator, horizon: usize, total_horizon: usize) -> f64 {
         let mut total_rew = 0.0;
         let num_actions = agent.get_num_actions();
+        let gamma = agent.discount_gamma().clamp(0.0, 1.0);
+        let mut discount = 1.0;
 
         for _ in 0..horizon {
             let act = agent.gen_range(num_actions);
             agent.model_update_action(act as Action);
-            let (_obs, rew) = agent.gen_percepts_and_update();
-            total_rew += rew as f64;
+            let (_key, rew) = agent.gen_percepts_and_update();
+            total_rew += discount * (rew as f64);
+            discount *= gamma;
         }
 
         agent.model_revert(total_horizon);
@@ -384,10 +424,9 @@ impl SearchTree {
 
         // Find chance child (prev_act)
         if let Some(mut chance_child) = old_root.children.remove(&prev_act) {
-            let obs_bits = agent.get_num_observation_bits();
             let offset = agent.reward_offset();
             let key_rew_u = (prev_rew + offset) as u64;
-            let key = prev_obs + (key_rew_u << obs_bits);
+            let key = agent.percept_key(prev_obs, key_rew_u);
 
             if let Some(action_child) = chance_child.children.remove(&key) {
                 self.root = Some(action_child);

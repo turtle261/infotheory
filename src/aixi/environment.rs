@@ -19,6 +19,13 @@ pub trait Environment {
     /// Returns the current observation produced by the environment.
     fn get_observation(&self) -> PerceptVal;
 
+    /// Returns a stream of observation symbols produced by the last action.
+    ///
+    /// Default behavior is a single observation.
+    fn drain_observations(&mut self) -> Vec<PerceptVal> {
+        vec![self.get_observation()]
+    }
+
     /// Returns the current reward produced by the environment.
     fn get_reward(&self) -> Reward;
 

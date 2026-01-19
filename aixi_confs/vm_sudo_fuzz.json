@@ -1,0 +1,82 @@
+{
+    "algorithm": "ctw",
+    "environment": "vm",
+    "ct_depth": 32,
+    "agent_horizon": 4,
+    "observation_bits": 8,
+    "observation_stream_len": 1024,
+    "observation_key_mode": "stream-hash",
+    "reward_bits": 16,
+    "num_simulations": 100,
+    "exploration_exploitation_ratio": 2.0,
+    "discount_gamma": 0.95,
+    "terminate-lifetime": 1000,
+    "vm_config": {
+        "libvirt_uri": "qemu:///system",
+        "domain": "archlinux",
+        "snapshot": "fuzz-ready",
+        "transport": "ssh",
+        "auto_snapshot": true,
+        "ssh": {
+            "host": "192.168.122.50",
+            "port": 22,
+            "user": "aixi",
+            "password": "SuperSecurePassword",
+            "connect_timeout_ms": 5000,
+            "retry_interval_ms": 500,
+            "action_command": {
+                "cmd": "sudo",
+                "args": ["-S", "-k", "id"],
+                "stdin_payload": true
+            },
+            "provision_steps": [
+                { "run": "ls" }
+            ]
+        },
+        "stats_backend": {
+            "name": "rosa",
+            "max_order": -1
+        },
+        "episode_steps": 1,
+        "step_cost": 0,
+        "boot_timeout_ms": 30000,
+        "step_timeout_ms": 5000,
+        "verbose": true,
+        "resource_limits": {
+            "memory_mib": 2048,
+            "vcpus": 2,
+            "apply_mode": "live"
+        }
+    },
+    "vm_actions": {
+        "mode": "fuzz",
+        "fuzz": {
+            "seed_inputs": [
+                "password123\n"
+            ],
+            "mutators": [
+                "flip_bit",
+                "insert_byte",
+                "havoc"
+            ],
+            "min_len": 1,
+            "max_len": 256,
+            "rng_seed": 12345
+        }
+    },
+    "vm_observation": {
+        "mode": "raw",
+        "stream_len": 1024,
+        "stream_mode": "pad-truncate"
+    },
+    "vm_reward": {
+        "mode": "entropy-reduction",
+        "baseline_path": "aixi_confs/sudo_baseline.txt",
+        "max_order": 4,
+        "scale": -5.0
+    },
+    "vm_filter": {
+        "min_entropy": 0.5,
+        "reject_reward": -20
+    }
+}

@@ -14,3 +14,4 @@ pub mod common;
 pub mod environment;
 pub mod mcts;
 pub mod model;
+pub mod vm;

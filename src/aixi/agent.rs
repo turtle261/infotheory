@@ -3,7 +3,10 @@
 //! This module defines the `Agent` struct, which ties together a world model
 //! (Predictor) and a planner (SearchTree) to form a complete autonomous entity.
 
-use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward, decode, encode};
+use crate::aixi::common::{
+    Action, ObservationKeyMode, PerceptVal, RandomGenerator, Reward, decode, encode,
+    observation_key_from_stream,
+};
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor, Predictor, RosaPredictor, RwkvPredictor};
 use crate::load_rwkv7_model_from_path;
@@ -19,6 +22,10 @@ pub struct AgentConfig {
     pub agent_horizon: usize,
     /// Number of bits used to encode observations.
     pub observation_bits: usize,
+    /// Number of observation symbols per action (stream length).
+    pub observation_stream_len: usize,
+    /// Strategy for mapping observation streams into search keys.
+    pub observation_key_mode: ObservationKeyMode,
     /// Number of bits used to encode rewards.
     pub reward_bits: usize,
     /// Number of possible actions.
@@ -27,6 +34,8 @@ pub struct AgentConfig {
     pub num_simulations: usize,
     /// Constant governing exploration vs exploitation in UCT.
     pub exploration_exploitation_ratio: f64,
+    /// Discount factor for future rewards (1.0 = undiscounted).
+    pub discount_gamma: f64,
     /// Minimum possible instantaneous reward in the environment.
     pub min_reward: Reward,
     /// Maximum possible instantaneous reward in the environment.
@@ -157,8 +166,15 @@ impl Agent {
 
     /// Updates the world model with real-world percepts.
     pub fn model_update_percept(&mut self, observation: PerceptVal, reward: Reward) {
+        self.model_update_percept_stream(&[observation], reward);
+    }
+
+    /// Updates the world model with an observation stream and a terminal reward.
+    pub fn model_update_percept_stream(&mut self, observations: &[PerceptVal], reward: Reward) {
         let mut percept_syms = Vec::new();
-        encode(&mut percept_syms, observation, self.config.observation_bits);
+        for &obs in observations {
+            encode(&mut percept_syms, obs, self.config.observation_bits);
+        }
         crate::aixi::common::encode_reward_offset(
             &mut percept_syms,
             reward,
@@ -174,6 +190,15 @@ impl Agent {
         self.is_last_update_percept = true;
     }
 
+    /// Computes the observation key used for search-tree branching.
+    pub fn observation_key_from_stream(&self, observations: &[PerceptVal]) -> PerceptVal {
+        observation_key_from_stream(
+            self.config.observation_key_mode,
+            observations,
+            self.config.observation_bits,
+        )
+    }
+
     /// Explicitly updates the world model with an action.
     pub fn model_update_action_external(&mut self, action: Action) {
         self.model_update_action(action);
@@ -187,6 +212,14 @@ impl AgentSimulator for Agent {
 
     fn get_num_observation_bits(&self) -> usize {
         self.config.observation_bits
+    }
+
+    fn observation_stream_len(&self) -> usize {
+        self.config.observation_stream_len.max(1)
+    }
+
+    fn observation_key_mode(&self) -> ObservationKeyMode {
+        self.config.observation_key_mode
     }
 
     fn get_num_reward_bits(&self) -> usize {
@@ -211,6 +244,10 @@ impl AgentSimulator for Agent {
 
     fn get_explore_exploit_ratio(&self) -> f64 {
         self.config.exploration_exploitation_ratio
+    }
+
+    fn discount_gamma(&self) -> f64 {
+        self.config.discount_gamma
     }
 
     fn model_update_action(&mut self, action: Action) {
@@ -244,7 +281,8 @@ impl AgentSimulator for Agent {
     }
 
     fn model_revert(&mut self, steps: usize) {
-        let percept_bits = self.config.observation_bits + self.config.reward_bits;
+        let obs_bits = self.config.observation_bits * self.config.observation_stream_len.max(1);
+        let percept_bits = obs_bits + self.config.reward_bits;
 
         for _ in 0..steps {
             for _ in 0..percept_bits {
