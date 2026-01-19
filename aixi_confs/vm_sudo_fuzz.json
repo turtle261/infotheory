@@ -26,11 +26,17 @@
             "retry_interval_ms": 500,
             "action_command": {
                 "cmd": "sudo",
-                "args": ["-S", "-k", "id"],
+                "args": [
+                    "-S",
+                    "-k",
+                    "id"
+                ],
                 "stdin_payload": true
             },
             "provision_steps": [
-                { "run": "ls" }
+                {
+                    "run": "ls"
+                }
             ]
         },
         "stats_backend": {
@@ -43,8 +49,8 @@
         "step_timeout_ms": 5000,
         "verbose": true,
         "resource_limits": {
-            "memory_mib": 2048,
-            "vcpus": 2,
+            "memory_mib": 1024,
+            "vcpus": 1,
             "apply_mode": "live"
         }
     },
