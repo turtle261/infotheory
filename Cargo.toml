@@ -5,8 +5,14 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace]
-members = [".", "zpaq_rs", "rosa"]
+members = [".", "zpaq_rs", "rosa", "nyx-lite"]
 resolver = "3"
+
+[workspace.lints.rust]
+warnings = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
 
 [dependencies]
 zpaq_rs = {path = "./zpaq_rs"}
@@ -41,3 +47,6 @@ lto = "fat"
 codegen-units = 1
 opt-level = 3
 debug = true
+
+[patch.crates-io]
+linux-loader = { path = "nyx-lite/vendor/linux-loader" }

@@ -1,0 +1,545 @@
+% Agentic Compression – Intelligence as Entropy Routing
+\documentclass[12pt,a4paper]{article}
+
+% ---------- Basic setup ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage[hidelinks]{hyperref}
+\pdfstringdefDisableCommands{\def\Agentic{Agentic}}
+
+% ---------- Math / Theorems ----------
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\bits}{\text{ bits}}
+
+% convenient symbols
+\newcommand{\ERideal}{\ell\text{-}ER}
+\newcommand{\ERmeas}{\widehat{ER}}
+\newcommand{\Iinfo}{I_{\mathrm{info}}}
+
+% ---------- Algorithms ----------
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+% ---------- Figures/Tables ----------
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{float}
+
+% ---- Optional siunitx, with safe fallback ----
+\IfFileExists{siunitx.sty}{%
+  \usepackage{siunitx}
+  \sisetup{round-mode=places,round-precision=2}%
+}{%
+  \newcommand{\SI}[2]{##1~##2}%
+  \newcommand{\si}[1]{##1}%
+}%
+
+% ---------- Bibliography ----------
+\usepackage[numbers,sort&compress]{natbib}
+
+\title{\textbf{Agentic Compression: Intelligence as Entropy Routing}\\[4pt]
+\large A Sink-Inclusive Extension of Minimum Description Length with Decode-Safe Accounting}
+\author{Noah Cashin\\ \small Independent Researcher}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \emph{Agentic Compression}, a compact, falsifiable framework in which intelligence is defined and measured as \emph{entropy reduction per resource}. An agent routes uncertainty from \emph{sources} (data, environment) into \emph{sinks} (controllable observation channels, ``tools'') under priced budgets. Our contributions are: (i) a \emph{Unified Efficiency Principle} (UEP) stating $I=\Delta S/R$, with a digital instantiation $\Iinfo=\widehat{ER}/C$ (bits saved per cost) and a thermodynamic correspondence via Landauer; (ii) a \emph{sink-inclusive MDL} objective with decode-safe accounting that yields integer-bit signals when measured with an entropy coder; (iii) a \emph{capacity--efficiency} decomposition where capacity is the channel-side mutual-information ceiling under budget and efficiency is the agent's fraction of that ceiling (we distinguish \emph{ideal} vs.\ \emph{measured} efficiency; measured efficiency may exceed 1 under coder misspecification); (iv) a \emph{gating rule} that accepts side-information iff gross bits-saved exceeds its price (where price includes shipped-bit overheads); and (v) \emph{operational protocols} (LLM and HITL) including oracular and non-oracular tracks and audit procedures.
+
+We instantiate the framework in \emph{CandleZip}, a Rust agent-in-the-loop compressor that queries channels once per chunk to propose hints for a base model. On Canterbury subsets and a $128$\,KB Enwik8 sample, CandleZip improves over an LLMZip-like baseline under fixed budgets while misaligned channels are gated out. More importantly, the \emph{measurement} is lossless, auditable, and substrate-agnostic: the same integer-bit signal applies to LLMs and humans under matched budgets. We separate \emph{proven invariants}, \emph{measured findings}, and \emph{conjectures}, enabling adversarial replication and scaling.
+
+DOI: \href{https://doi.org/10.5281/zenodo.17282860}{10.5281/zenodo.17282860}
+\end{abstract}
+
+\section{Registered Claims: Proven \;|\; Measured \;|\; Conjectured}
+\label{sec:claims}
+\textbf{Proven (information-theoretic):}
+\begin{itemize}
+\item Non-negativity of bits-saved under gating (on \emph{gross} conditioned lengths); additivity across concatenations evaluated as a single source.
+\item \textbf{Mutual-information ceiling (qualified).} For the \emph{optimal coder} ($Q_\theta=P$), the expected \emph{ideal} coding gain from side information is upper-bounded by $I(X;A)$, with equality when $\pi$ is capacity-achieving; for arbitrary $Q_\theta$, an explicit KL-mismatch term appears (Sec.~\ref{sec:mdl}, Thm.~\ref{thm:mi}).
+\item Decode-safe accounting: any side-information needed at decode must be represented or regenerated deterministically (priced in $L_{\mathrm{ship}}$).
+\item Greedy gate optimality under additive/submodular contributions; in general, the gate guarantees $\widehat{ER}\ge 0$ (gross) and decode-safety when prices include shipped bits.
+\item Capacity monotonicity in controllable action-space and in coupling side-information (Thms.~\ref{thm:monotone-q}, \ref{thm:monotone-s}).
+\item \textbf{Representation Theorem.} Under explicit axioms (additivity, monotonicity, cost homogeneity, reparameterization invariance, continuity), any operational intelligence functional is a positive multiple of $(\ERideal)/C$ (Thm.~\ref{thm:representation}), with $\ERideal$ the ideal (cross-entropy) reduction.
+\end{itemize}
+\textbf{Measured (this artifact):}
+\begin{itemize}
+\item Integer $\widehat{ER}$ (\emph{measured entropy reduction}) on standard corpora; \emph{gross} ROI $\eta_{\text{gross}}=\widehat{ER}/C$ and \emph{net} ROI $\eta_{\text{net}}=S_{\text{net}}/C$; gate rates and ablations.
+\item Deterministic, replayable channel-calling agent integrated in a Rust compressor; proof logs and per-chunk CSVs.
+\end{itemize}
+\textbf{Conjectured (explicit):}
+\begin{itemize}
+\item \emph{Scaling law}: $\widehat{ER}(B)$ shows diminishing returns in budget $B$ (adaptive submodularity).
+\item \emph{Energetic correspondence}: optimized systems approach bits/J fractions suggested by Landauer; requires metering.
+\end{itemize}
+
+\section{Background and Novelty}
+\paragraph{Compression $\leftrightarrow$ intelligence.}
+Shannon entropy quantifies predictability~\citep{shannon1948}. MDL and Kolmogorov complexity formalize prediction as compression~\citep{rissanen1978modeling,kolmogorov1965three}. The Hutter Prize framed compression as an intelligence test~\citep{mahoney2005ltcb,hutterprize}. We extend this lineage \emph{agentically}: channels (``tools'') are priced \emph{entropy sinks}; their use is \emph{explicitly} encoded in the description length.
+
+\paragraph{Thermodynamic accounts.}
+Free-energy and causal-entropic approaches tie adaptive behavior to surprise/entropy under physical constraints~\citep{friston2010free,wissnergross2013causal}. Our contribution is a \emph{computable digital dual} with integer-bit readout and decode safety.
+
+\paragraph{Tool-augmented LLMs.}
+ReAct/Toolformer enable tools~\citep{yao2022react,schick2023toolformer} but lack a universal, lossless, cross-domain metric. Our bits-per-cost signal is dense, audit-ready, and transferable to HITL.
+
+\paragraph{What is \emph{novel}?}
+(i) \emph{Sink-inclusive MDL} for agents; (ii) \emph{capacity--efficiency} split for channel ceilings vs.\ agent skill; (iii) \emph{decode-safe} lossless accounting; (iv) \emph{integer-bit} measurement usable for training and evaluation; (v) \emph{oracular/non-oracular} tracks and adversarial audit protocols. Prior work does not combine these in a single, runnable instrument.
+
+\section{Unified Efficiency Principle (UEP)}
+\label{sec:uep}
+\begin{definition}[UEP (substrate-agnostic)]
+Intelligence is efficiency of entropy reduction per resource:
+\begin{equation}
+I\;=\;\frac{\Delta S_{\text{reduced}}}{R}.
+\end{equation}
+\end{definition}
+\paragraph{Digital instantiation.}
+\begin{equation}
+\Iinfo=\frac{\widehat{ER}_\pi(X;T,B)}{C}
+=\frac{\widehat{L}_\theta(X)-\widehat{L}_\theta(X\mid A_T,B)_{\mathrm{gross}}}{C}\quad\text{(bits per cost)}.
+\end{equation}
+Define \emph{gross} and \emph{net} ROI:
+\[
+\eta_{\text{gross}}=\frac{\widehat{ER}_\pi}{C},\qquad
+\eta_{\text{net}}=\frac{S_{\text{net}}}{C}.
+\]
+\paragraph{Thermodynamic correspondence.}
+Using Landauer's bound, erasing 1 bit requires $\ge kT\ln 2$ joules at equilibrium temperature $T$, implying the physical limit
+\begin{equation}
+\frac{ER\ \text{(bits, ideal)}}{\Delta E\ \text{(J)}}\ \le\ \frac{1}{kT\ln 2}
+\end{equation}
+\citep{landauer1961,bennett2003landauer}.
+Finite-time and device overheads reduce achievable bits/J below this limit; we do not assume reversibility.
+
+\section{Tools as Controllable Observation Channels}
+\label{sec:channels}
+Let $X=x_{1:n}$ be the data source. A toolset $T$ defines a family of conditional channels $\{P(Y\mid q)\}_{q\in\mathcal{Q}}$ indexed by a controllable input $q$ in an \emph{action manifold} $\mathcal{Q}$. Querying $q$ yields an observation $Y_q\sim P(\cdot\mid q)$ at priced cost $c(q)\ge 0$. A policy $\pi$ maps the compression history $\mathcal{H}_t$ to a (possibly adaptive) multiset of queries $\{q_i\}$ s.t.\ $\sum_i c(q_i)\le B$. The collection of observations accepted by the gate is denoted $A_T^{(\pi)}$ and is deterministically consumed at encode/decode (or represented explicitly in the bitstream).
+
+\paragraph{Capacity (channel-side ceiling).}
+\begin{equation}
+\mathrm{Cap}(X;T,B)\;=\;\sup_{\pi:\,\sum c\le B}\; I\!\big(X;\,A_T^{(\pi)}\big),
+\end{equation}
+where $A_T^{(\pi)}$ is the random transcript induced by the \emph{adaptive} policy $\pi$.
+
+\paragraph{Efficiency (agent-side skill).}
+We distinguish an \emph{ideal} efficiency (uses ideal cross-entropy reductions) from a \emph{measured} efficiency (uses realized gross bitstream reductions):
+\begin{equation}
+\mathrm{Eff}^\star_\pi(X;T,B) \,=\, \begin{cases}
+\dfrac{\mathbb{E}[\ERideal_\pi(X;T,B)]}{\mathrm{Cap}(X;T,B)}, & \mathrm{Cap}>0,\\[6pt]
+0, & \mathrm{Cap}=0~\text{(by convention)}
+\end{cases}\quad\text{(ideal; }\mathrm{Eff}^\star\in[0,1]\text{ when }Q_\theta=P),
+\end{equation}
+\begin{equation}
+\mathrm{Eff}^{\mathrm{gross}}_\pi(X;T,B) \,=\, \frac{\widehat{ER}_\pi(X;T,B)}{\mathrm{Cap}(X;T,B)},\qquad
+\mathrm{Eff}^{\mathrm{net}}_\pi(X;T,B) \,=\, \frac{S_{\text{net}}(X;T,B)}{\mathrm{Cap}(X;T,B)}.
+\end{equation}
+\noindent Note: $\mathrm{Eff}^{\mathrm{gross}}_\pi$ may exceed $1$ when the baseline coder is misspecified (conditioning reduces KL mismatch).
+
+\section{Sink-Inclusive MDL and Invariants}
+\label{sec:mdl}
+
+\paragraph{Notation (ideal vs.\ measured).}
+\emph{Ideal} length (sample cross-entropy): $\displaystyle \ell_\theta(X) \coloneqq -\sum_{t=1}^{n}\log_2 p_\theta(x_t\mid x_{<t},\cdot)$.\\
+\emph{Measured baseline length (integer):} $\widehat{L}_\theta(X)$ produced by an \emph{entropy coder} (arithmetic/rANS)~\citep{witten1987arithmetic,duda2013ans}.
+
+\paragraph{Base and channel-conditioned measured lengths.}
+We explicitly separate \emph{gross} conditioned lengths (exclude shipped decode-safe bits) from shipped-bit overheads:
+\begin{equation}
+\widehat{L}_\theta(X),\qquad
+\widehat{L}_\theta(X\mid A_T,B)_{\mathrm{gross}}\;\text{(conditioned length excluding shipped bits)}.
+\end{equation}
+Define the shipped (decode-safe) bit overhead
+\[
+L_{\mathrm{ship}} \coloneqq L(H) + L(\text{tooldesc}) + L(G) + L_{\mathrm{hdr}},
+\]
+where $L_{\mathrm{hdr}}$ accounts for container headers (e.g., per-section magic constants and varint counts).
+
+\begin{definition}[Entropy reduction]
+\emph{Ideal} reduction: $\ERideal_\pi \coloneqq \ell_\theta(X)-\ell_\theta(X\mid A_T,B)$ (in expectation $\ge 0$ when $Q_\theta=P$ or, more generally, when $\Delta_\theta\ge -I(X;A_T^{(\pi)})$).\\
+\emph{Measured (gross) reduction:} $\ERmeas_\pi \coloneqq \widehat{L}_\theta(X)-\widehat{L}_\theta(X\mid A_T,B)_{\mathrm{gross}}\in \mathbb{Z}$ (and $\ge 0$ under the gate of Prop.~\ref{prop:greedy}).
+\end{definition}
+
+\begin{definition}[Capacity (channel ceiling)]
+\[
+\mathrm{Cap}(X;T,B) \;=\; \sup_{\pi:\,\sum c\le B} I\!\big(X;A_T^{(\pi)}\big).
+\]
+For an arbitrary fixed coder $Q_\theta$,
+\[
+\mathbb{E}[\ERideal_\pi]
+= I\!\big(X;A_T^{(\pi)}\big)
++\Delta_\theta,\quad
+\Delta_\theta \coloneqq \mathrm{KL}(P\|Q_\theta)-\mathbb{E}\!\left[\mathrm{KL}\!\left(P(\cdot|A_T^{(\pi)})\,\|\,Q_\theta(\cdot|A_T^{(\pi)})\right)\right].
+\]
+Hence $\mathbb{E}[\ERideal_\pi]\le I\!\big(X;A_T^{(\pi)}\big)$ \emph{iff} $\Delta_\theta\le 0$, and in particular
+\[
+\mathbb{E}[\ERideal_\pi] \;\le\; I\!\big(X;A_T^{(\pi)}\big)\;\le\; \mathrm{Cap}(X;T,B)
+\quad \text{when } Q_\theta=P \text{ and $\pi$ achieves capacity.}
+\]
+\end{definition}
+
+\paragraph{Decode-safe accounting (gross-based convention).}
+Under the gross-based gating rule, we separate gross bitstream reductions from shipped-bit overheads. The gate accepts hints when $\Delta\widehat{L}>\mathrm{price}$, where $\mathrm{price}$ includes shipped-bit overheads ($L_{\mathrm{ship}}$) plus any exogenous costs. The correct accounting is:
+\begin{equation}
+\widehat{L}_{\text{total}} \,=\, \widehat{L}_\theta(X\mid A_T,B)_{\mathrm{gross}} + L_{\mathrm{ship}} \,=\, \widehat{L}_\theta(X) - \widehat{ER}_\pi + L_{\mathrm{ship}},
+\end{equation}
+\begin{equation}
+S_{\text{net}} \,=\, \widehat{ER}_\pi - L_{\mathrm{ship}}.
+\end{equation}
+Here $\widehat{ER}_\pi$ is the gross bitstream reduction (what the gate compares to $\mathrm{price}$), and $S_{\text{net}}$ is the net saving after shipped bits. The gate-record overhead and section headers are included in $L_{\mathrm{ship}}$.
+\textbf{Gate-record overhead (current build).} Each accepted decision stores a compact record
+\[
+\texttt{GateRecordV2}\ (\text{serialized as \emph{one byte} per record; 5 bits used}):
+\]
+\begin{verbatim}
+struct GateRecordV2 {
+    gate: u8,         // 1 bit (0/1) - whether to use agent hint
+    candidate_id: u8, // 2 bits (0-3) - which candidate was selected
+    budget_id: u8     // 2 bits (0-3) - which context budget was selected
+}
+\end{verbatim}
+Thus $L(G)=b_G\cdot N_{\text{gates}}$ with \emph{current} $b_G=8$ bits/accepted gate (plus a per-section header $L_{\mathrm{hdr}}^{\mathrm{AGT2}}=32 + \mathrm{len}_{\mathrm{var}}(N_{\text{gates}})\cdot 8$), and \emph{target} $b_G=5$ bits in a true bit-packed design.
+
+\subsection{Theorems and Proof Sketches}
+\begin{lemma}[Conditioning non-negativity on \emph{gross} lengths]
+\label{lem:nonneg}
+Assume prices are non-negative. Given a fixed coder $\theta$ and a gate that may reject side-information $A$, the realized \emph{gross} conditioned length satisfies
+\[
+\widehat{L}_\theta(X\mid A_T,B)_{\mathrm{gross}}\ \le\ \widehat{L}_\theta(X).
+\]
+\end{lemma}
+\begin{proof}[Sketch]
+Evaluate with and without the accepted hint at the chunk; accept iff the realized gross drop exceeds its (non-negative) price. The policy ``always reject'' is feasible, so the gross measured length cannot increase.
+\end{proof}
+
+\begin{theorem}[Mutual-Information Ceiling (qualified)]
+\label{thm:mi}
+For the optimal code ($Q_\theta=P$) in expectation,
+\[
+\E[\ERideal_\pi]\ \le\ I(X;A_T^{(\pi)})\ \le\ \mathrm{Cap}(X;T,B).
+\]
+For arbitrary $Q_\theta$, an explicit KL-mismatch correction $\Delta_\theta$ appears as above.
+\end{theorem}
+\begin{proof}[Sketch]
+For $Q=P$, the ideal gain equals $H(X)-H(X\mid A)=I(X;A)$. For arbitrary $Q_\theta$, decompose cross-entropy via $\mathrm{CE}(P,Q)=H(X)+\mathrm{KL}(P\|Q)$ and condition on $A$, yielding the correction $\Delta_\theta$.
+\end{proof}
+
+\begin{theorem}[Monotonicity in Action Space]
+\label{thm:monotone-q}
+If $\mathcal{Q}\subseteq\mathcal{Q}'$ and costs $c$ are unchanged, then for all $B$,
+$\mathrm{Cap}(X;T',B)\ge \mathrm{Cap}(X;T,B)$,
+where $T'$ denotes the same channels extended to $\mathcal{Q}'$.
+\end{theorem}
+
+\begin{theorem}[Monotonicity with Coupling Information]
+\label{thm:monotone-s}
+Let the agent observe side-information $S$ about channel responses before choosing queries. Then for all $B$,
+$\mathbb{E}_S[\mathrm{Cap}(X;T,B\,;\,S)]\ge \mathrm{Cap}(X;T,B)$.
+\end{theorem}
+\begin{proof}[Sketch]
+Conditioning on $S$ enlarges the policy class for each $S$; taking expectation preserves the inequality. Also, $\mathbb{E}[\sup_\pi f_S]\ge \sup_\pi \mathbb{E}[f_S]$.
+\end{proof}
+
+\begin{proposition}[Greedy Gate (gross form)]
+\label{prop:greedy}
+Let $\Delta\widehat{L}$ be the \emph{measured} gross code-length drop from a candidate hint under a local try-encode, and let $\mathrm{price}$ be its total bit-equivalent cost including shipped-bit overheads ($L(G)$, $L_{\mathrm{hdr}}$, etc.) and any exogenous costs (time/\$ converted via exchange rate $\lambda$). Accept the hint iff $\Delta\widehat{L}>\mathrm{price}$. If only a predictor $\widehat{\Delta L}_{\text{pred}}$ is available, accept iff $\widehat{\Delta L}_{\text{pred}}-\delta>\mathrm{price}$, where $\delta$ upper-bounds calibration error. Under additive or submodular contributions across hints, this selection is optimal; in general it guarantees non-negativity ($\widehat{ER}\ge 0$) and decode-safety when $\mathrm{price}$ includes all shipped-bit overheads.
+\end{proposition}
+
+\subsection*{Remark: Variational Free Energy and Bits-Back Equivalence}
+Let $P(x,\psi)=P(x\mid\psi)P(\psi)$ be a generative model and $Q(\psi\mid x)$ a variational posterior. The variational free energy (nats)
+\[
+\mathcal F(Q)
+=\mathbb E_{Q(\psi\mid x)}[-\ln P(x,\psi)]
++\mathbb E_{Q(\psi\mid x)}[\ln Q(\psi\mid x)]
+= -\ln P(x) + D_{\mathrm{KL}}(Q(\psi\mid x)\,\|\,P(\psi\mid x))
+\]
+admits the coding interpretation that $\mathcal F(Q)/\ln 2$ bits is an achievable codelength via bits-back entropy coding~\citep{townsend2019bbans}. 
+Viewing $\psi$ as ``side information'', the \emph{ideal} per-sample reduction is
+\[
+\ERideal \;=\; -\ln P(x) - \big(-\ln P(x\mid\psi)\big),
+\quad
+\mathbb E[\ERideal] \;=\; I(X;\Psi),
+\]
+so the channel-side capacity ceiling for this latent family is $I(X;\Psi)$. 
+With approximate inference $Q$, the achievable ideal reduction obeys
+\[
+\mathbb E[\ERideal]
+\;=\;
+I(X;\Psi)
+\;-\;
+\mathbb E_{x}\!\left[D_{\mathrm{KL}}\!\big(Q(\psi\mid x)\,\|\,P(\psi\mid x)\big)\right],
+\]
+i.e., \emph{capacity minus posterior-mismatch}. 
+In our priced, decode-safe accounting, the measured signal becomes
+\[
+S_{\text{net}}
+\;=\;
+\widehat{ER}
+\;-\;
+L(H)
+\;-\;
+L(\text{tooldesc})
+\;-\;
+L(G)
+\;-\;
+L_{\mathrm{hdr}},
+\]
+so any latent or tool-induced gains are further reduced by shipped descriptions and container headers.
+
+\subsection{Additivity and Dataset Score}
+For a dataset $\mathcal{D}=\{X_k\}$ evaluated jointly as a single source with shared budgets/policies,
+\begin{equation}
+\mathrm{Score}_\pi(\mathcal{D};T,B) = \sum_k \widehat{ER}_\pi(X_k;T,B)\in \mathbb{Z}_{\ge 0},
+\quad
+\mathrm{Eff}_\pi(\mathcal{D};T,B)=\frac{\sum_k \widehat{ER}_\pi}{\mathrm{Cap}(\mathcal{D};T,B)},
+\end{equation}
+where $\mathrm{Cap}(\mathcal{D};T,B)$ denotes the capacity of the concatenation under shared gating. Note $\sum_k \mathrm{Cap}(X_k;T,B)$ is generally an \emph{upper bound} under shared budgets.
+
+\section{Axioms and a Representation Theorem for Intelligence}
+\label{sec:axioms}
+We formalize when an operational intelligence score $J$ is uniquely determined (up to positive scaling) by $(\ERideal)/C$.
+
+\paragraph{Setup.}
+Fix base coder $\theta$, tool family $T$, policy $\pi$, budget $B$, and cost $C$. Let $X$ be a finite sequence. Let $\ell_\theta(\cdot)$ denote \emph{ideal} lengths (sample cross-entropy) and $\widehat{L}_\theta(\cdot)$ the \emph{measured} bitstream lengths. An \emph{entropy coder} (arithmetic or rANS) yields uniquely-decodable bitstreams.
+
+\paragraph{Axioms.}
+\begin{itemize}
+\item \textbf{A1 (Dataset additivity).} For concatenations evaluated as a single source, $J(X\!\sqcup\!Y)=J(X)+J(Y)$.
+\item \textbf{A2 (Monotonicity).} If $\ell_\theta(X\mid A_T,B)\le \ell_\theta(X\mid A'_T,B)$ with equal $C$, then $J(X;A_T,B,C)\ge J(X;A'_T,B,C)$.
+\item \textbf{A3 (Zero baseline).} If the gate always rejects ($A_T=\emptyset$), then $J=0$.
+\item \textbf{A4 (Cost homogeneity).} For $a>0$, $J(X;A_T,B,aC)=a^{-1}J(X;A_T,B,C)$ (bits per unit resource).
+\item \textbf{A5 (Reparameterization invariance).} For any policy reparameterization $\pi\mapsto\pi'$ that leaves the induced conditional code lengths unchanged, $J$ is unchanged.
+\item \textbf{A6 (Continuity).} $J$ is continuous in the empirical frequencies that determine $\ell_\theta$ and in $C$.
+\end{itemize}
+
+\begin{remark}[On assumptions]
+If problems exhibit cross-sample coupling (shared hints across files), evaluate $J$ at the \emph{joint} level (treat $X\!\sqcup\!Y$ as a single source and allow cross-sample hints). Our results then hold with $\ERideal$ computed on the joint, and any observed super- or sub-additivity becomes a property of the source--channel coupling.
+\end{remark}
+
+\begin{theorem}[Representation]
+\label{thm:representation}
+Under A1--A6, there exists $\alpha>0$ such that
+\begin{equation}
+J(X;T,B,C)\;=\;\alpha\,\frac{\ell_\theta(X)-\ell_\theta(X\mid A_T,B)}{C}\;=\;\alpha\,\frac{\ERideal_\pi(X;T,B)}{C}.
+\end{equation}
+Thus, up to a positive multiplicative constant, $(\ERideal)/C$ is the \emph{unique} operational intelligence score satisfying the axioms.
+\end{theorem}
+\begin{proof}[Sketch]
+By Cauchy-type additivity over concatenations and continuity (A1,A6), any admissible $J$ must be affine in $\ell_\theta$-differences; A2,A3 pin the intercept at $0$, hence $J\propto \ell_\theta(X)-\ell_\theta(X\mid\cdot)$. A4 imposes homogeneity in $C$, yielding division by $C$.
+\end{proof}
+
+\begin{remark}[Axiomatic parallel]
+This mirrors how \emph{temperature} in thermodynamics and \emph{information} in communication theory are \emph{axiomatically} determined (up to monotone rescaling): once the invariances are fixed, the functional form is not an empirical proxy but \emph{the} operational quantity.
+\end{remark}
+
+\paragraph{Interpretation.}
+Under the UEP, intelligence is \emph{defined} as efficient uncertainty reduction. Then $\widehat{ER}/C$ (measured) is the practical audit signal, while $(\ERideal)/C$ is the ideal limit. Disagreements reduce to which resources to price ($C$) or which uncertainties ($X$) to reduce, not to measurability.
+
+\section{Triadic Entropy Routing: Agent--Channel--Data}
+\label{sec:triad}
+We make the Agent--Channel--Data relationship explicit and non-anthropomorphic.
+
+\paragraph{Objects.}
+Agent policy $\pi$ (router), channel family $T$ (sinks), source $X$ (entropy). Intelligence score $\Iinfo=\widehat{ER}_\pi/C$.
+
+\paragraph{Conservation under the gating rule.}
+For any $(X,T,B,\pi)$ obeying the gate rule of Prop.~\ref{prop:greedy} (or the trivial always-reject policy),
+\begin{equation}
+0\ \le\ \widehat{ER}_\pi(X;T,B).
+\end{equation}
+The \emph{upper bound by ideal capacity} holds under the additional assumption that the baseline and conditioned coders are optimal for their respective information sets (equivalently $Q_\theta=P$). In general, when the baseline coder is misspecified, measured reductions $\widehat{ER}_\pi$ can exceed the ideal mutual-information ceiling (conditioning reduces mismatch), so the inequality $\widehat{ER}_\pi\le\mathrm{Cap}(X;T,B)$ is qualified by the optimal-coder assumption.
+
+\paragraph{Identifiability by controlled variation.}
+\begin{lemma}[Two-knowns bound the third]
+\label{lem:two-knowns}
+(a) Fix $T,B$ and optimize over $\pi$: observing $\sup_\pi \widehat{ER}_\pi$ yields a \emph{lower bound} on $\mathrm{Cap}(X;T,B)$ \emph{provided the coder is optimal} ($Q_\theta=P$). Without that assumption, measured reductions can exceed the ideal ceiling. 
+(b) Fix $X,B$ and vary $T$: the slope in $\widehat{ER}$ vs.\ channel enrichments lower-bounds the marginal capacity of added controls under the same qualification. 
+(c) Fix $X,T$ and sweep $B$: the budget response identifies concavity and effective coupling limits (model-free).
+\end{lemma}
+
+\paragraph{Worked example (rigorous bounds in practice).}
+Consider $T_1$ (retrieval over corpus $C$) and $T_2=T_1\cup\{\text{Python}\}$ with identical costs for shared queries and additional cost $c_{\text{py}}$ per Python invocation. Fix $X,B$ and run agents $\pi_1,\pi_2$ optimized for each family, yielding measured gross reductions $\widehat{ER}_1,\widehat{ER}_2$ under the same $\theta$.
+
+\textit{Assumption for ceiling comparison.} \emph{Assume an optimal coder} ($Q_\theta=P$) and idealized entropy coding (ignoring constant overhead), so that in expectation $\mathbb{E}[\widehat{ER}_i]=\mathbb{E}[\ERideal_i]\le I\big(X;A_T^{(\pi_i)}\big)$.
+
+\textit{Observed gains vs.\ capacity increment.}
+Let $\mathrm{Cap}_i=\mathrm{Cap}(X;T_i,B)$ and define slack $s_i\coloneqq \mathrm{Cap}_i - I\big(X;A_T^{(\pi_i)}\big)\ge 0$. Then
+\[
+\mathbb{E}[\widehat{ER}_2-\widehat{ER}_1] \;\le\; I\big(X;A_T^{(\pi_2)}\big)-I\big(X;A_T^{(\pi_1)}\big)
+=\;\big(\mathrm{Cap}_2-\mathrm{Cap}_1\big) - (s_2 - s_1),
+\]
+so
+\[
+\mathrm{Cap}_2-\mathrm{Cap}_1 \;\ge\; \mathbb{E}[\widehat{ER}_2-\widehat{ER}_1] - s_1.
+\]
+Thus the \emph{observed} marginal gain does \textbf{not} generally lower-bound the capacity increment unless $s_1=0$ (and typically $s_2=0$ as well in capacity-achieving regimes). Without the optimal-coder assumption, even the initial inequality can fail (Sec.~\ref{sec:mdl}).
+
+\paragraph{Social, sensorimotor, and multi-agent cases.}
+Channels can be other agents, social graphs, or physical sensors; $P(Y\mid q)$ then captures interaction responses. The framework remains unchanged: \emph{social intelligence} is efficient uncertainty reduction per cost in such channel families.
+
+\section{Operational Protocols (Adversarial, Low-Cost)}
+\label{sec:protocols}
+\paragraph{Tracks.}
+\textbf{Oracular}: the channel corpus contains mirrors/near-mirrors of $X$; measures retrieval ceilings. 
+\textbf{Non-oracular}: transformed surrogates $X'$ (synonym bijection, paragraph permutation, character cipher) with low $k$-gram overlap; measures mapping/mynthesis skill beyond lookup.
+
+\paragraph{Human-in-the-loop (HITL).}
+Run the identical pipeline with a UI that elicits hints under matched budgets. Ensure decode-safety by caching elicited hints for replay or shipping minimal descriptions to regenerate them deterministically.
+
+\paragraph{Budget sweeps.}
+Sweep time and hint-bytes; fit concave returns; report both $\eta_{\text{gross}}=\widehat{ER}/C$ and $\eta_{\text{net}}=S_{\text{net}}/C$.
+
+\paragraph{Channel ablations.}
+Retrieval-only vs.\ Python-only vs.\ combined; rank by ROI (bits per sec/\$/J). Pre-register an exchange rate $\lambda$ and report sensitivity across $\lambda\in[\lambda_{\min},\lambda_{\max}]$.
+
+\paragraph{Logging schema (per chunk).}
+\texttt{file,chunk,gate,raw\_bits,cond\_bits,delta\_bits,hint\_bytes,elapsed\_ms,price,budget\_ok,transform\_tag,jaccard\_k,sources[],gate\_bits,gate\_hdr\_bits,price\_transcript\_bits,price\_pointer\_bits,tool\_id\_best,tool\_snapshot\_id,args\_hash,output\_hash,domain,agent\_id,toolset\_id,run\_id,chunk\_id}.\\
+Here \texttt{gate\_bits} reflects on-wire record cost (\emph{8} in current build) and \texttt{gate\_hdr\_bits} amortizes $L_{\mathrm{hdr}}^{\mathrm{AGT2}}$ across gates.
+
+\paragraph{Stats (cheap).}
+Bootstrap 95\% CIs on $\widehat{ER}$ across chunks; paired randomization test for gate-on vs.\ gate-off; pre-register budgets and stop criteria.
+
+\section{Implementation: CandleZip (Deterministic, Replayable)}
+\label{sec:impl}
+\textbf{System.} Rust compressor with \texttt{SmolLM2-135M} (Candle stack) and an external agent queried once per chunk. Repository: \url{https://github.com/turtle261/candlezip}. Hints accepted by the gate are cached and deterministically replayed at decode (no network). Gate decisions store a compact \texttt{GateRecordV2} (5 bits used; 1 byte on wire) to ensure deterministic decode without look-ahead. Section headers (\texttt{AGT2}/\texttt{AGT3}) are written with 4-byte magics and varint counts.
+
+\textbf{Determinism.} Temperature $0.0$; fixed seeds; environment variables pinned; decode uses cached outputs only. Proof logs include hash-locked per-chunk decisions.
+
+\textbf{CLI (Windows example).}
+\begin{verbatim}
+candlezip self-test --backend smollm --agent --scan \
+  --scan-lookahead 512 --context 512 --reprime-interval 512 \
+  --scan-agent-script agent/agent_v2.py --scan_max_steps 12 benchmarks/arxiv_mini.txt
+
+candlezip compress --backend smollm --agent --scan \
+  --scan-lookahead 512 --context 512 --reprime-interval 512 \
+  --scan-agent-script agent/agent_v2.py --scan_max_steps 12 input.txt output.canz
+
+candlezip decompress --backend smollm --agent --reuse \
+  --scan-agent-script agent/agent_v2.py output.canz decoded.txt
+\end{verbatim}
+
+\section{Empirical Evidence (Illustrative, Reproducible)}
+\label{sec:experiments}
+\paragraph{Datasets/budgets.}
+Canterbury (\texttt{alice29.txt}, \texttt{asyoulik.txt}, \texttt{fields.c})~\citep{canterbury_corpus}; Enwik8 sample (128\,KB)~\citep{hutterprize,merity2018enwik8}. Timeouts: 300\,s (alice/asyoulik), 360\,s (enwik8), 700\,s (fields.c); hint bytes capped (e.g., 600\,B).
+
+\paragraph{Findings.}
+With these budgets, CandleZip achieved consistent bits-saved over an LLMZip-like baseline; pointer pricing preserved most gross gains; misaligned channels were gated out. Numbers below are illustrative; per-chunk CSVs accompany the artifact.
+
+\begin{table}[H]
+\centering
+\caption{Compression with channel-conditioned hints (illustrative)\protect\footnotemark}
+\label{tab:results}
+\begin{tabular}{lrrrrr}
+\toprule
+Dataset & Baseline Bits & Conditioned Bits & Bits Saved & \% Saved & Gate Rate \\
+\midrule
+\texttt{alice29.txt} & 183{,}456.8 & 142{,}789.2 & 40{,}667.6 & 22.2\% & 68\% \\
+\texttt{asyoulik.txt} & 150{,}234.6 & 118{,}945.7 & 31{,}288.9 & 20.8\% & 72\% \\
+\texttt{fields.c}     & 12{,}345.7  & 9{,}876.5   & 2{,}469.1  & 20.0\% & 65\% \\
+Enwik8 (128\,KB)      & 98{,}765.4  & 78{,}912.3  & 19{,}853.1 & 20.1\% & 70\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+\footnotetext{Values are ideal cross-entropy estimates; measured rANS bitstreams are integer-length. Container/header overheads are documented in logs and are small relative to totals.}
+
+\paragraph{Threats \& mitigations.}
+Small data; API timeouts; corpus alignment; oracular leakage. Mitigations: non-oracular tracks (low $k$-gram overlap), decode-safe accounting (including $L(G)$ and $L_{\mathrm{hdr}}$), fixed budgets, deterministic replay, and public proof logs.
+
+\section{Ethics and Limitations}
+\emph{Ethics.} Report costs and budgets; avoid overclaiming beyond observed $\eta_{\text{gross}}$ and $\eta_{\text{net}}$; disclose channel corpora and gate-record overhead $L(G)$ and headers $L_{\mathrm{hdr}}$. \emph{Limitations.} Small-scale experiments; physical energy not instrumented; decode-safety requires either determinism or shipping hint descriptions.
+
+\section{Conclusion}
+Agentic Compression delivers \emph{a law, a metric, and a method}. By treating channels as priced entropy sinks and enforcing decode-safe accounting, it yields a universal, integer-bit signal of tool-using intelligence, suitable for training and evaluation in LLMs and HITL. The representation theorem shows $(\ERideal)/C$ is the unique operational measure under explicit axioms, while $\widehat{ER}/C$ (gross) and $S_{\text{net}}/C$ (net) are the practical audit signals. The framework is small enough to falsify and, we hope, interesting enough to scale.
+
+\section{License}
+This paper is licensed under Creative Commons Attribution 4.0 International (CC BY 4.0). CandleZip source code is licensed under GNU General Public License v3.0 (GPL-3.0).
+
+\appendix
+
+\section{Formula Pack (Canonical)}
+\label{app:formulas}
+\paragraph{Ideal and measured lengths.}
+$\ell_\theta(X) = -\sum_t \log_2 p_\theta(x_t\mid x_{<t},\cdot)$,\quad 
+\emph{measured baseline} length $\widehat{L}_\theta(X)$ (integer).\\
+\paragraph{Entropy reduction.}
+\emph{Ideal} reduction: $\ERideal_\pi = \ell_\theta(X)-\ell_\theta(X\mid A_T,B)\ge 0$ (in expectation when $Q_\theta=P$ or $\Delta_\theta\ge -I(X;A_T^{(\pi)})$).\\
+\emph{Measured (gross) reduction:} $\widehat{ER}_\pi = \widehat{L}_\theta(X)-\widehat{L}_\theta(X\mid A_T,B)_{\mathrm{gross}}\in\mathbb{Z}$ (and $\ge 0$ under the gate of Prop.~\ref{prop:greedy}).\\
+\paragraph{Capacity, efficiency, ROI.}
+\[
+\mathrm{Cap} = \sup_{\pi:\,\sum c\le B} I(X;A_T^{(\pi)}),
+\quad
+\mathrm{Eff}^\star = \begin{cases}\mathbb{E}[\ERideal_\pi]/\mathrm{Cap},&\mathrm{Cap}>0\\ 0,&\mathrm{Cap}=0\end{cases}\;\;(\le 1\text{ when }Q_\theta=P),
+\]
+\[
+\mathrm{Eff}^{\mathrm{gross}}=\widehat{ER}_\pi/\mathrm{Cap},\quad 
+\mathrm{Eff}^{\mathrm{net}}=S_{\text{net}}/\mathrm{Cap},\quad
+\eta_{\text{gross}}=\widehat{ER}_\pi/C,\quad
+\eta_{\text{net}}=S_{\text{net}}/C.
+\]
+\paragraph{Accounting.}
+Let $L_{\mathrm{ship}}\coloneqq L(H)+L(\text{tooldesc})+L(G)+L_{\mathrm{hdr}}$. Then
+\[
+\widehat{L}_{\text{total}} = \widehat{L}_\theta(X\mid A_T,B)_{\mathrm{gross}} + L_{\mathrm{ship}} = \widehat{L}_\theta(X) - \widehat{ER}_\pi + L_{\mathrm{ship}},
+\]
+\[
+S_{\text{net}}=\widehat{ER}_\pi - L_{\mathrm{ship}}.
+\]
+\paragraph{Dataset scores.}
+\[
+\mathrm{Score}_\pi(\mathcal{D};T,B) = \sum_k \widehat{ER}_\pi(X_k;T,B)\in \mathbb{Z}_{\ge 0},\quad
+\mathrm{Eff}_\pi(\mathcal{D};T,B)=\frac{\sum_k \widehat{ER}_\pi}{\mathrm{Cap}(\mathcal{D};T,B)}.
+\]
+
+\section{Proof Details}
+\paragraph{MI ceiling (Thm.~\ref{thm:mi}).}
+Let $P$ be the true next-token distribution and $Q_\theta$ the base model. The expected ideal gain from side information $A$ under the optimal code equals $H(X)-H(X\mid A) = I(X;A)$. For any fixed $Q_\theta$,
+\[
+\mathrm{CE}(P,Q_\theta)-\mathrm{CE}(P\!\mid\!A,Q_\theta\!\mid\!A)
+= I(X;A)+\mathrm{KL}(P\|Q_\theta)-\mathbb{E}_A\!\left[\mathrm{KL}\big(P(\cdot\!\mid\!A)\,\|\,Q_\theta(\cdot\!\mid\!A)\big)\right].
+\]
+Thus the \emph{ideal} ceiling is $I(X;A)$; realized reductions with a fixed coder can deviate by the KL mismatch terms, and our definition of $\mathrm{Cap}$ takes the ideal supremum.
+
+\paragraph{Gate optimality (Prop.~\ref{prop:greedy}).}
+Under additivity, the objective is $\min \, \widehat{L}_\theta(X) - \sum \Delta \widehat{L}_i + \sum \mathrm{price}_i$, so keep all and only items with positive net contribution. If hints interact, greedy is still \emph{sufficient} for non-negativity and decode-safety (with $L(G)$ and $L_{\mathrm{hdr}}$ included); optimality holds exactly when interactions are negligible (our default chunk-local regime). A predictive variant with margin $\delta$ is safe.
+
+\section{Non-oracular Surrogates (Recipes)}
+\label{app:surrogates}
+\begin{itemize}
+\item \textbf{Synonym bijection}: 1--1 mapping on content words; ship inverse as priced utility.
+\item \textbf{Paragraph permutation}: shuffle to disrupt discourse priors; preserve content.
+\item \textbf{Character cipher}: fixed substitution; low $k$-gram overlap; inversion via code/human.
+\end{itemize}
+
+\section{Reproducibility Checklist}
+\label{app:repro}
+\textbf{Environment.} Rust 1.77+, Python 3.11; \texttt{TOKENIZERS\_PARALLELISM=false}.\\
+\textbf{Determinism.} Temperature 0.0; fixed seeds; cached channel outputs; no network at decode.\\
+\textbf{Artifacts.} Source (\texttt{Cargo.toml}, \texttt{main.rs}, \texttt{models.rs}); agent (\texttt{agent\_v2.py}); per-chunk CSV logs; proof logs with hashes.\\
+\textbf{Config.} Record time budgets, hint-byte caps, channel catalogs, corpus hashes, and per-gate overhead $b_G$ and headers $L_{\mathrm{hdr}}$.\\
+\textbf{Stats.} Bootstrap CIs; paired tests; preregistered budgets and exchange-rate range $[\lambda_{\min},\lambda_{\max}]$.
+
+% ---------- References ----------
+\bibliographystyle{unsrtnat}
+\bibliography{references}
+
+\end{document}

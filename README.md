@@ -55,6 +55,13 @@ Add the following to your `Cargo.toml`:
 infotheory = { path = "." } # Or git or whatever, you know rust.
 ```
 
+### Building nyx-lite
+`nyx-lite` is included as a workspace member. Build it with:
+```bash
+cargo build -p nyx-lite
+```
+Note: some nyx-lite tests require `/dev/kvm` and VM image artifacts under `nyx-lite/vm_image`.
+
 
 ---
 
