@@ -1,2 +1,1 @@
-Sorry, try again.
-sudo: 3 incorrect password attempts
+sudo: must be setuid root

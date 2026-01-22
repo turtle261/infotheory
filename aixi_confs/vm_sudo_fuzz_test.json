@@ -10,8 +10,8 @@
     "num_simulations": 0,
     "exploration_exploitation_ratio": 2.0,
     "discount_gamma": 0.95,
-    "terminate-lifetime": 10000,
-    "log_every": 500,
+    "terminate-lifetime": 500,
+    "log_every": 50,
     "perf": true,
     "vm_config": {
         "firecracker_config": "nyx-lite/vm_image/vmconfig.json",

@@ -1010,6 +1010,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "num_cpus",
+ "nyx-lite",
  "once_cell",
  "rayon",
  "rosaplus",

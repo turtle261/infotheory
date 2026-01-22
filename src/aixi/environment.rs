@@ -7,6 +7,9 @@
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Interface for an agent's environment.
 ///
@@ -49,14 +52,18 @@ pub trait Environment {
     /// Returns the maximum possible reward value in this environment.
     fn max_reward(&self) -> Reward {
         let bits = self.get_reward_bits();
-        if bits == 0 { return 0; }
+        if bits == 0 {
+            return 0;
+        }
         (1 << (bits - 1)) - 1
     }
 
     /// Returns the minimum possible reward value in this environment.
     fn min_reward(&self) -> Reward {
         let bits = self.get_reward_bits();
-        if bits == 0 { return 0; }
+        if bits == 0 {
+            return 0;
+        }
         -(1 << (bits - 1))
     }
 }
@@ -704,20 +711,35 @@ impl Environment for KuhnPoker {
 }
 
 /// An environment that interacts with an external process.
+///
+/// **DEPRECATED**: This environment is deprecated in favor of `NyxVmEnvironment`
+/// which provides better isolation, security, and performance through VM-based
+/// sandboxing. The `ProcessEnvironment` exposes the host system to untrusted
+/// commands, making it unsuitable for autonomous agent exploration.
+///
+/// Enable the `vm` feature and use `NyxVmEnvironment` instead for production use.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use NyxVmEnvironment with the `vm` feature for secure sandboxed environments"
+)]
+#[allow(deprecated)]
 pub struct ProcessEnvironment {
     _child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    stdout_rx: Receiver<String>,
+    stdout_thread: Option<JoinHandle<()>>,
     action_map: Vec<String>,
     observation_bits: usize,
     reward_bits: usize,
     reward_pattern: Option<String>,
     step_cost: u64,
+    step_timeout: Duration,
     debug_mode: bool,
     obs: PerceptVal,
     rew: Reward,
 }
 
+#[allow(deprecated)]
 impl ProcessEnvironment {
     /// Creates a new `ProcessEnvironment` by spawning a subprocess.
     pub fn new(
@@ -728,6 +750,7 @@ impl ProcessEnvironment {
         rew_bits: usize,
         pattern: Option<String>,
         step_cost: u64,
+        step_timeout: Duration,
         debug_mode: bool,
     ) -> anyhow::Result<Self> {
         let mut child = Command::new(command)
@@ -740,22 +763,40 @@ impl ProcessEnvironment {
             .stdin
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
-        let stdout = BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?,
-        );
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+
+        let (tx, rx) = mpsc::channel();
+        let stdout_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(line.clone()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
 
         Ok(Self {
             _child: child,
             stdin,
-            stdout,
+            stdout_rx: rx,
+            stdout_thread: Some(stdout_thread),
             action_map: actions,
             observation_bits: obs_bits,
             reward_bits: rew_bits,
             reward_pattern: pattern,
             step_cost,
+            step_timeout,
             debug_mode,
             obs: 0,
             rew: 0,
@@ -772,6 +813,7 @@ impl ProcessEnvironment {
     }
 }
 
+#[allow(deprecated)]
 impl Environment for ProcessEnvironment {
     fn perform_action(&mut self, action: Action) {
         let cmd = self
@@ -791,23 +833,36 @@ impl Environment for ProcessEnvironment {
 
         let mut output = String::new();
         let mut exit_code = 0;
-        let mut line = String::new();
+        let mut saw_sentinel = false;
+        let deadline = Instant::now() + self.step_timeout;
 
-        while self.stdout.read_line(&mut line).unwrap_or(0) > 0 {
-            if line.contains("___SENTINEL___") {
-                if let Some(pos) = line.find("___SENTINEL___") {
-                    let code_str = line[pos + 14..].trim();
-                    exit_code = code_str.parse().unwrap_or(0);
+        while Instant::now() < deadline {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            match self.stdout_rx.recv_timeout(timeout) {
+                Ok(line) => {
+                    if line.contains("___SENTINEL___") {
+                        if let Some(pos) = line.find("___SENTINEL___") {
+                            let code_str = line[pos + 14..].trim();
+                            exit_code = code_str.parse().unwrap_or(0);
+                        }
+                        saw_sentinel = true;
+                        break;
+                    }
+                    // Simple mirroring check: don't include the exact command line if it's echoed back
+                    if line.trim() == cmd.trim() {
+                        continue;
+                    }
+                    output.push_str(&line);
                 }
-                break;
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            // Simple mirroring check: don't include the exact command line if it's echoed back
-            if line.trim() == cmd.trim() {
-                line.clear();
-                continue;
-            }
-            output.push_str(&line);
-            line.clear();
+        }
+
+        if !saw_sentinel {
+            let _ = self._child.kill();
+            let _ = self._child.wait();
+            exit_code = 1;
         }
 
         if self.debug_mode {
@@ -836,6 +891,10 @@ impl Environment for ProcessEnvironment {
 
         // Apply step cost (saturating at 0)
         self.rew = base_rew.saturating_sub(self.step_cost as i64);
+
+        let min_reward = self.min_reward();
+        let max_reward = self.max_reward();
+        self.rew = self.rew.clamp(min_reward, max_reward);
 
         if self.debug_mode {
             eprintln!(
@@ -869,5 +928,16 @@ impl Environment for ProcessEnvironment {
     }
     fn get_num_actions(&self) -> usize {
         self.action_map.len()
+    }
+}
+
+#[allow(deprecated)]
+impl Drop for ProcessEnvironment {
+    fn drop(&mut self) {
+        let _ = self._child.kill();
+        let _ = self._child.wait();
+        if let Some(handle) = self.stdout_thread.take() {
+            let _ = handle.join();
+        }
     }
 }

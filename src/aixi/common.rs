@@ -18,6 +18,8 @@ pub type PerceptVal = u64;
 /// Strategy for mapping an observation stream into a single percept key for tree search.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationKeyMode {
+    /// Use the full observation stream as the key (paper-accurate expectimax).
+    FullStream,
     /// Use the first observation symbol as the key.
     First,
     /// Use the last observation symbol as the key.
@@ -33,6 +35,18 @@ pub fn observation_key_from_stream(
     observation_bits: usize,
 ) -> PerceptVal {
     match mode {
+        ObservationKeyMode::FullStream => {
+            debug_assert!(
+                false,
+                "observation_key_from_stream called with FullStream; use observation_repr_from_stream"
+            );
+            // Fallback to hash in release builds to avoid panics.
+            observation_key_from_stream(
+                ObservationKeyMode::StreamHash,
+                observations,
+                observation_bits,
+            )
+        }
         ObservationKeyMode::First => observations.first().copied().unwrap_or(0),
         ObservationKeyMode::Last => observations.last().copied().unwrap_or(0),
         ObservationKeyMode::StreamHash => {
@@ -50,6 +64,25 @@ pub fn observation_key_from_stream(
             }
             h
         }
+    }
+}
+
+/// Compute the observation representation used for tree branching.
+///
+/// - `FullStream` returns the full stream (paper-accurate expectimax).
+/// - Other modes collapse to a single-key vector.
+pub fn observation_repr_from_stream(
+    mode: ObservationKeyMode,
+    observations: &[PerceptVal],
+    observation_bits: usize,
+) -> Vec<PerceptVal> {
+    match mode {
+        ObservationKeyMode::FullStream => observations.to_vec(),
+        _ => vec![observation_key_from_stream(
+            mode,
+            observations,
+            observation_bits,
+        )],
     }
 }
 

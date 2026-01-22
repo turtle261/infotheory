@@ -1,35 +1,31 @@
 {
     "algorithm": "ctw",
     "environment": "vm",
-    "ct_depth": 32,
-    "agent_horizon": 8,
+    "ct_depth": 8,
+    "agent_horizon": 1,
     "observation_bits": 8,
     "observation_stream_len": 1,
     "observation_key_mode": "first",
     "reward_bits": 8,
     "num_simulations": 0,
-    "exploration_exploitation_ratio": 1.4,
+    "exploration_exploitation_ratio": 1.0,
     "discount_gamma": 1.0,
-    "terminate-lifetime": 50,
-    "explore_epsilon": 1.0,
-    "explore_gamma": 1.0,
-    "log_every": 0,
+    "terminate-lifetime": 5,
+    "perf_cycles": 5,
+    "log_every": 1,
     "perf": true,
+    "vm_perf_only": true,
     "vm_config": {
         "firecracker_config": "nyx-lite/vm_image/vmconfig.json",
         "instance_id": "aixi-nyx",
         "shared_region_name": "shared",
         "shared_region_size": 4096,
         "shared_memory_policy": "snapshot",
-        "stats_backend": {
-            "name": "ctw",
-            "ct_depth": 32
-        },
-        "episode_steps": 8,
-        "step_cost": 1,
+        "episode_steps": 1000,
+        "step_cost": 0,
         "boot_timeout_ms": 30000,
-        "step_timeout_ms": 5000,
-        "verbose": false
+        "step_timeout_ms": 1000,
+        "verbose": true
     },
     "vm_actions": {
         "mode": "literal",
@@ -37,11 +33,6 @@
             {
                 "name": "ping",
                 "payload": "PING",
-                "encoding": "utf8"
-            },
-            {
-                "name": "status",
-                "payload": "STATUS",
                 "encoding": "utf8"
             }
         ]

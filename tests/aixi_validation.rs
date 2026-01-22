@@ -124,27 +124,26 @@ fn ctw_test_env_is_deterministic() {
 
 fn run_agent_env<T: Environment>(agent: &mut Agent, mut env: T, cycles: usize) -> f64 {
     let mut total_reward = 0.0;
-    let mut prev_obs = 0;
-    let mut prev_rew = 0;
+    let mut obs_stream = env.drain_observations();
+    let mut prev_rew = env.get_reward();
     let mut prev_act = 0;
 
     for _ in 0..cycles {
-        let action = agent.get_planned_action(prev_obs, prev_rew, prev_act);
+        agent.model_update_percept_stream(&obs_stream, prev_rew);
+        let action = agent.get_planned_action(&obs_stream, prev_rew, prev_act);
 
         // Update model with chosen action (so model sees: ...p a p a p a...)
         agent.model_update_action_external(action);
 
         env.perform_action(action);
 
-        let obs_stream = env.drain_observations();
-        let obs = agent.observation_key_from_stream(&obs_stream);
+        obs_stream = env.drain_observations();
         let rew = env.get_reward();
 
         // Update model with observed percept stream
         agent.model_update_percept_stream(&obs_stream, rew);
 
         total_reward += rew as f64;
-        prev_obs = obs;
         prev_rew = rew;
         prev_act = action;
 
@@ -163,7 +162,7 @@ fn agent_solves_ctw_test_environment() {
         agent_horizon: 8, // Increased from 4
         observation_bits: 1,
         observation_stream_len: 1,
-        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::First,
+        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::FullStream,
         reward_bits: 1,
         agent_actions: 2,
         num_simulations: 200, // Increased from 50
@@ -202,7 +201,7 @@ fn agent_regret_sublinear_coinflip() {
         agent_horizon: 4, // Increased from 2
         observation_bits: 1,
         observation_stream_len: 1,
-        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::First,
+        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::FullStream,
         reward_bits: 1,
         agent_actions: 2,
         num_simulations: 100, // Increased from 20

@@ -5,7 +5,7 @@
 
 use crate::aixi::common::{
     Action, ObservationKeyMode, PerceptVal, RandomGenerator, Reward, decode, encode,
-    observation_key_from_stream,
+    observation_repr_from_stream,
 };
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor, Predictor, RosaPredictor, RwkvPredictor};
@@ -76,6 +76,11 @@ pub struct Agent {
 
     /// Internal PRNG for simulations.
     rng: RandomGenerator,
+
+    /// Recycled buffer for observation generation during planning.
+    obs_buffer: Vec<u64>,
+    /// Recycled buffer for symbol processing.
+    sym_buffer: Vec<bool>,
 }
 
 impl Agent {
@@ -96,7 +101,8 @@ impl Agent {
         let model: Box<dyn Predictor> = match config.algorithm.as_str() {
             // FAC-CTW is the default and recommended CTW variant per the paper
             "ctw" | "fac-ctw" => {
-                let percept_bits = config.observation_bits + config.reward_bits;
+                let obs_len = config.observation_stream_len.max(1);
+                let percept_bits = (config.observation_bits * obs_len) + config.reward_bits;
                 Box::new(FacCtwPredictor::new(config.ct_depth, percept_bits))
             }
             // AC-CTW is the legacy single-tree variant
@@ -125,6 +131,8 @@ impl Agent {
             action_bits,
             is_last_update_percept: true,
             rng: RandomGenerator::new(),
+            obs_buffer: Vec::with_capacity(128),
+            sym_buffer: Vec::with_capacity(64),
         }
     }
 
@@ -138,6 +146,8 @@ impl Agent {
             action_bits: self.action_bits,
             is_last_update_percept: self.is_last_update_percept,
             rng: self.rng.fork_with(seed),
+            obs_buffer: Vec::with_capacity(128),
+            sym_buffer: Vec::with_capacity(64),
         }
     }
 
@@ -153,13 +163,13 @@ impl Agent {
     /// Uses MCTS to find the action that maximizes expected future reward.
     pub fn get_planned_action(
         &mut self,
-        prev_obs: PerceptVal,
+        prev_obs_stream: &[PerceptVal],
         prev_rew: Reward,
         prev_act: Action,
     ) -> Action {
         let mut planner = self.planner.take().expect("Planner missing");
         let num_sim = self.config.num_simulations;
-        let action = planner.search(self, prev_obs, prev_rew, prev_act, num_sim);
+        let action = planner.search(self, prev_obs_stream, prev_rew, prev_act, num_sim);
         self.planner = Some(planner);
         action
     }
@@ -171,6 +181,10 @@ impl Agent {
 
     /// Updates the world model with an observation stream and a terminal reward.
     pub fn model_update_percept_stream(&mut self, observations: &[PerceptVal], reward: Reward) {
+        debug_assert!(
+            !observations.is_empty() || self.config.observation_bits == 0,
+            "percept update missing observation stream"
+        );
         let mut percept_syms = Vec::new();
         for &obs in observations {
             encode(&mut percept_syms, obs, self.config.observation_bits);
@@ -191,8 +205,8 @@ impl Agent {
     }
 
     /// Computes the observation key used for search-tree branching.
-    pub fn observation_key_from_stream(&self, observations: &[PerceptVal]) -> PerceptVal {
-        observation_key_from_stream(
+    pub fn observation_repr_from_stream(&self, observations: &[PerceptVal]) -> Vec<PerceptVal> {
+        observation_repr_from_stream(
             self.config.observation_key_mode,
             observations,
             self.config.observation_bits,
@@ -251,10 +265,14 @@ impl AgentSimulator for Agent {
     }
 
     fn model_update_action(&mut self, action: Action) {
-        let mut action_syms = Vec::new();
-        encode(&mut action_syms, action, self.action_bits);
+        debug_assert!(
+            self.is_last_update_percept,
+            "action update called twice without intervening percept"
+        );
+        self.sym_buffer.clear();
+        encode(&mut self.sym_buffer, action, self.action_bits);
 
-        for &sym in &action_syms {
+        for &sym in &self.sym_buffer {
             self.model.update_history(sym);
         }
 
@@ -262,14 +280,39 @@ impl AgentSimulator for Agent {
     }
 
     fn gen_percept_and_update(&mut self, bits: usize) -> u64 {
-        let mut syms = Vec::with_capacity(bits);
+        self.sym_buffer.clear();
         for _ in 0..bits {
             let prob_1 = self.model.predict_one();
             let sym = self.rng.gen_bool(prob_1);
             self.model.update(sym);
-            syms.push(sym);
+            self.sym_buffer.push(sym);
         }
-        decode(&syms, bits)
+        decode(&self.sym_buffer, bits)
+    }
+
+    fn gen_percepts_and_update(&mut self) -> (Vec<PerceptVal>, Reward) {
+        let obs_bits = self.config.observation_bits;
+        let obs_len = self.config.observation_stream_len.max(1);
+
+        self.obs_buffer.clear();
+        for _ in 0..obs_len {
+            let p = self.gen_percept_and_update(obs_bits);
+            self.obs_buffer.push(p);
+        }
+
+        let obs_repr = observation_repr_from_stream(
+            self.config.observation_key_mode,
+            &self.obs_buffer,
+            obs_bits,
+        );
+        let rew_bits = self.config.reward_bits;
+        let rew_u = self.gen_percept_and_update(rew_bits);
+        let rew = (rew_u as i64) - self.config.reward_offset;
+
+        // Mark that we've completed a percept cycle (ready for next action)
+        self.is_last_update_percept = true;
+
+        (obs_repr, rew)
     }
 
     fn gen_range(&mut self, end: usize) -> usize {
@@ -292,6 +335,9 @@ impl AgentSimulator for Agent {
                 self.model.pop_history();
             }
         }
+
+        // After revert, we're at a percept boundary (ready for next action)
+        self.is_last_update_percept = true;
     }
 
     fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn AgentSimulator> {

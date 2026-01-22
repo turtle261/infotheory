@@ -6,7 +6,9 @@
 
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::environment::Environment;
-use crate::{RateBackend, cross_entropy_rate_backend, entropy_rate_backend, marginal_entropy_bytes};
+use crate::{
+    RateBackend, cross_entropy_rate_backend, entropy_rate_backend, marginal_entropy_bytes,
+};
 use rosaplus::RosaPlus;
 use rwkvzip::Compressor;
 use rwkvzip::coders::softmax_pdf_inplace;
@@ -278,6 +280,21 @@ pub enum VmRewardPolicy {
     },
 }
 
+/// Optional reward shaping (additive to base reward).
+#[derive(Clone, Debug)]
+pub enum VmRewardShaping {
+    EntropyReduction {
+        baseline_bytes: Vec<u8>,
+        max_order: i64,
+        scale: f64,
+    },
+    TraceEntropy {
+        max_order: i64,
+        scale: f64,
+        normalize: bool,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct VmActionFilter {
     pub min_entropy: Option<f64>,
@@ -346,6 +363,8 @@ pub struct VmEnvironmentConfig {
     /// Padding byte used when stream normalization pads.
     pub observation_stream_pad_byte: u8,
     pub reward_policy: VmRewardPolicy,
+    /// Optional reward shaping (additive; non-canonical).
+    pub reward_shaping: Option<VmRewardShaping>,
     pub action_source: VmActionSource,
     pub action_filter: Option<VmActionFilter>,
     pub resource_limits: Option<VmResourceLimits>,
@@ -368,7 +387,10 @@ impl VmConsole {
                     stream = Some(s);
                     break;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused || e.raw_os_error() == Some(11) => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused
+                        || e.raw_os_error() == Some(11) =>
+                {
                     // EAGAIN (11) or Refused: QEMU might still be initializing the device.
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -376,7 +398,8 @@ impl VmConsole {
             }
         }
 
-        let stream = stream.ok_or_else(|| anyhow::anyhow!("timeout connecting to VM console socket: {}", path))?;
+        let stream = stream
+            .ok_or_else(|| anyhow::anyhow!("timeout connecting to VM console socket: {}", path))?;
         stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
         let writer = stream.try_clone()?;
         Ok(Self {
@@ -981,11 +1004,7 @@ impl TraceModel {
                         compressor
                             .model
                             .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                    softmax_pdf_inplace(
-                        logits,
-                        vocab_size,
-                        &mut compressor.pdf_buffer,
-                    );
+                    softmax_pdf_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
                     *primed = true;
                 }
                 let mut bits = 0.0;
@@ -993,9 +1012,11 @@ impl TraceModel {
                 for &b in data {
                     let p = compressor.pdf_buffer[b as usize].max(1e-12);
                     bits -= p.log2();
-                    let logits = compressor
-                        .model
-                        .forward(&mut compressor.scratch, b as u32, &mut compressor.state);
+                    let logits = compressor.model.forward(
+                        &mut compressor.scratch,
+                        b as u32,
+                        &mut compressor.state,
+                    );
                     softmax_pdf_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
                 }
                 bits
@@ -1011,6 +1032,7 @@ pub struct VmEnvironment {
     ssh: Option<SshClient>,
     trace: Option<VmTraceStream>,
     trace_model: Option<TraceModel>,
+    reward_shaping: Option<VmRewardShaping>,
     obs: PerceptVal,
     rew: Reward,
     obs_stream: Vec<PerceptVal>,
@@ -1035,12 +1057,16 @@ impl VmEnvironment {
         match config.transport {
             VmTransport::Serial => {
                 if config.console.is_none() {
-                    return Err(anyhow::anyhow!("vm_config.console must be set for serial transport"));
+                    return Err(anyhow::anyhow!(
+                        "vm_config.console must be set for serial transport"
+                    ));
                 }
             }
             VmTransport::Ssh => {
                 if config.ssh.is_none() {
-                    return Err(anyhow::anyhow!("vm_config.ssh must be set for ssh transport"));
+                    return Err(anyhow::anyhow!(
+                        "vm_config.ssh must be set for ssh transport"
+                    ));
                 }
             }
         }
@@ -1058,11 +1084,44 @@ impl VmEnvironment {
                 "observation_bits must be >= 8 for raw output streams"
             ));
         }
-        if matches!(config.reward_policy, VmRewardPolicy::TraceEntropy { .. })
+        if matches!(
+            config.reward_policy,
+            VmRewardPolicy::EntropyReduction { .. } | VmRewardPolicy::TraceEntropy { .. }
+        ) && config.reward_shaping.is_some()
+        {
+            eprintln!(
+                "Warning: reward_policy uses shaping while reward_shaping is set; reward_policy shaping will be ignored."
+            );
+        }
+        let mut reward_shaping = config.reward_shaping.clone();
+        if reward_shaping.is_none() {
+            reward_shaping = match &config.reward_policy {
+                VmRewardPolicy::EntropyReduction {
+                    baseline_bytes,
+                    max_order,
+                    scale,
+                } => Some(VmRewardShaping::EntropyReduction {
+                    baseline_bytes: baseline_bytes.clone(),
+                    max_order: *max_order,
+                    scale: *scale,
+                }),
+                VmRewardPolicy::TraceEntropy {
+                    max_order,
+                    scale,
+                    normalize,
+                } => Some(VmRewardShaping::TraceEntropy {
+                    max_order: *max_order,
+                    scale: *scale,
+                    normalize: *normalize,
+                }),
+                _ => None,
+            };
+        }
+        if matches!(reward_shaping, Some(VmRewardShaping::TraceEntropy { .. }))
             && config.trace.is_none()
         {
             return Err(anyhow::anyhow!(
-                "vm_trace must be configured for vm_reward.mode=trace-entropy"
+                "vm_trace must be configured for vm_reward_shaping.mode=trace-entropy"
             ));
         }
         if let Some(trace) = &config.trace {
@@ -1085,28 +1144,24 @@ impl VmEnvironment {
         }
 
         let driver = LibvirtDriver::new(config.libvirt_uri.clone(), config.debug_mode)?;
-        let baseline_entropy = match &config.reward_policy {
-            VmRewardPolicy::EntropyReduction {
+        let baseline_entropy = match &reward_shaping {
+            Some(VmRewardShaping::EntropyReduction {
                 baseline_bytes,
                 max_order,
                 ..
-            } => {
+            }) => {
                 let h = if *max_order == 0 {
                     marginal_entropy_bytes(baseline_bytes)
                 } else {
-                    entropy_rate_backend(
-                        baseline_bytes,
-                        *max_order,
-                        &config.stats_backend,
-                    )
+                    entropy_rate_backend(baseline_bytes, *max_order, &config.stats_backend)
                 };
                 Some(h)
             }
             _ => None,
         };
 
-        let trace_model = match &config.reward_policy {
-            VmRewardPolicy::TraceEntropy { max_order, .. } => {
+        let trace_model = match &reward_shaping {
+            Some(VmRewardShaping::TraceEntropy { max_order, .. }) => {
                 Some(TraceModel::new(&config.stats_backend, *max_order))
             }
             _ => None,
@@ -1115,7 +1170,9 @@ impl VmEnvironment {
         let fuzz_state = match &config.action_source {
             VmActionSource::Fuzz(fuzz) => {
                 if fuzz.seeds.is_empty() {
-                    return Err(anyhow::anyhow!("vm_actions.fuzz requires at least one seed"));
+                    return Err(anyhow::anyhow!(
+                        "vm_actions.fuzz requires at least one seed"
+                    ));
                 }
                 if fuzz.mutators.is_empty() {
                     return Err(anyhow::anyhow!(
@@ -1145,6 +1202,7 @@ impl VmEnvironment {
             ssh: None,
             trace: None,
             trace_model,
+            reward_shaping,
             obs: 0,
             rew: 0,
             obs_stream: Vec::new(),
@@ -1171,14 +1229,19 @@ impl VmEnvironment {
         for hook in &self.config.hooks.pre_revert {
             let _ = Command::new(&hook.command).args(&hook.args).status();
         }
-        if self.driver.snapshot_exists(&self.config.domain, &self.config.snapshot)? {
+        if self
+            .driver
+            .snapshot_exists(&self.config.domain, &self.config.snapshot)?
+        {
             self.driver
                 .snapshot_revert(&self.config.domain, &self.config.snapshot)?;
         }
         self.driver.ensure_running(&self.config.domain)?;
         if let Some(limits) = &self.config.resource_limits {
             if let Some(vcpus) = limits.vcpus {
-                let _ = self.driver.set_vcpus(&self.config.domain, vcpus, limits.apply_mode);
+                let _ = self
+                    .driver
+                    .set_vcpus(&self.config.domain, vcpus, limits.apply_mode);
             }
             if let Some(memory_mib) = limits.memory_mib {
                 let _ =
@@ -1200,8 +1263,7 @@ impl VmEnvironment {
                     .console
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("console missing"))?;
-                let console =
-                    VmConsole::connect(&console_cfg.socket_path, console_cfg.timeout_ms)?;
+                let console = VmConsole::connect(&console_cfg.socket_path, console_cfg.timeout_ms)?;
                 self.console = Some(console);
                 if self.trace_model.is_some() {
                     if let Some(trace_cfg) = &self.config.trace {
@@ -1249,7 +1311,10 @@ impl VmEnvironment {
         if self.snapshot_ready {
             return Ok(());
         }
-        if self.driver.snapshot_exists(&self.config.domain, &self.config.snapshot)? {
+        if self
+            .driver
+            .snapshot_exists(&self.config.domain, &self.config.snapshot)?
+        {
             self.snapshot_ready = true;
             return Ok(());
         }
@@ -1346,7 +1411,11 @@ impl VmEnvironment {
             .ok_or_else(|| anyhow::anyhow!("ssh session missing"))?;
         for step in steps {
             match step {
-                VmSshProvisionStep::Upload { local, remote, mode } => {
+                VmSshProvisionStep::Upload {
+                    local,
+                    remote,
+                    mode,
+                } => {
                     ssh.upload_file(local, remote, *mode)?;
                 }
                 VmSshProvisionStep::UploadText { remote, text, mode } => {
@@ -1361,7 +1430,11 @@ impl VmEnvironment {
                         ));
                     }
                 }
-                VmSshProvisionStep::RunScript { local, remote, mode } => {
+                VmSshProvisionStep::RunScript {
+                    local,
+                    remote,
+                    mode,
+                } => {
                     ssh.upload_file(local, remote, *mode)?;
                     let mut cmd = VmSshCommand {
                         command: remote.to_string(),
@@ -1502,7 +1575,10 @@ impl VmEnvironment {
     fn format_action(&self, action: Action, payload: &[u8]) -> String {
         let encoded = self.config.protocol.wire_encoding.encode(payload);
         if encoded.is_empty() {
-            format!("{}{}{}", self.config.protocol.action_prefix, action, self.config.protocol.action_suffix)
+            format!(
+                "{}{}{}",
+                self.config.protocol.action_prefix, action, self.config.protocol.action_suffix
+            )
         } else {
             format!(
                 "{}{} {}{}",
@@ -1563,7 +1639,11 @@ impl VmEnvironment {
     fn run_ssh_action(&mut self, action: Action, payload: &[u8]) -> anyhow::Result<VmResponse> {
         self.ensure_ssh_ready()?;
         let cmd = self.select_ssh_command(action)?;
-        let stdin = if cmd.stdin_payload { Some(payload) } else { None };
+        let stdin = if cmd.stdin_payload {
+            Some(payload)
+        } else {
+            None
+        };
         let result = {
             let ssh = self
                 .ssh
@@ -1613,12 +1693,15 @@ impl VmEnvironment {
     }
 
     fn compute_reward(&mut self, response: &VmResponse) -> Reward {
-        let trace_data = if matches!(self.config.reward_policy, VmRewardPolicy::TraceEntropy { .. }) {
+        let trace_data = if matches!(
+            self.reward_shaping,
+            Some(VmRewardShaping::TraceEntropy { .. })
+        ) {
             self.read_trace_bytes()
         } else {
             Vec::new()
         };
-        let mut reward = match &self.config.reward_policy {
+        let base_reward = match &self.config.reward_policy {
             VmRewardPolicy::FromGuest => response.rew.unwrap_or(0),
             VmRewardPolicy::Pattern {
                 pattern,
@@ -1632,10 +1715,32 @@ impl VmEnvironment {
                     *base_reward
                 }
             }
-            VmRewardPolicy::EntropyReduction {
-                max_order,
-                scale,
-                ..
+            VmRewardPolicy::EntropyReduction { .. } | VmRewardPolicy::TraceEntropy { .. } => 0,
+        };
+
+        let shaping_reward = if let Some(shaping) = self.reward_shaping.clone() {
+            self.compute_reward_shaping(&shaping, response, &trace_data)
+        } else {
+            0
+        };
+
+        let mut reward = base_reward.saturating_add(shaping_reward);
+
+        reward = reward.saturating_sub(self.config.step_cost);
+        let min_reward = self.min_reward();
+        let max_reward = self.max_reward();
+        reward.clamp(min_reward, max_reward)
+    }
+
+    fn compute_reward_shaping(
+        &mut self,
+        shaping: &VmRewardShaping,
+        response: &VmResponse,
+        trace_data: &[u8],
+    ) -> Reward {
+        match shaping {
+            VmRewardShaping::EntropyReduction {
+                max_order, scale, ..
             } => {
                 let data = response
                     .data
@@ -1651,29 +1756,21 @@ impl VmEnvironment {
                 let er = (h_base - h_obs) * scale;
                 er.round() as i64
             }
-            VmRewardPolicy::TraceEntropy {
-                scale,
-                normalize,
-                ..
+            VmRewardShaping::TraceEntropy {
+                scale, normalize, ..
             } => {
-                let data = &trace_data;
                 let bits = match self.trace_model.as_mut() {
-                    Some(model) => model.update_and_score(data),
+                    Some(model) => model.update_and_score(trace_data),
                     None => 0.0,
                 };
-                let bits = if *normalize && !data.is_empty() {
-                    bits / data.len() as f64
+                let bits = if *normalize && !trace_data.is_empty() {
+                    bits / trace_data.len() as f64
                 } else {
                     bits
                 };
                 (bits * scale).round() as i64
             }
-        };
-
-        reward = reward.saturating_sub(self.config.step_cost);
-        let min_reward = self.min_reward();
-        let max_reward = self.max_reward();
-        reward.clamp(min_reward, max_reward)
+        }
     }
 
     fn read_trace_bytes(&mut self) -> Vec<u8> {

@@ -140,6 +140,7 @@ pub struct ContextTree {
     history: Vec<Symbol>,
     max_depth: usize,
     context_buf: Vec<Symbol>,
+    path_buf: Vec<NodeIndex>,
 }
 
 impl ContextTree {
@@ -153,6 +154,7 @@ impl ContextTree {
             history: Vec::new(),
             max_depth: depth,
             context_buf: vec![false; depth],
+            path_buf: Vec::with_capacity(depth + 1),
         }
     }
 
@@ -259,7 +261,9 @@ impl ContextTree {
         let max_depth = self.max_depth;
 
         // Build path from root to leaf
-        let mut path: Vec<NodeIndex> = Vec::with_capacity(max_depth + 1);
+        // optimizations: reuse buffer to avoid repeated allocations
+        let mut path = std::mem::take(&mut self.path_buf);
+        path.clear();
         path.push(root_idx);
 
         let mut current = root_idx;
@@ -302,6 +306,8 @@ impl ContextTree {
                 }
             }
         }
+
+        self.path_buf = path;
     }
 
     #[inline(always)]
@@ -388,6 +394,7 @@ struct ContextTreeCore {
     root: NodeIndex,
     max_depth: usize,
     context_buf: Vec<Symbol>,
+    path_buf: Vec<NodeIndex>,
 }
 
 impl ContextTreeCore {
@@ -399,6 +406,7 @@ impl ContextTreeCore {
             root,
             max_depth: depth,
             context_buf: vec![false; depth],
+            path_buf: Vec::with_capacity(depth + 1),
         }
     }
 
@@ -454,7 +462,8 @@ impl ContextTreeCore {
     fn update_node_iterative(&mut self, sym: Symbol, revert: bool) {
         let max_depth = self.max_depth;
 
-        let mut path: Vec<NodeIndex> = Vec::with_capacity(max_depth + 1);
+        let mut path = std::mem::take(&mut self.path_buf);
+        path.clear();
         path.push(self.root);
 
         let mut current = self.root;
@@ -495,6 +504,8 @@ impl ContextTreeCore {
                 }
             }
         }
+
+        self.path_buf = path;
     }
 
     #[inline(always)]

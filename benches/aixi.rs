@@ -10,17 +10,15 @@ fn bench_agent(
 ) -> Duration {
     let mut prev_action = 0u64;
     let mut obs_stream = env.drain_observations();
-    let mut obs = agent.observation_key_from_stream(&obs_stream);
     let mut rew = env.get_reward();
 
     // Warmup
     for _ in 0..warmup {
         agent.model_update_percept_stream(&obs_stream, rew);
-        let action = agent.get_planned_action(obs, rew, prev_action);
+        let action = agent.get_planned_action(&obs_stream, rew, prev_action);
         agent.model_update_action_external(action);
         env.perform_action(action);
         obs_stream = env.drain_observations();
-        obs = agent.observation_key_from_stream(&obs_stream);
         rew = env.get_reward();
         prev_action = action;
     }
@@ -28,11 +26,10 @@ fn bench_agent(
     let now = Instant::now();
     for _ in 0..cycles {
         agent.model_update_percept_stream(&obs_stream, rew);
-        let action = agent.get_planned_action(obs, rew, prev_action);
+        let action = agent.get_planned_action(&obs_stream, rew, prev_action);
         agent.model_update_action_external(action);
         env.perform_action(action);
         obs_stream = env.drain_observations();
-        obs = agent.observation_key_from_stream(&obs_stream);
         rew = env.get_reward();
         prev_action = action;
     }
@@ -55,7 +52,7 @@ fn main() {
         agent_horizon: 5,
         observation_bits: 2,
         observation_stream_len: 1,
-        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::First,
+        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::FullStream,
         reward_bits: 2,
         agent_actions: 3,
         num_simulations: 400,
@@ -68,12 +65,12 @@ fn main() {
         rosa_max_order: Some(20),
     };
 
-    let benches = [
-        ("fac-ctw", base_cfg("fac-ctw")),
-        ("rosa", base_cfg("rosa")),
-    ];
+    let benches = [("fac-ctw", base_cfg("fac-ctw")), ("rosa", base_cfg("rosa"))];
 
-    println!("MC-AIXI benchmark (env={}, warmup={}, cycles={})", env_name, warmup, cycles);
+    println!(
+        "MC-AIXI benchmark (env={}, warmup={}, cycles={})",
+        env_name, warmup, cycles
+    );
     for (name, cfg) in benches {
         // Fresh env per backend to keep interaction distribution identical.
         // (Environment is stochastic; we intentionally measure typical runtime not identical traces.)

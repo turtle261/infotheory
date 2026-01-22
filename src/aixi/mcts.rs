@@ -5,10 +5,16 @@
 //! by simulating future interactions with a world model.
 
 use crate::aixi::common::{
-    Action, ObservationKeyMode, PerceptVal, Reward, observation_key_from_stream,
+    Action, ObservationKeyMode, PerceptVal, Reward, observation_repr_from_stream,
 };
 use rayon::prelude::*;
 use std::collections::HashMap;
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct PerceptOutcome {
+    observations: Vec<PerceptVal>,
+    reward: Reward,
+}
 
 /// Interface for an agent that can be simulated during MCTS.
 ///
@@ -29,7 +35,16 @@ pub trait AgentSimulator: Send + Sync {
 
     /// Returns the observation key mode for search-tree branching.
     fn observation_key_mode(&self) -> ObservationKeyMode {
-        ObservationKeyMode::First
+        ObservationKeyMode::FullStream
+    }
+
+    /// Returns the observation representation used for tree branching.
+    fn observation_repr_from_stream(&self, observations: &[PerceptVal]) -> Vec<PerceptVal> {
+        observation_repr_from_stream(
+            self.observation_key_mode(),
+            observations,
+            self.get_num_observation_bits(),
+        )
     }
 
     /// Returns the bit-width used to encode rewards.
@@ -103,7 +118,7 @@ pub trait AgentSimulator: Send + Sync {
     }
 
     /// Helper to generate a percept stream, update the model, and return a search key + reward.
-    fn gen_percepts_and_update(&mut self) -> (PerceptVal, Reward) {
+    fn gen_percepts_and_update(&mut self) -> (Vec<PerceptVal>, Reward) {
         let obs_bits = self.get_num_observation_bits();
         let obs_len = self.observation_stream_len().max(1);
         let mut observations = Vec::with_capacity(obs_len);
@@ -111,25 +126,11 @@ pub trait AgentSimulator: Send + Sync {
             observations.push(self.gen_percept_and_update(obs_bits));
         }
 
-        let obs_key = observation_key_from_stream(self.observation_key_mode(), &observations, obs_bits);
+        let obs_key = self.observation_repr_from_stream(&observations);
         let rew_bits = self.get_num_reward_bits();
         let rew_u = self.gen_percept_and_update(rew_bits);
         let rew = (rew_u as i64) - self.reward_offset();
-        (self.percept_key(obs_key, rew_u), rew)
-    }
-
-    /// Combines observation and reward into a single search-tree key.
-    fn percept_key(&self, obs_key: PerceptVal, rew_u: u64) -> u64 {
-        let obs_bits = self.get_num_observation_bits();
-        let rew_bits = self.get_num_reward_bits();
-        let can_pack = self.observation_stream_len() == 1
-            && matches!(self.observation_key_mode(), ObservationKeyMode::First | ObservationKeyMode::Last)
-            && obs_bits + rew_bits <= 63;
-        if can_pack {
-            obs_key + (rew_u << obs_bits)
-        } else {
-            obs_key.rotate_left(17) ^ rew_u.wrapping_mul(0x9E3779B97F4A7C15)
-        }
+        (obs_key, rew)
     }
 }
 
@@ -145,8 +146,10 @@ pub struct SearchNode {
     mean: f64,
     /// Whether this is a chance node (observation/reward) rather than an action node.
     is_chance_node: bool,
-    /// Maps from Action or Percept key to child nodes.
-    children: HashMap<u64, SearchNode>,
+    /// Children indexed by action (action nodes only).
+    action_children: Vec<Option<SearchNode>>,
+    /// Children indexed by percept outcome (chance nodes only).
+    percept_children: HashMap<PerceptOutcome, SearchNode>,
 }
 
 impl SearchNode {
@@ -156,7 +159,8 @@ impl SearchNode {
             visits: 0,
             mean: 0.0,
             is_chance_node,
-            children: HashMap::new(),
+            action_children: Vec::new(),
+            percept_children: HashMap::new(),
         }
     }
 
@@ -165,14 +169,17 @@ impl SearchNode {
         let mut best_actions = Vec::new();
         let mut best_mean = -f64::INFINITY;
 
-        for (&action, child) in &self.children {
+        for (action, child) in self.action_children.iter().enumerate() {
+            let Some(child) = child.as_ref() else {
+                continue;
+            };
             let mean = child.mean;
             if mean > best_mean {
                 best_mean = mean;
                 best_actions.clear();
-                best_actions.push(action);
+                best_actions.push(action as u64);
             } else if (mean - best_mean).abs() < 1e-9 {
-                best_actions.push(action);
+                best_actions.push(action as u64);
             }
         }
 
@@ -216,28 +223,68 @@ impl SearchNode {
             };
         }
 
-        for (key, updated_child) in &updated.children {
-            if let Some(base_child) = base.children.get(key) {
-                if let Some(self_child) = self.children.get_mut(key) {
-                    self_child.apply_delta(base_child, updated_child);
+        if self.is_chance_node {
+            for (key, updated_child) in &updated.percept_children {
+                if let Some(base_child) = base.percept_children.get(key) {
+                    if let Some(self_child) = self.percept_children.get_mut(key) {
+                        self_child.apply_delta(base_child, updated_child);
+                    } else {
+                        let mut child = SearchNode::new(updated_child.is_chance_node);
+                        child.apply_delta(
+                            &SearchNode::new(updated_child.is_chance_node),
+                            updated_child,
+                        );
+                        self.percept_children.insert(key.clone(), child);
+                    }
+                } else if let Some(self_child) = self.percept_children.get_mut(key) {
+                    let empty = SearchNode::new(updated_child.is_chance_node);
+                    self_child.apply_delta(&empty, updated_child);
                 } else {
                     let mut child = SearchNode::new(updated_child.is_chance_node);
                     child.apply_delta(
                         &SearchNode::new(updated_child.is_chance_node),
                         updated_child,
                     );
-                    self.children.insert(*key, child);
+                    self.percept_children.insert(key.clone(), child);
                 }
-            } else if let Some(self_child) = self.children.get_mut(key) {
-                let empty = SearchNode::new(updated_child.is_chance_node);
-                self_child.apply_delta(&empty, updated_child);
-            } else {
-                let mut child = SearchNode::new(updated_child.is_chance_node);
-                child.apply_delta(
-                    &SearchNode::new(updated_child.is_chance_node),
-                    updated_child,
-                );
-                self.children.insert(*key, child);
+            }
+        } else {
+            let max_len = base
+                .action_children
+                .len()
+                .max(updated.action_children.len());
+            if self.action_children.len() < max_len {
+                self.action_children.resize_with(max_len, || None);
+            }
+            for idx in 0..max_len {
+                let base_child = base.action_children.get(idx).and_then(|c| c.as_ref());
+                let updated_child = updated.action_children.get(idx).and_then(|c| c.as_ref());
+                let Some(updated_child) = updated_child else {
+                    continue;
+                };
+                match (base_child, self.action_children.get_mut(idx)) {
+                    (Some(base_child), Some(Some(self_child))) => {
+                        self_child.apply_delta(base_child, updated_child);
+                    }
+                    (Some(base_child), Some(slot @ None)) => {
+                        let mut child = SearchNode::new(updated_child.is_chance_node);
+                        child.apply_delta(base_child, updated_child);
+                        *slot = Some(child);
+                    }
+                    (None, Some(Some(self_child))) => {
+                        let empty = SearchNode::new(updated_child.is_chance_node);
+                        self_child.apply_delta(&empty, updated_child);
+                    }
+                    (None, Some(slot @ None)) => {
+                        let mut child = SearchNode::new(updated_child.is_chance_node);
+                        child.apply_delta(
+                            &SearchNode::new(updated_child.is_chance_node),
+                            updated_child,
+                        );
+                        *slot = Some(child);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -250,9 +297,13 @@ impl SearchNode {
     ) -> (&mut SearchNode, Action) {
         let num_actions = agent.get_num_actions();
 
+        if self.action_children.len() < num_actions {
+            self.action_children.resize_with(num_actions, || None);
+        }
+
         let mut unvisited = Vec::new();
         for a in 0..num_actions {
-            if !self.children.contains_key(&(a as u64)) {
+            if self.action_children[a].is_none() {
                 unvisited.push(a as u64);
             }
         }
@@ -261,14 +312,17 @@ impl SearchNode {
         if !unvisited.is_empty() {
             let idx = agent.gen_range(unvisited.len());
             action = unvisited[idx];
-            self.children.insert(action, SearchNode::new(true));
+            self.action_children[action as usize] = Some(SearchNode::new(true));
         } else {
             // UCT Formula: exploit + explore
             let c = agent.get_explore_exploit_ratio();
             let mut best_val = -f64::INFINITY;
             let mut best_action = 0;
             let log_visits = (self.visits as f64).ln().max(0.0);
-            for (&a, child) in &self.children {
+            for (a, child) in self.action_children.iter().enumerate() {
+                let Some(child) = child.as_ref() else {
+                    continue;
+                };
                 let exploit = agent.norm_reward(child.expectation());
                 let explore = if child.visits > 0 {
                     c * (log_visits / child.visits as f64).sqrt()
@@ -278,14 +332,19 @@ impl SearchNode {
                 let val = exploit + explore;
                 if val > best_val {
                     best_val = val;
-                    best_action = a;
+                    best_action = a as u64;
                 }
             }
             action = best_action;
         }
 
         agent.model_update_action(action as Action);
-        (self.children.get_mut(&action).unwrap(), action as Action)
+        (
+            self.action_children[action as usize]
+                .as_mut()
+                .expect("missing action child"),
+            action as Action,
+        )
     }
 
     /// Performs a single simulation (sample) from this node.
@@ -302,12 +361,17 @@ impl SearchNode {
 
         let reward;
         if self.is_chance_node {
-            let (key, rew) = agent.gen_percepts_and_update();
+            let (obs, rew) = agent.gen_percepts_and_update();
+            let key = PerceptOutcome {
+                observations: obs,
+                reward: rew,
+            };
             let child = self
-                .children
+                .percept_children
                 .entry(key)
                 .or_insert_with(|| SearchNode::new(false));
-            reward = (rew as f64) + agent.discount_gamma() * child.sample(agent, horizon - 1, total_horizon);
+            reward = (rew as f64)
+                + agent.discount_gamma() * child.sample(agent, horizon - 1, total_horizon);
         } else if self.visits == 0 {
             reward = Self::playout(agent, horizon, total_horizon);
         } else {
@@ -359,12 +423,12 @@ impl SearchTree {
     pub fn search(
         &mut self,
         agent: &mut dyn AgentSimulator,
-        prev_obs: u64,
+        prev_obs_stream: &[PerceptVal],
         prev_rew: Reward,
         prev_act: u64,
         samples: usize,
     ) -> Action {
-        self.prune_tree(agent, prev_obs, prev_rew, prev_act);
+        self.prune_tree(agent, prev_obs_stream, prev_rew, prev_act);
 
         let root = self.root.as_mut().unwrap();
         let h = agent.horizon();
@@ -411,7 +475,7 @@ impl SearchTree {
     fn prune_tree(
         &mut self,
         agent: &mut dyn AgentSimulator,
-        prev_obs: u64,
+        prev_obs_stream: &[PerceptVal],
         prev_rew: Reward,
         prev_act: u64,
     ) {
@@ -423,12 +487,20 @@ impl SearchTree {
         let mut old_root = self.root.take().unwrap();
 
         // Find chance child (prev_act)
-        if let Some(mut chance_child) = old_root.children.remove(&prev_act) {
-            let offset = agent.reward_offset();
-            let key_rew_u = (prev_rew + offset) as u64;
-            let key = agent.percept_key(prev_obs, key_rew_u);
+        let action_child_opt = if old_root.action_children.len() > prev_act as usize {
+            old_root.action_children[prev_act as usize].take()
+        } else {
+            None
+        };
 
-            if let Some(action_child) = chance_child.children.remove(&key) {
+        if let Some(mut chance_child) = action_child_opt {
+            let obs_repr = agent.observation_repr_from_stream(prev_obs_stream);
+            let key = PerceptOutcome {
+                observations: obs_repr,
+                reward: prev_rew,
+            };
+
+            if let Some(action_child) = chance_child.percept_children.remove(&key) {
                 self.root = Some(action_child);
             } else {
                 self.root = Some(SearchNode::new(false));

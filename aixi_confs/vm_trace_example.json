@@ -11,27 +11,13 @@
     "exploration_exploitation_ratio": 1.4,
     "discount_gamma": 1.0,
     "terminate-lifetime": 50,
+    "log_every": 0,
     "vm_config": {
-        "libvirt_uri": "qemu:///system",
-        "domain": "aixi-guest",
-        "snapshot": "clean",
-        "transport": "ssh",
-        "auto_snapshot": true,
-        "ssh": {
-            "host": "192.168.122.100",
-            "port": 22,
-            "user": "root",
-            "password": "CHANGE_ME",
-            "connect_timeout_ms": 5000,
-            "retry_interval_ms": 500,
-            "action_command": {
-                "cmd": "cat",
-                "stdin_payload": true
-            },
-            "provision_steps": [
-                { "run": "true" }
-            ]
-        },
+        "firecracker_config": "nyx-lite/vm_image/vmconfig.json",
+        "instance_id": "aixi-nyx",
+        "shared_region_name": "shared",
+        "shared_region_size": 4096,
+        "shared_memory_policy": "snapshot",
         "stats_backend": {
             "name": "ctw",
             "ct_depth": 32
@@ -40,19 +26,11 @@
         "step_cost": 1,
         "boot_timeout_ms": 30000,
         "step_timeout_ms": 5000,
-        "verbose": false,
-        "resource_limits": {
-            "memory_mib": 16384,
-            "vcpus": 6,
-            "apply_mode": "both"
-        }
+        "verbose": false
     },
     "vm_trace": {
-        "mode": "ssh",
-        "command": {
-            "cmd": "cat",
-            "args": ["/tmp/trace.bin"]
-        },
+        "mode": "shared-memory",
+        "shared_region_name": "trace",
         "max_bytes": 1048576,
         "reset_on_episode": false
     },
@@ -72,7 +50,7 @@
         ]
     },
     "vm_observation": {
-        "mode": "raw",
+        "mode": "shared-memory",
         "stream_len": 64,
         "stream_mode": "pad-truncate"
     },

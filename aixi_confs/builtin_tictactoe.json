@@ -1,8 +1,8 @@
 {
     "environment": "tictactoe",
     "algorithm": "fac-ctw",
-    "ct_depth": 64,
-    "agent_horizon": 9,
+    "ct_depth": 32,
+    "agent_horizon": 4,
     "observation_bits": 18,
     "reward_bits": 3,
     "agent_actions": 9,
