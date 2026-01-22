@@ -100,20 +100,29 @@ pub trait AgentSimulator: Send + Sync {
     fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn AgentSimulator>;
 
     /// Normalizes a reward value to [0, 1] based on the agent's range and horizon.
+    ///
+    /// For discounted rewards, the cumulative range is `sum_{t=0}^{h-1} gamma^t * (max - min)`.
+    /// Similarly, the minimum cumulative reward is `sum_{t=0}^{h-1} gamma^t * min`.
     fn norm_reward(&self, reward: f64) -> f64 {
         let min = self.min_reward() as f64;
         let max = self.max_reward() as f64;
         let h = self.horizon() as f64;
         let gamma = self.discount_gamma().clamp(0.0, 1.0);
-        let range = if (gamma - 1.0).abs() < 1e-9 {
-            (max - min) * h
+
+        // Discounted sum factor: sum_{t=0}^{h-1} gamma^t = (1 - gamma^h) / (1 - gamma) for gamma != 1
+        let discount_sum = if (gamma - 1.0).abs() < 1e-9 {
+            h
         } else {
-            (max - min) * ((1.0 - gamma.powi(h as i32)) / (1.0 - gamma))
+            (1.0 - gamma.powi(h as i32)) / (1.0 - gamma)
         };
+
+        let range = (max - min) * discount_sum;
+        let min_cumulative = min * discount_sum;
+
         if range.abs() < 1e-9 {
             0.5
         } else {
-            (reward - (min * h)) / range
+            (reward - min_cumulative) / range
         }
     }
 

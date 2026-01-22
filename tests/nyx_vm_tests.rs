@@ -168,6 +168,7 @@ fn test_observation_policies() {
 // Reward Policy Tests
 // ============================================================================
 
+
 #[test]
 fn test_reward_policy_from_guest() {
     let policy = NyxRewardPolicy::FromGuest;
@@ -188,26 +189,26 @@ fn test_reward_policy_pattern() {
 }
 
 #[test]
-fn test_reward_policy_entropy_reduction() {
-    let policy = NyxRewardPolicy::EntropyReduction {
+fn test_reward_shaping_entropy() {
+    let shaping = NyxRewardShaping::EntropyReduction {
         baseline_bytes: vec![0u8; 100],
         max_order: 8,
         scale: 1.0,
         crash_bonus: None,
         timeout_bonus: None,
     };
-    let debug_str = format!("{:?}", policy);
+    let debug_str = format!("{:?}", shaping);
     assert!(debug_str.contains("EntropyReduction"));
 }
 
 #[test]
-fn test_reward_policy_trace_entropy() {
-    let policy = NyxRewardPolicy::TraceEntropy {
+fn test_reward_shaping_trace() {
+    let shaping = NyxRewardShaping::TraceEntropy {
         max_order: 4,
         scale: 2.0,
         normalize: true,
     };
-    let debug_str = format!("{:?}", policy);
+    let debug_str = format!("{:?}", shaping);
     assert!(debug_str.contains("TraceEntropy"));
 }
 
@@ -414,48 +415,145 @@ mod info_theory_properties {
 mod vm_integration_tests {
     #[allow(unused_imports)]
     use super::*;
+    use infotheory::aixi::environment::Environment;
+    use std::path::{Path, PathBuf};
+    use std::fs::File;
+    use std::io::Write;
+
+    fn get_project_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn check_kvm_available() -> bool {
+        std::path::Path::new("/dev/kvm").exists()
+    }
+
+    fn create_firecracker_config(kernel: &Path, initrd: &Path, test_name: &str) -> PathBuf {
+        let config_json = format!(
+            r#"{{
+  "boot-source": {{
+    "kernel_image_path": "{}",
+    "initrd_path": "{}",
+    "boot_args": "ro console=ttyS0 noapic reboot=k panic=1 pci=off nomodules random.trust_cpu=on init=/init quiet loglevel=3"
+  }},
+  "drives": [],
+  "machine-config": {{
+    "vcpu_count": 1,
+    "mem_size_mib": 1024
+  }}
+}}"#,
+            kernel.to_string_lossy(),
+            initrd.to_string_lossy()
+        );
+
+        let root = get_project_root();
+        let config_path = root.join("target").join(format!("test_vm_config_{}_{}.json", std::process::id(), test_name));
+        // Ensure target dir exists
+        let _ = std::fs::create_dir_all(root.join("target"));
+        
+        let mut file = File::create(&config_path).expect("Failed to create temp config");
+        file.write_all(config_json.as_bytes()).expect("Failed to write config");
+        
+        config_path
+    }
+
+    fn get_test_vm_config(test_name: &str) -> Option<NyxVmConfig> {
+        let root = get_project_root();
+        let kernel_path = root.join("vmlinux-6.1.58");
+        let initrd_path = root.join("nyx-lite/guest/aixi_initramfs.cpio");
+
+        if !kernel_path.exists() {
+            eprintln!("Skipping VM test: Kernel not found at {:?}", kernel_path);
+            return None;
+        }
+        if !initrd_path.exists() {
+            eprintln!("Skipping VM test: Initrd not found at {:?}", initrd_path);
+            return None;
+        }
+
+        let fc_config_path = create_firecracker_config(&kernel_path, &initrd_path, test_name);
+
+        Some(NyxVmConfig {
+            firecracker_config: fc_config_path.to_string_lossy().to_string(),
+            instance_id: format!("test-vm-{}-{}", std::process::id(), test_name),
+            shared_region_name: "shared".to_string(),
+            shared_region_size: 4096,
+            shared_memory_policy: SharedMemoryPolicy::Snapshot,
+            step_timeout: Duration::from_millis(500),
+            boot_timeout: Duration::from_secs(30),
+            episode_steps: 10,
+            step_cost: 1,
+            // With proper agent initrd, we can use SharedMemory policy
+            observation_policy: NyxObservationPolicy::SharedMemory,
+            observation_bits: 8,
+            observation_stream_len: 1,
+            observation_stream_mode: NyxObservationStreamMode::PadTruncate,
+            observation_pad_byte: 0,
+            reward_bits: 8,
+            reward_policy: NyxRewardPolicy::FromGuest,
+            reward_shaping: None,
+            action_source: NyxActionSource::Literal(vec![
+                NyxActionSpec {
+                    name: Some("nop".to_string()),
+                    payload: vec![],
+                },
+                NyxActionSpec {
+                    name: Some("act".to_string()),
+                    payload: vec![0x01],
+                },
+            ]),
+            action_filter: None,
+            protocol: NyxProtocolConfig::default(),
+            stats_backend: RateBackend::default(),
+            trace: None,
+            debug_mode: true,
+            crash_log: None,
+        })
+    }
 
     #[test]
-    #[ignore = "Requires Firecracker VM setup"]
     fn test_vm_boot_and_snapshot() {
-        // This would test:
-        // 1. Boot the VM
-        // 2. Wait for shared memory registration
-        // 3. Take a base snapshot
-        // 4. Verify snapshot can be restored
+        if !check_kvm_available() {
+            eprintln!("Skipping VM test: /dev/kvm not found");
+            return;
+        }
+        let Some(config) = get_test_vm_config("boot") else {
+            return;
+        };
+        // Clean up config file on return ideally, but fine for test
+        
+        let result = NyxVmEnvironment::new(config);
+        
+        match result {
+            Ok(mut env) => {
+                assert!(!env.is_finished());
+                env.perform_action(0);
+                
+                let obs = env.get_observation();
+                let rew = env.get_reward();
+                
+                println!("VM Boot Success. Obs={}, Rew={}", obs, rew);
+                assert!(!env.is_finished());
+            },
+            Err(e) => {
+                panic!("Failed to create NyxVmEnvironment: {:?}", e);
+            }
+        }
     }
 
     #[test]
-    #[ignore = "Requires Firecracker VM setup"]
     fn test_vm_action_execution() {
-        // This would test:
-        // 1. Boot and snapshot
-        // 2. Execute an action
-        // 3. Verify observation is received
-        // 4. Verify reward is computed
-    }
-
-    #[test]
-    #[ignore = "Requires Firecracker VM setup"]
-    fn test_vm_reset_performance() {
-        // This would test:
-        // 1. Boot and snapshot
-        // 2. Perform many resets
-        // 3. Verify we achieve >10k resets/second
-    }
-
-    #[test]
-    #[ignore = "Requires Firecracker VM setup"]
-    fn test_vm_episode_boundary() {
-        // This would test:
-        // 1. Run through a complete episode
-        // 2. Verify automatic reset at episode boundary
-    }
-
-    #[test]
-    #[ignore = "Requires Firecracker VM setup"]
-    fn test_vm_environment_trait() {
-        // This would test full Environment trait compliance
+        if !check_kvm_available() { return; }
+        let Some(config) = get_test_vm_config("action") else { return; };
+        
+        let mut env = NyxVmEnvironment::new(config).expect("Failed to init VM");
+        
+        for _ in 0..5 {
+            env.perform_action(1);
+            let _ = env.get_observation();
+            // In RawOutput mode, we might get 0 bytes if VM is quiet, or console logs.
+            // Just verifying we don't crash.
+        }
     }
 }
 
@@ -500,12 +598,12 @@ fn test_complete_experiment_config() {
         observation_stream_mode: NyxObservationStreamMode::PadTruncate,
         observation_pad_byte: 0,
         reward_bits: 8,
-        reward_policy: NyxRewardPolicy::TraceEntropy {
+        reward_policy: NyxRewardPolicy::FromGuest,
+        reward_shaping: Some(NyxRewardShaping::TraceEntropy {
             max_order: 8,
             scale: 1.0,
             normalize: true,
-        },
-        reward_shaping: None,
+        }),
         action_source: NyxActionSource::Literal(vec![
             NyxActionSpec {
                 name: Some("nop".to_string()),

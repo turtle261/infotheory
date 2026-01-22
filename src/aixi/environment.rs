@@ -5,11 +5,6 @@
 //! providing a consistent interface for interaction.
 
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 /// Interface for an agent's environment.
 ///
@@ -55,7 +50,12 @@ pub trait Environment {
         if bits == 0 {
             return 0;
         }
-        (1 << (bits - 1)) - 1
+        // Prevent overflow for bits >= 64
+        if bits >= 64 {
+            i64::MAX
+        } else {
+            (1i64 << (bits - 1)) - 1
+        }
     }
 
     /// Returns the minimum possible reward value in this environment.
@@ -64,7 +64,12 @@ pub trait Environment {
         if bits == 0 {
             return 0;
         }
-        -(1 << (bits - 1))
+        // Prevent overflow for bits >= 64
+        if bits >= 64 {
+            i64::MIN
+        } else {
+            -(1i64 << (bits - 1))
+        }
     }
 }
 
@@ -710,234 +715,4 @@ impl Environment for KuhnPoker {
     }
 }
 
-/// An environment that interacts with an external process.
-///
-/// **DEPRECATED**: This environment is deprecated in favor of `NyxVmEnvironment`
-/// which provides better isolation, security, and performance through VM-based
-/// sandboxing. The `ProcessEnvironment` exposes the host system to untrusted
-/// commands, making it unsuitable for autonomous agent exploration.
-///
-/// Enable the `vm` feature and use `NyxVmEnvironment` instead for production use.
-#[deprecated(
-    since = "0.2.0",
-    note = "Use NyxVmEnvironment with the `vm` feature for secure sandboxed environments"
-)]
-#[allow(deprecated)]
-pub struct ProcessEnvironment {
-    _child: Child,
-    stdin: ChildStdin,
-    stdout_rx: Receiver<String>,
-    stdout_thread: Option<JoinHandle<()>>,
-    action_map: Vec<String>,
-    observation_bits: usize,
-    reward_bits: usize,
-    reward_pattern: Option<String>,
-    step_cost: u64,
-    step_timeout: Duration,
-    debug_mode: bool,
-    obs: PerceptVal,
-    rew: Reward,
-}
 
-#[allow(deprecated)]
-impl ProcessEnvironment {
-    /// Creates a new `ProcessEnvironment` by spawning a subprocess.
-    pub fn new(
-        command: &str,
-        args: &[String],
-        actions: Vec<String>,
-        obs_bits: usize,
-        rew_bits: usize,
-        pattern: Option<String>,
-        step_cost: u64,
-        step_timeout: Duration,
-        debug_mode: bool,
-    ) -> anyhow::Result<Self> {
-        let mut child = Command::new(command)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
-
-        let (tx, rx) = mpsc::channel();
-        let stdout_thread = std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if tx.send(line.clone()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Ok(Self {
-            _child: child,
-            stdin,
-            stdout_rx: rx,
-            stdout_thread: Some(stdout_thread),
-            action_map: actions,
-            observation_bits: obs_bits,
-            reward_bits: rew_bits,
-            reward_pattern: pattern,
-            step_cost,
-            step_timeout,
-            debug_mode,
-            obs: 0,
-            rew: 0,
-        })
-    }
-
-    /// Robust hash of a string into a u64, folding via rotate/XOR.
-    fn robust_hash(s: &str) -> u64 {
-        let mut h = 0u64;
-        for &b in s.as_bytes() {
-            h = h.rotate_left(7) ^ (b as u64);
-        }
-        h
-    }
-}
-
-#[allow(deprecated)]
-impl Environment for ProcessEnvironment {
-    fn perform_action(&mut self, action: Action) {
-        let cmd = self
-            .action_map
-            .get(action as usize)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        if self.debug_mode {
-            eprintln!("\n[AIXI Env] Action {}: '{}'", action, cmd);
-        }
-
-        // Write action + sentinel
-        let _ = writeln!(self.stdin, "{}", cmd);
-        let _ = writeln!(self.stdin, "echo ___SENTINEL___$?");
-        let _ = self.stdin.flush();
-
-        let mut output = String::new();
-        let mut exit_code = 0;
-        let mut saw_sentinel = false;
-        let deadline = Instant::now() + self.step_timeout;
-
-        while Instant::now() < deadline {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            match self.stdout_rx.recv_timeout(timeout) {
-                Ok(line) => {
-                    if line.contains("___SENTINEL___") {
-                        if let Some(pos) = line.find("___SENTINEL___") {
-                            let code_str = line[pos + 14..].trim();
-                            exit_code = code_str.parse().unwrap_or(0);
-                        }
-                        saw_sentinel = true;
-                        break;
-                    }
-                    // Simple mirroring check: don't include the exact command line if it's echoed back
-                    if line.trim() == cmd.trim() {
-                        continue;
-                    }
-                    output.push_str(&line);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        if !saw_sentinel {
-            let _ = self._child.kill();
-            let _ = self._child.wait();
-            exit_code = 1;
-        }
-
-        if self.debug_mode {
-            eprintln!("[AIXI Env] Output: {:?}", output.trim());
-        }
-
-        // Encode observation via robust hash
-        let hash = Self::robust_hash(&output);
-        let mask = if self.observation_bits >= 64 {
-            !0u64
-        } else {
-            (1u64 << self.observation_bits) - 1
-        };
-        self.obs = hash & mask;
-
-        // Reward logic:
-        // Base reward: 2 for success, 0 for error.
-        let mut base_rew = if exit_code == 0 { 2 } else { 0 };
-
-        // Match reward: large but not max, to allow room for "discovery bonus" vs "pure luck"
-        if let Some(ref pattern) = self.reward_pattern {
-            if output.contains(pattern) {
-                base_rew += self.max_reward().saturating_sub(10);
-            }
-        }
-
-        // Apply step cost (saturating at 0)
-        self.rew = base_rew.saturating_sub(self.step_cost as i64);
-
-        let min_reward = self.min_reward();
-        let max_reward = self.max_reward();
-        self.rew = self.rew.clamp(min_reward, max_reward);
-
-        if self.debug_mode {
-            eprintln!(
-                "[AIXI Env] ExitCode: {}, Obs: {}, Rew: {}",
-                exit_code, self.obs, self.rew
-            );
-        }
-    }
-
-    fn get_observation(&self) -> PerceptVal {
-        self.obs
-    }
-    fn get_reward(&self) -> Reward {
-        self.rew
-    }
-    fn is_finished(&self) -> bool {
-        false
-    }
-    fn get_observation_bits(&self) -> usize {
-        self.observation_bits
-    }
-    fn get_reward_bits(&self) -> usize {
-        self.reward_bits
-    }
-    fn get_action_bits(&self) -> usize {
-        let n = self.action_map.len();
-        if n <= 1 {
-            return 1;
-        }
-        (n as f64).log2().ceil() as usize
-    }
-    fn get_num_actions(&self) -> usize {
-        self.action_map.len()
-    }
-}
-
-#[allow(deprecated)]
-impl Drop for ProcessEnvironment {
-    fn drop(&mut self) {
-        let _ = self._child.kill();
-        let _ = self._child.wait();
-        if let Some(handle) = self.stdout_thread.take() {
-            let _ = handle.join();
-        }
-    }
-}

@@ -71,9 +71,6 @@ pub struct Agent {
     /// Pre-calculated bit depth for actions based on `agent_actions`.
     action_bits: usize,
 
-    /// State tracking to ensure model update consistency.
-    is_last_update_percept: bool,
-
     /// Internal PRNG for simulations.
     rng: RandomGenerator,
 
@@ -129,7 +126,6 @@ impl Agent {
             age: 0,
             total_reward: 0.0,
             action_bits,
-            is_last_update_percept: true,
             rng: RandomGenerator::new(),
             obs_buffer: Vec::with_capacity(128),
             sym_buffer: Vec::with_capacity(64),
@@ -144,7 +140,6 @@ impl Agent {
             age: self.age,
             total_reward: self.total_reward,
             action_bits: self.action_bits,
-            is_last_update_percept: self.is_last_update_percept,
             rng: self.rng.fork_with(seed),
             obs_buffer: Vec::with_capacity(128),
             sym_buffer: Vec::with_capacity(64),
@@ -155,7 +150,6 @@ impl Agent {
     pub fn reset(&mut self) {
         self.age = 0;
         self.total_reward = 0.0;
-        self.is_last_update_percept = true;
     }
 
     /// Primary interface for decision making.
@@ -201,7 +195,6 @@ impl Agent {
         }
 
         self.total_reward += reward as f64;
-        self.is_last_update_percept = true;
     }
 
     /// Computes the observation key used for search-tree branching.
@@ -265,18 +258,12 @@ impl AgentSimulator for Agent {
     }
 
     fn model_update_action(&mut self, action: Action) {
-        debug_assert!(
-            self.is_last_update_percept,
-            "action update called twice without intervening percept"
-        );
         self.sym_buffer.clear();
         encode(&mut self.sym_buffer, action, self.action_bits);
 
         for &sym in &self.sym_buffer {
             self.model.update_history(sym);
         }
-
-        self.is_last_update_percept = false;
     }
 
     fn gen_percept_and_update(&mut self, bits: usize) -> u64 {
@@ -310,7 +297,6 @@ impl AgentSimulator for Agent {
         let rew = (rew_u as i64) - self.config.reward_offset;
 
         // Mark that we've completed a percept cycle (ready for next action)
-        self.is_last_update_percept = true;
 
         (obs_repr, rew)
     }
@@ -336,8 +322,6 @@ impl AgentSimulator for Agent {
             }
         }
 
-        // After revert, we're at a percept boundary (ready for next action)
-        self.is_last_update_percept = true;
     }
 
     fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn AgentSimulator> {

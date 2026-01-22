@@ -87,44 +87,35 @@ The `infotheory` binary provides a powerful interface for file analysis.
 ./infotheory aixi conf/kuhn_poker.json
 ```
 
-### AIXI Agent Mode (VM via libvirt + SSH)
+### AIXI Agent Mode (VM via Nyx-Lite)
 ```bash
-# VM-backed environment using libvirt + SSH
+# VM-backed environment using high-performance Firecracker (Nyx-Lite)
 ./infotheory aixi aixi_confs/vm_example.json
-
-# VM-backed environment with trace-entropy reward
-./infotheory aixi aixi_confs/vm_trace_example.json
 ```
 
-VM config highlights (see `aixi_confs/vm_example.json` for a full reference):
-- `vm_config.domain`, `vm_config.snapshot`, `vm_config.transport` control libvirt lifecycle; use `transport: "ssh"` for SSH-only operation.
-- `vm_config.ssh` configures SSH (host, port, user, password/key) and the per-action command to run in the guest.
-- `vm_config.auto_snapshot` enables automatic snapshot creation when missing, after provisioning steps run.
-- `vm_config.ssh.provision_steps` is a dockerfile-like list of `run`, `upload`, or `script` steps executed via SSH before snapshot creation.
-- `vm_config.stats_backend` selects the rate backend used for info-theoretic scoring (entropy, novelty). If omitted, it defaults to the agent algorithm settings.
-- `vm_protocol` optionally defines a line-based wire protocol (`OBS`, `REW`, `DATA`) if your SSH command emits structured output.
-- `vm_actions` can be literal payloads or `fuzz` mutators with seeds and dictionaries; for SSH, payloads are sent to stdin when `vm_config.ssh.action_command.stdin_payload=true`.
-- `vm_reward` supports guest-provided rewards, pattern matches, entropy-reduction, or trace-entropy signals.
-- `vm_trace` can pull trace bytes via `ssh` command output when `vm_reward.mode = "trace-entropy"` (see `aixi_confs/vm_trace_example.json`).
-  - Example: `vm_trace.mode = "ssh"` with `command = { "cmd": "cat", "args": ["/tmp/trace.bin"] }`.
-- `vm_observation` controls observation streams:
-  - `mode: "raw"` streams raw output bytes as observation symbols (no hashing).
-  - `stream_len` + `stream_mode` define fixed-length normalization for planning consistency.
-- `observation_stream_len` and `observation_key_mode` select how observation streams map to search-tree keys (`first`, `last`, `stream-hash`).
-- `discount_gamma` (optional) enables discounted UCT for long-horizon approximations.
+VM config highlights:
+- **Environment**: Use `"environment": "nyx-vm"` or `"vm"` (requires `vm` feature).
+- **Core Config**:
+  - `vm_config.kernel_image_path`: Path to `vmlinux` kernel.
+  - `vm_config.rootfs_image_path`: Path to `rootfs.ext4`.
+  - `vm_config.instance_id`: Unique ID for the VM instance.
+- **Performance**:
+  - `vm_config.shared_memory_policy`: Use `"snapshot"` for fast resets (fork-server style).
+  - `vm_config.observation_policy`: `"shared_memory"` for zero-copy observations.
+- **Rewards & Observations**:
+  - `vm_reward.mode`: `"guest"` (guest writes to specific address), `"pattern"`, or `"trace-entropy"`.
+  - `vm_observation.mode`: `"raw"` (bytes) or hash-based.
+  - `observation_stream_len`: **Critical** for planning consistency. Must match guest output.
 
-Tip: For raw text output, set `vm_observation.mode = "raw"` and `observation_bits = 8`, and choose a fixed `stream_len` to keep planning consistent.
-- `vm_filter` enables optional info-theoretic pruning gates (entropy / intrinsic dependence / novelty).
+**Prerequisites**:
+- Linux with KVM enabled (`/dev/kvm` accessible).
+- `vmlinux` kernel and `rootfs.ext4` image valid for Firecracker.
+- `nyx-lite` crate (included in workspace).
 
-Prerequisites:
-- libvirt daemon accessible via the configured `libvirt_uri` (uses the `virt` crate bindings).
-- Guest OS with SSH enabled (root login allowed for isolated VMs), and an IP/port reachable from the host.
-- libssh2 available for the `ssh2` crate (package name is usually `libssh2`).
-
-SSH setup quick notes:
-- Enable root SSH login (isolated VM), or use a dedicated user and set `vm_config.ssh.user`.
-- Set `vm_config.ssh.action_command` to the command you want each action to run; when `stdin_payload=true`, the fuzzed bytes are piped to stdin.
-- Use `vm_config.ssh.provision_steps` to install packages, add users, and copy scripts before auto-snapshot creation.
+**Setup**:
+1. Ensure you have the `vmlinux-6.1.58` kernel in the project root (or update config).
+2. Ensure `nyx-lite/vm_image/dockerimage/rootfs.ext4` exists or provide your own.
+3. Enable the feature: `cargo build --release --features vm`.
 
 ---
 

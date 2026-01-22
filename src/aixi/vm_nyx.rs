@@ -304,20 +304,6 @@ pub enum NyxRewardPolicy {
         base_reward: i64,
         bonus_reward: i64,
     },
-    /// Entropy reduction vs baseline.
-    EntropyReduction {
-        baseline_bytes: Vec<u8>,
-        max_order: i64,
-        scale: f64,
-        crash_bonus: Option<i64>,
-        timeout_bonus: Option<i64>,
-    },
-    /// Entropy of trace data (online learning).
-    TraceEntropy {
-        max_order: i64,
-        scale: f64,
-        normalize: bool,
-    },
     /// Custom reward function (callback-based).
     Custom(Arc<dyn Fn(&NyxStepResult) -> Reward + Send + Sync>),
 }
@@ -354,30 +340,6 @@ impl std::fmt::Debug for NyxRewardPolicy {
                 .field("pattern", pattern)
                 .field("base_reward", base_reward)
                 .field("bonus_reward", bonus_reward)
-                .finish(),
-            Self::EntropyReduction {
-                baseline_bytes,
-                max_order,
-                scale,
-                crash_bonus,
-                timeout_bonus,
-            } => f
-                .debug_struct("EntropyReduction")
-                .field("baseline_bytes_len", &baseline_bytes.len())
-                .field("max_order", max_order)
-                .field("scale", scale)
-                .field("crash_bonus", crash_bonus)
-                .field("timeout_bonus", timeout_bonus)
-                .finish(),
-            Self::TraceEntropy {
-                max_order,
-                scale,
-                normalize,
-            } => f
-                .debug_struct("TraceEntropy")
-                .field("max_order", max_order)
-                .field("scale", scale)
-                .field("normalize", normalize)
                 .finish(),
             Self::Custom(_) => write!(f, "Custom(<fn>)"),
         }
@@ -498,6 +460,7 @@ pub struct NyxVmConfig {
     // Crash logging
     /// Path to log crashes/interesting behaviors (JSONL format).
     pub crash_log: Option<String>,
+
 }
 
 impl Default for NyxVmConfig {
@@ -814,44 +777,8 @@ impl NyxVmEnvironment {
         // Create the VM
         let vm = NyxVM::new(config.instance_id.clone(), &fc_config);
 
-        // Derive effective reward shaping (separate from canonical reward policy)
-        if matches!(
-            config.reward_policy,
-            NyxRewardPolicy::EntropyReduction { .. } | NyxRewardPolicy::TraceEntropy { .. }
-        ) && config.reward_shaping.is_some()
-        {
-            eprintln!(
-                "Warning: reward_policy uses shaping while reward_shaping is set; reward_policy shaping will be ignored."
-            );
-        }
-        let mut reward_shaping = config.reward_shaping.clone();
-        if reward_shaping.is_none() {
-            reward_shaping = match &config.reward_policy {
-                NyxRewardPolicy::EntropyReduction {
-                    baseline_bytes,
-                    max_order,
-                    scale,
-                    crash_bonus,
-                    timeout_bonus,
-                } => Some(NyxRewardShaping::EntropyReduction {
-                    baseline_bytes: baseline_bytes.clone(),
-                    max_order: *max_order,
-                    scale: *scale,
-                    crash_bonus: *crash_bonus,
-                    timeout_bonus: *timeout_bonus,
-                }),
-                NyxRewardPolicy::TraceEntropy {
-                    max_order,
-                    scale,
-                    normalize,
-                } => Some(NyxRewardShaping::TraceEntropy {
-                    max_order: *max_order,
-                    scale: *scale,
-                    normalize: *normalize,
-                }),
-                _ => None,
-            };
-        }
+        // Initialize reward shaping
+        let reward_shaping = config.reward_shaping.clone();
 
         if matches!(reward_shaping, Some(NyxRewardShaping::TraceEntropy { .. }))
             && config.trace.is_none()
@@ -1361,6 +1288,14 @@ impl NyxVmEnvironment {
         None
     }
 
+    fn wrap_action_payload(&self, payload: &[u8]) -> Vec<u8> {
+        let p = &self.config.protocol;
+        let mut wrapped = p.action_prefix.clone().into_bytes();
+        wrapped.extend_from_slice(p.wire_encoding.encode(payload).as_bytes());
+        wrapped.extend_from_slice(p.action_suffix.as_bytes());
+        wrapped
+    }
+
     fn compute_filter_metrics(&self, payload: &[u8], filter: &NyxActionFilter) -> (f64, f64, f64) {
         let h_marg = marginal_entropy_bytes(payload);
         let h_rate = if filter.max_order == 0 {
@@ -1401,7 +1336,6 @@ impl NyxVmEnvironment {
                     *base_reward
                 }
             }
-            NyxRewardPolicy::EntropyReduction { .. } | NyxRewardPolicy::TraceEntropy { .. } => 0,
             NyxRewardPolicy::Custom(f) => f(result),
         };
 
@@ -1685,7 +1619,8 @@ impl Environment for NyxVmEnvironment {
         }
 
         // Run the step
-        let result = match self.run_step(&payload) {
+        let wrapped_payload = self.wrap_action_payload(&payload);
+        let result = match self.run_step(&wrapped_payload) {
             Ok(result) => result,
             Err(e) => {
                 if self.config.debug_mode {

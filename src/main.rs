@@ -33,15 +33,7 @@ use infotheory::aixi::agent::{Agent, AgentConfig};
 use infotheory::aixi::common::{ObservationKeyMode, RandomGenerator};
 use infotheory::aixi::environment::{
     BiasedRockPaperScissor, CoinFlip, CtwTest, Environment, ExtendedTiger, KuhnPoker,
-    ProcessEnvironment, TicTacToe,
-};
-#[cfg(feature = "vm")]
-use infotheory::aixi::vm::{
-    FuzzMutator, PayloadEncoding, ResourceApplyMode, VmActionFilter, VmActionSource, VmActionSpec,
-    VmConsoleConfig, VmEnvironment, VmEnvironmentConfig, VmFuzzConfig, VmHook, VmHooks,
-    VmObservationPolicy, VmObservationStreamMode, VmProtocolConfig, VmResourceLimits,
-    VmRewardPolicy, VmRewardShaping, VmSshCommand, VmSshConfig, VmSshProvisionStep, VmTraceConfig,
-    VmTraceFraming, VmTransport,
+    TicTacToe,
 };
 #[cfg(feature = "vm")]
 use infotheory::aixi::vm_nyx::{
@@ -93,150 +85,7 @@ fn parse_rwkv7_coder(v: &str) -> Option<rwkvzip::CoderType> {
     }
 }
 
-#[cfg(feature = "vm")]
-fn parse_vm_environment_config(
-    v: &serde_json::Value,
-    observation_bits: usize,
-    reward_bits: usize,
-    agent_horizon: usize,
-) -> anyhow::Result<VmEnvironmentConfig> {
-    let vm = &v["vm_config"];
-    if vm.is_null() {
-        return Err(anyhow::anyhow!("vm_config is required for environment=vm"));
-    }
 
-    let domain = vm["domain"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("vm_config.domain is required"))?
-        .to_string();
-    let snapshot = vm["snapshot"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("vm_config.snapshot is required"))?
-        .to_string();
-
-    let libvirt_uri = vm["libvirt_uri"].as_str().map(|s| s.to_string());
-    let ssh = parse_vm_ssh_config(if !vm["ssh"].is_null() {
-        &vm["ssh"]
-    } else {
-        &v["vm_ssh"]
-    })?;
-    let transport = parse_vm_transport(
-        vm["transport"]
-            .as_str()
-            .or_else(|| v["vm_transport"].as_str()),
-        ssh.is_some(),
-    );
-    let console = if transport == VmTransport::Serial {
-        Some(parse_vm_console_config(&vm["console"])?)
-    } else {
-        None
-    };
-    let protocol = parse_vm_protocol_config(if !vm["protocol"].is_null() {
-        &vm["protocol"]
-    } else {
-        &v["vm_protocol"]
-    });
-    let stats_backend = parse_vm_stats_backend(
-        if !vm["stats_backend"].is_null() {
-            &vm["stats_backend"]
-        } else {
-            &v["vm_stats_backend"]
-        },
-        v,
-    )?;
-    let trace = parse_vm_trace_config(if !vm["trace"].is_null() {
-        &vm["trace"]
-    } else {
-        &v["vm_trace"]
-    })?;
-    let action_source = parse_vm_actions(if !vm["actions"].is_null() {
-        &vm["actions"]
-    } else {
-        &v["vm_actions"]
-    })?;
-    let observation_policy = parse_vm_observation_policy(if !vm["observation"].is_null() {
-        &vm["observation"]
-    } else {
-        &v["vm_observation"]
-    });
-    let observation_stream_len =
-        parse_observation_stream_len_for_vm(if !vm["observation"].is_null() {
-            &vm["observation"]
-        } else {
-            &v["vm_observation"]
-        });
-    let observation_stream_mode =
-        parse_vm_observation_stream_mode(if !vm["observation"].is_null() {
-            &vm["observation"]
-        } else {
-            &v["vm_observation"]
-        });
-    let observation_stream_pad_byte =
-        parse_vm_observation_pad_byte(if !vm["observation"].is_null() {
-            &vm["observation"]
-        } else {
-            &v["vm_observation"]
-        });
-    let reward_policy = parse_vm_reward_policy(if !vm["reward"].is_null() {
-        &vm["reward"]
-    } else {
-        &v["vm_reward"]
-    })?;
-    let reward_shaping = if !vm["reward_shaping"].is_null() {
-        parse_vm_reward_shaping(&vm["reward_shaping"])?
-    } else if !v["vm_reward_shaping"].is_null() {
-        parse_vm_reward_shaping(&v["vm_reward_shaping"])?
-    } else if !vm["reward"].is_null() && !vm["reward"]["shaping"].is_null() {
-        parse_vm_reward_shaping(&vm["reward"]["shaping"])?
-    } else {
-        None
-    };
-    let step_cost = vm["step_cost"].as_i64().unwrap_or(1);
-    let episode_steps = vm["episode_steps"].as_u64().unwrap_or(agent_horizon as u64) as usize;
-    let action_filter = parse_vm_filter(
-        if !vm["filter"].is_null() {
-            &vm["filter"]
-        } else {
-            &v["vm_filter"]
-        },
-        step_cost,
-    )?;
-    let resource_limits = parse_vm_resource_limits(&vm["resource_limits"]);
-    let hooks = parse_vm_hooks(&vm["hooks"]);
-
-    Ok(VmEnvironmentConfig {
-        libvirt_uri,
-        domain,
-        snapshot,
-        transport,
-        console,
-        ssh,
-        protocol,
-        stats_backend,
-        trace,
-        auto_snapshot: vm["auto_snapshot"].as_bool().unwrap_or(true),
-        episode_steps,
-        step_cost,
-        debug_mode: vm["verbose"].as_bool().unwrap_or(false),
-        boot_ready: vm["boot_ready"].as_str().map(|s| s.to_string()),
-        boot_timeout_ms: vm["boot_timeout_ms"].as_u64().unwrap_or(30_000),
-        step_timeout_ms: vm["step_timeout_ms"].as_u64().unwrap_or(5_000),
-        max_response_lines: vm["max_response_lines"].as_u64().unwrap_or(128) as usize,
-        max_output_bytes: vm["max_output_bytes"].as_u64().unwrap_or(1_000_000) as usize,
-        observation_bits,
-        reward_bits,
-        observation_policy,
-        observation_stream_len,
-        observation_stream_mode,
-        observation_stream_pad_byte,
-        reward_policy,
-        reward_shaping,
-        action_source,
-        action_filter,
-        resource_limits,
-        hooks,
-    })
-}
 
 #[cfg(feature = "vm")]
 fn parse_shared_memory_policy(v: Option<&str>) -> SharedMemoryPolicy {
@@ -415,9 +264,17 @@ fn parse_vm_stats_backend(
                 .or_else(|| cfg["ct_depth"].as_u64())
                 .unwrap_or(32) as usize;
             let encoding_bits = cfg["encoding_bits"].as_u64().unwrap_or(8) as usize;
+            
+            // Fix: Default num_percept_bits to observation_bits + reward_bits if available,
+            // fallback to encoding_bits if not.
+            let obs_bits = root["observation_bits"].as_u64().unwrap_or(16);
+            let rew_bits = root["reward_bits"].as_u64().unwrap_or(8);
+            let default_percept_bits = obs_bits + rew_bits;
+
             let num_percept_bits = cfg["num_percept_bits"]
                 .as_u64()
-                .unwrap_or(encoding_bits as u64) as usize;
+                .unwrap_or(default_percept_bits) as usize;
+                
             Ok(RateBackend::FacCtw {
                 base_depth,
                 num_percept_bits,
@@ -462,378 +319,9 @@ fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBack
     }
 }
 
-#[cfg(feature = "vm")]
-fn parse_vm_console_config(v: &serde_json::Value) -> anyhow::Result<VmConsoleConfig> {
-    let path = v["socket_path"]
-        .as_str()
-        .or_else(|| v["path"].as_str())
-        .ok_or_else(|| anyhow::anyhow!("vm_config.console.socket_path is required"))?
-        .to_string();
-    let timeout_ms = v["timeout_ms"].as_u64().unwrap_or(5_000);
-    Ok(VmConsoleConfig {
-        socket_path: path,
-        timeout_ms,
-    })
-}
 
-#[cfg(feature = "vm")]
-fn parse_vm_protocol_config(v: &serde_json::Value) -> VmProtocolConfig {
-    let mut cfg = VmProtocolConfig::default();
-    if let Some(s) = v["action_prefix"].as_str() {
-        cfg.action_prefix = s.to_string();
-    }
-    if let Some(s) = v["action_suffix"].as_str() {
-        cfg.action_suffix = s.to_string();
-    }
-    if let Some(s) = v["obs_prefix"].as_str() {
-        cfg.obs_prefix = s.to_string();
-    }
-    if let Some(s) = v["rew_prefix"].as_str() {
-        cfg.rew_prefix = s.to_string();
-    }
-    if let Some(s) = v["done_prefix"].as_str() {
-        cfg.done_prefix = s.to_string();
-    }
-    if let Some(s) = v["data_prefix"].as_str() {
-        cfg.data_prefix = s.to_string();
-    }
-    if let Some(s) = v["wire_encoding"].as_str() {
-        if let Some(enc) = PayloadEncoding::from_str(s) {
-            cfg.wire_encoding = enc;
-        }
-    }
-    cfg
-}
 
-#[cfg(feature = "vm")]
-fn parse_nyx_protocol_config(v: &serde_json::Value) -> NyxProtocolConfig {
-    let mut cfg = NyxProtocolConfig::default();
-    if let Some(s) = v["action_prefix"].as_str() {
-        cfg.action_prefix = s.to_string();
-    }
-    if let Some(s) = v["action_suffix"].as_str() {
-        cfg.action_suffix = s.to_string();
-    }
-    if let Some(s) = v["obs_prefix"].as_str() {
-        cfg.obs_prefix = s.to_string();
-    }
-    if let Some(s) = v["rew_prefix"].as_str() {
-        cfg.rew_prefix = s.to_string();
-    }
-    if let Some(s) = v["done_prefix"].as_str() {
-        cfg.done_prefix = s.to_string();
-    }
-    if let Some(s) = v["data_prefix"].as_str() {
-        cfg.data_prefix = s.to_string();
-    }
-    if let Some(s) = v["wire_encoding"].as_str() {
-        if let Some(enc) = NyxPayloadEncoding::from_str(s) {
-            cfg.wire_encoding = enc;
-        }
-    }
-    cfg
-}
 
-#[cfg(feature = "vm")]
-fn parse_vm_transport(mode: Option<&str>, has_ssh: bool) -> VmTransport {
-    if let Some(mode) = mode {
-        if let Some(t) = VmTransport::from_str(mode) {
-            return t;
-        }
-    }
-    if has_ssh {
-        VmTransport::Ssh
-    } else {
-        VmTransport::Serial
-    }
-}
-
-#[cfg(feature = "vm")]
-fn parse_vm_ssh_command(v: &serde_json::Value) -> anyhow::Result<VmSshCommand> {
-    if let Some(cmd) = v.as_str() {
-        return Ok(VmSshCommand {
-            command: cmd.to_string(),
-            args: Vec::new(),
-            stdin_payload: false,
-            env: Vec::new(),
-            workdir: None,
-            run_as: None,
-        });
-    }
-    let command = v["cmd"]
-        .as_str()
-        .or_else(|| v["command"].as_str())
-        .ok_or_else(|| anyhow::anyhow!("ssh command requires cmd"))?
-        .to_string();
-    let args = v["args"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_else(Vec::new);
-    let stdin_payload = v["stdin_payload"].as_bool().unwrap_or(false);
-    let workdir = v["workdir"].as_str().map(|s| s.to_string());
-    let run_as = v["run_as"].as_str().map(|s| s.to_string());
-    let mut env = Vec::new();
-    if let Some(map) = v["env"].as_object() {
-        for (k, v) in map {
-            if let Some(val) = v.as_str() {
-                env.push((k.to_string(), val.to_string()));
-            }
-        }
-    }
-    Ok(VmSshCommand {
-        command,
-        args,
-        stdin_payload,
-        env,
-        workdir,
-        run_as,
-    })
-}
-
-#[cfg(feature = "vm")]
-fn parse_vm_ssh_provision_steps(v: &serde_json::Value) -> anyhow::Result<Vec<VmSshProvisionStep>> {
-    let mut steps = Vec::new();
-    let Some(arr) = v.as_array() else {
-        return Ok(steps);
-    };
-    for item in arr {
-        if let Some(cmd) = item.as_str() {
-            steps.push(VmSshProvisionStep::Run {
-                command: VmSshCommand {
-                    command: cmd.to_string(),
-                    args: Vec::new(),
-                    stdin_payload: false,
-                    env: Vec::new(),
-                    workdir: None,
-                    run_as: None,
-                },
-            });
-            continue;
-        }
-        if let Some(run) = item.get("run") {
-            let command = if run.is_string() {
-                VmSshCommand {
-                    command: run.as_str().unwrap_or_default().to_string(),
-                    args: Vec::new(),
-                    stdin_payload: false,
-                    env: Vec::new(),
-                    workdir: None,
-                    run_as: None,
-                }
-            } else {
-                parse_vm_ssh_command(run)?
-            };
-            steps.push(VmSshProvisionStep::Run { command });
-            continue;
-        }
-        if let Some(upload) = item.get("upload") {
-            let local = upload["local"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("upload.local is required"))?
-                .to_string();
-            let remote = upload["remote"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("upload.remote is required"))?
-                .to_string();
-            let mode = upload["mode"]
-                .as_str()
-                .and_then(|m| u32::from_str_radix(m.trim_start_matches("0o"), 8).ok())
-                .or_else(|| upload["mode"].as_u64().map(|m| m as u32));
-            steps.push(VmSshProvisionStep::Upload {
-                local,
-                remote,
-                mode,
-            });
-            continue;
-        }
-        if let Some(upload) = item.get("upload_text") {
-            let remote = upload["remote"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("upload_text.remote is required"))?
-                .to_string();
-            let text = upload["text"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("upload_text.text is required"))?
-                .to_string();
-            let mode = upload["mode"]
-                .as_str()
-                .and_then(|m| u32::from_str_radix(m.trim_start_matches("0o"), 8).ok())
-                .or_else(|| upload["mode"].as_u64().map(|m| m as u32));
-            steps.push(VmSshProvisionStep::UploadText { remote, text, mode });
-            continue;
-        }
-        if let Some(script) = item.get("script") {
-            let local = script["local"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("script.local is required"))?
-                .to_string();
-            let remote = script["remote"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("script.remote is required"))?
-                .to_string();
-            let mode = script["mode"]
-                .as_str()
-                .and_then(|m| u32::from_str_radix(m.trim_start_matches("0o"), 8).ok())
-                .or_else(|| script["mode"].as_u64().map(|m| m as u32))
-                .or(Some(0o755));
-            steps.push(VmSshProvisionStep::RunScript {
-                local,
-                remote,
-                mode,
-            });
-            continue;
-        }
-    }
-    Ok(steps)
-}
-
-#[cfg(feature = "vm")]
-fn parse_vm_ssh_config(v: &serde_json::Value) -> anyhow::Result<Option<VmSshConfig>> {
-    if v.is_null() {
-        return Ok(None);
-    }
-    let host = v["host"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("vm_ssh.host is required"))?
-        .to_string();
-    let port = v["port"].as_u64().unwrap_or(22) as u16;
-    let user = v["user"].as_str().unwrap_or("root").to_string();
-    let password = v["password"].as_str().map(|s| s.to_string());
-    let private_key = v["private_key"].as_str().map(|s| s.to_string());
-    let public_key = v["public_key"].as_str().map(|s| s.to_string());
-    let passphrase = v["passphrase"].as_str().map(|s| s.to_string());
-    let connect_timeout_ms = v["connect_timeout_ms"].as_u64().unwrap_or(5_000);
-    let retry_interval_ms = v["retry_interval_ms"].as_u64().unwrap_or(500);
-    let action_command = parse_vm_ssh_command(&v["action_command"])?;
-    let action_commands = if v["action_commands"].is_array() {
-        let mut list = Vec::new();
-        for item in v["action_commands"].as_array().unwrap_or(&vec![]) {
-            list.push(parse_vm_ssh_command(item)?);
-        }
-        Some(list)
-    } else {
-        None
-    };
-    let provision_steps_val = if !v["provision_steps"].is_null() {
-        &v["provision_steps"]
-    } else {
-        &v["provision"]["steps"]
-    };
-    let provision_steps = parse_vm_ssh_provision_steps(provision_steps_val)?;
-    let provision_always = v["provision_always"]
-        .as_bool()
-        .or_else(|| v["provision"]["always"].as_bool())
-        .unwrap_or(false);
-    let ready_command = if v["ready_command"].is_null() {
-        None
-    } else if v["ready_command"].is_string() {
-        Some(VmSshCommand {
-            command: v["ready_command"].as_str().unwrap_or("true").to_string(),
-            args: Vec::new(),
-            stdin_payload: false,
-            env: Vec::new(),
-            workdir: None,
-            run_as: None,
-        })
-    } else {
-        Some(parse_vm_ssh_command(&v["ready_command"])?)
-    };
-
-    Ok(Some(VmSshConfig {
-        host,
-        port,
-        user,
-        password,
-        private_key,
-        public_key,
-        passphrase,
-        connect_timeout_ms,
-        retry_interval_ms,
-        action_command,
-        action_commands,
-        provision_steps,
-        provision_always,
-        ready_command,
-    }))
-}
-
-#[cfg(feature = "vm")]
-fn parse_vm_trace_config(v: &serde_json::Value) -> anyhow::Result<Option<VmTraceConfig>> {
-    if v.is_null() {
-        return Ok(None);
-    }
-
-    let max_bytes = v["max_bytes"].as_u64().unwrap_or(1_000_000) as usize;
-    let reset_on_episode = v["reset_on_episode"].as_bool().unwrap_or(false);
-    let mode = v["mode"].as_str().unwrap_or("socket");
-    let ssh_command = if mode == "ssh" || !v["ssh_command"].is_null() {
-        let cmd_val = if v["ssh_command"].is_null() {
-            &v["command"]
-        } else {
-            &v["ssh_command"]
-        };
-        Some(parse_vm_ssh_command(cmd_val)?)
-    } else {
-        None
-    };
-
-    let (socket_path, timeout_ms, framing, encoding, line_prefix) = if ssh_command.is_some() {
-        (None, 0, VmTraceFraming::Len32Le, PayloadEncoding::Hex, None)
-    } else {
-        let socket_path = v["socket_path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("vm_trace.socket_path is required"))?
-            .to_string();
-        let timeout_ms = v["timeout_ms"].as_u64().unwrap_or(100);
-        let framing = match v["framing"].as_str().unwrap_or("len32le") {
-            "len32" | "len32le" | "length" => VmTraceFraming::Len32Le,
-            "line" => VmTraceFraming::Line,
-            other => {
-                return Err(anyhow::anyhow!(
-                    "vm_trace.framing must be len32le or line (got {})",
-                    other
-                ));
-            }
-        };
-        let encoding = match v["encoding"]
-            .as_str()
-            .or_else(|| v["wire_encoding"].as_str())
-            .unwrap_or("hex")
-        {
-            "hex" => PayloadEncoding::Hex,
-            "utf8" | "text" => PayloadEncoding::Utf8,
-            other => {
-                return Err(anyhow::anyhow!(
-                    "vm_trace.encoding must be utf8 or hex (got {})",
-                    other
-                ));
-            }
-        };
-        let line_prefix = v["line_prefix"].as_str().map(|s| s.to_string());
-        (
-            Some(socket_path),
-            timeout_ms,
-            framing,
-            encoding,
-            line_prefix,
-        )
-    };
-
-    Ok(Some(VmTraceConfig {
-        socket_path,
-        timeout_ms,
-        max_bytes,
-        framing,
-        encoding,
-        line_prefix,
-        reset_on_episode,
-        ssh_command,
-    }))
-}
 
 #[cfg(feature = "vm")]
 fn parse_nyx_trace_config(v: &serde_json::Value) -> anyhow::Result<Option<NyxTraceConfig>> {
@@ -864,88 +352,32 @@ fn parse_nyx_trace_config(v: &serde_json::Value) -> anyhow::Result<Option<NyxTra
 }
 
 #[cfg(feature = "vm")]
-fn parse_vm_actions(v: &serde_json::Value) -> anyhow::Result<VmActionSource> {
-    let mode = v["mode"].as_str().unwrap_or("literal");
-    match mode {
-        "fuzz" => {
-            let fuzz = if v["fuzz"].is_null() { v } else { &v["fuzz"] };
-            let seed_encoding =
-                PayloadEncoding::from_str(fuzz["seed_encoding"].as_str().unwrap_or("utf8"))
-                    .unwrap_or(PayloadEncoding::Utf8);
-            let mut seeds = Vec::new();
-            if let Some(arr) = fuzz["seed_paths"].as_array() {
-                for item in arr {
-                    if let Some(path) = item.as_str() {
-                        let data = std::fs::read(path)?;
-                        seeds.push(data);
-                    }
-                }
-            }
-            if let Some(arr) = fuzz["seed_inputs"].as_array() {
-                for item in arr {
-                    if let Some(text) = item.as_str() {
-                        seeds.push(seed_encoding.decode(text)?);
-                    }
-                }
-            }
-
-            let mut mutators = Vec::new();
-            if let Some(arr) = fuzz["mutators"].as_array() {
-                for item in arr {
-                    if let Some(name) = item.as_str() {
-                        if let Some(m) = parse_fuzz_mutator(name) {
-                            mutators.push(m);
-                        }
-                    }
-                }
-            }
-            let min_len = fuzz["min_len"].as_u64().unwrap_or(1) as usize;
-            let max_len = fuzz["max_len"].as_u64().unwrap_or(4096) as usize;
-            let dict_encoding =
-                PayloadEncoding::from_str(fuzz["dict_encoding"].as_str().unwrap_or("utf8"))
-                    .unwrap_or(PayloadEncoding::Utf8);
-            let mut dictionary = Vec::new();
-            if let Some(arr) = fuzz["dictionary"].as_array() {
-                for item in arr {
-                    if let Some(text) = item.as_str() {
-                        dictionary.push(dict_encoding.decode(text)?);
-                    }
-                }
-            }
-            let rng_seed = fuzz["rng_seed"].as_u64().unwrap_or(0);
-            Ok(VmActionSource::Fuzz(VmFuzzConfig {
-                seeds,
-                mutators,
-                min_len,
-                max_len,
-                dictionary,
-                rng_seed,
-            }))
-        }
-        _ => {
-            let mut actions = Vec::new();
-            if let Some(arr) = v["actions"].as_array() {
-                for item in arr {
-                    if let Some(text) = item.as_str() {
-                        let payload = PayloadEncoding::Utf8.decode(text)?;
-                        actions.push(VmActionSpec {
-                            name: None,
-                            payload,
-                        });
-                        continue;
-                    }
-                    let payload = item["payload"].as_str().unwrap_or_default();
-                    let encoding =
-                        PayloadEncoding::from_str(item["encoding"].as_str().unwrap_or("utf8"))
-                            .unwrap_or(PayloadEncoding::Utf8);
-                    let payload = encoding.decode(payload)?;
-                    let name = item["name"].as_str().map(|s| s.to_string());
-                    actions.push(VmActionSpec { name, payload });
-                }
-            }
-            Ok(VmActionSource::Literal(actions))
+fn parse_nyx_protocol_config(v: &serde_json::Value) -> NyxProtocolConfig {
+    let mut cfg = NyxProtocolConfig::default();
+    if let Some(s) = v["action_prefix"].as_str() {
+        cfg.action_prefix = s.to_string();
+    }
+    if let Some(s) = v["action_suffix"].as_str() {
+        cfg.action_suffix = s.to_string();
+    }
+    if let Some(s) = v["obs_prefix"].as_str() {
+        cfg.obs_prefix = s.to_string();
+    }
+    if let Some(s) = v["rew_prefix"].as_str() {
+        cfg.rew_prefix = s.to_string();
+    }
+    if let Some(s) = v["done_prefix"].as_str() {
+        cfg.done_prefix = s.to_string();
+    }
+    if let Some(s) = v["data_prefix"].as_str() {
+        cfg.data_prefix = s.to_string();
+    }
+    if let Some(s) = v["wire_encoding"].as_str() {
+        if let Some(enc) = NyxPayloadEncoding::from_str(s) {
+            cfg.wire_encoding = enc;
         }
     }
+    cfg
 }
 
 #[cfg(feature = "vm")]
@@ -1034,18 +466,7 @@ fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActionSource> {
 }
 
 #[cfg(feature = "vm")]
-fn parse_fuzz_mutator(name: &str) -> Option<FuzzMutator> {
-    match name {
-        "flip_bit" | "flipbit" => Some(FuzzMutator::FlipBit),
-        "flip_byte" | "flipbyte" => Some(FuzzMutator::FlipByte),
-        "insert" | "insert_byte" => Some(FuzzMutator::InsertByte),
-        "delete" | "delete_byte" => Some(FuzzMutator::DeleteByte),
-        "splice" | "splice_seed" => Some(FuzzMutator::SpliceSeed),
-        "reset" | "reset_seed" => Some(FuzzMutator::ResetSeed),
-        "havoc" => Some(FuzzMutator::Havoc),
-        _ => None,
-    }
-}
+
 
 #[cfg(feature = "vm")]
 fn parse_nyx_fuzz_mutator(name: &str) -> Option<NyxFuzzMutator> {
@@ -1058,15 +479,6 @@ fn parse_nyx_fuzz_mutator(name: &str) -> Option<NyxFuzzMutator> {
         "reset" | "reset_seed" => Some(NyxFuzzMutator::ResetSeed),
         "havoc" => Some(NyxFuzzMutator::Havoc),
         _ => None,
-    }
-}
-
-#[cfg(feature = "vm")]
-fn parse_vm_observation_policy(v: &serde_json::Value) -> VmObservationPolicy {
-    match v["mode"].as_str().unwrap_or("guest") {
-        "raw" | "raw-bytes" | "bytes" | "stream" => VmObservationPolicy::RawOutput,
-        "hash" | "output-hash" => VmObservationPolicy::OutputHash,
-        _ => VmObservationPolicy::FromGuest,
     }
 }
 
@@ -1098,7 +510,7 @@ fn parse_observation_key_mode_str(s: &str) -> ObservationKeyMode {
 }
 
 fn parse_observation_stream_len_for_env(v: &serde_json::Value, env_name: &str) -> usize {
-    if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" || env_name == "libvirt-vm" {
+    if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" {
         if v["vm_observation"].is_null() {
             parse_observation_stream_len(v)
         } else {
@@ -1110,7 +522,7 @@ fn parse_observation_stream_len_for_env(v: &serde_json::Value, env_name: &str) -
 }
 
 fn parse_observation_key_mode_for_env(v: &serde_json::Value, env_name: &str) -> ObservationKeyMode {
-    if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" || env_name == "libvirt-vm" {
+    if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" {
         if v["vm_observation"].is_null() {
             parse_observation_key_mode(v)
         } else {
@@ -1143,26 +555,12 @@ fn parse_observation_stream_len_for_vm(v: &serde_json::Value) -> usize {
 }
 
 #[cfg(feature = "vm")]
-fn parse_vm_observation_stream_mode(v: &serde_json::Value) -> VmObservationStreamMode {
-    match v["stream_mode"].as_str().unwrap_or("pad-truncate") {
-        "pad" => VmObservationStreamMode::Pad,
-        "truncate" => VmObservationStreamMode::Truncate,
-        _ => VmObservationStreamMode::PadTruncate,
-    }
-}
-
-#[cfg(feature = "vm")]
 fn parse_nyx_observation_stream_mode(v: &serde_json::Value) -> NyxObservationStreamMode {
     match v["stream_mode"].as_str().unwrap_or("pad-truncate") {
         "pad" => NyxObservationStreamMode::Pad,
         "truncate" => NyxObservationStreamMode::Truncate,
         _ => NyxObservationStreamMode::PadTruncate,
     }
-}
-
-#[cfg(feature = "vm")]
-fn parse_vm_observation_pad_byte(v: &serde_json::Value) -> u8 {
-    v["pad_byte"].as_u64().unwrap_or(0) as u8
 }
 
 #[cfg(feature = "vm")]
@@ -1209,7 +607,7 @@ fn validate_observation_config(
     if observation_stream_len == 0 {
         return Err(anyhow::anyhow!("observation_stream_len must be > 0"));
     }
-    if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" || env_name == "libvirt-vm" {
+    if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" {
         if let (Some(top_len), Some(vm_len)) = (
             extract_observation_stream_len_raw(v),
             extract_vm_observation_stream_len_raw(&v["vm_observation"]),
@@ -1250,82 +648,26 @@ fn validate_observation_config(
     Ok(())
 }
 
-#[cfg(feature = "vm")]
-fn parse_vm_reward_policy(v: &serde_json::Value) -> anyhow::Result<VmRewardPolicy> {
-    match v["mode"].as_str().unwrap_or("guest") {
-        "pattern" => {
-            let pattern = v["pattern"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("vm_reward.pattern is required"))?
-                .to_string();
-            let base_reward = v["base_reward"].as_i64().unwrap_or(0);
-            let bonus_reward = v["bonus_reward"].as_i64().unwrap_or(10);
-            Ok(VmRewardPolicy::Pattern {
-                pattern,
-                base_reward,
-                bonus_reward,
-            })
-        }
-        "entropy-reduction" | "entropy_reduction" => {
-            let baseline_path = v["baseline_path"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("vm_reward.baseline_path is required"))?;
-            let baseline_bytes = std::fs::read(baseline_path)?;
-            let max_order = v["max_order"].as_i64().unwrap_or(8);
-            let scale = v["scale"].as_f64().unwrap_or(10.0);
-            Ok(VmRewardPolicy::EntropyReduction {
-                baseline_bytes,
-                max_order,
-                scale,
-            })
-        }
-        "trace-entropy" | "trace_entropy" => {
-            let max_order = v["max_order"].as_i64().unwrap_or(8);
-            let scale = v["scale"].as_f64().unwrap_or(1.0);
-            let normalize = v["normalize"].as_bool().unwrap_or(false);
-            Ok(VmRewardPolicy::TraceEntropy {
-                max_order,
-                scale,
-                normalize,
-            })
-        }
-        _ => Ok(VmRewardPolicy::FromGuest),
+/// Validates that the actual observation stream length matches the configured value.
+///
+/// This is a hard error to prevent FAC-CTW bit cycling desynchronization.
+fn validate_obs_stream_len(expected: usize, actual: usize) -> anyhow::Result<()> {
+    if actual != expected {
+        return Err(anyhow::anyhow!(
+            "Observation stream length mismatch: config expects {} symbols, but environment returned {}. \
+            This causes FAC-CTW bit cycling desynchronization. \
+            Fix your `observation_stream_len` config or environment implementation.",
+            expected,
+            actual
+        ));
     }
+    Ok(())
 }
 
-#[cfg(feature = "vm")]
-fn parse_vm_reward_shaping(v: &serde_json::Value) -> anyhow::Result<Option<VmRewardShaping>> {
-    if v.is_null() {
-        return Ok(None);
-    }
-    match v["mode"].as_str().unwrap_or("none") {
-        "entropy-reduction" | "entropy_reduction" => {
-            let baseline_path = v["baseline_path"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("vm_reward_shaping.baseline_path is required"))?;
-            let baseline_bytes = std::fs::read(baseline_path)?;
-            let max_order = v["max_order"].as_i64().unwrap_or(8);
-            let scale = v["scale"].as_f64().unwrap_or(10.0);
-            Ok(Some(VmRewardShaping::EntropyReduction {
-                baseline_bytes,
-                max_order,
-                scale,
-            }))
-        }
-        "trace-entropy" | "trace_entropy" => {
-            let max_order = v["max_order"].as_i64().unwrap_or(8);
-            let scale = v["scale"].as_f64().unwrap_or(1.0);
-            let normalize = v["normalize"].as_bool().unwrap_or(false);
-            Ok(Some(VmRewardShaping::TraceEntropy {
-                max_order,
-                scale,
-                normalize,
-            }))
-        }
-        "none" | "off" => Ok(None),
-        _ => Ok(None),
-    }
-}
+
+
+
+
 
 #[cfg(feature = "vm")]
 fn parse_nyx_reward_policy(v: &serde_json::Value) -> anyhow::Result<NyxRewardPolicy> {
@@ -1341,33 +683,6 @@ fn parse_nyx_reward_policy(v: &serde_json::Value) -> anyhow::Result<NyxRewardPol
                 pattern,
                 base_reward,
                 bonus_reward,
-            })
-        }
-        "entropy-reduction" | "entropy_reduction" => {
-            let baseline_path = v["baseline_path"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("vm_reward.baseline_path is required"))?;
-            let baseline_bytes = std::fs::read(baseline_path)?;
-            let max_order = v["max_order"].as_i64().unwrap_or(8);
-            let scale = v["scale"].as_f64().unwrap_or(10.0);
-            let crash_bonus = v["crash_bonus"].as_i64();
-            let timeout_bonus = v["timeout_bonus"].as_i64();
-            Ok(NyxRewardPolicy::EntropyReduction {
-                baseline_bytes,
-                max_order,
-                scale,
-                crash_bonus,
-                timeout_bonus,
-            })
-        }
-        "trace-entropy" | "trace_entropy" => {
-            let max_order = v["max_order"].as_i64().unwrap_or(8);
-            let scale = v["scale"].as_f64().unwrap_or(1.0);
-            let normalize = v["normalize"].as_bool().unwrap_or(false);
-            Ok(NyxRewardPolicy::TraceEntropy {
-                max_order,
-                scale,
-                normalize,
             })
         }
         _ => Ok(NyxRewardPolicy::FromGuest),
@@ -1412,30 +727,7 @@ fn parse_nyx_reward_shaping(v: &serde_json::Value) -> anyhow::Result<Option<NyxR
     }
 }
 
-#[cfg(feature = "vm")]
-fn parse_vm_filter(
-    v: &serde_json::Value,
-    step_cost: i64,
-) -> anyhow::Result<Option<VmActionFilter>> {
-    if v.is_null() {
-        return Ok(None);
-    }
-    let novelty_prior = if let Some(path) = v["novelty_prior_path"].as_str() {
-        Some(std::fs::read(path)?)
-    } else {
-        None
-    };
-    let reject_reward = v["reject_reward"].as_i64().or_else(|| Some(-step_cost));
-    Ok(Some(VmActionFilter {
-        min_entropy: v["min_entropy"].as_f64(),
-        max_entropy: v["max_entropy"].as_f64(),
-        min_intrinsic_dependence: v["min_intrinsic_dependence"].as_f64(),
-        min_novelty: v["min_novelty"].as_f64(),
-        novelty_prior,
-        max_order: v["max_order"].as_i64().unwrap_or(8),
-        reject_reward,
-    }))
-}
+
 
 #[cfg(feature = "vm")]
 fn parse_nyx_filter(
@@ -1462,70 +754,7 @@ fn parse_nyx_filter(
     }))
 }
 
-#[cfg(feature = "vm")]
-fn parse_vm_resource_limits(v: &serde_json::Value) -> Option<VmResourceLimits> {
-    if v.is_null() {
-        return None;
-    }
-    let apply_mode = match v["apply_mode"].as_str().unwrap_or("both") {
-        "live" => ResourceApplyMode::Live,
-        "config" => ResourceApplyMode::Config,
-        _ => ResourceApplyMode::Both,
-    };
-    Some(VmResourceLimits {
-        vcpus: v["vcpus"].as_u64().map(|n| n as u32),
-        memory_mib: v["memory_mib"].as_u64(),
-        apply_mode,
-    })
-}
 
-#[cfg(feature = "vm")]
-fn parse_vm_hooks(v: &serde_json::Value) -> VmHooks {
-    let mut hooks = VmHooks::default();
-    hooks.pre_revert = parse_vm_hook_list(&v["pre_revert"]);
-    hooks.post_revert = parse_vm_hook_list(&v["post_revert"]);
-    hooks
-}
-
-#[cfg(feature = "vm")]
-fn parse_vm_hook_list(v: &serde_json::Value) -> Vec<VmHook> {
-    let mut hooks = Vec::new();
-    if let Some(arr) = v.as_array() {
-        for item in arr {
-            if let Some(cmd) = item.as_str() {
-                hooks.push(VmHook {
-                    command: cmd.to_string(),
-                    args: Vec::new(),
-                });
-            } else if let Some(list) = item.as_array() {
-                if let Some(cmd) = list.get(0).and_then(|v| v.as_str()) {
-                    let args = list
-                        .iter()
-                        .skip(1)
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                    hooks.push(VmHook {
-                        command: cmd.to_string(),
-                        args,
-                    });
-                }
-            } else if let Some(cmd) = item["command"].as_str() {
-                let args = if let Some(arr) = item["args"].as_array() {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                hooks.push(VmHook {
-                    command: cmd.to_string(),
-                    args,
-                });
-            }
-        }
-    }
-    hooks
-}
 
 fn build_ctx(rate_backend: &str, ncd_backend: &str, method: Option<&str>) -> InfotheoryCtx {
     let rate_backend = match rate_backend {
@@ -2045,42 +1274,10 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         "biased-rock-paper-scissor" => Box::new(BiasedRockPaperScissor::new()),
         "kuhn-poker" => Box::new(KuhnPoker::new()),
         "external" => {
-            eprintln!(
-                "Warning: environment=external is deprecated and may be removed; prefer VM-based environments."
-            );
-            let ext = &v["external_config"];
-            let cmd = ext["command"].as_str().unwrap_or("/bin/bash");
-            let args: Vec<String> = ext["args"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .map(|a| a.as_str().unwrap_or_default().to_string())
-                .collect();
-            let actions: Vec<String> = ext["actions"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .map(|a| a.as_str().unwrap_or_default().to_string())
-                .collect();
-            let pattern = ext["reward_pattern"].as_str().map(|s| s.to_string());
-            let step_cost = ext["step_cost"].as_u64().unwrap_or(1);
-            let step_timeout_ms = ext["step_timeout_ms"].as_u64().unwrap_or(1000);
-            let debug_mode = ext["verbose"].as_bool().unwrap_or(false);
-
-            let observation_bits = v["observation_bits"].as_u64().unwrap_or(1) as usize;
-            let reward_bits = v["reward_bits"].as_u64().unwrap_or(1) as usize;
-
-            Box::new(ProcessEnvironment::new(
-                cmd,
-                &args,
-                actions,
-                observation_bits,
-                reward_bits,
-                pattern,
-                step_cost,
-                Duration::from_millis(step_timeout_ms),
-                debug_mode,
-            )?)
+            return Err(anyhow::anyhow!(
+                "environment=external (ProcessEnvironment) has been removed for security reasons. \
+                Use NyxVmEnvironment with --features vm for secure sandboxed environments."
+            ));
         }
         "vm" | "nyx" | "nyx-vm" => {
             #[cfg(not(feature = "vm"))]
@@ -2099,23 +1296,6 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
                 Box::new(NyxVmEnvironment::new(vm_cfg)?)
             }
         }
-        "libvirt-vm" => {
-            #[cfg(not(feature = "vm"))]
-            {
-                return Err(anyhow::anyhow!(
-                    "libvirt VM environments require the `vm` feature (enable with --features vm)"
-                ));
-            }
-            #[cfg(feature = "vm")]
-            {
-                let observation_bits = v["observation_bits"].as_u64().unwrap_or(16) as usize;
-                let reward_bits = v["reward_bits"].as_u64().unwrap_or(8) as usize;
-                let agent_horizon = v["agent_horizon"].as_u64().unwrap_or(3) as usize;
-                let vm_cfg =
-                    parse_vm_environment_config(&v, observation_bits, reward_bits, agent_horizon)?;
-                Box::new(VmEnvironment::new(vm_cfg)?)
-            }
-        }
         _ => return Err(anyhow::anyhow!("Unknown environment: {}", env_name)),
     };
 
@@ -2128,7 +1308,9 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             .as_u64()
             .or_else(|| v["terminate-lifetime"].as_u64())
             .unwrap_or(1000) as usize;
+        let observation_stream_len = parse_observation_stream_len_for_env(&v, env_name);
         let mut obs_stream = env.drain_observations();
+        validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
         let mut obs = obs_stream.first().copied().unwrap_or(0);
         let mut rew = env.get_reward();
         let start = Instant::now();
@@ -2138,6 +1320,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             }
             env.perform_action(0);
             obs_stream = env.drain_observations();
+            validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
             obs = obs_stream.first().copied().unwrap_or(0);
             rew = env.get_reward();
         }
@@ -2217,6 +1400,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     let mut total_reward = 0;
     let mut prev_action = 0;
     let mut obs_stream = env.drain_observations();
+    validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
     let mut obs_repr = agent.observation_repr_from_stream(&obs_stream);
     let mut rew = env.get_reward();
 
@@ -2248,6 +1432,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         agent.model_update_action_external(action);
         env.perform_action(action);
         obs_stream = env.drain_observations();
+        validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
         obs_repr = agent.observation_repr_from_stream(&obs_stream);
         rew = env.get_reward();
         prev_action = action;
@@ -2277,6 +1462,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             agent.model_update_action_external(action);
             env.perform_action(action);
             obs_stream = env.drain_observations();
+            validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
             obs_repr = agent.observation_repr_from_stream(&obs_stream);
             rew = env.get_reward();
             prev_action = action;

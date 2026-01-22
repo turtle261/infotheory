@@ -9,20 +9,17 @@
 //! Veness et al., which uses Monte Carlo Tree Search (MCTS) to approximate
 //! the optimal policy.
 //!
-//! ## VM Backends
+//! ## VM Backend
 //!
-//! Two VM environment backends are available:
+//! A high-performance Firecracker-based VM environment is available via the `vm` feature:
 //!
-//! - **vm**: Original libvirt-based implementation (requires libvirt/QEMU)
-//! - **vm_nyx**: High-performance Firecracker-based implementation using nyx-lite
-//!   (10,000+ resets/second, requires KVM)
+//! - **NyxVmEnvironment**: Uses nyx-lite for 10,000+ resets/second (requires KVM).
+
 
 pub mod agent;
 pub mod common;
 pub mod environment;
 pub mod mcts;
 pub mod model;
-#[cfg(feature = "vm")]
-pub mod vm;
 #[cfg(feature = "vm")]
 pub mod vm_nyx;
