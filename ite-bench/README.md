@@ -36,7 +36,7 @@ The benchmark currently tests:
 4.  **Jensen-Shannon Divergence $D_{JS}(P||Q)$**
 5.  **Conditional Entropy $H(X|Y)$**
 6.  **Joint Entropy $H(X,Y)$**
-7.  **Cross-Entropy $H(P,Q)$** (Rust only)
+7.  **Cross-Entropy $H(P,Q)$** 
 
 ### Findings
 

@@ -99,12 +99,12 @@ private def runSuite : IO Bool := do
   let mut ok := true
   let tolMetric := ToleranceDefaults.defaults.metric
   -- NCD is only approximately a metric at finite sizes (compressor headers, non-idealities).
-  -- Use a more realistic tolerance for the NCD identity/symmetry checks.
+  -- 10% tolerance for identity checks, 5% for symmetry/triangle.
   let tolMetricNcd : MetricTolerances :=
     { tolMetric with
-        identity := 0.25
-        symmetry := 0.10
-        triangle := 0.15 }
+        identity := 0.10
+        symmetry := 0.05
+        triangle := 0.05 }
 
   for (idx, r) in regimes.toList.enum do
     IO.println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
