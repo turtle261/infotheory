@@ -2126,4 +2126,47 @@ mod tests {
         let out = m.generate(b"a", 10).unwrap();
         assert!(!out.is_empty());
     }
+
+    #[test]
+    fn tx_rollback_restores_sam_and_unigram_counts() {
+        let mut m = RosaPlus::new(4, false, 0, 123);
+        m.train_example(b"hello");
+        m.build_lm_full_bytes_no_finalize_endpos();
+
+        let base_text = m.sam.text.clone();
+        let base_text_len = m.sam.text.len();
+        let base_total_uni = m.lm.total_uni;
+        assert!(base_text_len > 0);
+
+        let mut tx = m.begin_tx();
+        m.train_example_tx(&mut tx, b"abc");
+        assert_eq!(m.lm.total_uni, base_total_uni + 3);
+        assert_eq!(m.sam.text.len(), base_text_len + 3);
+
+        m.rollback_tx(tx);
+        assert_eq!(m.sam.text, base_text);
+        assert_eq!(m.lm.total_uni, base_total_uni);
+    }
+
+    #[test]
+    fn checkpoint_restore_reverts_append_only_buffers() {
+        let mut m = RosaPlus::new(3, true, b'\n', 7);
+        m.train_example(b"aaaa");
+
+        let ck = m.checkpoint();
+        let base_text = m.sam.text.clone();
+        let base_states = m.sam.text_states.clone();
+        let base_boundary = m.sam.boundary_after.clone();
+        let base_last = m.sam.last;
+
+        m.train_example(b"bbbb");
+        assert_ne!(m.sam.text, base_text);
+
+        m.restore(&ck);
+        assert_eq!(m.sam.text, base_text);
+        assert_eq!(m.sam.text_states, base_states);
+        assert_eq!(m.sam.boundary_after, base_boundary);
+        assert_eq!(m.sam.last, base_last);
+        assert!(!m.lm_built);
+    }
 }

@@ -48,7 +48,11 @@ use nyx_lite::SharedMemoryPolicy;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, Read};
+#[cfg(feature = "vm")]
 use std::time::{Duration, Instant};
+
+#[cfg(not(feature = "vm"))]
+use std::time::Instant;
 
 mod search;
 

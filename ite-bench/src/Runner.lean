@@ -1,0 +1,204 @@
+import ITE.Types
+import ITE.Oracles
+import ITE.Verification
+import ITE.Estimators
+
+open ITE
+open Std
+open IO
+open System
+
+set_option maxRecDepth 2000
+
+namespace ITE
+
+private def ensureExecutable (path : FilePath) : IO Unit := do
+  if !(← path.pathExists) then
+    throw <| IO.userError s!"Missing required executable: {path}. Build the Rust workspace (e.g. `cargo build --release`) and re-run."
+
+private def randBytes (n : Nat) : IO ByteArray := do
+  let mut out := ByteArray.empty
+  for _ in [:n] do
+    let v ← IO.rand 0 255
+    out := out.push (UInt8.ofNat v)
+  return out
+
+private def mutateBytes (bytes : ByteArray) (nFlips : Nat) : IO ByteArray := do
+  if bytes.size == 0 then
+    return bytes
+  let mut out := bytes
+  for _ in [:nFlips] do
+    let idx ← IO.rand 0 (bytes.size - 1)
+    let v ← IO.rand 0 255
+    out := out.set! idx (UInt8.ofNat v)
+  return out
+
+/-- Triplet generator for metric checks on NCD-like quantities.
+
+We generate a base sequence `x`, then two slightly mutated variants `y` and `z`.
+This tends to make triangle/symmetry violations easier to detect if there are
+bugs (e.g. asymmetric concatenation, non-deterministic compression settings).
+-/
+private def ncdTripletGen (regime : DataRegime) : IO (SampleBundle × SampleBundle × SampleBundle) := do
+  let len := match regime.sampleSize with
+    | .tiny => 128
+    | .small => 512
+    | .medium => 2048
+    | .large => 8192
+    | .asymptotic => 16384
+
+  let base ← randBytes len
+  let flips := match regime.compressibility with
+    | .high | .structured => 1
+    | .medium => 4
+    | .low => 16
+    | .incompressible => 64
+
+  let y ← mutateBytes base flips
+  let z ← mutateBytes base flips
+
+  let bx : SampleBundle := { bytesX := some base }
+  let byBundle : SampleBundle := { bytesX := some y }
+  let bz : SampleBundle := { bytesX := some z }
+  return (bx, byBundle, bz)
+
+private def oracleGenFromOutcome (key : String) (outcome : OracleOutcome) : IO (SampleBundle × Float) := do
+  let some v := outcome.truths.find? key
+    | throw <| IO.userError s!"Missing oracle truth key: {key}"
+  return (outcome.bundle, v)
+
+private def runSuite : IO Bool := do
+  let est := infotheoryEstimator
+  ensureExecutable (FilePath.mk "../target/release/infotheory")
+
+  IO.println "╔══════════════════════════════════════════════════════════════╗"
+  IO.println "║    ITE Benchmark: Self-Contained Mathematical Validation     ║"
+  IO.println "╚══════════════════════════════════════════════════════════════╝"
+  IO.println ""
+  IO.println s!"[INIT] Estimator: {est.name}"
+  IO.println ""
+
+  let regimes : Array DataRegime := #[(
+    { sampleSize := .small
+      alphabetSize := .small
+      distribution := .uniform
+      dependence := .independent
+      dimensionality := .bivariate
+      compressibility := .medium
+      stationarity := .iid
+    }), (
+    { sampleSize := .medium
+      alphabetSize := .binary
+      distribution := .uniform
+      dependence := .independent
+      dimensionality := .bivariate
+      compressibility := .structured
+      stationarity := .iid
+    })]
+
+  let mut ok := true
+  let tolMetric := ToleranceDefaults.defaults.metric
+  -- NCD is only approximately a metric at finite sizes (compressor headers, non-idealities).
+  -- Use a more realistic tolerance for the NCD identity/symmetry checks.
+  let tolMetricNcd : MetricTolerances :=
+    { tolMetric with
+        identity := 0.25
+        symmetry := 0.10
+        triangle := 0.15 }
+
+  for (idx, r) in regimes.toList.enum do
+    IO.println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    IO.println s!"[REGIME {idx+1}] {repr r}"
+    IO.println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    -- Accuracy: independent uniform sources
+    let outcomeInd ← independentSourcesOracle.generate r 2000
+    let (bundleH, truthHX) ← oracleGenFromOutcome "H_X" outcomeInd
+    let (bundleMI, truthMI) ← oracleGenFromOutcome "I_XY" outcomeInd
+
+    let repHX ← verifyAccuracy est (fun _ => pure (bundleH, truthHX)) .shannonEntropy r 30
+    let repMI ← verifyAccuracy est (fun _ => pure (bundleMI, truthMI)) .mutualInformation r 30
+
+    let tolHX := ToleranceDefaults.defaults.quantity .shannonEntropy r
+    let tolMI := ToleranceDefaults.defaults.quantity .mutualInformation r
+
+    IO.println s!"[ACCURACY] H(X) MAE={repHX.mae} maxAbs={repHX.maxAbsError} (tol≈{tolHX})"
+    IO.println s!"[ACCURACY] I(X;Y) MAE={repMI.mae} maxAbs={repMI.maxAbsError} (tol≈{tolMI})"
+
+    if repHX.maxAbsError > 2.0 * tolHX then
+      ok := false
+      IO.println "[FAIL] H(X) exceeded tolerance"
+    if repMI.maxAbsError > 2.0 * tolMI then
+      ok := false
+      IO.println "[FAIL] I(X;Y) exceeded tolerance"
+
+    -- Inequalities: subadditivity + MI non-negativity (and data processing if Z present)
+    let viols ← verifyInequalities est (fun _ => pure outcomeInd.bundle) r 30 tolMetric.nonNegativity
+    if viols.isEmpty then
+      IO.println "[INEQ] PASS (no violations in trials)"
+    else
+      ok := false
+      IO.println s!"[INEQ] FAIL ({viols.size} violations)"
+      for v in viols do
+        IO.println s!"  - {repr v.id}: {v.details} (magnitude={v.magnitude})"
+
+    -- Conditional entropy: if Y = f(X) with f injective, then H(X|Y)=0.
+    -- Use identity so this is true for any discrete alphabet.
+    let detFn := fun (x : Float) => x
+    let outcomeDet ← (deterministicFunctionOracle detFn).generate r 1500
+    let (bundleCE, truthCE) ← oracleGenFromOutcome "H_X_given_Y" outcomeDet
+    let repCE ← verifyAccuracy est (fun _ => pure (bundleCE, truthCE)) .conditionalEntropy r 30
+    let tolCE := ToleranceDefaults.defaults.quantity .conditionalEntropy r
+    IO.println s!"[ACCURACY] H(X|Y) MAE={repCE.mae} maxAbs={repCE.maxAbsError} (tol≈{tolCE})"
+    if repCE.maxAbsError > 2.0 * tolCE then
+      ok := false
+      IO.println "[FAIL] H(X|Y) exceeded tolerance"
+
+    -- Noisy channel: analytic MI
+    let outcomeCh ← (noisyChannelOracle 0.1).generate r 2500
+    let (bundleCh, truthCh) ← oracleGenFromOutcome "I_XY" outcomeCh
+    let repCh ← verifyAccuracy est (fun _ => pure (bundleCh, truthCh)) .mutualInformation r 30
+    let tolCh := ToleranceDefaults.defaults.quantity .mutualInformation r
+    IO.println s!"[ACCURACY] BSC(0.1) I(X;Y) MAE={repCh.mae} maxAbs={repCh.maxAbsError} (tol≈{tolCh})"
+    if repCh.maxAbsError > 2.0 * tolCh then
+      ok := false
+      IO.println "[FAIL] Channel MI exceeded tolerance"
+
+    -- Metric checks: NCD (Vitányi) should satisfy metric axioms within tolerance
+    IO.println "[METRIC] Checking NCD metric axioms..."
+    let metricRep ← verifyMetric est ncdTripletGen r 40 tolMetricNcd
+    let passRate (xs : Array MetricEntry) : Float :=
+      if xs.isEmpty then 1.0 else
+        Float.ofNat (xs.filter (·.passed)).size / Float.ofNat xs.size
+
+    let nnRate := passRate metricRep.nonNegativity
+    let idRate := passRate metricRep.identity
+    let symRate := passRate metricRep.symmetry
+    let triRate := passRate metricRep.triangle
+
+    IO.println s!"  non-negativity pass rate: {nnRate}"
+    IO.println s!"  identity pass rate:       {idRate}"
+    IO.println s!"  symmetry pass rate:       {symRate}"
+    IO.println s!"  triangle pass rate:       {triRate}"
+
+    if nnRate < 0.99 || idRate < 0.90 || symRate < 0.90 || triRate < 0.80 then
+      ok := false
+      IO.println "[FAIL] Metric axiom pass-rates too low"
+
+    IO.println ""
+
+  return ok
+
+end ITE
+
+
+def main (_args : List String) : IO UInt32 := do
+  let ok ← ITE.runSuite
+  if ok then
+    IO.println "[OK] ite-bench validation suite passed"
+    return 0
+  else
+    IO.println "[FAIL] ite-bench validation suite failed"
+    return 2
+
+

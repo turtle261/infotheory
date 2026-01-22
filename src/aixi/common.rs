@@ -218,3 +218,63 @@ pub fn decode_reward_offset(symlist: &[Symbol], bits: usize, offset: i64) -> i64
     let v = decode(symlist, bits) as i64;
     v - offset
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observation_repr_full_stream_is_identity() {
+        let obs = vec![1u64, 2u64, 3u64];
+        let repr = observation_repr_from_stream(ObservationKeyMode::FullStream, &obs, 8);
+        assert_eq!(repr, obs);
+    }
+
+    #[test]
+    fn observation_key_first_last() {
+        let obs = vec![10u64, 20u64, 30u64];
+        assert_eq!(
+            observation_key_from_stream(ObservationKeyMode::First, &obs, 8),
+            10
+        );
+        assert_eq!(
+            observation_key_from_stream(ObservationKeyMode::Last, &obs, 8),
+            30
+        );
+
+        let empty: Vec<PerceptVal> = vec![];
+        assert_eq!(
+            observation_key_from_stream(ObservationKeyMode::First, &empty, 8),
+            0
+        );
+        assert_eq!(
+            observation_key_from_stream(ObservationKeyMode::Last, &empty, 8),
+            0
+        );
+    }
+
+    #[test]
+    fn observation_key_stream_hash_masks_and_mix() {
+        // observation_bits=3 => mask=0b111
+        // obs[0]=9 -> 1; h=0.rotate_left(7)^1 = 1
+        // obs[1]=2 -> 2; h=1.rotate_left(7)^2 = 128^2 = 130
+        let obs = vec![9u64, 2u64];
+        let h = observation_key_from_stream(ObservationKeyMode::StreamHash, &obs, 3);
+        assert_eq!(h, 130);
+    }
+
+    #[test]
+    fn observation_key_stream_hash_observation_bits_zero_is_zero() {
+        let obs = vec![123u64, 456u64, 789u64];
+        let h = observation_key_from_stream(ObservationKeyMode::StreamHash, &obs, 0);
+        assert_eq!(h, 0);
+    }
+
+    #[test]
+    fn observation_key_stream_hash_observation_bits_ge_64_uses_full_u64() {
+        let obs = vec![u64::MAX, 0x0123_4567_89ab_cdef];
+        let h1 = observation_key_from_stream(ObservationKeyMode::StreamHash, &obs, 64);
+        let h2 = observation_key_from_stream(ObservationKeyMode::StreamHash, &obs, 128);
+        assert_eq!(h1, h2);
+    }
+}

@@ -850,4 +850,24 @@ mod tests {
         let c2 = crc32(b"World");
         assert_ne!(c1, c2);
     }
+
+    #[test]
+    fn test_crc32_known_vector() {
+        // Standard CRC-32 (ISO-HDLC) test vector.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn test_header_rejects_invalid_magic() {
+        let mut buf = Vec::new();
+        let header = Header::new(CoderType::AC, 1, 2);
+        header.write(&mut buf).unwrap();
+        // Corrupt magic.
+        buf[0] ^= 0xFF;
+
+        let mut cursor = Cursor::new(&buf);
+        let err = Header::read(&mut cursor).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Invalid magic number"));
+    }
 }

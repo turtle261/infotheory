@@ -519,3 +519,164 @@ impl SearchTree {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aixi::common::ObservationKeyMode;
+
+    #[derive(Clone)]
+    struct DummyAgent {
+        obs_bits: usize,
+        rew_bits: usize,
+        horizon: usize,
+        min_reward: Reward,
+        max_reward: Reward,
+        key_mode: ObservationKeyMode,
+    }
+
+    impl DummyAgent {
+        fn new(obs_bits: usize, key_mode: ObservationKeyMode) -> Self {
+            Self {
+                obs_bits,
+                rew_bits: 8,
+                horizon: 5,
+                min_reward: -1,
+                max_reward: 1,
+                key_mode,
+            }
+        }
+    }
+
+    impl AgentSimulator for DummyAgent {
+        fn get_num_actions(&self) -> usize {
+            4
+        }
+
+        fn get_num_observation_bits(&self) -> usize {
+            self.obs_bits
+        }
+
+        fn observation_key_mode(&self) -> ObservationKeyMode {
+            self.key_mode
+        }
+
+        fn get_num_reward_bits(&self) -> usize {
+            self.rew_bits
+        }
+
+        fn horizon(&self) -> usize {
+            self.horizon
+        }
+
+        fn max_reward(&self) -> Reward {
+            self.max_reward
+        }
+
+        fn min_reward(&self) -> Reward {
+            self.min_reward
+        }
+
+        fn model_update_action(&mut self, _action: Action) {}
+
+        fn gen_percept_and_update(&mut self, _bits: usize) -> u64 {
+            0
+        }
+
+        fn model_revert(&mut self, _steps: usize) {}
+
+        fn gen_range(&mut self, _end: usize) -> usize {
+            0
+        }
+
+        fn gen_f64(&mut self) -> f64 {
+            0.0
+        }
+
+        fn boxed_clone_with_seed(&self, _seed: u64) -> Box<dyn AgentSimulator> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn build_tree_with_key(
+        agent: &DummyAgent,
+        prev_act: u64,
+        prev_obs_stream: &[PerceptVal],
+        prev_rew: Reward,
+        kept_mean: f64,
+        kept_visits: u32,
+    ) -> SearchTree {
+        let mut old_root = SearchNode::new(false);
+        old_root.action_children.resize(prev_act as usize + 1, None);
+
+        let mut chance_child = SearchNode::new(true);
+        let mut kept = SearchNode::new(false);
+        kept.mean = kept_mean;
+        kept.visits = kept_visits;
+
+        let obs_repr = agent.observation_repr_from_stream(prev_obs_stream);
+        let key = PerceptOutcome {
+            observations: obs_repr,
+            reward: prev_rew,
+        };
+        chance_child.percept_children.insert(key, kept);
+
+        old_root.action_children[prev_act as usize] = Some(chance_child);
+        SearchTree {
+            root: Some(old_root),
+        }
+    }
+
+    #[test]
+    fn prune_tree_keeps_matching_subtree() {
+        let prev_act = 2u64;
+        let prev_obs_stream = vec![9u64, 2u64, 7u64];
+        let prev_rew: Reward = 3;
+
+        let mut agent = DummyAgent::new(3, ObservationKeyMode::FullStream);
+        let mut tree = build_tree_with_key(&agent, prev_act, &prev_obs_stream, prev_rew, 123.0, 7);
+
+        tree.prune_tree(&mut agent, &prev_obs_stream, prev_rew, prev_act);
+
+        let root = tree.root.as_ref().expect("root should exist");
+        assert!(!root.is_chance_node);
+        assert_eq!(root.mean, 123.0);
+        assert_eq!(root.visits, 7);
+    }
+
+    #[test]
+    fn prune_tree_resets_when_action_missing() {
+        let prev_act = 10u64;
+        let prev_obs_stream = vec![1u64];
+        let prev_rew: Reward = 0;
+
+        let mut agent = DummyAgent::new(1, ObservationKeyMode::FullStream);
+        let mut tree = SearchTree::new();
+
+        tree.prune_tree(&mut agent, &prev_obs_stream, prev_rew, prev_act);
+
+        let root = tree.root.as_ref().unwrap();
+        assert!(!root.is_chance_node);
+        assert_eq!(root.visits, 0);
+        assert_eq!(root.mean, 0.0);
+    }
+
+    #[test]
+    fn prune_tree_resets_when_percept_key_missing() {
+        let prev_act = 0u64;
+        let prev_obs_stream = vec![1u64, 2u64];
+        let prev_rew: Reward = 1;
+
+        let mut agent = DummyAgent::new(4, ObservationKeyMode::Last);
+
+        // Build tree keyed on a different reward so the percept key won't match.
+        let mut tree = build_tree_with_key(&agent, prev_act, &prev_obs_stream, prev_rew + 1, 9.0, 2);
+
+        tree.prune_tree(&mut agent, &prev_obs_stream, prev_rew, prev_act);
+
+        let root = tree.root.as_ref().unwrap();
+        assert!(!root.is_chance_node);
+        assert_eq!(root.visits, 0);
+        assert_eq!(root.mean, 0.0);
+    }
+}
