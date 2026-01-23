@@ -173,7 +173,8 @@ pub struct RosaPredictor {
 }
 
 impl RosaPredictor {
-    /// Creates a new `RosaPredictor` with the specified maximum Markov order.
+    /// Creates a new `RosaPredictor` with a maximum context length for the fallback LM.
+    /// Note: deterministic ROSA uses the full SAM and is not capped by `max_order`.
     pub fn new(max_order: i64) -> Self {
         // Seed and EOT
         let mut model = RosaPlus::new(max_order, false, 0, 42);
