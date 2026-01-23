@@ -1,0 +1,16 @@
+{
+  "environment": "coin-flip",
+  "algorithm": "fac-ctw",
+  "ct_depth": 16,
+  "agent_horizon": 2,
+  "observation_bits": 1,
+  "reward_bits": 1,
+  "agent_actions": 2,
+  "num_simulations": 120,
+  "exploration_exploitation_ratio": 1.0,
+  "explore_epsilon": 0.995,
+  "explore_gamma": 0.999,
+  "learn_cycles": 2000,
+  "eval_cycles": 200,
+  "log_every": 50
+}
