@@ -163,9 +163,9 @@ impl Predictor for FacCtwPredictor {
     }
 }
 
-/// A predictor using the ROSA (Record of Success Automaton) algorithm.
+/// A predictor using the ROSA-Plus (Rapid Online Suffix Automaton + Witten-Bell Smoother) algorithm.
 ///
-/// ROSA is a sub-quadratic suffix automaton based language model that
+/// ROSA is a (practically) sub-quadratic suffix automaton based language model that
 /// can handle very long contexts efficiently.
 pub struct RosaPredictor {
     model: RosaPlus,
