@@ -62,7 +62,13 @@ cargo build -p nyx-lite
 ```
 Note: some nyx-lite tests require `/dev/kvm` and VM image artifacts under `nyx-lite/vm_image`.
 
-
+### Additional notes
+Some tests/dependencies which may be optional in some cases but not all:
+- docker (for tests, or if you want to use it for rootfs generation)
+- cpio
+- wget (for tests, or to use the provided kernel. you can also use curl instead manually on the download_kernel.sh file )
+- cmake (for VM feature, firecracker needs it)
+- Lean4 (Toolchain Version 4.14.0)
 ---
 
 ## 💻 CLI Usage
