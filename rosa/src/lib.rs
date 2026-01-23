@@ -317,6 +317,13 @@ impl Sam {
 
         self.last = r;
         self.text_states.push(r);
+
+        // Maintain rightmost endpos online (ROSA deterministic predictor).
+        let mut v = r;
+        while v != -1 && self.st[v as usize].endpos < i {
+            self.st[v as usize].endpos = i;
+            v = self.st[v as usize].link;
+        }
     }
 
     fn mark_boundary(&mut self) {
@@ -573,6 +580,14 @@ impl Sam {
 
         self.last = r;
         self.text_states.push(r);
+
+        // Maintain rightmost endpos online (ROSA deterministic predictor).
+        let mut v = r;
+        while v != -1 && self.st[v as usize].endpos < i {
+            self.record_state_change(tx, v as usize);
+            self.st[v as usize].endpos = i;
+            v = self.st[v as usize].link;
+        }
     }
 
     fn mark_boundary_tx(&mut self, tx: &mut SamTx) {
@@ -1234,8 +1249,10 @@ impl RosaPlus {
         self.lm.unigram = counts.to_vec();
         self.lm.total_uni = counts.iter().sum();
         if self.lm.total_uni == 0 {
-            self.lm.unigram[b'\n' as usize] = 1;
-            self.lm.total_uni = 1;
+            for i in 0..256 {
+                self.lm.unigram[i] = 1;
+            }
+            self.lm.total_uni = 256;
         }
 
         // Counts
@@ -1270,6 +1287,15 @@ impl RosaPlus {
 
     /// Apply a training example and update LM counts incrementally (byte alphabet must be full 256).
     pub fn train_example_tx(&mut self, tx: &mut RosaTx, s: &[u8]) {
+        self.train_example_tx_impl(tx, s, true);
+    }
+
+    /// Apply a sequential update without inserting a boundary (continuous stream).
+    pub fn train_sequence_tx(&mut self, tx: &mut RosaTx, s: &[u8]) {
+        self.train_example_tx_impl(tx, s, false);
+    }
+
+    fn train_example_tx_impl(&mut self, tx: &mut RosaTx, s: &[u8], mark_boundary: bool) {
         if s.is_empty() {
             return;
         }
@@ -1292,7 +1318,9 @@ impl RosaPlus {
             tx.lm.uni_delta[b as usize] += 1;
             tx.lm.total_uni_add += 1;
         }
-        self.sam.mark_boundary_tx(&mut tx.sam);
+        if mark_boundary {
+            self.sam.mark_boundary_tx(&mut tx.sam);
+        }
 
         // LM must be built for scoring; we keep it built and update counts incrementally.
         // Extend ls for any new SAM states created by feeding.
@@ -1388,6 +1416,49 @@ impl RosaPlus {
     pub fn ensure_lm_built_no_finalize_endpos(&mut self) {
         if !self.lm_built {
             self.build_lm_no_finalize_endpos();
+        }
+    }
+
+    fn predictive_entropy_rate_order(data: &[u8], max_order: i64, seed: u64) -> f64 {
+        if data.len() < 2 {
+            return 0.0;
+        }
+        let num_chunks = 16;
+        let chunk_size = (data.len() + num_chunks - 1) / num_chunks;
+        let mut total_log_prob = 0.0f64;
+        let mut count = 0usize;
+
+        for i in 0..num_chunks {
+            let start = i * chunk_size;
+            let end = ((i + 1) * chunk_size).min(data.len());
+            if start >= end {
+                break;
+            }
+            if i == 0 {
+                continue;
+            }
+
+            let mut m = RosaPlus::new(max_order, false, 0, seed);
+            m.train_example(&data[..start]);
+            m.build_lm();
+            let mut v = m.sam.last;
+
+            for &b in &data[start..end] {
+                let sym_idx = m.lm.find_sym(b as u32);
+                let p = m.lm.prob_for_sym(&m.sam, max_order, v, sym_idx);
+                total_log_prob += p.log2();
+                count += 1;
+                v = m.sam.advance(v, b as u32);
+            }
+        }
+
+        if count == 0 {
+            let mut m = RosaPlus::new(max_order, false, 0, seed);
+            m.train_example(data);
+            m.build_lm();
+            m.cross_entropy(data)
+        } else {
+            -total_log_prob / (count as f64)
         }
     }
 
@@ -1647,65 +1718,30 @@ impl RosaPlus {
         result
     }
 
-    /// Compute the unbiased predictive entropy rate (bits per symbol) of the given data.
+    /// Compute the predictive entropy rate (bits per symbol) of the given data.
     ///
-    /// This uses a chunk-based prequential approach (training on past chunks to score the current one)
-    /// to eliminate the "in-sample bias" present in simple plugin estimators.
-    /// Complexity: O(N * Chunks) where Chunks is small (default 16).
+    /// Uses chunked prequential scoring (train on past chunks, score next chunk).
     pub fn predictive_entropy_rate(&mut self, data: &[u8]) -> f64 {
         if data.len() < 2 {
             return 0.0;
         }
-
-        self.sam = Sam::new(data.len());
-        self.lm_built = false;
-
-        let num_chunks = 16;
-        let chunk_size = (data.len() + num_chunks - 1) / num_chunks;
-
-        let mut total_log_prob = 0.0f64;
-        let mut count = 0usize;
-
-        for i in 0..num_chunks {
-            let start = i * chunk_size;
-            let end = ((i + 1) * chunk_size).min(data.len());
-            if start >= end {
-                break;
-            }
-
-            let chunk = &data[start..end];
-
-            if i > 0 {
-                self.build_lm();
-                // Context state at the start of this chunk is the last state of the previous chunk.
-                // text_states[start] is the state reached after feeding symbols 0..start-1.
-                let mut v = self.sam.text_states[start];
-
-                for &b in chunk {
-                    let ch = b as u32;
-                    let sym_idx = self.lm.find_sym(ch);
-                    let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
-                    total_log_prob += p.log2();
-                    count += 1;
-
-                    // Advance context
-                    v = self.sam.advance(v, ch);
+        if self.max_order < 0 {
+            let candidates: [i64; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
+            let mut best = f64::INFINITY;
+            for &mo in &candidates {
+                if mo as usize >= data.len() {
+                    continue;
+                }
+                let h = Self::predictive_entropy_rate_order(data, mo, self.seed);
+                if h < best {
+                    best = h;
                 }
             }
-
-            // Incremental training (adds to self.sam.text and updates structure)
-            for &b in chunk {
-                self.sam.feed(b as u32);
+            if best.is_finite() {
+                return best;
             }
         }
-
-        if count == 0 {
-            // Fallback if data is too small for chunking
-            self.build_lm();
-            self.entropy_rate_plugin_bytes(data)
-        } else {
-            -total_log_prob / (count as f64)
-        }
+        Self::predictive_entropy_rate_order(data, self.max_order, self.seed)
     }
 
     pub fn entropy_rate_cps(&mut self, cps: &[u32]) -> f64 {
@@ -1729,7 +1765,8 @@ impl RosaPlus {
             }
             let chunk = &cps[start..end];
             if i > 0 {
-                self.build_lm();
+                // Avoid endpos finalization since we continue mutating the SAM across chunks.
+                self.build_lm_no_finalize_endpos();
                 let mut v = self.sam.text_states[start];
                 for &ch in chunk {
                     let sym_idx = self.lm.find_sym(ch);

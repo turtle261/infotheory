@@ -643,7 +643,7 @@ impl TraceModel {
                 for &b in data {
                     let p = model.prob_for_last(b as u32).max(1e-12);
                     bits -= p.log2();
-                    model.train_example_tx(&mut tx, &[b]);
+                    model.train_sequence_tx(&mut tx, &[b]);
                 }
                 bits
             }

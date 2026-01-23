@@ -75,7 +75,7 @@ structure BenchmarkReport where
 
 /-- Decide falsification based on counts and thresholds. -/
 def decideFalsified (rules : FalsificationRules) (metricRate inequalityRate : Float)
-    (mae mape : Float) (maxAbs maxRel : Float) : Bool :=
+    (_mae _mape : Float) (maxAbs maxRel : Float) : Bool :=
   metricRate > rules.metricViolation.threshold
     ∨ inequalityRate > rules.inequalityViolation.threshold
     ∨ maxAbs > rules.oracleDivergenceAbs

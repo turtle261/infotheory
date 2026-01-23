@@ -193,7 +193,7 @@ impl Predictor for RosaPredictor {
         let byte = if sym { 1u8 } else { 0u8 };
 
         // train_example_tx updates the tx object and the model
-        self.model.train_example_tx(&mut tx, &[byte]);
+        self.model.train_sequence_tx(&mut tx, &[byte]);
         self.history.push(tx);
     }
 
@@ -204,8 +204,10 @@ impl Predictor for RosaPredictor {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let byte = if sym { 1u32 } else { 0u32 };
-        self.model.prob_for_last(byte)
+        let p0 = self.model.prob_for_last(0);
+        let p1 = self.model.prob_for_last(1);
+        let denom = (p0 + p1).max(1e-12);
+        if sym { p1 / denom } else { p0 / denom }
     }
 
     fn model_name(&self) -> String {

@@ -105,9 +105,10 @@ structure DataRegime where
 /-- Generic estimator parameters; kept agnostic to concrete implementations. -/
 structure EstimatorParams where
   scalars : HashMap String Float := HashMap.empty
+  strings : HashMap String String := HashMap.empty
   deriving Repr, Inhabited
 
-def defaultParams : EstimatorParams := { scalars := HashMap.empty }
+def defaultParams : EstimatorParams := { scalars := HashMap.empty, strings := HashMap.empty }
 
 /-- Data payload passed to estimators. Optional components let each estimator pick what it needs. -/
 structure SampleBundle where

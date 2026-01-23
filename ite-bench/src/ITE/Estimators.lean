@@ -125,14 +125,42 @@ def infotheoryEstimator (binPath : FilePath := FilePath.mk "../target/release/in
         match ← bundleToByteInputs bundle with
         | .error e => return .error e
         | .ok bytes =>
+          let params := _params
+          let paramString (k : String) : Option String :=
+            params.strings[k]?
+          let maxOrderStr : Option String :=
+            paramString "max_order"
+          let rateBackendStr := paramString "rate_backend"
+          let ncdBackendStr := paramString "ncd_backend"
+          let methodStr := paramString "method"
+
+          let withCommonFlags (args : Array String) : Array String :=
+            let args := match rateBackendStr with
+              | some rb => args.push "--rate-backend" |>.push rb
+              | none => args
+            let args := match ncdBackendStr with
+              | some nb => args.push "--ncd-backend" |>.push nb
+              | none => args
+            let args := match methodStr with
+              | some m => args.push "--method" |>.push m
+              | none => args
+            args
+
+          let withMaxOrder (args : Array String) : Array String :=
+            match maxOrderStr with
+            | some mo => args.push mo
+            | none => args
+
           let runUnary (primName : String) (path : FilePath) : IO (Except String Float) := do
-            let out ← IO.Process.output { cmd := binPath.toString, args := #[primName, path.toString] }
+            let args := withCommonFlags <| withMaxOrder #[primName, path.toString]
+            let out ← IO.Process.output { cmd := binPath.toString, args := args }
             if out.exitCode ≠ 0 then
               return .error s!"infotheory call failed: {out.stderr}"
             return parseFloatSimple out.stdout
 
           let runBinary (primName : String) (p1 p2 : FilePath) : IO (Except String Float) := do
-            let out ← IO.Process.output { cmd := binPath.toString, args := #[primName, p1.toString, p2.toString] }
+            let args := withCommonFlags <| withMaxOrder #[primName, p1.toString, p2.toString]
+            let out ← IO.Process.output { cmd := binPath.toString, args := args }
             if out.exitCode ≠ 0 then
               return .error s!"infotheory call failed: {out.stderr}"
             return parseFloatSimple out.stdout
@@ -149,4 +177,3 @@ def infotheoryEstimator (binPath : FilePath := FilePath.mk "../target/release/in
   }
 
 end ITE
-

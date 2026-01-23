@@ -7,21 +7,27 @@ This benchmark framework validates information-theoretic estimators against orac
 ## Test Results
 
 ### Rust Estimator (infotheory)
-✅ **7/7 tests passed**
+This suite now runs a **strict, broad validation matrix** across multiple regimes, oracles, and quantities.
+Failures are expected under strict tolerances and are treated as signals for estimator or model improvements.
 
-All quantities correctly estimated with compression-based methods:
+Covered quantities (non-exhaustive):
 - Shannon Entropy H(X)
 - Mutual Information I(X;Y)
-- KL Divergence D_KL
-- JS Divergence D_JS
 - Conditional Entropy H(X|Y)
 - Joint Entropy H(X,Y)
-- Cross-Entropy (Rust-only)
+- KL Divergence D_KL
+- JS Divergence D_JS
+- Cross-Entropy H(P,Q)
+- Total Variation Distance (TVD)
+- Normalized Entropy Distance (NED)
+- Normalized Transform Effort (NTE)
+- Entropy Rate H_rate
+- NCD metric axioms (Vitányi)
 
 ### External estimator dependencies
 None. This benchmark is intentionally self-contained.
 
-## Key Findings
+## Key Findings (Current Strict Run)
 
 ### 1. Estimator Methodology Differences
 
@@ -39,10 +45,11 @@ None. This benchmark is intentionally self-contained.
 
 ### 3. Information-Theoretic Properties Verified
 
-✓ **Non-negativity**: I(X;Y) ≥ 0, D_KL ≥ 0, H(X|Y) ≥ 0
+✓ **Non-negativity**: I(X;Y) ≥ 0, D_KL ≥ 0, H(X|Y) ≥ 0  
 ✓ **Divergence bounds**: 0 ≤ D_JS ≤ log(2)  
-✓ **Oracle accuracy**: Estimates within sample tolerance
-✓ **Subadditivity**: H(X,Y) ≤ H(X) + H(Y)
+✓ **Oracle accuracy**: Estimates within strict tolerance (may fail; intended)  
+✓ **Subadditivity / data processing**: H(X,Y) ≤ H(X)+H(Y), I(X;Z) ≤ I(X;Y)  
+✓ **Metric axioms**: NCD approximate non-negativity, identity, symmetry, triangle
 
 ## Framework Architecture
 
@@ -69,14 +76,14 @@ lake build runner
 ## Recommendations
 
 ### For Production Use
-- **Discrete/categorical data**: Rust infotheory
-- **Research/experimentation**: Rust (more robust)
+- **Discrete/categorical data**: Rust infotheory (marginal measures)
+- **Research/experimentation**: Use strict suite to identify estimator weaknesses
 
 ## Future Work
 
-1. Increase regime coverage (sample size, alphabet size, stationarity)
-2. Add deeper end-to-end tests for rate backends (ROSA/CTW/RWKV) and entropy-rate primitives
-3. Extend formal verification layer to cover more identities/inequalities and edge-cases
+1. Extend rate-backend coverage to RWKV and fac-CTW
+2. Increase regime diversity (mixtures, heavy tails, higher dimensionality)
+3. Tighten formal identities (NED equivalences, NTE bounds) with larger samples
 
 ## Technical Implementation
 

@@ -41,7 +41,6 @@ fn ctw_probabilities_valid() {
 }
 
 #[test]
-#[ignore = "Known bug: ROSA probability leakage"]
 fn rosa_probabilities_valid() {
     test_predictor_sum_to_one(Box::new(RosaPredictor::new(8)), "ROSA");
 }
@@ -86,7 +85,6 @@ fn ctw_update_revert_consistency() {
 }
 
 #[test]
-#[ignore = "Known bug: ROSA revert broken"]
 fn rosa_update_revert_consistency() {
     test_predictor_revert(Box::new(RosaPredictor::new(8)), "ROSA");
 }

@@ -63,9 +63,30 @@ private def ncdTripletGen (regime : DataRegime) : IO (SampleBundle × SampleBund
   return (bx, byBundle, bz)
 
 private def oracleGenFromOutcome (key : String) (outcome : OracleOutcome) : IO (SampleBundle × Float) := do
-  let some v := outcome.truths.find? key
+  let some v := outcome.truths[key]?
     | throw <| IO.userError s!"Missing oracle truth key: {key}"
   return (outcome.bundle, v)
+
+private def mkParams
+    (maxOrder : Option String := none)
+    (rateBackend : Option String := none)
+    (ncdBackend : Option String := none)
+    (method : Option String := none) : EstimatorParams :=
+  Id.run do
+    let mut strings := HashMap.empty
+    match maxOrder with
+    | some v => strings := strings.insert "max_order" v
+    | none => pure ()
+    match rateBackend with
+    | some v => strings := strings.insert "rate_backend" v
+    | none => pure ()
+    match ncdBackend with
+    | some v => strings := strings.insert "ncd_backend" v
+    | none => pure ()
+    match method with
+    | some v => strings := strings.insert "method" v
+    | none => pure ()
+    return { scalars := HashMap.empty, strings := strings }
 
 private def runSuite : IO Bool := do
   let est := infotheoryEstimator
@@ -94,10 +115,27 @@ private def runSuite : IO Bool := do
       dimensionality := .bivariate
       compressibility := .structured
       stationarity := .iid
+    }), (
+    { sampleSize := .large
+      alphabetSize := .small
+      distribution := .highlySkewed
+      dependence := .independent
+      dimensionality := .univariate
+      compressibility := .low
+      stationarity := .iid
+    }), (
+    { sampleSize := .large
+      alphabetSize := .binary
+      distribution := .structured
+      dependence := .moderate
+      dimensionality := .bivariate
+      compressibility := .structured
+      stationarity := .markov
     })]
 
   let mut ok := true
   let tolMetric := ToleranceDefaults.defaults.metric
+  let strictScale : Float := 0.5
   -- NCD is only approximately a metric at finite sizes (compressor headers, non-idealities).
   -- 10% tolerance for identity checks, 5% for symmetry/triangle.
   let tolMetricNcd : MetricTolerances :=
@@ -116,8 +154,9 @@ private def runSuite : IO Bool := do
     let (bundleH, truthHX) ← oracleGenFromOutcome "H_X" outcomeInd
     let (bundleMI, truthMI) ← oracleGenFromOutcome "I_XY" outcomeInd
 
-    let repHX ← verifyAccuracy est (fun _ => pure (bundleH, truthHX)) .shannonEntropy r 30
-    let repMI ← verifyAccuracy est (fun _ => pure (bundleMI, truthMI)) .mutualInformation r 30
+    let paramsMarg := mkParams (some "0")
+    let repHX ← verifyAccuracyWith est (fun _ => pure (bundleH, truthHX)) .shannonEntropy r paramsMarg 30
+    let repMI ← verifyAccuracyWith est (fun _ => pure (bundleMI, truthMI)) .mutualInformation r paramsMarg 30
 
     let tolHX := ToleranceDefaults.defaults.quantity .shannonEntropy r
     let tolMI := ToleranceDefaults.defaults.quantity .mutualInformation r
@@ -125,15 +164,15 @@ private def runSuite : IO Bool := do
     IO.println s!"[ACCURACY] H(X) MAE={repHX.mae} maxAbs={repHX.maxAbsError} (tol≈{tolHX})"
     IO.println s!"[ACCURACY] I(X;Y) MAE={repMI.mae} maxAbs={repMI.maxAbsError} (tol≈{tolMI})"
 
-    if repHX.maxAbsError > 2.0 * tolHX then
+    if repHX.maxAbsError > strictScale * tolHX then
       ok := false
       IO.println "[FAIL] H(X) exceeded tolerance"
-    if repMI.maxAbsError > 2.0 * tolMI then
+    if repMI.maxAbsError > strictScale * tolMI then
       ok := false
       IO.println "[FAIL] I(X;Y) exceeded tolerance"
 
     -- Inequalities: subadditivity + MI non-negativity (and data processing if Z present)
-    let viols ← verifyInequalities est (fun _ => pure outcomeInd.bundle) r 30 tolMetric.nonNegativity
+    let viols ← verifyInequalitiesWith est (fun _ => pure outcomeInd.bundle) r paramsMarg 30 tolMetric.nonNegativity
     if viols.isEmpty then
       IO.println "[INEQ] PASS (no violations in trials)"
     else
@@ -147,22 +186,145 @@ private def runSuite : IO Bool := do
     let detFn := fun (x : Float) => x
     let outcomeDet ← (deterministicFunctionOracle detFn).generate r 1500
     let (bundleCE, truthCE) ← oracleGenFromOutcome "H_X_given_Y" outcomeDet
-    let repCE ← verifyAccuracy est (fun _ => pure (bundleCE, truthCE)) .conditionalEntropy r 30
+    let repCE ← verifyAccuracyWith est (fun _ => pure (bundleCE, truthCE)) .conditionalEntropy r paramsMarg 30
     let tolCE := ToleranceDefaults.defaults.quantity .conditionalEntropy r
     IO.println s!"[ACCURACY] H(X|Y) MAE={repCE.mae} maxAbs={repCE.maxAbsError} (tol≈{tolCE})"
-    if repCE.maxAbsError > 2.0 * tolCE then
+    if repCE.maxAbsError > strictScale * tolCE then
       ok := false
       IO.println "[FAIL] H(X|Y) exceeded tolerance"
 
     -- Noisy channel: analytic MI
     let outcomeCh ← (noisyChannelOracle 0.1).generate r 2500
     let (bundleCh, truthCh) ← oracleGenFromOutcome "I_XY" outcomeCh
-    let repCh ← verifyAccuracy est (fun _ => pure (bundleCh, truthCh)) .mutualInformation r 30
+    let repCh ← verifyAccuracyWith est (fun _ => pure (bundleCh, truthCh)) .mutualInformation r paramsMarg 30
     let tolCh := ToleranceDefaults.defaults.quantity .mutualInformation r
     IO.println s!"[ACCURACY] BSC(0.1) I(X;Y) MAE={repCh.mae} maxAbs={repCh.maxAbsError} (tol≈{tolCh})"
-    if repCh.maxAbsError > 2.0 * tolCh then
+    if repCh.maxAbsError > strictScale * tolCh then
       ok := false
       IO.println "[FAIL] Channel MI exceeded tolerance"
+
+    -- Skewed categorical entropy
+    let outcomeSkew ← skewedCategoricalOracle.generate r 30000
+    let (bundleSkew, truthSkew) ← oracleGenFromOutcome "H_X" outcomeSkew
+    let repSkew ← verifyAccuracyWith est (fun _ => pure (bundleSkew, truthSkew)) .shannonEntropy r paramsMarg 20
+    let tolSkew := ToleranceDefaults.defaults.quantity .shannonEntropy r
+    IO.println s!"[ACCURACY] Skewed H(X) MAE={repSkew.mae} maxAbs={repSkew.maxAbsError} (tol≈{tolSkew})"
+    if repSkew.maxAbsError > strictScale * tolSkew then
+      ok := false
+      IO.println "[FAIL] Skewed H(X) exceeded tolerance"
+
+    -- Joint categorical: Hx, Hy, Hxy, MI, NED, NTE
+    let outcomeJoint ← jointCategoricalOracle.generate r 30000
+    let (bundleJX, truthJX) ← oracleGenFromOutcome "H_X" outcomeJoint
+    let (bundleJY, truthJY) ← oracleGenFromOutcome "H_Y" outcomeJoint
+    let (bundleJXY, truthJXY) ← oracleGenFromOutcome "H_XY" outcomeJoint
+    let (bundleJMI, truthJMI) ← oracleGenFromOutcome "I_XY" outcomeJoint
+    let (bundleJNED, truthJNED) ← oracleGenFromOutcome "NED" outcomeJoint
+    let (bundleJNTE, truthJNTE) ← oracleGenFromOutcome "NTE" outcomeJoint
+
+    let repJX ← verifyAccuracyWith est (fun _ => pure (bundleJX, truthJX)) .shannonEntropy r paramsMarg 20
+    let repJY ← verifyAccuracyWith est (fun _ => pure (bundleJY, truthJY)) .shannonEntropy r paramsMarg 20
+    let repJXY ← verifyAccuracyWith est (fun _ => pure (bundleJXY, truthJXY)) .jointEntropy r paramsMarg 20
+    let repJMI ← verifyAccuracyWith est (fun _ => pure (bundleJMI, truthJMI)) .mutualInformation r paramsMarg 20
+    let repJNED ← verifyAccuracyWith est (fun _ => pure (bundleJNED, truthJNED)) .ned r paramsMarg 20
+    let repJNTE ← verifyAccuracyWith est (fun _ => pure (bundleJNTE, truthJNTE)) .nte r paramsMarg 20
+
+    let tolJ := ToleranceDefaults.defaults.quantity .shannonEntropy r
+    if repJX.maxAbsError > strictScale * tolJ then
+      ok := false
+      IO.println "[FAIL] Joint H(X) exceeded tolerance"
+    if repJY.maxAbsError > strictScale * tolJ then
+      ok := false
+      IO.println "[FAIL] Joint H(Y) exceeded tolerance"
+    if repJXY.maxAbsError > strictScale * tolJ then
+      ok := false
+      IO.println "[FAIL] Joint H(X,Y) exceeded tolerance"
+    if repJMI.maxAbsError > strictScale * tolJ then
+      ok := false
+      IO.println "[FAIL] Joint MI exceeded tolerance"
+    if repJNED.maxAbsError > strictScale * tolJ then
+      ok := false
+      IO.println "[FAIL] NED exceeded tolerance"
+    if repJNTE.maxAbsError > strictScale * tolJ then
+      ok := false
+      IO.println "[FAIL] NTE exceeded tolerance"
+
+    -- KL / JS / TVD / Cross-Entropy
+    let outcomePair ← pairDistributionsOracle.generate r 40000
+    let (bundleKL, truthKL) ← oracleGenFromOutcome "D_KL" outcomePair
+    let (bundleJS, truthJS) ← oracleGenFromOutcome "D_JS" outcomePair
+    let (bundleTVD, truthTVD) ← oracleGenFromOutcome "TVD" outcomePair
+    let (bundleXE, truthXE) ← oracleGenFromOutcome "H_XE" outcomePair
+    let (_bundleHP, _truthHP) ← oracleGenFromOutcome "H_X" outcomePair
+
+    let repKL ← verifyAccuracyWith est (fun _ => pure (bundleKL, truthKL)) .klDivergence r paramsMarg 20
+    let repJS ← verifyAccuracyWith est (fun _ => pure (bundleJS, truthJS)) .jsDivergence r paramsMarg 20
+    let repTVD ← verifyAccuracyWith est (fun _ => pure (bundleTVD, truthTVD)) .tvd r paramsMarg 20
+    let repXE ← verifyAccuracyWith est (fun _ => pure (bundleXE, truthXE)) .crossEntropy r paramsMarg 20
+
+    let tolKL := ToleranceDefaults.defaults.quantity .klDivergence r
+    if repKL.maxAbsError > strictScale * tolKL then
+      ok := false
+      IO.println "[FAIL] KL exceeded tolerance"
+    if repJS.maxAbsError > strictScale * tolKL then
+      ok := false
+      IO.println "[FAIL] JS exceeded tolerance"
+    if repTVD.maxAbsError > strictScale * tolKL then
+      ok := false
+      IO.println "[FAIL] TVD exceeded tolerance"
+    if repXE.maxAbsError > strictScale * tolKL then
+      ok := false
+      IO.println "[FAIL] Cross-Entropy exceeded tolerance"
+
+    -- Sanity: cross-entropy >= entropy
+    let estXE ← runEstimateIO est .crossEntropy outcomePair.bundle paramsMarg
+    let estHP ← runEstimateIO est .shannonEntropy outcomePair.bundle paramsMarg
+    if estXE + 1e-9 < estHP then
+      ok := false
+      IO.println s!"[FAIL] Cross-entropy < entropy: {estXE} < {estHP}"
+
+    -- Entropy rate: binary Markov chain
+    let outcomeMarkov ← (binaryMarkovOracle 0.9 0.8).generate r 60000
+    let (bundleRate, truthRate) ← oracleGenFromOutcome "H_RATE" outcomeMarkov
+    let paramsRate := mkParams (some "-1")
+    let repRate ← verifyAccuracyWith est (fun _ => pure (bundleRate, truthRate)) .entropyRate r paramsRate 20
+    let tolRate := ToleranceDefaults.defaults.quantity .entropyRate r
+    IO.println s!"[ACCURACY] Markov H_rate MAE={repRate.mae} maxAbs={repRate.maxAbsError} (tol={tolRate}, strictScale={strictScale}, allowed={strictScale*tolRate})"
+    if repRate.maxAbsError > strictScale * tolRate then
+      ok := false
+      IO.println "[FAIL] Entropy rate exceeded tolerance"
+
+    -- Entropy rate with CTW backend and explicit depth
+    let paramsRateCtw := mkParams (some "-1") (some "ctw") none (some "16")
+    let repRateCtw ← verifyAccuracyWith est (fun _ => pure (bundleRate, truthRate)) .entropyRate r paramsRateCtw 10
+    IO.println s!"[ACCURACY] Markov H_rate (CTW) MAE={repRateCtw.mae} maxAbs={repRateCtw.maxAbsError} (tol={tolRate}, strictScale={strictScale}, allowed={strictScale*tolRate})"
+    if repRateCtw.maxAbsError > strictScale * tolRate then
+      ok := false
+      IO.println "[FAIL] Entropy rate (CTW) exceeded tolerance"
+
+    -- Entropy rate: binary Markov chain (order 2)
+    let outcomeMarkov2 ← (binaryMarkov2Oracle 0.1 0.7 0.4 0.9).generate r 60000
+    let (bundleRate2, truthRate2) ← oracleGenFromOutcome "H_RATE" outcomeMarkov2
+    let repRate2 ← verifyAccuracyWith est (fun _ => pure (bundleRate2, truthRate2)) .entropyRate r paramsRate 20
+    IO.println s!"[ACCURACY] Markov2 H_rate MAE={repRate2.mae} maxAbs={repRate2.maxAbsError} (tol={tolRate}, strictScale={strictScale}, allowed={strictScale*tolRate})"
+    if repRate2.maxAbsError > strictScale * tolRate then
+      ok := false
+      IO.println "[FAIL] Entropy rate (Markov2) exceeded tolerance"
+
+    let repRate2Ctw ← verifyAccuracyWith est (fun _ => pure (bundleRate2, truthRate2)) .entropyRate r paramsRateCtw 10
+    IO.println s!"[ACCURACY] Markov2 H_rate (CTW) MAE={repRate2Ctw.mae} maxAbs={repRate2Ctw.maxAbsError} (tol={tolRate}, strictScale={strictScale}, allowed={strictScale*tolRate})"
+    if repRate2Ctw.maxAbsError > strictScale * tolRate then
+      ok := false
+      IO.println "[FAIL] Entropy rate (Markov2, CTW) exceeded tolerance"
+
+    -- Data processing checks using X->Y->Z
+    let outcomeXYZ ← (markovChainOracle 0.1 0.2).generate r 30000
+    let violsXYZ ← verifyInequalitiesWith est (fun _ => pure outcomeXYZ.bundle) r paramsMarg 20 tolMetric.nonNegativity
+    if violsXYZ.isEmpty then
+      IO.println "[INEQ] PASS (data processing with Z)"
+    else
+      ok := false
+      IO.println s!"[INEQ] FAIL (data processing) {violsXYZ.size} violations"
 
     -- Metric checks: NCD (Vitányi) should satisfy metric axioms within tolerance
     IO.println "[METRIC] Checking NCD metric axioms..."
@@ -181,7 +343,7 @@ private def runSuite : IO Bool := do
     IO.println s!"  symmetry pass rate:       {symRate}"
     IO.println s!"  triangle pass rate:       {triRate}"
 
-    if nnRate < 0.99 || idRate < 0.90 || symRate < 0.90 || triRate < 0.80 then
+    if nnRate < 0.995 || idRate < 0.92 || symRate < 0.92 || triRate < 0.85 then
       ok := false
       IO.println "[FAIL] Metric axiom pass-rates too low"
 
@@ -200,5 +362,3 @@ def main (_args : List String) : IO UInt32 := do
   else
     IO.println "[FAIL] ite-bench validation suite failed"
     return 2
-
-

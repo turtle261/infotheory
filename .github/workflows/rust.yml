@@ -20,3 +20,9 @@ jobs:
       run: cargo build --verbose --release
     - name: Run tests
       run: cargo test --verbose --release
+    - name: Install Lean (elan)
+      run: |
+        curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y
+        echo "$HOME/.elan/bin" >> $GITHUB_PATH
+    - name: Run Lean validation (ite-bench)
+      run: ./projman.sh lean_test
