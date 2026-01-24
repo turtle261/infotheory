@@ -89,7 +89,7 @@ pub fn observation_repr_from_stream(
 /// A high-performance random number generator using the XorShift64* algorithm.
 ///
 /// This generator is seeded using `zpaq_rs::random_bytes` to avoid external dependencies
-/// like the `rand` crate while maintaining cryptographic-grade entropy for the seed.
+/// like the `rand` crate while using OS-provided entropy for the initial seed.
 #[derive(Clone, Copy)]
 pub struct RandomGenerator {
     state: u64,

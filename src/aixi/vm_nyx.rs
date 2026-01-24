@@ -1,7 +1,8 @@
 //! High-performance VM-backed AIXI environment using nyx-lite (Firecracker).
 //!
 //! This module provides a VM environment implementation built on top of nyx-lite,
-//! enabling ~10,000+ VM resets per second for extremely fast experimentation.
+//! enabling high-frequency snapshot-based resets for fast experimentation (hardware and
+//! guest behavior dependent).
 //!
 //! ## Architecture
 //!

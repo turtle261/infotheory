@@ -1769,7 +1769,7 @@ Primitives:
 
   Distance & Divergence:
     ncd <f1> <f2> [method]                  Normalized Compression Distance (Vitanyi)
-    ncd_sym, ncd_cons                       NCD variants (Symmetric, Consistent, etc.)
+    ncd_sym, ncd_cons, ncd_sym_cons         NCD variants (Symmetric, Conservative, etc.)
     ned <f1> <f2> [max_order]               Normalized Entropy Distance
     nte <f1> <f2> [max_order]               Normalized Transform Effort
     kl, kl_divergence <f1> <f2>             Kullback-Leibler Divergence
