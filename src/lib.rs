@@ -74,6 +74,7 @@ pub mod aixi;
 pub mod axioms;
 pub mod ctw;
 pub mod datagen;
+pub mod mixture;
 
 use rayon::prelude::*;
 

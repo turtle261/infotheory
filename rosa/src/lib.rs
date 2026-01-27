@@ -1347,13 +1347,23 @@ impl RosaPlus {
         let seg_start = tx.seg_start;
         let seg_end = self.sam.text.len();
         tx.seg_len = seg_end - seg_start;
-        if tx.seg_len >= 2 {
+        if tx.seg_len >= 1 {
             let mo = if self.max_order < 0 {
                 -1
             } else {
                 self.max_order
             };
-            for i in seg_start..(seg_end - 1) {
+            // For continuous streams, include the cross-boundary transition from the
+            // previous symbol into the first new symbol. For segmented examples,
+            // respect boundary markers and skip that transition.
+            let mut start_i = seg_start;
+            if !mark_boundary
+                && seg_start > 0
+                && self.sam.boundary_after.get(seg_start - 1).copied().unwrap_or(0) == 0
+            {
+                start_i = seg_start - 1;
+            }
+            for i in start_i..(seg_end - 1) {
                 // ctx state after consuming sam.text[i] within its segment
                 let mut ctx = self.sam.text_states[i + 1];
                 if mo >= 0 {
