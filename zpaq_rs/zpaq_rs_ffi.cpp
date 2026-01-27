@@ -679,6 +679,32 @@ int zpaq_compressor_start_block_level(libzpaq::Compressor* c, int level) {
   }
 }
 
+int zpaq_compressor_start_block_method(libzpaq::Compressor* c, const char* method) {
+  clear_last_error();
+  try {
+    if (!c || !method || !*method) return -1;
+    const char type = method[0];
+    if (!(type == 'x' || type == 's' || type == 'i' || type == '0')) {
+      set_last_error("method must start with one of: x, s, i, 0 (or use numeric 1..3)");
+      return -1;
+    }
+    int args[9] = {0};
+    std::string config = libzpaq::makeConfig(method, args);
+    if (args[1] != 0) {
+      std::string msg = "method uses block preprocessing (args[1]=" + std::to_string(args[1]) +
+                        "); not streamable";
+      set_last_error(msg.c_str());
+      return -1;
+    }
+    libzpaq::StringBuffer pcomp_cmd;
+    c->startBlock(config.c_str(), args, &pcomp_cmd);
+    return 0;
+  } catch (const std::exception& e) {
+    set_last_error(e.what());
+    return -1;
+  }
+}
+
 int zpaq_compressor_start_block_hcomp(libzpaq::Compressor* c, const char* hcomp_bytecode) {
   clear_last_error();
   try {
@@ -769,6 +795,10 @@ int zpaq_compressor_end_segment_checksum(libzpaq::Compressor* c, int64_t* size_o
 
 int64_t zpaq_compressor_get_size(libzpaq::Compressor* c) {
   return c ? c->getSize() : 0;
+}
+
+double zpaq_compressor_get_bits(libzpaq::Compressor* c) {
+  return c ? c->getEncodedBits() : 0.0;
 }
 
 int zpaq_compressor_get_checksum(libzpaq::Compressor* c, unsigned char out_hash20[20]) {

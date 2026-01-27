@@ -69,6 +69,7 @@ fn parse_rate_backend(v: &str) -> Option<&'static str> {
         "rwkv7" | "rwkv" => Some("rwkv7"),
         "ctw" => Some("ctw"),
         "fac-ctw" | "facctw" => Some("fac-ctw"),
+        "zpaq" => Some("zpaq"),
         _ => None,
     }
 }
@@ -295,6 +296,20 @@ fn parse_vm_stats_backend(
             let model = load_rwkv7_model_from_path(&path);
             Ok(RateBackend::Rwkv7 { model })
         }
+        Some("zpaq") => {
+            let method = cfg["method"]
+                .as_str()
+                .or_else(|| cfg["zpaq_method"].as_str())
+                .or_else(|| root["method"].as_str())
+                .unwrap_or("2")
+                .to_string();
+            if let Err(err) = validate_zpaq_rate_method(&method) {
+                return Err(anyhow::anyhow!(
+                    "unsupported ZPAQ rate method '{method}': {err}"
+                ));
+            }
+            Ok(RateBackend::Zpaq { method })
+        }
         _ => Ok(fallback),
     }
 }
@@ -319,6 +334,17 @@ fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBack
             let model = load_rwkv7_model_from_path(&path);
             Ok(RateBackend::Rwkv7 { model })
         }
+        "zpaq" => Ok(RateBackend::Zpaq {
+            method: {
+                let method = root["method"].as_str().unwrap_or("2").to_string();
+                if let Err(err) = validate_zpaq_rate_method(&method) {
+                    return Err(anyhow::anyhow!(
+                        "unsupported ZPAQ rate method '{method}': {err}"
+                    ));
+                }
+                method
+            },
+        }),
         _ => Ok(RateBackend::RosaPlus),
     }
 }
@@ -786,6 +812,14 @@ fn build_ctx(rate_backend: &str, ncd_backend: &str, method: Option<&str>) -> Inf
                 num_percept_bits: 8, // Default for byte-oriented CLI
                 encoding_bits: 8,    // Default for byte-oriented CLI
             }
+        }
+        "zpaq" => {
+            let m = method.unwrap_or("2").to_string();
+            if let Err(err) = validate_zpaq_rate_method(&m) {
+                eprintln!("Error: unsupported ZPAQ rate method '{m}': {err}");
+                std::process::exit(1);
+            }
+            RateBackend::Zpaq { method: m }
         }
         _ => RateBackend::RosaPlus,
     };
@@ -1381,6 +1415,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         reward_offset,
         rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
         rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
+        zpaq_method: v["zpaq_method"].as_str().map(|s| s.to_string()),
     };
 
     let mut agent = Agent::new(config);
@@ -1784,7 +1819,7 @@ Primitives:
     batch                                   Run in JSON-L batch mode
 
 Options:
-  --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'fac-ctw', 'rwkv7'
+  --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'fac-ctw', 'rwkv7', 'zpaq'
   --ncd-backend <name>    Backend for NCD: 'zpaq' (default), 'rwkv7'
   --method <val>          Method/Depth parameter (e.g. '5' for zpaq, '16' for ctw)
 

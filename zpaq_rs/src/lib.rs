@@ -13,6 +13,7 @@
 
 mod sys;
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::raw::{c_char, c_int};
@@ -131,6 +132,206 @@ unsafe extern "C" fn write_cb<W: Write + Send>(
                 set_callback_error(&e.to_string());
                 sys::RUST_CALLBACK_ERROR
             }
+        }
+    }
+}
+
+// ---------------- Streaming compressor ----------------
+
+#[derive(Default)]
+struct StreamReader {
+    buf: VecDeque<u8>,
+}
+
+impl StreamReader {
+    fn push(&mut self, b: u8) {
+        self.buf.push_back(b);
+    }
+}
+
+impl Read for StreamReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let mut n = 0usize;
+        while n < out.len() {
+            match self.buf.pop_front() {
+                Some(b) => {
+                    out[n] = b;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// Streaming ZPAQ compressor that exposes incremental encoded bit counts.
+///
+/// Note: Streaming mode supports numeric levels 1..=3 and explicit method
+/// strings (x/s/i/0...) that do not use block preprocessing.
+pub struct StreamingCompressor {
+    compressor: *mut sys::Compressor,
+    reader: *mut sys::RustReader,
+    writer: *mut sys::RustWriter,
+    reader_ctx: *mut ReadCtx<StreamReader>,
+    writer_ctx: *mut WriteCtx<CountingWriter>,
+}
+
+unsafe impl Send for StreamingCompressor {}
+
+impl StreamingCompressor {
+    pub fn new(method: &str) -> Result<Self> {
+        let method_trim = method.trim();
+        if method_trim.is_empty() {
+            return Err(ZpaqError::Ffi("method string is empty".into()));
+        }
+        let numeric = method_trim.parse::<i32>().ok();
+        let level = numeric.filter(|v| (1..=3).contains(v));
+        if numeric.is_some() && level.is_none() {
+            return Err(ZpaqError::Ffi(
+                "streaming numeric levels support 1..3 only; use x/s/i/0 with no preprocessing"
+                    .into(),
+            ));
+        }
+
+        let compressor = unsafe { sys::zpaq_compressor_new() };
+        if compressor.is_null() {
+            return Err(ZpaqError::Ffi("zpaq_compressor_new failed".into()));
+        }
+
+        let reader_ctx = Box::into_raw(Box::new(ReadCtx {
+            reader: StreamReader::default(),
+        }));
+        let writer_ctx = Box::into_raw(Box::new(WriteCtx {
+            writer: CountingWriter::default(),
+        }));
+
+        let reader = unsafe { sys::zpaq_reader_new(reader_ctx.cast(), None, Some(read_cb::<StreamReader>)) };
+        if reader.is_null() {
+            unsafe {
+                sys::zpaq_compressor_free(compressor);
+                drop(Box::from_raw(reader_ctx));
+                drop(Box::from_raw(writer_ctx));
+            }
+            return Err(ZpaqError::Ffi("zpaq_reader_new failed".into()));
+        }
+
+        let writer = unsafe {
+            sys::zpaq_writer_new(
+                writer_ctx.cast(),
+                Some(put_cb::<CountingWriter>),
+                Some(write_cb::<CountingWriter>),
+            )
+        };
+        if writer.is_null() {
+            unsafe {
+                sys::zpaq_reader_free(reader);
+                sys::zpaq_compressor_free(compressor);
+                drop(Box::from_raw(reader_ctx));
+                drop(Box::from_raw(writer_ctx));
+            }
+            return Err(ZpaqError::Ffi("zpaq_writer_new failed".into()));
+        }
+
+        let rc_out = unsafe { sys::zpaq_compressor_set_output(compressor, writer) };
+        if rc_out != 0 {
+            unsafe {
+                sys::zpaq_writer_free(writer);
+                sys::zpaq_reader_free(reader);
+                sys::zpaq_compressor_free(compressor);
+                drop(Box::from_raw(reader_ctx));
+                drop(Box::from_raw(writer_ctx));
+            }
+            return Err(err_from_last());
+        }
+
+        let rc_in = unsafe { sys::zpaq_compressor_set_input(compressor, reader) };
+        if rc_in != 0 {
+            unsafe {
+                sys::zpaq_writer_free(writer);
+                sys::zpaq_reader_free(reader);
+                sys::zpaq_compressor_free(compressor);
+                drop(Box::from_raw(reader_ctx));
+                drop(Box::from_raw(writer_ctx));
+            }
+            return Err(err_from_last());
+        }
+
+        let rc_tag = unsafe { sys::zpaq_compressor_write_tag(compressor) };
+        if rc_tag != 0 {
+            unsafe {
+                sys::zpaq_writer_free(writer);
+                sys::zpaq_reader_free(reader);
+                sys::zpaq_compressor_free(compressor);
+                drop(Box::from_raw(reader_ctx));
+                drop(Box::from_raw(writer_ctx));
+            }
+            return Err(err_from_last());
+        }
+
+        let rc_block = if let Some(level) = level {
+            unsafe { sys::zpaq_compressor_start_block_level(compressor, level) }
+        } else {
+            let method_c = CString::new(method_trim).map_err(|_| ZpaqError::NulInString)?;
+            unsafe { sys::zpaq_compressor_start_block_method(compressor, method_c.as_ptr()) }
+        };
+        if rc_block != 0 {
+            unsafe {
+                sys::zpaq_writer_free(writer);
+                sys::zpaq_reader_free(reader);
+                sys::zpaq_compressor_free(compressor);
+                drop(Box::from_raw(reader_ctx));
+                drop(Box::from_raw(writer_ctx));
+            }
+            return Err(err_from_last());
+        }
+
+        let rc_seg = unsafe { sys::zpaq_compressor_start_segment(compressor, ptr::null(), ptr::null()) };
+        if rc_seg != 0 {
+            unsafe {
+                sys::zpaq_writer_free(writer);
+                sys::zpaq_reader_free(reader);
+                sys::zpaq_compressor_free(compressor);
+                drop(Box::from_raw(reader_ctx));
+                drop(Box::from_raw(writer_ctx));
+            }
+            return Err(err_from_last());
+        }
+
+        Ok(Self {
+            compressor,
+            reader,
+            writer,
+            reader_ctx,
+            writer_ctx,
+        })
+    }
+
+    pub fn push(&mut self, b: u8) -> Result<()> {
+        unsafe {
+            let ctx = &mut *self.reader_ctx;
+            ctx.reader.push(b);
+        }
+        let rc = unsafe { sys::zpaq_compressor_compress(self.compressor, 1) };
+        if rc < 0 {
+            return Err(err_from_last());
+        }
+        Ok(())
+    }
+
+    pub fn bits(&self) -> f64 {
+        unsafe { sys::zpaq_compressor_get_bits(self.compressor) }
+    }
+}
+
+impl Drop for StreamingCompressor {
+    fn drop(&mut self) {
+        unsafe {
+            sys::zpaq_writer_free(self.writer);
+            sys::zpaq_reader_free(self.reader);
+            sys::zpaq_compressor_free(self.compressor);
+            drop(Box::from_raw(self.reader_ctx));
+            drop(Box::from_raw(self.writer_ctx));
         }
     }
 }

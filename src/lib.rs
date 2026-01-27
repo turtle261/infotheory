@@ -75,6 +75,7 @@ pub mod axioms;
 pub mod ctw;
 pub mod datagen;
 pub mod mixture;
+mod zpaq_rate;
 
 use rayon::prelude::*;
 
@@ -190,6 +191,10 @@ pub enum RateBackend {
     RosaPlus,
     Rwkv7 {
         model: Arc<rwkvzip::Model>,
+    },
+    /// ZPAQ compression-based rate model (streamable methods only).
+    Zpaq {
+        method: String,
     },
     /// Action-Conditional CTW (single context tree).
     Ctw {
@@ -338,6 +343,17 @@ impl InfotheoryCtx {
                 let bits = -log_p_cond / std::f64::consts::LN_2;
                 bits / (data.len() as f64)
             }
+            RateBackend::Zpaq { method } => {
+                if data.is_empty() {
+                    return 0.0;
+                }
+                let mut model = crate::zpaq_rate::ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
+                for &part in prefix_parts {
+                    model.update_and_score(part);
+                }
+                let bits = model.update_and_score(data);
+                bits / (data.len() as f64)
+            }
             RateBackend::FacCtw {
                 base_depth,
                 num_percept_bits: _,
@@ -483,6 +499,10 @@ pub fn get_compressed_size(path: &str, method: &str) -> u64 {
     zpaq_rs::compress_size(&std::fs::read(path).unwrap(), method).unwrap()
 }
 
+pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
+    zpaq_rate::validate_zpaq_rate_method(method)
+}
+
 fn with_rwkv_tls<R>(
     model: &Arc<rwkvzip::Model>,
     f: impl FnOnce(&mut rwkvzip::Compressor) -> R,
@@ -576,6 +596,14 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
         }
+        RateBackend::Zpaq { method } => {
+            if data.is_empty() {
+                return 0.0;
+            }
+            let mut model = crate::zpaq_rate::ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
+            let bits = model.update_and_score(data);
+            bits / (data.len() as f64)
+        }
         RateBackend::Ctw { depth } => {
             if data.is_empty() {
                 return 0.0;
@@ -626,6 +654,7 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
         }
+        RateBackend::Zpaq { .. } => entropy_rate_backend(data, max_order, backend),
         RateBackend::Ctw { .. } | RateBackend::FacCtw { .. } => {
             // CTW/FAC-CTW are online, so biased=prequential
             entropy_rate_backend(data, max_order, backend)
@@ -654,6 +683,15 @@ pub fn cross_entropy_rate_backend(
                 c.cross_entropy_conditional(train_data, test_data)
                     .unwrap_or(0.0)
             })
+        }
+        RateBackend::Zpaq { method } => {
+            if test_data.is_empty() {
+                return 0.0;
+            }
+            let mut model = crate::zpaq_rate::ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
+            model.update_and_score(train_data);
+            let bits = model.update_and_score(test_data);
+            bits / (test_data.len() as f64)
         }
         RateBackend::Ctw { depth } => {
             if test_data.is_empty() {
@@ -727,6 +765,19 @@ pub fn joint_entropy_rate_backend(
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
             c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
         }),
+        RateBackend::Zpaq { method } => {
+            if x.is_empty() {
+                return 0.0;
+            }
+            let mut joint = Vec::with_capacity(x.len() * 2);
+            for i in 0..x.len() {
+                joint.push(x[i]);
+                joint.push(y[i]);
+            }
+            let mut model = crate::zpaq_rate::ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
+            let bits = model.update_and_score(&joint);
+            bits / (x.len() as f64)
+        }
         RateBackend::Ctw { depth } => {
             // NOTE: CTW interleaves bits: x_0, y_0, x_1, y_1...
             // This estimates the joint entropy H(X,Y) by modeling the sequence

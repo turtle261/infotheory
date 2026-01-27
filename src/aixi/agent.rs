@@ -8,13 +8,15 @@ use crate::aixi::common::{
     observation_repr_from_stream,
 };
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
-use crate::aixi::model::{CtwPredictor, FacCtwPredictor, Predictor, RosaPredictor, RwkvPredictor};
-use crate::load_rwkv7_model_from_path;
+use crate::aixi::model::{
+    CtwPredictor, FacCtwPredictor, Predictor, RosaPredictor, RwkvPredictor, ZpaqPredictor,
+};
+use crate::{load_rwkv7_model_from_path, validate_zpaq_rate_method};
 
 /// Configuration parameters for an AIXI agent.
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
-    /// The predictive algorithm to use ("ctw", "rosa", "rwkv").
+    /// The predictive algorithm to use ("ctw", "rosa", "rwkv", "zpaq").
     pub algorithm: String,
     /// Context depth for the CTW model.
     pub ct_depth: usize,
@@ -48,6 +50,8 @@ pub struct AgentConfig {
     pub rwkv_model_path: Option<String>,
     /// Maximum Markov order for the ROSA model (if using "rosa").
     pub rosa_max_order: Option<i64>,
+    /// ZPAQ method string for the rate model (if using "zpaq").
+    pub zpaq_method: Option<String>,
 }
 
 /// A complete MC-AIXI agent.
@@ -115,6 +119,16 @@ impl Agent {
                     .expect("RWKV model path required");
                 let model_arc = load_rwkv7_model_from_path(path);
                 Box::new(RwkvPredictor::new(model_arc))
+            }
+            "zpaq" => {
+                let method = config
+                    .zpaq_method
+                    .clone()
+                    .unwrap_or_else(|| "1".to_string());
+                if let Err(err) = validate_zpaq_rate_method(&method) {
+                    panic!("Invalid zpaq method for AIXI: {err}");
+                }
+                Box::new(ZpaqPredictor::new(method, 2f64.powi(-24)))
             }
             _ => panic!("Unknown algorithm: {}", config.algorithm),
         };

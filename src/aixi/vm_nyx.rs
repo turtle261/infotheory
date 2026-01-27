@@ -25,6 +25,7 @@ use crate::aixi::environment::Environment;
 use crate::{
     RateBackend, cross_entropy_rate_backend, entropy_rate_backend, marginal_entropy_bytes,
 };
+use crate::zpaq_rate::ZpaqRateModel;
 use rosaplus::RosaPlus;
 use rwkvzip::Compressor;
 use rwkvzip::coders::softmax_pdf_inplace;
@@ -582,6 +583,9 @@ enum TraceModel {
         compressor: Compressor,
         primed: bool,
     },
+    Zpaq {
+        model: ZpaqRateModel,
+    },
 }
 
 impl TraceModel {
@@ -599,6 +603,9 @@ impl TraceModel {
                     primed: false,
                 }
             }
+            RateBackend::Zpaq { method } => TraceModel::Zpaq {
+                model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
+            },
             RateBackend::Ctw { depth } => TraceModel::Ctw {
                 tree: crate::ctw::ContextTree::new(*depth),
             },
@@ -628,6 +635,9 @@ impl TraceModel {
             TraceModel::Rwkv7 { compressor, primed } => {
                 compressor.state.reset();
                 *primed = false;
+            }
+            TraceModel::Zpaq { model } => {
+                model.reset();
             }
         }
     }
@@ -697,6 +707,7 @@ impl TraceModel {
                 }
                 bits
             }
+            TraceModel::Zpaq { model } => model.update_and_score(data),
         }
     }
 }

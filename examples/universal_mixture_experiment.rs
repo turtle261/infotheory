@@ -5,8 +5,9 @@ use infotheory::mixture::{
 };
 
 use rayon::prelude::*;
+use std::env;
 use std::f64::consts::LN_2;
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
 
 #[derive(Clone, Copy)]
@@ -127,6 +128,35 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
+const ZPAQ_METHODS: [&str; 5] = [
+    "1",
+    "2",
+    //    "3",
+    //    "x5.0c0i1.1.1a24.1.1w1.65.26.223.20.0m8.24t8.24s8.32.255",
+    //    "x4.0c256.0.255.255.255s8.32.255m8.24",
+    //    "x4.0w1.65.26.223.20.0m8.24",
+    //    "x4.0a24.1.1m8.24",
+    "x4.0ci1.1.2",
+    "x4.0c0",
+    "x4.0ci8",
+];
+
+const ZPAQ_EXTENDED_METHODS: [&str; 5] = [
+    "x6.0c0i1.1.1.2a24.1.1w2.65.26.223.20.0m8.24m16.24t8.24s8.32.255",
+    "x5.0c64.0.255.255c0i1.1a24.1.1m8.24t8.24s8.32.255",
+    "x5.0c0i1.1.2w2.65.26.223.20.0m8.24t8.24",
+    "x5.0a24.0.0m8.24s8.32.255",
+    "x5.0c0i1.1.1.1.2",
+];
+
+fn include_zpaq_from_args() -> bool {
+    env::args().any(|a| a == "--include-zpaq")
+}
+
+fn include_zpaq_extended_from_args() -> bool {
+    env::args().any(|a| a == "--include-zpaq-extended")
+}
+
 fn periodic_with_mutation(
     n: usize,
     pattern: &[u8],
@@ -154,7 +184,11 @@ fn copy_mutate(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let base = if i >= lag { out[i - lag] } else { rng.next_u8(alphabet) };
+        let base = if i >= lag {
+            out[i - lag]
+        } else {
+            rng.next_u8(alphabet)
+        };
         let mut sym = base;
         if rng.next_f64() < mutate_prob {
             sym = rng.next_u8(alphabet);
@@ -312,6 +346,8 @@ fn run_once(
     gap: GapConfig,
     neff_collapse: f64,
     neff_recover: f64,
+    include_zpaq: bool,
+    include_zpaq_extended: bool,
     trace_path: Option<&str>,
     verbose: bool,
 ) -> (RunSummary, Vec<String>) {
@@ -328,6 +364,19 @@ fn run_once(
         ExpertConfig::rosa("rosa-auto", -1),
         ExpertConfig::fac_ctw("fac-ctw-d6b8", 6, symbol_bits),
     ];
+    let mut experts = experts;
+    if include_zpaq {
+        for method in ZPAQ_METHODS {
+            let name = format!("zpaq-{}", method);
+            experts.push(ExpertConfig::zpaq(name, method));
+        }
+    }
+    if include_zpaq_extended {
+        for method in ZPAQ_EXTENDED_METHODS {
+            let name = format!("zpaq-{}", method);
+            experts.push(ExpertConfig::zpaq(name, method));
+        }
+    }
 
     let mut bayes = BayesMixture::new(&experts);
     let mut switch = SwitchingMixture::new(&experts, alpha);
@@ -458,7 +507,11 @@ fn run_once(
         write!(w, "bayes_bps,switch_bps,fading_bps,mdl_bps,").unwrap();
         write!(w, "bayes_ema,switch_ema,fading_ema,mdl_ema,").unwrap();
         write!(w, "bayes_neff,switch_neff,fading_neff,").unwrap();
-        write!(w, "bayes_entropy_bits,switch_entropy_bits,fading_entropy_bits").unwrap();
+        write!(
+            w,
+            "bayes_entropy_bits,switch_entropy_bits,fading_entropy_bits"
+        )
+        .unwrap();
         for name in &expert_names_sanitized {
             write!(w, ",bayes_w_{}", name).unwrap();
         }
@@ -518,10 +571,7 @@ fn run_once(
         }
 
         for i in 0..n_experts {
-            let log_switch = logsumexp2(
-                log_1m_alpha + forward_logw[i],
-                log_alpha + log_priors[i],
-            );
+            let log_switch = logsumexp2(log_1m_alpha + forward_logw[i], log_alpha + log_priors[i]);
             forward_logw_next[i] = step_logps[i] + log_switch;
         }
         let log_mix_forward = logsumexp(&forward_logw_next);
@@ -531,10 +581,7 @@ fn run_once(
         }
         forward_max_abs_diff = forward_max_abs_diff.max((log_mix_forward - logp_switch).abs());
 
-        let prev_best = viterbi_cost
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min);
+        let prev_best = viterbi_cost.iter().copied().fold(f64::INFINITY, f64::min);
         for i in 0..n_experts {
             let stay = viterbi_cost[i] - log_1m_alpha;
             let switch_cost = prev_best - log_alpha - log_priors[i];
@@ -789,8 +836,8 @@ fn run_once(
         }
         for i in 0..n_experts {
             if ema_initialized[i] {
-                ema_experts[i] = (1.0 - ema_alpha) * ema_experts[i]
-                    + ema_alpha * (-step_logps[i] / LN_2);
+                ema_experts[i] =
+                    (1.0 - ema_alpha) * ema_experts[i] + ema_alpha * (-step_logps[i] / LN_2);
             } else {
                 ema_experts[i] = -step_logps[i] / LN_2;
                 ema_initialized[i] = true;
@@ -801,10 +848,7 @@ fn run_once(
             write!(
                 writer,
                 "{},{},{},{},",
-                t,
-                seg_idx,
-                segments[seg_idx].name,
-                sym
+                t, seg_idx, segments[seg_idx].name, sym
             )
             .unwrap();
             write!(
@@ -1114,7 +1158,10 @@ fn run_once(
             );
             if let Some(t) = stats.collapse_time {
                 println!("  collapse @t (Neff<= {:.2}) = {}", neff_collapse, t);
-                println!("  time Neff<= {:.2} = {} steps", neff_collapse, stats.time_below_neff);
+                println!(
+                    "  time Neff<= {:.2} = {} steps",
+                    neff_collapse, stats.time_below_neff
+                );
                 if let Some(bits) = stats.inertia_bits {
                     println!("  posterior inertia = {:.2} bits", bits);
                 }
@@ -1122,7 +1169,10 @@ fn run_once(
             if stats.name != "mdl" {
                 println!("  min Neff = {:.3}", stats.min_neff);
                 println!("  min entropy (bits) = {:.3}", stats.min_entropy_bits);
-                println!("  adopt times after shifts (steps): {:?}", stats.adopt_times);
+                println!(
+                    "  adopt times after shifts (steps): {:?}",
+                    stats.adopt_times
+                );
                 println!(
                     "  soft recovery (Neff>= {:.2}) times: {:?}",
                     neff_recover, stats.soft_recovery_times
@@ -1157,8 +1207,14 @@ fn run_once(
         );
         println!();
 
-        println!("Oracle segmented total bits/byte = {:.4}", oracle_segment_bits / total_len);
-        println!("Forward switch total bits/byte = {:.4}", forward_bits / total_len);
+        println!(
+            "Oracle segmented total bits/byte = {:.4}",
+            oracle_segment_bits / total_len
+        );
+        println!(
+            "Forward switch total bits/byte = {:.4}",
+            forward_bits / total_len
+        );
         println!(
             "Forward-vs-switch max |Δlogp| = {:.3e}",
             forward_max_abs_diff
@@ -1290,6 +1346,9 @@ fn run_once(
 }
 
 fn main() {
+    let include_zpaq = include_zpaq_from_args();
+    let include_zpaq_extended = include_zpaq_extended_from_args();
+    let include_zpaq_all = include_zpaq || include_zpaq_extended;
     let seed = 42u64;
     let seg_len = 20_000usize;
     let alpha = 0.001f64;
@@ -1313,6 +1372,8 @@ fn main() {
         gap,
         neff_collapse,
         neff_recover,
+        include_zpaq_all,
+        include_zpaq_extended,
         Some(trace_path),
         true,
     );
@@ -1361,6 +1422,8 @@ fn main() {
                 *gap,
                 neff_collapse,
                 neff_recover,
+                include_zpaq_all,
+                include_zpaq_extended,
                 None,
                 false,
             );
@@ -1441,4 +1504,20 @@ fn main() {
 
     println!("\nWrote trace CSV: {}", trace_path);
     println!("Wrote sweep CSV: {}", sweep_path);
+    println!(
+        "ZPAQ experts: {}",
+        if include_zpaq_all {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "ZPAQ extended experts: {}",
+        if include_zpaq_extended {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 }

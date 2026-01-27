@@ -27,6 +27,7 @@ See libzpaq.h for additional documentation.
 #include <string>
 #include <vector>
 #include <stdio.h>
+#include <cmath>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -2399,6 +2400,7 @@ void Encoder::init() {
   low=1;
   high=0xFFFFFFFF;
   pr.init();
+  bits=0;
   if (!pr.isModeled()) low=0, buf.resize(1<<16);
 }
 
@@ -2428,11 +2430,15 @@ void Encoder::compress(int c) {
     else {
       assert(c>=0 && c<=255);
       encode(0, 0);
+      const double inv_ln2=1.0/std::log(2.0);
       for (int i=7; i>=0; --i) {
         int p=pr.predict()*2+1;
         assert(p>0 && p<65536);
         int y=c>>i&1;
         encode(y, p);
+        const double p1=double(p)/65536.0;
+        if (y) bits-=std::log(p1)*inv_ln2;
+        else bits-=std::log(1.0-p1)*inv_ln2;
         pr.update(y);
       }
     }
@@ -2446,7 +2452,10 @@ void Encoder::compress(int c) {
       out->write(&buf[0], low);
       low=0;
     }
-    if (c>=0) buf[low++]=c;
+    if (c>=0) {
+      buf[low++]=c;
+      bits+=8.0;
+    }
   }
 }
 

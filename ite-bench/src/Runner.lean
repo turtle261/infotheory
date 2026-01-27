@@ -317,6 +317,21 @@ private def runSuite : IO Bool := do
       ok := false
       IO.println "[FAIL] Entropy rate (Markov2, CTW) exceeded tolerance"
 
+    -- ZPAQ rate backend sanity: copy-like data should compress well
+    let pattern ← randBytes 64
+    let reps := 1024
+    let mut copyData := ByteArray.empty
+    for _ in [:reps] do
+      for i in [:pattern.size] do
+        copyData := copyData.push (pattern.get! i)
+    let copyBundle : SampleBundle := { bytesX := some copyData }
+    let paramsZpaq := mkParams (some "-1") (some "zpaq") none (some "2")
+    let zpaqRate ← runEstimateIO est .entropyRate copyBundle paramsZpaq
+    IO.println s!"[ACCURACY] ZPAQ H_rate on copy-like data = {zpaqRate}"
+    if zpaqRate > 0.3 then
+      ok := false
+      IO.println "[FAIL] ZPAQ entropy rate too high on copy-like data"
+
     -- Data processing checks using X->Y->Z
     let outcomeXYZ ← (markovChainOracle 0.1 0.2).generate r 30000
     let violsXYZ ← verifyInequalitiesWith est (fun _ => pure outcomeXYZ.bundle) r paramsMarg 20 tolMetric.nonNegativity

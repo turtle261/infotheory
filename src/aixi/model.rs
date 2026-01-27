@@ -5,6 +5,7 @@
 //! provide different complexity vs performance trade-offs.
 
 use crate::ctw::{ContextTree, FacContextTree};
+use crate::zpaq_rate::ZpaqRateModel;
 use rosaplus::{RosaPlus, RosaTx};
 use rwkvzip::{Compressor, Model, State};
 use std::sync::Arc;
@@ -219,6 +220,104 @@ impl Predictor for RosaPredictor {
         Box::new(Self {
             model: self.model.clone(),
             history: self.history.clone(),
+        })
+    }
+}
+
+/// A predictor using ZPAQ as a streaming rate model.
+///
+/// This maintains a full history so it can rebuild state on revert and handle
+/// any misuse where `predict_prob` is called without a matching `update`.
+pub struct ZpaqPredictor {
+    method: String,
+    min_prob: f64,
+    model: ZpaqRateModel,
+    history: Vec<u8>,
+    pending: Option<(u8, f64)>,
+}
+
+unsafe impl Sync for ZpaqPredictor {}
+
+impl ZpaqPredictor {
+    pub fn new(method: String, min_prob: f64) -> Self {
+        let model = ZpaqRateModel::new(method.clone(), min_prob);
+        Self {
+            method,
+            min_prob,
+            model,
+            history: Vec::new(),
+            pending: None,
+        }
+    }
+
+    fn rebuild_from_history(&mut self) {
+        self.model.reset();
+        if !self.history.is_empty() {
+            self.model.update_and_score(&self.history);
+        }
+    }
+
+    fn log_prob_from_history(&self, symbol: u8) -> f64 {
+        let mut tmp = ZpaqRateModel::new(self.method.clone(), self.min_prob);
+        if !self.history.is_empty() {
+            tmp.update_and_score(&self.history);
+        }
+        tmp.log_prob(symbol)
+    }
+}
+
+impl Predictor for ZpaqPredictor {
+    fn update(&mut self, sym: bool) {
+        let byte = if sym { 1u8 } else { 0u8 };
+        if let Some((pending, _)) = self.pending {
+            if pending == byte {
+                self.model.update(byte);
+                self.pending = None;
+                self.history.push(byte);
+                return;
+            }
+            self.pending = None;
+            self.rebuild_from_history();
+        }
+        self.model.update(byte);
+        self.history.push(byte);
+    }
+
+    fn revert(&mut self) {
+        if self.history.pop().is_some() {
+            self.pending = None;
+            self.rebuild_from_history();
+        }
+    }
+
+    fn predict_prob(&mut self, sym: bool) -> f64 {
+        let byte = if sym { 1u8 } else { 0u8 };
+        if let Some((pending, logp)) = self.pending {
+            if pending == byte {
+                return logp.exp();
+            }
+            return self.log_prob_from_history(byte).exp();
+        }
+        let logp = self.model.log_prob(byte);
+        self.pending = Some((byte, logp));
+        logp.exp()
+    }
+
+    fn model_name(&self) -> String {
+        format!("ZPAQ({})", self.method)
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        let mut model = ZpaqRateModel::new(self.method.clone(), self.min_prob);
+        if !self.history.is_empty() {
+            model.update_and_score(&self.history);
+        }
+        Box::new(Self {
+            method: self.method.clone(),
+            min_prob: self.min_prob,
+            model,
+            history: self.history.clone(),
+            pending: None,
         })
     }
 }

@@ -63,6 +63,7 @@ fn main() {
         reward_offset: 1,
         rwkv_model_path: None,
         rosa_max_order: Some(20),
+        zpaq_method: None,
     };
 
     let benches = [("fac-ctw", base_cfg("fac-ctw")), ("rosa", base_cfg("rosa"))];

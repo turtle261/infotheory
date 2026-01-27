@@ -171,6 +171,7 @@ fn agent_solves_ctw_test_environment() {
         reward_offset: 0,
         rwkv_model_path: None,
         rosa_max_order: None,
+        zpaq_method: None,
     };
 
     let mut agent = Agent::new(config);
@@ -210,6 +211,7 @@ fn agent_regret_sublinear_coinflip() {
         reward_offset: 0,
         rwkv_model_path: None,
         rosa_max_order: None,
+        zpaq_method: None,
     };
 
     let mut agent = Agent::new(config);

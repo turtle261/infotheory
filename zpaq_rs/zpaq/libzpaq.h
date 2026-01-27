@@ -840,6 +840,7 @@ Use at your own risk.
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <string>
 
 namespace libzpaq {
 
@@ -1277,11 +1278,13 @@ public:
   void init();
   void compress(int c);  // c is 0..255 or EOF
   int stat(int x) {return pr.stat(x);}
+  double bitCount() const {return bits;}
   Writer* out;  // destination
 private:
   U32 low, high; // range
   Predictor pr;  // to get p
   Array<char> buf; // unmodeled input
+  double bits; // cumulative ideal code length in bits
   void encode(int y, int p); // encode bit y (0..1) with prob. p (0..65535)
 };
 
@@ -1357,6 +1360,7 @@ public:
   void endSegment(const char* sha1string = 0);
   char* endSegmentChecksum(int64_t* size = 0, bool dosha1=true);
   int64_t getSize() {return sha1.usize();}
+  double getEncodedBits() const {return enc.bitCount();}
   const char* getChecksum() {return sha1.result();}
   void endBlock();
   int stat(int x) {return enc.stat(x);}
@@ -1500,6 +1504,9 @@ public:
 // dosha1 means save the SHA-1 checksum.
 void compress(Reader* in, Writer* out, const char* method,
      const char* filename=0, const char* comment=0, bool dosha1=true);
+
+// Generate a ZPAQL config from a method string (e.g. "s4.0ci1") and return args.
+std::string makeConfig(const char* method, int args[]);
 
 // Same as compress() but output is 1 block, ignoring block size parameter.
 void compressBlock(StringBuffer* in, Writer* out, const char* method,
