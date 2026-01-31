@@ -29,6 +29,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libseccomp-dev clang pkg-config lld
       - name: Build docs
+        env:
+          RUSTFLAGS: "--cap-lints allow"
+          RUSTDOCFLAGS: "--cap-lints allow"
         run: cargo doc --workspace --features vm --no-deps
       - name: Prepare Pages artifact
         run: |
