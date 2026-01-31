@@ -152,7 +152,7 @@ set_default_ctx(InfotheoryCtx::new(
 | `mi`  | Mutual Information | Shannon |
 | `id`  | Internal Redundancy | Algorithmic |
 | `rt`  | Resistance to Transform | Algorithmic |
-
+and more!
 ---
 
 ## 📄 License
