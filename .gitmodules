@@ -3,4 +3,4 @@
 	url = admi@10.0.0.58:~/repos/rwkvzip
 [submodule "nyx-lite"]
 	path = nyx-lite
-	url = git@github.com:turtle261/nyx-lite.git
+	url = https://github.com/turtle261/nyx-lite.git
