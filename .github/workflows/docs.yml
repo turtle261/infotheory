@@ -24,8 +24,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+      - name: Install VM build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libseccomp-dev clang pkg-config lld
       - name: Build docs
-        run: cargo doc -p infotheory -p rosaplus -p rwkvzip -p zpaq_rs --no-deps
+        run: cargo doc --workspace --features vm --no-deps
       - name: Prepare Pages artifact
         run: |
           rm -rf site
