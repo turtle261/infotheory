@@ -113,3 +113,26 @@ pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zpaq_log_prob_update_matches_update_and_score() {
+        let data = b"the quick brown fox jumps over the lazy dog";
+        let mut model_a = ZpaqRateModel::new("1", 1e-9);
+        let mut bits_a = 0.0;
+        for &b in data {
+            let logp = model_a.log_prob(b);
+            bits_a += -logp / LN_2;
+            model_a.update(b);
+        }
+
+        let mut model_b = ZpaqRateModel::new("1", 1e-9);
+        let bits_b = model_b.update_and_score(data);
+
+        let diff = (bits_a - bits_b).abs();
+        assert!(diff < 1e-6, "bits mismatch: {bits_a} vs {bits_b}");
+    }
+}

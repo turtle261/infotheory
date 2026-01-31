@@ -196,6 +196,10 @@ pub enum RateBackend {
     Zpaq {
         method: String,
     },
+    /// Online mixture over rate-model experts (Bayes, fading Bayes, switching, MDL).
+    Mixture {
+        spec: Arc<MixtureSpec>,
+    },
     /// Action-Conditional CTW (single context tree).
     Ctw {
         depth: usize,
@@ -217,6 +221,72 @@ pub enum NcdBackend {
         model: Arc<rwkvzip::Model>,
         coder: rwkvzip::CoderType,
     },
+}
+
+/// Mixture policy kind for rate-backend mixtures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixtureKind {
+    Bayes,
+    FadingBayes,
+    Switching,
+    Mdl,
+}
+
+/// Expert specification for mixture backends.
+#[derive(Clone)]
+pub struct MixtureExpertSpec {
+    pub name: Option<String>,
+    /// Log prior weight (natural log). Uniform priors can be `0.0`.
+    pub log_prior: f64,
+    /// Max order for ROSA experts (ignored for other backends).
+    pub max_order: i64,
+    pub backend: RateBackend,
+}
+
+/// Mixture specification for rate-backend mixtures.
+#[derive(Clone)]
+pub struct MixtureSpec {
+    pub kind: MixtureKind,
+    /// Switching probability (per step) for switching mixtures.
+    pub alpha: f64,
+    /// Decay factor for fading Bayes mixtures.
+    pub decay: Option<f64>,
+    pub experts: Vec<MixtureExpertSpec>,
+}
+
+impl MixtureSpec {
+    pub fn new(kind: MixtureKind, experts: Vec<MixtureExpertSpec>) -> Self {
+        Self {
+            kind,
+            alpha: 0.01,
+            decay: None,
+            experts,
+        }
+    }
+
+    pub fn with_alpha(mut self, alpha: f64) -> Self {
+        self.alpha = alpha;
+        self
+    }
+
+    pub fn with_decay(mut self, decay: f64) -> Self {
+        self.decay = Some(decay);
+        self
+    }
+
+    pub fn build_experts(&self) -> Vec<crate::mixture::ExpertConfig> {
+        self.experts
+            .iter()
+            .map(|spec| {
+                crate::mixture::ExpertConfig::from_rate_backend(
+                    spec.name.clone(),
+                    spec.log_prior,
+                    spec.backend.clone(),
+                    spec.max_order,
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -352,6 +422,24 @@ impl InfotheoryCtx {
                     model.update_and_score(part);
                 }
                 let bits = model.update_and_score(data);
+                bits / (data.len() as f64)
+            }
+            RateBackend::Mixture { spec } => {
+                if data.is_empty() {
+                    return 0.0;
+                }
+                let experts = spec.build_experts();
+                let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
+                    .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
+                for &part in prefix_parts {
+                    for &b in part {
+                        mix.step(b);
+                    }
+                }
+                let mut bits = 0.0;
+                for &b in data {
+                    bits -= mix.step(b) / std::f64::consts::LN_2;
+                }
                 bits / (data.len() as f64)
             }
             RateBackend::FacCtw {
@@ -604,6 +692,19 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             let bits = model.update_and_score(data);
             bits / (data.len() as f64)
         }
+        RateBackend::Mixture { spec } => {
+            if data.is_empty() {
+                return 0.0;
+            }
+            let experts = spec.build_experts();
+            let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
+                .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
+            let mut bits = 0.0;
+            for &b in data {
+                bits -= mix.step(b) / std::f64::consts::LN_2;
+            }
+            bits / (data.len() as f64)
+        }
         RateBackend::Ctw { depth } => {
             if data.is_empty() {
                 return 0.0;
@@ -655,6 +756,7 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
             with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
         }
         RateBackend::Zpaq { .. } => entropy_rate_backend(data, max_order, backend),
+        RateBackend::Mixture { .. } => entropy_rate_backend(data, max_order, backend),
         RateBackend::Ctw { .. } | RateBackend::FacCtw { .. } => {
             // CTW/FAC-CTW are online, so biased=prequential
             entropy_rate_backend(data, max_order, backend)
@@ -691,6 +793,22 @@ pub fn cross_entropy_rate_backend(
             let mut model = crate::zpaq_rate::ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
             model.update_and_score(train_data);
             let bits = model.update_and_score(test_data);
+            bits / (test_data.len() as f64)
+        }
+        RateBackend::Mixture { spec } => {
+            if test_data.is_empty() {
+                return 0.0;
+            }
+            let experts = spec.build_experts();
+            let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
+                .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
+            for &b in train_data {
+                mix.step(b);
+            }
+            let mut bits = 0.0;
+            for &b in test_data {
+                bits -= mix.step(b) / std::f64::consts::LN_2;
+            }
             bits / (test_data.len() as f64)
         }
         RateBackend::Ctw { depth } => {
@@ -776,6 +894,24 @@ pub fn joint_entropy_rate_backend(
             }
             let mut model = crate::zpaq_rate::ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
             let bits = model.update_and_score(&joint);
+            bits / (x.len() as f64)
+        }
+        RateBackend::Mixture { spec } => {
+            if x.is_empty() {
+                return 0.0;
+            }
+            let mut joint = Vec::with_capacity(x.len() * 2);
+            for i in 0..x.len() {
+                joint.push(x[i]);
+                joint.push(y[i]);
+            }
+            let experts = spec.build_experts();
+            let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
+                .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
+            let mut bits = 0.0;
+            for &b in &joint {
+                bits -= mix.step(b) / std::f64::consts::LN_2;
+            }
             bits / (x.len() as f64)
         }
         RateBackend::Ctw { depth } => {

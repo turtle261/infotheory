@@ -48,6 +48,8 @@ use nyx_lite::SharedMemoryPolicy;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, Read};
+use std::path::Path;
+use std::sync::Arc;
 #[cfg(feature = "vm")]
 use std::time::{Duration, Instant};
 
@@ -70,6 +72,7 @@ fn parse_rate_backend(v: &str) -> Option<&'static str> {
         "ctw" => Some("ctw"),
         "fac-ctw" | "facctw" => Some("fac-ctw"),
         "zpaq" => Some("zpaq"),
+        "mixture" | "mix" => Some("mixture"),
         _ => None,
     }
 }
@@ -90,7 +93,190 @@ fn parse_rwkv7_coder(v: &str) -> Option<rwkvzip::CoderType> {
     }
 }
 
+const MAX_MIXTURE_NESTING: usize = 8;
 
+fn load_mixture_spec(path: &str) -> anyhow::Result<MixtureSpec> {
+    load_mixture_spec_with_depth(path, MAX_MIXTURE_NESTING)
+}
+
+fn load_mixture_spec_with_depth(path: &str, depth: usize) -> anyhow::Result<MixtureSpec> {
+    let raw = std::fs::read(path)?;
+    let value: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            let decompressed = zpaq_rs::decompress_to_vec(&raw)?;
+            serde_json::from_slice(&decompressed)?
+        }
+    };
+    let base_dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    parse_mixture_spec_value(&value, base_dir, depth)
+}
+
+fn parse_mixture_kind(kind: &str) -> anyhow::Result<MixtureKind> {
+    match kind {
+        "bayes" | "bayes-mix" | "bayes_mix" => Ok(MixtureKind::Bayes),
+        "fading" | "fading-bayes" | "fading_bayes" => Ok(MixtureKind::FadingBayes),
+        "switch" | "switching" | "switch-mix" | "switch_mix" => Ok(MixtureKind::Switching),
+        "mdl" | "selector" | "mdr" => Ok(MixtureKind::Mdl),
+        other => Err(anyhow::anyhow!("unknown mixture kind '{other}'")),
+    }
+}
+
+fn parse_mixture_spec_value(
+    v: &serde_json::Value,
+    base_dir: &Path,
+    depth: usize,
+) -> anyhow::Result<MixtureSpec> {
+    if depth == 0 {
+        return Err(anyhow::anyhow!("mixture spec nesting too deep"));
+    }
+    let kind_str = v["kind"]
+        .as_str()
+        .or_else(|| v["mixture_kind"].as_str())
+        .or_else(|| v["mix_kind"].as_str())
+        .unwrap_or("bayes");
+    let kind = parse_mixture_kind(kind_str)?;
+    let alpha = v["alpha"].as_f64().unwrap_or(0.01);
+    let decay = v["decay"].as_f64();
+    let experts_v = v["experts"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("mixture spec missing 'experts' array"))?;
+    if experts_v.is_empty() {
+        return Err(anyhow::anyhow!("mixture spec must include at least one expert"));
+    }
+    let mut experts = Vec::with_capacity(experts_v.len());
+    for e in experts_v {
+        experts.push(parse_mixture_expert_value(e, base_dir, depth - 1)?);
+    }
+    let mut spec = MixtureSpec::new(kind, experts).with_alpha(alpha);
+    if let Some(decay) = decay {
+        spec = spec.with_decay(decay);
+    }
+    if matches!(kind, MixtureKind::FadingBayes) && spec.decay.is_none() {
+        return Err(anyhow::anyhow!(
+            "fading Bayes mixture requires 'decay' in mixture spec"
+        ));
+    }
+    Ok(spec)
+}
+
+fn parse_mixture_expert_value(
+    v: &serde_json::Value,
+    base_dir: &Path,
+    depth: usize,
+) -> anyhow::Result<MixtureExpertSpec> {
+    if depth == 0 {
+        return Err(anyhow::anyhow!("mixture spec nesting too deep"));
+    }
+    let kind = v["kind"]
+        .as_str()
+        .or_else(|| v["type"].as_str())
+        .or_else(|| v["backend"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("expert missing 'kind'"))?;
+    let name = v["name"].as_str().map(|s| s.to_string());
+    let log_prior = v["log_prior"]
+        .as_f64()
+        .or_else(|| v["prior"].as_f64())
+        .unwrap_or(0.0);
+
+    match kind {
+        "rosa" | "rosaplus" => {
+            let max_order = v["max_order"]
+                .as_i64()
+                .or_else(|| v["order"].as_i64())
+                .unwrap_or(8);
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order,
+                backend: RateBackend::RosaPlus,
+            })
+        }
+        "ctw" => {
+            let depth = v["depth"]
+                .as_u64()
+                .or_else(|| v["ct_depth"].as_u64())
+                .unwrap_or(16) as usize;
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order: -1,
+                backend: RateBackend::Ctw { depth },
+            })
+        }
+        "fac-ctw" | "facctw" => {
+            let base_depth = v["base_depth"]
+                .as_u64()
+                .or_else(|| v["ct_depth"].as_u64())
+                .unwrap_or(16) as usize;
+            let encoding_bits = v["encoding_bits"].as_u64().unwrap_or(8) as usize;
+            let num_percept_bits = v["num_percept_bits"]
+                .as_u64()
+                .unwrap_or(encoding_bits as u64) as usize;
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order: -1,
+                backend: RateBackend::FacCtw {
+                    base_depth,
+                    num_percept_bits,
+                    encoding_bits,
+                },
+            })
+        }
+        "zpaq" => {
+            let method = v["method"].as_str().unwrap_or("2").to_string();
+            if let Err(err) = validate_zpaq_rate_method(&method) {
+                return Err(anyhow::anyhow!(
+                    "unsupported ZPAQ rate method '{method}': {err}"
+                ));
+            }
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order: -1,
+                backend: RateBackend::Zpaq { method },
+            })
+        }
+        "rwkv7" | "rwkv" => {
+            let model_path = v["model_path"]
+                .as_str()
+                .or_else(|| v["rwkv_model_path"].as_str())
+                .ok_or_else(|| anyhow::anyhow!("rwkv expert missing model_path"))?;
+            let model = load_rwkv7_model_from_path(model_path);
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order: -1,
+                backend: RateBackend::Rwkv7 { model },
+            })
+        }
+        "mixture" | "mix" => {
+            let spec = if let Some(spec_v) = v.get("spec") {
+                parse_mixture_spec_value(spec_v, base_dir, depth - 1)?
+            } else if let Some(path) = v["spec_path"]
+                .as_str()
+                .or_else(|| v["path"].as_str())
+            {
+                let full = base_dir.join(path);
+                load_mixture_spec_with_depth(full.to_str().unwrap_or(path), depth - 1)?
+            } else {
+                return Err(anyhow::anyhow!(
+                    "mixture expert requires 'spec' (inline) or 'spec_path'"
+                ));
+            };
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order: -1,
+                backend: RateBackend::Mixture {
+                    spec: Arc::new(spec),
+                },
+            })
+        }
+        other => Err(anyhow::anyhow!("unknown expert kind '{other}'")),
+    }
+}
 
 #[cfg(feature = "vm")]
 fn parse_shared_memory_policy(v: Option<&str>) -> SharedMemoryPolicy {
@@ -310,6 +496,18 @@ fn parse_vm_stats_backend(
             }
             Ok(RateBackend::Zpaq { method })
         }
+        Some("mixture") => {
+            let spec_path = cfg["mixture_spec"]
+                .as_str()
+                .or_else(|| cfg["spec_path"].as_str())
+                .or_else(|| cfg["spec"].as_str())
+                .or_else(|| root["mixture_spec"].as_str())
+                .ok_or_else(|| anyhow::anyhow!("mixture stats backend requires mixture_spec"))?;
+            let spec = load_mixture_spec(spec_path)?;
+            Ok(RateBackend::Mixture {
+                spec: Arc::new(spec),
+            })
+        }
         _ => Ok(fallback),
     }
 }
@@ -345,6 +543,15 @@ fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBack
                 method
             },
         }),
+        "mixture" | "mix" => {
+            let spec_path = root["mixture_spec"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("mixture stats backend requires mixture_spec"))?;
+            let spec = load_mixture_spec(spec_path)?;
+            Ok(RateBackend::Mixture {
+                spec: Arc::new(spec),
+            })
+        }
         _ => Ok(RateBackend::RosaPlus),
     }
 }
@@ -820,6 +1027,19 @@ fn build_ctx(rate_backend: &str, ncd_backend: &str, method: Option<&str>) -> Inf
                 std::process::exit(1);
             }
             RateBackend::Zpaq { method: m }
+        }
+        "mixture" => {
+            let path = method.unwrap_or_else(|| {
+                eprintln!("Error: --rate-backend mixture requires --method <spec.json>");
+                std::process::exit(1);
+            });
+            let spec = load_mixture_spec(path).unwrap_or_else(|e| {
+                eprintln!("Error: failed to load mixture spec '{path}': {e}");
+                std::process::exit(1);
+            });
+            RateBackend::Mixture {
+                spec: Arc::new(spec),
+            }
         }
         _ => RateBackend::RosaPlus,
     };
@@ -1819,13 +2039,14 @@ Primitives:
     batch                                   Run in JSON-L batch mode
 
 Options:
-  --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'fac-ctw', 'rwkv7', 'zpaq'
+  --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'fac-ctw', 'rwkv7', 'zpaq', 'mixture'
   --ncd-backend <name>    Backend for NCD: 'zpaq' (default), 'rwkv7'
-  --method <val>          Method/Depth parameter (e.g. '5' for zpaq, '16' for ctw)
+  --method <val>          Method/Depth parameter (e.g. '5' for zpaq, '16' for ctw, or path to mixture spec JSON)
 
 Examples:
   infotheory ncd file1.txt file2.txt --ncd-backend zpaq --method 5
   infotheory h file.txt --rate-backend ctw --method 32
+  infotheory h file.txt --rate-backend mixture --method mixture.json
   infotheory search "encryption" ./src --prior "codebase context"
 "#
     );

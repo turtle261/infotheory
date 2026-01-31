@@ -586,6 +586,10 @@ enum TraceModel {
     Zpaq {
         model: ZpaqRateModel,
     },
+    Mixture {
+        backend: RateBackend,
+        model: crate::mixture::RateBackendPredictor,
+    },
 }
 
 impl TraceModel {
@@ -606,6 +610,15 @@ impl TraceModel {
             RateBackend::Zpaq { method } => TraceModel::Zpaq {
                 model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
             },
+            RateBackend::Mixture { spec } => {
+                let backend = RateBackend::Mixture { spec: spec.clone() };
+                let model = crate::mixture::RateBackendPredictor::from_backend(
+                    backend.clone(),
+                    -1,
+                    2f64.powi(-24),
+                );
+                TraceModel::Mixture { backend, model }
+            }
             RateBackend::Ctw { depth } => TraceModel::Ctw {
                 tree: crate::ctw::ContextTree::new(*depth),
             },
@@ -638,6 +651,13 @@ impl TraceModel {
             }
             TraceModel::Zpaq { model } => {
                 model.reset();
+            }
+            TraceModel::Mixture { backend, model } => {
+                *model = crate::mixture::RateBackendPredictor::from_backend(
+                    backend.clone(),
+                    -1,
+                    2f64.powi(-24),
+                );
             }
         }
     }
@@ -708,6 +728,15 @@ impl TraceModel {
                 bits
             }
             TraceModel::Zpaq { model } => model.update_and_score(data),
+            TraceModel::Mixture { model, .. } => {
+                let mut bits = 0.0;
+                for &b in data {
+                    let logp = model.log_prob(b);
+                    bits -= logp / std::f64::consts::LN_2;
+                    model.update(b);
+                }
+                bits
+            }
         }
     }
 }

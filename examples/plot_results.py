@@ -2,7 +2,6 @@
 import argparse
 import csv
 import math
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -202,146 +201,6 @@ def plot_sweep(sweep_path, out_path):
     plt.close(fig)
 
 
-def plot_cost_pareto(pareto_path, out_path):
-    header, rows = read_csv(pareto_path)
-    cols = {name: idx for idx, name in enumerate(header)}
-
-    lambdas = np.array([parse_float(r[cols["lambda"]]) for r in rows])
-    total_bits = np.array([parse_float(r[cols["total_bits"]]) for r in rows])
-    bps = np.array([parse_float(r[cols["bps"]]) for r in rows])
-    expected_time_ns = np.array(
-        [parse_float(r[cols["total_expected_time_ns"]]) for r in rows]
-    )
-    expected_time_per_sym = np.array(
-        [parse_float(r[cols["expected_time_per_symbol_ns"]]) for r in rows]
-    )
-
-    expert_bits_cols = [i for i, name in enumerate(header) if name.startswith("bits_")]
-    expert_time_cols = [i for i, name in enumerate(header) if name.startswith("time_ns_")]
-    expert_names = [header[i].replace("bits_", "") for i in expert_bits_cols]
-
-    expert_bits = np.array(
-        [[parse_float(r[i]) for i in expert_bits_cols] for r in rows]
-    )
-    expert_times = np.array(
-        [[parse_float(r[i]) for i in expert_time_cols] for r in rows]
-    )
-
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    ax = axes[0, 0]
-    ax.scatter(
-        expected_time_ns / 1e6,
-        total_bits,
-        c=np.log10(lambdas + 1e-15),
-        cmap="viridis",
-        s=60,
-    )
-    ax.plot(expected_time_ns / 1e6, total_bits, "k-", alpha=0.3, lw=1)
-    ax.set_xlabel("Total Expected Time (ms)")
-    ax.set_ylabel("Total Bits")
-    ax.set_title("Pareto Frontier: Bits vs Expected Time")
-
-    for i in range(0, len(rows), max(1, len(rows) // 5)):
-        ax.annotate(
-            f"λ={lambdas[i]:.1e}",
-            (expected_time_ns[i] / 1e6, total_bits[i]),
-            fontsize=7,
-            alpha=0.7,
-        )
-
-    ax = axes[0, 1]
-    ax.scatter(
-        expected_time_per_sym / 1e3,
-        bps,
-        c=np.log10(lambdas + 1e-15),
-        cmap="viridis",
-        s=60,
-    )
-    ax.plot(expected_time_per_sym / 1e3, bps, "k-", alpha=0.3, lw=1)
-    ax.set_xlabel("Expected Time per Symbol (μs)")
-    ax.set_ylabel("Bits per Symbol")
-    ax.set_title("Rate-Distortion: BPS vs Time/Symbol")
-
-    ax = axes[1, 0]
-    for i, name in enumerate(expert_names):
-        ax.plot(lambdas, expert_bits[:, i], label=name, lw=1.2)
-    ax.set_xscale("symlog", linthresh=1e-12)
-    ax.set_xlabel("λ (nats/ns)")
-    ax.set_ylabel("Expert Bits")
-    ax.set_title("Expert Cumulative Bits vs λ")
-    ax.legend(fontsize=7, ncol=2)
-
-    ax = axes[1, 1]
-    for i, name in enumerate(expert_names):
-        ax.plot(lambdas, expert_times[:, i] / 1e6, label=name, lw=1.2)
-    ax.set_xscale("symlog", linthresh=1e-12)
-    ax.set_xlabel("λ (nats/ns)")
-    ax.set_ylabel("Expert Time (ms)")
-    ax.set_title("Expert Cumulative Time vs λ")
-    ax.legend(fontsize=7, ncol=2)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=400)
-    plt.close(fig)
-
-
-def plot_cost_trace(trace_path, out_path):
-    header, rows = read_csv(trace_path)
-    cols = {name: idx for idx, name in enumerate(header)}
-
-    t = np.array([int(r[cols["t"]]) for r in rows])
-    bits_plain = np.array([parse_float(r[cols["bits_plain"]]) for r in rows])
-    bits_aug = np.array([parse_float(r[cols["bits_aug"]]) for r in rows])
-    expected_time = np.array([parse_float(r[cols["expected_time_ns"]]) for r in rows])
-    cum_bits = np.array([parse_float(r[cols["cum_bits"]]) for r in rows])
-    cum_expected_time = np.array(
-        [parse_float(r[cols["cum_expected_time_ns"]]) for r in rows]
-    )
-
-    w_cols = [i for i, name in enumerate(header) if name.startswith("w_")]
-    expert_names = [header[i].replace("w_", "") for i in w_cols]
-    weights = np.array([[parse_float(r[i]) for i in w_cols] for r in rows])
-
-    ema_alpha = 0.02
-    ema_bits = np.zeros_like(bits_plain)
-    ema_bits[0] = bits_plain[0]
-    for i in range(1, len(bits_plain)):
-        ema_bits[i] = (1 - ema_alpha) * ema_bits[i - 1] + ema_alpha * bits_plain[i]
-
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
-
-    ax = axes[0]
-    ax.plot(t, ema_bits, lw=1.2, label="Bits/symbol (EMA)")
-    ax.set_ylabel("Bits/symbol (EMA)")
-    ax.set_title("Cost-Aware Mixture Trace")
-    ax.legend(loc="upper right")
-
-    ax = axes[1]
-    ax.plot(t, expected_time / 1e3, lw=1.0, color="orange")
-    ax.set_ylabel("Expected Time (μs)")
-
-    ax = axes[2]
-    for i, name in enumerate(expert_names):
-        ax.plot(t, weights[:, i], label=name, lw=0.8)
-    ax.set_ylabel("Expert Weights")
-    ax.legend(ncol=3, fontsize=7, loc="upper right")
-
-    ax = axes[3]
-    ax2 = ax.twinx()
-    ax.plot(t, cum_bits, "b-", lw=1.2, label="Cum. Bits")
-    ax2.plot(t, cum_expected_time / 1e6, "r-", lw=1.2, label="Cum. Time (ms)")
-    ax.set_xlabel("Time step")
-    ax.set_ylabel("Cumulative Bits", color="b")
-    ax2.set_ylabel("Cumulative Expected Time (ms)", color="r")
-    ax.legend(loc="upper left")
-    ax2.legend(loc="upper right")
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=400)
-    plt.close(fig)
 
 
 def plot_adoption(sweep_path, out_path):
@@ -460,32 +319,9 @@ def main():
     parser.add_argument("--trace-out", help="Universal trace plot output")
     parser.add_argument("--sweep-out", help="Universal sweep plot output")
     parser.add_argument("--adopt-out", help="Universal adoption plot output")
-    parser.add_argument("--cost-pareto", help="Cost-aware Pareto CSV")
-    parser.add_argument("--cost-trace", help="Cost-aware trace CSV")
-    parser.add_argument(
-        "--cost-out",
-        default="examples/outputs/cost_aware",
-        help="Base output path for cost-aware plots",
-    )
     args = parser.parse_args()
 
     ran_any = False
-
-    if args.cost_pareto or args.cost_trace:
-        base = Path(args.cost_out)
-        stem = base.stem
-        suffix = base.suffix or ".png"
-        parent = base.parent if base.parent.as_posix() != "." else Path(".")
-        if args.cost_pareto:
-            out = parent / f"{stem}_pareto{suffix}"
-            plot_cost_pareto(args.cost_pareto, str(out))
-            print(f"Wrote {out}")
-            ran_any = True
-        if args.cost_trace:
-            out = parent / f"{stem}_trace{suffix}"
-            plot_cost_trace(args.cost_trace, str(out))
-            print(f"Wrote {out}")
-            ran_any = True
 
     if args.trace or args.sweep or args.adopt_out:
         trace = args.trace or "examples/outputs/universal_mixture_trace.csv"
@@ -502,7 +338,7 @@ def main():
         ran_any = True
 
     if not ran_any:
-        print("No plots requested. Use --trace/--sweep or --cost-pareto/--cost-trace.")
+        print("No plots requested. Use --trace/--sweep.")
 
 
 if __name__ == "__main__":
