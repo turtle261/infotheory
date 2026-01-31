@@ -1799,6 +1799,7 @@ impl RosaPlus {
         }
     }
 
+    #[allow(dead_code)]
     fn entropy_rate_plugin_bytes(&mut self, data: &[u8]) -> f64 {
         let mut v = 0i32;
         let mut total_log_prob = 0.0f64;
