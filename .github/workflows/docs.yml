@@ -25,7 +25,7 @@ jobs:
         with:
           toolchain: stable
       - name: Build docs
-        run: cargo doc --workspace --no-deps
+        run: cargo doc -p infotheory -p rosaplus -p rwkvzip -p zpaq_rs --no-deps
       - name: Prepare Pages artifact
         run: |
           rm -rf site
