@@ -38,6 +38,20 @@ jobs:
           rm -rf site
           mkdir -p site
           cp -a target/doc/. site/
+          cat > site/index.html <<'EOF'
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8" />
+              <meta http-equiv="refresh" content="0; url=./infotheory/index.html" />
+              <meta name="viewport" content="width=device-width, initial-scale=1" />
+              <title>InfoTheory Docs</title>
+            </head>
+            <body>
+              <p>Redirecting to <a href="./infotheory/index.html">InfoTheory docs</a>…</p>
+            </body>
+          </html>
+          EOF
           touch site/.nojekyll
           echo "docs.infotheory.dev" > site/CNAME
       - name: Upload Pages artifact
