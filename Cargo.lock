@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "infotheory"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "num_cpus",
