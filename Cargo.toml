@@ -16,9 +16,9 @@ warnings = "warn"
 all = "warn"
 
 [dependencies]
-zpaq_rs = {path = "./zpaq_rs"}
-rosaplus = {path = "./rosa"}
-rwkvzip = {path = "./rwkvzip", default-features = false}
+zpaq_rs = { version = "0.1.0", git = "https://github.com/turtle261/infotheory", rev = "f546ca5" }
+rosaplus = { version = "0.1.0", git = "https://github.com/turtle261/infotheory", rev = "f546ca5" }
+rwkvzip = { version = "0.1.0", git = "https://github.com/turtle261/infotheory", rev = "f546ca5", default-features = false }
 nyx-lite = { version = "0.1.0", git = "https://github.com/turtle261/nyx-lite", rev = "51a6a9f", optional = true}
 rayon = "1.11.0"
 num_cpus = "1.17.0"
