@@ -22,6 +22,7 @@
 
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::environment::Environment;
+use crate::mixture::OnlineBytePredictor;
 use crate::{
     RateBackend, cross_entropy_rate_backend, entropy_rate_backend, marginal_entropy_bytes,
 };
