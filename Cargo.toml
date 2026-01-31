@@ -5,7 +5,8 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace]
-members = [".", "zpaq_rs", "rosa", "nyx-lite"]
+members = [".", "zpaq_rs", "rosa"]
+exclude = ["nyx-lite"]
 resolver = "3"
 
 [workspace.lints.rust]
@@ -18,7 +19,7 @@ all = "warn"
 zpaq_rs = {path = "./zpaq_rs"}
 rosaplus = {path = "./rosa"}
 rwkvzip = {path = "./rwkvzip", default-features = false}
-nyx-lite = {path = "./nyx-lite", optional = true}
+nyx-lite = { version = "0.1.0", git = "https://github.com/turtle261/nyx-lite", rev = "51a6a9f", optional = true}
 rayon = "1.11.0"
 num_cpus = "1.17.0"
 once_cell = "1.21.3"
@@ -52,4 +53,4 @@ opt-level = 3
 debug = true
 
 [patch.crates-io]
-linux-loader = { path = "nyx-lite/vendor/linux-loader" }
+linux-loader = { git = "https://github.com/turtle261/nyx-lite", rev = "684ed37", package = "linux-loader" }
