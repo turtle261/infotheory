@@ -23,7 +23,7 @@ Therefore, you can use a trained RWKV7 model as a rate backend/"World Model" for
 
 ---
 
-## 🛠 Compilation & Installation
+## Compilation & Installation
 ### Compiling Infotheory
 X86_64 Linux TLDR: Install Rust, Clang, and do `cargo build --release`. That's all.
 Infotheory is tested on x86_64 architecture only. It should work on other architectures, but I have not tested it yet.
@@ -71,7 +71,7 @@ Some tests/dependencies which may be optional in some cases but not all:
 - Lean4 (Toolchain Version 4.14.0)
 ---
 
-## 💻 CLI Usage
+## CLI Usage
 
 The `infotheory` binary provides a powerful interface for file analysis.
 
@@ -125,7 +125,7 @@ VM config highlights:
 
 ---
 
-## 🦀 Library Usage
+## Library Usage
 
 ```rust
 use infotheory::*;
@@ -142,7 +142,7 @@ set_default_ctx(InfotheoryCtx::new(
 
 ---
 
-## 📊 Supported Primitives
+## Supported Primitives
 
 | Command | Description | Domain |
 | :--- | :--- | :--- |
