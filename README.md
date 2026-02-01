@@ -17,7 +17,6 @@ Switch between different modeling paradigms seamlessly:
 
 ### 3. Integrated MC-AIXI Agent
 Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, or RWKV) for universal reinforcement learning.
-As of my knowledge, this is the *first* real AIXI approximation that can be used for universal reinforcement learning, due to the libraries design of allowing any rate backend to be used rather than merely CTW. I am not aware of any other implementations of AIXI that are not merely CTW (Which performs poorly on non-Markovian tasks, and is not universal).
 
 Provided, our library full includes native RWKV7 Model Training (Hybrid CPU/GPU) -- and a native optimized CPU inference Kernel(which will be faster than GPU for all but huge models). Training REQUIRES CUDA, but you can bring your own model instead. CPU Inference is explicitly SIMD optimized, for x86_64 -- so: non x86_64 architectures will be slower or perhaps not work at all for RWKV -- same goes for really old x86_64 without FMA/AVX2.
 Therefore, you can use a trained RWKV7 model as a rate backend/"World Model" for MC-AIXI. Meaning, you can get information inside the Agent's mind before it ever makes a decision or plan. You can train the model on agent output, etc. 
@@ -34,6 +33,7 @@ It is known to work with the Following OS's:
 - **OpenBSD**: `pkg_add rust`
 - **NetBSD**\*: `pkg_add rust clang lld` 
 
+It MAY work on Windows or MacOS, but I have not been able to test that yet. 
 * NetBSD will need manual configuration to get this compiling, but is tested to work. Read the comments in the netbsd section of.cargo/.config.toml in this repository. TLDR: LTO breaks it on NetBSD, so disable it.
 
 NOTE for NetBSD, OpenBSD, non-x86_64, and potentially other systems:
