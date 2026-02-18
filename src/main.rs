@@ -47,7 +47,7 @@ use infotheory::*;
 use nyx_lite::SharedMemoryPolicy;
 use std::env;
 use std::fs::File;
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "vm")]
@@ -57,6 +57,111 @@ use std::time::{Duration, Instant};
 use std::time::Instant;
 
 mod search;
+
+struct AixiRunLogger {
+    bits01: Option<BufWriter<File>>,
+    jsonl: Option<BufWriter<File>>,
+    flush_every: usize,
+    step: usize,
+}
+
+impl AixiRunLogger {
+    fn new(v: &serde_json::Value) -> anyhow::Result<Option<Self>> {
+        let bits01_path = v["trace_bits01_path"].as_str();
+        let jsonl_path = v["trace_jsonl_path"].as_str();
+        if bits01_path.is_none() && jsonl_path.is_none() {
+            return Ok(None);
+        }
+
+        let bits01 = if let Some(p) = bits01_path {
+            let f = File::create(p)?;
+            Some(BufWriter::new(f))
+        } else {
+            None
+        };
+        let jsonl = if let Some(p) = jsonl_path {
+            let f = File::create(p)?;
+            Some(BufWriter::new(f))
+        } else {
+            None
+        };
+        let flush_every = v["trace_flush_every"].as_u64().unwrap_or(1024) as usize;
+
+        Ok(Some(Self {
+            bits01,
+            jsonl,
+            flush_every,
+            step: 0,
+        }))
+    }
+
+    fn write_bits01(&mut self, bits: &[bool]) -> anyhow::Result<()> {
+        if let Some(w) = self.bits01.as_mut() {
+            for &b in bits {
+                w.write_all(&[if b { 1u8 } else { 0u8 }])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn log_percept(
+        &mut self,
+        observations: &[u64],
+        reward: i64,
+        observation_bits: usize,
+        reward_bits: usize,
+        reward_offset: i64,
+    ) -> anyhow::Result<()> {
+        // Exact same bit encoding the agent uses internally.
+        let mut bits = Vec::new();
+        for &obs in observations {
+            infotheory::aixi::common::encode(&mut bits, obs, observation_bits);
+        }
+        infotheory::aixi::common::encode_reward_offset(&mut bits, reward, reward_bits, reward_offset);
+
+        self.write_bits01(&bits)?;
+
+        if let Some(w) = self.jsonl.as_mut() {
+            let rec = serde_json::json!({
+                "t": self.step,
+                "kind": "percept",
+                "observations": observations,
+                "reward": reward,
+            });
+            writeln!(w, "{}", rec.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn log_action(&mut self, action: u64, action_bits: usize) -> anyhow::Result<()> {
+        let mut bits = Vec::new();
+        infotheory::aixi::common::encode(&mut bits, action, action_bits);
+        self.write_bits01(&bits)?;
+
+        if let Some(w) = self.jsonl.as_mut() {
+            let rec = serde_json::json!({
+                "t": self.step,
+                "kind": "action",
+                "action": action,
+            });
+            writeln!(w, "{}", rec.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn next_step(&mut self) -> anyhow::Result<()> {
+        self.step = self.step.saturating_add(1);
+        if self.flush_every > 0 && (self.step % self.flush_every == 0) {
+            if let Some(w) = self.bits01.as_mut() {
+                w.flush()?;
+            }
+            if let Some(w) = self.jsonl.as_mut() {
+                w.flush()?;
+            }
+        }
+        Ok(())
+    }
+}
 
 fn rwkv7_model_path_from_env() -> String {
     env::var("RWKV7_MODEL_PATH").unwrap_or_else(|_| {
@@ -1667,10 +1772,24 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     let explore_gamma = v["explore_gamma"].as_f64().unwrap_or(1.0);
     let mut explore_rng = RandomGenerator::new();
 
+    // Optional trace logger: can emit a RWKV-friendly stream (0/1 bytes) and/or JSONL metadata.
+    // NOTE: The bits are emitted in the same order the agent consumes them:
+    // percept bits (obs stream + reward) first, then action bits.
+    let mut trace_logger = AixiRunLogger::new(&v)?;
+
     let learn_start = Instant::now();
     for t in 0..learn_cycles {
         if log_every > 0 && t % log_every == 0 {
             println!("Cycle {}: Obs={:?}, Rew={}", t, obs_repr, rew);
+        }
+        if let Some(l) = trace_logger.as_mut() {
+            l.log_percept(
+                &obs_stream,
+                rew,
+                observation_bits,
+                reward_bits,
+                reward_offset,
+            )?;
         }
         agent.model_update_percept_stream(&obs_stream, rew);
         total_reward += rew;
@@ -1688,6 +1807,12 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         if log_every > 0 && t % log_every == 0 {
             println!("Cycle {}: Planned Action={}", t, action);
         }
+
+        if let Some(l) = trace_logger.as_mut() {
+            // Mirror the agent's action encoding (same number of bits).
+            let action_bits = env.get_action_bits();
+            l.log_action(action, action_bits)?;
+        }
         agent.model_update_action_external(action);
         env.perform_action(action);
         obs_stream = env.drain_observations();
@@ -1695,6 +1820,10 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         obs_repr = agent.observation_repr_from_stream(&obs_stream);
         rew = env.get_reward();
         prev_action = action;
+
+        if let Some(l) = trace_logger.as_mut() {
+            l.next_step()?;
+        }
     }
 
     if perf && learn_cycles > 0 {
@@ -1711,12 +1840,26 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             if log_every > 0 && step % log_every == 0 {
                 println!("Cycle {}: Obs={:?}, Rew={}", step, obs_repr, rew);
             }
+            if let Some(l) = trace_logger.as_mut() {
+                l.log_percept(
+                    &obs_stream,
+                    rew,
+                    observation_bits,
+                    reward_bits,
+                    reward_offset,
+                )?;
+            }
             agent.model_update_percept_stream(&obs_stream, rew);
             eval_total_reward += rew;
 
             let action = agent.get_planned_action(&obs_stream, rew, prev_action);
             if log_every > 0 && step % log_every == 0 {
                 println!("Cycle {}: Planned Action={}", step, action);
+            }
+
+            if let Some(l) = trace_logger.as_mut() {
+                let action_bits = env.get_action_bits();
+                l.log_action(action, action_bits)?;
             }
             agent.model_update_action_external(action);
             env.perform_action(action);
@@ -1725,6 +1868,10 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             obs_repr = agent.observation_repr_from_stream(&obs_stream);
             rew = env.get_reward();
             prev_action = action;
+
+            if let Some(l) = trace_logger.as_mut() {
+                l.next_step()?;
+            }
         }
 
         if perf && eval_cycles > 0 {
@@ -1856,31 +2003,28 @@ fn main() {
         return;
     }
 
-    // Common positional and flag parsing
+    // Common positional and flag parsing.
+    // Collect positionals only up to the first flag token, then parse flags separately.
     let mut file1: Option<String> = None;
     let mut file2: Option<String> = None;
     let mut pos_arg3: Option<String> = None;
     let mut flags_start = 2usize;
 
     if primitive != "search" && primitive != "aixi" {
-        if let Some(f1) = args.get(2) {
-            if !f1.starts_with('-') {
-                file1 = Some(f1.clone());
-                flags_start = 3;
+        let mut positionals: Vec<String> = Vec::new();
+        let mut i = 2usize;
+        while i < args.len() {
+            let tok = &args[i];
+            if tok.starts_with('-') {
+                break;
             }
+            positionals.push(tok.clone());
+            i += 1;
         }
-        if let Some(f2) = args.get(3) {
-            if !f2.starts_with('-') {
-                file2 = Some(f2.clone());
-                flags_start = 4;
-            }
-        }
-        if let Some(a3) = args.get(4) {
-            if !a3.starts_with('-') {
-                pos_arg3 = Some(a3.clone());
-                flags_start = 5;
-            }
-        }
+        flags_start = i;
+        file1 = positionals.first().cloned();
+        file2 = positionals.get(1).cloned();
+        pos_arg3 = positionals.get(2).cloned();
     }
 
     let mut rate_backend_str = "rosaplus".to_string();
@@ -1957,7 +2101,7 @@ fn main() {
             if max_order == 0 && !primitive.contains("rate") && !rate_backend_specified {
                 println!("{}", marginal_entropy_bytes(&data));
             } else {
-                println!("{}", entropy_rate_bytes(&data, max_order));
+                println!("{}", ctx.entropy_rate_bytes(&data, max_order));
             }
         }
         "id" | "intrinsic_dep" => {
@@ -2039,7 +2183,7 @@ Primitives:
     batch                                   Run in JSON-L batch mode
 
 Options:
-  --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'fac-ctw', 'rwkv7', 'zpaq', 'mixture'
+    --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'fac-ctw', 'rwkv7', 'zpaq', 'mixture'
   --ncd-backend <name>    Backend for NCD: 'zpaq' (default), 'rwkv7'
   --method <val>          Method/Depth parameter (e.g. '5' for zpaq, '16' for ctw, or path to mixture spec JSON)
 

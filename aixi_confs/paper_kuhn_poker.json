@@ -1,16 +1,18 @@
 {
   "environment": "kuhn-poker",
   "algorithm": "fac-ctw",
-  "ct_depth": 42,
+  "ct_depth": 16,
+  "trace_bit01_path": "runs/kuhnpoker.bits01.bin",
+  "trace_jsonl_path": "runs/kuhnpoker.trace.jsonl",
   "agent_horizon": 2,
   "observation_bits": 4,
   "reward_bits": 3,
   "agent_actions": 2,
   "reward_offset": 2,
-  "num_simulations": 500,
+  "num_simulations": 200,
   "exploration_exploitation_ratio": 1.4,
   "explore_epsilon": 0.99,
   "explore_gamma": 0.9999,
-  "learn_cycles": 50000,
-  "eval_cycles": 5000
+  "learn_cycles": 25000,
+  "eval_cycles": 200
 }
