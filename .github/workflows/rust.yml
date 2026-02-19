@@ -70,6 +70,9 @@ jobs:
           curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
+      - name: Build infotheory CLI for Lean validation
+        run: cargo build --release --features cli --bin infotheory --locked
+
       - name: Run Lean validation (ite-bench)
         run: ./projman.sh lean_test
 
