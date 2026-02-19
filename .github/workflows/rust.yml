@@ -184,9 +184,27 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Detect musl linker
+        shell: sh
+        run: |
+          set -eu
+          linker=""
+          for cand in x86_64-linux-musl-gcc x86_64-linux-musl-cc musl-gcc; do
+            if command -v "$cand" >/dev/null 2>&1; then
+              linker="$cand"
+              break
+            fi
+          done
+          if [ -z "$linker" ]; then
+            echo "No musl cross-linker found in container" >&2
+            exit 1
+          fi
+          echo "Using musl linker: $linker"
+          echo "MUSL_LINKER=$linker" >> "$GITHUB_ENV"
+
       - name: Feature checks (musl target)
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ env.MUSL_LINKER }}
         run: |
           RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-musl --features cli --locked
           RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-musl --no-default-features --features cli --locked
@@ -194,7 +212,7 @@ jobs:
 
       - name: Build release CLI binary
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ env.MUSL_LINKER }}
         run: |
           cargo rustc --release --features cli --bin infotheory --target x86_64-unknown-linux-musl --locked -- -C target-cpu=x86-64
 
@@ -221,3 +239,98 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: infotheory-cli-x86_64-unknown-linux-musl.tar.gz
+
+  platform-bsd:
+    name: BSD ${{ matrix.os }} (${{ matrix.version }})
+    needs: lint-security-lean
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: freebsd
+            version: "15.0"
+          - os: openbsd
+            version: "7.8"
+          - os: netbsd
+            version: "10.1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cross-platform BSD checks
+        uses: cross-platform-actions/action@v0.32.0
+        with:
+          operating_system: ${{ matrix.os }}
+          version: ${{ matrix.version }}
+          architecture: x86_64
+          memory: 6G
+          environment_variables: CARGO_TERM_COLOR
+          shell: sh
+          run: |
+            set -eu
+
+            as_root() {
+              if command -v sudo >/dev/null 2>&1; then
+                sudo "$@"
+              elif command -v doas >/dev/null 2>&1; then
+                doas "$@"
+              else
+                "$@"
+              fi
+            }
+
+            ensure_rust() {
+              if command -v cargo >/dev/null 2>&1; then
+                return 0
+              fi
+              if command -v pkg >/dev/null 2>&1; then
+                as_root pkg update -f || true
+                as_root pkg install -y rust || true
+              elif command -v pkgin >/dev/null 2>&1; then
+                as_root pkgin -y update || true
+                as_root pkgin -y install rust || true
+              elif command -v pkg_add >/dev/null 2>&1; then
+                as_root pkg_add rust || true
+              fi
+              if ! command -v cargo >/dev/null 2>&1; then
+                if command -v curl >/dev/null 2>&1; then
+                  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+                elif command -v ftp >/dev/null 2>&1; then
+                  ftp -o /tmp/rustup-init.sh https://sh.rustup.rs
+                  sh /tmp/rustup-init.sh -y --profile minimal
+                else
+                  echo "Unable to install Rust toolchain in BSD runner" >&2
+                  exit 1
+                fi
+              fi
+            }
+
+            ensure_rust
+            export PATH="/usr/local/bin:/usr/pkg/bin:$HOME/.cargo/bin:$PATH"
+            cargo --version
+            rustc --version
+
+            OS="$(uname -s)"
+            case "$OS" in
+              NetBSD)
+                export CARGO_FEATURE_NOJIT=1
+                if ! command -v clang >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
+                  export CARGO_TARGET_X86_64_UNKNOWN_NETBSD_LINKER=cc
+                fi
+                ;;
+              OpenBSD)
+                export CARGO_FEATURE_NOJIT=1
+                ;;
+              FreeBSD)
+                :
+                ;;
+            esac
+
+            cargo check --locked --features cli
+            cargo check --locked --no-default-features --features cli
+            cargo test --locked --features cli
+            cargo test --locked --no-default-features

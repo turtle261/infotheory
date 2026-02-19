@@ -65,19 +65,25 @@
     int zpaq_cli_main(int argc, const char** argv);
 #endif
 
-// memrchr is a GNU extension not available on Windows
-#ifdef _WIN32
-static inline const void* memrchr(const void* s, int c, size_t n) {
+// Reverse-search helper:
+// - Use system memrchr where it is known to exist (GNU/Linux + BSDs).
+// - Use a local fallback on platforms where memrchr is typically unavailable
+//   (notably macOS and Windows). IF PORTING: Here may be a point to change!
+static inline const void* zpaq_memrchr(const void* s, int c, size_t n) {
+#if defined(__APPLE__) || defined(_WIN32)
     if (!s || n == 0) return nullptr;
-    const unsigned char* p = static_cast<const unsigned char*>(s) + n;
+    const unsigned char* begin = static_cast<const unsigned char*>(s);
+    const unsigned char* p = begin + n;
     const unsigned char ch = static_cast<unsigned char>(c);
-    while (p > s) {
+    while (p != begin) {
         --p;
         if (*p == ch) return p;
     }
     return nullptr;
-}
+#else
+    return ::memrchr(s, c, n);
 #endif
+}
 
 namespace {
 
@@ -461,7 +467,7 @@ static bool parse_last_archive_mb(const char* s, size_t n, double* out_mb) {
   const char* p = end;
   while (p > s) {
     // Find previous '='
-    const char* eq = (const char*)memrchr(s, '=', (size_t)(p - s));
+    const char* eq = (const char*)zpaq_memrchr(s, '=', (size_t)(p - s));
     if (!eq) break;
     const char* q = eq + 1;
     while (q < end && (*q == ' ' || *q == '\t')) ++q;
