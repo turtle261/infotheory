@@ -79,10 +79,18 @@ fn main() {
     // Try to enable LTO for the C++ objects in release-like profiles.
     // Cross-language LTO (Rust <-> C++) is toolchain-dependent; this at least
     // enables LTO within the C++ compilation unit(s) when supported.
-    // Note: On Windows with clang++ + MSVC linker, -flto produces LLVM IR
-    // which lib.exe can't handle, so we skip LTO on Windows.
+    // Notes:
+    // - On Windows with clang++ + MSVC linker, -flto produces LLVM IR
+    //   which lib.exe can't handle, so we skip LTO on Windows.
+    // - On NetBSD, archive/link toolchains commonly miss the LTO plugin for
+    //   C++ objects, which can drop symbols from libzpaq_rs_ffi.a. Disable
+    //   C++-side LTO there to preserve reliable linking.
     let profile = env::var("PROFILE").unwrap_or_default();
-    if (profile == "release" || profile == "bench") && !cfg!(windows) {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if (profile == "release" || profile == "bench")
+        && !cfg!(windows)
+        && target_os != "netbsd"
+    {
         build.flag_if_supported("-flto");
     }
 
