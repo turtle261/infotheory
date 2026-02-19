@@ -90,11 +90,13 @@ jobs:
             runs_on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             run_vm: true
+            rustdocflags: -C target-cpu=native -C link-arg=-fuse-ld=lld
             artifact_ext: ""
           - name: macOS (x86_64)
             runs_on: macos-15-intel
             target: x86_64-apple-darwin
             run_vm: false
+            rustdocflags: -C target-cpu=native
             artifact_ext: ""
     steps:
       - uses: actions/checkout@v4
@@ -127,12 +129,16 @@ jobs:
         run: cargo check --features vm --locked
 
       - name: Test matrix
+        env:
+          RUSTDOCFLAGS: ${{ matrix.rustdocflags }}
         run: |
           cargo test --release --locked
           cargo test --release --no-default-features --locked
 
       - name: VM tests
         if: ${{ matrix.run_vm }}
+        env:
+          RUSTDOCFLAGS: ${{ matrix.rustdocflags }}
         run: cargo test --release --features vm --locked
 
       - name: Build release CLI binary
@@ -167,14 +173,6 @@ jobs:
     name: Linux musl (x86_64)
     needs: lint-security-lean
     runs-on: ubuntu-latest
-    container: alpine:3.23.3
-    env:
-      CARGO_HOME: /root/.cargo
-      RUSTUP_HOME: /root/.rustup
-      CC_x86_64_unknown_linux_musl: clang
-      CXX_x86_64_unknown_linux_musl: clang++
-      CFLAGS_x86_64_unknown_linux_musl: --gcc-toolchain=/usr
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: clang
     permissions:
       contents: write
     steps:
@@ -182,70 +180,59 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Alpine build dependencies
-        run: |
-          set -eux
-          apk add --no-cache \
-            bash \
-            build-base \
-            clang \
-            lld \
-            curl \
-            ca-certificates \
-            git \
-            musl-dev \
-            pkgconf
+      - name: Cache musl toolchain + target artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci-cache/musl/cargo
+            .ci-cache/musl/rustup
+            target/x86_64-unknown-linux-musl
+          key: ${{ runner.os }}-musl-alpine-3.23.3-${{ hashFiles('Cargo.lock', '.github/workflows/rust.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-musl-alpine-3.23.3-
 
-      - name: Install Rust toolchain (stable + musl target)
+      - name: Comprehensive musl validation + build (Alpine 3.23.3)
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v rustup >/dev/null 2>&1; then
-            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-          fi
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-          export PATH="$CARGO_HOME/bin:$PATH"
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustup target add x86_64-unknown-linux-musl
-          rustc --version
-          cargo --version
+          mkdir -p .ci-cache/musl/cargo .ci-cache/musl/rustup
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$PWD/.ci-cache/musl/cargo:/root/.cargo" \
+            -v "$PWD/.ci-cache/musl/rustup:/root/.rustup" \
+            -w /work \
+            -e CARGO_TERM_COLOR=always \
+            alpine:3.23.3 \
+            sh -euxc '
+              apk add --no-cache bash build-base clang lld curl ca-certificates git musl-dev pkgconf
+              if ! command -v rustup >/dev/null 2>&1; then
+                curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              fi
+              . /root/.cargo/env
+              rustup toolchain install stable --profile minimal --no-self-update
+              rustup default stable
+              rustup target add x86_64-unknown-linux-musl
 
-      - name: Configure clang flags for musl target
-        shell: bash
-        run: |
-          set -euo pipefail
-          gcc_ver="$(g++ -dumpversion)"
-          cxx_base="/usr/include/c++/${gcc_ver}"
-          if [ ! -d "${cxx_base}" ]; then
-            echo "Missing C++ include directory: ${cxx_base}" >&2
-            exit 1
-          fi
-          {
-            echo "CXXFLAGS_x86_64_unknown_linux_musl<<EOF"
-            echo "--gcc-toolchain=/usr -isystem ${cxx_base} -isystem ${cxx_base}/x86_64-alpine-linux-musl -isystem ${cxx_base}/backward"
-            echo "EOF"
-            echo "MUSL_LD_RUSTFLAGS=-C link-arg=-fuse-ld=lld"
-          } >> "$GITHUB_ENV"
+              gcc_ver="$(g++ -dumpversion)"
+              cxx_base="/usr/include/c++/${gcc_ver}"
+              export CC_x86_64_unknown_linux_musl=clang
+              export CXX_x86_64_unknown_linux_musl=clang++
+              export CFLAGS_x86_64_unknown_linux_musl="--gcc-toolchain=/usr"
+              export CXXFLAGS_x86_64_unknown_linux_musl="--gcc-toolchain=/usr -isystem ${cxx_base} -isystem ${cxx_base}/x86_64-alpine-linux-musl -isystem ${cxx_base}/backward"
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=clang
+              export MUSL_LD_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+              export MUSL_RUSTDOCFLAGS="-C target-cpu=native -C link-arg=-fuse-ld=lld"
 
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --no-default-features --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --features cli --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --no-default-features --features cli --locked
 
-      - name: Feature checks (musl target)
-        shell: bash
-        run: |
-          set -euo pipefail
-          export PATH="$CARGO_HOME/bin:$PATH"
-          RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --features cli --locked
-          RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --no-default-features --features cli --locked
-          RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" cargo test --release --target x86_64-unknown-linux-musl --features cli --no-run --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test --release --target x86_64-unknown-linux-musl --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test --release --target x86_64-unknown-linux-musl --no-default-features --locked
 
-      - name: Build release CLI binary
-        shell: bash
-        run: |
-          set -euo pipefail
-          export PATH="$CARGO_HOME/bin:$PATH"
-          RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" cargo rustc --release --features cli --bin infotheory --target x86_64-unknown-linux-musl --locked -- -C target-cpu=x86-64
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" cargo rustc --release --features cli --bin infotheory --target x86_64-unknown-linux-musl --locked -- -C target-cpu=x86-64
+            '
 
       - name: Package binary artifact
         shell: bash
@@ -272,27 +259,33 @@ jobs:
           files: infotheory-cli-x86_64-unknown-linux-musl.tar.gz
 
   platform-bsd:
-    name: BSD ${{ matrix.os }} (${{ matrix.version }})
+    name: BSD x86_64 ${{ matrix.os }} (${{ matrix.version }})
     needs: lint-security-lean
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: freebsd
             version: "15.0"
+            target: x86_64-unknown-freebsd
+            rustdocflags: -C target-cpu=native -C link-arg=-fuse-ld=lld
           - os: openbsd
             version: "7.8"
+            target: x86_64-unknown-openbsd
+            rustdocflags: -C target-cpu=native -C link-arg=-fuse-ld=lld
           - os: netbsd
             version: "10.1"
+            target: x86_64-unknown-netbsd
+            rustdocflags: -C target-cpu=native
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Cross-platform BSD checks
+      - name: Cross-platform BSD validation + build
         uses: cross-platform-actions/action@v0.32.0
         with:
           operating_system: ${{ matrix.os }}
@@ -349,6 +342,7 @@ jobs:
             case "$OS" in
               NetBSD)
                 export CARGO_FEATURE_NOJIT=1
+                export CARGO_PROFILE_RELEASE_LTO=off
                 if ! command -v clang >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
                   export CARGO_TARGET_X86_64_UNKNOWN_NETBSD_LINKER=cc
                 fi
@@ -361,7 +355,31 @@ jobs:
                 ;;
             esac
 
-            cargo check --locked --features cli
-            cargo check --locked --no-default-features --features cli
-            cargo test --locked --features cli
-            cargo test --locked --no-default-features
+            export RUSTDOCFLAGS="${{ matrix.rustdocflags }}"
+
+            RUSTFLAGS="-D warnings" cargo check --locked
+            RUSTFLAGS="-D warnings" cargo check --locked --no-default-features
+            RUSTFLAGS="-D warnings" cargo check --locked --features cli
+            RUSTFLAGS="-D warnings" cargo check --locked --no-default-features --features cli
+
+            cargo test --release --locked
+            cargo test --release --no-default-features --locked
+
+            cargo rustc --release --features cli --bin infotheory --locked -- -C target-cpu=x86-64
+
+            mkdir -p dist
+            cp target/release/infotheory dist/infotheory
+            tar -C dist -czf "infotheory-cli-${{ matrix.target }}.tar.gz" infotheory
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infotheory-cli-${{ matrix.target }}
+          path: infotheory-cli-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload binary to GitHub release (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: infotheory-cli-${{ matrix.target }}.tar.gz
