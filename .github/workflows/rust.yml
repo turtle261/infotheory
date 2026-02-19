@@ -92,7 +92,7 @@ jobs:
             run_vm: true
             artifact_ext: ""
           - name: macOS (x86_64)
-            runs_on: macos-13
+            runs_on: macos-15-intel
             target: x86_64-apple-darwin
             run_vm: false
             artifact_ext: ""
@@ -175,10 +175,11 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
+      - name: Verify musl toolchain in container
+        run: |
+          rustc --version
+          cargo --version
+          rustup target list --installed || true
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
