@@ -87,10 +87,7 @@ fn main() {
     //   C++-side LTO there to preserve reliable linking.
     let profile = env::var("PROFILE").unwrap_or_default();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if (profile == "release" || profile == "bench")
-        && !cfg!(windows)
-        && target_os != "netbsd"
-    {
+    if (profile == "release" || profile == "bench") && !cfg!(windows) && target_os != "netbsd" {
         build.flag_if_supported("-flto");
     }
 
