@@ -1933,7 +1933,7 @@ checksum = "ac93432f5b761b22864c774aac244fa5c0fd877678a4c37ebf6cf42208f9c9ec"
 
 [[package]]
 name = "zpaq_rs"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cc",
  "hex",

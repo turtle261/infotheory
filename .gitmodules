@@ -1,3 +1,6 @@
 [submodule "nyx-lite"]
 	path = nyx-lite
 	url = https://github.com/turtle261/nyx-lite.git
+[submodule "zpaq_rs"]
+	path = zpaq_rs
+	url = https://github.com/turtle261/zpaq-rs

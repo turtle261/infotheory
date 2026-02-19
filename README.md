@@ -2,7 +2,7 @@
 
 ### 1. Unified Information Estimation
 Estimate core measures using both **Marginal** (distribution-based) and **Rate** (predictive-based) approaches:
-- **NCD (Normalized Compression Distance)**: Approximates information distance using real-world compressors (ZPAQ).
+- **NCD (Normalized Compression Distance)**: Approximates information distance using compression.
 - **MI (Mutual Information)**: Quantifies shared information between sequences.
 - **NED (Normalized Entropy Distance)**: A metric distance based on mutual information.
 - **NTE (Normalized Transform Effort)**: Variation of Information (VI).
@@ -11,44 +11,48 @@ Estimate core measures using both **Marginal** (distribution-based) and **Rate**
 
 ### 2. Multi-Backend Predictive Engine
 Switch between different modeling paradigms seamlessly:
-- **ROSA+ (Rapid Online Suffix Automaton + Witten Bell)**: A statistical LM. Default backend. Extremely fast online learning. Highly optimized for x86_64, memory tuned, parallelized, and with disk-caching.
+- **ROSA+ (Rapid Online Suffix Automaton + Witten Bell)**: A fast statistical LM. Default backend. 
 - **CTW (Context Tree Weighting)**: Historically standard for AIXI. Accurate bit-level Bayesian model (KT-estimator).
-- **RWKV (Neural Network)**: Highly optimized x86_64 RWKV7 LLM CPU inference kernel, and training (requires CUDA only for training).
+- **RWKV (Neural Network)**: Highly optimized x86_64 RWKV7 CPU inference backend.
 
 ### 3. Integrated MC-AIXI Agent
 Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, or RWKV) for universal reinforcement learning.
 
-Provided, our library full includes native RWKV7 Model Training (Hybrid CPU/GPU) -- and a native optimized CPU inference Kernel(which will be faster than GPU for all but huge models). Training REQUIRES CUDA, but you can bring your own model instead. CPU Inference is explicitly SIMD optimized, for x86_64 -- so: non x86_64 architectures will be slower or perhaps not work at all for RWKV -- same goes for really old x86_64 without FMA/AVX2.
-Therefore, you can use a trained RWKV7 model as a rate backend/"World Model" for MC-AIXI. Meaning, you can get information inside the Agent's mind before it ever makes a decision or plan. You can train the model on agent output, etc. 
+RWKV inference is SIMD-optimized for x86_64. On non-x86_64 systems, or very old x86_64 CPUs without AVX2/FMA, performance may be significantly lower and support may be limited.
+You can use a trained RWKV7 model as a rate backend ("world model") for MC-AIXI. Something like Rosetta 2 should make an exception to this for Apple Silicon.
 
 ---
 
 ## Compilation & Installation
-### Compiling Infotheory
-X86_64 Linux TLDR: Install Rust, Clang, and do `cargo build --release`. That's all.
-Infotheory is tested on x86_64 architecture only. It should work on other architectures, but I have not tested it yet.
-It is known to work with the Following OS's:
-- **Linux**: Install Rust via Rustup, and install clang++ and lld from your distribution's package manager.
-- **FreeBSD**: `pkg install rust`
-- **OpenBSD**: `pkg_add rust`
-- **NetBSD**\*: `pkg_add rust clang lld` 
+### Platform Support (tested)
+`infotheory` is currently tested on **x86_64** for:
+- **Linux (GNU libc)** (`x86_64-unknown-linux-gnu`)
+- **Linux (musl)** (`x86_64-unknown-linux-musl`)
+- **macOS (Intel)** (`x86_64-apple-darwin`)
+- **FreeBSD** (`x86_64-unknown-freebsd`)
+- **OpenBSD** (`x86_64-unknown-openbsd`)
+- **NetBSD** (`x86_64-unknown-netbsd`)
 
-It MAY work on Windows or MacOS, but I have not been able to test that yet. 
-* NetBSD will need manual configuration to get this compiling, but is tested to work. Read the comments in the netbsd section of.cargo/.config.toml in this repository. TLDR: LTO breaks it on NetBSD, so disable it.
+<small>Apple Silicon (AARCH64) with MacOS can run this program using Rosetta 2</small>
 
-NOTE for NetBSD, OpenBSD, non-x86_64, and potentially other systems:
-If your Kernel enforces W^X protection (as NetBSD and OpenBSD do), you will need to set the environment variable `CARGO_FEATURE_NOJIT` equal to something, such as "true". This is very important, as ZPAQ will fail at **runtime** otherwise.
-If you are not using x86_64, ZPAQ JIT will also not work, and should be disabled.
-You will get innacurate NCD results otherwise. JIT should work fine on Linux(x86_64!), and you should not set the env variable there--enjoy the better performance.
+### Build Prerequisites
+- Rust toolchain (stable): `rustup` recommended.
+- C/C++ toolchain: `clang` + `lld` recommended on Unix-like systems.
+- For local repository builds with VM support available: clone recursively (`--recurse-submodules`) so `nyx-lite` is present.
 
+### Build the CLI
+Enable the `cli` feature (the binary is feature-gated):
 
-if using as a CLI:
-0. Install dependencies as noted above.
-1. Use git to clone the repository (recursively) -- configure as needed for your platform (x86_64 Linux, FreeBSD will work by default)
-2. Run `cargo build --release` and the infotheory CLI will be present at `./target/release/infotheory`.
+```bash
+cargo build --release --features cli --bin infotheory
+```
 
-if using as a library:
-Add the following to your `Cargo.toml`:
+Output binary:
+- `./target/release/infotheory` (host target)
+- `./target/<target-triple>/release/infotheory` (cross target)
+
+### Build as a library
+Add the dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -56,14 +60,21 @@ infotheory = { path = "." } # Or git or whatever, you know rust.
 ```
 
 ### Building nyx-lite
-`nyx-lite` is included as a workspace member. Build it with:
+The VM backend is optional (`--features vm`) and depends on `nyx-lite` (and its vendored submodule code). Build it with:
 ```bash
-cargo build -p nyx-lite
+cargo build --release --features vm
 ```
-Note: some nyx-lite tests require `/dev/kvm` and VM image artifacts under `nyx-lite/vm_image`.
+Notes:
+- VM is Linux/KVM-oriented (`/dev/kvm` required).
+- Some `nyx-lite` tests also require VM image artifacts under `nyx-lite/vm_image`.
 
 ### Additional notes
-Some tests/dependencies which may be optional in some cases but not all:
+Platform caveats:
+- **OpenBSD/NetBSD**: kernel W^X policies can break ZPAQ JIT at runtime. Set `CARGO_FEATURE_NOJIT=true`.
+- **NetBSD**: release LTO is problematic in common toolchains; disable release LTO if needed (see `.cargo/config.toml` comments).
+- **MacOS**: MacOS is supported in full, and will work on both Intel and Modern Apple Silicon natively due to Rosetta.
+
+Optional tooling used by some tests/workflows:
 - docker (for tests, or if you want to use it for rootfs generation)
 - cpio
 - wget (for tests, or to use the provided kernel. you can also use curl instead manually on the download_kernel.sh file )
@@ -75,7 +86,7 @@ Some tests/dependencies which may be optional in some cases but not all:
 
 The `infotheory` binary provides a powerful interface for file analysis.
 
-### Information Theoretic Primitives
+### Primitives
 ```bash
 # Calculate Mutual Information (ROSA backend, order 8)
 ./infotheory mi file1.txt file2.txt 8
