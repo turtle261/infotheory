@@ -167,7 +167,14 @@ jobs:
     name: Linux musl (x86_64)
     needs: lint-security-lean
     runs-on: ubuntu-latest
-    container: messense/rust-musl-cross:x86_64-musl
+    container: alpine:3.23.3
+    env:
+      CARGO_HOME: /root/.cargo
+      RUSTUP_HOME: /root/.rustup
+      CC_x86_64_unknown_linux_musl: clang
+      CXX_x86_64_unknown_linux_musl: clang++
+      CFLAGS_x86_64_unknown_linux_musl: --gcc-toolchain=/usr
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: clang
     permissions:
       contents: write
     steps:
@@ -175,46 +182,70 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Verify musl toolchain in container
+      - name: Install Alpine build dependencies
         run: |
+          set -eux
+          apk add --no-cache \
+            bash \
+            build-base \
+            clang \
+            lld \
+            curl \
+            ca-certificates \
+            git \
+            musl-dev \
+            pkgconf
+
+      - name: Install Rust toolchain (stable + musl target)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$CARGO_HOME/bin:$PATH"
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
           rustc --version
           cargo --version
-          rustup target list --installed || true
+
+      - name: Configure clang flags for musl target
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcc_ver="$(g++ -dumpversion)"
+          cxx_base="/usr/include/c++/${gcc_ver}"
+          if [ ! -d "${cxx_base}" ]; then
+            echo "Missing C++ include directory: ${cxx_base}" >&2
+            exit 1
+          fi
+          {
+            echo "CXXFLAGS_x86_64_unknown_linux_musl<<EOF"
+            echo "--gcc-toolchain=/usr -isystem ${cxx_base} -isystem ${cxx_base}/x86_64-alpine-linux-musl -isystem ${cxx_base}/backward"
+            echo "EOF"
+            echo "MUSL_LD_RUSTFLAGS=-C link-arg=-fuse-ld=lld"
+          } >> "$GITHUB_ENV"
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Detect musl linker
-        shell: sh
-        run: |
-          set -eu
-          linker=""
-          for cand in x86_64-linux-musl-gcc x86_64-linux-musl-cc musl-gcc; do
-            if command -v "$cand" >/dev/null 2>&1; then
-              linker="$cand"
-              break
-            fi
-          done
-          if [ -z "$linker" ]; then
-            echo "No musl cross-linker found in container" >&2
-            exit 1
-          fi
-          echo "Using musl linker: $linker"
-          echo "MUSL_LINKER=$linker" >> "$GITHUB_ENV"
-
       - name: Feature checks (musl target)
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ env.MUSL_LINKER }}
+        shell: bash
         run: |
-          RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-musl --features cli --locked
-          RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-musl --no-default-features --features cli --locked
-          cargo test --release --target x86_64-unknown-linux-musl --features cli --no-run --locked
+          set -euo pipefail
+          export PATH="$CARGO_HOME/bin:$PATH"
+          RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --features cli --locked
+          RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --no-default-features --features cli --locked
+          RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" cargo test --release --target x86_64-unknown-linux-musl --features cli --no-run --locked
 
       - name: Build release CLI binary
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ env.MUSL_LINKER }}
+        shell: bash
         run: |
-          cargo rustc --release --features cli --bin infotheory --target x86_64-unknown-linux-musl --locked -- -C target-cpu=x86-64
+          set -euo pipefail
+          export PATH="$CARGO_HOME/bin:$PATH"
+          RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" cargo rustc --release --features cli --bin infotheory --target x86_64-unknown-linux-musl --locked -- -C target-cpu=x86-64
 
       - name: Package binary artifact
         shell: bash
