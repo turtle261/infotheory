@@ -670,7 +670,8 @@ mod tests {
         let mut agent = DummyAgent::new(4, ObservationKeyMode::Last);
 
         // Build tree keyed on a different reward so the percept key won't match.
-        let mut tree = build_tree_with_key(&agent, prev_act, &prev_obs_stream, prev_rew + 1, 9.0, 2);
+        let mut tree =
+            build_tree_with_key(&agent, prev_act, &prev_obs_stream, prev_rew + 1, 9.0, 2);
 
         tree.prune_tree(&mut agent, &prev_obs_stream, prev_rew, prev_act);
 

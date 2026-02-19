@@ -1,4 +1,4 @@
-use zpaq_rs::{compress_size, StreamingCompressor};
+use zpaq_rs::{StreamingCompressor, compress_size};
 
 #[test]
 #[ignore = "streaming zpaq encoder is experimental; enable when stable"]

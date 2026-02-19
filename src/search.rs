@@ -1,6 +1,6 @@
+use infotheory::rosaplus::RosaPlus;
 use infotheory::{InfotheoryCtx, RateBackend, cross_entropy_bytes, marginal_entropy_bytes};
 use rayon::prelude::*;
-use rosaplus::RosaPlus;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};

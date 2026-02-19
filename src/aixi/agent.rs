@@ -8,10 +8,12 @@ use crate::aixi::common::{
     observation_repr_from_stream,
 };
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
-use crate::aixi::model::{
-    CtwPredictor, FacCtwPredictor, Predictor, RosaPredictor, RwkvPredictor, ZpaqPredictor,
-};
-use crate::{load_rwkv7_model_from_path, validate_zpaq_rate_method};
+#[cfg(feature = "backend-rwkv")]
+use crate::aixi::model::RwkvPredictor;
+use crate::aixi::model::{CtwPredictor, FacCtwPredictor, Predictor, RosaPredictor, ZpaqPredictor};
+#[cfg(feature = "backend-rwkv")]
+use crate::load_rwkv7_model_from_path;
+use crate::validate_zpaq_rate_method;
 
 /// Configuration parameters for an AIXI agent.
 #[derive(Clone, Debug)]
@@ -112,6 +114,7 @@ impl Agent {
                 let max_order = config.rosa_max_order.unwrap_or(20);
                 Box::new(RosaPredictor::new(max_order))
             }
+            #[cfg(feature = "backend-rwkv")]
             "rwkv" => {
                 let path = config
                     .rwkv_model_path
@@ -120,6 +123,8 @@ impl Agent {
                 let model_arc = load_rwkv7_model_from_path(path);
                 Box::new(RwkvPredictor::new(model_arc))
             }
+            #[cfg(not(feature = "backend-rwkv"))]
+            "rwkv" => panic!("RWKV backend disabled at compile time"),
             "zpaq" => {
                 let method = config
                     .zpaq_method
@@ -335,7 +340,6 @@ impl AgentSimulator for Agent {
                 self.model.pop_history();
             }
         }
-
     }
 
     fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn AgentSimulator> {

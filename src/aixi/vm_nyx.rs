@@ -22,14 +22,16 @@
 
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::environment::Environment;
+#[cfg(feature = "backend-rwkv")]
+use crate::coders::softmax_pdf_inplace;
 use crate::mixture::OnlineBytePredictor;
+use crate::rosaplus::RosaPlus;
+#[cfg(feature = "backend-rwkv")]
+use crate::rwkvzip::Compressor;
+use crate::zpaq_rate::ZpaqRateModel;
 use crate::{
     RateBackend, cross_entropy_rate_backend, entropy_rate_backend, marginal_entropy_bytes,
 };
-use crate::zpaq_rate::ZpaqRateModel;
-use rosaplus::RosaPlus;
-use rwkvzip::Compressor;
-use rwkvzip::coders::softmax_pdf_inplace;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::fs::OpenOptions;
@@ -463,7 +465,6 @@ pub struct NyxVmConfig {
     // Crash logging
     /// Path to log crashes/interesting behaviors (JSONL format).
     pub crash_log: Option<String>,
-
 }
 
 impl Default for NyxVmConfig {

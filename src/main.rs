@@ -32,8 +32,7 @@
 use infotheory::aixi::agent::{Agent, AgentConfig};
 use infotheory::aixi::common::{ObservationKeyMode, RandomGenerator};
 use infotheory::aixi::environment::{
-    BiasedRockPaperScissor, CoinFlip, CtwTest, Environment, ExtendedTiger, KuhnPoker,
-    TicTacToe,
+    BiasedRockPaperScissor, CoinFlip, CtwTest, Environment, ExtendedTiger, KuhnPoker, TicTacToe,
 };
 #[cfg(feature = "vm")]
 use infotheory::aixi::vm_nyx::{
@@ -117,7 +116,12 @@ impl AixiRunLogger {
         for &obs in observations {
             infotheory::aixi::common::encode(&mut bits, obs, observation_bits);
         }
-        infotheory::aixi::common::encode_reward_offset(&mut bits, reward, reward_bits, reward_offset);
+        infotheory::aixi::common::encode_reward_offset(
+            &mut bits,
+            reward,
+            reward_bits,
+            reward_offset,
+        );
 
         self.write_bits01(&bits)?;
 
@@ -163,6 +167,7 @@ impl AixiRunLogger {
     }
 }
 
+#[cfg(feature = "backend-rwkv")]
 fn rwkv7_model_path_from_env() -> String {
     env::var("RWKV7_MODEL_PATH").unwrap_or_else(|_| {
         eprintln!("Error: RWKV7_MODEL_PATH env var must be set when using rwkv7 backends");
@@ -171,30 +176,28 @@ fn rwkv7_model_path_from_env() -> String {
 }
 
 fn parse_rate_backend(v: &str) -> Option<&'static str> {
-    match v {
-        "rosaplus" | "rosa" => Some("rosaplus"),
-        "rwkv7" | "rwkv" => Some("rwkv7"),
-        "ctw" => Some("ctw"),
-        "fac-ctw" | "facctw" => Some("fac-ctw"),
-        "zpaq" => Some("zpaq"),
-        "mixture" | "mix" => Some("mixture"),
-        _ => None,
+    match infotheory::backends::resolve_rate_backend_name(v) {
+        Some(infotheory::backends::BackendAvailability::Enabled(name)) => Some(name),
+        Some(infotheory::backends::BackendAvailability::Disabled { canonical, feature }) => {
+            eprintln!(
+                "Error: rate backend '{canonical}' requires infotheory built with feature '{feature}'"
+            );
+            std::process::exit(1);
+        }
+        None => None,
     }
 }
 
 fn parse_ncd_backend(v: &str) -> Option<&'static str> {
-    match v {
-        "zpaq" => Some("zpaq"),
-        "rwkv7" | "rwkv" => Some("rwkv7"),
-        _ => None,
-    }
-}
-
-fn parse_rwkv7_coder(v: &str) -> Option<rwkvzip::CoderType> {
-    match v {
-        "ac" | "AC" => Some(rwkvzip::CoderType::AC),
-        "rans" | "RANS" | "rANS" => Some(rwkvzip::CoderType::RANS),
-        _ => None,
+    match infotheory::backends::resolve_ncd_backend_name(v) {
+        Some(infotheory::backends::BackendAvailability::Enabled(name)) => Some(name),
+        Some(infotheory::backends::BackendAvailability::Disabled { canonical, feature }) => {
+            eprintln!(
+                "Error: NCD backend '{canonical}' requires infotheory built with feature '{feature}'"
+            );
+            std::process::exit(1);
+        }
+        None => None,
     }
 }
 
@@ -247,7 +250,9 @@ fn parse_mixture_spec_value(
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("mixture spec missing 'experts' array"))?;
     if experts_v.is_empty() {
-        return Err(anyhow::anyhow!("mixture spec must include at least one expert"));
+        return Err(anyhow::anyhow!(
+            "mixture spec must include at least one expert"
+        ));
     }
     let mut experts = Vec::with_capacity(experts_v.len());
     for e in experts_v {
@@ -273,11 +278,20 @@ fn parse_mixture_expert_value(
     if depth == 0 {
         return Err(anyhow::anyhow!("mixture spec nesting too deep"));
     }
-    let kind = v["kind"]
+    let raw_kind = v["kind"]
         .as_str()
         .or_else(|| v["type"].as_str())
         .or_else(|| v["backend"].as_str())
         .ok_or_else(|| anyhow::anyhow!("expert missing 'kind'"))?;
+    let kind = match infotheory::backends::resolve_rate_backend_name(raw_kind) {
+        Some(infotheory::backends::BackendAvailability::Enabled(name)) => name,
+        Some(infotheory::backends::BackendAvailability::Disabled { canonical, feature }) => {
+            return Err(anyhow::anyhow!(
+                "expert backend '{canonical}' requires infotheory feature '{feature}'"
+            ));
+        }
+        None => return Err(anyhow::anyhow!("unknown expert kind '{raw_kind}'")),
+    };
     let name = v["name"].as_str().map(|s| s.to_string());
     let log_prior = v["log_prior"]
         .as_f64()
@@ -285,7 +299,7 @@ fn parse_mixture_expert_value(
         .unwrap_or(0.0);
 
     match kind {
-        "rosa" | "rosaplus" => {
+        "rosaplus" => {
             let max_order = v["max_order"]
                 .as_i64()
                 .or_else(|| v["order"].as_i64())
@@ -309,7 +323,7 @@ fn parse_mixture_expert_value(
                 backend: RateBackend::Ctw { depth },
             })
         }
-        "fac-ctw" | "facctw" => {
+        "fac-ctw" => {
             let base_depth = v["base_depth"]
                 .as_u64()
                 .or_else(|| v["ct_depth"].as_u64())
@@ -343,26 +357,33 @@ fn parse_mixture_expert_value(
                 backend: RateBackend::Zpaq { method },
             })
         }
-        "rwkv7" | "rwkv" => {
-            let model_path = v["model_path"]
-                .as_str()
-                .or_else(|| v["rwkv_model_path"].as_str())
-                .ok_or_else(|| anyhow::anyhow!("rwkv expert missing model_path"))?;
-            let model = load_rwkv7_model_from_path(model_path);
-            Ok(MixtureExpertSpec {
-                name,
-                log_prior,
-                max_order: -1,
-                backend: RateBackend::Rwkv7 { model },
-            })
+        "rwkv7" => {
+            #[cfg(feature = "backend-rwkv")]
+            {
+                let model_path = v["model_path"]
+                    .as_str()
+                    .or_else(|| v["rwkv_model_path"].as_str())
+                    .ok_or_else(|| anyhow::anyhow!("rwkv expert missing model_path"))?;
+                let model = load_rwkv7_model_from_path(model_path);
+                Ok(MixtureExpertSpec {
+                    name,
+                    log_prior,
+                    max_order: -1,
+                    backend: RateBackend::Rwkv7 { model },
+                })
+            }
+            #[cfg(not(feature = "backend-rwkv"))]
+            {
+                let _ = (name, log_prior);
+                Err(anyhow::anyhow!(
+                    "rwkv expert requires 'backend-rwkv' feature in infotheory"
+                ))
+            }
         }
-        "mixture" | "mix" => {
+        "mixture" => {
             let spec = if let Some(spec_v) = v.get("spec") {
                 parse_mixture_spec_value(spec_v, base_dir, depth - 1)?
-            } else if let Some(path) = v["spec_path"]
-                .as_str()
-                .or_else(|| v["path"].as_str())
-            {
+            } else if let Some(path) = v["spec_path"].as_str().or_else(|| v["path"].as_str()) {
                 let full = base_dir.join(path);
                 load_mixture_spec_with_depth(full.to_str().unwrap_or(path), depth - 1)?
             } else {
@@ -379,7 +400,7 @@ fn parse_mixture_expert_value(
                 },
             })
         }
-        other => Err(anyhow::anyhow!("unknown expert kind '{other}'")),
+        other => Err(anyhow::anyhow!("unsupported expert kind '{other}'")),
     }
 }
 
@@ -545,7 +566,17 @@ fn parse_vm_stats_backend(
         .or_else(|| cfg.as_str())
         .unwrap_or("rosaplus");
 
-    match parse_rate_backend(name) {
+    let resolved = match infotheory::backends::resolve_rate_backend_name(name) {
+        Some(infotheory::backends::BackendAvailability::Enabled(name)) => Some(name),
+        Some(infotheory::backends::BackendAvailability::Disabled { canonical, feature }) => {
+            return Err(anyhow::anyhow!(
+                "rate backend '{canonical}' requires infotheory feature '{feature}'"
+            ));
+        }
+        None => None,
+    };
+
+    match resolved {
         Some("rosaplus") => Ok(RateBackend::RosaPlus),
         Some("ctw") => {
             let depth = cfg["ct_depth"]
@@ -560,7 +591,7 @@ fn parse_vm_stats_backend(
                 .or_else(|| cfg["ct_depth"].as_u64())
                 .unwrap_or(32) as usize;
             let encoding_bits = cfg["encoding_bits"].as_u64().unwrap_or(8) as usize;
-            
+
             // Fix: Default num_percept_bits to observation_bits + reward_bits if available,
             // fallback to encoding_bits if not.
             let obs_bits = root["observation_bits"].as_u64().unwrap_or(16);
@@ -570,7 +601,7 @@ fn parse_vm_stats_backend(
             let num_percept_bits = cfg["num_percept_bits"]
                 .as_u64()
                 .unwrap_or(default_percept_bits) as usize;
-                
+
             Ok(RateBackend::FacCtw {
                 base_depth,
                 num_percept_bits,
@@ -578,14 +609,23 @@ fn parse_vm_stats_backend(
             })
         }
         Some("rwkv7") => {
-            let path = cfg["rwkv_model_path"]
-                .as_str()
-                .or_else(|| cfg["model_path"].as_str())
-                .or_else(|| root["rwkv_model_path"].as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(rwkv7_model_path_from_env);
-            let model = load_rwkv7_model_from_path(&path);
-            Ok(RateBackend::Rwkv7 { model })
+            #[cfg(feature = "backend-rwkv")]
+            {
+                let path = cfg["rwkv_model_path"]
+                    .as_str()
+                    .or_else(|| cfg["model_path"].as_str())
+                    .or_else(|| root["rwkv_model_path"].as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(rwkv7_model_path_from_env);
+                let model = load_rwkv7_model_from_path(&path);
+                Ok(RateBackend::Rwkv7 { model })
+            }
+            #[cfg(not(feature = "backend-rwkv"))]
+            {
+                Err(anyhow::anyhow!(
+                    "rwkv7 stats backend requires 'backend-rwkv' feature in infotheory"
+                ))
+            }
         }
         Some("zpaq") => {
             let method = cfg["method"]
@@ -630,12 +670,21 @@ fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBack
         }),
         "rosa" | "rosaplus" => Ok(RateBackend::RosaPlus),
         "rwkv" | "rwkv7" => {
-            let path = root["rwkv_model_path"]
-                .as_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(rwkv7_model_path_from_env);
-            let model = load_rwkv7_model_from_path(&path);
-            Ok(RateBackend::Rwkv7 { model })
+            #[cfg(feature = "backend-rwkv")]
+            {
+                let path = root["rwkv_model_path"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(rwkv7_model_path_from_env);
+                let model = load_rwkv7_model_from_path(&path);
+                Ok(RateBackend::Rwkv7 { model })
+            }
+            #[cfg(not(feature = "backend-rwkv"))]
+            {
+                Err(anyhow::anyhow!(
+                    "rwkv7 default stats backend requires 'backend-rwkv' feature in infotheory"
+                ))
+            }
         }
         "zpaq" => Ok(RateBackend::Zpaq {
             method: {
@@ -660,10 +709,6 @@ fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBack
         _ => Ok(RateBackend::RosaPlus),
     }
 }
-
-
-
-
 
 #[cfg(feature = "vm")]
 fn parse_nyx_trace_config(v: &serde_json::Value) -> anyhow::Result<Option<NyxTraceConfig>> {
@@ -808,8 +853,6 @@ fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActionSource> {
 }
 
 #[cfg(feature = "vm")]
-
-
 #[cfg(feature = "vm")]
 fn parse_nyx_fuzz_mutator(name: &str) -> Option<NyxFuzzMutator> {
     match name {
@@ -1006,11 +1049,6 @@ fn validate_obs_stream_len(expected: usize, actual: usize) -> anyhow::Result<()>
     Ok(())
 }
 
-
-
-
-
-
 #[cfg(feature = "vm")]
 fn parse_nyx_reward_policy(v: &serde_json::Value) -> anyhow::Result<NyxRewardPolicy> {
     match v["mode"].as_str().unwrap_or("guest") {
@@ -1069,8 +1107,6 @@ fn parse_nyx_reward_shaping(v: &serde_json::Value) -> anyhow::Result<Option<NyxR
     }
 }
 
-
-
 #[cfg(feature = "vm")]
 fn parse_nyx_filter(
     v: &serde_json::Value,
@@ -1096,14 +1132,22 @@ fn parse_nyx_filter(
     }))
 }
 
-
-
 fn build_ctx(rate_backend: &str, ncd_backend: &str, method: Option<&str>) -> InfotheoryCtx {
     let rate_backend = match rate_backend {
         "rwkv7" => {
-            let p = rwkv7_model_path_from_env();
-            let model = load_rwkv7_model_from_path(&p);
-            RateBackend::Rwkv7 { model }
+            #[cfg(feature = "backend-rwkv")]
+            {
+                let p = rwkv7_model_path_from_env();
+                let model = load_rwkv7_model_from_path(&p);
+                RateBackend::Rwkv7 { model }
+            }
+            #[cfg(not(feature = "backend-rwkv"))]
+            {
+                eprintln!(
+                    "Error: rate backend 'rwkv7' requires infotheory built with feature 'backend-rwkv'"
+                );
+                std::process::exit(1);
+            }
         }
         "ctw" => {
             let depth = if let Some(m) = method {
@@ -1151,12 +1195,22 @@ fn build_ctx(rate_backend: &str, ncd_backend: &str, method: Option<&str>) -> Inf
 
     let ncd_backend = match ncd_backend {
         "rwkv7" => {
-            let p = rwkv7_model_path_from_env();
-            let model = load_rwkv7_model_from_path(&p);
-            let coder = method
-                .and_then(parse_rwkv7_coder)
-                .unwrap_or(rwkvzip::CoderType::AC);
-            NcdBackend::Rwkv7 { model, coder }
+            #[cfg(feature = "backend-rwkv")]
+            {
+                let p = rwkv7_model_path_from_env();
+                let model = load_rwkv7_model_from_path(&p);
+                let coder = method
+                    .and_then(infotheory::backends::parse_rwkv7_coder)
+                    .unwrap_or(rwkvzip::CoderType::AC);
+                NcdBackend::Rwkv7 { model, coder }
+            }
+            #[cfg(not(feature = "backend-rwkv"))]
+            {
+                eprintln!(
+                    "Error: NCD backend 'rwkv7' requires infotheory built with feature 'backend-rwkv'"
+                );
+                std::process::exit(1);
+            }
         }
         _ => {
             let m = method.unwrap_or("5").to_string();
@@ -2152,6 +2206,31 @@ fn main() {
 }
 
 fn print_usage() {
+    let rate_backends = infotheory::backends::AVAILABLE_RATE_BACKENDS
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            if idx == 0 {
+                format!("'{name}' (default)")
+            } else {
+                format!("'{name}'")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ncd_backends = infotheory::backends::AVAILABLE_NCD_BACKENDS
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            if idx == 0 {
+                format!("'{name}' (default)")
+            } else {
+                format!("'{name}'")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
     eprintln!(
         r#"InfoTheory CLI
 Usage: infotheory <primitive> [args...] [options]
@@ -2183,8 +2262,8 @@ Primitives:
     batch                                   Run in JSON-L batch mode
 
 Options:
-    --rate-backend <name>   Backend for rate estimation: 'rosaplus' (default), 'ctw', 'fac-ctw', 'rwkv7', 'zpaq', 'mixture'
-  --ncd-backend <name>    Backend for NCD: 'zpaq' (default), 'rwkv7'
+    --rate-backend <name>   Backend for rate estimation: {rate_backends}
+  --ncd-backend <name>    Backend for NCD: {ncd_backends}
   --method <val>          Method/Depth parameter (e.g. '5' for zpaq, '16' for ctw, or path to mixture spec JSON)
 
 Examples:

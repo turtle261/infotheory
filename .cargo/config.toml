@@ -10,8 +10,25 @@ rustdocflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"] # Comm
 #rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]
 
 
+# Linux, FreeBSD and OpenBSD should use the same configuration. 
+# It is highly recommended to use `lld`, and link with `clang`
+# This is important for ZPAQ integration. 
+[target.'cfg(target_os = "linux")']
+linker = "clang"
+rustflags = [
+  "-C", "target-cpu=native",
+  "-C", "link-arg=-fuse-ld=lld",
+]
 
-[target.'cfg(unix)']
+[target.'cfg(target_os = "freebsd")']
+linker = "clang"
+rustflags = [
+  "-C", "target-cpu=native",
+  "-C", "link-arg=-fuse-ld=lld",
+]
+
+# OpenBSD: should work by default if the `comp` file set is installed. 
+[target.'cfg(target_os = "openbsd")']
 linker = "clang"
 rustflags = [
   "-C", "target-cpu=native",

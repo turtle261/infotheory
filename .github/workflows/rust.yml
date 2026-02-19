@@ -1,30 +1,219 @@
-name: Rust
+name: Rust CI
 
 on:
   push:
-    branches: [ "github" ]
+    branches: ["github"]
+    tags: ["v*"]
   pull_request:
-    branches: [ "github" ]
+    branches: ["github"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-
+  lint-security-lean:
+    name: Lint, Security, Lean
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
-    - name: Build
-      run: cargo build --verbose --release
-    - name: Run tests
-      run: cargo test --verbose --release
-    - name: Install Lean (elan)
-      run: |
-        curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y
-        echo "$HOME/.elan/bin" >> $GITHUB_PATH
-    - name: Run Lean validation (ite-bench)
-      run: ./projman.sh lean_test
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld cmake pkg-config libseccomp-dev
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rustfmt
+        run: cargo fmt --all --check
+
+      - name: Clippy (default + CLI)
+        run: |
+          cargo clippy -p zpaq_rs --locked
+          cargo clippy -p infotheory --lib --bins --features cli --locked
+          cargo clippy -p infotheory --lib --bins --no-default-features --features cli --locked
+
+      - name: Warnings gate (default + no-default CLI)
+        run: |
+          RUSTFLAGS="-D warnings" cargo check -p zpaq_rs --locked
+          RUSTFLAGS="-D warnings" cargo check -p infotheory --features cli --locked
+          RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features cli --locked
+
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+      - name: Dependency integrity
+        run: |
+          cargo update --workspace --locked --dry-run
+          cargo tree --workspace --all-features --locked --duplicates
+
+      - name: Install Lean (elan)
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Run Lean validation (ite-bench)
+        run: ./projman.sh lean_test
+
+  platform-hosted:
+    name: ${{ matrix.name }}
+    needs: lint-security-lean
+    runs-on: ${{ matrix.runs_on }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GNU (x86_64)
+            runs_on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            run_vm: true
+            artifact_ext: ""
+          - name: macOS (x86_64)
+            runs_on: macos-13
+            target: x86_64-apple-darwin
+            run_vm: false
+            artifact_ext: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld cmake pkg-config libseccomp-dev
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Feature checks
+        run: |
+          RUSTFLAGS="-D warnings" cargo check --locked
+          RUSTFLAGS="-D warnings" cargo check --no-default-features --locked
+          RUSTFLAGS="-D warnings" cargo check --no-default-features --features cli --locked
+          RUSTFLAGS="-D warnings" cargo check --features cli --locked
+
+      - name: VM feature check
+        if: ${{ matrix.run_vm }}
+        run: cargo check --features vm --locked
+
+      - name: Test matrix
+        run: |
+          cargo test --release --locked
+          cargo test --release --no-default-features --locked
+
+      - name: VM tests
+        if: ${{ matrix.run_vm }}
+        run: cargo test --release --features vm --locked
+
+      - name: Build release CLI binary
+        run: |
+          cargo rustc --release --features cli --bin infotheory --target ${{ matrix.target }} --locked -- -C target-cpu=x86-64
+
+      - name: Package binary artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="target/${{ matrix.target }}/release"
+          bin_name="infotheory${{ matrix.artifact_ext }}"
+          artifact_name="infotheory-cli-${{ matrix.target }}"
+          mkdir -p dist
+          cp "${out_dir}/${bin_name}" "dist/${bin_name}"
+          tar -C dist -czf "${artifact_name}.tar.gz" "${bin_name}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infotheory-cli-${{ matrix.target }}
+          path: infotheory-cli-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload binary to GitHub release (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: infotheory-cli-${{ matrix.target }}.tar.gz
+
+  platform-musl:
+    name: Linux musl (x86_64)
+    needs: lint-security-lean
+    runs-on: ubuntu-latest
+    container: messense/rust-musl-cross:x86_64-musl
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Feature checks (musl target)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
+        run: |
+          RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-musl --features cli --locked
+          RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-musl --no-default-features --features cli --locked
+          cargo test --release --target x86_64-unknown-linux-musl --features cli --no-run --locked
+
+      - name: Build release CLI binary
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
+        run: |
+          cargo rustc --release --features cli --bin infotheory --target x86_64-unknown-linux-musl --locked -- -C target-cpu=x86-64
+
+      - name: Package binary artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="target/x86_64-unknown-linux-musl/release"
+          bin_name="infotheory"
+          artifact_name="infotheory-cli-x86_64-unknown-linux-musl"
+          mkdir -p dist
+          cp "${out_dir}/${bin_name}" "dist/${bin_name}"
+          tar -C dist -czf "${artifact_name}.tar.gz" "${bin_name}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infotheory-cli-x86_64-unknown-linux-musl
+          path: infotheory-cli-x86_64-unknown-linux-musl.tar.gz
+          if-no-files-found: error
+
+      - name: Upload binary to GitHub release (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: infotheory-cli-x86_64-unknown-linux-musl.tar.gz

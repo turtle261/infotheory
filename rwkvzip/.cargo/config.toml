@@ -1,8 +1,0 @@
-# .cargo/config.toml
-[build]
-rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]
-
-[env]
-# Default to downloading CUDA-enabled libtorch when using the training feature.
-# Override as needed (e.g., TORCH_CUDA_VERSION=118 for CUDA 11.8).
-TORCH_CUDA_VERSION = "121"

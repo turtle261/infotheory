@@ -125,8 +125,7 @@ unsafe extern "C" {
     pub fn zpaq_compressor_set_input(c: *mut Compressor, input: *mut RustReader) -> c_int;
     pub fn zpaq_compressor_write_tag(c: *mut Compressor) -> c_int;
     pub fn zpaq_compressor_start_block_level(c: *mut Compressor, level: c_int) -> c_int;
-    pub fn zpaq_compressor_start_block_method(c: *mut Compressor, method: *const c_char)
-        -> c_int;
+    pub fn zpaq_compressor_start_block_method(c: *mut Compressor, method: *const c_char) -> c_int;
     pub fn zpaq_compressor_start_block_hcomp(c: *mut Compressor, hcomp: *const c_char) -> c_int;
     pub fn zpaq_compressor_set_verify(c: *mut Compressor, verify: c_int) -> c_int;
     pub fn zpaq_compressor_start_segment(

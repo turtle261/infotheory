@@ -9,11 +9,14 @@
 //! The mixture primitives here power `RateBackend::Mixture`, enabling Bayes, fading Bayes,
 //! switching, and MDL-style selectors to be used anywhere a rate backend is accepted.
 
+#[cfg(feature = "backend-rwkv")]
+use crate::coders::softmax_pdf_floor_inplace;
 use crate::ctw::FacContextTree;
+use crate::rosaplus::RosaPlus;
+#[cfg(feature = "backend-rwkv")]
+use crate::rwkvzip;
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{MixtureKind, MixtureSpec, RateBackend};
-use rosaplus::RosaPlus;
-use rwkvzip::coders::softmax_pdf_floor_inplace;
 use std::sync::Arc;
 
 /// Default minimum probability floor to avoid log(0).
@@ -85,15 +88,9 @@ pub trait OnlineBytePredictor: Send {
 /// A concrete online predictor backed by a `RateBackend` configuration.
 pub enum RateBackendPredictor {
     /// ROSA-Plus online suffix automaton.
-    Rosa {
-        model: RosaPlus,
-        min_prob: f64,
-    },
+    Rosa { model: RosaPlus, min_prob: f64 },
     /// Byte-wise CTW implemented as 8 factorized bit trees (MSB-first).
-    Ctw {
-        tree: FacContextTree,
-        min_prob: f64,
-    },
+    Ctw { tree: FacContextTree, min_prob: f64 },
     /// Factorized CTW with configurable bit-encoding (LSB-first).
     FacCtw {
         tree: FacContextTree,
@@ -101,15 +98,14 @@ pub enum RateBackendPredictor {
         min_prob: f64,
     },
     /// RWKV-7 neural predictor.
+    #[cfg(feature = "backend-rwkv")]
     Rwkv7 {
         compressor: rwkvzip::Compressor,
         primed: bool,
         min_prob: f64,
     },
     /// ZPAQ streaming rate model.
-    Zpaq {
-        model: ZpaqRateModel,
-    },
+    Zpaq { model: ZpaqRateModel },
     /// Online mixture over experts (Bayes, fading Bayes, switching, MDL).
     Mixture {
         runtime: MixtureRuntime,
@@ -144,12 +140,14 @@ impl RateBackendPredictor {
                     min_prob,
                 }
             }
+            #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { model } => {
                 let mut compressor = rwkvzip::Compressor::new_from_model(model);
                 let vocab_size = compressor.vocab_size();
-                let logits = compressor
-                    .model
-                    .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                let logits =
+                    compressor
+                        .model
+                        .forward(&mut compressor.scratch, 0, &mut compressor.state);
                 softmax_pdf_floor_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
                 Self::Rwkv7 {
                     compressor,
@@ -184,6 +182,7 @@ impl RateBackendPredictor {
                 encoding_bits,
                 ..
             } => format!("fac-ctw(d={},b={})", base_depth, encoding_bits),
+            #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { .. } => "rwkv7".to_string(),
             RateBackend::Zpaq { method } => format!("zpaq(m={})", method),
             RateBackend::Mixture { spec } => {
@@ -244,6 +243,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     min_prob.ln()
                 }
             }
+            #[cfg(feature = "backend-rwkv")]
             RateBackendPredictor::Rwkv7 {
                 compressor,
                 primed,
@@ -251,9 +251,10 @@ impl OnlineBytePredictor for RateBackendPredictor {
             } => {
                 if !*primed {
                     let vocab_size = compressor.vocab_size();
-                    let logits = compressor
-                        .model
-                        .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
                     softmax_pdf_floor_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
                     *primed = true;
                 }
@@ -302,16 +303,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     tree.update(bit, i);
                 }
             }
+            #[cfg(feature = "backend-rwkv")]
             RateBackendPredictor::Rwkv7 {
-                compressor,
-                primed,
-                ..
+                compressor, primed, ..
             } => {
                 if !*primed {
                     let vocab_size = compressor.vocab_size();
-                    let logits = compressor
-                        .model
-                        .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
                     softmax_pdf_floor_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
                     *primed = true;
                 }
@@ -433,11 +434,14 @@ impl ExpertConfig {
     }
 
     /// RWKV-7 expert (uniform prior).
+    #[cfg(feature = "backend-rwkv")]
     pub fn rwkv(name: impl Into<String>, model: Arc<rwkvzip::Model>) -> Self {
         let name = name.into();
         Self::uniform(name, move || {
             Box::new(RateBackendPredictor::from_backend(
-                RateBackend::Rwkv7 { model: model.clone() },
+                RateBackend::Rwkv7 {
+                    model: model.clone(),
+                },
                 -1,
                 DEFAULT_MIN_PROB,
             ))

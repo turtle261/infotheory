@@ -206,7 +206,8 @@ impl StreamingCompressor {
             writer: CountingWriter::default(),
         }));
 
-        let reader = unsafe { sys::zpaq_reader_new(reader_ctx.cast(), None, Some(read_cb::<StreamReader>)) };
+        let reader =
+            unsafe { sys::zpaq_reader_new(reader_ctx.cast(), None, Some(read_cb::<StreamReader>)) };
         if reader.is_null() {
             unsafe {
                 sys::zpaq_compressor_free(compressor);
@@ -286,7 +287,8 @@ impl StreamingCompressor {
             return Err(err_from_last());
         }
 
-        let rc_seg = unsafe { sys::zpaq_compressor_start_segment(compressor, ptr::null(), ptr::null()) };
+        let rc_seg =
+            unsafe { sys::zpaq_compressor_start_segment(compressor, ptr::null(), ptr::null()) };
         if rc_seg != 0 {
             unsafe {
                 sys::zpaq_writer_free(writer);

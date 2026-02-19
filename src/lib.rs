@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 //! # InfoTheory: Information Theoretic Estimators & Metrics
 //!
 //! This crate provides a comprehensive suite of information-theoretic primitives for
@@ -72,14 +74,20 @@
 
 pub mod aixi;
 pub mod axioms;
-pub mod ctw;
+pub mod backends;
+pub mod coders;
 pub mod datagen;
 pub mod mixture;
-mod zpaq_rate;
+pub use backends::ctw;
+pub use backends::rosaplus;
+#[cfg(feature = "backend-rwkv")]
+pub use backends::rwkvzip;
+pub use backends::zpaq_rate;
 
 use rayon::prelude::*;
 
 use std::cell::RefCell;
+#[cfg(feature = "backend-rwkv")]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -87,12 +95,26 @@ use std::sync::OnceLock;
 static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 
 thread_local! {
+    #[cfg(feature = "backend-rwkv")]
     static RWKV_TLS: RefCell<HashMap<usize, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
 }
 
 impl Default for RateBackend {
     fn default() -> Self {
-        RateBackend::RosaPlus
+        #[cfg(feature = "backend-rosa")]
+        {
+            return RateBackend::RosaPlus;
+        }
+        #[cfg(all(not(feature = "backend-rosa"), feature = "backend-zpaq"))]
+        {
+            return RateBackend::Zpaq {
+                method: "1".to_string(),
+            };
+        }
+        #[cfg(all(not(feature = "backend-rosa"), not(feature = "backend-zpaq")))]
+        {
+            RateBackend::Ctw { depth: 16 }
+        }
     }
 }
 
@@ -189,6 +211,7 @@ pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBacken
 #[derive(Clone)]
 pub enum RateBackend {
     RosaPlus,
+    #[cfg(feature = "backend-rwkv")]
     Rwkv7 {
         model: Arc<rwkvzip::Model>,
     },
@@ -217,6 +240,7 @@ pub enum NcdBackend {
     Zpaq {
         method: String,
     },
+    #[cfg(feature = "backend-rwkv")]
     Rwkv7 {
         model: Arc<rwkvzip::Model>,
         coder: rwkvzip::CoderType,
@@ -386,6 +410,7 @@ impl InfotheoryCtx {
                 }
                 cross_entropy_rate_backend(data, &prefix, -1, &RateBackend::RosaPlus)
             }
+            #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
                 c.cross_entropy_conditional_chain(prefix_parts, data)
                     .unwrap_or(0.0)
@@ -417,7 +442,8 @@ impl InfotheoryCtx {
                 if data.is_empty() {
                     return 0.0;
                 }
-                let mut model = crate::zpaq_rate::ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
+                let mut model =
+                    crate::zpaq_rate::ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
                 for &part in prefix_parts {
                     model.update_and_score(part);
                 }
@@ -569,6 +595,7 @@ impl InfotheoryCtx {
     }
 }
 
+#[cfg(feature = "backend-rwkv")]
 pub fn load_rwkv7_model_from_path(path: &str) -> Arc<rwkvzip::Model> {
     rwkvzip::Compressor::load_model(path).expect("failed to load RWKV7 model")
 }
@@ -588,9 +615,18 @@ pub fn get_compressed_size(path: &str, method: &str) -> u64 {
 }
 
 pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
-    zpaq_rate::validate_zpaq_rate_method(method)
+    #[cfg(feature = "backend-zpaq")]
+    {
+        return zpaq_rate::validate_zpaq_rate_method(method);
+    }
+    #[cfg(not(feature = "backend-zpaq"))]
+    {
+        let _ = method;
+        Err("zpaq backend disabled at compile time".to_string())
+    }
 }
 
+#[cfg(feature = "backend-rwkv")]
 fn with_rwkv_tls<R>(
     model: &Arc<rwkvzip::Model>,
     f: impl FnOnce(&mut rwkvzip::Compressor) -> R,
@@ -660,6 +696,7 @@ pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &NcdBackend) -> u64
             let r = SliceChainReader::new(parts);
             zpaq_rs::compress_size_stream(r, method.as_str(), None, None).unwrap_or(0)
         }
+        #[cfg(feature = "backend-rwkv")]
         NcdBackend::Rwkv7 { model, coder } => {
             with_rwkv_tls(model, |c| c.compress_size_chain(parts, *coder).unwrap_or(0))
         }
@@ -669,6 +706,7 @@ pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &NcdBackend) -> u64
 pub fn compress_size_backend(data: &[u8], backend: &NcdBackend) -> u64 {
     match backend {
         NcdBackend::Zpaq { method } => zpaq_rs::compress_size(data, method.as_str()).unwrap_or(0),
+        #[cfg(feature = "backend-rwkv")]
         NcdBackend::Rwkv7 { model, coder } => {
             with_rwkv_tls(model, |c| c.compress_size(data, *coder).unwrap_or(0))
         }
@@ -681,6 +719,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
             m.predictive_entropy_rate(data)
         }
+        #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
         }
@@ -752,6 +791,7 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
             m.build_lm();
             m.cross_entropy(data)
         }
+        #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
         }
@@ -778,6 +818,7 @@ pub fn cross_entropy_rate_backend(
             m.build_lm();
             m.cross_entropy(test_data)
         }
+        #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| {
                 // Inverted args fix: (prefix, target) -> (train, test)
@@ -880,6 +921,7 @@ pub fn joint_entropy_rate_backend(
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
             m.entropy_rate_cps(&joint_symbols)
         }
+        #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
             c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
         }),
@@ -1804,6 +1846,11 @@ mod tests {
         let x = b"the quick brown fox jumps over the lazy dog";
         let y = b"the quick brown fox jumps over the lazy dog";
         let max_order = 8;
+        let prev = get_default_ctx();
+        set_default_ctx(InfotheoryCtx::new(
+            RateBackend::RosaPlus,
+            NcdBackend::default(),
+        ));
 
         let h_x = entropy_rate_bytes(x, max_order);
         let h_xy = joint_entropy_rate_bytes(x, y, max_order);
@@ -1817,15 +1864,22 @@ mod tests {
         assert!(h_x_given_y < tol);
         assert!((mi - h_x).abs() < tol);
         assert!(ned < tol);
+        set_default_ctx(prev);
     }
 
     #[test]
     fn resistance_identity_is_one() {
         let x = b"some repeated repeated repeated text";
+        let prev = get_default_ctx();
+        set_default_ctx(InfotheoryCtx::new(
+            RateBackend::RosaPlus,
+            NcdBackend::default(),
+        ));
         let r0 = resistance_to_transformation_bytes(x, x, 0);
         let r8 = resistance_to_transformation_bytes(x, x, 8);
         assert!((r0 - 1.0).abs() < 1e-12);
         assert!((r8 - 1.0).abs() < 1e-6);
+        set_default_ctx(prev);
     }
 
     #[test]

@@ -73,6 +73,10 @@ cmd_code_test() {
   need_cmd cargo
 
   (cd "$ROOT_DIR" && cargo build --release)
+  if [ "${BUILD_CLI:-0}" = "1" ]; then
+    say "[code_test] BUILD_CLI=1 set; checking optional CLI binary"
+    (cd "$ROOT_DIR" && cargo build --release --features cli)
+  fi
 
   # If docker is available, enable the nyx-lite rootfs builder test.
   DOCKER_TEST=0
@@ -161,6 +165,7 @@ Commands:
 
 Environment variables:
   SKIP_DOCKER=1   Skip docker rootfs.ext4 build during init-vm.
+  BUILD_CLI=1     Also build optional infotheory CLI binary (feature: cli) during code_test.
 EOF
 }
 

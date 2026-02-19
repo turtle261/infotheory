@@ -168,7 +168,6 @@ fn test_observation_policies() {
 // Reward Policy Tests
 // ============================================================================
 
-
 #[test]
 fn test_reward_policy_from_guest() {
     let policy = NyxRewardPolicy::FromGuest;
@@ -416,9 +415,9 @@ mod vm_integration_tests {
     #[allow(unused_imports)]
     use super::*;
     use infotheory::aixi::environment::Environment;
-    use std::path::{Path, PathBuf};
     use std::fs::File;
     use std::io::Write;
+    use std::path::{Path, PathBuf};
 
     fn get_project_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -447,13 +446,18 @@ mod vm_integration_tests {
         );
 
         let root = get_project_root();
-        let config_path = root.join("target").join(format!("test_vm_config_{}_{}.json", std::process::id(), test_name));
+        let config_path = root.join("target").join(format!(
+            "test_vm_config_{}_{}.json",
+            std::process::id(),
+            test_name
+        ));
         // Ensure target dir exists
         let _ = std::fs::create_dir_all(root.join("target"));
-        
+
         let mut file = File::create(&config_path).expect("Failed to create temp config");
-        file.write_all(config_json.as_bytes()).expect("Failed to write config");
-        
+        file.write_all(config_json.as_bytes())
+            .expect("Failed to write config");
+
         config_path
     }
 
@@ -521,20 +525,20 @@ mod vm_integration_tests {
             return;
         };
         // Clean up config file on return ideally, but fine for test
-        
+
         let result = NyxVmEnvironment::new(config);
-        
+
         match result {
             Ok(mut env) => {
                 assert!(!env.is_finished());
                 env.perform_action(0);
-                
+
                 let obs = env.get_observation();
                 let rew = env.get_reward();
-                
+
                 println!("VM Boot Success. Obs={}, Rew={}", obs, rew);
                 assert!(!env.is_finished());
-            },
+            }
             Err(e) => {
                 panic!("Failed to create NyxVmEnvironment: {:?}", e);
             }
@@ -543,11 +547,15 @@ mod vm_integration_tests {
 
     #[test]
     fn test_vm_action_execution() {
-        if !check_kvm_available() { return; }
-        let Some(config) = get_test_vm_config("action") else { return; };
-        
+        if !check_kvm_available() {
+            return;
+        }
+        let Some(config) = get_test_vm_config("action") else {
+            return;
+        };
+
         let mut env = NyxVmEnvironment::new(config).expect("Failed to init VM");
-        
+
         for _ in 0..5 {
             env.perform_action(1);
             let _ = env.get_observation();

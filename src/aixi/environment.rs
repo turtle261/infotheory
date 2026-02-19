@@ -714,5 +714,3 @@ impl Environment for KuhnPoker {
         2
     }
 }
-
-

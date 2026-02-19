@@ -1,4 +1,4 @@
-use infotheory::{entropy_rate_backend, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend};
+use infotheory::{MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend, entropy_rate_backend};
 use std::sync::Arc;
 
 #[test]

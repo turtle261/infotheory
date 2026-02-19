@@ -15,7 +15,6 @@
 //!
 //! - **NyxVmEnvironment**: Uses nyx-lite for 10,000+ resets/second (requires KVM).
 
-
 pub mod agent;
 pub mod common;
 pub mod environment;

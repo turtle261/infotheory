@@ -5,9 +5,11 @@
 //! provide different complexity vs performance trade-offs.
 
 use crate::ctw::{ContextTree, FacContextTree};
+use crate::rosaplus::{RosaPlus, RosaTx};
+#[cfg(feature = "backend-rwkv")]
+use crate::rwkvzip::{Compressor, Model, State};
 use crate::zpaq_rate::ZpaqRateModel;
-use rosaplus::{RosaPlus, RosaTx};
-use rwkvzip::{Compressor, Model, State};
+#[cfg(feature = "backend-rwkv")]
 use std::sync::Arc;
 
 /// Interface for an AIXI world model.
@@ -322,17 +324,20 @@ impl Predictor for ZpaqPredictor {
     }
 }
 
-use rwkvzip::coders::softmax_pdf_floor_inplace;
+#[cfg(feature = "backend-rwkv")]
+use crate::coders::softmax_pdf_floor_inplace;
 
 /// A predictor using the RWKV neural network architecture.
 ///
 /// This provides a deep learning based world model for AIXI, allowing
 /// the agent to leverage large pre-trained models for sequence prediction.
+#[cfg(feature = "backend-rwkv")]
 pub struct RwkvPredictor {
     compressor: Compressor,
     history: Vec<(State, Vec<f64>)>,
 }
 
+#[cfg(feature = "backend-rwkv")]
 impl RwkvPredictor {
     /// Creates a new `RwkvPredictor` from an initialized `Model`.
     pub fn new(model: Arc<Model>) -> Self {
@@ -350,6 +355,7 @@ impl RwkvPredictor {
     }
 }
 
+#[cfg(feature = "backend-rwkv")]
 impl Predictor for RwkvPredictor {
     fn update(&mut self, sym: bool) {
         // Save current state and pdf

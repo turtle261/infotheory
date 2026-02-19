@@ -1,4 +1,4 @@
-use infotheory::{entropy_rate_backend, RateBackend};
+use infotheory::{RateBackend, entropy_rate_backend};
 
 #[test]
 fn zpaq_rate_backend_compresses_copy_data() {
