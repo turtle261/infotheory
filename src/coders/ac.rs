@@ -224,7 +224,7 @@ unsafe fn exp256_ps_fast(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m
     );
 
     // exp(x) = 2^(x * log2(e))
-    let log2e = _mm256_set1_ps(1.442695041);
+    let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
     let fx = _mm256_mul_ps(x, log2e);
 
     // Split into integer and fractional parts
@@ -234,7 +234,7 @@ unsafe fn exp256_ps_fast(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m
     // Polynomial approximation for 2^f where f in [0, 1]
     // 2^f ≈ 1 + f*(0.693147 + f*(0.240226 + f*0.0558))
     let c0 = _mm256_set1_ps(1.0);
-    let c1 = _mm256_set1_ps(0.693147180559945);
+    let c1 = _mm256_set1_ps(std::f32::consts::LN_2);
     let c2 = _mm256_set1_ps(0.240226506959101);
     let c3 = _mm256_set1_ps(0.0558263180532956);
 
