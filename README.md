@@ -166,6 +166,8 @@ set_default_ctx(InfotheoryCtx::new(
 and more!
 ---
 
-## 📄 License
 
-Apache License, Version 2.0.
+## License
+- This is free software, which you may use under either the Apache-2.0 License, or the ISC License, at your choice. Those are available at LICENSE-APACHE and LICENSE respectively.
+- Contributing to this repository means you agree to submit all contributions under the above Licensing arrangement. In other words, such that it is available to others under either license(ISC and Apache-2.0), at the others choice. 
+- Don't forget to add your Copyright notice to the LICENSE file.
