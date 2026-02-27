@@ -432,7 +432,8 @@ impl InfotheoryCtx {
             RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
                 c.cross_entropy_conditional_chain(prefix_parts, data)
                     .unwrap_or(0.0)
-            }),
+            })
+            .unwrap_or(0.0),
             RateBackend::Ctw { depth } => {
                 if data.is_empty() {
                     return 0.0;
@@ -660,13 +661,23 @@ fn with_rwkv_tls<R>(
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn with_rwkv_method_tls<R>(method: &str, f: impl FnOnce(&mut rwkvzip::Compressor) -> R) -> R {
+fn with_rwkv_method_tls<R>(
+    method: &str,
+    f: impl FnOnce(&mut rwkvzip::Compressor) -> R,
+) -> Option<R> {
     RWKV_METHOD_TLS.with(|cell| {
         let mut map = cell.borrow_mut();
-        let comp = map
-            .entry(method.to_string())
-            .or_insert_with(|| rwkvzip::Compressor::new_from_method(method).unwrap());
-        f(comp)
+        // Keep a per-method template compressor for fast cloning while ensuring
+        // each call gets isolated mutable runtime state (no cross-call leakage).
+        let mut comp = if let Some(template) = map.get(method) {
+            template.clone()
+        } else {
+            let template = rwkvzip::Compressor::new_from_method(method).ok()?;
+            map.insert(method.to_string(), template.clone());
+            template
+        };
+        drop(map);
+        Some(f(&mut comp))
     })
 }
 
@@ -810,7 +821,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
         }
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7Method { method } => {
-            with_rwkv_method_tls(method, |c| c.cross_entropy(data).unwrap_or(0.0))
+            with_rwkv_method_tls(method, |c| c.cross_entropy(data).unwrap_or(0.0)).unwrap_or(0.0)
         }
         RateBackend::Zpaq { method } => {
             if data.is_empty() {
@@ -886,7 +897,7 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
         }
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7Method { method } => {
-            with_rwkv_method_tls(method, |c| c.cross_entropy(data).unwrap_or(0.0))
+            with_rwkv_method_tls(method, |c| c.cross_entropy(data).unwrap_or(0.0)).unwrap_or(0.0)
         }
         RateBackend::Zpaq { .. } => entropy_rate_backend(data, max_order, backend),
         RateBackend::Mixture { .. } => entropy_rate_backend(data, max_order, backend),
@@ -924,7 +935,8 @@ pub fn cross_entropy_rate_backend(
         RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
             c.cross_entropy_conditional(train_data, test_data)
                 .unwrap_or(0.0)
-        }),
+        })
+        .unwrap_or(0.0),
         RateBackend::Zpaq { method } => {
             if test_data.is_empty() {
                 return 0.0;
@@ -1026,7 +1038,8 @@ pub fn joint_entropy_rate_backend(
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
             c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
-        }),
+        })
+        .unwrap_or(0.0),
         RateBackend::Zpaq { method } => {
             if x.is_empty() {
                 return 0.0;
@@ -2141,6 +2154,44 @@ mod tests {
             "estimated H={} should be close to theoretical H={}",
             estimated_h,
             theoretical_h
+        );
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn rwkv_method_entropy_is_stable_across_calls() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=21,train=sgd,lr=0.01,stride=1";
+        let backend = RateBackend::Rwkv7Method {
+            method: method.to_string(),
+        };
+        let data = b"rwkv method entropy stability regression sample";
+
+        let h1 = entropy_rate_backend(data, -1, &backend);
+        let h2 = entropy_rate_backend(data, -1, &backend);
+        assert!(
+            (h1 - h2).abs() < 1e-12,
+            "rwkv method entropy leaked mutable state across calls: h1={h1}, h2={h2}"
+        );
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn rwkv_method_conditional_chain_is_stable_across_calls() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=22,train=sgd,lr=0.01,stride=1";
+        let ctx = InfotheoryCtx::new(
+            RateBackend::Rwkv7Method {
+                method: method.to_string(),
+            },
+            CompressionBackend::default(),
+        );
+
+        let prefix = b"universal prior slice";
+        let data = b"query payload";
+        let h1 = ctx.cross_entropy_conditional_chain(&[prefix.as_slice()], data);
+        let h2 = ctx.cross_entropy_conditional_chain(&[prefix.as_slice()], data);
+        assert!(
+            (h1 - h2).abs() < 1e-12,
+            "rwkv method conditional chain leaked mutable state across calls: h1={h1}, h2={h2}"
         );
     }
 }

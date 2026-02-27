@@ -364,11 +364,9 @@ impl RwkvPredictor {
         &self.pdf
     }
 
-    fn update(&mut self, symbol: u8) {
+    fn update(&mut self, symbol: u8) -> Result<()> {
         self.ensure_predicted();
-        self.compressor
-            .online_update_from_pdf(symbol, &self.pdf)
-            .expect("rwkv online update failed");
+        self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
         let bias = self.compressor.online_bias_snapshot();
         let logits = self.compressor.model.forward(
             &mut self.compressor.scratch,
@@ -381,6 +379,7 @@ impl RwkvPredictor {
             &mut self.compressor.pdf_buffer,
         );
         self.valid = false;
+        Ok(())
     }
 }
 
@@ -582,10 +581,7 @@ impl RatePdfPredictor {
                 Ok(())
             }
             #[cfg(feature = "backend-rwkv")]
-            Self::Rwkv(m) => {
-                m.update(symbol);
-                Ok(())
-            }
+            Self::Rwkv(m) => m.update(symbol),
             Self::Zpaq(m) => {
                 m.update(symbol);
                 Ok(())

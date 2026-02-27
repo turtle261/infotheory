@@ -1216,18 +1216,48 @@ fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>
         "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
-                let model_path = match method {
+                match method {
+                    // Legacy: allow passing only coder (ac/rans), model path from env.
                     Some(m) if infotheory::backends::parse_rwkv7_coder(m).is_some() => {
-                        rwkv7_model_path_from_env()
+                        let model_path = rwkv7_model_path_from_env();
+                        let model = load_rwkv7_model_from_path(&model_path);
+                        let coder = infotheory::backends::parse_rwkv7_coder(m)
+                            .unwrap_or(rwkvzip::CoderType::AC);
+                        CompressionBackend::Rwkv7 { model, coder }
                     }
-                    Some(m) => m.to_string(),
-                    None => rwkv7_model_path_from_env(),
-                };
-                let model = load_rwkv7_model_from_path(&model_path);
-                let coder = method
-                    .and_then(infotheory::backends::parse_rwkv7_coder)
-                    .unwrap_or(rwkvzip::CoderType::AC);
-                CompressionBackend::Rwkv7 { model, coder }
+                    // Method-based RWKV config: file:/... or cfg:...
+                    Some(m) => match rwkvzip::parse_method_spec(m) {
+                        Ok(rwkvzip::MethodSpec::File(path)) => {
+                            let model = load_rwkv7_model_from_path(path.to_string_lossy().as_ref());
+                            CompressionBackend::Rwkv7 {
+                                model,
+                                coder: rwkvzip::CoderType::AC,
+                            }
+                        }
+                        Ok(rwkvzip::MethodSpec::Online(_)) => CompressionBackend::Rate {
+                            rate_backend: RateBackend::Rwkv7Method {
+                                method: m.to_string(),
+                            },
+                            coder: rwkvzip::CoderType::AC,
+                            framing: infotheory::compression::FramingMode::Raw,
+                        },
+                        Err(err) => {
+                            eprintln!(
+                                "Error: invalid RWKV method for --compression-backend rwkv7: {err}"
+                            );
+                            std::process::exit(1);
+                        }
+                    },
+                    // No method: model path from env.
+                    None => {
+                        let model_path = rwkv7_model_path_from_env();
+                        let model = load_rwkv7_model_from_path(&model_path);
+                        CompressionBackend::Rwkv7 {
+                            model,
+                            coder: rwkvzip::CoderType::AC,
+                        }
+                    }
+                }
             }
             #[cfg(not(feature = "backend-rwkv"))]
             {
@@ -1361,20 +1391,31 @@ fn rosa_distance(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 
 /// Process a single JSON line and return result
 fn process_json_line(line: &str) -> String {
-    // Parse JSON manually to avoid serde dependency
     let line = line.trim();
     if line.is_empty() {
         return r#"{"error":"empty input"}"#.to_string();
     }
 
-    // Extract operation type
-    let op = extract_json_string(line, "op").unwrap_or_default();
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("invalid json: {e}")
+            })
+            .to_string();
+        }
+    };
+    let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("");
 
-    match op.as_str() {
+    match op {
         "metrics" => {
             // Single text metrics: H0, H_rate, ID
-            let text = extract_json_string(line, "text").unwrap_or_default();
-            let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
+            let text = v
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
             let data = text.as_bytes();
 
             if data.is_empty() {
@@ -1393,8 +1434,12 @@ fn process_json_line(line: &str) -> String {
 
         "metrics_file" => {
             // File-based metrics
-            let path = extract_json_string(line, "path").unwrap_or_default();
-            let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
+            let path = v
+                .get("path")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             match std::fs::read(&path) {
                 Ok(data) => {
@@ -1413,10 +1458,26 @@ fn process_json_line(line: &str) -> String {
 
         "ncd" => {
             // NCD between two texts
-            let text1 = extract_json_string(line, "text1").unwrap_or_default();
-            let text2 = extract_json_string(line, "text2").unwrap_or_default();
-            let method = extract_json_string(line, "method").unwrap_or_else(|| "5".to_string());
-            let variant = extract_json_string(line, "variant").unwrap_or_else(|| "vitanyi".to_string());
+            let text1 = v
+                .get("text1")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let text2 = v
+                .get("text2")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let method = v
+                .get("method")
+                .and_then(|x| x.as_str())
+                .unwrap_or("5")
+                .to_string();
+            let variant = v
+                .get("variant")
+                .and_then(|x| x.as_str())
+                .unwrap_or("vitanyi")
+                .to_string();
 
             let x = text1.as_bytes();
             let y = text2.as_bytes();
@@ -1437,10 +1498,26 @@ fn process_json_line(line: &str) -> String {
         }
         "ncd_files" => {
             // NCD between two files
-            let path1 = extract_json_string(line, "path1").unwrap_or_default();
-            let path2 = extract_json_string(line, "path2").unwrap_or_default();
-            let method = extract_json_string(line, "method").unwrap_or_else(|| "5".to_string());
-            let variant = extract_json_string(line, "variant").unwrap_or_else(|| "vitanyi".to_string());
+            let path1 = v
+                .get("path1")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let path2 = v
+                .get("path2")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let method = v
+                .get("method")
+                .and_then(|x| x.as_str())
+                .unwrap_or("5")
+                .to_string();
+            let variant = v
+                .get("variant")
+                .and_then(|x| x.as_str())
+                .unwrap_or("vitanyi")
+                .to_string();
 
             let ncd_variant = match variant.as_str() {
                 "sym" | "sym_vitanyi" => NcdVariant::SymVitanyi,
@@ -1455,9 +1532,17 @@ fn process_json_line(line: &str) -> String {
 
         "rosa_dist" => {
             // ROSA-based distance (faster than NCD)
-            let text1 = extract_json_string(line, "text1").unwrap_or_default();
-            let text2 = extract_json_string(line, "text2").unwrap_or_default();
-            let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
+            let text1 = v
+                .get("text1")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let text2 = v
+                .get("text2")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             let x = text1.as_bytes();
             let y = text2.as_bytes();
@@ -1472,9 +1557,17 @@ fn process_json_line(line: &str) -> String {
 
         "cross_entropy" => {
             // Cross-entropy H_y(x) - score x under model trained on y
-            let text_x = extract_json_string(line, "text_x").unwrap_or_default();
-            let text_y = extract_json_string(line, "text_y").unwrap_or_default();
-            let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
+            let text_x = v
+                .get("text_x")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let text_y = v
+                .get("text_y")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             let x = text_x.as_bytes();
             let y = text_y.as_bytes();
@@ -1488,8 +1581,16 @@ fn process_json_line(line: &str) -> String {
         }
         "batch_metrics" => {
             // Batch metrics for multiple texts
-            let texts = extract_json_array(line, "texts");
-            let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
+            let texts: Vec<String> = v
+                .get("texts")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             let results: Vec<String> = texts.iter().map(|text| {
                 let data = text.as_bytes();
@@ -1511,9 +1612,25 @@ fn process_json_line(line: &str) -> String {
 
         "ncd_matrix" => {
             // NCD matrix for multiple texts (for diversity/clustering)
-            let texts = extract_json_array(line, "texts");
-            let method = extract_json_string(line, "method").unwrap_or_else(|| "5".to_string());
-            let variant = extract_json_string(line, "variant").unwrap_or_else(|| "vitanyi".to_string());
+            let texts: Vec<String> = v
+                .get("texts")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let method = v
+                .get("method")
+                .and_then(|x| x.as_str())
+                .unwrap_or("5")
+                .to_string();
+            let variant = v
+                .get("variant")
+                .and_then(|x| x.as_str())
+                .unwrap_or("vitanyi")
+                .to_string();
 
             let ncd_variant = match variant.as_str() {
                 "sym" | "sym_vitanyi" => NcdVariant::SymVitanyi,
@@ -1536,8 +1653,16 @@ fn process_json_line(line: &str) -> String {
         }
         "rosa_matrix" => {
             // ROSA distance matrix (faster than NCD matrix)
-            let texts = extract_json_array(line, "texts");
-            let max_order = extract_json_i64(line, "max_order").unwrap_or(-1);
+            let texts: Vec<String> = v
+                .get("texts")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             let n = texts.len();
             let datas: Vec<&[u8]> = texts.iter().map(|t| t.as_bytes()).collect();
@@ -1566,11 +1691,15 @@ fn process_json_line(line: &str) -> String {
         }
         "spam_check" => {
             // Quick spam/quality check for a single text
-            let text = extract_json_string(line, "text").unwrap_or_default();
-            let h0_threshold = extract_json_f64(line, "h0_min").unwrap_or(1.0);
-            let h_rate_threshold = extract_json_f64(line, "h_rate_min").unwrap_or(0.5);
-            let id_threshold = extract_json_f64(line, "id_max").unwrap_or(0.95);
-            let min_len = extract_json_i64(line, "min_len").unwrap_or(10) as usize;
+            let text = v
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let h0_threshold = v.get("h0_min").and_then(|x| x.as_f64()).unwrap_or(1.0);
+            let h_rate_threshold = v.get("h_rate_min").and_then(|x| x.as_f64()).unwrap_or(0.5);
+            let id_threshold = v.get("id_max").and_then(|x| x.as_f64()).unwrap_or(0.95);
+            let min_len = v.get("min_len").and_then(|x| x.as_i64()).unwrap_or(10) as usize;
 
             let data = text.as_bytes();
             let len = data.len();
@@ -1603,167 +1732,6 @@ fn process_json_line(line: &str) -> String {
             format!(r#"{{"error":"unknown op: {}"}}"#, op)
         }
     }
-}
-
-/// Extract a string value from JSON (simple parser, no serde needed)
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!(r#""{}":"#, key);
-    if let Some(start) = json.find(&pattern) {
-        let rest = &json[start + pattern.len()..];
-        // Optimized scanning for quote
-        if let Some(start_quote) = rest.find('"') {
-            let rest = &rest[start_quote + 1..];
-            let mut end = 0;
-            let mut escaped = false;
-            for (i, c) in rest.char_indices() {
-                if escaped {
-                    escaped = false;
-                    continue;
-                }
-                if c == '\\' {
-                    escaped = true;
-                    continue;
-                }
-                if c == '"' {
-                    end = i;
-                    break;
-                }
-            }
-            return Some(unescape_json_string(&rest[..end]));
-        }
-    }
-    None
-}
-
-/// Extract an i64 value from JSON
-fn extract_json_i64(json: &str, key: &str) -> Option<i64> {
-    let pattern = format!(r#""{}":"#, key);
-    if let Some(start) = json.find(&pattern) {
-        let rest = &json[start + pattern.len()..];
-        // Skip potential whitespace/quotes if any (though standard JSON number doesn't have quotes)
-        // Adjust for simple numeric find
-        let rest = rest.trim_start_matches(|c| c == ':' || c == ' ' || c == '"');
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit() && c != '-')
-            .unwrap_or(rest.len());
-        // Simple trim in case we consumed quotes incorrectly?
-        // Let's assume valid JSON input
-        return rest[..end].parse().ok();
-    }
-    None
-}
-
-/// Extract a f64 value from JSON
-fn extract_json_f64(json: &str, key: &str) -> Option<f64> {
-    let pattern = format!(r#""{}":"#, key);
-    if let Some(start) = json.find(&pattern) {
-        let rest = &json[start + pattern.len()..];
-        let rest = rest.trim_start_matches(|c| c == ':' || c == ' ' || c == '"');
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit() && c != '-' && c != '.')
-            .unwrap_or(rest.len());
-        return rest[..end].parse().ok();
-    }
-    None
-}
-
-/// Extract a string array from JSON
-fn extract_json_array(json: &str, key: &str) -> Vec<String> {
-    let pattern = format!(r#""{}":["#, key);
-    if let Some(start) = json.find(&pattern) {
-        let rest = &json[start + pattern.len()..];
-        // Find matching ]
-        let mut depth = 1;
-        let mut end = 0;
-        for (i, c) in rest.char_indices() {
-            match c {
-                '[' => depth += 1,
-                ']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let array_content = &rest[..end];
-        // Parse strings from array
-        let mut results = Vec::new();
-        let mut in_string = false;
-        let mut escaped = false;
-        let mut current = String::new();
-
-        for c in array_content.chars() {
-            if escaped {
-                current.push(c);
-                escaped = false;
-                continue;
-            }
-            match c {
-                '\\' if in_string => {
-                    escaped = true;
-                    current.push(c);
-                }
-                '"' => {
-                    if in_string {
-                        results.push(unescape_json_string(&current));
-                        current.clear();
-                    }
-                    in_string = !in_string;
-                }
-                _ if in_string => {
-                    current.push(c);
-                }
-                _ => {}
-            }
-        }
-        return results;
-    }
-    Vec::new()
-}
-
-/// Unescape JSON string
-fn unescape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(&next) = chars.peek() {
-                match next {
-                    'n' => {
-                        result.push('\n');
-                        chars.next();
-                    }
-                    'r' => {
-                        result.push('\r');
-                        chars.next();
-                    }
-                    't' => {
-                        result.push('\t');
-                        chars.next();
-                    }
-                    '"' => {
-                        result.push('"');
-                        chars.next();
-                    }
-                    '\\' => {
-                        result.push('\\');
-                        chars.next();
-                    }
-                    _ => {
-                        result.push(c);
-                    }
-                }
-            } else {
-                result.push(c);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }
 
 fn run_batch_mode() {
@@ -2417,4 +2385,59 @@ Examples:
   infotheory search "encryption" ./src --prior "codebase context"
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_json_line_rejects_invalid_json() {
+        let out = process_json_line(r#"{"op":"metrics","text":"abc""#);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("output should be json");
+        assert!(
+            parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("invalid json")
+        );
+    }
+
+    #[test]
+    fn process_json_line_parses_escaped_and_nested_json_correctly() {
+        let line = r#"{
+            "op":"metrics",
+            "text":"hello\n\"json\"",
+            "meta":{"op":"ncd"},
+            "max_order":-1
+        }"#;
+        let out = process_json_line(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("output should be json");
+        assert!(parsed.get("h0").and_then(|v| v.as_f64()).unwrap_or(-1.0) >= 0.0);
+        assert_eq!(parsed.get("len").and_then(|v| v.as_u64()), Some(12));
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn build_ctx_rwkv7_compression_accepts_cfg_method() {
+        let ctx = build_ctx(
+            "rosaplus",
+            "rwkv7",
+            Some("cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01"),
+        );
+
+        match ctx.compression_backend {
+            CompressionBackend::Rate {
+                rate_backend,
+                coder,
+                framing,
+            } => {
+                assert!(matches!(rate_backend, RateBackend::Rwkv7Method { .. }));
+                assert_eq!(coder, rwkvzip::CoderType::AC);
+                assert_eq!(framing, infotheory::compression::FramingMode::Raw);
+            }
+            _ => panic!("expected rate-coded RWKV backend for cfg: method"),
+        }
+    }
 }
