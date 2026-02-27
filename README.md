@@ -18,7 +18,6 @@ Switch between different modeling paradigms seamlessly:
 ### 3. Integrated MC-AIXI Agent
 Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, or RWKV) for universal reinforcement learning.
 
-RWKV inference uses portable SIMD via `wide`, so it compiles and runs across x86_64 (including generic/non-AVX2), AArch64, and WASM (RWKV-only build profile).
 You can use a trained RWKV7 model as a rate backend ("world model") for MC-AIXI.
 
 ---
@@ -45,6 +44,9 @@ You can use a trained RWKV7 model as a rate backend ("world model") for MC-AIXI.
 - Rust toolchain (stable): `rustup` recommended.
 - C/C++ toolchain: `clang` + `lld` recommended on Unix-like systems.
 - For local repository builds with VM support available: clone recursively (`--recurse-submodules`) so `nyx-lite` is present.
+
+### Build Configuration
+- By default, .cargo/config.toml is set to use march=native as the target-cpu, which will allow LLVM to make full use of your specific CPU. This can improve performance by roughly 2x for the RWKV Model. This may affect binary compatibility depending on your usecase.
 
 ### Build the CLI
 Enable the `cli` feature (the binary is feature-gated):
