@@ -4,6 +4,7 @@ version = "1.0.2"
 edition = "2024"
 license = "ISC OR Apache-2.0"
 homepage = "https://infotheory.tech"
+description = "The algorithmic information theory library."
 autobins = false
 
 [workspace]
