@@ -134,11 +134,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Feature checks
+        env:
+          RUSTFLAGS: -D warnings
         run: |
-          RUSTFLAGS="-D warnings" cargo check --locked
-          RUSTFLAGS="-D warnings" cargo check --no-default-features --locked
-          RUSTFLAGS="-D warnings" cargo check --no-default-features --features cli --locked
-          RUSTFLAGS="-D warnings" cargo check --features cli --locked
+          cargo check --locked
+          cargo check --no-default-features --locked
+          cargo check --no-default-features --features cli --locked
+          cargo check --features cli --locked
 
       - name: VM feature check
         if: ${{ matrix.run_vm }}
