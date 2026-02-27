@@ -91,12 +91,28 @@ jobs:
             target: x86_64-unknown-linux-gnu
             run_vm: true
             rustdocflags: -C target-cpu=native -C link-arg=-fuse-ld=lld
+            release_rustc_flags: -C target-cpu=x86-64
             artifact_ext: ""
           - name: macOS (x86_64)
             runs_on: macos-15-intel
             target: x86_64-apple-darwin
             run_vm: false
             rustdocflags: -C target-cpu=native
+            release_rustc_flags: -C target-cpu=x86-64
+            artifact_ext: ""
+          - name: Windows (x86_64)
+            runs_on: windows-latest
+            target: x86_64-pc-windows-msvc
+            run_vm: false
+            rustdocflags: -C target-cpu=native
+            release_rustc_flags: -C target-cpu=x86-64
+            artifact_ext: ".exe"
+          - name: macOS (arm64)
+            runs_on: macos-15
+            target: aarch64-apple-darwin
+            run_vm: false
+            rustdocflags: -C target-cpu=native
+            release_rustc_flags: -C target-cpu=generic
             artifact_ext: ""
     steps:
       - uses: actions/checkout@v4
@@ -143,7 +159,7 @@ jobs:
 
       - name: Build release CLI binary
         run: |
-          cargo rustc --release --features cli --bin infotheory --target ${{ matrix.target }} --locked -- -C target-cpu=x86-64
+          cargo rustc --release --features cli --bin infotheory --target ${{ matrix.target }} --locked -- ${{ matrix.release_rustc_flags }}
 
       - name: Package binary artifact
         shell: bash
@@ -168,6 +184,39 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: infotheory-cli-${{ matrix.target }}.tar.gz
+
+  portability-cross:
+    name: Portability checks (AArch64 + WASM + generic x86_64)
+    needs: lint-security-lean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            aarch64-unknown-linux-gnu
+            aarch64-unknown-linux-musl
+            aarch64-apple-darwin
+            aarch64-pc-windows-msvc
+            wasm32-unknown-unknown
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cross-target compile checks (RWKV-only portable profile)
+        env:
+          CARGO_BUILD_RUSTFLAGS: -Cdebuginfo=0
+        run: |
+          RUSTFLAGS="-D warnings -Cdebuginfo=0" cargo check -p infotheory --target aarch64-unknown-linux-gnu --no-default-features --features backend-rwkv --locked
+          RUSTFLAGS="-D warnings -Cdebuginfo=0" cargo check -p infotheory --target aarch64-unknown-linux-musl --no-default-features --features backend-rwkv --locked
+          RUSTFLAGS="-D warnings -Cdebuginfo=0" cargo check -p infotheory --target aarch64-apple-darwin --no-default-features --features backend-rwkv --locked
+          RUSTFLAGS="-D warnings -Cdebuginfo=0" cargo check -p infotheory --target aarch64-pc-windows-msvc --no-default-features --features backend-rwkv --locked
+          RUSTFLAGS="-D warnings -Cdebuginfo=0" cargo check -p infotheory --target wasm32-unknown-unknown --no-default-features --features backend-rwkv --locked
+          RUSTFLAGS="-D warnings -C target-cpu=x86-64" cargo check -p infotheory --no-default-features --features backend-rwkv --locked
 
   platform-musl:
     name: Linux musl (x86_64)

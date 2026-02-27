@@ -13,27 +13,33 @@ Estimate core measures using both **Marginal** (distribution-based) and **Rate**
 Switch between different modeling paradigms seamlessly:
 - **ROSA+ (Rapid Online Suffix Automaton + Witten Bell)**: A fast statistical LM. Default backend. 
 - **CTW (Context Tree Weighting)**: Historically standard for AIXI. Accurate bit-level Bayesian model (KT-estimator).
-- **RWKV (Neural Network)**: Highly optimized x86_64 RWKV7 CPU inference backend.
+- **RWKV (Neural Network)**: Portable SIMD RWKV7 CPU inference backend (`wide`-based).
 
 ### 3. Integrated MC-AIXI Agent
 Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, or RWKV) for universal reinforcement learning.
 
-RWKV inference is SIMD-optimized for x86_64. On non-x86_64 systems, or very old x86_64 CPUs without AVX2/FMA, performance may be significantly lower and support may be limited.
-You can use a trained RWKV7 model as a rate backend ("world model") for MC-AIXI. Something like Rosetta 2 should make an exception to this for Apple Silicon.
+RWKV inference uses portable SIMD via `wide`, so it compiles and runs across x86_64 (including generic/non-AVX2), AArch64, and WASM (RWKV-only build profile).
+You can use a trained RWKV7 model as a rate backend ("world model") for MC-AIXI.
 
 ---
 
 ## Compilation & Installation
 ### Platform Support (tested)
-`infotheory` is currently tested on **x86_64** for:
+`infotheory` is currently tested on:
 - **Linux (GNU libc)** (`x86_64-unknown-linux-gnu`)
 - **Linux (musl)** (`x86_64-unknown-linux-musl`)
 - **macOS (Intel)** (`x86_64-apple-darwin`)
+- **macOS (Apple Silicon)** (`aarch64-apple-darwin`)
+- **Windows** (`x86_64-pc-windows-msvc`)
 - **FreeBSD** (`x86_64-unknown-freebsd`)
 - **OpenBSD** (`x86_64-unknown-openbsd`)
 - **NetBSD** (`x86_64-unknown-netbsd`)
+- Cross-target compile validation for RWKV portability:
+  - **AArch64 Linux (GNU/musl)** (`aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`)
+  - **AArch64 Windows** (`aarch64-pc-windows-msvc`)
+  - **WASM** (`wasm32-unknown-unknown`, RWKV-only/no-zpaq profile)
 
-<small>Apple Silicon (AARCH64) with MacOS can run this program using Rosetta 2</small>
+<small>WASM support is compile-target validation for the RWKV path (no zpaq/VM feature path).</small>
 
 ### Build Prerequisites
 - Rust toolchain (stable): `rustup` recommended.
@@ -72,7 +78,7 @@ Notes:
 Platform caveats:
 - **OpenBSD/NetBSD**: kernel W^X policies can break ZPAQ JIT at runtime. Set `CARGO_FEATURE_NOJIT=true`.
 - **NetBSD**: release LTO is problematic in common toolchains; disable release LTO if needed (see `.cargo/config.toml` comments).
-- **MacOS**: MacOS is supported in full, and will work on both Intel and Modern Apple Silicon natively due to Rosetta.
+- **MacOS**: Supported on both Intel and Apple Silicon natively.
 
 Optional tooling used by some tests/workflows:
 - docker (for tests, or if you want to use it for rootfs generation)

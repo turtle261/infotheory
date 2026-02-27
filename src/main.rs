@@ -212,8 +212,17 @@ fn load_mixture_spec_with_depth(path: &str, depth: usize) -> anyhow::Result<Mixt
     let value: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
         Err(_) => {
-            let decompressed = zpaq_rs::decompress_to_vec(&raw)?;
-            serde_json::from_slice(&decompressed)?
+            #[cfg(feature = "backend-zpaq")]
+            {
+                let decompressed = zpaq_rs::decompress_to_vec(&raw)?;
+                serde_json::from_slice(&decompressed)?
+            }
+            #[cfg(not(feature = "backend-zpaq"))]
+            {
+                return Err(anyhow::anyhow!(
+                    "Failed to parse mixture JSON, and zpaq support is disabled at compile time"
+                ));
+            }
         }
     };
     let base_dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));

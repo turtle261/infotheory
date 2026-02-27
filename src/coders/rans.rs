@@ -1,7 +1,7 @@
-//! rANS (range Asymmetric Numeral System) coder with SIMD optimizations.
+//! rANS (range Asymmetric Numeral System) coder with an optional multi-lane path.
 //!
-//! This implements a vectorized rANS coder optimized for x86_64 with AVX2/BMI2.
-//! Falls back to scalar implementation on other architectures.
+//! The primary implementation is scalar and portable. On x86_64 builds, this
+//! module also exposes an 8-lane interleaved encoder/decoder API.
 //!
 //! # Design
 //!
@@ -310,19 +310,17 @@ impl<'a> RansDecoder<'a> {
 }
 
 // =============================================================================
-// SIMD-optimized 8-way interleaved rANS (x86_64 AVX2)
+// 8-way interleaved rANS API (x86_64 build target)
 // =============================================================================
 
 #[cfg(target_arch = "x86_64")]
 mod simd {
     use super::*;
-    #[allow(unused_imports)]
-    use std::arch::x86_64::*;
 
     /// Number of parallel rANS streams
     pub const RANS_LANES: usize = 8;
 
-    /// 8-way parallel rANS encoder using AVX2.
+    /// 8-way interleaved rANS encoder.
     pub struct SimdRansEncoder {
         states: [u32; RANS_LANES],
         outputs: [Vec<u8>; RANS_LANES],
@@ -393,7 +391,7 @@ mod simd {
         }
     }
 
-    /// 8-way parallel rANS decoder using AVX2.
+    /// 8-way interleaved rANS decoder.
     pub struct SimdRansDecoder<'a> {
         states: [u32; RANS_LANES],
         input: &'a [u8],

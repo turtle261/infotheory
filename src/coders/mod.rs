@@ -7,7 +7,7 @@
 //! - **Arithmetic Coding (AC)**: Optimal compression ratio, slightly slower.
 //!   Best for small files or maximum compression.
 //! - **rANS**: Near-optimal compression with better throughput, especially
-//!   with SIMD on x86_64. Best for larger files.
+//!   with lane-interleaved encoding. Best for larger files.
 
 pub mod ac;
 pub mod rans;
@@ -25,5 +25,5 @@ pub use rans::{
     quantize_pdf_to_rans_cdf_with_buffer,
 };
 
-// SIMD types (x86_64 AVX2-enabled by default for this build)
+// Interleaved multi-lane rANS types
 pub use rans::{RANS_LANES, SimdRansDecoder, SimdRansEncoder};

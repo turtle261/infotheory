@@ -1,7 +1,7 @@
 //! Simple aligned tensor types for SIMD operations.
 //!
 //! These are minimal, no-frills tensor implementations designed for:
-//! - Aligned memory for AVX2 (32-byte alignment)
+//! - 32-byte aligned memory for portable SIMD kernels
 //! - Direct access to underlying data
 //! - Zero-copy views for weights
 
@@ -9,7 +9,7 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
 
-/// 32-byte alignment for AVX2
+/// 32-byte alignment for SIMD-friendly access.
 const ALIGNMENT: usize = 32;
 
 /// Owned 1D tensor with aligned memory.
@@ -141,7 +141,7 @@ pub struct Tensor2D {
 impl Tensor2D {
     /// Create a new zero-initialized 2D tensor.
     pub fn zeros(rows: usize, cols: usize) -> Self {
-        // Pad cols to 8 for AVX2 alignment
+        // Pad cols to a multiple of 8 f32 lanes.
         let stride = (cols + 7) & !7;
         let total = rows * stride;
 

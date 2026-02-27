@@ -14,15 +14,38 @@ pub enum BackendAvailability {
 }
 
 #[cfg(feature = "backend-rwkv")]
-pub const AVAILABLE_RATE_BACKENDS: &[&str] =
-    &["rosaplus", "ctw", "fac-ctw", "rwkv7", "zpaq", "mixture"];
+pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
+    "rosaplus",
+    "ctw",
+    "fac-ctw",
+    "rwkv7",
+    #[cfg(feature = "backend-zpaq")]
+    "zpaq",
+    "mixture",
+];
 #[cfg(not(feature = "backend-rwkv"))]
-pub const AVAILABLE_RATE_BACKENDS: &[&str] = &["rosaplus", "ctw", "fac-ctw", "zpaq", "mixture"];
+pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
+    "rosaplus",
+    "ctw",
+    "fac-ctw",
+    #[cfg(feature = "backend-zpaq")]
+    "zpaq",
+    "mixture",
+];
 
 #[cfg(feature = "backend-rwkv")]
-pub const AVAILABLE_COMPRESSION_BACKENDS: &[&str] = &["zpaq", "rwkv7", "rate-ac", "rate-rans"];
+pub const AVAILABLE_COMPRESSION_BACKENDS: &[&str] = &[
+    #[cfg(feature = "backend-zpaq")]
+    "zpaq",
+    "rwkv7",
+    "rate-ac",
+    "rate-rans",
+];
 #[cfg(not(feature = "backend-rwkv"))]
-pub const AVAILABLE_COMPRESSION_BACKENDS: &[&str] = &["zpaq"];
+pub const AVAILABLE_COMPRESSION_BACKENDS: &[&str] = &[
+    #[cfg(feature = "backend-zpaq")]
+    "zpaq",
+];
 
 pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
     let key = input.trim().to_ascii_lowercase();
@@ -30,7 +53,16 @@ pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
         "rosaplus" | "rosa" => Some(BackendAvailability::Enabled("rosaplus")),
         "ctw" => Some(BackendAvailability::Enabled("ctw")),
         "fac-ctw" | "facctw" => Some(BackendAvailability::Enabled("fac-ctw")),
-        "zpaq" => Some(BackendAvailability::Enabled("zpaq")),
+        "zpaq" => {
+            if cfg!(feature = "backend-zpaq") {
+                Some(BackendAvailability::Enabled("zpaq"))
+            } else {
+                Some(BackendAvailability::Disabled {
+                    canonical: "zpaq",
+                    feature: "backend-zpaq",
+                })
+            }
+        }
         "mixture" | "mix" => Some(BackendAvailability::Enabled("mixture")),
         "rwkv7" | "rwkv" => {
             if cfg!(feature = "backend-rwkv") {
@@ -49,7 +81,16 @@ pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
 pub fn resolve_compression_backend_name(input: &str) -> Option<BackendAvailability> {
     let key = input.trim().to_ascii_lowercase();
     match key.as_str() {
-        "zpaq" => Some(BackendAvailability::Enabled("zpaq")),
+        "zpaq" => {
+            if cfg!(feature = "backend-zpaq") {
+                Some(BackendAvailability::Enabled("zpaq"))
+            } else {
+                Some(BackendAvailability::Disabled {
+                    canonical: "zpaq",
+                    feature: "backend-zpaq",
+                })
+            }
+        }
         "rwkv7" | "rwkv" => {
             if cfg!(feature = "backend-rwkv") {
                 Some(BackendAvailability::Enabled("rwkv7"))
