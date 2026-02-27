@@ -11,9 +11,11 @@
 // - **x86_64 optimized**: AVX2/FMA SIMD throughout, no external BLAS dependencies
 // - **Correct-by-construction**: Information-theoretically sound implementation
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use serde_json::json;
+use std::fs;
 use std::io::{Cursor, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod rwkv7;
@@ -22,7 +24,6 @@ pub use crate::coders;
 use crate::coders::{
     ANS_TOTAL, ArithmeticDecoder, ArithmeticEncoder, BlockedRansDecoder, BlockedRansEncoder,
     CDF_TOTAL, Cdf, quantize_pdf_to_cdf_inplace, quantize_pdf_to_rans_cdf_with_buffer,
-    softmax_pdf_floor_inplace, softmax_pdf_inplace,
 };
 
 pub use rwkv7::{Config, Model, ScratchBuffers, State};
@@ -98,6 +99,284 @@ impl std::fmt::Display for CoderType {
             CoderType::RANS => write!(f, "rANS"),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnlineTrainMode {
+    None,
+    Sgd,
+    Adam,
+}
+
+#[derive(Clone, Debug)]
+pub struct OnlineConfig {
+    pub hidden: usize,
+    pub layers: usize,
+    pub intermediate: usize,
+    pub decay_rank: usize,
+    pub a_rank: usize,
+    pub v_rank: usize,
+    pub g_rank: usize,
+    pub seed: u64,
+    pub train_mode: OnlineTrainMode,
+    pub lr: f32,
+    pub stride: usize,
+}
+
+impl Default for OnlineConfig {
+    fn default() -> Self {
+        Self {
+            hidden: 256,
+            layers: 6,
+            intermediate: 1024,
+            decay_rank: 32,
+            a_rank: 32,
+            v_rank: 32,
+            g_rank: 64,
+            seed: 0,
+            train_mode: OnlineTrainMode::None,
+            lr: 0.001,
+            stride: 1,
+        }
+    }
+}
+
+impl OnlineConfig {
+    pub fn to_rwkv_config(&self) -> Result<Config> {
+        let hidden = self.hidden.max(64);
+        if hidden % 64 != 0 {
+            bail!("rwkv hidden must be a multiple of 64 (got {hidden})");
+        }
+        let num_heads = hidden / 64;
+        let cfg = Config {
+            vocab_size: 256,
+            hidden_size: hidden,
+            num_layers: self.layers.max(1),
+            num_heads,
+            head_dim: 64,
+            intermediate_size: self.intermediate.max(1),
+            layer_norm_eps: 1e-5,
+            group_norm_eps: 64e-5,
+            decay_low_rank: self.decay_rank.max(1),
+            a_low_rank: self.a_rank.max(1),
+            v_low_rank: self.v_rank.max(1),
+            g_low_rank: self.g_rank.max(1),
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum MethodSpec {
+    File(PathBuf),
+    Online(OnlineConfig),
+}
+
+#[derive(Clone, Debug)]
+struct OnlineRuntime {
+    cfg: OnlineConfig,
+    canonical_cfg: String,
+    tokens_processed: u64,
+    out_bias: Vec<f32>,
+    adam_m: Option<Vec<f32>>,
+    adam_v: Option<Vec<f32>>,
+    adam_t: usize,
+}
+
+impl OnlineRuntime {
+    fn new(cfg: OnlineConfig, vocab_size: usize) -> Self {
+        let use_adam = matches!(cfg.train_mode, OnlineTrainMode::Adam);
+        Self {
+            canonical_cfg: cfg_to_method_string(&cfg),
+            cfg,
+            tokens_processed: 0,
+            out_bias: vec![0.0; vocab_size],
+            adam_m: use_adam.then(|| vec![0.0; vocab_size]),
+            adam_v: use_adam.then(|| vec![0.0; vocab_size]),
+            adam_t: 0,
+        }
+    }
+}
+
+fn cfg_to_method_string(cfg: &OnlineConfig) -> String {
+    let train = match cfg.train_mode {
+        OnlineTrainMode::None => "none",
+        OnlineTrainMode::Sgd => "sgd",
+        OnlineTrainMode::Adam => "adam",
+    };
+    format!(
+        "cfg:hidden={},layers={},intermediate={},decay_rank={},a_rank={},v_rank={},g_rank={},seed={},train={},lr={},stride={}",
+        cfg.hidden,
+        cfg.layers,
+        cfg.intermediate,
+        cfg.decay_rank,
+        cfg.a_rank,
+        cfg.v_rank,
+        cfg.g_rank,
+        cfg.seed,
+        train,
+        cfg.lr,
+        cfg.stride.max(1),
+    )
+}
+
+fn softmax_pdf_floor_with_bias(logits: &[f32], bias: Option<&[f32]>, pdf_out: &mut [f64]) {
+    debug_assert_eq!(logits.len(), pdf_out.len());
+    if let Some(b) = bias {
+        debug_assert_eq!(b.len(), logits.len());
+    }
+    if logits.is_empty() {
+        return;
+    }
+
+    let mut max_logit = f32::NEG_INFINITY;
+    for i in 0..logits.len() {
+        let z = logits[i] + bias.map_or(0.0, |b| b[i]);
+        if z > max_logit {
+            max_logit = z;
+        }
+    }
+
+    let mut sum = 0.0f64;
+    for i in 0..logits.len() {
+        let z = logits[i] + bias.map_or(0.0, |b| b[i]);
+        let p = ((z - max_logit) as f64).exp();
+        pdf_out[i] = p;
+        sum += p;
+    }
+
+    let inv_sum = if sum.is_finite() && sum > 0.0 {
+        1.0 / sum
+    } else {
+        1.0 / (logits.len() as f64)
+    };
+
+    let floor = 1e-12f64;
+    let mut norm = 0.0f64;
+    for p in pdf_out.iter_mut() {
+        *p = (*p * inv_sum).max(floor);
+        norm += *p;
+    }
+    let inv_norm = if norm.is_finite() && norm > 0.0 {
+        1.0 / norm
+    } else {
+        1.0 / (logits.len() as f64)
+    };
+    for p in pdf_out.iter_mut() {
+        *p *= inv_norm;
+    }
+}
+
+fn parse_u64(v: &str, key: &str) -> Result<u64> {
+    v.parse::<u64>()
+        .with_context(|| format!("invalid integer value for '{key}': {v}"))
+}
+
+fn parse_usize(v: &str, key: &str) -> Result<usize> {
+    v.parse::<usize>()
+        .with_context(|| format!("invalid integer value for '{key}': {v}"))
+}
+
+fn parse_f32(v: &str, key: &str) -> Result<f32> {
+    v.parse::<f32>()
+        .with_context(|| format!("invalid float value for '{key}': {v}"))
+}
+
+fn parse_train_mode_token(v: &str) -> Result<OnlineTrainMode> {
+    let code = v.trim().to_ascii_lowercase();
+    match code.as_str() {
+        "0" | "none" | "off" => Ok(OnlineTrainMode::None),
+        "1" | "sgd" => Ok(OnlineTrainMode::Sgd),
+        "2" | "adam" => Ok(OnlineTrainMode::Adam),
+        other => bail!("unknown train mode '{other}'"),
+    }
+}
+
+fn parse_cfg_positional(csv: &str) -> Result<OnlineConfig> {
+    let vals: Vec<&str> = csv
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if vals.len() != 6 && vals.len() != 7 {
+        bail!(
+            "positional cfg format expects 6 or 7 values: hidden,intermediate,layers,train,seed,lr[,stride]"
+        );
+    }
+
+    let mut cfg = OnlineConfig::default();
+    cfg.hidden = parse_usize(vals[0], "hidden")?;
+    cfg.intermediate = parse_usize(vals[1], "intermediate")?;
+    cfg.layers = parse_usize(vals[2], "layers")?;
+    cfg.train_mode = parse_train_mode_token(vals[3])?;
+    cfg.seed = parse_u64(vals[4], "seed")?;
+    cfg.lr = parse_f32(vals[5], "lr")?;
+    if vals.len() == 7 {
+        cfg.stride = parse_usize(vals[6], "stride")?;
+    }
+    Ok(cfg)
+}
+
+pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
+    let trimmed = method.trim();
+    if trimmed.is_empty() {
+        bail!("empty rwkv method");
+    }
+
+    if let Some(path) = trimmed.strip_prefix("file:") {
+        let p = PathBuf::from(path.trim());
+        if p.as_os_str().is_empty() {
+            bail!("empty file path in rwkv method");
+        }
+        return Ok(MethodSpec::File(p));
+    }
+
+    if let Some(cfg_s) = trimmed.strip_prefix("cfg:") {
+        if !cfg_s.contains('=') {
+            return Ok(MethodSpec::Online(parse_cfg_positional(cfg_s)?));
+        }
+        let mut cfg = OnlineConfig::default();
+        for pair in cfg_s.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let (k, v) = pair
+                .split_once('=')
+                .with_context(|| format!("invalid cfg key/value pair '{pair}'"))?;
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            match key.as_str() {
+                "hidden" => cfg.hidden = parse_usize(val, "hidden")?,
+                "layers" => cfg.layers = parse_usize(val, "layers")?,
+                "intermediate" => cfg.intermediate = parse_usize(val, "intermediate")?,
+                "decay_rank" => cfg.decay_rank = parse_usize(val, "decay_rank")?,
+                "a_rank" => cfg.a_rank = parse_usize(val, "a_rank")?,
+                "v_rank" => cfg.v_rank = parse_usize(val, "v_rank")?,
+                "g_rank" => cfg.g_rank = parse_usize(val, "g_rank")?,
+                "seed" => cfg.seed = parse_u64(val, "seed")?,
+                "lr" => cfg.lr = parse_f32(val, "lr")?,
+                "stride" => cfg.stride = parse_usize(val, "stride")?,
+                "train" | "train_mode" => cfg.train_mode = parse_train_mode_token(val)?,
+                other => bail!("unknown rwkv cfg key '{other}'"),
+            }
+        }
+        return Ok(MethodSpec::Online(cfg));
+    }
+
+    let plain = PathBuf::from(trimmed);
+    if plain.exists() {
+        return Ok(MethodSpec::File(plain));
+    }
+
+    if trimmed.contains(',') {
+        return Ok(MethodSpec::Online(parse_cfg_positional(trimmed)?));
+    }
+
+    bail!(
+        "rwkv method must be 'file:<path>', 'cfg:<k=v,...>', positional cfg CSV, or an existing model path"
+    );
 }
 
 // =============================================================================
@@ -242,6 +521,8 @@ pub struct Compressor {
     pub cdf_buffer_rans: Vec<u32>,
     /// Scratch frequencies for rANS quantization.
     pub rans_freq_buffer: Vec<i64>,
+    online: Option<OnlineRuntime>,
+    source_model_path: Option<PathBuf>,
 }
 
 impl Clone for Compressor {
@@ -252,6 +533,8 @@ impl Clone for Compressor {
         cloned.cdf_buffer_ac.clone_from(&self.cdf_buffer_ac);
         cloned.cdf_buffer_rans.clone_from(&self.cdf_buffer_rans);
         cloned.rans_freq_buffer.clone_from(&self.rans_freq_buffer);
+        cloned.online = self.online.clone();
+        cloned.source_model_path = self.source_model_path.clone();
         cloned
     }
 }
@@ -265,8 +548,12 @@ impl Compressor {
     /// # Returns
     /// A new Compressor ready for compression/decompression operations.
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self> {
+        let model_path = model_path.as_ref();
         let model = Arc::new(Model::load(model_path)?);
-        Ok(Self::new_from_model(model))
+        let mut c = Self::new_from_model(model);
+        c.source_model_path = Some(model_path.to_path_buf());
+        c.maybe_load_sidecar()?;
+        Ok(c)
     }
 
     pub fn load_model<P: AsRef<Path>>(model_path: P) -> Result<Arc<Model>> {
@@ -285,6 +572,21 @@ impl Compressor {
             cdf_buffer_ac: vec![0u32; vocab_size + 1],
             cdf_buffer_rans: vec![0u32; vocab_size + 1],
             rans_freq_buffer: vec![0i64; vocab_size],
+            online: None,
+            source_model_path: None,
+        }
+    }
+
+    pub fn new_from_method(method: &str) -> Result<Self> {
+        match parse_method_spec(method)? {
+            MethodSpec::File(path) => Self::new(path),
+            MethodSpec::Online(cfg) => {
+                let rwcfg = cfg.to_rwkv_config()?;
+                let model = Arc::new(Model::new_random(rwcfg, cfg.seed)?);
+                let mut c = Self::new_from_model(model);
+                c.online = Some(OnlineRuntime::new(cfg, VOCAB_SIZE));
+                Ok(c)
+            }
         }
     }
 
@@ -296,9 +598,220 @@ impl Compressor {
         self.state.reset();
     }
 
+    pub fn is_online(&self) -> bool {
+        self.online.is_some()
+    }
+
+    pub fn tokens_processed(&self) -> u64 {
+        self.online.as_ref().map_or(0, |s| s.tokens_processed)
+    }
+
+    pub fn online_method_string(&self) -> Option<&str> {
+        self.online.as_ref().map(|s| s.canonical_cfg.as_str())
+    }
+
     /// Get the vocabulary size (should always be 256 for byte-level).
     pub fn vocab_size(&self) -> usize {
         self.model.config().vocab_size
+    }
+
+    pub fn online_apply_logits_bias(&self, logits: &[f32], pdf_out: &mut [f64]) {
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
+        Self::logits_to_pdf(logits, bias, pdf_out);
+    }
+
+    pub fn logits_to_pdf(logits: &[f32], bias: Option<&[f32]>, pdf_out: &mut [f64]) {
+        softmax_pdf_floor_with_bias(logits, bias, pdf_out);
+    }
+
+    pub fn online_bias_snapshot(&self) -> Option<Vec<f32>> {
+        self.online.as_ref().map(|o| o.out_bias.clone())
+    }
+
+    pub fn online_update_from_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
+        let Some(online) = self.online.as_mut() else {
+            return Ok(());
+        };
+        online.tokens_processed = online.tokens_processed.saturating_add(1);
+
+        if matches!(online.cfg.train_mode, OnlineTrainMode::None) {
+            return Ok(());
+        }
+
+        let stride = online.cfg.stride.max(1) as u64;
+        if stride > 1 && (online.tokens_processed % stride) != 0 {
+            return Ok(());
+        }
+
+        let lr = online.cfg.lr.max(0.0);
+        if lr == 0.0 {
+            return Ok(());
+        }
+
+        let n = online.out_bias.len().min(pdf.len());
+        match online.cfg.train_mode {
+            OnlineTrainMode::None => {}
+            OnlineTrainMode::Sgd => {
+                for (i, p_raw) in pdf.iter().enumerate().take(n) {
+                    let p = (*p_raw).clamp(1e-12, 1.0) as f32;
+                    let target = if i == symbol as usize { 1.0 } else { 0.0 };
+                    let grad = target - p;
+                    online.out_bias[i] += lr * grad;
+                }
+            }
+            OnlineTrainMode::Adam => {
+                online.adam_t = online.adam_t.saturating_add(1);
+                let t = online.adam_t as i32;
+                let b1 = 0.9f32;
+                let b2 = 0.999f32;
+                let eps = 1e-8f32;
+                if let (Some(m), Some(v)) = (online.adam_m.as_mut(), online.adam_v.as_mut()) {
+                    for i in 0..n {
+                        let p = pdf[i].clamp(1e-12, 1.0) as f32;
+                        let target = if i == symbol as usize { 1.0 } else { 0.0 };
+                        let grad = target - p;
+                        m[i] = b1 * m[i] + (1.0 - b1) * grad;
+                        v[i] = b2 * v[i] + (1.0 - b2) * grad * grad;
+                        let m_hat = m[i] / (1.0 - b1.powi(t));
+                        let v_hat = v[i] / (1.0 - b2.powi(t));
+                        online.out_bias[i] += lr * m_hat / (v_hat.sqrt() + eps);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn online_update_from_current_pdf(&mut self, symbol: u8) -> Result<()> {
+        if self.online.is_none() {
+            return Ok(());
+        }
+        let pdf = self.pdf_buffer.clone();
+        self.online_update_from_pdf(symbol, &pdf)
+    }
+
+    pub fn export_online<P: AsRef<Path>>(&self, model_path: P) -> Result<()> {
+        let model_path = model_path.as_ref();
+        self.model.save_safetensors(model_path)?;
+
+        let sidecar = model_path.with_extension("json");
+        let meta = if let Some(online) = &self.online {
+            let train_mode = match online.cfg.train_mode {
+                OnlineTrainMode::None => "none",
+                OnlineTrainMode::Sgd => "sgd",
+                OnlineTrainMode::Adam => "adam",
+            };
+            json!({
+                "version": 1,
+                "method": online.canonical_cfg,
+                "training_mode": train_mode,
+                "tokens_processed": online.tokens_processed,
+                "config": {
+                    "hidden": online.cfg.hidden,
+                    "layers": online.cfg.layers,
+                    "intermediate": online.cfg.intermediate,
+                    "decay_rank": online.cfg.decay_rank,
+                    "a_rank": online.cfg.a_rank,
+                    "v_rank": online.cfg.v_rank,
+                    "g_rank": online.cfg.g_rank,
+                    "seed": online.cfg.seed,
+                    "lr": online.cfg.lr,
+                    "stride": online.cfg.stride.max(1),
+                },
+                "output_bias": online.out_bias,
+            })
+        } else {
+            json!({
+                "version": 1,
+                "method": format!("file:{}", model_path.display()),
+                "training_mode": "none",
+                "tokens_processed": 0,
+            })
+        };
+
+        fs::write(&sidecar, serde_json::to_vec_pretty(&meta)?)?;
+        Ok(())
+    }
+
+    fn maybe_load_sidecar(&mut self) -> Result<()> {
+        let Some(model_path) = &self.source_model_path else {
+            return Ok(());
+        };
+        let sidecar = model_path.with_extension("json");
+        if !sidecar.exists() {
+            return Ok(());
+        }
+        let raw = fs::read(&sidecar)?;
+        let v: serde_json::Value = serde_json::from_slice(&raw)?;
+        let output_bias = v
+            .get("output_bias")
+            .and_then(|arr| arr.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                    .collect::<Vec<f32>>()
+            });
+        let method = v
+            .get("method")
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("file:{}", model_path.display()));
+        let tokens = v
+            .get("tokens_processed")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        if let Some(mut out_bias) = output_bias {
+            out_bias.resize(self.vocab_size(), 0.0);
+            let mut cfg = OnlineConfig::default();
+            if let Some(cfg_v) = v.get("config").and_then(|x| x.as_object()) {
+                if let Some(x) = cfg_v.get("hidden").and_then(|x| x.as_u64()) {
+                    cfg.hidden = x as usize;
+                }
+                if let Some(x) = cfg_v.get("layers").and_then(|x| x.as_u64()) {
+                    cfg.layers = x as usize;
+                }
+                if let Some(x) = cfg_v.get("intermediate").and_then(|x| x.as_u64()) {
+                    cfg.intermediate = x as usize;
+                }
+                if let Some(x) = cfg_v.get("decay_rank").and_then(|x| x.as_u64()) {
+                    cfg.decay_rank = x as usize;
+                }
+                if let Some(x) = cfg_v.get("a_rank").and_then(|x| x.as_u64()) {
+                    cfg.a_rank = x as usize;
+                }
+                if let Some(x) = cfg_v.get("v_rank").and_then(|x| x.as_u64()) {
+                    cfg.v_rank = x as usize;
+                }
+                if let Some(x) = cfg_v.get("g_rank").and_then(|x| x.as_u64()) {
+                    cfg.g_rank = x as usize;
+                }
+                if let Some(x) = cfg_v.get("seed").and_then(|x| x.as_u64()) {
+                    cfg.seed = x;
+                }
+                if let Some(x) = cfg_v.get("lr").and_then(|x| x.as_f64()) {
+                    cfg.lr = x as f32;
+                }
+                if let Some(x) = cfg_v.get("stride").and_then(|x| x.as_u64()) {
+                    cfg.stride = (x as usize).max(1);
+                }
+            }
+            cfg.train_mode = v
+                .get("training_mode")
+                .and_then(|x| x.as_str())
+                .and_then(|s| parse_train_mode_token(s).ok())
+                .unwrap_or(OnlineTrainMode::None);
+            self.online = Some(OnlineRuntime {
+                cfg,
+                canonical_cfg: method,
+                tokens_processed: tokens,
+                out_bias,
+                adam_m: None,
+                adam_v: None,
+                adam_t: 0,
+            });
+        }
+        Ok(())
     }
 
     /// Compress data using the specified entropy coder.
@@ -385,11 +898,11 @@ impl Compressor {
         I: IntoIterator<Item = u8>,
     {
         let mut encoder = ArithmeticEncoder::new(output);
-        let vocab_size = self.vocab_size();
 
         // Prime the model with a null byte to establish initial state
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        softmax_pdf_floor_inplace(logits, vocab_size, &mut self.pdf_buffer);
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         for byte in data {
             quantize_pdf_to_cdf_inplace(&self.pdf_buffer, &mut self.cdf_buffer_ac);
@@ -397,12 +910,14 @@ impl Compressor {
             let c_lo = self.cdf_buffer_ac[sym] as u64;
             let c_hi = self.cdf_buffer_ac[sym + 1] as u64;
             encoder.encode_counts(c_lo, c_hi, CDF_TOTAL as u64)?;
+            self.online_update_from_current_pdf(byte)?;
 
             // Update model state with actual byte for next prediction
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, byte as u32, &mut self.state);
-            softmax_pdf_floor_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         let _ = encoder.finish()?;
@@ -418,14 +933,13 @@ impl Compressor {
     where
         I: IntoIterator<Item = u8>,
     {
-        let vocab_size = self.vocab_size();
-
         // Use blocked encoder (128KB blocks) for streaming large files
         let mut encoder = BlockedRansEncoder::new();
 
         // Prime the model with a null byte
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        softmax_pdf_floor_inplace(logits, vocab_size, &mut self.pdf_buffer);
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         for byte in data {
             quantize_pdf_to_rans_cdf_with_buffer(
@@ -440,12 +954,14 @@ impl Compressor {
                 ANS_TOTAL,
             );
             encoder.encode(cdf);
+            self.online_update_from_current_pdf(byte)?;
 
             // Update model state
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, byte as u32, &mut self.state);
-            softmax_pdf_floor_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         // Finish encoding and write blocks
@@ -498,24 +1014,26 @@ impl Compressor {
     /// Decompress using arithmetic coding.
     fn decompress_ac(&mut self, compressed: &[u8], original_len: usize) -> Result<Vec<u8>> {
         let mut decoder = ArithmeticDecoder::new(compressed)?;
-        let vocab_size = self.vocab_size();
 
         let mut result = Vec::with_capacity(original_len);
 
         // Prime with null byte (must match compression)
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        softmax_pdf_floor_inplace(logits, vocab_size, &mut self.pdf_buffer);
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         for _ in 0..original_len {
             quantize_pdf_to_cdf_inplace(&self.pdf_buffer, &mut self.cdf_buffer_ac);
             let sym = decoder.decode_symbol_counts(&self.cdf_buffer_ac, CDF_TOTAL)?;
             result.push(sym as u8);
+            self.online_update_from_current_pdf(sym as u8)?;
 
             // Update model state with decoded byte
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, sym as u32, &mut self.state);
-            softmax_pdf_floor_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         Ok(result)
@@ -556,12 +1074,12 @@ impl Compressor {
 
         // Decode using blocked decoder
         let mut decoder = BlockedRansDecoder::new(blocks);
-        let vocab_size = self.vocab_size();
         let mut result = Vec::with_capacity(original_len);
 
         // Prime with null byte
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        softmax_pdf_floor_inplace(logits, vocab_size, &mut self.pdf_buffer);
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         for _ in 0..original_len {
             quantize_pdf_to_rans_cdf_with_buffer(
@@ -571,12 +1089,14 @@ impl Compressor {
             );
             let sym = decoder.decode(&self.cdf_buffer_rans)?;
             result.push(sym as u8);
+            self.online_update_from_current_pdf(sym as u8)?;
 
             // Update model state
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, sym as u32, &mut self.state);
-            softmax_pdf_floor_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         Ok(result)
@@ -598,21 +1118,23 @@ impl Compressor {
         }
 
         self.state.reset();
-        let vocab_size = self.vocab_size();
 
         let mut total_bits = 0.0f64;
 
         // Prime with null byte
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         for &byte in data {
             let p = self.pdf_buffer[byte as usize];
             total_bits -= p.log2();
+            self.online_update_from_current_pdf(byte)?;
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, byte as u32, &mut self.state);
-            softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         Ok(total_bits / (data.len() as f64))
@@ -628,17 +1150,19 @@ impl Compressor {
         }
 
         self.state.reset();
-        let vocab_size = self.vocab_size();
 
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         for p in prefix_parts {
             for &byte in *p {
+                self.online_update_from_current_pdf(byte)?;
+                let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
                 let logits = self
                     .model
                     .forward(&mut self.scratch, byte as u32, &mut self.state);
-                softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+                Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
             }
         }
 
@@ -646,10 +1170,12 @@ impl Compressor {
         for &byte in data {
             let p = self.pdf_buffer[byte as usize];
             total_bits -= p.log2();
+            self.online_update_from_current_pdf(byte)?;
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, byte as u32, &mut self.state);
-            softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         Ok(total_bits / (data.len() as f64))
@@ -661,28 +1187,32 @@ impl Compressor {
         }
 
         self.state.reset();
-        let vocab_size = self.vocab_size();
 
         // Prime with null byte
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         // Condition on prefix (update state, no scoring)
         for &byte in prefix {
+            self.online_update_from_current_pdf(byte)?;
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, byte as u32, &mut self.state);
-            softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         let mut total_bits = 0.0f64;
         for &byte in data {
             let p = self.pdf_buffer[byte as usize];
             total_bits -= p.log2();
+            self.online_update_from_current_pdf(byte)?;
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, byte as u32, &mut self.state);
-            softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         Ok(total_bits / (data.len() as f64))
@@ -706,10 +1236,10 @@ impl Compressor {
         }
 
         self.state.reset();
-        let vocab_size = self.vocab_size();
 
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         let mut total_bits = 0.0f64;
         for i in 0..n {
@@ -718,17 +1248,21 @@ impl Compressor {
 
             let pa = self.pdf_buffer[a as usize];
             total_bits -= pa.log2();
+            self.online_update_from_current_pdf(a)?;
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, a as u32, &mut self.state);
-            softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
             let pb = self.pdf_buffer[b as usize];
             total_bits -= pb.log2();
+            self.online_update_from_current_pdf(b)?;
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
                 .forward(&mut self.scratch, b as u32, &mut self.state);
-            softmax_pdf_inplace(logits, vocab_size, &mut self.pdf_buffer);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         Ok(total_bits / (n as f64))
@@ -802,6 +1336,15 @@ pub fn compress_with_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str, ext: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("infotheory_rwkvzip_{name}_{ts}.{ext}"))
+    }
 
     #[test]
     fn test_header_roundtrip() {
@@ -869,5 +1412,77 @@ mod tests {
         let err = Header::read(&mut cursor).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Invalid magic number"));
+    }
+
+    #[test]
+    fn test_parse_method_spec_file_and_cfg() {
+        let p = temp_path("dummy", "bin");
+        std::fs::write(&p, b"x").unwrap();
+
+        match parse_method_spec(&format!("file:{}", p.display())).unwrap() {
+            MethodSpec::File(got) => assert_eq!(got, p),
+            _ => panic!("expected file method"),
+        }
+
+        match parse_method_spec(
+            "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=1,train=none,lr=0.01,stride=2",
+        )
+        .unwrap()
+        {
+            MethodSpec::Online(cfg) => {
+                assert_eq!(cfg.hidden, 64);
+                assert_eq!(cfg.layers, 1);
+                assert_eq!(cfg.seed, 1);
+                assert_eq!(cfg.stride, 2);
+            }
+            _ => panic!("expected cfg method"),
+        }
+
+        match parse_method_spec("64,64,1,0,7,0.01,2").unwrap() {
+            MethodSpec::Online(cfg) => {
+                assert_eq!(cfg.hidden, 64);
+                assert_eq!(cfg.intermediate, 64);
+                assert_eq!(cfg.layers, 1);
+                assert_eq!(cfg.seed, 7);
+                assert_eq!(cfg.stride, 2);
+            }
+            _ => panic!("expected positional cfg method"),
+        }
+
+        // Backward-compatible plain existing path.
+        match parse_method_spec(&p.display().to_string()).unwrap() {
+            MethodSpec::File(got) => assert_eq!(got, p),
+            _ => panic!("expected file method"),
+        }
+
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn test_parse_method_spec_rejects_unknown_cfg_key() {
+        let err = parse_method_spec("cfg:hidden=64,wat=1").unwrap_err();
+        assert!(format!("{err:#}").contains("unknown rwkv cfg key"));
+    }
+
+    #[test]
+    fn test_online_export_reload_roundtrip() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=7,train=sgd,lr=0.01,stride=1";
+        let data = b"rwkv online export/load deterministic sample";
+
+        let mut c1 = Compressor::new_from_method(method).unwrap();
+        let _ = c1.compress(data, CoderType::AC).unwrap();
+
+        let model_path = temp_path("export", "safetensors");
+        c1.export_online(&model_path).unwrap();
+        let out1_after_export = c1.compress(data, CoderType::AC).unwrap();
+
+        let mut c2 = Compressor::new(&model_path).unwrap();
+        let out2 = c2.compress(data, CoderType::AC).unwrap();
+
+        assert_eq!(out1_after_export, out2);
+        assert!(model_path.with_extension("json").exists());
+
+        std::fs::remove_file(&model_path).ok();
+        std::fs::remove_file(model_path.with_extension("json")).ok();
     }
 }

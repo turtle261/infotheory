@@ -3,7 +3,10 @@
 //! This is a high-performance implementation specifically for x86_64 CPUs.
 //! Single-token inference is the primary use case (streaming compression).
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use serde_json::json;
+use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
@@ -47,6 +50,32 @@ impl Default for Config {
             v_low_rank: 32,
             g_low_rank: 64,
         }
+    }
+}
+
+impl Config {
+    pub fn validate(&self) -> Result<()> {
+        if self.vocab_size == 0 {
+            bail!("rwkv7 vocab_size must be > 0");
+        }
+        if self.head_dim != 64 {
+            bail!("rwkv7 head_dim must be 64 for current AVX2 kernels");
+        }
+        if self.hidden_size != self.num_heads * self.head_dim {
+            bail!(
+                "rwkv7 hidden_size must equal num_heads * head_dim ({} != {} * {})",
+                self.hidden_size,
+                self.num_heads,
+                self.head_dim
+            );
+        }
+        if self.num_layers == 0 {
+            bail!("rwkv7 num_layers must be > 0");
+        }
+        if self.intermediate_size == 0 {
+            bail!("rwkv7 intermediate_size must be > 0");
+        }
+        Ok(())
     }
 }
 
@@ -447,6 +476,424 @@ impl Model {
             lm_head,
             blocks,
         })
+    }
+
+    /// Create a randomly initialized model for online-training workflows.
+    pub fn new_random(cfg: Config, seed: u64) -> Result<Self> {
+        cfg.validate()?;
+
+        let mut rng = RwkvRng::new(seed);
+        let c = cfg.hidden_size;
+        let v = cfg.vocab_size;
+        let i = cfg.intermediate_size;
+        let d_w = cfg.decay_low_rank;
+        let d_a = cfg.a_low_rank;
+        let d_v = cfg.v_low_rank;
+        let d_g = cfg.g_low_rank;
+
+        let mut embeddings = Tensor1D::zeros(v * c);
+        init_uniform(&mut embeddings, &mut rng, 0.02);
+
+        let mut ln_out_w = Tensor1D::zeros(c);
+        let mut ln_out_b = Tensor1D::zeros(c);
+        init_const(&mut ln_out_w, 1.0);
+        init_const(&mut ln_out_b, 0.0);
+
+        let mut lm_head = Tensor1D::zeros(v * c);
+        init_uniform(&mut lm_head, &mut rng, 0.02);
+
+        let mut blocks = Vec::with_capacity(cfg.num_layers);
+        for layer_idx in 0..cfg.num_layers {
+            let (pre_norm_w, pre_norm_b) = if layer_idx == 0 {
+                let mut w = Tensor1D::zeros(c);
+                let mut b = Tensor1D::zeros(c);
+                init_const(&mut w, 1.0);
+                init_const(&mut b, 0.0);
+                (Some(w), Some(b))
+            } else {
+                (None, None)
+            };
+
+            let mut attn_norm_w = Tensor1D::zeros(c);
+            let mut attn_norm_b = Tensor1D::zeros(c);
+            init_const(&mut attn_norm_w, 1.0);
+            init_const(&mut attn_norm_b, 0.0);
+
+            let mut ffn_norm_w = Tensor1D::zeros(c);
+            let mut ffn_norm_b = Tensor1D::zeros(c);
+            init_const(&mut ffn_norm_w, 1.0);
+            init_const(&mut ffn_norm_b, 0.0);
+
+            let mut rkv_proj = Tensor1D::zeros(3 * c * c);
+            init_uniform(&mut rkv_proj, &mut rng, 0.02);
+
+            let mut o_proj = Tensor1D::zeros(c * c);
+            init_uniform(&mut o_proj, &mut rng, 0.02);
+
+            let mut w1 = Tensor1D::zeros(d_w * c);
+            let mut w2 = Tensor1D::zeros(c * d_w);
+            let mut w0 = Tensor1D::zeros(c);
+            init_uniform(&mut w1, &mut rng, 0.02);
+            init_uniform(&mut w2, &mut rng, 0.02);
+            init_const(&mut w0, 0.0);
+
+            let mut a1 = Tensor1D::zeros(d_a * c);
+            let mut a2 = Tensor1D::zeros(c * d_a);
+            let mut a0 = Tensor1D::zeros(c);
+            init_uniform(&mut a1, &mut rng, 0.02);
+            init_uniform(&mut a2, &mut rng, 0.02);
+            init_const(&mut a0, 0.0);
+
+            let (v1, v2, v0) = if layer_idx == 0 {
+                (None, None, None)
+            } else {
+                let mut v1 = Tensor1D::zeros(d_v * c);
+                let mut v2 = Tensor1D::zeros(c * d_v);
+                let mut v0 = Tensor1D::zeros(c);
+                init_uniform(&mut v1, &mut rng, 0.02);
+                init_uniform(&mut v2, &mut rng, 0.02);
+                init_const(&mut v0, 0.0);
+                (Some(v1), Some(v2), Some(v0))
+            };
+
+            let mut g1 = Tensor1D::zeros(d_g * c);
+            let mut g2 = Tensor1D::zeros(c * d_g);
+            init_uniform(&mut g1, &mut rng, 0.02);
+            init_uniform(&mut g2, &mut rng, 0.02);
+
+            let mut x_r = Tensor1D::zeros(c);
+            let mut x_w = Tensor1D::zeros(c);
+            let mut x_k = Tensor1D::zeros(c);
+            let mut x_v = Tensor1D::zeros(c);
+            let mut x_a = Tensor1D::zeros(c);
+            let mut x_g = Tensor1D::zeros(c);
+            init_centered(&mut x_r, &mut rng, 0.5, 0.02);
+            init_centered(&mut x_w, &mut rng, 0.5, 0.02);
+            init_centered(&mut x_k, &mut rng, 0.5, 0.02);
+            init_centered(&mut x_v, &mut rng, 0.5, 0.02);
+            init_centered(&mut x_a, &mut rng, 0.5, 0.02);
+            init_centered(&mut x_g, &mut rng, 0.5, 0.02);
+
+            let mut k_k = Tensor1D::zeros(c);
+            let mut k_a = Tensor1D::zeros(c);
+            let mut r_k = Tensor1D::zeros(c);
+            init_const(&mut k_k, 1.0);
+            init_const(&mut k_a, 1.0);
+            init_const(&mut r_k, 1.0);
+
+            let mut g_norm_w = Tensor1D::zeros(c);
+            let mut g_norm_b = Tensor1D::zeros(c);
+            init_const(&mut g_norm_w, 1.0);
+            init_const(&mut g_norm_b, 0.0);
+
+            let attn = AttentionWeights {
+                x_r,
+                x_w,
+                x_k,
+                x_v,
+                x_a,
+                x_g,
+                rkv_proj,
+                o_proj,
+                w1,
+                w2,
+                w0,
+                a1,
+                a2,
+                a0,
+                v1,
+                v2,
+                v0,
+                g1,
+                g2,
+                k_k,
+                k_a,
+                r_k,
+                g_norm_w,
+                g_norm_b,
+            };
+
+            let mut ffn_x_k = Tensor1D::zeros(c);
+            init_centered(&mut ffn_x_k, &mut rng, 0.5, 0.02);
+            let mut key_w = Tensor1D::zeros(i * c);
+            let mut value_w = Tensor1D::zeros(c * i);
+            init_uniform(&mut key_w, &mut rng, 0.02);
+            init_uniform(&mut value_w, &mut rng, 0.02);
+
+            let ffn = FfnWeights {
+                x_k: ffn_x_k,
+                key_w,
+                value_w,
+            };
+
+            blocks.push(BlockWeights {
+                pre_norm_w,
+                pre_norm_b,
+                attn_norm_w,
+                attn_norm_b,
+                ffn_norm_w,
+                ffn_norm_b,
+                attn,
+                ffn,
+            });
+        }
+
+        Ok(Self {
+            cfg,
+            embeddings,
+            ln_out_w,
+            ln_out_b,
+            lm_head,
+            blocks,
+        })
+    }
+
+    pub fn save_safetensors<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        #[derive(Clone)]
+        struct TensorRec {
+            name: String,
+            shape: Vec<usize>,
+            data: Vec<f32>,
+        }
+
+        let c = self.cfg.hidden_size;
+        let v = self.cfg.vocab_size;
+        let i = self.cfg.intermediate_size;
+        let d_w = self.cfg.decay_low_rank;
+        let d_a = self.cfg.a_low_rank;
+        let d_v = self.cfg.v_low_rank;
+        let d_g = self.cfg.g_low_rank;
+
+        let mut recs = Vec::<TensorRec>::new();
+        let push = |recs: &mut Vec<TensorRec>, name: String, shape: Vec<usize>, src: &Tensor1D| {
+            recs.push(TensorRec {
+                name,
+                shape,
+                data: src.as_slice().to_vec(),
+            });
+        };
+
+        push(
+            &mut recs,
+            "model.embeddings.weight".to_string(),
+            vec![v, c],
+            &self.embeddings,
+        );
+        push(
+            &mut recs,
+            "model.norm.weight".to_string(),
+            vec![c],
+            &self.ln_out_w,
+        );
+        push(
+            &mut recs,
+            "model.norm.bias".to_string(),
+            vec![c],
+            &self.ln_out_b,
+        );
+        push(
+            &mut recs,
+            "lm_head.weight".to_string(),
+            vec![v, c],
+            &self.lm_head,
+        );
+
+        for (idx, b) in self.blocks.iter().enumerate() {
+            let pfx = format!("model.layers.{idx}");
+            if let (Some(w), Some(bias)) = (&b.pre_norm_w, &b.pre_norm_b) {
+                push(&mut recs, format!("{pfx}.pre_norm.weight"), vec![c], w);
+                push(&mut recs, format!("{pfx}.pre_norm.bias"), vec![c], bias);
+            }
+
+            push(
+                &mut recs,
+                format!("{pfx}.attn_norm.weight"),
+                vec![c],
+                &b.attn_norm_w,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.attn_norm.bias"),
+                vec![c],
+                &b.attn_norm_b,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.ffn_norm.weight"),
+                vec![c],
+                &b.ffn_norm_w,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.ffn_norm.bias"),
+                vec![c],
+                &b.ffn_norm_b,
+            );
+
+            let proj = b.attn.rkv_proj.as_slice();
+            let proj_size = c * c;
+            recs.push(TensorRec {
+                name: format!("{pfx}.attn.r_proj.weight"),
+                shape: vec![c, c],
+                data: proj[0..proj_size].to_vec(),
+            });
+            recs.push(TensorRec {
+                name: format!("{pfx}.attn.k_proj.weight"),
+                shape: vec![c, c],
+                data: proj[proj_size..2 * proj_size].to_vec(),
+            });
+            recs.push(TensorRec {
+                name: format!("{pfx}.attn.v_proj.weight"),
+                shape: vec![c, c],
+                data: proj[2 * proj_size..3 * proj_size].to_vec(),
+            });
+
+            push(
+                &mut recs,
+                format!("{pfx}.attn.o_proj.weight"),
+                vec![c, c],
+                &b.attn.o_proj,
+            );
+            push(&mut recs, format!("{pfx}.attn.x_r"), vec![c], &b.attn.x_r);
+            push(&mut recs, format!("{pfx}.attn.x_w"), vec![c], &b.attn.x_w);
+            push(&mut recs, format!("{pfx}.attn.x_k"), vec![c], &b.attn.x_k);
+            push(&mut recs, format!("{pfx}.attn.x_v"), vec![c], &b.attn.x_v);
+            push(&mut recs, format!("{pfx}.attn.x_a"), vec![c], &b.attn.x_a);
+            push(&mut recs, format!("{pfx}.attn.x_g"), vec![c], &b.attn.x_g);
+
+            push(
+                &mut recs,
+                format!("{pfx}.attn.w_lora.lora.0.weight"),
+                vec![d_w, c],
+                &b.attn.w1,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.attn.w_lora.lora.2.weight"),
+                vec![c, d_w],
+                &b.attn.w2,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.attn.w_lora.lora.2.bias"),
+                vec![c],
+                &b.attn.w0,
+            );
+
+            push(
+                &mut recs,
+                format!("{pfx}.attn.a_lora.lora.0.weight"),
+                vec![d_a, c],
+                &b.attn.a1,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.attn.a_lora.lora.2.weight"),
+                vec![c, d_a],
+                &b.attn.a2,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.attn.a_lora.lora.2.bias"),
+                vec![c],
+                &b.attn.a0,
+            );
+
+            if let Some(v1) = &b.attn.v1 {
+                push(
+                    &mut recs,
+                    format!("{pfx}.attn.v_lora.lora.0.weight"),
+                    vec![d_v, c],
+                    v1,
+                );
+            }
+            if let Some(v2) = &b.attn.v2 {
+                push(
+                    &mut recs,
+                    format!("{pfx}.attn.v_lora.lora.2.weight"),
+                    vec![c, d_v],
+                    v2,
+                );
+            }
+            if let Some(v0) = &b.attn.v0 {
+                push(
+                    &mut recs,
+                    format!("{pfx}.attn.v_lora.lora.2.bias"),
+                    vec![c],
+                    v0,
+                );
+            }
+
+            push(
+                &mut recs,
+                format!("{pfx}.attn.g_lora.lora.0.weight"),
+                vec![d_g, c],
+                &b.attn.g1,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.attn.g_lora.lora.2.weight"),
+                vec![c, d_g],
+                &b.attn.g2,
+            );
+
+            push(&mut recs, format!("{pfx}.attn.k_k"), vec![c], &b.attn.k_k);
+            push(&mut recs, format!("{pfx}.attn.k_a"), vec![c], &b.attn.k_a);
+            push(&mut recs, format!("{pfx}.attn.r_k"), vec![c], &b.attn.r_k);
+            push(
+                &mut recs,
+                format!("{pfx}.attn.g_norm.weight"),
+                vec![c],
+                &b.attn.g_norm_w,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.attn.g_norm.bias"),
+                vec![c],
+                &b.attn.g_norm_b,
+            );
+
+            push(&mut recs, format!("{pfx}.ffn.x_k"), vec![c], &b.ffn.x_k);
+            push(
+                &mut recs,
+                format!("{pfx}.ffn.key.weight"),
+                vec![i, c],
+                &b.ffn.key_w,
+            );
+            push(
+                &mut recs,
+                format!("{pfx}.ffn.value.weight"),
+                vec![c, i],
+                &b.ffn.value_w,
+            );
+        }
+
+        recs.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut offset = 0usize;
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({}));
+        for rec in &recs {
+            let bytes = rec.data.len() * 4;
+            header.insert(
+                rec.name.clone(),
+                json!({
+                    "dtype": "F32",
+                    "shape": rec.shape,
+                    "data_offsets": [offset, offset + bytes]
+                }),
+            );
+            offset += bytes;
+        }
+        let header_bytes = serde_json::to_vec(&header)?;
+        let mut f = File::create(path.as_ref())?;
+        f.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
+        f.write_all(&header_bytes)?;
+        for rec in &recs {
+            for v in &rec.data {
+                f.write_all(&v.to_le_bytes())?;
+            }
+        }
+        Ok(())
     }
 
     /// Get model configuration.
@@ -898,6 +1345,56 @@ impl Model {
             i,
         );
     }
+}
+
+struct RwkvRng {
+    state: u64,
+}
+
+impl RwkvRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    #[inline]
+    fn next_u32(&mut self) -> u32 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (self.state >> 32) as u32
+    }
+
+    #[inline]
+    fn next_f32(&mut self) -> f32 {
+        let v = self.next_u32() as f32;
+        v * (1.0 / (u32::MAX as f32))
+    }
+}
+
+#[inline]
+fn init_uniform(t: &mut Tensor1D, rng: &mut RwkvRng, scale: f32) {
+    let s = t.as_mut_slice();
+    for v in s {
+        let r = rng.next_f32() - 0.5;
+        *v = r * 2.0 * scale;
+    }
+}
+
+#[inline]
+fn init_centered(t: &mut Tensor1D, rng: &mut RwkvRng, center: f32, scale: f32) {
+    let s = t.as_mut_slice();
+    for v in s {
+        let r = rng.next_f32() - 0.5;
+        *v = center + r * 2.0 * scale;
+    }
+}
+
+#[inline]
+fn init_const(t: &mut Tensor1D, value: f32) {
+    t.as_mut_slice().fill(value);
 }
 
 #[cfg(test)]

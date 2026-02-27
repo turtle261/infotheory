@@ -188,12 +188,12 @@ fn parse_rate_backend(v: &str) -> Option<&'static str> {
     }
 }
 
-fn parse_ncd_backend(v: &str) -> Option<&'static str> {
-    match infotheory::backends::resolve_ncd_backend_name(v) {
+fn parse_compression_backend(v: &str) -> Option<&'static str> {
+    match infotheory::backends::resolve_compression_backend_name(v) {
         Some(infotheory::backends::BackendAvailability::Enabled(name)) => Some(name),
         Some(infotheory::backends::BackendAvailability::Disabled { canonical, feature }) => {
             eprintln!(
-                "Error: NCD backend '{canonical}' requires infotheory built with feature '{feature}'"
+                "Error: compression backend '{canonical}' requires infotheory built with feature '{feature}'"
             );
             std::process::exit(1);
         }
@@ -360,17 +360,30 @@ fn parse_mixture_expert_value(
         "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
-                let model_path = v["model_path"]
-                    .as_str()
-                    .or_else(|| v["rwkv_model_path"].as_str())
-                    .ok_or_else(|| anyhow::anyhow!("rwkv expert missing model_path"))?;
-                let model = load_rwkv7_model_from_path(model_path);
-                Ok(MixtureExpertSpec {
-                    name,
-                    log_prior,
-                    max_order: -1,
-                    backend: RateBackend::Rwkv7 { model },
-                })
+                if let Some(method) = v["method"].as_str().or_else(|| v["rwkv_method"].as_str()) {
+                    Ok(MixtureExpertSpec {
+                        name,
+                        log_prior,
+                        max_order: -1,
+                        backend: RateBackend::Rwkv7Method {
+                            method: method.to_string(),
+                        },
+                    })
+                } else {
+                    let model_path = v["model_path"]
+                        .as_str()
+                        .or_else(|| v["rwkv_model_path"].as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("rwkv expert missing model_path or method")
+                        })?;
+                    let model = load_rwkv7_model_from_path(model_path);
+                    Ok(MixtureExpertSpec {
+                        name,
+                        log_prior,
+                        max_order: -1,
+                        backend: RateBackend::Rwkv7 { model },
+                    })
+                }
             }
             #[cfg(not(feature = "backend-rwkv"))]
             {
@@ -1132,14 +1145,20 @@ fn parse_nyx_filter(
     }))
 }
 
-fn build_ctx(rate_backend: &str, ncd_backend: &str, method: Option<&str>) -> InfotheoryCtx {
+fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>) -> InfotheoryCtx {
     let rate_backend = match rate_backend {
         "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
-                let p = rwkv7_model_path_from_env();
-                let model = load_rwkv7_model_from_path(&p);
-                RateBackend::Rwkv7 { model }
+                if let Some(m) = method {
+                    RateBackend::Rwkv7Method {
+                        method: m.to_string(),
+                    }
+                } else {
+                    let p = rwkv7_model_path_from_env();
+                    let model = load_rwkv7_model_from_path(&p);
+                    RateBackend::Rwkv7 { model }
+                }
             }
             #[cfg(not(feature = "backend-rwkv"))]
             {
@@ -1193,32 +1212,72 @@ fn build_ctx(rate_backend: &str, ncd_backend: &str, method: Option<&str>) -> Inf
         _ => RateBackend::RosaPlus,
     };
 
-    let ncd_backend = match ncd_backend {
+    let compression_backend = match compression_backend {
         "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
-                let p = rwkv7_model_path_from_env();
-                let model = load_rwkv7_model_from_path(&p);
+                let model_path = match method {
+                    Some(m) if infotheory::backends::parse_rwkv7_coder(m).is_some() => {
+                        rwkv7_model_path_from_env()
+                    }
+                    Some(m) => m.to_string(),
+                    None => rwkv7_model_path_from_env(),
+                };
+                let model = load_rwkv7_model_from_path(&model_path);
                 let coder = method
                     .and_then(infotheory::backends::parse_rwkv7_coder)
                     .unwrap_or(rwkvzip::CoderType::AC);
-                NcdBackend::Rwkv7 { model, coder }
+                CompressionBackend::Rwkv7 { model, coder }
             }
             #[cfg(not(feature = "backend-rwkv"))]
             {
                 eprintln!(
-                    "Error: NCD backend 'rwkv7' requires infotheory built with feature 'backend-rwkv'"
+                    "Error: compression backend 'rwkv7' requires infotheory built with feature 'backend-rwkv'"
+                );
+                std::process::exit(1);
+            }
+        }
+        "rate-ac" => {
+            #[cfg(feature = "backend-rwkv")]
+            {
+                CompressionBackend::Rate {
+                    rate_backend: rate_backend.clone(),
+                    coder: rwkvzip::CoderType::AC,
+                    framing: infotheory::compression::FramingMode::Raw,
+                }
+            }
+            #[cfg(not(feature = "backend-rwkv"))]
+            {
+                eprintln!(
+                    "Error: compression backend 'rate-ac' requires infotheory built with feature 'backend-rwkv'"
+                );
+                std::process::exit(1);
+            }
+        }
+        "rate-rans" => {
+            #[cfg(feature = "backend-rwkv")]
+            {
+                CompressionBackend::Rate {
+                    rate_backend: rate_backend.clone(),
+                    coder: rwkvzip::CoderType::RANS,
+                    framing: infotheory::compression::FramingMode::Raw,
+                }
+            }
+            #[cfg(not(feature = "backend-rwkv"))]
+            {
+                eprintln!(
+                    "Error: compression backend 'rate-rans' requires infotheory built with feature 'backend-rwkv'"
                 );
                 std::process::exit(1);
             }
         }
         _ => {
             let m = method.unwrap_or("5").to_string();
-            NcdBackend::Zpaq { method: m }
+            CompressionBackend::Zpaq { method: m }
         }
     };
 
-    InfotheoryCtx::new(rate_backend, ncd_backend)
+    InfotheoryCtx::new(rate_backend, compression_backend)
 }
 
 fn read_file(path: &str) -> Vec<u8> {
@@ -1229,6 +1288,46 @@ fn read_file(path: &str) -> Vec<u8> {
             std::process::exit(1);
         }
     }
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn maybe_export_rwkv_online(
+    export_path: Option<&str>,
+    ctx: &InfotheoryCtx,
+    parts: &[&[u8]],
+) -> anyhow::Result<()> {
+    let Some(path) = export_path else {
+        return Ok(());
+    };
+
+    let method = match &ctx.rate_backend {
+        RateBackend::Rwkv7Method { method } => Some(method.as_str()),
+        _ => match &ctx.compression_backend {
+            CompressionBackend::Rate { rate_backend, .. } => match rate_backend {
+                RateBackend::Rwkv7Method { method } => Some(method.as_str()),
+                _ => None,
+            },
+            _ => None,
+        },
+    };
+
+    let Some(method) = method else {
+        return Ok(());
+    };
+
+    let mut compressor = rwkvzip::Compressor::new_from_method(method)?;
+    let _ = compressor.compress_size_chain(parts, rwkvzip::CoderType::AC)?;
+    compressor.export_online(path)?;
+    Ok(())
+}
+
+#[cfg(not(feature = "backend-rwkv"))]
+fn maybe_export_rwkv_online(
+    _export_path: Option<&str>,
+    _ctx: &InfotheoryCtx,
+    _parts: &[&[u8]],
+) -> anyhow::Result<()> {
+    Ok(())
 }
 
 // ============================================================
@@ -1959,7 +2058,7 @@ fn search_command(args: &[String]) {
 
     let mut opts = search::SearchOptions::default();
     let mut rate_backend = "rosaplus".to_string();
-    let ncd_backend = "zpaq".to_string();
+    let compression_backend = "zpaq".to_string();
     let mut method: Option<String> = None;
     let mut stage2_prior_mode: Option<search::Stage2PriorMode> = None;
 
@@ -2021,7 +2120,7 @@ fn search_command(args: &[String]) {
     if let Some(mode) = stage2_prior_mode {
         opts.stage2_prior_mode = mode;
     }
-    opts.ctx = build_ctx(&rate_backend, &ncd_backend, method.as_deref());
+    opts.ctx = build_ctx(&rate_backend, &compression_backend, method.as_deref());
     search::run_search_with_options(query, target, &opts);
 }
 
@@ -2082,8 +2181,9 @@ fn main() {
     }
 
     let mut rate_backend_str = "rosaplus".to_string();
-    let mut ncd_backend_str = "zpaq".to_string();
+    let mut compression_backend_str = "zpaq".to_string();
     let mut method_str: Option<String> = None;
+    let mut rwkv_export_path: Option<String> = None;
     let mut rate_backend_specified = false;
 
     let mut i = flags_start;
@@ -2101,19 +2201,36 @@ fn main() {
                 i += 1;
                 let v = args
                     .get(i)
-                    .unwrap_or_exit("Error: --ncd-backend requires a value");
-                ncd_backend_str = parse_ncd_backend(v).unwrap_or("zpaq").to_string();
+                    .unwrap_or_exit("Error: --compression-backend requires a value");
+                compression_backend_str =
+                    parse_compression_backend(v).unwrap_or("zpaq").to_string();
+            }
+            "--compression-backend" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --compression-backend requires a value");
+                compression_backend_str =
+                    parse_compression_backend(v).unwrap_or("zpaq").to_string();
             }
             "--method" => {
                 i += 1;
                 method_str = args.get(i).cloned();
+            }
+            "--rwkv-export" => {
+                i += 1;
+                rwkv_export_path = args.get(i).cloned();
             }
             _ => {}
         }
         i += 1;
     }
 
-    let ctx = build_ctx(&rate_backend_str, &ncd_backend_str, method_str.as_deref());
+    let ctx = build_ctx(
+        &rate_backend_str,
+        &compression_backend_str,
+        method_str.as_deref(),
+    );
     set_default_ctx(ctx.clone());
 
     match primitive.as_str() {
@@ -2139,7 +2256,17 @@ fn main() {
                 "ncd_sym_cons" => NcdVariant::SymCons,
                 _ => NcdVariant::Vitanyi,
             };
-            println!("{}", ncd_paths_backend(&f1, &f2, &ctx.ncd_backend, variant));
+            let b1 = read_file(&f1);
+            let b2 = read_file(&f2);
+            println!(
+                "{}",
+                ncd_bytes_backend(&b1, &b2, &ctx.compression_backend, variant)
+            );
+            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&b1, &b2])
+            {
+                eprintln!("Error exporting RWKV model: {e}");
+                std::process::exit(1);
+            }
         }
         "entropy" | "h" | "entropy_rate" | "h_rate" => {
             let f1 = file1.unwrap_or_exit("Error: 'h' requires a file");
@@ -2157,14 +2284,20 @@ fn main() {
             } else {
                 println!("{}", ctx.entropy_rate_bytes(&data, max_order));
             }
+            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&data]) {
+                eprintln!("Error exporting RWKV model: {e}");
+                std::process::exit(1);
+            }
         }
         "id" | "intrinsic_dep" => {
             let f1 = file1.unwrap_or_exit("Error: 'id' requires a file");
             let max_order = pos_arg3.and_then(|s| s.parse().ok()).unwrap_or(-1);
-            println!(
-                "{:.6}",
-                intrinsic_dependence_bytes(&read_file(&f1), max_order)
-            );
+            let data = read_file(&f1);
+            println!("{:.6}", intrinsic_dependence_bytes(&data, max_order));
+            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&data]) {
+                eprintln!("Error exporting RWKV model: {e}");
+                std::process::exit(1);
+            }
         }
         other => {
             let f1 = file1.unwrap_or_exit("Error: requires two files");
@@ -2201,6 +2334,11 @@ fn main() {
                 }
             };
             println!("{}", res);
+            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&b1, &b2])
+            {
+                eprintln!("Error exporting RWKV model: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -2218,7 +2356,7 @@ fn print_usage() {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let ncd_backends = infotheory::backends::AVAILABLE_NCD_BACKENDS
+    let compression_backends = infotheory::backends::AVAILABLE_COMPRESSION_BACKENDS
         .iter()
         .enumerate()
         .map(|(idx, name)| {
@@ -2263,11 +2401,17 @@ Primitives:
 
 Options:
     --rate-backend <name>   Backend for rate estimation: {rate_backends}
-  --ncd-backend <name>    Backend for NCD: {ncd_backends}
-  --method <val>          Method/Depth parameter (e.g. '5' for zpaq, '16' for ctw, or path to mixture spec JSON)
+  --compression-backend <name>
+                          Backend for NCD/compression: {compression_backends}
+  --ncd-backend <name>    Deprecated alias for --compression-backend
+  --method <val>          Method/config (e.g. '5' for zpaq, '16' for ctw, mixture spec path,
+                          RWKV method: file:/path/model.safetensors or cfg:key=value,...)
+  --rwkv-export <path>    Optional RWKV export path (.safetensors + .json sidecar)
 
 Examples:
-  infotheory ncd file1.txt file2.txt --ncd-backend zpaq --method 5
+  infotheory ncd file1.txt file2.txt --compression-backend zpaq --method 5
+  infotheory ncd file1.txt file2.txt --compression-backend rate-ac --rate-backend ctw
+  infotheory h file.txt --rate-backend rwkv7 --method "cfg:hidden=64,layers=1,intermediate=64,train=sgd,lr=0.01" --rwkv-export ./rwkv_online.safetensors
   infotheory h file.txt --rate-backend ctw --method 32
   infotheory h file.txt --rate-backend mixture --method mixture.json
   infotheory search "encryption" ./src --prior "codebase context"

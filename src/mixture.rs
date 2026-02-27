@@ -9,8 +9,6 @@
 //! The mixture primitives here power `RateBackend::Mixture`, enabling Bayes, fading Bayes,
 //! switching, and MDL-style selectors to be used anywhere a rate backend is accepted.
 
-#[cfg(feature = "backend-rwkv")]
-use crate::coders::softmax_pdf_floor_inplace;
 use crate::ctw::FacContextTree;
 use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
@@ -143,12 +141,36 @@ impl RateBackendPredictor {
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { model } => {
                 let mut compressor = rwkvzip::Compressor::new_from_model(model);
-                let vocab_size = compressor.vocab_size();
+                let bias = compressor.online_bias_snapshot();
                 let logits =
                     compressor
                         .model
                         .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                softmax_pdf_floor_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
+                rwkvzip::Compressor::logits_to_pdf(
+                    logits,
+                    bias.as_deref(),
+                    &mut compressor.pdf_buffer,
+                );
+                Self::Rwkv7 {
+                    compressor,
+                    primed: true,
+                    min_prob,
+                }
+            }
+            #[cfg(feature = "backend-rwkv")]
+            RateBackend::Rwkv7Method { method } => {
+                let mut compressor = rwkvzip::Compressor::new_from_method(&method)
+                    .unwrap_or_else(|e| panic!("invalid rwkv method '{method}': {e}"));
+                let bias = compressor.online_bias_snapshot();
+                let logits =
+                    compressor
+                        .model
+                        .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                rwkvzip::Compressor::logits_to_pdf(
+                    logits,
+                    bias.as_deref(),
+                    &mut compressor.pdf_buffer,
+                );
                 Self::Rwkv7 {
                     compressor,
                     primed: true,
@@ -184,6 +206,8 @@ impl RateBackendPredictor {
             } => format!("fac-ctw(d={},b={})", base_depth, encoding_bits),
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { .. } => "rwkv7".to_string(),
+            #[cfg(feature = "backend-rwkv")]
+            RateBackend::Rwkv7Method { method } => format!("rwkv7({method})"),
             RateBackend::Zpaq { method } => format!("zpaq(m={})", method),
             RateBackend::Mixture { spec } => {
                 let kind = match spec.kind {
@@ -250,12 +274,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 min_prob,
             } => {
                 if !*primed {
-                    let vocab_size = compressor.vocab_size();
+                    let bias = compressor.online_bias_snapshot();
                     let logits =
                         compressor
                             .model
                             .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                    softmax_pdf_floor_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
+                    rwkvzip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
                     *primed = true;
                 }
                 let p = clamp_prob(compressor.pdf_buffer[symbol as usize], *min_prob);
@@ -308,21 +336,31 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 compressor, primed, ..
             } => {
                 if !*primed {
-                    let vocab_size = compressor.vocab_size();
+                    let bias = compressor.online_bias_snapshot();
                     let logits =
                         compressor
                             .model
                             .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                    softmax_pdf_floor_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
+                    rwkvzip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
                     *primed = true;
                 }
-                let vocab_size = compressor.vocab_size();
+                let pdf = compressor.pdf_buffer.clone();
+                let _ = compressor.online_update_from_pdf(symbol, &pdf);
+                let bias = compressor.online_bias_snapshot();
                 let logits = compressor.model.forward(
                     &mut compressor.scratch,
                     symbol as u32,
                     &mut compressor.state,
                 );
-                softmax_pdf_floor_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
+                rwkvzip::Compressor::logits_to_pdf(
+                    logits,
+                    bias.as_deref(),
+                    &mut compressor.pdf_buffer,
+                );
             }
             RateBackendPredictor::Zpaq { model } => {
                 model.update(symbol);

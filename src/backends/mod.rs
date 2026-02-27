@@ -20,9 +20,9 @@ pub const AVAILABLE_RATE_BACKENDS: &[&str] =
 pub const AVAILABLE_RATE_BACKENDS: &[&str] = &["rosaplus", "ctw", "fac-ctw", "zpaq", "mixture"];
 
 #[cfg(feature = "backend-rwkv")]
-pub const AVAILABLE_NCD_BACKENDS: &[&str] = &["zpaq", "rwkv7"];
+pub const AVAILABLE_COMPRESSION_BACKENDS: &[&str] = &["zpaq", "rwkv7", "rate-ac", "rate-rans"];
 #[cfg(not(feature = "backend-rwkv"))]
-pub const AVAILABLE_NCD_BACKENDS: &[&str] = &["zpaq"];
+pub const AVAILABLE_COMPRESSION_BACKENDS: &[&str] = &["zpaq"];
 
 pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
     let key = input.trim().to_ascii_lowercase();
@@ -46,7 +46,7 @@ pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
     }
 }
 
-pub fn resolve_ncd_backend_name(input: &str) -> Option<BackendAvailability> {
+pub fn resolve_compression_backend_name(input: &str) -> Option<BackendAvailability> {
     let key = input.trim().to_ascii_lowercase();
     match key.as_str() {
         "zpaq" => Some(BackendAvailability::Enabled("zpaq")),
@@ -56,6 +56,26 @@ pub fn resolve_ncd_backend_name(input: &str) -> Option<BackendAvailability> {
             } else {
                 Some(BackendAvailability::Disabled {
                     canonical: "rwkv7",
+                    feature: "backend-rwkv",
+                })
+            }
+        }
+        "rate-ac" | "rate_ac" | "rateac" => {
+            if cfg!(feature = "backend-rwkv") {
+                Some(BackendAvailability::Enabled("rate-ac"))
+            } else {
+                Some(BackendAvailability::Disabled {
+                    canonical: "rate-ac",
+                    feature: "backend-rwkv",
+                })
+            }
+        }
+        "rate-rans" | "rate_rans" | "raterans" => {
+            if cfg!(feature = "backend-rwkv") {
+                Some(BackendAvailability::Enabled("rate-rans"))
+            } else {
+                Some(BackendAvailability::Disabled {
+                    canonical: "rate-rans",
                     feature: "backend-rwkv",
                 })
             }

@@ -76,6 +76,7 @@ pub mod aixi;
 pub mod axioms;
 pub mod backends;
 pub mod coders;
+pub mod compression;
 pub mod datagen;
 pub mod mixture;
 pub use backends::ctw;
@@ -97,6 +98,8 @@ static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 thread_local! {
     #[cfg(feature = "backend-rwkv")]
     static RWKV_TLS: RefCell<HashMap<usize, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
+    #[cfg(feature = "backend-rwkv")]
+    static RWKV_METHOD_TLS: RefCell<HashMap<String, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
 }
 
 impl Default for RateBackend {
@@ -118,9 +121,9 @@ impl Default for RateBackend {
     }
 }
 
-impl Default for NcdBackend {
+impl Default for CompressionBackend {
     fn default() -> Self {
-        NcdBackend::Zpaq {
+        CompressionBackend::Zpaq {
             method: "5".to_string(),
         }
     }
@@ -130,7 +133,7 @@ impl Default for InfotheoryCtx {
     fn default() -> Self {
         Self {
             rate_backend: RateBackend::default(),
-            ncd_backend: NcdBackend::default(),
+            compression_backend: CompressionBackend::default(),
         }
     }
 }
@@ -215,6 +218,10 @@ pub enum RateBackend {
     Rwkv7 {
         model: Arc<rwkvzip::Model>,
     },
+    #[cfg(feature = "backend-rwkv")]
+    Rwkv7Method {
+        method: String,
+    },
     /// ZPAQ compression-based rate model (streamable methods only).
     Zpaq {
         method: String,
@@ -236,7 +243,7 @@ pub enum RateBackend {
 }
 
 #[derive(Clone)]
-pub enum NcdBackend {
+pub enum CompressionBackend {
     Zpaq {
         method: String,
     },
@@ -244,6 +251,12 @@ pub enum NcdBackend {
     Rwkv7 {
         model: Arc<rwkvzip::Model>,
         coder: rwkvzip::CoderType,
+    },
+    #[cfg(feature = "backend-rwkv")]
+    Rate {
+        rate_backend: RateBackend,
+        coder: rwkvzip::CoderType,
+        framing: compression::FramingMode,
     },
 }
 
@@ -316,32 +329,32 @@ impl MixtureSpec {
 #[derive(Clone)]
 pub struct InfotheoryCtx {
     pub rate_backend: RateBackend,
-    pub ncd_backend: NcdBackend,
+    pub compression_backend: CompressionBackend,
 }
 
 impl InfotheoryCtx {
-    pub fn new(rate_backend: RateBackend, ncd_backend: NcdBackend) -> Self {
+    pub fn new(rate_backend: RateBackend, compression_backend: CompressionBackend) -> Self {
         Self {
             rate_backend,
-            ncd_backend,
+            compression_backend,
         }
     }
 
     pub fn with_zpaq(method: impl Into<String>) -> Self {
         Self {
             rate_backend: RateBackend::RosaPlus,
-            ncd_backend: NcdBackend::Zpaq {
+            compression_backend: CompressionBackend::Zpaq {
                 method: method.into(),
             },
         }
     }
 
     pub fn compress_size(&self, data: &[u8]) -> u64 {
-        compress_size_backend(data, &self.ncd_backend)
+        compress_size_backend(data, &self.compression_backend)
     }
 
     pub fn compress_size_chain(&self, parts: &[&[u8]]) -> u64 {
-        compress_size_chain_backend(parts, &self.ncd_backend)
+        compress_size_chain_backend(parts, &self.compression_backend)
     }
 
     pub fn entropy_rate_bytes(&self, data: &[u8], max_order: i64) -> f64 {
@@ -412,6 +425,11 @@ impl InfotheoryCtx {
             }
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
+                c.cross_entropy_conditional_chain(prefix_parts, data)
+                    .unwrap_or(0.0)
+            }),
+            #[cfg(feature = "backend-rwkv")]
+            RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
                 c.cross_entropy_conditional_chain(prefix_parts, data)
                     .unwrap_or(0.0)
             }),
@@ -504,7 +522,7 @@ impl InfotheoryCtx {
     }
 
     pub fn ncd_bytes(&self, x: &[u8], y: &[u8], variant: NcdVariant) -> f64 {
-        ncd_bytes_backend(x, y, &self.ncd_backend, variant)
+        ncd_bytes_backend(x, y, &self.compression_backend, variant)
     }
 
     pub fn mutual_information_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
@@ -641,6 +659,17 @@ fn with_rwkv_tls<R>(
     })
 }
 
+#[cfg(feature = "backend-rwkv")]
+fn with_rwkv_method_tls<R>(method: &str, f: impl FnOnce(&mut rwkvzip::Compressor) -> R) -> R {
+    RWKV_METHOD_TLS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let comp = map
+            .entry(method.to_string())
+            .or_insert_with(|| rwkvzip::Compressor::new_from_method(method).unwrap());
+        f(comp)
+    })
+}
+
 struct SliceChainReader<'a> {
     parts: &'a [&'a [u8]],
     i: usize,
@@ -690,26 +719,82 @@ impl<'a> std::io::Read for SliceChainReader<'a> {
     }
 }
 
-pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &NcdBackend) -> u64 {
+pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &CompressionBackend) -> u64 {
     match backend {
-        NcdBackend::Zpaq { method } => {
+        CompressionBackend::Zpaq { method } => {
             let r = SliceChainReader::new(parts);
             zpaq_rs::compress_size_stream(r, method.as_str(), None, None).unwrap_or(0)
         }
         #[cfg(feature = "backend-rwkv")]
-        NcdBackend::Rwkv7 { model, coder } => {
+        CompressionBackend::Rwkv7 { model, coder } => {
             with_rwkv_tls(model, |c| c.compress_size_chain(parts, *coder).unwrap_or(0))
+        }
+        #[cfg(feature = "backend-rwkv")]
+        CompressionBackend::Rate {
+            rate_backend,
+            coder,
+            framing,
+        } => {
+            crate::compression::compress_rate_size_chain(parts, rate_backend, -1, *coder, *framing)
+                .unwrap_or(0)
         }
     }
 }
 
-pub fn compress_size_backend(data: &[u8], backend: &NcdBackend) -> u64 {
+pub fn compress_size_backend(data: &[u8], backend: &CompressionBackend) -> u64 {
     match backend {
-        NcdBackend::Zpaq { method } => zpaq_rs::compress_size(data, method.as_str()).unwrap_or(0),
+        CompressionBackend::Zpaq { method } => {
+            zpaq_rs::compress_size(data, method.as_str()).unwrap_or(0)
+        }
         #[cfg(feature = "backend-rwkv")]
-        NcdBackend::Rwkv7 { model, coder } => {
+        CompressionBackend::Rwkv7 { model, coder } => {
             with_rwkv_tls(model, |c| c.compress_size(data, *coder).unwrap_or(0))
         }
+        #[cfg(feature = "backend-rwkv")]
+        CompressionBackend::Rate {
+            rate_backend,
+            coder,
+            framing,
+        } => crate::compression::compress_rate_size(data, rate_backend, -1, *coder, *framing)
+            .unwrap_or(0),
+    }
+}
+
+pub fn compress_bytes_backend(
+    data: &[u8],
+    backend: &CompressionBackend,
+) -> anyhow::Result<Vec<u8>> {
+    match backend {
+        CompressionBackend::Zpaq { method } => Ok(zpaq_rs::compress_to_vec(data, method)?),
+        #[cfg(feature = "backend-rwkv")]
+        CompressionBackend::Rwkv7 { model, coder } => {
+            with_rwkv_tls(model, |c| c.compress(data, *coder)).map_err(Into::into)
+        }
+        #[cfg(feature = "backend-rwkv")]
+        CompressionBackend::Rate {
+            rate_backend,
+            coder,
+            framing,
+        } => crate::compression::compress_rate_bytes(data, rate_backend, -1, *coder, *framing),
+    }
+}
+
+pub fn decompress_bytes_backend(
+    input: &[u8],
+    backend: &CompressionBackend,
+) -> anyhow::Result<Vec<u8>> {
+    match backend {
+        CompressionBackend::Zpaq { .. } => Ok(zpaq_rs::decompress_to_vec(input)?),
+        #[cfg(feature = "backend-rwkv")]
+        CompressionBackend::Rwkv7 { model, .. } => {
+            with_rwkv_tls(model, |c| c.decompress(input)).map_err(Into::into)
+        }
+        #[cfg(feature = "backend-rwkv")]
+        CompressionBackend::Rate {
+            rate_backend,
+            coder,
+            framing,
+        } => crate::compression::decompress_rate_bytes(input, rate_backend, -1, *coder, *framing),
     }
 }
 
@@ -722,6 +807,10 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
+        }
+        #[cfg(feature = "backend-rwkv")]
+        RateBackend::Rwkv7Method { method } => {
+            with_rwkv_method_tls(method, |c| c.cross_entropy(data).unwrap_or(0.0))
         }
         RateBackend::Zpaq { method } => {
             if data.is_empty() {
@@ -795,6 +884,10 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
         RateBackend::Rwkv7 { model } => {
             with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
         }
+        #[cfg(feature = "backend-rwkv")]
+        RateBackend::Rwkv7Method { method } => {
+            with_rwkv_method_tls(method, |c| c.cross_entropy(data).unwrap_or(0.0))
+        }
         RateBackend::Zpaq { .. } => entropy_rate_backend(data, max_order, backend),
         RateBackend::Mixture { .. } => entropy_rate_backend(data, max_order, backend),
         RateBackend::Ctw { .. } | RateBackend::FacCtw { .. } => {
@@ -827,6 +920,11 @@ pub fn cross_entropy_rate_backend(
                     .unwrap_or(0.0)
             })
         }
+        #[cfg(feature = "backend-rwkv")]
+        RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
+            c.cross_entropy_conditional(train_data, test_data)
+                .unwrap_or(0.0)
+        }),
         RateBackend::Zpaq { method } => {
             if test_data.is_empty() {
                 return 0.0;
@@ -923,6 +1021,10 @@ pub fn joint_entropy_rate_backend(
         }
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
+            c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
+        }),
+        #[cfg(feature = "backend-rwkv")]
+        RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
             c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
         }),
         RateBackend::Zpaq { method } => {
@@ -1165,7 +1267,7 @@ fn ncd_from_sizes(cx: u64, cy: u64, cxy: u64, cyx: Option<u64>, variant: NcdVari
 
 #[inline(always)]
 pub fn ncd_bytes(x: &[u8], y: &[u8], method: &str, variant: NcdVariant) -> f64 {
-    let backend = NcdBackend::Zpaq {
+    let backend = CompressionBackend::Zpaq {
         method: method.to_string(),
     };
     ncd_bytes_backend(x, y, &backend, variant)
@@ -1177,7 +1279,12 @@ pub fn ncd_bytes_default(x: &[u8], y: &[u8], variant: NcdVariant) -> f64 {
     with_default_ctx(|ctx| ctx.ncd_bytes(x, y, variant))
 }
 
-pub fn ncd_bytes_backend(x: &[u8], y: &[u8], backend: &NcdBackend, variant: NcdVariant) -> f64 {
+pub fn ncd_bytes_backend(
+    x: &[u8],
+    y: &[u8],
+    backend: &CompressionBackend,
+    variant: NcdVariant,
+) -> f64 {
     let (cx, cy) = rayon::join(
         || compress_size_backend(x, backend),
         || compress_size_backend(y, backend),
@@ -1204,7 +1311,12 @@ pub fn ncd_paths(x: &str, y: &str, method: &str, variant: NcdVariant) -> f64 {
     ncd_bytes(&bx, &by, method, variant)
 }
 
-pub fn ncd_paths_backend(x: &str, y: &str, backend: &NcdBackend, variant: NcdVariant) -> f64 {
+pub fn ncd_paths_backend(
+    x: &str,
+    y: &str,
+    backend: &CompressionBackend,
+    variant: NcdVariant,
+) -> f64 {
     let (bx, by) = rayon::join(
         || std::fs::read(x).expect("failed to read x"),
         || std::fs::read(y).expect("failed to read y"),
@@ -1849,7 +1961,7 @@ mod tests {
         let prev = get_default_ctx();
         set_default_ctx(InfotheoryCtx::new(
             RateBackend::RosaPlus,
-            NcdBackend::default(),
+            CompressionBackend::default(),
         ));
 
         let h_x = entropy_rate_bytes(x, max_order);
@@ -1873,7 +1985,7 @@ mod tests {
         let prev = get_default_ctx();
         set_default_ctx(InfotheoryCtx::new(
             RateBackend::RosaPlus,
-            NcdBackend::default(),
+            CompressionBackend::default(),
         ));
         let r0 = resistance_to_transformation_bytes(x, x, 0);
         let r8 = resistance_to_transformation_bytes(x, x, 8);
@@ -1915,7 +2027,7 @@ mod tests {
         // Switch to CTW
         set_default_ctx(InfotheoryCtx::new(
             RateBackend::Ctw { depth: 16 },
-            NcdBackend::default(),
+            CompressionBackend::default(),
         ));
 
         let h_ctw = entropy_rate_bytes(x, 8);
@@ -1975,7 +2087,7 @@ mod tests {
         // Use CTW backend for rate-based test
         set_default_ctx(InfotheoryCtx::new(
             RateBackend::Ctw { depth: 8 },
-            NcdBackend::default(),
+            CompressionBackend::default(),
         ));
 
         // Generate two completely different patterns - should have high VI
@@ -2001,7 +2113,7 @@ mod tests {
         // Verify empty data doesn't cause division-by-zero or NaN
         set_default_ctx(InfotheoryCtx::new(
             RateBackend::Ctw { depth: 16 },
-            NcdBackend::default(),
+            CompressionBackend::default(),
         ));
 
         let empty: &[u8] = &[];

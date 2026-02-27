@@ -1,7 +1,7 @@
 use infotheory::axioms;
 use infotheory::datagen;
 use infotheory::{
-    NcdBackend, NcdVariant, RateBackend, entropy_rate_backend, marginal_entropy_bytes,
+    CompressionBackend, NcdVariant, RateBackend, entropy_rate_backend, marginal_entropy_bytes,
     mutual_information_bytes, ncd_bytes_backend,
 };
 
@@ -142,7 +142,7 @@ fn ncd_identity_is_zero() {
     let (x, y) = datagen::identical_pair(n, 42);
 
     // Using default ZPAQ method 1
-    let backend = NcdBackend::Zpaq {
+    let backend = CompressionBackend::Zpaq {
         method: "1".to_string(),
     };
     let ncd = ncd_bytes_backend(&x, &y, &backend, NcdVariant::Vitanyi);
@@ -160,7 +160,7 @@ fn ncd_independent_is_near_one() {
     let n = 2_000;
     let (x, y) = datagen::independent_pair(n, 12345, 67890);
 
-    let backend = NcdBackend::Zpaq {
+    let backend = CompressionBackend::Zpaq {
         method: "1".to_string(),
     };
     let ncd = ncd_bytes_backend(&x, &y, &backend, NcdVariant::Vitanyi);
@@ -183,7 +183,7 @@ fn ncd_triangle_inequality() {
     let y = datagen::uniform_random(n, 222);
     let z = datagen::uniform_random(n, 333);
 
-    let backend = NcdBackend::Zpaq {
+    let backend = CompressionBackend::Zpaq {
         method: "1".to_string(),
     };
     let metric = |a: &[u8], b: &[u8]| ncd_bytes_backend(a, b, &backend, NcdVariant::Vitanyi);

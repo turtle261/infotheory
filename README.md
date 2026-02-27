@@ -98,6 +98,54 @@ The `infotheory` binary provides a powerful interface for file analysis.
 ./infotheory ncd file1.txt file2.txt 5
 ```
 
+### Compression Backends
+
+`CompressionBackend` is the canonical compression enum in the library.
+
+CLI:
+
+```bash
+# ZPAQ standalone (as before)
+./infotheory ncd a.bin b.bin --compression-backend zpaq --method 5
+
+# Turn any rate backend into a compressor via AC/rANS
+./infotheory ncd a.bin b.bin --compression-backend rate-ac --rate-backend ctw --method 16
+./infotheory ncd a.bin b.bin --compression-backend rate-rans --rate-backend fac-ctw --method 16
+```
+
+For rate-coded metrics, raw framing is used by default to avoid framing overhead.
+Explicit `compress_bytes_backend` / `decompress_bytes_backend` APIs support framed payloads for roundtrip verification.
+
+### RWKV Method Strings
+
+RWKV can be configured with either a model file or compact method string:
+
+- `file:/abs/or/relative/model.safetensors`
+- `cfg:key=value,...`
+
+Supported `cfg:` keys:
+`hidden,layers,intermediate,decay_rank,a_rank,v_rank,g_rank,seed,train,lr,stride`
+
+`train` supports: `none`, `sgd`, `adam`.
+
+Example:
+
+```bash
+./infotheory h file.txt \
+  --rate-backend rwkv7 \
+  --method "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=7,train=sgd,lr=0.01,stride=1"
+```
+
+Optional online export after processing input:
+
+```bash
+./infotheory h file.txt --rate-backend rwkv7 --method "cfg:hidden=64,layers=1,intermediate=64" --rwkv-export ./rwkv_online.safetensors
+```
+
+This writes:
+- `rwkv_online.safetensors`
+- `rwkv_online.json` (sidecar with resolved config + metadata)
+
 ### AIXI Agent Mode
 ```bash
 # Run the AIXI agent using config-specified backend
@@ -147,7 +195,7 @@ let h = entropy_rate_bytes(data, 8);
 // Switch the entire thread to use CTW for all subsequent calls
 set_default_ctx(InfotheoryCtx::new(
     RateBackend::Ctw { depth: 32 },
-    NcdBackend::default()
+    CompressionBackend::default()
 ));
 ```
 

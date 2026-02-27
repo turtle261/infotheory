@@ -18,7 +18,7 @@ warnings = "warn"
 all = "warn"
 
 [dependencies]
-zpaq_rs = { path = "./zpaq_rs" }
+zpaq_rs = "1.0.2"
 nyx-lite = { path = "./nyx-lite", optional = true }
 rayon = "1.11.0"
 num_cpus = "1.17.0"
