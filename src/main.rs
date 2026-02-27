@@ -782,7 +782,7 @@ fn parse_nyx_protocol_config(v: &serde_json::Value) -> NyxProtocolConfig {
         cfg.data_prefix = s.to_string();
     }
     if let Some(s) = v["wire_encoding"].as_str() {
-        if let Some(enc) = NyxPayloadEncoding::from_str(s) {
+        if let Some(enc) = NyxPayloadEncoding::parse(s) {
             cfg.wire_encoding = enc;
         }
     }
@@ -796,7 +796,7 @@ fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActionSource> {
         "fuzz" => {
             let fuzz = if v["fuzz"].is_null() { v } else { &v["fuzz"] };
             let seed_encoding =
-                NyxPayloadEncoding::from_str(fuzz["seed_encoding"].as_str().unwrap_or("utf8"))
+                NyxPayloadEncoding::parse(fuzz["seed_encoding"].as_str().unwrap_or("utf8"))
                     .unwrap_or(NyxPayloadEncoding::Utf8);
             let mut seeds = Vec::new();
             if let Some(arr) = fuzz["seed_paths"].as_array() {
@@ -828,7 +828,7 @@ fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActionSource> {
             let min_len = fuzz["min_len"].as_u64().unwrap_or(1) as usize;
             let max_len = fuzz["max_len"].as_u64().unwrap_or(4096) as usize;
             let dict_encoding =
-                NyxPayloadEncoding::from_str(fuzz["dict_encoding"].as_str().unwrap_or("utf8"))
+                NyxPayloadEncoding::parse(fuzz["dict_encoding"].as_str().unwrap_or("utf8"))
                     .unwrap_or(NyxPayloadEncoding::Utf8);
             let mut dictionary = Vec::new();
             if let Some(arr) = fuzz["dictionary"].as_array() {
@@ -862,7 +862,7 @@ fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActionSource> {
                     }
                     let payload = item["payload"].as_str().unwrap_or_default();
                     let encoding =
-                        NyxPayloadEncoding::from_str(item["encoding"].as_str().unwrap_or("utf8"))
+                        NyxPayloadEncoding::parse(item["encoding"].as_str().unwrap_or("utf8"))
                             .unwrap_or(NyxPayloadEncoding::Utf8);
                     let payload = encoding.decode(payload)?;
                     let name = item["name"].as_str().map(|s| s.to_string());

@@ -57,7 +57,7 @@ pub enum PayloadEncoding {
 }
 
 impl PayloadEncoding {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "utf8" | "text" => Some(Self::Utf8),
             "hex" => Some(Self::Hex),
@@ -77,6 +77,14 @@ impl PayloadEncoding {
             Self::Utf8 => String::from_utf8_lossy(bytes).to_string(),
             Self::Hex => hex_encode(bytes),
         }
+    }
+}
+
+impl std::str::FromStr for PayloadEncoding {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or("unknown payload encoding")
     }
 }
 
@@ -123,27 +131,27 @@ fn rewrite_firecracker_config_paths(config_path: &str, raw_json: &str) -> anyhow
     let mut v: Value = serde_json::from_str(raw_json)?;
 
     if let Some(boot) = v.get_mut("boot-source") {
-        if let Some(path_val) = boot.get_mut("kernel_image_path") {
-            if let Some(path_str) = path_val.as_str() {
-                let resolved = resolve_relative_path(base_dir, path_str);
-                *path_val = Value::String(resolved);
-            }
+        if let Some(path_val) = boot.get_mut("kernel_image_path")
+            && let Some(path_str) = path_val.as_str()
+        {
+            let resolved = resolve_relative_path(base_dir, path_str);
+            *path_val = Value::String(resolved);
         }
-        if let Some(path_val) = boot.get_mut("initrd_path") {
-            if let Some(path_str) = path_val.as_str() {
-                let resolved = resolve_relative_path(base_dir, path_str);
-                *path_val = Value::String(resolved);
-            }
+        if let Some(path_val) = boot.get_mut("initrd_path")
+            && let Some(path_str) = path_val.as_str()
+        {
+            let resolved = resolve_relative_path(base_dir, path_str);
+            *path_val = Value::String(resolved);
         }
     }
 
     if let Some(drives) = v.get_mut("drives").and_then(|d| d.as_array_mut()) {
         for drive in drives {
-            if let Some(path_val) = drive.get_mut("path_on_host") {
-                if let Some(path_str) = path_val.as_str() {
-                    let resolved = resolve_relative_path(base_dir, path_str);
-                    *path_val = Value::String(resolved);
-                }
+            if let Some(path_val) = drive.get_mut("path_on_host")
+                && let Some(path_str) = path_val.as_str()
+            {
+                let resolved = resolve_relative_path(base_dir, path_str);
+                *path_val = Value::String(resolved);
             }
         }
     }
@@ -637,7 +645,7 @@ impl TraceModel {
                 num_percept_bits: _,
                 encoding_bits,
             } => {
-                let bits_per_symbol = (*encoding_bits).min(8).max(1);
+                let bits_per_symbol = (*encoding_bits).clamp(1, 8);
                 TraceModel::FacCtw {
                     tree: crate::ctw::FacContextTree::new(*base_depth, bits_per_symbol),
                     bits_per_symbol,
@@ -1018,12 +1026,11 @@ impl NyxVmEnvironment {
         self.vm.apply_snapshot(&snapshot);
 
         // Reset trace model if configured
-        if let Some(trace_cfg) = &self.config.trace {
-            if trace_cfg.reset_on_episode {
-                if let Some(model) = &mut self.trace_model {
-                    model.reset();
-                }
-            }
+        if let Some(trace_cfg) = &self.config.trace
+            && trace_cfg.reset_on_episode
+            && let Some(model) = &mut self.trace_model
+        {
+            model.reset();
         }
 
         self.step_in_episode = 0;
@@ -1245,14 +1252,14 @@ impl NyxVmEnvironment {
         self.clear_shared_length();
 
         // Collect trace data if configured
-        if let Some(trace_cfg) = &self.config.trace {
-            if trace_cfg.shared_region_name.is_some() {
-                // Read from trace shared memory region (implementation-specific)
-                // For now, use main shared memory as fallback
-                trace_data = shared_memory.clone();
-                if trace_data.len() > trace_cfg.max_bytes {
-                    trace_data.truncate(trace_cfg.max_bytes);
-                }
+        if let Some(trace_cfg) = &self.config.trace
+            && trace_cfg.shared_region_name.is_some()
+        {
+            // Read from trace shared memory region (implementation-specific)
+            // For now, use main shared memory as fallback
+            trace_data = shared_memory.clone();
+            if trace_data.len() > trace_cfg.max_bytes {
+                trace_data.truncate(trace_cfg.max_bytes);
             }
         }
 
@@ -1316,25 +1323,26 @@ impl NyxVmEnvironment {
 
         let (entropy, intrinsic, novelty) = self.compute_filter_metrics(payload, filter);
 
-        if let Some(min_entropy) = filter.min_entropy {
-            if entropy < min_entropy {
-                return filter.reject_reward;
-            }
+        if let Some(min_entropy) = filter.min_entropy
+            && entropy < min_entropy
+        {
+            return filter.reject_reward;
         }
-        if let Some(max_entropy) = filter.max_entropy {
-            if entropy > max_entropy {
-                return filter.reject_reward;
-            }
+        if let Some(max_entropy) = filter.max_entropy
+            && entropy > max_entropy
+        {
+            return filter.reject_reward;
         }
-        if let Some(min_intrinsic) = filter.min_intrinsic_dependence {
-            if intrinsic < min_intrinsic {
-                return filter.reject_reward;
-            }
+        if let Some(min_intrinsic) = filter.min_intrinsic_dependence
+            && intrinsic < min_intrinsic
+        {
+            return filter.reject_reward;
         }
-        if let Some(min_novelty) = filter.min_novelty {
-            if filter.novelty_prior.is_some() && novelty < min_novelty {
-                return filter.reject_reward;
-            }
+        if let Some(min_novelty) = filter.min_novelty
+            && filter.novelty_prior.is_some()
+            && novelty < min_novelty
+        {
+            return filter.reject_reward;
         }
         None
     }
@@ -1616,10 +1624,10 @@ impl NyxVmEnvironment {
         });
 
         // Append to JSONL file
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
-            if let Ok(json_str) = serde_json::to_string(&log_entry) {
-                let _ = writeln!(file, "{}", json_str);
-            }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path)
+            && let Ok(json_str) = serde_json::to_string(&log_entry)
+        {
+            let _ = writeln!(file, "{}", json_str);
         }
     }
 }
@@ -1630,12 +1638,11 @@ impl NyxVmEnvironment {
 
 impl Environment for NyxVmEnvironment {
     fn perform_action(&mut self, action: Action) {
-        if self.needs_reset {
-            if let Err(e) = self.reset() {
-                if self.config.debug_mode {
-                    eprintln!("[NyxVm] Reset failed: {}", e);
-                }
-            }
+        if self.needs_reset
+            && let Err(e) = self.reset()
+            && self.config.debug_mode
+        {
+            eprintln!("[NyxVm] Reset failed: {}", e);
         }
 
         let payload = match self.get_action_payload(action) {

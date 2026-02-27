@@ -501,9 +501,9 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     }
 
     // Handle remaining floats
-    for i in (chunks * 4)..num_floats {
-        let base = i * 4;
-        result[i] = f32::from_le_bytes([
+    for (offset, out) in result.iter_mut().skip(chunks * 4).enumerate() {
+        let base = (chunks * 4 + offset) * 4;
+        *out = f32::from_le_bytes([
             bytes[base],
             bytes[base + 1],
             bytes[base + 2],

@@ -234,6 +234,7 @@ pub unsafe fn token_shift_avx(
 
 /// Token shift for six projections sharing the same x/prev inputs.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn token_shift_multi6_avx(
     x: *const f32,
     prev: *const f32,
@@ -554,6 +555,7 @@ pub unsafe fn l2_normalize_avx(x: *const f32, y: *mut f32, len: usize, min_norm:
 
 /// RWKV7 state update kernel for single token, N=64 head dimension.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn rwkv7_wkv_update_avx(
     state: *mut f32,
     w: *const f32,

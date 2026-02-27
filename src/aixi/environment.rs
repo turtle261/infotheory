@@ -165,6 +165,12 @@ impl CtwTest {
     }
 }
 
+impl Default for CtwTest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Environment for CtwTest {
     fn perform_action(&mut self, action: Action) {
         if self.cycle == 0 {
@@ -229,6 +235,12 @@ impl BiasedRockPaperScissor {
             opponent_won_last_round: false,
             opponent_last_round_action: 0,
         }
+    }
+}
+
+impl Default for BiasedRockPaperScissor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -332,6 +344,12 @@ impl ExtendedTiger {
     fn reset_doors(&mut self) {
         self.gold_door = if self.rng.gen_bool(0.5) { 1 } else { 2 };
         self.tiger_door = if self.gold_door == 1 { 2 } else { 3 };
+    }
+}
+
+impl Default for ExtendedTiger {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -472,6 +490,12 @@ impl TicTacToe {
             }
         }
         false
+    }
+}
+
+impl Default for TicTacToe {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -641,6 +665,12 @@ impl KuhnPoker {
         let card_code = 1 << self.agent_card;
         let action_code = if self.opponent_action == 1 { 8 } else { 0 };
         self.obs = (action_code + card_code) as PerceptVal;
+    }
+}
+
+impl Default for KuhnPoker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

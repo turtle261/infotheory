@@ -185,12 +185,14 @@ impl Sam {
         s.text_states.reserve(text_cap);
         s.boundary_after.reserve(text_cap);
 
-        let mut root = SamState::default();
-        root.link = -1;
-        root.len = 0;
-        root.endpos = -1;
-        root.small_n = 0;
-        root.head = -1;
+        let root = SamState {
+            link: -1,
+            len: 0,
+            endpos: -1,
+            small_n: 0,
+            head: -1,
+            ..Default::default()
+        };
         s.st.push(root);
         s.text_states.push(0); // Root state for empty context
         s
@@ -276,12 +278,14 @@ impl Sam {
 
         let g = self.last;
         let r = self.st.len() as i32;
-        let mut st_r = SamState::default();
-        st_r.link = 0;
-        st_r.len = self.st[g as usize].len + 1;
-        st_r.endpos = i;
-        st_r.small_n = 0;
-        st_r.head = -1;
+        let st_r = SamState {
+            link: 0,
+            len: self.st[g as usize].len + 1,
+            endpos: i,
+            small_n: 0,
+            head: -1,
+            ..Default::default()
+        };
         self.st.push(st_r);
 
         let mut p = g;
@@ -536,12 +540,14 @@ impl Sam {
 
         let g = self.last;
         let r = self.st.len() as i32;
-        let mut st_r = SamState::default();
-        st_r.link = 0;
-        st_r.len = self.st[g as usize].len + 1;
-        st_r.endpos = i;
-        st_r.small_n = 0;
-        st_r.head = -1;
+        let st_r = SamState {
+            link: 0,
+            len: self.st[g as usize].len + 1,
+            endpos: i,
+            small_n: 0,
+            head: -1,
+            ..Default::default()
+        };
         self.st.push(st_r);
 
         let mut p = g;
@@ -1052,16 +1058,15 @@ impl RngStream {
             pos: 0,
             xs: 88172645463325252u64,
         };
-        if let Ok(path) = std::env::var("ROSAPLUS_RNG_PATH") {
-            if !path.is_empty() {
-                if let Ok(mut f) = File::open(path) {
-                    let mut b = Vec::new();
-                    if f.read_to_end(&mut b).is_ok() && b.len() >= 8 {
-                        let n = b.len();
-                        r.pos = ((seed.wrapping_mul(8)) as usize) % n;
-                        r.buf = b;
-                    }
-                }
+        if let Ok(path) = std::env::var("ROSAPLUS_RNG_PATH")
+            && !path.is_empty()
+            && let Ok(mut f) = File::open(path)
+        {
+            let mut b = Vec::new();
+            if f.read_to_end(&mut b).is_ok() && b.len() >= 8 {
+                let n = b.len();
+                r.pos = ((seed.wrapping_mul(8)) as usize) % n;
+                r.buf = b;
             }
         }
         r
@@ -1440,7 +1445,7 @@ impl RosaPlus {
             return 0.0;
         }
         let num_chunks = 16;
-        let chunk_size = (data.len() + num_chunks - 1) / num_chunks;
+        let chunk_size = data.len().div_ceil(num_chunks);
         let mut total_log_prob = 0.0f64;
         let mut count = 0usize;
 
@@ -1769,7 +1774,7 @@ impl RosaPlus {
         self.lm_built = false;
 
         let num_chunks = 16;
-        let chunk_size = (cps.len() + num_chunks - 1) / num_chunks;
+        let chunk_size = cps.len().div_ceil(num_chunks);
         let mut total_log_prob = 0.0f64;
         let mut count = 0usize;
 
@@ -1914,17 +1919,13 @@ impl RosaPlus {
 
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         if !self.lm_built {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "LM not built",
-            ));
+            return Err(std::io::Error::other("LM not built"));
         }
 
         // Transactional conditional updates require a valid prefix-state trace.
         // If this invariant is violated, the loaded model would be unusable.
         if self.sam.text_states.len() != self.sam.text.len() + 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "SAM text_states mismatch (expected text.len()+1)",
             ));
         }

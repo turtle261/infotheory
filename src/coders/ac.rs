@@ -62,13 +62,13 @@ pub fn softmax_pdf_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64
 
     if sum > 0.0 {
         let inv = 1.0 / sum;
-        for i in 0..vocab_size {
-            pdf_out[i] *= inv;
+        for value in pdf_out.iter_mut().take(vocab_size) {
+            *value *= inv;
         }
     } else {
         let inv = 1.0 / (vocab_size.max(1) as f64);
-        for i in 0..vocab_size {
-            pdf_out[i] = inv;
+        for value in pdf_out.iter_mut().take(vocab_size) {
+            *value = inv;
         }
     }
 }
@@ -103,14 +103,14 @@ pub fn softmax_pdf_floor_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mu
     }
 
     // Normalize and apply floor
-    for i in 0..vocab_size {
-        pdf_out[i] = (pdf_out[i] / sum).max(p_min_val);
+    for value in pdf_out.iter_mut().take(vocab_size) {
+        *value = (*value / sum).max(p_min_val);
     }
 
     // Re-normalize after floor application
     let norm: f64 = pdf_out[..vocab_size].iter().sum();
-    for i in 0..vocab_size {
-        pdf_out[i] /= norm;
+    for value in pdf_out.iter_mut().take(vocab_size) {
+        *value /= norm;
     }
 }
 
@@ -213,7 +213,7 @@ pub fn quantize_pdf_to_cdf(pdf: &[f64]) -> Vec<u32> {
 #[inline]
 pub fn quantize_pdf_to_cdf_inplace(pdf: &[f64], cdf_out: &mut [u32]) {
     let n = pdf.len();
-    debug_assert!(cdf_out.len() >= n + 1, "cdf buffer too small");
+    debug_assert!(cdf_out.len() > n, "cdf buffer too small");
 
     unsafe {
         *cdf_out.get_unchecked_mut(0) = 0;

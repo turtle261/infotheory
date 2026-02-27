@@ -1187,36 +1187,36 @@ impl Model {
             // Copy v to v_first buffer (no allocation)
             state.v_first.copy_from(&scratch.v);
             state.v_first_set = true;
-        } else if state.v_first_set {
-            if let (Some(v1), Some(v2), Some(v0)) = (&attn.v1, &attn.v2, &attn.v0) {
-                let d_v = self.cfg.v_low_rank;
-                // nu = sigmoid(xv @ v1.T @ v2.T + v0)
-                kernel::gemv_avx(
-                    v1.as_ptr(),
-                    scratch.xv.as_ptr(),
-                    scratch.w_lora_tmp.as_mut_ptr(),
-                    d_v,
-                    c,
-                );
-                kernel::gemv_avx(
-                    v2.as_ptr(),
-                    scratch.w_lora_tmp.as_ptr(),
-                    scratch.att_out.as_mut_ptr(), // reuse as temp
-                    c,
-                    d_v,
-                );
-                kernel::add_avx(
-                    scratch.att_out.as_ptr(),
-                    v0.as_ptr(),
-                    scratch.att_out.as_mut_ptr(),
-                    c,
-                );
-                kernel::sigmoid_avx(scratch.att_out.as_ptr(), scratch.att_out.as_mut_ptr(), c);
-                // v = v + (v_first - v) * nu
-                for i in 0..c {
-                    let nu = scratch.att_out[i];
-                    scratch.v[i] += (state.v_first[i] - scratch.v[i]) * nu;
-                }
+        } else if state.v_first_set
+            && let (Some(v1), Some(v2), Some(v0)) = (&attn.v1, &attn.v2, &attn.v0)
+        {
+            let d_v = self.cfg.v_low_rank;
+            // nu = sigmoid(xv @ v1.T @ v2.T + v0)
+            kernel::gemv_avx(
+                v1.as_ptr(),
+                scratch.xv.as_ptr(),
+                scratch.w_lora_tmp.as_mut_ptr(),
+                d_v,
+                c,
+            );
+            kernel::gemv_avx(
+                v2.as_ptr(),
+                scratch.w_lora_tmp.as_ptr(),
+                scratch.att_out.as_mut_ptr(), // reuse as temp
+                c,
+                d_v,
+            );
+            kernel::add_avx(
+                scratch.att_out.as_ptr(),
+                v0.as_ptr(),
+                scratch.att_out.as_mut_ptr(),
+                c,
+            );
+            kernel::sigmoid_avx(scratch.att_out.as_ptr(), scratch.att_out.as_mut_ptr(), c);
+            // v = v + (v_first - v) * nu
+            for i in 0..c {
+                let nu = scratch.att_out[i];
+                scratch.v[i] += (state.v_first[i] - scratch.v[i]) * nu;
             }
         }
 

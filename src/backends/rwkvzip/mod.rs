@@ -144,7 +144,7 @@ impl Default for OnlineConfig {
 impl OnlineConfig {
     pub fn to_rwkv_config(&self) -> Result<Config> {
         let hidden = self.hidden.max(64);
-        if hidden % 64 != 0 {
+        if !hidden.is_multiple_of(64) {
             bail!("rwkv hidden must be a multiple of 64 (got {hidden})");
         }
         let num_heads = hidden / 64;
@@ -312,16 +312,20 @@ fn parse_cfg_positional(csv: &str) -> Result<OnlineConfig> {
         );
     }
 
-    let mut cfg = OnlineConfig::default();
-    cfg.hidden = parse_usize(vals[0], "hidden")?;
-    cfg.intermediate = parse_usize(vals[1], "intermediate")?;
-    cfg.layers = parse_usize(vals[2], "layers")?;
-    cfg.train_mode = parse_train_mode_token(vals[3])?;
-    cfg.seed = parse_u64(vals[4], "seed")?;
-    cfg.lr = parse_f32(vals[5], "lr")?;
-    if vals.len() == 7 {
-        cfg.stride = parse_usize(vals[6], "stride")?;
-    }
+    let cfg = OnlineConfig {
+        hidden: parse_usize(vals[0], "hidden")?,
+        intermediate: parse_usize(vals[1], "intermediate")?,
+        layers: parse_usize(vals[2], "layers")?,
+        train_mode: parse_train_mode_token(vals[3])?,
+        seed: parse_u64(vals[4], "seed")?,
+        lr: parse_f32(vals[5], "lr")?,
+        stride: if vals.len() == 7 {
+            parse_usize(vals[6], "stride")?
+        } else {
+            1
+        },
+        ..OnlineConfig::default()
+    };
     Ok(cfg)
 }
 

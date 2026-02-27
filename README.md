@@ -246,6 +246,9 @@ Notes:
 - Published wheels are intended to be portable and exclude `vm` support by default.
 - Linux source builds can opt into VM bindings by enabling the Rust `vm` feature when building the extension.
   Example: `uv run maturin develop --release --features vm`
+- Python trait-callback adapters (`PredictorABC`, `EnvironmentABC`, `AgentSimulatorABC`) are fail-fast:
+  unhandled callback exceptions terminate the process after printing traceback context. This prevents
+  silently continuing planning/search with invalid fallback values.
 
 ## License
 - This is free software, which you may use under either the Apache-2.0 License, or the ISC License, at your choice. Those are available at LICENSE-APACHE and LICENSE respectively.

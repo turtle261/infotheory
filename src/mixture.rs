@@ -84,6 +84,7 @@ pub trait OnlineBytePredictor: Send {
 }
 
 /// A concrete online predictor backed by a `RateBackend` configuration.
+#[allow(clippy::large_enum_variant)]
 pub enum RateBackendPredictor {
     /// ROSA-Plus online suffix automaton.
     Rosa { model: RosaPlus, min_prob: f64 },
@@ -130,7 +131,7 @@ impl RateBackendPredictor {
                 num_percept_bits: _,
                 encoding_bits,
             } => {
-                let bits_per_symbol = encoding_bits.min(8).max(1);
+                let bits_per_symbol = encoding_bits.clamp(1, 8);
                 let tree = FacContextTree::new(base_depth, bits_per_symbol);
                 Self::FacCtw {
                     tree,
@@ -370,11 +371,11 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 pending_symbol,
                 ..
             } => {
-                if let Some(pending) = *pending_symbol {
-                    if pending == symbol {
-                        *pending_symbol = None;
-                        return;
-                    }
+                if let Some(pending) = *pending_symbol
+                    && pending == symbol
+                {
+                    *pending_symbol = None;
+                    return;
                 }
                 *pending_symbol = None;
                 let _ = runtime.step(symbol);

@@ -103,25 +103,6 @@ thread_local! {
     static RWKV_METHOD_TLS: RefCell<HashMap<String, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
 }
 
-impl Default for RateBackend {
-    fn default() -> Self {
-        #[cfg(feature = "backend-rosa")]
-        {
-            return RateBackend::RosaPlus;
-        }
-        #[cfg(all(not(feature = "backend-rosa"), feature = "backend-zpaq"))]
-        {
-            return RateBackend::Zpaq {
-                method: "1".to_string(),
-            };
-        }
-        #[cfg(all(not(feature = "backend-rosa"), not(feature = "backend-zpaq")))]
-        {
-            RateBackend::Ctw { depth: 16 }
-        }
-    }
-}
-
 #[cfg(feature = "backend-zpaq")]
 impl Default for CompressionBackend {
     fn default() -> Self {
@@ -153,15 +134,6 @@ impl Default for CompressionBackend {
     }
 }
 
-impl Default for InfotheoryCtx {
-    fn default() -> Self {
-        Self {
-            rate_backend: RateBackend::default(),
-            compression_backend: CompressionBackend::default(),
-        }
-    }
-}
-
 thread_local! {
     static DEFAULT_CTX: RefCell<InfotheoryCtx> = RefCell::new(InfotheoryCtx::default());
 }
@@ -178,7 +150,7 @@ pub fn set_default_ctx(ctx: InfotheoryCtx) {
 
 #[inline(always)]
 fn with_default_ctx<R>(f: impl FnOnce(&InfotheoryCtx) -> R) -> R {
-    DEFAULT_CTX.with(|ctx| f(&*ctx.borrow()))
+    DEFAULT_CTX.with(|ctx| f(&ctx.borrow()))
 }
 
 pub fn mutual_information_rate_backend(
@@ -266,6 +238,26 @@ pub enum RateBackend {
     },
 }
 
+#[allow(clippy::derivable_impls)]
+impl Default for RateBackend {
+    fn default() -> Self {
+        #[cfg(feature = "backend-rosa")]
+        {
+            RateBackend::RosaPlus
+        }
+        #[cfg(all(not(feature = "backend-rosa"), feature = "backend-zpaq"))]
+        {
+            RateBackend::Zpaq {
+                method: "1".to_string(),
+            }
+        }
+        #[cfg(all(not(feature = "backend-rosa"), not(feature = "backend-zpaq")))]
+        {
+            RateBackend::Ctw { depth: 16 }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum CompressionBackend {
     Zpaq {
@@ -350,7 +342,7 @@ impl MixtureSpec {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct InfotheoryCtx {
     pub rate_backend: RateBackend,
     pub compression_backend: CompressionBackend,
@@ -519,7 +511,7 @@ impl InfotheoryCtx {
                 if data.is_empty() {
                     return 0.0;
                 }
-                let bits_per_byte = (*encoding_bits).min(8).max(1);
+                let bits_per_byte = (*encoding_bits).clamp(1, 8);
                 let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
                 for &part in prefix_parts {
                     for &b in part {
@@ -720,7 +712,7 @@ pub fn get_compressed_size(path: &str, method: &str) -> u64 {
 pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
     #[cfg(feature = "backend-zpaq")]
     {
-        return zpaq_rate::validate_zpaq_rate_method(method);
+        zpaq_rate::validate_zpaq_rate_method(method)
     }
     #[cfg(not(feature = "backend-zpaq"))]
     {
@@ -861,7 +853,7 @@ pub fn compress_bytes_backend(
         CompressionBackend::Zpaq { method } => zpaq_compress_to_vec(data, method),
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { model, coder } => {
-            with_rwkv_tls(model, |c| c.compress(data, *coder)).map_err(Into::into)
+            with_rwkv_tls(model, |c| c.compress(data, *coder))
         }
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rate {
@@ -879,9 +871,7 @@ pub fn decompress_bytes_backend(
     match backend {
         CompressionBackend::Zpaq { .. } => zpaq_decompress_to_vec(input),
         #[cfg(feature = "backend-rwkv")]
-        CompressionBackend::Rwkv7 { model, .. } => {
-            with_rwkv_tls(model, |c| c.decompress(input)).map_err(Into::into)
-        }
+        CompressionBackend::Rwkv7 { model, .. } => with_rwkv_tls(model, |c| c.decompress(input)),
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rate {
             rate_backend,
@@ -950,7 +940,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             if data.is_empty() {
                 return 0.0;
             }
-            let bits_per_byte = (*encoding_bits).min(8).max(1);
+            let bits_per_byte = (*encoding_bits).clamp(1, 8);
             let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
             for &b in data {
                 for i in 0..bits_per_byte {
@@ -1075,7 +1065,7 @@ pub fn cross_entropy_rate_backend(
             if test_data.is_empty() {
                 return 0.0;
             }
-            let bits_per_byte = (*encoding_bits).min(8).max(1);
+            let bits_per_byte = (*encoding_bits).clamp(1, 8);
             let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
             for &b in train_data {
                 for i in 0..bits_per_byte {
@@ -1180,7 +1170,7 @@ pub fn joint_entropy_rate_backend(
             encoding_bits,
         } => {
             // Joint: interleave x and y bits, use 2*encoding_bits trees
-            let bits_per_byte = (*encoding_bits).min(8).max(1);
+            let bits_per_byte = (*encoding_bits).clamp(1, 8);
             let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte * 2);
             for k in 0..x.len() {
                 let bx = x[k];
@@ -1282,9 +1272,9 @@ pub fn get_parallel_compressed_sizes_from_parallel_paths(
 #[inline(always)]
 pub fn get_compressed_sizes_from_paths(paths: &[&str], method: &str) -> Vec<u64> {
     let n: usize = paths.len();
-    let num_threads: usize = *NUM_THREADS.get_or_init(|| num_cpus::get());
+    let num_threads: usize = *NUM_THREADS.get_or_init(num_cpus::get);
     if n < num_threads {
-        get_parallel_compressed_sizes_from_parallel_paths(paths, method, (num_threads + n - 1) / n)
+        get_parallel_compressed_sizes_from_parallel_paths(paths, method, num_threads.div_ceil(n))
     } else {
         get_sequential_compressed_sizes_from_parallel_paths(paths, method)
     }
@@ -1541,9 +1531,9 @@ pub fn marginal_entropy_bytes(data: &[u8]) -> f64 {
 
     let n = data.len() as f64;
     let mut h = 0.0f64;
-    for i in 0..256 {
-        if counts[i] > 0 {
-            let p = counts[i] as f64 / n;
+    for &count in &counts {
+        if count > 0 {
+            let p = count as f64 / n;
             h -= p * p.log2();
         }
     }

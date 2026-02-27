@@ -88,11 +88,11 @@ mod imp {
         }
 
         pub fn update(&mut self, symbol: u8) {
-            if let Some(pending) = self.pending_symbol {
-                if pending == symbol {
-                    self.pending_symbol = None;
-                    return;
-                }
+            if let Some(pending) = self.pending_symbol
+                && pending == symbol
+            {
+                self.pending_symbol = None;
+                return;
             }
             self.pending_symbol = None;
             self.pending_bits = 0.0;

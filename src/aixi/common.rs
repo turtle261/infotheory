@@ -182,6 +182,12 @@ impl RandomGenerator {
     }
 }
 
+impl Default for RandomGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Encodes a numeric value into its bit representation and appends it to a `SymbolList`.
 ///
 /// Bits are appended in least-significant-bit first order.

@@ -28,12 +28,17 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
+/// Fatal policy for Python trait callbacks:
+/// any unhandled callback exception aborts the process after traceback output.
+///
+/// This avoids silently continuing MCTS/planning with default fallback values.
 fn fatal_python_callback_error(py: Python<'_>, where_: &'static str, err: PyErr) -> ! {
     eprintln!("fatal: unhandled Python callback exception in {where_}; terminating process");
     err.print(py);
     std::process::exit(1);
 }
 
+/// Extracts a Python result or terminates on callback exception.
 fn py_result_or_fatal<T>(py: Python<'_>, where_: &'static str, result: PyResult<T>) -> T {
     match result {
         Ok(v) => v,
@@ -41,6 +46,7 @@ fn py_result_or_fatal<T>(py: Python<'_>, where_: &'static str, result: PyResult<
     }
 }
 
+/// `hasattr` variant that follows the same fatal callback-exception policy.
 fn py_hasattr_or_fatal(obj: &Bound<'_, PyAny>, name: &str, where_: &'static str) -> bool {
     match obj.hasattr(name) {
         Ok(v) => v,
@@ -126,13 +132,13 @@ fn parse_compression_backend(
         }),
         #[cfg(feature = "backend-rwkv")]
         "rate-ac" | "rate_ac" | "rateac" => Ok(CompressionBackend::Rate {
-            rate_backend: rate_backend.unwrap_or_else(RateBackend::default),
+            rate_backend: rate_backend.unwrap_or_default(),
             coder: infotheory::rwkvzip::CoderType::AC,
             framing: infotheory::compression::FramingMode::Raw,
         }),
         #[cfg(feature = "backend-rwkv")]
         "rate-rans" | "rate_rans" | "raterans" => Ok(CompressionBackend::Rate {
-            rate_backend: rate_backend.unwrap_or_else(RateBackend::default),
+            rate_backend: rate_backend.unwrap_or_default(),
             coder: infotheory::rwkvzip::CoderType::RANS,
             framing: infotheory::compression::FramingMode::Raw,
         }),
@@ -396,12 +402,10 @@ impl PyInfotheoryCtx {
         rate_backend: Option<&PyRateBackend>,
         compression_backend: Option<&PyCompressionBackend>,
     ) -> Self {
-        let rb = rate_backend
-            .map(|b| b.inner.clone())
-            .unwrap_or_else(RateBackend::default);
+        let rb = rate_backend.map(|b| b.inner.clone()).unwrap_or_default();
         let cb = compression_backend
             .map(|b| b.inner.clone())
-            .unwrap_or_else(CompressionBackend::default);
+            .unwrap_or_default();
         Self {
             inner: InfotheoryCtx::new(rb, cb),
         }
@@ -1262,7 +1266,7 @@ impl PyPredictorShim {
             }
             match py.import("copy") {
                 Ok(copy_mod) => match copy_mod.call_method1("deepcopy", (b,)) {
-                    Ok(v) => return v.unbind(),
+                    Ok(v) => v.unbind(),
                     Err(e) => fatal_python_callback_error(py, "Predictor.deepcopy", e),
                 },
                 Err(e) => fatal_python_callback_error(py, "Predictor.deepcopy_import", e),
@@ -1288,10 +1292,8 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
                 if let Err(e) = guard.bind(py).call_method1("update_history", (sym,)) {
                     fatal_python_callback_error(py, "Predictor.update_history", e);
                 }
-            } else {
-                if let Err(e) = guard.bind(py).call_method1("update", (sym,)) {
-                    fatal_python_callback_error(py, "Predictor.update", e);
-                }
+            } else if let Err(e) = guard.bind(py).call_method1("update", (sym,)) {
+                fatal_python_callback_error(py, "Predictor.update", e);
             }
         });
     }
@@ -1312,10 +1314,8 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
                 if let Err(e) = guard.bind(py).call_method0("pop_history") {
                     fatal_python_callback_error(py, "Predictor.pop_history", e);
                 }
-            } else {
-                if let Err(e) = guard.bind(py).call_method0("revert") {
-                    fatal_python_callback_error(py, "Predictor.revert", e);
-                }
+            } else if let Err(e) = guard.bind(py).call_method0("revert") {
+                fatal_python_callback_error(py, "Predictor.revert", e);
             }
         });
     }
@@ -1541,7 +1541,7 @@ impl PyAgentSimulatorShim {
             }
             match py.import("copy") {
                 Ok(copy_mod) => match copy_mod.call_method1("deepcopy", (b,)) {
-                    Ok(v) => return v.unbind(),
+                    Ok(v) => v.unbind(),
                     Err(e) => fatal_python_callback_error(py, "AgentSimulator.deepcopy", e),
                 },
                 Err(e) => fatal_python_callback_error(py, "AgentSimulator.deepcopy_import", e),
@@ -1956,6 +1956,7 @@ struct PyAgentConfig {
 #[pymethods]
 impl PyAgentConfig {
     #[new]
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         algorithm="fac-ctw".to_string(),
         ct_depth=16,

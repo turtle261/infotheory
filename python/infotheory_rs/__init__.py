@@ -1,3 +1,16 @@
+"""Python bindings for `infotheory` (import name: `infotheory_rs`).
+
+This module re-exports symbols from the native extension and provides:
+- ergonomic wrappers for common entry points (`ncd_paths`, `ncd_bytes`)
+- abstract base classes for Python-driven AIXI trait adapters
+
+Callback error policy:
+- Exceptions raised inside `PredictorABC`, `EnvironmentABC`, or
+  `AgentSimulatorABC` callbacks are treated as fatal by the Rust shim layer.
+- The process exits after printing callback context and traceback. This avoids
+  silently continuing MCTS/planning with corrupted fallback values.
+"""
+
 from . import _core as _c
 from abc import ABC, abstractmethod
 
@@ -15,6 +28,8 @@ def ncd_bytes(x, y, method="5", variant="vitanyi", backend=None):
 
 
 class PredictorABC(ABC):
+    """Python-side adapter for the Rust `Predictor` trait."""
+
     @abstractmethod
     def update(self, sym: bool): ...
 
@@ -42,6 +57,8 @@ class PredictorABC(ABC):
 
 
 class EnvironmentABC(ABC):
+    """Python-side adapter for the Rust `Environment` trait."""
+
     @abstractmethod
     def perform_action(self, action: int): ...
 
@@ -68,6 +85,8 @@ class EnvironmentABC(ABC):
 
 
 class AgentSimulatorABC(ABC):
+    """Python-side adapter for the Rust `AgentSimulator` trait."""
+
     @abstractmethod
     def get_num_actions(self) -> int: ...
 

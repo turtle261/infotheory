@@ -16,16 +16,11 @@ const FRAMED_MAGIC: u32 = 0x4354_4946; // "FITC"
 const FRAMED_VERSION: u8 = 1;
 const PDF_MIN: f64 = DEFAULT_MIN_PROB;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FramingMode {
     Raw,
+    #[default]
     Framed,
-}
-
-impl Default for FramingMode {
-    fn default() -> Self {
-        Self::Framed
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -180,8 +175,8 @@ impl CtwPredictor {
                 let patterns = 1usize << self.bits_per_symbol;
                 let aliases = 1usize << (8 - self.bits_per_symbol);
                 let mut ppat = vec![0.0f64; patterns];
-                for pat in 0..patterns {
-                    ppat[pat] = self.log_prob_symbol(pat as u8).exp();
+                for (pat, value) in ppat.iter_mut().enumerate() {
+                    *value = self.log_prob_symbol(pat as u8).exp();
                 }
                 for byte in 0..256usize {
                     let pat = byte & (patterns - 1);
@@ -518,6 +513,7 @@ impl MixturePredictor {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum RatePdfPredictor {
     Rosa(RosaPredictor),
     Ctw(CtwPredictor),

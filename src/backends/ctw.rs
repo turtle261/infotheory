@@ -69,6 +69,12 @@ impl CtNode {
     }
 }
 
+impl Default for CtNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Arena allocator for context tree nodes.
 #[derive(Clone, Debug)]
 pub struct CtArena {
@@ -129,6 +135,12 @@ impl CtArena {
     pub fn memory_usage(&self) -> usize {
         self.nodes.capacity() * std::mem::size_of::<CtNode>()
             + self.free_list.capacity() * std::mem::size_of::<NodeIndex>()
+    }
+}
+
+impl Default for CtArena {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -79,7 +79,7 @@ pub fn quantize_pdf_to_rans_cdf_with_buffer(
     freq_buf: &mut [i64],
 ) {
     let n = pdf.len();
-    assert!(cdf_out.len() >= n + 1, "cdf buffer too small");
+    assert!(cdf_out.len() > n, "cdf buffer too small");
     assert!(freq_buf.len() >= n, "frequency buffer too small");
 
     let total = ANS_TOTAL as i64;
@@ -126,8 +126,8 @@ pub fn quantize_pdf_to_rans_cdf_with_buffer(
                 }
             }
             if added == 0 {
-                for i in 0..n {
-                    freq_buf[i] += 1;
+                for value in freq_buf.iter_mut().take(n) {
+                    *value += 1;
                     to_add -= 1;
                     if to_add == 0 {
                         break;
@@ -361,8 +361,7 @@ mod simd {
             let mut result = Vec::new();
 
             // Output final states (interleaved)
-            for i in 0..RANS_LANES {
-                let s = self.states[i];
+            for &s in self.states.iter().take(RANS_LANES) {
                 result.extend_from_slice(&s.to_le_bytes());
             }
 
@@ -407,9 +406,9 @@ mod simd {
             }
 
             let mut states = [0u32; RANS_LANES];
-            for i in 0..RANS_LANES {
+            for (i, state) in states.iter_mut().enumerate() {
                 let offset = i * 4;
-                states[i] = u32::from_le_bytes([
+                *state = u32::from_le_bytes([
                     input[offset],
                     input[offset + 1],
                     input[offset + 2],
