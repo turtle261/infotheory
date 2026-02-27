@@ -1320,6 +1320,22 @@ fn read_file(path: &str) -> Vec<u8> {
     }
 }
 
+fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
+    match backend {
+        #[cfg(feature = "backend-rwkv")]
+        CompressionBackend::Rate {
+            rate_backend,
+            coder,
+            ..
+        } => CompressionBackend::Rate {
+            rate_backend: rate_backend.clone(),
+            coder: *coder,
+            framing: infotheory::compression::FramingMode::Framed,
+        },
+        _ => backend.clone(),
+    }
+}
+
 #[cfg(feature = "backend-rwkv")]
 fn maybe_export_rwkv_online(
     export_path: Option<&str>,
@@ -2214,6 +2230,59 @@ fn main() {
             }
         }
         "search" => search_command(&args),
+        "compress" => {
+            let in_path = file1.unwrap_or_exit("Error: 'compress' requires <input> <output>");
+            let out_path = file2.unwrap_or_exit("Error: 'compress' requires <input> <output>");
+            let data = read_file(&in_path);
+            let backend = file_roundtrip_backend(&ctx.compression_backend);
+            let compressed = match compress_bytes_backend(&data, &backend) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: compression failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = std::fs::write(&out_path, &compressed) {
+                eprintln!("Error: failed to write output '{}': {}", out_path, e);
+                std::process::exit(1);
+            }
+            println!(
+                "compressed {} bytes -> {} bytes",
+                data.len(),
+                compressed.len()
+            );
+            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&data]) {
+                eprintln!("Error exporting RWKV model: {e}");
+                std::process::exit(1);
+            }
+        }
+        "decompress" => {
+            let in_path = file1.unwrap_or_exit("Error: 'decompress' requires <input> <output>");
+            let out_path = file2.unwrap_or_exit("Error: 'decompress' requires <input> <output>");
+            let input = read_file(&in_path);
+            let backend = file_roundtrip_backend(&ctx.compression_backend);
+            let decoded = match decompress_bytes_backend(&input, &backend) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: decompression failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = std::fs::write(&out_path, &decoded) {
+                eprintln!("Error: failed to write output '{}': {}", out_path, e);
+                std::process::exit(1);
+            }
+            println!(
+                "decompressed {} bytes -> {} bytes",
+                input.len(),
+                decoded.len()
+            );
+            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&decoded])
+            {
+                eprintln!("Error exporting RWKV model: {e}");
+                std::process::exit(1);
+            }
+        }
         "ncd" | "ncd_vitanyi" | "ncd_sym" | "ncd_sym_vitanyi" | "ncd_cons" | "ncd_sym_cons" => {
             let f1 = file1.unwrap_or_exit("Error: NCD requires two files");
             let f2 = file2.unwrap_or_exit("Error: NCD requires two files");
@@ -2366,6 +2435,8 @@ Primitives:
     search <query> <target> [options]       Search target using info-theoretic ranking
     aixi <config.json>                      Run AIXI agent
     batch                                   Run in JSON-L batch mode
+    compress <in> <out>                     Compress file using selected compression backend
+    decompress <in> <out>                   Decompress file using selected compression backend
 
 Options:
     --rate-backend <name>   Backend for rate estimation: {rate_backends}
@@ -2383,6 +2454,8 @@ Examples:
   infotheory h file.txt --rate-backend ctw --method 32
   infotheory h file.txt --rate-backend mixture --method mixture.json
   infotheory search "encryption" ./src --prior "codebase context"
+  infotheory compress in.bin out.itc --compression-backend rate-ac --rate-backend mixture --method mixture.json
+  infotheory decompress out.itc restored.bin --compression-backend rate-ac --rate-backend mixture --method mixture.json
 "#
     );
 }
@@ -2390,6 +2463,35 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_roundtrip_backend_keeps_zpaq_unchanged() {
+        let b = CompressionBackend::Zpaq {
+            method: "5".to_string(),
+        };
+        let out = file_roundtrip_backend(&b);
+        match out {
+            CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
+            _ => panic!("expected zpaq backend"),
+        }
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn file_roundtrip_backend_forces_rate_framed() {
+        let b = CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 8 },
+            coder: rwkvzip::CoderType::AC,
+            framing: infotheory::compression::FramingMode::Raw,
+        };
+        let out = file_roundtrip_backend(&b);
+        match out {
+            CompressionBackend::Rate { framing, .. } => {
+                assert_eq!(framing, infotheory::compression::FramingMode::Framed)
+            }
+            _ => panic!("expected rate backend"),
+        }
+    }
 
     #[test]
     fn process_json_line_rejects_invalid_json() {
