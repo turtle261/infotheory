@@ -609,6 +609,14 @@ impl TraceModel {
                     primed: false,
                 }
             }
+            RateBackend::Rwkv7Method { method } => {
+                let compressor = Compressor::new_from_method(method)
+                    .unwrap_or_else(|e| panic!("invalid rwkv7 method for vm trace model: {e}"));
+                TraceModel::Rwkv7 {
+                    compressor,
+                    primed: false,
+                }
+            }
             RateBackend::Zpaq { method } => TraceModel::Zpaq {
                 model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
             },

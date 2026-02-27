@@ -76,6 +76,7 @@ pub mod aixi;
 pub mod axioms;
 pub mod backends;
 pub mod coders;
+#[cfg(feature = "backend-rwkv")]
 pub mod compression;
 pub mod datagen;
 pub mod mixture;
