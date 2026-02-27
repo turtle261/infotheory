@@ -762,6 +762,7 @@ dependencies = [
  "nyx-lite",
  "once_cell",
  "rayon",
+ "serde",
  "serde_json",
  "wide",
  "zpaq_rs 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)",

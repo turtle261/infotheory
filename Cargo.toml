@@ -64,3 +64,6 @@ lto = "fat"
 codegen-units = 1
 opt-level = 3
 debug = true
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }

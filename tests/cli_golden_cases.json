@@ -1,0 +1,82 @@
+[
+  {
+    "name": "metrics abracadabra",
+    "input": {"op":"metrics","text":"abracadabra","max_order":3},
+    "expected": {"h0":2.040373,"h_rate":1.763318,"id":0.135787,"len":11},
+    "float_tolerance": 1e-6
+  },
+  {
+    "name": "ncd abracadabra alakazam",
+    "input": {"op":"ncd","text1":"abracadabra","text2":"alakazam","method":"5","variant":"vitanyi"},
+    "expected": {"ncd":0.025000},
+    "float_tolerance": 1e-6
+  },
+  {
+    "name": "rosa distance abracadabra alakazam",
+    "input": {"op":"rosa_dist","text1":"abracadabra","text2":"alakazam","max_order":3},
+    "expected": {"rosa_dist":0.360834},
+    "float_tolerance": 1e-6
+  },
+  {
+    "name": "cross entropy abracadabra alakazam",
+    "input": {"op":"cross_entropy","text_x":"abracadabra","text_y":"alakazam","max_order":3},
+    "expected": {"cross_entropy":1.778111},
+    "float_tolerance": 1e-6
+  },
+  {
+    "name": "batch metrics triple",
+    "input": {"op":"batch_metrics","texts":["abracadabra","alakazam",""],"max_order":3},
+    "expected": {
+      "results": [
+        {"h0":2.040373,"h_rate":1.763318,"id":0.135787,"len":11},
+        {"h0":2.000000,"h_rate":1.288275,"id":0.355863,"len":8},
+        {"h0":0,"h_rate":0,"id":0,"len":0}
+      ]
+    },
+    "float_tolerance": 1e-6
+  },
+  {
+    "name": "ncd matrix trio",
+    "input": {"op":"ncd_matrix","texts":["abracadabra","alakazam","xyzxyz"],"method":"5","variant":"sym"},
+    "expected": {
+      "matrix": [
+        [0.000000,0.025000,0.031250],
+        [0.025000,0.000000,0.022082],
+        [0.031250,0.022082,0.000000]
+      ],
+      "n": 3
+    },
+    "float_tolerance": 1e-6
+  },
+  {
+    "name": "rosa matrix trio",
+    "input": {"op":"rosa_matrix","texts":["abracadabra","alakazam","xyzxyz"],"max_order":3},
+    "expected": {
+      "matrix": [
+        [0.000000,0.360834,1.000000],
+        [0.360834,0.000000,1.000000],
+        [1.000000,1.000000,0.000000]
+      ],
+      "n": 3
+    },
+    "float_tolerance": 1e-6
+  },
+  {
+    "name": "spam check quality pass",
+    "input": {
+      "op":"spam_check",
+      "text":"This is a small but nontrivial sentence for entropy checks.",
+      "h0_min":1.0,
+      "h_rate_min":0.3,
+      "id_max":0.99,
+      "min_len":10
+    },
+    "expected": {"pass":true,"h0":4.1007,"h_rate":3.3061,"id":0.1938,"len":59},
+    "float_tolerance": 1e-4
+  },
+  {
+    "name": "help operation list",
+    "input": {"op":"help"},
+    "expected": {"ops":["metrics","metrics_file","ncd","ncd_files","rosa_dist","cross_entropy","batch_metrics","ncd_matrix","rosa_matrix","spam_check"]}
+  }
+]
