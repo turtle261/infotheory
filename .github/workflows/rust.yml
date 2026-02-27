@@ -144,6 +144,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang lld cmake pkg-config libseccomp-dev
 
+      - name: Configure Linux GNU ARM linker/toolchain
+        if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
+        run: |
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -191,6 +197,134 @@ jobs:
           mkdir -p dist
           cp "${out_dir}/${bin_name}" "dist/${bin_name}"
           tar -C dist -czf "${artifact_name}.tar.gz" "${bin_name}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infotheory-cli-${{ matrix.target }}
+          path: infotheory-cli-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload binary to GitHub release (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: infotheory-cli-${{ matrix.target }}.tar.gz
+
+  platform-bsd:
+    name: BSD x86_64 ${{ matrix.os }} (${{ matrix.version }})
+    needs: lint-security-lean
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: freebsd
+            version: "15.0"
+            target: x86_64-unknown-freebsd
+            rustdocflags: -C target-cpu=x86-64 -C link-arg=-fuse-ld=lld
+          - os: openbsd
+            version: "7.8"
+            target: x86_64-unknown-openbsd
+            rustdocflags: -C target-cpu=x86-64 -C link-arg=-fuse-ld=lld
+          - os: netbsd
+            version: "10.1"
+            target: x86_64-unknown-netbsd
+            rustdocflags: -C target-cpu=x86-64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cross-platform BSD validation + build
+        uses: cross-platform-actions/action@v0.32.0
+        with:
+          operating_system: ${{ matrix.os }}
+          version: ${{ matrix.version }}
+          architecture: x86_64
+          memory: 6G
+          environment_variables: CARGO_TERM_COLOR
+          shell: sh
+          run: |
+            set -eu
+
+            as_root() {
+              if command -v sudo >/dev/null 2>&1; then
+                sudo "$@"
+              elif command -v doas >/dev/null 2>&1; then
+                doas "$@"
+              else
+                "$@"
+              fi
+            }
+
+            ensure_rust() {
+              if command -v cargo >/dev/null 2>&1; then
+                return 0
+              fi
+              if command -v pkg >/dev/null 2>&1; then
+                as_root pkg update -f || true
+                as_root pkg install -y rust || true
+              elif command -v pkgin >/dev/null 2>&1; then
+                as_root pkgin -y update || true
+                as_root pkgin -y install rust || true
+              elif command -v pkg_add >/dev/null 2>&1; then
+                as_root pkg_add rust || true
+              fi
+              if ! command -v cargo >/dev/null 2>&1; then
+                if command -v curl >/dev/null 2>&1; then
+                  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+                elif command -v ftp >/dev/null 2>&1; then
+                  ftp -o /tmp/rustup-init.sh https://sh.rustup.rs
+                  sh /tmp/rustup-init.sh -y --profile minimal
+                else
+                  echo "Unable to install Rust toolchain in BSD runner" >&2
+                  exit 1
+                fi
+              fi
+            }
+
+            ensure_rust
+            export PATH="/usr/local/bin:/usr/pkg/bin:$HOME/.cargo/bin:$PATH"
+            cargo --version
+            rustc --version
+
+            OS="$(uname -s)"
+            case "$OS" in
+              NetBSD)
+                export CARGO_FEATURE_NOJIT=1
+                export CARGO_PROFILE_RELEASE_LTO=off
+                if ! command -v clang >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
+                  export CARGO_TARGET_X86_64_UNKNOWN_NETBSD_LINKER=cc
+                fi
+                ;;
+              OpenBSD)
+                export CARGO_FEATURE_NOJIT=1
+                ;;
+              FreeBSD)
+                :
+                ;;
+            esac
+
+            export RUSTDOCFLAGS="${{ matrix.rustdocflags }}"
+
+            RUSTFLAGS="-D warnings" cargo check --locked
+            RUSTFLAGS="-D warnings" cargo check --locked --no-default-features
+            RUSTFLAGS="-D warnings" cargo check --locked --features cli
+            RUSTFLAGS="-D warnings" cargo check --locked --no-default-features --features cli
+
+            cargo test --release --locked
+            cargo test --release --no-default-features --locked
+            cargo test --release --features cli --locked
+            cargo test --release --no-default-features --features cli --locked
+
+            cargo rustc --release --features cli --bin infotheory --locked -- -C target-cpu=x86-64
+
+            mkdir -p dist
+            cp target/release/infotheory dist/infotheory
+            tar -C dist -czf "infotheory-cli-${{ matrix.target }}.tar.gz" infotheory
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
