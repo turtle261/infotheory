@@ -1,4 +1,7 @@
 import infotheory_rs as ait
+import pathlib
+import subprocess
+import sys
 
 
 class DummyPredictor(ait.PredictorABC):
@@ -109,50 +112,53 @@ def test_search_with_simulator_adapter():
     assert action in (0, 1)
 
 
-class ErrorPredictor(ait.PredictorABC):
-    def update(self, sym: bool):
-        raise RuntimeError("predictor update boom")
+def _repo_root() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parents[2]
 
-    def revert(self):
-        raise RuntimeError("predictor revert boom")
 
+def test_predictor_callback_exception_is_fatal():
+    code = """
+import infotheory_rs as ait
+class BadPred(ait.PredictorABC):
+    def update(self, sym: bool): pass
+    def revert(self): pass
     def predict_prob(self, sym: bool) -> float:
         raise RuntimeError("predictor prob boom")
+ait.predictor_probe(BadPred(), steps=1)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_repo_root(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "Predictor.predict_prob" in proc.stderr
+    assert "predictor prob boom" in proc.stderr
 
 
-def test_predictor_callback_exception_printed_and_defaulted(capsys):
-    probs, name = ait.predictor_probe(ErrorPredictor(), steps=3)
-    assert probs == [0.5, 0.5, 0.5]
-    assert isinstance(name, str)
-    err = capsys.readouterr().err
-    assert "predictor prob boom" in err
-
-
-class ErrorEnv(ait.EnvironmentABC):
+def test_environment_callback_exception_is_fatal():
+    code = """
+import infotheory_rs as ait
+class BadEnv(ait.EnvironmentABC):
     def perform_action(self, action: int):
         raise RuntimeError("environment action boom")
-
-    def get_observation(self) -> int:
-        return 0
-
-    def get_reward(self) -> int:
-        return 0
-
-    def is_finished(self) -> bool:
-        return False
-
-    def get_observation_bits(self) -> int:
-        return 1
-
-    def get_reward_bits(self) -> int:
-        return 1
-
-    def get_action_bits(self) -> int:
-        return 1
-
-
-def test_environment_callback_exception_printed_and_continues(capsys):
-    rows = ait.environment_probe(ErrorEnv(), [0, 1])
-    assert rows == [(0, 0, False), (0, 0, False)]
-    err = capsys.readouterr().err
-    assert "environment action boom" in err
+    def get_observation(self) -> int: return 0
+    def get_reward(self) -> int: return 0
+    def is_finished(self) -> bool: return False
+    def get_observation_bits(self) -> int: return 1
+    def get_reward_bits(self) -> int: return 1
+    def get_action_bits(self) -> int: return 1
+ait.environment_probe(BadEnv(), [0])
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_repo_root(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "Environment.perform_action" in proc.stderr
+    assert "environment action boom" in proc.stderr

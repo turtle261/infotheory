@@ -28,23 +28,23 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-fn py_result_or<T>(py: Python<'_>, result: PyResult<T>, default: T) -> T {
+fn fatal_python_callback_error(py: Python<'_>, where_: &'static str, err: PyErr) -> ! {
+    eprintln!("fatal: unhandled Python callback exception in {where_}; terminating process");
+    err.print(py);
+    std::process::exit(1);
+}
+
+fn py_result_or_fatal<T>(py: Python<'_>, where_: &'static str, result: PyResult<T>) -> T {
     match result {
         Ok(v) => v,
-        Err(e) => {
-            e.print(py);
-            default
-        }
+        Err(e) => fatal_python_callback_error(py, where_, e),
     }
 }
 
-fn py_hasattr(obj: &Bound<'_, PyAny>, name: &str) -> bool {
+fn py_hasattr_or_fatal(obj: &Bound<'_, PyAny>, name: &str, where_: &'static str) -> bool {
     match obj.hasattr(name) {
         Ok(v) => v,
-        Err(e) => {
-            e.print(obj.py());
-            false
-        }
+        Err(e) => fatal_python_callback_error(obj.py(), where_, e),
     }
 }
 
@@ -1244,26 +1244,29 @@ impl PyPredictorShim {
     fn clone_py_obj(obj: &Py<PyAny>) -> Py<PyAny> {
         Python::with_gil(|py| {
             let b = obj.bind(py);
-            if py_hasattr(b, "boxed_clone_with_seed") {
+            if py_hasattr_or_fatal(
+                b,
+                "boxed_clone_with_seed",
+                "Predictor.boxed_clone_with_seed",
+            ) {
                 match b.call_method1("boxed_clone_with_seed", (0u64,)) {
                     Ok(v) => return v.unbind(),
-                    Err(e) => e.print(py),
+                    Err(e) => fatal_python_callback_error(py, "Predictor.boxed_clone_with_seed", e),
                 }
             }
-            if py_hasattr(b, "boxed_clone") {
+            if py_hasattr_or_fatal(b, "boxed_clone", "Predictor.boxed_clone") {
                 match b.call_method0("boxed_clone") {
                     Ok(v) => return v.unbind(),
-                    Err(e) => e.print(py),
+                    Err(e) => fatal_python_callback_error(py, "Predictor.boxed_clone", e),
                 }
             }
             match py.import("copy") {
                 Ok(copy_mod) => match copy_mod.call_method1("deepcopy", (b,)) {
                     Ok(v) => return v.unbind(),
-                    Err(e) => e.print(py),
+                    Err(e) => fatal_python_callback_error(py, "Predictor.deepcopy", e),
                 },
-                Err(e) => e.print(py),
+                Err(e) => fatal_python_callback_error(py, "Predictor.deepcopy_import", e),
             }
-            obj.clone_ref(py)
         })
     }
 }
@@ -1273,7 +1276,7 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
             if let Err(e) = guard.bind(py).call_method1("update", (sym,)) {
-                e.print(py);
+                fatal_python_callback_error(py, "Predictor.update", e);
             }
         });
     }
@@ -1281,13 +1284,13 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     fn update_history(&mut self, sym: bool) {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            if py_hasattr(guard.bind(py), "update_history") {
+            if py_hasattr_or_fatal(guard.bind(py), "update_history", "Predictor.update_history") {
                 if let Err(e) = guard.bind(py).call_method1("update_history", (sym,)) {
-                    e.print(py);
+                    fatal_python_callback_error(py, "Predictor.update_history", e);
                 }
             } else {
                 if let Err(e) = guard.bind(py).call_method1("update", (sym,)) {
-                    e.print(py);
+                    fatal_python_callback_error(py, "Predictor.update", e);
                 }
             }
         });
@@ -1297,7 +1300,7 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
             if let Err(e) = guard.bind(py).call_method0("revert") {
-                e.print(py);
+                fatal_python_callback_error(py, "Predictor.revert", e);
             }
         });
     }
@@ -1305,13 +1308,13 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     fn pop_history(&mut self) {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            if py_hasattr(guard.bind(py), "pop_history") {
+            if py_hasattr_or_fatal(guard.bind(py), "pop_history", "Predictor.pop_history") {
                 if let Err(e) = guard.bind(py).call_method0("pop_history") {
-                    e.print(py);
+                    fatal_python_callback_error(py, "Predictor.pop_history", e);
                 }
             } else {
                 if let Err(e) = guard.bind(py).call_method0("revert") {
-                    e.print(py);
+                    fatal_python_callback_error(py, "Predictor.revert", e);
                 }
             }
         });
@@ -1320,13 +1323,13 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     fn predict_prob(&mut self, sym: bool) -> f64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "Predictor.predict_prob",
                 guard
                     .bind(py)
                     .call_method1("predict_prob", (sym,))
                     .and_then(|v| v.extract::<f64>()),
-                0.5,
             )
         })
     }
@@ -1334,13 +1337,13 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     fn model_name(&self) -> String {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "Predictor.model_name",
                 guard
                     .bind(py)
                     .call_method0("model_name")
                     .and_then(|v| v.extract::<String>()),
-                "PyPredictor".to_string(),
             )
         })
     }
@@ -1371,7 +1374,7 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
             if let Err(e) = guard.bind(py).call_method1("perform_action", (action,)) {
-                e.print(py);
+                fatal_python_callback_error(py, "Environment.perform_action", e);
             }
         });
     }
@@ -1379,13 +1382,13 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     fn get_observation(&self) -> u64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "Environment.get_observation",
                 guard
                     .bind(py)
                     .call_method0("get_observation")
                     .and_then(|v| v.extract::<u64>()),
-                0,
             )
         })
     }
@@ -1393,33 +1396,27 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     fn drain_observations(&mut self) -> Vec<u64> {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            if py_hasattr(guard.bind(py), "drain_observations") {
+            if py_hasattr_or_fatal(
+                guard.bind(py),
+                "drain_observations",
+                "Environment.drain_observations",
+            ) {
                 match guard
                     .bind(py)
                     .call_method0("drain_observations")
                     .and_then(|v| v.extract::<Vec<u64>>())
                 {
                     Ok(v) => v,
-                    Err(e) => {
-                        e.print(py);
-                        vec![py_result_or(
-                            py,
-                            guard
-                                .bind(py)
-                                .call_method0("get_observation")
-                                .and_then(|v| v.extract::<u64>()),
-                            0,
-                        )]
-                    }
+                    Err(e) => fatal_python_callback_error(py, "Environment.drain_observations", e),
                 }
             } else {
-                vec![py_result_or(
+                vec![py_result_or_fatal(
                     py,
+                    "Environment.get_observation",
                     guard
                         .bind(py)
                         .call_method0("get_observation")
                         .and_then(|v| v.extract::<u64>()),
-                    0,
                 )]
             }
         })
@@ -1428,13 +1425,13 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     fn get_reward(&self) -> i64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "Environment.get_reward",
                 guard
                     .bind(py)
                     .call_method0("get_reward")
                     .and_then(|v| v.extract::<i64>()),
-                0,
             )
         })
     }
@@ -1442,13 +1439,13 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     fn is_finished(&self) -> bool {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "Environment.is_finished",
                 guard
                     .bind(py)
                     .call_method0("is_finished")
                     .and_then(|v| v.extract::<bool>()),
-                false,
             )
         })
     }
@@ -1456,13 +1453,13 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     fn get_observation_bits(&self) -> usize {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "Environment.get_observation_bits",
                 guard
                     .bind(py)
                     .call_method0("get_observation_bits")
                     .and_then(|v| v.extract::<usize>()),
-                1,
             )
         })
     }
@@ -1470,13 +1467,13 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     fn get_reward_bits(&self) -> usize {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "Environment.get_reward_bits",
                 guard
                     .bind(py)
                     .call_method0("get_reward_bits")
                     .and_then(|v| v.extract::<usize>()),
-                1,
             )
         })
     }
@@ -1484,13 +1481,13 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     fn get_action_bits(&self) -> usize {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "Environment.get_action_bits",
                 guard
                     .bind(py)
                     .call_method0("get_action_bits")
                     .and_then(|v| v.extract::<usize>()),
-                1,
             )
         })
     }
@@ -1524,26 +1521,31 @@ impl PyAgentSimulatorShim {
     fn clone_py_obj(obj: &Py<PyAny>) -> Py<PyAny> {
         Python::with_gil(|py| {
             let b = obj.bind(py);
-            if py_hasattr(b, "boxed_clone_with_seed") {
+            if py_hasattr_or_fatal(
+                b,
+                "boxed_clone_with_seed",
+                "AgentSimulator.boxed_clone_with_seed",
+            ) {
                 match b.call_method1("boxed_clone_with_seed", (0u64,)) {
                     Ok(v) => return v.unbind(),
-                    Err(e) => e.print(py),
+                    Err(e) => {
+                        fatal_python_callback_error(py, "AgentSimulator.boxed_clone_with_seed", e)
+                    }
                 }
             }
-            if py_hasattr(b, "boxed_clone") {
+            if py_hasattr_or_fatal(b, "boxed_clone", "AgentSimulator.boxed_clone") {
                 match b.call_method0("boxed_clone") {
                     Ok(v) => return v.unbind(),
-                    Err(e) => e.print(py),
+                    Err(e) => fatal_python_callback_error(py, "AgentSimulator.boxed_clone", e),
                 }
             }
             match py.import("copy") {
                 Ok(copy_mod) => match copy_mod.call_method1("deepcopy", (b,)) {
                     Ok(v) => return v.unbind(),
-                    Err(e) => e.print(py),
+                    Err(e) => fatal_python_callback_error(py, "AgentSimulator.deepcopy", e),
                 },
-                Err(e) => e.print(py),
+                Err(e) => fatal_python_callback_error(py, "AgentSimulator.deepcopy_import", e),
             }
-            obj.clone_ref(py)
         })
     }
 }
@@ -1552,13 +1554,13 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn get_num_actions(&self) -> usize {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "AgentSimulator.get_num_actions",
                 guard
                     .bind(py)
                     .call_method0("get_num_actions")
                     .and_then(|v| v.extract::<usize>()),
-                2,
             )
         })
     }
@@ -1566,13 +1568,13 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn get_num_observation_bits(&self) -> usize {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "AgentSimulator.get_num_observation_bits",
                 guard
                     .bind(py)
                     .call_method0("get_num_observation_bits")
                     .and_then(|v| v.extract::<usize>()),
-                1,
             )
         })
     }
@@ -1580,14 +1582,18 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn observation_stream_len(&self) -> usize {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            if py_hasattr(guard.bind(py), "observation_stream_len") {
-                py_result_or(
+            if py_hasattr_or_fatal(
+                guard.bind(py),
+                "observation_stream_len",
+                "AgentSimulator.observation_stream_len",
+            ) {
+                py_result_or_fatal(
                     py,
+                    "AgentSimulator.observation_stream_len",
                     guard
                         .bind(py)
                         .call_method0("observation_stream_len")
                         .and_then(|v| v.extract::<usize>()),
-                    1,
                 )
             } else {
                 1
@@ -1598,12 +1604,15 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn observation_key_mode(&self) -> infotheory::aixi::common::ObservationKeyMode {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            if py_hasattr(guard.bind(py), "observation_key_mode") {
+            if py_hasattr_or_fatal(
+                guard.bind(py),
+                "observation_key_mode",
+                "AgentSimulator.observation_key_mode",
+            ) {
                 match guard.bind(py).call_method0("observation_key_mode") {
                     Ok(v) => Self::parse_key_mode(&v),
                     Err(e) => {
-                        e.print(py);
-                        infotheory::aixi::common::ObservationKeyMode::FullStream
+                        fatal_python_callback_error(py, "AgentSimulator.observation_key_mode", e)
                     }
                 }
             } else {
@@ -1615,13 +1624,13 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn get_num_reward_bits(&self) -> usize {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "AgentSimulator.get_num_reward_bits",
                 guard
                     .bind(py)
                     .call_method0("get_num_reward_bits")
                     .and_then(|v| v.extract::<usize>()),
-                1,
             )
         })
     }
@@ -1629,13 +1638,13 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn horizon(&self) -> usize {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "AgentSimulator.horizon",
                 guard
                     .bind(py)
                     .call_method0("horizon")
                     .and_then(|v| v.extract::<usize>()),
-                1,
             )
         })
     }
@@ -1643,13 +1652,13 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn max_reward(&self) -> i64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "AgentSimulator.max_reward",
                 guard
                     .bind(py)
                     .call_method0("max_reward")
                     .and_then(|v| v.extract::<i64>()),
-                1,
             )
         })
     }
@@ -1657,13 +1666,13 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn min_reward(&self) -> i64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "AgentSimulator.min_reward",
                 guard
                     .bind(py)
                     .call_method0("min_reward")
                     .and_then(|v| v.extract::<i64>()),
-                0,
             )
         })
     }
@@ -1671,14 +1680,18 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn reward_offset(&self) -> i64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            if py_hasattr(guard.bind(py), "reward_offset") {
-                py_result_or(
+            if py_hasattr_or_fatal(
+                guard.bind(py),
+                "reward_offset",
+                "AgentSimulator.reward_offset",
+            ) {
+                py_result_or_fatal(
                     py,
+                    "AgentSimulator.reward_offset",
                     guard
                         .bind(py)
                         .call_method0("reward_offset")
                         .and_then(|v| v.extract::<i64>()),
-                    0,
                 )
             } else {
                 0
@@ -1689,14 +1702,18 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn get_explore_exploit_ratio(&self) -> f64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            if py_hasattr(guard.bind(py), "get_explore_exploit_ratio") {
-                py_result_or(
+            if py_hasattr_or_fatal(
+                guard.bind(py),
+                "get_explore_exploit_ratio",
+                "AgentSimulator.get_explore_exploit_ratio",
+            ) {
+                py_result_or_fatal(
                     py,
+                    "AgentSimulator.get_explore_exploit_ratio",
                     guard
                         .bind(py)
                         .call_method0("get_explore_exploit_ratio")
                         .and_then(|v| v.extract::<f64>()),
-                    1.0,
                 )
             } else {
                 1.0
@@ -1707,14 +1724,18 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn discount_gamma(&self) -> f64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            if py_hasattr(guard.bind(py), "discount_gamma") {
-                py_result_or(
+            if py_hasattr_or_fatal(
+                guard.bind(py),
+                "discount_gamma",
+                "AgentSimulator.discount_gamma",
+            ) {
+                py_result_or_fatal(
                     py,
+                    "AgentSimulator.discount_gamma",
                     guard
                         .bind(py)
                         .call_method0("discount_gamma")
                         .and_then(|v| v.extract::<f64>()),
-                    1.0,
                 )
             } else {
                 1.0
@@ -1729,7 +1750,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
                 .bind(py)
                 .call_method1("model_update_action", (action,))
             {
-                e.print(py);
+                fatal_python_callback_error(py, "AgentSimulator.model_update_action", e);
             }
         });
     }
@@ -1737,13 +1758,13 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn gen_percept_and_update(&mut self, bits: usize) -> u64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "AgentSimulator.gen_percept_and_update",
                 guard
                     .bind(py)
                     .call_method1("gen_percept_and_update", (bits,))
                     .and_then(|v| v.extract::<u64>()),
-                0,
             )
         })
     }
@@ -1752,7 +1773,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
             if let Err(e) = guard.bind(py).call_method1("model_revert", (steps,)) {
-                e.print(py);
+                fatal_python_callback_error(py, "AgentSimulator.model_revert", e);
             }
         });
     }
@@ -1760,13 +1781,13 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn gen_range(&mut self, end: usize) -> usize {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "AgentSimulator.gen_range",
                 guard
                     .bind(py)
                     .call_method1("gen_range", (end,))
                     .and_then(|v| v.extract::<usize>()),
-                0,
             )
         })
     }
@@ -1774,13 +1795,13 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn gen_f64(&mut self) -> f64 {
         Python::with_gil(|py| {
             let guard = lock_recover(&self.obj);
-            py_result_or(
+            py_result_or_fatal(
                 py,
+                "AgentSimulator.gen_f64",
                 guard
                     .bind(py)
                     .call_method0("gen_f64")
                     .and_then(|v| v.extract::<f64>()),
-                0.5,
             )
         })
     }
@@ -1790,13 +1811,18 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
             let guard = lock_recover(&self.obj);
             Python::with_gil(|py| {
                 let b = guard.bind(py);
-                if py_hasattr(b, "boxed_clone_with_seed") {
+                if py_hasattr_or_fatal(
+                    b,
+                    "boxed_clone_with_seed",
+                    "AgentSimulator.boxed_clone_with_seed",
+                ) {
                     match b.call_method1("boxed_clone_with_seed", (seed,)) {
                         Ok(v) => v.unbind(),
-                        Err(e) => {
-                            e.print(py);
-                            Self::clone_py_obj(&guard)
-                        }
+                        Err(e) => fatal_python_callback_error(
+                            py,
+                            "AgentSimulator.boxed_clone_with_seed",
+                            e,
+                        ),
                     }
                 } else {
                     Self::clone_py_obj(&guard)
@@ -2575,7 +2601,7 @@ impl PyNyxVmConfig {
 }
 
 #[cfg(feature = "vm")]
-#[pyclass(name = "NyxVmEnvironment")]
+#[pyclass(name = "NyxVmEnvironment", unsendable)]
 struct PyNyxVmEnvironment {
     inner: infotheory::aixi::vm_nyx::NyxVmEnvironment,
 }
