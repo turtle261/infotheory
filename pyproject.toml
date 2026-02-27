@@ -32,7 +32,7 @@ dev = [
 manifest-path = "infotheory_py/Cargo.toml"
 module-name = "infotheory_rs._core"
 python-source = "python"
-features = ["backend-rosa", "backend-rwkv", "backend-zpaq"]
+features = ["python-extension", "backend-rosa", "backend-rwkv", "backend-zpaq"]
 include = [
   { path = "python/infotheory_rs/**/*.py", format = ["sdist", "wheel"] },
 ]

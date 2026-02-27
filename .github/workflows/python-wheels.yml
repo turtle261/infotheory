@@ -25,10 +25,17 @@ jobs:
 
       - uses: astral-sh/setup-uv@v4
 
-      - name: Build wheel
+      - name: Build wheel (Linux)
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: -C target-cpu=generic -C link-arg=-fuse-ld=lld
+        run: uv run maturin build --release --features python-extension,backend-rosa,backend-rwkv,backend-zpaq
+
+      - name: Build wheel (macOS/Windows)
+        if: runner.os != 'Linux'
         env:
           RUSTFLAGS: -C target-cpu=generic
-        run: uv run maturin build --release --features backend-rosa,backend-rwkv,backend-zpaq
+        run: uv run maturin build --release --features python-extension,backend-rosa,backend-rwkv,backend-zpaq
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4

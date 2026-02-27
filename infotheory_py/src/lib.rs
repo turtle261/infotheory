@@ -152,7 +152,7 @@ fn parse_compression_backend(
     }
 }
 
-#[pyclass(name = "MixtureKind")]
+#[pyclass(name = "MixtureKind", from_py_object)]
 #[derive(Clone)]
 struct PyMixtureKind {
     inner: MixtureKind,
@@ -190,7 +190,7 @@ impl PyMixtureKind {
     }
 }
 
-#[pyclass(name = "MixtureExpertSpec")]
+#[pyclass(name = "MixtureExpertSpec", from_py_object)]
 #[derive(Clone)]
 struct PyMixtureExpertSpec {
     inner: MixtureExpertSpec,
@@ -212,7 +212,7 @@ impl PyMixtureExpertSpec {
     }
 }
 
-#[pyclass(name = "MixtureSpec")]
+#[pyclass(name = "MixtureSpec", from_py_object)]
 #[derive(Clone)]
 struct PyMixtureSpec {
     inner: MixtureSpec,
@@ -237,7 +237,7 @@ impl PyMixtureSpec {
     }
 }
 
-#[pyclass(name = "RateBackend")]
+#[pyclass(name = "RateBackend", from_py_object)]
 #[derive(Clone)]
 struct PyRateBackend {
     inner: RateBackend,
@@ -304,7 +304,7 @@ impl PyRateBackend {
     }
 }
 
-#[pyclass(name = "CompressionBackend")]
+#[pyclass(name = "CompressionBackend", from_py_object)]
 #[derive(Clone)]
 struct PyCompressionBackend {
     inner: CompressionBackend,
@@ -388,7 +388,7 @@ impl PyCompressionBackend {
     }
 }
 
-#[pyclass(name = "InfotheoryCtx")]
+#[pyclass(name = "InfotheoryCtx", from_py_object)]
 #[derive(Clone)]
 struct PyInfotheoryCtx {
     inner: InfotheoryCtx,
@@ -412,7 +412,7 @@ impl PyInfotheoryCtx {
     }
 
     fn entropy_rate_bytes(&self, py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
-        py.allow_threads(|| py_try(|| Ok(self.inner.entropy_rate_bytes(data, max_order))))
+        py.detach(|| py_try(|| Ok(self.inner.entropy_rate_bytes(data, max_order))))
     }
 
     #[pyo3(signature = (x, y, variant=None))]
@@ -424,7 +424,7 @@ impl PyInfotheoryCtx {
         variant: Option<String>,
     ) -> PyResult<f64> {
         let v = parse_ncd_variant(variant.as_deref().unwrap_or("vitanyi"))?;
-        py.allow_threads(|| py_try(|| Ok(self.inner.ncd_bytes(x, y, v))))
+        py.detach(|| py_try(|| Ok(self.inner.ncd_bytes(x, y, v))))
     }
 
     #[pyo3(signature = (x, y, variant=None))]
@@ -436,7 +436,7 @@ impl PyInfotheoryCtx {
         variant: Option<String>,
     ) -> PyResult<f64> {
         let v = parse_ncd_variant(variant.as_deref().unwrap_or("vitanyi"))?;
-        py.allow_threads(|| {
+        py.detach(|| {
             py_try(|| {
                 Ok(infotheory::ncd_paths_backend(
                     x,
@@ -510,7 +510,7 @@ fn ncd_paths(
 ) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
     let cb = compression_backend_from_py(backend, Some(method), None)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_paths_backend(x, y, &cb, v))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_paths_backend(x, y, &cb, v))))
 }
 
 #[pyfunction]
@@ -525,7 +525,7 @@ fn ncd_bytes(
 ) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
     let cb = compression_backend_from_py(backend, Some(method), None)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_bytes_backend(x, y, &cb, v))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_bytes_backend(x, y, &cb, v))))
 }
 
 #[pyfunction]
@@ -541,7 +541,7 @@ fn ncd_paths_with_backend(
     let v = parse_ncd_variant(variant)?;
     let cb = compression_backend_from_py(backend, method, None)?;
 
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_paths_backend(x, y, &cb, v))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_paths_backend(x, y, &cb, v))))
 }
 
 #[pyfunction]
@@ -556,24 +556,24 @@ fn ncd_bytes_with_backend(
 ) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
     let cb = compression_backend_from_py(backend, method, None)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_bytes_backend(x, y, &cb, v))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_bytes_backend(x, y, &cb, v))))
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, variant="vitanyi"))]
 fn ncd_bytes_default(py: Python<'_>, x: &[u8], y: &[u8], variant: &str) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_bytes_default(x, y, v))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_bytes_default(x, y, v))))
 }
 
 #[pyfunction]
 fn entropy_rate_bytes(py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::entropy_rate_bytes(data, max_order))))
+    py.detach(|| py_try(|| Ok(infotheory::entropy_rate_bytes(data, max_order))))
 }
 
 #[pyfunction]
 fn biased_entropy_rate_bytes(py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::biased_entropy_rate_bytes(data, max_order))))
+    py.detach(|| py_try(|| Ok(infotheory::biased_entropy_rate_bytes(data, max_order))))
 }
 
 #[pyfunction]
@@ -590,7 +590,7 @@ macro_rules! py_metric_bytes_3 {
     ($fn_name:ident, $target:path) => {
         #[pyfunction]
         fn $fn_name(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-            py.allow_threads(|| py_try(|| Ok($target(x, y, max_order))))
+            py.detach(|| py_try(|| Ok($target(x, y, max_order))))
         }
     };
 }
@@ -599,7 +599,7 @@ macro_rules! py_metric_paths_3 {
     ($fn_name:ident, $target:path) => {
         #[pyfunction]
         fn $fn_name(py: Python<'_>, x: &str, y: &str, max_order: i64) -> PyResult<f64> {
-            py.allow_threads(|| py_try(|| Ok($target(x, y, max_order))))
+            py.detach(|| py_try(|| Ok($target(x, y, max_order))))
         }
     };
 }
@@ -660,17 +660,17 @@ fn js_div_bytes(x: &[u8], y: &[u8]) -> f64 {
 
 #[pyfunction]
 fn kl_divergence_paths(py: Python<'_>, x: &str, y: &str) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::kl_divergence_paths(x, y))))
+    py.detach(|| py_try(|| Ok(infotheory::kl_divergence_paths(x, y))))
 }
 
 #[pyfunction]
 fn js_divergence_paths(py: Python<'_>, x: &str, y: &str) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::js_divergence_paths(x, y))))
+    py.detach(|| py_try(|| Ok(infotheory::js_divergence_paths(x, y))))
 }
 
 #[pyfunction]
 fn intrinsic_dependence_bytes(py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::intrinsic_dependence_bytes(data, max_order))))
+    py.detach(|| py_try(|| Ok(infotheory::intrinsic_dependence_bytes(data, max_order))))
 }
 
 #[pyfunction]
@@ -680,7 +680,7 @@ fn resistance_to_transformation_bytes(
     tx: &[u8],
     max_order: i64,
 ) -> PyResult<f64> {
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             Ok(infotheory::resistance_to_transformation_bytes(
                 x, tx, max_order,
@@ -701,12 +701,12 @@ fn ned_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 
 #[pyfunction]
 fn ned_rate_bytes(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::ned_rate_bytes(x, y, max_order))))
+    py.detach(|| py_try(|| Ok(infotheory::ned_rate_bytes(x, y, max_order))))
 }
 
 #[pyfunction]
 fn ned_cons_bytes(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::ned_cons_bytes(x, y, max_order))))
+    py.detach(|| py_try(|| Ok(infotheory::ned_cons_bytes(x, y, max_order))))
 }
 
 #[pyfunction]
@@ -716,7 +716,7 @@ fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 
 #[pyfunction]
 fn ned_cons_rate_bytes(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::ned_cons_rate_bytes(x, y, max_order))))
+    py.detach(|| py_try(|| Ok(infotheory::ned_cons_rate_bytes(x, y, max_order))))
 }
 
 #[pyfunction]
@@ -726,7 +726,7 @@ fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 
 #[pyfunction]
 fn nte_rate_bytes(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::nte_rate_bytes(x, y, max_order))))
+    py.detach(|| py_try(|| Ok(infotheory::nte_rate_bytes(x, y, max_order))))
 }
 
 #[pyfunction]
@@ -739,7 +739,7 @@ fn validate_zpaq_rate_method(method: &str) -> PyResult<()> {
 
 #[pyfunction]
 fn get_compressed_size(py: Python<'_>, path: &str, method: &str) -> PyResult<u64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::get_compressed_size(path, method))))
+    py.detach(|| py_try(|| Ok(infotheory::get_compressed_size(path, method))))
 }
 
 #[pyfunction]
@@ -749,7 +749,7 @@ fn get_compressed_size_parallel(
     method: &str,
     threads: usize,
 ) -> PyResult<u64> {
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             Ok(infotheory::get_compressed_size_parallel(
                 path, method, threads,
@@ -766,7 +766,7 @@ fn get_compressed_sizes_from_paths(
     method: &str,
 ) -> PyResult<Vec<u64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.allow_threads(|| py_try(|| Ok(infotheory::get_compressed_sizes_from_paths(&refs, method))))
+    py.detach(|| py_try(|| Ok(infotheory::get_compressed_sizes_from_paths(&refs, method))))
 }
 
 #[pyfunction]
@@ -777,7 +777,7 @@ fn get_sequential_compressed_sizes_from_sequential_paths(
     method: &str,
 ) -> PyResult<Vec<u64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             Ok(infotheory::get_sequential_compressed_sizes_from_sequential_paths(&refs, method))
         })
@@ -793,7 +793,7 @@ fn get_parallel_compressed_sizes_from_sequential_paths(
     threads: usize,
 ) -> PyResult<Vec<u64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             Ok(
                 infotheory::get_parallel_compressed_sizes_from_sequential_paths(
@@ -812,7 +812,7 @@ fn get_sequential_compressed_sizes_from_parallel_paths(
     method: &str,
 ) -> PyResult<Vec<u64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             Ok(infotheory::get_sequential_compressed_sizes_from_parallel_paths(&refs, method))
         })
@@ -828,7 +828,7 @@ fn get_parallel_compressed_sizes_from_parallel_paths(
     threads: usize,
 ) -> PyResult<Vec<u64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             Ok(
                 infotheory::get_parallel_compressed_sizes_from_parallel_paths(
@@ -842,31 +842,31 @@ fn get_parallel_compressed_sizes_from_parallel_paths(
 #[pyfunction]
 fn get_bytes_from_paths(py: Python<'_>, paths: Vec<String>) -> PyResult<Vec<Vec<u8>>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.allow_threads(|| py_try(|| Ok(infotheory::get_bytes_from_paths(&refs))))
+    py.detach(|| py_try(|| Ok(infotheory::get_bytes_from_paths(&refs))))
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_vitanyi(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_vitanyi(x, y, method))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_vitanyi(x, y, method))))
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_sym_vitanyi(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_sym_vitanyi(x, y, method))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_sym_vitanyi(x, y, method))))
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_cons(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_cons(x, y, method))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_cons(x, y, method))))
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_sym_cons(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_sym_cons(x, y, method))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_sym_cons(x, y, method))))
 }
 
 #[pyfunction]
@@ -881,7 +881,7 @@ fn compress_size_backend(
 ) -> PyResult<u64> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
     let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::compress_size_backend(data, &cb))))
+    py.detach(|| py_try(|| Ok(infotheory::compress_size_backend(data, &cb))))
 }
 
 #[pyfunction]
@@ -897,7 +897,7 @@ fn compress_size_chain_backend(
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
     let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
     let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    py.allow_threads(|| py_try(|| Ok(infotheory::compress_size_chain_backend(&refs, &cb))))
+    py.detach(|| py_try(|| Ok(infotheory::compress_size_chain_backend(&refs, &cb))))
 }
 
 #[pyfunction]
@@ -912,7 +912,7 @@ fn compress_bytes_backend<'py>(
 ) -> PyResult<Bound<'py, PyBytes>> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
     let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
-    let out = py.allow_threads(|| {
+    let out = py.detach(|| {
         py_try(|| {
             infotheory::compress_bytes_backend(data, &cb)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -933,7 +933,7 @@ fn decompress_bytes_backend<'py>(
 ) -> PyResult<Bound<'py, PyBytes>> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
     let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
-    let out = py.allow_threads(|| {
+    let out = py.detach(|| {
         py_try(|| {
             infotheory::decompress_bytes_backend(input, &cb)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -952,7 +952,7 @@ fn entropy_rate_backend(
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::entropy_rate_backend(data, max_order, &rb))))
+    py.detach(|| py_try(|| Ok(infotheory::entropy_rate_backend(data, max_order, &rb))))
 }
 
 #[pyfunction]
@@ -965,7 +965,7 @@ fn biased_entropy_rate_backend(
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             Ok(infotheory::biased_entropy_rate_backend(
                 data, max_order, &rb,
@@ -985,7 +985,7 @@ fn cross_entropy_rate_backend(
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             Ok(infotheory::cross_entropy_rate_backend(
                 test_data, train_data, max_order, &rb,
@@ -1005,7 +1005,7 @@ fn joint_entropy_rate_backend(
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::joint_entropy_rate_backend(x, y, max_order, &rb))))
+    py.detach(|| py_try(|| Ok(infotheory::joint_entropy_rate_backend(x, y, max_order, &rb))))
 }
 
 #[pyfunction]
@@ -1019,7 +1019,7 @@ fn mutual_information_rate_backend(
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             Ok(infotheory::mutual_information_rate_backend(
                 x, y, max_order, &rb,
@@ -1039,7 +1039,7 @@ fn ned_rate_backend(
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::ned_rate_backend(x, y, max_order, &rb))))
+    py.detach(|| py_try(|| Ok(infotheory::ned_rate_backend(x, y, max_order, &rb))))
 }
 
 #[pyfunction]
@@ -1053,7 +1053,7 @@ fn nte_rate_backend(
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::nte_rate_backend(x, y, max_order, &rb))))
+    py.detach(|| py_try(|| Ok(infotheory::nte_rate_backend(x, y, max_order, &rb))))
 }
 
 #[pyfunction]
@@ -1066,7 +1066,7 @@ fn ncd_matrix_paths(
 ) -> PyResult<Vec<f64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
     let v = parse_ncd_variant(variant)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_matrix_paths(&refs, method, v))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_matrix_paths(&refs, method, v))))
 }
 
 #[pyfunction]
@@ -1078,7 +1078,7 @@ fn ncd_matrix_bytes(
     variant: &str,
 ) -> PyResult<Vec<f64>> {
     let v = parse_ncd_variant(variant)?;
-    py.allow_threads(|| py_try(|| Ok(infotheory::ncd_matrix_bytes(&datas, method, v))))
+    py.detach(|| py_try(|| Ok(infotheory::ncd_matrix_bytes(&datas, method, v))))
 }
 
 #[pyfunction]
@@ -1089,7 +1089,7 @@ fn rate_backend(name: &str, method: Option<&str>) -> PyResult<PyRateBackend> {
     })
 }
 
-#[pyclass(name = "NcdVariant")]
+#[pyclass(name = "NcdVariant", from_py_object)]
 #[derive(Clone)]
 struct PyNcdVariant {
     inner: NcdVariant,
@@ -1201,7 +1201,7 @@ fn decode_reward_offset_bits(symbols: Vec<bool>, bits: usize, offset: i64) -> i6
     infotheory::aixi::common::decode_reward_offset(&symbols, bits, offset)
 }
 
-#[pyclass(name = "RandomGenerator")]
+#[pyclass(name = "RandomGenerator", from_py_object)]
 #[derive(Clone, Copy)]
 struct PyRandomGenerator {
     inner: infotheory::aixi::common::RandomGenerator,
@@ -1246,7 +1246,7 @@ impl PyPredictorShim {
     }
 
     fn clone_py_obj(obj: &Py<PyAny>) -> Py<PyAny> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let b = obj.bind(py);
             if py_hasattr_or_fatal(
                 b,
@@ -1277,7 +1277,7 @@ impl PyPredictorShim {
 
 impl infotheory::aixi::model::Predictor for PyPredictorShim {
     fn update(&mut self, sym: bool) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if let Err(e) = guard.bind(py).call_method1("update", (sym,)) {
                 fatal_python_callback_error(py, "Predictor.update", e);
@@ -1286,7 +1286,7 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     }
 
     fn update_history(&mut self, sym: bool) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if py_hasattr_or_fatal(guard.bind(py), "update_history", "Predictor.update_history") {
                 if let Err(e) = guard.bind(py).call_method1("update_history", (sym,)) {
@@ -1299,7 +1299,7 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     }
 
     fn revert(&mut self) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if let Err(e) = guard.bind(py).call_method0("revert") {
                 fatal_python_callback_error(py, "Predictor.revert", e);
@@ -1308,7 +1308,7 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     }
 
     fn pop_history(&mut self) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if py_hasattr_or_fatal(guard.bind(py), "pop_history", "Predictor.pop_history") {
                 if let Err(e) = guard.bind(py).call_method0("pop_history") {
@@ -1321,7 +1321,7 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1335,7 +1335,7 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     }
 
     fn model_name(&self) -> String {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1371,7 +1371,7 @@ impl PyEnvironmentShim {
 
 impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     fn perform_action(&mut self, action: u64) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if let Err(e) = guard.bind(py).call_method1("perform_action", (action,)) {
                 fatal_python_callback_error(py, "Environment.perform_action", e);
@@ -1380,7 +1380,7 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     }
 
     fn get_observation(&self) -> u64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1394,7 +1394,7 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     }
 
     fn drain_observations(&mut self) -> Vec<u64> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if py_hasattr_or_fatal(
                 guard.bind(py),
@@ -1423,7 +1423,7 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     }
 
     fn get_reward(&self) -> i64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1437,7 +1437,7 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     }
 
     fn is_finished(&self) -> bool {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1451,7 +1451,7 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     }
 
     fn get_observation_bits(&self) -> usize {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1465,7 +1465,7 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     }
 
     fn get_reward_bits(&self) -> usize {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1479,7 +1479,7 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
     }
 
     fn get_action_bits(&self) -> usize {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1505,12 +1505,19 @@ impl PyAgentSimulatorShim {
     }
 
     fn parse_key_mode(py_obj: &Bound<'_, PyAny>) -> infotheory::aixi::common::ObservationKeyMode {
+        if let Ok(mode) = py_obj.extract::<PyRef<'_, PyObservationKeyMode>>() {
+            return mode.inner;
+        }
+
         if let Ok(s) = py_obj.extract::<String>() {
             match s.to_ascii_lowercase().as_str() {
                 "first" => return infotheory::aixi::common::ObservationKeyMode::First,
                 "last" => return infotheory::aixi::common::ObservationKeyMode::Last,
-                "streamhash" | "hash" => {
+                "streamhash" | "stream_hash" | "hash" => {
                     return infotheory::aixi::common::ObservationKeyMode::StreamHash;
+                }
+                "fullstream" | "full_stream" => {
+                    return infotheory::aixi::common::ObservationKeyMode::FullStream;
                 }
                 _ => {}
             }
@@ -1519,7 +1526,7 @@ impl PyAgentSimulatorShim {
     }
 
     fn clone_py_obj(obj: &Py<PyAny>) -> Py<PyAny> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let b = obj.bind(py);
             if py_hasattr_or_fatal(
                 b,
@@ -1552,7 +1559,7 @@ impl PyAgentSimulatorShim {
 
 impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn get_num_actions(&self) -> usize {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1566,7 +1573,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn get_num_observation_bits(&self) -> usize {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1580,7 +1587,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn observation_stream_len(&self) -> usize {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if py_hasattr_or_fatal(
                 guard.bind(py),
@@ -1602,7 +1609,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn observation_key_mode(&self) -> infotheory::aixi::common::ObservationKeyMode {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if py_hasattr_or_fatal(
                 guard.bind(py),
@@ -1622,7 +1629,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn get_num_reward_bits(&self) -> usize {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1636,7 +1643,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn horizon(&self) -> usize {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1650,7 +1657,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn max_reward(&self) -> i64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1664,7 +1671,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn min_reward(&self) -> i64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1678,7 +1685,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn reward_offset(&self) -> i64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if py_hasattr_or_fatal(
                 guard.bind(py),
@@ -1700,7 +1707,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn get_explore_exploit_ratio(&self) -> f64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if py_hasattr_or_fatal(
                 guard.bind(py),
@@ -1722,7 +1729,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn discount_gamma(&self) -> f64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if py_hasattr_or_fatal(
                 guard.bind(py),
@@ -1744,7 +1751,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn model_update_action(&mut self, action: u64) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if let Err(e) = guard
                 .bind(py)
@@ -1756,7 +1763,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn gen_percept_and_update(&mut self, bits: usize) -> u64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1770,7 +1777,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn model_revert(&mut self, steps: usize) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             if let Err(e) = guard.bind(py).call_method1("model_revert", (steps,)) {
                 fatal_python_callback_error(py, "AgentSimulator.model_revert", e);
@@ -1779,7 +1786,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn gen_range(&mut self, end: usize) -> usize {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1793,7 +1800,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn gen_f64(&mut self) -> f64 {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             py_result_or_fatal(
                 py,
@@ -1807,9 +1814,8 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn infotheory::aixi::mcts::AgentSimulator> {
-        let cloned = {
+        let cloned = Python::attach(|py| {
             let guard = lock_recover(&self.obj);
-            Python::with_gil(|py| {
                 let b = guard.bind(py);
                 if py_hasattr_or_fatal(
                     b,
@@ -1827,8 +1833,7 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
                 } else {
                     Self::clone_py_obj(&guard)
                 }
-            })
-        };
+            });
         Box::new(Self::new(cloned))
     }
 }
@@ -1840,7 +1845,7 @@ fn predictor_probe(
     predictor: Py<PyAny>,
     steps: usize,
 ) -> PyResult<(Vec<f64>, String)> {
-    let (probs, name) = py.allow_threads(|| {
+    let (probs, name) = py.detach(|| {
         py_try(|| {
             use infotheory::aixi::model::Predictor;
             let mut p = PyPredictorShim::new(predictor);
@@ -1864,7 +1869,7 @@ fn environment_probe(
     environment: Py<PyAny>,
     actions: Vec<u64>,
 ) -> PyResult<Vec<(u64, i64, bool)>> {
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             use infotheory::aixi::environment::Environment;
             let mut env = PyEnvironmentShim::new(environment);
@@ -1888,7 +1893,7 @@ fn search_with_simulator(
     prev_act: u64,
     num_simulations: usize,
 ) -> PyResult<u64> {
-    py.allow_threads(|| {
+    py.detach(|| {
         py_try(|| {
             let mut sim = PyAgentSimulatorShim::new(simulator);
             let mut tree = infotheory::aixi::mcts::SearchTree::new();
@@ -1909,7 +1914,7 @@ fn search_with_simulator(
     })
 }
 
-#[pyclass(name = "ObservationKeyMode")]
+#[pyclass(name = "ObservationKeyMode", from_py_object)]
 #[derive(Clone)]
 struct PyObservationKeyMode {
     inner: infotheory::aixi::common::ObservationKeyMode,
@@ -1947,7 +1952,7 @@ impl PyObservationKeyMode {
     }
 }
 
-#[pyclass(name = "AgentConfig")]
+#[pyclass(name = "AgentConfig", from_py_object)]
 #[derive(Clone)]
 struct PyAgentConfig {
     inner: infotheory::aixi::agent::AgentConfig,
@@ -2560,7 +2565,7 @@ fn vm_enabled() -> bool {
 }
 
 #[cfg(feature = "vm")]
-#[pyclass(name = "NyxVmConfig")]
+#[pyclass(name = "NyxVmConfig", from_py_object)]
 #[derive(Clone)]
 struct PyNyxVmConfig {
     inner: infotheory::aixi::vm_nyx::NyxVmConfig,
@@ -2768,4 +2773,44 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(search_with_simulator, m)?)?;
     m.add_function(wrap_pyfunction!(vm_enabled, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_observation_key_mode_accepts_pyclass_instance() {
+        Python::attach(|py| {
+            let mode_obj = Py::new(
+                py,
+                PyObservationKeyMode {
+                    inner: infotheory::aixi::common::ObservationKeyMode::First,
+                },
+            )
+            .expect("construct ObservationKeyMode pyclass");
+
+            let parsed = PyAgentSimulatorShim::parse_key_mode(mode_obj.bind(py).as_any());
+            assert_eq!(parsed, infotheory::aixi::common::ObservationKeyMode::First);
+        });
+    }
+
+    #[test]
+    fn parse_observation_key_mode_accepts_string_aliases() {
+        Python::attach(|py| {
+            let stream_hash = pyo3::types::PyString::new(py, "stream_hash");
+            let parsed_hash = PyAgentSimulatorShim::parse_key_mode(stream_hash.as_any());
+            assert_eq!(
+                parsed_hash,
+                infotheory::aixi::common::ObservationKeyMode::StreamHash
+            );
+
+            let full_stream = pyo3::types::PyString::new(py, "fullstream");
+            let parsed_full = PyAgentSimulatorShim::parse_key_mode(full_stream.as_any());
+            assert_eq!(
+                parsed_full,
+                infotheory::aixi::common::ObservationKeyMode::FullStream
+            );
+        });
+    }
 }
