@@ -1816,24 +1816,22 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn infotheory::aixi::mcts::AgentSimulator> {
         let cloned = Python::attach(|py| {
             let guard = lock_recover(&self.obj);
-                let b = guard.bind(py);
-                if py_hasattr_or_fatal(
-                    b,
-                    "boxed_clone_with_seed",
-                    "AgentSimulator.boxed_clone_with_seed",
-                ) {
-                    match b.call_method1("boxed_clone_with_seed", (seed,)) {
-                        Ok(v) => v.unbind(),
-                        Err(e) => fatal_python_callback_error(
-                            py,
-                            "AgentSimulator.boxed_clone_with_seed",
-                            e,
-                        ),
+            let b = guard.bind(py);
+            if py_hasattr_or_fatal(
+                b,
+                "boxed_clone_with_seed",
+                "AgentSimulator.boxed_clone_with_seed",
+            ) {
+                match b.call_method1("boxed_clone_with_seed", (seed,)) {
+                    Ok(v) => v.unbind(),
+                    Err(e) => {
+                        fatal_python_callback_error(py, "AgentSimulator.boxed_clone_with_seed", e)
                     }
-                } else {
-                    Self::clone_py_obj(&guard)
                 }
-            });
+            } else {
+                Self::clone_py_obj(&guard)
+            }
+        });
         Box::new(Self::new(cloned))
     }
 }
