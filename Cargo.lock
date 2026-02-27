@@ -765,7 +765,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wide",
- "zpaq_rs 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zpaq_rs 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2126,7 +2126,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zpaq_rs"
-version = "1.0.2"
+version = "1.0.4"
 dependencies = [
  "cc",
  "hex",
@@ -2134,9 +2134,9 @@ dependencies = [
 
 [[package]]
 name = "zpaq_rs"
-version = "1.0.2"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34493dae21a40f1d15426bf7f0c446862439537db4b6a75071f06077e164c9b2"
+checksum = "5f6e6e20f814ac75e2f98d6916ca65cece82ffe9f61ed1b222ea81dacd86c27d"
 dependencies = [
  "cc",
 ]

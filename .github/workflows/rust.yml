@@ -139,13 +139,15 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Linux build deps
-        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        if: ${{ endsWith(matrix.target, 'unknown-linux-gnu') }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang lld cmake pkg-config libseccomp-dev
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: platform-hosted-${{ matrix.target }}
 
       - name: Feature checks
         env:
@@ -270,7 +272,8 @@ jobs:
           set -euo pipefail
           mkdir -p .ci-cache/musl/cargo .ci-cache/musl/rustup
           target="${{ matrix.target }}"
-          target_env="$(echo "${target}" | tr '[:lower:]-' '[:upper:]_')"
+          target_env_upper="$(echo "${target}" | tr '[:lower:]-' '[:upper:]_')"
+          target_env_lower="$(echo "${target}" | tr '-' '_')"
           cxx_triplet="${{ matrix.cxx_triplet }}"
           docker run --rm \
             -v "$PWD:/work" \
@@ -279,7 +282,8 @@ jobs:
             -w /work \
             -e CARGO_TERM_COLOR=always \
             -e TARGET="${target}" \
-            -e TARGET_ENV="${target_env}" \
+            -e TARGET_ENV_UPPER="${target_env_upper}" \
+            -e TARGET_ENV_LOWER="${target_env_lower}" \
             -e CXX_TRIPLET="${cxx_triplet}" \
             -e RELEASE_RUSTC_FLAGS="${{ matrix.release_rustc_flags }}" \
             alpine:3.23.3 \
@@ -295,11 +299,11 @@ jobs:
 
               gcc_ver="$(g++ -dumpversion)"
               cxx_base="/usr/include/c++/${gcc_ver}"
-              eval "export CC_${TARGET_ENV}=clang"
-              eval "export CXX_${TARGET_ENV}=clang++"
-              eval "export CFLAGS_${TARGET_ENV}=\"--gcc-toolchain=/usr\""
-              eval "export CXXFLAGS_${TARGET_ENV}=\"--gcc-toolchain=/usr -isystem ${cxx_base} -isystem ${cxx_base}/${CXX_TRIPLET} -isystem ${cxx_base}/backward\""
-              eval "export CARGO_TARGET_${TARGET_ENV}_LINKER=clang"
+              eval "export CC_${TARGET_ENV_LOWER}=clang"
+              eval "export CXX_${TARGET_ENV_LOWER}=clang++"
+              eval "export CFLAGS_${TARGET_ENV_LOWER}=\"--gcc-toolchain=/usr\""
+              eval "export CXXFLAGS_${TARGET_ENV_LOWER}=\"--gcc-toolchain=/usr -isystem ${cxx_base} -isystem ${cxx_base}/${CXX_TRIPLET} -isystem ${cxx_base}/backward\""
+              eval "export CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=clang"
               export MUSL_LD_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
               export MUSL_RUSTDOCFLAGS="-C target-cpu=generic -C link-arg=-fuse-ld=lld"
 

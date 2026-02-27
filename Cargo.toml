@@ -19,7 +19,7 @@ warnings = "warn"
 all = "warn"
 
 [dependencies]
-zpaq_rs = { version = "1.0.2", optional = true }
+zpaq_rs = { version = "1.0.4", optional = true }
 nyx-lite = { path = "./nyx-lite", optional = true }
 rayon = "1.11.0"
 num_cpus = "1.17.0"
