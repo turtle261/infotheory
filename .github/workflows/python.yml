@@ -1,0 +1,50 @@
+name: Python CI
+
+on:
+  push:
+    branches: ["github"]
+  pull_request:
+    branches: ["github"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C target-cpu=generic
+
+jobs:
+  test:
+    name: Python tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build extension
+        run: uv run maturin develop --release
+
+      - name: Run tests
+        run: uv run pytest -q python/tests
+
+      - name: Build sdist
+        run: uv run maturin sdist
+
+      - name: Build wheel
+        run: uv run maturin build --release
+
+      - name: Install built wheel and import
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="$(ls target/wheels/*.whl | head -n1)"
+          uv run pip install "$wheel"
+          uv run python -c "import infotheory_rs; print('ok')"

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "infotheory-rs"
+version = "1.1.0"
+description = "Python bindings for the infotheory Rust library"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "ISC OR Apache-2.0" }
+authors = [{ name = "infotheory contributors" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Rust",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://infotheory.tech"
+Repository = "https://github.com/turtle261/infotheory"
+
+[dependency-groups]
+dev = [
+  "maturin>=1.7,<2",
+  "pytest>=8.0",
+]
+
+[tool.maturin]
+manifest-path = "infotheory_py/Cargo.toml"
+module-name = "infotheory_rs._core"
+python-source = "python"
+features = ["backend-rosa", "backend-rwkv", "backend-zpaq"]
+include = [
+  { path = "python/infotheory_rs/**/*.py", format = ["sdist", "wheel"] },
+]

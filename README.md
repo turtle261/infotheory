@@ -222,6 +222,30 @@ set_default_ctx(InfotheoryCtx::new(
 and more!
 ---
 
+## Python Bindings (`infotheory-rs`)
+
+This repository now includes PyO3/maturin bindings with package name:
+- PyPI distribution: `infotheory-rs`
+- Python import: `infotheory_rs`
+
+Quickstart (local, via `uv`):
+
+```bash
+uv run maturin develop --release
+uv run python -c "import infotheory_rs as ait; print(ait.ncd_paths('README.md','README.md', backend='zpaq', method='5', variant='vitanyi'))"
+```
+
+Run Python tests:
+
+```bash
+uv run pytest -q python/tests
+```
+
+Notes:
+- Built as `abi3-py310` (compatible with Python 3.10+).
+- Published wheels are intended to be portable and exclude `vm` support by default.
+- Linux source builds can opt into VM bindings by enabling the Rust `vm` feature when building the extension.
+  Example: `uv run maturin develop --release --features vm`
 
 ## License
 - This is free software, which you may use under either the Apache-2.0 License, or the ISC License, at your choice. Those are available at LICENSE-APACHE and LICENSE respectively.

@@ -1,0 +1,29 @@
+[package]
+name = "infotheory_py"
+version = "1.1.0"
+edition = "2024"
+license = "ISC OR Apache-2.0"
+description = "PyO3 bindings for infotheory."
+homepage = "https://infotheory.tech"
+repository = "https://github.com/turtle261/infotheory"
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.100"
+infotheory = { path = "..", default-features = false }
+pyo3 = { version = "0.23.4", features = ["extension-module", "abi3-py310"] }
+rayon = "1.11.0"
+
+[features]
+default = ["backend-rosa", "backend-rwkv", "backend-zpaq"]
+backend-rosa = ["infotheory/backend-rosa"]
+backend-rwkv = ["infotheory/backend-rwkv"]
+backend-zpaq = ["infotheory/backend-zpaq"]
+vm = ["infotheory/vm"]
+
+[lints]
+workspace = true
