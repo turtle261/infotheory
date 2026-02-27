@@ -184,6 +184,13 @@ struct OnlineRuntime {
     adam_t: usize,
 }
 
+#[derive(Clone)]
+pub struct RuntimeSnapshot {
+    state: State,
+    pdf_buffer: Vec<f64>,
+    online: Option<OnlineRuntime>,
+}
+
 impl OnlineRuntime {
     fn new(cfg: OnlineConfig, vocab_size: usize) -> Self {
         let use_adam = matches!(cfg.train_mode, OnlineTrainMode::Adam);
@@ -596,6 +603,59 @@ impl Compressor {
     /// to ensure a clean state.
     pub fn reset(&mut self) {
         self.state.reset();
+    }
+
+    pub fn reset_and_prime(&mut self) {
+        self.state.reset();
+        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
+        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+    }
+
+    pub fn snapshot_runtime(&self) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            state: self.state.clone(),
+            pdf_buffer: self.pdf_buffer.clone(),
+            online: self.online.clone(),
+        }
+    }
+
+    pub fn restore_runtime(&mut self, snapshot: &RuntimeSnapshot) {
+        self.state = snapshot.state.clone();
+        self.pdf_buffer.clone_from(&snapshot.pdf_buffer);
+        self.online = snapshot.online.clone();
+    }
+
+    pub fn absorb_chain(&mut self, parts: &[&[u8]]) -> Result<()> {
+        for part in parts {
+            for &byte in *part {
+                self.online_update_from_current_pdf(byte)?;
+                let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
+                let logits = self
+                    .model
+                    .forward(&mut self.scratch, byte as u32, &mut self.state);
+                Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn cross_entropy_from_current(&mut self, data: &[u8]) -> Result<f64> {
+        if data.is_empty() {
+            return Ok(0.0);
+        }
+        let mut total_bits = 0.0f64;
+        for &byte in data {
+            let p = self.pdf_buffer[byte as usize];
+            total_bits -= p.log2();
+            self.online_update_from_current_pdf(byte)?;
+            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
+            let logits = self
+                .model
+                .forward(&mut self.scratch, byte as u32, &mut self.state);
+            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+        }
+        Ok(total_bits / (data.len() as f64))
     }
 
     pub fn is_online(&self) -> bool {
@@ -1113,31 +1173,8 @@ impl Compressor {
     /// # Returns
     /// Average bits per byte (lower is better, 8.0 means no compression possible).
     pub fn cross_entropy(&mut self, data: &[u8]) -> Result<f64> {
-        if data.is_empty() {
-            return Ok(0.0);
-        }
-
-        self.state.reset();
-
-        let mut total_bits = 0.0f64;
-
-        // Prime with null byte
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-
-        for &byte in data {
-            let p = self.pdf_buffer[byte as usize];
-            total_bits -= p.log2();
-            self.online_update_from_current_pdf(byte)?;
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, byte as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-        }
-
-        Ok(total_bits / (data.len() as f64))
+        self.reset_and_prime();
+        self.cross_entropy_from_current(data)
     }
 
     pub fn cross_entropy_conditional_chain(
@@ -1148,37 +1185,9 @@ impl Compressor {
         if data.is_empty() {
             return Ok(0.0);
         }
-
-        self.state.reset();
-
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-
-        for p in prefix_parts {
-            for &byte in *p {
-                self.online_update_from_current_pdf(byte)?;
-                let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-                let logits = self
-                    .model
-                    .forward(&mut self.scratch, byte as u32, &mut self.state);
-                Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-            }
-        }
-
-        let mut total_bits = 0.0f64;
-        for &byte in data {
-            let p = self.pdf_buffer[byte as usize];
-            total_bits -= p.log2();
-            self.online_update_from_current_pdf(byte)?;
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, byte as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-        }
-
-        Ok(total_bits / (data.len() as f64))
+        self.reset_and_prime();
+        self.absorb_chain(prefix_parts)?;
+        self.cross_entropy_from_current(data)
     }
 
     pub fn cross_entropy_conditional(&mut self, prefix: &[u8], data: &[u8]) -> Result<f64> {
@@ -1484,5 +1493,28 @@ mod tests {
 
         std::fs::remove_file(&model_path).ok();
         std::fs::remove_file(model_path.with_extension("json")).ok();
+    }
+
+    #[test]
+    fn test_runtime_snapshot_restores_online_state() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=9,train=sgd,lr=0.01,stride=1";
+        let mut c = Compressor::new_from_method(method).unwrap();
+        c.reset_and_prime();
+        c.absorb_chain(&[b"prior context".as_slice()]).unwrap();
+        let snap = c.snapshot_runtime();
+
+        c.absorb_chain(&[b"snippet-a".as_slice()]).unwrap();
+        let score_a = c.cross_entropy_from_current(b"query").unwrap();
+
+        c.restore_runtime(&snap);
+        c.absorb_chain(&[b"snippet-b".as_slice()]).unwrap();
+        let score_b = c.cross_entropy_from_current(b"query").unwrap();
+
+        c.restore_runtime(&snap);
+        c.absorb_chain(&[b"snippet-b".as_slice()]).unwrap();
+        let score_b_again = c.cross_entropy_from_current(b"query").unwrap();
+
+        assert!((score_b - score_b_again).abs() < 1e-12);
+        let _ = score_a;
     }
 }

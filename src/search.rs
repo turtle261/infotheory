@@ -240,6 +240,27 @@ fn stage1_filter_with_universal_prior(
     candidates: Vec<Snippet>,
     opts: &SearchOptions,
 ) -> Vec<Snippet> {
+    #[cfg(feature = "backend-rwkv")]
+    if let Some((mut base, prior_snapshot)) = rwkv_prior_snapshot(opts, prior_path) {
+        let h_u_q = {
+            base.restore_runtime(&prior_snapshot);
+            base.cross_entropy_from_current(query_bytes).unwrap_or(0.0)
+        };
+        return candidates
+            .into_par_iter()
+            .map_init(
+                || base.clone(),
+                |m, mut snippet| {
+                    m.restore_runtime(&prior_snapshot);
+                    let _ = m.absorb_chain(&[snippet.content.as_slice()]);
+                    let h_ux_q = m.cross_entropy_from_current(query_bytes).unwrap_or(0.0);
+                    snippet.score = h_u_q - h_ux_q;
+                    snippet
+                },
+            )
+            .collect();
+    }
+
     if !matches!(opts.ctx.rate_backend, RateBackend::RosaPlus) {
         let prior_prefix = corpus_bytes(prior_path, SearchGranularity::File);
         let h_u_q = opts
@@ -303,6 +324,31 @@ fn stage1_filter_with_universal_prior(
             )
             .collect()
     })
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn rwkv_prior_snapshot(
+    opts: &SearchOptions,
+    prior_path: &str,
+) -> Option<(
+    infotheory::rwkvzip::Compressor,
+    infotheory::rwkvzip::RuntimeSnapshot,
+)> {
+    let mut compressor = match &opts.ctx.rate_backend {
+        RateBackend::Rwkv7 { model } => {
+            infotheory::rwkvzip::Compressor::new_from_model(model.clone())
+        }
+        RateBackend::Rwkv7Method { method } => {
+            infotheory::rwkvzip::Compressor::new_from_method(method).ok()?
+        }
+        _ => return None,
+    };
+
+    let prior_prefix = corpus_bytes(prior_path, SearchGranularity::File);
+    compressor.reset_and_prime();
+    let _ = compressor.absorb_chain(&[prior_prefix.as_slice()]);
+    let snapshot = compressor.snapshot_runtime();
+    Some((compressor, snapshot))
 }
 
 fn memory_aware_threads(model_bytes: usize) -> usize {
