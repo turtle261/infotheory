@@ -658,7 +658,7 @@ fn zpaq_compress_size_bytes(data: &[u8], method: &str) -> u64 {
 #[cfg(not(feature = "backend-zpaq"))]
 #[inline(always)]
 fn zpaq_compress_size_bytes(_data: &[u8], _method: &str) -> u64 {
-    0
+    panic!("CompressionBackend::Zpaq is unavailable: build with feature 'backend-zpaq'")
 }
 
 #[cfg(feature = "backend-zpaq")]
@@ -670,7 +670,7 @@ fn zpaq_compress_size_parallel_bytes(data: &[u8], method: &str, threads: usize) 
 #[cfg(not(feature = "backend-zpaq"))]
 #[inline(always)]
 fn zpaq_compress_size_parallel_bytes(_data: &[u8], _method: &str, _threads: usize) -> u64 {
-    0
+    panic!("CompressionBackend::Zpaq is unavailable: build with feature 'backend-zpaq'")
 }
 
 #[cfg(feature = "backend-zpaq")]
@@ -682,7 +682,7 @@ fn zpaq_compress_size_stream<R: std::io::Read + Send>(reader: R, method: &str) -
 #[cfg(not(feature = "backend-zpaq"))]
 #[inline(always)]
 fn zpaq_compress_size_stream<R: std::io::Read + Send>(_reader: R, _method: &str) -> u64 {
-    0
+    panic!("CompressionBackend::Zpaq is unavailable: build with feature 'backend-zpaq'")
 }
 
 #[cfg(feature = "backend-zpaq")]
@@ -2115,10 +2115,10 @@ mod tests {
 
     #[cfg(not(feature = "backend-zpaq"))]
     #[test]
-    fn zpaq_disabled_size_paths_do_not_panic() {
+    #[should_panic(expected = "CompressionBackend::Zpaq is unavailable")]
+    fn zpaq_disabled_size_paths_fail_loudly() {
         let backend = CompressionBackend::default();
-        let size = compress_size_backend(b"abc", &backend);
-        assert_eq!(size, 0);
+        let _ = compress_size_backend(b"abc", &backend);
     }
 
     #[test]
