@@ -12,6 +12,7 @@
 //! - Probability floor ensures no symbol has zero probability (critical for lossless)
 
 use std::io::Write;
+use wide::f32x8;
 
 /// Total count for CDF quantization (2^30 for high precision)
 pub const CDF_TOTAL: u32 = 1 << 30;
@@ -79,10 +80,9 @@ pub fn softmax_pdf_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64
 /// * `vocab_size` - Size of the vocabulary
 /// * `pdf_out` - Pre-allocated buffer for output PDF (length >= vocab_size)
 pub fn softmax_pdf_floor_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64]) {
-    // Fast path for vocab_size=256 with AVX2
-    #[cfg(target_arch = "x86_64")]
+    // Fast path for byte-level vocab using portable SIMD (`wide`).
     if vocab_size == 256 {
-        unsafe { softmax_pdf_floor_avx2(logits, pdf_out) };
+        softmax_pdf_floor_wide_256(logits, pdf_out);
         return;
     }
 
@@ -114,141 +114,52 @@ pub fn softmax_pdf_floor_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mu
     }
 }
 
-/// AVX2-optimized softmax with probability floor for vocab_size=256.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn softmax_pdf_floor_avx2(logits: &[f32], pdf_out: &mut [f64]) {
-    use std::arch::x86_64::*;
-
+/// Portable SIMD softmax with probability floor for vocab_size=256.
+#[inline]
+fn softmax_pdf_floor_wide_256(logits: &[f32], pdf_out: &mut [f64]) {
     const N: usize = 256;
+    debug_assert!(logits.len() >= N);
+    debug_assert!(pdf_out.len() >= N);
     let p_min_val = p_min();
 
-    // Find max using AVX2
-    let mut max_v = _mm256_set1_ps(f32::NEG_INFINITY);
-    for i in (0..N).step_by(8) {
-        let v = _mm256_loadu_ps(logits.as_ptr().add(i));
-        max_v = _mm256_max_ps(max_v, v);
-    }
-    // Horizontal max reduction
-    let hi = _mm256_extractf128_ps(max_v, 1);
-    let lo = _mm256_castps256_ps128(max_v);
-    let max128 = _mm_max_ps(hi, lo);
-    let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
-    let max32 = _mm_max_ss(max64, _mm_shuffle_ps(max64, max64, 0x55));
-    let max = _mm_cvtss_f32(max32);
-    let max_v = _mm256_set1_ps(max);
-
-    // Compute exp(x - max) and sum
-    // Use f32 for exp computation, convert to f64 for accumulation
-    let mut sum0 = _mm256_setzero_pd();
-    let mut sum1 = _mm256_setzero_pd();
-    for i in (0..N).step_by(8) {
-        let v = _mm256_loadu_ps(logits.as_ptr().add(i));
-        let centered = _mm256_sub_ps(v, max_v);
-        let exp_vals = exp256_ps_fast(centered);
-
-        // Convert f32 to f64 using AVX2: 8 floats -> 2x4 doubles
-        let lo4 = _mm256_castps256_ps128(exp_vals);
-        let hi4 = _mm256_extractf128_ps(exp_vals, 1);
-        let d_lo = _mm256_cvtps_pd(lo4);
-        let d_hi = _mm256_cvtps_pd(hi4);
-
-        // Store and accumulate
-        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i), d_lo);
-        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i + 4), d_hi);
-        sum0 = _mm256_add_pd(sum0, d_lo);
-        sum1 = _mm256_add_pd(sum1, d_hi);
+    #[inline(always)]
+    unsafe fn load8(ptr: *const f32) -> f32x8 {
+        ptr.cast::<f32x8>().read_unaligned()
     }
 
-    // Horizontal sum of sum0 and sum1
-    let sum01 = _mm256_add_pd(sum0, sum1);
-    let hi128 = _mm256_extractf128_pd(sum01, 1);
-    let lo128 = _mm256_castpd256_pd128(sum01);
-    let sum2 = _mm_add_pd(hi128, lo128);
-    let sum1_v = _mm_unpackhi_pd(sum2, sum2);
-    let sum_v = _mm_add_sd(sum2, sum1_v);
-    let sum = _mm_cvtsd_f64(sum_v);
+    let mut max_v = f32x8::splat(f32::NEG_INFINITY);
+    for i in (0..N).step_by(8) {
+        let v = unsafe { load8(logits.as_ptr().add(i)) };
+        max_v = max_v.fast_max(v);
+    }
+    let mut max = f32::NEG_INFINITY;
+    for x in max_v.to_array() {
+        max = max.max(x);
+    }
+    let max_v = f32x8::splat(max);
 
-    // Normalize and apply floor
+    let mut sum = 0.0f64;
+    for i in (0..N).step_by(8) {
+        let centered = unsafe { load8(logits.as_ptr().add(i)) } - max_v;
+        let exp_vals = centered.exp().to_array();
+        for lane in 0..8 {
+            let v = exp_vals[lane] as f64;
+            pdf_out[i + lane] = v;
+            sum += v;
+        }
+    }
+
     let inv_sum = 1.0 / sum;
-    let p_min_v = _mm256_set1_pd(p_min_val);
-    let inv_sum_v = _mm256_set1_pd(inv_sum);
-
-    let mut new_sum0 = _mm256_setzero_pd();
-    let mut new_sum1 = _mm256_setzero_pd();
-    for i in (0..N).step_by(8) {
-        let v0 = _mm256_loadu_pd(pdf_out.as_ptr().add(i));
-        let v1 = _mm256_loadu_pd(pdf_out.as_ptr().add(i + 4));
-        let normed0 = _mm256_mul_pd(v0, inv_sum_v);
-        let normed1 = _mm256_mul_pd(v1, inv_sum_v);
-        let floored0 = _mm256_max_pd(normed0, p_min_v);
-        let floored1 = _mm256_max_pd(normed1, p_min_v);
-        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i), floored0);
-        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i + 4), floored1);
-        new_sum0 = _mm256_add_pd(new_sum0, floored0);
-        new_sum1 = _mm256_add_pd(new_sum1, floored1);
+    let mut norm = 0.0f64;
+    for v in pdf_out.iter_mut().take(N) {
+        *v = (*v * inv_sum).max(p_min_val);
+        norm += *v;
     }
 
-    // Horizontal sum for new_sum
-    let ns01 = _mm256_add_pd(new_sum0, new_sum1);
-    let ns_hi = _mm256_extractf128_pd(ns01, 1);
-    let ns_lo = _mm256_castpd256_pd128(ns01);
-    let ns2 = _mm_add_pd(ns_hi, ns_lo);
-    let ns1 = _mm_unpackhi_pd(ns2, ns2);
-    let ns_v = _mm_add_sd(ns2, ns1);
-    let new_sum = _mm_cvtsd_f64(ns_v);
-
-    // Re-normalize
-    let inv_norm = 1.0 / new_sum;
-    let inv_norm_v = _mm256_set1_pd(inv_norm);
-    for i in (0..N).step_by(8) {
-        let v0 = _mm256_loadu_pd(pdf_out.as_ptr().add(i));
-        let v1 = _mm256_loadu_pd(pdf_out.as_ptr().add(i + 4));
-        let result0 = _mm256_mul_pd(v0, inv_norm_v);
-        let result1 = _mm256_mul_pd(v1, inv_norm_v);
-        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i), result0);
-        _mm256_storeu_pd(pdf_out.as_mut_ptr().add(i + 4), result1);
+    let inv_norm = 1.0 / norm;
+    for v in pdf_out.iter_mut().take(N) {
+        *v *= inv_norm;
     }
-}
-
-/// Fast exp approximation for f32 (AVX2).
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn exp256_ps_fast(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
-    use std::arch::x86_64::*;
-
-    // Clamp to avoid overflow/underflow
-    let x = _mm256_max_ps(
-        _mm256_min_ps(x, _mm256_set1_ps(88.0)),
-        _mm256_set1_ps(-88.0),
-    );
-
-    // exp(x) = 2^(x * log2(e))
-    let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
-    let fx = _mm256_mul_ps(x, log2e);
-
-    // Split into integer and fractional parts
-    let fx_floor = _mm256_floor_ps(fx);
-    let f = _mm256_sub_ps(fx, fx_floor);
-
-    // Polynomial approximation for 2^f where f in [0, 1]
-    // 2^f ≈ 1 + f*(0.693147 + f*(0.240226 + f*0.0558))
-    let c0 = _mm256_set1_ps(1.0);
-    let c1 = _mm256_set1_ps(std::f32::consts::LN_2);
-    let c2 = _mm256_set1_ps(0.240226506959101);
-    let c3 = _mm256_set1_ps(0.0558263180532956);
-
-    let poly = _mm256_fmadd_ps(f, c3, c2);
-    let poly = _mm256_fmadd_ps(f, poly, c1);
-    let poly = _mm256_fmadd_ps(f, poly, c0);
-
-    // Scale by 2^n using float bit manipulation
-    let n = _mm256_cvtps_epi32(fx_floor);
-    let n = _mm256_add_epi32(n, _mm256_set1_epi32(127)); // Add exponent bias
-    let n = _mm256_slli_epi32(n, 23); // Shift to exponent position
-    let pow2n = _mm256_castsi256_ps(n);
-
-    _mm256_mul_ps(poly, pow2n)
 }
 
 /// Compute softmax PDF without floor (for entropy calculation).

@@ -19,7 +19,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
- "getrandom 0.3.4",
  "once_cell",
  "version_check",
  "zerocopy",
@@ -243,6 +242,12 @@ name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
+
+[[package]]
+name = "bytemuck"
+version = "1.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
 
 [[package]]
 name = "byteorder"
@@ -748,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "infotheory"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ahash",
  "anyhow",
@@ -757,8 +762,10 @@ dependencies = [
  "nyx-lite",
  "once_cell",
  "rayon",
+ "serde",
  "serde_json",
- "zpaq_rs 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wide",
+ "zpaq_rs 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -1300,6 +1307,15 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "safe_arch"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f7caad094bd561859bcd467734a720c3c1f5d1f338995351fefe2190c45efed"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "same-file"
@@ -1845,6 +1861,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wide"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac11b009ebeae802ed758530b6496784ebfee7a87b9abfbcaf3bbe25b814eb25"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
+]
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2100,7 +2126,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zpaq_rs"
-version = "1.0.2"
+version = "1.0.4"
 dependencies = [
  "cc",
  "hex",
@@ -2108,9 +2134,9 @@ dependencies = [
 
 [[package]]
 name = "zpaq_rs"
-version = "1.0.2"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34493dae21a40f1d15426bf7f0c446862439537db4b6a75071f06077e164c9b2"
+checksum = "5f6e6e20f814ac75e2f98d6916ca65cece82ffe9f61ed1b222ea81dacd86c27d"
 dependencies = [
  "cc",
 ]

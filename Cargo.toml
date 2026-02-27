@@ -1,6 +1,6 @@
 [package]
 name = "infotheory"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 license = "ISC OR Apache-2.0"
 homepage = "https://infotheory.tech"
@@ -19,21 +19,22 @@ warnings = "warn"
 all = "warn"
 
 [dependencies]
-zpaq_rs = "1.0.2"
+zpaq_rs = { version = "1.0.4", optional = true }
 nyx-lite = { path = "./nyx-lite", optional = true }
 rayon = "1.11.0"
 num_cpus = "1.17.0"
 once_cell = "1.21.3"
 serde_json = "1.0.149"
 anyhow = "1.0.100"
-ahash = "0.8.12"
+ahash = { version = "0.8.12", default-features = false, features = ["std", "no-rng"] }
 crc32fast = "1.5.0"
+wide = "1.1.1"
 
 [features]
 default = ["backend-rosa", "backend-rwkv", "backend-zpaq"]
 backend-rosa = []
 backend-rwkv = []
-backend-zpaq = []
+backend-zpaq = ["dep:zpaq_rs"]
 cli = []
 vm = ["dep:nyx-lite", "backend-rosa", "backend-rwkv", "backend-zpaq"]
 
@@ -63,3 +64,6 @@ lto = "fat"
 codegen-units = 1
 opt-level = 3
 debug = true
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }

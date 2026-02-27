@@ -1,366 +1,166 @@
-//! AVX2/FMA SIMD kernels for RWKV7 operations.
+//! Portable SIMD kernels for RWKV7 operations.
 //!
-//! All functions require x86_64 with AVX2 and FMA support.
-//! No runtime feature detection - caller must ensure features are available.
+//! This module uses `wide` vectors so LLVM/rustc can select the best SIMD path
+//! per target (x86_64, aarch64, wasm32-simd128) while preserving a scalar
+//! fallback on targets without SIMD support.
 
-#![allow(clippy::identity_op)]
-#![allow(dead_code, unused_macros)]
+#![allow(dead_code)]
 
-use std::arch::asm;
-use std::arch::x86_64::*;
+use wide::f32x8;
 
-/// Force inline and AVX2/FMA for all kernel functions
-macro_rules! kernel_fn {
-    ($vis:vis fn $name:ident $($tt:tt)*) => {
-        #[inline(always)]
-        #[target_feature(enable = "avx2,fma")]
-        $vis unsafe fn $name $($tt)*
-    };
+const LANES: usize = 8;
+const HEAD_DIM: usize = 64;
+const HEAD_CHUNKS: usize = HEAD_DIM / LANES;
+
+#[inline(always)]
+unsafe fn load8(ptr: *const f32) -> f32x8 {
+    ptr.cast::<f32x8>().read_unaligned()
 }
 
 #[inline(always)]
-unsafe fn prefetch_t0(ptr: *const f32) {
-    asm!("prefetcht0 [{0}]", in(reg) ptr, options(nostack, preserves_flags, readonly));
-}
-
-const EXP_MAX: f32 = 88.376_26;
-const EXP_MIN: f32 = -88.376_26;
-const LOG2EF: f32 = std::f32::consts::LOG2_E;
-#[allow(clippy::excessive_precision)]
-const LN2_HI: f32 = 0.693_359_4;
-#[allow(clippy::excessive_precision)]
-const LN2_LO: f32 = -2.121_944_4e-4;
-#[allow(clippy::excessive_precision)]
-const EXP_P0: f32 = 1.987_569_1e-4;
-#[allow(clippy::excessive_precision)]
-const EXP_P1: f32 = 1.398_199_9e-3;
-#[allow(clippy::excessive_precision)]
-const EXP_P2: f32 = 8.333_452e-3;
-#[allow(clippy::excessive_precision)]
-const EXP_P3: f32 = 4.166_579_6e-2;
-#[allow(clippy::excessive_precision)]
-const EXP_P4: f32 = 1.666_666_6e-1;
-const EXP_P5: f32 = 5e-1;
-
-/// Horizontal sum of 8 __m256 vectors, returning results packed in a single __m256.
-#[inline(always)]
-pub unsafe fn hsum_8x_avx(
-    s0: __m256,
-    s1: __m256,
-    s2: __m256,
-    s3: __m256,
-    s4: __m256,
-    s5: __m256,
-    s6: __m256,
-    s7: __m256,
-) -> __m256 {
-    // Stage 1: add pairs horizontally within each vector (8 -> 4 per vector)
-    let a01 = _mm256_hadd_ps(s0, s1); // [a0+a1, a2+a3, b0+b1, b2+b3 | a4+a5, a6+a7, b4+b5, b6+b7]
-    let a23 = _mm256_hadd_ps(s2, s3);
-    let a45 = _mm256_hadd_ps(s4, s5);
-    let a67 = _mm256_hadd_ps(s6, s7);
-
-    // Stage 2: add pairs again (4 -> 2 per vector)
-    let b0123 = _mm256_hadd_ps(a01, a23); // [sum0, sum1, sum2, sum3 | ...]
-    let b4567 = _mm256_hadd_ps(a45, a67);
-
-    // Stage 3: combine low and high 128-bit lanes
-    let lo_0123 = _mm256_castps256_ps128(b0123);
-    let hi_0123 = _mm256_extractf128_ps(b0123, 1);
-    let lo_4567 = _mm256_castps256_ps128(b4567);
-    let hi_4567 = _mm256_extractf128_ps(b4567, 1);
-
-    let sum_lo = _mm_add_ps(lo_0123, hi_0123); // [sum0, sum1, sum2, sum3]
-    let sum_hi = _mm_add_ps(lo_4567, hi_4567); // [sum4, sum5, sum6, sum7]
-
-    // Combine into single __m256
-    _mm256_set_m128(sum_hi, sum_lo)
-}
-
-/// Horizontal sum of 4 __m256 vectors, returning results in lower 4 floats of __m128.
-#[inline(always)]
-pub unsafe fn hsum_4x_avx(s0: __m256, s1: __m256, s2: __m256, s3: __m256) -> __m128 {
-    // Stage 1: hadd pairs
-    let a01 = _mm256_hadd_ps(s0, s1);
-    let a23 = _mm256_hadd_ps(s2, s3);
-
-    // Stage 2: hadd again
-    let b = _mm256_hadd_ps(a01, a23);
-
-    // Stage 3: add low and high 128-bit lanes
-    let lo = _mm256_castps256_ps128(b);
-    let hi = _mm256_extractf128_ps(b, 1);
-    _mm_add_ps(lo, hi)
-}
-
-/// Horizontal sum of __m256 (8 floats -> 1 float).
-#[inline(always)]
-pub unsafe fn hsum_avx(v: __m256) -> f32 {
-    let x128 = _mm_add_ps(_mm256_extractf128_ps(v, 1), _mm256_castps256_ps128(v));
-    let x64 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
-    let x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
-    _mm_cvtss_f32(x32)
+unsafe fn store8(ptr: *mut f32, v: f32x8) {
+    ptr.cast::<f32x8>().write_unaligned(v)
 }
 
 #[inline(always)]
-unsafe fn exp256_ps(mut x: __m256) -> __m256 {
-    let max = _mm256_set1_ps(EXP_MAX);
-    let min = _mm256_set1_ps(EXP_MIN);
-    x = _mm256_max_ps(_mm256_min_ps(x, max), min);
-
-    let log2ef = _mm256_set1_ps(LOG2EF);
-    let half = _mm256_set1_ps(0.5);
-    let mut fx = _mm256_mul_ps(x, log2ef);
-    fx = _mm256_add_ps(fx, half);
-
-    let fx_floor = _mm256_floor_ps(fx);
-    let tmp = fx_floor;
-
-    let mut r = _mm256_fnmadd_ps(tmp, _mm256_set1_ps(LN2_HI), x);
-    r = _mm256_fnmadd_ps(tmp, _mm256_set1_ps(LN2_LO), r);
-
-    let mut y = _mm256_set1_ps(EXP_P0);
-    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(EXP_P1));
-    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(EXP_P2));
-    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(EXP_P3));
-    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(EXP_P4));
-    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(EXP_P5));
-
-    let r2 = _mm256_mul_ps(r, r);
-    y = _mm256_mul_ps(y, r2);
-    y = _mm256_add_ps(y, r);
-    y = _mm256_add_ps(y, _mm256_set1_ps(1.0));
-
-    let emm0 = _mm256_cvtps_epi32(fx_floor);
-    let emm0 = _mm256_add_epi32(emm0, _mm256_set1_epi32(127));
-    let emm0 = _mm256_slli_epi32(emm0, 23);
-    let pow2n = _mm256_castsi256_ps(emm0);
-
-    _mm256_mul_ps(y, pow2n)
+fn reduce_max(v: f32x8) -> f32 {
+    let lanes = v.to_array();
+    let mut m = f32::NEG_INFINITY;
+    for &x in &lanes {
+        m = m.max(x);
+    }
+    m
 }
 
-/// Dot product of two aligned f32 slices (length must be multiple of 8).
+/// Dot product of two slices.
 #[inline(always)]
 pub unsafe fn dot_avx(a: *const f32, b: *const f32, len: usize) -> f32 {
-    debug_assert!(len % 8 == 0);
-
-    let mut sum0 = _mm256_setzero_ps();
-    let mut sum1 = _mm256_setzero_ps();
-    let mut sum2 = _mm256_setzero_ps();
-    let mut sum3 = _mm256_setzero_ps();
-
+    let mut sum = f32x8::ZERO;
     let mut i = 0;
-    // Unroll 4x for better pipelining
-    while i + 32 <= len {
-        let a0 = _mm256_load_ps(a.add(i));
-        let b0 = _mm256_load_ps(b.add(i));
-        sum0 = _mm256_fmadd_ps(a0, b0, sum0);
 
-        let a1 = _mm256_load_ps(a.add(i + 8));
-        let b1 = _mm256_load_ps(b.add(i + 8));
-        sum1 = _mm256_fmadd_ps(a1, b1, sum1);
-
-        let a2 = _mm256_load_ps(a.add(i + 16));
-        let b2 = _mm256_load_ps(b.add(i + 16));
-        sum2 = _mm256_fmadd_ps(a2, b2, sum2);
-
-        let a3 = _mm256_load_ps(a.add(i + 24));
-        let b3 = _mm256_load_ps(b.add(i + 24));
-        sum3 = _mm256_fmadd_ps(a3, b3, sum3);
-
-        i += 32;
+    while i + LANES <= len {
+        let av = load8(a.add(i));
+        let bv = load8(b.add(i));
+        sum += av * bv;
+        i += LANES;
     }
 
-    // Handle remaining (up to 24 elements)
-    while i + 8 <= len {
-        let av = _mm256_load_ps(a.add(i));
-        let bv = _mm256_load_ps(b.add(i));
-        sum0 = _mm256_fmadd_ps(av, bv, sum0);
-        i += 8;
+    let mut out = sum.reduce_add();
+    while i < len {
+        out += *a.add(i) * *b.add(i);
+        i += 1;
     }
 
-    // Combine accumulators
-    sum0 = _mm256_add_ps(sum0, sum1);
-    sum2 = _mm256_add_ps(sum2, sum3);
-    sum0 = _mm256_add_ps(sum0, sum2);
-
-    hsum_avx(sum0)
+    out
 }
 
 /// Matrix-vector multiply: y = A @ x where A is (rows, cols), x is (cols,), y is (rows,).
-/// A is row-major, cols must be multiple of 8.
 #[inline(always)]
 pub unsafe fn gemv_avx(a: *const f32, x: *const f32, y: *mut f32, rows: usize, cols: usize) {
-    debug_assert!(cols % 8 == 0);
-
-    // Process 8 rows at a time to maximize FMA throughput and amortize hsum overhead
     let mut r = 0;
-    while r + 8 <= rows {
-        let row0 = a.add(r * cols);
-        let row1 = a.add((r + 1) * cols);
-        let row2 = a.add((r + 2) * cols);
-        let row3 = a.add((r + 3) * cols);
-        let row4 = a.add((r + 4) * cols);
-        let row5 = a.add((r + 5) * cols);
-        let row6 = a.add((r + 6) * cols);
-        let row7 = a.add((r + 7) * cols);
 
-        // Prefetch next batch of rows
-        if r + 16 <= rows {
-            prefetch_t0(a.add((r + 8) * cols));
-            prefetch_t0(a.add((r + 9) * cols));
-            prefetch_t0(a.add((r + 10) * cols));
-            prefetch_t0(a.add((r + 11) * cols));
-            prefetch_t0(a.add((r + 12) * cols));
-            prefetch_t0(a.add((r + 13) * cols));
-            prefetch_t0(a.add((r + 14) * cols));
-            prefetch_t0(a.add((r + 15) * cols));
-        }
-
-        let mut sum0 = _mm256_setzero_ps();
-        let mut sum1 = _mm256_setzero_ps();
-        let mut sum2 = _mm256_setzero_ps();
-        let mut sum3 = _mm256_setzero_ps();
-        let mut sum4 = _mm256_setzero_ps();
-        let mut sum5 = _mm256_setzero_ps();
-        let mut sum6 = _mm256_setzero_ps();
-        let mut sum7 = _mm256_setzero_ps();
-
-        // Unroll inner loop 2x to hide FMA latency
-        let mut c = 0;
-        while c + 16 <= cols {
-            let xv0 = _mm256_load_ps(x.add(c));
-            let xv1 = _mm256_load_ps(x.add(c + 8));
-
-            sum0 = _mm256_fmadd_ps(_mm256_load_ps(row0.add(c)), xv0, sum0);
-            sum0 = _mm256_fmadd_ps(_mm256_load_ps(row0.add(c + 8)), xv1, sum0);
-            sum1 = _mm256_fmadd_ps(_mm256_load_ps(row1.add(c)), xv0, sum1);
-            sum1 = _mm256_fmadd_ps(_mm256_load_ps(row1.add(c + 8)), xv1, sum1);
-            sum2 = _mm256_fmadd_ps(_mm256_load_ps(row2.add(c)), xv0, sum2);
-            sum2 = _mm256_fmadd_ps(_mm256_load_ps(row2.add(c + 8)), xv1, sum2);
-            sum3 = _mm256_fmadd_ps(_mm256_load_ps(row3.add(c)), xv0, sum3);
-            sum3 = _mm256_fmadd_ps(_mm256_load_ps(row3.add(c + 8)), xv1, sum3);
-            sum4 = _mm256_fmadd_ps(_mm256_load_ps(row4.add(c)), xv0, sum4);
-            sum4 = _mm256_fmadd_ps(_mm256_load_ps(row4.add(c + 8)), xv1, sum4);
-            sum5 = _mm256_fmadd_ps(_mm256_load_ps(row5.add(c)), xv0, sum5);
-            sum5 = _mm256_fmadd_ps(_mm256_load_ps(row5.add(c + 8)), xv1, sum5);
-            sum6 = _mm256_fmadd_ps(_mm256_load_ps(row6.add(c)), xv0, sum6);
-            sum6 = _mm256_fmadd_ps(_mm256_load_ps(row6.add(c + 8)), xv1, sum6);
-            sum7 = _mm256_fmadd_ps(_mm256_load_ps(row7.add(c)), xv0, sum7);
-            sum7 = _mm256_fmadd_ps(_mm256_load_ps(row7.add(c + 8)), xv1, sum7);
-            c += 16;
-        }
-        // Handle remaining 8 elements if cols not multiple of 16
-        while c < cols {
-            let xv = _mm256_load_ps(x.add(c));
-            sum0 = _mm256_fmadd_ps(_mm256_load_ps(row0.add(c)), xv, sum0);
-            sum1 = _mm256_fmadd_ps(_mm256_load_ps(row1.add(c)), xv, sum1);
-            sum2 = _mm256_fmadd_ps(_mm256_load_ps(row2.add(c)), xv, sum2);
-            sum3 = _mm256_fmadd_ps(_mm256_load_ps(row3.add(c)), xv, sum3);
-            sum4 = _mm256_fmadd_ps(_mm256_load_ps(row4.add(c)), xv, sum4);
-            sum5 = _mm256_fmadd_ps(_mm256_load_ps(row5.add(c)), xv, sum5);
-            sum6 = _mm256_fmadd_ps(_mm256_load_ps(row6.add(c)), xv, sum6);
-            sum7 = _mm256_fmadd_ps(_mm256_load_ps(row7.add(c)), xv, sum7);
-            c += 8;
-        }
-
-        // Batch horizontal sums using SIMD hadd
-        let sums = hsum_8x_avx(sum0, sum1, sum2, sum3, sum4, sum5, sum6, sum7);
-        _mm256_storeu_ps(y.add(r), sums);
-        r += 8;
-    }
-
-    // Handle remaining 4 rows
     while r + 4 <= rows {
         let row0 = a.add(r * cols);
         let row1 = a.add((r + 1) * cols);
         let row2 = a.add((r + 2) * cols);
         let row3 = a.add((r + 3) * cols);
 
-        let mut sum0 = _mm256_setzero_ps();
-        let mut sum1 = _mm256_setzero_ps();
-        let mut sum2 = _mm256_setzero_ps();
-        let mut sum3 = _mm256_setzero_ps();
+        let mut sum0 = f32x8::ZERO;
+        let mut sum1 = f32x8::ZERO;
+        let mut sum2 = f32x8::ZERO;
+        let mut sum3 = f32x8::ZERO;
 
-        for c in (0..cols).step_by(8) {
-            let xv = _mm256_load_ps(x.add(c));
-            sum0 = _mm256_fmadd_ps(_mm256_load_ps(row0.add(c)), xv, sum0);
-            sum1 = _mm256_fmadd_ps(_mm256_load_ps(row1.add(c)), xv, sum1);
-            sum2 = _mm256_fmadd_ps(_mm256_load_ps(row2.add(c)), xv, sum2);
-            sum3 = _mm256_fmadd_ps(_mm256_load_ps(row3.add(c)), xv, sum3);
+        let mut c = 0;
+        while c + LANES <= cols {
+            let xv = load8(x.add(c));
+            sum0 += load8(row0.add(c)) * xv;
+            sum1 += load8(row1.add(c)) * xv;
+            sum2 += load8(row2.add(c)) * xv;
+            sum3 += load8(row3.add(c)) * xv;
+            c += LANES;
         }
 
-        *y.add(r) = hsum_avx(sum0);
-        *y.add(r + 1) = hsum_avx(sum1);
-        *y.add(r + 2) = hsum_avx(sum2);
-        *y.add(r + 3) = hsum_avx(sum3);
+        let mut out0 = sum0.reduce_add();
+        let mut out1 = sum1.reduce_add();
+        let mut out2 = sum2.reduce_add();
+        let mut out3 = sum3.reduce_add();
+
+        while c < cols {
+            let xv = *x.add(c);
+            out0 += *row0.add(c) * xv;
+            out1 += *row1.add(c) * xv;
+            out2 += *row2.add(c) * xv;
+            out3 += *row3.add(c) * xv;
+            c += 1;
+        }
+
+        *y.add(r) = out0;
+        *y.add(r + 1) = out1;
+        *y.add(r + 2) = out2;
+        *y.add(r + 3) = out3;
+
         r += 4;
     }
 
-    // Handle remaining rows
     while r < rows {
         *y.add(r) = dot_avx(a.add(r * cols), x, cols);
         r += 1;
     }
 }
 
-/// Matrix-vector multiply with transposed matrix: y = A^T @ x
-/// A is (rows, cols) row-major, we compute A^T @ x = (cols, rows) @ (rows,) = (cols,)
+/// Matrix-vector multiply with transposed matrix: y = A^T @ x.
 #[inline(always)]
-pub unsafe fn gemv_t_avx(
-    a: *const f32, // (rows, cols) row-major
-    x: *const f32, // (rows,)
-    y: *mut f32,   // (cols,)
-    rows: usize,
-    cols: usize,
-) {
-    debug_assert!(cols % 8 == 0);
-
-    // Zero output
-    for c in (0..cols).step_by(8) {
-        _mm256_store_ps(y.add(c), _mm256_setzero_ps());
+pub unsafe fn gemv_t_avx(a: *const f32, x: *const f32, y: *mut f32, rows: usize, cols: usize) {
+    let mut c = 0;
+    while c + LANES <= cols {
+        store8(y.add(c), f32x8::ZERO);
+        c += LANES;
+    }
+    while c < cols {
+        *y.add(c) = 0.0;
+        c += 1;
     }
 
-    // Accumulate A[r, :] * x[r] for each row
     for r in 0..rows {
-        let row_ptr = a.add(r * cols);
-        let x_r = _mm256_set1_ps(*x.add(r));
+        let x_r = f32x8::splat(*x.add(r));
+        let row = a.add(r * cols);
 
-        for c in (0..cols).step_by(8) {
-            let a_vec = _mm256_load_ps(row_ptr.add(c));
-            let y_vec = _mm256_load_ps(y.add(c));
-            let result = _mm256_fmadd_ps(a_vec, x_r, y_vec);
-            _mm256_store_ps(y.add(c), result);
+        let mut c = 0;
+        while c + LANES <= cols {
+            let yv = load8(y.add(c));
+            let av = load8(row.add(c));
+            store8(y.add(c), yv + av * x_r);
+            c += LANES;
+        }
+
+        while c < cols {
+            *y.add(c) += *row.add(c) * *x.add(r);
+            c += 1;
         }
     }
 }
 
-/// Element-wise multiply: y = a * b
+/// Element-wise multiply: y = a * b.
 #[inline(always)]
 pub unsafe fn mul_avx(a: *const f32, b: *const f32, y: *mut f32, len: usize) {
     let mut i = 0;
-    while i + 8 <= len {
-        let av = _mm256_load_ps(a.add(i));
-        let bv = _mm256_load_ps(b.add(i));
-        _mm256_store_ps(y.add(i), _mm256_mul_ps(av, bv));
-        i += 8;
+    while i + LANES <= len {
+        store8(y.add(i), load8(a.add(i)) * load8(b.add(i)));
+        i += LANES;
     }
-    // Scalar remainder
     while i < len {
         *y.add(i) = *a.add(i) * *b.add(i);
         i += 1;
     }
 }
 
-/// Element-wise add: y = a + b
+/// Element-wise add: y = a + b.
 #[inline(always)]
 pub unsafe fn add_avx(a: *const f32, b: *const f32, y: *mut f32, len: usize) {
     let mut i = 0;
-    while i + 8 <= len {
-        let av = _mm256_load_ps(a.add(i));
-        let bv = _mm256_load_ps(b.add(i));
-        _mm256_store_ps(y.add(i), _mm256_add_ps(av, bv));
-        i += 8;
+    while i + LANES <= len {
+        store8(y.add(i), load8(a.add(i)) + load8(b.add(i)));
+        i += LANES;
     }
     while i < len {
         *y.add(i) = *a.add(i) + *b.add(i);
@@ -368,16 +168,16 @@ pub unsafe fn add_avx(a: *const f32, b: *const f32, y: *mut f32, len: usize) {
     }
 }
 
-/// Element-wise fused multiply-add: y = a * b + c
+/// Element-wise fused multiply-add: y = a * b + c.
 #[inline(always)]
 pub unsafe fn fma_avx(a: *const f32, b: *const f32, c: *const f32, y: *mut f32, len: usize) {
     let mut i = 0;
-    while i + 8 <= len {
-        let av = _mm256_load_ps(a.add(i));
-        let bv = _mm256_load_ps(b.add(i));
-        let cv = _mm256_load_ps(c.add(i));
-        _mm256_store_ps(y.add(i), _mm256_fmadd_ps(av, bv, cv));
-        i += 8;
+    while i + LANES <= len {
+        let av = load8(a.add(i));
+        let bv = load8(b.add(i));
+        let cv = load8(c.add(i));
+        store8(y.add(i), av.mul_add(bv, cv));
+        i += LANES;
     }
     while i < len {
         *y.add(i) = *a.add(i) * *b.add(i) + *c.add(i);
@@ -385,16 +185,16 @@ pub unsafe fn fma_avx(a: *const f32, b: *const f32, c: *const f32, y: *mut f32, 
     }
 }
 
-/// Scaled add: y = y + scale * x
+/// Scaled add: y = y + scale * x.
 #[inline(always)]
 pub unsafe fn scaled_add_avx(y: *mut f32, x: *const f32, scale: f32, len: usize) {
-    let scale_v = _mm256_set1_ps(scale);
+    let scale_v = f32x8::splat(scale);
     let mut i = 0;
-    while i + 8 <= len {
-        let yv = _mm256_load_ps(y.add(i));
-        let xv = _mm256_load_ps(x.add(i));
-        _mm256_store_ps(y.add(i), _mm256_fmadd_ps(xv, scale_v, yv));
-        i += 8;
+    while i + LANES <= len {
+        let yv = load8(y.add(i));
+        let xv = load8(x.add(i));
+        store8(y.add(i), scale_v.mul_add(xv, yv));
+        i += LANES;
     }
     while i < len {
         *y.add(i) += scale * *x.add(i);
@@ -402,14 +202,13 @@ pub unsafe fn scaled_add_avx(y: *mut f32, x: *const f32, scale: f32, len: usize)
     }
 }
 
-/// Copy: dst = src
+/// Copy: dst = src.
 #[inline(always)]
 pub unsafe fn copy(src: *const f32, dst: *mut f32, len: usize) {
     std::ptr::copy_nonoverlapping(src, dst, len);
 }
 
-/// Token shift: out = x + mix * (prev - x)
-/// Equivalent to: out = (1 - mix) * x + mix * prev = lerp(x, prev, mix)
+/// Token shift: out = x + mix * (prev - x).
 #[inline(always)]
 pub unsafe fn token_shift_avx(
     x: *const f32,
@@ -419,22 +218,16 @@ pub unsafe fn token_shift_avx(
     len: usize,
 ) {
     let mut i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        let pv = _mm256_load_ps(prev.add(i));
-        let mv = _mm256_load_ps(mix.add(i));
-
-        // out = x + mix * (prev - x) = x + mix*prev - mix*x
-        let diff = _mm256_sub_ps(pv, xv);
-        let result = _mm256_fmadd_ps(mv, diff, xv);
-        _mm256_store_ps(out.add(i), result);
-        i += 8;
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        let pv = load8(prev.add(i));
+        let mv = load8(mix.add(i));
+        store8(out.add(i), mv.mul_add(pv - xv, xv));
+        i += LANES;
     }
     while i < len {
         let xi = *x.add(i);
-        let pi = *prev.add(i);
-        let mi = *mix.add(i);
-        *out.add(i) = xi + mi * (pi - xi);
+        *out.add(i) = xi + *mix.add(i) * (*prev.add(i) - xi);
         i += 1;
     }
 }
@@ -459,43 +252,36 @@ pub unsafe fn token_shift_multi6_avx(
     len: usize,
 ) {
     let mut i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        let pv = _mm256_load_ps(prev.add(i));
-        let diff = _mm256_sub_ps(pv, xv);
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        let diff = load8(prev.add(i)) - xv;
 
-        let m0 = _mm256_load_ps(mix0.add(i));
-        let m1 = _mm256_load_ps(mix1.add(i));
-        let m2 = _mm256_load_ps(mix2.add(i));
-        let m3 = _mm256_load_ps(mix3.add(i));
-        let m4 = _mm256_load_ps(mix4.add(i));
-        let m5 = _mm256_load_ps(mix5.add(i));
+        store8(out0.add(i), load8(mix0.add(i)).mul_add(diff, xv));
+        store8(out1.add(i), load8(mix1.add(i)).mul_add(diff, xv));
+        store8(out2.add(i), load8(mix2.add(i)).mul_add(diff, xv));
+        store8(out3.add(i), load8(mix3.add(i)).mul_add(diff, xv));
+        store8(out4.add(i), load8(mix4.add(i)).mul_add(diff, xv));
+        store8(out5.add(i), load8(mix5.add(i)).mul_add(diff, xv));
 
-        _mm256_store_ps(out0.add(i), _mm256_fmadd_ps(m0, diff, xv));
-        _mm256_store_ps(out1.add(i), _mm256_fmadd_ps(m1, diff, xv));
-        _mm256_store_ps(out2.add(i), _mm256_fmadd_ps(m2, diff, xv));
-        _mm256_store_ps(out3.add(i), _mm256_fmadd_ps(m3, diff, xv));
-        _mm256_store_ps(out4.add(i), _mm256_fmadd_ps(m4, diff, xv));
-        _mm256_store_ps(out5.add(i), _mm256_fmadd_ps(m5, diff, xv));
-        i += 8;
+        i += LANES;
     }
 
     while i < len {
         let xi = *x.add(i);
-        let pi = *prev.add(i);
-        let d = pi - xi;
+        let d = *prev.add(i) - xi;
+
         *out0.add(i) = xi + *mix0.add(i) * d;
         *out1.add(i) = xi + *mix1.add(i) * d;
         *out2.add(i) = xi + *mix2.add(i) * d;
         *out3.add(i) = xi + *mix3.add(i) * d;
         *out4.add(i) = xi + *mix4.add(i) * d;
         *out5.add(i) = xi + *mix5.add(i) * d;
+
         i += 1;
     }
 }
 
-/// Layer normalization: y = (x - mean) / sqrt(var + eps) * weight + bias
-/// Uses population variance (divide by N, not N-1).
+/// Layer normalization: y = (x - mean) / sqrt(var + eps) * weight + bias.
 #[inline(always)]
 pub unsafe fn layer_norm_avx(
     x: *const f32,
@@ -505,56 +291,52 @@ pub unsafe fn layer_norm_avx(
     len: usize,
     eps: f32,
 ) {
-    // Compute mean
-    let mut sum = _mm256_setzero_ps();
+    let mut sum = f32x8::ZERO;
     let mut i = 0;
-    while i + 8 <= len {
-        sum = _mm256_add_ps(sum, _mm256_load_ps(x.add(i)));
-        i += 8;
+
+    while i + LANES <= len {
+        sum += load8(x.add(i));
+        i += LANES;
     }
-    let mut mean = hsum_avx(sum);
-    // Handle remainder
+
+    let mut mean = sum.reduce_add();
     while i < len {
         mean += *x.add(i);
         i += 1;
     }
     mean /= len as f32;
-    let mean_v = _mm256_set1_ps(mean);
 
-    // Compute variance = mean((x - mean)^2)
-    let mut var_sum = _mm256_setzero_ps();
+    let mean_v = f32x8::splat(mean);
+
+    let mut var_sum = f32x8::ZERO;
     i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        let diff = _mm256_sub_ps(xv, mean_v);
-        var_sum = _mm256_fmadd_ps(diff, diff, var_sum);
-        i += 8;
+    while i + LANES <= len {
+        let d = load8(x.add(i)) - mean_v;
+        var_sum += d * d;
+        i += LANES;
     }
-    let mut var = hsum_avx(var_sum);
+
+    let mut var = var_sum.reduce_add();
     while i < len {
-        let diff = *x.add(i) - mean;
-        var += diff * diff;
+        let d = *x.add(i) - mean;
+        var += d * d;
         i += 1;
     }
     var /= len as f32;
 
-    // Normalize: y = (x - mean) / sqrt(var + eps) * weight + bias
     let inv_std = 1.0 / (var + eps).sqrt();
-    let inv_std_v = _mm256_set1_ps(inv_std);
+    let inv_std_v = f32x8::splat(inv_std);
 
     i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        let wv = _mm256_load_ps(weight.add(i));
-        let bv = _mm256_load_ps(bias.add(i));
-
-        let centered = _mm256_sub_ps(xv, mean_v);
-        let normed = _mm256_mul_ps(centered, inv_std_v);
-        let result = _mm256_fmadd_ps(normed, wv, bv);
-
-        _mm256_store_ps(y.add(i), result);
-        i += 8;
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        let wv = load8(weight.add(i));
+        let bv = load8(bias.add(i));
+        let out = ((xv - mean_v) * inv_std_v).mul_add(wv, bv);
+        store8(y.add(i), out);
+        i += LANES;
     }
+
     while i < len {
         let normed = (*x.add(i) - mean) * inv_std;
         *y.add(i) = normed * *weight.add(i) + *bias.add(i);
@@ -562,8 +344,7 @@ pub unsafe fn layer_norm_avx(
     }
 }
 
-/// Group normalization for RWKV7 (groups = num_heads, elements per group = head_dim).
-/// Input shape is (groups * group_size), normalize within each group.
+/// Group normalization for RWKV7.
 #[inline(always)]
 pub unsafe fn group_norm_avx(
     x: *const f32,
@@ -581,55 +362,52 @@ pub unsafe fn group_norm_avx(
         let b_g = bias.add(offset);
         let y_g = y.add(offset);
 
-        // Mean within group
-        let mut sum = _mm256_setzero_ps();
+        let mut sum = f32x8::ZERO;
         let mut i = 0;
-        while i + 8 <= group_size {
-            sum = _mm256_add_ps(sum, _mm256_load_ps(x_g.add(i)));
-            i += 8;
+
+        while i + LANES <= group_size {
+            sum += load8(x_g.add(i));
+            i += LANES;
         }
-        let mut mean = hsum_avx(sum);
+
+        let mut mean = sum.reduce_add();
         while i < group_size {
             mean += *x_g.add(i);
             i += 1;
         }
         mean /= group_size as f32;
-        let mean_v = _mm256_set1_ps(mean);
 
-        // Variance within group
-        let mut var_sum = _mm256_setzero_ps();
+        let mean_v = f32x8::splat(mean);
+
+        let mut var_sum = f32x8::ZERO;
         i = 0;
-        while i + 8 <= group_size {
-            let xv = _mm256_load_ps(x_g.add(i));
-            let diff = _mm256_sub_ps(xv, mean_v);
-            var_sum = _mm256_fmadd_ps(diff, diff, var_sum);
-            i += 8;
+        while i + LANES <= group_size {
+            let d = load8(x_g.add(i)) - mean_v;
+            var_sum += d * d;
+            i += LANES;
         }
-        let mut var = hsum_avx(var_sum);
+
+        let mut var = var_sum.reduce_add();
         while i < group_size {
-            let diff = *x_g.add(i) - mean;
-            var += diff * diff;
+            let d = *x_g.add(i) - mean;
+            var += d * d;
             i += 1;
         }
         var /= group_size as f32;
 
         let inv_std = 1.0 / (var + eps).sqrt();
-        let inv_std_v = _mm256_set1_ps(inv_std);
+        let inv_std_v = f32x8::splat(inv_std);
 
-        // Normalize
         i = 0;
-        while i + 8 <= group_size {
-            let xv = _mm256_load_ps(x_g.add(i));
-            let wv = _mm256_load_ps(w_g.add(i));
-            let bv = _mm256_load_ps(b_g.add(i));
-
-            let centered = _mm256_sub_ps(xv, mean_v);
-            let normed = _mm256_mul_ps(centered, inv_std_v);
-            let result = _mm256_fmadd_ps(normed, wv, bv);
-
-            _mm256_store_ps(y_g.add(i), result);
-            i += 8;
+        while i + LANES <= group_size {
+            let xv = load8(x_g.add(i));
+            let wv = load8(w_g.add(i));
+            let bv = load8(b_g.add(i));
+            let out = ((xv - mean_v) * inv_std_v).mul_add(wv, bv);
+            store8(y_g.add(i), out);
+            i += LANES;
         }
+
         while i < group_size {
             let normed = (*x_g.add(i) - mean) * inv_std;
             *y_g.add(i) = normed * *w_g.add(i) + *b_g.add(i);
@@ -638,86 +416,79 @@ pub unsafe fn group_norm_avx(
     }
 }
 
-/// Sigmoid: y = 1 / (1 + exp(-x))
+/// Sigmoid: y = 1 / (1 + exp(-x)).
 #[inline(always)]
 pub unsafe fn sigmoid_avx(x: *const f32, y: *mut f32, len: usize) {
-    let ones = _mm256_set1_ps(1.0);
-    let twos = _mm256_set1_ps(2.0);
-    let zeros = _mm256_setzero_ps();
+    let ones = f32x8::ONE;
+
     let mut i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        let neg = _mm256_sub_ps(zeros, xv);
-        let exp_neg = exp256_ps(neg);
-        let denom = _mm256_add_ps(ones, exp_neg);
-        let mut recip = _mm256_rcp_ps(denom);
-        recip = _mm256_mul_ps(recip, _mm256_sub_ps(twos, _mm256_mul_ps(denom, recip)));
-        _mm256_store_ps(y.add(i), recip);
-        i += 8;
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        let out = ones / (ones + (-xv).exp());
+        store8(y.add(i), out);
+        i += LANES;
     }
+
     while i < len {
-        let v = *x.add(i);
-        *y.add(i) = 1.0 / (1.0 + (-v).exp());
+        let xv = *x.add(i);
+        *y.add(i) = 1.0 / (1.0 + (-xv).exp());
         i += 1;
     }
 }
 
-/// Tanh: y = tanh(x)
+/// Tanh: y = tanh(x).
 #[inline(always)]
 pub unsafe fn tanh_avx(x: *const f32, y: *mut f32, len: usize) {
-    let ones = _mm256_set1_ps(1.0);
-    let twos = _mm256_set1_ps(2.0);
-    let minus_two = _mm256_set1_ps(-2.0);
+    let ones = f32x8::ONE;
+    let two = f32x8::splat(2.0);
+
     let mut i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        let neg2x = _mm256_mul_ps(minus_two, xv);
-        let exp_neg2x = exp256_ps(neg2x);
-        let numer = _mm256_sub_ps(ones, exp_neg2x);
-        let denom = _mm256_add_ps(ones, exp_neg2x);
-        let mut recip = _mm256_rcp_ps(denom);
-        recip = _mm256_mul_ps(recip, _mm256_sub_ps(twos, _mm256_mul_ps(denom, recip)));
-        let tanh = _mm256_mul_ps(numer, recip);
-        _mm256_store_ps(y.add(i), tanh);
-        i += 8;
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        let exp_neg_2x = (-xv * two).exp();
+        let out = (ones - exp_neg_2x) / (ones + exp_neg_2x);
+        store8(y.add(i), out);
+        i += LANES;
     }
+
     while i < len {
         *y.add(i) = (*x.add(i)).tanh();
         i += 1;
     }
 }
 
-/// In-place transform: x = exp(-x * scale)
+/// In-place transform: x = exp(-x * scale).
 #[inline(always)]
 pub unsafe fn exp_neg_scaled_inplace(x: *mut f32, scale: f32, len: usize) {
-    let scale_v = _mm256_set1_ps(-scale);
+    let neg_scale = f32x8::splat(-scale);
     let mut i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        let scaled = _mm256_mul_ps(xv, scale_v);
-        let expv = exp256_ps(scaled);
-        _mm256_store_ps(x.add(i), expv);
-        i += 8;
+
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        store8(x.add(i), (xv * neg_scale).exp());
+        i += LANES;
     }
+
     while i < len {
-        let ptr = x.add(i);
-        let val = *ptr;
-        *ptr = (-val * scale).exp();
+        let v = *x.add(i);
+        *x.add(i) = (-v * scale).exp();
         i += 1;
     }
 }
 
-/// ReLU squared: y = max(0, x)^2
+/// ReLU squared: y = max(0, x)^2.
 #[inline(always)]
 pub unsafe fn relu_squared_avx(x: *const f32, y: *mut f32, len: usize) {
-    let zero = _mm256_setzero_ps();
+    let zero = f32x8::ZERO;
     let mut i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        let relu = _mm256_max_ps(xv, zero);
-        _mm256_store_ps(y.add(i), _mm256_mul_ps(relu, relu));
-        i += 8;
+
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        let relu = xv.fast_max(zero);
+        store8(y.add(i), relu * relu);
+        i += LANES;
     }
+
     while i < len {
         let v = (*x.add(i)).max(0.0);
         *y.add(i) = v * v;
@@ -725,392 +496,227 @@ pub unsafe fn relu_squared_avx(x: *const f32, y: *mut f32, len: usize) {
     }
 }
 
-/// exp(x) element-wise
-#[inline]
+/// exp(x) element-wise.
+#[inline(always)]
 pub unsafe fn exp_scalar(x: *const f32, y: *mut f32, len: usize) {
-    for i in 0..len {
+    let mut i = 0;
+
+    while i + LANES <= len {
+        store8(y.add(i), load8(x.add(i)).exp());
+        i += LANES;
+    }
+
+    while i < len {
         *y.add(i) = (*x.add(i)).exp();
+        i += 1;
     }
 }
 
-/// L2 norm of a vector
+/// L2 norm of a vector.
 #[inline(always)]
 pub unsafe fn l2_norm_avx(x: *const f32, len: usize) -> f32 {
-    let mut sum = _mm256_setzero_ps();
+    let mut sum = f32x8::ZERO;
     let mut i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        sum = _mm256_fmadd_ps(xv, xv, sum);
-        i += 8;
+
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        sum += xv * xv;
+        i += LANES;
     }
-    let mut result = hsum_avx(sum);
+
+    let mut out = sum.reduce_add();
     while i < len {
-        result += (*x.add(i)) * (*x.add(i));
+        let xv = *x.add(i);
+        out += xv * xv;
         i += 1;
     }
-    result.sqrt()
+
+    out.sqrt()
 }
 
 /// Normalize vector to unit length (L2), with min norm threshold.
 #[inline(always)]
 pub unsafe fn l2_normalize_avx(x: *const f32, y: *mut f32, len: usize, min_norm: f32) {
     let norm = l2_norm_avx(x, len).max(min_norm);
-    let inv_norm = 1.0 / norm;
-    let inv_norm_v = _mm256_set1_ps(inv_norm);
+    let inv = f32x8::splat(1.0 / norm);
 
     let mut i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        _mm256_store_ps(y.add(i), _mm256_mul_ps(xv, inv_norm_v));
-        i += 8;
+    while i + LANES <= len {
+        store8(y.add(i), load8(x.add(i)) * inv);
+        i += LANES;
     }
+
     while i < len {
-        *y.add(i) = *x.add(i) * inv_norm;
+        *y.add(i) = *x.add(i) / norm;
         i += 1;
     }
 }
 
 /// RWKV7 state update kernel for single token, N=64 head dimension.
-/// Implements: S = S * w.T - S @ kk * (kk*a).T + v * k.T; y = S @ r
-///
-/// This is the critical inner kernel - must be maximally optimized.
-/// Processes 4 rows at a time for better instruction-level parallelism.
 #[inline(always)]
 pub unsafe fn rwkv7_wkv_update_avx(
-    state: *mut f32, // (H, N, N) = H * 64 * 64 floats
-    w: *const f32,   // (H, N) decay
-    k: *const f32,   // (H, N) key (already scaled)
-    v: *const f32,   // (H, N) value
-    kk: *const f32,  // (H, N) normalized key
-    a: *const f32,   // (H, N) gate for subtraction term
-    r: *const f32,   // (H, N) receptance
-    y: *mut f32,     // (H, N) output
+    state: *mut f32,
+    w: *const f32,
+    k: *const f32,
+    v: *const f32,
+    kk: *const f32,
+    a: *const f32,
+    r: *const f32,
+    y: *mut f32,
     num_heads: usize,
-    head_dim: usize, // Must be 64
+    head_dim: usize,
 ) {
-    debug_assert_eq!(head_dim, 64);
-    const N: usize = 64;
+    debug_assert_eq!(head_dim, HEAD_DIM);
 
     for h in 0..num_heads {
-        let s_h = state.add(h * N * N);
-        let w_h = w.add(h * N);
-        let k_h = k.add(h * N);
-        let v_h = v.add(h * N);
-        let kk_h = kk.add(h * N);
-        let a_h = a.add(h * N);
-        let r_h = r.add(h * N);
-        let y_h = y.add(h * N);
+        let s_h = state.add(h * HEAD_DIM * HEAD_DIM);
+        let w_h = w.add(h * HEAD_DIM);
+        let k_h = k.add(h * HEAD_DIM);
+        let v_h = v.add(h * HEAD_DIM);
+        let kk_h = kk.add(h * HEAD_DIM);
+        let a_h = a.add(h * HEAD_DIM);
+        let r_h = r.add(h * HEAD_DIM);
+        let y_h = y.add(h * HEAD_DIM);
 
-        // Preload w, kk, r, k, a vectors (8 AVX registers each = 64 floats)
-        let w0 = _mm256_load_ps(w_h.add(0));
-        let w1 = _mm256_load_ps(w_h.add(8));
-        let w2 = _mm256_load_ps(w_h.add(16));
-        let w3 = _mm256_load_ps(w_h.add(24));
-        let w4 = _mm256_load_ps(w_h.add(32));
-        let w5 = _mm256_load_ps(w_h.add(40));
-        let w6 = _mm256_load_ps(w_h.add(48));
-        let w7 = _mm256_load_ps(w_h.add(56));
+        let w0 = load8(w_h.add(0));
+        let w1 = load8(w_h.add(8));
+        let w2 = load8(w_h.add(16));
+        let w3 = load8(w_h.add(24));
+        let w4 = load8(w_h.add(32));
+        let w5 = load8(w_h.add(40));
+        let w6 = load8(w_h.add(48));
+        let w7 = load8(w_h.add(56));
 
-        let kk0 = _mm256_load_ps(kk_h.add(0));
-        let kk1 = _mm256_load_ps(kk_h.add(8));
-        let kk2 = _mm256_load_ps(kk_h.add(16));
-        let kk3 = _mm256_load_ps(kk_h.add(24));
-        let kk4 = _mm256_load_ps(kk_h.add(32));
-        let kk5 = _mm256_load_ps(kk_h.add(40));
-        let kk6 = _mm256_load_ps(kk_h.add(48));
-        let kk7 = _mm256_load_ps(kk_h.add(56));
+        let k0 = load8(k_h.add(0));
+        let k1 = load8(k_h.add(8));
+        let k2 = load8(k_h.add(16));
+        let k3 = load8(k_h.add(24));
+        let k4 = load8(k_h.add(32));
+        let k5 = load8(k_h.add(40));
+        let k6 = load8(k_h.add(48));
+        let k7 = load8(k_h.add(56));
 
-        let r0 = _mm256_load_ps(r_h.add(0));
-        let r1 = _mm256_load_ps(r_h.add(8));
-        let r2 = _mm256_load_ps(r_h.add(16));
-        let r3 = _mm256_load_ps(r_h.add(24));
-        let r4 = _mm256_load_ps(r_h.add(32));
-        let r5 = _mm256_load_ps(r_h.add(40));
-        let r6 = _mm256_load_ps(r_h.add(48));
-        let r7 = _mm256_load_ps(r_h.add(56));
+        let kk0 = load8(kk_h.add(0));
+        let kk1 = load8(kk_h.add(8));
+        let kk2 = load8(kk_h.add(16));
+        let kk3 = load8(kk_h.add(24));
+        let kk4 = load8(kk_h.add(32));
+        let kk5 = load8(kk_h.add(40));
+        let kk6 = load8(kk_h.add(48));
+        let kk7 = load8(kk_h.add(56));
 
-        let k0 = _mm256_load_ps(k_h.add(0));
-        let k1 = _mm256_load_ps(k_h.add(8));
-        let k2 = _mm256_load_ps(k_h.add(16));
-        let k3 = _mm256_load_ps(k_h.add(24));
-        let k4 = _mm256_load_ps(k_h.add(32));
-        let k5 = _mm256_load_ps(k_h.add(40));
-        let k6 = _mm256_load_ps(k_h.add(48));
-        let k7 = _mm256_load_ps(k_h.add(56));
+        let a0 = load8(a_h.add(0));
+        let a1 = load8(a_h.add(8));
+        let a2 = load8(a_h.add(16));
+        let a3 = load8(a_h.add(24));
+        let a4 = load8(a_h.add(32));
+        let a5 = load8(a_h.add(40));
+        let a6 = load8(a_h.add(48));
+        let a7 = load8(a_h.add(56));
 
-        // Precompute kk*a
-        let a0 = _mm256_load_ps(a_h.add(0));
-        let a1 = _mm256_load_ps(a_h.add(8));
-        let a2 = _mm256_load_ps(a_h.add(16));
-        let a3 = _mm256_load_ps(a_h.add(24));
-        let a4 = _mm256_load_ps(a_h.add(32));
-        let a5 = _mm256_load_ps(a_h.add(40));
-        let a6 = _mm256_load_ps(a_h.add(48));
-        let a7 = _mm256_load_ps(a_h.add(56));
+        let kka0 = kk0 * a0;
+        let kka1 = kk1 * a1;
+        let kka2 = kk2 * a2;
+        let kka3 = kk3 * a3;
+        let kka4 = kk4 * a4;
+        let kka5 = kk5 * a5;
+        let kka6 = kk6 * a6;
+        let kka7 = kk7 * a7;
 
-        let kka0 = _mm256_mul_ps(kk0, a0);
-        let kka1 = _mm256_mul_ps(kk1, a1);
-        let kka2 = _mm256_mul_ps(kk2, a2);
-        let kka3 = _mm256_mul_ps(kk3, a3);
-        let kka4 = _mm256_mul_ps(kk4, a4);
-        let kka5 = _mm256_mul_ps(kk5, a5);
-        let kka6 = _mm256_mul_ps(kk6, a6);
-        let kka7 = _mm256_mul_ps(kk7, a7);
+        let r0 = load8(r_h.add(0));
+        let r1 = load8(r_h.add(8));
+        let r2 = load8(r_h.add(16));
+        let r3 = load8(r_h.add(24));
+        let r4 = load8(r_h.add(32));
+        let r5 = load8(r_h.add(40));
+        let r6 = load8(r_h.add(48));
+        let r7 = load8(r_h.add(56));
 
-        // Process 4 rows at a time for maximum ILP
-        let mut i = 0;
-        while i + 4 <= N {
-            let row0 = s_h.add(i * N);
-            let row1 = s_h.add((i + 1) * N);
-            let row2 = s_h.add((i + 2) * N);
-            let row3 = s_h.add((i + 3) * N);
+        for i in 0..HEAD_DIM {
+            let row = s_h.add(i * HEAD_DIM);
+            let v_i = f32x8::splat(*v_h.add(i));
 
-            // Prefetch next batch
-            if i + 7 < N {
-                prefetch_t0(s_h.add((i + 4) * N));
-                prefetch_t0(s_h.add((i + 4) * N).add(32));
-                prefetch_t0(s_h.add((i + 5) * N));
-                prefetch_t0(s_h.add((i + 5) * N).add(32));
-                prefetch_t0(s_h.add((i + 6) * N));
-                prefetch_t0(s_h.add((i + 6) * N).add(32));
-                prefetch_t0(s_h.add((i + 7) * N));
-                prefetch_t0(s_h.add((i + 7) * N).add(32));
-            }
+            let s0 = load8(row.add(0)) * w0;
+            let s1 = load8(row.add(8)) * w1;
+            let s2 = load8(row.add(16)) * w2;
+            let s3 = load8(row.add(24)) * w3;
+            let s4 = load8(row.add(32)) * w4;
+            let s5 = load8(row.add(40)) * w5;
+            let s6 = load8(row.add(48)) * w6;
+            let s7 = load8(row.add(56)) * w7;
 
-            // Load all 4 rows' first half
-            let s00 = _mm256_mul_ps(_mm256_load_ps(row0.add(0)), w0);
-            let s01 = _mm256_mul_ps(_mm256_load_ps(row0.add(8)), w1);
-            let s02 = _mm256_mul_ps(_mm256_load_ps(row0.add(16)), w2);
-            let s03 = _mm256_mul_ps(_mm256_load_ps(row0.add(24)), w3);
-            let s04 = _mm256_mul_ps(_mm256_load_ps(row0.add(32)), w4);
-            let s05 = _mm256_mul_ps(_mm256_load_ps(row0.add(40)), w5);
-            let s06 = _mm256_mul_ps(_mm256_load_ps(row0.add(48)), w6);
-            let s07 = _mm256_mul_ps(_mm256_load_ps(row0.add(56)), w7);
+            let mut dot_acc = s0 * kk0;
+            dot_acc = s1.mul_add(kk1, dot_acc);
+            dot_acc = s2.mul_add(kk2, dot_acc);
+            dot_acc = s3.mul_add(kk3, dot_acc);
+            dot_acc = s4.mul_add(kk4, dot_acc);
+            dot_acc = s5.mul_add(kk5, dot_acc);
+            dot_acc = s6.mul_add(kk6, dot_acc);
+            dot_acc = s7.mul_add(kk7, dot_acc);
 
-            let s10 = _mm256_mul_ps(_mm256_load_ps(row1.add(0)), w0);
-            let s11 = _mm256_mul_ps(_mm256_load_ps(row1.add(8)), w1);
-            let s12 = _mm256_mul_ps(_mm256_load_ps(row1.add(16)), w2);
-            let s13 = _mm256_mul_ps(_mm256_load_ps(row1.add(24)), w3);
-            let s14 = _mm256_mul_ps(_mm256_load_ps(row1.add(32)), w4);
-            let s15 = _mm256_mul_ps(_mm256_load_ps(row1.add(40)), w5);
-            let s16 = _mm256_mul_ps(_mm256_load_ps(row1.add(48)), w6);
-            let s17 = _mm256_mul_ps(_mm256_load_ps(row1.add(56)), w7);
+            let t = f32x8::splat(dot_acc.reduce_add());
 
-            let s20 = _mm256_mul_ps(_mm256_load_ps(row2.add(0)), w0);
-            let s21 = _mm256_mul_ps(_mm256_load_ps(row2.add(8)), w1);
-            let s22 = _mm256_mul_ps(_mm256_load_ps(row2.add(16)), w2);
-            let s23 = _mm256_mul_ps(_mm256_load_ps(row2.add(24)), w3);
-            let s24 = _mm256_mul_ps(_mm256_load_ps(row2.add(32)), w4);
-            let s25 = _mm256_mul_ps(_mm256_load_ps(row2.add(40)), w5);
-            let s26 = _mm256_mul_ps(_mm256_load_ps(row2.add(48)), w6);
-            let s27 = _mm256_mul_ps(_mm256_load_ps(row2.add(56)), w7);
+            let u0 = (v_i * k0) + (s0 - t * kka0);
+            let u1 = (v_i * k1) + (s1 - t * kka1);
+            let u2 = (v_i * k2) + (s2 - t * kka2);
+            let u3 = (v_i * k3) + (s3 - t * kka3);
+            let u4 = (v_i * k4) + (s4 - t * kka4);
+            let u5 = (v_i * k5) + (s5 - t * kka5);
+            let u6 = (v_i * k6) + (s6 - t * kka6);
+            let u7 = (v_i * k7) + (s7 - t * kka7);
 
-            let s30 = _mm256_mul_ps(_mm256_load_ps(row3.add(0)), w0);
-            let s31 = _mm256_mul_ps(_mm256_load_ps(row3.add(8)), w1);
-            let s32 = _mm256_mul_ps(_mm256_load_ps(row3.add(16)), w2);
-            let s33 = _mm256_mul_ps(_mm256_load_ps(row3.add(24)), w3);
-            let s34 = _mm256_mul_ps(_mm256_load_ps(row3.add(32)), w4);
-            let s35 = _mm256_mul_ps(_mm256_load_ps(row3.add(40)), w5);
-            let s36 = _mm256_mul_ps(_mm256_load_ps(row3.add(48)), w6);
-            let s37 = _mm256_mul_ps(_mm256_load_ps(row3.add(56)), w7);
+            store8(row.add(0), u0);
+            store8(row.add(8), u1);
+            store8(row.add(16), u2);
+            store8(row.add(24), u3);
+            store8(row.add(32), u4);
+            store8(row.add(40), u5);
+            store8(row.add(48), u6);
+            store8(row.add(56), u7);
 
-            // Compute dot products with kk for all 4 rows
-            let mut d0 = _mm256_mul_ps(s00, kk0);
-            d0 = _mm256_fmadd_ps(s01, kk1, d0);
-            d0 = _mm256_fmadd_ps(s02, kk2, d0);
-            d0 = _mm256_fmadd_ps(s03, kk3, d0);
-            d0 = _mm256_fmadd_ps(s04, kk4, d0);
-            d0 = _mm256_fmadd_ps(s05, kk5, d0);
-            d0 = _mm256_fmadd_ps(s06, kk6, d0);
-            d0 = _mm256_fmadd_ps(s07, kk7, d0);
+            let mut y_acc = u0 * r0;
+            y_acc = u1.mul_add(r1, y_acc);
+            y_acc = u2.mul_add(r2, y_acc);
+            y_acc = u3.mul_add(r3, y_acc);
+            y_acc = u4.mul_add(r4, y_acc);
+            y_acc = u5.mul_add(r5, y_acc);
+            y_acc = u6.mul_add(r6, y_acc);
+            y_acc = u7.mul_add(r7, y_acc);
 
-            let mut d1 = _mm256_mul_ps(s10, kk0);
-            d1 = _mm256_fmadd_ps(s11, kk1, d1);
-            d1 = _mm256_fmadd_ps(s12, kk2, d1);
-            d1 = _mm256_fmadd_ps(s13, kk3, d1);
-            d1 = _mm256_fmadd_ps(s14, kk4, d1);
-            d1 = _mm256_fmadd_ps(s15, kk5, d1);
-            d1 = _mm256_fmadd_ps(s16, kk6, d1);
-            d1 = _mm256_fmadd_ps(s17, kk7, d1);
-
-            let mut d2 = _mm256_mul_ps(s20, kk0);
-            d2 = _mm256_fmadd_ps(s21, kk1, d2);
-            d2 = _mm256_fmadd_ps(s22, kk2, d2);
-            d2 = _mm256_fmadd_ps(s23, kk3, d2);
-            d2 = _mm256_fmadd_ps(s24, kk4, d2);
-            d2 = _mm256_fmadd_ps(s25, kk5, d2);
-            d2 = _mm256_fmadd_ps(s26, kk6, d2);
-            d2 = _mm256_fmadd_ps(s27, kk7, d2);
-
-            let mut d3 = _mm256_mul_ps(s30, kk0);
-            d3 = _mm256_fmadd_ps(s31, kk1, d3);
-            d3 = _mm256_fmadd_ps(s32, kk2, d3);
-            d3 = _mm256_fmadd_ps(s33, kk3, d3);
-            d3 = _mm256_fmadd_ps(s34, kk4, d3);
-            d3 = _mm256_fmadd_ps(s35, kk5, d3);
-            d3 = _mm256_fmadd_ps(s36, kk6, d3);
-            d3 = _mm256_fmadd_ps(s37, kk7, d3);
-
-            // Horizontal sums
-            let t0 = _mm256_set1_ps(hsum_avx(d0));
-            let t1 = _mm256_set1_ps(hsum_avx(d1));
-            let t2 = _mm256_set1_ps(hsum_avx(d2));
-            let t3 = _mm256_set1_ps(hsum_avx(d3));
-
-            // v scalars
-            let v0 = _mm256_set1_ps(*v_h.add(i));
-            let v1 = _mm256_set1_ps(*v_h.add(i + 1));
-            let v2 = _mm256_set1_ps(*v_h.add(i + 2));
-            let v3 = _mm256_set1_ps(*v_h.add(i + 3));
-
-            // Update: s = s - tmp * kka + v * k
-            let s00 = _mm256_fmadd_ps(v0, k0, _mm256_fnmadd_ps(t0, kka0, s00));
-            let s01 = _mm256_fmadd_ps(v0, k1, _mm256_fnmadd_ps(t0, kka1, s01));
-            let s02 = _mm256_fmadd_ps(v0, k2, _mm256_fnmadd_ps(t0, kka2, s02));
-            let s03 = _mm256_fmadd_ps(v0, k3, _mm256_fnmadd_ps(t0, kka3, s03));
-            let s04 = _mm256_fmadd_ps(v0, k4, _mm256_fnmadd_ps(t0, kka4, s04));
-            let s05 = _mm256_fmadd_ps(v0, k5, _mm256_fnmadd_ps(t0, kka5, s05));
-            let s06 = _mm256_fmadd_ps(v0, k6, _mm256_fnmadd_ps(t0, kka6, s06));
-            let s07 = _mm256_fmadd_ps(v0, k7, _mm256_fnmadd_ps(t0, kka7, s07));
-
-            let s10 = _mm256_fmadd_ps(v1, k0, _mm256_fnmadd_ps(t1, kka0, s10));
-            let s11 = _mm256_fmadd_ps(v1, k1, _mm256_fnmadd_ps(t1, kka1, s11));
-            let s12 = _mm256_fmadd_ps(v1, k2, _mm256_fnmadd_ps(t1, kka2, s12));
-            let s13 = _mm256_fmadd_ps(v1, k3, _mm256_fnmadd_ps(t1, kka3, s13));
-            let s14 = _mm256_fmadd_ps(v1, k4, _mm256_fnmadd_ps(t1, kka4, s14));
-            let s15 = _mm256_fmadd_ps(v1, k5, _mm256_fnmadd_ps(t1, kka5, s15));
-            let s16 = _mm256_fmadd_ps(v1, k6, _mm256_fnmadd_ps(t1, kka6, s16));
-            let s17 = _mm256_fmadd_ps(v1, k7, _mm256_fnmadd_ps(t1, kka7, s17));
-
-            let s20 = _mm256_fmadd_ps(v2, k0, _mm256_fnmadd_ps(t2, kka0, s20));
-            let s21 = _mm256_fmadd_ps(v2, k1, _mm256_fnmadd_ps(t2, kka1, s21));
-            let s22 = _mm256_fmadd_ps(v2, k2, _mm256_fnmadd_ps(t2, kka2, s22));
-            let s23 = _mm256_fmadd_ps(v2, k3, _mm256_fnmadd_ps(t2, kka3, s23));
-            let s24 = _mm256_fmadd_ps(v2, k4, _mm256_fnmadd_ps(t2, kka4, s24));
-            let s25 = _mm256_fmadd_ps(v2, k5, _mm256_fnmadd_ps(t2, kka5, s25));
-            let s26 = _mm256_fmadd_ps(v2, k6, _mm256_fnmadd_ps(t2, kka6, s26));
-            let s27 = _mm256_fmadd_ps(v2, k7, _mm256_fnmadd_ps(t2, kka7, s27));
-
-            let s30 = _mm256_fmadd_ps(v3, k0, _mm256_fnmadd_ps(t3, kka0, s30));
-            let s31 = _mm256_fmadd_ps(v3, k1, _mm256_fnmadd_ps(t3, kka1, s31));
-            let s32 = _mm256_fmadd_ps(v3, k2, _mm256_fnmadd_ps(t3, kka2, s32));
-            let s33 = _mm256_fmadd_ps(v3, k3, _mm256_fnmadd_ps(t3, kka3, s33));
-            let s34 = _mm256_fmadd_ps(v3, k4, _mm256_fnmadd_ps(t3, kka4, s34));
-            let s35 = _mm256_fmadd_ps(v3, k5, _mm256_fnmadd_ps(t3, kka5, s35));
-            let s36 = _mm256_fmadd_ps(v3, k6, _mm256_fnmadd_ps(t3, kka6, s36));
-            let s37 = _mm256_fmadd_ps(v3, k7, _mm256_fnmadd_ps(t3, kka7, s37));
-
-            // Store updated state
-            _mm256_store_ps(row0.add(0), s00);
-            _mm256_store_ps(row0.add(8), s01);
-            _mm256_store_ps(row0.add(16), s02);
-            _mm256_store_ps(row0.add(24), s03);
-            _mm256_store_ps(row0.add(32), s04);
-            _mm256_store_ps(row0.add(40), s05);
-            _mm256_store_ps(row0.add(48), s06);
-            _mm256_store_ps(row0.add(56), s07);
-
-            _mm256_store_ps(row1.add(0), s10);
-            _mm256_store_ps(row1.add(8), s11);
-            _mm256_store_ps(row1.add(16), s12);
-            _mm256_store_ps(row1.add(24), s13);
-            _mm256_store_ps(row1.add(32), s14);
-            _mm256_store_ps(row1.add(40), s15);
-            _mm256_store_ps(row1.add(48), s16);
-            _mm256_store_ps(row1.add(56), s17);
-
-            _mm256_store_ps(row2.add(0), s20);
-            _mm256_store_ps(row2.add(8), s21);
-            _mm256_store_ps(row2.add(16), s22);
-            _mm256_store_ps(row2.add(24), s23);
-            _mm256_store_ps(row2.add(32), s24);
-            _mm256_store_ps(row2.add(40), s25);
-            _mm256_store_ps(row2.add(48), s26);
-            _mm256_store_ps(row2.add(56), s27);
-
-            _mm256_store_ps(row3.add(0), s30);
-            _mm256_store_ps(row3.add(8), s31);
-            _mm256_store_ps(row3.add(16), s32);
-            _mm256_store_ps(row3.add(24), s33);
-            _mm256_store_ps(row3.add(32), s34);
-            _mm256_store_ps(row3.add(40), s35);
-            _mm256_store_ps(row3.add(48), s36);
-            _mm256_store_ps(row3.add(56), s37);
-
-            // Compute y = s @ r
-            let mut y0 = _mm256_mul_ps(s00, r0);
-            y0 = _mm256_fmadd_ps(s01, r1, y0);
-            y0 = _mm256_fmadd_ps(s02, r2, y0);
-            y0 = _mm256_fmadd_ps(s03, r3, y0);
-            y0 = _mm256_fmadd_ps(s04, r4, y0);
-            y0 = _mm256_fmadd_ps(s05, r5, y0);
-            y0 = _mm256_fmadd_ps(s06, r6, y0);
-            y0 = _mm256_fmadd_ps(s07, r7, y0);
-
-            let mut y1 = _mm256_mul_ps(s10, r0);
-            y1 = _mm256_fmadd_ps(s11, r1, y1);
-            y1 = _mm256_fmadd_ps(s12, r2, y1);
-            y1 = _mm256_fmadd_ps(s13, r3, y1);
-            y1 = _mm256_fmadd_ps(s14, r4, y1);
-            y1 = _mm256_fmadd_ps(s15, r5, y1);
-            y1 = _mm256_fmadd_ps(s16, r6, y1);
-            y1 = _mm256_fmadd_ps(s17, r7, y1);
-
-            let mut y2 = _mm256_mul_ps(s20, r0);
-            y2 = _mm256_fmadd_ps(s21, r1, y2);
-            y2 = _mm256_fmadd_ps(s22, r2, y2);
-            y2 = _mm256_fmadd_ps(s23, r3, y2);
-            y2 = _mm256_fmadd_ps(s24, r4, y2);
-            y2 = _mm256_fmadd_ps(s25, r5, y2);
-            y2 = _mm256_fmadd_ps(s26, r6, y2);
-            y2 = _mm256_fmadd_ps(s27, r7, y2);
-
-            let mut y3 = _mm256_mul_ps(s30, r0);
-            y3 = _mm256_fmadd_ps(s31, r1, y3);
-            y3 = _mm256_fmadd_ps(s32, r2, y3);
-            y3 = _mm256_fmadd_ps(s33, r3, y3);
-            y3 = _mm256_fmadd_ps(s34, r4, y3);
-            y3 = _mm256_fmadd_ps(s35, r5, y3);
-            y3 = _mm256_fmadd_ps(s36, r6, y3);
-            y3 = _mm256_fmadd_ps(s37, r7, y3);
-
-            *y_h.add(i) = hsum_avx(y0);
-            *y_h.add(i + 1) = hsum_avx(y1);
-            *y_h.add(i + 2) = hsum_avx(y2);
-            *y_h.add(i + 3) = hsum_avx(y3);
-
-            i += 4;
+            *y_h.add(i) = y_acc.reduce_add();
         }
     }
 }
+
 /// Softmax: computes softmax(x) and stores in y.
 /// Returns log(sum(exp(x - max))).
 #[inline(always)]
 pub unsafe fn softmax_avx(x: *const f32, y: *mut f32, len: usize) -> f32 {
-    // Find max
-    let mut max_v = _mm256_set1_ps(f32::NEG_INFINITY);
     let mut i = 0;
-    while i + 8 <= len {
-        let xv = _mm256_load_ps(x.add(i));
-        max_v = _mm256_max_ps(max_v, xv);
-        i += 8;
+    let mut max_v = f32x8::splat(f32::NEG_INFINITY);
+
+    while i + LANES <= len {
+        max_v = max_v.fast_max(load8(x.add(i)));
+        i += LANES;
     }
-    // Reduce max_v
-    let max128 = _mm_max_ps(
-        _mm256_extractf128_ps(max_v, 1),
-        _mm256_castps256_ps128(max_v),
-    );
-    let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
-    let max32 = _mm_max_ss(max64, _mm_shuffle_ps(max64, max64, 0x55));
-    let mut max_val = _mm_cvtss_f32(max32);
+
+    let mut max_val = reduce_max(max_v);
     while i < len {
         max_val = max_val.max(*x.add(i));
         i += 1;
     }
 
-    // Compute exp(x - max) and sum
+    let max_vec = f32x8::splat(max_val);
+
     let mut sum = 0.0f32;
     i = 0;
+    while i + LANES <= len {
+        let exp_v = (load8(x.add(i)) - max_vec).exp();
+        store8(y.add(i), exp_v);
+        sum += exp_v.reduce_add();
+        i += LANES;
+    }
+
     while i < len {
         let exp_val = (*x.add(i) - max_val).exp();
         *y.add(i) = exp_val;
@@ -1118,19 +724,538 @@ pub unsafe fn softmax_avx(x: *const f32, y: *mut f32, len: usize) -> f32 {
         i += 1;
     }
 
-    // Normalize
-    let inv_sum = 1.0 / sum;
-    let inv_sum_v = _mm256_set1_ps(inv_sum);
+    let inv_sum = f32x8::splat(1.0 / sum);
     i = 0;
-    while i + 8 <= len {
-        let yv = _mm256_load_ps(y.add(i));
-        _mm256_store_ps(y.add(i), _mm256_mul_ps(yv, inv_sum_v));
-        i += 8;
+
+    while i + LANES <= len {
+        store8(y.add(i), load8(y.add(i)) * inv_sum);
+        i += LANES;
     }
+
     while i < len {
-        *y.add(i) *= inv_sum;
+        *y.add(i) /= sum;
         i += 1;
     }
 
     sum.ln() + max_val
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Lcg {
+        state: u64,
+    }
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_f32(&mut self) -> f32 {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let v = (self.state >> 32) as u32;
+            (v as f32) * (1.0 / (u32::MAX as f32))
+        }
+
+        fn centered(&mut self, scale: f32) -> f32 {
+            (self.next_f32() - 0.5) * 2.0 * scale
+        }
+    }
+
+    fn fill_centered(buf: &mut [f32], rng: &mut Lcg, scale: f32) {
+        for v in buf {
+            *v = rng.centered(scale);
+        }
+    }
+
+    fn assert_close_slice(lhs: &[f32], rhs: &[f32], tol: f32) {
+        assert_eq!(lhs.len(), rhs.len());
+        for i in 0..lhs.len() {
+            let d = (lhs[i] - rhs[i]).abs();
+            assert!(
+                d <= tol,
+                "index={i} lhs={} rhs={} abs_diff={d} tol={tol}",
+                lhs[i],
+                rhs[i]
+            );
+        }
+    }
+
+    fn gemv_scalar(a: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut y = vec![0.0; rows];
+        for r in 0..rows {
+            let mut s = 0.0;
+            for c in 0..cols {
+                s += a[r * cols + c] * x[c];
+            }
+            y[r] = s;
+        }
+        y
+    }
+
+    fn gemv_t_scalar(a: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut y = vec![0.0; cols];
+        for r in 0..rows {
+            let xr = x[r];
+            for c in 0..cols {
+                y[c] += a[r * cols + c] * xr;
+            }
+        }
+        y
+    }
+
+    fn layer_norm_scalar(x: &[f32], w: &[f32], b: &[f32], eps: f32) -> Vec<f32> {
+        let n = x.len() as f32;
+        let mean = x.iter().sum::<f32>() / n;
+        let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        let mut out = vec![0.0; x.len()];
+        for i in 0..x.len() {
+            out[i] = ((x[i] - mean) * inv_std) * w[i] + b[i];
+        }
+        out
+    }
+
+    fn group_norm_scalar(
+        x: &[f32],
+        w: &[f32],
+        b: &[f32],
+        groups: usize,
+        group_size: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0; x.len()];
+        for g in 0..groups {
+            let start = g * group_size;
+            let end = start + group_size;
+            let xg = &x[start..end];
+            let wg = &w[start..end];
+            let bg = &b[start..end];
+            let n = group_size as f32;
+            let mean = xg.iter().sum::<f32>() / n;
+            let var = xg.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+            let inv_std = 1.0 / (var + eps).sqrt();
+            for i in 0..group_size {
+                out[start + i] = ((xg[i] - mean) * inv_std) * wg[i] + bg[i];
+            }
+        }
+        out
+    }
+
+    fn token_shift_scalar(x: &[f32], prev: &[f32], mix: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0; x.len()];
+        for i in 0..x.len() {
+            out[i] = x[i] + mix[i] * (prev[i] - x[i]);
+        }
+        out
+    }
+
+    fn rwkv_update_scalar(
+        state: &mut [f32],
+        w: &[f32],
+        k: &[f32],
+        v: &[f32],
+        kk: &[f32],
+        a: &[f32],
+        r: &[f32],
+        y: &mut [f32],
+        num_heads: usize,
+    ) {
+        const N: usize = 64;
+        for h in 0..num_heads {
+            let state_base = h * N * N;
+            let vec_base = h * N;
+            for i in 0..N {
+                let row_base = state_base + i * N;
+                for j in 0..N {
+                    state[row_base + j] *= w[vec_base + j];
+                }
+
+                let mut dot = 0.0;
+                for j in 0..N {
+                    dot += state[row_base + j] * kk[vec_base + j];
+                }
+
+                let vi = v[vec_base + i];
+                for j in 0..N {
+                    state[row_base + j] = state[row_base + j]
+                        - dot * (kk[vec_base + j] * a[vec_base + j])
+                        + vi * k[vec_base + j];
+                }
+
+                let mut yi = 0.0;
+                for j in 0..N {
+                    yi += state[row_base + j] * r[vec_base + j];
+                }
+                y[vec_base + i] = yi;
+            }
+        }
+    }
+
+    #[test]
+    fn gemv_and_norm_match_scalar_reference() {
+        let mut rng = Lcg::new(0xBAD5EED);
+
+        let rows = 11;
+        let cols = 37;
+        let mut a = vec![0.0; rows * cols];
+        let mut x = vec![0.0; cols];
+        let mut x_t = vec![0.0; rows];
+        fill_centered(&mut a, &mut rng, 0.75);
+        fill_centered(&mut x, &mut rng, 0.5);
+        fill_centered(&mut x_t, &mut rng, 0.5);
+
+        let mut y = vec![0.0; rows];
+        unsafe { gemv_avx(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), rows, cols) };
+        let y_ref = gemv_scalar(&a, &x, rows, cols);
+        assert_close_slice(&y, &y_ref, 2.5e-5);
+
+        let mut yt = vec![0.0; cols];
+        unsafe { gemv_t_avx(a.as_ptr(), x_t.as_ptr(), yt.as_mut_ptr(), rows, cols) };
+        let yt_ref = gemv_t_scalar(&a, &x_t, rows, cols);
+        assert_close_slice(&yt, &yt_ref, 2.5e-5);
+
+        let ln_len = 137;
+        let mut ln_x = vec![0.0; ln_len];
+        let mut ln_w = vec![0.0; ln_len];
+        let mut ln_b = vec![0.0; ln_len];
+        fill_centered(&mut ln_x, &mut rng, 0.85);
+        fill_centered(&mut ln_w, &mut rng, 0.4);
+        fill_centered(&mut ln_b, &mut rng, 0.3);
+
+        let mut ln_out = vec![0.0; ln_len];
+        unsafe {
+            layer_norm_avx(
+                ln_x.as_ptr(),
+                ln_w.as_ptr(),
+                ln_b.as_ptr(),
+                ln_out.as_mut_ptr(),
+                ln_len,
+                1e-5,
+            )
+        };
+        let ln_ref = layer_norm_scalar(&ln_x, &ln_w, &ln_b, 1e-5);
+        assert_close_slice(&ln_out, &ln_ref, 2.5e-5);
+
+        let groups = 5;
+        let group_size = 26;
+        let gn_len = groups * group_size;
+        let mut gn_x = vec![0.0; gn_len];
+        let mut gn_w = vec![0.0; gn_len];
+        let mut gn_b = vec![0.0; gn_len];
+        fill_centered(&mut gn_x, &mut rng, 0.7);
+        fill_centered(&mut gn_w, &mut rng, 0.45);
+        fill_centered(&mut gn_b, &mut rng, 0.2);
+
+        let mut gn_out = vec![0.0; gn_len];
+        unsafe {
+            group_norm_avx(
+                gn_x.as_ptr(),
+                gn_w.as_ptr(),
+                gn_b.as_ptr(),
+                gn_out.as_mut_ptr(),
+                groups,
+                group_size,
+                1e-5,
+            )
+        };
+        let gn_ref = group_norm_scalar(&gn_x, &gn_w, &gn_b, groups, group_size, 1e-5);
+        assert_close_slice(&gn_out, &gn_ref, 2.5e-5);
+    }
+
+    #[test]
+    fn elementwise_and_softmax_match_scalar_reference() {
+        let mut rng = Lcg::new(0xA11CE55);
+        let len = 145;
+
+        let mut a = vec![0.0; len];
+        let mut b = vec![0.0; len];
+        let mut c = vec![0.0; len];
+        fill_centered(&mut a, &mut rng, 0.95);
+        fill_centered(&mut b, &mut rng, 0.6);
+        fill_centered(&mut c, &mut rng, 0.25);
+
+        let mut mul = vec![0.0; len];
+        let mut add = vec![0.0; len];
+        let mut fma = vec![0.0; len];
+        let mut sig = vec![0.0; len];
+        let mut tanh = vec![0.0; len];
+        let mut relu2 = vec![0.0; len];
+        let mut exp = vec![0.0; len];
+        let mut soft = vec![0.0; len];
+
+        unsafe {
+            mul_avx(a.as_ptr(), b.as_ptr(), mul.as_mut_ptr(), len);
+            add_avx(a.as_ptr(), b.as_ptr(), add.as_mut_ptr(), len);
+            fma_avx(a.as_ptr(), b.as_ptr(), c.as_ptr(), fma.as_mut_ptr(), len);
+            sigmoid_avx(a.as_ptr(), sig.as_mut_ptr(), len);
+            tanh_avx(a.as_ptr(), tanh.as_mut_ptr(), len);
+            relu_squared_avx(a.as_ptr(), relu2.as_mut_ptr(), len);
+            exp_scalar(a.as_ptr(), exp.as_mut_ptr(), len);
+        }
+        let lse = unsafe { softmax_avx(a.as_ptr(), soft.as_mut_ptr(), len) };
+
+        let mut mul_ref = vec![0.0; len];
+        let mut add_ref = vec![0.0; len];
+        let mut fma_ref = vec![0.0; len];
+        let mut sig_ref = vec![0.0; len];
+        let mut tanh_ref = vec![0.0; len];
+        let mut relu2_ref = vec![0.0; len];
+        let mut exp_ref = vec![0.0; len];
+
+        let mut max_val = f32::NEG_INFINITY;
+        for &v in &a {
+            max_val = max_val.max(v);
+        }
+        let mut sum_exp = 0.0;
+        let mut soft_ref = vec![0.0; len];
+
+        for i in 0..len {
+            mul_ref[i] = a[i] * b[i];
+            add_ref[i] = a[i] + b[i];
+            fma_ref[i] = a[i] * b[i] + c[i];
+            sig_ref[i] = 1.0 / (1.0 + (-a[i]).exp());
+            tanh_ref[i] = a[i].tanh();
+            let relu = a[i].max(0.0);
+            relu2_ref[i] = relu * relu;
+            exp_ref[i] = a[i].exp();
+
+            let e = (a[i] - max_val).exp();
+            soft_ref[i] = e;
+            sum_exp += e;
+        }
+        for v in &mut soft_ref {
+            *v /= sum_exp;
+        }
+
+        assert_close_slice(&mul, &mul_ref, 2.5e-5);
+        assert_close_slice(&add, &add_ref, 2.5e-5);
+        assert_close_slice(&fma, &fma_ref, 2.5e-5);
+        assert_close_slice(&sig, &sig_ref, 2.5e-5);
+        assert_close_slice(&tanh, &tanh_ref, 2.5e-5);
+        assert_close_slice(&relu2, &relu2_ref, 2.5e-5);
+        assert_close_slice(&exp, &exp_ref, 2.5e-5);
+        assert_close_slice(&soft, &soft_ref, 2.5e-5);
+        assert!((lse - (sum_exp.ln() + max_val)).abs() <= 2.5e-5);
+    }
+
+    #[test]
+    fn token_shift_kernels_match_scalar_reference() {
+        let mut rng = Lcg::new(0x71F7_5EED);
+        let len = 131;
+
+        let mut x = vec![0.0; len];
+        let mut prev = vec![0.0; len];
+        let mut mix0 = vec![0.0; len];
+        let mut mix1 = vec![0.0; len];
+        let mut mix2 = vec![0.0; len];
+        let mut mix3 = vec![0.0; len];
+        let mut mix4 = vec![0.0; len];
+        let mut mix5 = vec![0.0; len];
+
+        fill_centered(&mut x, &mut rng, 0.8);
+        fill_centered(&mut prev, &mut rng, 0.8);
+        fill_centered(&mut mix0, &mut rng, 1.0);
+        fill_centered(&mut mix1, &mut rng, 1.0);
+        fill_centered(&mut mix2, &mut rng, 1.0);
+        fill_centered(&mut mix3, &mut rng, 1.0);
+        fill_centered(&mut mix4, &mut rng, 1.0);
+        fill_centered(&mut mix5, &mut rng, 1.0);
+
+        let mut out_single = vec![0.0; len];
+        unsafe {
+            token_shift_avx(
+                x.as_ptr(),
+                prev.as_ptr(),
+                mix0.as_ptr(),
+                out_single.as_mut_ptr(),
+                len,
+            )
+        };
+        let single_ref = token_shift_scalar(&x, &prev, &mix0);
+        assert_close_slice(&out_single, &single_ref, 2.5e-5);
+
+        let mut out0 = vec![0.0; len];
+        let mut out1 = vec![0.0; len];
+        let mut out2 = vec![0.0; len];
+        let mut out3 = vec![0.0; len];
+        let mut out4 = vec![0.0; len];
+        let mut out5 = vec![0.0; len];
+
+        unsafe {
+            token_shift_multi6_avx(
+                x.as_ptr(),
+                prev.as_ptr(),
+                mix0.as_ptr(),
+                mix1.as_ptr(),
+                mix2.as_ptr(),
+                mix3.as_ptr(),
+                mix4.as_ptr(),
+                mix5.as_ptr(),
+                out0.as_mut_ptr(),
+                out1.as_mut_ptr(),
+                out2.as_mut_ptr(),
+                out3.as_mut_ptr(),
+                out4.as_mut_ptr(),
+                out5.as_mut_ptr(),
+                len,
+            )
+        };
+
+        let ref0 = token_shift_scalar(&x, &prev, &mix0);
+        let ref1 = token_shift_scalar(&x, &prev, &mix1);
+        let ref2 = token_shift_scalar(&x, &prev, &mix2);
+        let ref3 = token_shift_scalar(&x, &prev, &mix3);
+        let ref4 = token_shift_scalar(&x, &prev, &mix4);
+        let ref5 = token_shift_scalar(&x, &prev, &mix5);
+
+        assert_close_slice(&out0, &ref0, 2.5e-5);
+        assert_close_slice(&out1, &ref1, 2.5e-5);
+        assert_close_slice(&out2, &ref2, 2.5e-5);
+        assert_close_slice(&out3, &ref3, 2.5e-5);
+        assert_close_slice(&out4, &ref4, 2.5e-5);
+        assert_close_slice(&out5, &ref5, 2.5e-5);
+    }
+
+    #[test]
+    fn rwkv_update_matches_scalar_reference() {
+        let num_heads = 3;
+        let mut rng = Lcg::new(0xFACEFEED);
+
+        let mut state = vec![0.0; num_heads * HEAD_DIM * HEAD_DIM];
+        let mut state_ref = vec![0.0; num_heads * HEAD_DIM * HEAD_DIM];
+        let mut w = vec![0.0; num_heads * HEAD_DIM];
+        let mut k = vec![0.0; num_heads * HEAD_DIM];
+        let mut v = vec![0.0; num_heads * HEAD_DIM];
+        let mut kk = vec![0.0; num_heads * HEAD_DIM];
+        let mut a = vec![0.0; num_heads * HEAD_DIM];
+        let mut r = vec![0.0; num_heads * HEAD_DIM];
+        let mut y = vec![0.0; num_heads * HEAD_DIM];
+        let mut y_ref = vec![0.0; num_heads * HEAD_DIM];
+
+        fill_centered(&mut state, &mut rng, 0.4);
+        state_ref.copy_from_slice(&state);
+        fill_centered(&mut w, &mut rng, 0.2);
+        fill_centered(&mut k, &mut rng, 0.3);
+        fill_centered(&mut v, &mut rng, 0.3);
+        fill_centered(&mut kk, &mut rng, 0.25);
+        fill_centered(&mut a, &mut rng, 0.5);
+        fill_centered(&mut r, &mut rng, 0.25);
+
+        unsafe {
+            rwkv7_wkv_update_avx(
+                state.as_mut_ptr(),
+                w.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                kk.as_ptr(),
+                a.as_ptr(),
+                r.as_ptr(),
+                y.as_mut_ptr(),
+                num_heads,
+                HEAD_DIM,
+            )
+        };
+
+        rwkv_update_scalar(
+            &mut state_ref,
+            &w,
+            &k,
+            &v,
+            &kk,
+            &a,
+            &r,
+            &mut y_ref,
+            num_heads,
+        );
+
+        assert_close_slice(&state, &state_ref, 5e-4);
+        assert_close_slice(&y, &y_ref, 5e-4);
+    }
+
+    #[test]
+    fn deterministic_kernel_snapshot() {
+        let num_heads = 2;
+        let mut rng = Lcg::new(0xDEC0DED);
+
+        let mut state = vec![0.0; num_heads * HEAD_DIM * HEAD_DIM];
+        let mut w = vec![0.0; num_heads * HEAD_DIM];
+        let mut k = vec![0.0; num_heads * HEAD_DIM];
+        let mut v = vec![0.0; num_heads * HEAD_DIM];
+        let mut kk = vec![0.0; num_heads * HEAD_DIM];
+        let mut a = vec![0.0; num_heads * HEAD_DIM];
+        let mut r = vec![0.0; num_heads * HEAD_DIM];
+        let mut y = vec![0.0; num_heads * HEAD_DIM];
+        fill_centered(&mut state, &mut rng, 0.4);
+        fill_centered(&mut w, &mut rng, 0.2);
+        fill_centered(&mut k, &mut rng, 0.3);
+        fill_centered(&mut v, &mut rng, 0.25);
+        fill_centered(&mut kk, &mut rng, 0.2);
+        fill_centered(&mut a, &mut rng, 0.35);
+        fill_centered(&mut r, &mut rng, 0.2);
+
+        unsafe {
+            rwkv7_wkv_update_avx(
+                state.as_mut_ptr(),
+                w.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                kk.as_ptr(),
+                a.as_ptr(),
+                r.as_ptr(),
+                y.as_mut_ptr(),
+                num_heads,
+                HEAD_DIM,
+            )
+        };
+
+        let mut sm = vec![0.0; HEAD_DIM];
+        let lse = unsafe { softmax_avx(y.as_ptr(), sm.as_mut_ptr(), HEAD_DIM) };
+
+        let mut normed = vec![0.0; HEAD_DIM];
+        unsafe { l2_normalize_avx(y.as_ptr(), normed.as_mut_ptr(), HEAD_DIM, 1e-6) };
+
+        let checksum = |data: &[f32]| -> f64 {
+            data.iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64 + 1.0) * (v as f64))
+                .sum::<f64>()
+        };
+
+        let state_checksum = checksum(&state);
+        let y_checksum = checksum(&y);
+        let softmax_checksum = checksum(&sm);
+        let normed_checksum = checksum(&normed);
+        let lse_val = lse as f64;
+
+        let expected_state_checksum = 712.653_817_538_841_4_f64;
+        let expected_y_checksum = 3.817_787_693_347_782_f64;
+        let expected_softmax_checksum = 32.405_059_017_241_f64;
+        let expected_normed_checksum = -13.328_749_446_634_902_f64;
+        let expected_lse = 4.160_823_822_021_484_f64;
+
+        let tol = 2e-4_f64;
+        assert!(
+            (state_checksum - expected_state_checksum).abs() <= tol,
+            "state_checksum={state_checksum}"
+        );
+        assert!(
+            (y_checksum - expected_y_checksum).abs() <= tol,
+            "y_checksum={y_checksum}"
+        );
+        assert!(
+            (softmax_checksum - expected_softmax_checksum).abs() <= tol,
+            "softmax_checksum={softmax_checksum}"
+        );
+        assert!(
+            (normed_checksum - expected_normed_checksum).abs() <= tol,
+            "normed_checksum={normed_checksum}"
+        );
+        assert!((lse_val - expected_lse).abs() <= tol, "lse={lse_val}");
+    }
 }

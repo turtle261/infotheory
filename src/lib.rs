@@ -122,8 +122,31 @@ impl Default for RateBackend {
     }
 }
 
+#[cfg(feature = "backend-zpaq")]
 impl Default for CompressionBackend {
     fn default() -> Self {
+        CompressionBackend::Zpaq {
+            method: "5".to_string(),
+        }
+    }
+}
+
+#[cfg(all(not(feature = "backend-zpaq"), feature = "backend-rwkv"))]
+impl Default for CompressionBackend {
+    fn default() -> Self {
+        CompressionBackend::Rate {
+            rate_backend: RateBackend::default(),
+            coder: rwkvzip::CoderType::AC,
+            framing: compression::FramingMode::Raw,
+        }
+    }
+}
+
+#[cfg(all(not(feature = "backend-zpaq"), not(feature = "backend-rwkv")))]
+impl Default for CompressionBackend {
+    fn default() -> Self {
+        // No compression backend feature is enabled; keep a placeholder variant
+        // that maps to non-zpaq stubs without panicking.
         CompressionBackend::Zpaq {
             method: "5".to_string(),
         }
@@ -626,12 +649,72 @@ fn aligned_prefix<'a>(x: &'a [u8], y: &'a [u8]) -> (&'a [u8], &'a [u8]) {
     (&x[..n], &y[..n])
 }
 
+#[cfg(feature = "backend-zpaq")]
+#[inline(always)]
+fn zpaq_compress_size_bytes(data: &[u8], method: &str) -> u64 {
+    zpaq_rs::compress_size(data, method).unwrap_or(0)
+}
+
+#[cfg(not(feature = "backend-zpaq"))]
+#[inline(always)]
+fn zpaq_compress_size_bytes(_data: &[u8], _method: &str) -> u64 {
+    panic!("CompressionBackend::Zpaq is unavailable: build with feature 'backend-zpaq'")
+}
+
+#[cfg(feature = "backend-zpaq")]
+#[inline(always)]
+fn zpaq_compress_size_parallel_bytes(data: &[u8], method: &str, threads: usize) -> u64 {
+    zpaq_rs::compress_size_parallel(data, method, threads).unwrap_or(0)
+}
+
+#[cfg(not(feature = "backend-zpaq"))]
+#[inline(always)]
+fn zpaq_compress_size_parallel_bytes(_data: &[u8], _method: &str, _threads: usize) -> u64 {
+    panic!("CompressionBackend::Zpaq is unavailable: build with feature 'backend-zpaq'")
+}
+
+#[cfg(feature = "backend-zpaq")]
+#[inline(always)]
+fn zpaq_compress_size_stream<R: std::io::Read + Send>(reader: R, method: &str) -> u64 {
+    zpaq_rs::compress_size_stream(reader, method, None, None).unwrap_or(0)
+}
+
+#[cfg(not(feature = "backend-zpaq"))]
+#[inline(always)]
+fn zpaq_compress_size_stream<R: std::io::Read + Send>(_reader: R, _method: &str) -> u64 {
+    panic!("CompressionBackend::Zpaq is unavailable: build with feature 'backend-zpaq'")
+}
+
+#[cfg(feature = "backend-zpaq")]
+#[inline(always)]
+fn zpaq_compress_to_vec(data: &[u8], method: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(zpaq_rs::compress_to_vec(data, method)?)
+}
+
+#[cfg(not(feature = "backend-zpaq"))]
+#[inline(always)]
+fn zpaq_compress_to_vec(_data: &[u8], _method: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("zpaq backend disabled at compile time (enable feature 'backend-zpaq')")
+}
+
+#[cfg(feature = "backend-zpaq")]
+#[inline(always)]
+fn zpaq_decompress_to_vec(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    Ok(zpaq_rs::decompress_to_vec(data)?)
+}
+
+#[cfg(not(feature = "backend-zpaq"))]
+#[inline(always)]
+fn zpaq_decompress_to_vec(_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("zpaq backend disabled at compile time (enable feature 'backend-zpaq')")
+}
+
 /// ------- Base Compression Functions -------
 #[inline(always)]
 pub fn get_compressed_size(path: &str, method: &str) -> u64 {
     // Convert Input file to Vec<u8>, and reference that (compress_size only takes &[u8] input), and pass method.
     // Will panic if file does not exist, so it must be prevalidated.
-    zpaq_rs::compress_size(&std::fs::read(path).unwrap(), method).unwrap()
+    zpaq_compress_size_bytes(&std::fs::read(path).unwrap(), method)
 }
 
 pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
@@ -735,7 +818,7 @@ pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &CompressionBackend
     match backend {
         CompressionBackend::Zpaq { method } => {
             let r = SliceChainReader::new(parts);
-            zpaq_rs::compress_size_stream(r, method.as_str(), None, None).unwrap_or(0)
+            zpaq_compress_size_stream(r, method.as_str())
         }
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { model, coder } => {
@@ -755,9 +838,7 @@ pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &CompressionBackend
 
 pub fn compress_size_backend(data: &[u8], backend: &CompressionBackend) -> u64 {
     match backend {
-        CompressionBackend::Zpaq { method } => {
-            zpaq_rs::compress_size(data, method.as_str()).unwrap_or(0)
-        }
+        CompressionBackend::Zpaq { method } => zpaq_compress_size_bytes(data, method.as_str()),
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { model, coder } => {
             with_rwkv_tls(model, |c| c.compress_size(data, *coder).unwrap_or(0))
@@ -777,7 +858,7 @@ pub fn compress_bytes_backend(
     backend: &CompressionBackend,
 ) -> anyhow::Result<Vec<u8>> {
     match backend {
-        CompressionBackend::Zpaq { method } => Ok(zpaq_rs::compress_to_vec(data, method)?),
+        CompressionBackend::Zpaq { method } => zpaq_compress_to_vec(data, method),
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { model, coder } => {
             with_rwkv_tls(model, |c| c.compress(data, *coder)).map_err(Into::into)
@@ -796,7 +877,7 @@ pub fn decompress_bytes_backend(
     backend: &CompressionBackend,
 ) -> anyhow::Result<Vec<u8>> {
     match backend {
-        CompressionBackend::Zpaq { .. } => Ok(zpaq_rs::decompress_to_vec(input)?),
+        CompressionBackend::Zpaq { .. } => zpaq_decompress_to_vec(input),
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { model, .. } => {
             with_rwkv_tls(model, |c| c.decompress(input)).map_err(Into::into)
@@ -1125,7 +1206,7 @@ pub fn joint_entropy_rate_backend(
 pub fn get_compressed_size_parallel(path: &str, method: &str, threads: usize) -> u64 {
     // Convert Input file to Vec<u8>, and reference that (compress_size only takes &[u8] input), and pass method.
     // Will panic if file does not exist, so it must be prevalidated.
-    zpaq_rs::compress_size_parallel(&std::fs::read(path).unwrap(), method, threads).unwrap()
+    zpaq_compress_size_parallel_bytes(&std::fs::read(path).unwrap(), method, threads)
 }
 
 #[inline(always)]
@@ -1148,7 +1229,7 @@ pub fn get_sequential_compressed_sizes_from_sequential_paths(
     // For VERY large n (relative to threads) with small files (relative to memory) this may be useful.
     get_bytes_from_paths(paths)
         .par_iter()
-        .map(|data| zpaq_rs::compress_size(data, method).unwrap())
+        .map(|data| zpaq_compress_size_bytes(data, method))
         .collect()
 }
 
@@ -1163,7 +1244,7 @@ pub fn get_parallel_compressed_sizes_from_sequential_paths(
     // Balanced parallelization between RAYON_NUM_THREADS and ZPAQ `THREADS` const. For when total dataset will fit in memory.
     get_bytes_from_paths(paths)
         .par_iter()
-        .map(|data| zpaq_rs::compress_size_parallel(data, method, threads).unwrap())
+        .map(|data| zpaq_compress_size_parallel_bytes(data, method, threads))
         .collect()
 }
 
@@ -1240,7 +1321,7 @@ pub enum NcdVariant {
 
 #[inline(always)]
 fn compress_size_bytes(data: &[u8], method: &str) -> u64 {
-    zpaq_rs::compress_size(data, method).unwrap_or(0)
+    zpaq_compress_size_bytes(data, method)
 }
 
 #[inline(always)]
@@ -1941,6 +2022,7 @@ pub fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -
 mod tests {
     use super::*;
 
+    #[cfg(feature = "backend-zpaq")]
     #[test]
     fn ncd_basic_identity_nonnegative() {
         let x = b"abcdabcdabcd";
@@ -2029,6 +2111,14 @@ mod tests {
         let y = b"abc";
         let ctx = InfotheoryCtx::with_zpaq("5");
         assert_eq!(ctx.cross_entropy_bytes(empty, y, 0), 0.0);
+    }
+
+    #[cfg(not(feature = "backend-zpaq"))]
+    #[test]
+    #[should_panic(expected = "CompressionBackend::Zpaq is unavailable")]
+    fn zpaq_disabled_size_paths_fail_loudly() {
+        let backend = CompressionBackend::default();
+        let _ = compress_size_backend(b"abc", &backend);
     }
 
     #[test]

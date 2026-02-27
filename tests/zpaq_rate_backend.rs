@@ -1,6 +1,8 @@
+#[cfg(feature = "backend-zpaq")]
 use infotheory::{RateBackend, entropy_rate_backend};
 
 #[test]
+#[cfg(feature = "backend-zpaq")]
 fn zpaq_rate_backend_compresses_copy_data() {
     let mut data = Vec::new();
     let pattern = b"copy-like-pattern-";

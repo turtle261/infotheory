@@ -8,7 +8,7 @@
 //
 // - **Byte-level compression**: Operates directly on raw bytes (vocab_size=256)
 // - **Infinite context**: RWKV7's recurrent architecture maintains state indefinitely
-// - **x86_64 optimized**: AVX2/FMA SIMD throughout, no external BLAS dependencies
+// - **Portable SIMD optimized**: `wide`-based kernels with ISA-specific codegen
 // - **Correct-by-construction**: Information-theoretically sound implementation
 
 use anyhow::{Context, Result, bail};

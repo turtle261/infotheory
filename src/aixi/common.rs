@@ -87,22 +87,46 @@ pub fn observation_repr_from_stream(
 }
 
 /// A high-performance random number generator using the XorShift64* algorithm.
-///
-/// This generator is seeded using `zpaq_rs::random_bytes` to avoid external dependencies
-/// like the `rand` crate while using OS-provided entropy for the initial seed.
 #[derive(Clone, Copy)]
 pub struct RandomGenerator {
     state: u64,
 }
 
 impl RandomGenerator {
+    #[inline]
+    fn initial_seed() -> u64 {
+        #[cfg(feature = "backend-zpaq")]
+        {
+            if let Ok(bytes) = zpaq_rs::random_bytes(8) {
+                let mut seed_arr = [0u8; 8];
+                seed_arr.copy_from_slice(&bytes);
+                return u64::from_le_bytes(seed_arr);
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // `SystemTime::now()` is unavailable on `wasm32-unknown-unknown` without WASI.
+            return 0xCAFEBABEDEADBEEF ^ 0x9E3779B97F4A7C15;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0xCAFEBABEDEADBEEF);
+            return nanos ^ 0x9E3779B97F4A7C15;
+        }
+
+        #[allow(unreachable_code)]
+        0xCAFEBABEDEADBEEF
+    }
+
     /// Creates a new `RandomGenerator` with a fresh seed.
     pub fn new() -> Self {
-        // Seeding from zpaq_rs
-        let bytes = zpaq_rs::random_bytes(8).expect("Failed to get random seed");
-        let mut seed_arr = [0u8; 8];
-        seed_arr.copy_from_slice(&bytes);
-        let seed = u64::from_le_bytes(seed_arr);
+        let seed = Self::initial_seed();
         let state = if seed == 0 { 0xCAFEBABEDEADBEEF } else { seed };
         Self { state }
     }

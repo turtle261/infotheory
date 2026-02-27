@@ -1,12 +1,14 @@
 use infotheory::axioms;
 use infotheory::datagen;
+#[cfg(feature = "backend-zpaq")]
+use infotheory::{CompressionBackend, NcdVariant, ncd_bytes_backend};
 use infotheory::{
-    CompressionBackend, NcdVariant, RateBackend, entropy_rate_backend, marginal_entropy_bytes,
-    mutual_information_bytes, ncd_bytes_backend,
+    RateBackend, entropy_rate_backend, marginal_entropy_bytes, mutual_information_bytes,
 };
 
 const TOLERANCE_ENTROPY: f64 = 0.1;
 const TOLERANCE_MI: f64 = 0.2;
+#[cfg(feature = "backend-zpaq")]
 const TOLERANCE_NCD: f64 = 0.1;
 
 // ============================================================================
@@ -137,6 +139,7 @@ fn mi_identical_equals_entropy() {
 // ============================================================================
 
 #[test]
+#[cfg(feature = "backend-zpaq")]
 fn ncd_identity_is_zero() {
     let n = 2_000; // Smaller for compression speed
     let (x, y) = datagen::identical_pair(n, 42);
@@ -156,6 +159,7 @@ fn ncd_identity_is_zero() {
 }
 
 #[test]
+#[cfg(feature = "backend-zpaq")]
 fn ncd_independent_is_near_one() {
     let n = 2_000;
     let (x, y) = datagen::independent_pair(n, 12345, 67890);
@@ -173,6 +177,7 @@ fn ncd_independent_is_near_one() {
 }
 
 #[test]
+#[cfg(feature = "backend-zpaq")]
 fn ncd_triangle_inequality() {
     // x = random, y = x + noise, z = random
     // d(x,z) <= d(x,y) + d(y,z)

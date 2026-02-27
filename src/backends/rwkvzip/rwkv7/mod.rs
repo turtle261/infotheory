@@ -1,13 +1,14 @@
-//! High-performance RWKV7 inference kernel for x86_64.
+//! High-performance RWKV7 inference kernel.
 //!
-//! This module provides a highly optimized RWKV7 implementation specifically
-//! designed for x86_64 CPUs with AVX2/FMA support. No portability fallbacks.
+//! This module provides a portable SIMD RWKV7 implementation using `wide` so
+//! rustc/LLVM can pick the best ISA per target (x86_64, aarch64, wasm32 SIMD,
+//! or scalar fallback on non-SIMD CPUs).
 //!
 //! # Architecture
 //!
-//! - All matrix operations are SIMD-vectorized (AVX2 + FMA)
-//! - State updates use hand-tuned kernel for N=64 head dimension
-//! - Memory layout optimized for cache efficiency
+//! - Matrix/vector operations are vectorized via `wide` (`f32x8`)
+//! - State updates are optimized for RWKV7 head dimension N=64
+//! - Memory layout is cache-friendly and alignment-aware
 //! - No external BLAS dependencies
 
 mod kernel;

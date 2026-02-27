@@ -1,6 +1,6 @@
-//! RWKV7 model implementation with SIMD-optimized inference.
+//! RWKV7 model implementation with portable SIMD-optimized inference.
 //!
-//! This is a high-performance implementation specifically for x86_64 CPUs.
+//! This is a high-performance implementation built on `wide` kernels.
 //! Single-token inference is the primary use case (streaming compression).
 
 use anyhow::{Context, Result, bail};
@@ -59,7 +59,7 @@ impl Config {
             bail!("rwkv7 vocab_size must be > 0");
         }
         if self.head_dim != 64 {
-            bail!("rwkv7 head_dim must be 64 for current AVX2 kernels");
+            bail!("rwkv7 head_dim must be 64 for current kernels");
         }
         if self.hidden_size != self.num_heads * self.head_dim {
             bail!(
@@ -1401,6 +1401,13 @@ fn init_const(t: &mut Tensor1D, value: f32) {
 mod tests {
     use super::*;
 
+    fn weighted_checksum(data: &[f32]) -> f64 {
+        data.iter()
+            .enumerate()
+            .map(|(i, &v)| (i as f64 + 1.0) * (v as f64))
+            .sum()
+    }
+
     #[test]
     fn test_config_default() {
         let cfg = Config::default();
@@ -1409,5 +1416,77 @@ mod tests {
         assert_eq!(cfg.num_layers, 12);
         assert_eq!(cfg.num_heads, 4);
         assert_eq!(cfg.head_dim, 64);
+    }
+
+    #[test]
+    fn test_forward_deterministic_snapshot() {
+        let cfg = Config {
+            vocab_size: 256,
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 1,
+            head_dim: 64,
+            intermediate_size: 128,
+            layer_norm_eps: 1e-5,
+            group_norm_eps: 64e-5,
+            decay_low_rank: 16,
+            a_low_rank: 16,
+            v_low_rank: 16,
+            g_low_rank: 32,
+        };
+        cfg.validate().expect("valid test config");
+
+        let model = Model::new_random(cfg.clone(), 0x1234_5678_9ABC_DEF0).expect("random model");
+        let mut state = model.new_state();
+        let mut scratch = ScratchBuffers::new(&cfg);
+        let tokens = [0u32, 1, 7, 42, 255, 3, 128, 64, 17, 99];
+
+        let mut probes = Vec::new();
+        let mut last_logits = vec![0.0; 8];
+
+        for &token in &tokens {
+            let logits = model.forward(&mut scratch, token, &mut state);
+            probes.push(logits[0]);
+            probes.push(logits[1]);
+            probes.push(logits[2]);
+            probes.push(logits[42]);
+            probes.push(logits[127]);
+            probes.push(logits[255]);
+            last_logits.copy_from_slice(&logits[0..8]);
+        }
+
+        let probe_checksum = weighted_checksum(&probes);
+        let last_logits_checksum = weighted_checksum(&last_logits);
+        let state_att_checksum = weighted_checksum(state.layers[0].att_state.as_slice());
+        let state_prev_checksum = weighted_checksum(state.layers[1].att_x_prev.as_slice());
+        let v_first_checksum = weighted_checksum(state.v_first.as_slice());
+
+        let expected_probe_checksum = 25.674_567_410_722_375_f64;
+        let expected_last_logits_checksum = 0.679_873_816_668_987_3_f64;
+        let expected_state_att_checksum = 130.723_190_760_245_42_f64;
+        let expected_state_prev_checksum = -231.324_942_490_085_96_f64;
+        let expected_v_first_checksum = -1.921_361_377_462_744_7_f64;
+
+        let tol = 2e-4_f64;
+        assert!(
+            (probe_checksum - expected_probe_checksum).abs() <= tol,
+            "probe_checksum={probe_checksum}"
+        );
+        assert!(
+            (last_logits_checksum - expected_last_logits_checksum).abs() <= tol,
+            "last_logits_checksum={last_logits_checksum}"
+        );
+        assert!(
+            (state_att_checksum - expected_state_att_checksum).abs() <= tol,
+            "state_att_checksum={state_att_checksum}"
+        );
+        assert!(
+            (state_prev_checksum - expected_state_prev_checksum).abs() <= tol,
+            "state_prev_checksum={state_prev_checksum}"
+        );
+        assert!(
+            (v_first_checksum - expected_v_first_checksum).abs() <= tol,
+            "v_first_checksum={v_first_checksum}"
+        );
     }
 }
