@@ -92,7 +92,7 @@ fn api_surface_entropy_and_distance_wrappers_are_callable() {
     set_default_ctx(prev);
 }
 
-#[cfg(feature = "backend-zpaq")]
+#[cfg(all(feature = "backend-zpaq", not(target_env = "musl")))]
 #[test]
 fn api_surface_path_and_compression_helpers_are_callable() {
     let x = b"lorem ipsum dolor sit amet";

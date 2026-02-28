@@ -2,8 +2,11 @@
 
 use infotheory::{CompressionBackend, compress_bytes_backend, decompress_bytes_backend};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "cli")]
 use std::io::Write;
+#[cfg(feature = "cli")]
 use std::path::Path;
+#[cfg(feature = "cli")]
 use std::process::{Command, Stdio};
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -53,6 +56,7 @@ fn zpaq_roundtrip_fixture_b_and_hash_stability() {
     );
 }
 
+#[cfg(feature = "cli")]
 #[test]
 fn batch_metrics_output_hash_stability() {
     let Some(bin) = option_env!("CARGO_BIN_EXE_infotheory") else {
