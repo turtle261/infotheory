@@ -55,6 +55,29 @@ jobs:
           RUSTFLAGS="-D warnings" cargo check -p infotheory --features cli --locked
           RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features cli --locked
 
+      - name: Install coverage tooling
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Rust line coverage gate (CLI + library parity suite)
+        run: |
+          cargo llvm-cov -p infotheory --tests --features cli --locked --summary-only --fail-under-lines 50
+
+      - name: Rustdoc coverage gate
+        run: |
+          cargo +nightly rustdoc -p infotheory --all-features -- -Z unstable-options --show-coverage --output-format json > /tmp/rustdoc_cov.json
+          python - <<'PY'
+          import json, sys
+          data = json.load(open("/tmp/rustdoc_cov.json"))
+          files = data.get("files", data)
+          total = sum(v.get("total", 0) for v in files.values())
+          with_docs = sum(v.get("with_docs", 0) for v in files.values())
+          pct = 100.0 if total == 0 else (with_docs * 100.0 / total)
+          print(f"Rustdoc documented items: {with_docs}/{total} ({pct:.2f}%)")
+          if with_docs != total:
+              print("Rustdoc coverage gate failed (<100.0%).", file=sys.stderr)
+              sys.exit(1)
+          PY
+
       - name: Security audit
         run: |
           cargo install cargo-audit --locked

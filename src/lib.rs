@@ -72,18 +72,29 @@
 //! let mi_rate = mutual_information_bytes(x, y, 8);
 //! ```
 
+/// AIXI planning components, environments, and model abstractions.
 pub mod aixi;
+/// Core information-theoretic axioms and validation helpers.
 pub mod axioms;
+/// Entropy/compression backend implementations and backend discovery.
 pub mod backends;
+/// Entropy coder implementations (AC and rANS).
 pub mod coders;
 #[cfg(feature = "backend-rwkv")]
+/// Rate-coded compression helpers built on RWKV/CTW/ZPAQ backends.
 pub mod compression;
+/// Synthetic data generators for information-theory experiments.
 pub mod datagen;
+/// Online Bayesian/switching/MDL mixture predictors.
 pub mod mixture;
+/// CTW and FAC-CTW backend types.
 pub use backends::ctw;
+/// ROSA+ backend types.
 pub use backends::rosaplus;
 #[cfg(feature = "backend-rwkv")]
+/// RWKV backend types and compressor.
 pub use backends::rwkvzip;
+/// ZPAQ rate-model adapter.
 pub use backends::zpaq_rate;
 
 use rayon::prelude::*;
@@ -153,6 +164,9 @@ fn with_default_ctx<R>(f: impl FnOnce(&InfotheoryCtx) -> R) -> R {
     DEFAULT_CTX.with(|ctx| f(&ctx.borrow()))
 }
 
+/// Mutual information rate estimate under an explicit `backend`.
+///
+/// Inputs are aligned to the shared prefix length.
 pub fn mutual_information_rate_backend(
     x: &[u8],
     y: &[u8],
@@ -171,6 +185,9 @@ pub fn mutual_information_rate_backend(
     (h_x + h_y - h_xy).max(0.0)
 }
 
+/// Normalized entropy distance under an explicit `backend`.
+///
+/// Returns a value in `[0, 1]` after clamping.
 pub fn ned_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     if x.is_empty() {
@@ -188,6 +205,9 @@ pub fn ned_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBacken
     }
 }
 
+/// Normalized transform effort (variation-of-information form) under an explicit `backend`.
+///
+/// Returns a value in `[0, 2]` after clamping.
 pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     if x.is_empty() {
@@ -207,33 +227,45 @@ pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBacken
     }
 }
 
+/// Sequential entropy/rate backend used by context-aware metrics.
 #[derive(Clone)]
 pub enum RateBackend {
+    /// ROSA+ suffix-automaton estimator.
     RosaPlus,
     #[cfg(feature = "backend-rwkv")]
+    /// RWKV7 model loaded from explicit weights.
     Rwkv7 {
+        /// Loaded RWKV7 model.
         model: Arc<rwkvzip::Model>,
     },
     #[cfg(feature = "backend-rwkv")]
+    /// RWKV7 method string (e.g. `file:...` or `cfg:...`) resolved lazily.
     Rwkv7Method {
+        /// RWKV7 method string.
         method: String,
     },
     /// ZPAQ compression-based rate model (streamable methods only).
     Zpaq {
+        /// ZPAQ method string (streamable modes only for rate estimation).
         method: String,
     },
     /// Online mixture over rate-model experts (Bayes, fading Bayes, switching, MDL).
     Mixture {
+        /// Mixture expert/runtime specification.
         spec: Arc<MixtureSpec>,
     },
     /// Action-Conditional CTW (single context tree).
     Ctw {
+        /// Context tree depth.
         depth: usize,
     },
     /// Factorized Action-Conditional CTW (k trees for k-bit percepts).
     FacCtw {
+        /// Base context depth.
         base_depth: usize,
+        /// Number of percept bits.
         num_percept_bits: usize,
+        /// Encoding width in bits.
         encoding_bits: usize,
     },
 }
@@ -258,20 +290,30 @@ impl Default for RateBackend {
     }
 }
 
+/// Compression backend used by NCD/compression-size operations.
 #[derive(Clone)]
 pub enum CompressionBackend {
+    /// ZPAQ compressor with explicit method string.
     Zpaq {
+        /// ZPAQ method (for example `"1"` or `"5"`).
         method: String,
     },
     #[cfg(feature = "backend-rwkv")]
+    /// RWKV7 model as an entropy-coded compressor.
     Rwkv7 {
+        /// Loaded RWKV7 model.
         model: Arc<rwkvzip::Model>,
+        /// Entropy coder used for coding model PDFs.
         coder: rwkvzip::CoderType,
     },
     #[cfg(feature = "backend-rwkv")]
+    /// Generic rate-coded compressor wrapping an arbitrary rate backend.
     Rate {
+        /// Predictive rate backend.
         rate_backend: RateBackend,
+        /// Entropy coder used for coding model PDFs.
         coder: rwkvzip::CoderType,
+        /// Framing mode for output payloads.
         framing: compression::FramingMode,
     },
 }
@@ -279,35 +321,44 @@ pub enum CompressionBackend {
 /// Mixture policy kind for rate-backend mixtures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MixtureKind {
+    /// Standard Bayesian mixture with fixed expert weights.
     Bayes,
+    /// Bayesian mixture with exponential weight decay.
     FadingBayes,
+    /// Switching mixture with hazard `alpha`.
     Switching,
+    /// MDL-style best-expert selector.
     Mdl,
 }
 
 /// Expert specification for mixture backends.
 #[derive(Clone)]
 pub struct MixtureExpertSpec {
+    /// Optional expert display name.
     pub name: Option<String>,
     /// Log prior weight (natural log). Uniform priors can be `0.0`.
     pub log_prior: f64,
     /// Max order for ROSA experts (ignored for other backends).
     pub max_order: i64,
+    /// Underlying backend for this expert.
     pub backend: RateBackend,
 }
 
 /// Mixture specification for rate-backend mixtures.
 #[derive(Clone)]
 pub struct MixtureSpec {
+    /// Mixture policy.
     pub kind: MixtureKind,
     /// Switching probability (per step) for switching mixtures.
     pub alpha: f64,
     /// Decay factor for fading Bayes mixtures.
     pub decay: Option<f64>,
+    /// Expert list.
     pub experts: Vec<MixtureExpertSpec>,
 }
 
 impl MixtureSpec {
+    /// Build a mixture specification from kind and expert list.
     pub fn new(kind: MixtureKind, experts: Vec<MixtureExpertSpec>) -> Self {
         Self {
             kind,
@@ -317,16 +368,19 @@ impl MixtureSpec {
         }
     }
 
+    /// Set switching hazard / adaptation parameter.
     pub fn with_alpha(mut self, alpha: f64) -> Self {
         self.alpha = alpha;
         self
     }
 
+    /// Set fading decay factor.
     pub fn with_decay(mut self, decay: f64) -> Self {
         self.decay = Some(decay);
         self
     }
 
+    /// Convert to executable expert configs for runtime mixture evaluation.
     pub fn build_experts(&self) -> Vec<crate::mixture::ExpertConfig> {
         self.experts
             .iter()
@@ -342,13 +396,17 @@ impl MixtureSpec {
     }
 }
 
+/// Reusable execution context holding default rate and compression backends.
 #[derive(Clone, Default)]
 pub struct InfotheoryCtx {
+    /// Default rate backend for entropy/rate metrics.
     pub rate_backend: RateBackend,
+    /// Default compression backend for NCD/compression primitives.
     pub compression_backend: CompressionBackend,
 }
 
 impl InfotheoryCtx {
+    /// Create a context from explicit rate and compression backends.
     pub fn new(rate_backend: RateBackend, compression_backend: CompressionBackend) -> Self {
         Self {
             rate_backend,
@@ -356,6 +414,7 @@ impl InfotheoryCtx {
         }
     }
 
+    /// Create a context with ROSA+ rate backend and ZPAQ compression backend.
     pub fn with_zpaq(method: impl Into<String>) -> Self {
         Self {
             rate_backend: RateBackend::RosaPlus,
@@ -365,22 +424,27 @@ impl InfotheoryCtx {
         }
     }
 
+    /// Compressed length of one byte slice under this context's compressor.
     pub fn compress_size(&self, data: &[u8]) -> u64 {
         compress_size_backend(data, &self.compression_backend)
     }
 
+    /// Compressed length of chained slices under one stream.
     pub fn compress_size_chain(&self, parts: &[&[u8]]) -> u64 {
         compress_size_chain_backend(parts, &self.compression_backend)
     }
 
+    /// Entropy-rate estimate for `data` under this context's rate backend.
     pub fn entropy_rate_bytes(&self, data: &[u8], max_order: i64) -> f64 {
         entropy_rate_backend(data, max_order, &self.rate_backend)
     }
 
+    /// Biased entropy-rate estimate (plugin variant) for `data`.
     pub fn biased_entropy_rate_bytes(&self, data: &[u8], max_order: i64) -> f64 {
         biased_entropy_rate_backend(data, max_order, &self.rate_backend)
     }
 
+    /// Cross entropy of `test_data` under model trained on `train_data`.
     pub fn cross_entropy_rate_bytes(
         &self,
         test_data: &[u8],
@@ -390,6 +454,7 @@ impl InfotheoryCtx {
         cross_entropy_rate_backend(test_data, train_data, max_order, &self.rate_backend)
     }
 
+    /// Cross entropy with order-0 fast-path fallback when `max_order == 0`.
     pub fn cross_entropy_bytes(&self, test_data: &[u8], train_data: &[u8], max_order: i64) -> f64 {
         if max_order == 0 {
             if test_data.is_empty() {
@@ -410,6 +475,7 @@ impl InfotheoryCtx {
         }
     }
 
+    /// Joint entropy-rate estimate `H(X,Y)` under aligned-prefix semantics.
     pub fn joint_entropy_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         let (x, y) = aligned_prefix(x, y);
         if x.is_empty() {
@@ -418,6 +484,7 @@ impl InfotheoryCtx {
         joint_entropy_rate_backend(x, y, max_order, &self.rate_backend)
     }
 
+    /// Conditional entropy-rate estimate `H(X|Y)`.
     pub fn conditional_entropy_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         let (x, y) = aligned_prefix(x, y);
         if x.is_empty() {
@@ -428,6 +495,8 @@ impl InfotheoryCtx {
         (h_xy - h_y).max(0.0)
     }
 
+    /// Compute `H(data | prefix_parts)` by conditioning the active rate backend
+    /// on an explicit prefix chain.
     pub fn cross_entropy_conditional_chain(&self, prefix_parts: &[&[u8]], data: &[u8]) -> f64 {
         match &self.rate_backend {
             RateBackend::RosaPlus => {
@@ -538,14 +607,17 @@ impl InfotheoryCtx {
         }
     }
 
+    /// NCD between byte slices using this context's compression backend.
     pub fn ncd_bytes(&self, x: &[u8], y: &[u8], variant: NcdVariant) -> f64 {
         ncd_bytes_backend(x, y, &self.compression_backend, variant)
     }
 
+    /// Rate-backend mutual information estimate.
     pub fn mutual_information_rate_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         mutual_information_rate_backend(x, y, max_order, &self.rate_backend)
     }
 
+    /// Mutual information with `max_order == 0` marginal fast-path.
     pub fn mutual_information_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         if max_order == 0 {
             mutual_information_marg_bytes(x, y)
@@ -554,6 +626,7 @@ impl InfotheoryCtx {
         }
     }
 
+    /// Conditional entropy with aligned-prefix semantics.
     pub fn conditional_entropy_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         let (x, y) = aligned_prefix(x, y);
         if max_order == 0 {
@@ -567,6 +640,7 @@ impl InfotheoryCtx {
         }
     }
 
+    /// Normalized entropy distance (NED) under this context.
     pub fn ned_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         if max_order == 0 {
             ned_marg_bytes(x, y)
@@ -575,6 +649,7 @@ impl InfotheoryCtx {
         }
     }
 
+    /// Conservative NED normalization variant.
     pub fn ned_cons_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         let (x, y) = aligned_prefix(x, y);
         let (h_x, h_y, h_xy) = if max_order == 0 {
@@ -598,6 +673,7 @@ impl InfotheoryCtx {
         }
     }
 
+    /// Normalized transform effort (NTE) under this context.
     pub fn nte_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> f64 {
         if max_order == 0 {
             nte_marg_bytes(x, y)
@@ -606,6 +682,7 @@ impl InfotheoryCtx {
         }
     }
 
+    /// Intrinsic dependence score in `[0,1]`.
     pub fn intrinsic_dependence_bytes(&self, data: &[u8], max_order: i64) -> f64 {
         let h_marginal = marginal_entropy_bytes(data);
         if h_marginal < 1e-9 {
@@ -615,6 +692,7 @@ impl InfotheoryCtx {
         ((h_marginal - h_rate) / h_marginal).clamp(0.0, 1.0)
     }
 
+    /// Resistance-to-transformation ratio `I(X;T(X))/H(X)` in `[0,1]`.
     pub fn resistance_to_transformation_bytes(&self, x: &[u8], tx: &[u8], max_order: i64) -> f64 {
         let (x, tx) = aligned_prefix(x, tx);
         let h_x = if max_order == 0 {
@@ -631,6 +709,7 @@ impl InfotheoryCtx {
 }
 
 #[cfg(feature = "backend-rwkv")]
+/// Load an RWKV7 model from `.safetensors` path.
 pub fn load_rwkv7_model_from_path(path: &str) -> Arc<rwkvzip::Model> {
     rwkvzip::Compressor::load_model(path).expect("failed to load RWKV7 model")
 }
@@ -709,6 +788,7 @@ pub fn get_compressed_size(path: &str, method: &str) -> u64 {
     zpaq_compress_size_bytes(&std::fs::read(path).unwrap(), method)
 }
 
+/// Validate that a ZPAQ method string is supported for rate estimation.
 pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
     #[cfg(feature = "backend-zpaq")]
     {
@@ -806,6 +886,7 @@ impl<'a> std::io::Read for SliceChainReader<'a> {
     }
 }
 
+/// Compute compressed size of a chain of byte slices with a selected compression backend.
 pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &CompressionBackend) -> u64 {
     match backend {
         CompressionBackend::Zpaq { method } => {
@@ -828,6 +909,7 @@ pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &CompressionBackend
     }
 }
 
+/// Compute compressed size of a single byte slice with a selected compression backend.
 pub fn compress_size_backend(data: &[u8], backend: &CompressionBackend) -> u64 {
     match backend {
         CompressionBackend::Zpaq { method } => zpaq_compress_size_bytes(data, method.as_str()),
@@ -845,6 +927,7 @@ pub fn compress_size_backend(data: &[u8], backend: &CompressionBackend) -> u64 {
     }
 }
 
+/// Compress bytes with a selected compression backend.
 pub fn compress_bytes_backend(
     data: &[u8],
     backend: &CompressionBackend,
@@ -864,6 +947,7 @@ pub fn compress_bytes_backend(
     }
 }
 
+/// Decompress bytes with a selected compression backend.
 pub fn decompress_bytes_backend(
     input: &[u8],
     backend: &CompressionBackend,
@@ -881,6 +965,7 @@ pub fn decompress_bytes_backend(
     }
 }
 
+/// Estimate entropy rate of `data` using the explicit rate `backend`.
 pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
         RateBackend::RosaPlus => {
@@ -955,6 +1040,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
     }
 }
 
+/// Estimate biased/plugin entropy rate of `data` using the explicit rate `backend`.
 pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
         RateBackend::RosaPlus => {
@@ -1089,6 +1175,7 @@ pub fn cross_entropy_rate_backend(
     }
 }
 
+/// Estimate joint entropy rate `H(X,Y)` using an explicit `backend`.
 pub fn joint_entropy_rate_backend(
     x: &[u8],
     y: &[u8],
@@ -1193,6 +1280,7 @@ pub fn joint_entropy_rate_backend(
     }
 }
 #[inline(always)]
+/// Compute compressed size for a file path with an explicit ZPAQ thread count.
 pub fn get_compressed_size_parallel(path: &str, method: &str, threads: usize) -> u64 {
     // Convert Input file to Vec<u8>, and reference that (compress_size only takes &[u8] input), and pass method.
     // Will panic if file does not exist, so it must be prevalidated.
@@ -1200,6 +1288,7 @@ pub fn get_compressed_size_parallel(path: &str, method: &str, threads: usize) ->
 }
 
 #[inline(always)]
+/// Read all files in `paths` in parallel and return their byte contents.
 pub fn get_bytes_from_paths(paths: &[&str]) -> Vec<Vec<u8>> {
     paths
         .par_iter()
@@ -1224,6 +1313,7 @@ pub fn get_sequential_compressed_sizes_from_sequential_paths(
 }
 
 #[inline(always)]
+/// Compress all paths after preloading bytes, using per-file parallel ZPAQ compression.
 pub fn get_parallel_compressed_sizes_from_sequential_paths(
     paths: &[&str],
     method: &str,
@@ -1239,6 +1329,7 @@ pub fn get_parallel_compressed_sizes_from_sequential_paths(
 }
 
 #[inline(always)]
+/// Compress all paths directly from disk using single-thread ZPAQ per file.
 pub fn get_sequential_compressed_sizes_from_parallel_paths(
     paths: &[&str],
     method: &str,
@@ -1253,6 +1344,7 @@ pub fn get_sequential_compressed_sizes_from_parallel_paths(
 }
 
 #[inline(always)]
+/// Compress all paths directly from disk using per-file multi-thread ZPAQ.
 pub fn get_parallel_compressed_sizes_from_parallel_paths(
     paths: &[&str],
     method: &str,
@@ -1351,6 +1443,7 @@ fn ncd_from_sizes(cx: u64, cy: u64, cxy: u64, cyx: Option<u64>, variant: NcdVari
 }
 
 #[inline(always)]
+/// Compute NCD for in-memory byte slices using the given ZPAQ `method` and `variant`.
 pub fn ncd_bytes(x: &[u8], y: &[u8], method: &str, variant: NcdVariant) -> f64 {
     let backend = CompressionBackend::Zpaq {
         method: method.to_string(),
@@ -1364,6 +1457,7 @@ pub fn ncd_bytes_default(x: &[u8], y: &[u8], variant: NcdVariant) -> f64 {
     with_default_ctx(|ctx| ctx.ncd_bytes(x, y, variant))
 }
 
+/// Compute NCD for in-memory byte slices using an explicit compression `backend`.
 pub fn ncd_bytes_backend(
     x: &[u8],
     y: &[u8],
@@ -1388,6 +1482,7 @@ pub fn ncd_bytes_backend(
 }
 
 #[inline(always)]
+/// Compute NCD for two file paths using a ZPAQ `method` and `variant`.
 pub fn ncd_paths(x: &str, y: &str, method: &str, variant: NcdVariant) -> f64 {
     let (bx, by) = rayon::join(
         || std::fs::read(x).expect("failed to read x"),
@@ -1396,6 +1491,7 @@ pub fn ncd_paths(x: &str, y: &str, method: &str, variant: NcdVariant) -> f64 {
     ncd_bytes(&bx, &by, method, variant)
 }
 
+/// Compute NCD for two file paths using an explicit compression `backend`.
 pub fn ncd_paths_backend(
     x: &str,
     y: &str,
@@ -1415,14 +1511,17 @@ pub fn ncd_vitanyi(x: &str, y: &str, method: &str) -> f64 {
     ncd_paths(x, y, method, NcdVariant::Vitanyi)
 }
 #[inline(always)]
+/// Convenience wrapper for symmetric-Vitanyi NCD on file paths.
 pub fn ncd_sym_vitanyi(x: &str, y: &str, method: &str) -> f64 {
     ncd_paths(x, y, method, NcdVariant::SymVitanyi)
 }
 #[inline(always)]
+/// Convenience wrapper for conservative NCD on file paths.
 pub fn ncd_cons(x: &str, y: &str, method: &str) -> f64 {
     ncd_paths(x, y, method, NcdVariant::Cons)
 }
 #[inline(always)]
+/// Convenience wrapper for symmetric-conservative NCD on file paths.
 pub fn ncd_sym_cons(x: &str, y: &str, method: &str) -> f64 {
     ncd_paths(x, y, method, NcdVariant::SymCons)
 }
@@ -1706,6 +1805,7 @@ pub fn ned_cons_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     with_default_ctx(|ctx| ctx.ned_cons_bytes(x, y, max_order))
 }
 
+/// Conservative marginal NED using histogram entropy estimates.
 pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     let h_x = marginal_entropy_bytes(x);
     let h_y = marginal_entropy_bytes(y);
@@ -1719,6 +1819,7 @@ pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 #[inline(always)]
+/// Conservative rate NED using the current default context backend.
 pub fn ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     with_default_ctx(|ctx| ctx.ned_cons_bytes(x, y, max_order))
 }
@@ -1742,6 +1843,7 @@ pub fn nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     with_default_ctx(|ctx| ctx.nte_bytes(x, y, max_order))
 }
 
+/// Marginal NTE using histogram entropy estimates.
 pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     let h_x = marginal_entropy_bytes(x);
@@ -1757,6 +1859,7 @@ pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 #[inline(always)]
+/// Rate NTE using the current default context backend.
 pub fn nte_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
     with_default_ctx(|ctx| ctx.nte_bytes(x, y, max_order))
 }

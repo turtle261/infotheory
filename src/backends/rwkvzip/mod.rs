@@ -18,7 +18,9 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// RWKV7 model core (weights/state/kernels).
 pub mod rwkv7;
+/// Shared entropy coders used by rwkvzip containers.
 pub use crate::coders;
 
 use crate::coders::{
@@ -26,7 +28,14 @@ use crate::coders::{
     CDF_TOTAL, Cdf, quantize_pdf_to_cdf_inplace, quantize_pdf_to_rans_cdf_with_buffer,
 };
 
-pub use rwkv7::{Config, Model, ScratchBuffers, State};
+/// RWKV7 model configuration type.
+pub use rwkv7::Config;
+/// RWKV7 model type.
+pub use rwkv7::Model;
+/// RWKV7 temporary scratch buffers used during forward passes.
+pub use rwkv7::ScratchBuffers;
+/// RWKV7 recurrent state container.
+pub use rwkv7::State;
 
 // =============================================================================
 // File Format Constants
@@ -102,24 +111,40 @@ impl std::fmt::Display for CoderType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Online adaptation mode for RWKV output-bias updates.
 pub enum OnlineTrainMode {
+    /// Disable online updates.
     None,
+    /// SGD updates on output bias.
     Sgd,
+    /// Adam updates on output bias.
     Adam,
 }
 
 #[derive(Clone, Debug)]
+/// Configuration for online RWKV model instantiation and adaptation.
 pub struct OnlineConfig {
+    /// Hidden size (must be multiple of 64 after clamping).
     pub hidden: usize,
+    /// Number of recurrent layers.
     pub layers: usize,
+    /// Feed-forward intermediate size.
     pub intermediate: usize,
+    /// Low-rank dimension for decay projection.
     pub decay_rank: usize,
+    /// Low-rank dimension for key-like projection.
     pub a_rank: usize,
+    /// Low-rank dimension for value-like projection.
     pub v_rank: usize,
+    /// Low-rank dimension for gate projection.
     pub g_rank: usize,
+    /// Random seed used for online-random model initialization.
     pub seed: u64,
+    /// Online training mode.
     pub train_mode: OnlineTrainMode,
+    /// Learning rate for online adaptation.
     pub lr: f32,
+    /// Update stride (apply update every `stride` tokens).
     pub stride: usize,
 }
 
@@ -142,6 +167,7 @@ impl Default for OnlineConfig {
 }
 
 impl OnlineConfig {
+    /// Convert to a validated RWKV model configuration.
     pub fn to_rwkv_config(&self) -> Result<Config> {
         let hidden = self.hidden.max(64);
         if !hidden.is_multiple_of(64) {
@@ -168,8 +194,11 @@ impl OnlineConfig {
 }
 
 #[derive(Clone, Debug)]
+/// Parsed RWKV method specification.
 pub enum MethodSpec {
+    /// Load a model from disk.
     File(PathBuf),
+    /// Build an online/random model from configuration.
     Online(OnlineConfig),
 }
 
@@ -185,6 +214,7 @@ struct OnlineRuntime {
 }
 
 #[derive(Clone)]
+/// Snapshot of mutable runtime state used for reversible scoring.
 pub struct RuntimeSnapshot {
     state: State,
     pdf_buffer: Vec<f64>,
@@ -329,6 +359,13 @@ fn parse_cfg_positional(csv: &str) -> Result<OnlineConfig> {
     Ok(cfg)
 }
 
+/// Parse a method string into a concrete RWKV method specification.
+///
+/// Supported formats:
+/// - `file:/path/to/model.safetensors`
+/// - `cfg:key=value,...`
+/// - positional `cfg` CSV
+/// - existing model path
 pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
     let trimmed = method.trim();
     if trimmed.is_empty() {
@@ -523,6 +560,7 @@ pub struct Compressor {
     pub model: Arc<Model>,
     /// Model state (recurrent hidden states).
     pub state: State,
+    /// Scratch buffers for model forward passes.
     pub scratch: ScratchBuffers,
     /// Pre-allocated PDF buffer (eliminates allocations in compression loop).
     pub pdf_buffer: Vec<f64>,
@@ -567,10 +605,12 @@ impl Compressor {
         Ok(c)
     }
 
+    /// Load a model from disk and wrap it in `Arc`.
     pub fn load_model<P: AsRef<Path>>(model_path: P) -> Result<Arc<Model>> {
         Ok(Arc::new(Model::load(model_path)?))
     }
 
+    /// Create a compressor from a preloaded model.
     pub fn new_from_model(model: Arc<Model>) -> Self {
         let state = model.new_state();
         let vocab_size = model.config().vocab_size;
@@ -588,6 +628,7 @@ impl Compressor {
         }
     }
 
+    /// Create a compressor from a user method string.
     pub fn new_from_method(method: &str) -> Result<Self> {
         match parse_method_spec(method)? {
             MethodSpec::File(path) => Self::new(path),
@@ -609,6 +650,7 @@ impl Compressor {
         self.state.reset();
     }
 
+    /// Reset state and prime the first predictive distribution.
     pub fn reset_and_prime(&mut self) {
         self.state.reset();
         let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
@@ -616,6 +658,7 @@ impl Compressor {
         Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
     }
 
+    /// Capture runtime state for later restoration.
     pub fn snapshot_runtime(&self) -> RuntimeSnapshot {
         RuntimeSnapshot {
             state: self.state.clone(),
@@ -624,12 +667,14 @@ impl Compressor {
         }
     }
 
+    /// Restore previously captured runtime state.
     pub fn restore_runtime(&mut self, snapshot: &RuntimeSnapshot) {
         self.state = snapshot.state.clone();
         self.pdf_buffer.clone_from(&snapshot.pdf_buffer);
         self.online = snapshot.online.clone();
     }
 
+    /// Absorb a sequence of byte slices as conditioning context.
     pub fn absorb_chain(&mut self, parts: &[&[u8]]) -> Result<()> {
         for part in parts {
             for &byte in *part {
@@ -644,6 +689,7 @@ impl Compressor {
         Ok(())
     }
 
+    /// Score bytes from the current predictive state.
     pub fn cross_entropy_from_current(&mut self, data: &[u8]) -> Result<f64> {
         if data.is_empty() {
             return Ok(0.0);
@@ -662,14 +708,17 @@ impl Compressor {
         Ok(total_bits / (data.len() as f64))
     }
 
+    /// Returns `true` when the compressor is in online-adaptation mode.
     pub fn is_online(&self) -> bool {
         self.online.is_some()
     }
 
+    /// Number of tokens processed by the online updater.
     pub fn tokens_processed(&self) -> u64 {
         self.online.as_ref().map_or(0, |s| s.tokens_processed)
     }
 
+    /// Canonical method string for online mode, if enabled.
     pub fn online_method_string(&self) -> Option<&str> {
         self.online.as_ref().map(|s| s.canonical_cfg.as_str())
     }
@@ -679,19 +728,23 @@ impl Compressor {
         self.model.config().vocab_size
     }
 
+    /// Apply optional online bias to logits and emit normalized PDF.
     pub fn online_apply_logits_bias(&self, logits: &[f32], pdf_out: &mut [f64]) {
         let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         Self::logits_to_pdf(logits, bias, pdf_out);
     }
 
+    /// Convert logits (and optional bias) to a normalized PDF.
     pub fn logits_to_pdf(logits: &[f32], bias: Option<&[f32]>, pdf_out: &mut [f64]) {
         softmax_pdf_floor_with_bias(logits, bias, pdf_out);
     }
 
+    /// Snapshot current online output bias, if online mode is active.
     pub fn online_bias_snapshot(&self) -> Option<Vec<f32>> {
         self.online.as_ref().map(|o| o.out_bias.clone())
     }
 
+    /// Apply one online update using externally supplied predictive PDF.
     pub fn online_update_from_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
         let Some(online) = self.online.as_mut() else {
             return Ok(());
@@ -755,6 +808,7 @@ impl Compressor {
         self.online_update_from_pdf(symbol, &pdf)
     }
 
+    /// Export model weights and JSON sidecar metadata.
     pub fn export_online<P: AsRef<Path>>(&self, model_path: P) -> Result<()> {
         let model_path = model_path.as_ref();
         self.model.save_safetensors(model_path)?;
@@ -892,6 +946,7 @@ impl Compressor {
         Ok(output)
     }
 
+    /// Compress into an arbitrary writer.
     pub fn compress_into<W: Write>(
         &mut self,
         data: &[u8],
@@ -912,6 +967,7 @@ impl Compressor {
         Ok(())
     }
 
+    /// Compress a chain of byte slices into an arbitrary writer.
     pub fn compress_chain_into<W: Write>(
         &mut self,
         parts: &[&[u8]],
@@ -940,12 +996,14 @@ impl Compressor {
         Ok(())
     }
 
+    /// Return compressed byte size without materializing output bytes.
     pub fn compress_size(&mut self, data: &[u8], coder: CoderType) -> Result<u64> {
         let mut w = CountingWriter::new();
         self.compress_into(data, coder, &mut w)?;
         Ok(w.bytes_written())
     }
 
+    /// Return compressed byte size for chained inputs.
     pub fn compress_size_chain(&mut self, parts: &[&[u8]], coder: CoderType) -> Result<u64> {
         let mut w = CountingWriter::new();
         self.compress_chain_into(parts, coder, &mut w)?;
@@ -1181,6 +1239,7 @@ impl Compressor {
         self.cross_entropy_from_current(data)
     }
 
+    /// Cross entropy conditioned on chained prefix slices.
     pub fn cross_entropy_conditional_chain(
         &mut self,
         prefix_parts: &[&[u8]],
@@ -1194,6 +1253,7 @@ impl Compressor {
         self.cross_entropy_from_current(data)
     }
 
+    /// Cross entropy conditioned on a single prefix slice.
     pub fn cross_entropy_conditional(&mut self, prefix: &[u8], data: &[u8]) -> Result<f64> {
         if data.is_empty() {
             return Ok(0.0);
@@ -1231,6 +1291,7 @@ impl Compressor {
         Ok(total_bits / (data.len() as f64))
     }
 
+    /// Symmetric aligned joint cross entropy using the better ordering.
     pub fn joint_cross_entropy_aligned_min(&mut self, x: &[u8], y: &[u8]) -> Result<f64> {
         let n = x.len().min(y.len());
         if n == 0 {

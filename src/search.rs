@@ -73,11 +73,11 @@ pub enum SearchGranularity {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Stage2PriorMode {
     /// Use the (full or summarized) universal prior as a prefix for compression metrics.
-    UsePrior,
+    Use,
     /// Do NOT use the universal prior in Stage 2 (pure NCD/KMI rerank on Stage-1-filtered set).
-    NoPrior,
+    Disable,
     /// Summarize the universal prior via an inner prior-less search over the prior corpus.
-    SummarizePrior,
+    Summarize,
 }
 
 #[derive(Clone)]
@@ -85,7 +85,7 @@ pub struct SearchOptions {
     pub granularity: SearchGranularity,
     /// Universal prior corpus path (file or directory). If set:
     /// - Stage 1 always uses it.
-    /// - Stage 2 uses it by default (unless Stage2PriorMode::NoPrior).
+    /// - Stage 2 uses it by default (unless Stage2PriorMode::Disable).
     pub universal_prior: Option<String>,
     pub stage2_prior_mode: Stage2PriorMode,
     pub max_order: i64,
@@ -99,7 +99,7 @@ impl Default for SearchOptions {
         Self {
             granularity: SearchGranularity::Snippet,
             universal_prior: None,
-            stage2_prior_mode: Stage2PriorMode::UsePrior,
+            stage2_prior_mode: Stage2PriorMode::Use,
             max_order: 8,
             top_k: 50,
             stage0_keep_frac: 0.2,
@@ -384,11 +384,11 @@ fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &
     let prior_prefix: Option<Vec<u8>> =
         match (opts.universal_prior.as_deref(), opts.stage2_prior_mode) {
             (None, _) => None,
-            (Some(_), Stage2PriorMode::NoPrior) => None,
-            (Some(prior_path), Stage2PriorMode::UsePrior) => {
+            (Some(_), Stage2PriorMode::Disable) => None,
+            (Some(prior_path), Stage2PriorMode::Use) => {
                 Some(corpus_bytes(prior_path, SearchGranularity::File))
             }
-            (Some(prior_path), Stage2PriorMode::SummarizePrior) => {
+            (Some(prior_path), Stage2PriorMode::Summarize) => {
                 Some(summarize_prior_for_query(query_bytes, prior_path, opts))
             }
         };
@@ -514,15 +514,15 @@ fn load_or_train_prior_model(prior_path: &str, opts: &SearchOptions) -> RosaPlus
         if let Some(parent) = cache_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if cache_path.exists() {
-            if let Ok(mut m) = RosaPlus::load(cache_path.to_string_lossy().as_ref()) {
-                // Ensure fixed 256-byte alphabet LM for incremental conditional updates.
-                if m.lm_alpha_n() != 256 {
-                    m.build_lm_full_bytes_no_finalize_endpos();
-                    let _ = m.save(cache_path.to_string_lossy().as_ref());
-                }
-                return m;
+        if cache_path.exists()
+            && let Ok(mut m) = RosaPlus::load(cache_path.to_string_lossy().as_ref())
+        {
+            // Ensure fixed 256-byte alphabet LM for incremental conditional updates.
+            if m.lm_alpha_n() != 256 {
+                m.build_lm_full_bytes_no_finalize_endpos();
+                let _ = m.save(cache_path.to_string_lossy().as_ref());
             }
+            return m;
         }
 
         // Train + save.
@@ -571,20 +571,16 @@ fn collect_candidates(target: &str, granularity: SearchGranularity) -> Vec<Snipp
 
 fn visit_dirs(dir: &Path, snippets: &mut Vec<Snippet>, granularity: SearchGranularity) {
     if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(name) = path.file_name() {
-                        if let Some(name_str) = name.to_str() {
-                            if !name_str.starts_with('.') {
-                                visit_dirs(&path, snippets, granularity);
-                            }
-                        }
-                    }
-                } else {
-                    snippets.extend(file_to_candidates(&path, granularity));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name_str) = path.file_name().and_then(|n| n.to_str())
+                    && !name_str.starts_with('.')
+                {
+                    visit_dirs(&path, snippets, granularity);
                 }
+            } else {
+                snippets.extend(file_to_candidates(&path, granularity));
             }
         }
     }
@@ -606,18 +602,18 @@ fn file_to_candidates(path: &Path, granularity: SearchGranularity) -> Vec<Snippe
 
     match granularity {
         SearchGranularity::File => {
-            if let Ok(bytes) = fs::read(path) {
-                if !bytes.is_empty() {
-                    // Best-effort line count for `sed` output.
-                    let lines = bytes.iter().filter(|&&b| b == b'\n').count() + 1;
-                    snippets.push(Snippet {
-                        path: path.to_path_buf(),
-                        start_line: 1,
-                        end_line: lines.max(1),
-                        content: bytes,
-                        score: 0.0,
-                    });
-                }
+            if let Ok(bytes) = fs::read(path)
+                && !bytes.is_empty()
+            {
+                // Best-effort line count for `sed` output.
+                let lines = bytes.iter().filter(|&&b| b == b'\n').count() + 1;
+                snippets.push(Snippet {
+                    path: path.to_path_buf(),
+                    start_line: 1,
+                    end_line: lines.max(1),
+                    content: bytes,
+                    score: 0.0,
+                });
             }
         }
         SearchGranularity::Snippet => {
@@ -676,4 +672,96 @@ fn file_to_candidates(path: &Path, granularity: SearchGranularity) -> Vec<Snippe
         }
     }
     snippets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("infotheory-search-{prefix}-{nanos}"))
+    }
+
+    #[test]
+    fn resolve_query_bytes_prefers_file_contents() {
+        let path = temp_path("query");
+        fs::write(&path, b"query-from-file").expect("write query file");
+        let got = resolve_query_bytes(path.to_string_lossy().as_ref());
+        assert_eq!(got, b"query-from-file");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_to_candidates_skips_binary_extensions() {
+        let path = temp_path("binary").with_extension("png");
+        fs::write(&path, b"not-actually-image").expect("write pseudo-binary");
+        let out = file_to_candidates(&path, SearchGranularity::File);
+        assert!(out.is_empty(), "binary extension should be skipped");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_to_candidates_generates_snippets() {
+        let path = temp_path("snippet").with_extension("txt");
+        let mut text = String::new();
+        for i in 0..120 {
+            text.push_str(&format!("line-{i:03}\n"));
+        }
+        fs::write(&path, text.as_bytes()).expect("write snippet file");
+        let out = file_to_candidates(&path, SearchGranularity::Snippet);
+        assert!(!out.is_empty(), "expected snippet candidates");
+        assert!(out.iter().all(|s| s.end_line >= s.start_line));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn collect_candidates_skips_hidden_directories() {
+        let root = temp_path("tree");
+        let hidden = root.join(".hidden");
+        let visible = root.join("visible");
+        fs::create_dir_all(&hidden).expect("create hidden dir");
+        fs::create_dir_all(&visible).expect("create visible dir");
+        fs::write(hidden.join("secret.txt"), b"hidden").expect("write hidden file");
+        fs::write(visible.join("public.txt"), b"visible\ntext\n").expect("write visible file");
+
+        let out = collect_candidates(root.to_string_lossy().as_ref(), SearchGranularity::File);
+        assert_eq!(out.len(), 1, "only visible file should be collected");
+        assert!(
+            out[0].path.to_string_lossy().contains("public.txt"),
+            "unexpected collected file path: {}",
+            out[0].path.display()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage0_prefilter_respects_topk_floor() {
+        let mut candidates = Vec::new();
+        for i in 0..10 {
+            candidates.push(Snippet {
+                path: PathBuf::from(format!("f{i}.txt")),
+                start_line: 1,
+                end_line: 1,
+                content: format!("candidate-{i}").into_bytes(),
+                score: 0.0,
+            });
+        }
+        let opts = SearchOptions {
+            top_k: 4,
+            stage0_keep_frac: 0.1,
+            ..SearchOptions::default()
+        };
+        let kept = stage0_prefilter(b"candidate", candidates, &opts, false);
+        assert!(
+            kept.len() >= 4,
+            "stage0 must keep at least top_k candidates, got {}",
+            kept.len()
+        );
+    }
 }

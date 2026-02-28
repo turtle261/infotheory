@@ -1,3 +1,10 @@
+//! Rate-coded compression helpers (AC/rANS) with optional framing.
+//!
+//! The functions in this module implement lossless byte compression by combining:
+//! - a predictive rate model (`RateBackend`) that emits per-symbol PDFs,
+//! - an entropy coder (`AC` or `rANS`),
+//! - optional framing metadata for robust decompression.
+
 use anyhow::{Result, bail};
 
 #[cfg(feature = "backend-rwkv")]
@@ -17,8 +24,11 @@ const FRAMED_VERSION: u8 = 1;
 const PDF_MIN: f64 = DEFAULT_MIN_PROB;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Wire format mode for rate-coded payloads.
 pub enum FramingMode {
+    /// Emit only coder payload bytes (no integrity/length header).
     Raw,
+    /// Emit framed payload with magic/version/length/checksum header.
     #[default]
     Framed,
 }
@@ -689,6 +699,10 @@ fn decode_payload_rans(
     Ok(out)
 }
 
+/// Compress bytes using a predictive rate backend and entropy coder.
+///
+/// When `framing` is [`FramingMode::Framed`], output includes a compact header
+/// with payload metadata and CRC for safer transport/storage.
 pub fn compress_rate_bytes(
     data: &[u8],
     rate_backend: &RateBackend,
@@ -713,6 +727,7 @@ pub fn compress_rate_bytes(
     Ok(out)
 }
 
+/// Return compressed size (in bytes) for `data` using rate coding.
 pub fn compress_rate_size(
     data: &[u8],
     rate_backend: &RateBackend,
@@ -724,6 +739,7 @@ pub fn compress_rate_size(
     Ok(encoded.len() as u64)
 }
 
+/// Return compressed size (in bytes) for concatenated slices under one stream.
 pub fn compress_rate_size_chain(
     parts: &[&[u8]],
     rate_backend: &RateBackend,
@@ -739,6 +755,7 @@ pub fn compress_rate_size_chain(
     compress_rate_size(&data, rate_backend, max_order, coder, framing)
 }
 
+/// Decompress bytes produced by [`compress_rate_bytes`].
 pub fn decompress_rate_bytes(
     input: &[u8],
     rate_backend: &RateBackend,

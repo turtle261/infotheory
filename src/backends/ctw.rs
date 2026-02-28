@@ -20,18 +20,24 @@ type Symbol = bool;
 pub struct NodeIndex(u32);
 
 impl NodeIndex {
+    /// Sentinel value indicating the absence of a node.
     pub const NONE: NodeIndex = NodeIndex(u32::MAX);
 
+    /// Returns `true` when this is [`NodeIndex::NONE`].
     #[inline(always)]
     pub fn is_none(self) -> bool {
         self.0 == u32::MAX
     }
 
+    /// Returns `true` when this points to a valid arena node.
     #[inline(always)]
     pub fn is_some(self) -> bool {
         self.0 != u32::MAX
     }
 
+    /// Convert to a `usize` arena index.
+    ///
+    /// Caller must ensure this is not `NONE`.
     #[inline(always)]
     pub fn get(self) -> usize {
         self.0 as usize
@@ -52,6 +58,7 @@ pub struct CtNode {
 }
 
 impl CtNode {
+    /// Create a zero-initialized CTW node.
     #[inline(always)]
     pub fn new() -> Self {
         Self {
@@ -83,6 +90,7 @@ pub struct CtArena {
 }
 
 impl CtArena {
+    /// Create an empty arena with a small default reserve.
     pub fn new() -> Self {
         Self {
             nodes: Vec::with_capacity(1024),
@@ -90,6 +98,7 @@ impl CtArena {
         }
     }
 
+    /// Create an empty arena with explicit node capacity.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(cap),
@@ -97,6 +106,7 @@ impl CtArena {
         }
     }
 
+    /// Allocate a node and return its index.
     #[inline(always)]
     pub fn alloc(&mut self) -> NodeIndex {
         if let Some(idx) = self.free_list.pop() {
@@ -109,6 +119,7 @@ impl CtArena {
         }
     }
 
+    /// Mark a node index as reusable.
     #[inline(always)]
     pub fn free(&mut self, idx: NodeIndex) {
         if idx.is_some() {
@@ -116,16 +127,19 @@ impl CtArena {
         }
     }
 
+    /// Immutable access to a node by index.
     #[inline(always)]
     pub fn get(&self, idx: NodeIndex) -> &CtNode {
         &self.nodes[idx.get()]
     }
 
+    /// Mutable access to a node by index.
     #[inline(always)]
     pub fn get_mut(&mut self, idx: NodeIndex) -> &mut CtNode {
         &mut self.nodes[idx.get()]
     }
 
+    /// Remove all nodes and reset allocator state.
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.free_list.clear();

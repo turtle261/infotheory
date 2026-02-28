@@ -132,7 +132,7 @@ impl AixiRunLogger {
                 "observations": observations,
                 "reward": reward,
             });
-            writeln!(w, "{}", rec.to_string())?;
+            writeln!(w, "{rec}")?;
         }
         Ok(())
     }
@@ -148,14 +148,14 @@ impl AixiRunLogger {
                 "kind": "action",
                 "action": action,
             });
-            writeln!(w, "{}", rec.to_string())?;
+            writeln!(w, "{rec}")?;
         }
         Ok(())
     }
 
     fn next_step(&mut self) -> anyhow::Result<()> {
         self.step = self.step.saturating_add(1);
-        if self.flush_every > 0 && (self.step % self.flush_every == 0) {
+        if self.flush_every > 0 && self.step.is_multiple_of(self.flush_every) {
             if let Some(w) = self.bits01.as_mut() {
                 w.flush()?;
             }
@@ -1018,26 +1018,24 @@ fn validate_observation_config(
         if let (Some(top_len), Some(vm_len)) = (
             extract_observation_stream_len_raw(v),
             extract_vm_observation_stream_len_raw(&v["vm_observation"]),
-        ) {
-            if top_len != vm_len {
-                return Err(anyhow::anyhow!(
-                    "observation_stream_len ({}) conflicts with vm_observation.stream_len ({})",
-                    top_len,
-                    vm_len
-                ));
-            }
+        ) && top_len != vm_len
+        {
+            return Err(anyhow::anyhow!(
+                "observation_stream_len ({}) conflicts with vm_observation.stream_len ({})",
+                top_len,
+                vm_len
+            ));
         }
         if let (Some(top_mode), Some(vm_mode)) = (
             extract_observation_key_mode_raw(v),
             extract_vm_observation_key_mode_raw(&v["vm_observation"]),
-        ) {
-            if top_mode != vm_mode {
-                return Err(anyhow::anyhow!(
-                    "observation_key_mode ({:?}) conflicts with vm_observation.key_mode ({:?})",
-                    top_mode,
-                    vm_mode
-                ));
-            }
+        ) && top_mode != vm_mode
+        {
+            return Err(anyhow::anyhow!(
+                "observation_key_mode ({:?}) conflicts with vm_observation.key_mode ({:?})",
+                top_mode,
+                vm_mode
+            ));
         }
     }
     if observation_stream_len > 1 && matches!(observation_key_mode, ObservationKeyMode::First) {
@@ -1358,10 +1356,10 @@ fn maybe_export_rwkv_online(
     let method = match &ctx.rate_backend {
         RateBackend::Rwkv7Method { method } => Some(method.as_str()),
         _ => match &ctx.compression_backend {
-            CompressionBackend::Rate { rate_backend, .. } => match rate_backend {
-                RateBackend::Rwkv7Method { method } => Some(method.as_str()),
-                _ => None,
-            },
+            CompressionBackend::Rate {
+                rate_backend: RateBackend::Rwkv7Method { method },
+                ..
+            } => Some(method.as_str()),
             _ => None,
         },
     };
@@ -1762,8 +1760,9 @@ fn process_json_line(line: &str) -> String {
 fn run_batch_mode() {
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
-        if let Ok(l) = line {
-            println!("{}", process_json_line(&l));
+        match line {
+            Ok(l) => println!("{}", process_json_line(&l)),
+            Err(_) => continue,
         }
     }
 }
@@ -2096,11 +2095,10 @@ fn search_command(args: &[String]) {
                 i += 1;
                 if let Some(v) = args.get(i) {
                     stage2_prior_mode = match v.as_str() {
-                        "none" | "no-prior" => Some(search::Stage2PriorMode::NoPrior),
-                        "summarize" | "summarize-prior" => {
-                            Some(search::Stage2PriorMode::SummarizePrior)
-                        }
-                        "use" | "use-prior" | _ => Some(search::Stage2PriorMode::UsePrior),
+                        "none" | "no-prior" => Some(search::Stage2PriorMode::Disable),
+                        "summarize" | "summarize-prior" => Some(search::Stage2PriorMode::Summarize),
+                        "use" | "use-prior" => Some(search::Stage2PriorMode::Use),
+                        _ => Some(search::Stage2PriorMode::Use),
                     };
                 }
             }
@@ -2472,6 +2470,8 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn file_roundtrip_backend_keeps_zpaq_unchanged() {
@@ -2479,10 +2479,7 @@ mod tests {
             method: "5".to_string(),
         };
         let out = file_roundtrip_backend(&b);
-        match out {
-            CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
-            _ => panic!("expected zpaq backend"),
-        }
+        assert!(matches!(out, CompressionBackend::Zpaq { method } if method == "5"));
     }
 
     #[cfg(feature = "backend-rwkv")]
@@ -2550,5 +2547,134 @@ mod tests {
             }
             _ => panic!("expected rate-coded RWKV backend for cfg: method"),
         }
+    }
+
+    #[test]
+    fn parse_backend_aliases_and_unknowns() {
+        assert_eq!(parse_rate_backend("rosa"), Some("rosaplus"));
+        assert_eq!(parse_rate_backend("facctw"), Some("fac-ctw"));
+        assert_eq!(parse_rate_backend("unknown"), None);
+
+        assert_eq!(parse_compression_backend("unknown"), None);
+        #[cfg(feature = "backend-zpaq")]
+        assert_eq!(parse_compression_backend("zpaq"), Some("zpaq"));
+        #[cfg(feature = "backend-rwkv")]
+        {
+            assert_eq!(parse_compression_backend("rate_ac"), Some("rate-ac"));
+            assert_eq!(parse_compression_backend("raterans"), Some("rate-rans"));
+            assert_eq!(parse_compression_backend("rwkv"), Some("rwkv7"));
+        }
+    }
+
+    #[test]
+    fn parse_observation_helpers_cover_vm_and_non_vm_cases() {
+        let base = json!({
+            "observation_stream_len": 3,
+            "observation_key_mode": "stream-hash"
+        });
+        assert_eq!(parse_observation_stream_len(&base), 3);
+        assert_eq!(
+            parse_observation_key_mode(&base),
+            ObservationKeyMode::StreamHash
+        );
+        assert_eq!(
+            parse_observation_key_mode_str("full"),
+            ObservationKeyMode::FullStream
+        );
+        assert_eq!(
+            parse_observation_key_mode_str("last"),
+            ObservationKeyMode::Last
+        );
+        assert_eq!(
+            parse_observation_key_mode_str("unknown"),
+            ObservationKeyMode::First
+        );
+
+        let vm = json!({
+            "observation_stream_len": 2,
+            "observation_key_mode": "full",
+            "vm_observation": {
+                "stream_len": 2,
+                "key_mode": "last"
+            }
+        });
+        assert_eq!(
+            parse_observation_stream_len_for_vm(&vm["vm_observation"]),
+            2
+        );
+        assert_eq!(
+            parse_observation_key_mode_for_vm(&vm["vm_observation"]),
+            ObservationKeyMode::Last
+        );
+        assert_eq!(parse_observation_stream_len_for_env(&vm, "vm"), 2);
+        assert_eq!(
+            parse_observation_key_mode_for_env(&vm, "vm"),
+            ObservationKeyMode::Last
+        );
+        assert_eq!(
+            parse_observation_key_mode_for_env(&vm, "coin"),
+            ObservationKeyMode::FullStream
+        );
+
+        let mismatch = json!({
+            "observation_stream_len": 2,
+            "vm_observation": {
+                "stream_len": 3
+            }
+        });
+        let err = validate_observation_config("vm", &mismatch, 2, ObservationKeyMode::FullStream)
+            .expect_err("mismatched vm stream_len should fail");
+        assert!(err.to_string().contains("conflicts"));
+
+        let mismatch_mode = json!({
+            "observation_key_mode": "full",
+            "vm_observation": {
+                "key_mode": "last"
+            }
+        });
+        let err = validate_observation_config("nyx", &mismatch_mode, 1, ObservationKeyMode::Last)
+            .expect_err("mismatched vm key mode should fail");
+        assert!(err.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn parse_mixture_kind_and_spec_validation() {
+        assert_eq!(
+            parse_mixture_kind("bayes-mix").expect("bayes alias"),
+            MixtureKind::Bayes
+        );
+        assert_eq!(
+            parse_mixture_kind("switch").expect("switch alias"),
+            MixtureKind::Switching
+        );
+        assert!(parse_mixture_kind("nonsense").is_err());
+
+        let base_dir = Path::new(".");
+        let missing_experts = json!({
+            "kind": "bayes",
+            "experts": []
+        });
+        assert!(parse_mixture_spec_value(&missing_experts, base_dir, 8).is_err());
+
+        let fading_without_decay = json!({
+            "kind": "fading",
+            "experts": [
+                {"name": "ctw-e", "kind": "ctw", "depth": 4}
+            ]
+        });
+        assert!(parse_mixture_spec_value(&fading_without_decay, base_dir, 8).is_err());
+
+        let valid = json!({
+            "kind": "bayes",
+            "alpha": 0.03,
+            "experts": [
+                {"name": "ctw-e", "kind": "ctw", "depth": 8},
+                {"name": "fac-e", "kind": "fac-ctw", "base_depth": 8, "encoding_bits": 8}
+            ]
+        });
+        let spec = parse_mixture_spec_value(&valid, base_dir, 8).expect("valid mixture");
+        assert_eq!(spec.alpha, 0.03);
+        assert_eq!(spec.experts.len(), 2);
+        assert!(matches!(spec.kind, MixtureKind::Bayes));
     }
 }

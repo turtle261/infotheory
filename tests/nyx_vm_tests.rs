@@ -327,18 +327,18 @@ fn test_trace_config() {
 #[test]
 fn test_payload_encoding_from_str() {
     assert!(matches!(
-        PayloadEncoding::from_str("utf8"),
+        PayloadEncoding::parse("utf8"),
         Some(PayloadEncoding::Utf8)
     ));
     assert!(matches!(
-        PayloadEncoding::from_str("text"),
+        PayloadEncoding::parse("text"),
         Some(PayloadEncoding::Utf8)
     ));
     assert!(matches!(
-        PayloadEncoding::from_str("hex"),
+        PayloadEncoding::parse("hex"),
         Some(PayloadEncoding::Hex)
     ));
-    assert!(PayloadEncoding::from_str("unknown").is_none());
+    assert!(PayloadEncoding::parse("unknown").is_none());
 }
 
 // ============================================================================

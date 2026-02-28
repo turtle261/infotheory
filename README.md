@@ -241,6 +241,20 @@ Run Python tests:
 uv run pytest -q python/tests
 ```
 
+Run Python wrapper coverage (enforced in CI):
+
+```bash
+uv run pytest \
+  --cov=infotheory_rs \
+  --cov-report=term-missing \
+  --cov-report=xml:target/python-coverage.xml \
+  --cov-fail-under=100 \
+  python/tests
+```
+
+For full developer test and coverage workflows (Rust + Python + VM), see:
+`docs/developer-testing.md`.
+
 Notes:
 - Built as `abi3-py310` (compatible with Python 3.10+).
 - Published wheels are intended to be portable and exclude `vm` support by default.

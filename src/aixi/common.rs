@@ -208,6 +208,7 @@ pub fn encode_reward(symlist: &mut SymbolList, value: i64, bits: usize) {
     }
 }
 
+/// Encodes a reward after applying an additive `offset`.
 pub fn encode_reward_offset(symlist: &mut SymbolList, value: i64, bits: usize, offset: i64) {
     let shifted = (value + offset) as u64;
     encode(symlist, shifted, bits);
@@ -241,6 +242,7 @@ pub fn decode_reward(symlist: &[Symbol], bits: usize) -> i64 {
     }
 }
 
+/// Decodes a reward encoded with [`encode_reward_offset`].
 pub fn decode_reward_offset(symlist: &[Symbol], bits: usize, offset: i64) -> i64 {
     if bits == 0 {
         return 0;

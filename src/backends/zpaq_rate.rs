@@ -1,3 +1,8 @@
+//! ZPAQ-backed sequential rate model.
+//!
+//! This backend estimates `log p(x_t | x_{<t})` by measuring incremental
+//! streaming compression growth under a streamable ZPAQ method.
+
 #[cfg(feature = "backend-zpaq")]
 use std::f64::consts::LN_2;
 
@@ -180,4 +185,7 @@ mod imp {
     }
 }
 
-pub use imp::{ZpaqRateModel, validate_zpaq_rate_method};
+/// Stateful ZPAQ-based rate estimator.
+pub use imp::ZpaqRateModel;
+/// Validate that a ZPAQ method string is streamable and usable for rate modeling.
+pub use imp::validate_zpaq_rate_method;

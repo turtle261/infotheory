@@ -64,6 +64,35 @@ fn parse_ncd_variant(s: &str) -> PyResult<NcdVariant> {
     }
 }
 
+fn parse_observation_key_mode(
+    py_obj: &Bound<'_, PyAny>,
+) -> PyResult<infotheory::aixi::common::ObservationKeyMode> {
+    if let Ok(mode) = py_obj.extract::<PyRef<'_, PyObservationKeyMode>>() {
+        return Ok(mode.inner);
+    }
+
+    if let Ok(s) = py_obj.extract::<String>() {
+        match s.to_ascii_lowercase().as_str() {
+            "first" => return Ok(infotheory::aixi::common::ObservationKeyMode::First),
+            "last" => return Ok(infotheory::aixi::common::ObservationKeyMode::Last),
+            "streamhash" | "stream_hash" | "hash" => {
+                return Ok(infotheory::aixi::common::ObservationKeyMode::StreamHash);
+            }
+            "fullstream" | "full_stream" => {
+                return Ok(infotheory::aixi::common::ObservationKeyMode::FullStream);
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown ObservationKeyMode '{s}' (expected one of: first, last, stream_hash, full_stream)"
+                )));
+            }
+        }
+    }
+    Err(PyValueError::new_err(
+        "ObservationKeyMode must be an ObservationKeyMode enum value or string alias",
+    ))
+}
+
 fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend> {
     let m = method.unwrap_or_default();
     match name.to_ascii_lowercase().as_str() {
@@ -1140,29 +1169,29 @@ impl PyNcdVariant {
 #[pyfunction]
 #[pyo3(signature = (mode, observations, observation_bits))]
 fn observation_key_from_stream(
-    mode: &PyObservationKeyMode,
+    mode: &Bound<'_, PyAny>,
     observations: Vec<u64>,
     observation_bits: usize,
-) -> u64 {
-    infotheory::aixi::common::observation_key_from_stream(
-        mode.inner,
+) -> PyResult<u64> {
+    Ok(infotheory::aixi::common::observation_key_from_stream(
+        parse_observation_key_mode(mode)?,
         &observations,
         observation_bits,
-    )
+    ))
 }
 
 #[pyfunction]
 #[pyo3(signature = (mode, observations, observation_bits))]
 fn observation_repr_from_stream(
-    mode: &PyObservationKeyMode,
+    mode: &Bound<'_, PyAny>,
     observations: Vec<u64>,
     observation_bits: usize,
-) -> Vec<u64> {
-    infotheory::aixi::common::observation_repr_from_stream(
-        mode.inner,
+) -> PyResult<Vec<u64>> {
+    Ok(infotheory::aixi::common::observation_repr_from_stream(
+        parse_observation_key_mode(mode)?,
         &observations,
         observation_bits,
-    )
+    ))
 }
 
 #[pyfunction]
@@ -1349,10 +1378,14 @@ impl infotheory::aixi::model::Predictor for PyPredictorShim {
     }
 
     fn boxed_clone(&self) -> Box<dyn infotheory::aixi::model::Predictor> {
-        let cloned = {
+        // Keep lock ordering consistent (GIL -> mutex) across all callbacks.
+        // Clone a Py handle under lock, then perform callback-driven cloning
+        // after releasing the mutex.
+        let src = Python::attach(|py| {
             let guard = lock_recover(&self.obj);
-            Self::clone_py_obj(&guard)
-        };
+            guard.clone_ref(py)
+        });
+        let cloned = Self::clone_py_obj(&src);
         Box::new(Self::new(cloned))
     }
 }
@@ -1505,24 +1538,11 @@ impl PyAgentSimulatorShim {
     }
 
     fn parse_key_mode(py_obj: &Bound<'_, PyAny>) -> infotheory::aixi::common::ObservationKeyMode {
-        if let Ok(mode) = py_obj.extract::<PyRef<'_, PyObservationKeyMode>>() {
-            return mode.inner;
-        }
-
-        if let Ok(s) = py_obj.extract::<String>() {
-            match s.to_ascii_lowercase().as_str() {
-                "first" => return infotheory::aixi::common::ObservationKeyMode::First,
-                "last" => return infotheory::aixi::common::ObservationKeyMode::Last,
-                "streamhash" | "stream_hash" | "hash" => {
-                    return infotheory::aixi::common::ObservationKeyMode::StreamHash;
-                }
-                "fullstream" | "full_stream" => {
-                    return infotheory::aixi::common::ObservationKeyMode::FullStream;
-                }
-                _ => {}
-            }
-        }
-        infotheory::aixi::common::ObservationKeyMode::FullStream
+        py_result_or_fatal(
+            py_obj.py(),
+            "AgentSimulator.observation_key_mode",
+            parse_observation_key_mode(py_obj),
+        )
     }
 
     fn clone_py_obj(obj: &Py<PyAny>) -> Py<PyAny> {
@@ -1814,24 +1834,38 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
     }
 
     fn boxed_clone_with_seed(&self, seed: u64) -> Box<dyn infotheory::aixi::mcts::AgentSimulator> {
-        let cloned = Python::attach(|py| {
+        enum CloneDecision {
+            InvokeSeedClone(Py<PyAny>),
+            Fallback(Py<PyAny>),
+        }
+
+        let decision = Python::attach(|py| {
             let guard = lock_recover(&self.obj);
+            let src = guard.clone_ref(py);
             let b = guard.bind(py);
-            if py_hasattr_or_fatal(
+            let has_seed_clone = py_hasattr_or_fatal(
                 b,
                 "boxed_clone_with_seed",
                 "AgentSimulator.boxed_clone_with_seed",
-            ) {
-                match b.call_method1("boxed_clone_with_seed", (seed,)) {
+            );
+            if has_seed_clone {
+                CloneDecision::InvokeSeedClone(src)
+            } else {
+                CloneDecision::Fallback(src)
+            }
+        });
+
+        let cloned = match decision {
+            CloneDecision::InvokeSeedClone(src) => Python::attach(|py| {
+                match src.bind(py).call_method1("boxed_clone_with_seed", (seed,)) {
                     Ok(v) => v.unbind(),
                     Err(e) => {
                         fatal_python_callback_error(py, "AgentSimulator.boxed_clone_with_seed", e)
                     }
                 }
-            } else {
-                Self::clone_py_obj(&guard)
-            }
-        });
+            }),
+            CloneDecision::Fallback(src) => Self::clone_py_obj(&src),
+        };
         Box::new(Self::new(cloned))
     }
 }
