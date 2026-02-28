@@ -3,6 +3,7 @@
 use infotheory::{CompressionBackend, compress_bytes_backend, decompress_bytes_backend};
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -58,6 +59,11 @@ fn batch_metrics_output_hash_stability() {
         // Binary is only built in cli-enabled test runs.
         return;
     };
+    if !Path::new(bin).exists() {
+        // Some test invocations expose CARGO_BIN_EXE_* without building
+        // the required-features binary; skip in those configurations.
+        return;
+    }
     let mut child = Command::new(bin)
         .arg("batch")
         .stdin(Stdio::piped())
