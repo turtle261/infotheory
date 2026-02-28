@@ -1478,10 +1478,10 @@ mod tests {
         let state_prev_checksum = weighted_checksum(state.layers[1].att_x_prev.as_slice());
         let v_first_checksum = weighted_checksum(state.v_first.as_slice());
 
-        let expected_probe_checksum = 25.674_567_410_722_375_f64;
+        let expected_probe_checksum = 25.674_967_924_598_604_f64;
         let expected_last_logits_checksum = 0.679_873_816_668_987_3_f64;
-        let expected_state_att_checksum = 130.723_190_760_245_42_f64;
-        let expected_state_prev_checksum = -231.324_942_490_085_96_f64;
+        let expected_state_att_checksum = 129.962_464_237_222_32_f64;
+        let expected_state_prev_checksum = -231.326_208_570_972_08_f64;
         let expected_v_first_checksum = -1.921_361_377_462_744_7_f64;
 
         let tol = 2e-4_f64;

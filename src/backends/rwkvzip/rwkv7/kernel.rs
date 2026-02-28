@@ -638,25 +638,37 @@ pub unsafe fn rwkv7_wkv_update_avx(
             let row = s_h.add(i * HEAD_DIM);
             let v_i = f32x8::splat(*v_h.add(i));
 
-            let s0 = load8(row.add(0)) * w0;
-            let s1 = load8(row.add(8)) * w1;
-            let s2 = load8(row.add(16)) * w2;
-            let s3 = load8(row.add(24)) * w3;
-            let s4 = load8(row.add(32)) * w4;
-            let s5 = load8(row.add(40)) * w5;
-            let s6 = load8(row.add(48)) * w6;
-            let s7 = load8(row.add(56)) * w7;
+            // RWKV7 reference ordering:
+            // 1) overlap t = dot(S_old_row, kk)
+            // 2) decay/write S_new_row = S_old_row * w - t * (kk * a) + v_i * k
+            let old0 = load8(row.add(0));
+            let old1 = load8(row.add(8));
+            let old2 = load8(row.add(16));
+            let old3 = load8(row.add(24));
+            let old4 = load8(row.add(32));
+            let old5 = load8(row.add(40));
+            let old6 = load8(row.add(48));
+            let old7 = load8(row.add(56));
 
-            let mut dot_acc = s0 * kk0;
-            dot_acc = s1.mul_add(kk1, dot_acc);
-            dot_acc = s2.mul_add(kk2, dot_acc);
-            dot_acc = s3.mul_add(kk3, dot_acc);
-            dot_acc = s4.mul_add(kk4, dot_acc);
-            dot_acc = s5.mul_add(kk5, dot_acc);
-            dot_acc = s6.mul_add(kk6, dot_acc);
-            dot_acc = s7.mul_add(kk7, dot_acc);
+            let mut dot_acc = old0 * kk0;
+            dot_acc = old1.mul_add(kk1, dot_acc);
+            dot_acc = old2.mul_add(kk2, dot_acc);
+            dot_acc = old3.mul_add(kk3, dot_acc);
+            dot_acc = old4.mul_add(kk4, dot_acc);
+            dot_acc = old5.mul_add(kk5, dot_acc);
+            dot_acc = old6.mul_add(kk6, dot_acc);
+            dot_acc = old7.mul_add(kk7, dot_acc);
 
             let t = f32x8::splat(dot_acc.reduce_add());
+
+            let s0 = old0 * w0;
+            let s1 = old1 * w1;
+            let s2 = old2 * w2;
+            let s3 = old3 * w3;
+            let s4 = old4 * w4;
+            let s5 = old5 * w5;
+            let s6 = old6 * w6;
+            let s7 = old7 * w7;
 
             let u0 = (v_i * k0) + (s0 - t * kka0);
             let u1 = (v_i * k1) + (s1 - t * kka1);
@@ -874,10 +886,6 @@ mod tests {
             let vec_base = h * N;
             for i in 0..N {
                 let row_base = state_base + i * N;
-                for j in 0..N {
-                    state[row_base + j] *= w[vec_base + j];
-                }
-
                 let mut dot = 0.0;
                 for j in 0..N {
                     dot += state[row_base + j] * kk[vec_base + j];
@@ -885,7 +893,7 @@ mod tests {
 
                 let vi = v[vec_base + i];
                 for j in 0..N {
-                    state[row_base + j] = state[row_base + j]
+                    state[row_base + j] = state[row_base + j] * w[vec_base + j]
                         - dot * (kk[vec_base + j] * a[vec_base + j])
                         + vi * k[vec_base + j];
                 }
@@ -1181,6 +1189,50 @@ mod tests {
     }
 
     #[test]
+    fn rwkv_update_uses_pre_decay_overlap_order() {
+        let num_heads = 1;
+        let mut state = vec![0.0f32; HEAD_DIM * HEAD_DIM];
+        let mut w = vec![1.0f32; HEAD_DIM];
+        let k = vec![0.0f32; HEAD_DIM];
+        let v = vec![0.0f32; HEAD_DIM];
+        let mut kk = vec![0.0f32; HEAD_DIM];
+        let a = vec![1.0f32; HEAD_DIM];
+        let r = vec![0.0f32; HEAD_DIM];
+        let mut y = vec![0.0f32; HEAD_DIM];
+
+        // Construct a row where pre-decay and post-decay overlap differ.
+        // S_old row: [1, 2, 0, ...], w: [0, 1, ...], kk: [1, 1, ...]
+        // Official overlap = dot(S_old, kk) = 3.
+        state[0] = 1.0;
+        state[1] = 2.0;
+        w[0] = 0.0;
+        w[1] = 1.0;
+        kk[0] = 1.0;
+        kk[1] = 1.0;
+
+        unsafe {
+            rwkv7_wkv_update_avx(
+                state.as_mut_ptr(),
+                w.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                kk.as_ptr(),
+                a.as_ptr(),
+                r.as_ptr(),
+                y.as_mut_ptr(),
+                num_heads,
+                HEAD_DIM,
+            )
+        };
+
+        // Expected with official ordering:
+        // S_new = S_old * w - dot(S_old, kk) * (kk * a)
+        //       = [0,2] - 3 * [1,1] = [-3,-1]
+        assert!((state[0] + 3.0).abs() <= 1e-6, "state[0]={}", state[0]);
+        assert!((state[1] + 1.0).abs() <= 1e-6, "state[1]={}", state[1]);
+    }
+
+    #[test]
     fn deterministic_kernel_snapshot() {
         let num_heads = 2;
         let mut rng = Lcg::new(0xDEC0DED);
@@ -1235,11 +1287,11 @@ mod tests {
         let normed_checksum = checksum(&normed);
         let lse_val = lse as f64;
 
-        let expected_state_checksum = 712.653_817_538_841_4_f64;
-        let expected_y_checksum = 3.817_787_693_347_782_f64;
-        let expected_softmax_checksum = 32.405_059_017_241_f64;
-        let expected_normed_checksum = -13.328_749_446_634_902_f64;
-        let expected_lse = 4.160_823_822_021_484_f64;
+        let expected_state_checksum = 9_361.599_056_353_56_f64;
+        let expected_y_checksum = 24.356_927_025_131_88_f64;
+        let expected_softmax_checksum = 32.418_806_117_028_f64;
+        let expected_normed_checksum = -0.442_276_961_402_967_57_f64;
+        let expected_lse = 4.161_582_469_940_185_5_f64;
 
         let tol = 2e-4_f64;
         assert!(
