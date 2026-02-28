@@ -12,12 +12,15 @@ pub struct LayerTiming {
 /// Sink trait used by the model to surface per-layer timings without
 /// committing to a particular profiler implementation.
 pub trait ProfilerSink {
+    /// Start timing a new token forward pass.
     #[inline(always)]
     fn begin_token(&mut self) {}
 
+    /// Record attention-kernel duration for `layer`.
     #[inline(always)]
     fn record_attention(&mut self, _layer: usize, _duration: Duration) {}
 
+    /// Record feed-forward duration for `layer`.
     #[inline(always)]
     fn record_ffn(&mut self, _layer: usize, _duration: Duration) {}
 }
@@ -35,6 +38,7 @@ pub struct LayerProfiler {
 }
 
 impl LayerProfiler {
+    /// Create a layer profiler with `num_layers` counters.
     pub fn new(num_layers: usize) -> Self {
         Self {
             layers: vec![LayerTiming::default(); num_layers],
@@ -43,17 +47,20 @@ impl LayerProfiler {
     }
 
     #[inline]
+    /// Reset token counter and all accumulated timings.
     pub fn reset(&mut self) {
         self.tokens = 0;
         self.layers.fill(LayerTiming::default());
     }
 
     #[inline]
+    /// Number of tokens observed by this profiler.
     pub fn tokens(&self) -> u64 {
         self.tokens
     }
 
     #[inline]
+    /// Per-layer timing accumulators.
     pub fn timings(&self) -> &[LayerTiming] {
         &self.layers
     }

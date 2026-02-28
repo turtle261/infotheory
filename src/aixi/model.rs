@@ -241,6 +241,7 @@ pub struct ZpaqPredictor {
 unsafe impl Sync for ZpaqPredictor {}
 
 impl ZpaqPredictor {
+    /// Create a ZPAQ-backed predictor from a `method` and probability floor.
     pub fn new(method: String, min_prob: f64) -> Self {
         let model = ZpaqRateModel::new(method.clone(), min_prob);
         Self {

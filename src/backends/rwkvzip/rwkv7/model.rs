@@ -18,19 +18,30 @@ use super::weights::Weights;
 /// Model configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Vocabulary size (byte-level models use 256).
     pub vocab_size: usize,
+    /// Hidden channel width `C`.
     pub hidden_size: usize,
+    /// Number of RWKV blocks.
     pub num_layers: usize,
+    /// Number of attention heads `H`.
     pub num_heads: usize,
+    /// Per-head channel width `N` (currently fixed to 64 in kernels).
     pub head_dim: usize,
+    /// Feed-forward intermediate width.
     pub intermediate_size: usize,
+    /// Epsilon for layer normalization.
     pub layer_norm_eps: f32,
-    pub group_norm_eps: f32, // 64e-5 per reference
+    /// Epsilon for group normalization (`64e-5` in reference).
+    pub group_norm_eps: f32,
 
-    // Low-rank dimensions
+    /// Low-rank width for decay projection.
     pub decay_low_rank: usize, // w_lora
+    /// Low-rank width for `a` projection.
     pub a_low_rank: usize,
+    /// Low-rank width for `v` projection.
     pub v_low_rank: usize,
+    /// Low-rank width for `g` projection.
     pub g_low_rank: usize,
 }
 
@@ -54,6 +65,7 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Validate configuration invariants required by current kernels.
     pub fn validate(&self) -> Result<()> {
         if self.vocab_size == 0 {
             bail!("rwkv7 vocab_size must be > 0");
@@ -104,6 +116,7 @@ impl LayerState {
 /// Full model state.
 #[derive(Clone)]
 pub struct State {
+    /// Per-layer recurrent state.
     pub layers: Vec<LayerState>,
     /// First layer's value output (for residual connection) - pre-allocated
     pub v_first: Tensor1D,
@@ -112,6 +125,7 @@ pub struct State {
 }
 
 impl State {
+    /// Allocate a zero-initialized recurrent state for a model configuration.
     pub fn new(cfg: &Config) -> Self {
         Self {
             layers: (0..cfg.num_layers).map(|_| LayerState::new(cfg)).collect(),
@@ -120,6 +134,7 @@ impl State {
         }
     }
 
+    /// Reset recurrent buffers to their initial (all-zero) state.
     pub fn reset(&mut self) {
         self.v_first_set = false;
         self.v_first.zero();
@@ -246,6 +261,7 @@ pub struct ScratchBuffers {
 }
 
 impl ScratchBuffers {
+    /// Allocate reusable per-token scratch buffers sized for `cfg`.
     pub fn new(cfg: &Config) -> Self {
         let c = cfg.hidden_size;
         let i = cfg.intermediate_size;
@@ -648,6 +664,7 @@ impl Model {
         })
     }
 
+    /// Save model weights to a `.safetensors` file plus JSON sidecar config.
     pub fn save_safetensors<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         #[derive(Clone)]
         struct TensorRec {

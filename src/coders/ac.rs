@@ -45,6 +45,9 @@ pub fn softmax_pdf_floor(logits: &[f32], vocab_size: usize) -> Vec<f64> {
     result
 }
 
+/// In-place softmax from logits into a caller-provided `pdf_out` buffer.
+///
+/// `pdf_out.len()` must be at least `vocab_size`.
 pub fn softmax_pdf_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64]) {
     debug_assert!(pdf_out.len() >= vocab_size);
 

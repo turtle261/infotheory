@@ -87,28 +87,50 @@ pub trait OnlineBytePredictor: Send {
 #[allow(clippy::large_enum_variant)]
 pub enum RateBackendPredictor {
     /// ROSA-Plus online suffix automaton.
-    Rosa { model: RosaPlus, min_prob: f64 },
+    Rosa {
+        /// ROSA model state.
+        model: RosaPlus,
+        /// Probability floor for numeric stability.
+        min_prob: f64,
+    },
     /// Byte-wise CTW implemented as 8 factorized bit trees (MSB-first).
-    Ctw { tree: FacContextTree, min_prob: f64 },
+    Ctw {
+        /// FAC-CTW tree stack (8 bits per byte).
+        tree: FacContextTree,
+        /// Probability floor for numeric stability.
+        min_prob: f64,
+    },
     /// Factorized CTW with configurable bit-encoding (LSB-first).
     FacCtw {
+        /// FAC-CTW tree stack for configured bit width.
         tree: FacContextTree,
+        /// Active bit-width per symbol.
         bits_per_symbol: usize,
+        /// Probability floor for numeric stability.
         min_prob: f64,
     },
     /// RWKV-7 neural predictor.
     #[cfg(feature = "backend-rwkv")]
     Rwkv7 {
+        /// RWKV compressor/runtime state.
         compressor: rwkvzip::Compressor,
+        /// Whether the first-token distribution has been primed.
         primed: bool,
+        /// Probability floor for numeric stability.
         min_prob: f64,
     },
     /// ZPAQ streaming rate model.
-    Zpaq { model: ZpaqRateModel },
+    Zpaq {
+        /// ZPAQ rate model state.
+        model: ZpaqRateModel,
+    },
     /// Online mixture over experts (Bayes, fading Bayes, switching, MDL).
     Mixture {
+        /// Active mixture runtime.
         runtime: MixtureRuntime,
+        /// Pending symbol when caller separates `log_prob` and `update`.
         pending_symbol: Option<u8>,
+        /// Cached pending log-probability for the pending symbol.
         pending_logp: f64,
     },
 }
@@ -387,6 +409,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
 /// Configuration for a mixture expert.
 #[derive(Clone)]
 pub struct ExpertConfig {
+    /// Human-readable expert identifier.
     pub name: String,
     /// Log prior weight (natural log). Uniform priors can be `0.0`.
     pub log_prior: f64,
@@ -557,6 +580,7 @@ pub struct BayesMixture {
 }
 
 impl BayesMixture {
+    /// Construct a normalized Bayes mixture from expert configs.
     pub fn new(configs: &[ExpertConfig]) -> Self {
         let mut experts: Vec<ExpertState> = configs.iter().map(|c| c.build()).collect();
         let log_priors: Vec<f64> = experts.iter().map(|e| e.log_prior).collect();
@@ -659,6 +683,7 @@ pub struct FadingBayesMixture {
 }
 
 impl FadingBayesMixture {
+    /// Construct a fading Bayes mixture with decay in `[0, 1]`.
     pub fn new(configs: &[ExpertConfig], decay: f64) -> Self {
         let mut experts: Vec<ExpertState> = configs.iter().map(|c| c.build()).collect();
         let log_priors: Vec<f64> = experts.iter().map(|e| e.log_prior).collect();
@@ -742,6 +767,7 @@ pub struct SwitchingMixture {
 }
 
 impl SwitchingMixture {
+    /// Construct a switching mixture with switch probability `alpha`.
     pub fn new(configs: &[ExpertConfig], alpha: f64) -> Self {
         let mut experts: Vec<ExpertState> = configs.iter().map(|c| c.build()).collect();
         let log_priors: Vec<f64> = experts.iter().map(|e| e.log_prior).collect();
@@ -854,6 +880,7 @@ pub struct MdlSelector {
 }
 
 impl MdlSelector {
+    /// Construct an MDL-style expert selector.
     pub fn new(configs: &[ExpertConfig]) -> Self {
         let experts: Vec<ExpertState> = configs.iter().map(|c| c.build()).collect();
         let last_best = 0usize;
@@ -932,10 +959,15 @@ impl MdlSelector {
 // Mixture Runtime Helper (for RateBackend::Mixture)
 // =============================================================================
 
+/// Runtime wrapper over concrete mixture strategies.
 pub enum MixtureRuntime {
+    /// Bayes mixture.
     Bayes(BayesMixture),
+    /// Fading Bayes mixture.
     Fading(FadingBayesMixture),
+    /// Switching mixture.
     Switching(SwitchingMixture),
+    /// MDL selector.
     Mdl(MdlSelector),
 }
 

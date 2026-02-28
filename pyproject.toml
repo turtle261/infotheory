@@ -26,6 +26,7 @@ Repository = "https://github.com/turtle261/infotheory"
 dev = [
   "maturin>=1.7,<2",
   "pytest>=8.0",
+  "pytest-cov>=7.0.0",
 ]
 
 [tool.maturin]
@@ -35,4 +36,10 @@ python-source = "python"
 features = ["python-extension", "backend-rosa", "backend-rwkv", "backend-zpaq"]
 include = [
   { path = "python/infotheory_rs/**/*.py", format = ["sdist", "wheel"] },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+markers = [
+  "vm: tests that require bindings compiled with the vm feature",
 ]

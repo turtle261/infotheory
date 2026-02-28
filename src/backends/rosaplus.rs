@@ -1121,6 +1121,7 @@ impl SampleScratch {
 }
 
 #[derive(Clone)]
+/// ROSA+ predictive model with optional transactional updates.
 pub struct RosaPlus {
     max_order: i64,
     use_eot: bool,
@@ -1160,6 +1161,9 @@ pub struct RosaTx {
 }
 
 impl RosaPlus {
+    /// Create a new ROSA+ model.
+    ///
+    /// `max_order < 0` enables adaptive order selection in predictive scoring.
     pub fn new(max_order: i64, use_eot: bool, eot_char: u8, seed: u64) -> Self {
         let sam = Sam::new(0);
         RosaPlus {
@@ -1176,6 +1180,7 @@ impl RosaPlus {
         }
     }
 
+    /// Train on one byte sequence, optionally appending EOT marker.
     pub fn train_example(&mut self, s: &[u8]) {
         if s.is_empty() {
             return;
@@ -1197,6 +1202,7 @@ impl RosaPlus {
         self.lm_built = false;
     }
 
+    /// Build the language model from current SAM state.
     pub fn build_lm(&mut self) {
         self.sam.finalize_endpos();
         self.lm = LM::default();
@@ -1492,6 +1498,7 @@ impl RosaPlus {
         }
     }
 
+    /// Approximate in-memory footprint of major model buffers.
     pub fn estimated_size_bytes(&self) -> usize {
         use std::mem::size_of;
 
@@ -1522,6 +1529,7 @@ impl RosaPlus {
         n
     }
 
+    /// Shrink auxiliary scratch buffers to fit current usage.
     pub fn shrink_aux_buffers(&mut self) {
         self.dist.shrink_to_fit();
         self.scratch.idx.shrink_to_fit();
@@ -1668,6 +1676,9 @@ impl RosaPlus {
         self.lm.alphabet[sym]
     }
 
+    /// Generate continuation bytes from a prompt.
+    ///
+    /// Returns `None` if LM is not built yet.
     pub fn generate(&mut self, prompt: &[u8], steps: i32) -> Option<Vec<u8>> {
         if !self.lm_built {
             return None;
@@ -1765,6 +1776,7 @@ impl RosaPlus {
         Self::predictive_entropy_rate_order(data, self.max_order, self.seed)
     }
 
+    /// Predictive entropy rate on codepoint streams.
     pub fn entropy_rate_cps(&mut self, cps: &[u32]) -> f64 {
         if cps.len() < 2 {
             return 0.0;
@@ -1830,6 +1842,7 @@ impl RosaPlus {
         }
     }
 
+    /// Cross entropy of byte data under current LM state.
     pub fn cross_entropy(&self, data: &[u8]) -> f64 {
         if !self.lm_built || data.is_empty() {
             return 0.0;
@@ -1846,6 +1859,7 @@ impl RosaPlus {
         -total_log_prob / (data.len() as f64)
     }
 
+    /// Cross entropy of codepoint data under current LM state.
     pub fn cross_entropy_cps(&self, data: &[u32]) -> f64 {
         if !self.lm_built || data.is_empty() {
             return 0.0;
@@ -1917,6 +1931,7 @@ impl RosaPlus {
         h
     }
 
+    /// Persist trained SAM+LM state to disk.
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         if !self.lm_built {
             return Err(std::io::Error::other("LM not built"));
@@ -1984,6 +1999,7 @@ impl RosaPlus {
         Ok(())
     }
 
+    /// Load a previously saved ROSA+ model from disk.
     pub fn load(path: &str) -> std::io::Result<Self> {
         let mut f = BufReader::with_capacity(1024 * 1024, File::open(path)?);
         let mut magic = vec![0u8; MAGIC.len()];
@@ -2152,6 +2168,7 @@ impl RosaPlus {
         Ok(m)
     }
 
+    /// Probability of `sym` from current SAM cursor (`sam.last`).
     pub fn prob_for_last(&mut self, sym: u32) -> f64 {
         if !self.lm_built {
             self.build_lm();

@@ -326,6 +326,7 @@ fn test_trace_config() {
 
 #[test]
 fn test_payload_encoding_from_str() {
+    // Inherent parser should work without importing `std::str::FromStr`.
     assert!(matches!(
         PayloadEncoding::from_str("utf8"),
         Some(PayloadEncoding::Utf8)
@@ -339,6 +340,21 @@ fn test_payload_encoding_from_str() {
         Some(PayloadEncoding::Hex)
     ));
     assert!(PayloadEncoding::from_str("unknown").is_none());
+
+    // `parse` remains equivalent aliasing behavior.
+    assert!(matches!(
+        PayloadEncoding::parse("utf8"),
+        Some(PayloadEncoding::Utf8)
+    ));
+    assert!(matches!(
+        PayloadEncoding::parse("text"),
+        Some(PayloadEncoding::Utf8)
+    ));
+    assert!(matches!(
+        PayloadEncoding::parse("hex"),
+        Some(PayloadEncoding::Hex)
+    ));
+    assert!(PayloadEncoding::parse("unknown").is_none());
 }
 
 // ============================================================================

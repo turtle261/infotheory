@@ -52,16 +52,24 @@ pub use nyx_lite::{ExitReason, NyxVM, SharedMemoryPolicy};
 /// Payload encoding for wire protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PayloadEncoding {
+    /// Treat payloads as UTF-8/text bytes.
     Utf8,
+    /// Treat payloads as hexadecimal text.
     Hex,
 }
 
 impl PayloadEncoding {
+    /// Parse a payload encoding label.
+    ///
+    /// Accepted values are `utf8`, `text`, and `hex`.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         Self::parse(s)
     }
 
+    /// Parse a payload encoding label.
+    ///
+    /// Accepted values are `utf8`, `text`, and `hex`.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "utf8" | "text" => Some(Self::Utf8),
@@ -70,6 +78,7 @@ impl PayloadEncoding {
         }
     }
 
+    /// Decode a wire payload string into raw bytes using this encoding.
     pub fn decode(self, s: &str) -> anyhow::Result<Vec<u8>> {
         match self {
             Self::Utf8 => Ok(s.as_bytes().to_vec()),
@@ -77,6 +86,7 @@ impl PayloadEncoding {
         }
     }
 
+    /// Encode raw bytes for transport over the configured wire protocol.
     pub fn encode(self, bytes: &[u8]) -> String {
         match self {
             Self::Utf8 => String::from_utf8_lossy(bytes).to_string(),
@@ -188,12 +198,16 @@ fn hex_digit(v: u8) -> char {
 /// These are exported for use by custom guest programs.
 #[allow(dead_code)]
 pub const HYPERCALL_EXECDONE: u64 = 0x656e6f6463657865; // "execdone"
+/// Guest requested host-side snapshot operation.
 #[allow(dead_code)]
 pub const HYPERCALL_SNAPSHOT: u64 = 0x746f687370616e73; // "snapshot"
+/// Guest announced nyx-lite protocol/version handshake.
 #[allow(dead_code)]
 pub const HYPERCALL_NYX_LITE: u64 = 0x6574696c2d78796e; // "nyx-lite"
+/// Guest requested shared memory initialization/refresh.
 #[allow(dead_code)]
 pub const HYPERCALL_SHAREMEM: u64 = 0x6d656d6572616873; // "sharemem"
+/// Guest emitted a debug-print hypercall payload.
 #[allow(dead_code)]
 pub const HYPERCALL_DBGPRINT: u64 = 0x746e697270676264; // "dbgprint"
 
@@ -250,23 +264,36 @@ pub struct NyxActionSpec {
 /// Fuzzing mutator types.
 #[derive(Clone, Debug)]
 pub enum FuzzMutator {
+    /// Flip one random bit.
     FlipBit,
+    /// Flip one full byte.
     FlipByte,
+    /// Insert a random byte at a random position.
     InsertByte,
+    /// Delete one random byte.
     DeleteByte,
+    /// Splice bytes from an existing seed input.
     SpliceSeed,
+    /// Replace the working input with a seed input.
     ResetSeed,
+    /// Apply a short sequence of random mutations.
     Havoc,
 }
 
 /// Fuzzing configuration for action generation.
 #[derive(Clone, Debug)]
 pub struct NyxFuzzConfig {
+    /// Corpus used for seed/reset/splice operations.
     pub seeds: Vec<Vec<u8>>,
+    /// Mutator set available for action generation.
     pub mutators: Vec<FuzzMutator>,
+    /// Minimum generated action length.
     pub min_len: usize,
+    /// Maximum generated action length.
     pub max_len: usize,
+    /// Optional dictionary tokens for insertion/splicing.
     pub dictionary: Vec<Vec<u8>>,
+    /// Deterministic RNG seed for mutation sampling.
     pub rng_seed: u64,
 }
 
@@ -318,8 +345,11 @@ pub enum NyxRewardPolicy {
     FromGuest,
     /// Pattern matching on output.
     Pattern {
+        /// Substring/pattern tested against guest output.
         pattern: String,
+        /// Reward returned when the pattern does not match.
         base_reward: i64,
+        /// Additional reward added when the pattern matches.
         bonus_reward: i64,
     },
     /// Custom reward function (callback-based).
@@ -331,16 +361,24 @@ pub enum NyxRewardPolicy {
 pub enum NyxRewardShaping {
     /// Entropy reduction vs baseline.
     EntropyReduction {
+        /// Reference bytes used as baseline data distribution.
         baseline_bytes: Vec<u8>,
+        /// Max order passed to entropy estimators.
         max_order: i64,
+        /// Scaling factor applied to the shaping term.
         scale: f64,
+        /// Optional additive bonus when guest crashes.
         crash_bonus: Option<i64>,
+        /// Optional additive bonus when guest times out.
         timeout_bonus: Option<i64>,
     },
     /// Entropy of trace data (online learning).
     TraceEntropy {
+        /// Max order passed to trace entropy estimation.
         max_order: i64,
+        /// Scaling factor applied to the shaping term.
         scale: f64,
+        /// If true, normalize by trace length.
         normalize: bool,
     },
 }
@@ -473,6 +511,7 @@ pub struct NyxVmConfig {
     pub trace: Option<NyxTraceConfig>,
 
     // Debug mode
+    /// Enable verbose VM/protocol diagnostics.
     pub debug_mode: bool,
 
     // Crash logging
@@ -537,18 +576,30 @@ pub struct NyxStepResult {
 /// Simplified exit reason categories.
 #[derive(Clone, Debug)]
 pub enum NyxExitKind {
+    /// Guest terminated normally with an application-defined code.
     ExecDone(u64),
+    /// Step timed out before a terminal signal/response.
     Timeout,
+    /// VM reported a shutdown event.
     Shutdown,
+    /// Raw hypercall event with integer arguments.
     Hypercall {
+        /// Hypercall identifier/magic value.
         code: u64,
+        /// Hypercall argument 1.
         arg1: u64,
+        /// Hypercall argument 2.
         arg2: u64,
+        /// Hypercall argument 3.
         arg3: u64,
+        /// Hypercall argument 4.
         arg4: u64,
     },
+    /// Debug string emitted by guest/host bridge.
     DebugPrint(String),
+    /// Breakpoint/trap-like stop event.
     Breakpoint,
+    /// Uncategorized exit event represented as text.
     Other(String),
 }
 

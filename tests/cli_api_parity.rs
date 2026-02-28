@@ -1,0 +1,241 @@
+#![cfg(all(feature = "cli", feature = "backend-rosa", feature = "backend-zpaq"))]
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use infotheory::{
+    NcdVariant, biased_entropy_rate_bytes, cross_entropy_rate_bytes, entropy_rate_bytes,
+    marginal_entropy_bytes, ncd_matrix_bytes, ncd_paths,
+};
+use serde_json::Value;
+
+fn run_batch(input: &Value) -> Value {
+    let bin = env!("CARGO_BIN_EXE_infotheory");
+    let mut child = Command::new(bin)
+        .arg("batch")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn infotheory batch");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        let line = serde_json::to_string(input).expect("failed to encode json input");
+        writeln!(stdin, "{line}").expect("failed to write json input");
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to read batch output");
+    assert!(
+        output.status.success(),
+        "batch exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is not utf-8");
+    serde_json::from_str(stdout.lines().next().unwrap_or("")).expect("invalid batch json")
+}
+
+fn as_f64(obj: &Value, key: &str) -> f64 {
+    obj.get(key)
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("missing/invalid key '{key}' in {obj}"))
+}
+
+fn assert_close(actual: f64, expected: f64, tol: f64, label: &str) {
+    let delta = (actual - expected).abs();
+    assert!(
+        delta <= tol,
+        "{label} mismatch: actual={actual}, expected={expected}, delta={delta}, tol={tol}"
+    );
+}
+
+fn rosa_distance_like_cli(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+    let h_x_x = biased_entropy_rate_bytes(x, max_order);
+    let h_y_y = biased_entropy_rate_bytes(y, max_order);
+    let h_y_x = cross_entropy_rate_bytes(x, y, max_order);
+    let h_x_y = cross_entropy_rate_bytes(y, x, max_order);
+    if h_x_x < 1e-9 || h_y_y < 1e-9 {
+        return 1.0;
+    }
+    (0.5 * (h_y_x / h_x_x + h_x_y / h_y_y) - 1.0).clamp(0.0, 1.0)
+}
+
+#[test]
+fn metrics_text_parity_with_library() {
+    let text = "entropy parity text";
+    let max_order = 5;
+    let out = run_batch(&serde_json::json!({
+        "op": "metrics",
+        "text": text,
+        "max_order": max_order,
+    }));
+
+    let data = text.as_bytes();
+    let h0 = marginal_entropy_bytes(data);
+    let h_rate = entropy_rate_bytes(data, max_order);
+    let id = ((h0 - h_rate) / h0).clamp(0.0, 1.0);
+
+    assert_close(as_f64(&out, "h0"), h0, 1e-6, "h0");
+    assert_close(as_f64(&out, "h_rate"), h_rate, 1e-6, "h_rate");
+    assert_close(as_f64(&out, "id"), id, 1e-6, "id");
+    assert_eq!(
+        out.get("len").and_then(Value::as_u64),
+        Some(data.len() as u64),
+        "length mismatch"
+    );
+}
+
+#[test]
+fn metrics_file_parity_with_library() {
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fixture_a.txt");
+    let bytes = std::fs::read(fixture).expect("failed to read fixture");
+    let out = run_batch(&serde_json::json!({
+        "op": "metrics_file",
+        "path": fixture,
+        "max_order": 3,
+    }));
+
+    let h0 = marginal_entropy_bytes(&bytes);
+    let h_rate = entropy_rate_bytes(&bytes, 3);
+    let id = if h0 < 1e-9 {
+        0.0
+    } else {
+        ((h0 - h_rate) / h0).clamp(0.0, 1.0)
+    };
+
+    assert_close(as_f64(&out, "h0"), h0, 1e-6, "h0");
+    assert_close(as_f64(&out, "h_rate"), h_rate, 1e-6, "h_rate");
+    assert_close(as_f64(&out, "id"), id, 1e-6, "id");
+    assert_eq!(
+        out.get("len").and_then(Value::as_u64),
+        Some(bytes.len() as u64),
+        "length mismatch"
+    );
+}
+
+#[test]
+fn ncd_file_parity_with_library() {
+    let a = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fixture_a.txt");
+    let b = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fixture_b.txt");
+    let out = run_batch(&serde_json::json!({
+        "op": "ncd_files",
+        "path1": a,
+        "path2": b,
+        "method": "5",
+        "variant": "vitanyi",
+    }));
+    let rust_val = ncd_paths(a, b, "5", NcdVariant::Vitanyi);
+    assert_close(as_f64(&out, "ncd"), rust_val, 1e-6, "ncd");
+}
+
+#[test]
+fn cross_entropy_parity_with_library() {
+    let x = "abracadabra";
+    let y = "alakazam";
+    let max_order = 3;
+    let out = run_batch(&serde_json::json!({
+        "op": "cross_entropy",
+        "text_x": x,
+        "text_y": y,
+        "max_order": max_order,
+    }));
+    let rust_val = cross_entropy_rate_bytes(x.as_bytes(), y.as_bytes(), max_order);
+    assert_close(
+        as_f64(&out, "cross_entropy"),
+        rust_val,
+        1e-6,
+        "cross_entropy",
+    );
+}
+
+#[test]
+fn batch_metrics_parity_with_library() {
+    let texts = vec!["abracadabra", "alakazam", "xyzxyz"];
+    let max_order = 4;
+    let out = run_batch(&serde_json::json!({
+        "op": "batch_metrics",
+        "texts": texts,
+        "max_order": max_order,
+    }));
+    let rows = out
+        .get("results")
+        .and_then(Value::as_array)
+        .expect("missing results array");
+    assert_eq!(rows.len(), texts.len());
+
+    for (idx, text) in texts.iter().enumerate() {
+        let data = text.as_bytes();
+        let h0 = marginal_entropy_bytes(data);
+        let h_rate = entropy_rate_bytes(data, max_order);
+        let id = if h0 < 1e-9 {
+            0.0
+        } else {
+            ((h0 - h_rate) / h0).clamp(0.0, 1.0)
+        };
+        assert_close(as_f64(&rows[idx], "h0"), h0, 1e-6, "h0");
+        assert_close(as_f64(&rows[idx], "h_rate"), h_rate, 1e-6, "h_rate");
+        assert_close(as_f64(&rows[idx], "id"), id, 1e-6, "id");
+        assert_eq!(
+            rows[idx].get("len").and_then(Value::as_u64),
+            Some(data.len() as u64)
+        );
+    }
+}
+
+#[test]
+fn ncd_matrix_parity_with_library() {
+    let texts = vec!["abracadabra", "alakazam", "xyzxyz"];
+    let datas: Vec<Vec<u8>> = texts.iter().map(|s| s.as_bytes().to_vec()).collect();
+    let out = run_batch(&serde_json::json!({
+        "op": "ncd_matrix",
+        "texts": texts,
+        "method": "5",
+        "variant": "sym",
+    }));
+    let n = out.get("n").and_then(Value::as_u64).expect("missing n") as usize;
+    let matrix = out
+        .get("matrix")
+        .and_then(Value::as_array)
+        .expect("missing matrix");
+    assert_eq!(matrix.len(), n);
+    let rust_flat = ncd_matrix_bytes(&datas, "5", NcdVariant::SymVitanyi);
+    for i in 0..n {
+        let row = matrix[i].as_array().expect("row must be array");
+        for j in 0..n {
+            let val = row[j].as_f64().expect("entry must be number");
+            assert_close(val, rust_flat[i * n + j], 1e-6, "ncd_matrix");
+        }
+    }
+}
+
+#[test]
+fn rosa_matrix_parity_with_library_formula() {
+    let texts = vec!["abracadabra", "alakazam", "xyzxyz"];
+    let max_order = 3;
+    let out = run_batch(&serde_json::json!({
+        "op": "rosa_matrix",
+        "texts": texts,
+        "max_order": max_order,
+    }));
+    let n = out.get("n").and_then(Value::as_u64).expect("missing n") as usize;
+    let matrix = out
+        .get("matrix")
+        .and_then(Value::as_array)
+        .expect("missing matrix");
+    assert_eq!(matrix.len(), n);
+
+    for i in 0..n {
+        let row = matrix[i].as_array().expect("row must be array");
+        for j in 0..n {
+            let val = row[j].as_f64().expect("entry must be number");
+            let expected = if i == j {
+                0.0
+            } else {
+                rosa_distance_like_cli(texts[i].as_bytes(), texts[j].as_bytes(), max_order)
+            };
+            assert_close(val, expected, 1e-6, "rosa_matrix");
+        }
+    }
+}

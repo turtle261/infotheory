@@ -468,28 +468,34 @@ mod simd {
     }
 }
 #[cfg(target_arch = "x86_64")]
+/// SIMD lane-parallel rANS types on x86_64.
 pub use simd::*;
 
 #[cfg(not(target_arch = "x86_64"))]
+/// Number of SIMD lanes for the portable fallback (single-lane).
 pub const RANS_LANES: usize = 1;
 
 #[cfg(not(target_arch = "x86_64"))]
+/// Portable wrapper that maps SIMD encoder API to scalar rANS.
 pub struct SimdRansEncoder {
     inner: RansEncoder,
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 impl SimdRansEncoder {
+    /// Create a fallback single-lane encoder.
     pub fn new() -> Self {
         Self {
             inner: RansEncoder::new(),
         }
     }
 
+    /// Encode one symbol using scalar rANS.
     pub fn encode(&mut self, cdf: &Cdf) {
         self.inner.encode(cdf);
     }
 
+    /// Finalize encoding and return encoded bytes.
     pub fn finish(self) -> Vec<u8> {
         self.inner.finish()
     }
@@ -503,18 +509,21 @@ impl Default for SimdRansEncoder {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
+/// Portable wrapper that maps SIMD decoder API to scalar rANS.
 pub struct SimdRansDecoder<'a> {
     inner: RansDecoder<'a>,
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 impl<'a> SimdRansDecoder<'a> {
+    /// Create a fallback single-lane decoder.
     pub fn new(input: &'a [u8]) -> anyhow::Result<Self> {
         Ok(Self {
             inner: RansDecoder::new(input)?,
         })
     }
 
+    /// Decode one symbol using scalar rANS.
     pub fn decode(&mut self, cdf: &[u32]) -> anyhow::Result<usize> {
         self.inner.decode(cdf)
     }
@@ -539,6 +548,7 @@ pub struct BlockedRansEncoder {
 }
 
 impl BlockedRansEncoder {
+    /// Create an empty blocked encoder.
     pub fn new() -> Self {
         Self {
             symbols: Vec::with_capacity(BLOCK_SIZE),

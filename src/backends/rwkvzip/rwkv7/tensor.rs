@@ -38,31 +38,37 @@ impl Tensor1D {
     }
 
     #[inline]
+    /// Number of logical elements.
     pub fn len(&self) -> usize {
         self.len
     }
 
     #[inline]
+    /// Returns `true` when `len() == 0`.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     #[inline]
+    /// Raw pointer to the aligned backing buffer.
     pub fn as_ptr(&self) -> *const f32 {
         self.data.as_ptr()
     }
 
     #[inline]
+    /// Mutable raw pointer to the aligned backing buffer.
     pub fn as_mut_ptr(&mut self) -> *mut f32 {
         self.data.as_ptr()
     }
 
     #[inline]
+    /// Immutable slice over logical elements.
     pub fn as_slice(&self) -> &[f32] {
         unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.len) }
     }
 
     #[inline]
+    /// Mutable slice over logical elements.
     pub fn as_mut_slice(&mut self) -> &mut [f32] {
         unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }
     }
@@ -173,26 +179,31 @@ impl Tensor2D {
     }
 
     #[inline]
+    /// Number of matrix rows.
     pub fn rows(&self) -> usize {
         self.rows
     }
 
     #[inline]
+    /// Number of logical columns (excluding stride padding).
     pub fn cols(&self) -> usize {
         self.cols
     }
 
     #[inline]
+    /// Row stride in elements (includes alignment padding).
     pub fn stride(&self) -> usize {
         self.stride
     }
 
     #[inline]
+    /// Raw pointer to matrix storage.
     pub fn as_ptr(&self) -> *const f32 {
         self.data.as_ptr()
     }
 
     #[inline]
+    /// Mutable raw pointer to matrix storage.
     pub fn as_mut_ptr(&mut self) -> *mut f32 {
         self.data.as_ptr()
     }
@@ -283,26 +294,31 @@ pub struct TensorView1D<'a> {
 
 impl<'a> TensorView1D<'a> {
     #[inline]
+    /// Wrap an immutable 1D slice.
     pub fn new(data: &'a [f32]) -> Self {
         Self { data }
     }
 
     #[inline]
+    /// Number of elements in the view.
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
     #[inline]
+    /// Returns `true` when the view is empty.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
     #[inline]
+    /// Raw pointer to the first element.
     pub fn as_ptr(&self) -> *const f32 {
         self.data.as_ptr()
     }
 
     #[inline]
+    /// Borrow the underlying immutable slice.
     pub fn as_slice(&self) -> &[f32] {
         self.data
     }
@@ -327,27 +343,32 @@ pub struct TensorView2D<'a> {
 
 impl<'a> TensorView2D<'a> {
     #[inline]
+    /// Wrap row-major data with explicit `(rows, cols)` logical shape.
     pub fn new(data: &'a [f32], rows: usize, cols: usize) -> Self {
         debug_assert_eq!(data.len(), rows * cols);
         Self { data, rows, cols }
     }
 
     #[inline]
+    /// Number of rows in the view.
     pub fn rows(&self) -> usize {
         self.rows
     }
 
     #[inline]
+    /// Number of columns in the view.
     pub fn cols(&self) -> usize {
         self.cols
     }
 
     #[inline]
+    /// Raw pointer to the first element.
     pub fn as_ptr(&self) -> *const f32 {
         self.data.as_ptr()
     }
 
     #[inline]
+    /// Borrow row `r`.
     pub fn row(&self, r: usize) -> &[f32] {
         debug_assert!(r < self.rows);
         let start = r * self.cols;
@@ -355,6 +376,7 @@ impl<'a> TensorView2D<'a> {
     }
 
     #[inline]
+    /// Pointer to the first element of row `r`.
     pub fn row_ptr(&self, r: usize) -> *const f32 {
         debug_assert!(r < self.rows);
         unsafe { self.data.as_ptr().add(r * self.cols) }
