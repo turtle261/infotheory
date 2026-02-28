@@ -261,6 +261,7 @@ pub struct ScratchBuffers {
 }
 
 impl ScratchBuffers {
+    /// Allocate reusable per-token scratch buffers sized for `cfg`.
     pub fn new(cfg: &Config) -> Self {
         let c = cfg.hidden_size;
         let i = cfg.intermediate_size;
@@ -663,6 +664,7 @@ impl Model {
         })
     }
 
+    /// Save model weights to a `.safetensors` file plus JSON sidecar config.
     pub fn save_safetensors<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         #[derive(Clone)]
         struct TensorRec {

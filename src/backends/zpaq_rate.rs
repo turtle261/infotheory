@@ -19,6 +19,7 @@ mod imp {
         last_bits: f64,
     }
 
+    /// Stateful ZPAQ-backed estimator of sequential symbol log-probabilities.
     pub struct ZpaqRateModel {
         stream: ZpaqStreaming,
         pending_symbol: Option<u8>,
@@ -28,6 +29,9 @@ mod imp {
     }
 
     impl ZpaqRateModel {
+        /// Create a new model with the provided streamable ZPAQ `method`.
+        ///
+        /// `min_prob` clamps very small probabilities for numerical stability.
         pub fn new(method: impl Into<String>, min_prob: f64) -> Self {
             let method = method.into();
             let min_prob = if min_prob.is_finite() && min_prob > 0.0 {
@@ -52,6 +56,7 @@ mod imp {
             }
         }
 
+        /// Reset model state and clear any pending prediction cache.
         pub fn reset(&mut self) {
             let method = self.method.clone();
             let compressor = StreamingCompressor::new(method.as_str()).unwrap_or_else(|e| {
@@ -76,6 +81,9 @@ mod imp {
             (after - before).max(0.0)
         }
 
+        /// Return `ln p(symbol | history)` under the current model state.
+        ///
+        /// This may cache the encoded-bit result for a matching immediate `update`.
         pub fn log_prob(&mut self, symbol: u8) -> f64 {
             if let Some(pending) = self.pending_symbol {
                 if pending == symbol {
@@ -92,6 +100,7 @@ mod imp {
             logp.max(self.min_prob.ln())
         }
 
+        /// Advance model state with one observed symbol.
         pub fn update(&mut self, symbol: u8) {
             if let Some(pending) = self.pending_symbol
                 && pending == symbol
@@ -104,6 +113,7 @@ mod imp {
             let _ = self.encode_bits(symbol);
         }
 
+        /// Score and consume an entire byte slice, returning total code length in bits.
         pub fn update_and_score(&mut self, data: &[u8]) -> f64 {
             if data.is_empty() {
                 return 0.0;
@@ -118,6 +128,7 @@ mod imp {
         }
     }
 
+    /// Validate that `method` is streamable and accepted by the ZPAQ backend.
     pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
         StreamingCompressor::new(method)
             .map(|_| ())
