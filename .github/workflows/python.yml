@@ -46,13 +46,7 @@ jobs:
         run: uv run maturin develop --release
 
       - name: Run tests
-        run: |
-          uv run pytest \
-            --cov=infotheory_rs \
-            --cov-report=term-missing \
-            --cov-report=xml:target/python-coverage.xml \
-            --cov-fail-under=100 \
-            python/tests
+        run: uv run pytest --cov=infotheory_rs --cov-report=term-missing --cov-report=xml:target/python-coverage.xml --cov-fail-under=100 python/tests
 
       - name: Upload Python coverage artifact
         uses: actions/upload-artifact@v4
