@@ -10,10 +10,12 @@
 //! switching, and MDL-style selectors to be used anywhere a rate backend is accepted.
 
 use crate::ctw::FacContextTree;
+use crate::neural_mix::{
+    NeuralHistoryState, NeuralMixCore, normalize_log_prob_row_and_make_logits,
+};
 use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
-use crate::simd_math::{affine3_wide, axpy_wide, dot_wide, logsumexp_wide};
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{MixtureKind, MixtureSpec, RateBackend};
 use std::sync::Arc;
@@ -33,11 +35,6 @@ fn clamp_prob(p: f64, min_prob: f64) -> f64 {
 #[inline]
 fn clamp_unit_prob(p: f64, min_prob: f64) -> f64 {
     clamp_prob(p, min_prob).min(1.0 - min_prob)
-}
-
-#[inline]
-fn sanitize_weight(w: f64) -> f64 {
-    if w.is_finite() { w } else { 0.0 }
 }
 
 #[inline]
@@ -688,6 +685,9 @@ pub struct BayesMixture {
     experts: Vec<ExpertState>,
     scratch_logps: Vec<f64>,
     scratch_mix: Vec<f64>,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
     total_log_loss: f64,
 }
 
@@ -704,6 +704,9 @@ impl BayesMixture {
             experts,
             scratch_logps: vec![0.0; configs.len()],
             scratch_mix: vec![0.0; configs.len()],
+            cached_symbol: 0,
+            cached_log_mix: f64::NEG_INFINITY,
+            cache_valid: false,
             total_log_loss: 0.0,
         }
     }
@@ -713,16 +716,21 @@ impl BayesMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            self.scratch_logps[i] = expert.log_prob(symbol);
-            self.scratch_mix[i] = expert.log_weight + self.scratch_logps[i];
-        }
-        let log_mix = logsumexp(&self.scratch_mix);
+        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
+            self.cached_log_mix
+        } else {
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                self.scratch_logps[i] = expert.log_prob(symbol);
+                self.scratch_mix[i] = expert.log_weight + self.scratch_logps[i];
+            }
+            logsumexp(&self.scratch_mix)
+        };
         for (i, expert) in self.experts.iter_mut().enumerate() {
             expert.log_weight = expert.log_weight + self.scratch_logps[i] - log_mix;
             expert.cum_log_loss -= self.scratch_logps[i];
             expert.update(symbol);
         }
+        self.cache_valid = false;
         self.total_log_loss -= log_mix;
         log_mix
     }
@@ -732,9 +740,14 @@ impl BayesMixture {
             return f64::NEG_INFINITY;
         }
         for (i, expert) in self.experts.iter_mut().enumerate() {
-            self.scratch_mix[i] = expert.log_weight + expert.log_prob(symbol);
+            self.scratch_logps[i] = expert.log_prob(symbol);
+            self.scratch_mix[i] = expert.log_weight + self.scratch_logps[i];
         }
-        logsumexp(&self.scratch_mix)
+        let log_mix = logsumexp(&self.scratch_mix);
+        self.cached_symbol = symbol;
+        self.cached_log_mix = log_mix;
+        self.cache_valid = true;
+        log_mix
     }
 
     /// Posterior weights (normalized) over experts.
@@ -801,6 +814,9 @@ pub struct FadingBayesMixture {
     decay: f64,
     scratch_logps: Vec<f64>,
     scratch_mix: Vec<f64>,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
     total_log_loss: f64,
 }
 
@@ -819,6 +835,9 @@ impl FadingBayesMixture {
             decay,
             scratch_logps: vec![0.0; configs.len()],
             scratch_mix: vec![0.0; configs.len()],
+            cached_symbol: 0,
+            cached_log_mix: f64::NEG_INFINITY,
+            cache_valid: false,
             total_log_loss: 0.0,
         }
     }
@@ -828,18 +847,23 @@ impl FadingBayesMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            self.scratch_logps[i] = expert.log_prob(symbol);
-            let decayed = self.decay * expert.log_weight;
-            self.scratch_mix[i] = decayed + self.scratch_logps[i];
-        }
-        let log_mix = logsumexp(&self.scratch_mix);
+        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
+            self.cached_log_mix
+        } else {
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                self.scratch_logps[i] = expert.log_prob(symbol);
+                let decayed = self.decay * expert.log_weight;
+                self.scratch_mix[i] = decayed + self.scratch_logps[i];
+            }
+            logsumexp(&self.scratch_mix)
+        };
         for (i, expert) in self.experts.iter_mut().enumerate() {
             let decayed = self.decay * expert.log_weight;
             expert.log_weight = decayed + self.scratch_logps[i] - log_mix;
             expert.cum_log_loss -= self.scratch_logps[i];
             expert.update(symbol);
         }
+        self.cache_valid = false;
         self.total_log_loss -= log_mix;
         log_mix
     }
@@ -849,9 +873,14 @@ impl FadingBayesMixture {
             return f64::NEG_INFINITY;
         }
         for (i, expert) in self.experts.iter_mut().enumerate() {
-            self.scratch_mix[i] = self.decay * expert.log_weight + expert.log_prob(symbol);
+            self.scratch_logps[i] = expert.log_prob(symbol);
+            self.scratch_mix[i] = self.decay * expert.log_weight + self.scratch_logps[i];
         }
-        logsumexp(&self.scratch_mix)
+        let log_mix = logsumexp(&self.scratch_mix);
+        self.cached_symbol = symbol;
+        self.cached_log_mix = log_mix;
+        self.cache_valid = true;
+        log_mix
     }
 
     /// Posterior weights (normalized) over experts.
@@ -895,6 +924,9 @@ pub struct SwitchingMixture {
     log_1m_alpha: f64,
     scratch_logps: Vec<f64>,
     scratch_switch: Vec<f64>,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
     total_log_loss: f64,
 }
 
@@ -916,6 +948,9 @@ impl SwitchingMixture {
             log_1m_alpha: (1.0 - alpha).ln(),
             scratch_logps: vec![0.0; configs.len()],
             scratch_switch: vec![0.0; configs.len()],
+            cached_symbol: 0,
+            cached_log_mix: f64::NEG_INFINITY,
+            cache_valid: false,
             total_log_loss: 0.0,
         }
     }
@@ -925,24 +960,28 @@ impl SwitchingMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            self.scratch_logps[i] = expert.log_prob(symbol);
-        }
-
-        for i in 0..self.experts.len() {
-            let log_switch = logsumexp2(
-                self.log_1m_alpha + self.experts[i].log_weight,
-                self.log_alpha + self.log_prior[i],
-            );
-            self.scratch_switch[i] = self.scratch_logps[i] + log_switch;
-        }
-        let log_mix = logsumexp(&self.scratch_switch);
+        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
+            self.cached_log_mix
+        } else {
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                self.scratch_logps[i] = expert.log_prob(symbol);
+            }
+            for i in 0..self.experts.len() {
+                let log_switch = logsumexp2(
+                    self.log_1m_alpha + self.experts[i].log_weight,
+                    self.log_alpha + self.log_prior[i],
+                );
+                self.scratch_switch[i] = self.scratch_logps[i] + log_switch;
+            }
+            logsumexp(&self.scratch_switch)
+        };
         for i in 0..self.experts.len() {
             let expert = &mut self.experts[i];
             expert.log_weight = self.scratch_switch[i] - log_mix;
             expert.cum_log_loss -= self.scratch_logps[i];
             expert.update(symbol);
         }
+        self.cache_valid = false;
         self.total_log_loss -= log_mix;
         log_mix
     }
@@ -953,13 +992,18 @@ impl SwitchingMixture {
         }
         for i in 0..self.experts.len() {
             let lp = self.experts[i].log_prob(symbol);
+            self.scratch_logps[i] = lp;
             let log_switch = logsumexp2(
                 self.log_1m_alpha + self.experts[i].log_weight,
                 self.log_alpha + self.log_prior[i],
             );
             self.scratch_switch[i] = lp + log_switch;
         }
-        logsumexp(&self.scratch_switch)
+        let log_mix = logsumexp(&self.scratch_switch);
+        self.cached_symbol = symbol;
+        self.cached_log_mix = log_mix;
+        self.cache_valid = true;
+        log_mix
     }
 
     /// Posterior weights (normalized) over experts.
@@ -1024,34 +1068,10 @@ pub struct MdlSelector {
     scratch_logps: Vec<f64>,
     total_log_loss: f64,
     last_best: usize,
-}
-
-struct NeuralWeightEntry {
-    weights: Vec<f64>,
-    bias: f64,
-}
-
-impl NeuralWeightEntry {
-    fn new(width: usize) -> Self {
-        Self {
-            weights: vec![0.0; width],
-            bias: 0.0,
-        }
-    }
-}
-
-struct NeuralStage2Entry {
-    weights: Vec<f64>,
-    bias: Vec<f64>,
-}
-
-impl NeuralStage2Entry {
-    fn new(width: usize) -> Self {
-        Self {
-            weights: vec![0.0; width],
-            bias: vec![0.0; 256],
-        }
-    }
+    cached_symbol: u8,
+    cached_best_idx: usize,
+    cached_best_logp: f64,
+    cache_valid: bool,
 }
 
 /// Bytewise neural mixer inspired by fx2-cmix online adaptation.
@@ -1064,35 +1084,16 @@ impl NeuralStage2Entry {
 /// 4) per-symbol SGD updates with optional tiny-error skip.
 pub struct NeuralMixture {
     experts: Vec<ExpertState>,
-    stage1_tables: Vec<Vec<NeuralWeightEntry>>,
-    stage2_table: Vec<NeuralStage2Entry>,
-    stage1_lr: f64,
-    stage2_lr: f64,
-    update_skip_threshold: f64,
+    neural: NeuralMixCore,
     min_prob: f64,
-    prev1: u8,
-    prev2: u8,
-    run_len: u16,
-    has_history: bool,
     scratch_expert_logps: Vec<f64>,
     scratch_expert_logits: Vec<f64>,
-    scratch_stage1_out: Vec<f64>,
-    scratch_energy: Vec<f64>,
-    scratch_probs: Vec<f64>,
-    scratch_errors: Vec<f64>,
     eval_cache_valid: bool,
-    eval_cache_prev1: u8,
-    eval_cache_prev2: u8,
-    eval_cache_run_len: u16,
-    eval_cache_has_history: bool,
+    eval_cache_history: NeuralHistoryState,
     total_log_loss: f64,
 }
 
 impl NeuralMixture {
-    const STAGE1_CONTEXTS: usize = 3;
-    const STAGE1_TABLE_SIZES: [usize; Self::STAGE1_CONTEXTS] = [1, 256, 1024];
-    const STAGE2_TABLE_SIZE: usize = 512;
-
     /// Construct a neural mixture. `learning_rate` is taken from `MixtureSpec.alpha`.
     pub fn new(configs: &[ExpertConfig], learning_rate: f64) -> Self {
         let mut experts: Vec<ExpertState> = configs.iter().map(|c| c.build()).collect();
@@ -1108,98 +1109,27 @@ impl NeuralMixture {
             }
         }
 
-        let mut stage1_tables = Vec::with_capacity(Self::STAGE1_CONTEXTS);
-        for (ctx_idx, table_size) in Self::STAGE1_TABLE_SIZES.iter().enumerate() {
-            let mut table = Vec::with_capacity(*table_size);
-            for _ in 0..*table_size {
-                let mut entry = NeuralWeightEntry::new(n);
-                if ctx_idx == 0 {
-                    entry.weights.clone_from(&prior_weights);
-                }
-                table.push(entry);
-            }
-            stage1_tables.push(table);
-        }
-
-        let mut stage2_table = Vec::with_capacity(Self::STAGE2_TABLE_SIZE);
-        for _ in 0..Self::STAGE2_TABLE_SIZE {
-            let mut entry = NeuralStage2Entry::new(Self::STAGE1_CONTEXTS);
-            for w in &mut entry.weights {
-                *w = 1.0 / (Self::STAGE1_CONTEXTS as f64);
-            }
-            stage2_table.push(entry);
-        }
-
         let base_lr = if learning_rate.is_finite() {
             learning_rate.abs().clamp(1e-6, 1.0)
         } else {
             0.03
         };
+        let neural = NeuralMixCore::new(n, &prior_weights, base_lr * 0.5, base_lr, 1e-5);
+        let eval_cache_history = neural.history_state();
 
         Self {
             experts,
-            stage1_tables,
-            stage2_table,
-            stage1_lr: base_lr * 0.5,
-            stage2_lr: base_lr,
-            update_skip_threshold: 1e-5,
+            neural,
             min_prob: DEFAULT_MIN_PROB,
-            prev1: 0,
-            prev2: 0,
-            run_len: 0,
-            has_history: false,
             scratch_expert_logps: vec![0.0; n * 256],
             scratch_expert_logits: vec![0.0; n * 256],
-            scratch_stage1_out: vec![0.0; Self::STAGE1_CONTEXTS * 256],
-            scratch_energy: vec![0.0; 256],
-            scratch_probs: vec![0.0; 256],
-            scratch_errors: vec![0.0; 256],
             eval_cache_valid: false,
-            eval_cache_prev1: 0,
-            eval_cache_prev2: 0,
-            eval_cache_run_len: 0,
-            eval_cache_has_history: false,
+            eval_cache_history,
             total_log_loss: 0.0,
         }
     }
 
-    #[inline]
-    fn stage1_context_indices(&self) -> [usize; Self::STAGE1_CONTEXTS] {
-        if !self.has_history {
-            return [0, 0, 0];
-        }
-        let run_bucket = (self.run_len.min(63) as usize) & 0x3f;
-        let h = ((self.prev1 as usize) << 10)
-            ^ ((self.prev2 as usize) << 2)
-            ^ run_bucket
-            ^ (((self.prev1 ^ self.prev2) as usize) << 5);
-        [0, self.prev1 as usize, h % Self::STAGE1_TABLE_SIZES[2]]
-    }
-
-    #[inline]
-    fn stage2_context_index(&self) -> usize {
-        if !self.has_history {
-            return 0;
-        }
-        let run_bucket = (self.run_len.min(127) as usize) & 0x7f;
-        let h = ((self.prev1 as usize) << 8) ^ (self.prev2 as usize) ^ run_bucket;
-        h % Self::STAGE2_TABLE_SIZE
-    }
-
-    #[inline]
-    fn update_history(&mut self, symbol: u8) {
-        if self.has_history && symbol == self.prev1 {
-            self.run_len = self.run_len.saturating_add(1).min(255);
-        } else {
-            self.run_len = 1;
-        }
-        self.prev2 = self.prev1;
-        self.prev1 = symbol;
-        self.has_history = true;
-        self.eval_cache_valid = false;
-    }
-
-    fn evaluate_state(&mut self, stage1_idx: [usize; Self::STAGE1_CONTEXTS], stage2_idx: usize) {
+    fn evaluate_state(&mut self) {
         let expert_count = self.experts.len();
         for i in 0..expert_count {
             let expert = &mut self.experts[i];
@@ -1208,66 +1138,21 @@ impl NeuralMixture {
             for (b, lp) in row.iter().enumerate() {
                 self.scratch_expert_logps[i * 256 + b] = *lp;
             }
-            let row = &mut self.scratch_expert_logps[(i * 256)..((i + 1) * 256)];
-            let log_z = logsumexp_wide(row);
-            for v in row.iter_mut() {
-                *v -= log_z;
-            }
-            for b in 0..256usize {
-                self.scratch_expert_logits[i * 256 + b] =
-                    self.scratch_expert_logps[i * 256 + b].max(self.min_prob.ln());
-            }
+            let logps = &mut self.scratch_expert_logps[(i * 256)..((i + 1) * 256)];
+            let logits = &mut self.scratch_expert_logits[(i * 256)..((i + 1) * 256)];
+            normalize_log_prob_row_and_make_logits(logps, logits, self.min_prob);
         }
-
-        for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-            let entry = &self.stage1_tables[k][ctx_i];
-            let row = &mut self.scratch_stage1_out[(k * 256)..((k + 1) * 256)];
-            row.fill(entry.bias);
-            for i in 0..expert_count {
-                let feat = &self.scratch_expert_logits[(i * 256)..((i + 1) * 256)];
-                axpy_wide(row, entry.weights[i], feat);
-            }
-            let log_z = logsumexp_wide(row);
-            for v in row.iter_mut() {
-                *v -= log_z;
-            }
-        }
-
-        let entry2 = &self.stage2_table[stage2_idx];
-        affine3_wide(
-            &mut self.scratch_energy,
-            &entry2.bias,
-            [entry2.weights[0], entry2.weights[1], entry2.weights[2]],
-            &self.scratch_stage1_out[0..256],
-            &self.scratch_stage1_out[256..512],
-            &self.scratch_stage1_out[512..768],
-        );
-
-        let log_z = logsumexp_wide(&self.scratch_energy);
-        for b in 0..256usize {
-            self.scratch_probs[b] = (self.scratch_energy[b] - log_z).exp();
-        }
+        self.neural.evaluate(&self.scratch_expert_logits);
     }
 
     fn ensure_evaluated(&mut self) {
-        if self.eval_cache_valid
-            && self.eval_cache_prev1 == self.prev1
-            && self.eval_cache_prev2 == self.prev2
-            && self.eval_cache_run_len == self.run_len
-            && self.eval_cache_has_history == self.has_history
-        {
+        let history = self.neural.history_state();
+        if self.eval_cache_valid && self.eval_cache_history == history {
             return;
         }
-
-        let stage1_idx = self.stage1_context_indices();
-        let stage2_idx = self.stage2_context_index();
-        self.evaluate_state(stage1_idx, stage2_idx);
-
+        self.evaluate_state();
         self.eval_cache_valid = true;
-        self.eval_cache_prev1 = self.prev1;
-        self.eval_cache_prev2 = self.prev2;
-        self.eval_cache_run_len = self.run_len;
-        self.eval_cache_has_history = self.has_history;
+        self.eval_cache_history = history;
     }
 
     fn predict_log_prob(&mut self, symbol: u8) -> f64 {
@@ -1278,7 +1163,7 @@ impl NeuralMixture {
             return self.experts[0].log_prob(symbol);
         }
         self.ensure_evaluated();
-        clamp_unit_prob(self.scratch_probs[symbol as usize], self.min_prob).ln()
+        clamp_unit_prob(self.neural.prob(symbol), self.min_prob).ln()
     }
 
     /// Log-probability (natural log) of the neural mixture for `symbol`, then update.
@@ -1293,58 +1178,17 @@ impl NeuralMixture {
             expert.cum_log_loss -= logp;
             expert.update(symbol);
             self.total_log_loss -= logp;
-            self.update_history(symbol);
+            self.neural.update_history(symbol);
+            self.eval_cache_valid = false;
             return logp;
         }
 
         let y = symbol as usize;
-        let stage1_idx = self.stage1_context_indices();
-        let stage2_idx = self.stage2_context_index();
         self.ensure_evaluated();
-        for b in 0..256usize {
-            self.scratch_errors[b] = if b == y { 1.0 } else { 0.0 } - self.scratch_probs[b];
-        }
-        let logp = clamp_unit_prob(self.scratch_probs[y], self.min_prob).ln();
+        let logp = clamp_unit_prob(self.neural.prob(symbol), self.min_prob).ln();
         let expert_count = self.experts.len();
-
-        let error_mag = (1.0 - self.scratch_probs[y]).abs();
-        if error_mag > self.update_skip_threshold {
-            let old_stage2_weights = {
-                let w = &self.stage2_table[stage2_idx].weights;
-                [w[0], w[1], w[2]]
-            };
-
-            {
-                let entry2 = &mut self.stage2_table[stage2_idx];
-                for k in 0..Self::STAGE1_CONTEXTS {
-                    let grad = dot_wide(
-                        &self.scratch_errors,
-                        &self.scratch_stage1_out[(k * 256)..((k + 1) * 256)],
-                    );
-                    entry2.weights[k] = sanitize_weight(entry2.weights[k] + self.stage2_lr * grad);
-                }
-                for b in 0..256usize {
-                    entry2.bias[b] =
-                        sanitize_weight(entry2.bias[b] + self.stage2_lr * self.scratch_errors[b]);
-                }
-            }
-
-            for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-                let v = old_stage2_weights[k];
-                let entry = &mut self.stage1_tables[k][ctx_i];
-
-                let mut grad_bias: f64 = self.scratch_errors.iter().sum();
-                grad_bias *= v;
-                entry.bias = sanitize_weight(entry.bias + self.stage1_lr * grad_bias);
-
-                for i in 0..expert_count {
-                    let feat = &self.scratch_expert_logits[(i * 256)..((i + 1) * 256)];
-                    let mut grad = dot_wide(&self.scratch_errors, feat);
-                    grad *= v;
-                    entry.weights[i] = sanitize_weight(entry.weights[i] + self.stage1_lr * grad);
-                }
-            }
-        }
+        self.neural
+            .update_weights(&self.scratch_expert_logits, symbol);
 
         for i in 0..expert_count {
             let expert = &mut self.experts[i];
@@ -1352,7 +1196,8 @@ impl NeuralMixture {
             expert.update(symbol);
         }
         self.total_log_loss -= logp;
-        self.update_history(symbol);
+        self.neural.update_history(symbol);
+        self.eval_cache_valid = false;
         logp
     }
 
@@ -1372,6 +1217,10 @@ impl MdlSelector {
             scratch_logps: vec![0.0; configs.len()],
             total_log_loss: 0.0,
             last_best,
+            cached_symbol: 0,
+            cached_best_idx: 0,
+            cached_best_logp: f64::NEG_INFINITY,
+            cache_valid: false,
         }
     }
 
@@ -1380,18 +1229,31 @@ impl MdlSelector {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            self.scratch_logps[i] = expert.log_prob(symbol);
-        }
-        let mut best_idx = 0usize;
-        let mut best_loss = f64::INFINITY;
-        for (i, expert) in self.experts.iter().enumerate() {
-            if expert.cum_log_loss < best_loss {
-                best_loss = expert.cum_log_loss;
-                best_idx = i;
+        let best_idx = if self.cache_valid && self.cached_symbol == symbol {
+            self.scratch_logps[self.cached_best_idx] = self.cached_best_logp;
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                if i == self.cached_best_idx {
+                    continue;
+                }
+                self.scratch_logps[i] = expert.log_prob(symbol);
             }
-        }
+            self.cached_best_idx
+        } else {
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                self.scratch_logps[i] = expert.log_prob(symbol);
+            }
+            let mut best_idx = 0usize;
+            let mut best_loss = f64::INFINITY;
+            for (i, expert) in self.experts.iter().enumerate() {
+                if expert.cum_log_loss < best_loss {
+                    best_loss = expert.cum_log_loss;
+                    best_idx = i;
+                }
+            }
+            best_idx
+        };
         let logp = self.scratch_logps[best_idx];
+        self.cache_valid = false;
         for (i, expert) in self.experts.iter_mut().enumerate() {
             expert.cum_log_loss -= self.scratch_logps[i];
             expert.update(symbol);
@@ -1413,7 +1275,12 @@ impl MdlSelector {
                 best_idx = i;
             }
         }
-        self.experts[best_idx].log_prob(symbol)
+        let logp = self.experts[best_idx].log_prob(symbol);
+        self.cached_symbol = symbol;
+        self.cached_best_idx = best_idx;
+        self.cached_best_logp = logp;
+        self.cache_valid = true;
+        logp
     }
 
     /// Index of the current best expert.
@@ -1559,6 +1426,84 @@ mod tests {
         let post = mix.posterior();
         assert!(post[0] > 0.999);
         assert!(post[1] < 1e-6);
+    }
+
+    fn counting_cfg(name: &'static str, calls: Arc<AtomicUsize>) -> ExpertConfig {
+        ExpertConfig::uniform(name, move || {
+            Box::new(CountingPredict {
+                calls: calls.clone(),
+            })
+        })
+    }
+
+    #[test]
+    fn bayes_predict_then_step_reuses_cached_log_probs() {
+        let c0 = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::new(AtomicUsize::new(0));
+        let mut mix = BayesMixture::new(&[
+            counting_cfg("c0", c0.clone()),
+            counting_cfg("c1", c1.clone()),
+        ]);
+        let _ = mix.predict_log_prob(0);
+        let after_predict = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
+        assert_eq!(after_predict, 2);
+        let _ = mix.step(0);
+        let after_step = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
+        assert_eq!(after_step, after_predict);
+    }
+
+    #[test]
+    fn fading_predict_then_step_reuses_cached_log_probs() {
+        let c0 = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::new(AtomicUsize::new(0));
+        let mut mix = FadingBayesMixture::new(
+            &[
+                counting_cfg("c0", c0.clone()),
+                counting_cfg("c1", c1.clone()),
+            ],
+            0.95,
+        );
+        let _ = mix.predict_log_prob(0);
+        let after_predict = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
+        assert_eq!(after_predict, 2);
+        let _ = mix.step(0);
+        let after_step = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
+        assert_eq!(after_step, after_predict);
+    }
+
+    #[test]
+    fn switching_predict_then_step_reuses_cached_log_probs() {
+        let c0 = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::new(AtomicUsize::new(0));
+        let mut mix = SwitchingMixture::new(
+            &[
+                counting_cfg("c0", c0.clone()),
+                counting_cfg("c1", c1.clone()),
+            ],
+            0.05,
+        );
+        let _ = mix.predict_log_prob(0);
+        let after_predict = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
+        assert_eq!(after_predict, 2);
+        let _ = mix.step(0);
+        let after_step = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
+        assert_eq!(after_step, after_predict);
+    }
+
+    #[test]
+    fn mdl_predict_then_step_reuses_best_expert_log_prob() {
+        let c0 = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::new(AtomicUsize::new(0));
+        let mut mdl = MdlSelector::new(&[
+            counting_cfg("c0", c0.clone()),
+            counting_cfg("c1", c1.clone()),
+        ]);
+        let _ = mdl.predict_log_prob(0);
+        let after_predict = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
+        assert_eq!(after_predict, 1);
+        let _ = mdl.step(0);
+        let after_step = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
+        assert_eq!(after_step, 2);
     }
 
     #[test]

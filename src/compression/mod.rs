@@ -15,8 +15,10 @@ use crate::coders::{
 };
 use crate::ctw::FacContextTree;
 use crate::mixture::DEFAULT_MIN_PROB;
+use crate::neural_mix::{
+    NeuralMixCore, fill_log_probs_from_pdf_row, normalize_log_prob_row_and_make_logits,
+};
 use crate::rosaplus::RosaPlus;
-use crate::simd_math::{affine3_wide, axpy_wide, dot_wide, logsumexp_wide};
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{MixtureKind, MixtureSpec, RateBackend};
 
@@ -398,57 +400,14 @@ struct MixExpert {
 }
 
 #[derive(Clone)]
-struct NeuralMixStage1Entry {
-    weights: Vec<f64>,
-    bias: f64,
-}
-
-impl NeuralMixStage1Entry {
-    fn new(width: usize) -> Self {
-        Self {
-            weights: vec![0.0; width],
-            bias: 0.0,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct NeuralMixStage2Entry {
-    weights: Vec<f64>,
-    bias: Vec<f64>,
-}
-
-impl NeuralMixStage2Entry {
-    fn new(width: usize) -> Self {
-        Self {
-            weights: vec![0.0; width],
-            bias: vec![0.0; 256],
-        }
-    }
-}
-
-const NEURAL_STAGE1_CONTEXTS: usize = 3;
-const NEURAL_STAGE1_TABLE_SIZES: [usize; NEURAL_STAGE1_CONTEXTS] = [1, 256, 1024];
-const NEURAL_STAGE2_TABLE_SIZE: usize = 512;
-
-#[derive(Clone)]
 struct MixturePredictor {
     kind: MixtureKind,
     alpha: f64,
     decay: f64,
     experts: Vec<MixExpert>,
-    neural_stage1_tables: Vec<Vec<NeuralMixStage1Entry>>,
-    neural_stage2_table: Vec<NeuralMixStage2Entry>,
-    neural_stage1_lr: f64,
-    neural_stage2_lr: f64,
-    neural_skip: f64,
+    neural: NeuralMixCore,
+    neural_logps: Vec<f64>,
     neural_features: Vec<f64>,
-    neural_stage1_out: Vec<f64>,
-    neural_errors: Vec<f64>,
-    neural_prev1: u8,
-    neural_prev2: u8,
-    neural_run_len: u16,
-    neural_has_history: bool,
     scratch: Vec<f64>,
     scratch2: Vec<f64>,
     pdf: Vec<f64>,
@@ -483,46 +442,17 @@ impl MixturePredictor {
             prior_weights[i] = p;
         }
 
-        let mut neural_stage1_tables = Vec::with_capacity(NEURAL_STAGE1_CONTEXTS);
-        for (ctx_idx, table_size) in NEURAL_STAGE1_TABLE_SIZES.iter().enumerate() {
-            let mut table = Vec::with_capacity(*table_size);
-            for _ in 0..*table_size {
-                let mut entry = NeuralMixStage1Entry::new(experts.len());
-                if ctx_idx == 0 {
-                    entry.weights.clone_from(&prior_weights);
-                }
-                table.push(entry);
-            }
-            neural_stage1_tables.push(table);
-        }
-
-        let mut neural_stage2_table = Vec::with_capacity(NEURAL_STAGE2_TABLE_SIZE);
-        for _ in 0..NEURAL_STAGE2_TABLE_SIZE {
-            let mut entry = NeuralMixStage2Entry::new(NEURAL_STAGE1_CONTEXTS);
-            for w in &mut entry.weights {
-                *w = 1.0 / (NEURAL_STAGE1_CONTEXTS as f64);
-            }
-            neural_stage2_table.push(entry);
-        }
-
         let base_lr = spec.alpha.abs().clamp(1e-6, 1.0);
+        let neural =
+            NeuralMixCore::new(experts.len(), &prior_weights, base_lr * 0.5, base_lr, 1e-5);
         Ok(Self {
             kind: spec.kind,
             alpha: spec.alpha.clamp(1e-12, 1.0 - 1e-12),
             decay: spec.decay.unwrap_or(1.0).clamp(0.0, 1.0),
             experts,
-            neural_stage1_tables,
-            neural_stage2_table,
-            neural_stage1_lr: base_lr * 0.5,
-            neural_stage2_lr: base_lr,
-            neural_skip: 1e-5,
+            neural,
+            neural_logps: vec![0.0; spec.experts.len() * 256],
             neural_features: vec![0.0; spec.experts.len() * 256],
-            neural_stage1_out: vec![0.0; NEURAL_STAGE1_CONTEXTS * 256],
-            neural_errors: vec![0.0; 256],
-            neural_prev1: 0,
-            neural_prev2: 0,
-            neural_run_len: 0,
-            neural_has_history: false,
             scratch: Vec::new(),
             scratch2: Vec::new(),
             pdf: vec![0.0; 256],
@@ -530,50 +460,17 @@ impl MixturePredictor {
         })
     }
 
-    fn neural_stage1_context_indices(&self) -> [usize; NEURAL_STAGE1_CONTEXTS] {
-        if !self.neural_has_history {
-            return [0, 0, 0];
-        }
-        let run_bucket = (self.neural_run_len.min(63) as usize) & 0x3f;
-        let h = ((self.neural_prev1 as usize) << 10)
-            ^ ((self.neural_prev2 as usize) << 2)
-            ^ run_bucket
-            ^ (((self.neural_prev1 ^ self.neural_prev2) as usize) << 5);
-        [
-            0,
-            self.neural_prev1 as usize,
-            h % NEURAL_STAGE1_TABLE_SIZES[2],
-        ]
-    }
-
-    fn neural_stage2_context_index(&self) -> usize {
-        if !self.neural_has_history {
-            return 0;
-        }
-        let run_bucket = (self.neural_run_len.min(127) as usize) & 0x7f;
-        let h = ((self.neural_prev1 as usize) << 8) ^ (self.neural_prev2 as usize) ^ run_bucket;
-        h % NEURAL_STAGE2_TABLE_SIZE
-    }
-
-    fn neural_update_history(&mut self, symbol: u8) {
-        if self.neural_has_history && symbol == self.neural_prev1 {
-            self.neural_run_len = self.neural_run_len.saturating_add(1).min(255);
-        } else {
-            self.neural_run_len = 1;
-        }
-        self.neural_prev2 = self.neural_prev1;
-        self.neural_prev1 = symbol;
-        self.neural_has_history = true;
-    }
-
     fn ensure_pdf(&mut self) -> Result<&[f64]> {
         if self.valid {
-            return Ok(&self.pdf);
+            return match self.kind {
+                MixtureKind::Neural if self.experts.len() > 1 => Ok(self.neural.probs()),
+                _ => Ok(&self.pdf),
+            };
         }
         match self.kind {
             MixtureKind::Neural => {
-                self.pdf.fill(0.0);
                 if self.experts.len() == 1 {
+                    self.pdf.fill(0.0);
                     let epdf = self.experts[0].predictor.pdf_next()?;
                     self.pdf.copy_from_slice(epdf);
                     normalize_pdf(&mut self.pdf);
@@ -582,43 +479,18 @@ impl MixturePredictor {
                 }
                 self.neural_features.fill(0.0);
 
-                let stage1_idx = self.neural_stage1_context_indices();
-                let stage2_idx = self.neural_stage2_context_index();
-
                 for (i, e) in self.experts.iter_mut().enumerate() {
                     let epdf = e.predictor.pdf_next()?;
-                    for (b, p) in epdf.iter().enumerate().take(256) {
-                        self.neural_features[i * 256 + b] = p.max(PDF_MIN).ln();
-                    }
+                    let row_logps = &mut self.neural_logps[(i * 256)..((i + 1) * 256)];
+                    fill_log_probs_from_pdf_row(epdf, PDF_MIN, row_logps);
+                    let row_logits = &mut self.neural_features[(i * 256)..((i + 1) * 256)];
+                    normalize_log_prob_row_and_make_logits(row_logps, row_logits, PDF_MIN);
                 }
 
-                for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-                    let entry = &self.neural_stage1_tables[k][ctx_i];
-                    let row = &mut self.neural_stage1_out[(k * 256)..((k + 1) * 256)];
-                    row.fill(entry.bias);
-                    for i in 0..self.experts.len() {
-                        let feat = &self.neural_features[(i * 256)..((i + 1) * 256)];
-                        axpy_wide(row, entry.weights[i], feat);
-                    }
-                    let log_z = logsumexp_wide(row);
-                    for v in row.iter_mut() {
-                        *v -= log_z;
-                    }
-                }
-
-                let entry2 = &self.neural_stage2_table[stage2_idx];
-                affine3_wide(
-                    &mut self.pdf,
-                    &entry2.bias,
-                    [entry2.weights[0], entry2.weights[1], entry2.weights[2]],
-                    &self.neural_stage1_out[0..256],
-                    &self.neural_stage1_out[256..512],
-                    &self.neural_stage1_out[512..768],
-                );
-                let z = logsumexp_wide(&self.pdf);
-                for p in &mut self.pdf {
-                    *p = (*p - z).exp();
-                }
+                self.neural.evaluate(&self.neural_features);
+                normalize_pdf(self.neural.probs_mut());
+                self.valid = true;
+                return Ok(self.neural.probs());
             }
             _ => {
                 self.pdf.fill(0.0);
@@ -722,66 +594,19 @@ impl MixturePredictor {
                     let lp = self.experts[0].predictor.pdf_next()?[y].max(PDF_MIN).ln();
                     self.experts[0].cum_log_loss -= lp;
                     self.experts[0].predictor.update(symbol)?;
-                    self.neural_update_history(symbol);
+                    self.neural.update_history(symbol);
                     self.valid = false;
                     return Ok(());
                 }
-                for e in &mut self.experts {
-                    e.cum_log_loss -= e.predictor.pdf_next()?[y].max(PDF_MIN).ln();
+                for (i, e) in self.experts.iter_mut().enumerate() {
+                    e.cum_log_loss -= self.neural_logps[i * 256 + y];
                 }
-
-                let error_mag = (1.0 - self.pdf[y]).abs();
-                if error_mag > self.neural_skip {
-                    for b in 0..256usize {
-                        self.neural_errors[b] = if b == y { 1.0 } else { 0.0 } - self.pdf[b];
-                    }
-
-                    let stage1_idx = self.neural_stage1_context_indices();
-                    let stage2_idx = self.neural_stage2_context_index();
-                    let old_stage2_weights = {
-                        let w = &self.neural_stage2_table[stage2_idx].weights;
-                        [w[0], w[1], w[2]]
-                    };
-
-                    {
-                        let entry2 = &mut self.neural_stage2_table[stage2_idx];
-                        for k in 0..NEURAL_STAGE1_CONTEXTS {
-                            let grad = dot_wide(
-                                &self.neural_errors,
-                                &self.neural_stage1_out[(k * 256)..((k + 1) * 256)],
-                            );
-                            let w = entry2.weights[k] + self.neural_stage2_lr * grad;
-                            entry2.weights[k] = if w.is_finite() { w } else { 0.0 };
-                        }
-                        for b in 0..256usize {
-                            let nb = entry2.bias[b] + self.neural_stage2_lr * self.neural_errors[b];
-                            entry2.bias[b] = if nb.is_finite() { nb } else { 0.0 };
-                        }
-                    }
-
-                    for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-                        let v = old_stage2_weights[k];
-                        let entry = &mut self.neural_stage1_tables[k][ctx_i];
-
-                        let mut grad_bias: f64 = self.neural_errors.iter().sum();
-                        grad_bias *= v;
-                        let nb = entry.bias + self.neural_stage1_lr * grad_bias;
-                        entry.bias = if nb.is_finite() { nb } else { 0.0 };
-
-                        for i in 0..self.experts.len() {
-                            let feat = &self.neural_features[(i * 256)..((i + 1) * 256)];
-                            let mut grad = dot_wide(&self.neural_errors, feat);
-                            grad *= v;
-                            let nw = entry.weights[i] + self.neural_stage1_lr * grad;
-                            entry.weights[i] = if nw.is_finite() { nw } else { 0.0 };
-                        }
-                    }
-                }
+                self.neural.update_weights(&self.neural_features, symbol);
 
                 for e in &mut self.experts {
                     e.predictor.update(symbol)?;
                 }
-                self.neural_update_history(symbol);
+                self.neural.update_history(symbol);
             }
         }
 
