@@ -16,6 +16,7 @@ use crate::rwkvzip;
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{MixtureKind, MixtureSpec, RateBackend};
 use std::sync::Arc;
+use wide::f64x4;
 
 /// Default minimum probability floor to avoid log(0).
 pub const DEFAULT_MIN_PROB: f64 = 5.960_464_477_539_063e-8;
@@ -35,24 +36,28 @@ fn clamp_unit_prob(p: f64, min_prob: f64) -> f64 {
 }
 
 #[inline]
-fn logistic(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
-
-#[inline]
-fn logit(p: f64) -> f64 {
-    let p = clamp_unit_prob(p, DEFAULT_MIN_PROB);
-    (p / (1.0 - p)).ln()
-}
-
-#[inline]
 fn sanitize_weight(w: f64) -> f64 {
     if w.is_finite() { w } else { 0.0 }
+}
+
+#[inline]
+fn dot_wide(lhs: &[f64], rhs: &[f64]) -> f64 {
+    let n = lhs.len().min(rhs.len());
+    let mut acc = f64x4::ZERO;
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let a = f64x4::new([lhs[i], lhs[i + 1], lhs[i + 2], lhs[i + 3]]);
+        let b = f64x4::new([rhs[i], rhs[i + 1], rhs[i + 2], rhs[i + 3]]);
+        acc += a * b;
+        i += 4;
+    }
+    let lanes = acc.to_array();
+    let mut out = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    while i < n {
+        out += lhs[i] * rhs[i];
+        i += 1;
+    }
+    out
 }
 
 #[inline]
@@ -105,8 +110,92 @@ pub trait OnlineBytePredictor: Send {
     /// Log-probability (natural log) of `symbol` given the current history.
     fn log_prob(&mut self, symbol: u8) -> f64;
 
+    /// Bulk 256-way log-probabilities for the next byte.
+    fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+        for (sym, slot) in out.iter_mut().enumerate() {
+            *slot = self.log_prob(sym as u8);
+        }
+    }
+
     /// Update the predictor with the observed `symbol`.
     fn update(&mut self, symbol: u8);
+}
+
+fn fill_fac_tree_log_probs(
+    tree: &mut FacContextTree,
+    bits_per_symbol: usize,
+    msb_first: bool,
+    min_logp: f64,
+    out: &mut [f64; 256],
+) {
+    let bits = bits_per_symbol.clamp(1, 8);
+    let patterns = 1usize << bits;
+    let mut pattern_logps = [f64::NEG_INFINITY; 256];
+    let log_before = tree.get_log_block_probability();
+
+    fn rec(
+        tree: &mut FacContextTree,
+        depth: usize,
+        bits: usize,
+        msb_first: bool,
+        symbol_acc: u8,
+        log_before: f64,
+        min_logp: f64,
+        pattern_logps: &mut [f64; 256],
+    ) {
+        if depth == bits {
+            let pat = symbol_acc as usize;
+            let logp = (tree.get_log_block_probability() - log_before).max(min_logp);
+            pattern_logps[pat] = logp;
+            return;
+        }
+
+        for bit in [false, true] {
+            tree.update(bit, depth);
+            let mut next_symbol = symbol_acc;
+            if msb_first {
+                let shift = 7usize.saturating_sub(depth);
+                if bit {
+                    next_symbol |= 1u8 << shift;
+                }
+            } else if bit {
+                next_symbol |= 1u8 << depth;
+            }
+            rec(
+                tree,
+                depth + 1,
+                bits,
+                msb_first,
+                next_symbol,
+                log_before,
+                min_logp,
+                pattern_logps,
+            );
+            tree.revert(depth);
+        }
+    }
+
+    rec(
+        tree,
+        0,
+        bits,
+        msb_first,
+        0,
+        log_before,
+        min_logp,
+        &mut pattern_logps,
+    );
+
+    if bits == 8 {
+        out.copy_from_slice(&pattern_logps);
+    } else {
+        let aliases = 1usize << (8 - bits);
+        let alias_ln = (aliases as f64).ln();
+        let mask = patterns - 1;
+        for byte in 0..256usize {
+            out[byte] = pattern_logps[byte & mask] - alias_ln;
+        }
+    }
 }
 
 /// A concrete online predictor backed by a `RateBackend` configuration.
@@ -333,6 +422,61 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             RateBackendPredictor::Zpaq { model } => model.log_prob(symbol),
             RateBackendPredictor::Mixture { runtime } => runtime.peek_log_prob(symbol),
+        }
+    }
+
+    fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+        match self {
+            RateBackendPredictor::Rosa { model, min_prob } => {
+                for sym in 0..256usize {
+                    let p = clamp_prob(model.prob_for_last(sym as u32), *min_prob);
+                    out[sym] = p.ln();
+                }
+            }
+            RateBackendPredictor::Ctw { tree, min_prob } => {
+                fill_fac_tree_log_probs(tree, 8, true, min_prob.ln(), out);
+            }
+            RateBackendPredictor::FacCtw {
+                tree,
+                bits_per_symbol,
+                min_prob,
+            } => {
+                fill_fac_tree_log_probs(tree, *bits_per_symbol, false, min_prob.ln(), out);
+            }
+            #[cfg(feature = "backend-rwkv")]
+            RateBackendPredictor::Rwkv7 {
+                compressor,
+                primed,
+                min_prob,
+            } => {
+                if !*primed {
+                    let bias = compressor.online_bias_snapshot();
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    rwkvzip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                    *primed = true;
+                }
+                for sym in 0..256usize {
+                    let p = clamp_prob(compressor.pdf_buffer[sym], *min_prob);
+                    out[sym] = p.ln();
+                }
+            }
+            RateBackendPredictor::Zpaq { model } => {
+                for sym in 0..256usize {
+                    out[sym] = model.log_prob(sym as u8);
+                }
+            }
+            RateBackendPredictor::Mixture { runtime } => {
+                for sym in 0..256usize {
+                    out[sym] = runtime.peek_log_prob(sym as u8);
+                }
+            }
         }
     }
 
@@ -935,13 +1079,13 @@ impl NeuralStage2Entry {
     }
 }
 
-/// Bytewise neural mixer inspired by fx2-cmix logistic online adaptation.
+/// Bytewise neural mixer inspired by fx2-cmix online adaptation.
 ///
 /// This model is a context-conditioned two-stage network trained online with
 /// multiclass (256-way) log-loss:
 /// 1) expert probability stretch/logit features,
-/// 2) context-local first-stage logistic units,
-/// 3) context-local second-stage softmax classifier,
+/// 2) context-local first-stage softmax experts,
+/// 3) context-local second-stage softmax meta-mixer,
 /// 4) per-symbol SGD updates with optional tiny-error skip.
 pub struct NeuralMixture {
     experts: Vec<ExpertState>,
@@ -979,13 +1123,13 @@ impl NeuralMixture {
         let mut experts: Vec<ExpertState> = configs.iter().map(|c| c.build()).collect();
         let n = experts.len();
 
-        let mut prior_logits = vec![0.0; n];
+        let mut prior_weights = vec![0.0; n];
         if n > 0 {
             let log_priors: Vec<f64> = experts.iter().map(|e| e.log_prior).collect();
             let norm = logsumexp(&log_priors);
             for (i, e) in experts.iter_mut().enumerate() {
                 let p = (e.log_prior - norm).exp();
-                prior_logits[i] = logit(p);
+                prior_weights[i] = p;
             }
         }
 
@@ -995,7 +1139,7 @@ impl NeuralMixture {
             for _ in 0..*table_size {
                 let mut entry = NeuralWeightEntry::new(n);
                 if ctx_idx == 0 {
-                    entry.weights.clone_from(&prior_logits);
+                    entry.weights.clone_from(&prior_weights);
                 }
                 table.push(entry);
             }
@@ -1084,29 +1228,47 @@ impl NeuralMixture {
         let expert_count = self.experts.len();
         for i in 0..expert_count {
             let expert = &mut self.experts[i];
+            let mut row = [0.0f64; 256];
+            expert.predictor.fill_log_probs(&mut row);
+            for (b, lp) in row.iter().enumerate() {
+                self.scratch_expert_logps[i * 256 + b] = *lp;
+            }
+            let row = &mut self.scratch_expert_logps[(i * 256)..((i + 1) * 256)];
+            let log_z = logsumexp(row);
+            for v in row.iter_mut() {
+                *v -= log_z;
+            }
             for b in 0..256usize {
-                let lp = expert.log_prob(b as u8);
-                self.scratch_expert_logps[i * 256 + b] = lp;
-                let p = clamp_unit_prob(lp.exp(), self.min_prob);
-                self.scratch_expert_logits[i * 256 + b] = logit(p);
+                self.scratch_expert_logits[i * 256 + b] =
+                    self.scratch_expert_logps[i * 256 + b].max(self.min_prob.ln());
             }
         }
 
-        for b in 0..256usize {
-            for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-                let entry = &self.stage1_tables[k][ctx_i];
+        for (k, &ctx_i) in stage1_idx.iter().enumerate() {
+            let entry = &self.stage1_tables[k][ctx_i];
+            for b in 0..256usize {
                 let mut z = entry.bias;
                 for i in 0..expert_count {
                     z += entry.weights[i] * self.scratch_expert_logits[i * 256 + b];
                 }
-                self.scratch_stage1_out[k * 256 + b] = logistic(z);
+                self.scratch_stage1_out[k * 256 + b] = z;
             }
+            let row = &mut self.scratch_stage1_out[(k * 256)..((k + 1) * 256)];
+            let log_z = logsumexp(row);
+            for v in row.iter_mut() {
+                *v -= log_z;
+            }
+        }
 
+        for b in 0..256usize {
             let entry2 = &self.stage2_table[stage2_idx];
             let mut e = entry2.bias[b];
-            for k in 0..Self::STAGE1_CONTEXTS {
-                e += entry2.weights[k] * self.scratch_stage1_out[k * 256 + b];
-            }
+            let stage_row = [
+                self.scratch_stage1_out[b],
+                self.scratch_stage1_out[256 + b],
+                self.scratch_stage1_out[512 + b],
+            ];
+            e += dot_wide(&entry2.weights, &stage_row);
             self.scratch_energy[b] = e;
         }
 
@@ -1200,23 +1362,16 @@ impl NeuralMixture {
                 let v = old_stage2_weights[k];
                 let entry = &mut self.stage1_tables[k][ctx_i];
 
-                let mut grad_bias = 0.0;
-                for b in 0..256usize {
-                    let q = self.scratch_stage1_out[k * 256 + b];
-                    grad_bias += self.scratch_errors[b] * v * q * (1.0 - q);
-                }
+                let mut grad_bias: f64 = self.scratch_errors.iter().sum();
+                grad_bias *= v;
                 entry.bias = sanitize_weight(entry.bias + self.stage1_lr * grad_bias);
 
                 for i in 0..expert_count {
                     let mut grad = 0.0;
                     for b in 0..256usize {
-                        let q = self.scratch_stage1_out[k * 256 + b];
-                        grad += self.scratch_errors[b]
-                            * v
-                            * q
-                            * (1.0 - q)
-                            * self.scratch_expert_logits[i * 256 + b];
+                        grad += self.scratch_errors[b] * self.scratch_expert_logits[i * 256 + b];
                     }
+                    grad *= v;
                     entry.weights[i] = sanitize_weight(entry.weights[i] + self.stage1_lr * grad);
                 }
             }

@@ -18,6 +18,7 @@ use crate::mixture::DEFAULT_MIN_PROB;
 use crate::rosaplus::RosaPlus;
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{MixtureKind, MixtureSpec, RateBackend};
+use wide::f64x4;
 
 const FRAMED_MAGIC: u32 = 0x4354_4946; // "FITC"
 const FRAMED_VERSION: u8 = 1;
@@ -426,6 +427,26 @@ impl NeuralMixStage2Entry {
     }
 }
 
+#[inline]
+fn dot_wide(lhs: &[f64], rhs: &[f64]) -> f64 {
+    let n = lhs.len().min(rhs.len());
+    let mut acc = f64x4::ZERO;
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let a = f64x4::new([lhs[i], lhs[i + 1], lhs[i + 2], lhs[i + 3]]);
+        let b = f64x4::new([rhs[i], rhs[i + 1], rhs[i + 2], rhs[i + 3]]);
+        acc += a * b;
+        i += 4;
+    }
+    let lanes = acc.to_array();
+    let mut out = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    while i < n {
+        out += lhs[i] * rhs[i];
+        i += 1;
+    }
+    out
+}
+
 const NEURAL_STAGE1_CONTEXTS: usize = 3;
 const NEURAL_STAGE1_TABLE_SIZES: [usize; NEURAL_STAGE1_CONTEXTS] = [1, 256, 1024];
 const NEURAL_STAGE2_TABLE_SIZE: usize = 512;
@@ -476,10 +497,10 @@ impl MixturePredictor {
             e.log_weight -= m;
         }
 
-        let mut prior_logits = vec![0.0; experts.len()];
+        let mut prior_weights = vec![0.0; experts.len()];
         for (i, e) in experts.iter().enumerate() {
             let p = (e.log_weight).exp().clamp(PDF_MIN, 1.0 - PDF_MIN);
-            prior_logits[i] = (p / (1.0 - p)).ln();
+            prior_weights[i] = p;
         }
 
         let mut neural_stage1_tables = Vec::with_capacity(NEURAL_STAGE1_CONTEXTS);
@@ -488,7 +509,7 @@ impl MixturePredictor {
             for _ in 0..*table_size {
                 let mut entry = NeuralMixStage1Entry::new(experts.len());
                 if ctx_idx == 0 {
-                    entry.weights.clone_from(&prior_logits);
+                    entry.weights.clone_from(&prior_weights);
                 }
                 table.push(entry);
             }
@@ -583,26 +604,35 @@ impl MixturePredictor {
                 for (i, e) in self.experts.iter_mut().enumerate() {
                     let epdf = e.predictor.pdf_next()?;
                     for (b, p) in epdf.iter().enumerate().take(256) {
-                        let p = p.clamp(PDF_MIN, 1.0 - PDF_MIN);
-                        self.neural_features[i * 256 + b] = (p / (1.0 - p)).ln();
+                        self.neural_features[i * 256 + b] = p.max(PDF_MIN).ln();
                     }
                 }
 
-                for b in 0..256usize {
-                    for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-                        let entry = &self.neural_stage1_tables[k][ctx_i];
+                for (k, &ctx_i) in stage1_idx.iter().enumerate() {
+                    let entry = &self.neural_stage1_tables[k][ctx_i];
+                    for b in 0..256usize {
                         let mut z = entry.bias;
                         for i in 0..self.experts.len() {
                             z += entry.weights[i] * self.neural_features[i * 256 + b];
                         }
-                        self.neural_stage1_out[k * 256 + b] = logistic(z);
+                        self.neural_stage1_out[k * 256 + b] = z;
                     }
+                    let row = &mut self.neural_stage1_out[(k * 256)..((k + 1) * 256)];
+                    let log_z = logsumexp(row.iter().copied());
+                    for v in row.iter_mut() {
+                        *v -= log_z;
+                    }
+                }
 
+                for b in 0..256usize {
                     let entry2 = &self.neural_stage2_table[stage2_idx];
                     let mut e = entry2.bias[b];
-                    for k in 0..NEURAL_STAGE1_CONTEXTS {
-                        e += entry2.weights[k] * self.neural_stage1_out[k * 256 + b];
-                    }
+                    let stage_row = [
+                        self.neural_stage1_out[b],
+                        self.neural_stage1_out[256 + b],
+                        self.neural_stage1_out[512 + b],
+                    ];
+                    e += dot_wide(&entry2.weights, &stage_row);
                     self.pdf[b] = e;
                 }
                 let z = logsumexp(self.pdf.iter().copied());
@@ -753,24 +783,17 @@ impl MixturePredictor {
                         let v = old_stage2_weights[k];
                         let entry = &mut self.neural_stage1_tables[k][ctx_i];
 
-                        let mut grad_bias = 0.0;
-                        for b in 0..256usize {
-                            let q = self.neural_stage1_out[k * 256 + b];
-                            grad_bias += self.neural_errors[b] * v * q * (1.0 - q);
-                        }
+                        let mut grad_bias: f64 = self.neural_errors.iter().sum();
+                        grad_bias *= v;
                         let nb = entry.bias + self.neural_stage1_lr * grad_bias;
                         entry.bias = if nb.is_finite() { nb } else { 0.0 };
 
                         for i in 0..self.experts.len() {
                             let mut grad = 0.0;
                             for b in 0..256usize {
-                                let q = self.neural_stage1_out[k * 256 + b];
-                                grad += self.neural_errors[b]
-                                    * v
-                                    * q
-                                    * (1.0 - q)
-                                    * self.neural_features[i * 256 + b];
+                                grad += self.neural_errors[b] * self.neural_features[i * 256 + b];
                             }
+                            grad *= v;
                             let nw = entry.weights[i] + self.neural_stage1_lr * grad;
                             entry.weights[i] = if nw.is_finite() { nw } else { 0.0 };
                         }
@@ -1079,16 +1102,6 @@ fn normalize_pdf(pdf: &mut [f64]) {
     let inv = 1.0 / sum;
     for p in pdf.iter_mut() {
         *p *= inv;
-    }
-}
-
-#[inline]
-fn logistic(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
     }
 }
 
