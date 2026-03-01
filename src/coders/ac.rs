@@ -612,4 +612,14 @@ mod tests {
             assert!(cdf[i] >= cdf[i - 1]);
         }
     }
+
+    #[test]
+    #[should_panic]
+    fn test_softmax_floor_256_short_logits_panics_safely() {
+        // For vocab_size=256, short logits must not hit the SIMD fast path.
+        // Safe fallback behavior is a normal Rust bounds panic in scalar code.
+        let logits = vec![0.0f32; 255];
+        let mut pdf_out = vec![0.0f64; 256];
+        softmax_pdf_floor_inplace(&logits, 256, &mut pdf_out);
+    }
 }
