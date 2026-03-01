@@ -440,9 +440,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 }
             }
             RateBackendPredictor::Zpaq { model } => {
-                for (sym, slot) in out.iter_mut().enumerate().take(256) {
-                    *slot = model.log_prob(sym as u8);
-                }
+                model.fill_log_probs(out);
             }
             RateBackendPredictor::Mixture { runtime } => {
                 for (sym, slot) in out.iter_mut().enumerate().take(256) {
@@ -1592,5 +1590,37 @@ mod tests {
         let _ = mix.predict_log_prob(1);
         let after_second = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
         assert_eq!(after_second, after_first);
+    }
+
+    #[test]
+    fn zpaq_fill_log_probs_does_not_drift_history() {
+        let backend = RateBackend::Zpaq {
+            method: "1".to_string(),
+        };
+        let mut baseline =
+            RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
+        let mut probe = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+
+        let history = b"history for zpaq predictor";
+        for &b in history {
+            baseline.update(b);
+            probe.update(b);
+        }
+
+        let mut row = [0.0f64; 256];
+        probe.fill_log_probs(&mut row);
+
+        let sym = b'k';
+        let lp_base = baseline.log_prob(sym);
+        let lp_probe = probe.log_prob(sym);
+        assert!((lp_base - lp_probe).abs() < 1e-9);
+        assert!((row[sym as usize] - lp_base).abs() < 1e-9);
+
+        baseline.update(sym);
+        probe.update(sym);
+        let next = b'q';
+        let next_base = baseline.log_prob(next);
+        let next_probe = probe.log_prob(next);
+        assert!((next_base - next_probe).abs() < 1e-9);
     }
 }
