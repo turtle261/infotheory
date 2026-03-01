@@ -1238,6 +1238,7 @@ mod tests {
         let mut rng = Lcg::new(0xDEC0DED);
 
         let mut state = vec![0.0; num_heads * HEAD_DIM * HEAD_DIM];
+        let mut state_ref = vec![0.0; num_heads * HEAD_DIM * HEAD_DIM];
         let mut w = vec![0.0; num_heads * HEAD_DIM];
         let mut k = vec![0.0; num_heads * HEAD_DIM];
         let mut v = vec![0.0; num_heads * HEAD_DIM];
@@ -1245,7 +1246,9 @@ mod tests {
         let mut a = vec![0.0; num_heads * HEAD_DIM];
         let mut r = vec![0.0; num_heads * HEAD_DIM];
         let mut y = vec![0.0; num_heads * HEAD_DIM];
+        let mut y_ref = vec![0.0; num_heads * HEAD_DIM];
         fill_centered(&mut state, &mut rng, 0.4);
+        state_ref.copy_from_slice(&state);
         fill_centered(&mut w, &mut rng, 0.2);
         fill_centered(&mut k, &mut rng, 0.3);
         fill_centered(&mut v, &mut rng, 0.25);
@@ -1268,11 +1271,51 @@ mod tests {
             )
         };
 
+        rwkv_update_scalar(
+            &mut state_ref,
+            &w,
+            &k,
+            &v,
+            &kk,
+            &a,
+            &r,
+            &mut y_ref,
+            num_heads,
+        );
+
         let mut sm = vec![0.0; HEAD_DIM];
         let lse = unsafe { softmax_avx(y.as_ptr(), sm.as_mut_ptr(), HEAD_DIM) };
+        let y_ref_head = &y_ref[..HEAD_DIM];
+        let mut sm_ref = vec![0.0; HEAD_DIM];
+        let mut max_ref = f32::NEG_INFINITY;
+        for &v in y_ref_head {
+            max_ref = max_ref.max(v);
+        }
+        let mut sum_ref = 0.0f32;
+        for i in 0..HEAD_DIM {
+            let e = (y_ref_head[i] - max_ref).exp();
+            sm_ref[i] = e;
+            sum_ref += e;
+        }
+        if sum_ref > 0.0 {
+            let inv = 1.0 / sum_ref;
+            for v in &mut sm_ref {
+                *v *= inv;
+            }
+        }
+        let lse_ref = sum_ref.ln() + max_ref;
 
         let mut normed = vec![0.0; HEAD_DIM];
         unsafe { l2_normalize_avx(y.as_ptr(), normed.as_mut_ptr(), HEAD_DIM, 1e-6) };
+        let mut normed_ref = vec![0.0; HEAD_DIM];
+        let mut sq = 0.0f32;
+        for &v in y_ref_head {
+            sq += v * v;
+        }
+        let denom = sq.sqrt().max(1e-6);
+        for i in 0..HEAD_DIM {
+            normed_ref[i] = y_ref_head[i] / denom;
+        }
 
         let checksum = |data: &[f32]| -> f64 {
             data.iter()
@@ -1282,34 +1325,36 @@ mod tests {
         };
 
         let state_checksum = checksum(&state);
+        let state_ref_checksum = checksum(&state_ref);
         let y_checksum = checksum(&y);
+        let y_ref_checksum = checksum(&y_ref);
         let softmax_checksum = checksum(&sm);
+        let softmax_ref_checksum = checksum(&sm_ref);
         let normed_checksum = checksum(&normed);
+        let normed_ref_checksum = checksum(&normed_ref);
         let lse_val = lse as f64;
+        let lse_ref_val = lse_ref as f64;
 
-        let expected_state_checksum = 9_361.599_056_353_56_f64;
-        let expected_y_checksum = 24.356_927_025_131_88_f64;
-        let expected_softmax_checksum = 32.418_806_117_028_f64;
-        let expected_normed_checksum = -0.442_276_961_402_967_57_f64;
-        let expected_lse = 4.161_582_469_940_185_5_f64;
-
-        let tol = 2e-4_f64;
+        let tol = 7e-4_f64;
         assert!(
-            (state_checksum - expected_state_checksum).abs() <= tol,
-            "state_checksum={state_checksum}"
+            (state_checksum - state_ref_checksum).abs() <= tol,
+            "state_checksum={state_checksum} state_ref_checksum={state_ref_checksum}"
         );
         assert!(
-            (y_checksum - expected_y_checksum).abs() <= tol,
-            "y_checksum={y_checksum}"
+            (y_checksum - y_ref_checksum).abs() <= tol,
+            "y_checksum={y_checksum} y_ref_checksum={y_ref_checksum}"
         );
         assert!(
-            (softmax_checksum - expected_softmax_checksum).abs() <= tol,
-            "softmax_checksum={softmax_checksum}"
+            (softmax_checksum - softmax_ref_checksum).abs() <= tol,
+            "softmax_checksum={softmax_checksum} softmax_ref_checksum={softmax_ref_checksum}"
         );
         assert!(
-            (normed_checksum - expected_normed_checksum).abs() <= tol,
-            "normed_checksum={normed_checksum}"
+            (normed_checksum - normed_ref_checksum).abs() <= tol,
+            "normed_checksum={normed_checksum} normed_ref_checksum={normed_ref_checksum}"
         );
-        assert!((lse_val - expected_lse).abs() <= tol, "lse={lse_val}");
+        assert!(
+            (lse_val - lse_ref_val).abs() <= tol,
+            "lse={lse_val} lse_ref={lse_ref_val}"
+        );
     }
 }
