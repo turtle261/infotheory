@@ -79,6 +79,64 @@ fn logsumexp(xs: &[f64]) -> f64 {
 }
 
 #[inline]
+fn max_wide(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+    let mut i = 0usize;
+    let mut max4 = f64x4::splat(f64::NEG_INFINITY);
+    while i + 4 <= xs.len() {
+        let v = f64x4::new([xs[i], xs[i + 1], xs[i + 2], xs[i + 3]]);
+        max4 = max4.max(v);
+        i += 4;
+    }
+    let lanes = max4.to_array();
+    let mut max_v = lanes[0].max(lanes[1]).max(lanes[2]).max(lanes[3]);
+    while i < xs.len() {
+        if xs[i] > max_v {
+            max_v = xs[i];
+        }
+        i += 1;
+    }
+    max_v
+}
+
+#[inline]
+fn logsumexp_wide(xs: &[f64]) -> f64 {
+    let max_v = max_wide(xs);
+    if !max_v.is_finite() {
+        return max_v;
+    }
+    let mut sum = 0.0;
+    for &v in xs {
+        sum += (v - max_v).exp();
+    }
+    max_v + sum.ln()
+}
+
+#[inline]
+fn axpy_wide(dst: &mut [f64], alpha: f64, src: &[f64]) {
+    let n = dst.len().min(src.len());
+    let mut i = 0usize;
+    let a4 = f64x4::splat(alpha);
+    while i + 4 <= n {
+        let d = f64x4::new([dst[i], dst[i + 1], dst[i + 2], dst[i + 3]]);
+        let s = f64x4::new([src[i], src[i + 1], src[i + 2], src[i + 3]]);
+        let r = d + a4 * s;
+        let lanes = r.to_array();
+        dst[i] = lanes[0];
+        dst[i + 1] = lanes[1];
+        dst[i + 2] = lanes[2];
+        dst[i + 3] = lanes[3];
+        i += 4;
+    }
+    while i < n {
+        dst[i] += alpha * src[i];
+        i += 1;
+    }
+}
+
+#[inline]
 fn logsumexp2(a: f64, b: f64) -> f64 {
     let m = if a > b { a } else { b };
     if !m.is_finite() {
@@ -1246,15 +1304,13 @@ impl NeuralMixture {
 
         for (k, &ctx_i) in stage1_idx.iter().enumerate() {
             let entry = &self.stage1_tables[k][ctx_i];
-            for b in 0..256usize {
-                let mut z = entry.bias;
-                for i in 0..expert_count {
-                    z += entry.weights[i] * self.scratch_expert_logits[i * 256 + b];
-                }
-                self.scratch_stage1_out[k * 256 + b] = z;
-            }
             let row = &mut self.scratch_stage1_out[(k * 256)..((k + 1) * 256)];
-            let log_z = logsumexp(row);
+            row.fill(entry.bias);
+            for i in 0..expert_count {
+                let feat = &self.scratch_expert_logits[(i * 256)..((i + 1) * 256)];
+                axpy_wide(row, entry.weights[i], feat);
+            }
+            let log_z = logsumexp_wide(row);
             for v in row.iter_mut() {
                 *v -= log_z;
             }
@@ -1263,16 +1319,13 @@ impl NeuralMixture {
         for b in 0..256usize {
             let entry2 = &self.stage2_table[stage2_idx];
             let mut e = entry2.bias[b];
-            let stage_row = [
-                self.scratch_stage1_out[b],
-                self.scratch_stage1_out[256 + b],
-                self.scratch_stage1_out[512 + b],
-            ];
-            e += dot_wide(&entry2.weights, &stage_row);
+            e += entry2.weights[0] * self.scratch_stage1_out[b]
+                + entry2.weights[1] * self.scratch_stage1_out[256 + b]
+                + entry2.weights[2] * self.scratch_stage1_out[512 + b];
             self.scratch_energy[b] = e;
         }
 
-        let log_z = logsumexp(&self.scratch_energy);
+        let log_z = logsumexp_wide(&self.scratch_energy);
         for b in 0..256usize {
             self.scratch_probs[b] = (self.scratch_energy[b] - log_z).exp();
         }
@@ -1367,10 +1420,8 @@ impl NeuralMixture {
                 entry.bias = sanitize_weight(entry.bias + self.stage1_lr * grad_bias);
 
                 for i in 0..expert_count {
-                    let mut grad = 0.0;
-                    for b in 0..256usize {
-                        grad += self.scratch_errors[b] * self.scratch_expert_logits[i * 256 + b];
-                    }
+                    let feat = &self.scratch_expert_logits[(i * 256)..((i + 1) * 256)];
+                    let mut grad = dot_wide(&self.scratch_errors, feat);
                     grad *= v;
                     entry.weights[i] = sanitize_weight(entry.weights[i] + self.stage1_lr * grad);
                 }

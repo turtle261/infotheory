@@ -1,5 +1,5 @@
 {
-  "kind": "switching",
+  "kind": "neural",
   "alpha": 0.03,
   "experts": [
     {

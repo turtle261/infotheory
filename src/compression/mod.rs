@@ -447,6 +447,64 @@ fn dot_wide(lhs: &[f64], rhs: &[f64]) -> f64 {
     out
 }
 
+#[inline]
+fn max_wide(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+    let mut i = 0usize;
+    let mut max4 = f64x4::splat(f64::NEG_INFINITY);
+    while i + 4 <= xs.len() {
+        let v = f64x4::new([xs[i], xs[i + 1], xs[i + 2], xs[i + 3]]);
+        max4 = max4.max(v);
+        i += 4;
+    }
+    let lanes = max4.to_array();
+    let mut max_v = lanes[0].max(lanes[1]).max(lanes[2]).max(lanes[3]);
+    while i < xs.len() {
+        if xs[i] > max_v {
+            max_v = xs[i];
+        }
+        i += 1;
+    }
+    max_v
+}
+
+#[inline]
+fn logsumexp_wide(xs: &[f64]) -> f64 {
+    let max_v = max_wide(xs);
+    if !max_v.is_finite() {
+        return max_v;
+    }
+    let mut sum = 0.0;
+    for &v in xs {
+        sum += (v - max_v).exp();
+    }
+    max_v + sum.ln()
+}
+
+#[inline]
+fn axpy_wide(dst: &mut [f64], alpha: f64, src: &[f64]) {
+    let n = dst.len().min(src.len());
+    let mut i = 0usize;
+    let a4 = f64x4::splat(alpha);
+    while i + 4 <= n {
+        let d = f64x4::new([dst[i], dst[i + 1], dst[i + 2], dst[i + 3]]);
+        let s = f64x4::new([src[i], src[i + 1], src[i + 2], src[i + 3]]);
+        let r = d + a4 * s;
+        let lanes = r.to_array();
+        dst[i] = lanes[0];
+        dst[i + 1] = lanes[1];
+        dst[i + 2] = lanes[2];
+        dst[i + 3] = lanes[3];
+        i += 4;
+    }
+    while i < n {
+        dst[i] += alpha * src[i];
+        i += 1;
+    }
+}
+
 const NEURAL_STAGE1_CONTEXTS: usize = 3;
 const NEURAL_STAGE1_TABLE_SIZES: [usize; NEURAL_STAGE1_CONTEXTS] = [1, 256, 1024];
 const NEURAL_STAGE2_TABLE_SIZE: usize = 512;
@@ -610,15 +668,13 @@ impl MixturePredictor {
 
                 for (k, &ctx_i) in stage1_idx.iter().enumerate() {
                     let entry = &self.neural_stage1_tables[k][ctx_i];
-                    for b in 0..256usize {
-                        let mut z = entry.bias;
-                        for i in 0..self.experts.len() {
-                            z += entry.weights[i] * self.neural_features[i * 256 + b];
-                        }
-                        self.neural_stage1_out[k * 256 + b] = z;
-                    }
                     let row = &mut self.neural_stage1_out[(k * 256)..((k + 1) * 256)];
-                    let log_z = logsumexp(row.iter().copied());
+                    row.fill(entry.bias);
+                    for i in 0..self.experts.len() {
+                        let feat = &self.neural_features[(i * 256)..((i + 1) * 256)];
+                        axpy_wide(row, entry.weights[i], feat);
+                    }
+                    let log_z = logsumexp_wide(row);
                     for v in row.iter_mut() {
                         *v -= log_z;
                     }
@@ -627,15 +683,12 @@ impl MixturePredictor {
                 for b in 0..256usize {
                     let entry2 = &self.neural_stage2_table[stage2_idx];
                     let mut e = entry2.bias[b];
-                    let stage_row = [
-                        self.neural_stage1_out[b],
-                        self.neural_stage1_out[256 + b],
-                        self.neural_stage1_out[512 + b],
-                    ];
-                    e += dot_wide(&entry2.weights, &stage_row);
+                    e += entry2.weights[0] * self.neural_stage1_out[b]
+                        + entry2.weights[1] * self.neural_stage1_out[256 + b]
+                        + entry2.weights[2] * self.neural_stage1_out[512 + b];
                     self.pdf[b] = e;
                 }
-                let z = logsumexp(self.pdf.iter().copied());
+                let z = logsumexp_wide(&self.pdf);
                 for p in &mut self.pdf {
                     *p = (*p - z).exp();
                 }
@@ -789,10 +842,8 @@ impl MixturePredictor {
                         entry.bias = if nb.is_finite() { nb } else { 0.0 };
 
                         for i in 0..self.experts.len() {
-                            let mut grad = 0.0;
-                            for b in 0..256usize {
-                                grad += self.neural_errors[b] * self.neural_features[i * 256 + b];
-                            }
+                            let feat = &self.neural_features[(i * 256)..((i + 1) * 256)];
+                            let mut grad = dot_wide(&self.neural_errors, feat);
                             grad *= v;
                             let nw = entry.weights[i] + self.neural_stage1_lr * grad;
                             entry.weights[i] = if nw.is_finite() { nw } else { 0.0 };
