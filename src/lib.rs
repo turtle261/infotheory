@@ -329,6 +329,8 @@ pub enum MixtureKind {
     Switching,
     /// MDL-style best-expert selector.
     Mdl,
+    /// Bytewise neural logistic mixer (fx2-cmix style adaptation).
+    Neural,
 }
 
 /// Expert specification for mixture backends.

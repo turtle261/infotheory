@@ -52,6 +52,10 @@ harness = false
 name = "aixi"
 harness = false
 
+[[bench]]
+name = "mixture_backends"
+harness = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

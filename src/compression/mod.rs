@@ -397,11 +397,57 @@ struct MixExpert {
 }
 
 #[derive(Clone)]
+struct NeuralMixStage1Entry {
+    weights: Vec<f64>,
+    bias: f64,
+}
+
+impl NeuralMixStage1Entry {
+    fn new(width: usize) -> Self {
+        Self {
+            weights: vec![0.0; width],
+            bias: 0.0,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NeuralMixStage2Entry {
+    weights: Vec<f64>,
+    bias: Vec<f64>,
+}
+
+impl NeuralMixStage2Entry {
+    fn new(width: usize) -> Self {
+        Self {
+            weights: vec![0.0; width],
+            bias: vec![0.0; 256],
+        }
+    }
+}
+
+const NEURAL_STAGE1_CONTEXTS: usize = 3;
+const NEURAL_STAGE1_TABLE_SIZES: [usize; NEURAL_STAGE1_CONTEXTS] = [1, 256, 1024];
+const NEURAL_STAGE2_TABLE_SIZE: usize = 512;
+
+#[derive(Clone)]
 struct MixturePredictor {
     kind: MixtureKind,
     alpha: f64,
     decay: f64,
     experts: Vec<MixExpert>,
+    neural_stage1_tables: Vec<Vec<NeuralMixStage1Entry>>,
+    neural_stage2_table: Vec<NeuralMixStage2Entry>,
+    neural_stage1_lr: f64,
+    neural_stage2_lr: f64,
+    neural_skip: f64,
+    neural_features: Vec<f64>,
+    neural_stage1_out: Vec<f64>,
+    neural_errors: Vec<f64>,
+    neural_prev1: u8,
+    neural_prev2: u8,
+    neural_run_len: u16,
+    neural_has_history: bool,
     scratch: Vec<f64>,
     scratch2: Vec<f64>,
     pdf: Vec<f64>,
@@ -429,11 +475,53 @@ impl MixturePredictor {
         for e in &mut experts {
             e.log_weight -= m;
         }
+
+        let mut prior_logits = vec![0.0; experts.len()];
+        for (i, e) in experts.iter().enumerate() {
+            let p = (e.log_weight).exp().clamp(PDF_MIN, 1.0 - PDF_MIN);
+            prior_logits[i] = (p / (1.0 - p)).ln();
+        }
+
+        let mut neural_stage1_tables = Vec::with_capacity(NEURAL_STAGE1_CONTEXTS);
+        for (ctx_idx, table_size) in NEURAL_STAGE1_TABLE_SIZES.iter().enumerate() {
+            let mut table = Vec::with_capacity(*table_size);
+            for _ in 0..*table_size {
+                let mut entry = NeuralMixStage1Entry::new(experts.len());
+                if ctx_idx == 0 {
+                    entry.weights.clone_from(&prior_logits);
+                }
+                table.push(entry);
+            }
+            neural_stage1_tables.push(table);
+        }
+
+        let mut neural_stage2_table = Vec::with_capacity(NEURAL_STAGE2_TABLE_SIZE);
+        for _ in 0..NEURAL_STAGE2_TABLE_SIZE {
+            let mut entry = NeuralMixStage2Entry::new(NEURAL_STAGE1_CONTEXTS);
+            for w in &mut entry.weights {
+                *w = 1.0 / (NEURAL_STAGE1_CONTEXTS as f64);
+            }
+            neural_stage2_table.push(entry);
+        }
+
+        let base_lr = spec.alpha.abs().clamp(1e-6, 1.0);
         Ok(Self {
             kind: spec.kind,
             alpha: spec.alpha.clamp(1e-12, 1.0 - 1e-12),
             decay: spec.decay.unwrap_or(1.0).clamp(0.0, 1.0),
             experts,
+            neural_stage1_tables,
+            neural_stage2_table,
+            neural_stage1_lr: base_lr * 0.5,
+            neural_stage2_lr: base_lr,
+            neural_skip: 1e-5,
+            neural_features: vec![0.0; spec.experts.len() * 256],
+            neural_stage1_out: vec![0.0; NEURAL_STAGE1_CONTEXTS * 256],
+            neural_errors: vec![0.0; 256],
+            neural_prev1: 0,
+            neural_prev2: 0,
+            neural_run_len: 0,
+            neural_has_history: false,
             scratch: Vec::new(),
             scratch2: Vec::new(),
             pdf: vec![0.0; 256],
@@ -441,18 +529,98 @@ impl MixturePredictor {
         })
     }
 
+    fn neural_stage1_context_indices(&self) -> [usize; NEURAL_STAGE1_CONTEXTS] {
+        if !self.neural_has_history {
+            return [0, 0, 0];
+        }
+        let run_bucket = (self.neural_run_len.min(63) as usize) & 0x3f;
+        let h = ((self.neural_prev1 as usize) << 10)
+            ^ ((self.neural_prev2 as usize) << 2)
+            ^ run_bucket
+            ^ (((self.neural_prev1 ^ self.neural_prev2) as usize) << 5);
+        [0, self.neural_prev1 as usize, h % NEURAL_STAGE1_TABLE_SIZES[2]]
+    }
+
+    fn neural_stage2_context_index(&self) -> usize {
+        if !self.neural_has_history {
+            return 0;
+        }
+        let run_bucket = (self.neural_run_len.min(127) as usize) & 0x7f;
+        let h = ((self.neural_prev1 as usize) << 8) ^ (self.neural_prev2 as usize) ^ run_bucket;
+        h % NEURAL_STAGE2_TABLE_SIZE
+    }
+
+    fn neural_update_history(&mut self, symbol: u8) {
+        if self.neural_has_history && symbol == self.neural_prev1 {
+            self.neural_run_len = self.neural_run_len.saturating_add(1).min(255);
+        } else {
+            self.neural_run_len = 1;
+        }
+        self.neural_prev2 = self.neural_prev1;
+        self.neural_prev1 = symbol;
+        self.neural_has_history = true;
+    }
+
     fn ensure_pdf(&mut self) -> Result<&[f64]> {
         if self.valid {
             return Ok(&self.pdf);
         }
-        self.pdf.fill(0.0);
+        match self.kind {
+            MixtureKind::Neural => {
+                self.pdf.fill(0.0);
+                if self.experts.len() == 1 {
+                    let epdf = self.experts[0].predictor.pdf_next()?;
+                    self.pdf.copy_from_slice(epdf);
+                    normalize_pdf(&mut self.pdf);
+                    self.valid = true;
+                    return Ok(&self.pdf);
+                }
+                self.neural_features.fill(0.0);
 
-        let lw_norm = logsumexp(self.experts.iter().map(|e| e.log_weight));
-        for e in &mut self.experts {
-            let w = (e.log_weight - lw_norm).exp();
-            let epdf = e.predictor.pdf_next()?;
-            for (i, p) in epdf.iter().enumerate().take(256) {
-                self.pdf[i] += w * *p;
+                let stage1_idx = self.neural_stage1_context_indices();
+                let stage2_idx = self.neural_stage2_context_index();
+
+                for (i, e) in self.experts.iter_mut().enumerate() {
+                    let epdf = e.predictor.pdf_next()?;
+                    for (b, p) in epdf.iter().enumerate().take(256) {
+                        let p = p.clamp(PDF_MIN, 1.0 - PDF_MIN);
+                        self.neural_features[i * 256 + b] = (p / (1.0 - p)).ln();
+                    }
+                }
+
+                for b in 0..256usize {
+                    for (k, &ctx_i) in stage1_idx.iter().enumerate() {
+                        let entry = &self.neural_stage1_tables[k][ctx_i];
+                        let mut z = entry.bias;
+                        for i in 0..self.experts.len() {
+                            z += entry.weights[i] * self.neural_features[i * 256 + b];
+                        }
+                        self.neural_stage1_out[k * 256 + b] = logistic(z);
+                    }
+
+                    let entry2 = &self.neural_stage2_table[stage2_idx];
+                    let mut e = entry2.bias[b];
+                    for k in 0..NEURAL_STAGE1_CONTEXTS {
+                        e += entry2.weights[k] * self.neural_stage1_out[k * 256 + b];
+                    }
+                    self.pdf[b] = e;
+                }
+                let z = logsumexp(self.pdf.iter().copied());
+                for p in &mut self.pdf {
+                    *p = (*p - z).exp();
+                }
+            }
+            _ => {
+                self.pdf.fill(0.0);
+
+                let lw_norm = logsumexp(self.experts.iter().map(|e| e.log_weight));
+                for e in &mut self.experts {
+                    let w = (e.log_weight - lw_norm).exp();
+                    let epdf = e.predictor.pdf_next()?;
+                    for (i, p) in epdf.iter().enumerate().take(256) {
+                        self.pdf[i] += w * *p;
+                    }
+                }
             }
         }
 
@@ -464,19 +632,17 @@ impl MixturePredictor {
     fn update(&mut self, symbol: u8) -> Result<()> {
         let _ = self.ensure_pdf()?;
 
-        let n = self.experts.len();
-        self.scratch.resize(n, 0.0);
-        self.scratch2.resize(n, 0.0);
-
-        for (i, e) in self.experts.iter_mut().enumerate() {
-            let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
-            let lp = p.ln();
-            self.scratch[i] = lp;
-            self.scratch2[i] = e.log_weight + lp;
-        }
-
         match self.kind {
             MixtureKind::Bayes => {
+                let n = self.experts.len();
+                self.scratch.resize(n, 0.0);
+                self.scratch2.resize(n, 0.0);
+                for (i, e) in self.experts.iter_mut().enumerate() {
+                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
+                    let lp = p.ln();
+                    self.scratch[i] = lp;
+                    self.scratch2[i] = e.log_weight + lp;
+                }
                 let log_mix = logsumexp(self.scratch2.iter().copied());
                 for (i, e) in self.experts.iter_mut().enumerate() {
                     e.log_weight = e.log_weight + self.scratch[i] - log_mix;
@@ -485,6 +651,15 @@ impl MixturePredictor {
                 }
             }
             MixtureKind::FadingBayes => {
+                let n = self.experts.len();
+                self.scratch.resize(n, 0.0);
+                self.scratch2.resize(n, 0.0);
+                for (i, e) in self.experts.iter_mut().enumerate() {
+                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
+                    let lp = p.ln();
+                    self.scratch[i] = lp;
+                    self.scratch2[i] = e.log_weight + lp;
+                }
                 for (i, e) in self.experts.iter_mut().enumerate() {
                     self.scratch2[i] = self.decay * e.log_weight + self.scratch[i];
                 }
@@ -496,6 +671,15 @@ impl MixturePredictor {
                 }
             }
             MixtureKind::Switching => {
+                let n = self.experts.len();
+                self.scratch.resize(n, 0.0);
+                self.scratch2.resize(n, 0.0);
+                for (i, e) in self.experts.iter_mut().enumerate() {
+                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
+                    let lp = p.ln();
+                    self.scratch[i] = lp;
+                    self.scratch2[i] = e.log_weight + lp;
+                }
                 let log_alpha = self.alpha.ln();
                 let log_1m_alpha = (1.0 - self.alpha).ln();
                 for (i, e) in self.experts.iter_mut().enumerate() {
@@ -510,10 +694,93 @@ impl MixturePredictor {
                 }
             }
             MixtureKind::Mdl => {
+                let n = self.experts.len();
+                self.scratch.resize(n, 0.0);
+                for (i, e) in self.experts.iter_mut().enumerate() {
+                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
+                    let lp = p.ln();
+                    self.scratch[i] = lp;
+                }
                 for (i, e) in self.experts.iter_mut().enumerate() {
                     e.cum_log_loss -= self.scratch[i];
                     e.predictor.update(symbol)?;
                 }
+            }
+            MixtureKind::Neural => {
+                let y = symbol as usize;
+                if self.experts.len() == 1 {
+                    let lp = self.experts[0].predictor.pdf_next()?[y].max(PDF_MIN).ln();
+                    self.experts[0].cum_log_loss -= lp;
+                    self.experts[0].predictor.update(symbol)?;
+                    self.neural_update_history(symbol);
+                    self.valid = false;
+                    return Ok(());
+                }
+                for e in &mut self.experts {
+                    e.cum_log_loss -= e.predictor.pdf_next()?[y].max(PDF_MIN).ln();
+                }
+
+                let error_mag = (1.0 - self.pdf[y]).abs();
+                if error_mag > self.neural_skip {
+                    for b in 0..256usize {
+                        self.neural_errors[b] = if b == y { 1.0 } else { 0.0 } - self.pdf[b];
+                    }
+
+                    let stage1_idx = self.neural_stage1_context_indices();
+                    let stage2_idx = self.neural_stage2_context_index();
+                    let old_stage2_weights = {
+                        let w = &self.neural_stage2_table[stage2_idx].weights;
+                        [w[0], w[1], w[2]]
+                    };
+
+                    {
+                        let entry2 = &mut self.neural_stage2_table[stage2_idx];
+                        for k in 0..NEURAL_STAGE1_CONTEXTS {
+                            let mut grad = 0.0;
+                            for b in 0..256usize {
+                                grad += self.neural_errors[b] * self.neural_stage1_out[k * 256 + b];
+                            }
+                            let w = entry2.weights[k] + self.neural_stage2_lr * grad;
+                            entry2.weights[k] = if w.is_finite() { w } else { 0.0 };
+                        }
+                        for b in 0..256usize {
+                            let nb = entry2.bias[b] + self.neural_stage2_lr * self.neural_errors[b];
+                            entry2.bias[b] = if nb.is_finite() { nb } else { 0.0 };
+                        }
+                    }
+
+                    for (k, &ctx_i) in stage1_idx.iter().enumerate() {
+                        let v = old_stage2_weights[k];
+                        let entry = &mut self.neural_stage1_tables[k][ctx_i];
+
+                        let mut grad_bias = 0.0;
+                        for b in 0..256usize {
+                            let q = self.neural_stage1_out[k * 256 + b];
+                            grad_bias += self.neural_errors[b] * v * q * (1.0 - q);
+                        }
+                        let nb = entry.bias + self.neural_stage1_lr * grad_bias;
+                        entry.bias = if nb.is_finite() { nb } else { 0.0 };
+
+                        for i in 0..self.experts.len() {
+                            let mut grad = 0.0;
+                            for b in 0..256usize {
+                                let q = self.neural_stage1_out[k * 256 + b];
+                                grad += self.neural_errors[b]
+                                    * v
+                                    * q
+                                    * (1.0 - q)
+                                    * self.neural_features[i * 256 + b];
+                            }
+                            let nw = entry.weights[i] + self.neural_stage1_lr * grad;
+                            entry.weights[i] = if nw.is_finite() { nw } else { 0.0 };
+                        }
+                    }
+                }
+
+                for e in &mut self.experts {
+                    e.predictor.update(symbol)?;
+                }
+                self.neural_update_history(symbol);
             }
         }
 
@@ -815,6 +1082,16 @@ fn normalize_pdf(pdf: &mut [f64]) {
     }
 }
 
+#[inline]
+fn logistic(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
 fn logsumexp<I: Iterator<Item = f64>>(it: I) -> f64 {
     let vals: Vec<f64> = it.collect();
     let mut m = f64::NEG_INFINITY;
@@ -939,6 +1216,121 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_rate_ac_recursive_neural_mixture() {
+        let data = b"neural recursive mixture payload for ac coder";
+        let inner = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                crate::MixtureExpertSpec {
+                    name: Some("ctw".to_string()),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend: RateBackend::Ctw { depth: 6 },
+                },
+                crate::MixtureExpertSpec {
+                    name: Some("fac".to_string()),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend: RateBackend::FacCtw {
+                        base_depth: 6,
+                        num_percept_bits: 8,
+                        encoding_bits: 8,
+                    },
+                },
+            ],
+        );
+        let root = MixtureSpec::new(
+            MixtureKind::Neural,
+            vec![
+                crate::MixtureExpertSpec {
+                    name: Some("nested".to_string()),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend: RateBackend::Mixture {
+                        spec: Arc::new(inner),
+                    },
+                },
+                crate::MixtureExpertSpec {
+                    name: Some("zpaq".to_string()),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend: RateBackend::Zpaq {
+                        method: "1".to_string(),
+                    },
+                },
+            ],
+        )
+        .with_alpha(0.03);
+
+        let backend = RateBackend::Mixture {
+            spec: Arc::new(root),
+        };
+        let enc = compress_rate_bytes(
+            data,
+            &backend,
+            -1,
+            rwkvzip::CoderType::AC,
+            FramingMode::Framed,
+        )
+        .unwrap();
+        let dec = decompress_rate_bytes(
+            &enc,
+            &backend,
+            -1,
+            rwkvzip::CoderType::AC,
+            FramingMode::Framed,
+        )
+        .unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn neural_runtime_and_compression_predictor_align() {
+        let spec = MixtureSpec::new(
+            MixtureKind::Neural,
+            vec![
+                crate::MixtureExpertSpec {
+                    name: Some("ctw".to_string()),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend: RateBackend::Ctw { depth: 7 },
+                },
+                crate::MixtureExpertSpec {
+                    name: Some("fac".to_string()),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend: RateBackend::FacCtw {
+                        base_depth: 7,
+                        num_percept_bits: 8,
+                        encoding_bits: 8,
+                    },
+                },
+            ],
+        )
+        .with_alpha(0.03);
+
+        let backend = RateBackend::Mixture {
+            spec: Arc::new(spec.clone()),
+        };
+        let mut predictor = RatePdfPredictor::from_rate_backend(backend, -1).unwrap();
+        let experts = spec.build_experts();
+        let mut runtime = crate::mixture::build_mixture_runtime(&spec, &experts).unwrap();
+
+        let data = b"neural alignment check sequence";
+        for &b in data {
+            let pdf = predictor.pdf_next().unwrap();
+            let p_comp = pdf[b as usize];
+            let p_runtime = runtime.peek_log_prob(b).exp();
+            assert!(
+                (p_comp - p_runtime).abs() < 1e-8,
+                "p_comp={p_comp} p_runtime={p_runtime} symbol={b}"
+            );
+            predictor.update(b).unwrap();
+            runtime.step(b);
+        }
     }
 
     #[test]

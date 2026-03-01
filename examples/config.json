@@ -1,0 +1,20 @@
+{
+  "kind": "switching",
+  "alpha": 0.03,
+  "experts": [
+    {
+      "name": "fac",
+      "kind": "fac-ctw",
+      "base_depth": 32,
+      "encoding_bits": 8,
+      "num_percept_bits": 8,
+      "log_prior": 0.0
+    },
+    {
+      "name": "rosa",
+      "kind": "rosaplus",
+      "max_order": -1,
+      "log_prior": 0.0
+    }
+  ]
+}

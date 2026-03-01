@@ -217,6 +217,13 @@ impl PyMixtureKind {
             inner: MixtureKind::Mdl,
         }
     }
+    #[classattr]
+    #[pyo3(name = "Neural")]
+    fn neural() -> Self {
+        Self {
+            inner: MixtureKind::Neural,
+        }
+    }
 }
 
 #[pyclass(name = "MixtureExpertSpec", from_py_object)]
