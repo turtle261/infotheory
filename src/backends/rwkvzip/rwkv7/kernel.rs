@@ -1317,44 +1317,13 @@ mod tests {
             normed_ref[i] = y_ref_head[i] / denom;
         }
 
-        let checksum = |data: &[f32]| -> f64 {
-            data.iter()
-                .enumerate()
-                .map(|(i, &v)| (i as f64 + 1.0) * (v as f64))
-                .sum::<f64>()
-        };
-
-        let state_checksum = checksum(&state);
-        let state_ref_checksum = checksum(&state_ref);
-        let y_checksum = checksum(&y);
-        let y_ref_checksum = checksum(&y_ref);
-        let softmax_checksum = checksum(&sm);
-        let softmax_ref_checksum = checksum(&sm_ref);
-        let normed_checksum = checksum(&normed);
-        let normed_ref_checksum = checksum(&normed_ref);
-        let lse_val = lse as f64;
-        let lse_ref_val = lse_ref as f64;
-
-        let tol = 7e-4_f64;
-        assert!(
-            (state_checksum - state_ref_checksum).abs() <= tol,
-            "state_checksum={state_checksum} state_ref_checksum={state_ref_checksum}"
-        );
-        assert!(
-            (y_checksum - y_ref_checksum).abs() <= tol,
-            "y_checksum={y_checksum} y_ref_checksum={y_ref_checksum}"
-        );
-        assert!(
-            (softmax_checksum - softmax_ref_checksum).abs() <= tol,
-            "softmax_checksum={softmax_checksum} softmax_ref_checksum={softmax_ref_checksum}"
-        );
-        assert!(
-            (normed_checksum - normed_ref_checksum).abs() <= tol,
-            "normed_checksum={normed_checksum} normed_ref_checksum={normed_ref_checksum}"
-        );
-        assert!(
-            (lse_val - lse_ref_val).abs() <= tol,
-            "lse={lse_val} lse_ref={lse_ref_val}"
-        );
+        // Compare AVX output directly against the scalar reference.
+        // Checksum comparisons are brittle across CPUs because tiny per-element
+        // FP ordering differences accumulate over long vectors.
+        assert_close_slice(&state, &state_ref, 5e-4);
+        assert_close_slice(&y, &y_ref, 5e-4);
+        assert_close_slice(&sm, &sm_ref, 5e-5);
+        assert_close_slice(&normed, &normed_ref, 5e-5);
+        assert!((lse - lse_ref).abs() <= 5e-5, "lse={lse} lse_ref={lse_ref}");
     }
 }
