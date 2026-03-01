@@ -150,11 +150,13 @@ impl NeuralMixCore {
         self.probs[symbol as usize]
     }
 
+    #[cfg(feature = "backend-rwkv")]
     #[inline]
     pub(crate) fn probs(&self) -> &[f64] {
         &self.probs
     }
 
+    #[cfg(feature = "backend-rwkv")]
     #[inline]
     pub(crate) fn probs_mut(&mut self) -> &mut [f64] {
         &mut self.probs
@@ -248,6 +250,7 @@ impl NeuralMixCore {
     }
 }
 
+#[cfg(feature = "backend-rwkv")]
 #[inline]
 fn clamp_prob(p: f64, min_prob: f64) -> f64 {
     if p.is_finite() {
@@ -257,6 +260,7 @@ fn clamp_prob(p: f64, min_prob: f64) -> f64 {
     }
 }
 
+#[cfg(feature = "backend-rwkv")]
 #[inline]
 pub(crate) fn fill_log_probs_from_pdf_row(
     pdf_row: &[f64],
