@@ -87,6 +87,8 @@ pub mod compression;
 pub mod datagen;
 /// Online Bayesian/switching/MDL mixture predictors.
 pub mod mixture;
+pub(crate) mod neural_mix;
+pub(crate) mod simd_math;
 /// CTW and FAC-CTW backend types.
 pub use backends::ctw;
 /// ROSA+ backend types.
@@ -329,6 +331,8 @@ pub enum MixtureKind {
     Switching,
     /// MDL-style best-expert selector.
     Mdl,
+    /// Bytewise neural logistic mixer (fx2-cmix style adaptation).
+    Neural,
 }
 
 /// Expert specification for mixture backends.

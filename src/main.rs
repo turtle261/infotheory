@@ -235,6 +235,9 @@ fn parse_mixture_kind(kind: &str) -> anyhow::Result<MixtureKind> {
         "fading" | "fading-bayes" | "fading_bayes" => Ok(MixtureKind::FadingBayes),
         "switch" | "switching" | "switch-mix" | "switch_mix" => Ok(MixtureKind::Switching),
         "mdl" | "selector" | "mdr" => Ok(MixtureKind::Mdl),
+        "neural" | "neural-mix" | "neural_mix" | "fx2" | "fx2-cmix" | "fx2_cmix" => {
+            Ok(MixtureKind::Neural)
+        }
         other => Err(anyhow::anyhow!("unknown mixture kind '{other}'")),
     }
 }
@@ -2646,6 +2649,10 @@ mod tests {
         assert_eq!(
             parse_mixture_kind("switch").expect("switch alias"),
             MixtureKind::Switching
+        );
+        assert_eq!(
+            parse_mixture_kind("neural").expect("neural kind"),
+            MixtureKind::Neural
         );
         assert!(parse_mixture_kind("nonsense").is_err());
 

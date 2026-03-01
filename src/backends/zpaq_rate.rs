@@ -22,6 +22,7 @@ mod imp {
     /// Stateful ZPAQ-backed estimator of sequential symbol log-probabilities.
     pub struct ZpaqRateModel {
         stream: ZpaqStreaming,
+        history: Vec<u8>,
         pending_symbol: Option<u8>,
         pending_bits: f64,
         min_prob: f64,
@@ -49,6 +50,7 @@ mod imp {
                     compressor,
                     last_bits: 0.0,
                 },
+                history: Vec::new(),
                 pending_symbol: None,
                 pending_bits: 0.0,
                 min_prob,
@@ -66,8 +68,43 @@ mod imp {
                 compressor,
                 last_bits: 0.0,
             };
+            self.history.clear();
             self.pending_symbol = None;
             self.pending_bits = 0.0;
+        }
+
+        fn rebuild_stream_from_history(&mut self) {
+            let method = self.method.clone();
+            let compressor = StreamingCompressor::new(method.as_str()).unwrap_or_else(|e| {
+                panic!("ZPAQ rate backend requires a streamable method; got '{method}': {e}")
+            });
+            self.stream = ZpaqStreaming {
+                compressor,
+                last_bits: 0.0,
+            };
+            let history = self.history.clone();
+            for b in history {
+                let _ = self.encode_bits(b);
+            }
+            self.pending_symbol = None;
+            self.pending_bits = 0.0;
+        }
+
+        fn log_prob_from_history(&self, symbol: u8) -> f64 {
+            let mut compressor =
+                StreamingCompressor::new(self.method.as_str()).expect("zpaq streaming new failed");
+            for &b in &self.history {
+                compressor
+                    .push(b)
+                    .expect("zpaq streaming compression failed");
+            }
+            let before = compressor.bits();
+            compressor
+                .push(symbol)
+                .expect("zpaq streaming compression failed");
+            let bits = (compressor.bits() - before).max(0.0);
+            let logp = -(bits * LN_2);
+            logp.max(self.min_prob.ln())
         }
 
         fn encode_bits(&mut self, symbol: u8) -> f64 {
@@ -90,7 +127,8 @@ mod imp {
                     let logp = -(self.pending_bits * LN_2);
                     return logp.max(self.min_prob.ln());
                 }
-                self.pending_symbol = None;
+                // We cannot rollback `StreamingCompressor`; rebuild to committed history.
+                self.rebuild_stream_from_history();
             }
 
             let bits = self.encode_bits(symbol);
@@ -100,17 +138,31 @@ mod imp {
             logp.max(self.min_prob.ln())
         }
 
+        /// Fill 256-way log-probabilities for the current committed history without mutation.
+        pub fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+            // Treat fill as a read-only query of committed history.
+            self.rebuild_stream_from_history();
+            for (sym, slot) in out.iter_mut().enumerate() {
+                *slot = self.log_prob_from_history(sym as u8);
+            }
+        }
+
         /// Advance model state with one observed symbol.
         pub fn update(&mut self, symbol: u8) {
             if let Some(pending) = self.pending_symbol
                 && pending == symbol
             {
                 self.pending_symbol = None;
+                self.history.push(symbol);
                 return;
             }
+            if self.pending_symbol.is_some() {
+                self.rebuild_stream_from_history();
+            }
+            let _ = self.encode_bits(symbol);
             self.pending_symbol = None;
             self.pending_bits = 0.0;
-            let _ = self.encode_bits(symbol);
+            self.history.push(symbol);
         }
 
         /// Score and consume an entire byte slice, returning total code length in bits.
@@ -123,6 +175,7 @@ mod imp {
             let mut bits = 0.0;
             for &b in data {
                 bits += self.encode_bits(b);
+                self.history.push(b);
             }
             bits
         }
@@ -156,6 +209,33 @@ mod imp {
             let diff = (bits_a - bits_b).abs();
             assert!(diff < 1e-6, "bits mismatch: {bits_a} vs {bits_b}");
         }
+
+        #[test]
+        fn zpaq_fill_log_probs_is_non_mutating() {
+            let history = b"zpaq fill non mutating";
+            let mut model_a = ZpaqRateModel::new("1", 1e-9);
+            let mut model_b = ZpaqRateModel::new("1", 1e-9);
+            for &b in history {
+                model_a.update(b);
+                model_b.update(b);
+            }
+
+            let mut row = [0.0f64; 256];
+            model_b.fill_log_probs(&mut row);
+
+            let sym = b'x';
+            let lp_a = model_a.log_prob(sym);
+            let lp_b = model_b.log_prob(sym);
+            assert!((lp_a - lp_b).abs() < 1e-9, "lp_a={lp_a} lp_b={lp_b}");
+            assert!((row[sym as usize] - lp_a).abs() < 1e-9);
+
+            model_a.update(sym);
+            model_b.update(sym);
+            let next_sym = b'y';
+            let lp_a2 = model_a.log_prob(next_sym);
+            let lp_b2 = model_b.log_prob(next_sym);
+            assert!((lp_a2 - lp_b2).abs() < 1e-9, "lp_a2={lp_a2} lp_b2={lp_b2}");
+        }
     }
 }
 
@@ -181,6 +261,10 @@ mod imp {
 
         pub fn log_prob(&mut self, _symbol: u8) -> f64 {
             self.min_log_prob
+        }
+
+        pub fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+            out.fill(self.min_log_prob);
         }
 
         pub fn update(&mut self, _symbol: u8) {}

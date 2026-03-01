@@ -52,6 +52,18 @@ harness = false
 name = "aixi"
 harness = false
 
+[[bench]]
+name = "mixture_backends"
+harness = false
+
+[[bench]]
+name = "neural_baseline"
+harness = false
+
+[[bench]]
+name = "simd_hotspots"
+harness = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
