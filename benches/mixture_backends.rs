@@ -19,7 +19,8 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn source_data(expand_factor: usize) -> Vec<u8> {
-    let raw = std::fs::read("LICENSE-APACHE").expect("failed to read LICENSE-APACHE from repo root");
+    let raw =
+        std::fs::read("LICENSE-APACHE").expect("failed to read LICENSE-APACHE from repo root");
     assert!(!raw.is_empty(), "LICENSE-APACHE must not be empty");
     let mut expanded = Vec::with_capacity(raw.len() * expand_factor);
     for _ in 0..expand_factor {
@@ -59,7 +60,13 @@ fn make_spec(kind: MixtureKind) -> MixtureSpec {
     }
 }
 
-fn bench_kind(name: &str, kind: MixtureKind, data: &[u8], warmup_iters: usize, bench_iters: usize) -> Duration {
+fn bench_kind(
+    name: &str,
+    kind: MixtureKind,
+    data: &[u8],
+    warmup_iters: usize,
+    bench_iters: usize,
+) -> Duration {
     let backend = RateBackend::Mixture {
         spec: Arc::new(make_spec(kind)),
     };

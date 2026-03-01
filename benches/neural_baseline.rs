@@ -65,7 +65,10 @@ fn run_one(name: &str, kind: MixtureKind, bytes: &[u8]) {
 
 fn main() {
     let bytes = data();
-    println!("Neural baseline benchmark on LICENSE-APACHE (n={})", bytes.len());
+    println!(
+        "Neural baseline benchmark on LICENSE-APACHE (n={})",
+        bytes.len()
+    );
     run_one("neural", MixtureKind::Neural, &bytes);
     run_one("switch", MixtureKind::Switching, &bytes);
     run_one("bayes", MixtureKind::Bayes, &bytes);

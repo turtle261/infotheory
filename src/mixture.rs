@@ -13,10 +13,10 @@ use crate::ctw::FacContextTree;
 use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
+use crate::simd_math::{affine3_wide, axpy_wide, dot_wide, logsumexp_wide};
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{MixtureKind, MixtureSpec, RateBackend};
 use std::sync::Arc;
-use wide::f64x4;
 
 /// Default minimum probability floor to avoid log(0).
 pub const DEFAULT_MIN_PROB: f64 = 5.960_464_477_539_063e-8;
@@ -41,26 +41,6 @@ fn sanitize_weight(w: f64) -> f64 {
 }
 
 #[inline]
-fn dot_wide(lhs: &[f64], rhs: &[f64]) -> f64 {
-    let n = lhs.len().min(rhs.len());
-    let mut acc = f64x4::ZERO;
-    let mut i = 0usize;
-    while i + 4 <= n {
-        let a = f64x4::new([lhs[i], lhs[i + 1], lhs[i + 2], lhs[i + 3]]);
-        let b = f64x4::new([rhs[i], rhs[i + 1], rhs[i + 2], rhs[i + 3]]);
-        acc += a * b;
-        i += 4;
-    }
-    let lanes = acc.to_array();
-    let mut out = lanes[0] + lanes[1] + lanes[2] + lanes[3];
-    while i < n {
-        out += lhs[i] * rhs[i];
-        i += 1;
-    }
-    out
-}
-
-#[inline]
 fn logsumexp(xs: &[f64]) -> f64 {
     let mut max_v = f64::NEG_INFINITY;
     for &v in xs {
@@ -76,64 +56,6 @@ fn logsumexp(xs: &[f64]) -> f64 {
         sum += (v - max_v).exp();
     }
     max_v + sum.ln()
-}
-
-#[inline]
-fn max_wide(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
-        return f64::NEG_INFINITY;
-    }
-    let mut i = 0usize;
-    let mut max4 = f64x4::splat(f64::NEG_INFINITY);
-    while i + 4 <= xs.len() {
-        let v = f64x4::new([xs[i], xs[i + 1], xs[i + 2], xs[i + 3]]);
-        max4 = max4.max(v);
-        i += 4;
-    }
-    let lanes = max4.to_array();
-    let mut max_v = lanes[0].max(lanes[1]).max(lanes[2]).max(lanes[3]);
-    while i < xs.len() {
-        if xs[i] > max_v {
-            max_v = xs[i];
-        }
-        i += 1;
-    }
-    max_v
-}
-
-#[inline]
-fn logsumexp_wide(xs: &[f64]) -> f64 {
-    let max_v = max_wide(xs);
-    if !max_v.is_finite() {
-        return max_v;
-    }
-    let mut sum = 0.0;
-    for &v in xs {
-        sum += (v - max_v).exp();
-    }
-    max_v + sum.ln()
-}
-
-#[inline]
-fn axpy_wide(dst: &mut [f64], alpha: f64, src: &[f64]) {
-    let n = dst.len().min(src.len());
-    let mut i = 0usize;
-    let a4 = f64x4::splat(alpha);
-    while i + 4 <= n {
-        let d = f64x4::new([dst[i], dst[i + 1], dst[i + 2], dst[i + 3]]);
-        let s = f64x4::new([src[i], src[i + 1], src[i + 2], src[i + 3]]);
-        let r = d + a4 * s;
-        let lanes = r.to_array();
-        dst[i] = lanes[0];
-        dst[i + 1] = lanes[1];
-        dst[i + 2] = lanes[2];
-        dst[i + 3] = lanes[3];
-        i += 4;
-    }
-    while i < n {
-        dst[i] += alpha * src[i];
-        i += 1;
-    }
 }
 
 #[inline]
@@ -186,24 +108,33 @@ fn fill_fac_tree_log_probs(
     min_logp: f64,
     out: &mut [f64; 256],
 ) {
+    struct RecParams {
+        bits: usize,
+        msb_first: bool,
+        log_before: f64,
+        min_logp: f64,
+    }
+
     let bits = bits_per_symbol.clamp(1, 8);
     let patterns = 1usize << bits;
     let mut pattern_logps = [f64::NEG_INFINITY; 256];
-    let log_before = tree.get_log_block_probability();
+    let params = RecParams {
+        bits,
+        msb_first,
+        log_before: tree.get_log_block_probability(),
+        min_logp,
+    };
 
     fn rec(
         tree: &mut FacContextTree,
         depth: usize,
-        bits: usize,
-        msb_first: bool,
+        params: &RecParams,
         symbol_acc: u8,
-        log_before: f64,
-        min_logp: f64,
         pattern_logps: &mut [f64; 256],
     ) {
-        if depth == bits {
+        if depth == params.bits {
             let pat = symbol_acc as usize;
-            let logp = (tree.get_log_block_probability() - log_before).max(min_logp);
+            let logp = (tree.get_log_block_probability() - params.log_before).max(params.min_logp);
             pattern_logps[pat] = logp;
             return;
         }
@@ -211,7 +142,7 @@ fn fill_fac_tree_log_probs(
         for bit in [false, true] {
             tree.update(bit, depth);
             let mut next_symbol = symbol_acc;
-            if msb_first {
+            if params.msb_first {
                 let shift = 7usize.saturating_sub(depth);
                 if bit {
                     next_symbol |= 1u8 << shift;
@@ -219,30 +150,12 @@ fn fill_fac_tree_log_probs(
             } else if bit {
                 next_symbol |= 1u8 << depth;
             }
-            rec(
-                tree,
-                depth + 1,
-                bits,
-                msb_first,
-                next_symbol,
-                log_before,
-                min_logp,
-                pattern_logps,
-            );
+            rec(tree, depth + 1, params, next_symbol, pattern_logps);
             tree.revert(depth);
         }
     }
 
-    rec(
-        tree,
-        0,
-        bits,
-        msb_first,
-        0,
-        log_before,
-        min_logp,
-        &mut pattern_logps,
-    );
+    rec(tree, 0, &params, 0, &mut pattern_logps);
 
     if bits == 8 {
         out.copy_from_slice(&pattern_logps);
@@ -486,9 +399,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         match self {
             RateBackendPredictor::Rosa { model, min_prob } => {
-                for sym in 0..256usize {
+                for (sym, slot) in out.iter_mut().enumerate().take(256) {
                     let p = clamp_prob(model.prob_for_last(sym as u32), *min_prob);
-                    out[sym] = p.ln();
+                    *slot = p.ln();
                 }
             }
             RateBackendPredictor::Ctw { tree, min_prob } => {
@@ -520,19 +433,23 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     );
                     *primed = true;
                 }
-                for sym in 0..256usize {
-                    let p = clamp_prob(compressor.pdf_buffer[sym], *min_prob);
-                    out[sym] = p.ln();
+                for (slot, &p_raw) in out
+                    .iter_mut()
+                    .take(256)
+                    .zip(compressor.pdf_buffer.iter().take(256))
+                {
+                    let p = clamp_prob(p_raw, *min_prob);
+                    *slot = p.ln();
                 }
             }
             RateBackendPredictor::Zpaq { model } => {
-                for sym in 0..256usize {
-                    out[sym] = model.log_prob(sym as u8);
+                for (sym, slot) in out.iter_mut().enumerate().take(256) {
+                    *slot = model.log_prob(sym as u8);
                 }
             }
             RateBackendPredictor::Mixture { runtime } => {
-                for sym in 0..256usize {
-                    out[sym] = runtime.peek_log_prob(sym as u8);
+                for (sym, slot) in out.iter_mut().enumerate().take(256) {
+                    *slot = runtime.peek_log_prob(sym as u8);
                 }
             }
         }
@@ -1292,7 +1209,7 @@ impl NeuralMixture {
                 self.scratch_expert_logps[i * 256 + b] = *lp;
             }
             let row = &mut self.scratch_expert_logps[(i * 256)..((i + 1) * 256)];
-            let log_z = logsumexp(row);
+            let log_z = logsumexp_wide(row);
             for v in row.iter_mut() {
                 *v -= log_z;
             }
@@ -1316,14 +1233,15 @@ impl NeuralMixture {
             }
         }
 
-        for b in 0..256usize {
-            let entry2 = &self.stage2_table[stage2_idx];
-            let mut e = entry2.bias[b];
-            e += entry2.weights[0] * self.scratch_stage1_out[b]
-                + entry2.weights[1] * self.scratch_stage1_out[256 + b]
-                + entry2.weights[2] * self.scratch_stage1_out[512 + b];
-            self.scratch_energy[b] = e;
-        }
+        let entry2 = &self.stage2_table[stage2_idx];
+        affine3_wide(
+            &mut self.scratch_energy,
+            &entry2.bias,
+            [entry2.weights[0], entry2.weights[1], entry2.weights[2]],
+            &self.scratch_stage1_out[0..256],
+            &self.scratch_stage1_out[256..512],
+            &self.scratch_stage1_out[512..768],
+        );
 
         let log_z = logsumexp_wide(&self.scratch_energy);
         for b in 0..256usize {
@@ -1399,10 +1317,10 @@ impl NeuralMixture {
             {
                 let entry2 = &mut self.stage2_table[stage2_idx];
                 for k in 0..Self::STAGE1_CONTEXTS {
-                    let mut grad = 0.0;
-                    for b in 0..256usize {
-                        grad += self.scratch_errors[b] * self.scratch_stage1_out[k * 256 + b];
-                    }
+                    let grad = dot_wide(
+                        &self.scratch_errors,
+                        &self.scratch_stage1_out[(k * 256)..((k + 1) * 256)],
+                    );
                     entry2.weights[k] = sanitize_weight(entry2.weights[k] + self.stage2_lr * grad);
                 }
                 for b in 0..256usize {
@@ -1598,7 +1516,9 @@ pub(crate) fn build_mixture_runtime(
             experts, spec.alpha,
         ))),
         MixtureKind::Mdl => Ok(MixtureRuntime::Mdl(MdlSelector::new(experts))),
-        MixtureKind::Neural => Ok(MixtureRuntime::Neural(NeuralMixture::new(experts, spec.alpha))),
+        MixtureKind::Neural => Ok(MixtureRuntime::Neural(NeuralMixture::new(
+            experts, spec.alpha,
+        ))),
     }
 }
 
@@ -1663,7 +1583,10 @@ mod tests {
 
         let early_avg = early / 20.0;
         let late_avg = late / 20.0;
-        assert!(late_avg < early_avg, "late_avg={late_avg} early_avg={early_avg}");
+        assert!(
+            late_avg < early_avg,
+            "late_avg={late_avg} early_avg={early_avg}"
+        );
         assert!(late_avg < 0.30, "late_avg={late_avg}");
     }
 
@@ -1674,11 +1597,7 @@ mod tests {
     impl OnlineBytePredictor for CountingPredict {
         fn log_prob(&mut self, symbol: u8) -> f64 {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            if symbol == 0 {
-                0.0
-            } else {
-                -20.0
-            }
+            if symbol == 0 { 0.0 } else { -20.0 }
         }
 
         fn update(&mut self, _symbol: u8) {}

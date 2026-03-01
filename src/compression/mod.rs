@@ -16,9 +16,9 @@ use crate::coders::{
 use crate::ctw::FacContextTree;
 use crate::mixture::DEFAULT_MIN_PROB;
 use crate::rosaplus::RosaPlus;
+use crate::simd_math::{affine3_wide, axpy_wide, dot_wide, logsumexp_wide};
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{MixtureKind, MixtureSpec, RateBackend};
-use wide::f64x4;
 
 const FRAMED_MAGIC: u32 = 0x4354_4946; // "FITC"
 const FRAMED_VERSION: u8 = 1;
@@ -427,84 +427,6 @@ impl NeuralMixStage2Entry {
     }
 }
 
-#[inline]
-fn dot_wide(lhs: &[f64], rhs: &[f64]) -> f64 {
-    let n = lhs.len().min(rhs.len());
-    let mut acc = f64x4::ZERO;
-    let mut i = 0usize;
-    while i + 4 <= n {
-        let a = f64x4::new([lhs[i], lhs[i + 1], lhs[i + 2], lhs[i + 3]]);
-        let b = f64x4::new([rhs[i], rhs[i + 1], rhs[i + 2], rhs[i + 3]]);
-        acc += a * b;
-        i += 4;
-    }
-    let lanes = acc.to_array();
-    let mut out = lanes[0] + lanes[1] + lanes[2] + lanes[3];
-    while i < n {
-        out += lhs[i] * rhs[i];
-        i += 1;
-    }
-    out
-}
-
-#[inline]
-fn max_wide(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
-        return f64::NEG_INFINITY;
-    }
-    let mut i = 0usize;
-    let mut max4 = f64x4::splat(f64::NEG_INFINITY);
-    while i + 4 <= xs.len() {
-        let v = f64x4::new([xs[i], xs[i + 1], xs[i + 2], xs[i + 3]]);
-        max4 = max4.max(v);
-        i += 4;
-    }
-    let lanes = max4.to_array();
-    let mut max_v = lanes[0].max(lanes[1]).max(lanes[2]).max(lanes[3]);
-    while i < xs.len() {
-        if xs[i] > max_v {
-            max_v = xs[i];
-        }
-        i += 1;
-    }
-    max_v
-}
-
-#[inline]
-fn logsumexp_wide(xs: &[f64]) -> f64 {
-    let max_v = max_wide(xs);
-    if !max_v.is_finite() {
-        return max_v;
-    }
-    let mut sum = 0.0;
-    for &v in xs {
-        sum += (v - max_v).exp();
-    }
-    max_v + sum.ln()
-}
-
-#[inline]
-fn axpy_wide(dst: &mut [f64], alpha: f64, src: &[f64]) {
-    let n = dst.len().min(src.len());
-    let mut i = 0usize;
-    let a4 = f64x4::splat(alpha);
-    while i + 4 <= n {
-        let d = f64x4::new([dst[i], dst[i + 1], dst[i + 2], dst[i + 3]]);
-        let s = f64x4::new([src[i], src[i + 1], src[i + 2], src[i + 3]]);
-        let r = d + a4 * s;
-        let lanes = r.to_array();
-        dst[i] = lanes[0];
-        dst[i + 1] = lanes[1];
-        dst[i + 2] = lanes[2];
-        dst[i + 3] = lanes[3];
-        i += 4;
-    }
-    while i < n {
-        dst[i] += alpha * src[i];
-        i += 1;
-    }
-}
-
 const NEURAL_STAGE1_CONTEXTS: usize = 3;
 const NEURAL_STAGE1_TABLE_SIZES: [usize; NEURAL_STAGE1_CONTEXTS] = [1, 256, 1024];
 const NEURAL_STAGE2_TABLE_SIZE: usize = 512;
@@ -617,7 +539,11 @@ impl MixturePredictor {
             ^ ((self.neural_prev2 as usize) << 2)
             ^ run_bucket
             ^ (((self.neural_prev1 ^ self.neural_prev2) as usize) << 5);
-        [0, self.neural_prev1 as usize, h % NEURAL_STAGE1_TABLE_SIZES[2]]
+        [
+            0,
+            self.neural_prev1 as usize,
+            h % NEURAL_STAGE1_TABLE_SIZES[2],
+        ]
     }
 
     fn neural_stage2_context_index(&self) -> usize {
@@ -680,14 +606,15 @@ impl MixturePredictor {
                     }
                 }
 
-                for b in 0..256usize {
-                    let entry2 = &self.neural_stage2_table[stage2_idx];
-                    let mut e = entry2.bias[b];
-                    e += entry2.weights[0] * self.neural_stage1_out[b]
-                        + entry2.weights[1] * self.neural_stage1_out[256 + b]
-                        + entry2.weights[2] * self.neural_stage1_out[512 + b];
-                    self.pdf[b] = e;
-                }
+                let entry2 = &self.neural_stage2_table[stage2_idx];
+                affine3_wide(
+                    &mut self.pdf,
+                    &entry2.bias,
+                    [entry2.weights[0], entry2.weights[1], entry2.weights[2]],
+                    &self.neural_stage1_out[0..256],
+                    &self.neural_stage1_out[256..512],
+                    &self.neural_stage1_out[512..768],
+                );
                 let z = logsumexp_wide(&self.pdf);
                 for p in &mut self.pdf {
                     *p = (*p - z).exp();
@@ -819,10 +746,10 @@ impl MixturePredictor {
                     {
                         let entry2 = &mut self.neural_stage2_table[stage2_idx];
                         for k in 0..NEURAL_STAGE1_CONTEXTS {
-                            let mut grad = 0.0;
-                            for b in 0..256usize {
-                                grad += self.neural_errors[b] * self.neural_stage1_out[k * 256 + b];
-                            }
+                            let grad = dot_wide(
+                                &self.neural_errors,
+                                &self.neural_stage1_out[(k * 256)..((k + 1) * 256)],
+                            );
                             let w = entry2.weights[k] + self.neural_stage2_lr * grad;
                             entry2.weights[k] = if w.is_finite() { w } else { 0.0 };
                         }

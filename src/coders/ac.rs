@@ -13,6 +13,7 @@
 
 use std::io::Write;
 use wide::f32x8;
+use wide::f64x4;
 
 /// Total count for CDF quantization (2^30 for high precision)
 pub const CDF_TOTAL: u32 = 1 << 30;
@@ -84,7 +85,7 @@ pub fn softmax_pdf_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64
 /// * `pdf_out` - Pre-allocated buffer for output PDF (length >= vocab_size)
 pub fn softmax_pdf_floor_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64]) {
     // Fast path for byte-level vocab using portable SIMD (`wide`).
-    if vocab_size == 256 {
+    if vocab_size == 256 && logits.len() >= 256 && pdf_out.len() >= 256 {
         softmax_pdf_floor_wide_256(logits, pdf_out);
         return;
     }
@@ -141,27 +142,59 @@ fn softmax_pdf_floor_wide_256(logits: &[f32], pdf_out: &mut [f64]) {
     }
     let max_v = f32x8::splat(max);
 
-    let mut sum = 0.0f64;
-    for i in (0..N).step_by(8) {
+    let mut sum4 = f64x4::ZERO;
+    for (chunk_idx, out_chunk) in pdf_out[..N].chunks_exact_mut(8).enumerate() {
+        let i = chunk_idx * 8;
         let centered = unsafe { load8(logits.as_ptr().add(i)) } - max_v;
         let exp_vals = centered.exp().to_array();
-        for lane in 0..8 {
-            let v = exp_vals[lane] as f64;
-            pdf_out[i + lane] = v;
-            sum += v;
-        }
+        let v0 = f64x4::new([
+            exp_vals[0] as f64,
+            exp_vals[1] as f64,
+            exp_vals[2] as f64,
+            exp_vals[3] as f64,
+        ]);
+        let v1 = f64x4::new([
+            exp_vals[4] as f64,
+            exp_vals[5] as f64,
+            exp_vals[6] as f64,
+            exp_vals[7] as f64,
+        ]);
+        sum4 += v0 + v1;
+
+        let lanes0 = v0.to_array();
+        let lanes1 = v1.to_array();
+        out_chunk[..4].copy_from_slice(&lanes0);
+        out_chunk[4..].copy_from_slice(&lanes1);
     }
+
+    let sum_lanes = sum4.to_array();
+    let sum = sum_lanes[0] + sum_lanes[1] + sum_lanes[2] + sum_lanes[3];
 
     let inv_sum = 1.0 / sum;
-    let mut norm = 0.0f64;
-    for v in pdf_out.iter_mut().take(N) {
-        *v = (*v * inv_sum).max(p_min_val);
-        norm += *v;
+    let mut norm4 = f64x4::ZERO;
+    let inv_sum4 = f64x4::splat(inv_sum);
+    let min4 = f64x4::splat(p_min_val);
+
+    for chunk in pdf_out[..N].chunks_exact_mut(4) {
+        let vals = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mut v = vals * inv_sum4;
+        v = v.max(min4);
+
+        let lanes = v.to_array();
+        chunk.copy_from_slice(&lanes);
+        norm4 += v;
     }
 
+    let norm_lanes = norm4.to_array();
+    let norm = norm_lanes[0] + norm_lanes[1] + norm_lanes[2] + norm_lanes[3];
+
     let inv_norm = 1.0 / norm;
-    for v in pdf_out.iter_mut().take(N) {
-        *v *= inv_norm;
+    let inv_norm4 = f64x4::splat(inv_norm);
+    for chunk in pdf_out[..N].chunks_exact_mut(4) {
+        let vals = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let out = vals * inv_norm4;
+        let lanes = out.to_array();
+        chunk.copy_from_slice(&lanes);
     }
 }
 
