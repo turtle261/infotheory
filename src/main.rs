@@ -239,29 +239,81 @@ fn load_particle_spec(path: &str) -> anyhow::Result<ParticleSpec> {
 }
 
 fn parse_particle_spec_value(v: &serde_json::Value) -> anyhow::Result<ParticleSpec> {
+    if v.get("experts").is_some() {
+        return Err(anyhow::anyhow!(
+            "looks like a mixture spec (found 'experts'); --rate-backend particle expects a ParticleSpec JSON"
+        ));
+    }
+    if let Some(kind) = v.get("kind").and_then(|k| k.as_str()) {
+        let k = kind.to_ascii_lowercase();
+        if matches!(
+            k.as_str(),
+            "bayes"
+                | "fading"
+                | "fading-bayes"
+                | "switch"
+                | "switching"
+                | "mdl"
+                | "neural"
+                | "mixture"
+        ) {
+            return Err(anyhow::anyhow!(
+                "looks like a mixture spec (kind='{kind}'); --rate-backend particle expects a ParticleSpec JSON"
+            ));
+        }
+    }
+    let d = ParticleSpec::default();
     Ok(ParticleSpec {
-        num_particles: v["num_particles"].as_u64().unwrap_or(16) as usize,
-        context_window: v["context_window"].as_u64().unwrap_or(32) as usize,
-        unroll_steps: v["unroll_steps"].as_u64().unwrap_or(2) as usize,
-        num_cells: v["num_cells"].as_u64().unwrap_or(8) as usize,
-        cell_dim: v["cell_dim"].as_u64().unwrap_or(32) as usize,
-        num_rules: v["num_rules"].as_u64().unwrap_or(4) as usize,
-        selector_hidden: v["selector_hidden"].as_u64().unwrap_or(64) as usize,
-        rule_hidden: v["rule_hidden"].as_u64().unwrap_or(64) as usize,
-        noise_dim: v["noise_dim"].as_u64().unwrap_or(8) as usize,
-        deterministic: v["deterministic"].as_bool().unwrap_or(true),
-        enable_noise: v["enable_noise"].as_bool().unwrap_or(false),
-        learning_rate_readout: v["learning_rate_readout"].as_f64().unwrap_or(0.01),
-        learning_rate_selector: v["learning_rate_selector"].as_f64().unwrap_or(0.003),
-        learning_rate_rule: v["learning_rate_rule"].as_f64().unwrap_or(0.003),
-        grad_clip: v["grad_clip"].as_f64().unwrap_or(1.0),
-        state_clip: v["state_clip"].as_f64().unwrap_or(8.0),
-        forget_lambda: v["forget_lambda"].as_f64().unwrap_or(0.0),
-        resample_threshold: v["resample_threshold"].as_f64().unwrap_or(0.5),
-        mutate_fraction: v["mutate_fraction"].as_f64().unwrap_or(0.1),
-        mutate_scale: v["mutate_scale"].as_f64().unwrap_or(0.01),
-        min_prob: v["min_prob"].as_f64().unwrap_or(2f64.powi(-24)),
-        seed: v["seed"].as_u64().unwrap_or(42),
+        num_particles: v["num_particles"]
+            .as_u64()
+            .unwrap_or(d.num_particles as u64) as usize,
+        context_window: v["context_window"]
+            .as_u64()
+            .unwrap_or(d.context_window as u64) as usize,
+        unroll_steps: v["unroll_steps"].as_u64().unwrap_or(d.unroll_steps as u64) as usize,
+        num_cells: v["num_cells"].as_u64().unwrap_or(d.num_cells as u64) as usize,
+        cell_dim: v["cell_dim"].as_u64().unwrap_or(d.cell_dim as u64) as usize,
+        num_rules: v["num_rules"].as_u64().unwrap_or(d.num_rules as u64) as usize,
+        selector_hidden: v["selector_hidden"]
+            .as_u64()
+            .unwrap_or(d.selector_hidden as u64) as usize,
+        rule_hidden: v["rule_hidden"].as_u64().unwrap_or(d.rule_hidden as u64) as usize,
+        noise_dim: v["noise_dim"].as_u64().unwrap_or(d.noise_dim as u64) as usize,
+        deterministic: v["deterministic"].as_bool().unwrap_or(d.deterministic),
+        enable_noise: v["enable_noise"].as_bool().unwrap_or(d.enable_noise),
+        noise_scale: v["noise_scale"].as_f64().unwrap_or(d.noise_scale),
+        noise_anneal_steps: v["noise_anneal_steps"]
+            .as_u64()
+            .unwrap_or(d.noise_anneal_steps as u64) as usize,
+        learning_rate_readout: v["learning_rate_readout"]
+            .as_f64()
+            .unwrap_or(d.learning_rate_readout),
+        learning_rate_selector: v["learning_rate_selector"]
+            .as_f64()
+            .unwrap_or(d.learning_rate_selector),
+        learning_rate_rule: v["learning_rate_rule"]
+            .as_f64()
+            .unwrap_or(d.learning_rate_rule),
+        bptt_depth: v["bptt_depth"].as_u64().unwrap_or(d.bptt_depth as u64) as usize,
+        optimizer_momentum: v["optimizer_momentum"]
+            .as_f64()
+            .unwrap_or(d.optimizer_momentum),
+        grad_clip: v["grad_clip"].as_f64().unwrap_or(d.grad_clip),
+        state_clip: v["state_clip"].as_f64().unwrap_or(d.state_clip),
+        forget_lambda: v["forget_lambda"].as_f64().unwrap_or(d.forget_lambda),
+        resample_threshold: v["resample_threshold"]
+            .as_f64()
+            .unwrap_or(d.resample_threshold),
+        mutate_fraction: v["mutate_fraction"].as_f64().unwrap_or(d.mutate_fraction),
+        mutate_scale: v["mutate_scale"].as_f64().unwrap_or(d.mutate_scale),
+        mutate_model_params: v["mutate_model_params"]
+            .as_bool()
+            .unwrap_or(d.mutate_model_params),
+        diagnostics_interval: v["diagnostics_interval"]
+            .as_u64()
+            .unwrap_or(d.diagnostics_interval as u64) as usize,
+        min_prob: v["min_prob"].as_f64().unwrap_or(d.min_prob),
+        seed: v["seed"].as_u64().unwrap_or(d.seed),
     })
 }
 

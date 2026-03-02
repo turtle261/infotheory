@@ -6,6 +6,8 @@
 //! - exported lists of enabled backend families.
 
 pub mod ctw;
+/// Particle-latent rate backend.
+pub mod particle;
 pub mod rosaplus;
 /// RWKV7-based rate/compression backend.
 #[cfg(feature = "backend-rwkv")]

@@ -105,6 +105,29 @@ fn parse_observation_key_mode(
 }
 
 fn parse_particle_spec_json(v: &serde_json::Value) -> PyResult<ParticleSpec> {
+    if v.get("experts").is_some() {
+        return Err(PyValueError::new_err(
+            "looks like a mixture spec (found 'experts'); expected ParticleSpec JSON",
+        ));
+    }
+    if let Some(kind) = v.get("kind").and_then(|k| k.as_str()) {
+        let k = kind.to_ascii_lowercase();
+        if matches!(
+            k.as_str(),
+            "bayes"
+                | "fading"
+                | "fading-bayes"
+                | "switch"
+                | "switching"
+                | "mdl"
+                | "neural"
+                | "mixture"
+        ) {
+            return Err(PyValueError::new_err(format!(
+                "looks like a mixture spec (kind='{kind}'); expected ParticleSpec JSON"
+            )));
+        }
+    }
     let d = ParticleSpec::default();
     Ok(ParticleSpec {
         num_particles: v
@@ -160,6 +183,15 @@ fn parse_particle_spec_json(v: &serde_json::Value) -> PyResult<ParticleSpec> {
             .get("enable_noise")
             .and_then(|x| x.as_bool())
             .unwrap_or(d.enable_noise),
+        noise_scale: v
+            .get("noise_scale")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.noise_scale),
+        noise_anneal_steps: v
+            .get("noise_anneal_steps")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.noise_anneal_steps),
         learning_rate_readout: v
             .get("learning_rate_readout")
             .and_then(|x| x.as_f64())
@@ -172,6 +204,15 @@ fn parse_particle_spec_json(v: &serde_json::Value) -> PyResult<ParticleSpec> {
             .get("learning_rate_rule")
             .and_then(|x| x.as_f64())
             .unwrap_or(d.learning_rate_rule),
+        bptt_depth: v
+            .get("bptt_depth")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.bptt_depth),
+        optimizer_momentum: v
+            .get("optimizer_momentum")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.optimizer_momentum),
         grad_clip: v
             .get("grad_clip")
             .and_then(|x| x.as_f64())
@@ -196,14 +237,20 @@ fn parse_particle_spec_json(v: &serde_json::Value) -> PyResult<ParticleSpec> {
             .get("mutate_scale")
             .and_then(|x| x.as_f64())
             .unwrap_or(d.mutate_scale),
+        mutate_model_params: v
+            .get("mutate_model_params")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(d.mutate_model_params),
+        diagnostics_interval: v
+            .get("diagnostics_interval")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.diagnostics_interval),
         min_prob: v
             .get("min_prob")
             .and_then(|x| x.as_f64())
             .unwrap_or(d.min_prob),
-        seed: v
-            .get("seed")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(d.seed),
+        seed: v.get("seed").and_then(|x| x.as_u64()).unwrap_or(d.seed),
     })
 }
 
@@ -265,9 +312,8 @@ fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend>
                 })?;
                 parse_particle_spec_json(&v)?
             };
-            spec.validate().map_err(|e| {
-                PyValueError::new_err(format!("invalid particle spec: {e}"))
-            })?;
+            spec.validate()
+                .map_err(|e| PyValueError::new_err(format!("invalid particle spec: {e}")))?;
             Ok(RateBackend::Particle {
                 spec: Arc::new(spec),
             })
@@ -427,15 +473,21 @@ impl PyParticleSpec {
         noise_dim=8,
         deterministic=true,
         enable_noise=false,
+        noise_scale=0.10,
+        noise_anneal_steps=8192,
         learning_rate_readout=0.01,
-        learning_rate_selector=0.003,
-        learning_rate_rule=0.003,
+        learning_rate_selector=1e-4,
+        learning_rate_rule=3e-4,
+        bptt_depth=3,
+        optimizer_momentum=0.05,
         grad_clip=1.0,
         state_clip=8.0,
         forget_lambda=0.0,
         resample_threshold=0.5,
         mutate_fraction=0.1,
         mutate_scale=0.01,
+        mutate_model_params=false,
+        diagnostics_interval=0,
         min_prob=5.960_464_477_539_063e-8,
         seed=42
     ))]
@@ -452,15 +504,21 @@ impl PyParticleSpec {
         noise_dim: usize,
         deterministic: bool,
         enable_noise: bool,
+        noise_scale: f64,
+        noise_anneal_steps: usize,
         learning_rate_readout: f64,
         learning_rate_selector: f64,
         learning_rate_rule: f64,
+        bptt_depth: usize,
+        optimizer_momentum: f64,
         grad_clip: f64,
         state_clip: f64,
         forget_lambda: f64,
         resample_threshold: f64,
         mutate_fraction: f64,
         mutate_scale: f64,
+        mutate_model_params: bool,
+        diagnostics_interval: usize,
         min_prob: f64,
         seed: u64,
     ) -> PyResult<Self> {
@@ -476,15 +534,21 @@ impl PyParticleSpec {
             noise_dim,
             deterministic,
             enable_noise,
+            noise_scale,
+            noise_anneal_steps,
             learning_rate_readout,
             learning_rate_selector,
             learning_rate_rule,
+            bptt_depth,
+            optimizer_momentum,
             grad_clip,
             state_clip,
             forget_lambda,
             resample_threshold,
             mutate_fraction,
             mutate_scale,
+            mutate_model_params,
+            diagnostics_interval,
             min_prob,
             seed,
         };

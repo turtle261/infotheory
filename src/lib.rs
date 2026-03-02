@@ -88,11 +88,11 @@ pub mod datagen;
 /// Online Bayesian/switching/MDL mixture predictors.
 pub mod mixture;
 pub(crate) mod neural_mix;
-/// Particle-latent filter ensemble rate backend.
-pub mod particle;
 pub(crate) mod simd_math;
 /// CTW and FAC-CTW backend types.
 pub use backends::ctw;
+/// Particle-latent filter ensemble rate backend.
+pub use backends::particle;
 /// ROSA+ backend types.
 pub use backends::rosaplus;
 #[cfg(feature = "backend-rwkv")]
@@ -432,12 +432,20 @@ pub struct ParticleSpec {
     pub deterministic: bool,
     /// Whether to inject noise into rule inputs (ignored when deterministic).
     pub enable_noise: bool,
+    /// Base scale for deterministic hash-noise injected into rule inputs.
+    pub noise_scale: f64,
+    /// Number of steps over which injected noise linearly anneals to zero.
+    pub noise_anneal_steps: usize,
     /// Learning rate for readout layer SGD.
     pub learning_rate_readout: f64,
     /// Learning rate for selector MLP SGD.
     pub learning_rate_selector: f64,
     /// Learning rate for rule MLP SGD.
     pub learning_rate_rule: f64,
+    /// Truncated backpropagation-through-time depth (number of recent steps).
+    pub bptt_depth: usize,
+    /// Momentum coefficient for selector/rule online updates (in [0, 1)).
+    pub optimizer_momentum: f64,
     /// Gradient clipping threshold (max abs value per element).
     pub grad_clip: f64,
     /// Latent cell state clipping threshold (max abs value per element).
@@ -450,6 +458,10 @@ pub struct ParticleSpec {
     pub mutate_fraction: f64,
     /// Scale of hash-noise perturbation applied during mutation.
     pub mutate_scale: f64,
+    /// Whether mutation also perturbs model parameters (state is always mutated).
+    pub mutate_model_params: bool,
+    /// Diagnostics print interval in steps (0 disables particle diagnostics logs).
+    pub diagnostics_interval: usize,
     /// Minimum probability floor for numerical stability.
     pub min_prob: f64,
     /// Master seed for deterministic initialization and mutation.
@@ -470,15 +482,21 @@ impl Default for ParticleSpec {
             noise_dim: 8,
             deterministic: true,
             enable_noise: false,
+            noise_scale: 0.10,
+            noise_anneal_steps: 8192,
             learning_rate_readout: 0.01,
-            learning_rate_selector: 0.003,
-            learning_rate_rule: 0.003,
+            learning_rate_selector: 1e-4,
+            learning_rate_rule: 3e-4,
+            bptt_depth: 3,
+            optimizer_momentum: 0.05,
             grad_clip: 1.0,
             state_clip: 8.0,
             forget_lambda: 0.0,
             resample_threshold: 0.5,
             mutate_fraction: 0.1,
             mutate_scale: 0.01,
+            mutate_model_params: false,
+            diagnostics_interval: 0,
             min_prob: 2f64.powi(-24),
             seed: 42,
         }
@@ -520,6 +538,18 @@ impl ParticleSpec {
         }
         if !self.learning_rate_rule.is_finite() || self.learning_rate_rule < 0.0 {
             return Err("learning_rate_rule must be finite and non-negative".into());
+        }
+        if !self.noise_scale.is_finite() || self.noise_scale < 0.0 {
+            return Err("noise_scale must be finite and non-negative".into());
+        }
+        if !self.optimizer_momentum.is_finite()
+            || self.optimizer_momentum < 0.0
+            || self.optimizer_momentum >= 1.0
+        {
+            return Err("optimizer_momentum must be finite and in [0, 1)".into());
+        }
+        if self.bptt_depth == 0 {
+            return Err("bptt_depth must be > 0".into());
         }
         if !(self.resample_threshold > 0.0 && self.resample_threshold <= 1.0) {
             return Err("resample_threshold must be in (0, 1]".into());

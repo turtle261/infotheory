@@ -651,9 +651,9 @@ impl RatePdfPredictor {
             RateBackend::Mixture { spec } => {
                 Ok(Self::Mixture(MixturePredictor::new(spec.as_ref())?))
             }
-            RateBackend::Particle { spec } => {
-                Ok(Self::Particle(crate::particle::ParticleRuntime::new(spec.as_ref())))
-            }
+            RateBackend::Particle { spec } => Ok(Self::Particle(
+                crate::particle::ParticleRuntime::new(spec.as_ref()),
+            )),
         }
     }
 
