@@ -625,6 +625,7 @@ enum RatePdfPredictor {
     Rwkv(RwkvPredictor),
     Zpaq(ZpaqPredictor),
     Mixture(MixturePredictor),
+    Particle(crate::particle::ParticleRuntime),
 }
 
 impl RatePdfPredictor {
@@ -650,6 +651,9 @@ impl RatePdfPredictor {
             RateBackend::Mixture { spec } => {
                 Ok(Self::Mixture(MixturePredictor::new(spec.as_ref())?))
             }
+            RateBackend::Particle { spec } => {
+                Ok(Self::Particle(crate::particle::ParticleRuntime::new(spec.as_ref())))
+            }
         }
     }
 
@@ -662,6 +666,7 @@ impl RatePdfPredictor {
             Self::Rwkv(m) => Ok(m.pdf_next()),
             Self::Zpaq(m) => Ok(m.pdf_next()),
             Self::Mixture(m) => m.ensure_pdf(),
+            Self::Particle(m) => Ok(m.pdf_next()),
         }
     }
 
@@ -686,6 +691,10 @@ impl RatePdfPredictor {
                 Ok(())
             }
             Self::Mixture(m) => m.update(symbol),
+            Self::Particle(m) => {
+                m.step(symbol);
+                Ok(())
+            }
         }
     }
 }
@@ -1173,6 +1182,133 @@ mod tests {
         let backend = RateBackend::Rwkv7Method {
             method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1".to_string(),
         };
+        let enc = compress_rate_bytes(
+            data,
+            &backend,
+            -1,
+            rwkvzip::CoderType::AC,
+            FramingMode::Framed,
+        )
+        .unwrap();
+        let dec = decompress_rate_bytes(
+            &enc,
+            &backend,
+            -1,
+            rwkvzip::CoderType::AC,
+            FramingMode::Framed,
+        )
+        .unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_rate_ac_particle() {
+        let spec = crate::ParticleSpec {
+            num_particles: 4,
+            num_cells: 4,
+            cell_dim: 8,
+            num_rules: 2,
+            selector_hidden: 16,
+            rule_hidden: 16,
+            context_window: 8,
+            unroll_steps: 1,
+            ..crate::ParticleSpec::default()
+        };
+        let data = b"particle ac roundtrip payload";
+        let backend = RateBackend::Particle {
+            spec: Arc::new(spec),
+        };
+        let enc = compress_rate_bytes(
+            data,
+            &backend,
+            -1,
+            rwkvzip::CoderType::AC,
+            FramingMode::Framed,
+        )
+        .unwrap();
+        let dec = decompress_rate_bytes(
+            &enc,
+            &backend,
+            -1,
+            rwkvzip::CoderType::AC,
+            FramingMode::Framed,
+        )
+        .unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_rate_rans_particle() {
+        let spec = crate::ParticleSpec {
+            num_particles: 4,
+            num_cells: 4,
+            cell_dim: 8,
+            num_rules: 2,
+            selector_hidden: 16,
+            rule_hidden: 16,
+            context_window: 8,
+            unroll_steps: 1,
+            ..crate::ParticleSpec::default()
+        };
+        let data = b"particle rans roundtrip payload";
+        let backend = RateBackend::Particle {
+            spec: Arc::new(spec),
+        };
+        let enc = compress_rate_bytes(
+            data,
+            &backend,
+            -1,
+            rwkvzip::CoderType::RANS,
+            FramingMode::Framed,
+        )
+        .unwrap();
+        let dec = decompress_rate_bytes(
+            &enc,
+            &backend,
+            -1,
+            rwkvzip::CoderType::RANS,
+            FramingMode::Framed,
+        )
+        .unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn mixture_with_particle_expert_roundtrip() {
+        let particle_spec = crate::ParticleSpec {
+            num_particles: 4,
+            num_cells: 4,
+            cell_dim: 8,
+            num_rules: 2,
+            selector_hidden: 16,
+            rule_hidden: 16,
+            context_window: 8,
+            unroll_steps: 1,
+            ..crate::ParticleSpec::default()
+        };
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                crate::MixtureExpertSpec {
+                    name: Some("particle".to_string()),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend: RateBackend::Particle {
+                        spec: Arc::new(particle_spec),
+                    },
+                },
+                crate::MixtureExpertSpec {
+                    name: Some("ctw".to_string()),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend: RateBackend::Ctw { depth: 6 },
+                },
+            ],
+        );
+        let backend = RateBackend::Mixture {
+            spec: Arc::new(spec),
+        };
+        let data = b"mixture with particle expert roundtrip";
         let enc = compress_rate_bytes(
             data,
             &backend,

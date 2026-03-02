@@ -36,6 +36,7 @@ pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     #[cfg(feature = "backend-zpaq")]
     "zpaq",
     "mixture",
+    "particle",
 ];
 /// Canonical names for available rate backends in this build.
 #[cfg(not(feature = "backend-rwkv"))]
@@ -46,6 +47,7 @@ pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     #[cfg(feature = "backend-zpaq")]
     "zpaq",
     "mixture",
+    "particle",
 ];
 
 /// Canonical names for available compression backends in this build.
@@ -85,6 +87,7 @@ pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
             }
         }
         "mixture" | "mix" => Some(BackendAvailability::Enabled("mixture")),
+        "particle" | "particles" => Some(BackendAvailability::Enabled("particle")),
         "rwkv7" | "rwkv" => {
             if cfg!(feature = "backend-rwkv") {
                 Some(BackendAvailability::Enabled("rwkv7"))

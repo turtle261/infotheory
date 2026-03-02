@@ -88,6 +88,8 @@ pub mod datagen;
 /// Online Bayesian/switching/MDL mixture predictors.
 pub mod mixture;
 pub(crate) mod neural_mix;
+/// Particle-latent filter ensemble rate backend.
+pub mod particle;
 pub(crate) mod simd_math;
 /// CTW and FAC-CTW backend types.
 pub use backends::ctw;
@@ -256,6 +258,11 @@ pub enum RateBackend {
         /// Mixture expert/runtime specification.
         spec: Arc<MixtureSpec>,
     },
+    /// Particle-latent filter ensemble.
+    Particle {
+        /// Particle filter specification.
+        spec: Arc<ParticleSpec>,
+    },
     /// Action-Conditional CTW (single context tree).
     Ctw {
         /// Context tree depth.
@@ -397,6 +404,133 @@ impl MixtureSpec {
                 )
             })
             .collect()
+    }
+}
+
+/// Configuration for a particle-latent filter ensemble rate backend.
+#[derive(Clone, Debug)]
+pub struct ParticleSpec {
+    /// Number of particles in the ensemble.
+    pub num_particles: usize,
+    /// Context window length for rolling byte context.
+    pub context_window: usize,
+    /// Number of latent update unroll steps per byte.
+    pub unroll_steps: usize,
+    /// Number of latent cells per particle.
+    pub num_cells: usize,
+    /// Dimensionality of each latent cell.
+    pub cell_dim: usize,
+    /// Number of discrete rules for soft routing.
+    pub num_rules: usize,
+    /// Hidden dimension for the selector MLP.
+    pub selector_hidden: usize,
+    /// Hidden dimension for each rule MLP.
+    pub rule_hidden: usize,
+    /// Dimension of per-rule noise input (ignored when deterministic).
+    pub noise_dim: usize,
+    /// Whether to use fully deterministic execution (no RNG).
+    pub deterministic: bool,
+    /// Whether to inject noise into rule inputs (ignored when deterministic).
+    pub enable_noise: bool,
+    /// Learning rate for readout layer SGD.
+    pub learning_rate_readout: f64,
+    /// Learning rate for selector MLP SGD.
+    pub learning_rate_selector: f64,
+    /// Learning rate for rule MLP SGD.
+    pub learning_rate_rule: f64,
+    /// Gradient clipping threshold (max abs value per element).
+    pub grad_clip: f64,
+    /// Latent cell state clipping threshold (max abs value per element).
+    pub state_clip: f64,
+    /// Forgetting factor for particle log-weights (0 = no forgetting).
+    pub forget_lambda: f64,
+    /// Effective sample size ratio threshold for resampling (in (0, 1]).
+    pub resample_threshold: f64,
+    /// Fraction of particles to mutate after resampling (in [0, 1]).
+    pub mutate_fraction: f64,
+    /// Scale of hash-noise perturbation applied during mutation.
+    pub mutate_scale: f64,
+    /// Minimum probability floor for numerical stability.
+    pub min_prob: f64,
+    /// Master seed for deterministic initialization and mutation.
+    pub seed: u64,
+}
+
+impl Default for ParticleSpec {
+    fn default() -> Self {
+        Self {
+            num_particles: 16,
+            context_window: 32,
+            unroll_steps: 2,
+            num_cells: 8,
+            cell_dim: 32,
+            num_rules: 4,
+            selector_hidden: 64,
+            rule_hidden: 64,
+            noise_dim: 8,
+            deterministic: true,
+            enable_noise: false,
+            learning_rate_readout: 0.01,
+            learning_rate_selector: 0.003,
+            learning_rate_rule: 0.003,
+            grad_clip: 1.0,
+            state_clip: 8.0,
+            forget_lambda: 0.0,
+            resample_threshold: 0.5,
+            mutate_fraction: 0.1,
+            mutate_scale: 0.01,
+            min_prob: 2f64.powi(-24),
+            seed: 42,
+        }
+    }
+}
+
+impl ParticleSpec {
+    /// Validate all fields, returning an error message on failure.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.num_particles == 0 {
+            return Err("num_particles must be > 0".into());
+        }
+        if self.context_window == 0 {
+            return Err("context_window must be > 0".into());
+        }
+        if self.unroll_steps == 0 {
+            return Err("unroll_steps must be > 0".into());
+        }
+        if self.num_cells == 0 {
+            return Err("num_cells must be > 0".into());
+        }
+        if self.cell_dim == 0 {
+            return Err("cell_dim must be > 0".into());
+        }
+        if self.num_rules == 0 {
+            return Err("num_rules must be > 0".into());
+        }
+        if self.selector_hidden == 0 {
+            return Err("selector_hidden must be > 0".into());
+        }
+        if self.rule_hidden == 0 {
+            return Err("rule_hidden must be > 0".into());
+        }
+        if !self.learning_rate_readout.is_finite() || self.learning_rate_readout < 0.0 {
+            return Err("learning_rate_readout must be finite and non-negative".into());
+        }
+        if !self.learning_rate_selector.is_finite() || self.learning_rate_selector < 0.0 {
+            return Err("learning_rate_selector must be finite and non-negative".into());
+        }
+        if !self.learning_rate_rule.is_finite() || self.learning_rate_rule < 0.0 {
+            return Err("learning_rate_rule must be finite and non-negative".into());
+        }
+        if !(self.resample_threshold > 0.0 && self.resample_threshold <= 1.0) {
+            return Err("resample_threshold must be in (0, 1]".into());
+        }
+        if !(self.mutate_fraction >= 0.0 && self.mutate_fraction <= 1.0) {
+            return Err("mutate_fraction must be in [0, 1]".into());
+        }
+        if !(self.min_prob > 0.0 && self.min_prob < 0.5) {
+            return Err("min_prob must be in (0, 0.5)".into());
+        }
+        Ok(())
     }
 }
 
@@ -573,6 +707,22 @@ impl InfotheoryCtx {
                 let mut bits = 0.0;
                 for &b in data {
                     bits -= mix.step(b) / std::f64::consts::LN_2;
+                }
+                bits / (data.len() as f64)
+            }
+            RateBackend::Particle { spec } => {
+                if data.is_empty() {
+                    return 0.0;
+                }
+                let mut runtime = crate::particle::ParticleRuntime::new(spec.as_ref());
+                for &part in prefix_parts {
+                    for &b in part {
+                        runtime.step(b);
+                    }
+                }
+                let mut bits = 0.0;
+                for &b in data {
+                    bits -= runtime.step(b) / std::f64::consts::LN_2;
                 }
                 bits / (data.len() as f64)
             }
@@ -1005,6 +1155,17 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             }
             bits / (data.len() as f64)
         }
+        RateBackend::Particle { spec } => {
+            if data.is_empty() {
+                return 0.0;
+            }
+            let mut runtime = crate::particle::ParticleRuntime::new(spec.as_ref());
+            let mut bits = 0.0;
+            for &b in data {
+                bits -= runtime.step(b) / std::f64::consts::LN_2;
+            }
+            bits / (data.len() as f64)
+        }
         RateBackend::Ctw { depth } => {
             if data.is_empty() {
                 return 0.0;
@@ -1063,6 +1224,7 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
         }
         RateBackend::Zpaq { .. } => entropy_rate_backend(data, max_order, backend),
         RateBackend::Mixture { .. } => entropy_rate_backend(data, max_order, backend),
+        RateBackend::Particle { .. } => entropy_rate_backend(data, max_order, backend),
         RateBackend::Ctw { .. } | RateBackend::FacCtw { .. } => {
             // CTW/FAC-CTW are online, so biased=prequential
             entropy_rate_backend(data, max_order, backend)
@@ -1121,6 +1283,20 @@ pub fn cross_entropy_rate_backend(
             let mut bits = 0.0;
             for &b in test_data {
                 bits -= mix.step(b) / std::f64::consts::LN_2;
+            }
+            bits / (test_data.len() as f64)
+        }
+        RateBackend::Particle { spec } => {
+            if test_data.is_empty() {
+                return 0.0;
+            }
+            let mut runtime = crate::particle::ParticleRuntime::new(spec.as_ref());
+            for &b in train_data {
+                runtime.step(b);
+            }
+            let mut bits = 0.0;
+            for &b in test_data {
+                bits -= runtime.step(b) / std::f64::consts::LN_2;
             }
             bits / (test_data.len() as f64)
         }
@@ -1231,6 +1407,22 @@ pub fn joint_entropy_rate_backend(
             let mut bits = 0.0;
             for &b in &joint {
                 bits -= mix.step(b) / std::f64::consts::LN_2;
+            }
+            bits / (x.len() as f64)
+        }
+        RateBackend::Particle { spec } => {
+            if x.is_empty() {
+                return 0.0;
+            }
+            let mut joint = Vec::with_capacity(x.len() * 2);
+            for i in 0..x.len() {
+                joint.push(x[i]);
+                joint.push(y[i]);
+            }
+            let mut runtime = crate::particle::ParticleRuntime::new(spec.as_ref());
+            let mut bits = 0.0;
+            for &b in &joint {
+                bits -= runtime.step(b) / std::f64::consts::LN_2;
             }
             bits / (x.len() as f64)
         }
@@ -2380,6 +2572,94 @@ mod tests {
         assert!(
             (h1 - h2).abs() < 1e-12,
             "rwkv method conditional chain leaked mutable state across calls: h1={h1}, h2={h2}"
+        );
+    }
+
+    #[test]
+    fn particle_entropy_rate_in_valid_range() {
+        let spec = ParticleSpec {
+            num_particles: 4,
+            num_cells: 4,
+            cell_dim: 8,
+            num_rules: 2,
+            selector_hidden: 16,
+            rule_hidden: 16,
+            context_window: 8,
+            unroll_steps: 1,
+            ..ParticleSpec::default()
+        };
+        let rb = RateBackend::Particle {
+            spec: Arc::new(spec),
+        };
+        let data = b"hello world particle backend test";
+        let rate = entropy_rate_backend(data, -1, &rb);
+        assert!(
+            rate > 0.0 && rate < 8.0,
+            "particle entropy rate out of (0, 8) range: {rate}"
+        );
+    }
+
+    #[test]
+    fn particle_cross_entropy_stability() {
+        let spec = ParticleSpec {
+            num_particles: 4,
+            num_cells: 4,
+            cell_dim: 8,
+            num_rules: 2,
+            selector_hidden: 16,
+            rule_hidden: 16,
+            context_window: 8,
+            unroll_steps: 1,
+            ..ParticleSpec::default()
+        };
+        let rb = RateBackend::Particle {
+            spec: Arc::new(spec),
+        };
+        let train = b"ABCABC";
+        let test = b"ABC";
+        let h1 = cross_entropy_rate_backend(test, train, -1, &rb);
+        let h2 = cross_entropy_rate_backend(test, train, -1, &rb);
+        assert!(
+            (h1 - h2).abs() < 1e-12,
+            "particle cross entropy not deterministic: h1={h1}, h2={h2}"
+        );
+    }
+
+    #[test]
+    fn particle_empty_input() {
+        let spec = ParticleSpec::default();
+        let rb = RateBackend::Particle {
+            spec: Arc::new(spec),
+        };
+        let rate = entropy_rate_backend(b"", -1, &rb);
+        assert!(
+            rate == 0.0,
+            "particle entropy rate for empty input should be 0.0, got {rate}"
+        );
+    }
+
+    #[test]
+    fn particle_joint_entropy_rate() {
+        let spec = ParticleSpec {
+            num_particles: 4,
+            num_cells: 4,
+            cell_dim: 8,
+            num_rules: 2,
+            selector_hidden: 16,
+            rule_hidden: 16,
+            context_window: 8,
+            unroll_steps: 1,
+            ..ParticleSpec::default()
+        };
+        let rb = RateBackend::Particle {
+            spec: Arc::new(spec),
+        };
+        let x = b"AAAA";
+        let y = b"BBBB";
+        let joint = joint_entropy_rate_backend(x, y, -1, &rb);
+        assert!(
+            joint > 0.0 && joint < 16.0,
+            "particle joint entropy rate out of range: {joint}"
         );
     }
 }

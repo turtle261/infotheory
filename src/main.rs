@@ -229,6 +229,42 @@ fn load_mixture_spec_with_depth(path: &str, depth: usize) -> anyhow::Result<Mixt
     parse_mixture_spec_value(&value, base_dir, depth)
 }
 
+fn load_particle_spec(path: &str) -> anyhow::Result<ParticleSpec> {
+    let raw = std::fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)?;
+    let spec = parse_particle_spec_value(&value)?;
+    spec.validate()
+        .map_err(|e| anyhow::anyhow!("invalid particle spec: {e}"))?;
+    Ok(spec)
+}
+
+fn parse_particle_spec_value(v: &serde_json::Value) -> anyhow::Result<ParticleSpec> {
+    Ok(ParticleSpec {
+        num_particles: v["num_particles"].as_u64().unwrap_or(16) as usize,
+        context_window: v["context_window"].as_u64().unwrap_or(32) as usize,
+        unroll_steps: v["unroll_steps"].as_u64().unwrap_or(2) as usize,
+        num_cells: v["num_cells"].as_u64().unwrap_or(8) as usize,
+        cell_dim: v["cell_dim"].as_u64().unwrap_or(32) as usize,
+        num_rules: v["num_rules"].as_u64().unwrap_or(4) as usize,
+        selector_hidden: v["selector_hidden"].as_u64().unwrap_or(64) as usize,
+        rule_hidden: v["rule_hidden"].as_u64().unwrap_or(64) as usize,
+        noise_dim: v["noise_dim"].as_u64().unwrap_or(8) as usize,
+        deterministic: v["deterministic"].as_bool().unwrap_or(true),
+        enable_noise: v["enable_noise"].as_bool().unwrap_or(false),
+        learning_rate_readout: v["learning_rate_readout"].as_f64().unwrap_or(0.01),
+        learning_rate_selector: v["learning_rate_selector"].as_f64().unwrap_or(0.003),
+        learning_rate_rule: v["learning_rate_rule"].as_f64().unwrap_or(0.003),
+        grad_clip: v["grad_clip"].as_f64().unwrap_or(1.0),
+        state_clip: v["state_clip"].as_f64().unwrap_or(8.0),
+        forget_lambda: v["forget_lambda"].as_f64().unwrap_or(0.0),
+        resample_threshold: v["resample_threshold"].as_f64().unwrap_or(0.5),
+        mutate_fraction: v["mutate_fraction"].as_f64().unwrap_or(0.1),
+        mutate_scale: v["mutate_scale"].as_f64().unwrap_or(0.01),
+        min_prob: v["min_prob"].as_f64().unwrap_or(2f64.powi(-24)),
+        seed: v["seed"].as_u64().unwrap_or(42),
+    })
+}
+
 fn parse_mixture_kind(kind: &str) -> anyhow::Result<MixtureKind> {
     match kind {
         "bayes" | "bayes-mix" | "bayes_mix" => Ok(MixtureKind::Bayes),
@@ -421,6 +457,26 @@ fn parse_mixture_expert_value(
                 log_prior,
                 max_order: -1,
                 backend: RateBackend::Mixture {
+                    spec: Arc::new(spec),
+                },
+            })
+        }
+        "particle" => {
+            let spec = if let Some(spec_v) = v.get("spec") {
+                parse_particle_spec_value(spec_v)?
+            } else if let Some(path) = v["spec_path"].as_str().or_else(|| v["path"].as_str()) {
+                let full = base_dir.join(path);
+                load_particle_spec(full.to_str().unwrap_or(path))?
+            } else {
+                ParticleSpec::default()
+            };
+            spec.validate()
+                .map_err(|e| anyhow::anyhow!("invalid particle spec: {e}"))?;
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order: -1,
+                backend: RateBackend::Particle {
                     spec: Arc::new(spec),
                 },
             })
@@ -1216,6 +1272,19 @@ fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>
                 std::process::exit(1);
             });
             RateBackend::Mixture {
+                spec: Arc::new(spec),
+            }
+        }
+        "particle" => {
+            let path = method.unwrap_or_else(|| {
+                eprintln!("Error: --rate-backend particle requires --method <spec.json>");
+                std::process::exit(1);
+            });
+            let spec = load_particle_spec(path).unwrap_or_else(|e| {
+                eprintln!("Error: failed to load particle spec '{path}': {e}");
+                std::process::exit(1);
+            });
+            RateBackend::Particle {
                 spec: Arc::new(spec),
             }
         }

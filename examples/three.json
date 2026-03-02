@@ -3,8 +3,8 @@
   "alpha": 0.03,
   "experts": [
     {
-      "name": "ctw",
-      "kind": "ctw",
+      "name": "fac",
+      "kind": "fac-ctw",
       "base_depth": 32,
       "encoding_bits": 8,
       "num_percept_bits": 8,
@@ -14,6 +14,12 @@
       "name": "rosa",
       "kind": "rosaplus",
       "max_order": -1,
+      "log_prior": 0.0
+    },
+    {
+      "name": "particle",
+      "kind": "particle",
+      "spec_path": "particle_config.json",
       "log_prior": 0.0
     }
   ]

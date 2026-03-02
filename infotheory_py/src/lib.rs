@@ -2,7 +2,7 @@
 
 use infotheory::{
     CompressionBackend, InfotheoryCtx, MixtureExpertSpec, MixtureKind, MixtureSpec, NcdVariant,
-    RateBackend,
+    ParticleSpec, RateBackend,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -104,6 +104,109 @@ fn parse_observation_key_mode(
     ))
 }
 
+fn parse_particle_spec_json(v: &serde_json::Value) -> PyResult<ParticleSpec> {
+    let d = ParticleSpec::default();
+    Ok(ParticleSpec {
+        num_particles: v
+            .get("num_particles")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.num_particles),
+        context_window: v
+            .get("context_window")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.context_window),
+        unroll_steps: v
+            .get("unroll_steps")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.unroll_steps),
+        num_cells: v
+            .get("num_cells")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.num_cells),
+        cell_dim: v
+            .get("cell_dim")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.cell_dim),
+        num_rules: v
+            .get("num_rules")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.num_rules),
+        selector_hidden: v
+            .get("selector_hidden")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.selector_hidden),
+        rule_hidden: v
+            .get("rule_hidden")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.rule_hidden),
+        noise_dim: v
+            .get("noise_dim")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(d.noise_dim),
+        deterministic: v
+            .get("deterministic")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(d.deterministic),
+        enable_noise: v
+            .get("enable_noise")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(d.enable_noise),
+        learning_rate_readout: v
+            .get("learning_rate_readout")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.learning_rate_readout),
+        learning_rate_selector: v
+            .get("learning_rate_selector")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.learning_rate_selector),
+        learning_rate_rule: v
+            .get("learning_rate_rule")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.learning_rate_rule),
+        grad_clip: v
+            .get("grad_clip")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.grad_clip),
+        state_clip: v
+            .get("state_clip")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.state_clip),
+        forget_lambda: v
+            .get("forget_lambda")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.forget_lambda),
+        resample_threshold: v
+            .get("resample_threshold")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.resample_threshold),
+        mutate_fraction: v
+            .get("mutate_fraction")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.mutate_fraction),
+        mutate_scale: v
+            .get("mutate_scale")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.mutate_scale),
+        min_prob: v
+            .get("min_prob")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(d.min_prob),
+        seed: v
+            .get("seed")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(d.seed),
+    })
+}
+
 fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend> {
     let m = method.unwrap_or_default();
     match name.to_ascii_lowercase().as_str() {
@@ -150,6 +253,25 @@ fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend>
         "rwkv" | "rwkv7" => Err(PyValueError::new_err(
             "rwkv backend disabled at compile time",
         )),
+        "particle" | "particles" => {
+            let spec = if m.is_empty() {
+                ParticleSpec::default()
+            } else {
+                let raw = std::fs::read_to_string(m).map_err(|e| {
+                    PyValueError::new_err(format!("failed to read particle spec '{m}': {e}"))
+                })?;
+                let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                    PyValueError::new_err(format!("invalid particle spec JSON: {e}"))
+                })?;
+                parse_particle_spec_json(&v)?
+            };
+            spec.validate().map_err(|e| {
+                PyValueError::new_err(format!("invalid particle spec: {e}"))
+            })?;
+            Ok(RateBackend::Particle {
+                spec: Arc::new(spec),
+            })
+        }
         _ => Err(PyValueError::new_err(format!(
             "unknown rate backend '{name}'"
         ))),
@@ -284,6 +406,101 @@ impl PyMixtureSpec {
     }
 }
 
+#[pyclass(name = "ParticleSpec", from_py_object)]
+#[derive(Clone)]
+struct PyParticleSpec {
+    inner: ParticleSpec,
+}
+
+#[pymethods]
+impl PyParticleSpec {
+    #[new]
+    #[pyo3(signature = (
+        num_particles=16,
+        context_window=32,
+        unroll_steps=2,
+        num_cells=8,
+        cell_dim=32,
+        num_rules=4,
+        selector_hidden=64,
+        rule_hidden=64,
+        noise_dim=8,
+        deterministic=true,
+        enable_noise=false,
+        learning_rate_readout=0.01,
+        learning_rate_selector=0.003,
+        learning_rate_rule=0.003,
+        grad_clip=1.0,
+        state_clip=8.0,
+        forget_lambda=0.0,
+        resample_threshold=0.5,
+        mutate_fraction=0.1,
+        mutate_scale=0.01,
+        min_prob=5.960_464_477_539_063e-8,
+        seed=42
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        num_particles: usize,
+        context_window: usize,
+        unroll_steps: usize,
+        num_cells: usize,
+        cell_dim: usize,
+        num_rules: usize,
+        selector_hidden: usize,
+        rule_hidden: usize,
+        noise_dim: usize,
+        deterministic: bool,
+        enable_noise: bool,
+        learning_rate_readout: f64,
+        learning_rate_selector: f64,
+        learning_rate_rule: f64,
+        grad_clip: f64,
+        state_clip: f64,
+        forget_lambda: f64,
+        resample_threshold: f64,
+        mutate_fraction: f64,
+        mutate_scale: f64,
+        min_prob: f64,
+        seed: u64,
+    ) -> PyResult<Self> {
+        let spec = ParticleSpec {
+            num_particles,
+            context_window,
+            unroll_steps,
+            num_cells,
+            cell_dim,
+            num_rules,
+            selector_hidden,
+            rule_hidden,
+            noise_dim,
+            deterministic,
+            enable_noise,
+            learning_rate_readout,
+            learning_rate_selector,
+            learning_rate_rule,
+            grad_clip,
+            state_clip,
+            forget_lambda,
+            resample_threshold,
+            mutate_fraction,
+            mutate_scale,
+            min_prob,
+            seed,
+        };
+        spec.validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid ParticleSpec: {e}")))?;
+        Ok(Self { inner: spec })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ParticleSpec(num_particles={}, num_cells={}, cell_dim={})",
+            self.inner.num_particles, self.inner.num_cells, self.inner.cell_dim
+        )
+    }
+}
+
 #[pyclass(name = "RateBackend", from_py_object)]
 #[derive(Clone)]
 struct PyRateBackend {
@@ -341,6 +558,15 @@ impl PyRateBackend {
     fn mixture(spec: &PyMixtureSpec) -> Self {
         Self {
             inner: RateBackend::Mixture {
+                spec: Arc::new(spec.inner.clone()),
+            },
+        }
+    }
+
+    #[staticmethod]
+    fn particle(spec: &PyParticleSpec) -> Self {
+        Self {
+            inner: RateBackend::Particle {
                 spec: Arc::new(spec.inner.clone()),
             },
         }
@@ -2706,6 +2932,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMixtureKind>()?;
     m.add_class::<PyMixtureExpertSpec>()?;
     m.add_class::<PyMixtureSpec>()?;
+    m.add_class::<PyParticleSpec>()?;
     m.add_class::<PyNcdVariant>()?;
     m.add_class::<PyObservationKeyMode>()?;
     m.add_class::<PyRandomGenerator>()?;

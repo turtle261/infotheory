@@ -212,6 +212,11 @@ pub enum RateBackendPredictor {
         /// Active mixture runtime.
         runtime: MixtureRuntime,
     },
+    /// Particle-latent filter ensemble.
+    Particle {
+        /// Particle runtime.
+        runtime: crate::particle::ParticleRuntime,
+    },
 }
 
 impl RateBackendPredictor {
@@ -289,6 +294,10 @@ impl RateBackendPredictor {
                     .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
                 Self::Mixture { runtime }
             }
+            RateBackend::Particle { spec } => {
+                let runtime = crate::particle::ParticleRuntime::new(spec.as_ref());
+                Self::Particle { runtime }
+            }
         }
     }
 
@@ -316,6 +325,9 @@ impl RateBackendPredictor {
                     MixtureKind::Neural => "neural",
                 };
                 format!("mix({})", kind)
+            }
+            RateBackend::Particle { spec } => {
+                format!("particle(n={},c={})", spec.num_particles, spec.num_cells)
             }
         }
     }
@@ -390,6 +402,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             RateBackendPredictor::Zpaq { model } => model.log_prob(symbol),
             RateBackendPredictor::Mixture { runtime } => runtime.peek_log_prob(symbol),
+            RateBackendPredictor::Particle { runtime } => runtime.peek_log_prob(symbol),
         }
     }
 
@@ -446,6 +459,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 for (sym, slot) in out.iter_mut().enumerate().take(256) {
                     *slot = runtime.peek_log_prob(sym as u8);
                 }
+            }
+            RateBackendPredictor::Particle { runtime } => {
+                runtime.fill_log_probs_cached(out);
             }
         }
     }
@@ -508,6 +524,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             RateBackendPredictor::Mixture { runtime } => {
                 let _ = runtime.step(symbol);
+            }
+            RateBackendPredictor::Particle { runtime } => {
+                runtime.step(symbol);
             }
         }
     }
