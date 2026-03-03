@@ -109,6 +109,7 @@ struct CtwPredictor {
     bits_per_symbol: usize,
     msb_first: bool,
     pdf: Vec<f64>,
+    pattern_logps: Vec<f64>,
     valid: bool,
 }
 
@@ -119,6 +120,7 @@ impl CtwPredictor {
             bits_per_symbol: 8,
             msb_first: true,
             pdf: vec![0.0; 256],
+            pattern_logps: vec![f64::NEG_INFINITY; 256],
             valid: false,
         }
     }
@@ -129,29 +131,82 @@ impl CtwPredictor {
             bits_per_symbol,
             msb_first: false,
             pdf: vec![0.0; 256],
+            pattern_logps: vec![f64::NEG_INFINITY; 256],
             valid: false,
         }
     }
 
-    fn log_prob_symbol(&mut self, symbol: u8) -> f64 {
+    fn fill_pattern_log_probs(&mut self) -> usize {
+        fn rec(
+            tree: &mut FacContextTree,
+            bits: usize,
+            msb_first: bool,
+            depth: usize,
+            pattern: usize,
+            log_before: f64,
+            out: &mut [f64],
+        ) {
+            if depth == bits {
+                out[pattern] = tree.get_log_block_probability() - log_before;
+                return;
+            }
+            for bit in [false, true] {
+                tree.update(bit, depth);
+                let next_pattern = if msb_first {
+                    (pattern << 1) | (bit as usize)
+                } else {
+                    pattern | ((bit as usize) << depth)
+                };
+                rec(
+                    tree,
+                    bits,
+                    msb_first,
+                    depth + 1,
+                    next_pattern,
+                    log_before,
+                    out,
+                );
+                tree.revert(depth);
+            }
+        }
+
+        let bits = self.bits_per_symbol.clamp(1, 8);
+        let patterns = 1usize << bits;
+        let log_before = self.tree.get_log_block_probability();
+        self.pattern_logps[..patterns].fill(f64::NEG_INFINITY);
+        rec(
+            &mut self.tree,
+            bits,
+            self.msb_first,
+            0,
+            0,
+            log_before,
+            &mut self.pattern_logps[..patterns],
+        );
+        patterns
+    }
+
+    #[cfg(test)]
+    fn log_prob_symbol_bruteforce(&mut self, symbol: u8) -> f64 {
+        let bits = self.bits_per_symbol.clamp(1, 8);
         let before = self.tree.get_log_block_probability();
         if self.msb_first {
-            for bit_idx in 0..self.bits_per_symbol {
+            for bit_idx in 0..bits {
                 let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
                 self.tree.update(bit, bit_idx);
             }
             let after = self.tree.get_log_block_probability();
-            for bit_idx in (0..self.bits_per_symbol).rev() {
+            for bit_idx in (0..bits).rev() {
                 self.tree.revert(bit_idx);
             }
             after - before
         } else {
-            for bit_idx in 0..self.bits_per_symbol {
+            for bit_idx in 0..bits {
                 let bit = ((symbol >> bit_idx) & 1) == 1;
                 self.tree.update(bit, bit_idx);
             }
             let after = self.tree.get_log_block_probability();
-            for bit_idx in (0..self.bits_per_symbol).rev() {
+            for bit_idx in (0..bits).rev() {
                 self.tree.revert(bit_idx);
             }
             after - before
@@ -180,20 +235,21 @@ impl CtwPredictor {
 
     fn pdf_next(&mut self) -> &[f64] {
         if !self.valid {
-            if self.bits_per_symbol >= 8 {
-                for sym in 0..256u16 {
-                    self.pdf[sym as usize] = self.log_prob_symbol(sym as u8).exp();
+            let bits = self.bits_per_symbol.clamp(1, 8);
+            let patterns = self.fill_pattern_log_probs();
+            if bits == 8 {
+                for sym in 0..256usize {
+                    self.pdf[sym] = self.pattern_logps[sym].exp();
                 }
             } else {
-                let patterns = 1usize << self.bits_per_symbol;
-                let aliases = 1usize << (8 - self.bits_per_symbol);
-                let mut ppat = vec![0.0f64; patterns];
-                for (pat, value) in ppat.iter_mut().enumerate() {
-                    *value = self.log_prob_symbol(pat as u8).exp();
-                }
+                let aliases = 1usize << (8 - bits);
                 for byte in 0..256usize {
-                    let pat = byte & (patterns - 1);
-                    self.pdf[byte] = ppat[pat] / (aliases as f64);
+                    let pat = if self.msb_first {
+                        byte >> (8 - bits)
+                    } else {
+                        byte & (patterns - 1)
+                    };
+                    self.pdf[byte] = self.pattern_logps[pat].exp() / (aliases as f64);
                 }
             }
             Self::normalize_pdf(&mut self.pdf);
@@ -238,25 +294,11 @@ impl RosaPredictor {
 
     fn pdf_next(&mut self) -> &[f64] {
         if !self.valid {
-            for s in 0..256usize {
-                self.pdf[s] = self.model.prob_for_last(s as u32).max(PDF_MIN);
-            }
-            let sum: f64 = self.pdf.iter().sum();
-            let inv = if sum.is_finite() && sum > 0.0 {
-                1.0 / sum
-            } else {
-                1.0 / 256.0
-            };
+            self.model.fill_probs_for_last_bytes(&mut self.pdf);
             for p in &mut self.pdf {
-                *p = (*p * inv).max(PDF_MIN);
+                *p = (*p).max(PDF_MIN);
             }
-            let norm: f64 = self.pdf.iter().sum();
-            if norm > 0.0 {
-                let invn = 1.0 / norm;
-                for p in &mut self.pdf {
-                    *p *= invn;
-                }
-            }
+            normalize_pdf(&mut self.pdf);
             self.valid = true;
         }
         &self.pdf
@@ -950,6 +992,84 @@ fn _zpaq_marker(_: &ZpaqRateModel) {}
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn brute_force_pdf(predictor: &mut CtwPredictor) -> Vec<f64> {
+        let bits = predictor.bits_per_symbol.clamp(1, 8);
+        let mut out = vec![0.0; 256];
+
+        if bits == 8 {
+            for sym in 0..256usize {
+                out[sym] = predictor.log_prob_symbol_bruteforce(sym as u8).exp();
+            }
+        } else {
+            let patterns = 1usize << bits;
+            let aliases = 1usize << (8 - bits);
+            let mut pat_prob = vec![0.0; patterns];
+            for (pat, value) in pat_prob.iter_mut().enumerate() {
+                let symbol = if predictor.msb_first {
+                    (pat as u8) << (8 - bits)
+                } else {
+                    pat as u8
+                };
+                *value = predictor.log_prob_symbol_bruteforce(symbol).exp();
+            }
+            for byte in 0..256usize {
+                let pat = if predictor.msb_first {
+                    byte >> (8 - bits)
+                } else {
+                    byte & (patterns - 1)
+                };
+                out[byte] = pat_prob[pat] / (aliases as f64);
+            }
+        }
+
+        CtwPredictor::normalize_pdf(&mut out);
+        out
+    }
+
+    #[test]
+    fn ctw_pdf_fast_matches_bruteforce() {
+        let mut predictor = CtwPredictor::new_ctw(6);
+        for &b in b"ctw fast-path regression corpus 1234567890" {
+            predictor.update(b);
+        }
+
+        let fast = predictor.pdf_next().to_vec();
+        predictor.valid = false;
+        let brute = brute_force_pdf(&mut predictor);
+
+        for i in 0..256usize {
+            let delta = (fast[i] - brute[i]).abs();
+            assert!(
+                delta < 1e-12,
+                "symbol={i} fast={} brute={} delta={delta}",
+                fast[i],
+                brute[i]
+            );
+        }
+    }
+
+    #[test]
+    fn fac_pdf_fast_matches_bruteforce_subbyte() {
+        let mut predictor = CtwPredictor::new_fac(5, 5);
+        for &b in b"fac ctw subbyte regression corpus abcdefghijklmnopqrstuvwxyz" {
+            predictor.update(b);
+        }
+
+        let fast = predictor.pdf_next().to_vec();
+        predictor.valid = false;
+        let brute = brute_force_pdf(&mut predictor);
+
+        for i in 0..256usize {
+            let delta = (fast[i] - brute[i]).abs();
+            assert!(
+                delta < 1e-12,
+                "symbol={i} fast={} brute={} delta={delta}",
+                fast[i],
+                brute[i]
+            );
+        }
+    }
 
     #[test]
     fn roundtrip_rate_ac_ctw() {

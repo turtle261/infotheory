@@ -1446,47 +1446,94 @@ impl RosaPlus {
         }
     }
 
+    /// Incrementally absorb one byte in continuous-stream mode.
+    ///
+    /// This updates SAM and LM counts without boundary insertion and without
+    /// transactional logging, for fast prequential scoring.
+    #[inline]
+    fn train_byte_stream(&mut self, b: u8) {
+        if self.sam.text.is_empty() {
+            self.sam = Sam::new(1024);
+        }
+        if !self.lm_built {
+            self.build_lm_full_bytes_no_finalize_endpos();
+        }
+
+        let seg_start = self.sam.text.len();
+        self.sam.feed(b as u32);
+
+        if self.lm.ls.len() < self.sam.st.len() {
+            self.lm.ls.resize(
+                self.sam.st.len(),
+                LmState {
+                    head: -1,
+                    last_node: -1,
+                    ..LmState::default()
+                },
+            );
+        }
+
+        self.lm.unigram[b as usize] += 1;
+        self.lm.total_uni += 1;
+
+        let mo = if self.max_order < 0 {
+            -1
+        } else {
+            self.max_order
+        };
+        let seg_end = self.sam.text.len();
+        if seg_end >= 2 {
+            let mut start_i = seg_start;
+            if seg_start > 0
+                && self
+                    .sam
+                    .boundary_after
+                    .get(seg_start - 1)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+            {
+                start_i = seg_start - 1;
+            }
+            for i in start_i..(seg_end - 1) {
+                let mut ctx = self.sam.text_states[i + 1];
+                if mo >= 0 {
+                    while ctx != -1 && (self.sam.st[ctx as usize].len as i64) > mo {
+                        ctx = self.sam.st[ctx as usize].link;
+                    }
+                    if ctx == -1 {
+                        ctx = 0;
+                    }
+                }
+                let nxt = self.sam.text[i + 1];
+                let si = self.lm.find_sym(nxt);
+                if si >= 0 {
+                    let mut u = ctx;
+                    while u != -1 {
+                        self.lm.inc(u as u32, si as u32, 1);
+                        u = self.sam.st[u as usize].link;
+                    }
+                }
+            }
+        }
+
+        self.lm_built = true;
+    }
+
     fn predictive_entropy_rate_order(data: &[u8], max_order: i64, seed: u64) -> f64 {
-        if data.len() < 2 {
+        if data.is_empty() {
             return 0.0;
         }
-        let num_chunks = 16;
-        let chunk_size = data.len().div_ceil(num_chunks);
+        let mut m = RosaPlus::new(max_order, false, 0, seed);
+        m.build_lm_full_bytes_no_finalize_endpos();
+
         let mut total_log_prob = 0.0f64;
-        let mut count = 0usize;
-
-        for i in 0..num_chunks {
-            let start = i * chunk_size;
-            let end = ((i + 1) * chunk_size).min(data.len());
-            if start >= end {
-                break;
-            }
-            if i == 0 {
-                continue;
-            }
-
-            let mut m = RosaPlus::new(max_order, false, 0, seed);
-            m.train_example(&data[..start]);
-            m.build_lm();
-            let mut v = m.sam.last;
-
-            for &b in &data[start..end] {
-                let sym_idx = m.lm.find_sym(b as u32);
-                let p = m.lm.prob_for_sym(&m.sam, max_order, v, sym_idx);
-                total_log_prob += p.log2();
-                count += 1;
-                v = m.sam.advance(v, b as u32);
-            }
+        for &b in data {
+            let p = m.prob_for_last(b as u32);
+            total_log_prob += p.log2();
+            m.train_byte_stream(b);
         }
-
-        if count == 0 {
-            let mut m = RosaPlus::new(max_order, false, 0, seed);
-            m.train_example(data);
-            m.build_lm();
-            m.cross_entropy(data)
-        } else {
-            -total_log_prob / (count as f64)
-        }
+        -total_log_prob / (data.len() as f64)
     }
 
     /// Current LM alphabet size (0 if LM not built).
@@ -1757,23 +1804,14 @@ impl RosaPlus {
         if data.len() < 2 {
             return 0.0;
         }
-        if self.max_order < 0 {
-            let candidates: [i64; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
-            let mut best = f64::INFINITY;
-            for &mo in &candidates {
-                if mo as usize >= data.len() {
-                    continue;
-                }
-                let h = Self::predictive_entropy_rate_order(data, mo, self.seed);
-                if h < best {
-                    best = h;
-                }
-            }
-            if best.is_finite() {
-                return best;
-            }
-        }
-        Self::predictive_entropy_rate_order(data, self.max_order, self.seed)
+        // Uncapped mode now follows a single streaming prequential pass to
+        // match online compression semantics and avoid multi-pass order search.
+        let mo = if self.max_order < 0 {
+            -1
+        } else {
+            self.max_order
+        };
+        Self::predictive_entropy_rate_order(data, mo, self.seed)
     }
 
     /// Predictive entropy rate on codepoint streams.
@@ -2181,6 +2219,45 @@ impl RosaPlus {
             self.max_order
         };
         self.lm.prob_for_sym(&self.sam, mo, v, sym_idx)
+    }
+
+    /// Fill a dense byte-wise probability vector for the current SAM cursor (`sam.last`).
+    ///
+    /// `out` must have length at least 256. The output is normalized.
+    pub fn fill_probs_for_last_bytes(&mut self, out: &mut [f64]) {
+        debug_assert!(out.len() >= 256);
+        if !self.lm_built {
+            self.build_lm();
+        }
+
+        let v = self.sam.last;
+        let mo = if self.max_order < 0 {
+            -1
+        } else {
+            self.max_order
+        };
+        self.dist.resize(self.lm.alpha_n as usize, 0.0);
+        self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
+
+        out[..256].fill(0.0);
+        for (i, &cp) in self.lm.alphabet.iter().enumerate() {
+            if cp < 256 {
+                out[cp as usize] = self.dist[i];
+            }
+        }
+
+        let sum: f64 = out[..256].iter().sum();
+        if sum.is_finite() && sum > 0.0 {
+            let inv = 1.0 / sum;
+            for p in &mut out[..256] {
+                *p *= inv;
+            }
+        } else {
+            let u = 1.0 / 256.0;
+            for p in &mut out[..256] {
+                *p = u;
+            }
+        }
     }
 }
 

@@ -5,7 +5,7 @@
 //! and resample+mutation.
 
 use crate::ParticleSpec;
-use crate::simd_math::{dot_wide, logsumexp_wide, max_wide};
+use crate::simd_math::{axpy_wide, dot_wide, logsumexp_wide, max_wide};
 use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
@@ -158,24 +158,26 @@ impl DenseLayer {
     /// SGD update: weights -= lr * grad_out ⊗ x, bias -= lr * grad_out.
     /// Clips gradients and parameters.
     fn sgd_update(&mut self, grad_out: &[f64], x: &[f64], lr: f64, grad_clip: f64, momentum: f64) {
+        if momentum == 0.0 {
+            for r in 0..self.out_dim {
+                let g = clip(grad_out[r], grad_clip);
+                let row = &mut self.weights[r * self.in_dim..(r + 1) * self.in_dim];
+                axpy_wide(row, -lr * g, &x[..self.in_dim]);
+                self.bias[r] -= lr * g;
+            }
+            return;
+        }
+
         for r in 0..self.out_dim {
             let g = clip(grad_out[r], grad_clip);
             for c in 0..self.in_dim {
                 let idx = r * self.in_dim + c;
                 let grad = g * x[c];
-                if momentum > 0.0 {
-                    self.vel_weights[idx] = momentum * self.vel_weights[idx] + grad;
-                    self.weights[idx] -= lr * self.vel_weights[idx];
-                } else {
-                    self.weights[idx] -= lr * grad;
-                }
+                self.vel_weights[idx] = momentum * self.vel_weights[idx] + grad;
+                self.weights[idx] -= lr * self.vel_weights[idx];
             }
-            if momentum > 0.0 {
-                self.vel_bias[r] = momentum * self.vel_bias[r] + g;
-                self.bias[r] -= lr * self.vel_bias[r];
-            } else {
-                self.bias[r] -= lr * g;
-            }
+            self.vel_bias[r] = momentum * self.vel_bias[r] + g;
+            self.bias[r] -= lr * self.vel_bias[r];
         }
     }
 }
@@ -667,6 +669,10 @@ impl ParticleState {
             .readout
             .forward(&self.scratch_phi, &mut self.scratch_logits);
 
+        // Reuse exact softmax(logits) in SGD to avoid recomputing it.
+        self.scratch_softmax.copy_from_slice(&self.scratch_logits);
+        softmax_inplace(&mut self.scratch_softmax);
+
         // Log-softmax with floor
         log_softmax_with_floor(
             &self.scratch_logits,
@@ -791,10 +797,6 @@ impl ParticleState {
 
     /// Online SGD update after observing byte `y`.
     fn sgd_update(&mut self, y: u8, spec: &ParticleSpec) {
-        // Compute softmax of logits
-        self.scratch_softmax.copy_from_slice(&self.scratch_logits);
-        softmax_inplace(&mut self.scratch_softmax);
-
         // Readout gradient: d_logits = softmax - onehot(y)
         self.scratch_d_logits.copy_from_slice(&self.scratch_softmax);
         self.scratch_d_logits[y as usize] -= 1.0;
@@ -834,15 +836,17 @@ impl ParticleState {
 
         if spec.learning_rate_selector > 0.0 || spec.learning_rate_rule > 0.0 {
             let depth = spec.bptt_depth.max(1).min(self.trace_history.len());
-            let d_phi = self.scratch_d_phi.clone();
+            let traces = std::mem::take(&mut self.trace_history);
+            let d_phi = self.scratch_d_phi[..phi_dim].to_vec();
             let mut temporal = 1.0_f64;
             let temporal_decay = 0.7_f64;
             for idx in 0..depth {
-                let hist_idx = self.trace_history.len() - 1 - idx;
-                let trace = self.trace_history[hist_idx].clone();
-                self.apply_selector_rule_update_from_trace(&trace, &d_phi, temporal, spec);
+                let hist_idx = traces.len() - 1 - idx;
+                let trace = &traces[hist_idx];
+                self.apply_selector_rule_update_from_trace(trace, &d_phi, temporal, spec);
                 temporal *= temporal_decay;
             }
+            self.trace_history = traces;
         }
     }
 

@@ -64,6 +64,11 @@ harness = false
 name = "simd_hotspots"
 harness = false
 
+[[bench]]
+name = "rate_backend_coders"
+harness = false
+required-features = ["backend-rwkv"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
@@ -80,3 +85,4 @@ debug = true
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

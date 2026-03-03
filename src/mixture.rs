@@ -199,6 +199,8 @@ pub enum RateBackendPredictor {
         compressor: rwkvzip::Compressor,
         /// Whether the first-token distribution has been primed.
         primed: bool,
+        /// Scratch copy used for update API that borrows immutable PDF.
+        pdf_scratch: Vec<f64>,
         /// Probability floor for numeric stability.
         min_prob: f64,
     },
@@ -259,6 +261,7 @@ impl RateBackendPredictor {
                     &mut compressor.pdf_buffer,
                 );
                 Self::Rwkv7 {
+                    pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
                     compressor,
                     primed: true,
                     min_prob,
@@ -279,6 +282,7 @@ impl RateBackendPredictor {
                     &mut compressor.pdf_buffer,
                 );
                 Self::Rwkv7 {
+                    pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
                     compressor,
                     primed: true,
                     min_prob,
@@ -383,6 +387,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 compressor,
                 primed,
                 min_prob,
+                ..
             } => {
                 if !*primed {
                     let bias = compressor.online_bias_snapshot();
@@ -409,9 +414,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         match self {
             RateBackendPredictor::Rosa { model, min_prob } => {
-                for (sym, slot) in out.iter_mut().enumerate().take(256) {
-                    let p = clamp_prob(model.prob_for_last(sym as u32), *min_prob);
-                    *slot = p.ln();
+                model.fill_probs_for_last_bytes(out);
+                for slot in out.iter_mut() {
+                    *slot = clamp_prob(*slot, *min_prob).ln();
                 }
             }
             RateBackendPredictor::Ctw { tree, min_prob } => {
@@ -429,6 +434,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 compressor,
                 primed,
                 min_prob,
+                ..
             } => {
                 if !*primed {
                     let bias = compressor.online_bias_snapshot();
@@ -456,9 +462,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 model.fill_log_probs(out);
             }
             RateBackendPredictor::Mixture { runtime } => {
-                for (sym, slot) in out.iter_mut().enumerate().take(256) {
-                    *slot = runtime.peek_log_prob(sym as u8);
-                }
+                runtime.fill_log_probs(out);
             }
             RateBackendPredictor::Particle { runtime } => {
                 runtime.fill_log_probs_cached(out);
@@ -490,7 +494,10 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             #[cfg(feature = "backend-rwkv")]
             RateBackendPredictor::Rwkv7 {
-                compressor, primed, ..
+                compressor,
+                primed,
+                pdf_scratch,
+                ..
             } => {
                 if !*primed {
                     let bias = compressor.online_bias_snapshot();
@@ -505,8 +512,11 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     );
                     *primed = true;
                 }
-                let pdf = compressor.pdf_buffer.clone();
-                let _ = compressor.online_update_from_pdf(symbol, &pdf);
+                if pdf_scratch.len() != compressor.pdf_buffer.len() {
+                    pdf_scratch.resize(compressor.pdf_buffer.len(), 0.0);
+                }
+                pdf_scratch.copy_from_slice(&compressor.pdf_buffer);
+                let _ = compressor.online_update_from_pdf(symbol, pdf_scratch);
                 let bias = compressor.online_bias_snapshot();
                 let logits = compressor.model.forward(
                     &mut compressor.scratch,
@@ -767,6 +777,23 @@ impl BayesMixture {
         log_mix
     }
 
+    fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        out.fill(f64::NEG_INFINITY);
+        let norm = logsumexp_weights(&self.experts);
+        let mut row = [0.0f64; 256];
+        for expert in &mut self.experts {
+            expert.predictor.fill_log_probs(&mut row);
+            let lw = expert.log_weight - norm;
+            for b in 0..256 {
+                out[b] = logsumexp2(out[b], lw + row[b]);
+            }
+        }
+    }
+
     /// Posterior weights (normalized) over experts.
     pub fn posterior(&self) -> Vec<f64> {
         let norm = logsumexp_weights(&self.experts);
@@ -900,6 +927,27 @@ impl FadingBayesMixture {
         log_mix
     }
 
+    fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        out.fill(f64::NEG_INFINITY);
+        let mut decayed = Vec::with_capacity(self.experts.len());
+        for expert in &self.experts {
+            decayed.push(self.decay * expert.log_weight);
+        }
+        let norm = logsumexp(&decayed);
+        let mut row = [0.0f64; 256];
+        for (i, expert) in self.experts.iter_mut().enumerate() {
+            expert.predictor.fill_log_probs(&mut row);
+            let lw = decayed[i] - norm;
+            for b in 0..256 {
+                out[b] = logsumexp2(out[b], lw + row[b]);
+            }
+        }
+    }
+
     /// Posterior weights (normalized) over experts.
     pub fn posterior(&self) -> Vec<f64> {
         let norm = logsumexp_weights(&self.experts);
@@ -1021,6 +1069,30 @@ impl SwitchingMixture {
         self.cached_log_mix = log_mix;
         self.cache_valid = true;
         log_mix
+    }
+
+    fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        out.fill(f64::NEG_INFINITY);
+        let mut log_switch = vec![0.0f64; self.experts.len()];
+        for (i, expert) in self.experts.iter().enumerate() {
+            log_switch[i] = logsumexp2(
+                self.log_1m_alpha + expert.log_weight,
+                self.log_alpha + self.log_prior[i],
+            );
+        }
+        let norm = logsumexp(&log_switch);
+        let mut row = [0.0f64; 256];
+        for (i, expert) in self.experts.iter_mut().enumerate() {
+            expert.predictor.fill_log_probs(&mut row);
+            let lw = log_switch[i] - norm;
+            for b in 0..256 {
+                out[b] = logsumexp2(out[b], lw + row[b]);
+            }
+        }
     }
 
     /// Posterior weights (normalized) over experts.
@@ -1183,6 +1255,21 @@ impl NeuralMixture {
         clamp_unit_prob(self.neural.prob(symbol), self.min_prob).ln()
     }
 
+    fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        if self.experts.len() == 1 {
+            self.experts[0].predictor.fill_log_probs(out);
+            return;
+        }
+        self.ensure_evaluated();
+        for (sym, slot) in out.iter_mut().enumerate() {
+            *slot = clamp_unit_prob(self.neural.prob(sym as u8), self.min_prob).ln();
+        }
+    }
+
     /// Log-probability (natural log) of the neural mixture for `symbol`, then update.
     pub fn step(&mut self, symbol: u8) -> f64 {
         if self.experts.is_empty() {
@@ -1300,6 +1387,22 @@ impl MdlSelector {
         logp
     }
 
+    fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        let mut best_idx = 0usize;
+        let mut best_loss = f64::INFINITY;
+        for (i, expert) in self.experts.iter().enumerate() {
+            if expert.cum_log_loss < best_loss {
+                best_loss = expert.cum_log_loss;
+                best_idx = i;
+            }
+        }
+        self.experts[best_idx].predictor.fill_log_probs(out);
+    }
+
     /// Index of the current best expert.
     pub fn best_index(&self) -> usize {
         self.last_best
@@ -1375,6 +1478,16 @@ impl MixtureRuntime {
             MixtureRuntime::Switching(m) => m.step(symbol),
             MixtureRuntime::Mdl(m) => m.step(symbol),
             MixtureRuntime::Neural(m) => m.step(symbol),
+        }
+    }
+
+    pub(crate) fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+        match self {
+            MixtureRuntime::Bayes(m) => m.fill_log_probs(out),
+            MixtureRuntime::Fading(m) => m.fill_log_probs(out),
+            MixtureRuntime::Switching(m) => m.fill_log_probs(out),
+            MixtureRuntime::Mdl(m) => m.fill_log_probs(out),
+            MixtureRuntime::Neural(m) => m.fill_log_probs(out),
         }
     }
 }

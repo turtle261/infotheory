@@ -15,6 +15,24 @@ use std::f64;
 
 type Symbol = bool;
 
+#[inline(always)]
+fn ensure_log_caches(log_int: &mut Vec<f64>, log_half: &mut Vec<f64>, upto: usize) {
+    if upto < log_int.len() {
+        return;
+    }
+    let start = log_int.len();
+    log_int.reserve(upto + 1 - start);
+    log_half.reserve(upto + 1 - start);
+    for n in start..=upto {
+        if n == 0 {
+            log_int.push(f64::NEG_INFINITY);
+        } else {
+            log_int.push((n as f64).ln());
+        }
+        log_half.push((n as f64 + 0.5).ln());
+    }
+}
+
 /// Index into the node arena. `NONE` indicates no child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeIndex(u32);
@@ -167,6 +185,8 @@ pub struct ContextTree {
     max_depth: usize,
     context_buf: Vec<Symbol>,
     path_buf: Vec<NodeIndex>,
+    log_int: Vec<f64>,
+    log_half: Vec<f64>,
 }
 
 impl ContextTree {
@@ -181,6 +201,8 @@ impl ContextTree {
             max_depth: depth,
             context_buf: vec![false; depth],
             path_buf: Vec::with_capacity(depth + 1),
+            log_int: vec![f64::NEG_INFINITY],
+            log_half: vec![(0.5f64).ln()],
         }
     }
 
@@ -195,6 +217,11 @@ impl ContextTree {
     /// Updates the tree with a new symbol.
     #[inline]
     pub fn update(&mut self, sym: Symbol) {
+        ensure_log_caches(
+            &mut self.log_int,
+            &mut self.log_half,
+            self.history.len() + 1,
+        );
         self.prepare_context();
         self.update_from_root(sym, false);
         self.history.push(sym);
@@ -206,6 +233,11 @@ impl ContextTree {
         let Some(last_sym) = self.history.pop() else {
             return;
         };
+        ensure_log_caches(
+            &mut self.log_int,
+            &mut self.log_half,
+            self.history.len() + 1,
+        );
         self.prepare_context();
         self.update_from_root(last_sym, true);
     }
@@ -363,14 +395,15 @@ impl ContextTree {
         // Update KT estimator
         let sym_idx = sym as usize;
         if !revert {
-            node.log_prob_kt += log_kt_mul(node.symbol_count, sym);
+            let total_before = (node.symbol_count[0] + node.symbol_count[1]) as usize;
+            let sym_before = node.symbol_count[sym_idx] as usize;
+            node.log_prob_kt += self.log_half[sym_before] - self.log_int[total_before + 1];
             node.symbol_count[sym_idx] += 1;
         } else {
-            let total = node.symbol_count[0] + node.symbol_count[1];
-            if node.symbol_count[sym_idx] > 0 && total > 0 {
-                let numerator = (node.symbol_count[sym_idx] as f64 - 0.5).ln();
-                let denominator = (total as f64).ln();
-                node.log_prob_kt -= numerator - denominator;
+            let total = (node.symbol_count[0] + node.symbol_count[1]) as usize;
+            let sym_count = node.symbol_count[sym_idx] as usize;
+            if sym_count > 0 && total > 0 {
+                node.log_prob_kt -= self.log_half[sym_count - 1] - self.log_int[total];
                 node.symbol_count[sym_idx] -= 1;
             }
         }
@@ -403,13 +436,6 @@ impl ContextTree {
     }
 }
 
-/// KT estimator log-multiplier calculation.
-#[inline(always)]
-fn log_kt_mul(counts: [u32; 2], sym: Symbol) -> f64 {
-    let sym_idx = sym as usize;
-    let denominator = ((counts[0] + counts[1] + 1) as f64).ln();
-    (counts[sym_idx] as f64 + 0.5).ln() - denominator
-}
 // Factorized Action-Conditional CTW (FAC-CTW)
 // =============================================================================
 
@@ -421,6 +447,8 @@ struct ContextTreeCore {
     max_depth: usize,
     context_buf: Vec<Symbol>,
     path_buf: Vec<NodeIndex>,
+    log_int: Vec<f64>,
+    log_half: Vec<f64>,
 }
 
 impl ContextTreeCore {
@@ -433,6 +461,8 @@ impl ContextTreeCore {
             max_depth: depth,
             context_buf: vec![false; depth],
             path_buf: Vec::with_capacity(depth + 1),
+            log_int: vec![f64::NEG_INFINITY],
+            log_half: vec![(0.5f64).ln()],
         }
     }
 
@@ -457,6 +487,11 @@ impl ContextTreeCore {
     /// Update tree with symbol, using shared history for context.
     #[inline]
     fn update(&mut self, sym: Symbol, shared_history: &[Symbol]) {
+        ensure_log_caches(
+            &mut self.log_int,
+            &mut self.log_half,
+            shared_history.len() + 1,
+        );
         self.prepare_context(shared_history);
         self.update_node_iterative(sym, false);
     }
@@ -464,6 +499,11 @@ impl ContextTreeCore {
     /// Revert last update, using shared history for context.
     #[inline]
     fn revert(&mut self, last_sym: Symbol, shared_history: &[Symbol]) {
+        ensure_log_caches(
+            &mut self.log_int,
+            &mut self.log_half,
+            shared_history.len() + 1,
+        );
         self.prepare_context(shared_history);
         self.update_node_iterative(last_sym, true);
     }
@@ -559,14 +599,15 @@ impl ContextTreeCore {
 
         let sym_idx = sym as usize;
         if !revert {
-            node.log_prob_kt += log_kt_mul(node.symbol_count, sym);
+            let total_before = (node.symbol_count[0] + node.symbol_count[1]) as usize;
+            let sym_before = node.symbol_count[sym_idx] as usize;
+            node.log_prob_kt += self.log_half[sym_before] - self.log_int[total_before + 1];
             node.symbol_count[sym_idx] += 1;
         } else {
-            let total = node.symbol_count[0] + node.symbol_count[1];
-            if node.symbol_count[sym_idx] > 0 && total > 0 {
-                let numerator = (node.symbol_count[sym_idx] as f64 - 0.5).ln();
-                let denominator = (total as f64).ln();
-                node.log_prob_kt -= numerator - denominator;
+            let total = (node.symbol_count[0] + node.symbol_count[1]) as usize;
+            let sym_count = node.symbol_count[sym_idx] as usize;
+            if sym_count > 0 && total > 0 {
+                node.log_prob_kt -= self.log_half[sym_count - 1] - self.log_int[total];
                 node.symbol_count[sym_idx] -= 1;
             }
         }
