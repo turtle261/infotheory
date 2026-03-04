@@ -1,31 +1,25 @@
-use crate::simd_math::{affine3_wide, axpy_wide, dot_wide, logsumexp_wide};
-
 #[derive(Clone)]
 struct NeuralStage1Entry {
-    weights: Vec<f64>,
-    bias: f64,
+    logits: Vec<f64>,
 }
 
 impl NeuralStage1Entry {
     fn new(width: usize) -> Self {
         Self {
-            weights: vec![0.0; width],
-            bias: 0.0,
+            logits: vec![0.0; width],
         }
     }
 }
 
 #[derive(Clone)]
 struct NeuralStage2Entry {
-    weights: Vec<f64>,
-    bias: Vec<f64>,
+    logits: Vec<f64>,
 }
 
 impl NeuralStage2Entry {
     fn new(width: usize) -> Self {
         Self {
-            weights: vec![0.0; width],
-            bias: vec![0.0; 256],
+            logits: vec![0.0; width],
         }
     }
 }
@@ -48,10 +42,13 @@ pub(crate) struct NeuralMixCore {
     update_skip_threshold: f64,
     history: NeuralHistoryState,
     expert_count: usize,
-    stage1_out: Vec<f64>,
-    energy: Vec<f64>,
-    probs: Vec<f64>,
-    errors: Vec<f64>,
+    expert_probs: Vec<f64>,
+    stage1_mix: Vec<f64>,
+    stage1_probs: Vec<f64>,
+    stage2_mix: Vec<f64>,
+    expert_weights: Vec<f64>,
+    mix_prob: f64,
+    evaluated: bool,
 }
 
 impl NeuralMixCore {
@@ -73,7 +70,14 @@ impl NeuralMixCore {
             for _ in 0..*table_size {
                 let mut entry = NeuralStage1Entry::new(expert_count);
                 if ctx_idx == 0 {
-                    entry.weights.clone_from_slice(prior_weights);
+                    for (dst, &p) in entry.logits.iter_mut().zip(prior_weights.iter()) {
+                        let p = if p.is_finite() {
+                            p.max(1e-12)
+                        } else {
+                            1e-12
+                        };
+                        *dst = p.ln();
+                    }
                 }
                 table.push(entry);
             }
@@ -83,8 +87,8 @@ impl NeuralMixCore {
         let mut stage2_table = Vec::with_capacity(Self::STAGE2_TABLE_SIZE);
         for _ in 0..Self::STAGE2_TABLE_SIZE {
             let mut entry = NeuralStage2Entry::new(Self::STAGE1_CONTEXTS);
-            for w in &mut entry.weights {
-                *w = 1.0 / (Self::STAGE1_CONTEXTS as f64);
+            for logit in &mut entry.logits {
+                *logit = 0.0;
             }
             stage2_table.push(entry);
         }
@@ -97,10 +101,13 @@ impl NeuralMixCore {
             update_skip_threshold,
             history: NeuralHistoryState::default(),
             expert_count,
-            stage1_out: vec![0.0; Self::STAGE1_CONTEXTS * 256],
-            energy: vec![0.0; 256],
-            probs: vec![0.0; 256],
-            errors: vec![0.0; 256],
+            expert_probs: vec![0.0; expert_count],
+            stage1_mix: vec![0.0; Self::STAGE1_CONTEXTS * expert_count],
+            stage1_probs: vec![0.0; Self::STAGE1_CONTEXTS],
+            stage2_mix: vec![0.0; Self::STAGE1_CONTEXTS],
+            expert_weights: vec![0.0; expert_count],
+            mix_prob: 1.0 / 256.0,
+            evaluated: false,
         }
     }
 
@@ -110,104 +117,80 @@ impl NeuralMixCore {
     }
 
     #[inline]
-    pub(crate) fn evaluate(&mut self, expert_logits: &[f64]) {
-        debug_assert_eq!(expert_logits.len(), self.expert_count * 256);
-        let stage1_idx = self.stage1_context_indices();
-
-        for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-            let entry = &self.stage1_tables[k][ctx_i];
-            let row = &mut self.stage1_out[(k * 256)..((k + 1) * 256)];
-            row.fill(entry.bias);
-            for i in 0..self.expert_count {
-                let feat = &expert_logits[(i * 256)..((i + 1) * 256)];
-                axpy_wide(row, entry.weights[i], feat);
-            }
-            let log_z = logsumexp_wide(row);
-            for v in row.iter_mut() {
-                *v -= log_z;
-            }
+    pub(crate) fn evaluate_symbol(&mut self, expert_log_probs: &[f64], min_prob: f64) -> f64 {
+        debug_assert_eq!(expert_log_probs.len(), self.expert_count);
+        let floor = min_prob.clamp(1e-12, 0.49);
+        for i in 0..self.expert_count {
+            let lp = expert_log_probs[i];
+            let p = if lp.is_finite() { lp.exp() } else { floor };
+            self.expert_probs[i] = p.max(floor).min(1.0 - floor);
         }
 
-        let stage2_idx = self.stage2_context_index();
-        let entry2 = &self.stage2_table[stage2_idx];
-        affine3_wide(
-            &mut self.energy,
-            &entry2.bias,
-            [entry2.weights[0], entry2.weights[1], entry2.weights[2]],
-            &self.stage1_out[0..256],
-            &self.stage1_out[256..512],
-            &self.stage1_out[512..768],
-        );
+        self.compute_context_mixtures();
 
-        let log_z = logsumexp_wide(&self.energy);
-        for b in 0..256usize {
-            self.probs[b] = (self.energy[b] - log_z).exp();
+        let mut mix = 0.0;
+        for k in 0..Self::STAGE1_CONTEXTS {
+            let n = self.expert_count;
+            let row = &self.stage1_mix[(k * n)..((k + 1) * n)];
+            let mut p_k = 0.0;
+            for i in 0..n {
+                p_k += row[i] * self.expert_probs[i];
+            }
+            let p_k = p_k.max(floor).min(1.0 - floor);
+            self.stage1_probs[k] = p_k;
+            mix += self.stage2_mix[k] * p_k;
         }
+        self.mix_prob = mix.max(floor).min(1.0 - floor);
+        self.evaluated = true;
+        self.mix_prob
     }
 
     #[inline]
-    pub(crate) fn prob(&self, symbol: u8) -> f64 {
-        self.probs[symbol as usize]
-    }
-
-    #[cfg(feature = "backend-rwkv")]
-    #[inline]
-    pub(crate) fn probs(&self) -> &[f64] {
-        &self.probs
-    }
-
-    #[cfg(feature = "backend-rwkv")]
-    #[inline]
-    pub(crate) fn probs_mut(&mut self) -> &mut [f64] {
-        &mut self.probs
+    pub(crate) fn evaluate_expert_weights(&mut self) {
+        self.compute_context_mixtures();
+        self.evaluated = false;
     }
 
     #[inline]
-    pub(crate) fn update_weights(&mut self, expert_logits: &[f64], symbol: u8) {
-        debug_assert_eq!(expert_logits.len(), self.expert_count * 256);
-        let y = symbol as usize;
-        let error_mag = (1.0 - self.probs[y]).abs();
+    pub(crate) fn expert_weights(&self) -> &[f64] {
+        &self.expert_weights
+    }
+
+    #[inline]
+    pub(crate) fn update_weights_symbol(&mut self, expert_log_probs: &[f64], min_prob: f64) {
+        debug_assert_eq!(expert_log_probs.len(), self.expert_count);
+        if !self.evaluated {
+            self.evaluate_symbol(expert_log_probs, min_prob);
+        }
+        let p_mix = self.mix_prob.max(1e-12);
+        let error_mag = (1.0 - p_mix).abs();
         if error_mag <= self.update_skip_threshold {
             return;
         }
 
-        for b in 0..256usize {
-            self.errors[b] = if b == y { 1.0 } else { 0.0 } - self.probs[b];
-        }
-
         let stage1_idx = self.stage1_context_indices();
         let stage2_idx = self.stage2_context_index();
-        let old_stage2_weights = {
-            let w = &self.stage2_table[stage2_idx].weights;
-            [w[0], w[1], w[2]]
-        };
-
+        let old_stage2_mix = self.stage2_mix.clone();
         {
             let entry2 = &mut self.stage2_table[stage2_idx];
             for k in 0..Self::STAGE1_CONTEXTS {
-                let grad = dot_wide(&self.errors, &self.stage1_out[(k * 256)..((k + 1) * 256)]);
-                entry2.weights[k] = sanitize_weight(entry2.weights[k] + self.stage2_lr * grad);
-            }
-            for b in 0..256usize {
-                entry2.bias[b] = sanitize_weight(entry2.bias[b] + self.stage2_lr * self.errors[b]);
+                let grad = old_stage2_mix[k] * (self.stage1_probs[k] - p_mix) / p_mix;
+                entry2.logits[k] = sanitize_weight(entry2.logits[k] + self.stage2_lr * grad);
             }
         }
 
-        let grad_bias_base: f64 = self.errors.iter().sum();
         for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-            let v = old_stage2_weights[k];
             let entry = &mut self.stage1_tables[k][ctx_i];
-
-            let grad_bias = grad_bias_base * v;
-            entry.bias = sanitize_weight(entry.bias + self.stage1_lr * grad_bias);
-
-            for i in 0..self.expert_count {
-                let feat = &expert_logits[(i * 256)..((i + 1) * 256)];
-                let mut grad = dot_wide(&self.errors, feat);
-                grad *= v;
-                entry.weights[i] = sanitize_weight(entry.weights[i] + self.stage1_lr * grad);
+            let r_k = old_stage2_mix[k];
+            let p_k = self.stage1_probs[k];
+            let n = self.expert_count;
+            let row = &self.stage1_mix[(k * n)..((k + 1) * n)];
+            for i in 0..n {
+                let grad = r_k * row[i] * (self.expert_probs[i] - p_k) / p_mix;
+                entry.logits[i] = sanitize_weight(entry.logits[i] + self.stage1_lr * grad);
             }
         }
+        self.evaluated = false;
     }
 
     #[inline]
@@ -248,55 +231,65 @@ impl NeuralMixCore {
         let h = ((self.history.prev1 as usize) << 8) ^ (self.history.prev2 as usize) ^ run_bucket;
         h % Self::STAGE2_TABLE_SIZE
     }
-}
 
-#[cfg(feature = "backend-rwkv")]
-#[inline]
-fn clamp_prob(p: f64, min_prob: f64) -> f64 {
-    if p.is_finite() {
-        p.max(min_prob)
-    } else {
-        min_prob
-    }
-}
+    #[inline]
+    fn compute_context_mixtures(&mut self) {
+        let stage1_idx = self.stage1_context_indices();
+        let n = self.expert_count;
+        self.expert_weights.fill(0.0);
 
-#[cfg(feature = "backend-rwkv")]
-#[inline]
-pub(crate) fn fill_log_probs_from_pdf_row(
-    pdf_row: &[f64],
-    min_prob: f64,
-    out_log_probs: &mut [f64],
-) {
-    debug_assert!(pdf_row.len() >= 256);
-    debug_assert!(out_log_probs.len() >= 256);
-    for b in 0..256usize {
-        out_log_probs[b] = clamp_prob(pdf_row[b], min_prob).ln();
-    }
-}
-
-#[inline]
-pub(crate) fn normalize_log_prob_row_and_make_logits(
-    log_probs: &mut [f64],
-    logits_out: &mut [f64],
-    min_prob: f64,
-) {
-    debug_assert!(log_probs.len() >= 256);
-    debug_assert!(logits_out.len() >= 256);
-    let min_log = min_prob.ln();
-    let row = &mut log_probs[..256];
-    let log_z = logsumexp_wide(row);
-    if !log_z.is_finite() {
-        for b in 0..256usize {
-            row[b] = min_log;
-            logits_out[b] = min_log;
+        for (k, &ctx_i) in stage1_idx.iter().enumerate() {
+            let entry = &self.stage1_tables[k][ctx_i];
+            let row = &mut self.stage1_mix[(k * n)..((k + 1) * n)];
+            softmax_into(&entry.logits, row);
         }
+
+        let stage2_idx = self.stage2_context_index();
+        let entry2 = &self.stage2_table[stage2_idx];
+        softmax_into(&entry2.logits, &mut self.stage2_mix);
+
+        for k in 0..Self::STAGE1_CONTEXTS {
+            let n = self.expert_count;
+            let row = &self.stage1_mix[(k * n)..((k + 1) * n)];
+            let r_k = self.stage2_mix[k];
+            for i in 0..n {
+                self.expert_weights[i] += r_k * row[i];
+            }
+        }
+    }
+}
+
+#[inline]
+fn softmax_into(logits: &[f64], out: &mut [f64]) {
+    debug_assert_eq!(logits.len(), out.len());
+    if out.is_empty() {
         return;
     }
-    for b in 0..256usize {
-        let v = row[b] - log_z;
-        let nv = if v.is_finite() { v } else { min_log };
-        row[b] = nv;
-        logits_out[b] = nv.max(min_log);
+    let mut max_v = f64::NEG_INFINITY;
+    for &v in logits {
+        if v > max_v {
+            max_v = v;
+        }
+    }
+    if !max_v.is_finite() {
+        let u = 1.0 / (out.len() as f64);
+        out.fill(u);
+        return;
+    }
+    let mut sum = 0.0;
+    for (dst, &v) in out.iter_mut().zip(logits.iter()) {
+        let x = (v - max_v).exp();
+        *dst = x;
+        sum += x;
+    }
+    if sum <= 0.0 || !sum.is_finite() {
+        let u = 1.0 / (out.len() as f64);
+        out.fill(u);
+        return;
+    }
+    let inv = 1.0 / sum;
+    for v in out.iter_mut() {
+        *v *= inv;
     }
 }
 

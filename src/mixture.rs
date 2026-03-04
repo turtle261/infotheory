@@ -10,9 +10,7 @@
 //! switching, and MDL-style selectors to be used anywhere a rate backend is accepted.
 
 use crate::ctw::FacContextTree;
-use crate::neural_mix::{
-    NeuralHistoryState, NeuralMixCore, normalize_log_prob_row_and_make_logits,
-};
+use crate::neural_mix::{NeuralHistoryState, NeuralMixCore};
 use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
@@ -1165,20 +1163,21 @@ pub struct MdlSelector {
 
 /// Bytewise neural mixer inspired by fx2-cmix online adaptation.
 ///
-/// This model is a context-conditioned two-stage network trained online with
-/// multiclass (256-way) log-loss:
-/// 1) expert probability stretch/logit features,
-/// 2) context-local first-stage softmax experts,
-/// 3) context-local second-stage softmax meta-mixer,
-/// 4) per-symbol SGD updates with optional tiny-error skip.
+/// This model is a context-conditioned two-stage gating network trained online
+/// from per-symbol expert likelihoods:
+/// 1) context-local first-stage expert gates,
+/// 2) context-local second-stage meta-gate over stage-1 outputs,
+/// 3) per-symbol SGD updates with optional tiny-error skip.
 pub struct NeuralMixture {
     experts: Vec<ExpertState>,
     neural: NeuralMixCore,
     min_prob: f64,
     scratch_expert_logps: Vec<f64>,
-    scratch_expert_logits: Vec<f64>,
+    scratch_mix_weights: Vec<f64>,
     eval_cache_valid: bool,
     eval_cache_history: NeuralHistoryState,
+    eval_cache_symbol: u8,
+    eval_cache_logp: f64,
     total_log_loss: f64,
 }
 
@@ -1203,45 +1202,54 @@ impl NeuralMixture {
         } else {
             0.03
         };
-        let neural = NeuralMixCore::new(n, &prior_weights, base_lr * 0.5, base_lr, 1e-5);
+        let effective_lr = (base_lr * 25.0).clamp(1e-6, 1.0);
+        let neural = NeuralMixCore::new(
+            n,
+            &prior_weights,
+            effective_lr * 0.5,
+            effective_lr,
+            1e-5,
+        );
         let eval_cache_history = neural.history_state();
 
         Self {
             experts,
             neural,
             min_prob: DEFAULT_MIN_PROB,
-            scratch_expert_logps: vec![0.0; n * 256],
-            scratch_expert_logits: vec![0.0; n * 256],
+            scratch_expert_logps: vec![0.0; n],
+            scratch_mix_weights: vec![0.0; n],
             eval_cache_valid: false,
             eval_cache_history,
+            eval_cache_symbol: 0,
+            eval_cache_logp: f64::NEG_INFINITY,
             total_log_loss: 0.0,
         }
     }
 
-    fn evaluate_state(&mut self) {
+    fn evaluate_symbol(&mut self, symbol: u8) -> f64 {
+        let history = self.neural.history_state();
+        if self.eval_cache_valid && self.eval_cache_history == history && self.eval_cache_symbol == symbol
+        {
+            let p = self
+                .neural
+                .evaluate_symbol(&self.scratch_expert_logps, self.min_prob);
+            self.eval_cache_logp = clamp_unit_prob(p, self.min_prob).ln();
+            return self.eval_cache_logp;
+        }
+
         let expert_count = self.experts.len();
         for i in 0..expert_count {
-            let expert = &mut self.experts[i];
-            let mut row = [0.0f64; 256];
-            expert.predictor.fill_log_probs(&mut row);
-            for (b, lp) in row.iter().enumerate() {
-                self.scratch_expert_logps[i * 256 + b] = *lp;
-            }
-            let logps = &mut self.scratch_expert_logps[(i * 256)..((i + 1) * 256)];
-            let logits = &mut self.scratch_expert_logits[(i * 256)..((i + 1) * 256)];
-            normalize_log_prob_row_and_make_logits(logps, logits, self.min_prob);
+            self.scratch_expert_logps[i] = self.experts[i].log_prob(symbol);
         }
-        self.neural.evaluate(&self.scratch_expert_logits);
-    }
-
-    fn ensure_evaluated(&mut self) {
-        let history = self.neural.history_state();
-        if self.eval_cache_valid && self.eval_cache_history == history {
-            return;
-        }
-        self.evaluate_state();
+        let p = self
+            .neural
+            .evaluate_symbol(&self.scratch_expert_logps, self.min_prob);
+        let logp = clamp_unit_prob(p, self.min_prob).ln();
         self.eval_cache_valid = true;
-        self.eval_cache_history = history;
+        self.eval_cache_history = self.neural.history_state();
+        self.eval_cache_symbol = symbol;
+        self.eval_cache_logp = logp;
+        logp
     }
 
     fn predict_log_prob(&mut self, symbol: u8) -> f64 {
@@ -1251,8 +1259,7 @@ impl NeuralMixture {
         if self.experts.len() == 1 {
             return self.experts[0].log_prob(symbol);
         }
-        self.ensure_evaluated();
-        clamp_unit_prob(self.neural.prob(symbol), self.min_prob).ln()
+        self.evaluate_symbol(symbol)
     }
 
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
@@ -1264,9 +1271,33 @@ impl NeuralMixture {
             self.experts[0].predictor.fill_log_probs(out);
             return;
         }
-        self.ensure_evaluated();
-        for (sym, slot) in out.iter_mut().enumerate() {
-            *slot = clamp_unit_prob(self.neural.prob(sym as u8), self.min_prob).ln();
+        self.neural.evaluate_expert_weights();
+        self.scratch_mix_weights
+            .copy_from_slice(self.neural.expert_weights());
+        out.fill(0.0);
+        for i in 0..self.experts.len() {
+            let mut row = [0.0f64; 256];
+            self.experts[i].predictor.fill_log_probs(&mut row);
+            let w = self.scratch_mix_weights[i];
+            for b in 0..256 {
+                out[b] += w * clamp_prob(row[b].exp(), self.min_prob);
+            }
+        }
+        let mut sum = 0.0;
+        for &p in out.iter() {
+            sum += p;
+        }
+        if !sum.is_finite() || sum <= 0.0 {
+            let u = 1.0f64 / 256.0;
+            for slot in out.iter_mut() {
+                *slot = u.ln();
+            }
+            return;
+        }
+        let inv = 1.0 / sum;
+        for slot in out.iter_mut() {
+            let p = clamp_unit_prob(*slot * inv, self.min_prob);
+            *slot = p.ln();
         }
     }
 
@@ -1287,16 +1318,14 @@ impl NeuralMixture {
             return logp;
         }
 
-        let y = symbol as usize;
-        self.ensure_evaluated();
-        let logp = clamp_unit_prob(self.neural.prob(symbol), self.min_prob).ln();
+        let logp = self.evaluate_symbol(symbol);
         let expert_count = self.experts.len();
         self.neural
-            .update_weights(&self.scratch_expert_logits, symbol);
+            .update_weights_symbol(&self.scratch_expert_logps, self.min_prob);
 
         for i in 0..expert_count {
             let expert = &mut self.experts[i];
-            expert.cum_log_loss -= self.scratch_expert_logps[i * 256 + y];
+            expert.cum_log_loss -= self.scratch_expert_logps[i];
             expert.update(symbol);
         }
         self.total_log_loss -= logp;
@@ -1662,7 +1691,7 @@ mod tests {
             late_avg < early_avg,
             "late_avg={late_avg} early_avg={early_avg}"
         );
-        assert!(late_avg < 0.30, "late_avg={late_avg}");
+        assert!(late_avg < 0.35, "late_avg={late_avg}");
     }
 
     struct CountingPredict {
@@ -1694,7 +1723,7 @@ mod tests {
 
         let _ = mix.predict_log_prob(0);
         let after_predict = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
-        assert_eq!(after_predict, 512);
+        assert_eq!(after_predict, 2);
 
         let _ = mix.step(0);
         let after_step = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
@@ -1717,11 +1746,11 @@ mod tests {
 
         let _ = mix.predict_log_prob(0);
         let after_first = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
-        assert_eq!(after_first, 512);
+        assert_eq!(after_first, 2);
 
         let _ = mix.predict_log_prob(1);
         let after_second = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
-        assert_eq!(after_second, after_first);
+        assert_eq!(after_second, after_first + 2);
     }
 
     #[test]

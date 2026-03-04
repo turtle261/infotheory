@@ -190,6 +190,11 @@ pub struct ContextTree {
 }
 
 impl ContextTree {
+    #[inline(always)]
+    fn root_visits(&self) -> usize {
+        self.arena.get(self.root).visits() as usize
+    }
+
     /// Creates a new `ContextTree` with the given depth.
     pub fn new(depth: usize) -> Self {
         let mut arena = CtArena::with_capacity(1024.min(1 << depth.min(16)));
@@ -217,11 +222,10 @@ impl ContextTree {
     /// Updates the tree with a new symbol.
     #[inline]
     pub fn update(&mut self, sym: Symbol) {
-        ensure_log_caches(
-            &mut self.log_int,
-            &mut self.log_half,
-            self.history.len() + 1,
-        );
+        // Cache bounds are determined by per-tree symbol counts, not history size.
+        // For update we need log_int[total_before + 1] where total_before <= root visits.
+        let upto = self.root_visits() + 1;
+        ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
         self.prepare_context();
         self.update_from_root(sym, false);
         self.history.push(sym);
@@ -233,11 +237,9 @@ impl ContextTree {
         let Some(last_sym) = self.history.pop() else {
             return;
         };
-        ensure_log_caches(
-            &mut self.log_int,
-            &mut self.log_half,
-            self.history.len() + 1,
-        );
+        // Revert uses current counts before decrement, so root visits is sufficient.
+        let upto = self.root_visits();
+        ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
         self.prepare_context();
         self.update_from_root(last_sym, true);
     }
@@ -452,6 +454,11 @@ struct ContextTreeCore {
 }
 
 impl ContextTreeCore {
+    #[inline(always)]
+    fn root_visits(&self) -> usize {
+        self.arena.get(self.root).visits() as usize
+    }
+
     fn new(depth: usize) -> Self {
         let mut arena = CtArena::with_capacity(1024.min(1 << depth.min(16)));
         let root = arena.alloc();
@@ -487,11 +494,10 @@ impl ContextTreeCore {
     /// Update tree with symbol, using shared history for context.
     #[inline]
     fn update(&mut self, sym: Symbol, shared_history: &[Symbol]) {
-        ensure_log_caches(
-            &mut self.log_int,
-            &mut self.log_half,
-            shared_history.len() + 1,
-        );
+        // Do not scale caches with global shared history length; only this tree's
+        // own visit counts are needed for KT updates.
+        let upto = self.root_visits() + 1;
+        ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
         self.prepare_context(shared_history);
         self.update_node_iterative(sym, false);
     }
@@ -499,11 +505,9 @@ impl ContextTreeCore {
     /// Revert last update, using shared history for context.
     #[inline]
     fn revert(&mut self, last_sym: Symbol, shared_history: &[Symbol]) {
-        ensure_log_caches(
-            &mut self.log_int,
-            &mut self.log_half,
-            shared_history.len() + 1,
-        );
+        // Revert uses counts prior to decrement.
+        let upto = self.root_visits();
+        ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
         self.prepare_context(shared_history);
         self.update_node_iterative(last_sym, true);
     }
@@ -784,5 +788,34 @@ mod tests {
 
         fac.revert(0);
         assert_eq!(fac.shared_history.len(), 3);
+    }
+
+    #[test]
+    fn fac_ctw_log_cache_tracks_tree_visits_not_shared_history() {
+        let mut fac = FacContextTree::new(8, 8);
+        let updates_per_tree = 512usize;
+
+        for step in 0..updates_per_tree {
+            let bit = (step & 1) == 1;
+            for bit_idx in 0..8usize {
+                fac.update(bit, bit_idx);
+            }
+        }
+
+        assert_eq!(fac.shared_history.len(), updates_per_tree * 8);
+        for tree in &fac.trees {
+            let visits = tree.arena.get(tree.root).visits() as usize;
+            assert_eq!(visits, updates_per_tree);
+            assert!(
+                tree.log_int.len() <= visits + 1,
+                "log_int grew to {} for visits={visits}",
+                tree.log_int.len()
+            );
+            assert!(
+                tree.log_half.len() <= visits + 1,
+                "log_half grew to {} for visits={visits}",
+                tree.log_half.len()
+            );
+        }
     }
 }

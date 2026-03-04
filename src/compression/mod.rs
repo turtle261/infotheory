@@ -15,9 +15,7 @@ use crate::coders::{
 };
 use crate::ctw::FacContextTree;
 use crate::mixture::DEFAULT_MIN_PROB;
-use crate::neural_mix::{
-    NeuralMixCore, fill_log_probs_from_pdf_row, normalize_log_prob_row_and_make_logits,
-};
+use crate::neural_mix::NeuralMixCore;
 use crate::rosaplus::RosaPlus;
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{MixtureKind, MixtureSpec, RateBackend};
@@ -272,6 +270,21 @@ impl CtwPredictor {
         }
         self.valid = false;
     }
+
+    #[inline]
+    fn bit_prob_one_msb(&mut self, bit_idx: usize) -> f64 {
+        debug_assert!(self.bits_per_symbol == 8);
+        debug_assert!(self.msb_first);
+        self.tree.predict(true, bit_idx).clamp(PDF_MIN, 1.0 - PDF_MIN)
+    }
+
+    #[inline]
+    fn update_bit_msb(&mut self, bit_idx: usize, bit: bool) {
+        debug_assert!(self.bits_per_symbol == 8);
+        debug_assert!(self.msb_first);
+        self.tree.update(bit, bit_idx);
+        self.valid = false;
+    }
 }
 
 #[derive(Clone)]
@@ -449,7 +462,10 @@ struct MixturePredictor {
     experts: Vec<MixExpert>,
     neural: NeuralMixCore,
     neural_logps: Vec<f64>,
-    neural_features: Vec<f64>,
+    neural_bit_modes: Vec<u8>,
+    neural_lo: Vec<usize>,
+    neural_hi: Vec<usize>,
+    neural_pdf_cdf_rows: Vec<Vec<f64>>,
     scratch: Vec<f64>,
     scratch2: Vec<f64>,
     pdf: Vec<f64>,
@@ -485,16 +501,25 @@ impl MixturePredictor {
         }
 
         let base_lr = spec.alpha.abs().clamp(1e-6, 1.0);
-        let neural =
-            NeuralMixCore::new(experts.len(), &prior_weights, base_lr * 0.5, base_lr, 1e-5);
+        let effective_lr = (base_lr * 25.0).clamp(1e-6, 1.0);
+        let neural = NeuralMixCore::new(
+            experts.len(),
+            &prior_weights,
+            effective_lr * 0.5,
+            effective_lr,
+            1e-5,
+        );
         Ok(Self {
             kind: spec.kind,
             alpha: spec.alpha.clamp(1e-12, 1.0 - 1e-12),
             decay: spec.decay.unwrap_or(1.0).clamp(0.0, 1.0),
             experts,
             neural,
-            neural_logps: vec![0.0; spec.experts.len() * 256],
-            neural_features: vec![0.0; spec.experts.len() * 256],
+            neural_logps: vec![0.0; spec.experts.len()],
+            neural_bit_modes: vec![0; spec.experts.len()],
+            neural_lo: vec![0; spec.experts.len()],
+            neural_hi: vec![256; spec.experts.len()],
+            neural_pdf_cdf_rows: vec![vec![0.0; 257]; spec.experts.len()],
             scratch: Vec::new(),
             scratch2: Vec::new(),
             pdf: vec![0.0; 256],
@@ -504,10 +529,7 @@ impl MixturePredictor {
 
     fn ensure_pdf(&mut self) -> Result<&[f64]> {
         if self.valid {
-            return match self.kind {
-                MixtureKind::Neural if self.experts.len() > 1 => Ok(self.neural.probs()),
-                _ => Ok(&self.pdf),
-            };
+            return Ok(&self.pdf);
         }
         match self.kind {
             MixtureKind::Neural => {
@@ -519,20 +541,21 @@ impl MixturePredictor {
                     self.valid = true;
                     return Ok(&self.pdf);
                 }
-                self.neural_features.fill(0.0);
-
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    let epdf = e.predictor.pdf_next()?;
-                    let row_logps = &mut self.neural_logps[(i * 256)..((i + 1) * 256)];
-                    fill_log_probs_from_pdf_row(epdf, PDF_MIN, row_logps);
-                    let row_logits = &mut self.neural_features[(i * 256)..((i + 1) * 256)];
-                    normalize_log_prob_row_and_make_logits(row_logps, row_logits, PDF_MIN);
+                self.neural.evaluate_expert_weights();
+                let n = self.experts.len();
+                self.scratch.resize(n, 0.0);
+                self.scratch.copy_from_slice(self.neural.expert_weights());
+                self.pdf.fill(0.0);
+                for i in 0..n {
+                    let epdf = self.experts[i].predictor.pdf_next()?;
+                    let w = self.scratch[i];
+                    for b in 0..256 {
+                        self.pdf[b] += w * epdf[b];
+                    }
                 }
-
-                self.neural.evaluate(&self.neural_features);
-                normalize_pdf(self.neural.probs_mut());
+                normalize_pdf(&mut self.pdf);
                 self.valid = true;
-                return Ok(self.neural.probs());
+                return Ok(&self.pdf);
             }
             _ => {
                 self.pdf.fill(0.0);
@@ -640,11 +663,17 @@ impl MixturePredictor {
                     self.valid = false;
                     return Ok(());
                 }
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    e.cum_log_loss -= self.neural_logps[i * 256 + y];
+                let n = self.experts.len();
+                self.neural_logps.resize(n, 0.0);
+                for i in 0..n {
+                    let p = self.experts[i].predictor.pdf_next()?[y].max(PDF_MIN);
+                    let lp = p.ln();
+                    self.neural_logps[i] = lp;
+                    self.experts[i].cum_log_loss -= lp;
                 }
-                self.neural.update_weights(&self.neural_features, symbol);
-
+                self.neural.evaluate_symbol(&self.neural_logps, PDF_MIN);
+                self.neural
+                    .update_weights_symbol(&self.neural_logps, PDF_MIN);
                 for e in &mut self.experts {
                     e.predictor.update(symbol)?;
                 }
@@ -654,6 +683,154 @@ impl MixturePredictor {
 
         self.valid = false;
         Ok(())
+    }
+
+    #[inline]
+    fn can_fast_neural_ac_bitwise(&self) -> bool {
+        if self.kind != MixtureKind::Neural || self.experts.len() <= 1 {
+            return false;
+        }
+        self.experts.iter().any(|e| {
+            if let RatePdfPredictor::Ctw(ctw) = &*e.predictor {
+                ctw.bits_per_symbol == 8 && ctw.msb_first
+            } else {
+                false
+            }
+        })
+    }
+
+    fn ac_step_neural_bitwise<F>(&mut self, mut choose_bit: F) -> Result<u8>
+    where
+        F: FnMut(usize, f64) -> Result<u8>,
+    {
+        debug_assert_eq!(self.kind, MixtureKind::Neural);
+        debug_assert!(self.experts.len() > 1);
+
+        let n = self.experts.len();
+        self.neural.evaluate_expert_weights();
+        self.scratch.resize(n, 0.0);
+        self.scratch.copy_from_slice(self.neural.expert_weights());
+        self.scratch2.resize(n, 1.0);
+        self.scratch2.fill(1.0);
+        self.neural_logps.resize(n, 0.0);
+        self.neural_bit_modes.resize(n, 0);
+        self.neural_lo.resize(n, 0);
+        self.neural_hi.resize(n, 256);
+        if self.neural_pdf_cdf_rows.len() < n {
+            self.neural_pdf_cdf_rows
+                .resize_with(n, || vec![0.0; 257]);
+        }
+
+        for i in 0..n {
+            self.neural_bit_modes[i] = 1;
+            self.neural_lo[i] = 0;
+            self.neural_hi[i] = 256;
+
+            let mut handled_ctw = false;
+            if let RatePdfPredictor::Ctw(ctw) = &mut *self.experts[i].predictor {
+                if ctw.bits_per_symbol == 8 && ctw.msb_first {
+                    self.neural_bit_modes[i] = 0;
+                    handled_ctw = true;
+                }
+            }
+            if handled_ctw {
+                continue;
+            }
+
+            let pdf = self.experts[i].predictor.pdf_next()?;
+            let row = &mut self.neural_pdf_cdf_rows[i];
+            if row.len() != 257 {
+                row.resize(257, 0.0);
+            }
+            row[0] = 0.0;
+            for b in 0..256usize {
+                row[b + 1] = row[b] + pdf[b].max(PDF_MIN);
+            }
+            let norm = row[256];
+            if norm.is_finite() && norm > 0.0 {
+                let inv = 1.0 / norm;
+                for v in row.iter_mut() {
+                    *v *= inv;
+                }
+            } else {
+                for (j, v) in row.iter_mut().enumerate() {
+                    *v = (j as f64) / 256.0;
+                }
+            }
+        }
+
+        let mut symbol = 0u8;
+        for bit_idx in 0..8usize {
+            let mut denom = 0.0;
+            let mut numer1 = 0.0;
+
+            for i in 0..n {
+                let p1 = if self.neural_bit_modes[i] == 0 {
+                    match &mut *self.experts[i].predictor {
+                        RatePdfPredictor::Ctw(ctw) => ctw.bit_prob_one_msb(bit_idx),
+                        _ => 0.5,
+                    }
+                } else {
+                    let lo = self.neural_lo[i];
+                    let hi = self.neural_hi[i];
+                    let mid = (lo + hi) >> 1;
+                    let row = &self.neural_pdf_cdf_rows[i];
+                    let total = (row[hi] - row[lo]).max(PDF_MIN);
+                    let one = (row[hi] - row[mid]).max(0.0);
+                    (one / total).clamp(PDF_MIN, 1.0 - PDF_MIN)
+                };
+                self.neural_logps[i] = p1;
+                let wp = self.scratch[i] * self.scratch2[i];
+                denom += wp;
+                numer1 += wp * p1;
+            }
+
+            let p1_mix = if denom.is_finite() && denom > 0.0 {
+                (numer1 / denom).clamp(PDF_MIN, 1.0 - PDF_MIN)
+            } else {
+                0.5
+            };
+            let bit = choose_bit(bit_idx, p1_mix)? & 1;
+            symbol |= bit << (7 - bit_idx);
+
+            for i in 0..n {
+                let p1 = self.neural_logps[i];
+                let pb = if bit == 1 { p1 } else { 1.0 - p1 };
+                self.scratch2[i] = (self.scratch2[i] * pb).max(PDF_MIN);
+
+                if self.neural_bit_modes[i] == 0 {
+                    if let RatePdfPredictor::Ctw(ctw) = &mut *self.experts[i].predictor {
+                        ctw.update_bit_msb(bit_idx, bit == 1);
+                    }
+                } else {
+                    let lo = self.neural_lo[i];
+                    let hi = self.neural_hi[i];
+                    let mid = (lo + hi) >> 1;
+                    if bit == 1 {
+                        self.neural_lo[i] = mid;
+                        self.neural_hi[i] = hi;
+                    } else {
+                        self.neural_lo[i] = lo;
+                        self.neural_hi[i] = mid;
+                    }
+                }
+            }
+        }
+
+        for i in 0..n {
+            let lp = self.scratch2[i].max(PDF_MIN).ln();
+            self.neural_logps[i] = lp;
+            self.experts[i].cum_log_loss -= lp;
+            if self.neural_bit_modes[i] != 0 {
+                self.experts[i].predictor.update(symbol)?;
+            }
+        }
+
+        self.neural.evaluate_symbol(&self.neural_logps, PDF_MIN);
+        self.neural.update_weights_symbol(&self.neural_logps, PDF_MIN);
+        self.neural.update_history(symbol);
+        self.valid = false;
+        Ok(symbol)
     }
 }
 
@@ -741,7 +918,43 @@ impl RatePdfPredictor {
     }
 }
 
+#[inline]
+fn binary_split_from_prob_one(p1: f64) -> u32 {
+    let p1 = p1.clamp(PDF_MIN, 1.0 - PDF_MIN);
+    let p0 = 1.0 - p1;
+    let mut split = (p0 * (CDF_TOTAL as f64)) as u32;
+    if split == 0 {
+        split = 1;
+    } else if split >= CDF_TOTAL {
+        split = CDF_TOTAL - 1;
+    }
+    split
+}
+
 fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Vec<u8>> {
+    if let RatePdfPredictor::Mixture(mix) = predictor {
+        if mix.can_fast_neural_ac_bitwise() {
+            let mut out = Vec::new();
+            {
+                let mut enc = ArithmeticEncoder::new(&mut out);
+                for &symbol in data {
+                    mix.ac_step_neural_bitwise(|bit_idx, p1_mix| {
+                        let bit = (symbol >> (7 - bit_idx)) & 1;
+                        let split = binary_split_from_prob_one(p1_mix);
+                        if bit == 0 {
+                            enc.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
+                        } else {
+                            enc.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
+                        }
+                        Ok(bit)
+                    })?;
+                }
+                let _ = enc.finish()?;
+            }
+            return Ok(out);
+        }
+    }
+
     let mut out = Vec::new();
     {
         let mut enc = ArithmeticEncoder::new(&mut out);
@@ -763,6 +976,22 @@ fn decode_payload_ac(
     out_len: usize,
     predictor: &mut RatePdfPredictor,
 ) -> Result<Vec<u8>> {
+    if let RatePdfPredictor::Mixture(mix) = predictor {
+        if mix.can_fast_neural_ac_bitwise() {
+            let mut dec = ArithmeticDecoder::new(payload)?;
+            let mut out = Vec::with_capacity(out_len);
+            for _ in 0..out_len {
+                let symbol = mix.ac_step_neural_bitwise(|_, p1_mix| {
+                    let split = binary_split_from_prob_one(p1_mix);
+                    let cdf = [0u32, split, CDF_TOTAL];
+                    Ok(dec.decode_symbol_counts(&cdf, CDF_TOTAL)? as u8)
+                })?;
+                out.push(symbol);
+            }
+            return Ok(out);
+        }
+    }
+
     let mut dec = ArithmeticDecoder::new(payload)?;
     let mut out = Vec::with_capacity(out_len);
     let mut cdf = vec![0u32; 257];
