@@ -1,15 +1,4 @@
-// rwkvzip - High-performance neural network compressor using RWKV7.
-//
-// This library provides lossless compression by leveraging the RWKV7 language model's
-// predictive capabilities to generate probability distributions, which are then
-// compressed via entropy coding (arithmetic coding or rANS).
-//
-// # Architecture
-//
-// - **Byte-level compression**: Operates directly on raw bytes (vocab_size=256)
-// - **Infinite context**: RWKV7's recurrent architecture maintains state indefinitely
-// - **Portable SIMD optimized**: `wide`-based kernels with ISA-specific codegen
-// - **Correct-by-construction**: Information-theoretically sound implementation
+// mambazip - deterministic CPU-first Mamba-1 compressor/runtime.
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -21,11 +10,12 @@ use std::sync::Arc;
 use crate::backends::llm_policy::{
     self, LlmPolicy, OptimizerKind, PolicyAction, PolicyRuntime, split_method_policy_segments,
 };
-/// RWKV7 model core (weights/state/kernels).
-pub mod rwkv7;
-/// Shared entropy coders used by rwkvzip containers.
+/// Mamba-1 model internals.
+pub mod mamba1;
+
+/// Shared entropy coders.
 pub use crate::coders;
-/// Backward-compatible re-export of generic coder selection enum.
+/// Backward-compatible coder re-export.
 pub use crate::coders::CoderType;
 
 use crate::coders::{
@@ -33,110 +23,71 @@ use crate::coders::{
     CDF_TOTAL, Cdf, quantize_pdf_to_cdf_inplace, quantize_pdf_to_rans_cdf_with_buffer,
 };
 
-/// RWKV7 model configuration type.
-pub use rwkv7::Config;
-/// RWKV7 model type.
-pub use rwkv7::Model;
-/// RWKV7 temporary scratch buffers used during forward passes.
-pub use rwkv7::ScratchBuffers;
-/// RWKV7 recurrent state container.
-pub use rwkv7::State;
+/// Mamba model config.
+pub use mamba1::Config;
+/// Mamba model.
+pub use mamba1::Model;
+/// Mamba reusable scratch buffers.
+pub use mamba1::ScratchBuffers;
+/// Mamba recurrent state.
+pub use mamba1::State;
 
-// =============================================================================
-// File Format Constants
-// =============================================================================
-
-/// File format magic number: "GPTZ" in little-endian (0x47505A54 as ASCII).
-/// Used to identify valid rwkvzip compressed files.
-pub const MAGIC: u32 = 0x5a505447;
-
-/// File format version. Increment on breaking changes to ensure compatibility.
-pub const VERSION: u8 = 2;
-
-/// Vocabulary size for byte-level compression.
-/// Each byte (0-255) is treated as a separate symbol.
+/// File format magic for mambazip payloads.
+pub const MAGIC: u32 = 0x5a424d4d; // "MMBZ"
+/// File format version.
+pub const VERSION: u8 = 1;
+/// Byte vocabulary size.
 pub const VOCAB_SIZE: usize = 256;
-fn optimizer_sidecar_path(model_path: &Path) -> PathBuf {
-    model_path.with_extension("opt.safetensors")
-}
-const RWKV_TRAIN_SCOPES: &[&str] = &[
+const MAMBA_TRAIN_SCOPES: &[&str] = &[
     "embed",
-    "pre_norm",
-    "attn_norm",
-    "ffn_norm",
-    "attn",
-    "ffn",
+    "layer_norm",
+    "mixer_conv",
+    "mixer_ssm",
+    "mixer_proj",
     "head",
     "bias",
     "all",
     "none",
 ];
 
-struct CountingWriter {
-    n: u64,
-}
-
-impl CountingWriter {
-    #[inline]
-    fn new() -> Self {
-        Self { n: 0 }
-    }
-
-    #[inline]
-    fn bytes_written(&self) -> u64 {
-        self.n
-    }
-}
-
-impl Write for CountingWriter {
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = buf.len();
-        self.n = self.n.saturating_add(n as u64);
-        Ok(n)
-    }
-
-    #[inline]
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+#[inline]
+fn optimizer_sidecar_path(model_path: &Path) -> PathBuf {
+    model_path.with_extension("opt.safetensors")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// Online adaptation mode for RWKV output-bias updates.
+/// Online adaptation mode for Mamba output-bias updates.
 pub enum OnlineTrainMode {
-    /// Disable online updates.
+    /// Disable updates.
     None,
-    /// SGD updates on output bias.
+    /// SGD updates.
     Sgd,
-    /// Adam updates on output bias.
+    /// Adam updates.
     Adam,
 }
 
 #[derive(Clone, Debug)]
-/// Configuration for online RWKV model instantiation and adaptation.
+/// Online/runtime model construction config.
 pub struct OnlineConfig {
-    /// Hidden size (must be multiple of 64 after clamping).
+    /// Hidden width.
     pub hidden: usize,
-    /// Number of recurrent layers.
+    /// Number of layers.
     pub layers: usize,
-    /// Feed-forward intermediate size.
+    /// Mamba inner width (`d_inner`).
     pub intermediate: usize,
-    /// Low-rank dimension for decay projection.
-    pub decay_rank: usize,
-    /// Low-rank dimension for key-like projection.
-    pub a_rank: usize,
-    /// Low-rank dimension for value-like projection.
-    pub v_rank: usize,
-    /// Low-rank dimension for gate projection.
-    pub g_rank: usize,
-    /// Random seed used for online-random model initialization.
+    /// Mamba state width (`d_state`).
+    pub state: usize,
+    /// Mamba depthwise conv width (`d_conv`).
+    pub conv: usize,
+    /// Delta rank (`dt_rank`).
+    pub dt_rank: usize,
+    /// RNG seed for random init.
     pub seed: u64,
     /// Online training mode.
     pub train_mode: OnlineTrainMode,
-    /// Learning rate for online adaptation.
+    /// Learning rate.
     pub lr: f32,
-    /// Update stride (apply update every `stride` tokens).
+    /// Update stride.
     pub stride: usize,
 }
 
@@ -145,11 +96,10 @@ impl Default for OnlineConfig {
         Self {
             hidden: 256,
             layers: 6,
-            intermediate: 1024,
-            decay_rank: 32,
-            a_rank: 32,
-            v_rank: 32,
-            g_rank: 64,
+            intermediate: 512,
+            state: 16,
+            conv: 4,
+            dt_rank: 16,
             seed: 0,
             train_mode: OnlineTrainMode::None,
             lr: 0.001,
@@ -159,26 +109,17 @@ impl Default for OnlineConfig {
 }
 
 impl OnlineConfig {
-    /// Convert to a validated RWKV model configuration.
-    pub fn to_rwkv_config(&self) -> Result<Config> {
-        let hidden = self.hidden.max(64);
-        if !hidden.is_multiple_of(64) {
-            bail!("rwkv hidden must be a multiple of 64 (got {hidden})");
-        }
-        let num_heads = hidden / 64;
+    /// Convert to validated model config.
+    pub fn to_mamba_config(&self) -> Result<Config> {
         let cfg = Config {
-            vocab_size: 256,
-            hidden_size: hidden,
+            vocab_size: VOCAB_SIZE,
+            hidden_size: self.hidden.max(16),
             num_layers: self.layers.max(1),
-            num_heads,
-            head_dim: 64,
-            intermediate_size: self.intermediate.max(1),
+            inner_size: self.intermediate.max(16),
+            state_size: self.state.max(1),
+            conv_kernel: self.conv.max(1),
+            dt_rank: self.dt_rank.max(1),
             layer_norm_eps: 1e-5,
-            group_norm_eps: 64e-5,
-            decay_low_rank: self.decay_rank.max(1),
-            a_low_rank: self.a_rank.max(1),
-            v_low_rank: self.v_rank.max(1),
-            g_low_rank: self.g_rank.max(1),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -186,14 +127,14 @@ impl OnlineConfig {
 }
 
 #[derive(Clone, Debug)]
-/// Parsed RWKV method specification.
+/// Parsed method specification.
 pub enum MethodSpec {
-    /// Load a model from disk.
+    /// Load model from filesystem.
     File {
         path: PathBuf,
         policy: Option<LlmPolicy>,
     },
-    /// Build an online/random model from configuration.
+    /// Construct random model + online adaptation config.
     Online {
         cfg: OnlineConfig,
         policy: Option<LlmPolicy>,
@@ -213,14 +154,14 @@ struct OnlineRuntime {
     out_bias: Vec<f32>,
     adam_m: Option<Vec<f32>>,
     adam_v: Option<Vec<f32>>,
-    full_adam: Option<rwkv7::FullAdamState>,
+    full_adam: Option<mamba1::FullAdamState>,
     lm_head_adam_m: Option<Vec<f32>>,
     lm_head_adam_v: Option<Vec<f32>>,
     adam_t: usize,
 }
 
 #[derive(Clone)]
-/// Snapshot of mutable runtime state used for reversible scoring.
+/// Snapshot of mutable runtime state.
 pub struct RuntimeSnapshot {
     model: Arc<Model>,
     scratch: ScratchBuffers,
@@ -286,107 +227,6 @@ impl OnlineRuntime {
     }
 }
 
-fn apply_online_lm_head_update(
-    model: &mut Model,
-    online: &mut OnlineRuntime,
-    hidden: &[f32],
-    symbol: u8,
-    pdf: &[f64],
-    lr: f32,
-    optimizer: OptimizerKind,
-    train_head: bool,
-    train_bias: bool,
-    clip: f32,
-) {
-    let h = hidden.len();
-    if h == 0 {
-        return;
-    }
-
-    let head = model.lm_head_weights_mut();
-    let vocab_rows = head.len() / h;
-    let n = online.out_bias.len().min(pdf.len()).min(vocab_rows);
-
-    match optimizer {
-        OptimizerKind::Sgd => {
-            for (i, p_raw) in pdf.iter().enumerate().take(n) {
-                let p = (*p_raw).clamp(1e-12, 1.0) as f32;
-                let target = if i == symbol as usize { 1.0 } else { 0.0 };
-                let mut grad = target - p;
-                if clip > 0.0 {
-                    grad = grad.clamp(-clip, clip);
-                }
-                if train_bias {
-                    online.out_bias[i] += lr * grad;
-                }
-
-                if train_head {
-                    let row_off = i * h;
-                    for j in 0..h {
-                        head[row_off + j] += lr * grad * hidden[j];
-                    }
-                }
-            }
-        }
-        OptimizerKind::Adam => {
-            online.adam_t = online.adam_t.saturating_add(1);
-            let t = online.adam_t as i32;
-            let b1 = 0.9f32;
-            let b2 = 0.999f32;
-            let eps = 1e-8f32;
-            let bias_corr1 = 1.0 - b1.powi(t);
-            let bias_corr2 = 1.0 - b2.powi(t);
-            if online.adam_m.is_none() || online.adam_v.is_none() {
-                online.adam_m = Some(vec![0.0; online.out_bias.len()]);
-                online.adam_v = Some(vec![0.0; online.out_bias.len()]);
-            }
-            if online.lm_head_adam_m.is_none() || online.lm_head_adam_v.is_none() {
-                online.lm_head_adam_m = Some(vec![0.0; vocab_rows * h]);
-                online.lm_head_adam_v = Some(vec![0.0; vocab_rows * h]);
-            }
-            let bm = online.adam_m.as_mut().expect("adam_m initialized");
-            let bv = online.adam_v.as_mut().expect("adam_v initialized");
-            let hm = online
-                .lm_head_adam_m
-                .as_mut()
-                .expect("lm_head_adam_m initialized");
-            let hv = online
-                .lm_head_adam_v
-                .as_mut()
-                .expect("lm_head_adam_v initialized");
-            for i in 0..n {
-                let p = pdf[i].clamp(1e-12, 1.0) as f32;
-                let target = if i == symbol as usize { 1.0 } else { 0.0 };
-                let mut grad = target - p;
-                if clip > 0.0 {
-                    grad = grad.clamp(-clip, clip);
-                }
-
-                if train_bias {
-                    bm[i] = b1 * bm[i] + (1.0 - b1) * grad;
-                    bv[i] = b2 * bv[i] + (1.0 - b2) * grad * grad;
-                    let m_hat = bm[i] / bias_corr1;
-                    let v_hat = bv[i] / bias_corr2;
-                    online.out_bias[i] += lr * m_hat / (v_hat.sqrt() + eps);
-                }
-
-                if train_head {
-                    let row_off = i * h;
-                    for j in 0..h {
-                        let idx = row_off + j;
-                        let g = grad * hidden[j];
-                        hm[idx] = b1 * hm[idx] + (1.0 - b1) * g;
-                        hv[idx] = b2 * hv[idx] + (1.0 - b2) * g * g;
-                        let m_hat_w = hm[idx] / bias_corr1;
-                        let v_hat_w = hv[idx] / bias_corr2;
-                        head[idx] += lr * m_hat_w / (v_hat_w.sqrt() + eps);
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn policy_uses_adam(policy: &LlmPolicy) -> bool {
     use llm_policy::ScheduleRule;
     for rule in &policy.schedule {
@@ -415,11 +255,10 @@ fn policy_uses_adam(policy: &LlmPolicy) -> bool {
 fn scope_needs_full_trace(scope: &llm_policy::TrainScopeSet) -> bool {
     scope.all
         || scope.contains("embed")
-        || scope.contains("pre_norm")
-        || scope.contains("attn_norm")
-        || scope.contains("ffn_norm")
-        || scope.contains("attn")
-        || scope.contains("ffn")
+        || scope.contains("layer_norm")
+        || scope.contains("mixer_conv")
+        || scope.contains("mixer_ssm")
+        || scope.contains("mixer_proj")
 }
 
 fn policy_needs_full_trace(policy: &LlmPolicy) -> bool {
@@ -447,22 +286,6 @@ fn policy_needs_full_trace(policy: &LlmPolicy) -> bool {
     false
 }
 
-fn scope_from_train_action(train: &llm_policy::TrainAction) -> rwkv7::TrainScopeMask {
-    if train.scope.all {
-        return rwkv7::TrainScopeMask::all();
-    }
-    rwkv7::TrainScopeMask {
-        embed: train.scope.contains("embed"),
-        pre_norm: train.scope.contains("pre_norm"),
-        attn_norm: train.scope.contains("attn_norm"),
-        ffn_norm: train.scope.contains("ffn_norm"),
-        attn: train.scope.contains("attn"),
-        ffn: train.scope.contains("ffn"),
-        head: train.scope.contains("head"),
-        bias: train.scope.contains("bias"),
-    }
-}
-
 fn cfg_to_method_string(cfg: &OnlineConfig) -> String {
     let train = match cfg.train_mode {
         OnlineTrainMode::None => "none",
@@ -470,14 +293,13 @@ fn cfg_to_method_string(cfg: &OnlineConfig) -> String {
         OnlineTrainMode::Adam => "adam",
     };
     format!(
-        "cfg:hidden={},layers={},intermediate={},decay_rank={},a_rank={},v_rank={},g_rank={},seed={},train={},lr={},stride={}",
+        "cfg:hidden={},layers={},intermediate={},state={},conv={},dt_rank={},seed={},train={},lr={},stride={}",
         cfg.hidden,
         cfg.layers,
         cfg.intermediate,
-        cfg.decay_rank,
-        cfg.a_rank,
-        cfg.v_rank,
-        cfg.g_rank,
+        cfg.state,
+        cfg.conv,
+        cfg.dt_rank,
         cfg.seed,
         train,
         cfg.lr,
@@ -584,7 +406,7 @@ fn parse_cfg_positional(csv: &str) -> Result<OnlineConfig> {
         );
     }
 
-    let cfg = OnlineConfig {
+    Ok(OnlineConfig {
         hidden: parse_usize(vals[0], "hidden")?,
         intermediate: parse_usize(vals[1], "intermediate")?,
         layers: parse_usize(vals[2], "layers")?,
@@ -597,11 +419,10 @@ fn parse_cfg_positional(csv: &str) -> Result<OnlineConfig> {
             1
         },
         ..OnlineConfig::default()
-    };
-    Ok(cfg)
+    })
 }
 
-/// Parse a method string into a concrete RWKV method specification.
+/// Parse a method string.
 ///
 /// Supported formats:
 /// - `file:/path/to/model.safetensors`
@@ -611,20 +432,20 @@ fn parse_cfg_positional(csv: &str) -> Result<OnlineConfig> {
 /// - existing model path
 pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
     let (base, policy_segment) = split_method_policy_segments(method)?;
-    let parse_policy = |s: &str| llm_policy::parse_policy_segment(s, RWKV_TRAIN_SCOPES);
+    let parse_policy = |s: &str| llm_policy::parse_policy_segment(s, MAMBA_TRAIN_SCOPES);
     let policy = policy_segment
         .as_deref()
         .map(parse_policy)
         .transpose()
-        .context("failed to parse rwkv policy segment")?;
+        .context("failed to parse mamba policy segment")?;
 
     if let Some(path) = base.strip_prefix("file:") {
         let p = PathBuf::from(path.trim());
         if p.as_os_str().is_empty() {
-            bail!("empty file path in rwkv method");
+            bail!("empty file path in mamba method");
         }
         if policy.as_ref().and_then(|p| p.load_from.as_ref()).is_some() {
-            bail!("rwkv method cannot use policy load_from together with file:<path>");
+            bail!("mamba method cannot use policy load_from together with file:<path>");
         }
         return Ok(MethodSpec::File { path: p, policy });
     }
@@ -651,15 +472,14 @@ pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
                 "hidden" => cfg.hidden = parse_usize(val, "hidden")?,
                 "layers" => cfg.layers = parse_usize(val, "layers")?,
                 "intermediate" => cfg.intermediate = parse_usize(val, "intermediate")?,
-                "decay_rank" => cfg.decay_rank = parse_usize(val, "decay_rank")?,
-                "a_rank" => cfg.a_rank = parse_usize(val, "a_rank")?,
-                "v_rank" => cfg.v_rank = parse_usize(val, "v_rank")?,
-                "g_rank" => cfg.g_rank = parse_usize(val, "g_rank")?,
+                "state" | "d_state" => cfg.state = parse_usize(val, "state")?,
+                "conv" | "d_conv" => cfg.conv = parse_usize(val, "conv")?,
+                "dt_rank" => cfg.dt_rank = parse_usize(val, "dt_rank")?,
                 "seed" => cfg.seed = parse_u64(val, "seed")?,
                 "lr" => cfg.lr = parse_f32(val, "lr")?,
                 "stride" => cfg.stride = parse_usize(val, "stride")?,
                 "train" | "train_mode" => cfg.train_mode = parse_train_mode_token(val)?,
-                other => bail!("unknown rwkv cfg key '{other}'"),
+                other => bail!("unknown mamba cfg key '{other}'"),
             }
         }
         return Ok(MethodSpec::Online { cfg, policy });
@@ -668,7 +488,7 @@ pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
     let plain = PathBuf::from(base.trim());
     if plain.exists() {
         if policy.as_ref().and_then(|p| p.load_from.as_ref()).is_some() {
-            bail!("rwkv method cannot use policy load_from together with file path");
+            bail!("mamba method cannot use policy load_from together with file path");
         }
         return Ok(MethodSpec::File {
             path: plain,
@@ -684,41 +504,30 @@ pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
     }
 
     bail!(
-        "rwkv method must be 'file:<path>', 'cfg:<k=v,...>', positional cfg CSV, or an existing model path"
+        "mamba method must be 'file:<path>', 'cfg:<k=v,...>', positional cfg CSV, or an existing model path"
     );
 }
 
-// =============================================================================
-// File Header
-// =============================================================================
-
-/// Header structure for compressed data files.
-///
-/// Layout (18 bytes total):
-/// - magic: 4 bytes (little-endian u32)
-/// - version: 1 byte
-/// - coder: 1 byte (0=AC, 1=rANS)
-/// - original_len: 8 bytes (little-endian u64)
-/// - crc32: 4 bytes (little-endian u32)
+/// Framing header for mambazip streams.
 #[derive(Debug, Clone)]
 pub struct Header {
-    /// Magic number for format identification (must be MAGIC).
+    /// Magic number.
     pub magic: u32,
-    /// Format version for compatibility checking.
+    /// Version byte.
     pub version: u8,
-    /// Coder type used (0=AC, 1=rANS).
+    /// Coder type (0=AC,1=rANS).
     pub coder: u8,
-    /// Original uncompressed data length in bytes.
+    /// Original length.
     pub original_len: u64,
-    /// CRC32 checksum of original data for integrity verification.
+    /// CRC32 checksum of original data.
     pub crc32: u32,
 }
 
 impl Header {
-    /// Total header size in bytes.
-    pub const SIZE: usize = 4 + 1 + 1 + 8 + 4; // 18 bytes
+    /// Header serialized size.
+    pub const SIZE: usize = 4 + 1 + 1 + 8 + 4;
 
-    /// Create a new header for compressed data.
+    /// Construct a new header.
     pub fn new(coder: CoderType, original_len: u64, crc32: u32) -> Self {
         Self {
             magic: MAGIC,
@@ -732,7 +541,7 @@ impl Header {
         }
     }
 
-    /// Serialize header to a writer (little-endian format).
+    /// Write header.
     pub fn write<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_all(&self.magic.to_le_bytes())?;
         w.write_all(&[self.version])?;
@@ -742,7 +551,7 @@ impl Header {
         Ok(())
     }
 
-    /// Deserialize header from a reader (little-endian format).
+    /// Read header.
     pub fn read<R: Read>(r: &mut R) -> Result<Self> {
         let mut buf4 = [0u8; 4];
         let mut buf8 = [0u8; 8];
@@ -752,7 +561,7 @@ impl Header {
         let magic = u32::from_le_bytes(buf4);
         if magic != MAGIC {
             bail!(
-                "Invalid magic number: expected 0x{:08X}, got 0x{:08X}",
+                "invalid magic number: expected 0x{:08X}, got 0x{:08X}",
                 MAGIC,
                 magic
             );
@@ -762,7 +571,7 @@ impl Header {
         let version = buf1[0];
         if version > VERSION {
             bail!(
-                "Unsupported version: {} (max supported: {})",
+                "unsupported version: {} (max supported: {})",
                 version,
                 VERSION
             );
@@ -786,7 +595,7 @@ impl Header {
         })
     }
 
-    /// Get the coder type from the header byte.
+    /// Decode coder selection.
     pub fn coder_type(&self) -> CoderType {
         match self.coder {
             0 => CoderType::AC,
@@ -795,42 +604,318 @@ impl Header {
     }
 }
 
-// =============================================================================
-// CRC32 Checksum
-// =============================================================================
-
-/// Compute CRC32 checksum for data integrity verification.
-///
-/// Uses the crc32fast crate for hardware-accelerated computation.
+/// Compute CRC32 of data.
 pub fn crc32(data: &[u8]) -> u32 {
     crate::coders::crc32(data)
 }
 
-// =============================================================================
-// Compressor
-// =============================================================================
+struct CountingWriter {
+    n: u64,
+}
 
-/// Main compressor/decompressor that combines RWKV7 inference with entropy coding.
-///
-/// The compressor maintains internal state and pre-allocated buffers to minimize
-/// allocations during the compression/decompression hot path.
+impl CountingWriter {
+    #[inline]
+    fn new() -> Self {
+        Self { n: 0 }
+    }
+
+    #[inline]
+    fn bytes_written(&self) -> u64 {
+        self.n
+    }
+}
+
+impl Write for CountingWriter {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = buf.len();
+        self.n = self.n.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Stateful compressor built around a Mamba model.
 pub struct Compressor {
-    /// RWKV7 model for generating probability distributions.
+    /// Model weights.
     pub model: Arc<Model>,
-    /// Model state (recurrent hidden states).
+    /// Recurrent state.
     pub state: State,
-    /// Scratch buffers for model forward passes.
+    /// Reusable scratch.
     pub scratch: ScratchBuffers,
-    /// Pre-allocated PDF buffer (eliminates allocations in compression loop).
+    /// Reusable PDF buffer.
     pub pdf_buffer: Vec<f64>,
-    /// Reusable AC CDF buffer (vocab_size + 1 entries).
-    pub cdf_buffer_ac: Vec<u32>,
-    /// Reusable rANS CDF buffer (vocab_size + 1 entries).
-    pub cdf_buffer_rans: Vec<u32>,
-    /// Scratch frequencies for rANS quantization.
-    pub rans_freq_buffer: Vec<i64>,
+    cdf_buffer_ac: Vec<u32>,
+    cdf_buffer_rans: Vec<u32>,
+    rans_freq_buffer: Vec<i64>,
     online: Option<OnlineRuntime>,
     source_model_path: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_method_spec_accepts_cfg_and_positional() {
+        let named = parse_method_spec(
+            "cfg:hidden=64,layers=2,intermediate=96,state=8,conv=3,dt_rank=4,train=sgd,lr=0.01,stride=2;policy:schedule=0..100:infer",
+        )
+        .expect("named cfg");
+        match named {
+            MethodSpec::Online { cfg, .. } => {
+                assert_eq!(cfg.hidden, 64);
+                assert_eq!(cfg.layers, 2);
+                assert_eq!(cfg.intermediate, 96);
+                assert_eq!(cfg.state, 8);
+                assert_eq!(cfg.conv, 3);
+                assert_eq!(cfg.dt_rank, 4);
+                assert!(matches!(cfg.train_mode, OnlineTrainMode::Sgd));
+                assert_eq!(cfg.stride, 2);
+            }
+            _ => panic!("expected online cfg"),
+        }
+
+        let positional =
+            parse_method_spec("cfg:64,96,2,adam,123,0.001,3;policy:schedule=0..100:infer")
+                .expect("positional cfg");
+        match positional {
+            MethodSpec::Online { cfg, .. } => {
+                assert_eq!(cfg.hidden, 64);
+                assert_eq!(cfg.intermediate, 96);
+                assert_eq!(cfg.layers, 2);
+                assert!(matches!(cfg.train_mode, OnlineTrainMode::Adam));
+                assert_eq!(cfg.seed, 123);
+                assert_eq!(cfg.stride, 3);
+            }
+            _ => panic!("expected online cfg"),
+        }
+    }
+
+    #[test]
+    fn parse_method_spec_accepts_cfg_without_policy() {
+        let spec = parse_method_spec("cfg:hidden=64,layers=2,intermediate=96").expect("cfg");
+        match spec {
+            MethodSpec::Online { cfg, policy } => {
+                assert_eq!(cfg.hidden, 64);
+                assert_eq!(cfg.layers, 2);
+                assert_eq!(cfg.intermediate, 96);
+                assert!(policy.is_none());
+            }
+            _ => panic!("expected online cfg"),
+        }
+    }
+
+    #[test]
+    fn canonical_method_omits_policy_when_absent() {
+        let c = Compressor::new_from_method("cfg:hidden=64,layers=1,intermediate=96")
+            .expect("online model");
+        assert_eq!(
+            c.online_method_string(),
+            Some(
+                "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=0,train=none,lr=0.001,stride=1"
+            )
+        );
+    }
+
+    #[test]
+    fn export_reload_roundtrip_reproducible() {
+        let cfg = Config {
+            vocab_size: 256,
+            hidden_size: 32,
+            num_layers: 2,
+            inner_size: 48,
+            state_size: 8,
+            conv_kernel: 3,
+            dt_rank: 4,
+            layer_norm_eps: 1e-5,
+        };
+        let model = Arc::new(Model::new_random(cfg.clone(), 42).expect("random model"));
+        let mut c1 = Compressor::new_from_model(model);
+        c1.reset_and_prime();
+        let _ = c1.cross_entropy_from_current(b"mamba test").expect("score");
+
+        let base = std::env::temp_dir().join(format!(
+            "infotheory_mamba_rt_{}_{}.safetensors",
+            std::process::id(),
+            c1.tokens_processed()
+        ));
+        c1.export_online(&base).expect("export");
+
+        let mut c2 = Compressor::new(&base).expect("reload");
+        c2.reset_and_prime();
+        let h1 = c1.cross_entropy(b"abcabc").expect("h1");
+        let h2 = c2.cross_entropy(b"abcabc").expect("h2");
+        assert!((h1 - h2).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(base.with_extension("json"));
+    }
+
+    #[test]
+    fn online_training_updates_lm_head_weights() {
+        let method = "cfg:hidden=64,layers=2,intermediate=96,state=8,conv=3,dt_rank=4,seed=11,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.9)";
+        let mut c = Compressor::new_from_method(method).expect("online model");
+        c.reset_and_prime();
+        let before = c.model.lm_head_weights()[0..64].to_vec();
+        let _ = c
+            .cross_entropy_from_current(b"online mamba weight update")
+            .expect("score");
+        let after = &c.model.lm_head_weights()[0..64];
+        let mut changed = false;
+        for i in 0..before.len() {
+            if before[i].to_bits() != after[i].to_bits() {
+                changed = true;
+                break;
+            }
+        }
+        assert!(
+            changed,
+            "expected LM-head weights to change under online training"
+        );
+    }
+
+    #[test]
+    fn online_training_scope_all_updates_non_head_params() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=adam,lr=0.002,stride=1;policy:schedule=0..100:train(scope=mixer_proj,opt=adam,lr=0.002,stride=1,bptt=1,clip=0,momentum=0.9)";
+        let mut c = Compressor::new_from_method(method).expect("online model");
+        c.reset_and_prime();
+        let before_head = c.model.lm_head_weights()[0..64].to_vec();
+        let before_model = (*c.model).clone();
+        let _ = c
+            .cross_entropy_from_current(b"scope mixer_proj should train non-head mamba params")
+            .expect("score");
+        let after_head = &c.model.lm_head_weights()[0..64];
+        let mut head_unchanged = true;
+        for i in 0..before_head.len() {
+            if before_head[i].to_bits() != after_head[i].to_bits() {
+                head_unchanged = false;
+                break;
+            }
+        }
+        assert!(
+            head_unchanged,
+            "expected LM-head weights to remain unchanged under scope=mixer_proj"
+        );
+
+        // Compare logits from fresh state to detect non-head parameter movement.
+        let mut s1 = before_model.new_state();
+        let mut sc1 = ScratchBuffers::new(before_model.config());
+        let mut s2 = c.model.new_state();
+        let mut sc2 = ScratchBuffers::new(c.model.config());
+        let logits_before = before_model.forward(&mut sc1, 0, &mut s1);
+        let logits_after = c.model.forward(&mut sc2, 0, &mut s2);
+        let mut changed = false;
+        for idx in 0..logits_before.len().min(logits_after.len()) {
+            if logits_before[idx].to_bits() != logits_after[idx].to_bits() {
+                changed = true;
+                break;
+            }
+        }
+        assert!(
+            changed,
+            "expected non-head parameters to update under scope=mixer_proj"
+        );
+    }
+
+    #[test]
+    fn online_training_scope_all_bptt_gt_one_rejected() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=adam,lr=0.002,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.002,stride=1,bptt=2,clip=0,momentum=0.9)";
+        let mut c = Compressor::new_from_method(method).expect("online model");
+        c.reset_and_prime();
+        let err = c.cross_entropy_from_current(b"abcd").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("bptt=1"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn export_reload_roundtrip_preserves_full_adam_resume() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=17,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
+        let data = b"mamba full adam export/reload deterministic continuation";
+        let mut c1 = Compressor::new_from_method(method).expect("online model");
+        let _ = c1.compress(data, CoderType::AC).expect("pre-train pass");
+
+        let model_path = std::env::temp_dir().join(format!(
+            "infotheory_mamba_full_adam_{}_{}.safetensors",
+            std::process::id(),
+            c1.tokens_processed()
+        ));
+        c1.export_online(&model_path).expect("export");
+        assert!(model_path.with_extension("opt.safetensors").exists());
+
+        let out1 = c1
+            .compress(data, CoderType::AC)
+            .expect("post-export compress");
+        let mut c2 = Compressor::new(&model_path).expect("reload");
+        let out2 = c2.compress(data, CoderType::AC).expect("reload compress");
+        assert_eq!(out1, out2, "full-adam resume must be bit-identical");
+
+        let _ = std::fs::remove_file(&model_path);
+        let _ = std::fs::remove_file(model_path.with_extension("json"));
+        let _ = std::fs::remove_file(model_path.with_extension("opt.safetensors"));
+    }
+
+    #[test]
+    fn clone_keeps_full_training_trace_mode() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=18,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
+        let mut c = Compressor::new_from_method(method).expect("online model");
+        let mut cloned = c.clone();
+        cloned.reset_and_prime();
+        let _ = cloned
+            .cross_entropy_from_current(b"clone must preserve training-trace mode")
+            .expect("full-training step should succeed after clone");
+        c.reset_and_prime();
+        let _ = c
+            .cross_entropy_from_current(b"baseline run")
+            .expect("baseline full-training step");
+    }
+
+    #[test]
+    fn runtime_snapshot_restores_non_head_training_state() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=19,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
+        let mut c = Compressor::new_from_method(method).expect("online model");
+        c.reset_and_prime();
+        c.absorb_chain(&[b"prior context".as_slice()])
+            .expect("prefix");
+        let snap = c.snapshot_runtime();
+
+        let _ = c
+            .cross_entropy_from_current(b"mutate model before restore")
+            .expect("mutation pass");
+
+        c.restore_runtime(&snap);
+        let score_a = c
+            .cross_entropy_from_current(b"query after restore")
+            .expect("score a");
+
+        c.restore_runtime(&snap);
+        let score_b = c
+            .cross_entropy_from_current(b"query after restore")
+            .expect("score b");
+
+        assert!((score_a - score_b).abs() < 1e-12);
+    }
+
+    #[test]
+    fn clone_preserves_non_head_training_trace() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=20,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
+        let mut c = Compressor::new_from_method(method).expect("online model");
+        c.reset_and_prime();
+        c.absorb_chain(&[b"clone trace prefix".as_slice()])
+            .expect("prefix");
+
+        let mut cloned = c.clone();
+        let score = cloned
+            .cross_entropy_from_current(b"clone trace query")
+            .expect("cloned full-training step");
+        assert!(score.is_finite());
+    }
 }
 
 impl Clone for Compressor {
@@ -849,13 +934,7 @@ impl Clone for Compressor {
 }
 
 impl Compressor {
-    /// Create a new compressor with the given model.
-    ///
-    /// # Arguments
-    /// * `model_path` - Path to RWKV7 model weights (.safetensors format)
-    ///
-    /// # Returns
-    /// A new Compressor ready for compression/decompression operations.
+    /// Create compressor by loading model path.
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self> {
         let model_path = model_path.as_ref();
         let model = Arc::new(Model::load(model_path)?);
@@ -865,12 +944,12 @@ impl Compressor {
         Ok(c)
     }
 
-    /// Load a model from disk and wrap it in `Arc`.
+    /// Load model from path and wrap in Arc.
     pub fn load_model<P: AsRef<Path>>(model_path: P) -> Result<Arc<Model>> {
         Ok(Arc::new(Model::load(model_path)?))
     }
 
-    /// Create a compressor from a preloaded model.
+    /// Create compressor from preloaded model.
     pub fn new_from_model(model: Arc<Model>) -> Self {
         let state = model.new_state();
         let vocab_size = model.config().vocab_size;
@@ -879,7 +958,7 @@ impl Compressor {
             model,
             state,
             scratch,
-            pdf_buffer: vec![0.0f64; vocab_size],
+            pdf_buffer: vec![0.0; vocab_size],
             cdf_buffer_ac: vec![0u32; vocab_size + 1],
             cdf_buffer_rans: vec![0u32; vocab_size + 1],
             rans_freq_buffer: vec![0i64; vocab_size],
@@ -888,7 +967,7 @@ impl Compressor {
         }
     }
 
-    /// Create a compressor from a user method string.
+    /// Create compressor from method string.
     pub fn new_from_method(method: &str) -> Result<Self> {
         match parse_method_spec(method)? {
             MethodSpec::File { path, policy } => {
@@ -921,30 +1000,27 @@ impl Compressor {
                 Ok(c)
             }
             MethodSpec::Online { cfg, policy } => {
-                let rwcfg = cfg.to_rwkv_config()?;
+                let mcfg = cfg.to_mamba_config()?;
                 let model = if let Some(load_from) =
                     policy.as_ref().and_then(|p| p.load_from.as_ref())
                 {
                     let loaded = Arc::new(Model::load(load_from)?);
                     let loaded_cfg = loaded.config();
-                    let shape_ok = loaded_cfg.vocab_size == rwcfg.vocab_size
-                        && loaded_cfg.hidden_size == rwcfg.hidden_size
-                        && loaded_cfg.num_layers == rwcfg.num_layers
-                        && loaded_cfg.num_heads == rwcfg.num_heads
-                        && loaded_cfg.head_dim == rwcfg.head_dim
-                        && loaded_cfg.intermediate_size == rwcfg.intermediate_size
-                        && loaded_cfg.decay_low_rank == rwcfg.decay_low_rank
-                        && loaded_cfg.a_low_rank == rwcfg.a_low_rank
-                        && loaded_cfg.v_low_rank == rwcfg.v_low_rank
-                        && loaded_cfg.g_low_rank == rwcfg.g_low_rank;
+                    let shape_ok = loaded_cfg.vocab_size == mcfg.vocab_size
+                        && loaded_cfg.hidden_size == mcfg.hidden_size
+                        && loaded_cfg.num_layers == mcfg.num_layers
+                        && loaded_cfg.inner_size == mcfg.inner_size
+                        && loaded_cfg.state_size == mcfg.state_size
+                        && loaded_cfg.conv_kernel == mcfg.conv_kernel
+                        && loaded_cfg.dt_rank == mcfg.dt_rank;
                     if !shape_ok {
                         bail!(
-                            "rwkv policy load_from shape mismatch with cfg (strict match required)"
+                            "mamba policy load_from shape mismatch with cfg (strict match required)"
                         );
                     }
                     loaded
                 } else {
-                    Arc::new(Model::new_random(rwcfg, cfg.seed)?)
+                    Arc::new(Model::new_random(mcfg, cfg.seed)?)
                 };
                 let mut c = Self::new_from_model(model);
                 let mut canonical_method = cfg_to_method_string(&cfg);
@@ -966,10 +1042,7 @@ impl Compressor {
         }
     }
 
-    /// Reset the model state to initial values.
-    ///
-    /// Call this between independent compression/decompression operations
-    /// to ensure a clean state.
+    /// Reset state.
     pub fn reset(&mut self) {
         self.state.reset();
     }
@@ -986,7 +1059,7 @@ impl Compressor {
         self.prepare_policy_stream(total_symbols)
     }
 
-    /// Reset state and prime the first predictive distribution.
+    /// Reset and compute initial distribution.
     pub fn reset_and_prime(&mut self) {
         self.state.reset();
         let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
@@ -994,7 +1067,7 @@ impl Compressor {
         Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
     }
 
-    /// Capture runtime state for later restoration.
+    /// Capture runtime snapshot.
     pub fn snapshot_runtime(&self) -> RuntimeSnapshot {
         RuntimeSnapshot {
             model: self.model.clone(),
@@ -1005,7 +1078,7 @@ impl Compressor {
         }
     }
 
-    /// Restore previously captured runtime state.
+    /// Restore runtime snapshot.
     pub fn restore_runtime(&mut self, snapshot: &RuntimeSnapshot) {
         self.model = snapshot.model.clone();
         self.scratch = snapshot.scratch.clone();
@@ -1014,7 +1087,7 @@ impl Compressor {
         self.online = snapshot.online.clone();
     }
 
-    /// Absorb a sequence of byte slices as conditioning context.
+    /// Condition the model on a chain of prefixes.
     pub fn absorb_chain(&mut self, parts: &[&[u8]]) -> Result<()> {
         let total = parts
             .iter()
@@ -1033,15 +1106,15 @@ impl Compressor {
         Ok(())
     }
 
-    /// Score bytes from the current predictive state.
+    /// Cross entropy from current runtime state.
     pub fn cross_entropy_from_current(&mut self, data: &[u8]) -> Result<f64> {
         if data.is_empty() {
             return Ok(0.0);
         }
         self.prepare_policy_stream(Some(data.len() as u64))?;
-        let mut total_bits = 0.0f64;
+        let mut total_bits = 0.0;
         for &byte in data {
-            let p = self.pdf_buffer[byte as usize];
+            let p = self.pdf_buffer[byte as usize].max(1e-300);
             total_bits -= p.log2();
             self.online_update_from_current_pdf(byte)?;
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
@@ -1053,45 +1126,53 @@ impl Compressor {
         Ok(total_bits / (data.len() as f64))
     }
 
-    /// Returns `true` when the compressor is in online-adaptation mode.
+    /// Whether online adaptation is enabled.
     pub fn is_online(&self) -> bool {
         self.online.is_some()
     }
 
-    /// Number of tokens processed by the online updater.
+    /// Tokens processed by online updater.
     pub fn tokens_processed(&self) -> u64 {
         self.online.as_ref().map_or(0, |s| s.tokens_processed)
     }
 
-    /// Canonical method string for online mode, if enabled.
+    /// Canonical online method string.
     pub fn online_method_string(&self) -> Option<&str> {
         self.online.as_ref().map(|s| s.canonical_method.as_str())
     }
 
-    /// Get the vocabulary size (should always be 256 for byte-level).
+    /// Vocabulary size.
     pub fn vocab_size(&self) -> usize {
         self.model.config().vocab_size
     }
 
-    /// Apply optional online bias to logits and emit normalized PDF.
+    /// Convert logits to PDF with online bias if active.
     pub fn online_apply_logits_bias(&self, logits: &[f32], pdf_out: &mut [f64]) {
         let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         Self::logits_to_pdf(logits, bias, pdf_out);
     }
 
-    /// Convert logits (and optional bias) to a normalized PDF.
+    /// Convert logits + optional bias into stable normalized PDF.
     pub fn logits_to_pdf(logits: &[f32], bias: Option<&[f32]>, pdf_out: &mut [f64]) {
         softmax_pdf_floor_with_bias(logits, bias, pdf_out);
     }
 
-    /// Snapshot current online output bias, if online mode is active.
+    /// Snapshot online bias only.
     pub fn online_bias_snapshot(&self) -> Option<Vec<f32>> {
         self.online.as_ref().map(|o| o.out_bias.clone())
     }
 
-    fn resolve_online_train_action(
-        online: &mut OnlineRuntime,
-    ) -> Result<(OptimizerKind, f32, u64, rwkv7::TrainScopeMask, usize, f32)> {
+    /// Apply one online update using external PDF.
+    pub fn online_update_from_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
+        self.online_update_with_pdf(symbol, pdf)
+    }
+
+    fn online_update_with_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
+        let Some(online) = self.online.as_mut() else {
+            return Ok(());
+        };
+        online.tokens_processed = online.tokens_processed.saturating_add(1);
+
         let mut optimizer = match online.cfg.train_mode {
             OnlineTrainMode::None => OptimizerKind::Sgd,
             OnlineTrainMode::Sgd => OptimizerKind::Sgd,
@@ -1099,7 +1180,7 @@ impl Compressor {
         };
         let mut lr = online.cfg.lr.max(0.0);
         let mut stride = online.cfg.stride.max(1) as u64;
-        let mut scope = rwkv7::TrainScopeMask::default();
+        let mut scope = mamba1::TrainScopeMask::default();
         let default_train = !matches!(online.cfg.train_mode, OnlineTrainMode::None);
         scope.head = default_train;
         scope.bias = default_train;
@@ -1109,36 +1190,31 @@ impl Compressor {
         if let Some(action) = online.next_policy_action()? {
             match action {
                 PolicyAction::Infer => {
-                    scope = rwkv7::TrainScopeMask::default();
+                    scope = mamba1::TrainScopeMask::default();
                 }
                 PolicyAction::Train(train) => {
                     optimizer = train.optimizer;
                     lr = train.hyper.lr.max(0.0);
                     stride = train.hyper.stride.max(1) as u64;
-                    bptt = train.hyper.bptt.max(1);
                     clip = train.hyper.clip.max(0.0);
-                    scope = scope_from_train_action(&train);
+                    bptt = train.hyper.bptt.max(1);
+                    if train.scope.all {
+                        scope = mamba1::TrainScopeMask::all();
+                    } else {
+                        scope = mamba1::TrainScopeMask::default();
+                        scope.embed = train.scope.contains("embed");
+                        scope.layer_norm = train.scope.contains("layer_norm");
+                        scope.mixer_conv = train.scope.contains("mixer_conv");
+                        scope.mixer_ssm = train.scope.contains("mixer_ssm");
+                        scope.mixer_proj = train.scope.contains("mixer_proj");
+                        scope.head = train.scope.contains("head");
+                        scope.bias = train.scope.contains("bias");
+                    }
                 }
             }
         }
 
-        Ok((optimizer, lr, stride, scope, bptt, clip))
-    }
-
-    /// Apply one online update using externally supplied predictive PDF.
-    pub fn online_update_from_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
-        self.online_update_with_pdf(symbol, pdf)
-    }
-
-    fn online_update_with_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
-        let model_template = self.model.clone();
-        let Some(online) = self.online.as_mut() else {
-            return Ok(());
-        };
-        online.tokens_processed = online.tokens_processed.saturating_add(1);
-
-        let (optimizer, lr, stride, scope, bptt, clip) = Self::resolve_online_train_action(online)?;
-        if !scope.trains_any_params() {
+        if !scope.trains_model_params() && !scope.bias {
             return Ok(());
         }
         online.policy_train_steps = online.policy_train_steps.saturating_add(1);
@@ -1149,8 +1225,18 @@ impl Compressor {
             return Ok(());
         }
 
-        if bptt > 1 && scope.trains_non_head_params() {
-            bail!("rwkv full-parameter online training currently supports bptt=1");
+        if bptt > 1
+            && (scope.embed
+                || scope.layer_norm
+                || scope.mixer_conv
+                || scope.mixer_ssm
+                || scope.mixer_proj)
+        {
+            bail!("mamba full-parameter online training currently supports bptt=1");
+        }
+
+        if scope.trains_model_params() {
+            self.scratch.set_capture_train_trace(true);
         }
 
         if matches!(optimizer, OptimizerKind::Adam) {
@@ -1158,22 +1244,11 @@ impl Compressor {
                 online.adam_m = Some(vec![0.0; online.out_bias.len()]);
                 online.adam_v = Some(vec![0.0; online.out_bias.len()]);
             }
-            if scope.trains_non_head_params() && online.full_adam.is_none() {
-                online.full_adam = Some(model_template.new_full_adam_state());
+            if scope.trains_model_params() && online.full_adam.is_none() {
+                online.full_adam = Some(self.model.as_ref().new_full_adam_state());
             }
         }
 
-        // Preserve legacy fast-path throughput for pure head/bias updates.
-        if !scope.trains_non_head_params() {
-            let hidden = self.scratch.lm_head_input();
-            let model = Arc::make_mut(&mut self.model);
-            apply_online_lm_head_update(
-                model, online, hidden, symbol, pdf, lr, optimizer, scope.head, scope.bias, clip,
-            );
-            return Ok(());
-        }
-
-        self.scratch.set_capture_train_trace(true);
         let model = Arc::make_mut(&mut self.model);
         let OnlineRuntime {
             out_bias,
@@ -1215,14 +1290,53 @@ impl Compressor {
     }
 
     fn online_update_from_current_pdf(&mut self, symbol: u8) -> Result<()> {
-        let model_template = self.model.clone();
         let Some(online) = self.online.as_mut() else {
             return Ok(());
         };
         online.tokens_processed = online.tokens_processed.saturating_add(1);
 
-        let (optimizer, lr, stride, scope, bptt, clip) = Self::resolve_online_train_action(online)?;
-        if !scope.trains_any_params() {
+        let mut optimizer = match online.cfg.train_mode {
+            OnlineTrainMode::None => OptimizerKind::Sgd,
+            OnlineTrainMode::Sgd => OptimizerKind::Sgd,
+            OnlineTrainMode::Adam => OptimizerKind::Adam,
+        };
+        let mut lr = online.cfg.lr.max(0.0);
+        let mut stride = online.cfg.stride.max(1) as u64;
+        let mut scope = mamba1::TrainScopeMask::default();
+        let default_train = !matches!(online.cfg.train_mode, OnlineTrainMode::None);
+        scope.head = default_train;
+        scope.bias = default_train;
+        let mut bptt = 1usize;
+        let mut clip = 0.0f32;
+
+        if let Some(action) = online.next_policy_action()? {
+            match action {
+                PolicyAction::Infer => {
+                    scope = mamba1::TrainScopeMask::default();
+                }
+                PolicyAction::Train(train) => {
+                    optimizer = train.optimizer;
+                    lr = train.hyper.lr.max(0.0);
+                    stride = train.hyper.stride.max(1) as u64;
+                    clip = train.hyper.clip.max(0.0);
+                    bptt = train.hyper.bptt.max(1);
+                    if train.scope.all {
+                        scope = mamba1::TrainScopeMask::all();
+                    } else {
+                        scope = mamba1::TrainScopeMask::default();
+                        scope.embed = train.scope.contains("embed");
+                        scope.layer_norm = train.scope.contains("layer_norm");
+                        scope.mixer_conv = train.scope.contains("mixer_conv");
+                        scope.mixer_ssm = train.scope.contains("mixer_ssm");
+                        scope.mixer_proj = train.scope.contains("mixer_proj");
+                        scope.head = train.scope.contains("head");
+                        scope.bias = train.scope.contains("bias");
+                    }
+                }
+            }
+        }
+
+        if !scope.trains_model_params() && !scope.bias {
             return Ok(());
         }
         online.policy_train_steps = online.policy_train_steps.saturating_add(1);
@@ -1233,31 +1347,28 @@ impl Compressor {
             return Ok(());
         }
 
-        if bptt > 1 && scope.trains_non_head_params() {
-            bail!("rwkv full-parameter online training currently supports bptt=1");
+        if bptt > 1
+            && (scope.embed
+                || scope.layer_norm
+                || scope.mixer_conv
+                || scope.mixer_ssm
+                || scope.mixer_proj)
+        {
+            bail!("mamba full-parameter online training currently supports bptt=1");
         }
-
+        if scope.trains_model_params() {
+            self.scratch.set_capture_train_trace(true);
+        }
         if matches!(optimizer, OptimizerKind::Adam) {
             if scope.bias && (online.adam_m.is_none() || online.adam_v.is_none()) {
                 online.adam_m = Some(vec![0.0; online.out_bias.len()]);
                 online.adam_v = Some(vec![0.0; online.out_bias.len()]);
             }
-            if scope.trains_non_head_params() && online.full_adam.is_none() {
-                online.full_adam = Some(model_template.new_full_adam_state());
+            if scope.trains_model_params() && online.full_adam.is_none() {
+                online.full_adam = Some(self.model.as_ref().new_full_adam_state());
             }
         }
 
-        if !scope.trains_non_head_params() {
-            let hidden = self.scratch.lm_head_input();
-            let model = Arc::make_mut(&mut self.model);
-            let pdf = &self.pdf_buffer;
-            apply_online_lm_head_update(
-                model, online, hidden, symbol, pdf, lr, optimizer, scope.head, scope.bias, clip,
-            );
-            return Ok(());
-        }
-
-        self.scratch.set_capture_train_trace(true);
         let model = Arc::make_mut(&mut self.model);
         let pdf = &self.pdf_buffer;
         let OnlineRuntime {
@@ -1299,7 +1410,7 @@ impl Compressor {
         Ok(())
     }
 
-    /// Export model weights and JSON sidecar metadata.
+    /// Export model and online sidecar.
     pub fn export_online<P: AsRef<Path>>(&self, model_path: P) -> Result<()> {
         let model_path = model_path.as_ref();
         self.model.save_safetensors(model_path)?;
@@ -1333,10 +1444,9 @@ impl Compressor {
                     "hidden": online.cfg.hidden,
                     "layers": online.cfg.layers,
                     "intermediate": online.cfg.intermediate,
-                    "decay_rank": online.cfg.decay_rank,
-                    "a_rank": online.cfg.a_rank,
-                    "v_rank": online.cfg.v_rank,
-                    "g_rank": online.cfg.g_rank,
+                    "state": online.cfg.state,
+                    "conv": online.cfg.conv,
+                    "dt_rank": online.cfg.dt_rank,
                     "seed": online.cfg.seed,
                     "lr": online.cfg.lr,
                     "stride": online.cfg.stride.max(1),
@@ -1359,7 +1469,7 @@ impl Compressor {
             })
         };
 
-        fs::write(&sidecar, serde_json::to_vec_pretty(&meta)?)?;
+        fs::write(sidecar, serde_json::to_vec_pretty(&meta)?)?;
         Ok(())
     }
 
@@ -1371,6 +1481,7 @@ impl Compressor {
         if !sidecar.exists() {
             return Ok(());
         }
+
         let raw = fs::read(&sidecar)?;
         let v: serde_json::Value = serde_json::from_slice(&raw)?;
         let parse_vec_f32 = |key: &str| -> Option<Vec<f32>> {
@@ -1388,6 +1499,7 @@ impl Compressor {
                     .map(|x| x.as_f64().unwrap_or(0.0) as f32)
                     .collect::<Vec<f32>>()
             });
+
         let method = v
             .get("method")
             .and_then(|m| m.as_str())
@@ -1400,11 +1512,12 @@ impl Compressor {
         let policy = v
             .get("policy")
             .and_then(|p| p.as_str())
-            .and_then(|s| llm_policy::parse_policy_segment(s, RWKV_TRAIN_SCOPES).ok());
+            .and_then(|s| llm_policy::parse_policy_segment(s, MAMBA_TRAIN_SCOPES).ok());
         let tokens = v
             .get("tokens_processed")
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
+
         if let Some(mut out_bias) = output_bias {
             out_bias.resize(self.vocab_size(), 0.0);
             let mut cfg = OnlineConfig::default();
@@ -1418,17 +1531,14 @@ impl Compressor {
                 if let Some(x) = cfg_v.get("intermediate").and_then(|x| x.as_u64()) {
                     cfg.intermediate = x as usize;
                 }
-                if let Some(x) = cfg_v.get("decay_rank").and_then(|x| x.as_u64()) {
-                    cfg.decay_rank = x as usize;
+                if let Some(x) = cfg_v.get("state").and_then(|x| x.as_u64()) {
+                    cfg.state = x as usize;
                 }
-                if let Some(x) = cfg_v.get("a_rank").and_then(|x| x.as_u64()) {
-                    cfg.a_rank = x as usize;
+                if let Some(x) = cfg_v.get("conv").and_then(|x| x.as_u64()) {
+                    cfg.conv = x as usize;
                 }
-                if let Some(x) = cfg_v.get("v_rank").and_then(|x| x.as_u64()) {
-                    cfg.v_rank = x as usize;
-                }
-                if let Some(x) = cfg_v.get("g_rank").and_then(|x| x.as_u64()) {
-                    cfg.g_rank = x as usize;
+                if let Some(x) = cfg_v.get("dt_rank").and_then(|x| x.as_u64()) {
+                    cfg.dt_rank = x as usize;
                 }
                 if let Some(x) = cfg_v.get("seed").and_then(|x| x.as_u64()) {
                     cfg.seed = x;
@@ -1449,6 +1559,7 @@ impl Compressor {
                 .as_ref()
                 .map(policy_needs_full_trace)
                 .unwrap_or(false);
+
             self.online = Some(OnlineRuntime {
                 cfg,
                 canonical_method: method,
@@ -1497,21 +1608,7 @@ impl Compressor {
         Ok(())
     }
 
-    /// Compress data using the specified entropy coder.
-    ///
-    /// # Arguments
-    /// * `data` - Raw bytes to compress
-    /// * `coder` - Entropy coder to use (AC or rANS)
-    ///
-    /// # Returns
-    /// Compressed data including header with checksum.
-    pub fn compress(&mut self, data: &[u8], coder: CoderType) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        self.compress_into(data, coder, &mut output)?;
-        Ok(output)
-    }
-
-    /// Compress into an arbitrary writer.
+    /// Compress into writer.
     pub fn compress_into<W: Write>(
         &mut self,
         data: &[u8],
@@ -1520,20 +1617,18 @@ impl Compressor {
     ) -> Result<()> {
         self.state.reset();
         self.prepare_policy_stream(Some(data.len() as u64))?;
-
         let checksum = crc32(data);
         let header = Header::new(coder, data.len() as u64, checksum);
         header.write(w)?;
 
         match coder {
-            CoderType::AC => self.compress_ac(data, w)?,
-            CoderType::RANS => self.compress_rans(data, w)?,
+            CoderType::AC => self.compress_ac_iter(data.iter().copied(), w)?,
+            CoderType::RANS => self.compress_rans_iter(data.iter().copied(), w)?,
         }
-
         Ok(())
     }
 
-    /// Compress a chain of byte slices into an arbitrary writer.
+    /// Compress a chain of byte slices into writer.
     pub fn compress_chain_into<W: Write>(
         &mut self,
         parts: &[&[u8]],
@@ -1548,9 +1643,8 @@ impl Compressor {
             total_len = total_len.saturating_add(p.len() as u64);
             hasher.update(p);
         }
-        let checksum = hasher.finalize();
         self.prepare_policy_stream(Some(total_len))?;
-
+        let checksum = hasher.finalize();
         let header = Header::new(coder, total_len, checksum);
         header.write(w)?;
 
@@ -1559,27 +1653,28 @@ impl Compressor {
             CoderType::AC => self.compress_ac_iter(it, w)?,
             CoderType::RANS => self.compress_rans_iter(it, w)?,
         }
-
         Ok(())
     }
 
-    /// Return compressed byte size without materializing output bytes.
+    /// Return compressed size without output allocation.
     pub fn compress_size(&mut self, data: &[u8], coder: CoderType) -> Result<u64> {
         let mut w = CountingWriter::new();
         self.compress_into(data, coder, &mut w)?;
         Ok(w.bytes_written())
     }
 
-    /// Return compressed byte size for chained inputs.
+    /// Return compressed size for chained inputs.
     pub fn compress_size_chain(&mut self, parts: &[&[u8]], coder: CoderType) -> Result<u64> {
         let mut w = CountingWriter::new();
         self.compress_chain_into(parts, coder, &mut w)?;
         Ok(w.bytes_written())
     }
 
-    /// Compress using arithmetic coding.
-    fn compress_ac<W: Write>(&mut self, data: &[u8], output: &mut W) -> Result<()> {
-        self.compress_ac_iter(data.iter().copied(), output)
+    /// Compress to bytes.
+    pub fn compress(&mut self, data: &[u8], coder: CoderType) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.compress_into(data, coder, &mut out)?;
+        Ok(out)
     }
 
     fn compress_ac_iter<I, W: Write>(&mut self, data: I, output: &mut W) -> Result<()>
@@ -1588,7 +1683,6 @@ impl Compressor {
     {
         let mut encoder = ArithmeticEncoder::new(output);
 
-        // Prime the model with a null byte to establish initial state
         let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
         Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
@@ -1596,12 +1690,11 @@ impl Compressor {
         for byte in data {
             quantize_pdf_to_cdf_inplace(&self.pdf_buffer, &mut self.cdf_buffer_ac);
             let sym = byte as usize;
-            let c_lo = self.cdf_buffer_ac[sym] as u64;
-            let c_hi = self.cdf_buffer_ac[sym + 1] as u64;
-            encoder.encode_counts(c_lo, c_hi, CDF_TOTAL as u64)?;
+            let lo = self.cdf_buffer_ac[sym] as u64;
+            let hi = self.cdf_buffer_ac[sym + 1] as u64;
+            encoder.encode_counts(lo, hi, CDF_TOTAL as u64)?;
             self.online_update_from_current_pdf(byte)?;
 
-            // Update model state with actual byte for next prediction
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
@@ -1613,19 +1706,12 @@ impl Compressor {
         Ok(())
     }
 
-    /// Compress using rANS coding with block-based encoding.
-    fn compress_rans<W: Write>(&mut self, data: &[u8], output: &mut W) -> Result<()> {
-        self.compress_rans_iter(data.iter().copied(), output)
-    }
-
     fn compress_rans_iter<I, W: Write>(&mut self, data: I, output: &mut W) -> Result<()>
     where
         I: IntoIterator<Item = u8>,
     {
-        // Use blocked encoder (128KB blocks) for streaming large files
         let mut encoder = BlockedRansEncoder::new();
 
-        // Prime the model with a null byte
         let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
         Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
@@ -1645,7 +1731,6 @@ impl Compressor {
             encoder.encode(cdf);
             self.online_update_from_current_pdf(byte)?;
 
-            // Update model state
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
@@ -1653,42 +1738,28 @@ impl Compressor {
             Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
-        // Finish encoding and write blocks
         let blocks = encoder.finish();
-
-        // Write block count
         output.write_all(&(blocks.len() as u32).to_le_bytes())?;
-
-        // Write each block with length prefix
         for block in &blocks {
             output.write_all(&(block.len() as u32).to_le_bytes())?;
             output.write_all(block)?;
         }
-
         Ok(())
     }
 
-    /// Decompress data.
-    ///
-    /// # Arguments
-    /// * `data` - Compressed data (must include header)
-    ///
-    /// # Returns
-    /// Original decompressed data. Returns error if checksum doesn't match.
+    /// Decompress bytes.
     pub fn decompress(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let mut cursor = Cursor::new(data);
         let header = Header::read(&mut cursor)?;
 
         self.state.reset();
         self.prepare_policy_stream(Some(header.original_len))?;
-
         let compressed = &data[Header::SIZE..];
         let result = match header.coder_type() {
             CoderType::AC => self.decompress_ac(compressed, header.original_len as usize)?,
             CoderType::RANS => self.decompress_rans(compressed, header.original_len as usize)?,
         };
 
-        // Verify checksum for data integrity
         let actual_crc = crc32(&result);
         if actual_crc != header.crc32 {
             bail!(
@@ -1697,17 +1768,13 @@ impl Compressor {
                 actual_crc
             );
         }
-
         Ok(result)
     }
 
-    /// Decompress using arithmetic coding.
     fn decompress_ac(&mut self, compressed: &[u8], original_len: usize) -> Result<Vec<u8>> {
         let mut decoder = ArithmeticDecoder::new(compressed)?;
-
         let mut result = Vec::with_capacity(original_len);
 
-        // Prime with null byte (must match compression)
         let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
         Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
@@ -1715,23 +1782,21 @@ impl Compressor {
         for _ in 0..original_len {
             quantize_pdf_to_cdf_inplace(&self.pdf_buffer, &mut self.cdf_buffer_ac);
             let sym = decoder.decode_symbol_counts(&self.cdf_buffer_ac, CDF_TOTAL)?;
-            result.push(sym as u8);
-            self.online_update_from_current_pdf(sym as u8)?;
+            let byte = sym as u8;
+            result.push(byte);
+            self.online_update_from_current_pdf(byte)?;
 
-            // Update model state with decoded byte
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
-                .forward(&mut self.scratch, sym as u32, &mut self.state);
+                .forward(&mut self.scratch, byte as u32, &mut self.state);
             Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
 
         Ok(result)
     }
 
-    /// Decompress using rANS coding.
     fn decompress_rans(&mut self, compressed: &[u8], original_len: usize) -> Result<Vec<u8>> {
-        // Read block count
         if compressed.len() < 4 {
             bail!("rANS data too short");
         }
@@ -1739,34 +1804,29 @@ impl Compressor {
             u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]])
                 as usize;
 
-        // Read blocks
         let mut blocks = Vec::with_capacity(block_count);
-        let mut pos = 4;
-
+        let mut pos = 4usize;
         for _ in 0..block_count {
             if pos + 4 > compressed.len() {
-                bail!("Truncated block header");
+                bail!("truncated rANS block header");
             }
-            let block_len = u32::from_le_bytes([
+            let len = u32::from_le_bytes([
                 compressed[pos],
                 compressed[pos + 1],
                 compressed[pos + 2],
                 compressed[pos + 3],
             ]) as usize;
             pos += 4;
-
-            if pos + block_len > compressed.len() {
-                bail!("Truncated block data");
+            if pos + len > compressed.len() {
+                bail!("truncated rANS block data");
             }
-            blocks.push(&compressed[pos..pos + block_len]);
-            pos += block_len;
+            blocks.push(&compressed[pos..pos + len]);
+            pos += len;
         }
 
-        // Decode using blocked decoder
         let mut decoder = BlockedRansDecoder::new(blocks);
         let mut result = Vec::with_capacity(original_len);
 
-        // Prime with null byte
         let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
         let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
         Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
@@ -1777,11 +1837,10 @@ impl Compressor {
                 &mut self.cdf_buffer_rans,
                 &mut self.rans_freq_buffer,
             );
-            let sym = decoder.decode(&self.cdf_buffer_rans)?;
-            result.push(sym as u8);
-            self.online_update_from_current_pdf(sym as u8)?;
+            let sym = decoder.decode(&self.cdf_buffer_rans)? as u8;
+            result.push(sym);
+            self.online_update_from_current_pdf(sym)?;
 
-            // Update model state
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
                 .model
@@ -1792,22 +1851,13 @@ impl Compressor {
         Ok(result)
     }
 
-    /// Calculate cross-entropy (bits per byte) for data without compression.
-    ///
-    /// This measures how well the model predicts the data, giving a theoretical
-    /// lower bound on achievable compression. Useful for evaluating model quality.
-    ///
-    /// # Arguments
-    /// * `data` - Data to analyze
-    ///
-    /// # Returns
-    /// Average bits per byte (lower is better, 8.0 means no compression possible).
+    /// Cross entropy over whole sample.
     pub fn cross_entropy(&mut self, data: &[u8]) -> Result<f64> {
         self.reset_and_prime();
         self.cross_entropy_from_current(data)
     }
 
-    /// Cross entropy conditioned on chained prefix slices.
+    /// Cross entropy conditioned on prefix chain.
     pub fn cross_entropy_conditional_chain(
         &mut self,
         prefix_parts: &[&[u8]],
@@ -1837,10 +1887,9 @@ impl Compressor {
             }
         }
 
-        let mut total_bits = 0.0f64;
+        let mut total_bits = 0.0;
         for &byte in data {
-            let p = self.pdf_buffer[byte as usize];
-            total_bits -= p.log2();
+            total_bits -= self.pdf_buffer[byte as usize].max(1e-300).log2();
             self.online_update_from_current_pdf(byte)?;
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
@@ -1848,47 +1897,12 @@ impl Compressor {
                 .forward(&mut self.scratch, byte as u32, &mut self.state);
             Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
         }
-
         Ok(total_bits / (data.len() as f64))
     }
 
-    /// Cross entropy conditioned on a single prefix slice.
+    /// Cross entropy conditioned on one prefix.
     pub fn cross_entropy_conditional(&mut self, prefix: &[u8], data: &[u8]) -> Result<f64> {
-        if data.is_empty() {
-            return Ok(0.0);
-        }
-
-        self.state.reset();
-        self.prepare_policy_stream(Some((prefix.len() + data.len()) as u64))?;
-
-        // Prime with null byte
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-
-        // Condition on prefix (update state, no scoring)
-        for &byte in prefix {
-            self.online_update_from_current_pdf(byte)?;
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, byte as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-        }
-
-        let mut total_bits = 0.0f64;
-        for &byte in data {
-            let p = self.pdf_buffer[byte as usize];
-            total_bits -= p.log2();
-            self.online_update_from_current_pdf(byte)?;
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, byte as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-        }
-
-        Ok(total_bits / (data.len() as f64))
+        self.cross_entropy_conditional_chain(&[prefix], data)
     }
 
     /// Symmetric aligned joint cross entropy using the better ordering.
@@ -1897,7 +1911,6 @@ impl Compressor {
         if n == 0 {
             return Ok(0.0);
         }
-
         let h_xy = self.joint_cross_entropy_aligned_order(x, y, false)?;
         let h_yx = self.joint_cross_entropy_aligned_order(x, y, true)?;
         Ok(h_xy.min(h_yx))
@@ -1909,20 +1922,15 @@ impl Compressor {
             return Ok(0.0);
         }
 
-        self.state.reset();
+        self.reset_and_prime();
         self.prepare_policy_stream(Some((2 * n) as u64))?;
 
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+        let mut total_bits = 0.0;
+        for idx in 0..n {
+            let a = if swap { y[idx] } else { x[idx] };
+            let b = if swap { x[idx] } else { y[idx] };
 
-        let mut total_bits = 0.0f64;
-        for i in 0..n {
-            let a = if swap { y[i] } else { x[i] };
-            let b = if swap { x[i] } else { y[i] };
-
-            let pa = self.pdf_buffer[a as usize];
-            total_bits -= pa.log2();
+            total_bits -= self.pdf_buffer[a as usize].max(1e-300).log2();
             self.online_update_from_current_pdf(a)?;
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
@@ -1930,8 +1938,7 @@ impl Compressor {
                 .forward(&mut self.scratch, a as u32, &mut self.state);
             Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
-            let pb = self.pdf_buffer[b as usize];
-            total_bits -= pb.log2();
+            total_bits -= self.pdf_buffer[b as usize].max(1e-300).log2();
             self.online_update_from_current_pdf(b)?;
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
@@ -1941,428 +1948,5 @@ impl Compressor {
         }
 
         Ok(total_bits / (n as f64))
-    }
-}
-
-// =============================================================================
-// Compression Statistics
-// =============================================================================
-
-/// Statistics from a compression operation.
-#[derive(Debug, Clone)]
-pub struct CompressionStats {
-    /// Original size in bytes.
-    pub original_size: usize,
-    /// Compressed size in bytes (including header).
-    pub compressed_size: usize,
-    /// Compression ratio (original/compressed). Higher is better.
-    pub ratio: f64,
-    /// Bits per byte. Lower is better (theoretical minimum: ~0, maximum: 8).
-    pub bits_per_byte: f64,
-    /// Time taken in seconds.
-    pub time_seconds: f64,
-    /// Throughput in bytes per second.
-    pub throughput: f64,
-}
-
-impl std::fmt::Display for CompressionStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} bytes -> {} bytes | ratio={:.3} | bits/byte={:.3} | time={:.2}s | {:.0} B/s",
-            self.original_size,
-            self.compressed_size,
-            self.ratio,
-            self.bits_per_byte,
-            self.time_seconds,
-            self.throughput,
-        )
-    }
-}
-
-/// Compress data and return both the compressed output and statistics.
-///
-/// This is a convenience function that wraps `Compressor::compress` with timing.
-pub fn compress_with_stats(
-    compressor: &mut Compressor,
-    data: &[u8],
-    coder: CoderType,
-) -> Result<(Vec<u8>, CompressionStats)> {
-    let start = std::time::Instant::now();
-    let compressed = compressor.compress(data, coder)?;
-    let elapsed = start.elapsed().as_secs_f64();
-
-    let stats = CompressionStats {
-        original_size: data.len(),
-        compressed_size: compressed.len(),
-        ratio: data.len() as f64 / compressed.len() as f64,
-        bits_per_byte: (compressed.len() as f64 * 8.0) / data.len() as f64,
-        time_seconds: elapsed,
-        throughput: data.len() as f64 / elapsed,
-    };
-
-    Ok((compressed, stats))
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_path(name: &str, ext: &str) -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("infotheory_rwkvzip_{name}_{ts}.{ext}"))
-    }
-
-    #[test]
-    fn test_header_roundtrip() {
-        let header = Header::new(CoderType::AC, 12345, 0xDEADBEEF);
-
-        let mut buf = Vec::new();
-        header.write(&mut buf).unwrap();
-
-        assert_eq!(buf.len(), Header::SIZE);
-
-        let mut cursor = Cursor::new(&buf);
-        let read_header = Header::read(&mut cursor).unwrap();
-
-        assert_eq!(read_header.magic, MAGIC);
-        assert_eq!(read_header.version, VERSION);
-        assert_eq!(read_header.coder, 0);
-        assert_eq!(read_header.original_len, 12345);
-        assert_eq!(read_header.crc32, 0xDEADBEEF);
-    }
-
-    #[test]
-    fn test_header_rans() {
-        let header = Header::new(CoderType::RANS, 67890, 0xCAFEBABE);
-        assert_eq!(header.coder, 1);
-        assert_eq!(header.coder_type(), CoderType::RANS);
-    }
-
-    #[test]
-    fn test_coder_type_display() {
-        assert_eq!(format!("{}", CoderType::AC), "AC");
-        assert_eq!(format!("{}", CoderType::RANS), "rANS");
-    }
-
-    #[test]
-    fn test_crc32() {
-        let data = b"Hello, World!";
-        let c = crc32(data);
-        assert_ne!(c, 0);
-        // CRC32 should be deterministic
-        assert_eq!(c, crc32(data));
-    }
-
-    #[test]
-    fn test_crc32_different_data() {
-        let c1 = crc32(b"Hello");
-        let c2 = crc32(b"World");
-        assert_ne!(c1, c2);
-    }
-
-    #[test]
-    fn test_crc32_known_vector() {
-        // Standard CRC-32 (ISO-HDLC) test vector.
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-    }
-
-    #[test]
-    fn test_header_rejects_invalid_magic() {
-        let mut buf = Vec::new();
-        let header = Header::new(CoderType::AC, 1, 2);
-        header.write(&mut buf).unwrap();
-        // Corrupt magic.
-        buf[0] ^= 0xFF;
-
-        let mut cursor = Cursor::new(&buf);
-        let err = Header::read(&mut cursor).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("Invalid magic number"));
-    }
-
-    #[test]
-    fn test_parse_method_spec_file_and_cfg() {
-        let p = temp_path("dummy", "bin");
-        std::fs::write(&p, b"x").unwrap();
-
-        match parse_method_spec(&format!("file:{}", p.display())).unwrap() {
-            MethodSpec::File { path: got, .. } => assert_eq!(got, p),
-            _ => panic!("expected file method"),
-        }
-
-        match parse_method_spec(
-            "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=1,train=none,lr=0.01,stride=2;policy:schedule=0..100:infer",
-        )
-        .unwrap()
-        {
-            MethodSpec::Online { cfg, .. } => {
-                assert_eq!(cfg.hidden, 64);
-                assert_eq!(cfg.layers, 1);
-                assert_eq!(cfg.seed, 1);
-                assert_eq!(cfg.stride, 2);
-            }
-            _ => panic!("expected cfg method"),
-        }
-
-        match parse_method_spec("64,64,1,0,7,0.01,2;policy:schedule=0..100:infer").unwrap() {
-            MethodSpec::Online { cfg, .. } => {
-                assert_eq!(cfg.hidden, 64);
-                assert_eq!(cfg.intermediate, 64);
-                assert_eq!(cfg.layers, 1);
-                assert_eq!(cfg.seed, 7);
-                assert_eq!(cfg.stride, 2);
-            }
-            _ => panic!("expected positional cfg method"),
-        }
-
-        // Backward-compatible plain existing path.
-        match parse_method_spec(&p.display().to_string()).unwrap() {
-            MethodSpec::File { path: got, .. } => assert_eq!(got, p),
-            _ => panic!("expected file method"),
-        }
-
-        std::fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn test_parse_method_spec_rejects_unknown_cfg_key() {
-        let err =
-            parse_method_spec("cfg:hidden=64,wat=1;policy:schedule=0..100:infer").unwrap_err();
-        assert!(format!("{err:#}").contains("unknown rwkv cfg key"));
-    }
-
-    #[test]
-    fn test_parse_method_spec_accepts_cfg_without_policy() {
-        let spec = parse_method_spec("cfg:hidden=64,layers=1,intermediate=64").unwrap();
-        match spec {
-            MethodSpec::Online { cfg, policy } => {
-                assert_eq!(cfg.hidden, 64);
-                assert_eq!(cfg.layers, 1);
-                assert_eq!(cfg.intermediate, 64);
-                assert!(policy.is_none());
-            }
-            _ => panic!("expected cfg method"),
-        }
-    }
-
-    #[test]
-    fn test_canonical_method_omits_policy_when_absent() {
-        let c = Compressor::new_from_method("cfg:hidden=64,layers=1,intermediate=64").unwrap();
-        assert_eq!(
-            c.online_method_string(),
-            Some(
-                "cfg:hidden=64,layers=1,intermediate=64,decay_rank=32,a_rank=32,v_rank=32,g_rank=64,seed=0,train=none,lr=0.001,stride=1"
-            )
-        );
-    }
-
-    #[test]
-    fn test_online_export_reload_roundtrip() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=7,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.9)";
-        let data = b"rwkv online export/load deterministic sample";
-
-        let mut c1 = Compressor::new_from_method(method).unwrap();
-        let _ = c1.compress(data, CoderType::AC).unwrap();
-
-        let model_path = temp_path("export", "safetensors");
-        c1.export_online(&model_path).unwrap();
-        let out1_after_export = c1.compress(data, CoderType::AC).unwrap();
-
-        let mut c2 = Compressor::new(&model_path).unwrap();
-        let out2 = c2.compress(data, CoderType::AC).unwrap();
-
-        assert_eq!(out1_after_export, out2);
-        assert!(model_path.with_extension("json").exists());
-
-        std::fs::remove_file(&model_path).ok();
-        std::fs::remove_file(model_path.with_extension("json")).ok();
-    }
-
-    #[test]
-    fn test_runtime_snapshot_restores_online_state() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=9,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.9)";
-        let mut c = Compressor::new_from_method(method).unwrap();
-        c.reset_and_prime();
-        c.absorb_chain(&[b"prior context".as_slice()]).unwrap();
-        let snap = c.snapshot_runtime();
-
-        c.absorb_chain(&[b"snippet-a".as_slice()]).unwrap();
-        let score_a = c.cross_entropy_from_current(b"query").unwrap();
-
-        c.restore_runtime(&snap);
-        c.absorb_chain(&[b"snippet-b".as_slice()]).unwrap();
-        let score_b = c.cross_entropy_from_current(b"query").unwrap();
-
-        c.restore_runtime(&snap);
-        c.absorb_chain(&[b"snippet-b".as_slice()]).unwrap();
-        let score_b_again = c.cross_entropy_from_current(b"query").unwrap();
-
-        assert!((score_b - score_b_again).abs() < 1e-12);
-        let _ = score_a;
-    }
-
-    #[test]
-    fn test_runtime_snapshot_restores_non_head_training_state() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=15,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
-        let mut c = Compressor::new_from_method(method).unwrap();
-        c.reset_and_prime();
-        c.absorb_chain(&[b"prior context".as_slice()]).unwrap();
-        let snap = c.snapshot_runtime();
-
-        let _ = c
-            .cross_entropy_from_current(b"mutate model before restore")
-            .unwrap();
-
-        c.restore_runtime(&snap);
-        let score_a = c
-            .cross_entropy_from_current(b"query after restore")
-            .unwrap();
-
-        c.restore_runtime(&snap);
-        let score_b = c
-            .cross_entropy_from_current(b"query after restore")
-            .unwrap();
-
-        assert!((score_a - score_b).abs() < 1e-12);
-    }
-
-    #[test]
-    fn test_online_training_updates_lm_head_weights() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=5,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.9)";
-        let mut c = Compressor::new_from_method(method).unwrap();
-        c.reset_and_prime();
-        let before = c.model.lm_head_weights()[0..64].to_vec();
-        let _ = c
-            .cross_entropy_from_current(b"online rwkv weight update")
-            .unwrap();
-        let after = &c.model.lm_head_weights()[0..64];
-        let mut changed = false;
-        for i in 0..before.len() {
-            if before[i].to_bits() != after[i].to_bits() {
-                changed = true;
-                break;
-            }
-        }
-        assert!(
-            changed,
-            "expected LM-head weights to change under online training"
-        );
-    }
-
-    #[test]
-    fn test_online_training_non_head_scope_updates_model_params() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=13,train=sgd,lr=0.005,stride=1;policy:schedule=0..100:train(scope=attn,opt=sgd,lr=0.005,stride=1,bptt=1,clip=0,momentum=0.9)";
-        let mut c = Compressor::new_from_method(method).unwrap();
-
-        let head_before = c.model.lm_head_weights()[0..64].to_vec();
-        let before_path = temp_path("rwkv_non_head_before", "safetensors");
-        let after_path = temp_path("rwkv_non_head_after", "safetensors");
-        c.model.save_safetensors(&before_path).unwrap();
-
-        c.reset_and_prime();
-        let _ = c
-            .cross_entropy_from_current(b"rwkv non head online update")
-            .unwrap();
-        c.model.save_safetensors(&after_path).unwrap();
-
-        let head_after = &c.model.lm_head_weights()[0..64];
-        for idx in 0..head_before.len() {
-            assert_eq!(
-                head_before[idx].to_bits(),
-                head_after[idx].to_bits(),
-                "lm-head changed under scope=attn at index {idx}"
-            );
-        }
-
-        let before_bytes = std::fs::read(&before_path).unwrap();
-        let after_bytes = std::fs::read(&after_path).unwrap();
-        assert_ne!(
-            before_bytes, after_bytes,
-            "expected non-head params to change"
-        );
-
-        std::fs::remove_file(&before_path).ok();
-        std::fs::remove_file(&after_path).ok();
-    }
-
-    #[test]
-    fn test_online_training_scope_all_bptt_gt_one_rejected() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=23,train=adam,lr=0.001,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=2,clip=0,momentum=0.9)";
-        let mut c = Compressor::new_from_method(method).unwrap();
-        c.reset_and_prime();
-        let err = c.cross_entropy_from_current(b"abc").unwrap_err();
-        assert!(format!("{err:#}").contains("bptt=1"));
-    }
-
-    #[test]
-    fn test_online_export_reload_roundtrip_preserves_full_adam_resume() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
-        let data = b"rwkv full-adam export/load deterministic continuation sample";
-
-        let mut c1 = Compressor::new_from_method(method).unwrap();
-        let _ = c1.compress(data, CoderType::AC).unwrap();
-
-        let model_path = temp_path("rwkv_full_adam_export", "safetensors");
-        let opt_path = optimizer_sidecar_path(&model_path);
-        c1.export_online(&model_path).unwrap();
-        assert!(
-            opt_path.exists(),
-            "expected optimizer sidecar to be exported"
-        );
-        let out1_after_export = c1.compress(data, CoderType::AC).unwrap();
-
-        let mut c2 = Compressor::new(&model_path).unwrap();
-        let out2 = c2.compress(data, CoderType::AC).unwrap();
-        assert_eq!(out1_after_export, out2);
-
-        std::fs::remove_file(&model_path).ok();
-        std::fs::remove_file(model_path.with_extension("json")).ok();
-        std::fs::remove_file(&opt_path).ok();
-    }
-
-    #[test]
-    fn test_online_export_reload_missing_full_adam_sidecar_fails() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=41,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
-        let mut c = Compressor::new_from_method(method).unwrap();
-        let _ = c
-            .compress(b"rwkv strict optimizer-sidecar requirement", CoderType::AC)
-            .unwrap();
-
-        let model_path = temp_path("rwkv_full_adam_missing_sidecar", "safetensors");
-        let opt_path = optimizer_sidecar_path(&model_path);
-        c.export_online(&model_path).unwrap();
-        std::fs::remove_file(&opt_path).unwrap();
-
-        let err = match Compressor::new(&model_path) {
-            Ok(_) => panic!("expected missing optimizer sidecar to fail"),
-            Err(err) => err,
-        };
-        assert!(format!("{err:#}").contains("missing optimizer sidecar"));
-
-        std::fs::remove_file(&model_path).ok();
-        std::fs::remove_file(model_path.with_extension("json")).ok();
-    }
-
-    #[test]
-    fn test_clone_preserves_non_head_training_trace() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=43,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
-        let mut c = Compressor::new_from_method(method).unwrap();
-        c.reset_and_prime();
-        c.absorb_chain(&[b"clone trace prefix".as_slice()]).unwrap();
-
-        let mut cloned = c.clone();
-        let score = cloned
-            .cross_entropy_from_current(b"clone trace query")
-            .unwrap();
-        assert!(score.is_finite());
     }
 }

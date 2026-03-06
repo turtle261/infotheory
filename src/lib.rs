@@ -80,8 +80,7 @@ pub mod axioms;
 pub mod backends;
 /// Entropy coder implementations (AC and rANS).
 pub mod coders;
-#[cfg(feature = "backend-rwkv")]
-/// Rate-coded compression helpers built on RWKV/CTW/ZPAQ backends.
+/// Rate-coded compression helpers built on generic rate backends.
 pub mod compression;
 /// Synthetic data generators for information-theory experiments.
 pub mod datagen;
@@ -91,6 +90,9 @@ pub(crate) mod neural_mix;
 pub(crate) mod simd_math;
 /// CTW and FAC-CTW backend types.
 pub use backends::ctw;
+#[cfg(feature = "backend-mamba")]
+/// Mamba backend types and compressor.
+pub use backends::mambazip;
 /// Particle-latent filter ensemble rate backend.
 pub use backends::particle;
 /// ROSA+ backend types.
@@ -103,8 +105,9 @@ pub use backends::zpaq_rate;
 
 use rayon::prelude::*;
 
+use crate::coders::CoderType;
 use std::cell::RefCell;
-#[cfg(feature = "backend-rwkv")]
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -112,6 +115,10 @@ use std::sync::OnceLock;
 static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 
 thread_local! {
+    #[cfg(feature = "backend-mamba")]
+    static MAMBA_TLS: RefCell<HashMap<usize, mambazip::Compressor>> = RefCell::new(HashMap::new());
+    #[cfg(feature = "backend-mamba")]
+    static MAMBA_METHOD_TLS: RefCell<HashMap<String, mambazip::Compressor>> = RefCell::new(HashMap::new());
     #[cfg(feature = "backend-rwkv")]
     static RWKV_TLS: RefCell<HashMap<usize, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
     #[cfg(feature = "backend-rwkv")]
@@ -127,24 +134,13 @@ impl Default for CompressionBackend {
     }
 }
 
-#[cfg(all(not(feature = "backend-zpaq"), feature = "backend-rwkv"))]
+#[cfg(not(feature = "backend-zpaq"))]
 impl Default for CompressionBackend {
     fn default() -> Self {
         CompressionBackend::Rate {
             rate_backend: RateBackend::default(),
-            coder: rwkvzip::CoderType::AC,
+            coder: CoderType::AC,
             framing: compression::FramingMode::Raw,
-        }
-    }
-}
-
-#[cfg(all(not(feature = "backend-zpaq"), not(feature = "backend-rwkv")))]
-impl Default for CompressionBackend {
-    fn default() -> Self {
-        // No compression backend feature is enabled; keep a placeholder variant
-        // that maps to non-zpaq stubs without panicking.
-        CompressionBackend::Zpaq {
-            method: "5".to_string(),
         }
     }
 }
@@ -236,6 +232,18 @@ pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBacken
 pub enum RateBackend {
     /// ROSA+ suffix-automaton estimator.
     RosaPlus,
+    #[cfg(feature = "backend-mamba")]
+    /// Mamba model loaded from explicit weights.
+    Mamba {
+        /// Loaded Mamba model.
+        model: Arc<mambazip::Model>,
+    },
+    #[cfg(feature = "backend-mamba")]
+    /// Mamba method string (e.g. `file:...` or `cfg:...[;policy:...]`) resolved lazily.
+    MambaMethod {
+        /// Mamba method string.
+        method: String,
+    },
     #[cfg(feature = "backend-rwkv")]
     /// RWKV7 model loaded from explicit weights.
     Rwkv7 {
@@ -243,7 +251,7 @@ pub enum RateBackend {
         model: Arc<rwkvzip::Model>,
     },
     #[cfg(feature = "backend-rwkv")]
-    /// RWKV7 method string (e.g. `file:...` or `cfg:...`) resolved lazily.
+    /// RWKV7 method string (e.g. `file:...` or `cfg:...[;policy:...]`) resolved lazily.
     Rwkv7Method {
         /// RWKV7 method string.
         method: String,
@@ -313,15 +321,14 @@ pub enum CompressionBackend {
         /// Loaded RWKV7 model.
         model: Arc<rwkvzip::Model>,
         /// Entropy coder used for coding model PDFs.
-        coder: rwkvzip::CoderType,
+        coder: CoderType,
     },
-    #[cfg(feature = "backend-rwkv")]
     /// Generic rate-coded compressor wrapping an arbitrary rate backend.
     Rate {
         /// Predictive rate backend.
         rate_backend: RateBackend,
         /// Entropy coder used for coding model PDFs.
-        coder: rwkvzip::CoderType,
+        coder: CoderType,
         /// Framing mode for output payloads.
         framing: compression::FramingMode,
     },
@@ -679,14 +686,27 @@ impl InfotheoryCtx {
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
                 c.cross_entropy_conditional_chain(prefix_parts, data)
-                    .unwrap_or(0.0)
+                    .unwrap_or_else(|e| panic!("rwkv conditional-chain scoring failed: {e:#}"))
             }),
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
                 c.cross_entropy_conditional_chain(prefix_parts, data)
-                    .unwrap_or(0.0)
-            })
-            .unwrap_or(0.0),
+                    .unwrap_or_else(|e| {
+                        panic!("rwkv method conditional-chain scoring failed: {e:#}")
+                    })
+            }),
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::Mamba { model } => with_mamba_tls(model, |c| {
+                c.cross_entropy_conditional_chain(prefix_parts, data)
+                    .unwrap_or_else(|e| panic!("mamba conditional-chain scoring failed: {e:#}"))
+            }),
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::MambaMethod { method } => with_mamba_method_tls(method, |c| {
+                c.cross_entropy_conditional_chain(prefix_parts, data)
+                    .unwrap_or_else(|e| {
+                        panic!("mamba method conditional-chain scoring failed: {e:#}")
+                    })
+            }),
             RateBackend::Ctw { depth } => {
                 if data.is_empty() {
                     return 0.0;
@@ -729,6 +749,13 @@ impl InfotheoryCtx {
                 let experts = spec.build_experts();
                 let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
                     .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
+                let total = prefix_parts
+                    .iter()
+                    .map(|p| p.len() as u64)
+                    .sum::<u64>()
+                    .saturating_add(data.len() as u64);
+                mix.begin_stream(Some(total))
+                    .unwrap_or_else(|e| panic!("Mixture stream init failed: {e}"));
                 for &part in prefix_parts {
                     for &b in part {
                         mix.step(b);
@@ -898,6 +925,12 @@ pub fn load_rwkv7_model_from_path(path: &str) -> Arc<rwkvzip::Model> {
     rwkvzip::Compressor::load_model(path).expect("failed to load RWKV7 model")
 }
 
+#[cfg(feature = "backend-mamba")]
+/// Load a Mamba-1 model from `.safetensors` path.
+pub fn load_mamba_model_from_path(path: &str) -> Arc<mambazip::Model> {
+    mambazip::Compressor::load_model(path).expect("failed to load Mamba model")
+}
+
 #[inline(always)]
 fn aligned_prefix<'a>(x: &'a [u8], y: &'a [u8]) -> (&'a [u8], &'a [u8]) {
     let n = x.len().min(y.len());
@@ -1001,10 +1034,7 @@ fn with_rwkv_tls<R>(
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn with_rwkv_method_tls<R>(
-    method: &str,
-    f: impl FnOnce(&mut rwkvzip::Compressor) -> R,
-) -> Option<R> {
+fn with_rwkv_method_tls<R>(method: &str, f: impl FnOnce(&mut rwkvzip::Compressor) -> R) -> R {
     RWKV_METHOD_TLS.with(|cell| {
         let mut map = cell.borrow_mut();
         // Keep a per-method template compressor for fast cloning while ensuring
@@ -1012,12 +1042,47 @@ fn with_rwkv_method_tls<R>(
         let mut comp = if let Some(template) = map.get(method) {
             template.clone()
         } else {
-            let template = rwkvzip::Compressor::new_from_method(method).ok()?;
+            let template = rwkvzip::Compressor::new_from_method(method).unwrap_or_else(|e| {
+                panic!("invalid rwkv method '{method}': {e:#}");
+            });
             map.insert(method.to_string(), template.clone());
             template
         };
         drop(map);
-        Some(f(&mut comp))
+        f(&mut comp)
+    })
+}
+
+#[cfg(feature = "backend-mamba")]
+fn with_mamba_tls<R>(
+    model: &Arc<mambazip::Model>,
+    f: impl FnOnce(&mut mambazip::Compressor) -> R,
+) -> R {
+    let key = Arc::as_ptr(model) as usize;
+    MAMBA_TLS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let comp = map
+            .entry(key)
+            .or_insert_with(|| mambazip::Compressor::new_from_model(model.clone()));
+        f(comp)
+    })
+}
+
+#[cfg(feature = "backend-mamba")]
+fn with_mamba_method_tls<R>(method: &str, f: impl FnOnce(&mut mambazip::Compressor) -> R) -> R {
+    MAMBA_METHOD_TLS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let mut comp = if let Some(template) = map.get(method) {
+            template.clone()
+        } else {
+            let template = mambazip::Compressor::new_from_method(method).unwrap_or_else(|e| {
+                panic!("invalid mamba method '{method}': {e:#}");
+            });
+            map.insert(method.to_string(), template.clone());
+            template
+        };
+        drop(map);
+        f(&mut comp)
     })
 }
 
@@ -1081,7 +1146,6 @@ pub fn compress_size_chain_backend(parts: &[&[u8]], backend: &CompressionBackend
         CompressionBackend::Rwkv7 { model, coder } => {
             with_rwkv_tls(model, |c| c.compress_size_chain(parts, *coder).unwrap_or(0))
         }
-        #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rate {
             rate_backend,
             coder,
@@ -1101,7 +1165,6 @@ pub fn compress_size_backend(data: &[u8], backend: &CompressionBackend) -> u64 {
         CompressionBackend::Rwkv7 { model, coder } => {
             with_rwkv_tls(model, |c| c.compress_size(data, *coder).unwrap_or(0))
         }
-        #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rate {
             rate_backend,
             coder,
@@ -1122,7 +1185,6 @@ pub fn compress_bytes_backend(
         CompressionBackend::Rwkv7 { model, coder } => {
             with_rwkv_tls(model, |c| c.compress(data, *coder))
         }
-        #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rate {
             rate_backend,
             coder,
@@ -1140,7 +1202,6 @@ pub fn decompress_bytes_backend(
         CompressionBackend::Zpaq { .. } => zpaq_decompress_to_vec(input),
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { model, .. } => with_rwkv_tls(model, |c| c.decompress(input)),
-        #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rate {
             rate_backend,
             coder,
@@ -1157,13 +1218,25 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             m.predictive_entropy_rate(data)
         }
         #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7 { model } => {
-            with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
-        }
+        RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
+            c.cross_entropy(data)
+                .unwrap_or_else(|e| panic!("rwkv entropy scoring failed: {e:#}"))
+        }),
         #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7Method { method } => {
-            with_rwkv_method_tls(method, |c| c.cross_entropy(data).unwrap_or(0.0)).unwrap_or(0.0)
-        }
+        RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
+            c.cross_entropy(data)
+                .unwrap_or_else(|e| panic!("rwkv method entropy scoring failed: {e:#}"))
+        }),
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::Mamba { model } => with_mamba_tls(model, |c| {
+            c.cross_entropy(data)
+                .unwrap_or_else(|e| panic!("mamba entropy scoring failed: {e:#}"))
+        }),
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::MambaMethod { method } => with_mamba_method_tls(method, |c| {
+            c.cross_entropy(data)
+                .unwrap_or_else(|e| panic!("mamba method entropy scoring failed: {e:#}"))
+        }),
         RateBackend::Zpaq { method } => {
             if data.is_empty() {
                 return 0.0;
@@ -1179,6 +1252,8 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             let experts = spec.build_experts();
             let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
                 .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
+            mix.begin_stream(Some(data.len() as u64))
+                .unwrap_or_else(|e| panic!("Mixture stream init failed: {e}"));
             let mut bits = 0.0;
             for &b in data {
                 bits -= mix.step(b) / std::f64::consts::LN_2;
@@ -1245,13 +1320,25 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
             m.cross_entropy(data)
         }
         #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7 { model } => {
-            with_rwkv_tls(model, |c| c.cross_entropy(data).unwrap_or(0.0))
-        }
+        RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
+            c.cross_entropy(data)
+                .unwrap_or_else(|e| panic!("rwkv biased-entropy scoring failed: {e:#}"))
+        }),
         #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7Method { method } => {
-            with_rwkv_method_tls(method, |c| c.cross_entropy(data).unwrap_or(0.0)).unwrap_or(0.0)
-        }
+        RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
+            c.cross_entropy(data)
+                .unwrap_or_else(|e| panic!("rwkv method biased-entropy scoring failed: {e:#}"))
+        }),
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::Mamba { model } => with_mamba_tls(model, |c| {
+            c.cross_entropy(data)
+                .unwrap_or_else(|e| panic!("mamba biased-entropy scoring failed: {e:#}"))
+        }),
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::MambaMethod { method } => with_mamba_method_tls(method, |c| {
+            c.cross_entropy(data)
+                .unwrap_or_else(|e| panic!("mamba method biased-entropy scoring failed: {e:#}"))
+        }),
         RateBackend::Zpaq { .. } => entropy_rate_backend(data, max_order, backend),
         RateBackend::Mixture { .. } => entropy_rate_backend(data, max_order, backend),
         RateBackend::Particle { .. } => entropy_rate_backend(data, max_order, backend),
@@ -1282,15 +1369,24 @@ pub fn cross_entropy_rate_backend(
                 // Inverted args fix: (prefix, target) -> (train, test)
                 // This estimates H_{train}(test)
                 c.cross_entropy_conditional(train_data, test_data)
-                    .unwrap_or(0.0)
+                    .unwrap_or_else(|e| panic!("rwkv cross-entropy scoring failed: {e:#}"))
             })
         }
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
             c.cross_entropy_conditional(train_data, test_data)
-                .unwrap_or(0.0)
-        })
-        .unwrap_or(0.0),
+                .unwrap_or_else(|e| panic!("rwkv method cross-entropy scoring failed: {e:#}"))
+        }),
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::Mamba { model } => with_mamba_tls(model, |c| {
+            c.cross_entropy_conditional(train_data, test_data)
+                .unwrap_or_else(|e| panic!("mamba cross-entropy scoring failed: {e:#}"))
+        }),
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::MambaMethod { method } => with_mamba_method_tls(method, |c| {
+            c.cross_entropy_conditional(train_data, test_data)
+                .unwrap_or_else(|e| panic!("mamba method cross-entropy scoring failed: {e:#}"))
+        }),
         RateBackend::Zpaq { method } => {
             if test_data.is_empty() {
                 return 0.0;
@@ -1307,6 +1403,9 @@ pub fn cross_entropy_rate_backend(
             let experts = spec.build_experts();
             let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
                 .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
+            let total = (train_data.len() as u64).saturating_add(test_data.len() as u64);
+            mix.begin_stream(Some(total))
+                .unwrap_or_else(|e| panic!("Mixture stream init failed: {e}"));
             for &b in train_data {
                 mix.step(b);
             }
@@ -1402,13 +1501,24 @@ pub fn joint_entropy_rate_backend(
         }
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
-            c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
+            c.joint_cross_entropy_aligned_min(x, y)
+                .unwrap_or_else(|e| panic!("rwkv joint-entropy scoring failed: {e:#}"))
         }),
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
-            c.joint_cross_entropy_aligned_min(x, y).unwrap_or(0.0)
-        })
-        .unwrap_or(0.0),
+            c.joint_cross_entropy_aligned_min(x, y)
+                .unwrap_or_else(|e| panic!("rwkv method joint-entropy scoring failed: {e:#}"))
+        }),
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::Mamba { model } => with_mamba_tls(model, |c| {
+            c.joint_cross_entropy_aligned_min(x, y)
+                .unwrap_or_else(|e| panic!("mamba joint-entropy scoring failed: {e:#}"))
+        }),
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::MambaMethod { method } => with_mamba_method_tls(method, |c| {
+            c.joint_cross_entropy_aligned_min(x, y)
+                .unwrap_or_else(|e| panic!("mamba method joint-entropy scoring failed: {e:#}"))
+        }),
         RateBackend::Zpaq { method } => {
             if x.is_empty() {
                 return 0.0;
@@ -1434,6 +1544,8 @@ pub fn joint_entropy_rate_backend(
             let experts = spec.build_experts();
             let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
                 .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
+            mix.begin_stream(Some(joint.len() as u64))
+                .unwrap_or_else(|e| panic!("Mixture stream init failed: {e}"));
             let mut bits = 0.0;
             for &b in &joint {
                 bits -= mix.step(b) / std::f64::consts::LN_2;
@@ -2570,7 +2682,7 @@ mod tests {
     #[cfg(feature = "backend-rwkv")]
     #[test]
     fn rwkv_method_entropy_is_stable_across_calls() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=21,train=sgd,lr=0.01,stride=1";
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=21,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:infer";
         let backend = RateBackend::Rwkv7Method {
             method: method.to_string(),
         };
@@ -2587,7 +2699,7 @@ mod tests {
     #[cfg(feature = "backend-rwkv")]
     #[test]
     fn rwkv_method_conditional_chain_is_stable_across_calls() {
-        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=22,train=sgd,lr=0.01,stride=1";
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=22,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:infer";
         let ctx = InfotheoryCtx::new(
             RateBackend::Rwkv7Method {
                 method: method.to_string(),

@@ -24,6 +24,10 @@ use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::environment::Environment;
 #[cfg(feature = "backend-rwkv")]
 use crate::coders::softmax_pdf_inplace;
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip;
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip::Compressor as MambaCompressor;
 use crate::mixture::OnlineBytePredictor;
 use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
@@ -645,6 +649,11 @@ enum TraceModel {
         tree: crate::ctw::FacContextTree,
         bits_per_symbol: usize,
     },
+    #[cfg(feature = "backend-mamba")]
+    Mamba {
+        compressor: MambaCompressor,
+        primed: bool,
+    },
     Rwkv7 {
         compressor: Compressor,
         primed: bool,
@@ -666,6 +675,23 @@ impl TraceModel {
                 model.build_lm_full_bytes_no_finalize_endpos();
                 TraceModel::Rosa { model, max_order }
             }
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::Mamba { model } => {
+                let compressor = MambaCompressor::new_from_model(model.clone());
+                TraceModel::Mamba {
+                    compressor,
+                    primed: false,
+                }
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::MambaMethod { method } => {
+                let compressor = MambaCompressor::new_from_method(method)
+                    .unwrap_or_else(|e| panic!("invalid mamba method for vm trace model: {e}"));
+                TraceModel::Mamba {
+                    compressor,
+                    primed: false,
+                }
+            }
             RateBackend::Rwkv7 { model } => {
                 let compressor = Compressor::new_from_model(model.clone());
                 TraceModel::Rwkv7 {
@@ -686,11 +712,26 @@ impl TraceModel {
             },
             RateBackend::Mixture { spec } => {
                 let backend = RateBackend::Mixture { spec: spec.clone() };
-                let model = crate::mixture::RateBackendPredictor::from_backend(
+                let mut model = crate::mixture::RateBackendPredictor::from_backend(
                     backend.clone(),
                     -1,
                     2f64.powi(-24),
                 );
+                model
+                    .begin_stream(None)
+                    .unwrap_or_else(|e| panic!("mixture stream init failed: {e}"));
+                TraceModel::Mixture { backend, model }
+            }
+            RateBackend::Particle { spec } => {
+                let backend = RateBackend::Particle { spec: spec.clone() };
+                let mut model = crate::mixture::RateBackendPredictor::from_backend(
+                    backend.clone(),
+                    -1,
+                    2f64.powi(-24),
+                );
+                model
+                    .begin_stream(None)
+                    .unwrap_or_else(|e| panic!("mixture stream init failed: {e}"));
                 TraceModel::Mixture { backend, model }
             }
             RateBackend::Ctw { depth } => TraceModel::Ctw {
@@ -719,6 +760,11 @@ impl TraceModel {
             }
             TraceModel::Ctw { tree } => tree.clear(),
             TraceModel::FacCtw { tree, .. } => tree.clear(),
+            #[cfg(feature = "backend-mamba")]
+            TraceModel::Mamba { compressor, primed } => {
+                compressor.state.reset();
+                *primed = false;
+            }
             TraceModel::Rwkv7 { compressor, primed } => {
                 compressor.state.reset();
                 *primed = false;
@@ -732,6 +778,9 @@ impl TraceModel {
                     -1,
                     2f64.powi(-24),
                 );
+                model
+                    .begin_stream(None)
+                    .unwrap_or_else(|e| panic!("mixture stream init failed: {e}"));
             }
         }
     }
@@ -776,6 +825,39 @@ impl TraceModel {
                 let log_after = tree.get_log_block_probability();
                 let log_delta = log_after - log_before;
                 -log_delta / std::f64::consts::LN_2
+            }
+            #[cfg(feature = "backend-mamba")]
+            TraceModel::Mamba { compressor, primed } => {
+                if !*primed {
+                    let bias = compressor.online_bias_snapshot();
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    mambazip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                    *primed = true;
+                }
+                let mut bits = 0.0;
+                for &b in data {
+                    let p = compressor.pdf_buffer[b as usize].max(1e-12);
+                    bits -= p.log2();
+                    let bias = compressor.online_bias_snapshot();
+                    let logits = compressor.model.forward(
+                        &mut compressor.scratch,
+                        b as u32,
+                        &mut compressor.state,
+                    );
+                    mambazip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                }
+                bits
             }
             TraceModel::Rwkv7 { compressor, primed } => {
                 if !*primed {

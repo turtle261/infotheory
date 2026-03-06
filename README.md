@@ -13,12 +13,13 @@ Estimate core measures using both **Marginal** (distribution-based) and **Rate**
 Switch between different modeling paradigms seamlessly:
 - **ROSA+ (Rapid Online Suffix Automaton + Witten Bell)**: A fast statistical LM. Default backend. 
 - **CTW (Context Tree Weighting)**: Historically standard for AIXI. Accurate bit-level Bayesian model (KT-estimator).
+- **Mamba (Neural Network)**: Deterministic CPU-first Mamba-1 backend with online mode + export.
 - **RWKV (Neural Network)**: Portable SIMD RWKV7 CPU inference backend (`wide`-based).
 
 ### 3. Integrated MC-AIXI Agent
-Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, or RWKV) for universal reinforcement learning.
+Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, Mamba, or RWKV) for universal reinforcement learning.
 
-You can use a trained RWKV7 model as a rate backend ("world model") for MC-AIXI.
+You can use a trained neural model (Mamba-1 or RWKV7) as a rate backend ("world model") for MC-AIXI.
 
 ---
 
@@ -124,30 +125,33 @@ CLI:
 For rate-coded metrics, raw framing is used by default to avoid framing overhead.
 Explicit `compress_bytes_backend` / `decompress_bytes_backend` APIs support framed payloads for roundtrip verification.
 
-### RWKV Method Strings
+### Neural Method Strings
 
-RWKV can be configured with either a model file or compact method string:
+Mamba and RWKV can be configured with either a model file or compact method string:
 
 - `file:/abs/or/relative/model.safetensors`
-- `cfg:key=value,...`
+- `file:/abs/or/relative/model.safetensors;policy:...`
+- `cfg:key=value,...[;policy:...]`
 
 Supported `cfg:` keys:
-`hidden,layers,intermediate,decay_rank,a_rank,v_rank,g_rank,seed,train,lr,stride`
+- RWKV7: `hidden,layers,intermediate,decay_rank,a_rank,v_rank,g_rank,seed,train,lr,stride`
+- Mamba-1: `hidden,layers,intermediate,state,conv,dt_rank,seed,train,lr,stride`
 
 `train` supports: `none`, `sgd`, `adam`.
+`policy` supports `schedule=...` rules (for example `0..100:infer` or `0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)`).
 
 Example:
 
 ```bash
 ./infotheory h file.txt \
   --rate-backend rwkv7 \
-  --method "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=7,train=sgd,lr=0.01,stride=1"
+  --method "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=7,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.9)"
 ```
 
 Optional online export after processing input:
 
 ```bash
-./infotheory h file.txt --rate-backend rwkv7 --method "cfg:hidden=64,layers=1,intermediate=64" --rwkv-export ./rwkv_online.safetensors
+./infotheory h file.txt --rate-backend mamba --method "cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4;policy:schedule=0..100:infer" --model-export ./mamba_online.safetensors
 ```
 
 This writes:

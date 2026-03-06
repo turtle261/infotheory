@@ -1446,94 +1446,47 @@ impl RosaPlus {
         }
     }
 
-    /// Incrementally absorb one byte in continuous-stream mode.
-    ///
-    /// This updates SAM and LM counts without boundary insertion and without
-    /// transactional logging, for fast prequential scoring.
-    #[inline]
-    fn train_byte_stream(&mut self, b: u8) {
-        if self.sam.text.is_empty() {
-            self.sam = Sam::new(1024);
-        }
-        if !self.lm_built {
-            self.build_lm_full_bytes_no_finalize_endpos();
-        }
-
-        let seg_start = self.sam.text.len();
-        self.sam.feed(b as u32);
-
-        if self.lm.ls.len() < self.sam.st.len() {
-            self.lm.ls.resize(
-                self.sam.st.len(),
-                LmState {
-                    head: -1,
-                    last_node: -1,
-                    ..LmState::default()
-                },
-            );
-        }
-
-        self.lm.unigram[b as usize] += 1;
-        self.lm.total_uni += 1;
-
-        let mo = if self.max_order < 0 {
-            -1
-        } else {
-            self.max_order
-        };
-        let seg_end = self.sam.text.len();
-        if seg_end >= 2 {
-            let mut start_i = seg_start;
-            if seg_start > 0
-                && self
-                    .sam
-                    .boundary_after
-                    .get(seg_start - 1)
-                    .copied()
-                    .unwrap_or(0)
-                    == 0
-            {
-                start_i = seg_start - 1;
-            }
-            for i in start_i..(seg_end - 1) {
-                let mut ctx = self.sam.text_states[i + 1];
-                if mo >= 0 {
-                    while ctx != -1 && (self.sam.st[ctx as usize].len as i64) > mo {
-                        ctx = self.sam.st[ctx as usize].link;
-                    }
-                    if ctx == -1 {
-                        ctx = 0;
-                    }
-                }
-                let nxt = self.sam.text[i + 1];
-                let si = self.lm.find_sym(nxt);
-                if si >= 0 {
-                    let mut u = ctx;
-                    while u != -1 {
-                        self.lm.inc(u as u32, si as u32, 1);
-                        u = self.sam.st[u as usize].link;
-                    }
-                }
-            }
-        }
-
-        self.lm_built = true;
-    }
-
     fn predictive_entropy_rate_order(data: &[u8], max_order: i64, seed: u64) -> f64 {
-        if data.is_empty() {
+        if data.len() < 2 {
             return 0.0;
         }
-        let mut m = RosaPlus::new(max_order, false, 0, seed);
-        m.build_lm_full_bytes_no_finalize_endpos();
-
+        let num_chunks = 16;
+        let chunk_size = data.len().div_ceil(num_chunks);
         let mut total_log_prob = 0.0f64;
-        for &b in data {
-            let p = m.prob_for_last(b as u32);
-            total_log_prob += p.log2();
-            m.train_byte_stream(b);
+        let mut count = 0usize;
+
+        for i in 0..num_chunks {
+            let start = i * chunk_size;
+            let end = ((i + 1) * chunk_size).min(data.len());
+            if start >= end {
+                break;
+            }
+            if i == 0 {
+                continue;
+            }
+
+            let mut m = RosaPlus::new(max_order, false, 0, seed);
+            m.train_example(&data[..start]);
+            m.build_lm();
+            let mut v = m.sam.last;
+
+            for &b in &data[start..end] {
+                let sym_idx = m.lm.find_sym(b as u32);
+                let p = m.lm.prob_for_sym(&m.sam, max_order, v, sym_idx);
+                total_log_prob += p.log2();
+                count += 1;
+                v = m.sam.advance(v, b as u32);
+            }
         }
-        -total_log_prob / (data.len() as f64)
+
+        if count == 0 {
+            let mut m = RosaPlus::new(max_order, false, 0, seed);
+            m.train_example(data);
+            m.build_lm();
+            m.cross_entropy(data)
+        } else {
+            -total_log_prob / (count as f64)
+        }
     }
 
     /// Current LM alphabet size (0 if LM not built).
@@ -1804,14 +1757,23 @@ impl RosaPlus {
         if data.len() < 2 {
             return 0.0;
         }
-        // Uncapped mode now follows a single streaming prequential pass to
-        // match online compression semantics and avoid multi-pass order search.
-        let mo = if self.max_order < 0 {
-            -1
-        } else {
-            self.max_order
-        };
-        Self::predictive_entropy_rate_order(data, mo, self.seed)
+        if self.max_order < 0 {
+            let candidates: [i64; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
+            let mut best = f64::INFINITY;
+            for &mo in &candidates {
+                if mo as usize >= data.len() {
+                    continue;
+                }
+                let h = Self::predictive_entropy_rate_order(data, mo, self.seed);
+                if h < best {
+                    best = h;
+                }
+            }
+            if best.is_finite() {
+                return best;
+            }
+        }
+        Self::predictive_entropy_rate_order(data, self.max_order, self.seed)
     }
 
     /// Predictive entropy rate on codepoint streams.
@@ -1880,6 +1842,25 @@ impl RosaPlus {
         }
     }
 
+    fn entropy_rate_plugin_cps(&mut self, cps: &[u32]) -> f64 {
+        let mut v = 0i32;
+        let mut total_log_prob = 0.0f64;
+        let mut count = 0usize;
+        for t in 0..(cps.len() - 1) {
+            v = self.sam.advance(v, cps[t]);
+            let next_ch = cps[t + 1];
+            let sym_idx = self.lm.find_sym(next_ch);
+            let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
+            total_log_prob += p.log2();
+            count += 1;
+        }
+        if count == 0 {
+            0.0
+        } else {
+            -total_log_prob / (count as f64)
+        }
+    }
+
     /// Cross entropy of byte data under current LM state.
     pub fn cross_entropy(&self, data: &[u8]) -> f64 {
         if !self.lm_built || data.is_empty() {
@@ -1911,25 +1892,6 @@ impl RosaPlus {
             v = self.sam.advance(v, ch);
         }
         -total_log_prob / (data.len() as f64)
-    }
-
-    fn entropy_rate_plugin_cps(&mut self, cps: &[u32]) -> f64 {
-        let mut v = 0i32;
-        let mut total_log_prob = 0.0f64;
-        let mut count = 0usize;
-        for t in 0..(cps.len() - 1) {
-            v = self.sam.advance(v, cps[t]);
-            let next_ch = cps[t + 1];
-            let sym_idx = self.lm.find_sym(next_ch);
-            let p = self.lm.prob_for_sym(&self.sam, self.max_order, v, sym_idx);
-            total_log_prob += p.log2();
-            count += 1;
-        }
-        if count == 0 {
-            0.0
-        } else {
-            -total_log_prob / (count as f64)
-        }
     }
 
     /// Returns the marginal (unigram) distribution over the training data.
@@ -2265,6 +2227,93 @@ impl RosaPlus {
 mod tests {
     use super::*;
 
+    fn manual_chunked_entropy_rate_bytes(data: &[u8], max_order: i64, seed: u64) -> f64 {
+        if data.len() < 2 {
+            return 0.0;
+        }
+        let num_chunks = 16;
+        let chunk_size = data.len().div_ceil(num_chunks);
+        let mut total_log_prob = 0.0f64;
+        let mut count = 0usize;
+
+        for i in 0..num_chunks {
+            let start = i * chunk_size;
+            let end = ((i + 1) * chunk_size).min(data.len());
+            if start >= end {
+                break;
+            }
+            if i == 0 {
+                continue;
+            }
+
+            let mut m = RosaPlus::new(max_order, false, 0, seed);
+            m.train_example(&data[..start]);
+            m.build_lm();
+            let mut v = m.sam.last;
+
+            for &b in &data[start..end] {
+                let sym_idx = m.lm.find_sym(b as u32);
+                let p = m.lm.prob_for_sym(&m.sam, max_order, v, sym_idx);
+                total_log_prob += p.log2();
+                count += 1;
+                v = m.sam.advance(v, b as u32);
+            }
+        }
+
+        if count == 0 {
+            let mut m = RosaPlus::new(max_order, false, 0, seed);
+            m.train_example(data);
+            m.build_lm();
+            m.cross_entropy(data)
+        } else {
+            -total_log_prob / (count as f64)
+        }
+    }
+
+    fn manual_chunked_entropy_rate_cps(data: &[u32], max_order: i64, seed: u64) -> f64 {
+        if data.len() < 2 {
+            return 0.0;
+        }
+        let mut m = RosaPlus::new(max_order, false, 0, seed);
+        m.sam = Sam::new(data.len());
+        m.lm_built = false;
+
+        let num_chunks = 16;
+        let chunk_size = data.len().div_ceil(num_chunks);
+        let mut total_log_prob = 0.0f64;
+        let mut count = 0usize;
+
+        for i in 0..num_chunks {
+            let start = i * chunk_size;
+            let end = ((i + 1) * chunk_size).min(data.len());
+            if start >= end {
+                break;
+            }
+            let chunk = &data[start..end];
+            if i > 0 {
+                m.build_lm_no_finalize_endpos();
+                let mut v = m.sam.text_states[start];
+                for &ch in chunk {
+                    let sym_idx = m.lm.find_sym(ch);
+                    let p = m.lm.prob_for_sym(&m.sam, max_order, v, sym_idx);
+                    total_log_prob += p.log2();
+                    count += 1;
+                    v = m.sam.advance(v, ch);
+                }
+            }
+            for &ch in chunk {
+                m.sam.feed(ch);
+            }
+        }
+
+        if count == 0 {
+            m.build_lm();
+            m.entropy_rate_plugin_cps(data)
+        } else {
+            -total_log_prob / (count as f64)
+        }
+    }
+
     #[test]
     fn rosa_md_example_basic() {
         // From rosa.md: ROSA predicts next token of best previous match.
@@ -2317,5 +2366,41 @@ mod tests {
         assert_eq!(m.sam.boundary_after, base_boundary);
         assert_eq!(m.sam.last, base_last);
         assert!(!m.lm_built);
+    }
+
+    #[test]
+    fn predictive_entropy_rate_matches_chunked_reference_fixed_order() {
+        let data = b"abracadabra abracadabra abracadabra";
+        let seed = 11;
+        let expected = manual_chunked_entropy_rate_bytes(data, 4, seed);
+        let mut m = RosaPlus::new(4, false, 0, seed);
+        let got = m.predictive_entropy_rate(data);
+        assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn predictive_entropy_rate_uncapped_matches_candidate_search() {
+        let data = b"the quick brown fox jumps over the lazy dog the quick brown fox";
+        let seed = 29;
+        let mut expected = f64::INFINITY;
+        for &mo in &[0, 1, 2, 4, 8, 16, 32, 64] {
+            if mo as usize >= data.len() {
+                continue;
+            }
+            expected = expected.min(manual_chunked_entropy_rate_bytes(data, mo, seed));
+        }
+        let mut m = RosaPlus::new(-1, false, 0, seed);
+        let got = m.predictive_entropy_rate(data);
+        assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn entropy_rate_cps_matches_chunked_reference() {
+        let data = [0u32, 7, 0, 42, 7, 42, 0, 7, 42, 42];
+        let seed = 31;
+        let expected = manual_chunked_entropy_rate_cps(&data, -1, seed);
+        let mut m = RosaPlus::new(-1, false, 0, seed);
+        let got = m.entropy_rate_cps(&data);
+        assert!((got - expected).abs() < 1e-12);
     }
 }

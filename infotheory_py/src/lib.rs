@@ -64,7 +64,6 @@ fn parse_ncd_variant(s: &str) -> PyResult<NcdVariant> {
     }
 }
 
-#[cfg(feature = "backend-rwkv")]
 fn parse_framing_mode(s: &str) -> PyResult<infotheory::compression::FramingMode> {
     match s.to_ascii_lowercase().as_str() {
         "raw" => Ok(infotheory::compression::FramingMode::Raw),
@@ -284,11 +283,27 @@ fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend>
                 m.to_string()
             },
         }),
+        #[cfg(feature = "backend-mamba")]
+        "mamba" | "mamba1" => {
+            if m.is_empty() {
+                Err(PyValueError::new_err(
+                    "mamba backend requires method string (cfg:...;policy:... or file:...)",
+                ))
+            } else {
+                Ok(RateBackend::MambaMethod {
+                    method: m.to_string(),
+                })
+            }
+        }
+        #[cfg(not(feature = "backend-mamba"))]
+        "mamba" | "mamba1" => Err(PyValueError::new_err(
+            "mamba backend disabled at compile time",
+        )),
         #[cfg(feature = "backend-rwkv")]
         "rwkv" | "rwkv7" => {
             if m.is_empty() {
                 Err(PyValueError::new_err(
-                    "rwkv backend requires method string (cfg:... or file:...)",
+                    "rwkv backend requires method string (cfg:...;policy:... or file:...)",
                 ))
             } else {
                 Ok(RateBackend::Rwkv7Method {
@@ -338,22 +353,16 @@ fn parse_compression_backend(
                 m.to_string()
             },
         }),
-        #[cfg(feature = "backend-rwkv")]
         "rate-ac" | "rate_ac" | "rateac" => Ok(CompressionBackend::Rate {
             rate_backend: rate_backend.unwrap_or_default(),
-            coder: infotheory::rwkvzip::CoderType::AC,
+            coder: infotheory::coders::CoderType::AC,
             framing: infotheory::compression::FramingMode::Raw,
         }),
-        #[cfg(feature = "backend-rwkv")]
         "rate-rans" | "rate_rans" | "raterans" => Ok(CompressionBackend::Rate {
             rate_backend: rate_backend.unwrap_or_default(),
-            coder: infotheory::rwkvzip::CoderType::RANS,
+            coder: infotheory::coders::CoderType::RANS,
             framing: infotheory::compression::FramingMode::Raw,
         }),
-        #[cfg(not(feature = "backend-rwkv"))]
-        "rate-ac" | "rate_ac" | "rateac" | "rate-rans" | "rate_rans" | "raterans" => Err(
-            PyValueError::new_err("rate-coded compression backends require backend-rwkv feature"),
-        ),
         _ => Err(PyValueError::new_err(format!(
             "unknown compression backend '{name}'"
         ))),
@@ -611,6 +620,14 @@ impl PyRateBackend {
     }
 
     #[staticmethod]
+    #[cfg(feature = "backend-mamba")]
+    fn mamba(method: String) -> Self {
+        Self {
+            inner: RateBackend::MambaMethod { method },
+        }
+    }
+
+    #[staticmethod]
     #[cfg(feature = "backend-rwkv")]
     fn rwkv7(method: String) -> Self {
         Self {
@@ -660,28 +677,26 @@ impl PyCompressionBackend {
     }
 
     #[staticmethod]
-    #[cfg(feature = "backend-rwkv")]
     #[pyo3(signature = (rate_backend, framing="raw"))]
     fn rate_ac(rate_backend: &PyRateBackend, framing: &str) -> PyResult<Self> {
         let framing = parse_framing_mode(framing)?;
         Ok(Self {
             inner: CompressionBackend::Rate {
                 rate_backend: rate_backend.inner.clone(),
-                coder: infotheory::rwkvzip::CoderType::AC,
+                coder: infotheory::coders::CoderType::AC,
                 framing,
             },
         })
     }
 
     #[staticmethod]
-    #[cfg(feature = "backend-rwkv")]
     #[pyo3(signature = (rate_backend, framing="raw"))]
     fn rate_rans(rate_backend: &PyRateBackend, framing: &str) -> PyResult<Self> {
         let framing = parse_framing_mode(framing)?;
         Ok(Self {
             inner: CompressionBackend::Rate {
                 rate_backend: rate_backend.inner.clone(),
-                coder: infotheory::rwkvzip::CoderType::RANS,
+                coder: infotheory::coders::CoderType::RANS,
                 framing,
             },
         })
@@ -695,14 +710,17 @@ impl PyCompressionBackend {
             .ok_or_else(|| PyValueError::new_err("coder must be 'ac' or 'rans'"))?;
         match method {
             Some(m) => match infotheory::rwkvzip::parse_method_spec(&m) {
-                Ok(infotheory::rwkvzip::MethodSpec::File(path)) => {
+                Ok(infotheory::rwkvzip::MethodSpec::File { path, policy: None }) => {
                     let model =
                         infotheory::load_rwkv7_model_from_path(path.to_string_lossy().as_ref());
                     Ok(Self {
                         inner: CompressionBackend::Rwkv7 { model, coder },
                     })
                 }
-                Ok(infotheory::rwkvzip::MethodSpec::Online(_)) => Ok(Self {
+                Ok(infotheory::rwkvzip::MethodSpec::File {
+                    policy: Some(_), ..
+                })
+                | Ok(infotheory::rwkvzip::MethodSpec::Online { .. }) => Ok(Self {
                     inner: CompressionBackend::Rate {
                         rate_backend: RateBackend::Rwkv7Method { method: m },
                         coder,
@@ -3159,7 +3177,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "backend-rwkv")]
     #[test]
     fn parse_framing_mode_accepts_aliases() {
         let raw = parse_framing_mode("raw").expect("raw framing");
@@ -3171,7 +3188,6 @@ mod tests {
         assert!(parse_framing_mode("nope").is_err());
     }
 
-    #[cfg(feature = "backend-rwkv")]
     #[test]
     fn compression_backend_rate_methods_accept_framed() {
         let rb = PyRateBackend {

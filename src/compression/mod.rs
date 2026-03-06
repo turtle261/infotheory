@@ -7,16 +7,19 @@
 
 use anyhow::{Result, bail};
 
-#[cfg(feature = "backend-rwkv")]
-use crate::backends::rwkvzip;
 use crate::coders::{
     ANS_TOTAL, ArithmeticDecoder, ArithmeticEncoder, BlockedRansDecoder, BlockedRansEncoder,
-    CDF_TOTAL, Cdf, quantize_pdf_to_cdf_inplace, quantize_pdf_to_rans_cdf_with_buffer,
+    CDF_TOTAL, Cdf, CoderType, crc32, quantize_pdf_to_cdf_inplace,
+    quantize_pdf_to_rans_cdf_with_buffer,
 };
 use crate::ctw::FacContextTree;
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip;
 use crate::mixture::DEFAULT_MIN_PROB;
 use crate::neural_mix::NeuralMixCore;
 use crate::rosaplus::RosaPlus;
+#[cfg(feature = "backend-rwkv")]
+use crate::rwkvzip;
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{MixtureKind, MixtureSpec, RateBackend};
 
@@ -46,13 +49,13 @@ struct FramedHeader {
 impl FramedHeader {
     const SIZE: usize = 4 + 1 + 1 + 8 + 4;
 
-    fn new(coder: rwkvzip::CoderType, original_len: u64, crc32: u32) -> Self {
+    fn new(coder: CoderType, original_len: u64, crc32: u32) -> Self {
         Self {
             magic: FRAMED_MAGIC,
             version: FRAMED_VERSION,
             coder: match coder {
-                rwkvzip::CoderType::AC => 0,
-                rwkvzip::CoderType::RANS => 1,
+                CoderType::AC => 0,
+                CoderType::RANS => 1,
             },
             original_len,
             crc32,
@@ -93,10 +96,10 @@ impl FramedHeader {
         })
     }
 
-    fn coder_type(&self) -> rwkvzip::CoderType {
+    fn coder_type(&self) -> CoderType {
         match self.coder {
-            0 => rwkvzip::CoderType::AC,
-            _ => rwkvzip::CoderType::RANS,
+            0 => CoderType::AC,
+            _ => CoderType::RANS,
         }
     }
 }
@@ -275,7 +278,9 @@ impl CtwPredictor {
     fn bit_prob_one_msb(&mut self, bit_idx: usize) -> f64 {
         debug_assert!(self.bits_per_symbol == 8);
         debug_assert!(self.msb_first);
-        self.tree.predict(true, bit_idx).clamp(PDF_MIN, 1.0 - PDF_MIN)
+        self.tree
+            .predict(true, bit_idx)
+            .clamp(PDF_MIN, 1.0 - PDF_MIN)
     }
 
     #[inline]
@@ -325,6 +330,16 @@ impl RosaPredictor {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "backend-mamba")]
+struct MambaPredictor {
+    compressor: mambazip::Compressor,
+    primed: bool,
+    pdf: Vec<f64>,
+    valid: bool,
+}
+
+#[derive(Clone)]
+#[cfg(feature = "backend-rwkv")]
 struct RwkvPredictor {
     compressor: rwkvzip::Compressor,
     primed: bool,
@@ -372,8 +387,86 @@ impl ZpaqPredictor {
     }
 }
 
+#[cfg(feature = "backend-mamba")]
+impl MambaPredictor {
+    fn from_model(model: std::sync::Arc<mambazip::Model>) -> Self {
+        let compressor = mambazip::Compressor::new_from_model(model);
+        let vocab = compressor.vocab_size();
+        Self {
+            compressor,
+            primed: false,
+            pdf: vec![0.0; vocab],
+            valid: false,
+        }
+    }
+
+    fn from_method(method: &str) -> Result<Self> {
+        let compressor = mambazip::Compressor::new_from_method(method)?;
+        let vocab = compressor.vocab_size();
+        Ok(Self {
+            compressor,
+            primed: false,
+            pdf: vec![0.0; vocab],
+            valid: false,
+        })
+    }
+
+    fn ensure_predicted(&mut self) {
+        if self.valid {
+            return;
+        }
+        if !self.primed {
+            let bias = self.compressor.online_bias_snapshot();
+            let logits = self.compressor.model.forward(
+                &mut self.compressor.scratch,
+                0,
+                &mut self.compressor.state,
+            );
+            mambazip::Compressor::logits_to_pdf(
+                logits,
+                bias.as_deref(),
+                &mut self.compressor.pdf_buffer,
+            );
+            self.pdf.copy_from_slice(&self.compressor.pdf_buffer);
+            self.primed = true;
+            self.valid = true;
+            return;
+        }
+        self.pdf.copy_from_slice(&self.compressor.pdf_buffer);
+        self.valid = true;
+    }
+
+    fn pdf_next(&mut self) -> &[f64] {
+        self.ensure_predicted();
+        &self.pdf
+    }
+
+    fn update(&mut self, symbol: u8) -> Result<()> {
+        self.ensure_predicted();
+        self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
+        let bias = self.compressor.online_bias_snapshot();
+        let logits = self.compressor.model.forward(
+            &mut self.compressor.scratch,
+            symbol as u32,
+            &mut self.compressor.state,
+        );
+        mambazip::Compressor::logits_to_pdf(
+            logits,
+            bias.as_deref(),
+            &mut self.compressor.pdf_buffer,
+        );
+        self.valid = false;
+        Ok(())
+    }
+
+    fn begin_stream(&mut self, total_len: usize) -> Result<()> {
+        self.compressor
+            .begin_online_policy_stream(Some(total_len as u64))
+    }
+}
+
+#[cfg(feature = "backend-rwkv")]
 impl RwkvPredictor {
-    #[cfg(feature = "backend-rwkv")]
     fn from_model(model: std::sync::Arc<rwkvzip::Model>) -> Self {
         let compressor = rwkvzip::Compressor::new_from_model(model);
         let vocab = compressor.vocab_size();
@@ -385,7 +478,6 @@ impl RwkvPredictor {
         }
     }
 
-    #[cfg(feature = "backend-rwkv")]
     fn from_method(method: &str) -> Result<Self> {
         let compressor = rwkvzip::Compressor::new_from_method(method)?;
         let vocab = compressor.vocab_size();
@@ -443,6 +535,11 @@ impl RwkvPredictor {
         );
         self.valid = false;
         Ok(())
+    }
+
+    fn begin_stream(&mut self, total_len: usize) -> Result<()> {
+        self.compressor
+            .begin_online_policy_stream(Some(total_len as u64))
     }
 }
 
@@ -574,6 +671,13 @@ impl MixturePredictor {
         normalize_pdf(&mut self.pdf);
         self.valid = true;
         Ok(&self.pdf)
+    }
+
+    fn begin_stream(&mut self, total_len: usize) -> Result<()> {
+        for expert in &mut self.experts {
+            expert.predictor.begin_stream(total_len)?;
+        }
+        Ok(())
     }
 
     fn update(&mut self, symbol: u8) -> Result<()> {
@@ -717,8 +821,7 @@ impl MixturePredictor {
         self.neural_lo.resize(n, 0);
         self.neural_hi.resize(n, 256);
         if self.neural_pdf_cdf_rows.len() < n {
-            self.neural_pdf_cdf_rows
-                .resize_with(n, || vec![0.0; 257]);
+            self.neural_pdf_cdf_rows.resize_with(n, || vec![0.0; 257]);
         }
 
         for i in 0..n {
@@ -827,7 +930,8 @@ impl MixturePredictor {
         }
 
         self.neural.evaluate_symbol(&self.neural_logps, PDF_MIN);
-        self.neural.update_weights_symbol(&self.neural_logps, PDF_MIN);
+        self.neural
+            .update_weights_symbol(&self.neural_logps, PDF_MIN);
         self.neural.update_history(symbol);
         self.valid = false;
         Ok(symbol)
@@ -840,6 +944,8 @@ enum RatePdfPredictor {
     Rosa(RosaPredictor),
     Ctw(CtwPredictor),
     FacCtw(CtwPredictor),
+    #[cfg(feature = "backend-mamba")]
+    Mamba(MambaPredictor),
     #[cfg(feature = "backend-rwkv")]
     Rwkv(RwkvPredictor),
     Zpaq(ZpaqPredictor),
@@ -860,6 +966,12 @@ impl RatePdfPredictor {
                 let bits = encoding_bits.clamp(1, 8);
                 Ok(Self::FacCtw(CtwPredictor::new_fac(base_depth, bits)))
             }
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::Mamba { model } => Ok(Self::Mamba(MambaPredictor::from_model(model))),
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::MambaMethod { method } => {
+                Ok(Self::Mamba(MambaPredictor::from_method(&method)?))
+            }
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { model } => Ok(Self::Rwkv(RwkvPredictor::from_model(model))),
             #[cfg(feature = "backend-rwkv")]
@@ -876,11 +988,26 @@ impl RatePdfPredictor {
         }
     }
 
+    fn begin_stream(&mut self, total_len: usize) -> Result<()> {
+        match self {
+            Self::Rosa(_) | Self::Ctw(_) | Self::FacCtw(_) | Self::Zpaq(_) | Self::Particle(_) => {
+                Ok(())
+            }
+            #[cfg(feature = "backend-mamba")]
+            Self::Mamba(m) => m.begin_stream(total_len),
+            #[cfg(feature = "backend-rwkv")]
+            Self::Rwkv(m) => m.begin_stream(total_len),
+            Self::Mixture(m) => m.begin_stream(total_len),
+        }
+    }
+
     fn pdf_next(&mut self) -> Result<&[f64]> {
         match self {
             Self::Rosa(m) => Ok(m.pdf_next()),
             Self::Ctw(m) => Ok(m.pdf_next()),
             Self::FacCtw(m) => Ok(m.pdf_next()),
+            #[cfg(feature = "backend-mamba")]
+            Self::Mamba(m) => Ok(m.pdf_next()),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => Ok(m.pdf_next()),
             Self::Zpaq(m) => Ok(m.pdf_next()),
@@ -903,6 +1030,8 @@ impl RatePdfPredictor {
                 m.update(symbol);
                 Ok(())
             }
+            #[cfg(feature = "backend-mamba")]
+            Self::Mamba(m) => m.update(symbol),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => m.update(symbol),
             Self::Zpaq(m) => {
@@ -932,6 +1061,7 @@ fn binary_split_from_prob_one(p1: f64) -> u32 {
 }
 
 fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Vec<u8>> {
+    predictor.begin_stream(data.len())?;
     if let RatePdfPredictor::Mixture(mix) = predictor {
         if mix.can_fast_neural_ac_bitwise() {
             let mut out = Vec::new();
@@ -976,6 +1106,7 @@ fn decode_payload_ac(
     out_len: usize,
     predictor: &mut RatePdfPredictor,
 ) -> Result<Vec<u8>> {
+    predictor.begin_stream(out_len)?;
     if let RatePdfPredictor::Mixture(mix) = predictor {
         if mix.can_fast_neural_ac_bitwise() {
             let mut dec = ArithmeticDecoder::new(payload)?;
@@ -1006,6 +1137,7 @@ fn decode_payload_ac(
 }
 
 fn encode_payload_rans(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Vec<u8>> {
+    predictor.begin_stream(data.len())?;
     let mut encoder = BlockedRansEncoder::new();
     let mut cdf = vec![0u32; 257];
     let mut freq = vec![0i64; 256];
@@ -1033,6 +1165,7 @@ fn decode_payload_rans(
     out_len: usize,
     predictor: &mut RatePdfPredictor,
 ) -> Result<Vec<u8>> {
+    predictor.begin_stream(out_len)?;
     if payload.len() < 4 {
         bail!("rANS payload too short");
     }
@@ -1080,13 +1213,13 @@ pub fn compress_rate_bytes(
     data: &[u8],
     rate_backend: &RateBackend,
     max_order: i64,
-    coder: rwkvzip::CoderType,
+    coder: CoderType,
     framing: FramingMode,
 ) -> Result<Vec<u8>> {
     let mut predictor = RatePdfPredictor::from_rate_backend(rate_backend.clone(), max_order)?;
     let payload = match coder {
-        rwkvzip::CoderType::AC => encode_payload_ac(data, &mut predictor)?,
-        rwkvzip::CoderType::RANS => encode_payload_rans(data, &mut predictor)?,
+        CoderType::AC => encode_payload_ac(data, &mut predictor)?,
+        CoderType::RANS => encode_payload_rans(data, &mut predictor)?,
     };
 
     if framing == FramingMode::Raw {
@@ -1094,7 +1227,7 @@ pub fn compress_rate_bytes(
     }
 
     let mut out = Vec::with_capacity(FramedHeader::SIZE + payload.len());
-    let hdr = FramedHeader::new(coder, data.len() as u64, rwkvzip::crc32(data));
+    let hdr = FramedHeader::new(coder, data.len() as u64, crc32(data));
     hdr.write(&mut out);
     out.extend_from_slice(&payload);
     Ok(out)
@@ -1105,7 +1238,7 @@ pub fn compress_rate_size(
     data: &[u8],
     rate_backend: &RateBackend,
     max_order: i64,
-    coder: rwkvzip::CoderType,
+    coder: CoderType,
     framing: FramingMode,
 ) -> Result<u64> {
     let encoded = compress_rate_bytes(data, rate_backend, max_order, coder, framing)?;
@@ -1117,7 +1250,7 @@ pub fn compress_rate_size_chain(
     parts: &[&[u8]],
     rate_backend: &RateBackend,
     max_order: i64,
-    coder: rwkvzip::CoderType,
+    coder: CoderType,
     framing: FramingMode,
 ) -> Result<u64> {
     let total = parts.iter().map(|p| p.len()).sum();
@@ -1133,7 +1266,7 @@ pub fn decompress_rate_bytes(
     input: &[u8],
     rate_backend: &RateBackend,
     max_order: i64,
-    _coder: rwkvzip::CoderType,
+    _coder: CoderType,
     framing: FramingMode,
 ) -> Result<Vec<u8>> {
     let (payload, coder, out_len, expected_crc) = if framing == FramingMode::Framed {
@@ -1151,12 +1284,12 @@ pub fn decompress_rate_bytes(
     let _ = coder;
     let mut predictor = RatePdfPredictor::from_rate_backend(rate_backend.clone(), max_order)?;
     let decoded = match coder {
-        rwkvzip::CoderType::AC => decode_payload_ac(payload, out_len, &mut predictor)?,
-        rwkvzip::CoderType::RANS => decode_payload_rans(payload, out_len, &mut predictor)?,
+        CoderType::AC => decode_payload_ac(payload, out_len, &mut predictor)?,
+        CoderType::RANS => decode_payload_rans(payload, out_len, &mut predictor)?,
     };
 
     if let Some(crc) = expected_crc {
-        let got = rwkvzip::crc32(&decoded);
+        let got = crc32(&decoded);
         if got != crc {
             bail!("CRC32 mismatch: expected 0x{crc:08X}, got 0x{got:08X}");
         }
@@ -1304,22 +1437,10 @@ mod tests {
     fn roundtrip_rate_ac_ctw() {
         let data = b"ctw backend roundtrip payload";
         let backend = RateBackend::Ctw { depth: 8 };
-        let enc = compress_rate_bytes(
-            data,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
-        let dec = decompress_rate_bytes(
-            &enc,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -1373,22 +1494,10 @@ mod tests {
         let backend = RateBackend::Mixture {
             spec: Arc::new(root),
         };
-        let enc = compress_rate_bytes(
-            data,
-            &backend,
-            -1,
-            rwkvzip::CoderType::RANS,
-            FramingMode::Framed,
-        )
-        .unwrap();
-        let dec = decompress_rate_bytes(
-            &enc,
-            &backend,
-            -1,
-            rwkvzip::CoderType::RANS,
-            FramingMode::Framed,
-        )
-        .unwrap();
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::RANS, FramingMode::Framed).unwrap();
+        let dec = decompress_rate_bytes(&enc, &backend, -1, CoderType::RANS, FramingMode::Framed)
+            .unwrap();
         assert_eq!(dec, data);
     }
 
@@ -1442,22 +1551,10 @@ mod tests {
         let backend = RateBackend::Mixture {
             spec: Arc::new(root),
         };
-        let enc = compress_rate_bytes(
-            data,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
-        let dec = decompress_rate_bytes(
-            &enc,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -1511,16 +1608,9 @@ mod tests {
     fn raw_size_not_larger_than_framed_size() {
         let data = b"raw/framed size check payload";
         let backend = RateBackend::RosaPlus;
-        let raw = compress_rate_size(data, &backend, 8, rwkvzip::CoderType::AC, FramingMode::Raw)
-            .unwrap();
-        let framed = compress_rate_size(
-            data,
-            &backend,
-            8,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
+        let raw = compress_rate_size(data, &backend, 8, CoderType::AC, FramingMode::Raw).unwrap();
+        let framed =
+            compress_rate_size(data, &backend, 8, CoderType::AC, FramingMode::Framed).unwrap();
         assert!(framed >= raw);
     }
 
@@ -1529,24 +1619,12 @@ mod tests {
     fn roundtrip_rate_rwkv_method_cfg() {
         let data = b"rwkv cfg method backend";
         let backend = RateBackend::Rwkv7Method {
-            method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1".to_string(),
+            method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
         };
-        let enc = compress_rate_bytes(
-            data,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
-        let dec = decompress_rate_bytes(
-            &enc,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -1567,22 +1645,10 @@ mod tests {
         let backend = RateBackend::Particle {
             spec: Arc::new(spec),
         };
-        let enc = compress_rate_bytes(
-            data,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
-        let dec = decompress_rate_bytes(
-            &enc,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -1603,22 +1669,10 @@ mod tests {
         let backend = RateBackend::Particle {
             spec: Arc::new(spec),
         };
-        let enc = compress_rate_bytes(
-            data,
-            &backend,
-            -1,
-            rwkvzip::CoderType::RANS,
-            FramingMode::Framed,
-        )
-        .unwrap();
-        let dec = decompress_rate_bytes(
-            &enc,
-            &backend,
-            -1,
-            rwkvzip::CoderType::RANS,
-            FramingMode::Framed,
-        )
-        .unwrap();
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::RANS, FramingMode::Framed).unwrap();
+        let dec = decompress_rate_bytes(&enc, &backend, -1, CoderType::RANS, FramingMode::Framed)
+            .unwrap();
         assert_eq!(dec, data);
     }
 
@@ -1658,22 +1712,10 @@ mod tests {
             spec: Arc::new(spec),
         };
         let data = b"mixture with particle expert roundtrip";
-        let enc = compress_rate_bytes(
-            data,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
-        let dec = decompress_rate_bytes(
-            &enc,
-            &backend,
-            -1,
-            rwkvzip::CoderType::AC,
-            FramingMode::Framed,
-        )
-        .unwrap();
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 }

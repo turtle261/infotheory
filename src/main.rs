@@ -175,6 +175,14 @@ fn rwkv7_model_path_from_env() -> String {
     })
 }
 
+#[cfg(feature = "backend-mamba")]
+fn mamba_model_path_from_env() -> String {
+    env::var("MAMBA_MODEL_PATH").unwrap_or_else(|_| {
+        eprintln!("Error: MAMBA_MODEL_PATH env var must be set when using mamba backends");
+        std::process::exit(1);
+    })
+}
+
 fn parse_rate_backend(v: &str) -> Option<&'static str> {
     match infotheory::backends::resolve_rate_backend_name(v) {
         Some(infotheory::backends::BackendAvailability::Enabled(name)) => Some(name),
@@ -456,6 +464,42 @@ fn parse_mixture_expert_value(
                 max_order: -1,
                 backend: RateBackend::Zpaq { method },
             })
+        }
+        "mamba" => {
+            #[cfg(feature = "backend-mamba")]
+            {
+                if let Some(method) = v["method"].as_str().or_else(|| v["mamba_method"].as_str()) {
+                    Ok(MixtureExpertSpec {
+                        name,
+                        log_prior,
+                        max_order: -1,
+                        backend: RateBackend::MambaMethod {
+                            method: method.to_string(),
+                        },
+                    })
+                } else {
+                    let model_path = v["model_path"]
+                        .as_str()
+                        .or_else(|| v["mamba_model_path"].as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("mamba expert missing model_path or method")
+                        })?;
+                    let model = load_mamba_model_from_path(model_path);
+                    Ok(MixtureExpertSpec {
+                        name,
+                        log_prior,
+                        max_order: -1,
+                        backend: RateBackend::Mamba { model },
+                    })
+                }
+            }
+            #[cfg(not(feature = "backend-mamba"))]
+            {
+                let _ = (name, log_prior);
+                Err(anyhow::anyhow!(
+                    "mamba expert requires 'backend-mamba' feature in infotheory"
+                ))
+            }
         }
         "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
@@ -741,6 +785,34 @@ fn parse_vm_stats_backend(
                 encoding_bits,
             })
         }
+        Some("mamba") => {
+            #[cfg(feature = "backend-mamba")]
+            {
+                if let Some(method) = cfg["method"]
+                    .as_str()
+                    .or_else(|| cfg["mamba_method"].as_str())
+                {
+                    Ok(RateBackend::MambaMethod {
+                        method: method.to_string(),
+                    })
+                } else {
+                    let path = cfg["mamba_model_path"]
+                        .as_str()
+                        .or_else(|| cfg["model_path"].as_str())
+                        .or_else(|| root["mamba_model_path"].as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(mamba_model_path_from_env);
+                    let model = load_mamba_model_from_path(&path);
+                    Ok(RateBackend::Mamba { model })
+                }
+            }
+            #[cfg(not(feature = "backend-mamba"))]
+            {
+                Err(anyhow::anyhow!(
+                    "mamba stats backend requires 'backend-mamba' feature in infotheory"
+                ))
+            }
+        }
         Some("rwkv7") => {
             #[cfg(feature = "backend-rwkv")]
             {
@@ -801,6 +873,23 @@ fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBack
             num_percept_bits: 8,
             encoding_bits: 8,
         }),
+        "mamba" | "mamba1" => {
+            #[cfg(feature = "backend-mamba")]
+            {
+                let path = root["mamba_model_path"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(mamba_model_path_from_env);
+                let model = load_mamba_model_from_path(&path);
+                Ok(RateBackend::Mamba { model })
+            }
+            #[cfg(not(feature = "backend-mamba"))]
+            {
+                Err(anyhow::anyhow!(
+                    "mamba default stats backend requires 'backend-mamba' feature in infotheory"
+                ))
+            }
+        }
         "rosa" | "rosaplus" => Ok(RateBackend::RosaPlus),
         "rwkv" | "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
@@ -1265,6 +1354,27 @@ fn parse_nyx_filter(
 
 fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>) -> InfotheoryCtx {
     let rate_backend = match rate_backend {
+        "mamba" => {
+            #[cfg(feature = "backend-mamba")]
+            {
+                if let Some(m) = method {
+                    RateBackend::MambaMethod {
+                        method: m.to_string(),
+                    }
+                } else {
+                    let p = mamba_model_path_from_env();
+                    let model = load_mamba_model_from_path(&p);
+                    RateBackend::Mamba { model }
+                }
+            }
+            #[cfg(not(feature = "backend-mamba"))]
+            {
+                eprintln!(
+                    "Error: rate backend 'mamba' requires infotheory built with feature 'backend-mamba'"
+                );
+                std::process::exit(1);
+            }
+        }
         "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
@@ -1358,14 +1468,17 @@ fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>
                     }
                     // Method-based RWKV config: file:/... or cfg:...
                     Some(m) => match rwkvzip::parse_method_spec(m) {
-                        Ok(rwkvzip::MethodSpec::File(path)) => {
+                        Ok(rwkvzip::MethodSpec::File { path, policy: None }) => {
                             let model = load_rwkv7_model_from_path(path.to_string_lossy().as_ref());
                             CompressionBackend::Rwkv7 {
                                 model,
                                 coder: rwkvzip::CoderType::AC,
                             }
                         }
-                        Ok(rwkvzip::MethodSpec::Online(_)) => CompressionBackend::Rate {
+                        Ok(rwkvzip::MethodSpec::File {
+                            policy: Some(_), ..
+                        })
+                        | Ok(rwkvzip::MethodSpec::Online { .. }) => CompressionBackend::Rate {
                             rate_backend: RateBackend::Rwkv7Method {
                                 method: m.to_string(),
                             },
@@ -1398,40 +1511,16 @@ fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>
                 std::process::exit(1);
             }
         }
-        "rate-ac" => {
-            #[cfg(feature = "backend-rwkv")]
-            {
-                CompressionBackend::Rate {
-                    rate_backend: rate_backend.clone(),
-                    coder: rwkvzip::CoderType::AC,
-                    framing: infotheory::compression::FramingMode::Raw,
-                }
-            }
-            #[cfg(not(feature = "backend-rwkv"))]
-            {
-                eprintln!(
-                    "Error: compression backend 'rate-ac' requires infotheory built with feature 'backend-rwkv'"
-                );
-                std::process::exit(1);
-            }
-        }
-        "rate-rans" => {
-            #[cfg(feature = "backend-rwkv")]
-            {
-                CompressionBackend::Rate {
-                    rate_backend: rate_backend.clone(),
-                    coder: rwkvzip::CoderType::RANS,
-                    framing: infotheory::compression::FramingMode::Raw,
-                }
-            }
-            #[cfg(not(feature = "backend-rwkv"))]
-            {
-                eprintln!(
-                    "Error: compression backend 'rate-rans' requires infotheory built with feature 'backend-rwkv'"
-                );
-                std::process::exit(1);
-            }
-        }
+        "rate-ac" => CompressionBackend::Rate {
+            rate_backend: rate_backend.clone(),
+            coder: infotheory::coders::CoderType::AC,
+            framing: infotheory::compression::FramingMode::Raw,
+        },
+        "rate-rans" => CompressionBackend::Rate {
+            rate_backend: rate_backend.clone(),
+            coder: infotheory::coders::CoderType::RANS,
+            framing: infotheory::compression::FramingMode::Raw,
+        },
         _ => {
             let m = method.unwrap_or("5").to_string();
             CompressionBackend::Zpaq { method: m }
@@ -1453,7 +1542,6 @@ fn read_file(path: &str) -> Vec<u8> {
 
 fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
     match backend {
-        #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rate {
             rate_backend,
             coder,
@@ -1467,8 +1555,7 @@ fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
     }
 }
 
-#[cfg(feature = "backend-rwkv")]
-fn maybe_export_rwkv_online(
+fn maybe_export_online_model(
     export_path: Option<&str>,
     ctx: &InfotheoryCtx,
     parts: &[&[u8]],
@@ -1477,33 +1564,46 @@ fn maybe_export_rwkv_online(
         return Ok(());
     };
 
-    let method = match &ctx.rate_backend {
-        RateBackend::Rwkv7Method { method } => Some(method.as_str()),
-        _ => match &ctx.compression_backend {
-            CompressionBackend::Rate {
-                rate_backend: RateBackend::Rwkv7Method { method },
-                ..
-            } => Some(method.as_str()),
-            _ => None,
-        },
-    };
+    #[cfg(feature = "backend-rwkv")]
+    {
+        let rwkv_method = match &ctx.rate_backend {
+            RateBackend::Rwkv7Method { method } => Some(method.as_str()),
+            _ => match &ctx.compression_backend {
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::Rwkv7Method { method },
+                    ..
+                } => Some(method.as_str()),
+                _ => None,
+            },
+        };
+        if let Some(method) = rwkv_method {
+            let mut compressor = rwkvzip::Compressor::new_from_method(method)?;
+            let _ = compressor.compress_size_chain(parts, infotheory::coders::CoderType::AC)?;
+            compressor.export_online(path)?;
+            return Ok(());
+        }
+    }
 
-    let Some(method) = method else {
-        return Ok(());
-    };
+    #[cfg(feature = "backend-mamba")]
+    {
+        let mamba_method = match &ctx.rate_backend {
+            RateBackend::MambaMethod { method } => Some(method.as_str()),
+            _ => match &ctx.compression_backend {
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::MambaMethod { method },
+                    ..
+                } => Some(method.as_str()),
+                _ => None,
+            },
+        };
+        if let Some(method) = mamba_method {
+            let mut compressor = mambazip::Compressor::new_from_method(method)?;
+            let _ = compressor.compress_size_chain(parts, infotheory::coders::CoderType::AC)?;
+            compressor.export_online(path)?;
+            return Ok(());
+        }
+    }
 
-    let mut compressor = rwkvzip::Compressor::new_from_method(method)?;
-    let _ = compressor.compress_size_chain(parts, rwkvzip::CoderType::AC)?;
-    compressor.export_online(path)?;
-    Ok(())
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-fn maybe_export_rwkv_online(
-    _export_path: Option<&str>,
-    _ctx: &InfotheoryCtx,
-    _parts: &[&[u8]],
-) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -2298,7 +2398,7 @@ fn main() {
     let mut rate_backend_str = "rosaplus".to_string();
     let mut compression_backend_str = "zpaq".to_string();
     let mut method_str: Option<String> = None;
-    let mut rwkv_export_path: Option<String> = None;
+    let mut model_export_path: Option<String> = None;
     let mut rate_backend_specified = false;
 
     let mut i = flags_start;
@@ -2332,9 +2432,9 @@ fn main() {
                 i += 1;
                 method_str = args.get(i).cloned();
             }
-            "--rwkv-export" => {
+            "--model-export" | "--rwkv-export" => {
                 i += 1;
-                rwkv_export_path = args.get(i).cloned();
+                model_export_path = args.get(i).cloned();
             }
             _ => {}
         }
@@ -2382,8 +2482,9 @@ fn main() {
                 data.len(),
                 compressed.len()
             );
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&data]) {
-                eprintln!("Error exporting RWKV model: {e}");
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
+            {
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
@@ -2408,9 +2509,10 @@ fn main() {
                 input.len(),
                 decoded.len()
             );
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&decoded])
+            if let Err(e) =
+                maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&decoded])
             {
-                eprintln!("Error exporting RWKV model: {e}");
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
@@ -2430,9 +2532,10 @@ fn main() {
                 "{}",
                 ncd_bytes_backend(&b1, &b2, &ctx.compression_backend, variant)
             );
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&b1, &b2])
+            if let Err(e) =
+                maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&b1, &b2])
             {
-                eprintln!("Error exporting RWKV model: {e}");
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
@@ -2452,8 +2555,9 @@ fn main() {
             } else {
                 println!("{}", ctx.entropy_rate_bytes(&data, max_order));
             }
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&data]) {
-                eprintln!("Error exporting RWKV model: {e}");
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
+            {
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
@@ -2462,8 +2566,9 @@ fn main() {
             let max_order = pos_arg3.and_then(|s| s.parse().ok()).unwrap_or(-1);
             let data = read_file(&f1);
             println!("{:.6}", intrinsic_dependence_bytes(&data, max_order));
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&data]) {
-                eprintln!("Error exporting RWKV model: {e}");
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
+            {
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
@@ -2502,9 +2607,10 @@ fn main() {
                 }
             };
             println!("{}", res);
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&b1, &b2])
+            if let Err(e) =
+                maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&b1, &b2])
             {
-                eprintln!("Error exporting RWKV model: {e}");
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
@@ -2575,13 +2681,14 @@ Options:
                           Backend for NCD/compression: {compression_backends}
   --ncd-backend <name>    Deprecated alias for --compression-backend
   --method <val>          Method/config (e.g. '5' for zpaq, '16' for ctw, mixture spec path,
-                          RWKV method: file:/path/model.safetensors or cfg:key=value,...)
-  --rwkv-export <path>    Optional RWKV export path (.safetensors + .json sidecar)
+                          model method: file:/path/model.safetensors[;policy:...] or cfg:key=value,...[;policy:...])
+  --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
+  --rwkv-export <path>    Backward-compatible alias for --model-export
 
 Examples:
   infotheory ncd file1.txt file2.txt --compression-backend zpaq --method 5
   infotheory ncd file1.txt file2.txt --compression-backend rate-ac --rate-backend ctw
-  infotheory h file.txt --rate-backend rwkv7 --method "cfg:hidden=64,layers=1,intermediate=64,train=sgd,lr=0.01" --rwkv-export ./rwkv_online.safetensors
+  infotheory h file.txt --rate-backend mamba --method "cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4,train=adam,lr=0.001;policy:schedule=0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)" --model-export ./mamba_online.safetensors
   infotheory h file.txt --rate-backend ctw --method 32
   infotheory h file.txt --rate-backend mixture --method mixture.json
   infotheory search "encryption" ./src --prior "codebase context"
@@ -2606,12 +2713,11 @@ mod tests {
         assert!(matches!(out, CompressionBackend::Zpaq { method } if method == "5"));
     }
 
-    #[cfg(feature = "backend-rwkv")]
     #[test]
     fn file_roundtrip_backend_forces_rate_framed() {
         let b = CompressionBackend::Rate {
             rate_backend: RateBackend::Ctw { depth: 8 },
-            coder: rwkvzip::CoderType::AC,
+            coder: infotheory::coders::CoderType::AC,
             framing: infotheory::compression::FramingMode::Raw,
         };
         let out = file_roundtrip_backend(&b);
@@ -2656,7 +2762,9 @@ mod tests {
         let ctx = build_ctx(
             "rosaplus",
             "rwkv7",
-            Some("cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01"),
+            Some(
+                "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer",
+            ),
         );
 
         match ctx.compression_backend {
@@ -2682,11 +2790,15 @@ mod tests {
         assert_eq!(parse_compression_backend("unknown"), None);
         #[cfg(feature = "backend-zpaq")]
         assert_eq!(parse_compression_backend("zpaq"), Some("zpaq"));
+        assert_eq!(parse_compression_backend("rate_ac"), Some("rate-ac"));
+        assert_eq!(parse_compression_backend("raterans"), Some("rate-rans"));
         #[cfg(feature = "backend-rwkv")]
         {
-            assert_eq!(parse_compression_backend("rate_ac"), Some("rate-ac"));
-            assert_eq!(parse_compression_backend("raterans"), Some("rate-rans"));
             assert_eq!(parse_compression_backend("rwkv"), Some("rwkv7"));
+        }
+        #[cfg(feature = "backend-mamba")]
+        {
+            assert_eq!(parse_rate_backend("mamba1"), Some("mamba"));
         }
     }
 

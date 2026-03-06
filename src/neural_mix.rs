@@ -71,11 +71,7 @@ impl NeuralMixCore {
                 let mut entry = NeuralStage1Entry::new(expert_count);
                 if ctx_idx == 0 {
                     for (dst, &p) in entry.logits.iter_mut().zip(prior_weights.iter()) {
-                        let p = if p.is_finite() {
-                            p.max(1e-12)
-                        } else {
-                            1e-12
-                        };
+                        let p = if p.is_finite() { p.max(1e-12) } else { 1e-12 };
                         *dst = p.ln();
                     }
                 }

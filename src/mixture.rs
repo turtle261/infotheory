@@ -10,6 +10,8 @@
 //! switching, and MDL-style selectors to be used anywhere a rate backend is accepted.
 
 use crate::ctw::FacContextTree;
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip;
 use crate::neural_mix::{NeuralHistoryState, NeuralMixCore};
 use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
@@ -82,6 +84,14 @@ fn logsumexp_weights(experts: &[ExpertState]) -> f64 {
 
 /// Trait for online byte-level predictors that expose per-symbol log-probabilities.
 pub trait OnlineBytePredictor: Send {
+    /// Optional stream-start hook.
+    ///
+    /// Predictors that require total symbol count (for example percent-based
+    /// policy schedules) can initialize runtime state here.
+    fn begin_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Log-probability (natural log) of `symbol` given the current history.
     fn log_prob(&mut self, symbol: u8) -> f64;
 
@@ -202,6 +212,18 @@ pub enum RateBackendPredictor {
         /// Probability floor for numeric stability.
         min_prob: f64,
     },
+    /// Mamba-1 neural predictor.
+    #[cfg(feature = "backend-mamba")]
+    Mamba {
+        /// Mamba compressor/runtime state.
+        compressor: mambazip::Compressor,
+        /// Whether the first-token distribution has been primed.
+        primed: bool,
+        /// Scratch copy used for update API that borrows immutable PDF.
+        pdf_scratch: Vec<f64>,
+        /// Probability floor for numeric stability.
+        min_prob: f64,
+    },
     /// ZPAQ streaming rate model.
     Zpaq {
         /// ZPAQ rate model state.
@@ -286,6 +308,47 @@ impl RateBackendPredictor {
                     min_prob,
                 }
             }
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::Mamba { model } => {
+                let mut compressor = mambazip::Compressor::new_from_model(model);
+                let bias = compressor.online_bias_snapshot();
+                let logits =
+                    compressor
+                        .model
+                        .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                mambazip::Compressor::logits_to_pdf(
+                    logits,
+                    bias.as_deref(),
+                    &mut compressor.pdf_buffer,
+                );
+                Self::Mamba {
+                    pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
+                    compressor,
+                    primed: true,
+                    min_prob,
+                }
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::MambaMethod { method } => {
+                let mut compressor = mambazip::Compressor::new_from_method(&method)
+                    .unwrap_or_else(|e| panic!("invalid mamba method '{method}': {e}"));
+                let bias = compressor.online_bias_snapshot();
+                let logits =
+                    compressor
+                        .model
+                        .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                mambazip::Compressor::logits_to_pdf(
+                    logits,
+                    bias.as_deref(),
+                    &mut compressor.pdf_buffer,
+                );
+                Self::Mamba {
+                    pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
+                    compressor,
+                    primed: true,
+                    min_prob,
+                }
+            }
             RateBackend::Zpaq { method } => {
                 let model = ZpaqRateModel::new(method, min_prob);
                 Self::Zpaq { model }
@@ -317,6 +380,10 @@ impl RateBackendPredictor {
             RateBackend::Rwkv7 { .. } => "rwkv7".to_string(),
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7Method { method } => format!("rwkv7({method})"),
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::Mamba { .. } => "mamba".to_string(),
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::MambaMethod { method } => format!("mamba({method})"),
             RateBackend::Zpaq { method } => format!("zpaq(m={})", method),
             RateBackend::Mixture { spec } => {
                 let kind = match spec.kind {
@@ -336,6 +403,25 @@ impl RateBackendPredictor {
 }
 
 impl OnlineBytePredictor for RateBackendPredictor {
+    fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        match self {
+            RateBackendPredictor::Rosa { .. }
+            | RateBackendPredictor::Ctw { .. }
+            | RateBackendPredictor::FacCtw { .. }
+            | RateBackendPredictor::Zpaq { .. }
+            | RateBackendPredictor::Particle { .. } => Ok(()),
+            #[cfg(feature = "backend-rwkv")]
+            RateBackendPredictor::Rwkv7 { compressor, .. } => compressor
+                .begin_online_policy_stream(total_symbols)
+                .map_err(|e| e.to_string()),
+            #[cfg(feature = "backend-mamba")]
+            RateBackendPredictor::Mamba { compressor, .. } => compressor
+                .begin_online_policy_stream(total_symbols)
+                .map_err(|e| e.to_string()),
+            RateBackendPredictor::Mixture { runtime } => runtime.begin_stream(total_symbols),
+        }
+    }
+
     fn log_prob(&mut self, symbol: u8) -> f64 {
         match self {
             RateBackendPredictor::Rosa { model, min_prob } => {
@@ -403,6 +489,29 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 let p = clamp_prob(compressor.pdf_buffer[symbol as usize], *min_prob);
                 p.ln()
             }
+            #[cfg(feature = "backend-mamba")]
+            RateBackendPredictor::Mamba {
+                compressor,
+                primed,
+                min_prob,
+                ..
+            } => {
+                if !*primed {
+                    let bias = compressor.online_bias_snapshot();
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    mambazip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                    *primed = true;
+                }
+                let p = clamp_prob(compressor.pdf_buffer[symbol as usize], *min_prob);
+                p.ln()
+            }
             RateBackendPredictor::Zpaq { model } => model.log_prob(symbol),
             RateBackendPredictor::Mixture { runtime } => runtime.peek_log_prob(symbol),
             RateBackendPredictor::Particle { runtime } => runtime.peek_log_prob(symbol),
@@ -441,6 +550,35 @@ impl OnlineBytePredictor for RateBackendPredictor {
                             .model
                             .forward(&mut compressor.scratch, 0, &mut compressor.state);
                     rwkvzip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                    *primed = true;
+                }
+                for (slot, &p_raw) in out
+                    .iter_mut()
+                    .take(256)
+                    .zip(compressor.pdf_buffer.iter().take(256))
+                {
+                    let p = clamp_prob(p_raw, *min_prob);
+                    *slot = p.ln();
+                }
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackendPredictor::Mamba {
+                compressor,
+                primed,
+                min_prob,
+                ..
+            } => {
+                if !*primed {
+                    let bias = compressor.online_bias_snapshot();
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    mambazip::Compressor::logits_to_pdf(
                         logits,
                         bias.as_deref(),
                         &mut compressor.pdf_buffer,
@@ -514,7 +652,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     pdf_scratch.resize(compressor.pdf_buffer.len(), 0.0);
                 }
                 pdf_scratch.copy_from_slice(&compressor.pdf_buffer);
-                let _ = compressor.online_update_from_pdf(symbol, pdf_scratch);
+                compressor
+                    .online_update_from_pdf(symbol, pdf_scratch)
+                    .unwrap_or_else(|e| panic!("rwkv online update failed: {e}"));
                 let bias = compressor.online_bias_snapshot();
                 let logits = compressor.model.forward(
                     &mut compressor.scratch,
@@ -522,6 +662,45 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     &mut compressor.state,
                 );
                 rwkvzip::Compressor::logits_to_pdf(
+                    logits,
+                    bias.as_deref(),
+                    &mut compressor.pdf_buffer,
+                );
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackendPredictor::Mamba {
+                compressor,
+                primed,
+                pdf_scratch,
+                ..
+            } => {
+                if !*primed {
+                    let bias = compressor.online_bias_snapshot();
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    mambazip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                    *primed = true;
+                }
+                if pdf_scratch.len() != compressor.pdf_buffer.len() {
+                    pdf_scratch.resize(compressor.pdf_buffer.len(), 0.0);
+                }
+                pdf_scratch.copy_from_slice(&compressor.pdf_buffer);
+                compressor
+                    .online_update_from_pdf(symbol, pdf_scratch)
+                    .unwrap_or_else(|e| panic!("mamba online update failed: {e}"));
+                let bias = compressor.online_bias_snapshot();
+                let logits = compressor.model.forward(
+                    &mut compressor.scratch,
+                    symbol as u32,
+                    &mut compressor.state,
+                );
+                mambazip::Compressor::logits_to_pdf(
                     logits,
                     bias.as_deref(),
                     &mut compressor.pdf_buffer,
@@ -644,6 +823,21 @@ impl ExpertConfig {
         })
     }
 
+    /// Mamba expert (uniform prior).
+    #[cfg(feature = "backend-mamba")]
+    pub fn mamba(name: impl Into<String>, model: Arc<mambazip::Model>) -> Self {
+        let name = name.into();
+        Self::uniform(name, move || {
+            Box::new(RateBackendPredictor::from_backend(
+                RateBackend::Mamba {
+                    model: model.clone(),
+                },
+                -1,
+                DEFAULT_MIN_PROB,
+            ))
+        })
+    }
+
     /// ZPAQ expert (uniform prior).
     pub fn zpaq(name: impl Into<String>, method: impl Into<String>) -> Self {
         let name = name.into();
@@ -694,6 +888,11 @@ struct ExpertState {
 }
 
 impl ExpertState {
+    #[inline]
+    fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        self.predictor.begin_stream(total_symbols)
+    }
+
     #[inline]
     fn log_prob(&mut self, symbol: u8) -> f64 {
         self.predictor.log_prob(symbol)
@@ -1203,13 +1402,7 @@ impl NeuralMixture {
             0.03
         };
         let effective_lr = (base_lr * 25.0).clamp(1e-6, 1.0);
-        let neural = NeuralMixCore::new(
-            n,
-            &prior_weights,
-            effective_lr * 0.5,
-            effective_lr,
-            1e-5,
-        );
+        let neural = NeuralMixCore::new(n, &prior_weights, effective_lr * 0.5, effective_lr, 1e-5);
         let eval_cache_history = neural.history_state();
 
         Self {
@@ -1228,7 +1421,9 @@ impl NeuralMixture {
 
     fn evaluate_symbol(&mut self, symbol: u8) -> f64 {
         let history = self.neural.history_state();
-        if self.eval_cache_valid && self.eval_cache_history == history && self.eval_cache_symbol == symbol
+        if self.eval_cache_valid
+            && self.eval_cache_history == history
+            && self.eval_cache_symbol == symbol
         {
             let p = self
                 .neural
@@ -1488,6 +1683,16 @@ pub enum MixtureRuntime {
 }
 
 impl MixtureRuntime {
+    pub(crate) fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        match self {
+            MixtureRuntime::Bayes(m) => begin_expert_stream(&mut m.experts, total_symbols),
+            MixtureRuntime::Fading(m) => begin_expert_stream(&mut m.experts, total_symbols),
+            MixtureRuntime::Switching(m) => begin_expert_stream(&mut m.experts, total_symbols),
+            MixtureRuntime::Mdl(m) => begin_expert_stream(&mut m.experts, total_symbols),
+            MixtureRuntime::Neural(m) => begin_expert_stream(&mut m.experts, total_symbols),
+        }
+    }
+
     /// Non-mutating log-probability (nats) for `symbol` at current state.
     pub(crate) fn peek_log_prob(&mut self, symbol: u8) -> f64 {
         match self {
@@ -1519,6 +1724,16 @@ impl MixtureRuntime {
             MixtureRuntime::Neural(m) => m.fill_log_probs(out),
         }
     }
+}
+
+fn begin_expert_stream(
+    experts: &mut [ExpertState],
+    total_symbols: Option<u64>,
+) -> Result<(), String> {
+    for expert in experts {
+        expert.begin_stream(total_symbols)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn build_mixture_runtime(
@@ -1553,7 +1768,7 @@ mod tests {
     use super::*;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     };
 
     struct AlwaysPredict {
@@ -1707,6 +1922,26 @@ mod tests {
         fn update(&mut self, _symbol: u8) {}
     }
 
+    struct BeginAwarePredict {
+        seen_total: Arc<AtomicU64>,
+        began: bool,
+    }
+
+    impl OnlineBytePredictor for BeginAwarePredict {
+        fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+            let total = total_symbols.ok_or_else(|| "missing total symbols".to_string())?;
+            self.seen_total.store(total, Ordering::Relaxed);
+            self.began = true;
+            Ok(())
+        }
+
+        fn log_prob(&mut self, _symbol: u8) -> f64 {
+            if self.began { 0.0 } else { f64::NEG_INFINITY }
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+    }
+
     #[test]
     fn neural_predict_then_step_reuses_evaluation_cache() {
         let c0 = Arc::new(AtomicUsize::new(0));
@@ -1751,6 +1986,26 @@ mod tests {
         let _ = mix.predict_log_prob(1);
         let after_second = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
         assert_eq!(after_second, after_first + 2);
+    }
+
+    #[test]
+    fn runtime_begin_stream_propagates_to_experts() {
+        let seen_total = Arc::new(AtomicU64::new(0));
+        let cfg = {
+            let seen_total = seen_total.clone();
+            ExpertConfig::uniform("begin-aware", move || {
+                Box::new(BeginAwarePredict {
+                    seen_total: seen_total.clone(),
+                    began: false,
+                })
+            })
+        };
+
+        let spec = MixtureSpec::new(MixtureKind::Bayes, vec![]);
+        let mut runtime = build_mixture_runtime(&spec, &[cfg]).expect("runtime");
+        runtime.begin_stream(Some(123)).expect("begin stream");
+        let _ = runtime.step(0);
+        assert_eq!(seen_total.load(Ordering::Relaxed), 123);
     }
 
     #[test]

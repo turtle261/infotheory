@@ -16,18 +16,18 @@
       "max_order": -1,
       "log_prior": 0.0
     },
-   {
+ {
       "name": "particle",
       "kind": "particle",
       "spec_path": "particle_fast.json",
       "log_prior": 0.0
-    },
-	{
-		"name": "rwkv",
-		"kind": "rwkv",
-		"method": "cfg:hidden=128,layers=1,intermediate=256,decay_rank=16,a_rank=16,v_rank=16,g_rank=16,seed=26,train=adam,lr=0.01,stride=1",
+    },  
+
+  {
+		"name": "mamba",
+		"kind": "mamba",
+		"method": "cfg:hidden=128,layers=1,intermediate=128,seed=26,train=adam,lr=0.001,stride=1;policy:schedule=0..10%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)",
 		"log_prior": 0.0
 	}
-
   ]
 }

@@ -31,12 +31,13 @@ crc32fast = "1.5.0"
 wide = "1.1.1"
 
 [features]
-default = ["backend-rosa", "backend-rwkv", "backend-zpaq"]
+default = ["backend-rosa", "backend-mamba", "backend-rwkv", "backend-zpaq"]
 backend-rosa = []
+backend-mamba = []
 backend-rwkv = []
 backend-zpaq = ["dep:zpaq_rs"]
 cli = []
-vm = ["dep:nyx-lite", "backend-rosa", "backend-rwkv", "backend-zpaq"]
+vm = ["dep:nyx-lite", "backend-rosa", "backend-mamba", "backend-rwkv", "backend-zpaq"]
 
 [[bin]]
 name = "infotheory"
@@ -66,6 +67,21 @@ harness = false
 
 [[bench]]
 name = "rate_backend_coders"
+harness = false
+required-features = ["backend-rwkv"]
+
+[[bench]]
+name = "mamba_rate"
+harness = false
+required-features = ["backend-mamba"]
+
+[[bench]]
+name = "mamba_online_train_full"
+harness = false
+required-features = ["backend-mamba"]
+
+[[bench]]
+name = "rwkv_online_train_full"
 harness = false
 required-features = ["backend-rwkv"]
 

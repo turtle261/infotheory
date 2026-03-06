@@ -6,11 +6,58 @@
 //! - Zero-copy views for weights
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::mem::size_of;
 use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
 
 /// 32-byte alignment for SIMD-friendly access.
 const ALIGNMENT: usize = 32;
+
+#[inline]
+fn dangling_aligned_f32() -> NonNull<f32> {
+    debug_assert_eq!(ALIGNMENT % std::mem::align_of::<f32>(), 0);
+    NonNull::new(ALIGNMENT as *mut u8)
+        .expect("aligned dangling pointer must be non-null")
+        .cast()
+}
+
+#[inline]
+fn layout_for_f32_elems(len: usize) -> Layout {
+    let bytes = len
+        .checked_mul(size_of::<f32>())
+        .expect("tensor allocation overflow");
+    Layout::from_size_align(bytes, ALIGNMENT).expect("Invalid layout")
+}
+
+#[inline]
+fn alloc_f32_buffer(len: usize) -> NonNull<f32> {
+    if len == 0 {
+        return dangling_aligned_f32();
+    }
+    let layout = layout_for_f32_elems(len);
+    let ptr = unsafe { alloc_zeroed(layout) };
+    NonNull::new(ptr)
+        .expect("Allocation failed")
+        .cast()
+}
+
+#[inline]
+unsafe fn dealloc_f32_buffer(ptr: NonNull<f32>, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let layout = layout_for_f32_elems(len);
+    unsafe {
+        dealloc(ptr.as_ptr() as *mut u8, layout);
+    }
+}
+
+#[inline]
+fn padded_stride(cols: usize) -> usize {
+    cols.checked_add(7)
+        .expect("tensor stride overflow")
+        & !7
+}
 
 /// Owned 1D tensor with aligned memory.
 #[repr(C)]
@@ -22,12 +69,10 @@ pub struct Tensor1D {
 impl Tensor1D {
     /// Create a new zero-initialized tensor.
     pub fn zeros(len: usize) -> Self {
-        let layout = Layout::from_size_align(len * 4, ALIGNMENT).expect("Invalid layout");
-
-        let ptr = unsafe { alloc_zeroed(layout) as *mut f32 };
-        let data = NonNull::new(ptr).expect("Allocation failed");
-
-        Self { data, len }
+        Self {
+            data: alloc_f32_buffer(len),
+            len,
+        }
     }
 
     /// Create from an existing `Vec<f32>` (may copy if not aligned).
@@ -106,9 +151,8 @@ impl Clone for Tensor1D {
 
 impl Drop for Tensor1D {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.len * 4, ALIGNMENT).expect("Invalid layout");
         unsafe {
-            dealloc(self.data.as_ptr() as *mut u8, layout);
+            dealloc_f32_buffer(self.data, self.len);
         }
     }
 }
@@ -148,16 +192,13 @@ impl Tensor2D {
     /// Create a new zero-initialized 2D tensor.
     pub fn zeros(rows: usize, cols: usize) -> Self {
         // Pad cols to a multiple of 8 f32 lanes.
-        let stride = (cols + 7) & !7;
-        let total = rows * stride;
-
-        let layout = Layout::from_size_align(total * 4, ALIGNMENT).expect("Invalid layout");
-
-        let ptr = unsafe { alloc_zeroed(layout) as *mut f32 };
-        let data = NonNull::new(ptr).expect("Allocation failed");
+        let stride = padded_stride(cols);
+        let total = rows
+            .checked_mul(stride)
+            .expect("tensor allocation overflow");
 
         Self {
-            data,
+            data: alloc_f32_buffer(total),
             rows,
             cols,
             stride,
@@ -244,7 +285,10 @@ impl Tensor2D {
 
     /// Fill with zeros.
     pub fn zero(&mut self) {
-        let total = self.rows * self.stride;
+        let total = self
+            .rows
+            .checked_mul(self.stride)
+            .expect("tensor allocation overflow");
         unsafe {
             std::ptr::write_bytes(self.data.as_ptr(), 0, total);
         }
@@ -253,14 +297,14 @@ impl Tensor2D {
 
 impl Clone for Tensor2D {
     fn clone(&self) -> Self {
-        let total = self.rows * self.stride;
-        let layout = Layout::from_size_align(total * 4, ALIGNMENT).expect("Invalid layout");
-
-        let ptr = unsafe { alloc_zeroed(layout) as *mut f32 };
-        let data = NonNull::new(ptr).expect("Allocation failed");
+        let total = self
+            .rows
+            .checked_mul(self.stride)
+            .expect("tensor allocation overflow");
+        let data = alloc_f32_buffer(total);
 
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.as_ptr(), ptr, total);
+            std::ptr::copy_nonoverlapping(self.data.as_ptr(), data.as_ptr(), total);
         }
 
         Self {
@@ -274,10 +318,12 @@ impl Clone for Tensor2D {
 
 impl Drop for Tensor2D {
     fn drop(&mut self) {
-        let total = self.rows * self.stride;
-        let layout = Layout::from_size_align(total * 4, ALIGNMENT).expect("Invalid layout");
+        let total = self
+            .rows
+            .checked_mul(self.stride)
+            .expect("tensor allocation overflow");
         unsafe {
-            dealloc(self.data.as_ptr() as *mut u8, layout);
+            dealloc_f32_buffer(self.data, total);
         }
     }
 }
@@ -427,5 +473,35 @@ impl<'a> TransposedView2D<'a> {
     pub fn orig_row(&self, r: usize) -> &[f32] {
         let start = r * self.orig_cols;
         &self.data[start..start + self.orig_cols]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_len_tensor1d_uses_aligned_non_allocating_sentinel() {
+        let mut t = Tensor1D::zeros(0);
+        assert_eq!(t.len(), 0);
+        assert!(t.is_empty());
+        assert!(t.as_slice().is_empty());
+        assert!(t.as_mut_slice().is_empty());
+        assert_eq!((t.as_ptr() as usize) % ALIGNMENT, 0);
+        t.zero();
+    }
+
+    #[test]
+    fn zero_sized_tensor2d_is_safe() {
+        let mut t = Tensor2D::zeros(3, 0);
+        assert_eq!(t.rows(), 3);
+        assert_eq!(t.cols(), 0);
+        assert_eq!(t.stride(), 0);
+        assert_eq!((t.as_ptr() as usize) % ALIGNMENT, 0);
+        for row in 0..t.rows() {
+            assert!(t.row(row).is_empty());
+            assert!(t.row_mut(row).is_empty());
+        }
+        t.zero();
     }
 }

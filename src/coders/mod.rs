@@ -12,6 +12,33 @@
 pub mod ac;
 pub mod rans;
 
+/// Entropy coder type used by generic rate-coded compression.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoderType {
+    /// Arithmetic coding: optimal compression ratio, slightly slower.
+    #[default]
+    AC,
+    /// rANS coding: near-optimal compression with better throughput.
+    RANS,
+}
+
+impl std::fmt::Display for CoderType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoderType::AC => write!(f, "AC"),
+            CoderType::RANS => write!(f, "rANS"),
+        }
+    }
+}
+
+/// Compute CRC32 checksum for data integrity verification.
+#[inline]
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
 // Re-export main types
 pub use ac::{
     ArithmeticDecoder, ArithmeticEncoder, CDF_TOTAL, p_min, quantize_pdf_to_cdf,
