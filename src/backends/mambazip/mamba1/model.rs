@@ -245,10 +245,12 @@ struct LayerTrainTrace {
     xz: Tensor1D,
     conv_pre: Tensor1D,
     conv_post: Tensor1D,
+    conv_sigmoid: Tensor1D,
     proj: Tensor1D,
     dt_raw: Tensor1D,
     dt: Tensor1D,
     gate: Tensor1D,
+    gate_sigmoid: Tensor1D,
     y_pre: Tensor1D,
     y: Tensor1D,
     out: Tensor1D,
@@ -266,10 +268,12 @@ impl LayerTrainTrace {
             xz: Tensor1D::zeros(cfg.inner_size * 2),
             conv_pre: Tensor1D::zeros(cfg.inner_size),
             conv_post: Tensor1D::zeros(cfg.inner_size),
+            conv_sigmoid: Tensor1D::zeros(cfg.inner_size),
             proj: Tensor1D::zeros(cfg.dt_rank + 2 * cfg.state_size),
             dt_raw: Tensor1D::zeros(cfg.inner_size),
             dt: Tensor1D::zeros(cfg.inner_size),
             gate: Tensor1D::zeros(cfg.inner_size),
+            gate_sigmoid: Tensor1D::zeros(cfg.inner_size),
             y_pre: Tensor1D::zeros(cfg.inner_size),
             y: Tensor1D::zeros(cfg.inner_size),
             out: Tensor1D::zeros(cfg.hidden_size),
@@ -987,14 +991,18 @@ impl Model {
                     .copy_from_slice(scratch.conv.as_slice());
             }
 
-            for idx in 0..i {
-                scratch.conv[idx] = silu(scratch.conv[idx]);
-            }
             if scratch.capture_train_trace {
                 let tr = &mut scratch.train_trace_layers[layer_idx];
-                tr.conv_post
-                    .as_mut_slice()
-                    .copy_from_slice(scratch.conv.as_slice());
+                for idx in 0..i {
+                    let (post, sig) = silu_with_sigmoid(scratch.conv[idx]);
+                    scratch.conv[idx] = post;
+                    tr.conv_post[idx] = post;
+                    tr.conv_sigmoid[idx] = sig;
+                }
+            } else {
+                for idx in 0..i {
+                    scratch.conv[idx] = silu(scratch.conv[idx]);
+                }
             }
 
             unsafe {
@@ -1053,8 +1061,10 @@ impl Model {
 
             for ch in 0..i {
                 let x_ch = conv[ch];
-                let dt = softplus(dt_raw[ch] + dt_bias[ch]);
-                let gate = silu(xz[i + ch]);
+                let dt_pre = dt_raw[ch] + dt_bias[ch];
+                let gate_pre = xz[i + ch];
+                let dt = softplus(dt_pre);
+                let (gate, gate_sigmoid) = silu_with_sigmoid(gate_pre);
                 let x_dt = x_ch * dt;
 
                 let mut y = d[ch] * x_ch;
@@ -1084,6 +1094,7 @@ impl Model {
                     let tr = &mut scratch.train_trace_layers[layer_idx];
                     tr.dt[ch] = dt;
                     tr.gate[ch] = gate;
+                    tr.gate_sigmoid[ch] = gate_sigmoid;
                     tr.y_pre[ch] = y;
                 }
                 scratch.y[ch] = y * gate;
@@ -1539,7 +1550,8 @@ impl Model {
                 let y_pre = tr.y_pre[ch];
                 let g_y_pre = g_y * gate;
                 let g_gate = g_y * y_pre;
-                scratch.grad_xz[i + ch] = g_gate * silu_grad(tr.xz[i + ch]);
+                scratch.grad_xz[i + ch] =
+                    g_gate * silu_grad_from_sigmoid(tr.xz[i + ch], tr.gate_sigmoid[ch]);
 
                 let conv = tr.conv_post[ch];
                 let dt = tr.dt[ch];
@@ -1591,7 +1603,9 @@ impl Model {
                             for idx in 0..(i * s) {
                                 let g_log =
                                     (scratch.grad_ssm_a[idx] * layer.a[idx]).clamp(-clip, clip);
-                                layer.a_log[idx] += lr * g_log;
+                                let new_log = layer.a_log[idx] + lr * g_log;
+                                layer.a_log[idx] = new_log;
+                                layer.a[idx] = -new_log.exp();
                             }
                         } else {
                             for idx in 0..i {
@@ -1599,10 +1613,11 @@ impl Model {
                             }
                             for idx in 0..(i * s) {
                                 let g_log = scratch.grad_ssm_a[idx] * layer.a[idx];
-                                layer.a_log[idx] += lr * g_log;
+                                let new_log = layer.a_log[idx] + lr * g_log;
+                                layer.a_log[idx] = new_log;
+                                layer.a[idx] = -new_log.exp();
                             }
                         }
-                        sync_a_from_a_log(&mut layer.a, &layer.a_log);
                     }
                     OptimizerKind::Adam => {
                         let cfg = adam_cfg.as_ref().expect("adam cfg initialized");
@@ -1617,13 +1632,13 @@ impl Model {
                             &mut adam_layer.d,
                             cfg,
                         );
-                        apply_adam_vec_update(
+                        apply_adam_vec_update_and_sync_neg_exp(
                             layer.a_log.as_mut_slice(),
+                            layer.a.as_mut_slice(),
                             scratch.grad_ssm_a_log.as_slice(),
                             &mut adam_layer.a,
                             cfg,
                         );
-                        sync_a_from_a_log(&mut layer.a, &layer.a_log);
                     }
                 }
             }
@@ -1742,7 +1757,8 @@ impl Model {
             // conv + silu + in-proj(x branch)
             scratch.grad_conv_pre.zero();
             for ch in 0..i {
-                scratch.grad_conv_pre[ch] = scratch.grad_conv[ch] * silu_grad(tr.conv_pre[ch]);
+                scratch.grad_conv_pre[ch] = scratch.grad_conv[ch]
+                    * silu_grad_from_sigmoid(tr.conv_pre[ch], tr.conv_sigmoid[ch]);
             }
 
             for ch in 0..i {
@@ -2236,16 +2252,6 @@ fn a_from_a_log_tensor(a_log: &Tensor1D) -> Tensor1D {
     Tensor1D::from_vec(out)
 }
 
-#[inline(always)]
-fn sync_a_from_a_log(a: &mut Tensor1D, a_log: &Tensor1D) {
-    let dst = a.as_mut_slice();
-    let src = a_log.as_slice();
-    debug_assert_eq!(dst.len(), src.len());
-    for idx in 0..dst.len().min(src.len()) {
-        dst[idx] = -src[idx].exp();
-    }
-}
-
 fn optional_tensor_from(weights: &Weights, name: &str) -> Result<Option<Tensor1D>> {
     match weights.get(name) {
         Some(t) => Ok(Some(tensor_from(t)?)),
@@ -2579,6 +2585,99 @@ fn apply_adam_vec_update(
 }
 
 #[inline(always)]
+fn apply_adam_vec_update_and_sync_neg_exp(
+    param_log: &mut [f32],
+    param_value: &mut [f32],
+    grad: &[f32],
+    adam: &mut AdamTensorState,
+    step: &AdamStep,
+) {
+    let n = param_log
+        .len()
+        .min(param_value.len())
+        .min(grad.len())
+        .min(adam.m.len())
+        .min(adam.v.len());
+    if n == 0 {
+        return;
+    }
+    let b1 = step.b1;
+    let b2 = step.b2;
+    let one_m_b1 = 1.0 - b1;
+    let one_m_b2 = 1.0 - b2;
+    let lr = step.lr;
+    let eps = step.eps;
+    let inv_bc1 = 1.0 / step.bias_corr1;
+    let inv_bc2 = 1.0 / step.bias_corr2;
+    let do_clip = step.clip > 0.0;
+    let clip = step.clip;
+    let m = adam.m.as_mut_slice();
+    let v = adam.v.as_mut_slice();
+    if do_clip {
+        for idx in 0..n {
+            let g = grad[idx].clamp(-clip, clip);
+            let mm = b1 * m[idx] + one_m_b1 * g;
+            let vv = b2 * v[idx] + one_m_b2 * g * g;
+            m[idx] = mm;
+            v[idx] = vv;
+            let m_hat = mm * inv_bc1;
+            let v_hat = vv * inv_bc2;
+            let new_log = param_log[idx] + lr * m_hat / (v_hat.sqrt() + eps);
+            param_log[idx] = new_log;
+            param_value[idx] = -new_log.exp();
+        }
+        return;
+    }
+
+    let mut idx = 0usize;
+    unsafe {
+        let b1v = f32x8::splat(b1);
+        let b2v = f32x8::splat(b2);
+        let one_b1v = f32x8::splat(one_m_b1);
+        let one_b2v = f32x8::splat(one_m_b2);
+        let inv_bc1v = f32x8::splat(inv_bc1);
+        let inv_bc2v = f32x8::splat(inv_bc2);
+        let lrv = f32x8::splat(lr);
+        let epsv = f32x8::splat(eps);
+        while idx + 8 <= n {
+            let gv = grad.as_ptr().add(idx).cast::<f32x8>().read_unaligned();
+            let mv = m.as_ptr().add(idx).cast::<f32x8>().read_unaligned();
+            let vv = v.as_ptr().add(idx).cast::<f32x8>().read_unaligned();
+            let mm = mv * b1v + gv * one_b1v;
+            let vv2 = vv * b2v + (gv * gv) * one_b2v;
+            m.as_mut_ptr().add(idx).cast::<f32x8>().write_unaligned(mm);
+            v.as_mut_ptr().add(idx).cast::<f32x8>().write_unaligned(vv2);
+
+            let pv = param_log.as_ptr().add(idx).cast::<f32x8>().read_unaligned();
+            let new_log = pv + ((mm * inv_bc1v) / ((vv2 * inv_bc2v).sqrt() + epsv)) * lrv;
+            param_log
+                .as_mut_ptr()
+                .add(idx)
+                .cast::<f32x8>()
+                .write_unaligned(new_log);
+            let lanes = new_log.to_array();
+            for (lane, value) in lanes.iter().enumerate() {
+                param_value[idx + lane] = -value.exp();
+            }
+            idx += 8;
+        }
+    }
+    while idx < n {
+        let g = grad[idx];
+        let mm = b1 * m[idx] + one_m_b1 * g;
+        let vv = b2 * v[idx] + one_m_b2 * g * g;
+        m[idx] = mm;
+        v[idx] = vv;
+        let m_hat = mm * inv_bc1;
+        let v_hat = vv * inv_bc2;
+        let new_log = param_log[idx] + lr * m_hat / (v_hat.sqrt() + eps);
+        param_log[idx] = new_log;
+        param_value[idx] = -new_log.exp();
+        idx += 1;
+    }
+}
+
+#[inline(always)]
 fn apply_adam_outer_update(
     param: &mut [f32],
     rows: usize,
@@ -2722,8 +2821,13 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 #[inline(always)]
-fn silu_grad(x: f32) -> f32 {
-    let s = sigmoid(x);
+fn silu_with_sigmoid(x: f32) -> (f32, f32) {
+    let denom = 1.0 + (-x).exp();
+    (x / denom, 1.0 / denom)
+}
+
+#[inline(always)]
+fn silu_grad_from_sigmoid(x: f32, s: f32) -> f32 {
     s * (1.0 + x * (1.0 - s))
 }
 
