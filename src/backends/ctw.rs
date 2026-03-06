@@ -35,22 +35,27 @@ fn ensure_log_caches(log_int: &mut Vec<f64>, log_half: &mut Vec<f64>, upto: usiz
 
 /// Index into the node arena. `NONE` indicates no child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NodeIndex(u32);
+pub struct NodeIndex(u64);
 
 impl NodeIndex {
     /// Sentinel value indicating the absence of a node.
-    pub const NONE: NodeIndex = NodeIndex(u32::MAX);
+    pub const NONE: NodeIndex = NodeIndex(u64::MAX);
+
+    #[inline(always)]
+    fn from_usize(idx: usize) -> Self {
+        Self(u64::try_from(idx).expect("ctw node index overflow"))
+    }
 
     /// Returns `true` when this is [`NodeIndex::NONE`].
     #[inline(always)]
     pub fn is_none(self) -> bool {
-        self.0 == u32::MAX
+        self.0 == u64::MAX
     }
 
     /// Returns `true` when this points to a valid arena node.
     #[inline(always)]
     pub fn is_some(self) -> bool {
-        self.0 != u32::MAX
+        self.0 != u64::MAX
     }
 
     /// Convert to a `usize` arena index.
@@ -131,7 +136,7 @@ impl CtArena {
             self.nodes[idx.get()] = CtNode::new();
             idx
         } else {
-            let idx = NodeIndex(self.nodes.len() as u32);
+            let idx = NodeIndex::from_usize(self.nodes.len());
             self.nodes.push(CtNode::new());
             idx
         }
@@ -176,6 +181,74 @@ impl Default for CtArena {
     }
 }
 
+#[inline(always)]
+fn history_symbol(history: &[Symbol], depth: usize) -> Symbol {
+    let idx = history.len().wrapping_sub(depth + 1);
+    if depth < history.len() {
+        history[idx]
+    } else {
+        false
+    }
+}
+
+#[inline(always)]
+fn update_weighted_log_prob(node: &mut CtNode, log_prob_w0: f64, log_prob_w1: f64, is_leaf: bool) {
+    if is_leaf {
+        node.log_prob_weighted = node.log_prob_kt;
+    } else {
+        let mut prob_w01_kt_ratio = (log_prob_w0 + log_prob_w1 - node.log_prob_kt).exp();
+        if prob_w01_kt_ratio > 1.0 {
+            prob_w01_kt_ratio = (node.log_prob_kt - log_prob_w0 - log_prob_w1).exp();
+            node.log_prob_weighted = log_prob_w0 + log_prob_w1;
+        } else {
+            node.log_prob_weighted = node.log_prob_kt;
+        }
+
+        if prob_w01_kt_ratio.is_nan() {
+            prob_w01_kt_ratio = 0.0;
+        }
+        node.log_prob_weighted += prob_w01_kt_ratio.ln_1p() - std::f64::consts::LN_2;
+    }
+
+    if node.log_prob_kt > 1.0e-10 {
+        node.log_prob_kt = 0.0;
+    }
+    if node.log_prob_weighted > 1.0e-10 {
+        node.log_prob_weighted = 0.0;
+    }
+}
+
+#[inline(always)]
+fn predict_ratio_kt(node: &CtNode, sym_idx: usize) -> f64 {
+    let total = (node.symbol_count[0] + node.symbol_count[1]) as f64;
+    let sym_count = node.symbol_count[sym_idx] as f64;
+    (sym_count + 0.5) / (total + 1.0)
+}
+
+#[inline(always)]
+fn logsumexp2(a: f64, b: f64) -> f64 {
+    if a >= b {
+        a + (b - a).exp().ln_1p()
+    } else {
+        b + (a - b).exp().ln_1p()
+    }
+}
+
+#[inline(always)]
+fn predict_ratio_internal(
+    node: &CtNode,
+    path_child_log_prob: f64,
+    sibling_log_prob: f64,
+    child_ratio: f64,
+    sym_idx: usize,
+) -> f64 {
+    let log_new = logsumexp2(
+        node.log_prob_kt + predict_ratio_kt(node, sym_idx).ln(),
+        path_child_log_prob + sibling_log_prob + child_ratio.ln(),
+    ) - std::f64::consts::LN_2;
+    (log_new - node.log_prob_weighted).exp()
+}
+
 /// A Context Tree for binary sequence prediction using arena allocation.
 #[derive(Clone)]
 pub struct ContextTree {
@@ -183,8 +256,8 @@ pub struct ContextTree {
     root: NodeIndex,
     history: Vec<Symbol>,
     max_depth: usize,
-    context_buf: Vec<Symbol>,
-    path_buf: Vec<NodeIndex>,
+    path_nodes: Vec<NodeIndex>,
+    path_symbols: Vec<Symbol>,
     log_int: Vec<f64>,
     log_half: Vec<f64>,
 }
@@ -204,8 +277,8 @@ impl ContextTree {
             root,
             history: Vec::new(),
             max_depth: depth,
-            context_buf: vec![false; depth],
-            path_buf: Vec::with_capacity(depth + 1),
+            path_nodes: vec![NodeIndex::NONE; depth + 1],
+            path_symbols: vec![false; depth],
             log_int: vec![f64::NEG_INFINITY],
             log_half: vec![(0.5f64).ln()],
         }
@@ -216,7 +289,8 @@ impl ContextTree {
         self.history.clear();
         self.arena.clear();
         self.root = self.arena.alloc();
-        self.context_buf.fill(false);
+        self.path_nodes.fill(NodeIndex::NONE);
+        self.path_symbols.fill(false);
     }
 
     /// Updates the tree with a new symbol.
@@ -226,8 +300,7 @@ impl ContextTree {
         // For update we need log_int[total_before + 1] where total_before <= root visits.
         let upto = self.root_visits() + 1;
         ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
-        self.prepare_context();
-        self.update_from_root(sym, false);
+        self.update_from_root(sym);
         self.history.push(sym);
     }
 
@@ -240,8 +313,7 @@ impl ContextTree {
         // Revert uses current counts before decrement, so root visits is sufficient.
         let upto = self.root_visits();
         ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
-        self.prepare_context();
-        self.update_from_root(last_sym, true);
+        self.revert_from_root(last_sym);
     }
 
     /// Appends symbols to the history without updating the tree (for action conditioning).
@@ -266,11 +338,7 @@ impl ContextTree {
     /// Predicts the probability of the next symbol being `sym`.
     #[inline]
     pub fn predict(&mut self, sym: Symbol) -> f64 {
-        let log_prob_before = self.arena.get(self.root).log_prob_weighted;
-        self.update(sym);
-        let log_prob_after = self.arena.get(self.root).log_prob_weighted;
-        self.revert();
-        (log_prob_after - log_prob_before).exp()
+        self.predict_from_root(sym)
     }
 
     /// Shorthand for predicting the probability of symbol `1` (`true`).
@@ -299,141 +367,181 @@ impl ContextTree {
 
     // --- Internal methods ---
 
-    #[inline(always)]
-    fn prepare_context(&mut self) {
-        self.context_buf.fill(false);
-        let history_len = self.history.len();
-        let copy_len = history_len.min(self.max_depth);
-        if copy_len > 0 {
-            self.context_buf[self.max_depth - copy_len..]
-                .copy_from_slice(&self.history[history_len - copy_len..]);
-        }
-    }
-
     #[inline]
-    fn update_from_root(&mut self, sym: Symbol, revert: bool) {
-        self.update_node_iterative(self.root, sym, revert);
-    }
+    fn update_from_root(&mut self, sym: Symbol) {
+        let mut current = self.root;
+        self.path_nodes[0] = current;
+        let mut path_len = 1usize;
 
-    /// Iterative update to avoid deep recursion and enable better inlining.
-    #[inline]
-    fn update_node_iterative(&mut self, root_idx: NodeIndex, sym: Symbol, revert: bool) {
-        let max_depth = self.max_depth;
-
-        // Build path from root to leaf
-        // optimizations: reuse buffer to avoid repeated allocations
-        let mut path = std::mem::take(&mut self.path_buf);
-        path.clear();
-        path.push(root_idx);
-
-        let mut current = root_idx;
-        for depth in 0..max_depth {
-            let child_sym = self.context_buf[max_depth - 1 - depth];
+        for depth in 0..self.max_depth {
+            let child_sym = history_symbol(&self.history, depth);
+            self.path_symbols[depth] = child_sym;
             let child_idx = self.arena.get(current).children[child_sym as usize];
-
-            if revert {
-                if child_idx.is_none() {
-                    break;
-                }
-                current = child_idx;
+            let next = if child_idx.is_none() {
+                let new_child = self.arena.alloc();
+                self.arena.get_mut(current).children[child_sym as usize] = new_child;
+                new_child
             } else {
-                let child = if child_idx.is_none() {
-                    let new_child = self.arena.alloc();
-                    self.arena.get_mut(current).children[child_sym as usize] = new_child;
-                    new_child
-                } else {
-                    child_idx
-                };
-                current = child;
-            }
-            path.push(current);
+                child_idx
+            };
+            current = next;
+            self.path_nodes[path_len] = current;
+            path_len += 1;
         }
 
-        // Update nodes from leaf to root
-        let leaf_depth = path.len() - 1;
-        for (i, &node_idx) in path.iter().enumerate().rev() {
-            let is_leaf = i == leaf_depth;
-            self.update_single_node(node_idx, sym, revert, is_leaf);
+        self.unwind_update(sym, path_len);
+    }
 
-            // Clean up empty children during revert
-            if revert && i > 0 {
-                let parent_idx = path[i - 1];
-                let depth = i - 1;
-                let child_sym = self.context_buf[max_depth - 1 - depth];
-                if self.arena.get(node_idx).visits() == 0 {
-                    self.arena.get_mut(parent_idx).children[child_sym as usize] = NodeIndex::NONE;
-                    self.arena.free(node_idx);
-                }
+    #[inline]
+    fn predict_from_root(&mut self, sym: Symbol) -> f64 {
+        let mut current = self.root;
+        self.path_nodes[0] = current;
+        let mut path_len = 1usize;
+        let mut reached_max_depth = true;
+
+        for depth in 0..self.max_depth {
+            let child_sym = history_symbol(&self.history, depth);
+            self.path_symbols[depth] = child_sym;
+            let child_idx = self.arena.get(current).children[child_sym as usize];
+            if child_idx.is_none() {
+                reached_max_depth = false;
+                break;
             }
+            current = child_idx;
+            self.path_nodes[path_len] = current;
+            path_len += 1;
         }
 
-        self.path_buf = path;
+        let sym_idx = sym as usize;
+        let mut ratio = 0.5f64;
+        for i in (0..path_len).rev() {
+            let idx = self.path_nodes[i];
+            let node = self.arena.get(idx);
+            if i + 1 == path_len && reached_max_depth {
+                ratio = predict_ratio_kt(node, sym_idx);
+                continue;
+            }
+
+            let child_sym = self.path_symbols[i];
+            let path_child = if i + 1 < path_len {
+                self.path_nodes[i + 1]
+            } else {
+                NodeIndex::NONE
+            };
+            let path_child_log_prob = if path_child.is_some() {
+                self.arena.get(path_child).log_prob_weighted
+            } else {
+                0.0
+            };
+            let sibling = node.children[(!child_sym) as usize];
+            let sibling_log_prob = if sibling.is_some() {
+                self.arena.get(sibling).log_prob_weighted
+            } else {
+                0.0
+            };
+            ratio =
+                predict_ratio_internal(node, path_child_log_prob, sibling_log_prob, ratio, sym_idx);
+        }
+        ratio
+    }
+
+    #[inline]
+    fn revert_from_root(&mut self, sym: Symbol) {
+        let mut current = self.root;
+        self.path_nodes[0] = current;
+        let mut path_len = 1usize;
+
+        for depth in 0..self.max_depth {
+            let child_sym = history_symbol(&self.history, depth);
+            self.path_symbols[depth] = child_sym;
+            let child_idx = self.arena.get(current).children[child_sym as usize];
+            if child_idx.is_none() {
+                break;
+            }
+            current = child_idx;
+            self.path_nodes[path_len] = current;
+            path_len += 1;
+        }
+
+        self.unwind_revert(sym, path_len);
     }
 
     #[inline(always)]
-    fn update_single_node(&mut self, idx: NodeIndex, sym: Symbol, revert: bool, is_leaf: bool) {
-        // Read child weighted probs BEFORE taking mutable borrow
-        let (log_prob_w0, log_prob_w1) = if !is_leaf {
-            let node = self.arena.get(idx);
-            let child0 = node.children[0];
-            let child1 = node.children[1];
-            let w0 = if child0.is_some() {
-                self.arena.get(child0).log_prob_weighted
-            } else {
-                0.0
-            };
-            let w1 = if child1.is_some() {
-                self.arena.get(child1).log_prob_weighted
-            } else {
-                0.0
-            };
-            (w0, w1)
-        } else {
-            (0.0, 0.0)
-        };
-
-        let node = self.arena.get_mut(idx);
-
-        // Update KT estimator
+    fn unwind_update(&mut self, sym: Symbol, path_len: usize) {
         let sym_idx = sym as usize;
-        if !revert {
+        for i in (0..path_len).rev() {
+            let idx = self.path_nodes[i];
+            let is_leaf = i + 1 == path_len;
+            let (log_prob_w0, log_prob_w1) = if is_leaf {
+                (0.0, 0.0)
+            } else {
+                let node = self.arena.get(idx);
+                let child0 = node.children[0];
+                let child1 = node.children[1];
+                let w0 = if child0.is_some() {
+                    self.arena.get(child0).log_prob_weighted
+                } else {
+                    0.0
+                };
+                let w1 = if child1.is_some() {
+                    self.arena.get(child1).log_prob_weighted
+                } else {
+                    0.0
+                };
+                (w0, w1)
+            };
+
+            let node = self.arena.get_mut(idx);
             let total_before = (node.symbol_count[0] + node.symbol_count[1]) as usize;
             let sym_before = node.symbol_count[sym_idx] as usize;
             node.log_prob_kt += self.log_half[sym_before] - self.log_int[total_before + 1];
             node.symbol_count[sym_idx] += 1;
-        } else {
-            let total = (node.symbol_count[0] + node.symbol_count[1]) as usize;
-            let sym_count = node.symbol_count[sym_idx] as usize;
-            if sym_count > 0 && total > 0 {
-                node.log_prob_kt -= self.log_half[sym_count - 1] - self.log_int[total];
-                node.symbol_count[sym_idx] -= 1;
-            }
+            update_weighted_log_prob(node, log_prob_w0, log_prob_w1, is_leaf);
         }
+    }
 
-        // Update weighted probability
-        if is_leaf {
-            node.log_prob_weighted = node.log_prob_kt;
-        } else {
-            let mut prob_w01_kt_ratio = (log_prob_w0 + log_prob_w1 - node.log_prob_kt).exp();
-            if prob_w01_kt_ratio > 1.0 {
-                prob_w01_kt_ratio = (node.log_prob_kt - log_prob_w0 - log_prob_w1).exp();
-                node.log_prob_weighted = log_prob_w0 + log_prob_w1;
+    #[inline(always)]
+    fn unwind_revert(&mut self, sym: Symbol, path_len: usize) {
+        let sym_idx = sym as usize;
+        for i in (0..path_len).rev() {
+            let idx = self.path_nodes[i];
+            let is_leaf = i + 1 == path_len;
+            let (log_prob_w0, log_prob_w1) = if is_leaf {
+                (0.0, 0.0)
             } else {
-                node.log_prob_weighted = node.log_prob_kt;
+                let node = self.arena.get(idx);
+                let child0 = node.children[0];
+                let child1 = node.children[1];
+                let w0 = if child0.is_some() {
+                    self.arena.get(child0).log_prob_weighted
+                } else {
+                    0.0
+                };
+                let w1 = if child1.is_some() {
+                    self.arena.get(child1).log_prob_weighted
+                } else {
+                    0.0
+                };
+                (w0, w1)
+            };
+
+            {
+                let node = self.arena.get_mut(idx);
+                let total = (node.symbol_count[0] + node.symbol_count[1]) as usize;
+                let sym_count = node.symbol_count[sym_idx] as usize;
+                if sym_count > 0 && total > 0 {
+                    node.log_prob_kt -= self.log_half[sym_count - 1] - self.log_int[total];
+                    node.symbol_count[sym_idx] -= 1;
+                }
+                update_weighted_log_prob(node, log_prob_w0, log_prob_w1, is_leaf);
             }
 
-            if prob_w01_kt_ratio.is_nan() {
-                prob_w01_kt_ratio = 0.0;
+            if i > 0 && self.arena.get(idx).visits() == 0 {
+                let parent_idx = self.path_nodes[i - 1];
+                let child_sym = self.path_symbols[i - 1];
+                self.arena.get_mut(parent_idx).children[child_sym as usize] = NodeIndex::NONE;
+                self.arena.free(idx);
             }
-            node.log_prob_weighted += prob_w01_kt_ratio.ln_1p() - std::f64::consts::LN_2;
-        }
-
-        // Sanity check
-        if node.log_prob_kt > 1.0e-10 {
-            node.log_prob_kt = 0.0;
-        }
-        if node.log_prob_weighted > 1.0e-10 {
-            node.log_prob_weighted = 0.0;
         }
     }
 }
@@ -447,8 +555,8 @@ struct ContextTreeCore {
     arena: CtArena,
     root: NodeIndex,
     max_depth: usize,
-    context_buf: Vec<Symbol>,
-    path_buf: Vec<NodeIndex>,
+    path_nodes: Vec<NodeIndex>,
+    path_symbols: Vec<Symbol>,
     log_int: Vec<f64>,
     log_half: Vec<f64>,
 }
@@ -466,8 +574,8 @@ impl ContextTreeCore {
             arena,
             root,
             max_depth: depth,
-            context_buf: vec![false; depth],
-            path_buf: Vec::with_capacity(depth + 1),
+            path_nodes: vec![NodeIndex::NONE; depth + 1],
+            path_symbols: vec![false; depth],
             log_int: vec![f64::NEG_INFINITY],
             log_half: vec![(0.5f64).ln()],
         }
@@ -476,19 +584,8 @@ impl ContextTreeCore {
     fn clear(&mut self) {
         self.arena.clear();
         self.root = self.arena.alloc();
-        self.context_buf.fill(false);
-    }
-
-    /// Prepares context buffer from shared history using this tree's effective length.
-    #[inline(always)]
-    fn prepare_context(&mut self, shared_history: &[Symbol]) {
-        self.context_buf.fill(false);
-        let history_len = shared_history.len();
-        let copy_len = history_len.min(self.max_depth);
-        if copy_len > 0 {
-            self.context_buf[self.max_depth - copy_len..]
-                .copy_from_slice(&shared_history[history_len - copy_len..]);
-        }
+        self.path_nodes.fill(NodeIndex::NONE);
+        self.path_symbols.fill(false);
     }
 
     /// Update tree with symbol, using shared history for context.
@@ -498,8 +595,7 @@ impl ContextTreeCore {
         // own visit counts are needed for KT updates.
         let upto = self.root_visits() + 1;
         ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
-        self.prepare_context(shared_history);
-        self.update_node_iterative(sym, false);
+        self.update_path(sym, shared_history);
     }
 
     /// Revert last update, using shared history for context.
@@ -508,19 +604,13 @@ impl ContextTreeCore {
         // Revert uses counts prior to decrement.
         let upto = self.root_visits();
         ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
-        self.prepare_context(shared_history);
-        self.update_node_iterative(last_sym, true);
+        self.revert_path(last_sym, shared_history);
     }
 
     /// Predict probability of sym using shared history.
     #[inline]
     fn predict(&mut self, sym: Symbol, shared_history: &[Symbol]) -> f64 {
-        let log_prob_before = self.arena.get(self.root).log_prob_weighted;
-        self.update(sym, shared_history);
-        let log_prob_after = self.arena.get(self.root).log_prob_weighted;
-        self.prepare_context(shared_history);
-        self.update_node_iterative(sym, true);
-        (log_prob_after - log_prob_before).exp()
+        self.predict_path(sym, shared_history)
     }
 
     #[inline]
@@ -529,115 +619,180 @@ impl ContextTreeCore {
     }
 
     #[inline]
-    fn update_node_iterative(&mut self, sym: Symbol, revert: bool) {
-        let max_depth = self.max_depth;
-
-        let mut path = std::mem::take(&mut self.path_buf);
-        path.clear();
-        path.push(self.root);
-
+    fn update_path(&mut self, sym: Symbol, shared_history: &[Symbol]) {
         let mut current = self.root;
-        for depth in 0..max_depth {
-            let child_sym = self.context_buf[max_depth - 1 - depth];
+        self.path_nodes[0] = current;
+        let mut path_len = 1usize;
+
+        for depth in 0..self.max_depth {
+            let child_sym = history_symbol(shared_history, depth);
+            self.path_symbols[depth] = child_sym;
             let child_idx = self.arena.get(current).children[child_sym as usize];
-
-            if revert {
-                if child_idx.is_none() {
-                    break;
-                }
-                current = child_idx;
+            let next = if child_idx.is_none() {
+                let new_child = self.arena.alloc();
+                self.arena.get_mut(current).children[child_sym as usize] = new_child;
+                new_child
             } else {
-                let child = if child_idx.is_none() {
-                    let new_child = self.arena.alloc();
-                    self.arena.get_mut(current).children[child_sym as usize] = new_child;
-                    new_child
-                } else {
-                    child_idx
-                };
-                current = child;
-            }
-            path.push(current);
+                child_idx
+            };
+            current = next;
+            self.path_nodes[path_len] = current;
+            path_len += 1;
         }
 
-        let leaf_depth = path.len() - 1;
-        for (i, &node_idx) in path.iter().enumerate().rev() {
-            let is_leaf = i == leaf_depth;
-            self.update_single_node(node_idx, sym, revert, is_leaf);
+        self.unwind_update(sym, path_len);
+    }
 
-            if revert && i > 0 {
-                let parent_idx = path[i - 1];
-                let depth = i - 1;
-                let child_sym = self.context_buf[max_depth - 1 - depth];
-                if self.arena.get(node_idx).visits() == 0 {
-                    self.arena.get_mut(parent_idx).children[child_sym as usize] = NodeIndex::NONE;
-                    self.arena.free(node_idx);
-                }
+    #[inline]
+    fn predict_path(&mut self, sym: Symbol, shared_history: &[Symbol]) -> f64 {
+        let mut current = self.root;
+        self.path_nodes[0] = current;
+        let mut path_len = 1usize;
+        let mut reached_max_depth = true;
+
+        for depth in 0..self.max_depth {
+            let child_sym = history_symbol(shared_history, depth);
+            self.path_symbols[depth] = child_sym;
+            let child_idx = self.arena.get(current).children[child_sym as usize];
+            if child_idx.is_none() {
+                reached_max_depth = false;
+                break;
             }
+            current = child_idx;
+            self.path_nodes[path_len] = current;
+            path_len += 1;
         }
 
-        self.path_buf = path;
+        let sym_idx = sym as usize;
+        let mut ratio = 0.5f64;
+        for i in (0..path_len).rev() {
+            let idx = self.path_nodes[i];
+            let node = self.arena.get(idx);
+            if i + 1 == path_len && reached_max_depth {
+                ratio = predict_ratio_kt(node, sym_idx);
+                continue;
+            }
+
+            let child_sym = self.path_symbols[i];
+            let path_child = if i + 1 < path_len {
+                self.path_nodes[i + 1]
+            } else {
+                NodeIndex::NONE
+            };
+            let path_child_log_prob = if path_child.is_some() {
+                self.arena.get(path_child).log_prob_weighted
+            } else {
+                0.0
+            };
+            let sibling = node.children[(!child_sym) as usize];
+            let sibling_log_prob = if sibling.is_some() {
+                self.arena.get(sibling).log_prob_weighted
+            } else {
+                0.0
+            };
+            ratio =
+                predict_ratio_internal(node, path_child_log_prob, sibling_log_prob, ratio, sym_idx);
+        }
+        ratio
     }
 
     #[inline(always)]
-    fn update_single_node(&mut self, idx: NodeIndex, sym: Symbol, revert: bool, is_leaf: bool) {
-        let (log_prob_w0, log_prob_w1) = if !is_leaf {
-            let node = self.arena.get(idx);
-            let child0 = node.children[0];
-            let child1 = node.children[1];
-            let w0 = if child0.is_some() {
-                self.arena.get(child0).log_prob_weighted
-            } else {
-                0.0
-            };
-            let w1 = if child1.is_some() {
-                self.arena.get(child1).log_prob_weighted
-            } else {
-                0.0
-            };
-            (w0, w1)
-        } else {
-            (0.0, 0.0)
-        };
+    fn revert_path(&mut self, sym: Symbol, shared_history: &[Symbol]) {
+        let mut current = self.root;
+        self.path_nodes[0] = current;
+        let mut path_len = 1usize;
 
-        let node = self.arena.get_mut(idx);
+        for depth in 0..self.max_depth {
+            let child_sym = history_symbol(shared_history, depth);
+            self.path_symbols[depth] = child_sym;
+            let child_idx = self.arena.get(current).children[child_sym as usize];
+            if child_idx.is_none() {
+                break;
+            }
+            current = child_idx;
+            self.path_nodes[path_len] = current;
+            path_len += 1;
+        }
 
+        self.unwind_revert(sym, path_len);
+    }
+
+    #[inline(always)]
+    fn unwind_update(&mut self, sym: Symbol, path_len: usize) {
         let sym_idx = sym as usize;
-        if !revert {
+        for i in (0..path_len).rev() {
+            let idx = self.path_nodes[i];
+            let is_leaf = i + 1 == path_len;
+            let (log_prob_w0, log_prob_w1) = if is_leaf {
+                (0.0, 0.0)
+            } else {
+                let node = self.arena.get(idx);
+                let child0 = node.children[0];
+                let child1 = node.children[1];
+                let w0 = if child0.is_some() {
+                    self.arena.get(child0).log_prob_weighted
+                } else {
+                    0.0
+                };
+                let w1 = if child1.is_some() {
+                    self.arena.get(child1).log_prob_weighted
+                } else {
+                    0.0
+                };
+                (w0, w1)
+            };
+
+            let node = self.arena.get_mut(idx);
             let total_before = (node.symbol_count[0] + node.symbol_count[1]) as usize;
             let sym_before = node.symbol_count[sym_idx] as usize;
             node.log_prob_kt += self.log_half[sym_before] - self.log_int[total_before + 1];
             node.symbol_count[sym_idx] += 1;
-        } else {
-            let total = (node.symbol_count[0] + node.symbol_count[1]) as usize;
-            let sym_count = node.symbol_count[sym_idx] as usize;
-            if sym_count > 0 && total > 0 {
-                node.log_prob_kt -= self.log_half[sym_count - 1] - self.log_int[total];
-                node.symbol_count[sym_idx] -= 1;
-            }
+            update_weighted_log_prob(node, log_prob_w0, log_prob_w1, is_leaf);
         }
+    }
 
-        if is_leaf {
-            node.log_prob_weighted = node.log_prob_kt;
-        } else {
-            let mut prob_w01_kt_ratio = (log_prob_w0 + log_prob_w1 - node.log_prob_kt).exp();
-            if prob_w01_kt_ratio > 1.0 {
-                prob_w01_kt_ratio = (node.log_prob_kt - log_prob_w0 - log_prob_w1).exp();
-                node.log_prob_weighted = log_prob_w0 + log_prob_w1;
+    #[inline(always)]
+    fn unwind_revert(&mut self, sym: Symbol, path_len: usize) {
+        let sym_idx = sym as usize;
+        for i in (0..path_len).rev() {
+            let idx = self.path_nodes[i];
+            let is_leaf = i + 1 == path_len;
+            let (log_prob_w0, log_prob_w1) = if is_leaf {
+                (0.0, 0.0)
             } else {
-                node.log_prob_weighted = node.log_prob_kt;
+                let node = self.arena.get(idx);
+                let child0 = node.children[0];
+                let child1 = node.children[1];
+                let w0 = if child0.is_some() {
+                    self.arena.get(child0).log_prob_weighted
+                } else {
+                    0.0
+                };
+                let w1 = if child1.is_some() {
+                    self.arena.get(child1).log_prob_weighted
+                } else {
+                    0.0
+                };
+                (w0, w1)
+            };
+
+            {
+                let node = self.arena.get_mut(idx);
+                let total = (node.symbol_count[0] + node.symbol_count[1]) as usize;
+                let sym_count = node.symbol_count[sym_idx] as usize;
+                if sym_count > 0 && total > 0 {
+                    node.log_prob_kt -= self.log_half[sym_count - 1] - self.log_int[total];
+                    node.symbol_count[sym_idx] -= 1;
+                }
+                update_weighted_log_prob(node, log_prob_w0, log_prob_w1, is_leaf);
             }
 
-            if prob_w01_kt_ratio.is_nan() {
-                prob_w01_kt_ratio = 0.0;
+            if i > 0 && self.arena.get(idx).visits() == 0 {
+                let parent_idx = self.path_nodes[i - 1];
+                let child_sym = self.path_symbols[i - 1];
+                self.arena.get_mut(parent_idx).children[child_sym as usize] = NodeIndex::NONE;
+                self.arena.free(idx);
             }
-            node.log_prob_weighted += prob_w01_kt_ratio.ln_1p() - std::f64::consts::LN_2;
-        }
-
-        if node.log_prob_kt > 1.0e-10 {
-            node.log_prob_kt = 0.0;
-        }
-        if node.log_prob_weighted > 1.0e-10 {
-            node.log_prob_weighted = 0.0;
         }
     }
 }
@@ -769,6 +924,21 @@ impl FacContextTree {
 mod tests {
     use super::*;
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn node_index_from_usize_does_not_truncate_large_indices() {
+        let raw = (u32::MAX as usize) + 17;
+        let idx = NodeIndex::from_usize(raw);
+        assert!(idx.is_some());
+        assert_eq!(idx.get(), raw);
+    }
+
+    fn assert_close(a: f64, b: f64) {
+        let diff = (a - b).abs();
+        let scale = a.abs().max(b.abs()).max(1.0);
+        assert!(diff <= 1e-12 * scale, "a={a} b={b} diff={diff}");
+    }
+
     #[test]
     fn fac_ctw_history_consistency() {
         let mut fac = FacContextTree::new(4, 4);
@@ -816,6 +986,80 @@ mod tests {
                 "log_half grew to {} for visits={visits}",
                 tree.log_half.len()
             );
+        }
+    }
+
+    #[test]
+    fn context_tree_predict_preserves_state() {
+        let mut tree = ContextTree::new(6);
+        for &bit in &[true, false, true, true, false, false, true, false] {
+            tree.update(bit);
+        }
+        let p0_before = tree.predict(false);
+        let p1_before = tree.predict(true);
+        let log_before = tree.get_log_block_probability();
+        let history_before = tree.history.clone();
+        let _ = tree.predict(true);
+
+        assert_eq!(tree.history, history_before);
+        assert_close(tree.get_log_block_probability(), log_before);
+        assert_close(tree.predict(false), p0_before);
+        assert_close(tree.predict(true), p1_before);
+    }
+
+    #[test]
+    fn context_tree_predict_matches_update_ratio() {
+        let mut tree = ContextTree::new(7);
+        for &bit in &[true, false, true, false, true, true, false, true, false] {
+            tree.update(bit);
+        }
+        for &sym in &[false, true] {
+            let predicted = tree.predict(sym);
+            let mut reference = tree.clone();
+            let before = reference.get_log_block_probability();
+            reference.update(sym);
+            let after = reference.get_log_block_probability();
+            assert_close(predicted, (after - before).exp());
+        }
+    }
+
+    #[test]
+    fn fac_ctw_predict_preserves_state() {
+        let mut fac = FacContextTree::new(5, 8);
+        for &byte in b"fac ctw state preservation" {
+            for bit_idx in 0..8usize {
+                let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+                fac.update(bit, bit_idx);
+            }
+        }
+        let p0_before = fac.predict(false, 3);
+        let p1_before = fac.predict(true, 3);
+        let log_before = fac.get_log_block_probability();
+        let history_before = fac.shared_history.clone();
+        let _ = fac.predict(true, 3);
+
+        assert_eq!(fac.shared_history, history_before);
+        assert_close(fac.get_log_block_probability(), log_before);
+        assert_close(fac.predict(false, 3), p0_before);
+        assert_close(fac.predict(true, 3), p1_before);
+    }
+
+    #[test]
+    fn fac_ctw_predict_matches_update_ratio() {
+        let mut fac = FacContextTree::new(6, 8);
+        for &byte in b"fac ctw exact predictive ratio" {
+            for bit_idx in 0..8usize {
+                let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+                fac.update(bit, bit_idx);
+            }
+        }
+        for &sym in &[false, true] {
+            let predicted = fac.predict(sym, 4);
+            let mut reference = fac.clone();
+            let before = reference.get_log_block_probability();
+            reference.update(sym, 4);
+            let after = reference.get_log_block_probability();
+            assert_close(predicted, (after - before).exp());
         }
     }
 }

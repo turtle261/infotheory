@@ -909,6 +909,19 @@ impl Model {
         token: u32,
         state: &mut State,
     ) -> &'a [f32] {
+        if scratch.capture_train_trace {
+            self.forward_impl::<true>(scratch, token, state)
+        } else {
+            self.forward_impl::<false>(scratch, token, state)
+        }
+    }
+
+    fn forward_impl<'a, const CAPTURE: bool>(
+        &'a self,
+        scratch: &'a mut ScratchBuffers,
+        token: u32,
+        state: &mut State,
+    ) -> &'a [f32] {
         let c = self.cfg.hidden_size;
         let i = self.cfg.inner_size;
         let s = self.cfg.state_size;
@@ -916,7 +929,7 @@ impl Model {
 
         let token_idx = (token as usize).min(self.cfg.vocab_size.saturating_sub(1));
         let emb_off = token_idx * c;
-        if scratch.capture_train_trace {
+        if CAPTURE {
             scratch.train_token = token_idx;
             scratch.train_trace_valid = true;
         } else {
@@ -930,7 +943,7 @@ impl Model {
         for layer_idx in 0..self.cfg.num_layers {
             let layer = &self.layers[layer_idx];
             let st = &mut state.layers[layer_idx];
-            if scratch.capture_train_trace {
+            if CAPTURE {
                 let tr = &mut scratch.train_trace_layers[layer_idx];
                 tr.h_in.as_mut_slice().copy_from_slice(scratch.h.as_slice());
                 tr.ssm_prev
@@ -949,7 +962,7 @@ impl Model {
                 self.cfg.layer_norm_eps,
                 scratch.norm.as_mut_slice(),
             );
-            if scratch.capture_train_trace {
+            if CAPTURE {
                 let tr = &mut scratch.train_trace_layers[layer_idx];
                 tr.norm
                     .as_mut_slice()
@@ -971,7 +984,7 @@ impl Model {
                     *dst += b;
                 }
             }
-            if scratch.capture_train_trace {
+            if CAPTURE {
                 let tr = &mut scratch.train_trace_layers[layer_idx];
                 tr.xz.as_mut_slice().copy_from_slice(scratch.xz.as_slice());
             }
@@ -984,14 +997,14 @@ impl Model {
                 st,
                 scratch.conv.as_mut_slice(),
             );
-            if scratch.capture_train_trace {
+            if CAPTURE {
                 let tr = &mut scratch.train_trace_layers[layer_idx];
                 tr.conv_pre
                     .as_mut_slice()
                     .copy_from_slice(scratch.conv.as_slice());
             }
 
-            if scratch.capture_train_trace {
+            if CAPTURE {
                 let tr = &mut scratch.train_trace_layers[layer_idx];
                 for idx in 0..i {
                     let (post, sig) = silu_with_sigmoid(scratch.conv[idx]);
@@ -1020,7 +1033,7 @@ impl Model {
                     *dst += b;
                 }
             }
-            if scratch.capture_train_trace {
+            if CAPTURE {
                 let tr = &mut scratch.train_trace_layers[layer_idx];
                 tr.proj
                     .as_mut_slice()
@@ -1037,7 +1050,7 @@ impl Model {
                     r,
                 );
             }
-            if scratch.capture_train_trace {
+            if CAPTURE {
                 let tr = &mut scratch.train_trace_layers[layer_idx];
                 tr.dt_raw
                     .as_mut_slice()
@@ -1073,24 +1086,42 @@ impl Model {
                 let row_a = unsafe { a_ptr.add(ssm_row_off) };
                 // SAFETY: offsets are in-bounds due to validated tensor shapes and loop ranges.
                 let row_ssm = unsafe { ssm_ptr.add(ssm_row_off) };
-                let mut j = 0usize;
-                while j < s {
-                    // SAFETY: j in [0, s), row pointers are valid for s elements.
-                    let prev = unsafe { *row_ssm.add(j) };
-                    // SAFETY: j in [0, s), row pointers are valid for s elements.
-                    let d_a = (dt * unsafe { *row_a.add(j) }).exp();
-                    if scratch.capture_train_trace {
-                        scratch.train_trace_layers[layer_idx].d_a[ssm_row_off + j] = d_a;
+                if s == 16 {
+                    let trace_ptr = if CAPTURE {
+                        unsafe {
+                            scratch.train_trace_layers[layer_idx]
+                                .d_a
+                                .as_mut_ptr()
+                                .add(ssm_row_off)
+                        }
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    y += unsafe {
+                        selective_scan_state16::<CAPTURE>(
+                            row_a, row_ssm, dt, x_dt, b_ptr, c_ptr, trace_ptr,
+                        )
+                    };
+                } else {
+                    let mut j = 0usize;
+                    while j < s {
+                        // SAFETY: j in [0, s), row pointers are valid for s elements.
+                        let prev = unsafe { *row_ssm.add(j) };
+                        // SAFETY: j in [0, s), row pointers are valid for s elements.
+                        let d_a = (dt * unsafe { *row_a.add(j) }).exp();
+                        if CAPTURE {
+                            scratch.train_trace_layers[layer_idx].d_a[ssm_row_off + j] = d_a;
+                        }
+                        // SAFETY: b/c vectors have length s by construction.
+                        let next = prev * d_a + x_dt * unsafe { *b_ptr.add(j) };
+                        // SAFETY: row pointer valid and unique for write.
+                        unsafe { *row_ssm.add(j) = next };
+                        // SAFETY: c vector has length s by construction.
+                        y += next * unsafe { *c_ptr.add(j) };
+                        j += 1;
                     }
-                    // SAFETY: b/c vectors have length s by construction.
-                    let next = prev * d_a + x_dt * unsafe { *b_ptr.add(j) };
-                    // SAFETY: row pointer valid and unique for write.
-                    unsafe { *row_ssm.add(j) = next };
-                    // SAFETY: c vector has length s by construction.
-                    y += next * unsafe { *c_ptr.add(j) };
-                    j += 1;
                 }
-                if scratch.capture_train_trace {
+                if CAPTURE {
                     let tr = &mut scratch.train_trace_layers[layer_idx];
                     tr.dt[ch] = dt;
                     tr.gate[ch] = gate;
@@ -1098,7 +1129,7 @@ impl Model {
                     tr.y_pre[ch] = y;
                 }
                 scratch.y[ch] = y * gate;
-                if scratch.capture_train_trace {
+                if CAPTURE {
                     scratch.train_trace_layers[layer_idx].y[ch] = scratch.y[ch];
                 }
             }
@@ -1118,7 +1149,7 @@ impl Model {
                     *dst += b;
                 }
             }
-            if scratch.capture_train_trace {
+            if CAPTURE {
                 let tr = &mut scratch.train_trace_layers[layer_idx];
                 tr.out
                     .as_mut_slice()
@@ -1130,7 +1161,7 @@ impl Model {
                 kernel::add_inplace(scratch.h.as_mut_ptr(), scratch.out.as_ptr(), c);
             }
         }
-        if scratch.capture_train_trace {
+        if CAPTURE {
             scratch
                 .train_h_final
                 .as_mut_slice()
@@ -1764,23 +1795,56 @@ impl Model {
             for ch in 0..i {
                 let g = scratch.grad_conv_pre[ch];
                 let base = ch * self.cfg.conv_kernel;
-                let mut ring = tr.conv_pos_prev;
                 let w0 = layer.conv_w[base];
                 scratch.grad_xz[ch] += g * w0;
-                for tap in 0..self.cfg.conv_kernel {
-                    let val = if ring == tr.conv_pos_prev {
-                        tr.xz[ch]
-                    } else {
-                        tr.conv_prev[base + ring]
+                if scope.mixer_conv && self.cfg.conv_kernel == 4 {
+                    let vals = match tr.conv_pos_prev {
+                        0 => [
+                            tr.xz[ch],
+                            tr.conv_prev[base + 3],
+                            tr.conv_prev[base + 2],
+                            tr.conv_prev[base + 1],
+                        ],
+                        1 => [
+                            tr.xz[ch],
+                            tr.conv_prev[base],
+                            tr.conv_prev[base + 3],
+                            tr.conv_prev[base + 2],
+                        ],
+                        2 => [
+                            tr.xz[ch],
+                            tr.conv_prev[base + 1],
+                            tr.conv_prev[base],
+                            tr.conv_prev[base + 3],
+                        ],
+                        _ => [
+                            tr.xz[ch],
+                            tr.conv_prev[base + 2],
+                            tr.conv_prev[base + 1],
+                            tr.conv_prev[base],
+                        ],
                     };
-                    if scope.mixer_conv {
-                        scratch.grad_conv_w[base + tap] = g * val;
+                    scratch.grad_conv_w[base] = g * vals[0];
+                    scratch.grad_conv_w[base + 1] = g * vals[1];
+                    scratch.grad_conv_w[base + 2] = g * vals[2];
+                    scratch.grad_conv_w[base + 3] = g * vals[3];
+                } else {
+                    let mut ring = tr.conv_pos_prev;
+                    for tap in 0..self.cfg.conv_kernel {
+                        let val = if ring == tr.conv_pos_prev {
+                            tr.xz[ch]
+                        } else {
+                            tr.conv_prev[base + ring]
+                        };
+                        if scope.mixer_conv {
+                            scratch.grad_conv_w[base + tap] = g * val;
+                        }
+                        ring = if ring == 0 {
+                            self.cfg.conv_kernel - 1
+                        } else {
+                            ring - 1
+                        };
                     }
-                    ring = if ring == 0 {
-                        self.cfg.conv_kernel - 1
-                    } else {
-                        ring - 1
-                    };
                 }
                 if scope.mixer_conv && layer.conv_b.is_some() {
                     scratch.grad_conv_b[ch] = g;
@@ -2782,6 +2846,10 @@ fn depthwise_conv_step(
     state: &mut LayerState,
     out: &mut [f32],
 ) {
+    if conv_kernel == 4 {
+        depthwise_conv_step_k4(x, conv_w, conv_b, state, out);
+        return;
+    }
     let inner = x.len();
     debug_assert_eq!(out.len(), inner);
     debug_assert_eq!(conv_w.len(), inner * conv_kernel);
@@ -2808,6 +2876,83 @@ fn depthwise_conv_step(
     }
 
     state.conv_pos = if pos + 1 == conv_kernel { 0 } else { pos + 1 };
+}
+
+#[inline(always)]
+fn depthwise_conv_step_k4(
+    x: &[f32],
+    conv_w: &Tensor1D,
+    conv_b: Option<&Tensor1D>,
+    state: &mut LayerState,
+    out: &mut [f32],
+) {
+    let inner = x.len();
+    debug_assert_eq!(out.len(), inner);
+    debug_assert_eq!(conv_w.len(), inner * 4);
+
+    let pos = state.conv_pos;
+    let conv_state = state.conv.as_mut_slice();
+    let weight = conv_w.as_slice();
+
+    for ch in 0..inner {
+        let base = ch * 4;
+        conv_state[base + pos] = x[ch];
+        let acc = match pos {
+            0 => {
+                conv_state[base] * weight[base]
+                    + conv_state[base + 3] * weight[base + 1]
+                    + conv_state[base + 2] * weight[base + 2]
+                    + conv_state[base + 1] * weight[base + 3]
+            }
+            1 => {
+                conv_state[base + 1] * weight[base]
+                    + conv_state[base] * weight[base + 1]
+                    + conv_state[base + 3] * weight[base + 2]
+                    + conv_state[base + 2] * weight[base + 3]
+            }
+            2 => {
+                conv_state[base + 2] * weight[base]
+                    + conv_state[base + 1] * weight[base + 1]
+                    + conv_state[base] * weight[base + 2]
+                    + conv_state[base + 3] * weight[base + 3]
+            }
+            _ => {
+                conv_state[base + 3] * weight[base]
+                    + conv_state[base + 2] * weight[base + 1]
+                    + conv_state[base + 1] * weight[base + 2]
+                    + conv_state[base] * weight[base + 3]
+            }
+        };
+        out[ch] = acc + conv_b.as_ref().map_or(0.0, |b| b[ch]);
+    }
+
+    state.conv_pos = (pos + 1) & 3;
+}
+
+#[inline(always)]
+unsafe fn selective_scan_state16<const CAPTURE: bool>(
+    row_a: *const f32,
+    row_ssm: *mut f32,
+    dt: f32,
+    x_dt: f32,
+    b_ptr: *const f32,
+    c_ptr: *const f32,
+    trace_d_a: *mut f32,
+) -> f32 {
+    let mut y = 0.0f32;
+    let mut j = 0usize;
+    while j < 16 {
+        let prev = *row_ssm.add(j);
+        let d_a = (dt * *row_a.add(j)).exp();
+        if CAPTURE {
+            *trace_d_a.add(j) = d_a;
+        }
+        let next = prev * d_a + x_dt * *b_ptr.add(j);
+        *row_ssm.add(j) = next;
+        y += next * *c_ptr.add(j);
+        j += 1;
+    }
+    y
 }
 
 #[inline(always)]
@@ -2921,6 +3066,60 @@ mod tests {
             assert_eq!(l1.len(), l2.len());
             for (a, b) in l1.iter().zip(l2.iter()) {
                 assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn traced_and_untraced_forward_match_exactly() {
+        let cfg = Config {
+            vocab_size: 256,
+            hidden_size: 64,
+            num_layers: 2,
+            inner_size: 96,
+            state_size: 8,
+            conv_kernel: 4,
+            dt_rank: 8,
+            layer_norm_eps: 1e-5,
+        };
+        let model = Model::new_random(cfg.clone(), 4321).expect("random model");
+        let mut traced_state = model.new_state();
+        let mut plain_state = model.new_state();
+        let mut traced_scratch = ScratchBuffers::new(&cfg);
+        let mut plain_scratch = ScratchBuffers::new(&cfg);
+        traced_scratch.set_capture_train_trace(true);
+        plain_scratch.set_capture_train_trace(false);
+
+        let seq = b"trace equivalence for mamba";
+        for &tok in seq {
+            let traced_logits = model
+                .forward(&mut traced_scratch, tok as u32, &mut traced_state)
+                .to_vec();
+            let plain_logits = model
+                .forward(&mut plain_scratch, tok as u32, &mut plain_state)
+                .to_vec();
+            for (a, b) in traced_logits.iter().zip(plain_logits.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+            for (tr_layer, plain_layer) in traced_state.layers.iter().zip(plain_state.layers.iter())
+            {
+                for (&a, &b) in tr_layer
+                    .conv
+                    .as_slice()
+                    .iter()
+                    .zip(plain_layer.conv.as_slice())
+                {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (&a, &b) in tr_layer
+                    .ssm
+                    .as_slice()
+                    .iter()
+                    .zip(plain_layer.ssm.as_slice())
+                {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                assert_eq!(tr_layer.conv_pos, plain_layer.conv_pos);
             }
         }
     }

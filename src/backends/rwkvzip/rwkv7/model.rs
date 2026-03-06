@@ -2061,35 +2061,78 @@ impl Model {
                 let off = head_idx * n;
                 let s_head_old_off = head_idx * n * n;
                 let s_head_new_off = head_idx * n * n;
-                for row in 0..n {
-                    let gy = scratch.grad_x4[off + row];
-                    if gy == 0.0 {
-                        continue;
-                    }
-                    let row_old_off = s_head_old_off + row * n;
-                    let row_new_off = s_head_new_off + row * n;
-                    let mut u = 0.0f32;
-                    for col in 0..n {
-                        u += s_old[row_old_off + col] * tr.kk[off + col];
-                    }
-                    let mut du = 0.0f32;
-                    let v_i = tr.v[off + row];
-                    for col in 0..n {
-                        let idx = off + col;
-                        let d_s = gy * tr.r[idx];
-                        scratch.grad_x2[idx] += s_new[row_new_off + col] * gy; // d r
-                        scratch.grad_param[idx] += d_s * s_old[row_old_off + col]; // d w
-                        scratch.grad_x3[idx] += d_s * v_i; // d k_scaled
-                        scratch.grad_x6[off + row] += d_s * tr.k[idx]; // d v
-                        let d_kka = -d_s * u;
-                        scratch.grad_param2[idx] += d_kka * tr.a[idx]; // d kk via kka
-                        scratch.grad_x5[idx] += d_kka * tr.kk[idx]; // d a via kka
-                        du += -d_s * (tr.kk[idx] * tr.a[idx]);
-                    }
-                    for col in 0..n {
-                        let idx = off + col;
-                        scratch.grad_param2[idx] += du * s_old[row_old_off + col];
-                    }
+                let grad_y = &scratch.grad_x4.as_slice()[off..off + n];
+                let r_head = &tr.r.as_slice()[off..off + n];
+                let k_head = &tr.k.as_slice()[off..off + n];
+                let kk_head = &tr.kk.as_slice()[off..off + n];
+                let a_head = &tr.a.as_slice()[off..off + n];
+                let v_head = &tr.v.as_slice()[off..off + n];
+
+                unsafe {
+                    kernel::gemv_t_avx(
+                        s_new.as_ptr().add(s_head_new_off),
+                        grad_y.as_ptr(),
+                        scratch.grad_low_rank.as_mut_ptr(),
+                        n,
+                        n,
+                    );
+                    kernel::gemv_t_avx(
+                        s_old.as_ptr().add(s_head_old_off),
+                        grad_y.as_ptr(),
+                        scratch.grad_low_rank2.as_mut_ptr(),
+                        n,
+                        n,
+                    );
+                }
+
+                for j in 0..n {
+                    let idx = off + j;
+                    scratch.grad_x2[idx] += scratch.grad_low_rank[j];
+                    scratch.grad_param[idx] += r_head[j] * scratch.grad_low_rank2[j];
+                }
+
+                unsafe {
+                    kernel::gemv_avx(
+                        s_old.as_ptr().add(s_head_old_off),
+                        kk_head.as_ptr(),
+                        scratch.grad_low_rank.as_mut_ptr(),
+                        n,
+                        n,
+                    );
+                }
+
+                let mut dot_gv = 0.0f32;
+                let mut dot_rk = 0.0f32;
+                let mut dot_r_kka = 0.0f32;
+                let mut sum_gy_u = 0.0f32;
+                for j in 0..n {
+                    dot_gv += grad_y[j] * v_head[j];
+                    dot_rk += r_head[j] * k_head[j];
+                    dot_r_kka += r_head[j] * kk_head[j] * a_head[j];
+                    sum_gy_u += grad_y[j] * scratch.grad_low_rank[j];
+                }
+
+                for j in 0..n {
+                    let idx = off + j;
+                    scratch.grad_x3[idx] += r_head[j] * dot_gv;
+                    scratch.grad_x6[idx] += grad_y[j] * dot_rk;
+                    scratch.grad_x5[idx] -= sum_gy_u * r_head[j] * kk_head[j];
+                    scratch.grad_low_rank[j] = -grad_y[j] * dot_r_kka;
+                }
+
+                unsafe {
+                    kernel::gemv_t_avx(
+                        s_old.as_ptr().add(s_head_old_off),
+                        scratch.grad_low_rank.as_ptr(),
+                        scratch.grad_low_rank2.as_mut_ptr(),
+                        n,
+                        n,
+                    );
+                }
+                for j in 0..n {
+                    let idx = off + j;
+                    scratch.grad_param2[idx] +=
+                        scratch.grad_low_rank2[j] - sum_gy_u * r_head[j] * a_head[j];
                 }
             }
 
@@ -2974,6 +3017,20 @@ impl Model {
         state: &mut State,
         profiler: &mut S,
     ) -> &'a [f32] {
+        if scratch.capture_train_trace {
+            self.forward_with_sink_impl::<true, S>(scratch, token, state, profiler)
+        } else {
+            self.forward_with_sink_impl::<false, S>(scratch, token, state, profiler)
+        }
+    }
+
+    fn forward_with_sink_impl<'a, const CAPTURE: bool, S: ProfilerSink>(
+        &'a self,
+        scratch: &'a mut ScratchBuffers,
+        token: u32,
+        state: &mut State,
+        profiler: &mut S,
+    ) -> &'a [f32] {
         let c = self.cfg.hidden_size;
         let _h = self.cfg.num_heads;
         let _n = self.cfg.head_dim;
@@ -2984,7 +3041,7 @@ impl Model {
         let emb_offset = token_idx * c;
         let emb_slice = &self.embeddings.as_slice()[emb_offset..emb_offset + c];
         scratch.x.as_mut_slice().copy_from_slice(emb_slice);
-        if scratch.capture_train_trace {
+        if CAPTURE {
             scratch.train_token = token_idx;
             scratch.train_trace_valid = true;
         } else {
@@ -2996,7 +3053,7 @@ impl Model {
         unsafe {
             // Process each layer (using index to avoid borrow conflicts)
             for layer_idx in 0..num_layers {
-                if scratch.capture_train_trace {
+                if CAPTURE {
                     scratch.train_trace_layers[layer_idx]
                         .x_in
                         .copy_from(&scratch.x);
@@ -3015,7 +3072,7 @@ impl Model {
                         self.cfg.layer_norm_eps,
                     );
                 }
-                if scratch.capture_train_trace {
+                if CAPTURE {
                     scratch.train_trace_layers[layer_idx]
                         .x_after_pre
                         .copy_from(&scratch.x);
@@ -3030,23 +3087,23 @@ impl Model {
                     c,
                     self.cfg.layer_norm_eps,
                 );
-                if scratch.capture_train_trace {
+                if CAPTURE {
                     scratch.train_trace_layers[layer_idx]
                         .attn_norm
                         .copy_from(&scratch.x_normed);
                 }
 
-                let trace_ptr = if scratch.capture_train_trace {
-                    Some(&mut scratch.train_trace_layers[layer_idx] as *mut LayerTrainTrace)
+                let trace_ptr = if CAPTURE {
+                    &mut scratch.train_trace_layers[layer_idx] as *mut LayerTrainTrace
                 } else {
-                    None
+                    std::ptr::null_mut()
                 };
                 if S::ENABLED {
                     let attn_start = Instant::now();
-                    self.attention_forward_impl(scratch, layer_idx, state, trace_ptr);
+                    self.attention_forward_impl::<CAPTURE>(scratch, layer_idx, state, trace_ptr);
                     profiler.record_attention(layer_idx, attn_start.elapsed());
                 } else {
-                    self.attention_forward_impl(scratch, layer_idx, state, trace_ptr);
+                    self.attention_forward_impl::<CAPTURE>(scratch, layer_idx, state, trace_ptr);
                 }
 
                 // Add attention residual: x = x + att_out
@@ -3056,7 +3113,7 @@ impl Model {
                     scratch.x.as_mut_ptr(),
                     c,
                 );
-                if scratch.capture_train_trace {
+                if CAPTURE {
                     scratch.train_trace_layers[layer_idx]
                         .x_after_attn
                         .copy_from(&scratch.x);
@@ -3071,7 +3128,7 @@ impl Model {
                     c,
                     self.cfg.layer_norm_eps,
                 );
-                if scratch.capture_train_trace {
+                if CAPTURE {
                     scratch.train_trace_layers[layer_idx]
                         .ffn_norm
                         .copy_from(&scratch.x_normed);
@@ -3079,7 +3136,7 @@ impl Model {
 
                 if S::ENABLED {
                     let ffn_start = Instant::now();
-                    self.ffn_forward_impl(
+                    self.ffn_forward_impl::<CAPTURE>(
                         scratch,
                         layer_idx,
                         &mut state.layers[layer_idx],
@@ -3087,7 +3144,7 @@ impl Model {
                     );
                     profiler.record_ffn(layer_idx, ffn_start.elapsed());
                 } else {
-                    self.ffn_forward_impl(
+                    self.ffn_forward_impl::<CAPTURE>(
                         scratch,
                         layer_idx,
                         &mut state.layers[layer_idx],
@@ -3102,7 +3159,7 @@ impl Model {
                     scratch.x.as_mut_ptr(),
                     c,
                 );
-                if scratch.capture_train_trace {
+                if CAPTURE {
                     scratch.train_trace_layers[layer_idx]
                         .x_out
                         .copy_from(&scratch.x);
@@ -3128,7 +3185,7 @@ impl Model {
                 c,
             );
         }
-        if scratch.capture_train_trace {
+        if CAPTURE {
             scratch.train_v_first.copy_from(&state.v_first);
         }
 
@@ -3136,12 +3193,12 @@ impl Model {
     }
 
     #[inline(always)]
-    unsafe fn attention_forward_impl(
+    unsafe fn attention_forward_impl<const CAPTURE: bool>(
         &self,
         scratch: &mut ScratchBuffers,
         layer_idx: usize,
         state: &mut State,
-        trace: Option<*mut LayerTrainTrace>,
+        trace: *mut LayerTrainTrace,
     ) {
         let attn = &self.blocks[layer_idx].attn;
         let layer_state = &mut state.layers[layer_idx];
@@ -3151,8 +3208,8 @@ impl Model {
         let d_w = self.cfg.decay_low_rank;
         let d_a = self.cfg.a_low_rank;
         let d_g = self.cfg.g_low_rank;
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.att_x_prev_old.copy_from(&layer_state.att_x_prev);
             tr.att_state_old.copy_from(&layer_state.att_state);
         }
@@ -3174,8 +3231,8 @@ impl Model {
             scratch.xg.as_mut_ptr(),
             c,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.xr.copy_from(&scratch.xr);
             tr.xw.copy_from(&scratch.xw);
             tr.xk.copy_from(&scratch.xk);
@@ -3215,8 +3272,8 @@ impl Model {
             c,
             c,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.r.copy_from(&scratch.r);
             tr.k_pre.copy_from(&scratch.k);
             tr.v_pre.copy_from(&scratch.v);
@@ -3237,8 +3294,8 @@ impl Model {
             scratch.w_lora_tmp.as_mut_ptr(),
             d_w,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.w_hidden.as_mut_slice()[0..d_w]
                 .copy_from_slice(&scratch.w_lora_tmp.as_slice()[0..d_w]);
         }
@@ -3257,16 +3314,16 @@ impl Model {
             scratch.w_decay.as_mut_ptr(),
             c,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.w_pre.copy_from(&scratch.w_decay);
         }
         // Step 4: exp(-sigmoid(x) / sqrt(e))
         let inv_sqrt_e = 1.0 / std::f32::consts::E.sqrt();
         kernel::sigmoid_avx(scratch.w_decay.as_ptr(), scratch.w_decay.as_mut_ptr(), c);
         kernel::exp_neg_scaled_inplace(scratch.w_decay.as_mut_ptr(), inv_sqrt_e, c);
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.w_decay.copy_from(&scratch.w_decay);
         }
 
@@ -3278,8 +3335,8 @@ impl Model {
             d_a,
             c,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.a_hidden.as_mut_slice()[0..d_a]
                 .copy_from_slice(&scratch.w_lora_tmp.as_slice()[0..d_a]);
         }
@@ -3297,8 +3354,8 @@ impl Model {
             c,
         );
         kernel::sigmoid_avx(scratch.a.as_ptr(), scratch.a.as_mut_ptr(), c);
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.a.copy_from(&scratch.a);
         }
 
@@ -3315,8 +3372,8 @@ impl Model {
             scratch.w_lora_tmp.as_mut_ptr(),
             d_g,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.g_hidden.as_mut_slice()[0..d_g]
                 .copy_from_slice(&scratch.w_lora_tmp.as_slice()[0..d_g]);
         }
@@ -3327,8 +3384,8 @@ impl Model {
             c,
             d_g,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.g.copy_from(&scratch.g);
         }
 
@@ -3337,8 +3394,8 @@ impl Model {
             // Copy v to v_first buffer (no allocation)
             state.v_first.copy_from(&scratch.v);
             state.v_first_set = true;
-            if let Some(tr_ptr) = trace {
-                let tr = &mut *tr_ptr;
+            if CAPTURE {
+                let tr = &mut *trace;
                 tr.uses_v_residual = false;
                 tr.nu.zero();
                 tr.v.copy_from(&scratch.v);
@@ -3355,8 +3412,8 @@ impl Model {
                 d_v,
                 c,
             );
-            if let Some(tr_ptr) = trace {
-                let tr = &mut *tr_ptr;
+            if CAPTURE {
+                let tr = &mut *trace;
                 tr.v_hidden.as_mut_slice()[0..d_v]
                     .copy_from_slice(&scratch.w_lora_tmp.as_slice()[0..d_v]);
             }
@@ -3374,8 +3431,8 @@ impl Model {
                 c,
             );
             kernel::sigmoid_avx(scratch.att_out.as_ptr(), scratch.att_out.as_mut_ptr(), c);
-            if let Some(tr_ptr) = trace {
-                let tr = &mut *tr_ptr;
+            if CAPTURE {
+                let tr = &mut *trace;
                 tr.uses_v_residual = true;
                 tr.nu.copy_from(&scratch.att_out);
             }
@@ -3384,12 +3441,12 @@ impl Model {
                 let nu = scratch.att_out[i];
                 scratch.v[i] += (state.v_first[i] - scratch.v[i]) * nu;
             }
-            if let Some(tr_ptr) = trace {
-                let tr = &mut *tr_ptr;
+            if CAPTURE {
+                let tr = &mut *trace;
                 tr.v.copy_from(&scratch.v);
             }
-        } else if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        } else if CAPTURE {
+            let tr = &mut *trace;
             tr.uses_v_residual = false;
             tr.nu.zero();
             tr.v.copy_from(&scratch.v);
@@ -3402,8 +3459,8 @@ impl Model {
             scratch.kk.as_mut_ptr(),
             c,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.kk_pre.copy_from(&scratch.kk);
         }
         // Normalize per head
@@ -3416,8 +3473,8 @@ impl Model {
                 1e-12,
             );
         }
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.kk.copy_from(&scratch.kk);
         }
 
@@ -3426,8 +3483,8 @@ impl Model {
             let scale = 1.0 + (scratch.a[i] - 1.0) * attn.k_a[i];
             scratch.k[i] *= scale;
         }
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.k.copy_from(&scratch.k);
         }
 
@@ -3444,8 +3501,8 @@ impl Model {
             h,
             n,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.y_wkv.copy_from(&scratch.y);
         }
 
@@ -3459,8 +3516,8 @@ impl Model {
             n,
             self.cfg.group_norm_eps,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.y_gn.copy_from(&scratch.y);
         }
 
@@ -3471,16 +3528,16 @@ impl Model {
             for j in 0..n {
                 alpha += scratch.r[offset + j] * scratch.k[offset + j] * attn.r_k[head * n + j];
             }
-            if let Some(tr_ptr) = trace {
-                let tr = &mut *tr_ptr;
+            if CAPTURE {
+                let tr = &mut *trace;
                 tr.alpha[head] = alpha;
             }
             for j in 0..n {
                 scratch.y[offset + j] += alpha * scratch.v[offset + j];
             }
         }
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.y_head.copy_from(&scratch.y);
         }
 
@@ -3491,8 +3548,8 @@ impl Model {
             scratch.y.as_mut_ptr(),
             c,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.y_gate.copy_from(&scratch.y);
         }
 
@@ -3504,25 +3561,25 @@ impl Model {
             c,
             c,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.att_out.copy_from(&scratch.att_out);
         }
     }
 
     #[inline(always)]
-    unsafe fn ffn_forward_impl(
+    unsafe fn ffn_forward_impl<const CAPTURE: bool>(
         &self,
         scratch: &mut ScratchBuffers,
         layer_idx: usize,
         layer_state: &mut LayerState,
-        trace: Option<*mut LayerTrainTrace>,
+        trace: *mut LayerTrainTrace,
     ) {
         let ffn = &self.blocks[layer_idx].ffn;
         let c = self.cfg.hidden_size;
         let i = self.cfg.intermediate_size;
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.ffn_x_prev_old.copy_from(&layer_state.ffn_x_prev);
         }
 
@@ -3534,8 +3591,8 @@ impl Model {
             scratch.xk.as_mut_ptr(),
             c,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.ffn_xk.copy_from(&scratch.xk);
         }
 
@@ -3554,13 +3611,13 @@ impl Model {
             i,
             c,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.ffn_pre.copy_from(&scratch.ffn_k);
         }
         kernel::relu_squared_avx(scratch.ffn_k.as_ptr(), scratch.ffn_k.as_mut_ptr(), i);
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.ffn_k.copy_from(&scratch.ffn_k);
         }
 
@@ -3572,8 +3629,8 @@ impl Model {
             c,
             i,
         );
-        if let Some(tr_ptr) = trace {
-            let tr = &mut *tr_ptr;
+        if CAPTURE {
+            let tr = &mut *trace;
             tr.ffn_out.copy_from(&scratch.ffn_out);
         }
     }
@@ -4328,5 +4385,80 @@ mod tests {
             (v_first_checksum - expected_v_first_checksum).abs() <= tol,
             "v_first_checksum={v_first_checksum}"
         );
+    }
+
+    #[test]
+    fn traced_and_untraced_forward_match_exactly() {
+        let cfg = Config {
+            vocab_size: 256,
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 1,
+            head_dim: 64,
+            intermediate_size: 128,
+            layer_norm_eps: 1e-5,
+            group_norm_eps: 64e-5,
+            decay_low_rank: 16,
+            a_low_rank: 16,
+            v_low_rank: 16,
+            g_low_rank: 32,
+        };
+        cfg.validate().expect("valid test config");
+        let model = Model::new_random(cfg.clone(), 0xCAFEBABE).expect("random model");
+        let mut traced_state = model.new_state();
+        let mut plain_state = model.new_state();
+        let mut traced_scratch = ScratchBuffers::new(&cfg);
+        let mut plain_scratch = ScratchBuffers::new(&cfg);
+        traced_scratch.set_capture_train_trace(true);
+        plain_scratch.set_capture_train_trace(false);
+
+        let tokens = [3u32, 19, 77, 120, 255, 5, 88, 13, 144, 1, 200];
+        for &token in &tokens {
+            let traced_logits = model
+                .forward(&mut traced_scratch, token, &mut traced_state)
+                .to_vec();
+            let plain_logits = model
+                .forward(&mut plain_scratch, token, &mut plain_state)
+                .to_vec();
+            for (a, b) in traced_logits.iter().zip(plain_logits.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+            assert_eq!(traced_state.v_first_set, plain_state.v_first_set);
+            for (&a, &b) in traced_state
+                .v_first
+                .as_slice()
+                .iter()
+                .zip(plain_state.v_first.as_slice())
+            {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+            for (tr_layer, plain_layer) in traced_state.layers.iter().zip(plain_state.layers.iter())
+            {
+                for (&a, &b) in tr_layer
+                    .att_x_prev
+                    .as_slice()
+                    .iter()
+                    .zip(plain_layer.att_x_prev.as_slice())
+                {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (&a, &b) in tr_layer
+                    .att_state
+                    .as_slice()
+                    .iter()
+                    .zip(plain_layer.att_state.as_slice())
+                {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (&a, &b) in tr_layer
+                    .ffn_x_prev
+                    .as_slice()
+                    .iter()
+                    .zip(plain_layer.ffn_x_prev.as_slice())
+                {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+            }
+        }
     }
 }

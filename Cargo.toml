@@ -85,6 +85,11 @@ name = "rwkv_online_train_full"
 harness = false
 required-features = ["backend-rwkv"]
 
+[[bench]]
+name = "exact_hotpaths"
+harness = false
+required-features = ["backend-rwkv", "backend-mamba"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

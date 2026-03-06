@@ -28,7 +28,7 @@ fn bench_rwkv_online_train_full(c: &mut Criterion) {
         "cfg:hidden=128,layers=2,intermediate=256,decay_rank=16,a_rank=16,v_rank=16,g_rank=16,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
     );
     let train_full = backend(
-        "cfg:hidden=128,layers=2,intermediate=256,decay_rank=16,a_rank=16,v_rank=16,g_rank=16,seed=7,train=adam,lr=0.001,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)",
+        "cfg:hidden=128,layers=2,intermediate=256,decay_rank=16,a_rank=16,v_rank=16,g_rank=16,seed=7,train=adam,lr=0.001,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)",
     );
 
     let mut group = c.benchmark_group("rwkv_online_train_full");
@@ -46,7 +46,7 @@ fn bench_rwkv_online_train_full(c: &mut Criterion) {
     );
 
     group.bench_with_input(
-        BenchmarkId::new("train_scope_head_bias", data.len()),
+        BenchmarkId::new("train_scope_all", data.len()),
         &train_full,
         |b, backend| {
             b.iter(|| {
