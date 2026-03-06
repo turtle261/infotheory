@@ -1157,9 +1157,23 @@ impl Compressor {
         softmax_pdf_floor_with_bias(logits, bias, pdf_out);
     }
 
+    #[inline]
+    pub fn forward_to_pdf(&mut self, token: u32, pdf_out: &mut [f64]) {
+        let logits = self
+            .model
+            .forward(&mut self.scratch, token, &mut self.state);
+        let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
+        Self::logits_to_pdf(logits, bias, pdf_out);
+    }
+
     /// Snapshot online bias only.
     pub fn online_bias_snapshot(&self) -> Option<Vec<f32>> {
         self.online.as_ref().map(|o| o.out_bias.clone())
+    }
+
+    #[inline]
+    pub fn online_bias_slice(&self) -> Option<&[f32]> {
+        self.online.as_ref().map(|o| o.out_bias.as_slice())
     }
 
     /// Apply one online update using external PDF.

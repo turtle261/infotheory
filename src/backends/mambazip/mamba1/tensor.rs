@@ -30,9 +30,7 @@ fn alloc_f32_buffer(len: usize) -> NonNull<f32> {
     }
     let layout = layout_for_f32_elems(len);
     let ptr = unsafe { alloc_zeroed(layout) };
-    NonNull::new(ptr)
-        .expect("allocation failed")
-        .cast()
+    NonNull::new(ptr).expect("allocation failed").cast()
 }
 
 #[inline]

@@ -275,9 +275,13 @@ impl CtwPredictor {
     }
 
     #[inline]
+    fn can_fast_ac_bitwise(&self) -> bool {
+        self.bits_per_symbol == 8 && self.msb_first
+    }
+
+    #[inline]
     fn bit_prob_one_msb(&mut self, bit_idx: usize) -> f64 {
-        debug_assert!(self.bits_per_symbol == 8);
-        debug_assert!(self.msb_first);
+        debug_assert!(self.can_fast_ac_bitwise());
         self.tree
             .predict(true, bit_idx)
             .clamp(PDF_MIN, 1.0 - PDF_MIN)
@@ -285,8 +289,7 @@ impl CtwPredictor {
 
     #[inline]
     fn update_bit_msb(&mut self, bit_idx: usize, bit: bool) {
-        debug_assert!(self.bits_per_symbol == 8);
-        debug_assert!(self.msb_first);
+        debug_assert!(self.can_fast_ac_bitwise());
         self.tree.update(bit, bit_idx);
         self.valid = false;
     }
@@ -416,23 +419,11 @@ impl MambaPredictor {
             return;
         }
         if !self.primed {
-            let bias = self.compressor.online_bias_snapshot();
-            let logits = self.compressor.model.forward(
-                &mut self.compressor.scratch,
-                0,
-                &mut self.compressor.state,
-            );
-            mambazip::Compressor::logits_to_pdf(
-                logits,
-                bias.as_deref(),
-                &mut self.compressor.pdf_buffer,
-            );
-            self.pdf.copy_from_slice(&self.compressor.pdf_buffer);
+            self.compressor.forward_to_pdf(0, &mut self.pdf);
             self.primed = true;
             self.valid = true;
             return;
         }
-        self.pdf.copy_from_slice(&self.compressor.pdf_buffer);
         self.valid = true;
     }
 
@@ -444,18 +435,8 @@ impl MambaPredictor {
     fn update(&mut self, symbol: u8) -> Result<()> {
         self.ensure_predicted();
         self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
-        let bias = self.compressor.online_bias_snapshot();
-        let logits = self.compressor.model.forward(
-            &mut self.compressor.scratch,
-            symbol as u32,
-            &mut self.compressor.state,
-        );
-        mambazip::Compressor::logits_to_pdf(
-            logits,
-            bias.as_deref(),
-            &mut self.compressor.pdf_buffer,
-        );
-        self.valid = false;
+        self.compressor.forward_to_pdf(symbol as u32, &mut self.pdf);
+        self.valid = true;
         Ok(())
     }
 
@@ -494,23 +475,11 @@ impl RwkvPredictor {
             return;
         }
         if !self.primed {
-            let bias = self.compressor.online_bias_snapshot();
-            let logits = self.compressor.model.forward(
-                &mut self.compressor.scratch,
-                0,
-                &mut self.compressor.state,
-            );
-            rwkvzip::Compressor::logits_to_pdf(
-                logits,
-                bias.as_deref(),
-                &mut self.compressor.pdf_buffer,
-            );
-            self.pdf.copy_from_slice(&self.compressor.pdf_buffer);
+            self.compressor.forward_to_pdf(0, &mut self.pdf);
             self.primed = true;
             self.valid = true;
             return;
         }
-        self.pdf.copy_from_slice(&self.compressor.pdf_buffer);
         self.valid = true;
     }
 
@@ -522,18 +491,8 @@ impl RwkvPredictor {
     fn update(&mut self, symbol: u8) -> Result<()> {
         self.ensure_predicted();
         self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
-        let bias = self.compressor.online_bias_snapshot();
-        let logits = self.compressor.model.forward(
-            &mut self.compressor.scratch,
-            symbol as u32,
-            &mut self.compressor.state,
-        );
-        rwkvzip::Compressor::logits_to_pdf(
-            logits,
-            bias.as_deref(),
-            &mut self.compressor.pdf_buffer,
-        );
-        self.valid = false;
+        self.compressor.forward_to_pdf(symbol as u32, &mut self.pdf);
+        self.valid = true;
         Ok(())
     }
 
@@ -790,30 +749,34 @@ impl MixturePredictor {
     }
 
     #[inline]
-    fn can_fast_neural_ac_bitwise(&self) -> bool {
-        if self.kind != MixtureKind::Neural || self.experts.len() <= 1 {
-            return false;
-        }
+    fn can_fast_ac_bitwise(&self) -> bool {
         self.experts.iter().any(|e| {
             if let RatePdfPredictor::Ctw(ctw) = &*e.predictor {
-                ctw.bits_per_symbol == 8 && ctw.msb_first
+                ctw.can_fast_ac_bitwise()
             } else {
                 false
             }
         })
     }
 
-    fn ac_step_neural_bitwise<F>(&mut self, mut choose_bit: F) -> Result<u8>
+    fn ac_step_bitwise<F>(&mut self, mut choose_bit: F) -> Result<u8>
     where
         F: FnMut(usize, f64) -> Result<u8>,
     {
-        debug_assert_eq!(self.kind, MixtureKind::Neural);
-        debug_assert!(self.experts.len() > 1);
-
         let n = self.experts.len();
-        self.neural.evaluate_expert_weights();
         self.scratch.resize(n, 0.0);
-        self.scratch.copy_from_slice(self.neural.expert_weights());
+        match self.kind {
+            MixtureKind::Neural if n > 1 => {
+                self.neural.evaluate_expert_weights();
+                self.scratch.copy_from_slice(self.neural.expert_weights());
+            }
+            _ => {
+                let lw_norm = logsumexp(self.experts.iter().map(|e| e.log_weight));
+                for (i, expert) in self.experts.iter().enumerate() {
+                    self.scratch[i] = (expert.log_weight - lw_norm).exp();
+                }
+            }
+        }
         self.scratch2.resize(n, 1.0);
         self.scratch2.fill(1.0);
         self.neural_logps.resize(n, 0.0);
@@ -831,7 +794,7 @@ impl MixturePredictor {
 
             let mut handled_ctw = false;
             if let RatePdfPredictor::Ctw(ctw) = &mut *self.experts[i].predictor {
-                if ctw.bits_per_symbol == 8 && ctw.msb_first {
+                if ctw.can_fast_ac_bitwise() {
                     self.neural_bit_modes[i] = 0;
                     handled_ctw = true;
                 }
@@ -929,10 +892,52 @@ impl MixturePredictor {
             }
         }
 
-        self.neural.evaluate_symbol(&self.neural_logps, PDF_MIN);
-        self.neural
-            .update_weights_symbol(&self.neural_logps, PDF_MIN);
-        self.neural.update_history(symbol);
+        match self.kind {
+            MixtureKind::Bayes => {
+                for i in 0..n {
+                    self.scratch[i] = self.experts[i].log_weight + self.neural_logps[i];
+                }
+                let log_mix = logsumexp(self.scratch.iter().take(n).copied());
+                for i in 0..n {
+                    self.experts[i].log_weight += self.neural_logps[i] - log_mix;
+                }
+            }
+            MixtureKind::FadingBayes => {
+                for i in 0..n {
+                    self.scratch[i] =
+                        self.decay * self.experts[i].log_weight + self.neural_logps[i];
+                }
+                let log_mix = logsumexp(self.scratch.iter().take(n).copied());
+                for i in 0..n {
+                    self.experts[i].log_weight = self.scratch[i] - log_mix;
+                }
+            }
+            MixtureKind::Switching => {
+                let log_alpha = self.alpha.ln();
+                let log_1m_alpha = (1.0 - self.alpha).ln();
+                for i in 0..n {
+                    let expert = &self.experts[i];
+                    let switched = logsumexp2(
+                        log_1m_alpha + expert.log_weight,
+                        log_alpha + expert.log_prior,
+                    );
+                    self.scratch[i] = switched + self.neural_logps[i];
+                }
+                let log_mix = logsumexp(self.scratch.iter().take(n).copied());
+                for i in 0..n {
+                    self.experts[i].log_weight = self.scratch[i] - log_mix;
+                }
+            }
+            MixtureKind::Mdl => {}
+            MixtureKind::Neural => {
+                if n > 1 {
+                    self.neural.evaluate_symbol(&self.neural_logps, PDF_MIN);
+                    self.neural
+                        .update_weights_symbol(&self.neural_logps, PDF_MIN);
+                }
+                self.neural.update_history(symbol);
+            }
+        }
         self.valid = false;
         Ok(symbol)
     }
@@ -1045,6 +1050,41 @@ impl RatePdfPredictor {
             }
         }
     }
+
+    #[inline]
+    fn can_fast_ac_bitwise(&self) -> bool {
+        match self {
+            Self::Ctw(m) => m.can_fast_ac_bitwise(),
+            Self::Mixture(m) => m.can_fast_ac_bitwise(),
+            _ => false,
+        }
+    }
+
+    fn ac_step_fast_bitwise<F>(&mut self, choose_bit: F) -> Result<u8>
+    where
+        F: FnMut(usize, f64) -> Result<u8>,
+    {
+        match self {
+            Self::Ctw(m) => ctw_ac_step_bitwise(m, choose_bit),
+            Self::Mixture(m) => m.ac_step_bitwise(choose_bit),
+            _ => unreachable!("fast bitwise path requested for unsupported predictor"),
+        }
+    }
+}
+
+fn ctw_ac_step_bitwise<F>(ctw: &mut CtwPredictor, mut choose_bit: F) -> Result<u8>
+where
+    F: FnMut(usize, f64) -> Result<u8>,
+{
+    debug_assert!(ctw.can_fast_ac_bitwise());
+    let mut symbol = 0u8;
+    for bit_idx in 0..8usize {
+        let p1 = ctw.bit_prob_one_msb(bit_idx);
+        let bit = choose_bit(bit_idx, p1)? & 1;
+        symbol |= bit << (7 - bit_idx);
+        ctw.update_bit_msb(bit_idx, bit == 1);
+    }
+    Ok(symbol)
 }
 
 #[inline]
@@ -1062,27 +1102,25 @@ fn binary_split_from_prob_one(p1: f64) -> u32 {
 
 fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Vec<u8>> {
     predictor.begin_stream(data.len())?;
-    if let RatePdfPredictor::Mixture(mix) = predictor {
-        if mix.can_fast_neural_ac_bitwise() {
-            let mut out = Vec::new();
-            {
-                let mut enc = ArithmeticEncoder::new(&mut out);
-                for &symbol in data {
-                    mix.ac_step_neural_bitwise(|bit_idx, p1_mix| {
-                        let bit = (symbol >> (7 - bit_idx)) & 1;
-                        let split = binary_split_from_prob_one(p1_mix);
-                        if bit == 0 {
-                            enc.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
-                        } else {
-                            enc.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
-                        }
-                        Ok(bit)
-                    })?;
-                }
-                let _ = enc.finish()?;
+    if predictor.can_fast_ac_bitwise() {
+        let mut out = Vec::new();
+        {
+            let mut enc = ArithmeticEncoder::new(&mut out);
+            for &symbol in data {
+                predictor.ac_step_fast_bitwise(|bit_idx, p1_mix| {
+                    let bit = (symbol >> (7 - bit_idx)) & 1;
+                    let split = binary_split_from_prob_one(p1_mix);
+                    if bit == 0 {
+                        enc.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
+                    } else {
+                        enc.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
+                    }
+                    Ok(bit)
+                })?;
             }
-            return Ok(out);
+            let _ = enc.finish()?;
         }
+        return Ok(out);
     }
 
     let mut out = Vec::new();
@@ -1107,20 +1145,18 @@ fn decode_payload_ac(
     predictor: &mut RatePdfPredictor,
 ) -> Result<Vec<u8>> {
     predictor.begin_stream(out_len)?;
-    if let RatePdfPredictor::Mixture(mix) = predictor {
-        if mix.can_fast_neural_ac_bitwise() {
-            let mut dec = ArithmeticDecoder::new(payload)?;
-            let mut out = Vec::with_capacity(out_len);
-            for _ in 0..out_len {
-                let symbol = mix.ac_step_neural_bitwise(|_, p1_mix| {
-                    let split = binary_split_from_prob_one(p1_mix);
-                    let cdf = [0u32, split, CDF_TOTAL];
-                    Ok(dec.decode_symbol_counts(&cdf, CDF_TOTAL)? as u8)
-                })?;
-                out.push(symbol);
-            }
-            return Ok(out);
+    if predictor.can_fast_ac_bitwise() {
+        let mut dec = ArithmeticDecoder::new(payload)?;
+        let mut out = Vec::with_capacity(out_len);
+        for _ in 0..out_len {
+            let symbol = predictor.ac_step_fast_bitwise(|_, p1_mix| {
+                let split = binary_split_from_prob_one(p1_mix);
+                let cdf = [0u32, split, CDF_TOTAL];
+                Ok(dec.decode_symbol_counts(&cdf, CDF_TOTAL)? as u8)
+            })?;
+            out.push(symbol);
         }
+        return Ok(out);
     }
 
     let mut dec = ArithmeticDecoder::new(payload)?;
@@ -1437,6 +1473,52 @@ mod tests {
     fn roundtrip_rate_ac_ctw() {
         let data = b"ctw backend roundtrip payload";
         let backend = RateBackend::Ctw { depth: 8 };
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_rate_ac_single_expert_ctw_neural_mixture() {
+        let data = b"single expert neural ctw fast path payload";
+        let spec = MixtureSpec::new(
+            MixtureKind::Neural,
+            vec![crate::MixtureExpertSpec {
+                name: Some("ctw".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Ctw { depth: 8 },
+            }],
+        )
+        .with_alpha(0.03);
+        let backend = RateBackend::Mixture {
+            spec: Arc::new(spec),
+        };
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_rate_ac_single_expert_ctw_bayes_mixture() {
+        let data = b"single expert bayes ctw fast path payload";
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![crate::MixtureExpertSpec {
+                name: Some("ctw".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Ctw { depth: 8 },
+            }],
+        )
+        .with_alpha(0.03);
+        let backend = RateBackend::Mixture {
+            spec: Arc::new(spec),
+        };
         let enc =
             compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =

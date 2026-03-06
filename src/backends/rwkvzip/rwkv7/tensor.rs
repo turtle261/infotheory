@@ -36,9 +36,7 @@ fn alloc_f32_buffer(len: usize) -> NonNull<f32> {
     }
     let layout = layout_for_f32_elems(len);
     let ptr = unsafe { alloc_zeroed(layout) };
-    NonNull::new(ptr)
-        .expect("Allocation failed")
-        .cast()
+    NonNull::new(ptr).expect("Allocation failed").cast()
 }
 
 #[inline]
@@ -54,9 +52,7 @@ unsafe fn dealloc_f32_buffer(ptr: NonNull<f32>, len: usize) {
 
 #[inline]
 fn padded_stride(cols: usize) -> usize {
-    cols.checked_add(7)
-        .expect("tensor stride overflow")
-        & !7
+    cols.checked_add(7).expect("tensor stride overflow") & !7
 }
 
 /// Owned 1D tensor with aligned memory.

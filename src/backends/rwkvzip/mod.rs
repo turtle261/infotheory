@@ -1084,9 +1084,23 @@ impl Compressor {
         softmax_pdf_floor_with_bias(logits, bias, pdf_out);
     }
 
+    #[inline]
+    pub fn forward_to_pdf(&mut self, token: u32, pdf_out: &mut [f64]) {
+        let logits = self
+            .model
+            .forward(&mut self.scratch, token, &mut self.state);
+        let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
+        Self::logits_to_pdf(logits, bias, pdf_out);
+    }
+
     /// Snapshot current online output bias, if online mode is active.
     pub fn online_bias_snapshot(&self) -> Option<Vec<f32>> {
         self.online.as_ref().map(|o| o.out_bias.clone())
+    }
+
+    #[inline]
+    pub fn online_bias_slice(&self) -> Option<&[f32]> {
+        self.online.as_ref().map(|o| o.out_bias.as_slice())
     }
 
     fn resolve_online_train_action(
@@ -1131,7 +1145,6 @@ impl Compressor {
     }
 
     fn online_update_with_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
-        let model_template = self.model.clone();
         let Some(online) = self.online.as_mut() else {
             return Ok(());
         };
@@ -1159,7 +1172,7 @@ impl Compressor {
                 online.adam_v = Some(vec![0.0; online.out_bias.len()]);
             }
             if scope.trains_non_head_params() && online.full_adam.is_none() {
-                online.full_adam = Some(model_template.new_full_adam_state());
+                online.full_adam = Some(self.model.new_full_adam_state());
             }
         }
 

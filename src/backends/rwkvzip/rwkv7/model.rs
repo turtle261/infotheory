@@ -1640,26 +1640,16 @@ impl Model {
         }
 
         scratch.grad_x.zero();
-        for row in 0..vocab {
-            let g = scratch.grad_logits[row];
-            if g == 0.0 {
-                continue;
-            }
-            let row_off = row * c;
-            for col in 0..c {
-                scratch.grad_x[col] += self.lm_head[row_off + col] * g;
-            }
-        }
-
         if scope.head {
             match optimizer {
                 OptimizerKind::Sgd => {
-                    sgd_outer_update(
+                    fused_sgd_head_backward_update(
                         self.lm_head.as_mut_slice(),
                         vocab,
                         c,
                         &scratch.grad_logits.as_slice()[0..vocab],
                         scratch.x_normed.as_slice(),
+                        scratch.grad_x.as_mut_slice(),
                         lr,
                         clip,
                     );
@@ -1667,15 +1657,28 @@ impl Model {
                 OptimizerKind::Adam => {
                     let cfg = adam_step.as_ref().expect("adam cfg initialized");
                     let adam = model_adam.as_mut().expect("adam state exists");
-                    apply_adam_outer_update(
+                    fused_adam_head_backward_update(
                         self.lm_head.as_mut_slice(),
                         vocab,
                         c,
                         &scratch.grad_logits.as_slice()[0..vocab],
                         scratch.x_normed.as_slice(),
-                        &mut adam.lm_head,
+                        scratch.grad_x.as_mut_slice(),
+                        adam.lm_head.m.as_mut_slice(),
+                        adam.lm_head.v.as_mut_slice(),
                         cfg,
                     );
+                }
+            }
+        } else {
+            for row in 0..vocab {
+                let g = scratch.grad_logits[row];
+                if g == 0.0 {
+                    continue;
+                }
+                let row_off = row * c;
+                for col in 0..c {
+                    scratch.grad_x[col] += self.lm_head[row_off + col] * g;
                 }
             }
         }
@@ -1739,16 +1742,14 @@ impl Model {
             scratch.grad_x3.copy_from_slice(scratch.grad_x.as_slice()); // d ffn_out
 
             // ffn_out = value_w @ ffn_k
-            scratch.grad_ffn.zero();
-            for row in 0..c {
-                let g = scratch.grad_x3[row];
-                if g == 0.0 {
-                    continue;
-                }
-                let off = row * i;
-                for col in 0..i {
-                    scratch.grad_ffn[col] += block.ffn.value_w[off + col] * g;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.ffn.value_w.as_ptr(),
+                    scratch.grad_x3.as_ptr(),
+                    scratch.grad_ffn.as_mut_ptr(),
+                    c,
+                    i,
+                );
             }
             if scope.ffn {
                 match optimizer {
@@ -1789,16 +1790,14 @@ impl Model {
             }
 
             // key_w backward
-            scratch.grad_x4.zero();
-            for row in 0..i {
-                let g = scratch.grad_ffn2[row];
-                if g == 0.0 {
-                    continue;
-                }
-                let off = row * c;
-                for col in 0..c {
-                    scratch.grad_x4[col] += block.ffn.key_w[off + col] * g;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.ffn.key_w.as_ptr(),
+                    scratch.grad_ffn2.as_ptr(),
+                    scratch.grad_x4.as_mut_ptr(),
+                    i,
+                    c,
+                );
             }
             if scope.ffn {
                 match optimizer {
@@ -1913,16 +1912,14 @@ impl Model {
             scratch.grad_x3.copy_from_slice(scratch.grad_x2.as_slice()); // d att_out
 
             // out_proj backward
-            scratch.grad_x4.zero(); // d y_gate
-            for row in 0..c {
-                let g = scratch.grad_x3[row];
-                if g == 0.0 {
-                    continue;
-                }
-                let off = row * c;
-                for col in 0..c {
-                    scratch.grad_x4[col] += block.attn.o_proj[off + col] * g;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.o_proj.as_ptr(),
+                    scratch.grad_x3.as_ptr(),
+                    scratch.grad_x4.as_mut_ptr(),
+                    c,
+                    c,
+                );
             }
             if scope.attn {
                 match optimizer {
@@ -2224,16 +2221,14 @@ impl Model {
                         }
                     }
                 }
-                scratch.grad_low_rank.zero();
-                for row in 0..c {
-                    let g = scratch.grad_x3[row];
-                    if g == 0.0 {
-                        continue;
-                    }
-                    let off = row * d_v;
-                    for col in 0..d_v {
-                        scratch.grad_low_rank[col] += v2[off + col] * g;
-                    }
+                unsafe {
+                    kernel::gemv_t_avx(
+                        v2.as_ptr(),
+                        scratch.grad_x3.as_ptr(),
+                        scratch.grad_low_rank.as_mut_ptr(),
+                        c,
+                        d_v,
+                    );
                 }
                 if scope.attn {
                     match optimizer {
@@ -2341,20 +2336,29 @@ impl Model {
                     }
                 }
             }
-            scratch.grad_param.zero(); // d xr
-            scratch.grad_param2.zero(); // d xk
-            scratch.grad_x4.zero(); // d xv
             let proj = block.attn.rkv_proj.as_slice();
-            for row in 0..c {
-                let gr = scratch.grad_x2[row];
-                let gk = scratch.grad_x3[row];
-                let gv = scratch.grad_x6[row];
-                let off = row * c;
-                for col in 0..c {
-                    scratch.grad_param[col] += proj[off + col] * gr;
-                    scratch.grad_param2[col] += proj[proj_size + off + col] * gk;
-                    scratch.grad_x4[col] += proj[2 * proj_size + off + col] * gv;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    proj.as_ptr(),
+                    scratch.grad_x2.as_ptr(),
+                    scratch.grad_param.as_mut_ptr(),
+                    c,
+                    c,
+                );
+                kernel::gemv_t_avx(
+                    proj.as_ptr().add(proj_size),
+                    scratch.grad_x3.as_ptr(),
+                    scratch.grad_param2.as_mut_ptr(),
+                    c,
+                    c,
+                );
+                kernel::gemv_t_avx(
+                    proj.as_ptr().add(2 * proj_size),
+                    scratch.grad_x6.as_ptr(),
+                    scratch.grad_x4.as_mut_ptr(),
+                    c,
+                    c,
+                );
             }
 
             // W low-rank backward.
@@ -2410,16 +2414,14 @@ impl Model {
                     }
                 }
             }
-            scratch.grad_low_rank.zero();
-            for row in 0..c {
-                let g = scratch.grad_param[row];
-                if g == 0.0 {
-                    continue;
-                }
-                let off = row * d_w;
-                for col in 0..d_w {
-                    scratch.grad_low_rank[col] += block.attn.w2[off + col] * g;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.w2.as_ptr(),
+                    scratch.grad_param.as_ptr(),
+                    scratch.grad_low_rank.as_mut_ptr(),
+                    c,
+                    d_w,
+                );
             }
             for col in 0..d_w {
                 let t = tr.w_hidden[col];
@@ -2452,16 +2454,14 @@ impl Model {
                     }
                 }
             }
-            scratch.grad_x6.zero(); // d xw
-            for row in 0..d_w {
-                let g = scratch.grad_low_rank[row];
-                if g == 0.0 {
-                    continue;
-                }
-                let off = row * c;
-                for col in 0..c {
-                    scratch.grad_x6[col] += block.attn.w1[off + col] * g;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.w1.as_ptr(),
+                    scratch.grad_low_rank.as_ptr(),
+                    scratch.grad_x6.as_mut_ptr(),
+                    d_w,
+                    c,
+                );
             }
 
             // A low-rank backward.
@@ -2515,16 +2515,14 @@ impl Model {
                     }
                 }
             }
-            scratch.grad_low_rank.zero();
-            for row in 0..c {
-                let g = scratch.grad_x5[row];
-                if g == 0.0 {
-                    continue;
-                }
-                let off = row * d_a;
-                for col in 0..d_a {
-                    scratch.grad_low_rank[col] += block.attn.a2[off + col] * g;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.a2.as_ptr(),
+                    scratch.grad_x5.as_ptr(),
+                    scratch.grad_low_rank.as_mut_ptr(),
+                    c,
+                    d_a,
+                );
             }
             if scope.attn {
                 match optimizer {
@@ -2553,16 +2551,14 @@ impl Model {
                     }
                 }
             }
-            scratch.grad_x5.zero(); // d xa
-            for row in 0..d_a {
-                let g = scratch.grad_low_rank[row];
-                if g == 0.0 {
-                    continue;
-                }
-                let off = row * c;
-                for col in 0..c {
-                    scratch.grad_x5[col] += block.attn.a1[off + col] * g;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.a1.as_ptr(),
+                    scratch.grad_low_rank.as_ptr(),
+                    scratch.grad_x5.as_mut_ptr(),
+                    d_a,
+                    c,
+                );
             }
 
             // G low-rank backward.
@@ -2593,16 +2589,14 @@ impl Model {
                     }
                 }
             }
-            scratch.grad_low_rank.zero();
-            for row in 0..c {
-                let g = scratch.grad_saved[row];
-                if g == 0.0 {
-                    continue;
-                }
-                let off = row * d_g;
-                for col in 0..d_g {
-                    scratch.grad_low_rank[col] += block.attn.g2[off + col] * g;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.g2.as_ptr(),
+                    scratch.grad_saved.as_ptr(),
+                    scratch.grad_low_rank.as_mut_ptr(),
+                    c,
+                    d_g,
+                );
             }
             for col in 0..d_g {
                 let sig = tr.g_hidden[col];
@@ -2635,16 +2629,14 @@ impl Model {
                     }
                 }
             }
-            scratch.grad_saved.zero(); // d xg
-            for row in 0..d_g {
-                let g = scratch.grad_low_rank2[row];
-                if g == 0.0 {
-                    continue;
-                }
-                let off = row * c;
-                for col in 0..c {
-                    scratch.grad_saved[col] += block.attn.g1[off + col] * g;
-                }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.g1.as_ptr(),
+                    scratch.grad_low_rank2.as_ptr(),
+                    scratch.grad_saved.as_mut_ptr(),
+                    d_g,
+                    c,
+                );
             }
 
             // Token-shift backward for attention branches.
@@ -3044,14 +3036,18 @@ impl Model {
                         .copy_from(&scratch.x_normed);
                 }
 
-                let attn_start = Instant::now();
                 let trace_ptr = if scratch.capture_train_trace {
                     Some(&mut scratch.train_trace_layers[layer_idx] as *mut LayerTrainTrace)
                 } else {
                     None
                 };
-                self.attention_forward_impl(scratch, layer_idx, state, trace_ptr);
-                profiler.record_attention(layer_idx, attn_start.elapsed());
+                if S::ENABLED {
+                    let attn_start = Instant::now();
+                    self.attention_forward_impl(scratch, layer_idx, state, trace_ptr);
+                    profiler.record_attention(layer_idx, attn_start.elapsed());
+                } else {
+                    self.attention_forward_impl(scratch, layer_idx, state, trace_ptr);
+                }
 
                 // Add attention residual: x = x + att_out
                 kernel::add_avx(
@@ -3081,9 +3077,23 @@ impl Model {
                         .copy_from(&scratch.x_normed);
                 }
 
-                let ffn_start = Instant::now();
-                self.ffn_forward_impl(scratch, layer_idx, &mut state.layers[layer_idx], trace_ptr);
-                profiler.record_ffn(layer_idx, ffn_start.elapsed());
+                if S::ENABLED {
+                    let ffn_start = Instant::now();
+                    self.ffn_forward_impl(
+                        scratch,
+                        layer_idx,
+                        &mut state.layers[layer_idx],
+                        trace_ptr,
+                    );
+                    profiler.record_ffn(layer_idx, ffn_start.elapsed());
+                } else {
+                    self.ffn_forward_impl(
+                        scratch,
+                        layer_idx,
+                        &mut state.layers[layer_idx],
+                        trace_ptr,
+                    );
+                }
 
                 // Add FFN residual: x = x + ffn_out
                 kernel::add_avx(
@@ -3778,6 +3788,79 @@ fn sgd_outer_update(
 }
 
 #[inline(always)]
+fn fused_sgd_head_backward_update(
+    param: &mut [f32],
+    rows: usize,
+    cols: usize,
+    left: &[f32],
+    right: &[f32],
+    grad_input: &mut [f32],
+    lr: f32,
+    clip: f32,
+) {
+    let rows = rows.min(left.len());
+    let cols = cols.min(right.len()).min(grad_input.len());
+    let n = param.len();
+    if rows == 0 || cols == 0 || n == 0 {
+        return;
+    }
+    let do_clip = clip > 0.0;
+    let lr8 = f32x8::splat(lr);
+    for row in 0..rows {
+        let g = left[row];
+        if g == 0.0 {
+            continue;
+        }
+        let off = row * cols;
+        if off >= n {
+            break;
+        }
+        let row_cols = cols.min(n - off);
+        if do_clip {
+            for col in 0..row_cols {
+                let idx = off + col;
+                let w_old = param[idx];
+                grad_input[col] += w_old * g;
+                param[idx] = w_old + lr * (g * right[col]).clamp(-clip, clip);
+            }
+            continue;
+        }
+        let mut col = 0usize;
+        unsafe {
+            let g8 = f32x8::splat(g);
+            while col + 8 <= row_cols {
+                let idx = off + col;
+                let wv = param.as_ptr().add(idx).cast::<f32x8>().read_unaligned();
+                let rv = right.as_ptr().add(col).cast::<f32x8>().read_unaligned();
+                let giv = grad_input
+                    .as_ptr()
+                    .add(col)
+                    .cast::<f32x8>()
+                    .read_unaligned();
+                grad_input
+                    .as_mut_ptr()
+                    .add(col)
+                    .cast::<f32x8>()
+                    .write_unaligned(giv + wv * g8);
+                param
+                    .as_mut_ptr()
+                    .add(idx)
+                    .cast::<f32x8>()
+                    .write_unaligned(wv + (g8 * rv) * lr8);
+                col += 8;
+            }
+        }
+        while col < row_cols {
+            let idx = off + col;
+            let w_old = param[idx];
+            grad_input[col] += w_old * g;
+            param[idx] = w_old + lr * g * right[col];
+            col += 1;
+        }
+    }
+}
+
+#[inline(always)]
 fn apply_adam_vec_update(
     param: &mut [f32],
     grad: &[f32],
@@ -3872,6 +3955,116 @@ fn apply_adam_vec_update_raw(
         let v_hat = vv * inv_bc2;
         param[idx] += step.lr * m_hat / (v_hat.sqrt() + step.eps);
         idx += 1;
+    }
+}
+
+#[inline(always)]
+fn fused_adam_head_backward_update(
+    param: &mut [f32],
+    rows: usize,
+    cols: usize,
+    left: &[f32],
+    right: &[f32],
+    grad_input: &mut [f32],
+    m: &mut [f32],
+    v: &mut [f32],
+    step: &AdamStep,
+) {
+    let rows = rows.min(left.len());
+    let cols = cols.min(right.len()).min(grad_input.len());
+    let n = param.len().min(m.len()).min(v.len());
+    if rows == 0 || cols == 0 || n == 0 {
+        return;
+    }
+    let b1 = step.b1;
+    let b2 = step.b2;
+    let one_b1 = 1.0 - b1;
+    let one_b2 = 1.0 - b2;
+    let inv_bc1 = 1.0 / step.bias_corr1;
+    let inv_bc2 = 1.0 / step.bias_corr2;
+    let do_clip = step.clip > 0.0;
+    let clip = step.clip;
+    let b1v = f32x8::splat(b1);
+    let b2v = f32x8::splat(b2);
+    let one_b1v = f32x8::splat(one_b1);
+    let one_b2v = f32x8::splat(one_b2);
+    let inv_bc1v = f32x8::splat(inv_bc1);
+    let inv_bc2v = f32x8::splat(inv_bc2);
+    let epsv = f32x8::splat(step.eps);
+    let lrv = f32x8::splat(step.lr);
+    for row in 0..rows {
+        let g = left[row];
+        if g == 0.0 {
+            continue;
+        }
+        let off = row * cols;
+        if off >= n {
+            break;
+        }
+        let row_cols = cols.min(n - off);
+        if do_clip {
+            for col in 0..row_cols {
+                let idx = off + col;
+                let w_old = param[idx];
+                grad_input[col] += w_old * g;
+                let gg = (g * right[col]).clamp(-clip, clip);
+                let mm = b1 * m[idx] + one_b1 * gg;
+                let vv = b2 * v[idx] + one_b2 * gg * gg;
+                m[idx] = mm;
+                v[idx] = vv;
+                let m_hat = mm * inv_bc1;
+                let v_hat = vv * inv_bc2;
+                param[idx] = w_old + step.lr * m_hat / (v_hat.sqrt() + step.eps);
+            }
+            continue;
+        }
+        let mut col = 0usize;
+        unsafe {
+            let g8 = f32x8::splat(g);
+            while col + 8 <= row_cols {
+                let idx = off + col;
+                let wv = param.as_ptr().add(idx).cast::<f32x8>().read_unaligned();
+                let rv = right.as_ptr().add(col).cast::<f32x8>().read_unaligned();
+                let giv = grad_input
+                    .as_ptr()
+                    .add(col)
+                    .cast::<f32x8>()
+                    .read_unaligned();
+                grad_input
+                    .as_mut_ptr()
+                    .add(col)
+                    .cast::<f32x8>()
+                    .write_unaligned(giv + wv * g8);
+                let gv = g8 * rv;
+                let mv = m.as_ptr().add(idx).cast::<f32x8>().read_unaligned();
+                let vv = v.as_ptr().add(idx).cast::<f32x8>().read_unaligned();
+                let mm = mv * b1v + gv * one_b1v;
+                let vv2 = vv * b2v + (gv * gv) * one_b2v;
+                m.as_mut_ptr().add(idx).cast::<f32x8>().write_unaligned(mm);
+                v.as_mut_ptr().add(idx).cast::<f32x8>().write_unaligned(vv2);
+                let upd = ((mm * inv_bc1v) / ((vv2 * inv_bc2v).sqrt() + epsv)) * lrv;
+                param
+                    .as_mut_ptr()
+                    .add(idx)
+                    .cast::<f32x8>()
+                    .write_unaligned(wv + upd);
+                col += 8;
+            }
+        }
+        while col < row_cols {
+            let idx = off + col;
+            let w_old = param[idx];
+            grad_input[col] += w_old * g;
+            let gg = g * right[col];
+            let mm = b1 * m[idx] + one_b1 * gg;
+            let vv = b2 * v[idx] + one_b2 * gg * gg;
+            m[idx] = mm;
+            v[idx] = vv;
+            let m_hat = mm * inv_bc1;
+            let v_hat = vv * inv_bc2;
+            param[idx] = w_old + step.lr * m_hat / (v_hat.sqrt() + step.eps);
+            col += 1;
+        }
     }
 }
 
