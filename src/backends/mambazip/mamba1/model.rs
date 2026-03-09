@@ -1072,21 +1072,18 @@ impl Model {
             let a_ptr = a.as_ptr();
             let ssm_ptr = ssm.as_mut_ptr();
 
-            for ch in 0..i {
-                let x_ch = conv[ch];
-                let dt_pre = dt_raw[ch] + dt_bias[ch];
-                let gate_pre = xz[i + ch];
-                let dt = softplus(dt_pre);
-                let (gate, gate_sigmoid) = silu_with_sigmoid(gate_pre);
-                let x_dt = x_ch * dt;
+            if s == 16 {
+                for ch in 0..i {
+                    let x_ch = conv[ch];
+                    let dt_pre = dt_raw[ch] + dt_bias[ch];
+                    let gate_pre = xz[i + ch];
+                    let dt = softplus(dt_pre);
+                    let (gate, gate_sigmoid) = silu_with_sigmoid(gate_pre);
+                    let x_dt = x_ch * dt;
 
-                let mut y = d[ch] * x_ch;
-                let ssm_row_off = ch * s;
-                // SAFETY: offsets are in-bounds due to validated tensor shapes and loop ranges.
-                let row_a = unsafe { a_ptr.add(ssm_row_off) };
-                // SAFETY: offsets are in-bounds due to validated tensor shapes and loop ranges.
-                let row_ssm = unsafe { ssm_ptr.add(ssm_row_off) };
-                if s == 16 {
+                    let ssm_row_off = ch * s;
+                    let row_a = unsafe { a_ptr.add(ssm_row_off) };
+                    let row_ssm = unsafe { ssm_ptr.add(ssm_row_off) };
                     let trace_ptr = if CAPTURE {
                         unsafe {
                             scratch.train_trace_layers[layer_idx]
@@ -1097,40 +1094,60 @@ impl Model {
                     } else {
                         std::ptr::null_mut()
                     };
+                    let mut y = d[ch] * x_ch;
                     y += unsafe {
                         selective_scan_state16::<CAPTURE>(
                             row_a, row_ssm, dt, x_dt, b_ptr, c_ptr, trace_ptr,
                         )
                     };
-                } else {
+                    if CAPTURE {
+                        let tr = &mut scratch.train_trace_layers[layer_idx];
+                        tr.dt[ch] = dt;
+                        tr.gate[ch] = gate;
+                        tr.gate_sigmoid[ch] = gate_sigmoid;
+                        tr.y_pre[ch] = y;
+                    }
+                    scratch.y[ch] = y * gate;
+                    if CAPTURE {
+                        scratch.train_trace_layers[layer_idx].y[ch] = scratch.y[ch];
+                    }
+                }
+            } else {
+                for ch in 0..i {
+                    let x_ch = conv[ch];
+                    let dt_pre = dt_raw[ch] + dt_bias[ch];
+                    let gate_pre = xz[i + ch];
+                    let dt = softplus(dt_pre);
+                    let (gate, gate_sigmoid) = silu_with_sigmoid(gate_pre);
+                    let x_dt = x_ch * dt;
+
+                    let mut y = d[ch] * x_ch;
+                    let ssm_row_off = ch * s;
+                    let row_a = unsafe { a_ptr.add(ssm_row_off) };
+                    let row_ssm = unsafe { ssm_ptr.add(ssm_row_off) };
                     let mut j = 0usize;
                     while j < s {
-                        // SAFETY: j in [0, s), row pointers are valid for s elements.
                         let prev = unsafe { *row_ssm.add(j) };
-                        // SAFETY: j in [0, s), row pointers are valid for s elements.
                         let d_a = (dt * unsafe { *row_a.add(j) }).exp();
                         if CAPTURE {
                             scratch.train_trace_layers[layer_idx].d_a[ssm_row_off + j] = d_a;
                         }
-                        // SAFETY: b/c vectors have length s by construction.
                         let next = prev * d_a + x_dt * unsafe { *b_ptr.add(j) };
-                        // SAFETY: row pointer valid and unique for write.
                         unsafe { *row_ssm.add(j) = next };
-                        // SAFETY: c vector has length s by construction.
                         y += next * unsafe { *c_ptr.add(j) };
                         j += 1;
                     }
-                }
-                if CAPTURE {
-                    let tr = &mut scratch.train_trace_layers[layer_idx];
-                    tr.dt[ch] = dt;
-                    tr.gate[ch] = gate;
-                    tr.gate_sigmoid[ch] = gate_sigmoid;
-                    tr.y_pre[ch] = y;
-                }
-                scratch.y[ch] = y * gate;
-                if CAPTURE {
-                    scratch.train_trace_layers[layer_idx].y[ch] = scratch.y[ch];
+                    if CAPTURE {
+                        let tr = &mut scratch.train_trace_layers[layer_idx];
+                        tr.dt[ch] = dt;
+                        tr.gate[ch] = gate;
+                        tr.gate_sigmoid[ch] = gate_sigmoid;
+                        tr.y_pre[ch] = y;
+                    }
+                    scratch.y[ch] = y * gate;
+                    if CAPTURE {
+                        scratch.train_trace_layers[layer_idx].y[ch] = scratch.y[ch];
+                    }
                 }
             }
 
@@ -1562,17 +1579,8 @@ impl Model {
                 .as_mut_slice()
                 .copy_from_slice(scratch.grad_out.as_slice());
             scratch.grad_xz.zero();
-            scratch.grad_conv.zero();
-            scratch.grad_proj.zero();
-            scratch.grad_dt_raw.zero();
-            scratch.grad_u.zero();
             scratch.grad_b.zero();
             scratch.grad_c.zero();
-            scratch.grad_ssm_d.zero();
-            scratch.grad_ssm_a.zero();
-            scratch.grad_ssm_a_log.zero();
-            scratch.grad_conv_w.zero();
-            scratch.grad_conv_b.zero();
 
             // y path, selective scan, and SSM params.
             for ch in 0..i {
@@ -1786,7 +1794,6 @@ impl Model {
             }
 
             // conv + silu + in-proj(x branch)
-            scratch.grad_conv_pre.zero();
             for ch in 0..i {
                 scratch.grad_conv_pre[ch] = scratch.grad_conv[ch]
                     * silu_grad_from_sigmoid(tr.conv_pre[ch], tr.conv_sigmoid[ch]);

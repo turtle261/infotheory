@@ -29,7 +29,8 @@ find_llvm_profdata() {
 }
 
 mode="${1:-all}"
-features="${INFOTHEORY_FEATURES:-cli}"
+cargo_features="${INFOTHEORY_CARGO_FEATURES:-${INFOTHEORY_FEATURES:-cli backend-rosa backend-rwkv backend-mamba}}"
+cargo_no_default_features="${INFOTHEORY_CARGO_NO_DEFAULT_FEATURES:-1}"
 preset="${WORKLOAD_PRESET:-two-json}"
 profile_root="${PGO_PROFILE_DIR:-${repo_root}/target/pgo/${preset}}"
 raw_dir="${profile_root}/raw"
@@ -38,12 +39,24 @@ record_target_dir="${profile_root}/target-instr"
 use_target_dir="${profile_root}/target-use"
 record_bin="${record_target_dir}/release/infotheory"
 
+cargo_build() {
+  local target_dir="$1"
+  shift
+  local build_args=(build --release --quiet)
+  if [[ "${cargo_no_default_features}" == "1" ]]; then
+    build_args+=(--no-default-features)
+  fi
+  if [[ -n "${cargo_features}" ]]; then
+    build_args+=(--features "${cargo_features}")
+  fi
+  CARGO_TARGET_DIR="${target_dir}" cargo "${build_args[@]}" "$@"
+}
+
 record_profiles() {
   mkdir -p "${raw_dir}"
   echo "Building instrumented binary"
   RUSTFLAGS="${RUSTFLAGS:-} -Cprofile-generate=${raw_dir}" \
-    CARGO_TARGET_DIR="${record_target_dir}" \
-    cargo build --release --features "${features}" --quiet
+    cargo_build "${record_target_dir}"
 
   local run_dir="${profile_root}/runs"
   mkdir -p "${run_dir}"
@@ -77,8 +90,7 @@ build_with_profiles() {
   fi
   echo "Building profile-use binary"
   RUSTFLAGS="${RUSTFLAGS:-} -Cprofile-use=${merged_profdata} -Cllvm-args=-pgo-warn-missing-function" \
-    CARGO_TARGET_DIR="${use_target_dir}" \
-    cargo build --release --features "${features}" --quiet
+    cargo_build "${use_target_dir}"
   echo "PGO binary: ${use_target_dir}/release/infotheory"
 }
 

@@ -246,6 +246,13 @@ fn load_particle_spec(path: &str) -> anyhow::Result<ParticleSpec> {
     Ok(spec)
 }
 
+fn load_calibrated_spec(path: &str) -> anyhow::Result<CalibratedSpec> {
+    let raw = std::fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)?;
+    let base_dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    parse_calibrated_spec_value(&value, base_dir, 4)
+}
+
 fn parse_particle_spec_value(v: &serde_json::Value) -> anyhow::Result<ParticleSpec> {
     if v.get("experts").is_some() {
         return Err(anyhow::anyhow!(
@@ -322,6 +329,46 @@ fn parse_particle_spec_value(v: &serde_json::Value) -> anyhow::Result<ParticleSp
             .unwrap_or(d.diagnostics_interval as u64) as usize,
         min_prob: v["min_prob"].as_f64().unwrap_or(d.min_prob),
         seed: v["seed"].as_u64().unwrap_or(d.seed),
+    })
+}
+
+fn parse_calibration_context_kind(value: Option<&str>) -> anyhow::Result<CalibrationContextKind> {
+    match value.unwrap_or("text").trim().to_ascii_lowercase().as_str() {
+        "global" => Ok(CalibrationContextKind::Global),
+        "byteclass" | "byte-class" | "byte_class" => Ok(CalibrationContextKind::ByteClass),
+        "text" => Ok(CalibrationContextKind::Text),
+        "repeat" => Ok(CalibrationContextKind::Repeat),
+        "textrepeat" | "text-repeat" | "text_repeat" => Ok(CalibrationContextKind::TextRepeat),
+        other => Err(anyhow::anyhow!("unknown calibration context '{other}'")),
+    }
+}
+
+fn parse_calibrated_spec_value(
+    v: &serde_json::Value,
+    base_dir: &Path,
+    depth: usize,
+) -> anyhow::Result<CalibratedSpec> {
+    if depth == 0 {
+        return Err(anyhow::anyhow!("calibrated spec nesting too deep"));
+    }
+    let base_backend = if let Some(base_v) = v.get("base") {
+        parse_mixture_expert_value(base_v, base_dir, depth - 1)?.backend
+    } else if let Some(path) = v["base_path"].as_str().or_else(|| v["path"].as_str()) {
+        let full = base_dir.join(path);
+        let raw = std::fs::read(&full)?;
+        let value: serde_json::Value = serde_json::from_slice(&raw)?;
+        parse_mixture_expert_value(&value, full.parent().unwrap_or(base_dir), depth - 1)?.backend
+    } else {
+        return Err(anyhow::anyhow!(
+            "calibrated expert requires 'base' or 'base_path'"
+        ));
+    };
+    Ok(CalibratedSpec {
+        base: base_backend,
+        context: parse_calibration_context_kind(v["context"].as_str())?,
+        bins: v["bins"].as_u64().unwrap_or(33) as usize,
+        learning_rate: v["learning_rate"].as_f64().unwrap_or(0.02),
+        bias_clip: v["bias_clip"].as_f64().unwrap_or(4.0),
     })
 }
 
@@ -417,6 +464,52 @@ fn parse_mixture_expert_value(
                 log_prior,
                 max_order,
                 backend: RateBackend::RosaPlus,
+            })
+        }
+        "match" => Ok(MixtureExpertSpec {
+            name,
+            log_prior,
+            max_order: -1,
+            backend: RateBackend::Match {
+                hash_bits: v["hash_bits"].as_u64().unwrap_or(20) as usize,
+                min_len: v["min_len"].as_u64().unwrap_or(4) as usize,
+                max_len: v["max_len"].as_u64().unwrap_or(255) as usize,
+                base_mix: v["base_mix"].as_f64().unwrap_or(0.02),
+                confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
+            },
+        }),
+        "sparse-match" => Ok(MixtureExpertSpec {
+            name,
+            log_prior,
+            max_order: -1,
+            backend: RateBackend::SparseMatch {
+                hash_bits: v["hash_bits"].as_u64().unwrap_or(19) as usize,
+                min_len: v["min_len"].as_u64().unwrap_or(3) as usize,
+                max_len: v["max_len"].as_u64().unwrap_or(64) as usize,
+                gap_min: v["gap_min"].as_u64().unwrap_or(1) as usize,
+                gap_max: v["gap_max"].as_u64().unwrap_or(2) as usize,
+                base_mix: v["base_mix"].as_f64().unwrap_or(0.05),
+                confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
+            },
+        }),
+        "ppmd" => Ok(MixtureExpertSpec {
+            name,
+            log_prior,
+            max_order: -1,
+            backend: RateBackend::Ppmd {
+                order: v["order"].as_u64().unwrap_or(10) as usize,
+                memory_mb: v["memory_mb"].as_u64().unwrap_or(64) as usize,
+            },
+        }),
+        "calibrated" => {
+            let spec = parse_calibrated_spec_value(v, base_dir, depth - 1)?;
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order: -1,
+                backend: RateBackend::Calibrated {
+                    spec: Arc::new(spec),
+                },
             })
         }
         "ctw" => {
@@ -1396,6 +1489,26 @@ fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>
                 std::process::exit(1);
             }
         }
+        "match" => RateBackend::Match {
+            hash_bits: 20,
+            min_len: 4,
+            max_len: 255,
+            base_mix: 0.02,
+            confidence_scale: 1.0,
+        },
+        "sparse-match" => RateBackend::SparseMatch {
+            hash_bits: 19,
+            min_len: 3,
+            max_len: 64,
+            gap_min: 1,
+            gap_max: 2,
+            base_mix: 0.05,
+            confidence_scale: 1.0,
+        },
+        "ppmd" => RateBackend::Ppmd {
+            order: method.and_then(|m| m.parse::<usize>().ok()).unwrap_or(10),
+            memory_mb: 64,
+        },
         "ctw" => {
             let depth = if let Some(m) = method {
                 m.parse::<usize>().unwrap_or(20)
@@ -1447,6 +1560,19 @@ fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>
                 std::process::exit(1);
             });
             RateBackend::Particle {
+                spec: Arc::new(spec),
+            }
+        }
+        "calibrated" => {
+            let path = method.unwrap_or_else(|| {
+                eprintln!("Error: --rate-backend calibrated requires --method <spec.json>");
+                std::process::exit(1);
+            });
+            let spec = load_calibrated_spec(path).unwrap_or_else(|e| {
+                eprintln!("Error: failed to load calibrated spec '{path}': {e}");
+                std::process::exit(1);
+            });
+            RateBackend::Calibrated {
                 spec: Arc::new(spec),
             }
         }
@@ -2785,6 +2911,9 @@ mod tests {
     fn parse_backend_aliases_and_unknowns() {
         assert_eq!(parse_rate_backend("rosa"), Some("rosaplus"));
         assert_eq!(parse_rate_backend("facctw"), Some("fac-ctw"));
+        assert_eq!(parse_rate_backend("sparsematch"), Some("sparse-match"));
+        assert_eq!(parse_rate_backend("ppm"), Some("ppmd"));
+        assert_eq!(parse_rate_backend("cal"), Some("calibrated"));
         assert_eq!(parse_rate_backend("unknown"), None);
 
         assert_eq!(parse_compression_backend("unknown"), None);
@@ -2799,6 +2928,30 @@ mod tests {
         #[cfg(feature = "backend-mamba")]
         {
             assert_eq!(parse_rate_backend("mamba1"), Some("mamba"));
+        }
+    }
+
+    #[test]
+    fn parse_mixture_expert_supports_calibrated_and_match_backends() {
+        let base_dir = Path::new(".");
+        let expert = json!({
+            "name": "cal-ctw",
+            "kind": "calibrated",
+            "context": "text",
+            "bins": 33,
+            "learning_rate": 0.02,
+            "bias_clip": 4.0,
+            "base": {
+                "kind": "match"
+            }
+        });
+        let parsed = parse_mixture_expert_value(&expert, base_dir, 4).expect("expert should parse");
+        match parsed.backend {
+            RateBackend::Calibrated { spec } => match spec.base {
+                RateBackend::Match { .. } => {}
+                _ => panic!("unexpected calibrated base"),
+            },
+            _ => panic!("expected calibrated backend"),
         }
     }
 

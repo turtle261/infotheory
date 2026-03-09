@@ -477,6 +477,43 @@ pub unsafe fn exp_neg_scaled_inplace(x: *mut f32, scale: f32, len: usize) {
     }
 }
 
+/// Combined transform: `y = exp(-sigmoid(x) * scale)`.
+///
+/// When `sigmoid_out` is non-null, the intermediate sigmoid is written there.
+#[inline(always)]
+pub unsafe fn sigmoid_exp_neg_scaled_avx(
+    x: *const f32,
+    y: *mut f32,
+    sigmoid_out: *mut f32,
+    scale: f32,
+    len: usize,
+) {
+    let ones = f32x8::ONE;
+    let neg_scale = f32x8::splat(-scale);
+    let capture_sigmoid = !sigmoid_out.is_null();
+    let mut i = 0usize;
+
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        let sig = ones / (ones + (-xv).exp());
+        if capture_sigmoid {
+            store8(sigmoid_out.add(i), sig);
+        }
+        store8(y.add(i), (sig * neg_scale).exp());
+        i += LANES;
+    }
+
+    while i < len {
+        let xv = *x.add(i);
+        let sig = 1.0 / (1.0 + (-xv).exp());
+        if capture_sigmoid {
+            *sigmoid_out.add(i) = sig;
+        }
+        *y.add(i) = (-sig * scale).exp();
+        i += 1;
+    }
+}
+
 /// ReLU squared: y = max(0, x)^2.
 #[inline(always)]
 pub unsafe fn relu_squared_avx(x: *const f32, y: *mut f32, len: usize) {
@@ -994,9 +1031,11 @@ mod tests {
         let mut add = vec![0.0; len];
         let mut fma = vec![0.0; len];
         let mut sig = vec![0.0; len];
+        let mut sig_capture = vec![0.0; len];
         let mut tanh = vec![0.0; len];
         let mut relu2 = vec![0.0; len];
         let mut exp = vec![0.0; len];
+        let mut exp_sig = vec![0.0; len];
         let mut soft = vec![0.0; len];
 
         unsafe {
@@ -1007,6 +1046,13 @@ mod tests {
             tanh_avx(a.as_ptr(), tanh.as_mut_ptr(), len);
             relu_squared_avx(a.as_ptr(), relu2.as_mut_ptr(), len);
             exp_scalar(a.as_ptr(), exp.as_mut_ptr(), len);
+            sigmoid_exp_neg_scaled_avx(
+                a.as_ptr(),
+                exp_sig.as_mut_ptr(),
+                sig_capture.as_mut_ptr(),
+                0.75,
+                len,
+            );
         }
         let lse = unsafe { softmax_avx(a.as_ptr(), soft.as_mut_ptr(), len) };
 
@@ -1017,6 +1063,7 @@ mod tests {
         let mut tanh_ref = vec![0.0; len];
         let mut relu2_ref = vec![0.0; len];
         let mut exp_ref = vec![0.0; len];
+        let mut exp_sig_ref = vec![0.0; len];
 
         let mut max_val = f32::NEG_INFINITY;
         for &v in &a {
@@ -1034,6 +1081,7 @@ mod tests {
             let relu = a[i].max(0.0);
             relu2_ref[i] = relu * relu;
             exp_ref[i] = a[i].exp();
+            exp_sig_ref[i] = (-sig_ref[i] * 0.75).exp();
 
             let e = (a[i] - max_val).exp();
             soft_ref[i] = e;
@@ -1047,9 +1095,11 @@ mod tests {
         assert_close_slice(&add, &add_ref, 2.5e-5);
         assert_close_slice(&fma, &fma_ref, 2.5e-5);
         assert_close_slice(&sig, &sig_ref, 2.5e-5);
+        assert_close_slice(&sig_capture, &sig_ref, 2.5e-5);
         assert_close_slice(&tanh, &tanh_ref, 2.5e-5);
         assert_close_slice(&relu2, &relu2_ref, 2.5e-5);
         assert_close_slice(&exp, &exp_ref, 2.5e-5);
+        assert_close_slice(&exp_sig, &exp_sig_ref, 2.5e-5);
         assert_close_slice(&soft, &soft_ref, 2.5e-5);
         assert!((lse - (sum_exp.ln() + max_val)).abs() <= 2.5e-5);
     }

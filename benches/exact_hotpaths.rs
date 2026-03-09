@@ -95,36 +95,35 @@ fn mamba_cfg() -> mamba1::Config {
 fn two_json_backend() -> RateBackend {
     let spec = MixtureSpec {
         kind: MixtureKind::Neural,
-        alpha: 0.04,
+        alpha: 0.03,
         decay: None,
         experts: vec![
-            MixtureExpertSpec {
-                name: Some("rwkv".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Rwkv7Method {
-                    method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=16,a_rank=16,v_rank=16,g_rank=16,seed=22,train=adam,lr=0.0009,stride=1;policy:schedule=0..20%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=1,clip=1.0,momentum=0.9)".to_string(),
-                },
-            },
-            MixtureExpertSpec {
-                name: Some("mamba".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::MambaMethod {
-                    method: "cfg:hidden=64,layers=1,intermediate=128,seed=26,train=adam,lr=0.001,stride=1;policy:schedule=0..25%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)".to_string(),
-                },
-            },
-            MixtureExpertSpec {
-                name: Some("rosa".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::RosaPlus,
-            },
             MixtureExpertSpec {
                 name: Some("ctw".to_string()),
                 log_prior: 0.0,
                 max_order: -1,
-                backend: RateBackend::Ctw { depth: 32 },
+                backend: RateBackend::Ctw { depth: 24 },
+            },
+            MixtureExpertSpec {
+                name: Some("ppmd".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Ppmd {
+                    order: 10,
+                    memory_mb: 64,
+                },
+            },
+            MixtureExpertSpec {
+                name: Some("match".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Match {
+                    hash_bits: 20,
+                    min_len: 4,
+                    max_len: 255,
+                    base_mix: 0.02,
+                    confidence_scale: 1.0,
+                },
             },
         ],
     };

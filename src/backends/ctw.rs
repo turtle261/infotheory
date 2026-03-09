@@ -226,15 +226,6 @@ fn predict_ratio_kt(node: &CtNode, sym_idx: usize) -> f64 {
 }
 
 #[inline(always)]
-fn logsumexp2(a: f64, b: f64) -> f64 {
-    if a >= b {
-        a + (b - a).exp().ln_1p()
-    } else {
-        b + (a - b).exp().ln_1p()
-    }
-}
-
-#[inline(always)]
 fn predict_ratio_internal(
     node: &CtNode,
     path_child_log_prob: f64,
@@ -242,11 +233,15 @@ fn predict_ratio_internal(
     child_ratio: f64,
     sym_idx: usize,
 ) -> f64 {
-    let log_new = logsumexp2(
-        node.log_prob_kt + predict_ratio_kt(node, sym_idx).ln(),
-        path_child_log_prob + sibling_log_prob + child_ratio.ln(),
-    ) - std::f64::consts::LN_2;
-    (log_new - node.log_prob_weighted).exp()
+    let kt_ratio = predict_ratio_kt(node, sym_idx);
+    let delta = path_child_log_prob + sibling_log_prob - node.log_prob_kt;
+    if delta >= 0.0 {
+        let inv_rho = (-delta).exp();
+        (kt_ratio * inv_rho + child_ratio) / (1.0 + inv_rho)
+    } else {
+        let rho = delta.exp();
+        (kt_ratio + rho * child_ratio) / (1.0 + rho)
+    }
 }
 
 /// A Context Tree for binary sequence prediction using arena allocation.

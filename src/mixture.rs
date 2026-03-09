@@ -9,6 +9,11 @@
 //! The mixture primitives here power `RateBackend::Mixture`, enabling Bayes, fading Bayes,
 //! switching, and MDL-style selectors to be used anywhere a rate backend is accepted.
 
+use crate::backends::calibration::CalibratorCore;
+use crate::backends::match_model::MatchModel;
+use crate::backends::ppmd::PpmdModel;
+use crate::backends::sparse_match::SparseMatchModel;
+use crate::backends::text_context::TextContextAnalyzer;
 use crate::ctw::FacContextTree;
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip;
@@ -17,7 +22,7 @@ use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
 use crate::zpaq_rate::ZpaqRateModel;
-use crate::{MixtureKind, MixtureSpec, RateBackend};
+use crate::{CalibratedSpec, MixtureKind, MixtureSpec, RateBackend};
 use std::sync::Arc;
 
 /// Default minimum probability floor to avoid log(0).
@@ -35,6 +40,11 @@ fn clamp_prob(p: f64, min_prob: f64) -> f64 {
 #[inline]
 fn clamp_unit_prob(p: f64, min_prob: f64) -> f64 {
     clamp_prob(p, min_prob).min(1.0 - min_prob)
+}
+
+#[inline]
+fn build_calibrator(spec: &CalibratedSpec) -> CalibratorCore {
+    CalibratorCore::new(spec.context, spec.bins, spec.learning_rate, spec.bias_clip)
 }
 
 #[inline]
@@ -184,6 +194,15 @@ pub enum RateBackendPredictor {
         /// Probability floor for numeric stability.
         min_prob: f64,
     },
+    /// Local contiguous match predictor.
+    Match { model: MatchModel, min_prob: f64 },
+    /// Sparse/gapped local match predictor.
+    SparseMatch {
+        model: SparseMatchModel,
+        min_prob: f64,
+    },
+    /// Bounded-memory PPMD-style predictor.
+    Ppmd { model: PpmdModel, min_prob: f64 },
     /// Byte-wise CTW implemented as 8 factorized bit trees (MSB-first).
     Ctw {
         /// FAC-CTW tree stack (8 bits per byte).
@@ -239,6 +258,14 @@ pub enum RateBackendPredictor {
         /// Particle runtime.
         runtime: crate::particle::ParticleRuntime,
     },
+    /// Calibrated wrapper around another predictor.
+    Calibrated {
+        base: Box<RateBackendPredictor>,
+        core: CalibratorCore,
+        pdf: [f64; 256],
+        valid: bool,
+        min_prob: f64,
+    },
 }
 
 impl RateBackendPredictor {
@@ -250,6 +277,46 @@ impl RateBackendPredictor {
                 model.build_lm_full_bytes_no_finalize_endpos();
                 Self::Rosa { model, min_prob }
             }
+            RateBackend::Match {
+                hash_bits,
+                min_len,
+                max_len,
+                base_mix,
+                confidence_scale,
+            } => Self::Match {
+                model: MatchModel::new_contiguous(
+                    hash_bits,
+                    min_len,
+                    max_len,
+                    base_mix,
+                    confidence_scale,
+                ),
+                min_prob,
+            },
+            RateBackend::SparseMatch {
+                hash_bits,
+                min_len,
+                max_len,
+                gap_min,
+                gap_max,
+                base_mix,
+                confidence_scale,
+            } => Self::SparseMatch {
+                model: SparseMatchModel::new(
+                    hash_bits,
+                    min_len,
+                    max_len,
+                    gap_min,
+                    gap_max,
+                    base_mix,
+                    confidence_scale,
+                ),
+                min_prob,
+            },
+            RateBackend::Ppmd { order, memory_mb } => Self::Ppmd {
+                model: PpmdModel::new(order, memory_mb),
+                min_prob,
+            },
             RateBackend::Ctw { depth } => {
                 let tree = FacContextTree::new(depth, 8);
                 Self::Ctw { tree, min_prob }
@@ -363,6 +430,13 @@ impl RateBackendPredictor {
                 let runtime = crate::particle::ParticleRuntime::new(spec.as_ref());
                 Self::Particle { runtime }
             }
+            RateBackend::Calibrated { spec } => Self::Calibrated {
+                base: Box::new(Self::from_backend(spec.base.clone(), max_order, min_prob)),
+                core: build_calibrator(spec.as_ref()),
+                pdf: [1.0 / 256.0; 256],
+                valid: false,
+                min_prob,
+            },
         }
     }
 
@@ -370,6 +444,11 @@ impl RateBackendPredictor {
     pub fn default_name(backend: &RateBackend, max_order: i64) -> String {
         match backend {
             RateBackend::RosaPlus => format!("rosa(mo={})", max_order),
+            RateBackend::Match { .. } => "match".to_string(),
+            RateBackend::SparseMatch { .. } => "sparse-match".to_string(),
+            RateBackend::Ppmd { order, memory_mb } => {
+                format!("ppmd(o={},m={}MiB)", order, memory_mb)
+            }
             RateBackend::Ctw { depth } => format!("ctw(d={})", depth),
             RateBackend::FacCtw {
                 base_depth,
@@ -398,6 +477,9 @@ impl RateBackendPredictor {
             RateBackend::Particle { spec } => {
                 format!("particle(n={},c={})", spec.num_particles, spec.num_cells)
             }
+            RateBackend::Calibrated { spec } => {
+                format!("calibrated({})", Self::default_name(&spec.base, max_order))
+            }
         }
     }
 }
@@ -405,8 +487,17 @@ impl RateBackendPredictor {
 impl OnlineBytePredictor for RateBackendPredictor {
     fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         match self {
-            RateBackendPredictor::Rosa { .. }
-            | RateBackendPredictor::Ctw { .. }
+            RateBackendPredictor::Rosa { model, .. } => {
+                if let Some(total) = total_symbols {
+                    let reserve = usize::try_from(total).unwrap_or(usize::MAX / 4);
+                    model.reserve_for_stream(reserve);
+                }
+                Ok(())
+            }
+            RateBackendPredictor::Match { .. }
+            | RateBackendPredictor::SparseMatch { .. }
+            | RateBackendPredictor::Ppmd { .. } => Ok(()),
+            RateBackendPredictor::Ctw { .. }
             | RateBackendPredictor::FacCtw { .. }
             | RateBackendPredictor::Zpaq { .. }
             | RateBackendPredictor::Particle { .. } => Ok(()),
@@ -419,6 +510,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 .begin_online_policy_stream(total_symbols)
                 .map_err(|e| e.to_string()),
             RateBackendPredictor::Mixture { runtime } => runtime.begin_stream(total_symbols),
+            RateBackendPredictor::Calibrated { base, .. } => base.begin_stream(total_symbols),
         }
     }
 
@@ -428,6 +520,11 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 let p = clamp_prob(model.prob_for_last(symbol as u32), *min_prob);
                 p.ln()
             }
+            RateBackendPredictor::Match { model, min_prob } => model.log_prob(symbol, *min_prob),
+            RateBackendPredictor::SparseMatch { model, min_prob } => {
+                model.log_prob(symbol, *min_prob)
+            }
+            RateBackendPredictor::Ppmd { model, min_prob } => model.log_prob(symbol, *min_prob),
             RateBackendPredictor::Ctw { tree, min_prob } => {
                 let log_before = tree.get_log_block_probability();
                 for bit_idx in 0..8 {
@@ -515,6 +612,25 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Zpaq { model } => model.log_prob(symbol),
             RateBackendPredictor::Mixture { runtime } => runtime.peek_log_prob(symbol),
             RateBackendPredictor::Particle { runtime } => runtime.peek_log_prob(symbol),
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+                min_prob,
+            } => {
+                if !*valid {
+                    let mut base_logps = [0.0; 256];
+                    base.fill_log_probs(&mut base_logps);
+                    let mut base_pdf = [0.0; 256];
+                    for (dst, &lp) in base_pdf.iter_mut().zip(base_logps.iter()) {
+                        *dst = clamp_prob(lp.exp(), *min_prob);
+                    }
+                    core.apply_pdf(&base_pdf, pdf);
+                    *valid = true;
+                }
+                pdf[symbol as usize].max(*min_prob).ln()
+            }
         }
     }
 
@@ -524,6 +640,27 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 model.fill_probs_for_last_bytes(out);
                 for slot in out.iter_mut() {
                     *slot = clamp_prob(*slot, *min_prob).ln();
+                }
+            }
+            RateBackendPredictor::Match { model, min_prob } => {
+                let mut pdf = [0.0; 256];
+                model.fill_pdf(&mut pdf);
+                for (slot, &p) in out.iter_mut().zip(pdf.iter()) {
+                    *slot = clamp_prob(p, *min_prob).ln();
+                }
+            }
+            RateBackendPredictor::SparseMatch { model, min_prob } => {
+                let mut pdf = [0.0; 256];
+                model.fill_pdf(&mut pdf);
+                for (slot, &p) in out.iter_mut().zip(pdf.iter()) {
+                    *slot = clamp_prob(p, *min_prob).ln();
+                }
+            }
+            RateBackendPredictor::Ppmd { model, min_prob } => {
+                let mut pdf = [0.0; 256];
+                model.fill_pdf(&mut pdf);
+                for (slot, &p) in out.iter_mut().zip(pdf.iter()) {
+                    *slot = clamp_prob(p, *min_prob).ln();
                 }
             }
             RateBackendPredictor::Ctw { tree, min_prob } => {
@@ -603,14 +740,43 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Particle { runtime } => {
                 runtime.fill_log_probs_cached(out);
             }
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+                min_prob,
+            } => {
+                if !*valid {
+                    let mut base_logps = [0.0; 256];
+                    base.fill_log_probs(&mut base_logps);
+                    let mut base_pdf = [0.0; 256];
+                    for (dst, &lp) in base_pdf.iter_mut().zip(base_logps.iter()) {
+                        *dst = clamp_prob(lp.exp(), *min_prob);
+                    }
+                    core.apply_pdf(&base_pdf, pdf);
+                    *valid = true;
+                }
+                for (slot, &p) in out.iter_mut().zip(pdf.iter()) {
+                    *slot = clamp_prob(p, *min_prob).ln();
+                }
+            }
         }
     }
 
     fn update(&mut self, symbol: u8) {
         match self {
             RateBackendPredictor::Rosa { model, .. } => {
-                let mut tx = model.begin_tx();
-                model.train_sequence_tx(&mut tx, &[symbol]);
+                model.train_byte(symbol);
+            }
+            RateBackendPredictor::Match { model, .. } => {
+                model.update(symbol);
+            }
+            RateBackendPredictor::SparseMatch { model, .. } => {
+                model.update(symbol);
+            }
+            RateBackendPredictor::Ppmd { model, .. } => {
+                model.update(symbol);
             }
             RateBackendPredictor::Ctw { tree, .. } => {
                 for bit_idx in 0..8 {
@@ -714,6 +880,26 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             RateBackendPredictor::Particle { runtime } => {
                 runtime.step(symbol);
+            }
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+                ..
+            } => {
+                if !*valid {
+                    let mut base_logps = [0.0; 256];
+                    base.fill_log_probs(&mut base_logps);
+                    let mut base_pdf = [0.0; 256];
+                    for (dst, &lp) in base_pdf.iter_mut().zip(base_logps.iter()) {
+                        *dst = clamp_prob(lp.exp(), DEFAULT_MIN_PROB);
+                    }
+                    core.apply_pdf(&base_pdf, pdf);
+                }
+                core.update(symbol, pdf);
+                base.update(symbol);
+                *valid = false;
             }
         }
     }
@@ -1370,6 +1556,7 @@ pub struct MdlSelector {
 pub struct NeuralMixture {
     experts: Vec<ExpertState>,
     neural: NeuralMixCore,
+    analyzer: TextContextAnalyzer,
     min_prob: f64,
     scratch_expert_logps: Vec<f64>,
     scratch_mix_weights: Vec<f64>,
@@ -1402,12 +1589,16 @@ impl NeuralMixture {
             0.03
         };
         let effective_lr = (base_lr * 25.0).clamp(1e-6, 1.0);
-        let neural = NeuralMixCore::new(n, &prior_weights, effective_lr * 0.5, effective_lr, 1e-5);
+        let analyzer = TextContextAnalyzer::new();
+        let mut neural =
+            NeuralMixCore::new(n, &prior_weights, effective_lr * 0.5, effective_lr, 1e-5);
+        neural.set_context_state(analyzer.state());
         let eval_cache_history = neural.history_state();
 
         Self {
             experts,
             neural,
+            analyzer,
             min_prob: DEFAULT_MIN_PROB,
             scratch_expert_logps: vec![0.0; n],
             scratch_mix_weights: vec![0.0; n],
@@ -1420,6 +1611,7 @@ impl NeuralMixture {
     }
 
     fn evaluate_symbol(&mut self, symbol: u8) -> f64 {
+        self.neural.set_context_state(self.analyzer.state());
         let history = self.neural.history_state();
         if self.eval_cache_valid
             && self.eval_cache_history == history
@@ -1466,6 +1658,7 @@ impl NeuralMixture {
             self.experts[0].predictor.fill_log_probs(out);
             return;
         }
+        self.neural.set_context_state(self.analyzer.state());
         self.neural.evaluate_expert_weights();
         self.scratch_mix_weights
             .copy_from_slice(self.neural.expert_weights());
@@ -1508,7 +1701,8 @@ impl NeuralMixture {
             expert.cum_log_loss -= logp;
             expert.update(symbol);
             self.total_log_loss -= logp;
-            self.neural.update_history(symbol);
+            self.analyzer.update(symbol);
+            self.neural.set_context_state(self.analyzer.state());
             self.eval_cache_valid = false;
             return logp;
         }
@@ -1524,7 +1718,8 @@ impl NeuralMixture {
             expert.update(symbol);
         }
         self.total_log_loss -= logp;
-        self.neural.update_history(symbol);
+        self.analyzer.update(symbol);
+        self.neural.set_context_state(self.analyzer.state());
         self.eval_cache_valid = false;
         logp
     }

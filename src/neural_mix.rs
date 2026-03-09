@@ -1,3 +1,6 @@
+use crate::backends::text_context::NeuralContextState;
+pub(crate) use crate::backends::text_context::NeuralHistoryState;
+
 #[derive(Clone)]
 struct NeuralStage1Entry {
     logits: Vec<f64>,
@@ -24,14 +27,6 @@ impl NeuralStage2Entry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct NeuralHistoryState {
-    pub(crate) prev1: u8,
-    pub(crate) prev2: u8,
-    pub(crate) run_len: u16,
-    pub(crate) has_history: bool,
-}
-
 /// Shared two-stage bytewise neural mixer core used by runtime and compression predictors.
 #[derive(Clone)]
 pub(crate) struct NeuralMixCore {
@@ -40,7 +35,7 @@ pub(crate) struct NeuralMixCore {
     stage1_lr: f64,
     stage2_lr: f64,
     update_skip_threshold: f64,
-    history: NeuralHistoryState,
+    context: NeuralContextState,
     expert_count: usize,
     expert_probs: Vec<f64>,
     stage1_mix: Vec<f64>,
@@ -52,9 +47,9 @@ pub(crate) struct NeuralMixCore {
 }
 
 impl NeuralMixCore {
-    const STAGE1_CONTEXTS: usize = 3;
-    const STAGE1_TABLE_SIZES: [usize; Self::STAGE1_CONTEXTS] = [1, 256, 1024];
-    const STAGE2_TABLE_SIZE: usize = 512;
+    const STAGE1_CONTEXTS: usize = 4;
+    const STAGE1_TABLE_SIZES: [usize; Self::STAGE1_CONTEXTS] = [1, 256, 4096, 4096];
+    const STAGE2_TABLE_SIZE: usize = 2048;
 
     pub(crate) fn new(
         expert_count: usize,
@@ -82,11 +77,7 @@ impl NeuralMixCore {
 
         let mut stage2_table = Vec::with_capacity(Self::STAGE2_TABLE_SIZE);
         for _ in 0..Self::STAGE2_TABLE_SIZE {
-            let mut entry = NeuralStage2Entry::new(Self::STAGE1_CONTEXTS);
-            for logit in &mut entry.logits {
-                *logit = 0.0;
-            }
-            stage2_table.push(entry);
+            stage2_table.push(NeuralStage2Entry::new(Self::STAGE1_CONTEXTS));
         }
 
         Self {
@@ -95,7 +86,7 @@ impl NeuralMixCore {
             stage1_lr,
             stage2_lr,
             update_skip_threshold,
-            history: NeuralHistoryState::default(),
+            context: NeuralContextState::default(),
             expert_count,
             expert_probs: vec![0.0; expert_count],
             stage1_mix: vec![0.0; Self::STAGE1_CONTEXTS * expert_count],
@@ -109,27 +100,31 @@ impl NeuralMixCore {
 
     #[inline]
     pub(crate) fn history_state(&self) -> NeuralHistoryState {
-        self.history
+        self.context
+    }
+
+    #[inline]
+    pub(crate) fn set_context_state(&mut self, context: NeuralContextState) {
+        self.context = context;
+        self.evaluated = false;
     }
 
     #[inline]
     pub(crate) fn evaluate_symbol(&mut self, expert_log_probs: &[f64], min_prob: f64) -> f64 {
         debug_assert_eq!(expert_log_probs.len(), self.expert_count);
         let floor = min_prob.clamp(1e-12, 0.49);
-        for i in 0..self.expert_count {
-            let lp = expert_log_probs[i];
+        for (dst, &lp) in self.expert_probs.iter_mut().zip(expert_log_probs.iter()) {
             let p = if lp.is_finite() { lp.exp() } else { floor };
-            self.expert_probs[i] = p.max(floor).min(1.0 - floor);
+            *dst = p.max(floor).min(1.0 - floor);
         }
 
         self.compute_context_mixtures();
 
         let mut mix = 0.0;
         for k in 0..Self::STAGE1_CONTEXTS {
-            let n = self.expert_count;
-            let row = &self.stage1_mix[(k * n)..((k + 1) * n)];
+            let row = &self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];
             let mut p_k = 0.0;
-            for i in 0..n {
+            for i in 0..self.expert_count {
                 p_k += row[i] * self.expert_probs[i];
             }
             let p_k = p_k.max(floor).min(1.0 - floor);
@@ -166,12 +161,17 @@ impl NeuralMixCore {
 
         let stage1_idx = self.stage1_context_indices();
         let stage2_idx = self.stage2_context_index();
-        let old_stage2_mix = self.stage2_mix.clone();
+        let old_stage2_mix = [
+            self.stage2_mix[0],
+            self.stage2_mix[1],
+            self.stage2_mix[2],
+            self.stage2_mix[3],
+        ];
         {
             let entry2 = &mut self.stage2_table[stage2_idx];
-            for k in 0..Self::STAGE1_CONTEXTS {
+            for (k, logit) in entry2.logits.iter_mut().enumerate() {
                 let grad = old_stage2_mix[k] * (self.stage1_probs[k] - p_mix) / p_mix;
-                entry2.logits[k] = sanitize_weight(entry2.logits[k] + self.stage2_lr * grad);
+                *logit = sanitize_weight(*logit + self.stage2_lr * grad);
             }
         }
 
@@ -179,9 +179,8 @@ impl NeuralMixCore {
             let entry = &mut self.stage1_tables[k][ctx_i];
             let r_k = old_stage2_mix[k];
             let p_k = self.stage1_probs[k];
-            let n = self.expert_count;
-            let row = &self.stage1_mix[(k * n)..((k + 1) * n)];
-            for i in 0..n {
+            let row = &self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];
+            for i in 0..self.expert_count {
                 let grad = r_k * row[i] * (self.expert_probs[i] - p_k) / p_mix;
                 entry.logits[i] = sanitize_weight(entry.logits[i] + self.stage1_lr * grad);
             }
@@ -190,53 +189,74 @@ impl NeuralMixCore {
     }
 
     #[inline]
-    pub(crate) fn update_history(&mut self, symbol: u8) {
-        if self.history.has_history && symbol == self.history.prev1 {
-            self.history.run_len = self.history.run_len.saturating_add(1).min(255);
-        } else {
-            self.history.run_len = 1;
-        }
-        self.history.prev2 = self.history.prev1;
-        self.history.prev1 = symbol;
-        self.history.has_history = true;
-    }
-
-    #[inline]
     fn stage1_context_indices(&self) -> [usize; Self::STAGE1_CONTEXTS] {
-        if !self.history.has_history {
-            return [0, 0, 0];
+        if !self.context.has_history {
+            return [0, 0, 0, 0];
         }
-        let run_bucket = (self.history.run_len.min(63) as usize) & 0x3f;
-        let h = ((self.history.prev1 as usize) << 10)
-            ^ ((self.history.prev2 as usize) << 2)
-            ^ run_bucket
-            ^ (((self.history.prev1 ^ self.history.prev2) as usize) << 5);
         [
             0,
-            self.history.prev1 as usize,
-            h % Self::STAGE1_TABLE_SIZES[2],
+            self.context.prev1 as usize,
+            hash_fields(
+                &[
+                    self.context.prev1_class,
+                    self.context.prev2_class,
+                    self.context.word_len_bucket,
+                    self.context.prev_word_class,
+                    self.context.bracket_bucket,
+                    self.context.quote_flags,
+                    self.context.utf8_left,
+                    self.context.sentence_boundary as u8,
+                    self.context.paragraph_break as u8,
+                ],
+                Self::STAGE1_TABLE_SIZES[2],
+            ),
+            hash_fields(
+                &[
+                    self.context.repeat_len_bucket,
+                    self.context.copied_last_byte as u8,
+                    self.context.run_len.min(63) as u8,
+                    self.context.prev1_class,
+                    self.context.prev2_class,
+                ],
+                Self::STAGE1_TABLE_SIZES[3],
+            ),
         ]
     }
 
     #[inline]
     fn stage2_context_index(&self) -> usize {
-        if !self.history.has_history {
+        if !self.context.has_history {
             return 0;
         }
-        let run_bucket = (self.history.run_len.min(127) as usize) & 0x7f;
-        let h = ((self.history.prev1 as usize) << 8) ^ (self.history.prev2 as usize) ^ run_bucket;
-        h % Self::STAGE2_TABLE_SIZE
+        hash_fields(
+            &[
+                self.context.prev1,
+                self.context.prev2,
+                self.context.prev1_class,
+                self.context.prev2_class,
+                self.context.word_len_bucket,
+                self.context.prev_word_class,
+                self.context.bracket_bucket,
+                self.context.quote_flags,
+                self.context.utf8_left,
+                self.context.repeat_len_bucket,
+                self.context.copied_last_byte as u8,
+                self.context.sentence_boundary as u8,
+                self.context.paragraph_break as u8,
+                self.context.run_len.min(127) as u8,
+            ],
+            Self::STAGE2_TABLE_SIZE,
+        )
     }
 
     #[inline]
     fn compute_context_mixtures(&mut self) {
         let stage1_idx = self.stage1_context_indices();
-        let n = self.expert_count;
         self.expert_weights.fill(0.0);
 
         for (k, &ctx_i) in stage1_idx.iter().enumerate() {
             let entry = &self.stage1_tables[k][ctx_i];
-            let row = &mut self.stage1_mix[(k * n)..((k + 1) * n)];
+            let row = &mut self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];
             softmax_into(&entry.logits, row);
         }
 
@@ -245,14 +265,23 @@ impl NeuralMixCore {
         softmax_into(&entry2.logits, &mut self.stage2_mix);
 
         for k in 0..Self::STAGE1_CONTEXTS {
-            let n = self.expert_count;
-            let row = &self.stage1_mix[(k * n)..((k + 1) * n)];
+            let row = &self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];
             let r_k = self.stage2_mix[k];
-            for i in 0..n {
+            for i in 0..self.expert_count {
                 self.expert_weights[i] += r_k * row[i];
             }
         }
     }
+}
+
+#[inline]
+fn hash_fields(values: &[u8], modulo: usize) -> usize {
+    let mut h = 0x9E37_79B9u32;
+    for &value in values {
+        h ^= value as u32;
+        h = h.rotate_left(5).wrapping_mul(0x85EB_CA6B);
+    }
+    (h as usize) % modulo
 }
 
 #[inline]

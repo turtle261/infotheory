@@ -7,7 +7,8 @@ source "${repo_root}/scripts/workload_presets.sh"
 
 mode="${1:-run}"
 build_mode="${BUILD_MODE:-release}"
-features="${INFOTHEORY_FEATURES:-cli}"
+cargo_features="${INFOTHEORY_CARGO_FEATURES:-${INFOTHEORY_FEATURES:-cli}}"
+cargo_no_default_features="${INFOTHEORY_CARGO_NO_DEFAULT_FEATURES:-0}"
 target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
 bin_path="${target_dir}/${build_mode}/infotheory"
 out_dir="${repo_root}/target/perf/${WORKLOAD_PRESET:-two-json}"
@@ -50,8 +51,16 @@ run_cmd() {
   esac
 }
 
-echo "Building infotheory (${build_mode}, features=${features})"
-cargo build --"${build_mode}" --features "${features}" --quiet
+build_args=(build "--${build_mode}" --quiet)
+if [[ "${cargo_no_default_features}" == "1" ]]; then
+  build_args+=(--no-default-features)
+fi
+if [[ -n "${cargo_features}" ]]; then
+  build_args+=(--features "${cargo_features}")
+fi
+
+echo "Building infotheory (${build_mode}, features=${cargo_features}, no_default_features=${cargo_no_default_features})"
+cargo "${build_args[@]}"
 
 configure_workload_preset "${repo_root}" "${bin_path}" "${out_dir}"
 echo "Preset: ${WORKLOAD_PRESET_NAME}"

@@ -195,15 +195,22 @@ struct SamEdge {
     next: SamEdgeIx,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Sam {
     st: Vec<SamState>,
     ed: Vec<SamEdge>,
     last: SamStateIx,
+    root_to: [SamStateIx; BYTE_ALPHA_N],
 
     text: Vec<u32>,
     text_states: Vec<SamStateIx>,
     boundary_after: Vec<u8>,
+}
+
+impl Default for Sam {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl Sam {
@@ -212,6 +219,7 @@ impl Sam {
             st: Vec::new(),
             ed: Vec::new(),
             last: 0,
+            root_to: [SAM_STATE_NONE; BYTE_ALPHA_N],
             text: Vec::new(),
             text_states: Vec::new(),
             boundary_after: Vec::new(),
@@ -252,7 +260,25 @@ impl Sam {
     }
 
     #[inline(always)]
+    fn reserve_additional(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        self.st
+            .reserve(additional.saturating_mul(2).saturating_add(16));
+        self.ed
+            .reserve(additional.saturating_mul(3).saturating_add(16));
+        let text_extra = additional.saturating_add(16);
+        self.text.reserve(text_extra);
+        self.text_states.reserve(text_extra);
+        self.boundary_after.reserve(text_extra);
+    }
+
+    #[inline(always)]
     fn get_edge(&self, v: SamStateIx, ch: u32) -> SamStateIx {
+        if v == 0 && ch < BYTE_ALPHA_N as u32 {
+            return self.root_to[ch as usize];
+        }
         let st = unsafe { self.st.get_unchecked(state_usize(v)) };
         for i in 0..(st.small_n as usize) {
             if st.small_ch[i] == ch {
@@ -289,6 +315,9 @@ impl Sam {
         } else {
             self.add_edge(v, ch, to);
         }
+        if v == 0 && ch < BYTE_ALPHA_N as u32 {
+            self.root_to[ch as usize] = to;
+        }
     }
 
     #[inline(always)]
@@ -304,6 +333,9 @@ impl Sam {
             for i in 0..(st.small_n as usize) {
                 if st.small_ch[i] == ch && st.small_to[i] == old_to {
                     st.small_to[i] = new_to;
+                    if v == 0 && ch < BYTE_ALPHA_N as u32 {
+                        self.root_to[ch as usize] = new_to;
+                    }
                     return true;
                 }
             }
@@ -313,11 +345,36 @@ impl Sam {
             let e = &mut self.ed[edge_usize(ei)];
             if e.ch == ch && e.to == old_to {
                 e.to = new_to;
+                if v == 0 && ch < BYTE_ALPHA_N as u32 {
+                    self.root_to[ch as usize] = new_to;
+                }
                 return true;
             }
             ei = e.next;
         }
         false
+    }
+
+    fn rebuild_root_cache(&mut self) {
+        self.root_to.fill(SAM_STATE_NONE);
+        if self.st.is_empty() {
+            return;
+        }
+        let root = self.st[0];
+        for i in 0..(root.small_n as usize) {
+            let ch = root.small_ch[i];
+            if ch < BYTE_ALPHA_N as u32 {
+                self.root_to[ch as usize] = root.small_to[i];
+            }
+        }
+        let mut ei = root.head;
+        while ei != SAM_EDGE_NONE {
+            let e = self.ed[edge_usize(ei)];
+            if e.ch < BYTE_ALPHA_N as u32 {
+                self.root_to[e.ch as usize] = e.to;
+            }
+            ei = e.next;
+        }
     }
 
     fn clone_overflow_edges(&mut self, src: SamStateIx, dst: SamStateIx) {
@@ -508,6 +565,7 @@ impl Sam {
         self.text_states.truncate(tx.old_text_states_len);
         self.boundary_after.truncate(tx.old_boundary_len);
         self.last = tx.old_last;
+        self.rebuild_root_cache();
     }
 
     #[inline(always)]
@@ -541,8 +599,14 @@ impl Sam {
             st.small_ch[i] = ch;
             st.small_to[i] = to;
             st.small_n += 1;
+            if v == 0 && ch < BYTE_ALPHA_N as u32 {
+                self.root_to[ch as usize] = to;
+            }
         } else {
             self.add_edge_tx(tx, v, ch, to);
+            if v == 0 && ch < BYTE_ALPHA_N as u32 {
+                self.root_to[ch as usize] = to;
+            }
         }
     }
 
@@ -562,6 +626,9 @@ impl Sam {
                 if st.small_ch[i] == ch && st.small_to[i] == old_to {
                     self.record_state_change(tx, state_usize(v));
                     self.st[state_usize(v)].small_to[i] = new_to;
+                    if v == 0 && ch < BYTE_ALPHA_N as u32 {
+                        self.root_to[ch as usize] = new_to;
+                    }
                     return true;
                 }
             }
@@ -574,6 +641,9 @@ impl Sam {
             if e.ch == ch && e.to == old_to {
                 self.record_edge_change(tx, eidx);
                 self.ed[eidx].to = new_to;
+                if v == 0 && ch < BYTE_ALPHA_N as u32 {
+                    self.root_to[ch as usize] = new_to;
+                }
                 return true;
             }
             ei = e.next;
@@ -679,7 +749,7 @@ struct SamTx {
     ed_changes: Vec<(usize, SamEdge)>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct LmState {
     head: LmNodeIx,
     total_n: u64,
@@ -689,7 +759,7 @@ struct LmState {
     last_node: LmNodeIx,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CountNode {
     sym_idx: u32,
     cnt: u64,
@@ -726,6 +796,17 @@ impl Default for LM {
 }
 
 impl LM {
+    #[inline(always)]
+    fn capped_start_state(&self, sam: &Sam, max_order: i64, mut v: SamStateIx) -> SamStateIx {
+        if max_order < 0 {
+            return v;
+        }
+        while v != SAM_STATE_NONE && (sam.st[state_usize(v)].len as i64) > max_order {
+            v = sam.st[state_usize(v)].link;
+        }
+        if v == SAM_STATE_NONE { 0 } else { v }
+    }
+
     fn build_alphabet(&mut self, sam: &Sam) {
         self.has_byte_map = false;
         self.byte_map = [-1; 256];
@@ -848,6 +929,17 @@ impl LM {
         ls.last_sym = sym_idx;
     }
 
+    #[inline(always)]
+    fn reserve_for_stream(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        self.ls
+            .reserve(additional.saturating_mul(2).saturating_add(16));
+        self.nodes
+            .reserve(additional.saturating_mul(3).saturating_add(16));
+    }
+
     fn build_counts(&mut self, sam: &Sam, max_order: i64) {
         self.ls = vec![
             LmState {
@@ -948,40 +1040,38 @@ impl LM {
         let sym_idx = sym_idx as u32;
         let mut p_accum = 0.0f64;
         let mut residual = 1.0f64;
-        let mut u = v;
+        let mut u = self.capped_start_state(sam, max_order, v);
 
         while u != SAM_STATE_NONE {
-            if !(max_order >= 0 && (sam.st[state_usize(u)].len as i64) > max_order) {
-                let n = self.ls[state_usize(u)].total_n;
-                let t = self.ls[state_usize(u)].types_t;
-                if n > 0 {
-                    let lam = if t > 0 {
-                        (n as f64) / ((n + (t as u64)) as f64)
-                    } else {
-                        1.0
-                    };
+            let n = self.ls[state_usize(u)].total_n;
+            let t = self.ls[state_usize(u)].types_t;
+            if n > 0 {
+                let lam = if t > 0 {
+                    (n as f64) / ((n + (t as u64)) as f64)
+                } else {
+                    1.0
+                };
 
-                    // Total probability mass from this state
-                    let scale = residual * lam;
+                // Total probability mass from this state
+                let scale = residual * lam;
 
-                    // Probability of specifically sym_idx in this state
-                    let mut count_for_sym = 0u64;
-                    let mut ni = self.ls[state_usize(u)].head;
-                    while ni != LM_NODE_NONE {
-                        let node = self.nodes[node_usize(ni)];
-                        if node.sym_idx == sym_idx {
-                            count_for_sym = node.cnt;
-                            break;
-                        }
-                        ni = node.next;
+                // Probability of specifically sym_idx in this state
+                let mut count_for_sym = 0u64;
+                let mut ni = self.ls[state_usize(u)].head;
+                while ni != LM_NODE_NONE {
+                    let node = self.nodes[node_usize(ni)];
+                    if node.sym_idx == sym_idx {
+                        count_for_sym = node.cnt;
+                        break;
                     }
-
-                    if count_for_sym > 0 {
-                        p_accum += scale * (count_for_sym as f64 / n as f64);
-                    }
-
-                    residual *= 1.0 - lam;
+                    ni = node.next;
                 }
+
+                if count_for_sym > 0 {
+                    p_accum += scale * (count_for_sym as f64 / n as f64);
+                }
+
+                residual *= 1.0 - lam;
             }
             u = sam.st[state_usize(u)].link;
         }
@@ -999,27 +1089,25 @@ impl LM {
     fn probs_for_state(&self, sam: &Sam, max_order: i64, v: SamStateIx, out: &mut [f64]) {
         out.fill(0.0);
         let mut residual = 1.0f64;
-        let mut u = v;
+        let mut u = self.capped_start_state(sam, max_order, v);
         while u != SAM_STATE_NONE {
-            if !(max_order >= 0 && (sam.st[state_usize(u)].len as i64) > max_order) {
-                let n = self.ls[state_usize(u)].total_n;
-                let t = self.ls[state_usize(u)].types_t;
-                if n > 0 {
-                    let lam = if t > 0 {
-                        (n as f64) / ((n + (t as u64)) as f64)
-                    } else {
-                        1.0
-                    };
-                    let scale = residual * lam;
-                    let inv_n = 1.0 / (n as f64);
-                    let mut ni = self.ls[state_usize(u)].head;
-                    while ni != LM_NODE_NONE {
-                        let node = self.nodes[node_usize(ni)];
-                        out[node.sym_idx as usize] += scale * ((node.cnt as f64) * inv_n);
-                        ni = node.next;
-                    }
-                    residual *= 1.0 - lam;
+            let n = self.ls[state_usize(u)].total_n;
+            let t = self.ls[state_usize(u)].types_t;
+            if n > 0 {
+                let lam = if t > 0 {
+                    (n as f64) / ((n + (t as u64)) as f64)
+                } else {
+                    1.0
+                };
+                let scale = residual * lam;
+                let inv_n = 1.0 / (n as f64);
+                let mut ni = self.ls[state_usize(u)].head;
+                while ni != LM_NODE_NONE {
+                    let node = self.nodes[node_usize(ni)];
+                    out[node.sym_idx as usize] += scale * ((node.cnt as f64) * inv_n);
+                    ni = node.next;
                 }
+                residual *= 1.0 - lam;
             }
             u = sam.st[state_usize(u)].link;
         }
@@ -1263,6 +1351,15 @@ impl RosaPlus {
         self.lm_built = false;
     }
 
+    /// Reserve append-only buffers for a future byte stream.
+    ///
+    /// This keeps compression-side updates from repeatedly growing the same vectors.
+    pub fn reserve_for_stream(&mut self, additional_bytes: usize) {
+        self.sam.reserve_additional(additional_bytes);
+        self.lm.reserve_for_stream(additional_bytes);
+        self.dist.reserve(BYTE_ALPHA_N);
+    }
+
     /// Build the language model from current SAM state.
     pub fn build_lm(&mut self) {
         self.sam.finalize_endpos();
@@ -1365,6 +1462,158 @@ impl RosaPlus {
     /// Apply a sequential update without inserting a boundary (continuous stream).
     pub fn train_sequence_tx(&mut self, tx: &mut RosaTx, s: &[u8]) {
         self.train_example_tx_impl(tx, s, false);
+    }
+
+    /// Apply a sequential byte-stream update without rollback bookkeeping.
+    pub fn train_sequence(&mut self, s: &[u8]) {
+        if s.is_empty() {
+            return;
+        }
+
+        if s.len() == 1 {
+            self.train_byte(s[0]);
+            return;
+        }
+
+        if self.sam.text.is_empty() {
+            self.sam = Sam::new(s.len());
+        }
+        self.reserve_for_stream(s.len());
+        if !self.lm_built || !self.lm.has_byte_map || (self.lm.alpha_n as usize) != BYTE_ALPHA_N {
+            self.build_lm_full_bytes_no_finalize_endpos();
+        }
+
+        if self.lm.ls.len() < self.sam.st.len() {
+            self.lm.ls.resize(
+                self.sam.st.len(),
+                LmState {
+                    head: LM_NODE_NONE,
+                    last_node: LM_NODE_NONE,
+                    ..LmState::default()
+                },
+            );
+        }
+
+        let seg_start = self.sam.text.len();
+        for &b in s {
+            self.sam.feed(b as u32);
+            self.lm.unigram[b as usize] += 1;
+            self.lm.total_uni += 1;
+        }
+
+        if self.lm.ls.len() < self.sam.st.len() {
+            self.lm.ls.resize(
+                self.sam.st.len(),
+                LmState {
+                    head: LM_NODE_NONE,
+                    last_node: LM_NODE_NONE,
+                    ..LmState::default()
+                },
+            );
+        }
+
+        let seg_end = self.sam.text.len();
+        if seg_end.saturating_sub(seg_start) >= 1 {
+            let mo = if self.max_order < 0 {
+                -1
+            } else {
+                self.max_order
+            };
+            let mut start_i = seg_start;
+            if seg_start > 0
+                && self
+                    .sam
+                    .boundary_after
+                    .get(seg_start - 1)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+            {
+                start_i = seg_start - 1;
+            }
+            for i in start_i..(seg_end - 1) {
+                let mut ctx = self.sam.text_states[i + 1];
+                if mo >= 0 {
+                    while ctx != SAM_STATE_NONE && (self.sam.st[state_usize(ctx)].len as i64) > mo {
+                        ctx = self.sam.st[state_usize(ctx)].link;
+                    }
+                    if ctx == SAM_STATE_NONE {
+                        ctx = 0;
+                    }
+                }
+                let nxt = self.sam.text[i + 1];
+                let si = self.lm.find_sym(nxt);
+                if si >= 0 {
+                    let mut u = ctx;
+                    while u != SAM_STATE_NONE {
+                        self.lm.inc(state_usize(u) as u32, si as u32, 1);
+                        u = self.sam.st[state_usize(u)].link;
+                    }
+                }
+            }
+        }
+
+        self.lm_built = true;
+    }
+
+    /// Apply a single byte sequential update without rollback bookkeeping.
+    #[inline]
+    pub fn train_byte(&mut self, b: u8) {
+        if self.sam.text.is_empty() {
+            self.sam = Sam::new(1);
+        }
+        if !self.lm_built || !self.lm.has_byte_map || (self.lm.alpha_n as usize) != BYTE_ALPHA_N {
+            self.build_lm_full_bytes_no_finalize_endpos();
+        }
+
+        self.sam.feed(b as u32);
+        self.lm.unigram[b as usize] += 1;
+        self.lm.total_uni += 1;
+
+        if self.lm.ls.len() < self.sam.st.len() {
+            self.lm.ls.resize(
+                self.sam.st.len(),
+                LmState {
+                    head: LM_NODE_NONE,
+                    last_node: LM_NODE_NONE,
+                    ..LmState::default()
+                },
+            );
+        }
+
+        let seg_end = self.sam.text.len();
+        if seg_end > 1
+            && self
+                .sam
+                .boundary_after
+                .get(seg_end - 2)
+                .copied()
+                .unwrap_or(0)
+                == 0
+        {
+            let mo = if self.max_order < 0 {
+                -1
+            } else {
+                self.max_order
+            };
+            let mut ctx = self.sam.text_states[seg_end - 1];
+            if mo >= 0 {
+                while ctx != SAM_STATE_NONE && (self.sam.st[state_usize(ctx)].len as i64) > mo {
+                    ctx = self.sam.st[state_usize(ctx)].link;
+                }
+                if ctx == SAM_STATE_NONE {
+                    ctx = 0;
+                }
+            }
+            let mut u = ctx;
+            let si = b as u32;
+            while u != SAM_STATE_NONE {
+                self.lm.inc(state_usize(u) as u32, si, 1);
+                u = self.sam.st[state_usize(u)].link;
+            }
+        }
+
+        self.lm_built = true;
     }
 
     fn train_example_tx_impl(&mut self, tx: &mut RosaTx, s: &[u8], mark_boundary: bool) {
@@ -1516,6 +1765,9 @@ impl RosaPlus {
         let chunk_size = data.len().div_ceil(num_chunks);
         let mut total_log_prob = 0.0f64;
         let mut count = 0usize;
+        let mut m = RosaPlus::new(max_order, false, 0, seed);
+        m.sam = Sam::new(data.len());
+        m.lm_built = false;
 
         for i in 0..num_chunks {
             let start = i * chunk_size;
@@ -1523,26 +1775,24 @@ impl RosaPlus {
             if start >= end {
                 break;
             }
-            if i == 0 {
-                continue;
+            let chunk = &data[start..end];
+            if i > 0 {
+                m.build_lm_no_finalize_endpos();
+                let mut v = 0;
+                for &b in chunk {
+                    let sym_idx = m.lm.find_sym(b as u32);
+                    let p = m.lm.prob_for_sym(&m.sam, max_order, v, sym_idx);
+                    total_log_prob += p.log2();
+                    count += 1;
+                    v = m.sam.advance(v, b as u32);
+                }
             }
-
-            let mut m = RosaPlus::new(max_order, false, 0, seed);
-            m.train_example(&data[..start]);
-            m.build_lm();
-            let mut v = m.sam.last;
-
-            for &b in &data[start..end] {
-                let sym_idx = m.lm.find_sym(b as u32);
-                let p = m.lm.prob_for_sym(&m.sam, max_order, v, sym_idx);
-                total_log_prob += p.log2();
-                count += 1;
-                v = m.sam.advance(v, b as u32);
+            for &b in chunk {
+                m.sam.feed(b as u32);
             }
         }
 
         if count == 0 {
-            let mut m = RosaPlus::new(max_order, false, 0, seed);
             m.train_example(data);
             m.build_lm();
             m.cross_entropy(data)
@@ -1575,6 +1825,7 @@ impl RosaPlus {
                 .len()
                 .saturating_mul(size_of::<SamStateIx>()),
         );
+        n = n.saturating_add(size_of::<[SamStateIx; BYTE_ALPHA_N]>());
         n = n.saturating_add(
             self.sam
                 .boundary_after
@@ -2204,6 +2455,7 @@ impl RosaPlus {
                 ));
             }
         }
+        m.sam.rebuild_root_cache();
 
         // LM
         f.read_exact(&mut b4)?;
@@ -2326,22 +2578,30 @@ impl RosaPlus {
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
         self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
 
-        out[..256].fill(0.0);
+        if self.lm.has_byte_map
+            && (self.lm.alpha_n as usize) == BYTE_ALPHA_N
+            && self.lm.alphabet.len() == BYTE_ALPHA_N
+        {
+            out[..BYTE_ALPHA_N].copy_from_slice(&self.dist[..BYTE_ALPHA_N]);
+            return;
+        }
+
+        out[..BYTE_ALPHA_N].fill(0.0);
         for (i, &cp) in self.lm.alphabet.iter().enumerate() {
-            if cp < 256 {
+            if cp < BYTE_ALPHA_N as u32 {
                 out[cp as usize] = self.dist[i];
             }
         }
 
-        let sum: f64 = out[..256].iter().sum();
+        let sum: f64 = out[..BYTE_ALPHA_N].iter().sum();
         if sum.is_finite() && sum > 0.0 {
             let inv = 1.0 / sum;
-            for p in &mut out[..256] {
+            for p in &mut out[..BYTE_ALPHA_N] {
                 *p *= inv;
             }
         } else {
-            let u = 1.0 / 256.0;
-            for p in &mut out[..256] {
+            let u = 1.0 / BYTE_ALPHA_N as f64;
+            for p in &mut out[..BYTE_ALPHA_N] {
                 *p = u;
             }
         }
@@ -2454,6 +2714,109 @@ mod tests {
         }
     }
 
+    fn prob_for_sym_reference(
+        lm: &LM,
+        sam: &Sam,
+        max_order: i64,
+        v: SamStateIx,
+        sym_idx: i32,
+    ) -> f64 {
+        if sym_idx < 0 {
+            return 1.0 / (lm.alpha_n.max(1) as f64);
+        }
+        let sym_idx = sym_idx as u32;
+        let mut p_accum = 0.0f64;
+        let mut residual = 1.0f64;
+        let mut u = v;
+
+        while u != SAM_STATE_NONE {
+            if !(max_order >= 0 && (sam.st[state_usize(u)].len as i64) > max_order) {
+                let n = lm.ls[state_usize(u)].total_n;
+                let t = lm.ls[state_usize(u)].types_t;
+                if n > 0 {
+                    let lam = if t > 0 {
+                        (n as f64) / ((n + (t as u64)) as f64)
+                    } else {
+                        1.0
+                    };
+                    let scale = residual * lam;
+                    let mut count_for_sym = 0u64;
+                    let mut ni = lm.ls[state_usize(u)].head;
+                    while ni != LM_NODE_NONE {
+                        let node = lm.nodes[node_usize(ni)];
+                        if node.sym_idx == sym_idx {
+                            count_for_sym = node.cnt;
+                            break;
+                        }
+                        ni = node.next;
+                    }
+                    if count_for_sym > 0 {
+                        p_accum += scale * (count_for_sym as f64 / n as f64);
+                    }
+                    residual *= 1.0 - lam;
+                }
+            }
+            u = sam.st[state_usize(u)].link;
+        }
+
+        if lm.total_uni > 0 && residual > 0.0 {
+            let p_uni = lm.unigram[sym_idx as usize] as f64 / lm.total_uni as f64;
+            p_accum += residual * p_uni;
+        } else if residual > 0.0 {
+            p_accum += residual * (1.0 / lm.alpha_n.max(1) as f64);
+        }
+
+        p_accum.clamp(1e-12, 1.0)
+    }
+
+    fn probs_for_state_reference(lm: &LM, sam: &Sam, max_order: i64, v: SamStateIx) -> Vec<f64> {
+        let mut out = vec![0.0; lm.alpha_n as usize];
+        let mut residual = 1.0f64;
+        let mut u = v;
+        while u != SAM_STATE_NONE {
+            if !(max_order >= 0 && (sam.st[state_usize(u)].len as i64) > max_order) {
+                let n = lm.ls[state_usize(u)].total_n;
+                let t = lm.ls[state_usize(u)].types_t;
+                if n > 0 {
+                    let lam = if t > 0 {
+                        (n as f64) / ((n + (t as u64)) as f64)
+                    } else {
+                        1.0
+                    };
+                    let scale = residual * lam;
+                    let inv_n = 1.0 / (n as f64);
+                    let mut ni = lm.ls[state_usize(u)].head;
+                    while ni != LM_NODE_NONE {
+                        let node = lm.nodes[node_usize(ni)];
+                        out[node.sym_idx as usize] += scale * ((node.cnt as f64) * inv_n);
+                        ni = node.next;
+                    }
+                    residual *= 1.0 - lam;
+                }
+            }
+            u = sam.st[state_usize(u)].link;
+        }
+
+        if lm.total_uni > 0 && residual > 0.0 {
+            let inv = 1.0 / (lm.total_uni as f64);
+            for (slot, &count) in out.iter_mut().zip(lm.unigram.iter()) {
+                *slot += residual * ((count as f64) * inv);
+            }
+        }
+
+        let sum: f64 = out.iter().sum();
+        if sum > 0.0 {
+            let inv = 1.0 / sum;
+            for slot in &mut out {
+                *slot *= inv;
+            }
+        } else {
+            let uprob = 1.0 / (lm.alpha_n.max(1) as f64);
+            out.fill(uprob);
+        }
+        out
+    }
+
     #[test]
     fn rosa_md_example_basic() {
         // From rosa.md: ROSA predicts next token of best previous match.
@@ -2484,6 +2847,97 @@ mod tests {
         m.rollback_tx(tx);
         assert_eq!(m.sam.text, base_text);
         assert_eq!(m.lm.total_uni, base_total_uni);
+    }
+
+    #[test]
+    fn train_sequence_matches_transactional_sequence_update() {
+        let mut direct = RosaPlus::new(4, false, 0, 123);
+        direct.build_lm_full_bytes_no_finalize_endpos();
+        direct.reserve_for_stream(64);
+        direct.train_sequence(b"abracadabra");
+        direct.train_sequence(b" mississippi");
+
+        let mut tx_model = RosaPlus::new(4, false, 0, 123);
+        tx_model.build_lm_full_bytes_no_finalize_endpos();
+        tx_model.reserve_for_stream(64);
+        let mut tx = tx_model.begin_tx();
+        tx_model.train_sequence_tx(&mut tx, b"abracadabra");
+        let mut tx = tx_model.begin_tx();
+        tx_model.train_sequence_tx(&mut tx, b" mississippi");
+
+        assert_eq!(direct.sam.text, tx_model.sam.text);
+        assert_eq!(direct.sam.text_states, tx_model.sam.text_states);
+        assert_eq!(direct.sam.boundary_after, tx_model.sam.boundary_after);
+        assert_eq!(direct.sam.last, tx_model.sam.last);
+        assert_eq!(direct.lm.total_uni, tx_model.lm.total_uni);
+        assert_eq!(direct.lm.unigram, tx_model.lm.unigram);
+        assert_eq!(direct.lm.nodes, tx_model.lm.nodes);
+        assert_eq!(direct.lm.ls, tx_model.lm.ls);
+
+        let mut direct_pdf = [0.0; BYTE_ALPHA_N];
+        let mut tx_pdf = [0.0; BYTE_ALPHA_N];
+        direct.fill_probs_for_last_bytes(&mut direct_pdf);
+        tx_model.fill_probs_for_last_bytes(&mut tx_pdf);
+        for idx in 0..BYTE_ALPHA_N {
+            assert!((direct_pdf[idx] - tx_pdf[idx]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn repeated_single_byte_train_byte_matches_transactional_update() {
+        let data = b"abracadabra mississippi";
+
+        let mut direct = RosaPlus::new(4, false, 0, 123);
+        direct.build_lm_full_bytes_no_finalize_endpos();
+        for &b in data {
+            direct.train_byte(b);
+        }
+
+        let mut tx_model = RosaPlus::new(4, false, 0, 123);
+        tx_model.build_lm_full_bytes_no_finalize_endpos();
+        for &b in data {
+            let mut tx = tx_model.begin_tx();
+            tx_model.train_sequence_tx(&mut tx, &[b]);
+        }
+
+        assert_eq!(direct.sam.text, tx_model.sam.text);
+        assert_eq!(direct.sam.text_states, tx_model.sam.text_states);
+        assert_eq!(direct.sam.boundary_after, tx_model.sam.boundary_after);
+        assert_eq!(direct.sam.last, tx_model.sam.last);
+        assert_eq!(direct.lm.total_uni, tx_model.lm.total_uni);
+        assert_eq!(direct.lm.unigram, tx_model.lm.unigram);
+        assert_eq!(direct.lm.nodes, tx_model.lm.nodes);
+        assert_eq!(direct.lm.ls, tx_model.lm.ls);
+    }
+
+    #[test]
+    fn max_order_capping_keeps_probability_semantics() {
+        let mut m = RosaPlus::new(4, false, 0, 321);
+        m.build_lm_full_bytes_no_finalize_endpos();
+        m.train_sequence(b"abracadabra mississippi abracadabra abracadabra");
+
+        let v = m.sam.last;
+        for &sym in &[b'a', b' ', b'm', b'z'] {
+            let sym_idx = m.lm.find_sym(sym as u32);
+            let expected = prob_for_sym_reference(&m.lm, &m.sam, m.max_order, v, sym_idx);
+            let got = m.lm.prob_for_sym(&m.sam, m.max_order, v, sym_idx);
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "sym={sym} got={got} expected={expected}"
+            );
+        }
+
+        let expected = probs_for_state_reference(&m.lm, &m.sam, m.max_order, v);
+        let mut got = vec![0.0; m.lm.alpha_n as usize];
+        m.lm.probs_for_state(&m.sam, m.max_order, v, &mut got);
+        for idx in 0..got.len() {
+            assert!(
+                (got[idx] - expected[idx]).abs() < 1e-12,
+                "idx={idx} got={} expected={}",
+                got[idx],
+                expected[idx]
+            );
+        }
     }
 
     #[test]

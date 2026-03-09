@@ -7,6 +7,11 @@
 
 use anyhow::{Result, bail};
 
+use crate::backends::calibration::CalibratorCore;
+use crate::backends::match_model::MatchModel;
+use crate::backends::ppmd::PpmdModel;
+use crate::backends::sparse_match::SparseMatchModel;
+use crate::backends::text_context::TextContextAnalyzer;
 use crate::coders::{
     ANS_TOTAL, ArithmeticDecoder, ArithmeticEncoder, BlockedRansDecoder, BlockedRansEncoder,
     CDF_TOTAL, Cdf, CoderType, crc32, quantize_pdf_to_cdf_inplace,
@@ -21,11 +26,16 @@ use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
 use crate::zpaq_rate::ZpaqRateModel;
-use crate::{MixtureKind, MixtureSpec, RateBackend};
+use crate::{CalibratedSpec, MixtureKind, MixtureSpec, RateBackend};
 
 const FRAMED_MAGIC: u32 = 0x4354_4946; // "FITC"
 const FRAMED_VERSION: u8 = 1;
 const PDF_MIN: f64 = DEFAULT_MIN_PROB;
+
+#[inline]
+fn build_calibrator(spec: &CalibratedSpec) -> CalibratorCore {
+    CalibratorCore::new(spec.context, spec.bins, spec.learning_rate, spec.bias_clip)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Wire format mode for rate-coded payloads.
@@ -326,9 +336,12 @@ impl RosaPredictor {
     }
 
     fn update(&mut self, symbol: u8) {
-        let mut tx = self.model.begin_tx();
-        self.model.train_sequence_tx(&mut tx, &[symbol]);
+        self.model.train_byte(symbol);
         self.valid = false;
+    }
+
+    fn begin_stream(&mut self, total_len: usize) {
+        self.model.reserve_for_stream(total_len);
     }
 }
 
@@ -517,6 +530,7 @@ struct MixturePredictor {
     decay: f64,
     experts: Vec<MixExpert>,
     neural: NeuralMixCore,
+    analyzer: TextContextAnalyzer,
     neural_logps: Vec<f64>,
     neural_bit_modes: Vec<u8>,
     neural_lo: Vec<usize>,
@@ -545,7 +559,7 @@ impl MixturePredictor {
                 cum_log_loss: 0.0,
             });
         }
-        let m = logsumexp(experts.iter().map(|e| e.log_weight));
+        let m = logsumexp_expert_weights(&experts);
         for e in &mut experts {
             e.log_weight -= m;
         }
@@ -558,19 +572,22 @@ impl MixturePredictor {
 
         let base_lr = spec.alpha.abs().clamp(1e-6, 1.0);
         let effective_lr = (base_lr * 25.0).clamp(1e-6, 1.0);
-        let neural = NeuralMixCore::new(
+        let analyzer = TextContextAnalyzer::new();
+        let mut neural = NeuralMixCore::new(
             experts.len(),
             &prior_weights,
             effective_lr * 0.5,
             effective_lr,
             1e-5,
         );
+        neural.set_context_state(analyzer.state());
         Ok(Self {
             kind: spec.kind,
             alpha: spec.alpha.clamp(1e-12, 1.0 - 1e-12),
             decay: spec.decay.unwrap_or(1.0).clamp(0.0, 1.0),
             experts,
             neural,
+            analyzer,
             neural_logps: vec![0.0; spec.experts.len()],
             neural_bit_modes: vec![0; spec.experts.len()],
             neural_lo: vec![0; spec.experts.len()],
@@ -597,6 +614,7 @@ impl MixturePredictor {
                     self.valid = true;
                     return Ok(&self.pdf);
                 }
+                self.neural.set_context_state(self.analyzer.state());
                 self.neural.evaluate_expert_weights();
                 let n = self.experts.len();
                 self.scratch.resize(n, 0.0);
@@ -616,7 +634,7 @@ impl MixturePredictor {
             _ => {
                 self.pdf.fill(0.0);
 
-                let lw_norm = logsumexp(self.experts.iter().map(|e| e.log_weight));
+                let lw_norm = logsumexp_expert_weights(&self.experts);
                 for e in &mut self.experts {
                     let w = (e.log_weight - lw_norm).exp();
                     let epdf = e.predictor.pdf_next()?;
@@ -653,7 +671,7 @@ impl MixturePredictor {
                     self.scratch[i] = lp;
                     self.scratch2[i] = e.log_weight + lp;
                 }
-                let log_mix = logsumexp(self.scratch2.iter().copied());
+                let log_mix = logsumexp_slice(&self.scratch2[..n]);
                 for (i, e) in self.experts.iter_mut().enumerate() {
                     e.log_weight = e.log_weight + self.scratch[i] - log_mix;
                     e.cum_log_loss -= self.scratch[i];
@@ -673,7 +691,7 @@ impl MixturePredictor {
                 for (i, e) in self.experts.iter_mut().enumerate() {
                     self.scratch2[i] = self.decay * e.log_weight + self.scratch[i];
                 }
-                let log_mix = logsumexp(self.scratch2.iter().copied());
+                let log_mix = logsumexp_slice(&self.scratch2[..n]);
                 for (i, e) in self.experts.iter_mut().enumerate() {
                     e.log_weight = self.decay * e.log_weight + self.scratch[i] - log_mix;
                     e.cum_log_loss -= self.scratch[i];
@@ -696,7 +714,7 @@ impl MixturePredictor {
                     let switched = logsumexp2(log_1m_alpha + e.log_weight, log_alpha + e.log_prior);
                     self.scratch2[i] = switched + self.scratch[i];
                 }
-                let log_mix = logsumexp(self.scratch2.iter().copied());
+                let log_mix = logsumexp_slice(&self.scratch2[..n]);
                 for (i, e) in self.experts.iter_mut().enumerate() {
                     e.log_weight = self.scratch2[i] - log_mix;
                     e.cum_log_loss -= self.scratch[i];
@@ -722,11 +740,13 @@ impl MixturePredictor {
                     let lp = self.experts[0].predictor.pdf_next()?[y].max(PDF_MIN).ln();
                     self.experts[0].cum_log_loss -= lp;
                     self.experts[0].predictor.update(symbol)?;
-                    self.neural.update_history(symbol);
+                    self.analyzer.update(symbol);
+                    self.neural.set_context_state(self.analyzer.state());
                     self.valid = false;
                     return Ok(());
                 }
                 let n = self.experts.len();
+                self.neural.set_context_state(self.analyzer.state());
                 self.neural_logps.resize(n, 0.0);
                 for i in 0..n {
                     let p = self.experts[i].predictor.pdf_next()?[y].max(PDF_MIN);
@@ -740,7 +760,8 @@ impl MixturePredictor {
                 for e in &mut self.experts {
                     e.predictor.update(symbol)?;
                 }
-                self.neural.update_history(symbol);
+                self.analyzer.update(symbol);
+                self.neural.set_context_state(self.analyzer.state());
             }
         }
 
@@ -767,11 +788,12 @@ impl MixturePredictor {
         self.scratch.resize(n, 0.0);
         match self.kind {
             MixtureKind::Neural if n > 1 => {
+                self.neural.set_context_state(self.analyzer.state());
                 self.neural.evaluate_expert_weights();
                 self.scratch.copy_from_slice(self.neural.expert_weights());
             }
             _ => {
-                let lw_norm = logsumexp(self.experts.iter().map(|e| e.log_weight));
+                let lw_norm = logsumexp_expert_weights(&self.experts);
                 for (i, expert) in self.experts.iter().enumerate() {
                     self.scratch[i] = (expert.log_weight - lw_norm).exp();
                 }
@@ -897,7 +919,7 @@ impl MixturePredictor {
                 for i in 0..n {
                     self.scratch[i] = self.experts[i].log_weight + self.neural_logps[i];
                 }
-                let log_mix = logsumexp(self.scratch.iter().take(n).copied());
+                let log_mix = logsumexp_slice(&self.scratch[..n]);
                 for i in 0..n {
                     self.experts[i].log_weight += self.neural_logps[i] - log_mix;
                 }
@@ -907,7 +929,7 @@ impl MixturePredictor {
                     self.scratch[i] =
                         self.decay * self.experts[i].log_weight + self.neural_logps[i];
                 }
-                let log_mix = logsumexp(self.scratch.iter().take(n).copied());
+                let log_mix = logsumexp_slice(&self.scratch[..n]);
                 for i in 0..n {
                     self.experts[i].log_weight = self.scratch[i] - log_mix;
                 }
@@ -923,7 +945,7 @@ impl MixturePredictor {
                     );
                     self.scratch[i] = switched + self.neural_logps[i];
                 }
-                let log_mix = logsumexp(self.scratch.iter().take(n).copied());
+                let log_mix = logsumexp_slice(&self.scratch[..n]);
                 for i in 0..n {
                     self.experts[i].log_weight = self.scratch[i] - log_mix;
                 }
@@ -931,11 +953,13 @@ impl MixturePredictor {
             MixtureKind::Mdl => {}
             MixtureKind::Neural => {
                 if n > 1 {
+                    self.neural.set_context_state(self.analyzer.state());
                     self.neural.evaluate_symbol(&self.neural_logps, PDF_MIN);
                     self.neural
                         .update_weights_symbol(&self.neural_logps, PDF_MIN);
                 }
-                self.neural.update_history(symbol);
+                self.analyzer.update(symbol);
+                self.neural.set_context_state(self.analyzer.state());
             }
         }
         self.valid = false;
@@ -947,6 +971,21 @@ impl MixturePredictor {
 #[allow(clippy::large_enum_variant)]
 enum RatePdfPredictor {
     Rosa(RosaPredictor),
+    Match {
+        model: MatchModel,
+        pdf: Vec<f64>,
+        valid: bool,
+    },
+    SparseMatch {
+        model: SparseMatchModel,
+        pdf: Vec<f64>,
+        valid: bool,
+    },
+    Ppmd {
+        model: PpmdModel,
+        pdf: Vec<f64>,
+        valid: bool,
+    },
     Ctw(CtwPredictor),
     FacCtw(CtwPredictor),
     #[cfg(feature = "backend-mamba")]
@@ -956,12 +995,61 @@ enum RatePdfPredictor {
     Zpaq(ZpaqPredictor),
     Mixture(MixturePredictor),
     Particle(crate::particle::ParticleRuntime),
+    Calibrated {
+        base: Box<RatePdfPredictor>,
+        core: CalibratorCore,
+        pdf: Vec<f64>,
+        valid: bool,
+    },
 }
 
 impl RatePdfPredictor {
     fn from_rate_backend(backend: RateBackend, max_order: i64) -> Result<Self> {
         match backend {
             RateBackend::RosaPlus => Ok(Self::Rosa(RosaPredictor::new(max_order))),
+            RateBackend::Match {
+                hash_bits,
+                min_len,
+                max_len,
+                base_mix,
+                confidence_scale,
+            } => Ok(Self::Match {
+                model: MatchModel::new_contiguous(
+                    hash_bits,
+                    min_len,
+                    max_len,
+                    base_mix,
+                    confidence_scale,
+                ),
+                pdf: vec![0.0; 256],
+                valid: false,
+            }),
+            RateBackend::SparseMatch {
+                hash_bits,
+                min_len,
+                max_len,
+                gap_min,
+                gap_max,
+                base_mix,
+                confidence_scale,
+            } => Ok(Self::SparseMatch {
+                model: SparseMatchModel::new(
+                    hash_bits,
+                    min_len,
+                    max_len,
+                    gap_min,
+                    gap_max,
+                    base_mix,
+                    confidence_scale,
+                ),
+                pdf: vec![0.0; 256],
+                valid: false,
+            }),
+            RateBackend::Ppmd { order, memory_mb } => Ok(Self::Ppmd {
+                model: PpmdModel::new(order, memory_mb),
+                pdf: vec![0.0; 256],
+                valid: false,
+            }),
             RateBackend::Ctw { depth } => Ok(Self::Ctw(CtwPredictor::new_ctw(depth))),
             RateBackend::FacCtw {
                 base_depth,
@@ -990,25 +1078,49 @@ impl RatePdfPredictor {
             RateBackend::Particle { spec } => Ok(Self::Particle(
                 crate::particle::ParticleRuntime::new(spec.as_ref()),
             )),
+            RateBackend::Calibrated { spec } => Ok(Self::Calibrated {
+                base: Box::new(Self::from_rate_backend(spec.base.clone(), max_order)?),
+                core: build_calibrator(spec.as_ref()),
+                pdf: vec![1.0 / 256.0; 256],
+                valid: false,
+            }),
         }
     }
 
     fn begin_stream(&mut self, total_len: usize) -> Result<()> {
         match self {
-            Self::Rosa(_) | Self::Ctw(_) | Self::FacCtw(_) | Self::Zpaq(_) | Self::Particle(_) => {
+            Self::Rosa(m) => {
+                m.begin_stream(total_len);
                 Ok(())
             }
+            Self::Match { .. }
+            | Self::SparseMatch { .. }
+            | Self::Ppmd { .. }
+            | Self::Ctw(_)
+            | Self::FacCtw(_)
+            | Self::Zpaq(_)
+            | Self::Particle(_) => Ok(()),
             #[cfg(feature = "backend-mamba")]
             Self::Mamba(m) => m.begin_stream(total_len),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => m.begin_stream(total_len),
             Self::Mixture(m) => m.begin_stream(total_len),
+            Self::Calibrated { base, .. } => base.begin_stream(total_len),
         }
     }
 
     fn pdf_next(&mut self) -> Result<&[f64]> {
         match self {
             Self::Rosa(m) => Ok(m.pdf_next()),
+            Self::Match { model, pdf, valid } => {
+                if !*valid {
+                    let mut row = [0.0; 256];
+                    model.fill_pdf(&mut row);
+                    pdf.copy_from_slice(&row);
+                    *valid = true;
+                }
+                Ok(pdf)
+            }
             Self::Ctw(m) => Ok(m.pdf_next()),
             Self::FacCtw(m) => Ok(m.pdf_next()),
             #[cfg(feature = "backend-mamba")]
@@ -1018,6 +1130,38 @@ impl RatePdfPredictor {
             Self::Zpaq(m) => Ok(m.pdf_next()),
             Self::Mixture(m) => m.ensure_pdf(),
             Self::Particle(m) => Ok(m.pdf_next()),
+            Self::SparseMatch { model, pdf, valid } => {
+                if !*valid {
+                    let mut row = [0.0; 256];
+                    model.fill_pdf(&mut row);
+                    pdf.copy_from_slice(&row);
+                    *valid = true;
+                }
+                Ok(pdf)
+            }
+            Self::Ppmd { model, pdf, valid } => {
+                if !*valid {
+                    let mut row = [0.0; 256];
+                    model.fill_pdf(&mut row);
+                    pdf.copy_from_slice(&row);
+                    *valid = true;
+                }
+                Ok(pdf)
+            }
+            Self::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+            } => {
+                if !*valid {
+                    let base_pdf = base.pdf_next()?;
+                    core.apply_pdf(base_pdf, pdf);
+                    normalize_pdf(pdf);
+                    *valid = true;
+                }
+                Ok(pdf)
+            }
         }
     }
 
@@ -1025,6 +1169,21 @@ impl RatePdfPredictor {
         match self {
             Self::Rosa(m) => {
                 m.update(symbol);
+                Ok(())
+            }
+            Self::Match { model, valid, .. } => {
+                model.update(symbol);
+                *valid = false;
+                Ok(())
+            }
+            Self::SparseMatch { model, valid, .. } => {
+                model.update(symbol);
+                *valid = false;
+                Ok(())
+            }
+            Self::Ppmd { model, valid, .. } => {
+                model.update(symbol);
+                *valid = false;
                 Ok(())
             }
             Self::Ctw(m) => {
@@ -1046,6 +1205,22 @@ impl RatePdfPredictor {
             Self::Mixture(m) => m.update(symbol),
             Self::Particle(m) => {
                 m.step(symbol);
+                Ok(())
+            }
+            Self::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+            } => {
+                if !*valid {
+                    let base_pdf = base.pdf_next()?;
+                    core.apply_pdf(base_pdf, pdf);
+                    normalize_pdf(pdf);
+                }
+                core.update(symbol, pdf);
+                base.update(symbol)?;
+                *valid = false;
                 Ok(())
             }
         }
@@ -1357,10 +1532,10 @@ fn normalize_pdf(pdf: &mut [f64]) {
     }
 }
 
-fn logsumexp<I: Iterator<Item = f64>>(it: I) -> f64 {
-    let vals: Vec<f64> = it.collect();
+#[inline]
+fn logsumexp_slice(vals: &[f64]) -> f64 {
     let mut m = f64::NEG_INFINITY;
-    for &v in &vals {
+    for &v in vals {
         if v > m {
             m = v;
         }
@@ -1369,8 +1544,26 @@ fn logsumexp<I: Iterator<Item = f64>>(it: I) -> f64 {
         return m;
     }
     let mut s = 0.0;
-    for &v in &vals {
+    for &v in vals {
         s += (v - m).exp();
+    }
+    m + s.ln()
+}
+
+#[inline]
+fn logsumexp_expert_weights(experts: &[MixExpert]) -> f64 {
+    let mut m = f64::NEG_INFINITY;
+    for e in experts {
+        if e.log_weight > m {
+            m = e.log_weight;
+        }
+    }
+    if !m.is_finite() {
+        return m;
+    }
+    let mut s = 0.0;
+    for e in experts {
+        s += (e.log_weight - m).exp();
     }
     m + s.ln()
 }
@@ -1473,6 +1666,58 @@ mod tests {
     fn roundtrip_rate_ac_ctw() {
         let data = b"ctw backend roundtrip payload";
         let backend = RateBackend::Ctw { depth: 8 };
+        let enc =
+            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_rate_ac_match_family_and_ppmd() {
+        let data = b"repeat repeat repeat sparse sparse repeat payload";
+        for backend in [
+            RateBackend::Match {
+                hash_bits: 20,
+                min_len: 4,
+                max_len: 255,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            },
+            RateBackend::SparseMatch {
+                hash_bits: 19,
+                min_len: 3,
+                max_len: 64,
+                gap_min: 1,
+                gap_max: 2,
+                base_mix: 0.05,
+                confidence_scale: 1.0,
+            },
+            RateBackend::Ppmd {
+                order: 8,
+                memory_mb: 8,
+            },
+        ] {
+            let enc = compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed)
+                .unwrap();
+            let dec = decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed)
+                .unwrap();
+            assert_eq!(dec, data);
+        }
+    }
+
+    #[test]
+    fn roundtrip_rate_ac_calibrated_backend() {
+        let data = b"calibration wrapper payload calibration wrapper payload";
+        let backend = RateBackend::Calibrated {
+            spec: Arc::new(crate::CalibratedSpec {
+                base: RateBackend::Ctw { depth: 8 },
+                context: crate::CalibrationContextKind::Text,
+                bins: 33,
+                learning_rate: 0.02,
+                bias_clip: 4.0,
+            }),
+        };
         let enc =
             compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =

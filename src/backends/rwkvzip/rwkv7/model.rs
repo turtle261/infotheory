@@ -385,6 +385,7 @@ struct LayerTrainTrace {
     nu: Tensor1D,
     w_hidden: Tensor1D,
     w_pre: Tensor1D,
+    w_sigmoid: Tensor1D,
     w_decay: Tensor1D,
     a_hidden: Tensor1D,
     a: Tensor1D,
@@ -435,6 +436,7 @@ impl LayerTrainTrace {
             nu: Tensor1D::zeros(c),
             w_hidden: Tensor1D::zeros(cfg.decay_low_rank),
             w_pre: Tensor1D::zeros(c),
+            w_sigmoid: Tensor1D::zeros(c),
             w_decay: Tensor1D::zeros(c),
             a_hidden: Tensor1D::zeros(cfg.a_low_rank),
             a: Tensor1D::zeros(c),
@@ -2407,7 +2409,7 @@ impl Model {
             // W low-rank backward.
             let inv_sqrt_e = 1.0 / std::f32::consts::E.sqrt();
             for col in 0..c {
-                let sig = sigmoid(tr.w_pre[col]);
+                let sig = tr.w_sigmoid[col];
                 let d_sig = scratch.grad_param[col] * (-inv_sqrt_e) * tr.w_decay[col];
                 scratch.grad_param[col] = d_sig * sig * (1.0 - sig); // d w_pre
             }
@@ -3320,8 +3322,17 @@ impl Model {
         }
         // Step 4: exp(-sigmoid(x) / sqrt(e))
         let inv_sqrt_e = 1.0 / std::f32::consts::E.sqrt();
-        kernel::sigmoid_avx(scratch.w_decay.as_ptr(), scratch.w_decay.as_mut_ptr(), c);
-        kernel::exp_neg_scaled_inplace(scratch.w_decay.as_mut_ptr(), inv_sqrt_e, c);
+        kernel::sigmoid_exp_neg_scaled_avx(
+            scratch.w_decay.as_ptr(),
+            scratch.w_decay.as_mut_ptr(),
+            if CAPTURE {
+                (*trace).w_sigmoid.as_mut_ptr()
+            } else {
+                std::ptr::null_mut()
+            },
+            inv_sqrt_e,
+            c,
+        );
         if CAPTURE {
             let tr = &mut *trace;
             tr.w_decay.copy_from(&scratch.w_decay);
@@ -3397,7 +3408,6 @@ impl Model {
             if CAPTURE {
                 let tr = &mut *trace;
                 tr.uses_v_residual = false;
-                tr.nu.zero();
                 tr.v.copy_from(&scratch.v);
             }
         } else if state.v_first_set
@@ -3448,7 +3458,6 @@ impl Model {
         } else if CAPTURE {
             let tr = &mut *trace;
             tr.uses_v_residual = false;
-            tr.nu.zero();
             tr.v.copy_from(&scratch.v);
         }
 
@@ -3634,11 +3643,6 @@ impl Model {
             tr.ffn_out.copy_from(&scratch.ffn_out);
         }
     }
-}
-
-#[inline(always)]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
 }
 
 fn layer_norm_backward(

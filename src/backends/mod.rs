@@ -5,18 +5,23 @@
 //! - feature-aware availability reporting,
 //! - exported lists of enabled backend families.
 
+pub mod calibration;
 pub mod ctw;
 /// Shared policy parser/compiler for online LLM backends.
 pub mod llm_policy;
 /// Mamba-1 based rate/compression backend.
 #[cfg(feature = "backend-mamba")]
 pub mod mambazip;
+pub mod match_model;
 /// Particle-latent rate backend.
 pub mod particle;
+pub mod ppmd;
 pub mod rosaplus;
 /// RWKV7-based rate/compression backend.
 #[cfg(feature = "backend-rwkv")]
 pub mod rwkvzip;
+pub mod sparse_match;
+pub mod text_context;
 pub mod zpaq_rate;
 use crate::coders::CoderType;
 
@@ -40,6 +45,10 @@ pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     "rosaplus",
     "ctw",
     "fac-ctw",
+    "match",
+    "sparse-match",
+    "ppmd",
+    "calibrated",
     "mamba",
     "rwkv7",
     #[cfg(feature = "backend-zpaq")]
@@ -53,6 +62,10 @@ pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     "rosaplus",
     "ctw",
     "fac-ctw",
+    "match",
+    "sparse-match",
+    "ppmd",
+    "calibrated",
     "mamba",
     #[cfg(feature = "backend-zpaq")]
     "zpaq",
@@ -65,6 +78,10 @@ pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     "rosaplus",
     "ctw",
     "fac-ctw",
+    "match",
+    "sparse-match",
+    "ppmd",
+    "calibrated",
     "rwkv7",
     #[cfg(feature = "backend-zpaq")]
     "zpaq",
@@ -77,6 +94,10 @@ pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     "rosaplus",
     "ctw",
     "fac-ctw",
+    "match",
+    "sparse-match",
+    "ppmd",
+    "calibrated",
     #[cfg(feature = "backend-zpaq")]
     "zpaq",
     "mixture",
@@ -103,6 +124,12 @@ pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
         "rosaplus" | "rosa" => Some(BackendAvailability::Enabled("rosaplus")),
         "ctw" => Some(BackendAvailability::Enabled("ctw")),
         "fac-ctw" | "facctw" => Some(BackendAvailability::Enabled("fac-ctw")),
+        "match" => Some(BackendAvailability::Enabled("match")),
+        "sparse-match" | "sparse_match" | "sparsematch" => {
+            Some(BackendAvailability::Enabled("sparse-match"))
+        }
+        "ppmd" | "ppm" => Some(BackendAvailability::Enabled("ppmd")),
+        "calibrated" | "cal" => Some(BackendAvailability::Enabled("calibrated")),
         "zpaq" => {
             if cfg!(feature = "backend-zpaq") {
                 Some(BackendAvailability::Enabled("zpaq"))

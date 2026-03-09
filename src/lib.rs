@@ -93,13 +93,19 @@ pub use backends::ctw;
 #[cfg(feature = "backend-mamba")]
 /// Mamba backend types and compressor.
 pub use backends::mambazip;
+/// Match-based repeat predictor.
+pub use backends::match_model;
 /// Particle-latent filter ensemble rate backend.
 pub use backends::particle;
+/// PPMD-style byte model.
+pub use backends::ppmd;
 /// ROSA+ backend types.
 pub use backends::rosaplus;
 #[cfg(feature = "backend-rwkv")]
 /// RWKV backend types and compressor.
 pub use backends::rwkvzip;
+/// Sparse/gapped match predictor.
+pub use backends::sparse_match;
 /// ZPAQ rate-model adapter.
 pub use backends::zpaq_rate;
 
@@ -232,6 +238,43 @@ pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBacken
 pub enum RateBackend {
     /// ROSA+ suffix-automaton estimator.
     RosaPlus,
+    /// Local contiguous match predictor.
+    Match {
+        /// Number of retained hash bits for suffix lookup.
+        hash_bits: usize,
+        /// Minimum repeat length required before predicting.
+        min_len: usize,
+        /// Maximum repeat length used for confidence scaling.
+        max_len: usize,
+        /// Residual probability mass left for non-match symbols.
+        base_mix: f64,
+        /// Confidence multiplier applied to short-match tapering.
+        confidence_scale: f64,
+    },
+    /// Sparse/gapped local match predictor.
+    SparseMatch {
+        /// Number of retained hash bits for spaced-suffix lookup.
+        hash_bits: usize,
+        /// Minimum spaced repeat length required before predicting.
+        min_len: usize,
+        /// Maximum spaced repeat length used for confidence scaling.
+        max_len: usize,
+        /// Minimum gap between matched bytes.
+        gap_min: usize,
+        /// Maximum gap between matched bytes.
+        gap_max: usize,
+        /// Residual probability mass left for non-match symbols.
+        base_mix: f64,
+        /// Confidence multiplier applied to short-match tapering.
+        confidence_scale: f64,
+    },
+    /// Pure-Rust bounded-memory PPMD-style model.
+    Ppmd {
+        /// Maximum context order.
+        order: usize,
+        /// Approximate memory budget in MiB.
+        memory_mb: usize,
+    },
     #[cfg(feature = "backend-mamba")]
     /// Mamba model loaded from explicit weights.
     Mamba {
@@ -270,6 +313,11 @@ pub enum RateBackend {
     Particle {
         /// Particle filter specification.
         spec: Arc<ParticleSpec>,
+    },
+    /// Calibrated wrapper over another bytewise backend.
+    Calibrated {
+        /// Calibration specification.
+        spec: Arc<CalibratedSpec>,
     },
     /// Action-Conditional CTW (single context tree).
     Ctw {
@@ -347,6 +395,36 @@ pub enum MixtureKind {
     Mdl,
     /// Bytewise neural logistic mixer (fx2-cmix style adaptation).
     Neural,
+}
+
+/// Fixed context families for calibrated PDF wrappers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CalibrationContextKind {
+    /// Single global calibration row.
+    Global,
+    /// Previous-byte class only.
+    ByteClass,
+    /// Text-structure-aware context hash.
+    Text,
+    /// Repeat-aware context hash.
+    Repeat,
+    /// Joint text/repeat-aware context hash.
+    TextRepeat,
+}
+
+/// Configuration for a calibrated wrapper rate backend.
+#[derive(Clone)]
+pub struct CalibratedSpec {
+    /// Base backend whose PDF is calibrated.
+    pub base: RateBackend,
+    /// Context family controlling table row selection.
+    pub context: CalibrationContextKind,
+    /// Number of probability bins per row.
+    pub bins: usize,
+    /// Online learning rate for observed-symbol updates.
+    pub learning_rate: f64,
+    /// Symmetric clip applied to calibration weights.
+    pub bias_clip: f64,
 }
 
 /// Expert specification for mixture backends.
@@ -682,6 +760,12 @@ impl InfotheoryCtx {
                     prefix.extend_from_slice(p);
                 }
                 cross_entropy_rate_backend(data, &prefix, -1, &RateBackend::RosaPlus)
+            }
+            RateBackend::Match { .. }
+            | RateBackend::SparseMatch { .. }
+            | RateBackend::Ppmd { .. }
+            | RateBackend::Calibrated { .. } => {
+                prequential_rate_backend(data, prefix_parts, -1, &self.rate_backend)
             }
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
@@ -1210,6 +1294,43 @@ pub fn decompress_bytes_backend(
     }
 }
 
+fn prequential_rate_backend(
+    data: &[u8],
+    prefix_parts: &[&[u8]],
+    max_order: i64,
+    backend: &RateBackend,
+) -> f64 {
+    use crate::mixture::OnlineBytePredictor;
+
+    if data.is_empty() {
+        return 0.0;
+    }
+    let total = prefix_parts
+        .iter()
+        .map(|p| p.len() as u64)
+        .sum::<u64>()
+        .saturating_add(data.len() as u64);
+    let mut predictor = crate::mixture::RateBackendPredictor::from_backend(
+        backend.clone(),
+        max_order,
+        crate::mixture::DEFAULT_MIN_PROB,
+    );
+    predictor
+        .begin_stream(Some(total))
+        .unwrap_or_else(|e| panic!("rate backend stream init failed: {e}"));
+    for prefix in prefix_parts {
+        for &b in *prefix {
+            predictor.update(b);
+        }
+    }
+    let mut bits = 0.0;
+    for &b in data {
+        bits -= predictor.log_prob(b) / std::f64::consts::LN_2;
+        predictor.update(b);
+    }
+    bits / (data.len() as f64)
+}
+
 /// Estimate entropy rate of `data` using the explicit rate `backend`.
 pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
@@ -1217,6 +1338,10 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
             m.predictive_entropy_rate(data)
         }
+        RateBackend::Match { .. }
+        | RateBackend::SparseMatch { .. }
+        | RateBackend::Ppmd { .. }
+        | RateBackend::Calibrated { .. } => prequential_rate_backend(data, &[], max_order, backend),
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
             c.cross_entropy(data)
@@ -1319,6 +1444,10 @@ pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBa
             m.build_lm();
             m.cross_entropy(data)
         }
+        RateBackend::Match { .. }
+        | RateBackend::SparseMatch { .. }
+        | RateBackend::Ppmd { .. }
+        | RateBackend::Calibrated { .. } => entropy_rate_backend(data, max_order, backend),
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
             c.cross_entropy(data)
@@ -1362,6 +1491,12 @@ pub fn cross_entropy_rate_backend(
             m.train_example(train_data);
             m.build_lm();
             m.cross_entropy(test_data)
+        }
+        RateBackend::Match { .. }
+        | RateBackend::SparseMatch { .. }
+        | RateBackend::Ppmd { .. }
+        | RateBackend::Calibrated { .. } => {
+            prequential_rate_backend(test_data, &[train_data], max_order, backend)
         }
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => {
@@ -1498,6 +1633,20 @@ pub fn joint_entropy_rate_backend(
                 .collect();
             let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
             m.entropy_rate_cps(&joint_symbols)
+        }
+        RateBackend::Match { .. }
+        | RateBackend::SparseMatch { .. }
+        | RateBackend::Ppmd { .. }
+        | RateBackend::Calibrated { .. } => {
+            if x.is_empty() {
+                return 0.0;
+            }
+            let mut joint = Vec::with_capacity(x.len() * 2);
+            for i in 0..x.len() {
+                joint.push(x[i]);
+                joint.push(y[i]);
+            }
+            entropy_rate_backend(&joint, max_order, backend) * 2.0
         }
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
