@@ -2696,9 +2696,26 @@ mod tests {
     #[cfg(not(feature = "backend-zpaq"))]
     #[test]
     #[should_panic(expected = "CompressionBackend::Zpaq is unavailable")]
-    fn zpaq_disabled_size_paths_fail_loudly() {
-        let backend = CompressionBackend::default();
+    fn explicit_zpaq_backend_fails_loudly() {
+        let backend = CompressionBackend::Zpaq {
+            method: "5".to_string(),
+        };
         let _ = compress_size_backend(b"abc", &backend);
+    }
+
+    #[cfg(not(feature = "backend-zpaq"))]
+    #[test]
+    fn default_compression_backend_falls_back_to_rate_coding() {
+        let backend = CompressionBackend::default();
+        assert!(matches!(
+            &backend,
+            CompressionBackend::Rate {
+                coder: crate::coders::CoderType::AC,
+                framing: crate::compression::FramingMode::Raw,
+                ..
+            }
+        ));
+        assert!(compress_size_backend(b"abc", &backend) > 0);
     }
 
     #[test]

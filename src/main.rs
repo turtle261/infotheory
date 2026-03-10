@@ -688,6 +688,7 @@ fn parse_nyx_environment_config(
     observation_bits: usize,
     reward_bits: usize,
     agent_horizon: usize,
+    base_dir: &Path,
 ) -> anyhow::Result<NyxVmConfig> {
     let vm = &v["vm_config"];
     if vm.is_null() {
@@ -734,6 +735,7 @@ fn parse_nyx_environment_config(
             &v["vm_stats_backend"]
         },
         v,
+        base_dir,
     )?;
     let trace = parse_nyx_trace_config(if !vm["trace"].is_null() {
         &vm["trace"]
@@ -823,6 +825,7 @@ fn parse_nyx_environment_config(
 fn parse_vm_stats_backend(
     cfg: &serde_json::Value,
     root: &serde_json::Value,
+    base_dir: &Path,
 ) -> anyhow::Result<RateBackend> {
     let fallback = default_vm_stats_backend(root)?;
     if cfg.is_null() {
@@ -837,25 +840,25 @@ fn parse_vm_stats_backend(
         .unwrap_or("rosaplus");
 
     let resolved = match infotheory::backends::resolve_rate_backend_name(name) {
-        Some(infotheory::backends::BackendAvailability::Enabled(name)) => Some(name),
+        Some(infotheory::backends::BackendAvailability::Enabled(name)) => name,
         Some(infotheory::backends::BackendAvailability::Disabled { canonical, feature }) => {
             return Err(anyhow::anyhow!(
                 "rate backend '{canonical}' requires infotheory feature '{feature}'"
             ));
         }
-        None => None,
+        None => return Err(anyhow::anyhow!("unknown vm stats backend '{name}'")),
     };
 
     match resolved {
-        Some("rosaplus") => Ok(RateBackend::RosaPlus),
-        Some("ctw") => {
+        "rosaplus" => Ok(RateBackend::RosaPlus),
+        "ctw" => {
             let depth = cfg["ct_depth"]
                 .as_u64()
                 .or_else(|| cfg["depth"].as_u64())
                 .unwrap_or(32) as usize;
             Ok(RateBackend::Ctw { depth })
         }
-        Some("fac-ctw") => {
+        "fac-ctw" => {
             let base_depth = cfg["base_depth"]
                 .as_u64()
                 .or_else(|| cfg["ct_depth"].as_u64())
@@ -878,7 +881,7 @@ fn parse_vm_stats_backend(
                 encoding_bits,
             })
         }
-        Some("mamba") => {
+        "mamba" => {
             #[cfg(feature = "backend-mamba")]
             {
                 if let Some(method) = cfg["method"]
@@ -906,17 +909,26 @@ fn parse_vm_stats_backend(
                 ))
             }
         }
-        Some("rwkv7") => {
+        "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
-                let path = cfg["rwkv_model_path"]
+                if let Some(method) = cfg["method"]
                     .as_str()
-                    .or_else(|| cfg["model_path"].as_str())
-                    .or_else(|| root["rwkv_model_path"].as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(rwkv7_model_path_from_env);
-                let model = load_rwkv7_model_from_path(&path);
-                Ok(RateBackend::Rwkv7 { model })
+                    .or_else(|| cfg["rwkv_method"].as_str())
+                {
+                    Ok(RateBackend::Rwkv7Method {
+                        method: method.to_string(),
+                    })
+                } else {
+                    let path = cfg["rwkv_model_path"]
+                        .as_str()
+                        .or_else(|| cfg["model_path"].as_str())
+                        .or_else(|| root["rwkv_model_path"].as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(rwkv7_model_path_from_env);
+                    let model = load_rwkv7_model_from_path(&path);
+                    Ok(RateBackend::Rwkv7 { model })
+                }
             }
             #[cfg(not(feature = "backend-rwkv"))]
             {
@@ -925,7 +937,7 @@ fn parse_vm_stats_backend(
                 ))
             }
         }
-        Some("zpaq") => {
+        "zpaq" => {
             let method = cfg["method"]
                 .as_str()
                 .or_else(|| cfg["zpaq_method"].as_str())
@@ -939,19 +951,85 @@ fn parse_vm_stats_backend(
             }
             Ok(RateBackend::Zpaq { method })
         }
-        Some("mixture") => {
-            let spec_path = cfg["mixture_spec"]
+        "match" => Ok(RateBackend::Match {
+            hash_bits: cfg["hash_bits"].as_u64().unwrap_or(20) as usize,
+            min_len: cfg["min_len"].as_u64().unwrap_or(4) as usize,
+            max_len: cfg["max_len"].as_u64().unwrap_or(255) as usize,
+            base_mix: cfg["base_mix"].as_f64().unwrap_or(0.02),
+            confidence_scale: cfg["confidence_scale"].as_f64().unwrap_or(1.0),
+        }),
+        "sparse-match" => Ok(RateBackend::SparseMatch {
+            hash_bits: cfg["hash_bits"].as_u64().unwrap_or(19) as usize,
+            min_len: cfg["min_len"].as_u64().unwrap_or(3) as usize,
+            max_len: cfg["max_len"].as_u64().unwrap_or(64) as usize,
+            gap_min: cfg["gap_min"].as_u64().unwrap_or(1) as usize,
+            gap_max: cfg["gap_max"].as_u64().unwrap_or(2) as usize,
+            base_mix: cfg["base_mix"].as_f64().unwrap_or(0.05),
+            confidence_scale: cfg["confidence_scale"].as_f64().unwrap_or(1.0),
+        }),
+        "ppmd" => Ok(RateBackend::Ppmd {
+            order: cfg["order"].as_u64().unwrap_or(10) as usize,
+            memory_mb: cfg["memory_mb"].as_u64().unwrap_or(64) as usize,
+        }),
+        "mixture" => {
+            let spec = if let Some(spec_v) = cfg.get("spec").filter(|value| value.is_object()) {
+                parse_mixture_spec_value(spec_v, base_dir, MAX_MIXTURE_NESTING)?
+            } else if let Some(path) = cfg["mixture_spec"]
                 .as_str()
                 .or_else(|| cfg["spec_path"].as_str())
                 .or_else(|| cfg["spec"].as_str())
                 .or_else(|| root["mixture_spec"].as_str())
-                .ok_or_else(|| anyhow::anyhow!("mixture stats backend requires mixture_spec"))?;
-            let spec = load_mixture_spec(spec_path)?;
+            {
+                let full = base_dir.join(path);
+                load_mixture_spec(full.to_str().unwrap_or(path))?
+            } else {
+                return Err(anyhow::anyhow!(
+                    "mixture stats backend requires inline 'spec' or 'mixture_spec' path"
+                ));
+            };
             Ok(RateBackend::Mixture {
                 spec: Arc::new(spec),
             })
         }
-        _ => Ok(fallback),
+        "particle" => {
+            let spec = if let Some(spec_v) = cfg.get("spec").filter(|value| value.is_object()) {
+                parse_particle_spec_value(spec_v)?
+            } else if let Some(path) = cfg["particle_spec"]
+                .as_str()
+                .or_else(|| cfg["spec_path"].as_str())
+                .or_else(|| cfg["spec"].as_str())
+                .or_else(|| root["particle_spec"].as_str())
+            {
+                let full = base_dir.join(path);
+                load_particle_spec(full.to_str().unwrap_or(path))?
+            } else {
+                parse_particle_spec_value(cfg)?
+            };
+            spec.validate()
+                .map_err(|e| anyhow::anyhow!("invalid particle spec: {e}"))?;
+            Ok(RateBackend::Particle {
+                spec: Arc::new(spec),
+            })
+        }
+        "calibrated" => {
+            let spec = if let Some(spec_v) = cfg.get("spec").filter(|value| value.is_object()) {
+                parse_calibrated_spec_value(spec_v, base_dir, 4)?
+            } else if let Some(path) = cfg["calibrated_spec"]
+                .as_str()
+                .or_else(|| cfg["spec_path"].as_str())
+                .or_else(|| cfg["spec"].as_str())
+                .or_else(|| root["calibrated_spec"].as_str())
+            {
+                let full = base_dir.join(path);
+                load_calibrated_spec(full.to_str().unwrap_or(path))?
+            } else {
+                parse_calibrated_spec_value(cfg, base_dir, 4)?
+            };
+            Ok(RateBackend::Calibrated {
+                spec: Arc::new(spec),
+            })
+        }
+        other => Err(anyhow::anyhow!("unsupported vm stats backend '{other}'")),
     }
 }
 
@@ -1683,18 +1761,18 @@ fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
 
 fn maybe_export_online_model(
     export_path: Option<&str>,
-    ctx: &InfotheoryCtx,
-    parts: &[&[u8]],
+    _ctx: &InfotheoryCtx,
+    _parts: &[&[u8]],
 ) -> anyhow::Result<()> {
-    let Some(path) = export_path else {
+    let Some(_path) = export_path else {
         return Ok(());
     };
 
     #[cfg(feature = "backend-rwkv")]
     {
-        let rwkv_method = match &ctx.rate_backend {
+        let rwkv_method = match &_ctx.rate_backend {
             RateBackend::Rwkv7Method { method } => Some(method.as_str()),
-            _ => match &ctx.compression_backend {
+            _ => match &_ctx.compression_backend {
                 CompressionBackend::Rate {
                     rate_backend: RateBackend::Rwkv7Method { method },
                     ..
@@ -1704,17 +1782,17 @@ fn maybe_export_online_model(
         };
         if let Some(method) = rwkv_method {
             let mut compressor = rwkvzip::Compressor::new_from_method(method)?;
-            let _ = compressor.compress_size_chain(parts, infotheory::coders::CoderType::AC)?;
-            compressor.export_online(path)?;
+            let _ = compressor.compress_size_chain(_parts, infotheory::coders::CoderType::AC)?;
+            compressor.export_online(_path)?;
             return Ok(());
         }
     }
 
     #[cfg(feature = "backend-mamba")]
     {
-        let mamba_method = match &ctx.rate_backend {
+        let mamba_method = match &_ctx.rate_backend {
             RateBackend::MambaMethod { method } => Some(method.as_str()),
-            _ => match &ctx.compression_backend {
+            _ => match &_ctx.compression_backend {
                 CompressionBackend::Rate {
                     rate_backend: RateBackend::MambaMethod { method },
                     ..
@@ -1724,8 +1802,8 @@ fn maybe_export_online_model(
         };
         if let Some(method) = mamba_method {
             let mut compressor = mambazip::Compressor::new_from_method(method)?;
-            let _ = compressor.compress_size_chain(parts, infotheory::coders::CoderType::AC)?;
-            compressor.export_online(path)?;
+            let _ = compressor.compress_size_chain(_parts, infotheory::coders::CoderType::AC)?;
+            compressor.export_online(_path)?;
             return Ok(());
         }
     }
@@ -2149,8 +2227,14 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
                 let observation_bits = v["observation_bits"].as_u64().unwrap_or(16) as usize;
                 let reward_bits = v["reward_bits"].as_u64().unwrap_or(8) as usize;
                 let agent_horizon = v["agent_horizon"].as_u64().unwrap_or(3) as usize;
-                let vm_cfg =
-                    parse_nyx_environment_config(&v, observation_bits, reward_bits, agent_horizon)?;
+                let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
+                let vm_cfg = parse_nyx_environment_config(
+                    &v,
+                    observation_bits,
+                    reward_bits,
+                    agent_horizon,
+                    config_dir,
+                )?;
                 Box::new(NyxVmEnvironment::new(vm_cfg)?)
             }
         }
@@ -3069,5 +3153,87 @@ mod tests {
         assert_eq!(spec.alpha, 0.03);
         assert_eq!(spec.experts.len(), 2);
         assert!(matches!(spec.kind, MixtureKind::Bayes));
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn parse_vm_stats_backend_supports_new_backends_and_rejects_unknowns() {
+        let root = json!({
+            "algorithm": "ctw",
+            "ct_depth": 8,
+            "observation_bits": 8,
+            "reward_bits": 8
+        });
+        let base_dir = Path::new(".");
+
+        let matched =
+            parse_vm_stats_backend(&json!({"name":"match","hash_bits":18}), &root, base_dir)
+                .expect("match backend should parse");
+        assert!(matches!(matched, RateBackend::Match { hash_bits: 18, .. }));
+
+        let sparse = parse_vm_stats_backend(
+            &json!({"name":"sparse-match","gap_min":2,"gap_max":4}),
+            &root,
+            base_dir,
+        )
+        .expect("sparse-match backend should parse");
+        assert!(matches!(
+            sparse,
+            RateBackend::SparseMatch {
+                gap_min: 2,
+                gap_max: 4,
+                ..
+            }
+        ));
+
+        let ppmd = parse_vm_stats_backend(&json!({"name":"ppmd","order":12}), &root, base_dir)
+            .expect("ppmd backend should parse");
+        assert!(matches!(ppmd, RateBackend::Ppmd { order: 12, .. }));
+
+        let particle = parse_vm_stats_backend(
+            &json!({
+                "name":"particle",
+                "spec":{"num_particles":4,"num_cells":4,"cell_dim":8}
+            }),
+            &root,
+            base_dir,
+        )
+        .expect("particle backend should parse");
+        assert!(matches!(particle, RateBackend::Particle { .. }));
+
+        let mixture = parse_vm_stats_backend(
+            &json!({
+                "name":"mixture",
+                "spec":{"kind":"bayes","experts":[{"kind":"match"}]}
+            }),
+            &root,
+            base_dir,
+        )
+        .expect("mixture backend should parse");
+        assert!(matches!(mixture, RateBackend::Mixture { .. }));
+
+        let calibrated = parse_vm_stats_backend(
+            &json!({
+                "name":"calibrated",
+                "base":{"kind":"ctw","depth":8},
+                "context":"text",
+                "bins":17,
+                "learning_rate":0.05,
+                "bias_clip":3.0
+            }),
+            &root,
+            base_dir,
+        )
+        .expect("calibrated backend should parse");
+        assert!(matches!(calibrated, RateBackend::Calibrated { .. }));
+
+        let err = match parse_vm_stats_backend(&json!("unknown-backend"), &root, base_dir) {
+            Ok(_) => panic!("unknown backend should not silently fall back"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unknown vm stats backend"),
+            "unexpected error: {err}"
+        );
     }
 }

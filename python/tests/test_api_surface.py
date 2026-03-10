@@ -1,10 +1,20 @@
+import json
 import math
 
 import infotheory_rs as ait
+import pytest
 
 
 def _is_finite_nonnegative(x: float) -> bool:
     return math.isfinite(x) and x >= 0.0
+
+
+def _rwkv7_cfg_method() -> str:
+    return (
+        "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,"
+        "v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;"
+        "policy:schedule=0..100:infer"
+    )
 
 
 def test_expected_public_surface_symbols_present():
@@ -16,6 +26,8 @@ def test_expected_public_surface_symbols_present():
         "MixtureKind",
         "MixtureExpertSpec",
         "MixtureSpec",
+        "ParticleSpec",
+        "CalibrationContextKind",
         "NcdVariant",
         "ObservationKeyMode",
         "RandomGenerator",
@@ -138,3 +150,128 @@ def test_bit_and_observation_helpers():
         ait.observation_key_from_stream(ait.ObservationKeyMode.StreamHash, stream, 8), int
     )
     assert isinstance(ait.observation_repr_from_stream("last", stream, 8), list)
+
+
+def test_new_rate_backends_parse_and_execute(tmp_path):
+    mixture_path = tmp_path / "mixture.json"
+    mixture_path.write_text(
+        json.dumps(
+            {
+                "kind": "bayes",
+                "experts": [
+                    {"name": "match-expert", "kind": "match"},
+                    {"name": "ctw-expert", "kind": "ctw", "depth": 8},
+                ],
+            }
+        )
+    )
+    particle_path = tmp_path / "particle.json"
+    particle_path.write_text(
+        json.dumps({"num_particles": 4, "num_cells": 4, "cell_dim": 8})
+    )
+    calibrated_path = tmp_path / "calibrated.json"
+    calibrated_path.write_text(
+        json.dumps(
+            {
+                "base": {"kind": "ctw", "depth": 8},
+                "context": "text",
+                "bins": 17,
+                "learning_rate": 0.05,
+                "bias_clip": 3.0,
+            }
+        )
+    )
+
+    parsed_backends = [
+        ait.rate_backend("match"),
+        ait.rate_backend("sparse-match"),
+        ait.rate_backend("ppmd", "12"),
+        ait.rate_backend("mixture", str(mixture_path)),
+        ait.rate_backend("particle", str(particle_path)),
+        ait.rate_backend("calibrated", str(calibrated_path)),
+    ]
+
+    particle_spec = ait.ParticleSpec(num_particles=4, num_cells=4, cell_dim=8)
+    mixture_spec = ait.MixtureSpec(
+        ait.MixtureKind.Bayes,
+        [
+            ait.MixtureExpertSpec(
+                ait.RateBackend.match(), max_order=-1, log_prior=0.0, name="match"
+            )
+        ],
+        alpha=0.02,
+    )
+    constructed_backends = [
+        ait.RateBackend.match(hash_bits=18, min_len=3, max_len=96),
+        ait.RateBackend.sparse_match(gap_min=2, gap_max=4),
+        ait.RateBackend.ppmd(order=8, memory_mb=8),
+        ait.RateBackend.mixture(mixture_spec),
+        ait.RateBackend.particle(particle_spec),
+        ait.RateBackend.calibrated(
+            ait.RateBackend.ctw(8),
+            ait.CalibrationContextKind.Text,
+            bins=17,
+            learning_rate=0.05,
+            bias_clip=3.0,
+        ),
+        ait.RateBackend.calibrated(ait.RateBackend.match(), "repeat", bins=9),
+    ]
+
+    payload = b"abracadabra abracadabra"
+    peer = b"alakazam alakazam"
+    for backend in parsed_backends + constructed_backends:
+        assert _is_finite_nonnegative(ait.entropy_rate_backend(payload, 4, backend=backend))
+        assert _is_finite_nonnegative(
+            ait.cross_entropy_rate_backend(payload, peer, 4, backend=backend)
+        )
+
+    with pytest.raises(ValueError):
+        ait.rate_backend("unknown-backend")
+
+
+def test_rate_coded_roundtrips_cover_ac_and_rans():
+    payload = b"rate coded roundtrip payload"
+
+    match_backend = ait.RateBackend.match()
+    cb_ac = ait.CompressionBackend.rate_ac(match_backend, "framed")
+    enc_ac = ait.compress_bytes_backend(payload, compression_backend=cb_ac)
+    assert ait.decompress_bytes_backend(enc_ac, compression_backend=cb_ac) == payload
+    assert (
+        ait.compress_size_backend(
+            payload,
+            compression_backend="rate-ac",
+            rate_backend=match_backend,
+        )
+        > 0
+    )
+
+    particle_backend = ait.RateBackend.particle(
+        ait.ParticleSpec(num_particles=4, num_cells=4, cell_dim=8)
+    )
+    cb_rans = ait.CompressionBackend.rate_rans(particle_backend, "framed")
+    enc_rans = ait.compress_bytes_backend(payload, compression_backend=cb_rans)
+    assert ait.decompress_bytes_backend(enc_rans, compression_backend=cb_rans) == payload
+    assert (
+        ait.compress_size_backend(
+            payload,
+            compression_backend="rate-rans",
+            rate_backend=particle_backend,
+        )
+        > 0
+    )
+
+
+def test_rwkv7_string_compression_backend_matches_object_backend():
+    method = _rwkv7_cfg_method()
+    payload = b"rwkv parity payload"
+
+    string_encoded = ait.compress_bytes_backend(
+        payload,
+        compression_backend="rwkv7",
+        method=method,
+    )
+    object_backend = ait.CompressionBackend.rwkv7(method)
+    object_encoded = ait.compress_bytes_backend(payload, compression_backend=object_backend)
+
+    assert string_encoded == object_encoded
+    assert len(string_encoded) > 0

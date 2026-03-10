@@ -1,8 +1,8 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use infotheory::{
-    CompressionBackend, InfotheoryCtx, MixtureExpertSpec, MixtureKind, MixtureSpec, NcdVariant,
-    ParticleSpec, RateBackend,
+    CalibratedSpec, CalibrationContextKind, CompressionBackend, InfotheoryCtx, MixtureExpertSpec,
+    MixtureKind, MixtureSpec, NcdVariant, ParticleSpec, RateBackend,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -10,6 +10,7 @@ use pyo3::types::PyBytes;
 #[cfg(feature = "vm")]
 use pyo3::types::PyDict;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 fn py_try<T>(f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
@@ -102,6 +103,9 @@ fn parse_observation_key_mode(
         "ObservationKeyMode must be an ObservationKeyMode enum value or string alias",
     ))
 }
+
+const MAX_MIXTURE_SPEC_NESTING: usize = 8;
+const MAX_CALIBRATED_SPEC_NESTING: usize = 4;
 
 fn parse_particle_spec_json(v: &serde_json::Value) -> PyResult<ParticleSpec> {
     if v.get("experts").is_some() {
@@ -253,10 +257,384 @@ fn parse_particle_spec_json(v: &serde_json::Value) -> PyResult<ParticleSpec> {
     })
 }
 
+fn resolve_spec_path(base_dir: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn load_json_value_from_path(
+    base_dir: &Path,
+    path: &str,
+    label: &str,
+) -> PyResult<(serde_json::Value, PathBuf)> {
+    let full = resolve_spec_path(base_dir, path);
+    let raw = std::fs::read_to_string(&full)
+        .map_err(|e| PyValueError::new_err(format!("failed to read {label} '{path}': {e}")))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| PyValueError::new_err(format!("invalid {label} JSON: {e}")))?;
+    Ok((value, full))
+}
+
+fn parse_calibration_context_kind_alias(s: &str) -> Option<CalibrationContextKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "global" => Some(CalibrationContextKind::Global),
+        "byteclass" | "byte-class" | "byte_class" | "class" => {
+            Some(CalibrationContextKind::ByteClass)
+        }
+        "text" => Some(CalibrationContextKind::Text),
+        "repeat" => Some(CalibrationContextKind::Repeat),
+        "textrepeat" | "text-repeat" | "text_repeat" => Some(CalibrationContextKind::TextRepeat),
+        _ => None,
+    }
+}
+
+fn parse_calibration_context_kind_value(
+    py_obj: &Bound<'_, PyAny>,
+) -> PyResult<CalibrationContextKind> {
+    if let Ok(mode) = py_obj.extract::<PyRef<'_, PyCalibrationContextKind>>() {
+        return Ok(mode.inner);
+    }
+
+    if let Ok(s) = py_obj.extract::<String>() {
+        return parse_calibration_context_kind_alias(&s)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown calibration context '{s}'")));
+    }
+
+    Err(PyValueError::new_err(
+        "CalibrationContextKind must be a CalibrationContextKind enum value or string alias",
+    ))
+}
+
+fn parse_calibration_context_kind_str(value: Option<&str>) -> PyResult<CalibrationContextKind> {
+    parse_calibration_context_kind_alias(value.unwrap_or("text")).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "unknown calibration context '{}'",
+            value.unwrap_or("text")
+        ))
+    })
+}
+
+fn parse_mixture_kind_json(kind: &str) -> PyResult<MixtureKind> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "bayes" | "bayes-mix" | "bayes_mix" => Ok(MixtureKind::Bayes),
+        "fading" | "fading-bayes" | "fading_bayes" => Ok(MixtureKind::FadingBayes),
+        "switch" | "switching" | "switch-mix" | "switch_mix" => Ok(MixtureKind::Switching),
+        "mdl" | "selector" | "mdr" => Ok(MixtureKind::Mdl),
+        "neural" | "mix" | "mixture" => Ok(MixtureKind::Neural),
+        other => Err(PyValueError::new_err(format!(
+            "unknown mixture kind '{other}'"
+        ))),
+    }
+}
+
+fn parse_calibrated_spec_json(
+    v: &serde_json::Value,
+    base_dir: &Path,
+    depth: usize,
+) -> PyResult<CalibratedSpec> {
+    if depth == 0 {
+        return Err(PyValueError::new_err("calibrated spec nesting too deep"));
+    }
+
+    let base_backend = if let Some(base_v) = v.get("base") {
+        parse_rate_backend_json(base_v, base_dir, depth - 1)?
+    } else if let Some(path) = v["base_path"].as_str().or_else(|| v["path"].as_str()) {
+        let (value, full) = load_json_value_from_path(base_dir, path, "calibrated base backend")?;
+        parse_rate_backend_json(&value, full.parent().unwrap_or(base_dir), depth - 1)?
+    } else {
+        return Err(PyValueError::new_err(
+            "calibrated backend requires 'base' or 'base_path'",
+        ));
+    };
+
+    Ok(CalibratedSpec {
+        base: base_backend,
+        context: parse_calibration_context_kind_str(v["context"].as_str())?,
+        bins: v["bins"].as_u64().unwrap_or(33) as usize,
+        learning_rate: v["learning_rate"].as_f64().unwrap_or(0.02),
+        bias_clip: v["bias_clip"].as_f64().unwrap_or(4.0),
+    })
+}
+
+fn parse_mixture_expert_json(
+    v: &serde_json::Value,
+    base_dir: &Path,
+    depth: usize,
+) -> PyResult<MixtureExpertSpec> {
+    if depth == 0 {
+        return Err(PyValueError::new_err("mixture spec nesting too deep"));
+    }
+
+    let backend = parse_rate_backend_json(v, base_dir, depth - 1)?;
+    let max_order = if matches!(backend, RateBackend::RosaPlus) {
+        v["max_order"]
+            .as_i64()
+            .or_else(|| v["order"].as_i64())
+            .unwrap_or(8)
+    } else {
+        -1
+    };
+
+    Ok(MixtureExpertSpec {
+        name: v["name"].as_str().map(|s| s.to_string()),
+        log_prior: v["log_prior"]
+            .as_f64()
+            .or_else(|| v["prior"].as_f64())
+            .unwrap_or(0.0),
+        max_order,
+        backend,
+    })
+}
+
+fn parse_mixture_spec_json(
+    v: &serde_json::Value,
+    base_dir: &Path,
+    depth: usize,
+) -> PyResult<MixtureSpec> {
+    if depth == 0 {
+        return Err(PyValueError::new_err("mixture spec nesting too deep"));
+    }
+
+    let kind_str = v["kind"]
+        .as_str()
+        .or_else(|| v["mixture_kind"].as_str())
+        .unwrap_or("bayes");
+    let kind = parse_mixture_kind_json(kind_str)?;
+
+    let experts_v = v["experts"]
+        .as_array()
+        .ok_or_else(|| PyValueError::new_err("mixture spec missing 'experts' array"))?;
+    if experts_v.is_empty() {
+        return Err(PyValueError::new_err(
+            "mixture spec must include at least one expert",
+        ));
+    }
+
+    let mut experts = Vec::with_capacity(experts_v.len());
+    for expert in experts_v {
+        experts.push(parse_mixture_expert_json(expert, base_dir, depth - 1)?);
+    }
+
+    let mut spec = MixtureSpec::new(kind, experts);
+    if let Some(alpha) = v["alpha"].as_f64() {
+        spec = spec.with_alpha(alpha);
+    }
+    if let Some(decay) = v["decay"].as_f64() {
+        spec = spec.with_decay(decay);
+    }
+    if matches!(kind, MixtureKind::FadingBayes) && spec.decay.is_none() {
+        return Err(PyValueError::new_err(
+            "fading Bayes mixture requires 'decay' in mixture spec",
+        ));
+    }
+    Ok(spec)
+}
+
+fn parse_rate_backend_json(
+    v: &serde_json::Value,
+    base_dir: &Path,
+    depth: usize,
+) -> PyResult<RateBackend> {
+    if depth == 0 {
+        return Err(PyValueError::new_err("backend spec nesting too deep"));
+    }
+
+    let raw_kind = v["kind"]
+        .as_str()
+        .or_else(|| v["type"].as_str())
+        .or_else(|| v["backend"].as_str())
+        .ok_or_else(|| PyValueError::new_err("backend spec missing 'kind'"))?;
+    let kind = match infotheory::backends::resolve_rate_backend_name(raw_kind) {
+        Some(infotheory::backends::BackendAvailability::Enabled(name)) => name,
+        Some(infotheory::backends::BackendAvailability::Disabled { canonical, feature }) => {
+            return Err(PyValueError::new_err(format!(
+                "backend '{canonical}' requires feature '{feature}'"
+            )));
+        }
+        None => {
+            return Err(PyValueError::new_err(format!(
+                "unknown backend kind '{raw_kind}'"
+            )));
+        }
+    };
+
+    match kind {
+        "rosaplus" => Ok(RateBackend::RosaPlus),
+        "ctw" => Ok(RateBackend::Ctw {
+            depth: v["depth"]
+                .as_u64()
+                .or_else(|| v["ct_depth"].as_u64())
+                .unwrap_or(16) as usize,
+        }),
+        "fac-ctw" => {
+            let base_depth = v["base_depth"]
+                .as_u64()
+                .or_else(|| v["ct_depth"].as_u64())
+                .unwrap_or(16) as usize;
+            let encoding_bits = v["encoding_bits"].as_u64().unwrap_or(8) as usize;
+            let num_percept_bits = v["num_percept_bits"]
+                .as_u64()
+                .unwrap_or(encoding_bits as u64) as usize;
+            Ok(RateBackend::FacCtw {
+                base_depth,
+                num_percept_bits,
+                encoding_bits,
+            })
+        }
+        "match" => Ok(RateBackend::Match {
+            hash_bits: v["hash_bits"].as_u64().unwrap_or(20) as usize,
+            min_len: v["min_len"].as_u64().unwrap_or(4) as usize,
+            max_len: v["max_len"].as_u64().unwrap_or(255) as usize,
+            base_mix: v["base_mix"].as_f64().unwrap_or(0.02),
+            confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
+        }),
+        "sparse-match" => Ok(RateBackend::SparseMatch {
+            hash_bits: v["hash_bits"].as_u64().unwrap_or(19) as usize,
+            min_len: v["min_len"].as_u64().unwrap_or(3) as usize,
+            max_len: v["max_len"].as_u64().unwrap_or(64) as usize,
+            gap_min: v["gap_min"].as_u64().unwrap_or(1) as usize,
+            gap_max: v["gap_max"].as_u64().unwrap_or(2) as usize,
+            base_mix: v["base_mix"].as_f64().unwrap_or(0.05),
+            confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
+        }),
+        "ppmd" => Ok(RateBackend::Ppmd {
+            order: v["order"].as_u64().unwrap_or(10) as usize,
+            memory_mb: v["memory_mb"].as_u64().unwrap_or(64) as usize,
+        }),
+        "zpaq" => {
+            let method = v["method"].as_str().unwrap_or("1").to_string();
+            infotheory::validate_zpaq_rate_method(&method).map_err(PyValueError::new_err)?;
+            Ok(RateBackend::Zpaq { method })
+        }
+        #[cfg(feature = "backend-mamba")]
+        "mamba" => {
+            if let Some(method) = v["method"].as_str().or_else(|| v["mamba_method"].as_str()) {
+                Ok(RateBackend::MambaMethod {
+                    method: method.to_string(),
+                })
+            } else {
+                let model_path = v["mamba_model_path"]
+                    .as_str()
+                    .or_else(|| v["model_path"].as_str())
+                    .ok_or_else(|| {
+                        PyValueError::new_err("mamba backend requires 'method' or 'model_path'")
+                    })?;
+                let full = resolve_spec_path(base_dir, model_path);
+                let model =
+                    infotheory::load_mamba_model_from_path(full.to_str().unwrap_or(model_path));
+                Ok(RateBackend::Mamba { model })
+            }
+        }
+        #[cfg(not(feature = "backend-mamba"))]
+        "mamba" => Err(PyValueError::new_err(
+            "mamba backend disabled at compile time",
+        )),
+        #[cfg(feature = "backend-rwkv")]
+        "rwkv7" => {
+            if let Some(method) = v["method"].as_str().or_else(|| v["rwkv_method"].as_str()) {
+                Ok(RateBackend::Rwkv7Method {
+                    method: method.to_string(),
+                })
+            } else {
+                let model_path = v["rwkv_model_path"]
+                    .as_str()
+                    .or_else(|| v["model_path"].as_str())
+                    .ok_or_else(|| {
+                        PyValueError::new_err("rwkv7 backend requires 'method' or 'model_path'")
+                    })?;
+                let full = resolve_spec_path(base_dir, model_path);
+                let model =
+                    infotheory::load_rwkv7_model_from_path(full.to_str().unwrap_or(model_path));
+                Ok(RateBackend::Rwkv7 { model })
+            }
+        }
+        #[cfg(not(feature = "backend-rwkv"))]
+        "rwkv7" => Err(PyValueError::new_err(
+            "rwkv backend disabled at compile time",
+        )),
+        "mixture" => {
+            let spec = if let Some(spec_v) = v.get("spec").filter(|value| value.is_object()) {
+                parse_mixture_spec_json(spec_v, base_dir, depth - 1)?
+            } else if let Some(path) = v["spec_path"].as_str().or_else(|| v["spec"].as_str()) {
+                let (value, full) = load_json_value_from_path(base_dir, path, "mixture spec")?;
+                parse_mixture_spec_json(&value, full.parent().unwrap_or(base_dir), depth - 1)?
+            } else {
+                return Err(PyValueError::new_err(
+                    "mixture backend requires inline 'spec' or 'spec_path'",
+                ));
+            };
+            Ok(RateBackend::Mixture {
+                spec: Arc::new(spec),
+            })
+        }
+        "particle" => {
+            let spec = if let Some(spec_v) = v.get("spec").filter(|value| value.is_object()) {
+                parse_particle_spec_json(spec_v)?
+            } else if let Some(path) = v["spec_path"].as_str().or_else(|| v["spec"].as_str()) {
+                let (value, _) = load_json_value_from_path(base_dir, path, "particle spec")?;
+                parse_particle_spec_json(&value)?
+            } else {
+                return Err(PyValueError::new_err(
+                    "particle backend requires inline 'spec' or 'spec_path'",
+                ));
+            };
+            spec.validate()
+                .map_err(|e| PyValueError::new_err(format!("invalid particle spec: {e}")))?;
+            Ok(RateBackend::Particle {
+                spec: Arc::new(spec),
+            })
+        }
+        "calibrated" => {
+            let spec = if let Some(spec_v) = v.get("spec").filter(|value| value.is_object()) {
+                parse_calibrated_spec_json(spec_v, base_dir, depth - 1)?
+            } else if let Some(path) = v["spec_path"].as_str().or_else(|| v["spec"].as_str()) {
+                let (value, full) = load_json_value_from_path(base_dir, path, "calibrated spec")?;
+                parse_calibrated_spec_json(&value, full.parent().unwrap_or(base_dir), depth - 1)?
+            } else {
+                parse_calibrated_spec_json(v, base_dir, depth - 1)?
+            };
+            Ok(RateBackend::Calibrated {
+                spec: Arc::new(spec),
+            })
+        }
+        other => Err(PyValueError::new_err(format!(
+            "unsupported backend kind '{other}'"
+        ))),
+    }
+}
+
 fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend> {
     let m = method.unwrap_or_default();
     match name.to_ascii_lowercase().as_str() {
         "rosa" | "rosaplus" => Ok(RateBackend::RosaPlus),
+        "match" => Ok(RateBackend::Match {
+            hash_bits: 20,
+            min_len: 4,
+            max_len: 255,
+            base_mix: 0.02,
+            confidence_scale: 1.0,
+        }),
+        "sparse-match" | "sparse_match" | "sparsematch" => Ok(RateBackend::SparseMatch {
+            hash_bits: 19,
+            min_len: 3,
+            max_len: 64,
+            gap_min: 1,
+            gap_max: 2,
+            base_mix: 0.05,
+            confidence_scale: 1.0,
+        }),
+        "ppmd" | "ppm" => Ok(RateBackend::Ppmd {
+            order: if m.is_empty() {
+                10
+            } else {
+                m.parse().unwrap_or(10)
+            },
+            memory_mb: 64,
+        }),
         "ctw" => Ok(RateBackend::Ctw {
             depth: if m.is_empty() {
                 16
@@ -315,17 +693,28 @@ fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend>
         "rwkv" | "rwkv7" => Err(PyValueError::new_err(
             "rwkv backend disabled at compile time",
         )),
+        "mixture" | "mix" => {
+            if m.is_empty() {
+                return Err(PyValueError::new_err(
+                    "mixture backend requires method path to a MixtureSpec JSON file",
+                ));
+            }
+            let (value, full) = load_json_value_from_path(Path::new("."), m, "mixture spec")?;
+            let spec = parse_mixture_spec_json(
+                &value,
+                full.parent().unwrap_or(Path::new(".")),
+                MAX_MIXTURE_SPEC_NESTING,
+            )?;
+            Ok(RateBackend::Mixture {
+                spec: Arc::new(spec),
+            })
+        }
         "particle" | "particles" => {
             let spec = if m.is_empty() {
                 ParticleSpec::default()
             } else {
-                let raw = std::fs::read_to_string(m).map_err(|e| {
-                    PyValueError::new_err(format!("failed to read particle spec '{m}': {e}"))
-                })?;
-                let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-                    PyValueError::new_err(format!("invalid particle spec JSON: {e}"))
-                })?;
-                parse_particle_spec_json(&v)?
+                let (value, _) = load_json_value_from_path(Path::new("."), m, "particle spec")?;
+                parse_particle_spec_json(&value)?
             };
             spec.validate()
                 .map_err(|e| PyValueError::new_err(format!("invalid particle spec: {e}")))?;
@@ -333,10 +722,75 @@ fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend>
                 spec: Arc::new(spec),
             })
         }
+        "calibrated" | "cal" => {
+            if m.is_empty() {
+                return Err(PyValueError::new_err(
+                    "calibrated backend requires method path to a CalibratedSpec JSON file",
+                ));
+            }
+            let (value, full) = load_json_value_from_path(Path::new("."), m, "calibrated spec")?;
+            let spec = parse_calibrated_spec_json(
+                &value,
+                full.parent().unwrap_or(Path::new(".")),
+                MAX_CALIBRATED_SPEC_NESTING,
+            )?;
+            Ok(RateBackend::Calibrated {
+                spec: Arc::new(spec),
+            })
+        }
         _ => Err(PyValueError::new_err(format!(
             "unknown rate backend '{name}'"
         ))),
     }
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn parse_rwkv7_compression_backend(method: Option<&str>) -> PyResult<CompressionBackend> {
+    let coder = infotheory::coders::CoderType::AC;
+    match method {
+        Some(m) if infotheory::backends::parse_rwkv7_coder(m).is_some() => {
+            let path = std::env::var("RWKV7_MODEL_PATH")
+                .map_err(|_| PyValueError::new_err("RWKV7_MODEL_PATH not set"))?;
+            let model = infotheory::load_rwkv7_model_from_path(&path);
+            Ok(CompressionBackend::Rwkv7 {
+                model,
+                coder: infotheory::backends::parse_rwkv7_coder(m)
+                    .expect("coder alias already validated"),
+            })
+        }
+        Some(m) => match infotheory::rwkvzip::parse_method_spec(m) {
+            Ok(infotheory::rwkvzip::MethodSpec::File { path, policy: None }) => {
+                let model = infotheory::load_rwkv7_model_from_path(path.to_string_lossy().as_ref());
+                Ok(CompressionBackend::Rwkv7 { model, coder })
+            }
+            Ok(infotheory::rwkvzip::MethodSpec::File {
+                policy: Some(_), ..
+            })
+            | Ok(infotheory::rwkvzip::MethodSpec::Online { .. }) => Ok(CompressionBackend::Rate {
+                rate_backend: RateBackend::Rwkv7Method {
+                    method: m.to_string(),
+                },
+                coder,
+                framing: infotheory::compression::FramingMode::Raw,
+            }),
+            Err(e) => Err(PyValueError::new_err(format!(
+                "invalid rwkv method string: {e}"
+            ))),
+        },
+        None => {
+            let path = std::env::var("RWKV7_MODEL_PATH")
+                .map_err(|_| PyValueError::new_err("RWKV7_MODEL_PATH not set"))?;
+            let model = infotheory::load_rwkv7_model_from_path(&path);
+            Ok(CompressionBackend::Rwkv7 { model, coder })
+        }
+    }
+}
+
+#[cfg(not(feature = "backend-rwkv"))]
+fn parse_rwkv7_compression_backend(_method: Option<&str>) -> PyResult<CompressionBackend> {
+    Err(PyValueError::new_err(
+        "rwkv7 compression backend disabled at compile time",
+    ))
 }
 
 fn parse_compression_backend(
@@ -363,6 +817,7 @@ fn parse_compression_backend(
             coder: infotheory::coders::CoderType::RANS,
             framing: infotheory::compression::FramingMode::Raw,
         }),
+        "rwkv" | "rwkv7" => parse_rwkv7_compression_backend(method),
         _ => Err(PyValueError::new_err(format!(
             "unknown compression backend '{name}'"
         ))),
@@ -574,6 +1029,65 @@ impl PyParticleSpec {
     }
 }
 
+#[pyclass(name = "CalibrationContextKind", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyCalibrationContextKind {
+    inner: CalibrationContextKind,
+}
+
+#[pymethods]
+impl PyCalibrationContextKind {
+    #[classattr]
+    #[pyo3(name = "Global")]
+    fn global() -> Self {
+        Self {
+            inner: CalibrationContextKind::Global,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "ByteClass")]
+    fn byte_class() -> Self {
+        Self {
+            inner: CalibrationContextKind::ByteClass,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "Text")]
+    fn text() -> Self {
+        Self {
+            inner: CalibrationContextKind::Text,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "Repeat")]
+    fn repeat() -> Self {
+        Self {
+            inner: CalibrationContextKind::Repeat,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "TextRepeat")]
+    fn text_repeat() -> Self {
+        Self {
+            inner: CalibrationContextKind::TextRepeat,
+        }
+    }
+
+    fn __repr__(&self) -> &'static str {
+        match self.inner {
+            CalibrationContextKind::Global => "CalibrationContextKind.Global",
+            CalibrationContextKind::ByteClass => "CalibrationContextKind.ByteClass",
+            CalibrationContextKind::Text => "CalibrationContextKind.Text",
+            CalibrationContextKind::Repeat => "CalibrationContextKind.Repeat",
+            CalibrationContextKind::TextRepeat => "CalibrationContextKind.TextRepeat",
+        }
+    }
+}
+
 #[pyclass(name = "RateBackend", from_py_object)]
 #[derive(Clone)]
 struct PyRateBackend {
@@ -606,6 +1120,67 @@ impl PyRateBackend {
                 num_percept_bits,
                 encoding_bits,
             },
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "match")]
+    #[pyo3(signature = (hash_bits=20, min_len=4, max_len=255, base_mix=0.02, confidence_scale=1.0))]
+    fn match_backend(
+        hash_bits: usize,
+        min_len: usize,
+        max_len: usize,
+        base_mix: f64,
+        confidence_scale: f64,
+    ) -> Self {
+        Self {
+            inner: RateBackend::Match {
+                hash_bits,
+                min_len,
+                max_len,
+                base_mix,
+                confidence_scale,
+            },
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (
+        hash_bits=19,
+        min_len=3,
+        max_len=64,
+        gap_min=1,
+        gap_max=2,
+        base_mix=0.05,
+        confidence_scale=1.0
+    ))]
+    fn sparse_match(
+        hash_bits: usize,
+        min_len: usize,
+        max_len: usize,
+        gap_min: usize,
+        gap_max: usize,
+        base_mix: f64,
+        confidence_scale: f64,
+    ) -> Self {
+        Self {
+            inner: RateBackend::SparseMatch {
+                hash_bits,
+                min_len,
+                max_len,
+                gap_min,
+                gap_max,
+                base_mix,
+                confidence_scale,
+            },
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (order=10, memory_mb=64))]
+    fn ppmd(order: usize, memory_mb: usize) -> Self {
+        Self {
+            inner: RateBackend::Ppmd { order, memory_mb },
         }
     }
 
@@ -651,6 +1226,31 @@ impl PyRateBackend {
                 spec: Arc::new(spec.inner.clone()),
             },
         }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (base_backend, context=None, bins=33, learning_rate=0.02, bias_clip=4.0))]
+    fn calibrated(
+        base_backend: &PyRateBackend,
+        context: Option<&Bound<'_, PyAny>>,
+        bins: usize,
+        learning_rate: f64,
+        bias_clip: f64,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: RateBackend::Calibrated {
+                spec: Arc::new(CalibratedSpec {
+                    base: base_backend.inner.clone(),
+                    context: context
+                        .map(parse_calibration_context_kind_value)
+                        .transpose()?
+                        .unwrap_or(CalibrationContextKind::Text),
+                    bins,
+                    learning_rate,
+                    bias_clip,
+                }),
+            },
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -3015,6 +3615,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMixtureExpertSpec>()?;
     m.add_class::<PyMixtureSpec>()?;
     m.add_class::<PyParticleSpec>()?;
+    m.add_class::<PyCalibrationContextKind>()?;
     m.add_class::<PyNcdVariant>()?;
     m.add_class::<PyObservationKeyMode>()?;
     m.add_class::<PyRandomGenerator>()?;

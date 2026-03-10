@@ -668,6 +668,15 @@ enum TraceModel {
 }
 
 impl TraceModel {
+    fn predictor_backed(backend: RateBackend) -> Self {
+        let mut model =
+            crate::mixture::RateBackendPredictor::from_backend(backend.clone(), -1, 2f64.powi(-24));
+        model
+            .begin_stream(None)
+            .unwrap_or_else(|e| panic!("predictor-backed stream init failed: {e}"));
+        TraceModel::Mixture { backend, model }
+    }
+
     fn new(backend: &RateBackend, max_order: i64) -> Self {
         match backend {
             RateBackend::RosaPlus => {
@@ -710,30 +719,12 @@ impl TraceModel {
             RateBackend::Zpaq { method } => TraceModel::Zpaq {
                 model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
             },
-            RateBackend::Mixture { spec } => {
-                let backend = RateBackend::Mixture { spec: spec.clone() };
-                let mut model = crate::mixture::RateBackendPredictor::from_backend(
-                    backend.clone(),
-                    -1,
-                    2f64.powi(-24),
-                );
-                model
-                    .begin_stream(None)
-                    .unwrap_or_else(|e| panic!("mixture stream init failed: {e}"));
-                TraceModel::Mixture { backend, model }
-            }
-            RateBackend::Particle { spec } => {
-                let backend = RateBackend::Particle { spec: spec.clone() };
-                let mut model = crate::mixture::RateBackendPredictor::from_backend(
-                    backend.clone(),
-                    -1,
-                    2f64.powi(-24),
-                );
-                model
-                    .begin_stream(None)
-                    .unwrap_or_else(|e| panic!("mixture stream init failed: {e}"));
-                TraceModel::Mixture { backend, model }
-            }
+            RateBackend::Mixture { .. }
+            | RateBackend::Particle { .. }
+            | RateBackend::Match { .. }
+            | RateBackend::SparseMatch { .. }
+            | RateBackend::Ppmd { .. }
+            | RateBackend::Calibrated { .. } => TraceModel::predictor_backed(backend.clone()),
             RateBackend::Ctw { depth } => TraceModel::Ctw {
                 tree: crate::ctw::ContextTree::new(*depth),
             },
@@ -2050,5 +2041,71 @@ mod tests {
 
         assert_eq!(utf8.decode("test").unwrap(), data);
         assert_eq!(hex.decode("74657374").unwrap(), data);
+    }
+
+    #[test]
+    fn trace_model_supports_predictor_backed_backends() {
+        let backends = vec![
+            RateBackend::Match {
+                hash_bits: 20,
+                min_len: 4,
+                max_len: 255,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            },
+            RateBackend::SparseMatch {
+                hash_bits: 19,
+                min_len: 3,
+                max_len: 64,
+                gap_min: 1,
+                gap_max: 2,
+                base_mix: 0.05,
+                confidence_scale: 1.0,
+            },
+            RateBackend::Ppmd {
+                order: 8,
+                memory_mb: 8,
+            },
+            RateBackend::Calibrated {
+                spec: Arc::new(crate::CalibratedSpec {
+                    base: RateBackend::Ctw { depth: 8 },
+                    context: crate::CalibrationContextKind::Text,
+                    bins: 33,
+                    learning_rate: 0.02,
+                    bias_clip: 4.0,
+                }),
+            },
+            RateBackend::Particle {
+                spec: Arc::new(crate::ParticleSpec {
+                    num_particles: 4,
+                    num_cells: 4,
+                    cell_dim: 8,
+                    ..crate::ParticleSpec::default()
+                }),
+            },
+            RateBackend::Mixture {
+                spec: Arc::new(crate::MixtureSpec::new(
+                    crate::MixtureKind::Bayes,
+                    vec![crate::MixtureExpertSpec {
+                        name: Some("ctw".to_string()),
+                        log_prior: 0.0,
+                        max_order: -1,
+                        backend: RateBackend::Ctw { depth: 8 },
+                    }],
+                )),
+            },
+        ];
+
+        for backend in backends {
+            let mut model = TraceModel::new(&backend, 4);
+            let bits = model.update_and_score(b"trace payload");
+            assert!(bits.is_finite() && bits >= 0.0, "bits={bits}");
+            model.reset();
+            let bits_after_reset = model.update_and_score(b"trace payload");
+            assert!(
+                bits_after_reset.is_finite() && bits_after_reset >= 0.0,
+                "bits_after_reset={bits_after_reset}"
+            );
+        }
     }
 }

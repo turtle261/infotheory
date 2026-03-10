@@ -239,6 +239,37 @@ uv run maturin develop --release
 uv run python -c "import infotheory_rs as ait; print(ait.ncd_paths('README.md','README.md', backend='zpaq', method='5', variant='vitanyi'))"
 ```
 
+Python exposes both string-based backend parsing and direct backend objects. The
+current surface includes `RateBackend.match(...)`, `RateBackend.sparse_match(...)`,
+`RateBackend.ppmd(...)`, `RateBackend.mixture(...)`, `RateBackend.particle(...)`,
+and `RateBackend.calibrated(...)`, plus `CalibrationContextKind` for calibrated
+backends.
+
+Example:
+
+```python
+import infotheory_rs as ait
+
+match_backend = ait.RateBackend.match()
+particle_backend = ait.RateBackend.particle(
+    ait.ParticleSpec(num_particles=4, num_cells=4, cell_dim=8)
+)
+cal_backend = ait.RateBackend.calibrated(
+    ait.RateBackend.ctw(8),
+    ait.CalibrationContextKind.Text,
+)
+
+assert ait.entropy_rate_backend(b"abracadabra", 4, backend=match_backend) >= 0.0
+framed = ait.CompressionBackend.rate_rans(particle_backend, "framed")
+blob = ait.compress_bytes_backend(b"payload", compression_backend=framed)
+assert ait.decompress_bytes_backend(blob, compression_backend=framed) == b"payload"
+assert ait.compress_size_backend(
+    b"payload",
+    compression_backend="rwkv7",
+    method="cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
+) > 0
+```
+
 Run Python tests:
 
 ```bash
