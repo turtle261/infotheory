@@ -906,6 +906,7 @@ mod tests {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rwkv_update_scalar(
         state: &mut [f32],
         w: &[f32],

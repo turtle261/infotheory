@@ -39,4 +39,12 @@ impl SparseMatchModel {
     pub fn update(&mut self, symbol: u8) {
         self.inner.update(symbol);
     }
+
+    pub fn reset_history(&mut self) {
+        self.inner.reset_history();
+    }
+
+    pub fn update_history_only(&mut self, symbol: u8) {
+        self.inner.update_history_only(symbol);
+    }
 }

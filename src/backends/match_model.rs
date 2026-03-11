@@ -95,6 +95,21 @@ impl MatchModel {
         self.valid = false;
     }
 
+    /// Reset only the conditioning history while preserving learned match tables.
+    pub fn reset_history(&mut self) {
+        self.history.clear();
+        self.valid = false;
+        self.predicted = None;
+        self.match_len = 0;
+        self.pdf.fill(1.0 / 256.0);
+    }
+
+    /// Advance conditioning history without updating learned match tables.
+    pub fn update_history_only(&mut self, symbol: u8) {
+        self.history.push(symbol);
+        self.valid = false;
+    }
+
     pub fn match_len(&mut self) -> usize {
         self.ensure_pdf();
         self.match_len

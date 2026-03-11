@@ -1546,6 +1546,7 @@ impl Model {
 
     /// Perform one exact bptt=1 online training step over the latest forward trace.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::needless_range_loop)]
     pub fn online_train_step_bptt1(
         &mut self,
         scratch: &mut ScratchBuffers,
@@ -3645,6 +3646,7 @@ impl Model {
     }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn layer_norm_backward(
     input: &[f32],
     weight: &[f32],
@@ -3694,7 +3696,7 @@ fn layer_norm_backward(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 fn group_norm_backward(
     input: &[f32],
     weight: &[f32],
@@ -3814,6 +3816,7 @@ fn sgd_vec_update(param: &mut [f32], grad: &[f32], lr: f32, clip: f32) {
 }
 
 #[inline(always)]
+#[allow(clippy::needless_range_loop)]
 fn sgd_outer_update(
     param: &mut [f32],
     rows: usize,
@@ -3849,6 +3852,7 @@ fn sgd_outer_update(
 }
 
 #[inline(always)]
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 fn fused_sgd_head_backward_update(
     param: &mut [f32],
     rows: usize,
@@ -4020,6 +4024,7 @@ fn apply_adam_vec_update_raw(
 }
 
 #[inline(always)]
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 fn fused_adam_head_backward_update(
     param: &mut [f32],
     rows: usize,
@@ -4157,6 +4162,7 @@ fn apply_adam_outer_update(
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
+#[allow(clippy::needless_range_loop)]
 fn apply_adam_outer_update_raw(
     param: &mut [f32],
     rows: usize,

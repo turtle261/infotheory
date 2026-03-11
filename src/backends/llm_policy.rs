@@ -81,7 +81,7 @@ impl TrainScopeSet {
         }
 
         let mut out = BTreeSet::<String>::new();
-        for tok in v.split(|c| c == '+' || c == '|' || c == '/') {
+        for tok in v.split(['+', '|', '/']) {
             let t = tok.trim();
             if t.is_empty() {
                 continue;
@@ -159,6 +159,28 @@ pub enum ScheduleRule {
 pub struct LlmPolicy {
     pub load_from: Option<PathBuf>,
     pub schedule: Vec<ScheduleRule>,
+}
+
+pub fn policy_can_train(policy: &LlmPolicy) -> bool {
+    for rule in &policy.schedule {
+        match rule {
+            ScheduleRule::Interval(interval) => {
+                if matches!(interval.action, PolicyAction::Train(_)) {
+                    return true;
+                }
+            }
+            ScheduleRule::Repeat(repeat) => {
+                if repeat
+                    .pattern
+                    .iter()
+                    .any(|seg| matches!(seg.action, PolicyAction::Train(_)))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 #[derive(Clone, Debug)]

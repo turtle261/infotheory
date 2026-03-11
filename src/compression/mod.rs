@@ -433,7 +433,6 @@ impl MambaPredictor {
         }
         if !self.primed {
             self.compressor.forward_to_pdf(0, &mut self.pdf);
-            normalize_pdf(&mut self.pdf);
             self.primed = true;
             self.valid = true;
             return;
@@ -450,7 +449,6 @@ impl MambaPredictor {
         self.ensure_predicted();
         self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
         self.compressor.forward_to_pdf(symbol as u32, &mut self.pdf);
-        normalize_pdf(&mut self.pdf);
         self.valid = true;
         Ok(())
     }
@@ -491,7 +489,6 @@ impl RwkvPredictor {
         }
         if !self.primed {
             self.compressor.forward_to_pdf(0, &mut self.pdf);
-            normalize_pdf(&mut self.pdf);
             self.primed = true;
             self.valid = true;
             return;
@@ -508,7 +505,6 @@ impl RwkvPredictor {
         self.ensure_predicted();
         self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
         self.compressor.forward_to_pdf(symbol as u32, &mut self.pdf);
-        normalize_pdf(&mut self.pdf);
         self.valid = true;
         Ok(())
     }
@@ -627,8 +623,8 @@ impl MixturePredictor {
                 for i in 0..n {
                     let epdf = self.experts[i].predictor.pdf_next()?;
                     let w = self.scratch[i];
-                    for b in 0..256 {
-                        self.pdf[b] += w * epdf[b];
+                    for (pdf_slot, &p) in self.pdf.iter_mut().zip(epdf.iter()) {
+                        *pdf_slot += w * p;
                     }
                 }
                 normalize_pdf(&mut self.pdf);
@@ -819,11 +815,11 @@ impl MixturePredictor {
             self.neural_hi[i] = 256;
 
             let mut handled_ctw = false;
-            if let RatePdfPredictor::Ctw(ctw) = &mut *self.experts[i].predictor {
-                if ctw.can_fast_ac_bitwise() {
-                    self.neural_bit_modes[i] = 0;
-                    handled_ctw = true;
-                }
+            if let RatePdfPredictor::Ctw(ctw) = &mut *self.experts[i].predictor
+                && ctw.can_fast_ac_bitwise()
+            {
+                self.neural_bit_modes[i] = 0;
+                handled_ctw = true;
             }
             if handled_ctw {
                 continue;
@@ -1591,13 +1587,24 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn assert_pdf_close(lhs: &[f64], rhs: &[f64], tol: f64) {
+        assert_eq!(lhs.len(), rhs.len());
+        for (idx, (&a, &b)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            let delta = (a - b).abs();
+            assert!(
+                delta <= tol,
+                "pdf mismatch at symbol {idx}: lhs={a} rhs={b} delta={delta}"
+            );
+        }
+    }
+
     fn brute_force_pdf(predictor: &mut CtwPredictor) -> Vec<f64> {
         let bits = predictor.bits_per_symbol.clamp(1, 8);
         let mut out = vec![0.0; 256];
 
         if bits == 8 {
-            for sym in 0..256usize {
-                out[sym] = predictor.log_prob_symbol_bruteforce(sym as u8).exp();
+            for (sym, slot) in out.iter_mut().enumerate().take(256usize) {
+                *slot = predictor.log_prob_symbol_bruteforce(sym as u8).exp();
             }
         } else {
             let patterns = 1usize << bits;
@@ -1611,13 +1618,13 @@ mod tests {
                 };
                 *value = predictor.log_prob_symbol_bruteforce(symbol).exp();
             }
-            for byte in 0..256usize {
+            for (byte, slot) in out.iter_mut().enumerate().take(256usize) {
                 let pat = if predictor.msb_first {
                     byte >> (8 - bits)
                 } else {
                     byte & (patterns - 1)
                 };
-                out[byte] = pat_prob[pat] / (aliases as f64);
+                *slot = pat_prob[pat] / (aliases as f64);
             }
         }
 
@@ -1984,6 +1991,26 @@ mod tests {
 
     #[cfg(feature = "backend-rwkv")]
     #[test]
+    fn rwkv_rate_predictor_preserves_backend_pdf_exactly() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
+        let mut predictor = RwkvPredictor::from_method(method).expect("rwkv predictor");
+        let mut backend = rwkvzip::Compressor::new_from_method(method).expect("rwkv backend");
+        let mut direct = vec![0.0; backend.vocab_size()];
+
+        let predicted = predictor.pdf_next().to_vec();
+        backend.forward_to_pdf(0, &mut direct);
+        assert_pdf_close(&predicted, &direct, 1e-18);
+
+        predictor.update(b'x').expect("predictor update");
+        backend
+            .online_update_from_pdf(b'x', &direct)
+            .expect("backend update");
+        backend.forward_to_pdf(u32::from(b'x'), &mut direct);
+        assert_pdf_close(predictor.pdf_next(), &direct, 1e-18);
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
     fn roundtrip_rate_rwkv_two_json_method_2m() {
         let two_json: serde_json::Value =
             serde_json::from_str(include_str!("../../examples/two.json")).unwrap();
@@ -2010,6 +2037,26 @@ mod tests {
         let dec =
             decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn mamba_rate_predictor_preserves_backend_pdf_exactly() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
+        let mut predictor = MambaPredictor::from_method(method).expect("mamba predictor");
+        let mut backend = mambazip::Compressor::new_from_method(method).expect("mamba backend");
+        let mut direct = vec![0.0; backend.vocab_size()];
+
+        let predicted = predictor.pdf_next().to_vec();
+        backend.forward_to_pdf(0, &mut direct);
+        assert_pdf_close(&predicted, &direct, 1e-18);
+
+        predictor.update(b'x').expect("predictor update");
+        backend
+            .online_update_from_pdf(b'x', &direct)
+            .expect("backend update");
+        backend.forward_to_pdf(u32::from(b'x'), &mut direct);
+        assert_pdf_close(predictor.pdf_next(), &direct, 1e-18);
     }
 
     #[test]

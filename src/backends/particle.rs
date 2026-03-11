@@ -88,7 +88,7 @@ fn log_softmax_with_floor(logits: &[f64], out: &mut [f64], min_prob: f64) {
         } else {
             let diff = lp - log_sum_exp_floor;
             if diff.is_finite() {
-                log_sum_exp_floor = log_sum_exp_floor + (1.0 + diff.exp()).ln();
+                log_sum_exp_floor += (1.0 + diff.exp()).ln();
             }
         }
     }
@@ -141,9 +141,9 @@ impl DenseLayer {
     fn forward(&self, x: &[f64], out: &mut [f64]) {
         debug_assert!(x.len() >= self.in_dim);
         debug_assert!(out.len() >= self.out_dim);
-        for r in 0..self.out_dim {
+        for (r, slot) in out.iter_mut().enumerate().take(self.out_dim) {
             let row = &self.weights[r * self.in_dim..(r + 1) * self.in_dim];
-            out[r] = dot_wide(row, &x[..self.in_dim]) + self.bias[r];
+            *slot = dot_wide(row, &x[..self.in_dim]) + self.bias[r];
         }
     }
 
@@ -159,8 +159,8 @@ impl DenseLayer {
     /// Clips gradients and parameters.
     fn sgd_update(&mut self, grad_out: &[f64], x: &[f64], lr: f64, grad_clip: f64, momentum: f64) {
         if momentum == 0.0 {
-            for r in 0..self.out_dim {
-                let g = clip(grad_out[r], grad_clip);
+            for (r, &grad) in grad_out.iter().enumerate().take(self.out_dim) {
+                let g = clip(grad, grad_clip);
                 let row = &mut self.weights[r * self.in_dim..(r + 1) * self.in_dim];
                 axpy_wide(row, -lr * g, &x[..self.in_dim]);
                 self.bias[r] -= lr * g;
@@ -168,12 +168,12 @@ impl DenseLayer {
             return;
         }
 
-        for r in 0..self.out_dim {
-            let g = clip(grad_out[r], grad_clip);
-            for c in 0..self.in_dim {
+        for (r, &grad) in grad_out.iter().enumerate().take(self.out_dim) {
+            let g = clip(grad, grad_clip);
+            for (c, &x_c) in x.iter().enumerate().take(self.in_dim) {
                 let idx = r * self.in_dim + c;
-                let grad = g * x[c];
-                self.vel_weights[idx] = momentum * self.vel_weights[idx] + grad;
+                let grad_w = g * x_c;
+                self.vel_weights[idx] = momentum * self.vel_weights[idx] + grad_w;
                 self.weights[idx] -= lr * self.vel_weights[idx];
             }
             self.vel_bias[r] = momentum * self.vel_bias[r] + g;
@@ -421,16 +421,16 @@ impl ParticleState {
         // recent bytes while keeping fixed-size context.
         let decay = 0.90_f64;
         let mut weight_sum = 0.0_f64;
-        for k in 0..len {
-            let pos = (self.ctx_pos + cw - len + k) % cw;
+        let mut w = 1.0_f64;
+        for age in 0..len {
+            let pos = (self.ctx_pos + cw - 1 - age) % cw;
             let byte = self.context[pos] as usize;
             let emb = &self.model.embed[byte * cd..(byte + 1) * cd];
-            let age = (len - 1 - k) as i32;
-            let w = decay.powi(age);
             weight_sum += w;
-            for j in 0..cd {
-                self.scratch_ctx[j] += emb[j] * w;
+            for (ctx, &emb_j) in self.scratch_ctx.iter_mut().zip(emb.iter()) {
+                *ctx += emb_j * w;
             }
+            w *= decay;
         }
         if weight_sum > 0.0 {
             let inv = 1.0 / weight_sum;
@@ -708,8 +708,11 @@ impl ParticleState {
             for ki in 0..spec.num_rules.min(ct.rules.len()) {
                 let gate_k = ct.gate[ki];
                 self.scratch_d_rule_out[..cd].fill(0.0);
-                for j in 0..cd {
-                    self.scratch_d_rule_out[j] = d_phi[j] * d_delta_scale * gate_k;
+                for (dst, &d_phi_j) in self.scratch_d_rule_out[..cd]
+                    .iter_mut()
+                    .zip(d_phi.iter().take(cd))
+                {
+                    *dst = d_phi_j * d_delta_scale * gate_k;
                 }
 
                 // output layer update
@@ -747,8 +750,12 @@ impl ParticleState {
                     spec.optimizer_momentum,
                 );
 
-                for j in 0..cd {
-                    self.scratch_d_gate[ki] += d_phi[j] * d_delta_scale * ct.rules[ki].rule_out[j];
+                for (&d_phi_j, &rule_out_j) in d_phi
+                    .iter()
+                    .take(cd)
+                    .zip(ct.rules[ki].rule_out.iter().take(cd))
+                {
+                    self.scratch_d_gate[ki] += d_phi_j * d_delta_scale * rule_out_j;
                 }
             }
 
@@ -856,6 +863,35 @@ impl ParticleState {
         self.ctx_pos = (self.ctx_pos + 1) % self.context.len();
         self.ctx_len += 1;
     }
+
+    fn reset_dynamic_state(&mut self) {
+        self.cells.fill(0.0);
+        self.context.fill(0);
+        self.ctx_pos = 0;
+        self.ctx_len = 0;
+        self.cached_log_probs.fill(0.0);
+        self.cache_valid = false;
+        self.scratch_ctx.fill(0.0);
+        self.scratch_mean_cells.fill(0.0);
+        self.scratch_p.fill(0.0);
+        self.scratch_sel_h.fill(0.0);
+        self.scratch_gate.fill(0.0);
+        self.scratch_rule_in.fill(0.0);
+        self.scratch_rule_h.fill(0.0);
+        self.scratch_delta_k.fill(0.0);
+        self.scratch_delta.fill(0.0);
+        self.scratch_phi.fill(0.0);
+        self.scratch_logits.fill(0.0);
+        self.scratch_d_logits.fill(0.0);
+        self.scratch_d_phi.fill(0.0);
+        self.scratch_softmax.fill(0.0);
+        self.scratch_d_rule_out.fill(0.0);
+        self.scratch_d_rule_h.fill(0.0);
+        self.scratch_d_gate.fill(0.0);
+        self.scratch_d_gate_logits.fill(0.0);
+        self.scratch_d_sel_h.fill(0.0);
+        self.trace_history.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -899,7 +935,9 @@ impl ParticleRuntime {
     #[inline]
     fn diagnostics_enabled(&self) -> bool {
         self.spec.diagnostics_interval > 0
-            && self.step_idx % self.spec.diagnostics_interval as u64 == 0
+            && self
+                .step_idx
+                .is_multiple_of(self.spec.diagnostics_interval as u64)
     }
 
     #[inline]
@@ -927,11 +965,14 @@ impl ParticleRuntime {
         let log_z = logsumexp_wide(&self.log_weights);
         let mut mix_log_probs = [0.0_f64; 256];
         let mut scratch_lse = vec![0.0_f64; n];
-        for v in 0..256 {
-            for i in 0..n {
-                scratch_lse[i] = self.log_weights[i] + self.particles[i].cached_log_probs[v];
+        for (v, mix_logp) in mix_log_probs.iter_mut().enumerate() {
+            for (slot, (log_weight, particle)) in scratch_lse
+                .iter_mut()
+                .zip(self.log_weights.iter().zip(self.particles.iter()))
+            {
+                *slot = *log_weight + particle.cached_log_probs[v];
             }
-            mix_log_probs[v] = logsumexp_wide(&scratch_lse) - log_z;
+            *mix_logp = logsumexp_wide(&scratch_lse) - log_z;
         }
         let mut d = 0.0_f64;
         for (i, p) in self.particles.iter().enumerate() {
@@ -940,10 +981,9 @@ impl ParticleRuntime {
                 continue;
             }
             let mut kl_i = 0.0_f64;
-            for v in 0..256 {
-                let lp_i = p.cached_log_probs[v];
+            for (&lp_i, &mix_logp) in p.cached_log_probs.iter().zip(mix_log_probs.iter()) {
                 let prob_i = lp_i.exp();
-                kl_i += prob_i * (lp_i - mix_log_probs[v]);
+                kl_i += prob_i * (lp_i - mix_logp);
             }
             d += alpha * kl_i.max(0.0);
         }
@@ -1164,6 +1204,59 @@ impl ParticleRuntime {
         self.step_idx += 1;
 
         log_prob
+    }
+
+    /// Reset dynamic inference state while preserving learned model parameters and particle weights.
+    ///
+    /// Frozen/plugin scoring for particles intentionally keeps the learned
+    /// ensemble and posterior weights from the fit pass. Only stream-local
+    /// recurrent/context state is reset before the score pass begins.
+    pub fn reset_frozen_state(&mut self) {
+        for particle in &mut self.particles {
+            particle.reset_dynamic_state();
+        }
+        self.mix_log_probs.fill(0.0);
+        self.mix_pdf.fill(1.0 / 256.0);
+        self.cache_valid = false;
+        self.step_idx = 0;
+    }
+
+    /// Advance the ensemble without SGD/model adaptation using the current observation.
+    ///
+    /// This still performs the Bayesian posterior-weight update over particles,
+    /// because that latent filtering step is part of the fixed model's
+    /// inference dynamics rather than a new fit/update of model parameters.
+    pub fn update_frozen(&mut self, symbol: u8) {
+        self.ensure_predictions();
+        let n = self.particles.len();
+        let spec = &self.spec;
+
+        let beta = self.likelihood_beta();
+        for i in 0..n {
+            self.log_weights[i] += beta * self.particles[i].cached_log_probs[symbol as usize];
+        }
+        let log_z = logsumexp_wide(&self.log_weights);
+        for weight in &mut self.log_weights {
+            *weight -= log_z;
+        }
+
+        if spec.forget_lambda > 0.0 {
+            let uniform = -(n as f64).ln();
+            for weight in &mut self.log_weights {
+                *weight = (1.0 - spec.forget_lambda) * *weight + spec.forget_lambda * uniform;
+            }
+            let log_z2 = logsumexp_wide(&self.log_weights);
+            for weight in &mut self.log_weights {
+                *weight -= log_z2;
+            }
+        }
+
+        for particle in &mut self.particles {
+            particle.push_context(symbol);
+            particle.cache_valid = false;
+        }
+        self.cache_valid = false;
+        self.step_idx += 1;
     }
 
     /// Check effective sample size and resample if needed.
@@ -1395,9 +1488,6 @@ impl crate::mixture::OnlineBytePredictor for ParticleRuntime {
     }
 }
 
-// Safety: ParticleRuntime is Send because all internal state is owned Vec/f64.
-unsafe impl Send for ParticleRuntime {}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1565,5 +1655,76 @@ mod tests {
 
         spec.min_prob = -1.0;
         assert!(spec.validate().is_err());
+    }
+
+    fn assert_models_equal(lhs: &ParticleModel, rhs: &ParticleModel) {
+        assert_eq!(lhs.embed, rhs.embed);
+        assert_eq!(lhs.readout.weights, rhs.readout.weights);
+        assert_eq!(lhs.readout.bias, rhs.readout.bias);
+        assert_eq!(lhs.readout.vel_weights, rhs.readout.vel_weights);
+        assert_eq!(lhs.readout.vel_bias, rhs.readout.vel_bias);
+        assert_eq!(lhs.cells.len(), rhs.cells.len());
+        for (lhs_cell, rhs_cell) in lhs.cells.iter().zip(rhs.cells.iter()) {
+            assert_eq!(
+                lhs_cell.selector.hidden.weights,
+                rhs_cell.selector.hidden.weights
+            );
+            assert_eq!(lhs_cell.selector.hidden.bias, rhs_cell.selector.hidden.bias);
+            assert_eq!(
+                lhs_cell.selector.hidden.vel_weights,
+                rhs_cell.selector.hidden.vel_weights
+            );
+            assert_eq!(
+                lhs_cell.selector.hidden.vel_bias,
+                rhs_cell.selector.hidden.vel_bias
+            );
+            assert_eq!(
+                lhs_cell.selector.gate.weights,
+                rhs_cell.selector.gate.weights
+            );
+            assert_eq!(lhs_cell.selector.gate.bias, rhs_cell.selector.gate.bias);
+            assert_eq!(
+                lhs_cell.selector.gate.vel_weights,
+                rhs_cell.selector.gate.vel_weights
+            );
+            assert_eq!(
+                lhs_cell.selector.gate.vel_bias,
+                rhs_cell.selector.gate.vel_bias
+            );
+            assert_eq!(lhs_cell.rules.len(), rhs_cell.rules.len());
+            for (lhs_rule, rhs_rule) in lhs_cell.rules.iter().zip(rhs_cell.rules.iter()) {
+                assert_eq!(lhs_rule.hidden.weights, rhs_rule.hidden.weights);
+                assert_eq!(lhs_rule.hidden.bias, rhs_rule.hidden.bias);
+                assert_eq!(lhs_rule.hidden.vel_weights, rhs_rule.hidden.vel_weights);
+                assert_eq!(lhs_rule.hidden.vel_bias, rhs_rule.hidden.vel_bias);
+                assert_eq!(lhs_rule.output.weights, rhs_rule.output.weights);
+                assert_eq!(lhs_rule.output.bias, rhs_rule.output.bias);
+                assert_eq!(lhs_rule.output.vel_weights, rhs_rule.output.vel_weights);
+                assert_eq!(lhs_rule.output.vel_bias, rhs_rule.output.vel_bias);
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_update_preserves_model_parameters() {
+        let spec = default_spec();
+        let mut rt = ParticleRuntime::new(&spec);
+        for &b in b"particle plugin separation" {
+            rt.step(b);
+        }
+
+        let before_models: Vec<_> = rt.particles.iter().map(|p| p.model.clone()).collect();
+        rt.reset_frozen_state();
+        assert!(rt.particles.iter().all(|p| p.ctx_len == 0));
+
+        let lp = rt.peek_log_prob(b'x');
+        assert!(lp.is_finite());
+        rt.update_frozen(b'x');
+
+        for (before, particle) in before_models.iter().zip(rt.particles.iter()) {
+            assert_models_equal(before, &particle.model);
+        }
+        assert_eq!(rt.step_idx, 1);
+        assert!(rt.particles.iter().all(|p| p.ctx_len == 1));
     }
 }

@@ -1616,6 +1616,16 @@ impl RosaPlus {
         self.lm_built = true;
     }
 
+    /// Reset only the predictive cursor while preserving the trained SAM/LM.
+    pub fn reset_conditioning_cursor(&mut self) {
+        self.sam.last = 0;
+    }
+
+    /// Advance only the predictive cursor without mutating fitted counts.
+    pub fn advance_conditioning_byte(&mut self, b: u8) {
+        self.sam.last = self.sam.advance(self.sam.last, b as u32);
+    }
+
     fn train_example_tx_impl(&mut self, tx: &mut RosaTx, s: &[u8], mark_boundary: bool) {
         if s.is_empty() {
             return;
@@ -2917,7 +2927,7 @@ mod tests {
         m.train_sequence(b"abracadabra mississippi abracadabra abracadabra");
 
         let v = m.sam.last;
-        for &sym in &[b'a', b' ', b'm', b'z'] {
+        for &sym in b"a mz" {
             let sym_idx = m.lm.find_sym(sym as u32);
             let expected = prob_for_sym_reference(&m.lm, &m.sam, m.max_order, v, sym_idx);
             let got = m.lm.prob_for_sym(&m.sam, m.max_order, v, sym_idx);

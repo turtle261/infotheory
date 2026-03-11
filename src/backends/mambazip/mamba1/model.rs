@@ -1222,6 +1222,7 @@ impl Model {
     /// This consumes the latest forward trace captured in `scratch` and applies
     /// one gradient step using the externally provided PDF/target symbol.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::needless_range_loop)]
     pub fn online_train_step_bptt1(
         &mut self,
         scratch: &mut ScratchBuffers,
@@ -2749,6 +2750,7 @@ fn apply_adam_vec_update_and_sync_neg_exp(
 }
 
 #[inline(always)]
+#[allow(clippy::needless_range_loop)]
 fn apply_adam_outer_update(
     param: &mut [f32],
     rows: usize,

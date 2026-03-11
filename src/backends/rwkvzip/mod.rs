@@ -286,6 +286,7 @@ impl OnlineRuntime {
     }
 }
 
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 fn apply_online_lm_head_update(
     model: &mut Model,
     online: &mut OnlineRuntime,
@@ -989,9 +990,7 @@ impl Compressor {
     /// Reset state and prime the first predictive distribution.
     pub fn reset_and_prime(&mut self) {
         self.state.reset();
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+        self.refresh_current_pdf(0);
     }
 
     /// Capture runtime state for later restoration.
@@ -1019,18 +1018,7 @@ impl Compressor {
         let total = parts
             .iter()
             .fold(0u64, |acc, part| acc.saturating_add(part.len() as u64));
-        self.prepare_policy_stream(Some(total))?;
-        for part in parts {
-            for &byte in *part {
-                self.online_update_from_current_pdf(byte)?;
-                let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-                let logits = self
-                    .model
-                    .forward(&mut self.scratch, byte as u32, &mut self.state);
-                Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-            }
-        }
-        Ok(())
+        self.fit_chain(parts, Some(total))
     }
 
     /// Score bytes from the current predictive state.
@@ -1041,8 +1029,7 @@ impl Compressor {
         self.prepare_policy_stream(Some(data.len() as u64))?;
         let mut total_bits = 0.0f64;
         for &byte in data {
-            let p = self.pdf_buffer[byte as usize];
-            total_bits -= p.log2();
+            total_bits -= self.pdf_buffer[byte as usize].log2();
             self.online_update_from_current_pdf(byte)?;
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
@@ -1053,9 +1040,47 @@ impl Compressor {
         Ok(total_bits / (data.len() as f64))
     }
 
+    /// Fit on `fit_parts`, then reset stream state and score `data` without further adaptation.
+    pub fn cross_entropy_frozen_plugin_chain(
+        &mut self,
+        fit_parts: &[&[u8]],
+        data: &[u8],
+    ) -> Result<f64> {
+        if data.is_empty() {
+            return Ok(0.0);
+        }
+        if !self.can_adapt_online() {
+            return self.cross_entropy(data);
+        }
+        self.reset_and_prime();
+        let fit_total = fit_parts
+            .iter()
+            .fold(0u64, |acc, part| acc.saturating_add(part.len() as u64));
+        self.fit_chain(fit_parts, Some(fit_total))?;
+        self.reset_and_prime();
+
+        let mut total_bits = 0.0f64;
+        for &byte in data {
+            total_bits -= self.pdf_buffer[byte as usize].max(1e-300).log2();
+            self.advance_inference_only(byte);
+        }
+        Ok(total_bits / (data.len() as f64))
+    }
+
     /// Returns `true` when the compressor is in online-adaptation mode.
     pub fn is_online(&self) -> bool {
         self.online.is_some()
+    }
+
+    /// Returns `true` when the current online configuration can actually adapt parameters.
+    pub fn can_adapt_online(&self) -> bool {
+        let Some(online) = &self.online else {
+            return false;
+        };
+        match &online.policy {
+            Some(policy) => llm_policy::policy_can_train(policy),
+            None => !matches!(online.cfg.train_mode, OnlineTrainMode::None),
+        }
     }
 
     /// Number of tokens processed by the online updater.
@@ -1101,6 +1126,31 @@ impl Compressor {
     #[inline]
     pub fn online_bias_slice(&self) -> Option<&[f32]> {
         self.online.as_ref().map(|o| o.out_bias.as_slice())
+    }
+
+    #[inline]
+    fn refresh_current_pdf(&mut self, token: u32) {
+        let logits = self
+            .model
+            .forward(&mut self.scratch, token, &mut self.state);
+        let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
+        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+    }
+
+    fn fit_chain(&mut self, parts: &[&[u8]], total_symbols: Option<u64>) -> Result<()> {
+        self.prepare_policy_stream(total_symbols)?;
+        for part in parts {
+            for &byte in *part {
+                self.online_update_from_current_pdf(byte)?;
+                self.refresh_current_pdf(byte as u32);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn advance_inference_only(&mut self, symbol: u8) {
+        self.refresh_current_pdf(symbol as u32);
     }
 
     fn resolve_online_train_action(
@@ -1829,31 +1879,15 @@ impl Compressor {
         if data.is_empty() {
             return Ok(0.0);
         }
-        self.state.reset();
         let prefix_len = prefix_parts
             .iter()
             .fold(0usize, |acc, p| acc.saturating_add(p.len()));
-        self.prepare_policy_stream(Some((prefix_len + data.len()) as u64))?;
-
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-
-        for part in prefix_parts {
-            for &byte in *part {
-                self.online_update_from_current_pdf(byte)?;
-                let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-                let logits = self
-                    .model
-                    .forward(&mut self.scratch, byte as u32, &mut self.state);
-                Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
-            }
-        }
+        self.reset_and_prime();
+        self.fit_chain(prefix_parts, Some((prefix_len + data.len()) as u64))?;
 
         let mut total_bits = 0.0f64;
         for &byte in data {
-            let p = self.pdf_buffer[byte as usize];
-            total_bits -= p.log2();
+            total_bits -= self.pdf_buffer[byte as usize].log2();
             self.online_update_from_current_pdf(byte)?;
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self
@@ -1871,28 +1905,18 @@ impl Compressor {
             return Ok(0.0);
         }
 
-        self.state.reset();
+        self.reset_and_prime();
         self.prepare_policy_stream(Some((prefix.len() + data.len()) as u64))?;
-
-        // Prime with null byte
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         // Condition on prefix (update state, no scoring)
         for &byte in prefix {
             self.online_update_from_current_pdf(byte)?;
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, byte as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+            self.refresh_current_pdf(byte as u32);
         }
 
         let mut total_bits = 0.0f64;
         for &byte in data {
-            let p = self.pdf_buffer[byte as usize];
-            total_bits -= p.log2();
+            total_bits -= self.pdf_buffer[byte as usize].log2();
             self.online_update_from_current_pdf(byte)?;
             let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
             let logits = self

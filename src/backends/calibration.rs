@@ -66,6 +66,18 @@ impl CalibratorCore {
             .clamp(-self.bias_clip, self.bias_clip);
         self.analyzer.update(symbol);
     }
+
+    /// Reset only the dynamic context state while preserving fitted weights.
+    pub fn reset_context(&mut self) {
+        self.analyzer = TextContextAnalyzer::new();
+        self.last_context = 0;
+        self.last_bins.fill(0);
+    }
+
+    /// Advance context state without updating fitted calibration weights.
+    pub fn update_context_only(&mut self, symbol: u8) {
+        self.analyzer.update(symbol);
+    }
 }
 
 fn context_cardinality(kind: CalibrationContextKind) -> usize {

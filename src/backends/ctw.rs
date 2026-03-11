@@ -890,6 +890,12 @@ impl FacContextTree {
         self.shared_history.truncate(new_len);
     }
 
+    /// Reset only the shared conditioning history while preserving fitted trees.
+    #[inline]
+    pub fn reset_history_only(&mut self) {
+        self.shared_history.clear();
+    }
+
     /// Returns the combined log block probability (sum of all trees).
     #[inline]
     pub fn get_log_block_probability(&self) -> f64 {

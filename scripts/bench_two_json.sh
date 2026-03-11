@@ -767,6 +767,8 @@ PY
 
 say "[bench] Raw TSV: ${RAW_TSV}"
 say "[bench] Summary TSV: ${SUMMARY_TSV}"
+say "[bench] Compare against the checked-in baseline:"
+say "  python3 '${ROOT_DIR}/scripts/compare_bench_two_json.py' '${SUMMARY_TSV}'"
 say "[bench] Plot commands:"
 say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title 'h RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
 say "  awk -F '\\t' 'NR==1 || \$1==\"compress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title 'compress RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"

@@ -43,6 +43,7 @@ pub(crate) struct NeuralMixCore {
     stage2_mix: Vec<f64>,
     expert_weights: Vec<f64>,
     mix_prob: f64,
+    context_mixtures_valid: bool,
     evaluated: bool,
 }
 
@@ -94,6 +95,7 @@ impl NeuralMixCore {
             stage2_mix: vec![0.0; Self::STAGE1_CONTEXTS],
             expert_weights: vec![0.0; expert_count],
             mix_prob: 1.0 / 256.0,
+            context_mixtures_valid: false,
             evaluated: false,
         }
     }
@@ -106,6 +108,7 @@ impl NeuralMixCore {
     #[inline]
     pub(crate) fn set_context_state(&mut self, context: NeuralContextState) {
         self.context = context;
+        self.context_mixtures_valid = false;
         self.evaluated = false;
     }
 
@@ -118,14 +121,14 @@ impl NeuralMixCore {
             *dst = p.max(floor).min(1.0 - floor);
         }
 
-        self.compute_context_mixtures();
+        self.ensure_context_mixtures();
 
         let mut mix = 0.0;
         for k in 0..Self::STAGE1_CONTEXTS {
             let row = &self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];
             let mut p_k = 0.0;
-            for i in 0..self.expert_count {
-                p_k += row[i] * self.expert_probs[i];
+            for (&weight, &expert_prob) in row.iter().zip(self.expert_probs.iter()) {
+                p_k += weight * expert_prob;
             }
             let p_k = p_k.max(floor).min(1.0 - floor);
             self.stage1_probs[k] = p_k;
@@ -138,7 +141,7 @@ impl NeuralMixCore {
 
     #[inline]
     pub(crate) fn evaluate_expert_weights(&mut self) {
-        self.compute_context_mixtures();
+        self.ensure_context_mixtures();
         self.evaluated = false;
     }
 
@@ -180,12 +183,27 @@ impl NeuralMixCore {
             let r_k = old_stage2_mix[k];
             let p_k = self.stage1_probs[k];
             let row = &self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];
-            for i in 0..self.expert_count {
-                let grad = r_k * row[i] * (self.expert_probs[i] - p_k) / p_mix;
-                entry.logits[i] = sanitize_weight(entry.logits[i] + self.stage1_lr * grad);
+            for ((logit, &weight), &expert_prob) in entry
+                .logits
+                .iter_mut()
+                .zip(row.iter())
+                .zip(self.expert_probs.iter())
+            {
+                let grad = r_k * weight * (expert_prob - p_k) / p_mix;
+                *logit = sanitize_weight(*logit + self.stage1_lr * grad);
             }
         }
         self.evaluated = false;
+        self.context_mixtures_valid = false;
+    }
+
+    #[inline]
+    fn ensure_context_mixtures(&mut self) {
+        if self.context_mixtures_valid {
+            return;
+        }
+        self.compute_context_mixtures();
+        self.context_mixtures_valid = true;
     }
 
     #[inline]
@@ -267,8 +285,8 @@ impl NeuralMixCore {
         for k in 0..Self::STAGE1_CONTEXTS {
             let row = &self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];
             let r_k = self.stage2_mix[k];
-            for i in 0..self.expert_count {
-                self.expert_weights[i] += r_k * row[i];
+            for (expert_weight, &weight) in self.expert_weights.iter_mut().zip(row.iter()) {
+                *expert_weight += r_k * weight;
             }
         }
     }

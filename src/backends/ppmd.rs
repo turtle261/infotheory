@@ -84,6 +84,19 @@ impl PpmdModel {
         self.valid = false;
     }
 
+    /// Reset only the conditioning history while preserving fitted contexts.
+    pub fn reset_history(&mut self) {
+        self.history.clear();
+        self.valid = false;
+        self.pdf.fill(1.0 / 256.0);
+    }
+
+    /// Advance conditioning history without updating fitted context counts.
+    pub fn update_history_only(&mut self, symbol: u8) {
+        self.history.push(symbol);
+        self.valid = false;
+    }
+
     fn ensure_pdf(&mut self) {
         if self.valid {
             return;

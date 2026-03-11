@@ -114,6 +114,23 @@ pub trait OnlineBytePredictor: Send {
 
     /// Update the predictor with the observed `symbol`.
     fn update(&mut self, symbol: u8);
+
+    /// Reset only dynamic conditioning state while preserving fitted parameters/statistics.
+    ///
+    /// Predictors with latent/posterior state may also preserve their learned
+    /// parameter posterior here; "frozen" means no new parameter fitting during
+    /// the score pass, not necessarily a static hidden-state belief.
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        self.begin_stream(total_symbols)
+    }
+
+    /// Advance conditioning state without fitting or adapting parameters.
+    ///
+    /// For state-space or latent-variable models this may still update internal
+    /// filtering/posterior state needed for correct sequential predictions.
+    fn update_frozen(&mut self, symbol: u8) {
+        self.update(symbol);
+    }
 }
 
 fn fill_fac_tree_log_probs(
@@ -903,6 +920,183 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
         }
     }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        match self {
+            RateBackendPredictor::Rosa { model, .. } => {
+                if let Some(total) = total_symbols {
+                    let reserve = usize::try_from(total).unwrap_or(usize::MAX / 4);
+                    model.reserve_for_stream(reserve);
+                }
+                model.build_lm_full_bytes_no_finalize_endpos();
+                model.reset_conditioning_cursor();
+                Ok(())
+            }
+            RateBackendPredictor::Match { model, .. } => {
+                model.reset_history();
+                Ok(())
+            }
+            RateBackendPredictor::SparseMatch { model, .. } => {
+                model.reset_history();
+                Ok(())
+            }
+            RateBackendPredictor::Ppmd { model, .. } => {
+                model.reset_history();
+                Ok(())
+            }
+            RateBackendPredictor::Ctw { tree, .. } => {
+                tree.reset_history_only();
+                Ok(())
+            }
+            RateBackendPredictor::FacCtw { tree, .. } => {
+                tree.reset_history_only();
+                Ok(())
+            }
+            #[cfg(feature = "backend-rwkv")]
+            RateBackendPredictor::Rwkv7 {
+                compressor, primed, ..
+            } => {
+                compressor.reset_and_prime();
+                *primed = true;
+                Ok(())
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackendPredictor::Mamba {
+                compressor, primed, ..
+            } => {
+                compressor.reset_and_prime();
+                *primed = true;
+                Ok(())
+            }
+            RateBackendPredictor::Zpaq { .. } => {
+                Err("plugin entropy is not supported for zpaq rate backends in 1.1.0".to_string())
+            }
+            RateBackendPredictor::Mixture { runtime } => runtime.reset_frozen(total_symbols),
+            RateBackendPredictor::Particle { runtime } => {
+                runtime.reset_frozen_state();
+                Ok(())
+            }
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+                ..
+            } => {
+                base.reset_frozen(total_symbols)?;
+                core.reset_context();
+                pdf.fill(1.0 / 256.0);
+                *valid = false;
+                Ok(())
+            }
+        }
+    }
+
+    fn update_frozen(&mut self, symbol: u8) {
+        match self {
+            RateBackendPredictor::Rosa { model, .. } => {
+                model.advance_conditioning_byte(symbol);
+            }
+            RateBackendPredictor::Match { model, .. } => {
+                model.update_history_only(symbol);
+            }
+            RateBackendPredictor::SparseMatch { model, .. } => {
+                model.update_history_only(symbol);
+            }
+            RateBackendPredictor::Ppmd { model, .. } => {
+                model.update_history_only(symbol);
+            }
+            RateBackendPredictor::Ctw { tree, .. } => {
+                let mut bits = [false; 8];
+                for (bit_idx, slot) in bits.iter_mut().enumerate() {
+                    *slot = ((symbol >> (7 - bit_idx)) & 1) == 1;
+                }
+                tree.update_history(&bits);
+            }
+            RateBackendPredictor::FacCtw {
+                tree,
+                bits_per_symbol,
+                ..
+            } => {
+                let bits = (*bits_per_symbol).clamp(1, 8);
+                let mut history_bits = [false; 8];
+                for (idx, slot) in history_bits.iter_mut().enumerate().take(bits) {
+                    *slot = ((symbol >> idx) & 1) == 1;
+                }
+                tree.update_history(&history_bits[..bits]);
+            }
+            #[cfg(feature = "backend-rwkv")]
+            RateBackendPredictor::Rwkv7 {
+                compressor, primed, ..
+            } => {
+                if !*primed {
+                    compressor.reset_and_prime();
+                    *primed = true;
+                }
+                let bias = compressor.online_bias_snapshot();
+                let logits = compressor.model.forward(
+                    &mut compressor.scratch,
+                    symbol as u32,
+                    &mut compressor.state,
+                );
+                rwkvzip::Compressor::logits_to_pdf(
+                    logits,
+                    bias.as_deref(),
+                    &mut compressor.pdf_buffer,
+                );
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackendPredictor::Mamba {
+                compressor, primed, ..
+            } => {
+                if !*primed {
+                    compressor.reset_and_prime();
+                    *primed = true;
+                }
+                let bias = compressor.online_bias_snapshot();
+                let logits = compressor.model.forward(
+                    &mut compressor.scratch,
+                    symbol as u32,
+                    &mut compressor.state,
+                );
+                mambazip::Compressor::logits_to_pdf(
+                    logits,
+                    bias.as_deref(),
+                    &mut compressor.pdf_buffer,
+                );
+            }
+            RateBackendPredictor::Zpaq { model } => {
+                model.update(symbol);
+            }
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.update_frozen(symbol);
+            }
+            RateBackendPredictor::Particle { runtime } => {
+                runtime.update_frozen(symbol);
+            }
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+                ..
+            } => {
+                if !*valid {
+                    let mut base_logps = [0.0; 256];
+                    base.fill_log_probs(&mut base_logps);
+                    let mut base_pdf = [0.0; 256];
+                    for (dst, &lp) in base_pdf.iter_mut().zip(base_logps.iter()) {
+                        *dst = clamp_prob(lp.exp(), DEFAULT_MIN_PROB);
+                    }
+                    core.apply_pdf(&base_pdf, pdf);
+                    *valid = true;
+                }
+                base.update_frozen(symbol);
+                core.update_context_only(symbol);
+                *valid = false;
+            }
+        }
+    }
 }
 
 /// Configuration for a mixture expert.
@@ -1088,6 +1282,16 @@ impl ExpertState {
     fn update(&mut self, symbol: u8) {
         self.predictor.update(symbol);
     }
+
+    #[inline]
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        self.predictor.reset_frozen(total_symbols)
+    }
+
+    #[inline]
+    fn update_frozen(&mut self, symbol: u8) {
+        self.predictor.update_frozen(symbol);
+    }
 }
 
 /// Exponential-weights Bayes mixture (log-loss Hedge).
@@ -1231,6 +1435,22 @@ impl BayesMixture {
     pub fn expert_names(&self) -> Vec<String> {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        for expert in &mut self.experts {
+            expert.reset_frozen(total_symbols)?;
+        }
+        self.cache_valid = false;
+        self.total_log_loss = 0.0;
+        Ok(())
+    }
+
+    fn update_frozen(&mut self, symbol: u8) {
+        for expert in &mut self.experts {
+            expert.update_frozen(symbol);
+        }
+        self.cache_valid = false;
+    }
 }
 
 /// Exponential-weights Bayes mixture with exponential forgetting on weights.
@@ -1361,6 +1581,22 @@ impl FadingBayesMixture {
     /// Expert names in order.
     pub fn expert_names(&self) -> Vec<String> {
         self.experts.iter().map(|e| e.name.clone()).collect()
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        for expert in &mut self.experts {
+            expert.reset_frozen(total_symbols)?;
+        }
+        self.cache_valid = false;
+        self.total_log_loss = 0.0;
+        Ok(())
+    }
+
+    fn update_frozen(&mut self, symbol: u8) {
+        for expert in &mut self.experts {
+            expert.update_frozen(symbol);
+        }
+        self.cache_valid = false;
     }
 }
 
@@ -1532,6 +1768,22 @@ impl SwitchingMixture {
     pub fn expert_names(&self) -> Vec<String> {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        for expert in &mut self.experts {
+            expert.reset_frozen(total_symbols)?;
+        }
+        self.cache_valid = false;
+        self.total_log_loss = 0.0;
+        Ok(())
+    }
+
+    fn update_frozen(&mut self, symbol: u8) {
+        for expert in &mut self.experts {
+            expert.update_frozen(symbol);
+        }
+        self.cache_valid = false;
+    }
 }
 
 /// MDL-style selector: predicts with the current best expert (by cumulative loss).
@@ -1561,9 +1813,12 @@ pub struct NeuralMixture {
     scratch_expert_logps: Vec<f64>,
     scratch_mix_weights: Vec<f64>,
     eval_cache_valid: bool,
+    eval_cache_full_valid: bool,
     eval_cache_history: NeuralHistoryState,
     eval_cache_symbol: u8,
     eval_cache_logp: f64,
+    eval_cache_mix_logps: [f64; 256],
+    eval_cache_expert_logps: Vec<[f64; 256]>,
     total_log_loss: f64,
 }
 
@@ -1603,25 +1858,90 @@ impl NeuralMixture {
             scratch_expert_logps: vec![0.0; n],
             scratch_mix_weights: vec![0.0; n],
             eval_cache_valid: false,
+            eval_cache_full_valid: false,
             eval_cache_history,
             eval_cache_symbol: 0,
             eval_cache_logp: f64::NEG_INFINITY,
+            eval_cache_mix_logps: [f64::NEG_INFINITY; 256],
+            eval_cache_expert_logps: vec![[f64::NEG_INFINITY; 256]; n],
             total_log_loss: 0.0,
         }
     }
 
+    #[inline]
+    fn invalidate_eval_cache(&mut self) {
+        self.eval_cache_valid = false;
+        self.eval_cache_full_valid = false;
+    }
+
+    fn sync_history_state(&mut self) -> NeuralHistoryState {
+        let history = self.analyzer.state();
+        if self.neural.history_state() != history {
+            self.neural.set_context_state(history);
+        }
+        if self.eval_cache_history != history {
+            self.invalidate_eval_cache();
+            self.eval_cache_history = history;
+        }
+        history
+    }
+
+    fn ensure_full_evaluation(&mut self) {
+        self.sync_history_state();
+        if self.eval_cache_full_valid {
+            return;
+        }
+
+        self.neural.evaluate_expert_weights();
+        self.scratch_mix_weights
+            .copy_from_slice(self.neural.expert_weights());
+        let mut mix_pdf = [0.0f64; 256];
+        for i in 0..self.experts.len() {
+            let row = &mut self.eval_cache_expert_logps[i];
+            self.experts[i].predictor.fill_log_probs(row);
+            let w = self.scratch_mix_weights[i];
+            for (dst, &lp) in mix_pdf.iter_mut().zip(row.iter()) {
+                *dst += w * clamp_prob(lp.exp(), self.min_prob);
+            }
+        }
+
+        let sum: f64 = mix_pdf.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 {
+            let uniform = (1.0f64 / 256.0).ln();
+            self.eval_cache_mix_logps.fill(uniform);
+        } else {
+            let inv = 1.0 / sum;
+            for (dst, &p_raw) in self.eval_cache_mix_logps.iter_mut().zip(mix_pdf.iter()) {
+                let p = clamp_unit_prob(p_raw * inv, self.min_prob);
+                *dst = p.ln();
+            }
+        }
+
+        self.eval_cache_full_valid = true;
+    }
+
     fn evaluate_symbol(&mut self, symbol: u8) -> f64 {
-        self.neural.set_context_state(self.analyzer.state());
-        let history = self.neural.history_state();
+        let history = self.sync_history_state();
         if self.eval_cache_valid
             && self.eval_cache_history == history
             && self.eval_cache_symbol == symbol
         {
-            let p = self
-                .neural
-                .evaluate_symbol(&self.scratch_expert_logps, self.min_prob);
-            self.eval_cache_logp = clamp_unit_prob(p, self.min_prob).ln();
             return self.eval_cache_logp;
+        }
+
+        if self.eval_cache_full_valid && self.eval_cache_history == history {
+            for (dst, row) in self
+                .scratch_expert_logps
+                .iter_mut()
+                .zip(self.eval_cache_expert_logps.iter())
+            {
+                *dst = row[symbol as usize];
+            }
+            let logp = self.eval_cache_mix_logps[symbol as usize];
+            self.eval_cache_valid = true;
+            self.eval_cache_symbol = symbol;
+            self.eval_cache_logp = logp;
+            return logp;
         }
 
         let expert_count = self.experts.len();
@@ -1633,7 +1953,7 @@ impl NeuralMixture {
             .evaluate_symbol(&self.scratch_expert_logps, self.min_prob);
         let logp = clamp_unit_prob(p, self.min_prob).ln();
         self.eval_cache_valid = true;
-        self.eval_cache_history = self.neural.history_state();
+        self.eval_cache_history = history;
         self.eval_cache_symbol = symbol;
         self.eval_cache_logp = logp;
         logp
@@ -1658,35 +1978,8 @@ impl NeuralMixture {
             self.experts[0].predictor.fill_log_probs(out);
             return;
         }
-        self.neural.set_context_state(self.analyzer.state());
-        self.neural.evaluate_expert_weights();
-        self.scratch_mix_weights
-            .copy_from_slice(self.neural.expert_weights());
-        out.fill(0.0);
-        for i in 0..self.experts.len() {
-            let mut row = [0.0f64; 256];
-            self.experts[i].predictor.fill_log_probs(&mut row);
-            let w = self.scratch_mix_weights[i];
-            for b in 0..256 {
-                out[b] += w * clamp_prob(row[b].exp(), self.min_prob);
-            }
-        }
-        let mut sum = 0.0;
-        for &p in out.iter() {
-            sum += p;
-        }
-        if !sum.is_finite() || sum <= 0.0 {
-            let u = 1.0f64 / 256.0;
-            for slot in out.iter_mut() {
-                *slot = u.ln();
-            }
-            return;
-        }
-        let inv = 1.0 / sum;
-        for slot in out.iter_mut() {
-            let p = clamp_unit_prob(*slot * inv, self.min_prob);
-            *slot = p.ln();
-        }
+        self.ensure_full_evaluation();
+        out.copy_from_slice(&self.eval_cache_mix_logps);
     }
 
     /// Log-probability (natural log) of the neural mixture for `symbol`, then update.
@@ -1703,7 +1996,7 @@ impl NeuralMixture {
             self.total_log_loss -= logp;
             self.analyzer.update(symbol);
             self.neural.set_context_state(self.analyzer.state());
-            self.eval_cache_valid = false;
+            self.invalidate_eval_cache();
             return logp;
         }
 
@@ -1720,13 +2013,35 @@ impl NeuralMixture {
         self.total_log_loss -= logp;
         self.analyzer.update(symbol);
         self.neural.set_context_state(self.analyzer.state());
-        self.eval_cache_valid = false;
+        self.invalidate_eval_cache();
         logp
     }
 
     /// Total log-loss of the mixture so far (nats).
     pub fn total_log_loss(&self) -> f64 {
         self.total_log_loss
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        for expert in &mut self.experts {
+            expert.reset_frozen(total_symbols)?;
+        }
+        self.analyzer = TextContextAnalyzer::new();
+        self.neural.set_context_state(self.analyzer.state());
+        self.invalidate_eval_cache();
+        self.eval_cache_history = self.neural.history_state();
+        self.total_log_loss = 0.0;
+        Ok(())
+    }
+
+    fn update_frozen(&mut self, symbol: u8) {
+        for expert in &mut self.experts {
+            expert.update_frozen(symbol);
+        }
+        self.analyzer.update(symbol);
+        self.neural.set_context_state(self.analyzer.state());
+        self.invalidate_eval_cache();
+        self.eval_cache_history = self.neural.history_state();
     }
 }
 
@@ -1857,6 +2172,22 @@ impl MdlSelector {
     pub fn expert_names(&self) -> Vec<String> {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        for expert in &mut self.experts {
+            expert.reset_frozen(total_symbols)?;
+        }
+        self.cache_valid = false;
+        self.total_log_loss = 0.0;
+        Ok(())
+    }
+
+    fn update_frozen(&mut self, symbol: u8) {
+        for expert in &mut self.experts {
+            expert.update_frozen(symbol);
+        }
+        self.cache_valid = false;
+    }
 }
 
 // =============================================================================
@@ -1864,6 +2195,7 @@ impl MdlSelector {
 // =============================================================================
 
 /// Runtime wrapper over concrete mixture strategies.
+#[allow(clippy::large_enum_variant)]
 pub enum MixtureRuntime {
     /// Bayes mixture.
     Bayes(BayesMixture),
@@ -1888,6 +2220,16 @@ impl MixtureRuntime {
         }
     }
 
+    pub(crate) fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.reset_frozen(total_symbols),
+            MixtureRuntime::Fading(m) => m.reset_frozen(total_symbols),
+            MixtureRuntime::Switching(m) => m.reset_frozen(total_symbols),
+            MixtureRuntime::Mdl(m) => m.reset_frozen(total_symbols),
+            MixtureRuntime::Neural(m) => m.reset_frozen(total_symbols),
+        }
+    }
+
     /// Non-mutating log-probability (nats) for `symbol` at current state.
     pub(crate) fn peek_log_prob(&mut self, symbol: u8) -> f64 {
         match self {
@@ -1907,6 +2249,16 @@ impl MixtureRuntime {
             MixtureRuntime::Switching(m) => m.step(symbol),
             MixtureRuntime::Mdl(m) => m.step(symbol),
             MixtureRuntime::Neural(m) => m.step(symbol),
+        }
+    }
+
+    pub(crate) fn update_frozen(&mut self, symbol: u8) {
+        match self {
+            MixtureRuntime::Bayes(m) => m.update_frozen(symbol),
+            MixtureRuntime::Fading(m) => m.update_frozen(symbol),
+            MixtureRuntime::Switching(m) => m.update_frozen(symbol),
+            MixtureRuntime::Mdl(m) => m.update_frozen(symbol),
+            MixtureRuntime::Neural(m) => m.update_frozen(symbol),
         }
     }
 
@@ -2117,6 +2469,26 @@ mod tests {
         fn update(&mut self, _symbol: u8) {}
     }
 
+    struct CountingFillPredict {
+        log_calls: Arc<AtomicUsize>,
+        fill_calls: Arc<AtomicUsize>,
+    }
+
+    impl OnlineBytePredictor for CountingFillPredict {
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            self.log_calls.fetch_add(1, Ordering::Relaxed);
+            if symbol == 0 { 0.0 } else { -20.0 }
+        }
+
+        fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+            self.fill_calls.fetch_add(1, Ordering::Relaxed);
+            out.fill(-20.0);
+            out[0] = 0.0;
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+    }
+
     struct BeginAwarePredict {
         seen_total: Arc<AtomicU64>,
         began: bool,
@@ -2181,6 +2553,48 @@ mod tests {
         let _ = mix.predict_log_prob(1);
         let after_second = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
         assert_eq!(after_second, after_first + 2);
+    }
+
+    #[test]
+    fn neural_fill_then_step_reuses_cached_full_rows() {
+        let log0 = Arc::new(AtomicUsize::new(0));
+        let log1 = Arc::new(AtomicUsize::new(0));
+        let fill0 = Arc::new(AtomicUsize::new(0));
+        let fill1 = Arc::new(AtomicUsize::new(0));
+        let cfg0 = {
+            let log_calls = log0.clone();
+            let fill_calls = fill0.clone();
+            ExpertConfig::uniform("c0", move || {
+                Box::new(CountingFillPredict {
+                    log_calls: log_calls.clone(),
+                    fill_calls: fill_calls.clone(),
+                })
+            })
+        };
+        let cfg1 = {
+            let log_calls = log1.clone();
+            let fill_calls = fill1.clone();
+            ExpertConfig::uniform("c1", move || {
+                Box::new(CountingFillPredict {
+                    log_calls: log_calls.clone(),
+                    fill_calls: fill_calls.clone(),
+                })
+            })
+        };
+        let mut mix = NeuralMixture::new(&[cfg0, cfg1], 0.03);
+
+        let mut row = [0.0; 256];
+        mix.fill_log_probs(&mut row);
+        assert_eq!(fill0.load(Ordering::Relaxed), 1);
+        assert_eq!(fill1.load(Ordering::Relaxed), 1);
+        assert_eq!(log0.load(Ordering::Relaxed), 0);
+        assert_eq!(log1.load(Ordering::Relaxed), 0);
+
+        let _ = mix.step(0);
+        assert_eq!(fill0.load(Ordering::Relaxed), 1);
+        assert_eq!(fill1.load(Ordering::Relaxed), 1);
+        assert_eq!(log0.load(Ordering::Relaxed), 0);
+        assert_eq!(log1.load(Ordering::Relaxed), 0);
     }
 
     #[test]

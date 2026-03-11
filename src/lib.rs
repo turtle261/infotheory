@@ -124,9 +124,13 @@ thread_local! {
     #[cfg(feature = "backend-mamba")]
     static MAMBA_TLS: RefCell<HashMap<usize, mambazip::Compressor>> = RefCell::new(HashMap::new());
     #[cfg(feature = "backend-mamba")]
+    static MAMBA_RATE_TLS: RefCell<HashMap<usize, mambazip::Compressor>> = RefCell::new(HashMap::new());
+    #[cfg(feature = "backend-mamba")]
     static MAMBA_METHOD_TLS: RefCell<HashMap<String, mambazip::Compressor>> = RefCell::new(HashMap::new());
     #[cfg(feature = "backend-rwkv")]
     static RWKV_TLS: RefCell<HashMap<usize, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
+    #[cfg(feature = "backend-rwkv")]
+    static RWKV_RATE_TLS: RefCell<HashMap<usize, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
     #[cfg(feature = "backend-rwkv")]
     static RWKV_METHOD_TLS: RefCell<HashMap<String, rwkvzip::Compressor>> = RefCell::new(HashMap::new());
 }
@@ -1137,6 +1141,26 @@ fn with_rwkv_method_tls<R>(method: &str, f: impl FnOnce(&mut rwkvzip::Compressor
     })
 }
 
+#[cfg(feature = "backend-rwkv")]
+fn with_rwkv_rate_tls<R>(
+    model: &Arc<rwkvzip::Model>,
+    f: impl FnOnce(&mut rwkvzip::Compressor) -> R,
+) -> R {
+    let key = Arc::as_ptr(model) as usize;
+    RWKV_RATE_TLS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let mut comp = if let Some(template) = map.get(&key) {
+            template.clone()
+        } else {
+            let template = rwkvzip::Compressor::new_from_model(model.clone());
+            map.insert(key, template.clone());
+            template
+        };
+        drop(map);
+        f(&mut comp)
+    })
+}
+
 #[cfg(feature = "backend-mamba")]
 fn with_mamba_tls<R>(
     model: &Arc<mambazip::Model>,
@@ -1149,6 +1173,26 @@ fn with_mamba_tls<R>(
             .entry(key)
             .or_insert_with(|| mambazip::Compressor::new_from_model(model.clone()));
         f(comp)
+    })
+}
+
+#[cfg(feature = "backend-mamba")]
+fn with_mamba_rate_tls<R>(
+    model: &Arc<mambazip::Model>,
+    f: impl FnOnce(&mut mambazip::Compressor) -> R,
+) -> R {
+    let key = Arc::as_ptr(model) as usize;
+    MAMBA_RATE_TLS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let mut comp = if let Some(template) = map.get(&key) {
+            template.clone()
+        } else {
+            let template = mambazip::Compressor::new_from_model(model.clone());
+            map.insert(key, template.clone());
+            template
+        };
+        drop(map);
+        f(&mut comp)
     })
 }
 
@@ -1331,6 +1375,83 @@ fn prequential_rate_backend(
     bits / (data.len() as f64)
 }
 
+fn frozen_plugin_rate_backend(
+    score_data: &[u8],
+    fit_parts: &[&[u8]],
+    max_order: i64,
+    backend: &RateBackend,
+) -> f64 {
+    if score_data.is_empty() {
+        return 0.0;
+    }
+    if matches!(backend, RateBackend::RosaPlus) {
+        let mut model = rosaplus::RosaPlus::new(max_order, false, 0, 42);
+        for part in fit_parts {
+            model.train_example(part);
+        }
+        model.build_lm();
+        return model.cross_entropy(score_data);
+    }
+    #[cfg(feature = "backend-rwkv")]
+    match backend {
+        RateBackend::Rwkv7 { model } => {
+            return with_rwkv_rate_tls(model, |c| {
+                c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
+                    .unwrap_or_else(|e| panic!("rwkv frozen-plugin scoring failed: {e:#}"))
+            });
+        }
+        RateBackend::Rwkv7Method { method } => {
+            return with_rwkv_method_tls(method, |c| {
+                c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
+                    .unwrap_or_else(|e| panic!("rwkv method frozen-plugin scoring failed: {e:#}"))
+            });
+        }
+        _ => {}
+    }
+    #[cfg(feature = "backend-mamba")]
+    match backend {
+        RateBackend::Mamba { model } => {
+            return with_mamba_rate_tls(model, |c| {
+                c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
+                    .unwrap_or_else(|e| panic!("mamba frozen-plugin scoring failed: {e:#}"))
+            });
+        }
+        RateBackend::MambaMethod { method } => {
+            return with_mamba_method_tls(method, |c| {
+                c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
+                    .unwrap_or_else(|e| panic!("mamba method frozen-plugin scoring failed: {e:#}"))
+            });
+        }
+        _ => {}
+    }
+
+    use crate::mixture::OnlineBytePredictor;
+
+    let fit_total = fit_parts.iter().map(|part| part.len() as u64).sum::<u64>();
+    let mut predictor = crate::mixture::RateBackendPredictor::from_backend(
+        backend.clone(),
+        max_order,
+        crate::mixture::DEFAULT_MIN_PROB,
+    );
+    predictor
+        .begin_stream(Some(fit_total))
+        .unwrap_or_else(|e| panic!("rate backend fit-pass init failed: {e}"));
+    for part in fit_parts {
+        for &byte in *part {
+            predictor.update(byte);
+        }
+    }
+    predictor
+        .reset_frozen(Some(score_data.len() as u64))
+        .unwrap_or_else(|e| panic!("rate backend frozen-score reset failed: {e}"));
+    let mut bits = 0.0;
+    for &byte in score_data {
+        bits -= predictor.log_prob(byte) / std::f64::consts::LN_2;
+        predictor.update_frozen(byte);
+    }
+    bits / (score_data.len() as f64)
+}
+
 /// Estimate entropy rate of `data` using the explicit rate `backend`.
 pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
@@ -1438,43 +1559,10 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
 /// Estimate biased/plugin entropy rate of `data` using the explicit rate `backend`.
 pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
-        RateBackend::RosaPlus => {
-            let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-            m.train_example(data);
-            m.build_lm();
-            m.cross_entropy(data)
+        RateBackend::Zpaq { .. } => {
+            panic!("biased/plugin entropy is not supported for zpaq rate backends in 1.1.0")
         }
-        RateBackend::Match { .. }
-        | RateBackend::SparseMatch { .. }
-        | RateBackend::Ppmd { .. }
-        | RateBackend::Calibrated { .. } => entropy_rate_backend(data, max_order, backend),
-        #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
-            c.cross_entropy(data)
-                .unwrap_or_else(|e| panic!("rwkv biased-entropy scoring failed: {e:#}"))
-        }),
-        #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
-            c.cross_entropy(data)
-                .unwrap_or_else(|e| panic!("rwkv method biased-entropy scoring failed: {e:#}"))
-        }),
-        #[cfg(feature = "backend-mamba")]
-        RateBackend::Mamba { model } => with_mamba_tls(model, |c| {
-            c.cross_entropy(data)
-                .unwrap_or_else(|e| panic!("mamba biased-entropy scoring failed: {e:#}"))
-        }),
-        #[cfg(feature = "backend-mamba")]
-        RateBackend::MambaMethod { method } => with_mamba_method_tls(method, |c| {
-            c.cross_entropy(data)
-                .unwrap_or_else(|e| panic!("mamba method biased-entropy scoring failed: {e:#}"))
-        }),
-        RateBackend::Zpaq { .. } => entropy_rate_backend(data, max_order, backend),
-        RateBackend::Mixture { .. } => entropy_rate_backend(data, max_order, backend),
-        RateBackend::Particle { .. } => entropy_rate_backend(data, max_order, backend),
-        RateBackend::Ctw { .. } | RateBackend::FacCtw { .. } => {
-            // CTW/FAC-CTW are online, so biased=prequential
-            entropy_rate_backend(data, max_order, backend)
-        }
+        _ => frozen_plugin_rate_backend(data, &[data], max_order, backend),
     }
 }
 
@@ -1486,42 +1574,6 @@ pub fn cross_entropy_rate_backend(
     backend: &RateBackend,
 ) -> f64 {
     match backend {
-        RateBackend::RosaPlus => {
-            let mut m = rosaplus::RosaPlus::new(max_order, false, 0, 42);
-            m.train_example(train_data);
-            m.build_lm();
-            m.cross_entropy(test_data)
-        }
-        RateBackend::Match { .. }
-        | RateBackend::SparseMatch { .. }
-        | RateBackend::Ppmd { .. }
-        | RateBackend::Calibrated { .. } => {
-            prequential_rate_backend(test_data, &[train_data], max_order, backend)
-        }
-        #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7 { model } => {
-            with_rwkv_tls(model, |c| {
-                // Inverted args fix: (prefix, target) -> (train, test)
-                // This estimates H_{train}(test)
-                c.cross_entropy_conditional(train_data, test_data)
-                    .unwrap_or_else(|e| panic!("rwkv cross-entropy scoring failed: {e:#}"))
-            })
-        }
-        #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
-            c.cross_entropy_conditional(train_data, test_data)
-                .unwrap_or_else(|e| panic!("rwkv method cross-entropy scoring failed: {e:#}"))
-        }),
-        #[cfg(feature = "backend-mamba")]
-        RateBackend::Mamba { model } => with_mamba_tls(model, |c| {
-            c.cross_entropy_conditional(train_data, test_data)
-                .unwrap_or_else(|e| panic!("mamba cross-entropy scoring failed: {e:#}"))
-        }),
-        #[cfg(feature = "backend-mamba")]
-        RateBackend::MambaMethod { method } => with_mamba_method_tls(method, |c| {
-            c.cross_entropy_conditional(train_data, test_data)
-                .unwrap_or_else(|e| panic!("mamba method cross-entropy scoring failed: {e:#}"))
-        }),
         RateBackend::Zpaq { method } => {
             if test_data.is_empty() {
                 return 0.0;
@@ -1531,91 +1583,7 @@ pub fn cross_entropy_rate_backend(
             let bits = model.update_and_score(test_data);
             bits / (test_data.len() as f64)
         }
-        RateBackend::Mixture { spec } => {
-            if test_data.is_empty() {
-                return 0.0;
-            }
-            let experts = spec.build_experts();
-            let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
-                .unwrap_or_else(|e| panic!("MixtureSpec invalid: {e}"));
-            let total = (train_data.len() as u64).saturating_add(test_data.len() as u64);
-            mix.begin_stream(Some(total))
-                .unwrap_or_else(|e| panic!("Mixture stream init failed: {e}"));
-            for &b in train_data {
-                mix.step(b);
-            }
-            let mut bits = 0.0;
-            for &b in test_data {
-                bits -= mix.step(b) / std::f64::consts::LN_2;
-            }
-            bits / (test_data.len() as f64)
-        }
-        RateBackend::Particle { spec } => {
-            if test_data.is_empty() {
-                return 0.0;
-            }
-            let mut runtime = crate::particle::ParticleRuntime::new(spec.as_ref());
-            for &b in train_data {
-                runtime.step(b);
-            }
-            let mut bits = 0.0;
-            for &b in test_data {
-                bits -= runtime.step(b) / std::f64::consts::LN_2;
-            }
-            bits / (test_data.len() as f64)
-        }
-        RateBackend::Ctw { depth } => {
-            if test_data.is_empty() {
-                return 0.0;
-            }
-            let mut fac = crate::ctw::FacContextTree::new(*depth, 8);
-            for &b in train_data {
-                for bit_idx in 0..8 {
-                    let bit = ((b >> (7 - bit_idx)) & 1) == 1;
-                    fac.update(bit, bit_idx);
-                }
-            }
-            let log_p_y = fac.get_log_block_probability();
-            for &b in test_data {
-                for bit_idx in 0..8 {
-                    let bit = ((b >> (7 - bit_idx)) & 1) == 1;
-                    fac.update(bit, bit_idx);
-                }
-            }
-            let log_p_yx = fac.get_log_block_probability();
-            let log_p_x_given_y = log_p_yx - log_p_y;
-            let bits = -log_p_x_given_y / std::f64::consts::LN_2;
-            bits / (test_data.len() as f64)
-        }
-        RateBackend::FacCtw {
-            base_depth,
-            num_percept_bits: _,
-            encoding_bits,
-        } => {
-            if test_data.is_empty() {
-                return 0.0;
-            }
-            let bits_per_byte = (*encoding_bits).clamp(1, 8);
-            let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
-            for &b in train_data {
-                for i in 0..bits_per_byte {
-                    let bit_idx = i;
-                    fac.update(((b >> i) & 1) == 1, bit_idx);
-                }
-            }
-
-            let log_p_y = fac.get_log_block_probability();
-            for &b in test_data {
-                for i in 0..bits_per_byte {
-                    let bit_idx = i;
-                    fac.update(((b >> i) & 1) == 1, bit_idx);
-                }
-            }
-            let log_p_yx = fac.get_log_block_probability();
-            let log_p_x_given_y = log_p_yx - log_p_y;
-            let bits = -log_p_x_given_y / std::f64::consts::LN_2;
-            bits / (test_data.len() as f64)
-        }
+        _ => frozen_plugin_rate_backend(test_data, &[train_data], max_order, backend),
     }
 }
 
@@ -1626,6 +1594,10 @@ pub fn joint_entropy_rate_backend(
     max_order: i64,
     backend: &RateBackend,
 ) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
+    if x.is_empty() {
+        return 0.0;
+    }
     match backend {
         RateBackend::RosaPlus => {
             let joint_symbols: Vec<u32> = (0..x.len())
@@ -1638,13 +1610,10 @@ pub fn joint_entropy_rate_backend(
         | RateBackend::SparseMatch { .. }
         | RateBackend::Ppmd { .. }
         | RateBackend::Calibrated { .. } => {
-            if x.is_empty() {
-                return 0.0;
-            }
             let mut joint = Vec::with_capacity(x.len() * 2);
-            for i in 0..x.len() {
-                joint.push(x[i]);
-                joint.push(y[i]);
+            for (&xb, &yb) in x.iter().zip(y.iter()) {
+                joint.push(xb);
+                joint.push(yb);
             }
             entropy_rate_backend(&joint, max_order, backend) * 2.0
         }
@@ -1669,26 +1638,20 @@ pub fn joint_entropy_rate_backend(
                 .unwrap_or_else(|e| panic!("mamba method joint-entropy scoring failed: {e:#}"))
         }),
         RateBackend::Zpaq { method } => {
-            if x.is_empty() {
-                return 0.0;
-            }
             let mut joint = Vec::with_capacity(x.len() * 2);
-            for i in 0..x.len() {
-                joint.push(x[i]);
-                joint.push(y[i]);
+            for (&xb, &yb) in x.iter().zip(y.iter()) {
+                joint.push(xb);
+                joint.push(yb);
             }
             let mut model = crate::zpaq_rate::ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
             let bits = model.update_and_score(&joint);
             bits / (x.len() as f64)
         }
         RateBackend::Mixture { spec } => {
-            if x.is_empty() {
-                return 0.0;
-            }
             let mut joint = Vec::with_capacity(x.len() * 2);
-            for i in 0..x.len() {
-                joint.push(x[i]);
-                joint.push(y[i]);
+            for (&xb, &yb) in x.iter().zip(y.iter()) {
+                joint.push(xb);
+                joint.push(yb);
             }
             let experts = spec.build_experts();
             let mut mix = crate::mixture::build_mixture_runtime(spec.as_ref(), &experts)
@@ -1702,13 +1665,10 @@ pub fn joint_entropy_rate_backend(
             bits / (x.len() as f64)
         }
         RateBackend::Particle { spec } => {
-            if x.is_empty() {
-                return 0.0;
-            }
             let mut joint = Vec::with_capacity(x.len() * 2);
-            for i in 0..x.len() {
-                joint.push(x[i]);
-                joint.push(y[i]);
+            for (&xb, &yb) in x.iter().zip(y.iter()) {
+                joint.push(xb);
+                joint.push(yb);
             }
             let mut runtime = crate::particle::ParticleRuntime::new(spec.as_ref());
             let mut bits = 0.0;
@@ -2602,6 +2562,73 @@ pub fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -
 mod tests {
     use super::*;
 
+    fn test_match_backend() -> RateBackend {
+        RateBackend::Match {
+            hash_bits: 12,
+            min_len: 2,
+            max_len: 16,
+            base_mix: 0.01,
+            confidence_scale: 1.0,
+        }
+    }
+
+    fn test_ppmd_backend() -> RateBackend {
+        RateBackend::Ppmd {
+            order: 4,
+            memory_mb: 1,
+        }
+    }
+
+    fn test_calibrated_backend() -> RateBackend {
+        RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec {
+                base: test_match_backend(),
+                context: CalibrationContextKind::Text,
+                bins: 16,
+                learning_rate: 0.05,
+                bias_clip: 4.0,
+            }),
+        }
+    }
+
+    fn test_mixture_backend() -> RateBackend {
+        RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![
+                    MixtureExpertSpec {
+                        name: Some("match".to_string()),
+                        log_prior: 0.0,
+                        max_order: -1,
+                        backend: test_match_backend(),
+                    },
+                    MixtureExpertSpec {
+                        name: Some("ppmd".to_string()),
+                        log_prior: 0.0,
+                        max_order: -1,
+                        backend: test_ppmd_backend(),
+                    },
+                ],
+            )),
+        }
+    }
+
+    fn test_particle_backend() -> RateBackend {
+        RateBackend::Particle {
+            spec: Arc::new(ParticleSpec {
+                num_particles: 4,
+                num_cells: 4,
+                cell_dim: 8,
+                num_rules: 2,
+                selector_hidden: 16,
+                rule_hidden: 16,
+                context_window: 8,
+                unroll_steps: 1,
+                ..ParticleSpec::default()
+            }),
+        }
+    }
+
     #[cfg(feature = "backend-zpaq")]
     #[test]
     fn ncd_basic_identity_nonnegative() {
@@ -2800,7 +2827,7 @@ mod tests {
         // With the fix, NTE should not be clamped to 1.0
         // It may or may not exceed 1.0 depending on the specifics, but it should be allowed to
         assert!(
-            nte_rate >= 0.0 && nte_rate <= 2.0 + 1e-9,
+            (0.0..=2.0 + 1e-9).contains(&nte_rate),
             "NTE should be in [0, 2], got {}",
             nte_rate
         );
@@ -2823,6 +2850,114 @@ mod tests {
 
         // Reset
         set_default_ctx(InfotheoryCtx::default());
+    }
+
+    #[test]
+    fn joint_entropy_rate_aligns_inputs_and_handles_empty_cases() {
+        let cases = vec![
+            ("ctw", RateBackend::Ctw { depth: 8 }),
+            (
+                "fac-ctw",
+                RateBackend::FacCtw {
+                    base_depth: 8,
+                    num_percept_bits: 8,
+                    encoding_bits: 8,
+                },
+            ),
+            ("match", test_match_backend()),
+        ];
+
+        for (name, backend) in cases {
+            assert_eq!(
+                joint_entropy_rate_backend(b"", b"nonempty", -1, &backend),
+                0.0,
+                "{name} should return 0.0 for empty aligned pairs"
+            );
+            assert_eq!(
+                joint_entropy_rate_backend(b"nonempty", b"", -1, &backend),
+                0.0,
+                "{name} should return 0.0 when alignment truncates to empty"
+            );
+
+            let aligned = joint_entropy_rate_backend(b"abcd", b"wxyz", -1, &backend);
+            let truncated = joint_entropy_rate_backend(b"abcdextra", b"wxyz", -1, &backend);
+            assert!(
+                (aligned - truncated).abs() < 1e-12,
+                "{name} should score only the aligned prefix: aligned={aligned} truncated={truncated}"
+            );
+        }
+    }
+
+    #[test]
+    fn biased_entropy_is_repeatable_across_backend_families() {
+        let data = b"ABABABAABBABABABAABB";
+        let cases = vec![
+            ("match", test_match_backend()),
+            ("ppmd", test_ppmd_backend()),
+            ("calibrated", test_calibrated_backend()),
+            ("ctw", RateBackend::Ctw { depth: 8 }),
+            ("mixture", test_mixture_backend()),
+            ("particle", test_particle_backend()),
+        ];
+
+        for (name, backend) in cases {
+            let h1 = biased_entropy_rate_backend(data, -1, &backend);
+            let h2 = biased_entropy_rate_backend(data, -1, &backend);
+            assert!(h1.is_finite(), "{name} biased entropy should be finite");
+            assert!(
+                (h1 - h2).abs() < 1e-12,
+                "{name} biased entropy leaked mutable state across calls: h1={h1} h2={h2}"
+            );
+        }
+    }
+
+    #[test]
+    fn biased_entropy_ctw_uses_frozen_plugin_scoring() {
+        let backend = RateBackend::Ctw { depth: 8 };
+        let data = b"AAAAAAAA";
+        let plugin = biased_entropy_rate_backend(data, -1, &backend);
+        let prequential = entropy_rate_backend(data, -1, &backend);
+        assert!(
+            plugin + 1e-9 < prequential,
+            "expected plugin scoring to beat prequential scoring: plugin={plugin} prequential={prequential}"
+        );
+    }
+
+    #[test]
+    fn rosa_plugin_entropy_matches_direct_model_api() {
+        let data = b"abracadabra";
+        let backend = RateBackend::RosaPlus;
+
+        let plugin = biased_entropy_rate_backend(data, 3, &backend);
+
+        let mut direct = rosaplus::RosaPlus::new(3, false, 0, 42);
+        direct.train_example(data);
+        direct.build_lm();
+        let expected = direct.cross_entropy(data);
+
+        assert!(
+            (plugin - expected).abs() < 1e-12,
+            "rosa plugin entropy must match direct model API: plugin={plugin} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn rosa_plugin_cross_entropy_matches_direct_model_api() {
+        let train = b"alakazam";
+        let test = b"abracadabra";
+        let backend = RateBackend::RosaPlus;
+
+        let plugin = cross_entropy_rate_backend(test, train, 3, &backend);
+
+        let mut direct = rosaplus::RosaPlus::new(3, false, 0, 42);
+        direct.train_example(train);
+        direct.build_lm();
+        let expected = direct.cross_entropy(test);
+
+        assert!(
+            (plugin - expected).abs() < 1e-12,
+            "rosa plugin cross entropy must match direct model API: plugin={plugin} expected={expected}"
+        );
     }
 
     #[test]
@@ -2864,6 +2999,49 @@ mod tests {
 
     #[cfg(feature = "backend-rwkv")]
     #[test]
+    fn rwkv_method_without_policy_is_accepted_by_public_api() {
+        let backend = RateBackend::Rwkv7Method {
+            method: "cfg:hidden=64,layers=1,intermediate=64".to_string(),
+        };
+        let data = b"rwkv method without policy";
+        let h1 = entropy_rate_backend(data, -1, &backend);
+        let h2 = biased_entropy_rate_backend(data, -1, &backend);
+        assert!(h1.is_finite());
+        assert!(h2.is_finite());
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn rwkv_infer_only_plugin_collapses_to_single_pass_entropy() {
+        let backend = RateBackend::Rwkv7Method {
+            method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=25,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+        };
+        let data = b"rwkv infer-only plugin equality sample";
+        let h = entropy_rate_backend(data, -1, &backend);
+        let plugin = biased_entropy_rate_backend(data, -1, &backend);
+        assert!(
+            (h - plugin).abs() < 1e-12,
+            "infer-only rwkv plugin should equal single-pass entropy: h={h}, plugin={plugin}"
+        );
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn rwkv_method_biased_entropy_is_stable_across_calls_with_training_policy() {
+        let backend = RateBackend::Rwkv7Method {
+            method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=23,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.0)".to_string(),
+        };
+        let data = b"rwkv plugin stability sample";
+        let h1 = biased_entropy_rate_backend(data, -1, &backend);
+        let h2 = biased_entropy_rate_backend(data, -1, &backend);
+        assert!(
+            (h1 - h2).abs() < 1e-12,
+            "rwkv method biased entropy leaked mutable state across calls: h1={h1}, h2={h2}"
+        );
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
     fn rwkv_method_conditional_chain_is_stable_across_calls() {
         let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=22,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:infer";
         let ctx = InfotheoryCtx::new(
@@ -2883,22 +3061,52 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn mamba_method_without_policy_is_accepted_by_public_api() {
+        let backend = RateBackend::MambaMethod {
+            method: "cfg:hidden=64,layers=1,intermediate=96".to_string(),
+        };
+        let data = b"mamba method without policy";
+        let h1 = entropy_rate_backend(data, -1, &backend);
+        let h2 = biased_entropy_rate_backend(data, -1, &backend);
+        assert!(h1.is_finite());
+        assert!(h2.is_finite());
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn mamba_infer_only_plugin_collapses_to_single_pass_entropy() {
+        let backend = RateBackend::MambaMethod {
+            method: "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+        };
+        let data = b"mamba infer-only plugin equality sample";
+        let h = entropy_rate_backend(data, -1, &backend);
+        let plugin = biased_entropy_rate_backend(data, -1, &backend);
+        assert!(
+            (h - plugin).abs() < 1e-12,
+            "infer-only mamba plugin should equal single-pass entropy: h={h}, plugin={plugin}"
+        );
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn mamba_method_biased_entropy_is_stable_across_calls_with_training_policy() {
+        let backend = RateBackend::MambaMethod {
+            method: "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=24,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.0)".to_string(),
+        };
+        let data = b"mamba plugin stability sample";
+        let h1 = biased_entropy_rate_backend(data, -1, &backend);
+        let h2 = biased_entropy_rate_backend(data, -1, &backend);
+        assert!(
+            (h1 - h2).abs() < 1e-12,
+            "mamba method biased entropy leaked mutable state across calls: h1={h1}, h2={h2}"
+        );
+    }
+
     #[test]
     fn particle_entropy_rate_in_valid_range() {
-        let spec = ParticleSpec {
-            num_particles: 4,
-            num_cells: 4,
-            cell_dim: 8,
-            num_rules: 2,
-            selector_hidden: 16,
-            rule_hidden: 16,
-            context_window: 8,
-            unroll_steps: 1,
-            ..ParticleSpec::default()
-        };
-        let rb = RateBackend::Particle {
-            spec: Arc::new(spec),
-        };
+        let rb = test_particle_backend();
         let data = b"hello world particle backend test";
         let rate = entropy_rate_backend(data, -1, &rb);
         assert!(
@@ -2909,20 +3117,7 @@ mod tests {
 
     #[test]
     fn particle_cross_entropy_stability() {
-        let spec = ParticleSpec {
-            num_particles: 4,
-            num_cells: 4,
-            cell_dim: 8,
-            num_rules: 2,
-            selector_hidden: 16,
-            rule_hidden: 16,
-            context_window: 8,
-            unroll_steps: 1,
-            ..ParticleSpec::default()
-        };
-        let rb = RateBackend::Particle {
-            spec: Arc::new(spec),
-        };
+        let rb = test_particle_backend();
         let train = b"ABCABC";
         let test = b"ABC";
         let h1 = cross_entropy_rate_backend(test, train, -1, &rb);
@@ -2935,9 +3130,8 @@ mod tests {
 
     #[test]
     fn particle_empty_input() {
-        let spec = ParticleSpec::default();
         let rb = RateBackend::Particle {
-            spec: Arc::new(spec),
+            spec: Arc::new(ParticleSpec::default()),
         };
         let rate = entropy_rate_backend(b"", -1, &rb);
         assert!(
@@ -2948,20 +3142,7 @@ mod tests {
 
     #[test]
     fn particle_joint_entropy_rate() {
-        let spec = ParticleSpec {
-            num_particles: 4,
-            num_cells: 4,
-            cell_dim: 8,
-            num_rules: 2,
-            selector_hidden: 16,
-            rule_hidden: 16,
-            context_window: 8,
-            unroll_steps: 1,
-            ..ParticleSpec::default()
-        };
-        let rb = RateBackend::Particle {
-            spec: Arc::new(spec),
-        };
+        let rb = test_particle_backend();
         let x = b"AAAA";
         let y = b"BBBB";
         let joint = joint_entropy_rate_backend(x, y, -1, &rb);

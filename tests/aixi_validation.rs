@@ -30,7 +30,7 @@ fn test_predictor_sum_to_one(mut predictor: Box<dyn Predictor>, name: &str) {
 
     // Check range
     assert!(
-        p_true >= 0.0 && p_true <= 1.0,
+        (0.0..=1.0).contains(&p_true),
         "{name}: Prob out of range: {p_true}"
     );
 }

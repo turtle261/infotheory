@@ -39,8 +39,6 @@ pub enum BackendAvailability {
     },
 }
 
-/// Canonical names for available rate backends in this build.
-#[cfg(all(feature = "backend-rwkv", feature = "backend-mamba"))]
 pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     "rosaplus",
     "ctw",
@@ -49,55 +47,10 @@ pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     "sparse-match",
     "ppmd",
     "calibrated",
+    #[cfg(feature = "backend-mamba")]
     "mamba",
+    #[cfg(feature = "backend-rwkv")]
     "rwkv7",
-    #[cfg(feature = "backend-zpaq")]
-    "zpaq",
-    "mixture",
-    "particle",
-];
-/// Canonical names for available rate backends in this build.
-#[cfg(all(not(feature = "backend-rwkv"), feature = "backend-mamba"))]
-pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
-    "rosaplus",
-    "ctw",
-    "fac-ctw",
-    "match",
-    "sparse-match",
-    "ppmd",
-    "calibrated",
-    "mamba",
-    #[cfg(feature = "backend-zpaq")]
-    "zpaq",
-    "mixture",
-    "particle",
-];
-/// Canonical names for available rate backends in this build.
-#[cfg(all(feature = "backend-rwkv", not(feature = "backend-mamba")))]
-pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
-    "rosaplus",
-    "ctw",
-    "fac-ctw",
-    "match",
-    "sparse-match",
-    "ppmd",
-    "calibrated",
-    "rwkv7",
-    #[cfg(feature = "backend-zpaq")]
-    "zpaq",
-    "mixture",
-    "particle",
-];
-/// Canonical names for available rate backends in this build.
-#[cfg(all(not(feature = "backend-rwkv"), not(feature = "backend-mamba")))]
-pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
-    "rosaplus",
-    "ctw",
-    "fac-ctw",
-    "match",
-    "sparse-match",
-    "ppmd",
-    "calibrated",
     #[cfg(feature = "backend-zpaq")]
     "zpaq",
     "mixture",
