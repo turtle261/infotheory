@@ -433,6 +433,7 @@ impl MambaPredictor {
         }
         if !self.primed {
             self.compressor.forward_to_pdf(0, &mut self.pdf);
+            normalize_pdf(&mut self.pdf);
             self.primed = true;
             self.valid = true;
             return;
@@ -449,6 +450,7 @@ impl MambaPredictor {
         self.ensure_predicted();
         self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
         self.compressor.forward_to_pdf(symbol as u32, &mut self.pdf);
+        normalize_pdf(&mut self.pdf);
         self.valid = true;
         Ok(())
     }
@@ -489,6 +491,7 @@ impl RwkvPredictor {
         }
         if !self.primed {
             self.compressor.forward_to_pdf(0, &mut self.pdf);
+            normalize_pdf(&mut self.pdf);
             self.primed = true;
             self.valid = true;
             return;
@@ -505,6 +508,7 @@ impl RwkvPredictor {
         self.ensure_predicted();
         self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
         self.compressor.forward_to_pdf(symbol as u32, &mut self.pdf);
+        normalize_pdf(&mut self.pdf);
         self.valid = true;
         Ok(())
     }
@@ -1117,6 +1121,7 @@ impl RatePdfPredictor {
                     let mut row = [0.0; 256];
                     model.fill_pdf(&mut row);
                     pdf.copy_from_slice(&row);
+                    normalize_pdf(pdf);
                     *valid = true;
                 }
                 Ok(pdf)
@@ -1135,6 +1140,7 @@ impl RatePdfPredictor {
                     let mut row = [0.0; 256];
                     model.fill_pdf(&mut row);
                     pdf.copy_from_slice(&row);
+                    normalize_pdf(pdf);
                     *valid = true;
                 }
                 Ok(pdf)
@@ -1144,6 +1150,7 @@ impl RatePdfPredictor {
                     let mut row = [0.0; 256];
                     model.fill_pdf(&mut row);
                     pdf.copy_from_slice(&row);
+                    normalize_pdf(pdf);
                     *valid = true;
                 }
                 Ok(pdf)
@@ -1707,6 +1714,26 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_rate_ac_ppmd_high_order_text_payload() {
+        let seed = include_bytes!("../../README.md");
+        let mut data = Vec::with_capacity(4096);
+        while data.len() < 4096 {
+            data.extend_from_slice(seed);
+        }
+        data.truncate(4096);
+
+        let backend = RateBackend::Ppmd {
+            order: 12,
+            memory_mb: 256,
+        };
+        let enc = compress_rate_bytes(&data, &backend, -1, CoderType::AC, FramingMode::Framed)
+            .expect("ppmd high-order compression");
+        let dec = decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed)
+            .expect("ppmd high-order decompression");
+        assert_eq!(dec, data);
+    }
+
+    #[test]
     fn roundtrip_rate_ac_calibrated_backend() {
         let data = b"calibration wrapper payload calibration wrapper payload";
         let backend = RateBackend::Calibrated {
@@ -1950,6 +1977,36 @@ mod tests {
         };
         let enc =
             compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn roundtrip_rate_rwkv_two_json_method_2m() {
+        let two_json: serde_json::Value =
+            serde_json::from_str(include_str!("../../examples/two.json")).unwrap();
+        let method = two_json["experts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|expert| expert["name"].as_str() == Some("rwkv"))
+            .and_then(|expert| expert["method"].as_str())
+            .unwrap()
+            .to_string();
+
+        let backend = RateBackend::Rwkv7Method { method };
+        let seed = include_bytes!("../../README.md");
+        let target_len = 2_097_152usize;
+        let mut data = Vec::with_capacity(target_len);
+        while data.len() < target_len {
+            let remaining = target_len - data.len();
+            data.extend_from_slice(&seed[..seed.len().min(remaining)]);
+        }
+
+        let enc =
+            compress_rate_bytes(&data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
             decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);

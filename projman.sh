@@ -127,6 +127,20 @@ cmd_test_all() {
   cmd_test_full
 }
 
+cmd_bench() {
+  say "[bench] Running examples/two.json benchmark suite..."
+  need_cmd sh
+  (cd "$ROOT_DIR" && sh "$ROOT_DIR/scripts/bench_two_json.sh" "$@")
+  say "[bench] Done"
+}
+
+cmd_plot() {
+  say "[plot] Rendering examples/two.json benchmark SVG plots..."
+  need_cmd sh
+  (cd "$ROOT_DIR" && sh "$ROOT_DIR/scripts/plot_two_json.sh" "$@")
+  say "[plot] Done"
+}
+
 cmd_clean() {
   say "[clean] Cleaning build artifacts (keeps kernel)..."
   need_cmd cargo
@@ -156,6 +170,8 @@ usage() {
 Usage: ./projman.sh <command>
 
 Commands:
+  bench       Run the standalone examples/two.json benchmark suite. Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
+  plot        Render SVG plots for the most recent completed examples/two.json benchmark summary in /tmp. Not included in test_all.
   code_test   Build (release) and run Rust tests (release). Uses --features vm iff VM artifacts exist and /dev/kvm is accessible.
   init-vm     Download/build VM artifacts needed for VM tests (kernel, initramfs, docker rootfs).
   lean_test   Run Lean validation suite (ite-bench). Requires lake.
@@ -164,6 +180,7 @@ Commands:
   clean       Clean build artifacts (cargo clean, lake clean, VM images/initramfs). Keeps vmlinux-6.1.58.
 
 Environment variables:
+  INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths.
   SKIP_DOCKER=1   Skip docker rootfs.ext4 build during init-vm.
   BUILD_CLI=1     Also build optional infotheory CLI binary (feature: cli) during code_test.
 EOF
@@ -171,6 +188,8 @@ EOF
 
 cmd=${1:-}
 case "$cmd" in
+  bench) shift; cmd_bench "$@" ;;
+  plot) shift; cmd_plot "$@" ;;
   code_test) shift; cmd_code_test "$@" ;;
   init-vm) shift; cmd_init_vm "$@" ;;
   lean_test) shift; cmd_lean_test "$@" ;;

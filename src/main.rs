@@ -253,6 +253,13 @@ fn load_calibrated_spec(path: &str) -> anyhow::Result<CalibratedSpec> {
     parse_calibrated_spec_value(&value, base_dir, 4)
 }
 
+fn load_expert_spec(path: &str) -> anyhow::Result<MixtureExpertSpec> {
+    let raw = std::fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)?;
+    let base_dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    parse_mixture_expert_value(&value, base_dir, MAX_MIXTURE_NESTING)
+}
+
 fn parse_particle_spec_value(v: &serde_json::Value) -> anyhow::Result<ParticleSpec> {
     if v.get("experts").is_some() {
         return Err(anyhow::anyhow!(
@@ -1523,138 +1530,152 @@ fn parse_nyx_filter(
     }))
 }
 
-fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>) -> InfotheoryCtx {
-    let rate_backend = match rate_backend {
-        "mamba" => {
-            #[cfg(feature = "backend-mamba")]
-            {
-                if let Some(m) = method {
-                    RateBackend::MambaMethod {
-                        method: m.to_string(),
+fn build_ctx(
+    rate_backend: &str,
+    compression_backend: &str,
+    method: Option<&str>,
+    expert_spec_path: Option<&str>,
+) -> InfotheoryCtx {
+    let rate_backend = if let Some(path) = expert_spec_path {
+        load_expert_spec(path)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: failed to load expert spec '{path}': {e}");
+                std::process::exit(1);
+            })
+            .backend
+    } else {
+        match rate_backend {
+            "mamba" => {
+                #[cfg(feature = "backend-mamba")]
+                {
+                    if let Some(m) = method {
+                        RateBackend::MambaMethod {
+                            method: m.to_string(),
+                        }
+                    } else {
+                        let p = mamba_model_path_from_env();
+                        let model = load_mamba_model_from_path(&p);
+                        RateBackend::Mamba { model }
                     }
-                } else {
-                    let p = mamba_model_path_from_env();
-                    let model = load_mamba_model_from_path(&p);
-                    RateBackend::Mamba { model }
+                }
+                #[cfg(not(feature = "backend-mamba"))]
+                {
+                    eprintln!(
+                        "Error: rate backend 'mamba' requires infotheory built with feature 'backend-mamba'"
+                    );
+                    std::process::exit(1);
                 }
             }
-            #[cfg(not(feature = "backend-mamba"))]
-            {
-                eprintln!(
-                    "Error: rate backend 'mamba' requires infotheory built with feature 'backend-mamba'"
-                );
-                std::process::exit(1);
-            }
-        }
-        "rwkv7" => {
-            #[cfg(feature = "backend-rwkv")]
-            {
-                if let Some(m) = method {
-                    RateBackend::Rwkv7Method {
-                        method: m.to_string(),
+            "rwkv7" => {
+                #[cfg(feature = "backend-rwkv")]
+                {
+                    if let Some(m) = method {
+                        RateBackend::Rwkv7Method {
+                            method: m.to_string(),
+                        }
+                    } else {
+                        let p = rwkv7_model_path_from_env();
+                        let model = load_rwkv7_model_from_path(&p);
+                        RateBackend::Rwkv7 { model }
                     }
-                } else {
-                    let p = rwkv7_model_path_from_env();
-                    let model = load_rwkv7_model_from_path(&p);
-                    RateBackend::Rwkv7 { model }
+                }
+                #[cfg(not(feature = "backend-rwkv"))]
+                {
+                    eprintln!(
+                        "Error: rate backend 'rwkv7' requires infotheory built with feature 'backend-rwkv'"
+                    );
+                    std::process::exit(1);
                 }
             }
-            #[cfg(not(feature = "backend-rwkv"))]
-            {
-                eprintln!(
-                    "Error: rate backend 'rwkv7' requires infotheory built with feature 'backend-rwkv'"
-                );
-                std::process::exit(1);
+            "match" => RateBackend::Match {
+                hash_bits: 20,
+                min_len: 4,
+                max_len: 255,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            },
+            "sparse-match" => RateBackend::SparseMatch {
+                hash_bits: 19,
+                min_len: 3,
+                max_len: 64,
+                gap_min: 1,
+                gap_max: 2,
+                base_mix: 0.05,
+                confidence_scale: 1.0,
+            },
+            "ppmd" => RateBackend::Ppmd {
+                order: method.and_then(|m| m.parse::<usize>().ok()).unwrap_or(10),
+                memory_mb: 64,
+            },
+            "ctw" => {
+                let depth = if let Some(m) = method {
+                    m.parse::<usize>().unwrap_or(20)
+                } else {
+                    20
+                };
+                RateBackend::Ctw { depth }
             }
-        }
-        "match" => RateBackend::Match {
-            hash_bits: 20,
-            min_len: 4,
-            max_len: 255,
-            base_mix: 0.02,
-            confidence_scale: 1.0,
-        },
-        "sparse-match" => RateBackend::SparseMatch {
-            hash_bits: 19,
-            min_len: 3,
-            max_len: 64,
-            gap_min: 1,
-            gap_max: 2,
-            base_mix: 0.05,
-            confidence_scale: 1.0,
-        },
-        "ppmd" => RateBackend::Ppmd {
-            order: method.and_then(|m| m.parse::<usize>().ok()).unwrap_or(10),
-            memory_mb: 64,
-        },
-        "ctw" => {
-            let depth = if let Some(m) = method {
-                m.parse::<usize>().unwrap_or(20)
-            } else {
-                20
-            };
-            RateBackend::Ctw { depth }
-        }
-        "fac-ctw" => {
-            let depth = if let Some(m) = method {
-                m.parse::<usize>().unwrap_or(20)
-            } else {
-                20
-            };
-            RateBackend::FacCtw {
-                base_depth: depth,
-                num_percept_bits: 8, // Default for byte-oriented CLI
-                encoding_bits: 8,    // Default for byte-oriented CLI
+            "fac-ctw" => {
+                let depth = if let Some(m) = method {
+                    m.parse::<usize>().unwrap_or(20)
+                } else {
+                    20
+                };
+                RateBackend::FacCtw {
+                    base_depth: depth,
+                    num_percept_bits: 8, // Default for byte-oriented CLI
+                    encoding_bits: 8,    // Default for byte-oriented CLI
+                }
             }
-        }
-        "zpaq" => {
-            let m = method.unwrap_or("2").to_string();
-            if let Err(err) = validate_zpaq_rate_method(&m) {
-                eprintln!("Error: unsupported ZPAQ rate method '{m}': {err}");
-                std::process::exit(1);
+            "zpaq" => {
+                let m = method.unwrap_or("2").to_string();
+                if let Err(err) = validate_zpaq_rate_method(&m) {
+                    eprintln!("Error: unsupported ZPAQ rate method '{m}': {err}");
+                    std::process::exit(1);
+                }
+                RateBackend::Zpaq { method: m }
             }
-            RateBackend::Zpaq { method: m }
-        }
-        "mixture" => {
-            let path = method.unwrap_or_else(|| {
-                eprintln!("Error: --rate-backend mixture requires --method <spec.json>");
-                std::process::exit(1);
-            });
-            let spec = load_mixture_spec(path).unwrap_or_else(|e| {
-                eprintln!("Error: failed to load mixture spec '{path}': {e}");
-                std::process::exit(1);
-            });
-            RateBackend::Mixture {
-                spec: Arc::new(spec),
+            "mixture" => {
+                let path = method.unwrap_or_else(|| {
+                    eprintln!("Error: --rate-backend mixture requires --method <spec.json>");
+                    std::process::exit(1);
+                });
+                let spec = load_mixture_spec(path).unwrap_or_else(|e| {
+                    eprintln!("Error: failed to load mixture spec '{path}': {e}");
+                    std::process::exit(1);
+                });
+                RateBackend::Mixture {
+                    spec: Arc::new(spec),
+                }
             }
-        }
-        "particle" => {
-            let path = method.unwrap_or_else(|| {
-                eprintln!("Error: --rate-backend particle requires --method <spec.json>");
-                std::process::exit(1);
-            });
-            let spec = load_particle_spec(path).unwrap_or_else(|e| {
-                eprintln!("Error: failed to load particle spec '{path}': {e}");
-                std::process::exit(1);
-            });
-            RateBackend::Particle {
-                spec: Arc::new(spec),
+            "particle" => {
+                let path = method.unwrap_or_else(|| {
+                    eprintln!("Error: --rate-backend particle requires --method <spec.json>");
+                    std::process::exit(1);
+                });
+                let spec = load_particle_spec(path).unwrap_or_else(|e| {
+                    eprintln!("Error: failed to load particle spec '{path}': {e}");
+                    std::process::exit(1);
+                });
+                RateBackend::Particle {
+                    spec: Arc::new(spec),
+                }
             }
-        }
-        "calibrated" => {
-            let path = method.unwrap_or_else(|| {
-                eprintln!("Error: --rate-backend calibrated requires --method <spec.json>");
-                std::process::exit(1);
-            });
-            let spec = load_calibrated_spec(path).unwrap_or_else(|e| {
-                eprintln!("Error: failed to load calibrated spec '{path}': {e}");
-                std::process::exit(1);
-            });
-            RateBackend::Calibrated {
-                spec: Arc::new(spec),
+            "calibrated" => {
+                let path = method.unwrap_or_else(|| {
+                    eprintln!("Error: --rate-backend calibrated requires --method <spec.json>");
+                    std::process::exit(1);
+                });
+                let spec = load_calibrated_spec(path).unwrap_or_else(|e| {
+                    eprintln!("Error: failed to load calibrated spec '{path}': {e}");
+                    std::process::exit(1);
+                });
+                RateBackend::Calibrated {
+                    spec: Arc::new(spec),
+                }
             }
+            _ => RateBackend::RosaPlus,
         }
-        _ => RateBackend::RosaPlus,
     };
 
     let compression_backend = match compression_backend {
@@ -2486,6 +2507,7 @@ fn search_command(args: &[String]) {
     let mut rate_backend = "rosaplus".to_string();
     let compression_backend = "zpaq".to_string();
     let mut method: Option<String> = None;
+    let mut expert_spec_path: Option<String> = None;
     let mut stage2_prior_mode: Option<search::Stage2PriorMode> = None;
 
     let mut i = 4usize;
@@ -2525,6 +2547,10 @@ fn search_command(args: &[String]) {
                 i += 1;
                 method = args.get(i).cloned();
             }
+            "--expert-spec" => {
+                i += 1;
+                expert_spec_path = args.get(i).cloned();
+            }
             "--stage2-prior-mode" => {
                 i += 1;
                 if let Some(v) = args.get(i) {
@@ -2545,7 +2571,12 @@ fn search_command(args: &[String]) {
     if let Some(mode) = stage2_prior_mode {
         opts.stage2_prior_mode = mode;
     }
-    opts.ctx = build_ctx(&rate_backend, &compression_backend, method.as_deref());
+    opts.ctx = build_ctx(
+        &rate_backend,
+        &compression_backend,
+        method.as_deref(),
+        expert_spec_path.as_deref(),
+    );
     search::run_search_with_options(query, target, &opts);
 }
 
@@ -2608,6 +2639,7 @@ fn main() {
     let mut rate_backend_str = "rosaplus".to_string();
     let mut compression_backend_str = "zpaq".to_string();
     let mut method_str: Option<String> = None;
+    let mut expert_spec_path: Option<String> = None;
     let mut model_export_path: Option<String> = None;
     let mut rate_backend_specified = false;
 
@@ -2642,6 +2674,11 @@ fn main() {
                 i += 1;
                 method_str = args.get(i).cloned();
             }
+            "--expert-spec" => {
+                i += 1;
+                expert_spec_path = args.get(i).cloned();
+                rate_backend_specified = true;
+            }
             "--model-export" | "--rwkv-export" => {
                 i += 1;
                 model_export_path = args.get(i).cloned();
@@ -2655,6 +2692,7 @@ fn main() {
         &rate_backend_str,
         &compression_backend_str,
         method_str.as_deref(),
+        expert_spec_path.as_deref(),
     );
     set_default_ctx(ctx.clone());
 
@@ -2892,12 +2930,14 @@ Options:
   --ncd-backend <name>    Deprecated alias for --compression-backend
   --method <val>          Method/config (e.g. '5' for zpaq, '16' for ctw, mixture spec path,
                           model method: file:/path/model.safetensors[;policy:...] or cfg:key=value,...[;policy:...])
+  --expert-spec <path>    Load one exact standalone expert JSON (same schema as a mixture 'experts' entry)
   --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
   --rwkv-export <path>    Backward-compatible alias for --model-export
 
 Examples:
   infotheory ncd file1.txt file2.txt --compression-backend zpaq --method 5
   infotheory ncd file1.txt file2.txt --compression-backend rate-ac --rate-backend ctw
+  infotheory h file.txt --expert-spec ./expert.json
   infotheory h file.txt --rate-backend mamba --method "cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4,train=adam,lr=0.001;policy:schedule=0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)" --model-export ./mamba_online.safetensors
   infotheory h file.txt --rate-backend ctw --method 32
   infotheory h file.txt --rate-backend mixture --method mixture.json
@@ -2975,6 +3015,7 @@ mod tests {
             Some(
                 "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer",
             ),
+            None,
         );
 
         match ctx.compression_backend {
@@ -3037,6 +3078,38 @@ mod tests {
             },
             _ => panic!("expected calibrated backend"),
         }
+    }
+
+    #[test]
+    fn load_expert_spec_preserves_exact_ppmd_settings() {
+        let expert_path = std::env::temp_dir().join(format!(
+            "infotheory-expert-spec-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &expert_path,
+            serde_json::to_vec(&json!({
+                "name": "ppmd",
+                "kind": "ppmd",
+                "order": 12,
+                "memory_mb": 256
+            }))
+            .expect("expert json"),
+        )
+        .expect("write temp expert spec");
+
+        let parsed = load_expert_spec(expert_path.to_str().expect("utf8 path"))
+            .expect("ppmd expert should load");
+        match parsed.backend {
+            RateBackend::Ppmd { order, memory_mb } => {
+                assert_eq!(order, 12);
+                assert_eq!(memory_mb, 256);
+            }
+            _ => panic!("expected ppmd backend"),
+        }
+
+        let _ = std::fs::remove_file(&expert_path);
     }
 
     #[test]
