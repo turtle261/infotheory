@@ -1278,37 +1278,53 @@ impl Compressor {
     }
 
     fn online_update_from_current_pdf(&mut self, symbol: u8) -> Result<()> {
-        let model_template = self.model.clone();
-        let Some(online) = self.online.as_mut() else {
-            return Ok(());
-        };
-        online.tokens_processed = online.tokens_processed.saturating_add(1);
+        let (optimizer, lr, _stride, scope, _bptt, clip, need_full_adam) = {
+            let Some(online) = self.online.as_mut() else {
+                return Ok(());
+            };
+            online.tokens_processed = online.tokens_processed.saturating_add(1);
 
-        let (optimizer, lr, stride, scope, bptt, clip) = Self::resolve_online_train_action(online)?;
-        if !scope.trains_any_params() {
-            return Ok(());
-        }
-        online.policy_train_steps = online.policy_train_steps.saturating_add(1);
-        if stride > 1 && (online.policy_train_steps % stride) != 0 {
-            return Ok(());
-        }
-        if lr == 0.0 {
-            return Ok(());
-        }
+            let (optimizer, lr, stride, scope, bptt, clip) =
+                Self::resolve_online_train_action(online)?;
+            if !scope.trains_any_params() {
+                return Ok(());
+            }
+            online.policy_train_steps = online.policy_train_steps.saturating_add(1);
+            if stride > 1 && (online.policy_train_steps % stride) != 0 {
+                return Ok(());
+            }
+            if lr == 0.0 {
+                return Ok(());
+            }
 
-        if bptt > 1 && scope.trains_non_head_params() {
-            bail!("rwkv full-parameter online training currently supports bptt=1");
-        }
+            if bptt > 1 && scope.trains_non_head_params() {
+                bail!("rwkv full-parameter online training currently supports bptt=1");
+            }
 
-        if matches!(optimizer, OptimizerKind::Adam) {
-            if scope.bias && (online.adam_m.is_none() || online.adam_v.is_none()) {
+            let need_full_adam = matches!(optimizer, OptimizerKind::Adam)
+                && scope.trains_non_head_params()
+                && online.full_adam.is_none();
+            if matches!(optimizer, OptimizerKind::Adam)
+                && scope.bias
+                && (online.adam_m.is_none() || online.adam_v.is_none())
+            {
                 online.adam_m = Some(vec![0.0; online.out_bias.len()]);
                 online.adam_v = Some(vec![0.0; online.out_bias.len()]);
             }
-            if scope.trains_non_head_params() && online.full_adam.is_none() {
-                online.full_adam = Some(model_template.new_full_adam_state());
+
+            (optimizer, lr, stride, scope, bptt, clip, need_full_adam)
+        };
+
+        if need_full_adam {
+            let full_adam = self.model.new_full_adam_state();
+            if let Some(online) = self.online.as_mut() {
+                online.full_adam = Some(full_adam);
             }
         }
+
+        let Some(online) = self.online.as_mut() else {
+            return Ok(());
+        };
 
         if !scope.trains_non_head_params() {
             let hidden = self.scratch.lm_head_input();
@@ -2293,6 +2309,21 @@ mod tests {
             changed,
             "expected LM-head weights to change under online training"
         );
+    }
+
+    #[test]
+    fn test_cross_entropy_from_current_keeps_unique_model_arc() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=21,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
+        let mut c = Compressor::new_from_method(method).unwrap();
+        c.reset_and_prime();
+
+        assert_eq!(Arc::strong_count(&c.model), 1);
+        let before = Arc::as_ptr(&c.model);
+        let _ = c.cross_entropy_from_current(b"arc uniqueness").unwrap();
+        let after = Arc::as_ptr(&c.model);
+
+        assert_eq!(Arc::strong_count(&c.model), 1);
+        assert_eq!(before, after);
     }
 
     #[test]
