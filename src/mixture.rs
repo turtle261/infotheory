@@ -102,6 +102,11 @@ pub trait OnlineBytePredictor: Send {
         Ok(())
     }
 
+    /// Optional stream-finalization hook.
+    fn finish_stream(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Log-probability (natural log) of `symbol` given the current history.
     fn log_prob(&mut self, symbol: u8) -> f64;
 
@@ -121,6 +126,7 @@ pub trait OnlineBytePredictor: Send {
     /// parameter posterior here; "frozen" means no new parameter fitting during
     /// the score pass, not necessarily a static hidden-state belief.
     fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        self.finish_stream()?;
         self.begin_stream(total_symbols)
     }
 
@@ -130,6 +136,15 @@ pub trait OnlineBytePredictor: Send {
     /// filtering/posterior state needed for correct sequential predictions.
     fn update_frozen(&mut self, symbol: u8) {
         self.update(symbol);
+    }
+}
+
+#[cfg(feature = "backend-rwkv")]
+#[inline]
+fn ensure_rwkv_primed(compressor: &mut rwkvzip::Compressor, primed: &mut bool) {
+    if !*primed {
+        compressor.reset_and_prime();
+        *primed = true;
     }
 }
 
@@ -354,16 +369,7 @@ impl RateBackendPredictor {
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7 { model } => {
                 let mut compressor = rwkvzip::Compressor::new_from_model(model);
-                let bias = compressor.online_bias_snapshot();
-                let logits =
-                    compressor
-                        .model
-                        .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                rwkvzip::Compressor::logits_to_pdf(
-                    logits,
-                    bias.as_deref(),
-                    &mut compressor.pdf_buffer,
-                );
+                compressor.reset_and_prime();
                 Self::Rwkv7 {
                     pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
                     compressor,
@@ -375,16 +381,7 @@ impl RateBackendPredictor {
             RateBackend::Rwkv7Method { method } => {
                 let mut compressor = rwkvzip::Compressor::new_from_method(&method)
                     .unwrap_or_else(|e| panic!("invalid rwkv method '{method}': {e}"));
-                let bias = compressor.online_bias_snapshot();
-                let logits =
-                    compressor
-                        .model
-                        .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                rwkvzip::Compressor::logits_to_pdf(
-                    logits,
-                    bias.as_deref(),
-                    &mut compressor.pdf_buffer,
-                );
+                compressor.reset_and_prime();
                 Self::Rwkv7 {
                     pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
                     compressor,
@@ -503,6 +500,7 @@ impl RateBackendPredictor {
 
 impl OnlineBytePredictor for RateBackendPredictor {
     fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        self.finish_stream()?;
         match self {
             RateBackendPredictor::Rosa { model, .. } => {
                 if let Some(total) = total_symbols {
@@ -528,6 +526,27 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 .map_err(|e| e.to_string()),
             RateBackendPredictor::Mixture { runtime } => runtime.begin_stream(total_symbols),
             RateBackendPredictor::Calibrated { base, .. } => base.begin_stream(total_symbols),
+        }
+    }
+
+    fn finish_stream(&mut self) -> Result<(), String> {
+        match self {
+            RateBackendPredictor::Rosa { .. }
+            | RateBackendPredictor::Match { .. }
+            | RateBackendPredictor::SparseMatch { .. }
+            | RateBackendPredictor::Ppmd { .. }
+            | RateBackendPredictor::Ctw { .. }
+            | RateBackendPredictor::FacCtw { .. }
+            | RateBackendPredictor::Zpaq { .. }
+            | RateBackendPredictor::Particle { .. } => Ok(()),
+            #[cfg(feature = "backend-rwkv")]
+            RateBackendPredictor::Rwkv7 { compressor, .. } => compressor
+                .finish_online_policy_stream()
+                .map_err(|e| e.to_string()),
+            #[cfg(feature = "backend-mamba")]
+            RateBackendPredictor::Mamba { .. } => Ok(()),
+            RateBackendPredictor::Mixture { runtime } => runtime.finish_stream(),
+            RateBackendPredictor::Calibrated { base, .. } => base.finish_stream(),
         }
     }
 
@@ -587,19 +606,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 min_prob,
                 ..
             } => {
-                if !*primed {
-                    let bias = compressor.online_bias_snapshot();
-                    let logits =
-                        compressor
-                            .model
-                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                    rwkvzip::Compressor::logits_to_pdf(
-                        logits,
-                        bias.as_deref(),
-                        &mut compressor.pdf_buffer,
-                    );
-                    *primed = true;
-                }
+                ensure_rwkv_primed(compressor, primed);
                 let p = clamp_prob(compressor.pdf_buffer[symbol as usize], *min_prob);
                 p.ln()
             }
@@ -697,19 +704,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 min_prob,
                 ..
             } => {
-                if !*primed {
-                    let bias = compressor.online_bias_snapshot();
-                    let logits =
-                        compressor
-                            .model
-                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                    rwkvzip::Compressor::logits_to_pdf(
-                        logits,
-                        bias.as_deref(),
-                        &mut compressor.pdf_buffer,
-                    );
-                    *primed = true;
-                }
+                ensure_rwkv_primed(compressor, primed);
                 for (slot, &p_raw) in out
                     .iter_mut()
                     .take(256)
@@ -813,42 +808,12 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             #[cfg(feature = "backend-rwkv")]
             RateBackendPredictor::Rwkv7 {
-                compressor,
-                primed,
-                pdf_scratch,
-                ..
+                compressor, primed, ..
             } => {
-                if !*primed {
-                    let bias = compressor.online_bias_snapshot();
-                    let logits =
-                        compressor
-                            .model
-                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                    rwkvzip::Compressor::logits_to_pdf(
-                        logits,
-                        bias.as_deref(),
-                        &mut compressor.pdf_buffer,
-                    );
-                    *primed = true;
-                }
-                if pdf_scratch.len() != compressor.pdf_buffer.len() {
-                    pdf_scratch.resize(compressor.pdf_buffer.len(), 0.0);
-                }
-                pdf_scratch.copy_from_slice(&compressor.pdf_buffer);
+                ensure_rwkv_primed(compressor, primed);
                 compressor
-                    .online_update_from_pdf(symbol, pdf_scratch)
+                    .observe_symbol_from_current_pdf(symbol)
                     .unwrap_or_else(|e| panic!("rwkv online update failed: {e}"));
-                let bias = compressor.online_bias_snapshot();
-                let logits = compressor.model.forward(
-                    &mut compressor.scratch,
-                    symbol as u32,
-                    &mut compressor.state,
-                );
-                rwkvzip::Compressor::logits_to_pdf(
-                    logits,
-                    bias.as_deref(),
-                    &mut compressor.pdf_buffer,
-                );
             }
             #[cfg(feature = "backend-mamba")]
             RateBackendPredictor::Mamba {
@@ -922,6 +887,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
     }
 
     fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        self.finish_stream()?;
         match self {
             RateBackendPredictor::Rosa { model, .. } => {
                 if let Some(total) = total_symbols {
@@ -1033,17 +999,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     compressor.reset_and_prime();
                     *primed = true;
                 }
-                let bias = compressor.online_bias_snapshot();
-                let logits = compressor.model.forward(
-                    &mut compressor.scratch,
-                    symbol as u32,
-                    &mut compressor.state,
-                );
-                rwkvzip::Compressor::logits_to_pdf(
-                    logits,
-                    bias.as_deref(),
-                    &mut compressor.pdf_buffer,
-                );
+                compressor.forward_to_internal_pdf(symbol as u32);
             }
             #[cfg(feature = "backend-mamba")]
             RateBackendPredictor::Mamba {
@@ -1271,6 +1227,11 @@ impl ExpertState {
     #[inline]
     fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         self.predictor.begin_stream(total_symbols)
+    }
+
+    #[inline]
+    fn finish_stream(&mut self) -> Result<(), String> {
+        self.predictor.finish_stream()
     }
 
     #[inline]
@@ -2220,6 +2181,16 @@ impl MixtureRuntime {
         }
     }
 
+    pub(crate) fn finish_stream(&mut self) -> Result<(), String> {
+        match self {
+            MixtureRuntime::Bayes(m) => finish_expert_stream(&mut m.experts),
+            MixtureRuntime::Fading(m) => finish_expert_stream(&mut m.experts),
+            MixtureRuntime::Switching(m) => finish_expert_stream(&mut m.experts),
+            MixtureRuntime::Mdl(m) => finish_expert_stream(&mut m.experts),
+            MixtureRuntime::Neural(m) => finish_expert_stream(&mut m.experts),
+        }
+    }
+
     pub(crate) fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         match self {
             MixtureRuntime::Bayes(m) => m.reset_frozen(total_symbols),
@@ -2279,6 +2250,13 @@ fn begin_expert_stream(
 ) -> Result<(), String> {
     for expert in experts {
         expert.begin_stream(total_symbols)?;
+    }
+    Ok(())
+}
+
+fn finish_expert_stream(experts: &mut [ExpertState]) -> Result<(), String> {
+    for expert in experts {
+        expert.finish_stream()?;
     }
     Ok(())
 }

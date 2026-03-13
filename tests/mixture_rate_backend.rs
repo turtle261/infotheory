@@ -27,6 +27,35 @@ fn mixture_single_expert_matches_backend() {
     );
 }
 
+#[cfg(feature = "backend-rwkv")]
+#[test]
+fn rwkv_mixture_single_expert_matches_backend_with_tbptt() {
+    let data = b"abcdefghij";
+    let base = RateBackend::Rwkv7Method {
+        method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=37,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=8,clip=0,momentum=0.9)".to_string(),
+    };
+    let base_rate = entropy_rate_backend(data, -1, &base);
+
+    let spec = MixtureSpec::new(
+        MixtureKind::Bayes,
+        vec![MixtureExpertSpec {
+            name: Some("rwkv".to_string()),
+            log_prior: 0.0,
+            max_order: -1,
+            backend: base.clone(),
+        }],
+    );
+    let mix_backend = RateBackend::Mixture {
+        spec: Arc::new(spec),
+    };
+    let mix_rate = entropy_rate_backend(data, -1, &mix_backend);
+
+    assert!(
+        (mix_rate - base_rate).abs() < 1e-6,
+        "mix={mix_rate} base={base_rate}"
+    );
+}
+
 #[test]
 fn mixture_recursive_expert_matches_backend() {
     let data = b"01010101010101010101010101010101";

@@ -14,7 +14,7 @@ use crate::backends::sparse_match::SparseMatchModel;
 use crate::backends::text_context::TextContextAnalyzer;
 use crate::coders::{
     ANS_TOTAL, ArithmeticDecoder, ArithmeticEncoder, BlockedRansDecoder, BlockedRansEncoder,
-    CDF_TOTAL, Cdf, CoderType, crc32, quantize_pdf_to_cdf_inplace,
+    CDF_TOTAL, Cdf, CoderType, crc32, quantize_pdf_to_cdf_with_buffer,
     quantize_pdf_to_rans_cdf_with_buffer,
 };
 use crate::ctw::FacContextTree;
@@ -359,8 +359,6 @@ struct MambaPredictor {
 struct RwkvPredictor {
     compressor: rwkvzip::Compressor,
     primed: bool,
-    pdf: Vec<f64>,
-    valid: bool,
 }
 
 #[derive(Clone)]
@@ -463,55 +461,45 @@ impl MambaPredictor {
 impl RwkvPredictor {
     fn from_model(model: std::sync::Arc<rwkvzip::Model>) -> Self {
         let compressor = rwkvzip::Compressor::new_from_model(model);
-        let vocab = compressor.vocab_size();
         Self {
             compressor,
             primed: false,
-            pdf: vec![0.0; vocab],
-            valid: false,
         }
     }
 
     fn from_method(method: &str) -> Result<Self> {
         let compressor = rwkvzip::Compressor::new_from_method(method)?;
-        let vocab = compressor.vocab_size();
         Ok(Self {
             compressor,
             primed: false,
-            pdf: vec![0.0; vocab],
-            valid: false,
         })
     }
 
     fn ensure_predicted(&mut self) {
-        if self.valid {
-            return;
-        }
         if !self.primed {
-            self.compressor.forward_to_pdf(0, &mut self.pdf);
+            self.compressor.reset_and_prime();
             self.primed = true;
-            self.valid = true;
-            return;
         }
-        self.valid = true;
     }
 
     fn pdf_next(&mut self) -> &[f64] {
         self.ensure_predicted();
-        &self.pdf
+        &self.compressor.pdf_buffer
     }
 
     fn update(&mut self, symbol: u8) -> Result<()> {
         self.ensure_predicted();
-        self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
-        self.compressor.forward_to_pdf(symbol as u32, &mut self.pdf);
-        self.valid = true;
+        self.compressor.observe_symbol_from_current_pdf(symbol)?;
         Ok(())
     }
 
     fn begin_stream(&mut self, total_len: usize) -> Result<()> {
         self.compressor
             .begin_online_policy_stream(Some(total_len as u64))
+    }
+
+    fn finish_stream(&mut self) -> Result<()> {
+        self.compressor.finish_online_policy_stream()
     }
 }
 
@@ -766,6 +754,13 @@ impl MixturePredictor {
         }
 
         self.valid = false;
+        Ok(())
+    }
+
+    fn finish_stream(&mut self) -> Result<()> {
+        for expert in &mut self.experts {
+            expert.predictor.finish_stream()?;
+        }
         Ok(())
     }
 
@@ -1088,6 +1083,7 @@ impl RatePdfPredictor {
     }
 
     fn begin_stream(&mut self, total_len: usize) -> Result<()> {
+        self.finish_stream()?;
         match self {
             Self::Rosa(m) => {
                 m.begin_stream(total_len);
@@ -1106,6 +1102,25 @@ impl RatePdfPredictor {
             Self::Rwkv(m) => m.begin_stream(total_len),
             Self::Mixture(m) => m.begin_stream(total_len),
             Self::Calibrated { base, .. } => base.begin_stream(total_len),
+        }
+    }
+
+    fn finish_stream(&mut self) -> Result<()> {
+        match self {
+            Self::Rosa(_)
+            | Self::Match { .. }
+            | Self::SparseMatch { .. }
+            | Self::Ppmd { .. }
+            | Self::Ctw(_)
+            | Self::FacCtw(_)
+            | Self::Zpaq(_)
+            | Self::Particle(_) => Ok(()),
+            #[cfg(feature = "backend-mamba")]
+            Self::Mamba(_) => Ok(()),
+            #[cfg(feature = "backend-rwkv")]
+            Self::Rwkv(m) => m.finish_stream(),
+            Self::Mixture(m) => m.finish_stream(),
+            Self::Calibrated { base, .. } => base.finish_stream(),
         }
     }
 
@@ -1298,6 +1313,7 @@ fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Ve
             }
             let _ = enc.finish()?;
         }
+        predictor.finish_stream()?;
         return Ok(out);
     }
 
@@ -1305,15 +1321,17 @@ fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Ve
     {
         let mut enc = ArithmeticEncoder::new(&mut out);
         let mut cdf = vec![0u32; 257];
+        let mut freq = vec![0i64; 256];
         for &b in data {
             let pdf = predictor.pdf_next()?;
-            quantize_pdf_to_cdf_inplace(pdf, &mut cdf);
+            quantize_pdf_to_cdf_with_buffer(pdf, &mut cdf, &mut freq);
             let sym = b as usize;
             enc.encode_counts(cdf[sym] as u64, cdf[sym + 1] as u64, CDF_TOTAL as u64)?;
             predictor.update(b)?;
         }
         let _ = enc.finish()?;
     }
+    predictor.finish_stream()?;
     Ok(out)
 }
 
@@ -1334,19 +1352,22 @@ fn decode_payload_ac(
             })?;
             out.push(symbol);
         }
+        predictor.finish_stream()?;
         return Ok(out);
     }
 
     let mut dec = ArithmeticDecoder::new(payload)?;
     let mut out = Vec::with_capacity(out_len);
     let mut cdf = vec![0u32; 257];
+    let mut freq = vec![0i64; 256];
     for _ in 0..out_len {
         let pdf = predictor.pdf_next()?;
-        quantize_pdf_to_cdf_inplace(pdf, &mut cdf);
+        quantize_pdf_to_cdf_with_buffer(pdf, &mut cdf, &mut freq);
         let sym = dec.decode_symbol_counts(&cdf, CDF_TOTAL)? as u8;
         out.push(sym);
         predictor.update(sym)?;
     }
+    predictor.finish_stream()?;
     Ok(out)
 }
 
@@ -1371,6 +1392,7 @@ fn encode_payload_rans(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<
         out.extend_from_slice(&(block.len() as u32).to_le_bytes());
         out.extend_from_slice(&block);
     }
+    predictor.finish_stream()?;
     Ok(out)
 }
 
@@ -1404,7 +1426,7 @@ fn decode_payload_rans(
         pos += len;
     }
 
-    let mut dec = BlockedRansDecoder::new(blocks);
+    let mut dec = BlockedRansDecoder::new(blocks, out_len)?;
     let mut out = Vec::with_capacity(out_len);
     let mut cdf = vec![0u32; 257];
     let mut freq = vec![0i64; 256];
@@ -1416,6 +1438,7 @@ fn decode_payload_rans(
         out.push(sym);
         predictor.update(sym)?;
     }
+    predictor.finish_stream()?;
     Ok(out)
 }
 
@@ -2006,6 +2029,42 @@ mod tests {
             .online_update_from_pdf(b'x', &direct)
             .expect("backend update");
         backend.forward_to_pdf(u32::from(b'x'), &mut direct);
+        assert_pdf_close(predictor.pdf_next(), &direct, 1e-18);
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn rwkv_rate_predictor_matches_backend_after_partial_tbptt_stream() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=29,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=8,clip=0,momentum=0.9)";
+        let data = b"abcdefghij";
+        let mut predictor = RwkvPredictor::from_method(method).expect("rwkv predictor");
+        let mut backend = rwkvzip::Compressor::new_from_method(method).expect("rwkv backend");
+        let mut direct = vec![0.0; backend.vocab_size()];
+
+        predictor
+            .begin_stream(data.len())
+            .expect("begin predictor stream");
+        backend
+            .begin_online_policy_stream(Some(data.len() as u64))
+            .expect("begin backend stream");
+        backend.reset_and_prime();
+
+        for &byte in data {
+            let predicted = predictor.pdf_next().to_vec();
+            backend.copy_current_pdf_to(&mut direct);
+            assert_pdf_close(&predicted, &direct, 1e-18);
+
+            predictor.update(byte).expect("predictor update");
+            backend
+                .observe_symbol_from_current_pdf(byte)
+                .expect("backend update");
+        }
+
+        predictor.finish_stream().expect("finish predictor stream");
+        backend
+            .finish_online_policy_stream()
+            .expect("finish backend stream");
+        backend.copy_current_pdf_to(&mut direct);
         assert_pdf_close(predictor.pdf_next(), &direct, 1e-18);
     }
 

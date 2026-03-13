@@ -10,6 +10,7 @@ COMP_BACKEND=${INFOTHEORY_BENCH_COMPRESSION_BACKEND:-rate-ac}
 REPEATS=${INFOTHEORY_BENCH_REPEATS:-3}
 WARMUPS=${INFOTHEORY_BENCH_WARMUPS:-1}
 SIZES=${INFOTHEORY_BENCH_SIZES:-"4096 16384 65536 262144 1048576 2097152 4194304 10000000"}
+SUBJECT_FILTER=${INFOTHEORY_BENCH_SUBJECTS:-}
 STAMP=$(date +%Y%m%d-%H%M%S)
 RAW_TSV=
 SUMMARY_TSV=
@@ -51,6 +52,7 @@ Environment:
   INFOTHEORY_BENCH_REPEATS=3
   INFOTHEORY_BENCH_WARMUPS=1
   INFOTHEORY_BENCH_SIZES="4096 16384 ... 10000000"
+  INFOTHEORY_BENCH_SUBJECTS=rwkv
   INFOTHEORY_BENCH_CPU=11
   INFOTHEORY_BENCH_COMPRESSION_BACKEND=rate-ac
   INFOTHEORY_BENCH_FRESH=1
@@ -285,6 +287,48 @@ for expert in experts:
     )
 PY
 
+if [ -n "${SUBJECT_FILTER}" ]; then
+  filtered_subjects_tsv="${WORK_DIR}/subjects-filtered.tsv"
+  python3 - "${SUBJECTS_TSV}" "${SUBJECT_FILTER}" > "${filtered_subjects_tsv}" <<'PY'
+import csv
+import re
+import sys
+
+subjects_path = sys.argv[1]
+raw_filter = sys.argv[2]
+selected = {token for token in re.split(r"[\s,]+", raw_filter.strip()) if token}
+if not selected:
+    raise SystemExit("INFOTHEORY_BENCH_SUBJECTS must contain at least one subject")
+
+with open(subjects_path, newline="") as fh:
+    reader = csv.DictReader(fh, delimiter="\t")
+    rows = list(reader)
+
+known = {row["subject"] for row in rows}
+unknown = sorted(selected - known)
+if unknown:
+    raise SystemExit(
+        "unknown INFOTHEORY_BENCH_SUBJECTS entries: "
+        + ", ".join(unknown)
+        + " (known: "
+        + ", ".join(sorted(known))
+        + ")"
+    )
+
+writer = csv.DictWriter(
+    sys.stdout,
+    fieldnames=["subject", "subject_kind", "expert_kind", "spec_path", "h_order"],
+    delimiter="\t",
+    lineterminator="\n",
+)
+writer.writeheader()
+for row in rows:
+    if row["subject"] in selected:
+        writer.writerow(row)
+PY
+  SUBJECTS_TSV="${filtered_subjects_tsv}"
+fi
+
 run_plain() {
   cmd_op=$1
   cmd_input_path=$2
@@ -453,6 +497,9 @@ say "[bench] Compression backend: ${COMP_BACKEND}"
 say "[bench] Repeats: ${REPEATS}"
 say "[bench] Warmups: ${WARMUPS}"
 say "[bench] Sizes: ${SIZES}"
+if [ -n "${SUBJECT_FILTER}" ]; then
+  say "[bench] Subjects: ${SUBJECT_FILTER}"
+fi
 say "[bench] Raw TSV: ${RAW_TSV}"
 say "[bench] Summary TSV: ${SUMMARY_TSV}"
 case "${OUTPUT_MODE}" in

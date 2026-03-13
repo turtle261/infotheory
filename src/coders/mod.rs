@@ -39,11 +39,47 @@ pub fn crc32(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+#[inline]
+pub(crate) fn quantize_pdf_to_integer_cdf_with_buffer(
+    pdf: &[f64],
+    total: u32,
+    cdf_out: &mut [u32],
+    _freq_buf: &mut [i64],
+) {
+    let n = pdf.len();
+    assert!(cdf_out.len() > n, "cdf buffer too small");
+
+    if n == 0 {
+        cdf_out[0] = 0;
+        return;
+    }
+
+    cdf_out[0] = 0;
+    let scale = total as f64;
+    let mut acc = 0.0f64;
+    for i in 0..n {
+        let p = pdf[i];
+        if p.is_finite() && p > 0.0 {
+            acc += p;
+        }
+        let mut next = (acc * scale) as u32;
+        let min_next = cdf_out[i].saturating_add(1);
+        let max_next = total.saturating_sub((n - i - 1) as u32);
+        if next < min_next {
+            next = min_next;
+        } else if next > max_next {
+            next = max_next;
+        }
+        cdf_out[i + 1] = next;
+    }
+    cdf_out[n] = total;
+}
+
 // Re-export main types
 pub use ac::{
     ArithmeticDecoder, ArithmeticEncoder, CDF_TOTAL, p_min, quantize_pdf_to_cdf,
-    quantize_pdf_to_cdf_inplace, softmax_pdf, softmax_pdf_floor, softmax_pdf_floor_inplace,
-    softmax_pdf_inplace,
+    quantize_pdf_to_cdf_inplace, quantize_pdf_to_cdf_with_buffer, softmax_pdf, softmax_pdf_floor,
+    softmax_pdf_floor_inplace, softmax_pdf_inplace,
 };
 
 pub use rans::{

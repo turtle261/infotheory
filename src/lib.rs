@@ -1372,6 +1372,9 @@ fn prequential_rate_backend(
         bits -= predictor.log_prob(b) / std::f64::consts::LN_2;
         predictor.update(b);
     }
+    predictor
+        .finish_stream()
+        .unwrap_or_else(|e| panic!("rate backend stream finalize failed: {e}"));
     bits / (data.len() as f64)
 }
 
@@ -1442,6 +1445,9 @@ fn frozen_plugin_rate_backend(
         }
     }
     predictor
+        .finish_stream()
+        .unwrap_or_else(|e| panic!("rate backend fit-pass finalize failed: {e}"));
+    predictor
         .reset_frozen(Some(score_data.len() as u64))
         .unwrap_or_else(|e| panic!("rate backend frozen-score reset failed: {e}"));
     let mut bits = 0.0;
@@ -1449,6 +1455,9 @@ fn frozen_plugin_rate_backend(
         bits -= predictor.log_prob(byte) / std::f64::consts::LN_2;
         predictor.update_frozen(byte);
     }
+    predictor
+        .finish_stream()
+        .unwrap_or_else(|e| panic!("rate backend frozen-score finalize failed: {e}"));
     bits / (score_data.len() as f64)
 }
 
@@ -1504,6 +1513,8 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             for &b in data {
                 bits -= mix.step(b) / std::f64::consts::LN_2;
             }
+            mix.finish_stream()
+                .unwrap_or_else(|e| panic!("Mixture stream finalize failed: {e}"));
             bits / (data.len() as f64)
         }
         RateBackend::Particle { spec } => {
@@ -1662,6 +1673,8 @@ pub fn joint_entropy_rate_backend(
             for &b in &joint {
                 bits -= mix.step(b) / std::f64::consts::LN_2;
             }
+            mix.finish_stream()
+                .unwrap_or_else(|e| panic!("Mixture stream finalize failed: {e}"));
             bits / (x.len() as f64)
         }
         RateBackend::Particle { spec } => {

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 from pathlib import Path
 
@@ -44,6 +45,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_BASELINE,
         help=f"Baseline summary TSV. Defaults to {DEFAULT_BASELINE}.",
     )
+    parser.add_argument(
+        "--subjects",
+        help=(
+            "Comma- or whitespace-separated subject filter. "
+            "Example: --subjects rwkv"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -56,15 +64,38 @@ def row_key(row: dict[str, str]) -> tuple[str, str, str, str]:
     )
 
 
-def load_rows(path: Path) -> dict[tuple[str, str, str, str], dict[str, str]]:
+def parse_subject_filter(raw: str | None) -> set[str] | None:
+    if raw is None:
+        return None
+    selected = {token for token in re.split(r"[\s,]+", raw.strip()) if token}
+    if not selected:
+        raise SystemExit("--subjects must contain at least one subject")
+    return selected
+
+
+def load_rows(
+    path: Path,
+    selected_subjects: set[str] | None,
+) -> dict[tuple[str, str, str, str], dict[str, str]]:
     rows: dict[tuple[str, str, str, str], dict[str, str]] = {}
+    seen_subjects: set[str] = set()
     with path.open(newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         for row in reader:
+            seen_subjects.add(row["subject"])
+            if selected_subjects is not None and row["subject"] not in selected_subjects:
+                continue
             key = row_key(row)
             if key in rows:
                 raise SystemExit(f"duplicate summary row in {path}: {key!r}")
             rows[key] = row
+    if selected_subjects is not None:
+        unknown = sorted(selected_subjects - seen_subjects)
+        if unknown:
+            raise SystemExit(
+                f"{path}: unknown filtered subjects: {', '.join(unknown)} "
+                f"(known: {', '.join(sorted(seen_subjects))})"
+            )
     return rows
 
 
@@ -150,6 +181,7 @@ def main() -> int:
     args = parse_args()
     candidate_path = args.candidate or latest_candidate_summary()
     baseline_path = args.baseline
+    selected_subjects = parse_subject_filter(args.subjects)
 
     if candidate_path is None:
         raise SystemExit("no candidate summary TSV provided and no /tmp summary TSV was found")
@@ -158,8 +190,8 @@ def main() -> int:
     if not candidate_path.is_file():
         raise SystemExit(f"candidate summary TSV not found: {candidate_path}")
 
-    baseline_rows = load_rows(baseline_path)
-    candidate_rows = load_rows(candidate_path)
+    baseline_rows = load_rows(baseline_path, selected_subjects)
+    candidate_rows = load_rows(candidate_path, selected_subjects)
     keys = sorted(set(baseline_rows) | set(candidate_rows), key=sort_key)
 
     full_issues = 0

@@ -79,71 +79,7 @@ pub fn quantize_pdf_to_rans_cdf_with_buffer(
     freq_buf: &mut [i64],
 ) {
     let n = pdf.len();
-    assert!(cdf_out.len() > n, "cdf buffer too small");
-    assert!(freq_buf.len() >= n, "frequency buffer too small");
-
-    let total = ANS_TOTAL as i64;
-    for i in 0..n {
-        freq_buf[i] = (pdf[i] * total as f64).round() as i64;
-        if pdf[i] > 0.0 && freq_buf[i] == 0 {
-            freq_buf[i] = 1;
-        } else if pdf[i] <= 0.0 {
-            freq_buf[i] = 0;
-        }
-    }
-
-    let sum: i64 = freq_buf[..n].iter().sum();
-    if sum > total {
-        let mut to_remove = sum - total;
-        while to_remove > 0 {
-            let mut removed = 0;
-            for i in (0..n).rev() {
-                if freq_buf[i] > 1 {
-                    freq_buf[i] -= 1;
-                    to_remove -= 1;
-                    removed += 1;
-                    if to_remove == 0 {
-                        break;
-                    }
-                }
-            }
-            if removed == 0 {
-                break;
-            }
-        }
-    } else if sum < total {
-        let mut to_add = total - sum;
-        while to_add > 0 {
-            let mut added = 0;
-            for i in 0..n {
-                if pdf[i] > 0.0 {
-                    freq_buf[i] += 1;
-                    to_add -= 1;
-                    added += 1;
-                    if to_add == 0 {
-                        break;
-                    }
-                }
-            }
-            if added == 0 {
-                for value in freq_buf.iter_mut().take(n) {
-                    *value += 1;
-                    to_add -= 1;
-                    if to_add == 0 {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    cdf_out[0] = 0;
-    let mut cumsum = 0u32;
-    for i in 0..n {
-        cdf_out[i] = cumsum;
-        cumsum += freq_buf[i] as u32;
-    }
-    cdf_out[n] = cumsum;
+    super::quantize_pdf_to_integer_cdf_with_buffer(pdf, ANS_TOTAL, cdf_out, freq_buf);
 
     debug_assert_eq!(cdf_out[n], ANS_TOTAL, "CDF total must equal ANS_TOTAL");
     for i in 0..n {
@@ -601,42 +537,64 @@ impl Default for BlockedRansEncoder {
 pub struct BlockedRansDecoder<'a> {
     blocks: Vec<&'a [u8]>,
     current_block: usize,
+    symbols_remaining_in_block: usize,
+    total_symbols: usize,
     decoder: Option<RansDecoder<'a>>,
 }
 
 impl<'a> BlockedRansDecoder<'a> {
     /// Create a new blocked decoder from encoded blocks.
-    pub fn new(blocks: Vec<&'a [u8]>) -> Self {
-        Self {
+    pub fn new(blocks: Vec<&'a [u8]>, total_symbols: usize) -> anyhow::Result<Self> {
+        let expected_blocks = if total_symbols == 0 {
+            0
+        } else {
+            total_symbols.div_ceil(BLOCK_SIZE)
+        };
+        if blocks.len() != expected_blocks {
+            anyhow::bail!(
+                "blocked rANS expected {expected_blocks} blocks for {total_symbols} symbols, got {}",
+                blocks.len()
+            );
+        }
+        Ok(Self {
             blocks,
             current_block: 0,
+            symbols_remaining_in_block: 0,
+            total_symbols,
             decoder: None,
+        })
+    }
+
+    #[inline]
+    fn open_block(&mut self, block_index: usize) -> anyhow::Result<()> {
+        if block_index >= self.blocks.len() {
+            anyhow::bail!("No more blocks to decode");
         }
+        let consumed = block_index.saturating_mul(BLOCK_SIZE);
+        let remaining = self.total_symbols.saturating_sub(consumed);
+        self.current_block = block_index;
+        self.symbols_remaining_in_block = remaining.min(BLOCK_SIZE);
+        self.decoder = Some(RansDecoder::new(self.blocks[block_index])?);
+        Ok(())
     }
 
     /// Decode next symbol with provided CDF.
     pub fn decode(&mut self, cdf: &[u32]) -> anyhow::Result<usize> {
-        // Initialize decoder for first block if needed
-        if self.decoder.is_none() {
-            if self.current_block >= self.blocks.len() {
-                anyhow::bail!("No more blocks to decode");
+        if self.symbols_remaining_in_block == 0 {
+            if self.decoder.is_some() {
+                self.open_block(self.current_block + 1)?;
+            } else {
+                self.open_block(0)?;
             }
-            self.decoder = Some(RansDecoder::new(self.blocks[self.current_block])?);
         }
 
-        // Try to decode from current block
-        match self.decoder.as_mut().unwrap().decode(cdf) {
-            Ok(sym) => Ok(sym),
-            Err(_) => {
-                // Current block exhausted, move to next
-                self.current_block += 1;
-                if self.current_block >= self.blocks.len() {
-                    anyhow::bail!("All blocks exhausted");
-                }
-                self.decoder = Some(RansDecoder::new(self.blocks[self.current_block])?);
-                self.decoder.as_mut().unwrap().decode(cdf)
-            }
-        }
+        let sym = self
+            .decoder
+            .as_mut()
+            .expect("decoder initialized for current block")
+            .decode(cdf)?;
+        self.symbols_remaining_in_block = self.symbols_remaining_in_block.saturating_sub(1);
+        Ok(sym)
     }
 }
 
@@ -701,6 +659,26 @@ mod tests {
         for &expected in &symbols {
             let got = dec.decode(&cdf_table).unwrap();
             assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn test_blocked_rans_roundtrip_across_block_boundary() {
+        let pdf = vec![0.5, 0.25, 0.125, 0.125];
+        let cdf = quantize_pdf_to_rans_cdf(&pdf);
+        let symbols: Vec<usize> = (0..(BLOCK_SIZE + 17)).map(|i| i % pdf.len()).collect();
+
+        let mut enc = BlockedRansEncoder::new();
+        for &sym in &symbols {
+            enc.encode(cdf_for_symbol(&cdf, sym));
+        }
+        let blocks = enc.finish();
+        let block_refs: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
+
+        let mut dec = BlockedRansDecoder::new(block_refs, symbols.len()).unwrap();
+        for &expected in &symbols {
+            let got = dec.decode(&cdf).unwrap();
+            assert_eq!(got, expected, "blocked rANS mismatch at symbol {expected}");
         }
     }
 }

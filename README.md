@@ -139,6 +139,7 @@ Supported `cfg:` keys:
 
 `train` supports: `none`, `sgd`, `adam`.
 `policy` supports `schedule=...` rules (for example `0..100:infer` or `0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)`).
+For RWKV full-parameter training scopes (`scope` touching non-head parameters), `bptt<=1` resolves to the fast default window `8`; specify a larger explicit `bptt` to override it.
 
 Example:
 
@@ -147,6 +148,8 @@ Example:
   --rate-backend rwkv7 \
   --method "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=7,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.9)"
 ```
+
+For `examples/two.json` benchmark plotting, `scripts/plot_two_json.sh` also accepts `INFOTHEORY_BASELINE_SUMMARY_TSV=/path/to/baseline-summary.tsv` to emit additional baseline-overlay SVGs.
 
 Optional online export after processing input:
 

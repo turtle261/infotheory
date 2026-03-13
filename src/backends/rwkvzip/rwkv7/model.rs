@@ -314,7 +314,7 @@ pub struct FullAdamState {
     blocks: Vec<BlockAdamState>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 /// Train-scope mask for RWKV full-parameter online updates.
 pub struct TrainScopeMask {
     pub embed: bool,
@@ -351,6 +351,62 @@ impl TrainScopeMask {
     pub fn trains_any_params(&self) -> bool {
         self.trains_non_head_params() || self.head || self.bias
     }
+}
+
+#[derive(Clone)]
+struct AttentionGradState {
+    x_r: Tensor1D,
+    x_w: Tensor1D,
+    x_k: Tensor1D,
+    x_v: Tensor1D,
+    x_a: Tensor1D,
+    x_g: Tensor1D,
+    rkv_proj: Tensor1D,
+    o_proj: Tensor1D,
+    w1: Tensor1D,
+    w2: Tensor1D,
+    w0: Tensor1D,
+    a1: Tensor1D,
+    a2: Tensor1D,
+    a0: Tensor1D,
+    v1: Option<Tensor1D>,
+    v2: Option<Tensor1D>,
+    v0: Option<Tensor1D>,
+    g1: Tensor1D,
+    g2: Tensor1D,
+    k_k: Tensor1D,
+    k_a: Tensor1D,
+    r_k: Tensor1D,
+    g_norm_w: Tensor1D,
+    g_norm_b: Tensor1D,
+}
+
+#[derive(Clone)]
+struct FfnGradState {
+    x_k: Tensor1D,
+    key_w: Tensor1D,
+    value_w: Tensor1D,
+}
+
+#[derive(Clone)]
+struct BlockGradState {
+    pre_norm_w: Option<Tensor1D>,
+    pre_norm_b: Option<Tensor1D>,
+    attn_norm_w: Tensor1D,
+    attn_norm_b: Tensor1D,
+    ffn_norm_w: Tensor1D,
+    ffn_norm_b: Tensor1D,
+    attn: AttentionGradState,
+    ffn: FfnGradState,
+}
+
+#[derive(Clone)]
+struct FullGradState {
+    embeddings: Tensor1D,
+    ln_out_w: Tensor1D,
+    ln_out_b: Tensor1D,
+    lm_head: Tensor1D,
+    blocks: Vec<BlockGradState>,
 }
 
 struct AdamStep {
@@ -463,6 +519,68 @@ impl LayerTrainTrace {
     }
 }
 
+#[derive(Clone)]
+struct TokenTrainTrace {
+    token: usize,
+    x: Tensor1D,
+    x_normed: Tensor1D,
+    v_first: Tensor1D,
+    layers: Vec<LayerTrainTrace>,
+}
+
+impl TokenTrainTrace {
+    fn from_scratch(scratch: &ScratchBuffers) -> Self {
+        Self {
+            token: scratch.train_token,
+            x: scratch.x.clone(),
+            x_normed: scratch.x_normed.clone(),
+            v_first: scratch.train_v_first.clone(),
+            layers: scratch.train_trace_layers.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LayerRecurrentGradState {
+    att_x_prev: Tensor1D,
+    att_state: Tensor1D,
+    ffn_x_prev: Tensor1D,
+}
+
+impl LayerRecurrentGradState {
+    fn new(cfg: &Config) -> Self {
+        let state_size = cfg.num_heads * cfg.head_dim * cfg.head_dim;
+        Self {
+            att_x_prev: Tensor1D::zeros(cfg.hidden_size),
+            att_state: Tensor1D::zeros(state_size),
+            ffn_x_prev: Tensor1D::zeros(cfg.hidden_size),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RecurrentGradState {
+    layers: Vec<LayerRecurrentGradState>,
+}
+
+impl RecurrentGradState {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            layers: (0..cfg.num_layers)
+                .map(|_| LayerRecurrentGradState::new(cfg))
+                .collect(),
+        }
+    }
+
+    fn zero(&mut self) {
+        for layer in &mut self.layers {
+            layer.att_x_prev.zero();
+            layer.att_state.zero();
+            layer.ffn_x_prev.zero();
+        }
+    }
+}
+
 /// Pre-allocated scratch buffers to avoid allocations in hot path.
 #[derive(Clone)]
 pub struct ScratchBuffers {
@@ -501,6 +619,7 @@ pub struct ScratchBuffers {
     grad_ffn2: Tensor1D,
     grad_low_rank: Tensor1D,
     grad_low_rank2: Tensor1D,
+    grad_att_state: Tensor1D,
     grad_logits: Tensor1D,
     train_trace_layers: Vec<LayerTrainTrace>,
     train_token: usize,
@@ -515,6 +634,7 @@ impl ScratchBuffers {
         let c = cfg.hidden_size;
         let i = cfg.intermediate_size;
         let v = cfg.vocab_size;
+        let state_size = cfg.num_heads * cfg.head_dim * cfg.head_dim;
         let d_rank = cfg
             .decay_low_rank
             .max(cfg.a_low_rank)
@@ -562,6 +682,7 @@ impl ScratchBuffers {
             grad_ffn2: Tensor1D::zeros(i),
             grad_low_rank: Tensor1D::zeros(d_rank),
             grad_low_rank2: Tensor1D::zeros(d_rank),
+            grad_att_state: Tensor1D::zeros(state_size),
             grad_logits: Tensor1D::zeros(v),
             train_trace_layers,
             train_token: 0,
@@ -575,6 +696,11 @@ impl ScratchBuffers {
     #[inline]
     pub fn lm_head_input(&self) -> &[f32] {
         self.x_normed.as_slice()
+    }
+
+    #[inline]
+    pub fn logits(&self) -> &[f32] {
+        self.logits.as_slice()
     }
 
     /// Restore LM-head input snapshot for reversible online updates.
@@ -1271,6 +1397,63 @@ impl Model {
         }
     }
 
+    /// Allocate zero-initialized gradient storage matching all trainable tensors.
+    fn new_full_grad_state(&self) -> FullGradState {
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for b in &self.blocks {
+            blocks.push(BlockGradState {
+                pre_norm_w: b.pre_norm_w.as_ref().map(|t| Tensor1D::zeros(t.len())),
+                pre_norm_b: b.pre_norm_b.as_ref().map(|t| Tensor1D::zeros(t.len())),
+                attn_norm_w: Tensor1D::zeros(b.attn_norm_w.len()),
+                attn_norm_b: Tensor1D::zeros(b.attn_norm_b.len()),
+                ffn_norm_w: Tensor1D::zeros(b.ffn_norm_w.len()),
+                ffn_norm_b: Tensor1D::zeros(b.ffn_norm_b.len()),
+                attn: AttentionGradState {
+                    x_r: Tensor1D::zeros(b.attn.x_r.len()),
+                    x_w: Tensor1D::zeros(b.attn.x_w.len()),
+                    x_k: Tensor1D::zeros(b.attn.x_k.len()),
+                    x_v: Tensor1D::zeros(b.attn.x_v.len()),
+                    x_a: Tensor1D::zeros(b.attn.x_a.len()),
+                    x_g: Tensor1D::zeros(b.attn.x_g.len()),
+                    rkv_proj: Tensor1D::zeros(b.attn.rkv_proj.len()),
+                    o_proj: Tensor1D::zeros(b.attn.o_proj.len()),
+                    w1: Tensor1D::zeros(b.attn.w1.len()),
+                    w2: Tensor1D::zeros(b.attn.w2.len()),
+                    w0: Tensor1D::zeros(b.attn.w0.len()),
+                    a1: Tensor1D::zeros(b.attn.a1.len()),
+                    a2: Tensor1D::zeros(b.attn.a2.len()),
+                    a0: Tensor1D::zeros(b.attn.a0.len()),
+                    v1: b.attn.v1.as_ref().map(|t| Tensor1D::zeros(t.len())),
+                    v2: b.attn.v2.as_ref().map(|t| Tensor1D::zeros(t.len())),
+                    v0: b.attn.v0.as_ref().map(|t| Tensor1D::zeros(t.len())),
+                    g1: Tensor1D::zeros(b.attn.g1.len()),
+                    g2: Tensor1D::zeros(b.attn.g2.len()),
+                    k_k: Tensor1D::zeros(b.attn.k_k.len()),
+                    k_a: Tensor1D::zeros(b.attn.k_a.len()),
+                    r_k: Tensor1D::zeros(b.attn.r_k.len()),
+                    g_norm_w: Tensor1D::zeros(b.attn.g_norm_w.len()),
+                    g_norm_b: Tensor1D::zeros(b.attn.g_norm_b.len()),
+                },
+                ffn: FfnGradState {
+                    x_k: Tensor1D::zeros(b.ffn.x_k.len()),
+                    key_w: Tensor1D::zeros(b.ffn.key_w.len()),
+                    value_w: Tensor1D::zeros(b.ffn.value_w.len()),
+                },
+            });
+        }
+        FullGradState {
+            embeddings: Tensor1D::zeros(self.embeddings.len()),
+            ln_out_w: Tensor1D::zeros(self.ln_out_w.len()),
+            ln_out_b: Tensor1D::zeros(self.ln_out_b.len()),
+            lm_head: Tensor1D::zeros(self.lm_head.len()),
+            blocks,
+        }
+    }
+
+    fn new_recurrent_grad_state(&self) -> RecurrentGradState {
+        RecurrentGradState::new(&self.cfg)
+    }
+
     /// Save full-parameter Adam moments for exact online-training continuation.
     pub fn save_full_adam_safetensors<P: AsRef<Path>>(
         &self,
@@ -1542,6 +1725,1509 @@ impl Model {
     #[inline]
     pub fn lm_head_weights_mut(&mut self) -> &mut [f32] {
         self.lm_head.as_mut_slice()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_full_gradients(
+        &mut self,
+        grads: &FullGradState,
+        scope: TrainScopeMask,
+        optimizer: OptimizerKind,
+        lr: f32,
+        clip: f32,
+        adam_t: &mut usize,
+        model_adam: Option<&mut FullAdamState>,
+        out_bias: Option<&mut [f32]>,
+        out_bias_grad: Option<&[f32]>,
+        out_bias_adam_m: Option<&mut [f32]>,
+        out_bias_adam_v: Option<&mut [f32]>,
+    ) -> Result<()> {
+        let mut adam_step = None::<AdamStep>;
+        let mut model_adam = model_adam;
+        if matches!(optimizer, OptimizerKind::Adam) {
+            *adam_t = adam_t.saturating_add(1);
+            let t = (*adam_t).max(1) as i32;
+            let b1 = 0.9f32;
+            let b2 = 0.999f32;
+            adam_step = Some(AdamStep {
+                lr,
+                clip: clip.max(0.0),
+                b1,
+                b2,
+                eps: 1e-8,
+                bias_corr1: 1.0 - b1.powi(t),
+                bias_corr2: 1.0 - b2.powi(t),
+            });
+            if scope.trains_non_head_params() && model_adam.is_none() {
+                bail!("rwkv Adam full-training state is missing");
+            }
+        }
+
+        if scope.bias
+            && let (Some(bias), Some(grad)) = (out_bias, out_bias_grad)
+        {
+            match optimizer {
+                OptimizerKind::Sgd => sgd_vec_update(bias, grad, lr, clip),
+                OptimizerKind::Adam => {
+                    let cfg = adam_step.as_ref().expect("adam cfg initialized");
+                    let Some(m) = out_bias_adam_m else {
+                        bail!("rwkv Adam output-bias state is missing (m)");
+                    };
+                    let Some(v) = out_bias_adam_v else {
+                        bail!("rwkv Adam output-bias state is missing (v)");
+                    };
+                    apply_adam_vec_update_raw(bias, grad, m, v, cfg);
+                }
+            }
+        }
+
+        if scope.head {
+            match optimizer {
+                OptimizerKind::Sgd => {
+                    sgd_vec_update(
+                        self.lm_head.as_mut_slice(),
+                        grads.lm_head.as_slice(),
+                        lr,
+                        clip,
+                    );
+                    sgd_vec_update(
+                        self.ln_out_w.as_mut_slice(),
+                        grads.ln_out_w.as_slice(),
+                        lr,
+                        clip,
+                    );
+                    sgd_vec_update(
+                        self.ln_out_b.as_mut_slice(),
+                        grads.ln_out_b.as_slice(),
+                        lr,
+                        clip,
+                    );
+                }
+                OptimizerKind::Adam => {
+                    let cfg = adam_step.as_ref().expect("adam cfg initialized");
+                    let adam = model_adam.as_mut().expect("adam state exists");
+                    apply_adam_vec_update(
+                        self.lm_head.as_mut_slice(),
+                        grads.lm_head.as_slice(),
+                        &mut adam.lm_head,
+                        cfg,
+                    );
+                    apply_adam_vec_update(
+                        self.ln_out_w.as_mut_slice(),
+                        grads.ln_out_w.as_slice(),
+                        &mut adam.ln_out_w,
+                        cfg,
+                    );
+                    apply_adam_vec_update(
+                        self.ln_out_b.as_mut_slice(),
+                        grads.ln_out_b.as_slice(),
+                        &mut adam.ln_out_b,
+                        cfg,
+                    );
+                }
+            }
+        }
+
+        for layer_idx in 0..self.cfg.num_layers {
+            let block = &mut self.blocks[layer_idx];
+            let grad = &grads.blocks[layer_idx];
+            match optimizer {
+                OptimizerKind::Sgd => {
+                    if scope.ffn {
+                        sgd_vec_update(
+                            block.ffn.x_k.as_mut_slice(),
+                            grad.ffn.x_k.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.ffn.key_w.as_mut_slice(),
+                            grad.ffn.key_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.ffn.value_w.as_mut_slice(),
+                            grad.ffn.value_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                    }
+                    if scope.ffn_norm {
+                        sgd_vec_update(
+                            block.ffn_norm_w.as_mut_slice(),
+                            grad.ffn_norm_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.ffn_norm_b.as_mut_slice(),
+                            grad.ffn_norm_b.as_slice(),
+                            lr,
+                            clip,
+                        );
+                    }
+                    if scope.attn {
+                        sgd_vec_update(
+                            block.attn.o_proj.as_mut_slice(),
+                            grad.attn.o_proj.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.r_k.as_mut_slice(),
+                            grad.attn.r_k.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.g_norm_w.as_mut_slice(),
+                            grad.attn.g_norm_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.g_norm_b.as_mut_slice(),
+                            grad.attn.g_norm_b.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.k_a.as_mut_slice(),
+                            grad.attn.k_a.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.k_k.as_mut_slice(),
+                            grad.attn.k_k.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.rkv_proj.as_mut_slice(),
+                            grad.attn.rkv_proj.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.w0.as_mut_slice(),
+                            grad.attn.w0.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.w2.as_mut_slice(),
+                            grad.attn.w2.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.w1.as_mut_slice(),
+                            grad.attn.w1.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.a0.as_mut_slice(),
+                            grad.attn.a0.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.a2.as_mut_slice(),
+                            grad.attn.a2.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.a1.as_mut_slice(),
+                            grad.attn.a1.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.g2.as_mut_slice(),
+                            grad.attn.g2.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.g1.as_mut_slice(),
+                            grad.attn.g1.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.x_r.as_mut_slice(),
+                            grad.attn.x_r.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.x_w.as_mut_slice(),
+                            grad.attn.x_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.x_k.as_mut_slice(),
+                            grad.attn.x_k.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.x_v.as_mut_slice(),
+                            grad.attn.x_v.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.x_a.as_mut_slice(),
+                            grad.attn.x_a.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn.x_g.as_mut_slice(),
+                            grad.attn.x_g.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        if let (Some(v1), Some(gv1)) =
+                            (block.attn.v1.as_mut(), grad.attn.v1.as_ref())
+                        {
+                            sgd_vec_update(v1.as_mut_slice(), gv1.as_slice(), lr, clip);
+                        }
+                        if let (Some(v2), Some(gv2)) =
+                            (block.attn.v2.as_mut(), grad.attn.v2.as_ref())
+                        {
+                            sgd_vec_update(v2.as_mut_slice(), gv2.as_slice(), lr, clip);
+                        }
+                        if let (Some(v0), Some(gv0)) =
+                            (block.attn.v0.as_mut(), grad.attn.v0.as_ref())
+                        {
+                            sgd_vec_update(v0.as_mut_slice(), gv0.as_slice(), lr, clip);
+                        }
+                    }
+                    if scope.attn_norm {
+                        sgd_vec_update(
+                            block.attn_norm_w.as_mut_slice(),
+                            grad.attn_norm_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            block.attn_norm_b.as_mut_slice(),
+                            grad.attn_norm_b.as_slice(),
+                            lr,
+                            clip,
+                        );
+                    }
+                    if scope.pre_norm
+                        && let (Some(w), Some(gw)) =
+                            (block.pre_norm_w.as_mut(), grad.pre_norm_w.as_ref())
+                    {
+                        sgd_vec_update(w.as_mut_slice(), gw.as_slice(), lr, clip);
+                    }
+                    if scope.pre_norm
+                        && let (Some(b), Some(gb)) =
+                            (block.pre_norm_b.as_mut(), grad.pre_norm_b.as_ref())
+                    {
+                        sgd_vec_update(b.as_mut_slice(), gb.as_slice(), lr, clip);
+                    }
+                }
+                OptimizerKind::Adam => {
+                    let cfg = adam_step.as_ref().expect("adam cfg initialized");
+                    let adam =
+                        &mut model_adam.as_mut().expect("adam state exists").blocks[layer_idx];
+                    if scope.ffn {
+                        apply_adam_vec_update(
+                            block.ffn.x_k.as_mut_slice(),
+                            grad.ffn.x_k.as_slice(),
+                            &mut adam.ffn.x_k,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.ffn.key_w.as_mut_slice(),
+                            grad.ffn.key_w.as_slice(),
+                            &mut adam.ffn.key_w,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.ffn.value_w.as_mut_slice(),
+                            grad.ffn.value_w.as_slice(),
+                            &mut adam.ffn.value_w,
+                            cfg,
+                        );
+                    }
+                    if scope.ffn_norm {
+                        apply_adam_vec_update(
+                            block.ffn_norm_w.as_mut_slice(),
+                            grad.ffn_norm_w.as_slice(),
+                            &mut adam.ffn_norm_w,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.ffn_norm_b.as_mut_slice(),
+                            grad.ffn_norm_b.as_slice(),
+                            &mut adam.ffn_norm_b,
+                            cfg,
+                        );
+                    }
+                    if scope.attn {
+                        apply_adam_vec_update(
+                            block.attn.o_proj.as_mut_slice(),
+                            grad.attn.o_proj.as_slice(),
+                            &mut adam.attn.o_proj,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.r_k.as_mut_slice(),
+                            grad.attn.r_k.as_slice(),
+                            &mut adam.attn.r_k,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.g_norm_w.as_mut_slice(),
+                            grad.attn.g_norm_w.as_slice(),
+                            &mut adam.attn.g_norm_w,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.g_norm_b.as_mut_slice(),
+                            grad.attn.g_norm_b.as_slice(),
+                            &mut adam.attn.g_norm_b,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.k_a.as_mut_slice(),
+                            grad.attn.k_a.as_slice(),
+                            &mut adam.attn.k_a,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.k_k.as_mut_slice(),
+                            grad.attn.k_k.as_slice(),
+                            &mut adam.attn.k_k,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.rkv_proj.as_mut_slice(),
+                            grad.attn.rkv_proj.as_slice(),
+                            &mut adam.attn.rkv_proj,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.w0.as_mut_slice(),
+                            grad.attn.w0.as_slice(),
+                            &mut adam.attn.w0,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.w2.as_mut_slice(),
+                            grad.attn.w2.as_slice(),
+                            &mut adam.attn.w2,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.w1.as_mut_slice(),
+                            grad.attn.w1.as_slice(),
+                            &mut adam.attn.w1,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.a0.as_mut_slice(),
+                            grad.attn.a0.as_slice(),
+                            &mut adam.attn.a0,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.a2.as_mut_slice(),
+                            grad.attn.a2.as_slice(),
+                            &mut adam.attn.a2,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.a1.as_mut_slice(),
+                            grad.attn.a1.as_slice(),
+                            &mut adam.attn.a1,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.g2.as_mut_slice(),
+                            grad.attn.g2.as_slice(),
+                            &mut adam.attn.g2,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.g1.as_mut_slice(),
+                            grad.attn.g1.as_slice(),
+                            &mut adam.attn.g1,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.x_r.as_mut_slice(),
+                            grad.attn.x_r.as_slice(),
+                            &mut adam.attn.x_r,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.x_w.as_mut_slice(),
+                            grad.attn.x_w.as_slice(),
+                            &mut adam.attn.x_w,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.x_k.as_mut_slice(),
+                            grad.attn.x_k.as_slice(),
+                            &mut adam.attn.x_k,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.x_v.as_mut_slice(),
+                            grad.attn.x_v.as_slice(),
+                            &mut adam.attn.x_v,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.x_a.as_mut_slice(),
+                            grad.attn.x_a.as_slice(),
+                            &mut adam.attn.x_a,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn.x_g.as_mut_slice(),
+                            grad.attn.x_g.as_slice(),
+                            &mut adam.attn.x_g,
+                            cfg,
+                        );
+                        if let (Some(v1), Some(gv1), Some(av1)) = (
+                            block.attn.v1.as_mut(),
+                            grad.attn.v1.as_ref(),
+                            adam.attn.v1.as_mut(),
+                        ) {
+                            apply_adam_vec_update(v1.as_mut_slice(), gv1.as_slice(), av1, cfg);
+                        }
+                        if let (Some(v2), Some(gv2), Some(av2)) = (
+                            block.attn.v2.as_mut(),
+                            grad.attn.v2.as_ref(),
+                            adam.attn.v2.as_mut(),
+                        ) {
+                            apply_adam_vec_update(v2.as_mut_slice(), gv2.as_slice(), av2, cfg);
+                        }
+                        if let (Some(v0), Some(gv0), Some(av0)) = (
+                            block.attn.v0.as_mut(),
+                            grad.attn.v0.as_ref(),
+                            adam.attn.v0.as_mut(),
+                        ) {
+                            apply_adam_vec_update(v0.as_mut_slice(), gv0.as_slice(), av0, cfg);
+                        }
+                    }
+                    if scope.attn_norm {
+                        apply_adam_vec_update(
+                            block.attn_norm_w.as_mut_slice(),
+                            grad.attn_norm_w.as_slice(),
+                            &mut adam.attn_norm_w,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            block.attn_norm_b.as_mut_slice(),
+                            grad.attn_norm_b.as_slice(),
+                            &mut adam.attn_norm_b,
+                            cfg,
+                        );
+                    }
+                    if scope.pre_norm
+                        && let (Some(w), Some(gw), Some(aw)) = (
+                            block.pre_norm_w.as_mut(),
+                            grad.pre_norm_w.as_ref(),
+                            adam.pre_norm_w.as_mut(),
+                        )
+                    {
+                        apply_adam_vec_update(w.as_mut_slice(), gw.as_slice(), aw, cfg);
+                    }
+                    if scope.pre_norm
+                        && let (Some(b), Some(gb), Some(ab)) = (
+                            block.pre_norm_b.as_mut(),
+                            grad.pre_norm_b.as_ref(),
+                            adam.pre_norm_b.as_mut(),
+                        )
+                    {
+                        apply_adam_vec_update(b.as_mut_slice(), gb.as_slice(), ab, cfg);
+                    }
+                }
+            }
+        }
+
+        if scope.embed {
+            match optimizer {
+                OptimizerKind::Sgd => {
+                    sgd_vec_update(
+                        self.embeddings.as_mut_slice(),
+                        grads.embeddings.as_slice(),
+                        lr,
+                        clip,
+                    );
+                }
+                OptimizerKind::Adam => {
+                    let cfg = adam_step.as_ref().expect("adam cfg initialized");
+                    let adam = model_adam.as_mut().expect("adam state exists");
+                    apply_adam_vec_update(
+                        self.embeddings.as_mut_slice(),
+                        grads.embeddings.as_slice(),
+                        &mut adam.embeddings,
+                        cfg,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn accumulate_token_step_gradients(
+        &self,
+        scratch: &mut ScratchBuffers,
+        trace: &TokenTrainTrace,
+        state_new: &State,
+        symbol: u8,
+        pdf: &[f64],
+        grad_scale: f32,
+        scope: TrainScopeMask,
+        grads: &mut FullGradState,
+        out_bias_grad: Option<&mut [f32]>,
+        future: &mut RecurrentGradState,
+    ) -> Result<()> {
+        let c = self.cfg.hidden_size;
+        let h = self.cfg.num_heads;
+        let n = self.cfg.head_dim;
+        let i = self.cfg.intermediate_size;
+        let d_w = self.cfg.decay_low_rank;
+        let d_a = self.cfg.a_low_rank;
+        let d_v = self.cfg.v_low_rank;
+        let d_g = self.cfg.g_low_rank;
+        let vocab = self.cfg.vocab_size.min(pdf.len());
+        if vocab == 0 {
+            return Ok(());
+        }
+
+        scratch.grad_logits.zero();
+        for idx in 0..vocab {
+            let p = pdf[idx].clamp(1e-12, 1.0) as f32;
+            let target = if idx == symbol as usize { 1.0 } else { 0.0 };
+            scratch.grad_logits[idx] = (target - p) * grad_scale;
+        }
+
+        if scope.bias
+            && let Some(bias_grad) = out_bias_grad
+        {
+            add_vec_grad(
+                &mut bias_grad[0..vocab],
+                &scratch.grad_logits.as_slice()[0..vocab],
+            );
+        }
+
+        scratch.grad_x.zero();
+        if scope.head {
+            add_outer_grad(
+                grads.lm_head.as_mut_slice(),
+                vocab,
+                c,
+                &scratch.grad_logits.as_slice()[0..vocab],
+                trace.x_normed.as_slice(),
+            );
+        }
+        for row in 0..vocab {
+            let g = scratch.grad_logits[row];
+            if g == 0.0 {
+                continue;
+            }
+            let row_off = row * c;
+            for col in 0..c {
+                scratch.grad_x[col] += self.lm_head[row_off + col] * g;
+            }
+        }
+
+        let needs_backprop = scope.trains_non_head_params() || scope.head;
+        if !needs_backprop {
+            return Ok(());
+        }
+
+        layer_norm_backward(
+            trace.x.as_slice(),
+            self.ln_out_w.as_slice(),
+            scratch.grad_x.as_slice(),
+            self.cfg.layer_norm_eps,
+            scratch.grad_x2.as_mut_slice(),
+            scratch.grad_x3.as_mut_slice(),
+            scratch.grad_x4.as_mut_slice(),
+        );
+        if scope.head {
+            add_vec_grad(grads.ln_out_w.as_mut_slice(), scratch.grad_x3.as_slice());
+            add_vec_grad(grads.ln_out_b.as_mut_slice(), scratch.grad_x4.as_slice());
+        }
+        scratch.grad_x.copy_from_slice(scratch.grad_x2.as_slice());
+        scratch.grad_v_first.zero();
+
+        for layer_idx in (0..self.cfg.num_layers).rev() {
+            let tr = &trace.layers[layer_idx];
+            let block = &self.blocks[layer_idx];
+            let block_grads = &mut grads.blocks[layer_idx];
+            let future_layer = &mut future.layers[layer_idx];
+
+            scratch.grad_x2.copy_from_slice(scratch.grad_x.as_slice());
+            scratch.grad_x3.copy_from_slice(scratch.grad_x.as_slice());
+
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.ffn.value_w.as_ptr(),
+                    scratch.grad_x3.as_ptr(),
+                    scratch.grad_ffn.as_mut_ptr(),
+                    c,
+                    i,
+                );
+            }
+            if scope.ffn {
+                add_outer_grad(
+                    block_grads.ffn.value_w.as_mut_slice(),
+                    c,
+                    i,
+                    scratch.grad_x3.as_slice(),
+                    tr.ffn_k.as_slice(),
+                );
+            }
+
+            for col in 0..i {
+                let pre = tr.ffn_pre[col];
+                scratch.grad_ffn2[col] = if pre > 0.0 {
+                    scratch.grad_ffn[col] * (2.0 * pre)
+                } else {
+                    0.0
+                };
+            }
+
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.ffn.key_w.as_ptr(),
+                    scratch.grad_ffn2.as_ptr(),
+                    scratch.grad_x4.as_mut_ptr(),
+                    i,
+                    c,
+                );
+            }
+            if scope.ffn {
+                add_outer_grad(
+                    block_grads.ffn.key_w.as_mut_slice(),
+                    i,
+                    c,
+                    scratch.grad_ffn2.as_slice(),
+                    tr.ffn_xk.as_slice(),
+                );
+            }
+
+            scratch
+                .grad_x5
+                .copy_from_slice(future_layer.ffn_x_prev.as_slice());
+            future_layer.ffn_x_prev.zero();
+            for col in 0..c {
+                let g = scratch.grad_x4[col];
+                let mix = block.ffn.x_k[col];
+                let base = tr.ffn_norm[col];
+                let prev = tr.ffn_x_prev_old[col];
+                scratch.grad_x5[col] += g * (1.0 - mix);
+                future_layer.ffn_x_prev[col] = g * mix;
+                scratch.grad_param[col] = g * (prev - base);
+            }
+            if scope.ffn {
+                add_vec_grad(
+                    block_grads.ffn.x_k.as_mut_slice(),
+                    scratch.grad_param.as_slice(),
+                );
+            }
+
+            layer_norm_backward(
+                tr.x_after_attn.as_slice(),
+                block.ffn_norm_w.as_slice(),
+                scratch.grad_x5.as_slice(),
+                self.cfg.layer_norm_eps,
+                scratch.grad_x4.as_mut_slice(),
+                scratch.grad_x3.as_mut_slice(),
+                scratch.grad_x6.as_mut_slice(),
+            );
+            if scope.ffn_norm {
+                add_vec_grad(
+                    block_grads.ffn_norm_w.as_mut_slice(),
+                    scratch.grad_x3.as_slice(),
+                );
+                add_vec_grad(
+                    block_grads.ffn_norm_b.as_mut_slice(),
+                    scratch.grad_x6.as_slice(),
+                );
+            }
+            for col in 0..c {
+                scratch.grad_x2[col] += scratch.grad_x4[col];
+            }
+
+            scratch.grad_x.copy_from_slice(scratch.grad_x2.as_slice());
+            scratch.grad_x3.copy_from_slice(scratch.grad_x2.as_slice());
+
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.o_proj.as_ptr(),
+                    scratch.grad_x3.as_ptr(),
+                    scratch.grad_x4.as_mut_ptr(),
+                    c,
+                    c,
+                );
+            }
+            if scope.attn {
+                add_outer_grad(
+                    block_grads.attn.o_proj.as_mut_slice(),
+                    c,
+                    c,
+                    scratch.grad_x3.as_slice(),
+                    tr.y_gate.as_slice(),
+                );
+            }
+
+            for col in 0..c {
+                let gy = scratch.grad_x4[col];
+                scratch.grad_saved[col] = gy * tr.y_head[col];
+                scratch.grad_x4[col] = gy * tr.g[col];
+            }
+
+            scratch.grad_x2.zero();
+            scratch.grad_x3.zero();
+            scratch.grad_x6.zero();
+            scratch.grad_param.zero();
+            for head_idx in 0..h {
+                let off = head_idx * n;
+                let mut g_alpha = 0.0f32;
+                for j in 0..n {
+                    let g = scratch.grad_x4[off + j];
+                    g_alpha += g * tr.v[off + j];
+                    scratch.grad_x6[off + j] += g * tr.alpha[head_idx];
+                }
+                for j in 0..n {
+                    let idx = off + j;
+                    let rk = block.attn.r_k[idx];
+                    let rv = tr.r[idx];
+                    let kv = tr.k[idx];
+                    let g = g_alpha * rk;
+                    scratch.grad_x2[idx] += g * kv;
+                    scratch.grad_x3[idx] += g * rv;
+                    scratch.grad_param[idx] += g_alpha * rv * kv;
+                }
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.r_k.as_mut_slice(),
+                    scratch.grad_param.as_slice(),
+                );
+            }
+
+            scratch.grad_x5.as_mut_slice()[0..c].copy_from_slice(&scratch.grad_x4.as_slice()[0..c]);
+            group_norm_backward(
+                tr.y_wkv.as_slice(),
+                block.attn.g_norm_w.as_slice(),
+                scratch.grad_x5.as_slice(),
+                h,
+                n,
+                self.cfg.group_norm_eps,
+                scratch.grad_x4.as_mut_slice(),
+                scratch.grad_param.as_mut_slice(),
+                scratch.grad_param2.as_mut_slice(),
+            );
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.g_norm_w.as_mut_slice(),
+                    scratch.grad_param.as_slice(),
+                );
+                add_vec_grad(
+                    block_grads.attn.g_norm_b.as_mut_slice(),
+                    scratch.grad_param2.as_slice(),
+                );
+            }
+
+            scratch.grad_param.zero();
+            scratch.grad_x5.zero();
+            scratch.grad_param2.zero();
+            scratch
+                .grad_att_state
+                .copy_from_slice(future_layer.att_state.as_slice());
+            future_layer.att_state.zero();
+            let s_old = tr.att_state_old.as_slice();
+            let s_new = state_new.layers[layer_idx].att_state.as_slice();
+            for head_idx in 0..h {
+                let off = head_idx * n;
+                let s_off = head_idx * n * n;
+                let grad_y = &scratch.grad_x4.as_slice()[off..off + n];
+                let r_head = &tr.r.as_slice()[off..off + n];
+                let k_head = &tr.k.as_slice()[off..off + n];
+                let kk_head = &tr.kk.as_slice()[off..off + n];
+                let a_head = &tr.a.as_slice()[off..off + n];
+                let v_head = &tr.v.as_slice()[off..off + n];
+                let w_head = &tr.w_decay.as_slice()[off..off + n];
+
+                unsafe {
+                    kernel::gemv_t_avx(
+                        s_new.as_ptr().add(s_off),
+                        grad_y.as_ptr(),
+                        scratch.grad_low_rank.as_mut_ptr(),
+                        n,
+                        n,
+                    );
+                }
+                for j in 0..n {
+                    scratch.grad_x2[off + j] += scratch.grad_low_rank[j];
+                }
+
+                let g_state = &mut scratch.grad_att_state.as_mut_slice()[s_off..s_off + n * n];
+                for irow in 0..n {
+                    let gy = grad_y[irow];
+                    let row_off = irow * n;
+                    for j in 0..n {
+                        g_state[row_off + j] += gy * r_head[j];
+                    }
+                }
+
+                unsafe {
+                    kernel::gemv_avx(
+                        s_old.as_ptr().add(s_off),
+                        kk_head.as_ptr(),
+                        scratch.grad_low_rank.as_mut_ptr(),
+                        n,
+                        n,
+                    );
+                }
+                let u = &scratch.grad_low_rank.as_slice()[0..n];
+
+                for j in 0..n {
+                    let mut grad_w = 0.0f32;
+                    let mut grad_k = 0.0f32;
+                    let mut grad_b = 0.0f32;
+                    for irow in 0..n {
+                        let g = g_state[irow * n + j];
+                        grad_w += g * s_old[s_off + irow * n + j];
+                        grad_k += g * v_head[irow];
+                        grad_b -= g * u[irow];
+                        future_layer.att_state[s_off + irow * n + j] = g * w_head[j];
+                    }
+                    scratch.grad_param[off + j] += grad_w;
+                    scratch.grad_x3[off + j] += grad_k;
+                    scratch.grad_param2[off + j] += grad_b * a_head[j];
+                    scratch.grad_x5[off + j] += grad_b * kk_head[j];
+                }
+
+                for irow in 0..n {
+                    let mut grad_u = 0.0f32;
+                    for j in 0..n {
+                        grad_u -= g_state[irow * n + j] * kk_head[j] * a_head[j];
+                    }
+                    scratch.grad_low_rank2[irow] = grad_u;
+                    let row_off = irow * n;
+                    for j in 0..n {
+                        future_layer.att_state[s_off + row_off + j] += grad_u * kk_head[j];
+                    }
+                }
+                unsafe {
+                    kernel::gemv_t_avx(
+                        s_old.as_ptr().add(s_off),
+                        scratch.grad_low_rank2.as_ptr(),
+                        scratch.grad_low_rank.as_mut_ptr(),
+                        n,
+                        n,
+                    );
+                }
+                for j in 0..n {
+                    scratch.grad_param2[off + j] += scratch.grad_low_rank[j];
+                }
+
+                for irow in 0..n {
+                    let mut grad_v = 0.0f32;
+                    for j in 0..n {
+                        grad_v += g_state[irow * n + j] * k_head[j];
+                    }
+                    scratch.grad_x6[off + irow] += grad_v;
+                }
+            }
+
+            for col in 0..c {
+                let gk = scratch.grad_x3[col];
+                let scale = 1.0 + (tr.a[col] - 1.0) * block.attn.k_a[col];
+                let d_scale = gk * tr.k_pre[col];
+                scratch.grad_x3[col] = gk * scale;
+                scratch.grad_x5[col] += d_scale * block.attn.k_a[col];
+                scratch.grad_param[col] = d_scale * (tr.a[col] - 1.0);
+            }
+            for head_idx in 0..h {
+                let off = head_idx * n;
+                l2_normalize_backward(
+                    &tr.kk_pre.as_slice()[off..off + n],
+                    &tr.kk.as_slice()[off..off + n],
+                    &scratch.grad_param2.as_slice()[off..off + n],
+                    1e-12,
+                    &mut scratch.grad_x4.as_mut_slice()[off..off + n],
+                );
+            }
+            for col in 0..c {
+                let g = scratch.grad_x4[col];
+                scratch.grad_x3[col] += g * block.attn.k_k[col];
+                scratch.grad_param2[col] = g * tr.k_pre[col];
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.k_a.as_mut_slice(),
+                    scratch.grad_param.as_slice(),
+                );
+                add_vec_grad(
+                    block_grads.attn.k_k.as_mut_slice(),
+                    scratch.grad_param2.as_slice(),
+                );
+            }
+
+            scratch
+                .grad_param2
+                .copy_from_slice(scratch.grad_x6.as_slice());
+            if layer_idx == 0 {
+                for col in 0..c {
+                    scratch.grad_x6[col] += scratch.grad_v_first[col];
+                }
+            } else if tr.uses_v_residual
+                && block.attn.v1.is_some()
+                && block.attn.v2.is_some()
+                && block.attn.v0.is_some()
+            {
+                let v1 = block.attn.v1.as_ref().expect("v1");
+                let v2 = block.attn.v2.as_ref().expect("v2");
+                for col in 0..c {
+                    let gv = scratch.grad_param2[col];
+                    let nu = tr.nu[col];
+                    scratch.grad_x6[col] = gv * (1.0 - nu);
+                    scratch.grad_x3[col] = gv * (trace.v_first[col] - tr.v_pre[col]);
+                    scratch.grad_v_first[col] += gv * nu;
+                }
+                for col in 0..c {
+                    let nu = tr.nu[col];
+                    scratch.grad_x3[col] *= nu * (1.0 - nu);
+                }
+                if scope.attn {
+                    add_vec_grad(
+                        block_grads
+                            .attn
+                            .v0
+                            .as_mut()
+                            .expect("grad v0")
+                            .as_mut_slice(),
+                        scratch.grad_x3.as_slice(),
+                    );
+                    add_outer_grad(
+                        block_grads
+                            .attn
+                            .v2
+                            .as_mut()
+                            .expect("grad v2")
+                            .as_mut_slice(),
+                        c,
+                        d_v,
+                        scratch.grad_x3.as_slice(),
+                        &tr.v_hidden.as_slice()[0..d_v],
+                    );
+                }
+                unsafe {
+                    kernel::gemv_t_avx(
+                        v2.as_ptr(),
+                        scratch.grad_x3.as_ptr(),
+                        scratch.grad_low_rank.as_mut_ptr(),
+                        c,
+                        d_v,
+                    );
+                }
+                if scope.attn {
+                    add_outer_grad(
+                        block_grads
+                            .attn
+                            .v1
+                            .as_mut()
+                            .expect("grad v1")
+                            .as_mut_slice(),
+                        d_v,
+                        c,
+                        &scratch.grad_low_rank.as_slice()[0..d_v],
+                        tr.xv.as_slice(),
+                    );
+                }
+                for col in 0..c {
+                    let mut acc = 0.0f32;
+                    for row in 0..d_v {
+                        acc += v1[row * c + col] * scratch.grad_low_rank[row];
+                    }
+                    scratch.grad_x4[col] += acc;
+                }
+            }
+
+            let proj_size = c * c;
+            if scope.attn {
+                add_outer_grad(
+                    &mut block_grads.attn.rkv_proj.as_mut_slice()[0..proj_size],
+                    c,
+                    c,
+                    scratch.grad_x2.as_slice(),
+                    tr.xr.as_slice(),
+                );
+                add_outer_grad(
+                    &mut block_grads.attn.rkv_proj.as_mut_slice()[proj_size..2 * proj_size],
+                    c,
+                    c,
+                    scratch.grad_x3.as_slice(),
+                    tr.xk.as_slice(),
+                );
+                add_outer_grad(
+                    &mut block_grads.attn.rkv_proj.as_mut_slice()[2 * proj_size..3 * proj_size],
+                    c,
+                    c,
+                    scratch.grad_x6.as_slice(),
+                    tr.xv.as_slice(),
+                );
+            }
+            let proj = block.attn.rkv_proj.as_slice();
+            unsafe {
+                kernel::gemv_t_avx(
+                    proj.as_ptr(),
+                    scratch.grad_x2.as_ptr(),
+                    scratch.grad_param.as_mut_ptr(),
+                    c,
+                    c,
+                );
+                kernel::gemv_t_avx(
+                    proj.as_ptr().add(proj_size),
+                    scratch.grad_x3.as_ptr(),
+                    scratch.grad_param2.as_mut_ptr(),
+                    c,
+                    c,
+                );
+                kernel::gemv_t_avx(
+                    proj.as_ptr().add(2 * proj_size),
+                    scratch.grad_x6.as_ptr(),
+                    scratch.grad_x4.as_mut_ptr(),
+                    c,
+                    c,
+                );
+            }
+
+            let inv_sqrt_e = 1.0 / std::f32::consts::E.sqrt();
+            for col in 0..c {
+                let sig = tr.w_sigmoid[col];
+                let d_sig = scratch.grad_param[col] * (-inv_sqrt_e) * tr.w_decay[col];
+                scratch.grad_param[col] = d_sig * sig * (1.0 - sig);
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.w0.as_mut_slice(),
+                    scratch.grad_param.as_slice(),
+                );
+                add_outer_grad(
+                    block_grads.attn.w2.as_mut_slice(),
+                    c,
+                    d_w,
+                    scratch.grad_param.as_slice(),
+                    &tr.w_hidden.as_slice()[0..d_w],
+                );
+            }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.w2.as_ptr(),
+                    scratch.grad_param.as_ptr(),
+                    scratch.grad_low_rank.as_mut_ptr(),
+                    c,
+                    d_w,
+                );
+            }
+            for col in 0..d_w {
+                let t = tr.w_hidden[col];
+                scratch.grad_low_rank[col] *= 1.0 - t * t;
+            }
+            if scope.attn {
+                add_outer_grad(
+                    block_grads.attn.w1.as_mut_slice(),
+                    d_w,
+                    c,
+                    &scratch.grad_low_rank.as_slice()[0..d_w],
+                    tr.xw.as_slice(),
+                );
+            }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.w1.as_ptr(),
+                    scratch.grad_low_rank.as_ptr(),
+                    scratch.grad_x6.as_mut_ptr(),
+                    d_w,
+                    c,
+                );
+            }
+
+            for col in 0..c {
+                let a = tr.a[col];
+                scratch.grad_x5[col] *= a * (1.0 - a);
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.a0.as_mut_slice(),
+                    scratch.grad_x5.as_slice(),
+                );
+                add_outer_grad(
+                    block_grads.attn.a2.as_mut_slice(),
+                    c,
+                    d_a,
+                    scratch.grad_x5.as_slice(),
+                    &tr.a_hidden.as_slice()[0..d_a],
+                );
+            }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.a2.as_ptr(),
+                    scratch.grad_x5.as_ptr(),
+                    scratch.grad_low_rank.as_mut_ptr(),
+                    c,
+                    d_a,
+                );
+            }
+            if scope.attn {
+                add_outer_grad(
+                    block_grads.attn.a1.as_mut_slice(),
+                    d_a,
+                    c,
+                    &scratch.grad_low_rank.as_slice()[0..d_a],
+                    tr.xa.as_slice(),
+                );
+            }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.a1.as_ptr(),
+                    scratch.grad_low_rank.as_ptr(),
+                    scratch.grad_x5.as_mut_ptr(),
+                    d_a,
+                    c,
+                );
+            }
+
+            if scope.attn {
+                add_outer_grad(
+                    block_grads.attn.g2.as_mut_slice(),
+                    c,
+                    d_g,
+                    scratch.grad_saved.as_slice(),
+                    &tr.g_hidden.as_slice()[0..d_g],
+                );
+            }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.g2.as_ptr(),
+                    scratch.grad_saved.as_ptr(),
+                    scratch.grad_low_rank.as_mut_ptr(),
+                    c,
+                    d_g,
+                );
+            }
+            for col in 0..d_g {
+                let sig = tr.g_hidden[col];
+                scratch.grad_low_rank2[col] = scratch.grad_low_rank[col] * sig * (1.0 - sig);
+            }
+            if scope.attn {
+                add_outer_grad(
+                    block_grads.attn.g1.as_mut_slice(),
+                    d_g,
+                    c,
+                    &scratch.grad_low_rank2.as_slice()[0..d_g],
+                    tr.xg.as_slice(),
+                );
+            }
+            unsafe {
+                kernel::gemv_t_avx(
+                    block.attn.g1.as_ptr(),
+                    scratch.grad_low_rank2.as_ptr(),
+                    scratch.grad_saved.as_mut_ptr(),
+                    d_g,
+                    c,
+                );
+            }
+
+            scratch
+                .grad_x3
+                .copy_from_slice(future_layer.att_x_prev.as_slice());
+            future_layer.att_x_prev.zero();
+
+            for col in 0..c {
+                let g = scratch.grad_param[col];
+                let mix = block.attn.x_r[col];
+                let base = tr.attn_norm[col];
+                let prev = tr.att_x_prev_old[col];
+                scratch.grad_x3[col] += g * (1.0 - mix);
+                future_layer.att_x_prev[col] += g * mix;
+                scratch.grad_x2[col] = g * (prev - base);
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.x_r.as_mut_slice(),
+                    scratch.grad_x2.as_slice(),
+                );
+            }
+
+            for col in 0..c {
+                let g = scratch.grad_x6[col];
+                let mix = block.attn.x_w[col];
+                let base = tr.attn_norm[col];
+                let prev = tr.att_x_prev_old[col];
+                scratch.grad_x3[col] += g * (1.0 - mix);
+                future_layer.att_x_prev[col] += g * mix;
+                scratch.grad_x2[col] = g * (prev - base);
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.x_w.as_mut_slice(),
+                    scratch.grad_x2.as_slice(),
+                );
+            }
+
+            for col in 0..c {
+                let g = scratch.grad_param2[col];
+                let mix = block.attn.x_k[col];
+                let base = tr.attn_norm[col];
+                let prev = tr.att_x_prev_old[col];
+                scratch.grad_x3[col] += g * (1.0 - mix);
+                future_layer.att_x_prev[col] += g * mix;
+                scratch.grad_x2[col] = g * (prev - base);
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.x_k.as_mut_slice(),
+                    scratch.grad_x2.as_slice(),
+                );
+            }
+
+            for col in 0..c {
+                let g = scratch.grad_x4[col];
+                let mix = block.attn.x_v[col];
+                let base = tr.attn_norm[col];
+                let prev = tr.att_x_prev_old[col];
+                scratch.grad_x3[col] += g * (1.0 - mix);
+                future_layer.att_x_prev[col] += g * mix;
+                scratch.grad_x2[col] = g * (prev - base);
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.x_v.as_mut_slice(),
+                    scratch.grad_x2.as_slice(),
+                );
+            }
+
+            for col in 0..c {
+                let g = scratch.grad_x5[col];
+                let mix = block.attn.x_a[col];
+                let base = tr.attn_norm[col];
+                let prev = tr.att_x_prev_old[col];
+                scratch.grad_x3[col] += g * (1.0 - mix);
+                future_layer.att_x_prev[col] += g * mix;
+                scratch.grad_x2[col] = g * (prev - base);
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.x_a.as_mut_slice(),
+                    scratch.grad_x2.as_slice(),
+                );
+            }
+
+            for col in 0..c {
+                let g = scratch.grad_saved[col];
+                let mix = block.attn.x_g[col];
+                let base = tr.attn_norm[col];
+                let prev = tr.att_x_prev_old[col];
+                scratch.grad_x3[col] += g * (1.0 - mix);
+                future_layer.att_x_prev[col] += g * mix;
+                scratch.grad_x2[col] = g * (prev - base);
+            }
+            if scope.attn {
+                add_vec_grad(
+                    block_grads.attn.x_g.as_mut_slice(),
+                    scratch.grad_x2.as_slice(),
+                );
+            }
+
+            layer_norm_backward(
+                tr.x_after_pre.as_slice(),
+                block.attn_norm_w.as_slice(),
+                scratch.grad_x3.as_slice(),
+                self.cfg.layer_norm_eps,
+                scratch.grad_x2.as_mut_slice(),
+                scratch.grad_x4.as_mut_slice(),
+                scratch.grad_x5.as_mut_slice(),
+            );
+            if scope.attn_norm {
+                add_vec_grad(
+                    block_grads.attn_norm_w.as_mut_slice(),
+                    scratch.grad_x4.as_slice(),
+                );
+                add_vec_grad(
+                    block_grads.attn_norm_b.as_mut_slice(),
+                    scratch.grad_x5.as_slice(),
+                );
+            }
+            for col in 0..c {
+                scratch.grad_x[col] += scratch.grad_x2[col];
+            }
+
+            if layer_idx == 0
+                && let (Some(w), Some(_b)) = (&block.pre_norm_w, &block.pre_norm_b)
+            {
+                layer_norm_backward(
+                    tr.x_in.as_slice(),
+                    w.as_slice(),
+                    scratch.grad_x.as_slice(),
+                    self.cfg.layer_norm_eps,
+                    scratch.grad_x2.as_mut_slice(),
+                    scratch.grad_x3.as_mut_slice(),
+                    scratch.grad_x4.as_mut_slice(),
+                );
+                if scope.pre_norm {
+                    add_vec_grad(
+                        block_grads
+                            .pre_norm_w
+                            .as_mut()
+                            .expect("grad pre_norm_w")
+                            .as_mut_slice(),
+                        scratch.grad_x3.as_slice(),
+                    );
+                    add_vec_grad(
+                        block_grads
+                            .pre_norm_b
+                            .as_mut()
+                            .expect("grad pre_norm_b")
+                            .as_mut_slice(),
+                        scratch.grad_x4.as_slice(),
+                    );
+                }
+                scratch.grad_x.copy_from_slice(scratch.grad_x2.as_slice());
+            }
+        }
+
+        if scope.embed {
+            let token_idx = trace.token.min(self.cfg.vocab_size.saturating_sub(1));
+            let off = token_idx * c;
+            add_vec_grad(
+                &mut grads.embeddings.as_mut_slice()[off..off + c],
+                scratch.grad_x.as_slice(),
+            );
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn online_train_segment_tbptt(
+        &mut self,
+        scratch: &mut ScratchBuffers,
+        start_state: &State,
+        steps: &[(u32, u8)],
+        scope: TrainScopeMask,
+        optimizer: OptimizerKind,
+        lr: f32,
+        clip: f32,
+        replay_chunk: usize,
+        adam_t: &mut usize,
+        model_adam: Option<&mut FullAdamState>,
+        out_bias: Option<&mut [f32]>,
+        out_bias_adam_m: Option<&mut [f32]>,
+        out_bias_adam_v: Option<&mut [f32]>,
+        live_state_out: &mut State,
+    ) -> Result<()> {
+        if steps.is_empty() {
+            *live_state_out = start_state.clone();
+            return Ok(());
+        }
+
+        let grad_scale = 1.0f32 / (steps.len() as f32);
+        let chunk = replay_chunk.max(1).min(steps.len().max(1));
+        let mut grads = self.new_full_grad_state();
+        let mut recurrent = self.new_recurrent_grad_state();
+        recurrent.zero();
+        let mut bias_grad = out_bias.as_deref().map(|b| vec![0.0f32; b.len()]);
+
+        {
+            let mut checkpoints = Vec::<State>::new();
+            let mut checkpoint_state = start_state.clone();
+            scratch.set_capture_train_trace(false);
+            for chunk_start in (0..steps.len()).step_by(chunk) {
+                checkpoints.push(checkpoint_state.clone());
+                let chunk_end = (chunk_start + chunk).min(steps.len());
+                for &(input_token, _) in &steps[chunk_start..chunk_end] {
+                    self.forward(scratch, input_token, &mut checkpoint_state);
+                }
+            }
+
+            for chunk_idx in (0..checkpoints.len()).rev() {
+                let chunk_start = chunk_idx * chunk;
+                let chunk_end = (chunk_start + chunk).min(steps.len());
+                let mut state = checkpoints[chunk_idx].clone();
+                let mut step_states = Vec::<State>::with_capacity(chunk_end - chunk_start + 1);
+                let mut step_traces =
+                    Vec::<TokenTrainTrace>::with_capacity(chunk_end - chunk_start);
+                let mut step_pdfs =
+                    Vec::<Vec<f64>>::with_capacity(chunk_end.saturating_sub(chunk_start));
+                step_states.push(state.clone());
+
+                for &(input_token, _) in &steps[chunk_start..chunk_end] {
+                    scratch.set_capture_train_trace(true);
+                    let logits = self.forward(scratch, input_token, &mut state);
+                    let mut pdf = vec![0.0f64; self.cfg.vocab_size];
+                    super::super::softmax_pdf_floor_with_bias(
+                        logits,
+                        out_bias.as_deref(),
+                        &mut pdf,
+                    );
+                    step_pdfs.push(pdf);
+                    step_traces.push(TokenTrainTrace::from_scratch(scratch));
+                    step_states.push(state.clone());
+                }
+
+                for local_idx in (0..step_traces.len()).rev() {
+                    let (_, target_symbol) = steps[chunk_start + local_idx];
+                    self.accumulate_token_step_gradients(
+                        scratch,
+                        &step_traces[local_idx],
+                        &step_states[local_idx + 1],
+                        target_symbol,
+                        &step_pdfs[local_idx],
+                        grad_scale,
+                        scope,
+                        &mut grads,
+                        bias_grad.as_deref_mut(),
+                        &mut recurrent,
+                    )?;
+                }
+            }
+        }
+
+        self.apply_full_gradients(
+            &grads,
+            scope,
+            optimizer,
+            lr,
+            clip,
+            adam_t,
+            model_adam,
+            out_bias,
+            bias_grad.as_deref(),
+            out_bias_adam_m,
+            out_bias_adam_v,
+        )?;
+
+        scratch.set_capture_train_trace(false);
+        *live_state_out = start_state.clone();
+        for &(input_token, _) in steps {
+            self.forward(scratch, input_token, live_state_out);
+        }
+        Ok(())
     }
 
     /// Perform one exact bptt=1 online training step over the latest forward trace.
@@ -3799,6 +5485,39 @@ fn l2_normalize_backward(
 }
 
 #[inline(always)]
+fn add_vec_grad(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    for i in 0..n {
+        dst[i] += src[i];
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::needless_range_loop)]
+fn add_outer_grad(dst: &mut [f32], rows: usize, cols: usize, left: &[f32], right: &[f32]) {
+    let rows = rows.min(left.len());
+    let cols = cols.min(right.len());
+    let n = dst.len();
+    if rows == 0 || cols == 0 || n == 0 {
+        return;
+    }
+    for r in 0..rows {
+        let g = left[r];
+        if g == 0.0 {
+            continue;
+        }
+        let off = r * cols;
+        if off >= n {
+            break;
+        }
+        let row_cols = cols.min(n - off);
+        for c in 0..row_cols {
+            dst[off + c] += g * right[c];
+        }
+    }
+}
+
+#[inline(always)]
 fn sgd_vec_update(param: &mut [f32], grad: &[f32], lr: f32, clip: f32) {
     let n = param.len().min(grad.len());
     if n == 0 {
@@ -4308,6 +6027,145 @@ fn init_const(t: &mut Tensor1D, value: f32) {
 mod tests {
     use super::*;
 
+    fn test_cfg() -> Config {
+        Config {
+            vocab_size: 256,
+            hidden_size: 64,
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 64,
+            intermediate_size: 64,
+            layer_norm_eps: 1e-5,
+            group_norm_eps: 64e-5,
+            decay_low_rank: 8,
+            a_low_rank: 8,
+            v_low_rank: 8,
+            g_low_rank: 8,
+        }
+    }
+
+    fn softmax_loss(logits: &[f32], target: u8) -> f64 {
+        let max_logit = logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+        let mut sum = 0.0f64;
+        for &z in logits {
+            sum += ((z - max_logit) as f64).exp();
+        }
+        let p = ((logits[target as usize] - max_logit) as f64).exp() / sum.max(1e-300);
+        -p.max(1e-300).ln()
+    }
+
+    fn segment_loss(model: &Model, cfg: &Config, steps: &[(u32, u8)]) -> f64 {
+        if steps.is_empty() {
+            return 0.0;
+        }
+        let mut scratch = ScratchBuffers::new(cfg);
+        let mut state = model.new_state();
+        let mut loss = 0.0f64;
+        for &(input, target) in steps {
+            let logits = model.forward(&mut scratch, input, &mut state);
+            loss += softmax_loss(logits, target);
+        }
+        loss / (steps.len() as f64)
+    }
+
+    fn segment_grads(model: &Model, cfg: &Config, steps: &[(u32, u8)]) -> FullGradState {
+        let mut scratch = ScratchBuffers::new(cfg);
+        let mut state = model.new_state();
+        let mut states = Vec::with_capacity(steps.len() + 1);
+        let mut traces = Vec::with_capacity(steps.len());
+        let mut pdfs = Vec::with_capacity(steps.len());
+        states.push(state.clone());
+        for &(input, _) in steps {
+            scratch.set_capture_train_trace(true);
+            let logits = model.forward(&mut scratch, input, &mut state);
+            let mut pdf = vec![0.0f64; cfg.vocab_size];
+            super::super::super::softmax_pdf_floor_with_bias(logits, None, &mut pdf);
+            pdfs.push(pdf);
+            traces.push(TokenTrainTrace::from_scratch(&scratch));
+            states.push(state.clone());
+        }
+        let mut grads = model.new_full_grad_state();
+        let mut recurrent = model.new_recurrent_grad_state();
+        let scope = TrainScopeMask {
+            embed: true,
+            pre_norm: true,
+            attn_norm: true,
+            ffn_norm: true,
+            attn: true,
+            ffn: true,
+            head: true,
+            bias: false,
+        };
+        let grad_scale = 1.0f32 / (steps.len() as f32);
+        for idx in (0..steps.len()).rev() {
+            model
+                .accumulate_token_step_gradients(
+                    &mut scratch,
+                    &traces[idx],
+                    &states[idx + 1],
+                    steps[idx].1,
+                    &pdfs[idx],
+                    grad_scale,
+                    scope,
+                    &mut grads,
+                    None,
+                    &mut recurrent,
+                )
+                .expect("segment gradient accumulation");
+        }
+        grads
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Probe {
+        Embed,
+        LnOutW,
+        AttnNormW,
+        OProj,
+        KProj,
+        VProj,
+        FfnKey,
+    }
+
+    fn probe_value(model: &Model, probe: Probe) -> f32 {
+        match probe {
+            Probe::Embed => model.embeddings[7],
+            Probe::LnOutW => model.ln_out_w[5],
+            Probe::AttnNormW => model.blocks[0].attn_norm_w[9],
+            Probe::OProj => model.blocks[0].attn.o_proj[23],
+            Probe::KProj => model.blocks[0].attn.rkv_proj[64 * 64 + 17],
+            Probe::VProj => model.blocks[0].attn.rkv_proj[2 * 64 * 64 + 29],
+            Probe::FfnKey => model.blocks[0].ffn.key_w[11],
+        }
+    }
+
+    fn set_probe(model: &mut Model, probe: Probe, value: f32) {
+        match probe {
+            Probe::Embed => model.embeddings[7] = value,
+            Probe::LnOutW => model.ln_out_w[5] = value,
+            Probe::AttnNormW => model.blocks[0].attn_norm_w[9] = value,
+            Probe::OProj => model.blocks[0].attn.o_proj[23] = value,
+            Probe::KProj => model.blocks[0].attn.rkv_proj[64 * 64 + 17] = value,
+            Probe::VProj => model.blocks[0].attn.rkv_proj[2 * 64 * 64 + 29] = value,
+            Probe::FfnKey => model.blocks[0].ffn.key_w[11] = value,
+        }
+    }
+
+    fn probe_grad(grads: &FullGradState, probe: Probe) -> f32 {
+        match probe {
+            Probe::Embed => grads.embeddings[7],
+            Probe::LnOutW => grads.ln_out_w[5],
+            Probe::AttnNormW => grads.blocks[0].attn_norm_w[9],
+            Probe::OProj => grads.blocks[0].attn.o_proj[23],
+            Probe::KProj => grads.blocks[0].attn.rkv_proj[64 * 64 + 17],
+            Probe::VProj => grads.blocks[0].attn.rkv_proj[2 * 64 * 64 + 29],
+            Probe::FfnKey => grads.blocks[0].ffn.key_w[11],
+        }
+    }
+
     fn weighted_checksum(data: &[f32]) -> f64 {
         data.iter()
             .enumerate()
@@ -4470,5 +6328,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tbptt_segment_gradients_match_finite_difference() {
+        let cfg = test_cfg();
+        cfg.validate().expect("valid test config");
+        let model = Model::new_random(cfg.clone(), 0xD00D_F00D).expect("random model");
+        let steps = [(0u32, 1u8), (1, 2), (2, 3)];
+        let grads = segment_grads(&model, &cfg, &steps);
+        let eps = 1e-3f32;
+
+        for probe in [
+            Probe::Embed,
+            Probe::LnOutW,
+            Probe::AttnNormW,
+            Probe::OProj,
+            Probe::KProj,
+            Probe::VProj,
+            Probe::FfnKey,
+        ] {
+            let analytic = probe_grad(&grads, probe);
+
+            let mut plus = model.clone();
+            let base = probe_value(&plus, probe);
+            set_probe(&mut plus, probe, base + eps);
+            let loss_plus = segment_loss(&plus, &cfg, &steps);
+
+            let mut minus = model.clone();
+            set_probe(&mut minus, probe, base - eps);
+            let loss_minus = segment_loss(&minus, &cfg, &steps);
+
+            let numeric = -((loss_plus - loss_minus) / (2.0 * eps as f64)) as f32;
+            let tol = 5e-2f32.max(analytic.abs().max(numeric.abs()) * 8e-2);
+            assert!(
+                (analytic - numeric).abs() <= tol,
+                "probe={probe:?} analytic={analytic} numeric={numeric} tol={tol}"
+            );
+        }
+    }
+
+    #[test]
+    fn tbptt_sgd_step_reduces_mean_segment_loss() {
+        let cfg = test_cfg();
+        cfg.validate().expect("valid test config");
+        let mut model = Model::new_random(cfg.clone(), 0x1234_5678).expect("random model");
+        let steps = [(0u32, 1u8), (1, 2), (2, 3), (3, 4)];
+        let before = segment_loss(&model, &cfg, &steps);
+
+        let mut scratch = ScratchBuffers::new(&cfg);
+        let start_state = model.new_state();
+        let mut live_state = model.new_state();
+        let mut adam_t = 0usize;
+        let scope = TrainScopeMask {
+            embed: true,
+            pre_norm: true,
+            attn_norm: true,
+            ffn_norm: true,
+            attn: true,
+            ffn: true,
+            head: true,
+            bias: false,
+        };
+
+        model
+            .online_train_segment_tbptt(
+                &mut scratch,
+                &start_state,
+                &steps,
+                scope,
+                OptimizerKind::Sgd,
+                1e-3,
+                0.0,
+                2,
+                &mut adam_t,
+                None,
+                None,
+                None,
+                None,
+                &mut live_state,
+            )
+            .expect("tbptt sgd step");
+
+        let after = segment_loss(&model, &cfg, &steps);
+        assert!(
+            after < before,
+            "expected SGD TBPTT step to reduce mean loss: before={before} after={after}"
+        );
     }
 }

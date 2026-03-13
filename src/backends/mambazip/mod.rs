@@ -22,7 +22,7 @@ pub use crate::coders::CoderType;
 
 use crate::coders::{
     ANS_TOTAL, ArithmeticDecoder, ArithmeticEncoder, BlockedRansDecoder, BlockedRansEncoder,
-    CDF_TOTAL, Cdf, quantize_pdf_to_cdf_inplace, quantize_pdf_to_rans_cdf_with_buffer,
+    CDF_TOTAL, Cdf, quantize_pdf_to_cdf_with_buffer, quantize_pdf_to_rans_cdf_with_buffer,
 };
 
 /// Mamba model config.
@@ -652,6 +652,7 @@ pub struct Compressor {
     /// Reusable PDF buffer.
     pub pdf_buffer: Vec<f64>,
     cdf_buffer_ac: Vec<u32>,
+    ac_freq_buffer: Vec<i64>,
     cdf_buffer_rans: Vec<u32>,
     rans_freq_buffer: Vec<i64>,
     online: Option<OnlineRuntime>,
@@ -926,6 +927,7 @@ impl Clone for Compressor {
         cloned.state = self.state.clone();
         cloned.pdf_buffer.clone_from(&self.pdf_buffer);
         cloned.cdf_buffer_ac.clone_from(&self.cdf_buffer_ac);
+        cloned.ac_freq_buffer.clone_from(&self.ac_freq_buffer);
         cloned.cdf_buffer_rans.clone_from(&self.cdf_buffer_rans);
         cloned.rans_freq_buffer.clone_from(&self.rans_freq_buffer);
         cloned.scratch = self.scratch.clone();
@@ -962,6 +964,7 @@ impl Compressor {
             scratch,
             pdf_buffer: vec![0.0; vocab_size],
             cdf_buffer_ac: vec![0u32; vocab_size + 1],
+            ac_freq_buffer: vec![0i64; vocab_size],
             cdf_buffer_rans: vec![0u32; vocab_size + 1],
             rans_freq_buffer: vec![0i64; vocab_size],
             online: None,
@@ -1751,7 +1754,11 @@ impl Compressor {
         Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         for byte in data {
-            quantize_pdf_to_cdf_inplace(&self.pdf_buffer, &mut self.cdf_buffer_ac);
+            quantize_pdf_to_cdf_with_buffer(
+                &self.pdf_buffer,
+                &mut self.cdf_buffer_ac,
+                &mut self.ac_freq_buffer,
+            );
             let sym = byte as usize;
             let lo = self.cdf_buffer_ac[sym] as u64;
             let hi = self.cdf_buffer_ac[sym + 1] as u64;
@@ -1843,7 +1850,11 @@ impl Compressor {
         Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
 
         for _ in 0..original_len {
-            quantize_pdf_to_cdf_inplace(&self.pdf_buffer, &mut self.cdf_buffer_ac);
+            quantize_pdf_to_cdf_with_buffer(
+                &self.pdf_buffer,
+                &mut self.cdf_buffer_ac,
+                &mut self.ac_freq_buffer,
+            );
             let sym = decoder.decode_symbol_counts(&self.cdf_buffer_ac, CDF_TOTAL)?;
             let byte = sym as u8;
             result.push(byte);
@@ -1887,7 +1898,7 @@ impl Compressor {
             pos += len;
         }
 
-        let mut decoder = BlockedRansDecoder::new(blocks);
+        let mut decoder = BlockedRansDecoder::new(blocks, original_len)?;
         let mut result = Vec::with_capacity(original_len);
 
         let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());

@@ -248,24 +248,14 @@ pub fn quantize_pdf_to_cdf(pdf: &[f64]) -> Vec<u32> {
 /// `cdf_out` must have length at least `pdf.len() + 1`.
 #[inline]
 pub fn quantize_pdf_to_cdf_inplace(pdf: &[f64], cdf_out: &mut [u32]) {
-    let n = pdf.len();
-    debug_assert!(cdf_out.len() > n, "cdf buffer too small");
+    let mut freq_buf = vec![0i64; pdf.len()];
+    quantize_pdf_to_cdf_with_buffer(pdf, cdf_out, &mut freq_buf);
+}
 
-    unsafe {
-        *cdf_out.get_unchecked_mut(0) = 0;
-        let scale = CDF_TOTAL as f64;
-        let mut acc = 0.0f64;
-        let mut prev = 0u32;
-
-        for i in 0..n {
-            acc += *pdf.get_unchecked(i);
-            let v = (acc * scale) as u32;
-            let v = v.max(prev);
-            *cdf_out.get_unchecked_mut(i + 1) = v;
-            prev = v;
-        }
-        *cdf_out.get_unchecked_mut(n) = CDF_TOTAL;
-    }
+/// Quantize PDF to integer CDF using reusable output and frequency buffers.
+#[inline]
+pub fn quantize_pdf_to_cdf_with_buffer(pdf: &[f64], cdf_out: &mut [u32], freq_buf: &mut [i64]) {
+    super::quantize_pdf_to_integer_cdf_with_buffer(pdf, CDF_TOTAL, cdf_out, freq_buf);
 }
 
 /// Binary arithmetic encoder.
@@ -610,6 +600,23 @@ mod tests {
         // Check monotonicity
         for i in 1..cdf.len() {
             assert!(cdf[i] >= cdf[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_cdf_positive_width_for_tiny_positive_tail() {
+        let tail = 1e-18;
+        let head = 1.0 - (255.0 * tail);
+        let mut pdf = vec![tail; 256];
+        pdf[0] = head;
+        let mut cdf = vec![0u32; 257];
+        let mut freq = vec![0i64; 256];
+        quantize_pdf_to_cdf_with_buffer(&pdf, &mut cdf, &mut freq);
+
+        assert_eq!(cdf[0], 0);
+        assert_eq!(cdf[256], CDF_TOTAL);
+        for i in 0..256 {
+            assert!(cdf[i + 1] > cdf[i], "symbol {i} has zero-width interval");
         }
     }
 
