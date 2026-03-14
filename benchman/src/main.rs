@@ -23,6 +23,16 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 
 const DEFAULT_PLOT_DIR: &str = "/tmp/plotimgs";
+const PLOT_DIR_MARKER_FILE: &str = ".benchman-managed-plot-dir";
+const LEGACY_PLOT_SVG_PREFIX: &str = "infotheory-two-json-";
+const LEGACY_PLOT_SVG_SUFFIX: &str = ".svg";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlotDirDeletionPolicy {
+    ManagedMarker,
+    LegacyArtifacts,
+    RequiresExplicitConfirmation,
+}
 
 const COLOR_PALETTE: [Color; 12] = [
     Color::Rgb(0, 114, 178),
@@ -817,30 +827,128 @@ fn ensure_plot_artifacts(inputs: &ResolvedInputs) -> Result<()> {
     };
 
     if should_rebuild {
+        clear_plot_dir_for_rebuild(
+            plot_dir,
+            if inputs.no_replot {
+                "remove existing plot dir while --no-replot is set"
+            } else {
+                "clear plot dir before regenerating plots"
+            },
+        )?;
+
         if inputs.no_replot {
-            if plot_dir.exists() {
-                fs::remove_dir_all(plot_dir).with_context(|| {
-                    format!(
-                        "failed to remove existing plot dir while --no-replot is set: {}",
-                        plot_dir.display()
-                    )
-                })?;
-            }
             fs::create_dir_all(plot_dir)
                 .with_context(|| format!("failed to create {}", plot_dir.display()))?;
+            write_plot_dir_marker(plot_dir)?;
         } else {
-            if plot_dir.exists() {
-                fs::remove_dir_all(plot_dir)
-                    .with_context(|| format!("failed to clear {}", plot_dir.display()))?;
-            }
             run_plot_script(inputs)?;
+            write_plot_dir_marker(plot_dir)?;
         }
     } else if !plot_dir.exists() {
         fs::create_dir_all(plot_dir)
             .with_context(|| format!("failed to create {}", plot_dir.display()))?;
+        write_plot_dir_marker(plot_dir)?;
     }
 
     Ok(())
+}
+
+fn clear_plot_dir_for_rebuild(plot_dir: &Path, context: &str) -> Result<()> {
+    if !plot_dir.exists() {
+        return Ok(());
+    }
+    if !plot_dir.is_dir() {
+        bail!("plot dir path is not a directory: {}", plot_dir.display());
+    }
+    if plot_dir.parent().is_none() {
+        bail!(
+            "refusing to delete filesystem root as plot dir: {}",
+            plot_dir.display()
+        );
+    }
+
+    match plot_dir_deletion_policy(plot_dir)? {
+        PlotDirDeletionPolicy::ManagedMarker | PlotDirDeletionPolicy::LegacyArtifacts => {}
+        PlotDirDeletionPolicy::RequiresExplicitConfirmation => {
+            confirm_unmanaged_plot_dir_deletion(plot_dir)?;
+        }
+    }
+
+    fs::remove_dir_all(plot_dir)
+        .with_context(|| format!("failed to {context}: {}", plot_dir.display()))?;
+    Ok(())
+}
+
+fn plot_dir_deletion_policy(plot_dir: &Path) -> Result<PlotDirDeletionPolicy> {
+    if plot_dir_marker_path(plot_dir).is_file() {
+        return Ok(PlotDirDeletionPolicy::ManagedMarker);
+    }
+
+    let mut saw_legacy_artifact = false;
+    for entry in fs::read_dir(plot_dir)
+        .with_context(|| format!("failed to inspect {}", plot_dir.display()))?
+    {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            return Ok(PlotDirDeletionPolicy::RequiresExplicitConfirmation);
+        };
+        if file_name == PLOT_DIR_MARKER_FILE {
+            continue;
+        }
+
+        if entry.file_type()?.is_file() && is_legacy_plot_svg_name(file_name) {
+            saw_legacy_artifact = true;
+            continue;
+        }
+        return Ok(PlotDirDeletionPolicy::RequiresExplicitConfirmation);
+    }
+
+    if saw_legacy_artifact {
+        Ok(PlotDirDeletionPolicy::LegacyArtifacts)
+    } else {
+        Ok(PlotDirDeletionPolicy::RequiresExplicitConfirmation)
+    }
+}
+
+fn is_legacy_plot_svg_name(file_name: &str) -> bool {
+    file_name.starts_with(LEGACY_PLOT_SVG_PREFIX) && file_name.ends_with(LEGACY_PLOT_SVG_SUFFIX)
+}
+
+fn confirm_unmanaged_plot_dir_deletion(plot_dir: &Path) -> Result<()> {
+    println!(
+        "[benchman] Plot directory {} is not benchman-managed.",
+        plot_dir.display()
+    );
+    println!("It does not match legacy plot artifacts and might contain unrelated files.");
+    println!("Type the full path to confirm deletion, or press Enter to cancel rebuild.");
+
+    print!("Confirm deletion of {}: ", plot_dir.display());
+    io::stdout().flush().context("failed to flush stdout")?;
+
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("failed to read deletion confirmation")?;
+
+    if line.trim() == plot_dir.to_string_lossy() {
+        return Ok(());
+    }
+
+    bail!(
+        "aborted rebuild because deletion confirmation did not match {}",
+        plot_dir.display()
+    );
+}
+
+fn plot_dir_marker_path(plot_dir: &Path) -> PathBuf {
+    plot_dir.join(PLOT_DIR_MARKER_FILE)
+}
+
+fn write_plot_dir_marker(plot_dir: &Path) -> Result<()> {
+    let marker_path = plot_dir_marker_path(plot_dir);
+    fs::write(&marker_path, "managed by benchman\n")
+        .with_context(|| format!("failed to write marker {}", marker_path.display()))
 }
 
 fn prompt_plot_dir_decision(plot_dir: &Path) -> Result<bool> {
@@ -1038,12 +1146,7 @@ fn load_summary_rows(
 
         let operation = get_field(&row, idx_operation).trim().to_string();
         let series = get_field(&row, idx_series).trim().to_string();
-        let size_bytes = parse_u64(
-            get_field(&row, idx_size_bytes),
-            "size_bytes",
-            row_idx + 2,
-            path,
-        )?;
+        let size_bytes = parse_size_bytes(get_field(&row, idx_size_bytes), row_idx + 2, path)?;
 
         let row = RenderRow {
             source,
@@ -1131,12 +1234,7 @@ fn load_raw_rows(
         let key = RawKey {
             operation: get_field(&row, idx_operation).trim().to_string(),
             subject,
-            size_bytes: parse_u64(
-                get_field(&row, idx_size_bytes),
-                "size_bytes",
-                row_idx + 2,
-                path,
-            )?,
+            size_bytes: parse_size_bytes(get_field(&row, idx_size_bytes), row_idx + 2, path)?,
             compression_backend: get_field(&row, idx_compression_backend).trim().to_string(),
         };
 
@@ -1217,6 +1315,24 @@ fn parse_u64(raw: &str, field: &str, row_no: usize, path: &Path) -> Result<u64> 
         )
     })?;
     Ok(value)
+}
+
+fn parse_positive_u64(raw: &str, field: &str, row_no: usize, path: &Path) -> Result<u64> {
+    let value = parse_u64(raw, field, row_no, path)?;
+    if value == 0 {
+        bail!(
+            "{} row {}: {} must be > 0, got {:?}",
+            path.display(),
+            row_no,
+            field,
+            raw
+        );
+    }
+    Ok(value)
+}
+
+fn parse_size_bytes(raw: &str, row_no: usize, path: &Path) -> Result<u64> {
+    parse_positive_u64(raw, "size_bytes", row_no, path)
 }
 
 fn parse_u32(raw: &str, field: &str, row_no: usize, path: &Path) -> Result<u32> {
@@ -2096,4 +2212,104 @@ fn format_size_bytes(value: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let seq = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "benchman-{label}-{}-{stamp}-{seq}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("failed to create test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn parse_size_bytes_rejects_zero() {
+        let err = parse_size_bytes("0", 7, Path::new("summary.tsv"))
+            .expect_err("size_bytes=0 should be rejected");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("size_bytes must be > 0"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_size_bytes_accepts_positive_values() {
+        assert_eq!(
+            parse_size_bytes("4096", 11, Path::new("summary.tsv")).expect("valid positive value"),
+            4096
+        );
+    }
+
+    #[test]
+    fn plot_dir_deletion_policy_prefers_marker() {
+        let dir = TestDir::new("marker");
+        fs::write(plot_dir_marker_path(dir.path()), "managed by benchman\n")
+            .expect("failed to write marker");
+        fs::write(dir.path().join("keep.txt"), "non-legacy file")
+            .expect("failed to write fixture file");
+
+        assert_eq!(
+            plot_dir_deletion_policy(dir.path()).expect("policy should evaluate"),
+            PlotDirDeletionPolicy::ManagedMarker
+        );
+    }
+
+    #[test]
+    fn plot_dir_deletion_policy_accepts_legacy_artifacts() {
+        let dir = TestDir::new("legacy");
+        fs::write(
+            dir.path().join("infotheory-two-json-h-rss-run.svg"),
+            "<svg/>",
+        )
+        .expect("failed to write legacy artifact");
+
+        assert_eq!(
+            plot_dir_deletion_policy(dir.path()).expect("policy should evaluate"),
+            PlotDirDeletionPolicy::LegacyArtifacts
+        );
+    }
+
+    #[test]
+    fn plot_dir_deletion_policy_requires_confirmation_for_unknown_contents() {
+        let dir = TestDir::new("unknown");
+        fs::write(dir.path().join("notes.txt"), "not a plot artifact")
+            .expect("failed to write fixture file");
+
+        assert_eq!(
+            plot_dir_deletion_policy(dir.path()).expect("policy should evaluate"),
+            PlotDirDeletionPolicy::RequiresExplicitConfirmation
+        );
+    }
 }
