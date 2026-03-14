@@ -141,6 +141,29 @@ cmd_plot() {
   say "[plot] Done"
 }
 
+cmd_tui_man() {
+  need_cmd man
+  need_cmd nvim
+  export MANPAGER='nvim +Man!'
+  man -l "$ROOT_DIR/docs/benchman.1"
+}
+
+cmd_tui() {
+  if [ "${1:-}" = "man" ]; then
+    shift
+    cmd_tui_man "$@"
+    return 0
+  fi
+
+  say "[tui] Building benchman (release)..."
+  need_cmd cargo
+  (cd "$ROOT_DIR" && CARGO_INCREMENTAL=0 cargo build --release --locked -p benchman)
+
+  say "[tui] Launching benchman..."
+  (cd "$ROOT_DIR" && "$ROOT_DIR/target/release/benchman" "$@")
+  say "[tui] Done"
+}
+
 cmd_clean() {
   say "[clean] Cleaning build artifacts (keeps kernel)..."
   need_cmd cargo
@@ -172,6 +195,8 @@ Usage: ./projman.sh <command>
 Commands:
   bench       Run the standalone examples/two.json benchmark suite. Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
   plot        Render SVG plots for the most recent completed examples/two.json benchmark summary in /tmp. Not included in test_all.
+  tui         Build and launch the interactive benchmark TUI (`benchman`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
+  tui man     Open the local benchman manual via nvim man pager (MANPAGER='nvim +Man!').
   code_test   Build (release) and run Rust tests (release). Uses --features vm iff VM artifacts exist and /dev/kvm is accessible.
   init-vm     Download/build VM artifacts needed for VM tests (kernel, initramfs, docker rootfs).
   lean_test   Run Lean validation suite (ite-bench). Requires lake.
@@ -182,6 +207,7 @@ Commands:
 Environment variables:
   INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv.
   INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv and INFOTHEORY_PLOT_SUMMARY_TSV=....
+  INFOTHEORY_BASELINE_SUMMARY_TSV / INFOTHEORY_BENCH_RAW_TSV  Also read by benchman for baseline overlays and raw inspector detail.
   SKIP_DOCKER=1   Skip docker rootfs.ext4 build during init-vm.
   BUILD_CLI=1     Also build optional infotheory CLI binary (feature: cli) during code_test.
 EOF
@@ -191,6 +217,7 @@ cmd=${1:-}
 case "$cmd" in
   bench) shift; cmd_bench "$@" ;;
   plot) shift; cmd_plot "$@" ;;
+  tui) shift; cmd_tui "$@" ;;
   code_test) shift; cmd_code_test "$@" ;;
   init-vm) shift; cmd_init_vm "$@" ;;
   lean_test) shift; cmd_lean_test "$@" ;;

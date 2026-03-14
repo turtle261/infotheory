@@ -14,8 +14,7 @@ use crate::backends::sparse_match::SparseMatchModel;
 use crate::backends::text_context::TextContextAnalyzer;
 use crate::coders::{
     ANS_TOTAL, ArithmeticDecoder, ArithmeticEncoder, BlockedRansDecoder, BlockedRansEncoder,
-    CDF_TOTAL, Cdf, CoderType, crc32, quantize_pdf_to_cdf_with_buffer,
-    quantize_pdf_to_rans_cdf_with_buffer,
+    CDF_TOTAL, Cdf, CoderType, crc32, quantize_pdf_to_rans_cdf_with_buffer,
 };
 use crate::ctw::FacContextTree;
 #[cfg(feature = "backend-mamba")]
@@ -968,18 +967,12 @@ enum RatePdfPredictor {
     Rosa(RosaPredictor),
     Match {
         model: MatchModel,
-        pdf: Vec<f64>,
-        valid: bool,
     },
     SparseMatch {
         model: SparseMatchModel,
-        pdf: Vec<f64>,
-        valid: bool,
     },
     Ppmd {
         model: PpmdModel,
-        pdf: Vec<f64>,
-        valid: bool,
     },
     Ctw(CtwPredictor),
     FacCtw(CtwPredictor),
@@ -1016,8 +1009,6 @@ impl RatePdfPredictor {
                     base_mix,
                     confidence_scale,
                 ),
-                pdf: vec![0.0; 256],
-                valid: false,
             }),
             RateBackend::SparseMatch {
                 hash_bits,
@@ -1037,13 +1028,9 @@ impl RatePdfPredictor {
                     base_mix,
                     confidence_scale,
                 ),
-                pdf: vec![0.0; 256],
-                valid: false,
             }),
             RateBackend::Ppmd { order, memory_mb } => Ok(Self::Ppmd {
                 model: PpmdModel::new(order, memory_mb),
-                pdf: vec![0.0; 256],
-                valid: false,
             }),
             RateBackend::Ctw { depth } => Ok(Self::Ctw(CtwPredictor::new_ctw(depth))),
             RateBackend::FacCtw {
@@ -1127,16 +1114,7 @@ impl RatePdfPredictor {
     fn pdf_next(&mut self) -> Result<&[f64]> {
         match self {
             Self::Rosa(m) => Ok(m.pdf_next()),
-            Self::Match { model, pdf, valid } => {
-                if !*valid {
-                    let mut row = [0.0; 256];
-                    model.fill_pdf(&mut row);
-                    pdf.copy_from_slice(&row);
-                    normalize_pdf(pdf);
-                    *valid = true;
-                }
-                Ok(pdf)
-            }
+            Self::Match { model } => Ok(model.pdf()),
             Self::Ctw(m) => Ok(m.pdf_next()),
             Self::FacCtw(m) => Ok(m.pdf_next()),
             #[cfg(feature = "backend-mamba")]
@@ -1146,26 +1124,8 @@ impl RatePdfPredictor {
             Self::Zpaq(m) => Ok(m.pdf_next()),
             Self::Mixture(m) => m.ensure_pdf(),
             Self::Particle(m) => Ok(m.pdf_next()),
-            Self::SparseMatch { model, pdf, valid } => {
-                if !*valid {
-                    let mut row = [0.0; 256];
-                    model.fill_pdf(&mut row);
-                    pdf.copy_from_slice(&row);
-                    normalize_pdf(pdf);
-                    *valid = true;
-                }
-                Ok(pdf)
-            }
-            Self::Ppmd { model, pdf, valid } => {
-                if !*valid {
-                    let mut row = [0.0; 256];
-                    model.fill_pdf(&mut row);
-                    pdf.copy_from_slice(&row);
-                    normalize_pdf(pdf);
-                    *valid = true;
-                }
-                Ok(pdf)
-            }
+            Self::SparseMatch { model } => Ok(model.pdf()),
+            Self::Ppmd { model } => Ok(model.pdf()),
             Self::Calibrated {
                 base,
                 core,
@@ -1189,19 +1149,16 @@ impl RatePdfPredictor {
                 m.update(symbol);
                 Ok(())
             }
-            Self::Match { model, valid, .. } => {
+            Self::Match { model } => {
                 model.update(symbol);
-                *valid = false;
                 Ok(())
             }
-            Self::SparseMatch { model, valid, .. } => {
+            Self::SparseMatch { model } => {
                 model.update(symbol);
-                *valid = false;
                 Ok(())
             }
-            Self::Ppmd { model, valid, .. } => {
+            Self::Ppmd { model } => {
                 model.update(symbol);
-                *valid = false;
                 Ok(())
             }
             Self::Ctw(m) => {
@@ -1321,10 +1278,11 @@ fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Ve
     {
         let mut enc = ArithmeticEncoder::new(&mut out);
         let mut cdf = vec![0u32; 257];
-        let mut freq = vec![0i64; 256];
         for &b in data {
             let pdf = predictor.pdf_next()?;
-            quantize_pdf_to_cdf_with_buffer(pdf, &mut cdf, &mut freq);
+            crate::coders::quantize_pdf_to_integer_cdf_dense_positive_with_buffer(
+                pdf, CDF_TOTAL, &mut cdf,
+            );
             let sym = b as usize;
             enc.encode_counts(cdf[sym] as u64, cdf[sym + 1] as u64, CDF_TOTAL as u64)?;
             predictor.update(b)?;
@@ -1359,10 +1317,11 @@ fn decode_payload_ac(
     let mut dec = ArithmeticDecoder::new(payload)?;
     let mut out = Vec::with_capacity(out_len);
     let mut cdf = vec![0u32; 257];
-    let mut freq = vec![0i64; 256];
     for _ in 0..out_len {
         let pdf = predictor.pdf_next()?;
-        quantize_pdf_to_cdf_with_buffer(pdf, &mut cdf, &mut freq);
+        crate::coders::quantize_pdf_to_integer_cdf_dense_positive_with_buffer(
+            pdf, CDF_TOTAL, &mut cdf,
+        );
         let sym = dec.decode_symbol_counts(&cdf, CDF_TOTAL)? as u8;
         out.push(sym);
         predictor.update(sym)?;

@@ -32,6 +32,10 @@ impl SparseMatchModel {
         self.inner.fill_pdf(out);
     }
 
+    pub fn pdf(&mut self) -> &[f64; 256] {
+        self.inner.pdf()
+    }
+
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
         self.inner.log_prob(symbol, min_prob)
     }

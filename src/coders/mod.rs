@@ -53,26 +53,125 @@ pub(crate) fn quantize_pdf_to_integer_cdf_with_buffer(
         cdf_out[0] = 0;
         return;
     }
+    assert!(
+        (n as u32) <= total,
+        "CDF total {total} must be >= symbol count {n} to guarantee positive widths"
+    );
 
-    cdf_out[0] = 0;
     let scale = total as f64;
     let mut acc = 0.0f64;
-    for i in 0..n {
-        let p = pdf[i];
-        if p.is_finite() && p > 0.0 {
-            acc += p;
+    let mut prev = 0u32;
+
+    unsafe {
+        *cdf_out.get_unchecked_mut(0) = 0;
+        for i in 0..n {
+            let p = *pdf.get_unchecked(i);
+            if p.is_finite() && p > 0.0 {
+                acc += p;
+            }
+
+            let next = (acc * scale) as u32;
+            if next <= prev || next > total {
+                quantize_pdf_to_integer_cdf_positive_width(pdf, total, cdf_out);
+                return;
+            }
+            *cdf_out.get_unchecked_mut(i + 1) = next;
+            prev = next;
         }
-        let mut next = (acc * scale) as u32;
-        let min_next = cdf_out[i].saturating_add(1);
-        let max_next = total.saturating_sub((n - i - 1) as u32);
-        if next < min_next {
-            next = min_next;
-        } else if next > max_next {
-            next = max_next;
-        }
-        cdf_out[i + 1] = next;
+        *cdf_out.get_unchecked_mut(n) = total;
     }
-    cdf_out[n] = total;
+}
+
+#[inline]
+pub(crate) fn quantize_pdf_to_integer_cdf_dense_positive_with_buffer(
+    pdf: &[f64],
+    total: u32,
+    cdf_out: &mut [u32],
+) {
+    let n = pdf.len();
+    assert!(cdf_out.len() > n, "cdf buffer too small");
+
+    if n == 0 {
+        cdf_out[0] = 0;
+        return;
+    }
+    assert!(
+        (n as u32) <= total,
+        "CDF total {total} must be >= symbol count {n} to guarantee positive widths"
+    );
+
+    debug_assert!(pdf.iter().all(|&p| p.is_finite() && p > 0.0));
+
+    let scale = total as f64;
+    let mut acc = 0.0f64;
+    let mut prev = 0u32;
+
+    unsafe {
+        *cdf_out.get_unchecked_mut(0) = 0;
+        for i in 0..n {
+            acc += *pdf.get_unchecked(i);
+
+            let next = (acc * scale) as u32;
+            if next <= prev || next > total {
+                quantize_pdf_to_integer_cdf_positive_width_dense(pdf, total, cdf_out);
+                return;
+            }
+            *cdf_out.get_unchecked_mut(i + 1) = next;
+            prev = next;
+        }
+        *cdf_out.get_unchecked_mut(n) = total;
+    }
+}
+
+#[inline]
+fn quantize_pdf_to_integer_cdf_positive_width(pdf: &[f64], total: u32, cdf_out: &mut [u32]) {
+    let n = pdf.len();
+    let scale = total as f64;
+    let remaining_extra = total - (n as u32);
+    let mut acc = 0.0f64;
+    let mut extra = 0u32;
+
+    unsafe {
+        *cdf_out.get_unchecked_mut(0) = 0;
+        for i in 0..n {
+            let p = *pdf.get_unchecked(i);
+            if p.is_finite() && p > 0.0 {
+                acc += p;
+            }
+
+            let raw_extra = ((acc * scale) as u32).saturating_sub((i as u32) + 1);
+            let capped_extra = raw_extra.min(remaining_extra);
+            if capped_extra > extra {
+                extra = capped_extra;
+            }
+            *cdf_out.get_unchecked_mut(i + 1) = extra + (i as u32) + 1;
+        }
+        *cdf_out.get_unchecked_mut(n) = total;
+    }
+}
+
+#[inline]
+fn quantize_pdf_to_integer_cdf_positive_width_dense(pdf: &[f64], total: u32, cdf_out: &mut [u32]) {
+    let n = pdf.len();
+    let scale = total as f64;
+    let remaining_extra = total - (n as u32);
+    let mut acc = 0.0f64;
+    let mut extra = 0u32;
+
+    unsafe {
+        *cdf_out.get_unchecked_mut(0) = 0;
+        for i in 0..n {
+            acc += *pdf.get_unchecked(i);
+
+            let raw_extra = ((acc * scale) as u32).saturating_sub((i as u32) + 1);
+            let capped_extra = raw_extra.min(remaining_extra);
+            if capped_extra > extra {
+                extra = capped_extra;
+            }
+            *cdf_out.get_unchecked_mut(i + 1) = extra + (i as u32) + 1;
+        }
+        *cdf_out.get_unchecked_mut(n) = total;
+    }
 }
 
 // Re-export main types

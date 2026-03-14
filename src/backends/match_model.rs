@@ -73,6 +73,11 @@ impl MatchModel {
         out.copy_from_slice(&self.pdf);
     }
 
+    pub fn pdf(&mut self) -> &[f64; 256] {
+        self.ensure_pdf();
+        &self.pdf
+    }
+
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
         self.ensure_pdf();
         self.pdf[symbol as usize].max(min_prob).ln()

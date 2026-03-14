@@ -248,8 +248,8 @@ pub fn quantize_pdf_to_cdf(pdf: &[f64]) -> Vec<u32> {
 /// `cdf_out` must have length at least `pdf.len() + 1`.
 #[inline]
 pub fn quantize_pdf_to_cdf_inplace(pdf: &[f64], cdf_out: &mut [u32]) {
-    let mut freq_buf = vec![0i64; pdf.len()];
-    quantize_pdf_to_cdf_with_buffer(pdf, cdf_out, &mut freq_buf);
+    let mut unused_freq = [];
+    super::quantize_pdf_to_integer_cdf_with_buffer(pdf, CDF_TOTAL, cdf_out, &mut unused_freq);
 }
 
 /// Quantize PDF to integer CDF using reusable output and frequency buffers.
@@ -614,6 +614,22 @@ mod tests {
         quantize_pdf_to_cdf_with_buffer(&pdf, &mut cdf, &mut freq);
 
         assert_eq!(cdf[0], 0);
+        assert_eq!(cdf[256], CDF_TOTAL);
+        for i in 0..256 {
+            assert!(cdf[i + 1] > cdf[i], "symbol {i} has zero-width interval");
+        }
+    }
+
+    #[test]
+    fn test_cdf_positive_width_when_mass_is_last_symbol() {
+        let mut pdf = vec![0.0; 256];
+        pdf[255] = 1.0;
+        let mut cdf = vec![0u32; 257];
+        let mut freq = vec![0i64; 256];
+        quantize_pdf_to_cdf_with_buffer(&pdf, &mut cdf, &mut freq);
+
+        assert_eq!(cdf[0], 0);
+        assert_eq!(cdf[255], 255);
         assert_eq!(cdf[256], CDF_TOTAL);
         for i in 0..256 {
             assert!(cdf[i + 1] > cdf[i], "symbol {i} has zero-width interval");

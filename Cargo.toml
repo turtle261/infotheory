@@ -8,7 +8,7 @@ description = "The algorithmic information theory library."
 autobins = false
 
 [workspace]
-members = [".", "zpaq_rs", "infotheory_py"]
+members = [".", "zpaq_rs", "infotheory_py", "benchman"]
 exclude = ["nyx-lite"]
 resolver = "3"
 

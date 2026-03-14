@@ -35,27 +35,27 @@ fn ensure_log_caches(log_int: &mut Vec<f64>, log_half: &mut Vec<f64>, upto: usiz
 
 /// Index into the node arena. `NONE` indicates no child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NodeIndex(u64);
+pub struct NodeIndex(u32);
 
 impl NodeIndex {
     /// Sentinel value indicating the absence of a node.
-    pub const NONE: NodeIndex = NodeIndex(u64::MAX);
+    pub const NONE: NodeIndex = NodeIndex(u32::MAX);
 
     #[inline(always)]
     fn from_usize(idx: usize) -> Self {
-        Self(u64::try_from(idx).expect("ctw node index overflow"))
+        Self(u32::try_from(idx).expect("ctw node index overflow"))
     }
 
     /// Returns `true` when this is [`NodeIndex::NONE`].
     #[inline(always)]
     pub fn is_none(self) -> bool {
-        self.0 == u64::MAX
+        self.0 == u32::MAX
     }
 
     /// Returns `true` when this points to a valid arena node.
     #[inline(always)]
     pub fn is_some(self) -> bool {
-        self.0 != u64::MAX
+        self.0 != u32::MAX
     }
 
     /// Convert to a `usize` arena index.
@@ -925,13 +925,15 @@ impl FacContextTree {
 mod tests {
     use super::*;
 
-    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn node_index_from_usize_does_not_truncate_large_indices() {
-        let raw = (u32::MAX as usize) + 17;
-        let idx = NodeIndex::from_usize(raw);
-        assert!(idx.is_some());
-        assert_eq!(idx.get(), raw);
+    #[should_panic(expected = "ctw node index overflow")]
+    fn node_index_from_usize_rejects_overflow() {
+        let _ = NodeIndex::from_usize((u32::MAX as usize) + 1);
+    }
+
+    #[test]
+    fn ct_node_stays_compact() {
+        assert_eq!(std::mem::size_of::<CtNode>(), 32);
     }
 
     fn assert_close(a: f64, b: f64) {

@@ -1,0 +1,124 @@
+.TH BENCHMAN 1 "March 2026" "InfoTheory" "InfoTheory Benchmark Tools"
+.SH NAME
+benchman \- interactive InfoTheory benchmark TUI
+.SH SYNOPSIS
+.B projman.sh tui
+[\-\-summary\-tsv PATH]
+[\-\-baseline\-summary\-tsv PATH]
+[\-\-raw\-tsv PATH]
+[\-\-subjects LIST]
+[\-\-plot\-dir PATH]
+.PP
+.B projman.sh tui man
+.SH DESCRIPTION
+.B benchman
+is a keyboard-only scientific benchmark helper for InfoTheory TSV outputs.
+It provides interactive graph inspection for all graph families produced by
+.B scripts/plot_two_json.sh
+including current-vs-baseline overlays.
+.PP
+The interface supports:
+.IP \(bu 2
+graph navigation across all benchmark plot families
+.IP \(bu
+series focus/filtering for subject comparisons
+.IP \(bu
+cursor-based point inspection with exact x/y values
+.IP \(bu
+overlap detection when multiple visible series share the same point
+.IP \(bu
+optional raw TSV enrichment for per-repetition details
+.SH OPTIONS
+.TP
+.B \-\-summary\-tsv PATH
+Summary TSV (defaults to newest
+.I /tmp/infotheory-two-json-summary-*.tsv
+).
+.TP
+.B \-\-baseline\-summary\-tsv PATH
+Optional baseline summary TSV for overlay graphs.
+.TP
+.B \-\-raw\-tsv PATH
+Optional raw TSV for per-repetition inspector details.
+.TP
+.B \-\-subjects LIST
+Comma/whitespace separated subject filter.
+.TP
+.B \-\-plot\-dir PATH
+Artifact directory (default:
+.I /tmp/plotimgs
+).
+.TP
+.B \-\-no\-replot
+Do not run plot regeneration script when rebuilding the plot directory.
+.SH KEYBOARD
+.TP
+.B h/l
+or
+.B Left/Right
+Move cursor across x points.
+.TP
+.B j/k
+or
+.B Down/Up
+Move cursor across visible series.
+.TP
+.B [ ]
+Previous / next graph.
+.TP
+.B g / G
+First / last graph.
+.TP
+.B f
+Open series focus/filter popup.
+.TP
+.B Enter
+Inspect exact values at current cursor x for all visible lines.
+.TP
+.B c
+or
+.B Esc
+Clear inspector popup.
+.TP
+.B q
+Quit.
+.SH PLOT ARTIFACT DIRECTORY
+When the plot directory already exists, benchman prompts:
+.IP "A" 4
+Use current artifacts (assume up-to-date).
+.IP "B" 4
+Remove and regenerate via
+.B scripts/plot_two_json.sh
+.
+.SH MANUAL VIEW
+Use:
+.PP
+.B projman.sh tui man
+.PP
+This sets:
+.PP
+.B MANPAGER='nvim +Man!'
+.PP
+and opens this local manual through
+.BR man (1)
+.
+.SH ENVIRONMENT
+.TP
+.B INFOTHEORY_PLOT_SUMMARY_TSV
+Summary TSV path.
+.TP
+.B INFOTHEORY_BASELINE_SUMMARY_TSV
+Baseline summary TSV path.
+.TP
+.B INFOTHEORY_BENCH_RAW_TSV
+Raw TSV path.
+.TP
+.B INFOTHEORY_PLOT_SUBJECTS
+Subject filter list.
+.TP
+.B INFOTHEORY_PLOT_OUTPUT_DIR
+Plot artifact directory.
+.SH SEE ALSO
+.BR projman.sh (1),
+.BR scripts/bench_two_json.sh (1),
+.BR scripts/plot_two_json.sh (1)

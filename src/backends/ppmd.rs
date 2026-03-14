@@ -1,6 +1,8 @@
 use ahash::AHashMap;
 use std::collections::VecDeque;
 
+const PDF_MIN: f64 = crate::mixture::DEFAULT_MIN_PROB;
+
 #[derive(Clone, Debug, Default)]
 struct ContextStats {
     counts: Vec<(u8, u16)>,
@@ -61,6 +63,11 @@ impl PpmdModel {
         out.copy_from_slice(&self.pdf);
     }
 
+    pub fn pdf(&mut self) -> &[f64; 256] {
+        self.ensure_pdf();
+        &self.pdf
+    }
+
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
         self.ensure_pdf();
         self.pdf[symbol as usize].max(min_prob).ln()
@@ -110,6 +117,7 @@ impl PpmdModel {
             }
         }
         self.pdf.copy_from_slice(&lower);
+        normalize_pdf(&mut self.pdf);
         self.valid = true;
     }
 
@@ -146,6 +154,27 @@ fn interpolate_context(ctx: &ContextStats, lower: &[f64; 256]) -> [f64; 256] {
         out[symbol as usize] += (count as f64) / denom;
     }
     out
+}
+
+fn normalize_pdf(pdf: &mut [f64; 256]) {
+    let mut sum = 0.0;
+    for p in pdf.iter_mut() {
+        *p = if p.is_finite() {
+            (*p).max(PDF_MIN)
+        } else {
+            PDF_MIN
+        };
+        sum += *p;
+    }
+    if !(sum.is_finite()) || sum <= 0.0 {
+        let u = 1.0 / 256.0;
+        pdf.fill(u);
+        return;
+    }
+    let inv = 1.0 / sum;
+    for p in pdf.iter_mut() {
+        *p *= inv;
+    }
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
