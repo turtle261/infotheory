@@ -3,6 +3,7 @@
 benchman \- interactive InfoTheory benchmark TUI
 .SH SYNOPSIS
 .B projman.sh tui
+[\-\-suite NAME]
 [\-\-summary\-tsv PATH]
 [\-\-baseline\-summary\-tsv PATH]
 [\-\-raw\-tsv PATH]
@@ -30,9 +31,16 @@ overlap detection when multiple visible series share the same point
 optional raw TSV enrichment for per-repetition details
 .SH OPTIONS
 .TP
+.B \-\-suite NAME
+Benchmark suite name (
+.B two\-json
+or
+.B extra
+). Controls latest-summary discovery and plot regeneration context.
+.TP
 .B \-\-summary\-tsv PATH
 Summary TSV (defaults to newest
-.I /tmp/infotheory-two-json-summary-*.tsv
+.I /tmp/infotheory-<suite>-summary-*.tsv
 ).
 .TP
 .B \-\-baseline\-summary\-tsv PATH
@@ -106,6 +114,13 @@ and opens this local manual through
 .TP
 .B INFOTHEORY_PLOT_SUMMARY_TSV
 Summary TSV path.
+.TP
+.B INFOTHEORY_PLOT_SUITE
+Benchmark suite (
+.B two\-json
+or
+.B extra
+).
 .TP
 .B INFOTHEORY_BASELINE_SUMMARY_TSV
 Baseline summary TSV path.

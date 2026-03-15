@@ -23,9 +23,54 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 
 const DEFAULT_PLOT_DIR: &str = "/tmp/plotimgs";
+const DEFAULT_BENCH_SUITE: &str = "two-json";
 const PLOT_DIR_MARKER_FILE: &str = ".benchman-managed-plot-dir";
-const LEGACY_PLOT_SVG_PREFIX: &str = "infotheory-two-json-";
 const LEGACY_PLOT_SVG_SUFFIX: &str = ".svg";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchSuite {
+    TwoJson,
+    Extra,
+}
+
+impl BenchSuite {
+    fn parse(raw: &str) -> Result<Self> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "two-json" | "two_json" | "two" | "core" | "full" => Ok(Self::TwoJson),
+            "extra" => Ok(Self::Extra),
+            _ => bail!("unknown benchmark suite '{raw}' (expected 'two-json' or 'extra')"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoJson => "two-json",
+            Self::Extra => "extra",
+        }
+    }
+
+    fn summary_prefix(self) -> &'static str {
+        match self {
+            Self::TwoJson => "infotheory-two-json",
+            Self::Extra => "infotheory-extra",
+        }
+    }
+
+    fn spec_label(self) -> &'static str {
+        match self {
+            Self::TwoJson => "examples/two.json",
+            Self::Extra => "examples/extra.json",
+        }
+    }
+
+    fn focus_subjects(self) -> &'static [&'static str] {
+        match self {
+            Self::TwoJson => &["neural_mixture", "rwkv"],
+            Self::Extra => &["neural_mixture", "mamba"],
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlotDirDeletionPolicy {
@@ -58,8 +103,16 @@ const COLOR_PALETTE: [Color; 12] = [
 struct Cli {
     #[arg(
         long,
+        env = "INFOTHEORY_PLOT_SUITE",
+        default_value = DEFAULT_BENCH_SUITE,
+        help = "Benchmark suite (`two-json` or `extra`) used for latest-summary discovery and plot regeneration"
+    )]
+    suite: String,
+
+    #[arg(
+        long,
         env = "INFOTHEORY_PLOT_SUMMARY_TSV",
-        help = "Path to summary TSV. Defaults to latest /tmp/infotheory-two-json-summary-*.tsv"
+        help = "Path to summary TSV. Defaults to latest /tmp/<suite>-summary-*.tsv for the selected suite"
     )]
     summary_tsv: Option<PathBuf>,
 
@@ -276,6 +329,7 @@ struct FilterPopup {
 
 #[derive(Clone, Debug)]
 struct BenchData {
+    suite: BenchSuite,
     current_rows: Vec<RenderRow>,
     combined_rows: Vec<RenderRow>,
     baseline_paths_mismatch: Option<(usize, usize)>,
@@ -288,6 +342,7 @@ struct BenchData {
 
 #[derive(Clone, Debug)]
 struct ResolvedInputs {
+    suite: BenchSuite,
     summary_path: PathBuf,
     baseline_path: Option<PathBuf>,
     raw_path: Option<PathBuf>,
@@ -322,7 +377,7 @@ impl App {
             subjects_present.insert(row.subject.clone());
         }
 
-        let specs = build_graph_specs(data.baseline_path.is_some(), &subjects_present);
+        let specs = build_graph_specs(data.suite, data.baseline_path.is_some(), &subjects_present);
         let mut models = Vec::with_capacity(specs.len());
         for spec in specs {
             let source = if spec.data_view == DataView::Current {
@@ -725,11 +780,13 @@ fn main() -> Result<()> {
 }
 
 fn resolve_inputs(cli: Cli) -> Result<ResolvedInputs> {
+    let suite = BenchSuite::parse(&cli.suite)?;
     let summary_path = match cli.summary_tsv {
         Some(path) => path,
-        None => latest_summary_tsv()?.context(
-            "no summary TSV provided and no /tmp/infotheory-two-json-summary-*.tsv found",
-        )?,
+        None => latest_summary_tsv(suite)?.context(format!(
+            "no summary TSV provided and no /tmp/{}-summary-*.tsv found",
+            suite.summary_prefix()
+        ))?,
     };
     if !summary_path.is_file() {
         bail!("summary TSV not found: {}", summary_path.display());
@@ -759,6 +816,7 @@ fn resolve_inputs(cli: Cli) -> Result<ResolvedInputs> {
     let subject_filter = parse_subject_filter(cli.subjects.as_deref())?;
 
     Ok(ResolvedInputs {
+        suite,
         summary_path,
         baseline_path,
         raw_path,
@@ -769,7 +827,8 @@ fn resolve_inputs(cli: Cli) -> Result<ResolvedInputs> {
     })
 }
 
-fn latest_summary_tsv() -> Result<Option<PathBuf>> {
+fn latest_summary_tsv(suite: BenchSuite) -> Result<Option<PathBuf>> {
+    let expected_prefix = format!("{}-summary-", suite.summary_prefix());
     let mut candidates = Vec::new();
     for entry in fs::read_dir("/tmp").context("failed to list /tmp")? {
         let entry = entry?;
@@ -777,7 +836,7 @@ fn latest_summary_tsv() -> Result<Option<PathBuf>> {
         let Some(file_name) = path.file_name().and_then(|f| f.to_str()) else {
             continue;
         };
-        if !(file_name.starts_with("infotheory-two-json-summary-") && file_name.ends_with(".tsv")) {
+        if !(file_name.starts_with(&expected_prefix) && file_name.ends_with(".tsv")) {
             continue;
         }
         let modified = entry.metadata()?.modified()?;
@@ -912,7 +971,13 @@ fn plot_dir_deletion_policy(plot_dir: &Path) -> Result<PlotDirDeletionPolicy> {
 }
 
 fn is_legacy_plot_svg_name(file_name: &str) -> bool {
-    file_name.starts_with(LEGACY_PLOT_SVG_PREFIX) && file_name.ends_with(LEGACY_PLOT_SVG_SUFFIX)
+    file_name.ends_with(LEGACY_PLOT_SVG_SUFFIX)
+        && [BenchSuite::TwoJson, BenchSuite::Extra]
+            .into_iter()
+            .any(|suite| {
+                let expected_prefix = format!("{}-", suite.summary_prefix());
+                file_name.starts_with(&expected_prefix)
+            })
 }
 
 fn confirm_unmanaged_plot_dir_deletion(plot_dir: &Path) -> Result<()> {
@@ -992,6 +1057,7 @@ fn run_plot_script(inputs: &ResolvedInputs) -> Result<()> {
     let mut cmd = Command::new("sh");
     cmd.arg(&script)
         .env("INFOTHEORY_PLOT_SUMMARY_TSV", &inputs.summary_path)
+        .env("INFOTHEORY_PLOT_SUITE", inputs.suite.as_str())
         .env("INFOTHEORY_PLOT_OUTPUT_DIR", &inputs.plot_dir);
 
     if let Some(path) = &inputs.baseline_path {
@@ -1082,6 +1148,7 @@ fn load_bench_data(inputs: &ResolvedInputs) -> Result<BenchData> {
     };
 
     Ok(BenchData {
+        suite: inputs.suite,
         current_rows,
         combined_rows,
         baseline_paths_mismatch,
@@ -1388,69 +1455,71 @@ fn parse_opt_u64(raw: &str, field: &str, row_no: usize, path: &Path) -> Result<O
 }
 
 fn build_graph_specs(
+    suite: BenchSuite,
     baseline_available: bool,
     subjects_present: &HashSet<String>,
 ) -> Vec<GraphSpec> {
+    let suite_label = suite.spec_label();
     let mut specs = vec![
         spec_current(
             "h-rss",
-            "examples/two.json h RSS vs size",
+            &format!("{suite_label} h RSS vs size"),
             Some("h"),
             Metric::RssKibMedian,
             SeriesField::Subject,
         ),
         spec_current(
             "compress-rss",
-            "examples/two.json compress RSS vs size",
+            &format!("{suite_label} compress RSS vs size"),
             Some("compress"),
             Metric::RssKibMedian,
             SeriesField::Subject,
         ),
         spec_current(
             "decompress-rss",
-            "examples/two.json decompress RSS vs size",
+            &format!("{suite_label} decompress RSS vs size"),
             Some("decompress"),
             Metric::RssKibMedian,
             SeriesField::Subject,
         ),
         spec_current(
             "h-time",
-            "examples/two.json h wall time vs size",
+            &format!("{suite_label} h wall time vs size"),
             Some("h"),
             Metric::RealSecondsMedian,
             SeriesField::Subject,
         ),
         spec_current(
             "compress-time",
-            "examples/two.json compress wall time vs size",
+            &format!("{suite_label} compress wall time vs size"),
             Some("compress"),
             Metric::RealSecondsMedian,
             SeriesField::Subject,
         ),
         spec_current(
             "decompress-time",
-            "examples/two.json decompress wall time vs size",
+            &format!("{suite_label} decompress wall time vs size"),
             Some("decompress"),
             Metric::RealSecondsMedian,
             SeriesField::Subject,
         ),
         spec_current(
             "h-entropy",
-            "examples/two.json h bits per byte vs size",
+            &format!("{suite_label} h bits per byte vs size"),
             Some("h"),
             Metric::EntropyBpbMedian,
             SeriesField::Subject,
         ),
         spec_current(
             "all-time",
-            "examples/two.json all operations wall time vs size",
+            &format!("{suite_label} all operations wall time vs size"),
             None,
             Metric::RealSecondsMedian,
             SeriesField::Series,
         ),
         spec_current(
             "all-rss",
-            "examples/two.json all operations RSS vs size",
+            &format!("{suite_label} all operations RSS vs size"),
             None,
             Metric::RssKibMedian,
             SeriesField::Series,
@@ -1461,82 +1530,82 @@ fn build_graph_specs(
         specs.extend([
             spec_combined(
                 "h-rss-baseline",
-                "examples/two.json h RSS vs size (current vs baseline)",
+                &format!("{suite_label} h RSS vs size (current vs baseline)"),
                 Some("h"),
                 Metric::RssKibMedian,
                 SeriesField::SubjectOverlay,
             ),
             spec_combined(
                 "compress-rss-baseline",
-                "examples/two.json compress RSS vs size (current vs baseline)",
+                &format!("{suite_label} compress RSS vs size (current vs baseline)"),
                 Some("compress"),
                 Metric::RssKibMedian,
                 SeriesField::SubjectOverlay,
             ),
             spec_combined(
                 "decompress-rss-baseline",
-                "examples/two.json decompress RSS vs size (current vs baseline)",
+                &format!("{suite_label} decompress RSS vs size (current vs baseline)"),
                 Some("decompress"),
                 Metric::RssKibMedian,
                 SeriesField::SubjectOverlay,
             ),
             spec_combined(
                 "h-time-baseline",
-                "examples/two.json h wall time vs size (current vs baseline)",
+                &format!("{suite_label} h wall time vs size (current vs baseline)"),
                 Some("h"),
                 Metric::RealSecondsMedian,
                 SeriesField::SubjectOverlay,
             ),
             spec_combined(
                 "compress-time-baseline",
-                "examples/two.json compress wall time vs size (current vs baseline)",
+                &format!("{suite_label} compress wall time vs size (current vs baseline)"),
                 Some("compress"),
                 Metric::RealSecondsMedian,
                 SeriesField::SubjectOverlay,
             ),
             spec_combined(
                 "decompress-time-baseline",
-                "examples/two.json decompress wall time vs size (current vs baseline)",
+                &format!("{suite_label} decompress wall time vs size (current vs baseline)"),
                 Some("decompress"),
                 Metric::RealSecondsMedian,
                 SeriesField::SubjectOverlay,
             ),
             spec_combined(
                 "h-entropy-baseline",
-                "examples/two.json h bits per byte vs size (current vs baseline)",
+                &format!("{suite_label} h bits per byte vs size (current vs baseline)"),
                 Some("h"),
                 Metric::EntropyBpbMedian,
                 SeriesField::SubjectOverlay,
             ),
             spec_combined(
                 "all-time-baseline",
-                "examples/two.json all operations wall time vs size (current vs baseline)",
+                &format!("{suite_label} all operations wall time vs size (current vs baseline)"),
                 None,
                 Metric::RealSecondsMedian,
                 SeriesField::SeriesOverlay,
             ),
             spec_combined(
                 "all-rss-baseline",
-                "examples/two.json all operations RSS vs size (current vs baseline)",
+                &format!("{suite_label} all operations RSS vs size (current vs baseline)"),
                 None,
                 Metric::RssKibMedian,
                 SeriesField::SeriesOverlay,
             ),
         ]);
 
-        for subject in ["neural_mixture", "rwkv"] {
-            if !subjects_present.contains(subject) {
+        for subject in suite.focus_subjects() {
+            if !subjects_present.contains(*subject) {
                 continue;
             }
             specs.extend([
                 GraphSpec {
                     id: format!("{}-h-time-baseline", subject),
                     title: format!(
-                        "examples/two.json {} h wall time vs size (current vs baseline)",
+                        "{suite_label} {} h wall time vs size (current vs baseline)",
                         subject
                     ),
                     operation_filter: Some("h".to_string()),
-                    subject_filter: Some(subject.to_string()),
+                    subject_filter: Some((*subject).to_string()),
                     metric: Metric::RealSecondsMedian,
                     series_field: SeriesField::SummarySource,
                     data_view: DataView::Combined,
@@ -1544,11 +1613,11 @@ fn build_graph_specs(
                 GraphSpec {
                     id: format!("{}-h-entropy-baseline", subject),
                     title: format!(
-                        "examples/two.json {} h bits per byte vs size (current vs baseline)",
+                        "{suite_label} {} h bits per byte vs size (current vs baseline)",
                         subject
                     ),
                     operation_filter: Some("h".to_string()),
-                    subject_filter: Some(subject.to_string()),
+                    subject_filter: Some((*subject).to_string()),
                     metric: Metric::EntropyBpbMedian,
                     series_field: SeriesField::SummarySource,
                     data_view: DataView::Combined,
@@ -1556,11 +1625,11 @@ fn build_graph_specs(
                 GraphSpec {
                     id: format!("{}-compress-time-baseline", subject),
                     title: format!(
-                        "examples/two.json {} compress wall time vs size (current vs baseline)",
+                        "{suite_label} {} compress wall time vs size (current vs baseline)",
                         subject
                     ),
                     operation_filter: Some("compress".to_string()),
-                    subject_filter: Some(subject.to_string()),
+                    subject_filter: Some((*subject).to_string()),
                     metric: Metric::RealSecondsMedian,
                     series_field: SeriesField::SummarySource,
                     data_view: DataView::Combined,
@@ -1568,11 +1637,11 @@ fn build_graph_specs(
                 GraphSpec {
                     id: format!("{}-compress-archive-ratio-baseline", subject),
                     title: format!(
-                        "examples/two.json {} compress archive ratio vs size (current vs baseline)",
+                        "{suite_label} {} compress archive ratio vs size (current vs baseline)",
                         subject
                     ),
                     operation_filter: Some("compress".to_string()),
-                    subject_filter: Some(subject.to_string()),
+                    subject_filter: Some((*subject).to_string()),
                     metric: Metric::ArchiveRatioMedian,
                     series_field: SeriesField::SummarySource,
                     data_view: DataView::Combined,
@@ -1580,11 +1649,11 @@ fn build_graph_specs(
                 GraphSpec {
                     id: format!("{}-decompress-time-baseline", subject),
                     title: format!(
-                        "examples/two.json {} decompress wall time vs size (current vs baseline)",
+                        "{suite_label} {} decompress wall time vs size (current vs baseline)",
                         subject
                     ),
                     operation_filter: Some("decompress".to_string()),
-                    subject_filter: Some(subject.to_string()),
+                    subject_filter: Some((*subject).to_string()),
                     metric: Metric::RealSecondsMedian,
                     series_field: SeriesField::SummarySource,
                     data_view: DataView::Combined,
@@ -2294,6 +2363,18 @@ mod tests {
             "<svg/>",
         )
         .expect("failed to write legacy artifact");
+
+        assert_eq!(
+            plot_dir_deletion_policy(dir.path()).expect("policy should evaluate"),
+            PlotDirDeletionPolicy::LegacyArtifacts
+        );
+    }
+
+    #[test]
+    fn plot_dir_deletion_policy_accepts_extra_suite_artifacts() {
+        let dir = TestDir::new("legacy-extra");
+        fs::write(dir.path().join("infotheory-extra-h-rss-run.svg"), "<svg/>")
+            .expect("failed to write legacy artifact");
 
         assert_eq!(
             plot_dir_deletion_policy(dir.path()).expect("policy should evaluate"),

@@ -6,6 +6,7 @@ export LC_ALL=C
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SOURCE_FILE=${INFOTHEORY_BENCH_SOURCE:-/tmp/enwik7}
 TIME_CMD=/usr/bin/time
+BENCH_SUITE=${INFOTHEORY_BENCH_SUITE:-two-json}
 COMP_BACKEND=${INFOTHEORY_BENCH_COMPRESSION_BACKEND:-rate-ac}
 REPEATS=${INFOTHEORY_BENCH_REPEATS:-3}
 WARMUPS=${INFOTHEORY_BENCH_WARMUPS:-1}
@@ -21,6 +22,26 @@ RAW_HEADER="operation	subject	subject_kind	expert_kind	series	size_bytes	repetit
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"; }
+
+case "${BENCH_SUITE}" in
+  two-json|two_json|two|core|full)
+    BENCH_SUITE=two-json
+    SUITE_SPEC_PATH="${ROOT_DIR}/examples/two.json"
+    SUITE_DISPLAY="examples/two.json"
+    SUITE_PATH_PREFIX="infotheory-two-json"
+    ;;
+  extra)
+    BENCH_SUITE=extra
+    SUITE_SPEC_PATH="${ROOT_DIR}/examples/extra.json"
+    SUITE_DISPLAY="examples/extra.json"
+    SUITE_PATH_PREFIX="infotheory-extra"
+    ;;
+  *)
+    fail "INFOTHEORY_BENCH_SUITE must be 'two-json' or 'extra' (found '${BENCH_SUITE}')"
+    ;;
+esac
+
+[ -f "${SUITE_SPEC_PATH}" ] || fail "Benchmark spec not found: ${SUITE_SPEC_PATH}"
 
 cleanup() {
   if [ "${INFOTHEORY_BENCH_KEEP_WORKDIR:-0}" = "1" ]; then
@@ -39,16 +60,17 @@ usage() {
   cat <<EOF
 Usage: sh ./scripts/bench_two_json.sh
 
-Runs a sequential benchmark suite for every standalone expert in examples/two.json
+Runs a sequential benchmark suite for every standalone expert in ${SUITE_DISPLAY}
 plus the full neural mixture, using only /tmp/enwik7 as the source corpus.
 
 Resume behavior:
-  By default, resumes the newest /tmp/infotheory-two-json-raw-*.tsv if one exists.
+  By default, resumes the newest /tmp/${SUITE_PATH_PREFIX}-raw-*.tsv if one exists.
   Set INFOTHEORY_BENCH_FRESH=1 to force a new timestamped run.
-  Set INFOTHEORY_BENCH_RAW_TSV=/tmp/infotheory-two-json-raw-<stamp>.tsv to resume
+  Set INFOTHEORY_BENCH_RAW_TSV=/tmp/${SUITE_PATH_PREFIX}-raw-<stamp>.tsv to resume
   or append to a specific run file.
 
 Environment:
+  INFOTHEORY_BENCH_SUITE=two-json|extra
   INFOTHEORY_BENCH_REPEATS=3
   INFOTHEORY_BENCH_WARMUPS=1
   INFOTHEORY_BENCH_SIZES="4096 16384 ... 10000000"
@@ -117,7 +139,7 @@ derive_summary_path() {
 }
 
 latest_existing_raw_tsv() {
-  ls -1t /tmp/infotheory-two-json-raw-*.tsv 2>/dev/null | head -n 1 || true
+  ls -1t "/tmp/${SUITE_PATH_PREFIX}-raw-"*.tsv 2>/dev/null | head -n 1 || true
 }
 
 resolve_output_paths() {
@@ -126,7 +148,7 @@ resolve_output_paths() {
     RAW_TSV=${INFOTHEORY_BENCH_RAW_TSV}
     OUTPUT_MODE=explicit
   elif [ "${INFOTHEORY_BENCH_FRESH:-0}" = "1" ]; then
-    RAW_TSV=/tmp/infotheory-two-json-raw-${STAMP}.tsv
+    RAW_TSV=/tmp/${SUITE_PATH_PREFIX}-raw-${STAMP}.tsv
     OUTPUT_MODE=fresh
   else
     latest_raw=$(latest_existing_raw_tsv)
@@ -134,7 +156,7 @@ resolve_output_paths() {
       RAW_TSV=${latest_raw}
       OUTPUT_MODE=resume-latest
     else
-      RAW_TSV=/tmp/infotheory-two-json-raw-${STAMP}.tsv
+      RAW_TSV=/tmp/${SUITE_PATH_PREFIX}-raw-${STAMP}.tsv
       OUTPUT_MODE=fresh
     fi
   fi
@@ -187,7 +209,7 @@ initialize_raw_tsv() {
   printf '%s\n' "${RAW_HEADER}" > "${RAW_TSV}"
 }
 
-WORK_DIR=$(mktemp -d /tmp/infotheory-two-json-work.XXXXXX)
+WORK_DIR=$(mktemp -d "/tmp/${SUITE_PATH_PREFIX}-work.XXXXXX")
 BIN_PATH="${ROOT_DIR}/target/release/infotheory"
 SUBJECTS_TSV="${WORK_DIR}/subjects.tsv"
 
@@ -232,9 +254,8 @@ say "[bench] Building release CLI binary with fresh cargo build..."
 (cd "${ROOT_DIR}" && CARGO_INCREMENTAL=0 cargo build --release --features cli --bin infotheory --locked)
 [ -x "${BIN_PATH}" ] || fail "Expected built binary at ${BIN_PATH}"
 
-python3 - "${ROOT_DIR}/examples/two.json" "${ROOT_DIR}" "${WORK_DIR}" > "${SUBJECTS_TSV}" <<'PY'
+python3 - "${SUITE_SPEC_PATH}" "${ROOT_DIR}" "${WORK_DIR}" "${SUITE_DISPLAY}" > "${SUBJECTS_TSV}" <<'PY'
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -242,15 +263,50 @@ from pathlib import Path
 spec_path = Path(sys.argv[1]).resolve()
 repo_root = Path(sys.argv[2]).resolve()
 work_dir = Path(sys.argv[3]).resolve()
+suite_label = sys.argv[4]
 subject_dir = work_dir / "subjects"
 subject_dir.mkdir(parents=True, exist_ok=True)
 
 data = json.loads(spec_path.read_text())
 if data.get("kind") != "neural":
-    raise SystemExit(f"expected examples/two.json kind=neural, found {data.get('kind')!r}")
+    raise SystemExit(f"expected {suite_label} kind=neural, found {data.get('kind')!r}")
 experts = data.get("experts")
 if not isinstance(experts, list) or not experts:
-    raise SystemExit("examples/two.json must contain a non-empty experts array")
+    raise SystemExit(f"{suite_label} must contain a non-empty experts array")
+spec_dir = spec_path.parent
+
+PATH_KEYS = {
+    "spec_path",
+    "base_path",
+    "path",
+    "model_path",
+    "rwkv_model_path",
+    "mamba_model_path",
+}
+
+
+def looks_like_uri(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value))
+
+
+def canonicalize_relative_paths(node):
+    if isinstance(node, dict):
+        out = {}
+        for key, value in node.items():
+            if (
+                isinstance(value, str)
+                and value
+                and (key in PATH_KEYS or key.endswith("_path"))
+                and not Path(value).is_absolute()
+                and not looks_like_uri(value)
+            ):
+                out[key] = str((spec_dir / value).resolve())
+            else:
+                out[key] = canonicalize_relative_paths(value)
+        return out
+    if isinstance(node, list):
+        return [canonicalize_relative_paths(item) for item in node]
+    return node
 
 def slug(text: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip())
@@ -269,17 +325,18 @@ print(
     )
 )
 for expert in experts:
-    name = str(expert.get("name") or expert.get("kind") or "expert")
+    expert_resolved = canonicalize_relative_paths(expert)
+    name = str(expert_resolved.get("name") or expert_resolved.get("kind") or "expert")
     subject = slug(name)
     out_path = subject_dir / f"{subject}.json"
-    out_path.write_text(json.dumps(expert, indent=2, sort_keys=True) + "\n")
-    h_order = expert.get("max_order", "")
+    out_path.write_text(json.dumps(expert_resolved, indent=2, sort_keys=True) + "\n")
+    h_order = expert_resolved.get("max_order", "")
     print(
         "\t".join(
             [
                 subject,
                 "expert",
-                str(expert.get("kind", "")),
+                str(expert_resolved.get("kind", "")),
                 str(out_path),
                 "" if h_order == "" else str(h_order),
             ]
@@ -492,6 +549,7 @@ row_exists() {
 }
 
 say "[bench] Source: ${SOURCE_FILE}"
+say "[bench] Suite: ${BENCH_SUITE} (${SUITE_DISPLAY})"
 say "[bench] CPU affinity: ${CPU}"
 say "[bench] Compression backend: ${COMP_BACKEND}"
 say "[bench] Repeats: ${REPEATS}"
@@ -814,15 +872,19 @@ PY
 
 say "[bench] Raw TSV: ${RAW_TSV}"
 say "[bench] Summary TSV: ${SUMMARY_TSV}"
-say "[bench] Compare against the checked-in baseline:"
-say "  python3 '${ROOT_DIR}/scripts/compare_bench_two_json.py' '${SUMMARY_TSV}'"
+if [ "${BENCH_SUITE}" = "two-json" ]; then
+  say "[bench] Compare against the checked-in baseline:"
+  say "  python3 '${ROOT_DIR}/scripts/compare_bench_two_json.py' '${SUMMARY_TSV}'"
+else
+  say "[bench] No checked-in baseline comparator is configured for suite '${BENCH_SUITE}'."
+fi
 say "[bench] Plot commands:"
-say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title 'h RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"compress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title 'compress RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"decompress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title 'decompress RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y real_seconds_median --color-by subject --legend --log-x --title 'h wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"compress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y real_seconds_median --color-by subject --legend --log-x --title 'compress wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"decompress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y real_seconds_median --color-by subject --legend --log-x --title 'decompress wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y entropy_bpb_median --color-by subject --legend --log-x --title 'h bits per byte vs size' --x-label 'size (bytes)' --y-label 'bits per byte' --terminal"
-say "  kuva line '${SUMMARY_TSV}' --x size_bytes --y real_seconds_median --color-by series --legend --log-x --title 'all operations wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
-say "  kuva line '${SUMMARY_TSV}' --x size_bytes --y rss_kib_median --color-by series --legend --log-x --title 'all operations RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
+say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} h RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
+say "  awk -F '\\t' 'NR==1 || \$1==\"compress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} compress RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
+say "  awk -F '\\t' 'NR==1 || \$1==\"decompress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} decompress RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
+say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y real_seconds_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} h wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
+say "  awk -F '\\t' 'NR==1 || \$1==\"compress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y real_seconds_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} compress wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
+say "  awk -F '\\t' 'NR==1 || \$1==\"decompress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y real_seconds_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} decompress wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
+say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y entropy_bpb_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} h bits per byte vs size' --x-label 'size (bytes)' --y-label 'bits per byte' --terminal"
+say "  kuva line '${SUMMARY_TSV}' --x size_bytes --y real_seconds_median --color-by series --legend --log-x --title '${SUITE_DISPLAY} all operations wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
+say "  kuva line '${SUMMARY_TSV}' --x size_bytes --y rss_kib_median --color-by series --legend --log-x --title '${SUITE_DISPLAY} all operations RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"

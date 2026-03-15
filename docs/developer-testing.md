@@ -62,7 +62,7 @@ The suite includes:
 - Rust API ↔ CLI batch parity (`tests/cli_api_parity.rs`)
 - Python bindings ↔ CLI parity (`python/tests/test_cli_parity_expanded.py`)
 - Python backend parity for `match`, `sparse-match`, `ppmd`, `mixture`, `particle`,
-  `calibrated`, and `rwkv7` string parsing (`python/tests/test_api_surface.py`)
+  `calibrated`, `mamba`, and `rwkv7` string parsing (`python/tests/test_api_surface.py`)
 - Compression/decompression roundtrip checks in Rust and Python
 - VM stats-backend parsing and predictor-backed trace-model coverage for the new
   backends (`src/main.rs`, `src/aixi/vm_nyx.rs`)

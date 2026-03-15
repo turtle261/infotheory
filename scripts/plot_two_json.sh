@@ -4,6 +4,7 @@ set -eu
 export LC_ALL=C
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PLOT_SUITE=${INFOTHEORY_PLOT_SUITE:-${INFOTHEORY_BENCH_SUITE:-two-json}}
 PLOT_DIR=${INFOTHEORY_PLOT_OUTPUT_DIR:-/tmp/plotimgs}
 SUMMARY_TSV=${INFOTHEORY_PLOT_SUMMARY_TSV:-}
 BASELINE_SUMMARY_TSV=${INFOTHEORY_BASELINE_SUMMARY_TSV:-}
@@ -18,6 +19,24 @@ say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"; }
 
+case "${PLOT_SUITE}" in
+  two-json|two_json|two|core|full)
+    PLOT_SUITE=two-json
+    SUITE_DISPLAY="examples/two.json"
+    SUITE_PATH_PREFIX="infotheory-two-json"
+    SUITE_FOCUS_SUBJECTS="neural_mixture rwkv"
+    ;;
+  extra)
+    PLOT_SUITE=extra
+    SUITE_DISPLAY="examples/extra.json"
+    SUITE_PATH_PREFIX="infotheory-extra"
+    SUITE_FOCUS_SUBJECTS="neural_mixture mamba"
+    ;;
+  *)
+    fail "INFOTHEORY_PLOT_SUITE must be 'two-json' or 'extra' (found '${PLOT_SUITE}')"
+    ;;
+esac
+
 cleanup() {
   if [ -n "${WORK_DIR}" ] && [ -d "${WORK_DIR}" ]; then
     rm -rf "${WORK_DIR}"
@@ -29,15 +48,16 @@ usage() {
   cat <<EOF
 Usage: sh ./scripts/plot_two_json.sh
 
-Creates SVG plots for the most recent completed examples/two.json benchmark
+Creates SVG plots for the most recent completed ${SUITE_DISPLAY} benchmark
 summary in /tmp, or for INFOTHEORY_PLOT_SUMMARY_TSV if provided.
 
 Outputs:
   ${PLOT_DIR}/*.svg
 
 Environment:
-  INFOTHEORY_PLOT_SUMMARY_TSV=/tmp/infotheory-two-json-summary-<stamp>.tsv
-  INFOTHEORY_BASELINE_SUMMARY_TSV=benchmarks/baselines/infotheory-two-json-summary-<stamp>.tsv
+  INFOTHEORY_PLOT_SUITE=two-json|extra
+  INFOTHEORY_PLOT_SUMMARY_TSV=/tmp/${SUITE_PATH_PREFIX}-summary-<stamp>.tsv
+  INFOTHEORY_BASELINE_SUMMARY_TSV=benchmarks/baselines/${SUITE_PATH_PREFIX}-summary-<stamp>.tsv
   INFOTHEORY_PLOT_SUBJECTS=rwkv
   INFOTHEORY_PLOT_OUTPUT_DIR=/tmp/plotimgs
   INFOTHEORY_PLOT_WIDTH=2400
@@ -59,7 +79,7 @@ need_cmd ls
 need_cmd head
 
 latest_summary_tsv() {
-  ls -1t /tmp/infotheory-two-json-summary-*.tsv 2>/dev/null | head -n 1 || true
+  ls -1t "/tmp/${SUITE_PATH_PREFIX}-summary-"*.tsv 2>/dev/null | head -n 1 || true
 }
 
 resolve_summary_tsv() {
@@ -275,11 +295,11 @@ if [ -n "${BASELINE_SUMMARY_TSV}" ]; then
   validate_summary_tsv "${BASELINE_SUMMARY_TSV}"
 fi
 
-WORK_DIR=$(mktemp -d /tmp/infotheory-two-json-plot-work.XXXXXX)
+WORK_DIR=$(mktemp -d "/tmp/${SUITE_PATH_PREFIX}-plot-work.XXXXXX")
 mkdir -p "${PLOT_DIR}"
 
 run_id=$(basename "${SUMMARY_TSV}")
-run_id=${run_id#infotheory-two-json-summary-}
+run_id=${run_id#${SUITE_PATH_PREFIX}-summary-}
 run_id=${run_id%.tsv}
 
 if [ -n "${SUBJECT_FILTER}" ]; then
@@ -303,57 +323,57 @@ subset_tsv "${SUMMARY_TSV}" "compress" "${compress_tsv}"
 subset_tsv "${SUMMARY_TSV}" "decompress" "${decompress_tsv}"
 
 plot_line "${h_tsv}" \
-  "${PLOT_DIR}/infotheory-two-json-h-rss-${run_id}.svg" \
+  "${PLOT_DIR}/${SUITE_PATH_PREFIX}-h-rss-${run_id}.svg" \
   "size_bytes" "rss_kib_median" "subject" \
-  "examples/two.json h RSS vs size" \
+  "${SUITE_DISPLAY} h RSS vs size" \
   "size (bytes)" "peak RSS (KiB)"
 
 plot_line "${compress_tsv}" \
-  "${PLOT_DIR}/infotheory-two-json-compress-rss-${run_id}.svg" \
+  "${PLOT_DIR}/${SUITE_PATH_PREFIX}-compress-rss-${run_id}.svg" \
   "size_bytes" "rss_kib_median" "subject" \
-  "examples/two.json compress RSS vs size" \
+  "${SUITE_DISPLAY} compress RSS vs size" \
   "size (bytes)" "peak RSS (KiB)"
 
 plot_line "${decompress_tsv}" \
-  "${PLOT_DIR}/infotheory-two-json-decompress-rss-${run_id}.svg" \
+  "${PLOT_DIR}/${SUITE_PATH_PREFIX}-decompress-rss-${run_id}.svg" \
   "size_bytes" "rss_kib_median" "subject" \
-  "examples/two.json decompress RSS vs size" \
+  "${SUITE_DISPLAY} decompress RSS vs size" \
   "size (bytes)" "peak RSS (KiB)"
 
 plot_line "${h_tsv}" \
-  "${PLOT_DIR}/infotheory-two-json-h-time-${run_id}.svg" \
+  "${PLOT_DIR}/${SUITE_PATH_PREFIX}-h-time-${run_id}.svg" \
   "size_bytes" "real_seconds_median" "subject" \
-  "examples/two.json h wall time vs size" \
+  "${SUITE_DISPLAY} h wall time vs size" \
   "size (bytes)" "seconds"
 
 plot_line "${compress_tsv}" \
-  "${PLOT_DIR}/infotheory-two-json-compress-time-${run_id}.svg" \
+  "${PLOT_DIR}/${SUITE_PATH_PREFIX}-compress-time-${run_id}.svg" \
   "size_bytes" "real_seconds_median" "subject" \
-  "examples/two.json compress wall time vs size" \
+  "${SUITE_DISPLAY} compress wall time vs size" \
   "size (bytes)" "seconds"
 
 plot_line "${decompress_tsv}" \
-  "${PLOT_DIR}/infotheory-two-json-decompress-time-${run_id}.svg" \
+  "${PLOT_DIR}/${SUITE_PATH_PREFIX}-decompress-time-${run_id}.svg" \
   "size_bytes" "real_seconds_median" "subject" \
-  "examples/two.json decompress wall time vs size" \
+  "${SUITE_DISPLAY} decompress wall time vs size" \
   "size (bytes)" "seconds"
 
 plot_line "${h_tsv}" \
-  "${PLOT_DIR}/infotheory-two-json-h-entropy-${run_id}.svg" \
+  "${PLOT_DIR}/${SUITE_PATH_PREFIX}-h-entropy-${run_id}.svg" \
   "size_bytes" "entropy_bpb_median" "subject" \
-  "examples/two.json h bits per byte vs size" \
+  "${SUITE_DISPLAY} h bits per byte vs size" \
   "size (bytes)" "bits per byte"
 
 plot_line "${SUMMARY_TSV}" \
-  "${PLOT_DIR}/infotheory-two-json-all-time-${run_id}.svg" \
+  "${PLOT_DIR}/${SUITE_PATH_PREFIX}-all-time-${run_id}.svg" \
   "size_bytes" "real_seconds_median" "series" \
-  "examples/two.json all operations wall time vs size" \
+  "${SUITE_DISPLAY} all operations wall time vs size" \
   "size (bytes)" "seconds"
 
 plot_line "${SUMMARY_TSV}" \
-  "${PLOT_DIR}/infotheory-two-json-all-rss-${run_id}.svg" \
+  "${PLOT_DIR}/${SUITE_PATH_PREFIX}-all-rss-${run_id}.svg" \
   "size_bytes" "rss_kib_median" "series" \
-  "examples/two.json all operations RSS vs size" \
+  "${SUITE_DISPLAY} all operations RSS vs size" \
   "size (bytes)" "peak RSS (KiB)"
 
 if [ -n "${BASELINE_SUMMARY_TSV}" ]; then
@@ -368,60 +388,60 @@ if [ -n "${BASELINE_SUMMARY_TSV}" ]; then
   subset_tsv "${combined_summary_tsv}" "decompress" "${combined_decompress_tsv}"
 
   plot_line "${combined_h_tsv}" \
-    "${PLOT_DIR}/infotheory-two-json-h-rss-baseline-${run_id}.svg" \
+    "${PLOT_DIR}/${SUITE_PATH_PREFIX}-h-rss-baseline-${run_id}.svg" \
     "size_bytes" "rss_kib_median" "subject_overlay" \
-    "examples/two.json h RSS vs size (current vs baseline)" \
+    "${SUITE_DISPLAY} h RSS vs size (current vs baseline)" \
     "size (bytes)" "peak RSS (KiB)"
 
   plot_line "${combined_compress_tsv}" \
-    "${PLOT_DIR}/infotheory-two-json-compress-rss-baseline-${run_id}.svg" \
+    "${PLOT_DIR}/${SUITE_PATH_PREFIX}-compress-rss-baseline-${run_id}.svg" \
     "size_bytes" "rss_kib_median" "subject_overlay" \
-    "examples/two.json compress RSS vs size (current vs baseline)" \
+    "${SUITE_DISPLAY} compress RSS vs size (current vs baseline)" \
     "size (bytes)" "peak RSS (KiB)"
 
   plot_line "${combined_decompress_tsv}" \
-    "${PLOT_DIR}/infotheory-two-json-decompress-rss-baseline-${run_id}.svg" \
+    "${PLOT_DIR}/${SUITE_PATH_PREFIX}-decompress-rss-baseline-${run_id}.svg" \
     "size_bytes" "rss_kib_median" "subject_overlay" \
-    "examples/two.json decompress RSS vs size (current vs baseline)" \
+    "${SUITE_DISPLAY} decompress RSS vs size (current vs baseline)" \
     "size (bytes)" "peak RSS (KiB)"
 
   plot_line "${combined_h_tsv}" \
-    "${PLOT_DIR}/infotheory-two-json-h-time-baseline-${run_id}.svg" \
+    "${PLOT_DIR}/${SUITE_PATH_PREFIX}-h-time-baseline-${run_id}.svg" \
     "size_bytes" "real_seconds_median" "subject_overlay" \
-    "examples/two.json h wall time vs size (current vs baseline)" \
+    "${SUITE_DISPLAY} h wall time vs size (current vs baseline)" \
     "size (bytes)" "seconds"
 
   plot_line "${combined_compress_tsv}" \
-    "${PLOT_DIR}/infotheory-two-json-compress-time-baseline-${run_id}.svg" \
+    "${PLOT_DIR}/${SUITE_PATH_PREFIX}-compress-time-baseline-${run_id}.svg" \
     "size_bytes" "real_seconds_median" "subject_overlay" \
-    "examples/two.json compress wall time vs size (current vs baseline)" \
+    "${SUITE_DISPLAY} compress wall time vs size (current vs baseline)" \
     "size (bytes)" "seconds"
 
   plot_line "${combined_decompress_tsv}" \
-    "${PLOT_DIR}/infotheory-two-json-decompress-time-baseline-${run_id}.svg" \
+    "${PLOT_DIR}/${SUITE_PATH_PREFIX}-decompress-time-baseline-${run_id}.svg" \
     "size_bytes" "real_seconds_median" "subject_overlay" \
-    "examples/two.json decompress wall time vs size (current vs baseline)" \
+    "${SUITE_DISPLAY} decompress wall time vs size (current vs baseline)" \
     "size (bytes)" "seconds"
 
   plot_line "${combined_h_tsv}" \
-    "${PLOT_DIR}/infotheory-two-json-h-entropy-baseline-${run_id}.svg" \
+    "${PLOT_DIR}/${SUITE_PATH_PREFIX}-h-entropy-baseline-${run_id}.svg" \
     "size_bytes" "entropy_bpb_median" "subject_overlay" \
-    "examples/two.json h bits per byte vs size (current vs baseline)" \
+    "${SUITE_DISPLAY} h bits per byte vs size (current vs baseline)" \
     "size (bytes)" "bits per byte"
 
   plot_line "${combined_summary_tsv}" \
-    "${PLOT_DIR}/infotheory-two-json-all-time-baseline-${run_id}.svg" \
+    "${PLOT_DIR}/${SUITE_PATH_PREFIX}-all-time-baseline-${run_id}.svg" \
     "size_bytes" "real_seconds_median" "series_overlay" \
-    "examples/two.json all operations wall time vs size (current vs baseline)" \
+    "${SUITE_DISPLAY} all operations wall time vs size (current vs baseline)" \
     "size (bytes)" "seconds"
 
   plot_line "${combined_summary_tsv}" \
-    "${PLOT_DIR}/infotheory-two-json-all-rss-baseline-${run_id}.svg" \
+    "${PLOT_DIR}/${SUITE_PATH_PREFIX}-all-rss-baseline-${run_id}.svg" \
     "size_bytes" "rss_kib_median" "series_overlay" \
-    "examples/two.json all operations RSS vs size (current vs baseline)" \
+    "${SUITE_DISPLAY} all operations RSS vs size (current vs baseline)" \
     "size (bytes)" "peak RSS (KiB)"
 
-  for subject in neural_mixture rwkv; do
+  for subject in ${SUITE_FOCUS_SUBJECTS}; do
     subject_slug=$(slugify "${subject}")
     subject_tsv="${WORK_DIR}/${subject_slug}-with-baseline.tsv"
     subject_h_tsv="${WORK_DIR}/${subject_slug}-h-with-baseline.tsv"
@@ -434,33 +454,33 @@ if [ -n "${BASELINE_SUMMARY_TSV}" ]; then
     subset_tsv "${subject_tsv}" "decompress" "${subject_decompress_tsv}"
 
     plot_line "${subject_h_tsv}" \
-      "${PLOT_DIR}/infotheory-two-json-${subject_slug}-h-time-baseline-${run_id}.svg" \
+      "${PLOT_DIR}/${SUITE_PATH_PREFIX}-${subject_slug}-h-time-baseline-${run_id}.svg" \
       "size_bytes" "real_seconds_median" "summary_source" \
-      "examples/two.json ${subject} h wall time vs size (current vs baseline)" \
+      "${SUITE_DISPLAY} ${subject} h wall time vs size (current vs baseline)" \
       "size (bytes)" "seconds"
 
     plot_line "${subject_h_tsv}" \
-      "${PLOT_DIR}/infotheory-two-json-${subject_slug}-h-entropy-baseline-${run_id}.svg" \
+      "${PLOT_DIR}/${SUITE_PATH_PREFIX}-${subject_slug}-h-entropy-baseline-${run_id}.svg" \
       "size_bytes" "entropy_bpb_median" "summary_source" \
-      "examples/two.json ${subject} h bits per byte vs size (current vs baseline)" \
+      "${SUITE_DISPLAY} ${subject} h bits per byte vs size (current vs baseline)" \
       "size (bytes)" "bits per byte"
 
     plot_line "${subject_compress_tsv}" \
-      "${PLOT_DIR}/infotheory-two-json-${subject_slug}-compress-time-baseline-${run_id}.svg" \
+      "${PLOT_DIR}/${SUITE_PATH_PREFIX}-${subject_slug}-compress-time-baseline-${run_id}.svg" \
       "size_bytes" "real_seconds_median" "summary_source" \
-      "examples/two.json ${subject} compress wall time vs size (current vs baseline)" \
+      "${SUITE_DISPLAY} ${subject} compress wall time vs size (current vs baseline)" \
       "size (bytes)" "seconds"
 
     plot_line "${subject_compress_tsv}" \
-      "${PLOT_DIR}/infotheory-two-json-${subject_slug}-compress-archive-ratio-baseline-${run_id}.svg" \
+      "${PLOT_DIR}/${SUITE_PATH_PREFIX}-${subject_slug}-compress-archive-ratio-baseline-${run_id}.svg" \
       "size_bytes" "archive_ratio_median" "summary_source" \
-      "examples/two.json ${subject} compress archive ratio vs size (current vs baseline)" \
+      "${SUITE_DISPLAY} ${subject} compress archive ratio vs size (current vs baseline)" \
       "size (bytes)" "archive/input ratio"
 
     plot_line "${subject_decompress_tsv}" \
-      "${PLOT_DIR}/infotheory-two-json-${subject_slug}-decompress-time-baseline-${run_id}.svg" \
+      "${PLOT_DIR}/${SUITE_PATH_PREFIX}-${subject_slug}-decompress-time-baseline-${run_id}.svg" \
       "size_bytes" "real_seconds_median" "summary_source" \
-      "examples/two.json ${subject} decompress wall time vs size (current vs baseline)" \
+      "${SUITE_DISPLAY} ${subject} decompress wall time vs size (current vs baseline)" \
       "size (bytes)" "seconds"
   done
 fi
@@ -474,4 +494,4 @@ if [ -n "${SUBJECT_FILTER}" ]; then
 fi
 say "[plot] Output directory: ${PLOT_DIR}"
 say "[plot] SVG files:"
-ls -1 "${PLOT_DIR}"/infotheory-two-json-*-"${run_id}".svg
+ls -1 "${PLOT_DIR}/${SUITE_PATH_PREFIX}"-*-"${run_id}".svg

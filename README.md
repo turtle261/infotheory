@@ -151,6 +151,16 @@ Example:
 
 For `examples/two.json` benchmark plotting, `scripts/plot_two_json.sh` also accepts `INFOTHEORY_BASELINE_SUMMARY_TSV=/path/to/baseline-summary.tsv` to emit additional baseline-overlay SVGs.
 
+The benchmark tooling also supports an `extra` suite for additional rate backends
+not in `examples/two.json` (currently `mamba`, `particle` via
+`examples/particle_fast.json`, and `sparse-match`):
+
+```bash
+./projman.sh bench extra
+./projman.sh plot extra
+./projman.sh tui extra
+```
+
 For interactive benchmark analysis (all `plot_two_json.sh` graph families, subject focus, exact point inspection, overlap-aware readouts), use:
 
 ```bash

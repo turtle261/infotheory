@@ -128,16 +128,46 @@ cmd_test_all() {
 }
 
 cmd_bench() {
-  say "[bench] Running examples/two.json benchmark suite..."
+  suite=${INFOTHEORY_BENCH_SUITE:-two-json}
+  case "${1:-}" in
+    two-json|two_json|two|core|full)
+      suite=two-json
+      shift
+      ;;
+    extra)
+      suite=extra
+      shift
+      ;;
+  esac
+  case "${suite}" in
+    extra) suite_display="examples/extra.json" ;;
+    *) suite=two-json; suite_display="examples/two.json" ;;
+  esac
+  say "[bench] Running ${suite_display} benchmark suite..."
   need_cmd sh
-  (cd "$ROOT_DIR" && sh "$ROOT_DIR/scripts/bench_two_json.sh" "$@")
+  (cd "$ROOT_DIR" && INFOTHEORY_BENCH_SUITE="$suite" sh "$ROOT_DIR/scripts/bench_two_json.sh" "$@")
   say "[bench] Done"
 }
 
 cmd_plot() {
-  say "[plot] Rendering examples/two.json benchmark SVG plots..."
+  suite=${INFOTHEORY_PLOT_SUITE:-${INFOTHEORY_BENCH_SUITE:-two-json}}
+  case "${1:-}" in
+    two-json|two_json|two|core|full)
+      suite=two-json
+      shift
+      ;;
+    extra)
+      suite=extra
+      shift
+      ;;
+  esac
+  case "${suite}" in
+    extra) suite_display="examples/extra.json" ;;
+    *) suite=two-json; suite_display="examples/two.json" ;;
+  esac
+  say "[plot] Rendering ${suite_display} benchmark SVG plots..."
   need_cmd sh
-  (cd "$ROOT_DIR" && sh "$ROOT_DIR/scripts/plot_two_json.sh" "$@")
+  (cd "$ROOT_DIR" && INFOTHEORY_PLOT_SUITE="$suite" sh "$ROOT_DIR/scripts/plot_two_json.sh" "$@")
   say "[plot] Done"
 }
 
@@ -155,12 +185,24 @@ cmd_tui() {
     return 0
   fi
 
+  suite=${INFOTHEORY_PLOT_SUITE:-${INFOTHEORY_BENCH_SUITE:-two-json}}
+  case "${1:-}" in
+    two-json|two_json|two|core|full)
+      suite=two-json
+      shift
+      ;;
+    extra)
+      suite=extra
+      shift
+      ;;
+  esac
+
   say "[tui] Building benchman (release)..."
   need_cmd cargo
   (cd "$ROOT_DIR" && CARGO_INCREMENTAL=0 cargo build --release --locked -p benchman)
 
   say "[tui] Launching benchman..."
-  (cd "$ROOT_DIR" && "$ROOT_DIR/target/release/benchman" "$@")
+  (cd "$ROOT_DIR" && INFOTHEORY_PLOT_SUITE="$suite" INFOTHEORY_BENCH_SUITE="$suite" "$ROOT_DIR/target/release/benchman" --suite "$suite" "$@")
   say "[tui] Done"
 }
 
@@ -193,9 +235,9 @@ usage() {
 Usage: ./projman.sh <command>
 
 Commands:
-  bench       Run the standalone examples/two.json benchmark suite. Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
-  plot        Render SVG plots for the most recent completed examples/two.json benchmark summary in /tmp. Not included in test_all.
-  tui         Build and launch the interactive benchmark TUI (`benchman`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
+  bench [suite]  Run benchmark suite (`two-json` default, or `extra`). Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV for the selected suite by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
+  plot [suite]   Render SVG plots for the most recent completed summary in /tmp for the selected suite (`two-json` default, or `extra`). Not included in test_all.
+  tui [suite]    Build and launch the interactive benchmark TUI (`benchman`) for the selected suite (`two-json` default, or `extra`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
   tui man     Open the local benchman manual via nvim man pager (MANPAGER='nvim +Man!').
   code_test   Build (release) and run Rust tests (release). Uses --features vm iff VM artifacts exist and /dev/kvm is accessible.
   init-vm     Download/build VM artifacts needed for VM tests (kernel, initramfs, docker rootfs).
@@ -205,8 +247,8 @@ Commands:
   clean       Clean build artifacts (cargo clean, lake clean, VM images/initramfs). Keeps vmlinux-6.1.58.
 
 Environment variables:
-  INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv.
-  INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv and INFOTHEORY_PLOT_SUMMARY_TSV=....
+  INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv and INFOTHEORY_BENCH_SUITE=extra.
+  INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv, INFOTHEORY_PLOT_SUMMARY_TSV=..., and INFOTHEORY_PLOT_SUITE=extra.
   INFOTHEORY_BASELINE_SUMMARY_TSV / INFOTHEORY_BENCH_RAW_TSV  Also read by benchman for baseline overlays and raw inspector detail.
   SKIP_DOCKER=1   Skip docker rootfs.ext4 build during init-vm.
   BUILD_CLI=1     Also build optional infotheory CLI binary (feature: cli) during code_test.

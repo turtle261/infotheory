@@ -17,6 +17,13 @@ def _rwkv7_cfg_method() -> str:
     )
 
 
+def _mamba_cfg_method() -> str:
+    return (
+        "cfg:hidden=64,layers=1,intermediate=128,state=16,conv=4,dt_rank=16,"
+        "seed=13,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer"
+    )
+
+
 def test_expected_public_surface_symbols_present():
     names = set(n for n in dir(ait) if not n.startswith("_"))
     expected = {
@@ -275,3 +282,36 @@ def test_rwkv7_string_compression_backend_matches_object_backend():
 
     assert string_encoded == object_encoded
     assert len(string_encoded) > 0
+
+
+def test_mamba_rate_backend_parse_construct_metrics_and_roundtrip_parity():
+    method = _mamba_cfg_method()
+    payload = b"mamba parity payload"
+    peer = b"mamba parity peer"
+
+    parsed_backend = ait.rate_backend("mamba", method)
+    object_backend = ait.RateBackend.mamba(method)
+
+    for backend in (parsed_backend, object_backend):
+        assert _is_finite_nonnegative(ait.entropy_rate_backend(payload, 4, backend=backend))
+        assert _is_finite_nonnegative(
+            ait.cross_entropy_rate_backend(payload, peer, 4, backend=backend)
+        )
+
+    framed_from_parsed = ait.CompressionBackend.rate_ac(parsed_backend, "framed")
+    framed_from_object = ait.CompressionBackend.rate_ac(object_backend, "framed")
+    encoded_from_string = ait.compress_bytes_backend(
+        payload,
+        compression_backend=framed_from_parsed,
+    )
+    encoded_from_object = ait.compress_bytes_backend(
+        payload,
+        compression_backend=framed_from_object,
+    )
+
+    assert encoded_from_string == encoded_from_object
+    decoded = ait.decompress_bytes_backend(
+        encoded_from_string,
+        compression_backend=framed_from_object,
+    )
+    assert decoded == payload

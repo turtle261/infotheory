@@ -91,7 +91,7 @@ jobs:
         env:
           CC: clang
           CXX: clang++
-        run: uv run maturin develop --release --features python-extension,backend-rosa,backend-rwkv,backend-zpaq,vm
+        run: uv run maturin develop --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq,vm
 
       - name: Run VM-featured Python smoke tests
         run: uv run pytest -q python/tests/test_vm.py
