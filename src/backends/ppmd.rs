@@ -40,7 +40,9 @@ pub struct PpmdModel {
     queue: VecDeque<(usize, u64)>,
     history: Vec<u8>,
     pdf: [f64; 256],
+    cdf: [f64; 257],
     valid: bool,
+    cdf_valid: bool,
 }
 
 impl PpmdModel {
@@ -54,22 +56,29 @@ impl PpmdModel {
             queue: VecDeque::new(),
             history: Vec::new(),
             pdf: [1.0 / 256.0; 256],
+            cdf: uniform_cdf(),
             valid: false,
+            cdf_valid: false,
         }
     }
 
     pub fn fill_pdf(&mut self, out: &mut [f64; 256]) {
-        self.ensure_pdf();
+        self.ensure_pdf_inner(false);
         out.copy_from_slice(&self.pdf);
     }
 
     pub fn pdf(&mut self) -> &[f64; 256] {
-        self.ensure_pdf();
+        self.ensure_pdf_inner(false);
         &self.pdf
     }
 
+    pub fn cdf(&mut self) -> &[f64; 257] {
+        self.ensure_pdf_inner(true);
+        &self.cdf
+    }
+
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
-        self.ensure_pdf();
+        self.ensure_pdf_inner(false);
         self.pdf[symbol as usize].max(min_prob).ln()
     }
 
@@ -89,23 +98,31 @@ impl PpmdModel {
         self.prune();
         self.history.push(symbol);
         self.valid = false;
+        self.cdf_valid = false;
     }
 
     /// Reset only the conditioning history while preserving fitted contexts.
     pub fn reset_history(&mut self) {
         self.history.clear();
         self.valid = false;
+        self.cdf_valid = false;
         self.pdf.fill(1.0 / 256.0);
+        self.cdf = uniform_cdf();
     }
 
     /// Advance conditioning history without updating fitted context counts.
     pub fn update_history_only(&mut self, symbol: u8) {
         self.history.push(symbol);
         self.valid = false;
+        self.cdf_valid = false;
     }
 
-    fn ensure_pdf(&mut self) {
+    fn ensure_pdf_inner(&mut self, want_cdf: bool) {
         if self.valid {
+            if want_cdf && !self.cdf_valid {
+                build_cdf_from_pdf(&self.pdf, &mut self.cdf);
+                self.cdf_valid = true;
+            }
             return;
         }
         let mut lower = [1.0 / 256.0; 256];
@@ -117,8 +134,12 @@ impl PpmdModel {
             }
         }
         self.pdf.copy_from_slice(&lower);
-        normalize_pdf(&mut self.pdf);
+        normalize_pdf_and_maybe_cdf(
+            &mut self.pdf,
+            if want_cdf { Some(&mut self.cdf) } else { None },
+        );
         self.valid = true;
+        self.cdf_valid = want_cdf;
     }
 
     fn prune(&mut self) {
@@ -156,7 +177,7 @@ fn interpolate_context(ctx: &ContextStats, lower: &[f64; 256]) -> [f64; 256] {
     out
 }
 
-fn normalize_pdf(pdf: &mut [f64; 256]) {
+fn normalize_pdf_and_maybe_cdf(pdf: &mut [f64; 256], mut cdf: Option<&mut [f64; 257]>) {
     let mut sum = 0.0;
     for p in pdf.iter_mut() {
         *p = if p.is_finite() {
@@ -169,11 +190,44 @@ fn normalize_pdf(pdf: &mut [f64; 256]) {
     if !(sum.is_finite()) || sum <= 0.0 {
         let u = 1.0 / 256.0;
         pdf.fill(u);
+        if let Some(cdf) = cdf.as_deref_mut() {
+            *cdf = uniform_cdf();
+        }
         return;
     }
     let inv = 1.0 / sum;
-    for p in pdf.iter_mut() {
-        *p *= inv;
+    if let Some(cdf) = cdf.as_deref_mut() {
+        cdf[0] = 0.0;
+        let mut acc = 0.0;
+        for i in 0..256 {
+            pdf[i] *= inv;
+            acc += pdf[i];
+            cdf[i + 1] = acc;
+        }
+    } else {
+        for p in pdf.iter_mut() {
+            *p *= inv;
+        }
+    }
+}
+
+#[inline]
+fn uniform_cdf() -> [f64; 257] {
+    let mut cdf = [0.0; 257];
+    let inv = 1.0 / 256.0;
+    for (i, slot) in cdf.iter_mut().enumerate() {
+        *slot = (i as f64) * inv;
+    }
+    cdf
+}
+
+#[inline]
+fn build_cdf_from_pdf(pdf: &[f64; 256], cdf: &mut [f64; 257]) {
+    cdf[0] = 0.0;
+    let mut acc = 0.0;
+    for i in 0..256 {
+        acc += pdf[i];
+        cdf[i + 1] = acc;
     }
 }
 

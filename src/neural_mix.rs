@@ -1,37 +1,11 @@
 use crate::backends::text_context::NeuralContextState;
 pub(crate) use crate::backends::text_context::NeuralHistoryState;
 
-#[derive(Clone)]
-struct NeuralStage1Entry {
-    logits: Vec<f64>,
-}
-
-impl NeuralStage1Entry {
-    fn new(width: usize) -> Self {
-        Self {
-            logits: vec![0.0; width],
-        }
-    }
-}
-
-#[derive(Clone)]
-struct NeuralStage2Entry {
-    logits: Vec<f64>,
-}
-
-impl NeuralStage2Entry {
-    fn new(width: usize) -> Self {
-        Self {
-            logits: vec![0.0; width],
-        }
-    }
-}
-
 /// Shared two-stage bytewise neural mixer core used by runtime and compression predictors.
 #[derive(Clone)]
 pub(crate) struct NeuralMixCore {
-    stage1_tables: Vec<Vec<NeuralStage1Entry>>,
-    stage2_table: Vec<NeuralStage2Entry>,
+    stage1_tables: Vec<Vec<f64>>,
+    stage2_table: Vec<[f64; Self::STAGE1_CONTEXTS]>,
     stage1_lr: f64,
     stage2_lr: f64,
     update_skip_threshold: f64,
@@ -62,24 +36,17 @@ impl NeuralMixCore {
         debug_assert_eq!(prior_weights.len(), expert_count);
         let mut stage1_tables = Vec::with_capacity(Self::STAGE1_CONTEXTS);
         for (ctx_idx, table_size) in Self::STAGE1_TABLE_SIZES.iter().enumerate() {
-            let mut table = Vec::with_capacity(*table_size);
-            for _ in 0..*table_size {
-                let mut entry = NeuralStage1Entry::new(expert_count);
-                if ctx_idx == 0 {
-                    for (dst, &p) in entry.logits.iter_mut().zip(prior_weights.iter()) {
-                        let p = if p.is_finite() { p.max(1e-12) } else { 1e-12 };
-                        *dst = p.ln();
-                    }
+            let mut table = vec![0.0; table_size.saturating_mul(expert_count)];
+            if ctx_idx == 0 && expert_count > 0 {
+                for (dst, &p) in table[..expert_count].iter_mut().zip(prior_weights.iter()) {
+                    let p = if p.is_finite() { p.max(1e-12) } else { 1e-12 };
+                    *dst = p.ln();
                 }
-                table.push(entry);
             }
             stage1_tables.push(table);
         }
 
-        let mut stage2_table = Vec::with_capacity(Self::STAGE2_TABLE_SIZE);
-        for _ in 0..Self::STAGE2_TABLE_SIZE {
-            stage2_table.push(NeuralStage2Entry::new(Self::STAGE1_CONTEXTS));
-        }
+        let stage2_table = vec![[0.0; Self::STAGE1_CONTEXTS]; Self::STAGE2_TABLE_SIZE];
 
         Self {
             stage1_tables,
@@ -110,6 +77,12 @@ impl NeuralMixCore {
         self.context = context;
         self.context_mixtures_valid = false;
         self.evaluated = false;
+    }
+
+    #[inline]
+    fn stage1_row_bounds(&self, ctx_idx: usize) -> (usize, usize) {
+        let start = ctx_idx * self.expert_count;
+        (start, start + self.expert_count)
     }
 
     #[inline]
@@ -172,19 +145,19 @@ impl NeuralMixCore {
         ];
         {
             let entry2 = &mut self.stage2_table[stage2_idx];
-            for (k, logit) in entry2.logits.iter_mut().enumerate() {
+            for (k, logit) in entry2.iter_mut().enumerate() {
                 let grad = old_stage2_mix[k] * (self.stage1_probs[k] - p_mix) / p_mix;
                 *logit = sanitize_weight(*logit + self.stage2_lr * grad);
             }
         }
 
         for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-            let entry = &mut self.stage1_tables[k][ctx_i];
+            let (start, end) = self.stage1_row_bounds(ctx_i);
+            let entry = &mut self.stage1_tables[k][start..end];
             let r_k = old_stage2_mix[k];
             let p_k = self.stage1_probs[k];
             let row = &self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];
             for ((logit, &weight), &expert_prob) in entry
-                .logits
                 .iter_mut()
                 .zip(row.iter())
                 .zip(self.expert_probs.iter())
@@ -273,14 +246,15 @@ impl NeuralMixCore {
         self.expert_weights.fill(0.0);
 
         for (k, &ctx_i) in stage1_idx.iter().enumerate() {
-            let entry = &self.stage1_tables[k][ctx_i];
+            let (start, end) = self.stage1_row_bounds(ctx_i);
+            let entry = &self.stage1_tables[k][start..end];
             let row = &mut self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];
-            softmax_into(&entry.logits, row);
+            softmax_into(entry, row);
         }
 
         let stage2_idx = self.stage2_context_index();
         let entry2 = &self.stage2_table[stage2_idx];
-        softmax_into(&entry2.logits, &mut self.stage2_mix);
+        softmax_into(entry2, &mut self.stage2_mix);
 
         for k in 0..Self::STAGE1_CONTEXTS {
             let row = &self.stage1_mix[(k * self.expert_count)..((k + 1) * self.expert_count)];

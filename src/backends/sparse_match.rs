@@ -36,6 +36,10 @@ impl SparseMatchModel {
         self.inner.pdf()
     }
 
+    pub fn cdf(&mut self) -> &[f64; 257] {
+        self.inner.cdf()
+    }
+
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
         self.inner.log_prob(symbol, min_prob)
     }

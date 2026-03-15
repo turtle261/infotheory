@@ -299,7 +299,7 @@ impl CtwPredictor {
     #[inline]
     fn update_bit_msb(&mut self, bit_idx: usize, bit: bool) {
         debug_assert!(self.can_fast_ac_bitwise());
-        self.tree.update(bit, bit_idx);
+        self.tree.update_predicted(bit, bit_idx);
         self.valid = false;
     }
 }
@@ -308,7 +308,9 @@ impl CtwPredictor {
 struct RosaPredictor {
     model: RosaPlus,
     pdf: Vec<f64>,
+    cdf: [f64; 257],
     valid: bool,
+    cdf_valid: bool,
 }
 
 impl RosaPredictor {
@@ -318,25 +320,43 @@ impl RosaPredictor {
         Self {
             model,
             pdf: vec![0.0; 256],
+            cdf: uniform_cdf_row(),
             valid: false,
+            cdf_valid: false,
         }
     }
 
     fn pdf_next(&mut self) -> &[f64] {
-        if !self.valid {
-            self.model.fill_probs_for_last_bytes(&mut self.pdf);
-            for p in &mut self.pdf {
-                *p = (*p).max(PDF_MIN);
-            }
-            normalize_pdf(&mut self.pdf);
-            self.valid = true;
-        }
+        self.ensure_pdf(false);
         &self.pdf
+    }
+
+    fn cdf_next(&mut self) -> &[f64; 257] {
+        self.ensure_pdf(true);
+        &self.cdf
+    }
+
+    fn ensure_pdf(&mut self, want_cdf: bool) {
+        if self.valid {
+            if want_cdf && !self.cdf_valid {
+                build_cdf_row_from_pdf_slice(&self.pdf, &mut self.cdf);
+                self.cdf_valid = true;
+            }
+            return;
+        }
+        self.model.fill_probs_for_last_bytes(&mut self.pdf);
+        normalize_pdf_vec_and_maybe_build_cdf(
+            &mut self.pdf,
+            if want_cdf { Some(&mut self.cdf) } else { None },
+        );
+        self.valid = true;
+        self.cdf_valid = want_cdf;
     }
 
     fn update(&mut self, symbol: u8) {
         self.model.train_byte(symbol);
         self.valid = false;
+        self.cdf_valid = false;
     }
 
     fn begin_stream(&mut self, total_len: usize) {
@@ -639,7 +659,12 @@ impl MixturePredictor {
 
     fn begin_stream(&mut self, total_len: usize) -> Result<()> {
         for expert in &mut self.experts {
-            expert.predictor.begin_stream(total_len)?;
+            match &mut *expert.predictor {
+                // Direct CTW benefits from pre-reserving, but inside mixtures that extra
+                // headroom can dominate peak RSS without a proportional runtime gain.
+                RatePdfPredictor::Ctw(_) | RatePdfPredictor::FacCtw(_) => {}
+                _ => expert.predictor.begin_stream(total_len)?,
+            }
         }
         Ok(())
     }
@@ -819,6 +844,14 @@ impl MixturePredictor {
                 continue;
             }
 
+            if self.experts[i]
+                .predictor
+                .prepare_cached_cdf_fast_bitwise()?
+            {
+                self.neural_bit_modes[i] = 2;
+                continue;
+            }
+
             let pdf = self.experts[i].predictor.pdf_next()?;
             let row = &mut self.neural_pdf_cdf_rows[i];
             if row.len() != 257 {
@@ -828,13 +861,7 @@ impl MixturePredictor {
             for b in 0..256usize {
                 row[b + 1] = row[b] + pdf[b].max(PDF_MIN);
             }
-            let norm = row[256];
-            if norm.is_finite() && norm > 0.0 {
-                let inv = 1.0 / norm;
-                for v in row.iter_mut() {
-                    *v *= inv;
-                }
-            } else {
+            if !row[256].is_finite() || row[256] <= 0.0 {
                 for (j, v) in row.iter_mut().enumerate() {
                     *v = (j as f64) / 256.0;
                 }
@@ -852,6 +879,11 @@ impl MixturePredictor {
                         RatePdfPredictor::Ctw(ctw) => ctw.bit_prob_one_msb(bit_idx),
                         _ => 0.5,
                     }
+                } else if self.neural_bit_modes[i] == 2 {
+                    self.experts[i]
+                        .predictor
+                        .cached_cdf_bit_prob_one_msb(self.neural_lo[i], self.neural_hi[i])
+                        .unwrap_or(0.5)
                 } else {
                     let lo = self.neural_lo[i];
                     let hi = self.neural_hi[i];
@@ -1079,10 +1111,12 @@ impl RatePdfPredictor {
             Self::Match { .. }
             | Self::SparseMatch { .. }
             | Self::Ppmd { .. }
-            | Self::Ctw(_)
-            | Self::FacCtw(_)
             | Self::Zpaq(_)
             | Self::Particle(_) => Ok(()),
+            Self::Ctw(m) | Self::FacCtw(m) => {
+                m.tree.reserve_for_symbols(total_len);
+                Ok(())
+            }
             #[cfg(feature = "backend-mamba")]
             Self::Mamba(m) => m.begin_stream(total_len),
             #[cfg(feature = "backend-rwkv")]
@@ -1198,6 +1232,38 @@ impl RatePdfPredictor {
                 *valid = false;
                 Ok(())
             }
+        }
+    }
+
+    fn prepare_cached_cdf_fast_bitwise(&mut self) -> Result<bool> {
+        match self {
+            Self::Rosa(m) => {
+                let _ = m.cdf_next();
+                Ok(true)
+            }
+            Self::Match { model } => {
+                let _ = model.cdf();
+                Ok(true)
+            }
+            Self::SparseMatch { model } => {
+                let _ = model.cdf();
+                Ok(true)
+            }
+            Self::Ppmd { model } => {
+                let _ = model.cdf();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn cached_cdf_bit_prob_one_msb(&mut self, lo: usize, hi: usize) -> Option<f64> {
+        match self {
+            Self::Rosa(m) => Some(cdf_bit_prob_one_msb(&m.cdf, lo, hi)),
+            Self::Match { model } => Some(cdf_bit_prob_one_msb(model.cdf(), lo, hi)),
+            Self::SparseMatch { model } => Some(cdf_bit_prob_one_msb(model.cdf(), lo, hi)),
+            Self::Ppmd { model } => Some(cdf_bit_prob_one_msb(model.cdf(), lo, hi)),
+            _ => None,
         }
     }
 
@@ -1515,6 +1581,68 @@ fn normalize_pdf(pdf: &mut [f64]) {
     for p in pdf.iter_mut() {
         *p *= inv;
     }
+}
+
+#[inline]
+fn uniform_cdf_row() -> [f64; 257] {
+    let mut cdf = [0.0; 257];
+    let inv = 1.0 / 256.0;
+    for (i, slot) in cdf.iter_mut().enumerate() {
+        *slot = (i as f64) * inv;
+    }
+    cdf
+}
+
+#[inline]
+fn build_cdf_row_from_pdf_slice(pdf: &[f64], cdf: &mut [f64; 257]) {
+    cdf[0] = 0.0;
+    let mut acc = 0.0;
+    for i in 0..256 {
+        acc += pdf[i];
+        cdf[i + 1] = acc;
+    }
+}
+
+fn normalize_pdf_vec_and_maybe_build_cdf(pdf: &mut [f64], mut cdf: Option<&mut [f64; 257]>) {
+    let mut sum = 0.0;
+    for p in pdf.iter_mut() {
+        *p = if p.is_finite() {
+            (*p).max(PDF_MIN)
+        } else {
+            PDF_MIN
+        };
+        sum += *p;
+    }
+    if !(sum.is_finite()) || sum <= 0.0 {
+        let u = 1.0 / (pdf.len() as f64);
+        pdf.fill(u);
+        if let Some(cdf) = cdf.as_deref_mut() {
+            *cdf = uniform_cdf_row();
+        }
+        return;
+    }
+    let inv = 1.0 / sum;
+    if let Some(cdf) = cdf.as_deref_mut() {
+        cdf[0] = 0.0;
+        let mut acc = 0.0;
+        for i in 0..256 {
+            pdf[i] *= inv;
+            acc += pdf[i];
+            cdf[i + 1] = acc;
+        }
+    } else {
+        for p in pdf.iter_mut() {
+            *p *= inv;
+        }
+    }
+}
+
+#[inline]
+fn cdf_bit_prob_one_msb(cdf: &[f64; 257], lo: usize, hi: usize) -> f64 {
+    let mid = (lo + hi) >> 1;
+    let total = (cdf[hi] - cdf[lo]).max(PDF_MIN);
+    let one = (cdf[hi] - cdf[mid]).max(0.0);
+    (one / total).clamp(PDF_MIN, 1.0 - PDF_MIN)
 }
 
 #[inline]
@@ -1945,6 +2073,71 @@ mod tests {
             predictor.update(b).unwrap();
             runtime.step(b);
         }
+    }
+
+    fn assert_cached_cdf_fast_bitwise_matches_pdf_rows(mut predictor: RatePdfPredictor) {
+        let data = b"cached cdf parity check payload";
+        for &symbol in data {
+            let pdf = predictor.pdf_next().unwrap().to_vec();
+            assert!(predictor.prepare_cached_cdf_fast_bitwise().unwrap());
+
+            let mut row = [0.0; 257];
+            row[0] = 0.0;
+            for i in 0..256 {
+                row[i + 1] = row[i] + pdf[i].max(PDF_MIN);
+            }
+
+            let mut stack = vec![(0usize, 256usize)];
+            while let Some((lo, hi)) = stack.pop() {
+                if hi - lo <= 1 {
+                    continue;
+                }
+                let expected = cdf_bit_prob_one_msb(&row, lo, hi);
+                let got = predictor
+                    .cached_cdf_bit_prob_one_msb(lo, hi)
+                    .expect("cached cdf branch probability");
+                let diff = (expected - got).abs();
+                assert!(
+                    diff <= 1e-12,
+                    "lo={lo} hi={hi} expected={expected} got={got} diff={diff}"
+                );
+                let mid = (lo + hi) >> 1;
+                stack.push((lo, mid));
+                stack.push((mid, hi));
+            }
+
+            predictor.update(symbol).unwrap();
+        }
+    }
+
+    #[test]
+    fn cached_cdf_fast_bitwise_matches_pdf_rows_for_specialized_predictors() {
+        assert_cached_cdf_fast_bitwise_matches_pdf_rows(
+            RatePdfPredictor::from_rate_backend(RateBackend::RosaPlus, -1).unwrap(),
+        );
+        assert_cached_cdf_fast_bitwise_matches_pdf_rows(
+            RatePdfPredictor::from_rate_backend(
+                RateBackend::Ppmd {
+                    order: 6,
+                    memory_mb: 8,
+                },
+                -1,
+            )
+            .unwrap(),
+        );
+        assert_cached_cdf_fast_bitwise_matches_pdf_rows(
+            RatePdfPredictor::from_rate_backend(
+                RateBackend::Match {
+                    hash_bits: 20,
+                    min_len: 4,
+                    max_len: 255,
+                    base_mix: 0.02,
+                    confidence_scale: 1.0,
+                },
+                -1,
+            )
+            .unwrap(),
+        );
     }
 
     #[test]

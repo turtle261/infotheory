@@ -41,9 +41,18 @@ impl NodeIndex {
     /// Sentinel value indicating the absence of a node.
     pub const NONE: NodeIndex = NodeIndex(u32::MAX);
 
+    #[cold]
+    #[inline(never)]
+    fn overflow() -> ! {
+        panic!("ctw node index overflow");
+    }
+
     #[inline(always)]
     fn from_usize(idx: usize) -> Self {
-        Self(u32::try_from(idx).expect("ctw node index overflow"))
+        if idx >= u32::MAX as usize {
+            Self::overflow();
+        }
+        Self(idx as u32)
     }
 
     /// Returns `true` when this is [`NodeIndex::NONE`].
@@ -127,6 +136,12 @@ impl CtArena {
             nodes: Vec::with_capacity(cap),
             free_list: Vec::new(),
         }
+    }
+
+    /// Reserve space for at least `additional` more arena nodes.
+    #[inline]
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.nodes.reserve_exact(additional);
     }
 
     /// Allocate a node and return its index.
@@ -554,6 +569,11 @@ struct ContextTreeCore {
     path_symbols: Vec<Symbol>,
     log_int: Vec<f64>,
     log_half: Vec<f64>,
+    prepared_valid: bool,
+    prepared_history_len: usize,
+    prepared_history_version: u64,
+    prepared_path_len: usize,
+    prepared_reached_max_depth: bool,
 }
 
 impl ContextTreeCore {
@@ -573,6 +593,11 @@ impl ContextTreeCore {
             path_symbols: vec![false; depth],
             log_int: vec![f64::NEG_INFINITY],
             log_half: vec![(0.5f64).ln()],
+            prepared_valid: false,
+            prepared_history_len: 0,
+            prepared_history_version: 0,
+            prepared_path_len: 0,
+            prepared_reached_max_depth: false,
         }
     }
 
@@ -581,6 +606,13 @@ impl ContextTreeCore {
         self.root = self.arena.alloc();
         self.path_nodes.fill(NodeIndex::NONE);
         self.path_symbols.fill(false);
+        self.prepared_valid = false;
+        self.prepared_history_version = 0;
+    }
+
+    #[inline]
+    fn reserve_for_symbols(&mut self, total_symbols: usize) {
+        self.arena.reserve_exact(total_symbols);
     }
 
     /// Update tree with symbol, using shared history for context.
@@ -590,7 +622,15 @@ impl ContextTreeCore {
         // own visit counts are needed for KT updates.
         let upto = self.root_visits() + 1;
         ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
-        self.update_path(sym, shared_history);
+        self.update_fresh_path(sym, shared_history);
+    }
+
+    /// Update tree after a prediction on the same shared history.
+    #[inline]
+    fn update_predicted(&mut self, sym: Symbol, shared_history: &[Symbol], history_version: u64) {
+        let upto = self.root_visits() + 1;
+        ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
+        self.update_path(sym, shared_history, history_version);
     }
 
     /// Revert last update, using shared history for context.
@@ -599,13 +639,14 @@ impl ContextTreeCore {
         // Revert uses counts prior to decrement.
         let upto = self.root_visits();
         ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
+        self.prepared_valid = false;
         self.revert_path(last_sym, shared_history);
     }
 
     /// Predict probability of sym using shared history.
     #[inline]
-    fn predict(&mut self, sym: Symbol, shared_history: &[Symbol]) -> f64 {
-        self.predict_path(sym, shared_history)
+    fn predict(&mut self, sym: Symbol, shared_history: &[Symbol], history_version: u64) -> f64 {
+        self.predict_path(sym, shared_history, history_version)
     }
 
     #[inline]
@@ -614,7 +655,40 @@ impl ContextTreeCore {
     }
 
     #[inline]
-    fn update_path(&mut self, sym: Symbol, shared_history: &[Symbol]) {
+    fn update_path(&mut self, sym: Symbol, shared_history: &[Symbol], history_version: u64) {
+        if self.prepared_valid
+            && self.prepared_history_len == shared_history.len()
+            && self.prepared_history_version == history_version
+        {
+            let mut path_len = self.prepared_path_len;
+            if !self.prepared_reached_max_depth {
+                let mut current = self.path_nodes[path_len - 1];
+                for depth in (path_len - 1)..self.max_depth {
+                    let child_sym = history_symbol(shared_history, depth);
+                    self.path_symbols[depth] = child_sym;
+                    let child_idx = self.arena.get(current).children[child_sym as usize];
+                    let next = if child_idx.is_none() {
+                        let new_child = self.arena.alloc();
+                        self.arena.get_mut(current).children[child_sym as usize] = new_child;
+                        new_child
+                    } else {
+                        child_idx
+                    };
+                    current = next;
+                    self.path_nodes[path_len] = current;
+                    path_len += 1;
+                }
+            }
+            self.prepared_valid = false;
+            self.unwind_update(sym, path_len);
+            return;
+        }
+
+        self.update_fresh_path(sym, shared_history);
+    }
+
+    #[inline]
+    fn update_fresh_path(&mut self, sym: Symbol, shared_history: &[Symbol]) {
         let mut current = self.root;
         self.path_nodes[0] = current;
         let mut path_len = 1usize;
@@ -635,11 +709,17 @@ impl ContextTreeCore {
             path_len += 1;
         }
 
+        self.prepared_valid = false;
         self.unwind_update(sym, path_len);
     }
 
     #[inline]
-    fn predict_path(&mut self, sym: Symbol, shared_history: &[Symbol]) -> f64 {
+    fn predict_path(
+        &mut self,
+        sym: Symbol,
+        shared_history: &[Symbol],
+        history_version: u64,
+    ) -> f64 {
         let mut current = self.root;
         self.path_nodes[0] = current;
         let mut path_len = 1usize;
@@ -688,11 +768,17 @@ impl ContextTreeCore {
             ratio =
                 predict_ratio_internal(node, path_child_log_prob, sibling_log_prob, ratio, sym_idx);
         }
+        self.prepared_valid = true;
+        self.prepared_history_len = shared_history.len();
+        self.prepared_history_version = history_version;
+        self.prepared_path_len = path_len;
+        self.prepared_reached_max_depth = reached_max_depth;
         ratio
     }
 
     #[inline(always)]
     fn revert_path(&mut self, sym: Symbol, shared_history: &[Symbol]) {
+        self.prepared_valid = false;
         let mut current = self.root;
         self.path_nodes[0] = current;
         let mut path_len = 1usize;
@@ -812,6 +898,8 @@ pub struct FacContextTree {
     base_depth: usize,
     /// Number of percept bits (k = l_X).
     num_bits: usize,
+    /// Monotonic version for shared-history mutations.
+    shared_history_version: u64,
 }
 
 impl FacContextTree {
@@ -827,6 +915,25 @@ impl FacContextTree {
             shared_history: Vec::new(),
             base_depth,
             num_bits: num_percept_bits,
+            shared_history_version: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn bump_shared_history_version(&mut self) {
+        self.shared_history_version = self.shared_history_version.wrapping_add(1);
+    }
+
+    /// Reserve history and node capacity for an upcoming byte stream.
+    #[inline]
+    pub fn reserve_for_symbols(&mut self, total_symbols: usize) {
+        if total_symbols == 0 {
+            return;
+        }
+        self.shared_history
+            .reserve_exact(total_symbols.saturating_mul(self.num_bits));
+        for tree in &mut self.trees {
+            tree.reserve_for_symbols(total_symbols);
         }
     }
 
@@ -854,13 +961,28 @@ impl FacContextTree {
 
         // Append to shared history
         self.shared_history.push(sym);
+        self.bump_shared_history_version();
+    }
+
+    /// Updates tree `bit_index` with `sym` after a prediction on the same history.
+    #[inline]
+    pub fn update_predicted(&mut self, sym: Symbol, bit_index: usize) {
+        debug_assert!(bit_index < self.num_bits);
+
+        self.trees[bit_index].update_predicted(
+            sym,
+            &self.shared_history,
+            self.shared_history_version,
+        );
+        self.shared_history.push(sym);
+        self.bump_shared_history_version();
     }
 
     /// Predicts the probability of `sym` at `bit_index`.
     #[inline]
     pub fn predict(&mut self, sym: Symbol, bit_index: usize) -> f64 {
         debug_assert!(bit_index < self.num_bits);
-        self.trees[bit_index].predict(sym, &self.shared_history)
+        self.trees[bit_index].predict(sym, &self.shared_history, self.shared_history_version)
     }
 
     /// Reverts the update at `bit_index`.
@@ -875,25 +997,39 @@ impl FacContextTree {
 
         // Revert the tree responsible for this bit
         self.trees[bit_index].revert(last_sym, &self.shared_history);
+        self.bump_shared_history_version();
     }
 
     /// Updates all trees' effective history lengths with action symbols (no KT update).
     #[inline]
     pub fn update_history(&mut self, symbols: &[Symbol]) {
+        if symbols.is_empty() {
+            return;
+        }
         self.shared_history.extend_from_slice(symbols);
+        self.bump_shared_history_version();
     }
 
     /// Reverts history from all trees.
     #[inline]
     pub fn revert_history(&mut self, count: usize) {
+        let old_len = self.shared_history.len();
         let new_len = self.shared_history.len().saturating_sub(count);
+        if new_len == old_len {
+            return;
+        }
         self.shared_history.truncate(new_len);
+        self.bump_shared_history_version();
     }
 
     /// Reset only the shared conditioning history while preserving fitted trees.
     #[inline]
     pub fn reset_history_only(&mut self) {
+        if self.shared_history.is_empty() {
+            return;
+        }
         self.shared_history.clear();
+        self.bump_shared_history_version();
     }
 
     /// Returns the combined log block probability (sum of all trees).
@@ -911,6 +1047,7 @@ impl FacContextTree {
             tree.clear();
         }
         self.shared_history.clear();
+        self.shared_history_version = 0;
     }
 
     /// Returns approximate memory usage in bytes (including shared history).
@@ -929,6 +1066,12 @@ mod tests {
     #[should_panic(expected = "ctw node index overflow")]
     fn node_index_from_usize_rejects_overflow() {
         let _ = NodeIndex::from_usize((u32::MAX as usize) + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ctw node index overflow")]
+    fn node_index_from_usize_rejects_sentinel_alias() {
+        let _ = NodeIndex::from_usize(u32::MAX as usize);
     }
 
     #[test]
@@ -990,6 +1133,110 @@ mod tests {
                 tree.log_half.len()
             );
         }
+    }
+
+    fn seed_fac_cache_regression_state(fac: &mut FacContextTree) {
+        for step in 0..24usize {
+            for bit_idx in 0..fac.num_bits() {
+                let bit = ((step * 3 + bit_idx) & 1) == 1;
+                fac.update(bit, bit_idx);
+            }
+        }
+    }
+
+    fn assert_update_predicted_matches_fresh_after_history_rewrite<F>(mut rewrite: F)
+    where
+        F: FnMut(&mut FacContextTree),
+    {
+        let mut predicted = FacContextTree::new(6, 4);
+        seed_fac_cache_regression_state(&mut predicted);
+        let mut fresh = predicted.clone();
+        let original_history = predicted.shared_history.clone();
+        let target_bit = 2usize;
+
+        let _ = predicted.predict(true, target_bit);
+        rewrite(&mut predicted);
+        rewrite(&mut fresh);
+
+        assert_eq!(predicted.shared_history.len(), original_history.len());
+        assert_ne!(predicted.shared_history, original_history);
+        assert_eq!(predicted.shared_history, fresh.shared_history);
+
+        predicted.update_predicted(false, target_bit);
+        fresh.update(false, target_bit);
+
+        assert_eq!(predicted.shared_history, fresh.shared_history);
+        assert_close(
+            predicted.get_log_block_probability(),
+            fresh.get_log_block_probability(),
+        );
+        for bit_idx in 0..predicted.num_bits() {
+            assert_close(
+                predicted.predict(false, bit_idx),
+                fresh.predict(false, bit_idx),
+            );
+            assert_close(
+                predicted.predict(true, bit_idx),
+                fresh.predict(true, bit_idx),
+            );
+        }
+    }
+
+    #[test]
+    fn fac_ctw_update_predicted_ignores_stale_cache_after_reset_and_rewrite() {
+        assert_update_predicted_matches_fresh_after_history_rewrite(|fac| {
+            let mut rewritten = fac.shared_history.clone();
+            for bit in &mut rewritten {
+                *bit = !*bit;
+            }
+            fac.reset_history_only();
+            fac.update_history(&rewritten);
+        });
+    }
+
+    #[test]
+    fn fac_ctw_update_predicted_ignores_stale_cache_after_revert_and_rewrite() {
+        assert_update_predicted_matches_fresh_after_history_rewrite(|fac| {
+            let original = fac.shared_history.clone();
+            let keep = original.len() / 3;
+            let remove = original.len() - keep;
+            let mut rewritten_suffix = original[keep..].to_vec();
+            for bit in &mut rewritten_suffix {
+                *bit = !*bit;
+            }
+            fac.revert_history(remove);
+            fac.update_history(&rewritten_suffix);
+        });
+    }
+
+    #[test]
+    fn fac_ctw_shared_history_version_tracks_mutations() {
+        let mut fac = FacContextTree::new(4, 2);
+        let mut version = fac.shared_history_version;
+
+        fac.update_history(&[]);
+        assert_eq!(fac.shared_history_version, version);
+
+        fac.update_history(&[true, false]);
+        assert_ne!(fac.shared_history_version, version);
+        version = fac.shared_history_version;
+
+        fac.revert_history(0);
+        assert_eq!(fac.shared_history_version, version);
+
+        fac.revert_history(1);
+        assert_ne!(fac.shared_history_version, version);
+        version = fac.shared_history_version;
+
+        let _ = fac.predict(true, 0);
+        assert_eq!(fac.shared_history_version, version);
+
+        fac.update_predicted(true, 0);
+        assert_ne!(fac.shared_history_version, version);
+        version = fac.shared_history_version;
+
+        fac.reset_history_only();
+        assert_ne!(fac.shared_history_version, version);
     }
 
     #[test]

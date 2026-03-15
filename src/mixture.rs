@@ -117,6 +117,13 @@ pub trait OnlineBytePredictor: Send {
         }
     }
 
+    /// Log-probability (natural log) of `symbol`, then update the predictor.
+    fn log_prob_update(&mut self, symbol: u8) -> f64 {
+        let logp = self.log_prob(symbol);
+        self.update(symbol);
+        logp
+    }
+
     /// Update the predictor with the observed `symbol`.
     fn update(&mut self, symbol: u8);
 
@@ -145,6 +152,51 @@ fn ensure_rwkv_primed(compressor: &mut rwkvzip::Compressor, primed: &mut bool) {
     if !*primed {
         compressor.reset_and_prime();
         *primed = true;
+    }
+}
+
+#[inline]
+fn ctw_log_prob_update_msb(tree: &mut FacContextTree, symbol: u8, min_prob: f64) -> f64 {
+    let mut logp = 0.0;
+    for bit_idx in 0..8 {
+        let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
+        let p = tree.predict(bit, bit_idx);
+        if p.is_finite() && p > 0.0 {
+            logp += p.ln();
+        } else {
+            logp = f64::NEG_INFINITY;
+        }
+        tree.update_predicted(bit, bit_idx);
+    }
+    if logp.is_finite() {
+        logp.max(min_prob.ln())
+    } else {
+        min_prob.ln()
+    }
+}
+
+#[inline]
+fn ctw_log_prob_update_lsb(
+    tree: &mut FacContextTree,
+    symbol: u8,
+    bits_per_symbol: usize,
+    min_prob: f64,
+) -> f64 {
+    let mut logp = 0.0;
+    for bit_idx in 0..bits_per_symbol {
+        let bit = ((symbol >> bit_idx) & 1) == 1;
+        let p = tree.predict(bit, bit_idx);
+        if p.is_finite() && p > 0.0 {
+            logp += p.ln();
+        } else {
+            logp = f64::NEG_INFINITY;
+        }
+        tree.update_predicted(bit, bit_idx);
+    }
+    if logp.is_finite() {
+        logp.max(min_prob.ln())
+    } else {
+        min_prob.ln()
     }
 }
 
@@ -886,6 +938,29 @@ impl OnlineBytePredictor for RateBackendPredictor {
         }
     }
 
+    fn log_prob_update(&mut self, symbol: u8) -> f64 {
+        match self {
+            RateBackendPredictor::Rosa { model, min_prob } => {
+                let p = clamp_prob(model.prob_for_last(symbol as u32), *min_prob);
+                model.train_byte(symbol);
+                p.ln()
+            }
+            RateBackendPredictor::Ctw { tree, min_prob } => {
+                ctw_log_prob_update_msb(tree, symbol, *min_prob)
+            }
+            RateBackendPredictor::FacCtw {
+                tree,
+                bits_per_symbol,
+                min_prob,
+            } => ctw_log_prob_update_lsb(tree, symbol, *bits_per_symbol, *min_prob),
+            _ => {
+                let logp = self.log_prob(symbol);
+                self.update(symbol);
+                logp
+            }
+        }
+    }
+
     fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         self.finish_stream()?;
         match self {
@@ -1240,6 +1315,11 @@ impl ExpertState {
     }
 
     #[inline]
+    fn log_prob_update(&mut self, symbol: u8) -> f64 {
+        self.predictor.log_prob_update(symbol)
+    }
+
+    #[inline]
     fn update(&mut self, symbol: u8) {
         self.predictor.update(symbol);
     }
@@ -1292,18 +1372,21 @@ impl BayesMixture {
             return f64::NEG_INFINITY;
         }
         let log_mix = if self.cache_valid && self.cached_symbol == symbol {
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                expert.cum_log_loss -= self.scratch_logps[i];
+                expert.update(symbol);
+            }
             self.cached_log_mix
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
-                self.scratch_logps[i] = expert.log_prob(symbol);
+                self.scratch_logps[i] = expert.log_prob_update(symbol);
                 self.scratch_mix[i] = expert.log_weight + self.scratch_logps[i];
+                expert.cum_log_loss -= self.scratch_logps[i];
             }
             logsumexp(&self.scratch_mix)
         };
         for (i, expert) in self.experts.iter_mut().enumerate() {
             expert.log_weight = expert.log_weight + self.scratch_logps[i] - log_mix;
-            expert.cum_log_loss -= self.scratch_logps[i];
-            expert.update(symbol);
         }
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
@@ -1456,20 +1539,23 @@ impl FadingBayesMixture {
             return f64::NEG_INFINITY;
         }
         let log_mix = if self.cache_valid && self.cached_symbol == symbol {
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                expert.cum_log_loss -= self.scratch_logps[i];
+                expert.update(symbol);
+            }
             self.cached_log_mix
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
-                self.scratch_logps[i] = expert.log_prob(symbol);
+                self.scratch_logps[i] = expert.log_prob_update(symbol);
                 let decayed = self.decay * expert.log_weight;
                 self.scratch_mix[i] = decayed + self.scratch_logps[i];
+                expert.cum_log_loss -= self.scratch_logps[i];
             }
             logsumexp(&self.scratch_mix)
         };
         for (i, expert) in self.experts.iter_mut().enumerate() {
             let decayed = self.decay * expert.log_weight;
             expert.log_weight = decayed + self.scratch_logps[i] - log_mix;
-            expert.cum_log_loss -= self.scratch_logps[i];
-            expert.update(symbol);
         }
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
@@ -1606,10 +1692,15 @@ impl SwitchingMixture {
             return f64::NEG_INFINITY;
         }
         let log_mix = if self.cache_valid && self.cached_symbol == symbol {
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                expert.cum_log_loss -= self.scratch_logps[i];
+                expert.update(symbol);
+            }
             self.cached_log_mix
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
-                self.scratch_logps[i] = expert.log_prob(symbol);
+                self.scratch_logps[i] = expert.log_prob_update(symbol);
+                expert.cum_log_loss -= self.scratch_logps[i];
             }
             for i in 0..self.experts.len() {
                 let log_switch = logsumexp2(
@@ -1623,8 +1714,6 @@ impl SwitchingMixture {
         for i in 0..self.experts.len() {
             let expert = &mut self.experts[i];
             expert.log_weight = self.scratch_switch[i] - log_mix;
-            expert.cum_log_loss -= self.scratch_logps[i];
-            expert.update(symbol);
         }
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
@@ -1951,9 +2040,8 @@ impl NeuralMixture {
 
         if self.experts.len() == 1 {
             let expert = &mut self.experts[0];
-            let logp = expert.log_prob(symbol);
+            let logp = expert.log_prob_update(symbol);
             expert.cum_log_loss -= logp;
-            expert.update(symbol);
             self.total_log_loss -= logp;
             self.analyzer.update(symbol);
             self.neural.set_context_state(self.analyzer.state());
@@ -1961,16 +2049,42 @@ impl NeuralMixture {
             return logp;
         }
 
-        let logp = self.evaluate_symbol(symbol);
-        let expert_count = self.experts.len();
+        let history = self.sync_history_state();
+        let logp = if self.eval_cache_valid
+            && self.eval_cache_history == history
+            && self.eval_cache_symbol == symbol
+        {
+            let logp = self.eval_cache_logp;
+            for i in 0..self.experts.len() {
+                let expert = &mut self.experts[i];
+                expert.cum_log_loss -= self.scratch_expert_logps[i];
+                expert.update(symbol);
+            }
+            logp
+        } else if self.eval_cache_full_valid && self.eval_cache_history == history {
+            for i in 0..self.experts.len() {
+                self.scratch_expert_logps[i] = self.eval_cache_expert_logps[i][symbol as usize];
+            }
+            let logp = self.eval_cache_mix_logps[symbol as usize];
+            for i in 0..self.experts.len() {
+                let expert = &mut self.experts[i];
+                expert.cum_log_loss -= self.scratch_expert_logps[i];
+                expert.update(symbol);
+            }
+            logp
+        } else {
+            for i in 0..self.experts.len() {
+                let expert = &mut self.experts[i];
+                self.scratch_expert_logps[i] = expert.log_prob_update(symbol);
+                expert.cum_log_loss -= self.scratch_expert_logps[i];
+            }
+            let p = self
+                .neural
+                .evaluate_symbol(&self.scratch_expert_logps, self.min_prob);
+            clamp_unit_prob(p, self.min_prob).ln()
+        };
         self.neural
             .update_weights_symbol(&self.scratch_expert_logps, self.min_prob);
-
-        for i in 0..expert_count {
-            let expert = &mut self.experts[i];
-            expert.cum_log_loss -= self.scratch_expert_logps[i];
-            expert.update(symbol);
-        }
         self.total_log_loss -= logp;
         self.analyzer.update(symbol);
         self.neural.set_context_state(self.analyzer.state());
@@ -2028,7 +2142,8 @@ impl MdlSelector {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        let best_idx = if self.cache_valid && self.cached_symbol == symbol {
+        let used_cache = self.cache_valid && self.cached_symbol == symbol;
+        let best_idx = if used_cache {
             self.scratch_logps[self.cached_best_idx] = self.cached_best_logp;
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 if i == self.cached_best_idx {
@@ -2039,7 +2154,7 @@ impl MdlSelector {
             self.cached_best_idx
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
-                self.scratch_logps[i] = expert.log_prob(symbol);
+                self.scratch_logps[i] = expert.log_prob_update(symbol);
             }
             let mut best_idx = 0usize;
             let mut best_loss = f64::INFINITY;
@@ -2055,7 +2170,9 @@ impl MdlSelector {
         self.cache_valid = false;
         for (i, expert) in self.experts.iter_mut().enumerate() {
             expert.cum_log_loss -= self.scratch_logps[i];
-            expert.update(symbol);
+            if used_cache {
+                expert.update(symbol);
+            }
         }
         self.total_log_loss -= logp;
         self.last_best = best_idx;
@@ -2485,6 +2602,49 @@ mod tests {
         }
 
         fn update(&mut self, _symbol: u8) {}
+    }
+
+    fn assert_log_prob_update_matches_separate(backend: RateBackend) {
+        let mut separate =
+            RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
+        let mut combined = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+        let data = b"combined step check data";
+
+        for &b in data {
+            let logp_separate = separate.log_prob(b);
+            separate.update(b);
+            let logp_combined = combined.log_prob_update(b);
+            let diff = (logp_separate - logp_combined).abs();
+            assert!(
+                diff <= 1e-12,
+                "symbol={b} separate={logp_separate} combined={logp_combined} diff={diff}"
+            );
+
+            let mut sep_row = [0.0; 256];
+            let mut combo_row = [0.0; 256];
+            separate.fill_log_probs(&mut sep_row);
+            combined.fill_log_probs(&mut combo_row);
+            for i in 0..256 {
+                let diff = (sep_row[i] - combo_row[i]).abs();
+                assert!(
+                    diff <= 1e-12,
+                    "row mismatch at {i}: {} vs {}",
+                    sep_row[i],
+                    combo_row[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn predictor_log_prob_update_matches_separate_update_for_specialized_backends() {
+        assert_log_prob_update_matches_separate(RateBackend::RosaPlus);
+        assert_log_prob_update_matches_separate(RateBackend::Ctw { depth: 6 });
+        assert_log_prob_update_matches_separate(RateBackend::FacCtw {
+            base_depth: 6,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+        });
     }
 
     #[test]

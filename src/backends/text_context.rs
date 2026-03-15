@@ -1,5 +1,17 @@
 use ahash::AHashMap;
 
+type RepeatPos = u32;
+const REPEAT_POS_NONE: RepeatPos = u32::MAX;
+type RepeatKey = u32;
+
+#[inline]
+fn repeat_pos_from_usize(pos: usize) -> RepeatPos {
+    if pos >= REPEAT_POS_NONE as usize {
+        panic!("text repeat position overflow");
+    }
+    pos as RepeatPos
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NeuralContextState {
     pub(crate) prev1: u8,
@@ -64,7 +76,7 @@ impl WordTracker {
 #[derive(Clone, Debug, Default)]
 struct LocalRepeatState {
     history: Vec<u8>,
-    table: AHashMap<u64, (usize, usize)>,
+    table: AHashMap<RepeatKey, (RepeatPos, RepeatPos)>,
     predicted: Option<u8>,
     match_len: usize,
     copied_last_byte: bool,
@@ -79,14 +91,19 @@ impl LocalRepeatState {
             return (None, 0);
         }
         let end = self.history.len() - 1;
-        let Some(key) = hash_suffix(&self.history, Self::MIN_LEN, 1) else {
+        let Some(key) = repeat_key(&self.history) else {
             return (None, 0);
         };
         let Some(&(latest, previous)) = self.table.get(&key) else {
             return (None, 0);
         };
-        let candidate_end = if latest == end { previous } else { latest };
-        if candidate_end == usize::MAX || candidate_end + 1 >= self.history.len() {
+        let end_pos = repeat_pos_from_usize(end);
+        let candidate_end = if latest == end_pos { previous } else { latest };
+        if candidate_end == REPEAT_POS_NONE {
+            return (None, 0);
+        }
+        let candidate_end = candidate_end as usize;
+        if candidate_end + 1 >= self.history.len() {
             return (None, 0);
         }
         let mut matched = Self::MIN_LEN;
@@ -107,15 +124,15 @@ impl LocalRepeatState {
     fn update(&mut self, symbol: u8) {
         self.copied_last_byte = self.predicted == Some(symbol);
         self.history.push(symbol);
-        if let Some(key) = hash_suffix(&self.history, Self::MIN_LEN, 1) {
-            let end = self.history.len() - 1;
+        if let Some(key) = repeat_key(&self.history) {
+            let end = repeat_pos_from_usize(self.history.len() - 1);
             self.table
                 .entry(key)
                 .and_modify(|entry| {
                     entry.1 = entry.0;
                     entry.0 = end;
                 })
-                .or_insert((end, usize::MAX));
+                .or_insert((end, REPEAT_POS_NONE));
         }
         let (predicted, match_len) = self.predict_from_history();
         self.predicted = predicted;
@@ -294,20 +311,16 @@ fn utf8_left_after(symbol: u8, prev_left: u8) -> u8 {
     }
 }
 
-fn hash_suffix(history: &[u8], len: usize, stride: usize) -> Option<u64> {
-    let need = len.checked_sub(1)?.saturating_mul(stride).saturating_add(1);
-    if history.len() < need {
+#[inline]
+fn repeat_key(history: &[u8]) -> Option<RepeatKey> {
+    if history.len() < LocalRepeatState::MIN_LEN {
         return None;
     }
-    let mut h = 0x9E37_79B9_7F4A_7C15u64;
-    let mut idx = history.len() - 1;
-    for _ in 0..len {
-        h ^= history[idx] as u64;
-        h = h.rotate_left(9).wrapping_mul(0x1000_0000_01B3);
-        if idx < stride {
-            break;
-        }
-        idx -= stride;
-    }
-    Some(h)
+    let n = history.len();
+    Some(u32::from_be_bytes([
+        history[n - 4],
+        history[n - 3],
+        history[n - 2],
+        history[n - 1],
+    ]))
 }

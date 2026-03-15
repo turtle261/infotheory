@@ -265,13 +265,13 @@ impl Sam {
             return;
         }
         self.st
-            .reserve(additional.saturating_mul(2).saturating_add(16));
+            .reserve_exact(additional.saturating_mul(2).saturating_add(16));
         self.ed
-            .reserve(additional.saturating_mul(3).saturating_add(16));
+            .reserve_exact(additional.saturating_mul(3).saturating_add(16));
         let text_extra = additional.saturating_add(16);
-        self.text.reserve(text_extra);
-        self.text_states.reserve(text_extra);
-        self.boundary_after.reserve(text_extra);
+        self.text.reserve_exact(text_extra);
+        self.text_states.reserve_exact(text_extra);
+        self.boundary_after.reserve_exact(text_extra);
     }
 
     #[inline(always)]
@@ -935,9 +935,9 @@ impl LM {
             return;
         }
         self.ls
-            .reserve(additional.saturating_mul(2).saturating_add(16));
+            .reserve_exact(additional.saturating_mul(2).saturating_add(16));
         self.nodes
-            .reserve(additional.saturating_mul(3).saturating_add(16));
+            .reserve_exact(additional.saturating_mul(3).saturating_add(16));
     }
 
     fn build_counts(&mut self, sam: &Sam, max_order: i64) {
@@ -1043,8 +1043,9 @@ impl LM {
         let mut u = self.capped_start_state(sam, max_order, v);
 
         while u != SAM_STATE_NONE {
-            let n = self.ls[state_usize(u)].total_n;
-            let t = self.ls[state_usize(u)].types_t;
+            let ls = &self.ls[state_usize(u)];
+            let n = ls.total_n;
+            let t = ls.types_t;
             if n > 0 {
                 let lam = if t > 0 {
                     (n as f64) / ((n + (t as u64)) as f64)
@@ -1057,14 +1058,18 @@ impl LM {
 
                 // Probability of specifically sym_idx in this state
                 let mut count_for_sym = 0u64;
-                let mut ni = self.ls[state_usize(u)].head;
-                while ni != LM_NODE_NONE {
-                    let node = self.nodes[node_usize(ni)];
-                    if node.sym_idx == sym_idx {
-                        count_for_sym = node.cnt;
-                        break;
+                if ls.last_node != LM_NODE_NONE && ls.last_sym == sym_idx {
+                    count_for_sym = self.nodes[node_usize(ls.last_node)].cnt;
+                } else {
+                    let mut ni = ls.head;
+                    while ni != LM_NODE_NONE {
+                        let node = self.nodes[node_usize(ni)];
+                        if node.sym_idx == sym_idx {
+                            count_for_sym = node.cnt;
+                            break;
+                        }
+                        ni = node.next;
                     }
-                    ni = node.next;
                 }
 
                 if count_for_sym > 0 {
@@ -1086,13 +1091,14 @@ impl LM {
         p_accum.clamp(1e-12, 1.0)
     }
 
-    fn probs_for_state(&self, sam: &Sam, max_order: i64, v: SamStateIx, out: &mut [f64]) {
+    fn probs_for_state_raw(&self, sam: &Sam, max_order: i64, v: SamStateIx, out: &mut [f64]) {
         out.fill(0.0);
         let mut residual = 1.0f64;
         let mut u = self.capped_start_state(sam, max_order, v);
         while u != SAM_STATE_NONE {
-            let n = self.ls[state_usize(u)].total_n;
-            let t = self.ls[state_usize(u)].types_t;
+            let ls = &self.ls[state_usize(u)];
+            let n = ls.total_n;
+            let t = ls.types_t;
             if n > 0 {
                 let lam = if t > 0 {
                     (n as f64) / ((n + (t as u64)) as f64)
@@ -1101,7 +1107,7 @@ impl LM {
                 };
                 let scale = residual * lam;
                 let inv_n = 1.0 / (n as f64);
-                let mut ni = self.ls[state_usize(u)].head;
+                let mut ni = ls.head;
                 while ni != LM_NODE_NONE {
                     let node = self.nodes[node_usize(ni)];
                     out[node.sym_idx as usize] += scale * ((node.cnt as f64) * inv_n);
@@ -1118,12 +1124,18 @@ impl LM {
                 out[i] += residual * ((self.unigram[i] as f64) * inv);
             }
         }
+    }
 
+    fn probs_for_state(&self, sam: &Sam, max_order: i64, v: SamStateIx, out: &mut [f64]) {
+        self.probs_for_state_raw(sam, max_order, v, out);
         let mut s = 0.0;
         for i in 0..(self.alpha_n as usize) {
             s += out[i];
         }
-        if s > 0.0 {
+        if s > 0.0 && s.is_finite() {
+            if (s - 1.0).abs() <= 1e-12 {
+                return;
+            }
             let invs = 1.0 / s;
             for i in 0..(self.alpha_n as usize) {
                 out[i] *= invs;
@@ -2586,7 +2598,8 @@ impl RosaPlus {
             self.max_order
         };
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
-        self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
+        self.lm
+            .probs_for_state_raw(&self.sam, mo, v, &mut self.dist);
 
         if self.lm.has_byte_map
             && (self.lm.alpha_n as usize) == BYTE_ALPHA_N
@@ -2597,17 +2610,21 @@ impl RosaPlus {
         }
 
         out[..BYTE_ALPHA_N].fill(0.0);
+        let mut sum = 0.0;
         for (i, &cp) in self.lm.alphabet.iter().enumerate() {
             if cp < BYTE_ALPHA_N as u32 {
-                out[cp as usize] = self.dist[i];
+                let p = self.dist[i];
+                out[cp as usize] = p;
+                sum += p;
             }
         }
 
-        let sum: f64 = out[..BYTE_ALPHA_N].iter().sum();
         if sum.is_finite() && sum > 0.0 {
-            let inv = 1.0 / sum;
-            for p in &mut out[..BYTE_ALPHA_N] {
-                *p *= inv;
+            if (sum - 1.0).abs() > 1e-12 {
+                let inv = 1.0 / sum;
+                for p in &mut out[..BYTE_ALPHA_N] {
+                    *p *= inv;
+                }
             }
         } else {
             let u = 1.0 / BYTE_ALPHA_N as f64;

@@ -1534,6 +1534,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             }
             // Byte-wise CTW: factorize by bit position so deterministic bits don't leak entropy.
             let mut fac = crate::ctw::FacContextTree::new(*depth, 8);
+            fac.reserve_for_symbols(data.len());
             for &b in data {
                 for bit_idx in 0..8 {
                     let bit = ((b >> (7 - bit_idx)) & 1) == 1;
@@ -1554,6 +1555,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             }
             let bits_per_byte = (*encoding_bits).clamp(1, 8);
             let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
+            fac.reserve_for_symbols(data.len());
             for &b in data {
                 for i in 0..bits_per_byte {
                     let bit_idx = i;

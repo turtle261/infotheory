@@ -12,7 +12,9 @@ pub struct MatchModel {
     history: Vec<u8>,
     tables: Vec<AHashMap<u64, (usize, usize)>>,
     pdf: [f64; 256],
+    cdf: [f64; 257],
     valid: bool,
+    cdf_valid: bool,
     predicted: Option<u8>,
     match_len: usize,
 }
@@ -44,7 +46,9 @@ impl MatchModel {
             history: Vec::new(),
             tables,
             pdf: [1.0 / 256.0; 256],
+            cdf: uniform_cdf(),
             valid: false,
+            cdf_valid: false,
             predicted: None,
             match_len: 0,
         }
@@ -69,17 +73,22 @@ impl MatchModel {
     }
 
     pub fn fill_pdf(&mut self, out: &mut [f64; 256]) {
-        self.ensure_pdf();
+        self.ensure_pdf_inner(false);
         out.copy_from_slice(&self.pdf);
     }
 
     pub fn pdf(&mut self) -> &[f64; 256] {
-        self.ensure_pdf();
+        self.ensure_pdf_inner(false);
         &self.pdf
     }
 
+    pub fn cdf(&mut self) -> &[f64; 257] {
+        self.ensure_pdf_inner(true);
+        &self.cdf
+    }
+
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
-        self.ensure_pdf();
+        self.ensure_pdf_inner(false);
         self.pdf[symbol as usize].max(min_prob).ln()
     }
 
@@ -98,35 +107,43 @@ impl MatchModel {
             }
         }
         self.valid = false;
+        self.cdf_valid = false;
     }
 
     /// Reset only the conditioning history while preserving learned match tables.
     pub fn reset_history(&mut self) {
         self.history.clear();
         self.valid = false;
+        self.cdf_valid = false;
         self.predicted = None;
         self.match_len = 0;
         self.pdf.fill(1.0 / 256.0);
+        self.cdf = uniform_cdf();
     }
 
     /// Advance conditioning history without updating learned match tables.
     pub fn update_history_only(&mut self, symbol: u8) {
         self.history.push(symbol);
         self.valid = false;
+        self.cdf_valid = false;
     }
 
     pub fn match_len(&mut self) -> usize {
-        self.ensure_pdf();
+        self.ensure_pdf_inner(false);
         self.match_len
     }
 
     pub fn predicted_byte(&mut self) -> Option<u8> {
-        self.ensure_pdf();
+        self.ensure_pdf_inner(false);
         self.predicted
     }
 
-    fn ensure_pdf(&mut self) {
+    fn ensure_pdf_inner(&mut self, want_cdf: bool) {
         if self.valid {
+            if want_cdf && !self.cdf_valid {
+                build_cdf_from_pdf(&self.pdf, &mut self.cdf);
+                self.cdf_valid = true;
+            }
             return;
         }
         self.predicted = None;
@@ -134,6 +151,12 @@ impl MatchModel {
         self.pdf.fill(1.0 / 256.0);
         if self.history.len() < self.min_len {
             self.valid = true;
+            if want_cdf {
+                self.cdf = uniform_cdf();
+                self.cdf_valid = true;
+            } else {
+                self.cdf_valid = false;
+            }
             return;
         }
 
@@ -178,7 +201,11 @@ impl MatchModel {
             self.pdf.fill(rest);
             self.pdf[predicted as usize] = p_copy;
         }
+        if want_cdf {
+            build_cdf_from_pdf(&self.pdf, &mut self.cdf);
+        }
         self.valid = true;
+        self.cdf_valid = want_cdf;
     }
 
     fn suffix_key(&self, stride: usize) -> Option<u64> {
@@ -216,5 +243,23 @@ impl MatchModel {
             matched += 1;
         }
         matched
+    }
+}
+
+#[inline]
+fn uniform_cdf() -> [f64; 257] {
+    let mut cdf = [0.0; 257];
+    let inv = 1.0 / 256.0;
+    for (i, slot) in cdf.iter_mut().enumerate() {
+        *slot = (i as f64) * inv;
+    }
+    cdf
+}
+
+#[inline]
+fn build_cdf_from_pdf(pdf: &[f64; 256], cdf: &mut [f64; 257]) {
+    cdf[0] = 0.0;
+    for i in 0..256 {
+        cdf[i + 1] = cdf[i] + pdf[i];
     }
 }
