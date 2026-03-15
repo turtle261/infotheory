@@ -285,6 +285,90 @@ impl LayerTrainTrace {
     }
 }
 
+#[derive(Clone)]
+struct TokenTrainTrace {
+    token: usize,
+    norm: Tensor1D,
+    h_final: Tensor1D,
+    layers: Vec<LayerTrainTrace>,
+}
+
+impl TokenTrainTrace {
+    fn from_scratch(scratch: &ScratchBuffers) -> Self {
+        Self {
+            token: scratch.train_token,
+            norm: scratch.norm.clone(),
+            h_final: scratch.train_h_final.clone(),
+            layers: scratch.train_trace_layers.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LayerGradState {
+    norm_w: Tensor1D,
+    norm_b: Option<Tensor1D>,
+    in_proj_w: Tensor1D,
+    in_proj_b: Option<Tensor1D>,
+    conv_w: Tensor1D,
+    conv_b: Option<Tensor1D>,
+    x_proj_w: Tensor1D,
+    x_proj_b: Option<Tensor1D>,
+    dt_proj_w: Tensor1D,
+    dt_proj_b: Tensor1D,
+    a: Tensor1D,
+    d: Tensor1D,
+    out_proj_w: Tensor1D,
+    out_proj_b: Option<Tensor1D>,
+}
+
+#[derive(Clone)]
+struct FullGradState {
+    embeddings: Tensor1D,
+    final_norm_w: Tensor1D,
+    final_norm_b: Option<Tensor1D>,
+    lm_head: Tensor1D,
+    lm_head_b: Option<Tensor1D>,
+    layers: Vec<LayerGradState>,
+}
+
+#[derive(Clone)]
+struct LayerRecurrentGradState {
+    ssm_next: Tensor1D,
+    conv_next: Tensor1D,
+}
+
+impl LayerRecurrentGradState {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            ssm_next: Tensor1D::zeros(cfg.inner_size * cfg.state_size),
+            conv_next: Tensor1D::zeros(cfg.inner_size * cfg.conv_kernel),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RecurrentGradState {
+    layers: Vec<LayerRecurrentGradState>,
+}
+
+impl RecurrentGradState {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            layers: (0..cfg.num_layers)
+                .map(|_| LayerRecurrentGradState::new(cfg))
+                .collect(),
+        }
+    }
+
+    fn zero(&mut self) {
+        for layer in &mut self.layers {
+            layer.ssm_next.zero();
+            layer.conv_next.zero();
+        }
+    }
+}
+
 /// Mamba model weights and inference kernels.
 #[derive(Clone)]
 pub struct Model {
@@ -383,6 +467,12 @@ impl ScratchBuffers {
     #[inline]
     pub fn lm_head_input(&self) -> &[f32] {
         self.norm.as_slice()
+    }
+
+    /// Output logits from the latest forward pass.
+    #[inline]
+    pub fn logits(&self) -> &[f32] {
+        self.logits.as_slice()
     }
 
     /// Restore LM-head input snapshot for reversible online updates.
@@ -899,6 +989,836 @@ impl Model {
     #[inline]
     pub fn lm_head_weights_mut(&mut self) -> &mut [f32] {
         self.lm_head.as_mut_slice()
+    }
+
+    fn new_full_grad_state(&self) -> FullGradState {
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            layers.push(LayerGradState {
+                norm_w: Tensor1D::zeros(layer.norm_w.len()),
+                norm_b: layer.norm_b.as_ref().map(|b| Tensor1D::zeros(b.len())),
+                in_proj_w: Tensor1D::zeros(layer.in_proj_w.len()),
+                in_proj_b: layer.in_proj_b.as_ref().map(|b| Tensor1D::zeros(b.len())),
+                conv_w: Tensor1D::zeros(layer.conv_w.len()),
+                conv_b: layer.conv_b.as_ref().map(|b| Tensor1D::zeros(b.len())),
+                x_proj_w: Tensor1D::zeros(layer.x_proj_w.len()),
+                x_proj_b: layer.x_proj_b.as_ref().map(|b| Tensor1D::zeros(b.len())),
+                dt_proj_w: Tensor1D::zeros(layer.dt_proj_w.len()),
+                dt_proj_b: Tensor1D::zeros(layer.dt_proj_b.len()),
+                a: Tensor1D::zeros(layer.a.len()),
+                d: Tensor1D::zeros(layer.d.len()),
+                out_proj_w: Tensor1D::zeros(layer.out_proj_w.len()),
+                out_proj_b: layer.out_proj_b.as_ref().map(|b| Tensor1D::zeros(b.len())),
+            });
+        }
+        FullGradState {
+            embeddings: Tensor1D::zeros(self.embeddings.len()),
+            final_norm_w: Tensor1D::zeros(self.final_norm_w.len()),
+            final_norm_b: self.final_norm_b.as_ref().map(|b| Tensor1D::zeros(b.len())),
+            lm_head: Tensor1D::zeros(self.lm_head.len()),
+            lm_head_b: self.lm_head_b.as_ref().map(|b| Tensor1D::zeros(b.len())),
+            layers,
+        }
+    }
+
+    fn new_recurrent_grad_state(&self) -> RecurrentGradState {
+        RecurrentGradState::new(&self.cfg)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_full_gradients(
+        &mut self,
+        grads: &FullGradState,
+        scope: TrainScopeMask,
+        optimizer: OptimizerKind,
+        lr: f32,
+        clip: f32,
+        adam_t: &mut usize,
+        model_adam: Option<&mut FullAdamState>,
+        out_bias: Option<&mut [f32]>,
+        out_bias_grad: Option<&[f32]>,
+        out_bias_adam_m: Option<&mut [f32]>,
+        out_bias_adam_v: Option<&mut [f32]>,
+    ) -> Result<()> {
+        let mut adam_step = None::<AdamStep>;
+        let mut model_adam = model_adam;
+        if matches!(optimizer, OptimizerKind::Adam) {
+            *adam_t = adam_t.saturating_add(1);
+            let t = (*adam_t).max(1) as i32;
+            let b1 = 0.9f32;
+            let b2 = 0.999f32;
+            adam_step = Some(AdamStep {
+                lr,
+                clip: clip.max(0.0),
+                b1,
+                b2,
+                eps: 1e-8,
+                bias_corr1: 1.0 - b1.powi(t),
+                bias_corr2: 1.0 - b2.powi(t),
+            });
+            if scope.trains_model_params() && model_adam.is_none() {
+                bail!("mamba Adam full-training state is missing");
+            }
+        }
+
+        if scope.bias
+            && let (Some(bias), Some(grad)) = (out_bias, out_bias_grad)
+        {
+            match optimizer {
+                OptimizerKind::Sgd => sgd_vec_update(bias, grad, lr, clip),
+                OptimizerKind::Adam => {
+                    let cfg = adam_step.as_ref().expect("adam cfg initialized");
+                    let Some(m) = out_bias_adam_m else {
+                        bail!("mamba Adam output-bias moments are missing");
+                    };
+                    let Some(v) = out_bias_adam_v else {
+                        bail!("mamba Adam output-bias moments are missing");
+                    };
+                    apply_adam_vec_update_raw(bias, grad, m, v, cfg);
+                }
+            }
+        }
+
+        if scope.head {
+            match optimizer {
+                OptimizerKind::Sgd => {
+                    sgd_vec_update(
+                        self.lm_head.as_mut_slice(),
+                        grads.lm_head.as_slice(),
+                        lr,
+                        clip,
+                    );
+                    if let (Some(b), Some(gb)) = (self.lm_head_b.as_mut(), grads.lm_head_b.as_ref())
+                    {
+                        sgd_vec_update(b.as_mut_slice(), gb.as_slice(), lr, clip);
+                    }
+                }
+                OptimizerKind::Adam => {
+                    let cfg = adam_step.as_ref().expect("adam cfg initialized");
+                    let adam = model_adam.as_mut().expect("adam state exists");
+                    apply_adam_vec_update(
+                        self.lm_head.as_mut_slice(),
+                        grads.lm_head.as_slice(),
+                        &mut adam.lm_head,
+                        cfg,
+                    );
+                    if let (Some(b), Some(gb), Some(ab)) = (
+                        self.lm_head_b.as_mut(),
+                        grads.lm_head_b.as_ref(),
+                        adam.lm_head_b.as_mut(),
+                    ) {
+                        apply_adam_vec_update(b.as_mut_slice(), gb.as_slice(), ab, cfg);
+                    }
+                }
+            }
+        }
+
+        if scope.layer_norm {
+            match optimizer {
+                OptimizerKind::Sgd => {
+                    sgd_vec_update(
+                        self.final_norm_w.as_mut_slice(),
+                        grads.final_norm_w.as_slice(),
+                        lr,
+                        clip,
+                    );
+                    if let (Some(b), Some(gb)) =
+                        (self.final_norm_b.as_mut(), grads.final_norm_b.as_ref())
+                    {
+                        sgd_vec_update(b.as_mut_slice(), gb.as_slice(), lr, clip);
+                    }
+                }
+                OptimizerKind::Adam => {
+                    let cfg = adam_step.as_ref().expect("adam cfg initialized");
+                    let adam = model_adam.as_mut().expect("adam state exists");
+                    apply_adam_vec_update(
+                        self.final_norm_w.as_mut_slice(),
+                        grads.final_norm_w.as_slice(),
+                        &mut adam.final_norm_w,
+                        cfg,
+                    );
+                    if let (Some(b), Some(gb), Some(ab)) = (
+                        self.final_norm_b.as_mut(),
+                        grads.final_norm_b.as_ref(),
+                        adam.final_norm_b.as_mut(),
+                    ) {
+                        apply_adam_vec_update(b.as_mut_slice(), gb.as_slice(), ab, cfg);
+                    }
+                }
+            }
+        }
+
+        for layer_idx in 0..self.cfg.num_layers {
+            let layer = &mut self.layers[layer_idx];
+            let grad = &grads.layers[layer_idx];
+            match optimizer {
+                OptimizerKind::Sgd => {
+                    if scope.layer_norm {
+                        sgd_vec_update(
+                            layer.norm_w.as_mut_slice(),
+                            grad.norm_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        if let (Some(b), Some(gb)) = (layer.norm_b.as_mut(), grad.norm_b.as_ref()) {
+                            sgd_vec_update(b.as_mut_slice(), gb.as_slice(), lr, clip);
+                        }
+                    }
+                    if scope.mixer_proj {
+                        sgd_vec_update(
+                            layer.in_proj_w.as_mut_slice(),
+                            grad.in_proj_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        if let (Some(b), Some(gb)) =
+                            (layer.in_proj_b.as_mut(), grad.in_proj_b.as_ref())
+                        {
+                            sgd_vec_update(b.as_mut_slice(), gb.as_slice(), lr, clip);
+                        }
+                        sgd_vec_update(
+                            layer.x_proj_w.as_mut_slice(),
+                            grad.x_proj_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        if let (Some(b), Some(gb)) =
+                            (layer.x_proj_b.as_mut(), grad.x_proj_b.as_ref())
+                        {
+                            sgd_vec_update(b.as_mut_slice(), gb.as_slice(), lr, clip);
+                        }
+                        sgd_vec_update(
+                            layer.dt_proj_w.as_mut_slice(),
+                            grad.dt_proj_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            layer.dt_proj_b.as_mut_slice(),
+                            grad.dt_proj_b.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        sgd_vec_update(
+                            layer.out_proj_w.as_mut_slice(),
+                            grad.out_proj_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        if let (Some(b), Some(gb)) =
+                            (layer.out_proj_b.as_mut(), grad.out_proj_b.as_ref())
+                        {
+                            sgd_vec_update(b.as_mut_slice(), gb.as_slice(), lr, clip);
+                        }
+                    }
+                    if scope.mixer_conv {
+                        sgd_vec_update(
+                            layer.conv_w.as_mut_slice(),
+                            grad.conv_w.as_slice(),
+                            lr,
+                            clip,
+                        );
+                        if let (Some(b), Some(gb)) = (layer.conv_b.as_mut(), grad.conv_b.as_ref()) {
+                            sgd_vec_update(b.as_mut_slice(), gb.as_slice(), lr, clip);
+                        }
+                    }
+                    if scope.mixer_ssm {
+                        sgd_vec_update(layer.d.as_mut_slice(), grad.d.as_slice(), lr, clip);
+                        for idx in 0..layer.a_log.len().min(grad.a.len()) {
+                            let mut g = grad.a[idx] * layer.a[idx];
+                            if clip > 0.0 {
+                                g = g.clamp(-clip, clip);
+                            }
+                            let new_log = layer.a_log[idx] + lr * g;
+                            layer.a_log[idx] = new_log;
+                            layer.a[idx] = -new_log.exp();
+                        }
+                    }
+                }
+                OptimizerKind::Adam => {
+                    let cfg = adam_step.as_ref().expect("adam cfg initialized");
+                    let adam =
+                        &mut model_adam.as_mut().expect("adam state exists").layers[layer_idx];
+                    if scope.layer_norm {
+                        apply_adam_vec_update(
+                            layer.norm_w.as_mut_slice(),
+                            grad.norm_w.as_slice(),
+                            &mut adam.norm_w,
+                            cfg,
+                        );
+                        if let (Some(b), Some(gb), Some(ab)) = (
+                            layer.norm_b.as_mut(),
+                            grad.norm_b.as_ref(),
+                            adam.norm_b.as_mut(),
+                        ) {
+                            apply_adam_vec_update(b.as_mut_slice(), gb.as_slice(), ab, cfg);
+                        }
+                    }
+                    if scope.mixer_proj {
+                        apply_adam_vec_update(
+                            layer.in_proj_w.as_mut_slice(),
+                            grad.in_proj_w.as_slice(),
+                            &mut adam.in_proj_w,
+                            cfg,
+                        );
+                        if let (Some(b), Some(gb), Some(ab)) = (
+                            layer.in_proj_b.as_mut(),
+                            grad.in_proj_b.as_ref(),
+                            adam.in_proj_b.as_mut(),
+                        ) {
+                            apply_adam_vec_update(b.as_mut_slice(), gb.as_slice(), ab, cfg);
+                        }
+                        apply_adam_vec_update(
+                            layer.x_proj_w.as_mut_slice(),
+                            grad.x_proj_w.as_slice(),
+                            &mut adam.x_proj_w,
+                            cfg,
+                        );
+                        if let (Some(b), Some(gb), Some(ab)) = (
+                            layer.x_proj_b.as_mut(),
+                            grad.x_proj_b.as_ref(),
+                            adam.x_proj_b.as_mut(),
+                        ) {
+                            apply_adam_vec_update(b.as_mut_slice(), gb.as_slice(), ab, cfg);
+                        }
+                        apply_adam_vec_update(
+                            layer.dt_proj_w.as_mut_slice(),
+                            grad.dt_proj_w.as_slice(),
+                            &mut adam.dt_proj_w,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            layer.dt_proj_b.as_mut_slice(),
+                            grad.dt_proj_b.as_slice(),
+                            &mut adam.dt_proj_b,
+                            cfg,
+                        );
+                        apply_adam_vec_update(
+                            layer.out_proj_w.as_mut_slice(),
+                            grad.out_proj_w.as_slice(),
+                            &mut adam.out_proj_w,
+                            cfg,
+                        );
+                        if let (Some(b), Some(gb), Some(ab)) = (
+                            layer.out_proj_b.as_mut(),
+                            grad.out_proj_b.as_ref(),
+                            adam.out_proj_b.as_mut(),
+                        ) {
+                            apply_adam_vec_update(b.as_mut_slice(), gb.as_slice(), ab, cfg);
+                        }
+                    }
+                    if scope.mixer_conv {
+                        apply_adam_vec_update(
+                            layer.conv_w.as_mut_slice(),
+                            grad.conv_w.as_slice(),
+                            &mut adam.conv_w,
+                            cfg,
+                        );
+                        if let (Some(b), Some(gb), Some(ab)) = (
+                            layer.conv_b.as_mut(),
+                            grad.conv_b.as_ref(),
+                            adam.conv_b.as_mut(),
+                        ) {
+                            apply_adam_vec_update(b.as_mut_slice(), gb.as_slice(), ab, cfg);
+                        }
+                    }
+                    if scope.mixer_ssm {
+                        apply_adam_vec_update(
+                            layer.d.as_mut_slice(),
+                            grad.d.as_slice(),
+                            &mut adam.d,
+                            cfg,
+                        );
+                        let mut grad_log = vec![0.0f32; grad.a.len().min(layer.a.len())];
+                        for idx in 0..grad_log.len() {
+                            grad_log[idx] = grad.a[idx] * layer.a[idx];
+                        }
+                        apply_adam_vec_update_and_sync_neg_exp(
+                            layer.a_log.as_mut_slice(),
+                            layer.a.as_mut_slice(),
+                            &grad_log,
+                            &mut adam.a,
+                            cfg,
+                        );
+                    }
+                }
+            }
+        }
+
+        if scope.embed {
+            match optimizer {
+                OptimizerKind::Sgd => {
+                    sgd_vec_update(
+                        self.embeddings.as_mut_slice(),
+                        grads.embeddings.as_slice(),
+                        lr,
+                        clip,
+                    );
+                }
+                OptimizerKind::Adam => {
+                    let cfg = adam_step.as_ref().expect("adam cfg initialized");
+                    let adam = model_adam.as_mut().expect("adam state exists");
+                    apply_adam_vec_update(
+                        self.embeddings.as_mut_slice(),
+                        grads.embeddings.as_slice(),
+                        &mut adam.embeddings,
+                        cfg,
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn accumulate_token_step_gradients(
+        &self,
+        scratch: &mut ScratchBuffers,
+        trace: &TokenTrainTrace,
+        state_new: &State,
+        symbol: u8,
+        pdf: &[f64],
+        grad_scale: f32,
+        scope: TrainScopeMask,
+        grads: &mut FullGradState,
+        out_bias_grad: Option<&mut [f32]>,
+        future: &mut RecurrentGradState,
+    ) -> Result<()> {
+        let c = self.cfg.hidden_size;
+        let i = self.cfg.inner_size;
+        let s = self.cfg.state_size;
+        let r = self.cfg.dt_rank;
+        let k = self.cfg.conv_kernel;
+        let v = self.cfg.vocab_size.min(pdf.len());
+        if v == 0 {
+            return Ok(());
+        }
+
+        scratch.grad_logits.zero();
+        for tok in 0..v {
+            let p = pdf[tok].clamp(1e-12, 1.0) as f32;
+            let target = if tok == symbol as usize { 1.0 } else { 0.0 };
+            scratch.grad_logits[tok] = (target - p) * grad_scale;
+        }
+
+        if scope.bias
+            && let Some(bias_grad) = out_bias_grad
+        {
+            add_vec_grad(&mut bias_grad[0..v], &scratch.grad_logits.as_slice()[0..v]);
+        }
+
+        scratch.grad_h.zero();
+        if scope.head {
+            add_outer_grad(
+                grads.lm_head.as_mut_slice(),
+                v,
+                c,
+                &scratch.grad_logits.as_slice()[0..v],
+                trace.norm.as_slice(),
+            );
+            if let Some(lm_head_b) = grads.lm_head_b.as_mut() {
+                let n = v.min(lm_head_b.len());
+                add_vec_grad(
+                    &mut lm_head_b.as_mut_slice()[0..n],
+                    &scratch.grad_logits.as_slice()[0..n],
+                );
+            }
+        }
+        for tok in 0..v {
+            let g = scratch.grad_logits[tok];
+            if g == 0.0 {
+                continue;
+            }
+            let row_off = tok * c;
+            for col in 0..c {
+                scratch.grad_h[col] += self.lm_head[row_off + col] * g;
+            }
+        }
+
+        let needs_backprop = scope.embed
+            || scope.layer_norm
+            || scope.mixer_conv
+            || scope.mixer_ssm
+            || scope.mixer_proj;
+        if !needs_backprop {
+            return Ok(());
+        }
+
+        rms_norm_backward(
+            trace.h_final.as_slice(),
+            self.final_norm_w.as_slice(),
+            scratch.grad_h.as_slice(),
+            self.cfg.layer_norm_eps,
+            scratch.grad_norm.as_mut_slice(),
+            scratch.grad_out.as_mut_slice(),
+        );
+        if scope.layer_norm {
+            add_vec_grad(
+                grads.final_norm_w.as_mut_slice(),
+                scratch.grad_out.as_slice(),
+            );
+            if let Some(final_norm_b) = grads.final_norm_b.as_mut() {
+                add_vec_grad(final_norm_b.as_mut_slice(), scratch.grad_h.as_slice());
+            }
+        }
+        scratch
+            .grad_h
+            .as_mut_slice()
+            .copy_from_slice(scratch.grad_norm.as_slice());
+
+        for layer_idx in (0..self.cfg.num_layers).rev() {
+            let tr = &trace.layers[layer_idx];
+            let st_new = &state_new.layers[layer_idx];
+            let layer = &self.layers[layer_idx];
+            let layer_grads = &mut grads.layers[layer_idx];
+            let future_layer = &mut future.layers[layer_idx];
+
+            scratch
+                .grad_out
+                .as_mut_slice()
+                .copy_from_slice(scratch.grad_h.as_slice());
+
+            unsafe {
+                kernel::gemv_t(
+                    layer.out_proj_w.as_ptr(),
+                    scratch.grad_out.as_ptr(),
+                    scratch.grad_y.as_mut_ptr(),
+                    c,
+                    i,
+                );
+            }
+            if scope.mixer_proj {
+                add_outer_grad(
+                    layer_grads.out_proj_w.as_mut_slice(),
+                    c,
+                    i,
+                    scratch.grad_out.as_slice(),
+                    tr.y.as_slice(),
+                );
+                if let Some(out_proj_b) = layer_grads.out_proj_b.as_mut() {
+                    add_vec_grad(out_proj_b.as_mut_slice(), scratch.grad_out.as_slice());
+                }
+            }
+
+            scratch
+                .grad_residual
+                .as_mut_slice()
+                .copy_from_slice(scratch.grad_out.as_slice());
+            scratch.grad_xz.zero();
+            scratch.grad_b.zero();
+            scratch.grad_c.zero();
+            scratch.grad_ssm_d.zero();
+            scratch.grad_ssm_a.zero();
+            scratch.grad_dt_raw.zero();
+            scratch.grad_conv.zero();
+            scratch.grad_conv_pre.zero();
+            scratch.grad_conv_w.zero();
+            scratch.grad_conv_b.zero();
+
+            for ch in 0..i {
+                let g_y = scratch.grad_y[ch];
+                let g_y_pre = g_y * tr.gate[ch];
+                let g_gate = g_y * tr.y_pre[ch];
+                scratch.grad_xz[i + ch] =
+                    g_gate * silu_grad_from_sigmoid(tr.xz[i + ch], tr.gate_sigmoid[ch]);
+
+                let conv = tr.conv_post[ch];
+                let dt = tr.dt[ch];
+                let xdt = conv * dt;
+                let mut g_xdt = 0.0f32;
+                let mut g_dt = 0.0f32;
+
+                scratch.grad_conv[ch] = g_y_pre * layer.d[ch];
+                if scope.mixer_ssm {
+                    scratch.grad_ssm_d[ch] = g_y_pre * conv;
+                }
+
+                let row = ch * s;
+                for j in 0..s {
+                    let idx = row + j;
+                    let c_j = tr.proj[r + s + j];
+                    let b_j = tr.proj[r + j];
+                    let s_prev = tr.ssm_prev[idx];
+                    let s_new = st_new.ssm[idx];
+                    let a_ij = layer.a[idx];
+                    let d_a = tr.d_a[idx];
+
+                    let g_ssm_new = g_y_pre * c_j + future_layer.ssm_next[idx];
+                    scratch.grad_c[j] += g_y_pre * s_new;
+                    g_xdt += g_ssm_new * b_j;
+                    scratch.grad_b[j] += g_ssm_new * xdt;
+
+                    let g_d_a = g_ssm_new * s_prev;
+                    g_dt += g_d_a * d_a * a_ij;
+                    if scope.mixer_ssm {
+                        scratch.grad_ssm_a[idx] += g_d_a * d_a * dt;
+                    }
+                    future_layer.ssm_next[idx] = g_ssm_new * d_a;
+                }
+
+                scratch.grad_conv[ch] += g_xdt * dt;
+                g_dt += g_xdt * conv;
+                let dt_pre = tr.dt_raw[ch] + layer.dt_proj_b[ch];
+                scratch.grad_dt_raw[ch] = g_dt * sigmoid(dt_pre);
+            }
+
+            if scope.mixer_ssm {
+                add_vec_grad(layer_grads.d.as_mut_slice(), scratch.grad_ssm_d.as_slice());
+                add_vec_grad(layer_grads.a.as_mut_slice(), scratch.grad_ssm_a.as_slice());
+            }
+
+            unsafe {
+                kernel::gemv_t(
+                    layer.dt_proj_w.as_ptr(),
+                    scratch.grad_dt_raw.as_ptr(),
+                    scratch.grad_u.as_mut_ptr(),
+                    i,
+                    r,
+                );
+            }
+            if scope.mixer_proj {
+                add_outer_grad(
+                    layer_grads.dt_proj_w.as_mut_slice(),
+                    i,
+                    r,
+                    scratch.grad_dt_raw.as_slice(),
+                    &tr.proj.as_slice()[0..r],
+                );
+                add_vec_grad(
+                    layer_grads.dt_proj_b.as_mut_slice(),
+                    scratch.grad_dt_raw.as_slice(),
+                );
+            }
+
+            for kk in 0..r {
+                scratch.grad_proj[kk] = scratch.grad_u[kk];
+            }
+            for j in 0..s {
+                scratch.grad_proj[r + j] = scratch.grad_b[j];
+                scratch.grad_proj[r + s + j] = scratch.grad_c[j];
+            }
+
+            unsafe {
+                kernel::gemv_t(
+                    layer.x_proj_w.as_ptr(),
+                    scratch.grad_proj.as_ptr(),
+                    scratch.grad_conv_pre.as_mut_ptr(),
+                    r + 2 * s,
+                    i,
+                );
+                kernel::add_inplace(
+                    scratch.grad_conv.as_mut_ptr(),
+                    scratch.grad_conv_pre.as_ptr(),
+                    i,
+                );
+            }
+            if scope.mixer_proj {
+                add_outer_grad(
+                    layer_grads.x_proj_w.as_mut_slice(),
+                    r + 2 * s,
+                    i,
+                    scratch.grad_proj.as_slice(),
+                    tr.conv_post.as_slice(),
+                );
+                if let Some(x_proj_b) = layer_grads.x_proj_b.as_mut() {
+                    add_vec_grad(x_proj_b.as_mut_slice(), scratch.grad_proj.as_slice());
+                }
+            }
+
+            for ch in 0..i {
+                scratch.grad_conv_pre[ch] = scratch.grad_conv[ch]
+                    * silu_grad_from_sigmoid(tr.conv_pre[ch], tr.conv_sigmoid[ch]);
+            }
+
+            for ch in 0..i {
+                let g = scratch.grad_conv_pre[ch];
+                let base = ch * k;
+                let conv_future = &mut future_layer.conv_next.as_mut_slice()[base..base + k];
+                let mut ring = tr.conv_pos_prev;
+
+                scratch.grad_xz[ch] += g * layer.conv_w[base];
+                scratch.grad_xz[ch] += conv_future[tr.conv_pos_prev];
+
+                if scope.mixer_conv {
+                    scratch.grad_conv_w[base] += g * tr.xz[ch];
+                    if layer.conv_b.is_some() {
+                        scratch.grad_conv_b[ch] += g;
+                    }
+                }
+
+                conv_future[tr.conv_pos_prev] = 0.0;
+                for tap in 1..k {
+                    ring = if ring == 0 { k - 1 } else { ring - 1 };
+                    conv_future[ring] += g * layer.conv_w[base + tap];
+                    if scope.mixer_conv {
+                        scratch.grad_conv_w[base + tap] += g * tr.conv_prev[base + ring];
+                    }
+                }
+            }
+            if scope.mixer_conv {
+                add_vec_grad(
+                    layer_grads.conv_w.as_mut_slice(),
+                    scratch.grad_conv_w.as_slice(),
+                );
+                if let Some(conv_b) = layer_grads.conv_b.as_mut() {
+                    add_vec_grad(conv_b.as_mut_slice(), scratch.grad_conv_b.as_slice());
+                }
+            }
+
+            unsafe {
+                kernel::gemv_t(
+                    layer.in_proj_w.as_ptr(),
+                    scratch.grad_xz.as_ptr(),
+                    scratch.grad_norm.as_mut_ptr(),
+                    2 * i,
+                    c,
+                );
+            }
+            if scope.mixer_proj {
+                add_outer_grad(
+                    layer_grads.in_proj_w.as_mut_slice(),
+                    2 * i,
+                    c,
+                    scratch.grad_xz.as_slice(),
+                    tr.norm.as_slice(),
+                );
+                if let Some(in_proj_b) = layer_grads.in_proj_b.as_mut() {
+                    add_vec_grad(in_proj_b.as_mut_slice(), scratch.grad_xz.as_slice());
+                }
+            }
+
+            rms_norm_backward(
+                tr.h_in.as_slice(),
+                layer.norm_w.as_slice(),
+                scratch.grad_norm.as_slice(),
+                self.cfg.layer_norm_eps,
+                scratch.grad_h.as_mut_slice(),
+                scratch.grad_out.as_mut_slice(),
+            );
+            if scope.layer_norm {
+                add_vec_grad(
+                    layer_grads.norm_w.as_mut_slice(),
+                    scratch.grad_out.as_slice(),
+                );
+                if let Some(norm_b) = layer_grads.norm_b.as_mut() {
+                    add_vec_grad(norm_b.as_mut_slice(), scratch.grad_norm.as_slice());
+                }
+            }
+
+            for idx in 0..c {
+                scratch.grad_h[idx] += scratch.grad_residual[idx];
+            }
+        }
+
+        if scope.embed {
+            let tok = trace.token.min(self.cfg.vocab_size.saturating_sub(1));
+            let row_off = tok * c;
+            add_vec_grad(
+                &mut grads.embeddings.as_mut_slice()[row_off..row_off + c],
+                scratch.grad_h.as_slice(),
+            );
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn online_train_segment_tbptt(
+        &mut self,
+        scratch: &mut ScratchBuffers,
+        start_state: &State,
+        steps: &[(u32, u8, Vec<f64>)],
+        scope: TrainScopeMask,
+        optimizer: OptimizerKind,
+        lr: f32,
+        clip: f32,
+        replay_chunk: usize,
+        adam_t: &mut usize,
+        model_adam: Option<&mut FullAdamState>,
+        out_bias: Option<&mut [f32]>,
+        out_bias_adam_m: Option<&mut [f32]>,
+        out_bias_adam_v: Option<&mut [f32]>,
+        live_state_out: &mut State,
+    ) -> Result<()> {
+        if steps.is_empty() {
+            *live_state_out = start_state.clone();
+            return Ok(());
+        }
+
+        let grad_scale = 1.0f32 / (steps.len() as f32);
+        let chunk = replay_chunk.max(1).min(steps.len().max(1));
+        let mut grads = self.new_full_grad_state();
+        let mut recurrent = self.new_recurrent_grad_state();
+        recurrent.zero();
+        let mut bias_grad = out_bias.as_deref().map(|b| vec![0.0f32; b.len()]);
+
+        {
+            let mut checkpoints = Vec::<State>::new();
+            let mut checkpoint_state = start_state.clone();
+            scratch.set_capture_train_trace(false);
+            for chunk_start in (0..steps.len()).step_by(chunk) {
+                checkpoints.push(checkpoint_state.clone());
+                let chunk_end = (chunk_start + chunk).min(steps.len());
+                for (input_token, _, _) in &steps[chunk_start..chunk_end] {
+                    let _ = self.forward(scratch, *input_token, &mut checkpoint_state);
+                }
+            }
+
+            for chunk_idx in (0..checkpoints.len()).rev() {
+                let chunk_start = chunk_idx * chunk;
+                let chunk_end = (chunk_start + chunk).min(steps.len());
+                let mut state = checkpoints[chunk_idx].clone();
+                let mut step_states = Vec::<State>::with_capacity(chunk_end - chunk_start + 1);
+                let mut step_traces =
+                    Vec::<TokenTrainTrace>::with_capacity(chunk_end - chunk_start);
+                step_states.push(state.clone());
+
+                for (input_token, _, _) in &steps[chunk_start..chunk_end] {
+                    scratch.set_capture_train_trace(true);
+                    let _ = self.forward(scratch, *input_token, &mut state);
+                    step_traces.push(TokenTrainTrace::from_scratch(scratch));
+                    step_states.push(state.clone());
+                }
+
+                for local_idx in (0..step_traces.len()).rev() {
+                    let (_, target_symbol, pdf) = &steps[chunk_start + local_idx];
+                    self.accumulate_token_step_gradients(
+                        scratch,
+                        &step_traces[local_idx],
+                        &step_states[local_idx + 1],
+                        *target_symbol,
+                        pdf,
+                        grad_scale,
+                        scope,
+                        &mut grads,
+                        bias_grad.as_deref_mut(),
+                        &mut recurrent,
+                    )?;
+                }
+            }
+        }
+
+        self.apply_full_gradients(
+            &grads,
+            scope,
+            optimizer,
+            lr,
+            clip,
+            adam_t,
+            model_adam,
+            out_bias,
+            bias_grad.as_deref(),
+            out_bias_adam_m,
+            out_bias_adam_v,
+        )?;
+
+        scratch.set_capture_train_trace(false);
+        *live_state_out = start_state.clone();
+        for (input_token, _, _) in steps {
+            let _ = self.forward(scratch, *input_token, live_state_out);
+        }
+        Ok(())
     }
 
     /// Forward a single byte token and return logits for next symbol.
@@ -2575,6 +3495,97 @@ fn rms_norm_backward(
 }
 
 #[inline(always)]
+fn add_vec_grad(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    for idx in 0..n {
+        dst[idx] += src[idx];
+    }
+}
+
+#[inline(always)]
+fn sgd_vec_update(param: &mut [f32], grad: &[f32], lr: f32, clip: f32) {
+    let n = param.len().min(grad.len());
+    if clip > 0.0 {
+        for idx in 0..n {
+            param[idx] += lr * grad[idx].clamp(-clip, clip);
+        }
+    } else {
+        for idx in 0..n {
+            param[idx] += lr * grad[idx];
+        }
+    }
+}
+
+#[allow(clippy::needless_range_loop)]
+#[inline(always)]
+fn add_outer_grad(dst: &mut [f32], rows: usize, cols: usize, left: &[f32], right: &[f32]) {
+    let rows = rows.min(left.len());
+    let cols = cols.min(right.len());
+    let n = dst.len();
+    for row in 0..rows {
+        let off = row * cols;
+        if off >= n {
+            break;
+        }
+        let limit = (n - off).min(cols);
+        let g = left[row];
+        for col in 0..limit {
+            dst[off + col] += g * right[col];
+        }
+    }
+}
+
+#[inline(always)]
+fn apply_adam_vec_update_raw(
+    param: &mut [f32],
+    grad: &[f32],
+    moment_m: &mut [f32],
+    moment_v: &mut [f32],
+    step: &AdamStep,
+) {
+    let n = param
+        .len()
+        .min(grad.len())
+        .min(moment_m.len())
+        .min(moment_v.len());
+    if n == 0 {
+        return;
+    }
+    let b1 = step.b1;
+    let b2 = step.b2;
+    let one_m_b1 = 1.0 - b1;
+    let one_m_b2 = 1.0 - b2;
+    let lr = step.lr;
+    let eps = step.eps;
+    let inv_bc1 = 1.0 / step.bias_corr1;
+    let inv_bc2 = 1.0 / step.bias_corr2;
+    if step.clip > 0.0 {
+        let clip = step.clip;
+        for idx in 0..n {
+            let g = grad[idx].clamp(-clip, clip);
+            let m = b1 * moment_m[idx] + one_m_b1 * g;
+            let v = b2 * moment_v[idx] + one_m_b2 * g * g;
+            moment_m[idx] = m;
+            moment_v[idx] = v;
+            let m_hat = m * inv_bc1;
+            let v_hat = v * inv_bc2;
+            param[idx] += lr * m_hat / (v_hat.sqrt() + eps);
+        }
+    } else {
+        for idx in 0..n {
+            let g = grad[idx];
+            let m = b1 * moment_m[idx] + one_m_b1 * g;
+            let v = b2 * moment_v[idx] + one_m_b2 * g * g;
+            moment_m[idx] = m;
+            moment_v[idx] = v;
+            let m_hat = m * inv_bc1;
+            let v_hat = v * inv_bc2;
+            param[idx] += lr * m_hat / (v_hat.sqrt() + eps);
+        }
+    }
+}
+
+#[inline(always)]
 fn apply_adam_vec_update(
     param: &mut [f32],
     grad: &[f32],
@@ -3209,6 +4220,254 @@ mod tests {
         assert!(
             diff <= 2e-2 * scale,
             "analytic={analytic} numeric={numeric} diff={diff}"
+        );
+    }
+
+    fn test_cfg() -> Config {
+        Config {
+            vocab_size: 256,
+            hidden_size: 32,
+            num_layers: 1,
+            inner_size: 48,
+            state_size: 6,
+            conv_kernel: 3,
+            dt_rank: 6,
+            layer_norm_eps: 1e-5,
+        }
+    }
+
+    fn softmax_loss(logits: &[f32], target: u8) -> f64 {
+        let max_logit = logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+        let mut denom = 0.0f64;
+        for &z in logits {
+            denom += ((z - max_logit) as f64).exp();
+        }
+        let p = ((logits[target as usize] - max_logit) as f64).exp() / denom.max(1e-300);
+        -p.max(1e-300).ln()
+    }
+
+    fn softmax_pdf(logits: &[f32]) -> Vec<f64> {
+        let mut pdf = vec![0.0f64; logits.len()];
+        let max_logit = logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+        let mut denom = 0.0f64;
+        for &z in logits {
+            denom += ((z - max_logit) as f64).exp();
+        }
+        let inv = 1.0 / denom.max(1e-300);
+        for (idx, out) in pdf.iter_mut().enumerate() {
+            *out = ((logits[idx] - max_logit) as f64).exp() * inv;
+        }
+        pdf
+    }
+
+    fn segment_loss(model: &Model, cfg: &Config, steps: &[(u32, u8)]) -> f64 {
+        if steps.is_empty() {
+            return 0.0;
+        }
+        let mut scratch = ScratchBuffers::new(cfg);
+        let mut state = model.new_state();
+        let mut loss = 0.0f64;
+        for &(input, target) in steps {
+            let logits = model.forward(&mut scratch, input, &mut state);
+            loss += softmax_loss(logits, target);
+        }
+        loss / (steps.len() as f64)
+    }
+
+    fn segment_grads(model: &Model, cfg: &Config, steps: &[(u32, u8)]) -> FullGradState {
+        let mut scratch = ScratchBuffers::new(cfg);
+        let mut state = model.new_state();
+        let mut states = Vec::with_capacity(steps.len() + 1);
+        let mut traces = Vec::with_capacity(steps.len());
+        let mut pdfs = Vec::with_capacity(steps.len());
+        states.push(state.clone());
+        for &(input, _) in steps {
+            scratch.set_capture_train_trace(true);
+            let logits = model.forward(&mut scratch, input, &mut state);
+            pdfs.push(softmax_pdf(logits));
+            traces.push(TokenTrainTrace::from_scratch(&scratch));
+            states.push(state.clone());
+        }
+        let mut grads = model.new_full_grad_state();
+        let mut recurrent = model.new_recurrent_grad_state();
+        recurrent.zero();
+        let scope = TrainScopeMask {
+            embed: true,
+            layer_norm: true,
+            mixer_conv: true,
+            mixer_ssm: true,
+            mixer_proj: true,
+            head: true,
+            bias: false,
+        };
+        let grad_scale = 1.0f32 / (steps.len() as f32);
+        for idx in (0..steps.len()).rev() {
+            model
+                .accumulate_token_step_gradients(
+                    &mut scratch,
+                    &traces[idx],
+                    &states[idx + 1],
+                    steps[idx].1,
+                    &pdfs[idx],
+                    grad_scale,
+                    scope,
+                    &mut grads,
+                    None,
+                    &mut recurrent,
+                )
+                .expect("segment gradient accumulation");
+        }
+        grads
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Probe {
+        Embed,
+        FinalNormW,
+        LayerNormW,
+        InProjW,
+        ConvW,
+        SsmA,
+        OutProjW,
+        LmHead,
+    }
+
+    fn probe_value(model: &Model, probe: Probe) -> f32 {
+        match probe {
+            Probe::Embed => model.embeddings[7],
+            Probe::FinalNormW => model.final_norm_w[5],
+            Probe::LayerNormW => model.layers[0].norm_w[9],
+            Probe::InProjW => model.layers[0].in_proj_w[13],
+            Probe::ConvW => model.layers[0].conv_w[4],
+            Probe::SsmA => model.layers[0].a[11],
+            Probe::OutProjW => model.layers[0].out_proj_w[17],
+            Probe::LmHead => model.lm_head[23],
+        }
+    }
+
+    fn set_probe(model: &mut Model, probe: Probe, value: f32) {
+        match probe {
+            Probe::Embed => model.embeddings[7] = value,
+            Probe::FinalNormW => model.final_norm_w[5] = value,
+            Probe::LayerNormW => model.layers[0].norm_w[9] = value,
+            Probe::InProjW => model.layers[0].in_proj_w[13] = value,
+            Probe::ConvW => model.layers[0].conv_w[4] = value,
+            Probe::SsmA => model.layers[0].a[11] = value,
+            Probe::OutProjW => model.layers[0].out_proj_w[17] = value,
+            Probe::LmHead => model.lm_head[23] = value,
+        }
+    }
+
+    fn probe_grad(grads: &FullGradState, probe: Probe) -> f32 {
+        match probe {
+            Probe::Embed => grads.embeddings[7],
+            Probe::FinalNormW => grads.final_norm_w[5],
+            Probe::LayerNormW => grads.layers[0].norm_w[9],
+            Probe::InProjW => grads.layers[0].in_proj_w[13],
+            Probe::ConvW => grads.layers[0].conv_w[4],
+            Probe::SsmA => grads.layers[0].a[11],
+            Probe::OutProjW => grads.layers[0].out_proj_w[17],
+            Probe::LmHead => grads.lm_head[23],
+        }
+    }
+
+    #[test]
+    fn tbptt_segment_gradients_match_finite_difference() {
+        let cfg = test_cfg();
+        cfg.validate().expect("valid test config");
+        let model = Model::new_random(cfg.clone(), 0xD00D_F00D).expect("random model");
+        let steps = [(0u32, 1u8), (1, 2), (2, 3)];
+        let grads = segment_grads(&model, &cfg, &steps);
+        let eps = 1e-3f32;
+
+        for probe in [
+            Probe::Embed,
+            Probe::FinalNormW,
+            Probe::LayerNormW,
+            Probe::InProjW,
+            Probe::ConvW,
+            Probe::SsmA,
+            Probe::OutProjW,
+            Probe::LmHead,
+        ] {
+            let analytic = probe_grad(&grads, probe);
+
+            let mut plus = model.clone();
+            let base = probe_value(&plus, probe);
+            set_probe(&mut plus, probe, base + eps);
+            let loss_plus = segment_loss(&plus, &cfg, &steps);
+
+            let mut minus = model.clone();
+            set_probe(&mut minus, probe, base - eps);
+            let loss_minus = segment_loss(&minus, &cfg, &steps);
+
+            let numeric = -((loss_plus - loss_minus) / (2.0 * eps as f64)) as f32;
+            let tol = 6e-2f32.max(analytic.abs().max(numeric.abs()) * 1e-1);
+            assert!(
+                (analytic - numeric).abs() <= tol,
+                "probe={probe:?} analytic={analytic} numeric={numeric} tol={tol}"
+            );
+        }
+    }
+
+    #[test]
+    fn tbptt_sgd_step_reduces_mean_segment_loss() {
+        let cfg = test_cfg();
+        cfg.validate().expect("valid test config");
+        let mut model = Model::new_random(cfg.clone(), 0x1234_5678).expect("random model");
+        let steps = [(0u32, 1u8), (1, 2), (2, 3), (3, 4)];
+        let before = segment_loss(&model, &cfg, &steps);
+
+        let mut scratch = ScratchBuffers::new(&cfg);
+        let start_state = model.new_state();
+        let mut state = start_state.clone();
+        let mut segment_steps = Vec::with_capacity(steps.len());
+        for &(input, target) in &steps {
+            let logits = model.forward(&mut scratch, input, &mut state);
+            segment_steps.push((input, target, softmax_pdf(logits)));
+        }
+
+        let mut live_state = model.new_state();
+        let mut adam_t = 0usize;
+        let scope = TrainScopeMask {
+            embed: true,
+            layer_norm: true,
+            mixer_conv: true,
+            mixer_ssm: true,
+            mixer_proj: true,
+            head: true,
+            bias: false,
+        };
+
+        model
+            .online_train_segment_tbptt(
+                &mut scratch,
+                &start_state,
+                &segment_steps,
+                scope,
+                OptimizerKind::Sgd,
+                8e-4,
+                0.0,
+                2,
+                &mut adam_t,
+                None,
+                None,
+                None,
+                None,
+                &mut live_state,
+            )
+            .expect("tbptt sgd step");
+
+        let after = segment_loss(&model, &cfg, &steps);
+        assert!(
+            after < before,
+            "expected SGD TBPTT step to reduce mean loss: before={before} after={after}"
         );
     }
 }

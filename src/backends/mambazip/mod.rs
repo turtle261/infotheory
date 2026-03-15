@@ -40,6 +40,7 @@ pub const MAGIC: u32 = 0x5a424d4d; // "MMBZ"
 pub const VERSION: u8 = 1;
 /// Byte vocabulary size.
 pub const VOCAB_SIZE: usize = 256;
+const TBPTT_REPLAY_CHUNK: usize = 32;
 const MAMBA_TRAIN_SCOPES: &[&str] = &[
     "embed",
     "layer_norm",
@@ -160,6 +161,55 @@ struct OnlineRuntime {
     lm_head_adam_m: Option<Vec<f32>>,
     lm_head_adam_v: Option<Vec<f32>>,
     adam_t: usize,
+    full_tbptt: Option<FullTbpttRuntime>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FullTrainSettings {
+    optimizer: OptimizerKind,
+    lr: f32,
+    scope: mamba1::TrainScopeMask,
+    bptt: usize,
+    clip: f32,
+}
+
+impl FullTrainSettings {
+    fn matches(
+        self,
+        optimizer: OptimizerKind,
+        lr: f32,
+        scope: mamba1::TrainScopeMask,
+        bptt: usize,
+        clip: f32,
+    ) -> bool {
+        self.optimizer == optimizer
+            && self.lr.to_bits() == lr.to_bits()
+            && self.scope.embed == scope.embed
+            && self.scope.layer_norm == scope.layer_norm
+            && self.scope.mixer_conv == scope.mixer_conv
+            && self.scope.mixer_ssm == scope.mixer_ssm
+            && self.scope.mixer_proj == scope.mixer_proj
+            && self.scope.head == scope.head
+            && self.scope.bias == scope.bias
+            && self.bptt == bptt
+            && self.clip.to_bits() == clip.to_bits()
+    }
+}
+
+#[derive(Clone)]
+struct FullTbpttStep {
+    input_token: u32,
+    target_symbol: u8,
+    pdf: Vec<f64>,
+}
+
+#[derive(Clone)]
+struct FullTbpttRuntime {
+    pending_input_token: Option<u32>,
+    pending_input_pre_state: Option<State>,
+    segment_start_state: Option<State>,
+    steps: Vec<FullTbpttStep>,
+    settings: Option<FullTrainSettings>,
 }
 
 #[derive(Clone)]
@@ -204,12 +254,25 @@ impl OnlineRuntime {
             lm_head_adam_m: use_adam.then(|| vec![0.0; vocab_size * hidden_size]),
             lm_head_adam_v: use_adam.then(|| vec![0.0; vocab_size * hidden_size]),
             adam_t: 0,
+            full_tbptt: needs_full_trace.then(|| FullTbpttRuntime {
+                pending_input_token: None,
+                pending_input_pre_state: None,
+                segment_start_state: None,
+                steps: Vec::new(),
+                settings: None,
+            }),
         }
     }
 
     fn prepare_policy_stream(&mut self, total_symbols: Option<u64>) -> Result<()> {
         self.policy_stream_total = total_symbols;
         self.policy_train_steps = 0;
+        if let Some(tbptt) = self.full_tbptt.as_mut() {
+            // Preserve pending predictive edge while resetting segment bookkeeping.
+            tbptt.segment_start_state = None;
+            tbptt.steps.clear();
+            tbptt.settings = None;
+        }
         self.policy_runtime = match &self.policy {
             Some(p) => Some(PolicyRuntime::new(p.compile(total_symbols)?)),
             None => None,
@@ -663,6 +726,14 @@ pub struct Compressor {
 mod tests {
     use super::*;
 
+    fn temp_path(prefix: &str, ext: &str) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}_{}_{}.{}", std::process::id(), now, ext))
+    }
+
     #[test]
     fn parse_method_spec_accepts_cfg_and_positional() {
         let named = parse_method_spec(
@@ -826,15 +897,51 @@ mod tests {
     }
 
     #[test]
-    fn online_training_scope_all_bptt_gt_one_rejected() {
+    fn online_training_scope_all_bptt_gt_one_supported() {
         let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=adam,lr=0.002,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.002,stride=1,bptt=2,clip=0,momentum=0.9)";
         let mut c = Compressor::new_from_method(method).expect("online model");
+        let before_path = temp_path("mamba_tbptt_before", "safetensors");
+        let after_path = temp_path("mamba_tbptt_after", "safetensors");
+        c.model.save_safetensors(&before_path).expect("save before");
         c.reset_and_prime();
-        let err = c.cross_entropy_from_current(b"abcd").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("bptt=1"),
-            "unexpected error: {err:#}"
+        let score = c
+            .cross_entropy_from_current(b"abcdef")
+            .expect("tbptt score");
+        assert!(score.is_finite());
+        c.model.save_safetensors(&after_path).expect("save after");
+        let before = std::fs::read(&before_path).expect("read before");
+        let after = std::fs::read(&after_path).expect("read after");
+        assert_ne!(
+            before, after,
+            "expected tbptt full training to update params"
         );
+        std::fs::remove_file(before_path).ok();
+        std::fs::remove_file(after_path).ok();
+    }
+
+    #[test]
+    fn online_training_full_tbptt_updates_first_symbol_after_priming() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=33,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=8,clip=0,momentum=0.9)";
+        let mut c = Compressor::new_from_method(method).expect("online model");
+        let before_path = temp_path("mamba_first_symbol_before", "safetensors");
+        let after_path = temp_path("mamba_first_symbol_after", "safetensors");
+        c.model.save_safetensors(&before_path).expect("save before");
+
+        c.reset_and_prime();
+        let score = c
+            .cross_entropy_from_current(b"a")
+            .expect("single-symbol score");
+        assert!(score.is_finite());
+        c.model.save_safetensors(&after_path).expect("save after");
+
+        let before = std::fs::read(&before_path).expect("read before");
+        let after = std::fs::read(&after_path).expect("read after");
+        assert_ne!(
+            before, after,
+            "expected first symbol update to flush at stream end"
+        );
+        std::fs::remove_file(before_path).ok();
+        std::fs::remove_file(after_path).ok();
     }
 
     #[test]
@@ -997,6 +1104,13 @@ impl Compressor {
                         .as_ref()
                         .map(policy_needs_full_trace)
                         .unwrap_or(false);
+                    online.full_tbptt = online.needs_full_trace.then(|| FullTbpttRuntime {
+                        pending_input_token: None,
+                        pending_input_pre_state: None,
+                        segment_start_state: None,
+                        steps: Vec::new(),
+                        settings: None,
+                    });
                     c.online = Some(online);
                     c.scratch.set_capture_train_trace(
                         c.online.as_ref().is_some_and(|o| o.needs_full_trace),
@@ -1050,6 +1164,7 @@ impl Compressor {
     /// Reset state.
     pub fn reset(&mut self) {
         self.state.reset();
+        self.clear_online_training_buffers();
     }
 
     fn prepare_policy_stream(&mut self, total_symbols: Option<u64>) -> Result<()> {
@@ -1059,14 +1174,185 @@ impl Compressor {
         Ok(())
     }
 
+    fn clear_online_training_buffers(&mut self) {
+        if let Some(online) = self.online.as_mut()
+            && let Some(tbptt) = online.full_tbptt.as_mut()
+        {
+            tbptt.pending_input_token = None;
+            tbptt.pending_input_pre_state = None;
+            tbptt.segment_start_state = None;
+            tbptt.steps.clear();
+            tbptt.settings = None;
+        }
+    }
+
+    fn forward_with_online_record(&mut self, token: u32) {
+        if let Some(online) = self.online.as_mut()
+            && let Some(tbptt) = online.full_tbptt.as_mut()
+        {
+            tbptt.pending_input_token = Some(token);
+            tbptt.pending_input_pre_state = Some(self.state.clone());
+        }
+        let _ = self
+            .model
+            .forward(&mut self.scratch, token, &mut self.state);
+    }
+
+    fn flush_full_tbptt_segment(&mut self) -> Result<()> {
+        let extracted = {
+            match self.online.as_mut() {
+                Some(online) => match online.full_tbptt.as_mut() {
+                    Some(tbptt) if !tbptt.steps.is_empty() => {
+                        let settings = tbptt.settings.take().ok_or_else(|| {
+                            anyhow::anyhow!("mamba full tbptt settings are missing")
+                        })?;
+                        let start_state = tbptt.segment_start_state.take().ok_or_else(|| {
+                            anyhow::anyhow!("mamba full tbptt segment start is missing")
+                        })?;
+                        let steps = std::mem::take(&mut tbptt.steps);
+                        let need_full_adam = matches!(settings.optimizer, OptimizerKind::Adam)
+                            && settings.scope.trains_model_params()
+                            && online.full_adam.is_none();
+                        Some((settings, start_state, steps, need_full_adam))
+                    }
+                    _ => None,
+                },
+                None => None,
+            }
+        };
+        let Some((settings, start_state, steps, need_full_adam)) = extracted else {
+            return Ok(());
+        };
+
+        if need_full_adam {
+            let full_adam = self.model.new_full_adam_state();
+            if let Some(online) = self.online.as_mut() {
+                online.full_adam = Some(full_adam);
+            }
+        }
+
+        let segment_steps = steps
+            .into_iter()
+            .map(|step| (step.input_token, step.target_symbol, step.pdf))
+            .collect::<Vec<_>>();
+        let model = Arc::make_mut(&mut self.model);
+        let Some(online) = self.online.as_mut() else {
+            return Ok(());
+        };
+        model.online_train_segment_tbptt(
+            &mut self.scratch,
+            &start_state,
+            &segment_steps,
+            settings.scope,
+            settings.optimizer,
+            settings.lr,
+            settings.clip,
+            TBPTT_REPLAY_CHUNK,
+            &mut online.adam_t,
+            online.full_adam.as_mut(),
+            if settings.scope.bias {
+                Some(online.out_bias.as_mut_slice())
+            } else {
+                None
+            },
+            if settings.scope.bias {
+                online.adam_m.as_deref_mut()
+            } else {
+                None
+            },
+            if settings.scope.bias {
+                online.adam_v.as_deref_mut()
+            } else {
+                None
+            },
+            &mut self.state,
+        )?;
+        let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
+        Self::logits_to_pdf(self.scratch.logits(), bias, &mut self.pdf_buffer);
+        Ok(())
+    }
+
+    fn enqueue_full_tbptt_step(
+        &mut self,
+        settings: FullTrainSettings,
+        target_symbol: u8,
+        pdf: &[f64],
+    ) -> Result<()> {
+        let should_flush = {
+            let Some(online) = self.online.as_mut() else {
+                return Ok(());
+            };
+            let Some(tbptt) = online.full_tbptt.as_mut() else {
+                bail!("mamba full-parameter online training requires trace-enabled tbptt runtime");
+            };
+            tbptt.settings.is_some_and(|prev| {
+                !prev.matches(
+                    settings.optimizer,
+                    settings.lr,
+                    settings.scope,
+                    settings.bptt,
+                    settings.clip,
+                )
+            }) && !tbptt.steps.is_empty()
+        };
+        if should_flush {
+            self.flush_full_tbptt_segment()?;
+        }
+
+        let flush_now = {
+            let Some(online) = self.online.as_mut() else {
+                return Ok(());
+            };
+            let Some(tbptt) = online.full_tbptt.as_mut() else {
+                bail!("mamba full-parameter online training requires trace-enabled tbptt runtime");
+            };
+            let Some(input_token) = tbptt.pending_input_token.take() else {
+                return Ok(());
+            };
+            let input_pre_state = tbptt
+                .pending_input_pre_state
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("mamba full tbptt pending pre-state is missing"))?;
+            if tbptt.steps.is_empty() {
+                tbptt.segment_start_state = Some(input_pre_state);
+            }
+            tbptt.settings = Some(settings);
+            tbptt.steps.push(FullTbpttStep {
+                input_token,
+                target_symbol,
+                pdf: pdf.to_vec(),
+            });
+            tbptt.steps.len() >= settings.bptt.max(1)
+        };
+        if flush_now {
+            self.flush_full_tbptt_segment()?;
+        }
+        Ok(())
+    }
+
     /// Begin a policy stream with optional total symbol count.
     pub fn begin_online_policy_stream(&mut self, total_symbols: Option<u64>) -> Result<()> {
+        self.finish_online_policy_stream()?;
+        self.prepare_policy_stream(total_symbols)
+    }
+
+    /// Flush any pending TBPTT segment while preserving current predictive state.
+    pub fn finish_online_policy_stream(&mut self) -> Result<()> {
+        self.flush_full_tbptt_segment()
+    }
+
+    /// Reset hidden state and TBPTT bookkeeping for a fresh stream.
+    pub fn restart_online_policy_stream(&mut self, total_symbols: Option<u64>) -> Result<()> {
+        self.finish_online_policy_stream()?;
+        self.state.reset();
+        self.clear_online_training_buffers();
         self.prepare_policy_stream(total_symbols)
     }
 
     /// Reset and compute initial distribution.
     pub fn reset_and_prime(&mut self) {
         self.state.reset();
+        self.clear_online_training_buffers();
         self.refresh_current_pdf(0);
     }
 
@@ -1103,14 +1389,14 @@ impl Compressor {
         if data.is_empty() {
             return Ok(0.0);
         }
-        self.prepare_policy_stream(Some(data.len() as u64))?;
+        self.begin_online_policy_stream(Some(data.len() as u64))?;
         let mut total_bits = 0.0;
         for &byte in data {
             let p = self.pdf_buffer[byte as usize].max(1e-300);
             total_bits -= p.log2();
-            self.online_update_from_current_pdf(byte)?;
-            self.refresh_current_pdf(byte as u32);
+            self.observe_symbol_from_current_pdf(byte)?;
         }
+        self.finish_online_policy_stream()?;
         Ok(total_bits / (data.len() as f64))
     }
 
@@ -1124,9 +1410,9 @@ impl Compressor {
             return Ok(0.0);
         }
         if !self.can_adapt_online() {
-            self.reset_and_prime();
-            return self.cross_entropy_from_current(data);
+            return self.cross_entropy(data);
         }
+        self.finish_online_policy_stream()?;
         self.reset_and_prime();
         let fit_total = fit_parts
             .iter()
@@ -1186,11 +1472,9 @@ impl Compressor {
 
     #[inline]
     pub fn forward_to_pdf(&mut self, token: u32, pdf_out: &mut [f64]) {
-        let logits = self
-            .model
-            .forward(&mut self.scratch, token, &mut self.state);
+        self.forward_with_online_record(token);
         let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
-        Self::logits_to_pdf(logits, bias, pdf_out);
+        Self::logits_to_pdf(self.scratch.logits(), bias, pdf_out);
     }
 
     /// Snapshot online bias only.
@@ -1208,12 +1492,9 @@ impl Compressor {
         self.online_update_with_pdf(symbol, pdf)
     }
 
-    fn online_update_with_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
-        let Some(online) = self.online.as_mut() else {
-            return Ok(());
-        };
-        online.tokens_processed = online.tokens_processed.saturating_add(1);
-
+    fn resolve_online_train_action(
+        online: &mut OnlineRuntime,
+    ) -> Result<(OptimizerKind, f32, u64, mamba1::TrainScopeMask, usize, f32)> {
         let mut optimizer = match online.cfg.train_mode {
             OnlineTrainMode::None => OptimizerKind::Sgd,
             OnlineTrainMode::Sgd => OptimizerKind::Sgd,
@@ -1237,8 +1518,8 @@ impl Compressor {
                     optimizer = train.optimizer;
                     lr = train.hyper.lr.max(0.0);
                     stride = train.hyper.stride.max(1) as u64;
-                    clip = train.hyper.clip.max(0.0);
                     bptt = train.hyper.bptt.max(1);
+                    clip = train.hyper.clip.max(0.0);
                     if train.scope.all {
                         scope = mamba1::TrainScopeMask::all();
                     } else {
@@ -1254,43 +1535,94 @@ impl Compressor {
                 }
             }
         }
+        Ok((optimizer, lr, stride, scope, bptt, clip))
+    }
 
-        if !scope.trains_model_params() && !scope.bias {
-            return Ok(());
-        }
-        online.policy_train_steps = online.policy_train_steps.saturating_add(1);
-        if stride > 1 && (online.policy_train_steps % stride) != 0 {
-            return Ok(());
-        }
-        if lr == 0.0 {
+    #[inline]
+    pub fn observe_symbol_from_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
+        self.online_update_with_pdf(symbol, pdf)?;
+        self.refresh_current_pdf(symbol as u32);
+        Ok(())
+    }
+
+    fn online_update_with_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
+        let (optimizer, lr, stride_hit, scope, bptt, clip) = {
+            let Some(online) = self.online.as_mut() else {
+                return Ok(());
+            };
+            online.tokens_processed = online.tokens_processed.saturating_add(1);
+            let (optimizer, lr, stride, scope, bptt, clip) =
+                Self::resolve_online_train_action(online)?;
+            let mut stride_hit = false;
+            if scope.trains_model_params() || scope.bias {
+                online.policy_train_steps = online.policy_train_steps.saturating_add(1);
+                stride_hit = stride <= 1 || (online.policy_train_steps % stride) == 0;
+            }
+            (optimizer, lr, stride_hit, scope, bptt, clip)
+        };
+
+        if (!scope.trains_model_params() && !scope.bias) || !stride_hit || lr == 0.0 {
+            self.flush_full_tbptt_segment()?;
+            if let Some(online) = self.online.as_mut()
+                && let Some(tbptt) = online.full_tbptt.as_mut()
+            {
+                tbptt.pending_input_token = None;
+                tbptt.pending_input_pre_state = None;
+            }
             return Ok(());
         }
 
-        if bptt > 1
-            && (scope.embed
-                || scope.layer_norm
-                || scope.mixer_conv
-                || scope.mixer_ssm
-                || scope.mixer_proj)
+        if matches!(optimizer, OptimizerKind::Adam)
+            && let Some(online) = self.online.as_mut()
+            && scope.bias
+            && (online.adam_m.is_none() || online.adam_v.is_none())
         {
-            bail!("mamba full-parameter online training currently supports bptt=1");
+            online.adam_m = Some(vec![0.0; online.out_bias.len()]);
+            online.adam_v = Some(vec![0.0; online.out_bias.len()]);
         }
 
+        let trains_non_head = scope.embed
+            || scope.layer_norm
+            || scope.mixer_conv
+            || scope.mixer_ssm
+            || scope.mixer_proj;
+        if trains_non_head && bptt > 1 {
+            let settings = FullTrainSettings {
+                optimizer,
+                lr,
+                scope,
+                bptt,
+                clip,
+            };
+            return self.enqueue_full_tbptt_step(settings, symbol, pdf);
+        }
+
+        self.flush_full_tbptt_segment()?;
+        if let Some(online) = self.online.as_mut()
+            && let Some(tbptt) = online.full_tbptt.as_mut()
+        {
+            tbptt.pending_input_token = None;
+            tbptt.pending_input_pre_state = None;
+        }
         if scope.trains_model_params() {
             self.scratch.set_capture_train_trace(true);
         }
-
-        if matches!(optimizer, OptimizerKind::Adam) {
-            if scope.bias && (online.adam_m.is_none() || online.adam_v.is_none()) {
-                online.adam_m = Some(vec![0.0; online.out_bias.len()]);
-                online.adam_v = Some(vec![0.0; online.out_bias.len()]);
-            }
-            if scope.trains_model_params() && online.full_adam.is_none() {
-                online.full_adam = Some(self.model.as_ref().new_full_adam_state());
+        if matches!(optimizer, OptimizerKind::Adam)
+            && scope.trains_model_params()
+            && self.online.as_ref().is_some_and(|o| o.full_adam.is_none())
+        {
+            let full_adam = self.model.as_ref().new_full_adam_state();
+            if let Some(online) = self.online.as_mut()
+                && online.full_adam.is_none()
+            {
+                online.full_adam = Some(full_adam);
             }
         }
 
         let model = Arc::make_mut(&mut self.model);
+        let Some(online) = self.online.as_mut() else {
+            return Ok(());
+        };
         let OnlineRuntime {
             out_bias,
             adam_m,
@@ -1325,28 +1657,24 @@ impl Compressor {
             } else {
                 None
             },
-        )?;
-
-        Ok(())
+        )
     }
 
     #[inline]
     fn refresh_current_pdf(&mut self, token: u32) {
-        let logits = self
-            .model
-            .forward(&mut self.scratch, token, &mut self.state);
+        self.forward_with_online_record(token);
         let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+        Self::logits_to_pdf(self.scratch.logits(), bias, &mut self.pdf_buffer);
     }
 
     fn fit_chain(&mut self, parts: &[&[u8]], total_symbols: Option<u64>) -> Result<()> {
-        self.prepare_policy_stream(total_symbols)?;
+        self.begin_online_policy_stream(total_symbols)?;
         for part in parts {
             for &byte in *part {
-                self.online_update_from_current_pdf(byte)?;
-                self.refresh_current_pdf(byte as u32);
+                self.observe_symbol_from_current_pdf(byte)?;
             }
         }
+        self.finish_online_policy_stream()?;
         Ok(())
     }
 
@@ -1356,123 +1684,14 @@ impl Compressor {
     }
 
     fn online_update_from_current_pdf(&mut self, symbol: u8) -> Result<()> {
-        let Some(online) = self.online.as_mut() else {
-            return Ok(());
-        };
-        online.tokens_processed = online.tokens_processed.saturating_add(1);
+        let pdf_snapshot = self.pdf_buffer.clone();
+        self.online_update_with_pdf(symbol, &pdf_snapshot)
+    }
 
-        let mut optimizer = match online.cfg.train_mode {
-            OnlineTrainMode::None => OptimizerKind::Sgd,
-            OnlineTrainMode::Sgd => OptimizerKind::Sgd,
-            OnlineTrainMode::Adam => OptimizerKind::Adam,
-        };
-        let mut lr = online.cfg.lr.max(0.0);
-        let mut stride = online.cfg.stride.max(1) as u64;
-        let mut scope = mamba1::TrainScopeMask::default();
-        let default_train = !matches!(online.cfg.train_mode, OnlineTrainMode::None);
-        scope.head = default_train;
-        scope.bias = default_train;
-        let mut bptt = 1usize;
-        let mut clip = 0.0f32;
-
-        if let Some(action) = online.next_policy_action()? {
-            match action {
-                PolicyAction::Infer => {
-                    scope = mamba1::TrainScopeMask::default();
-                }
-                PolicyAction::Train(train) => {
-                    optimizer = train.optimizer;
-                    lr = train.hyper.lr.max(0.0);
-                    stride = train.hyper.stride.max(1) as u64;
-                    clip = train.hyper.clip.max(0.0);
-                    bptt = train.hyper.bptt.max(1);
-                    if train.scope.all {
-                        scope = mamba1::TrainScopeMask::all();
-                    } else {
-                        scope = mamba1::TrainScopeMask::default();
-                        scope.embed = train.scope.contains("embed");
-                        scope.layer_norm = train.scope.contains("layer_norm");
-                        scope.mixer_conv = train.scope.contains("mixer_conv");
-                        scope.mixer_ssm = train.scope.contains("mixer_ssm");
-                        scope.mixer_proj = train.scope.contains("mixer_proj");
-                        scope.head = train.scope.contains("head");
-                        scope.bias = train.scope.contains("bias");
-                    }
-                }
-            }
-        }
-
-        if !scope.trains_model_params() && !scope.bias {
-            return Ok(());
-        }
-        online.policy_train_steps = online.policy_train_steps.saturating_add(1);
-        if stride > 1 && (online.policy_train_steps % stride) != 0 {
-            return Ok(());
-        }
-        if lr == 0.0 {
-            return Ok(());
-        }
-
-        if bptt > 1
-            && (scope.embed
-                || scope.layer_norm
-                || scope.mixer_conv
-                || scope.mixer_ssm
-                || scope.mixer_proj)
-        {
-            bail!("mamba full-parameter online training currently supports bptt=1");
-        }
-        if scope.trains_model_params() {
-            self.scratch.set_capture_train_trace(true);
-        }
-        if matches!(optimizer, OptimizerKind::Adam) {
-            if scope.bias && (online.adam_m.is_none() || online.adam_v.is_none()) {
-                online.adam_m = Some(vec![0.0; online.out_bias.len()]);
-                online.adam_v = Some(vec![0.0; online.out_bias.len()]);
-            }
-            if scope.trains_model_params() && online.full_adam.is_none() {
-                online.full_adam = Some(self.model.as_ref().new_full_adam_state());
-            }
-        }
-
-        let model = Arc::make_mut(&mut self.model);
-        let pdf = &self.pdf_buffer;
-        let OnlineRuntime {
-            out_bias,
-            adam_m,
-            adam_v,
-            full_adam,
-            adam_t,
-            ..
-        } = online;
-        model.online_train_step_bptt1(
-            &mut self.scratch,
-            &self.state,
-            symbol,
-            pdf,
-            scope,
-            optimizer,
-            lr,
-            clip,
-            adam_t,
-            full_adam.as_mut(),
-            if scope.bias {
-                Some(out_bias.as_mut_slice())
-            } else {
-                None
-            },
-            if scope.bias {
-                adam_m.as_deref_mut()
-            } else {
-                None
-            },
-            if scope.bias {
-                adam_v.as_deref_mut()
-            } else {
-                None
-            },
-        )?;
-
+    #[inline]
+    pub fn observe_symbol_from_current_pdf(&mut self, symbol: u8) -> Result<()> {
+        self.online_update_from_current_pdf(symbol)?;
+        self.refresh_current_pdf(symbol as u32);
         Ok(())
     }
 
@@ -1645,6 +1864,13 @@ impl Compressor {
                 lm_head_adam_m: parse_vec_f32("lm_head_adam_m"),
                 lm_head_adam_v: parse_vec_f32("lm_head_adam_v"),
                 adam_t: v.get("adam_t").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                full_tbptt: needs_full_trace.then(|| FullTbpttRuntime {
+                    pending_input_token: None,
+                    pending_input_pre_state: None,
+                    segment_start_state: None,
+                    steps: Vec::new(),
+                    settings: None,
+                }),
             });
             let opt_sidecar = optimizer_sidecar_path(model_path);
             if opt_sidecar.exists() {
@@ -1681,8 +1907,7 @@ impl Compressor {
         coder: CoderType,
         w: &mut W,
     ) -> Result<()> {
-        self.state.reset();
-        self.prepare_policy_stream(Some(data.len() as u64))?;
+        self.restart_online_policy_stream(Some(data.len() as u64))?;
         let checksum = crc32(data);
         let header = Header::new(coder, data.len() as u64, checksum);
         header.write(w)?;
@@ -1691,6 +1916,7 @@ impl Compressor {
             CoderType::AC => self.compress_ac_iter(data.iter().copied(), w)?,
             CoderType::RANS => self.compress_rans_iter(data.iter().copied(), w)?,
         }
+        self.finish_online_policy_stream()?;
         Ok(())
     }
 
@@ -1701,15 +1927,13 @@ impl Compressor {
         coder: CoderType,
         w: &mut W,
     ) -> Result<()> {
-        self.state.reset();
-
         let mut total_len: u64 = 0;
         let mut hasher = crc32fast::Hasher::new();
         for p in parts {
             total_len = total_len.saturating_add(p.len() as u64);
             hasher.update(p);
         }
-        self.prepare_policy_stream(Some(total_len))?;
+        self.restart_online_policy_stream(Some(total_len))?;
         let checksum = hasher.finalize();
         let header = Header::new(coder, total_len, checksum);
         header.write(w)?;
@@ -1719,6 +1943,7 @@ impl Compressor {
             CoderType::AC => self.compress_ac_iter(it, w)?,
             CoderType::RANS => self.compress_rans_iter(it, w)?,
         }
+        self.finish_online_policy_stream()?;
         Ok(())
     }
 
@@ -1749,9 +1974,7 @@ impl Compressor {
     {
         let mut encoder = ArithmeticEncoder::new(output);
 
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+        self.refresh_current_pdf(0);
 
         for byte in data {
             quantize_pdf_to_cdf_with_buffer(
@@ -1763,13 +1986,7 @@ impl Compressor {
             let lo = self.cdf_buffer_ac[sym] as u64;
             let hi = self.cdf_buffer_ac[sym + 1] as u64;
             encoder.encode_counts(lo, hi, CDF_TOTAL as u64)?;
-            self.online_update_from_current_pdf(byte)?;
-
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, byte as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+            self.observe_symbol_from_current_pdf(byte)?;
         }
 
         let _ = encoder.finish()?;
@@ -1782,9 +1999,7 @@ impl Compressor {
     {
         let mut encoder = BlockedRansEncoder::new();
 
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+        self.refresh_current_pdf(0);
 
         for byte in data {
             quantize_pdf_to_rans_cdf_with_buffer(
@@ -1799,13 +2014,7 @@ impl Compressor {
                 ANS_TOTAL,
             );
             encoder.encode(cdf);
-            self.online_update_from_current_pdf(byte)?;
-
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, byte as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+            self.observe_symbol_from_current_pdf(byte)?;
         }
 
         let blocks = encoder.finish();
@@ -1822,8 +2031,7 @@ impl Compressor {
         let mut cursor = Cursor::new(data);
         let header = Header::read(&mut cursor)?;
 
-        self.state.reset();
-        self.prepare_policy_stream(Some(header.original_len))?;
+        self.restart_online_policy_stream(Some(header.original_len))?;
         let compressed = &data[Header::SIZE..];
         let result = match header.coder_type() {
             CoderType::AC => self.decompress_ac(compressed, header.original_len as usize)?,
@@ -1838,6 +2046,7 @@ impl Compressor {
                 actual_crc
             );
         }
+        self.finish_online_policy_stream()?;
         Ok(result)
     }
 
@@ -1845,9 +2054,7 @@ impl Compressor {
         let mut decoder = ArithmeticDecoder::new(compressed)?;
         let mut result = Vec::with_capacity(original_len);
 
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+        self.refresh_current_pdf(0);
 
         for _ in 0..original_len {
             quantize_pdf_to_cdf_with_buffer(
@@ -1858,13 +2065,7 @@ impl Compressor {
             let sym = decoder.decode_symbol_counts(&self.cdf_buffer_ac, CDF_TOTAL)?;
             let byte = sym as u8;
             result.push(byte);
-            self.online_update_from_current_pdf(byte)?;
-
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, byte as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+            self.observe_symbol_from_current_pdf(byte)?;
         }
 
         Ok(result)
@@ -1901,9 +2102,7 @@ impl Compressor {
         let mut decoder = BlockedRansDecoder::new(blocks, original_len)?;
         let mut result = Vec::with_capacity(original_len);
 
-        let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-        let logits = self.model.forward(&mut self.scratch, 0, &mut self.state);
-        Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+        self.refresh_current_pdf(0);
 
         for _ in 0..original_len {
             quantize_pdf_to_rans_cdf_with_buffer(
@@ -1913,13 +2112,7 @@ impl Compressor {
             );
             let sym = decoder.decode(&self.cdf_buffer_rans)? as u8;
             result.push(sym);
-            self.online_update_from_current_pdf(sym)?;
-
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, sym as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+            self.observe_symbol_from_current_pdf(sym)?;
         }
 
         Ok(result)
@@ -1943,15 +2136,16 @@ impl Compressor {
         let prefix_len = prefix_parts
             .iter()
             .fold(0usize, |acc, p| acc.saturating_add(p.len()));
+        self.finish_online_policy_stream()?;
         self.reset_and_prime();
         self.fit_chain(prefix_parts, Some((prefix_len + data.len()) as u64))?;
 
         let mut total_bits = 0.0;
         for &byte in data {
             total_bits -= self.pdf_buffer[byte as usize].max(1e-300).log2();
-            self.online_update_from_current_pdf(byte)?;
-            self.refresh_current_pdf(byte as u32);
+            self.observe_symbol_from_current_pdf(byte)?;
         }
+        self.finish_online_policy_stream()?;
         Ok(total_bits / (data.len() as f64))
     }
 
@@ -1977,8 +2171,9 @@ impl Compressor {
             return Ok(0.0);
         }
 
-        self.reset_and_prime();
-        self.prepare_policy_stream(Some((2 * n) as u64))?;
+        self.restart_online_policy_stream(Some((2 * n) as u64))?;
+
+        self.refresh_current_pdf(0);
 
         let mut total_bits = 0.0;
         for idx in 0..n {
@@ -1986,22 +2181,13 @@ impl Compressor {
             let b = if swap { x[idx] } else { y[idx] };
 
             total_bits -= self.pdf_buffer[a as usize].max(1e-300).log2();
-            self.online_update_from_current_pdf(a)?;
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, a as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+            self.observe_symbol_from_current_pdf(a)?;
 
             total_bits -= self.pdf_buffer[b as usize].max(1e-300).log2();
-            self.online_update_from_current_pdf(b)?;
-            let bias = self.online.as_ref().map(|s| s.out_bias.as_slice());
-            let logits = self
-                .model
-                .forward(&mut self.scratch, b as u32, &mut self.state);
-            Self::logits_to_pdf(logits, bias, &mut self.pdf_buffer);
+            self.observe_symbol_from_current_pdf(b)?;
         }
 
+        self.finish_online_policy_stream()?;
         Ok(total_bits / (n as f64))
     }
 }
