@@ -1536,10 +1536,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             let mut fac = crate::ctw::FacContextTree::new(*depth, 8);
             fac.reserve_for_symbols(data.len());
             for &b in data {
-                for bit_idx in 0..8 {
-                    let bit = ((b >> (7 - bit_idx)) & 1) == 1;
-                    fac.update(bit, bit_idx);
-                }
+                fac.update_byte_msb(b);
             }
             let ln_p = fac.get_log_block_probability();
             let bits = -ln_p / std::f64::consts::LN_2;
@@ -1557,10 +1554,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
             let mut fac = crate::ctw::FacContextTree::new(*base_depth, bits_per_byte);
             fac.reserve_for_symbols(data.len());
             for &b in data {
-                for i in 0..bits_per_byte {
-                    let bit_idx = i;
-                    fac.update(((b >> i) & 1) == 1, bit_idx);
-                }
+                fac.update_byte_lsb(b);
             }
             let ln_p = fac.get_log_block_probability();
             let bits = -ln_p / std::f64::consts::LN_2;

@@ -291,9 +291,7 @@ impl CtwPredictor {
     #[inline]
     fn bit_prob_one_msb(&mut self, bit_idx: usize) -> f64 {
         debug_assert!(self.can_fast_ac_bitwise());
-        self.tree
-            .predict(true, bit_idx)
-            .clamp(PDF_MIN, 1.0 - PDF_MIN)
+        self.tree.predict_one(bit_idx).clamp(PDF_MIN, 1.0 - PDF_MIN)
     }
 
     #[inline]
@@ -370,7 +368,9 @@ struct MambaPredictor {
     compressor: mambazip::Compressor,
     primed: bool,
     pdf: Vec<f64>,
+    cdf: [f64; 257],
     valid: bool,
+    cdf_valid: bool,
 }
 
 #[derive(Clone)]
@@ -378,6 +378,8 @@ struct MambaPredictor {
 struct RwkvPredictor {
     compressor: rwkvzip::Compressor,
     primed: bool,
+    cdf: [f64; 257],
+    cdf_valid: bool,
 }
 
 #[derive(Clone)]
@@ -429,7 +431,9 @@ impl MambaPredictor {
             compressor,
             primed: false,
             pdf: vec![0.0; vocab],
+            cdf: uniform_cdf_row(),
             valid: false,
+            cdf_valid: false,
         }
     }
 
@@ -440,33 +444,58 @@ impl MambaPredictor {
             compressor,
             primed: false,
             pdf: vec![0.0; vocab],
+            cdf: uniform_cdf_row(),
             valid: false,
+            cdf_valid: false,
         })
     }
 
-    fn ensure_predicted(&mut self) {
+    fn ensure_predicted(&mut self, want_cdf: bool) {
         if self.valid {
+            if want_cdf && !self.cdf_valid {
+                debug_assert!(self.pdf.len() >= 256);
+                build_cdf_row_from_pdf_slice(&self.pdf[..256], &mut self.cdf);
+                self.cdf_valid = true;
+            }
             return;
         }
         if !self.primed {
             self.compressor.forward_to_pdf(0, &mut self.pdf);
             self.primed = true;
             self.valid = true;
+            self.cdf_valid = false;
+            if want_cdf {
+                debug_assert!(self.pdf.len() >= 256);
+                build_cdf_row_from_pdf_slice(&self.pdf[..256], &mut self.cdf);
+                self.cdf_valid = true;
+            }
             return;
         }
         self.valid = true;
+        self.cdf_valid = false;
+        if want_cdf {
+            debug_assert!(self.pdf.len() >= 256);
+            build_cdf_row_from_pdf_slice(&self.pdf[..256], &mut self.cdf);
+            self.cdf_valid = true;
+        }
     }
 
     fn pdf_next(&mut self) -> &[f64] {
-        self.ensure_predicted();
+        self.ensure_predicted(false);
         &self.pdf
     }
 
+    fn cdf_next(&mut self) -> &[f64; 257] {
+        self.ensure_predicted(true);
+        &self.cdf
+    }
+
     fn update(&mut self, symbol: u8) -> Result<()> {
-        self.ensure_predicted();
+        self.ensure_predicted(false);
         self.compressor.online_update_from_pdf(symbol, &self.pdf)?;
         self.compressor.forward_to_pdf(symbol as u32, &mut self.pdf);
         self.valid = true;
+        self.cdf_valid = false;
         Ok(())
     }
 
@@ -483,6 +512,8 @@ impl RwkvPredictor {
         Self {
             compressor,
             primed: false,
+            cdf: uniform_cdf_row(),
+            cdf_valid: false,
         }
     }
 
@@ -491,24 +522,38 @@ impl RwkvPredictor {
         Ok(Self {
             compressor,
             primed: false,
+            cdf: uniform_cdf_row(),
+            cdf_valid: false,
         })
     }
 
-    fn ensure_predicted(&mut self) {
+    fn ensure_predicted(&mut self, want_cdf: bool) {
         if !self.primed {
             self.compressor.reset_and_prime();
             self.primed = true;
+            self.cdf_valid = false;
+        }
+        if want_cdf && !self.cdf_valid {
+            debug_assert!(self.compressor.pdf_buffer.len() >= 256);
+            build_cdf_row_from_pdf_slice(&self.compressor.pdf_buffer[..256], &mut self.cdf);
+            self.cdf_valid = true;
         }
     }
 
     fn pdf_next(&mut self) -> &[f64] {
-        self.ensure_predicted();
+        self.ensure_predicted(false);
         &self.compressor.pdf_buffer
     }
 
+    fn cdf_next(&mut self) -> &[f64; 257] {
+        self.ensure_predicted(true);
+        &self.cdf
+    }
+
     fn update(&mut self, symbol: u8) -> Result<()> {
-        self.ensure_predicted();
+        self.ensure_predicted(false);
         self.compressor.observe_symbol_from_current_pdf(symbol)?;
+        self.cdf_valid = false;
         Ok(())
     }
 
@@ -1253,6 +1298,16 @@ impl RatePdfPredictor {
                 let _ = model.cdf();
                 Ok(true)
             }
+            #[cfg(feature = "backend-mamba")]
+            Self::Mamba(m) => {
+                let _ = m.cdf_next();
+                Ok(true)
+            }
+            #[cfg(feature = "backend-rwkv")]
+            Self::Rwkv(m) => {
+                let _ = m.cdf_next();
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -1263,6 +1318,10 @@ impl RatePdfPredictor {
             Self::Match { model } => Some(cdf_bit_prob_one_msb(model.cdf(), lo, hi)),
             Self::SparseMatch { model } => Some(cdf_bit_prob_one_msb(model.cdf(), lo, hi)),
             Self::Ppmd { model } => Some(cdf_bit_prob_one_msb(model.cdf(), lo, hi)),
+            #[cfg(feature = "backend-mamba")]
+            Self::Mamba(m) => Some(cdf_bit_prob_one_msb(m.cdf_next(), lo, hi)),
+            #[cfg(feature = "backend-rwkv")]
+            Self::Rwkv(m) => Some(cdf_bit_prob_one_msb(m.cdf_next(), lo, hi)),
             _ => None,
         }
     }
@@ -1786,6 +1845,113 @@ mod tests {
         }
     }
 
+    fn assert_ctw_pdf_next_preserves_state(mut predictor: CtwPredictor) {
+        for &b in b"ctw predictor state preservation payload" {
+            predictor.update(b);
+        }
+        let mut before_p0 = [0.0f64; 8];
+        let mut before_p1 = [0.0f64; 8];
+        for bit_idx in 0..8usize {
+            before_p0[bit_idx] = predictor.tree.predict(false, bit_idx);
+            before_p1[bit_idx] = predictor.tree.predict(true, bit_idx);
+        }
+        let log_before = predictor.tree.get_log_block_probability();
+        let _ = predictor.pdf_next();
+        let log_after = predictor.tree.get_log_block_probability();
+        assert!(
+            (log_before - log_after).abs() < 1e-12,
+            "log drift: before={log_before} after={log_after}"
+        );
+        for bit_idx in 0..8usize {
+            let after_p0 = predictor.tree.predict(false, bit_idx);
+            let after_p1 = predictor.tree.predict(true, bit_idx);
+            assert!(
+                (before_p0[bit_idx] - after_p0).abs() < 1e-12,
+                "bit {bit_idx} p0 drift: {} vs {}",
+                before_p0[bit_idx],
+                after_p0
+            );
+            assert!(
+                (before_p1[bit_idx] - after_p1).abs() < 1e-12,
+                "bit {bit_idx} p1 drift: {} vs {}",
+                before_p1[bit_idx],
+                after_p1
+            );
+        }
+    }
+
+    #[test]
+    fn ctw_pdf_next_preserves_state() {
+        assert_ctw_pdf_next_preserves_state(CtwPredictor::new_ctw(7));
+    }
+
+    #[test]
+    fn fac_pdf_next_preserves_state() {
+        assert_ctw_pdf_next_preserves_state(CtwPredictor::new_fac(7, 8));
+    }
+
+    fn assert_fill_pattern_preserves_symbol_log_probs(mut predictor: CtwPredictor) {
+        for &b in b"fill-pattern preservation regression payload" {
+            predictor.update(b);
+        }
+        let mut baseline = [0.0f64; 256];
+        for (sym, slot) in baseline.iter_mut().enumerate() {
+            *slot = predictor.log_prob_symbol_bruteforce(sym as u8);
+        }
+        let _ = predictor.fill_pattern_log_probs();
+        for (sym, &expected) in baseline.iter().enumerate() {
+            let got = predictor.log_prob_symbol_bruteforce(sym as u8);
+            let diff = (expected - got).abs();
+            assert!(
+                diff < 1e-12,
+                "symbol={sym} expected={expected} got={got} diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctw_fill_pattern_preserves_symbol_log_probs() {
+        assert_fill_pattern_preserves_symbol_log_probs(CtwPredictor::new_ctw(7));
+    }
+
+    #[test]
+    fn fac_fill_pattern_preserves_symbol_log_probs() {
+        assert_fill_pattern_preserves_symbol_log_probs(CtwPredictor::new_fac(7, 8));
+    }
+
+    fn assert_pdf_then_update_matches_plain_update(mut base: CtwPredictor) {
+        for &b in b"pdf then update parity payload" {
+            base.update(b);
+        }
+        let observed = b'n';
+        let mut with_pdf = base.clone();
+        let mut plain = base;
+
+        let _ = with_pdf.pdf_next();
+        with_pdf.update(observed);
+        plain.update(observed);
+
+        for sym in 0u8..=255u8 {
+            let lp_with_pdf = with_pdf.log_prob_symbol_bruteforce(sym);
+            let lp_plain = plain.log_prob_symbol_bruteforce(sym);
+            let diff = (lp_with_pdf - lp_plain).abs();
+            assert!(
+                diff < 1e-12,
+                "symbol={sym} with_pdf={lp_with_pdf} plain={lp_plain} diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctw_pdf_then_update_matches_plain_update() {
+        assert_pdf_then_update_matches_plain_update(CtwPredictor::new_ctw(7));
+    }
+
+    #[test]
+    fn fac_pdf_then_update_matches_plain_update() {
+        assert_pdf_then_update_matches_plain_update(CtwPredictor::new_fac(7, 8));
+    }
+
     #[test]
     fn roundtrip_rate_ac_ctw() {
         let data = b"ctw backend roundtrip payload";
@@ -2133,6 +2299,26 @@ mod tests {
                     max_len: 255,
                     base_mix: 0.02,
                     confidence_scale: 1.0,
+                },
+                -1,
+            )
+            .unwrap(),
+        );
+        #[cfg(feature = "backend-rwkv")]
+        assert_cached_cdf_fast_bitwise_matches_pdf_rows(
+            RatePdfPredictor::from_rate_backend(
+                RateBackend::Rwkv7Method {
+                    method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+                },
+                -1,
+            )
+            .unwrap(),
+        );
+        #[cfg(feature = "backend-mamba")]
+        assert_cached_cdf_fast_bitwise_matches_pdf_rows(
+            RatePdfPredictor::from_rate_backend(
+                RateBackend::MambaMethod {
+                    method: "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
                 },
                 -1,
             )

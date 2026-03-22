@@ -8,10 +8,12 @@ SOURCE_FILE=${INFOTHEORY_BENCH_SOURCE:-/tmp/enwik7}
 TIME_CMD=/usr/bin/time
 BENCH_SUITE=${INFOTHEORY_BENCH_SUITE:-two-json}
 COMP_BACKEND=${INFOTHEORY_BENCH_COMPRESSION_BACKEND:-rate-ac}
+BENCH_FEATURES=${INFOTHEORY_BENCH_FEATURES:-cli}
 REPEATS=${INFOTHEORY_BENCH_REPEATS:-3}
 WARMUPS=${INFOTHEORY_BENCH_WARMUPS:-1}
 SIZES=${INFOTHEORY_BENCH_SIZES:-"4096 16384 65536 262144 1048576 2097152 4194304 10000000"}
 SUBJECT_FILTER=${INFOTHEORY_BENCH_SUBJECTS:-}
+WORKDIR_ROOT=${INFOTHEORY_BENCH_WORKDIR_ROOT:-${TMPDIR:-/tmp}}
 STAMP=$(date +%Y%m%d-%H%M%S)
 RAW_TSV=
 SUMMARY_TSV=
@@ -75,8 +77,10 @@ Environment:
   INFOTHEORY_BENCH_WARMUPS=1
   INFOTHEORY_BENCH_SIZES="4096 16384 ... 10000000"
   INFOTHEORY_BENCH_SUBJECTS=rwkv
+  INFOTHEORY_BENCH_FEATURES="cli backend-rwkv"
   INFOTHEORY_BENCH_CPU=11
   INFOTHEORY_BENCH_COMPRESSION_BACKEND=rate-ac
+  INFOTHEORY_BENCH_WORKDIR_ROOT=/var/tmp
   INFOTHEORY_BENCH_FRESH=1
   INFOTHEORY_BENCH_RAW_TSV=/tmp/custom-raw.tsv
   INFOTHEORY_BENCH_SUMMARY_TSV=/tmp/custom-summary.tsv
@@ -109,6 +113,13 @@ case "${COMP_BACKEND}" in
   *)
     fail "INFOTHEORY_BENCH_COMPRESSION_BACKEND must be 'rate-ac' or 'rate-rans'"
     ;;
+esac
+
+BENCH_FEATURES=$(printf '%s' "${BENCH_FEATURES}" | tr ',' ' ' | xargs)
+[ -n "${BENCH_FEATURES}" ] || BENCH_FEATURES="cli"
+case " ${BENCH_FEATURES} " in
+  *" cli "*) ;;
+  *) BENCH_FEATURES="cli ${BENCH_FEATURES}" ;;
 esac
 
 case "${REPEATS}" in
@@ -209,7 +220,8 @@ initialize_raw_tsv() {
   printf '%s\n' "${RAW_HEADER}" > "${RAW_TSV}"
 }
 
-WORK_DIR=$(mktemp -d "/tmp/${SUITE_PATH_PREFIX}-work.XXXXXX")
+mkdir -p "${WORKDIR_ROOT}"
+WORK_DIR=$(mktemp -d "${WORKDIR_ROOT%/}/${SUITE_PATH_PREFIX}-work.XXXXXX")
 BIN_PATH="${ROOT_DIR}/target/release/infotheory"
 SUBJECTS_TSV="${WORK_DIR}/subjects.tsv"
 
@@ -250,8 +262,8 @@ PY
 
 CPU=$(choose_cpu)
 
-say "[bench] Building release CLI binary with fresh cargo build..."
-(cd "${ROOT_DIR}" && CARGO_INCREMENTAL=0 cargo build --release --features cli --bin infotheory --locked)
+say "[bench] Building release CLI binary with features: ${BENCH_FEATURES}"
+(cd "${ROOT_DIR}" && CARGO_INCREMENTAL=0 cargo build --release --features "${BENCH_FEATURES}" --bin infotheory --locked)
 [ -x "${BIN_PATH}" ] || fail "Expected built binary at ${BIN_PATH}"
 
 python3 - "${SUITE_SPEC_PATH}" "${ROOT_DIR}" "${WORK_DIR}" "${SUITE_DISPLAY}" > "${SUBJECTS_TSV}" <<'PY'
@@ -668,15 +680,30 @@ EOF
           "${stdout_path}" "${stderr_path}" "${time_path}"
         archive_ready=1
         archive_bytes=$(wc -c < "${archive_path}" | tr -d ' ')
-        IFS="$(printf '\t')" read -r real_seconds user_seconds sys_seconds rss_kib <<EOF
+        IFS="$(printf '\t')" read -r compress_real_seconds compress_user_seconds compress_sys_seconds compress_rss_kib <<EOF
 $(parse_time_file "${time_path}")
 EOF
-        run_plain decompress "${archive_path}" "${restored_path}" "${subject_kind}" "${spec_path}" "${h_order}"
-        cmp -s "${input_path}" "${restored_path}" || fail "Compression round-trip failed for ${subject} at ${size_bytes} bytes (rep ${rep})"
+        if [ "${need_decompress}" -eq 1 ]; then
+          run_timed decompress "${archive_path}" "${restored_path}" "${subject_kind}" "${spec_path}" "${h_order}" \
+            "${stdout_path}" "${stderr_path}" "${time_path}"
+          cmp -s "${input_path}" "${restored_path}" || fail "Compression round-trip failed for ${subject} at ${size_bytes} bytes (rep ${rep})"
+          IFS="$(printf '\t')" read -r decompress_real_seconds decompress_user_seconds decompress_sys_seconds decompress_rss_kib <<EOF
+$(parse_time_file "${time_path}")
+EOF
+        else
+          run_plain decompress "${archive_path}" "${restored_path}" "${subject_kind}" "${spec_path}" "${h_order}"
+          cmp -s "${input_path}" "${restored_path}" || fail "Compression round-trip failed for ${subject} at ${size_bytes} bytes (rep ${rep})"
+        fi
         rm -f "${restored_path}"
         append_row \
           "compress" "${subject}" "${subject_kind}" "${expert_kind}" "compress:${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" \
-          "${input_sha256}" "${archive_bytes}" "" "${real_seconds}" "${user_seconds}" "${sys_seconds}" "${rss_kib}" "1"
+          "${input_sha256}" "${archive_bytes}" "" "${compress_real_seconds}" "${compress_user_seconds}" "${compress_sys_seconds}" "${compress_rss_kib}" "1"
+        if [ "${need_decompress}" -eq 1 ]; then
+          append_row \
+            "decompress" "${subject}" "${subject_kind}" "${expert_kind}" "decompress:${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" \
+            "${input_sha256}" "${archive_bytes}" "" "${decompress_real_seconds}" "${decompress_user_seconds}" "${decompress_sys_seconds}" "${decompress_rss_kib}" "1"
+          need_decompress=0
+        fi
       fi
 
       if [ "${need_decompress}" -eq 1 ]; then

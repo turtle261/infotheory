@@ -2604,7 +2604,7 @@ mod tests {
         fn update(&mut self, _symbol: u8) {}
     }
 
-    fn assert_log_prob_update_matches_separate(backend: RateBackend) {
+    fn assert_log_prob_update_matches_separate(label: &str, backend: RateBackend) {
         let mut separate =
             RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
         let mut combined = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
@@ -2617,7 +2617,7 @@ mod tests {
             let diff = (logp_separate - logp_combined).abs();
             assert!(
                 diff <= 1e-12,
-                "symbol={b} separate={logp_separate} combined={logp_combined} diff={diff}"
+                "[{label}] symbol={b} separate={logp_separate} combined={logp_combined} diff={diff}"
             );
 
             let mut sep_row = [0.0; 256];
@@ -2637,14 +2637,25 @@ mod tests {
     }
 
     #[test]
-    fn predictor_log_prob_update_matches_separate_update_for_specialized_backends() {
-        assert_log_prob_update_matches_separate(RateBackend::RosaPlus);
-        assert_log_prob_update_matches_separate(RateBackend::Ctw { depth: 6 });
-        assert_log_prob_update_matches_separate(RateBackend::FacCtw {
-            base_depth: 6,
-            num_percept_bits: 8,
-            encoding_bits: 8,
-        });
+    fn predictor_log_prob_update_matches_separate_update_for_rosa_backend() {
+        assert_log_prob_update_matches_separate("rosa", RateBackend::RosaPlus);
+    }
+
+    #[test]
+    fn predictor_log_prob_update_matches_separate_update_for_ctw_backend() {
+        assert_log_prob_update_matches_separate("ctw", RateBackend::Ctw { depth: 6 });
+    }
+
+    #[test]
+    fn predictor_log_prob_update_matches_separate_update_for_fac_ctw_backend() {
+        assert_log_prob_update_matches_separate(
+            "fac-ctw",
+            RateBackend::FacCtw {
+                base_depth: 6,
+                num_percept_bits: 8,
+                encoding_bits: 8,
+            },
+        );
     }
 
     #[test]
@@ -2785,5 +2796,34 @@ mod tests {
         let next_base = baseline.log_prob(next);
         let next_probe = probe.log_prob(next);
         assert!((next_base - next_probe).abs() < 1e-9);
+    }
+
+    fn assert_predictor_log_probs_normalize_to_one(backend: RateBackend) {
+        let mut predictor = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+        for &b in b"normalization corpus for ctw/fac predictor checks" {
+            predictor.update(b);
+        }
+        let mut sum = 0.0f64;
+        for sym in 0u8..=255u8 {
+            sum += predictor.log_prob(sym).exp();
+        }
+        assert!(
+            (sum - 1.0).abs() <= 1e-10,
+            "probability mass drift: sum={sum}"
+        );
+    }
+
+    #[test]
+    fn ctw_predictor_symbol_probs_normalize() {
+        assert_predictor_log_probs_normalize_to_one(RateBackend::Ctw { depth: 7 });
+    }
+
+    #[test]
+    fn fac_ctw_predictor_symbol_probs_normalize() {
+        assert_predictor_log_probs_normalize_to_one(RateBackend::FacCtw {
+            base_depth: 7,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+        });
     }
 }

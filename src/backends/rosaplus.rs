@@ -15,6 +15,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -31,6 +32,8 @@ type LmNodeIx = u32;
 const SAM_STATE_NONE: SamStateIx = -1;
 const SAM_EDGE_NONE: SamEdgeIx = u32::MAX;
 const LM_NODE_NONE: LmNodeIx = u32::MAX;
+const LM_PACKED_SYM_OVERFLOW: u16 = u16::MAX;
+const LM_PACKED_CNT_MAX: u16 = u16::MAX;
 
 // This crate is used byte-wise by infotheory; for fast incremental conditional updates we
 // support an optional fixed 256-byte alphabet LM build/update path.
@@ -766,6 +769,176 @@ struct CountNode {
     next: LmNodeIx,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LmNodes {
+    sym_lo: Vec<u16>,
+    cnt_lo: Vec<u16>,
+    next: Vec<LmNodeIx>,
+    cnt_overflow_mask: Vec<u8>,
+    sym_overflow: HashMap<u32, u32>,
+    cnt_overflow: HashMap<u32, u64>,
+}
+
+impl LmNodes {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.next.len()
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.sym_lo.clear();
+        self.cnt_lo.clear();
+        self.next.clear();
+        self.cnt_overflow_mask.clear();
+        self.sym_overflow.clear();
+        self.cnt_overflow.clear();
+    }
+
+    #[inline(always)]
+    fn reserve_exact(&mut self, additional: usize) {
+        self.sym_lo.reserve_exact(additional);
+        self.cnt_lo.reserve_exact(additional);
+        self.next.reserve_exact(additional);
+        self.cnt_overflow_mask.reserve_exact(additional);
+    }
+
+    #[inline(always)]
+    fn truncate(&mut self, new_len: usize) {
+        self.sym_lo.truncate(new_len);
+        self.cnt_lo.truncate(new_len);
+        self.next.truncate(new_len);
+        self.cnt_overflow_mask.truncate(new_len);
+        self.sym_overflow.retain(|&k, _| (k as usize) < new_len);
+        self.cnt_overflow.retain(|&k, _| (k as usize) < new_len);
+    }
+
+    #[inline(always)]
+    fn resize(&mut self, new_len: usize, value: CountNode) {
+        if new_len <= self.len() {
+            self.truncate(new_len);
+            return;
+        }
+        while self.len() < new_len {
+            self.push(value);
+        }
+    }
+
+    #[inline(always)]
+    fn set_sym_idx(&mut self, idx: usize, sym_idx: u32) {
+        if sym_idx < LM_PACKED_SYM_OVERFLOW as u32 {
+            self.sym_lo[idx] = sym_idx as u16;
+            self.sym_overflow.remove(&(idx as u32));
+        } else {
+            self.sym_lo[idx] = LM_PACKED_SYM_OVERFLOW;
+            self.sym_overflow.insert(idx as u32, sym_idx);
+        }
+    }
+
+    #[inline(always)]
+    fn set_cnt(&mut self, idx: usize, cnt: u64) {
+        if cnt <= LM_PACKED_CNT_MAX as u64 {
+            self.cnt_lo[idx] = cnt as u16;
+            self.cnt_overflow.remove(&(idx as u32));
+            self.cnt_overflow_mask[idx] = 0;
+        } else {
+            self.cnt_lo[idx] = LM_PACKED_CNT_MAX;
+            self.cnt_overflow
+                .insert(idx as u32, cnt - LM_PACKED_CNT_MAX as u64);
+            self.cnt_overflow_mask[idx] = 1;
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, node: CountNode) {
+        let idx = self.len();
+        self.sym_lo.push(0);
+        self.cnt_lo.push(0);
+        self.next.push(node.next);
+        self.cnt_overflow_mask.push(0);
+        self.set_sym_idx(idx, node.sym_idx);
+        self.set_cnt(idx, node.cnt);
+    }
+
+    #[inline(always)]
+    fn get(&self, idx: usize) -> CountNode {
+        CountNode {
+            sym_idx: self.sym_idx(idx),
+            cnt: self.cnt(idx),
+            next: self.next[idx],
+        }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, idx: usize, node: CountNode) {
+        self.next[idx] = node.next;
+        self.set_sym_idx(idx, node.sym_idx);
+        self.set_cnt(idx, node.cnt);
+    }
+
+    #[inline(always)]
+    fn sym_idx(&self, idx: usize) -> u32 {
+        if self.sym_lo[idx] == LM_PACKED_SYM_OVERFLOW {
+            self.sym_overflow
+                .get(&(idx as u32))
+                .copied()
+                .unwrap_or(LM_PACKED_SYM_OVERFLOW as u32)
+        } else {
+            self.sym_lo[idx] as u32
+        }
+    }
+
+    #[inline(always)]
+    fn cnt(&self, idx: usize) -> u64 {
+        if self.cnt_overflow_mask[idx] == 0 {
+            self.cnt_lo[idx] as u64
+        } else {
+            self.cnt_lo[idx] as u64 + self.cnt_overflow.get(&(idx as u32)).copied().unwrap_or(0)
+        }
+    }
+
+    #[inline(always)]
+    fn next(&self, idx: usize) -> LmNodeIx {
+        self.next[idx]
+    }
+
+    #[inline(always)]
+    fn add_cnt(&mut self, idx: usize, add: u64) {
+        let next = self.cnt(idx).saturating_add(add);
+        self.set_cnt(idx, next);
+    }
+}
+
+struct LmNodesIter<'a> {
+    nodes: &'a LmNodes,
+    idx: usize,
+}
+
+impl<'a> Iterator for LmNodesIter<'a> {
+    type Item = CountNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.nodes.len() {
+            return None;
+        }
+        let out = self.nodes.get(self.idx);
+        self.idx += 1;
+        Some(out)
+    }
+}
+
+impl<'a> IntoIterator for &'a LmNodes {
+    type Item = CountNode;
+    type IntoIter = LmNodesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        LmNodesIter {
+            nodes: self,
+            idx: 0,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LM {
     alphabet: Vec<u32>,
@@ -777,7 +950,7 @@ struct LM {
     byte_map: [i16; 256],
 
     ls: Vec<LmState>,
-    nodes: Vec<CountNode>,
+    nodes: LmNodes,
 }
 
 impl Default for LM {
@@ -790,12 +963,17 @@ impl Default for LM {
             has_byte_map: false,
             byte_map: [-1; 256],
             ls: Vec::new(),
-            nodes: Vec::new(),
+            nodes: LmNodes::default(),
         }
     }
 }
 
 impl LM {
+    #[inline(always)]
+    fn ls_is_implicit_single(ls: &LmState) -> bool {
+        ls.head == LM_NODE_NONE && ls.types_t == 1 && ls.total_n > 0
+    }
+
     #[inline(always)]
     fn capped_start_state(&self, sam: &Sam, max_order: i64, mut v: SamStateIx) -> SamStateIx {
         if max_order < 0 {
@@ -896,24 +1074,61 @@ impl LM {
     #[inline(always)]
     fn inc(&mut self, state: u32, sym_idx: u32, add: u64) {
         let ls = &mut self.ls[state as usize];
+        if ls.head == LM_NODE_NONE {
+            if ls.total_n == 0 {
+                ls.total_n = add;
+                ls.types_t = 1;
+                ls.last_sym = sym_idx;
+                ls.last_node = LM_NODE_NONE;
+                return;
+            }
+            if Self::ls_is_implicit_single(ls) {
+                if ls.last_sym == sym_idx {
+                    ls.total_n += add;
+                    ls.last_node = LM_NODE_NONE;
+                    return;
+                }
+                let old_sym = ls.last_sym;
+                let old_cnt = ls.total_n;
+                let old_idx = node_ix(self.nodes.len());
+                self.nodes.push(CountNode {
+                    sym_idx: old_sym,
+                    cnt: old_cnt,
+                    next: LM_NODE_NONE,
+                });
+                let new_idx = node_ix(self.nodes.len());
+                self.nodes.push(CountNode {
+                    sym_idx,
+                    cnt: add,
+                    next: old_idx,
+                });
+                ls.head = new_idx;
+                ls.total_n = old_cnt + add;
+                ls.types_t = 2;
+                ls.last_node = new_idx;
+                ls.last_sym = sym_idx;
+                return;
+            }
+        }
+
         let last = ls.last_node;
-        if last != LM_NODE_NONE && self.nodes[node_usize(last)].sym_idx == sym_idx {
-            self.nodes[node_usize(last)].cnt += add;
+        if last != LM_NODE_NONE && self.nodes.sym_idx(node_usize(last)) == sym_idx {
+            self.nodes.add_cnt(node_usize(last), add);
             ls.total_n += add;
             return;
         }
 
         let mut ni = ls.head;
         while ni != LM_NODE_NONE {
-            let node = &mut self.nodes[node_usize(ni)];
-            if node.sym_idx == sym_idx {
-                node.cnt += add;
+            let idx = node_usize(ni);
+            if self.nodes.sym_idx(idx) == sym_idx {
+                self.nodes.add_cnt(idx, add);
                 ls.total_n += add;
                 ls.last_node = ni;
                 ls.last_sym = sym_idx;
                 return;
             }
-            ni = node.next;
+            ni = self.nodes.next(idx);
         }
 
         let idx = node_ix(self.nodes.len());
@@ -1019,12 +1234,17 @@ impl LM {
             if p < 0 {
                 continue;
             }
-            if self.ls[v].total_n == 0 {
+            let ls_v = self.ls[v];
+            if ls_v.total_n == 0 {
                 continue;
             }
-            let mut ni = self.ls[v].head;
+            if Self::ls_is_implicit_single(&ls_v) {
+                self.inc(state_usize(p) as u32, ls_v.last_sym, ls_v.total_n);
+                continue;
+            }
+            let mut ni = ls_v.head;
             while ni != LM_NODE_NONE {
-                let node = self.nodes[node_usize(ni)];
+                let node = self.nodes.get(node_usize(ni));
                 self.inc(state_usize(p) as u32, node.sym_idx, node.cnt);
                 ni = node.next;
             }
@@ -1058,12 +1278,16 @@ impl LM {
 
                 // Probability of specifically sym_idx in this state
                 let mut count_for_sym = 0u64;
-                if ls.last_node != LM_NODE_NONE && ls.last_sym == sym_idx {
-                    count_for_sym = self.nodes[node_usize(ls.last_node)].cnt;
+                if Self::ls_is_implicit_single(ls) {
+                    if ls.last_sym == sym_idx {
+                        count_for_sym = n;
+                    }
+                } else if ls.last_node != LM_NODE_NONE && ls.last_sym == sym_idx {
+                    count_for_sym = self.nodes.cnt(node_usize(ls.last_node));
                 } else {
                     let mut ni = ls.head;
                     while ni != LM_NODE_NONE {
-                        let node = self.nodes[node_usize(ni)];
+                        let node = self.nodes.get(node_usize(ni));
                         if node.sym_idx == sym_idx {
                             count_for_sym = node.cnt;
                             break;
@@ -1107,11 +1331,15 @@ impl LM {
                 };
                 let scale = residual * lam;
                 let inv_n = 1.0 / (n as f64);
-                let mut ni = ls.head;
-                while ni != LM_NODE_NONE {
-                    let node = self.nodes[node_usize(ni)];
-                    out[node.sym_idx as usize] += scale * ((node.cnt as f64) * inv_n);
-                    ni = node.next;
+                if Self::ls_is_implicit_single(ls) {
+                    out[ls.last_sym as usize] += scale;
+                } else {
+                    let mut ni = ls.head;
+                    while ni != LM_NODE_NONE {
+                        let node = self.nodes.get(node_usize(ni));
+                        out[node.sym_idx as usize] += scale * ((node.cnt as f64) * inv_n);
+                        ni = node.next;
+                    }
                 }
                 residual *= 1.0 - lam;
             }
@@ -1155,11 +1383,49 @@ impl LM {
         tx.ls_changes.push((si, self.ls[si]));
 
         let ls = &mut self.ls[si];
+        if ls.head == LM_NODE_NONE {
+            if ls.total_n == 0 {
+                ls.total_n = add;
+                ls.types_t = 1;
+                ls.last_sym = sym_idx;
+                ls.last_node = LM_NODE_NONE;
+                return;
+            }
+            if Self::ls_is_implicit_single(ls) {
+                if ls.last_sym == sym_idx {
+                    ls.total_n += add;
+                    ls.last_node = LM_NODE_NONE;
+                    return;
+                }
+                let old_sym = ls.last_sym;
+                let old_cnt = ls.total_n;
+                tx.old_nodes_len = tx.old_nodes_len.min(self.nodes.len());
+                let old_idx = node_ix(self.nodes.len());
+                self.nodes.push(CountNode {
+                    sym_idx: old_sym,
+                    cnt: old_cnt,
+                    next: LM_NODE_NONE,
+                });
+                let new_idx = node_ix(self.nodes.len());
+                self.nodes.push(CountNode {
+                    sym_idx,
+                    cnt: add,
+                    next: old_idx,
+                });
+                ls.head = new_idx;
+                ls.total_n = old_cnt + add;
+                ls.types_t = 2;
+                ls.last_node = new_idx;
+                ls.last_sym = sym_idx;
+                return;
+            }
+        }
+
         let last = ls.last_node;
-        if last != LM_NODE_NONE && self.nodes[node_usize(last)].sym_idx == sym_idx {
+        if last != LM_NODE_NONE && self.nodes.sym_idx(node_usize(last)) == sym_idx {
             let ni = node_usize(last);
-            tx.node_changes.push((ni, self.nodes[ni]));
-            self.nodes[ni].cnt += add;
+            tx.node_changes.push((ni, self.nodes.get(ni)));
+            self.nodes.add_cnt(ni, add);
             ls.total_n += add;
             return;
         }
@@ -1167,15 +1433,15 @@ impl LM {
         let mut ni = ls.head;
         while ni != LM_NODE_NONE {
             let idx = node_usize(ni);
-            if self.nodes[idx].sym_idx == sym_idx {
-                tx.node_changes.push((idx, self.nodes[idx]));
-                self.nodes[idx].cnt += add;
+            if self.nodes.sym_idx(idx) == sym_idx {
+                tx.node_changes.push((idx, self.nodes.get(idx)));
+                self.nodes.add_cnt(idx, add);
                 ls.total_n += add;
                 ls.last_node = ni;
                 ls.last_sym = sym_idx;
                 return;
             }
-            ni = self.nodes[idx].next;
+            ni = self.nodes.next(idx);
         }
 
         // New node
@@ -1755,7 +2021,7 @@ impl RosaPlus {
 
         for (idx, old) in tx.lm.node_changes.into_iter().rev() {
             if idx < self.lm.nodes.len() {
-                self.lm.nodes[idx] = old;
+                self.lm.nodes.set(idx, old);
             }
         }
         for (idx, old) in tx.lm.ls_changes.into_iter().rev() {
@@ -1858,7 +2124,36 @@ impl RosaPlus {
         n = n.saturating_add(self.lm.alphabet.len().saturating_mul(size_of::<u32>()));
         n = n.saturating_add(self.lm.unigram.len().saturating_mul(size_of::<u64>()));
         n = n.saturating_add(self.lm.ls.len().saturating_mul(size_of::<LmState>()));
-        n = n.saturating_add(self.lm.nodes.len().saturating_mul(size_of::<CountNode>()));
+        n = n.saturating_add(self.lm.nodes.sym_lo.len().saturating_mul(size_of::<u16>()));
+        n = n.saturating_add(self.lm.nodes.cnt_lo.len().saturating_mul(size_of::<u16>()));
+        n = n.saturating_add(
+            self.lm
+                .nodes
+                .next
+                .len()
+                .saturating_mul(size_of::<LmNodeIx>()),
+        );
+        n = n.saturating_add(
+            self.lm
+                .nodes
+                .cnt_overflow_mask
+                .len()
+                .saturating_mul(size_of::<u8>()),
+        );
+        n = n.saturating_add(
+            self.lm
+                .nodes
+                .sym_overflow
+                .len()
+                .saturating_mul(size_of::<u32>() + size_of::<u32>()),
+        );
+        n = n.saturating_add(
+            self.lm
+                .nodes
+                .cnt_overflow
+                .len()
+                .saturating_mul(size_of::<u32>() + size_of::<u64>()),
+        );
 
         n = n.saturating_add(self.dist.len().saturating_mul(size_of::<f64>()));
         n = n.saturating_add(self.scratch.idx.len().saturating_mul(size_of::<u32>()));
@@ -2517,11 +2812,12 @@ impl RosaPlus {
         }
         for i in 0..nodes_n {
             f.read_exact(&mut b4)?;
-            m.lm.nodes[i].sym_idx = u32::from_le_bytes(b4);
+            let sym_idx = u32::from_le_bytes(b4);
             f.read_exact(&mut b8)?;
-            m.lm.nodes[i].cnt = u64::from_le_bytes(b8);
+            let cnt = u64::from_le_bytes(b8);
             f.read_exact(&mut b4)?;
-            m.lm.nodes[i].next = u32::from_le_bytes(b4);
+            let next = u32::from_le_bytes(b4);
+            m.lm.nodes.set(i, CountNode { sym_idx, cnt, next });
         }
         for ls in &m.lm.ls {
             if ls.head != LM_NODE_NONE && node_usize(ls.head) >= nodes_n {
@@ -2768,14 +3064,21 @@ mod tests {
                     };
                     let scale = residual * lam;
                     let mut count_for_sym = 0u64;
-                    let mut ni = lm.ls[state_usize(u)].head;
-                    while ni != LM_NODE_NONE {
-                        let node = lm.nodes[node_usize(ni)];
-                        if node.sym_idx == sym_idx {
-                            count_for_sym = node.cnt;
-                            break;
+                    let ls = &lm.ls[state_usize(u)];
+                    if LM::ls_is_implicit_single(ls) {
+                        if ls.last_sym == sym_idx {
+                            count_for_sym = n;
                         }
-                        ni = node.next;
+                    } else {
+                        let mut ni = ls.head;
+                        while ni != LM_NODE_NONE {
+                            let node = lm.nodes.get(node_usize(ni));
+                            if node.sym_idx == sym_idx {
+                                count_for_sym = node.cnt;
+                                break;
+                            }
+                            ni = node.next;
+                        }
                     }
                     if count_for_sym > 0 {
                         p_accum += scale * (count_for_sym as f64 / n as f64);
@@ -2812,11 +3115,16 @@ mod tests {
                     };
                     let scale = residual * lam;
                     let inv_n = 1.0 / (n as f64);
-                    let mut ni = lm.ls[state_usize(u)].head;
-                    while ni != LM_NODE_NONE {
-                        let node = lm.nodes[node_usize(ni)];
-                        out[node.sym_idx as usize] += scale * ((node.cnt as f64) * inv_n);
-                        ni = node.next;
+                    let ls = &lm.ls[state_usize(u)];
+                    if LM::ls_is_implicit_single(ls) {
+                        out[ls.last_sym as usize] += scale;
+                    } else {
+                        let mut ni = ls.head;
+                        while ni != LM_NODE_NONE {
+                            let node = lm.nodes.get(node_usize(ni));
+                            out[node.sym_idx as usize] += scale * ((node.cnt as f64) * inv_n);
+                            ni = node.next;
+                        }
                     }
                     residual *= 1.0 - lam;
                 }

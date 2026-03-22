@@ -784,11 +784,10 @@ impl TraceModel {
         match self {
             TraceModel::Rosa { model, .. } => {
                 let mut bits = 0.0;
-                let mut tx = model.begin_tx();
                 for &b in data {
                     let p = model.prob_for_last(b as u32).max(1e-12);
                     bits -= p.log2();
-                    model.train_sequence_tx(&mut tx, &[b]);
+                    model.train_byte(b);
                 }
                 bits
             }
