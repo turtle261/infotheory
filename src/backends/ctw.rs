@@ -4437,8 +4437,14 @@ mod tests {
         }
 
         for bit_idx in 0..predicted.num_bits() {
-            assert_close(predicted.predict(false, bit_idx), fresh.predict(false, bit_idx));
-            assert_close(predicted.predict(true, bit_idx), fresh.predict(true, bit_idx));
+            assert_close(
+                predicted.predict(false, bit_idx),
+                fresh.predict(false, bit_idx),
+            );
+            assert_close(
+                predicted.predict(true, bit_idx),
+                fresh.predict(true, bit_idx),
+            );
         }
     }
 
