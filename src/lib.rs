@@ -86,6 +86,8 @@ pub mod compression;
 pub mod datagen;
 /// Online Bayesian/switching/MDL mixture predictors.
 pub mod mixture;
+/// Information-theoretic code search pipeline (3-stage: prefilter, filter, KMI rerank).
+pub mod search;
 pub(crate) mod neural_mix;
 pub(crate) mod simd_math;
 /// CTW and FAC-CTW backend types.

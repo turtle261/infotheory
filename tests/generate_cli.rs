@@ -91,6 +91,31 @@ fn generate_cli_rosaplus_predicts_green_from_file_and_stdin() {
     let _ = fs::remove_file(prompt_path);
 }
 
+/// When stdin is piped and the sole positional parses as an integer,
+/// the CLI should interpret it as `max_order` (not try to open it as a file).
+#[test]
+fn generate_cli_stdin_with_max_order_positional() {
+    let from_stdin_with_order = run_generate(
+        &[
+            "generate",
+            "8",
+            "--rate-backend",
+            "ctw",
+            "--method",
+            "8",
+            "--bytes",
+            "4",
+            "--greedy",
+        ],
+        Some(PROMPT),
+    );
+    assert_eq!(
+        from_stdin_with_order.len(),
+        4,
+        "should interpret '8' as max_order and read prompt from stdin"
+    );
+}
+
 #[test]
 fn generate_cli_backend_matrix_emits_requested_bytes() {
     let prompt_path = write_temp_file("matrix_prompt", "txt", PROMPT);
@@ -206,19 +231,23 @@ fn generate_cli_supports_expert_spec_and_mixture_spec() {
     );
     assert_eq!(expert_out.len(), 8);
 
-    let mut experts = vec![
+    let experts = vec![
         json!({"name": "ctw", "kind": "ctw", "depth": 32, "log_prior": 0.0}),
         json!({"name": "ppmd", "kind": "ppmd", "order": 12, "memory_mb": 8, "log_prior": 0.0}),
         json!({"name": "rosa", "kind": "rosaplus", "max_order": -1, "log_prior": 0.0}),
         json!({"name": "match", "kind": "match", "log_prior": 0.0}),
     ];
     #[cfg(feature = "backend-rwkv")]
-    experts.push(json!({
-        "name": "rwkv",
-        "kind": "rwkv",
-        "method": "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
-        "log_prior": 0.0
-    }));
+    let experts = {
+        let mut experts = experts;
+        experts.push(json!({
+            "name": "rwkv",
+            "kind": "rwkv",
+            "method": "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
+            "log_prior": 0.0
+        }));
+        experts
+    };
 
     let mixture_path = write_temp_file(
         "mixture",

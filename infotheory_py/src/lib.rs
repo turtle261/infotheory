@@ -1,8 +1,9 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use infotheory::{
-    CalibratedSpec, CalibrationContextKind, CompressionBackend, InfotheoryCtx, MixtureExpertSpec,
-    MixtureKind, MixtureSpec, NcdVariant, ParticleSpec, RateBackend,
+    CalibratedSpec, CalibrationContextKind, CompressionBackend, GenerationConfig,
+    GenerationStrategy, GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec, MixtureKind,
+    MixtureSpec, NcdVariant, ParticleSpec, RateBackend, RateBackendSession,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -104,8 +105,209 @@ fn parse_observation_key_mode(
     ))
 }
 
+fn parse_generation_strategy_value(py_obj: &Bound<'_, PyAny>) -> PyResult<GenerationStrategy> {
+    if let Ok(strategy) = py_obj.extract::<PyRef<'_, PyGenerationStrategy>>() {
+        return Ok(strategy.inner);
+    }
+    if let Ok(s) = py_obj.extract::<String>() {
+        return match s.to_ascii_lowercase().as_str() {
+            "greedy" => Ok(GenerationStrategy::Greedy),
+            "sample" | "sampled" => Ok(GenerationStrategy::Sample),
+            _ => Err(PyValueError::new_err(format!(
+                "unknown GenerationStrategy '{s}' (expected 'greedy' or 'sample')"
+            ))),
+        };
+    }
+    Err(PyValueError::new_err(
+        "GenerationStrategy must be a GenerationStrategy enum value or string alias",
+    ))
+}
+
+fn parse_generation_update_mode_value(py_obj: &Bound<'_, PyAny>) -> PyResult<GenerationUpdateMode> {
+    if let Ok(mode) = py_obj.extract::<PyRef<'_, PyGenerationUpdateMode>>() {
+        return Ok(mode.inner);
+    }
+    if let Ok(s) = py_obj.extract::<String>() {
+        return match s.to_ascii_lowercase().as_str() {
+            "adaptive" => Ok(GenerationUpdateMode::Adaptive),
+            "frozen" => Ok(GenerationUpdateMode::Frozen),
+            _ => Err(PyValueError::new_err(format!(
+                "unknown GenerationUpdateMode '{s}' (expected 'adaptive' or 'frozen')"
+            ))),
+        };
+    }
+    Err(PyValueError::new_err(
+        "GenerationUpdateMode must be a GenerationUpdateMode enum value or string alias",
+    ))
+}
+
+fn generation_config_from_py(config: Option<&Bound<'_, PyAny>>) -> PyResult<GenerationConfig> {
+    if let Some(obj) = config {
+        if let Ok(cfg) = obj.extract::<PyRef<'_, PyGenerationConfig>>() {
+            return Ok(cfg.inner);
+        }
+        return Err(PyValueError::new_err(
+            "config must be a GenerationConfig instance",
+        ));
+    }
+    Ok(GenerationConfig::default())
+}
+
 const MAX_MIXTURE_SPEC_NESTING: usize = 8;
 const MAX_CALIBRATED_SPEC_NESTING: usize = 4;
+
+#[pyclass(name = "GenerationStrategy", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyGenerationStrategy {
+    inner: GenerationStrategy,
+}
+
+#[pymethods]
+impl PyGenerationStrategy {
+    #[classattr]
+    #[pyo3(name = "Greedy")]
+    fn greedy() -> Self {
+        Self {
+            inner: GenerationStrategy::Greedy,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "Sample")]
+    fn sample() -> Self {
+        Self {
+            inner: GenerationStrategy::Sample,
+        }
+    }
+
+    fn __repr__(&self) -> &'static str {
+        match self.inner {
+            GenerationStrategy::Greedy => "GenerationStrategy.Greedy",
+            GenerationStrategy::Sample => "GenerationStrategy.Sample",
+        }
+    }
+}
+
+#[pyclass(name = "GenerationUpdateMode", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyGenerationUpdateMode {
+    inner: GenerationUpdateMode,
+}
+
+#[pymethods]
+impl PyGenerationUpdateMode {
+    #[classattr]
+    #[pyo3(name = "Adaptive")]
+    fn adaptive() -> Self {
+        Self {
+            inner: GenerationUpdateMode::Adaptive,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "Frozen")]
+    fn frozen() -> Self {
+        Self {
+            inner: GenerationUpdateMode::Frozen,
+        }
+    }
+
+    fn __repr__(&self) -> &'static str {
+        match self.inner {
+            GenerationUpdateMode::Adaptive => "GenerationUpdateMode.Adaptive",
+            GenerationUpdateMode::Frozen => "GenerationUpdateMode.Frozen",
+        }
+    }
+}
+
+#[pyclass(name = "GenerationConfig", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyGenerationConfig {
+    inner: GenerationConfig,
+}
+
+#[pymethods]
+impl PyGenerationConfig {
+    #[new]
+    #[pyo3(signature = (
+        strategy=None,
+        update_mode=None,
+        seed=42,
+        temperature=1.0,
+        top_k=0,
+        top_p=1.0
+    ))]
+    fn new(
+        strategy: Option<&Bound<'_, PyAny>>,
+        update_mode: Option<&Bound<'_, PyAny>>,
+        seed: u64,
+        temperature: f64,
+        top_k: usize,
+        top_p: f64,
+    ) -> PyResult<Self> {
+        let mut inner = GenerationConfig::default();
+        if let Some(strategy) = strategy {
+            inner.strategy = parse_generation_strategy_value(strategy)?;
+        }
+        if let Some(update_mode) = update_mode {
+            inner.update_mode = parse_generation_update_mode_value(update_mode)?;
+        }
+        inner.seed = seed;
+        inner.temperature = temperature;
+        inner.top_k = top_k;
+        inner.top_p = top_p;
+        Ok(Self { inner })
+    }
+
+    #[staticmethod]
+    fn greedy_frozen() -> Self {
+        Self {
+            inner: GenerationConfig::greedy_frozen(),
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (seed=42))]
+    fn sampled_frozen(seed: u64) -> Self {
+        Self {
+            inner: GenerationConfig::sampled_frozen(seed),
+        }
+    }
+
+    #[getter]
+    fn strategy(&self) -> PyGenerationStrategy {
+        PyGenerationStrategy {
+            inner: self.inner.strategy,
+        }
+    }
+
+    #[getter]
+    fn update_mode(&self) -> PyGenerationUpdateMode {
+        PyGenerationUpdateMode {
+            inner: self.inner.update_mode,
+        }
+    }
+
+    #[getter]
+    fn seed(&self) -> u64 {
+        self.inner.seed
+    }
+
+    #[getter]
+    fn temperature(&self) -> f64 {
+        self.inner.temperature
+    }
+
+    #[getter]
+    fn top_k(&self) -> usize {
+        self.inner.top_k
+    }
+
+    #[getter]
+    fn top_p(&self) -> f64 {
+        self.inner.top_p
+    }
+}
 
 fn parse_particle_spec_json(v: &serde_json::Value) -> PyResult<ParticleSpec> {
     if v.get("experts").is_some() {
@@ -1353,6 +1555,12 @@ struct PyInfotheoryCtx {
     inner: InfotheoryCtx,
 }
 
+#[pyclass(name = "RateBackendSession", from_py_object)]
+#[derive(Clone)]
+struct PyRateBackendSession {
+    inner: Arc<Mutex<RateBackendSession>>,
+}
+
 #[pymethods]
 impl PyInfotheoryCtx {
     #[new]
@@ -1372,6 +1580,209 @@ impl PyInfotheoryCtx {
 
     fn entropy_rate_bytes(&self, py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
         py.detach(|| py_try(|| Ok(self.inner.entropy_rate_bytes(data, max_order))))
+    }
+
+    fn biased_entropy_rate_bytes(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.biased_entropy_rate_bytes(data, max_order))))
+    }
+
+    fn compress_size(&self, py: Python<'_>, data: &[u8]) -> PyResult<u64> {
+        py.detach(|| py_try(|| Ok(self.inner.compress_size(data))))
+    }
+
+    fn compress_size_chain(&self, py: Python<'_>, parts: Vec<Vec<u8>>) -> PyResult<u64> {
+        let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        py.detach(|| py_try(|| Ok(self.inner.compress_size_chain(&refs))))
+    }
+
+    fn cross_entropy_rate_bytes(
+        &self,
+        py: Python<'_>,
+        test_data: &[u8],
+        train_data: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| {
+            py_try(|| {
+                Ok(self
+                    .inner
+                    .cross_entropy_rate_bytes(test_data, train_data, max_order))
+            })
+        })
+    }
+
+    fn cross_entropy_bytes(
+        &self,
+        py: Python<'_>,
+        test_data: &[u8],
+        train_data: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| {
+            py_try(|| {
+                Ok(self
+                    .inner
+                    .cross_entropy_bytes(test_data, train_data, max_order))
+            })
+        })
+    }
+
+    fn joint_entropy_rate_bytes(
+        &self,
+        py: Python<'_>,
+        x: &[u8],
+        y: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.joint_entropy_rate_bytes(x, y, max_order))))
+    }
+
+    fn conditional_entropy_rate_bytes(
+        &self,
+        py: Python<'_>,
+        x: &[u8],
+        y: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.conditional_entropy_rate_bytes(x, y, max_order))))
+    }
+
+    fn cross_entropy_conditional_chain(
+        &self,
+        py: Python<'_>,
+        prefix_parts: Vec<Vec<u8>>,
+        data: &[u8],
+    ) -> PyResult<f64> {
+        let refs: Vec<&[u8]> = prefix_parts.iter().map(Vec::as_slice).collect();
+        py.detach(|| py_try(|| Ok(self.inner.cross_entropy_conditional_chain(&refs, data))))
+    }
+
+    fn mutual_information_rate_bytes(
+        &self,
+        py: Python<'_>,
+        x: &[u8],
+        y: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.mutual_information_rate_bytes(x, y, max_order))))
+    }
+
+    fn mutual_information_bytes(
+        &self,
+        py: Python<'_>,
+        x: &[u8],
+        y: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.mutual_information_bytes(x, y, max_order))))
+    }
+
+    fn conditional_entropy_bytes(
+        &self,
+        py: Python<'_>,
+        x: &[u8],
+        y: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.conditional_entropy_bytes(x, y, max_order))))
+    }
+
+    fn ned_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.ned_bytes(x, y, max_order))))
+    }
+
+    fn ned_cons_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.ned_cons_bytes(x, y, max_order))))
+    }
+
+    fn nte_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.nte_bytes(x, y, max_order))))
+    }
+
+    fn intrinsic_dependence_bytes(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| py_try(|| Ok(self.inner.intrinsic_dependence_bytes(data, max_order))))
+    }
+
+    fn resistance_to_transformation_bytes(
+        &self,
+        py: Python<'_>,
+        x: &[u8],
+        tx: &[u8],
+        max_order: i64,
+    ) -> PyResult<f64> {
+        py.detach(|| {
+            py_try(|| {
+                Ok(self
+                    .inner
+                    .resistance_to_transformation_bytes(x, tx, max_order))
+            })
+        })
+    }
+
+    #[pyo3(signature = (prompt, bytes, max_order=-1, config=None))]
+    fn generate_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &[u8],
+        bytes: usize,
+        max_order: i64,
+        config: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let cfg = generation_config_from_py(config)?;
+        let out = py.detach(|| {
+            py_try(|| {
+                Ok(self
+                    .inner
+                    .generate_bytes_with_config(prompt, bytes, max_order, cfg))
+            })
+        })?;
+        Ok(PyBytes::new(py, &out))
+    }
+
+    #[pyo3(signature = (prefix_parts, bytes, max_order=-1, config=None))]
+    fn generate_bytes_conditional_chain<'py>(
+        &self,
+        py: Python<'py>,
+        prefix_parts: Vec<Vec<u8>>,
+        bytes: usize,
+        max_order: i64,
+        config: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let cfg = generation_config_from_py(config)?;
+        let refs: Vec<&[u8]> = prefix_parts.iter().map(Vec::as_slice).collect();
+        let out = py.detach(|| {
+            py_try(|| {
+                Ok(self
+                    .inner
+                    .generate_bytes_conditional_chain_with_config(&refs, bytes, max_order, cfg))
+            })
+        })?;
+        Ok(PyBytes::new(py, &out))
+    }
+
+    #[pyo3(signature = (max_order=-1, total_symbols=None))]
+    fn rate_backend_session(
+        &self,
+        max_order: i64,
+        total_symbols: Option<u64>,
+    ) -> PyResult<PyRateBackendSession> {
+        let inner = self
+            .inner
+            .rate_backend_session(max_order, total_symbols)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyRateBackendSession {
+            inner: Arc::new(Mutex::new(inner)),
+        })
     }
 
     #[pyo3(signature = (x, y, variant=None))]
@@ -1408,6 +1819,62 @@ impl PyInfotheoryCtx {
     }
 }
 
+#[pymethods]
+impl PyRateBackendSession {
+    #[new]
+    #[pyo3(signature = (backend, max_order=-1, total_symbols=None))]
+    fn new(backend: &PyRateBackend, max_order: i64, total_symbols: Option<u64>) -> PyResult<Self> {
+        let inner =
+            RateBackendSession::from_backend(backend.inner.clone(), max_order, total_symbols)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+
+    fn observe(&self, data: &[u8]) {
+        lock_recover(&self.inner).observe(data);
+    }
+
+    fn condition(&self, data: &[u8]) {
+        lock_recover(&self.inner).condition(data);
+    }
+
+    #[pyo3(signature = (total_symbols=None))]
+    fn reset_frozen(&self, total_symbols: Option<u64>) -> PyResult<()> {
+        lock_recover(&self.inner)
+            .reset_frozen(total_symbols)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn fill_log_probs(&self) -> Vec<f64> {
+        let mut out = [0.0f64; 256];
+        lock_recover(&self.inner).fill_log_probs(&mut out);
+        out.to_vec()
+    }
+
+    #[pyo3(signature = (bytes, config=None))]
+    fn generate_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        bytes: usize,
+        config: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let cfg = generation_config_from_py(config)?;
+        let out = {
+            let mut guard = lock_recover(&self.inner);
+            guard.generate_bytes(bytes, cfg)
+        };
+        Ok(PyBytes::new(py, &out))
+    }
+
+    fn finish(&self) -> PyResult<()> {
+        lock_recover(&self.inner)
+            .finish()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
 #[pyfunction]
 fn get_default_ctx() -> PyInfotheoryCtx {
     PyInfotheoryCtx {
@@ -1418,6 +1885,108 @@ fn get_default_ctx() -> PyInfotheoryCtx {
 #[pyfunction]
 fn set_default_ctx(ctx: &PyInfotheoryCtx) {
     infotheory::set_default_ctx(ctx.inner.clone());
+}
+
+#[pyfunction]
+#[pyo3(signature = (x, y, tolerance=1e-9))]
+fn verify_identity(x: &[u8], y: &[u8], tolerance: f64) -> bool {
+    infotheory::axioms::verify_identity(
+        |a, b| infotheory::ncd_bytes(a, b, "5", NcdVariant::Vitanyi),
+        x,
+        tolerance,
+    ) && infotheory::axioms::verify_identity(
+        |a, b| infotheory::ncd_bytes(a, b, "5", NcdVariant::Vitanyi),
+        y,
+        tolerance,
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (x, y, tolerance=1e-9))]
+fn verify_symmetry(x: &[u8], y: &[u8], tolerance: f64) -> bool {
+    infotheory::axioms::verify_symmetry(
+        |a, b| infotheory::ncd_bytes(a, b, "5", NcdVariant::Vitanyi),
+        x,
+        y,
+        tolerance,
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (x, y, z, tolerance=1e-9))]
+fn verify_triangle_inequality(x: &[u8], y: &[u8], z: &[u8], tolerance: f64) -> bool {
+    infotheory::axioms::verify_triangle_inequality(
+        |a, b| infotheory::ncd_bytes(a, b, "5", NcdVariant::Vitanyi),
+        x,
+        y,
+        z,
+        tolerance,
+    )
+}
+
+#[pyfunction]
+fn verify_non_negativity(x: &[u8], y: &[u8]) -> bool {
+    infotheory::axioms::verify_non_negativity(
+        |a, b| infotheory::ncd_bytes(a, b, "5", NcdVariant::Vitanyi),
+        x,
+        y,
+    )
+}
+
+#[pyfunction]
+fn verify_mi_nonnegative(x: &[u8], y: &[u8]) -> bool {
+    infotheory::axioms::verify_mi_nonnegative(infotheory::mutual_information_marg_bytes, x, y)
+}
+
+#[pyfunction]
+#[pyo3(signature = (x, y, tolerance=1e-9))]
+fn verify_subadditivity(x: &[u8], y: &[u8], tolerance: f64) -> bool {
+    infotheory::axioms::verify_subadditivity(
+        infotheory::joint_marginal_entropy_bytes,
+        infotheory::marginal_entropy_bytes,
+        x,
+        y,
+        tolerance,
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (x, y, tolerance=1e-9))]
+fn verify_conditioning_reduces_entropy(x: &[u8], y: &[u8], tolerance: f64) -> bool {
+    infotheory::axioms::verify_conditioning_reduces_entropy(
+        |a, b| infotheory::conditional_entropy_bytes(a, b, 6),
+        infotheory::marginal_entropy_bytes,
+        x,
+        y,
+        tolerance,
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (x, y, tolerance=1e-9))]
+fn verify_chain_rule(x: &[u8], y: &[u8], tolerance: f64) -> bool {
+    infotheory::axioms::verify_chain_rule(
+        |a, b| infotheory::joint_entropy_rate_bytes(a, b, 6),
+        |a| infotheory::entropy_rate_bytes(a, 6),
+        |a, b| infotheory::conditional_entropy_rate_bytes(a, b, 6),
+        x,
+        y,
+        tolerance,
+    )
+}
+
+#[pyfunction]
+fn verify_ncd_bounds(x: &[u8], y: &[u8]) -> bool {
+    infotheory::axioms::verify_ncd_bounds(
+        |a, b| infotheory::ncd_bytes(a, b, "5", NcdVariant::Vitanyi),
+        x,
+        y,
+    )
+}
+
+#[pyfunction]
+fn verify_entropy_bounds(data: &[u8]) -> bool {
+    infotheory::axioms::verify_entropy_bounds(infotheory::marginal_entropy_bytes, data)
 }
 
 fn compression_backend_from_py(
@@ -1902,6 +2471,127 @@ fn decompress_bytes_backend<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (input_path, output_path, compression_backend=None, method="5", rate_backend=None, rate_method=None))]
+fn compress_file(
+    py: Python<'_>,
+    input_path: &str,
+    output_path: &str,
+    compression_backend: Option<&Bound<'_, PyAny>>,
+    method: &str,
+    rate_backend: Option<&Bound<'_, PyAny>>,
+    rate_method: Option<&str>,
+) -> PyResult<()> {
+    let rb = rate_backend_from_py(rate_backend, rate_method)?;
+    let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
+    py.detach(|| {
+        py_try(|| {
+            let input = std::fs::read(input_path).map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to read '{input_path}': {e}"))
+            })?;
+            let out = infotheory::compress_bytes_backend(&input, &cb)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            std::fs::write(output_path, &out).map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to write '{output_path}': {e}"))
+            })?;
+            Ok(())
+        })
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, compression_backend=None, method="5", rate_backend=None, rate_method=None))]
+fn decompress_file(
+    py: Python<'_>,
+    input_path: &str,
+    output_path: &str,
+    compression_backend: Option<&Bound<'_, PyAny>>,
+    method: &str,
+    rate_backend: Option<&Bound<'_, PyAny>>,
+    rate_method: Option<&str>,
+) -> PyResult<()> {
+    let rb = rate_backend_from_py(rate_backend, rate_method)?;
+    let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
+    py.detach(|| {
+        py_try(|| {
+            let input = std::fs::read(input_path).map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to read '{input_path}': {e}"))
+            })?;
+            let out = infotheory::decompress_bytes_backend(&input, &cb)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            std::fs::write(output_path, &out).map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to write '{output_path}': {e}"))
+            })?;
+            Ok(())
+        })
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (prompt, bytes, max_order=-1, backend=None, method=None, config=None))]
+fn generate_bytes<'py>(
+    py: Python<'py>,
+    prompt: &[u8],
+    bytes: usize,
+    max_order: i64,
+    backend: Option<&Bound<'_, PyAny>>,
+    method: Option<&str>,
+    config: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let cfg = generation_config_from_py(config)?;
+    let out = if let Some(backend) = backend {
+        let rb = rate_backend_from_py(Some(backend), method)?;
+        py.detach(|| {
+            py_try(|| {
+                let ctx = InfotheoryCtx::new(rb, CompressionBackend::default());
+                Ok(ctx.generate_bytes_with_config(prompt, bytes, max_order, cfg))
+            })
+        })?
+    } else {
+        py.detach(|| {
+            py_try(|| {
+                Ok(infotheory::generate_bytes_with_config(
+                    prompt, bytes, max_order, cfg,
+                ))
+            })
+        })?
+    };
+    Ok(PyBytes::new(py, &out))
+}
+
+#[pyfunction]
+#[pyo3(signature = (prefix_parts, bytes, max_order=-1, backend=None, method=None, config=None))]
+fn generate_bytes_conditional_chain<'py>(
+    py: Python<'py>,
+    prefix_parts: Vec<Vec<u8>>,
+    bytes: usize,
+    max_order: i64,
+    backend: Option<&Bound<'_, PyAny>>,
+    method: Option<&str>,
+    config: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let cfg = generation_config_from_py(config)?;
+    let refs: Vec<&[u8]> = prefix_parts.iter().map(Vec::as_slice).collect();
+    let out = if let Some(backend) = backend {
+        let rb = rate_backend_from_py(Some(backend), method)?;
+        py.detach(|| {
+            py_try(|| {
+                let ctx = InfotheoryCtx::new(rb, CompressionBackend::default());
+                Ok(ctx.generate_bytes_conditional_chain_with_config(&refs, bytes, max_order, cfg))
+            })
+        })?
+    } else {
+        py.detach(|| {
+            py_try(|| {
+                Ok(infotheory::generate_bytes_conditional_chain_with_config(
+                    &refs, bytes, max_order, cfg,
+                ))
+            })
+        })?
+    };
+    Ok(PyBytes::new(py, &out))
+}
+
+#[pyfunction]
 #[pyo3(signature = (data, max_order, backend=None, method=None))]
 fn entropy_rate_backend(
     py: Python<'_>,
@@ -2038,6 +2728,44 @@ fn ncd_matrix_bytes(
 ) -> PyResult<Vec<f64>> {
     let v = parse_ncd_variant(variant)?;
     py.detach(|| py_try(|| Ok(infotheory::ncd_matrix_bytes(&datas, method, v))))
+}
+
+#[pyfunction]
+#[pyo3(signature = (datas, backend=None, method=None, variant="vitanyi"))]
+fn ncd_matrix_bytes_with_backend(
+    py: Python<'_>,
+    datas: Vec<Vec<u8>>,
+    backend: Option<&Bound<'_, PyAny>>,
+    method: Option<&str>,
+    variant: &str,
+) -> PyResult<Vec<f64>> {
+    let v = parse_ncd_variant(variant)?;
+    let cb = compression_backend_from_py(backend, method, None)?;
+    py.detach(|| {
+        py_try(|| {
+            let n = datas.len();
+            let mut out = vec![0.0; n * n];
+            for i in 0..n {
+                for j in 0..n {
+                    out[i * n + j] = infotheory::ncd_bytes_backend(&datas[i], &datas[j], &cb, v);
+                }
+            }
+            Ok(out)
+        })
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (paths, backend=None, method=None, variant="vitanyi"))]
+fn ncd_matrix_paths_with_backend(
+    py: Python<'_>,
+    paths: Vec<String>,
+    backend: Option<&Bound<'_, PyAny>>,
+    method: Option<&str>,
+    variant: &str,
+) -> PyResult<Vec<f64>> {
+    let datas = get_bytes_from_paths(py, paths)?;
+    ncd_matrix_bytes_with_backend(py, datas, backend, method, variant)
 }
 
 #[pyfunction]
@@ -3606,11 +4334,149 @@ impl PyNyxVmEnvironment {
     }
 }
 
+#[pyclass(name = "SearchGranularity", eq, from_py_object)]
+#[derive(Clone, Copy, PartialEq)]
+struct PySearchGranularity {
+    inner: infotheory::search::SearchGranularity,
+}
+
+#[pymethods]
+impl PySearchGranularity {
+    #[classattr]
+    #[pyo3(name = "Snippet")]
+    fn snippet() -> Self {
+        Self {
+            inner: infotheory::search::SearchGranularity::Snippet,
+        }
+    }
+    #[classattr]
+    #[pyo3(name = "File")]
+    fn file() -> Self {
+        Self {
+            inner: infotheory::search::SearchGranularity::File,
+        }
+    }
+    fn __repr__(&self) -> &'static str {
+        match self.inner {
+            infotheory::search::SearchGranularity::Snippet => "SearchGranularity.Snippet",
+            infotheory::search::SearchGranularity::File => "SearchGranularity.File",
+        }
+    }
+}
+
+#[pyclass(name = "Stage2PriorMode", eq, from_py_object)]
+#[derive(Clone, Copy, PartialEq)]
+struct PyStage2PriorMode {
+    inner: infotheory::search::Stage2PriorMode,
+}
+
+#[pymethods]
+impl PyStage2PriorMode {
+    #[classattr]
+    #[pyo3(name = "Use")]
+    fn use_prior() -> Self {
+        Self {
+            inner: infotheory::search::Stage2PriorMode::Use,
+        }
+    }
+    #[classattr]
+    #[pyo3(name = "Disable")]
+    fn disable() -> Self {
+        Self {
+            inner: infotheory::search::Stage2PriorMode::Disable,
+        }
+    }
+    #[classattr]
+    #[pyo3(name = "Summarize")]
+    fn summarize() -> Self {
+        Self {
+            inner: infotheory::search::Stage2PriorMode::Summarize,
+        }
+    }
+    fn __repr__(&self) -> &'static str {
+        match self.inner {
+            infotheory::search::Stage2PriorMode::Use => "Stage2PriorMode.Use",
+            infotheory::search::Stage2PriorMode::Disable => "Stage2PriorMode.Disable",
+            infotheory::search::Stage2PriorMode::Summarize => "Stage2PriorMode.Summarize",
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    query,
+    target_path,
+    granularity=None,
+    universal_prior=None,
+    stage2_prior_mode=None,
+    max_order=8,
+    top_k=50,
+    stage0_keep_frac=0.2,
+    rate_backend=None,
+    compression_backend=None,
+    method=None
+))]
+fn search(
+    py: Python<'_>,
+    query: &str,
+    target_path: &str,
+    granularity: Option<&PySearchGranularity>,
+    universal_prior: Option<String>,
+    stage2_prior_mode: Option<&PyStage2PriorMode>,
+    max_order: i64,
+    top_k: usize,
+    stage0_keep_frac: f64,
+    rate_backend: Option<&Bound<'_, PyAny>>,
+    compression_backend: Option<&Bound<'_, PyAny>>,
+    method: Option<&str>,
+) -> PyResult<Vec<(String, usize, usize, f64)>> {
+    let rb = rate_backend_from_py(rate_backend, method)?;
+    let cb = compression_backend_from_py(compression_backend, method, Some(rb.clone()))?;
+    let q = query.to_string();
+    let tp = target_path.to_string();
+    let gran = granularity
+        .map(|g| g.inner)
+        .unwrap_or(infotheory::search::SearchGranularity::Snippet);
+    let s2pm = stage2_prior_mode
+        .map(|m| m.inner)
+        .unwrap_or(infotheory::search::Stage2PriorMode::Use);
+
+    py.detach(|| {
+        py_try(|| {
+            let opts = infotheory::search::SearchOptions {
+                granularity: gran,
+                universal_prior,
+                stage2_prior_mode: s2pm,
+                max_order,
+                top_k,
+                stage0_keep_frac,
+                ctx: InfotheoryCtx::new(rb, cb),
+            };
+            let results = infotheory::search::search_with_options(&q, &tp, &opts);
+            Ok(results
+                .into_iter()
+                .map(|s| {
+                    (
+                        s.path.to_string_lossy().to_string(),
+                        s.start_line,
+                        s.end_line,
+                        s.score,
+                    )
+                })
+                .collect())
+        })
+    })
+}
+
 #[pymodule]
 fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRateBackend>()?;
     m.add_class::<PyCompressionBackend>()?;
     m.add_class::<PyInfotheoryCtx>()?;
+    m.add_class::<PyGenerationStrategy>()?;
+    m.add_class::<PyGenerationUpdateMode>()?;
+    m.add_class::<PyGenerationConfig>()?;
+    m.add_class::<PyRateBackendSession>()?;
     m.add_class::<PyMixtureKind>()?;
     m.add_class::<PyMixtureExpertSpec>()?;
     m.add_class::<PyMixtureSpec>()?;
@@ -3635,6 +4501,8 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ExtendedTigerEnv>()?;
     m.add_class::<TicTacToeEnv>()?;
     m.add_class::<KuhnPokerEnv>()?;
+    m.add_class::<PySearchGranularity>()?;
+    m.add_class::<PyStage2PriorMode>()?;
 
     #[cfg(feature = "vm")]
     {
@@ -3670,6 +4538,10 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compress_size_chain_backend, m)?)?;
     m.add_function(wrap_pyfunction!(compress_bytes_backend, m)?)?;
     m.add_function(wrap_pyfunction!(decompress_bytes_backend, m)?)?;
+    m.add_function(wrap_pyfunction!(compress_file, m)?)?;
+    m.add_function(wrap_pyfunction!(decompress_file, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_bytes_conditional_chain, m)?)?;
     m.add_function(wrap_pyfunction!(ncd_paths, m)?)?;
     m.add_function(wrap_pyfunction!(ncd_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(ncd_bytes_default, m)?)?;
@@ -3681,6 +4553,8 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ncd_sym_cons, m)?)?;
     m.add_function(wrap_pyfunction!(ncd_matrix_paths, m)?)?;
     m.add_function(wrap_pyfunction!(ncd_matrix_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(ncd_matrix_paths_with_backend, m)?)?;
+    m.add_function(wrap_pyfunction!(ncd_matrix_bytes_with_backend, m)?)?;
     m.add_function(wrap_pyfunction!(marginal_entropy_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(entropy_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(entropy_rate_backend, m)?)?;
@@ -3724,6 +4598,16 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(js_divergence_paths, m)?)?;
     m.add_function(wrap_pyfunction!(intrinsic_dependence_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(resistance_to_transformation_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_identity, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_symmetry, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_triangle_inequality, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_non_negativity, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_mi_nonnegative, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_subadditivity, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_conditioning_reduces_entropy, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_chain_rule, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_ncd_bounds, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_entropy_bounds, m)?)?;
     m.add_function(wrap_pyfunction!(observation_key_from_stream, m)?)?;
     m.add_function(wrap_pyfunction!(observation_repr_from_stream, m)?)?;
     m.add_function(wrap_pyfunction!(encode_bits, m)?)?;
@@ -3735,6 +4619,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(predictor_probe, m)?)?;
     m.add_function(wrap_pyfunction!(environment_probe, m)?)?;
     m.add_function(wrap_pyfunction!(search_with_simulator, m)?)?;
+    m.add_function(wrap_pyfunction!(search, m)?)?;
     m.add_function(wrap_pyfunction!(vm_enabled, m)?)?;
     Ok(())
 }

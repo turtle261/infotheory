@@ -30,6 +30,10 @@ def test_expected_public_surface_symbols_present():
         "RateBackend",
         "CompressionBackend",
         "InfotheoryCtx",
+        "GenerationStrategy",
+        "GenerationUpdateMode",
+        "GenerationConfig",
+        "RateBackendSession",
         "MixtureKind",
         "MixtureExpertSpec",
         "MixtureSpec",
@@ -40,10 +44,21 @@ def test_expected_public_surface_symbols_present():
         "RandomGenerator",
         "ncd_paths",
         "ncd_bytes",
+        "generate_bytes",
+        "generate_bytes_conditional_chain",
         "compress_bytes_backend",
         "decompress_bytes_backend",
+        "compress_file",
+        "decompress_file",
+        "ncd_matrix_bytes_with_backend",
+        "ncd_matrix_paths_with_backend",
         "mutual_information_bytes",
+        "verify_chain_rule",
+        "verify_ncd_bounds",
         "search_with_simulator",
+        "search",
+        "SearchGranularity",
+        "Stage2PriorMode",
         "vm_enabled",
     }
     missing = expected - names
@@ -98,6 +113,30 @@ def test_backend_objects_context_and_helpers(tmp_path):
         ait.set_default_ctx(ctx)
         assert isinstance(ait.get_default_ctx(), ait.InfotheoryCtx)
         assert _is_finite_nonnegative(ctx.entropy_rate_bytes(b"abcabcabc", 4))
+        assert _is_finite_nonnegative(ctx.biased_entropy_rate_bytes(b"abcabcabc", 4))
+        assert _is_finite_nonnegative(ctx.compress_size(b"payload"))
+        assert _is_finite_nonnegative(ctx.compress_size_chain([b"pay", b"load"]))
+        assert _is_finite_nonnegative(
+            ctx.cross_entropy_rate_bytes(b"abcabc", b"abcabd", 4)
+        )
+        assert _is_finite_nonnegative(ctx.cross_entropy_bytes(b"abcabc", b"abcabd", 4))
+        assert _is_finite_nonnegative(ctx.joint_entropy_rate_bytes(b"abc", b"abd", 4))
+        assert _is_finite_nonnegative(
+            ctx.conditional_entropy_rate_bytes(b"abc", b"abd", 4)
+        )
+        assert _is_finite_nonnegative(
+            ctx.cross_entropy_conditional_chain([b"ab", b"ca"], b"bc")
+        )
+        assert _is_finite_nonnegative(ctx.mutual_information_rate_bytes(b"abc", b"abd", 4))
+        assert _is_finite_nonnegative(ctx.mutual_information_bytes(b"abc", b"abd", 4))
+        assert _is_finite_nonnegative(ctx.conditional_entropy_bytes(b"abc", b"abd", 4))
+        assert _is_finite_nonnegative(ctx.ned_bytes(b"abc", b"abd", 4))
+        assert _is_finite_nonnegative(ctx.ned_cons_bytes(b"abc", b"abd", 4))
+        assert _is_finite_nonnegative(ctx.nte_bytes(b"abc", b"abd", 4))
+        assert _is_finite_nonnegative(ctx.intrinsic_dependence_bytes(b"abcabc", 4))
+        assert _is_finite_nonnegative(
+            ctx.resistance_to_transformation_bytes(b"abc", b"abc", 4)
+        )
         assert _is_finite_nonnegative(ctx.ncd_bytes(b"abc", b"abd", "vitanyi"))
         assert _is_finite_nonnegative(
             ait.ncd_paths(str(a), str(b), backend="zpaq", method="5", variant="vitanyi")
@@ -139,6 +178,15 @@ def test_backend_objects_context_and_helpers(tmp_path):
         assert _is_finite_nonnegative(
             ait.cross_entropy_rate_backend(b"abc", b"abd", 4, backend=rb)
         )
+        generated = ctx.generate_bytes(
+            b"abcabcabc",
+            4,
+            config=ait.GenerationConfig.greedy_frozen(),
+        )
+        assert len(generated) == 4
+        session = ctx.rate_backend_session(total_symbols=16)
+        session.observe(b"abcabc")
+        assert len(session.fill_log_probs()) == 256
     finally:
         ait.set_default_ctx(prev)
 
@@ -315,3 +363,41 @@ def test_mamba_rate_backend_parse_construct_metrics_and_roundtrip_parity():
         compression_backend=framed_from_object,
     )
     assert decoded == payload
+
+
+def test_search_pipeline_returns_results(tmp_path):
+    # Create a small directory with a few text files
+    (tmp_path / "algorithm.txt").write_text(
+        "Kolmogorov complexity is the length of the shortest program that "
+        "produces a given string. It is a fundamental concept in algorithmic "
+        "information theory.\n" * 5
+    )
+    (tmp_path / "entropy.txt").write_text(
+        "Shannon entropy measures the average amount of information produced "
+        "by a stochastic source of data. It is measured in bits.\n" * 5
+    )
+    (tmp_path / "unrelated.txt").write_text(
+        "The quick brown fox jumps over the lazy dog. "
+        "Pack my box with five dozen liquor jugs.\n" * 5
+    )
+
+    # Verify enum types
+    assert ait.SearchGranularity.Snippet != ait.SearchGranularity.File
+    assert ait.Stage2PriorMode.Use != ait.Stage2PriorMode.Disable
+    assert ait.Stage2PriorMode.Summarize != ait.Stage2PriorMode.Use
+
+    # File-level search
+    results = ait.search(
+        "Kolmogorov complexity algorithmic information",
+        str(tmp_path),
+        granularity=ait.SearchGranularity.File,
+        top_k=3,
+    )
+    assert len(results) >= 1, "search should return at least one result"
+    # Each result is (path, start_line, end_line, score)
+    path, start, end, score = results[0]
+    assert isinstance(path, str)
+    assert isinstance(start, int)
+    assert isinstance(end, int)
+    assert isinstance(score, float)
+    assert "algorithm" in path, f"top result should be algorithm.txt, got {path}"

@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 #[cfg(not(feature = "vm"))]
 use std::time::Instant;
 
-mod search;
+use infotheory::search;
 
 struct AixiRunLogger {
     bits01: Option<BufWriter<File>>,
@@ -1831,6 +1831,23 @@ fn maybe_export_online_model(
             compressor.export_online(_path)?;
             return Ok(());
         }
+        // Pre-loaded model Arc variants do not carry a method string and cannot
+        // replay training for export.  Warn the user explicitly.
+        let has_rwkv_model = matches!(&_ctx.rate_backend, RateBackend::Rwkv7 { .. })
+            || matches!(
+                &_ctx.compression_backend,
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::Rwkv7 { .. },
+                    ..
+                } | CompressionBackend::Rwkv7 { .. }
+            );
+        if has_rwkv_model {
+            eprintln!(
+                "Warning: --model-export is not supported for pre-loaded RWKV7 model backends. \
+                 Use --method with a cfg:/file: spec to enable online model export."
+            );
+            return Ok(());
+        }
     }
 
     #[cfg(feature = "backend-mamba")]
@@ -1851,8 +1868,27 @@ fn maybe_export_online_model(
             compressor.export_online(_path)?;
             return Ok(());
         }
+        let has_mamba_model = matches!(&_ctx.rate_backend, RateBackend::Mamba { .. })
+            || matches!(
+                &_ctx.compression_backend,
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::Mamba { .. },
+                    ..
+                }
+            );
+        if has_mamba_model {
+            eprintln!(
+                "Warning: --model-export is not supported for pre-loaded Mamba model backends. \
+                 Use --method with a cfg: spec to enable online model export."
+            );
+            return Ok(());
+        }
     }
 
+    eprintln!(
+        "Warning: --model-export was requested but the current backend does not support \
+         online model export. Only RWKV7 and Mamba method-based backends support export."
+    );
     Ok(())
 }
 
@@ -2874,12 +2910,28 @@ fn main() {
             }
         }
         "generate" => {
-            let max_order = file2
-                .as_deref()
-                .or(pos_arg3.as_deref())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(expert_spec_max_order.unwrap_or(-1));
-            let input = if let Some(path) = file1.as_deref() {
+            // Disambiguate positional args for `generate [file] [max_order]`.
+            // When stdin is piped and the first positional looks like an integer,
+            // treat it as max_order (not a file path).
+            let stdin_is_piped = !io::stdin().is_terminal();
+            let (file_path, explicit_max_order) = match (file1.as_deref(), file2.as_deref()) {
+                // `generate <file> <max_order>` — both present
+                (Some(f), Some(mo)) => (Some(f), mo.parse::<i64>().ok()),
+                // `generate <arg>` — single positional:
+                //   if stdin is piped and it parses as an integer, it's max_order
+                //   otherwise it's a file path
+                (Some(arg), None) if stdin_is_piped && arg.parse::<i64>().is_ok() => {
+                    (None, arg.parse::<i64>().ok())
+                }
+                (Some(f), None) => (Some(f), None),
+                // No positionals at all
+                (None, _) => (None, None),
+            };
+            let max_order = explicit_max_order
+                .or(pos_arg3.as_deref().and_then(|s| s.parse().ok()))
+                .or(expert_spec_max_order)
+                .unwrap_or(-1);
+            let input = if let Some(path) = file_path {
                 read_file(path)
             } else {
                 read_stdin_all_for_generate()
