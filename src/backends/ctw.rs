@@ -106,8 +106,14 @@ const INDEX_BITS: u32 = 31;
 const INDEX_LIMIT: usize = 1usize << INDEX_BITS;
 const CHILD_SEGMENT_TAG: u32 = 1u32 << INDEX_BITS;
 const CHILD_INDEX_MASK: u32 = CHILD_SEGMENT_TAG - 1;
-const SEG_FLAG_HISTORY: u8 = 1;
-const SEG_FLAG_INVERT: u8 = 1 << 1;
+const SEG_META_MODE_SHIFT: u32 = 30;
+const SEG_META_MODE_MASK: u32 = 0b11 << SEG_META_MODE_SHIFT;
+const SEG_LEN_MASK: u32 = !SEG_META_MODE_MASK;
+const SEG_MODE_EXACT: u32 = 0 << SEG_META_MODE_SHIFT;
+const SEG_MODE_HISTORY: u32 = 1 << SEG_META_MODE_SHIFT;
+const SEG_MODE_HISTORY_INVERT: u32 = 2 << SEG_META_MODE_SHIFT;
+const SEG_MODE_CONST: u32 = 3 << SEG_META_MODE_SHIFT;
+const SEG_EXACT_MAX_LEN: u32 = 64;
 
 /// Index into the explicit-node arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +220,140 @@ impl Default for ChildRef {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+struct SegmentPayload {
+    repr_lo: u32,
+    repr_hi: u32,
+    meta: u32,
+}
+
+impl SegmentPayload {
+    #[inline(always)]
+    fn exact(bits: u64, len: u32) -> Self {
+        debug_assert!(len <= SEG_EXACT_MAX_LEN);
+        debug_assert!(len <= SEG_LEN_MASK);
+        Self {
+            repr_lo: bits as u32,
+            repr_hi: (bits >> 32) as u32,
+            meta: SEG_MODE_EXACT | len,
+        }
+    }
+
+    #[inline(always)]
+    fn history(anchor: u32, len: u32, invert: bool) -> Self {
+        debug_assert!(len <= SEG_LEN_MASK);
+        Self {
+            repr_lo: anchor,
+            repr_hi: 0,
+            meta: if invert {
+                SEG_MODE_HISTORY_INVERT | len
+            } else {
+                SEG_MODE_HISTORY | len
+            },
+        }
+    }
+
+    #[inline(always)]
+    fn constant(bit: bool, len: u32) -> Self {
+        debug_assert!(len <= SEG_LEN_MASK);
+        Self {
+            repr_lo: bit as u32,
+            repr_hi: 0,
+            meta: SEG_MODE_CONST | len,
+        }
+    }
+
+    #[inline(always)]
+    fn len(self) -> u32 {
+        self.meta & SEG_LEN_MASK
+    }
+
+    #[inline(always)]
+    fn set_len(&mut self, len: u32) {
+        debug_assert!(len <= SEG_LEN_MASK);
+        self.meta = (self.meta & SEG_META_MODE_MASK) | len;
+    }
+
+    #[inline(always)]
+    fn mode(self) -> u32 {
+        self.meta & SEG_META_MODE_MASK
+    }
+
+    #[inline(always)]
+    fn is_exact(self) -> bool {
+        self.mode() == SEG_MODE_EXACT
+    }
+
+    #[inline(always)]
+    fn exact_bits(self) -> u64 {
+        (self.repr_lo as u64) | ((self.repr_hi as u64) << 32)
+    }
+
+    #[inline(always)]
+    fn anchor_or_const(self) -> u32 {
+        self.repr_lo
+    }
+
+    #[inline(always)]
+    fn const_bit(self) -> bool {
+        (self.repr_lo & 1) != 0
+    }
+
+    #[inline(always)]
+    fn prepend_exact(self, edge: usize) -> Option<Self> {
+        if !self.is_exact() || self.len() >= SEG_EXACT_MAX_LEN {
+            return None;
+        }
+        let len = self.len() + 1;
+        let bits = ((edge as u64) & 1) | (self.exact_bits() << 1);
+        Some(Self::exact(bits, len))
+    }
+
+    #[inline(always)]
+    fn prefix(self, len: u32) -> Self {
+        debug_assert!(len <= self.len());
+        match self.mode() {
+            SEG_MODE_EXACT => Self::exact(self.exact_bits() & low_bits_mask_u64(len), len),
+            SEG_MODE_HISTORY | SEG_MODE_HISTORY_INVERT => Self {
+                meta: (self.meta & SEG_META_MODE_MASK) | len,
+                ..self
+            },
+            SEG_MODE_CONST => Self::constant(self.const_bit(), len),
+            _ => unreachable!("invalid ctw segment payload mode"),
+        }
+    }
+
+    #[inline(always)]
+    fn suffix_after(self, skip: u32) -> Self {
+        debug_assert!(skip <= self.len());
+        let new_len = self.len() - skip;
+        match self.mode() {
+            SEG_MODE_EXACT => Self::exact(self.exact_bits() >> skip, new_len),
+            SEG_MODE_HISTORY | SEG_MODE_HISTORY_INVERT => Self {
+                repr_lo: self
+                    .anchor_or_const()
+                    .checked_sub(skip)
+                    .expect("ctw history segment anchor underflow"),
+                meta: (self.meta & SEG_META_MODE_MASK) | new_len,
+                ..self
+            },
+            SEG_MODE_CONST => Self::constant(self.const_bit(), new_len),
+            _ => unreachable!("invalid ctw segment payload mode"),
+        }
+    }
+
+    #[inline(always)]
+    fn from_path(history: &[Symbol], depth: usize, len: u32) -> Option<Self> {
+        if len > SEG_EXACT_MAX_LEN {
+            return None;
+        }
+        Some(Self::exact(
+            path_bits_from_history(history, depth, len as usize),
+            len,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct LevelState {
     symbol_count: [u32; 2],
     log_prob_kt: f64,
@@ -276,10 +416,7 @@ struct CtSegment {
     log_prob_kt: f64,
     head_log_prob_weighted: f64,
     symbol_count: [u32; 2],
-    anchor_or_const: u32,
-    len: u32,
-    flags: u8,
-    _pad: [u8; 3],
+    payload: SegmentPayload,
 }
 
 impl Default for CtSegment {
@@ -289,11 +426,81 @@ impl Default for CtSegment {
             log_prob_kt: 0.0,
             head_log_prob_weighted: 0.0,
             symbol_count: [0, 0],
-            anchor_or_const: 0,
-            len: 0,
-            flags: 0,
-            _pad: [0; 3],
+            payload: SegmentPayload::default(),
         }
+    }
+}
+
+impl CtSegment {
+    #[inline(always)]
+    fn len(self) -> u32 {
+        self.payload.len()
+    }
+
+    #[inline(always)]
+    fn set_len(&mut self, len: u32) {
+        self.payload.set_len(len);
+    }
+}
+
+#[inline(always)]
+fn low_bits_mask_u64(len: u32) -> u64 {
+    if len >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << len) - 1
+    }
+}
+
+#[inline(always)]
+fn path_bits_from_history(history: &[Symbol], depth: usize, len: usize) -> u64 {
+    let history_len = history.len();
+    let available = history_len.saturating_sub(depth).min(len);
+    if available == 0 {
+        return 0;
+    }
+
+    let mut bits = 0u64;
+    let mut hist_idx = history_len - depth - 1;
+    for offset in 0..available {
+        bits |= (unsafe { *history.get_unchecked(hist_idx) } as u64) << offset;
+        if hist_idx == 0 {
+            break;
+        }
+        hist_idx -= 1;
+    }
+    bits
+}
+
+#[inline(always)]
+fn shift_path_bits(path_bits: u64, consumed: usize) -> u64 {
+    if consumed >= 64 {
+        0
+    } else {
+        path_bits >> consumed
+    }
+}
+
+#[inline(always)]
+fn first_exact_segment_mismatch(
+    exact_bits: u64,
+    path_bits: u64,
+    comparable_len: usize,
+) -> Option<(usize, bool, bool)> {
+    if comparable_len == 0 {
+        return None;
+    }
+
+    let diff = (exact_bits ^ path_bits) & low_bits_mask_u64(comparable_len as u32);
+    if diff == 0 {
+        None
+    } else {
+        let offset = diff.trailing_zeros() as usize;
+        Some((
+            offset,
+            ((path_bits >> offset) & 1) != 0,
+            ((exact_bits >> offset) & 1) != 0,
+        ))
     }
 }
 
@@ -565,24 +772,83 @@ fn segment_edge_from_parts(
     history: &[Symbol],
     history_len: usize,
 ) -> bool {
-    if (segment.flags & SEG_FLAG_HISTORY) != 0 {
-        if segment.anchor_or_const as usize >= offset {
-            let hist_idx = segment.anchor_or_const as usize - offset;
-            if hist_idx < history_len {
-                let raw = history[hist_idx];
-                if (segment.flags & SEG_FLAG_INVERT) != 0 {
-                    !raw
+    match segment.payload.mode() {
+        SEG_MODE_EXACT => ((segment.payload.exact_bits() >> offset) & 1) != 0,
+        SEG_MODE_HISTORY | SEG_MODE_HISTORY_INVERT => {
+            if segment.payload.anchor_or_const() as usize >= offset {
+                let hist_idx = segment.payload.anchor_or_const() as usize - offset;
+                if hist_idx < history_len {
+                    let raw = history[hist_idx];
+                    if segment.payload.mode() == SEG_MODE_HISTORY_INVERT {
+                        !raw
+                    } else {
+                        raw
+                    }
                 } else {
-                    raw
+                    segment.payload.mode() == SEG_MODE_HISTORY_INVERT
                 }
             } else {
-                (segment.flags & SEG_FLAG_INVERT) != 0
+                segment.payload.mode() == SEG_MODE_HISTORY_INVERT
             }
-        } else {
-            (segment.flags & SEG_FLAG_INVERT) != 0
         }
-    } else {
-        (segment.anchor_or_const & 1) != 0
+        SEG_MODE_CONST => segment.payload.const_bit(),
+        _ => unreachable!("invalid ctw segment payload mode"),
+    }
+}
+
+#[inline(always)]
+fn first_segment_mismatch(
+    segment: CtSegment,
+    depth: usize,
+    history: &[Symbol],
+    comparable_len: usize,
+) -> Option<(usize, bool, bool)> {
+    if comparable_len == 0 {
+        return None;
+    }
+
+    match segment.payload.mode() {
+        SEG_MODE_EXACT => first_exact_segment_mismatch(
+            segment.payload.exact_bits(),
+            path_bits_from_history(history, depth, comparable_len),
+            comparable_len,
+        ),
+        SEG_MODE_HISTORY | SEG_MODE_HISTORY_INVERT => {
+            let history_ptr = history.as_ptr();
+            let history_len = history.len() as isize;
+            let mut path_hist_idx = history_len - depth as isize - 1;
+            let mut seg_hist_idx = segment.payload.anchor_or_const() as isize;
+            let invert = segment.payload.mode() == SEG_MODE_HISTORY_INVERT;
+            for offset in 0..comparable_len {
+                let path_edge =
+                    unsafe { history_at_or_zero(history_ptr, history_len, path_hist_idx) };
+                let existing_raw =
+                    unsafe { history_at_or_zero(history_ptr, history_len, seg_hist_idx) };
+                let existing_edge = if invert { !existing_raw } else { existing_raw };
+                if existing_edge != path_edge {
+                    return Some((offset, path_edge, existing_edge));
+                }
+                path_hist_idx -= 1;
+                seg_hist_idx -= 1;
+            }
+            None
+        }
+        SEG_MODE_CONST => {
+            let history_ptr = history.as_ptr();
+            let history_len = history.len() as isize;
+            let mut path_hist_idx = history_len - depth as isize - 1;
+            let existing_edge = segment.payload.const_bit();
+            for offset in 0..comparable_len {
+                let path_edge =
+                    unsafe { history_at_or_zero(history_ptr, history_len, path_hist_idx) };
+                if existing_edge != path_edge {
+                    return Some((offset, path_edge, existing_edge));
+                }
+                path_hist_idx -= 1;
+            }
+            None
+        }
+        _ => unreachable!("invalid ctw segment payload mode"),
     }
 }
 
@@ -736,18 +1002,6 @@ impl CtArena {
         self.free_segments.clear();
     }
 
-    #[cfg(test)]
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    #[cfg(test)]
-    #[inline(always)]
-    fn segment_count(&self) -> usize {
-        self.segments.len()
-    }
-
     #[inline(always)]
     fn child(&self, parent_idx: NodeIndex, child_idx: usize) -> ChildRef {
         debug_assert!(parent_idx.get() < self.nodes.len());
@@ -802,13 +1056,13 @@ impl CtArena {
 
     #[inline(always)]
     fn segment_len(&self, segment_idx: SegmentIndex) -> u32 {
-        self.segments[segment_idx.get()].len
+        self.segments[segment_idx.get()].len()
     }
 
     #[inline(always)]
     fn segment_has_child(&self, segment_idx: SegmentIndex, offset: u32) -> bool {
         let segment = self.segments[segment_idx.get()];
-        offset + 1 < segment.len || segment.tail.is_some()
+        offset + 1 < segment.len() || segment.tail.is_some()
     }
 
     #[inline(always)]
@@ -843,56 +1097,26 @@ impl CtArena {
         unsafe { self.child_ref_weighted_unchecked(child) }
     }
 
-    fn singleton_segment_pattern(
-        &self,
-        history: &[Symbol],
-        depth: usize,
-        edge: usize,
-    ) -> (u32, u8) {
-        if depth < history.len() {
-            let anchor = (history.len() - depth - 1) as u32;
-            let path_edge = history_symbol(history, depth) as usize;
-            let mut flags = SEG_FLAG_HISTORY;
-            if edge != path_edge {
-                flags |= SEG_FLAG_INVERT;
-            }
-            (anchor, flags)
-        } else {
-            (edge as u32, 0)
-        }
+    #[inline(always)]
+    fn singleton_segment_payload(&self, edge: usize) -> SegmentPayload {
+        SegmentPayload::exact((edge & 1) as u64, 1)
     }
 
     #[inline(always)]
     fn segment_edge(&self, segment_idx: SegmentIndex, offset: u32, history: &[Symbol]) -> usize {
         let segment = self.segments[segment_idx.get()];
-        if (segment.flags & SEG_FLAG_HISTORY) != 0 {
-            let hist_idx = segment.anchor_or_const as usize;
-            let raw = if hist_idx >= offset as usize && hist_idx - (offset as usize) < history.len()
-            {
-                history[hist_idx - offset as usize]
-            } else {
-                false
-            };
-            let bit = if (segment.flags & SEG_FLAG_INVERT) != 0 {
-                !raw
-            } else {
-                raw
-            };
-            bit as usize
-        } else {
-            (segment.anchor_or_const & 1) as usize
-        }
+        segment_edge_from_parts(segment, offset as usize, history, history.len()) as usize
     }
 
     fn segment_suffix_weight(&self, segment_idx: SegmentIndex, offset: u32) -> f64 {
         let segment = self.segments[segment_idx.get()];
-        if offset >= segment.len {
+        if offset >= segment.len() {
             return self.child_ref_weighted(segment.tail);
         }
         if segment.tail.is_none() {
             return segment.log_prob_kt;
         }
-        let remaining = segment.len - offset;
+        let remaining = segment.len() - offset;
         unary_chain_log_weight(
             segment.log_prob_kt,
             self.child_ref_weighted(segment.tail),
@@ -903,7 +1127,7 @@ impl CtArena {
     #[inline(always)]
     fn segment_continuation_weight(&self, segment_idx: SegmentIndex, offset: u32) -> f64 {
         let segment = self.segments[segment_idx.get()];
-        if offset + 1 < segment.len {
+        if offset + 1 < segment.len() {
             self.segment_suffix_weight(segment_idx, offset + 1)
         } else {
             self.child_ref_weighted(segment.tail)
@@ -916,7 +1140,7 @@ impl CtArena {
             unary_chain_log_weight(
                 segment.log_prob_kt,
                 self.child_ref_weighted(segment.tail),
-                segment.len,
+                segment.len(),
             )
         } else {
             segment.log_prob_kt
@@ -946,9 +1170,7 @@ impl CtArena {
         symbol_count: [u32; 2],
         log_prob_kt: f64,
         tail: ChildRef,
-        anchor_or_const: u32,
-        len: u32,
-        flags: u8,
+        payload: SegmentPayload,
     ) -> SegmentIndex {
         let segment_idx = self.alloc_segment();
         self.segments[segment_idx.get()] = CtSegment {
@@ -956,12 +1178,9 @@ impl CtArena {
             log_prob_kt,
             head_log_prob_weighted: 0.0,
             symbol_count,
-            anchor_or_const,
-            len,
-            flags,
-            _pad: [0; 3],
+            payload,
         };
-        if len == 1 && tail.is_none() {
+        if payload.len() == 1 && tail.is_none() {
             self.segments[segment_idx.get()].head_log_prob_weighted = log_prob_kt;
         } else {
             self.recompute_segment_head(segment_idx);
@@ -976,20 +1195,12 @@ impl CtArena {
         detaches: &mut Vec<Detach>,
     ) -> ChildRef {
         let segment = self.segments[segment_idx.get()];
-        if offset + 1 < segment.len {
-            let suffix_len = segment.len - (offset + 1);
-            let suffix_anchor = if (segment.flags & SEG_FLAG_HISTORY) != 0 {
-                segment.anchor_or_const - (offset + 1)
-            } else {
-                segment.anchor_or_const
-            };
+        if offset + 1 < segment.len() {
             let suffix = self.alloc_segment_with_parts(
                 segment.symbol_count,
                 segment.log_prob_kt,
                 segment.tail,
-                suffix_anchor,
-                suffix_len,
-                segment.flags,
+                segment.payload.suffix_after(offset + 1),
             );
             detaches.push(Detach::SegmentNext {
                 segment: segment_idx,
@@ -1001,7 +1212,7 @@ impl CtArena {
             if tail.is_some() {
                 detaches.push(Detach::SegmentNext {
                     segment: segment_idx,
-                    new_len: segment.len,
+                    new_len: segment.len(),
                 });
             }
             tail
@@ -1018,51 +1229,47 @@ impl CtArena {
         edge: usize,
         allow_history_pattern: bool,
     ) -> ChildRef {
-        let (anchor_or_const, flags) = if allow_history_pattern {
-            self.singleton_segment_pattern(history, depth, edge)
-        } else {
-            (edge as u32, 0)
-        };
+        let singleton_payload = self.singleton_segment_payload(edge);
 
         if let Some(segment_idx) = child.as_segment() {
             let segment = self.segments[segment_idx.get()];
             let same_state = segment.symbol_count == symbol_count
                 && segment.log_prob_kt.to_bits() == log_prob_kt.to_bits();
-            let can_extend = same_state
-                && segment.tail == child
-                && if (flags & SEG_FLAG_HISTORY) != 0 {
-                    (segment.flags & SEG_FLAG_HISTORY) != 0
-                        && segment.flags == flags
-                        && segment.anchor_or_const.checked_add(1) == Some(anchor_or_const)
-                } else {
-                    (segment.flags & SEG_FLAG_HISTORY) == 0
-                        && segment.anchor_or_const == anchor_or_const
-                };
-
-            if can_extend {
+            if same_state && segment.tail == child {
                 let segment = &mut self.segments[segment_idx.get()];
-                let old_head = segment.head_log_prob_weighted;
-                segment.len = segment
-                    .len
-                    .checked_add(1)
-                    .expect("ctw segment length overflow");
-                if (flags & SEG_FLAG_HISTORY) != 0 {
-                    segment.anchor_or_const = anchor_or_const;
+                let extended_payload = if segment.payload.is_exact() {
+                    segment.payload.prepend_exact(edge)
+                } else if allow_history_pattern {
+                    let path_payload =
+                        SegmentPayload::from_path(history, depth, segment.len().saturating_add(1));
+                    path_payload.filter(|payload| {
+                        let mut matches = true;
+                        for offset in 0..segment.len() as usize {
+                            let seg_edge =
+                                segment_edge_from_parts(*segment, offset, history, history.len());
+                            let payload_edge = ((payload.exact_bits() >> (offset + 1)) & 1) != 0;
+                            if seg_edge != payload_edge {
+                                matches = false;
+                                break;
+                            }
+                        }
+                        matches
+                    })
+                } else {
+                    None
+                };
+                if let Some(payload) = extended_payload {
+                    let old_head = segment.head_log_prob_weighted;
+                    segment.payload = payload;
+                    segment.head_log_prob_weighted =
+                        update_weighted_log_prob(log_prob_kt, old_head, 0.0, false);
+                    return ChildRef::from_segment(segment_idx);
                 }
-                segment.head_log_prob_weighted =
-                    update_weighted_log_prob(log_prob_kt, old_head, 0.0, false);
-                return ChildRef::from_segment(segment_idx);
             }
         }
 
-        let segment_idx = self.alloc_segment_with_parts(
-            symbol_count,
-            log_prob_kt,
-            child,
-            anchor_or_const,
-            1,
-            flags,
-        );
+        let segment_idx =
+            self.alloc_segment_with_parts(symbol_count, log_prob_kt, child, singleton_payload);
         ChildRef::from_segment(segment_idx)
     }
 
@@ -1123,6 +1330,7 @@ struct CtEngine {
 impl CtEngine {
     const RESERVE_MIN_NODES: usize = 4 * 1024;
     const RESERVE_MAX_NODES: usize = 1 << 18;
+    const HOT_PREFIX_DEPTH: usize = 10;
 
     fn new(depth: usize) -> Self {
         let mut arena = CtArena::with_capacity(1024.min(1 << depth.min(16)));
@@ -1158,6 +1366,11 @@ impl CtEngine {
     #[inline(always)]
     fn root_visits(&self) -> usize {
         self.arena.visits(self.root) as usize
+    }
+
+    #[inline(always)]
+    fn hot_prefix_depth(&self) -> usize {
+        self.max_depth.min(Self::HOT_PREFIX_DEPTH)
     }
 
     fn clear(&mut self) {
@@ -1218,7 +1431,7 @@ impl CtEngine {
         )
     }
 
-    fn build_missing_path(
+    fn build_missing_segment_path(
         &mut self,
         depth: usize,
         history: &[Symbol],
@@ -1234,6 +1447,13 @@ impl CtEngine {
         let log_prob_kt = singleton_log_prob_kt;
         let total_len = self.max_depth - depth + 1;
 
+        if let Some(payload) = SegmentPayload::from_path(history, depth, total_len as u32) {
+            let segment =
+                self.arena
+                    .alloc_segment_with_parts(counts, log_prob_kt, ChildRef::NONE, payload);
+            return ChildRef::from_segment(segment);
+        }
+
         let history_nodes = if depth < history.len() {
             (self.max_depth.min(history.len() - 1) - depth) + 1
         } else {
@@ -1247,9 +1467,7 @@ impl CtEngine {
                 counts,
                 log_prob_kt,
                 ChildRef::NONE,
-                0,
-                const_nodes as u32,
-                0,
+                SegmentPayload::constant(false, const_nodes as u32),
             );
             built = ChildRef::from_segment(const_segment);
         }
@@ -1258,11 +1476,135 @@ impl CtEngine {
                 counts,
                 log_prob_kt,
                 built,
-                (history.len() - depth - 1) as u32,
-                history_nodes as u32,
-                SEG_FLAG_HISTORY,
+                SegmentPayload::history(
+                    (history.len() - depth - 1) as u32,
+                    history_nodes as u32,
+                    false,
+                ),
             );
             built = ChildRef::from_segment(history_segment);
+        }
+        built
+    }
+
+    fn build_missing_path(
+        &mut self,
+        depth: usize,
+        history: &[Symbol],
+        sym_idx: usize,
+        singleton_log_prob_kt: f64,
+    ) -> ChildRef {
+        if depth > self.max_depth {
+            return ChildRef::NONE;
+        }
+
+        let hot_prefix_depth = self.hot_prefix_depth();
+        if depth > hot_prefix_depth {
+            return self.build_missing_segment_path(depth, history, sym_idx, singleton_log_prob_kt);
+        }
+
+        let mut counts = [0u32; 2];
+        counts[sym_idx] = 1;
+        let mut built = if hot_prefix_depth < self.max_depth {
+            self.build_missing_segment_path(
+                hot_prefix_depth + 1,
+                history,
+                sym_idx,
+                singleton_log_prob_kt,
+            )
+        } else {
+            ChildRef::NONE
+        };
+
+        for node_depth in (depth..=hot_prefix_depth).rev() {
+            let node = self
+                .arena
+                .alloc_node_with_state(counts, singleton_log_prob_kt);
+            if node_depth < self.max_depth {
+                let edge = history_symbol(history, node_depth) as usize;
+                self.arena.set_child(node, edge, built);
+            }
+            self.arena.recompute_node_weight(node);
+            built = ChildRef::from_node(node);
+        }
+        built
+    }
+
+    #[inline(always)]
+    fn build_missing_segment_path_exact_bits(
+        &mut self,
+        depth: usize,
+        path_bits: u64,
+        sym_idx: usize,
+        singleton_log_prob_kt: f64,
+    ) -> ChildRef {
+        debug_assert!(self.max_depth <= SEG_EXACT_MAX_LEN as usize);
+        if depth > self.max_depth {
+            return ChildRef::NONE;
+        }
+
+        let mut counts = [0u32; 2];
+        counts[sym_idx] = 1;
+        let total_len = self.max_depth - depth + 1;
+        let payload = SegmentPayload::exact(
+            path_bits & low_bits_mask_u64(total_len as u32),
+            total_len as u32,
+        );
+        let segment = self.arena.alloc_segment_with_parts(
+            counts,
+            singleton_log_prob_kt,
+            ChildRef::NONE,
+            payload,
+        );
+        ChildRef::from_segment(segment)
+    }
+
+    #[inline(always)]
+    fn build_missing_path_exact_bits(
+        &mut self,
+        depth: usize,
+        path_bits: u64,
+        sym_idx: usize,
+        singleton_log_prob_kt: f64,
+    ) -> ChildRef {
+        debug_assert!(self.max_depth <= SEG_EXACT_MAX_LEN as usize);
+        if depth > self.max_depth {
+            return ChildRef::NONE;
+        }
+
+        let hot_prefix_depth = self.hot_prefix_depth();
+        if depth > hot_prefix_depth {
+            return self.build_missing_segment_path_exact_bits(
+                depth,
+                path_bits,
+                sym_idx,
+                singleton_log_prob_kt,
+            );
+        }
+
+        let mut counts = [0u32; 2];
+        counts[sym_idx] = 1;
+        let mut built = if hot_prefix_depth < self.max_depth {
+            self.build_missing_segment_path_exact_bits(
+                hot_prefix_depth + 1,
+                shift_path_bits(path_bits, hot_prefix_depth + 1 - depth),
+                sym_idx,
+                singleton_log_prob_kt,
+            )
+        } else {
+            ChildRef::NONE
+        };
+
+        for node_depth in (depth..=hot_prefix_depth).rev() {
+            let node = self
+                .arena
+                .alloc_node_with_state(counts, singleton_log_prob_kt);
+            if node_depth < self.max_depth {
+                let edge = ((path_bits >> (node_depth - depth)) & 1) as usize;
+                self.arena.set_child(node, edge, built);
+            }
+            self.arena.recompute_node_weight(node);
+            built = ChildRef::from_node(node);
         }
         built
     }
@@ -1332,7 +1674,7 @@ impl CtEngine {
     fn recompute_segment_head(&mut self, segment_idx: SegmentIndex) {
         let segment = self.arena.segments[segment_idx.get()];
         let head = if segment.tail.is_some() {
-            let (alpha, log_alpha, log_one_minus_alpha) = self.segment_constants(segment.len);
+            let (alpha, log_alpha, log_one_minus_alpha) = self.segment_constants(segment.len());
             unary_chain_log_weight_precomputed(
                 segment.log_prob_kt,
                 self.arena.child_ref_weighted(segment.tail),
@@ -1423,7 +1765,7 @@ impl CtEngine {
 
         let original = self.arena.segments[segment_idx.get()];
         let offset = offset_u32 as usize;
-        let seg_len = original.len as usize;
+        let seg_len = original.len() as usize;
         let history_len = history.len();
         let current_start_depth = self.prepared_levels - last_step.span as usize + 1;
         let node_depth = current_start_depth + offset;
@@ -1434,28 +1776,18 @@ impl CtEngine {
         let old_continuation = if offset + 1 < seg_len {
             if offset == 0 {
                 let segment = &mut self.arena.segments[segment_idx.get()];
-                segment.len = (seg_len - 1) as u32;
-                if (segment.flags & SEG_FLAG_HISTORY) != 0 {
-                    segment.anchor_or_const -= 1;
-                }
+                segment.payload = original.payload.suffix_after(1);
                 segment.tail = original.tail;
                 segment.symbol_count = original.symbol_count;
                 segment.log_prob_kt = original.log_prob_kt;
                 self.recompute_segment_head(segment_idx);
                 ChildRef::from_segment(segment_idx)
             } else {
-                let suffix_anchor = if (original.flags & SEG_FLAG_HISTORY) != 0 {
-                    original.anchor_or_const - (offset as u32 + 1)
-                } else {
-                    original.anchor_or_const
-                };
                 ChildRef::from_segment(self.arena.alloc_segment_with_parts(
                     original.symbol_count,
                     original.log_prob_kt,
                     original.tail,
-                    suffix_anchor,
-                    (seg_len - offset - 1) as u32,
-                    original.flags,
+                    original.payload.suffix_after(offset as u32 + 1),
                 ))
             }
         } else {
@@ -1494,7 +1826,7 @@ impl CtEngine {
             );
         } else {
             let segment = &mut self.arena.segments[segment_idx.get()];
-            segment.len = offset as u32;
+            segment.payload = original.payload.prefix(offset as u32);
             segment.tail = ChildRef::from_node(branch);
             segment.symbol_count = updated_counts;
             segment.log_prob_kt = updated_log_prob_kt;
@@ -1597,7 +1929,7 @@ impl CtEngine {
                             clamp_log_prob(log_prob_kt)
                         } else {
                             let (alpha, log_alpha, log_one_minus_alpha) =
-                                self.segment_constants(self.arena.segments[slot].len);
+                                self.segment_constants(self.arena.segments[slot].len());
                             unary_chain_log_weight_precomputed(
                                 log_prob_kt,
                                 child_weight,
@@ -1661,7 +1993,7 @@ impl CtEngine {
 
         let segment_idx = child.as_segment().unwrap();
         let original = self.arena.segments[segment_idx.get()];
-        let seg_len = original.len as usize;
+        let seg_len = original.len() as usize;
         let mut updated_counts = original.symbol_count;
         let mut updated_log_prob_kt = original.log_prob_kt;
         apply_update_to_state_raw(
@@ -1679,73 +2011,26 @@ impl CtEngine {
             seg_len
         }
         .min(depth_budget);
-        let mismatch = if comparable_len == 0 {
-            None
-        } else if (original.flags & SEG_FLAG_HISTORY) != 0 {
-            let history_ptr = history.as_ptr();
-            let history_len = history.len() as isize;
-            let mut path_hist_idx = history_len - depth as isize - 1;
-            let mut seg_hist_idx = original.anchor_or_const as isize;
-            let invert = (original.flags & SEG_FLAG_INVERT) != 0;
-            let mut mismatch = None;
-            for offset in 0..comparable_len {
-                let path_edge =
-                    unsafe { history_at_or_zero(history_ptr, history_len, path_hist_idx) };
-                let existing_raw =
-                    unsafe { history_at_or_zero(history_ptr, history_len, seg_hist_idx) };
-                let existing_edge = if invert { !existing_raw } else { existing_raw };
-                if existing_edge != path_edge {
-                    mismatch = Some((offset, depth + offset, path_edge, existing_edge));
-                    break;
-                }
-                path_hist_idx -= 1;
-                seg_hist_idx -= 1;
-            }
-            mismatch
-        } else {
-            let history_ptr = history.as_ptr();
-            let history_len = history.len() as isize;
-            let mut path_hist_idx = history_len - depth as isize - 1;
-            let existing_edge = (original.anchor_or_const & 1) != 0;
-            let mut mismatch = None;
-            for offset in 0..comparable_len {
-                let path_edge =
-                    unsafe { history_at_or_zero(history_ptr, history_len, path_hist_idx) };
-                if existing_edge != path_edge {
-                    mismatch = Some((offset, depth + offset, path_edge, existing_edge));
-                    break;
-                }
-                path_hist_idx -= 1;
-            }
-            mismatch
-        };
+        let mismatch = first_segment_mismatch(original, depth, history, comparable_len).map(
+            |(offset, path_edge, existing_edge)| (offset, depth + offset, path_edge, existing_edge),
+        );
 
         if let Some((offset, node_depth, path_edge, existing_edge)) = mismatch {
             let old_continuation = if offset + 1 < seg_len {
                 if offset == 0 {
                     let segment = &mut self.arena.segments[segment_idx.get()];
-                    segment.len = (seg_len - 1) as u32;
-                    if (segment.flags & SEG_FLAG_HISTORY) != 0 {
-                        segment.anchor_or_const -= 1;
-                    }
+                    segment.payload = original.payload.suffix_after(1);
                     segment.tail = original.tail;
                     segment.symbol_count = original.symbol_count;
                     segment.log_prob_kt = original.log_prob_kt;
                     self.recompute_segment_head(segment_idx);
                     ChildRef::from_segment(segment_idx)
                 } else {
-                    let suffix_anchor = if (original.flags & SEG_FLAG_HISTORY) != 0 {
-                        original.anchor_or_const - (offset as u32 + 1)
-                    } else {
-                        original.anchor_or_const
-                    };
                     ChildRef::from_segment(self.arena.alloc_segment_with_parts(
                         original.symbol_count,
                         original.log_prob_kt,
                         original.tail,
-                        suffix_anchor,
-                        (seg_len - offset - 1) as u32,
-                        original.flags,
+                        original.payload.suffix_after(offset as u32 + 1),
                     ))
                 }
             } else {
@@ -1770,7 +2055,7 @@ impl CtEngine {
             }
 
             let segment = &mut self.arena.segments[segment_idx.get()];
-            segment.len = offset as u32;
+            segment.payload = original.payload.prefix(offset as u32);
             segment.tail = ChildRef::from_node(branch);
             segment.symbol_count = updated_counts;
             segment.log_prob_kt = updated_log_prob_kt;
@@ -1812,6 +2097,223 @@ impl CtEngine {
         self.arena.segments[segment_idx.get()].log_prob_kt = updated_log_prob_kt;
         self.recompute_segment_head(segment_idx);
         ChildRef::from_segment(segment_idx)
+    }
+
+    fn update_child_fast_exact(
+        &mut self,
+        log_int: &[f64],
+        log_half: &[f64],
+        child: ChildRef,
+        depth: usize,
+        history: &[Symbol],
+        path_bits: u64,
+        sym_idx: usize,
+        singleton_log_prob_kt: f64,
+    ) -> ChildRef {
+        debug_assert!(self.max_depth <= SEG_EXACT_MAX_LEN as usize);
+        if depth > self.max_depth {
+            return child;
+        }
+        if child.is_none() {
+            return self.build_missing_path_exact_bits(
+                depth,
+                path_bits,
+                sym_idx,
+                singleton_log_prob_kt,
+            );
+        }
+
+        if let Some(node_idx) = child.as_node() {
+            if depth < self.max_depth {
+                let path_edge = (path_bits & 1) as usize;
+                let next = self.arena.child(node_idx, path_edge);
+                let updated = self.update_child_fast_exact(
+                    log_int,
+                    log_half,
+                    next,
+                    depth + 1,
+                    history,
+                    shift_path_bits(path_bits, 1),
+                    sym_idx,
+                    singleton_log_prob_kt,
+                );
+                if updated != next {
+                    self.arena.set_child(node_idx, path_edge, updated);
+                }
+            }
+            let mut counts = self.arena.nodes[node_idx.get()].symbol_count;
+            let mut log_prob_kt = self.arena.nodes[node_idx.get()].log_prob_kt;
+            apply_update_to_state_raw(log_int, log_half, &mut counts, &mut log_prob_kt, sym_idx);
+            self.arena.nodes[node_idx.get()].symbol_count = counts;
+            self.arena.nodes[node_idx.get()].log_prob_kt = log_prob_kt;
+            self.arena.recompute_node_weight(node_idx);
+            return ChildRef::from_node(node_idx);
+        }
+
+        let segment_idx = child.as_segment().unwrap();
+        let original = self.arena.segments[segment_idx.get()];
+        if !original.payload.is_exact() {
+            return self.update_child_fast(
+                log_int,
+                log_half,
+                child,
+                depth,
+                history,
+                sym_idx,
+                singleton_log_prob_kt,
+            );
+        }
+
+        let seg_len = original.len() as usize;
+        let mut updated_counts = original.symbol_count;
+        let mut updated_log_prob_kt = original.log_prob_kt;
+        apply_update_to_state_raw(
+            log_int,
+            log_half,
+            &mut updated_counts,
+            &mut updated_log_prob_kt,
+            sym_idx,
+        );
+
+        let depth_budget = self.max_depth.saturating_sub(depth);
+        let comparable_len = if original.tail.is_none() {
+            seg_len.saturating_sub(1)
+        } else {
+            seg_len
+        }
+        .min(depth_budget);
+        let mismatch =
+            first_exact_segment_mismatch(original.payload.exact_bits(), path_bits, comparable_len)
+                .map(|(offset, path_edge, existing_edge)| {
+                    (offset, depth + offset, path_edge, existing_edge)
+                });
+
+        if let Some((offset, node_depth, path_edge, existing_edge)) = mismatch {
+            let old_continuation = if offset + 1 < seg_len {
+                if offset == 0 {
+                    let segment = &mut self.arena.segments[segment_idx.get()];
+                    segment.payload = original.payload.suffix_after(1);
+                    segment.tail = original.tail;
+                    segment.symbol_count = original.symbol_count;
+                    segment.log_prob_kt = original.log_prob_kt;
+                    self.recompute_segment_head(segment_idx);
+                    ChildRef::from_segment(segment_idx)
+                } else {
+                    ChildRef::from_segment(self.arena.alloc_segment_with_parts(
+                        original.symbol_count,
+                        original.log_prob_kt,
+                        original.tail,
+                        original.payload.suffix_after(offset as u32 + 1),
+                    ))
+                }
+            } else {
+                original.tail
+            };
+
+            let new_tail = self.build_missing_path_exact_bits(
+                node_depth + 1,
+                shift_path_bits(path_bits, offset + 1),
+                sym_idx,
+                singleton_log_prob_kt,
+            );
+            let branch = self
+                .arena
+                .alloc_node_with_state(updated_counts, updated_log_prob_kt);
+            self.arena
+                .set_child(branch, existing_edge as usize, old_continuation);
+            self.arena.set_child(branch, path_edge as usize, new_tail);
+            self.arena.recompute_node_weight(branch);
+
+            if offset == 0 {
+                if offset + 1 >= seg_len {
+                    self.arena.free_segment(segment_idx);
+                }
+                return ChildRef::from_node(branch);
+            }
+
+            let segment = &mut self.arena.segments[segment_idx.get()];
+            segment.payload = original.payload.prefix(offset as u32);
+            segment.tail = ChildRef::from_node(branch);
+            segment.symbol_count = updated_counts;
+            segment.log_prob_kt = updated_log_prob_kt;
+            self.recompute_segment_head(segment_idx);
+            return ChildRef::from_segment(segment_idx);
+        }
+
+        if depth_budget < seg_len {
+            self.arena.segments[segment_idx.get()].symbol_count = updated_counts;
+            self.arena.segments[segment_idx.get()].log_prob_kt = updated_log_prob_kt;
+            self.recompute_segment_head(segment_idx);
+            return ChildRef::from_segment(segment_idx);
+        }
+
+        if original.tail.is_none() {
+            let new_tail = self.build_missing_path_exact_bits(
+                depth + seg_len,
+                shift_path_bits(path_bits, seg_len),
+                sym_idx,
+                singleton_log_prob_kt,
+            );
+            self.arena.segments[segment_idx.get()].tail = new_tail;
+            self.arena.segments[segment_idx.get()].symbol_count = updated_counts;
+            self.arena.segments[segment_idx.get()].log_prob_kt = updated_log_prob_kt;
+            self.recompute_segment_head(segment_idx);
+            return ChildRef::from_segment(segment_idx);
+        }
+
+        let tail = original.tail;
+        let updated_tail = self.update_child_fast_exact(
+            log_int,
+            log_half,
+            tail,
+            depth + seg_len,
+            history,
+            shift_path_bits(path_bits, seg_len),
+            sym_idx,
+            singleton_log_prob_kt,
+        );
+        if updated_tail != tail {
+            self.arena.set_segment_tail(segment_idx, updated_tail);
+        }
+        self.arena.segments[segment_idx.get()].symbol_count = updated_counts;
+        self.arena.segments[segment_idx.get()].log_prob_kt = updated_log_prob_kt;
+        self.recompute_segment_head(segment_idx);
+        ChildRef::from_segment(segment_idx)
+    }
+
+    #[inline(always)]
+    fn update_root_child(
+        &mut self,
+        log_int: &[f64],
+        log_half: &[f64],
+        child: ChildRef,
+        history: &[Symbol],
+        sym_idx: usize,
+        singleton_log_prob_kt: f64,
+    ) -> ChildRef {
+        if self.max_depth <= SEG_EXACT_MAX_LEN as usize {
+            let path_bits = path_bits_from_history(history, 1, self.max_depth);
+            self.update_child_fast_exact(
+                log_int,
+                log_half,
+                child,
+                1,
+                history,
+                path_bits,
+                sym_idx,
+                singleton_log_prob_kt,
+            )
+        } else {
+            self.update_child_fast(
+                log_int,
+                log_half,
+                child,
+                1,
+                history,
+                sym_idx,
+                singleton_log_prob_kt,
+            )
+        }
     }
 
     fn collect_existing_levels(&mut self, history: &[Symbol]) -> ChildRef {
@@ -1923,13 +2425,18 @@ impl CtEngine {
             };
             let has_path_child = built.is_some();
             let has_sibling = level.sibling.is_some();
+            let force_node = depth <= self.hot_prefix_depth();
 
-            if has_path_child && has_sibling {
+            if force_node || (has_path_child && has_sibling) {
                 let node = self
                     .arena
                     .alloc_node_with_state(level.symbol_count, level.log_prob_kt);
-                self.arena.set_child(node, path_edge, built);
-                self.arena.set_child(node, path_edge ^ 1, level.sibling);
+                if has_path_child {
+                    self.arena.set_child(node, path_edge, built);
+                }
+                if has_sibling {
+                    self.arena.set_child(node, path_edge ^ 1, level.sibling);
+                }
                 self.arena.recompute_node_weight(node);
                 built = ChildRef::from_node(node);
             } else {
@@ -1962,7 +2469,7 @@ impl CtEngine {
                     self.arena.set_child(node, edge, ChildRef::NONE);
                 }
                 Detach::SegmentNext { segment, new_len } => {
-                    self.arena.segments[segment.get()].len = new_len;
+                    self.arena.segments[segment.get()].set_len(new_len);
                     self.arena.set_segment_tail(segment, ChildRef::NONE);
                 }
             }
@@ -1990,11 +2497,10 @@ impl CtEngine {
         if self.max_depth > 0 {
             let root_edge = history_symbol(history, 0) as usize;
             let old_child = self.arena.child(self.root, root_edge);
-            let new_child = self.update_child_fast(
+            let new_child = self.update_root_child(
                 log_int,
                 log_half,
                 old_child,
-                1,
                 history,
                 sym_idx,
                 singleton_log_prob_kt,
@@ -2061,11 +2567,10 @@ impl CtEngine {
                         ),
                     }
                 } else {
-                    this.update_child_fast(
+                    this.update_root_child(
                         log_int,
                         log_half,
                         old_child,
-                        1,
                         history,
                         sym_idx,
                         singleton_log_prob_kt,
@@ -2188,81 +2693,14 @@ impl CtEngine {
                 }
                 ExistingSource::Segment(segment_idx, _) => {
                     let segment = self.arena.segments[segment_idx.get()];
-                    let seg_len = segment.len as usize;
+                    let seg_len = segment.len() as usize;
                     let counts = segment.symbol_count;
                     let kt_log_prob = segment.log_prob_kt;
-                    let history_len_i64 = history_len as i64;
-                    let mut path_hist_idx = history_len_i64 - depth as i64 - 1;
+                    for offset in 0..seg_len {
+                        let node_depth = depth + offset;
+                        let span = (offset + 1) as u32;
 
-                    if (segment.flags & SEG_FLAG_HISTORY) != 0 {
-                        let invert = (segment.flags & SEG_FLAG_INVERT) != 0;
-                        let mut seg_hist_idx = segment.anchor_or_const as i64;
-                        for offset in 0..seg_len {
-                            let node_depth = depth + offset;
-                            let span = (offset + 1) as u32;
-
-                            if node_depth == self.max_depth {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: 0.0,
-                                    has_sibling: 0,
-                                });
-                                self.prepared_levels += span as usize;
-                                break 'walk;
-                            }
-
-                            if offset + 1 >= seg_len && segment.tail.is_none() {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: 0.0,
-                                    has_sibling: 0,
-                                });
-                                self.prepared_levels += span as usize;
-                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
-                                break 'walk;
-                            }
-
-                            let path_edge = if path_hist_idx >= 0 {
-                                history[path_hist_idx as usize]
-                            } else {
-                                false
-                            };
-                            let existing_raw =
-                                if seg_hist_idx >= 0 && seg_hist_idx < history_len_i64 {
-                                    history[seg_hist_idx as usize]
-                                } else {
-                                    false
-                                };
-                            let existing_edge = if invert { !existing_raw } else { existing_raw };
-                            if path_edge != existing_edge {
-                                let span = (offset + 1) as u32;
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: self
-                                        .arena
-                                        .segment_continuation_weight(segment_idx, offset as u32),
-                                    has_sibling: 1,
-                                });
-                                self.prepared_levels += span as usize;
-                                self.prepared_end = PreparedEnd::MismatchAtCurrentSegment;
-                                break 'walk;
-                            }
-
-                            if offset + 1 < seg_len {
-                                path_hist_idx -= 1;
-                                seg_hist_idx -= 1;
-                                continue;
-                            }
-
+                        if node_depth == self.max_depth {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
                                 counts,
@@ -2272,76 +2710,10 @@ impl CtEngine {
                                 has_sibling: 0,
                             });
                             self.prepared_levels += span as usize;
-                            let tail = segment.tail;
-                            source = Self::child_to_existing_source(tail)
-                                .unwrap_or(ExistingSource::None);
-                            if matches!(source, ExistingSource::None) {
-                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
-                                break 'walk;
-                            }
-                            depth = node_depth + 1;
-                            continue 'walk;
+                            break 'walk;
                         }
-                    } else {
-                        let existing_edge = (segment.anchor_or_const & 1) != 0;
-                        for offset in 0..seg_len {
-                            let node_depth = depth + offset;
-                            let span = (offset + 1) as u32;
 
-                            if node_depth == self.max_depth {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: 0.0,
-                                    has_sibling: 0,
-                                });
-                                self.prepared_levels += span as usize;
-                                break 'walk;
-                            }
-
-                            if offset + 1 >= seg_len && segment.tail.is_none() {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: 0.0,
-                                    has_sibling: 0,
-                                });
-                                self.prepared_levels += span as usize;
-                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
-                                break 'walk;
-                            }
-
-                            let path_edge = if path_hist_idx >= 0 {
-                                history[path_hist_idx as usize]
-                            } else {
-                                false
-                            };
-                            if path_edge != existing_edge {
-                                let span = (offset + 1) as u32;
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: self
-                                        .arena
-                                        .segment_continuation_weight(segment_idx, offset as u32),
-                                    has_sibling: 1,
-                                });
-                                self.prepared_levels += span as usize;
-                                self.prepared_end = PreparedEnd::MismatchAtCurrentSegment;
-                                break 'walk;
-                            }
-
-                            if offset + 1 < seg_len {
-                                path_hist_idx -= 1;
-                                continue;
-                            }
-
+                        if offset + 1 >= seg_len && segment.tail.is_none() {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
                                 counts,
@@ -2351,16 +2723,51 @@ impl CtEngine {
                                 has_sibling: 0,
                             });
                             self.prepared_levels += span as usize;
-                            let tail = segment.tail;
-                            source = Self::child_to_existing_source(tail)
-                                .unwrap_or(ExistingSource::None);
-                            if matches!(source, ExistingSource::None) {
-                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
-                                break 'walk;
-                            }
-                            depth = node_depth + 1;
-                            continue 'walk;
+                            self.prepared_end = PreparedEnd::MissingAfterCurrent;
+                            break 'walk;
                         }
+
+                        let path_edge = path_edge_at_depth(history, history_len, node_depth);
+                        let existing_edge =
+                            segment_edge_from_parts(segment, offset, history, history_len);
+                        if path_edge != existing_edge {
+                            self.prepared_steps.push(PreparedStep {
+                                source: ExistingSource::Segment(segment_idx, offset as u32),
+                                counts,
+                                kt_log_prob,
+                                span,
+                                sibling_weight: self
+                                    .arena
+                                    .segment_continuation_weight(segment_idx, offset as u32),
+                                has_sibling: 1,
+                            });
+                            self.prepared_levels += span as usize;
+                            self.prepared_end = PreparedEnd::MismatchAtCurrentSegment;
+                            break 'walk;
+                        }
+
+                        if offset + 1 < seg_len {
+                            continue;
+                        }
+
+                        self.prepared_steps.push(PreparedStep {
+                            source: ExistingSource::Segment(segment_idx, offset as u32),
+                            counts,
+                            kt_log_prob,
+                            span,
+                            sibling_weight: 0.0,
+                            has_sibling: 0,
+                        });
+                        self.prepared_levels += span as usize;
+                        let tail = segment.tail;
+                        source =
+                            Self::child_to_existing_source(tail).unwrap_or(ExistingSource::None);
+                        if matches!(source, ExistingSource::None) {
+                            self.prepared_end = PreparedEnd::MissingAfterCurrent;
+                            break 'walk;
+                        }
+                        depth = node_depth + 1;
+                        continue 'walk;
                     }
                 }
             }
@@ -2519,80 +2926,14 @@ impl CtEngine {
                 }
                 ExistingSource::Segment(segment_idx, _) => {
                     let segment = self.arena.segments[segment_idx.get()];
-                    let seg_len = segment.len as usize;
+                    let seg_len = segment.len() as usize;
                     let counts = segment.symbol_count;
                     let kt_log_prob = segment.log_prob_kt;
-                    let history_len_i64 = history_len as i64;
-                    let mut path_hist_idx = history_len_i64 - depth as i64 - 1;
+                    for offset in 0..seg_len {
+                        let node_depth = depth + offset;
+                        let span = (offset + 1) as u32;
 
-                    if (segment.flags & SEG_FLAG_HISTORY) != 0 {
-                        let invert = (segment.flags & SEG_FLAG_INVERT) != 0;
-                        let mut seg_hist_idx = segment.anchor_or_const as i64;
-                        for offset in 0..seg_len {
-                            let node_depth = depth + offset;
-                            let span = (offset + 1) as u32;
-
-                            if node_depth == self.max_depth {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: 0.0,
-                                    has_sibling: 0,
-                                });
-                                self.prepared_levels += span as usize;
-                                break 'walk;
-                            }
-
-                            if offset + 1 >= seg_len && segment.tail.is_none() {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: 0.0,
-                                    has_sibling: 0,
-                                });
-                                self.prepared_levels += span as usize;
-                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
-                                break 'walk;
-                            }
-
-                            let path_edge = if path_hist_idx >= 0 {
-                                history[path_hist_idx as usize]
-                            } else {
-                                false
-                            };
-                            let existing_raw =
-                                if seg_hist_idx >= 0 && seg_hist_idx < history_len_i64 {
-                                    history[seg_hist_idx as usize]
-                                } else {
-                                    false
-                                };
-                            let existing_edge = if invert { !existing_raw } else { existing_raw };
-                            if path_edge != existing_edge {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: self
-                                        .arena
-                                        .segment_continuation_weight(segment_idx, offset as u32),
-                                    has_sibling: 1,
-                                });
-                                self.prepared_levels += span as usize;
-                                self.prepared_end = PreparedEnd::MismatchAtCurrentSegment;
-                                break 'walk;
-                            }
-
-                            if offset + 1 < seg_len {
-                                path_hist_idx -= 1;
-                                seg_hist_idx -= 1;
-                                continue;
-                            }
-
+                        if node_depth == self.max_depth {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
                                 counts,
@@ -2602,75 +2943,10 @@ impl CtEngine {
                                 has_sibling: 0,
                             });
                             self.prepared_levels += span as usize;
-                            let tail = segment.tail;
-                            source = Self::child_to_existing_source(tail)
-                                .unwrap_or(ExistingSource::None);
-                            if matches!(source, ExistingSource::None) {
-                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
-                                break 'walk;
-                            }
-                            depth = node_depth + 1;
-                            continue 'walk;
+                            break 'walk;
                         }
-                    } else {
-                        let existing_edge = (segment.anchor_or_const & 1) != 0;
-                        for offset in 0..seg_len {
-                            let node_depth = depth + offset;
-                            let span = (offset + 1) as u32;
 
-                            if node_depth == self.max_depth {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: 0.0,
-                                    has_sibling: 0,
-                                });
-                                self.prepared_levels += span as usize;
-                                break 'walk;
-                            }
-
-                            if offset + 1 >= seg_len && segment.tail.is_none() {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: 0.0,
-                                    has_sibling: 0,
-                                });
-                                self.prepared_levels += span as usize;
-                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
-                                break 'walk;
-                            }
-
-                            let path_edge = if path_hist_idx >= 0 {
-                                history[path_hist_idx as usize]
-                            } else {
-                                false
-                            };
-                            if path_edge != existing_edge {
-                                self.prepared_steps.push(PreparedStep {
-                                    source: ExistingSource::Segment(segment_idx, offset as u32),
-                                    counts,
-                                    kt_log_prob,
-                                    span,
-                                    sibling_weight: self
-                                        .arena
-                                        .segment_continuation_weight(segment_idx, offset as u32),
-                                    has_sibling: 1,
-                                });
-                                self.prepared_levels += span as usize;
-                                self.prepared_end = PreparedEnd::MismatchAtCurrentSegment;
-                                break 'walk;
-                            }
-
-                            if offset + 1 < seg_len {
-                                path_hist_idx -= 1;
-                                continue;
-                            }
-
+                        if offset + 1 >= seg_len && segment.tail.is_none() {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
                                 counts,
@@ -2680,16 +2956,51 @@ impl CtEngine {
                                 has_sibling: 0,
                             });
                             self.prepared_levels += span as usize;
-                            let tail = segment.tail;
-                            source = Self::child_to_existing_source(tail)
-                                .unwrap_or(ExistingSource::None);
-                            if matches!(source, ExistingSource::None) {
-                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
-                                break 'walk;
-                            }
-                            depth = node_depth + 1;
-                            continue 'walk;
+                            self.prepared_end = PreparedEnd::MissingAfterCurrent;
+                            break 'walk;
                         }
+
+                        let path_edge = path_edge_at_depth(history, history_len, node_depth);
+                        let existing_edge =
+                            segment_edge_from_parts(segment, offset, history, history_len);
+                        if path_edge != existing_edge {
+                            self.prepared_steps.push(PreparedStep {
+                                source: ExistingSource::Segment(segment_idx, offset as u32),
+                                counts,
+                                kt_log_prob,
+                                span,
+                                sibling_weight: self
+                                    .arena
+                                    .segment_continuation_weight(segment_idx, offset as u32),
+                                has_sibling: 1,
+                            });
+                            self.prepared_levels += span as usize;
+                            self.prepared_end = PreparedEnd::MismatchAtCurrentSegment;
+                            break 'walk;
+                        }
+
+                        if offset + 1 < seg_len {
+                            continue;
+                        }
+
+                        self.prepared_steps.push(PreparedStep {
+                            source: ExistingSource::Segment(segment_idx, offset as u32),
+                            counts,
+                            kt_log_prob,
+                            span,
+                            sibling_weight: 0.0,
+                            has_sibling: 0,
+                        });
+                        self.prepared_levels += span as usize;
+                        let tail = segment.tail;
+                        source =
+                            Self::child_to_existing_source(tail).unwrap_or(ExistingSource::None);
+                        if matches!(source, ExistingSource::None) {
+                            self.prepared_end = PreparedEnd::MissingAfterCurrent;
+                            break 'walk;
+                        }
+                        depth = node_depth + 1;
+                        continue 'walk;
                     }
                 }
             }
@@ -3441,6 +3752,32 @@ mod tests {
         assert!(diff <= 1e-12 * scale, "a={a} b={b} diff={diff}");
     }
 
+    fn child_after_hot_prefix(tree: &ContextTree, history_before_update: &[Symbol]) -> ChildRef {
+        let hot_prefix_depth = tree.engine.hot_prefix_depth();
+        if hot_prefix_depth == 0 {
+            return ChildRef::NONE;
+        }
+
+        let root_edge = history_symbol(history_before_update, 0) as usize;
+        let mut current = tree
+            .engine
+            .arena
+            .child(tree.engine.root, root_edge)
+            .as_node()
+            .expect("hot-prefix node");
+        for node_depth in 1..hot_prefix_depth {
+            let edge = history_symbol(history_before_update, node_depth) as usize;
+            current = tree
+                .engine
+                .arena
+                .child(current, edge)
+                .as_node()
+                .expect("next hot-prefix node");
+        }
+        let tail_edge = history_symbol(history_before_update, hot_prefix_depth) as usize;
+        tree.engine.arena.child(current, tail_edge)
+    }
+
     #[test]
     #[should_panic(expected = "ctw node index overflow")]
     fn node_index_from_usize_rejects_overflow() {
@@ -3459,19 +3796,124 @@ mod tests {
     }
 
     #[test]
-    fn context_tree_singleton_paths_use_segments() {
-        let mut tree = ContextTree::new(4);
+    fn ctw_segment_payload_stays_packed() {
+        assert_eq!(std::mem::size_of::<CtSegment>(), 40);
+    }
+
+    #[test]
+    fn context_tree_singleton_paths_use_hot_prefix_nodes() {
+        let mut tree = ContextTree::new(12);
         tree.update(false);
-        assert_eq!(tree.engine.arena.len(), 1);
-        assert_eq!(tree.engine.arena.segment_count(), 1);
+
+        let hot_prefix_depth = tree.engine.hot_prefix_depth();
         let child = tree.engine.arena.child(tree.engine.root, 0);
-        assert!(child.as_segment().is_some());
-        let segment = child.as_segment().unwrap();
+        let mut current = child.as_node().expect("hot-prefix node");
+        let mut visited_hot_prefix_nodes = 1usize;
+        for depth in 1..hot_prefix_depth {
+            let next = tree.engine.arena.child(current, 0);
+            current = next.as_node().expect("next hot-prefix node");
+            visited_hot_prefix_nodes += 1;
+            assert!(depth < hot_prefix_depth);
+        }
+        assert_eq!(visited_hot_prefix_nodes, hot_prefix_depth);
+        let segment = tree
+            .engine
+            .arena
+            .child(current, 0)
+            .as_segment()
+            .expect("segment tail");
+        assert!(tree.engine.arena.child(current, 1).is_none());
+        assert!(tree.engine.arena.segments[segment.get()].tail.is_none());
         assert_close(
             tree.engine.arena.segments[segment.get()].head_log_prob_weighted,
             -std::f64::consts::LN_2,
         );
         assert_close(tree.get_log_block_probability(), -std::f64::consts::LN_2);
+    }
+
+    #[test]
+    fn context_tree_missing_path_tail_uses_exact_segment_payloads() {
+        let mut tree = ContextTree::new(12);
+        tree.update(true);
+        let child = tree.engine.arena.child(tree.engine.root, 0);
+        let mut current = child.as_node().expect("hot-prefix node");
+        for _ in 1..tree.engine.hot_prefix_depth() {
+            current = tree
+                .engine
+                .arena
+                .child(current, 0)
+                .as_node()
+                .expect("next hot-prefix node");
+        }
+        let segment = tree
+            .engine
+            .arena
+            .child(current, 0)
+            .as_segment()
+            .expect("segment tail");
+        let payload = tree.engine.arena.segments[segment.get()].payload;
+        assert!(payload.is_exact());
+        assert_eq!(
+            payload.len() as usize,
+            tree.engine.max_depth - tree.engine.hot_prefix_depth()
+        );
+        assert_eq!(payload.exact_bits() & low_bits_mask_u64(payload.len()), 0);
+    }
+
+    #[test]
+    fn context_tree_missing_path_tail_uses_const_payload_beyond_exact_limit() {
+        let mut tree = ContextTree::new(80);
+        let history_before = tree.history.clone();
+        tree.update(false);
+
+        let segment = child_after_hot_prefix(&tree, &history_before)
+            .as_segment()
+            .expect("segment tail");
+        let segment = tree.engine.arena.segments[segment.get()];
+        assert_eq!(segment.payload.mode(), SEG_MODE_CONST);
+        assert_eq!(
+            segment.payload.len() as usize,
+            tree.engine.max_depth - tree.engine.hot_prefix_depth()
+        );
+        assert!(!segment.payload.const_bit());
+        assert!(segment.tail.is_none());
+    }
+
+    #[test]
+    fn context_tree_missing_path_tail_uses_history_and_const_payloads_beyond_exact_limit() {
+        let mut tree = ContextTree::new(80);
+        let seeded_history: Vec<Symbol> = (0..80).map(|i| (i & 1) == 1).collect();
+        tree.update_history(&seeded_history);
+        let history_before = tree.history.clone();
+        tree.update(false);
+
+        let first_segment = child_after_hot_prefix(&tree, &history_before)
+            .as_segment()
+            .expect("history-backed segment tail");
+        let first_segment = tree.engine.arena.segments[first_segment.get()];
+        assert_eq!(first_segment.payload.mode(), SEG_MODE_HISTORY);
+        assert_eq!(first_segment.payload.len(), 69);
+        for offset in [0usize, 1, 7, 31, 68] {
+            assert_eq!(
+                segment_edge_from_parts(
+                    first_segment,
+                    offset,
+                    &history_before,
+                    history_before.len()
+                ),
+                history_symbol(&history_before, tree.engine.hot_prefix_depth() + 1 + offset)
+            );
+        }
+
+        let tail_segment = first_segment
+            .tail
+            .as_segment()
+            .expect("constant fallback tail");
+        let tail_segment = tree.engine.arena.segments[tail_segment.get()];
+        assert_eq!(tail_segment.payload.mode(), SEG_MODE_CONST);
+        assert_eq!(tail_segment.payload.len(), 1);
+        assert!(!tail_segment.payload.const_bit());
+        assert!(tail_segment.tail.is_none());
     }
 
     #[test]
@@ -3552,6 +3994,58 @@ mod tests {
     }
 
     #[test]
+    fn context_tree_long_depth_matches_reference_on_short_sequences() {
+        for &depth in &[65usize, 80usize] {
+            for len in 0..=6usize {
+                for mask in 0..(1usize << len) {
+                    let mut prod = ContextTree::new(depth);
+                    let mut reference = RefContextTree::new(depth);
+                    for step in 0..len {
+                        let p_prod_0 = prod.predict(false);
+                        let p_ref_0 = reference.predict(false);
+                        assert!(
+                            (p_prod_0 - p_ref_0).abs()
+                                <= 1e-12 * p_prod_0.abs().max(p_ref_0.abs()).max(1.0),
+                            "long-depth predict0 mismatch depth={depth} len={len} mask={mask} step={step} prod={p_prod_0} ref={p_ref_0} history={:?}",
+                            prod.history
+                        );
+                        let p_prod_1 = prod.predict(true);
+                        let p_ref_1 = reference.predict(true);
+                        assert!(
+                            (p_prod_1 - p_ref_1).abs()
+                                <= 1e-12 * p_prod_1.abs().max(p_ref_1.abs()).max(1.0),
+                            "long-depth predict1 mismatch depth={depth} len={len} mask={mask} step={step} prod={p_prod_1} ref={p_ref_1} history={:?}",
+                            prod.history
+                        );
+                        assert_close(
+                            prod.get_log_block_probability(),
+                            reference.get_log_block_probability(),
+                        );
+                        let bit = ((mask >> step) & 1) == 1;
+                        prod.update(bit);
+                        reference.update(bit);
+                        assert_close(
+                            prod.get_log_block_probability(),
+                            reference.get_log_block_probability(),
+                        );
+                    }
+
+                    while prod.history_size() > 0 {
+                        assert_close(prod.predict(false), reference.predict(false));
+                        assert_close(prod.predict(true), reference.predict(true));
+                        prod.revert();
+                        reference.revert();
+                        assert_close(
+                            prod.get_log_block_probability(),
+                            reference.get_log_block_probability(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fac_ctw_matches_reference_on_short_sequences() {
         let mut fac = FacContextTree::new(4, 4);
         let mut reference = RefFacContextTree::new(4, 4);
@@ -3614,6 +4108,20 @@ mod tests {
                 let p_one = fac.predict_one(bit_idx);
                 assert_close(p_generic, p_one);
                 let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+                fac.update_predicted(bit, bit_idx);
+            }
+        }
+    }
+
+    #[test]
+    fn fac_ctw_long_depth_predict_one_matches_predict_true() {
+        let mut fac = FacContextTree::new(78, 4);
+        for step in 0..24usize {
+            for bit_idx in 0..fac.num_bits() {
+                let p_generic = fac.predict(true, bit_idx);
+                let p_one = fac.predict_one(bit_idx);
+                assert_close(p_generic, p_one);
+                let bit = ((step * 5 + bit_idx * 3) & 1) == 1;
                 fac.update_predicted(bit, bit_idx);
             }
         }
@@ -3906,6 +4414,31 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn fac_ctw_long_depth_update_predicted_matches_fresh_update_on_bit_stream() {
+        let mut predicted = FacContextTree::new(78, 4);
+        let mut fresh = predicted.clone();
+
+        for step in 0..20usize {
+            for bit_idx in 0..predicted.num_bits() {
+                let bit = ((step * 7 + bit_idx * 11) & 1) == 1;
+                let _ = predicted.predict(true, bit_idx);
+                predicted.update_predicted(bit, bit_idx);
+                fresh.update(bit, bit_idx);
+                assert_eq!(predicted.shared_history, fresh.shared_history);
+                assert_close(
+                    predicted.get_log_block_probability(),
+                    fresh.get_log_block_probability(),
+                );
+            }
+        }
+
+        for bit_idx in 0..predicted.num_bits() {
+            assert_close(predicted.predict(false, bit_idx), fresh.predict(false, bit_idx));
+            assert_close(predicted.predict(true, bit_idx), fresh.predict(true, bit_idx));
         }
     }
 

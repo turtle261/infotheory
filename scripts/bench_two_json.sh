@@ -905,13 +905,5 @@ if [ "${BENCH_SUITE}" = "two-json" ]; then
 else
   say "[bench] No checked-in baseline comparator is configured for suite '${BENCH_SUITE}'."
 fi
-say "[bench] Plot commands:"
-say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} h RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"compress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} compress RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"decompress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y rss_kib_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} decompress RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y real_seconds_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} h wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"compress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y real_seconds_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} compress wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"decompress\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y real_seconds_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} decompress wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
-say "  awk -F '\\t' 'NR==1 || \$1==\"h\"' '${SUMMARY_TSV}' | kuva line - --x size_bytes --y entropy_bpb_median --color-by subject --legend --log-x --title '${SUITE_DISPLAY} h bits per byte vs size' --x-label 'size (bytes)' --y-label 'bits per byte' --terminal"
-say "  kuva line '${SUMMARY_TSV}' --x size_bytes --y real_seconds_median --color-by series --legend --log-x --title '${SUITE_DISPLAY} all operations wall time vs size' --x-label 'size (bytes)' --y-label 'seconds' --terminal"
-say "  kuva line '${SUMMARY_TSV}' --x size_bytes --y rss_kib_median --color-by series --legend --log-x --title '${SUITE_DISPLAY} all operations RSS vs size' --x-label 'size (bytes)' --y-label 'peak RSS (KiB)' --terminal"
+say "[bench] Plot and inspect the results via benchman TUI instead of legacy Kuva commands:"
+say "  '${ROOT_DIR}/projman.sh' tui '${BENCH_SUITE}' --summary-tsv '${SUMMARY_TSV}'"

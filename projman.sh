@@ -165,10 +165,9 @@ cmd_plot() {
     extra) suite_display="examples/extra.json" ;;
     *) suite=two-json; suite_display="examples/two.json" ;;
   esac
-  say "[plot] Rendering ${suite_display} benchmark SVG plots..."
-  need_cmd sh
-  (cd "$ROOT_DIR" && INFOTHEORY_PLOT_SUITE="$suite" sh "$ROOT_DIR/scripts/plot_two_json.sh" "$@")
-  say "[plot] Done"
+  say "[plot] Legacy plot generation is superseded by the benchman TUI."
+  say "[plot] Use './projman.sh tui ${suite}' to inspect ${suite_display} benchmarks."
+  cmd_tui "$suite" "$@"
 }
 
 cmd_tui_man() {
