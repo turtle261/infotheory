@@ -2636,6 +2636,72 @@ mod tests {
         }
     }
 
+    fn assert_fill_matches_symbol_queries(label: &str, backend: RateBackend) {
+        let mut bulk = RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
+        let mut queried = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+        let data = b"continuation consistency prompt";
+
+        bulk.begin_stream(Some(data.len() as u64))
+            .expect("bulk begin");
+        queried
+            .begin_stream(Some(data.len() as u64))
+            .expect("query begin");
+        for &b in data {
+            bulk.update(b);
+            queried.update(b);
+        }
+
+        let mut bulk_row = [0.0; 256];
+        bulk.fill_log_probs(&mut bulk_row);
+        for (sym, &bulk_logp) in bulk_row.iter().enumerate() {
+            let queried_logp = queried.log_prob(sym as u8);
+            let diff = (bulk_logp - queried_logp).abs();
+            assert!(
+                diff <= 1e-12,
+                "[{label}] sym={sym} bulk={bulk_logp} queried={queried_logp} diff={diff}"
+            );
+        }
+    }
+
+    fn assert_fill_matches_symbol_queries_after_frozen_conditioning(
+        label: &str,
+        backend: RateBackend,
+    ) {
+        let fit = b"If a frog is green, dogs are red.\nIf a toad is green, cats are red.\n";
+        let condition = b"If a cat is red, toads are \n";
+        let total = (fit.len() + condition.len()) as u64;
+
+        let mut bulk = RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
+        let mut queried = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+
+        bulk.begin_stream(Some(total)).expect("bulk begin");
+        queried.begin_stream(Some(total)).expect("query begin");
+        for &b in fit {
+            bulk.update(b);
+            queried.update(b);
+        }
+        bulk.reset_frozen(Some(condition.len() as u64))
+            .expect("bulk reset frozen");
+        queried
+            .reset_frozen(Some(condition.len() as u64))
+            .expect("query reset frozen");
+        for &b in condition {
+            bulk.update_frozen(b);
+            queried.update_frozen(b);
+        }
+
+        let mut bulk_row = [0.0; 256];
+        bulk.fill_log_probs(&mut bulk_row);
+        for (sym, &bulk_logp) in bulk_row.iter().enumerate() {
+            let queried_logp = queried.log_prob(sym as u8);
+            let diff = (bulk_logp - queried_logp).abs();
+            assert!(
+                diff <= 1e-12,
+                "[{label}] frozen sym={sym} bulk={bulk_logp} queried={queried_logp} diff={diff}"
+            );
+        }
+    }
+
     #[test]
     fn predictor_log_prob_update_matches_separate_update_for_rosa_backend() {
         assert_log_prob_update_matches_separate("rosa", RateBackend::RosaPlus);
@@ -2656,6 +2722,57 @@ mod tests {
                 encoding_bits: 8,
             },
         );
+    }
+
+    #[test]
+    fn predictor_fill_matches_symbol_queries_for_rosa_backend() {
+        assert_fill_matches_symbol_queries("rosa", RateBackend::RosaPlus);
+    }
+
+    #[test]
+    fn predictor_fill_matches_symbol_queries_for_ctw_backend() {
+        assert_fill_matches_symbol_queries("ctw", RateBackend::Ctw { depth: 6 });
+    }
+
+    #[test]
+    fn predictor_fill_matches_symbol_queries_for_match_backend() {
+        assert_fill_matches_symbol_queries(
+            "match",
+            RateBackend::Match {
+                hash_bits: 18,
+                min_len: 4,
+                max_len: 64,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            },
+        );
+    }
+
+    #[test]
+    fn predictor_fill_matches_symbol_queries_for_ppmd_backend() {
+        assert_fill_matches_symbol_queries(
+            "ppmd",
+            RateBackend::Ppmd {
+                order: 8,
+                memory_mb: 8,
+            },
+        );
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn predictor_fill_matches_symbol_queries_for_rwkv_backend() {
+        assert_fill_matches_symbol_queries(
+            "rwkv7",
+            RateBackend::Rwkv7Method {
+                method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn predictor_fill_matches_symbol_queries_for_rosa_backend_after_frozen_conditioning() {
+        assert_fill_matches_symbol_queries_after_frozen_conditioning("rosa", RateBackend::RosaPlus);
     }
 
     #[test]

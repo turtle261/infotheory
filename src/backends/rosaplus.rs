@@ -2894,8 +2894,7 @@ impl RosaPlus {
             self.max_order
         };
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
-        self.lm
-            .probs_for_state_raw(&self.sam, mo, v, &mut self.dist);
+        self.lm.probs_for_state(&self.sam, mo, v, &mut self.dist);
 
         if self.lm.has_byte_map
             && (self.lm.alpha_n as usize) == BYTE_ALPHA_N

@@ -46,7 +46,7 @@ use infotheory::*;
 use nyx_lite::SharedMemoryPolicy;
 use std::env;
 use std::fs::File;
-use std::io::{self, BufRead, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "vm")]
@@ -1775,6 +1775,20 @@ fn read_file(path: &str) -> Vec<u8> {
     }
 }
 
+fn read_stdin_all_for_generate() -> Vec<u8> {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        eprintln!("Error: 'generate' requires <input_file> or piped stdin");
+        std::process::exit(1);
+    }
+    let mut data = Vec::new();
+    if let Err(e) = stdin.lock().read_to_end(&mut data) {
+        eprintln!("Error reading stdin: {e}");
+        std::process::exit(1);
+    }
+    data
+}
+
 fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
     match backend {
         CompressionBackend::Rate {
@@ -2652,6 +2666,8 @@ fn main() {
     let mut method_str: Option<String> = None;
     let mut expert_spec_path: Option<String> = None;
     let mut model_export_path: Option<String> = None;
+    let mut generate_len_bytes: usize = 8;
+    let mut generate_config = GenerationConfig::default();
     let mut rate_backend_specified = false;
 
     let mut i = flags_start;
@@ -2693,6 +2709,86 @@ fn main() {
             "--model-export" | "--rwkv-export" => {
                 i += 1;
                 model_export_path = args.get(i).cloned();
+            }
+            "--bytes" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --bytes requires a non-negative integer");
+                generate_len_bytes = raw.parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("Error: --bytes must be a non-negative integer, got '{raw}'");
+                    std::process::exit(1);
+                });
+            }
+            "--sample" => {
+                generate_config.strategy = GenerationStrategy::Sample;
+            }
+            "--greedy" => {
+                generate_config.strategy = GenerationStrategy::Greedy;
+            }
+            "--adaptive" => {
+                generate_config.update_mode = GenerationUpdateMode::Adaptive;
+            }
+            "--seed" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --seed requires an unsigned integer");
+                generate_config.seed = raw.parse::<u64>().unwrap_or_else(|_| {
+                    eprintln!("Error: --seed must be an unsigned integer, got '{raw}'");
+                    std::process::exit(1);
+                });
+                generate_config.strategy = GenerationStrategy::Sample;
+            }
+            "--temperature" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --temperature requires a finite number");
+                generate_config.temperature = raw.parse::<f64>().unwrap_or_else(|_| {
+                    eprintln!("Error: --temperature must be a finite number, got '{raw}'");
+                    std::process::exit(1);
+                });
+                if !generate_config.temperature.is_finite() || generate_config.temperature < 0.0 {
+                    eprintln!(
+                        "Error: --temperature must be finite and non-negative, got '{}'",
+                        generate_config.temperature
+                    );
+                    std::process::exit(1);
+                }
+                generate_config.strategy = GenerationStrategy::Sample;
+            }
+            "--top-k" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --top-k requires a non-negative integer");
+                generate_config.top_k = raw.parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("Error: --top-k must be a non-negative integer, got '{raw}'");
+                    std::process::exit(1);
+                });
+                generate_config.strategy = GenerationStrategy::Sample;
+            }
+            "--top-p" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --top-p requires a number in (0, 1]");
+                generate_config.top_p = raw.parse::<f64>().unwrap_or_else(|_| {
+                    eprintln!("Error: --top-p must be a number in (0, 1], got '{raw}'");
+                    std::process::exit(1);
+                });
+                if !generate_config.top_p.is_finite()
+                    || generate_config.top_p <= 0.0
+                    || generate_config.top_p > 1.0
+                {
+                    eprintln!(
+                        "Error: --top-p must be in (0, 1], got '{}'",
+                        generate_config.top_p
+                    );
+                    std::process::exit(1);
+                }
+                generate_config.strategy = GenerationStrategy::Sample;
             }
             _ => {}
         }
@@ -2772,6 +2868,37 @@ fn main() {
             );
             if let Err(e) =
                 maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&decoded])
+            {
+                eprintln!("Error exporting online model: {e}");
+                std::process::exit(1);
+            }
+        }
+        "generate" => {
+            let max_order = file2
+                .as_deref()
+                .or(pos_arg3.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(expert_spec_max_order.unwrap_or(-1));
+            let input = if let Some(path) = file1.as_deref() {
+                read_file(path)
+            } else {
+                read_stdin_all_for_generate()
+            };
+            let generated = ctx.generate_bytes_with_config(
+                &input,
+                generate_len_bytes,
+                max_order,
+                generate_config,
+            );
+            if let Err(e) = io::stdout().write_all(&generated) {
+                eprintln!("Error writing generated output: {e}");
+                std::process::exit(1);
+            }
+            if let Err(e) = io::stdout().flush() {
+                eprintln!("Error flushing generated output: {e}");
+                std::process::exit(1);
+            }
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&input])
             {
                 eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
@@ -2939,6 +3066,7 @@ Primitives:
     search <query> <target> [options]       Search target using info-theoretic ranking
     aixi <config.json>                      Run AIXI agent
     batch                                   Run in JSON-L batch mode
+    generate [file] [max_order]             Generate continuation from file or piped stdin
     compress <in> <out>                     Compress file using selected compression backend
     decompress <in> <out>                   Decompress file using selected compression backend
 
@@ -2952,6 +3080,14 @@ Options:
   --expert-spec <path>    Load one exact standalone expert JSON (same schema as a mixture 'experts' entry)
   --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
   --rwkv-export <path>    Backward-compatible alias for --model-export
+  --bytes <n>             Bytes to generate for 'generate' (default: 8)
+  --sample                Use seeded sampling for generation
+  --greedy                Force deterministic greedy generation
+  --adaptive              Keep fitting on generated bytes instead of frozen continuation
+  --seed <u64>            RNG seed for sampled generation
+  --temperature <x>       Sampling temperature (default: 1.0)
+  --top-k <n>             Sample only from the top-k bytes (0 disables)
+  --top-p <p>             Nucleus sampling threshold in (0, 1]
 
 Examples:
   infotheory ncd file1.txt file2.txt --compression-backend zpaq --method 5
@@ -2961,6 +3097,8 @@ Examples:
   infotheory h file.txt --rate-backend ctw --method 32
   infotheory h file.txt --rate-backend mixture --method mixture.json
   infotheory search "encryption" ./src --prior "codebase context"
+  cat prompt.txt | infotheory generate --rate-backend ctw --method 32 --bytes 8
+  infotheory generate prompt.txt --rate-backend match --bytes 16 --sample --seed 7
   infotheory compress in.bin out.itc --compression-backend rate-ac --rate-backend mixture --method mixture.json
   infotheory decompress out.itc restored.bin --compression-backend rate-ac --rate-backend mixture --method mixture.json
 "#

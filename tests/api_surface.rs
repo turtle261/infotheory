@@ -1,14 +1,15 @@
 use infotheory::{
-    CompressionBackend, InfotheoryCtx, RateBackend, biased_entropy_rate_backend,
-    biased_entropy_rate_bytes, conditional_entropy_bytes, conditional_entropy_rate_bytes,
-    cross_entropy_bytes, cross_entropy_rate_backend, cross_entropy_rate_bytes, d_kl_bytes,
-    entropy_rate_backend, entropy_rate_bytes, get_default_ctx, intrinsic_dependence_bytes,
-    joint_entropy_rate_backend, joint_entropy_rate_bytes, joint_marginal_entropy_bytes,
-    js_div_bytes, marginal_entropy_bytes, mutual_information_bytes, mutual_information_marg_bytes,
-    mutual_information_rate_backend, mutual_information_rate_bytes, ned_bytes, ned_cons_bytes,
-    ned_cons_marg_bytes, ned_cons_rate_bytes, ned_marg_bytes, ned_rate_backend, ned_rate_bytes,
-    nhd_bytes, nte_bytes, nte_marg_bytes, nte_rate_backend, nte_rate_bytes,
-    resistance_to_transformation_bytes, set_default_ctx, tvd_bytes,
+    CompressionBackend, GenerationConfig, InfotheoryCtx, RateBackend, RateBackendSession,
+    biased_entropy_rate_backend, biased_entropy_rate_bytes, conditional_entropy_bytes,
+    conditional_entropy_rate_bytes, cross_entropy_bytes, cross_entropy_rate_backend,
+    cross_entropy_rate_bytes, d_kl_bytes, entropy_rate_backend, entropy_rate_bytes,
+    get_default_ctx, intrinsic_dependence_bytes, joint_entropy_rate_backend,
+    joint_entropy_rate_bytes, joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes,
+    mutual_information_bytes, mutual_information_marg_bytes, mutual_information_rate_backend,
+    mutual_information_rate_bytes, ned_bytes, ned_cons_bytes, ned_cons_marg_bytes,
+    ned_cons_rate_bytes, ned_marg_bytes, ned_rate_backend, ned_rate_bytes, nhd_bytes, nte_bytes,
+    nte_marg_bytes, nte_rate_backend, nte_rate_bytes, resistance_to_transformation_bytes,
+    set_default_ctx, tvd_bytes,
 };
 #[cfg(feature = "backend-zpaq")]
 use infotheory::{
@@ -90,6 +91,26 @@ fn api_surface_entropy_and_distance_wrappers_are_callable() {
     assert!((0.0..=1.0).contains(&resistance_to_transformation_bytes(x, y, -1)));
 
     set_default_ctx(prev);
+}
+
+#[test]
+fn api_surface_generation_session_and_config_are_callable() {
+    let prompt = b"If a frog is green, dogs are red.\nIf a toad is green, cats are red.\nIf a dog is green, frogs are red.\nIf a cat is green, toads are red.\nIf a frog is red, dogs are green.\nIf a toad is red, cats are green.\nIf a dog is red, frogs are green.\nIf a cat is red, toads are ";
+    let backend = RateBackend::RosaPlus;
+    let ctx = InfotheoryCtx::new(backend.clone(), CompressionBackend::default());
+    let cfg = GenerationConfig::sampled_frozen(42);
+
+    let direct = ctx.generate_bytes_with_config(prompt, 8, -1, cfg);
+    assert_eq!(direct.len(), 8);
+
+    let mut session =
+        RateBackendSession::from_backend(backend, -1, Some((prompt.len() + direct.len()) as u64))
+            .expect("session init");
+    session.observe(prompt);
+    let from_session = session.generate_bytes(8, cfg);
+    session.finish().expect("session finish");
+
+    assert_eq!(from_session, direct);
 }
 
 #[cfg(all(feature = "backend-zpaq", not(target_env = "musl")))]
