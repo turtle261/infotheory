@@ -7,11 +7,17 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
+/// One scored retrieval unit returned by code search.
 pub struct Snippet {
+    /// Source file containing the match/candidate.
     pub path: PathBuf,
+    /// 1-based inclusive start line for snippet display.
     pub start_line: usize,
+    /// 1-based inclusive end line for snippet display.
     pub end_line: usize,
+    /// Raw candidate bytes used for entropy/rerank scoring.
     pub content: Vec<u8>,
+    /// Final ranking score (larger is better).
     pub score: f64,
 }
 
@@ -65,12 +71,16 @@ fn stage0_prefilter(
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Candidate unit granularity for stage-0/1 collection.
 pub enum SearchGranularity {
+    /// Split files into hashed line windows/snippets.
     Snippet,
+    /// Treat each file as a single candidate.
     File,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Stage-2 prior handling strategy for KMI reranking.
 pub enum Stage2PriorMode {
     /// Use the (full or summarized) universal prior as a prefix for compression metrics.
     Use,
@@ -81,16 +91,23 @@ pub enum Stage2PriorMode {
 }
 
 #[derive(Clone)]
+/// Tunables for the three-stage information-theoretic search pipeline.
 pub struct SearchOptions {
+    /// Candidate granularity at collection time.
     pub granularity: SearchGranularity,
     /// Universal prior corpus path (file or directory). If set:
     /// - Stage 1 always uses it.
     /// - Stage 2 uses it by default (unless Stage2PriorMode::Disable).
     pub universal_prior: Option<String>,
+    /// Whether/how Stage-2 reranking uses universal prior context.
     pub stage2_prior_mode: Stage2PriorMode,
+    /// Maximum model order used by entropy-rate estimators.
     pub max_order: i64,
+    /// Number of final results to keep.
     pub top_k: usize,
+    /// Fraction of candidates retained by the unigram prefilter.
     pub stage0_keep_frac: f64,
+    /// Fully configured information-theory context/backend bundle.
     pub ctx: InfotheoryCtx,
 }
 
@@ -108,10 +125,12 @@ impl Default for SearchOptions {
     }
 }
 
+/// Run search with default options and print top shell extraction commands.
 pub fn run_search(query: &str, target_path: &str) {
     run_search_with_options(query, target_path, &SearchOptions::default());
 }
 
+/// Run search with explicit options and print top shell extraction commands.
 pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOptions) {
     let debug = std::env::var("DEBUG_SEARCH").is_ok();
     let results = search_with_options(query, target_path, opts);

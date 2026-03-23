@@ -33,6 +33,7 @@ impl ContextStats {
 }
 
 #[derive(Clone, Debug)]
+/// Bounded-memory PPMD-inspired byte model with interpolation across orders.
 pub struct PpmdModel {
     order: usize,
     max_contexts: usize,
@@ -46,6 +47,7 @@ pub struct PpmdModel {
 }
 
 impl PpmdModel {
+    /// Create a model with maximum `order` and approximate memory budget in MiB.
     pub fn new(order: usize, memory_mb: usize) -> Self {
         let order = order.max(1);
         let max_contexts = (memory_mb.max(1) * 1024 * 1024) / 96;
@@ -62,26 +64,31 @@ impl PpmdModel {
         }
     }
 
+    /// Fill `out` with the current normalized byte PDF.
     pub fn fill_pdf(&mut self, out: &mut [f64; 256]) {
         self.ensure_pdf_inner(false);
         out.copy_from_slice(&self.pdf);
     }
 
+    /// Borrow the current normalized byte PDF.
     pub fn pdf(&mut self) -> &[f64; 256] {
         self.ensure_pdf_inner(false);
         &self.pdf
     }
 
+    /// Borrow the cumulative distribution derived from the current PDF.
     pub fn cdf(&mut self) -> &[f64; 257] {
         self.ensure_pdf_inner(true);
         &self.cdf
     }
 
+    /// Return `ln(max(P(symbol), min_prob))`.
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
         self.ensure_pdf_inner(false);
         self.pdf[symbol as usize].max(min_prob).ln()
     }
 
+    /// Observe one symbol and update all active contexts up to model order.
     pub fn update(&mut self, symbol: u8) {
         let max_order = self.order.min(self.history.len());
         for ord in 0..=max_order {

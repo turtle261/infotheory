@@ -3,23 +3,35 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq)]
+/// Position expression used in policy schedules.
 pub enum PositionExpr {
+    /// Absolute byte/token offset.
     Bytes(u64),
+    /// Percentage of the known total stream length.
     Percent(f64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Optimizer family selected by a train action.
 pub enum OptimizerKind {
+    /// Stochastic gradient descent.
     Sgd,
+    /// Adam optimizer.
     Adam,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Hyper-parameters attached to a training action.
 pub struct OptimizerHyperParams {
+    /// Learning rate (clamped non-negative by parser).
     pub lr: f32,
+    /// Apply one update every `stride` eligible steps.
     pub stride: usize,
+    /// Truncated backprop length for full-parameter training.
     pub bptt: usize,
+    /// Optional gradient clipping threshold (`0` disables clipping).
     pub clip: f32,
+    /// Momentum used by SGD-style updates.
     pub momentum: f32,
 }
 
@@ -36,12 +48,16 @@ impl Default for OptimizerHyperParams {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Canonical set of train scopes (`all`, `none`, or sorted named scopes).
 pub struct TrainScopeSet {
+    /// If true, every allowed scope is enabled.
     pub all: bool,
+    /// Sorted explicit scope names used when `all == false`.
     pub names: Vec<String>,
 }
 
 impl TrainScopeSet {
+    /// Enable all scopes.
     pub fn all() -> Self {
         Self {
             all: true,
@@ -49,6 +65,7 @@ impl TrainScopeSet {
         }
     }
 
+    /// Disable all scopes.
     pub fn none() -> Self {
         Self {
             all: false,
@@ -56,6 +73,7 @@ impl TrainScopeSet {
         }
     }
 
+    /// Returns whether `name` is enabled by this set.
     pub fn contains(&self, name: &str) -> bool {
         self.all
             || self
@@ -64,10 +82,14 @@ impl TrainScopeSet {
                 .is_ok()
     }
 
+    /// Returns `true` when the set explicitly enables no scopes.
     pub fn is_none(&self) -> bool {
         !self.all && self.names.is_empty()
     }
 
+    /// Parse a scope expression against an allow-list.
+    ///
+    /// Supports `all`, `none`, or a `+`/`|`/`/` separated list.
     pub fn parse(value: &str, allowed_scopes: &[&str]) -> Result<Self> {
         let v = value.trim().to_ascii_lowercase();
         if v.is_empty() {
@@ -104,6 +126,7 @@ impl TrainScopeSet {
         })
     }
 
+    /// Canonical string form (`all`, `none`, or `a+b+c`).
     pub fn canonical(&self) -> String {
         if self.all {
             return "all".to_string();
@@ -116,51 +139,77 @@ impl TrainScopeSet {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Concrete training directive.
 pub struct TrainAction {
+    /// Parameter subsets to update.
     pub scope: TrainScopeSet,
+    /// Optimizer family.
     pub optimizer: OptimizerKind,
+    /// Optimizer hyper-parameters.
     pub hyper: OptimizerHyperParams,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Action emitted by the policy at each stream position.
 pub enum PolicyAction {
+    /// Inference-only step (no adaptation).
     Infer,
+    /// Training step with provided parameters.
     Train(TrainAction),
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Interval schedule rule (`start..end:action`).
 pub struct PolicyRule {
+    /// Inclusive interval start.
     pub start: PositionExpr,
+    /// Exclusive interval end.
     pub end: PositionExpr,
+    /// Action applied in the interval.
     pub action: PolicyAction,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// One segment inside a repeating pattern.
 pub struct RepeatSegment {
+    /// Segment duration.
     pub span: PositionExpr,
+    /// Action active for this segment.
     pub action: PolicyAction,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Repeat schedule rule with cycle period and inner pattern.
 pub struct RepeatRule {
+    /// Inclusive active-start boundary.
     pub start: PositionExpr,
+    /// Exclusive active-end boundary.
     pub end: PositionExpr,
+    /// Repeat cycle length.
     pub period: PositionExpr,
+    /// Ordered segments inside one cycle.
     pub pattern: Vec<RepeatSegment>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Top-level schedule rule.
 pub enum ScheduleRule {
+    /// Single contiguous interval.
     Interval(PolicyRule),
+    /// Periodic repeating schedule.
     Repeat(RepeatRule),
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// Parsed policy specification for online LLM adaptation.
 pub struct LlmPolicy {
+    /// Optional initial weights/source to load before running schedule.
     pub load_from: Option<PathBuf>,
+    /// Ordered schedule rules.
     pub schedule: Vec<ScheduleRule>,
 }
 
+/// Returns `true` if any schedule branch can emit a training action.
 pub fn policy_can_train(policy: &LlmPolicy) -> bool {
     for rule in &policy.schedule {
         match rule {
@@ -206,11 +255,13 @@ enum CompiledScheduleRule {
 }
 
 #[derive(Clone, Debug)]
+/// Compiled, position-resolved policy ready for runtime evaluation.
 pub struct CompiledPolicy {
     rules: Vec<CompiledScheduleRule>,
 }
 
 impl CompiledPolicy {
+    /// Resolve the action at absolute position `pos`.
     pub fn action_at(&self, pos: u64) -> PolicyAction {
         for rule in &self.rules {
             match rule {
@@ -245,12 +296,14 @@ impl CompiledPolicy {
 }
 
 #[derive(Clone, Debug)]
+/// Stateful cursor over a [`CompiledPolicy`].
 pub struct PolicyRuntime {
     compiled: CompiledPolicy,
     cursor: u64,
 }
 
 impl PolicyRuntime {
+    /// Create a runtime positioned at cursor `0`.
     pub fn new(compiled: CompiledPolicy) -> Self {
         Self {
             compiled,
@@ -259,21 +312,25 @@ impl PolicyRuntime {
     }
 
     #[inline]
+    /// Current cursor position.
     pub fn cursor(&self) -> u64 {
         self.cursor
     }
 
     #[inline]
+    /// Set cursor position directly.
     pub fn set_cursor(&mut self, cursor: u64) {
         self.cursor = cursor;
     }
 
     #[inline]
+    /// Peek current action without advancing cursor.
     pub fn peek_action(&self) -> PolicyAction {
         self.compiled.action_at(self.cursor)
     }
 
     #[inline]
+    /// Return current action and advance cursor by one.
     pub fn next_action(&mut self) -> PolicyAction {
         let action = self.compiled.action_at(self.cursor);
         self.cursor = self.cursor.saturating_add(1);
@@ -281,6 +338,7 @@ impl PolicyRuntime {
     }
 }
 
+/// Split `method` into base method segment and optional `policy:...` segment.
 pub fn split_method_policy_segments(method: &str) -> Result<(String, Option<String>)> {
     let trimmed = method.trim();
     if trimmed.is_empty() {
@@ -311,6 +369,7 @@ pub fn split_method_policy_segments(method: &str) -> Result<(String, Option<Stri
     Ok((base, policy))
 }
 
+/// Parse a `policy:...` string into [`LlmPolicy`].
 pub fn parse_policy_segment(policy_segment: &str, allowed_scopes: &[&str]) -> Result<LlmPolicy> {
     let body = policy_segment
         .trim()
@@ -380,6 +439,7 @@ pub fn parse_policy_segment(policy_segment: &str, allowed_scopes: &[&str]) -> Re
 }
 
 impl LlmPolicy {
+    /// Compile policy boundaries/spans using optional known total symbol count.
     pub fn compile(&self, total_symbols: Option<u64>) -> Result<CompiledPolicy> {
         let mut out = Vec::<CompiledScheduleRule>::with_capacity(self.schedule.len());
         for rule in &self.schedule {
@@ -437,6 +497,7 @@ impl LlmPolicy {
         Ok(CompiledPolicy { rules: out })
     }
 
+    /// Serialize back to canonical `load_from=...,schedule=...` form.
     pub fn canonical(&self) -> String {
         let mut out = String::new();
         if let Some(path) = &self.load_from {

@@ -194,17 +194,25 @@ pub struct FullAdamState {
 #[derive(Clone, Copy, Debug, Default)]
 /// Train-scope mask for Mamba full-parameter online updates.
 pub struct TrainScopeMask {
+    /// Train token embeddings.
     pub embed: bool,
+    /// Train layer-normalization weights/biases.
     pub layer_norm: bool,
+    /// Train convolutional mixer parameters.
     pub mixer_conv: bool,
+    /// Train SSM/state-space mixer parameters.
     pub mixer_ssm: bool,
+    /// Train projection matrices around the mixer.
     pub mixer_proj: bool,
+    /// Train LM-head weights.
     pub head: bool,
+    /// Train additive output-bias terms.
     pub bias: bool,
 }
 
 impl TrainScopeMask {
     #[inline]
+    /// Enable all train scopes.
     pub fn all() -> Self {
         Self {
             embed: true,
@@ -218,6 +226,7 @@ impl TrainScopeMask {
     }
 
     #[inline]
+    /// Returns whether any model parameters (excluding standalone output bias) are trainable.
     pub fn trains_model_params(&self) -> bool {
         self.embed
             || self.layer_norm
@@ -1724,6 +1733,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Run one TBPTT training segment and write the resulting live state.
     pub fn online_train_segment_tbptt(
         &mut self,
         scratch: &mut ScratchBuffers,

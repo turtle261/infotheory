@@ -279,14 +279,26 @@ pub enum RateBackendPredictor {
         min_prob: f64,
     },
     /// Local contiguous match predictor.
-    Match { model: MatchModel, min_prob: f64 },
+    Match {
+        /// Match model state.
+        model: MatchModel,
+        /// Probability floor for numeric stability.
+        min_prob: f64,
+    },
     /// Sparse/gapped local match predictor.
     SparseMatch {
+        /// Sparse-match model state.
         model: SparseMatchModel,
+        /// Probability floor for numeric stability.
         min_prob: f64,
     },
     /// Bounded-memory PPMD-style predictor.
-    Ppmd { model: PpmdModel, min_prob: f64 },
+    Ppmd {
+        /// PPMD model state.
+        model: PpmdModel,
+        /// Probability floor for numeric stability.
+        min_prob: f64,
+    },
     /// Byte-wise CTW implemented as 8 factorized bit trees (MSB-first).
     Ctw {
         /// FAC-CTW tree stack (8 bits per byte).
@@ -344,10 +356,15 @@ pub enum RateBackendPredictor {
     },
     /// Calibrated wrapper around another predictor.
     Calibrated {
+        /// Wrapped predictor whose PDF is calibrated.
         base: Box<RateBackendPredictor>,
+        /// Online calibrator state and context features.
         core: CalibratorCore,
+        /// Cached calibrated PDF.
         pdf: [f64; 256],
+        /// Whether `pdf` currently matches wrapped state.
         valid: bool,
+        /// Probability floor used for numerical stability.
         min_prob: f64,
     },
 }

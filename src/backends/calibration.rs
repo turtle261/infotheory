@@ -2,6 +2,10 @@ use crate::CalibrationContextKind;
 use crate::backends::text_context::{NeuralContextState, TextContextAnalyzer};
 
 #[derive(Clone, Debug)]
+/// Lightweight online calibrator that rescales a base 256-way PDF by context/bin.
+///
+/// The calibrator keeps per-context logits over probability bins and applies an
+/// exponential tilt `p' ∝ p * exp(w_bin)` followed by normalization.
 pub struct CalibratorCore {
     analyzer: TextContextAnalyzer,
     context: CalibrationContextKind,
@@ -14,6 +18,7 @@ pub struct CalibratorCore {
 }
 
 impl CalibratorCore {
+    /// Create a calibrator with bounded bin count and stable learning parameters.
     pub fn new(
         context: CalibrationContextKind,
         bins: usize,
@@ -34,6 +39,9 @@ impl CalibratorCore {
         }
     }
 
+    /// Apply the learned calibration transform to `base`, writing a normalized PDF to `out`.
+    ///
+    /// `base`/`out` are expected to be 256-byte distributions.
     pub fn apply_pdf(&mut self, base: &[f64], out: &mut [f64]) {
         let ctx = context_index(self.context, self.analyzer.state());
         self.last_context = ctx;
@@ -59,6 +67,7 @@ impl CalibratorCore {
         }
     }
 
+    /// Update the active bin weight from the observed symbol and calibrated distribution.
     pub fn update(&mut self, symbol: u8, calibrated_pdf: &[f64]) {
         let idx = self.last_context * self.bins + self.last_bins[symbol as usize];
         let q = calibrated_pdf[symbol as usize].clamp(1e-9, 1.0);

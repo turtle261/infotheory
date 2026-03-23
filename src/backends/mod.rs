@@ -5,6 +5,7 @@
 //! - feature-aware availability reporting,
 //! - exported lists of enabled backend families.
 
+/// Online probability calibration wrapper for rate predictors.
 pub mod calibration;
 pub mod ctw;
 /// Shared policy parser/compiler for online LLM backends.
@@ -12,15 +13,19 @@ pub mod llm_policy;
 /// Mamba-1 based rate/compression backend.
 #[cfg(feature = "backend-mamba")]
 pub mod mambazip;
+/// Contiguous/sparse local match predictor primitives.
 pub mod match_model;
 /// Particle-latent rate backend.
 pub mod particle;
+/// Bounded-memory PPMD-style byte model.
 pub mod ppmd;
 pub mod rosaplus;
 /// RWKV7-based rate/compression backend.
 #[cfg(feature = "backend-rwkv")]
 pub mod rwkvzip;
+/// Sparse/gapped match predictor that wraps [`match_model`].
 pub mod sparse_match;
+/// Text/repeat context feature extraction for adaptive backends.
 pub mod text_context;
 pub mod zpaq_rate;
 use crate::coders::CoderType;
@@ -39,6 +44,7 @@ pub enum BackendAvailability {
     },
 }
 
+/// Canonical names for rate backends recognized by CLI/API alias resolution.
 pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     "rosaplus",
     "ctw",

@@ -1,6 +1,7 @@
 use ahash::AHashMap;
 
 #[derive(Clone, Debug)]
+/// Local match predictor with configurable contiguous or gapped matching.
 pub struct MatchModel {
     hash_bits: usize,
     min_len: usize,
@@ -20,6 +21,7 @@ pub struct MatchModel {
 }
 
 impl MatchModel {
+    /// Create a match model with an inclusive stride range `[gap_min+1, gap_max+1]`.
     pub fn new(
         hash_bits: usize,
         min_len: usize,
@@ -54,6 +56,7 @@ impl MatchModel {
         }
     }
 
+    /// Convenience constructor for contiguous matching (`gap_min = gap_max = 0`).
     pub fn new_contiguous(
         hash_bits: usize,
         min_len: usize,
@@ -72,26 +75,31 @@ impl MatchModel {
         )
     }
 
+    /// Fill `out` with the current normalized byte PDF.
     pub fn fill_pdf(&mut self, out: &mut [f64; 256]) {
         self.ensure_pdf_inner(false);
         out.copy_from_slice(&self.pdf);
     }
 
+    /// Borrow the current normalized byte PDF.
     pub fn pdf(&mut self) -> &[f64; 256] {
         self.ensure_pdf_inner(false);
         &self.pdf
     }
 
+    /// Borrow the cumulative distribution derived from the current PDF.
     pub fn cdf(&mut self) -> &[f64; 257] {
         self.ensure_pdf_inner(true);
         &self.cdf
     }
 
+    /// Return `ln(max(P(symbol), min_prob))`.
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
         self.ensure_pdf_inner(false);
         self.pdf[symbol as usize].max(min_prob).ln()
     }
 
+    /// Observe one symbol and update match tables/history.
     pub fn update(&mut self, symbol: u8) {
         self.history.push(symbol);
         for stride in self.stride_min..=self.stride_max {
@@ -128,11 +136,13 @@ impl MatchModel {
         self.cdf_valid = false;
     }
 
+    /// Length of the best match used for the last computed distribution.
     pub fn match_len(&mut self) -> usize {
         self.ensure_pdf_inner(false);
         self.match_len
     }
 
+    /// Predicted next byte from the best match, if any.
     pub fn predicted_byte(&mut self) -> Option<u8> {
         self.ensure_pdf_inner(false);
         self.predicted

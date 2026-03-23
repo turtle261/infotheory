@@ -317,18 +317,27 @@ pub struct FullAdamState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 /// Train-scope mask for RWKV full-parameter online updates.
 pub struct TrainScopeMask {
+    /// Train token embeddings.
     pub embed: bool,
+    /// Train optional pre-norm parameters.
     pub pre_norm: bool,
+    /// Train attention norm parameters.
     pub attn_norm: bool,
+    /// Train FFN norm parameters.
     pub ffn_norm: bool,
+    /// Train attention block parameters.
     pub attn: bool,
+    /// Train FFN block parameters.
     pub ffn: bool,
+    /// Train LM-head weights.
     pub head: bool,
+    /// Train additive output-bias terms.
     pub bias: bool,
 }
 
 impl TrainScopeMask {
     #[inline]
+    /// Enable all train scopes.
     pub fn all() -> Self {
         Self {
             embed: true,
@@ -343,11 +352,13 @@ impl TrainScopeMask {
     }
 
     #[inline]
+    /// Returns whether any non-head model parameters are trainable.
     pub fn trains_non_head_params(&self) -> bool {
         self.embed || self.pre_norm || self.attn_norm || self.ffn_norm || self.attn || self.ffn
     }
 
     #[inline]
+    /// Returns whether any parameter/bias updates are enabled.
     pub fn trains_any_params(&self) -> bool {
         self.trains_non_head_params() || self.head || self.bias
     }
@@ -699,6 +710,7 @@ impl ScratchBuffers {
     }
 
     #[inline]
+    /// Borrow logits from the latest forward pass scratch buffer.
     pub fn logits(&self) -> &[f32] {
         self.logits.as_slice()
     }
@@ -3124,6 +3136,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Run one TBPTT training segment and write the resulting live state.
     pub fn online_train_segment_tbptt(
         &mut self,
         scratch: &mut ScratchBuffers,

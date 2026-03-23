@@ -193,12 +193,16 @@ impl OnlineConfig {
 pub enum MethodSpec {
     /// Load a model from disk.
     File {
+        /// Path to `.safetensors` model weights.
         path: PathBuf,
+        /// Optional runtime training/inference policy.
         policy: Option<LlmPolicy>,
     },
     /// Build an online/random model from configuration.
     Online {
+        /// Online model/training configuration.
         cfg: OnlineConfig,
+        /// Optional runtime training/inference policy.
         policy: Option<LlmPolicy>,
     },
 }
@@ -1339,6 +1343,7 @@ impl Compressor {
     }
 
     #[inline]
+    /// Forward one token and emit the resulting (optionally biased) PDF.
     pub fn forward_to_pdf(&mut self, token: u32, pdf_out: &mut [f64]) {
         self.forward_with_online_record(token);
         let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
@@ -1346,11 +1351,13 @@ impl Compressor {
     }
 
     #[inline]
+    /// Refresh the internal cached PDF buffer from `token`.
     pub fn forward_to_internal_pdf(&mut self, token: u32) {
         self.refresh_current_pdf(token);
     }
 
     #[inline]
+    /// Copy the internal cached PDF into `pdf_out` (length must match vocab size).
     pub fn copy_current_pdf_to(&self, pdf_out: &mut [f64]) {
         assert_eq!(
             pdf_out.len(),
@@ -1366,6 +1373,7 @@ impl Compressor {
     }
 
     #[inline]
+    /// Borrow online output bias vector when online mode is active.
     pub fn online_bias_slice(&self) -> Option<&[f32]> {
         self.online.as_ref().map(|o| o.out_bias.as_slice())
     }
@@ -1435,6 +1443,7 @@ impl Compressor {
     }
 
     #[inline]
+    /// Update online state from `pdf`, then advance model state with `symbol`.
     pub fn observe_symbol_from_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
         self.online_update_with_pdf(symbol, pdf)?;
         self.refresh_current_pdf(symbol as u32);
@@ -1520,6 +1529,7 @@ impl Compressor {
     }
 
     #[inline]
+    /// Update online state using current internal PDF, then consume `symbol`.
     pub fn observe_symbol_from_current_pdf(&mut self, symbol: u8) -> Result<()> {
         self.online_update_from_current_pdf(symbol)?;
         self.refresh_current_pdf(symbol as u32);

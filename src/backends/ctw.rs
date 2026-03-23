@@ -403,6 +403,7 @@ struct PreparedStep {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Compact node payload used by [`CtArena`].
 pub struct CtNode {
     children: [ChildRef; 2],
     log_prob_kt: f64,
@@ -900,6 +901,10 @@ fn apply_revert_to_state_raw(
 }
 
 #[derive(Clone, Debug)]
+/// Arena allocator and storage for CTW nodes/segments.
+///
+/// This structure owns all backing memory for compressed CTW trees and provides
+/// index-based access used by the update/revert engine.
 pub struct CtArena {
     nodes: Vec<CtNode>,
     segments: Vec<CtSegment>,
@@ -908,6 +913,7 @@ pub struct CtArena {
 }
 
 impl CtArena {
+    /// Create an empty arena with small default capacities.
     pub fn new() -> Self {
         Self {
             nodes: Vec::with_capacity(1024),
@@ -917,6 +923,7 @@ impl CtArena {
         }
     }
 
+    /// Create an empty arena with explicit node-oriented capacity hint.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(cap),
@@ -927,6 +934,7 @@ impl CtArena {
     }
 
     #[inline]
+    /// Reserve additional capacity for upcoming node/segment allocations.
     pub fn reserve_exact(&mut self, additional: usize) {
         self.nodes.reserve_exact(additional);
         self.segments.reserve_exact(additional / 4 + 1);
@@ -995,6 +1003,7 @@ impl CtArena {
         self.free_segments.push(idx);
     }
 
+    /// Drop all nodes/segments and free-list bookkeeping.
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.segments.clear();
@@ -1298,6 +1307,7 @@ impl CtArena {
         }
     }
 
+    /// Approximate heap usage (bytes) for arena-owned storage.
     pub fn memory_usage(&self) -> usize {
         self.nodes.capacity() * size_of::<CtNode>()
             + self.segments.capacity() * size_of::<CtSegment>()
@@ -3109,6 +3119,7 @@ pub struct ContextTree {
 }
 
 impl ContextTree {
+    /// Construct a binary CTW predictor with maximum context depth `depth`.
     pub fn new(depth: usize) -> Self {
         Self {
             engine: CtEngine::new(depth),
@@ -3116,18 +3127,21 @@ impl ContextTree {
         }
     }
 
+    /// Reset tree parameters and clear conditioning history.
     pub fn clear(&mut self) {
         self.history.clear();
         self.engine.clear();
     }
 
     #[inline]
+    /// Observe one binary symbol and update the model.
     pub fn update(&mut self, sym: Symbol) {
         self.engine.update(sym, &self.history);
         self.history.push(sym);
     }
 
     #[inline]
+    /// Revert the last symbol update if history is non-empty.
     pub fn revert(&mut self) {
         let Some(last_sym) = self.history.pop() else {
             return;
@@ -3136,15 +3150,18 @@ impl ContextTree {
     }
 
     #[inline]
+    /// Append external symbols to history without touching model state.
     pub fn update_history(&mut self, symbols: &[Symbol]) {
         self.history.extend_from_slice(symbols);
     }
 
     #[inline]
+    /// Remove one history symbol without reverting model statistics.
     pub fn revert_history(&mut self) {
         self.history.pop();
     }
 
+    /// Truncate the stored history to `new_size` symbols.
     pub fn truncate_history(&mut self, new_size: usize) {
         if new_size < self.history.len() {
             self.history.truncate(new_size);
@@ -3152,26 +3169,31 @@ impl ContextTree {
     }
 
     #[inline]
+    /// Predict `P(sym | history)` under current weighted CTW model.
     pub fn predict(&mut self, sym: Symbol) -> f64 {
         self.engine.predict(sym, &self.history)
     }
 
     #[inline]
+    /// Predict probability of symbol `true`.
     pub fn predict_sym_prob(&mut self) -> f64 {
         self.predict(true)
     }
 
     #[inline]
+    /// Return log block probability accumulated by the root model.
     pub fn get_log_block_probability(&self) -> f64 {
         self.engine.get_log_block_probability()
     }
 
     #[inline]
+    /// Maximum context depth configured for this tree.
     pub fn depth(&self) -> usize {
         self.engine.max_depth
     }
 
     #[inline]
+    /// Current number of stored history symbols.
     pub fn history_size(&self) -> usize {
         self.history.len()
     }
@@ -3264,6 +3286,9 @@ pub struct FacContextTree {
 }
 
 impl FacContextTree {
+    /// Create a factorized CTW stack over `num_percept_bits` bit positions.
+    ///
+    /// Tree `i` uses depth `base_depth + i`, matching FAC-CTW's increasing context.
     pub fn new(base_depth: usize, num_percept_bits: usize) -> Self {
         let trees = (0..num_percept_bits)
             .map(|i| ContextTreeCore::new(base_depth + i))
@@ -3283,6 +3308,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Reserve history/tree capacity for approximately `total_symbols` updates.
     pub fn reserve_for_symbols(&mut self, total_symbols: usize) {
         if total_symbols == 0 {
             return;
@@ -3295,16 +3321,19 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Number of bit positions currently modeled per symbol.
     pub fn num_bits(&self) -> usize {
         self.num_bits
     }
 
     #[inline]
+    /// Base depth used to construct the first factorized tree.
     pub fn base_depth(&self) -> usize {
         self.base_depth
     }
 
     #[inline]
+    /// Update one bit position with a binary symbol.
     pub fn update(&mut self, sym: Symbol, bit_index: usize) {
         debug_assert!(bit_index < self.num_bits);
         self.trees[bit_index].update(sym, &self.shared_history);
@@ -3313,6 +3342,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Update all bit positions from one byte, most-significant bit first.
     pub fn update_byte_msb(&mut self, byte: u8) {
         if self.num_bits != 8 {
             for bit_idx in 0..self.num_bits {
@@ -3342,6 +3372,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Update all active bit positions from one byte, least-significant bit first.
     pub fn update_byte_lsb(&mut self, byte: u8) {
         let bits = self.num_bits.clamp(1, 8);
         let upto = self.trees[0].engine.root_visits() + 1;
@@ -3365,6 +3396,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Commit an update using the fast-path prepared by a prior prediction call.
     pub fn update_predicted(&mut self, sym: Symbol, bit_index: usize) {
         debug_assert!(bit_index < self.num_bits);
         self.trees[bit_index].update_predicted(
@@ -3377,6 +3409,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Predict a single bit probability for `bit_index`.
     pub fn predict(&mut self, sym: Symbol, bit_index: usize) -> f64 {
         debug_assert!(bit_index < self.num_bits);
         self.trees[bit_index].predict(sym, &self.shared_history, self.shared_history_version)
@@ -3389,6 +3422,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Revert the most recent bit update for `bit_index`.
     pub fn revert(&mut self, bit_index: usize) {
         debug_assert!(bit_index < self.num_bits);
         let Some(last_sym) = self.shared_history.pop() else {
@@ -3399,6 +3433,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Append raw shared-history symbols without model updates.
     pub fn update_history(&mut self, symbols: &[Symbol]) {
         if symbols.is_empty() {
             return;
@@ -3408,6 +3443,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Drop the last `count` symbols from shared history.
     pub fn revert_history(&mut self, count: usize) {
         let old_len = self.shared_history.len();
         let new_len = self.shared_history.len().saturating_sub(count);
@@ -3419,6 +3455,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Clear shared history while preserving learned tree parameters.
     pub fn reset_history_only(&mut self) {
         if self.shared_history.is_empty() {
             return;
@@ -3428,6 +3465,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    /// Sum of per-tree log block probabilities.
     pub fn get_log_block_probability(&self) -> f64 {
         self.trees
             .iter()
@@ -3435,6 +3473,7 @@ impl FacContextTree {
             .sum()
     }
 
+    /// Clear all trees and shared history.
     pub fn clear(&mut self) {
         for tree in &mut self.trees {
             tree.clear();
@@ -3443,6 +3482,7 @@ impl FacContextTree {
         self.shared_history_version = 0;
     }
 
+    /// Approximate heap memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
         let tree_mem: usize = self.trees.iter().map(|t| t.engine.memory_usage()).sum();
         let log_cache_mem = self
