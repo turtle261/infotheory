@@ -3163,9 +3163,26 @@ Examples:
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
     use std::any::Any;
     use std::panic;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp_path(prefix: &str, suffix: &str) -> PathBuf {
+        let counter = TEMP_TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{nanos}-{counter}{suffix}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn file_roundtrip_backend_keeps_zpaq_unchanged() {
@@ -3308,8 +3325,7 @@ mod tests {
     #[cfg(feature = "backend-mamba")]
     #[test]
     fn parse_mixture_expert_resolves_mamba_model_path_relative_to_base_dir() {
-        let base_dir =
-            std::env::temp_dir().join(format!("infotheory-mamba-relpath-{}", std::process::id()));
+        let base_dir = unique_temp_path("infotheory-mamba-relpath", "");
         std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
         let rel_path = "weights/model.safetensors";
         let expected = base_dir.join(rel_path).to_string_lossy().to_string();
@@ -3333,8 +3349,7 @@ mod tests {
     #[cfg(feature = "backend-rwkv")]
     #[test]
     fn parse_mixture_expert_resolves_rwkv_model_path_relative_to_base_dir() {
-        let base_dir =
-            std::env::temp_dir().join(format!("infotheory-rwkv-relpath-{}", std::process::id()));
+        let base_dir = unique_temp_path("infotheory-rwkv-relpath", "");
         std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
         let rel_path = "weights/model.safetensors";
         let expected = base_dir.join(rel_path).to_string_lossy().to_string();
@@ -3357,11 +3372,7 @@ mod tests {
 
     #[test]
     fn load_expert_spec_preserves_exact_ppmd_settings() {
-        let expert_path = std::env::temp_dir().join(format!(
-            "infotheory-expert-spec-{}-{}.json",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let expert_path = unique_temp_path("infotheory-expert-spec", ".json");
         std::fs::write(
             &expert_path,
             serde_json::to_vec(&json!({
@@ -3389,11 +3400,7 @@ mod tests {
 
     #[test]
     fn build_ctx_propagates_expert_spec_max_order_default() {
-        let expert_path = std::env::temp_dir().join(format!(
-            "infotheory-expert-spec-rosa-{}-{}.json",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let expert_path = unique_temp_path("infotheory-expert-spec-rosa", ".json");
         std::fs::write(
             &expert_path,
             serde_json::to_vec(&json!({

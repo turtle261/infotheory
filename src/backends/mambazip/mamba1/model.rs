@@ -3263,7 +3263,7 @@ fn optional_tensor_from(weights: &Weights, name: &str) -> Result<Option<Tensor1D
 
 fn tensor_from_conv(t: &WeightTensor, inner_size: usize) -> Result<Tensor1D> {
     match t.shape() {
-        [i, k] if *i == inner_size => Ok(Tensor1D::from_vec(t.data().to_vec())),
+        [i, _k] if *i == inner_size => Ok(Tensor1D::from_vec(t.data().to_vec())),
         [i, one, k] if *i == inner_size && *one == 1 => {
             let mut out = Vec::with_capacity(inner_size * k);
             let src = t.data();
