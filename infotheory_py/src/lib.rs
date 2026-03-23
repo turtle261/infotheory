@@ -4666,7 +4666,8 @@ mod tests {
             );
 
             let stream_hash_hyphen = pyo3::types::PyString::new(py, "stream-hash");
-            let parsed_hash_hyphen = PyAgentSimulatorShim::parse_key_mode(stream_hash_hyphen.as_any());
+            let parsed_hash_hyphen =
+                PyAgentSimulatorShim::parse_key_mode(stream_hash_hyphen.as_any());
             assert_eq!(
                 parsed_hash_hyphen,
                 infotheory::aixi::common::ObservationKeyMode::StreamHash
@@ -4680,7 +4681,8 @@ mod tests {
             );
 
             let full_stream_hyphen = pyo3::types::PyString::new(py, "full-stream");
-            let parsed_full_hyphen = PyAgentSimulatorShim::parse_key_mode(full_stream_hyphen.as_any());
+            let parsed_full_hyphen =
+                PyAgentSimulatorShim::parse_key_mode(full_stream_hyphen.as_any());
             assert_eq!(
                 parsed_full_hyphen,
                 infotheory::aixi::common::ObservationKeyMode::FullStream
