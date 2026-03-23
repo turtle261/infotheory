@@ -1,5 +1,5 @@
-use infotheory::rosaplus::RosaPlus;
-use infotheory::{InfotheoryCtx, RateBackend, cross_entropy_bytes, marginal_entropy_bytes};
+use crate::rosaplus::RosaPlus;
+use crate::{InfotheoryCtx, RateBackend, cross_entropy_bytes, marginal_entropy_bytes};
 use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -114,10 +114,36 @@ pub fn run_search(query: &str, target_path: &str) {
 
 pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOptions) {
     let debug = std::env::var("DEBUG_SEARCH").is_ok();
+    let results = search_with_options(query, target_path, opts);
+    for (i, snippet) in results.iter().take(5).enumerate() {
+        if debug {
+            println!(
+                "Rank {}: Score={:.6}, Path={}",
+                i + 1,
+                snippet.score,
+                snippet.path.display()
+            );
+        }
+        println!(
+            "sed -n '{},{}p' {}",
+            snippet.start_line,
+            snippet.end_line,
+            snippet.path.display()
+        );
+    }
+}
+
+/// Run the full 3-stage search pipeline and return ranked results.
+///
+/// The returned `Vec<Snippet>` is sorted by descending score, truncated
+/// to `opts.top_k` entries.  Each snippet carries its file path, line
+/// range, content bytes, and final KMI-reranked score.
+pub fn search_with_options(query: &str, target_path: &str, opts: &SearchOptions) -> Vec<Snippet> {
+    let debug = std::env::var("DEBUG_SEARCH").is_ok();
     let query_bytes = resolve_query_bytes(query);
     if query_bytes.is_empty() {
         eprintln!("Error: Query is empty.");
-        return;
+        return Vec::new();
     }
 
     if debug {
@@ -133,13 +159,13 @@ pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOpti
     let candidates = collect_candidates(target_path, opts.granularity);
     if candidates.is_empty() {
         eprintln!("No accessible files found in target '{}'.", target_path);
-        return;
+        return Vec::new();
     }
 
     let candidates = stage0_prefilter(query_bytes.as_slice(), candidates, opts, debug);
     if candidates.is_empty() {
         eprintln!("No candidates remain after Stage-0 prefilter.");
-        return;
+        return Vec::new();
     }
     if debug {
         println!("Found {} candidates. Filtering...", candidates.len());
@@ -185,22 +211,7 @@ pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOpti
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    for (i, snippet) in top_candidates.iter().take(5).enumerate() {
-        if debug {
-            println!(
-                "Rank {}: Score={:.6}, Path={}",
-                i + 1,
-                snippet.score,
-                snippet.path.display()
-            );
-        }
-        println!(
-            "sed -n '{},{}p' {}",
-            snippet.start_line,
-            snippet.end_line,
-            snippet.path.display()
-        );
-    }
+    scored_candidates
 }
 
 fn resolve_query_bytes(query: &str) -> Vec<u8> {
@@ -250,7 +261,7 @@ fn stage1_filter_with_universal_prior(
             .into_par_iter()
             .map_init(
                 || base.clone(),
-                |m, mut snippet| {
+                |m: &mut crate::rwkvzip::Compressor, mut snippet| {
                     m.restore_runtime(&prior_snapshot);
                     let _ = m.absorb_chain(&[snippet.content.as_slice()]);
                     let h_ux_q = m.cross_entropy_from_current(query_bytes).unwrap_or(0.0);
@@ -331,15 +342,15 @@ fn rwkv_prior_snapshot(
     opts: &SearchOptions,
     prior_path: &str,
 ) -> Option<(
-    infotheory::rwkvzip::Compressor,
-    infotheory::rwkvzip::RuntimeSnapshot,
+    crate::rwkvzip::Compressor,
+    crate::rwkvzip::RuntimeSnapshot,
 )> {
     let mut compressor = match &opts.ctx.rate_backend {
         RateBackend::Rwkv7 { model } => {
-            infotheory::rwkvzip::Compressor::new_from_model(model.clone())
+            crate::rwkvzip::Compressor::new_from_model(model.clone())
         }
         RateBackend::Rwkv7Method { method } => {
-            infotheory::rwkvzip::Compressor::new_from_method(method).ok()?
+            crate::rwkvzip::Compressor::new_from_method(method).ok()?
         }
         _ => return None,
     };

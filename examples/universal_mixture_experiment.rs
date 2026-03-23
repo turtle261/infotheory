@@ -253,6 +253,7 @@ struct MixStats {
     soft_recovery_times: Vec<Option<usize>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summarize_mix(
     name: &'static str,
     total_bits: f64,
@@ -338,6 +339,11 @@ struct RunSummary {
     forward_vs_switch_max_diff: f64,
 }
 
+#[allow(
+    clippy::collapsible_if,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments
+)]
 fn run_once(
     seed: u64,
     seg_len: usize,
@@ -1252,8 +1258,8 @@ fn run_once(
         for name in &expert_names {
             print!("{:>width$}", name, width = col_width);
         }
-        print!(
-            "{:>width$}{:>width$}{:>width$}{:>width$}\n",
+        println!(
+            "{:>width$}{:>width$}{:>width$}{:>width$}",
             "bayes",
             "switch",
             "fading",
@@ -1267,8 +1273,8 @@ fn run_once(
                 let bpb = expert_bits_by_segment[seg_i][i] / seg_len_f;
                 print!("{:>width$.4}", bpb, width = col_width);
             }
-            print!(
-                "{:>width$.4}{:>width$.4}{:>width$.4}{:>width$.4}\n",
+            println!(
+                "{:>width$.4}{:>width$.4}{:>width$.4}{:>width$.4}",
                 bayes_bits_by_segment[seg_i] / seg_len_f,
                 switch_bits_by_segment[seg_i] / seg_len_f,
                 fading_bits_by_segment[seg_i] / seg_len_f,
@@ -1300,7 +1306,7 @@ fn run_once(
         bayes_inertia_seg2_bits: bayes_inertia_boundary.get(1).copied().unwrap_or(None),
         bayes_inertia_seg3_bits: bayes_inertia_boundary.get(2).copied().unwrap_or(None),
         bayes_inertia_boundary_max_bits: bayes_inertia_boundary_max,
-        bayes_max_logodds_bits: bayes_max_logodds_bits,
+        bayes_max_logodds_bits,
         bayes_delta_bpb_seg2,
         bayes_delta_bpb_seg3,
         bayes_oracle_adopt_seg2,
@@ -1316,7 +1322,7 @@ fn run_once(
         fading_inertia_seg2_bits: fading_inertia_boundary.get(1).copied().unwrap_or(None),
         fading_inertia_seg3_bits: fading_inertia_boundary.get(2).copied().unwrap_or(None),
         fading_inertia_boundary_max_bits: fading_inertia_boundary_max,
-        fading_max_logodds_bits: fading_max_logodds_bits,
+        fading_max_logodds_bits,
         fading_delta_bpb_seg2,
         fading_delta_bpb_seg3,
         fading_oracle_adopt_seg2,
@@ -1332,7 +1338,7 @@ fn run_once(
         switch_inertia_seg2_bits: switch_inertia_boundary.get(1).copied().unwrap_or(None),
         switch_inertia_seg3_bits: switch_inertia_boundary.get(2).copied().unwrap_or(None),
         switch_inertia_boundary_max_bits: switch_inertia_boundary_max,
-        switch_max_logodds_bits: switch_max_logodds_bits,
+        switch_max_logodds_bits,
         switch_delta_bpb_seg2,
         switch_delta_bpb_seg3,
         switch_oracle_adopt_seg2,

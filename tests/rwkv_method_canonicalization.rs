@@ -10,7 +10,7 @@ fn parse_cfg_named_fields_and_train_aliases() {
     .expect("cfg parse should succeed");
 
     match spec {
-        MethodSpec::Online(cfg) => {
+        MethodSpec::Online { cfg, policy } => {
             assert_eq!(cfg.hidden, 256);
             assert_eq!(cfg.layers, 1);
             assert_eq!(cfg.intermediate, 256);
@@ -22,6 +22,7 @@ fn parse_cfg_named_fields_and_train_aliases() {
             assert!(matches!(cfg.train_mode, OnlineTrainMode::Adam));
             assert!((cfg.lr - 0.01).abs() < f32::EPSILON);
             assert_eq!(cfg.stride, 2);
+            assert!(policy.is_none());
         }
         other => panic!("expected online cfg spec, got {other:?}"),
     }
@@ -29,19 +30,20 @@ fn parse_cfg_named_fields_and_train_aliases() {
 
 #[test]
 fn parse_positional_cfg_and_canonicalize_method_string() {
-    let compressor = Compressor::new_from_method("cfg:256,256,1,sgd,42,0.01,1")
-        .expect("positional cfg should parse and build compressor");
+    let compressor =
+        Compressor::new_from_method("cfg:256,256,1,sgd,42,0.01,1;policy:schedule=0..100:infer")
+            .expect("positional cfg should parse and build compressor");
     let method = compressor
         .online_method_string()
         .expect("online method should be available");
     assert_eq!(
         method,
-        "cfg:hidden=256,layers=1,intermediate=256,decay_rank=32,a_rank=32,v_rank=32,g_rank=64,seed=42,train=sgd,lr=0.01,stride=1"
+        "cfg:hidden=256,layers=1,intermediate=256,decay_rank=32,a_rank=32,v_rank=32,g_rank=64,seed=42,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:infer"
     );
 
     let reparsed = parse_method_spec(method).expect("canonical method should reparse");
     match reparsed {
-        MethodSpec::Online(cfg) => {
+        MethodSpec::Online { cfg, .. } => {
             assert_eq!(cfg.hidden, 256);
             assert_eq!(cfg.layers, 1);
             assert_eq!(cfg.intermediate, 256);
@@ -56,11 +58,37 @@ fn parse_positional_cfg_and_canonicalize_method_string() {
 
 #[test]
 fn parse_rejects_unknown_cfg_key() {
-    let err =
-        parse_method_spec("cfg:hidden=256,unknown_key=1").expect_err("unknown cfg key should fail");
+    let err = parse_method_spec("cfg:hidden=256,unknown_key=1;policy:schedule=0..100:infer")
+        .expect_err("unknown cfg key should fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("unknown rwkv cfg key"),
         "unexpected error message: {msg}"
     );
+}
+
+#[test]
+fn canonical_method_without_policy_roundtrips() {
+    let compressor = Compressor::new_from_method("cfg:256,256,1,sgd,42,0.01,1")
+        .expect("positional cfg without policy should parse");
+    let method = compressor
+        .online_method_string()
+        .expect("online method should be available");
+    assert_eq!(
+        method,
+        "cfg:hidden=256,layers=1,intermediate=256,decay_rank=32,a_rank=32,v_rank=32,g_rank=64,seed=42,train=sgd,lr=0.01,stride=1"
+    );
+
+    let reparsed = parse_method_spec(method).expect("canonical method should reparse");
+    match reparsed {
+        MethodSpec::Online { cfg, policy } => {
+            assert_eq!(cfg.hidden, 256);
+            assert_eq!(cfg.layers, 1);
+            assert_eq!(cfg.intermediate, 256);
+            assert_eq!(cfg.seed, 42);
+            assert!(matches!(cfg.train_mode, OnlineTrainMode::Sgd));
+            assert!(policy.is_none());
+        }
+        other => panic!("expected online cfg spec, got {other:?}"),
+    }
 }

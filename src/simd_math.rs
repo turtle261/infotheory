@@ -78,6 +78,7 @@ pub(crate) fn axpy_wide(dst: &mut [f64], alpha: f64, src: &[f64]) {
     }
 }
 
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn affine3_wide(
     dst: &mut [f64],

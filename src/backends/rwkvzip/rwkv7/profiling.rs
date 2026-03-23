@@ -12,6 +12,9 @@ pub struct LayerTiming {
 /// Sink trait used by the model to surface per-layer timings without
 /// committing to a particular profiler implementation.
 pub trait ProfilerSink {
+    /// Whether the caller should pay profiling overhead on the hot path.
+    const ENABLED: bool = false;
+
     /// Start timing a new token forward pass.
     #[inline(always)]
     fn begin_token(&mut self) {}
@@ -72,6 +75,8 @@ impl LayerProfiler {
 }
 
 impl ProfilerSink for LayerProfiler {
+    const ENABLED: bool = true;
+
     #[inline(always)]
     fn begin_token(&mut self) {
         self.tokens = self.tokens.saturating_add(1);

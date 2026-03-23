@@ -1,0 +1,12 @@
+{
+  "kind": "neural",
+  "alpha": 0.04,
+  "experts": [
+    {
+      "name": "rosa",
+      "kind": "rosaplus",
+      "max_order": -1,
+      "log_prior": 0.0
+    }
+  ]
+}

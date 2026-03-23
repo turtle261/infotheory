@@ -17,11 +17,13 @@ anyhow = "1.0.100"
 infotheory = { path = "..", default-features = false }
 pyo3 = { version = "0.28.2", features = ["abi3-py310", "auto-initialize"] }
 rayon = "1.11.0"
+serde_json = "1.0.149"
 
 [features]
-default = ["backend-rosa", "backend-rwkv", "backend-zpaq"]
+default = ["backend-rosa", "backend-mamba", "backend-rwkv", "backend-zpaq"]
 python-extension = ["pyo3/extension-module"]
 backend-rosa = ["infotheory/backend-rosa"]
+backend-mamba = ["infotheory/backend-mamba"]
 backend-rwkv = ["infotheory/backend-rwkv"]
 backend-zpaq = ["infotheory/backend-zpaq"]
 vm = ["infotheory/vm"]

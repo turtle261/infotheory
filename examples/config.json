@@ -3,8 +3,8 @@
   "alpha": 0.03,
   "experts": [
     {
-      "name": "fac",
-      "kind": "fac-ctw",
+      "name": "ctw",
+      "kind": "ctw",
       "base_depth": 32,
       "encoding_bits": 8,
       "num_percept_bits": 8,

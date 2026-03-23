@@ -34,13 +34,13 @@ jobs:
           RUSTFLAGS: -C target-cpu=generic -C link-arg=-fuse-ld=lld
           CC: clang
           CXX: clang++
-        run: uv run maturin build --release --features python-extension,backend-rosa,backend-rwkv,backend-zpaq
+        run: uv run maturin build --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
 
       - name: Build wheel (macOS/Windows)
         if: runner.os != 'Linux'
         env:
           RUSTFLAGS: -C target-cpu=generic
-        run: uv run maturin build --release --features python-extension,backend-rosa,backend-rwkv,backend-zpaq
+        run: uv run maturin build --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
