@@ -1012,12 +1012,12 @@ fn parse_compression_backend(
         "rate-ac" | "rate_ac" | "rateac" => Ok(CompressionBackend::Rate {
             rate_backend: rate_backend.unwrap_or_default(),
             coder: infotheory::coders::CoderType::AC,
-            framing: infotheory::compression::FramingMode::Raw,
+            framing: infotheory::compression::FramingMode::Framed,
         }),
         "rate-rans" | "rate_rans" | "raterans" => Ok(CompressionBackend::Rate {
             rate_backend: rate_backend.unwrap_or_default(),
             coder: infotheory::coders::CoderType::RANS,
-            framing: infotheory::compression::FramingMode::Raw,
+            framing: infotheory::compression::FramingMode::Framed,
         }),
         "rwkv" | "rwkv7" => parse_rwkv7_compression_backend(method),
         _ => Err(PyValueError::new_err(format!(
@@ -1479,7 +1479,7 @@ impl PyCompressionBackend {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (rate_backend, framing="raw"))]
+    #[pyo3(signature = (rate_backend, framing="framed"))]
     fn rate_ac(rate_backend: &PyRateBackend, framing: &str) -> PyResult<Self> {
         let framing = parse_framing_mode(framing)?;
         Ok(Self {
@@ -1492,7 +1492,7 @@ impl PyCompressionBackend {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (rate_backend, framing="raw"))]
+    #[pyo3(signature = (rate_backend, framing="framed"))]
     fn rate_rans(rate_backend: &PyRateBackend, framing: &str) -> PyResult<Self> {
         let framing = parse_framing_mode(framing)?;
         Ok(Self {
@@ -4705,6 +4705,46 @@ mod tests {
             _ => panic!("expected rate backend"),
         }
         match cb_rans.inner {
+            CompressionBackend::Rate { framing, .. } => {
+                assert_eq!(framing, infotheory::compression::FramingMode::Framed)
+            }
+            _ => panic!("expected rate backend"),
+        }
+    }
+
+    #[test]
+    fn compression_backend_rate_methods_default_to_framed() {
+        let rb = PyRateBackend {
+            inner: RateBackend::Ctw { depth: 8 },
+        };
+        let cb_ac = PyCompressionBackend::rate_ac(&rb, "framed").expect("rate_ac default framed");
+        let cb_rans =
+            PyCompressionBackend::rate_rans(&rb, "framed").expect("rate_rans default framed");
+        match cb_ac.inner {
+            CompressionBackend::Rate { framing, .. } => {
+                assert_eq!(framing, infotheory::compression::FramingMode::Framed)
+            }
+            _ => panic!("expected rate backend"),
+        }
+        match cb_rans.inner {
+            CompressionBackend::Rate { framing, .. } => {
+                assert_eq!(framing, infotheory::compression::FramingMode::Framed)
+            }
+            _ => panic!("expected rate backend"),
+        }
+    }
+
+    #[test]
+    fn parse_rate_compression_backend_defaults_to_framed() {
+        let ac = parse_compression_backend("rate-ac", None, None).expect("parse rate-ac");
+        let rans = parse_compression_backend("rate-rans", None, None).expect("parse rate-rans");
+        match ac {
+            CompressionBackend::Rate { framing, .. } => {
+                assert_eq!(framing, infotheory::compression::FramingMode::Framed)
+            }
+            _ => panic!("expected rate backend"),
+        }
+        match rans {
             CompressionBackend::Rate { framing, .. } => {
                 assert_eq!(framing, infotheory::compression::FramingMode::Framed)
             }

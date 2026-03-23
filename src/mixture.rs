@@ -2793,6 +2793,68 @@ mod tests {
     }
 
     #[test]
+    fn predictor_frozen_conditioning_reuses_match_fit_corpus() {
+        let mut predictor = RateBackendPredictor::from_backend(
+            RateBackend::Match {
+                hash_bits: 20,
+                min_len: 3,
+                max_len: 32,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            },
+            -1,
+            DEFAULT_MIN_PROB,
+        );
+
+        for &b in b"abcabcX" {
+            predictor.update(b);
+        }
+        predictor
+            .reset_frozen(Some(6))
+            .expect("reset frozen for match backend");
+        for &b in b"abcabc" {
+            predictor.update_frozen(b);
+        }
+        let p_x = predictor.log_prob(b'X').exp();
+        assert!(
+            p_x > 0.01,
+            "frozen conditioning should preserve fit corpus for match backend; p_x={p_x}"
+        );
+    }
+
+    #[test]
+    fn predictor_frozen_conditioning_reuses_sparse_match_fit_corpus() {
+        let mut predictor = RateBackendPredictor::from_backend(
+            RateBackend::SparseMatch {
+                hash_bits: 20,
+                min_len: 3,
+                max_len: 32,
+                gap_min: 0,
+                gap_max: 2,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            },
+            -1,
+            DEFAULT_MIN_PROB,
+        );
+
+        for &b in b"abcabcX" {
+            predictor.update(b);
+        }
+        predictor
+            .reset_frozen(Some(6))
+            .expect("reset frozen for sparse-match backend");
+        for &b in b"abcabc" {
+            predictor.update_frozen(b);
+        }
+        let p_x = predictor.log_prob(b'X').exp();
+        assert!(
+            p_x > 0.01,
+            "frozen conditioning should preserve fit corpus for sparse-match backend; p_x={p_x}"
+        );
+    }
+
+    #[test]
     fn neural_predict_then_step_reuses_evaluation_cache() {
         let c0 = Arc::new(AtomicUsize::new(0));
         let c1 = Arc::new(AtomicUsize::new(0));
