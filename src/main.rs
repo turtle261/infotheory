@@ -3308,10 +3308,8 @@ mod tests {
     #[cfg(feature = "backend-mamba")]
     #[test]
     fn parse_mixture_expert_resolves_mamba_model_path_relative_to_base_dir() {
-        let base_dir = std::env::temp_dir().join(format!(
-            "infotheory-mamba-relpath-{}",
-            std::process::id()
-        ));
+        let base_dir =
+            std::env::temp_dir().join(format!("infotheory-mamba-relpath-{}", std::process::id()));
         std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
         let rel_path = "weights/model.safetensors";
         let expected = base_dir.join(rel_path).to_string_lossy().to_string();
@@ -3335,10 +3333,8 @@ mod tests {
     #[cfg(feature = "backend-rwkv")]
     #[test]
     fn parse_mixture_expert_resolves_rwkv_model_path_relative_to_base_dir() {
-        let base_dir = std::env::temp_dir().join(format!(
-            "infotheory-rwkv-relpath-{}",
-            std::process::id()
-        ));
+        let base_dir =
+            std::env::temp_dir().join(format!("infotheory-rwkv-relpath-{}", std::process::id()));
         std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
         let rel_path = "weights/model.safetensors";
         let expected = base_dir.join(rel_path).to_string_lossy().to_string();

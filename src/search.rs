@@ -341,14 +341,9 @@ fn stage1_filter_with_universal_prior(
 fn rwkv_prior_snapshot(
     opts: &SearchOptions,
     prior_path: &str,
-) -> Option<(
-    crate::rwkvzip::Compressor,
-    crate::rwkvzip::RuntimeSnapshot,
-)> {
+) -> Option<(crate::rwkvzip::Compressor, crate::rwkvzip::RuntimeSnapshot)> {
     let mut compressor = match &opts.ctx.rate_backend {
-        RateBackend::Rwkv7 { model } => {
-            crate::rwkvzip::Compressor::new_from_model(model.clone())
-        }
+        RateBackend::Rwkv7 { model } => crate::rwkvzip::Compressor::new_from_model(model.clone()),
         RateBackend::Rwkv7Method { method } => {
             crate::rwkvzip::Compressor::new_from_method(method).ok()?
         }
