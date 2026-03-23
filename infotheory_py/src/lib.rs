@@ -2008,6 +2008,21 @@ fn compression_backend_from_py(
     parse_compression_backend("zpaq", method, rate_backend)
 }
 
+fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
+    match backend {
+        CompressionBackend::Rate {
+            rate_backend,
+            coder,
+            ..
+        } => CompressionBackend::Rate {
+            rate_backend: rate_backend.clone(),
+            coder: *coder,
+            framing: infotheory::compression::FramingMode::Framed,
+        },
+        _ => backend.clone(),
+    }
+}
+
 fn rate_backend_from_py(
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
@@ -2483,6 +2498,7 @@ fn compress_file(
 ) -> PyResult<()> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
     let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
+    let cb = file_roundtrip_backend(&cb);
     py.detach(|| {
         py_try(|| {
             let input = std::fs::read(input_path).map_err(|e| {
@@ -2511,6 +2527,7 @@ fn decompress_file(
 ) -> PyResult<()> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
     let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
+    let cb = file_roundtrip_backend(&cb);
     py.detach(|| {
         py_try(|| {
             let input = std::fs::read(input_path).map_err(|e| {
@@ -4688,6 +4705,22 @@ mod tests {
             _ => panic!("expected rate backend"),
         }
         match cb_rans.inner {
+            CompressionBackend::Rate { framing, .. } => {
+                assert_eq!(framing, infotheory::compression::FramingMode::Framed)
+            }
+            _ => panic!("expected rate backend"),
+        }
+    }
+
+    #[test]
+    fn file_roundtrip_backend_forces_rate_framed() {
+        let backend = CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 8 },
+            coder: infotheory::coders::CoderType::AC,
+            framing: infotheory::compression::FramingMode::Raw,
+        };
+        let normalized = file_roundtrip_backend(&backend);
+        match normalized {
             CompressionBackend::Rate { framing, .. } => {
                 assert_eq!(framing, infotheory::compression::FramingMode::Framed)
             }

@@ -154,3 +154,27 @@ def test_file_roundtrip_backend_matrices_and_axiom_helpers(tmp_path):
     assert ait.verify_chain_rule(datas[0], datas[1], tolerance=2.0)
     assert ait.verify_ncd_bounds(datas[0], datas[1])
     assert ait.verify_entropy_bounds(datas[0])
+
+
+def test_file_roundtrip_with_string_rate_backend_defaults_to_framed(tmp_path):
+    payload = b"string rate backend file roundtrip payload"
+    input_path = tmp_path / "input.bin"
+    compressed_path = tmp_path / "payload.it"
+    output_path = tmp_path / "output.bin"
+    input_path.write_bytes(payload)
+
+    match_backend = ait.RateBackend.match()
+    ait.compress_file(
+        str(input_path),
+        str(compressed_path),
+        compression_backend="rate-ac",
+        rate_backend=match_backend,
+    )
+    ait.decompress_file(
+        str(compressed_path),
+        str(output_path),
+        compression_backend="rate-ac",
+        rate_backend=match_backend,
+    )
+
+    assert output_path.read_bytes() == payload

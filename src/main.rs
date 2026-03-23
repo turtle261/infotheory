@@ -584,7 +584,8 @@ fn parse_mixture_expert_value(
                         .ok_or_else(|| {
                             anyhow::anyhow!("mamba expert missing model_path or method")
                         })?;
-                    let model = load_mamba_model_from_path(model_path);
+                    let model_path = base_dir.join(model_path);
+                    let model = load_mamba_model_from_path(model_path.to_string_lossy().as_ref());
                     Ok(MixtureExpertSpec {
                         name,
                         log_prior,
@@ -620,7 +621,8 @@ fn parse_mixture_expert_value(
                         .ok_or_else(|| {
                             anyhow::anyhow!("rwkv expert missing model_path or method")
                         })?;
-                    let model = load_rwkv7_model_from_path(model_path);
+                    let model_path = base_dir.join(model_path);
+                    let model = load_rwkv7_model_from_path(model_path.to_string_lossy().as_ref());
                     Ok(MixtureExpertSpec {
                         name,
                         log_prior,
@@ -3161,6 +3163,8 @@ Examples:
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::any::Any;
+    use std::panic;
     use std::path::Path;
 
     #[test]
@@ -3288,6 +3292,71 @@ mod tests {
             },
             _ => panic!("expected calibrated backend"),
         }
+    }
+
+    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
+    fn panic_message(payload: Box<dyn Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<String>() {
+            return s.clone();
+        }
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            return (*s).to_string();
+        }
+        "non-string panic payload".to_string()
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn parse_mixture_expert_resolves_mamba_model_path_relative_to_base_dir() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "infotheory-mamba-relpath-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
+        let rel_path = "weights/model.safetensors";
+        let expected = base_dir.join(rel_path).to_string_lossy().to_string();
+        let expert = json!({
+            "name": "mamba-relative",
+            "kind": "mamba",
+            "model_path": rel_path
+        });
+        let panic = panic::catch_unwind(|| {
+            let _ = parse_mixture_expert_value(&expert, &base_dir, 4);
+        })
+        .expect_err("missing model should panic during load");
+        let msg = panic_message(panic);
+        assert!(
+            msg.contains(&expected),
+            "panic should mention resolved absolute model path. expected substring: {expected}, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn parse_mixture_expert_resolves_rwkv_model_path_relative_to_base_dir() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "infotheory-rwkv-relpath-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
+        let rel_path = "weights/model.safetensors";
+        let expected = base_dir.join(rel_path).to_string_lossy().to_string();
+        let expert = json!({
+            "name": "rwkv-relative",
+            "kind": "rwkv7",
+            "model_path": rel_path
+        });
+        let panic = panic::catch_unwind(|| {
+            let _ = parse_mixture_expert_value(&expert, &base_dir, 4);
+        })
+        .expect_err("missing model should panic during load");
+        let msg = panic_message(panic);
+        assert!(
+            msg.contains(&expected),
+            "panic should mention resolved absolute model path. expected substring: {expected}, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]
