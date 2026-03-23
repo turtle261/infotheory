@@ -1,4 +1,5 @@
 import infotheory_rs as ait
+import os
 import pathlib
 import subprocess
 import sys
@@ -94,6 +95,15 @@ class DummySim(ait.AgentSimulatorABC):
         return c
 
 
+class DummySimWithKeyMode(DummySim):
+    def __init__(self, mode: str):
+        super().__init__()
+        self._mode = mode
+
+    def observation_key_mode(self):
+        return self._mode
+
+
 def test_predictor_probe_with_python_callback_object():
     probs, name = ait.predictor_probe(DummyPredictor(), steps=5)
     assert len(probs) == 5
@@ -112,8 +122,57 @@ def test_search_with_simulator_adapter():
     assert action in (0, 1)
 
 
+def test_search_with_simulator_accepts_cli_observation_key_aliases():
+    for mode in ("full", "full-stream", "stream-hash"):
+        action = ait.search_with_simulator(DummySimWithKeyMode(mode), [0], 0, 0, 4)
+        assert action in (0, 1)
+
+
 def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[2]
+
+
+def test_search_with_simulator_respects_rayon_num_threads_env():
+    code = """
+import infotheory_rs as ait
+class ProbeSim(ait.AgentSimulatorABC):
+    def __init__(self):
+        self._rng = ait.RandomGenerator()
+        self._obs = 0
+        self.seed_clone_calls = 0
+    def get_num_actions(self) -> int: return 2
+    def get_num_observation_bits(self) -> int: return 1
+    def get_num_reward_bits(self) -> int: return 1
+    def horizon(self) -> int: return 2
+    def max_reward(self) -> int: return 1
+    def min_reward(self) -> int: return 0
+    def model_update_action(self, action: int): self._obs = action & 1
+    def gen_percept_and_update(self, bits: int) -> int: return self._obs if bits == 1 else 0
+    def model_revert(self, steps: int): return None
+    def gen_range(self, end: int) -> int: return self._rng.gen_range(end)
+    def gen_f64(self) -> float: return self._rng.gen_f64()
+    def boxed_clone_with_seed(self, seed: int):
+        self.seed_clone_calls += 1
+        c = ProbeSim()
+        c._rng = self._rng.fork_with(seed)
+        c._obs = self._obs
+        return c
+sim = ProbeSim()
+ait.search_with_simulator(sim, [0], 0, 0, 8)
+print(sim.seed_clone_calls)
+"""
+    env = dict(os.environ)
+    env["RAYON_NUM_THREADS"] = "2"
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_repo_root(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert int(proc.stdout.strip()) >= 1
 
 
 def test_predictor_callback_exception_is_fatal():

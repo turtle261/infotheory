@@ -87,15 +87,15 @@ fn parse_observation_key_mode(
         match s.to_ascii_lowercase().as_str() {
             "first" => return Ok(infotheory::aixi::common::ObservationKeyMode::First),
             "last" => return Ok(infotheory::aixi::common::ObservationKeyMode::Last),
-            "streamhash" | "stream_hash" | "hash" => {
+            "streamhash" | "stream_hash" | "stream-hash" | "hash" => {
                 return Ok(infotheory::aixi::common::ObservationKeyMode::StreamHash);
             }
-            "fullstream" | "full_stream" => {
+            "full" | "stream" | "fullstream" | "full_stream" | "full-stream" => {
                 return Ok(infotheory::aixi::common::ObservationKeyMode::FullStream);
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown ObservationKeyMode '{s}' (expected one of: first, last, stream_hash, full_stream)"
+                    "unknown ObservationKeyMode '{s}' (expected one of: first, last, hash/stream_hash/stream-hash, full/full-stream/full_stream/fullstream/stream)"
                 )));
             }
         }
@@ -3604,19 +3604,13 @@ fn search_with_simulator(
         py_try(|| {
             let mut sim = PyAgentSimulatorShim::new(simulator);
             let mut tree = infotheory::aixi::mcts::SearchTree::new();
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(pool.install(|| {
-                tree.search(
-                    &mut sim,
-                    &prev_obs_stream,
-                    prev_rew,
-                    prev_act,
-                    num_simulations,
-                )
-            }))
+            Ok(tree.search(
+                &mut sim,
+                &prev_obs_stream,
+                prev_rew,
+                prev_act,
+                num_simulations,
+            ))
         })
     })
 }
@@ -4671,10 +4665,31 @@ mod tests {
                 infotheory::aixi::common::ObservationKeyMode::StreamHash
             );
 
+            let stream_hash_hyphen = pyo3::types::PyString::new(py, "stream-hash");
+            let parsed_hash_hyphen = PyAgentSimulatorShim::parse_key_mode(stream_hash_hyphen.as_any());
+            assert_eq!(
+                parsed_hash_hyphen,
+                infotheory::aixi::common::ObservationKeyMode::StreamHash
+            );
+
             let full_stream = pyo3::types::PyString::new(py, "fullstream");
             let parsed_full = PyAgentSimulatorShim::parse_key_mode(full_stream.as_any());
             assert_eq!(
                 parsed_full,
+                infotheory::aixi::common::ObservationKeyMode::FullStream
+            );
+
+            let full_stream_hyphen = pyo3::types::PyString::new(py, "full-stream");
+            let parsed_full_hyphen = PyAgentSimulatorShim::parse_key_mode(full_stream_hyphen.as_any());
+            assert_eq!(
+                parsed_full_hyphen,
+                infotheory::aixi::common::ObservationKeyMode::FullStream
+            );
+
+            let full = pyo3::types::PyString::new(py, "full");
+            let parsed_full_alias = PyAgentSimulatorShim::parse_key_mode(full.as_any());
+            assert_eq!(
+                parsed_full_alias,
                 infotheory::aixi::common::ObservationKeyMode::FullStream
             );
         });
