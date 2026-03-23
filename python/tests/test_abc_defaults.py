@@ -84,6 +84,87 @@ class _Sim(ait.AgentSimulatorABC):
         return self.rng.random()
 
 
+class _ForkableSim(ait.AgentSimulatorABC):
+    def __init__(self):
+        self.rng = ait.RandomGenerator()
+        self.obs = 0
+
+    def get_num_actions(self) -> int:
+        return 2
+
+    def get_num_observation_bits(self) -> int:
+        return 1
+
+    def get_num_reward_bits(self) -> int:
+        return 1
+
+    def horizon(self) -> int:
+        return 2
+
+    def max_reward(self) -> int:
+        return 1
+
+    def min_reward(self) -> int:
+        return 0
+
+    def model_update_action(self, action: int):
+        self.obs = action & 1
+
+    def gen_percept_and_update(self, bits: int) -> int:
+        return self.obs if bits == 1 else 0
+
+    def model_revert(self, steps: int):
+        return None
+
+    def gen_range(self, end: int) -> int:
+        return self.rng.gen_range(end)
+
+    def gen_f64(self) -> float:
+        return self.rng.gen_f64()
+
+
+class _SharedRngSim(ait.AgentSimulatorABC):
+    __slots__ = ("rng", "mirror", "obs")
+
+    def __init__(self):
+        self.rng = random.Random(0)
+        self.mirror = self.rng
+        self.obs = 0
+
+    def get_num_actions(self) -> int:
+        return 2
+
+    def get_num_observation_bits(self) -> int:
+        return 1
+
+    def get_num_reward_bits(self) -> int:
+        return 1
+
+    def horizon(self) -> int:
+        return 2
+
+    def max_reward(self) -> int:
+        return 1
+
+    def min_reward(self) -> int:
+        return 0
+
+    def model_update_action(self, action: int):
+        self.obs = action & 1
+
+    def gen_percept_and_update(self, bits: int) -> int:
+        return self.obs if bits == 1 else 0
+
+    def model_revert(self, steps: int):
+        return None
+
+    def gen_range(self, end: int) -> int:
+        return self.rng.randrange(end)
+
+    def gen_f64(self) -> float:
+        return self.rng.random()
+
+
 def test_predictor_default_methods():
     p = _Predictor()
     p.update_history(True)
@@ -111,3 +192,37 @@ def test_agent_simulator_default_methods():
     assert sim.discount_gamma() == 1.0
     clone = sim.boxed_clone_with_seed(42)
     assert isinstance(clone, _Sim)
+
+
+def test_agent_simulator_default_clone_reseeds_python_random():
+    sim = _Sim()
+    clone_a = sim.boxed_clone_with_seed(42)
+    clone_b = sim.boxed_clone_with_seed(42)
+    clone_c = sim.boxed_clone_with_seed(43)
+
+    seq_a = [clone_a.gen_range(1 << 30) for _ in range(8)]
+    seq_b = [clone_b.gen_range(1 << 30) for _ in range(8)]
+    seq_c = [clone_c.gen_range(1 << 30) for _ in range(8)]
+
+    assert seq_a == seq_b
+    assert seq_a != seq_c
+
+
+def test_agent_simulator_default_clone_forks_infotheory_rng():
+    sim = _ForkableSim()
+    clone_a = sim.boxed_clone_with_seed(101)
+    clone_b = sim.boxed_clone_with_seed(101)
+    clone_c = sim.boxed_clone_with_seed(202)
+
+    seq_a = [clone_a.gen_range(1 << 30) for _ in range(8)]
+    seq_b = [clone_b.gen_range(1 << 30) for _ in range(8)]
+    seq_c = [clone_c.gen_range(1 << 30) for _ in range(8)]
+
+    assert seq_a == seq_b
+    assert seq_a != seq_c
+
+
+def test_agent_simulator_default_clone_preserves_shared_references():
+    sim = _SharedRngSim()
+    clone = sim.boxed_clone_with_seed(1234)
+    assert clone.rng is clone.mirror

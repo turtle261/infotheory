@@ -27,6 +27,95 @@ def ncd_bytes(x, y, method="5", variant="vitanyi", backend=None):
     return _c.ncd_bytes(x, y, method, variant, backend=backend)
 
 
+def _deepcopy_with_seeded_rng_fields(obj, seed: int):
+    import copy
+    import random
+    import types
+
+    def _slot_names(instance):
+        cls = type(instance)
+        for base in cls.__mro__:
+            base_slots = getattr(base, "__slots__", ())
+            if isinstance(base_slots, str):
+                base_slots = (base_slots,)
+            for slot in base_slots:
+                if slot not in {"__dict__", "__weakref__"}:
+                    yield slot
+
+    def _is_forkable_rng(value):
+        return (
+            hasattr(value, "fork_with")
+            and callable(value.fork_with)
+            and hasattr(value, "gen_range")
+            and callable(value.gen_range)
+            and hasattr(value, "gen_f64")
+            and callable(value.gen_f64)
+        )
+
+    def _iter_children(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield key
+                yield child
+            return
+
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for child in value:
+                yield child
+            return
+
+        if hasattr(value, "__dict__"):
+            for child in vars(value).values():
+                yield child
+
+        for slot in _slot_names(value):
+            if hasattr(value, slot):
+                yield getattr(value, slot)
+
+    seed = int(seed) & ((1 << 64) - 1)
+    memo = {}
+    seen = set()
+    stack = [obj]
+
+    while stack:
+        value = stack.pop()
+        value_id = id(value)
+        if value_id in seen:
+            continue
+        seen.add(value_id)
+
+        if _is_forkable_rng(value):
+            memo[value_id] = value.fork_with(seed)
+        elif isinstance(value, random.Random):
+            copied = copy.deepcopy(value, memo)
+            copied.seed(seed)
+            memo[value_id] = copied
+        elif isinstance(
+            value,
+            (
+                str,
+                bytes,
+                bytearray,
+                memoryview,
+                int,
+                float,
+                bool,
+                complex,
+                type(None),
+                types.FunctionType,
+                types.BuiltinFunctionType,
+                types.MethodType,
+                types.ModuleType,
+                type,
+            ),
+        ):
+            continue
+        else:
+            stack.extend(_iter_children(value))
+
+    return copy.deepcopy(obj, memo)
+
+
 class PredictorABC(ABC):
     """Python-side adapter for the Rust `Predictor` trait."""
 
@@ -136,8 +225,7 @@ class AgentSimulatorABC(ABC):
     def gen_f64(self) -> float: ...
 
     def boxed_clone_with_seed(self, seed: int):
-        import copy
-        return copy.deepcopy(self)
+        return _deepcopy_with_seeded_rng_fields(self, seed)
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
