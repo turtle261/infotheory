@@ -104,6 +104,60 @@ class DummySimWithKeyMode(DummySim):
         return self._mode
 
 
+class RunnerTupleEnv(ait.EnvironmentABC):
+    def __init__(self):
+        self.obs = 0
+        self.rew = 0
+        self.finished = False
+        self.perform_calls = 0
+        self.get_obs_calls = 0
+        self.get_rew_calls = 0
+
+    def perform_action(self, action: int):
+        self.perform_calls += 1
+        self.obs = action & 1
+        self.rew = 1 if self.obs else 0
+        return (self.obs, self.rew)
+
+    def get_observation(self) -> int:
+        self.get_obs_calls += 1
+        return self.obs
+
+    def get_reward(self) -> int:
+        self.get_rew_calls += 1
+        return self.rew
+
+    def is_finished(self) -> bool:
+        return self.finished
+
+    def get_observation_bits(self) -> int:
+        return 1
+
+    def get_reward_bits(self) -> int:
+        return 1
+
+    def get_action_bits(self) -> int:
+        return 1
+
+
+def _test_agent_config() -> ait.AgentConfig:
+    return ait.AgentConfig(
+        algorithm="ac-ctw",
+        ct_depth=8,
+        agent_horizon=2,
+        observation_bits=1,
+        observation_stream_len=1,
+        reward_bits=1,
+        agent_actions=2,
+        num_simulations=8,
+        exploration_exploitation_ratio=1.41,
+        discount_gamma=1.0,
+        min_reward=0,
+        max_reward=1,
+        reward_offset=0,
+    )
+
+
 def test_predictor_probe_with_python_callback_object():
     probs, name = ait.predictor_probe(DummyPredictor(), steps=5)
     assert len(probs) == 5
@@ -115,6 +169,35 @@ def test_environment_probe_with_python_callback_object():
     rows = ait.environment_probe(DummyEnv(), [0, 1, 1, 0])
     assert len(rows) == 4
     assert rows[1][1] == 1
+
+
+def test_run_agent_with_environment_adapter():
+    env = DummyEnv()
+    summary = ait.run_agent_with_environment(
+        env,
+        _test_agent_config(),
+        learn_cycles=4,
+        eval_cycles=6,
+        terminate_lifetime=10,
+    )
+    assert summary["learn_cycles_completed"] == 4
+    assert summary["eval_cycles_completed"] == 6
+    assert isinstance(summary["eval_average_reward"], float)
+
+
+def test_run_agent_with_environment_uses_perform_action_tuple_fast_path():
+    env = RunnerTupleEnv()
+    summary = ait.run_agent_with_environment(
+        env,
+        _test_agent_config(),
+        learn_cycles=10,
+        eval_cycles=0,
+        check_finished=False,
+    )
+    assert summary["learn_cycles_completed"] == 10
+    assert env.perform_calls == 10
+    assert env.get_obs_calls == 1
+    assert env.get_rew_calls == 1
 
 
 def test_search_with_simulator_adapter():

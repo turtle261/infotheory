@@ -7,12 +7,11 @@ use infotheory::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-#[cfg(feature = "vm")]
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 fn py_try<T>(f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -3075,6 +3074,106 @@ impl PyEnvironmentShim {
             obj: Mutex::new(obj),
         }
     }
+
+    fn parse_step_result(result: &Bound<'_, PyAny>) -> Option<(Vec<u64>, i64, Option<bool>)> {
+        if result.is_none() {
+            return None;
+        }
+
+        if let Ok((obs_stream, reward, finished)) = result.extract::<(Vec<u64>, i64, bool)>() {
+            return Some((obs_stream, reward, Some(finished)));
+        }
+
+        if let Ok((obs, reward, finished)) = result.extract::<(u64, i64, bool)>() {
+            return Some((vec![obs], reward, Some(finished)));
+        }
+
+        if let Ok((obs_stream, reward)) = result.extract::<(Vec<u64>, i64)>() {
+            return Some((obs_stream, reward, None));
+        }
+
+        if let Ok((obs, reward)) = result.extract::<(u64, i64)>() {
+            return Some((vec![obs], reward, None));
+        }
+
+        None
+    }
+
+    fn perform_action_and_collect(
+        &mut self,
+        action: u64,
+        include_finished: bool,
+    ) -> (Vec<u64>, i64, Option<bool>) {
+        Python::attach(|py| {
+            let guard = lock_recover(&self.obj);
+            let obj = guard.bind(py);
+
+            let step_result = match obj.call_method1("perform_action", (action,)) {
+                Ok(v) => v,
+                Err(e) => fatal_python_callback_error(py, "Environment.perform_action", e),
+            };
+
+            if let Some((obs_stream, reward, finished_opt)) = Self::parse_step_result(&step_result)
+            {
+                let finished = if include_finished {
+                    match finished_opt {
+                        Some(done) => Some(done),
+                        None => Some(py_result_or_fatal(
+                            py,
+                            "Environment.is_finished",
+                            obj.call_method0("is_finished")
+                                .and_then(|v| v.extract::<bool>()),
+                        )),
+                    }
+                } else {
+                    finished_opt
+                };
+
+                return (obs_stream, reward, finished);
+            }
+
+            let observations =
+                if py_hasattr_or_fatal(obj, "drain_observations", "Environment.drain_observations")
+                {
+                    match obj
+                        .call_method0("drain_observations")
+                        .and_then(|v| v.extract::<Vec<u64>>())
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            fatal_python_callback_error(py, "Environment.drain_observations", e)
+                        }
+                    }
+                } else {
+                    vec![py_result_or_fatal(
+                        py,
+                        "Environment.get_observation",
+                        obj.call_method0("get_observation")
+                            .and_then(|v| v.extract::<u64>()),
+                    )]
+                };
+
+            let reward = py_result_or_fatal(
+                py,
+                "Environment.get_reward",
+                obj.call_method0("get_reward")
+                    .and_then(|v| v.extract::<i64>()),
+            );
+
+            let finished = if include_finished {
+                Some(py_result_or_fatal(
+                    py,
+                    "Environment.is_finished",
+                    obj.call_method0("is_finished")
+                        .and_then(|v| v.extract::<bool>()),
+                ))
+            } else {
+                None
+            };
+
+            (observations, reward, finished)
+        })
+    }
 }
 
 impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
@@ -3578,16 +3677,214 @@ fn environment_probe(
 ) -> PyResult<Vec<(u64, i64, bool)>> {
     py.detach(|| {
         py_try(|| {
-            use infotheory::aixi::environment::Environment;
             let mut env = PyEnvironmentShim::new(environment);
             let mut out = Vec::with_capacity(actions.len());
             for a in actions {
-                env.perform_action(a);
-                out.push((env.get_observation(), env.get_reward(), env.is_finished()));
+                let (obs_stream, reward, finished_opt) = env.perform_action_and_collect(a, true);
+                let observation = obs_stream.first().copied().unwrap_or(0);
+                out.push((observation, reward, finished_opt.unwrap_or(false)));
             }
             Ok(out)
         })
     })
+}
+
+fn validate_observation_stream_len(expected: usize, actual: usize) -> PyResult<()> {
+    if expected != actual {
+        return Err(PyValueError::new_err(format!(
+            "observation stream length mismatch: AgentConfig expects {expected} symbols, but environment returned {actual}; update AgentConfig.observation_stream_len or environment.drain_observations"
+        )));
+    }
+    Ok(())
+}
+
+struct AixiRunSummary {
+    learn_total_reward: i64,
+    eval_total_reward: i64,
+    eval_average_reward: f64,
+    learn_cycles_completed: usize,
+    eval_cycles_completed: usize,
+    learn_elapsed_seconds: f64,
+    eval_elapsed_seconds: f64,
+    learn_cycles_per_second: f64,
+    eval_cycles_per_second: f64,
+    last_action: u64,
+    last_reward: i64,
+    last_observation_stream: Vec<u64>,
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    environment,
+    config,
+    learn_cycles=None,
+    eval_cycles=None,
+    terminate_lifetime=20,
+    explore_epsilon=0.0,
+    explore_gamma=1.0,
+    prev_action=0,
+    check_finished=false
+))]
+fn run_agent_with_environment<'py>(
+    py: Python<'py>,
+    environment: Py<PyAny>,
+    config: &PyAgentConfig,
+    learn_cycles: Option<usize>,
+    eval_cycles: Option<usize>,
+    terminate_lifetime: usize,
+    explore_epsilon: f64,
+    explore_gamma: f64,
+    prev_action: u64,
+    check_finished: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    if explore_epsilon < 0.0 {
+        return Err(PyValueError::new_err(
+            "explore_epsilon must be >= 0.0 for run_agent_with_environment",
+        ));
+    }
+    if !(0.0..=1.0).contains(&explore_gamma) {
+        return Err(PyValueError::new_err(
+            "explore_gamma must be in [0, 1] for run_agent_with_environment",
+        ));
+    }
+    if config.inner.agent_actions == 0 {
+        return Err(PyValueError::new_err(
+            "AgentConfig.agent_actions must be >= 1 for run_agent_with_environment",
+        ));
+    }
+
+    let summary = py.detach(|| {
+        py_try(|| {
+            use infotheory::aixi::agent::Agent;
+            use infotheory::aixi::common::RandomGenerator;
+            use infotheory::aixi::environment::Environment;
+
+            let mut env = PyEnvironmentShim::new(environment);
+            let mut agent = Agent::new(config.inner.clone());
+
+            let observation_stream_len = config.inner.observation_stream_len.max(1);
+            let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
+                (Some(learn), Some(eval)) => (learn, eval),
+                (Some(learn), None) => (learn, 0usize),
+                (None, Some(eval)) => (terminate_lifetime, eval),
+                (None, None) => (terminate_lifetime, 0usize),
+            };
+
+            let mut learn_total_reward: i64 = 0;
+            let mut eval_total_reward: i64 = 0;
+            let mut prev_action = prev_action;
+            let mut obs_stream = env.drain_observations();
+            validate_observation_stream_len(observation_stream_len, obs_stream.len())?;
+            let mut reward = env.get_reward();
+            let mut explore_rng = RandomGenerator::new();
+
+            let learn_start = Instant::now();
+            let mut learn_cycles_completed = 0usize;
+            for t in 0..learn_cycles {
+                agent.model_update_percept_stream(&obs_stream, reward);
+                learn_total_reward += reward;
+
+                let explore_p = if explore_epsilon > 0.0 {
+                    explore_epsilon * explore_gamma.powi(t as i32)
+                } else {
+                    0.0
+                };
+
+                let action = if explore_p > 0.0 && explore_rng.gen_bool(explore_p.min(1.0)) {
+                    explore_rng.gen_range(config.inner.agent_actions) as u64
+                } else {
+                    agent.get_planned_action(&obs_stream, reward, prev_action)
+                };
+
+                agent.model_update_action_external(action);
+                let (next_obs_stream, next_reward, finished_opt) =
+                    env.perform_action_and_collect(action, check_finished);
+                validate_observation_stream_len(observation_stream_len, next_obs_stream.len())?;
+
+                obs_stream = next_obs_stream;
+                reward = next_reward;
+                prev_action = action;
+                learn_cycles_completed += 1;
+
+                if check_finished && finished_opt.unwrap_or(false) {
+                    break;
+                }
+            }
+            let learn_elapsed_seconds = learn_start.elapsed().as_secs_f64();
+
+            let eval_start = Instant::now();
+            let mut eval_cycles_completed = 0usize;
+            for _ in 0..eval_cycles {
+                agent.model_update_percept_stream(&obs_stream, reward);
+                eval_total_reward += reward;
+
+                let action = agent.get_planned_action(&obs_stream, reward, prev_action);
+                agent.model_update_action_external(action);
+
+                let (next_obs_stream, next_reward, finished_opt) =
+                    env.perform_action_and_collect(action, check_finished);
+                validate_observation_stream_len(observation_stream_len, next_obs_stream.len())?;
+
+                obs_stream = next_obs_stream;
+                reward = next_reward;
+                prev_action = action;
+                eval_cycles_completed += 1;
+
+                if check_finished && finished_opt.unwrap_or(false) {
+                    break;
+                }
+            }
+            let eval_elapsed_seconds = eval_start.elapsed().as_secs_f64();
+
+            let eval_average_reward = if eval_cycles_completed > 0 {
+                eval_total_reward as f64 / eval_cycles_completed as f64
+            } else {
+                0.0
+            };
+
+            let learn_cycles_per_second = if learn_elapsed_seconds > 0.0 {
+                learn_cycles_completed as f64 / learn_elapsed_seconds
+            } else {
+                0.0
+            };
+
+            let eval_cycles_per_second = if eval_elapsed_seconds > 0.0 {
+                eval_cycles_completed as f64 / eval_elapsed_seconds
+            } else {
+                0.0
+            };
+
+            Ok(AixiRunSummary {
+                learn_total_reward,
+                eval_total_reward,
+                eval_average_reward,
+                learn_cycles_completed,
+                eval_cycles_completed,
+                learn_elapsed_seconds,
+                eval_elapsed_seconds,
+                learn_cycles_per_second,
+                eval_cycles_per_second,
+                last_action: prev_action,
+                last_reward: reward,
+                last_observation_stream: obs_stream,
+            })
+        })
+    })?;
+
+    let out = PyDict::new(py);
+    out.set_item("learn_total_reward", summary.learn_total_reward)?;
+    out.set_item("eval_total_reward", summary.eval_total_reward)?;
+    out.set_item("eval_average_reward", summary.eval_average_reward)?;
+    out.set_item("learn_cycles_completed", summary.learn_cycles_completed)?;
+    out.set_item("eval_cycles_completed", summary.eval_cycles_completed)?;
+    out.set_item("learn_elapsed_seconds", summary.learn_elapsed_seconds)?;
+    out.set_item("eval_elapsed_seconds", summary.eval_elapsed_seconds)?;
+    out.set_item("learn_cycles_per_second", summary.learn_cycles_per_second)?;
+    out.set_item("eval_cycles_per_second", summary.eval_cycles_per_second)?;
+    out.set_item("last_action", summary.last_action)?;
+    out.set_item("last_reward", summary.last_reward)?;
+    out.set_item("last_observation_stream", summary.last_observation_stream)?;
+    Ok(out)
 }
 
 #[pyfunction]
@@ -4629,6 +4926,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_reward_offset_bits, m)?)?;
     m.add_function(wrap_pyfunction!(predictor_probe, m)?)?;
     m.add_function(wrap_pyfunction!(environment_probe, m)?)?;
+    m.add_function(wrap_pyfunction!(run_agent_with_environment, m)?)?;
     m.add_function(wrap_pyfunction!(search_with_simulator, m)?)?;
     m.add_function(wrap_pyfunction!(search, m)?)?;
     m.add_function(wrap_pyfunction!(vm_enabled, m)?)?;

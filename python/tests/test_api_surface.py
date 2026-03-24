@@ -55,6 +55,7 @@ def test_expected_public_surface_symbols_present():
         "mutual_information_bytes",
         "verify_chain_rule",
         "verify_ncd_bounds",
+        "run_agent_with_environment",
         "search_with_simulator",
         "search",
         "SearchGranularity",
