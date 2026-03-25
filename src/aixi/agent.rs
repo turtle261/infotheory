@@ -48,6 +48,10 @@ pub struct AgentConfig {
     ///
     /// Paper-compatible encoding shifts rewards by an offset so all encoded values are non-negative.
     pub reward_offset: Reward,
+    /// Optional deterministic RNG seed for planning/simulation behavior.
+    ///
+    /// When `None`, a fresh runtime-derived seed is used.
+    pub random_seed: Option<u64>,
     /// Path to the RWKV model weights (if using "rwkv").
     pub rwkv_model_path: Option<String>,
     /// Maximum Markov order for the ROSA model (if using "rosa").
@@ -138,6 +142,12 @@ impl Agent {
             _ => panic!("Unknown algorithm: {}", config.algorithm),
         };
 
+        let rng = if let Some(seed) = config.random_seed {
+            RandomGenerator::from_seed(seed)
+        } else {
+            RandomGenerator::new()
+        };
+
         Self {
             model,
             planner: Some(SearchTree::new()),
@@ -145,7 +155,7 @@ impl Agent {
             age: 0,
             total_reward: 0.0,
             action_bits,
-            rng: RandomGenerator::new(),
+            rng,
             obs_buffer: Vec::with_capacity(128),
             sym_buffer: Vec::with_capacity(64),
         }

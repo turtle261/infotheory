@@ -4,7 +4,9 @@
 //! for learning from history and predicting future symbols. Different implementations
 //! provide different complexity vs performance trade-offs.
 
+use crate::RateBackend;
 use crate::ctw::{ContextTree, FacContextTree};
+use crate::mixture::{DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor};
 use crate::rosaplus::{RosaPlus, RosaTx};
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip::{Compressor, Model, State};
@@ -14,9 +16,10 @@ use std::sync::Arc;
 
 /// Interface for an AIXI world model.
 ///
-/// A predictor must be able to update its internal state based on observed symbols,
-/// revert its state for Monte Carlo simulations, and provide probabilities for
-pub trait Predictor: Send + Sync {
+/// Predictors are mutated behind `&mut self` and cloned per worker during
+/// parallel MCTS. They only need `Send`, not `Sync`, which avoids unsound
+/// thread-sharing requirements for backends with thread-confined internals.
+pub trait Predictor: Send {
     /// Incorporates a new symbol into the model's training history.
     fn update(&mut self, sym: bool);
 
@@ -238,8 +241,6 @@ pub struct ZpaqPredictor {
     pending: Option<(u8, f64)>,
 }
 
-unsafe impl Sync for ZpaqPredictor {}
-
 impl ZpaqPredictor {
     /// Create a ZPAQ-backed predictor from a `method` and probability floor.
     pub fn new(method: String, min_prob: f64) -> Self {
@@ -311,17 +312,125 @@ impl Predictor for ZpaqPredictor {
     }
 
     fn boxed_clone(&self) -> Box<dyn Predictor> {
-        let mut model = ZpaqRateModel::new(self.method.clone(), self.min_prob);
-        if !self.history.is_empty() {
-            model.update_and_score(&self.history);
-        }
         Box::new(Self {
             method: self.method.clone(),
             min_prob: self.min_prob,
-            model,
+            model: self.model.clone(),
             history: self.history.clone(),
-            pending: None,
+            pending: self.pending,
         })
+    }
+}
+
+/// A generic bit-level predictor backed by any [`RateBackend`].
+///
+/// This adapter maps boolean symbols to bytes `{0,1}` and forwards them to the
+/// workspace-wide rate backend abstraction. It prioritizes correctness and
+/// backend coverage over rollback efficiency.
+pub struct RateBackendBitPredictor {
+    backend: RateBackend,
+    max_order: i64,
+    min_prob: f64,
+    predictor: RateBackendPredictor,
+}
+
+impl RateBackendBitPredictor {
+    /// Create a new bit-level adapter from a rate backend.
+    pub fn new(backend: RateBackend, max_order: i64) -> Result<Self, String> {
+        Self::new_with_min_prob(backend, max_order, DEFAULT_MIN_PROB)
+    }
+
+    /// Create a new bit-level adapter with an explicit probability floor.
+    pub fn new_with_min_prob(
+        backend: RateBackend,
+        max_order: i64,
+        min_prob: f64,
+    ) -> Result<Self, String> {
+        if rate_backend_contains_zpaq(&backend) {
+            return Err(
+                "RateBackendBitPredictor does not support zpaq backends; use a non-zpaq rate_backend"
+                    .to_string(),
+            );
+        }
+        let mut predictor =
+            RateBackendPredictor::from_backend(backend.clone(), max_order, min_prob);
+        predictor
+            .begin_stream(None)
+            .map_err(|err| format!("failed to start RateBackend predictor stream: {err}"))?;
+        Ok(Self {
+            backend,
+            max_order,
+            min_prob,
+            predictor,
+        })
+    }
+
+    #[inline(always)]
+    fn bit_to_byte(sym: bool) -> u8 {
+        if sym { 1u8 } else { 0u8 }
+    }
+
+    fn clone_state(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            max_order: self.max_order,
+            min_prob: self.min_prob,
+            predictor: self.predictor.clone(),
+        }
+    }
+}
+
+fn rate_backend_contains_zpaq(backend: &RateBackend) -> bool {
+    match backend {
+        RateBackend::Zpaq { .. } => true,
+        RateBackend::Mixture { spec } => spec
+            .experts
+            .iter()
+            .any(|expert| rate_backend_contains_zpaq(&expert.backend)),
+        RateBackend::Calibrated { spec } => rate_backend_contains_zpaq(&spec.base),
+        _ => false,
+    }
+}
+
+impl Predictor for RateBackendBitPredictor {
+    fn update(&mut self, sym: bool) {
+        self.predictor.update(Self::bit_to_byte(sym));
+    }
+
+    fn update_history(&mut self, sym: bool) {
+        self.predictor.update_frozen(Self::bit_to_byte(sym));
+    }
+
+    fn revert(&mut self) {
+        panic!(
+            "RateBackendBitPredictor does not support generic rollback; callers must use cloned temporary predictors"
+        );
+    }
+
+    fn pop_history(&mut self) {
+        panic!(
+            "RateBackendBitPredictor does not support generic rollback; callers must use cloned temporary predictors"
+        );
+    }
+
+    fn predict_prob(&mut self, sym: bool) -> f64 {
+        let p = self.predictor.log_prob(Self::bit_to_byte(sym)).exp();
+        if p.is_finite() {
+            p.clamp(self.min_prob, 1.0 - self.min_prob)
+        } else {
+            0.5
+        }
+    }
+
+    fn model_name(&self) -> String {
+        format!(
+            "RateBackendBits({})",
+            RateBackendPredictor::default_name(&self.backend, self.max_order)
+        )
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(self.clone_state())
     }
 }
 

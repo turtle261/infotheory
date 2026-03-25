@@ -3776,13 +3776,16 @@ fn run_agent_with_environment<'py>(
             let mut obs_stream = env.drain_observations();
             validate_observation_stream_len(observation_stream_len, obs_stream.len())?;
             let mut reward = env.get_reward();
-            let mut explore_rng = RandomGenerator::new();
+            let mut explore_rng = if let Some(seed) = config.inner.random_seed {
+                RandomGenerator::from_seed(seed).fork_with(0x4558504c4f52455f)
+            } else {
+                RandomGenerator::new()
+            };
 
             let learn_start = Instant::now();
             let mut learn_cycles_completed = 0usize;
             for t in 0..learn_cycles {
                 agent.model_update_percept_stream(&obs_stream, reward);
-                learn_total_reward += reward;
 
                 let explore_p = if explore_epsilon > 0.0 {
                     explore_epsilon * explore_gamma.powi(t as i32)
@@ -3804,6 +3807,7 @@ fn run_agent_with_environment<'py>(
                 obs_stream = next_obs_stream;
                 reward = next_reward;
                 prev_action = action;
+                learn_total_reward += reward;
                 learn_cycles_completed += 1;
 
                 if check_finished && finished_opt.unwrap_or(false) {
@@ -3816,7 +3820,6 @@ fn run_agent_with_environment<'py>(
             let mut eval_cycles_completed = 0usize;
             for _ in 0..eval_cycles {
                 agent.model_update_percept_stream(&obs_stream, reward);
-                eval_total_reward += reward;
 
                 let action = agent.get_planned_action(&obs_stream, reward, prev_action);
                 agent.model_update_action_external(action);
@@ -3828,6 +3831,7 @@ fn run_agent_with_environment<'py>(
                 obs_stream = next_obs_stream;
                 reward = next_reward;
                 prev_action = action;
+                eval_total_reward += reward;
                 eval_cycles_completed += 1;
 
                 if check_finished && finished_opt.unwrap_or(false) {
@@ -3865,6 +3869,169 @@ fn run_agent_with_environment<'py>(
                 learn_cycles_per_second,
                 eval_cycles_per_second,
                 last_action: prev_action,
+                last_reward: reward,
+                last_observation_stream: obs_stream,
+            })
+        })
+    })?;
+
+    let out = PyDict::new(py);
+    out.set_item("learn_total_reward", summary.learn_total_reward)?;
+    out.set_item("eval_total_reward", summary.eval_total_reward)?;
+    out.set_item("eval_average_reward", summary.eval_average_reward)?;
+    out.set_item("learn_cycles_completed", summary.learn_cycles_completed)?;
+    out.set_item("eval_cycles_completed", summary.eval_cycles_completed)?;
+    out.set_item("learn_elapsed_seconds", summary.learn_elapsed_seconds)?;
+    out.set_item("eval_elapsed_seconds", summary.eval_elapsed_seconds)?;
+    out.set_item("learn_cycles_per_second", summary.learn_cycles_per_second)?;
+    out.set_item("eval_cycles_per_second", summary.eval_cycles_per_second)?;
+    out.set_item("last_action", summary.last_action)?;
+    out.set_item("last_reward", summary.last_reward)?;
+    out.set_item("last_observation_stream", summary.last_observation_stream)?;
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    environment,
+    config,
+    learn_cycles=None,
+    eval_cycles=None,
+    terminate_lifetime=20,
+    explore_epsilon=0.0,
+    explore_gamma=1.0,
+    check_finished=false
+))]
+fn run_aiqi_with_environment<'py>(
+    py: Python<'py>,
+    environment: Py<PyAny>,
+    config: &PyAiqiConfig,
+    learn_cycles: Option<usize>,
+    eval_cycles: Option<usize>,
+    terminate_lifetime: usize,
+    explore_epsilon: f64,
+    explore_gamma: f64,
+    check_finished: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    if explore_epsilon < 0.0 {
+        return Err(PyValueError::new_err(
+            "explore_epsilon must be >= 0.0 for run_aiqi_with_environment",
+        ));
+    }
+    if !(0.0..=1.0).contains(&explore_gamma) {
+        return Err(PyValueError::new_err(
+            "explore_gamma must be in [0, 1] for run_aiqi_with_environment",
+        ));
+    }
+
+    let summary = py.detach(|| {
+        py_try(|| {
+            use infotheory::aixi::aiqi::AiqiAgent;
+            use infotheory::aixi::environment::Environment;
+
+            let mut env = PyEnvironmentShim::new(environment);
+            let mut agent = AiqiAgent::new(config.inner.clone()).map_err(PyValueError::new_err)?;
+
+            let observation_stream_len = config.inner.observation_stream_len.max(1);
+            let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
+                (Some(learn), Some(eval)) => (learn, eval),
+                (Some(learn), None) => (learn, 0usize),
+                (None, Some(eval)) => (terminate_lifetime, eval),
+                (None, None) => (terminate_lifetime, 0usize),
+            };
+
+            let mut learn_total_reward: i64 = 0;
+            let mut eval_total_reward: i64 = 0;
+            let mut last_action = 0u64;
+
+            let mut obs_stream = env.drain_observations();
+            validate_observation_stream_len(observation_stream_len, obs_stream.len())?;
+            let mut reward = env.get_reward();
+
+            let learn_start = Instant::now();
+            let mut learn_cycles_completed = 0usize;
+            for t in 0..learn_cycles {
+                let extra_explore_p = if explore_epsilon > 0.0 {
+                    (explore_epsilon * explore_gamma.powi(t as i32)).min(1.0)
+                } else {
+                    0.0
+                };
+                let action = agent.get_planned_action_with_extra_exploration(extra_explore_p);
+
+                let (next_obs_stream, next_reward, finished_opt) =
+                    env.perform_action_and_collect(action, check_finished);
+                validate_observation_stream_len(observation_stream_len, next_obs_stream.len())?;
+
+                agent
+                    .observe_transition(action, &next_obs_stream, next_reward)
+                    .map_err(PyValueError::new_err)?;
+
+                obs_stream = next_obs_stream;
+                reward = next_reward;
+                last_action = action;
+                learn_total_reward += reward;
+                learn_cycles_completed += 1;
+
+                if check_finished && finished_opt.unwrap_or(false) {
+                    break;
+                }
+            }
+            let learn_elapsed_seconds = learn_start.elapsed().as_secs_f64();
+
+            let eval_start = Instant::now();
+            let mut eval_cycles_completed = 0usize;
+            for _ in 0..eval_cycles {
+                let action = agent.get_planned_action();
+
+                let (next_obs_stream, next_reward, finished_opt) =
+                    env.perform_action_and_collect(action, check_finished);
+                validate_observation_stream_len(observation_stream_len, next_obs_stream.len())?;
+
+                agent
+                    .observe_transition(action, &next_obs_stream, next_reward)
+                    .map_err(PyValueError::new_err)?;
+
+                obs_stream = next_obs_stream;
+                reward = next_reward;
+                last_action = action;
+                eval_total_reward += reward;
+                eval_cycles_completed += 1;
+
+                if check_finished && finished_opt.unwrap_or(false) {
+                    break;
+                }
+            }
+            let eval_elapsed_seconds = eval_start.elapsed().as_secs_f64();
+
+            let eval_average_reward = if eval_cycles_completed > 0 {
+                eval_total_reward as f64 / eval_cycles_completed as f64
+            } else {
+                0.0
+            };
+
+            let learn_cycles_per_second = if learn_elapsed_seconds > 0.0 {
+                learn_cycles_completed as f64 / learn_elapsed_seconds
+            } else {
+                0.0
+            };
+
+            let eval_cycles_per_second = if eval_elapsed_seconds > 0.0 {
+                eval_cycles_completed as f64 / eval_elapsed_seconds
+            } else {
+                0.0
+            };
+
+            Ok(AixiRunSummary {
+                learn_total_reward,
+                eval_total_reward,
+                eval_average_reward,
+                learn_cycles_completed,
+                eval_cycles_completed,
+                learn_elapsed_seconds,
+                eval_elapsed_seconds,
+                learn_cycles_per_second,
+                eval_cycles_per_second,
+                last_action,
                 last_reward: reward,
                 last_observation_stream: obs_stream,
             })
@@ -3956,6 +4123,12 @@ struct PyAgentConfig {
     inner: infotheory::aixi::agent::AgentConfig,
 }
 
+#[pyclass(name = "AiqiConfig", from_py_object)]
+#[derive(Clone)]
+struct PyAiqiConfig {
+    inner: infotheory::aixi::aiqi::AiqiConfig,
+}
+
 #[pymethods]
 impl PyAgentConfig {
     #[new]
@@ -3975,6 +4148,7 @@ impl PyAgentConfig {
         min_reward=-128,
         max_reward=127,
         reward_offset=128,
+        random_seed=None,
         rwkv_model_path=None,
         rosa_max_order=None,
         zpaq_method=None
@@ -3994,6 +4168,7 @@ impl PyAgentConfig {
         min_reward: i64,
         max_reward: i64,
         reward_offset: i64,
+        random_seed: Option<u64>,
         rwkv_model_path: Option<String>,
         rosa_max_order: Option<i64>,
         zpaq_method: Option<String>,
@@ -4016,6 +4191,85 @@ impl PyAgentConfig {
                 min_reward,
                 max_reward,
                 reward_offset,
+                random_seed,
+                rwkv_model_path,
+                rosa_max_order,
+                zpaq_method,
+            },
+        }
+    }
+}
+
+#[pymethods]
+impl PyAiqiConfig {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        algorithm="ac-ctw".to_string(),
+        ct_depth=16,
+        observation_bits=8,
+        observation_stream_len=1,
+        reward_bits=8,
+        agent_actions=2,
+        min_reward=-128,
+        max_reward=127,
+        reward_offset=128,
+        discount_gamma=0.99,
+        return_horizon=6,
+        return_bins=32,
+        augmentation_period=None,
+        history_prune_keep_steps=None,
+        baseline_exploration=0.01,
+        random_seed=None,
+        rate_backend=None,
+        rate_backend_max_order=20,
+        rwkv_model_path=None,
+        rosa_max_order=None,
+        zpaq_method=None
+    ))]
+    fn new(
+        algorithm: String,
+        ct_depth: usize,
+        observation_bits: usize,
+        observation_stream_len: usize,
+        reward_bits: usize,
+        agent_actions: usize,
+        min_reward: i64,
+        max_reward: i64,
+        reward_offset: i64,
+        discount_gamma: f64,
+        return_horizon: usize,
+        return_bins: usize,
+        augmentation_period: Option<usize>,
+        history_prune_keep_steps: Option<usize>,
+        baseline_exploration: f64,
+        random_seed: Option<u64>,
+        rate_backend: Option<&PyRateBackend>,
+        rate_backend_max_order: i64,
+        rwkv_model_path: Option<String>,
+        rosa_max_order: Option<i64>,
+        zpaq_method: Option<String>,
+    ) -> Self {
+        Self {
+            inner: infotheory::aixi::aiqi::AiqiConfig {
+                algorithm,
+                ct_depth,
+                observation_bits,
+                observation_stream_len,
+                reward_bits,
+                agent_actions,
+                min_reward,
+                max_reward,
+                reward_offset,
+                discount_gamma,
+                return_horizon,
+                return_bins,
+                augmentation_period: augmentation_period.unwrap_or(return_horizon),
+                history_prune_keep_steps,
+                baseline_exploration,
+                random_seed,
+                rate_backend: rate_backend.map(|rb| rb.inner.clone()),
+                rate_backend_max_order,
                 rwkv_model_path,
                 rosa_max_order,
                 zpaq_method,
@@ -4067,6 +4321,50 @@ impl PyAgent {
 
     fn model_update_action_external(&mut self, action: u64) {
         self.inner.model_update_action_external(action)
+    }
+}
+
+#[pyclass(name = "AiqiAgent")]
+struct PyAiqiAgent {
+    inner: infotheory::aixi::aiqi::AiqiAgent,
+}
+
+#[pymethods]
+impl PyAiqiAgent {
+    #[new]
+    fn new(config: &PyAiqiConfig) -> PyResult<Self> {
+        let inner = infotheory::aixi::aiqi::AiqiAgent::new(config.inner.clone())
+            .map_err(PyValueError::new_err)?;
+        Ok(Self { inner })
+    }
+
+    fn steps_observed(&self) -> usize {
+        self.inner.steps_observed()
+    }
+
+    fn num_actions(&self) -> usize {
+        self.inner.num_actions()
+    }
+
+    fn get_planned_action(&mut self) -> u64 {
+        self.inner.get_planned_action()
+    }
+
+    #[pyo3(signature = (extra_exploration=0.0))]
+    fn get_planned_action_with_extra_exploration(&mut self, extra_exploration: f64) -> u64 {
+        self.inner
+            .get_planned_action_with_extra_exploration(extra_exploration)
+    }
+
+    fn observe_transition(
+        &mut self,
+        action: u64,
+        observations: Vec<u64>,
+        reward: i64,
+    ) -> PyResult<()> {
+        self.inner
+            .observe_transition(action, &observations, reward)
+            .map_err(PyValueError::new_err)
     }
 }
 
@@ -4794,7 +5092,9 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyObservationKeyMode>()?;
     m.add_class::<PyRandomGenerator>()?;
     m.add_class::<PyAgentConfig>()?;
+    m.add_class::<PyAiqiConfig>()?;
     m.add_class::<PyAgent>()?;
+    m.add_class::<PyAiqiAgent>()?;
     m.add_class::<PyCtwPredictor>()?;
     m.add_class::<PyFacCtwPredictor>()?;
     m.add_class::<PyRosaPredictor>()?;
@@ -4927,6 +5227,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(predictor_probe, m)?)?;
     m.add_function(wrap_pyfunction!(environment_probe, m)?)?;
     m.add_function(wrap_pyfunction!(run_agent_with_environment, m)?)?;
+    m.add_function(wrap_pyfunction!(run_aiqi_with_environment, m)?)?;
     m.add_function(wrap_pyfunction!(search_with_simulator, m)?)?;
     m.add_function(wrap_pyfunction!(search, m)?)?;
     m.add_function(wrap_pyfunction!(vm_enabled, m)?)?;

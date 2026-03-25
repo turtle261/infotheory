@@ -26,6 +26,7 @@ fn mk_agent(discount_gamma: f64, horizon: usize, min_reward: i64, max_reward: i6
         min_reward,
         max_reward,
         reward_offset: 0,
+        random_seed: Some(13),
         rwkv_model_path: None,
         rosa_max_order: None,
         zpaq_method: None,

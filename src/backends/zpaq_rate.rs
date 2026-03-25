@@ -181,6 +181,26 @@ mod imp {
         }
     }
 
+    impl Clone for ZpaqRateModel {
+        fn clone(&self) -> Self {
+            let mut cloned = Self::new(self.method.clone(), self.min_prob);
+            if !self.history.is_empty() {
+                let _ = cloned.update_and_score(&self.history);
+            }
+            // Preserve speculative pending state so clone() is state-equivalent
+            // even when called between log_prob() and update().
+            if let Some(symbol) = self.pending_symbol {
+                let bits = cloned.encode_bits(symbol);
+                cloned.pending_symbol = Some(symbol);
+                cloned.pending_bits = bits;
+            } else {
+                cloned.pending_symbol = None;
+                cloned.pending_bits = 0.0;
+            }
+            cloned
+        }
+    }
+
     /// Validate that `method` is streamable and accepted by the ZPAQ backend.
     pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
         StreamingCompressor::new(method)
@@ -236,11 +256,33 @@ mod imp {
             let lp_b2 = model_b.log_prob(next_sym);
             assert!((lp_a2 - lp_b2).abs() < 1e-9, "lp_a2={lp_a2} lp_b2={lp_b2}");
         }
+
+        #[test]
+        fn zpaq_clone_preserves_pending_prediction_state() {
+            let mut model_a = ZpaqRateModel::new("1", 1e-9);
+            for &b in b"clone preserves pending state" {
+                model_a.update(b);
+            }
+
+            let probe = b'x';
+            let lp_a = model_a.log_prob(probe);
+            let mut model_b = model_a.clone();
+            let lp_b = model_b.log_prob(probe);
+            assert!((lp_a - lp_b).abs() < 1e-9, "lp_a={lp_a} lp_b={lp_b}");
+
+            model_a.update(probe);
+            model_b.update(probe);
+            let next = b'y';
+            let lp_a2 = model_a.log_prob(next);
+            let lp_b2 = model_b.log_prob(next);
+            assert!((lp_a2 - lp_b2).abs() < 1e-9, "lp_a2={lp_a2} lp_b2={lp_b2}");
+        }
     }
 }
 
 #[cfg(not(feature = "backend-zpaq"))]
 mod imp {
+    #[derive(Clone)]
     pub struct ZpaqRateModel {
         min_log_prob: f64,
     }

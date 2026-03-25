@@ -30,6 +30,7 @@
 //! See `print_usage` for details on supported primitives.
 
 use infotheory::aixi::agent::{Agent, AgentConfig};
+use infotheory::aixi::aiqi::{AiqiAgent, AiqiConfig};
 use infotheory::aixi::common::{ObservationKeyMode, RandomGenerator};
 use infotheory::aixi::environment::{
     BiasedRockPaperScissor, CoinFlip, CtwTest, Environment, ExtendedTiger, KuhnPoker, TicTacToe,
@@ -830,7 +831,6 @@ fn parse_nyx_environment_config(
     })
 }
 
-#[cfg(feature = "vm")]
 fn parse_vm_stats_backend(
     cfg: &serde_json::Value,
     root: &serde_json::Value,
@@ -1042,7 +1042,6 @@ fn parse_vm_stats_backend(
     }
 }
 
-#[cfg(feature = "vm")]
 fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBackend> {
     let algo = root["algorithm"].as_str().unwrap_or("ctw");
     let ct_depth = root["ct_depth"].as_u64().unwrap_or(20) as usize;
@@ -1447,6 +1446,18 @@ fn validate_obs_stream_len(expected: usize, actual: usize) -> anyhow::Result<()>
         ));
     }
     Ok(())
+}
+
+fn aiqi_backend_label(config: &AiqiConfig) -> String {
+    if let Some(rate_backend) = &config.rate_backend {
+        let name = infotheory::mixture::RateBackendPredictor::default_name(
+            rate_backend,
+            config.rate_backend_max_order,
+        );
+        format!("rate_backend={name}")
+    } else {
+        format!("algorithm={}", config.algorithm)
+    }
 }
 
 #[cfg(feature = "vm")]
@@ -2283,6 +2294,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     let v: serde_json::Value = serde_json::from_str(&content)?;
+    let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
 
     let env_name = v["environment"].as_str().unwrap_or("coin-flip");
     let mut env: Box<dyn Environment> = match env_name {
@@ -2310,7 +2322,6 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
                 let observation_bits = v["observation_bits"].as_u64().unwrap_or(16) as usize;
                 let reward_bits = v["reward_bits"].as_u64().unwrap_or(8) as usize;
                 let agent_horizon = v["agent_horizon"].as_u64().unwrap_or(3) as usize;
-                let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
                 let vm_cfg = parse_nyx_environment_config(
                     &v,
                     observation_bits,
@@ -2377,6 +2388,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     let reward_offset = v["reward_offset"]
         .as_i64()
         .unwrap_or_else(|| (-min_reward).max(0));
+    let run_random_seed = v["random_seed"].as_u64().or_else(|| v["rng_seed"].as_u64());
     let discount_gamma = v["discount_gamma"].as_f64().unwrap_or(1.0);
     if !(0.0..=1.0).contains(&discount_gamma) {
         return Err(anyhow::anyhow!(
@@ -2385,6 +2397,213 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         ));
     }
 
+    let planner = v["planner"]
+        .as_str()
+        .or_else(|| v["solver"].as_str())
+        .unwrap_or("mc-aixi");
+    let planner_norm = planner.to_ascii_lowercase();
+    if !matches!(planner_norm.as_str(), "mc-aixi" | "aiqi") {
+        return Err(anyhow::anyhow!(
+            "Unknown planner/solver '{}'. Supported values: mc-aixi, aiqi",
+            planner
+        ));
+    }
+    if planner_norm.as_str() == "aiqi" {
+        let aiqi_random_seed = v["aiqi_random_seed"].as_u64().or(run_random_seed);
+        let aiqi_rate_backend = if !v["aiqi_rate_backend"].is_null() {
+            Some(parse_vm_stats_backend(
+                &v["aiqi_rate_backend"],
+                &v,
+                config_dir,
+            )?)
+        } else if !v["rate_backend"].is_null() {
+            Some(parse_vm_stats_backend(&v["rate_backend"], &v, config_dir)?)
+        } else {
+            None
+        };
+
+        let aiqi_discount_gamma = if v["discount_gamma"].is_null() {
+            0.99
+        } else {
+            discount_gamma
+        };
+
+        let aiqi_config = AiqiConfig {
+            algorithm: v["algorithm"].as_str().unwrap_or("ac-ctw").to_string(),
+            ct_depth: v["ct_depth"].as_u64().unwrap_or(20) as usize,
+            observation_bits,
+            observation_stream_len,
+            reward_bits,
+            agent_actions,
+            min_reward,
+            max_reward,
+            reward_offset,
+            discount_gamma: aiqi_discount_gamma,
+            return_horizon: v["return_horizon"]
+                .as_u64()
+                .or_else(|| v["agent_horizon"].as_u64())
+                .unwrap_or(3) as usize,
+            return_bins: v["return_bins"]
+                .as_u64()
+                .or_else(|| v["aiqi_bins"].as_u64())
+                .unwrap_or(16) as usize,
+            augmentation_period: v["augmentation_period"]
+                .as_u64()
+                .or_else(|| v["aiqi_period"].as_u64())
+                .or_else(|| v["return_horizon"].as_u64())
+                .or_else(|| v["agent_horizon"].as_u64())
+                .unwrap_or(3) as usize,
+            history_prune_keep_steps: v["history_prune_keep_steps"]
+                .as_u64()
+                .or_else(|| v["aiqi_history_prune_keep_steps"].as_u64())
+                .map(|n| n as usize),
+            baseline_exploration: v["baseline_exploration"]
+                .as_f64()
+                .or_else(|| v["tau"].as_f64())
+                .unwrap_or(0.01),
+            random_seed: aiqi_random_seed,
+            rate_backend: aiqi_rate_backend,
+            rate_backend_max_order: v["rate_backend_max_order"]
+                .as_i64()
+                .or_else(|| v["max_order"].as_i64())
+                .or_else(|| v["rosa_max_order"].as_i64())
+                .unwrap_or(20),
+            rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
+            rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
+            zpaq_method: v["zpaq_method"].as_str().map(|s| s.to_string()),
+        };
+        let aiqi_backend_desc = aiqi_backend_label(&aiqi_config);
+        let mut aiqi = AiqiAgent::new(aiqi_config).map_err(|e| anyhow::anyhow!(e))?;
+
+        println!(
+            "AIQI initialized ({}) for {} environment.",
+            aiqi_backend_desc, env_name
+        );
+
+        let learn_cycles = v["learn_cycles"].as_u64().map(|n| n as usize);
+        let eval_cycles = v["eval_cycles"].as_u64().map(|n| n as usize);
+        let cycles = v["terminate-lifetime"].as_u64().unwrap_or(20) as usize;
+
+        let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
+            (Some(l), Some(e)) => (l, e),
+            (Some(l), None) => (l, 0usize),
+            (None, Some(e)) => (cycles, e),
+            (None, None) => (cycles, 0usize),
+        };
+
+        let mut obs_stream = env.drain_observations();
+        validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
+        let mut rew = env.get_reward();
+        let mut learn_total_reward: i64 = 0;
+        let mut eval_total_reward: i64 = 0;
+
+        let explore_epsilon = v["explore_epsilon"].as_f64().unwrap_or(0.0);
+        let explore_gamma = v["explore_gamma"].as_f64().unwrap_or(1.0);
+
+        let mut trace_logger = AixiRunLogger::new(&v)?;
+
+        let learn_start = Instant::now();
+        for t in 0..learn_cycles {
+            let extra_explore_p = if explore_epsilon > 0.0 {
+                (explore_epsilon * explore_gamma.powi(t as i32)).min(1.0)
+            } else {
+                0.0
+            };
+
+            let action = aiqi.get_planned_action_with_extra_exploration(extra_explore_p);
+            if log_every > 0 && t % log_every == 0 {
+                println!(
+                    "Cycle {}: Action={} Obs={:?} Rew={}",
+                    t, action, obs_stream, rew
+                );
+            }
+
+            if let Some(l) = trace_logger.as_mut() {
+                let action_bits = env.get_action_bits();
+                l.log_action(action, action_bits)?;
+            }
+
+            env.perform_action(action);
+            obs_stream = env.drain_observations();
+            validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
+            rew = env.get_reward();
+
+            if let Some(l) = trace_logger.as_mut() {
+                l.log_percept(
+                    &obs_stream,
+                    rew,
+                    observation_bits,
+                    reward_bits,
+                    reward_offset,
+                )?;
+                l.next_step()?;
+            }
+
+            aiqi.observe_transition(action, &obs_stream, rew)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            learn_total_reward += rew;
+        }
+
+        if perf && learn_cycles > 0 {
+            let elapsed = learn_start.elapsed().as_secs_f64().max(1e-9);
+            let cps = learn_cycles as f64 / elapsed;
+            println!("Learn cycles/s: {:.2}", cps);
+        }
+
+        if eval_cycles > 0 {
+            let eval_start = Instant::now();
+            for t in 0..eval_cycles {
+                let step = learn_cycles + t;
+                let action = aiqi.get_planned_action();
+                if log_every > 0 && step % log_every == 0 {
+                    println!(
+                        "Cycle {}: Action={} Obs={:?} Rew={}",
+                        step, action, obs_stream, rew
+                    );
+                }
+
+                if let Some(l) = trace_logger.as_mut() {
+                    let action_bits = env.get_action_bits();
+                    l.log_action(action, action_bits)?;
+                }
+
+                env.perform_action(action);
+                obs_stream = env.drain_observations();
+                validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
+                rew = env.get_reward();
+
+                if let Some(l) = trace_logger.as_mut() {
+                    l.log_percept(
+                        &obs_stream,
+                        rew,
+                        observation_bits,
+                        reward_bits,
+                        reward_offset,
+                    )?;
+                    l.next_step()?;
+                }
+
+                aiqi.observe_transition(action, &obs_stream, rew)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                eval_total_reward += rew;
+            }
+
+            if perf && eval_cycles > 0 {
+                let elapsed = eval_start.elapsed().as_secs_f64().max(1e-9);
+                let cps = eval_cycles as f64 / elapsed;
+                println!("Eval cycles/s: {:.2}", cps);
+            }
+
+            let avg = (eval_total_reward as f64) / (eval_cycles as f64);
+            println!("Eval Total Reward: {}", eval_total_reward);
+            println!("Eval Average Reward per Cycle: {:.6}", avg);
+        }
+
+        println!("Total Reward: {}", learn_total_reward);
+        return Ok(());
+    }
+
+    let mcaixi_random_seed = v["mcaixi_random_seed"].as_u64().or(run_random_seed);
     let config = AgentConfig {
         algorithm: v["algorithm"].as_str().unwrap_or("ctw").to_string(),
         ct_depth: v["ct_depth"].as_u64().unwrap_or(20) as usize,
@@ -2400,6 +2619,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         min_reward,
         max_reward,
         reward_offset,
+        random_seed: mcaixi_random_seed,
         rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
         rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
         zpaq_method: v["zpaq_method"].as_str().map(|s| s.to_string()),
@@ -2432,7 +2652,11 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
 
     let explore_epsilon = v["explore_epsilon"].as_f64().unwrap_or(0.0);
     let explore_gamma = v["explore_gamma"].as_f64().unwrap_or(1.0);
-    let mut explore_rng = RandomGenerator::new();
+    let mut explore_rng = if let Some(seed) = mcaixi_random_seed {
+        RandomGenerator::from_seed(seed).fork_with(0x4558504c4f52455f)
+    } else {
+        RandomGenerator::new()
+    };
 
     // Optional trace logger: can emit a RWKV-friendly stream (0/1 bytes) and/or JSONL metadata.
     // NOTE: The bits are emitted in the same order the agent consumes them:
@@ -2454,7 +2678,6 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             )?;
         }
         agent.model_update_percept_stream(&obs_stream, rew);
-        total_reward += rew;
 
         let explore_p = if explore_epsilon > 0.0 {
             explore_epsilon * explore_gamma.powi(t as i32)
@@ -2482,6 +2705,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         obs_repr = agent.observation_repr_from_stream(&obs_stream);
         rew = env.get_reward();
         prev_action = action;
+        total_reward += rew;
 
         if let Some(l) = trace_logger.as_mut() {
             l.next_step()?;
@@ -2512,7 +2736,6 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
                 )?;
             }
             agent.model_update_percept_stream(&obs_stream, rew);
-            eval_total_reward += rew;
 
             let action = agent.get_planned_action(&obs_stream, rew, prev_action);
             if log_every > 0 && step % log_every == 0 {
@@ -2530,6 +2753,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             obs_repr = agent.observation_repr_from_stream(&obs_stream);
             rew = env.get_reward();
             prev_action = action;
+            eval_total_reward += rew;
 
             if let Some(l) = trace_logger.as_mut() {
                 l.next_step()?;

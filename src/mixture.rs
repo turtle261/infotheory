@@ -93,7 +93,31 @@ fn logsumexp_weights(experts: &[ExpertState]) -> f64 {
 }
 
 /// Trait for online byte-level predictors that expose per-symbol log-probabilities.
-pub trait OnlineBytePredictor: Send {
+pub trait OnlineBytePredictorClone {
+    /// Clone this predictor as a trait object.
+    ///
+    /// This supports `Clone` for `Box<dyn OnlineBytePredictor>` via type erasure,
+    /// so mixture experts can be duplicated without knowing their concrete type.
+    fn clone_box(&self) -> Box<dyn OnlineBytePredictor>;
+}
+
+impl<T> OnlineBytePredictorClone for T
+where
+    T: 'static + OnlineBytePredictor + Clone,
+{
+    fn clone_box(&self) -> Box<dyn OnlineBytePredictor> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn OnlineBytePredictor> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
+/// Trait for online byte-level predictors that expose per-symbol log-probabilities.
+pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     /// Optional stream-start hook.
     ///
     /// Predictors that require total symbol count (for example percent-based
@@ -270,6 +294,7 @@ fn fill_fac_tree_log_probs(
 
 /// A concrete online predictor backed by a `RateBackend` configuration.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum RateBackendPredictor {
     /// ROSA-Plus online suffix automaton.
     Rosa {
@@ -1307,6 +1332,7 @@ impl ExpertConfig {
     }
 }
 
+#[derive(Clone)]
 struct ExpertState {
     name: String,
     log_weight: f64,
@@ -1353,6 +1379,7 @@ impl ExpertState {
 }
 
 /// Exponential-weights Bayes mixture (log-loss Hedge).
+#[derive(Clone)]
 pub struct BayesMixture {
     experts: Vec<ExpertState>,
     scratch_logps: Vec<f64>,
@@ -1517,6 +1544,7 @@ impl BayesMixture {
 /// Exponential-weights Bayes mixture with exponential forgetting on weights.
 ///
 /// This is a non-stationary control: weights are discounted each step by `decay`.
+#[derive(Clone)]
 pub struct FadingBayesMixture {
     experts: Vec<ExpertState>,
     decay: f64,
@@ -1665,6 +1693,7 @@ impl FadingBayesMixture {
 }
 
 /// Switching mixture: allows occasional switches between experts.
+#[derive(Clone)]
 pub struct SwitchingMixture {
     experts: Vec<ExpertState>,
     log_prior: Vec<f64>,
@@ -1854,6 +1883,7 @@ impl SwitchingMixture {
 }
 
 /// MDL-style selector: predicts with the current best expert (by cumulative loss).
+#[derive(Clone)]
 pub struct MdlSelector {
     experts: Vec<ExpertState>,
     scratch_logps: Vec<f64>,
@@ -1872,6 +1902,7 @@ pub struct MdlSelector {
 /// 1) context-local first-stage expert gates,
 /// 2) context-local second-stage meta-gate over stage-1 outputs,
 /// 3) per-symbol SGD updates with optional tiny-error skip.
+#[derive(Clone)]
 pub struct NeuralMixture {
     experts: Vec<ExpertState>,
     neural: NeuralMixCore,
@@ -2291,6 +2322,7 @@ impl MdlSelector {
 
 /// Runtime wrapper over concrete mixture strategies.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum MixtureRuntime {
     /// Bayes mixture.
     Bayes(BayesMixture),
@@ -2430,6 +2462,7 @@ mod tests {
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
 
+    #[derive(Clone)]
     struct AlwaysPredict {
         byte: u8,
     }
@@ -2568,6 +2601,7 @@ mod tests {
         assert!(late_avg < 0.35, "late_avg={late_avg}");
     }
 
+    #[derive(Clone)]
     struct CountingPredict {
         calls: Arc<AtomicUsize>,
     }
@@ -2581,6 +2615,7 @@ mod tests {
         fn update(&mut self, _symbol: u8) {}
     }
 
+    #[derive(Clone)]
     struct CountingFillPredict {
         log_calls: Arc<AtomicUsize>,
         fill_calls: Arc<AtomicUsize>,
@@ -2601,6 +2636,7 @@ mod tests {
         fn update(&mut self, _symbol: u8) {}
     }
 
+    #[derive(Clone)]
     struct BeginAwarePredict {
         seen_total: Arc<AtomicU64>,
         began: bool,
