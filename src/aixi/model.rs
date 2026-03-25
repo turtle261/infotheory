@@ -4,10 +4,10 @@
 //! for learning from history and predicting future symbols. Different implementations
 //! provide different complexity vs performance trade-offs.
 
+use crate::RateBackend;
 use crate::ctw::{ContextTree, FacContextTree};
 use crate::mixture::{DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor};
 use crate::rosaplus::{RosaPlus, RosaTx};
-use crate::RateBackend;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip::{Compressor, Model, State};
 use crate::zpaq_rate::ZpaqRateModel;
@@ -16,9 +16,10 @@ use std::sync::Arc;
 
 /// Interface for an AIXI world model.
 ///
-/// A predictor must be able to update its internal state based on observed symbols,
-/// revert its state for Monte Carlo simulations, and provide probabilities for
-pub trait Predictor: Send + Sync {
+/// Predictors are mutated behind `&mut self` and cloned per worker during
+/// parallel MCTS. They only need `Send`, not `Sync`, which avoids unsound
+/// thread-sharing requirements for backends with thread-confined internals.
+pub trait Predictor: Send {
     /// Incorporates a new symbol into the model's training history.
     fn update(&mut self, sym: bool);
 
@@ -240,8 +241,6 @@ pub struct ZpaqPredictor {
     pending: Option<(u8, f64)>,
 }
 
-unsafe impl Sync for ZpaqPredictor {}
-
 impl ZpaqPredictor {
     /// Create a ZPAQ-backed predictor from a `method` and probability floor.
     pub fn new(method: String, min_prob: f64) -> Self {
@@ -347,7 +346,13 @@ impl RateBackendBitPredictor {
 
     /// Create a new bit-level adapter with an explicit probability floor.
     pub fn new_with_min_prob(backend: RateBackend, max_order: i64, min_prob: f64) -> Self {
-        let mut predictor = RateBackendPredictor::from_backend(backend.clone(), max_order, min_prob);
+        if rate_backend_contains_zpaq(&backend) {
+            panic!(
+                "RateBackendBitPredictor does not support zpaq backends; use a non-zpaq rate_backend"
+            );
+        }
+        let mut predictor =
+            RateBackendPredictor::from_backend(backend.clone(), max_order, min_prob);
         if let Err(err) = predictor.begin_stream(None) {
             panic!("failed to start RateBackend predictor stream: {err}");
         }
@@ -371,6 +376,18 @@ impl RateBackendBitPredictor {
             min_prob: self.min_prob,
             predictor: self.predictor.clone(),
         }
+    }
+}
+
+fn rate_backend_contains_zpaq(backend: &RateBackend) -> bool {
+    match backend {
+        RateBackend::Zpaq { .. } => true,
+        RateBackend::Mixture { spec } => spec
+            .experts
+            .iter()
+            .any(|expert| rate_backend_contains_zpaq(&expert.backend)),
+        RateBackend::Calibrated { spec } => rate_backend_contains_zpaq(&spec.base),
+        _ => false,
     }
 }
 
@@ -415,8 +432,6 @@ impl Predictor for RateBackendBitPredictor {
         Box::new(self.clone_state())
     }
 }
-
-unsafe impl Sync for RateBackendBitPredictor {}
 
 #[cfg(feature = "backend-rwkv")]
 use crate::coders::softmax_pdf_floor_inplace;

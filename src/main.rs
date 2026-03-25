@@ -2402,19 +2402,20 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         .or_else(|| v["solver"].as_str())
         .unwrap_or("mc-aixi");
     let planner_norm = planner.to_ascii_lowercase();
-    if !matches!(
-        planner_norm.as_str(),
-        "mc-aixi" | "mcaixi" | "aixi" | "mc_aixi" | "aiqi" | "q-induction" | "aiqi-ctw"
-    ) {
+    if !matches!(planner_norm.as_str(), "mc-aixi" | "aiqi") {
         return Err(anyhow::anyhow!(
             "Unknown planner/solver '{}'. Supported values: mc-aixi, aiqi",
             planner
         ));
     }
-    if matches!(planner_norm.as_str(), "aiqi" | "q-induction" | "aiqi-ctw") {
+    if planner_norm.as_str() == "aiqi" {
         let aiqi_random_seed = v["aiqi_random_seed"].as_u64().or(run_random_seed);
         let aiqi_rate_backend = if !v["aiqi_rate_backend"].is_null() {
-            Some(parse_vm_stats_backend(&v["aiqi_rate_backend"], &v, config_dir)?)
+            Some(parse_vm_stats_backend(
+                &v["aiqi_rate_backend"],
+                &v,
+                config_dir,
+            )?)
         } else if !v["rate_backend"].is_null() {
             Some(parse_vm_stats_backend(&v["rate_backend"], &v, config_dir)?)
         } else {
@@ -2476,8 +2477,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
 
         println!(
             "AIQI initialized ({}) for {} environment.",
-            aiqi_backend_desc,
-            env_name
+            aiqi_backend_desc, env_name
         );
 
         let learn_cycles = v["learn_cycles"].as_u64().map(|n| n as usize);

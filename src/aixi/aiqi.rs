@@ -452,7 +452,11 @@ impl AiqiAgent {
         let mut q_values = vec![0.0; self.config.agent_actions];
         for action in 0..self.config.agent_actions {
             let mut action_predictor = context_predictor.boxed_clone();
-            let _ = push_encoded_bits_history(action_predictor.as_mut(), action as u64, self.action_bits);
+            let _ = push_encoded_bits_history(
+                action_predictor.as_mut(),
+                action as u64,
+                self.action_bits,
+            );
             let dist = Self::predict_return_distribution_from_base_predictor(
                 self.config.return_bins,
                 self.return_bits,
@@ -699,13 +703,7 @@ fn push_step_tokens_history(
     idx: usize,
 ) -> usize {
     let mut pushed = 0usize;
-    pushed += push_action_tokens_history(
-        history_base_step,
-        steps,
-        action_bits,
-        predictor,
-        idx,
-    );
+    pushed += push_action_tokens_history(history_base_step, steps, action_bits, predictor, idx);
 
     if idx % config.augmentation_period == phase {
         let local_idx = idx - history_base_step;
@@ -765,7 +763,9 @@ fn build_predictor(config: &AiqiConfig, return_bits: usize) -> Box<dyn Predictor
             Box::new(FacCtwPredictor::new(config.ct_depth, return_bits))
         }
         "rosa" => {
-            let max_order = config.rosa_max_order.unwrap_or(config.rate_backend_max_order);
+            let max_order = config
+                .rosa_max_order
+                .unwrap_or(config.rate_backend_max_order);
             let bit_backend = adapt_rate_backend_for_bit_tokens(RateBackend::RosaPlus);
             Box::new(RateBackendBitPredictor::new(bit_backend, max_order))
         }
@@ -776,9 +776,8 @@ fn build_predictor(config: &AiqiConfig, return_bits: usize) -> Box<dyn Predictor
                 .as_ref()
                 .expect("RWKV model path required for AIQI when algorithm=rwkv");
             let model_arc = load_rwkv7_model_from_path(path);
-            let bit_backend = adapt_rate_backend_for_bit_tokens(RateBackend::Rwkv7 {
-                model: model_arc,
-            });
+            let bit_backend =
+                adapt_rate_backend_for_bit_tokens(RateBackend::Rwkv7 { model: model_arc });
             Box::new(RateBackendBitPredictor::new(
                 bit_backend,
                 config.rate_backend_max_order,
@@ -1197,7 +1196,10 @@ mod tests {
 
         // Global progress should be preserved even when retained history is bounded.
         assert_eq!(agent.steps_observed(), 256);
-        assert!(agent.history_base_step > 1, "history should have been pruned");
+        assert!(
+            agent.history_base_step > 1,
+            "history should have been pruned"
+        );
         assert!(
             agent.steps.len() < agent.steps_observed(),
             "retained history should be smaller than total observed"

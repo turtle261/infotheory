@@ -1,8 +1,9 @@
 //! AIQI validation tests.
 
+use infotheory::RateBackend;
 use infotheory::aixi::aiqi::{AiqiAgent, AiqiConfig};
 use infotheory::aixi::environment::{CoinFlip, CtwTest, Environment};
-use infotheory::RateBackend;
+use infotheory::aixi::model::RateBackendBitPredictor;
 
 fn base_config() -> AiqiConfig {
     AiqiConfig {
@@ -183,4 +184,15 @@ fn aiqi_seeded_policy_is_reproducible() {
         b.observe_transition(act_b, &obs, rew)
             .expect("transition should be accepted");
     }
+}
+
+#[test]
+#[should_panic(expected = "does not support zpaq backends")]
+fn rate_backend_bit_predictor_rejects_zpaq_backend() {
+    let _ = RateBackendBitPredictor::new(
+        RateBackend::Zpaq {
+            method: "1".to_string(),
+        },
+        8,
+    );
 }

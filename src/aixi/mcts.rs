@@ -21,7 +21,7 @@ struct PerceptOutcome {
 /// This trait allows the MCTS algorithm to interact with an agent
 /// (like `Agent` in `agent.rs`) to perform "imagined" actions and
 /// receive "imagined" percepts during planning.
-pub trait AgentSimulator: Send + Sync {
+pub trait AgentSimulator: Send {
     /// Returns the number of possible actions the agent can perform.
     fn get_num_actions(&self) -> usize;
 

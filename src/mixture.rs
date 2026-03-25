@@ -94,6 +94,10 @@ fn logsumexp_weights(experts: &[ExpertState]) -> f64 {
 
 /// Trait for online byte-level predictors that expose per-symbol log-probabilities.
 pub trait OnlineBytePredictorClone {
+    /// Clone this predictor as a trait object.
+    ///
+    /// This supports `Clone` for `Box<dyn OnlineBytePredictor>` via type erasure,
+    /// so mixture experts can be duplicated without knowing their concrete type.
     fn clone_box(&self) -> Box<dyn OnlineBytePredictor>;
 }
 
