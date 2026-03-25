@@ -2627,6 +2627,9 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         reward_offset,
         random_seed: mcaixi_random_seed,
         rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
+        rwkv_method: v["rwkv_method"].as_str().map(|s| s.to_string()),
+        mamba_model_path: v["mamba_model_path"].as_str().map(|s| s.to_string()),
+        mamba_method: v["mamba_method"].as_str().map(|s| s.to_string()),
         rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
         zpaq_method: v["zpaq_method"].as_str().map(|s| s.to_string()),
     };

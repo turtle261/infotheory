@@ -6,12 +6,14 @@
 
 use crate::RateBackend;
 use crate::ctw::{ContextTree, FacContextTree};
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip::{Compressor as MambaCompressor, Model as MambaModel, State as MambaState};
 use crate::mixture::{DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor};
 use crate::rosaplus::{RosaPlus, RosaTx};
 #[cfg(feature = "backend-rwkv")]
-use crate::rwkvzip::{Compressor, Model, State};
+use crate::rwkvzip::{Compressor as RwkvCompressor, Model as RwkvModel, State as RwkvState};
 use crate::zpaq_rate::ZpaqRateModel;
-#[cfg(feature = "backend-rwkv")]
+#[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
 use std::sync::Arc;
 
 /// Interface for an AIXI world model.
@@ -443,15 +445,15 @@ use crate::coders::softmax_pdf_floor_inplace;
 /// the agent to leverage large pre-trained models for sequence prediction.
 #[cfg(feature = "backend-rwkv")]
 pub struct RwkvPredictor {
-    compressor: Compressor,
-    history: Vec<(State, Vec<f64>)>,
+    compressor: RwkvCompressor,
+    history: Vec<(RwkvState, Vec<f64>)>,
 }
 
 #[cfg(feature = "backend-rwkv")]
 impl RwkvPredictor {
     /// Creates a new `RwkvPredictor` from an initialized `Model`.
-    pub fn new(model: Arc<Model>) -> Self {
-        let mut compressor = Compressor::new_from_model(model);
+    pub fn new(model: Arc<RwkvModel>) -> Self {
+        let mut compressor = RwkvCompressor::new_from_model(model);
         let vocab_size = compressor.vocab_size();
         let logits = compressor
             .model
@@ -462,6 +464,17 @@ impl RwkvPredictor {
             compressor,
             history: Vec::new(),
         }
+    }
+
+    /// Creates a new `RwkvPredictor` from a method string.
+    pub fn from_method(method: &str) -> Result<Self, String> {
+        let mut compressor =
+            RwkvCompressor::new_from_method(method).map_err(|err| err.to_string())?;
+        compressor.forward_to_internal_pdf(0);
+        Ok(Self {
+            compressor,
+            history: Vec::new(),
+        })
     }
 }
 
@@ -500,6 +513,91 @@ impl Predictor for RwkvPredictor {
 
     fn model_name(&self) -> String {
         "RWKV".to_string()
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(Self {
+            compressor: self.compressor.clone(),
+            history: self.history.clone(),
+        })
+    }
+}
+
+/// A predictor using the Mamba neural network architecture.
+#[cfg(feature = "backend-mamba")]
+pub struct MambaPredictor {
+    compressor: MambaCompressor,
+    history: Vec<(MambaState, Vec<f64>)>,
+}
+
+#[cfg(feature = "backend-mamba")]
+impl MambaPredictor {
+    /// Creates a new `MambaPredictor` from an initialized `Model`.
+    pub fn new(model: Arc<MambaModel>) -> Self {
+        let mut compressor = MambaCompressor::new_from_model(model);
+        let logits = compressor
+            .model
+            .forward(&mut compressor.scratch, 0, &mut compressor.state)
+            .to_vec();
+        let bias = compressor.online_bias_snapshot();
+        MambaCompressor::logits_to_pdf(&logits, bias.as_deref(), &mut compressor.pdf_buffer);
+
+        Self {
+            compressor,
+            history: Vec::new(),
+        }
+    }
+
+    /// Creates a new `MambaPredictor` from a method string.
+    pub fn from_method(method: &str) -> Result<Self, String> {
+        let mut compressor =
+            MambaCompressor::new_from_method(method).map_err(|err| err.to_string())?;
+        let mut pdf = vec![0.0f64; compressor.vocab_size()];
+        compressor.forward_to_pdf(0, &mut pdf);
+        compressor.pdf_buffer.clone_from(&pdf);
+        Ok(Self {
+            compressor,
+            history: Vec::new(),
+        })
+    }
+}
+
+#[cfg(feature = "backend-mamba")]
+impl Predictor for MambaPredictor {
+    fn update(&mut self, sym: bool) {
+        self.history.push((
+            self.compressor.state.clone(),
+            self.compressor.pdf_buffer.clone(),
+        ));
+
+        let byte = if sym { 1u32 } else { 0u32 };
+        let logits = self
+            .compressor
+            .model
+            .forward(
+                &mut self.compressor.scratch,
+                byte,
+                &mut self.compressor.state,
+            )
+            .to_vec();
+        let bias = self.compressor.online_bias_snapshot();
+        MambaCompressor::logits_to_pdf(&logits, bias.as_deref(), &mut self.compressor.pdf_buffer);
+    }
+
+    fn revert(&mut self) {
+        if let Some((state, pdf)) = self.history.pop() {
+            self.compressor.state = state;
+            self.compressor.pdf_buffer = pdf;
+        }
+    }
+
+    fn predict_prob(&mut self, sym: bool) -> f64 {
+        let idx = if sym { 1 } else { 0 };
+        self.compressor.pdf_buffer[idx]
+    }
+
+    fn model_name(&self) -> String {
+        "Mamba".to_string()
     }
 
     fn boxed_clone(&self) -> Box<dyn Predictor> {

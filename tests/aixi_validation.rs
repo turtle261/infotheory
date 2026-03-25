@@ -171,6 +171,9 @@ fn agent_solves_ctw_test_environment() {
         reward_offset: 0,
         random_seed: Some(17),
         rwkv_model_path: None,
+        rwkv_method: None,
+        mamba_model_path: None,
+        mamba_method: None,
         rosa_max_order: None,
         zpaq_method: None,
     };
@@ -212,6 +215,9 @@ fn agent_regret_sublinear_coinflip() {
         reward_offset: 0,
         random_seed: Some(23),
         rwkv_model_path: None,
+        rwkv_method: None,
+        mamba_model_path: None,
+        mamba_method: None,
         rosa_max_order: None,
         zpaq_method: None,
     };
@@ -253,6 +259,9 @@ fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
         reward_offset: 0,
         random_seed: Some(12345),
         rwkv_model_path: None,
+        rwkv_method: None,
+        mamba_model_path: None,
+        mamba_method: None,
         rosa_max_order: None,
         zpaq_method: None,
     };
