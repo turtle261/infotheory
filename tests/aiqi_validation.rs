@@ -187,12 +187,41 @@ fn aiqi_seeded_policy_is_reproducible() {
 }
 
 #[test]
-#[should_panic(expected = "does not support zpaq backends")]
 fn rate_backend_bit_predictor_rejects_zpaq_backend() {
-    let _ = RateBackendBitPredictor::new(
+    let err = match RateBackendBitPredictor::new(
         RateBackend::Zpaq {
             method: "1".to_string(),
         },
         8,
-    );
+    ) {
+        Ok(_) => panic!("zpaq must be rejected in RateBackendBitPredictor"),
+        Err(err) => err,
+    };
+    assert!(err.contains("does not support zpaq backends"));
+}
+
+#[cfg(feature = "backend-rwkv")]
+#[test]
+fn aiqi_config_rejects_rwkv_without_model_path_when_no_rate_backend() {
+    let mut cfg = base_config();
+    cfg.algorithm = "rwkv".to_string();
+    cfg.rwkv_model_path = None;
+    cfg.rate_backend = None;
+
+    let err = cfg
+        .validate()
+        .expect_err("algorithm=rwkv without path and without rate_backend override must fail");
+    assert!(err.contains("rwkv_model_path"));
+}
+
+#[cfg(feature = "backend-rwkv")]
+#[test]
+fn aiqi_config_allows_rwkv_without_model_path_with_rate_backend_override() {
+    let mut cfg = base_config();
+    cfg.algorithm = "rwkv".to_string();
+    cfg.rwkv_model_path = None;
+    cfg.rate_backend = Some(RateBackend::RosaPlus);
+
+    cfg.validate()
+        .expect("rate_backend override should avoid requiring rwkv_model_path");
 }

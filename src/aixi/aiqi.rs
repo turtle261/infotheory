@@ -67,7 +67,10 @@ pub struct AiqiConfig {
     pub rate_backend: Option<RateBackend>,
     /// Max-order hint for `rate_backend` constructors that use it (for example ROSA).
     pub rate_backend_max_order: i64,
-    /// Optional RWKV model path (required when `algorithm="rwkv"`).
+    /// Optional RWKV model path.
+    ///
+    /// Required only when selecting `algorithm="rwkv"` and no `rate_backend`
+    /// override is configured.
     pub rwkv_model_path: Option<String>,
     /// Optional ROSA max order.
     pub rosa_max_order: Option<i64>,
@@ -133,6 +136,19 @@ impl AiqiConfig {
                     "AIQI strict mode requires frozen context updates; configured rate_backend contains zpaq which does not provide strict frozen conditioning"
                         .to_string(),
                 );
+            }
+        }
+
+        #[cfg(feature = "backend-rwkv")]
+        if self.rate_backend.is_none() && self.algorithm == "rwkv" {
+            match self.rwkv_model_path.as_deref() {
+                Some(path) if !path.trim().is_empty() => {}
+                _ => {
+                    return Err(
+                        "algorithm=rwkv requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
+                            .to_string(),
+                    )
+                }
             }
         }
 
@@ -206,7 +222,7 @@ impl AiqiAgent {
         let mut phases = Vec::with_capacity(config.augmentation_period);
         for _ in 0..config.augmentation_period {
             phases.push(PhaseModel {
-                predictor: build_predictor(&config, return_bits),
+                predictor: build_predictor(&config, return_bits)?,
                 last_augmented_step: 0,
             });
         }
@@ -747,48 +763,46 @@ fn push_percept_tokens_history(
         )
 }
 
-fn build_predictor(config: &AiqiConfig, return_bits: usize) -> Box<dyn Predictor> {
+fn build_predictor(config: &AiqiConfig, return_bits: usize) -> Result<Box<dyn Predictor>, String> {
     if let Some(rate_backend) = config.rate_backend.clone() {
         let bit_backend = adapt_rate_backend_for_bit_tokens(rate_backend);
-        return Box::new(RateBackendBitPredictor::new(
-            bit_backend,
-            config.rate_backend_max_order,
-        ));
+        let predictor = RateBackendBitPredictor::new(bit_backend, config.rate_backend_max_order)?;
+        return Ok(Box::new(predictor));
     }
 
     match config.algorithm.as_str() {
-        "ctw" | "ac-ctw" | "ctw-context-tree" => Box::new(CtwPredictor::new(config.ct_depth)),
+        "ctw" | "ac-ctw" | "ctw-context-tree" => Ok(Box::new(CtwPredictor::new(config.ct_depth))),
         "fac-ctw" => {
             // AIQI-FAC-CTW extension: factorized return-bit modeling.
-            Box::new(FacCtwPredictor::new(config.ct_depth, return_bits))
+            Ok(Box::new(FacCtwPredictor::new(config.ct_depth, return_bits)))
         }
         "rosa" => {
             let max_order = config
                 .rosa_max_order
                 .unwrap_or(config.rate_backend_max_order);
             let bit_backend = adapt_rate_backend_for_bit_tokens(RateBackend::RosaPlus);
-            Box::new(RateBackendBitPredictor::new(bit_backend, max_order))
+            let predictor = RateBackendBitPredictor::new(bit_backend, max_order)?;
+            Ok(Box::new(predictor))
         }
         #[cfg(feature = "backend-rwkv")]
         "rwkv" => {
-            let path = config
-                .rwkv_model_path
-                .as_ref()
-                .expect("RWKV model path required for AIQI when algorithm=rwkv");
+            let path = config.rwkv_model_path.as_ref().ok_or_else(|| {
+                "algorithm=rwkv requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
+                    .to_string()
+            })?;
             let model_arc = load_rwkv7_model_from_path(path);
             let bit_backend =
                 adapt_rate_backend_for_bit_tokens(RateBackend::Rwkv7 { model: model_arc });
-            Box::new(RateBackendBitPredictor::new(
-                bit_backend,
-                config.rate_backend_max_order,
-            ))
+            let predictor = RateBackendBitPredictor::new(bit_backend, config.rate_backend_max_order)?;
+            Ok(Box::new(predictor))
         }
         #[cfg(not(feature = "backend-rwkv"))]
-        "rwkv" => panic!("RWKV backend disabled at compile time"),
-        "zpaq" => panic!(
+        "rwkv" => Err("algorithm=rwkv requires backend-rwkv feature".to_string()),
+        "zpaq" => Err(
             "AIQI strict mode does not support algorithm=zpaq; configure a backend with strict frozen conditioning"
+                .to_string(),
         ),
-        _ => panic!("Unknown AIQI algorithm: {}", config.algorithm),
+        _ => Err(format!("Unknown AIQI algorithm: {}", config.algorithm)),
     }
 }
 

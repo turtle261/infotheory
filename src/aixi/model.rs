@@ -312,16 +312,12 @@ impl Predictor for ZpaqPredictor {
     }
 
     fn boxed_clone(&self) -> Box<dyn Predictor> {
-        let mut model = ZpaqRateModel::new(self.method.clone(), self.min_prob);
-        if !self.history.is_empty() {
-            model.update_and_score(&self.history);
-        }
         Box::new(Self {
             method: self.method.clone(),
             min_prob: self.min_prob,
-            model,
+            model: self.model.clone(),
             history: self.history.clone(),
-            pending: None,
+            pending: self.pending,
         })
     }
 }
@@ -340,28 +336,33 @@ pub struct RateBackendBitPredictor {
 
 impl RateBackendBitPredictor {
     /// Create a new bit-level adapter from a rate backend.
-    pub fn new(backend: RateBackend, max_order: i64) -> Self {
+    pub fn new(backend: RateBackend, max_order: i64) -> Result<Self, String> {
         Self::new_with_min_prob(backend, max_order, DEFAULT_MIN_PROB)
     }
 
     /// Create a new bit-level adapter with an explicit probability floor.
-    pub fn new_with_min_prob(backend: RateBackend, max_order: i64, min_prob: f64) -> Self {
+    pub fn new_with_min_prob(
+        backend: RateBackend,
+        max_order: i64,
+        min_prob: f64,
+    ) -> Result<Self, String> {
         if rate_backend_contains_zpaq(&backend) {
-            panic!(
+            return Err(
                 "RateBackendBitPredictor does not support zpaq backends; use a non-zpaq rate_backend"
+                    .to_string(),
             );
         }
         let mut predictor =
             RateBackendPredictor::from_backend(backend.clone(), max_order, min_prob);
-        if let Err(err) = predictor.begin_stream(None) {
-            panic!("failed to start RateBackend predictor stream: {err}");
-        }
-        Self {
+        predictor
+            .begin_stream(None)
+            .map_err(|err| format!("failed to start RateBackend predictor stream: {err}"))?;
+        Ok(Self {
             backend,
             max_order,
             min_prob,
             predictor,
-        }
+        })
     }
 
     #[inline(always)]
