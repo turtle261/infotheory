@@ -181,6 +181,18 @@ mod imp {
         }
     }
 
+    impl Clone for ZpaqRateModel {
+        fn clone(&self) -> Self {
+            let mut cloned = Self::new(self.method.clone(), self.min_prob);
+            if !self.history.is_empty() {
+                let _ = cloned.update_and_score(&self.history);
+            }
+            cloned.pending_symbol = None;
+            cloned.pending_bits = 0.0;
+            cloned
+        }
+    }
+
     /// Validate that `method` is streamable and accepted by the ZPAQ backend.
     pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
         StreamingCompressor::new(method)
@@ -241,6 +253,7 @@ mod imp {
 
 #[cfg(not(feature = "backend-zpaq"))]
 mod imp {
+    #[derive(Clone)]
     pub struct ZpaqRateModel {
         min_log_prob: f64,
     }

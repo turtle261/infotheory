@@ -131,6 +131,15 @@ impl RandomGenerator {
         Self { state }
     }
 
+    /// Creates a new `RandomGenerator` from an explicit seed.
+    ///
+    /// A zero seed is remapped to a fixed non-zero constant to avoid the
+    /// xorshift zero-state trap.
+    pub fn from_seed(seed: u64) -> Self {
+        let state = if seed == 0 { 0xCAFEBABEDEADBEEF } else { seed };
+        Self { state }
+    }
+
     /// Generates the next pseudo-random `u64`.
     pub fn next_u64(&mut self) -> u64 {
         // xorshift64*

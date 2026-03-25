@@ -21,6 +21,20 @@ Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent descr
 
 You can use a trained neural model (Mamba-1 or RWKV7) as a rate backend ("world model") for MC-AIXI.
 
+### 4. Integrated AIQI Agent
+The repository also includes **AIQI (Universal AI with Q-Induction)**: a model-free return-prediction agent with periodic augmentation (`N >= H`) and discretized H-step return targets.
+
+- `planner: "aiqi"` enables AIQI in `infotheory aixi <config.json>`.
+- `planner: "mc-aixi"` (default) keeps the existing MC-AIXI path.
+- **Paper path**: `algorithm: "ac-ctw"` (or `"ctw"`) is the literal AIQI-CTW path from the paper.
+- **Extensions**: AIQI also supports `fac-ctw`, `rosa`, `rwkv`, and generic `rate_backend` predictors.
+- **Intentional exclusion**: `zpaq` is not supported for AIQI because strict frozen conditioning is required.
+- **Strict paper-domain validation**: AIQI enforces `discount_gamma in (0,1)` and `baseline_exploration (tau) in (0,1]`.
+- **Tie-breaking**: greedy action selection uses a fixed tie-break rule (first maximizing action) to match paper assumptions.
+- **Optional bounded memory**: set `history_prune_keep_steps` (or `aiqi_history_prune_keep_steps`) to retain only recent history while preserving exact return construction.
+- **Reproducibility**: set `random_seed` in config (or planner-specific `aiqi_random_seed` / `mcaixi_random_seed`) to make agent-side randomness deterministic across runs.
+- AIQI uses the same environment interfaces as MC-AIXI, including VM environments.
+
 ---
 
 ## Compilation & Installation
@@ -189,10 +203,46 @@ This writes:
 ./infotheory aixi conf/kuhn_poker.json
 ```
 
+Planner switch in config:
+
+```json
+{
+  "planner": "aiqi",
+  "algorithm": "ac-ctw",
+  "random_seed": 12345,
+  "discount_gamma": 0.99,
+  "return_horizon": 6,
+  "return_bins": 32,
+  "augmentation_period": 6,
+  "history_prune_keep_steps": 2048,
+  "baseline_exploration": 0.01
+}
+```
+
+Optional generic backend override (uses the shared RateBackend parser; `zpaq` is intentionally rejected for AIQI):
+
+```json
+{
+  "planner": "aiqi",
+  "rate_backend": {
+    "name": "ppmd",
+    "order": 10,
+    "memory_mb": 64
+  },
+  "rate_backend_max_order": 8
+}
+```
+
 ### AIXI Agent Mode (VM via Nyx-Lite)
 ```bash
 # VM-backed environment using high-performance Firecracker (Nyx-Lite)
 ./infotheory aixi aixi_confs/vm_example.json
+```
+
+Quick benchmark (AIQI vs MC-AIXI):
+
+```bash
+./scripts/bench_aiqi_vs_aixi.sh
 ```
 
 VM config highlights:

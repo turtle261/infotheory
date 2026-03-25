@@ -5,7 +5,9 @@
 //! provide different complexity vs performance trade-offs.
 
 use crate::ctw::{ContextTree, FacContextTree};
+use crate::mixture::{DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor};
 use crate::rosaplus::{RosaPlus, RosaTx};
+use crate::RateBackend;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip::{Compressor, Model, State};
 use crate::zpaq_rate::ZpaqRateModel;
@@ -324,6 +326,97 @@ impl Predictor for ZpaqPredictor {
         })
     }
 }
+
+/// A generic bit-level predictor backed by any [`RateBackend`].
+///
+/// This adapter maps boolean symbols to bytes `{0,1}` and forwards them to the
+/// workspace-wide rate backend abstraction. It prioritizes correctness and
+/// backend coverage over rollback efficiency.
+pub struct RateBackendBitPredictor {
+    backend: RateBackend,
+    max_order: i64,
+    min_prob: f64,
+    predictor: RateBackendPredictor,
+}
+
+impl RateBackendBitPredictor {
+    /// Create a new bit-level adapter from a rate backend.
+    pub fn new(backend: RateBackend, max_order: i64) -> Self {
+        Self::new_with_min_prob(backend, max_order, DEFAULT_MIN_PROB)
+    }
+
+    /// Create a new bit-level adapter with an explicit probability floor.
+    pub fn new_with_min_prob(backend: RateBackend, max_order: i64, min_prob: f64) -> Self {
+        let mut predictor = RateBackendPredictor::from_backend(backend.clone(), max_order, min_prob);
+        if let Err(err) = predictor.begin_stream(None) {
+            panic!("failed to start RateBackend predictor stream: {err}");
+        }
+        Self {
+            backend,
+            max_order,
+            min_prob,
+            predictor,
+        }
+    }
+
+    #[inline(always)]
+    fn bit_to_byte(sym: bool) -> u8 {
+        if sym { 1u8 } else { 0u8 }
+    }
+
+    fn clone_state(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            max_order: self.max_order,
+            min_prob: self.min_prob,
+            predictor: self.predictor.clone(),
+        }
+    }
+}
+
+impl Predictor for RateBackendBitPredictor {
+    fn update(&mut self, sym: bool) {
+        self.predictor.update(Self::bit_to_byte(sym));
+    }
+
+    fn update_history(&mut self, sym: bool) {
+        self.predictor.update_frozen(Self::bit_to_byte(sym));
+    }
+
+    fn revert(&mut self) {
+        panic!(
+            "RateBackendBitPredictor does not support generic rollback; callers must use cloned temporary predictors"
+        );
+    }
+
+    fn pop_history(&mut self) {
+        panic!(
+            "RateBackendBitPredictor does not support generic rollback; callers must use cloned temporary predictors"
+        );
+    }
+
+    fn predict_prob(&mut self, sym: bool) -> f64 {
+        let p = self.predictor.log_prob(Self::bit_to_byte(sym)).exp();
+        if p.is_finite() {
+            p.clamp(self.min_prob, 1.0 - self.min_prob)
+        } else {
+            0.5
+        }
+    }
+
+    fn model_name(&self) -> String {
+        format!(
+            "RateBackendBits({})",
+            RateBackendPredictor::default_name(&self.backend, self.max_order)
+        )
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(self.clone_state())
+    }
+}
+
+unsafe impl Sync for RateBackendBitPredictor {}
 
 #[cfg(feature = "backend-rwkv")]
 use crate::coders::softmax_pdf_floor_inplace;
