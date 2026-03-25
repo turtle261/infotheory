@@ -71,3 +71,23 @@ The suite includes:
 
 These tests are designed to catch semantic drift and output regressions across
 interfaces.
+
+## MC-AIXI Competitor Benchmark Validation
+
+Use the reproducible benchmark harness to validate cross-implementation parity
+for MC-AIXI behavior and reporting:
+
+```bash
+./projman.sh bench__aixi_competitors --profile default --trials 1
+```
+
+Parity/correctness expectations for this benchmark:
+
+- Rust environments used in the run are reference-aligned with C++/PyAIXI for
+  Kuhn Poker and Biased Rock-Paper-Scissors dynamics.
+- `random_seed`/`rng_seed` deterministically seeds both agent and environment
+  stochasticity.
+- Reported rewards are on a common native domain scale (Kuhn offset removed for
+  C++/PyAIXI outputs).
+- MC-AIXI uses reference-style UCB scaling while retaining reward-sensitive
+  chance-node tree reuse to avoid percept collisions in generic environments.

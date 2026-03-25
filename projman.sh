@@ -149,6 +149,14 @@ cmd_bench() {
   say "[bench] Done"
 }
 
+cmd_bench__aixi_competitors() {
+  say "[bench__aixi_competitors] Running reproducible Guix benchmark (Infotheory Rust/Python vs PyAIXI vs C++ MC-AIXI)..."
+  need_cmd guix
+  need_cmd bash
+  (cd "$ROOT_DIR" && bash "$ROOT_DIR/scripts/bench_aixi_competitors_guix.sh" "$@")
+  say "[bench__aixi_competitors] Done"
+}
+
 cmd_plot() {
   suite=${INFOTHEORY_PLOT_SUITE:-${INFOTHEORY_BENCH_SUITE:-two-json}}
   case "${1:-}" in
@@ -235,6 +243,7 @@ Usage: ./projman.sh <command>
 
 Commands:
   bench [suite]  Run benchmark suite (`two-json` default, or `extra`). Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV for the selected suite by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
+  bench__aixi_competitors  Run reproducible Guix time-machine benchmark for Infotheory MC-AIXI (Rust+Python) vs PyAIXI and C++ MC-AIXI. Fails fast if Guix is unavailable.
   plot [suite]   Open benchmark results in the benchman TUI for the selected suite (`two-json` default, or `extra`). Not included in test_all.
   tui [suite]    Build and launch the interactive benchmark TUI (`benchman`) for the selected suite (`two-json` default, or `extra`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
   tui man     Open the local benchman manual via nvim man pager (MANPAGER='nvim +Man!').
@@ -257,6 +266,7 @@ EOF
 cmd=${1:-}
 case "$cmd" in
   bench) shift; cmd_bench "$@" ;;
+  bench__aixi_competitors) shift; cmd_bench__aixi_competitors "$@" ;;
   plot) shift; cmd_plot "$@" ;;
   tui) shift; cmd_tui "$@" ;;
   code_test) shift; cmd_code_test "$@" ;;

@@ -3298,6 +3298,18 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
             )
         })
     }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        Python::attach(|py| {
+            let guard = lock_recover(&self.obj);
+            let obj = guard.bind(py);
+            if py_hasattr_or_fatal(obj, "set_random_seed", "Environment.set_random_seed") {
+                if let Err(e) = obj.call_method1("set_random_seed", (seed,)) {
+                    fatal_python_callback_error(py, "Environment.set_random_seed", e);
+                }
+            }
+        });
+    }
 }
 
 struct PyAgentSimulatorShim {
@@ -3760,6 +3772,9 @@ fn run_agent_with_environment<'py>(
             use infotheory::aixi::environment::Environment;
 
             let mut env = PyEnvironmentShim::new(environment);
+            if let Some(seed) = config.inner.random_seed {
+                env.set_random_seed(seed);
+            }
             let mut agent = Agent::new(config.inner.clone());
 
             let observation_stream_len = config.inner.observation_stream_len.max(1);
@@ -3930,6 +3945,9 @@ fn run_aiqi_with_environment<'py>(
             use infotheory::aixi::environment::Environment;
 
             let mut env = PyEnvironmentShim::new(environment);
+            if let Some(seed) = config.inner.random_seed {
+                env.set_random_seed(seed);
+            }
             let mut agent = AiqiAgent::new(config.inner.clone()).map_err(PyValueError::new_err)?;
 
             let observation_stream_len = config.inner.observation_stream_len.max(1);
@@ -4651,11 +4669,49 @@ struct CoinFlipEnv {
 #[pymethods]
 impl CoinFlipEnv {
     #[new]
-    #[pyo3(signature = (p=0.5))]
-    fn new(p: f64) -> Self {
-        Self {
-            inner: infotheory::aixi::environment::CoinFlip::new(p),
+    #[pyo3(signature = (p=0.5, random_seed=None))]
+    fn new(p: f64, random_seed: Option<u64>) -> Self {
+        use infotheory::aixi::environment::Environment;
+        let mut inner = infotheory::aixi::environment::CoinFlip::new(p);
+        if let Some(seed) = random_seed {
+            inner.set_random_seed(seed);
         }
+        Self { inner }
+    }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        use infotheory::aixi::environment::Environment;
+        self.inner.set_random_seed(seed);
+    }
+
+    fn get_observation_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_observation_bits()
+    }
+
+    fn get_reward_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_reward_bits()
+    }
+
+    fn get_action_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_action_bits()
+    }
+
+    fn get_num_actions(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_num_actions()
+    }
+
+    fn min_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.min_reward()
+    }
+
+    fn max_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.max_reward()
     }
 
     fn perform_action(&mut self, action: u64) {
@@ -4723,10 +4779,49 @@ struct BiasedRockPaperScissorEnv {
 #[pymethods]
 impl BiasedRockPaperScissorEnv {
     #[new]
-    fn new() -> Self {
-        Self {
-            inner: infotheory::aixi::environment::BiasedRockPaperScissor::new(),
+    #[pyo3(signature = (random_seed=None))]
+    fn new(random_seed: Option<u64>) -> Self {
+        use infotheory::aixi::environment::Environment;
+        let mut inner = infotheory::aixi::environment::BiasedRockPaperScissor::new();
+        if let Some(seed) = random_seed {
+            inner.set_random_seed(seed);
         }
+        Self { inner }
+    }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        use infotheory::aixi::environment::Environment;
+        self.inner.set_random_seed(seed);
+    }
+
+    fn get_observation_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_observation_bits()
+    }
+
+    fn get_reward_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_reward_bits()
+    }
+
+    fn get_action_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_action_bits()
+    }
+
+    fn get_num_actions(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_num_actions()
+    }
+
+    fn min_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.min_reward()
+    }
+
+    fn max_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.max_reward()
     }
     fn perform_action(&mut self, action: u64) {
         use infotheory::aixi::environment::Environment;
@@ -4758,10 +4853,49 @@ struct ExtendedTigerEnv {
 #[pymethods]
 impl ExtendedTigerEnv {
     #[new]
-    fn new() -> Self {
-        Self {
-            inner: infotheory::aixi::environment::ExtendedTiger::new(),
+    #[pyo3(signature = (random_seed=None))]
+    fn new(random_seed: Option<u64>) -> Self {
+        use infotheory::aixi::environment::Environment;
+        let mut inner = infotheory::aixi::environment::ExtendedTiger::new();
+        if let Some(seed) = random_seed {
+            inner.set_random_seed(seed);
         }
+        Self { inner }
+    }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        use infotheory::aixi::environment::Environment;
+        self.inner.set_random_seed(seed);
+    }
+
+    fn get_observation_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_observation_bits()
+    }
+
+    fn get_reward_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_reward_bits()
+    }
+
+    fn get_action_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_action_bits()
+    }
+
+    fn get_num_actions(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_num_actions()
+    }
+
+    fn min_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.min_reward()
+    }
+
+    fn max_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.max_reward()
     }
     fn perform_action(&mut self, action: u64) {
         use infotheory::aixi::environment::Environment;
@@ -4793,10 +4927,49 @@ struct TicTacToeEnv {
 #[pymethods]
 impl TicTacToeEnv {
     #[new]
-    fn new() -> Self {
-        Self {
-            inner: infotheory::aixi::environment::TicTacToe::new(),
+    #[pyo3(signature = (random_seed=None))]
+    fn new(random_seed: Option<u64>) -> Self {
+        use infotheory::aixi::environment::Environment;
+        let mut inner = infotheory::aixi::environment::TicTacToe::new();
+        if let Some(seed) = random_seed {
+            inner.set_random_seed(seed);
         }
+        Self { inner }
+    }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        use infotheory::aixi::environment::Environment;
+        self.inner.set_random_seed(seed);
+    }
+
+    fn get_observation_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_observation_bits()
+    }
+
+    fn get_reward_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_reward_bits()
+    }
+
+    fn get_action_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_action_bits()
+    }
+
+    fn get_num_actions(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_num_actions()
+    }
+
+    fn min_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.min_reward()
+    }
+
+    fn max_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.max_reward()
     }
     fn perform_action(&mut self, action: u64) {
         use infotheory::aixi::environment::Environment;
@@ -4828,10 +5001,49 @@ struct KuhnPokerEnv {
 #[pymethods]
 impl KuhnPokerEnv {
     #[new]
-    fn new() -> Self {
-        Self {
-            inner: infotheory::aixi::environment::KuhnPoker::new(),
+    #[pyo3(signature = (random_seed=None))]
+    fn new(random_seed: Option<u64>) -> Self {
+        use infotheory::aixi::environment::Environment;
+        let mut inner = infotheory::aixi::environment::KuhnPoker::new();
+        if let Some(seed) = random_seed {
+            inner.set_random_seed(seed);
         }
+        Self { inner }
+    }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        use infotheory::aixi::environment::Environment;
+        self.inner.set_random_seed(seed);
+    }
+
+    fn get_observation_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_observation_bits()
+    }
+
+    fn get_reward_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_reward_bits()
+    }
+
+    fn get_action_bits(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_action_bits()
+    }
+
+    fn get_num_actions(&self) -> usize {
+        use infotheory::aixi::environment::Environment;
+        self.inner.get_num_actions()
+    }
+
+    fn min_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.min_reward()
+    }
+
+    fn max_reward(&self) -> i64 {
+        use infotheory::aixi::environment::Environment;
+        self.inner.max_reward()
     }
     fn perform_action(&mut self, action: u64) {
         use infotheory::aixi::environment::Environment;

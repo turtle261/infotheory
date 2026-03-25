@@ -2335,6 +2335,13 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         _ => return Err(anyhow::anyhow!("Unknown environment: {}", env_name)),
     };
 
+    // Use the run seed for environment stochasticity as well, so environment
+    // trajectories are reproducible across repeated runs.
+    let run_random_seed = v["random_seed"].as_u64().or_else(|| v["rng_seed"].as_u64());
+    if let Some(seed) = run_random_seed {
+        env.set_random_seed(seed);
+    }
+
     let log_every = v["log_every"].as_u64().unwrap_or(1) as usize;
     let perf = v["perf"].as_bool().unwrap_or(false);
     let vm_perf_only = v["vm_perf_only"].as_bool().unwrap_or(false);
@@ -2388,7 +2395,6 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     let reward_offset = v["reward_offset"]
         .as_i64()
         .unwrap_or_else(|| (-min_reward).max(0));
-    let run_random_seed = v["random_seed"].as_u64().or_else(|| v["rng_seed"].as_u64());
     let discount_gamma = v["discount_gamma"].as_f64().unwrap_or(1.0);
     if !(0.0..=1.0).contains(&discount_gamma) {
         return Err(anyhow::anyhow!(

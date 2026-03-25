@@ -10,10 +10,29 @@ use crate::aixi::common::{
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+/// Hash key for a sampled percept outcome at a chance node.
+///
+/// Both the observation representation and the immediate reward are required
+/// to identify the correct continuation subtree for generic environments.
+/// Some environments can emit the same observation alongside different
+/// rewards, so observation-only keys would incorrectly merge distinct
+/// successor states during search-tree reuse.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct PerceptOutcome {
-    observations: Vec<PerceptVal>,
+    /// Observation symbols used for chance-node branching.
+    observations: Box<[PerceptVal]>,
+    /// Immediate reward observed on the sampled edge.
     reward: Reward,
+}
+
+impl PerceptOutcome {
+    /// Creates a compact percept key from an observation stream and reward.
+    fn new(observations: Vec<PerceptVal>, reward: Reward) -> Self {
+        Self {
+            observations: observations.into_boxed_slice(),
+            reward,
+        }
+    }
 }
 
 /// Interface for an agent that can be simulated during MCTS.
@@ -299,11 +318,7 @@ impl SearchNode {
     }
 
     /// Selects an action to explore, potentially creating a new child node.
-    fn select_action(
-        &mut self,
-        agent: &mut dyn AgentSimulator,
-        _horizon: usize,
-    ) -> (&mut SearchNode, Action) {
+    fn select_action(&mut self, agent: &mut dyn AgentSimulator) -> (&mut SearchNode, Action) {
         let num_actions = agent.get_num_actions();
 
         if self.action_children.len() < num_actions {
@@ -323,8 +338,10 @@ impl SearchNode {
             action = unvisited[idx];
             self.action_children[action as usize] = Some(SearchNode::new(true));
         } else {
-            // UCT Formula: exploit + explore
-            let c = agent.get_explore_exploit_ratio();
+            // Match reference MC-AIXI UCB scaling:
+            // priority = E[return] + horizon*max_reward*sqrt(C*log(N)/n)
+            let c = agent.get_explore_exploit_ratio().max(0.0);
+            let explore_bias = (agent.horizon() as f64) * (agent.max_reward() as f64).max(0.0);
             let mut best_val = -f64::INFINITY;
             let mut best_action = 0;
             let log_visits = (self.visits as f64).ln().max(0.0);
@@ -332,14 +349,10 @@ impl SearchNode {
                 let Some(child) = child.as_ref() else {
                     continue;
                 };
-                let exploit = agent.norm_reward(child.expectation());
-                let explore = if child.visits > 0 {
-                    c * (log_visits / child.visits as f64).sqrt()
-                } else {
-                    f64::INFINITY
-                };
-                let val = exploit + explore;
-                if val > best_val {
+                let nvisits = child.visits as f64;
+                let val = child.expectation() + explore_bias * ((c * log_visits) / nvisits).sqrt();
+                // Keep random tie-break behavior from reference implementations.
+                if val > best_val + agent.gen_f64() * 0.001 {
                     best_val = val;
                     best_action = a as u64;
                 }
@@ -371,10 +384,7 @@ impl SearchNode {
         let reward;
         if self.is_chance_node {
             let (obs, rew) = agent.gen_percepts_and_update();
-            let key = PerceptOutcome {
-                observations: obs,
-                reward: rew,
-            };
+            let key = PerceptOutcome::new(obs, rew);
             let child = self
                 .percept_children
                 .entry(key)
@@ -384,7 +394,7 @@ impl SearchNode {
         } else if self.visits == 0 {
             reward = Self::playout(agent, horizon, total_horizon);
         } else {
-            let (child, _act) = self.select_action(agent, horizon);
+            let (child, _act) = self.select_action(agent);
             reward = child.sample(agent, horizon, total_horizon);
         }
 
@@ -504,10 +514,7 @@ impl SearchTree {
 
         if let Some(mut chance_child) = action_child_opt {
             let obs_repr = agent.observation_repr_from_stream(prev_obs_stream);
-            let key = PerceptOutcome {
-                observations: obs_repr,
-                reward: prev_rew,
-            };
+            let key = PerceptOutcome::new(obs_repr, prev_rew);
 
             if let Some(action_child) = chance_child.percept_children.remove(&key) {
                 self.root = Some(action_child);
@@ -621,10 +628,7 @@ mod tests {
         kept.visits = kept_visits;
 
         let obs_repr = agent.observation_repr_from_stream(prev_obs_stream);
-        let key = PerceptOutcome {
-            observations: obs_repr,
-            reward: prev_rew,
-        };
+        let key = PerceptOutcome::new(obs_repr, prev_rew);
         chance_child.percept_children.insert(key, kept);
 
         old_root.action_children[prev_act as usize] = Some(chance_child);
@@ -675,11 +679,28 @@ mod tests {
 
         let mut agent = DummyAgent::new(4, ObservationKeyMode::Last);
 
-        // Build tree keyed on a different reward so the percept key won't match.
-        let mut tree =
-            build_tree_with_key(&agent, prev_act, &prev_obs_stream, prev_rew + 1, 9.0, 2);
+        // Build tree keyed on a different observation key so pruning misses it.
+        let mut tree = build_tree_with_key(&agent, prev_act, &[9u64], prev_rew, 9.0, 2);
 
         tree.prune_tree(&mut agent, &prev_obs_stream, prev_rew, prev_act);
+
+        let root = tree.root.as_ref().unwrap();
+        assert!(!root.is_chance_node);
+        assert_eq!(root.visits, 0);
+        assert_eq!(root.mean, 0.0);
+    }
+
+    #[test]
+    fn prune_tree_resets_when_reward_mismatch_shares_observation_key() {
+        let prev_act = 1u64;
+        let prev_obs_stream = vec![4u64, 5u64];
+        let kept_rew: Reward = -2;
+        let requested_rew: Reward = 2;
+
+        let mut agent = DummyAgent::new(6, ObservationKeyMode::FullStream);
+        let mut tree = build_tree_with_key(&agent, prev_act, &prev_obs_stream, kept_rew, 77.0, 11);
+
+        tree.prune_tree(&mut agent, &prev_obs_stream, requested_rew, prev_act);
 
         let root = tree.root.as_ref().unwrap();
         assert!(!root.is_chance_node);

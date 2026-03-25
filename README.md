@@ -245,6 +245,17 @@ Quick benchmark (AIQI vs MC-AIXI):
 ./scripts/bench_aiqi_vs_aixi.sh
 ```
 
+Reproducible competitor benchmark (Infotheory Rust/Python vs PyAIXI + C++ MC-AIXI):
+
+```bash
+./projman.sh bench__aixi_competitors --profile default --trials 1
+```
+
+Benchmark correctness notes:
+- Stochastic environments are seeded from `random_seed` (or `rng_seed`) in CLI and Python run loops for reproducible trajectories.
+- Reward reporting is normalized to native domain scale in competitor reports (for example Kuhn offset removal for C++/PyAIXI), so cross-implementation reward means are apples-to-apples.
+- MC-AIXI tree search uses reference-style UCB scaling while preserving reward-sensitive chance-node reuse for generic environment correctness.
+
 VM config highlights:
 - **Environment**: Use `"environment": "nyx-vm"` or `"vm"` (requires `vm` feature).
 - **Core Config**:
