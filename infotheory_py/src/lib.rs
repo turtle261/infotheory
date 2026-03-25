@@ -4278,7 +4278,7 @@ impl PyAiqiConfig {
     }
 }
 
-#[pyclass(name = "Agent")]
+#[pyclass(name = "Agent", unsendable)]
 struct PyAgent {
     inner: infotheory::aixi::agent::Agent,
 }
@@ -4324,7 +4324,7 @@ impl PyAgent {
     }
 }
 
-#[pyclass(name = "AiqiAgent")]
+#[pyclass(name = "AiqiAgent", unsendable)]
 struct PyAiqiAgent {
     inner: infotheory::aixi::aiqi::AiqiAgent,
 }
@@ -4498,7 +4498,7 @@ impl PyRosaPredictor {
     }
 }
 
-#[pyclass(name = "ZpaqPredictor")]
+#[pyclass(name = "ZpaqPredictor", unsendable)]
 struct PyZpaqPredictor {
     inner: infotheory::aixi::model::ZpaqPredictor,
 }
