@@ -115,19 +115,25 @@ impl AiqiConfig {
             ));
         }
 
-        match self.algorithm.as_str() {
-            "ctw" | "fac-ctw" | "ac-ctw" | "ctw-context-tree" | "rosa" => {}
-            "zpaq" => {
-                return Err(
-                    "AIQI strict mode does not support algorithm=zpaq: zpaq backends do not provide strict frozen conditioning"
-                        .to_string(),
-                )
+        // `rate_backend` takes precedence over `algorithm`; only validate
+        // algorithm choices when no backend override is configured.
+        if self.rate_backend.is_none() {
+            match self.algorithm.as_str() {
+                "ctw" | "fac-ctw" | "ac-ctw" | "ctw-context-tree" | "rosa" => {}
+                "zpaq" => {
+                    return Err(
+                        "AIQI strict mode does not support algorithm=zpaq: zpaq backends do not provide strict frozen conditioning"
+                            .to_string(),
+                    )
+                }
+                #[cfg(feature = "backend-rwkv")]
+                "rwkv" => {}
+                #[cfg(not(feature = "backend-rwkv"))]
+                "rwkv" => {
+                    return Err("algorithm=rwkv requires backend-rwkv feature".to_string())
+                }
+                other => return Err(format!("Unknown AIQI algorithm: {other}")),
             }
-            #[cfg(feature = "backend-rwkv")]
-            "rwkv" => {}
-            #[cfg(not(feature = "backend-rwkv"))]
-            "rwkv" => return Err("algorithm=rwkv requires backend-rwkv feature".to_string()),
-            other => return Err(format!("Unknown AIQI algorithm: {other}")),
         }
 
         if let Some(rate_backend) = &self.rate_backend {

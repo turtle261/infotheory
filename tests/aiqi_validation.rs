@@ -51,6 +51,30 @@ fn aiqi_config_rejects_zpaq_algorithm_in_strict_mode() {
 }
 
 #[test]
+fn aiqi_config_allows_unknown_algorithm_when_rate_backend_overrides() {
+    let mut cfg = base_config();
+    cfg.algorithm = "unknown-backend-name".to_string();
+    cfg.rate_backend = Some(RateBackend::Match {
+        hash_bits: 16,
+        min_len: 2,
+        max_len: 16,
+        base_mix: 0.05,
+        confidence_scale: 1.0,
+    });
+    cfg.validate()
+        .expect("rate_backend override should make algorithm non-binding");
+}
+
+#[test]
+fn aiqi_config_allows_algorithm_zpaq_when_rate_backend_overrides() {
+    let mut cfg = base_config();
+    cfg.algorithm = "zpaq".to_string();
+    cfg.rate_backend = Some(RateBackend::RosaPlus);
+    cfg.validate()
+        .expect("rate_backend override should ignore algorithm=zpaq");
+}
+
+#[test]
 fn aiqi_config_rejects_zpaq_rate_backend_in_strict_mode() {
     let mut cfg = base_config();
     cfg.rate_backend = Some(RateBackend::Zpaq {
