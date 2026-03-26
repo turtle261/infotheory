@@ -44,6 +44,8 @@ def test_python_release_linux_build_targets_manylinux2014():
 
 def test_python_release_linux_build_overrides_local_linker_and_uses_py310_abi3_base():
     workflow = (_repo_root() / ".github/workflows/python-release.yml").read_text()
-    assert "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc" in workflow
-    assert "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=generic" in workflow
+    assert "cargo check --release --manifest-path infotheory_py/Cargo.toml" in workflow
+    assert "--config 'build.rustflags=[]'" in workflow
+    assert "--config 'target.x86_64-unknown-linux-gnu.rustflags=[]'" in workflow
+    assert '--config \'target.x86_64-unknown-linux-gnu.linker="gcc"\'' in workflow
     assert "--interpreter /opt/python/cp310-cp310/bin/python3" in workflow
