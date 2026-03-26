@@ -29,7 +29,7 @@ def test_python_release_wheel_build_features_include_mamba():
 
 def test_python_ci_explicit_feature_builds_include_mamba():
     workflow = (_repo_root() / ".github/workflows/python.yml").read_text()
-    feature_args = re.findall(r"maturin develop --release --features ([^\n]+)", workflow)
+    feature_args = re.findall(r"maturin develop --profile python-release --features ([^\n]+)", workflow)
     assert feature_args, "no explicit maturin develop feature commands found in python.yml"
     for args in feature_args:
         features = [part.strip() for part in args.strip().split(",")]
@@ -55,3 +55,9 @@ def test_infotheory_py_does_not_enable_pyo3_auto_initialize_for_extension_builds
     cargo_toml = (_repo_root() / "infotheory_py/Cargo.toml").read_text()
     assert 'features = ["abi3-py310"]' in cargo_toml
     assert "auto-initialize" not in cargo_toml
+
+
+def test_pyproject_uses_python_release_profile_for_wheel_and_editable_builds():
+    pyproject = (_repo_root() / "pyproject.toml").read_text()
+    assert 'profile = "python-release"' in pyproject
+    assert 'editable-profile = "python-release"' in pyproject

@@ -39,11 +39,11 @@ jobs:
         env:
           CC: clang
           CXX: clang++
-        run: uv run maturin develop --release
+        run: uv run maturin develop --profile python-release
 
       - name: Build extension (macOS/Windows)
         if: runner.os != 'Linux'
-        run: uv run maturin develop --release
+        run: uv run maturin develop --profile python-release
 
       - name: Run tests
         run: uv run pytest --cov=infotheory_rs --cov-report=term-missing --cov-report=xml:target/python-coverage.xml --cov-fail-under=100 python/tests
@@ -59,7 +59,7 @@ jobs:
         run: uv run maturin sdist
 
       - name: Build wheel
-        run: uv run maturin build --release
+        run: uv run maturin build --profile python-release
 
       - name: Install built wheel and import
         shell: bash
@@ -91,7 +91,7 @@ jobs:
         env:
           CC: clang
           CXX: clang++
-        run: uv run maturin develop --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq,vm
+        run: uv run maturin develop --profile python-release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq,vm
 
       - name: Run VM-featured Python smoke tests
         run: uv run pytest -q python/tests/test_vm.py

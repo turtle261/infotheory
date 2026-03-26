@@ -101,6 +101,10 @@ codegen-units = 1
 opt-level = 3
 panic = "abort"
 
+[profile.python-release]
+inherits = "release"
+lto = false
+
 [profile.bench]
 inherits = "release"
 lto = "fat"
