@@ -46,8 +46,17 @@ jobs:
         if: runner.os != 'Linux'
         run: uv run maturin develop --profile python-release
 
-      - name: Run tests
-        run: uv run pytest --cov=infotheory_rs --cov-report=term-missing --cov-report=xml:target/python-coverage.xml --cov-fail-under=100 python/tests
+      - name: Run tests (Linux)
+        if: runner.os == 'Linux'
+        env:
+          CC: clang
+          CXX: clang++
+          RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
+        run: uv run --no-sync pytest --cov=infotheory_rs --cov-report=term-missing --cov-report=xml:target/python-coverage.xml --cov-fail-under=100 python/tests
+
+      - name: Run tests (macOS/Windows)
+        if: runner.os != 'Linux'
+        run: uv run --no-sync pytest --cov=infotheory_rs --cov-report=term-missing --cov-report=xml:target/python-coverage.xml --cov-fail-under=100 python/tests
 
       - name: Upload Python coverage artifact
         uses: actions/upload-artifact@v4
@@ -76,8 +85,8 @@ jobs:
         run: |
           set -euo pipefail
           wheel="$(ls target/wheels/*.whl | head -n1)"
-          uv run pip install "$wheel"
-          uv run python -c "import infotheory_rs; print('ok')"
+          uv run --no-sync pip install "$wheel"
+          uv run --no-sync python -c "import infotheory_rs; print('ok')"
 
   test-vm-linux:
     name: Python VM smoke (Linux)
@@ -105,4 +114,4 @@ jobs:
         run: uv run maturin develop --profile python-release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq,vm
 
       - name: Run VM-featured Python smoke tests
-        run: uv run pytest -q python/tests/test_vm.py
+        run: uv run --no-sync pytest -q python/tests/test_vm.py

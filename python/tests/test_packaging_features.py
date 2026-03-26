@@ -41,6 +41,8 @@ def test_python_ci_linux_uses_clang_and_lld_for_python_release_builds():
     assert "CC: clang" in workflow
     assert "CXX: clang++" in workflow
     assert "RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64" in workflow
+    assert "uv run --no-sync pytest" in workflow
+    assert "uv run --no-sync pip install" in workflow
 
 
 def test_python_release_linux_build_targets_manylinux2014():
