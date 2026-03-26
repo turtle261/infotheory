@@ -61,3 +61,10 @@ def test_pyproject_uses_python_release_profile_for_wheel_and_editable_builds():
     pyproject = (_repo_root() / "pyproject.toml").read_text()
     assert 'profile = "python-release"' in pyproject
     assert 'editable-profile = "python-release"' in pyproject
+
+
+def test_zpaq_build_disables_cpp_lto_for_python_extension_builds():
+    build_rs = (_repo_root() / "zpaq_rs" / "build.rs").read_text()
+    assert "fn building_python_extension()" in build_rs
+    assert 'env::var_os("PYO3_BUILD_EXTENSION_MODULE").is_some()' in build_rs
+    assert "!building_python_extension()" in build_rs
