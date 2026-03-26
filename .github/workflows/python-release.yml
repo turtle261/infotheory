@@ -31,9 +31,12 @@ jobs:
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
         uses: PyO3/maturin-action@v1
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=generic
         with:
           command: build
-          args: --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq --out target/wheels
+          args: --release --interpreter /opt/python/cp310-cp310/bin/python3 --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq --out target/wheels
           manylinux: 2014
 
       - name: Build wheel (macOS/Windows)
