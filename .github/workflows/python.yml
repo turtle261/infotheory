@@ -39,6 +39,7 @@ jobs:
         env:
           CC: clang
           CXX: clang++
+          RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
         run: uv run maturin develop --profile python-release
 
       - name: Build extension (macOS/Windows)
@@ -58,7 +59,16 @@ jobs:
       - name: Build sdist
         run: uv run maturin sdist
 
-      - name: Build wheel
+      - name: Build wheel (Linux)
+        if: runner.os == 'Linux'
+        env:
+          CC: clang
+          CXX: clang++
+          RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
+        run: uv run maturin build --profile python-release
+
+      - name: Build wheel (macOS/Windows)
+        if: runner.os != 'Linux'
         run: uv run maturin build --profile python-release
 
       - name: Install built wheel and import
@@ -91,6 +101,7 @@ jobs:
         env:
           CC: clang
           CXX: clang++
+          RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
         run: uv run maturin develop --profile python-release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq,vm
 
       - name: Run VM-featured Python smoke tests

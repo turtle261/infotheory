@@ -36,6 +36,13 @@ def test_python_ci_explicit_feature_builds_include_mamba():
         assert "backend-mamba" in features
 
 
+def test_python_ci_linux_uses_clang_and_lld_for_python_release_builds():
+    workflow = (_repo_root() / ".github/workflows/python.yml").read_text()
+    assert "CC: clang" in workflow
+    assert "CXX: clang++" in workflow
+    assert "RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64" in workflow
+
+
 def test_python_release_linux_build_targets_manylinux2014():
     workflow = (_repo_root() / ".github/workflows/python-release.yml").read_text()
     assert "--compatibility manylinux2014" in workflow
