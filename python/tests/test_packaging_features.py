@@ -67,6 +67,7 @@ def test_python_release_linux_build_overrides_local_linker_and_uses_py310_abi3_b
     assert "RUSTFLAGS: -C target-cpu=x86-64" in workflow
     assert "CC: clang" in workflow
     assert "CXX: clang++" in workflow
+    assert "ZPAQ_RS_CXX: clang++" in workflow
     assert "--interpreter python3" in workflow
     assert '.venv/bin/python -m maturin build --release' in workflow
     assert 'export PATH=".venv/bin:$PATH"' in workflow

@@ -67,6 +67,7 @@ jobs:
         env:
           CC: clang
           CXX: clang++
+          ZPAQ_RS_CXX: clang++
           RUSTFLAGS: -C target-cpu=x86-64
         run: |
           export PATH=".venv/bin:$PATH"
