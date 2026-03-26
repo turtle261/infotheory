@@ -20,16 +20,17 @@ def test_pyproject_maturin_features_include_mamba():
 
 def test_python_release_wheel_build_features_include_mamba():
     workflow = (_repo_root() / ".github/workflows/python-release.yml").read_text()
-    feature_args = re.findall(r"maturin build --release --features ([^\n]+)", workflow)
-    assert feature_args, "no maturin build commands found in python-release.yml"
-    for args in feature_args:
-        features = [part.strip() for part in args.strip().split(",")]
-        assert "backend-mamba" in features
+    assert "backend-mamba" in workflow
+    assert "backend-rwkv" in workflow
+    assert "backend-zpaq" in workflow
 
 
 def test_python_ci_explicit_feature_builds_include_mamba():
     workflow = (_repo_root() / ".github/workflows/python.yml").read_text()
-    feature_args = re.findall(r"maturin develop --profile python-release --features ([^\n]+)", workflow)
+    feature_args = re.findall(
+        r"maturin develop --profile python-release --manifest-path infotheory_py/Cargo.toml --features ([^\n]+)",
+        workflow,
+    )
     assert feature_args, "no explicit maturin develop feature commands found in python.yml"
     for args in feature_args:
         features = [part.strip() for part in args.strip().split(",")]
@@ -41,8 +42,17 @@ def test_python_ci_linux_uses_clang_and_lld_for_python_release_builds():
     assert "CC: clang" in workflow
     assert "CXX: clang++" in workflow
     assert "RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64" in workflow
-    assert "uv run --no-sync pytest" in workflow
-    assert "uv run --no-sync pip install" in workflow
+    assert 'uv pip install --python "$VENV_PY"' in workflow
+    assert 'VIRTUAL_ENV: .venv' in workflow
+    assert '"$VENV_PY" -m maturin develop --profile python-release --manifest-path infotheory_py/Cargo.toml' in workflow
+    assert '"$VENV_PY" -m pytest' in workflow
+
+
+def test_python_ci_avoids_uv_run_project_sync_for_maturin_and_pytest_steps():
+    workflow = (_repo_root() / ".github/workflows/python.yml").read_text()
+    assert "uv run maturin" not in workflow
+    assert "uv run pytest" not in workflow
+    assert "uv run --no-sync pytest" not in workflow
 
 
 def test_python_release_linux_build_targets_manylinux2014():
@@ -58,6 +68,14 @@ def test_python_release_linux_build_overrides_local_linker_and_uses_py310_abi3_b
     assert "CC: clang" in workflow
     assert "CXX: clang++" in workflow
     assert "--interpreter python3" in workflow
+    assert '.venv/bin/python -m maturin build --release' in workflow
+    assert 'export PATH=".venv/bin:$PATH"' in workflow
+
+
+def test_python_release_workflow_avoids_uv_run_project_sync():
+    workflow = (_repo_root() / ".github/workflows/python-release.yml").read_text()
+    assert "uv run maturin" not in workflow
+    assert "uv run --with 'maturin[zig]'" not in workflow
 
 
 def test_infotheory_py_does_not_enable_pyo3_auto_initialize_for_extension_builds():

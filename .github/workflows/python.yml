@@ -34,29 +34,47 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
 
+      - name: Create Python test venv
+        shell: bash
+        run: |
+          uv venv .venv
+
+      - name: Install Python test tools
+        shell: bash
+        env:
+          VENV_PY: ${{ runner.os == 'Windows' && '.venv/Scripts/python.exe' || '.venv/bin/python' }}
+        run: |
+          uv pip install --python "$VENV_PY" "maturin>=1.7,<2" "pytest>=8.0" "pytest-cov>=7.0.0"
+
       - name: Build extension (Linux)
         if: runner.os == 'Linux'
+        shell: bash
         env:
+          VIRTUAL_ENV: .venv
+          VENV_PY: .venv/bin/python
           CC: clang
           CXX: clang++
           RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
-        run: uv run maturin develop --profile python-release
+        run: |
+          export PATH="$(dirname "$VENV_PY"):$PATH"
+          "$VENV_PY" -m maturin develop --profile python-release --manifest-path infotheory_py/Cargo.toml
 
       - name: Build extension (macOS/Windows)
         if: runner.os != 'Linux'
-        run: uv run maturin develop --profile python-release
-
-      - name: Run tests (Linux)
-        if: runner.os == 'Linux'
+        shell: bash
         env:
-          CC: clang
-          CXX: clang++
-          RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
-        run: uv run --no-sync pytest --cov=infotheory_rs --cov-report=term-missing --cov-report=xml:target/python-coverage.xml --cov-fail-under=100 python/tests
+          VIRTUAL_ENV: .venv
+          VENV_PY: ${{ runner.os == 'Windows' && '.venv/Scripts/python.exe' || '.venv/bin/python' }}
+        run: |
+          export PATH="$(dirname "$VENV_PY"):$PATH"
+          "$VENV_PY" -m maturin develop --profile python-release --manifest-path infotheory_py/Cargo.toml
 
-      - name: Run tests (macOS/Windows)
-        if: runner.os != 'Linux'
-        run: uv run --no-sync pytest --cov=infotheory_rs --cov-report=term-missing --cov-report=xml:target/python-coverage.xml --cov-fail-under=100 python/tests
+      - name: Run tests
+        shell: bash
+        env:
+          VENV_PY: ${{ runner.os == 'Windows' && '.venv/Scripts/python.exe' || '.venv/bin/python' }}
+        run: |
+          "$VENV_PY" -m pytest --cov=infotheory_rs --cov-report=term-missing --cov-report=xml:target/python-coverage.xml --cov-fail-under=100 python/tests
 
       - name: Upload Python coverage artifact
         uses: actions/upload-artifact@v4
@@ -66,27 +84,43 @@ jobs:
           if-no-files-found: error
 
       - name: Build sdist
-        run: uv run maturin sdist
+        shell: bash
+        env:
+          VENV_PY: ${{ runner.os == 'Windows' && '.venv/Scripts/python.exe' || '.venv/bin/python' }}
+        run: |
+          "$VENV_PY" -m maturin sdist --manifest-path infotheory_py/Cargo.toml
 
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
+        shell: bash
         env:
+          VENV_PY: .venv/bin/python
           CC: clang
           CXX: clang++
           RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
-        run: uv run maturin build --profile python-release
+        run: |
+          export PATH="$(dirname "$VENV_PY"):$PATH"
+          "$VENV_PY" -m maturin build --profile python-release --manifest-path infotheory_py/Cargo.toml
 
       - name: Build wheel (macOS/Windows)
         if: runner.os != 'Linux'
-        run: uv run maturin build --profile python-release
+        shell: bash
+        env:
+          VENV_PY: ${{ runner.os == 'Windows' && '.venv/Scripts/python.exe' || '.venv/bin/python' }}
+        run: |
+          export PATH="$(dirname "$VENV_PY"):$PATH"
+          "$VENV_PY" -m maturin build --profile python-release --manifest-path infotheory_py/Cargo.toml
 
       - name: Install built wheel and import
         shell: bash
+        env:
+          WHEEL_VENV_PY: ${{ runner.os == 'Windows' && '.wheel-venv/Scripts/python.exe' || '.wheel-venv/bin/python' }}
         run: |
           set -euo pipefail
+          uv venv .wheel-venv
           wheel="$(ls target/wheels/*.whl | head -n1)"
-          uv run --no-sync pip install "$wheel"
-          uv run --no-sync python -c "import infotheory_rs; print('ok')"
+          uv pip install --python "$WHEEL_VENV_PY" "$wheel"
+          "$WHEEL_VENV_PY" -c "import infotheory_rs; print('ok')"
 
   test-vm-linux:
     name: Python VM smoke (Linux)
@@ -106,12 +140,28 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
 
+      - name: Create Python VM venv
+        shell: bash
+        run: |
+          uv venv .venv
+
+      - name: Install Python VM test tools
+        shell: bash
+        run: |
+          uv pip install --python .venv/bin/python "maturin>=1.7,<2" "pytest>=8.0"
+
       - name: Build extension with VM feature
+        shell: bash
         env:
+          VIRTUAL_ENV: .venv
           CC: clang
           CXX: clang++
           RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
-        run: uv run maturin develop --profile python-release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq,vm
+        run: |
+          export PATH=".venv/bin:$PATH"
+          .venv/bin/python -m maturin develop --profile python-release --manifest-path infotheory_py/Cargo.toml --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq,vm
 
       - name: Run VM-featured Python smoke tests
-        run: uv run --no-sync pytest -q python/tests/test_vm.py
+        shell: bash
+        run: |
+          .venv/bin/python -m pytest -q python/tests/test_vm.py

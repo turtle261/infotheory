@@ -28,11 +28,30 @@ jobs:
 
       - uses: astral-sh/setup-uv@v4
 
+      - name: Create Python release venv
+        shell: bash
+        run: |
+          uv venv .venv
+
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang lld
+
+      - name: Install Python release tools (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          uv pip install --python .venv/bin/python "maturin[zig]>=1.7,<2"
+
+      - name: Install Python release tools (macOS/Windows)
+        if: runner.os != 'Linux'
+        shell: bash
+        env:
+          VENV_PY: ${{ runner.os == 'Windows' && '.venv/Scripts/python.exe' || '.venv/bin/python' }}
+        run: |
+          uv pip install --python "$VENV_PY" "maturin>=1.7,<2"
 
       - name: Validate Linux release cargo env overrides
         if: runner.os == 'Linux'
@@ -44,23 +63,30 @@ jobs:
 
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
+        shell: bash
         env:
           CC: clang
           CXX: clang++
           RUSTFLAGS: -C target-cpu=x86-64
-        run: >-
-          uv run --with 'maturin[zig]' maturin build --release
-          --interpreter python3
-          --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
-          --out target/wheels
-          --compatibility manylinux2014
-          --zig
+        run: |
+          export PATH=".venv/bin:$PATH"
+          .venv/bin/python -m maturin build --release \
+            --manifest-path infotheory_py/Cargo.toml \
+            --interpreter python3 \
+            --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq \
+            --out target/wheels \
+            --compatibility manylinux2014 \
+            --zig
 
       - name: Build wheel (macOS/Windows)
         if: runner.os != 'Linux'
+        shell: bash
         env:
+          VENV_PY: ${{ runner.os == 'Windows' && '.venv/Scripts/python.exe' || '.venv/bin/python' }}
           RUSTFLAGS: -C target-cpu=generic
-        run: uv run maturin build --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq --out target/wheels
+        run: |
+          export PATH="$(dirname "$VENV_PY"):$PATH"
+          "$VENV_PY" -m maturin build --release --manifest-path infotheory_py/Cargo.toml --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq --out target/wheels
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
@@ -71,7 +97,10 @@ jobs:
 
       - name: Build sdist (Linux only)
         if: runner.os == 'Linux'
-        run: uv run maturin sdist
+        shell: bash
+        run: |
+          export PATH=".venv/bin:$PATH"
+          .venv/bin/python -m maturin sdist --manifest-path infotheory_py/Cargo.toml
 
       - name: Upload sdist artifact
         if: runner.os == 'Linux'
