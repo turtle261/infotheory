@@ -59,10 +59,9 @@ The repository also includes **AIQI**, the model-free return-prediction agent in
 - **FreeBSD** (`x86_64-unknown-freebsd`)
 - **OpenBSD** (`x86_64-unknown-openbsd`)
 - **NetBSD** (`x86_64-unknown-netbsd`)
-- Cross-target compile validation for RWKV portability:
-  - **AArch64 Linux (GNU/musl)** (`aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`)
-  - **AArch64 Windows** (`aarch64-pc-windows-msvc`)
-  - **WASM** (`wasm32-unknown-unknown`, RWKV-only/no-zpaq profile)
+- **AArch64 Linux (GNU/musl)** (`aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`)
+- **AArch64 Windows** (`aarch64-pc-windows-msvc`)
+- **WASM** (`wasm32-unknown-unknown`)
 
 <small>ZPAQ feature is not supported on WASM targets</small>
 
