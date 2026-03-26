@@ -1,10 +1,12 @@
 """Python bindings for `infotheory` (import name: `infotheory_rs`).
 
 This module re-exports symbols from the native extension and provides:
+
 - ergonomic wrappers for common entry points (`ncd_paths`, `ncd_bytes`)
 - abstract base classes for Python-driven AIXI trait adapters
 
 Callback error policy:
+
 - Exceptions raised inside `PredictorABC`, `EnvironmentABC`, or
   `AgentSimulatorABC` callbacks are treated as fatal by the Rust shim layer.
 - The process exits after printing callback context and traceback. This avoids
