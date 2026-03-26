@@ -30,17 +30,17 @@ jobs:
 
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
-        env:
-          RUSTFLAGS: -C target-cpu=generic -C link-arg=-fuse-ld=lld
-          CC: clang
-          CXX: clang++
-        run: uv run maturin build --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq --out target/wheels
+          manylinux: 2014
 
       - name: Build wheel (macOS/Windows)
         if: runner.os != 'Linux'
         env:
           RUSTFLAGS: -C target-cpu=generic
-        run: uv run maturin build --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
+        run: uv run maturin build --release --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq --out target/wheels
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4

@@ -34,3 +34,9 @@ def test_python_ci_explicit_feature_builds_include_mamba():
     for args in feature_args:
         features = [part.strip() for part in args.strip().split(",")]
         assert "backend-mamba" in features
+
+
+def test_python_release_linux_build_targets_manylinux2014():
+    workflow = (_repo_root() / ".github/workflows/python-release.yml").read_text()
+    assert "PyO3/maturin-action@v1" in workflow
+    assert "manylinux: 2014" in workflow
