@@ -1,7 +1,8 @@
-//! MC-AIXI Implementation
+//! AIXI Agent Implementations
 //!
-//! This module contains an implementation of the Monte Carlo AIXI algorithm
-//! using various predictive models (CTW, ROSA, RWKV) as backends.
+//! This module contains:
+//! - Monte Carlo AIXI (MC-AIXI) with pluggable predictive models.
+//! - AIQI (Universal AI with Q-Induction) with phase-indexed return prediction.
 //!
 //! AIXI is a theoretical mathematical formalism for universal artificial intelligence,
 //! which combines Solomonoff induction with sequential decision theory.
@@ -16,6 +17,7 @@
 //! - **NyxVmEnvironment**: Uses nyx-lite for 10,000+ resets/second (requires KVM).
 
 pub mod agent;
+pub mod aiqi;
 pub mod common;
 pub mod environment;
 pub mod mcts;

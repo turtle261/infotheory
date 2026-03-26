@@ -4,19 +4,24 @@
 //! for learning from history and predicting future symbols. Different implementations
 //! provide different complexity vs performance trade-offs.
 
+use crate::RateBackend;
 use crate::ctw::{ContextTree, FacContextTree};
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip::{Compressor as MambaCompressor, Model as MambaModel, State as MambaState};
+use crate::mixture::{DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor};
 use crate::rosaplus::{RosaPlus, RosaTx};
 #[cfg(feature = "backend-rwkv")]
-use crate::rwkvzip::{Compressor, Model, State};
+use crate::rwkvzip::{Compressor as RwkvCompressor, Model as RwkvModel, State as RwkvState};
 use crate::zpaq_rate::ZpaqRateModel;
-#[cfg(feature = "backend-rwkv")]
+#[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
 use std::sync::Arc;
 
 /// Interface for an AIXI world model.
 ///
-/// A predictor must be able to update its internal state based on observed symbols,
-/// revert its state for Monte Carlo simulations, and provide probabilities for
-pub trait Predictor: Send + Sync {
+/// Predictors are mutated behind `&mut self` and cloned per worker during
+/// parallel MCTS. They only need `Send`, not `Sync`, which avoids unsound
+/// thread-sharing requirements for backends with thread-confined internals.
+pub trait Predictor: Send {
     /// Incorporates a new symbol into the model's training history.
     fn update(&mut self, sym: bool);
 
@@ -238,9 +243,8 @@ pub struct ZpaqPredictor {
     pending: Option<(u8, f64)>,
 }
 
-unsafe impl Sync for ZpaqPredictor {}
-
 impl ZpaqPredictor {
+    /// Create a ZPAQ-backed predictor from a `method` and probability floor.
     pub fn new(method: String, min_prob: f64) -> Self {
         let model = ZpaqRateModel::new(method.clone(), min_prob);
         Self {
@@ -310,17 +314,125 @@ impl Predictor for ZpaqPredictor {
     }
 
     fn boxed_clone(&self) -> Box<dyn Predictor> {
-        let mut model = ZpaqRateModel::new(self.method.clone(), self.min_prob);
-        if !self.history.is_empty() {
-            model.update_and_score(&self.history);
-        }
         Box::new(Self {
             method: self.method.clone(),
             min_prob: self.min_prob,
-            model,
+            model: self.model.clone(),
             history: self.history.clone(),
-            pending: None,
+            pending: self.pending,
         })
+    }
+}
+
+/// A generic bit-level predictor backed by any [`RateBackend`].
+///
+/// This adapter maps boolean symbols to bytes `{0,1}` and forwards them to the
+/// workspace-wide rate backend abstraction. It prioritizes correctness and
+/// backend coverage over rollback efficiency.
+pub struct RateBackendBitPredictor {
+    backend: RateBackend,
+    max_order: i64,
+    min_prob: f64,
+    predictor: RateBackendPredictor,
+}
+
+impl RateBackendBitPredictor {
+    /// Create a new bit-level adapter from a rate backend.
+    pub fn new(backend: RateBackend, max_order: i64) -> Result<Self, String> {
+        Self::new_with_min_prob(backend, max_order, DEFAULT_MIN_PROB)
+    }
+
+    /// Create a new bit-level adapter with an explicit probability floor.
+    pub fn new_with_min_prob(
+        backend: RateBackend,
+        max_order: i64,
+        min_prob: f64,
+    ) -> Result<Self, String> {
+        if rate_backend_contains_zpaq(&backend) {
+            return Err(
+                "RateBackendBitPredictor does not support zpaq backends; use a non-zpaq rate_backend"
+                    .to_string(),
+            );
+        }
+        let mut predictor =
+            RateBackendPredictor::from_backend(backend.clone(), max_order, min_prob);
+        predictor
+            .begin_stream(None)
+            .map_err(|err| format!("failed to start RateBackend predictor stream: {err}"))?;
+        Ok(Self {
+            backend,
+            max_order,
+            min_prob,
+            predictor,
+        })
+    }
+
+    #[inline(always)]
+    fn bit_to_byte(sym: bool) -> u8 {
+        if sym { 1u8 } else { 0u8 }
+    }
+
+    fn clone_state(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            max_order: self.max_order,
+            min_prob: self.min_prob,
+            predictor: self.predictor.clone(),
+        }
+    }
+}
+
+fn rate_backend_contains_zpaq(backend: &RateBackend) -> bool {
+    match backend {
+        RateBackend::Zpaq { .. } => true,
+        RateBackend::Mixture { spec } => spec
+            .experts
+            .iter()
+            .any(|expert| rate_backend_contains_zpaq(&expert.backend)),
+        RateBackend::Calibrated { spec } => rate_backend_contains_zpaq(&spec.base),
+        _ => false,
+    }
+}
+
+impl Predictor for RateBackendBitPredictor {
+    fn update(&mut self, sym: bool) {
+        self.predictor.update(Self::bit_to_byte(sym));
+    }
+
+    fn update_history(&mut self, sym: bool) {
+        self.predictor.update_frozen(Self::bit_to_byte(sym));
+    }
+
+    fn revert(&mut self) {
+        panic!(
+            "RateBackendBitPredictor does not support generic rollback; callers must use cloned temporary predictors"
+        );
+    }
+
+    fn pop_history(&mut self) {
+        panic!(
+            "RateBackendBitPredictor does not support generic rollback; callers must use cloned temporary predictors"
+        );
+    }
+
+    fn predict_prob(&mut self, sym: bool) -> f64 {
+        let p = self.predictor.log_prob(Self::bit_to_byte(sym)).exp();
+        if p.is_finite() {
+            p.clamp(self.min_prob, 1.0 - self.min_prob)
+        } else {
+            0.5
+        }
+    }
+
+    fn model_name(&self) -> String {
+        format!(
+            "RateBackendBits({})",
+            RateBackendPredictor::default_name(&self.backend, self.max_order)
+        )
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(self.clone_state())
     }
 }
 
@@ -333,15 +445,15 @@ use crate::coders::softmax_pdf_floor_inplace;
 /// the agent to leverage large pre-trained models for sequence prediction.
 #[cfg(feature = "backend-rwkv")]
 pub struct RwkvPredictor {
-    compressor: Compressor,
-    history: Vec<(State, Vec<f64>)>,
+    compressor: RwkvCompressor,
+    history: Vec<(RwkvState, Vec<f64>)>,
 }
 
 #[cfg(feature = "backend-rwkv")]
 impl RwkvPredictor {
     /// Creates a new `RwkvPredictor` from an initialized `Model`.
-    pub fn new(model: Arc<Model>) -> Self {
-        let mut compressor = Compressor::new_from_model(model);
+    pub fn new(model: Arc<RwkvModel>) -> Self {
+        let mut compressor = RwkvCompressor::new_from_model(model);
         let vocab_size = compressor.vocab_size();
         let logits = compressor
             .model
@@ -352,6 +464,17 @@ impl RwkvPredictor {
             compressor,
             history: Vec::new(),
         }
+    }
+
+    /// Creates a new `RwkvPredictor` from a method string.
+    pub fn from_method(method: &str) -> Result<Self, String> {
+        let mut compressor =
+            RwkvCompressor::new_from_method(method).map_err(|err| err.to_string())?;
+        compressor.forward_to_internal_pdf(0);
+        Ok(Self {
+            compressor,
+            history: Vec::new(),
+        })
     }
 }
 
@@ -390,6 +513,91 @@ impl Predictor for RwkvPredictor {
 
     fn model_name(&self) -> String {
         "RWKV".to_string()
+    }
+
+    fn boxed_clone(&self) -> Box<dyn Predictor> {
+        Box::new(Self {
+            compressor: self.compressor.clone(),
+            history: self.history.clone(),
+        })
+    }
+}
+
+/// A predictor using the Mamba neural network architecture.
+#[cfg(feature = "backend-mamba")]
+pub struct MambaPredictor {
+    compressor: MambaCompressor,
+    history: Vec<(MambaState, Vec<f64>)>,
+}
+
+#[cfg(feature = "backend-mamba")]
+impl MambaPredictor {
+    /// Creates a new `MambaPredictor` from an initialized `Model`.
+    pub fn new(model: Arc<MambaModel>) -> Self {
+        let mut compressor = MambaCompressor::new_from_model(model);
+        let logits = compressor
+            .model
+            .forward(&mut compressor.scratch, 0, &mut compressor.state)
+            .to_vec();
+        let bias = compressor.online_bias_snapshot();
+        MambaCompressor::logits_to_pdf(&logits, bias.as_deref(), &mut compressor.pdf_buffer);
+
+        Self {
+            compressor,
+            history: Vec::new(),
+        }
+    }
+
+    /// Creates a new `MambaPredictor` from a method string.
+    pub fn from_method(method: &str) -> Result<Self, String> {
+        let mut compressor =
+            MambaCompressor::new_from_method(method).map_err(|err| err.to_string())?;
+        let mut pdf = vec![0.0f64; compressor.vocab_size()];
+        compressor.forward_to_pdf(0, &mut pdf);
+        compressor.pdf_buffer.clone_from(&pdf);
+        Ok(Self {
+            compressor,
+            history: Vec::new(),
+        })
+    }
+}
+
+#[cfg(feature = "backend-mamba")]
+impl Predictor for MambaPredictor {
+    fn update(&mut self, sym: bool) {
+        self.history.push((
+            self.compressor.state.clone(),
+            self.compressor.pdf_buffer.clone(),
+        ));
+
+        let byte = if sym { 1u32 } else { 0u32 };
+        let logits = self
+            .compressor
+            .model
+            .forward(
+                &mut self.compressor.scratch,
+                byte,
+                &mut self.compressor.state,
+            )
+            .to_vec();
+        let bias = self.compressor.online_bias_snapshot();
+        MambaCompressor::logits_to_pdf(&logits, bias.as_deref(), &mut self.compressor.pdf_buffer);
+    }
+
+    fn revert(&mut self) {
+        if let Some((state, pdf)) = self.history.pop() {
+            self.compressor.state = state;
+            self.compressor.pdf_buffer = pdf;
+        }
+    }
+
+    fn predict_prob(&mut self, sym: bool) -> f64 {
+        let idx = if sym { 1 } else { 0 };
+        self.compressor.pdf_buffer[idx]
+    }
+
+    fn model_name(&self) -> String {
+        "Mamba".to_string()
     }
 
     fn boxed_clone(&self) -> Box<dyn Predictor> {

@@ -136,7 +136,7 @@ where
     F: Fn(&[u8], &[u8]) -> f64,
 {
     let val = ncd(x, y);
-    val >= -1e-12 && val <= 1.1
+    (-1e-12..=1.1).contains(&val)
 }
 
 /// Verify entropy is bounded by log2(alphabet_size).
@@ -146,5 +146,5 @@ where
     F: Fn(&[u8]) -> f64,
 {
     let h = entropy(data);
-    h >= -1e-12 && h <= 8.0 + 1e-12
+    (-1e-12..=8.0 + 1e-12).contains(&h)
 }

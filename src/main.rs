@@ -30,6 +30,7 @@
 //! See `print_usage` for details on supported primitives.
 
 use infotheory::aixi::agent::{Agent, AgentConfig};
+use infotheory::aixi::aiqi::{AiqiAgent, AiqiConfig};
 use infotheory::aixi::common::{ObservationKeyMode, RandomGenerator};
 use infotheory::aixi::environment::{
     BiasedRockPaperScissor, CoinFlip, CtwTest, Environment, ExtendedTiger, KuhnPoker, TicTacToe,
@@ -46,7 +47,7 @@ use infotheory::*;
 use nyx_lite::SharedMemoryPolicy;
 use std::env;
 use std::fs::File;
-use std::io::{self, BufRead, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "vm")]
@@ -55,7 +56,7 @@ use std::time::{Duration, Instant};
 #[cfg(not(feature = "vm"))]
 use std::time::Instant;
 
-mod search;
+use infotheory::search;
 
 struct AixiRunLogger {
     bits01: Option<BufWriter<File>>,
@@ -132,7 +133,7 @@ impl AixiRunLogger {
                 "observations": observations,
                 "reward": reward,
             });
-            writeln!(w, "{}", rec.to_string())?;
+            writeln!(w, "{rec}")?;
         }
         Ok(())
     }
@@ -148,14 +149,14 @@ impl AixiRunLogger {
                 "kind": "action",
                 "action": action,
             });
-            writeln!(w, "{}", rec.to_string())?;
+            writeln!(w, "{rec}")?;
         }
         Ok(())
     }
 
     fn next_step(&mut self) -> anyhow::Result<()> {
         self.step = self.step.saturating_add(1);
-        if self.flush_every > 0 && (self.step % self.flush_every == 0) {
+        if self.flush_every > 0 && self.step.is_multiple_of(self.flush_every) {
             if let Some(w) = self.bits01.as_mut() {
                 w.flush()?;
             }
@@ -171,6 +172,14 @@ impl AixiRunLogger {
 fn rwkv7_model_path_from_env() -> String {
     env::var("RWKV7_MODEL_PATH").unwrap_or_else(|_| {
         eprintln!("Error: RWKV7_MODEL_PATH env var must be set when using rwkv7 backends");
+        std::process::exit(1);
+    })
+}
+
+#[cfg(feature = "backend-mamba")]
+fn mamba_model_path_from_env() -> String {
+    env::var("MAMBA_MODEL_PATH").unwrap_or_else(|_| {
+        eprintln!("Error: MAMBA_MODEL_PATH env var must be set when using mamba backends");
         std::process::exit(1);
     })
 }
@@ -229,12 +238,157 @@ fn load_mixture_spec_with_depth(path: &str, depth: usize) -> anyhow::Result<Mixt
     parse_mixture_spec_value(&value, base_dir, depth)
 }
 
+fn load_particle_spec(path: &str) -> anyhow::Result<ParticleSpec> {
+    let raw = std::fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)?;
+    let spec = parse_particle_spec_value(&value)?;
+    spec.validate()
+        .map_err(|e| anyhow::anyhow!("invalid particle spec: {e}"))?;
+    Ok(spec)
+}
+
+fn load_calibrated_spec(path: &str) -> anyhow::Result<CalibratedSpec> {
+    let raw = std::fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)?;
+    let base_dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    parse_calibrated_spec_value(&value, base_dir, 4)
+}
+
+fn load_expert_spec(path: &str) -> anyhow::Result<MixtureExpertSpec> {
+    let raw = std::fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)?;
+    let base_dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    parse_mixture_expert_value(&value, base_dir, MAX_MIXTURE_NESTING)
+}
+
+fn parse_particle_spec_value(v: &serde_json::Value) -> anyhow::Result<ParticleSpec> {
+    if v.get("experts").is_some() {
+        return Err(anyhow::anyhow!(
+            "looks like a mixture spec (found 'experts'); --rate-backend particle expects a ParticleSpec JSON"
+        ));
+    }
+    if let Some(kind) = v.get("kind").and_then(|k| k.as_str()) {
+        let k = kind.to_ascii_lowercase();
+        if matches!(
+            k.as_str(),
+            "bayes"
+                | "fading"
+                | "fading-bayes"
+                | "switch"
+                | "switching"
+                | "mdl"
+                | "neural"
+                | "mixture"
+        ) {
+            return Err(anyhow::anyhow!(
+                "looks like a mixture spec (kind='{kind}'); --rate-backend particle expects a ParticleSpec JSON"
+            ));
+        }
+    }
+    let d = ParticleSpec::default();
+    Ok(ParticleSpec {
+        num_particles: v["num_particles"]
+            .as_u64()
+            .unwrap_or(d.num_particles as u64) as usize,
+        context_window: v["context_window"]
+            .as_u64()
+            .unwrap_or(d.context_window as u64) as usize,
+        unroll_steps: v["unroll_steps"].as_u64().unwrap_or(d.unroll_steps as u64) as usize,
+        num_cells: v["num_cells"].as_u64().unwrap_or(d.num_cells as u64) as usize,
+        cell_dim: v["cell_dim"].as_u64().unwrap_or(d.cell_dim as u64) as usize,
+        num_rules: v["num_rules"].as_u64().unwrap_or(d.num_rules as u64) as usize,
+        selector_hidden: v["selector_hidden"]
+            .as_u64()
+            .unwrap_or(d.selector_hidden as u64) as usize,
+        rule_hidden: v["rule_hidden"].as_u64().unwrap_or(d.rule_hidden as u64) as usize,
+        noise_dim: v["noise_dim"].as_u64().unwrap_or(d.noise_dim as u64) as usize,
+        deterministic: v["deterministic"].as_bool().unwrap_or(d.deterministic),
+        enable_noise: v["enable_noise"].as_bool().unwrap_or(d.enable_noise),
+        noise_scale: v["noise_scale"].as_f64().unwrap_or(d.noise_scale),
+        noise_anneal_steps: v["noise_anneal_steps"]
+            .as_u64()
+            .unwrap_or(d.noise_anneal_steps as u64) as usize,
+        learning_rate_readout: v["learning_rate_readout"]
+            .as_f64()
+            .unwrap_or(d.learning_rate_readout),
+        learning_rate_selector: v["learning_rate_selector"]
+            .as_f64()
+            .unwrap_or(d.learning_rate_selector),
+        learning_rate_rule: v["learning_rate_rule"]
+            .as_f64()
+            .unwrap_or(d.learning_rate_rule),
+        bptt_depth: v["bptt_depth"].as_u64().unwrap_or(d.bptt_depth as u64) as usize,
+        optimizer_momentum: v["optimizer_momentum"]
+            .as_f64()
+            .unwrap_or(d.optimizer_momentum),
+        grad_clip: v["grad_clip"].as_f64().unwrap_or(d.grad_clip),
+        state_clip: v["state_clip"].as_f64().unwrap_or(d.state_clip),
+        forget_lambda: v["forget_lambda"].as_f64().unwrap_or(d.forget_lambda),
+        resample_threshold: v["resample_threshold"]
+            .as_f64()
+            .unwrap_or(d.resample_threshold),
+        mutate_fraction: v["mutate_fraction"].as_f64().unwrap_or(d.mutate_fraction),
+        mutate_scale: v["mutate_scale"].as_f64().unwrap_or(d.mutate_scale),
+        mutate_model_params: v["mutate_model_params"]
+            .as_bool()
+            .unwrap_or(d.mutate_model_params),
+        diagnostics_interval: v["diagnostics_interval"]
+            .as_u64()
+            .unwrap_or(d.diagnostics_interval as u64) as usize,
+        min_prob: v["min_prob"].as_f64().unwrap_or(d.min_prob),
+        seed: v["seed"].as_u64().unwrap_or(d.seed),
+    })
+}
+
+fn parse_calibration_context_kind(value: Option<&str>) -> anyhow::Result<CalibrationContextKind> {
+    match value.unwrap_or("text").trim().to_ascii_lowercase().as_str() {
+        "global" => Ok(CalibrationContextKind::Global),
+        "byteclass" | "byte-class" | "byte_class" => Ok(CalibrationContextKind::ByteClass),
+        "text" => Ok(CalibrationContextKind::Text),
+        "repeat" => Ok(CalibrationContextKind::Repeat),
+        "textrepeat" | "text-repeat" | "text_repeat" => Ok(CalibrationContextKind::TextRepeat),
+        other => Err(anyhow::anyhow!("unknown calibration context '{other}'")),
+    }
+}
+
+fn parse_calibrated_spec_value(
+    v: &serde_json::Value,
+    base_dir: &Path,
+    depth: usize,
+) -> anyhow::Result<CalibratedSpec> {
+    if depth == 0 {
+        return Err(anyhow::anyhow!("calibrated spec nesting too deep"));
+    }
+    let base_backend = if let Some(base_v) = v.get("base") {
+        parse_mixture_expert_value(base_v, base_dir, depth - 1)?.backend
+    } else if let Some(path) = v["base_path"].as_str().or_else(|| v["path"].as_str()) {
+        let full = base_dir.join(path);
+        let raw = std::fs::read(&full)?;
+        let value: serde_json::Value = serde_json::from_slice(&raw)?;
+        parse_mixture_expert_value(&value, full.parent().unwrap_or(base_dir), depth - 1)?.backend
+    } else {
+        return Err(anyhow::anyhow!(
+            "calibrated expert requires 'base' or 'base_path'"
+        ));
+    };
+    Ok(CalibratedSpec {
+        base: base_backend,
+        context: parse_calibration_context_kind(v["context"].as_str())?,
+        bins: v["bins"].as_u64().unwrap_or(33) as usize,
+        learning_rate: v["learning_rate"].as_f64().unwrap_or(0.02),
+        bias_clip: v["bias_clip"].as_f64().unwrap_or(4.0),
+    })
+}
+
 fn parse_mixture_kind(kind: &str) -> anyhow::Result<MixtureKind> {
     match kind {
         "bayes" | "bayes-mix" | "bayes_mix" => Ok(MixtureKind::Bayes),
         "fading" | "fading-bayes" | "fading_bayes" => Ok(MixtureKind::FadingBayes),
         "switch" | "switching" | "switch-mix" | "switch_mix" => Ok(MixtureKind::Switching),
         "mdl" | "selector" | "mdr" => Ok(MixtureKind::Mdl),
+        "neural" | "neural-mix" | "neural_mix" | "fx2" | "fx2-cmix" | "fx2_cmix" => {
+            Ok(MixtureKind::Neural)
+        }
         other => Err(anyhow::anyhow!("unknown mixture kind '{other}'")),
     }
 }
@@ -320,6 +474,52 @@ fn parse_mixture_expert_value(
                 backend: RateBackend::RosaPlus,
             })
         }
+        "match" => Ok(MixtureExpertSpec {
+            name,
+            log_prior,
+            max_order: -1,
+            backend: RateBackend::Match {
+                hash_bits: v["hash_bits"].as_u64().unwrap_or(20) as usize,
+                min_len: v["min_len"].as_u64().unwrap_or(4) as usize,
+                max_len: v["max_len"].as_u64().unwrap_or(255) as usize,
+                base_mix: v["base_mix"].as_f64().unwrap_or(0.02),
+                confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
+            },
+        }),
+        "sparse-match" => Ok(MixtureExpertSpec {
+            name,
+            log_prior,
+            max_order: -1,
+            backend: RateBackend::SparseMatch {
+                hash_bits: v["hash_bits"].as_u64().unwrap_or(19) as usize,
+                min_len: v["min_len"].as_u64().unwrap_or(3) as usize,
+                max_len: v["max_len"].as_u64().unwrap_or(64) as usize,
+                gap_min: v["gap_min"].as_u64().unwrap_or(1) as usize,
+                gap_max: v["gap_max"].as_u64().unwrap_or(2) as usize,
+                base_mix: v["base_mix"].as_f64().unwrap_or(0.05),
+                confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
+            },
+        }),
+        "ppmd" => Ok(MixtureExpertSpec {
+            name,
+            log_prior,
+            max_order: -1,
+            backend: RateBackend::Ppmd {
+                order: v["order"].as_u64().unwrap_or(10) as usize,
+                memory_mb: v["memory_mb"].as_u64().unwrap_or(64) as usize,
+            },
+        }),
+        "calibrated" => {
+            let spec = parse_calibrated_spec_value(v, base_dir, depth - 1)?;
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order: -1,
+                backend: RateBackend::Calibrated {
+                    spec: Arc::new(spec),
+                },
+            })
+        }
         "ctw" => {
             let depth = v["depth"]
                 .as_u64()
@@ -366,6 +566,43 @@ fn parse_mixture_expert_value(
                 backend: RateBackend::Zpaq { method },
             })
         }
+        "mamba" => {
+            #[cfg(feature = "backend-mamba")]
+            {
+                if let Some(method) = v["method"].as_str().or_else(|| v["mamba_method"].as_str()) {
+                    Ok(MixtureExpertSpec {
+                        name,
+                        log_prior,
+                        max_order: -1,
+                        backend: RateBackend::MambaMethod {
+                            method: method.to_string(),
+                        },
+                    })
+                } else {
+                    let model_path = v["model_path"]
+                        .as_str()
+                        .or_else(|| v["mamba_model_path"].as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("mamba expert missing model_path or method")
+                        })?;
+                    let model_path = base_dir.join(model_path);
+                    let model = load_mamba_model_from_path(model_path.to_string_lossy().as_ref());
+                    Ok(MixtureExpertSpec {
+                        name,
+                        log_prior,
+                        max_order: -1,
+                        backend: RateBackend::Mamba { model },
+                    })
+                }
+            }
+            #[cfg(not(feature = "backend-mamba"))]
+            {
+                let _ = (name, log_prior);
+                Err(anyhow::anyhow!(
+                    "mamba expert requires 'backend-mamba' feature in infotheory"
+                ))
+            }
+        }
         "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
@@ -385,7 +622,8 @@ fn parse_mixture_expert_value(
                         .ok_or_else(|| {
                             anyhow::anyhow!("rwkv expert missing model_path or method")
                         })?;
-                    let model = load_rwkv7_model_from_path(model_path);
+                    let model_path = base_dir.join(model_path);
+                    let model = load_rwkv7_model_from_path(model_path.to_string_lossy().as_ref());
                     Ok(MixtureExpertSpec {
                         name,
                         log_prior,
@@ -422,6 +660,26 @@ fn parse_mixture_expert_value(
                 },
             })
         }
+        "particle" => {
+            let spec = if let Some(spec_v) = v.get("spec") {
+                parse_particle_spec_value(spec_v)?
+            } else if let Some(path) = v["spec_path"].as_str().or_else(|| v["path"].as_str()) {
+                let full = base_dir.join(path);
+                load_particle_spec(full.to_str().unwrap_or(path))?
+            } else {
+                ParticleSpec::default()
+            };
+            spec.validate()
+                .map_err(|e| anyhow::anyhow!("invalid particle spec: {e}"))?;
+            Ok(MixtureExpertSpec {
+                name,
+                log_prior,
+                max_order: -1,
+                backend: RateBackend::Particle {
+                    spec: Arc::new(spec),
+                },
+            })
+        }
         other => Err(anyhow::anyhow!("unsupported expert kind '{other}'")),
     }
 }
@@ -440,6 +698,7 @@ fn parse_nyx_environment_config(
     observation_bits: usize,
     reward_bits: usize,
     agent_horizon: usize,
+    base_dir: &Path,
 ) -> anyhow::Result<NyxVmConfig> {
     let vm = &v["vm_config"];
     if vm.is_null() {
@@ -486,6 +745,7 @@ fn parse_nyx_environment_config(
             &v["vm_stats_backend"]
         },
         v,
+        base_dir,
     )?;
     let trace = parse_nyx_trace_config(if !vm["trace"].is_null() {
         &vm["trace"]
@@ -571,10 +831,10 @@ fn parse_nyx_environment_config(
     })
 }
 
-#[cfg(feature = "vm")]
 fn parse_vm_stats_backend(
     cfg: &serde_json::Value,
     root: &serde_json::Value,
+    base_dir: &Path,
 ) -> anyhow::Result<RateBackend> {
     let fallback = default_vm_stats_backend(root)?;
     if cfg.is_null() {
@@ -589,25 +849,25 @@ fn parse_vm_stats_backend(
         .unwrap_or("rosaplus");
 
     let resolved = match infotheory::backends::resolve_rate_backend_name(name) {
-        Some(infotheory::backends::BackendAvailability::Enabled(name)) => Some(name),
+        Some(infotheory::backends::BackendAvailability::Enabled(name)) => name,
         Some(infotheory::backends::BackendAvailability::Disabled { canonical, feature }) => {
             return Err(anyhow::anyhow!(
                 "rate backend '{canonical}' requires infotheory feature '{feature}'"
             ));
         }
-        None => None,
+        None => return Err(anyhow::anyhow!("unknown vm stats backend '{name}'")),
     };
 
     match resolved {
-        Some("rosaplus") => Ok(RateBackend::RosaPlus),
-        Some("ctw") => {
+        "rosaplus" => Ok(RateBackend::RosaPlus),
+        "ctw" => {
             let depth = cfg["ct_depth"]
                 .as_u64()
                 .or_else(|| cfg["depth"].as_u64())
                 .unwrap_or(32) as usize;
             Ok(RateBackend::Ctw { depth })
         }
-        Some("fac-ctw") => {
+        "fac-ctw" => {
             let base_depth = cfg["base_depth"]
                 .as_u64()
                 .or_else(|| cfg["ct_depth"].as_u64())
@@ -630,17 +890,54 @@ fn parse_vm_stats_backend(
                 encoding_bits,
             })
         }
-        Some("rwkv7") => {
+        "mamba" => {
+            #[cfg(feature = "backend-mamba")]
+            {
+                if let Some(method) = cfg["method"]
+                    .as_str()
+                    .or_else(|| cfg["mamba_method"].as_str())
+                {
+                    Ok(RateBackend::MambaMethod {
+                        method: method.to_string(),
+                    })
+                } else {
+                    let path = cfg["mamba_model_path"]
+                        .as_str()
+                        .or_else(|| cfg["model_path"].as_str())
+                        .or_else(|| root["mamba_model_path"].as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(mamba_model_path_from_env);
+                    let model = load_mamba_model_from_path(&path);
+                    Ok(RateBackend::Mamba { model })
+                }
+            }
+            #[cfg(not(feature = "backend-mamba"))]
+            {
+                Err(anyhow::anyhow!(
+                    "mamba stats backend requires 'backend-mamba' feature in infotheory"
+                ))
+            }
+        }
+        "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
-                let path = cfg["rwkv_model_path"]
+                if let Some(method) = cfg["method"]
                     .as_str()
-                    .or_else(|| cfg["model_path"].as_str())
-                    .or_else(|| root["rwkv_model_path"].as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(rwkv7_model_path_from_env);
-                let model = load_rwkv7_model_from_path(&path);
-                Ok(RateBackend::Rwkv7 { model })
+                    .or_else(|| cfg["rwkv_method"].as_str())
+                {
+                    Ok(RateBackend::Rwkv7Method {
+                        method: method.to_string(),
+                    })
+                } else {
+                    let path = cfg["rwkv_model_path"]
+                        .as_str()
+                        .or_else(|| cfg["model_path"].as_str())
+                        .or_else(|| root["rwkv_model_path"].as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(rwkv7_model_path_from_env);
+                    let model = load_rwkv7_model_from_path(&path);
+                    Ok(RateBackend::Rwkv7 { model })
+                }
             }
             #[cfg(not(feature = "backend-rwkv"))]
             {
@@ -649,7 +946,7 @@ fn parse_vm_stats_backend(
                 ))
             }
         }
-        Some("zpaq") => {
+        "zpaq" => {
             let method = cfg["method"]
                 .as_str()
                 .or_else(|| cfg["zpaq_method"].as_str())
@@ -663,23 +960,88 @@ fn parse_vm_stats_backend(
             }
             Ok(RateBackend::Zpaq { method })
         }
-        Some("mixture") => {
-            let spec_path = cfg["mixture_spec"]
+        "match" => Ok(RateBackend::Match {
+            hash_bits: cfg["hash_bits"].as_u64().unwrap_or(20) as usize,
+            min_len: cfg["min_len"].as_u64().unwrap_or(4) as usize,
+            max_len: cfg["max_len"].as_u64().unwrap_or(255) as usize,
+            base_mix: cfg["base_mix"].as_f64().unwrap_or(0.02),
+            confidence_scale: cfg["confidence_scale"].as_f64().unwrap_or(1.0),
+        }),
+        "sparse-match" => Ok(RateBackend::SparseMatch {
+            hash_bits: cfg["hash_bits"].as_u64().unwrap_or(19) as usize,
+            min_len: cfg["min_len"].as_u64().unwrap_or(3) as usize,
+            max_len: cfg["max_len"].as_u64().unwrap_or(64) as usize,
+            gap_min: cfg["gap_min"].as_u64().unwrap_or(1) as usize,
+            gap_max: cfg["gap_max"].as_u64().unwrap_or(2) as usize,
+            base_mix: cfg["base_mix"].as_f64().unwrap_or(0.05),
+            confidence_scale: cfg["confidence_scale"].as_f64().unwrap_or(1.0),
+        }),
+        "ppmd" => Ok(RateBackend::Ppmd {
+            order: cfg["order"].as_u64().unwrap_or(10) as usize,
+            memory_mb: cfg["memory_mb"].as_u64().unwrap_or(64) as usize,
+        }),
+        "mixture" => {
+            let spec = if let Some(spec_v) = cfg.get("spec").filter(|value| value.is_object()) {
+                parse_mixture_spec_value(spec_v, base_dir, MAX_MIXTURE_NESTING)?
+            } else if let Some(path) = cfg["mixture_spec"]
                 .as_str()
                 .or_else(|| cfg["spec_path"].as_str())
                 .or_else(|| cfg["spec"].as_str())
                 .or_else(|| root["mixture_spec"].as_str())
-                .ok_or_else(|| anyhow::anyhow!("mixture stats backend requires mixture_spec"))?;
-            let spec = load_mixture_spec(spec_path)?;
+            {
+                let full = base_dir.join(path);
+                load_mixture_spec(full.to_str().unwrap_or(path))?
+            } else {
+                return Err(anyhow::anyhow!(
+                    "mixture stats backend requires inline 'spec' or 'mixture_spec' path"
+                ));
+            };
             Ok(RateBackend::Mixture {
                 spec: Arc::new(spec),
             })
         }
-        _ => Ok(fallback),
+        "particle" => {
+            let spec = if let Some(spec_v) = cfg.get("spec").filter(|value| value.is_object()) {
+                parse_particle_spec_value(spec_v)?
+            } else if let Some(path) = cfg["particle_spec"]
+                .as_str()
+                .or_else(|| cfg["spec_path"].as_str())
+                .or_else(|| cfg["spec"].as_str())
+                .or_else(|| root["particle_spec"].as_str())
+            {
+                let full = base_dir.join(path);
+                load_particle_spec(full.to_str().unwrap_or(path))?
+            } else {
+                parse_particle_spec_value(cfg)?
+            };
+            spec.validate()
+                .map_err(|e| anyhow::anyhow!("invalid particle spec: {e}"))?;
+            Ok(RateBackend::Particle {
+                spec: Arc::new(spec),
+            })
+        }
+        "calibrated" => {
+            let spec = if let Some(spec_v) = cfg.get("spec").filter(|value| value.is_object()) {
+                parse_calibrated_spec_value(spec_v, base_dir, 4)?
+            } else if let Some(path) = cfg["calibrated_spec"]
+                .as_str()
+                .or_else(|| cfg["spec_path"].as_str())
+                .or_else(|| cfg["spec"].as_str())
+                .or_else(|| root["calibrated_spec"].as_str())
+            {
+                let full = base_dir.join(path);
+                load_calibrated_spec(full.to_str().unwrap_or(path))?
+            } else {
+                parse_calibrated_spec_value(cfg, base_dir, 4)?
+            };
+            Ok(RateBackend::Calibrated {
+                spec: Arc::new(spec),
+            })
+        }
+        other => Err(anyhow::anyhow!("unsupported vm stats backend '{other}'")),
     }
 }
 
-#[cfg(feature = "vm")]
 fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBackend> {
     let algo = root["algorithm"].as_str().unwrap_or("ctw");
     let ct_depth = root["ct_depth"].as_u64().unwrap_or(20) as usize;
@@ -690,6 +1052,23 @@ fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBack
             num_percept_bits: 8,
             encoding_bits: 8,
         }),
+        "mamba" | "mamba1" => {
+            #[cfg(feature = "backend-mamba")]
+            {
+                let path = root["mamba_model_path"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(mamba_model_path_from_env);
+                let model = load_mamba_model_from_path(&path);
+                Ok(RateBackend::Mamba { model })
+            }
+            #[cfg(not(feature = "backend-mamba"))]
+            {
+                Err(anyhow::anyhow!(
+                    "mamba default stats backend requires 'backend-mamba' feature in infotheory"
+                ))
+            }
+        }
         "rosa" | "rosaplus" => Ok(RateBackend::RosaPlus),
         "rwkv" | "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
@@ -782,7 +1161,7 @@ fn parse_nyx_protocol_config(v: &serde_json::Value) -> NyxProtocolConfig {
         cfg.data_prefix = s.to_string();
     }
     if let Some(s) = v["wire_encoding"].as_str() {
-        if let Some(enc) = NyxPayloadEncoding::from_str(s) {
+        if let Some(enc) = NyxPayloadEncoding::parse(s) {
             cfg.wire_encoding = enc;
         }
     }
@@ -796,7 +1175,7 @@ fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActionSource> {
         "fuzz" => {
             let fuzz = if v["fuzz"].is_null() { v } else { &v["fuzz"] };
             let seed_encoding =
-                NyxPayloadEncoding::from_str(fuzz["seed_encoding"].as_str().unwrap_or("utf8"))
+                NyxPayloadEncoding::parse(fuzz["seed_encoding"].as_str().unwrap_or("utf8"))
                     .unwrap_or(NyxPayloadEncoding::Utf8);
             let mut seeds = Vec::new();
             if let Some(arr) = fuzz["seed_paths"].as_array() {
@@ -828,7 +1207,7 @@ fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActionSource> {
             let min_len = fuzz["min_len"].as_u64().unwrap_or(1) as usize;
             let max_len = fuzz["max_len"].as_u64().unwrap_or(4096) as usize;
             let dict_encoding =
-                NyxPayloadEncoding::from_str(fuzz["dict_encoding"].as_str().unwrap_or("utf8"))
+                NyxPayloadEncoding::parse(fuzz["dict_encoding"].as_str().unwrap_or("utf8"))
                     .unwrap_or(NyxPayloadEncoding::Utf8);
             let mut dictionary = Vec::new();
             if let Some(arr) = fuzz["dictionary"].as_array() {
@@ -862,7 +1241,7 @@ fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActionSource> {
                     }
                     let payload = item["payload"].as_str().unwrap_or_default();
                     let encoding =
-                        NyxPayloadEncoding::from_str(item["encoding"].as_str().unwrap_or("utf8"))
+                        NyxPayloadEncoding::parse(item["encoding"].as_str().unwrap_or("utf8"))
                             .unwrap_or(NyxPayloadEncoding::Utf8);
                     let payload = encoding.decode(payload)?;
                     let name = item["name"].as_str().map(|s| s.to_string());
@@ -1018,26 +1397,24 @@ fn validate_observation_config(
         if let (Some(top_len), Some(vm_len)) = (
             extract_observation_stream_len_raw(v),
             extract_vm_observation_stream_len_raw(&v["vm_observation"]),
-        ) {
-            if top_len != vm_len {
-                return Err(anyhow::anyhow!(
-                    "observation_stream_len ({}) conflicts with vm_observation.stream_len ({})",
-                    top_len,
-                    vm_len
-                ));
-            }
+        ) && top_len != vm_len
+        {
+            return Err(anyhow::anyhow!(
+                "observation_stream_len ({}) conflicts with vm_observation.stream_len ({})",
+                top_len,
+                vm_len
+            ));
         }
         if let (Some(top_mode), Some(vm_mode)) = (
             extract_observation_key_mode_raw(v),
             extract_vm_observation_key_mode_raw(&v["vm_observation"]),
-        ) {
-            if top_mode != vm_mode {
-                return Err(anyhow::anyhow!(
-                    "observation_key_mode ({:?}) conflicts with vm_observation.key_mode ({:?})",
-                    top_mode,
-                    vm_mode
-                ));
-            }
+        ) && top_mode != vm_mode
+        {
+            return Err(anyhow::anyhow!(
+                "observation_key_mode ({:?}) conflicts with vm_observation.key_mode ({:?})",
+                top_mode,
+                vm_mode
+            ));
         }
     }
     if observation_stream_len > 1 && matches!(observation_key_mode, ObservationKeyMode::First) {
@@ -1069,6 +1446,18 @@ fn validate_obs_stream_len(expected: usize, actual: usize) -> anyhow::Result<()>
         ));
     }
     Ok(())
+}
+
+fn aiqi_backend_label(config: &AiqiConfig) -> String {
+    if let Some(rate_backend) = &config.rate_backend {
+        let name = infotheory::mixture::RateBackendPredictor::default_name(
+            rate_backend,
+            config.rate_backend_max_order,
+        );
+        format!("rate_backend={name}")
+    } else {
+        format!("algorithm={}", config.algorithm)
+    }
 }
 
 #[cfg(feature = "vm")]
@@ -1154,71 +1543,159 @@ fn parse_nyx_filter(
     }))
 }
 
-fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>) -> InfotheoryCtx {
-    let rate_backend = match rate_backend {
-        "rwkv7" => {
-            #[cfg(feature = "backend-rwkv")]
-            {
-                if let Some(m) = method {
-                    RateBackend::Rwkv7Method {
-                        method: m.to_string(),
+struct BuiltCtx {
+    ctx: InfotheoryCtx,
+    expert_spec_max_order: Option<i64>,
+}
+
+fn build_ctx(
+    rate_backend: &str,
+    compression_backend: &str,
+    method: Option<&str>,
+    expert_spec_path: Option<&str>,
+) -> BuiltCtx {
+    let (rate_backend, expert_spec_max_order) = if let Some(path) = expert_spec_path {
+        let spec = load_expert_spec(path).unwrap_or_else(|e| {
+            eprintln!("Error: failed to load expert spec '{path}': {e}");
+            std::process::exit(1);
+        });
+        (spec.backend, Some(spec.max_order))
+    } else {
+        (
+            match rate_backend {
+                "mamba" => {
+                    #[cfg(feature = "backend-mamba")]
+                    {
+                        if let Some(m) = method {
+                            RateBackend::MambaMethod {
+                                method: m.to_string(),
+                            }
+                        } else {
+                            let p = mamba_model_path_from_env();
+                            let model = load_mamba_model_from_path(&p);
+                            RateBackend::Mamba { model }
+                        }
                     }
-                } else {
-                    let p = rwkv7_model_path_from_env();
-                    let model = load_rwkv7_model_from_path(&p);
-                    RateBackend::Rwkv7 { model }
+                    #[cfg(not(feature = "backend-mamba"))]
+                    {
+                        eprintln!(
+                            "Error: rate backend 'mamba' requires infotheory built with feature 'backend-mamba'"
+                        );
+                        std::process::exit(1);
+                    }
                 }
-            }
-            #[cfg(not(feature = "backend-rwkv"))]
-            {
-                eprintln!(
-                    "Error: rate backend 'rwkv7' requires infotheory built with feature 'backend-rwkv'"
-                );
-                std::process::exit(1);
-            }
-        }
-        "ctw" => {
-            let depth = if let Some(m) = method {
-                m.parse::<usize>().unwrap_or(20)
-            } else {
-                20
-            };
-            RateBackend::Ctw { depth }
-        }
-        "fac-ctw" => {
-            let depth = if let Some(m) = method {
-                m.parse::<usize>().unwrap_or(20)
-            } else {
-                20
-            };
-            RateBackend::FacCtw {
-                base_depth: depth,
-                num_percept_bits: 8, // Default for byte-oriented CLI
-                encoding_bits: 8,    // Default for byte-oriented CLI
-            }
-        }
-        "zpaq" => {
-            let m = method.unwrap_or("2").to_string();
-            if let Err(err) = validate_zpaq_rate_method(&m) {
-                eprintln!("Error: unsupported ZPAQ rate method '{m}': {err}");
-                std::process::exit(1);
-            }
-            RateBackend::Zpaq { method: m }
-        }
-        "mixture" => {
-            let path = method.unwrap_or_else(|| {
-                eprintln!("Error: --rate-backend mixture requires --method <spec.json>");
-                std::process::exit(1);
-            });
-            let spec = load_mixture_spec(path).unwrap_or_else(|e| {
-                eprintln!("Error: failed to load mixture spec '{path}': {e}");
-                std::process::exit(1);
-            });
-            RateBackend::Mixture {
-                spec: Arc::new(spec),
-            }
-        }
-        _ => RateBackend::RosaPlus,
+                "rwkv7" => {
+                    #[cfg(feature = "backend-rwkv")]
+                    {
+                        if let Some(m) = method {
+                            RateBackend::Rwkv7Method {
+                                method: m.to_string(),
+                            }
+                        } else {
+                            let p = rwkv7_model_path_from_env();
+                            let model = load_rwkv7_model_from_path(&p);
+                            RateBackend::Rwkv7 { model }
+                        }
+                    }
+                    #[cfg(not(feature = "backend-rwkv"))]
+                    {
+                        eprintln!(
+                            "Error: rate backend 'rwkv7' requires infotheory built with feature 'backend-rwkv'"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                "match" => RateBackend::Match {
+                    hash_bits: 20,
+                    min_len: 4,
+                    max_len: 255,
+                    base_mix: 0.02,
+                    confidence_scale: 1.0,
+                },
+                "sparse-match" => RateBackend::SparseMatch {
+                    hash_bits: 19,
+                    min_len: 3,
+                    max_len: 64,
+                    gap_min: 1,
+                    gap_max: 2,
+                    base_mix: 0.05,
+                    confidence_scale: 1.0,
+                },
+                "ppmd" => RateBackend::Ppmd {
+                    order: method.and_then(|m| m.parse::<usize>().ok()).unwrap_or(10),
+                    memory_mb: 64,
+                },
+                "ctw" => {
+                    let depth = if let Some(m) = method {
+                        m.parse::<usize>().unwrap_or(20)
+                    } else {
+                        20
+                    };
+                    RateBackend::Ctw { depth }
+                }
+                "fac-ctw" => {
+                    let depth = if let Some(m) = method {
+                        m.parse::<usize>().unwrap_or(20)
+                    } else {
+                        20
+                    };
+                    RateBackend::FacCtw {
+                        base_depth: depth,
+                        num_percept_bits: 8, // Default for byte-oriented CLI
+                        encoding_bits: 8,    // Default for byte-oriented CLI
+                    }
+                }
+                "zpaq" => {
+                    let m = method.unwrap_or("2").to_string();
+                    if let Err(err) = validate_zpaq_rate_method(&m) {
+                        eprintln!("Error: unsupported ZPAQ rate method '{m}': {err}");
+                        std::process::exit(1);
+                    }
+                    RateBackend::Zpaq { method: m }
+                }
+                "mixture" => {
+                    let path = method.unwrap_or_else(|| {
+                        eprintln!("Error: --rate-backend mixture requires --method <spec.json>");
+                        std::process::exit(1);
+                    });
+                    let spec = load_mixture_spec(path).unwrap_or_else(|e| {
+                        eprintln!("Error: failed to load mixture spec '{path}': {e}");
+                        std::process::exit(1);
+                    });
+                    RateBackend::Mixture {
+                        spec: Arc::new(spec),
+                    }
+                }
+                "particle" => {
+                    let path = method.unwrap_or_else(|| {
+                        eprintln!("Error: --rate-backend particle requires --method <spec.json>");
+                        std::process::exit(1);
+                    });
+                    let spec = load_particle_spec(path).unwrap_or_else(|e| {
+                        eprintln!("Error: failed to load particle spec '{path}': {e}");
+                        std::process::exit(1);
+                    });
+                    RateBackend::Particle {
+                        spec: Arc::new(spec),
+                    }
+                }
+                "calibrated" => {
+                    let path = method.unwrap_or_else(|| {
+                        eprintln!("Error: --rate-backend calibrated requires --method <spec.json>");
+                        std::process::exit(1);
+                    });
+                    let spec = load_calibrated_spec(path).unwrap_or_else(|e| {
+                        eprintln!("Error: failed to load calibrated spec '{path}': {e}");
+                        std::process::exit(1);
+                    });
+                    RateBackend::Calibrated {
+                        spec: Arc::new(spec),
+                    }
+                }
+                _ => RateBackend::RosaPlus,
+            },
+            None,
+        )
     };
 
     let compression_backend = match compression_backend {
@@ -1236,14 +1713,17 @@ fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>
                     }
                     // Method-based RWKV config: file:/... or cfg:...
                     Some(m) => match rwkvzip::parse_method_spec(m) {
-                        Ok(rwkvzip::MethodSpec::File(path)) => {
+                        Ok(rwkvzip::MethodSpec::File { path, policy: None }) => {
                             let model = load_rwkv7_model_from_path(path.to_string_lossy().as_ref());
                             CompressionBackend::Rwkv7 {
                                 model,
                                 coder: rwkvzip::CoderType::AC,
                             }
                         }
-                        Ok(rwkvzip::MethodSpec::Online(_)) => CompressionBackend::Rate {
+                        Ok(rwkvzip::MethodSpec::File {
+                            policy: Some(_), ..
+                        })
+                        | Ok(rwkvzip::MethodSpec::Online { .. }) => CompressionBackend::Rate {
                             rate_backend: RateBackend::Rwkv7Method {
                                 method: m.to_string(),
                             },
@@ -1276,47 +1756,26 @@ fn build_ctx(rate_backend: &str, compression_backend: &str, method: Option<&str>
                 std::process::exit(1);
             }
         }
-        "rate-ac" => {
-            #[cfg(feature = "backend-rwkv")]
-            {
-                CompressionBackend::Rate {
-                    rate_backend: rate_backend.clone(),
-                    coder: rwkvzip::CoderType::AC,
-                    framing: infotheory::compression::FramingMode::Raw,
-                }
-            }
-            #[cfg(not(feature = "backend-rwkv"))]
-            {
-                eprintln!(
-                    "Error: compression backend 'rate-ac' requires infotheory built with feature 'backend-rwkv'"
-                );
-                std::process::exit(1);
-            }
-        }
-        "rate-rans" => {
-            #[cfg(feature = "backend-rwkv")]
-            {
-                CompressionBackend::Rate {
-                    rate_backend: rate_backend.clone(),
-                    coder: rwkvzip::CoderType::RANS,
-                    framing: infotheory::compression::FramingMode::Raw,
-                }
-            }
-            #[cfg(not(feature = "backend-rwkv"))]
-            {
-                eprintln!(
-                    "Error: compression backend 'rate-rans' requires infotheory built with feature 'backend-rwkv'"
-                );
-                std::process::exit(1);
-            }
-        }
+        "rate-ac" => CompressionBackend::Rate {
+            rate_backend: rate_backend.clone(),
+            coder: infotheory::coders::CoderType::AC,
+            framing: infotheory::compression::FramingMode::Raw,
+        },
+        "rate-rans" => CompressionBackend::Rate {
+            rate_backend: rate_backend.clone(),
+            coder: infotheory::coders::CoderType::RANS,
+            framing: infotheory::compression::FramingMode::Raw,
+        },
         _ => {
             let m = method.unwrap_or("5").to_string();
             CompressionBackend::Zpaq { method: m }
         }
     };
 
-    InfotheoryCtx::new(rate_backend, compression_backend)
+    BuiltCtx {
+        ctx: InfotheoryCtx::new(rate_backend, compression_backend),
+        expert_spec_max_order,
+    }
 }
 
 fn read_file(path: &str) -> Vec<u8> {
@@ -1329,9 +1788,22 @@ fn read_file(path: &str) -> Vec<u8> {
     }
 }
 
+fn read_stdin_all_for_generate() -> Vec<u8> {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        eprintln!("Error: 'generate' requires <input_file> or piped stdin");
+        std::process::exit(1);
+    }
+    let mut data = Vec::new();
+    if let Err(e) = stdin.lock().read_to_end(&mut data) {
+        eprintln!("Error reading stdin: {e}");
+        std::process::exit(1);
+    }
+    data
+}
+
 fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
     match backend {
-        #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rate {
             rate_backend,
             coder,
@@ -1345,43 +1817,91 @@ fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
     }
 }
 
-#[cfg(feature = "backend-rwkv")]
-fn maybe_export_rwkv_online(
+fn maybe_export_online_model(
     export_path: Option<&str>,
-    ctx: &InfotheoryCtx,
-    parts: &[&[u8]],
-) -> anyhow::Result<()> {
-    let Some(path) = export_path else {
-        return Ok(());
-    };
-
-    let method = match &ctx.rate_backend {
-        RateBackend::Rwkv7Method { method } => Some(method.as_str()),
-        _ => match &ctx.compression_backend {
-            CompressionBackend::Rate { rate_backend, .. } => match rate_backend {
-                RateBackend::Rwkv7Method { method } => Some(method.as_str()),
-                _ => None,
-            },
-            _ => None,
-        },
-    };
-
-    let Some(method) = method else {
-        return Ok(());
-    };
-
-    let mut compressor = rwkvzip::Compressor::new_from_method(method)?;
-    let _ = compressor.compress_size_chain(parts, rwkvzip::CoderType::AC)?;
-    compressor.export_online(path)?;
-    Ok(())
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-fn maybe_export_rwkv_online(
-    _export_path: Option<&str>,
     _ctx: &InfotheoryCtx,
     _parts: &[&[u8]],
 ) -> anyhow::Result<()> {
+    let Some(_path) = export_path else {
+        return Ok(());
+    };
+
+    #[cfg(feature = "backend-rwkv")]
+    {
+        let rwkv_method = match &_ctx.rate_backend {
+            RateBackend::Rwkv7Method { method } => Some(method.as_str()),
+            _ => match &_ctx.compression_backend {
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::Rwkv7Method { method },
+                    ..
+                } => Some(method.as_str()),
+                _ => None,
+            },
+        };
+        if let Some(method) = rwkv_method {
+            let mut compressor = rwkvzip::Compressor::new_from_method(method)?;
+            let _ = compressor.compress_size_chain(_parts, infotheory::coders::CoderType::AC)?;
+            compressor.export_online(_path)?;
+            return Ok(());
+        }
+        // Pre-loaded model Arc variants do not carry a method string and cannot
+        // replay training for export.  Warn the user explicitly.
+        let has_rwkv_model = matches!(&_ctx.rate_backend, RateBackend::Rwkv7 { .. })
+            || matches!(
+                &_ctx.compression_backend,
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::Rwkv7 { .. },
+                    ..
+                } | CompressionBackend::Rwkv7 { .. }
+            );
+        if has_rwkv_model {
+            eprintln!(
+                "Warning: --model-export is not supported for pre-loaded RWKV7 model backends. \
+                 Use --method with a cfg:/file: spec to enable online model export."
+            );
+            return Ok(());
+        }
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    {
+        let mamba_method = match &_ctx.rate_backend {
+            RateBackend::MambaMethod { method } => Some(method.as_str()),
+            _ => match &_ctx.compression_backend {
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::MambaMethod { method },
+                    ..
+                } => Some(method.as_str()),
+                _ => None,
+            },
+        };
+        if let Some(method) = mamba_method {
+            let mut compressor = mambazip::Compressor::new_from_method(method)?;
+            let _ = compressor.compress_size_chain(_parts, infotheory::coders::CoderType::AC)?;
+            compressor.export_online(_path)?;
+            return Ok(());
+        }
+        let has_mamba_model = matches!(&_ctx.rate_backend, RateBackend::Mamba { .. })
+            || matches!(
+                &_ctx.compression_backend,
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::Mamba { .. },
+                    ..
+                }
+            );
+        if has_mamba_model {
+            eprintln!(
+                "Warning: --model-export is not supported for pre-loaded Mamba model backends. \
+                 Use --method with a cfg: spec to enable online model export."
+            );
+            return Ok(());
+        }
+    }
+
+    eprintln!(
+        "Warning: --model-export was requested but the current backend does not support \
+         online model export. Only RWKV7 and Mamba method-based backends support export."
+    );
     Ok(())
 }
 
@@ -1762,8 +2282,9 @@ fn process_json_line(line: &str) -> String {
 fn run_batch_mode() {
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
-        if let Ok(l) = line {
-            println!("{}", process_json_line(&l));
+        match line {
+            Ok(l) => println!("{}", process_json_line(&l)),
+            Err(_) => continue,
         }
     }
 }
@@ -1773,6 +2294,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     let v: serde_json::Value = serde_json::from_str(&content)?;
+    let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
 
     let env_name = v["environment"].as_str().unwrap_or("coin-flip");
     let mut env: Box<dyn Environment> = match env_name {
@@ -1800,13 +2322,25 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
                 let observation_bits = v["observation_bits"].as_u64().unwrap_or(16) as usize;
                 let reward_bits = v["reward_bits"].as_u64().unwrap_or(8) as usize;
                 let agent_horizon = v["agent_horizon"].as_u64().unwrap_or(3) as usize;
-                let vm_cfg =
-                    parse_nyx_environment_config(&v, observation_bits, reward_bits, agent_horizon)?;
+                let vm_cfg = parse_nyx_environment_config(
+                    &v,
+                    observation_bits,
+                    reward_bits,
+                    agent_horizon,
+                    config_dir,
+                )?;
                 Box::new(NyxVmEnvironment::new(vm_cfg)?)
             }
         }
         _ => return Err(anyhow::anyhow!("Unknown environment: {}", env_name)),
     };
+
+    // Use the run seed for environment stochasticity as well, so environment
+    // trajectories are reproducible across repeated runs.
+    let run_random_seed = v["random_seed"].as_u64().or_else(|| v["rng_seed"].as_u64());
+    if let Some(seed) = run_random_seed {
+        env.set_random_seed(seed);
+    }
 
     let log_every = v["log_every"].as_u64().unwrap_or(1) as usize;
     let perf = v["perf"].as_bool().unwrap_or(false);
@@ -1869,6 +2403,213 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         ));
     }
 
+    let planner = v["planner"]
+        .as_str()
+        .or_else(|| v["solver"].as_str())
+        .unwrap_or("mc-aixi");
+    let planner_norm = planner.to_ascii_lowercase();
+    if !matches!(planner_norm.as_str(), "mc-aixi" | "aiqi") {
+        return Err(anyhow::anyhow!(
+            "Unknown planner/solver '{}'. Supported values: mc-aixi, aiqi",
+            planner
+        ));
+    }
+    if planner_norm.as_str() == "aiqi" {
+        let aiqi_random_seed = v["aiqi_random_seed"].as_u64().or(run_random_seed);
+        let aiqi_rate_backend = if !v["aiqi_rate_backend"].is_null() {
+            Some(parse_vm_stats_backend(
+                &v["aiqi_rate_backend"],
+                &v,
+                config_dir,
+            )?)
+        } else if !v["rate_backend"].is_null() {
+            Some(parse_vm_stats_backend(&v["rate_backend"], &v, config_dir)?)
+        } else {
+            None
+        };
+
+        let aiqi_discount_gamma = if v["discount_gamma"].is_null() {
+            0.99
+        } else {
+            discount_gamma
+        };
+
+        let aiqi_config = AiqiConfig {
+            algorithm: v["algorithm"].as_str().unwrap_or("ac-ctw").to_string(),
+            ct_depth: v["ct_depth"].as_u64().unwrap_or(20) as usize,
+            observation_bits,
+            observation_stream_len,
+            reward_bits,
+            agent_actions,
+            min_reward,
+            max_reward,
+            reward_offset,
+            discount_gamma: aiqi_discount_gamma,
+            return_horizon: v["return_horizon"]
+                .as_u64()
+                .or_else(|| v["agent_horizon"].as_u64())
+                .unwrap_or(3) as usize,
+            return_bins: v["return_bins"]
+                .as_u64()
+                .or_else(|| v["aiqi_bins"].as_u64())
+                .unwrap_or(16) as usize,
+            augmentation_period: v["augmentation_period"]
+                .as_u64()
+                .or_else(|| v["aiqi_period"].as_u64())
+                .or_else(|| v["return_horizon"].as_u64())
+                .or_else(|| v["agent_horizon"].as_u64())
+                .unwrap_or(3) as usize,
+            history_prune_keep_steps: v["history_prune_keep_steps"]
+                .as_u64()
+                .or_else(|| v["aiqi_history_prune_keep_steps"].as_u64())
+                .map(|n| n as usize),
+            baseline_exploration: v["baseline_exploration"]
+                .as_f64()
+                .or_else(|| v["tau"].as_f64())
+                .unwrap_or(0.01),
+            random_seed: aiqi_random_seed,
+            rate_backend: aiqi_rate_backend,
+            rate_backend_max_order: v["rate_backend_max_order"]
+                .as_i64()
+                .or_else(|| v["max_order"].as_i64())
+                .or_else(|| v["rosa_max_order"].as_i64())
+                .unwrap_or(20),
+            rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
+            rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
+            zpaq_method: v["zpaq_method"].as_str().map(|s| s.to_string()),
+        };
+        let aiqi_backend_desc = aiqi_backend_label(&aiqi_config);
+        let mut aiqi = AiqiAgent::new(aiqi_config).map_err(|e| anyhow::anyhow!(e))?;
+
+        println!(
+            "AIQI initialized ({}) for {} environment.",
+            aiqi_backend_desc, env_name
+        );
+
+        let learn_cycles = v["learn_cycles"].as_u64().map(|n| n as usize);
+        let eval_cycles = v["eval_cycles"].as_u64().map(|n| n as usize);
+        let cycles = v["terminate-lifetime"].as_u64().unwrap_or(20) as usize;
+
+        let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
+            (Some(l), Some(e)) => (l, e),
+            (Some(l), None) => (l, 0usize),
+            (None, Some(e)) => (cycles, e),
+            (None, None) => (cycles, 0usize),
+        };
+
+        let mut obs_stream = env.drain_observations();
+        validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
+        let mut rew = env.get_reward();
+        let mut learn_total_reward: i64 = 0;
+        let mut eval_total_reward: i64 = 0;
+
+        let explore_epsilon = v["explore_epsilon"].as_f64().unwrap_or(0.0);
+        let explore_gamma = v["explore_gamma"].as_f64().unwrap_or(1.0);
+
+        let mut trace_logger = AixiRunLogger::new(&v)?;
+
+        let learn_start = Instant::now();
+        for t in 0..learn_cycles {
+            let extra_explore_p = if explore_epsilon > 0.0 {
+                (explore_epsilon * explore_gamma.powi(t as i32)).min(1.0)
+            } else {
+                0.0
+            };
+
+            let action = aiqi.get_planned_action_with_extra_exploration(extra_explore_p);
+            if log_every > 0 && t % log_every == 0 {
+                println!(
+                    "Cycle {}: Action={} Obs={:?} Rew={}",
+                    t, action, obs_stream, rew
+                );
+            }
+
+            if let Some(l) = trace_logger.as_mut() {
+                let action_bits = env.get_action_bits();
+                l.log_action(action, action_bits)?;
+            }
+
+            env.perform_action(action);
+            obs_stream = env.drain_observations();
+            validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
+            rew = env.get_reward();
+
+            if let Some(l) = trace_logger.as_mut() {
+                l.log_percept(
+                    &obs_stream,
+                    rew,
+                    observation_bits,
+                    reward_bits,
+                    reward_offset,
+                )?;
+                l.next_step()?;
+            }
+
+            aiqi.observe_transition(action, &obs_stream, rew)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            learn_total_reward += rew;
+        }
+
+        if perf && learn_cycles > 0 {
+            let elapsed = learn_start.elapsed().as_secs_f64().max(1e-9);
+            let cps = learn_cycles as f64 / elapsed;
+            println!("Learn cycles/s: {:.2}", cps);
+        }
+
+        if eval_cycles > 0 {
+            let eval_start = Instant::now();
+            for t in 0..eval_cycles {
+                let step = learn_cycles + t;
+                let action = aiqi.get_planned_action();
+                if log_every > 0 && step % log_every == 0 {
+                    println!(
+                        "Cycle {}: Action={} Obs={:?} Rew={}",
+                        step, action, obs_stream, rew
+                    );
+                }
+
+                if let Some(l) = trace_logger.as_mut() {
+                    let action_bits = env.get_action_bits();
+                    l.log_action(action, action_bits)?;
+                }
+
+                env.perform_action(action);
+                obs_stream = env.drain_observations();
+                validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
+                rew = env.get_reward();
+
+                if let Some(l) = trace_logger.as_mut() {
+                    l.log_percept(
+                        &obs_stream,
+                        rew,
+                        observation_bits,
+                        reward_bits,
+                        reward_offset,
+                    )?;
+                    l.next_step()?;
+                }
+
+                aiqi.observe_transition(action, &obs_stream, rew)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                eval_total_reward += rew;
+            }
+
+            if perf && eval_cycles > 0 {
+                let elapsed = eval_start.elapsed().as_secs_f64().max(1e-9);
+                let cps = eval_cycles as f64 / elapsed;
+                println!("Eval cycles/s: {:.2}", cps);
+            }
+
+            let avg = (eval_total_reward as f64) / (eval_cycles as f64);
+            println!("Eval Total Reward: {}", eval_total_reward);
+            println!("Eval Average Reward per Cycle: {:.6}", avg);
+        }
+
+        println!("Total Reward: {}", learn_total_reward);
+        return Ok(());
+    }
+
+    let mcaixi_random_seed = v["mcaixi_random_seed"].as_u64().or(run_random_seed);
     let config = AgentConfig {
         algorithm: v["algorithm"].as_str().unwrap_or("ctw").to_string(),
         ct_depth: v["ct_depth"].as_u64().unwrap_or(20) as usize,
@@ -1884,7 +2625,11 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         min_reward,
         max_reward,
         reward_offset,
+        random_seed: mcaixi_random_seed,
         rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
+        rwkv_method: v["rwkv_method"].as_str().map(|s| s.to_string()),
+        mamba_model_path: v["mamba_model_path"].as_str().map(|s| s.to_string()),
+        mamba_method: v["mamba_method"].as_str().map(|s| s.to_string()),
         rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
         zpaq_method: v["zpaq_method"].as_str().map(|s| s.to_string()),
     };
@@ -1916,7 +2661,11 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
 
     let explore_epsilon = v["explore_epsilon"].as_f64().unwrap_or(0.0);
     let explore_gamma = v["explore_gamma"].as_f64().unwrap_or(1.0);
-    let mut explore_rng = RandomGenerator::new();
+    let mut explore_rng = if let Some(seed) = mcaixi_random_seed {
+        RandomGenerator::from_seed(seed).fork_with(0x4558504c4f52455f)
+    } else {
+        RandomGenerator::new()
+    };
 
     // Optional trace logger: can emit a RWKV-friendly stream (0/1 bytes) and/or JSONL metadata.
     // NOTE: The bits are emitted in the same order the agent consumes them:
@@ -1938,7 +2687,6 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             )?;
         }
         agent.model_update_percept_stream(&obs_stream, rew);
-        total_reward += rew;
 
         let explore_p = if explore_epsilon > 0.0 {
             explore_epsilon * explore_gamma.powi(t as i32)
@@ -1966,6 +2714,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         obs_repr = agent.observation_repr_from_stream(&obs_stream);
         rew = env.get_reward();
         prev_action = action;
+        total_reward += rew;
 
         if let Some(l) = trace_logger.as_mut() {
             l.next_step()?;
@@ -1996,7 +2745,6 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
                 )?;
             }
             agent.model_update_percept_stream(&obs_stream, rew);
-            eval_total_reward += rew;
 
             let action = agent.get_planned_action(&obs_stream, rew, prev_action);
             if log_every > 0 && step % log_every == 0 {
@@ -2014,6 +2762,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
             obs_repr = agent.observation_repr_from_stream(&obs_stream);
             rew = env.get_reward();
             prev_action = action;
+            eval_total_reward += rew;
 
             if let Some(l) = trace_logger.as_mut() {
                 l.next_step()?;
@@ -2053,6 +2802,7 @@ fn search_command(args: &[String]) {
     let mut rate_backend = "rosaplus".to_string();
     let compression_backend = "zpaq".to_string();
     let mut method: Option<String> = None;
+    let mut expert_spec_path: Option<String> = None;
     let mut stage2_prior_mode: Option<search::Stage2PriorMode> = None;
 
     let mut i = 4usize;
@@ -2092,15 +2842,18 @@ fn search_command(args: &[String]) {
                 i += 1;
                 method = args.get(i).cloned();
             }
+            "--expert-spec" => {
+                i += 1;
+                expert_spec_path = args.get(i).cloned();
+            }
             "--stage2-prior-mode" => {
                 i += 1;
                 if let Some(v) = args.get(i) {
                     stage2_prior_mode = match v.as_str() {
-                        "none" | "no-prior" => Some(search::Stage2PriorMode::NoPrior),
-                        "summarize" | "summarize-prior" => {
-                            Some(search::Stage2PriorMode::SummarizePrior)
-                        }
-                        "use" | "use-prior" | _ => Some(search::Stage2PriorMode::UsePrior),
+                        "none" | "no-prior" => Some(search::Stage2PriorMode::Disable),
+                        "summarize" | "summarize-prior" => Some(search::Stage2PriorMode::Summarize),
+                        "use" | "use-prior" => Some(search::Stage2PriorMode::Use),
+                        _ => Some(search::Stage2PriorMode::Use),
                     };
                 }
             }
@@ -2113,7 +2866,13 @@ fn search_command(args: &[String]) {
     if let Some(mode) = stage2_prior_mode {
         opts.stage2_prior_mode = mode;
     }
-    opts.ctx = build_ctx(&rate_backend, &compression_backend, method.as_deref());
+    opts.ctx = build_ctx(
+        &rate_backend,
+        &compression_backend,
+        method.as_deref(),
+        expert_spec_path.as_deref(),
+    )
+    .ctx;
     search::run_search_with_options(query, target, &opts);
 }
 
@@ -2176,7 +2935,10 @@ fn main() {
     let mut rate_backend_str = "rosaplus".to_string();
     let mut compression_backend_str = "zpaq".to_string();
     let mut method_str: Option<String> = None;
-    let mut rwkv_export_path: Option<String> = None;
+    let mut expert_spec_path: Option<String> = None;
+    let mut model_export_path: Option<String> = None;
+    let mut generate_len_bytes: usize = 8;
+    let mut generate_config = GenerationConfig::default();
     let mut rate_backend_specified = false;
 
     let mut i = flags_start;
@@ -2210,20 +2972,108 @@ fn main() {
                 i += 1;
                 method_str = args.get(i).cloned();
             }
-            "--rwkv-export" => {
+            "--expert-spec" => {
                 i += 1;
-                rwkv_export_path = args.get(i).cloned();
+                expert_spec_path = args.get(i).cloned();
+                rate_backend_specified = true;
+            }
+            "--model-export" | "--rwkv-export" => {
+                i += 1;
+                model_export_path = args.get(i).cloned();
+            }
+            "--bytes" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --bytes requires a non-negative integer");
+                generate_len_bytes = raw.parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("Error: --bytes must be a non-negative integer, got '{raw}'");
+                    std::process::exit(1);
+                });
+            }
+            "--sample" => {
+                generate_config.strategy = GenerationStrategy::Sample;
+            }
+            "--greedy" => {
+                generate_config.strategy = GenerationStrategy::Greedy;
+            }
+            "--adaptive" => {
+                generate_config.update_mode = GenerationUpdateMode::Adaptive;
+            }
+            "--seed" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --seed requires an unsigned integer");
+                generate_config.seed = raw.parse::<u64>().unwrap_or_else(|_| {
+                    eprintln!("Error: --seed must be an unsigned integer, got '{raw}'");
+                    std::process::exit(1);
+                });
+                generate_config.strategy = GenerationStrategy::Sample;
+            }
+            "--temperature" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --temperature requires a finite number");
+                generate_config.temperature = raw.parse::<f64>().unwrap_or_else(|_| {
+                    eprintln!("Error: --temperature must be a finite number, got '{raw}'");
+                    std::process::exit(1);
+                });
+                if !generate_config.temperature.is_finite() || generate_config.temperature < 0.0 {
+                    eprintln!(
+                        "Error: --temperature must be finite and non-negative, got '{}'",
+                        generate_config.temperature
+                    );
+                    std::process::exit(1);
+                }
+                generate_config.strategy = GenerationStrategy::Sample;
+            }
+            "--top-k" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --top-k requires a non-negative integer");
+                generate_config.top_k = raw.parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("Error: --top-k must be a non-negative integer, got '{raw}'");
+                    std::process::exit(1);
+                });
+                generate_config.strategy = GenerationStrategy::Sample;
+            }
+            "--top-p" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --top-p requires a number in (0, 1]");
+                generate_config.top_p = raw.parse::<f64>().unwrap_or_else(|_| {
+                    eprintln!("Error: --top-p must be a number in (0, 1], got '{raw}'");
+                    std::process::exit(1);
+                });
+                if !generate_config.top_p.is_finite()
+                    || generate_config.top_p <= 0.0
+                    || generate_config.top_p > 1.0
+                {
+                    eprintln!(
+                        "Error: --top-p must be in (0, 1], got '{}'",
+                        generate_config.top_p
+                    );
+                    std::process::exit(1);
+                }
+                generate_config.strategy = GenerationStrategy::Sample;
             }
             _ => {}
         }
         i += 1;
     }
 
-    let ctx = build_ctx(
+    let built_ctx = build_ctx(
         &rate_backend_str,
         &compression_backend_str,
         method_str.as_deref(),
+        expert_spec_path.as_deref(),
     );
+    let ctx = built_ctx.ctx;
+    let expert_spec_max_order = built_ctx.expert_spec_max_order;
     set_default_ctx(ctx.clone());
 
     match primitive.as_str() {
@@ -2260,8 +3110,9 @@ fn main() {
                 data.len(),
                 compressed.len()
             );
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&data]) {
-                eprintln!("Error exporting RWKV model: {e}");
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
+            {
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
@@ -2286,9 +3137,57 @@ fn main() {
                 input.len(),
                 decoded.len()
             );
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&decoded])
+            if let Err(e) =
+                maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&decoded])
             {
-                eprintln!("Error exporting RWKV model: {e}");
+                eprintln!("Error exporting online model: {e}");
+                std::process::exit(1);
+            }
+        }
+        "generate" => {
+            // Disambiguate positional args for `generate [file] [max_order]`.
+            // When stdin is piped and the first positional looks like an integer,
+            // treat it as max_order (not a file path).
+            let stdin_is_piped = !io::stdin().is_terminal();
+            let (file_path, explicit_max_order) = match (file1.as_deref(), file2.as_deref()) {
+                // `generate <file> <max_order>` — both present
+                (Some(f), Some(mo)) => (Some(f), mo.parse::<i64>().ok()),
+                // `generate <arg>` — single positional:
+                //   if stdin is piped and it parses as an integer, it's max_order
+                //   otherwise it's a file path
+                (Some(arg), None) if stdin_is_piped && arg.parse::<i64>().is_ok() => {
+                    (None, arg.parse::<i64>().ok())
+                }
+                (Some(f), None) => (Some(f), None),
+                // No positionals at all
+                (None, _) => (None, None),
+            };
+            let max_order = explicit_max_order
+                .or(pos_arg3.as_deref().and_then(|s| s.parse().ok()))
+                .or(expert_spec_max_order)
+                .unwrap_or(-1);
+            let input = if let Some(path) = file_path {
+                read_file(path)
+            } else {
+                read_stdin_all_for_generate()
+            };
+            let generated = ctx.generate_bytes_with_config(
+                &input,
+                generate_len_bytes,
+                max_order,
+                generate_config,
+            );
+            if let Err(e) = io::stdout().write_all(&generated) {
+                eprintln!("Error writing generated output: {e}");
+                std::process::exit(1);
+            }
+            if let Err(e) = io::stdout().flush() {
+                eprintln!("Error flushing generated output: {e}");
+                std::process::exit(1);
+            }
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&input])
+            {
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
@@ -2308,16 +3207,17 @@ fn main() {
                 "{}",
                 ncd_bytes_backend(&b1, &b2, &ctx.compression_backend, variant)
             );
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&b1, &b2])
+            if let Err(e) =
+                maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&b1, &b2])
             {
-                eprintln!("Error exporting RWKV model: {e}");
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
         "entropy" | "h" | "entropy_rate" | "h_rate" => {
             let f1 = file1.unwrap_or_exit("Error: 'h' requires a file");
             let default_order = if primitive.contains("rate") || rate_backend_specified {
-                -1
+                expert_spec_max_order.unwrap_or(-1)
             } else {
                 0
             };
@@ -2330,25 +3230,33 @@ fn main() {
             } else {
                 println!("{}", ctx.entropy_rate_bytes(&data, max_order));
             }
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&data]) {
-                eprintln!("Error exporting RWKV model: {e}");
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
+            {
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
         "id" | "intrinsic_dep" => {
             let f1 = file1.unwrap_or_exit("Error: 'id' requires a file");
-            let max_order = pos_arg3.and_then(|s| s.parse().ok()).unwrap_or(-1);
+            let max_order = pos_arg3
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(expert_spec_max_order.unwrap_or(-1));
             let data = read_file(&f1);
             println!("{:.6}", intrinsic_dependence_bytes(&data, max_order));
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&data]) {
-                eprintln!("Error exporting RWKV model: {e}");
+            if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
+            {
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
         other => {
             let f1 = file1.unwrap_or_exit("Error: requires two files");
             let f2 = file2.unwrap_or_exit("Error: requires two files");
-            let default_order = if rate_backend_specified { -1 } else { 0 };
+            let default_order = if rate_backend_specified {
+                expert_spec_max_order.unwrap_or(-1)
+            } else {
+                0
+            };
             let max_order = pos_arg3
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(default_order);
@@ -2380,9 +3288,10 @@ fn main() {
                 }
             };
             println!("{}", res);
-            if let Err(e) = maybe_export_rwkv_online(rwkv_export_path.as_deref(), &ctx, &[&b1, &b2])
+            if let Err(e) =
+                maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&b1, &b2])
             {
-                eprintln!("Error exporting RWKV model: {e}");
+                eprintln!("Error exporting online model: {e}");
                 std::process::exit(1);
             }
         }
@@ -2444,6 +3353,7 @@ Primitives:
     search <query> <target> [options]       Search target using info-theoretic ranking
     aixi <config.json>                      Run AIXI agent
     batch                                   Run in JSON-L batch mode
+    generate [file] [max_order]             Generate continuation from file or piped stdin
     compress <in> <out>                     Compress file using selected compression backend
     decompress <in> <out>                   Decompress file using selected compression backend
 
@@ -2453,16 +3363,29 @@ Options:
                           Backend for NCD/compression: {compression_backends}
   --ncd-backend <name>    Deprecated alias for --compression-backend
   --method <val>          Method/config (e.g. '5' for zpaq, '16' for ctw, mixture spec path,
-                          RWKV method: file:/path/model.safetensors or cfg:key=value,...)
-  --rwkv-export <path>    Optional RWKV export path (.safetensors + .json sidecar)
+                          model method: file:/path/model.safetensors[;policy:...] or cfg:key=value,...[;policy:...])
+  --expert-spec <path>    Load one exact standalone expert JSON (same schema as a mixture 'experts' entry)
+  --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
+  --rwkv-export <path>    Backward-compatible alias for --model-export
+  --bytes <n>             Bytes to generate for 'generate' (default: 8)
+  --sample                Use seeded sampling for generation
+  --greedy                Force deterministic greedy generation
+  --adaptive              Keep fitting on generated bytes instead of frozen continuation
+  --seed <u64>            RNG seed for sampled generation
+  --temperature <x>       Sampling temperature (default: 1.0)
+  --top-k <n>             Sample only from the top-k bytes (0 disables)
+  --top-p <p>             Nucleus sampling threshold in (0, 1]
 
 Examples:
   infotheory ncd file1.txt file2.txt --compression-backend zpaq --method 5
   infotheory ncd file1.txt file2.txt --compression-backend rate-ac --rate-backend ctw
-  infotheory h file.txt --rate-backend rwkv7 --method "cfg:hidden=64,layers=1,intermediate=64,train=sgd,lr=0.01" --rwkv-export ./rwkv_online.safetensors
+  infotheory h file.txt --expert-spec ./expert.json
+  infotheory h file.txt --rate-backend mamba --method "cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4,train=adam,lr=0.001;policy:schedule=0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)" --model-export ./mamba_online.safetensors
   infotheory h file.txt --rate-backend ctw --method 32
   infotheory h file.txt --rate-backend mixture --method mixture.json
   infotheory search "encryption" ./src --prior "codebase context"
+  cat prompt.txt | infotheory generate --rate-backend ctw --method 32 --bytes 8
+  infotheory generate prompt.txt --rate-backend match --bytes 16 --sample --seed 7
   infotheory compress in.bin out.itc --compression-backend rate-ac --rate-backend mixture --method mixture.json
   infotheory decompress out.itc restored.bin --compression-backend rate-ac --rate-backend mixture --method mixture.json
 "#
@@ -2472,6 +3395,27 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
+    use std::any::Any;
+    use std::panic;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp_path(prefix: &str, suffix: &str) -> PathBuf {
+        let counter = TEMP_TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{nanos}-{counter}{suffix}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn file_roundtrip_backend_keeps_zpaq_unchanged() {
@@ -2479,18 +3423,14 @@ mod tests {
             method: "5".to_string(),
         };
         let out = file_roundtrip_backend(&b);
-        match out {
-            CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
-            _ => panic!("expected zpaq backend"),
-        }
+        assert!(matches!(out, CompressionBackend::Zpaq { method } if method == "5"));
     }
 
-    #[cfg(feature = "backend-rwkv")]
     #[test]
     fn file_roundtrip_backend_forces_rate_framed() {
         let b = CompressionBackend::Rate {
             rate_backend: RateBackend::Ctw { depth: 8 },
-            coder: rwkvzip::CoderType::AC,
+            coder: infotheory::coders::CoderType::AC,
             framing: infotheory::compression::FramingMode::Raw,
         };
         let out = file_roundtrip_backend(&b);
@@ -2535,8 +3475,12 @@ mod tests {
         let ctx = build_ctx(
             "rosaplus",
             "rwkv7",
-            Some("cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01"),
-        );
+            Some(
+                "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer",
+            ),
+            None,
+        )
+        .ctx;
 
         match ctx.compression_backend {
             CompressionBackend::Rate {
@@ -2550,5 +3494,364 @@ mod tests {
             }
             _ => panic!("expected rate-coded RWKV backend for cfg: method"),
         }
+    }
+
+    #[test]
+    fn parse_backend_aliases_and_unknowns() {
+        assert_eq!(parse_rate_backend("rosa"), Some("rosaplus"));
+        assert_eq!(parse_rate_backend("facctw"), Some("fac-ctw"));
+        assert_eq!(parse_rate_backend("sparsematch"), Some("sparse-match"));
+        assert_eq!(parse_rate_backend("ppm"), Some("ppmd"));
+        assert_eq!(parse_rate_backend("cal"), Some("calibrated"));
+        assert_eq!(parse_rate_backend("unknown"), None);
+
+        assert_eq!(parse_compression_backend("unknown"), None);
+        #[cfg(feature = "backend-zpaq")]
+        assert_eq!(parse_compression_backend("zpaq"), Some("zpaq"));
+        assert_eq!(parse_compression_backend("rate_ac"), Some("rate-ac"));
+        assert_eq!(parse_compression_backend("raterans"), Some("rate-rans"));
+        #[cfg(feature = "backend-rwkv")]
+        {
+            assert_eq!(parse_compression_backend("rwkv"), Some("rwkv7"));
+        }
+        #[cfg(feature = "backend-mamba")]
+        {
+            assert_eq!(parse_rate_backend("mamba1"), Some("mamba"));
+        }
+    }
+
+    #[test]
+    fn parse_mixture_expert_supports_calibrated_and_match_backends() {
+        let base_dir = Path::new(".");
+        let expert = json!({
+            "name": "cal-ctw",
+            "kind": "calibrated",
+            "context": "text",
+            "bins": 33,
+            "learning_rate": 0.02,
+            "bias_clip": 4.0,
+            "base": {
+                "kind": "match"
+            }
+        });
+        let parsed = parse_mixture_expert_value(&expert, base_dir, 4).expect("expert should parse");
+        match parsed.backend {
+            RateBackend::Calibrated { spec } => match spec.base {
+                RateBackend::Match { .. } => {}
+                _ => panic!("unexpected calibrated base"),
+            },
+            _ => panic!("expected calibrated backend"),
+        }
+    }
+
+    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
+    fn panic_message(payload: Box<dyn Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<String>() {
+            return s.clone();
+        }
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            return (*s).to_string();
+        }
+        "non-string panic payload".to_string()
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn parse_mixture_expert_resolves_mamba_model_path_relative_to_base_dir() {
+        let base_dir = unique_temp_path("infotheory-mamba-relpath", "");
+        std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
+        let rel_path = "weights/model.safetensors";
+        let expected = base_dir.join(rel_path).to_string_lossy().to_string();
+        let expert = json!({
+            "name": "mamba-relative",
+            "kind": "mamba",
+            "model_path": rel_path
+        });
+        let panic = panic::catch_unwind(|| {
+            let _ = parse_mixture_expert_value(&expert, &base_dir, 4);
+        })
+        .expect_err("missing model should panic during load");
+        let msg = panic_message(panic);
+        assert!(
+            msg.contains(&expected),
+            "panic should mention resolved absolute model path. expected substring: {expected}, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn parse_mixture_expert_resolves_rwkv_model_path_relative_to_base_dir() {
+        let base_dir = unique_temp_path("infotheory-rwkv-relpath", "");
+        std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
+        let rel_path = "weights/model.safetensors";
+        let expected = base_dir.join(rel_path).to_string_lossy().to_string();
+        let expert = json!({
+            "name": "rwkv-relative",
+            "kind": "rwkv7",
+            "model_path": rel_path
+        });
+        let panic = panic::catch_unwind(|| {
+            let _ = parse_mixture_expert_value(&expert, &base_dir, 4);
+        })
+        .expect_err("missing model should panic during load");
+        let msg = panic_message(panic);
+        assert!(
+            msg.contains(&expected),
+            "panic should mention resolved absolute model path. expected substring: {expected}, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn load_expert_spec_preserves_exact_ppmd_settings() {
+        let expert_path = unique_temp_path("infotheory-expert-spec", ".json");
+        std::fs::write(
+            &expert_path,
+            serde_json::to_vec(&json!({
+                "name": "ppmd",
+                "kind": "ppmd",
+                "order": 12,
+                "memory_mb": 256
+            }))
+            .expect("expert json"),
+        )
+        .expect("write temp expert spec");
+
+        let parsed = load_expert_spec(expert_path.to_str().expect("utf8 path"))
+            .expect("ppmd expert should load");
+        match parsed.backend {
+            RateBackend::Ppmd { order, memory_mb } => {
+                assert_eq!(order, 12);
+                assert_eq!(memory_mb, 256);
+            }
+            _ => panic!("expected ppmd backend"),
+        }
+
+        let _ = std::fs::remove_file(&expert_path);
+    }
+
+    #[test]
+    fn build_ctx_propagates_expert_spec_max_order_default() {
+        let expert_path = unique_temp_path("infotheory-expert-spec-rosa", ".json");
+        std::fs::write(
+            &expert_path,
+            serde_json::to_vec(&json!({
+                "name": "rosa",
+                "kind": "rosaplus",
+                "max_order": 32
+            }))
+            .expect("expert json"),
+        )
+        .expect("write temp expert spec");
+
+        let built = build_ctx(
+            "rosaplus",
+            "zpaq",
+            None,
+            Some(expert_path.to_str().expect("utf8 path")),
+        );
+        assert_eq!(built.expert_spec_max_order, Some(32));
+        assert!(matches!(built.ctx.rate_backend, RateBackend::RosaPlus));
+
+        let _ = std::fs::remove_file(&expert_path);
+    }
+
+    #[test]
+    fn parse_observation_helpers_cover_vm_and_non_vm_cases() {
+        let base = json!({
+            "observation_stream_len": 3,
+            "observation_key_mode": "stream-hash"
+        });
+        assert_eq!(parse_observation_stream_len(&base), 3);
+        assert_eq!(
+            parse_observation_key_mode(&base),
+            ObservationKeyMode::StreamHash
+        );
+        assert_eq!(
+            parse_observation_key_mode_str("full"),
+            ObservationKeyMode::FullStream
+        );
+        assert_eq!(
+            parse_observation_key_mode_str("last"),
+            ObservationKeyMode::Last
+        );
+        assert_eq!(
+            parse_observation_key_mode_str("unknown"),
+            ObservationKeyMode::First
+        );
+
+        let vm = json!({
+            "observation_stream_len": 2,
+            "observation_key_mode": "full",
+            "vm_observation": {
+                "stream_len": 2,
+                "key_mode": "last"
+            }
+        });
+        assert_eq!(
+            parse_observation_stream_len_for_vm(&vm["vm_observation"]),
+            2
+        );
+        assert_eq!(
+            parse_observation_key_mode_for_vm(&vm["vm_observation"]),
+            ObservationKeyMode::Last
+        );
+        assert_eq!(parse_observation_stream_len_for_env(&vm, "vm"), 2);
+        assert_eq!(
+            parse_observation_key_mode_for_env(&vm, "vm"),
+            ObservationKeyMode::Last
+        );
+        assert_eq!(
+            parse_observation_key_mode_for_env(&vm, "coin"),
+            ObservationKeyMode::FullStream
+        );
+
+        let mismatch = json!({
+            "observation_stream_len": 2,
+            "vm_observation": {
+                "stream_len": 3
+            }
+        });
+        let err = validate_observation_config("vm", &mismatch, 2, ObservationKeyMode::FullStream)
+            .expect_err("mismatched vm stream_len should fail");
+        assert!(err.to_string().contains("conflicts"));
+
+        let mismatch_mode = json!({
+            "observation_key_mode": "full",
+            "vm_observation": {
+                "key_mode": "last"
+            }
+        });
+        let err = validate_observation_config("nyx", &mismatch_mode, 1, ObservationKeyMode::Last)
+            .expect_err("mismatched vm key mode should fail");
+        assert!(err.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn parse_mixture_kind_and_spec_validation() {
+        assert_eq!(
+            parse_mixture_kind("bayes-mix").expect("bayes alias"),
+            MixtureKind::Bayes
+        );
+        assert_eq!(
+            parse_mixture_kind("switch").expect("switch alias"),
+            MixtureKind::Switching
+        );
+        assert_eq!(
+            parse_mixture_kind("neural").expect("neural kind"),
+            MixtureKind::Neural
+        );
+        assert!(parse_mixture_kind("nonsense").is_err());
+
+        let base_dir = Path::new(".");
+        let missing_experts = json!({
+            "kind": "bayes",
+            "experts": []
+        });
+        assert!(parse_mixture_spec_value(&missing_experts, base_dir, 8).is_err());
+
+        let fading_without_decay = json!({
+            "kind": "fading",
+            "experts": [
+                {"name": "ctw-e", "kind": "ctw", "depth": 4}
+            ]
+        });
+        assert!(parse_mixture_spec_value(&fading_without_decay, base_dir, 8).is_err());
+
+        let valid = json!({
+            "kind": "bayes",
+            "alpha": 0.03,
+            "experts": [
+                {"name": "ctw-e", "kind": "ctw", "depth": 8},
+                {"name": "fac-e", "kind": "fac-ctw", "base_depth": 8, "encoding_bits": 8}
+            ]
+        });
+        let spec = parse_mixture_spec_value(&valid, base_dir, 8).expect("valid mixture");
+        assert_eq!(spec.alpha, 0.03);
+        assert_eq!(spec.experts.len(), 2);
+        assert!(matches!(spec.kind, MixtureKind::Bayes));
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn parse_vm_stats_backend_supports_new_backends_and_rejects_unknowns() {
+        let root = json!({
+            "algorithm": "ctw",
+            "ct_depth": 8,
+            "observation_bits": 8,
+            "reward_bits": 8
+        });
+        let base_dir = Path::new(".");
+
+        let matched =
+            parse_vm_stats_backend(&json!({"name":"match","hash_bits":18}), &root, base_dir)
+                .expect("match backend should parse");
+        assert!(matches!(matched, RateBackend::Match { hash_bits: 18, .. }));
+
+        let sparse = parse_vm_stats_backend(
+            &json!({"name":"sparse-match","gap_min":2,"gap_max":4}),
+            &root,
+            base_dir,
+        )
+        .expect("sparse-match backend should parse");
+        assert!(matches!(
+            sparse,
+            RateBackend::SparseMatch {
+                gap_min: 2,
+                gap_max: 4,
+                ..
+            }
+        ));
+
+        let ppmd = parse_vm_stats_backend(&json!({"name":"ppmd","order":12}), &root, base_dir)
+            .expect("ppmd backend should parse");
+        assert!(matches!(ppmd, RateBackend::Ppmd { order: 12, .. }));
+
+        let particle = parse_vm_stats_backend(
+            &json!({
+                "name":"particle",
+                "spec":{"num_particles":4,"num_cells":4,"cell_dim":8}
+            }),
+            &root,
+            base_dir,
+        )
+        .expect("particle backend should parse");
+        assert!(matches!(particle, RateBackend::Particle { .. }));
+
+        let mixture = parse_vm_stats_backend(
+            &json!({
+                "name":"mixture",
+                "spec":{"kind":"bayes","experts":[{"kind":"match"}]}
+            }),
+            &root,
+            base_dir,
+        )
+        .expect("mixture backend should parse");
+        assert!(matches!(mixture, RateBackend::Mixture { .. }));
+
+        let calibrated = parse_vm_stats_backend(
+            &json!({
+                "name":"calibrated",
+                "base":{"kind":"ctw","depth":8},
+                "context":"text",
+                "bins":17,
+                "learning_rate":0.05,
+                "bias_clip":3.0
+            }),
+            &root,
+            base_dir,
+        )
+        .expect("calibrated backend should parse");
+        assert!(matches!(calibrated, RateBackend::Calibrated { .. }));
+
+        let err = match parse_vm_stats_backend(&json!("unknown-backend"), &root, base_dir) {
+            Ok(_) => panic!("unknown backend should not silently fall back"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unknown vm stats backend"),
+            "unexpected error: {err}"
+        );
     }
 }

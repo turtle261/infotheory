@@ -1,0 +1,26 @@
+{
+  "kind": "neural",
+  "alpha": 0.03,
+  "experts": [
+    {
+      "name": "ctw",
+      "kind": "ctw",
+      "base_depth": 32,
+      "encoding_bits": 8,
+      "num_percept_bits": 8,
+      "log_prior": 0.0
+    },
+	{
+      "name": "rosa",
+      "kind": "rosaplus",
+      "max_order": -1,
+      "log_prior": 0.0
+    },
+  {
+		"name": "mamba",
+		"kind": "mamba",
+		"method": "cfg:hidden=128,layers=1,intermediate=128,seed=26,train=adam,lr=0.001,stride=1;policy:schedule=0..10%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)",
+		"log_prior": 0.0
+	}
+  ]
+}

@@ -30,7 +30,7 @@ fn test_predictor_sum_to_one(mut predictor: Box<dyn Predictor>, name: &str) {
 
     // Check range
     assert!(
-        p_true >= 0.0 && p_true <= 1.0,
+        (0.0..=1.0).contains(&p_true),
         "{name}: Prob out of range: {p_true}"
     );
 }
@@ -169,7 +169,11 @@ fn agent_solves_ctw_test_environment() {
         min_reward: 0,
         max_reward: 1,
         reward_offset: 0,
+        random_seed: Some(17),
         rwkv_model_path: None,
+        rwkv_method: None,
+        mamba_model_path: None,
+        mamba_method: None,
         rosa_max_order: None,
         zpaq_method: None,
     };
@@ -209,7 +213,11 @@ fn agent_regret_sublinear_coinflip() {
         min_reward: 0,
         max_reward: 1,
         reward_offset: 0,
+        random_seed: Some(23),
         rwkv_model_path: None,
+        rwkv_method: None,
+        mamba_model_path: None,
+        mamba_method: None,
         rosa_max_order: None,
         zpaq_method: None,
     };
@@ -230,4 +238,67 @@ fn agent_regret_sublinear_coinflip() {
 
     // Regret should be reasonable (< 0.25 per step)
     assert!(regret_per_step < 0.25, "Regret too high: {regret_per_step}");
+}
+
+#[test]
+fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
+    let config = AgentConfig {
+        algorithm: "ctw".into(),
+        ct_depth: 8,
+        agent_horizon: 6,
+        observation_bits: 1,
+        observation_stream_len: 1,
+        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::FullStream,
+        reward_bits: 1,
+        agent_actions: 2,
+        num_simulations: 80,
+        exploration_exploitation_ratio: 1.4,
+        discount_gamma: 1.0,
+        min_reward: 0,
+        max_reward: 1,
+        reward_offset: 0,
+        random_seed: Some(12345),
+        rwkv_model_path: None,
+        rwkv_method: None,
+        mamba_model_path: None,
+        mamba_method: None,
+        rosa_max_order: None,
+        zpaq_method: None,
+    };
+
+    let mut a = Agent::new(config.clone());
+    let mut b = Agent::new(config);
+    let mut env_a = CtwTest::new();
+    let mut env_b = CtwTest::new();
+
+    let mut obs_a = env_a.drain_observations();
+    let mut obs_b = env_b.drain_observations();
+    let mut rew_a = env_a.get_reward();
+    let mut rew_b = env_b.get_reward();
+    let mut prev_a = 0u64;
+    let mut prev_b = 0u64;
+
+    for step in 0..64usize {
+        assert_eq!(obs_a, obs_b, "observation mismatch at step {step}");
+        assert_eq!(rew_a, rew_b, "reward mismatch at step {step}");
+
+        a.model_update_percept_stream(&obs_a, rew_a);
+        b.model_update_percept_stream(&obs_b, rew_b);
+
+        let act_a = a.get_planned_action(&obs_a, rew_a, prev_a);
+        let act_b = b.get_planned_action(&obs_b, rew_b, prev_b);
+        assert_eq!(act_a, act_b, "action mismatch at step {step}");
+
+        a.model_update_action_external(act_a);
+        b.model_update_action_external(act_b);
+
+        env_a.perform_action(act_a);
+        env_b.perform_action(act_b);
+        obs_a = env_a.drain_observations();
+        obs_b = env_b.drain_observations();
+        rew_a = env_a.get_reward();
+        rew_b = env_b.get_reward();
+        prev_a = act_a;
+        prev_b = act_b;
+    }
 }

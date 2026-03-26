@@ -131,6 +131,15 @@ impl RandomGenerator {
         Self { state }
     }
 
+    /// Creates a new `RandomGenerator` from an explicit seed.
+    ///
+    /// A zero seed is remapped to a fixed non-zero constant to avoid the
+    /// xorshift zero-state trap.
+    pub fn from_seed(seed: u64) -> Self {
+        let state = if seed == 0 { 0xCAFEBABEDEADBEEF } else { seed };
+        Self { state }
+    }
+
     /// Generates the next pseudo-random `u64`.
     pub fn next_u64(&mut self) -> u64 {
         // xorshift64*
@@ -182,6 +191,12 @@ impl RandomGenerator {
     }
 }
 
+impl Default for RandomGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Encodes a numeric value into its bit representation and appends it to a `SymbolList`.
 ///
 /// Bits are appended in least-significant-bit first order.
@@ -202,6 +217,7 @@ pub fn encode_reward(symlist: &mut SymbolList, value: i64, bits: usize) {
     }
 }
 
+/// Encodes a reward after applying an additive `offset`.
 pub fn encode_reward_offset(symlist: &mut SymbolList, value: i64, bits: usize, offset: i64) {
     let shifted = (value + offset) as u64;
     encode(symlist, shifted, bits);
@@ -235,6 +251,7 @@ pub fn decode_reward(symlist: &[Symbol], bits: usize) -> i64 {
     }
 }
 
+/// Decodes a reward encoded with [`encode_reward_offset`].
 pub fn decode_reward_offset(symlist: &[Symbol], bits: usize, offset: i64) -> i64 {
     if bits == 0 {
         return 0;

@@ -13,12 +13,27 @@ Estimate core measures using both **Marginal** (distribution-based) and **Rate**
 Switch between different modeling paradigms seamlessly:
 - **ROSA+ (Rapid Online Suffix Automaton + Witten Bell)**: A fast statistical LM. Default backend. 
 - **CTW (Context Tree Weighting)**: Historically standard for AIXI. Accurate bit-level Bayesian model (KT-estimator).
+- **Mamba (Neural Network)**: Deterministic CPU-first Mamba-1 backend with online mode + export.
 - **RWKV (Neural Network)**: Portable SIMD RWKV7 CPU inference backend (`wide`-based).
 
 ### 3. Integrated MC-AIXI Agent
-Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, or RWKV) for universal reinforcement learning.
+Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, Mamba, or RWKV) for universal reinforcement learning.
 
-You can use a trained RWKV7 model as a rate backend ("world model") for MC-AIXI.
+You can use a trained neural model (Mamba-1 or RWKV7) as a rate backend ("world model") for MC-AIXI.
+
+### 4. Integrated AIQI Agent
+The repository also includes **AIQI (Universal AI with Q-Induction)**: a model-free return-prediction agent with periodic augmentation (`N >= H`) and discretized H-step return targets.
+
+- `planner: "aiqi"` enables AIQI in `infotheory aixi <config.json>`.
+- `planner: "mc-aixi"` (default) keeps the existing MC-AIXI path.
+- **Paper path**: `algorithm: "ac-ctw"` (or `"ctw"`) is the literal AIQI-CTW path from the paper.
+- **Extensions**: AIQI also supports `fac-ctw`, `rosa`, `rwkv`, and generic `rate_backend` predictors.
+- **Intentional exclusion**: `zpaq` is not supported for AIQI because strict frozen conditioning is required.
+- **Strict paper-domain validation**: AIQI enforces `discount_gamma in (0,1)` and `baseline_exploration (tau) in (0,1]`.
+- **Tie-breaking**: greedy action selection uses a fixed tie-break rule (first maximizing action) to match paper assumptions.
+- **Optional bounded memory**: set `history_prune_keep_steps` (or `aiqi_history_prune_keep_steps`) to retain only recent history while preserving exact return construction.
+- **Reproducibility**: set `random_seed` in config (or planner-specific `aiqi_random_seed` / `mcaixi_random_seed`) to make agent-side randomness deterministic across runs.
+- AIQI uses the same environment interfaces as MC-AIXI, including VM environments.
 
 ---
 
@@ -124,30 +139,58 @@ CLI:
 For rate-coded metrics, raw framing is used by default to avoid framing overhead.
 Explicit `compress_bytes_backend` / `decompress_bytes_backend` APIs support framed payloads for roundtrip verification.
 
-### RWKV Method Strings
+### Neural Method Strings
 
-RWKV can be configured with either a model file or compact method string:
+Mamba and RWKV can be configured with either a model file or compact method string:
 
 - `file:/abs/or/relative/model.safetensors`
-- `cfg:key=value,...`
+- `file:/abs/or/relative/model.safetensors;policy:...`
+- `cfg:key=value,...[;policy:...]`
 
 Supported `cfg:` keys:
-`hidden,layers,intermediate,decay_rank,a_rank,v_rank,g_rank,seed,train,lr,stride`
+- RWKV7: `hidden,layers,intermediate,decay_rank,a_rank,v_rank,g_rank,seed,train,lr,stride`
+- Mamba-1: `hidden,layers,intermediate,state,conv,dt_rank,seed,train,lr,stride`
 
 `train` supports: `none`, `sgd`, `adam`.
+`policy` supports `schedule=...` rules (for example `0..100:infer` or `0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)`).
+For RWKV full-parameter training scopes (`scope` touching non-head parameters), `bptt<=1` resolves to the fast default window `8`; specify a larger explicit `bptt` to override it.
 
 Example:
 
 ```bash
 ./infotheory h file.txt \
   --rate-backend rwkv7 \
-  --method "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=7,train=sgd,lr=0.01,stride=1"
+  --method "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=7,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.9)"
+```
+
+For `examples/two.json` benchmark plotting, `scripts/plot_two_json.sh` also accepts `INFOTHEORY_BASELINE_SUMMARY_TSV=/path/to/baseline-summary.tsv` to emit additional baseline-overlay SVGs.
+
+The benchmark tooling also supports an `extra` suite for additional rate backends
+not in `examples/two.json` (currently `mamba`, `particle` via
+`examples/particle_fast.json`, and `sparse-match`):
+
+```bash
+./projman.sh bench extra
+./projman.sh plot extra
+./projman.sh tui extra
+```
+
+For interactive benchmark analysis (all `plot_two_json.sh` graph families, subject focus, exact point inspection, overlap-aware readouts), use:
+
+```bash
+./projman.sh tui --summary-tsv /tmp/infotheory-two-json-summary-<stamp>.tsv
+```
+
+Manual:
+
+```bash
+./projman.sh tui man
 ```
 
 Optional online export after processing input:
 
 ```bash
-./infotheory h file.txt --rate-backend rwkv7 --method "cfg:hidden=64,layers=1,intermediate=64" --rwkv-export ./rwkv_online.safetensors
+./infotheory h file.txt --rate-backend mamba --method "cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4;policy:schedule=0..100:infer" --model-export ./mamba_online.safetensors
 ```
 
 This writes:
@@ -160,11 +203,58 @@ This writes:
 ./infotheory aixi conf/kuhn_poker.json
 ```
 
+Planner switch in config:
+
+```json
+{
+  "planner": "aiqi",
+  "algorithm": "ac-ctw",
+  "random_seed": 12345,
+  "discount_gamma": 0.99,
+  "return_horizon": 6,
+  "return_bins": 32,
+  "augmentation_period": 6,
+  "history_prune_keep_steps": 2048,
+  "baseline_exploration": 0.01
+}
+```
+
+Optional generic backend override (uses the shared RateBackend parser; `zpaq` is intentionally rejected for AIQI):
+
+```json
+{
+  "planner": "aiqi",
+  "rate_backend": {
+    "name": "ppmd",
+    "order": 10,
+    "memory_mb": 64
+  },
+  "rate_backend_max_order": 8
+}
+```
+
 ### AIXI Agent Mode (VM via Nyx-Lite)
 ```bash
 # VM-backed environment using high-performance Firecracker (Nyx-Lite)
 ./infotheory aixi aixi_confs/vm_example.json
 ```
+
+Quick benchmark (AIQI vs MC-AIXI):
+
+```bash
+./scripts/bench_aiqi_vs_aixi.sh
+```
+
+Reproducible competitor benchmark (Infotheory Rust/Python vs PyAIXI + C++ MC-AIXI):
+
+```bash
+./projman.sh bench__aixi_competitors --profile default --trials 1
+```
+
+Benchmark correctness notes:
+- Stochastic environments are seeded from `random_seed` (or `rng_seed`) in CLI and Python run loops for reproducible trajectories.
+- Reward reporting is normalized to native domain scale in competitor reports (for example Kuhn offset removal for C++/PyAIXI), so cross-implementation reward means are apples-to-apples.
+- MC-AIXI tree search uses reference-style UCB scaling while preserving reward-sensitive chance-node reuse for generic environment correctness.
 
 VM config highlights:
 - **Environment**: Use `"environment": "nyx-vm"` or `"vm"` (requires `vm` feature).
@@ -222,6 +312,78 @@ set_default_ctx(InfotheoryCtx::new(
 and more!
 ---
 
+## Python Bindings (`infotheory-rs`)
+
+This repository now includes PyO3/maturin bindings with package name:
+- PyPI distribution: `infotheory-rs`
+- Python import: `infotheory_rs`
+
+Quickstart (local, via `uv`):
+
+```bash
+uv run maturin develop --release
+uv run python -c "import infotheory_rs as ait; print(ait.ncd_paths('README.md','README.md', backend='zpaq', method='5', variant='vitanyi'))"
+```
+
+Python exposes both string-based backend parsing and direct backend objects. The
+current surface includes `RateBackend.match(...)`, `RateBackend.sparse_match(...)`,
+`RateBackend.ppmd(...)`, `RateBackend.mixture(...)`, `RateBackend.particle(...)`,
+and `RateBackend.calibrated(...)`, plus `CalibrationContextKind` for calibrated
+backends.
+
+Example:
+
+```python
+import infotheory_rs as ait
+
+match_backend = ait.RateBackend.match()
+particle_backend = ait.RateBackend.particle(
+    ait.ParticleSpec(num_particles=4, num_cells=4, cell_dim=8)
+)
+cal_backend = ait.RateBackend.calibrated(
+    ait.RateBackend.ctw(8),
+    ait.CalibrationContextKind.Text,
+)
+
+assert ait.entropy_rate_backend(b"abracadabra", 4, backend=match_backend) >= 0.0
+framed = ait.CompressionBackend.rate_rans(particle_backend, "framed")
+blob = ait.compress_bytes_backend(b"payload", compression_backend=framed)
+assert ait.decompress_bytes_backend(blob, compression_backend=framed) == b"payload"
+assert ait.compress_size_backend(
+    b"payload",
+    compression_backend="rwkv7",
+    method="cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
+) > 0
+```
+
+Run Python tests:
+
+```bash
+uv run pytest -q python/tests
+```
+
+Run Python wrapper coverage (enforced in CI):
+
+```bash
+uv run pytest \
+  --cov=infotheory_rs \
+  --cov-report=term-missing \
+  --cov-report=xml:target/python-coverage.xml \
+  --cov-fail-under=100 \
+  python/tests
+```
+
+For full developer test and coverage workflows (Rust + Python + VM), see:
+`docs/developer-testing.md`.
+
+Notes:
+- Built as `abi3-py310` (compatible with Python 3.10+).
+- Published wheels are intended to be portable and exclude `vm` support by default.
+- Linux source builds can opt into VM bindings by enabling the Rust `vm` feature when building the extension.
+  Example: `uv run maturin develop --release --features vm`
+- Python trait-callback adapters (`PredictorABC`, `EnvironmentABC`, `AgentSimulatorABC`) are fail-fast:
+  unhandled callback exceptions terminate the process after printing traceback context. This prevents
+  silently continuing planning/search with invalid fallback values.
 
 ## License
 - This is free software, which you may use under either the Apache-2.0 License, or the ISC License, at your choice. Those are available at LICENSE-APACHE and LICENSE respectively.

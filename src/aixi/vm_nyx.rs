@@ -24,6 +24,10 @@ use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::environment::Environment;
 #[cfg(feature = "backend-rwkv")]
 use crate::coders::softmax_pdf_inplace;
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip;
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip::Compressor as MambaCompressor;
 use crate::mixture::OnlineBytePredictor;
 use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
@@ -52,12 +56,25 @@ pub use nyx_lite::{ExitReason, NyxVM, SharedMemoryPolicy};
 /// Payload encoding for wire protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PayloadEncoding {
+    /// Treat payloads as UTF-8/text bytes.
     Utf8,
+    /// Treat payloads as hexadecimal text.
     Hex,
 }
 
 impl PayloadEncoding {
+    /// Parse a payload encoding label.
+    ///
+    /// Accepted values are `utf8`, `text`, and `hex`.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
+        Self::parse(s)
+    }
+
+    /// Parse a payload encoding label.
+    ///
+    /// Accepted values are `utf8`, `text`, and `hex`.
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "utf8" | "text" => Some(Self::Utf8),
             "hex" => Some(Self::Hex),
@@ -65,6 +82,7 @@ impl PayloadEncoding {
         }
     }
 
+    /// Decode a wire payload string into raw bytes using this encoding.
     pub fn decode(self, s: &str) -> anyhow::Result<Vec<u8>> {
         match self {
             Self::Utf8 => Ok(s.as_bytes().to_vec()),
@@ -72,11 +90,20 @@ impl PayloadEncoding {
         }
     }
 
+    /// Encode raw bytes for transport over the configured wire protocol.
     pub fn encode(self, bytes: &[u8]) -> String {
         match self {
             Self::Utf8 => String::from_utf8_lossy(bytes).to_string(),
             Self::Hex => hex_encode(bytes),
         }
+    }
+}
+
+impl std::str::FromStr for PayloadEncoding {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or("unknown payload encoding")
     }
 }
 
@@ -123,27 +150,27 @@ fn rewrite_firecracker_config_paths(config_path: &str, raw_json: &str) -> anyhow
     let mut v: Value = serde_json::from_str(raw_json)?;
 
     if let Some(boot) = v.get_mut("boot-source") {
-        if let Some(path_val) = boot.get_mut("kernel_image_path") {
-            if let Some(path_str) = path_val.as_str() {
-                let resolved = resolve_relative_path(base_dir, path_str);
-                *path_val = Value::String(resolved);
-            }
+        if let Some(path_val) = boot.get_mut("kernel_image_path")
+            && let Some(path_str) = path_val.as_str()
+        {
+            let resolved = resolve_relative_path(base_dir, path_str);
+            *path_val = Value::String(resolved);
         }
-        if let Some(path_val) = boot.get_mut("initrd_path") {
-            if let Some(path_str) = path_val.as_str() {
-                let resolved = resolve_relative_path(base_dir, path_str);
-                *path_val = Value::String(resolved);
-            }
+        if let Some(path_val) = boot.get_mut("initrd_path")
+            && let Some(path_str) = path_val.as_str()
+        {
+            let resolved = resolve_relative_path(base_dir, path_str);
+            *path_val = Value::String(resolved);
         }
     }
 
     if let Some(drives) = v.get_mut("drives").and_then(|d| d.as_array_mut()) {
         for drive in drives {
-            if let Some(path_val) = drive.get_mut("path_on_host") {
-                if let Some(path_str) = path_val.as_str() {
-                    let resolved = resolve_relative_path(base_dir, path_str);
-                    *path_val = Value::String(resolved);
-                }
+            if let Some(path_val) = drive.get_mut("path_on_host")
+                && let Some(path_str) = path_val.as_str()
+            {
+                let resolved = resolve_relative_path(base_dir, path_str);
+                *path_val = Value::String(resolved);
             }
         }
     }
@@ -175,12 +202,16 @@ fn hex_digit(v: u8) -> char {
 /// These are exported for use by custom guest programs.
 #[allow(dead_code)]
 pub const HYPERCALL_EXECDONE: u64 = 0x656e6f6463657865; // "execdone"
+/// Guest requested host-side snapshot operation.
 #[allow(dead_code)]
 pub const HYPERCALL_SNAPSHOT: u64 = 0x746f687370616e73; // "snapshot"
+/// Guest announced nyx-lite protocol/version handshake.
 #[allow(dead_code)]
 pub const HYPERCALL_NYX_LITE: u64 = 0x6574696c2d78796e; // "nyx-lite"
+/// Guest requested shared memory initialization/refresh.
 #[allow(dead_code)]
 pub const HYPERCALL_SHAREMEM: u64 = 0x6d656d6572616873; // "sharemem"
+/// Guest emitted a debug-print hypercall payload.
 #[allow(dead_code)]
 pub const HYPERCALL_DBGPRINT: u64 = 0x746e697270676264; // "dbgprint"
 
@@ -237,23 +268,36 @@ pub struct NyxActionSpec {
 /// Fuzzing mutator types.
 #[derive(Clone, Debug)]
 pub enum FuzzMutator {
+    /// Flip one random bit.
     FlipBit,
+    /// Flip one full byte.
     FlipByte,
+    /// Insert a random byte at a random position.
     InsertByte,
+    /// Delete one random byte.
     DeleteByte,
+    /// Splice bytes from an existing seed input.
     SpliceSeed,
+    /// Replace the working input with a seed input.
     ResetSeed,
+    /// Apply a short sequence of random mutations.
     Havoc,
 }
 
 /// Fuzzing configuration for action generation.
 #[derive(Clone, Debug)]
 pub struct NyxFuzzConfig {
+    /// Corpus used for seed/reset/splice operations.
     pub seeds: Vec<Vec<u8>>,
+    /// Mutator set available for action generation.
     pub mutators: Vec<FuzzMutator>,
+    /// Minimum generated action length.
     pub min_len: usize,
+    /// Maximum generated action length.
     pub max_len: usize,
+    /// Optional dictionary tokens for insertion/splicing.
     pub dictionary: Vec<Vec<u8>>,
+    /// Deterministic RNG seed for mutation sampling.
     pub rng_seed: u64,
 }
 
@@ -305,8 +349,11 @@ pub enum NyxRewardPolicy {
     FromGuest,
     /// Pattern matching on output.
     Pattern {
+        /// Substring/pattern tested against guest output.
         pattern: String,
+        /// Reward returned when the pattern does not match.
         base_reward: i64,
+        /// Additional reward added when the pattern matches.
         bonus_reward: i64,
     },
     /// Custom reward function (callback-based).
@@ -318,16 +365,24 @@ pub enum NyxRewardPolicy {
 pub enum NyxRewardShaping {
     /// Entropy reduction vs baseline.
     EntropyReduction {
+        /// Reference bytes used as baseline data distribution.
         baseline_bytes: Vec<u8>,
+        /// Max order passed to entropy estimators.
         max_order: i64,
+        /// Scaling factor applied to the shaping term.
         scale: f64,
+        /// Optional additive bonus when guest crashes.
         crash_bonus: Option<i64>,
+        /// Optional additive bonus when guest times out.
         timeout_bonus: Option<i64>,
     },
     /// Entropy of trace data (online learning).
     TraceEntropy {
+        /// Max order passed to trace entropy estimation.
         max_order: i64,
+        /// Scaling factor applied to the shaping term.
         scale: f64,
+        /// If true, normalize by trace length.
         normalize: bool,
     },
 }
@@ -460,6 +515,7 @@ pub struct NyxVmConfig {
     pub trace: Option<NyxTraceConfig>,
 
     // Debug mode
+    /// Enable verbose VM/protocol diagnostics.
     pub debug_mode: bool,
 
     // Crash logging
@@ -524,18 +580,30 @@ pub struct NyxStepResult {
 /// Simplified exit reason categories.
 #[derive(Clone, Debug)]
 pub enum NyxExitKind {
+    /// Guest terminated normally with an application-defined code.
     ExecDone(u64),
+    /// Step timed out before a terminal signal/response.
     Timeout,
+    /// VM reported a shutdown event.
     Shutdown,
+    /// Raw hypercall event with integer arguments.
     Hypercall {
+        /// Hypercall identifier/magic value.
         code: u64,
+        /// Hypercall argument 1.
         arg1: u64,
+        /// Hypercall argument 2.
         arg2: u64,
+        /// Hypercall argument 3.
         arg3: u64,
+        /// Hypercall argument 4.
         arg4: u64,
     },
+    /// Debug string emitted by guest/host bridge.
     DebugPrint(String),
+    /// Breakpoint/trap-like stop event.
     Breakpoint,
+    /// Uncategorized exit event represented as text.
     Other(String),
 }
 
@@ -581,6 +649,11 @@ enum TraceModel {
         tree: crate::ctw::FacContextTree,
         bits_per_symbol: usize,
     },
+    #[cfg(feature = "backend-mamba")]
+    Mamba {
+        compressor: MambaCompressor,
+        primed: bool,
+    },
     Rwkv7 {
         compressor: Compressor,
         primed: bool,
@@ -595,12 +668,38 @@ enum TraceModel {
 }
 
 impl TraceModel {
+    fn predictor_backed(backend: RateBackend) -> Self {
+        let mut model =
+            crate::mixture::RateBackendPredictor::from_backend(backend.clone(), -1, 2f64.powi(-24));
+        model
+            .begin_stream(None)
+            .unwrap_or_else(|e| panic!("predictor-backed stream init failed: {e}"));
+        TraceModel::Mixture { backend, model }
+    }
+
     fn new(backend: &RateBackend, max_order: i64) -> Self {
         match backend {
             RateBackend::RosaPlus => {
                 let mut model = RosaPlus::new(max_order, false, 0, 42);
                 model.build_lm_full_bytes_no_finalize_endpos();
                 TraceModel::Rosa { model, max_order }
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::Mamba { model } => {
+                let compressor = MambaCompressor::new_from_model(model.clone());
+                TraceModel::Mamba {
+                    compressor,
+                    primed: false,
+                }
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::MambaMethod { method } => {
+                let compressor = MambaCompressor::new_from_method(method)
+                    .unwrap_or_else(|e| panic!("invalid mamba method for vm trace model: {e}"));
+                TraceModel::Mamba {
+                    compressor,
+                    primed: false,
+                }
             }
             RateBackend::Rwkv7 { model } => {
                 let compressor = Compressor::new_from_model(model.clone());
@@ -620,15 +719,12 @@ impl TraceModel {
             RateBackend::Zpaq { method } => TraceModel::Zpaq {
                 model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
             },
-            RateBackend::Mixture { spec } => {
-                let backend = RateBackend::Mixture { spec: spec.clone() };
-                let model = crate::mixture::RateBackendPredictor::from_backend(
-                    backend.clone(),
-                    -1,
-                    2f64.powi(-24),
-                );
-                TraceModel::Mixture { backend, model }
-            }
+            RateBackend::Mixture { .. }
+            | RateBackend::Particle { .. }
+            | RateBackend::Match { .. }
+            | RateBackend::SparseMatch { .. }
+            | RateBackend::Ppmd { .. }
+            | RateBackend::Calibrated { .. } => TraceModel::predictor_backed(backend.clone()),
             RateBackend::Ctw { depth } => TraceModel::Ctw {
                 tree: crate::ctw::ContextTree::new(*depth),
             },
@@ -637,7 +733,7 @@ impl TraceModel {
                 num_percept_bits: _,
                 encoding_bits,
             } => {
-                let bits_per_symbol = (*encoding_bits).min(8).max(1);
+                let bits_per_symbol = (*encoding_bits).clamp(1, 8);
                 TraceModel::FacCtw {
                     tree: crate::ctw::FacContextTree::new(*base_depth, bits_per_symbol),
                     bits_per_symbol,
@@ -655,6 +751,11 @@ impl TraceModel {
             }
             TraceModel::Ctw { tree } => tree.clear(),
             TraceModel::FacCtw { tree, .. } => tree.clear(),
+            #[cfg(feature = "backend-mamba")]
+            TraceModel::Mamba { compressor, primed } => {
+                compressor.state.reset();
+                *primed = false;
+            }
             TraceModel::Rwkv7 { compressor, primed } => {
                 compressor.state.reset();
                 *primed = false;
@@ -668,6 +769,9 @@ impl TraceModel {
                     -1,
                     2f64.powi(-24),
                 );
+                model
+                    .begin_stream(None)
+                    .unwrap_or_else(|e| panic!("mixture stream init failed: {e}"));
             }
         }
     }
@@ -680,11 +784,10 @@ impl TraceModel {
         match self {
             TraceModel::Rosa { model, .. } => {
                 let mut bits = 0.0;
-                let mut tx = model.begin_tx();
                 for &b in data {
                     let p = model.prob_for_last(b as u32).max(1e-12);
                     bits -= p.log2();
-                    model.train_sequence_tx(&mut tx, &[b]);
+                    model.train_byte(b);
                 }
                 bits
             }
@@ -712,6 +815,39 @@ impl TraceModel {
                 let log_after = tree.get_log_block_probability();
                 let log_delta = log_after - log_before;
                 -log_delta / std::f64::consts::LN_2
+            }
+            #[cfg(feature = "backend-mamba")]
+            TraceModel::Mamba { compressor, primed } => {
+                if !*primed {
+                    let bias = compressor.online_bias_snapshot();
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    mambazip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                    *primed = true;
+                }
+                let mut bits = 0.0;
+                for &b in data {
+                    let p = compressor.pdf_buffer[b as usize].max(1e-12);
+                    bits -= p.log2();
+                    let bias = compressor.online_bias_snapshot();
+                    let logits = compressor.model.forward(
+                        &mut compressor.scratch,
+                        b as u32,
+                        &mut compressor.state,
+                    );
+                    mambazip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                }
+                bits
             }
             TraceModel::Rwkv7 { compressor, primed } => {
                 if !*primed {
@@ -1018,12 +1154,11 @@ impl NyxVmEnvironment {
         self.vm.apply_snapshot(&snapshot);
 
         // Reset trace model if configured
-        if let Some(trace_cfg) = &self.config.trace {
-            if trace_cfg.reset_on_episode {
-                if let Some(model) = &mut self.trace_model {
-                    model.reset();
-                }
-            }
+        if let Some(trace_cfg) = &self.config.trace
+            && trace_cfg.reset_on_episode
+            && let Some(model) = &mut self.trace_model
+        {
+            model.reset();
         }
 
         self.step_in_episode = 0;
@@ -1245,14 +1380,14 @@ impl NyxVmEnvironment {
         self.clear_shared_length();
 
         // Collect trace data if configured
-        if let Some(trace_cfg) = &self.config.trace {
-            if trace_cfg.shared_region_name.is_some() {
-                // Read from trace shared memory region (implementation-specific)
-                // For now, use main shared memory as fallback
-                trace_data = shared_memory.clone();
-                if trace_data.len() > trace_cfg.max_bytes {
-                    trace_data.truncate(trace_cfg.max_bytes);
-                }
+        if let Some(trace_cfg) = &self.config.trace
+            && trace_cfg.shared_region_name.is_some()
+        {
+            // Read from trace shared memory region (implementation-specific)
+            // For now, use main shared memory as fallback
+            trace_data = shared_memory.clone();
+            if trace_data.len() > trace_cfg.max_bytes {
+                trace_data.truncate(trace_cfg.max_bytes);
             }
         }
 
@@ -1316,25 +1451,26 @@ impl NyxVmEnvironment {
 
         let (entropy, intrinsic, novelty) = self.compute_filter_metrics(payload, filter);
 
-        if let Some(min_entropy) = filter.min_entropy {
-            if entropy < min_entropy {
-                return filter.reject_reward;
-            }
+        if let Some(min_entropy) = filter.min_entropy
+            && entropy < min_entropy
+        {
+            return filter.reject_reward;
         }
-        if let Some(max_entropy) = filter.max_entropy {
-            if entropy > max_entropy {
-                return filter.reject_reward;
-            }
+        if let Some(max_entropy) = filter.max_entropy
+            && entropy > max_entropy
+        {
+            return filter.reject_reward;
         }
-        if let Some(min_intrinsic) = filter.min_intrinsic_dependence {
-            if intrinsic < min_intrinsic {
-                return filter.reject_reward;
-            }
+        if let Some(min_intrinsic) = filter.min_intrinsic_dependence
+            && intrinsic < min_intrinsic
+        {
+            return filter.reject_reward;
         }
-        if let Some(min_novelty) = filter.min_novelty {
-            if filter.novelty_prior.is_some() && novelty < min_novelty {
-                return filter.reject_reward;
-            }
+        if let Some(min_novelty) = filter.min_novelty
+            && filter.novelty_prior.is_some()
+            && novelty < min_novelty
+        {
+            return filter.reject_reward;
         }
         None
     }
@@ -1616,10 +1752,10 @@ impl NyxVmEnvironment {
         });
 
         // Append to JSONL file
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
-            if let Ok(json_str) = serde_json::to_string(&log_entry) {
-                let _ = writeln!(file, "{}", json_str);
-            }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path)
+            && let Ok(json_str) = serde_json::to_string(&log_entry)
+        {
+            let _ = writeln!(file, "{}", json_str);
         }
     }
 }
@@ -1630,12 +1766,11 @@ impl NyxVmEnvironment {
 
 impl Environment for NyxVmEnvironment {
     fn perform_action(&mut self, action: Action) {
-        if self.needs_reset {
-            if let Err(e) = self.reset() {
-                if self.config.debug_mode {
-                    eprintln!("[NyxVm] Reset failed: {}", e);
-                }
-            }
+        if self.needs_reset
+            && let Err(e) = self.reset()
+            && self.config.debug_mode
+        {
+            eprintln!("[NyxVm] Reset failed: {}", e);
         }
 
         let payload = match self.get_action_payload(action) {
@@ -1905,5 +2040,71 @@ mod tests {
 
         assert_eq!(utf8.decode("test").unwrap(), data);
         assert_eq!(hex.decode("74657374").unwrap(), data);
+    }
+
+    #[test]
+    fn trace_model_supports_predictor_backed_backends() {
+        let backends = vec![
+            RateBackend::Match {
+                hash_bits: 20,
+                min_len: 4,
+                max_len: 255,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            },
+            RateBackend::SparseMatch {
+                hash_bits: 19,
+                min_len: 3,
+                max_len: 64,
+                gap_min: 1,
+                gap_max: 2,
+                base_mix: 0.05,
+                confidence_scale: 1.0,
+            },
+            RateBackend::Ppmd {
+                order: 8,
+                memory_mb: 8,
+            },
+            RateBackend::Calibrated {
+                spec: Arc::new(crate::CalibratedSpec {
+                    base: RateBackend::Ctw { depth: 8 },
+                    context: crate::CalibrationContextKind::Text,
+                    bins: 33,
+                    learning_rate: 0.02,
+                    bias_clip: 4.0,
+                }),
+            },
+            RateBackend::Particle {
+                spec: Arc::new(crate::ParticleSpec {
+                    num_particles: 4,
+                    num_cells: 4,
+                    cell_dim: 8,
+                    ..crate::ParticleSpec::default()
+                }),
+            },
+            RateBackend::Mixture {
+                spec: Arc::new(crate::MixtureSpec::new(
+                    crate::MixtureKind::Bayes,
+                    vec![crate::MixtureExpertSpec {
+                        name: Some("ctw".to_string()),
+                        log_prior: 0.0,
+                        max_order: -1,
+                        backend: RateBackend::Ctw { depth: 8 },
+                    }],
+                )),
+            },
+        ];
+
+        for backend in backends {
+            let mut model = TraceModel::new(&backend, 4);
+            let bits = model.update_and_score(b"trace payload");
+            assert!(bits.is_finite() && bits >= 0.0, "bits={bits}");
+            model.reset();
+            let bits_after_reset = model.update_and_score(b"trace payload");
+            assert!(
+                bits_after_reset.is_finite() && bits_after_reset >= 0.0,
+                "bits_after_reset={bits_after_reset}"
+            );
+        }
     }
 }

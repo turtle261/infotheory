@@ -18,7 +18,7 @@ mod tensor;
 mod weights;
 
 pub use model::ScratchBuffers;
-pub use model::{Config, Model, State};
+pub use model::{Config, FullAdamState, Model, State, TrainScopeMask};
 pub use profiling::{LayerProfiler, LayerTiming, NullProfiler, ProfilerSink};
 pub use tensor::{Tensor1D, Tensor2D, TensorView1D, TensorView2D};
 pub use weights::Weights;

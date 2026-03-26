@@ -1,6 +1,6 @@
 [package]
 name = "infotheory"
-version = "1.0.3"
+version = "1.1.0"
 edition = "2024"
 license = "ISC OR Apache-2.0"
 homepage = "https://infotheory.tech"
@@ -8,7 +8,7 @@ description = "The algorithmic information theory library."
 autobins = false
 
 [workspace]
-members = [".", "zpaq_rs"]
+members = [".", "zpaq_rs", "infotheory_py", "benchman"]
 exclude = ["nyx-lite"]
 resolver = "3"
 
@@ -31,12 +31,13 @@ crc32fast = "1.5.0"
 wide = "1.1.1"
 
 [features]
-default = ["backend-rosa", "backend-rwkv", "backend-zpaq"]
+default = ["backend-rosa", "backend-mamba", "backend-rwkv", "backend-zpaq"]
 backend-rosa = []
+backend-mamba = []
 backend-rwkv = []
 backend-zpaq = ["dep:zpaq_rs"]
 cli = []
-vm = ["dep:nyx-lite", "backend-rosa", "backend-rwkv", "backend-zpaq"]
+vm = ["dep:nyx-lite", "backend-rosa", "backend-mamba", "backend-rwkv", "backend-zpaq"]
 
 [[bin]]
 name = "infotheory"
@@ -51,6 +52,48 @@ harness = false
 [[bench]]
 name = "aixi"
 harness = false
+
+[[bench]]
+name = "mixture_backends"
+harness = false
+
+[[bench]]
+name = "neural_baseline"
+harness = false
+
+[[bench]]
+name = "simd_hotspots"
+harness = false
+
+[[bench]]
+name = "rate_backend_coders"
+harness = false
+required-features = ["backend-rwkv"]
+
+[[bench]]
+name = "mamba_rate"
+harness = false
+required-features = ["backend-mamba"]
+
+[[bench]]
+name = "mamba_online_train_full"
+harness = false
+required-features = ["backend-mamba"]
+
+[[bench]]
+name = "rwkv_online_train_full"
+harness = false
+required-features = ["backend-rwkv"]
+
+[[bench]]
+name = "exact_hotpaths"
+harness = false
+required-features = ["backend-rwkv", "backend-mamba"]
+
+[profile.dev]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
 
 [profile.release]
 lto = "fat"
@@ -67,3 +110,5 @@ debug = true
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

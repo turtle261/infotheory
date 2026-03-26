@@ -234,6 +234,7 @@ pub unsafe fn token_shift_avx(
 
 /// Token shift for six projections sharing the same x/prev inputs.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn token_shift_multi6_avx(
     x: *const f32,
     prev: *const f32,
@@ -476,6 +477,43 @@ pub unsafe fn exp_neg_scaled_inplace(x: *mut f32, scale: f32, len: usize) {
     }
 }
 
+/// Combined transform: `y = exp(-sigmoid(x) * scale)`.
+///
+/// When `sigmoid_out` is non-null, the intermediate sigmoid is written there.
+#[inline(always)]
+pub unsafe fn sigmoid_exp_neg_scaled_avx(
+    x: *const f32,
+    y: *mut f32,
+    sigmoid_out: *mut f32,
+    scale: f32,
+    len: usize,
+) {
+    let ones = f32x8::ONE;
+    let neg_scale = f32x8::splat(-scale);
+    let capture_sigmoid = !sigmoid_out.is_null();
+    let mut i = 0usize;
+
+    while i + LANES <= len {
+        let xv = load8(x.add(i));
+        let sig = ones / (ones + (-xv).exp());
+        if capture_sigmoid {
+            store8(sigmoid_out.add(i), sig);
+        }
+        store8(y.add(i), (sig * neg_scale).exp());
+        i += LANES;
+    }
+
+    while i < len {
+        let xv = *x.add(i);
+        let sig = 1.0 / (1.0 + (-xv).exp());
+        if capture_sigmoid {
+            *sigmoid_out.add(i) = sig;
+        }
+        *y.add(i) = (-sig * scale).exp();
+        i += 1;
+    }
+}
+
 /// ReLU squared: y = max(0, x)^2.
 #[inline(always)]
 pub unsafe fn relu_squared_avx(x: *const f32, y: *mut f32, len: usize) {
@@ -554,6 +592,7 @@ pub unsafe fn l2_normalize_avx(x: *const f32, y: *mut f32, len: usize, min_norm:
 
 /// RWKV7 state update kernel for single token, N=64 head dimension.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn rwkv7_wkv_update_avx(
     state: *mut f32,
     w: *const f32,
@@ -636,25 +675,37 @@ pub unsafe fn rwkv7_wkv_update_avx(
             let row = s_h.add(i * HEAD_DIM);
             let v_i = f32x8::splat(*v_h.add(i));
 
-            let s0 = load8(row.add(0)) * w0;
-            let s1 = load8(row.add(8)) * w1;
-            let s2 = load8(row.add(16)) * w2;
-            let s3 = load8(row.add(24)) * w3;
-            let s4 = load8(row.add(32)) * w4;
-            let s5 = load8(row.add(40)) * w5;
-            let s6 = load8(row.add(48)) * w6;
-            let s7 = load8(row.add(56)) * w7;
+            // RWKV7 reference ordering:
+            // 1) overlap t = dot(S_old_row, kk)
+            // 2) decay/write S_new_row = S_old_row * w - t * (kk * a) + v_i * k
+            let old0 = load8(row.add(0));
+            let old1 = load8(row.add(8));
+            let old2 = load8(row.add(16));
+            let old3 = load8(row.add(24));
+            let old4 = load8(row.add(32));
+            let old5 = load8(row.add(40));
+            let old6 = load8(row.add(48));
+            let old7 = load8(row.add(56));
 
-            let mut dot_acc = s0 * kk0;
-            dot_acc = s1.mul_add(kk1, dot_acc);
-            dot_acc = s2.mul_add(kk2, dot_acc);
-            dot_acc = s3.mul_add(kk3, dot_acc);
-            dot_acc = s4.mul_add(kk4, dot_acc);
-            dot_acc = s5.mul_add(kk5, dot_acc);
-            dot_acc = s6.mul_add(kk6, dot_acc);
-            dot_acc = s7.mul_add(kk7, dot_acc);
+            let mut dot_acc = old0 * kk0;
+            dot_acc = old1.mul_add(kk1, dot_acc);
+            dot_acc = old2.mul_add(kk2, dot_acc);
+            dot_acc = old3.mul_add(kk3, dot_acc);
+            dot_acc = old4.mul_add(kk4, dot_acc);
+            dot_acc = old5.mul_add(kk5, dot_acc);
+            dot_acc = old6.mul_add(kk6, dot_acc);
+            dot_acc = old7.mul_add(kk7, dot_acc);
 
             let t = f32x8::splat(dot_acc.reduce_add());
+
+            let s0 = old0 * w0;
+            let s1 = old1 * w1;
+            let s2 = old2 * w2;
+            let s3 = old3 * w3;
+            let s4 = old4 * w4;
+            let s5 = old5 * w5;
+            let s6 = old6 * w6;
+            let s7 = old7 * w7;
 
             let u0 = (v_i * k0) + (s0 - t * kka0);
             let u1 = (v_i * k1) + (s1 - t * kka1);
@@ -855,6 +906,7 @@ mod tests {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rwkv_update_scalar(
         state: &mut [f32],
         w: &[f32],
@@ -872,10 +924,6 @@ mod tests {
             let vec_base = h * N;
             for i in 0..N {
                 let row_base = state_base + i * N;
-                for j in 0..N {
-                    state[row_base + j] *= w[vec_base + j];
-                }
-
                 let mut dot = 0.0;
                 for j in 0..N {
                     dot += state[row_base + j] * kk[vec_base + j];
@@ -883,7 +931,7 @@ mod tests {
 
                 let vi = v[vec_base + i];
                 for j in 0..N {
-                    state[row_base + j] = state[row_base + j]
+                    state[row_base + j] = state[row_base + j] * w[vec_base + j]
                         - dot * (kk[vec_base + j] * a[vec_base + j])
                         + vi * k[vec_base + j];
                 }
@@ -984,9 +1032,11 @@ mod tests {
         let mut add = vec![0.0; len];
         let mut fma = vec![0.0; len];
         let mut sig = vec![0.0; len];
+        let mut sig_capture = vec![0.0; len];
         let mut tanh = vec![0.0; len];
         let mut relu2 = vec![0.0; len];
         let mut exp = vec![0.0; len];
+        let mut exp_sig = vec![0.0; len];
         let mut soft = vec![0.0; len];
 
         unsafe {
@@ -997,6 +1047,13 @@ mod tests {
             tanh_avx(a.as_ptr(), tanh.as_mut_ptr(), len);
             relu_squared_avx(a.as_ptr(), relu2.as_mut_ptr(), len);
             exp_scalar(a.as_ptr(), exp.as_mut_ptr(), len);
+            sigmoid_exp_neg_scaled_avx(
+                a.as_ptr(),
+                exp_sig.as_mut_ptr(),
+                sig_capture.as_mut_ptr(),
+                0.75,
+                len,
+            );
         }
         let lse = unsafe { softmax_avx(a.as_ptr(), soft.as_mut_ptr(), len) };
 
@@ -1007,6 +1064,7 @@ mod tests {
         let mut tanh_ref = vec![0.0; len];
         let mut relu2_ref = vec![0.0; len];
         let mut exp_ref = vec![0.0; len];
+        let mut exp_sig_ref = vec![0.0; len];
 
         let mut max_val = f32::NEG_INFINITY;
         for &v in &a {
@@ -1024,6 +1082,7 @@ mod tests {
             let relu = a[i].max(0.0);
             relu2_ref[i] = relu * relu;
             exp_ref[i] = a[i].exp();
+            exp_sig_ref[i] = (-sig_ref[i] * 0.75).exp();
 
             let e = (a[i] - max_val).exp();
             soft_ref[i] = e;
@@ -1037,9 +1096,11 @@ mod tests {
         assert_close_slice(&add, &add_ref, 2.5e-5);
         assert_close_slice(&fma, &fma_ref, 2.5e-5);
         assert_close_slice(&sig, &sig_ref, 2.5e-5);
+        assert_close_slice(&sig_capture, &sig_ref, 2.5e-5);
         assert_close_slice(&tanh, &tanh_ref, 2.5e-5);
         assert_close_slice(&relu2, &relu2_ref, 2.5e-5);
         assert_close_slice(&exp, &exp_ref, 2.5e-5);
+        assert_close_slice(&exp_sig, &exp_sig_ref, 2.5e-5);
         assert_close_slice(&soft, &soft_ref, 2.5e-5);
         assert!((lse - (sum_exp.ln() + max_val)).abs() <= 2.5e-5);
     }
@@ -1179,11 +1240,56 @@ mod tests {
     }
 
     #[test]
+    fn rwkv_update_uses_pre_decay_overlap_order() {
+        let num_heads = 1;
+        let mut state = vec![0.0f32; HEAD_DIM * HEAD_DIM];
+        let mut w = vec![1.0f32; HEAD_DIM];
+        let k = vec![0.0f32; HEAD_DIM];
+        let v = vec![0.0f32; HEAD_DIM];
+        let mut kk = vec![0.0f32; HEAD_DIM];
+        let a = vec![1.0f32; HEAD_DIM];
+        let r = vec![0.0f32; HEAD_DIM];
+        let mut y = vec![0.0f32; HEAD_DIM];
+
+        // Construct a row where pre-decay and post-decay overlap differ.
+        // S_old row: [1, 2, 0, ...], w: [0, 1, ...], kk: [1, 1, ...]
+        // Official overlap = dot(S_old, kk) = 3.
+        state[0] = 1.0;
+        state[1] = 2.0;
+        w[0] = 0.0;
+        w[1] = 1.0;
+        kk[0] = 1.0;
+        kk[1] = 1.0;
+
+        unsafe {
+            rwkv7_wkv_update_avx(
+                state.as_mut_ptr(),
+                w.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                kk.as_ptr(),
+                a.as_ptr(),
+                r.as_ptr(),
+                y.as_mut_ptr(),
+                num_heads,
+                HEAD_DIM,
+            )
+        };
+
+        // Expected with official ordering:
+        // S_new = S_old * w - dot(S_old, kk) * (kk * a)
+        //       = [0,2] - 3 * [1,1] = [-3,-1]
+        assert!((state[0] + 3.0).abs() <= 1e-6, "state[0]={}", state[0]);
+        assert!((state[1] + 1.0).abs() <= 1e-6, "state[1]={}", state[1]);
+    }
+
+    #[test]
     fn deterministic_kernel_snapshot() {
         let num_heads = 2;
         let mut rng = Lcg::new(0xDEC0DED);
 
         let mut state = vec![0.0; num_heads * HEAD_DIM * HEAD_DIM];
+        let mut state_ref = vec![0.0; num_heads * HEAD_DIM * HEAD_DIM];
         let mut w = vec![0.0; num_heads * HEAD_DIM];
         let mut k = vec![0.0; num_heads * HEAD_DIM];
         let mut v = vec![0.0; num_heads * HEAD_DIM];
@@ -1191,7 +1297,9 @@ mod tests {
         let mut a = vec![0.0; num_heads * HEAD_DIM];
         let mut r = vec![0.0; num_heads * HEAD_DIM];
         let mut y = vec![0.0; num_heads * HEAD_DIM];
+        let mut y_ref = vec![0.0; num_heads * HEAD_DIM];
         fill_centered(&mut state, &mut rng, 0.4);
+        state_ref.copy_from_slice(&state);
         fill_centered(&mut w, &mut rng, 0.2);
         fill_centered(&mut k, &mut rng, 0.3);
         fill_centered(&mut v, &mut rng, 0.25);
@@ -1214,48 +1322,59 @@ mod tests {
             )
         };
 
+        rwkv_update_scalar(
+            &mut state_ref,
+            &w,
+            &k,
+            &v,
+            &kk,
+            &a,
+            &r,
+            &mut y_ref,
+            num_heads,
+        );
+
         let mut sm = vec![0.0; HEAD_DIM];
         let lse = unsafe { softmax_avx(y.as_ptr(), sm.as_mut_ptr(), HEAD_DIM) };
+        let y_ref_head = &y_ref[..HEAD_DIM];
+        let mut sm_ref = vec![0.0; HEAD_DIM];
+        let mut max_ref = f32::NEG_INFINITY;
+        for &v in y_ref_head {
+            max_ref = max_ref.max(v);
+        }
+        let mut sum_ref = 0.0f32;
+        for i in 0..HEAD_DIM {
+            let e = (y_ref_head[i] - max_ref).exp();
+            sm_ref[i] = e;
+            sum_ref += e;
+        }
+        if sum_ref > 0.0 {
+            let inv = 1.0 / sum_ref;
+            for v in &mut sm_ref {
+                *v *= inv;
+            }
+        }
+        let lse_ref = sum_ref.ln() + max_ref;
 
         let mut normed = vec![0.0; HEAD_DIM];
         unsafe { l2_normalize_avx(y.as_ptr(), normed.as_mut_ptr(), HEAD_DIM, 1e-6) };
+        let mut normed_ref = vec![0.0; HEAD_DIM];
+        let mut sq = 0.0f32;
+        for &v in y_ref_head {
+            sq += v * v;
+        }
+        let denom = sq.sqrt().max(1e-6);
+        for i in 0..HEAD_DIM {
+            normed_ref[i] = y_ref_head[i] / denom;
+        }
 
-        let checksum = |data: &[f32]| -> f64 {
-            data.iter()
-                .enumerate()
-                .map(|(i, &v)| (i as f64 + 1.0) * (v as f64))
-                .sum::<f64>()
-        };
-
-        let state_checksum = checksum(&state);
-        let y_checksum = checksum(&y);
-        let softmax_checksum = checksum(&sm);
-        let normed_checksum = checksum(&normed);
-        let lse_val = lse as f64;
-
-        let expected_state_checksum = 712.653_817_538_841_4_f64;
-        let expected_y_checksum = 3.817_787_693_347_782_f64;
-        let expected_softmax_checksum = 32.405_059_017_241_f64;
-        let expected_normed_checksum = -13.328_749_446_634_902_f64;
-        let expected_lse = 4.160_823_822_021_484_f64;
-
-        let tol = 2e-4_f64;
-        assert!(
-            (state_checksum - expected_state_checksum).abs() <= tol,
-            "state_checksum={state_checksum}"
-        );
-        assert!(
-            (y_checksum - expected_y_checksum).abs() <= tol,
-            "y_checksum={y_checksum}"
-        );
-        assert!(
-            (softmax_checksum - expected_softmax_checksum).abs() <= tol,
-            "softmax_checksum={softmax_checksum}"
-        );
-        assert!(
-            (normed_checksum - expected_normed_checksum).abs() <= tol,
-            "normed_checksum={normed_checksum}"
-        );
-        assert!((lse_val - expected_lse).abs() <= tol, "lse={lse_val}");
+        // Compare AVX output directly against the scalar reference.
+        // Checksum comparisons are brittle across CPUs because tiny per-element
+        // FP ordering differences accumulate over long vectors.
+        assert_close_slice(&state, &state_ref, 5e-4);
+        assert_close_slice(&y, &y_ref, 5e-4);
+        assert_close_slice(&sm, &sm_ref, 5e-5);
+        assert_close_slice(&normed, &normed_ref, 5e-5);
+        assert!((lse - lse_ref).abs() <= 5e-5, "lse={lse} lse_ref={lse_ref}");
     }
 }

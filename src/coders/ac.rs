@@ -13,6 +13,7 @@
 
 use std::io::Write;
 use wide::f32x8;
+use wide::f64x4;
 
 /// Total count for CDF quantization (2^30 for high precision)
 pub const CDF_TOTAL: u32 = 1 << 30;
@@ -45,6 +46,9 @@ pub fn softmax_pdf_floor(logits: &[f32], vocab_size: usize) -> Vec<f64> {
     result
 }
 
+/// In-place softmax from logits into a caller-provided `pdf_out` buffer.
+///
+/// `pdf_out.len()` must be at least `vocab_size`.
 pub fn softmax_pdf_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64]) {
     debug_assert!(pdf_out.len() >= vocab_size);
 
@@ -62,13 +66,13 @@ pub fn softmax_pdf_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64
 
     if sum > 0.0 {
         let inv = 1.0 / sum;
-        for i in 0..vocab_size {
-            pdf_out[i] *= inv;
+        for value in pdf_out.iter_mut().take(vocab_size) {
+            *value *= inv;
         }
     } else {
         let inv = 1.0 / (vocab_size.max(1) as f64);
-        for i in 0..vocab_size {
-            pdf_out[i] = inv;
+        for value in pdf_out.iter_mut().take(vocab_size) {
+            *value = inv;
         }
     }
 }
@@ -81,7 +85,7 @@ pub fn softmax_pdf_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64
 /// * `pdf_out` - Pre-allocated buffer for output PDF (length >= vocab_size)
 pub fn softmax_pdf_floor_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mut [f64]) {
     // Fast path for byte-level vocab using portable SIMD (`wide`).
-    if vocab_size == 256 {
+    if vocab_size == 256 && logits.len() >= 256 && pdf_out.len() >= 256 {
         softmax_pdf_floor_wide_256(logits, pdf_out);
         return;
     }
@@ -103,14 +107,14 @@ pub fn softmax_pdf_floor_inplace(logits: &[f32], vocab_size: usize, pdf_out: &mu
     }
 
     // Normalize and apply floor
-    for i in 0..vocab_size {
-        pdf_out[i] = (pdf_out[i] / sum).max(p_min_val);
+    for value in pdf_out.iter_mut().take(vocab_size) {
+        *value = (*value / sum).max(p_min_val);
     }
 
     // Re-normalize after floor application
     let norm: f64 = pdf_out[..vocab_size].iter().sum();
-    for i in 0..vocab_size {
-        pdf_out[i] /= norm;
+    for value in pdf_out.iter_mut().take(vocab_size) {
+        *value /= norm;
     }
 }
 
@@ -138,27 +142,59 @@ fn softmax_pdf_floor_wide_256(logits: &[f32], pdf_out: &mut [f64]) {
     }
     let max_v = f32x8::splat(max);
 
-    let mut sum = 0.0f64;
-    for i in (0..N).step_by(8) {
+    let mut sum4 = f64x4::ZERO;
+    for (chunk_idx, out_chunk) in pdf_out[..N].chunks_exact_mut(8).enumerate() {
+        let i = chunk_idx * 8;
         let centered = unsafe { load8(logits.as_ptr().add(i)) } - max_v;
         let exp_vals = centered.exp().to_array();
-        for lane in 0..8 {
-            let v = exp_vals[lane] as f64;
-            pdf_out[i + lane] = v;
-            sum += v;
-        }
+        let v0 = f64x4::new([
+            exp_vals[0] as f64,
+            exp_vals[1] as f64,
+            exp_vals[2] as f64,
+            exp_vals[3] as f64,
+        ]);
+        let v1 = f64x4::new([
+            exp_vals[4] as f64,
+            exp_vals[5] as f64,
+            exp_vals[6] as f64,
+            exp_vals[7] as f64,
+        ]);
+        sum4 += v0 + v1;
+
+        let lanes0 = v0.to_array();
+        let lanes1 = v1.to_array();
+        out_chunk[..4].copy_from_slice(&lanes0);
+        out_chunk[4..].copy_from_slice(&lanes1);
     }
+
+    let sum_lanes = sum4.to_array();
+    let sum = sum_lanes[0] + sum_lanes[1] + sum_lanes[2] + sum_lanes[3];
 
     let inv_sum = 1.0 / sum;
-    let mut norm = 0.0f64;
-    for v in pdf_out.iter_mut().take(N) {
-        *v = (*v * inv_sum).max(p_min_val);
-        norm += *v;
+    let mut norm4 = f64x4::ZERO;
+    let inv_sum4 = f64x4::splat(inv_sum);
+    let min4 = f64x4::splat(p_min_val);
+
+    for chunk in pdf_out[..N].chunks_exact_mut(4) {
+        let vals = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mut v = vals * inv_sum4;
+        v = v.max(min4);
+
+        let lanes = v.to_array();
+        chunk.copy_from_slice(&lanes);
+        norm4 += v;
     }
 
+    let norm_lanes = norm4.to_array();
+    let norm = norm_lanes[0] + norm_lanes[1] + norm_lanes[2] + norm_lanes[3];
+
     let inv_norm = 1.0 / norm;
-    for v in pdf_out.iter_mut().take(N) {
-        *v *= inv_norm;
+    let inv_norm4 = f64x4::splat(inv_norm);
+    for chunk in pdf_out[..N].chunks_exact_mut(4) {
+        let vals = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let out = vals * inv_norm4;
+        let lanes = out.to_array();
+        chunk.copy_from_slice(&lanes);
     }
 }
 
@@ -212,24 +248,14 @@ pub fn quantize_pdf_to_cdf(pdf: &[f64]) -> Vec<u32> {
 /// `cdf_out` must have length at least `pdf.len() + 1`.
 #[inline]
 pub fn quantize_pdf_to_cdf_inplace(pdf: &[f64], cdf_out: &mut [u32]) {
-    let n = pdf.len();
-    debug_assert!(cdf_out.len() >= n + 1, "cdf buffer too small");
+    let mut unused_freq = [];
+    super::quantize_pdf_to_integer_cdf_with_buffer(pdf, CDF_TOTAL, cdf_out, &mut unused_freq);
+}
 
-    unsafe {
-        *cdf_out.get_unchecked_mut(0) = 0;
-        let scale = CDF_TOTAL as f64;
-        let mut acc = 0.0f64;
-        let mut prev = 0u32;
-
-        for i in 0..n {
-            acc += *pdf.get_unchecked(i);
-            let v = (acc * scale) as u32;
-            let v = v.max(prev);
-            *cdf_out.get_unchecked_mut(i + 1) = v;
-            prev = v;
-        }
-        *cdf_out.get_unchecked_mut(n) = CDF_TOTAL;
-    }
+/// Quantize PDF to integer CDF using reusable output and frequency buffers.
+#[inline]
+pub fn quantize_pdf_to_cdf_with_buffer(pdf: &[f64], cdf_out: &mut [u32], freq_buf: &mut [i64]) {
+    super::quantize_pdf_to_integer_cdf_with_buffer(pdf, CDF_TOTAL, cdf_out, freq_buf);
 }
 
 /// Binary arithmetic encoder.
@@ -575,5 +601,48 @@ mod tests {
         for i in 1..cdf.len() {
             assert!(cdf[i] >= cdf[i - 1]);
         }
+    }
+
+    #[test]
+    fn test_cdf_positive_width_for_tiny_positive_tail() {
+        let tail = 1e-18;
+        let head = 1.0 - (255.0 * tail);
+        let mut pdf = vec![tail; 256];
+        pdf[0] = head;
+        let mut cdf = vec![0u32; 257];
+        let mut freq = vec![0i64; 256];
+        quantize_pdf_to_cdf_with_buffer(&pdf, &mut cdf, &mut freq);
+
+        assert_eq!(cdf[0], 0);
+        assert_eq!(cdf[256], CDF_TOTAL);
+        for i in 0..256 {
+            assert!(cdf[i + 1] > cdf[i], "symbol {i} has zero-width interval");
+        }
+    }
+
+    #[test]
+    fn test_cdf_positive_width_when_mass_is_last_symbol() {
+        let mut pdf = vec![0.0; 256];
+        pdf[255] = 1.0;
+        let mut cdf = vec![0u32; 257];
+        let mut freq = vec![0i64; 256];
+        quantize_pdf_to_cdf_with_buffer(&pdf, &mut cdf, &mut freq);
+
+        assert_eq!(cdf[0], 0);
+        assert_eq!(cdf[255], 255);
+        assert_eq!(cdf[256], CDF_TOTAL);
+        for i in 0..256 {
+            assert!(cdf[i + 1] > cdf[i], "symbol {i} has zero-width interval");
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_softmax_floor_256_short_logits_panics_safely() {
+        // For vocab_size=256, short logits must not hit the SIMD fast path.
+        // Safe fallback behavior is a normal Rust bounds panic in scalar code.
+        let logits = vec![0.0f32; 255];
+        let mut pdf_out = vec![0.0f64; 256];
+        softmax_pdf_floor_inplace(&logits, 256, &mut pdf_out);
     }
 }

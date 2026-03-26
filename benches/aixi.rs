@@ -61,7 +61,11 @@ fn main() {
         min_reward: -1,
         max_reward: 1,
         reward_offset: 1,
+        random_seed: Some(1),
         rwkv_model_path: None,
+        rwkv_method: None,
+        mamba_model_path: None,
+        mamba_method: None,
         rosa_max_order: Some(20),
         zpaq_method: None,
     };

@@ -39,6 +39,13 @@ pub trait Environment {
     /// Returns the number of bits required to represent all possible actions.
     fn get_action_bits(&self) -> usize;
 
+    /// Reseed the environment RNG for deterministic, reproducible runs.
+    ///
+    /// Deterministic environments can ignore this. Stochastic environments
+    /// should reseed and reset any stochastic state so the initial percept
+    /// sequence is reproducible from `seed`.
+    fn set_random_seed(&mut self, _seed: u64) {}
+
     /// Returns the total number of valid actions available.
     fn get_num_actions(&self) -> usize {
         1 << self.get_action_bits()
@@ -91,11 +98,16 @@ pub struct CoinFlip {
 impl CoinFlip {
     /// Creates a new `CoinFlip` environment with bias `p`.
     pub fn new(p: f64) -> Self {
+        Self::new_with_seed(p, None)
+    }
+
+    /// Creates a new `CoinFlip` environment with optional deterministic seed.
+    pub fn new_with_seed(p: f64, seed: Option<u64>) -> Self {
         let mut env = Self {
             p,
             obs: 0,
             rew: 0,
-            rng: RandomGenerator::new(),
+            rng: seed.map(RandomGenerator::from_seed).unwrap_or_default(),
         };
         // Initial observation
         env.gen_next();
@@ -140,6 +152,12 @@ impl Environment for CoinFlip {
     fn get_action_bits(&self) -> usize {
         1
     }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        self.rng = RandomGenerator::from_seed(seed);
+        self.rew = 0;
+        self.gen_next();
+    }
 }
 
 /// A synthetic environment for testing CTW performance.
@@ -162,6 +180,12 @@ impl CtwTest {
             obs: 0,
             rew: 0,
         }
+    }
+}
+
+impl Default for CtwTest {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -215,29 +239,38 @@ pub struct BiasedRockPaperScissor {
     obs: PerceptVal,
     rew: Reward,
     rng: RandomGenerator,
-    opponent_won_last_round: bool,
-    opponent_last_round_action: Action,
 }
 
 impl BiasedRockPaperScissor {
     /// Creates a new `BiasedRockPaperScissor` environment.
     pub fn new() -> Self {
+        Self::new_with_seed(None)
+    }
+
+    /// Creates a new `BiasedRockPaperScissor` environment with optional seed.
+    pub fn new_with_seed(seed: Option<u64>) -> Self {
         Self {
-            obs: 0,
+            // Match reference MC-AIXI/PyAIXI initial percept: non-rock.
+            obs: 1,
             rew: 0,
-            rng: RandomGenerator::new(),
-            opponent_won_last_round: false,
-            opponent_last_round_action: 0,
+            rng: seed.map(RandomGenerator::from_seed).unwrap_or_default(),
         }
+    }
+}
+
+impl Default for BiasedRockPaperScissor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Environment for BiasedRockPaperScissor {
     fn perform_action(&mut self, action: Action) {
         // action 0: Rock, 1: Paper, 2: Scissors
-        // Opponent Logic
-        let opponent_action = if self.opponent_won_last_round {
-            self.opponent_last_round_action
+        // Match reference MC-AIXI/PyAIXI bias: repeat rock iff opponent won
+        // the previous round by playing rock.
+        let opponent_action = if self.obs == 0 && self.rew == -1 {
+            0
         } else {
             let r = self.rng.gen_f64();
             if r < 1.0 / 3.0 {
@@ -252,17 +285,13 @@ impl Environment for BiasedRockPaperScissor {
         // Determine Outcome
         if opponent_action == action {
             self.rew = 0; // Draw
-            self.opponent_won_last_round = false;
         } else if (opponent_action == 0 && action == 1)
             || (opponent_action == 1 && action == 2)
             || (opponent_action == 2 && action == 0)
         {
             self.rew = 1; // Win
-            self.opponent_won_last_round = false;
         } else {
             self.rew = -1; // Loss
-            self.opponent_won_last_round = true;
-            self.opponent_last_round_action = opponent_action;
         }
         self.obs = opponent_action as PerceptVal;
     }
@@ -296,6 +325,13 @@ impl Environment for BiasedRockPaperScissor {
     }
     fn get_num_actions(&self) -> usize {
         3
+    }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        self.rng = RandomGenerator::from_seed(seed);
+        // Match reference initial condition after reseed.
+        self.obs = 1;
+        self.rew = 0;
     }
 }
 
@@ -332,6 +368,12 @@ impl ExtendedTiger {
     fn reset_doors(&mut self) {
         self.gold_door = if self.rng.gen_bool(0.5) { 1 } else { 2 };
         self.tiger_door = if self.gold_door == 1 { 2 } else { 3 };
+    }
+}
+
+impl Default for ExtendedTiger {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -423,6 +465,14 @@ impl Environment for ExtendedTiger {
     fn get_num_actions(&self) -> usize {
         4
     }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        self.rng = RandomGenerator::from_seed(seed);
+        self.state = 0;
+        self.obs = 0;
+        self.rew = 0;
+        self.reset_doors();
+    }
 }
 
 /// A standard Tic-Tac-Toe environment against a random opponent.
@@ -472,6 +522,12 @@ impl TicTacToe {
             }
         }
         false
+    }
+}
+
+impl Default for TicTacToe {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -562,6 +618,13 @@ impl Environment for TicTacToe {
     fn get_num_actions(&self) -> usize {
         9
     }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        self.rng = RandomGenerator::from_seed(seed);
+        self.reset_game();
+        self.obs = 0;
+        self.rew = 0;
+    }
 }
 
 /// A 2-player imperfect information game: Kuhn Poker.
@@ -571,10 +634,7 @@ impl Environment for TicTacToe {
 pub struct KuhnPoker {
     opponent_card: usize, // 0:J, 1:Q, 2:K
     agent_card: usize,
-    agent_chips: usize,
-    chips_in_play: usize,
-    alpha: f64,
-    opponent_action: usize, // 0: pass, 1: bet
+    opponent_action: usize, // 0: bet, 1: pass
     obs: PerceptVal,
     rew: Reward,
     rng: RandomGenerator,
@@ -583,104 +643,133 @@ pub struct KuhnPoker {
 impl KuhnPoker {
     /// Creates a new `KuhnPoker` environment.
     pub fn new() -> Self {
+        Self::new_with_seed(None)
+    }
+
+    /// Creates a new `KuhnPoker` environment with optional deterministic seed.
+    pub fn new_with_seed(seed: Option<u64>) -> Self {
         let mut env = Self {
             opponent_card: 0,
             agent_card: 0,
-            agent_chips: 0,
-            chips_in_play: 0,
-            alpha: 0.0,
             opponent_action: 0,
             obs: 0,
             rew: 0,
-            rng: RandomGenerator::new(),
+            rng: seed.map(RandomGenerator::from_seed).unwrap_or_default(),
         };
         env.reset_game();
         env
     }
 
+    #[inline]
+    fn random_card(&mut self) -> usize {
+        self.rng.gen_range(3)
+    }
+
     fn reset_game(&mut self) {
-        let r = self.rng.gen_f64();
-        self.opponent_card = if r < 1.0 / 3.0 {
-            2
-        } else if self.rng.gen_bool(0.5) {
-            1
+        // Card encoding matches the reference implementations:
+        // 0=Jack, 1=Queen, 2=King.
+        self.agent_card = self.random_card();
+        self.opponent_card = self.agent_card;
+        while self.opponent_card == self.agent_card {
+            self.opponent_card = self.random_card();
+        }
+
+        const ACTION_BET: usize = 0;
+        const ACTION_PASS: usize = 1;
+        const BET_PROB_KING: f64 = 0.7;
+        const BET_PROB_JACK: f64 = BET_PROB_KING / 3.0;
+
+        // Opponent first action (reference Nash policy).
+        self.opponent_action = if self.opponent_card == 0 {
+            if self.rng.gen_bool(BET_PROB_JACK) {
+                ACTION_BET
+            } else {
+                ACTION_PASS
+            }
+        } else if self.opponent_card == 1 {
+            ACTION_PASS
+        } else if self.rng.gen_bool(BET_PROB_KING) {
+            ACTION_BET
+        } else {
+            ACTION_PASS
+        };
+
+        // Observation encoding matches C++/PyAIXI:
+        // observation = agent_card + (opponent_pass ? 4 : 0)
+        let action_code = if self.opponent_action == ACTION_PASS {
+            4
         } else {
             0
         };
-
-        // Agent card: one of the remaining
-        let k = if self.rng.gen_bool(0.5) { 1 } else { 2 };
-        self.agent_card = (self.opponent_card + k) % 3;
-
-        self.agent_chips = 1;
-        self.chips_in_play = 2; // Ante 1 each
-
-        // Opponent action (Nash)
-        self.alpha = self.rng.gen_f64() / 3.0; // alpha in [0, 1/3]
-
-        // Opponent logic matching C++
-        self.opponent_action = if self.opponent_card == 0 {
-            // Jack
-            if self.rng.gen_bool(self.alpha) { 1 } else { 0 }
-        } else if self.opponent_card == 1 {
-            // Queen
-            0 // Always check
-        } else {
-            // King
-            if self.rng.gen_bool(3.0 * self.alpha) {
-                1
-            } else {
-                0
-            }
-        };
-
-        if self.opponent_action == 1 {
-            self.chips_in_play += 1;
-        }
-
-        let card_code = 1 << self.agent_card;
-        let action_code = if self.opponent_action == 1 { 8 } else { 0 };
+        let card_code = self.agent_card;
         self.obs = (action_code + card_code) as PerceptVal;
+    }
+}
+
+impl Default for KuhnPoker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Environment for KuhnPoker {
     fn perform_action(&mut self, action: Action) {
-        // Action: 0: Pass, 1: Bet
-        self.agent_chips += action as usize;
-        self.chips_in_play += action as usize;
+        const ACTION_BET: usize = 0;
+        const ACTION_PASS: usize = 1;
 
-        let opponent_bets = self.opponent_action == 1;
-        let agent_bets = action == 1;
+        // Reference reward levels are encoded as {0,1,3,4}. We emit the
+        // offset-removed values {-2,-1,1,2} for direct comparability.
+        const R_BET_LOSS: Reward = -2;
+        const R_PASS_LOSS: Reward = -1;
+        const R_PASS_WIN: Reward = 1;
+        const R_BET_WIN: Reward = 2;
 
-        if opponent_bets == agent_bets {
-            // Showdown
-            if self.agent_card > self.opponent_card {
-                self.rew = self.chips_in_play as i64;
-            } else {
-                self.rew = -(self.agent_chips as i64);
-            }
+        const BET_PROB_KING: f64 = 0.7;
+        const BET_PROB_QUEEN: f64 = (1.0 + BET_PROB_KING) / 3.0;
+
+        if action > 1 {
+            self.rew = R_BET_LOSS;
             self.reset_game();
-        } else if opponent_bets && !agent_bets {
-            // Opponent bet, Agent fold
-            self.rew = -(self.agent_chips as i64);
-            self.reset_game();
-        } else {
-            // Opponent passed, Agent bet. Opponent decision.
-            let call = self.rng.gen_bool(self.alpha + 1.0 / 3.0);
-            if call {
-                self.chips_in_play += 1;
-                if self.agent_card > self.opponent_card {
-                    self.rew = self.chips_in_play as i64;
-                } else {
-                    self.rew = -(self.agent_chips as i64);
-                }
-            } else {
-                // Opponent folds
-                self.rew = self.chips_in_play as i64;
-            }
-            self.reset_game();
+            return;
         }
+
+        // If the agent did not call an opponent bet, the agent loses.
+        if action as usize == ACTION_PASS && self.opponent_action == ACTION_BET {
+            self.rew = R_PASS_LOSS;
+            self.reset_game();
+            return;
+        }
+
+        // If opponent passed and agent bet, opponent may reconsider.
+        if action as usize == ACTION_BET && self.opponent_action == ACTION_PASS {
+            if self.opponent_card == 1 && self.rng.gen_bool(BET_PROB_QUEEN) {
+                self.opponent_action = ACTION_BET;
+            } else if self.opponent_card == 2 {
+                self.opponent_action = ACTION_BET;
+            } else {
+                self.rew = R_PASS_WIN;
+                self.reset_game();
+                return;
+            }
+        }
+
+        // Showdown.
+        let agent_wins =
+            self.opponent_card == 0 || (self.opponent_card == 1 && self.agent_card == 2);
+        if agent_wins {
+            self.rew = if self.opponent_action == ACTION_BET {
+                R_BET_WIN
+            } else {
+                R_PASS_WIN
+            };
+        } else {
+            self.rew = if action as usize == ACTION_BET {
+                R_BET_LOSS
+            } else {
+                R_PASS_LOSS
+            };
+        }
+        self.reset_game();
     }
 
     fn get_observation(&self) -> PerceptVal {
@@ -694,7 +783,7 @@ impl Environment for KuhnPoker {
     }
 
     fn get_observation_bits(&self) -> usize {
-        4
+        3
     }
     fn get_reward_bits(&self) -> usize {
         3
@@ -705,12 +794,18 @@ impl Environment for KuhnPoker {
     }
 
     fn max_reward(&self) -> Reward {
-        4
+        2
     }
     fn get_action_bits(&self) -> usize {
         1
     } // 0 or 1
     fn get_num_actions(&self) -> usize {
         2
+    }
+
+    fn set_random_seed(&mut self, seed: u64) {
+        self.rng = RandomGenerator::from_seed(seed);
+        self.rew = 0;
+        self.reset_game();
     }
 }

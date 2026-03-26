@@ -1,0 +1,19 @@
+{
+  "kind": "neural",
+  "alpha": 0.04,
+  "experts": [
+	{
+		"name": "mamba",
+		"kind": "mamba",
+		"method": "cfg:hidden=32,layers=1,intermediate=128,seed=26,train=adam,lr=0.001,stride=1;policy:schedule=0..50%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)",
+		"log_prior": 0.0
+	},
+	{
+      "name": "rosa",
+      "kind": "rosaplus",
+      "max_order": -1,
+      "log_prior": 0.0
+    }
+
+  ]
+}

@@ -8,9 +8,13 @@ use crate::aixi::common::{
     observation_repr_from_stream,
 };
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
+#[cfg(feature = "backend-mamba")]
+use crate::aixi::model::MambaPredictor;
 #[cfg(feature = "backend-rwkv")]
 use crate::aixi::model::RwkvPredictor;
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor, Predictor, RosaPredictor, ZpaqPredictor};
+#[cfg(feature = "backend-mamba")]
+use crate::load_mamba_model_from_path;
 #[cfg(feature = "backend-rwkv")]
 use crate::load_rwkv7_model_from_path;
 use crate::validate_zpaq_rate_method;
@@ -18,7 +22,7 @@ use crate::validate_zpaq_rate_method;
 /// Configuration parameters for an AIXI agent.
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
-    /// The predictive algorithm to use ("ctw", "rosa", "rwkv", "zpaq").
+    /// The predictive algorithm to use ("ctw", "rosa", "rwkv", "mamba", "zpaq").
     pub algorithm: String,
     /// Context depth for the CTW model.
     pub ct_depth: usize,
@@ -48,8 +52,18 @@ pub struct AgentConfig {
     ///
     /// Paper-compatible encoding shifts rewards by an offset so all encoded values are non-negative.
     pub reward_offset: Reward,
+    /// Optional deterministic RNG seed for planning/simulation behavior.
+    ///
+    /// When `None`, a fresh runtime-derived seed is used.
+    pub random_seed: Option<u64>,
     /// Path to the RWKV model weights (if using "rwkv").
     pub rwkv_model_path: Option<String>,
+    /// Optional RWKV method string for hosted/browser-safe construction.
+    pub rwkv_method: Option<String>,
+    /// Path to the Mamba model weights (if using "mamba").
+    pub mamba_model_path: Option<String>,
+    /// Optional Mamba method string for hosted/browser-safe construction.
+    pub mamba_method: Option<String>,
     /// Maximum Markov order for the ROSA model (if using "rosa").
     pub rosa_max_order: Option<i64>,
     /// ZPAQ method string for the rate model (if using "zpaq").
@@ -116,15 +130,38 @@ impl Agent {
             }
             #[cfg(feature = "backend-rwkv")]
             "rwkv" => {
-                let path = config
-                    .rwkv_model_path
-                    .as_ref()
-                    .expect("RWKV model path required");
-                let model_arc = load_rwkv7_model_from_path(path);
-                Box::new(RwkvPredictor::new(model_arc))
+                if let Some(method) = config.rwkv_method.as_deref() {
+                    let predictor = RwkvPredictor::from_method(method)
+                        .unwrap_or_else(|err| panic!("Invalid RWKV method for AIXI: {err}"));
+                    Box::new(predictor)
+                } else {
+                    let path = config
+                        .rwkv_model_path
+                        .as_ref()
+                        .expect("RWKV model path required");
+                    let model_arc = load_rwkv7_model_from_path(path);
+                    Box::new(RwkvPredictor::new(model_arc))
+                }
             }
             #[cfg(not(feature = "backend-rwkv"))]
             "rwkv" => panic!("RWKV backend disabled at compile time"),
+            #[cfg(feature = "backend-mamba")]
+            "mamba" => {
+                if let Some(method) = config.mamba_method.as_deref() {
+                    let predictor = MambaPredictor::from_method(method)
+                        .unwrap_or_else(|err| panic!("Invalid Mamba method for AIXI: {err}"));
+                    Box::new(predictor)
+                } else {
+                    let path = config
+                        .mamba_model_path
+                        .as_ref()
+                        .expect("Mamba model path required");
+                    let model_arc = load_mamba_model_from_path(path);
+                    Box::new(MambaPredictor::new(model_arc))
+                }
+            }
+            #[cfg(not(feature = "backend-mamba"))]
+            "mamba" => panic!("Mamba backend disabled at compile time"),
             "zpaq" => {
                 let method = config
                     .zpaq_method
@@ -138,6 +175,12 @@ impl Agent {
             _ => panic!("Unknown algorithm: {}", config.algorithm),
         };
 
+        let rng = if let Some(seed) = config.random_seed {
+            RandomGenerator::from_seed(seed)
+        } else {
+            RandomGenerator::new()
+        };
+
         Self {
             model,
             planner: Some(SearchTree::new()),
@@ -145,7 +188,7 @@ impl Agent {
             age: 0,
             total_reward: 0.0,
             action_bits,
-            rng: RandomGenerator::new(),
+            rng,
             obs_buffer: Vec::with_capacity(128),
             sym_buffer: Vec::with_capacity(64),
         }

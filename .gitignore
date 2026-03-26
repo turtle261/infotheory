@@ -3,3 +3,31 @@
 vmlinux-6.1.58
 /*ict*.md
 ite-bench/.lake/
+
+# Python / uv local environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Coverage outputs
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging / build artifacts
+dist/
+build/
+*.egg-info/
+.maturin/
+
+# Local compiled extension dropped into source package by maturin develop
+python/infotheory_rs/_core*.so
+python/infotheory_rs/_core*.pyd

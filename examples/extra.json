@@ -1,0 +1,23 @@
+{
+  "kind": "neural",
+  "alpha": 0.03,
+  "experts": [
+    {
+      "name": "mamba",
+      "kind": "mamba",
+      "method": "cfg:hidden=64,layers=1,intermediate=128,state=16,conv=4,dt_rank=16,seed=26,train=adam,lr=0.001,stride=1;policy:schedule=0..10%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|10%..100%:infer",
+      "log_prior": 0.0
+    },
+    {
+      "name": "particle",
+      "kind": "particle",
+      "spec_path": "particle_fast.json",
+      "log_prior": 0.0
+    },
+    {
+      "name": "sparse-match",
+      "kind": "sparse-match",
+      "log_prior": 0.0
+    }
+  ]
+}
