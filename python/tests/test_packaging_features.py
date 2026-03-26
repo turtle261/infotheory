@@ -71,6 +71,10 @@ def test_python_release_linux_build_overrides_local_linker_and_uses_py310_abi3_b
     assert "--interpreter python3" in workflow
     assert '.venv/bin/python -m maturin build --release' in workflow
     assert 'export PATH=".venv/bin:$PATH"' in workflow
+    assert 'ln -sf python-zig .venv/bin/zig' in workflow
+    assert 'export ZIG_COMMAND="$(command -v zig)"' in workflow
+    assert 'export AR_x86_64_unknown_linux_gnu="$(command -v llvm-ar)"' in workflow
+    assert 'export RANLIB_x86_64_unknown_linux_gnu="$(command -v llvm-ranlib)"' in workflow
 
 
 def test_python_release_workflow_avoids_uv_run_project_sync():
