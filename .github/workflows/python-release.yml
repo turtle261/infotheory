@@ -28,28 +28,33 @@ jobs:
 
       - uses: astral-sh/setup-uv@v4
 
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld
+
       - name: Validate Linux release cargo env overrides
         if: runner.os == 'Linux'
         env:
-          RUSTFLAGS: -C target-cpu=generic
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc
+          RUSTFLAGS: -C target-cpu=x86-64
         run: >-
           cargo check --release --manifest-path infotheory_py/Cargo.toml
           --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
 
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
-        uses: PyO3/maturin-action@v1
         env:
-          RUSTFLAGS: -C target-cpu=generic
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc
-        with:
-          command: build
-          args: >-
-            --release --interpreter /opt/python/cp310-cp310/bin/python3
-            --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
-            --out target/wheels
-          manylinux: 2014
+          CC: clang
+          CXX: clang++
+          RUSTFLAGS: -C target-cpu=x86-64
+        run: >-
+          uv run --with 'maturin[zig]' maturin build --release
+          --interpreter python3
+          --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
+          --out target/wheels
+          --compatibility manylinux2014
+          --zig
 
       - name: Build wheel (macOS/Windows)
         if: runner.os != 'Linux'

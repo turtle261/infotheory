@@ -38,13 +38,20 @@ def test_python_ci_explicit_feature_builds_include_mamba():
 
 def test_python_release_linux_build_targets_manylinux2014():
     workflow = (_repo_root() / ".github/workflows/python-release.yml").read_text()
-    assert "PyO3/maturin-action@v1" in workflow
-    assert "manylinux: 2014" in workflow
+    assert "--compatibility manylinux2014" in workflow
+    assert "--zig" in workflow
 
 
 def test_python_release_linux_build_overrides_local_linker_and_uses_py310_abi3_base():
     workflow = (_repo_root() / ".github/workflows/python-release.yml").read_text()
     assert "cargo check --release --manifest-path infotheory_py/Cargo.toml" in workflow
-    assert "RUSTFLAGS: -C target-cpu=generic" in workflow
-    assert "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc" in workflow
-    assert "--interpreter /opt/python/cp310-cp310/bin/python3" in workflow
+    assert "RUSTFLAGS: -C target-cpu=x86-64" in workflow
+    assert "CC: clang" in workflow
+    assert "CXX: clang++" in workflow
+    assert "--interpreter python3" in workflow
+
+
+def test_infotheory_py_does_not_enable_pyo3_auto_initialize_for_extension_builds():
+    cargo_toml = (_repo_root() / "infotheory_py/Cargo.toml").read_text()
+    assert 'features = ["abi3-py310"]' in cargo_toml
+    assert "auto-initialize" not in cargo_toml
