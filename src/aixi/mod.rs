@@ -22,5 +22,6 @@ pub mod common;
 pub mod environment;
 pub mod mcts;
 pub mod model;
+pub(crate) mod rate_backend;
 #[cfg(feature = "vm")]
 pub mod vm_nyx;

@@ -484,6 +484,9 @@ pub enum CompressionBackend {
     },
 }
 
+/// Shared maximum nesting depth for recursive mixture specifications.
+pub const MAX_MIXTURE_NESTING: usize = 8;
+
 /// Mixture policy kind for rate-backend mixtures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MixtureKind {
@@ -491,12 +494,63 @@ pub enum MixtureKind {
     Bayes,
     /// Bayesian mixture with exponential weight decay.
     FadingBayes,
-    /// Switching mixture with hazard `alpha`.
+    /// Switching mixture using the paper's fixed-share update.
     Switching,
+    /// Online convex mixture with projected-simplex weight updates.
+    Convex,
     /// MDL-style best-expert selector.
     Mdl,
     /// Bytewise neural logistic mixer (fx2-cmix style adaptation).
     Neural,
+}
+
+/// Adaptive schedule family for switching and convex mixtures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixtureScheduleMode {
+    /// Use the implementation's default exposed parameterization.
+    ///
+    /// - `Switching`: constant switch rate `alpha`
+    /// - `Convex`: step size `alpha / sqrt(t)`
+    Default,
+    /// Use the paper/theorem schedule.
+    ///
+    /// - `Switching`: `alpha_t = 1 / t`
+    /// - `Convex`: `eta_t = epsilon / sqrt(t)` under this implementation's
+    ///   natural-log gradient, matching the paper's bit-loss schedule after
+    ///   accounting for the `1 / ln(2)` factor in the base-2 gradient
+    ///
+    /// This preserves configured expert priors; exact theorem hypotheses for
+    /// switching still additionally require uniform priors.
+    Theorem,
+}
+
+impl Default for MixtureScheduleMode {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+/// Parse a mixture kind name with the shared alias table used across CLI, Python, and WASM.
+pub fn parse_mixture_kind_name(kind: &str) -> Result<MixtureKind, String> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "bayes" | "bayes-mix" | "bayes_mix" => Ok(MixtureKind::Bayes),
+        "fading" | "fading-bayes" | "fading_bayes" => Ok(MixtureKind::FadingBayes),
+        "switch" | "switching" | "switch-mix" | "switch_mix" => Ok(MixtureKind::Switching),
+        "convex" | "convex-mix" | "convex_mix" => Ok(MixtureKind::Convex),
+        "mdl" | "selector" | "mdr" => Ok(MixtureKind::Mdl),
+        "neural" | "neural-mix" | "neural_mix" | "mix" | "mixture" | "fx2" | "fx2-cmix"
+        | "fx2_cmix" => Ok(MixtureKind::Neural),
+        other => Err(format!("unknown mixture kind '{other}'")),
+    }
+}
+
+/// Parse a mixture schedule mode with the shared alias table used across CLI, Python, and WASM.
+pub fn parse_mixture_schedule_name(schedule: &str) -> Result<MixtureScheduleMode, String> {
+    match schedule.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "constant" | "const" => Ok(MixtureScheduleMode::Default),
+        "theorem" | "paper" | "paper-theorem" | "paper_theorem" => Ok(MixtureScheduleMode::Theorem),
+        other => Err(format!("unknown mixture schedule '{other}'")),
+    }
 }
 
 /// Fixed context families for calibrated PDF wrappers.
@@ -547,7 +601,13 @@ pub struct MixtureExpertSpec {
 pub struct MixtureSpec {
     /// Mixture policy.
     pub kind: MixtureKind,
-    /// Switching probability (per step) for switching mixtures.
+    /// Adaptive schedule family for supported mixture kinds.
+    pub schedule: MixtureScheduleMode,
+    /// Shared scalar parameter: switch rate for `Switching`, step-size scale for `Convex`,
+    /// learning rate for `Neural`, and generic alpha for the remaining families.
+    ///
+    /// In theorem mode for `Switching` and `Convex`, this field is retained for API
+    /// compatibility but is not used by the update schedule.
     pub alpha: f64,
     /// Decay factor for fading Bayes mixtures.
     pub decay: Option<f64>,
@@ -560,13 +620,20 @@ impl MixtureSpec {
     pub fn new(kind: MixtureKind, experts: Vec<MixtureExpertSpec>) -> Self {
         Self {
             kind,
+            schedule: MixtureScheduleMode::Default,
             alpha: 0.01,
             decay: None,
             experts,
         }
     }
 
-    /// Set switching hazard / adaptation parameter.
+    /// Set the schedule family.
+    pub fn with_schedule(mut self, schedule: MixtureScheduleMode) -> Self {
+        self.schedule = schedule;
+        self
+    }
+
+    /// Set the family-specific alpha parameter.
     pub fn with_alpha(mut self, alpha: f64) -> Self {
         self.alpha = alpha;
         self
@@ -576,6 +643,11 @@ impl MixtureSpec {
     pub fn with_decay(mut self, decay: f64) -> Self {
         self.decay = Some(decay);
         self
+    }
+
+    /// Validate the mixture configuration before building runtime state.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_mixture_spec_with_depth(self, MAX_MIXTURE_NESTING)
     }
 
     /// Convert to executable expert configs for runtime mixture evaluation.
@@ -592,6 +664,90 @@ impl MixtureSpec {
             })
             .collect()
     }
+}
+
+fn validate_mixture_spec_with_depth(spec: &MixtureSpec, depth: usize) -> Result<(), String> {
+    if depth == 0 {
+        return Err("mixture spec nesting too deep".to_string());
+    }
+    validate_mixture_spec_shallow(spec)?;
+    for (index, expert) in spec.experts.iter().enumerate() {
+        validate_rate_backend_with_depth(&expert.backend, depth - 1).map_err(|err| {
+            if let Some(name) = expert.name.as_deref() {
+                format!("mixture expert '{name}' invalid: {err}")
+            } else {
+                format!("mixture expert #{} invalid: {err}", index + 1)
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_mixture_spec_shallow(spec: &MixtureSpec) -> Result<(), String> {
+    if spec.experts.is_empty() {
+        return Err("mixture spec must include at least one expert".to_string());
+    }
+    if !spec.alpha.is_finite() {
+        return Err("mixture alpha must be finite".to_string());
+    }
+    if spec
+        .experts
+        .iter()
+        .any(|expert| !expert.log_prior.is_finite())
+    {
+        return Err("mixture expert log_prior must be finite".to_string());
+    }
+    if let Some(decay) = spec.decay {
+        if !decay.is_finite() || !(0.0..1.0).contains(&decay) {
+            return Err("mixture decay must be in (0, 1)".to_string());
+        }
+    }
+    if matches!(spec.kind, MixtureKind::FadingBayes) && spec.decay.is_none() {
+        return Err("fading Bayes mixture requires decay".to_string());
+    }
+    if spec.schedule != MixtureScheduleMode::Default
+        && !matches!(spec.kind, MixtureKind::Switching | MixtureKind::Convex)
+    {
+        return Err(
+            "mixture schedule is only supported for switching and convex mixtures".to_string(),
+        );
+    }
+    match (spec.kind, spec.schedule) {
+        (MixtureKind::Switching, MixtureScheduleMode::Default) => {
+            if !(0.0..=1.0).contains(&spec.alpha) {
+                return Err("switching mixture alpha must be in [0, 1]".to_string());
+            }
+        }
+        (MixtureKind::Convex, MixtureScheduleMode::Default)
+        | (MixtureKind::Neural, MixtureScheduleMode::Default) => {
+            if spec.alpha <= 0.0 {
+                return Err("mixture alpha must be > 0".to_string());
+            }
+        }
+        (MixtureKind::Neural, MixtureScheduleMode::Theorem) => unreachable!(),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_rate_backend_with_depth(backend: &RateBackend, depth: usize) -> Result<(), String> {
+    match backend {
+        RateBackend::Mixture { spec } => validate_mixture_spec_with_depth(spec.as_ref(), depth),
+        RateBackend::Particle { spec } => spec.validate(),
+        RateBackend::Calibrated { spec } => {
+            if depth == 0 {
+                return Err("calibrated spec nesting too deep".to_string());
+            }
+            validate_rate_backend_with_depth(&spec.base, depth - 1)
+                .map_err(|err| format!("calibrated base invalid: {err}"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Validate a rate backend, including nested mixture/calibrated subgraphs.
+pub fn validate_rate_backend(backend: &RateBackend) -> Result<(), String> {
+    validate_rate_backend_with_depth(backend, MAX_MIXTURE_NESTING)
 }
 
 /// Configuration for a particle-latent filter ensemble rate backend.
@@ -774,6 +930,7 @@ impl RateBackendSession {
     ) -> Result<Self, String> {
         use crate::mixture::OnlineBytePredictor;
 
+        validate_rate_backend(&backend)?;
         let mut predictor = crate::mixture::RateBackendPredictor::from_backend(
             backend,
             max_order,
@@ -1956,7 +2113,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
 pub fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
     match backend {
         RateBackend::Zpaq { .. } => {
-            panic!("biased/plugin entropy is not supported for zpaq rate backends in 1.1.0")
+            panic!("biased/plugin entropy is not supported for zpaq rate backends in 1.1.1")
         }
         _ => frozen_plugin_rate_backend(data, &[data], max_order, backend),
     }

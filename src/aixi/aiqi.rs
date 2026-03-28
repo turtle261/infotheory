@@ -8,10 +8,10 @@
 
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor, Predictor, RateBackendBitPredictor};
+use crate::aixi::rate_backend::rate_backend_contains_zpaq;
 #[cfg(feature = "backend-rwkv")]
 use crate::load_rwkv7_model_from_path;
-use crate::{CalibratedSpec, MixtureSpec, RateBackend};
-use std::sync::Arc;
+use crate::{RateBackend, validate_rate_backend};
 
 /// Configuration parameters for an AIQI agent.
 #[derive(Clone)]
@@ -44,6 +44,9 @@ pub struct AiqiConfig {
     /// Return horizon `H`.
     pub return_horizon: usize,
     /// Number of discretization bins `M` for returns.
+    ///
+    /// This implementation uses exact fixed-width binary encoding of return bins,
+    /// so `return_bins` must be a power of two.
     pub return_bins: usize,
     /// Augmentation period `N` (must satisfy `N >= H`).
     pub augmentation_period: usize,
@@ -89,6 +92,12 @@ impl AiqiConfig {
         }
         if self.return_bins == 0 {
             return Err("return_bins must be >= 1".to_string());
+        }
+        if !self.return_bins.is_power_of_two() {
+            return Err(format!(
+                "return_bins must be a power of two for exact binary return encoding, got {}",
+                self.return_bins
+            ));
         }
         if self.augmentation_period < self.return_horizon {
             return Err(format!(
@@ -137,6 +146,8 @@ impl AiqiConfig {
         }
 
         if let Some(rate_backend) = &self.rate_backend {
+            validate_rate_backend(rate_backend)
+                .map_err(|err| format!("invalid rate_backend: {err}"))?;
             if !rate_backend_supports_aiqi_frozen_conditioning(rate_backend) {
                 return Err(
                     "AIQI strict mode requires frozen context updates; configured rate_backend contains zpaq which does not provide strict frozen conditioning"
@@ -457,7 +468,7 @@ impl AiqiAgent {
         let end = step.saturating_sub(1);
         if start <= end {
             for idx in start..=end {
-                push_step_tokens_history(
+                push_augmented_step_tokens_commit(
                     &self.config,
                     self.history_base_step,
                     &self.steps,
@@ -467,14 +478,15 @@ impl AiqiAgent {
                     context_predictor.as_mut(),
                     phase,
                     idx,
-                );
+                )
+                .expect("generic planner retained history must contain required augmented return");
             }
         }
 
         let mut q_values = vec![0.0; self.config.agent_actions];
         for action in 0..self.config.agent_actions {
             let mut action_predictor = context_predictor.boxed_clone();
-            let _ = push_encoded_bits_history(
+            let _ = push_encoded_bits_commit_history(
                 action_predictor.as_mut(),
                 action as u64,
                 self.action_bits,
@@ -496,6 +508,7 @@ impl AiqiAgent {
         predictor: &mut dyn Predictor,
         use_training_updates: bool,
     ) -> Vec<f64> {
+        debug_assert!(return_bins.is_power_of_two());
         if return_bins == 1 {
             return vec![1.0];
         }
@@ -541,6 +554,7 @@ impl AiqiAgent {
         return_bits: usize,
         base_predictor: &dyn Predictor,
     ) -> Vec<f64> {
+        debug_assert!(return_bins.is_power_of_two());
         if return_bins == 1 {
             return vec![1.0];
         }
@@ -555,7 +569,7 @@ impl AiqiAgent {
                 v >>= 1;
                 let q = predictor.predict_prob(bit).clamp(1e-12, 1.0 - 1e-12);
                 p *= q;
-                predictor.update_history(bit);
+                predictor.commit_update(bit);
             }
             *slot = p;
         }
@@ -591,32 +605,17 @@ impl AiqiAgent {
 
         let start = (model.last_augmented_step + 1).max(history_base_step);
         for idx in start..=target_step {
-            push_action_tokens_history(
-                history_base_step,
-                steps,
-                action_bits,
-                model.predictor.as_mut(),
-                idx,
-            );
-
-            if idx % config.augmentation_period == phase {
-                let local_idx = idx - history_base_step;
-                let bin = return_bins_by_step[local_idx].ok_or_else(|| {
-                    format!(
-                        "missing return bin for step {} in phase {} while advancing model",
-                        idx, phase
-                    )
-                })?;
-                push_encoded_bits_train(model.predictor.as_mut(), bin, return_bits);
-            }
-
-            push_percept_tokens_history(
+            push_augmented_step_tokens_commit(
                 config,
                 history_base_step,
                 steps,
+                return_bins_by_step,
+                action_bits,
+                return_bits,
                 model.predictor.as_mut(),
+                phase,
                 idx,
-            );
+            )?;
         }
 
         model.last_augmented_step = target_step;
@@ -737,6 +736,36 @@ fn push_step_tokens_history(
     pushed + push_percept_tokens_history(config, history_base_step, steps, predictor, idx)
 }
 
+fn push_augmented_step_tokens_commit(
+    config: &AiqiConfig,
+    history_base_step: usize,
+    steps: &[StepRecord],
+    return_bins_by_step: &[Option<u64>],
+    action_bits: usize,
+    return_bits: usize,
+    predictor: &mut dyn Predictor,
+    phase: usize,
+    idx: usize,
+) -> Result<usize, String> {
+    let mut pushed = 0usize;
+    pushed +=
+        push_action_tokens_commit_history(history_base_step, steps, action_bits, predictor, idx);
+
+    if idx % config.augmentation_period == phase {
+        let local_idx = idx - history_base_step;
+        let bin = return_bins_by_step[local_idx].ok_or_else(|| {
+            format!(
+                "missing return bin for step {} in phase {} while pushing augmented history",
+                idx, phase
+            )
+        })?;
+        pushed += push_encoded_bits_commit(predictor, bin, return_bits);
+    }
+
+    Ok(pushed
+        + push_percept_tokens_commit_history(config, history_base_step, steps, predictor, idx))
+}
+
 fn push_action_tokens_history(
     history_base_step: usize,
     steps: &[StepRecord],
@@ -746,6 +775,17 @@ fn push_action_tokens_history(
 ) -> usize {
     let action = steps[idx - history_base_step].action;
     push_encoded_bits_history(predictor, action, action_bits)
+}
+
+fn push_action_tokens_commit_history(
+    history_base_step: usize,
+    steps: &[StepRecord],
+    action_bits: usize,
+    predictor: &mut dyn Predictor,
+    idx: usize,
+) -> usize {
+    let action = steps[idx - history_base_step].action;
+    push_encoded_bits_commit_history(predictor, action, action_bits)
 }
 
 fn push_percept_tokens_history(
@@ -762,6 +802,27 @@ fn push_percept_tokens_history(
     }
     pushed
         + push_encoded_reward_history(
+            predictor,
+            step.reward,
+            config.reward_bits,
+            config.reward_offset,
+        )
+}
+
+fn push_percept_tokens_commit_history(
+    config: &AiqiConfig,
+    history_base_step: usize,
+    steps: &[StepRecord],
+    predictor: &mut dyn Predictor,
+    idx: usize,
+) -> usize {
+    let step = &steps[idx - history_base_step];
+    let mut pushed = 0usize;
+    for &obs in &step.observations {
+        pushed += push_encoded_bits_commit_history(predictor, obs, config.observation_bits);
+    }
+    pushed
+        + push_encoded_reward_commit_history(
             predictor,
             step.reward,
             config.reward_bits,
@@ -813,62 +874,11 @@ fn build_predictor(config: &AiqiConfig, return_bits: usize) -> Result<Box<dyn Pr
 }
 
 fn adapt_rate_backend_for_bit_tokens(backend: RateBackend) -> RateBackend {
-    match backend {
-        RateBackend::Ctw { depth } => RateBackend::FacCtw {
-            base_depth: depth,
-            num_percept_bits: 1,
-            encoding_bits: 1,
-        },
-        RateBackend::FacCtw { base_depth, .. } => RateBackend::FacCtw {
-            base_depth,
-            num_percept_bits: 1,
-            encoding_bits: 1,
-        },
-        RateBackend::Mixture { spec } => {
-            let experts = spec
-                .experts
-                .iter()
-                .map(|expert| crate::MixtureExpertSpec {
-                    name: expert.name.clone(),
-                    log_prior: expert.log_prior,
-                    max_order: expert.max_order,
-                    backend: adapt_rate_backend_for_bit_tokens(expert.backend.clone()),
-                })
-                .collect();
-
-            let mut adapted = MixtureSpec::new(spec.kind, experts).with_alpha(spec.alpha);
-            if let Some(decay) = spec.decay {
-                adapted = adapted.with_decay(decay);
-            }
-            RateBackend::Mixture {
-                spec: Arc::new(adapted),
-            }
-        }
-        RateBackend::Calibrated { spec } => RateBackend::Calibrated {
-            spec: Arc::new(CalibratedSpec {
-                base: adapt_rate_backend_for_bit_tokens(spec.base.clone()),
-                context: spec.context,
-                bins: spec.bins,
-                learning_rate: spec.learning_rate,
-                bias_clip: spec.bias_clip,
-            }),
-        },
-        other => other,
-    }
+    crate::aixi::rate_backend::adapt_rate_backend_for_bit_tokens(backend)
 }
 
 fn rate_backend_supports_aiqi_frozen_conditioning(backend: &RateBackend) -> bool {
-    match backend {
-        RateBackend::Zpaq { .. } => false,
-        RateBackend::Mixture { spec } => spec
-            .experts
-            .iter()
-            .all(|expert| rate_backend_supports_aiqi_frozen_conditioning(&expert.backend)),
-        RateBackend::Calibrated { spec } => {
-            rate_backend_supports_aiqi_frozen_conditioning(&spec.base)
-        }
-        _ => true,
-    }
+    !rate_backend_contains_zpaq(backend)
 }
 
 fn aiqi_requires_generic_planner(config: &AiqiConfig) -> bool {
@@ -898,10 +908,10 @@ fn max_value_for_bits(bits: usize) -> u64 {
     }
 }
 
-fn push_encoded_bits_train(predictor: &mut dyn Predictor, value: u64, bits: usize) -> usize {
+fn push_encoded_bits_commit(predictor: &mut dyn Predictor, value: u64, bits: usize) -> usize {
     let mut v = value;
     for _ in 0..bits {
-        predictor.update((v & 1) == 1);
+        predictor.commit_update((v & 1) == 1);
         v >>= 1;
     }
     bits
@@ -911,6 +921,19 @@ fn push_encoded_bits_history(predictor: &mut dyn Predictor, value: u64, bits: us
     let mut v = value;
     for _ in 0..bits {
         predictor.update_history((v & 1) == 1);
+        v >>= 1;
+    }
+    bits
+}
+
+fn push_encoded_bits_commit_history(
+    predictor: &mut dyn Predictor,
+    value: u64,
+    bits: usize,
+) -> usize {
+    let mut v = value;
+    for _ in 0..bits {
+        predictor.commit_update_history((v & 1) == 1);
         v >>= 1;
     }
     bits
@@ -931,6 +954,23 @@ fn push_encoded_reward_history(
         shifted as u64
     };
     push_encoded_bits_history(predictor, as_u64, bits)
+}
+
+fn push_encoded_reward_commit_history(
+    predictor: &mut dyn Predictor,
+    reward: Reward,
+    bits: usize,
+    offset: Reward,
+) -> usize {
+    let shifted = (reward as i128) + (offset as i128);
+    let as_u64 = if shifted <= 0 {
+        0
+    } else if shifted > (u64::MAX as i128) {
+        u64::MAX
+    } else {
+        shifted as u64
+    };
+    push_encoded_bits_commit_history(predictor, as_u64, bits)
 }
 
 fn pop_history_bits(predictor: &mut dyn Predictor, bits: usize) {
@@ -972,6 +1012,7 @@ fn argmax_with_fixed_tie_break(values: &[f64]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn basic_config() -> AiqiConfig {
         AiqiConfig {
@@ -1002,7 +1043,9 @@ mod tests {
     #[derive(Clone, Default)]
     struct CountingPredictor {
         update_calls: usize,
+        commit_update_calls: usize,
         update_history_calls: usize,
+        commit_update_history_calls: usize,
         revert_calls: usize,
         pop_history_calls: usize,
     }
@@ -1012,8 +1055,16 @@ mod tests {
             self.update_calls += 1;
         }
 
+        fn commit_update(&mut self, _sym: bool) {
+            self.commit_update_calls += 1;
+        }
+
         fn update_history(&mut self, _sym: bool) {
             self.update_history_calls += 1;
+        }
+
+        fn commit_update_history(&mut self, _sym: bool) {
+            self.commit_update_history_calls += 1;
         }
 
         fn revert(&mut self) {
@@ -1037,6 +1088,99 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct SharedCallCounts {
+        update: usize,
+        commit_update: usize,
+        update_history: usize,
+        commit_update_history: usize,
+    }
+
+    #[derive(Clone)]
+    struct SharedCountingPredictor {
+        counts: Arc<Mutex<SharedCallCounts>>,
+    }
+
+    impl SharedCountingPredictor {
+        fn new(counts: Arc<Mutex<SharedCallCounts>>) -> Self {
+            Self { counts }
+        }
+    }
+
+    impl Predictor for SharedCountingPredictor {
+        fn update(&mut self, _sym: bool) {
+            self.counts.lock().unwrap().update += 1;
+        }
+
+        fn commit_update(&mut self, _sym: bool) {
+            self.counts.lock().unwrap().commit_update += 1;
+        }
+
+        fn update_history(&mut self, _sym: bool) {
+            self.counts.lock().unwrap().update_history += 1;
+        }
+
+        fn commit_update_history(&mut self, _sym: bool) {
+            self.counts.lock().unwrap().commit_update_history += 1;
+        }
+
+        fn revert(&mut self) {}
+
+        fn pop_history(&mut self) {}
+
+        fn predict_prob(&mut self, sym: bool) -> f64 {
+            if sym { 0.75 } else { 0.25 }
+        }
+
+        fn model_name(&self) -> String {
+            "SharedCountingPredictor".to_string()
+        }
+
+        fn boxed_clone(&self) -> Box<dyn Predictor> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ReturnLearningPredictor {
+        saw_training_one: bool,
+    }
+
+    impl Predictor for ReturnLearningPredictor {
+        fn update(&mut self, sym: bool) {
+            if sym {
+                self.saw_training_one = true;
+            }
+        }
+
+        fn commit_update(&mut self, sym: bool) {
+            if sym {
+                self.saw_training_one = true;
+            }
+        }
+
+        fn update_history(&mut self, _sym: bool) {}
+
+        fn commit_update_history(&mut self, _sym: bool) {}
+
+        fn revert(&mut self) {}
+
+        fn pop_history(&mut self) {}
+
+        fn predict_prob(&mut self, sym: bool) -> f64 {
+            let p1 = if self.saw_training_one { 0.75 } else { 0.25 };
+            if sym { p1 } else { 1.0 - p1 }
+        }
+
+        fn model_name(&self) -> String {
+            "ReturnLearningPredictor".to_string()
+        }
+
+        fn boxed_clone(&self) -> Box<dyn Predictor> {
+            Box::new(self.clone())
+        }
+    }
+
     #[test]
     fn config_rejects_invalid_period() {
         let mut cfg = basic_config();
@@ -1046,6 +1190,16 @@ mod tests {
             .validate()
             .expect_err("N < H must be rejected for paper-correct augmentation");
         assert!(err.contains("augmentation_period"));
+    }
+
+    #[test]
+    fn config_rejects_non_power_of_two_return_bins() {
+        let mut cfg = basic_config();
+        cfg.return_bins = 3;
+        let err = cfg
+            .validate()
+            .expect_err("non-power-of-two return_bins should be rejected");
+        assert!(err.contains("power of two"));
     }
 
     #[test]
@@ -1165,6 +1319,25 @@ mod tests {
     }
 
     #[test]
+    fn generic_distribution_rollout_trains_on_return_symbols() {
+        let predictor = ReturnLearningPredictor::default();
+        let probs = AiqiAgent::predict_return_distribution_from_base_predictor(4, 2, &predictor);
+
+        assert_eq!(probs.len(), 4);
+        assert!((probs.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!(
+            probs[3] > probs[1],
+            "training on the first return bit should make bin 11 likelier than 01; got {:?}",
+            probs
+        );
+        assert!(
+            (probs[0] - 0.5625).abs() < 1e-12,
+            "expected exact normalized mass for 00, got {:?}",
+            probs
+        );
+    }
+
+    #[test]
     fn ac_ctw_rollout_uses_training_updates() {
         let mut cfg = basic_config();
         cfg.algorithm = "ac-ctw".to_string();
@@ -1227,5 +1400,78 @@ mod tests {
 
         let action = agent.get_planned_action();
         assert!(action <= 1);
+    }
+
+    #[test]
+    fn committed_phase_advancement_uses_commit_predictor_paths() {
+        let mut agent = AiqiAgent::new(basic_config()).expect("valid aiqi config");
+        let counts = Arc::new(Mutex::new(SharedCallCounts::default()));
+        agent.phases[1].predictor = Box::new(SharedCountingPredictor::new(counts.clone()));
+        agent.phases[1].last_augmented_step = 0;
+        agent.history_base_step = 1;
+        agent.total_steps_observed = 1;
+        agent.steps = vec![StepRecord {
+            action: 1,
+            observations: vec![1],
+            reward: 1,
+        }];
+        agent.return_bins_by_step = vec![Some(3)];
+
+        agent
+            .advance_phase_model_to_step(1, 1)
+            .expect("phase advancement should succeed");
+
+        let snapshot = counts.lock().unwrap().clone();
+        assert_eq!(snapshot.commit_update, 3);
+        assert_eq!(snapshot.commit_update_history, 3);
+        assert_eq!(snapshot.update, 0);
+        assert_eq!(snapshot.update_history, 0);
+    }
+
+    #[test]
+    fn generic_planner_trains_on_returns_and_freezes_conditioning_tokens() {
+        let mut cfg = basic_config();
+        cfg.rate_backend = Some(RateBackend::Match {
+            hash_bits: 16,
+            min_len: 2,
+            max_len: 16,
+            base_mix: 0.05,
+            confidence_scale: 1.0,
+        });
+
+        let mut agent = AiqiAgent::new(cfg).expect("valid aiqi config");
+        let counts = Arc::new(Mutex::new(SharedCallCounts::default()));
+        agent.phases[1].predictor = Box::new(SharedCountingPredictor::new(counts.clone()));
+        agent.phases[1].last_augmented_step = 0;
+        agent.history_base_step = 1;
+        agent.total_steps_observed = 2;
+        agent.steps = vec![
+            StepRecord {
+                action: 1,
+                observations: vec![1],
+                reward: 1,
+            },
+            StepRecord {
+                action: 0,
+                observations: vec![0],
+                reward: 0,
+            },
+        ];
+        agent.return_bins_by_step = vec![Some(3), None];
+
+        let q_values = agent.estimate_q_values_generic();
+
+        assert_eq!(q_values.len(), agent.config.agent_actions);
+        let snapshot = counts.lock().unwrap().clone();
+        assert_eq!(snapshot.update, 0);
+        assert_eq!(snapshot.update_history, 0);
+        assert!(
+            snapshot.commit_update > 0,
+            "generic planner should train on augmented return symbols"
+        );
+        assert!(
+            snapshot.commit_update_history > 0,
+            "generic planner should keep action/percept conditioning frozen"
+        );
     }
 }

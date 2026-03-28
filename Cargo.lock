@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "infotheory"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "infotheory_py"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "infotheory",

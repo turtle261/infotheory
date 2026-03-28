@@ -19,13 +19,16 @@ use crate::coders::{
 use crate::ctw::FacContextTree;
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip;
-use crate::mixture::DEFAULT_MIN_PROB;
+use crate::mixture::{
+    DEFAULT_MIN_PROB, convex_step_size_for_update, project_simplex_with_scratch,
+    switching_alpha_for_update,
+};
 use crate::neural_mix::NeuralMixCore;
 use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
 use crate::zpaq_rate::ZpaqRateModel;
-use crate::{CalibratedSpec, MixtureKind, MixtureSpec, RateBackend};
+use crate::{CalibratedSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend};
 
 const FRAMED_MAGIC: u32 = 0x4354_4946; // "FITC"
 const FRAMED_VERSION: u8 = 1;
@@ -578,9 +581,11 @@ struct MixExpert {
 #[derive(Clone)]
 struct MixturePredictor {
     kind: MixtureKind,
+    schedule: MixtureScheduleMode,
     alpha: f64,
     decay: f64,
     experts: Vec<MixExpert>,
+    prior_weights: Vec<f64>,
     neural: NeuralMixCore,
     analyzer: TextContextAnalyzer,
     neural_logps: Vec<f64>,
@@ -590,15 +595,16 @@ struct MixturePredictor {
     neural_pdf_cdf_rows: Vec<Vec<f64>>,
     scratch: Vec<f64>,
     scratch2: Vec<f64>,
+    projection_scratch: Vec<f64>,
     pdf: Vec<f64>,
     valid: bool,
+    switch_updates: u64,
+    convex_updates: u64,
 }
 
 impl MixturePredictor {
     fn new(spec: &MixtureSpec) -> Result<Self> {
-        if spec.experts.is_empty() {
-            bail!("mixture spec must include at least one expert");
-        }
+        spec.validate().map_err(anyhow::Error::msg)?;
         let mut experts = Vec::with_capacity(spec.experts.len());
         for e in &spec.experts {
             experts.push(MixExpert {
@@ -617,9 +623,10 @@ impl MixturePredictor {
         }
 
         let mut prior_weights = vec![0.0; experts.len()];
-        for (i, e) in experts.iter().enumerate() {
-            let p = (e.log_weight).exp().clamp(PDF_MIN, 1.0 - PDF_MIN);
-            prior_weights[i] = p;
+        normalized_mix_expert_prior_weights(&experts, &mut prior_weights);
+        let mut neural_prior_weights = prior_weights.clone();
+        for weight in &mut neural_prior_weights {
+            *weight = weight.clamp(PDF_MIN, 1.0 - PDF_MIN);
         }
 
         let base_lr = spec.alpha.abs().clamp(1e-6, 1.0);
@@ -627,7 +634,7 @@ impl MixturePredictor {
         let analyzer = TextContextAnalyzer::new();
         let mut neural = NeuralMixCore::new(
             experts.len(),
-            &prior_weights,
+            &neural_prior_weights,
             effective_lr * 0.5,
             effective_lr,
             1e-5,
@@ -635,9 +642,11 @@ impl MixturePredictor {
         neural.set_context_state(analyzer.state());
         Ok(Self {
             kind: spec.kind,
-            alpha: spec.alpha.clamp(1e-12, 1.0 - 1e-12),
+            schedule: spec.schedule,
+            alpha: spec.alpha,
             decay: spec.decay.unwrap_or(1.0).clamp(0.0, 1.0),
             experts,
+            prior_weights,
             neural,
             analyzer,
             neural_logps: vec![0.0; spec.experts.len()],
@@ -647,8 +656,11 @@ impl MixturePredictor {
             neural_pdf_cdf_rows: vec![vec![0.0; 257]; spec.experts.len()],
             scratch: Vec::new(),
             scratch2: Vec::new(),
+            projection_scratch: Vec::new(),
             pdf: vec![0.0; 256],
             valid: false,
+            switch_updates: 0,
+            convex_updates: 0,
         })
     }
 
@@ -765,17 +777,53 @@ impl MixturePredictor {
                     self.scratch[i] = lp;
                     self.scratch2[i] = e.log_weight + lp;
                 }
-                let log_alpha = self.alpha.ln();
-                let log_1m_alpha = (1.0 - self.alpha).ln();
-                for (i, e) in self.experts.iter_mut().enumerate() {
-                    let switched = logsumexp2(log_1m_alpha + e.log_weight, log_alpha + e.log_prior);
-                    self.scratch2[i] = switched + self.scratch[i];
-                }
                 let log_mix = logsumexp_slice(&self.scratch2[..n]);
                 for (i, e) in self.experts.iter_mut().enumerate() {
-                    e.log_weight = self.scratch2[i] - log_mix;
+                    self.scratch2[i] = (self.scratch2[i] - log_mix).exp();
                     e.cum_log_loss -= self.scratch[i];
                     e.predictor.update(symbol)?;
+                }
+                let alpha =
+                    switching_alpha_for_update(self.schedule, self.alpha, self.switch_updates);
+                self.switch_updates = self.switch_updates.saturating_add(1);
+                apply_switching_weights(
+                    &mut self.experts,
+                    &self.prior_weights[..n],
+                    alpha,
+                    &mut self.scratch2[..n],
+                    &mut self.scratch[..n],
+                );
+            }
+            MixtureKind::Convex => {
+                let n = self.experts.len();
+                self.scratch.resize(n, 0.0);
+                self.scratch2.resize(n, 0.0);
+                for (i, e) in self.experts.iter_mut().enumerate() {
+                    let p = e.predictor.pdf_next()?[symbol as usize].max(PDF_MIN);
+                    let lp = p.ln();
+                    self.scratch[i] = lp;
+                    self.scratch2[i] = e.log_weight.exp();
+                    e.cum_log_loss -= lp;
+                    e.predictor.update(symbol)?;
+                }
+                let mix_prob = self
+                    .scratch
+                    .iter()
+                    .zip(self.scratch2.iter())
+                    .map(|(&lp, &w)| w * lp.exp())
+                    .sum::<f64>()
+                    .max(PDF_MIN);
+                let log_mix = mix_prob.ln();
+                self.convex_updates = self.convex_updates.saturating_add(1);
+                let eta =
+                    convex_step_size_for_update(self.schedule, self.alpha, self.convex_updates);
+                for i in 0..n {
+                    let grad = -(self.scratch[i] - log_mix).exp();
+                    self.scratch2[i] -= eta * grad;
+                }
+                project_simplex_with_scratch(&mut self.scratch2[..n], &mut self.projection_scratch);
+                for i in 0..n {
+                    self.experts[i].log_weight = self.scratch2[i].max(PDF_MIN).ln();
                 }
             }
             MixtureKind::Mdl => {
@@ -1006,19 +1054,48 @@ impl MixturePredictor {
                 }
             }
             MixtureKind::Switching => {
-                let log_alpha = self.alpha.ln();
-                let log_1m_alpha = (1.0 - self.alpha).ln();
                 for i in 0..n {
-                    let expert = &self.experts[i];
-                    let switched = logsumexp2(
-                        log_1m_alpha + expert.log_weight,
-                        log_alpha + expert.log_prior,
-                    );
-                    self.scratch[i] = switched + self.neural_logps[i];
+                    self.scratch[i] = self.experts[i].log_weight + self.neural_logps[i];
                 }
                 let log_mix = logsumexp_slice(&self.scratch[..n]);
+                for weight in &mut self.scratch[..n] {
+                    *weight = (*weight - log_mix).exp();
+                }
+                let alpha =
+                    switching_alpha_for_update(self.schedule, self.alpha, self.switch_updates);
+                self.switch_updates = self.switch_updates.saturating_add(1);
+                apply_switching_weights(
+                    &mut self.experts,
+                    &self.prior_weights[..n],
+                    alpha,
+                    &mut self.scratch[..n],
+                    &mut self.scratch2[..n],
+                );
+            }
+            MixtureKind::Convex => {
+                self.scratch.resize(n, 0.0);
+                self.scratch2.resize(n, 0.0);
                 for i in 0..n {
-                    self.experts[i].log_weight = self.scratch[i] - log_mix;
+                    self.scratch2[i] = self.experts[i].log_weight.exp();
+                }
+                let mix_prob = self
+                    .neural_logps
+                    .iter()
+                    .zip(self.scratch2.iter())
+                    .map(|(&lp, &w)| w * lp.exp())
+                    .sum::<f64>()
+                    .max(PDF_MIN);
+                let log_mix = mix_prob.ln();
+                self.convex_updates = self.convex_updates.saturating_add(1);
+                let eta =
+                    convex_step_size_for_update(self.schedule, self.alpha, self.convex_updates);
+                for i in 0..n {
+                    let grad = -(self.neural_logps[i] - log_mix).exp();
+                    self.scratch2[i] -= eta * grad;
+                }
+                project_simplex_with_scratch(&mut self.scratch2[..n], &mut self.projection_scratch);
+                for i in 0..n {
+                    self.experts[i].log_weight = self.scratch2[i].max(PDF_MIN).ln();
                 }
             }
             MixtureKind::Mdl => {}
@@ -1740,12 +1817,104 @@ fn logsumexp_expert_weights(experts: &[MixExpert]) -> f64 {
     m + s.ln()
 }
 
-fn logsumexp2(a: f64, b: f64) -> f64 {
-    let m = if a > b { a } else { b };
-    if !m.is_finite() {
-        return m;
+fn normalize_simplex_weights(weights: &mut [f64]) {
+    if weights.is_empty() {
+        return;
     }
-    m + ((a - m).exp() + (b - m).exp()).ln()
+    let mut sum = 0.0;
+    for weight in weights.iter_mut() {
+        if !weight.is_finite() || *weight < 0.0 {
+            *weight = 0.0;
+        }
+        sum += *weight;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        let uniform = 1.0 / (weights.len() as f64);
+        weights.fill(uniform);
+        return;
+    }
+    for weight in weights.iter_mut() {
+        *weight /= sum;
+    }
+}
+
+fn normalized_mix_expert_prior_weights(experts: &[MixExpert], out: &mut [f64]) {
+    debug_assert_eq!(experts.len(), out.len());
+    let max_log = experts
+        .iter()
+        .map(|expert| expert.log_prior)
+        .fold(f64::NEG_INFINITY, f64::max);
+    for (slot, expert) in out.iter_mut().zip(experts.iter()) {
+        *slot = if max_log.is_finite() {
+            (expert.log_prior - max_log).exp()
+        } else {
+            0.0
+        };
+    }
+    normalize_simplex_weights(out);
+}
+
+fn set_mix_expert_log_weights_from_linear(experts: &mut [MixExpert], weights: &[f64]) {
+    for (expert, &weight) in experts.iter_mut().zip(weights.iter()) {
+        expert.log_weight = if weight > 0.0 {
+            weight.ln()
+        } else {
+            f64::NEG_INFINITY
+        };
+    }
+}
+
+fn apply_switching_weights(
+    experts: &mut [MixExpert],
+    prior_weights: &[f64],
+    alpha: f64,
+    posterior: &mut [f64],
+    scratch: &mut [f64],
+) {
+    if experts.is_empty() {
+        return;
+    }
+    debug_assert_eq!(experts.len(), prior_weights.len());
+
+    normalize_simplex_weights(posterior);
+    if experts.len() == 1 || alpha <= 0.0 {
+        set_mix_expert_log_weights_from_linear(experts, posterior);
+        return;
+    }
+
+    let num_switch_targets = prior_weights.iter().filter(|&&prior| prior < 1.0).count();
+    if num_switch_targets <= 1 {
+        set_mix_expert_log_weights_from_linear(experts, posterior);
+        return;
+    }
+
+    let mut switch_out_sum = 0.0;
+    for i in 0..experts.len() {
+        let denom = 1.0 - prior_weights[i];
+        if denom > 0.0 {
+            switch_out_sum += posterior[i] / denom;
+        }
+    }
+
+    for i in 0..experts.len() {
+        let prior = prior_weights[i];
+        let stay = (1.0 - alpha) * posterior[i];
+        let switch_in = if prior > 0.0 {
+            let denom = 1.0 - prior;
+            let switchable_mass = if denom > 0.0 {
+                switch_out_sum - posterior[i] / denom
+            } else {
+                0.0
+            };
+            alpha * prior * switchable_mass
+        } else {
+            0.0
+        };
+        scratch[i] = stay + switch_in;
+    }
+
+    normalize_simplex_weights(scratch);
+    set_mix_expert_log_weights_from_linear(experts, scratch);
 }
 
 #[allow(dead_code)]
@@ -2195,31 +2364,7 @@ mod tests {
         assert_eq!(dec, data);
     }
 
-    #[test]
-    fn neural_runtime_and_compression_predictor_align() {
-        let spec = MixtureSpec::new(
-            MixtureKind::Neural,
-            vec![
-                crate::MixtureExpertSpec {
-                    name: Some("ctw".to_string()),
-                    log_prior: 0.0,
-                    max_order: -1,
-                    backend: RateBackend::Ctw { depth: 7 },
-                },
-                crate::MixtureExpertSpec {
-                    name: Some("fac".to_string()),
-                    log_prior: 0.0,
-                    max_order: -1,
-                    backend: RateBackend::FacCtw {
-                        base_depth: 7,
-                        num_percept_bits: 8,
-                        encoding_bits: 8,
-                    },
-                },
-            ],
-        )
-        .with_alpha(0.03);
-
+    fn assert_runtime_and_compression_predictor_align(spec: MixtureSpec, data: &[u8], tol: f64) {
         let backend = RateBackend::Mixture {
             spec: Arc::new(spec.clone()),
         };
@@ -2227,18 +2372,102 @@ mod tests {
         let experts = spec.build_experts();
         let mut runtime = crate::mixture::build_mixture_runtime(&spec, &experts).unwrap();
 
-        let data = b"neural alignment check sequence";
-        for &b in data {
+        for &symbol in data {
             let pdf = predictor.pdf_next().unwrap();
-            let p_comp = pdf[b as usize];
-            let p_runtime = runtime.peek_log_prob(b).exp();
+            let p_comp = pdf[symbol as usize];
+            let p_runtime = runtime.peek_log_prob(symbol).exp();
             assert!(
-                (p_comp - p_runtime).abs() < 1e-8,
-                "p_comp={p_comp} p_runtime={p_runtime} symbol={b}"
+                (p_comp - p_runtime).abs() < tol,
+                "p_comp={p_comp} p_runtime={p_runtime} symbol={symbol}"
             );
-            predictor.update(b).unwrap();
-            runtime.step(b);
+            predictor.update(symbol).unwrap();
+            runtime.step(symbol);
         }
+    }
+
+    fn alignment_experts() -> Vec<crate::MixtureExpertSpec> {
+        vec![
+            crate::MixtureExpertSpec {
+                name: Some("ctw".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Ctw { depth: 7 },
+            },
+            crate::MixtureExpertSpec {
+                name: Some("fac".to_string()),
+                log_prior: -0.7,
+                max_order: -1,
+                backend: RateBackend::FacCtw {
+                    base_depth: 7,
+                    num_percept_bits: 8,
+                    encoding_bits: 8,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn bayes_runtime_and_compression_predictor_align() {
+        let spec = MixtureSpec::new(MixtureKind::Bayes, alignment_experts());
+        assert_runtime_and_compression_predictor_align(
+            spec,
+            b"bayes predictor alignment check sequence",
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn switching_runtime_and_compression_predictor_align() {
+        let spec = MixtureSpec::new(MixtureKind::Switching, alignment_experts()).with_alpha(0.17);
+        assert_runtime_and_compression_predictor_align(
+            spec,
+            b"switching predictor alignment check sequence",
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn switching_theorem_runtime_and_compression_predictor_align() {
+        let spec = MixtureSpec::new(MixtureKind::Switching, alignment_experts())
+            .with_schedule(MixtureScheduleMode::Theorem)
+            .with_alpha(0.91);
+        assert_runtime_and_compression_predictor_align(
+            spec,
+            b"switching theorem predictor alignment check sequence",
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn convex_runtime_and_compression_predictor_align_for_alpha_above_one() {
+        let spec = MixtureSpec::new(MixtureKind::Convex, alignment_experts()).with_alpha(1.25);
+        assert_runtime_and_compression_predictor_align(
+            spec,
+            b"convex predictor alignment check sequence",
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn convex_theorem_runtime_and_compression_predictor_align() {
+        let spec = MixtureSpec::new(MixtureKind::Convex, alignment_experts())
+            .with_schedule(MixtureScheduleMode::Theorem)
+            .with_alpha(7.5);
+        assert_runtime_and_compression_predictor_align(
+            spec,
+            b"convex theorem predictor alignment check sequence",
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn neural_runtime_and_compression_predictor_align() {
+        let spec = MixtureSpec::new(MixtureKind::Neural, alignment_experts()).with_alpha(0.03);
+        assert_runtime_and_compression_predictor_align(
+            spec,
+            b"neural alignment check sequence",
+            1e-8,
+        );
     }
 
     fn assert_cached_cdf_fast_bitwise_matches_pdf_rows(mut predictor: RatePdfPredictor) {

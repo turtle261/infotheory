@@ -22,7 +22,7 @@ use crate::rosaplus::RosaPlus;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
 use crate::zpaq_rate::ZpaqRateModel;
-use crate::{CalibratedSpec, MixtureKind, MixtureSpec, RateBackend};
+use crate::{CalibratedSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend};
 use std::sync::Arc;
 
 /// Default minimum probability floor to avoid log(0).
@@ -90,6 +90,121 @@ fn logsumexp_weights(experts: &[ExpertState]) -> f64 {
         sum += (e.log_weight - max_v).exp();
     }
     max_v + sum.ln()
+}
+
+fn normalize_simplex_weights(weights: &mut [f64]) {
+    if weights.is_empty() {
+        return;
+    }
+    let mut sum = 0.0;
+    for weight in weights.iter_mut() {
+        if !weight.is_finite() || *weight < 0.0 {
+            *weight = 0.0;
+        }
+        sum += *weight;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        let uniform = 1.0 / (weights.len() as f64);
+        weights.fill(uniform);
+        return;
+    }
+    for weight in weights.iter_mut() {
+        *weight /= sum;
+    }
+}
+
+pub(crate) fn project_simplex_with_scratch(weights: &mut [f64], scratch: &mut Vec<f64>) {
+    if weights.is_empty() {
+        return;
+    }
+
+    scratch.clear();
+    scratch.extend(
+        weights
+            .iter()
+            .map(|&weight| if weight.is_finite() { weight } else { 0.0 }),
+    );
+    let sorted = scratch.as_mut_slice();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+
+    let mut cumulative = 0.0;
+    let mut rho = None;
+    for (index, value) in sorted.iter().enumerate() {
+        cumulative += *value;
+        let theta = (cumulative - 1.0) / ((index + 1) as f64);
+        if *value > theta {
+            rho = Some(index);
+        }
+    }
+
+    let Some(rho_index) = rho else {
+        let uniform = 1.0 / (weights.len() as f64);
+        weights.fill(uniform);
+        return;
+    };
+
+    let theta = (sorted.iter().take(rho_index + 1).sum::<f64>() - 1.0) / ((rho_index + 1) as f64);
+    for weight in weights.iter_mut() {
+        *weight = (*weight - theta).max(0.0);
+    }
+    normalize_simplex_weights(weights);
+}
+
+#[inline]
+pub(crate) fn switching_alpha_for_update(
+    schedule: MixtureScheduleMode,
+    alpha: f64,
+    processed_symbols: u64,
+) -> f64 {
+    match schedule {
+        MixtureScheduleMode::Default => alpha.clamp(0.0, 1.0),
+        MixtureScheduleMode::Theorem => 1.0 / ((processed_symbols + 2) as f64),
+    }
+}
+
+#[inline]
+pub(crate) fn convex_step_size_for_update(
+    schedule: MixtureScheduleMode,
+    alpha: f64,
+    update_index: u64,
+) -> f64 {
+    let t = update_index.max(1) as f64;
+    match schedule {
+        MixtureScheduleMode::Default => alpha.max(1e-12) / t.sqrt(),
+        MixtureScheduleMode::Theorem => DEFAULT_MIN_PROB / t.sqrt(),
+    }
+}
+
+fn normalized_prior_weights(configs: &[ExpertConfig]) -> Vec<f64> {
+    if configs.is_empty() {
+        return Vec::new();
+    }
+    let max_log = configs
+        .iter()
+        .map(|cfg| cfg.log_prior)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut weights = configs
+        .iter()
+        .map(|cfg| {
+            if max_log.is_finite() {
+                (cfg.log_prior - max_log).exp()
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    normalize_simplex_weights(&mut weights);
+    weights
+}
+
+fn set_log_weights_from_linear(experts: &mut [ExpertState], weights: &[f64]) {
+    for (expert, &weight) in experts.iter_mut().zip(weights.iter()) {
+        expert.log_weight = if weight > 0.0 {
+            weight.ln()
+        } else {
+            f64::NEG_INFINITY
+        };
+    }
 }
 
 /// Trait for online byte-level predictors that expose per-symbol log-probabilities.
@@ -577,6 +692,7 @@ impl RateBackendPredictor {
                     MixtureKind::Bayes => "bayes",
                     MixtureKind::FadingBayes => "fading",
                     MixtureKind::Switching => "switch",
+                    MixtureKind::Convex => "convex",
                     MixtureKind::Mdl => "mdl",
                     MixtureKind::Neural => "neural",
                 };
@@ -1052,7 +1168,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 Ok(())
             }
             RateBackendPredictor::Zpaq { .. } => {
-                Err("plugin entropy is not supported for zpaq rate backends in 1.1.0".to_string())
+                Err("plugin entropy is not supported for zpaq rate backends in 1.1.1".to_string())
             }
             RateBackendPredictor::Mixture { runtime } => runtime.reset_frozen(total_symbols),
             RateBackendPredictor::Particle { runtime } => {
@@ -1696,39 +1812,38 @@ impl FadingBayesMixture {
 #[derive(Clone)]
 pub struct SwitchingMixture {
     experts: Vec<ExpertState>,
-    log_prior: Vec<f64>,
-    log_alpha: f64,
-    log_1m_alpha: f64,
+    prior: Vec<f64>,
+    alpha: f64,
+    schedule: MixtureScheduleMode,
     scratch_logps: Vec<f64>,
-    scratch_switch: Vec<f64>,
+    scratch_joint: Vec<f64>,
+    scratch_weights: Vec<f64>,
     cached_symbol: u8,
     cached_log_mix: f64,
     cache_valid: bool,
     total_log_loss: f64,
+    update_count: u64,
 }
 
 impl SwitchingMixture {
-    /// Construct a switching mixture with switch probability `alpha`.
-    pub fn new(configs: &[ExpertConfig], alpha: f64) -> Self {
+    /// Construct a switching mixture.
+    pub fn new(configs: &[ExpertConfig], alpha: f64, schedule: MixtureScheduleMode) -> Self {
         let mut experts: Vec<ExpertState> = configs.iter().map(|c| c.build()).collect();
-        let log_priors: Vec<f64> = experts.iter().map(|e| e.log_prior).collect();
-        let norm = logsumexp(&log_priors);
-        for e in &mut experts {
-            e.log_weight -= norm;
-        }
-        let log_prior: Vec<f64> = experts.iter().map(|e| e.log_prior - norm).collect();
-        let alpha = alpha.clamp(1e-12, 1.0 - 1e-12);
+        let prior = normalized_prior_weights(configs);
+        set_log_weights_from_linear(&mut experts, &prior);
         Self {
             experts,
-            log_prior,
-            log_alpha: alpha.ln(),
-            log_1m_alpha: (1.0 - alpha).ln(),
+            prior,
+            alpha,
+            schedule,
             scratch_logps: vec![0.0; configs.len()],
-            scratch_switch: vec![0.0; configs.len()],
+            scratch_joint: vec![0.0; configs.len()],
+            scratch_weights: vec![0.0; configs.len()],
             cached_symbol: 0,
             cached_log_mix: f64::NEG_INFINITY,
             cache_valid: false,
             total_log_loss: 0.0,
+            update_count: 0,
         }
     }
 
@@ -1747,19 +1862,57 @@ impl SwitchingMixture {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
                 expert.cum_log_loss -= self.scratch_logps[i];
+                self.scratch_joint[i] = expert.log_weight + self.scratch_logps[i];
             }
-            for i in 0..self.experts.len() {
-                let log_switch = logsumexp2(
-                    self.log_1m_alpha + self.experts[i].log_weight,
-                    self.log_alpha + self.log_prior[i],
-                );
-                self.scratch_switch[i] = self.scratch_logps[i] + log_switch;
-            }
-            logsumexp(&self.scratch_switch)
+            logsumexp(&self.scratch_joint)
         };
+
         for i in 0..self.experts.len() {
-            let expert = &mut self.experts[i];
-            expert.log_weight = self.scratch_switch[i] - log_mix;
+            self.scratch_weights[i] = (self.scratch_joint[i] - log_mix).exp();
+        }
+
+        let alpha = switching_alpha_for_update(self.schedule, self.alpha, self.update_count);
+        self.update_count = self.update_count.saturating_add(1);
+
+        if self.experts.len() == 1 || alpha <= 0.0 {
+            set_log_weights_from_linear(&mut self.experts, &self.scratch_weights);
+        } else {
+            let mut switch_out_sum = 0.0;
+            let mut num_switch_targets = 0usize;
+            for &prior in &self.prior {
+                if prior < 1.0 {
+                    num_switch_targets += 1;
+                }
+            }
+
+            if num_switch_targets <= 1 {
+                set_log_weights_from_linear(&mut self.experts, &self.scratch_weights);
+            } else {
+                for i in 0..self.experts.len() {
+                    let denom = 1.0 - self.prior[i];
+                    if denom > 0.0 {
+                        switch_out_sum += self.scratch_weights[i] / denom;
+                    }
+                }
+
+                for i in 0..self.experts.len() {
+                    let stay = (1.0 - alpha) * self.scratch_weights[i];
+                    let switch_in = if self.prior[i] > 0.0 {
+                        let denom = 1.0 - self.prior[i];
+                        let switchable_mass = if denom > 0.0 {
+                            switch_out_sum - self.scratch_weights[i] / denom
+                        } else {
+                            0.0
+                        };
+                        alpha * self.prior[i] * switchable_mass
+                    } else {
+                        0.0
+                    };
+                    self.scratch_joint[i] = stay + switch_in;
+                }
+                normalize_simplex_weights(&mut self.scratch_joint);
+                set_log_weights_from_linear(&mut self.experts, &self.scratch_joint);
+            }
         }
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
@@ -1773,13 +1926,9 @@ impl SwitchingMixture {
         for i in 0..self.experts.len() {
             let lp = self.experts[i].log_prob(symbol);
             self.scratch_logps[i] = lp;
-            let log_switch = logsumexp2(
-                self.log_1m_alpha + self.experts[i].log_weight,
-                self.log_alpha + self.log_prior[i],
-            );
-            self.scratch_switch[i] = lp + log_switch;
+            self.scratch_joint[i] = self.experts[i].log_weight + lp;
         }
-        let log_mix = logsumexp(&self.scratch_switch);
+        let log_mix = logsumexp(&self.scratch_joint);
         self.cached_symbol = symbol;
         self.cached_log_mix = log_mix;
         self.cache_valid = true;
@@ -1792,18 +1941,11 @@ impl SwitchingMixture {
             return;
         }
         out.fill(f64::NEG_INFINITY);
-        let mut log_switch = vec![0.0f64; self.experts.len()];
-        for (i, expert) in self.experts.iter().enumerate() {
-            log_switch[i] = logsumexp2(
-                self.log_1m_alpha + expert.log_weight,
-                self.log_alpha + self.log_prior[i],
-            );
-        }
-        let norm = logsumexp(&log_switch);
+        let norm = logsumexp_weights(&self.experts);
         let mut row = [0.0f64; 256];
-        for (i, expert) in self.experts.iter_mut().enumerate() {
+        for expert in &mut self.experts {
             expert.predictor.fill_log_probs(&mut row);
-            let lw = log_switch[i] - norm;
+            let lw = expert.log_weight - norm;
             for b in 0..256 {
                 out[b] = logsumexp2(out[b], lw + row[b]);
             }
@@ -1871,6 +2013,135 @@ impl SwitchingMixture {
         }
         self.cache_valid = false;
         self.total_log_loss = 0.0;
+        self.update_count = 0;
+        Ok(())
+    }
+
+    fn update_frozen(&mut self, symbol: u8) {
+        for expert in &mut self.experts {
+            expert.update_frozen(symbol);
+        }
+        self.cache_valid = false;
+    }
+}
+
+/// Convex mixture with projected-simplex online updates.
+#[derive(Clone)]
+pub struct ConvexMixture {
+    experts: Vec<ExpertState>,
+    alpha: f64,
+    schedule: MixtureScheduleMode,
+    lambda: Vec<f64>,
+    scratch_logps: Vec<f64>,
+    projection_scratch: Vec<f64>,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+    update_count: u64,
+}
+
+impl ConvexMixture {
+    /// Construct a convex mixture with prior-derived initial weights.
+    pub fn new(configs: &[ExpertConfig], alpha: f64, schedule: MixtureScheduleMode) -> Self {
+        Self {
+            experts: configs.iter().map(|c| c.build()).collect(),
+            alpha,
+            schedule,
+            lambda: normalized_prior_weights(configs),
+            scratch_logps: vec![0.0; configs.len()],
+            projection_scratch: Vec::with_capacity(configs.len()),
+            cached_symbol: 0,
+            cached_log_mix: f64::NEG_INFINITY,
+            cache_valid: false,
+            total_log_loss: 0.0,
+            update_count: 0,
+        }
+    }
+
+    fn mix_log_prob(&self, logps: &[f64]) -> f64 {
+        let mut mix = 0.0;
+        for (weight, &logp) in self.lambda.iter().zip(logps.iter()) {
+            if *weight > 0.0 {
+                mix += *weight * logp.exp();
+            }
+        }
+        clamp_prob(mix, DEFAULT_MIN_PROB).ln()
+    }
+
+    /// Log-probability (natural log) of the convex mixture for `symbol`, then update.
+    pub fn step(&mut self, symbol: u8) -> f64 {
+        if self.experts.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+
+        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                expert.cum_log_loss -= self.scratch_logps[i];
+                expert.update(symbol);
+            }
+            self.cached_log_mix
+        } else {
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                self.scratch_logps[i] = expert.log_prob_update(symbol);
+                expert.cum_log_loss -= self.scratch_logps[i];
+            }
+            self.mix_log_prob(&self.scratch_logps)
+        };
+
+        self.update_count = self.update_count.saturating_add(1);
+        let step_size = convex_step_size_for_update(self.schedule, self.alpha, self.update_count);
+        for (weight, &logp) in self.lambda.iter_mut().zip(self.scratch_logps.iter()) {
+            let grad = -(logp - log_mix).exp();
+            *weight -= step_size * grad;
+        }
+        project_simplex_with_scratch(&mut self.lambda, &mut self.projection_scratch);
+        self.cache_valid = false;
+        self.total_log_loss -= log_mix;
+        log_mix
+    }
+
+    fn predict_log_prob(&mut self, symbol: u8) -> f64 {
+        if self.experts.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+        for (i, expert) in self.experts.iter_mut().enumerate() {
+            self.scratch_logps[i] = expert.log_prob(symbol);
+        }
+        let log_mix = self.mix_log_prob(&self.scratch_logps);
+        self.cached_symbol = symbol;
+        self.cached_log_mix = log_mix;
+        self.cache_valid = true;
+        log_mix
+    }
+
+    fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        out.fill(f64::NEG_INFINITY);
+        let mut row = [0.0f64; 256];
+        for (index, expert) in self.experts.iter_mut().enumerate() {
+            expert.predictor.fill_log_probs(&mut row);
+            let weight = self.lambda.get(index).copied().unwrap_or(0.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            let log_weight = weight.ln();
+            for byte in 0..256 {
+                out[byte] = logsumexp2(out[byte], log_weight + row[byte]);
+            }
+        }
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        for expert in &mut self.experts {
+            expert.reset_frozen(total_symbols)?;
+        }
+        self.cache_valid = false;
+        self.total_log_loss = 0.0;
+        self.update_count = 0;
         Ok(())
     }
 
@@ -2330,6 +2601,8 @@ pub enum MixtureRuntime {
     Fading(FadingBayesMixture),
     /// Switching mixture.
     Switching(SwitchingMixture),
+    /// Convex mixture.
+    Convex(ConvexMixture),
     /// MDL selector.
     Mdl(MdlSelector),
     /// Bytewise neural logistic mixer.
@@ -2342,6 +2615,7 @@ impl MixtureRuntime {
             MixtureRuntime::Bayes(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Fading(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Switching(m) => begin_expert_stream(&mut m.experts, total_symbols),
+            MixtureRuntime::Convex(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Mdl(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Neural(m) => begin_expert_stream(&mut m.experts, total_symbols),
         }
@@ -2352,6 +2626,7 @@ impl MixtureRuntime {
             MixtureRuntime::Bayes(m) => finish_expert_stream(&mut m.experts),
             MixtureRuntime::Fading(m) => finish_expert_stream(&mut m.experts),
             MixtureRuntime::Switching(m) => finish_expert_stream(&mut m.experts),
+            MixtureRuntime::Convex(m) => finish_expert_stream(&mut m.experts),
             MixtureRuntime::Mdl(m) => finish_expert_stream(&mut m.experts),
             MixtureRuntime::Neural(m) => finish_expert_stream(&mut m.experts),
         }
@@ -2362,6 +2637,7 @@ impl MixtureRuntime {
             MixtureRuntime::Bayes(m) => m.reset_frozen(total_symbols),
             MixtureRuntime::Fading(m) => m.reset_frozen(total_symbols),
             MixtureRuntime::Switching(m) => m.reset_frozen(total_symbols),
+            MixtureRuntime::Convex(m) => m.reset_frozen(total_symbols),
             MixtureRuntime::Mdl(m) => m.reset_frozen(total_symbols),
             MixtureRuntime::Neural(m) => m.reset_frozen(total_symbols),
         }
@@ -2373,6 +2649,7 @@ impl MixtureRuntime {
             MixtureRuntime::Bayes(m) => m.predict_log_prob(symbol),
             MixtureRuntime::Fading(m) => m.predict_log_prob(symbol),
             MixtureRuntime::Switching(m) => m.predict_log_prob(symbol),
+            MixtureRuntime::Convex(m) => m.predict_log_prob(symbol),
             MixtureRuntime::Mdl(m) => m.predict_log_prob(symbol),
             MixtureRuntime::Neural(m) => m.predict_log_prob(symbol),
         }
@@ -2384,6 +2661,7 @@ impl MixtureRuntime {
             MixtureRuntime::Bayes(m) => m.step(symbol),
             MixtureRuntime::Fading(m) => m.step(symbol),
             MixtureRuntime::Switching(m) => m.step(symbol),
+            MixtureRuntime::Convex(m) => m.step(symbol),
             MixtureRuntime::Mdl(m) => m.step(symbol),
             MixtureRuntime::Neural(m) => m.step(symbol),
         }
@@ -2394,6 +2672,7 @@ impl MixtureRuntime {
             MixtureRuntime::Bayes(m) => m.update_frozen(symbol),
             MixtureRuntime::Fading(m) => m.update_frozen(symbol),
             MixtureRuntime::Switching(m) => m.update_frozen(symbol),
+            MixtureRuntime::Convex(m) => m.update_frozen(symbol),
             MixtureRuntime::Mdl(m) => m.update_frozen(symbol),
             MixtureRuntime::Neural(m) => m.update_frozen(symbol),
         }
@@ -2404,6 +2683,7 @@ impl MixtureRuntime {
             MixtureRuntime::Bayes(m) => m.fill_log_probs(out),
             MixtureRuntime::Fading(m) => m.fill_log_probs(out),
             MixtureRuntime::Switching(m) => m.fill_log_probs(out),
+            MixtureRuntime::Convex(m) => m.fill_log_probs(out),
             MixtureRuntime::Mdl(m) => m.fill_log_probs(out),
             MixtureRuntime::Neural(m) => m.fill_log_probs(out),
         }
@@ -2431,9 +2711,7 @@ pub(crate) fn build_mixture_runtime(
     spec: &MixtureSpec,
     experts: &[ExpertConfig],
 ) -> Result<MixtureRuntime, String> {
-    if experts.is_empty() {
-        return Err("mixture spec must include at least one expert".to_string());
-    }
+    spec.validate()?;
     match spec.kind {
         MixtureKind::Bayes => Ok(MixtureRuntime::Bayes(BayesMixture::new(experts))),
         MixtureKind::FadingBayes => {
@@ -2445,7 +2723,14 @@ pub(crate) fn build_mixture_runtime(
             )))
         }
         MixtureKind::Switching => Ok(MixtureRuntime::Switching(SwitchingMixture::new(
-            experts, spec.alpha,
+            experts,
+            spec.alpha,
+            spec.schedule,
+        ))),
+        MixtureKind::Convex => Ok(MixtureRuntime::Convex(ConvexMixture::new(
+            experts,
+            spec.alpha,
+            spec.schedule,
         ))),
         MixtureKind::Mdl => Ok(MixtureRuntime::Mdl(MdlSelector::new(experts))),
         MixtureKind::Neural => Ok(MixtureRuntime::Neural(NeuralMixture::new(
@@ -2477,6 +2762,30 @@ mod tests {
         }
 
         fn update(&mut self, _symbol: u8) {}
+    }
+
+    #[derive(Clone)]
+    struct FixedProbPredict {
+        prob_zero: f64,
+    }
+
+    impl OnlineBytePredictor for FixedProbPredict {
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            let p = if symbol == 0 {
+                self.prob_zero
+            } else {
+                1.0 - self.prob_zero
+            };
+            p.ln()
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+    }
+
+    fn weighted_cfg(name: &'static str, weight: f64, prob_zero: f64) -> ExpertConfig {
+        ExpertConfig::new(name, weight.ln(), move || {
+            Box::new(FixedProbPredict { prob_zero })
+        })
     }
 
     #[test]
@@ -2547,6 +2856,7 @@ mod tests {
                 counting_cfg("c1", c1.clone()),
             ],
             0.05,
+            MixtureScheduleMode::Default,
         );
         let _ = mix.predict_log_prob(0);
         let after_predict = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
@@ -2554,6 +2864,118 @@ mod tests {
         let _ = mix.step(0);
         let after_step = c0.load(Ordering::Relaxed) + c1.load(Ordering::Relaxed);
         assert_eq!(after_step, after_predict);
+    }
+
+    #[test]
+    fn switching_mixture_matches_fixed_share_update_for_uniform_prior() {
+        let configs = vec![weighted_cfg("a", 0.5, 0.8), weighted_cfg("b", 0.5, 0.3)];
+        let alpha = 0.2;
+        let mut mix = SwitchingMixture::new(&configs, alpha, MixtureScheduleMode::Default);
+
+        let predicted = mix.predict_log_prob(0).exp();
+        assert!((predicted - 0.55).abs() < 1e-12, "predicted={predicted}");
+
+        let observed = mix.step(0).exp();
+        assert!((observed - 0.55).abs() < 1e-12, "observed={observed}");
+
+        let post = mix.posterior();
+        let posterior_a = 0.5 * 0.8 / 0.55;
+        let posterior_b = 0.5 * 0.3 / 0.55;
+        let expected_a = (1.0 - alpha) * posterior_a + alpha * posterior_b;
+        let expected_b = (1.0 - alpha) * posterior_b + alpha * posterior_a;
+        assert!(
+            (post[0] - expected_a).abs() < 1e-12 && (post[1] - expected_b).abs() < 1e-12,
+            "expected [{expected_a}, {expected_b}], got {:?}",
+            post
+        );
+    }
+
+    #[test]
+    fn switching_mixture_switches_according_to_prior_over_other_experts() {
+        let configs = vec![
+            weighted_cfg("a", 0.5, 0.75),
+            weighted_cfg("b", 0.3, 0.25),
+            weighted_cfg("c", 0.2, 0.60),
+        ];
+        let alpha = 0.15;
+        let mut mix = SwitchingMixture::new(&configs, alpha, MixtureScheduleMode::Default);
+
+        let _ = mix.step(0);
+        let post = mix.posterior();
+
+        let current = [0.5_f64, 0.3, 0.2];
+        let likelihood = [0.75_f64, 0.25, 0.60];
+        let mix_prob = current
+            .iter()
+            .zip(likelihood.iter())
+            .map(|(w, p)| w * p)
+            .sum::<f64>();
+        let posterior = [
+            current[0] * likelihood[0] / mix_prob,
+            current[1] * likelihood[1] / mix_prob,
+            current[2] * likelihood[2] / mix_prob,
+        ];
+        let prior = [0.5_f64, 0.3, 0.2];
+        let mut expected = [0.0_f64; 3];
+        for j in 0..3 {
+            let stay = (1.0 - alpha) * posterior[j];
+            let switch_in = alpha
+                * prior[j]
+                * (0..3)
+                    .filter(|&k| k != j)
+                    .map(|k| posterior[k] / (1.0 - prior[k]))
+                    .sum::<f64>();
+            expected[j] = stay + switch_in;
+        }
+
+        for i in 0..3 {
+            assert!(
+                (post[i] - expected[i]).abs() < 1e-12,
+                "expert {i}: expected {} got {}",
+                expected[i],
+                post[i]
+            );
+        }
+    }
+
+    #[test]
+    fn switching_theorem_schedule_uses_one_over_t() {
+        assert!(
+            (switching_alpha_for_update(MixtureScheduleMode::Theorem, 0.99, 0) - 0.5).abs() < 1e-12
+        );
+        assert!(
+            (switching_alpha_for_update(MixtureScheduleMode::Theorem, 0.99, 1) - (1.0 / 3.0)).abs()
+                < 1e-12
+        );
+
+        let configs = vec![weighted_cfg("a", 0.5, 0.8), weighted_cfg("b", 0.5, 0.3)];
+        let mut mix = SwitchingMixture::new(&configs, 0.99, MixtureScheduleMode::Theorem);
+        let _ = mix.step(0);
+        let post = mix.posterior();
+        let posterior_a = 0.5 * 0.8 / 0.55;
+        let posterior_b = 0.5 * 0.3 / 0.55;
+        let expected_a = 0.5 * posterior_a + 0.5 * posterior_b;
+        let expected_b = expected_a;
+        assert!((post[0] - expected_a).abs() < 1e-12);
+        assert!((post[1] - expected_b).abs() < 1e-12);
+    }
+
+    #[test]
+    fn convex_theorem_schedule_uses_paper_step_size() {
+        let eta = convex_step_size_for_update(MixtureScheduleMode::Theorem, 9.0, 1);
+        assert!((eta - DEFAULT_MIN_PROB).abs() < 1e-18);
+
+        let configs = vec![weighted_cfg("a", 0.5, 0.8), weighted_cfg("b", 0.5, 0.3)];
+        let mut mix = ConvexMixture::new(&configs, 9.0, MixtureScheduleMode::Theorem);
+        let observed = mix.step(0).exp();
+        assert!((observed - 0.55).abs() < 1e-12, "observed={observed}");
+
+        let expected = [
+            0.5 + eta * ((0.8 / 0.55) - 1.0),
+            0.5 + eta * ((0.3 / 0.55) - 1.0),
+        ];
+        assert!((mix.lambda[0] - expected[0]).abs() < 1e-12);
+        assert!((mix.lambda[1] - expected[1]).abs() < 1e-12);
     }
 
     #[test]
@@ -2991,7 +3413,15 @@ mod tests {
             })
         };
 
-        let spec = MixtureSpec::new(MixtureKind::Bayes, vec![]);
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![crate::MixtureExpertSpec {
+                name: Some("begin-aware".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Ctw { depth: 1 },
+            }],
+        );
         let mut runtime = build_mixture_runtime(&spec, &[cfg]).expect("runtime");
         runtime.begin_stream(Some(123)).expect("begin stream");
         let _ = runtime.step(0);

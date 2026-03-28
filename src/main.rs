@@ -210,8 +210,6 @@ fn parse_compression_backend(v: &str) -> Option<&'static str> {
     }
 }
 
-const MAX_MIXTURE_NESTING: usize = 8;
-
 fn load_mixture_spec(path: &str) -> anyhow::Result<MixtureSpec> {
     load_mixture_spec_with_depth(path, MAX_MIXTURE_NESTING)
 }
@@ -381,16 +379,11 @@ fn parse_calibrated_spec_value(
 }
 
 fn parse_mixture_kind(kind: &str) -> anyhow::Result<MixtureKind> {
-    match kind {
-        "bayes" | "bayes-mix" | "bayes_mix" => Ok(MixtureKind::Bayes),
-        "fading" | "fading-bayes" | "fading_bayes" => Ok(MixtureKind::FadingBayes),
-        "switch" | "switching" | "switch-mix" | "switch_mix" => Ok(MixtureKind::Switching),
-        "mdl" | "selector" | "mdr" => Ok(MixtureKind::Mdl),
-        "neural" | "neural-mix" | "neural_mix" | "fx2" | "fx2-cmix" | "fx2_cmix" => {
-            Ok(MixtureKind::Neural)
-        }
-        other => Err(anyhow::anyhow!("unknown mixture kind '{other}'")),
-    }
+    infotheory::parse_mixture_kind_name(kind).map_err(anyhow::Error::msg)
+}
+
+fn parse_mixture_schedule(schedule: &str) -> anyhow::Result<MixtureScheduleMode> {
+    infotheory::parse_mixture_schedule_name(schedule).map_err(anyhow::Error::msg)
 }
 
 fn parse_mixture_spec_value(
@@ -407,6 +400,13 @@ fn parse_mixture_spec_value(
         .or_else(|| v["mix_kind"].as_str())
         .unwrap_or("bayes");
     let kind = parse_mixture_kind(kind_str)?;
+    let schedule = v["schedule"]
+        .as_str()
+        .or_else(|| v["schedule_mode"].as_str())
+        .or_else(|| v["mixture_schedule"].as_str())
+        .map(parse_mixture_schedule)
+        .transpose()?
+        .unwrap_or(MixtureScheduleMode::Default);
     let alpha = v["alpha"].as_f64().unwrap_or(0.01);
     let decay = v["decay"].as_f64();
     let experts_v = v["experts"]
@@ -421,15 +421,13 @@ fn parse_mixture_spec_value(
     for e in experts_v {
         experts.push(parse_mixture_expert_value(e, base_dir, depth - 1)?);
     }
-    let mut spec = MixtureSpec::new(kind, experts).with_alpha(alpha);
+    let mut spec = MixtureSpec::new(kind, experts)
+        .with_schedule(schedule)
+        .with_alpha(alpha);
     if let Some(decay) = decay {
         spec = spec.with_decay(decay);
     }
-    if matches!(kind, MixtureKind::FadingBayes) && spec.decay.is_none() {
-        return Err(anyhow::anyhow!(
-            "fading Bayes mixture requires 'decay' in mixture spec"
-        ));
-    }
+    spec.validate().map_err(anyhow::Error::msg)?;
     Ok(spec)
 }
 
@@ -2626,6 +2624,16 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         max_reward,
         reward_offset,
         random_seed: mcaixi_random_seed,
+        rate_backend: if !v["rate_backend"].is_null() {
+            Some(parse_vm_stats_backend(&v["rate_backend"], &v, config_dir)?)
+        } else {
+            None
+        },
+        rate_backend_max_order: v["rate_backend_max_order"]
+            .as_i64()
+            .or_else(|| v["max_order"].as_i64())
+            .or_else(|| v["rosa_max_order"].as_i64())
+            .unwrap_or(20),
         rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
         rwkv_method: v["rwkv_method"].as_str().map(|s| s.to_string()),
         mamba_model_path: v["mamba_model_path"].as_str().map(|s| s.to_string()),
@@ -2634,7 +2642,7 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
         zpaq_method: v["zpaq_method"].as_str().map(|s| s.to_string()),
     };
 
-    let mut agent = Agent::new(config);
+    let mut agent = Agent::try_new(config).map_err(|err| anyhow::anyhow!(err))?;
     println!(
         "Agent initialized with {} algorithm for {} environment.",
         v["algorithm"].as_str().unwrap_or("ctw"),
@@ -3739,10 +3747,19 @@ mod tests {
             MixtureKind::Switching
         );
         assert_eq!(
+            parse_mixture_kind("convex").expect("convex kind"),
+            MixtureKind::Convex
+        );
+        assert_eq!(
             parse_mixture_kind("neural").expect("neural kind"),
             MixtureKind::Neural
         );
         assert!(parse_mixture_kind("nonsense").is_err());
+        assert_eq!(
+            parse_mixture_schedule("theorem").expect("theorem schedule"),
+            MixtureScheduleMode::Theorem
+        );
+        assert!(parse_mixture_schedule("nonsense").is_err());
 
         let base_dir = Path::new(".");
         let missing_experts = json!({
@@ -3760,17 +3777,45 @@ mod tests {
         assert!(parse_mixture_spec_value(&fading_without_decay, base_dir, 8).is_err());
 
         let valid = json!({
-            "kind": "bayes",
-            "alpha": 0.03,
+            "kind": "convex",
+            "schedule": "theorem",
             "experts": [
                 {"name": "ctw-e", "kind": "ctw", "depth": 8},
                 {"name": "fac-e", "kind": "fac-ctw", "base_depth": 8, "encoding_bits": 8}
             ]
         });
         let spec = parse_mixture_spec_value(&valid, base_dir, 8).expect("valid mixture");
-        assert_eq!(spec.alpha, 0.03);
+        assert_eq!(spec.schedule, MixtureScheduleMode::Theorem);
         assert_eq!(spec.experts.len(), 2);
-        assert!(matches!(spec.kind, MixtureKind::Bayes));
+        assert!(matches!(spec.kind, MixtureKind::Convex));
+
+        let nested = json!({
+            "kind": "convex",
+            "alpha": 1.25,
+            "experts": [
+                {
+                    "name": "nested",
+                    "kind": "mixture",
+                    "spec": {
+                        "kind": "bayes",
+                        "experts": [
+                            {"name": "ctw-e", "kind": "ctw", "depth": 4}
+                        ]
+                    }
+                },
+                {"name": "match-e", "kind": "match", "hash_bits": 18}
+            ]
+        });
+        let nested_spec = parse_mixture_spec_value(&nested, base_dir, 8).expect("nested mixture");
+        assert!(matches!(nested_spec.kind, MixtureKind::Convex));
+        assert_eq!(nested_spec.experts.len(), 2);
+        match &nested_spec.experts[0].backend {
+            RateBackend::Mixture { spec } => {
+                assert!(matches!(spec.kind, MixtureKind::Bayes));
+                assert_eq!(spec.experts.len(), 1);
+            }
+            _ => panic!("expected nested mixture backend"),
+        }
     }
 
     #[cfg(feature = "vm")]

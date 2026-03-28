@@ -1,6 +1,6 @@
 [package]
 name = "infotheory"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 license = "ISC OR Apache-2.0"
 homepage = "https://infotheory.tech"
@@ -51,6 +51,10 @@ harness = false
 
 [[bench]]
 name = "aixi"
+harness = false
+
+[[bench]]
+name = "aiqi"
 harness = false
 
 [[bench]]

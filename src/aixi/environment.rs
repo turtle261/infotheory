@@ -809,3 +809,30 @@ impl Environment for KuhnPoker {
         self.reset_game();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tictactoe_illegal_move_preserves_state_and_penalizes() {
+        let mut env = TicTacToe::new();
+        env.set_random_seed(7);
+
+        env.perform_action(0);
+        let occupied_state = env.get_observation();
+        assert_ne!(occupied_state, 0, "first move should change the board");
+
+        env.perform_action(0);
+        assert_eq!(
+            env.get_reward(),
+            -3,
+            "illegal move should incur the documented penalty"
+        );
+        assert_eq!(
+            env.get_observation(),
+            occupied_state,
+            "illegal move should not mutate the board state",
+        );
+    }
+}

@@ -2,8 +2,9 @@
 
 use infotheory::{
     CalibratedSpec, CalibrationContextKind, CompressionBackend, GenerationConfig,
-    GenerationStrategy, GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec, MixtureKind,
-    MixtureSpec, NcdVariant, ParticleSpec, RateBackend, RateBackendSession,
+    GenerationStrategy, GenerationUpdateMode, InfotheoryCtx, MAX_MIXTURE_NESTING,
+    MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, NcdVariant, ParticleSpec,
+    RateBackend, RateBackendSession,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -152,7 +153,6 @@ fn generation_config_from_py(config: Option<&Bound<'_, PyAny>>) -> PyResult<Gene
     Ok(GenerationConfig::default())
 }
 
-const MAX_MIXTURE_SPEC_NESTING: usize = 8;
 const MAX_CALIBRATED_SPEC_NESTING: usize = 4;
 
 #[pyclass(name = "GenerationStrategy", from_py_object)]
@@ -520,16 +520,11 @@ fn parse_calibration_context_kind_str(value: Option<&str>) -> PyResult<Calibrati
 }
 
 fn parse_mixture_kind_json(kind: &str) -> PyResult<MixtureKind> {
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "bayes" | "bayes-mix" | "bayes_mix" => Ok(MixtureKind::Bayes),
-        "fading" | "fading-bayes" | "fading_bayes" => Ok(MixtureKind::FadingBayes),
-        "switch" | "switching" | "switch-mix" | "switch_mix" => Ok(MixtureKind::Switching),
-        "mdl" | "selector" | "mdr" => Ok(MixtureKind::Mdl),
-        "neural" | "mix" | "mixture" => Ok(MixtureKind::Neural),
-        other => Err(PyValueError::new_err(format!(
-            "unknown mixture kind '{other}'"
-        ))),
-    }
+    infotheory::parse_mixture_kind_name(kind).map_err(PyValueError::new_err)
+}
+
+fn parse_mixture_schedule_json(schedule: &str) -> PyResult<MixtureScheduleMode> {
+    infotheory::parse_mixture_schedule_name(schedule).map_err(PyValueError::new_err)
 }
 
 fn parse_calibrated_spec_json(
@@ -605,6 +600,13 @@ fn parse_mixture_spec_json(
         .or_else(|| v["mixture_kind"].as_str())
         .unwrap_or("bayes");
     let kind = parse_mixture_kind_json(kind_str)?;
+    let schedule = v["schedule"]
+        .as_str()
+        .or_else(|| v["schedule_mode"].as_str())
+        .or_else(|| v["mixture_schedule"].as_str())
+        .map(parse_mixture_schedule_json)
+        .transpose()?
+        .unwrap_or(MixtureScheduleMode::Default);
 
     let experts_v = v["experts"]
         .as_array()
@@ -620,18 +622,14 @@ fn parse_mixture_spec_json(
         experts.push(parse_mixture_expert_json(expert, base_dir, depth - 1)?);
     }
 
-    let mut spec = MixtureSpec::new(kind, experts);
+    let mut spec = MixtureSpec::new(kind, experts).with_schedule(schedule);
     if let Some(alpha) = v["alpha"].as_f64() {
         spec = spec.with_alpha(alpha);
     }
     if let Some(decay) = v["decay"].as_f64() {
         spec = spec.with_decay(decay);
     }
-    if matches!(kind, MixtureKind::FadingBayes) && spec.decay.is_none() {
-        return Err(PyValueError::new_err(
-            "fading Bayes mixture requires 'decay' in mixture spec",
-        ));
-    }
+    spec.validate().map_err(PyValueError::new_err)?;
     Ok(spec)
 }
 
@@ -904,7 +902,7 @@ fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend>
             let spec = parse_mixture_spec_json(
                 &value,
                 full.parent().unwrap_or(Path::new(".")),
-                MAX_MIXTURE_SPEC_NESTING,
+                MAX_MIXTURE_NESTING,
             )?;
             Ok(RateBackend::Mixture {
                 spec: Arc::new(spec),
@@ -1055,6 +1053,13 @@ impl PyMixtureKind {
         }
     }
     #[classattr]
+    #[pyo3(name = "Convex")]
+    fn convex() -> Self {
+        Self {
+            inner: MixtureKind::Convex,
+        }
+    }
+    #[classattr]
     #[pyo3(name = "Mdl")]
     fn mdl() -> Self {
         Self {
@@ -1066,6 +1071,31 @@ impl PyMixtureKind {
     fn neural() -> Self {
         Self {
             inner: MixtureKind::Neural,
+        }
+    }
+}
+
+#[pyclass(name = "MixtureScheduleMode", from_py_object)]
+#[derive(Clone)]
+struct PyMixtureScheduleMode {
+    inner: MixtureScheduleMode,
+}
+
+#[pymethods]
+impl PyMixtureScheduleMode {
+    #[classattr]
+    #[pyo3(name = "Default")]
+    fn default_mode() -> Self {
+        Self {
+            inner: MixtureScheduleMode::Default,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "Theorem")]
+    fn theorem() -> Self {
+        Self {
+            inner: MixtureScheduleMode::Theorem,
         }
     }
 }
@@ -1101,19 +1131,23 @@ struct PyMixtureSpec {
 #[pymethods]
 impl PyMixtureSpec {
     #[new]
-    #[pyo3(signature = (kind, experts, alpha=0.01, decay=None))]
+    #[pyo3(signature = (kind, experts, alpha=0.01, decay=None, schedule=None))]
     fn new(
         kind: &PyMixtureKind,
         experts: Vec<PyMixtureExpertSpec>,
         alpha: f64,
         decay: Option<f64>,
-    ) -> Self {
+        schedule: Option<&PyMixtureScheduleMode>,
+    ) -> PyResult<Self> {
         let mut spec = MixtureSpec::new(kind.inner, experts.into_iter().map(|e| e.inner).collect())
+            .with_schedule(schedule.map(|mode| mode.inner).unwrap_or_default())
             .with_alpha(alpha);
         if let Some(d) = decay {
             spec = spec.with_decay(d);
         }
-        Self { inner: spec }
+        spec.validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid MixtureSpec: {e}")))?;
+        Ok(Self { inner: spec })
     }
 }
 
@@ -1412,12 +1446,15 @@ impl PyRateBackend {
     }
 
     #[staticmethod]
-    fn mixture(spec: &PyMixtureSpec) -> Self {
-        Self {
+    fn mixture(spec: &PyMixtureSpec) -> PyResult<Self> {
+        spec.inner
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid MixtureSpec: {e}")))?;
+        Ok(Self {
             inner: RateBackend::Mixture {
                 spec: Arc::new(spec.inner.clone()),
             },
-        }
+        })
     }
 
     #[staticmethod]
@@ -1823,11 +1860,13 @@ impl PyRateBackendSession {
     #[new]
     #[pyo3(signature = (backend, max_order=-1, total_symbols=None))]
     fn new(backend: &PyRateBackend, max_order: i64, total_symbols: Option<u64>) -> PyResult<Self> {
-        let inner =
-            RateBackendSession::from_backend(backend.inner.clone(), max_order, total_symbols)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
+        py_try(|| {
+            let inner =
+                RateBackendSession::from_backend(backend.inner.clone(), max_order, total_symbols)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(Self {
+                inner: Arc::new(Mutex::new(inner)),
+            })
         })
     }
 
@@ -3764,6 +3803,7 @@ fn run_agent_with_environment<'py>(
             "AgentConfig.agent_actions must be >= 1 for run_agent_with_environment",
         ));
     }
+    config.inner.validate().map_err(PyValueError::new_err)?;
 
     let summary = py.detach(|| {
         py_try(|| {
@@ -3775,7 +3815,7 @@ fn run_agent_with_environment<'py>(
             if let Some(seed) = config.inner.random_seed {
                 env.set_random_seed(seed);
             }
-            let mut agent = Agent::new(config.inner.clone());
+            let mut agent = Agent::try_new(config.inner.clone()).map_err(PyValueError::new_err)?;
 
             let observation_stream_len = config.inner.observation_stream_len.max(1);
             let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
@@ -4167,6 +4207,8 @@ impl PyAgentConfig {
         max_reward=127,
         reward_offset=128,
         random_seed=None,
+        rate_backend=None,
+        rate_backend_max_order=20,
         rwkv_model_path=None,
         rosa_max_order=None,
         zpaq_method=None
@@ -4187,37 +4229,41 @@ impl PyAgentConfig {
         max_reward: i64,
         reward_offset: i64,
         random_seed: Option<u64>,
+        rate_backend: Option<&PyRateBackend>,
+        rate_backend_max_order: i64,
         rwkv_model_path: Option<String>,
         rosa_max_order: Option<i64>,
         zpaq_method: Option<String>,
-    ) -> Self {
-        Self {
-            inner: infotheory::aixi::agent::AgentConfig {
-                algorithm,
-                ct_depth,
-                agent_horizon,
-                observation_bits,
-                observation_stream_len,
-                observation_key_mode: observation_key_mode
-                    .map(|m| m.inner)
-                    .unwrap_or(infotheory::aixi::common::ObservationKeyMode::FullStream),
-                reward_bits,
-                agent_actions,
-                num_simulations,
-                exploration_exploitation_ratio,
-                discount_gamma,
-                min_reward,
-                max_reward,
-                reward_offset,
-                random_seed,
-                rwkv_model_path,
-                rwkv_method: None,
-                mamba_model_path: None,
-                mamba_method: None,
-                rosa_max_order,
-                zpaq_method,
-            },
-        }
+    ) -> PyResult<Self> {
+        let inner = infotheory::aixi::agent::AgentConfig {
+            algorithm,
+            ct_depth,
+            agent_horizon,
+            observation_bits,
+            observation_stream_len,
+            observation_key_mode: observation_key_mode
+                .map(|m| m.inner)
+                .unwrap_or(infotheory::aixi::common::ObservationKeyMode::FullStream),
+            reward_bits,
+            agent_actions,
+            num_simulations,
+            exploration_exploitation_ratio,
+            discount_gamma,
+            min_reward,
+            max_reward,
+            reward_offset,
+            random_seed,
+            rate_backend: rate_backend.map(|rb| rb.inner.clone()),
+            rate_backend_max_order,
+            rwkv_model_path,
+            rwkv_method: None,
+            mamba_model_path: None,
+            mamba_method: None,
+            rosa_max_order,
+            zpaq_method,
+        };
+        inner.validate().map_err(PyValueError::new_err)?;
+        Ok(Self { inner })
     }
 }
 
@@ -4270,32 +4316,32 @@ impl PyAiqiConfig {
         rwkv_model_path: Option<String>,
         rosa_max_order: Option<i64>,
         zpaq_method: Option<String>,
-    ) -> Self {
-        Self {
-            inner: infotheory::aixi::aiqi::AiqiConfig {
-                algorithm,
-                ct_depth,
-                observation_bits,
-                observation_stream_len,
-                reward_bits,
-                agent_actions,
-                min_reward,
-                max_reward,
-                reward_offset,
-                discount_gamma,
-                return_horizon,
-                return_bins,
-                augmentation_period: augmentation_period.unwrap_or(return_horizon),
-                history_prune_keep_steps,
-                baseline_exploration,
-                random_seed,
-                rate_backend: rate_backend.map(|rb| rb.inner.clone()),
-                rate_backend_max_order,
-                rwkv_model_path,
-                rosa_max_order,
-                zpaq_method,
-            },
-        }
+    ) -> PyResult<Self> {
+        let inner = infotheory::aixi::aiqi::AiqiConfig {
+            algorithm,
+            ct_depth,
+            observation_bits,
+            observation_stream_len,
+            reward_bits,
+            agent_actions,
+            min_reward,
+            max_reward,
+            reward_offset,
+            discount_gamma,
+            return_horizon,
+            return_bins,
+            augmentation_period: augmentation_period.unwrap_or(return_horizon),
+            history_prune_keep_steps,
+            baseline_exploration,
+            random_seed,
+            rate_backend: rate_backend.map(|rb| rb.inner.clone()),
+            rate_backend_max_order,
+            rwkv_model_path,
+            rosa_max_order,
+            zpaq_method,
+        };
+        inner.validate().map_err(PyValueError::new_err)?;
+        Ok(Self { inner })
     }
 }
 
@@ -4307,10 +4353,12 @@ struct PyAgent {
 #[pymethods]
 impl PyAgent {
     #[new]
-    fn new(config: &PyAgentConfig) -> Self {
-        Self {
-            inner: infotheory::aixi::agent::Agent::new(config.inner.clone()),
-        }
+    fn new(config: &PyAgentConfig) -> PyResult<Self> {
+        py_try(|| {
+            let inner = infotheory::aixi::agent::Agent::try_new(config.inner.clone())
+                .map_err(PyValueError::new_err)?;
+            Ok(Self { inner })
+        })
     }
 
     fn reset(&mut self) {
@@ -4354,9 +4402,11 @@ struct PyAiqiAgent {
 impl PyAiqiAgent {
     #[new]
     fn new(config: &PyAiqiConfig) -> PyResult<Self> {
-        let inner = infotheory::aixi::aiqi::AiqiAgent::new(config.inner.clone())
-            .map_err(PyValueError::new_err)?;
-        Ok(Self { inner })
+        py_try(|| {
+            let inner = infotheory::aixi::aiqi::AiqiAgent::new(config.inner.clone())
+                .map_err(PyValueError::new_err)?;
+            Ok(Self { inner })
+        })
     }
 
     fn steps_observed(&self) -> usize {
@@ -5299,6 +5349,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGenerationConfig>()?;
     m.add_class::<PyRateBackendSession>()?;
     m.add_class::<PyMixtureKind>()?;
+    m.add_class::<PyMixtureScheduleMode>()?;
     m.add_class::<PyMixtureExpertSpec>()?;
     m.add_class::<PyMixtureSpec>()?;
     m.add_class::<PyParticleSpec>()?;

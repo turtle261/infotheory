@@ -1,6 +1,16 @@
 use infotheory::aixi::agent::{Agent, AgentConfig};
 use infotheory::aixi::environment::{BiasedRockPaperScissor, Environment};
+use infotheory::{MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default)
+}
 
 fn bench_agent(
     mut agent: Agent,
@@ -38,8 +48,8 @@ fn bench_agent(
 
 fn main() {
     // Keep these fixed so backends are comparable.
-    let cycles = 2_000usize;
-    let warmup = 200usize;
+    let cycles = env_usize("AIXI_BENCH_CYCLES", 2_000);
+    let warmup = env_usize("AIXI_BENCH_WARMUP", 200);
 
     // Environment chosen because it has non-trivial observation+reward bits (2+2) and 3 actions.
     let env_name = "biased-rock-paper-scissor";
@@ -62,6 +72,8 @@ fn main() {
         max_reward: 1,
         reward_offset: 1,
         random_seed: Some(1),
+        rate_backend: None,
+        rate_backend_max_order: 20,
         rwkv_model_path: None,
         rwkv_method: None,
         mamba_model_path: None,
@@ -70,7 +82,82 @@ fn main() {
         zpaq_method: None,
     };
 
-    let benches = [("fac-ctw", base_cfg("fac-ctw")), ("rosa", base_cfg("rosa"))];
+    let make_mixture =
+        |kind: MixtureKind, alpha: f64, schedule: MixtureScheduleMode| RateBackend::Mixture {
+            spec: Arc::new(
+                MixtureSpec::new(
+                    kind,
+                    vec![
+                        MixtureExpertSpec {
+                            name: Some("ctw".to_string()),
+                            log_prior: 0.0,
+                            max_order: -1,
+                            backend: RateBackend::Ctw { depth: 32 },
+                        },
+                        MixtureExpertSpec {
+                            name: Some("rosa".to_string()),
+                            log_prior: 0.0,
+                            max_order: 20,
+                            backend: RateBackend::RosaPlus,
+                        },
+                    ],
+                )
+                .with_schedule(schedule)
+                .with_alpha(alpha),
+            ),
+        };
+    let rate_backend_cfg = |backend: RateBackend| {
+        let mut cfg = base_cfg("mixture");
+        cfg.rate_backend = Some(backend);
+        cfg
+    };
+
+    let benches = [
+        ("fac-ctw", base_cfg("fac-ctw")),
+        ("rosa", base_cfg("rosa")),
+        ("rate-ctw", rate_backend_cfg(RateBackend::Ctw { depth: 32 })),
+        ("rate-rosa", rate_backend_cfg(RateBackend::RosaPlus)),
+        (
+            "mix-bayes",
+            rate_backend_cfg(make_mixture(
+                MixtureKind::Bayes,
+                0.01,
+                MixtureScheduleMode::Default,
+            )),
+        ),
+        (
+            "mix-switch",
+            rate_backend_cfg(make_mixture(
+                MixtureKind::Switching,
+                0.17,
+                MixtureScheduleMode::Default,
+            )),
+        ),
+        (
+            "mix-switch-thm",
+            rate_backend_cfg(make_mixture(
+                MixtureKind::Switching,
+                0.99,
+                MixtureScheduleMode::Theorem,
+            )),
+        ),
+        (
+            "mix-convex",
+            rate_backend_cfg(make_mixture(
+                MixtureKind::Convex,
+                1.25,
+                MixtureScheduleMode::Default,
+            )),
+        ),
+        (
+            "mix-convex-thm",
+            rate_backend_cfg(make_mixture(
+                MixtureKind::Convex,
+                7.5,
+                MixtureScheduleMode::Theorem,
+            )),
+        ),
+    ];
 
     println!(
         "MC-AIXI benchmark (env={}, warmup={}, cycles={})",

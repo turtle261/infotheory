@@ -1,3 +1,4 @@
+use infotheory::MixtureScheduleMode;
 use infotheory::datagen;
 use infotheory::mixture::{
     BayesMixture, ExpertConfig, FadingBayesMixture, MdlSelector, OnlineBytePredictor,
@@ -385,7 +386,7 @@ fn run_once(
     }
 
     let mut bayes = BayesMixture::new(&experts);
-    let mut switch = SwitchingMixture::new(&experts, alpha);
+    let mut switch = SwitchingMixture::new(&experts, alpha, MixtureScheduleMode::Default);
     let mut fading = FadingBayesMixture::new(&experts, decay);
     let mut mdl = MdlSelector::new(&experts);
 

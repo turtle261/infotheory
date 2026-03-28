@@ -3,9 +3,11 @@
 //! Tests for predictors, environments, and agents.
 
 use infotheory::aixi::agent::{Agent, AgentConfig};
-use infotheory::aixi::common::Action;
+use infotheory::aixi::common::{Action, ObservationKeyMode};
 use infotheory::aixi::environment::{CoinFlip, CtwTest, Environment};
-use infotheory::aixi::model::{CtwPredictor, Predictor, RosaPredictor};
+use infotheory::aixi::model::{CtwPredictor, Predictor, RateBackendBitPredictor, RosaPredictor};
+use infotheory::{MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend};
+use std::sync::Arc;
 
 // ============================================================================
 // Predictor Consistency Tests
@@ -89,6 +91,112 @@ fn rosa_update_revert_consistency() {
     test_predictor_revert(Box::new(RosaPredictor::new(8)), "ROSA");
 }
 
+fn nested_generic_backend() -> RateBackend {
+    let inner = MixtureSpec::new(
+        MixtureKind::Bayes,
+        vec![
+            MixtureExpertSpec {
+                name: Some("ctw".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Ctw { depth: 6 },
+            },
+            MixtureExpertSpec {
+                name: Some("match".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Match {
+                    hash_bits: 18,
+                    min_len: 2,
+                    max_len: 32,
+                    base_mix: 0.05,
+                    confidence_scale: 1.0,
+                },
+            },
+        ],
+    )
+    .with_alpha(0.03);
+    let outer = MixtureSpec::new(
+        MixtureKind::Convex,
+        vec![
+            MixtureExpertSpec {
+                name: Some("nested".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Mixture {
+                    spec: Arc::new(inner),
+                },
+            },
+            MixtureExpertSpec {
+                name: Some("ppmd".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Ppmd {
+                    order: 4,
+                    memory_mb: 8,
+                },
+            },
+        ],
+    )
+    .with_alpha(1.25);
+    RateBackend::Mixture {
+        spec: Arc::new(outer),
+    }
+}
+
+fn predictor_snapshot(predictor: &mut dyn Predictor) -> (f64, f64) {
+    (predictor.predict_prob(false), predictor.predict_prob(true))
+}
+
+fn assert_snapshot_eq(actual: (f64, f64), expected: (f64, f64), label: &str) {
+    assert!(
+        (actual.0 - expected.0).abs() < 1e-12 && (actual.1 - expected.1).abs() < 1e-12,
+        "{label}: expected {:?}, got {:?}",
+        expected,
+        actual
+    );
+}
+
+#[test]
+fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
+    let mut predictor =
+        RateBackendBitPredictor::new(nested_generic_backend(), 8).expect("valid predictor");
+
+    let initial = predictor_snapshot(&mut predictor);
+
+    predictor.update(true);
+    let after_update = predictor_snapshot(&mut predictor);
+    predictor.revert();
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        initial,
+        "revert after update",
+    );
+
+    predictor.update(true);
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        after_update,
+        "redo after update",
+    );
+
+    predictor.update_history(false);
+    let after_frozen = predictor_snapshot(&mut predictor);
+    predictor.pop_history();
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        after_update,
+        "pop_history after frozen update",
+    );
+
+    predictor.update_history(false);
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        after_frozen,
+        "redo after frozen update",
+    );
+}
+
 // ============================================================================
 // Environment Tests
 // ============================================================================
@@ -152,6 +260,77 @@ fn run_agent_env<T: Environment>(agent: &mut Agent, mut env: T, cycles: usize) -
     total_reward
 }
 
+fn generic_agent_config(rate_backend: RateBackend) -> AgentConfig {
+    AgentConfig {
+        algorithm: "ignored-by-rate-backend".into(),
+        ct_depth: 8,
+        agent_horizon: 5,
+        observation_bits: 1,
+        observation_stream_len: 1,
+        observation_key_mode: ObservationKeyMode::FullStream,
+        reward_bits: 1,
+        agent_actions: 2,
+        num_simulations: 60,
+        exploration_exploitation_ratio: 1.4,
+        discount_gamma: 1.0,
+        min_reward: 0,
+        max_reward: 1,
+        reward_offset: 0,
+        random_seed: Some(2026),
+        rate_backend: Some(rate_backend),
+        rate_backend_max_order: 8,
+        rwkv_model_path: None,
+        rwkv_method: None,
+        mamba_model_path: None,
+        mamba_method: None,
+        rosa_max_order: Some(8),
+        zpaq_method: None,
+    }
+}
+
+fn mixture_backend(kind: MixtureKind) -> RateBackend {
+    let experts = vec![
+        MixtureExpertSpec {
+            name: Some("ctw".to_string()),
+            log_prior: 0.0,
+            max_order: -1,
+            backend: RateBackend::Ctw { depth: 8 },
+        },
+        MixtureExpertSpec {
+            name: Some("rosa".to_string()),
+            log_prior: 0.0,
+            max_order: 8,
+            backend: RateBackend::RosaPlus,
+        },
+    ];
+    let alpha = match kind {
+        MixtureKind::Switching => 0.05,
+        MixtureKind::Convex => 1.25,
+        _ => 0.03,
+    };
+    RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(kind, experts).with_alpha(alpha)),
+    }
+}
+
+fn deeply_nested_bayes_backend(depth: usize) -> RateBackend {
+    let mut backend = RateBackend::Ctw { depth: 4 };
+    for level in 0..depth {
+        backend = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![MixtureExpertSpec {
+                    name: Some(format!("level-{level}")),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend,
+                }],
+            )),
+        };
+    }
+    backend
+}
+
 #[test]
 fn agent_solves_ctw_test_environment() {
     let config = AgentConfig {
@@ -170,6 +349,8 @@ fn agent_solves_ctw_test_environment() {
         max_reward: 1,
         reward_offset: 0,
         random_seed: Some(17),
+        rate_backend: None,
+        rate_backend_max_order: 20,
         rwkv_model_path: None,
         rwkv_method: None,
         mamba_model_path: None,
@@ -214,6 +395,8 @@ fn agent_regret_sublinear_coinflip() {
         max_reward: 1,
         reward_offset: 0,
         random_seed: Some(23),
+        rate_backend: None,
+        rate_backend_max_order: 20,
         rwkv_model_path: None,
         rwkv_method: None,
         mamba_model_path: None,
@@ -258,6 +441,8 @@ fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
         max_reward: 1,
         reward_offset: 0,
         random_seed: Some(12345),
+        rate_backend: None,
+        rate_backend_max_order: 20,
         rwkv_model_path: None,
         rwkv_method: None,
         mamba_model_path: None,
@@ -300,5 +485,89 @@ fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
         rew_b = env_b.get_reward();
         prev_a = act_a;
         prev_b = act_b;
+    }
+}
+
+#[test]
+fn agent_config_allows_unknown_algorithm_when_rate_backend_overrides() {
+    let cfg = generic_agent_config(RateBackend::Ppmd {
+        order: 4,
+        memory_mb: 8,
+    });
+    assert!(cfg.validate().is_ok());
+    let mut agent = Agent::try_new(cfg).expect("rate_backend override should be valid");
+    let action = agent.get_planned_action(&[0], 0, 0);
+    assert!(action < 2);
+}
+
+#[test]
+fn agent_config_allows_algorithm_zpaq_when_rate_backend_overrides() {
+    let mut cfg = generic_agent_config(RateBackend::Ctw { depth: 8 });
+    cfg.algorithm = "zpaq".to_string();
+    cfg.zpaq_method = Some("1".to_string());
+    assert!(cfg.validate().is_ok());
+    let mut agent = Agent::try_new(cfg).expect("rate_backend override should bypass legacy zpaq");
+    let action = agent.get_planned_action(&[0], 0, 0);
+    assert!(action < 2);
+}
+
+#[test]
+fn agent_config_rejects_zpaq_rate_backend_in_strict_mode() {
+    let cfg = generic_agent_config(RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![MixtureExpertSpec {
+                name: Some("bad-zpaq".to_string()),
+                log_prior: 0.0,
+                max_order: -1,
+                backend: RateBackend::Zpaq {
+                    method: "1".to_string(),
+                },
+            }],
+        )),
+    });
+    let err = cfg
+        .validate()
+        .expect_err("zpaq-backed generic MC-AIXI should be rejected");
+    assert!(err.contains("paper-correct action conditioning"));
+    assert!(err.contains("zpaq"));
+}
+
+#[test]
+fn agent_config_rejects_invalid_programmatic_mixture_rate_backend() {
+    let cfg = generic_agent_config(RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(MixtureKind::Bayes, vec![])),
+    });
+    let err = cfg
+        .validate()
+        .expect_err("empty mixture backend should be rejected");
+    assert!(err.contains("invalid rate_backend"));
+    assert!(err.contains("must include at least one expert"));
+}
+
+#[test]
+fn agent_config_rejects_programmatic_mixture_nesting_overflow() {
+    let cfg = generic_agent_config(deeply_nested_bayes_backend(MAX_MIXTURE_NESTING + 1));
+    let err = cfg
+        .validate()
+        .expect_err("overly deep nested mixture should be rejected");
+    assert!(err.contains("invalid rate_backend"));
+    assert!(err.contains("nesting too deep"));
+}
+
+#[test]
+fn agent_with_generic_mixture_backends_smoke_runs() {
+    for (kind, label) in [
+        (MixtureKind::Bayes, "bayes"),
+        (MixtureKind::Switching, "switching"),
+        (MixtureKind::Convex, "convex"),
+    ] {
+        let mut agent =
+            Agent::try_new(generic_agent_config(mixture_backend(kind))).expect("valid mixture");
+        let total_reward = run_agent_env(&mut agent, CtwTest::new(), 48);
+        assert!(
+            total_reward > 16.0,
+            "{label} mixture backend reward too low on CtwTest: {total_reward}"
+        );
     }
 }

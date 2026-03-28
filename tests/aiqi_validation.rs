@@ -1,9 +1,10 @@
 //! AIQI validation tests.
 
-use infotheory::RateBackend;
 use infotheory::aixi::aiqi::{AiqiAgent, AiqiConfig};
 use infotheory::aixi::environment::{CoinFlip, CtwTest, Environment};
 use infotheory::aixi::model::RateBackendBitPredictor;
+use infotheory::{MixtureKind, MixtureSpec, RateBackend};
+use std::sync::Arc;
 
 fn base_config() -> AiqiConfig {
     AiqiConfig {
@@ -38,6 +39,16 @@ fn aiqi_config_rejects_period_shorter_than_horizon() {
     cfg.augmentation_period = 2;
     let err = cfg.validate().expect_err("N < H must be rejected");
     assert!(err.contains("augmentation_period"));
+}
+
+#[test]
+fn aiqi_config_rejects_non_power_of_two_return_bins() {
+    let mut cfg = base_config();
+    cfg.return_bins = 3;
+    let err = cfg
+        .validate()
+        .expect_err("non-power-of-two return_bins must be rejected");
+    assert!(err.contains("power of two"));
 }
 
 #[test]
@@ -84,6 +95,19 @@ fn aiqi_config_rejects_zpaq_rate_backend_in_strict_mode() {
         .validate()
         .expect_err("strict AIQI should reject zpaq rate backend");
     assert!(err.contains("strict frozen conditioning"));
+}
+
+#[test]
+fn aiqi_config_rejects_invalid_programmatic_mixture_rate_backend() {
+    let mut cfg = base_config();
+    cfg.rate_backend = Some(RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(MixtureKind::Bayes, vec![])),
+    });
+    let err = cfg
+        .validate()
+        .expect_err("empty mixture backend should be rejected");
+    assert!(err.contains("invalid rate_backend"));
+    assert!(err.contains("must include at least one expert"));
 }
 
 #[test]
@@ -147,6 +171,28 @@ fn aiqi_with_generic_rate_backend_smoke_runs() {
         confidence_scale: 1.0,
     });
     cfg.rate_backend_max_order = 8;
+
+    let mut agent = AiqiAgent::new(cfg).expect("valid AIQI config");
+    let mut env = CoinFlip::new(0.7);
+
+    for _ in 0..24 {
+        let action = agent.get_planned_action();
+        env.perform_action(action);
+        let obs_stream = env.drain_observations();
+        let rew = env.get_reward();
+        agent
+            .observe_transition(action, &obs_stream, rew)
+            .expect("transition must be accepted");
+    }
+
+    assert!(agent.steps_observed() >= 24);
+}
+
+#[test]
+fn aiqi_with_rosa_generic_planner_smoke_runs() {
+    let mut cfg = base_config();
+    cfg.algorithm = "rosa".to_string();
+    cfg.rosa_max_order = Some(8);
 
     let mut agent = AiqiAgent::new(cfg).expect("valid AIQI config");
     let mut env = CoinFlip::new(0.7);

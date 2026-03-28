@@ -1,9 +1,9 @@
 use infotheory::{
-    CompressionBackend, GenerationConfig, InfotheoryCtx, RateBackend, RateBackendSession,
-    biased_entropy_rate_backend, biased_entropy_rate_bytes, conditional_entropy_bytes,
-    conditional_entropy_rate_bytes, cross_entropy_bytes, cross_entropy_rate_backend,
-    cross_entropy_rate_bytes, d_kl_bytes, entropy_rate_backend, entropy_rate_bytes,
-    get_default_ctx, intrinsic_dependence_bytes, joint_entropy_rate_backend,
+    CompressionBackend, GenerationConfig, InfotheoryCtx, MixtureKind, MixtureSpec, RateBackend,
+    RateBackendSession, biased_entropy_rate_backend, biased_entropy_rate_bytes,
+    conditional_entropy_bytes, conditional_entropy_rate_bytes, cross_entropy_bytes,
+    cross_entropy_rate_backend, cross_entropy_rate_bytes, d_kl_bytes, entropy_rate_backend,
+    entropy_rate_bytes, get_default_ctx, intrinsic_dependence_bytes, joint_entropy_rate_backend,
     joint_entropy_rate_bytes, joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes,
     mutual_information_bytes, mutual_information_marg_bytes, mutual_information_rate_backend,
     mutual_information_rate_bytes, ned_bytes, ned_cons_bytes, ned_cons_marg_bytes,
@@ -28,6 +28,7 @@ use infotheory::{
 use std::fs;
 #[cfg(feature = "backend-zpaq")]
 use std::path::PathBuf;
+use std::sync::Arc;
 #[cfg(feature = "backend-zpaq")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -111,6 +112,18 @@ fn api_surface_generation_session_and_config_are_callable() {
     session.finish().expect("session finish");
 
     assert_eq!(from_session, direct);
+}
+
+#[test]
+fn api_surface_rate_backend_session_rejects_invalid_programmatic_mixture() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(MixtureKind::Bayes, vec![])),
+    };
+    let err = match RateBackendSession::from_backend(backend, -1, None) {
+        Ok(_) => panic!("invalid mixture backend should be rejected before runtime construction"),
+        Err(err) => err,
+    };
+    assert!(err.contains("must include at least one expert"));
 }
 
 #[cfg(all(feature = "backend-zpaq", not(target_env = "musl")))]

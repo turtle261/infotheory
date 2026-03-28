@@ -93,11 +93,9 @@ fn mamba_cfg() -> mamba1::Config {
 }
 
 fn two_json_backend() -> RateBackend {
-    let spec = MixtureSpec {
-        kind: MixtureKind::Neural,
-        alpha: 0.03,
-        decay: None,
-        experts: vec![
+    let spec = MixtureSpec::new(
+        MixtureKind::Neural,
+        vec![
             MixtureExpertSpec {
                 name: Some("ctw".to_string()),
                 log_prior: 0.0,
@@ -126,7 +124,8 @@ fn two_json_backend() -> RateBackend {
                 },
             },
         ],
-    };
+    )
+    .with_alpha(0.03);
     RateBackend::Mixture {
         spec: Arc::new(spec),
     }

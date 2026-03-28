@@ -5,6 +5,7 @@
 //! provide different complexity vs performance trade-offs.
 
 use crate::RateBackend;
+use crate::aixi::rate_backend::rate_backend_contains_zpaq;
 use crate::ctw::{ContextTree, FacContextTree};
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip::{Compressor as MambaCompressor, Model as MambaModel, State as MambaState};
@@ -25,10 +26,22 @@ pub trait Predictor: Send {
     /// Incorporates a new symbol into the model's training history.
     fn update(&mut self, sym: bool);
 
+    /// Incorporates a new symbol as committed training history without
+    /// retaining rollback state when the predictor supports that optimization.
+    fn commit_update(&mut self, sym: bool) {
+        self.update(sym);
+    }
+
     /// Appends a symbol to the model's interaction history without necessarily
     /// updating the training counts immediately (backend dependent).
     fn update_history(&mut self, sym: bool) {
         self.update(sym);
+    }
+
+    /// Appends a symbol as committed interaction history without retaining
+    /// rollback state when the predictor supports that optimization.
+    fn commit_update_history(&mut self, sym: bool) {
+        self.update_history(sym);
     }
 
     /// Reverts the model to its state before the last `update`.
@@ -37,6 +50,20 @@ pub trait Predictor: Send {
     /// Reverts the model to its state before the last `update_history`.
     fn pop_history(&mut self) {
         self.revert();
+    }
+
+    /// Begins an optional coarse rollback scope for simulation-heavy callers.
+    ///
+    /// Predictors that support this can avoid retaining per-symbol rollback state
+    /// until the matching `rollback_scope` call.
+    fn begin_rollback_scope(&mut self) {}
+
+    /// Rolls back to the last scope opened with `begin_rollback_scope`.
+    ///
+    /// Returns `true` when a scope rollback was performed, allowing callers to skip
+    /// per-symbol revert loops.
+    fn rollback_scope(&mut self) -> bool {
+        false
     }
 
     /// Predicts the probability of the next symbol being `sym`.
@@ -52,6 +79,47 @@ pub trait Predictor: Send {
 
     /// Creates a boxed clone of this predictor.
     fn boxed_clone(&self) -> Box<dyn Predictor>;
+}
+
+#[inline]
+fn binary_prob_floor(min_prob: f64) -> f64 {
+    if min_prob.is_finite() {
+        min_prob.clamp(1e-12, 0.499_999_999_999)
+    } else {
+        1e-12
+    }
+}
+
+#[inline]
+fn normalized_binary_prob_pair_from_probs(p0: f64, p1: f64, min_prob: f64) -> (f64, f64) {
+    let p0 = if p0.is_finite() && p0 > 0.0 { p0 } else { 0.0 };
+    let p1 = if p1.is_finite() && p1 > 0.0 { p1 } else { 0.0 };
+    let sum = p0 + p1;
+    if !sum.is_finite() || sum <= 0.0 {
+        return (0.5, 0.5);
+    }
+    let floor = binary_prob_floor(min_prob);
+    let q1 = (p1 / sum).clamp(floor, 1.0 - floor);
+    (1.0 - q1, q1)
+}
+
+#[inline]
+fn normalized_binary_prob_pair_from_log_probs(logp0: f64, logp1: f64, min_prob: f64) -> (f64, f64) {
+    let max_log = logp0.max(logp1);
+    if !max_log.is_finite() {
+        return (0.5, 0.5);
+    }
+    let p0 = if logp0.is_finite() {
+        (logp0 - max_log).exp()
+    } else {
+        0.0
+    };
+    let p1 = if logp1.is_finite() {
+        (logp1 - max_log).exp()
+    } else {
+        0.0
+    };
+    normalized_binary_prob_pair_from_probs(p0, p1, min_prob)
 }
 
 /// A predictor using the Action-Conditional CTW algorithm.
@@ -213,10 +281,12 @@ impl Predictor for RosaPredictor {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let p0 = self.model.prob_for_last(0);
-        let p1 = self.model.prob_for_last(1);
-        let denom = (p0 + p1).max(1e-12);
-        if sym { p1 / denom } else { p0 / denom }
+        let (p0, p1) = normalized_binary_prob_pair_from_probs(
+            self.model.prob_for_last(0),
+            self.model.prob_for_last(1),
+            DEFAULT_MIN_PROB,
+        );
+        if sym { p1 } else { p0 }
     }
 
     fn model_name(&self) -> String {
@@ -270,6 +340,28 @@ impl ZpaqPredictor {
         }
         tmp.log_prob(symbol)
     }
+
+    fn binary_log_prob_pair(&mut self, preferred_symbol: u8) -> (f64, f64) {
+        let other_symbol = preferred_symbol ^ 1;
+        let preferred_logp = match self.pending {
+            Some((pending, logp)) if pending == preferred_symbol => logp,
+            Some(_) => self.log_prob_from_history(preferred_symbol),
+            None => {
+                let logp = self.model.log_prob(preferred_symbol);
+                self.pending = Some((preferred_symbol, logp));
+                logp
+            }
+        };
+        let other_logp = match self.pending {
+            Some((pending, logp)) if pending == other_symbol => logp,
+            _ => self.log_prob_from_history(other_symbol),
+        };
+        if preferred_symbol == 0 {
+            (preferred_logp, other_logp)
+        } else {
+            (other_logp, preferred_logp)
+        }
+    }
 }
 
 impl Predictor for ZpaqPredictor {
@@ -297,16 +389,10 @@ impl Predictor for ZpaqPredictor {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let byte = if sym { 1u8 } else { 0u8 };
-        if let Some((pending, logp)) = self.pending {
-            if pending == byte {
-                return logp.exp();
-            }
-            return self.log_prob_from_history(byte).exp();
-        }
-        let logp = self.model.log_prob(byte);
-        self.pending = Some((byte, logp));
-        logp.exp()
+        let preferred_symbol = if sym { 1u8 } else { 0u8 };
+        let (logp0, logp1) = self.binary_log_prob_pair(preferred_symbol);
+        let (p0, p1) = normalized_binary_prob_pair_from_log_probs(logp0, logp1, self.min_prob);
+        if sym { p1 } else { p0 }
     }
 
     fn model_name(&self) -> String {
@@ -334,6 +420,26 @@ pub struct RateBackendBitPredictor {
     max_order: i64,
     min_prob: f64,
     predictor: RateBackendPredictor,
+    journal: Vec<RateBackendJournalEntry>,
+    rollback_scopes: Vec<RateBackendRollbackScope>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RateBackendJournalKind {
+    Update,
+    FrozenUpdate,
+}
+
+#[derive(Clone)]
+struct RateBackendJournalEntry {
+    kind: RateBackendJournalKind,
+    predictor: RateBackendPredictor,
+}
+
+#[derive(Clone)]
+struct RateBackendRollbackScope {
+    predictor: RateBackendPredictor,
+    journal_len: usize,
 }
 
 impl RateBackendBitPredictor {
@@ -364,6 +470,8 @@ impl RateBackendBitPredictor {
             max_order,
             min_prob,
             predictor,
+            journal: Vec::new(),
+            rollback_scopes: Vec::new(),
         })
     }
 
@@ -378,50 +486,92 @@ impl RateBackendBitPredictor {
             max_order: self.max_order,
             min_prob: self.min_prob,
             predictor: self.predictor.clone(),
+            journal: self.journal.clone(),
+            rollback_scopes: self.rollback_scopes.clone(),
         }
     }
-}
 
-fn rate_backend_contains_zpaq(backend: &RateBackend) -> bool {
-    match backend {
-        RateBackend::Zpaq { .. } => true,
-        RateBackend::Mixture { spec } => spec
-            .experts
-            .iter()
-            .any(|expert| rate_backend_contains_zpaq(&expert.backend)),
-        RateBackend::Calibrated { spec } => rate_backend_contains_zpaq(&spec.base),
-        _ => false,
+    fn checkpoint(&self, kind: RateBackendJournalKind) -> RateBackendJournalEntry {
+        RateBackendJournalEntry {
+            kind,
+            predictor: self.predictor.clone(),
+        }
+    }
+
+    fn restore_last(&mut self, expected_kind: RateBackendJournalKind) {
+        assert!(
+            self.rollback_scopes.is_empty(),
+            "RateBackendBitPredictor per-symbol rollback inside active scope is unsupported"
+        );
+        let entry = self
+            .journal
+            .pop()
+            .expect("RateBackendBitPredictor rollback underflow");
+        assert_eq!(
+            entry.kind, expected_kind,
+            "RateBackendBitPredictor rollback kind mismatch: expected {expected_kind:?}, got {:?}",
+            entry.kind
+        );
+        self.predictor = entry.predictor;
     }
 }
 
 impl Predictor for RateBackendBitPredictor {
     fn update(&mut self, sym: bool) {
+        if self.rollback_scopes.is_empty() {
+            self.journal
+                .push(self.checkpoint(RateBackendJournalKind::Update));
+        }
+        self.predictor.update(Self::bit_to_byte(sym));
+    }
+
+    fn commit_update(&mut self, sym: bool) {
         self.predictor.update(Self::bit_to_byte(sym));
     }
 
     fn update_history(&mut self, sym: bool) {
+        if self.rollback_scopes.is_empty() {
+            self.journal
+                .push(self.checkpoint(RateBackendJournalKind::FrozenUpdate));
+        }
+        self.predictor.update_frozen(Self::bit_to_byte(sym));
+    }
+
+    fn commit_update_history(&mut self, sym: bool) {
         self.predictor.update_frozen(Self::bit_to_byte(sym));
     }
 
     fn revert(&mut self) {
-        panic!(
-            "RateBackendBitPredictor does not support generic rollback; callers must use cloned temporary predictors"
-        );
+        self.restore_last(RateBackendJournalKind::Update);
     }
 
     fn pop_history(&mut self) {
-        panic!(
-            "RateBackendBitPredictor does not support generic rollback; callers must use cloned temporary predictors"
-        );
+        self.restore_last(RateBackendJournalKind::FrozenUpdate);
+    }
+
+    fn begin_rollback_scope(&mut self) {
+        self.rollback_scopes.push(RateBackendRollbackScope {
+            predictor: self.predictor.clone(),
+            journal_len: self.journal.len(),
+        });
+    }
+
+    fn rollback_scope(&mut self) -> bool {
+        let Some(scope) = self.rollback_scopes.pop() else {
+            return false;
+        };
+        self.predictor = scope.predictor;
+        self.journal.truncate(scope.journal_len);
+        true
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let p = self.predictor.log_prob(Self::bit_to_byte(sym)).exp();
-        if p.is_finite() {
-            p.clamp(self.min_prob, 1.0 - self.min_prob)
-        } else {
-            0.5
-        }
+        let (p0, p1) = normalized_binary_prob_pair_from_log_probs(
+            self.predictor.log_prob(0),
+            self.predictor.log_prob(1),
+            self.min_prob,
+        );
+        if sym { p1 } else { p0 }
     }
 
     fn model_name(&self) -> String {
@@ -506,9 +656,12 @@ impl Predictor for RwkvPredictor {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let idx = if sym { 1 } else { 0 };
-        // pdf_buffer contains probabilities
-        self.compressor.pdf_buffer[idx]
+        let (p0, p1) = normalized_binary_prob_pair_from_probs(
+            self.compressor.pdf_buffer[0],
+            self.compressor.pdf_buffer[1],
+            DEFAULT_MIN_PROB,
+        );
+        if sym { p1 } else { p0 }
     }
 
     fn model_name(&self) -> String {
@@ -592,8 +745,12 @@ impl Predictor for MambaPredictor {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let idx = if sym { 1 } else { 0 };
-        self.compressor.pdf_buffer[idx]
+        let (p0, p1) = normalized_binary_prob_pair_from_probs(
+            self.compressor.pdf_buffer[0],
+            self.compressor.pdf_buffer[1],
+            DEFAULT_MIN_PROB,
+        );
+        if sym { p1 } else { p0 }
     }
 
     fn model_name(&self) -> String {
@@ -605,5 +762,250 @@ impl Predictor for MambaPredictor {
             compressor: self.compressor.clone(),
             history: self.history.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: f64, b: f64) {
+        let diff = (a - b).abs();
+        assert!(
+            diff <= 1e-12,
+            "expected probabilities to match exactly enough: left={a} right={b} diff={diff}"
+        );
+    }
+
+    fn assert_binary_predictor_normalizes(mut predictor: Box<dyn Predictor>, label: &str) {
+        for (step, &bit) in [false, true, true, false, true, false].iter().enumerate() {
+            let p0 = predictor.predict_prob(false);
+            let p1 = predictor.predict_prob(true);
+            let sum = p0 + p1;
+            assert!(
+                (sum - 1.0).abs() < 1e-12,
+                "{label}: probabilities must sum to 1 at step {step}, got p0={p0}, p1={p1}, sum={sum}",
+            );
+            assert!(
+                (0.0..=1.0).contains(&p0) && (0.0..=1.0).contains(&p1),
+                "{label}: probabilities must stay in [0,1] at step {step}, got p0={p0}, p1={p1}",
+            );
+            predictor.commit_update(bit);
+        }
+    }
+
+    fn predictor_signature(
+        mut predictor: RateBackendBitPredictor,
+        probe: &[bool],
+    ) -> Vec<(f64, f64)> {
+        let mut signature = Vec::with_capacity(probe.len());
+        for &bit in probe {
+            signature.push((predictor.predict_prob(false), predictor.predict_prob(true)));
+            predictor.commit_update(bit);
+        }
+        signature
+    }
+
+    #[test]
+    fn committed_rate_backend_updates_do_not_grow_journal() {
+        let mut predictor = RateBackendBitPredictor::new(RateBackend::RosaPlus, 8)
+            .expect("rate backend predictor should initialize");
+
+        for idx in 0..512usize {
+            predictor.commit_update((idx & 1) == 0);
+            predictor.commit_update_history((idx % 3) == 0);
+        }
+
+        assert!(
+            predictor.journal.is_empty(),
+            "committed history should not retain rollback snapshots"
+        );
+    }
+
+    #[test]
+    fn reversible_rate_backend_update_paths_round_trip_exactly() {
+        let mut predictor = RateBackendBitPredictor::new(RateBackend::RosaPlus, 8)
+            .expect("rate backend predictor should initialize");
+        for &bit in &[true, false, true, true, false, false, true] {
+            predictor.commit_update(bit);
+        }
+
+        let baseline_after_train = predictor.clone_state();
+        predictor.update(true);
+        predictor.update(false);
+        predictor.revert();
+        predictor.revert();
+        assert_eq!(predictor.journal.len(), baseline_after_train.journal.len());
+
+        let train_probe = [true, false, false, true, true, false];
+        let got = predictor_signature(predictor.clone_state(), &train_probe);
+        let want = predictor_signature(baseline_after_train.clone_state(), &train_probe);
+        for ((got0, got1), (want0, want1)) in got.into_iter().zip(want.into_iter()) {
+            approx_eq(got0, want0);
+            approx_eq(got1, want1);
+        }
+
+        let baseline_after_history = baseline_after_train.clone_state();
+        predictor.update_history(false);
+        predictor.update_history(true);
+        predictor.pop_history();
+        predictor.pop_history();
+        assert_eq!(
+            predictor.journal.len(),
+            baseline_after_history.journal.len()
+        );
+
+        let history_probe = [false, true, true, false, false, true];
+        let got = predictor_signature(predictor.clone_state(), &history_probe);
+        let want = predictor_signature(baseline_after_history, &history_probe);
+        for ((got0, got1), (want0, want1)) in got.into_iter().zip(want.into_iter()) {
+            approx_eq(got0, want0);
+            approx_eq(got1, want1);
+        }
+    }
+
+    #[test]
+    fn long_committed_history_does_not_contaminate_clone_rollback_state() {
+        let mut predictor = RateBackendBitPredictor::new(RateBackend::RosaPlus, 8)
+            .expect("rate backend predictor should initialize");
+
+        for idx in 0..2048usize {
+            predictor.commit_update((idx & 7) < 3);
+            predictor.commit_update_history((idx % 5) < 2);
+        }
+        assert!(predictor.journal.is_empty());
+
+        let mut cloned = predictor.clone_state();
+        assert!(
+            cloned.journal.is_empty(),
+            "clone state should only carry active reversible rollback depth"
+        );
+
+        let baseline = predictor_signature(predictor.clone_state(), &[true, false, true, false]);
+        cloned.update(true);
+        cloned.revert();
+        cloned.update_history(false);
+        cloned.pop_history();
+        assert!(cloned.journal.is_empty());
+
+        let after_round_trip = predictor_signature(cloned, &[true, false, true, false]);
+        for ((got0, got1), (want0, want1)) in after_round_trip.into_iter().zip(baseline.into_iter())
+        {
+            approx_eq(got0, want0);
+            approx_eq(got1, want1);
+        }
+    }
+
+    #[test]
+    fn rollback_scope_restores_simulation_state_without_growing_journal() {
+        let mut predictor = RateBackendBitPredictor::new(RateBackend::RosaPlus, 8)
+            .expect("rate backend predictor should initialize");
+        for &bit in &[true, false, true, false, true] {
+            predictor.commit_update(bit);
+        }
+
+        let baseline = predictor_signature(predictor.clone_state(), &[true, true, false, false]);
+        predictor.begin_rollback_scope();
+        for idx in 0..512usize {
+            predictor.update((idx & 1) == 0);
+            predictor.update_history((idx % 3) == 0);
+        }
+        assert!(
+            predictor.journal.is_empty(),
+            "scoped reversible updates should not retain per-bit snapshots"
+        );
+        assert!(predictor.rollback_scope(), "scope rollback should succeed");
+        assert!(predictor.journal.is_empty());
+
+        let after = predictor_signature(predictor, &[true, true, false, false]);
+        for ((got0, got1), (want0, want1)) in after.into_iter().zip(baseline.into_iter()) {
+            approx_eq(got0, want0);
+            approx_eq(got1, want1);
+        }
+    }
+
+    #[test]
+    fn cloned_predictor_carries_only_active_scope_snapshots() {
+        let mut predictor = RateBackendBitPredictor::new(RateBackend::RosaPlus, 8)
+            .expect("rate backend predictor should initialize");
+        for idx in 0..1024usize {
+            predictor.commit_update((idx & 3) == 0);
+        }
+
+        predictor.begin_rollback_scope();
+        for idx in 0..256usize {
+            predictor.update((idx & 1) == 0);
+        }
+        let cloned = predictor.clone_state();
+        assert!(
+            cloned.journal.is_empty(),
+            "scoped reversible updates should not leak per-bit journal state into clones"
+        );
+        assert_eq!(cloned.rollback_scopes.len(), 1);
+    }
+
+    #[test]
+    fn generic_rate_backend_bit_predictors_normalize_binary_mass() {
+        assert_binary_predictor_normalizes(
+            Box::new(
+                RateBackendBitPredictor::new(RateBackend::RosaPlus, 8)
+                    .expect("generic rosa predictor"),
+            ),
+            "generic-rosa",
+        );
+        assert_binary_predictor_normalizes(
+            Box::new(
+                RateBackendBitPredictor::new(
+                    RateBackend::Ppmd {
+                        order: 4,
+                        memory_mb: 8,
+                    },
+                    8,
+                )
+                .expect("generic ppmd predictor"),
+            ),
+            "generic-ppmd",
+        );
+        assert_binary_predictor_normalizes(
+            Box::new(
+                RateBackendBitPredictor::new(
+                    RateBackend::Match {
+                        hash_bits: 16,
+                        min_len: 2,
+                        max_len: 32,
+                        base_mix: 0.05,
+                        confidence_scale: 1.0,
+                    },
+                    8,
+                )
+                .expect("generic match predictor"),
+            ),
+            "generic-match",
+        );
+    }
+
+    #[cfg(feature = "backend-zpaq")]
+    #[test]
+    fn zpaq_predictor_normalizes_binary_mass() {
+        assert_binary_predictor_normalizes(
+            Box::new(ZpaqPredictor::new("1".to_string(), DEFAULT_MIN_PROB)),
+            "zpaq",
+        );
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn rwkv_predictor_normalizes_binary_mass() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
+        let predictor = RwkvPredictor::from_method(method).expect("rwkv predictor");
+        assert_binary_predictor_normalizes(Box::new(predictor), "rwkv");
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn mamba_predictor_normalizes_binary_mass() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
+        let predictor = MambaPredictor::from_method(method).expect("mamba predictor");
+        assert_binary_predictor_normalizes(Box::new(predictor), "mamba");
     }
 }

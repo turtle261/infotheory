@@ -21,13 +21,20 @@ Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent descr
 
 You can use a trained neural model (Mamba-1 or RWKV7) as a rate backend ("world model") for MC-AIXI.
 
+- `planner: "mc-aixi"` keeps the classic MCTS planner path.
+- MC-AIXI now accepts the shared generic `rate_backend` override, including nested mixtures.
+- **Paper-facing mixture families**: `Bayes` and `Convex` are exposed directly, and `Switching` follows the paper's fixed-share update with a constant switch-rate `alpha`.
+- **Extensions**: `FadingBayes`, `Mdl`, and `Neural` remain available.
+- **Strict generic-path exclusion**: recursive `zpaq` backends are rejected for MC-AIXI `rate_backend` because they do not provide paper-correct reversible action conditioning. Legacy standalone `algorithm: "zpaq"` remains a separate non-strict path.
+- **Paper-correct UCB tie-breaking**: MC-AIXI chooses uniformly at random among unvisited actions and among exactly tied maximal UCB actions.
+
 ### 4. Integrated AIQI Agent
 The repository also includes **AIQI (Universal AI with Q-Induction)**: a model-free return-prediction agent with periodic augmentation (`N >= H`) and discretized H-step return targets.
 
 - `planner: "aiqi"` enables AIQI in `infotheory aixi <config.json>`.
 - `planner: "mc-aixi"` (default) keeps the existing MC-AIXI path.
 - **Paper path**: `algorithm: "ac-ctw"` (or `"ctw"`) is the literal AIQI-CTW path from the paper.
-- **Extensions**: AIQI also supports `fac-ctw`, `rosa`, `rwkv`, and generic `rate_backend` predictors.
+- **Extensions**: AIQI also supports `fac-ctw`, `rosa`, `rwkv`, and generic `rate_backend` predictors, including shared mixture specs.
 - **Intentional exclusion**: `zpaq` is not supported for AIQI because strict frozen conditioning is required.
 - **Strict paper-domain validation**: AIQI enforces `discount_gamma in (0,1)` and `baseline_exploration (tau) in (0,1]`.
 - **Tie-breaking**: greedy action selection uses a fixed tie-break rule (first maximizing action) to match paper assumptions.
@@ -219,7 +226,7 @@ Planner switch in config:
 }
 ```
 
-Optional generic backend override (uses the shared RateBackend parser; `zpaq` is intentionally rejected for AIQI):
+Optional generic backend override for MC-AIXI or AIQI (uses the shared RateBackend parser; recursive `zpaq` is intentionally rejected on the strict generic planner paths):
 
 ```json
 {
@@ -228,6 +235,27 @@ Optional generic backend override (uses the shared RateBackend parser; `zpaq` is
     "name": "ppmd",
     "order": 10,
     "memory_mb": 64
+  },
+  "rate_backend_max_order": 8
+}
+```
+
+Example MC-AIXI convex mixture override:
+
+```json
+{
+  "planner": "mc-aixi",
+  "algorithm": "fac-ctw",
+  "rate_backend": {
+    "name": "mixture",
+    "spec": {
+      "kind": "convex",
+      "alpha": 1.25,
+      "experts": [
+        {"name": "ctw", "kind": "ctw", "depth": 8},
+        {"name": "ppmd", "kind": "ppmd", "order": 8, "memory_mb": 16}
+      ]
+    }
   },
   "rate_backend_max_order": 8
 }
@@ -254,7 +282,7 @@ Reproducible competitor benchmark (Infotheory Rust/Python vs PyAIXI + C++ MC-AIX
 Benchmark correctness notes:
 - Stochastic environments are seeded from `random_seed` (or `rng_seed`) in CLI and Python run loops for reproducible trajectories.
 - Reward reporting is normalized to native domain scale in competitor reports (for example Kuhn offset removal for C++/PyAIXI), so cross-implementation reward means are apples-to-apples.
-- MC-AIXI tree search uses reference-style UCB scaling while preserving reward-sensitive chance-node reuse for generic environment correctness.
+- MC-AIXI tree search uses reference-style UCB scaling, paper-correct uniform tie-breaking among maximal UCB actions, and reward-sensitive chance-node reuse for generic environment correctness.
 
 VM config highlights:
 - **Environment**: Use `"environment": "nyx-vm"` or `"vm"` (requires `vm` feature).

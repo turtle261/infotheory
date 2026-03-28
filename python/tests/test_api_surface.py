@@ -35,6 +35,7 @@ def test_expected_public_surface_symbols_present():
         "GenerationConfig",
         "RateBackendSession",
         "MixtureKind",
+        "MixtureScheduleMode",
         "MixtureExpertSpec",
         "MixtureSpec",
         "ParticleSpec",
@@ -212,12 +213,18 @@ def test_bit_and_observation_helpers():
     assert isinstance(ait.observation_repr_from_stream("last", stream, 8), list)
 
 
+def test_invalid_programmatic_mixture_spec_raises_value_error():
+    with pytest.raises(ValueError, match="must include at least one expert"):
+        ait.MixtureSpec(ait.MixtureKind.Bayes, [], alpha=0.01)
+
+
 def test_new_rate_backends_parse_and_execute(tmp_path):
     mixture_path = tmp_path / "mixture.json"
     mixture_path.write_text(
         json.dumps(
             {
-                "kind": "bayes",
+                "kind": "convex",
+                "schedule": "theorem",
                 "experts": [
                     {"name": "match-expert", "kind": "match"},
                     {"name": "ctw-expert", "kind": "ctw", "depth": 8},
@@ -253,13 +260,14 @@ def test_new_rate_backends_parse_and_execute(tmp_path):
 
     particle_spec = ait.ParticleSpec(num_particles=4, num_cells=4, cell_dim=8)
     mixture_spec = ait.MixtureSpec(
-        ait.MixtureKind.Bayes,
+        ait.MixtureKind.Convex,
         [
             ait.MixtureExpertSpec(
                 ait.RateBackend.match(), max_order=-1, log_prior=0.0, name="match"
             )
         ],
         alpha=0.02,
+        schedule=ait.MixtureScheduleMode.Theorem,
     )
     constructed_backends = [
         ait.RateBackend.match(hash_bits=18, min_len=3, max_len=96),

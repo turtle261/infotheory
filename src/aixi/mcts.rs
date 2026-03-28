@@ -101,6 +101,9 @@ pub trait AgentSimulator: Send {
     /// Generates a simulated percept and updates the model state.
     fn gen_percept_and_update(&mut self, bits: usize) -> u64;
 
+    /// Marks the start of a new simulation rollout.
+    fn begin_simulation(&mut self) {}
+
     /// Reverts the model state to a previous point in the simulation.
     fn model_revert(&mut self, steps: usize);
 
@@ -343,7 +346,8 @@ impl SearchNode {
             let c = agent.get_explore_exploit_ratio().max(0.0);
             let explore_bias = (agent.horizon() as f64) * (agent.max_reward() as f64).max(0.0);
             let mut best_val = -f64::INFINITY;
-            let mut best_action = 0;
+            let mut best_action = None;
+            let mut num_maximal_actions = 0usize;
             let log_visits = (self.visits as f64).ln().max(0.0);
             for (a, child) in self.action_children.iter().enumerate() {
                 let Some(child) = child.as_ref() else {
@@ -351,13 +355,28 @@ impl SearchNode {
                 };
                 let nvisits = child.visits as f64;
                 let val = child.expectation() + explore_bias * ((c * log_visits) / nvisits).sqrt();
-                // Keep random tie-break behavior from reference implementations.
-                if val > best_val + agent.gen_f64() * 0.001 {
-                    best_val = val;
-                    best_action = a as u64;
+                debug_assert!(
+                    val.is_finite(),
+                    "UCB score must be finite for visited MC-AIXI action children"
+                );
+                match val.total_cmp(&best_val) {
+                    std::cmp::Ordering::Greater => {
+                        best_val = val;
+                        best_action = Some(a as u64);
+                        num_maximal_actions = 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        num_maximal_actions += 1;
+                        // Paper-correct tie-break: choose uniformly among maximal actions.
+                        // Reservoir sampling keeps this O(1) in memory without a tie list.
+                        if agent.gen_range(num_maximal_actions) == 0 {
+                            best_action = Some(a as u64);
+                        }
+                    }
+                    std::cmp::Ordering::Less => {}
                 }
             }
-            action = best_action;
+            action = best_action.expect("visited MC-AIXI node must have a maximal action");
         }
 
         agent.model_update_action(action as Action);
@@ -454,6 +473,7 @@ impl SearchTree {
         let threads = rayon::current_num_threads().max(1);
         if samples < 2 || threads < 2 {
             for _ in 0..samples {
+                agent.begin_simulation();
                 root.sample(agent, h, h);
             }
             return root.best_action(agent);
@@ -477,6 +497,7 @@ impl SearchTree {
                 let mut local_root = snapshot.clone();
                 let iterations = base + usize::from(i < extra);
                 for _ in 0..iterations {
+                    local_agent.begin_simulation();
                     local_root.sample(local_agent.as_mut(), h, h);
                 }
                 local_root
@@ -537,6 +558,10 @@ impl Default for SearchTree {
 mod tests {
     use super::*;
     use crate::aixi::common::ObservationKeyMode;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[derive(Clone)]
     struct DummyAgent {
@@ -706,5 +731,178 @@ mod tests {
         assert!(!root.is_chance_node);
         assert_eq!(root.visits, 0);
         assert_eq!(root.mean, 0.0);
+    }
+
+    #[derive(Clone)]
+    struct BeginCountingAgent {
+        begins: Arc<AtomicUsize>,
+    }
+
+    impl AgentSimulator for BeginCountingAgent {
+        fn get_num_actions(&self) -> usize {
+            2
+        }
+
+        fn get_num_observation_bits(&self) -> usize {
+            1
+        }
+
+        fn get_num_reward_bits(&self) -> usize {
+            1
+        }
+
+        fn horizon(&self) -> usize {
+            1
+        }
+
+        fn max_reward(&self) -> Reward {
+            1
+        }
+
+        fn min_reward(&self) -> Reward {
+            0
+        }
+
+        fn model_update_action(&mut self, _action: Action) {}
+
+        fn gen_percept_and_update(&mut self, _bits: usize) -> u64 {
+            0
+        }
+
+        fn begin_simulation(&mut self) {
+            self.begins.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn model_revert(&mut self, _steps: usize) {}
+
+        fn gen_range(&mut self, _end: usize) -> usize {
+            0
+        }
+
+        fn gen_f64(&mut self) -> f64 {
+            0.0
+        }
+
+        fn boxed_clone_with_seed(&self, _seed: u64) -> Box<dyn AgentSimulator> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn search_calls_begin_simulation_for_each_rollout() {
+        let begins = Arc::new(AtomicUsize::new(0));
+        let mut agent = BeginCountingAgent {
+            begins: begins.clone(),
+        };
+        let mut tree = SearchTree::new();
+
+        let _ = tree.search(&mut agent, &[0], 0, 0, 5);
+        assert_eq!(begins.load(Ordering::Relaxed), 5);
+    }
+
+    #[derive(Clone)]
+    struct TieBreakAgent {
+        next_range: Arc<AtomicUsize>,
+    }
+
+    impl AgentSimulator for TieBreakAgent {
+        fn get_num_actions(&self) -> usize {
+            4
+        }
+
+        fn get_num_observation_bits(&self) -> usize {
+            1
+        }
+
+        fn get_num_reward_bits(&self) -> usize {
+            1
+        }
+
+        fn horizon(&self) -> usize {
+            1
+        }
+
+        fn max_reward(&self) -> Reward {
+            1
+        }
+
+        fn min_reward(&self) -> Reward {
+            0
+        }
+
+        fn get_explore_exploit_ratio(&self) -> f64 {
+            0.0
+        }
+
+        fn model_update_action(&mut self, _action: Action) {}
+
+        fn gen_percept_and_update(&mut self, _bits: usize) -> u64 {
+            0
+        }
+
+        fn model_revert(&mut self, _steps: usize) {}
+
+        fn gen_range(&mut self, end: usize) -> usize {
+            self.next_range
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_sub(1))
+                })
+                .expect("range source should be initialized")
+                % end
+        }
+
+        fn gen_f64(&mut self) -> f64 {
+            0.0
+        }
+
+        fn boxed_clone_with_seed(&self, _seed: u64) -> Box<dyn AgentSimulator> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn select_action_uses_uniform_tie_break_for_maximal_ucb_actions() {
+        let mut node = SearchNode::new(false);
+        node.visits = 16;
+        node.action_children = vec![
+            Some(SearchNode {
+                visits: 5,
+                mean: 0.1,
+                is_chance_node: true,
+                action_children: Vec::new(),
+                percept_children: HashMap::new(),
+            }),
+            Some(SearchNode {
+                visits: 5,
+                mean: 0.9,
+                is_chance_node: true,
+                action_children: Vec::new(),
+                percept_children: HashMap::new(),
+            }),
+            Some(SearchNode {
+                visits: 5,
+                mean: 0.2,
+                is_chance_node: true,
+                action_children: Vec::new(),
+                percept_children: HashMap::new(),
+            }),
+            Some(SearchNode {
+                visits: 5,
+                mean: 0.9,
+                is_chance_node: true,
+                action_children: Vec::new(),
+                percept_children: HashMap::new(),
+            }),
+        ];
+
+        let mut agent = TieBreakAgent {
+            next_range: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let (_child, action) = node.select_action(&mut agent);
+        assert_eq!(
+            action, 3,
+            "exactly tied maximal UCB actions should be chosen uniformly; scripted RNG selected the later maximal action"
+        );
     }
 }
