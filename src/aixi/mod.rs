@@ -2,7 +2,7 @@
 //!
 //! This module contains:
 //! - Monte Carlo AIXI (MC-AIXI) with pluggable predictive models.
-//! - AIQI (Universal AI with Q-Induction) with phase-indexed return prediction.
+//! - AIQI from "A Model-Free Universal AI" with phase-indexed return prediction.
 //!
 //! AIXI is a theoretical mathematical formalism for universal artificial intelligence,
 //! which combines Solomonoff induction with sequential decision theory.

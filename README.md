@@ -10,35 +10,39 @@ Estimate core measures using both **Marginal** (distribution-based) and **Rate**
 - **Resistance**: Information preservation under noise/transform.
 
 ### 2. Multi-Backend Predictive Engine
-Switch between different modeling paradigms seamlessly:
+The core model class in the library is `RateBackend`. A `RateBackend` is the predictive model object used by entropy-rate estimators, rate-coded compression, generation, and the agent world-model interface.
+
+Switch between different `RateBackend` families seamlessly:
 - **ROSA+ (Rapid Online Suffix Automaton + Witten Bell)**: A fast statistical LM. Default backend. 
 - **CTW (Context Tree Weighting)**: Historically standard for AIXI. Accurate bit-level Bayesian model (KT-estimator).
 - **Mamba (Neural Network)**: Deterministic CPU-first Mamba-1 backend with online mode + export.
 - **RWKV (Neural Network)**: Portable SIMD RWKV7 CPU inference backend (`wide`-based).
 
+The same `RateBackend` model class also supports ensemble world models. `RateBackend::Mixture` combines `RateBackend` experts into a single predictive model: `Bayes`, `Switching`, and `Convex` follow *On Ensemble Techniques for AIXI Approximation*, while `FadingBayes`, `Mdl`, and `Neural` are extensions implemented in this repository.
+
 ### 3. Integrated MC-AIXI Agent
-Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. This approximates the incomputable AIXI Agent using Monte-Carlo Tree Search, and is **backend-agnostic** and can utilize any of the available predictive backends (ROSA, CTW, Mamba, or RWKV) for universal reinforcement learning.
+Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. It approximates incomputable AIXI with Monte-Carlo Tree Search and can use the library's `RateBackend` model class, including mixture-based ensemble world models, as its world model.
 
 You can use a trained neural model (Mamba-1 or RWKV7) as a rate backend ("world model") for MC-AIXI.
 
-- `planner: "mc-aixi"` keeps the classic MCTS planner path.
-- MC-AIXI now accepts the shared generic `rate_backend` override, including nested mixtures.
+- `planner: "mc-aixi"` selects the classic MCTS-based MC-AIXI planner.
+- MC-AIXI can also take a full `rate_backend` object instead of relying only on `algorithm`, including nested mixture backends built from other `RateBackend` experts.
 - **Mixture families from *On Ensemble Techniques for AIXI Approximation***: `Bayes` and `Convex` are exposed directly, and `Switching` follows the fixed-share update from *On Ensemble Techniques for AIXI Approximation* with a constant switch-rate `alpha`.
 - **Extensions**: `FadingBayes`, `Mdl`, and `Neural` remain available.
-- **Strict generic-path exclusion**: recursive `zpaq` backends are rejected for MC-AIXI `rate_backend` because they do not provide the reversible action conditioning required by *A Monte-Carlo AIXI Approximation*. Legacy standalone `algorithm: "zpaq"` remains a separate non-strict path.
+- **Why recursive `zpaq` is rejected in generic MC-AIXI configs**: `zpaq` cannot roll predictor state backward after hypothetical actions, so it does not satisfy the reversible action-conditioning requirement used by *A Monte-Carlo AIXI Approximation*. The older standalone `algorithm: "zpaq"` mode still exists, but it does not provide that exact rollback behavior.
 - **UCB tie-breaking from *A Monte-Carlo AIXI Approximation***: MC-AIXI chooses uniformly at random among unvisited actions and among exactly tied maximal UCB actions.
 
 ### 4. Integrated AIQI Agent
-The repository also includes **AIQI (Universal AI with Q-Induction)**: a model-free return-prediction agent with periodic augmentation (`N >= H`) and discretized H-step return targets.
+The repository also includes **AIQI**, the model-free return-prediction agent introduced in *A Model-Free Universal AI* by Yegon Kim and Juho Lee, with periodic augmentation (`N >= H`) and discretized H-step return targets.
 
 - `planner: "aiqi"` enables AIQI in `infotheory aixi <config.json>`.
-- `planner: "mc-aixi"` (default) keeps the existing MC-AIXI path.
-- **AIQI-CTW path from *Universal AI with Q-Induction***: `algorithm: "ac-ctw"` (or `"ctw"`) is the literal AIQI-CTW path from *Universal AI with Q-Induction*.
-- **Extensions**: AIQI also supports `fac-ctw`, `rosa`, `rwkv`, and generic `rate_backend` predictors, including shared mixture specs.
-- **Intentional exclusion**: `zpaq` is not supported for AIQI because strict frozen conditioning is required.
-- **Validation from *Universal AI with Q-Induction***: AIQI enforces `discount_gamma in (0,1)` and `baseline_exploration (tau) in (0,1]`.
-- **Tie-breaking from *Universal AI with Q-Induction***: greedy action selection uses a fixed tie-break rule (first maximizing action) to match the fixed tie-breaking assumption in *Universal AI with Q-Induction*.
-- **Optional bounded memory**: set `history_prune_keep_steps` (or `aiqi_history_prune_keep_steps`) to retain only recent history while preserving exact return construction.
+- `planner: "mc-aixi"` (default) keeps MC-AIXI as the default planner.
+- **Direct AIQI-CTW configuration from *A Model-Free Universal AI***: `algorithm: "ac-ctw"` (or `"ctw"`) selects the AIQI-CTW setup described in *A Model-Free Universal AI*.
+- **Extensions**: AIQI also supports `fac-ctw`, `rosa`, `rwkv`, and generic `rate_backend` predictors, including the same mixture JSON format used elsewhere in the repo.
+- **Why `zpaq` is excluded from AIQI**: AIQI needs exact frozen predictor states while it scores hypothetical actions and return bins, and `zpaq` does not provide that interface.
+- **Validation from *A Model-Free Universal AI***: AIQI enforces `discount_gamma in (0,1)` and `baseline_exploration (tau) in (0,1]`.
+- **Tie-breaking from *A Model-Free Universal AI***: greedy action selection uses a fixed tie-break rule (first maximizing action) to match the fixed tie-breaking assumption in *A Model-Free Universal AI*.
+- **Optional bounded memory**: set `history_prune_keep_steps` (or `aiqi_history_prune_keep_steps`) to retain only recent history while still keeping the steps needed for exact H-step return construction.
 - **Reproducibility**: set `random_seed` in config (or planner-specific `aiqi_random_seed` / `mcaixi_random_seed`) to make agent-side randomness deterministic across runs.
 - AIQI uses the same environment interfaces as MC-AIXI, including VM environments.
 
@@ -60,7 +64,7 @@ The repository also includes **AIQI (Universal AI with Q-Induction)**: a model-f
   - **AArch64 Windows** (`aarch64-pc-windows-msvc`)
   - **WASM** (`wasm32-unknown-unknown`, RWKV-only/no-zpaq profile)
 
-<small>WASM support is compile-target validation for the RWKV path (no zpaq/VM feature path).</small>
+<small>ZPAQ feature is not supported on WASM targets</small>
 
 ### Build Prerequisites
 - Rust toolchain (stable): `rustup` recommended.
@@ -86,7 +90,7 @@ Add the dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-infotheory = { path = "." } # Or git or whatever, you know rust.
+infotheory = { path = "." } # Replace with a git or crates.io source as needed.
 ```
 
 ### Building nyx-lite
@@ -226,7 +230,7 @@ Planner switch in config:
 }
 ```
 
-Optional generic backend override for MC-AIXI or AIQI (uses the shared RateBackend parser; recursive `zpaq` is intentionally rejected on the strict generic planner paths):
+Both planners also accept a `rate_backend` object using the same `RateBackend` schema and mixture language as the rest of the library. This is how the library's model class becomes the planner world model. Recursive `zpaq` is rejected here because these planner integrations need exact reversible or frozen conditioning during planning:
 
 ```json
 {
@@ -282,7 +286,7 @@ Reproducible competitor benchmark (Infotheory Rust/Python vs PyAIXI + C++ MC-AIX
 Benchmark correctness notes:
 - Stochastic environments are seeded from `random_seed` (or `rng_seed`) in CLI and Python run loops for reproducible trajectories.
 - Reward reporting is normalized to native domain scale in competitor reports (for example Kuhn offset removal for C++/PyAIXI), so cross-implementation reward means are apples-to-apples.
-- MC-AIXI tree search uses reference-style UCB scaling, the uniform-max UCB tie-breaking rule from *A Monte-Carlo AIXI Approximation*, and reward-sensitive chance-node reuse for generic environment correctness.
+- MC-AIXI tree search uses the same UCB scaling convention as common MC-AIXI reference implementations, the uniform-max tie-breaking rule from *A Monte-Carlo AIXI Approximation*, and chance-node cache keys that include reward as well as observation so environments with repeated observations but different rewards are handled correctly.
 
 VM config highlights:
 - **Environment**: Use `"environment": "nyx-vm"` or `"vm"` (requires `vm` feature).
@@ -354,7 +358,7 @@ uv run python -c "import infotheory_rs as ait; print(ait.ncd_paths('README.md','
 ```
 
 Python exposes both string-based backend parsing and direct backend objects. The
-current surface includes `RateBackend.match(...)`, `RateBackend.sparse_match(...)`,
+Python API includes `RateBackend.match(...)`, `RateBackend.sparse_match(...)`,
 `RateBackend.ppmd(...)`, `RateBackend.mixture(...)`, `RateBackend.particle(...)`,
 and `RateBackend.calibrated(...)`, plus `CalibrationContextKind` for calibrated
 backends.

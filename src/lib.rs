@@ -335,7 +335,11 @@ pub fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBacken
     }
 }
 
-/// Sequential entropy/rate backend used by context-aware metrics.
+/// Core predictive model class used by the library.
+///
+/// `RateBackend` is the shared model class behind entropy-rate estimation,
+/// rate-coded compression, generation, and the world-model interface used by
+/// MC-AIXI/AIQI planners.
 #[derive(Clone)]
 pub enum RateBackend {
     /// ROSA+ suffix-automaton estimator.
@@ -406,7 +410,11 @@ pub enum RateBackend {
         /// ZPAQ method string (streamable modes only for rate estimation).
         method: String,
     },
-    /// Online mixture over rate-model experts (Bayes, fading Bayes, switching, MDL).
+    /// Online mixture over `RateBackend` experts.
+    ///
+    /// `Bayes`, `Switching`, and `Convex` follow
+    /// "On Ensemble Techniques for AIXI Approximation"; `FadingBayes`,
+    /// `Mdl`, and `Neural` are repository extensions.
     Mixture {
         /// Mixture expert/runtime specification.
         spec: Arc<MixtureSpec>,

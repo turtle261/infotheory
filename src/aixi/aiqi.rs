@@ -1,9 +1,9 @@
-//! AIQI (Universal AI with Q-Induction) implementation.
+//! AIQI implementation from "A Model-Free Universal AI".
 //!
 //! This module implements a model-free universal agent that predicts
 //! discretized H-step returns directly from augmented interaction history.
 //! The implementation follows the phase-indexed periodic augmentation in
-//! "Universal AI with Q-Induction":
+//! "A Model-Free Universal AI":
 //! for return horizon `H` and period `N >= H`, each phase model only inserts
 //! returns at indices `i % N == phase`.
 
@@ -20,7 +20,7 @@ pub struct AiqiConfig {
     /// Predictive backend.
     ///
     /// - `ac-ctw` / `ctw` / `ctw-context-tree`: AIQI-CTW path from
-    ///   "Universal AI with Q-Induction".
+    ///   "A Model-Free Universal AI".
     /// - `fac-ctw`: factorized CTW extension.
     /// - `rosa` / `rwkv`: pluggable predictor extensions.
     /// - `zpaq`: intentionally unsupported for AIQI strict conditioning.
@@ -109,13 +109,13 @@ impl AiqiConfig {
         }
         if !(0.0 < self.discount_gamma && self.discount_gamma < 1.0) {
             return Err(format!(
-                "discount_gamma must be in (0, 1) for AIQI as defined in \"Universal AI with Q-Induction\", got {}",
+                "discount_gamma must be in (0, 1) for AIQI as defined in \"A Model-Free Universal AI\", got {}",
                 self.discount_gamma
             ));
         }
         if !(0.0 < self.baseline_exploration && self.baseline_exploration <= 1.0) {
             return Err(format!(
-                "baseline_exploration (tau) must be in (0, 1] for AIQI as defined in \"Universal AI with Q-Induction\", got {}",
+                "baseline_exploration (tau) must be in (0, 1] for AIQI as defined in \"A Model-Free Universal AI\", got {}",
                 self.baseline_exploration
             ));
         }
@@ -1190,7 +1190,7 @@ mod tests {
         cfg.return_horizon = 2;
         let err = cfg
             .validate()
-            .expect_err("N < H must be rejected to match \"Universal AI with Q-Induction\"");
+            .expect_err("N < H must be rejected to match \"A Model-Free Universal AI\"");
         assert!(err.contains("augmentation_period"));
     }
 
