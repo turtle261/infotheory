@@ -20,7 +20,8 @@ usage() {
 Usage: scripts/bench_aiqi_vs_aixi.sh [options]
 
 This is a quick in-repo benchmark harness for relative comparisons.
-It does NOT replicate the paper protocol against external pyaixi runs.
+It does NOT replicate the evaluation setup from "Universal AI with Q-Induction",
+and it does not compare against external pyaixi runs.
 
 Options:
   --out-dir <path>                    Output directory (default: target/aiqi-vs-aixi/<timestamp>)

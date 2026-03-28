@@ -23,21 +23,21 @@ You can use a trained neural model (Mamba-1 or RWKV7) as a rate backend ("world 
 
 - `planner: "mc-aixi"` keeps the classic MCTS planner path.
 - MC-AIXI now accepts the shared generic `rate_backend` override, including nested mixtures.
-- **Paper-facing mixture families**: `Bayes` and `Convex` are exposed directly, and `Switching` follows the paper's fixed-share update with a constant switch-rate `alpha`.
+- **Mixture families from *On Ensemble Techniques for AIXI Approximation***: `Bayes` and `Convex` are exposed directly, and `Switching` follows the fixed-share update from *On Ensemble Techniques for AIXI Approximation* with a constant switch-rate `alpha`.
 - **Extensions**: `FadingBayes`, `Mdl`, and `Neural` remain available.
-- **Strict generic-path exclusion**: recursive `zpaq` backends are rejected for MC-AIXI `rate_backend` because they do not provide paper-correct reversible action conditioning. Legacy standalone `algorithm: "zpaq"` remains a separate non-strict path.
-- **Paper-correct UCB tie-breaking**: MC-AIXI chooses uniformly at random among unvisited actions and among exactly tied maximal UCB actions.
+- **Strict generic-path exclusion**: recursive `zpaq` backends are rejected for MC-AIXI `rate_backend` because they do not provide the reversible action conditioning required by *A Monte-Carlo AIXI Approximation*. Legacy standalone `algorithm: "zpaq"` remains a separate non-strict path.
+- **UCB tie-breaking from *A Monte-Carlo AIXI Approximation***: MC-AIXI chooses uniformly at random among unvisited actions and among exactly tied maximal UCB actions.
 
 ### 4. Integrated AIQI Agent
 The repository also includes **AIQI (Universal AI with Q-Induction)**: a model-free return-prediction agent with periodic augmentation (`N >= H`) and discretized H-step return targets.
 
 - `planner: "aiqi"` enables AIQI in `infotheory aixi <config.json>`.
 - `planner: "mc-aixi"` (default) keeps the existing MC-AIXI path.
-- **Paper path**: `algorithm: "ac-ctw"` (or `"ctw"`) is the literal AIQI-CTW path from the paper.
+- **AIQI-CTW path from *Universal AI with Q-Induction***: `algorithm: "ac-ctw"` (or `"ctw"`) is the literal AIQI-CTW path from *Universal AI with Q-Induction*.
 - **Extensions**: AIQI also supports `fac-ctw`, `rosa`, `rwkv`, and generic `rate_backend` predictors, including shared mixture specs.
 - **Intentional exclusion**: `zpaq` is not supported for AIQI because strict frozen conditioning is required.
-- **Strict paper-domain validation**: AIQI enforces `discount_gamma in (0,1)` and `baseline_exploration (tau) in (0,1]`.
-- **Tie-breaking**: greedy action selection uses a fixed tie-break rule (first maximizing action) to match paper assumptions.
+- **Validation from *Universal AI with Q-Induction***: AIQI enforces `discount_gamma in (0,1)` and `baseline_exploration (tau) in (0,1]`.
+- **Tie-breaking from *Universal AI with Q-Induction***: greedy action selection uses a fixed tie-break rule (first maximizing action) to match the fixed tie-breaking assumption in *Universal AI with Q-Induction*.
 - **Optional bounded memory**: set `history_prune_keep_steps` (or `aiqi_history_prune_keep_steps`) to retain only recent history while preserving exact return construction.
 - **Reproducibility**: set `random_seed` in config (or planner-specific `aiqi_random_seed` / `mcaixi_random_seed`) to make agent-side randomness deterministic across runs.
 - AIQI uses the same environment interfaces as MC-AIXI, including VM environments.
@@ -282,7 +282,7 @@ Reproducible competitor benchmark (Infotheory Rust/Python vs PyAIXI + C++ MC-AIX
 Benchmark correctness notes:
 - Stochastic environments are seeded from `random_seed` (or `rng_seed`) in CLI and Python run loops for reproducible trajectories.
 - Reward reporting is normalized to native domain scale in competitor reports (for example Kuhn offset removal for C++/PyAIXI), so cross-implementation reward means are apples-to-apples.
-- MC-AIXI tree search uses reference-style UCB scaling, paper-correct uniform tie-breaking among maximal UCB actions, and reward-sensitive chance-node reuse for generic environment correctness.
+- MC-AIXI tree search uses reference-style UCB scaling, the uniform-max UCB tie-breaking rule from *A Monte-Carlo AIXI Approximation*, and reward-sensitive chance-node reuse for generic environment correctness.
 
 VM config highlights:
 - **Environment**: Use `"environment": "nyx-vm"` or `"vm"` (requires `vm` feature).

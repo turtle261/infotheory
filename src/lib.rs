@@ -494,7 +494,8 @@ pub enum MixtureKind {
     Bayes,
     /// Bayesian mixture with exponential weight decay.
     FadingBayes,
-    /// Switching mixture using the paper's fixed-share update.
+    /// Switching mixture using the fixed-share update from
+    /// "On Ensemble Techniques for AIXI Approximation".
     Switching,
     /// Online convex mixture with projected-simplex weight updates.
     Convex,
@@ -512,11 +513,13 @@ pub enum MixtureScheduleMode {
     /// - `Switching`: constant switch rate `alpha`
     /// - `Convex`: step size `alpha / sqrt(t)`
     Default,
-    /// Use the paper/theorem schedule.
+    /// Use the theorem schedule from
+    /// "On Ensemble Techniques for AIXI Approximation".
     ///
     /// - `Switching`: `alpha_t = 1 / t`
     /// - `Convex`: `eta_t = epsilon / sqrt(t)` under this implementation's
-    ///   natural-log gradient, matching the paper's bit-loss schedule after
+    ///   natural-log gradient, matching the bit-loss schedule analyzed in
+    ///   "On Ensemble Techniques for AIXI Approximation" after
     ///   accounting for the `1 / ln(2)` factor in the base-2 gradient
     ///
     /// This preserves configured expert priors; exact theorem hypotheses for

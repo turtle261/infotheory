@@ -529,7 +529,7 @@ fn agent_config_rejects_zpaq_rate_backend_in_strict_mode() {
     let err = cfg
         .validate()
         .expect_err("zpaq-backed generic MC-AIXI should be rejected");
-    assert!(err.contains("paper-correct action conditioning"));
+    assert!(err.contains("A Monte-Carlo AIXI Approximation"));
     assert!(err.contains("zpaq"));
 }
 

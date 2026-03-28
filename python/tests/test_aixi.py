@@ -235,7 +235,7 @@ def test_aiqi_rejects_zpaq_rate_backend_in_strict_mode():
 
 
 def test_mcaixi_rejects_zpaq_rate_backend_in_strict_mode():
-    with pytest.raises(ValueError, match="paper-correct action conditioning"):
+    with pytest.raises(ValueError, match="A Monte-Carlo AIXI Approximation"):
         ait.AgentConfig(
             algorithm="fac-ctw",
             ct_depth=6,

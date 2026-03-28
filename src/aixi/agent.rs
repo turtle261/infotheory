@@ -132,7 +132,7 @@ impl AgentConfig {
                 .map_err(|err| format!("invalid rate_backend: {err}"))?;
             if rate_backend_contains_zpaq(rate_backend) {
                 return Err(
-                    "MC-AIXI strict generic rate_backend support requires reversible action conditioning; configured rate_backend contains zpaq which does not provide paper-correct action conditioning"
+                    "MC-AIXI strict generic rate_backend support requires reversible action conditioning; configured rate_backend contains zpaq which does not provide the reversible action conditioning required by \"A Monte-Carlo AIXI Approximation\""
                         .to_string(),
                 );
             }
@@ -362,7 +362,8 @@ fn build_model(config: &AgentConfig) -> Result<Box<dyn Predictor>, String> {
     }
 
     match config.algorithm.as_str() {
-        // FAC-CTW is the default and recommended CTW variant per the paper
+        // FAC-CTW is the default and recommended CTW variant in
+        // "A Monte-Carlo AIXI Approximation".
         "ctw" | "fac-ctw" => {
             let obs_len = config.observation_stream_len.max(1);
             let percept_bits = (config.observation_bits * obs_len) + config.reward_bits;

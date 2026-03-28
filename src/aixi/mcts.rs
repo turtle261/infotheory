@@ -367,7 +367,8 @@ impl SearchNode {
                     }
                     std::cmp::Ordering::Equal => {
                         num_maximal_actions += 1;
-                        // Paper-correct tie-break: choose uniformly among maximal actions.
+                        // Tie-break from "A Monte-Carlo AIXI Approximation":
+                        // choose uniformly among maximal actions.
                         // Reservoir sampling keeps this O(1) in memory without a tie list.
                         if agent.gen_range(num_maximal_actions) == 0 {
                             best_action = Some(a as u64);
