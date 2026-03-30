@@ -1,6 +1,6 @@
 .TH BENCHMAN 1 "March 2026" "InfoTheory" "InfoTheory Benchmark Tools"
 .SH NAME
-benchman \- interactive InfoTheory benchmark TUI
+benchman \- interactive InfoTheory benchmark and log-loss TUI
 .SH SYNOPSIS
 .B projman.sh tui
 [\-\-suite NAME]
@@ -10,15 +10,33 @@ benchman \- interactive InfoTheory benchmark TUI
 [\-\-subjects LIST]
 [\-\-plot\-dir PATH]
 .PP
+.B projman.sh tui log\-loss
+.I PREFIX
+.PP
 .B projman.sh tui man
 .SH DESCRIPTION
 .B benchman
-is a keyboard-only scientific benchmark helper for InfoTheory TSV outputs.
-It provides interactive graph inspection for all graph families produced by
+is a keyboard-only scientific analysis helper for InfoTheory TSV outputs.
+It provides two modes:
+.IP \(bu 2
+benchmark inspection for all graph families produced by
 .B scripts/plot_two_json.sh
-including current-vs-baseline overlays.
+including current-vs-baseline overlays
+.IP \(bu
+AC log-loss inspection for
+.B infotheory ac\-log\-loss
+diagnostic prefixes containing
+.I .trace.tsv
+,
+.I .nodes.tsv
+,
+and
+.I .summary.tsv
 .PP
-The interface supports:
+Both modes preserve the same overall interaction style: vi-like keyboard
+navigation, graph switching, focused inspection, and exact value readout.
+.PP
+Benchmark mode supports:
 .IP \(bu 2
 graph navigation across all benchmark plot families
 .IP \(bu
@@ -29,7 +47,18 @@ cursor-based point inspection with exact x/y values
 overlap detection when multiple visible series share the same point
 .IP \(bu
 optional raw TSV enrichment for per-repetition details
+.PP
+Log-loss mode supports:
+.IP \(bu 2
+mixture/oracle/regret/entropy/margin graphs over file position
+.IP \(bu
+domain partition views based on oracle-best expert with adjustable uncovered and contested thresholds
+.IP \(bu
+blind-spot and ensemble-advantage views
+.IP \(bu
+region inspection with exact byte previews, worst positions, and per-node statistics
 .SH OPTIONS
+.SS Benchmark Mode
 .TP
 .B \-\-suite NAME
 Benchmark suite name (
@@ -59,7 +88,21 @@ Artifact directory (default:
 .TP
 .B \-\-no\-replot
 Do not run plot regeneration script when rebuilding the plot directory.
+.SS Log-Loss Mode
+.TP
+.I PREFIX
+Path prefix for
+.I PREFIX.trace.tsv
+,
+.I PREFIX.nodes.tsv
+,
+and
+.I PREFIX.summary.tsv
+produced by
+.B infotheory ac\-log\-loss
+.
 .SH KEYBOARD
+.SS Shared Navigation
 .TP
 .B h/l
 or
@@ -90,6 +133,25 @@ Clear inspector popup.
 .TP
 .B q
 Quit.
+.SS Log-Loss Mode Extras
+.TP
+.B z / Z / a
+Zoom into the current region, zoom out, or reset to the full file.
+.TP
+.B b / B
+Decrease / increase the uncovered-oracle threshold.
+.TP
+.B m / M
+Decrease / increase the contested-margin threshold.
+.TP
+.B r / R
+Decrease / increase the blind-spot regret threshold.
+.TP
+.B w / W
+Decrease / increase the blind-spot good-expert threshold.
+.TP
+.B ?
+Open log-loss help with the exact partitioning rule and threshold controls.
 .SH PLOT ARTIFACT DIRECTORY
 When the plot directory already exists, benchman prompts:
 .IP "A" 4
@@ -111,6 +173,7 @@ and opens this local manual through
 .BR man (1)
 .
 .SH ENVIRONMENT
+.SS Benchmark Mode
 .TP
 .B INFOTHEORY_PLOT_SUMMARY_TSV
 Summary TSV path.
@@ -133,7 +196,12 @@ Subject filter list.
 .TP
 .B INFOTHEORY_PLOT_OUTPUT_DIR
 Plot artifact directory.
+.SS Log-Loss Mode
+Log-loss mode reads the diagnostic files directly from the supplied
+.I PREFIX
+and does not require additional environment variables.
 .SH SEE ALSO
 .BR projman.sh (1),
 .BR scripts/bench_two_json.sh (1),
-.BR scripts/plot_two_json.sh (1)
+.BR scripts/plot_two_json.sh (1),
+.BR infotheory (1)

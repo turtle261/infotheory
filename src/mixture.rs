@@ -12,6 +12,7 @@
 use crate::backends::calibration::CalibratorCore;
 use crate::backends::match_model::MatchModel;
 use crate::backends::ppmd::PpmdModel;
+use crate::backends::sequitur::{SequiturCheckpoint, SequiturModel};
 use crate::backends::sparse_match::SparseMatchModel;
 use crate::backends::text_context::TextContextAnalyzer;
 use crate::ctw::FacContextTree;
@@ -439,6 +440,13 @@ pub enum RateBackendPredictor {
         /// Probability floor for numeric stability.
         min_prob: f64,
     },
+    /// Exact online Sequitur grammar backend with predictive suffix contexts.
+    Sequitur {
+        /// Sequitur model state.
+        model: SequiturModel,
+        /// Probability floor for numeric stability.
+        min_prob: f64,
+    },
     /// Byte-wise CTW implemented as 8 factorized bit trees (MSB-first).
     Ctw {
         /// FAC-CTW tree stack (8 bits per byte).
@@ -509,6 +517,12 @@ pub enum RateBackendPredictor {
     },
 }
 
+#[derive(Clone)]
+pub enum RateBackendPredictorCheckpoint {
+    Full(RateBackendPredictor),
+    Sequitur(SequiturCheckpoint),
+}
+
 impl RateBackendPredictor {
     /// Create a new online predictor from a rate backend configuration.
     pub fn from_backend(backend: RateBackend, max_order: i64, min_prob: f64) -> Self {
@@ -556,6 +570,10 @@ impl RateBackendPredictor {
             },
             RateBackend::Ppmd { order, memory_mb } => Self::Ppmd {
                 model: PpmdModel::new(order, memory_mb),
+                min_prob,
+            },
+            RateBackend::Sequitur { context_bytes } => Self::Sequitur {
+                model: SequiturModel::new(context_bytes),
                 min_prob,
             },
             RateBackend::Ctw { depth } => {
@@ -672,6 +690,9 @@ impl RateBackendPredictor {
             RateBackend::Ppmd { order, memory_mb } => {
                 format!("ppmd(o={},m={}MiB)", order, memory_mb)
             }
+            RateBackend::Sequitur { context_bytes } => {
+                format!("sequitur(ctx={context_bytes})")
+            }
             RateBackend::Ctw { depth } => format!("ctw(d={})", depth),
             RateBackend::FacCtw {
                 base_depth,
@@ -706,6 +727,35 @@ impl RateBackendPredictor {
             }
         }
     }
+
+    pub(crate) fn checkpoint(&mut self) -> RateBackendPredictorCheckpoint {
+        match self {
+            RateBackendPredictor::Sequitur { model, .. } => {
+                RateBackendPredictorCheckpoint::Sequitur(model.checkpoint())
+            }
+            _ => RateBackendPredictorCheckpoint::Full(self.clone()),
+        }
+    }
+
+    pub(crate) fn restore_checkpoint(&mut self, checkpoint: &RateBackendPredictorCheckpoint) {
+        match (self, checkpoint) {
+            (RateBackendPredictor::Sequitur { model, .. }, RateBackendPredictorCheckpoint::Sequitur(ck)) => {
+                model.restore(ck);
+            }
+            (slot, RateBackendPredictorCheckpoint::Full(state)) => {
+                *slot = state.clone();
+            }
+            (_, RateBackendPredictorCheckpoint::Sequitur(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+        }
+    }
+
+    pub(crate) fn clear_checkpoints_if_supported(&mut self) {
+        if let RateBackendPredictor::Sequitur { model, .. } = self {
+            model.clear_checkpoints();
+        }
+    }
 }
 
 impl OnlineBytePredictor for RateBackendPredictor {
@@ -722,6 +772,10 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Match { .. }
             | RateBackendPredictor::SparseMatch { .. }
             | RateBackendPredictor::Ppmd { .. } => Ok(()),
+            RateBackendPredictor::Sequitur { model, .. } => {
+                model.begin_stream(total_symbols);
+                Ok(())
+            }
             RateBackendPredictor::Ctw { .. }
             | RateBackendPredictor::FacCtw { .. }
             | RateBackendPredictor::Zpaq { .. }
@@ -749,6 +803,10 @@ impl OnlineBytePredictor for RateBackendPredictor {
             | RateBackendPredictor::FacCtw { .. }
             | RateBackendPredictor::Zpaq { .. }
             | RateBackendPredictor::Particle { .. } => Ok(()),
+            RateBackendPredictor::Sequitur { model, .. } => {
+                model.finish_stream();
+                Ok(())
+            }
             #[cfg(feature = "backend-rwkv")]
             RateBackendPredictor::Rwkv7 { compressor, .. } => compressor
                 .finish_online_policy_stream()
@@ -771,6 +829,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 model.log_prob(symbol, *min_prob)
             }
             RateBackendPredictor::Ppmd { model, min_prob } => model.log_prob(symbol, *min_prob),
+            RateBackendPredictor::Sequitur { model, min_prob } => {
+                model.log_prob(symbol, *min_prob)
+            }
             RateBackendPredictor::Ctw { tree, min_prob } => {
                 let log_before = tree.get_log_block_probability();
                 for bit_idx in 0..8 {
@@ -897,6 +958,13 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     *slot = clamp_prob(p, *min_prob).ln();
                 }
             }
+            RateBackendPredictor::Sequitur { model, min_prob } => {
+                let mut pdf = [0.0; 256];
+                model.fill_pdf(&mut pdf);
+                for (slot, &p) in out.iter_mut().zip(pdf.iter()) {
+                    *slot = clamp_prob(p, *min_prob).ln();
+                }
+            }
             RateBackendPredictor::Ctw { tree, min_prob } => {
                 fill_fac_tree_log_probs(tree, 8, true, min_prob.ln(), out);
             }
@@ -998,6 +1066,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 model.update(symbol);
             }
             RateBackendPredictor::Ppmd { model, .. } => {
+                model.update(symbol);
+            }
+            RateBackendPredictor::Sequitur { model, .. } => {
                 model.update(symbol);
             }
             RateBackendPredictor::Ctw { tree, .. } => {
@@ -1143,6 +1214,10 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 model.reset_history();
                 Ok(())
             }
+            RateBackendPredictor::Sequitur { model, .. } => {
+                model.reset_frozen();
+                Ok(())
+            }
             RateBackendPredictor::Ctw { tree, .. } => {
                 tree.reset_history_only();
                 Ok(())
@@ -1204,6 +1279,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             RateBackendPredictor::Ppmd { model, .. } => {
                 model.update_history_only(symbol);
+            }
+            RateBackendPredictor::Sequitur { model, .. } => {
+                model.update_frozen(symbol);
             }
             RateBackendPredictor::Ctw { tree, .. } => {
                 let mut bits = [false; 8];
@@ -1667,7 +1745,8 @@ pub struct FadingBayesMixture {
     scratch_logps: Vec<f64>,
     scratch_mix: Vec<f64>,
     cached_symbol: u8,
-    cached_log_mix: f64,
+    cached_log_predictive: f64,
+    cached_log_evidence: f64,
     cache_valid: bool,
     total_log_loss: f64,
 }
@@ -1688,7 +1767,8 @@ impl FadingBayesMixture {
             scratch_logps: vec![0.0; configs.len()],
             scratch_mix: vec![0.0; configs.len()],
             cached_symbol: 0,
-            cached_log_mix: f64::NEG_INFINITY,
+            cached_log_predictive: f64::NEG_INFINITY,
+            cached_log_evidence: f64::NEG_INFINITY,
             cache_valid: false,
             total_log_loss: 0.0,
         }
@@ -1699,28 +1779,32 @@ impl FadingBayesMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
+        let (log_predictive, log_evidence) = if self.cache_valid && self.cached_symbol == symbol {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 expert.cum_log_loss -= self.scratch_logps[i];
                 expert.update(symbol);
             }
-            self.cached_log_mix
+            (self.cached_log_predictive, self.cached_log_evidence)
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
-                let decayed = self.decay * expert.log_weight;
-                self.scratch_mix[i] = decayed + self.scratch_logps[i];
+                self.scratch_mix[i] = self.decay * expert.log_weight;
+            }
+            let log_prior_norm = logsumexp(&self.scratch_mix);
+            for (i, expert) in self.experts.iter_mut().enumerate() {
+                self.scratch_mix[i] += self.scratch_logps[i];
                 expert.cum_log_loss -= self.scratch_logps[i];
             }
-            logsumexp(&self.scratch_mix)
+            let log_evidence = logsumexp(&self.scratch_mix);
+            (log_evidence - log_prior_norm, log_evidence)
         };
         for (i, expert) in self.experts.iter_mut().enumerate() {
             let decayed = self.decay * expert.log_weight;
-            expert.log_weight = decayed + self.scratch_logps[i] - log_mix;
+            expert.log_weight = decayed + self.scratch_logps[i] - log_evidence;
         }
         self.cache_valid = false;
-        self.total_log_loss -= log_mix;
-        log_mix
+        self.total_log_loss -= log_predictive;
+        log_predictive
     }
 
     fn predict_log_prob(&mut self, symbol: u8) -> f64 {
@@ -1729,13 +1813,19 @@ impl FadingBayesMixture {
         }
         for (i, expert) in self.experts.iter_mut().enumerate() {
             self.scratch_logps[i] = expert.log_prob(symbol);
-            self.scratch_mix[i] = self.decay * expert.log_weight + self.scratch_logps[i];
+            self.scratch_mix[i] = self.decay * expert.log_weight;
         }
-        let log_mix = logsumexp(&self.scratch_mix);
+        let log_prior_norm = logsumexp(&self.scratch_mix);
+        for i in 0..self.experts.len() {
+            self.scratch_mix[i] += self.scratch_logps[i];
+        }
+        let log_evidence = logsumexp(&self.scratch_mix);
+        let log_predictive = log_evidence - log_prior_norm;
         self.cached_symbol = symbol;
-        self.cached_log_mix = log_mix;
+        self.cached_log_predictive = log_predictive;
+        self.cached_log_evidence = log_evidence;
         self.cache_valid = true;
-        log_mix
+        log_predictive
     }
 
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {

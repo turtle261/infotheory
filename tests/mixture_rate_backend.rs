@@ -27,6 +27,32 @@ fn mixture_single_expert_matches_backend() {
     );
 }
 
+#[test]
+fn mixture_single_sequitur_expert_matches_backend() {
+    let data = b"abcabcabcabcabcabc";
+    let base = RateBackend::Sequitur { context_bytes: 32 };
+    let base_rate = entropy_rate_backend(data, -1, &base);
+
+    let spec = MixtureSpec::new(
+        MixtureKind::Bayes,
+        vec![MixtureExpertSpec {
+            name: Some("sequitur".to_string()),
+            log_prior: 0.0,
+            max_order: -1,
+            backend: base.clone(),
+        }],
+    );
+    let mix_backend = RateBackend::Mixture {
+        spec: Arc::new(spec),
+    };
+    let mix_rate = entropy_rate_backend(data, -1, &mix_backend);
+
+    assert!(
+        (mix_rate - base_rate).abs() < 1e-6,
+        "mix={mix_rate} base={base_rate}"
+    );
+}
+
 #[cfg(feature = "backend-rwkv")]
 #[test]
 fn rwkv_mixture_single_expert_matches_backend_with_tbptt() {

@@ -724,6 +724,7 @@ impl TraceModel {
             | RateBackend::Match { .. }
             | RateBackend::SparseMatch { .. }
             | RateBackend::Ppmd { .. }
+            | RateBackend::Sequitur { .. }
             | RateBackend::Calibrated { .. } => TraceModel::predictor_backed(backend.clone()),
             RateBackend::Ctw { depth } => TraceModel::Ctw {
                 tree: crate::ctw::ContextTree::new(*depth),

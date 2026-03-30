@@ -6,7 +6,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -21,6 +21,10 @@ use ratatui::widgets::{
     Wrap,
 };
 use ratatui::{Frame, Terminal};
+
+mod log_loss;
+
+use log_loss::{LogLossApp, LogLossCli};
 
 const DEFAULT_PLOT_DIR: &str = "/tmp/plotimgs";
 const DEFAULT_BENCH_SUITE: &str = "two-json";
@@ -79,7 +83,7 @@ enum PlotDirDeletionPolicy {
     RequiresExplicitConfirmation,
 }
 
-const COLOR_PALETTE: [Color; 12] = [
+pub(crate) const COLOR_PALETTE: [Color; 12] = [
     Color::Rgb(0, 114, 178),
     Color::Rgb(213, 94, 0),
     Color::Rgb(0, 158, 115),
@@ -98,9 +102,24 @@ const COLOR_PALETTE: [Color; 12] = [
 #[command(
     name = "benchman",
     version,
-    about = "Interactive InfoTheory benchmark TUI (summary/baseline/raw TSV aware)"
+    about = "Interactive InfoTheory TUI for benchmarks and AC log-loss diagnostics"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<BenchmanCommand>,
+
+    #[command(flatten)]
+    bench: BenchCli,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum BenchmanCommand {
+    /// Inspect AC log-loss TSV diagnostics produced by `infotheory ac-log-loss`
+    LogLoss(LogLossCli),
+}
+
+#[derive(Args, Debug, Clone)]
+struct BenchCli {
     #[arg(
         long,
         env = "INFOTHEORY_PLOT_SUITE",
@@ -768,18 +787,53 @@ impl App {
     }
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let inputs = resolve_inputs(cli)?;
-    ensure_plot_artifacts(&inputs)?;
-
-    let data = load_bench_data(&inputs)?;
-    let mut app = App::new(data)?;
-
-    run_tui(&mut app)
+enum TuiApp {
+    Bench(App),
+    LogLoss(LogLossApp),
 }
 
-fn resolve_inputs(cli: Cli) -> Result<ResolvedInputs> {
+impl TuiApp {
+    fn should_quit(&self) -> bool {
+        match self {
+            Self::Bench(app) => app.should_quit,
+            Self::LogLoss(app) => app.should_quit(),
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        match self {
+            Self::Bench(app) => app.handle_key(key),
+            Self::LogLoss(app) => app.handle_key(key),
+        }
+    }
+
+    fn render(&self, frame: &mut Frame<'_>) {
+        match self {
+            Self::Bench(app) => render_bench(frame, app),
+            Self::LogLoss(app) => app.render(frame),
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Some(BenchmanCommand::LogLoss(log_loss_cli)) => {
+            let mut app = TuiApp::LogLoss(LogLossApp::from_cli(&log_loss_cli)?);
+            run_tui(&mut app)
+        }
+        None => {
+            let inputs = resolve_inputs(cli.bench)?;
+            ensure_plot_artifacts(&inputs)?;
+
+            let data = load_bench_data(&inputs)?;
+            let mut app = TuiApp::Bench(App::new(data)?);
+            run_tui(&mut app)
+        }
+    }
+}
+
+fn resolve_inputs(cli: BenchCli) -> Result<ResolvedInputs> {
     let suite = BenchSuite::parse(&cli.suite)?;
     let summary_path = match cli.summary_tsv {
         Some(path) => path,
@@ -1757,7 +1811,7 @@ fn build_graph_model(spec: GraphSpec, rows: &[RenderRow]) -> GraphModel {
     GraphModel { spec, series }
 }
 
-fn run_tui(app: &mut App) -> Result<()> {
+fn run_tui(app: &mut TuiApp) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
@@ -1775,10 +1829,13 @@ fn run_tui(app: &mut App) -> Result<()> {
     loop_result
 }
 
-fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
-    while !app.should_quit {
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut TuiApp,
+) -> Result<()> {
+    while !app.should_quit() {
         terminal
-            .draw(|frame| render(frame, app))
+            .draw(|frame| app.render(frame))
             .context("failed to draw TUI frame")?;
 
         if event::poll(Duration::from_millis(200)).context("failed to poll terminal events")?
@@ -1791,7 +1848,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
     Ok(())
 }
 
-fn render(frame: &mut Frame<'_>, app: &App) {
+fn render_bench(frame: &mut Frame<'_>, app: &App) {
     let root = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -2232,7 +2289,7 @@ fn render_inspection_popup(frame: &mut Frame<'_>, inspection: &Inspection) {
     frame.render_widget(paragraph, area);
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2252,7 +2309,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn format_float(value: f64) -> String {
+pub(crate) fn format_float(value: f64) -> String {
     let abs = value.abs();
     if abs != 0.0 && !(1e-4..1e6).contains(&abs) {
         return format!("{value:.6e}");
@@ -2271,7 +2328,7 @@ fn format_float(value: f64) -> String {
     out
 }
 
-fn format_size_bytes(value: u64) -> String {
+pub(crate) fn format_size_bytes(value: u64) -> String {
     let s = value.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (idx, ch) in s.chars().rev().enumerate() {

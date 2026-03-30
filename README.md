@@ -15,6 +15,7 @@ The core model class in the library is `RateBackend`. A `RateBackend` is the pre
 Switch between different `RateBackend` families seamlessly:
 - **ROSA+ (Rapid Online Suffix Automaton + Witten Bell)**: A fast statistical LM. Default backend. 
 - **CTW (Context Tree Weighting)**: Historically standard for AIXI. Accurate bit-level Bayesian model (KT-estimator).
+- **Sequitur**: Exact online grammar induction with Sequitur normalization plus predictive suffix-context readout.
 - **Mamba (Neural Network)**: Deterministic CPU-first Mamba-1 backend with online mode + export.
 - **RWKV (Neural Network)**: Portable SIMD RWKV7 CPU inference backend (`wide`-based).
 
@@ -148,6 +149,22 @@ CLI:
 
 For rate-coded metrics, raw framing is used by default to avoid framing overhead.
 Explicit `compress_bytes_backend` / `decompress_bytes_backend` APIs support framed payloads for roundtrip verification.
+
+### AC Log-Loss Diagnostics
+
+`ac-log-loss` runs the exact arithmetic-coding predictor path for a top-level mixture spec and streams per-position diagnostics to TSV without keeping the full trace in memory.
+
+```bash
+RAYON_NUM_THREADS=4 ./infotheory ac-log-loss corpus.bin \
+  --mixture examples/mixture_spec.json \
+  --out-prefix /tmp/mixture-diagnostic
+```
+
+It writes:
+
+- `/tmp/mixture-diagnostic.trace.tsv`: per-position mixture probability/bits, oracle fields, root weight statistics, and per-node `prob` / `bits` / `local_weight` / `effective_weight`
+- `/tmp/mixture-diagnostic.nodes.tsv`: flattened mixture-tree metadata with stable node ids
+- `/tmp/mixture-diagnostic.summary.tsv`: total bits, oracle regret, switch counts, AC payload bits, and per-node aggregates
 
 ### Neural Method Strings
 

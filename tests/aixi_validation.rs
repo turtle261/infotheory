@@ -197,6 +197,49 @@ fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
     );
 }
 
+#[test]
+fn rate_backend_bit_predictor_roundtrips_sequitur_backend() {
+    let mut predictor = RateBackendBitPredictor::new(
+        RateBackend::Sequitur { context_bytes: 32 },
+        8,
+    )
+    .expect("valid sequitur predictor");
+
+    let initial = predictor_snapshot(&mut predictor);
+
+    predictor.update(true);
+    let after_update = predictor_snapshot(&mut predictor);
+    predictor.revert();
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        initial,
+        "sequitur revert after update",
+    );
+
+    predictor.update(true);
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        after_update,
+        "sequitur redo after update",
+    );
+
+    predictor.update_history(false);
+    let after_frozen = predictor_snapshot(&mut predictor);
+    predictor.pop_history();
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        after_update,
+        "sequitur pop_history after frozen update",
+    );
+
+    predictor.update_history(false);
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        after_frozen,
+        "sequitur redo after frozen update",
+    );
+}
+
 // ============================================================================
 // Environment Tests
 // ============================================================================

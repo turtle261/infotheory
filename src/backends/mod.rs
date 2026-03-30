@@ -20,6 +20,8 @@ pub mod particle;
 /// Bounded-memory PPMD-style byte model.
 pub mod ppmd;
 pub mod rosaplus;
+/// Exact online Sequitur grammar backend with byte-level predictive readout.
+pub mod sequitur;
 /// RWKV7-based rate/compression backend.
 #[cfg(feature = "backend-rwkv")]
 pub mod rwkvzip;
@@ -52,6 +54,7 @@ pub const AVAILABLE_RATE_BACKENDS: &[&str] = &[
     "match",
     "sparse-match",
     "ppmd",
+    "sequitur",
     "calibrated",
     #[cfg(feature = "backend-mamba")]
     "mamba",
@@ -88,6 +91,7 @@ pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
             Some(BackendAvailability::Enabled("sparse-match"))
         }
         "ppmd" | "ppm" => Some(BackendAvailability::Enabled("ppmd")),
+        "sequitur" => Some(BackendAvailability::Enabled("sequitur")),
         "calibrated" | "cal" => Some(BackendAvailability::Enabled("calibrated")),
         "zpaq" => {
             if cfg!(feature = "backend-zpaq") {
@@ -190,6 +194,10 @@ mod tests {
         assert_eq!(
             resolve_rate_backend_name("mix"),
             Some(BackendAvailability::Enabled("mixture"))
+        );
+        assert_eq!(
+            resolve_rate_backend_name("sequitur"),
+            Some(BackendAvailability::Enabled("sequitur"))
         );
         assert_eq!(resolve_rate_backend_name("unknown"), None);
     }

@@ -2,6 +2,7 @@ import ITE.Types
 import ITE.Oracles
 import ITE.Verification
 import ITE.Estimators
+import ITE.Sequitur
 
 open ITE
 open Std
@@ -12,7 +13,7 @@ set_option maxRecDepth 2000
 
 namespace ITE
 
-private def ensureExecutable (path : FilePath) : IO Unit := do
+def ensureExecutable (path : FilePath) : IO Unit := do
   if !(← path.pathExists) then
     throw <| IO.userError s!"Missing required executable: {path}. Build the Rust workspace (e.g. `cargo build --release`) and re-run."
 
@@ -62,6 +63,44 @@ private def ncdTripletGen (regime : DataRegime) : IO (SampleBundle × SampleBund
   let bz : SampleBundle := { bytesX := some z }
   return (bx, byBundle, bz)
 
+private def validateSequiturDomain
+    (binPath : FilePath)
+    (label : String)
+    (inputs : Array ByteArray)
+    (alphabetPrefix : Nat)
+    (chunkSize : Nat := 128) : IO Bool := do
+  IO.println s!"[SEQUITUR] Validating {label} domain ({inputs.size} inputs, chunk={chunkSize})"
+  let chunks := batchHexInputs inputs chunkSize
+  let mut ok := true
+  for chunk in chunks do
+    match ← runRustSequiturDebug binPath chunk 64 alphabetPrefix with
+    | .error e =>
+      ok := false
+      IO.println s!"[SEQUITUR] FAIL: {e}"
+    | .ok batch =>
+      if batch.cases.size != chunk.size then
+        ok := false
+        IO.println s!"[SEQUITUR] FAIL: expected {chunk.size} cases, got {batch.cases.size}"
+      else
+        match validateDebugBatch batch with
+        | .error e =>
+          ok := false
+          IO.println s!"[SEQUITUR] FAIL: {e}"
+        | .ok _ => pure ()
+  if ok then
+    IO.println s!"[SEQUITUR] PASS: {label}"
+  pure ok
+
+def runSequiturSuite (binPath : FilePath) : IO Bool := do
+  IO.println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  IO.println "[SEQUITUR] Canonical Grammar Validation"
+  IO.println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  let binaryInputs := allWordsUpTo #[0, 1] 12
+  let ternaryInputs := allWordsUpTo #[0, 1, 2] 9
+  let okBinary ← validateSequiturDomain binPath "binary<=12" binaryInputs 4
+  let okTernary ← validateSequiturDomain binPath "ternary<=9" ternaryInputs 4
+  pure <| okBinary && okTernary
+
 private def oracleGenFromOutcome (key : String) (outcome : OracleOutcome) : IO (SampleBundle × Float) := do
   let some v := outcome.truths[key]?
     | throw <| IO.userError s!"Missing oracle truth key: {key}"
@@ -90,7 +129,8 @@ private def mkParams
 
 private def runSuite : IO Bool := do
   let est := infotheoryEstimator
-  ensureExecutable (FilePath.mk "../target/release/infotheory")
+  let rustBin := FilePath.mk "../target/release/infotheory"
+  ensureExecutable rustBin
 
   IO.println "╔══════════════════════════════════════════════════════════════╗"
   IO.println "║    ITE Benchmark: Self-Contained Mathematical Validation     ║"
@@ -364,13 +404,23 @@ private def runSuite : IO Bool := do
 
     IO.println ""
 
+  let okSequitur ← runSequiturSuite rustBin
+  if !okSequitur then
+    ok := false
+
   return ok
 
 end ITE
 
 
-def main (_args : List String) : IO UInt32 := do
-  let ok ← ITE.runSuite
+def main (args : List String) : IO UInt32 := do
+  let ok ←
+    if args == ["sequitur"] then
+      let rustBin := FilePath.mk "../target/release/infotheory"
+      ITE.ensureExecutable rustBin
+      ITE.runSequiturSuite rustBin
+    else
+      ITE.runSuite
   if ok then
     IO.println "[OK] ite-bench validation suite passed"
     return 0

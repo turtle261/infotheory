@@ -9,7 +9,10 @@ use crate::aixi::rate_backend::rate_backend_contains_zpaq;
 use crate::ctw::{ContextTree, FacContextTree};
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip::{Compressor as MambaCompressor, Model as MambaModel, State as MambaState};
-use crate::mixture::{DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor};
+use crate::mixture::{
+    DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor,
+    RateBackendPredictorCheckpoint,
+};
 use crate::rosaplus::{RosaPlus, RosaTx};
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip::{Compressor as RwkvCompressor, Model as RwkvModel, State as RwkvState};
@@ -433,12 +436,12 @@ enum RateBackendJournalKind {
 #[derive(Clone)]
 struct RateBackendJournalEntry {
     kind: RateBackendJournalKind,
-    predictor: RateBackendPredictor,
+    checkpoint: RateBackendPredictorCheckpoint,
 }
 
 #[derive(Clone)]
 struct RateBackendRollbackScope {
-    predictor: RateBackendPredictor,
+    checkpoint: RateBackendPredictorCheckpoint,
     journal_len: usize,
 }
 
@@ -491,10 +494,10 @@ impl RateBackendBitPredictor {
         }
     }
 
-    fn checkpoint(&self, kind: RateBackendJournalKind) -> RateBackendJournalEntry {
+    fn checkpoint(&mut self, kind: RateBackendJournalKind) -> RateBackendJournalEntry {
         RateBackendJournalEntry {
             kind,
-            predictor: self.predictor.clone(),
+            checkpoint: self.predictor.checkpoint(),
         }
     }
 
@@ -512,15 +515,18 @@ impl RateBackendBitPredictor {
             "RateBackendBitPredictor rollback kind mismatch: expected {expected_kind:?}, got {:?}",
             entry.kind
         );
-        self.predictor = entry.predictor;
+        self.predictor.restore_checkpoint(&entry.checkpoint);
+        if self.rollback_scopes.is_empty() && self.journal.is_empty() {
+            self.predictor.clear_checkpoints_if_supported();
+        }
     }
 }
 
 impl Predictor for RateBackendBitPredictor {
     fn update(&mut self, sym: bool) {
         if self.rollback_scopes.is_empty() {
-            self.journal
-                .push(self.checkpoint(RateBackendJournalKind::Update));
+            let checkpoint = self.checkpoint(RateBackendJournalKind::Update);
+            self.journal.push(checkpoint);
         }
         self.predictor.update(Self::bit_to_byte(sym));
     }
@@ -531,8 +537,8 @@ impl Predictor for RateBackendBitPredictor {
 
     fn update_history(&mut self, sym: bool) {
         if self.rollback_scopes.is_empty() {
-            self.journal
-                .push(self.checkpoint(RateBackendJournalKind::FrozenUpdate));
+            let checkpoint = self.checkpoint(RateBackendJournalKind::FrozenUpdate);
+            self.journal.push(checkpoint);
         }
         self.predictor.update_frozen(Self::bit_to_byte(sym));
     }
@@ -550,8 +556,9 @@ impl Predictor for RateBackendBitPredictor {
     }
 
     fn begin_rollback_scope(&mut self) {
+        let checkpoint = self.predictor.checkpoint();
         self.rollback_scopes.push(RateBackendRollbackScope {
-            predictor: self.predictor.clone(),
+            checkpoint,
             journal_len: self.journal.len(),
         });
     }
@@ -560,8 +567,11 @@ impl Predictor for RateBackendBitPredictor {
         let Some(scope) = self.rollback_scopes.pop() else {
             return false;
         };
-        self.predictor = scope.predictor;
+        self.predictor.restore_checkpoint(&scope.checkpoint);
         self.journal.truncate(scope.journal_len);
+        if self.rollback_scopes.is_empty() && self.journal.is_empty() {
+            self.predictor.clear_checkpoints_if_supported();
+        }
         true
     }
 

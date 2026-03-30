@@ -164,6 +164,17 @@ fn generate_cli_backend_matrix_emits_requested_bytes() {
             "8",
             "--greedy",
         ],
+        vec![
+            "generate",
+            path_str.as_str(),
+            "--rate-backend",
+            "sequitur",
+            "--method",
+            "64",
+            "--bytes",
+            "8",
+            "--greedy",
+        ],
     ];
 
     for args in cases {

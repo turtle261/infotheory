@@ -84,6 +84,8 @@ pub mod coders;
 pub mod compression;
 /// Synthetic data generators for information-theory experiments.
 pub mod datagen;
+/// Diagnostic tooling for exact AC/log-loss mixture tracing.
+pub mod diagnostics;
 /// Online Bayesian/switching/MDL mixture predictors.
 pub mod mixture;
 pub(crate) mod neural_mix;
@@ -103,6 +105,8 @@ pub use backends::particle;
 pub use backends::ppmd;
 /// ROSA+ backend types.
 pub use backends::rosaplus;
+/// Exact online Sequitur backend types.
+pub use backends::sequitur;
 #[cfg(feature = "backend-rwkv")]
 /// RWKV backend types and compressor.
 pub use backends::rwkvzip;
@@ -380,6 +384,11 @@ pub enum RateBackend {
         order: usize,
         /// Approximate memory budget in MiB.
         memory_mb: usize,
+    },
+    /// Exact online Sequitur grammar backend with byte-level predictive readout.
+    Sequitur {
+        /// Maximum number of terminal bytes retained per grammar-derived context.
+        context_bytes: usize,
     },
     #[cfg(feature = "backend-mamba")]
     /// Mamba model loaded from explicit weights.
@@ -743,6 +752,13 @@ fn validate_mixture_spec_shallow(spec: &MixtureSpec) -> Result<(), String> {
 
 fn validate_rate_backend_with_depth(backend: &RateBackend, depth: usize) -> Result<(), String> {
     match backend {
+        RateBackend::Sequitur { context_bytes } => {
+            if *context_bytes < 2 {
+                Err("sequitur context_bytes must be >= 2".to_string())
+            } else {
+                Ok(())
+            }
+        }
         RateBackend::Mixture { spec } => validate_mixture_spec_with_depth(spec.as_ref(), depth),
         RateBackend::Particle { spec } => spec.validate(),
         RateBackend::Calibrated { spec } => {
@@ -1139,6 +1155,7 @@ impl InfotheoryCtx {
             RateBackend::Match { .. }
             | RateBackend::SparseMatch { .. }
             | RateBackend::Ppmd { .. }
+            | RateBackend::Sequitur { .. }
             | RateBackend::Calibrated { .. } => {
                 prequential_rate_backend(data, prefix_parts, -1, &self.rate_backend)
             }
@@ -2028,6 +2045,7 @@ pub fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) 
         RateBackend::Match { .. }
         | RateBackend::SparseMatch { .. }
         | RateBackend::Ppmd { .. }
+        | RateBackend::Sequitur { .. }
         | RateBackend::Calibrated { .. } => prequential_rate_backend(data, &[], max_order, backend),
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7 { model } => with_rwkv_tls(model, |c| {
@@ -2173,6 +2191,7 @@ pub fn joint_entropy_rate_backend(
         RateBackend::Match { .. }
         | RateBackend::SparseMatch { .. }
         | RateBackend::Ppmd { .. }
+        | RateBackend::Sequitur { .. }
         | RateBackend::Calibrated { .. } => {
             let mut joint = Vec::with_capacity(x.len() * 2);
             for (&xb, &yb) in x.iter().zip(y.iter()) {

@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 use crate::backends::calibration::CalibratorCore;
 use crate::backends::match_model::MatchModel;
 use crate::backends::ppmd::PpmdModel;
+use crate::backends::sequitur::SequiturModel;
 use crate::backends::sparse_match::SparseMatchModel;
 use crate::backends::text_context::TextContextAnalyzer;
 use crate::coders::{
@@ -29,10 +30,12 @@ use crate::rosaplus::RosaPlus;
 use crate::rwkvzip;
 use crate::zpaq_rate::ZpaqRateModel;
 use crate::{CalibratedSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend};
+use rayon::{ThreadPool, prelude::*};
 
 const FRAMED_MAGIC: u32 = 0x4354_4946; // "FITC"
 const FRAMED_VERSION: u8 = 1;
 const PDF_MIN: f64 = DEFAULT_MIN_PROB;
+const DIAGNOSTIC_PARALLEL_THRESHOLD: usize = 4;
 
 #[inline]
 fn build_calibrator(spec: &CalibratedSpec) -> CalibratorCore {
@@ -578,6 +581,29 @@ struct MixExpert {
     cum_log_loss: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AcLogLossNodeValue {
+    pub(crate) prob: f64,
+    pub(crate) local_weight: f64,
+    pub(crate) effective_weight: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AcLogLossSubtreeSnapshot {
+    pub(crate) prob: f64,
+    pub(crate) rows: Vec<AcLogLossNodeValue>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AcLogLossRootSnapshot {
+    pub(crate) mix_prob: f64,
+    pub(crate) root_weight_entropy_bits: f64,
+    pub(crate) root_top1_child_index: Option<usize>,
+    pub(crate) root_top1_weight: f64,
+    pub(crate) root_top2_child_index: Option<usize>,
+    pub(crate) root_top2_weight: f64,
+}
+
 #[derive(Clone)]
 struct MixturePredictor {
     kind: MixtureKind,
@@ -664,48 +690,111 @@ impl MixturePredictor {
         })
     }
 
+    fn best_expert_index(&self) -> Option<usize> {
+        let mut best_idx = None;
+        let mut best_loss = f64::INFINITY;
+        for (index, expert) in self.experts.iter().enumerate() {
+            if expert.cum_log_loss < best_loss {
+                best_loss = expert.cum_log_loss;
+                best_idx = Some(index);
+            }
+        }
+        best_idx
+    }
+
+    fn predictive_weights(&mut self) -> Vec<f64> {
+        if self.experts.is_empty() {
+            return Vec::new();
+        }
+
+        match self.kind {
+            MixtureKind::Neural => {
+                if self.experts.len() == 1 {
+                    return vec![1.0];
+                }
+                self.neural.set_context_state(self.analyzer.state());
+                self.neural.evaluate_expert_weights();
+                let mut weights = self.neural.expert_weights().to_vec();
+                normalize_simplex_weights(&mut weights);
+                weights
+            }
+            MixtureKind::Mdl => {
+                let mut weights = vec![0.0; self.experts.len()];
+                if let Some(best_idx) = self.best_expert_index() {
+                    weights[best_idx] = 1.0;
+                }
+                weights
+            }
+            MixtureKind::FadingBayes => {
+                let max_log = self
+                    .experts
+                    .iter()
+                    .map(|expert| self.decay * expert.log_weight)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let mut weights = self
+                    .experts
+                    .iter()
+                    .map(|expert| {
+                        if max_log.is_finite() {
+                            (self.decay * expert.log_weight - max_log).exp()
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                normalize_simplex_weights(&mut weights);
+                weights
+            }
+            MixtureKind::Convex => {
+                let mut weights = self
+                    .experts
+                    .iter()
+                    .map(|expert| expert.log_weight.exp())
+                    .collect::<Vec<_>>();
+                normalize_simplex_weights(&mut weights);
+                weights
+            }
+            MixtureKind::Bayes | MixtureKind::Switching => {
+                let max_log = self
+                    .experts
+                    .iter()
+                    .map(|expert| expert.log_weight)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let mut weights = self
+                    .experts
+                    .iter()
+                    .map(|expert| {
+                        if max_log.is_finite() {
+                            (expert.log_weight - max_log).exp()
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                normalize_simplex_weights(&mut weights);
+                weights
+            }
+        }
+    }
+
     fn ensure_pdf(&mut self) -> Result<&[f64]> {
         if self.valid {
             return Ok(&self.pdf);
         }
-        match self.kind {
-            MixtureKind::Neural => {
-                if self.experts.len() == 1 {
-                    self.pdf.fill(0.0);
-                    let epdf = self.experts[0].predictor.pdf_next()?;
-                    self.pdf.copy_from_slice(epdf);
-                    normalize_pdf(&mut self.pdf);
-                    self.valid = true;
-                    return Ok(&self.pdf);
-                }
-                self.neural.set_context_state(self.analyzer.state());
-                self.neural.evaluate_expert_weights();
-                let n = self.experts.len();
-                self.scratch.resize(n, 0.0);
-                self.scratch.copy_from_slice(self.neural.expert_weights());
-                self.pdf.fill(0.0);
-                for i in 0..n {
-                    let epdf = self.experts[i].predictor.pdf_next()?;
-                    let w = self.scratch[i];
-                    for (pdf_slot, &p) in self.pdf.iter_mut().zip(epdf.iter()) {
-                        *pdf_slot += w * p;
-                    }
-                }
-                normalize_pdf(&mut self.pdf);
-                self.valid = true;
-                return Ok(&self.pdf);
+        let weights = self.predictive_weights();
+        if weights.len() == 1 && matches!(self.kind, MixtureKind::Mdl | MixtureKind::Neural) {
+            self.pdf.fill(0.0);
+        } else {
+            self.pdf.fill(0.0);
+        }
+        for (index, expert) in self.experts.iter_mut().enumerate() {
+            let weight = weights.get(index).copied().unwrap_or(0.0);
+            if weight <= 0.0 {
+                continue;
             }
-            _ => {
-                self.pdf.fill(0.0);
-
-                let lw_norm = logsumexp_expert_weights(&self.experts);
-                for e in &mut self.experts {
-                    let w = (e.log_weight - lw_norm).exp();
-                    let epdf = e.predictor.pdf_next()?;
-                    for (i, p) in epdf.iter().enumerate().take(256) {
-                        self.pdf[i] += w * *p;
-                    }
-                }
+            let epdf = expert.predictor.pdf_next()?;
+            for (slot, &p) in self.pdf.iter_mut().zip(epdf.iter()) {
+                *slot += weight * p;
             }
         }
 
@@ -724,6 +813,137 @@ impl MixturePredictor {
             }
         }
         Ok(())
+    }
+
+    fn diagnostic_collect_children(
+        &mut self,
+        symbol: u8,
+        weights: &[f64],
+        effective_prefix: f64,
+        pool: Option<&ThreadPool>,
+    ) -> Result<Vec<AcLogLossSubtreeSnapshot>> {
+        let use_parallel = pool.is_some() && self.experts.len() >= DIAGNOSTIC_PARALLEL_THRESHOLD;
+        if use_parallel {
+            let pool = pool.expect("checked is_some");
+            pool.install(|| {
+                self.experts
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(index, expert)| {
+                        let local_weight = weights.get(index).copied().unwrap_or(0.0);
+                        let effective_weight = effective_prefix * local_weight;
+                        expert.predictor.diagnostic_snapshot_subtree(
+                            symbol,
+                            local_weight,
+                            effective_weight,
+                            None,
+                        )
+                    })
+                    .collect()
+            })
+        } else {
+            let mut children = Vec::with_capacity(self.experts.len());
+            for (index, expert) in self.experts.iter_mut().enumerate() {
+                let local_weight = weights.get(index).copied().unwrap_or(0.0);
+                let effective_weight = effective_prefix * local_weight;
+                children.push(expert.predictor.diagnostic_snapshot_subtree(
+                    symbol,
+                    local_weight,
+                    effective_weight,
+                    pool,
+                )?);
+            }
+            Ok(children)
+        }
+    }
+
+    fn diagnostic_subtree_snapshot(
+        &mut self,
+        symbol: u8,
+        local_weight: f64,
+        effective_weight: f64,
+        pool: Option<&ThreadPool>,
+    ) -> Result<AcLogLossSubtreeSnapshot> {
+        let weights = self.predictive_weights();
+        let children =
+            self.diagnostic_collect_children(symbol, &weights, effective_weight, pool)?;
+        let mix_prob = children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| weights.get(index).copied().unwrap_or(0.0) * child.prob)
+            .sum::<f64>()
+            .max(PDF_MIN);
+        let total_rows = 1 + children.iter().map(|child| child.rows.len()).sum::<usize>();
+        let mut rows = Vec::with_capacity(total_rows);
+        rows.push(AcLogLossNodeValue {
+            prob: mix_prob,
+            local_weight,
+            effective_weight,
+        });
+        for child in children {
+            rows.extend(child.rows);
+        }
+        Ok(AcLogLossSubtreeSnapshot {
+            prob: mix_prob,
+            rows,
+        })
+    }
+
+    fn diagnostic_root_snapshot(
+        &mut self,
+        symbol: u8,
+        pool: Option<&ThreadPool>,
+        out: &mut Vec<AcLogLossNodeValue>,
+    ) -> Result<AcLogLossRootSnapshot> {
+        let weights = self.predictive_weights();
+        let children = self.diagnostic_collect_children(symbol, &weights, 1.0, pool)?;
+        out.clear();
+        out.reserve(children.iter().map(|child| child.rows.len()).sum::<usize>());
+        for child in &children {
+            out.extend_from_slice(&child.rows);
+        }
+
+        let mix_prob = children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| weights.get(index).copied().unwrap_or(0.0) * child.prob)
+            .sum::<f64>()
+            .max(PDF_MIN);
+
+        let mut top1 = None;
+        let mut top2 = None;
+        for (index, &weight) in weights.iter().enumerate() {
+            match top1 {
+                None => top1 = Some((index, weight)),
+                Some((best_idx, best_weight)) if weight > best_weight => {
+                    top2 = Some((best_idx, best_weight));
+                    top1 = Some((index, weight));
+                }
+                _ => match top2 {
+                    None => top2 = Some((index, weight)),
+                    Some((_, second_weight)) if weight > second_weight => {
+                        top2 = Some((index, weight));
+                    }
+                    _ => {}
+                },
+            }
+        }
+
+        let root_weight_entropy_bits = weights
+            .iter()
+            .copied()
+            .filter(|weight| *weight > 0.0)
+            .map(|weight| -weight * weight.log2())
+            .sum::<f64>();
+
+        Ok(AcLogLossRootSnapshot {
+            mix_prob,
+            root_weight_entropy_bits,
+            root_top1_child_index: top1.map(|(index, _)| index),
+            root_top1_weight: top1.map(|(_, weight)| weight).unwrap_or(0.0),
+            root_top2_child_index: top2.map(|(index, _)| index),
+            root_top2_weight: top2.map(|(_, weight)| weight).unwrap_or(0.0),
+        })
     }
 
     fn update(&mut self, symbol: u8) -> Result<()> {
@@ -904,11 +1124,17 @@ impl MixturePredictor {
                 self.neural.evaluate_expert_weights();
                 self.scratch.copy_from_slice(self.neural.expert_weights());
             }
+            MixtureKind::FadingBayes => {
+                let weights = self.predictive_weights();
+                self.scratch.copy_from_slice(&weights);
+            }
+            MixtureKind::Mdl => {
+                let weights = self.predictive_weights();
+                self.scratch.copy_from_slice(&weights);
+            }
             _ => {
-                let lw_norm = logsumexp_expert_weights(&self.experts);
-                for (i, expert) in self.experts.iter().enumerate() {
-                    self.scratch[i] = (expert.log_weight - lw_norm).exp();
-                }
+                let weights = self.predictive_weights();
+                self.scratch.copy_from_slice(&weights);
             }
         }
         self.scratch2.resize(n, 1.0);
@@ -1115,6 +1341,53 @@ impl MixturePredictor {
     }
 }
 
+pub(crate) struct DiagnosticRatePredictor {
+    inner: RatePdfPredictor,
+}
+
+impl DiagnosticRatePredictor {
+    pub(crate) fn from_rate_backend(backend: RateBackend, max_order: i64) -> Result<Self> {
+        Ok(Self {
+            inner: RatePdfPredictor::from_rate_backend(backend, max_order)?,
+        })
+    }
+
+    pub(crate) fn begin_stream(&mut self, total_len: usize) -> Result<()> {
+        self.inner.begin_stream(total_len)
+    }
+
+    pub(crate) fn finish_stream(&mut self) -> Result<()> {
+        self.inner.finish_stream()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pdf_next(&mut self) -> Result<&[f64]> {
+        self.inner.pdf_next()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update(&mut self, symbol: u8) -> Result<()> {
+        self.inner.update(symbol)
+    }
+
+    pub(crate) fn diagnostic_root_snapshot(
+        &mut self,
+        symbol: u8,
+        pool: Option<&ThreadPool>,
+        out: &mut Vec<AcLogLossNodeValue>,
+    ) -> Result<AcLogLossRootSnapshot> {
+        self.inner.diagnostic_root_snapshot(symbol, pool, out)
+    }
+
+    pub(crate) fn encode_symbol_ac_step<W: std::io::Write>(
+        &mut self,
+        symbol: u8,
+        encoder: &mut ArithmeticEncoder<W>,
+    ) -> Result<()> {
+        self.inner.encode_symbol_ac_step(symbol, encoder)
+    }
+}
+
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 enum RatePdfPredictor {
@@ -1127,6 +1400,9 @@ enum RatePdfPredictor {
     },
     Ppmd {
         model: PpmdModel,
+    },
+    Sequitur {
+        model: SequiturModel,
     },
     Ctw(CtwPredictor),
     FacCtw(CtwPredictor),
@@ -1186,6 +1462,9 @@ impl RatePdfPredictor {
             RateBackend::Ppmd { order, memory_mb } => Ok(Self::Ppmd {
                 model: PpmdModel::new(order, memory_mb),
             }),
+            RateBackend::Sequitur { context_bytes } => Ok(Self::Sequitur {
+                model: SequiturModel::new(context_bytes),
+            }),
             RateBackend::Ctw { depth } => Ok(Self::Ctw(CtwPredictor::new_ctw(depth))),
             RateBackend::FacCtw {
                 base_depth,
@@ -1235,6 +1514,10 @@ impl RatePdfPredictor {
             | Self::Ppmd { .. }
             | Self::Zpaq(_)
             | Self::Particle(_) => Ok(()),
+            Self::Sequitur { model } => {
+                model.begin_stream(Some(total_len as u64));
+                Ok(())
+            }
             Self::Ctw(m) | Self::FacCtw(m) => {
                 m.tree.reserve_for_symbols(total_len);
                 Ok(())
@@ -1254,6 +1537,7 @@ impl RatePdfPredictor {
             | Self::Match { .. }
             | Self::SparseMatch { .. }
             | Self::Ppmd { .. }
+            | Self::Sequitur { .. }
             | Self::Ctw(_)
             | Self::FacCtw(_)
             | Self::Zpaq(_)
@@ -1282,6 +1566,7 @@ impl RatePdfPredictor {
             Self::Particle(m) => Ok(m.pdf_next()),
             Self::SparseMatch { model } => Ok(model.pdf()),
             Self::Ppmd { model } => Ok(model.pdf()),
+            Self::Sequitur { model } => Ok(model.pdf()),
             Self::Calibrated {
                 base,
                 core,
@@ -1314,6 +1599,10 @@ impl RatePdfPredictor {
                 Ok(())
             }
             Self::Ppmd { model } => {
+                model.update(symbol);
+                Ok(())
+            }
+            Self::Sequitur { model } => {
                 model.update(symbol);
                 Ok(())
             }
@@ -1422,6 +1711,72 @@ impl RatePdfPredictor {
             _ => unreachable!("fast bitwise path requested for unsupported predictor"),
         }
     }
+
+    fn diagnostic_snapshot_subtree(
+        &mut self,
+        symbol: u8,
+        local_weight: f64,
+        effective_weight: f64,
+        pool: Option<&ThreadPool>,
+    ) -> Result<AcLogLossSubtreeSnapshot> {
+        match self {
+            Self::Mixture(m) => {
+                m.diagnostic_subtree_snapshot(symbol, local_weight, effective_weight, pool)
+            }
+            _ => {
+                let prob = self.pdf_next()?[symbol as usize].max(PDF_MIN);
+                Ok(AcLogLossSubtreeSnapshot {
+                    prob,
+                    rows: vec![AcLogLossNodeValue {
+                        prob,
+                        local_weight,
+                        effective_weight,
+                    }],
+                })
+            }
+        }
+    }
+
+    fn diagnostic_root_snapshot(
+        &mut self,
+        symbol: u8,
+        pool: Option<&ThreadPool>,
+        out: &mut Vec<AcLogLossNodeValue>,
+    ) -> Result<AcLogLossRootSnapshot> {
+        match self {
+            Self::Mixture(m) => m.diagnostic_root_snapshot(symbol, pool, out),
+            _ => anyhow::bail!("AC log-loss diagnostics require a top-level mixture backend"),
+        }
+    }
+
+    fn encode_symbol_ac_step<W: std::io::Write>(
+        &mut self,
+        symbol: u8,
+        encoder: &mut ArithmeticEncoder<W>,
+    ) -> Result<()> {
+        if self.can_fast_ac_bitwise() {
+            self.ac_step_fast_bitwise(|bit_idx, p1_mix| {
+                let bit = (symbol >> (7 - bit_idx)) & 1;
+                let split = binary_split_from_prob_one(p1_mix);
+                if bit == 0 {
+                    encoder.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
+                } else {
+                    encoder.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
+                }
+                Ok(bit)
+            })?;
+            return Ok(());
+        }
+
+        let pdf = self.pdf_next()?;
+        let mut cdf = vec![0u32; 257];
+        crate::coders::quantize_pdf_to_integer_cdf_dense_positive_with_buffer(
+            pdf, CDF_TOTAL, &mut cdf,
+        );
+        let sym = symbol as usize;
+        encoder.encode_counts(cdf[sym] as u64, cdf[sym + 1] as u64, CDF_TOTAL as u64)?;
+        self.update(symbol)
+    }
 }
 
 fn ctw_ac_step_bitwise<F>(ctw: &mut CtwPredictor, mut choose_bit: F) -> Result<u8>
@@ -1454,40 +1809,11 @@ fn binary_split_from_prob_one(p1: f64) -> u32 {
 
 fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Vec<u8>> {
     predictor.begin_stream(data.len())?;
-    if predictor.can_fast_ac_bitwise() {
-        let mut out = Vec::new();
-        {
-            let mut enc = ArithmeticEncoder::new(&mut out);
-            for &symbol in data {
-                predictor.ac_step_fast_bitwise(|bit_idx, p1_mix| {
-                    let bit = (symbol >> (7 - bit_idx)) & 1;
-                    let split = binary_split_from_prob_one(p1_mix);
-                    if bit == 0 {
-                        enc.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
-                    } else {
-                        enc.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
-                    }
-                    Ok(bit)
-                })?;
-            }
-            let _ = enc.finish()?;
-        }
-        predictor.finish_stream()?;
-        return Ok(out);
-    }
-
     let mut out = Vec::new();
     {
         let mut enc = ArithmeticEncoder::new(&mut out);
-        let mut cdf = vec![0u32; 257];
-        for &b in data {
-            let pdf = predictor.pdf_next()?;
-            crate::coders::quantize_pdf_to_integer_cdf_dense_positive_with_buffer(
-                pdf, CDF_TOTAL, &mut cdf,
-            );
-            let sym = b as usize;
-            enc.encode_counts(cdf[sym] as u64, cdf[sym + 1] as u64, CDF_TOTAL as u64)?;
-            predictor.update(b)?;
+        for &symbol in data {
+            predictor.encode_symbol_ac_step(symbol, &mut enc)?;
         }
         let _ = enc.finish()?;
     }
@@ -2372,13 +2698,13 @@ mod tests {
         let experts = spec.build_experts();
         let mut runtime = crate::mixture::build_mixture_runtime(&spec, &experts).unwrap();
 
-        for &symbol in data {
+        for (t, &symbol) in data.iter().enumerate() {
             let pdf = predictor.pdf_next().unwrap();
             let p_comp = pdf[symbol as usize];
             let p_runtime = runtime.peek_log_prob(symbol).exp();
             assert!(
                 (p_comp - p_runtime).abs() < tol,
-                "p_comp={p_comp} p_runtime={p_runtime} symbol={symbol}"
+                "t={t} p_comp={p_comp} p_runtime={p_runtime} symbol={symbol}"
             );
             predictor.update(symbol).unwrap();
             runtime.step(symbol);
@@ -2412,6 +2738,16 @@ mod tests {
         assert_runtime_and_compression_predictor_align(
             spec,
             b"bayes predictor alignment check sequence",
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn fading_runtime_and_compression_predictor_align() {
+        let spec = MixtureSpec::new(MixtureKind::FadingBayes, alignment_experts()).with_decay(0.97);
+        assert_runtime_and_compression_predictor_align(
+            spec,
+            b"fading predictor alignment check sequence",
             1e-8,
         );
     }
@@ -2466,6 +2802,45 @@ mod tests {
         assert_runtime_and_compression_predictor_align(
             spec,
             b"neural alignment check sequence",
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn mdl_runtime_and_compression_predictor_align() {
+        let spec = MixtureSpec::new(MixtureKind::Mdl, alignment_experts());
+        assert_runtime_and_compression_predictor_align(spec, b"mdl alignment check sequence", 1e-8);
+    }
+
+    #[test]
+    fn nested_runtime_and_compression_predictor_align() {
+        let nested = MixtureSpec::new(MixtureKind::Bayes, alignment_experts());
+        let spec = MixtureSpec::new(
+            MixtureKind::Switching,
+            vec![
+                crate::MixtureExpertSpec {
+                    name: Some("nested".to_string()),
+                    log_prior: 0.0,
+                    max_order: -1,
+                    backend: RateBackend::Mixture {
+                        spec: Arc::new(nested),
+                    },
+                },
+                crate::MixtureExpertSpec {
+                    name: Some("ppmd".to_string()),
+                    log_prior: -0.2,
+                    max_order: -1,
+                    backend: RateBackend::Ppmd {
+                        order: 5,
+                        memory_mb: 8,
+                    },
+                },
+            ],
+        )
+        .with_alpha(0.13);
+        assert_runtime_and_compression_predictor_align(
+            spec,
+            b"nested mixture predictor alignment check sequence",
             1e-8,
         );
     }

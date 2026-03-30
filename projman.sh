@@ -192,6 +192,22 @@ cmd_tui() {
     return 0
   fi
 
+  if [ "${1:-}" = "log-loss" ]; then
+    shift
+    [ $# -ge 1 ] || fail "Usage: ./projman.sh tui log-loss <prefix>"
+    prefix=$1
+    shift
+
+    say "[tui] Building benchman (release)..."
+    need_cmd cargo
+    (cd "$ROOT_DIR" && CARGO_INCREMENTAL=0 cargo build --release --locked -p benchman)
+
+    say "[tui] Launching benchman log-loss mode..."
+    (cd "$ROOT_DIR" && "$ROOT_DIR/target/release/benchman" log-loss "$prefix" "$@")
+    say "[tui] Done"
+    return 0
+  fi
+
   suite=${INFOTHEORY_PLOT_SUITE:-${INFOTHEORY_BENCH_SUITE:-two-json}}
   case "${1:-}" in
     two-json|two_json|two|core|full)
@@ -246,6 +262,7 @@ Commands:
   bench__aixi_competitors  Run reproducible Guix time-machine benchmark for Infotheory MC-AIXI (Rust+Python) vs PyAIXI and C++ MC-AIXI. Fails fast if Guix is unavailable.
   plot [suite]   Open benchmark results in the benchman TUI for the selected suite (`two-json` default, or `extra`). Not included in test_all.
   tui [suite]    Build and launch the interactive benchmark TUI (`benchman`) for the selected suite (`two-json` default, or `extra`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
+  tui log-loss <prefix>  Build and launch the log-loss diagnostic TUI for <prefix>.trace.tsv / .nodes.tsv / .summary.tsv.
   tui man     Open the local benchman manual via nvim man pager (MANPAGER='nvim +Man!').
   code_test   Build (release) and run Rust tests (release). Uses --features vm iff VM artifacts exist and /dev/kvm is accessible.
   init-vm     Download/build VM artifacts needed for VM tests (kernel, initramfs, docker rootfs).

@@ -43,6 +43,7 @@ use infotheory::aixi::vm_nyx::{
     PayloadEncoding as NyxPayloadEncoding,
 };
 use infotheory::*;
+use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
 #[cfg(feature = "vm")]
 use nyx_lite::SharedMemoryPolicy;
 use std::env;
@@ -505,6 +506,14 @@ fn parse_mixture_expert_value(
             backend: RateBackend::Ppmd {
                 order: v["order"].as_u64().unwrap_or(10) as usize,
                 memory_mb: v["memory_mb"].as_u64().unwrap_or(64) as usize,
+            },
+        }),
+        "sequitur" => Ok(MixtureExpertSpec {
+            name,
+            log_prior,
+            max_order: -1,
+            backend: RateBackend::Sequitur {
+                context_bytes: v["context_bytes"].as_u64().unwrap_or(64) as usize,
             },
         }),
         "calibrated" => {
@@ -978,6 +987,9 @@ fn parse_vm_stats_backend(
             order: cfg["order"].as_u64().unwrap_or(10) as usize,
             memory_mb: cfg["memory_mb"].as_u64().unwrap_or(64) as usize,
         }),
+        "sequitur" => Ok(RateBackend::Sequitur {
+            context_bytes: cfg["context_bytes"].as_u64().unwrap_or(64) as usize,
+        }),
         "mixture" => {
             let spec = if let Some(spec_v) = cfg.get("spec").filter(|value| value.is_object()) {
                 parse_mixture_spec_value(spec_v, base_dir, MAX_MIXTURE_NESTING)?
@@ -1049,6 +1061,9 @@ fn default_vm_stats_backend(root: &serde_json::Value) -> anyhow::Result<RateBack
             base_depth: ct_depth,
             num_percept_bits: 8,
             encoding_bits: 8,
+        }),
+        "sequitur" => Ok(RateBackend::Sequitur {
+            context_bytes: root["context_bytes"].as_u64().unwrap_or(64) as usize,
         }),
         "mamba" | "mamba1" => {
             #[cfg(feature = "backend-mamba")]
@@ -1623,6 +1638,9 @@ fn build_ctx(
                     order: method.and_then(|m| m.parse::<usize>().ok()).unwrap_or(10),
                     memory_mb: 64,
                 },
+                "sequitur" => RateBackend::Sequitur {
+                    context_bytes: method.and_then(|m| m.parse::<usize>().ok()).unwrap_or(64),
+                },
                 "ctw" => {
                     let depth = if let Some(m) = method {
                         m.parse::<usize>().unwrap_or(20)
@@ -1784,6 +1802,44 @@ fn read_file(path: &str) -> Vec<u8> {
             std::process::exit(1);
         }
     }
+}
+
+fn parse_hex_bytes(raw: &str) -> anyhow::Result<Vec<u8>> {
+    fn nibble(byte: u8) -> anyhow::Result<u8> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            b'A'..=b'F' => Ok(byte - b'A' + 10),
+            _ => Err(anyhow::anyhow!("invalid hex digit '{}'", byte as char)),
+        }
+    }
+
+    let cleaned: Vec<u8> = raw
+        .bytes()
+        .filter(|b| !matches!(b, b' ' | b'\n' | b'\r' | b'\t' | b'_'))
+        .collect();
+    if cleaned.len() % 2 != 0 {
+        return Err(anyhow::anyhow!("hex input must have an even number of digits"));
+    }
+    let mut out = Vec::with_capacity(cleaned.len() / 2);
+    let mut i = 0usize;
+    while i < cleaned.len() {
+        let hi = nibble(cleaned[i])?;
+        let lo = nibble(cleaned[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    out
 }
 
 fn read_stdin_all_for_generate() -> Vec<u8> {
@@ -2945,6 +3001,11 @@ fn main() {
     let mut method_str: Option<String> = None;
     let mut expert_spec_path: Option<String> = None;
     let mut model_export_path: Option<String> = None;
+    let mut diagnostic_mixture_path: Option<String> = None;
+    let mut diagnostic_out_prefix: Option<String> = None;
+    let mut sequitur_debug_hexes: Vec<String> = Vec::new();
+    let mut sequitur_context_bytes: usize = 64;
+    let mut sequitur_alphabet_prefix: usize = 4;
     let mut generate_len_bytes: usize = 8;
     let mut generate_config = GenerationConfig::default();
     let mut rate_backend_specified = false;
@@ -2988,6 +3049,40 @@ fn main() {
             "--model-export" | "--rwkv-export" => {
                 i += 1;
                 model_export_path = args.get(i).cloned();
+            }
+            "--mixture" => {
+                i += 1;
+                diagnostic_mixture_path = args.get(i).cloned();
+            }
+            "--out-prefix" => {
+                i += 1;
+                diagnostic_out_prefix = args.get(i).cloned();
+            }
+            "--hex" => {
+                i += 1;
+                if let Some(value) = args.get(i) {
+                    sequitur_debug_hexes.push(value.clone());
+                }
+            }
+            "--context-bytes" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --context-bytes requires a positive integer");
+                sequitur_context_bytes = raw.parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("Error: --context-bytes must be a positive integer, got '{raw}'");
+                    std::process::exit(1);
+                });
+            }
+            "--alphabet-prefix" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --alphabet-prefix requires a positive integer");
+                sequitur_alphabet_prefix = raw.parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("Error: --alphabet-prefix must be a positive integer, got '{raw}'");
+                    std::process::exit(1);
+                });
             }
             "--bytes" => {
                 i += 1;
@@ -3072,6 +3167,103 @@ fn main() {
             _ => {}
         }
         i += 1;
+    }
+
+    if primitive == "ac-log-loss" || primitive == "ac_log_loss" {
+        let input_path = file1.unwrap_or_exit(
+            "Error: 'ac-log-loss' requires <input> --mixture <spec.json> --out-prefix <prefix>",
+        );
+        let mixture_path = diagnostic_mixture_path
+            .unwrap_or_exit("Error: 'ac-log-loss' requires --mixture <spec.json>");
+        let out_prefix = diagnostic_out_prefix
+            .unwrap_or_exit("Error: 'ac-log-loss' requires --out-prefix <prefix>");
+        let spec = load_mixture_spec(&mixture_path).unwrap_or_else(|e| {
+            eprintln!(
+                "Error: failed to load mixture spec '{}': {}",
+                mixture_path, e
+            );
+            std::process::exit(1);
+        });
+        let data = read_file(&input_path);
+        match infotheory::diagnostics::run_ac_log_loss_mixture_bytes(&data, &spec, &out_prefix) {
+            Ok(summary) => {
+                println!(
+                    "wrote {} rows to {}, nodes to {}, summary to {}",
+                    summary.positions,
+                    summary.trace_path.display(),
+                    summary.nodes_path.display(),
+                    summary.summary_path.display()
+                );
+            }
+            Err(err) => {
+                eprintln!("Error: AC log-loss diagnostic failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if primitive == "sequitur-debug" || primitive == "sequitur_debug" {
+        let inputs = if !sequitur_debug_hexes.is_empty() {
+            sequitur_debug_hexes
+                .iter()
+                .map(|raw_hex| {
+                    parse_hex_bytes(raw_hex).unwrap_or_else(|e| {
+                        eprintln!("Error: invalid --hex input for 'sequitur-debug': {e}");
+                        std::process::exit(1);
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let input_path =
+                file1.unwrap_or_exit("Error: 'sequitur-debug' requires <input> or --hex <hex>");
+            vec![read_file(&input_path)]
+        };
+        let alphabet_prefix = sequitur_alphabet_prefix.clamp(1, 256);
+        let cases = inputs
+            .iter()
+            .map(|data| {
+                let mut model = SequiturModel::new(sequitur_context_bytes);
+                let trace = model.predictive_trace(data, alphabet_prefix);
+                let rules = model
+                    .canonical_grammar()
+                    .rules
+                    .iter()
+                    .map(|rule| {
+                        let rhs = rule
+                            .rhs
+                            .iter()
+                            .map(|sym| match sym {
+                                CanonicalSymbol::Terminal(byte) => serde_json::json!(*byte as i64),
+                                CanonicalSymbol::NonTerminal(rule_id) => {
+                                    serde_json::json!(-((*rule_id as i64) + 1))
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        serde_json::json!({
+                            "id": rule.id,
+                            "rhs": rhs,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "input_hex": bytes_to_hex(data),
+                    "decoded_hex": bytes_to_hex(&model.decode()),
+                    "rules": rules,
+                    "trace": trace,
+                })
+            })
+            .collect::<Vec<_>>();
+        let output = serde_json::json!({
+            "context_bytes": sequitur_context_bytes,
+            "alphabet_prefix": alphabet_prefix,
+            "cases": cases,
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&output).expect("sequitur debug json serialization")
+        );
+        return;
     }
 
     let built_ctx = build_ctx(
@@ -3364,6 +3556,10 @@ Primitives:
     generate [file] [max_order]             Generate continuation from file or piped stdin
     compress <in> <out>                     Compress file using selected compression backend
     decompress <in> <out>                   Decompress file using selected compression backend
+    ac-log-loss <input> --mixture <spec.json> --out-prefix <prefix>
+                                          Emit exact AC/log-loss TSV diagnostics for a mixture
+    sequitur-debug <input>|--hex <hex> [--hex <hex> ...]
+                                          Emit canonical Sequitur grammar and bounded predictive traces
 
 Options:
     --rate-backend <name>   Backend for rate estimation: {rate_backends}
@@ -3375,6 +3571,11 @@ Options:
   --expert-spec <path>    Load one exact standalone expert JSON (same schema as a mixture 'experts' entry)
   --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
   --rwkv-export <path>    Backward-compatible alias for --model-export
+  --mixture <path>        Mixture spec for 'ac-log-loss'
+  --out-prefix <prefix>   Output prefix for 'ac-log-loss' TSVs
+  --hex <hex>             Hex-encoded byte string for 'sequitur-debug' (repeatable)
+  --context-bytes <n>     Sequitur context width (default: 64)
+  --alphabet-prefix <n>   Prefix of predictive PDF to emit for 'sequitur-debug'
   --bytes <n>             Bytes to generate for 'generate' (default: 8)
   --sample                Use seeded sampling for generation
   --greedy                Force deterministic greedy generation
@@ -3391,11 +3592,13 @@ Examples:
   infotheory h file.txt --rate-backend mamba --method "cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4,train=adam,lr=0.001;policy:schedule=0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)" --model-export ./mamba_online.safetensors
   infotheory h file.txt --rate-backend ctw --method 32
   infotheory h file.txt --rate-backend mixture --method mixture.json
+  infotheory sequitur-debug --hex 616263616263 --alphabet-prefix 8
   infotheory search "encryption" ./src --prior "codebase context"
   cat prompt.txt | infotheory generate --rate-backend ctw --method 32 --bytes 8
   infotheory generate prompt.txt --rate-backend match --bytes 16 --sample --seed 7
   infotheory compress in.bin out.itc --compression-backend rate-ac --rate-backend mixture --method mixture.json
   infotheory decompress out.itc restored.bin --compression-backend rate-ac --rate-backend mixture --method mixture.json
+  RAYON_NUM_THREADS=4 infotheory ac-log-loss corpus.bin --mixture examples/mixture_spec.json --out-prefix /tmp/mixture-diagnostic
 "#
     );
 }
@@ -3549,6 +3752,21 @@ mod tests {
                 _ => panic!("unexpected calibrated base"),
             },
             _ => panic!("expected calibrated backend"),
+        }
+    }
+
+    #[test]
+    fn parse_mixture_expert_supports_sequitur_backend() {
+        let base_dir = Path::new(".");
+        let expert = json!({
+            "name": "sequitur",
+            "kind": "sequitur",
+            "context_bytes": 96
+        });
+        let parsed = parse_mixture_expert_value(&expert, base_dir, 4).expect("expert should parse");
+        match parsed.backend {
+            RateBackend::Sequitur { context_bytes } => assert_eq!(context_bytes, 96),
+            _ => panic!("expected sequitur backend"),
         }
     }
 
@@ -3852,6 +4070,14 @@ mod tests {
         let ppmd = parse_vm_stats_backend(&json!({"name":"ppmd","order":12}), &root, base_dir)
             .expect("ppmd backend should parse");
         assert!(matches!(ppmd, RateBackend::Ppmd { order: 12, .. }));
+
+        let sequitur =
+            parse_vm_stats_backend(&json!({"name":"sequitur","context_bytes":72}), &root, base_dir)
+                .expect("sequitur backend should parse");
+        assert!(matches!(
+            sequitur,
+            RateBackend::Sequitur { context_bytes: 72 }
+        ));
 
         let particle = parse_vm_stats_backend(
             &json!({
