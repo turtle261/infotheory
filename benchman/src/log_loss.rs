@@ -16,7 +16,7 @@ use ratatui::widgets::{
     Wrap,
 };
 
-use crate::{centered_rect, format_float, format_size_bytes, COLOR_PALETTE};
+use crate::{COLOR_PALETTE, centered_rect, format_float, format_size_bytes};
 
 const DEFAULT_CHART_BINS: usize = 240;
 const DEFAULT_COARSE_ROW_TARGET: usize = 1024;
@@ -26,7 +26,9 @@ const TOP_EXACT_POINTS: usize = 8;
 
 #[derive(Args, Clone, Debug)]
 pub(crate) struct LogLossCli {
-    #[arg(help = "Log-loss diagnostic prefix (for <prefix>.trace.tsv / .nodes.tsv / .summary.tsv)")]
+    #[arg(
+        help = "Log-loss diagnostic prefix (for <prefix>.trace.tsv / .nodes.tsv / .summary.tsv)"
+    )]
     pub(crate) prefix: PathBuf,
 }
 
@@ -397,7 +399,8 @@ impl LogLossApp {
             blindspot_regret_bits_q: quantize_threshold(thresholds.blindspot_regret_bits),
             blindspot_good_bits_q: quantize_threshold(thresholds.blindspot_good_expert_bits),
         };
-        let current_model = build_log_loss_graph_model(&data, specs[0].clone(), initial_viewport, thresholds)?;
+        let current_model =
+            build_log_loss_graph_model(&data, specs[0].clone(), initial_viewport, thresholds)?;
         let visibility = specs
             .iter()
             .enumerate()
@@ -762,7 +765,10 @@ impl LogLossApp {
         if end.saturating_sub(start) < 16 {
             return;
         }
-        self.viewport = Viewport { start_row: start, end_row: end };
+        self.viewport = Viewport {
+            start_row: start,
+            end_row: end,
+        };
         self.cursor_x_idx = 0;
         self.cursor_series_idx = 0;
         self.refresh_current_model();
@@ -778,11 +784,16 @@ impl LogLossApp {
             .current_point_range()
             .map(|(start, end)| (start + end) / 2)
             .unwrap_or((self.viewport.start_row + self.viewport.end_row) / 2);
-        let new_len = (len.saturating_mul(2)).min(total).max(DEFAULT_COARSE_ROW_TARGET);
+        let new_len = (len.saturating_mul(2))
+            .min(total)
+            .max(DEFAULT_COARSE_ROW_TARGET);
         let mut start = center.saturating_sub(new_len / 2);
         let end = (start + new_len).min(total);
         start = end.saturating_sub(new_len);
-        self.viewport = Viewport { start_row: start, end_row: end };
+        self.viewport = Viewport {
+            start_row: start,
+            end_row: end,
+        };
         self.cursor_x_idx = 0;
         self.cursor_series_idx = 0;
         self.refresh_current_model();
@@ -895,7 +906,13 @@ impl LogLossApp {
             .map(|(name, point)| format!("{name} = {}", format_float(point.y)))
             .unwrap_or_else(|| "no series point selected".to_string());
         let range_text = range
-            .map(|(start, end)| format!("t=[{}..{})", format_size_bytes(start as u64), format_size_bytes(end as u64)))
+            .map(|(start, end)| {
+                format!(
+                    "t=[{}..{})",
+                    format_size_bytes(start as u64),
+                    format_size_bytes(end as u64)
+                )
+            })
             .unwrap_or_else(|| "t=n/a".to_string());
 
         let mut lines = vec![
@@ -969,7 +986,9 @@ impl LogLossApp {
                 .map(|(name, weight)| format!("{name}={}", format_float(*weight)))
                 .collect::<Vec<_>>()
                 .join("  ");
-            lines.push(Line::from(format!("global avg effective weight: {summary}")));
+            lines.push(Line::from(format!(
+                "global avg effective weight: {summary}"
+            )));
         }
 
         if !highlights.is_empty() {
@@ -1015,12 +1034,7 @@ impl LogLossApp {
             self.inspection = None;
             return Ok(());
         };
-        let inspection = inspect_region(
-            &self.data,
-            start_row,
-            end_row,
-            self.thresholds,
-        )?;
+        let inspection = inspect_region(&self.data, start_row, end_row, self.thresholds)?;
         self.inspection = Some(inspection);
         Ok(())
     }
@@ -1078,8 +1092,12 @@ fn load_log_loss_data(paths: LogLossPaths) -> Result<LogLossData> {
         .map(|(pos, node)| (node.node_id, pos))
         .collect::<HashMap<_, _>>();
     let summary = load_summary(&paths.summary_path, &non_root_nodes)?;
-    let (schema, row_offsets, rows, bytes, tiles) =
-        load_trace(&paths.trace_path, &non_root_nodes, &node_id_to_pos, summary.positions)?;
+    let (schema, row_offsets, rows, bytes, tiles) = load_trace(
+        &paths.trace_path,
+        &non_root_nodes,
+        &node_id_to_pos,
+        summary.positions,
+    )?;
 
     if row_offsets.len() != summary.positions {
         bail!(
@@ -1147,16 +1165,24 @@ fn load_nodes(path: &Path) -> Result<Vec<LogLossNodeMeta>> {
                 path.display()
             )
         })?;
-        let node_id = parse_u64(get_field(&row, idx_node_id), "node_id", row_idx + 2, path)? as usize;
+        let node_id =
+            parse_u64(get_field(&row, idx_node_id), "node_id", row_idx + 2, path)? as usize;
         let display_name = get_field(&row, idx_display_name).trim().to_string();
-        let _parent_id =
-            parse_optional_usize(get_field(&row, idx_parent_id), "parent_id", row_idx + 2, path)?;
+        let _parent_id = parse_optional_usize(
+            get_field(&row, idx_parent_id),
+            "parent_id",
+            row_idx + 2,
+            path,
+        )?;
         let _depth = parse_u64(get_field(&row, idx_depth), "depth", row_idx + 2, path)? as usize;
         let _path = get_field(&row, idx_path).trim();
-        let _is_mixture =
-            parse_bool_flag(get_field(&row, idx_is_mixture), "is_mixture", row_idx + 2, path)?;
-        let _is_leaf =
-            parse_bool_flag(get_field(&row, idx_is_leaf), "is_leaf", row_idx + 2, path)?;
+        let _is_mixture = parse_bool_flag(
+            get_field(&row, idx_is_mixture),
+            "is_mixture",
+            row_idx + 2,
+            path,
+        )?;
+        let _is_leaf = parse_bool_flag(get_field(&row, idx_is_leaf), "is_leaf", row_idx + 2, path)?;
         let _is_root_child = parse_bool_flag(
             get_field(&row, idx_is_root_child),
             "is_root_child",
@@ -1237,7 +1263,10 @@ fn load_summary(path: &Path, non_root_nodes: &[LogLossNodeMeta]) -> Result<LogLo
         path,
     )?;
     let root_weight_entropy_bits_avg = parse_required_f64(
-        get_field(&row, header_index(&headers, "root_weight_entropy_bits_avg")?),
+        get_field(
+            &row,
+            header_index(&headers, "root_weight_entropy_bits_avg")?,
+        ),
         "root_weight_entropy_bits_avg",
         2,
         path,
@@ -1303,7 +1332,10 @@ fn load_summary(path: &Path, non_root_nodes: &[LogLossNodeMeta]) -> Result<LogLo
             avg_effective_weight: parse_required_f64(
                 get_field(
                     &row,
-                    header_index(&headers, &format!("n{}__avg_effective_weight", node.node_id))?,
+                    header_index(
+                        &headers,
+                        &format!("n{}__avg_effective_weight", node.node_id),
+                    )?,
                 ),
                 "node_avg_effective_weight",
                 2,
@@ -1340,7 +1372,8 @@ fn load_trace(
     Vec<u8>,
     Vec<TileAggregate>,
 )> {
-    let file = File::open(path).with_context(|| format!("failed to open trace TSV {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("failed to open trace TSV {}", path.display()))?;
     let mut reader = BufReader::new(file);
 
     let mut header_line = String::new();
@@ -1382,8 +1415,18 @@ fn load_trace(
 
         let mut fields = Vec::with_capacity(header_fields.len());
         split_tsv_line(&line, &mut fields);
-        let byte = parse_inline_u8(fields.get(schema.byte_u8_idx).copied().unwrap_or(""), "byte_u8", row_idx + 2, path)?;
-        let mix_bits = parse_inline_f64(fields.get(schema.mix_bits_idx).copied().unwrap_or(""), "mix_bits", row_idx + 2, path)?;
+        let byte = parse_inline_u8(
+            fields.get(schema.byte_u8_idx).copied().unwrap_or(""),
+            "byte_u8",
+            row_idx + 2,
+            path,
+        )?;
+        let mix_bits = parse_inline_f64(
+            fields.get(schema.mix_bits_idx).copied().unwrap_or(""),
+            "mix_bits",
+            row_idx + 2,
+            path,
+        )?;
         let entropy_bits = parse_inline_f64(
             fields
                 .get(schema.root_weight_entropy_bits_idx)
@@ -1403,10 +1446,7 @@ fn load_trace(
             path,
         )?;
         let oracle_best_id = parse_inline_usize(
-            fields
-                .get(schema.oracle_best_id_idx)
-                .copied()
-                .unwrap_or(""),
+            fields.get(schema.oracle_best_id_idx).copied().unwrap_or(""),
             "oracle_best_id",
             row_idx + 2,
             path,
@@ -1455,7 +1495,10 @@ fn load_trace(
                 path,
             )?;
             let effective_weight = parse_inline_f64(
-                fields.get(columns.effective_weight_idx).copied().unwrap_or(""),
+                fields
+                    .get(columns.effective_weight_idx)
+                    .copied()
+                    .unwrap_or(""),
                 "node_effective_weight",
                 row_idx + 2,
                 path,
@@ -1492,7 +1535,13 @@ fn load_trace(
         if current_tile.count == 0 {
             current_tile = TileAggregate::new(row_idx, non_root_nodes.len());
         }
-        current_tile.push(row_idx, compact, &node_bits, &node_local_weights, &node_effective_weights);
+        current_tile.push(
+            row_idx,
+            compact,
+            &node_bits,
+            &node_local_weights,
+            &node_effective_weights,
+        );
         if current_tile.count >= coarse_rows {
             tiles.push(current_tile);
             current_tile = TileAggregate::new(row_idx + 1, non_root_nodes.len());
@@ -1511,7 +1560,10 @@ fn coarse_rows_for_len(row_count: usize) -> usize {
     target.max(DEFAULT_COARSE_ROW_TARGET)
 }
 
-fn build_trace_schema(header_fields: &[&str], non_root_nodes: &[LogLossNodeMeta]) -> Result<LogLossTraceSchema> {
+fn build_trace_schema(
+    header_fields: &[&str],
+    non_root_nodes: &[LogLossNodeMeta],
+) -> Result<LogLossTraceSchema> {
     let mut header_map = HashMap::new();
     for (idx, field) in header_fields.iter().enumerate() {
         header_map.insert((*field).to_string(), idx);
@@ -1529,7 +1581,9 @@ fn build_trace_schema(header_fields: &[&str], non_root_nodes: &[LogLossNodeMeta]
                 .with_context(|| format!("trace header missing n{}__local_weight", node.node_id))?,
             effective_weight_idx: *header_map
                 .get(&format!("n{}__effective_weight", node.node_id))
-                .with_context(|| format!("trace header missing n{}__effective_weight", node.node_id))?,
+                .with_context(|| {
+                    format!("trace header missing n{}__effective_weight", node.node_id)
+                })?,
         });
     }
 
@@ -1729,25 +1783,43 @@ fn build_compact_row_series(
         let x_mid = ((start + end) as f64) / 2.0;
         match spec.kind {
             LogLossGraphKind::MixBitsAvg => {
-                let value = slice.iter().map(|row| row.mix_bits as f64).sum::<f64>() / (slice.len() as f64);
+                let value =
+                    slice.iter().map(|row| row.mix_bits as f64).sum::<f64>() / (slice.len() as f64);
                 series_builders
                     .entry("mixture".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::OracleBitsAvg => {
-                let value = slice.iter().map(|row| row.oracle_bits as f64).sum::<f64>() / (slice.len() as f64);
+                let value = slice.iter().map(|row| row.oracle_bits as f64).sum::<f64>()
+                    / (slice.len() as f64);
                 series_builders
                     .entry("oracle best".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::RegretBitsAvg => {
-                let value = slice.iter().map(|row| row.regret_bits as f64).sum::<f64>() / (slice.len() as f64);
+                let value = slice.iter().map(|row| row.regret_bits as f64).sum::<f64>()
+                    / (slice.len() as f64);
                 series_builders
                     .entry("mixture regret".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::RegretBitsMax => {
                 let value = slice
@@ -1757,7 +1829,12 @@ fn build_compact_row_series(
                 series_builders
                     .entry("max regret".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::RootWeightEntropyAvg => {
                 let value = slice
@@ -1768,7 +1845,12 @@ fn build_compact_row_series(
                 series_builders
                     .entry("root weight entropy".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::RootWeightMarginAvg => {
                 let value = slice
@@ -1779,7 +1861,12 @@ fn build_compact_row_series(
                 series_builders
                     .entry("root top-2 margin".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::BestGapAvg => {
                 let value = slice
@@ -1790,7 +1877,12 @@ fn build_compact_row_series(
                 series_builders
                     .entry("best-vs-runner-up gap".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::UncoveredFraction => {
                 let count = slice
@@ -1801,7 +1893,12 @@ fn build_compact_row_series(
                 series_builders
                     .entry("uncovered".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::BlindspotFraction => {
                 let count = slice
@@ -1815,7 +1912,12 @@ fn build_compact_row_series(
                 series_builders
                     .entry("mixture blindspot".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::EnsembleAdvantageFraction => {
                 let count = slice
@@ -1826,7 +1928,12 @@ fn build_compact_row_series(
                 series_builders
                     .entry("mixture beats all".to_string())
                     .or_default()
-                    .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                    .push(LogLossPointMeta {
+                        start_row: start,
+                        end_row: end,
+                        x_mid,
+                        y: value,
+                    });
             }
             LogLossGraphKind::DomainFraction => {
                 let mut assigned_counts = vec![0usize; data.non_root_nodes.len()];
@@ -1849,7 +1956,12 @@ fn build_compact_row_series(
                     series_builders
                         .entry(node.short_label.clone())
                         .or_default()
-                        .push(LogLossPointMeta { start_row: start, end_row: end, x_mid, y: value });
+                        .push(LogLossPointMeta {
+                            start_row: start,
+                            end_row: end,
+                            x_mid,
+                            y: value,
+                        });
                 }
                 series_builders
                     .entry("contested".to_string())
@@ -1926,39 +2038,62 @@ fn build_tile_node_metric_series(
             continue;
         }
         let tile_slice = &tile_indices[start_tile_idx..end_tile_idx];
-        let start_row = data.tiles[*tile_slice.first().unwrap()].start_row.max(viewport.start_row);
-        let end_row = data.tiles[*tile_slice.last().unwrap()].end_row.min(viewport.end_row);
-        let total_count = tile_slice.iter().map(|tile_idx| data.tiles[*tile_idx].count).sum::<usize>().max(1);
+        let start_row = data.tiles[*tile_slice.first().unwrap()]
+            .start_row
+            .max(viewport.start_row);
+        let end_row = data.tiles[*tile_slice.last().unwrap()]
+            .end_row
+            .min(viewport.end_row);
+        let total_count = tile_slice
+            .iter()
+            .map(|tile_idx| data.tiles[*tile_idx].count)
+            .sum::<usize>()
+            .max(1);
         let x_mid = ((start_row + end_row) as f64) / 2.0;
 
         for (node_pos, node) in data.non_root_nodes.iter().enumerate() {
             let value = match spec.kind {
-                LogLossGraphKind::ExpertBitsAvg => tile_slice
-                    .iter()
-                    .map(|tile_idx| data.tiles[*tile_idx].node_bits_sum[node_pos])
-                    .sum::<f64>()
-                    / (total_count as f64),
-                LogLossGraphKind::ExpertLocalWeightAvg => tile_slice
-                    .iter()
-                    .map(|tile_idx| data.tiles[*tile_idx].node_local_weight_sum[node_pos])
-                    .sum::<f64>()
-                    / (total_count as f64),
-                LogLossGraphKind::ExpertEffectiveWeightAvg => tile_slice
-                    .iter()
-                    .map(|tile_idx| data.tiles[*tile_idx].node_effective_weight_sum[node_pos])
-                    .sum::<f64>()
-                    / (total_count as f64),
-                LogLossGraphKind::OracleWinFraction => tile_slice
-                    .iter()
-                    .map(|tile_idx| data.tiles[*tile_idx].node_oracle_win_count[node_pos] as f64)
-                    .sum::<f64>()
-                    / (total_count as f64),
+                LogLossGraphKind::ExpertBitsAvg => {
+                    tile_slice
+                        .iter()
+                        .map(|tile_idx| data.tiles[*tile_idx].node_bits_sum[node_pos])
+                        .sum::<f64>()
+                        / (total_count as f64)
+                }
+                LogLossGraphKind::ExpertLocalWeightAvg => {
+                    tile_slice
+                        .iter()
+                        .map(|tile_idx| data.tiles[*tile_idx].node_local_weight_sum[node_pos])
+                        .sum::<f64>()
+                        / (total_count as f64)
+                }
+                LogLossGraphKind::ExpertEffectiveWeightAvg => {
+                    tile_slice
+                        .iter()
+                        .map(|tile_idx| data.tiles[*tile_idx].node_effective_weight_sum[node_pos])
+                        .sum::<f64>()
+                        / (total_count as f64)
+                }
+                LogLossGraphKind::OracleWinFraction => {
+                    tile_slice
+                        .iter()
+                        .map(|tile_idx| {
+                            data.tiles[*tile_idx].node_oracle_win_count[node_pos] as f64
+                        })
+                        .sum::<f64>()
+                        / (total_count as f64)
+                }
                 _ => 0.0,
             };
             series_builders
                 .entry(node.short_label.clone())
                 .or_default()
-                .push(LogLossPointMeta { start_row, end_row, x_mid, y: value });
+                .push(LogLossPointMeta {
+                    start_row,
+                    end_row,
+                    x_mid,
+                    y: value,
+                });
         }
     }
 
@@ -1973,57 +2108,64 @@ fn build_exact_node_metric_series(
     let len = viewport.len();
     let bin_count = len.min(DEFAULT_CHART_BINS).max(1);
     let mut accum = (0..bin_count)
-        .map(|bin_idx| ExactNodeBin::new(bin_range(viewport, len, bin_count, bin_idx), data.non_root_nodes.len()))
+        .map(|bin_idx| {
+            ExactNodeBin::new(
+                bin_range(viewport, len, bin_count, bin_idx),
+                data.non_root_nodes.len(),
+            )
+        })
         .collect::<Vec<_>>();
 
-    scan_trace_range(data, viewport.start_row, viewport.end_row, |row_idx, fields| {
-        let bin_idx = row_to_bin(viewport, len, bin_count, row_idx);
-        let bin = &mut accum[bin_idx];
-        bin.count += 1;
-        for columns in &data.schema.node_columns {
-            let node_pos = columns.node_pos;
-            let bits = parse_inline_f64(
-                fields.get(columns.bits_idx).copied().unwrap_or(""),
-                "node_bits",
-                row_idx + 2,
-                &data.paths.trace_path,
-            )?;
-            let local_weight = parse_inline_f64(
+    scan_trace_range(
+        data,
+        viewport.start_row,
+        viewport.end_row,
+        |row_idx, fields| {
+            let bin_idx = row_to_bin(viewport, len, bin_count, row_idx);
+            let bin = &mut accum[bin_idx];
+            bin.count += 1;
+            for columns in &data.schema.node_columns {
+                let node_pos = columns.node_pos;
+                let bits = parse_inline_f64(
+                    fields.get(columns.bits_idx).copied().unwrap_or(""),
+                    "node_bits",
+                    row_idx + 2,
+                    &data.paths.trace_path,
+                )?;
+                let local_weight = parse_inline_f64(
+                    fields.get(columns.local_weight_idx).copied().unwrap_or(""),
+                    "node_local_weight",
+                    row_idx + 2,
+                    &data.paths.trace_path,
+                )?;
+                let effective_weight = parse_inline_f64(
+                    fields
+                        .get(columns.effective_weight_idx)
+                        .copied()
+                        .unwrap_or(""),
+                    "node_effective_weight",
+                    row_idx + 2,
+                    &data.paths.trace_path,
+                )?;
+                bin.node_bits_sum[node_pos] += bits;
+                bin.node_local_weight_sum[node_pos] += local_weight;
+                bin.node_effective_weight_sum[node_pos] += effective_weight;
+            }
+            let oracle_best_id = parse_inline_usize(
                 fields
-                    .get(columns.local_weight_idx)
+                    .get(data.schema.oracle_best_id_idx)
                     .copied()
                     .unwrap_or(""),
-                "node_local_weight",
+                "oracle_best_id",
                 row_idx + 2,
                 &data.paths.trace_path,
             )?;
-            let effective_weight = parse_inline_f64(
-                fields
-                    .get(columns.effective_weight_idx)
-                    .copied()
-                    .unwrap_or(""),
-                "node_effective_weight",
-                row_idx + 2,
-                &data.paths.trace_path,
-            )?;
-            bin.node_bits_sum[node_pos] += bits;
-            bin.node_local_weight_sum[node_pos] += local_weight;
-            bin.node_effective_weight_sum[node_pos] += effective_weight;
-        }
-        let oracle_best_id = parse_inline_usize(
-            fields
-                .get(data.schema.oracle_best_id_idx)
-                .copied()
-                .unwrap_or(""),
-            "oracle_best_id",
-            row_idx + 2,
-            &data.paths.trace_path,
-        )?;
-        if let Some(&pos) = data.node_id_to_pos.get(&oracle_best_id) {
-            bin.node_oracle_win_count[pos] += 1;
-        }
-        Ok(())
-    })?;
+            if let Some(&pos) = data.node_id_to_pos.get(&oracle_best_id) {
+                bin.node_oracle_win_count[pos] += 1;
+            }
+            Ok(())
+        },
+    )?;
 
     let mut series_builders: BTreeMap<String, Vec<LogLossPointMeta>> = BTreeMap::new();
     for bin in accum {
@@ -2130,8 +2272,10 @@ fn inspect_region(
     let slice = &data.rows[start_row..end_row];
     let count = slice.len().max(1);
     let avg_mix_bits = slice.iter().map(|row| row.mix_bits as f64).sum::<f64>() / (count as f64);
-    let avg_oracle_bits = slice.iter().map(|row| row.oracle_bits as f64).sum::<f64>() / (count as f64);
-    let avg_regret_bits = slice.iter().map(|row| row.regret_bits as f64).sum::<f64>() / (count as f64);
+    let avg_oracle_bits =
+        slice.iter().map(|row| row.oracle_bits as f64).sum::<f64>() / (count as f64);
+    let avg_regret_bits =
+        slice.iter().map(|row| row.regret_bits as f64).sum::<f64>() / (count as f64);
     let max_regret_bits = slice
         .iter()
         .map(|row| row.regret_bits as f64)
@@ -2227,10 +2371,7 @@ fn inspect_region(
                 &data.paths.trace_path,
             )?;
             node_stats[node_pos].avg_local_weight += parse_inline_f64(
-                fields
-                    .get(columns.local_weight_idx)
-                    .copied()
-                    .unwrap_or(""),
+                fields.get(columns.local_weight_idx).copied().unwrap_or(""),
                 "node_local_weight",
                 row_idx + 2,
                 &data.paths.trace_path,
@@ -2332,9 +2473,13 @@ where
     let mut line = String::new();
     for row_idx in start_row..end_row {
         line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .with_context(|| format!("failed to read row {} from {}", row_idx, data.paths.trace_path.display()))?;
+        let bytes_read = reader.read_line(&mut line).with_context(|| {
+            format!(
+                "failed to read row {} from {}",
+                row_idx,
+                data.paths.trace_path.display()
+            )
+        })?;
         if bytes_read == 0 {
             bail!(
                 "unexpected EOF reading rows [{}..{}) from {}",
@@ -2363,7 +2508,11 @@ fn render_log_loss_graph_list(frame: &mut Frame<'_>, area: Rect, app: &LogLossAp
     let mut state = ListState::default();
     state.select(Some(app.current_graph));
     let list = List::new(items)
-        .block(Block::default().title("Log-Loss Views").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Log-Loss Views")
+                .borders(Borders::ALL),
+        )
         .highlight_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -2513,7 +2662,11 @@ fn render_log_loss_side_panel(frame: &mut Frame<'_>, area: Rect, app: &LogLossAp
         .split(area);
     render_log_loss_series_panel(frame, chunks[0], app);
     let paragraph = Paragraph::new(app.interpretation_lines())
-        .block(Block::default().title("Interpretation").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Interpretation")
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, chunks[1]);
 }
@@ -2639,9 +2792,15 @@ fn render_help_popup(frame: &mut Frame<'_>) {
     let area = centered_rect(82, 48, frame.area());
     frame.render_widget(Clear, area);
     let lines = vec![
-        Line::from("Keys: [ ] view | h/j/k/l cursor | z/Z zoom | a full range | Enter inspect | c clear | f focus | q quit"),
-        Line::from("Threshold controls: b/B uncovered bits, m/M contested margin, r/R blindspot regret, w/W blindspot good-expert bits."),
-        Line::from("Interpretation rule: uncovered if oracle>=threshold; otherwise contested if best-gap<threshold; otherwise assigned to the oracle-best node."),
+        Line::from(
+            "Keys: [ ] view | h/j/k/l cursor | z/Z zoom | a full range | Enter inspect | c clear | f focus | q quit",
+        ),
+        Line::from(
+            "Threshold controls: b/B uncovered bits, m/M contested margin, r/R blindspot regret, w/W blindspot good-expert bits.",
+        ),
+        Line::from(
+            "Interpretation rule: uncovered if oracle>=threshold; otherwise contested if best-gap<threshold; otherwise assigned to the oracle-best node.",
+        ),
         Line::from("Press c or Esc to clear this panel."),
     ];
     let paragraph = Paragraph::new(lines)
@@ -2765,7 +2924,11 @@ fn render_inspection_popup(
     lines.push(Line::from("Press c or Esc to clear this panel."));
 
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Region Inspector").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Region Inspector")
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -2815,7 +2978,12 @@ fn parse_required_f64(raw: &str, field: &str, row_no: usize, path: &Path) -> Res
     Ok(value)
 }
 
-fn parse_optional_usize(raw: &str, field: &str, row_no: usize, path: &Path) -> Result<Option<usize>> {
+fn parse_optional_usize(
+    raw: &str,
+    field: &str,
+    row_no: usize,
+    path: &Path,
+) -> Result<Option<usize>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -2947,7 +3115,10 @@ t\tbyte_u8\tbyte_hex\tmix_prob\tmix_bits\troot_weight_entropy_bits\troot_top1_id
         let inspection =
             inspect_region(&data, 0, 4, Thresholds::default()).expect("inspection should work");
         assert_eq!(inspection.node_stats.len(), 2);
-        assert_eq!(inspection.worst_regret_points.len(), 4.min(TOP_EXACT_POINTS));
+        assert_eq!(
+            inspection.worst_regret_points.len(),
+            4.min(TOP_EXACT_POINTS)
+        );
 
         let _ = fs::remove_file(prefix.with_extension("nodes.tsv"));
         let _ = fs::remove_file(prefix.with_extension("summary.tsv"));

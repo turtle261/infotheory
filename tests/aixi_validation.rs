@@ -199,11 +199,9 @@ fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
 
 #[test]
 fn rate_backend_bit_predictor_roundtrips_sequitur_backend() {
-    let mut predictor = RateBackendBitPredictor::new(
-        RateBackend::Sequitur { context_bytes: 32 },
-        8,
-    )
-    .expect("valid sequitur predictor");
+    let mut predictor =
+        RateBackendBitPredictor::new(RateBackend::Sequitur { context_bytes: 32 }, 8)
+            .expect("valid sequitur predictor");
 
     let initial = predictor_snapshot(&mut predictor);
 

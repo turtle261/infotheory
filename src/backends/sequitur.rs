@@ -273,7 +273,9 @@ impl SequiturModel {
             while node != guard {
                 match self.nodes[node as usize].data {
                     NodeData::Guard(_) => unreachable!("guard in rule body"),
-                    NodeData::Sym(Symbol::Terminal(byte)) => rhs.push(CanonicalSymbol::Terminal(byte)),
+                    NodeData::Sym(Symbol::Terminal(byte)) => {
+                        rhs.push(CanonicalSymbol::Terminal(byte))
+                    }
                     NodeData::Sym(Symbol::NonTerminal(child)) => {
                         let mapped = *seen
                             .get(&child)
@@ -577,7 +579,11 @@ impl SequiturModel {
     fn observe_symbol_in_stats(&mut self, symbol: u8) {
         let contexts = self.current_contexts();
         for context in contexts {
-            let mut state = self.followers.get(context.as_slice()).cloned().unwrap_or_default();
+            let mut state = self
+                .followers
+                .get(context.as_slice())
+                .cloned()
+                .unwrap_or_default();
             state.observe(symbol);
             self.record_context_followers(&context, Some(state));
         }
@@ -598,11 +604,7 @@ impl SequiturModel {
             NodeData::Guard(_) => (idx, idx),
             NodeData::Sym(_) => (self.dummy, self.dummy),
         };
-        self.nodes.push(Node {
-            prev,
-            next,
-            data,
-        });
+        self.nodes.push(Node { prev, next, data });
         idx
     }
 
@@ -1094,7 +1096,10 @@ mod tests {
 
     #[test]
     fn sequitur_repetitive_binary_inputs_preserve_invariants() {
-        for data in [b"\x00\x00\x00\x00\x00\x00\x00\x00".as_slice(), b"\x00\x01\x00\x01\x00\x01\x00\x01".as_slice()] {
+        for data in [
+            b"\x00\x00\x00\x00\x00\x00\x00\x00".as_slice(),
+            b"\x00\x01\x00\x01\x00\x01\x00\x01".as_slice(),
+        ] {
             let mut model = SequiturModel::new(32);
             for (idx, &byte) in data.iter().enumerate() {
                 model.update(byte);

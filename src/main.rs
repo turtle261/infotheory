@@ -42,8 +42,8 @@ use infotheory::aixi::vm_nyx::{
     NyxRewardShaping, NyxTraceConfig, NyxVmConfig, NyxVmEnvironment,
     PayloadEncoding as NyxPayloadEncoding,
 };
-use infotheory::*;
 use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
+use infotheory::*;
 #[cfg(feature = "vm")]
 use nyx_lite::SharedMemoryPolicy;
 use std::env;
@@ -1819,7 +1819,9 @@ fn parse_hex_bytes(raw: &str) -> anyhow::Result<Vec<u8>> {
         .filter(|b| !matches!(b, b' ' | b'\n' | b'\r' | b'\t' | b'_'))
         .collect();
     if cleaned.len() % 2 != 0 {
-        return Err(anyhow::anyhow!("hex input must have an even number of digits"));
+        return Err(anyhow::anyhow!(
+            "hex input must have an even number of digits"
+        ));
     }
     let mut out = Vec::with_capacity(cleaned.len() / 2);
     let mut i = 0usize;
@@ -4071,9 +4073,12 @@ mod tests {
             .expect("ppmd backend should parse");
         assert!(matches!(ppmd, RateBackend::Ppmd { order: 12, .. }));
 
-        let sequitur =
-            parse_vm_stats_backend(&json!({"name":"sequitur","context_bytes":72}), &root, base_dir)
-                .expect("sequitur backend should parse");
+        let sequitur = parse_vm_stats_backend(
+            &json!({"name":"sequitur","context_bytes":72}),
+            &root,
+            base_dir,
+        )
+        .expect("sequitur backend should parse");
         assert!(matches!(
             sequitur,
             RateBackend::Sequitur { context_bytes: 72 }

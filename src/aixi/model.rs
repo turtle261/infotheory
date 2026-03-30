@@ -10,8 +10,7 @@ use crate::ctw::{ContextTree, FacContextTree};
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip::{Compressor as MambaCompressor, Model as MambaModel, State as MambaState};
 use crate::mixture::{
-    DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor,
-    RateBackendPredictorCheckpoint,
+    DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor, RateBackendPredictorCheckpoint,
 };
 use crate::rosaplus::{RosaPlus, RosaTx};
 #[cfg(feature = "backend-rwkv")]

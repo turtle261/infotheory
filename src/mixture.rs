@@ -739,7 +739,10 @@ impl RateBackendPredictor {
 
     pub(crate) fn restore_checkpoint(&mut self, checkpoint: &RateBackendPredictorCheckpoint) {
         match (self, checkpoint) {
-            (RateBackendPredictor::Sequitur { model, .. }, RateBackendPredictorCheckpoint::Sequitur(ck)) => {
+            (
+                RateBackendPredictor::Sequitur { model, .. },
+                RateBackendPredictorCheckpoint::Sequitur(ck),
+            ) => {
                 model.restore(ck);
             }
             (slot, RateBackendPredictorCheckpoint::Full(state)) => {
@@ -829,9 +832,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 model.log_prob(symbol, *min_prob)
             }
             RateBackendPredictor::Ppmd { model, min_prob } => model.log_prob(symbol, *min_prob),
-            RateBackendPredictor::Sequitur { model, min_prob } => {
-                model.log_prob(symbol, *min_prob)
-            }
+            RateBackendPredictor::Sequitur { model, min_prob } => model.log_prob(symbol, *min_prob),
             RateBackendPredictor::Ctw { tree, min_prob } => {
                 let log_before = tree.get_log_block_probability();
                 for bit_idx in 0..8 {

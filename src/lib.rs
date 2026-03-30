@@ -105,11 +105,11 @@ pub use backends::particle;
 pub use backends::ppmd;
 /// ROSA+ backend types.
 pub use backends::rosaplus;
-/// Exact online Sequitur backend types.
-pub use backends::sequitur;
 #[cfg(feature = "backend-rwkv")]
 /// RWKV backend types and compressor.
 pub use backends::rwkvzip;
+/// Exact online Sequitur backend types.
+pub use backends::sequitur;
 /// Sparse/gapped match predictor.
 pub use backends::sparse_match;
 /// ZPAQ rate-model adapter.

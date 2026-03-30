@@ -20,11 +20,11 @@ pub mod particle;
 /// Bounded-memory PPMD-style byte model.
 pub mod ppmd;
 pub mod rosaplus;
-/// Exact online Sequitur grammar backend with byte-level predictive readout.
-pub mod sequitur;
 /// RWKV7-based rate/compression backend.
 #[cfg(feature = "backend-rwkv")]
 pub mod rwkvzip;
+/// Exact online Sequitur grammar backend with byte-level predictive readout.
+pub mod sequitur;
 /// Sparse/gapped match predictor that wraps [`match_model`].
 pub mod sparse_match;
 /// Text/repeat context feature extraction for adaptive backends.
