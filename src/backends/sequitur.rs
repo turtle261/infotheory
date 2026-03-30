@@ -93,6 +93,10 @@ enum UndoOp {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Opaque rollback marker for [`SequiturModel`] state.
+///
+/// Checkpoints are created with [`SequiturModel::checkpoint`] and later applied
+/// with [`SequiturModel::restore`].
 pub struct SequiturCheckpoint {
     undo_len: usize,
     node_len: usize,
@@ -100,23 +104,35 @@ pub struct SequiturCheckpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// A canonical Sequitur rule in a deterministic exported grammar.
 pub struct CanonicalRule {
+    /// Canonical rule id (index within [`CanonicalGrammar::rules`]).
     pub id: usize,
+    /// Right-hand side symbols for this rule.
     pub rhs: Vec<CanonicalSymbol>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Symbol in a [`CanonicalRule`] right-hand side.
 pub enum CanonicalSymbol {
+    /// Terminal byte symbol.
     Terminal(u8),
+    /// Reference to another canonical rule by canonical id.
     NonTerminal(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Deterministic snapshot of the currently learned Sequitur grammar.
 pub struct CanonicalGrammar {
+    /// Reachable rules in preorder, with rule `0` as the start rule.
     pub rules: Vec<CanonicalRule>,
 }
 
 #[derive(Clone, Debug)]
+/// Online Sequitur-based byte predictor with rollback support.
+///
+/// The model learns grammar structure from committed updates and exposes a
+/// normalized next-byte distribution for coding and planning.
 pub struct SequiturModel {
     context_bytes: usize,
     nodes: Vec<Node>,
@@ -135,6 +151,10 @@ pub struct SequiturModel {
 }
 
 impl SequiturModel {
+    /// Create a new Sequitur model.
+    ///
+    /// `context_bytes` is clamped to at least `2` and controls the maximum tail
+    /// context length considered by the fallback context statistics.
     pub fn new(context_bytes: usize) -> Self {
         let context_bytes = context_bytes.max(2);
         let mut nodes = Vec::with_capacity(16);
@@ -171,11 +191,18 @@ impl SequiturModel {
         }
     }
 
+    /// Reserve internal capacity for an upcoming stream.
+    ///
+    /// This only affects allocation behavior and does not change model state.
     pub fn reserve_for_stream(&mut self, additional_symbols: usize) {
         self.nodes.reserve(additional_symbols.saturating_mul(2));
         self.digrams.reserve(additional_symbols);
     }
 
+    /// Prepare the model for a new stream.
+    ///
+    /// If `total_symbols` is provided, internal storage is pre-reserved. Any
+    /// speculative frozen tail is cleared.
     pub fn begin_stream(&mut self, total_symbols: Option<u64>) {
         if let Some(total) = total_symbols {
             let reserve = usize::try_from(total).unwrap_or(usize::MAX / 4);
@@ -185,8 +212,15 @@ impl SequiturModel {
         self.pdf_valid = false;
     }
 
+    /// Finish a stream.
+    ///
+    /// This is currently a no-op and exists for API symmetry with other
+    /// predictors.
     pub fn finish_stream(&mut self) {}
 
+    /// Capture a rollback point for subsequent speculative updates.
+    ///
+    /// Calling this enables undo journaling until checkpoints are cleared.
     pub fn checkpoint(&mut self) -> SequiturCheckpoint {
         self.undo_enabled = true;
         SequiturCheckpoint {
@@ -196,6 +230,7 @@ impl SequiturModel {
         }
     }
 
+    /// Restore model state to a previously created checkpoint.
     pub fn restore(&mut self, checkpoint: &SequiturCheckpoint) {
         let saved = self.undo_enabled;
         self.undo_enabled = false;
@@ -209,31 +244,39 @@ impl SequiturModel {
         self.pdf_valid = false;
     }
 
+    /// Drop all stored undo history and disable journaling.
     pub fn clear_checkpoints(&mut self) {
         self.undo.clear();
         self.undo_enabled = false;
     }
 
+    /// Clear speculative frozen updates without touching committed state.
     pub fn reset_frozen(&mut self) {
         self.frozen_raw_tail.clear();
         self.pdf_valid = false;
     }
 
+    /// Fill `out` with the current normalized next-byte probability mass.
     pub fn fill_pdf(&mut self, out: &mut [f64; 256]) {
         self.ensure_pdf();
         out.copy_from_slice(&self.pdf);
     }
 
+    /// Return the current normalized next-byte probability mass.
     pub fn pdf(&mut self) -> &[f64; 256] {
         self.ensure_pdf();
         &self.pdf
     }
 
+    /// Return the natural-log probability of `symbol` under the current model.
+    ///
+    /// The symbol probability is clamped from below by `min_prob`.
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
         self.ensure_pdf();
         self.pdf[symbol as usize].max(min_prob).ln()
     }
 
+    /// Commit one observed symbol into grammar and context statistics.
     pub fn update(&mut self, symbol: u8) {
         self.observe_symbol_in_stats(symbol);
         self.append_terminal(symbol);
@@ -244,6 +287,11 @@ impl SequiturModel {
         self.pdf_valid = false;
     }
 
+    /// Apply a speculative symbol update used for lookahead.
+    ///
+    /// Frozen updates affect only the temporary raw-tail context and can be
+    /// cleared with [`Self::reset_frozen`]. They do not mutate committed grammar
+    /// structure or follower counts.
     pub fn update_frozen(&mut self, symbol: u8) {
         let mut next = self.frozen_raw_tail.clone();
         next.push(symbol);
@@ -255,12 +303,17 @@ impl SequiturModel {
         self.pdf_valid = false;
     }
 
+    /// Decode the current start rule into the equivalent terminal byte stream.
     pub fn decode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.decode_rule(0, &mut out);
         out
     }
 
+    /// Export a deterministic canonical grammar snapshot.
+    ///
+    /// Rules are emitted in preorder from the start rule, and non-terminals are
+    /// rewritten to canonical rule ids.
     pub fn canonical_grammar(&self) -> CanonicalGrammar {
         let mut order = Vec::<RuleId>::new();
         let mut seen = AHashMap::<RuleId, usize>::new();
@@ -290,6 +343,10 @@ impl SequiturModel {
         CanonicalGrammar { rules: canonical }
     }
 
+    /// Record a per-step predictive trace for `data`.
+    ///
+    /// At each position this captures the current PDF prefix of length
+    /// `alphabet_prefix` (capped at `256`) and then commits the observed byte.
     pub fn predictive_trace(&mut self, data: &[u8], alphabet_prefix: usize) -> Vec<Vec<f64>> {
         let mut trace = Vec::with_capacity(data.len());
         let mut pdf = [0.0; 256];

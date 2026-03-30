@@ -40,13 +40,27 @@ struct NodeSummaryAccum {
 }
 
 #[derive(Clone, Debug)]
+/// Output summary for an AC/log-loss diagnostic run.
+///
+/// The diagnostic writer emits three TSV files sharing a common prefix:
+///
+/// - `*.trace.tsv`: per-position mixture/expert probabilities and weights
+/// - `*.nodes.tsv`: flattened mixture-node schema used by trace columns
+/// - `*.summary.tsv`: aggregate totals/averages over the full sequence
 pub struct AcLogLossRunSummary {
+    /// Path to the generated per-position trace TSV.
     pub trace_path: PathBuf,
+    /// Path to the generated node-schema TSV.
     pub nodes_path: PathBuf,
+    /// Path to the generated aggregate summary TSV.
     pub summary_path: PathBuf,
+    /// Number of processed input positions.
     pub positions: usize,
+    /// Total mixture code length in bits, computed from mixture probabilities.
     pub mix_total_bits: f64,
+    /// Total oracle code length in bits, using best per-step expert in hindsight.
     pub oracle_total_bits: f64,
+    /// Raw arithmetic-coder payload size in bits.
     pub ac_payload_bits_raw: u64,
 }
 
@@ -283,6 +297,17 @@ fn write_nodes_tsv(path: &Path, schema: &FlatSchema) -> Result<()> {
     Ok(())
 }
 
+/// Run exact AC/log-loss diagnostics for a byte sequence under a mixture spec.
+///
+/// This function validates `spec`, evaluates mixture and expert probabilities at
+/// each input position, and writes three TSV artifacts using `out_prefix`:
+///
+/// - `out_prefix.trace.tsv`: per-position diagnostics and expert rows
+/// - `out_prefix.nodes.tsv`: flattened node metadata for trace column mapping
+/// - `out_prefix.summary.tsv`: aggregate totals and averages
+///
+/// The returned summary includes key scalar metrics and the concrete output
+/// paths.
 pub fn run_ac_log_loss_mixture_bytes(
     data: &[u8],
     spec: &MixtureSpec,

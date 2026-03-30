@@ -518,8 +518,14 @@ pub enum RateBackendPredictor {
 }
 
 #[derive(Clone)]
+/// Checkpoint snapshot used for temporary predictor rollback.
+///
+/// Most backends use a full cloned predictor snapshot. Sequitur uses a compact
+/// internal checkpoint to avoid cloning its full state.
 pub enum RateBackendPredictorCheckpoint {
+    /// Full predictor clone for backends without specialized checkpointing.
     Full(RateBackendPredictor),
+    /// Compact Sequitur undo marker for [`RateBackendPredictor::Sequitur`].
     Sequitur(SequiturCheckpoint),
 }
 
