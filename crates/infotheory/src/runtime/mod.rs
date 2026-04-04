@@ -411,6 +411,15 @@ pub fn find_compression_backend_descriptor(input: &str) -> Option<&'static Backe
         .find(|descriptor| descriptor.aliases.iter().any(|alias| *alias == key))
 }
 
+fn compression_backend_descriptor_by_canonical(canonical: &str) -> &'static BackendDescriptor {
+    COMPRESSION_BACKEND_REGISTRY
+        .iter()
+        .find(|descriptor| descriptor.canonical == canonical)
+        .unwrap_or_else(|| {
+            panic!("missing compression backend descriptor for canonical name '{canonical}'")
+        })
+}
+
 /// Return registry metadata for a concrete rate-backend spec.
 pub fn describe_rate_backend(backend: &RateBackend) -> &'static BackendDescriptor {
     match backend {
@@ -435,12 +444,14 @@ pub fn describe_rate_backend(backend: &RateBackend) -> &'static BackendDescripto
 /// Return registry metadata for a concrete compression-backend spec.
 pub fn describe_compression_backend(backend: &CompressionBackend) -> &'static BackendDescriptor {
     match backend {
-        CompressionBackend::Zpaq { .. } => &COMPRESSION_BACKEND_REGISTRY[0],
+        CompressionBackend::Zpaq { .. } => compression_backend_descriptor_by_canonical("zpaq"),
         #[cfg(feature = "backend-rwkv")]
-        CompressionBackend::Rwkv7 { .. } => &COMPRESSION_BACKEND_REGISTRY[1],
+        CompressionBackend::Rwkv7 { .. } => compression_backend_descriptor_by_canonical("rwkv7"),
         CompressionBackend::Rate { coder, .. } => match coder {
-            crate::coders::CoderType::AC => &COMPRESSION_BACKEND_REGISTRY[2],
-            crate::coders::CoderType::RANS => &COMPRESSION_BACKEND_REGISTRY[3],
+            crate::coders::CoderType::AC => compression_backend_descriptor_by_canonical("rate-ac"),
+            crate::coders::CoderType::RANS => {
+                compression_backend_descriptor_by_canonical("rate-rans")
+            }
         },
     }
 }
@@ -494,5 +505,22 @@ mod tests {
     fn compression_registry_resolves_aliases() {
         let ac = find_compression_backend_descriptor("rate_ac").expect("rate-ac descriptor");
         assert_eq!(ac.canonical, "rate-ac");
+    }
+
+    #[test]
+    fn describe_compression_backend_uses_canonical_lookup_not_positional_indices() {
+        let ac = describe_compression_backend(&CompressionBackend::Rate {
+            rate_backend: RateBackend::RosaPlus,
+            coder: crate::coders::CoderType::AC,
+            framing: crate::compression::FramingMode::Framed,
+        });
+        assert_eq!(ac.canonical, "rate-ac");
+
+        let rans = describe_compression_backend(&CompressionBackend::Rate {
+            rate_backend: RateBackend::RosaPlus,
+            coder: crate::coders::CoderType::RANS,
+            framing: crate::compression::FramingMode::Framed,
+        });
+        assert_eq!(rans.canonical, "rate-rans");
     }
 }

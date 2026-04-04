@@ -43,6 +43,11 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all --check
 
+      - name: Dependency integrity
+        run: |
+          cargo update --workspace --locked --dry-run
+          cargo tree --workspace --all-features --locked --duplicates
+
       - name: Clippy (default + CLI)
         run: |
           cargo clippy -p zpaq_rs --locked
@@ -82,11 +87,6 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
-
-      - name: Dependency integrity
-        run: |
-          cargo update --workspace --locked --dry-run
-          cargo tree --workspace --all-features --locked --duplicates
 
       - name: Install Lean (elan)
         run: |
