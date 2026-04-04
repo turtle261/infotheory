@@ -58,8 +58,8 @@ jobs:
         env:
           RUSTFLAGS: -C target-cpu=x86-64
         run: >-
-          cargo check --release --manifest-path infotheory_py/Cargo.toml
-          --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
+          cargo check --release --manifest-path crates/infotheory_py/Cargo.toml
+          --features python-extension,all-backends
 
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
@@ -76,9 +76,9 @@ jobs:
           export AR_x86_64_unknown_linux_gnu="$(command -v llvm-ar)"
           export RANLIB_x86_64_unknown_linux_gnu="$(command -v llvm-ranlib)"
           .venv/bin/python -m maturin build --release \
-            --manifest-path infotheory_py/Cargo.toml \
+            --manifest-path crates/infotheory_py/Cargo.toml \
             --interpreter python3 \
-            --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq \
+            --features python-extension,all-backends \
             --out target/wheels \
             --compatibility manylinux2014 \
             --zig
@@ -91,7 +91,7 @@ jobs:
           RUSTFLAGS: -C target-cpu=generic
         run: |
           export PATH="$(dirname "$VENV_PY"):$PATH"
-          "$VENV_PY" -m maturin build --release --manifest-path infotheory_py/Cargo.toml --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq --out target/wheels
+          "$VENV_PY" -m maturin build --release --manifest-path crates/infotheory_py/Cargo.toml --features python-extension,all-backends --out target/wheels
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
@@ -105,7 +105,7 @@ jobs:
         shell: bash
         run: |
           export PATH=".venv/bin:$PATH"
-          .venv/bin/python -m maturin sdist --manifest-path infotheory_py/Cargo.toml
+          .venv/bin/python -m maturin sdist --manifest-path crates/infotheory_py/Cargo.toml
 
       - name: Upload sdist artifact
         if: runner.os == 'Linux'

@@ -30,12 +30,12 @@ dev = [
 ]
 
 [tool.maturin]
-manifest-path = "infotheory_py/Cargo.toml"
+manifest-path = "crates/infotheory_py/Cargo.toml"
 module-name = "infotheory_rs._core"
 python-source = "python"
 profile = "python-release"
 editable-profile = "python-release"
-features = ["python-extension", "backend-rosa", "backend-mamba", "backend-rwkv", "backend-zpaq"]
+features = ["python-extension", "all-backends"]
 include = [
   { path = "python/infotheory_rs/**/*.py", format = ["sdist", "wheel"] },
 ]

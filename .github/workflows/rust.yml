@@ -184,6 +184,18 @@ jobs:
         run: |
           cargo check --locked
           cargo check --no-default-features --locked
+          cargo check --no-default-features --features backend-rosa --locked
+          cargo check --no-default-features --features backend-ctw --locked
+          cargo check --no-default-features --features backend-match --locked
+          cargo check --no-default-features --features backend-ppmd --locked
+          cargo check --no-default-features --features backend-sequitur --locked
+          cargo check --no-default-features --features backend-mixture --locked
+          cargo check --no-default-features --features backend-particle --locked
+          cargo check --no-default-features --features backend-calibrated --locked
+          cargo check --no-default-features --features backend-zpaq --locked
+          cargo check --no-default-features --features backend-rwkv --locked
+          cargo check --no-default-features --features backend-mamba --locked
+          cargo check --no-default-features --features all-backends --locked
           cargo check --no-default-features --features cli --locked
           cargo check --features cli --locked
 
@@ -196,9 +208,9 @@ jobs:
           RUSTDOCFLAGS: ${{ matrix.rustdocflags }}
         run: |
           cargo test --release --locked
-          cargo test --release --no-default-features --locked
+          cargo test --release --no-default-features --features all-backends --locked
           cargo test --release --features cli --locked
-          cargo test --release --no-default-features --features cli --locked
+          cargo test --release --no-default-features --features "cli all-backends" --locked
 
       - name: VM tests
         if: ${{ matrix.run_vm }}

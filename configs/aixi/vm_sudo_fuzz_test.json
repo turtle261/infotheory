@@ -1,0 +1,93 @@
+{
+    "algorithm": "ctw",
+    "environment": "vm",
+    "ct_depth": 32,
+    "agent_horizon": 4,
+    "observation_bits": 8,
+    "observation_stream_len": 64,
+    "observation_key_mode": "stream-hash",
+    "reward_bits": 16,
+    "num_simulations": 0,
+    "exploration_exploitation_ratio": 2.0,
+    "discount_gamma": 0.95,
+    "terminate-lifetime": 500,
+    "log_every": 50,
+    "perf": true,
+    "vm_config": {
+        "firecracker_config": "../../vendor/nyx-lite/vm_image/vmconfig.json",
+        "instance_id": "aixi-nyx",
+        "shared_region_name": "shared",
+        "shared_region_size": 4096,
+        "shared_memory_policy": "snapshot",
+        "stats_backend": {
+            "name": "rosa",
+            "max_order": 4
+        },
+        "episode_steps": 1,
+        "step_cost": 0,
+        "boot_timeout_ms": 30000,
+        "step_timeout_ms": 3000,
+        "verbose": false,
+        "crash_log": "sudo_crashes.jsonl"
+    },
+    "vm_actions": {
+        "mode": "fuzz",
+        "fuzz": {
+            "seed_inputs": [
+                "sudo -l\n",
+                "sudo -u root id\n",
+                "sudo -u#0 id\n",
+                "sudo -u#-1 id\n",
+                "sudo whoami\n",
+                "sudo -s\n",
+                "sudo -i\n",
+                "sudo -k\n",
+                "sudo -v\n",
+                "sudo env\n",
+                "sudo -E whoami\n",
+                "sudo -H whoami\n",
+                "sudo -u root -g root id\n",
+                "sudo -- id\n",
+                "sudo -n whoami\n",
+                "sudo -p 'Password:' whoami\n",
+                "sudo -S whoami\n",
+                "sudo -A whoami\n",
+                "sudo -b whoami\n",
+                "sudo -C 5 whoami\n",
+                "sudo --\n",
+                "sudo -u \n",
+                "sudo -u '' id\n",
+                "sudo -u root id\n",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+                "sudo ",
+                "\n\n\n\n\n",
+                "\u0000\u0000\u0000\u0000",
+                "sudo -u $(id -u) id\n",
+                "sudo -u `whoami` id\n"
+            ],
+            "mutators": [
+                "flip_bit",
+                "insert_byte",
+                "delete_byte",
+                "havoc",
+                "splice"
+            ],
+            "min_len": 1,
+            "max_len": 512,
+            "rng_seed": 12345
+        }
+    },
+    "vm_observation": {
+        "mode": "shared-memory",
+        "stream_len": 64,
+        "stream_mode": "pad-truncate"
+    },
+    "vm_reward": {
+        "mode": "entropy-reduction",
+        "baseline_path": "sudo_baseline.txt",
+        "max_order": 3,
+        "scale": 10.0,
+        "crash_bonus": 100,
+        "timeout_bonus": 50
+    }
+}

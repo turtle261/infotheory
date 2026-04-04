@@ -1,0 +1,63 @@
+{
+    "algorithm": "ctw",
+    "environment": "vm",
+    "ct_depth": 32,
+    "agent_horizon": 8,
+    "observation_bits": 8,
+    "observation_stream_len": 64,
+    "observation_key_mode": "stream-hash",
+    "reward_bits": 16,
+    "num_simulations": 100,
+    "exploration_exploitation_ratio": 1.4,
+    "discount_gamma": 1.0,
+    "terminate-lifetime": 50,
+    "log_every": 0,
+    "vm_config": {
+        "firecracker_config": "../../vendor/nyx-lite/vm_image/vmconfig.json",
+        "instance_id": "aixi-nyx",
+        "shared_region_name": "shared",
+        "shared_region_size": 4096,
+        "shared_memory_policy": "snapshot",
+        "stats_backend": {
+            "name": "ctw",
+            "ct_depth": 32
+        },
+        "episode_steps": 8,
+        "step_cost": 1,
+        "boot_timeout_ms": 30000,
+        "step_timeout_ms": 5000,
+        "verbose": false
+    },
+    "vm_trace": {
+        "mode": "shared-memory",
+        "shared_region_name": "trace",
+        "max_bytes": 1048576,
+        "reset_on_episode": false
+    },
+    "vm_actions": {
+        "mode": "literal",
+        "actions": [
+            {
+                "name": "ping",
+                "payload": "PING",
+                "encoding": "utf8"
+            },
+            {
+                "name": "status",
+                "payload": "STATUS",
+                "encoding": "utf8"
+            }
+        ]
+    },
+    "vm_observation": {
+        "mode": "shared-memory",
+        "stream_len": 64,
+        "stream_mode": "pad-truncate"
+    },
+    "vm_reward": {
+        "mode": "trace-entropy",
+        "max_order": 8,
+        "scale": 1.0,
+        "normalize": false
+    }
+}

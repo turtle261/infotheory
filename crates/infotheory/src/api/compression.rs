@@ -1,0 +1,219 @@
+//! Compression-focused public API surface.
+
+use rayon::prelude::*;
+
+use super::types::CompressionBackend;
+use crate::error::{InfotheoryError, InfotheoryResult};
+
+use crate::{try_zpaq_compress_size_bytes, with_default_ctx};
+use crate::runtime::CompressionRuntime;
+
+pub fn try_compress_size_chain_backend(
+    parts: &[&[u8]],
+    backend: &CompressionBackend,
+) -> InfotheoryResult<u64> {
+    let mut runtime = crate::runtime::build_compression_runtime(backend)
+        .map_err(InfotheoryError::invalid_backend_config)?;
+    runtime.compress_size_chain(parts)
+}
+
+pub fn try_compress_size_backend(
+    data: &[u8],
+    backend: &CompressionBackend,
+) -> InfotheoryResult<u64> {
+    let mut runtime = crate::runtime::build_compression_runtime(backend)
+        .map_err(InfotheoryError::invalid_backend_config)?;
+    runtime.compress_size(data)
+}
+
+pub fn try_compress_bytes_backend(
+    data: &[u8],
+    backend: &CompressionBackend,
+) -> InfotheoryResult<Vec<u8>> {
+    let mut runtime = crate::runtime::build_compression_runtime(backend)
+        .map_err(InfotheoryError::invalid_backend_config)?;
+    runtime.compress_bytes(data)
+}
+
+pub fn try_decompress_bytes_backend(
+    input: &[u8],
+    backend: &CompressionBackend,
+) -> InfotheoryResult<Vec<u8>> {
+    let mut runtime = crate::runtime::build_compression_runtime(backend)
+        .map_err(InfotheoryError::invalid_backend_config)?;
+    runtime.decompress_bytes(input)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NcdVariant {
+    Vitanyi,
+    SymVitanyi,
+    Cons,
+    SymCons,
+}
+
+#[inline(always)]
+fn ncd_from_sizes(cx: u64, cy: u64, cxy: u64, cyx: Option<u64>, variant: NcdVariant) -> f64 {
+    let min_c = cx.min(cy) as f64;
+    let max_c = cx.max(cy) as f64;
+
+    match variant {
+        NcdVariant::Vitanyi => {
+            if max_c == 0.0 {
+                0.0
+            } else {
+                (cxy as f64 - min_c) / max_c
+            }
+        }
+        NcdVariant::SymVitanyi => {
+            let m = cxy.min(cyx.expect("cyx required for SymVitanyi")) as f64;
+            if max_c == 0.0 {
+                0.0
+            } else {
+                (m - min_c) / max_c
+            }
+        }
+        NcdVariant::Cons => {
+            let denom = cxy as f64;
+            if denom == 0.0 {
+                0.0
+            } else {
+                (cxy as f64 - min_c) / denom
+            }
+        }
+        NcdVariant::SymCons => {
+            let m = cxy.min(cyx.expect("cyx required for SymCons")) as f64;
+            if m == 0.0 { 0.0 } else { (m - min_c) / m }
+        }
+    }
+}
+
+#[inline(always)]
+pub fn try_ncd_bytes(
+    x: &[u8],
+    y: &[u8],
+    method: &str,
+    variant: NcdVariant,
+) -> InfotheoryResult<f64> {
+    let backend = CompressionBackend::Zpaq {
+        method: method.to_string(),
+    };
+    try_ncd_bytes_backend(x, y, &backend, variant)
+}
+
+#[inline(always)]
+pub fn try_ncd_bytes_default(
+    x: &[u8],
+    y: &[u8],
+    variant: NcdVariant,
+) -> InfotheoryResult<f64> {
+    with_default_ctx(|ctx| ctx.try_ncd_bytes(x, y, variant))
+}
+
+pub fn try_ncd_bytes_backend(
+    x: &[u8],
+    y: &[u8],
+    backend: &CompressionBackend,
+    variant: NcdVariant,
+) -> InfotheoryResult<f64> {
+    let (cx, cy) = rayon::join(
+        || try_compress_size_backend(x, backend),
+        || try_compress_size_backend(y, backend),
+    );
+    let cx = cx?;
+    let cy = cy?;
+
+    let cxy = try_compress_size_chain_backend(&[x, y], backend)?;
+
+    let cyx = match variant {
+        NcdVariant::SymVitanyi | NcdVariant::SymCons => {
+            Some(try_compress_size_chain_backend(&[y, x], backend)?)
+        }
+        _ => None,
+    };
+
+    Ok(ncd_from_sizes(cx, cy, cxy, cyx, variant))
+}
+
+pub fn try_ncd_matrix_bytes(
+    datas: &[Vec<u8>],
+    method: &str,
+    variant: NcdVariant,
+) -> InfotheoryResult<Vec<f64>> {
+    let n = datas.len();
+    let cx = datas
+        .par_iter()
+        .map(|d| try_zpaq_compress_size_bytes(d, method))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<InfotheoryResult<Vec<_>>>()?;
+
+    let mut out = vec![0.0f64; n * n];
+
+    match variant {
+        NcdVariant::SymVitanyi | NcdVariant::SymCons => {
+            let pairs = (0..n)
+                .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+                .collect::<Vec<_>>();
+            let pair_results = pairs
+                .into_par_iter()
+                .map(|(i, j)| -> InfotheoryResult<(usize, usize, f64)> {
+                    let mut buf = Vec::new();
+                    let x = &datas[i];
+                    let y = &datas[j];
+
+                    buf.reserve(x.len() + y.len());
+                    buf.extend_from_slice(x);
+                    buf.extend_from_slice(y);
+                    let cxy = try_zpaq_compress_size_bytes(&buf, method)?;
+
+                    buf.clear();
+                    buf.reserve(x.len() + y.len());
+                    buf.extend_from_slice(y);
+                    buf.extend_from_slice(x);
+                    let cyx = try_zpaq_compress_size_bytes(&buf, method)?;
+
+                    let d = ncd_from_sizes(cx[i], cx[j], cxy, Some(cyx), variant);
+                    Ok((i, j, d))
+                })
+                .collect::<Vec<_>>();
+            for entry in pair_results {
+                let (i, j, d) = entry?;
+                out[i * n + j] = d;
+                out[j * n + i] = d;
+            }
+        }
+        NcdVariant::Vitanyi | NcdVariant::Cons => {
+            let rows = (0..n)
+                .into_par_iter()
+                .map(|i| -> InfotheoryResult<Vec<(usize, usize, f64)>> {
+                    let mut buf = Vec::new();
+                    let x = &datas[i];
+                    let mut row = Vec::with_capacity(n);
+                    for j in 0..n {
+                        let d = if i == j {
+                            0.0
+                        } else {
+                            let y = &datas[j];
+                            buf.clear();
+                            buf.reserve(x.len() + y.len());
+                            buf.extend_from_slice(x);
+                            buf.extend_from_slice(y);
+                            let cxy = try_zpaq_compress_size_bytes(&buf, method)?;
+                            ncd_from_sizes(cx[i], cx[j], cxy, None, variant)
+                        };
+                        row.push((i, j, d));
+                    }
+                    Ok(row)
+                })
+                .collect::<Vec<_>>();
+            for row in rows {
+                for (i, j, d) in row? {
+                    out[i * n + j] = d;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}

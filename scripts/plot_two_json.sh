@@ -22,13 +22,13 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: 
 case "${PLOT_SUITE}" in
   two-json|two_json|two|core|full)
     PLOT_SUITE=two-json
-    SUITE_DISPLAY="examples/two.json"
+    SUITE_DISPLAY="configs/bench/two.json"
     SUITE_PATH_PREFIX="infotheory-two-json"
     SUITE_FOCUS_SUBJECTS="neural_mixture rwkv"
     ;;
   extra)
     PLOT_SUITE=extra
-    SUITE_DISPLAY="examples/extra.json"
+    SUITE_DISPLAY="configs/bench/extra.json"
     SUITE_PATH_PREFIX="infotheory-extra"
     SUITE_FOCUS_SUBJECTS="neural_mixture mamba"
     ;;

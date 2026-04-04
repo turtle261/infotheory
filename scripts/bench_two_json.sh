@@ -28,14 +28,14 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: 
 case "${BENCH_SUITE}" in
   two-json|two_json|two|core|full)
     BENCH_SUITE=two-json
-    SUITE_SPEC_PATH="${ROOT_DIR}/examples/two.json"
-    SUITE_DISPLAY="examples/two.json"
+    SUITE_SPEC_PATH="${ROOT_DIR}/configs/bench/two.json"
+    SUITE_DISPLAY="configs/bench/two.json"
     SUITE_PATH_PREFIX="infotheory-two-json"
     ;;
   extra)
     BENCH_SUITE=extra
-    SUITE_SPEC_PATH="${ROOT_DIR}/examples/extra.json"
-    SUITE_DISPLAY="examples/extra.json"
+    SUITE_SPEC_PATH="${ROOT_DIR}/configs/bench/extra.json"
+    SUITE_DISPLAY="configs/bench/extra.json"
     SUITE_PATH_PREFIX="infotheory-extra"
     ;;
   *)

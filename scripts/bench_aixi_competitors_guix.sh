@@ -212,7 +212,7 @@ export PATH="$bench_venv/bin:$PATH"
 export PYO3_PYTHON="$bench_python"
 
 (
-  cd "$repo_root/infotheory_py"
+  cd "$repo_root/crates/infotheory_py"
   "$bench_python" -m maturin develop --release --no-default-features --features "python-extension" --pip-path "$bench_venv/bin/pip"
 )
 

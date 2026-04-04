@@ -69,10 +69,14 @@ The repository also includes **AIQI**, the model-free return-prediction agent in
 ### Build Prerequisites
 - Rust toolchain (stable): `rustup` recommended.
 - C/C++ toolchain: `clang` + `lld` recommended on Unix-like systems.
-- For local repository builds with VM support available: clone recursively (`--recurse-submodules`) so `nyx-lite` is present.
+- For local repository builds with VM support available: clone recursively (`--recurse-submodules`) so `vendor/nyx-lite` is present.
 
 ### Build Configuration
 - By default, .cargo/config.toml is set to use march=native as the target-cpu, which will allow LLVM to make full use of your specific CPU. This can improve performance by roughly 2x for the RWKV Model. This may affect binary compatibility depending on your usecase.
+- Local `projman.sh` workflows now make this explicit:
+  - `INFOTHEORY_BUILD_MODE=native` keeps the repository default `target-cpu=native` behavior for local development and benchmarking.
+  - `INFOTHEORY_BUILD_MODE=portable` overrides local cargo invocations to `target-cpu=generic`, matching the portable CI/release intent.
+  - `INFOTHEORY_CLI_BENCH_BUILD_MODE=native|portable` does the same specifically for `./projman.sh bench cli ...`.
 
 ### Build the CLI
 Enable the `cli` feature (the binary is feature-gated):
@@ -93,14 +97,14 @@ Add the dependency in your `Cargo.toml`:
 infotheory = { path = "." } # Replace with a git or crates.io source as needed.
 ```
 
-### Building nyx-lite
-The VM backend is optional (`--features vm`) and depends on `nyx-lite` (and its vendored submodule code). Build it with:
+### Building Nyx-Lite
+The VM backend is optional (`--features vm`) and depends on `vendor/nyx-lite` (and its vendored submodule code). Build it with:
 ```bash
 cargo build --release --features vm
 ```
 Notes:
 - VM is Linux/KVM-oriented (`/dev/kvm` required).
-- Some `nyx-lite` tests also require VM image artifacts under `nyx-lite/vm_image`.
+- Some `vendor/nyx-lite` tests also require VM image artifacts under `vendor/nyx-lite/vm_image`.
 
 ### Additional notes
 Platform caveats:
@@ -156,7 +160,7 @@ Explicit `compress_bytes_backend` / `decompress_bytes_backend` APIs support fram
 
 ```bash
 RAYON_NUM_THREADS=4 ./infotheory ac-log-loss corpus.bin \
-  --mixture examples/mixture_spec.json \
+  --mixture configs/bench/mixture.json \
   --out-prefix /tmp/mixture-diagnostic
 ```
 
@@ -190,11 +194,11 @@ Example:
   --method "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=7,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.9)"
 ```
 
-For `examples/two.json` benchmark plotting, `scripts/plot_two_json.sh` also accepts `INFOTHEORY_BASELINE_SUMMARY_TSV=/path/to/baseline-summary.tsv` to emit additional baseline-overlay SVGs.
+For `configs/bench/two.json` benchmark plotting, `scripts/plot_two_json.sh` also accepts `INFOTHEORY_BASELINE_SUMMARY_TSV=/path/to/baseline-summary.tsv` to emit additional baseline-overlay SVGs.
 
 The benchmark tooling also supports an `extra` suite for additional rate backends
-not in `examples/two.json` (currently `mamba`, `particle` via
-`examples/particle_fast.json`, and `sparse-match`):
+not in `configs/bench/two.json` (currently `mamba`, `particle` via
+`configs/bench/particle_fast.json`, and `sparse-match`):
 
 ```bash
 ./projman.sh bench extra
@@ -284,7 +288,7 @@ Example MC-AIXI convex mixture override:
 ### AIXI Agent Mode (VM via Nyx-Lite)
 ```bash
 # VM-backed environment using high-performance Firecracker (Nyx-Lite)
-./infotheory aixi aixi_confs/vm_example.json
+./infotheory aixi configs/aixi/vm_example.json
 ```
 
 Quick benchmark (AIQI vs MC-AIXI):
@@ -321,11 +325,11 @@ VM config highlights:
 **Prerequisites**:
 - Linux with KVM enabled (`/dev/kvm` accessible).
 - `vmlinux` kernel and `rootfs.ext4` image valid for Firecracker.
-- `nyx-lite` crate (included in workspace).
+- `vendor/nyx-lite` submodule (path dependency, kept outside the main workspace members).
 
 **Setup**:
 1. Ensure you have the `vmlinux-6.1.58` kernel in the project root (or update config).
-2. Ensure `nyx-lite/vm_image/dockerimage/rootfs.ext4` exists or provide your own.
+2. Ensure `vendor/nyx-lite/vm_image/dockerimage/rootfs.ext4` exists or provide your own.
 3. Enable the feature: `cargo build --release --features vm`.
 
 ---
