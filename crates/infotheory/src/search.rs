@@ -1,7 +1,5 @@
+use crate::api::{InfotheoryCtx, RateBackend, marginal_entropy_bytes, try_cross_entropy_bytes};
 use crate::backends::rosaplus::RosaPlus;
-use crate::api::{
-    InfotheoryCtx, RateBackend, marginal_entropy_bytes, try_cross_entropy_bytes,
-};
 use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;

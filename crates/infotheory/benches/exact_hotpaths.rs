@@ -1,13 +1,13 @@
 #![cfg(all(feature = "backend-rwkv", feature = "backend-mamba"))]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend};
 use infotheory::backends::ctw::FacContextTree;
 use infotheory::backends::llm_policy::OptimizerKind;
 use infotheory::coders::CoderType;
 use infotheory::compression::{FramingMode, compress_rate_bytes};
 use infotheory::mambazip::mamba1;
 use infotheory::rwkvzip::rwkv7;
-use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend};
 use std::sync::Arc;
 use std::time::Duration;
 

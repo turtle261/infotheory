@@ -24,6 +24,11 @@
 use anyhow::{Result, bail};
 
 #[cfg(feature = "backend-calibrated")]
+use crate::api::CalibratedSpec;
+use crate::api::{
+    MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend, validate_rate_backend,
+};
+#[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::FacContextTree;
@@ -53,9 +58,6 @@ use crate::mixture::{
 use crate::neural_mix::NeuralMixCore;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
-#[cfg(feature = "backend-calibrated")]
-use crate::api::CalibratedSpec;
-use crate::api::{MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend, validate_rate_backend};
 use rayon::{ThreadPool, prelude::*};
 
 const FRAMED_MAGIC: u32 = 0x4354_4946; // "FITC"
@@ -1414,21 +1416,13 @@ pub(crate) enum RatePdfPredictor {
     #[cfg(feature = "backend-rosa")]
     Rosa(RosaPredictor),
     #[cfg(feature = "backend-match")]
-    Match {
-        model: MatchModel,
-    },
+    Match { model: MatchModel },
     #[cfg(feature = "backend-match")]
-    SparseMatch {
-        model: SparseMatchModel,
-    },
+    SparseMatch { model: SparseMatchModel },
     #[cfg(feature = "backend-ppmd")]
-    Ppmd {
-        model: PpmdModel,
-    },
+    Ppmd { model: PpmdModel },
     #[cfg(feature = "backend-sequitur")]
-    Sequitur {
-        model: SequiturModel,
-    },
+    Sequitur { model: SequiturModel },
     #[cfg(feature = "backend-ctw")]
     Ctw(CtwPredictor),
     #[cfg(feature = "backend-ctw")]
@@ -1451,9 +1445,7 @@ pub(crate) enum RatePdfPredictor {
         valid: bool,
     },
     #[allow(dead_code)]
-    Disabled {
-        reason: String,
-    },
+    Disabled { reason: String },
 }
 
 impl RatePdfPredictor {

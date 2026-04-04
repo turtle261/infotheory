@@ -4,21 +4,21 @@
 //! for learning from history and predicting future symbols. Different implementations
 //! provide different complexity vs performance trade-offs.
 
-use crate::api::RateBackend;
 use crate::aixi::rate_backend::rate_backend_contains_zpaq;
+use crate::api::RateBackend;
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{ContextTree, FacContextTree};
+#[cfg(feature = "backend-rosa")]
+use crate::backends::rosaplus::{RosaPlus, RosaTx};
+#[cfg(feature = "backend-zpaq")]
+use crate::backends::zpaq_rate::ZpaqRateModel;
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip::{Compressor as MambaCompressor, Model as MambaModel, State as MambaState};
 use crate::mixture::{
     DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor, RateBackendPredictorCheckpoint,
 };
-#[cfg(feature = "backend-rosa")]
-use crate::backends::rosaplus::{RosaPlus, RosaTx};
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip::{Compressor as RwkvCompressor, Model as RwkvModel, State as RwkvState};
-#[cfg(feature = "backend-zpaq")]
-use crate::backends::zpaq_rate::ZpaqRateModel;
 #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
 use std::sync::Arc;
 

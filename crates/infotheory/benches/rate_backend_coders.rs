@@ -1,9 +1,9 @@
 #![cfg(feature = "backend-rwkv")]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend};
 use infotheory::compression::{FramingMode, compress_rate_bytes};
 use infotheory::rwkvzip::{self, OnlineConfig, OnlineTrainMode};
-use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 

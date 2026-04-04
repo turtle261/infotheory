@@ -548,7 +548,11 @@ fn validate_mixture_spec_shallow(spec: &MixtureSpec) -> Result<(), String> {
     if !spec.alpha.is_finite() {
         return Err("mixture alpha must be finite".to_string());
     }
-    if spec.experts.iter().any(|expert| !expert.log_prior.is_finite()) {
+    if spec
+        .experts
+        .iter()
+        .any(|expert| !expert.log_prior.is_finite())
+    {
         return Err("mixture expert log_prior must be finite".to_string());
     }
     if let Some(decay) = spec.decay {
@@ -703,7 +707,9 @@ impl ParticleSpec {
             ));
         }
         if self.cell_dim == 0 {
-            return Err(InfotheoryError::invalid_backend_config("cell_dim must be > 0"));
+            return Err(InfotheoryError::invalid_backend_config(
+                "cell_dim must be > 0",
+            ));
         }
         if self.num_rules == 0 {
             return Err(InfotheoryError::invalid_backend_config(

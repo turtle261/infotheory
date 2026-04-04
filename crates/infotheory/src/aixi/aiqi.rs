@@ -8,9 +8,9 @@
 //! returns at indices `i % N == phase`.
 
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
-use crate::aixi::model::{Predictor, RateBackendBitPredictor};
 #[cfg(feature = "backend-ctw")]
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor};
+use crate::aixi::model::{Predictor, RateBackendBitPredictor};
 use crate::aixi::rate_backend::rate_backend_contains_zpaq;
 use crate::api::{RateBackend, validate_rate_backend};
 

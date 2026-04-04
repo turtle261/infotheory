@@ -249,8 +249,7 @@ impl SearchNode {
 
         if delta.visits > 0 {
             let total_visits = self.visits + delta.visits;
-            let total_sum =
-                self.mean * (self.visits as f64) + delta.mean * (delta.visits as f64);
+            let total_sum = self.mean * (self.visits as f64) + delta.mean * (delta.visits as f64);
             self.visits = total_visits;
             self.mean = if total_visits > 0 {
                 total_sum / (total_visits as f64)
@@ -369,8 +368,8 @@ impl SearchNode {
             let base_child = base
                 .and_then(|node| node.action_children.get(action_idx))
                 .and_then(|child| child.as_ref());
-            let effective_visits =
-                local_child.map_or(0, |node| node.visits) + base_child.map_or(0, |node| node.visits);
+            let effective_visits = local_child.map_or(0, |node| node.visits)
+                + base_child.map_or(0, |node| node.visits);
             if effective_visits == 0 {
                 unvisited.push(action_idx as u64);
             }
@@ -392,8 +391,8 @@ impl SearchNode {
                 let base_child = base
                     .and_then(|node| node.action_children.get(action_idx))
                     .and_then(|child| child.as_ref());
-                let child_visits =
-                    local_child.map_or(0, |node| node.visits) + base_child.map_or(0, |node| node.visits);
+                let child_visits = local_child.map_or(0, |node| node.visits)
+                    + base_child.map_or(0, |node| node.visits);
                 if child_visits == 0 {
                     continue;
                 }

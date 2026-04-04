@@ -5,8 +5,8 @@ use rayon::prelude::*;
 use super::types::CompressionBackend;
 use crate::error::{InfotheoryError, InfotheoryResult};
 
-use crate::{try_zpaq_compress_size_bytes, with_default_ctx};
 use crate::runtime::CompressionRuntime;
+use crate::{try_zpaq_compress_size_bytes, with_default_ctx};
 
 pub fn try_compress_size_chain_backend(
     parts: &[&[u8]],
@@ -102,11 +102,7 @@ pub fn try_ncd_bytes(
 }
 
 #[inline(always)]
-pub fn try_ncd_bytes_default(
-    x: &[u8],
-    y: &[u8],
-    variant: NcdVariant,
-) -> InfotheoryResult<f64> {
+pub fn try_ncd_bytes_default(x: &[u8], y: &[u8], variant: NcdVariant) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_ncd_bytes(x, y, variant))
 }
 

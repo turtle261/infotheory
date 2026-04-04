@@ -208,7 +208,11 @@ struct SliceChainReader<'a> {
 
 impl<'a> SliceChainReader<'a> {
     fn new(parts: &'a [&'a [u8]]) -> Self {
-        Self { parts, i: 0, off: 0 }
+        Self {
+            parts,
+            i: 0,
+            off: 0,
+        }
     }
 }
 
@@ -291,9 +295,7 @@ impl CompressionRuntime for CompressionRuntimeHandle {
             CompressionRuntimeHandle::Rwkv7 { method, coder } => {
                 crate::with_rwkv_method_tls(method, |c| {
                     c.compress_size_chain(parts, *coder).map_err(|err| {
-                        InfotheoryError::runtime(format!(
-                            "rwkv7 chain compression failed: {err:#}"
-                        ))
+                        InfotheoryError::runtime(format!("rwkv7 chain compression failed: {err:#}"))
                     })
                 })
             }
@@ -301,12 +303,16 @@ impl CompressionRuntime for CompressionRuntimeHandle {
                 rate_backend,
                 coder,
                 framing,
-            } => crate::compression::compress_rate_size_chain(parts, rate_backend, -1, *coder, *framing)
-                .map_err(|err| {
-                    InfotheoryError::runtime(format!(
-                        "rate-coded chain compression failed: {err:#}"
-                    ))
-                }),
+            } => crate::compression::compress_rate_size_chain(
+                parts,
+                rate_backend,
+                -1,
+                *coder,
+                *framing,
+            )
+            .map_err(|err| {
+                InfotheoryError::runtime(format!("rate-coded chain compression failed: {err:#}"))
+            }),
         }
     }
 
@@ -328,19 +334,18 @@ impl CompressionRuntime for CompressionRuntimeHandle {
                 framing,
             } => crate::compression::compress_rate_bytes(data, rate_backend, -1, *coder, *framing)
                 .map_err(|err| {
-                    InfotheoryError::runtime(format!(
-                        "rate-coded byte compression failed: {err:#}"
-                    ))
+                    InfotheoryError::runtime(format!("rate-coded byte compression failed: {err:#}"))
                 }),
         }
     }
 
     fn decompress_bytes(&mut self, input: &[u8]) -> InfotheoryResult<Vec<u8>> {
         match self {
-            CompressionRuntimeHandle::Zpaq { .. } => crate::zpaq_decompress_to_vec(input)
-                .map_err(|err| {
+            CompressionRuntimeHandle::Zpaq { .. } => {
+                crate::zpaq_decompress_to_vec(input).map_err(|err| {
                     InfotheoryError::runtime(format!("zpaq decompression failed: {err:#}"))
-                }),
+                })
+            }
             #[cfg(feature = "backend-rwkv")]
             CompressionRuntimeHandle::Rwkv7 { method, .. } => {
                 crate::with_rwkv_method_tls(method, |c| c.decompress(input)).map_err(|err| {
@@ -351,12 +356,14 @@ impl CompressionRuntime for CompressionRuntimeHandle {
                 rate_backend,
                 coder,
                 framing,
-            } => crate::compression::decompress_rate_bytes(input, rate_backend, -1, *coder, *framing)
-                .map_err(|err| {
-                    InfotheoryError::runtime(format!(
-                        "rate-coded decompression failed: {err:#}"
-                    ))
-                }),
+            } => {
+                crate::compression::decompress_rate_bytes(input, rate_backend, -1, *coder, *framing)
+                    .map_err(|err| {
+                        InfotheoryError::runtime(format!(
+                            "rate-coded decompression failed: {err:#}"
+                        ))
+                    })
+            }
         }
     }
 }

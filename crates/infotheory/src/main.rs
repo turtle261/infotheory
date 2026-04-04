@@ -44,13 +44,13 @@ use infotheory::aixi::vm_nyx::{
     NyxRewardShaping, NyxTraceConfig, NyxVmConfig, NyxVmEnvironment,
     PayloadEncoding as NyxPayloadEncoding,
 };
-#[cfg(feature = "backend-sequitur")]
-use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
 use infotheory::api::*;
 #[cfg(feature = "backend-mamba")]
 use infotheory::mambazip;
 #[cfg(feature = "backend-rwkv")]
 use infotheory::rwkvzip;
+#[cfg(feature = "backend-sequitur")]
+use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
 #[cfg(feature = "vm")]
 use nyx_lite::SharedMemoryPolicy;
 use std::env;
@@ -63,19 +63,16 @@ use std::time::{Duration, Instant};
 #[cfg(not(feature = "vm"))]
 use std::time::Instant;
 
-#[cfg(feature = "backend-rosa")]
-use infotheory::search;
 use crate::cli::{
     aiqi_backend_label, build_ctx, bytes_to_hex, file_roundtrip_backend, load_mixture_spec,
     maybe_export_online_model, parse_compression_backend, parse_hex_bytes,
     parse_observation_key_mode_for_env, parse_observation_stream_len_for_env, parse_rate_backend,
     parse_vm_stats_backend, read_file, read_stdin_all_for_generate, run_batch_mode,
-    validate_observation_config, validate_obs_stream_len,
+    validate_obs_stream_len, validate_observation_config,
 };
 #[cfg(test)]
 use crate::cli::{
-    load_expert_spec, parse_observation_key_mode, parse_observation_stream_len,
-    process_json_line,
+    load_expert_spec, parse_observation_key_mode, parse_observation_stream_len, process_json_line,
 };
 #[cfg(feature = "vm")]
 use crate::cli::{
@@ -84,6 +81,8 @@ use crate::cli::{
     parse_nyx_observation_stream_mode, parse_nyx_protocol_config, parse_nyx_reward_policy,
     parse_nyx_reward_shaping, parse_nyx_trace_config, parse_shared_memory_policy,
 };
+#[cfg(feature = "backend-rosa")]
+use infotheory::search;
 
 #[track_caller]
 fn cli_unwrap<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
@@ -91,7 +90,10 @@ fn cli_unwrap<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T
 }
 
 fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
-    cli_unwrap(try_entropy_rate_bytes(data, max_order), "entropy_rate_bytes")
+    cli_unwrap(
+        try_entropy_rate_bytes(data, max_order),
+        "entropy_rate_bytes",
+    )
 }
 
 fn biased_entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
@@ -116,12 +118,7 @@ fn ncd_paths(x: &str, y: &str, method: &str, variant: NcdVariant) -> f64 {
     cli_unwrap(try_ncd_paths(x, y, method, variant), "ncd_paths")
 }
 
-fn ncd_bytes_backend(
-    x: &[u8],
-    y: &[u8],
-    backend: &CompressionBackend,
-    variant: NcdVariant,
-) -> f64 {
+fn ncd_bytes_backend(x: &[u8], y: &[u8], backend: &CompressionBackend, variant: NcdVariant) -> f64 {
     cli_unwrap(
         try_ncd_bytes_backend(x, y, backend, variant),
         "ncd_bytes_backend",
@@ -335,8 +332,6 @@ fn parse_mixture_expert_value(
 ) -> anyhow::Result<MixtureExpertSpec> {
     infotheory::spec::parse_mixture_expert_value(v, base_dir, depth).map_err(anyhow::Error::msg)
 }
-
-
 
 fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     let mut file = File::open(config_path)?;
@@ -1237,66 +1232,68 @@ fn main() {
         }
         #[cfg(feature = "backend-sequitur")]
         {
-        let inputs = if !sequitur_debug_hexes.is_empty() {
-            sequitur_debug_hexes
-                .iter()
-                .map(|raw_hex| {
-                    parse_hex_bytes(raw_hex).unwrap_or_else(|e| {
-                        eprintln!("Error: invalid --hex input for 'sequitur-debug': {e}");
-                        std::process::exit(1);
-                    })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            let input_path =
-                file1.unwrap_or_exit("Error: 'sequitur-debug' requires <input> or --hex <hex>");
-            vec![read_file(&input_path)]
-        };
-        let alphabet_prefix = sequitur_alphabet_prefix.clamp(1, 256);
-        let cases = inputs
-            .iter()
-            .map(|data| {
-                let mut model = SequiturModel::new(sequitur_context_bytes);
-                let trace = model.predictive_trace(data, alphabet_prefix);
-                let rules = model
-                    .canonical_grammar()
-                    .rules
+            let inputs = if !sequitur_debug_hexes.is_empty() {
+                sequitur_debug_hexes
                     .iter()
-                    .map(|rule| {
-                        let rhs = rule
-                            .rhs
-                            .iter()
-                            .map(|sym| match sym {
-                                CanonicalSymbol::Terminal(byte) => serde_json::json!(*byte as i64),
-                                CanonicalSymbol::NonTerminal(rule_id) => {
-                                    serde_json::json!(-((*rule_id as i64) + 1))
-                                }
-                            })
-                            .collect::<Vec<_>>();
-                        serde_json::json!({
-                            "id": rule.id,
-                            "rhs": rhs,
+                    .map(|raw_hex| {
+                        parse_hex_bytes(raw_hex).unwrap_or_else(|e| {
+                            eprintln!("Error: invalid --hex input for 'sequitur-debug': {e}");
+                            std::process::exit(1);
                         })
                     })
-                    .collect::<Vec<_>>();
-                serde_json::json!({
-                    "input_hex": bytes_to_hex(data),
-                    "decoded_hex": bytes_to_hex(&model.decode()),
-                    "rules": rules,
-                    "trace": trace,
+                    .collect::<Vec<_>>()
+            } else {
+                let input_path =
+                    file1.unwrap_or_exit("Error: 'sequitur-debug' requires <input> or --hex <hex>");
+                vec![read_file(&input_path)]
+            };
+            let alphabet_prefix = sequitur_alphabet_prefix.clamp(1, 256);
+            let cases = inputs
+                .iter()
+                .map(|data| {
+                    let mut model = SequiturModel::new(sequitur_context_bytes);
+                    let trace = model.predictive_trace(data, alphabet_prefix);
+                    let rules = model
+                        .canonical_grammar()
+                        .rules
+                        .iter()
+                        .map(|rule| {
+                            let rhs = rule
+                                .rhs
+                                .iter()
+                                .map(|sym| match sym {
+                                    CanonicalSymbol::Terminal(byte) => {
+                                        serde_json::json!(*byte as i64)
+                                    }
+                                    CanonicalSymbol::NonTerminal(rule_id) => {
+                                        serde_json::json!(-((*rule_id as i64) + 1))
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            serde_json::json!({
+                                "id": rule.id,
+                                "rhs": rhs,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    serde_json::json!({
+                        "input_hex": bytes_to_hex(data),
+                        "decoded_hex": bytes_to_hex(&model.decode()),
+                        "rules": rules,
+                        "trace": trace,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        let output = serde_json::json!({
-            "context_bytes": sequitur_context_bytes,
-            "alphabet_prefix": alphabet_prefix,
-            "cases": cases,
-        });
-        println!(
-            "{}",
-            serde_json::to_string(&output).expect("sequitur debug json serialization")
-        );
-        return;
+                .collect::<Vec<_>>();
+            let output = serde_json::json!({
+                "context_bytes": sequitur_context_bytes,
+                "alphabet_prefix": alphabet_prefix,
+                "cases": cases,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&output).expect("sequitur debug json serialization")
+            );
+            return;
         }
     }
 

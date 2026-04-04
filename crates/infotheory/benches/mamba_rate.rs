@@ -1,9 +1,9 @@
 #![cfg(feature = "backend-mamba")]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use infotheory::api::{RateBackend, try_entropy_rate_backend};
 use infotheory::coders::CoderType;
 use infotheory::compression::{FramingMode, compress_rate_bytes};
-use infotheory::api::{RateBackend, try_entropy_rate_backend};
 use std::time::Duration;
 
 const DATA_LEN: usize = 16 * 1024;

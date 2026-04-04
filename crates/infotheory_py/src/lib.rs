@@ -980,7 +980,13 @@ impl PyInfotheoryCtx {
     }
 
     fn compress_size(&self, py: Python<'_>, data: &[u8]) -> PyResult<u64> {
-        py.detach(|| py_try(|| self.inner.try_compress_size(data).map_err(py_infotheory_error)))
+        py.detach(|| {
+            py_try(|| {
+                self.inner
+                    .try_compress_size(data)
+                    .map_err(py_infotheory_error)
+            })
+        })
     }
 
     fn compress_size_chain(&self, py: Python<'_>, parts: Vec<Vec<u8>>) -> PyResult<u64> {
@@ -1123,7 +1129,13 @@ impl PyInfotheoryCtx {
     }
 
     fn ned_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-        py.detach(|| py_try(|| self.inner.try_ned_bytes(x, y, max_order).map_err(py_infotheory_error)))
+        py.detach(|| {
+            py_try(|| {
+                self.inner
+                    .try_ned_bytes(x, y, max_order)
+                    .map_err(py_infotheory_error)
+            })
+        })
     }
 
     fn ned_cons_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
@@ -1137,7 +1149,13 @@ impl PyInfotheoryCtx {
     }
 
     fn nte_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-        py.detach(|| py_try(|| self.inner.try_nte_bytes(x, y, max_order).map_err(py_infotheory_error)))
+        py.detach(|| {
+            py_try(|| {
+                self.inner
+                    .try_nte_bytes(x, y, max_order)
+                    .map_err(py_infotheory_error)
+            })
+        })
     }
 
     fn intrinsic_dependence_bytes(
@@ -1318,7 +1336,7 @@ impl PyRateBackendSession {
         lock_recover(&self.inner)
             .finish()
             .map_err(py_infotheory_error)
-}
+    }
 }
 
 #[pyfunction]
@@ -1499,9 +1517,7 @@ fn ncd_paths(
 ) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
     let cb = compression_backend_from_py(backend, Some(method), None)?;
-    py.detach(|| {
-        py_try(|| api::try_ncd_paths_backend(x, y, &cb, v).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_ncd_paths_backend(x, y, &cb, v).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -1516,9 +1532,7 @@ fn ncd_bytes(
 ) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
     let cb = compression_backend_from_py(backend, Some(method), None)?;
-    py.detach(|| {
-        py_try(|| api::try_ncd_bytes_backend(x, y, &cb, v).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_ncd_bytes_backend(x, y, &cb, v).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -1533,9 +1547,7 @@ fn ncd_paths_with_backend(
 ) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
     let cb = compression_backend_from_py(backend, method, None)?;
-    py.detach(|| {
-        py_try(|| api::try_ncd_paths_backend(x, y, &cb, v).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_ncd_paths_backend(x, y, &cb, v).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -1550,9 +1562,7 @@ fn ncd_bytes_with_backend(
 ) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
     let cb = compression_backend_from_py(backend, method, None)?;
-    py.detach(|| {
-        py_try(|| api::try_ncd_bytes_backend(x, y, &cb, v).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_ncd_bytes_backend(x, y, &cb, v).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -1564,12 +1574,16 @@ fn ncd_bytes_default(py: Python<'_>, x: &[u8], y: &[u8], variant: &str) -> PyRes
 
 #[pyfunction]
 fn entropy_rate_bytes(py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
-    py.detach(|| py_try(|| api::try_entropy_rate_bytes(data, max_order).map_err(py_infotheory_error)))
+    py.detach(|| {
+        py_try(|| api::try_entropy_rate_bytes(data, max_order).map_err(py_infotheory_error))
+    })
 }
 
 #[pyfunction]
 fn biased_entropy_rate_bytes(py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
-    py.detach(|| py_try(|| api::try_biased_entropy_rate_bytes(data, max_order).map_err(py_infotheory_error)))
+    py.detach(|| {
+        py_try(|| api::try_biased_entropy_rate_bytes(data, max_order).map_err(py_infotheory_error))
+    })
 }
 
 #[pyfunction]
@@ -1613,10 +1627,7 @@ macro_rules! py_metric_paths_3_try {
     };
 }
 
-py_metric_bytes_3_try!(
-    joint_entropy_rate_bytes,
-    api::try_joint_entropy_rate_bytes
-);
+py_metric_bytes_3_try!(joint_entropy_rate_bytes, api::try_joint_entropy_rate_bytes);
 py_metric_bytes_3_try!(
     conditional_entropy_rate_bytes,
     api::try_conditional_entropy_rate_bytes
@@ -1625,10 +1636,7 @@ py_metric_bytes_3_try!(
     conditional_entropy_bytes,
     api::try_conditional_entropy_bytes
 );
-py_metric_bytes_3_try!(
-    mutual_information_bytes,
-    api::try_mutual_information_bytes
-);
+py_metric_bytes_3_try!(mutual_information_bytes, api::try_mutual_information_bytes);
 py_metric_bytes_3_try!(
     mutual_information_rate_bytes,
     api::try_mutual_information_rate_bytes
@@ -1638,17 +1646,17 @@ py_metric_bytes_3_try!(nte_bytes, api::try_nte_bytes);
 py_metric_bytes_3!(tvd_bytes, api::tvd_bytes);
 py_metric_bytes_3!(nhd_bytes, api::nhd_bytes);
 py_metric_bytes_3_try!(cross_entropy_bytes, api::try_cross_entropy_bytes);
-py_metric_bytes_3_try!(
-    cross_entropy_rate_bytes,
-    api::try_cross_entropy_rate_bytes
-);
+py_metric_bytes_3_try!(cross_entropy_rate_bytes, api::try_cross_entropy_rate_bytes);
 
 py_metric_paths_3_try!(ned_paths, api::try_ned_paths);
 py_metric_paths_3_try!(nte_paths, api::try_nte_paths);
 py_metric_paths_3_try!(tvd_paths, api::try_tvd_paths);
 py_metric_paths_3_try!(nhd_paths, api::try_nhd_paths);
 py_metric_paths_3_try!(mutual_information_paths, api::try_mutual_information_paths);
-py_metric_paths_3_try!(conditional_entropy_paths, api::try_conditional_entropy_paths);
+py_metric_paths_3_try!(
+    conditional_entropy_paths,
+    api::try_conditional_entropy_paths
+);
 py_metric_paths_3_try!(cross_entropy_paths, api::try_cross_entropy_paths);
 
 #[pyfunction]
@@ -1663,16 +1671,12 @@ fn js_div_bytes(x: &[u8], y: &[u8]) -> f64 {
 
 #[pyfunction]
 fn kl_divergence_paths(py: Python<'_>, x: &str, y: &str) -> PyResult<f64> {
-    py.detach(|| {
-        py_try(|| api::try_kl_divergence_paths(x, y).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_kl_divergence_paths(x, y).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
 fn js_divergence_paths(py: Python<'_>, x: &str, y: &str) -> PyResult<f64> {
-    py.detach(|| {
-        py_try(|| api::try_js_divergence_paths(x, y).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_js_divergence_paths(x, y).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -1746,9 +1750,7 @@ fn validate_zpaq_rate_method(method: &str) -> PyResult<()> {
 
 #[pyfunction]
 fn get_compressed_size(py: Python<'_>, path: &str, method: &str) -> PyResult<u64> {
-    py.detach(|| {
-        py_try(|| api::try_get_compressed_size(path, method).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_get_compressed_size(path, method).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -1759,7 +1761,10 @@ fn get_compressed_size_parallel(
     threads: usize,
 ) -> PyResult<u64> {
     py.detach(|| {
-        py_try(|| api::try_get_compressed_size_parallel(path, method, threads).map_err(py_infotheory_error))
+        py_try(|| {
+            api::try_get_compressed_size_parallel(path, method, threads)
+                .map_err(py_infotheory_error)
+        })
     })
 }
 
@@ -1772,7 +1777,9 @@ fn get_compressed_sizes_from_paths(
 ) -> PyResult<Vec<u64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
     py.detach(|| {
-        py_try(|| api::try_get_compressed_sizes_from_paths(&refs, method).map_err(py_infotheory_error))
+        py_try(|| {
+            api::try_get_compressed_sizes_from_paths(&refs, method).map_err(py_infotheory_error)
+        })
     })
 }
 
@@ -1845,16 +1852,16 @@ fn get_parallel_compressed_sizes_from_parallel_paths(
 #[pyfunction]
 fn get_bytes_from_paths(py: Python<'_>, paths: Vec<String>) -> PyResult<Vec<Vec<u8>>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.detach(|| {
-        py_try(|| api::try_get_bytes_from_paths(&refs).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_get_bytes_from_paths(&refs).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_vitanyi(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
     py.detach(|| {
-        py_try(|| api::try_ncd_paths(x, y, method, NcdVariant::Vitanyi).map_err(py_infotheory_error))
+        py_try(|| {
+            api::try_ncd_paths(x, y, method, NcdVariant::Vitanyi).map_err(py_infotheory_error)
+        })
     })
 }
 
@@ -1862,7 +1869,9 @@ fn ncd_vitanyi(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> 
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_sym_vitanyi(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
     py.detach(|| {
-        py_try(|| api::try_ncd_paths(x, y, method, NcdVariant::SymVitanyi).map_err(py_infotheory_error))
+        py_try(|| {
+            api::try_ncd_paths(x, y, method, NcdVariant::SymVitanyi).map_err(py_infotheory_error)
+        })
     })
 }
 
@@ -1878,7 +1887,9 @@ fn ncd_cons(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_sym_cons(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
     py.detach(|| {
-        py_try(|| api::try_ncd_paths(x, y, method, NcdVariant::SymCons).map_err(py_infotheory_error))
+        py_try(|| {
+            api::try_ncd_paths(x, y, method, NcdVariant::SymCons).map_err(py_infotheory_error)
+        })
     })
 }
 
@@ -1982,8 +1993,8 @@ fn compress_file(
             let input = std::fs::read(input_path).map_err(|e| {
                 PyRuntimeError::new_err(format!("failed to read '{input_path}': {e}"))
             })?;
-            let out =
-                infotheory::api::try_compress_bytes_backend(&input, &cb).map_err(py_infotheory_error)?;
+            let out = infotheory::api::try_compress_bytes_backend(&input, &cb)
+                .map_err(py_infotheory_error)?;
             std::fs::write(output_path, &out).map_err(|e| {
                 PyRuntimeError::new_err(format!("failed to write '{output_path}': {e}"))
             })?;
@@ -2112,7 +2123,9 @@ fn biased_entropy_rate_backend(
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
     py.detach(|| {
-        py_try(|| api::try_biased_entropy_rate_backend(data, max_order, &rb).map_err(py_infotheory_error))
+        py_try(|| {
+            api::try_biased_entropy_rate_backend(data, max_order, &rb).map_err(py_infotheory_error)
+        })
     })
 }
 
@@ -2147,7 +2160,9 @@ fn joint_entropy_rate_backend(
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
     py.detach(|| {
-        py_try(|| api::try_joint_entropy_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error))
+        py_try(|| {
+            api::try_joint_entropy_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error)
+        })
     })
 }
 
@@ -2163,7 +2178,10 @@ fn mutual_information_rate_backend(
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
     py.detach(|| {
-        py_try(|| api::try_mutual_information_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error))
+        py_try(|| {
+            api::try_mutual_information_rate_backend(x, y, max_order, &rb)
+                .map_err(py_infotheory_error)
+        })
     })
 }
 
@@ -2178,7 +2196,9 @@ fn ned_rate_backend(
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
-    py.detach(|| py_try(|| api::try_ned_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error)))
+    py.detach(|| {
+        py_try(|| api::try_ned_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error))
+    })
 }
 
 #[pyfunction]
@@ -2192,7 +2212,9 @@ fn nte_rate_backend(
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = rate_backend_from_py(backend, method)?;
-    py.detach(|| py_try(|| api::try_nte_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error)))
+    py.detach(|| {
+        py_try(|| api::try_nte_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error))
+    })
 }
 
 #[pyfunction]
@@ -2205,7 +2227,9 @@ fn ncd_matrix_paths(
 ) -> PyResult<Vec<f64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
     let v = parse_ncd_variant(variant)?;
-    py.detach(|| py_try(|| api::try_ncd_matrix_paths(&refs, method, v).map_err(py_infotheory_error)))
+    py.detach(|| {
+        py_try(|| api::try_ncd_matrix_paths(&refs, method, v).map_err(py_infotheory_error))
+    })
 }
 
 #[pyfunction]
@@ -4065,8 +4089,9 @@ struct PyRwkvPredictor {
 impl PyRwkvPredictor {
     #[new]
     fn new(model_path: String) -> PyResult<Self> {
-        let model = infotheory::rwkvzip::Compressor::load_model(&model_path)
-            .map_err(|err| PyRuntimeError::new_err(format!("failed to load RWKV7 model: {err:#}")))?;
+        let model = infotheory::rwkvzip::Compressor::load_model(&model_path).map_err(|err| {
+            PyRuntimeError::new_err(format!("failed to load RWKV7 model: {err:#}"))
+        })?;
         Ok(Self {
             inner: infotheory::aixi::model::RwkvPredictor::new(model),
         })

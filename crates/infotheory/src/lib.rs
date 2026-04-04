@@ -99,6 +99,26 @@ pub mod search;
 pub(crate) mod simd_math;
 /// Shared backend/spec parsing and loading helpers.
 pub mod spec;
+use crate::api::RateBackend;
+#[cfg(test)]
+pub(crate) use crate::api::{
+    CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureSpec,
+    ParticleSpec,
+};
+#[cfg(test)]
+use crate::api::{
+    CompressionBackend, GenerationConfig, InfotheoryCtx, NcdVariant, RateBackendSession,
+    d_kl_bytes, try_biased_entropy_rate_backend, try_compress_size_backend,
+    try_conditional_entropy_bytes, try_conditional_entropy_rate_bytes,
+    try_cross_entropy_rate_backend, try_entropy_rate_backend, try_entropy_rate_bytes,
+    try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes, try_mutual_information_bytes,
+    try_ncd_bytes,
+};
+#[cfg(test)]
+use crate::api::{
+    joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes, nhd_bytes, tvd_bytes,
+};
+use crate::error::{InfotheoryError, InfotheoryResult};
 /// CTW and FAC-CTW backend types.
 #[cfg(feature = "backend-ctw")]
 pub use backends::ctw;
@@ -129,28 +149,10 @@ pub use backends::sparse_match;
 /// ZPAQ rate-model adapter.
 #[cfg(feature = "backend-zpaq")]
 pub use backends::zpaq_rate;
-use crate::api::RateBackend;
-use crate::error::{InfotheoryError, InfotheoryResult};
-#[cfg(test)]
-pub(crate) use crate::api::{
-    CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureSpec,
-    ParticleSpec,
-};
-#[cfg(test)]
-use crate::api::{
-    CompressionBackend, GenerationConfig, InfotheoryCtx, NcdVariant, RateBackendSession,
-    d_kl_bytes, try_biased_entropy_rate_backend, try_compress_size_backend,
-    try_conditional_entropy_bytes, try_entropy_rate_bytes,
-    try_conditional_entropy_rate_bytes, try_cross_entropy_rate_backend, try_entropy_rate_backend,
-    try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes, try_mutual_information_bytes,
-    try_ncd_bytes,
-};
-#[cfg(test)]
-use crate::api::{js_div_bytes, joint_marginal_entropy_bytes, marginal_entropy_bytes, nhd_bytes, tvd_bytes};
 
-use crate::mixture::OnlineBytePredictor;
 #[cfg(feature = "backend-rosa")]
 use crate::backends::rosaplus::RosaPlus;
+use crate::mixture::OnlineBytePredictor;
 use std::cell::RefCell;
 #[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
 use std::collections::HashMap;
@@ -201,10 +203,7 @@ pub(crate) fn try_zpaq_compress_size_bytes(data: &[u8], method: &str) -> Infothe
 
 #[cfg(not(feature = "backend-zpaq"))]
 #[inline(always)]
-pub(crate) fn try_zpaq_compress_size_bytes(
-    _data: &[u8],
-    _method: &str,
-) -> InfotheoryResult<u64> {
+pub(crate) fn try_zpaq_compress_size_bytes(_data: &[u8], _method: &str) -> InfotheoryResult<u64> {
     Err(InfotheoryError::unsupported(
         "CompressionBackend::Zpaq is unavailable: build with feature 'backend-zpaq'",
     ))
@@ -296,7 +295,10 @@ pub fn validate_zpaq_rate_method(method: &str) -> InfotheoryResult<()> {
 }
 
 #[cfg(feature = "backend-rwkv")]
-pub(crate) fn with_rwkv_method_tls<R>(method: &str, f: impl FnOnce(&mut rwkvzip::Compressor) -> R) -> R {
+pub(crate) fn with_rwkv_method_tls<R>(
+    method: &str,
+    f: impl FnOnce(&mut rwkvzip::Compressor) -> R,
+) -> R {
     RWKV_METHOD_TLS.with(|cell| {
         let mut map = cell.borrow_mut();
         // Keep a per-method template compressor for fast cloning while ensuring
@@ -531,8 +533,7 @@ mod tests {
     }
 
     fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-        try_conditional_entropy_rate_bytes(x, y, max_order)
-            .expect("conditional_entropy_rate_bytes")
+        try_conditional_entropy_rate_bytes(x, y, max_order).expect("conditional_entropy_rate_bytes")
     }
 
     fn mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {

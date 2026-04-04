@@ -1,10 +1,10 @@
-use infotheory::axioms;
-use infotheory::datagen;
 #[cfg(feature = "backend-zpaq")]
 use infotheory::api::{CompressionBackend, NcdVariant, try_ncd_bytes_backend};
 use infotheory::api::{
     RateBackend, marginal_entropy_bytes, try_entropy_rate_backend, try_mutual_information_bytes,
 };
+use infotheory::axioms;
+use infotheory::datagen;
 
 const TOLERANCE_ENTROPY: f64 = 0.1;
 const TOLERANCE_MI: f64 = 0.2;

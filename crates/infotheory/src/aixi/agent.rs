@@ -3,7 +3,6 @@
 //! This module defines the `Agent` struct, which ties together a world model
 //! (Predictor) and a planner (SearchTree) to form a complete autonomous entity.
 
-use crate::api::{RateBackend, validate_rate_backend};
 use crate::aixi::common::{
     Action, ObservationKeyMode, PerceptVal, RandomGenerator, Reward, decode, encode,
     observation_repr_from_stream,
@@ -11,18 +10,17 @@ use crate::aixi::common::{
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
 #[cfg(feature = "backend-mamba")]
 use crate::aixi::model::MambaPredictor;
+#[cfg(feature = "backend-rosa")]
+use crate::aixi::model::RosaPredictor;
 #[cfg(feature = "backend-rwkv")]
 use crate::aixi::model::RwkvPredictor;
-use crate::aixi::model::{
-    Predictor, RateBackendBitPredictor,
-};
 #[cfg(feature = "backend-zpaq")]
 use crate::aixi::model::ZpaqPredictor;
 #[cfg(feature = "backend-ctw")]
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor};
-#[cfg(feature = "backend-rosa")]
-use crate::aixi::model::RosaPredictor;
+use crate::aixi::model::{Predictor, RateBackendBitPredictor};
 use crate::aixi::rate_backend::{adapt_rate_backend_for_bit_tokens, rate_backend_contains_zpaq};
+use crate::api::{RateBackend, validate_rate_backend};
 use crate::validate_zpaq_rate_method;
 
 /// Configuration parameters for an AIXI agent.

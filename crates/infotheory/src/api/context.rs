@@ -1,9 +1,7 @@
 //! Stateful context and session API surface.
 
 use super::compression::{NcdVariant, try_ncd_bytes_backend};
-use super::generation::{
-    GenerationRng, pick_generated_byte, try_generate_rate_backend_chain,
-};
+use super::generation::{GenerationRng, pick_generated_byte, try_generate_rate_backend_chain};
 use super::metrics::{
     byte_histogram, joint_marginal_entropy_bytes, marginal_entropy_bytes,
     mutual_information_marg_bytes, ned_marg_bytes, nte_marg_bytes, try_biased_entropy_rate_backend,
@@ -11,11 +9,17 @@ use super::metrics::{
     try_mutual_information_rate_backend, try_ned_rate_backend, try_nte_rate_backend,
 };
 use super::types::{
-    validate_rate_backend, CompressionBackend, GenerationConfig, GenerationUpdateMode, RateBackend,
+    CompressionBackend, GenerationConfig, GenerationUpdateMode, RateBackend, validate_rate_backend,
 };
+use crate::aligned_prefix;
+#[cfg(feature = "backend-ctw")]
+use crate::backends::ctw::{ContextTree, FacContextTree};
+#[cfg(feature = "backend-particle")]
+use crate::backends::particle::ParticleRuntime;
+#[cfg(feature = "backend-zpaq")]
+use crate::backends::zpaq_rate::ZpaqRateModel;
 use crate::error::{InfotheoryError, InfotheoryResult};
 use crate::mixture::OnlineBytePredictor;
-use crate::aligned_prefix;
 #[cfg(any(
     feature = "backend-match",
     feature = "backend-ppmd",
@@ -23,12 +27,6 @@ use crate::aligned_prefix;
     feature = "backend-calibrated"
 ))]
 use crate::try_prequential_rate_backend;
-#[cfg(feature = "backend-ctw")]
-use crate::backends::ctw::{ContextTree, FacContextTree};
-#[cfg(feature = "backend-particle")]
-use crate::backends::particle::ParticleRuntime;
-#[cfg(feature = "backend-zpaq")]
-use crate::backends::zpaq_rate::ZpaqRateModel;
 #[cfg(feature = "backend-mamba")]
 use crate::with_mamba_method_tls;
 #[cfg(feature = "backend-rwkv")]
@@ -311,11 +309,11 @@ impl InfotheoryCtx {
                 try_prequential_rate_backend(data, prefix_parts, -1, &self.rate_backend)
             }
             #[cfg(not(feature = "backend-match"))]
-            RateBackend::Match { .. } | RateBackend::SparseMatch { .. } => Err(
-                InfotheoryError::invalid_backend_config(
+            RateBackend::Match { .. } | RateBackend::SparseMatch { .. } => {
+                Err(InfotheoryError::invalid_backend_config(
                     "backend 'match' requires infotheory feature 'backend-match'".to_string(),
-                ),
-            ),
+                ))
+            }
             #[cfg(not(feature = "backend-ppmd"))]
             RateBackend::Ppmd { .. } => Err(InfotheoryError::invalid_backend_config(
                 "backend 'ppmd' requires infotheory feature 'backend-ppmd'".to_string(),
@@ -326,8 +324,7 @@ impl InfotheoryCtx {
             )),
             #[cfg(not(feature = "backend-calibrated"))]
             RateBackend::Calibrated { .. } => Err(InfotheoryError::invalid_backend_config(
-                "backend 'calibrated' requires infotheory feature 'backend-calibrated'"
-                    .to_string(),
+                "backend 'calibrated' requires infotheory feature 'backend-calibrated'".to_string(),
             )),
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
@@ -586,12 +583,7 @@ impl InfotheoryCtx {
     }
 
     /// Conservative NED normalization variant.
-    pub fn try_ned_cons_bytes(
-        &self,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> InfotheoryResult<f64> {
+    pub fn try_ned_cons_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
         let (x, y) = aligned_prefix(x, y);
         let (h_x, h_y, h_xy) = if max_order == 0 {
             (

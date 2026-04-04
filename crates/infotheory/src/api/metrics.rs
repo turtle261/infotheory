@@ -11,11 +11,11 @@ use crate::backends::particle::ParticleRuntime;
 use crate::backends::rosaplus::RosaPlus;
 #[cfg(feature = "backend-zpaq")]
 use crate::backends::zpaq_rate::ZpaqRateModel;
-use crate::{aligned_prefix, with_default_ctx};
 #[cfg(feature = "backend-mamba")]
 use crate::with_mamba_method_tls;
 #[cfg(feature = "backend-rwkv")]
 use crate::with_rwkv_method_tls;
+use crate::{aligned_prefix, with_default_ctx};
 
 #[inline(always)]
 pub fn try_entropy_rate_bytes(data: &[u8], max_order: i64) -> InfotheoryResult<f64> {
@@ -525,20 +525,12 @@ pub fn try_conditional_entropy_rate_bytes(
 }
 
 #[inline(always)]
-pub fn try_conditional_entropy_bytes(
-    x: &[u8],
-    y: &[u8],
-    max_order: i64,
-) -> InfotheoryResult<f64> {
+pub fn try_conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_conditional_entropy_bytes(x, y, max_order))
 }
 
 #[inline(always)]
-pub fn try_mutual_information_bytes(
-    x: &[u8],
-    y: &[u8],
-    max_order: i64,
-) -> InfotheoryResult<f64> {
+pub fn try_mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_mutual_information_bytes(x, y, max_order))
 }
 
@@ -601,11 +593,7 @@ pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 #[inline(always)]
-pub fn try_ned_cons_rate_bytes(
-    x: &[u8],
-    y: &[u8],
-    max_order: i64,
-) -> InfotheoryResult<f64> {
+pub fn try_ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_ned_cons_bytes(x, y, max_order))
 }
 

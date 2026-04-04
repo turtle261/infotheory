@@ -2,13 +2,10 @@
 
 use rayon::prelude::*;
 
-use super::compression::{
-    NcdVariant, try_ncd_bytes, try_ncd_bytes_backend, try_ncd_matrix_bytes,
-};
+use super::compression::{NcdVariant, try_ncd_bytes, try_ncd_bytes_backend, try_ncd_matrix_bytes};
 use super::metrics::{
-    d_kl_bytes, js_div_bytes, nhd_bytes, try_conditional_entropy_bytes,
-    try_cross_entropy_bytes, try_mutual_information_bytes, try_ned_bytes, try_nte_bytes,
-    tvd_bytes,
+    d_kl_bytes, js_div_bytes, nhd_bytes, try_conditional_entropy_bytes, try_cross_entropy_bytes,
+    try_mutual_information_bytes, try_ned_bytes, try_nte_bytes, tvd_bytes,
 };
 use super::types::CompressionBackend;
 use crate::error::{InfotheoryError, InfotheoryResult};
@@ -106,19 +103,18 @@ pub fn try_get_compressed_sizes_from_paths(
     }
     let num_threads = *NUM_THREADS.get_or_init(num_cpus::get);
     if n < num_threads {
-        try_get_parallel_compressed_sizes_from_parallel_paths(paths, method, num_threads.div_ceil(n))
+        try_get_parallel_compressed_sizes_from_parallel_paths(
+            paths,
+            method,
+            num_threads.div_ceil(n),
+        )
     } else {
         try_get_sequential_compressed_sizes_from_parallel_paths(paths, method)
     }
 }
 
 #[inline(always)]
-pub fn try_ncd_paths(
-    x: &str,
-    y: &str,
-    method: &str,
-    variant: NcdVariant,
-) -> InfotheoryResult<f64> {
+pub fn try_ncd_paths(x: &str, y: &str, method: &str, variant: NcdVariant) -> InfotheoryResult<f64> {
     let (bx, by) = rayon::join(
         || std::fs::read(x).map_err(InfotheoryError::from),
         || std::fs::read(y).map_err(InfotheoryError::from),

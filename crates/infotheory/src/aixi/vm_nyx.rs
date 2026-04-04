@@ -22,6 +22,9 @@
 
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::environment::Environment;
+use crate::api::{
+    RateBackend, marginal_entropy_bytes, try_cross_entropy_rate_backend, try_entropy_rate_backend,
+};
 use crate::backends::ctw::{ContextTree, FacContextTree};
 use crate::backends::rosaplus::RosaPlus;
 use crate::backends::zpaq_rate::ZpaqRateModel;
@@ -34,9 +37,6 @@ use crate::mambazip::Compressor as MambaCompressor;
 use crate::mixture::OnlineBytePredictor;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip::Compressor;
-use crate::api::{
-    RateBackend, marginal_entropy_bytes, try_cross_entropy_rate_backend, try_entropy_rate_backend,
-};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::fs::OpenOptions;

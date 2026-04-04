@@ -326,9 +326,7 @@ pub(super) fn parse_nyx_observation_policy(v: &serde_json::Value) -> NyxObservat
 }
 
 #[cfg(feature = "vm")]
-pub(super) fn parse_nyx_observation_stream_mode(
-    v: &serde_json::Value,
-) -> NyxObservationStreamMode {
+pub(super) fn parse_nyx_observation_stream_mode(v: &serde_json::Value) -> NyxObservationStreamMode {
     match v["stream_mode"].as_str().unwrap_or("pad-truncate") {
         "pad" => NyxObservationStreamMode::Pad,
         "truncate" => NyxObservationStreamMode::Truncate,
@@ -725,10 +723,7 @@ pub(super) fn parse_observation_key_mode_str(s: &str) -> ObservationKeyMode {
     }
 }
 
-pub(super) fn parse_observation_stream_len_for_env(
-    v: &serde_json::Value,
-    env_name: &str,
-) -> usize {
+pub(super) fn parse_observation_stream_len_for_env(v: &serde_json::Value, env_name: &str) -> usize {
     if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" {
         if v["vm_observation"].is_null() {
             parse_observation_stream_len(v)

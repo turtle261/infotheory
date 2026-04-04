@@ -1,6 +1,8 @@
 use infotheory::aixi::agent::{Agent, AgentConfig};
 use infotheory::aixi::environment::{BiasedRockPaperScissor, Environment};
-use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend};
+use infotheory::api::{
+    MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

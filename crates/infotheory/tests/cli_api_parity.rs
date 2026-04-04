@@ -4,8 +4,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use infotheory::api::{
-    NcdVariant, marginal_entropy_bytes, try_biased_entropy_rate_bytes, try_ncd_matrix_bytes,
-    try_cross_entropy_rate_bytes, try_entropy_rate_bytes, try_ncd_paths,
+    NcdVariant, marginal_entropy_bytes, try_biased_entropy_rate_bytes,
+    try_cross_entropy_rate_bytes, try_entropy_rate_bytes, try_ncd_matrix_bytes, try_ncd_paths,
 };
 use serde_json::Value;
 

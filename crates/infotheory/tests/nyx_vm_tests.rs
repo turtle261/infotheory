@@ -13,8 +13,8 @@
 //! the appropriate guest image. Unit tests for non-VM components can
 //! run without the VM.
 
-use infotheory::api::RateBackend;
 use infotheory::aixi::vm_nyx::*;
+use infotheory::api::RateBackend;
 use std::sync::Arc;
 use std::time::Duration;
 

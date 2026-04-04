@@ -1,6 +1,8 @@
 #![cfg(feature = "backend-zpaq")]
 
-use infotheory::api::{CompressionBackend, try_compress_bytes_backend, try_decompress_bytes_backend};
+use infotheory::api::{
+    CompressionBackend, try_compress_bytes_backend, try_decompress_bytes_backend,
+};
 use sha2::{Digest, Sha256};
 #[cfg(feature = "cli")]
 use std::io::Write;

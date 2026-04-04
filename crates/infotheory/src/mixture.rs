@@ -22,9 +22,18 @@
         feature = "backend-rwkv",
         feature = "backend-mamba"
     )),
-    allow(dead_code, unused_imports, unused_variables, unused_mut, unreachable_code)
+    allow(
+        dead_code,
+        unused_imports,
+        unused_variables,
+        unused_mut,
+        unreachable_code
+    )
 )]
 
+#[cfg(feature = "backend-calibrated")]
+use crate::api::CalibratedSpec;
+use crate::api::{MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
@@ -47,9 +56,6 @@ use crate::mambazip;
 use crate::neural_mix::{NeuralHistoryState, NeuralMixCore};
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
-#[cfg(feature = "backend-calibrated")]
-use crate::api::CalibratedSpec;
-use crate::api::{MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend};
 use std::sync::Arc;
 
 /// Default minimum probability floor to avoid log(0).
@@ -621,7 +627,10 @@ fn restore_fac_ctw_checkpoint(
 ) {
     let bits = bits_per_symbol.clamp(1, 8);
     while checkpoint_journal.len() > target_len {
-        match checkpoint_journal.pop().expect("ctw checkpoint journal underflow") {
+        match checkpoint_journal
+            .pop()
+            .expect("ctw checkpoint journal underflow")
+        {
             FacCtwUndoOp::LearnedSymbol => {
                 for bit_idx in (0..bits).rev() {
                     tree.revert(bit_idx);
@@ -651,7 +660,9 @@ impl RateBackendPredictor {
             }
             #[cfg(not(feature = "backend-rosa"))]
             RateBackend::RosaPlus => {
-                return Err("backend 'rosaplus' requires infotheory feature 'backend-rosa'".to_string())
+                return Err(
+                    "backend 'rosaplus' requires infotheory feature 'backend-rosa'".to_string(),
+                );
             }
             #[cfg(feature = "backend-match")]
             RateBackend::Match {
@@ -672,7 +683,9 @@ impl RateBackendPredictor {
             },
             #[cfg(not(feature = "backend-match"))]
             RateBackend::Match { .. } => {
-                return Err("backend 'match' requires infotheory feature 'backend-match'".to_string())
+                return Err(
+                    "backend 'match' requires infotheory feature 'backend-match'".to_string(),
+                );
             }
             #[cfg(feature = "backend-match")]
             RateBackend::SparseMatch {
@@ -700,7 +713,7 @@ impl RateBackendPredictor {
                 return Err(
                     "backend 'sparse-match' requires infotheory feature 'backend-match'"
                         .to_string(),
-                )
+                );
             }
             #[cfg(feature = "backend-ppmd")]
             RateBackend::Ppmd { order, memory_mb } => Self::Ppmd {
@@ -709,7 +722,7 @@ impl RateBackendPredictor {
             },
             #[cfg(not(feature = "backend-ppmd"))]
             RateBackend::Ppmd { .. } => {
-                return Err("backend 'ppmd' requires infotheory feature 'backend-ppmd'".to_string())
+                return Err("backend 'ppmd' requires infotheory feature 'backend-ppmd'".to_string());
             }
             #[cfg(feature = "backend-sequitur")]
             RateBackend::Sequitur { context_bytes } => Self::Sequitur {
@@ -718,7 +731,9 @@ impl RateBackendPredictor {
             },
             #[cfg(not(feature = "backend-sequitur"))]
             RateBackend::Sequitur { .. } => {
-                return Err("backend 'sequitur' requires infotheory feature 'backend-sequitur'".to_string())
+                return Err(
+                    "backend 'sequitur' requires infotheory feature 'backend-sequitur'".to_string(),
+                );
             }
             #[cfg(feature = "backend-ctw")]
             RateBackend::Ctw { depth } => {
@@ -732,7 +747,7 @@ impl RateBackendPredictor {
             }
             #[cfg(not(feature = "backend-ctw"))]
             RateBackend::Ctw { .. } => {
-                return Err("backend 'ctw' requires infotheory feature 'backend-ctw'".to_string())
+                return Err("backend 'ctw' requires infotheory feature 'backend-ctw'".to_string());
             }
             #[cfg(feature = "backend-ctw")]
             RateBackend::FacCtw {
@@ -752,7 +767,9 @@ impl RateBackendPredictor {
             }
             #[cfg(not(feature = "backend-ctw"))]
             RateBackend::FacCtw { .. } => {
-                return Err("backend 'fac-ctw' requires infotheory feature 'backend-ctw'".to_string())
+                return Err(
+                    "backend 'fac-ctw' requires infotheory feature 'backend-ctw'".to_string(),
+                );
             }
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7Method { method } => {
@@ -794,7 +811,7 @@ impl RateBackendPredictor {
             }
             #[cfg(not(feature = "backend-zpaq"))]
             RateBackend::Zpaq { .. } => {
-                return Err("backend 'zpaq' requires infotheory feature 'backend-zpaq'".to_string())
+                return Err("backend 'zpaq' requires infotheory feature 'backend-zpaq'".to_string());
             }
             #[cfg(feature = "backend-mixture")]
             RateBackend::Mixture { spec } => {
@@ -805,7 +822,9 @@ impl RateBackendPredictor {
             }
             #[cfg(not(feature = "backend-mixture"))]
             RateBackend::Mixture { .. } => {
-                return Err("backend 'mixture' requires infotheory feature 'backend-mixture'".to_string())
+                return Err(
+                    "backend 'mixture' requires infotheory feature 'backend-mixture'".to_string(),
+                );
             }
             #[cfg(feature = "backend-particle")]
             RateBackend::Particle { spec } => {
@@ -814,7 +833,9 @@ impl RateBackendPredictor {
             }
             #[cfg(not(feature = "backend-particle"))]
             RateBackend::Particle { .. } => {
-                return Err("backend 'particle' requires infotheory feature 'backend-particle'".to_string())
+                return Err(
+                    "backend 'particle' requires infotheory feature 'backend-particle'".to_string(),
+                );
             }
             #[cfg(feature = "backend-calibrated")]
             RateBackend::Calibrated { spec } => Self::Calibrated {
@@ -833,7 +854,7 @@ impl RateBackendPredictor {
                 return Err(
                     "backend 'calibrated' requires infotheory feature 'backend-calibrated'"
                         .to_string(),
-                )
+                );
             }
         })
     }
@@ -974,7 +995,10 @@ impl RateBackendPredictor {
     pub(crate) fn restore_checkpoint(&mut self, checkpoint: &RateBackendPredictorCheckpoint) {
         match (self, checkpoint) {
             #[cfg(feature = "backend-rosa")]
-            (RateBackendPredictor::Rosa { model, .. }, RateBackendPredictorCheckpoint::Rosa(ck)) => {
+            (
+                RateBackendPredictor::Rosa { model, .. },
+                RateBackendPredictorCheckpoint::Rosa(ck),
+            ) => {
                 model.restore(ck);
             }
             #[cfg(feature = "backend-sequitur")]
@@ -4010,7 +4034,8 @@ mod tests {
     }
 
     fn assert_checkpoint_roundtrip_restores_predictor(backend: RateBackend, history: &[u8]) {
-        let mut predictor = RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
+        let mut predictor =
+            RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
         predictor.begin_stream(None).expect("begin stream");
         for &byte in history {
             predictor.update(byte);

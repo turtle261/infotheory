@@ -1,4 +1,6 @@
-use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend, try_entropy_rate_backend};
+use infotheory::api::{
+    MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend, try_entropy_rate_backend,
+};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;

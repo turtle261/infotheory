@@ -1,30 +1,27 @@
 use infotheory::api::{
     CompressionBackend, GenerationConfig, InfotheoryCtx, MixtureExpertSpec, MixtureKind,
-    MixtureSpec, ParticleSpec, RateBackend, RateBackendSession, d_kl_bytes, get_default_ctx,
-    joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes,
-    mutual_information_marg_bytes, ned_cons_marg_bytes, ned_marg_bytes, nhd_bytes,
-    nte_marg_bytes, set_default_ctx, try_biased_entropy_rate_backend,
-    try_biased_entropy_rate_bytes, try_compress_bytes_backend, try_compress_size_backend,
-    try_compress_size_chain_backend, try_conditional_entropy_bytes,
-    try_conditional_entropy_paths, try_conditional_entropy_rate_bytes,
-    try_cross_entropy_bytes, try_cross_entropy_paths, try_cross_entropy_rate_backend,
-    try_cross_entropy_rate_bytes, try_decompress_bytes_backend, try_entropy_rate_backend,
-    try_entropy_rate_bytes, try_get_bytes_from_paths,
-    try_get_compressed_size, try_get_compressed_size_parallel,
-    try_get_compressed_sizes_from_paths, try_get_parallel_compressed_sizes_from_parallel_paths,
+    MixtureSpec, NcdVariant, ParticleSpec, RateBackend, RateBackendSession, d_kl_bytes,
+    get_default_ctx, joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes,
+    mutual_information_marg_bytes, ned_cons_marg_bytes, ned_marg_bytes, nhd_bytes, nte_marg_bytes,
+    set_default_ctx, try_biased_entropy_rate_backend, try_biased_entropy_rate_bytes,
+    try_compress_bytes_backend, try_compress_size_backend, try_compress_size_chain_backend,
+    try_conditional_entropy_bytes, try_conditional_entropy_paths,
+    try_conditional_entropy_rate_bytes, try_cross_entropy_bytes, try_cross_entropy_paths,
+    try_cross_entropy_rate_backend, try_cross_entropy_rate_bytes, try_decompress_bytes_backend,
+    try_entropy_rate_backend, try_entropy_rate_bytes, try_get_bytes_from_paths,
+    try_get_compressed_size, try_get_compressed_size_parallel, try_get_compressed_sizes_from_paths,
+    try_get_parallel_compressed_sizes_from_parallel_paths,
     try_get_parallel_compressed_sizes_from_sequential_paths,
-    try_ncd_matrix_paths,
     try_get_sequential_compressed_sizes_from_parallel_paths,
-    try_get_sequential_compressed_sizes_from_sequential_paths,
-    try_intrinsic_dependence_bytes, try_joint_entropy_rate_backend,
-    try_joint_entropy_rate_bytes, try_js_divergence_paths, try_kl_divergence_paths,
-    try_mutual_information_bytes, try_mutual_information_paths,
+    try_get_sequential_compressed_sizes_from_sequential_paths, try_intrinsic_dependence_bytes,
+    try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes, try_js_divergence_paths,
+    try_kl_divergence_paths, try_mutual_information_bytes, try_mutual_information_paths,
     try_mutual_information_rate_backend, try_mutual_information_rate_bytes, try_ncd_bytes,
-    try_ncd_bytes_backend, try_ncd_bytes_default, try_ncd_matrix_bytes, try_ncd_paths, try_ncd_paths_backend,
-    try_ned_bytes, try_ned_cons_bytes, try_ned_cons_rate_bytes, try_ned_paths,
-    try_ned_rate_backend, try_ned_rate_bytes, try_nhd_paths, try_nte_bytes, try_nte_paths,
-    try_nte_rate_backend, try_nte_rate_bytes, try_resistance_to_transformation_bytes,
-    try_tvd_paths, tvd_bytes, NcdVariant,
+    try_ncd_bytes_backend, try_ncd_bytes_default, try_ncd_matrix_bytes, try_ncd_matrix_paths,
+    try_ncd_paths, try_ncd_paths_backend, try_ned_bytes, try_ned_cons_bytes,
+    try_ned_cons_rate_bytes, try_ned_paths, try_ned_rate_backend, try_ned_rate_bytes,
+    try_nhd_paths, try_nte_bytes, try_nte_paths, try_nte_rate_backend, try_nte_rate_bytes,
+    try_resistance_to_transformation_bytes, try_tvd_paths, tvd_bytes,
 };
 #[cfg(feature = "backend-zpaq")]
 use std::fs;
@@ -70,11 +67,16 @@ fn api_surface_entropy_and_distance_wrappers_are_callable() {
     assert!(try_entropy_rate_bytes(x, -1).expect("entropy rate bytes") >= 0.0);
     assert!(try_biased_entropy_rate_bytes(x, -1).expect("biased entropy rate bytes") >= 0.0);
     assert!(try_joint_entropy_rate_bytes(x, y, -1).expect("joint entropy rate bytes") >= 0.0);
-    assert!(try_conditional_entropy_rate_bytes(x, y, -1).expect("conditional entropy rate bytes") >= 0.0);
+    assert!(
+        try_conditional_entropy_rate_bytes(x, y, -1).expect("conditional entropy rate bytes")
+            >= 0.0
+    );
     assert!(try_conditional_entropy_bytes(x, y, 0).expect("conditional entropy bytes") >= 0.0);
     assert!(try_mutual_information_bytes(x, y, 0).expect("mutual information bytes") >= 0.0);
     assert!(mutual_information_marg_bytes(x, y) >= 0.0);
-    assert!(try_mutual_information_rate_bytes(x, y, -1).expect("mutual information rate bytes") >= 0.0);
+    assert!(
+        try_mutual_information_rate_bytes(x, y, -1).expect("mutual information rate bytes") >= 0.0
+    );
     assert!((0.0..=1.0).contains(&try_ned_bytes(x, y, 0).expect("ned bytes")));
     assert!((0.0..=1.0).contains(&ned_marg_bytes(x, y)));
     assert!((0.0..=1.0).contains(&try_ned_rate_bytes(x, y, -1).expect("ned rate bytes")));
@@ -90,8 +92,12 @@ fn api_surface_entropy_and_distance_wrappers_are_callable() {
     assert!(try_cross_entropy_rate_bytes(x, y, -1).expect("cross entropy rate bytes") >= 0.0);
     assert!(d_kl_bytes(x, y) >= 0.0);
     assert!(js_div_bytes(x, y) >= 0.0);
-    assert!((0.0..=1.0).contains(&try_intrinsic_dependence_bytes(x, -1).expect("intrinsic dependence")));
-    assert!((0.0..=1.0).contains(&try_resistance_to_transformation_bytes(x, y, -1).expect("resistance to transformation")));
+    assert!(
+        (0.0..=1.0).contains(&try_intrinsic_dependence_bytes(x, -1).expect("intrinsic dependence"))
+    );
+    assert!((0.0..=1.0).contains(
+        &try_resistance_to_transformation_bytes(x, y, -1).expect("resistance to transformation")
+    ));
 
     set_default_ctx(prev);
 }
@@ -210,7 +216,9 @@ fn api_surface_path_and_compression_helpers_are_callable() {
     );
     assert!(try_ncd_bytes(x, y, "1", NcdVariant::Vitanyi).expect("ncd bytes") >= 0.0);
     assert!(try_ncd_bytes_default(x, y, NcdVariant::SymVitanyi).expect("ncd bytes default") >= 0.0);
-    assert!(try_ncd_bytes_backend(x, y, &backend, NcdVariant::Cons).expect("ncd bytes backend") >= 0.0);
+    assert!(
+        try_ncd_bytes_backend(x, y, &backend, NcdVariant::Cons).expect("ncd bytes backend") >= 0.0
+    );
     assert!(try_ncd_paths(&sx, &sy, "1", NcdVariant::SymCons).expect("ncd paths") >= 0.0);
     assert!(
         try_ncd_paths_backend(&sx, &sy, &backend, NcdVariant::Vitanyi).expect("fallible file ncd")
