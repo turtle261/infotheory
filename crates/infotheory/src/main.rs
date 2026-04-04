@@ -64,12 +64,14 @@ use std::time::{Duration, Instant};
 use std::time::Instant;
 
 use crate::cli::{
-    aiqi_backend_label, build_ctx, bytes_to_hex, file_roundtrip_backend, load_mixture_spec,
-    maybe_export_online_model, parse_compression_backend, parse_hex_bytes,
-    parse_observation_key_mode_for_env, parse_observation_stream_len_for_env, parse_rate_backend,
-    parse_vm_stats_backend, read_file, read_stdin_all_for_generate, run_batch_mode,
-    validate_obs_stream_len, validate_observation_config,
+    aiqi_backend_label, build_ctx, file_roundtrip_backend, load_mixture_spec,
+    maybe_export_online_model, parse_compression_backend, parse_observation_key_mode_for_env,
+    parse_observation_stream_len_for_env, parse_rate_backend, parse_vm_stats_backend, read_file,
+    read_stdin_all_for_generate, run_batch_mode, validate_obs_stream_len,
+    validate_observation_config,
 };
+#[cfg(feature = "backend-sequitur")]
+use crate::cli::{bytes_to_hex, parse_hex_bytes};
 #[cfg(test)]
 use crate::cli::{
     load_expert_spec, parse_observation_key_mode, parse_observation_stream_len, process_json_line,

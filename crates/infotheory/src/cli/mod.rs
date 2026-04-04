@@ -1045,6 +1045,9 @@ pub(super) fn maybe_export_online_model(
         return Ok(());
     };
 
+    #[cfg(not(any(feature = "backend-rwkv", feature = "backend-mamba")))]
+    let _ = (ctx, parts, path);
+
     #[cfg(feature = "backend-rwkv")]
     {
         let rwkv_method = match &ctx.rate_backend {
