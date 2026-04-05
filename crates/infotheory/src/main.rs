@@ -74,7 +74,9 @@ use crate::cli::{
 use crate::cli::{bytes_to_hex, parse_hex_bytes};
 #[cfg(test)]
 use crate::cli::{
-    load_expert_spec, parse_observation_key_mode, parse_observation_stream_len, process_json_line,
+    load_expert_spec, parse_observation_key_mode, parse_observation_key_mode_for_vm,
+    parse_observation_key_mode_str, parse_observation_stream_len,
+    parse_observation_stream_len_for_vm, process_json_line,
 };
 #[cfg(feature = "vm")]
 use crate::cli::{
@@ -309,12 +311,12 @@ impl AixiRunLogger {
 
 #[cfg(test)]
 fn parse_mixture_kind(kind: &str) -> anyhow::Result<MixtureKind> {
-    infotheory::parse_mixture_kind_name(kind).map_err(anyhow::Error::msg)
+    infotheory::api::parse_mixture_kind_name(kind).map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]
 fn parse_mixture_schedule(schedule: &str) -> anyhow::Result<MixtureScheduleMode> {
-    infotheory::parse_mixture_schedule_name(schedule).map_err(anyhow::Error::msg)
+    infotheory::api::parse_mixture_schedule_name(schedule).map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]

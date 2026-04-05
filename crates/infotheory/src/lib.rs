@@ -108,11 +108,10 @@ pub(crate) use crate::api::{
 #[cfg(test)]
 use crate::api::{
     CompressionBackend, GenerationConfig, InfotheoryCtx, NcdVariant, RateBackendSession,
-    d_kl_bytes, try_biased_entropy_rate_backend, try_compress_size_backend,
-    try_conditional_entropy_bytes, try_conditional_entropy_rate_bytes,
-    try_cross_entropy_rate_backend, try_entropy_rate_backend, try_entropy_rate_bytes,
-    try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes, try_mutual_information_bytes,
-    try_ncd_bytes,
+    d_kl_bytes, try_biased_entropy_rate_backend, try_conditional_entropy_bytes,
+    try_conditional_entropy_rate_bytes, try_cross_entropy_rate_backend, try_entropy_rate_backend,
+    try_entropy_rate_bytes, try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes,
+    try_mutual_information_bytes, try_ncd_bytes,
 };
 #[cfg(test)]
 use crate::api::{
