@@ -129,6 +129,58 @@ pub const COMPRESSION_BACKEND_REGISTRY: &[BackendDescriptor] = &[
     },
 ];
 
+pub(crate) fn find_backend_descriptor_in_registry(
+    registry: &'static [BackendDescriptor],
+    input: &str,
+) -> Option<&'static BackendDescriptor> {
+    let key = input.trim().to_ascii_lowercase();
+    registry
+        .iter()
+        .find(|descriptor| descriptor.aliases.iter().any(|alias| *alias == key))
+}
+
+fn backend_descriptor_by_canonical(
+    registry: &'static [BackendDescriptor],
+    kind: &'static str,
+) -> &'static BackendDescriptor {
+    registry
+        .iter()
+        .find(|descriptor| descriptor.canonical == kind)
+        .unwrap_or_else(|| panic!("missing backend descriptor for canonical name '{kind}'"))
+}
+
+fn rate_backend_canonical_name(backend: &RateBackend) -> &'static str {
+    match backend {
+        RateBackend::RosaPlus => "rosaplus",
+        RateBackend::Ctw { .. } => "ctw",
+        RateBackend::FacCtw { .. } => "fac-ctw",
+        RateBackend::Match { .. } => "match",
+        RateBackend::SparseMatch { .. } => "sparse-match",
+        RateBackend::Ppmd { .. } => "ppmd",
+        RateBackend::Sequitur { .. } => "sequitur",
+        RateBackend::Calibrated { .. } => "calibrated",
+        RateBackend::Zpaq { .. } => "zpaq",
+        RateBackend::Mixture { .. } => "mixture",
+        RateBackend::Particle { .. } => "particle",
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::MambaMethod { .. } => "mamba",
+        #[cfg(feature = "backend-rwkv")]
+        RateBackend::Rwkv7Method { .. } => "rwkv7",
+    }
+}
+
+fn compression_backend_canonical_name(backend: &CompressionBackend) -> &'static str {
+    match backend {
+        CompressionBackend::Zpaq { .. } => "zpaq",
+        #[cfg(feature = "backend-rwkv")]
+        CompressionBackend::Rwkv7 { .. } => "rwkv7",
+        CompressionBackend::Rate { coder, .. } => match coder {
+            crate::coders::CoderType::AC => "rate-ac",
+            crate::coders::CoderType::RANS => "rate-rans",
+        },
+    }
+}
+
 /// Shared byte-level runtime predictor trait.
 pub trait BytePredictor: crate::mixture::OnlineBytePredictor {}
 
@@ -395,65 +447,17 @@ impl CompressionFactory for CompressionBackend {
     }
 }
 
-/// Shared alias lookup for rate backends.
-pub fn find_rate_backend_descriptor(input: &str) -> Option<&'static BackendDescriptor> {
-    let key = input.trim().to_ascii_lowercase();
-    RATE_BACKEND_REGISTRY
-        .iter()
-        .find(|descriptor| descriptor.aliases.iter().any(|alias| *alias == key))
-}
-
-/// Shared alias lookup for compression backends.
-pub fn find_compression_backend_descriptor(input: &str) -> Option<&'static BackendDescriptor> {
-    let key = input.trim().to_ascii_lowercase();
-    COMPRESSION_BACKEND_REGISTRY
-        .iter()
-        .find(|descriptor| descriptor.aliases.iter().any(|alias| *alias == key))
-}
-
-fn compression_backend_descriptor_by_canonical(canonical: &str) -> &'static BackendDescriptor {
-    COMPRESSION_BACKEND_REGISTRY
-        .iter()
-        .find(|descriptor| descriptor.canonical == canonical)
-        .unwrap_or_else(|| {
-            panic!("missing compression backend descriptor for canonical name '{canonical}'")
-        })
-}
-
 /// Return registry metadata for a concrete rate-backend spec.
 pub fn describe_rate_backend(backend: &RateBackend) -> &'static BackendDescriptor {
-    match backend {
-        RateBackend::RosaPlus => &RATE_BACKEND_REGISTRY[0],
-        RateBackend::Ctw { .. } => &RATE_BACKEND_REGISTRY[1],
-        RateBackend::FacCtw { .. } => &RATE_BACKEND_REGISTRY[2],
-        RateBackend::Match { .. } => &RATE_BACKEND_REGISTRY[3],
-        RateBackend::SparseMatch { .. } => &RATE_BACKEND_REGISTRY[4],
-        RateBackend::Ppmd { .. } => &RATE_BACKEND_REGISTRY[5],
-        RateBackend::Sequitur { .. } => &RATE_BACKEND_REGISTRY[6],
-        RateBackend::Calibrated { .. } => &RATE_BACKEND_REGISTRY[7],
-        RateBackend::Zpaq { .. } => &RATE_BACKEND_REGISTRY[8],
-        RateBackend::Mixture { .. } => &RATE_BACKEND_REGISTRY[9],
-        RateBackend::Particle { .. } => &RATE_BACKEND_REGISTRY[10],
-        #[cfg(feature = "backend-mamba")]
-        RateBackend::MambaMethod { .. } => &RATE_BACKEND_REGISTRY[11],
-        #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7Method { .. } => &RATE_BACKEND_REGISTRY[12],
-    }
+    backend_descriptor_by_canonical(RATE_BACKEND_REGISTRY, rate_backend_canonical_name(backend))
 }
 
 /// Return registry metadata for a concrete compression-backend spec.
 pub fn describe_compression_backend(backend: &CompressionBackend) -> &'static BackendDescriptor {
-    match backend {
-        CompressionBackend::Zpaq { .. } => compression_backend_descriptor_by_canonical("zpaq"),
-        #[cfg(feature = "backend-rwkv")]
-        CompressionBackend::Rwkv7 { .. } => compression_backend_descriptor_by_canonical("rwkv7"),
-        CompressionBackend::Rate { coder, .. } => match coder {
-            crate::coders::CoderType::AC => compression_backend_descriptor_by_canonical("rate-ac"),
-            crate::coders::CoderType::RANS => {
-                compression_backend_descriptor_by_canonical("rate-rans")
-            }
-        },
-    }
+    backend_descriptor_by_canonical(
+        COMPRESSION_BACKEND_REGISTRY,
+        compression_backend_canonical_name(backend),
+    )
 }
 
 /// Shared spec -> predictor runtime builder using the default probability floor.
@@ -494,16 +498,19 @@ mod tests {
 
     #[test]
     fn rate_backend_registry_resolves_aliases() {
-        let rosa = find_rate_backend_descriptor("rosa").expect("rosa descriptor");
+        let rosa = find_backend_descriptor_in_registry(RATE_BACKEND_REGISTRY, "rosa")
+            .expect("rosa descriptor");
         assert_eq!(rosa.canonical, "rosaplus");
 
-        let mix = find_rate_backend_descriptor("mix").expect("mixture descriptor");
+        let mix = find_backend_descriptor_in_registry(RATE_BACKEND_REGISTRY, "mix")
+            .expect("mixture descriptor");
         assert_eq!(mix.canonical, "mixture");
     }
 
     #[test]
     fn compression_registry_resolves_aliases() {
-        let ac = find_compression_backend_descriptor("rate_ac").expect("rate-ac descriptor");
+        let ac = find_backend_descriptor_in_registry(COMPRESSION_BACKEND_REGISTRY, "rate_ac")
+            .expect("rate-ac descriptor");
         assert_eq!(ac.canonical, "rate-ac");
     }
 

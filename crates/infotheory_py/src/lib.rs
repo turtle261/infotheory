@@ -785,18 +785,14 @@ impl PyRateBackend {
 
     #[staticmethod]
     #[cfg(feature = "backend-mamba")]
-    fn mamba(method: String) -> Self {
-        Self {
-            inner: RateBackend::MambaMethod { method },
-        }
+    fn mamba(method: String) -> PyResult<Self> {
+        parse_rate_backend("mamba", Some(method.as_str())).map(|inner| Self { inner })
     }
 
     #[staticmethod]
     #[cfg(feature = "backend-rwkv")]
-    fn rwkv7(method: String) -> Self {
-        Self {
-            inner: RateBackend::Rwkv7Method { method },
-        }
+    fn rwkv7(method: String) -> PyResult<Self> {
+        parse_rate_backend("rwkv7", Some(method.as_str())).map(|inner| Self { inner })
     }
 
     #[staticmethod]
@@ -902,22 +898,20 @@ impl PyCompressionBackend {
     fn rwkv7(method: Option<String>, coder: &str) -> PyResult<Self> {
         let coder = infotheory::backends::parse_rwkv7_coder(coder)
             .ok_or_else(|| PyValueError::new_err("coder must be 'ac' or 'rans'"))?;
-        let method = match method {
-            Some(method) => {
-                infotheory::rwkvzip::parse_method_spec(&method).map_err(|e| {
-                    PyValueError::new_err(format!("invalid rwkv method string: {e}"))
-                })?;
-                method
-            }
-            None => {
-                let path = std::env::var("RWKV7_MODEL_PATH")
-                    .map_err(|_| PyValueError::new_err("RWKV7_MODEL_PATH not set"))?;
-                format!("file:{path}")
-            }
+        let mut opts = infotheory::spec::CompressionBackendShorthandOptions {
+            default_framing: infotheory::compression::FramingMode::Framed,
+            ..Default::default()
         };
-        Ok(Self {
-            inner: CompressionBackend::Rwkv7 { method, coder },
-        })
+        if let Ok(path) = std::env::var("RWKV7_MODEL_PATH") {
+            opts.default_rwkv_model_path = Some(path);
+        }
+        let inner = infotheory::spec::parse_rwkv7_compression_backend_method(
+            method.as_deref(),
+            coder,
+            &opts,
+        )
+        .map_err(py_spec_value_error)?;
+        Ok(Self { inner })
     }
 
     fn __repr__(&self) -> String {
@@ -5095,6 +5089,31 @@ mod tests {
                 assert_eq!(framing, infotheory::compression::FramingMode::Framed)
             }
             _ => panic!("expected rate backend"),
+        }
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn compression_backend_rwkv7_constructor_uses_shared_cfg_lowering() {
+        let backend = PyCompressionBackend::rwkv7(
+            Some(
+                "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer"
+                    .to_string(),
+            ),
+            "ac",
+        )
+        .expect("rwkv7 constructor");
+
+        match backend.inner {
+            CompressionBackend::Rate {
+                rate_backend: RateBackend::Rwkv7Method { .. },
+                coder,
+                framing,
+            } => {
+                assert_eq!(coder, infotheory::coders::CoderType::AC);
+                assert_eq!(framing, infotheory::compression::FramingMode::Framed);
+            }
+            _ => panic!("expected rate-coded rwkv7 backend"),
         }
     }
 

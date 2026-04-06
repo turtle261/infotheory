@@ -57,20 +57,39 @@ pub enum BackendAvailability {
 
 /// Canonical names for enabled rate backends in this build.
 pub fn available_rate_backends() -> Vec<&'static str> {
-    crate::runtime::RATE_BACKEND_REGISTRY
+    available_backend_names(crate::runtime::RATE_BACKEND_REGISTRY)
+}
+
+/// Canonical names for enabled compression backends in this build.
+pub fn available_compression_backends() -> Vec<&'static str> {
+    available_backend_names(crate::runtime::COMPRESSION_BACKEND_REGISTRY)
+}
+
+fn available_backend_names(
+    registry: &'static [crate::runtime::BackendDescriptor],
+) -> Vec<&'static str> {
+    registry
         .iter()
         .filter(|descriptor| descriptor.enabled)
         .map(|descriptor| descriptor.canonical)
         .collect()
 }
 
-/// Canonical names for enabled compression backends in this build.
-pub fn available_compression_backends() -> Vec<&'static str> {
-    crate::runtime::COMPRESSION_BACKEND_REGISTRY
-        .iter()
-        .filter(|descriptor| descriptor.enabled)
-        .map(|descriptor| descriptor.canonical)
-        .collect()
+fn resolve_backend_name_from_registry(
+    registry: &'static [crate::runtime::BackendDescriptor],
+    input: &str,
+) -> Option<BackendAvailability> {
+    let descriptor = crate::runtime::find_backend_descriptor_in_registry(registry, input)?;
+    Some(if descriptor.enabled || descriptor.feature.is_none() {
+        BackendAvailability::Enabled(descriptor.canonical)
+    } else {
+        BackendAvailability::Disabled {
+            canonical: descriptor.canonical,
+            feature: descriptor
+                .feature
+                .expect("disabled backends must declare required feature"),
+        }
+    })
 }
 
 /// Resolve a user-provided rate backend alias to a canonical backend name.
@@ -78,18 +97,7 @@ pub fn available_compression_backends() -> Vec<&'static str> {
 /// Returns `None` when the alias is unknown, and `BackendAvailability::Disabled`
 /// when known but not enabled in the current feature set.
 pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
-    crate::runtime::find_rate_backend_descriptor(input).map(|descriptor| {
-        if descriptor.enabled || descriptor.feature.is_none() {
-            BackendAvailability::Enabled(descriptor.canonical)
-        } else {
-            BackendAvailability::Disabled {
-                canonical: descriptor.canonical,
-                feature: descriptor
-                    .feature
-                    .expect("disabled backends must declare required feature"),
-            }
-        }
-    })
+    resolve_backend_name_from_registry(crate::runtime::RATE_BACKEND_REGISTRY, input)
 }
 
 /// Resolve a user-provided compression backend alias to a canonical backend name.
@@ -97,18 +105,7 @@ pub fn resolve_rate_backend_name(input: &str) -> Option<BackendAvailability> {
 /// Returns `None` when the alias is unknown, and `BackendAvailability::Disabled`
 /// when known but not enabled in the current feature set.
 pub fn resolve_compression_backend_name(input: &str) -> Option<BackendAvailability> {
-    crate::runtime::find_compression_backend_descriptor(input).map(|descriptor| {
-        if descriptor.enabled || descriptor.feature.is_none() {
-            BackendAvailability::Enabled(descriptor.canonical)
-        } else {
-            BackendAvailability::Disabled {
-                canonical: descriptor.canonical,
-                feature: descriptor
-                    .feature
-                    .expect("disabled backends must declare required feature"),
-            }
-        }
-    })
+    resolve_backend_name_from_registry(crate::runtime::COMPRESSION_BACKEND_REGISTRY, input)
 }
 
 /// Parse a generic entropy coder alias (`"ac"`/`"rans"`).

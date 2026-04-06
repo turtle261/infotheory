@@ -260,6 +260,7 @@ fn framing_mode_name(mode: crate::compression::FramingMode) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
 fn split_method_policy_suffix(method: &str) -> (&str, Option<&str>) {
     if let Some((base, policy)) = method.split_once(";policy:") {
         (base, Some(policy))
@@ -268,6 +269,7 @@ fn split_method_policy_suffix(method: &str) -> (&str, Option<&str>) {
     }
 }
 
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
 fn canonicalize_explicit_file_method(
     base_dir: &Path,
     method: &str,
@@ -347,6 +349,56 @@ fn normalize_mamba_method_for_base_dir(base_dir: &Path, method: &str) -> SpecRes
         Ok(canonical)
     } else {
         Ok(method.to_string())
+    }
+}
+
+/// Parse an RWKV7 compression backend from a method string or configured model path,
+/// preserving the shared direct-vs-rate-coded lowering semantics across CLI, JSON,
+/// and binding surfaces.
+pub fn parse_rwkv7_compression_backend_method(
+    method: Option<&str>,
+    coder: crate::coders::CoderType,
+    options: &CompressionBackendShorthandOptions,
+) -> SpecResult<CompressionBackend> {
+    #[cfg(feature = "backend-rwkv")]
+    {
+        let method = if let Some(method) = method.filter(|value| !value.is_empty()) {
+            normalize_rwkv_method_for_base_dir(&options.base_dir, method)?
+        } else {
+            let model_path = options.default_rwkv_model_path.as_deref().ok_or_else(|| {
+                SpecError::new(
+                    "rwkv7 compression backend requires a method string or a configured model path",
+                )
+            })?;
+            normalize_rwkv_path_method(&options.base_dir, model_path)
+        };
+        let parsed = crate::rwkvzip::parse_method_spec(&method).map_err(|err| {
+            SpecError::new(format!(
+                "invalid rwkv7 compression method '{method}': {err}"
+            ))
+        })?;
+        match parsed {
+            crate::rwkvzip::MethodSpec::File { policy: None, .. } => {
+                Ok(CompressionBackend::Rwkv7 { method, coder })
+            }
+            crate::rwkvzip::MethodSpec::File {
+                policy: Some(_), ..
+            }
+            | crate::rwkvzip::MethodSpec::Online { .. } => Ok(CompressionBackend::Rate {
+                rate_backend: RateBackend::Rwkv7Method { method },
+                coder,
+                framing: options.default_framing,
+            }),
+        }
+    }
+    #[cfg(not(feature = "backend-rwkv"))]
+    {
+        let _ = method;
+        let _ = coder;
+        let _ = options;
+        Err(SpecError::new(
+            "rwkv7 compression backend disabled at compile time",
+        ))
     }
 }
 
@@ -867,27 +919,22 @@ pub fn parse_compression_backend_json(
                 } else {
                     crate::coders::CoderType::AC
                 };
-                if let Some(method) = v["method"].as_str().or_else(|| v["rwkv_method"].as_str()) {
-                    let method = normalize_rwkv_method_for_base_dir(base_dir, method)?;
-                    crate::rwkvzip::parse_method_spec(&method).map_err(|err| {
-                        SpecError::new(format!(
-                            "invalid rwkv7 compression method '{method}': {err}"
-                        ))
-                    })?;
-                    Ok(CompressionBackend::Rwkv7 { method, coder })
+                let method = v["method"].as_str().or_else(|| v["rwkv_method"].as_str());
+                let model_path = v["rwkv_model_path"]
+                    .as_str()
+                    .or_else(|| v["model_path"].as_str());
+                if method.is_none() && model_path.is_none() {
+                    Err(SpecError::new(
+                        "rwkv7 compression backend requires 'method' or 'model_path'",
+                    ))
                 } else {
-                    let model_path = v["rwkv_model_path"]
-                        .as_str()
-                        .or_else(|| v["model_path"].as_str())
-                        .ok_or_else(|| {
-                            SpecError::new(
-                                "rwkv7 compression backend requires 'method' or 'model_path'",
-                            )
-                        })?;
-                    Ok(CompressionBackend::Rwkv7 {
-                        method: normalize_rwkv_path_method(base_dir, model_path),
-                        coder,
-                    })
+                    let opts = CompressionBackendShorthandOptions {
+                        base_dir: base_dir.to_path_buf(),
+                        default_framing: framing,
+                        default_rwkv_model_path: model_path.map(ToOwned::to_owned),
+                        ..Default::default()
+                    };
+                    parse_rwkv7_compression_backend_method(method, coder, &opts)
                 }
             }
             #[cfg(not(feature = "backend-rwkv"))]
@@ -1308,41 +1355,16 @@ pub fn parse_compression_backend_name_method(
                                 .expect("coder alias already validated"),
                         })
                     }
-                    Some(m) => {
-                        let method = normalize_rwkv_method_for_base_dir(&options.base_dir, m)?;
-                        let parsed = crate::rwkvzip::parse_method_spec(&method).map_err(|err| {
-                            SpecError::new(format!("invalid rwkv7 compression method '{m}': {err}"))
-                        })?;
-                        match parsed {
-                            crate::rwkvzip::MethodSpec::File { policy: None, .. } => {
-                                Ok(CompressionBackend::Rwkv7 {
-                                    method,
-                                    coder: crate::coders::CoderType::AC,
-                                })
-                            }
-                            crate::rwkvzip::MethodSpec::File {
-                                policy: Some(_), ..
-                            }
-                            | crate::rwkvzip::MethodSpec::Online { .. } => {
-                                Ok(CompressionBackend::Rate {
-                                    rate_backend: RateBackend::Rwkv7Method { method },
-                                    coder: crate::coders::CoderType::AC,
-                                    framing: options.default_framing,
-                                })
-                            }
-                        }
-                    }
-                    None => {
-                        let model_path = options.default_rwkv_model_path.as_deref().ok_or_else(|| {
-                            SpecError::new(
-                                "rwkv7 compression backend requires a method string or a configured model path",
-                            )
-                        })?;
-                        Ok(CompressionBackend::Rwkv7 {
-                            method: normalize_rwkv_path_method(&options.base_dir, model_path),
-                            coder: crate::coders::CoderType::AC,
-                        })
-                    }
+                    Some(m) => parse_rwkv7_compression_backend_method(
+                        Some(m),
+                        crate::coders::CoderType::AC,
+                        options,
+                    ),
+                    None => parse_rwkv7_compression_backend_method(
+                        None,
+                        crate::coders::CoderType::AC,
+                        options,
+                    ),
                 }
             }
             #[cfg(not(feature = "backend-rwkv"))]
@@ -1514,6 +1536,37 @@ mod tests {
                 framing,
             } => {
                 assert_eq!(coder, CoderType::AC);
+                assert_eq!(framing, crate::compression::FramingMode::Raw);
+            }
+            _ => panic!("expected rate-coded RWKV backend"),
+        }
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn parse_compression_backend_json_wraps_rwkv_cfg_methods_as_rate_backend() {
+        let json = serde_json::json!({
+            "kind": "rwkv7",
+            "method": "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer",
+            "coder": "rans",
+            "framing": "raw"
+        });
+
+        let backend = parse_compression_backend_json(
+            &json,
+            Path::new("."),
+            None,
+            crate::compression::FramingMode::Framed,
+        )
+        .expect("parse rwkv cfg compression backend json");
+
+        match backend {
+            CompressionBackend::Rate {
+                rate_backend: RateBackend::Rwkv7Method { .. },
+                coder,
+                framing,
+            } => {
+                assert_eq!(coder, CoderType::RANS);
                 assert_eq!(framing, crate::compression::FramingMode::Raw);
             }
             _ => panic!("expected rate-coded RWKV backend"),
