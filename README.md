@@ -196,6 +196,18 @@ Example:
 
 For `configs/bench/two.json` benchmark plotting, `scripts/plot_two_json.sh` also accepts `INFOTHEORY_BASELINE_SUMMARY_TSV=/path/to/baseline-summary.tsv` to emit additional baseline-overlay SVGs.
 
+`scripts/bench_two_json.sh` now records benchmark provenance in both raw and
+summary TSVs:
+
+- resolved suite spec path
+- suite spec SHA-256 digest
+- build mode
+- build features
+
+`scripts/compare_bench_two_json.lua` rejects comparisons when the suite spec
+digest differs between baseline and candidate summaries. That prevents
+benchmark-spec drift from being misreported as a performance regression.
+
 The benchmark tooling also supports an `extra` suite for additional rate backends
 not in `configs/bench/two.json` (currently `mamba`, `particle` via
 `configs/bench/particle_fast.json`, and `sparse-match`):

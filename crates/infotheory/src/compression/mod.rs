@@ -3182,6 +3182,22 @@ mod tests {
         assert_eq!(dec, data);
     }
 
+    #[test]
+    fn benchmark_two_json_matches_examples_and_historical_alpha() {
+        let canonical: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../configs/bench/two.json")).unwrap();
+        let example: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../examples/two.json")).unwrap();
+
+        assert_eq!(canonical, example, "benchmark specs drifted");
+        assert_eq!(canonical["kind"].as_str(), Some("neural"));
+        let alpha = canonical["alpha"].as_f64().expect("neural alpha");
+        assert!(
+            (alpha - 0.03).abs() <= 1e-12,
+            "expected historical neural alpha 0.03, got {alpha}"
+        );
+    }
+
     #[cfg(feature = "backend-mamba")]
     #[test]
     fn mamba_rate_predictor_preserves_backend_pdf_exactly() {

@@ -1,6 +1,6 @@
 {
   "kind": "neural",
-  "alpha": 0.1,
+  "alpha": 0.03,
   "experts": [
     {
       "name": "ctw",

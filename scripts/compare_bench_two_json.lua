@@ -14,6 +14,10 @@ local REQUIRED_COLUMNS = {
 	"subject",
 	"size_bytes",
 	"compression_backend",
+	"suite_spec_path",
+	"suite_spec_sha256",
+	"build_mode",
+	"build_features",
 }
 
 local baseline_path, candidate_path
@@ -131,6 +135,39 @@ local function load_rows(path)
 	return rows
 end
 
+local function collect_single_value(rows, path, field)
+	local seen = {}
+	for _, row in pairs(rows) do
+		local value = chomp_cr(row[field] or "")
+		if value ~= "" then
+			seen[value] = true
+		end
+	end
+
+	local count, only = 0, nil
+	for value in pairs(seen) do
+		count = count + 1
+		only = value
+	end
+
+	if count == 0 then
+		die("missing required provenance value in " .. path .. ": " .. field)
+	end
+	if count > 1 then
+		die("multiple distinct provenance values in " .. path .. ": " .. field)
+	end
+	return only
+end
+
+local function collect_provenance(rows, path)
+	return {
+		suite_spec_path = collect_single_value(rows, path, "suite_spec_path"),
+		suite_spec_sha256 = collect_single_value(rows, path, "suite_spec_sha256"),
+		build_mode = collect_single_value(rows, path, "build_mode"),
+		build_features = collect_single_value(rows, path, "build_features"),
+	}
+end
+
 local function num(row, field)
 	local v = row[field]
 	if not v or v:match("^%s*$") then
@@ -192,6 +229,15 @@ end
 
 local baseline_rows  = load_rows(baseline_path)
 local candidate_rows = load_rows(candidate_path)
+local baseline_provenance = collect_provenance(baseline_rows, baseline_path)
+local candidate_provenance = collect_provenance(candidate_rows, candidate_path)
+
+if baseline_provenance.suite_spec_sha256 ~= candidate_provenance.suite_spec_sha256 then
+	die("suite spec digest mismatch: baseline "
+		.. baseline_provenance.suite_spec_sha256
+		.. " != candidate "
+		.. candidate_provenance.suite_spec_sha256)
+end
 
 local key_set, keys  = {}, {}
 for k in pairs(baseline_rows) do
@@ -232,6 +278,14 @@ local full_warnings, core_failures = 0, 0
 
 print("baseline\t" .. baseline_path)
 print("candidate\t" .. candidate_path)
+print("baseline_suite_spec_path\t" .. baseline_provenance.suite_spec_path)
+print("baseline_suite_spec_sha256\t" .. baseline_provenance.suite_spec_sha256)
+print("baseline_build_mode\t" .. baseline_provenance.build_mode)
+print("baseline_build_features\t" .. baseline_provenance.build_features)
+print("candidate_suite_spec_path\t" .. candidate_provenance.suite_spec_path)
+print("candidate_suite_spec_sha256\t" .. candidate_provenance.suite_spec_sha256)
+print("candidate_build_mode\t" .. candidate_provenance.build_mode)
+print("candidate_build_features\t" .. candidate_provenance.build_features)
 print("scope\tstatus\toperation\tsubject\tsize_bytes\tcompression_backend\treasons")
 
 for _, key in ipairs(keys) do

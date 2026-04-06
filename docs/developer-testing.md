@@ -72,6 +72,23 @@ The suite includes:
 These tests are designed to catch semantic drift and output regressions across
 interfaces.
 
+## Benchmark Provenance Checks
+
+The `two-json` benchmark suite is pinned to the historical canonical
+`configs/bench/two.json` / `examples/two.json` spec with `alpha = 0.03`.
+
+The benchmark harness and comparator now enforce provenance:
+
+- `scripts/bench_two_json.sh` records the resolved suite-spec path, suite-spec
+  SHA-256 digest, build mode, and build features in raw and summary TSVs.
+- `scripts/compare_bench_two_json.lua` rejects baseline/current comparisons when
+  the suite-spec digests differ.
+- Rust and Python tests assert that the checked-in `two.json` benchmark specs
+  stay byte-identical and preserve the historical `alpha = 0.03` setting.
+
+This is the guardrail against benchmark-subject drift being mistaken for a code
+regression.
+
 ## MC-AIXI Competitor Benchmark Validation
 
 Use the reproducible benchmark harness to validate cross-implementation parity

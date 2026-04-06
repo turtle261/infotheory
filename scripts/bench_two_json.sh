@@ -19,7 +19,7 @@ RAW_TSV=
 SUMMARY_TSV=
 WORK_DIR=
 OUTPUT_MODE=
-RAW_HEADER="operation	subject	subject_kind	expert_kind	series	size_bytes	repetition	cpu	compression_backend	input_sha256	archive_bytes	entropy_bpb	real_seconds	user_seconds	sys_seconds	rss_kib	verified"
+RAW_HEADER="operation	subject	subject_kind	expert_kind	series	size_bytes	repetition	cpu	compression_backend	input_sha256	suite_spec_path	suite_spec_sha256	build_mode	build_features	archive_bytes	entropy_bpb	real_seconds	user_seconds	sys_seconds	rss_kib	verified"
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -44,6 +44,14 @@ case "${BENCH_SUITE}" in
 esac
 
 [ -f "${SUITE_SPEC_PATH}" ] || fail "Benchmark spec not found: ${SUITE_SPEC_PATH}"
+SUITE_SPEC_RESOLVED=$(python3 - "${SUITE_SPEC_PATH}" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).resolve())
+PY
+)
+SUITE_SPEC_SHA256=$(sha256sum "${SUITE_SPEC_PATH}" | awk 'NR==1 { print $1 }')
 
 cleanup() {
   if [ "${INFOTHEORY_BENCH_KEEP_WORKDIR:-0}" = "1" ]; then
@@ -121,6 +129,7 @@ case " ${BENCH_FEATURES} " in
   *" cli "*) ;;
   *) BENCH_FEATURES="cli ${BENCH_FEATURES}" ;;
 esac
+BENCH_BUILD_MODE=${INFOTHEORY_CLI_BENCH_BUILD_MODE:-${INFOTHEORY_BUILD_MODE:-native}}
 
 case "${REPEATS}" in
   ''|*[!0-9]*)
@@ -196,6 +205,7 @@ with open(path, newline="") as fh:
         raise SystemExit(f"{path}: empty file") from exc
     if header != expected:
         raise SystemExit(f"{path}: unexpected header")
+    index = {name: idx for idx, name in enumerate(header)}
     for lineno, row in enumerate(reader, start=2):
         if not row:
             continue
@@ -203,9 +213,20 @@ with open(path, newline="") as fh:
             raise SystemExit(
                 f"{path}: line {lineno}: expected {len(expected)} fields, found {len(row)}"
             )
-        if row[16] != "1":
+        if row[index["verified"]] != "1":
             continue
-        key = (row[0], row[1], row[5], row[6], row[7], row[8], row[9])
+        key = (
+            row[index["operation"]],
+            row[index["subject"]],
+            row[index["size_bytes"]],
+            row[index["repetition"]],
+            row[index["cpu"]],
+            row[index["compression_backend"]],
+            row[index["input_sha256"]],
+            row[index["suite_spec_sha256"]],
+            row[index["build_mode"]],
+            row[index["build_features"]],
+        )
         if key in seen:
             raise SystemExit(f"{path}: duplicate verified row at line {lineno}: {key!r}")
         seen.add(key)
@@ -520,9 +541,12 @@ PY
 }
 
 append_row() {
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" \
-    >> "${RAW_TSV}"
+  sep=
+  for field in "$@"; do
+    printf '%s%s' "${sep}" "${field}" >> "${RAW_TSV}"
+    sep="$(printf '\t')"
+  done
+  printf '\n' >> "${RAW_TSV}"
 }
 
 row_exists() {
@@ -533,6 +557,9 @@ row_exists() {
   row_cpu=$5
   row_compression_backend=$6
   row_input_sha256=$7
+  row_suite_spec_sha256=$8
+  row_build_mode=$9
+  row_build_features=${10}
 
   awk -F '\t' \
     -v row_operation="${row_operation}" \
@@ -542,6 +569,9 @@ row_exists() {
     -v row_cpu="${row_cpu}" \
     -v row_compression_backend="${row_compression_backend}" \
     -v row_input_sha256="${row_input_sha256}" \
+    -v row_suite_spec_sha256="${row_suite_spec_sha256}" \
+    -v row_build_mode="${row_build_mode}" \
+    -v row_build_features="${row_build_features}" \
     '
       NR > 1 &&
       $1 == row_operation &&
@@ -551,7 +581,10 @@ row_exists() {
       $8 == row_cpu &&
       $9 == row_compression_backend &&
       $10 == row_input_sha256 &&
-      $17 == "1" {
+      $12 == row_suite_spec_sha256 &&
+      $13 == row_build_mode &&
+      $14 == row_build_features &&
+      $21 == "1" {
         found = 1
       }
       END {
@@ -562,8 +595,12 @@ row_exists() {
 
 say "[bench] Source: ${SOURCE_FILE}"
 say "[bench] Suite: ${BENCH_SUITE} (${SUITE_DISPLAY})"
+say "[bench] Suite spec: ${SUITE_SPEC_RESOLVED}"
+say "[bench] Suite spec digest: ${SUITE_SPEC_SHA256}"
 say "[bench] CPU affinity: ${CPU}"
 say "[bench] Compression backend: ${COMP_BACKEND}"
+say "[bench] Build mode: ${BENCH_BUILD_MODE}"
+say "[bench] Build features: ${BENCH_FEATURES}"
 say "[bench] Repeats: ${REPEATS}"
 say "[bench] Warmups: ${WARMUPS}"
 say "[bench] Sizes: ${SIZES}"
@@ -605,15 +642,15 @@ for size_bytes in ${SIZES}; do
     need_subject_work=0
     rep=1
     while [ "${rep}" -le "${REPEATS}" ]; do
-      if ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}"; then
+      if ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_subject_work=1
         break
       fi
-      if ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}"; then
+      if ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_subject_work=1
         break
       fi
-      if ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}"; then
+      if ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_subject_work=1
         break
       fi
@@ -652,13 +689,13 @@ for size_bytes in ${SIZES}; do
       need_decompress=0
       archive_ready=0
 
-      if ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}"; then
+      if ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_h=1
       fi
-      if ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}"; then
+      if ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_compress=1
       fi
-      if ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}"; then
+      if ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_decompress=1
       fi
 
@@ -672,7 +709,8 @@ $(parse_time_file "${time_path}")
 EOF
         append_row \
           "h" "${subject}" "${subject_kind}" "${expert_kind}" "h:${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" \
-          "${input_sha256}" "" "${entropy_bpb}" "${real_seconds}" "${user_seconds}" "${sys_seconds}" "${rss_kib}" "1"
+          "${input_sha256}" "${SUITE_SPEC_RESOLVED}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}" \
+          "" "${entropy_bpb}" "${real_seconds}" "${user_seconds}" "${sys_seconds}" "${rss_kib}" "1"
       fi
 
       if [ "${need_compress}" -eq 1 ]; then
@@ -697,11 +735,13 @@ EOF
         rm -f "${restored_path}"
         append_row \
           "compress" "${subject}" "${subject_kind}" "${expert_kind}" "compress:${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" \
-          "${input_sha256}" "${archive_bytes}" "" "${compress_real_seconds}" "${compress_user_seconds}" "${compress_sys_seconds}" "${compress_rss_kib}" "1"
+          "${input_sha256}" "${SUITE_SPEC_RESOLVED}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}" \
+          "${archive_bytes}" "" "${compress_real_seconds}" "${compress_user_seconds}" "${compress_sys_seconds}" "${compress_rss_kib}" "1"
         if [ "${need_decompress}" -eq 1 ]; then
           append_row \
             "decompress" "${subject}" "${subject_kind}" "${expert_kind}" "decompress:${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" \
-            "${input_sha256}" "${archive_bytes}" "" "${decompress_real_seconds}" "${decompress_user_seconds}" "${decompress_sys_seconds}" "${decompress_rss_kib}" "1"
+            "${input_sha256}" "${SUITE_SPEC_RESOLVED}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}" \
+            "${archive_bytes}" "" "${decompress_real_seconds}" "${decompress_user_seconds}" "${decompress_sys_seconds}" "${decompress_rss_kib}" "1"
           need_decompress=0
         fi
       fi
@@ -720,7 +760,8 @@ $(parse_time_file "${time_path}")
 EOF
         append_row \
           "decompress" "${subject}" "${subject_kind}" "${expert_kind}" "decompress:${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" \
-          "${input_sha256}" "${archive_bytes}" "" "${real_seconds}" "${user_seconds}" "${sys_seconds}" "${rss_kib}" "1"
+          "${input_sha256}" "${SUITE_SPEC_RESOLVED}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}" \
+          "${archive_bytes}" "" "${real_seconds}" "${user_seconds}" "${sys_seconds}" "${rss_kib}" "1"
       fi
       rm -f "${archive_path}" "${restored_path}"
 
@@ -797,6 +838,10 @@ with open(raw_path, newline="") as fh:
                 row["cpu"],
                 row["compression_backend"],
                 row["input_sha256"],
+                row["suite_spec_path"],
+                row["suite_spec_sha256"],
+                row["build_mode"],
+                row["build_features"],
             )
         ].append(row)
 
@@ -811,6 +856,10 @@ fieldnames = [
     "cpu",
     "compression_backend",
     "input_sha256",
+    "suite_spec_path",
+    "suite_spec_sha256",
+    "build_mode",
+    "build_features",
     "real_seconds_mean",
     "real_seconds_stdev",
     "real_seconds_median",
@@ -849,7 +898,7 @@ with open(summary_path, "w", newline="") as fh:
     writer.writeheader()
     for key in sorted_keys:
         rows = groups[key]
-        operation, subject, subject_kind, expert_kind, series, size_bytes, cpu, compression_backend, input_sha256 = key
+        operation, subject, subject_kind, expert_kind, series, size_bytes, cpu, compression_backend, input_sha256, suite_spec_path, suite_spec_sha256, build_mode, build_features = key
         real = [row["real_seconds"] for row in rows]
         user = [row["user_seconds"] for row in rows]
         sysc = [row["sys_seconds"] for row in rows]
@@ -872,6 +921,10 @@ with open(summary_path, "w", newline="") as fh:
                 "cpu": cpu,
                 "compression_backend": compression_backend,
                 "input_sha256": input_sha256,
+                "suite_spec_path": suite_spec_path,
+                "suite_spec_sha256": suite_spec_sha256,
+                "build_mode": build_mode,
+                "build_features": build_features,
                 "real_seconds_mean": fmt(mean(real)),
                 "real_seconds_stdev": fmt(stdev(real)),
                 "real_seconds_median": fmt(median(real)),
@@ -901,7 +954,7 @@ say "[bench] Raw TSV: ${RAW_TSV}"
 say "[bench] Summary TSV: ${SUMMARY_TSV}"
 if [ "${BENCH_SUITE}" = "two-json" ]; then
   say "[bench] Compare against the checked-in baseline:"
-  say "  python3 '${ROOT_DIR}/scripts/compare_bench_two_json.py' '${SUMMARY_TSV}'"
+  say "  '${ROOT_DIR}/scripts/compare_bench_two_json.lua' --baseline '${ROOT_DIR}/benchmarks/current/infotheory-two-json-summary-20260322-120428.tsv' '${SUMMARY_TSV}'"
 else
   say "[bench] No checked-in baseline comparator is configured for suite '${BENCH_SUITE}'."
 fi

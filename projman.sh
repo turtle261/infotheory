@@ -188,7 +188,7 @@ cmd_bench() {
 }
 
 cmd_bench_cli() {
-  [ $# -ge 1 ] || fail "Usage: ./projman.sh bench cli <baseline-commit>"
+  [ $# -ge 1 ] || fail "Usage: ./projman.sh bench cli <baseline-commit> [preset]"
   need_cmd bash
   validate_build_mode
   case "${1:-}" in
@@ -312,7 +312,7 @@ Usage: ./projman.sh <command>
 
 Commands:
   bench [suite]  Run benchmark suite (`two-json` default, or `extra`). Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV for the selected suite by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
-  bench cli <baseline-commit>  Build baseline vs dirty current trees and compare curated CLI workloads with hyperfine. Writes artifacts under /var/tmp/infotheory_bench/.
+  bench cli <baseline-commit> [preset]  Build baseline vs dirty current trees and compare CLI workloads with hyperfine. Presets: `default` (signal-focused defaults) and `quick` (same matrix with lighter defaults). Writes artifacts under /var/tmp/infotheory_bench/.
   bench_aixi_competitors  Run reproducible Guix time-machine benchmark for Infotheory MC-AIXI (Rust+Python) vs PyAIXI and C++ MC-AIXI. Fails fast if Guix is unavailable.
   plot [suite]   Open benchmark results in the benchman TUI for the selected suite (`two-json` default, or `extra`). Not included in test_all.
   tui [suite]    Build and launch the interactive benchmark TUI (`benchman`) for the selected suite (`two-json` default, or `extra`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
