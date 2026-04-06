@@ -43,7 +43,7 @@ use crate::backends::match_model::MatchModel;
 #[cfg(feature = "backend-ppmd")]
 use crate::backends::ppmd::PpmdModel;
 #[cfg(feature = "backend-rosa")]
-use crate::backends::rosaplus::{RosaCheckpoint, RosaPlus};
+use crate::backends::rosaplus::RosaPlus;
 #[cfg(feature = "backend-sequitur")]
 use crate::backends::sequitur::{SequiturCheckpoint, SequiturModel};
 #[cfg(feature = "backend-match")]
@@ -585,9 +585,6 @@ pub enum RateBackendPredictor {
 pub enum RateBackendPredictorCheckpoint {
     /// Full predictor clone for backends without specialized checkpointing.
     Full(RateBackendPredictor),
-    /// Compact append-only truncation checkpoint for [`RateBackendPredictor::Rosa`].
-    #[cfg(feature = "backend-rosa")]
-    Rosa(RosaCheckpoint),
     /// Compact Sequitur undo marker for [`RateBackendPredictor::Sequitur`].
     #[cfg(feature = "backend-sequitur")]
     Sequitur(SequiturCheckpoint),
@@ -943,10 +940,6 @@ impl RateBackendPredictor {
 
     pub(crate) fn checkpoint(&mut self) -> RateBackendPredictorCheckpoint {
         match self {
-            #[cfg(feature = "backend-rosa")]
-            RateBackendPredictor::Rosa { model, .. } => {
-                RateBackendPredictorCheckpoint::Rosa(model.checkpoint())
-            }
             #[cfg(feature = "backend-sequitur")]
             RateBackendPredictor::Sequitur { model, .. } => {
                 RateBackendPredictorCheckpoint::Sequitur(model.checkpoint())
@@ -994,13 +987,6 @@ impl RateBackendPredictor {
 
     pub(crate) fn restore_checkpoint(&mut self, checkpoint: &RateBackendPredictorCheckpoint) {
         match (self, checkpoint) {
-            #[cfg(feature = "backend-rosa")]
-            (
-                RateBackendPredictor::Rosa { model, .. },
-                RateBackendPredictorCheckpoint::Rosa(ck),
-            ) => {
-                model.restore(ck);
-            }
             #[cfg(feature = "backend-sequitur")]
             (
                 RateBackendPredictor::Sequitur { model, .. },
@@ -1054,10 +1040,6 @@ impl RateBackendPredictor {
             }
             (slot, RateBackendPredictorCheckpoint::Full(state)) => {
                 *slot = state.clone();
-            }
-            #[cfg(feature = "backend-rosa")]
-            (_, RateBackendPredictorCheckpoint::Rosa(_)) => {
-                panic!("mismatched RateBackendPredictor checkpoint variant")
             }
             #[cfg(feature = "backend-ctw")]
             (_, RateBackendPredictorCheckpoint::Ctw { .. }) => {
@@ -4067,6 +4049,14 @@ mod tests {
                 "checkpoint restore drifted predictor state: expected={expected}, actual={actual}"
             );
         }
+    }
+
+    #[test]
+    fn rosa_checkpoint_restores_exact_predictor_state() {
+        assert_checkpoint_roundtrip_restores_predictor(
+            RateBackend::RosaPlus,
+            b"rosa checkpoint base history",
+        );
     }
 
     #[test]

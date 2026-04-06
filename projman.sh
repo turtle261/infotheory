@@ -162,7 +162,7 @@ cmd_test_all() {
 cmd_bench() {
   if [ "${1:-}" = "cli" ]; then
     shift
-    cmd_bench__cli "$@"
+    cmd_bench_cli "$@"
     return 0
   fi
 
@@ -187,7 +187,7 @@ cmd_bench() {
   say "[bench] Done"
 }
 
-cmd_bench__cli() {
+cmd_bench_cli() {
   [ $# -ge 1 ] || fail "Usage: ./projman.sh bench cli <baseline-commit>"
   need_cmd bash
   validate_build_mode
@@ -197,17 +197,17 @@ cmd_bench__cli() {
       return 0
       ;;
   esac
-  say "[bench__cli] Running hyperfine CLI comparison against baseline '$1' (build mode: $(build_mode))..."
-  (cd "$ROOT_DIR" && bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@")
-  say "[bench__cli] Done"
+  say "[bench_cli] Running hyperfine CLI comparison against baseline '$1' (build mode: $(build_mode))..."
+  (cd "$ROOT_DIR" && bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@" && "$ROOT_DIR/scripts/summarize_interpret.sh")
+  say "[bench_cli] Done"
 }
 
-cmd_bench__aixi_competitors() {
-  say "[bench__aixi_competitors] Running reproducible Guix benchmark (Infotheory Rust/Python vs PyAIXI vs C++ MC-AIXI)..."
+cmd_bench_aixi_competitors() {
+  say "[bench_aixi_competitors] Running reproducible Guix benchmark (Infotheory Rust/Python vs PyAIXI vs C++ MC-AIXI)..."
   need_cmd guix
   need_cmd bash
   (cd "$ROOT_DIR" && bash "$ROOT_DIR/scripts/bench_aixi_competitors_guix.sh" "$@")
-  say "[bench__aixi_competitors] Done"
+  say "[bench_aixi_competitors] Done"
 }
 
 cmd_plot() {
@@ -313,7 +313,7 @@ Usage: ./projman.sh <command>
 Commands:
   bench [suite]  Run benchmark suite (`two-json` default, or `extra`). Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV for the selected suite by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
   bench cli <baseline-commit>  Build baseline vs dirty current trees and compare curated CLI workloads with hyperfine. Writes artifacts under /var/tmp/infotheory_bench/.
-  bench__aixi_competitors  Run reproducible Guix time-machine benchmark for Infotheory MC-AIXI (Rust+Python) vs PyAIXI and C++ MC-AIXI. Fails fast if Guix is unavailable.
+  bench_aixi_competitors  Run reproducible Guix time-machine benchmark for Infotheory MC-AIXI (Rust+Python) vs PyAIXI and C++ MC-AIXI. Fails fast if Guix is unavailable.
   plot [suite]   Open benchmark results in the benchman TUI for the selected suite (`two-json` default, or `extra`). Not included in test_all.
   tui [suite]    Build and launch the interactive benchmark TUI (`benchman`) for the selected suite (`two-json` default, or `extra`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
   tui log-loss <prefix>  Build and launch the log-loss diagnostic TUI for <prefix>.trace.tsv / .nodes.tsv / .summary.tsv.
@@ -339,7 +339,7 @@ EOF
 cmd=${1:-}
 case "$cmd" in
   bench) shift; cmd_bench "$@" ;;
-  bench__aixi_competitors) shift; cmd_bench__aixi_competitors "$@" ;;
+  bench_aixi_competitors) shift; cmd_bench_aixi_competitors "$@" ;;
   plot) shift; cmd_plot "$@" ;;
   tui) shift; cmd_tui "$@" ;;
   code_test) shift; cmd_code_test "$@" ;;

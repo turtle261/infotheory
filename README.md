@@ -300,7 +300,7 @@ Quick benchmark (AIQI vs MC-AIXI):
 Reproducible competitor benchmark (Infotheory Rust/Python vs PyAIXI + C++ MC-AIXI):
 
 ```bash
-./projman.sh bench__aixi_competitors --profile default --trials 1
+./projman.sh bench_aixi_competitors --profile default --trials 1
 ```
 
 Benchmark correctness notes:

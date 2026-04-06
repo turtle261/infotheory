@@ -1564,18 +1564,15 @@ pub struct RosaPlus {
     dist: Vec<f64>,
 }
 
-/// A lightweight snapshot of the append-only internal SAM buffers.
+/// A full snapshot of the ROSA model state.
 ///
-/// Restoring to a checkpoint is O(1) (via truncation) and is meant to support
-/// repeated evaluation of different continuations from the same base training state.
-#[derive(Clone, Copy, Debug)]
+/// Generic reversible checkpoints for ROSA must restore more than append-only
+/// buffers: suffix-automaton updates can rewire pre-existing states to newly
+/// created clone states, so truncation-only snapshots are unsound. This
+/// checkpoint therefore captures the full model state.
+#[derive(Clone)]
 pub struct RosaCheckpoint {
-    sam_st_len: usize,
-    sam_ed_len: usize,
-    sam_text_len: usize,
-    sam_text_states_len: usize,
-    sam_boundary_after_len: usize,
-    sam_last: SamStateIx,
+    model: Box<RosaPlus>,
 }
 
 /// Transaction object used to roll back a temporary conditional update.
@@ -2195,33 +2192,16 @@ impl RosaPlus {
         }
     }
 
-    /// A checkpoint that allows restoring the ROSA model back to a previous trained state
-    /// by truncating append-only internal buffers.
-    ///
-    /// Intended for workflows that repeatedly evaluate different continuations from the same base
-    /// training text (e.g. universal-prior conditioned scoring).
+    /// Capture a checkpoint that can restore the exact trained and predictive state.
     pub fn checkpoint(&self) -> RosaCheckpoint {
         RosaCheckpoint {
-            sam_st_len: self.sam.st.len(),
-            sam_ed_len: self.sam.ed.len(),
-            sam_text_len: self.sam.text.len(),
-            sam_text_states_len: self.sam.text_states.len(),
-            sam_boundary_after_len: self.sam.boundary_after.len(),
-            sam_last: self.sam.last,
+            model: Box::new(self.clone()),
         }
     }
 
-    /// Restore the model to a previously captured checkpoint.
-    ///
-    /// This invalidates the LM; callers should rebuild it before scoring.
+    /// Restore the model to a previously captured checkpoint exactly.
     pub fn restore(&mut self, ck: &RosaCheckpoint) {
-        self.sam.st.truncate(ck.sam_st_len);
-        self.sam.ed.truncate(ck.sam_ed_len);
-        self.sam.text.truncate(ck.sam_text_len);
-        self.sam.text_states.truncate(ck.sam_text_states_len);
-        self.sam.boundary_after.truncate(ck.sam_boundary_after_len);
-        self.sam.last = ck.sam_last;
-        self.lm_built = false;
+        *self = (*ck.model).clone();
     }
 
     #[inline(always)]
@@ -3275,9 +3255,11 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_restore_reverts_append_only_buffers() {
+    fn checkpoint_restore_reverts_exact_state() {
         let mut m = RosaPlus::new(3, true, b'\n', 7);
         m.train_example(b"aaaa");
+        m.build_lm_full_bytes_no_finalize_endpos();
+        let before_prob = m.prob_for_last(b'a' as u32);
 
         let ck = m.checkpoint();
         let base_text = m.sam.text.clone();
@@ -3293,7 +3275,12 @@ mod tests {
         assert_eq!(m.sam.text_states, base_states);
         assert_eq!(m.sam.boundary_after, base_boundary);
         assert_eq!(m.sam.last, base_last);
-        assert!(!m.lm_built);
+        assert!(m.lm_built);
+        let after_prob = m.prob_for_last(b'a' as u32);
+        assert!(
+            (after_prob - before_prob).abs() <= 1e-12,
+            "checkpoint restore should recover exact predictive state: before={before_prob} after={after_prob}"
+        );
     }
 
     #[test]

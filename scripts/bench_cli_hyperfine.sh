@@ -61,8 +61,8 @@ prepare_input() {
   : > "${out_path}"
   while [[ "$(wc -c < "${out_path}")" -lt "${bytes}" ]]; do
     cat \
-      "${repo_root}/README.md" \
-      "${repo_root}/Cargo.toml" \
+      "${repo_root}/LICENSE-APACHE" \
+      "${repo_root}/benchmarks/baseline/infotheory-two-json-summary-20260310-212017.tsv" \
       "${bench_two}" >> "${out_path}"
   done
   truncate -s "${bytes}" "${out_path}"

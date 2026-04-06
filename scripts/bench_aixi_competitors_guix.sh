@@ -235,7 +235,7 @@ INFOTHEORY_BIN="$CARGO_TARGET_DIR/release/infotheory"
 INNER
 chmod +x "$inner_script"
 
-echo "[bench__aixi_competitors] Running inside Guix time-machine..."
+echo "[bench_aixi_competitors] Running inside Guix time-machine..."
 "$guix_bin" time-machine -C "$guix_channels" -- shell --pure --container --network --no-cwd \
   --share="$repo_root=$repo_root" \
   bash coreutils findutils grep sed gawk git make gcc-toolchain \

@@ -78,7 +78,7 @@ Use the reproducible benchmark harness to validate cross-implementation parity
 for MC-AIXI behavior and reporting:
 
 ```bash
-./projman.sh bench__aixi_competitors --profile default --trials 1
+./projman.sh bench_aixi_competitors --profile default --trials 1
 ```
 
 Parity/correctness expectations for this benchmark:
