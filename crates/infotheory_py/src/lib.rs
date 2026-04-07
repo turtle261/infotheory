@@ -4988,10 +4988,20 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
+
+    fn with_python_initialized<F, R>(f: F) -> R
+    where
+        F: for<'py> FnOnce(Python<'py>) -> R,
+    {
+        static PYTHON_INIT: Once = Once::new();
+        PYTHON_INIT.call_once(Python::initialize);
+        Python::attach(f)
+    }
 
     #[test]
     fn parse_observation_key_mode_accepts_pyclass_instance() {
-        Python::attach(|py| {
+        with_python_initialized(|py| {
             let mode_obj = Py::new(
                 py,
                 PyObservationKeyMode {
@@ -5007,7 +5017,7 @@ mod tests {
 
     #[test]
     fn parse_observation_key_mode_accepts_string_aliases() {
-        Python::attach(|py| {
+        with_python_initialized(|py| {
             let stream_hash = pyo3::types::PyString::new(py, "stream_hash");
             let parsed_hash = PyAgentSimulatorShim::parse_key_mode(stream_hash.as_any());
             assert_eq!(
