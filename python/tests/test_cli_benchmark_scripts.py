@@ -1,4 +1,6 @@
 import json
+import functools
+import os
 import pathlib
 import shutil
 import subprocess
@@ -10,7 +12,47 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[2]
 
 
+@functools.lru_cache(maxsize=1)
+def _resolve_bash_executable() -> str:
+    if os.name != "nt":
+        return "bash"
+
+    candidates: list[str] = []
+    for env_var in ("ProgramW6432", "ProgramFiles"):
+        root = os.environ.get(env_var)
+        if root:
+            candidates.append(str(pathlib.Path(root) / "Git" / "bin" / "bash.exe"))
+            candidates.append(str(pathlib.Path(root) / "Git" / "usr" / "bin" / "bash.exe"))
+
+    which_bash = shutil.which("bash")
+    if which_bash:
+        candidates.append(which_bash)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = str(pathlib.Path(candidate))
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            probe = subprocess.run(
+                [normalized, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError:
+            continue
+        if probe.returncode == 0 and "GNU bash" in probe.stdout:
+            return normalized
+
+    pytest.skip("GNU bash executable is required on Windows for benchmark script tests")
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    if cmd and cmd[0] == "bash":
+        cmd = [_resolve_bash_executable(), *cmd[1:]]
     return subprocess.run(
         cmd,
         cwd=_repo_root(),

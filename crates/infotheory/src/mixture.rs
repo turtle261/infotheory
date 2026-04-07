@@ -590,24 +590,37 @@ pub enum RateBackendPredictorCheckpoint {
     Sequitur(SequiturCheckpoint),
     /// Compact CTW journal marker for [`RateBackendPredictor::Ctw`].
     #[cfg(feature = "backend-ctw")]
-    Ctw { journal_len: usize },
+    Ctw {
+        /// Length of the rollback journal to restore when unwinding the checkpoint.
+        journal_len: usize,
+    },
     /// Compact FAC-CTW journal marker for [`RateBackendPredictor::FacCtw`].
     #[cfg(feature = "backend-ctw")]
-    FacCtw { journal_len: usize },
+    FacCtw {
+        /// Length of the rollback journal to restore when unwinding the checkpoint.
+        journal_len: usize,
+    },
     /// Composite checkpoint for calibrated predictors.
     #[cfg(feature = "backend-calibrated")]
     Calibrated(Box<CalibratedPredictorCheckpoint>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal FAC-CTW journal event used to restore predictor state from checkpoints.
 #[doc(hidden)]
 pub enum FacCtwUndoOp {
+    /// Symbol update applied in learning mode.
     LearnedSymbol,
+    /// Symbol update applied in frozen/scoring mode.
     FrozenSymbol,
 }
 
 #[derive(Clone)]
 #[cfg(feature = "backend-calibrated")]
+/// Internal checkpoint payload for [`RateBackendPredictor::Calibrated`].
+///
+/// This stores wrapped predictor state plus calibrator caches so temporary
+/// lookahead scoring can rollback without rebuilding runtime objects.
 pub struct CalibratedPredictorCheckpoint {
     base: Box<RateBackendPredictorCheckpoint>,
     core: CalibratorCore,

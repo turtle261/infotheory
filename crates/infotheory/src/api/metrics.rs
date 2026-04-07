@@ -18,11 +18,13 @@ use crate::with_rwkv_method_tls;
 use crate::{aligned_prefix, with_default_ctx};
 
 #[inline(always)]
+/// Fallible entropy-rate estimate `Ĥ(X)` (bits per symbol) using the default context backend.
 pub fn try_entropy_rate_bytes(data: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_entropy_rate_bytes(data, max_order))
 }
 
 #[inline(always)]
+/// Fallible biased/plugin entropy-rate estimate using the default context backend.
 pub fn try_biased_entropy_rate_bytes(data: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_biased_entropy_rate_bytes(data, max_order))
 }
@@ -464,6 +466,7 @@ pub fn try_joint_entropy_rate_backend(
 }
 
 #[inline(always)]
+/// Marginal byte entropy `H(X)` in bits/symbol (i.i.d. histogram model).
 pub fn marginal_entropy_bytes(data: &[u8]) -> f64 {
     if data.is_empty() {
         return 0.0;
@@ -486,6 +489,7 @@ pub fn marginal_entropy_bytes(data: &[u8]) -> f64 {
 }
 
 #[inline(always)]
+/// Joint marginal byte entropy `H(X,Y)` in bits/pair over aligned prefixes.
 pub fn joint_marginal_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     let n = x.len();
@@ -511,11 +515,13 @@ pub fn joint_marginal_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 #[inline(always)]
+/// Fallible joint entropy-rate estimate `H(X,Y)` with the default context backend.
 pub fn try_joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_joint_entropy_rate_bytes(x, y, max_order))
 }
 
 #[inline(always)]
+/// Fallible conditional entropy-rate estimate `H(X|Y)` with the default context backend.
 pub fn try_conditional_entropy_rate_bytes(
     x: &[u8],
     y: &[u8],
@@ -525,15 +531,18 @@ pub fn try_conditional_entropy_rate_bytes(
 }
 
 #[inline(always)]
+/// Fallible conditional entropy estimate with default context backend selection.
 pub fn try_conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_conditional_entropy_bytes(x, y, max_order))
 }
 
 #[inline(always)]
+/// Fallible mutual-information estimate `I(X;Y)` with default context backend selection.
 pub fn try_mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_mutual_information_bytes(x, y, max_order))
 }
 
+/// Marginal (histogram) mutual information estimate `I(X;Y)` on aligned prefixes.
 pub fn mutual_information_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     let h_x = marginal_entropy_bytes(x);
@@ -543,6 +552,7 @@ pub fn mutual_information_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 #[inline(always)]
+/// Fallible mutual-information rate estimate with the default context backend.
 pub fn try_mutual_information_rate_bytes(
     x: &[u8],
     y: &[u8],
@@ -552,10 +562,13 @@ pub fn try_mutual_information_rate_bytes(
 }
 
 #[inline(always)]
+/// Fallible normalized entropy distance (NED) estimate with default context backend.
 pub fn try_ned_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_ned_bytes(x, y, max_order))
 }
 
+/// Marginal (histogram) normalized entropy distance:
+/// `(H(X,Y) - min(H(X), H(Y))) / max(H(X), H(Y))`.
 pub fn ned_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     let h_x = marginal_entropy_bytes(x);
@@ -571,15 +584,19 @@ pub fn ned_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 #[inline(always)]
+/// Fallible entropy-rate NED estimate with the default context backend.
 pub fn try_ned_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_ned_bytes(x, y, max_order))
 }
 
 #[inline(always)]
+/// Fallible constructive NED estimate with the default context backend.
 pub fn try_ned_cons_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_ned_cons_bytes(x, y, max_order))
 }
 
+/// Marginal constructive normalized entropy distance:
+/// `(H(X,Y) - min(H(X), H(Y))) / H(X,Y)`.
 pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     let h_x = marginal_entropy_bytes(x);
     let h_y = marginal_entropy_bytes(y);
@@ -593,15 +610,18 @@ pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 #[inline(always)]
+/// Fallible entropy-rate constructive NED estimate with the default context backend.
 pub fn try_ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_ned_cons_bytes(x, y, max_order))
 }
 
 #[inline(always)]
+/// Fallible normalized transform-effort (NTE/VI-based) estimate with default context backend.
 pub fn try_nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_nte_bytes(x, y, max_order))
 }
 
+/// Marginal (histogram) NTE estimate using variation of information normalized by `max(Hx, Hy)`.
 pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
     let (x, y) = aligned_prefix(x, y);
     let h_x = marginal_entropy_bytes(x);
@@ -617,6 +637,7 @@ pub fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 #[inline(always)]
+/// Fallible entropy-rate NTE estimate with the default context backend.
 pub fn try_nte_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_nte_bytes(x, y, max_order))
 }
@@ -639,6 +660,7 @@ pub(crate) fn byte_histogram(data: &[u8]) -> [f64; 256] {
 }
 
 #[inline(always)]
+/// Total variation distance between marginal byte distributions of `x` and `y`.
 pub fn tvd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
     if x.is_empty() || y.is_empty() {
         return 0.0;
@@ -655,6 +677,7 @@ pub fn tvd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
 }
 
 #[inline(always)]
+/// Normalized Hellinger distance between marginal byte distributions of `x` and `y`.
 pub fn nhd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
     if x.is_empty() || y.is_empty() {
         return 0.0;
@@ -671,6 +694,7 @@ pub fn nhd_bytes(x: &[u8], y: &[u8], _max_order: i64) -> f64 {
 }
 
 #[inline(always)]
+/// Fallible cross-entropy estimate `H_train(test)` with default context backend selection.
 pub fn try_cross_entropy_bytes(
     test_data: &[u8],
     train_data: &[u8],
@@ -680,6 +704,7 @@ pub fn try_cross_entropy_bytes(
 }
 
 #[inline(always)]
+/// Fallible cross-entropy *rate* estimate with the default context backend.
 pub fn try_cross_entropy_rate_bytes(
     test_data: &[u8],
     train_data: &[u8],
@@ -688,6 +713,7 @@ pub fn try_cross_entropy_rate_bytes(
     with_default_ctx(|ctx| ctx.try_cross_entropy_rate_bytes(test_data, train_data, max_order))
 }
 
+/// KL divergence `D_KL(P || Q)` between marginal byte histograms of `x` and `y` (bits).
 pub fn d_kl_bytes(x: &[u8], y: &[u8]) -> f64 {
     if x.is_empty() || y.is_empty() {
         return 0.0;
@@ -704,6 +730,7 @@ pub fn d_kl_bytes(x: &[u8], y: &[u8]) -> f64 {
     d_kl.max(0.0)
 }
 
+/// Jensen-Shannon divergence between marginal byte histograms of `x` and `y` (bits).
 pub fn js_div_bytes(x: &[u8], y: &[u8]) -> f64 {
     if x.is_empty() || y.is_empty() {
         return 0.0;
@@ -729,11 +756,15 @@ pub fn js_div_bytes(x: &[u8], y: &[u8]) -> f64 {
 }
 
 #[inline(always)]
+/// Fallible intrinsic dependence estimate:
+/// `(H_marginal(X) - H_rate(X)) / H_marginal(X)`.
 pub fn try_intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_intrinsic_dependence_bytes(data, max_order))
 }
 
 #[inline(always)]
+/// Fallible resistance-to-transformation estimate:
+/// `I(X; T(X)) / H(X)` for `tx = T(x)`.
 pub fn try_resistance_to_transformation_bytes(
     x: &[u8],
     tx: &[u8],

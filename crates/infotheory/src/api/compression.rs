@@ -8,6 +8,7 @@ use crate::error::{InfotheoryError, InfotheoryResult};
 use crate::runtime::CompressionRuntime;
 use crate::{try_zpaq_compress_size_bytes, with_default_ctx};
 
+/// Compute compressed size (bytes) for a logical concatenation of `parts` using `backend`.
 pub fn try_compress_size_chain_backend(
     parts: &[&[u8]],
     backend: &CompressionBackend,
@@ -17,6 +18,7 @@ pub fn try_compress_size_chain_backend(
     runtime.compress_size_chain(parts)
 }
 
+/// Compute compressed size (bytes) for `data` using `backend`.
 pub fn try_compress_size_backend(
     data: &[u8],
     backend: &CompressionBackend,
@@ -26,6 +28,7 @@ pub fn try_compress_size_backend(
     runtime.compress_size(data)
 }
 
+/// Compress `data` with `backend` and return encoded bytes.
 pub fn try_compress_bytes_backend(
     data: &[u8],
     backend: &CompressionBackend,
@@ -35,6 +38,7 @@ pub fn try_compress_bytes_backend(
     runtime.compress_bytes(data)
 }
 
+/// Decompress `input` with `backend` and return decoded bytes.
 pub fn try_decompress_bytes_backend(
     input: &[u8],
     backend: &CompressionBackend,
@@ -44,11 +48,16 @@ pub fn try_decompress_bytes_backend(
     runtime.decompress_bytes(input)
 }
 
+/// Normalized compression-distance formula variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NcdVariant {
+    /// Vitanyi-style NCD: `(C(xy) - min(C(x), C(y))) / max(C(x), C(y))`.
     Vitanyi,
+    /// Symmetric Vitanyi-style NCD using `min(C(xy), C(yx))`.
     SymVitanyi,
+    /// Constructive NCD: `(C(xy) - min(C(x), C(y))) / C(xy)`.
     Cons,
+    /// Symmetric constructive NCD using `min(C(xy), C(yx))` as denominator.
     SymCons,
 }
 
@@ -89,6 +98,10 @@ fn ncd_from_sizes(cx: u64, cy: u64, cxy: u64, cyx: Option<u64>, variant: NcdVari
 }
 
 #[inline(always)]
+/// Compute NCD for byte slices with a ZPAQ `method` string.
+///
+/// This is a convenience wrapper around [`try_ncd_bytes_backend`] with
+/// [`CompressionBackend::Zpaq`].
 pub fn try_ncd_bytes(
     x: &[u8],
     y: &[u8],
@@ -102,10 +115,12 @@ pub fn try_ncd_bytes(
 }
 
 #[inline(always)]
+/// Compute NCD for byte slices using the thread-local default context.
 pub fn try_ncd_bytes_default(x: &[u8], y: &[u8], variant: NcdVariant) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_ncd_bytes(x, y, variant))
 }
 
+/// Compute NCD for byte slices with an explicit compression backend.
 pub fn try_ncd_bytes_backend(
     x: &[u8],
     y: &[u8],
@@ -131,6 +146,9 @@ pub fn try_ncd_bytes_backend(
     Ok(ncd_from_sizes(cx, cy, cxy, cyx, variant))
 }
 
+/// Compute an `n x n` pairwise NCD matrix (row-major) for `datas`.
+///
+/// `out[i * n + j]` corresponds to `NCD(datas[i], datas[j])`.
 pub fn try_ncd_matrix_bytes(
     datas: &[Vec<u8>],
     method: &str,
