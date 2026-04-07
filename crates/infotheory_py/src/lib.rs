@@ -361,7 +361,14 @@ fn parse_compression_backend(
     method: Option<&str>,
     rate_backend: Option<RateBackend>,
 ) -> PyResult<CompressionBackend> {
+    #[cfg(feature = "backend-rwkv")]
     let mut opts = infotheory::spec::CompressionBackendShorthandOptions {
+        default_rate_backend: Some(rate_backend.unwrap_or_default()),
+        default_framing: infotheory::compression::FramingMode::Framed,
+        ..Default::default()
+    };
+    #[cfg(not(feature = "backend-rwkv"))]
+    let opts = infotheory::spec::CompressionBackendShorthandOptions {
         default_rate_backend: Some(rate_backend.unwrap_or_default()),
         default_framing: infotheory::compression::FramingMode::Framed,
         ..Default::default()
@@ -3895,11 +3902,13 @@ impl PyAiqiAgent {
     }
 }
 
+#[cfg(feature = "backend-ctw")]
 #[pyclass(name = "CtwPredictor")]
 struct PyCtwPredictor {
     inner: infotheory::aixi::model::CtwPredictor,
 }
 
+#[cfg(feature = "backend-ctw")]
 #[pymethods]
 impl PyCtwPredictor {
     #[new]
@@ -3938,11 +3947,13 @@ impl PyCtwPredictor {
     }
 }
 
+#[cfg(feature = "backend-ctw")]
 #[pyclass(name = "FacCtwPredictor")]
 struct PyFacCtwPredictor {
     inner: infotheory::aixi::model::FacCtwPredictor,
 }
 
+#[cfg(feature = "backend-ctw")]
 #[pymethods]
 impl PyFacCtwPredictor {
     #[new]
@@ -3981,11 +3992,13 @@ impl PyFacCtwPredictor {
     }
 }
 
+#[cfg(feature = "backend-rosa")]
 #[pyclass(name = "RosaPredictor")]
 struct PyRosaPredictor {
     inner: infotheory::aixi::model::RosaPredictor,
 }
 
+#[cfg(feature = "backend-rosa")]
 #[pymethods]
 impl PyRosaPredictor {
     #[new]
@@ -4025,11 +4038,13 @@ impl PyRosaPredictor {
     }
 }
 
+#[cfg(feature = "backend-zpaq")]
 #[pyclass(name = "ZpaqPredictor", unsendable)]
 struct PyZpaqPredictor {
     inner: infotheory::aixi::model::ZpaqPredictor,
 }
 
+#[cfg(feature = "backend-zpaq")]
 #[pymethods]
 impl PyZpaqPredictor {
     #[new]
@@ -4663,12 +4678,14 @@ impl PyNyxVmEnvironment {
     }
 }
 
+#[cfg(feature = "backend-rosa")]
 #[pyclass(name = "SearchGranularity", eq, from_py_object)]
 #[derive(Clone, Copy, PartialEq)]
 struct PySearchGranularity {
     inner: infotheory::search::SearchGranularity,
 }
 
+#[cfg(feature = "backend-rosa")]
 #[pymethods]
 impl PySearchGranularity {
     #[classattr]
@@ -4693,12 +4710,14 @@ impl PySearchGranularity {
     }
 }
 
+#[cfg(feature = "backend-rosa")]
 #[pyclass(name = "Stage2PriorMode", eq, from_py_object)]
 #[derive(Clone, Copy, PartialEq)]
 struct PyStage2PriorMode {
     inner: infotheory::search::Stage2PriorMode,
 }
 
+#[cfg(feature = "backend-rosa")]
 #[pymethods]
 impl PyStage2PriorMode {
     #[classattr]
@@ -4731,6 +4750,7 @@ impl PyStage2PriorMode {
     }
 }
 
+#[cfg(feature = "backend-rosa")]
 #[pyfunction]
 #[pyo3(signature = (
     query,
@@ -4819,9 +4839,13 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAiqiConfig>()?;
     m.add_class::<PyAgent>()?;
     m.add_class::<PyAiqiAgent>()?;
+    #[cfg(feature = "backend-ctw")]
     m.add_class::<PyCtwPredictor>()?;
+    #[cfg(feature = "backend-ctw")]
     m.add_class::<PyFacCtwPredictor>()?;
+    #[cfg(feature = "backend-rosa")]
     m.add_class::<PyRosaPredictor>()?;
+    #[cfg(feature = "backend-zpaq")]
     m.add_class::<PyZpaqPredictor>()?;
     #[cfg(feature = "backend-rwkv")]
     m.add_class::<PyRwkvPredictor>()?;
@@ -4833,7 +4857,9 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ExtendedTigerEnv>()?;
     m.add_class::<TicTacToeEnv>()?;
     m.add_class::<KuhnPokerEnv>()?;
+    #[cfg(feature = "backend-rosa")]
     m.add_class::<PySearchGranularity>()?;
+    #[cfg(feature = "backend-rosa")]
     m.add_class::<PyStage2PriorMode>()?;
 
     #[cfg(feature = "vm")]
@@ -4953,6 +4979,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_agent_with_environment, m)?)?;
     m.add_function(wrap_pyfunction!(run_aiqi_with_environment, m)?)?;
     m.add_function(wrap_pyfunction!(search_with_simulator, m)?)?;
+    #[cfg(feature = "backend-rosa")]
     m.add_function(wrap_pyfunction!(search, m)?)?;
     m.add_function(wrap_pyfunction!(vm_enabled, m)?)?;
     Ok(())
