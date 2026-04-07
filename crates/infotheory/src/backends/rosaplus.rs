@@ -1896,6 +1896,16 @@ impl RosaPlus {
         self.sam.last = 0;
     }
 
+    /// Return the current predictive cursor state.
+    pub(crate) fn conditioning_cursor(&self) -> i32 {
+        self.sam.last
+    }
+
+    /// Restore a previously recorded predictive cursor state.
+    pub(crate) fn restore_conditioning_cursor(&mut self, cursor: i32) {
+        self.sam.last = cursor;
+    }
+
     /// Advance only the predictive cursor without mutating fitted counts.
     pub fn advance_conditioning_byte(&mut self, b: u8) {
         self.sam.last = self.sam.advance(self.sam.last, b as u32);
@@ -2193,6 +2203,9 @@ impl RosaPlus {
     }
 
     /// Capture a checkpoint that can restore the exact trained and predictive state.
+    ///
+    /// This clones the full model. Prefer predictor/runtime checkpoints in hot
+    /// paths, which can use lighter-weight backend-specific rollback strategies.
     pub fn checkpoint(&self) -> RosaCheckpoint {
         RosaCheckpoint {
             model: Box::new(self.clone()),

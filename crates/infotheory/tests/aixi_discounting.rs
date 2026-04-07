@@ -1,6 +1,12 @@
-use infotheory::aixi::agent::{Agent, AgentConfig};
-use infotheory::aixi::common::ObservationKeyMode;
+use infotheory::aixi::common::{Action, ObservationKeyMode, Reward};
 use infotheory::aixi::mcts::AgentSimulator;
+
+struct NormRewardHarness {
+    discount_gamma: f64,
+    horizon: usize,
+    min_reward: Reward,
+    max_reward: Reward,
+}
 
 fn approx_eq(a: f64, b: f64, eps: f64) {
     assert!(
@@ -10,32 +16,81 @@ fn approx_eq(a: f64, b: f64, eps: f64) {
     );
 }
 
-fn mk_agent(discount_gamma: f64, horizon: usize, min_reward: i64, max_reward: i64) -> Agent {
-    Agent::new(AgentConfig {
-        algorithm: "ctw".to_string(),
-        ct_depth: 8,
-        agent_horizon: horizon,
-        observation_bits: 1,
-        observation_stream_len: 1,
-        observation_key_mode: ObservationKeyMode::FullStream,
-        reward_bits: 8,
-        agent_actions: 2,
-        num_simulations: 1,
-        exploration_exploitation_ratio: 1.0,
+impl AgentSimulator for NormRewardHarness {
+    fn get_num_actions(&self) -> usize {
+        2
+    }
+
+    fn get_num_observation_bits(&self) -> usize {
+        1
+    }
+
+    fn observation_key_mode(&self) -> ObservationKeyMode {
+        ObservationKeyMode::FullStream
+    }
+
+    fn get_num_reward_bits(&self) -> usize {
+        8
+    }
+
+    fn horizon(&self) -> usize {
+        self.horizon
+    }
+
+    fn max_reward(&self) -> Reward {
+        self.max_reward
+    }
+
+    fn min_reward(&self) -> Reward {
+        self.min_reward
+    }
+
+    fn reward_offset(&self) -> i64 {
+        (-self.min_reward).max(0)
+    }
+
+    fn discount_gamma(&self) -> f64 {
+        self.discount_gamma
+    }
+
+    fn model_update_action(&mut self, _action: Action) {}
+
+    fn gen_percept_and_update(&mut self, _bits: usize) -> u64 {
+        0
+    }
+
+    fn model_revert(&mut self, _steps: usize) {}
+
+    fn gen_range(&mut self, _end: usize) -> usize {
+        0
+    }
+
+    fn gen_f64(&mut self) -> f64 {
+        0.0
+    }
+
+    fn boxed_clone_with_seed(&self, _seed: u64) -> Box<dyn AgentSimulator> {
+        Box::new(Self {
+            discount_gamma: self.discount_gamma,
+            horizon: self.horizon,
+            min_reward: self.min_reward,
+            max_reward: self.max_reward,
+        })
+    }
+}
+
+fn mk_agent(
+    discount_gamma: f64,
+    horizon: usize,
+    min_reward: i64,
+    max_reward: i64,
+) -> NormRewardHarness {
+    NormRewardHarness {
         discount_gamma,
+        horizon,
         min_reward,
         max_reward,
-        reward_offset: (-min_reward).max(0),
-        random_seed: Some(13),
-        rate_backend: None,
-        rate_backend_max_order: 20,
-        rwkv_model_path: None,
-        rwkv_method: None,
-        mamba_model_path: None,
-        mamba_method: None,
-        rosa_max_order: None,
-        zpaq_method: None,
-    })
+    }
 }
 
 #[test]

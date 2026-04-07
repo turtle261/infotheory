@@ -129,22 +129,43 @@ mod tests {
 
     #[test]
     fn resolve_rate_backend_name_canonicalizes_aliases() {
-        assert_eq!(
-            resolve_rate_backend_name("  Rosa  "),
-            Some(BackendAvailability::Enabled("rosaplus"))
-        );
-        assert_eq!(
-            resolve_rate_backend_name("facctw"),
-            Some(BackendAvailability::Enabled("fac-ctw"))
-        );
-        assert_eq!(
-            resolve_rate_backend_name("mix"),
-            Some(BackendAvailability::Enabled("mixture"))
-        );
-        assert_eq!(
-            resolve_rate_backend_name("sequitur"),
-            Some(BackendAvailability::Enabled("sequitur"))
-        );
+        let rosa = if cfg!(feature = "backend-rosa") {
+            BackendAvailability::Enabled("rosaplus")
+        } else {
+            BackendAvailability::Disabled {
+                canonical: "rosaplus",
+                feature: "backend-rosa",
+            }
+        };
+        let fac_ctw = if cfg!(feature = "backend-ctw") {
+            BackendAvailability::Enabled("fac-ctw")
+        } else {
+            BackendAvailability::Disabled {
+                canonical: "fac-ctw",
+                feature: "backend-ctw",
+            }
+        };
+        let mixture = if cfg!(feature = "backend-mixture") {
+            BackendAvailability::Enabled("mixture")
+        } else {
+            BackendAvailability::Disabled {
+                canonical: "mixture",
+                feature: "backend-mixture",
+            }
+        };
+        let sequitur = if cfg!(feature = "backend-sequitur") {
+            BackendAvailability::Enabled("sequitur")
+        } else {
+            BackendAvailability::Disabled {
+                canonical: "sequitur",
+                feature: "backend-sequitur",
+            }
+        };
+
+        assert_eq!(resolve_rate_backend_name("  Rosa  "), Some(rosa));
+        assert_eq!(resolve_rate_backend_name("facctw"), Some(fac_ctw));
+        assert_eq!(resolve_rate_backend_name("mix"), Some(mixture));
+        assert_eq!(resolve_rate_backend_name("sequitur"), Some(sequitur));
         assert_eq!(resolve_rate_backend_name("unknown"), None);
     }
 

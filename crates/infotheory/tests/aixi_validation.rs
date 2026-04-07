@@ -1,3 +1,5 @@
+#![cfg(any(feature = "default-backends", feature = "all-backends"))]
+
 //! AIXI Module Validation Tests
 //!
 //! Tests for predictors, environments, and agents.

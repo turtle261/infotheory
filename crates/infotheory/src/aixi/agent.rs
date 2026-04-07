@@ -688,11 +688,30 @@ mod tests {
         }
     }
 
+    fn test_agent(model: Box<dyn Predictor>) -> Agent {
+        let config = basic_config();
+        let action_bits = if config.agent_actions <= 1 {
+            1
+        } else {
+            (usize::BITS - (config.agent_actions - 1).leading_zeros()) as usize
+        };
+        Agent {
+            action_bits,
+            model,
+            planner: Some(SearchTree::new()),
+            config,
+            age: 0,
+            total_reward: 0.0,
+            rng: RandomGenerator::from_seed(7),
+            obs_buffer: Vec::with_capacity(128),
+            sym_buffer: Vec::with_capacity(64),
+        }
+    }
+
     #[test]
     fn external_history_updates_use_committed_predictor_paths() {
-        let mut agent = Agent::try_new(basic_config()).expect("valid agent config");
         let counts = Arc::new(Mutex::new(CallCounts::default()));
-        agent.model = Box::new(InstrumentedPredictor::new(counts.clone()));
+        let mut agent = test_agent(Box::new(InstrumentedPredictor::new(counts.clone())));
 
         agent.model_update_percept_stream(&[1, 2], 1);
         agent.model_update_action_external(3);
@@ -706,9 +725,8 @@ mod tests {
 
     #[test]
     fn simulation_revert_prefers_predictor_scope_when_available() {
-        let mut agent = Agent::try_new(basic_config()).expect("valid agent config");
         let counts = Arc::new(Mutex::new(CallCounts::default()));
-        agent.model = Box::new(InstrumentedPredictor::new(counts.clone()));
+        let mut agent = test_agent(Box::new(InstrumentedPredictor::new(counts.clone())));
 
         AgentSimulator::begin_simulation(&mut agent);
         agent.model_revert(3);

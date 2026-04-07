@@ -5,6 +5,11 @@ members = [
     "crates/benchman",
     "vendor/zpaq_rs",
 ]
+default-members = [
+    "crates/infotheory",
+    "crates/benchman",
+    "vendor/zpaq_rs",
+]
 exclude = ["vendor/nyx-lite"]
 resolver = "3"
 

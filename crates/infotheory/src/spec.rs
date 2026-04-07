@@ -1382,9 +1382,12 @@ pub fn parse_compression_backend_name_method(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     use super::*;
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     use crate::coders::CoderType;
 
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
     fn rate_backend_json_roundtrip_handles_nested_specs() {
         let backend = RateBackend::Calibrated {
@@ -1437,6 +1440,7 @@ mod tests {
         assert_eq!(json, roundtrip);
     }
 
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
     fn compression_backend_json_roundtrip_handles_rate_wrappers() {
         let backend = CompressionBackend::Rate {
@@ -1465,6 +1469,7 @@ mod tests {
         assert_eq!(json, roundtrip);
     }
 
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
     fn parse_compression_backend_name_method_uses_shared_shorthand_defaults() {
         let rate_backend = RateBackend::Ppmd {

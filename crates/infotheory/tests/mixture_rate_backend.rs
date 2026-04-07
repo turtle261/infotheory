@@ -1,3 +1,5 @@
+#![cfg(any(feature = "default-backends", feature = "all-backends"))]
+
 use infotheory::api::{
     CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureScheduleMode,
     MixtureSpec, RateBackend, try_entropy_rate_backend,

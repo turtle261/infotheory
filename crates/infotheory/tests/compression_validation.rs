@@ -1,3 +1,5 @@
+#![cfg(feature = "backend-rosa")]
+
 use infotheory::api::{CompressionBackend, RateBackend, validate_compression_backend};
 use infotheory::coders::CoderType;
 use infotheory::compression::FramingMode;

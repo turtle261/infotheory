@@ -2388,7 +2388,7 @@ fn apply_switching_weights(
 #[cfg(feature = "backend-zpaq")]
 fn _zpaq_marker(_: &ZpaqRateModel) {}
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 mod tests {
     use super::*;
     use std::sync::Arc;

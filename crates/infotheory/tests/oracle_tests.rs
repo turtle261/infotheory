@@ -1,8 +1,8 @@
 #[cfg(feature = "backend-zpaq")]
 use infotheory::api::{CompressionBackend, NcdVariant, try_ncd_bytes_backend};
-use infotheory::api::{
-    RateBackend, marginal_entropy_bytes, try_entropy_rate_backend, try_mutual_information_bytes,
-};
+#[cfg(any(feature = "backend-rosa", feature = "backend-ctw"))]
+use infotheory::api::{RateBackend, try_entropy_rate_backend};
+use infotheory::api::{marginal_entropy_bytes, try_mutual_information_bytes};
 use infotheory::axioms;
 use infotheory::datagen;
 
@@ -75,6 +75,7 @@ fn mi_independent_is_zero() {
 
 // ... (other tests unchanged) ...
 
+#[cfg(feature = "backend-rosa")]
 #[test]
 fn rosa_matches_theoretical_markov_entropy() {
     let (p00, p11) = (0.8, 0.8);
@@ -205,6 +206,7 @@ fn ncd_triangle_inequality() {
 // Backend Specific (CTW / ROSA)
 // ============================================================================
 
+#[cfg(feature = "backend-ctw")]
 #[test]
 fn ctw_matches_theoretical_markov_entropy() {
     // Generate Markov chain with known entropy rate

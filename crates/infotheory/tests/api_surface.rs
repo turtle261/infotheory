@@ -1,27 +1,37 @@
+#[cfg(feature = "backend-rosa")]
+use infotheory::api::GenerationConfig;
+#[cfg(any(feature = "backend-ctw", feature = "backend-rosa"))]
+use infotheory::api::{CompressionBackend, InfotheoryCtx};
 use infotheory::api::{
-    CompressionBackend, GenerationConfig, InfotheoryCtx, MixtureExpertSpec, MixtureKind,
-    MixtureSpec, NcdVariant, ParticleSpec, RateBackend, RateBackendSession, d_kl_bytes,
-    get_default_ctx, joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes,
-    mutual_information_marg_bytes, ned_cons_marg_bytes, ned_marg_bytes, nhd_bytes, nte_marg_bytes,
-    set_default_ctx, try_biased_entropy_rate_backend, try_biased_entropy_rate_bytes,
-    try_compress_bytes_backend, try_compress_size_backend, try_compress_size_chain_backend,
-    try_conditional_entropy_bytes, try_conditional_entropy_paths,
-    try_conditional_entropy_rate_bytes, try_cross_entropy_bytes, try_cross_entropy_paths,
-    try_cross_entropy_rate_backend, try_cross_entropy_rate_bytes, try_decompress_bytes_backend,
-    try_entropy_rate_backend, try_entropy_rate_bytes, try_get_bytes_from_paths,
-    try_get_compressed_size, try_get_compressed_size_parallel, try_get_compressed_sizes_from_paths,
+    MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend, RateBackendSession,
+};
+#[cfg(feature = "backend-zpaq")]
+use infotheory::api::{
+    NcdVariant, try_compress_bytes_backend, try_compress_size_backend,
+    try_compress_size_chain_backend, try_conditional_entropy_paths, try_cross_entropy_paths,
+    try_decompress_bytes_backend, try_get_bytes_from_paths, try_get_compressed_size,
+    try_get_compressed_size_parallel, try_get_compressed_sizes_from_paths,
     try_get_parallel_compressed_sizes_from_parallel_paths,
     try_get_parallel_compressed_sizes_from_sequential_paths,
     try_get_sequential_compressed_sizes_from_parallel_paths,
-    try_get_sequential_compressed_sizes_from_sequential_paths, try_intrinsic_dependence_bytes,
-    try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes, try_js_divergence_paths,
-    try_kl_divergence_paths, try_mutual_information_bytes, try_mutual_information_paths,
-    try_mutual_information_rate_backend, try_mutual_information_rate_bytes, try_ncd_bytes,
-    try_ncd_bytes_backend, try_ncd_bytes_default, try_ncd_matrix_bytes, try_ncd_matrix_paths,
-    try_ncd_paths, try_ncd_paths_backend, try_ned_bytes, try_ned_cons_bytes,
-    try_ned_cons_rate_bytes, try_ned_paths, try_ned_rate_backend, try_ned_rate_bytes,
-    try_nhd_paths, try_nte_bytes, try_nte_paths, try_nte_rate_backend, try_nte_rate_bytes,
-    try_resistance_to_transformation_bytes, try_tvd_paths, tvd_bytes,
+    try_get_sequential_compressed_sizes_from_sequential_paths, try_js_divergence_paths,
+    try_kl_divergence_paths, try_mutual_information_paths, try_ncd_bytes, try_ncd_bytes_backend,
+    try_ncd_bytes_default, try_ncd_matrix_bytes, try_ncd_matrix_paths, try_ncd_paths,
+    try_ncd_paths_backend, try_ned_paths, try_nhd_paths, try_nte_paths, try_tvd_paths,
+};
+#[cfg(feature = "backend-ctw")]
+use infotheory::api::{
+    d_kl_bytes, get_default_ctx, joint_marginal_entropy_bytes, js_div_bytes,
+    marginal_entropy_bytes, mutual_information_marg_bytes, ned_cons_marg_bytes, ned_marg_bytes,
+    nhd_bytes, nte_marg_bytes, set_default_ctx, try_biased_entropy_rate_backend,
+    try_biased_entropy_rate_bytes, try_conditional_entropy_bytes,
+    try_conditional_entropy_rate_bytes, try_cross_entropy_bytes, try_cross_entropy_rate_backend,
+    try_cross_entropy_rate_bytes, try_entropy_rate_backend, try_entropy_rate_bytes,
+    try_intrinsic_dependence_bytes, try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes,
+    try_mutual_information_bytes, try_mutual_information_rate_backend,
+    try_mutual_information_rate_bytes, try_ned_bytes, try_ned_cons_bytes, try_ned_cons_rate_bytes,
+    try_ned_rate_backend, try_ned_rate_bytes, try_nte_bytes, try_nte_rate_backend,
+    try_nte_rate_bytes, try_resistance_to_transformation_bytes, tvd_bytes,
 };
 #[cfg(feature = "backend-zpaq")]
 use std::fs;
@@ -30,6 +40,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(feature = "backend-zpaq")]
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "backend-zpaq")]
+fn has_not_found_io_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::NotFound
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
 
 #[cfg(feature = "backend-zpaq")]
 fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
@@ -42,6 +66,7 @@ fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
     path
 }
 
+#[cfg(feature = "backend-ctw")]
 #[test]
 fn api_surface_entropy_and_distance_wrappers_are_callable() {
     let x = b"alpha beta alpha beta alpha";
@@ -102,6 +127,7 @@ fn api_surface_entropy_and_distance_wrappers_are_callable() {
     set_default_ctx(prev);
 }
 
+#[cfg(feature = "backend-rosa")]
 #[test]
 fn api_surface_generation_session_and_config_are_callable() {
     let prompt = b"If a frog is green, dogs are red.\nIf a toad is green, cats are red.\nIf a dog is green, frogs are red.\nIf a cat is green, toads are red.\nIf a frog is red, dogs are green.\nIf a toad is red, cats are green.\nIf a dog is red, frogs are green.\nIf a cat is red, toads are ";
@@ -133,7 +159,12 @@ fn api_surface_rate_backend_session_rejects_invalid_programmatic_mixture() {
         Ok(_) => panic!("invalid mixture backend should be rejected before runtime construction"),
         Err(err) => err,
     };
-    assert!(err.to_string().contains("must include at least one expert"));
+    let message = err.to_string();
+    if cfg!(feature = "backend-mixture") {
+        assert!(message.contains("must include at least one expert"));
+    } else {
+        assert!(message.contains("requires infotheory feature 'backend-mixture'"));
+    }
 }
 
 #[test]
@@ -247,24 +278,42 @@ fn api_surface_path_and_compression_helpers_are_callable() {
 #[cfg(feature = "backend-zpaq")]
 #[test]
 fn api_surface_fallible_path_helpers_report_missing_files() {
-    let missing = "/tmp/infotheory_api_missing_does_not_exist.bin";
-    let err = try_get_compressed_size(missing, "1").expect_err("missing file should error");
-    assert!(err.to_string().contains("No such file") || err.to_string().contains("not found"));
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic")
+        .as_nanos();
+    let missing_path = std::env::temp_dir().join(format!(
+        "infotheory_api_missing_does_not_exist_{unique}.bin"
+    ));
+    let missing = missing_path.to_string_lossy().to_string();
 
-    let err = try_get_bytes_from_paths(&[missing]).expect_err("missing bytes path should error");
-    assert!(err.to_string().contains("No such file") || err.to_string().contains("not found"));
+    let err = try_get_compressed_size(&missing, "1").expect_err("missing file should error");
+    assert!(
+        has_not_found_io_error(&err),
+        "expected not-found io error, got: {err}"
+    );
+
+    let err = try_get_bytes_from_paths(&[&missing]).expect_err("missing bytes path should error");
+    assert!(
+        has_not_found_io_error(&err),
+        "expected not-found io error, got: {err}"
+    );
 
     for err in [
-        try_ned_paths(missing, missing, 0).expect_err("ned paths should error"),
-        try_nte_paths(missing, missing, 0).expect_err("nte paths should error"),
-        try_nhd_paths(missing, missing, 0).expect_err("nhd paths should error"),
-        try_mutual_information_paths(missing, missing, 0).expect_err("mi paths should error"),
-        try_conditional_entropy_paths(missing, missing, 0)
+        try_ned_paths(&missing, &missing, 0).expect_err("ned paths should error"),
+        try_nte_paths(&missing, &missing, 0).expect_err("nte paths should error"),
+        try_nhd_paths(&missing, &missing, 0).expect_err("nhd paths should error"),
+        try_mutual_information_paths(&missing, &missing, 0).expect_err("mi paths should error"),
+        try_conditional_entropy_paths(&missing, &missing, 0)
             .expect_err("conditional entropy paths should error"),
-        try_cross_entropy_paths(missing, missing, 0).expect_err("cross entropy paths should error"),
-        try_kl_divergence_paths(missing, missing).expect_err("kl paths should error"),
-        try_js_divergence_paths(missing, missing).expect_err("jsd paths should error"),
+        try_cross_entropy_paths(&missing, &missing, 0)
+            .expect_err("cross entropy paths should error"),
+        try_kl_divergence_paths(&missing, &missing).expect_err("kl paths should error"),
+        try_js_divergence_paths(&missing, &missing).expect_err("jsd paths should error"),
     ] {
-        assert!(err.to_string().contains("No such file") || err.to_string().contains("not found"));
+        assert!(
+            has_not_found_io_error(&err),
+            "expected not-found io error, got: {err}"
+        );
     }
 }

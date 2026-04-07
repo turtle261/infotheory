@@ -556,7 +556,7 @@ fn validate_mixture_spec_shallow(spec: &MixtureSpec) -> Result<(), String> {
         return Err("mixture expert log_prior must be finite".to_string());
     }
     if let Some(decay) = spec.decay {
-        if !decay.is_finite() || !(0.0..1.0).contains(&decay) {
+        if !decay.is_finite() || !(decay > 0.0 && decay < 1.0) {
             return Err("mixture decay must be in (0, 1)".to_string());
         }
     }
@@ -799,5 +799,33 @@ impl CalibratedSpec {
     /// Serialize this spec into canonical JSON value form.
     pub fn to_canonical_json_value(&self) -> crate::spec::SpecResult<serde_json::Value> {
         crate::spec::calibrated_spec_to_json_value(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fading_bayes_decay_rejects_zero_and_one_boundaries() {
+        let expert = MixtureExpertSpec {
+            name: Some("placeholder".to_string()),
+            log_prior: 0.0,
+            max_order: -1,
+            backend: RateBackend::RosaPlus,
+        };
+
+        for &decay in &[0.0, 1.0] {
+            let spec =
+                MixtureSpec::new(MixtureKind::FadingBayes, vec![expert.clone()]).with_decay(decay);
+            let err = validate_mixture_spec_shallow(&spec).expect_err("boundary decay should fail");
+            assert!(
+                err.contains("(0, 1)"),
+                "unexpected error for decay={decay}: {err}"
+            );
+        }
+
+        let valid = MixtureSpec::new(MixtureKind::FadingBayes, vec![expert]).with_decay(0.5);
+        validate_mixture_spec_shallow(&valid).expect("strictly interior decay should validate");
     }
 }

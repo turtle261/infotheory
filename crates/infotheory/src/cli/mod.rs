@@ -1,4 +1,5 @@
 use super::*;
+use infotheory::error::InfotheoryResult;
 
 #[cfg(feature = "vm")]
 pub(super) fn parse_shared_memory_policy(v: Option<&str>) -> SharedMemoryPolicy {
@@ -1099,22 +1100,46 @@ pub(super) fn maybe_export_online_model(
 /// ROSA-based symmetric codelength distance (NCD-like but faster)
 /// d_ROSA(x,y) = 0.5 * (H_y(x)/H_x(x) + H_x(y)/H_y(y)) - 1
 /// Clamped to [0, 1]
-pub(super) fn rosa_distance(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+fn json_error(message: impl std::fmt::Display) -> String {
+    serde_json::json!({
+        "error": message.to_string(),
+    })
+    .to_string()
+}
+
+fn try_metrics_summary(data: &[u8], max_order: i64) -> InfotheoryResult<(f64, f64, f64, usize)> {
+    let h0 = marginal_entropy_bytes(data);
+    let h_rate = try_entropy_rate_bytes(data, max_order)?;
+    let id = if h0 < 1e-9 {
+        0.0
+    } else {
+        ((h0 - h_rate) / h0).clamp(0.0, 1.0)
+    };
+    Ok((h0, h_rate, id, data.len()))
+}
+
+fn format_metrics_json(h0: f64, h_rate: f64, id: f64, len: usize) -> String {
+    format!(
+        r#"{{"h0":{:.6},"h_rate":{:.6},"id":{:.6},"len":{}}}"#,
+        h0, h_rate, id, len
+    )
+}
+
+fn rosa_distance(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
     if x.is_empty() || y.is_empty() {
-        return 1.0;
+        return Ok(1.0);
     }
 
-    let h_x_x = biased_entropy_rate_bytes(x, max_order);
-    let h_y_y = biased_entropy_rate_bytes(y, max_order);
-    let h_y_x = cross_entropy_rate_bytes(x, y, max_order);
-    let h_x_y = cross_entropy_rate_bytes(y, x, max_order);
+    let h_x_x = try_biased_entropy_rate_bytes(x, max_order)?;
+    let h_y_y = try_biased_entropy_rate_bytes(y, max_order)?;
+    let h_y_x = try_cross_entropy_rate_bytes(x, y, max_order)?;
+    let h_x_y = try_cross_entropy_rate_bytes(y, x, max_order)?;
 
     if h_x_x < 1e-9 || h_y_y < 1e-9 {
-        return 1.0;
+        return Ok(1.0);
     }
 
-    let d = 0.5 * (h_y_x / h_x_x + h_x_y / h_y_y) - 1.0;
-    d.clamp(0.0, 1.0)
+    Ok((0.5 * (h_y_x / h_x_x + h_x_y / h_y_y) - 1.0).clamp(0.0, 1.0))
 }
 
 /// Process a single JSON line and return result.
@@ -1149,21 +1174,10 @@ pub(super) fn process_json_line(line: &str) -> String {
                 return r#"{"error":"empty text"}"#.to_string();
             }
 
-            let h0 = marginal_entropy_bytes(data);
-            let h_rate = entropy_rate_bytes(data, max_order);
-            let id = if h0 < 1e-9 {
-                0.0
-            } else {
-                ((h0 - h_rate) / h0).clamp(0.0, 1.0)
-            };
-
-            format!(
-                r#"{{"h0":{:.6},"h_rate":{:.6},"id":{:.6},"len":{}}}"#,
-                h0,
-                h_rate,
-                id,
-                data.len()
-            )
+            match try_metrics_summary(data, max_order) {
+                Ok((h0, h_rate, id, len)) => format_metrics_json(h0, h_rate, id, len),
+                Err(err) => json_error(format!("metrics failed: {err}")),
+            }
         }
         "metrics_file" => {
             let path = v
@@ -1174,24 +1188,11 @@ pub(super) fn process_json_line(line: &str) -> String {
             let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             match std::fs::read(&path) {
-                Ok(data) => {
-                    let h0 = marginal_entropy_bytes(&data);
-                    let h_rate = entropy_rate_bytes(&data, max_order);
-                    let id = if h0 < 1e-9 {
-                        0.0
-                    } else {
-                        ((h0 - h_rate) / h0).clamp(0.0, 1.0)
-                    };
-
-                    format!(
-                        r#"{{"h0":{:.6},"h_rate":{:.6},"id":{:.6},"len":{}}}"#,
-                        h0,
-                        h_rate,
-                        id,
-                        data.len()
-                    )
-                }
-                Err(e) => format!(r#"{{"error":"failed to read file: {}"}}"#, e),
+                Ok(data) => match try_metrics_summary(&data, max_order) {
+                    Ok((h0, h_rate, id, len)) => format_metrics_json(h0, h_rate, id, len),
+                    Err(err) => json_error(format!("metrics_file failed: {err}")),
+                },
+                Err(err) => json_error(format!("failed to read file: {err}")),
             }
         }
         "ncd" => {
@@ -1229,8 +1230,10 @@ pub(super) fn process_json_line(line: &str) -> String {
                 _ => NcdVariant::Vitanyi,
             };
 
-            let ncd = ncd_bytes(x, y, &method, ncd_variant);
-            format!(r#"{{"ncd":{:.6}}}"#, ncd)
+            match try_ncd_bytes(x, y, &method, ncd_variant) {
+                Ok(ncd) => format!(r#"{{"ncd":{:.6}}}"#, ncd),
+                Err(err) => json_error(format!("ncd failed: {err}")),
+            }
         }
         "ncd_files" => {
             let path1 = v
@@ -1261,8 +1264,10 @@ pub(super) fn process_json_line(line: &str) -> String {
                 _ => NcdVariant::Vitanyi,
             };
 
-            let ncd = ncd_paths(&path1, &path2, &method, ncd_variant);
-            format!(r#"{{"ncd":{:.6}}}"#, ncd)
+            match try_ncd_paths(&path1, &path2, &method, ncd_variant) {
+                Ok(ncd) => format!(r#"{{"ncd":{:.6}}}"#, ncd),
+                Err(err) => json_error(format!("ncd_files failed: {err}")),
+            }
         }
         "rosa_dist" => {
             let text1 = v
@@ -1283,8 +1288,10 @@ pub(super) fn process_json_line(line: &str) -> String {
                 return r#"{"error":"empty text(s)"}"#.to_string();
             }
 
-            let dist = rosa_distance(x, y, max_order);
-            format!(r#"{{"rosa_dist":{:.6}}}"#, dist)
+            match rosa_distance(x, y, max_order) {
+                Ok(dist) => format!(r#"{{"rosa_dist":{:.6}}}"#, dist),
+                Err(err) => json_error(format!("rosa_dist failed: {err}")),
+            }
         }
         "cross_entropy" => {
             let text_x = v
@@ -1305,8 +1312,10 @@ pub(super) fn process_json_line(line: &str) -> String {
                 return r#"{"error":"empty text(s)"}"#.to_string();
             }
 
-            let xe = cross_entropy_rate_bytes(x, y, max_order);
-            format!(r#"{{"cross_entropy":{:.6}}}"#, xe)
+            match try_cross_entropy_rate_bytes(x, y, max_order) {
+                Ok(xe) => format!(r#"{{"cross_entropy":{:.6}}}"#, xe),
+                Err(err) => json_error(format!("cross_entropy failed: {err}")),
+            }
         }
         "batch_metrics" => {
             let texts: Vec<String> = v
@@ -1327,20 +1336,14 @@ pub(super) fn process_json_line(line: &str) -> String {
                     if data.is_empty() {
                         r#"{"h0":0,"h_rate":0,"id":0,"len":0}"#.to_string()
                     } else {
-                        let h0 = marginal_entropy_bytes(data);
-                        let h_rate = entropy_rate_bytes(data, max_order);
-                        let id = if h0 < 1e-9 {
-                            0.0
-                        } else {
-                            ((h0 - h_rate) / h0).clamp(0.0, 1.0)
-                        };
-                        format!(
-                            r#"{{"h0":{:.6},"h_rate":{:.6},"id":{:.6},"len":{}}}"#,
-                            h0,
-                            h_rate,
-                            id,
-                            data.len()
-                        )
+                        match try_metrics_summary(data, max_order) {
+                            Ok((h0, h_rate, id, len)) => format_metrics_json(h0, h_rate, id, len),
+                            Err(err) => serde_json::json!({
+                                "error": format!("{err}"),
+                                "len": data.len(),
+                            })
+                            .to_string(),
+                        }
                     }
                 })
                 .collect();
@@ -1378,7 +1381,7 @@ pub(super) fn process_json_line(line: &str) -> String {
             let datas: Vec<Vec<u8>> = texts.iter().map(|t| t.as_bytes().to_vec()).collect();
             let matrix = match try_ncd_matrix_bytes(&datas, &method, ncd_variant) {
                 Ok(matrix) => matrix,
-                Err(err) => return format!(r#"{{"error":"ncd_matrix failed: {}"}}"#, err),
+                Err(err) => return json_error(format!("ncd_matrix failed: {err}")),
             };
             let n = datas.len();
 
@@ -1413,7 +1416,12 @@ pub(super) fn process_json_line(line: &str) -> String {
                     let d = if i == j {
                         0.0
                     } else {
-                        rosa_distance(datas[i], datas[j], max_order)
+                        match rosa_distance(datas[i], datas[j], max_order) {
+                            Ok(dist) => dist,
+                            Err(err) => {
+                                return json_error(format!("rosa_matrix failed: {err}"));
+                            }
+                        }
                     };
                     matrix[i * n + j] = d;
                     matrix[j * n + i] = d;
@@ -1453,7 +1461,10 @@ pub(super) fn process_json_line(line: &str) -> String {
                 return format!(r#"{{"pass":false,"reason":"low_entropy","h0":{:.4}}}"#, h0);
             }
 
-            let h_rate = entropy_rate_bytes(data, -1);
+            let h_rate = match try_entropy_rate_bytes(data, -1) {
+                Ok(h_rate) => h_rate,
+                Err(err) => return json_error(format!("spam_check failed: {err}")),
+            };
             if h_rate < h_rate_threshold {
                 return format!(
                     r#"{{"pass":false,"reason":"low_entropy_rate","h_rate":{:.4}}}"#,

@@ -1,4 +1,7 @@
-#![cfg(feature = "cli")]
+#![cfg(all(
+    feature = "cli",
+    any(feature = "default-backends", feature = "all-backends")
+))]
 
 use std::fs;
 use std::path::{Path, PathBuf};

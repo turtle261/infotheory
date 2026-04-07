@@ -43,7 +43,7 @@ use crate::backends::match_model::MatchModel;
 #[cfg(feature = "backend-ppmd")]
 use crate::backends::ppmd::PpmdModel;
 #[cfg(feature = "backend-rosa")]
-use crate::backends::rosaplus::RosaPlus;
+use crate::backends::rosaplus::{RosaPlus, RosaTx};
 #[cfg(feature = "backend-sequitur")]
 use crate::backends::sequitur::{SequiturCheckpoint, SequiturModel};
 #[cfg(feature = "backend-match")]
@@ -455,6 +455,10 @@ pub enum RateBackendPredictor {
         model: RosaPlus,
         /// Probability floor for numeric stability.
         min_prob: f64,
+        /// Undo log for checkpointed updates and frozen-conditioning moves.
+        checkpoint_journal: Vec<RosaPredictorUndo>,
+        /// Number of active checkpoints currently recording into `checkpoint_journal`.
+        checkpoint_depth: usize,
     },
     /// Local contiguous match predictor.
     #[cfg(feature = "backend-match")]
@@ -580,11 +584,18 @@ pub enum RateBackendPredictor {
 #[derive(Clone)]
 /// Checkpoint snapshot used for temporary predictor rollback.
 ///
-/// Most backends use a full cloned predictor snapshot. Sequitur uses a compact
-/// internal checkpoint to avoid cloning its full state.
+/// Most backends use a full cloned predictor snapshot. Sequitur, CTW/FAC-CTW,
+/// and ROSA use compact rollback markers to avoid cloning hot-path runtime
+/// state.
 pub enum RateBackendPredictorCheckpoint {
     /// Full predictor clone for backends without specialized checkpointing.
     Full(RateBackendPredictor),
+    /// Compact ROSA journal marker for [`RateBackendPredictor::Rosa`].
+    #[cfg(feature = "backend-rosa")]
+    Rosa {
+        /// Length of the rollback journal to restore when unwinding the checkpoint.
+        journal_len: usize,
+    },
     /// Compact Sequitur undo marker for [`RateBackendPredictor::Sequitur`].
     #[cfg(feature = "backend-sequitur")]
     Sequitur(SequiturCheckpoint),
@@ -613,6 +624,15 @@ pub enum FacCtwUndoOp {
     LearnedSymbol,
     /// Symbol update applied in frozen/scoring mode.
     FrozenSymbol,
+}
+
+#[derive(Clone)]
+#[cfg(feature = "backend-rosa")]
+/// Internal ROSA journal event used to restore predictor state from checkpoints.
+#[doc(hidden)]
+pub enum RosaPredictorUndo {
+    Learned(RosaTx),
+    FrozenCursor { previous_last: i32 },
 }
 
 #[derive(Clone)]
@@ -666,7 +686,12 @@ impl RateBackendPredictor {
             RateBackend::RosaPlus => {
                 let mut model = RosaPlus::new(max_order, false, 0, 42);
                 model.build_lm_full_bytes_no_finalize_endpos();
-                Self::Rosa { model, min_prob }
+                Self::Rosa {
+                    model,
+                    min_prob,
+                    checkpoint_journal: Vec::new(),
+                    checkpoint_depth: 0,
+                }
             }
             #[cfg(not(feature = "backend-rosa"))]
             RateBackend::RosaPlus => {
@@ -953,6 +978,17 @@ impl RateBackendPredictor {
 
     pub(crate) fn checkpoint(&mut self) -> RateBackendPredictorCheckpoint {
         match self {
+            #[cfg(feature = "backend-rosa")]
+            RateBackendPredictor::Rosa {
+                checkpoint_journal,
+                checkpoint_depth,
+                ..
+            } => {
+                *checkpoint_depth = checkpoint_depth.saturating_add(1);
+                RateBackendPredictorCheckpoint::Rosa {
+                    journal_len: checkpoint_journal.len(),
+                }
+            }
             #[cfg(feature = "backend-sequitur")]
             RateBackendPredictor::Sequitur { model, .. } => {
                 RateBackendPredictorCheckpoint::Sequitur(model.checkpoint())
@@ -1000,6 +1036,27 @@ impl RateBackendPredictor {
 
     pub(crate) fn restore_checkpoint(&mut self, checkpoint: &RateBackendPredictorCheckpoint) {
         match (self, checkpoint) {
+            #[cfg(feature = "backend-rosa")]
+            (
+                RateBackendPredictor::Rosa {
+                    model,
+                    checkpoint_journal,
+                    ..
+                },
+                RateBackendPredictorCheckpoint::Rosa { journal_len },
+            ) => {
+                while checkpoint_journal.len() > *journal_len {
+                    match checkpoint_journal
+                        .pop()
+                        .expect("rosa checkpoint journal underflow")
+                    {
+                        RosaPredictorUndo::Learned(tx) => model.rollback_tx(tx),
+                        RosaPredictorUndo::FrozenCursor { previous_last } => {
+                            model.restore_conditioning_cursor(previous_last)
+                        }
+                    }
+                }
+            }
             #[cfg(feature = "backend-sequitur")]
             (
                 RateBackendPredictor::Sequitur { model, .. },
@@ -1054,6 +1111,10 @@ impl RateBackendPredictor {
             (slot, RateBackendPredictorCheckpoint::Full(state)) => {
                 *slot = state.clone();
             }
+            #[cfg(feature = "backend-rosa")]
+            (_, RateBackendPredictorCheckpoint::Rosa { .. }) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
             #[cfg(feature = "backend-ctw")]
             (_, RateBackendPredictorCheckpoint::Ctw { .. }) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
@@ -1075,6 +1136,15 @@ impl RateBackendPredictor {
 
     pub(crate) fn clear_checkpoints_if_supported(&mut self) {
         match self {
+            #[cfg(feature = "backend-rosa")]
+            RateBackendPredictor::Rosa {
+                checkpoint_journal,
+                checkpoint_depth,
+                ..
+            } => {
+                checkpoint_journal.clear();
+                *checkpoint_depth = 0;
+            }
             #[cfg(feature = "backend-sequitur")]
             RateBackendPredictor::Sequitur { model, .. } => model.clear_checkpoints(),
             #[cfg(feature = "backend-ctw")]
@@ -1191,7 +1261,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
     fn log_prob(&mut self, symbol: u8) -> f64 {
         match self {
             #[cfg(feature = "backend-rosa")]
-            RateBackendPredictor::Rosa { model, min_prob } => {
+            RateBackendPredictor::Rosa {
+                model, min_prob, ..
+            } => {
                 let p = clamp_prob(model.prob_for_last(symbol as u32), *min_prob);
                 p.ln()
             }
@@ -1313,7 +1385,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         match self {
             #[cfg(feature = "backend-rosa")]
-            RateBackendPredictor::Rosa { model, min_prob } => {
+            RateBackendPredictor::Rosa {
+                model, min_prob, ..
+            } => {
                 model.fill_probs_for_last_bytes(out);
                 for slot in out.iter_mut() {
                     *slot = clamp_prob(*slot, *min_prob).ln();
@@ -1451,8 +1525,19 @@ impl OnlineBytePredictor for RateBackendPredictor {
     fn update(&mut self, symbol: u8) {
         match self {
             #[cfg(feature = "backend-rosa")]
-            RateBackendPredictor::Rosa { model, .. } => {
-                model.train_byte(symbol);
+            RateBackendPredictor::Rosa {
+                model,
+                checkpoint_journal,
+                checkpoint_depth,
+                ..
+            } => {
+                if *checkpoint_depth > 0 {
+                    let mut tx = model.begin_tx();
+                    model.train_sequence_tx(&mut tx, &[symbol]);
+                    checkpoint_journal.push(RosaPredictorUndo::Learned(tx));
+                } else {
+                    model.train_byte(symbol);
+                }
             }
             #[cfg(feature = "backend-match")]
             RateBackendPredictor::Match { model, .. } => {
@@ -1589,9 +1674,20 @@ impl OnlineBytePredictor for RateBackendPredictor {
     fn log_prob_update(&mut self, symbol: u8) -> f64 {
         match self {
             #[cfg(feature = "backend-rosa")]
-            RateBackendPredictor::Rosa { model, min_prob } => {
+            RateBackendPredictor::Rosa {
+                model,
+                min_prob,
+                checkpoint_journal,
+                checkpoint_depth,
+            } => {
                 let p = clamp_prob(model.prob_for_last(symbol as u32), *min_prob);
-                model.train_byte(symbol);
+                if *checkpoint_depth > 0 {
+                    let mut tx = model.begin_tx();
+                    model.train_sequence_tx(&mut tx, &[symbol]);
+                    checkpoint_journal.push(RosaPredictorUndo::Learned(tx));
+                } else {
+                    model.train_byte(symbol);
+                }
                 p.ln()
             }
             #[cfg(feature = "backend-ctw")]
@@ -1720,7 +1816,17 @@ impl OnlineBytePredictor for RateBackendPredictor {
     fn update_frozen(&mut self, symbol: u8) {
         match self {
             #[cfg(feature = "backend-rosa")]
-            RateBackendPredictor::Rosa { model, .. } => {
+            RateBackendPredictor::Rosa {
+                model,
+                checkpoint_journal,
+                checkpoint_depth,
+                ..
+            } => {
+                if *checkpoint_depth > 0 {
+                    checkpoint_journal.push(RosaPredictorUndo::FrozenCursor {
+                        previous_last: model.conditioning_cursor(),
+                    });
+                }
                 model.advance_conditioning_byte(symbol);
             }
             #[cfg(feature = "backend-match")]
@@ -3307,7 +3413,7 @@ pub(crate) fn build_mixture_runtime(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 mod tests {
     use super::*;
     use std::sync::{
@@ -4070,6 +4176,19 @@ mod tests {
             RateBackend::RosaPlus,
             b"rosa checkpoint base history",
         );
+    }
+
+    #[test]
+    fn rosa_checkpoint_uses_compact_journal_marker() {
+        let mut predictor =
+            RateBackendPredictor::from_backend(RateBackend::RosaPlus, -1, DEFAULT_MIN_PROB);
+        match predictor.checkpoint() {
+            RateBackendPredictorCheckpoint::Rosa { journal_len } => {
+                assert_eq!(journal_len, 0);
+            }
+            _ => panic!("expected compact rosa checkpoint"),
+        }
+        predictor.clear_checkpoints_if_supported();
     }
 
     #[test]

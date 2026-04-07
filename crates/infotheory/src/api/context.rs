@@ -282,15 +282,12 @@ impl InfotheoryCtx {
     ) -> InfotheoryResult<f64> {
         match &self.rate_backend {
             #[cfg(feature = "backend-rosa")]
-            RateBackend::RosaPlus => {
-                let mut prefix = Vec::new();
-                let total: usize = prefix_parts.iter().map(|p| p.len()).sum();
-                prefix.reserve(total);
-                for p in prefix_parts {
-                    prefix.extend_from_slice(p);
-                }
-                try_cross_entropy_rate_backend(data, &prefix, -1, &RateBackend::RosaPlus)
-            }
+            RateBackend::RosaPlus => crate::try_frozen_plugin_rate_backend(
+                data,
+                prefix_parts,
+                -1,
+                &RateBackend::RosaPlus,
+            ),
             #[cfg(not(feature = "backend-rosa"))]
             RateBackend::RosaPlus => Err(InfotheoryError::invalid_backend_config(
                 "backend 'rosaplus' requires infotheory feature 'backend-rosa'".to_string(),

@@ -100,12 +100,12 @@ pub(crate) mod simd_math;
 /// Shared backend/spec parsing and loading helpers.
 pub mod spec;
 use crate::api::RateBackend;
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 pub(crate) use crate::api::{
     CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureSpec,
     ParticleSpec,
 };
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 use crate::api::{
     CompressionBackend, GenerationConfig, InfotheoryCtx, NcdVariant, RateBackendSession,
     d_kl_bytes, try_biased_entropy_rate_backend, try_conditional_entropy_bytes,
@@ -113,7 +113,7 @@ use crate::api::{
     try_entropy_rate_bytes, try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes,
     try_mutual_information_bytes, try_ncd_bytes,
 };
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 use crate::api::{
     joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes, nhd_bytes, tvd_bytes,
 };
@@ -155,7 +155,7 @@ use crate::mixture::OnlineBytePredictor;
 use std::cell::RefCell;
 #[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -386,8 +386,21 @@ pub(crate) fn try_frozen_plugin_rate_backend(
     #[cfg(feature = "backend-rosa")]
     if matches!(backend, RateBackend::RosaPlus) {
         let mut model = RosaPlus::new(max_order, false, 0, 42);
-        for part in fit_parts {
-            model.train_example(part);
+        let fit_total = fit_parts.iter().map(|part| part.len()).sum::<usize>();
+        if fit_total > 0 {
+            model.reserve_for_stream(fit_total);
+            let mut non_empty_parts = fit_parts
+                .iter()
+                .copied()
+                .filter(|part| !part.is_empty())
+                .peekable();
+            while let Some(part) = non_empty_parts.next() {
+                if non_empty_parts.peek().is_some() {
+                    model.train_sequence(part);
+                } else {
+                    model.train_example(part);
+                }
+            }
         }
         model.build_lm();
         return Ok(model.cross_entropy(score_data));
@@ -481,13 +494,13 @@ pub(crate) fn try_frozen_plugin_rate_backend(
 /// * 0 means the transformation destroyed all information (e.g. mapping everything to a constant).
 ///
 /// Assumes X and T(X) are aligned.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 mod tests {
     use super::*;
 
     #[cfg(not(feature = "backend-zpaq"))]
     fn compress_size_backend(data: &[u8], backend: &CompressionBackend) -> u64 {
-        try_compress_size_backend(data, backend).expect("compress_size_backend")
+        crate::api::try_compress_size_backend(data, backend).expect("compress_size_backend")
     }
 
     fn ncd_bytes(x: &[u8], y: &[u8], method: &str, variant: NcdVariant) -> f64 {
@@ -789,31 +802,6 @@ mod tests {
                 .expect("cross entropy bytes"),
             0.0
         );
-    }
-
-    #[cfg(not(feature = "backend-zpaq"))]
-    #[test]
-    #[should_panic(expected = "CompressionBackend::Zpaq is unavailable")]
-    fn explicit_zpaq_backend_fails_loudly() {
-        let backend = CompressionBackend::Zpaq {
-            method: "5".to_string(),
-        };
-        let _ = compress_size_backend(b"abc", &backend);
-    }
-
-    #[cfg(not(feature = "backend-zpaq"))]
-    #[test]
-    fn default_compression_backend_falls_back_to_rate_coding() {
-        let backend = CompressionBackend::default();
-        assert!(matches!(
-            &backend,
-            CompressionBackend::Rate {
-                coder: crate::coders::CoderType::AC,
-                framing: crate::compression::FramingMode::Raw,
-                ..
-            }
-        ));
-        assert!(compress_size_backend(b"abc", &backend) > 0);
     }
 
     #[test]
@@ -1129,6 +1117,24 @@ mod tests {
     }
 
     #[test]
+    fn rosa_conditional_chain_matches_concatenated_prefix_scoring() {
+        let ctx = InfotheoryCtx::new(RateBackend::RosaPlus, CompressionBackend::default());
+        let prefix_parts: [&[u8]; 3] = [b"universal ", b"prior ", b"slice"];
+        let data = b"query payload";
+
+        let chained = ctx
+            .try_cross_entropy_conditional_chain(&prefix_parts, data)
+            .expect("conditional-chain cross entropy");
+        let flat_prefix: Vec<u8> = prefix_parts.concat();
+        let flat = cross_entropy_rate_backend(data, &flat_prefix, -1, &RateBackend::RosaPlus);
+
+        assert!(
+            (chained - flat).abs() < 1e-12,
+            "conditional-chain scoring drifted from concatenated-prefix scoring: chained={chained} flat={flat}"
+        );
+    }
+
+    #[test]
     fn datagen_bernoulli_entropy_estimate() {
         // Test that estimated entropy is close to theoretical for Bernoulli(0.5)
         let p = 0.5;
@@ -1321,6 +1327,62 @@ mod tests {
         assert!(
             joint > 0.0 && joint < 16.0,
             "particle joint entropy rate out of range: {joint}"
+        );
+    }
+}
+
+#[cfg(all(
+    test,
+    not(any(
+        feature = "default-backends",
+        feature = "all-backends",
+        feature = "backend-rosa",
+        feature = "backend-ctw",
+        feature = "backend-match",
+        feature = "backend-ppmd",
+        feature = "backend-sequitur",
+        feature = "backend-mixture",
+        feature = "backend-particle",
+        feature = "backend-calibrated",
+        feature = "backend-rwkv",
+        feature = "backend-mamba"
+    ))
+))]
+mod minimal_tests {
+    use crate::api::CompressionBackend;
+
+    #[cfg(not(feature = "backend-zpaq"))]
+    fn compress_size_backend(data: &[u8], backend: &CompressionBackend) -> u64 {
+        crate::api::try_compress_size_backend(data, backend).expect("compress_size_backend")
+    }
+
+    #[cfg(not(feature = "backend-zpaq"))]
+    #[test]
+    #[should_panic(expected = "requires infotheory feature 'backend-zpaq'")]
+    fn explicit_zpaq_backend_fails_loudly() {
+        let backend = CompressionBackend::Zpaq {
+            method: "5".to_string(),
+        };
+        let _ = compress_size_backend(b"abc", &backend);
+    }
+
+    #[cfg(not(feature = "backend-zpaq"))]
+    #[test]
+    fn default_compression_backend_reports_missing_rate_backend_when_none_are_enabled() {
+        let backend = CompressionBackend::default();
+        assert!(matches!(
+            &backend,
+            CompressionBackend::Rate {
+                coder: crate::coders::CoderType::AC,
+                framing: crate::compression::FramingMode::Raw,
+                ..
+            }
+        ));
+        let err = crate::api::try_compress_size_backend(b"abc", &backend)
+            .expect_err("default backend should fail loudly when no rate backends are enabled");
+        assert!(
+            err.to_string().contains("requires infotheory feature"),
+            "unexpected error: {err}"
         );
     }
 }

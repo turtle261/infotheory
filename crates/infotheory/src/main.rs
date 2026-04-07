@@ -63,6 +63,8 @@ use std::time::{Duration, Instant};
 #[cfg(not(feature = "vm"))]
 use std::time::Instant;
 
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+use crate::cli::load_expert_spec;
 use crate::cli::{
     aiqi_backend_label, build_ctx, file_roundtrip_backend, load_mixture_spec,
     maybe_export_online_model, parse_compression_backend, parse_observation_key_mode_for_env,
@@ -72,12 +74,6 @@ use crate::cli::{
 };
 #[cfg(feature = "backend-sequitur")]
 use crate::cli::{bytes_to_hex, parse_hex_bytes};
-#[cfg(test)]
-use crate::cli::{
-    load_expert_spec, parse_observation_key_mode, parse_observation_key_mode_for_vm,
-    parse_observation_key_mode_str, parse_observation_stream_len,
-    parse_observation_stream_len_for_vm, process_json_line,
-};
 #[cfg(feature = "vm")]
 use crate::cli::{
     parse_nyx_actions, parse_nyx_environment_config, parse_nyx_filter,
@@ -85,41 +81,17 @@ use crate::cli::{
     parse_nyx_observation_stream_mode, parse_nyx_protocol_config, parse_nyx_reward_policy,
     parse_nyx_reward_shaping, parse_nyx_trace_config, parse_shared_memory_policy,
 };
+#[cfg(test)]
+use crate::cli::{
+    parse_observation_key_mode, parse_observation_key_mode_for_vm, parse_observation_key_mode_str,
+    parse_observation_stream_len, parse_observation_stream_len_for_vm, process_json_line,
+};
 #[cfg(feature = "backend-rosa")]
 use infotheory::search;
 
 #[track_caller]
 fn cli_unwrap<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
     result.unwrap_or_else(|err| panic!("{context} failed: {err}"))
-}
-
-fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
-    cli_unwrap(
-        try_entropy_rate_bytes(data, max_order),
-        "entropy_rate_bytes",
-    )
-}
-
-fn biased_entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
-    cli_unwrap(
-        try_biased_entropy_rate_bytes(data, max_order),
-        "biased_entropy_rate_bytes",
-    )
-}
-
-fn cross_entropy_rate_bytes(test_data: &[u8], train_data: &[u8], max_order: i64) -> f64 {
-    cli_unwrap(
-        try_cross_entropy_rate_bytes(test_data, train_data, max_order),
-        "cross_entropy_rate_bytes",
-    )
-}
-
-fn ncd_bytes(x: &[u8], y: &[u8], method: &str, variant: NcdVariant) -> f64 {
-    cli_unwrap(try_ncd_bytes(x, y, method, variant), "ncd_bytes")
-}
-
-fn ncd_paths(x: &str, y: &str, method: &str, variant: NcdVariant) -> f64 {
-    cli_unwrap(try_ncd_paths(x, y, method, variant), "ncd_paths")
 }
 
 fn ncd_bytes_backend(x: &[u8], y: &[u8], backend: &CompressionBackend, variant: NcdVariant) -> f64 {
@@ -309,17 +281,17 @@ impl AixiRunLogger {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 fn parse_mixture_kind(kind: &str) -> anyhow::Result<MixtureKind> {
     infotheory::api::parse_mixture_kind_name(kind).map_err(anyhow::Error::msg)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 fn parse_mixture_schedule(schedule: &str) -> anyhow::Result<MixtureScheduleMode> {
     infotheory::api::parse_mixture_schedule_name(schedule).map_err(anyhow::Error::msg)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 fn parse_mixture_spec_value(
     v: &serde_json::Value,
     base_dir: &Path,
@@ -328,7 +300,15 @@ fn parse_mixture_spec_value(
     infotheory::spec::parse_mixture_spec_value(v, base_dir, depth).map_err(anyhow::Error::msg)
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "default-backends",
+        feature = "all-backends",
+        feature = "backend-mamba",
+        feature = "backend-rwkv"
+    )
+))]
 fn parse_mixture_expert_value(
     v: &serde_json::Value,
     base_dir: &Path,
@@ -1653,13 +1633,44 @@ mod tests {
     use serde_json::json;
     #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
     use std::any::Any;
+    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
     use std::panic;
+    #[cfg(any(
+        feature = "default-backends",
+        feature = "all-backends",
+        feature = "backend-mamba",
+        feature = "backend-rwkv"
+    ))]
     use std::path::{Path, PathBuf};
+    #[cfg(any(
+        feature = "default-backends",
+        feature = "all-backends",
+        feature = "backend-mamba",
+        feature = "backend-rwkv"
+    ))]
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(any(
+        feature = "default-backends",
+        feature = "all-backends",
+        feature = "backend-mamba",
+        feature = "backend-rwkv"
+    ))]
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(any(
+        feature = "default-backends",
+        feature = "all-backends",
+        feature = "backend-mamba",
+        feature = "backend-rwkv"
+    ))]
     static TEMP_TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(any(
+        feature = "default-backends",
+        feature = "all-backends",
+        feature = "backend-mamba",
+        feature = "backend-rwkv"
+    ))]
     fn unique_temp_path(prefix: &str, suffix: &str) -> PathBuf {
         let counter = TEMP_TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -1681,6 +1692,7 @@ mod tests {
         assert!(matches!(out, CompressionBackend::Zpaq { method } if method == "5"));
     }
 
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
     fn file_roundtrip_backend_forces_rate_framed() {
         let b = CompressionBackend::Rate {
@@ -1720,8 +1732,23 @@ mod tests {
         }"#;
         let out = process_json_line(line);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("output should be json");
-        assert!(parsed.get("h0").and_then(|v| v.as_f64()).unwrap_or(-1.0) >= 0.0);
-        assert_eq!(parsed.get("len").and_then(|v| v.as_u64()), Some(12));
+        if cfg!(any(
+            feature = "backend-rosa",
+            feature = "backend-zpaq",
+            feature = "backend-ctw"
+        )) {
+            assert!(parsed.get("h0").and_then(|v| v.as_f64()).unwrap_or(-1.0) >= 0.0);
+            assert_eq!(parsed.get("len").and_then(|v| v.as_u64()), Some(12));
+        } else {
+            let err = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .expect("backend-free build should return structured batch error");
+            assert!(
+                err.contains("metrics failed") && err.contains("requires infotheory feature"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[cfg(feature = "backend-rwkv")]
@@ -1753,10 +1780,15 @@ mod tests {
 
     #[test]
     fn parse_backend_aliases_and_unknowns() {
+        #[cfg(feature = "backend-rosa")]
         assert_eq!(parse_rate_backend("rosa"), Some("rosaplus"));
+        #[cfg(feature = "backend-ctw")]
         assert_eq!(parse_rate_backend("facctw"), Some("fac-ctw"));
+        #[cfg(feature = "backend-match")]
         assert_eq!(parse_rate_backend("sparsematch"), Some("sparse-match"));
+        #[cfg(feature = "backend-ppmd")]
         assert_eq!(parse_rate_backend("ppm"), Some("ppmd"));
+        #[cfg(feature = "backend-calibrated")]
         assert_eq!(parse_rate_backend("cal"), Some("calibrated"));
         assert_eq!(parse_rate_backend("unknown"), None);
 
@@ -1775,6 +1807,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
     fn parse_mixture_expert_supports_calibrated_and_match_backends() {
         let base_dir = Path::new(".");
@@ -1799,6 +1832,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
     fn parse_mixture_expert_supports_sequitur_backend() {
         let base_dir = Path::new(".");
@@ -1873,6 +1907,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base_dir);
     }
 
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
     fn load_expert_spec_preserves_exact_ppmd_settings() {
         let expert_path = unique_temp_path("infotheory-expert-spec", ".json");
@@ -1901,6 +1936,7 @@ mod tests {
         let _ = std::fs::remove_file(&expert_path);
     }
 
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
     fn build_ctx_propagates_expert_spec_max_order_default() {
         let expert_path = unique_temp_path("infotheory-expert-spec-rosa", ".json");
@@ -1998,6 +2034,7 @@ mod tests {
         assert!(err.to_string().contains("conflicts"));
     }
 
+    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
     fn parse_mixture_kind_and_spec_validation() {
         assert_eq!(
