@@ -79,15 +79,15 @@ fn resolve_backend_name_from_registry(
     registry: &'static [crate::runtime::BackendDescriptor],
     input: &str,
 ) -> Option<BackendAvailability> {
+    const INTERNAL_MISMATCH_FEATURE: &str = "__internal-registry-mismatch__";
+
     let descriptor = crate::runtime::find_backend_descriptor_in_registry(registry, input)?;
     Some(if descriptor.enabled || descriptor.feature.is_none() {
         BackendAvailability::Enabled(descriptor.canonical)
     } else {
         BackendAvailability::Disabled {
             canonical: descriptor.canonical,
-            feature: descriptor
-                .feature
-                .expect("disabled backends must declare required feature"),
+            feature: descriptor.feature.unwrap_or(INTERNAL_MISMATCH_FEATURE),
         }
     })
 }

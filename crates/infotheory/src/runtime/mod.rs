@@ -142,11 +142,22 @@ pub(crate) fn find_backend_descriptor_in_registry(
 fn backend_descriptor_by_canonical(
     registry: &'static [BackendDescriptor],
     kind: &'static str,
-) -> &'static BackendDescriptor {
+) -> Option<&'static BackendDescriptor> {
     registry
         .iter()
         .find(|descriptor| descriptor.canonical == kind)
-        .unwrap_or_else(|| panic!("missing backend descriptor for canonical name '{kind}'"))
+}
+
+fn backend_descriptor_by_canonical_checked(
+    registry: &'static [BackendDescriptor],
+    kind: &'static str,
+    registry_name: &'static str,
+) -> Result<&'static BackendDescriptor, String> {
+    backend_descriptor_by_canonical(registry, kind).ok_or_else(|| {
+        format!(
+            "internal backend registry mismatch: canonical backend '{kind}' is missing from {registry_name}"
+        )
+    })
 }
 
 fn rate_backend_canonical_name(backend: &RateBackend) -> &'static str {
@@ -447,16 +458,23 @@ impl CompressionFactory for CompressionBackend {
     }
 }
 
-/// Return registry metadata for a concrete rate-backend spec.
-pub fn describe_rate_backend(backend: &RateBackend) -> &'static BackendDescriptor {
-    backend_descriptor_by_canonical(RATE_BACKEND_REGISTRY, rate_backend_canonical_name(backend))
+pub(crate) fn try_describe_rate_backend(
+    backend: &RateBackend,
+) -> Result<&'static BackendDescriptor, String> {
+    backend_descriptor_by_canonical_checked(
+        RATE_BACKEND_REGISTRY,
+        rate_backend_canonical_name(backend),
+        "RATE_BACKEND_REGISTRY",
+    )
 }
 
-/// Return registry metadata for a concrete compression-backend spec.
-pub fn describe_compression_backend(backend: &CompressionBackend) -> &'static BackendDescriptor {
-    backend_descriptor_by_canonical(
+pub(crate) fn try_describe_compression_backend(
+    backend: &CompressionBackend,
+) -> Result<&'static BackendDescriptor, String> {
+    backend_descriptor_by_canonical_checked(
         COMPRESSION_BACKEND_REGISTRY,
         compression_backend_canonical_name(backend),
+        "COMPRESSION_BACKEND_REGISTRY",
     )
 }
 
@@ -516,18 +534,28 @@ mod tests {
 
     #[test]
     fn describe_compression_backend_uses_canonical_lookup_not_positional_indices() {
-        let ac = describe_compression_backend(&CompressionBackend::Rate {
+        let ac = try_describe_compression_backend(&CompressionBackend::Rate {
             rate_backend: RateBackend::RosaPlus,
             coder: crate::coders::CoderType::AC,
             framing: crate::compression::FramingMode::Framed,
-        });
+        })
+        .expect("descriptor for rate-ac");
         assert_eq!(ac.canonical, "rate-ac");
 
-        let rans = describe_compression_backend(&CompressionBackend::Rate {
+        let rans = try_describe_compression_backend(&CompressionBackend::Rate {
             rate_backend: RateBackend::RosaPlus,
             coder: crate::coders::CoderType::RANS,
             framing: crate::compression::FramingMode::Framed,
-        });
+        })
+        .expect("descriptor for rate-rans");
         assert_eq!(rans.canonical, "rate-rans");
+    }
+
+    #[test]
+    fn missing_descriptor_reports_registry_mismatch_error() {
+        let err = backend_descriptor_by_canonical_checked(&[], "rosaplus", "RATE_BACKEND_REGISTRY")
+            .expect_err("missing descriptor should return an error");
+        assert!(err.contains("internal backend registry mismatch"));
+        assert!(err.contains("rosaplus"));
     }
 }

@@ -589,11 +589,15 @@ fn validate_mixture_spec_shallow(spec: &MixtureSpec) -> Result<(), String> {
 }
 
 fn validate_rate_backend_with_depth(backend: &RateBackend, depth: usize) -> Result<(), String> {
-    let descriptor = crate::runtime::describe_rate_backend(backend);
+    let descriptor = crate::runtime::try_describe_rate_backend(backend)
+        .map_err(|err| format!("{err} (while validating rate backend)"))?;
     if !descriptor.enabled {
-        let feature = descriptor
-            .feature
-            .expect("disabled backend descriptors must declare a required feature");
+        let Some(feature) = descriptor.feature else {
+            return Err(format!(
+                "internal backend registry mismatch: disabled backend '{}' is missing required feature metadata",
+                descriptor.canonical
+            ));
+        };
         return Err(format!(
             "backend '{}' requires infotheory feature '{}'",
             descriptor.canonical, feature
@@ -628,11 +632,15 @@ pub fn validate_rate_backend(backend: &RateBackend) -> InfotheoryResult<()> {
 
 /// Validate a compression backend, including nested rate-backed compressors.
 pub fn validate_compression_backend(backend: &CompressionBackend) -> InfotheoryResult<()> {
-    let descriptor = crate::runtime::describe_compression_backend(backend);
+    let descriptor = crate::runtime::try_describe_compression_backend(backend)
+        .map_err(InfotheoryError::invalid_backend_config)?;
     if !descriptor.enabled {
-        let feature = descriptor
-            .feature
-            .expect("disabled backend descriptors must declare a required feature");
+        let Some(feature) = descriptor.feature else {
+            return Err(InfotheoryError::invalid_backend_config(format!(
+                "internal backend registry mismatch: disabled compression backend '{}' is missing required feature metadata",
+                descriptor.canonical
+            )));
+        };
         return Err(InfotheoryError::invalid_backend_config(format!(
             "compression backend '{}' requires infotheory feature '{}'",
             descriptor.canonical, feature
