@@ -180,6 +180,7 @@ pub(crate) fn try_generate_rate_backend_chain(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn generate_rate_backend_chain(
     prefix_parts: &[&[u8]],
     bytes: usize,

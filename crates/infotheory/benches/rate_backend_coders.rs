@@ -2,8 +2,8 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend};
+use infotheory::coders::CoderType;
 use infotheory::compression::{FramingMode, compress_rate_bytes};
-use infotheory::rwkvzip::{self, OnlineConfig, OnlineTrainMode};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -11,6 +11,8 @@ const DATA_LEN: usize = 10 * 1024;
 const CTW_DEPTH: usize = 6;
 const MIX_ALPHA: f64 = 0.03;
 const MIX_DECAY: f64 = 0.995;
+const RWKV_BENCH_METHOD: &str =
+    "cfg:hidden=64,intermediate=64,layers=1,train=none,lr=0.0;policy:schedule=0..100:infer";
 
 fn bench_data() -> &'static [u8] {
     static DATA: OnceLock<Vec<u8>> = OnceLock::new();
@@ -61,37 +63,14 @@ fn particle_spec_from_example() -> ParticleSpec {
     }
 }
 
-fn rwkv_model_64x64() -> Arc<rwkvzip::Model> {
-    static MODEL: OnceLock<Arc<rwkvzip::Model>> = OnceLock::new();
-    MODEL
-        .get_or_init(|| {
-            let cfg = OnlineConfig {
-                hidden: 64,
-                intermediate: 64,
-                layers: 1,
-                train_mode: OnlineTrainMode::None,
-                seed: 7,
-                ..OnlineConfig::default()
-            };
-            let rwkv_cfg = cfg
-                .to_rwkv_config()
-                .expect("failed to build RWKV config for 64x64 benchmark model");
-            Arc::new(
-                rwkvzip::Model::new_random(rwkv_cfg, cfg.seed)
-                    .expect("failed to initialize random RWKV benchmark model"),
-            )
-        })
-        .clone()
-}
-
 fn individual_backends() -> Vec<(&'static str, RateBackend)> {
     vec![
         ("rosaplus-o-1", RateBackend::RosaPlus),
         ("ctw-d6", RateBackend::Ctw { depth: CTW_DEPTH }),
         (
             "rwkv64x64",
-            RateBackend::Rwkv7 {
-                model: rwkv_model_64x64(),
+            RateBackend::Rwkv7Method {
+                method: RWKV_BENCH_METHOD.to_string(),
             },
         ),
         (
@@ -117,8 +96,8 @@ fn mixture_backends() -> Vec<(&'static str, RateBackend)> {
     let ctw = make_expert("ctw", RateBackend::Ctw { depth: CTW_DEPTH });
     let rwkv = make_expert(
         "rwkv64x64",
-        RateBackend::Rwkv7 {
-            model: rwkv_model_64x64(),
+        RateBackend::Rwkv7Method {
+            method: RWKV_BENCH_METHOD.to_string(),
         },
     );
     let particle = make_expert(
@@ -167,10 +146,7 @@ fn bench_matrix(c: &mut Criterion) {
     let mut group = c.benchmark_group("rate_coders_individual");
     group.throughput(Throughput::Bytes(data.len() as u64));
 
-    for (label, coder) in [
-        ("ac", rwkvzip::CoderType::AC),
-        ("rans", rwkvzip::CoderType::RANS),
-    ] {
+    for (label, coder) in [("ac", CoderType::AC), ("rans", CoderType::RANS)] {
         for (backend_name, backend) in individual_backends() {
             group.bench_with_input(
                 BenchmarkId::new(format!("{label}/{backend_name}"), data.len()),
@@ -191,10 +167,7 @@ fn bench_matrix(c: &mut Criterion) {
     let mut mix_group = c.benchmark_group("rate_coders_mixtures");
     mix_group.throughput(Throughput::Bytes(data.len() as u64));
 
-    for (label, coder) in [
-        ("ac", rwkvzip::CoderType::AC),
-        ("rans", rwkvzip::CoderType::RANS),
-    ] {
+    for (label, coder) in [("ac", CoderType::AC), ("rans", CoderType::RANS)] {
         for (mix_name, backend) in mixture_backends() {
             mix_group.bench_with_input(
                 BenchmarkId::new(format!("{label}/{mix_name}"), data.len()),

@@ -679,14 +679,52 @@ impl TraceModel {
     }
 
     fn new(backend: &RateBackend, max_order: i64) -> Self {
-        match backend {
-            RateBackend::RosaPlus => {
+        match crate::runtime::rate_backend_trace_model_strategy(backend) {
+            crate::runtime::TraceModelStrategy::Rosa => {
                 let mut model = RosaPlus::new(max_order, false, 0, 42);
                 model.build_lm_full_bytes_no_finalize_endpos();
                 TraceModel::Rosa { model, max_order }
             }
-            #[cfg(feature = "backend-mamba")]
-            RateBackend::MambaMethod { method } => {
+            crate::runtime::TraceModelStrategy::PredictorBacked => {
+                TraceModel::predictor_backed(backend.clone())
+            }
+            crate::runtime::TraceModelStrategy::Ctw => {
+                let RateBackend::Ctw { depth } = backend else {
+                    unreachable!("trace-model strategy mismatch for ctw");
+                };
+                TraceModel::Ctw {
+                    tree: ContextTree::new(*depth),
+                }
+            }
+            crate::runtime::TraceModelStrategy::FacCtw => {
+                let RateBackend::FacCtw {
+                    base_depth,
+                    num_percept_bits: _,
+                    encoding_bits,
+                } = backend
+                else {
+                    unreachable!("trace-model strategy mismatch for fac-ctw");
+                };
+                let bits_per_symbol = (*encoding_bits).clamp(1, 8);
+                TraceModel::FacCtw {
+                    tree: FacContextTree::new(*base_depth, bits_per_symbol),
+                    bits_per_symbol,
+                }
+            }
+            crate::runtime::TraceModelStrategy::Zpaq => {
+                let RateBackend::Zpaq { method } = backend else {
+                    unreachable!("trace-model strategy mismatch for zpaq");
+                };
+                TraceModel::Zpaq {
+                    model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
+                }
+            }
+            crate::runtime::TraceModelStrategy::Mamba => {
+                let method = crate::runtime::rate_backend_method(
+                    backend,
+                    crate::runtime::MethodBackendKind::Mamba,
+                )
+                .expect("mamba trace strategy should expose a method");
                 let compressor = MambaCompressor::new_from_method(method)
                     .unwrap_or_else(|e| panic!("invalid mamba method for vm trace model: {e}"));
                 TraceModel::Mamba {
@@ -694,36 +732,17 @@ impl TraceModel {
                     primed: false,
                 }
             }
-            RateBackend::Rwkv7Method { method } => {
+            crate::runtime::TraceModelStrategy::Rwkv7 => {
+                let method = crate::runtime::rate_backend_method(
+                    backend,
+                    crate::runtime::MethodBackendKind::Rwkv7,
+                )
+                .expect("rwkv7 trace strategy should expose a method");
                 let compressor = Compressor::new_from_method(method)
                     .unwrap_or_else(|e| panic!("invalid rwkv7 method for vm trace model: {e}"));
                 TraceModel::Rwkv7 {
                     compressor,
                     primed: false,
-                }
-            }
-            RateBackend::Zpaq { method } => TraceModel::Zpaq {
-                model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
-            },
-            RateBackend::Mixture { .. }
-            | RateBackend::Particle { .. }
-            | RateBackend::Match { .. }
-            | RateBackend::SparseMatch { .. }
-            | RateBackend::Ppmd { .. }
-            | RateBackend::Sequitur { .. }
-            | RateBackend::Calibrated { .. } => TraceModel::predictor_backed(backend.clone()),
-            RateBackend::Ctw { depth } => TraceModel::Ctw {
-                tree: ContextTree::new(*depth),
-            },
-            RateBackend::FacCtw {
-                base_depth,
-                num_percept_bits: _,
-                encoding_bits,
-            } => {
-                let bits_per_symbol = (*encoding_bits).clamp(1, 8);
-                TraceModel::FacCtw {
-                    tree: FacContextTree::new(*base_depth, bits_per_symbol),
-                    bits_per_symbol,
                 }
             }
         }

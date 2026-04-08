@@ -1,5 +1,5 @@
 use infotheory::api::{
-    try_get_parallel_compressed_sizes_from_parallel_paths,
+    try_get_compressed_sizes_from_paths, try_get_parallel_compressed_sizes_from_parallel_paths,
     try_get_parallel_compressed_sizes_from_sequential_paths,
     try_get_sequential_compressed_sizes_from_parallel_paths,
     try_get_sequential_compressed_sizes_from_sequential_paths,
@@ -97,4 +97,8 @@ fn get_parallel_compressed_sizes_from_parallel_paths(
     threads: usize,
 ) -> Vec<u64> {
     try_get_parallel_compressed_sizes_from_parallel_paths(paths, method, threads).expect("sizes")
+}
+
+fn get_compressed_sizes_from_paths(paths: &[&str], method: &str) -> Vec<u64> {
+    try_get_compressed_sizes_from_paths(paths, method).expect("sizes")
 }

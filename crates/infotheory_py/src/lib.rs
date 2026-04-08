@@ -1474,18 +1474,7 @@ fn compression_backend_from_py(
 }
 
 fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
-    match backend {
-        CompressionBackend::Rate {
-            rate_backend,
-            coder,
-            ..
-        } => CompressionBackend::Rate {
-            rate_backend: rate_backend.clone(),
-            coder: *coder,
-            framing: infotheory::compression::FramingMode::Framed,
-        },
-        _ => backend.clone(),
-    }
+    infotheory::backends::normalize_file_roundtrip_backend(backend)
 }
 
 fn rate_backend_from_py(

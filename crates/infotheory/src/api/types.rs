@@ -393,6 +393,34 @@ impl Default for RateBackend {
 }
 
 impl RateBackend {
+    /// Stable internal backend identity.
+    pub(crate) fn kind(&self) -> crate::runtime::RateBackendKind {
+        match self {
+            RateBackend::RosaPlus => crate::runtime::RateBackendKind::RosaPlus,
+            RateBackend::Match { .. } => crate::runtime::RateBackendKind::Match,
+            RateBackend::SparseMatch { .. } => crate::runtime::RateBackendKind::SparseMatch,
+            RateBackend::Ppmd { .. } => crate::runtime::RateBackendKind::Ppmd,
+            RateBackend::Sequitur { .. } => crate::runtime::RateBackendKind::Sequitur,
+            #[cfg(feature = "backend-mamba")]
+            RateBackend::MambaMethod { .. } => crate::runtime::RateBackendKind::Mamba,
+            #[cfg(feature = "backend-rwkv")]
+            RateBackend::Rwkv7Method { .. } => crate::runtime::RateBackendKind::Rwkv7,
+            RateBackend::Zpaq { .. } => crate::runtime::RateBackendKind::Zpaq,
+            RateBackend::Mixture { .. } => crate::runtime::RateBackendKind::Mixture,
+            RateBackend::Particle { .. } => crate::runtime::RateBackendKind::Particle,
+            RateBackend::Calibrated { .. } => crate::runtime::RateBackendKind::Calibrated,
+            RateBackend::Ctw { .. } => crate::runtime::RateBackendKind::Ctw,
+            RateBackend::FacCtw { .. } => crate::runtime::RateBackendKind::FacCtw,
+        }
+    }
+
+    /// Canonical registry descriptor for this backend.
+    pub(crate) fn descriptor(
+        &self,
+    ) -> Result<&'static crate::runtime::RateBackendDescriptor, String> {
+        crate::runtime::describe_rate_backend_kind(self.kind())
+    }
+
     /// Serialize this backend into deterministic canonical JSON.
     pub fn to_canonical_json(&self) -> crate::spec::SpecResult<String> {
         crate::spec::rate_backend_to_canonical_json(self)
@@ -425,6 +453,26 @@ impl Default for CompressionBackend {
 }
 
 impl CompressionBackend {
+    /// Stable internal backend identity.
+    pub(crate) fn kind(&self) -> crate::runtime::CompressionBackendKind {
+        match self {
+            CompressionBackend::Zpaq { .. } => crate::runtime::CompressionBackendKind::Zpaq,
+            #[cfg(feature = "backend-rwkv")]
+            CompressionBackend::Rwkv7 { .. } => crate::runtime::CompressionBackendKind::Rwkv7,
+            CompressionBackend::Rate { coder, .. } => match coder {
+                crate::coders::CoderType::AC => crate::runtime::CompressionBackendKind::RateAc,
+                crate::coders::CoderType::RANS => crate::runtime::CompressionBackendKind::RateRans,
+            },
+        }
+    }
+
+    /// Canonical registry descriptor for this compression backend.
+    pub(crate) fn descriptor(
+        &self,
+    ) -> Result<&'static crate::runtime::CompressionBackendDescriptor, String> {
+        crate::runtime::describe_compression_backend_kind(self.kind())
+    }
+
     /// Serialize this backend into deterministic canonical JSON.
     pub fn to_canonical_json(&self) -> crate::spec::SpecResult<String> {
         crate::spec::compression_backend_to_canonical_json(self)

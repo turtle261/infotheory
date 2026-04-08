@@ -148,31 +148,59 @@ pub fn resolve_spec_path(base_dir: &Path, path: &str) -> PathBuf {
 }
 
 /// Resolve a rate backend alias and require that it is enabled in the current build.
-pub fn resolve_enabled_rate_backend_name(input: &str) -> SpecResult<&'static str> {
-    match crate::backends::resolve_rate_backend_name(input) {
-        Some(crate::backends::BackendAvailability::Enabled(name)) => Ok(name),
-        Some(crate::backends::BackendAvailability::Disabled { canonical, feature }) => {
-            Err(SpecError::new(format!(
-                "backend '{canonical}' requires infotheory feature '{feature}'"
-            )))
-        }
+fn resolve_enabled_rate_backend_kind(input: &str) -> SpecResult<crate::runtime::RateBackendKind> {
+    match crate::runtime::find_backend_descriptor_in_registry(
+        crate::runtime::RATE_BACKEND_REGISTRY,
+        input,
+    ) {
+        Some(descriptor) if descriptor.enabled => Ok(descriptor.kind),
+        Some(descriptor) => Err(SpecError::new(format!(
+            "backend '{}' requires infotheory feature '{}'",
+            descriptor.canonical,
+            descriptor
+                .feature
+                .unwrap_or("__internal-registry-mismatch__")
+        ))),
         None => Err(SpecError::new(format!("unknown backend '{input}'"))),
+    }
+}
+
+/// Resolve a rate backend alias and require that it is enabled in the current build.
+pub fn resolve_enabled_rate_backend_name(input: &str) -> SpecResult<&'static str> {
+    let kind = resolve_enabled_rate_backend_kind(input)?;
+    Ok(crate::runtime::describe_rate_backend_kind(kind)
+        .map_err(SpecError::new)?
+        .canonical)
+}
+
+/// Resolve a compression backend alias and require that it is enabled in the current build.
+fn resolve_enabled_compression_backend_kind(
+    input: &str,
+) -> SpecResult<crate::runtime::CompressionBackendKind> {
+    match crate::runtime::find_backend_descriptor_in_registry(
+        crate::runtime::COMPRESSION_BACKEND_REGISTRY,
+        input,
+    ) {
+        Some(descriptor) if descriptor.enabled => Ok(descriptor.kind),
+        Some(descriptor) => Err(SpecError::new(format!(
+            "compression backend '{}' requires infotheory feature '{}'",
+            descriptor.canonical,
+            descriptor
+                .feature
+                .unwrap_or("__internal-registry-mismatch__")
+        ))),
+        None => Err(SpecError::new(format!(
+            "unknown compression backend '{input}'"
+        ))),
     }
 }
 
 /// Resolve a compression backend alias and require that it is enabled in the current build.
 pub fn resolve_enabled_compression_backend_name(input: &str) -> SpecResult<&'static str> {
-    match crate::backends::resolve_compression_backend_name(input) {
-        Some(crate::backends::BackendAvailability::Enabled(name)) => Ok(name),
-        Some(crate::backends::BackendAvailability::Disabled { canonical, feature }) => {
-            Err(SpecError::new(format!(
-                "compression backend '{canonical}' requires infotheory feature '{feature}'"
-            )))
-        }
-        None => Err(SpecError::new(format!(
-            "unknown compression backend '{input}'"
-        ))),
-    }
+    let kind = resolve_enabled_compression_backend_kind(input)?;
+    Ok(crate::runtime::describe_compression_backend_kind(kind)
+        .map_err(SpecError::new)?
+        .canonical)
 }
 
 /// Load a plain JSON value from disk, resolving relative paths against `base_dir`.
@@ -448,7 +476,7 @@ pub fn mixture_expert_spec_to_json_value(
         object.insert("name".to_string(), serde_json::Value::String(name.clone()));
     }
     object.insert("log_prior".to_string(), serde_json::json!(spec.log_prior));
-    if spec.max_order >= 0 {
+    if spec.max_order >= 0 || matches!(spec.backend, RateBackend::RosaPlus) {
         object.insert("max_order".to_string(), serde_json::json!(spec.max_order));
     }
     Ok(value)
@@ -482,8 +510,9 @@ pub fn calibrated_spec_to_json_value(spec: &CalibratedSpec) -> SpecResult<serde_
 
 /// Serialize a `RateBackend` into the canonical JSON representation.
 pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_json::Value> {
+    let canonical = backend.descriptor().map_err(SpecError::new)?.canonical;
     match backend {
-        RateBackend::RosaPlus => Ok(serde_json::json!({ "kind": "rosaplus" })),
+        RateBackend::RosaPlus => Ok(serde_json::json!({ "kind": canonical })),
         RateBackend::Match {
             hash_bits,
             min_len,
@@ -491,7 +520,7 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
             base_mix,
             confidence_scale,
         } => Ok(serde_json::json!({
-            "kind": "match",
+            "kind": canonical,
             "hash_bits": hash_bits,
             "min_len": min_len,
             "max_len": max_len,
@@ -507,7 +536,7 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
             base_mix,
             confidence_scale,
         } => Ok(serde_json::json!({
-            "kind": "sparse-match",
+            "kind": canonical,
             "hash_bits": hash_bits,
             "min_len": min_len,
             "max_len": max_len,
@@ -517,42 +546,42 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
             "confidence_scale": confidence_scale,
         })),
         RateBackend::Ppmd { order, memory_mb } => Ok(serde_json::json!({
-            "kind": "ppmd",
+            "kind": canonical,
             "order": order,
             "memory_mb": memory_mb,
         })),
         RateBackend::Sequitur { context_bytes } => Ok(serde_json::json!({
-            "kind": "sequitur",
+            "kind": canonical,
             "context_bytes": context_bytes,
         })),
         #[cfg(feature = "backend-mamba")]
         RateBackend::MambaMethod { method } => Ok(serde_json::json!({
-            "kind": "mamba",
+            "kind": canonical,
             "method": method,
         })),
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7Method { method } => Ok(serde_json::json!({
-            "kind": "rwkv7",
+            "kind": canonical,
             "method": method,
         })),
         RateBackend::Zpaq { method } => Ok(serde_json::json!({
-            "kind": "zpaq",
+            "kind": canonical,
             "method": method,
         })),
         RateBackend::Mixture { spec } => Ok(serde_json::json!({
-            "kind": "mixture",
+            "kind": canonical,
             "spec": mixture_spec_to_json_value(spec.as_ref())?,
         })),
         RateBackend::Particle { spec } => Ok(serde_json::json!({
-            "kind": "particle",
+            "kind": canonical,
             "spec": particle_spec_to_json_value(spec.as_ref()),
         })),
         RateBackend::Calibrated { spec } => Ok(serde_json::json!({
-            "kind": "calibrated",
+            "kind": canonical,
             "spec": calibrated_spec_to_json_value(spec.as_ref())?,
         })),
         RateBackend::Ctw { depth } => Ok(serde_json::json!({
-            "kind": "ctw",
+            "kind": canonical,
             "depth": depth,
         })),
         RateBackend::FacCtw {
@@ -560,7 +589,7 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
             num_percept_bits,
             encoding_bits,
         } => Ok(serde_json::json!({
-            "kind": "fac-ctw",
+            "kind": canonical,
             "base_depth": base_depth,
             "num_percept_bits": num_percept_bits,
             "encoding_bits": encoding_bits,
@@ -572,14 +601,15 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
 pub fn compression_backend_to_json_value(
     backend: &CompressionBackend,
 ) -> SpecResult<serde_json::Value> {
+    let canonical = backend.descriptor().map_err(SpecError::new)?.canonical;
     match backend {
         CompressionBackend::Zpaq { method } => Ok(serde_json::json!({
-            "kind": "zpaq",
+            "kind": canonical,
             "method": method,
         })),
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { method, coder } => Ok(serde_json::json!({
-            "kind": "rwkv7",
+            "kind": canonical,
             "method": method,
             "coder": match coder {
                 crate::coders::CoderType::AC => "ac",
@@ -588,13 +618,10 @@ pub fn compression_backend_to_json_value(
         })),
         CompressionBackend::Rate {
             rate_backend,
-            coder,
+            coder: _,
             framing,
         } => Ok(serde_json::json!({
-            "kind": match coder {
-                crate::coders::CoderType::AC => "rate-ac",
-                crate::coders::CoderType::RANS => "rate-rans",
-            },
+            "kind": canonical,
             "rate_backend": rate_backend_to_json_value(rate_backend)?,
             "framing": framing_mode_name(*framing),
         })),
@@ -707,17 +734,17 @@ pub fn parse_rate_backend_json(
         .or_else(|| v["type"].as_str())
         .or_else(|| v["backend"].as_str())
         .ok_or_else(|| SpecError::new("backend spec missing 'kind'"))?;
-    let kind = resolve_enabled_rate_backend_name(raw_kind)?;
+    let kind = resolve_enabled_rate_backend_kind(raw_kind)?;
 
     match kind {
-        "rosaplus" => Ok(RateBackend::RosaPlus),
-        "ctw" => Ok(RateBackend::Ctw {
+        crate::runtime::RateBackendKind::RosaPlus => Ok(RateBackend::RosaPlus),
+        crate::runtime::RateBackendKind::Ctw => Ok(RateBackend::Ctw {
             depth: v["depth"]
                 .as_u64()
                 .or_else(|| v["ct_depth"].as_u64())
                 .unwrap_or(16) as usize,
         }),
-        "fac-ctw" => {
+        crate::runtime::RateBackendKind::FacCtw => {
             let base_depth = v["base_depth"]
                 .as_u64()
                 .or_else(|| v["ct_depth"].as_u64())
@@ -732,14 +759,14 @@ pub fn parse_rate_backend_json(
                 encoding_bits,
             })
         }
-        "match" => Ok(RateBackend::Match {
+        crate::runtime::RateBackendKind::Match => Ok(RateBackend::Match {
             hash_bits: v["hash_bits"].as_u64().unwrap_or(20) as usize,
             min_len: v["min_len"].as_u64().unwrap_or(4) as usize,
             max_len: v["max_len"].as_u64().unwrap_or(255) as usize,
             base_mix: v["base_mix"].as_f64().unwrap_or(0.02),
             confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
         }),
-        "sparse-match" => Ok(RateBackend::SparseMatch {
+        crate::runtime::RateBackendKind::SparseMatch => Ok(RateBackend::SparseMatch {
             hash_bits: v["hash_bits"].as_u64().unwrap_or(19) as usize,
             min_len: v["min_len"].as_u64().unwrap_or(3) as usize,
             max_len: v["max_len"].as_u64().unwrap_or(64) as usize,
@@ -748,19 +775,19 @@ pub fn parse_rate_backend_json(
             base_mix: v["base_mix"].as_f64().unwrap_or(0.05),
             confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
         }),
-        "ppmd" => Ok(RateBackend::Ppmd {
+        crate::runtime::RateBackendKind::Ppmd => Ok(RateBackend::Ppmd {
             order: v["order"].as_u64().unwrap_or(10) as usize,
             memory_mb: v["memory_mb"].as_u64().unwrap_or(64) as usize,
         }),
-        "sequitur" => Ok(RateBackend::Sequitur {
+        crate::runtime::RateBackendKind::Sequitur => Ok(RateBackend::Sequitur {
             context_bytes: v["context_bytes"].as_u64().unwrap_or(64) as usize,
         }),
-        "zpaq" => {
+        crate::runtime::RateBackendKind::Zpaq => {
             let method = v["method"].as_str().unwrap_or("2").to_string();
             validate_zpaq_rate_method(&method).map_err(|err| SpecError::new(err.to_string()))?;
             Ok(RateBackend::Zpaq { method })
         }
-        "mamba" => {
+        crate::runtime::RateBackendKind::Mamba => {
             #[cfg(feature = "backend-mamba")]
             {
                 if let Some(method) = v["method"].as_str().or_else(|| v["mamba_method"].as_str()) {
@@ -784,7 +811,7 @@ pub fn parse_rate_backend_json(
                 Err(SpecError::new("mamba backend disabled at compile time"))
             }
         }
-        "rwkv7" => {
+        crate::runtime::RateBackendKind::Rwkv7 => {
             #[cfg(feature = "backend-rwkv")]
             {
                 if let Some(method) = v["method"].as_str().or_else(|| v["rwkv_method"].as_str()) {
@@ -808,7 +835,7 @@ pub fn parse_rate_backend_json(
                 Err(SpecError::new("rwkv backend disabled at compile time"))
             }
         }
-        "mixture" => {
+        crate::runtime::RateBackendKind::Mixture => {
             let spec = if let Some(spec_v) = v.get("spec").filter(|value| value.is_object()) {
                 parse_mixture_spec_value(spec_v, base_dir, depth - 1)?
             } else if let Some(path) = v["spec_path"]
@@ -825,7 +852,7 @@ pub fn parse_rate_backend_json(
                 spec: Arc::new(spec),
             })
         }
-        "particle" => {
+        crate::runtime::RateBackendKind::Particle => {
             let spec = if let Some(spec_v) = v.get("spec").filter(|value| value.is_object()) {
                 parse_particle_spec_value(spec_v)?
             } else if let Some(path) = v["spec_path"]
@@ -844,7 +871,7 @@ pub fn parse_rate_backend_json(
                 spec: Arc::new(spec),
             })
         }
-        "calibrated" => {
+        crate::runtime::RateBackendKind::Calibrated => {
             let spec = if let Some(spec_v) = v.get("spec").filter(|value| value.is_object()) {
                 parse_calibrated_spec_value(spec_v, base_dir, depth - 1)?
             } else if let Some(path) = v["spec_path"]
@@ -861,9 +888,6 @@ pub fn parse_rate_backend_json(
                 spec: Arc::new(spec),
             })
         }
-        other => Err(SpecError::new(format!(
-            "unsupported backend kind '{other}'"
-        ))),
     }
 }
 
@@ -879,7 +903,7 @@ pub fn parse_compression_backend_json(
         .or_else(|| v["type"].as_str())
         .or_else(|| v["backend"].as_str())
         .ok_or_else(|| SpecError::new("compression backend spec missing 'kind'"))?;
-    let kind = resolve_enabled_compression_backend_name(raw_kind)?;
+    let kind = resolve_enabled_compression_backend_kind(raw_kind)?;
     let framing = v["framing"]
         .as_str()
         .map(|value| parse_framing_mode(Some(value)))
@@ -887,10 +911,11 @@ pub fn parse_compression_backend_json(
         .unwrap_or(default_framing);
 
     match kind {
-        "zpaq" => Ok(CompressionBackend::Zpaq {
+        crate::runtime::CompressionBackendKind::Zpaq => Ok(CompressionBackend::Zpaq {
             method: v["method"].as_str().unwrap_or("5").to_string(),
         }),
-        "rate-ac" | "rate-rans" => {
+        crate::runtime::CompressionBackendKind::RateAc
+        | crate::runtime::CompressionBackendKind::RateRans => {
             let rate_backend = if let Some(rate_backend_v) = v.get("rate_backend") {
                 parse_rate_backend_json(rate_backend_v, base_dir, MAX_MIXTURE_NESTING)?
             } else if let Some(backend_v) = v.get("backend_spec") {
@@ -898,7 +923,7 @@ pub fn parse_compression_backend_json(
             } else {
                 default_rate_backend.unwrap_or_default()
             };
-            let coder = if kind == "rate-ac" {
+            let coder = if kind == crate::runtime::CompressionBackendKind::RateAc {
                 crate::coders::CoderType::AC
             } else {
                 crate::coders::CoderType::RANS
@@ -909,7 +934,7 @@ pub fn parse_compression_backend_json(
                 framing,
             })
         }
-        "rwkv7" => {
+        crate::runtime::CompressionBackendKind::Rwkv7 => {
             #[cfg(feature = "backend-rwkv")]
             {
                 let coder = if let Some(value) = v["coder"].as_str() {
@@ -944,9 +969,6 @@ pub fn parse_compression_backend_json(
                 ))
             }
         }
-        other => Err(SpecError::new(format!(
-            "unsupported compression backend kind '{other}'"
-        ))),
     }
 }
 
@@ -1171,19 +1193,19 @@ pub fn parse_rate_backend_name_method(
     method: Option<&str>,
     options: &RateBackendShorthandOptions,
 ) -> SpecResult<RateBackend> {
-    let canonical = resolve_enabled_rate_backend_name(name)?;
+    let kind = resolve_enabled_rate_backend_kind(name)?;
     let method = method.filter(|value| !value.is_empty());
 
-    match canonical {
-        "rosaplus" => Ok(RateBackend::RosaPlus),
-        "match" => Ok(RateBackend::Match {
+    match kind {
+        crate::runtime::RateBackendKind::RosaPlus => Ok(RateBackend::RosaPlus),
+        crate::runtime::RateBackendKind::Match => Ok(RateBackend::Match {
             hash_bits: 20,
             min_len: 4,
             max_len: 255,
             base_mix: 0.02,
             confidence_scale: 1.0,
         }),
-        "sparse-match" => Ok(RateBackend::SparseMatch {
+        crate::runtime::RateBackendKind::SparseMatch => Ok(RateBackend::SparseMatch {
             hash_bits: 19,
             min_len: 3,
             max_len: 64,
@@ -1192,23 +1214,23 @@ pub fn parse_rate_backend_name_method(
             base_mix: 0.05,
             confidence_scale: 1.0,
         }),
-        "ppmd" => Ok(RateBackend::Ppmd {
+        crate::runtime::RateBackendKind::Ppmd => Ok(RateBackend::Ppmd {
             order: method
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(options.ppmd_order),
             memory_mb: options.ppmd_memory_mb,
         }),
-        "sequitur" => Ok(RateBackend::Sequitur {
+        crate::runtime::RateBackendKind::Sequitur => Ok(RateBackend::Sequitur {
             context_bytes: method
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(options.sequitur_context_bytes),
         }),
-        "ctw" => Ok(RateBackend::Ctw {
+        crate::runtime::RateBackendKind::Ctw => Ok(RateBackend::Ctw {
             depth: method
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(options.ctw_depth),
         }),
-        "fac-ctw" => {
+        crate::runtime::RateBackendKind::FacCtw => {
             let base_depth = method
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(options.fac_ctw_base_depth);
@@ -1218,14 +1240,14 @@ pub fn parse_rate_backend_name_method(
                 encoding_bits: options.fac_ctw_encoding_bits,
             })
         }
-        "zpaq" => {
+        crate::runtime::RateBackendKind::Zpaq => {
             let method = method
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| options.zpaq_method.clone());
             validate_zpaq_rate_method(&method).map_err(|err| SpecError::new(err.to_string()))?;
             Ok(RateBackend::Zpaq { method })
         }
-        "mamba" => {
+        crate::runtime::RateBackendKind::Mamba => {
             #[cfg(feature = "backend-mamba")]
             {
                 if let Some(method) = method {
@@ -1247,7 +1269,7 @@ pub fn parse_rate_backend_name_method(
                 Err(SpecError::new("mamba backend disabled at compile time"))
             }
         }
-        "rwkv7" => {
+        crate::runtime::RateBackendKind::Rwkv7 => {
             #[cfg(feature = "backend-rwkv")]
             {
                 if let Some(method) = method {
@@ -1269,7 +1291,7 @@ pub fn parse_rate_backend_name_method(
                 Err(SpecError::new("rwkv backend disabled at compile time"))
             }
         }
-        "mixture" => {
+        crate::runtime::RateBackendKind::Mixture => {
             let path = method.ok_or_else(|| {
                 SpecError::new("mixture backend requires a path to a MixtureSpec JSON file")
             })?;
@@ -1278,7 +1300,7 @@ pub fn parse_rate_backend_name_method(
                 spec: Arc::new(load_mixture_spec(full.to_string_lossy().as_ref())?),
             })
         }
-        "particle" => {
+        crate::runtime::RateBackendKind::Particle => {
             let spec = if let Some(path) = method {
                 let full = resolve_spec_path(&options.base_dir, path);
                 load_particle_spec(full.to_string_lossy().as_ref())?
@@ -1295,7 +1317,7 @@ pub fn parse_rate_backend_name_method(
                 spec: Arc::new(spec),
             })
         }
-        "calibrated" => {
+        crate::runtime::RateBackendKind::Calibrated => {
             let path = method.ok_or_else(|| {
                 SpecError::new("calibrated backend requires a path to a CalibratedSpec JSON file")
             })?;
@@ -1304,7 +1326,6 @@ pub fn parse_rate_backend_name_method(
                 spec: Arc::new(load_calibrated_spec(full.to_string_lossy().as_ref())?),
             })
         }
-        other => Err(SpecError::new(format!("unsupported backend '{other}'"))),
     }
 }
 
@@ -1316,30 +1337,30 @@ pub fn parse_compression_backend_name_method(
     rate_backend: Option<RateBackend>,
     options: &CompressionBackendShorthandOptions,
 ) -> SpecResult<CompressionBackend> {
-    let canonical = resolve_enabled_compression_backend_name(name)?;
+    let kind = resolve_enabled_compression_backend_kind(name)?;
     let method = method.filter(|value| !value.is_empty());
 
-    match canonical {
-        "zpaq" => Ok(CompressionBackend::Zpaq {
+    match kind {
+        crate::runtime::CompressionBackendKind::Zpaq => Ok(CompressionBackend::Zpaq {
             method: method
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| options.zpaq_method.clone()),
         }),
-        "rate-ac" => Ok(CompressionBackend::Rate {
+        crate::runtime::CompressionBackendKind::RateAc => Ok(CompressionBackend::Rate {
             rate_backend: rate_backend
                 .or_else(|| options.default_rate_backend.clone())
                 .unwrap_or_default(),
             coder: crate::coders::CoderType::AC,
             framing: options.default_framing,
         }),
-        "rate-rans" => Ok(CompressionBackend::Rate {
+        crate::runtime::CompressionBackendKind::RateRans => Ok(CompressionBackend::Rate {
             rate_backend: rate_backend
                 .or_else(|| options.default_rate_backend.clone())
                 .unwrap_or_default(),
             coder: crate::coders::CoderType::RANS,
             framing: options.default_framing,
         }),
-        "rwkv7" => {
+        crate::runtime::CompressionBackendKind::Rwkv7 => {
             #[cfg(feature = "backend-rwkv")]
             {
                 match method {
@@ -1374,18 +1395,261 @@ pub fn parse_compression_backend_name_method(
                 ))
             }
         }
-        other => Err(SpecError::new(format!(
-            "unsupported compression backend '{other}'"
-        ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
+    #[allow(unused_imports)]
     use super::*;
-    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
+    use crate::api::{
+        CalibratedSpec, CalibrationContextKind, CompressionBackend, MAX_MIXTURE_NESTING,
+        MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend,
+    };
+    #[cfg(any(
+        feature = "default-backends",
+        feature = "all-backends",
+        feature = "backend-rwkv",
+        feature = "backend-mamba"
+    ))]
     use crate::coders::CoderType;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn sample_self_contained_rate_backend(
+        kind: crate::runtime::RateBackendKind,
+    ) -> Option<RateBackend> {
+        match kind {
+            crate::runtime::RateBackendKind::RosaPlus => Some(RateBackend::RosaPlus),
+            crate::runtime::RateBackendKind::Ctw => Some(RateBackend::Ctw { depth: 8 }),
+            crate::runtime::RateBackendKind::FacCtw => Some(RateBackend::FacCtw {
+                base_depth: 8,
+                num_percept_bits: 8,
+                encoding_bits: 8,
+            }),
+            crate::runtime::RateBackendKind::Match => Some(RateBackend::Match {
+                hash_bits: 18,
+                min_len: 4,
+                max_len: 96,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            }),
+            crate::runtime::RateBackendKind::SparseMatch => Some(RateBackend::SparseMatch {
+                hash_bits: 17,
+                min_len: 3,
+                max_len: 48,
+                gap_min: 1,
+                gap_max: 2,
+                base_mix: 0.05,
+                confidence_scale: 1.0,
+            }),
+            crate::runtime::RateBackendKind::Ppmd => Some(RateBackend::Ppmd {
+                order: 6,
+                memory_mb: 16,
+            }),
+            crate::runtime::RateBackendKind::Sequitur => {
+                Some(RateBackend::Sequitur { context_bytes: 32 })
+            }
+            crate::runtime::RateBackendKind::Zpaq => Some(RateBackend::Zpaq {
+                method: "2".to_string(),
+            }),
+            crate::runtime::RateBackendKind::Particle => Some(RateBackend::Particle {
+                spec: Arc::new(ParticleSpec::default()),
+            }),
+            crate::runtime::RateBackendKind::Mixture
+            | crate::runtime::RateBackendKind::Calibrated => None,
+            #[cfg(feature = "backend-mamba")]
+            crate::runtime::RateBackendKind::Mamba => Some(RateBackend::MambaMethod {
+                method: "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+            }),
+            #[cfg(not(feature = "backend-mamba"))]
+            crate::runtime::RateBackendKind::Mamba => None,
+            #[cfg(feature = "backend-rwkv")]
+            crate::runtime::RateBackendKind::Rwkv7 => Some(RateBackend::Rwkv7Method {
+                method: "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer".to_string(),
+            }),
+            #[cfg(not(feature = "backend-rwkv"))]
+            crate::runtime::RateBackendKind::Rwkv7 => None,
+        }
+    }
+
+    fn sample_enabled_leaf_rate_backend() -> Option<RateBackend> {
+        crate::runtime::RATE_BACKEND_REGISTRY
+            .iter()
+            .filter(|descriptor| descriptor.enabled)
+            .find_map(|descriptor| sample_self_contained_rate_backend(descriptor.kind))
+    }
+
+    fn sample_roundtrip_rate_backends() -> Vec<RateBackend> {
+        let mut backends = Vec::new();
+        let leaf = sample_enabled_leaf_rate_backend();
+
+        for descriptor in crate::runtime::RATE_BACKEND_REGISTRY {
+            if !descriptor.enabled {
+                continue;
+            }
+
+            match descriptor.kind {
+                crate::runtime::RateBackendKind::Mixture => {
+                    if let Some(base) = leaf.clone() {
+                        backends.push(RateBackend::Mixture {
+                            spec: Arc::new(MixtureSpec::new(
+                                MixtureKind::Bayes,
+                                vec![MixtureExpertSpec {
+                                    name: Some("leaf".to_string()),
+                                    log_prior: 0.0,
+                                    max_order: -1,
+                                    backend: base,
+                                }],
+                            )),
+                        });
+                    }
+                }
+                crate::runtime::RateBackendKind::Calibrated => {
+                    if let Some(base) = leaf.clone() {
+                        backends.push(RateBackend::Calibrated {
+                            spec: Arc::new(CalibratedSpec {
+                                base,
+                                context: CalibrationContextKind::Text,
+                                bins: 17,
+                                learning_rate: 0.05,
+                                bias_clip: 3.0,
+                            }),
+                        });
+                    }
+                }
+                _ => {
+                    if let Some(backend) = sample_self_contained_rate_backend(descriptor.kind) {
+                        backends.push(backend);
+                    }
+                }
+            }
+        }
+
+        backends
+    }
+
+    fn sample_roundtrip_compression_backends() -> Vec<CompressionBackend> {
+        let mut backends = Vec::new();
+        let leaf = sample_enabled_leaf_rate_backend();
+
+        if cfg!(feature = "backend-zpaq") {
+            backends.push(CompressionBackend::Zpaq {
+                method: "5".to_string(),
+            });
+        }
+
+        if let Some(rate_backend) = leaf.clone() {
+            backends.push(CompressionBackend::Rate {
+                rate_backend: rate_backend.clone(),
+                coder: crate::coders::CoderType::AC,
+                framing: crate::compression::FramingMode::Raw,
+            });
+            backends.push(CompressionBackend::Rate {
+                rate_backend,
+                coder: crate::coders::CoderType::RANS,
+                framing: crate::compression::FramingMode::Framed,
+            });
+        }
+
+        #[cfg(feature = "backend-rwkv")]
+        {
+            let opts = CompressionBackendShorthandOptions {
+                default_framing: crate::compression::FramingMode::Raw,
+                ..Default::default()
+            };
+            let backend = parse_compression_backend_name_method(
+                "rwkv7",
+                Some(
+                    "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer",
+                ),
+                None,
+                &opts,
+            )
+            .expect("rwkv shorthand should parse");
+            backends.push(backend);
+        }
+
+        backends
+    }
+
+    #[test]
+    fn rate_backend_aliases_share_registry_resolution_and_feature_errors() {
+        for descriptor in crate::runtime::RATE_BACKEND_REGISTRY {
+            for alias in descriptor.aliases {
+                if descriptor.enabled {
+                    assert_eq!(
+                        resolve_enabled_rate_backend_name(alias)
+                            .expect("enabled alias should resolve"),
+                        descriptor.canonical
+                    );
+                } else {
+                    let err = resolve_enabled_rate_backend_name(alias)
+                        .expect_err("disabled alias should fail");
+                    let message = err.to_string();
+                    assert!(message.contains(descriptor.canonical));
+                    assert!(
+                        message.contains(descriptor.feature.expect("disabled feature metadata"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compression_backend_aliases_share_registry_resolution_and_feature_errors() {
+        for descriptor in crate::runtime::COMPRESSION_BACKEND_REGISTRY {
+            for alias in descriptor.aliases {
+                if descriptor.enabled {
+                    assert_eq!(
+                        resolve_enabled_compression_backend_name(alias)
+                            .expect("enabled alias should resolve"),
+                        descriptor.canonical
+                    );
+                } else {
+                    let err = resolve_enabled_compression_backend_name(alias)
+                        .expect_err("disabled alias should fail");
+                    let message = err.to_string();
+                    assert!(message.contains(descriptor.canonical));
+                    assert!(
+                        message.contains(descriptor.feature.expect("disabled feature metadata"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enabled_self_contained_rate_backends_validate_and_roundtrip() {
+        for backend in sample_roundtrip_rate_backends() {
+            crate::api::validate_rate_backend(&backend).expect("sample backend should validate");
+            let json = rate_backend_to_json_value(&backend).expect("serialize backend");
+            let reparsed = parse_rate_backend_json(&json, Path::new("."), MAX_MIXTURE_NESTING)
+                .expect("parse backend");
+            let roundtrip = rate_backend_to_json_value(&reparsed).expect("re-serialize backend");
+            assert_eq!(json, roundtrip);
+        }
+    }
+
+    #[test]
+    fn enabled_compression_parse_paths_validate_and_roundtrip() {
+        for backend in sample_roundtrip_compression_backends() {
+            crate::api::validate_compression_backend(&backend)
+                .expect("sample compression backend should validate");
+            let json =
+                compression_backend_to_json_value(&backend).expect("serialize compression backend");
+            let reparsed = parse_compression_backend_json(
+                &json,
+                Path::new("."),
+                None,
+                crate::compression::FramingMode::Framed,
+            )
+            .expect("parse compression backend");
+            let roundtrip = compression_backend_to_json_value(&reparsed)
+                .expect("re-serialize compression backend");
+            assert_eq!(json, roundtrip);
+        }
+    }
 
     #[cfg(any(feature = "default-backends", feature = "all-backends"))]
     #[test]
@@ -1575,6 +1839,39 @@ mod tests {
                 assert_eq!(framing, crate::compression::FramingMode::Raw);
             }
             _ => panic!("expected rate-coded RWKV backend"),
+        }
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn parse_compression_backend_json_wraps_mamba_cfg_rate_backend() {
+        let json = serde_json::json!({
+            "kind": "rate-ac",
+            "framing": "raw",
+            "rate_backend": {
+                "kind": "mamba",
+                "method": "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer"
+            }
+        });
+
+        let backend = parse_compression_backend_json(
+            &json,
+            Path::new("."),
+            None,
+            crate::compression::FramingMode::Framed,
+        )
+        .expect("parse mamba rate-coded compression backend json");
+
+        match backend {
+            CompressionBackend::Rate {
+                rate_backend: RateBackend::MambaMethod { .. },
+                coder,
+                framing,
+            } => {
+                assert_eq!(coder, CoderType::AC);
+                assert_eq!(framing, crate::compression::FramingMode::Raw);
+            }
+            _ => panic!("expected rate-coded mamba backend"),
         }
     }
 }

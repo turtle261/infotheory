@@ -3,18 +3,6 @@
 use super::types::{RateBackend, validate_rate_backend};
 use crate::error::{InfotheoryError, InfotheoryResult};
 
-#[cfg(feature = "backend-ctw")]
-use crate::backends::ctw::FacContextTree;
-#[cfg(feature = "backend-particle")]
-use crate::backends::particle::ParticleRuntime;
-#[cfg(feature = "backend-rosa")]
-use crate::backends::rosaplus::RosaPlus;
-#[cfg(feature = "backend-zpaq")]
-use crate::backends::zpaq_rate::ZpaqRateModel;
-#[cfg(feature = "backend-mamba")]
-use crate::with_mamba_method_tls;
-#[cfg(feature = "backend-rwkv")]
-use crate::with_rwkv_method_tls;
 use crate::{aligned_prefix, with_default_ctx};
 
 #[inline(always)]
@@ -104,145 +92,7 @@ pub fn try_entropy_rate_backend(
     max_order: i64,
     backend: &RateBackend,
 ) -> InfotheoryResult<f64> {
-    validate_rate_backend(backend)?;
-    Ok(match backend {
-        #[cfg(feature = "backend-rosa")]
-        RateBackend::RosaPlus => {
-            let mut m = RosaPlus::new(max_order, false, 0, 42);
-            m.predictive_entropy_rate(data)
-        }
-        #[cfg(not(feature = "backend-rosa"))]
-        RateBackend::RosaPlus => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'rosaplus' requires infotheory feature 'backend-rosa'".to_string(),
-            ));
-        }
-        RateBackend::Match { .. }
-        | RateBackend::SparseMatch { .. }
-        | RateBackend::Ppmd { .. }
-        | RateBackend::Sequitur { .. }
-        | RateBackend::Calibrated { .. } => {
-            crate::try_prequential_rate_backend(data, &[], max_order, backend)?
-        }
-        #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
-            c.cross_entropy(data).map_err(|e| {
-                InfotheoryError::runtime(format!("rwkv method entropy scoring failed: {e:#}"))
-            })
-        })?,
-        #[cfg(feature = "backend-mamba")]
-        RateBackend::MambaMethod { method } => with_mamba_method_tls(method, |c| {
-            c.cross_entropy(data).map_err(|e| {
-                InfotheoryError::runtime(format!("mamba method entropy scoring failed: {e:#}"))
-            })
-        })?,
-        #[cfg(feature = "backend-zpaq")]
-        RateBackend::Zpaq { method } => {
-            if data.is_empty() {
-                return Ok(0.0);
-            }
-            let mut model = ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
-            let bits = model.update_and_score(data);
-            bits / (data.len() as f64)
-        }
-        #[cfg(not(feature = "backend-zpaq"))]
-        RateBackend::Zpaq { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'zpaq' requires infotheory feature 'backend-zpaq'".to_string(),
-            ));
-        }
-        #[cfg(feature = "backend-mixture")]
-        RateBackend::Mixture { spec } => {
-            if data.is_empty() {
-                return Ok(0.0);
-            }
-            let experts = spec.build_experts();
-            let mut mix =
-                crate::mixture::build_mixture_runtime(spec.as_ref(), &experts).map_err(|e| {
-                    InfotheoryError::invalid_backend_config(format!("MixtureSpec invalid: {e}"))
-                })?;
-            mix.begin_stream(Some(data.len() as u64)).map_err(|e| {
-                InfotheoryError::runtime(format!("Mixture stream init failed: {e}"))
-            })?;
-            let mut bits = 0.0;
-            for &b in data {
-                bits -= mix.step(b) / std::f64::consts::LN_2;
-            }
-            mix.finish_stream().map_err(|e| {
-                InfotheoryError::runtime(format!("Mixture stream finalize failed: {e}"))
-            })?;
-            bits / (data.len() as f64)
-        }
-        #[cfg(not(feature = "backend-mixture"))]
-        RateBackend::Mixture { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'mixture' requires infotheory feature 'backend-mixture'".to_string(),
-            ));
-        }
-        #[cfg(feature = "backend-particle")]
-        RateBackend::Particle { spec } => {
-            if data.is_empty() {
-                return Ok(0.0);
-            }
-            let mut runtime = ParticleRuntime::new(spec.as_ref());
-            let mut bits = 0.0;
-            for &b in data {
-                bits -= runtime.step(b) / std::f64::consts::LN_2;
-            }
-            bits / (data.len() as f64)
-        }
-        #[cfg(not(feature = "backend-particle"))]
-        RateBackend::Particle { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'particle' requires infotheory feature 'backend-particle'".to_string(),
-            ));
-        }
-        #[cfg(feature = "backend-ctw")]
-        RateBackend::Ctw { depth } => {
-            if data.is_empty() {
-                return Ok(0.0);
-            }
-            let mut fac = FacContextTree::new(*depth, 8);
-            fac.reserve_for_symbols(data.len());
-            for &b in data {
-                fac.update_byte_msb(b);
-            }
-            let ln_p = fac.get_log_block_probability();
-            let bits = -ln_p / std::f64::consts::LN_2;
-            bits / (data.len() as f64)
-        }
-        #[cfg(not(feature = "backend-ctw"))]
-        RateBackend::Ctw { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'ctw' requires infotheory feature 'backend-ctw'".to_string(),
-            ));
-        }
-        #[cfg(feature = "backend-ctw")]
-        RateBackend::FacCtw {
-            base_depth,
-            num_percept_bits: _,
-            encoding_bits,
-        } => {
-            if data.is_empty() {
-                return Ok(0.0);
-            }
-            let bits_per_byte = (*encoding_bits).clamp(1, 8);
-            let mut fac = FacContextTree::new(*base_depth, bits_per_byte);
-            fac.reserve_for_symbols(data.len());
-            for &b in data {
-                fac.update_byte_lsb(b);
-            }
-            let ln_p = fac.get_log_block_probability();
-            let bits = -ln_p / std::f64::consts::LN_2;
-            bits / (data.len() as f64)
-        }
-        #[cfg(not(feature = "backend-ctw"))]
-        RateBackend::FacCtw { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'fac-ctw' requires infotheory feature 'backend-ctw'".to_string(),
-            ));
-        }
-    })
+    crate::runtime::try_entropy_rate_backend_direct(data, max_order, backend)
 }
 
 /// Fallible biased/plugin entropy rate of `data` using the explicit rate `backend`.
@@ -251,14 +101,10 @@ pub fn try_biased_entropy_rate_backend(
     max_order: i64,
     backend: &RateBackend,
 ) -> InfotheoryResult<f64> {
-    match backend {
-        #[cfg(feature = "backend-zpaq")]
-        RateBackend::Zpaq { .. } => Err(InfotheoryError::unsupported(
+    validate_rate_backend(backend)?;
+    match backend.kind() {
+        crate::runtime::RateBackendKind::Zpaq => Err(InfotheoryError::unsupported(
             "biased/plugin entropy is not supported for zpaq rate backends in 1.1.1",
-        )),
-        #[cfg(not(feature = "backend-zpaq"))]
-        RateBackend::Zpaq { .. } => Err(InfotheoryError::invalid_backend_config(
-            "backend 'zpaq' requires infotheory feature 'backend-zpaq'".to_string(),
         )),
         _ => crate::try_frozen_plugin_rate_backend(data, &[data], max_order, backend),
     }
@@ -271,24 +117,7 @@ pub fn try_cross_entropy_rate_backend(
     max_order: i64,
     backend: &RateBackend,
 ) -> InfotheoryResult<f64> {
-    validate_rate_backend(backend)?;
-    match backend {
-        #[cfg(feature = "backend-zpaq")]
-        RateBackend::Zpaq { method } => {
-            if test_data.is_empty() {
-                return Ok(0.0);
-            }
-            let mut model = ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
-            model.update_and_score(train_data);
-            let bits = model.update_and_score(test_data);
-            Ok(bits / (test_data.len() as f64))
-        }
-        #[cfg(not(feature = "backend-zpaq"))]
-        RateBackend::Zpaq { .. } => Err(InfotheoryError::invalid_backend_config(
-            "backend 'zpaq' requires infotheory feature 'backend-zpaq'".to_string(),
-        )),
-        _ => crate::try_frozen_plugin_rate_backend(test_data, &[train_data], max_order, backend),
-    }
+    crate::runtime::try_cross_entropy_rate_backend_direct(test_data, train_data, max_order, backend)
 }
 
 /// Fallible joint entropy rate `H(X,Y)` using an explicit `backend`.
@@ -298,171 +127,7 @@ pub fn try_joint_entropy_rate_backend(
     max_order: i64,
     backend: &RateBackend,
 ) -> InfotheoryResult<f64> {
-    validate_rate_backend(backend)?;
-    let (x, y) = aligned_prefix(x, y);
-    if x.is_empty() {
-        return Ok(0.0);
-    }
-    Ok(match backend {
-        #[cfg(feature = "backend-rosa")]
-        RateBackend::RosaPlus => {
-            let joint_symbols: Vec<u32> = (0..x.len())
-                .map(|i| (x[i] as u32) * 256 + (y[i] as u32))
-                .collect();
-            let mut m = RosaPlus::new(max_order, false, 0, 42);
-            m.entropy_rate_cps(&joint_symbols)
-        }
-        #[cfg(not(feature = "backend-rosa"))]
-        RateBackend::RosaPlus => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'rosaplus' requires infotheory feature 'backend-rosa'".to_string(),
-            ));
-        }
-        RateBackend::Match { .. }
-        | RateBackend::SparseMatch { .. }
-        | RateBackend::Ppmd { .. }
-        | RateBackend::Sequitur { .. }
-        | RateBackend::Calibrated { .. } => {
-            let mut joint = Vec::with_capacity(x.len() * 2);
-            for (&xb, &yb) in x.iter().zip(y.iter()) {
-                joint.push(xb);
-                joint.push(yb);
-            }
-            try_entropy_rate_backend(&joint, max_order, backend)? * 2.0
-        }
-        #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7Method { method } => with_rwkv_method_tls(method, |c| {
-            c.joint_cross_entropy_aligned_min(x, y).map_err(|e| {
-                InfotheoryError::runtime(format!("rwkv method joint-entropy scoring failed: {e:#}"))
-            })
-        })?,
-        #[cfg(feature = "backend-mamba")]
-        RateBackend::MambaMethod { method } => with_mamba_method_tls(method, |c| {
-            c.joint_cross_entropy_aligned_min(x, y).map_err(|e| {
-                InfotheoryError::runtime(format!(
-                    "mamba method joint-entropy scoring failed: {e:#}"
-                ))
-            })
-        })?,
-        #[cfg(feature = "backend-zpaq")]
-        RateBackend::Zpaq { method } => {
-            let mut joint = Vec::with_capacity(x.len() * 2);
-            for (&xb, &yb) in x.iter().zip(y.iter()) {
-                joint.push(xb);
-                joint.push(yb);
-            }
-            let mut model = ZpaqRateModel::new(method.clone(), 2f64.powi(-24));
-            let bits = model.update_and_score(&joint);
-            bits / (x.len() as f64)
-        }
-        #[cfg(not(feature = "backend-zpaq"))]
-        RateBackend::Zpaq { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'zpaq' requires infotheory feature 'backend-zpaq'".to_string(),
-            ));
-        }
-        #[cfg(feature = "backend-mixture")]
-        RateBackend::Mixture { spec } => {
-            let mut joint = Vec::with_capacity(x.len() * 2);
-            for (&xb, &yb) in x.iter().zip(y.iter()) {
-                joint.push(xb);
-                joint.push(yb);
-            }
-            let experts = spec.build_experts();
-            let mut mix =
-                crate::mixture::build_mixture_runtime(spec.as_ref(), &experts).map_err(|e| {
-                    InfotheoryError::invalid_backend_config(format!("MixtureSpec invalid: {e}"))
-                })?;
-            mix.begin_stream(Some(joint.len() as u64)).map_err(|e| {
-                InfotheoryError::runtime(format!("Mixture stream init failed: {e}"))
-            })?;
-            let mut bits = 0.0;
-            for &b in &joint {
-                bits -= mix.step(b) / std::f64::consts::LN_2;
-            }
-            mix.finish_stream().map_err(|e| {
-                InfotheoryError::runtime(format!("Mixture stream finalize failed: {e}"))
-            })?;
-            bits / (x.len() as f64)
-        }
-        #[cfg(not(feature = "backend-mixture"))]
-        RateBackend::Mixture { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'mixture' requires infotheory feature 'backend-mixture'".to_string(),
-            ));
-        }
-        #[cfg(feature = "backend-particle")]
-        RateBackend::Particle { spec } => {
-            let mut joint = Vec::with_capacity(x.len() * 2);
-            for (&xb, &yb) in x.iter().zip(y.iter()) {
-                joint.push(xb);
-                joint.push(yb);
-            }
-            let mut runtime = ParticleRuntime::new(spec.as_ref());
-            let mut bits = 0.0;
-            for &b in &joint {
-                bits -= runtime.step(b) / std::f64::consts::LN_2;
-            }
-            bits / (x.len() as f64)
-        }
-        #[cfg(not(feature = "backend-particle"))]
-        RateBackend::Particle { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'particle' requires infotheory feature 'backend-particle'".to_string(),
-            ));
-        }
-        #[cfg(feature = "backend-ctw")]
-        RateBackend::Ctw { depth } => {
-            let mut fac = FacContextTree::new(*depth, 16);
-            for k in 0..x.len() {
-                let bx = x[k];
-                let by = y[k];
-                for bit_idx in 0..8 {
-                    let bit_x = ((bx >> (7 - bit_idx)) & 1) == 1;
-                    let bit_y = ((by >> (7 - bit_idx)) & 1) == 1;
-                    fac.update(bit_x, bit_idx);
-                    fac.update(bit_y, bit_idx + 8);
-                }
-            }
-            let ln_p = fac.get_log_block_probability();
-            let bits = -ln_p / std::f64::consts::LN_2;
-            bits / (x.len() as f64)
-        }
-        #[cfg(not(feature = "backend-ctw"))]
-        RateBackend::Ctw { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'ctw' requires infotheory feature 'backend-ctw'".to_string(),
-            ));
-        }
-        #[cfg(feature = "backend-ctw")]
-        RateBackend::FacCtw {
-            base_depth,
-            num_percept_bits: _,
-            encoding_bits,
-        } => {
-            let bits_per_byte = (*encoding_bits).clamp(1, 8);
-            let mut fac = FacContextTree::new(*base_depth, bits_per_byte * 2);
-            for k in 0..x.len() {
-                let bx = x[k];
-                let by = y[k];
-                for i in 0..bits_per_byte {
-                    let bit_idx_x = i * 2;
-                    let bit_idx_y = bit_idx_x + 1;
-                    fac.update(((bx >> i) & 1) == 1, bit_idx_x);
-                    fac.update(((by >> i) & 1) == 1, bit_idx_y);
-                }
-            }
-            let ln_p = fac.get_log_block_probability();
-            let bits = -ln_p / std::f64::consts::LN_2;
-            bits / (x.len() as f64)
-        }
-        #[cfg(not(feature = "backend-ctw"))]
-        RateBackend::FacCtw { .. } => {
-            return Err(InfotheoryError::invalid_backend_config(
-                "backend 'fac-ctw' requires infotheory feature 'backend-ctw'".to_string(),
-            ));
-        }
-    })
+    crate::runtime::try_joint_entropy_rate_backend_direct(x, y, max_order, backend)
 }
 
 #[inline(always)]

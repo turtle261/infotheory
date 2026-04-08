@@ -1023,18 +1023,7 @@ pub(super) fn read_stdin_all_for_generate() -> Vec<u8> {
 }
 
 pub(super) fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
-    match backend {
-        CompressionBackend::Rate {
-            rate_backend,
-            coder,
-            ..
-        } => CompressionBackend::Rate {
-            rate_backend: rate_backend.clone(),
-            coder: *coder,
-            framing: infotheory::compression::FramingMode::Framed,
-        },
-        _ => backend.clone(),
-    }
+    infotheory::backends::normalize_file_roundtrip_backend(backend)
 }
 
 pub(super) fn maybe_export_online_model(
@@ -1051,17 +1040,16 @@ pub(super) fn maybe_export_online_model(
 
     #[cfg(feature = "backend-rwkv")]
     {
-        let rwkv_method = match &ctx.rate_backend {
-            RateBackend::Rwkv7Method { method } => Some(method.as_str()),
-            _ => match &ctx.compression_backend {
-                CompressionBackend::Rate {
-                    rate_backend: RateBackend::Rwkv7Method { method },
-                    ..
-                } => Some(method.as_str()),
-                CompressionBackend::Rwkv7 { method, .. } => Some(method.as_str()),
-                _ => None,
-            },
-        };
+        let rwkv_method = infotheory::backends::rate_backend_method_string(
+            &ctx.rate_backend,
+            infotheory::backends::MethodBackendFamily::Rwkv7,
+        )
+        .or_else(|| {
+            infotheory::backends::compression_backend_method_string(
+                &ctx.compression_backend,
+                infotheory::backends::MethodBackendFamily::Rwkv7,
+            )
+        });
         if let Some(method) = rwkv_method {
             let mut compressor = rwkvzip::Compressor::new_from_method(method)?;
             let _ = compressor.compress_size_chain(parts, infotheory::coders::CoderType::AC)?;
@@ -1072,16 +1060,16 @@ pub(super) fn maybe_export_online_model(
 
     #[cfg(feature = "backend-mamba")]
     {
-        let mamba_method = match &ctx.rate_backend {
-            RateBackend::MambaMethod { method } => Some(method.as_str()),
-            _ => match &ctx.compression_backend {
-                CompressionBackend::Rate {
-                    rate_backend: RateBackend::MambaMethod { method },
-                    ..
-                } => Some(method.as_str()),
-                _ => None,
-            },
-        };
+        let mamba_method = infotheory::backends::rate_backend_method_string(
+            &ctx.rate_backend,
+            infotheory::backends::MethodBackendFamily::Mamba,
+        )
+        .or_else(|| {
+            infotheory::backends::compression_backend_method_string(
+                &ctx.compression_backend,
+                infotheory::backends::MethodBackendFamily::Mamba,
+            )
+        });
         if let Some(method) = mamba_method {
             let mut compressor = mambazip::Compressor::new_from_method(method)?;
             let _ = compressor.compress_size_chain(parts, infotheory::coders::CoderType::AC)?;
