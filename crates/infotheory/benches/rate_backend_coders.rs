@@ -1,7 +1,9 @@
 #![cfg(feature = "backend-rwkv")]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend};
+use infotheory::api::{
+    CompiledRateBackend, MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend,
+};
 use infotheory::coders::CoderType;
 use infotheory::compression::{FramingMode, compress_rate_bytes};
 use std::sync::{Arc, OnceLock};
@@ -63,21 +65,28 @@ fn particle_spec_from_example() -> ParticleSpec {
     }
 }
 
-fn individual_backends() -> Vec<(&'static str, RateBackend)> {
+fn compile_rate_backend(backend: RateBackend) -> CompiledRateBackend {
+    backend.compile().expect("compile benchmark rate backend")
+}
+
+fn individual_backends() -> Vec<(&'static str, CompiledRateBackend)> {
     vec![
-        ("rosaplus-o-1", RateBackend::RosaPlus),
-        ("ctw-d6", RateBackend::Ctw { depth: CTW_DEPTH }),
+        ("rosaplus-o-1", compile_rate_backend(RateBackend::RosaPlus)),
+        (
+            "ctw-d6",
+            compile_rate_backend(RateBackend::Ctw { depth: CTW_DEPTH }),
+        ),
         (
             "rwkv64x64",
-            RateBackend::Rwkv7Method {
+            compile_rate_backend(RateBackend::Rwkv7Method {
                 method: RWKV_BENCH_METHOD.to_string(),
-            },
+            }),
         ),
         (
             "particle-like-example",
-            RateBackend::Particle {
+            compile_rate_backend(RateBackend::Particle {
                 spec: Arc::new(particle_spec_from_example()),
-            },
+            }),
         ),
     ]
 }
@@ -91,7 +100,7 @@ fn make_expert(name: &str, backend: RateBackend) -> MixtureExpertSpec {
     }
 }
 
-fn mixture_backends() -> Vec<(&'static str, RateBackend)> {
+fn mixture_backends() -> Vec<(&'static str, CompiledRateBackend)> {
     let rosa = make_expert("rosa", RateBackend::RosaPlus);
     let ctw = make_expert("ctw", RateBackend::Ctw { depth: CTW_DEPTH });
     let rwkv = make_expert(
@@ -112,9 +121,9 @@ fn mixture_backends() -> Vec<(&'static str, RateBackend)> {
         if matches!(kind, MixtureKind::FadingBayes) {
             spec = spec.with_decay(MIX_DECAY);
         }
-        RateBackend::Mixture {
+        compile_rate_backend(RateBackend::Mixture {
             spec: Arc::new(spec),
-        }
+        })
     };
 
     vec![

@@ -1,5 +1,6 @@
 use infotheory::api::{
-    MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend, try_entropy_rate_backend,
+    CompiledRateBackend, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend,
+    try_entropy_rate_backend,
 };
 use std::hint::black_box;
 use std::sync::Arc;
@@ -41,7 +42,7 @@ fn backend(kind: MixtureKind) -> RateBackend {
 }
 
 fn run_one(name: &str, kind: MixtureKind, bytes: &[u8]) {
-    let backend = backend(kind);
+    let backend = backend(kind).compile().expect("compile mixture backend");
 
     for _ in 0..WARMUP_ITERS {
         let h = entropy_rate_backend(bytes, -1, &backend);
@@ -75,6 +76,6 @@ fn main() {
     run_one("switch", MixtureKind::Switching, &bytes);
     run_one("bayes", MixtureKind::Bayes, &bytes);
 }
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
     try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
 }

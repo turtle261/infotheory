@@ -2,9 +2,18 @@
 
 use infotheory::api::{
     CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureScheduleMode,
-    MixtureSpec, RateBackend, try_entropy_rate_backend,
+    MixtureSpec, RateBackend, try_entropy_rate_backend as try_entropy_rate_backend_compiled,
 };
 use std::sync::Arc;
+
+fn try_entropy_rate_backend(
+    data: &[u8],
+    max_order: i64,
+    backend: &RateBackend,
+) -> Result<f64, String> {
+    let compiled = backend.compile().map_err(|err| err.to_string())?;
+    try_entropy_rate_backend_compiled(data, max_order, &compiled).map_err(|err| err.to_string())
+}
 
 #[test]
 fn mixture_single_expert_matches_backend() {

@@ -4,8 +4,7 @@
 //! for learning from history and predicting future symbols. Different implementations
 //! provide different complexity vs performance trade-offs.
 
-use crate::aixi::rate_backend::rate_backend_contains_zpaq;
-use crate::api::RateBackend;
+use crate::api::{CompiledRateBackend, RateBackend};
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{ContextTree, FacContextTree};
 #[cfg(feature = "backend-rosa")]
@@ -433,7 +432,7 @@ impl Predictor for ZpaqPredictor {
 /// workspace-wide rate backend abstraction. It prioritizes correctness and
 /// backend coverage over rollback efficiency.
 pub struct RateBackendBitPredictor {
-    backend: RateBackend,
+    backend: CompiledRateBackend,
     max_order: i64,
     min_prob: f64,
     predictor: RateBackendPredictor,
@@ -471,7 +470,22 @@ impl RateBackendBitPredictor {
         max_order: i64,
         min_prob: f64,
     ) -> Result<Self, String> {
-        if rate_backend_contains_zpaq(&backend) {
+        let compiled = backend.compile().map_err(|err| err.to_string())?;
+        Self::from_compiled_with_min_prob(compiled, max_order, min_prob)
+    }
+
+    /// Create a new bit-level adapter from a compiled rate backend.
+    pub fn from_compiled(backend: CompiledRateBackend, max_order: i64) -> Result<Self, String> {
+        Self::from_compiled_with_min_prob(backend, max_order, DEFAULT_MIN_PROB)
+    }
+
+    /// Create a new bit-level adapter from a compiled backend and explicit probability floor.
+    pub fn from_compiled_with_min_prob(
+        backend: CompiledRateBackend,
+        max_order: i64,
+        min_prob: f64,
+    ) -> Result<Self, String> {
+        if backend.contains_zpaq() {
             return Err(
                 "RateBackendBitPredictor does not support zpaq backends; use a non-zpaq rate_backend"
                     .to_string(),
@@ -601,7 +615,7 @@ impl Predictor for RateBackendBitPredictor {
     fn model_name(&self) -> String {
         format!(
             "RateBackendBits({})",
-            RateBackendPredictor::default_name(&self.backend, self.max_order)
+            self.backend.default_name(self.max_order)
         )
     }
 
@@ -642,8 +656,14 @@ impl RwkvPredictor {
 
     /// Creates a new `RwkvPredictor` from a method string.
     pub fn from_method(method: &str) -> Result<Self, String> {
+        let spec = crate::rwkvzip::parse_method_spec(method).map_err(|err| err.to_string())?;
+        Self::from_method_spec(&spec)
+    }
+
+    /// Creates a new `RwkvPredictor` from a parsed method spec.
+    pub fn from_method_spec(method: &crate::rwkvzip::MethodSpec) -> Result<Self, String> {
         let mut compressor =
-            RwkvCompressor::new_from_method(method).map_err(|err| err.to_string())?;
+            RwkvCompressor::new_from_method_spec(method).map_err(|err| err.to_string())?;
         compressor.forward_to_internal_pdf(0);
         Ok(Self {
             compressor,
@@ -727,8 +747,14 @@ impl MambaPredictor {
 
     /// Creates a new `MambaPredictor` from a method string.
     pub fn from_method(method: &str) -> Result<Self, String> {
+        let spec = crate::mambazip::parse_method_spec(method).map_err(|err| err.to_string())?;
+        Self::from_method_spec(&spec)
+    }
+
+    /// Creates a new `MambaPredictor` from a parsed method spec.
+    pub fn from_method_spec(method: &crate::mambazip::MethodSpec) -> Result<Self, String> {
         let mut compressor =
-            MambaCompressor::new_from_method(method).map_err(|err| err.to_string())?;
+            MambaCompressor::new_from_method_spec(method).map_err(|err| err.to_string())?;
         let mut pdf = vec![0.0f64; compressor.vocab_size()];
         compressor.forward_to_pdf(0, &mut pdf);
         compressor.pdf_buffer.clone_from(&pdf);

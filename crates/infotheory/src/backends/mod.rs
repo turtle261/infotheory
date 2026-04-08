@@ -40,6 +40,7 @@ pub mod text_context;
 #[cfg(feature = "backend-zpaq")]
 pub mod zpaq_rate;
 use crate::coders::CoderType;
+use std::sync::Arc;
 
 /// Outcome of resolving a backend alias to a canonical backend name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +137,46 @@ pub fn normalize_file_roundtrip_backend(
     }
 }
 
+/// Normalize a compiled compression backend for file roundtrip helpers.
+pub fn normalize_file_roundtrip_compiled_backend(
+    backend: &crate::spec::CompiledCompressionBackend,
+) -> crate::spec::CompiledCompressionBackend {
+    match backend.plan() {
+        crate::spec::core::CompressionBackendPlan::Rate {
+            rate_backend,
+            coder,
+            ..
+        } => crate::spec::core::compiled_compression_backend_from_plan(Arc::new(
+            crate::spec::core::CompressionBackendPlan::Rate {
+                rate_backend: rate_backend.clone(),
+                coder: *coder,
+                framing: crate::compression::FramingMode::Framed,
+            },
+        ))
+        .expect(
+            "compiled rate-coded backend should remain valid when normalized for file roundtrip",
+        ),
+        _ => backend.clone(),
+    }
+}
+
+fn rate_backend_plan_method_string(
+    plan: &crate::spec::core::RateBackendPlan,
+    family: MethodBackendFamily,
+) -> Option<&str> {
+    match (family, plan) {
+        #[cfg(feature = "backend-rwkv")]
+        (MethodBackendFamily::Rwkv7, crate::spec::core::RateBackendPlan::Rwkv7 { method, .. }) => {
+            Some(method.as_str())
+        }
+        #[cfg(feature = "backend-mamba")]
+        (MethodBackendFamily::Mamba, crate::spec::core::RateBackendPlan::Mamba { method, .. }) => {
+            Some(method.as_str())
+        }
+        _ => None,
+    }
+}
+
 /// Extract a method string from a rate backend when it belongs to a method-backed family.
 pub fn rate_backend_method_string(
     backend: &crate::api::RateBackend,
@@ -154,6 +195,14 @@ pub fn rate_backend_method_string(
     }
 }
 
+/// Extract a method string from a compiled rate backend when it belongs to a method-backed family.
+pub fn rate_backend_method_string_compiled(
+    backend: &crate::spec::CompiledRateBackend,
+    family: MethodBackendFamily,
+) -> Option<&str> {
+    rate_backend_plan_method_string(backend.plan(), family)
+}
+
 /// Extract a method string from a compression backend or its wrapped rate backend.
 pub fn compression_backend_method_string(
     backend: &crate::api::CompressionBackend,
@@ -166,6 +215,24 @@ pub fn compression_backend_method_string(
         }
         (_, crate::api::CompressionBackend::Rate { rate_backend, .. }) => {
             rate_backend_method_string(rate_backend, family)
+        }
+        _ => None,
+    }
+}
+
+/// Extract a method string from a compiled compression backend or its wrapped rate backend.
+pub fn compression_backend_method_string_compiled(
+    backend: &crate::spec::CompiledCompressionBackend,
+    family: MethodBackendFamily,
+) -> Option<&str> {
+    match (family, backend.plan()) {
+        #[cfg(feature = "backend-rwkv")]
+        (
+            MethodBackendFamily::Rwkv7,
+            crate::spec::core::CompressionBackendPlan::Rwkv7 { method, .. },
+        ) => Some(method.as_str()),
+        (_, crate::spec::core::CompressionBackendPlan::Rate { rate_backend, .. }) => {
+            rate_backend_plan_method_string(rate_backend.as_ref(), family)
         }
         _ => None,
     }
@@ -364,6 +431,74 @@ mod tests {
             crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
             _ => panic!("expected zpaq backend to remain unchanged"),
         }
+    }
+
+    #[test]
+    fn normalize_file_roundtrip_compiled_backend_forces_framed_rate_payloads() {
+        let rate = crate::api::CompressionBackend::Rate {
+            rate_backend: crate::api::RateBackend::default(),
+            coder: CoderType::RANS,
+            framing: crate::compression::FramingMode::Raw,
+        }
+        .compile()
+        .expect("compiled rate backend");
+        let normalized = normalize_file_roundtrip_compiled_backend(&rate);
+        match normalized.canonical_spec() {
+            crate::api::CompressionBackend::Rate { coder, framing, .. } => {
+                assert_eq!(*coder, CoderType::RANS);
+                assert_eq!(*framing, crate::compression::FramingMode::Framed);
+            }
+            _ => panic!("expected normalized compiled rate backend"),
+        }
+
+        let zpaq = crate::api::CompressionBackend::Zpaq {
+            method: "5".to_string(),
+        }
+        .compile()
+        .expect("compiled zpaq");
+        match normalize_file_roundtrip_compiled_backend(&zpaq).canonical_spec() {
+            crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
+            _ => panic!("expected compiled zpaq backend to remain unchanged"),
+        }
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn compiled_method_string_helpers_reuse_compiled_specs() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
+        let rate = crate::api::RateBackend::Rwkv7Method {
+            method: method.to_string(),
+        }
+        .compile()
+        .expect("compiled rwkv rate backend");
+        let crate::api::RateBackend::Rwkv7Method {
+            method: canonical_rate,
+        } = rate.canonical_spec()
+        else {
+            panic!("expected canonical rwkv7 rate backend");
+        };
+        assert_eq!(
+            rate_backend_method_string_compiled(&rate, MethodBackendFamily::Rwkv7),
+            Some(canonical_rate.as_str())
+        );
+
+        let compression = crate::api::CompressionBackend::Rwkv7 {
+            method: method.to_string(),
+            coder: CoderType::AC,
+        }
+        .compile()
+        .expect("compiled rwkv compression backend");
+        let crate::api::CompressionBackend::Rwkv7 {
+            method: canonical_compression,
+            ..
+        } = compression.canonical_spec()
+        else {
+            panic!("expected canonical rwkv7 compression backend");
+        };
+        assert_eq!(
+            compression_backend_method_string_compiled(&compression, MethodBackendFamily::Rwkv7),
+            Some(canonical_compression.as_str())
+        );
     }
 
     #[cfg(feature = "backend-rwkv")]

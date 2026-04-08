@@ -8,7 +8,7 @@ fn api_surface_rate_backend_session_rejects_invalid_programmatic_mixture() {
     let backend = RateBackend::Mixture {
         spec: Arc::new(MixtureSpec::new(MixtureKind::Bayes, vec![])),
     };
-    let err = match RateBackendSession::from_backend(backend, -1, None) {
+    let err = match RateBackendSession::from_spec(backend, -1, None) {
         Ok(_) => panic!("invalid mixture backend should be rejected before runtime construction"),
         Err(err) => err,
     };
@@ -69,26 +69,31 @@ mod ctw_surface {
         let x = b"alpha beta alpha beta alpha";
         let y = b"alpha gamma alpha gamma alpha";
         let backend = RateBackend::Ctw { depth: 8 };
+        let compiled = backend.compile().expect("compiled ctw backend");
 
         let prev = get_default_ctx();
-        set_default_ctx(InfotheoryCtx::new(
-            backend.clone(),
-            CompressionBackend::default(),
-        ));
+        set_default_ctx(
+            InfotheoryCtx::from_specs(backend.clone(), CompressionBackend::default())
+                .expect("ctw context"),
+        );
 
-        assert!(try_entropy_rate_backend(x, -1, &backend).expect("entropy rate") >= 0.0);
+        assert!(try_entropy_rate_backend(x, -1, &compiled).expect("entropy rate") >= 0.0);
         assert!(
-            try_biased_entropy_rate_backend(x, -1, &backend).expect("biased entropy rate") >= 0.0
+            try_biased_entropy_rate_backend(x, -1, &compiled).expect("biased entropy rate") >= 0.0
         );
         assert!(
-            try_cross_entropy_rate_backend(x, y, -1, &backend).expect("cross entropy rate") >= 0.0
+            try_cross_entropy_rate_backend(x, y, -1, &compiled).expect("cross entropy rate") >= 0.0
         );
         assert!(
-            try_joint_entropy_rate_backend(x, y, -1, &backend).expect("joint entropy rate") >= 0.0
+            try_joint_entropy_rate_backend(x, y, -1, &compiled).expect("joint entropy rate") >= 0.0
         );
-        assert!(try_mutual_information_rate_backend(x, y, -1, &backend).expect("mi rate") >= 0.0);
-        assert!((0.0..=1.0).contains(&try_ned_rate_backend(x, y, -1, &backend).expect("ned rate")));
-        assert!((0.0..=2.0).contains(&try_nte_rate_backend(x, y, -1, &backend).expect("nte rate")));
+        assert!(try_mutual_information_rate_backend(x, y, -1, &compiled).expect("mi rate") >= 0.0);
+        assert!(
+            (0.0..=1.0).contains(&try_ned_rate_backend(x, y, -1, &compiled).expect("ned rate"))
+        );
+        assert!(
+            (0.0..=2.0).contains(&try_nte_rate_backend(x, y, -1, &compiled).expect("nte rate"))
+        );
 
         assert!(marginal_entropy_bytes(x) >= 0.0);
         assert!(joint_marginal_entropy_bytes(x, y) >= 0.0);
@@ -148,7 +153,8 @@ mod rosa_surface {
     fn api_surface_generation_session_and_config_are_callable() {
         let prompt = b"If a frog is green, dogs are red.\nIf a toad is green, cats are red.\nIf a dog is green, frogs are red.\nIf a cat is green, toads are red.\nIf a frog is red, dogs are green.\nIf a toad is red, cats are green.\nIf a dog is red, frogs are green.\nIf a cat is red, toads are ";
         let backend = RateBackend::RosaPlus;
-        let ctx = InfotheoryCtx::new(backend.clone(), CompressionBackend::default());
+        let ctx =
+            InfotheoryCtx::from_specs(backend.clone(), CompressionBackend::default()).expect("ctx");
         let cfg = GenerationConfig::sampled_frozen(42);
 
         let direct = ctx
@@ -156,12 +162,9 @@ mod rosa_surface {
             .expect("direct generation");
         assert_eq!(direct.len(), 8);
 
-        let mut session = RateBackendSession::from_backend(
-            backend,
-            -1,
-            Some((prompt.len() + direct.len()) as u64),
-        )
-        .expect("session init");
+        let mut session =
+            RateBackendSession::from_spec(backend, -1, Some((prompt.len() + direct.len()) as u64))
+                .expect("session init");
         session.observe(prompt);
         let from_session = session.generate_bytes(8, cfg);
         session.finish().expect("session finish");
@@ -227,15 +230,16 @@ mod zpaq_surface {
         let backend = CompressionBackend::Zpaq {
             method: "1".to_string(),
         };
+        let compiled = backend.compile().expect("compiled zpaq backend");
 
-        assert!(try_compress_size_backend(x, &backend).expect("fallible zpaq size") > 0);
+        assert!(try_compress_size_backend(x, &compiled).expect("fallible zpaq size") > 0);
         assert!(
-            try_compress_size_chain_backend(&[x.as_slice(), y.as_slice()], &backend)
+            try_compress_size_chain_backend(&[x.as_slice(), y.as_slice()], &compiled)
                 .expect("fallible chain size")
                 > 0
         );
-        let c = try_compress_bytes_backend(x, &backend).expect("zpaq compress");
-        let d = try_decompress_bytes_backend(&c, &backend).expect("zpaq decompress");
+        let c = try_compress_bytes_backend(x, &compiled).expect("zpaq compress");
+        let d = try_decompress_bytes_backend(&c, &compiled).expect("zpaq decompress");
         assert_eq!(d, x);
 
         assert!(try_get_compressed_size(&sx, "1").expect("fallible file size") > 0);
@@ -264,7 +268,7 @@ mod zpaq_surface {
         }
 
         assert!(
-            try_ncd_bytes_backend(x, y, &backend, NcdVariant::Vitanyi).expect("fallible ncd")
+            try_ncd_bytes_backend(x, y, &compiled, NcdVariant::Vitanyi).expect("fallible ncd")
                 >= 0.0
         );
         assert!(try_ncd_bytes(x, y, "1", NcdVariant::Vitanyi).expect("ncd bytes") >= 0.0);
@@ -272,7 +276,7 @@ mod zpaq_surface {
             try_ncd_bytes_default(x, y, NcdVariant::SymVitanyi).expect("ncd bytes default") >= 0.0
         );
         assert!(
-            try_ncd_bytes_backend(x, y, &backend, NcdVariant::Cons).expect("ncd bytes backend")
+            try_ncd_bytes_backend(x, y, &compiled, NcdVariant::Cons).expect("ncd bytes backend")
                 >= 0.0
         );
         assert!(try_ncd_paths(&sx, &sy, "1", NcdVariant::SymCons).expect("ncd paths") >= 0.0);

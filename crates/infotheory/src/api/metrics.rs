@@ -1,7 +1,7 @@
 //! Information-theoretic metric and scoring API surface.
 
-use super::types::{RateBackend, validate_rate_backend};
 use crate::error::{InfotheoryError, InfotheoryResult};
+use crate::spec::CompiledRateBackend;
 
 use crate::{aligned_prefix, with_default_ctx};
 
@@ -24,7 +24,7 @@ pub fn try_mutual_information_rate_backend(
     x: &[u8],
     y: &[u8],
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     let (x, y) = aligned_prefix(x, y);
     if x.is_empty() {
@@ -43,7 +43,7 @@ pub fn try_ned_rate_backend(
     x: &[u8],
     y: &[u8],
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     let (x, y) = aligned_prefix(x, y);
     if x.is_empty() {
@@ -68,7 +68,7 @@ pub fn try_nte_rate_backend(
     x: &[u8],
     y: &[u8],
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     let (x, y) = aligned_prefix(x, y);
     if x.is_empty() {
@@ -90,7 +90,7 @@ pub fn try_nte_rate_backend(
 pub fn try_entropy_rate_backend(
     data: &[u8],
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     crate::runtime::try_entropy_rate_backend_direct(data, max_order, backend)
 }
@@ -99,14 +99,14 @@ pub fn try_entropy_rate_backend(
 pub fn try_biased_entropy_rate_backend(
     data: &[u8],
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    validate_rate_backend(backend)?;
-    match backend.kind() {
-        crate::runtime::RateBackendKind::Zpaq => Err(InfotheoryError::unsupported(
+    if !backend.capabilities().supports_biased_entropy {
+        Err(InfotheoryError::unsupported(
             "biased/plugin entropy is not supported for zpaq rate backends in 1.1.1",
-        )),
-        _ => crate::try_frozen_plugin_rate_backend(data, &[data], max_order, backend),
+        ))
+    } else {
+        crate::try_frozen_plugin_rate_backend(data, &[data], max_order, backend)
     }
 }
 
@@ -115,7 +115,7 @@ pub fn try_cross_entropy_rate_backend(
     test_data: &[u8],
     train_data: &[u8],
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     crate::runtime::try_cross_entropy_rate_backend_direct(test_data, train_data, max_order, backend)
 }
@@ -125,7 +125,7 @@ pub fn try_joint_entropy_rate_backend(
     x: &[u8],
     y: &[u8],
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     crate::runtime::try_joint_entropy_rate_backend_direct(x, y, max_order, backend)
 }

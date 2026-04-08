@@ -1,5 +1,8 @@
-use crate::api::{InfotheoryCtx, RateBackend, marginal_entropy_bytes, try_cross_entropy_bytes};
+use crate::api::{InfotheoryCtx, marginal_entropy_bytes, try_cross_entropy_bytes};
 use crate::backends::rosaplus::RosaPlus;
+#[cfg(feature = "backend-rwkv")]
+use crate::spec::MethodBackendFamily;
+use crate::spec::RateBackendTraceStrategy;
 use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -296,7 +299,7 @@ fn stage1_filter_with_universal_prior(
             .collect();
     }
 
-    if !matches!(opts.ctx.rate_backend, RateBackend::RosaPlus) {
+    if opts.ctx.rate_backend.capabilities().trace_strategy != RateBackendTraceStrategy::Rosa {
         let prior_prefix = corpus_bytes(prior_path, SearchGranularity::File);
         let h_u_q = opts
             .ctx
@@ -370,12 +373,11 @@ fn rwkv_prior_snapshot(
     opts: &SearchOptions,
     prior_path: &str,
 ) -> Option<(crate::rwkvzip::Compressor, crate::rwkvzip::RuntimeSnapshot)> {
-    let mut compressor = match &opts.ctx.rate_backend {
-        RateBackend::Rwkv7Method { method } => {
-            crate::rwkvzip::Compressor::new_from_method(method).ok()?
-        }
-        _ => return None,
-    };
+    if opts.ctx.rate_backend.capabilities().method_family != Some(MethodBackendFamily::Rwkv7) {
+        return None;
+    }
+    let method = opts.ctx.rate_backend.method_string()?;
+    let mut compressor = crate::rwkvzip::Compressor::new_from_method(method).ok()?;
 
     let prior_prefix = corpus_bytes(prior_path, SearchGranularity::File);
     compressor.reset_and_prime();

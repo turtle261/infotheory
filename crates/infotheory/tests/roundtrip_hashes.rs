@@ -28,6 +28,7 @@ fn zpaq_roundtrip_fixture_a_and_hash_stability() {
     let backend = CompressionBackend::Zpaq {
         method: "5".to_string(),
     };
+    let backend = backend.compile().expect("compile zpaq backend");
     let compressed = try_compress_bytes_backend(&input, &backend).expect("compress failed");
     let restored = try_decompress_bytes_backend(&compressed, &backend).expect("decompress failed");
     assert_eq!(restored, input, "zpaq roundtrip mismatch");
@@ -48,6 +49,7 @@ fn zpaq_roundtrip_fixture_b_and_hash_stability() {
     let backend = CompressionBackend::Zpaq {
         method: "5".to_string(),
     };
+    let backend = backend.compile().expect("compile zpaq backend");
     let compressed = try_compress_bytes_backend(&input, &backend).expect("compress failed");
     let restored = try_decompress_bytes_backend(&compressed, &backend).expect("decompress failed");
     assert_eq!(restored, input, "zpaq roundtrip mismatch");

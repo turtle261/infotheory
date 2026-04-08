@@ -1,7 +1,7 @@
 #![cfg(feature = "backend-mamba")]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use infotheory::api::{RateBackend, try_entropy_rate_backend};
+use infotheory::api::{CompiledRateBackend, RateBackend, try_entropy_rate_backend};
 use infotheory::coders::CoderType;
 use infotheory::compression::{FramingMode, compress_rate_bytes};
 use std::time::Duration;
@@ -26,7 +26,7 @@ fn mamba_backend() -> RateBackend {
 
 fn bench_mamba(c: &mut Criterion) {
     let data = bench_data();
-    let backend = mamba_backend();
+    let backend = mamba_backend().compile().expect("compile mamba backend");
 
     let mut h_group = c.benchmark_group("mamba_entropy");
     h_group.throughput(Throughput::Bytes(data.len() as u64));
@@ -70,6 +70,6 @@ criterion_group! {
     targets = bench_mamba
 }
 criterion_main!(mamba_rate);
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
     try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
 }

@@ -430,6 +430,32 @@ impl RateBackend {
     pub fn to_canonical_json_value(&self) -> crate::spec::SpecResult<serde_json::Value> {
         crate::spec::rate_backend_to_json_value(self)
     }
+
+    /// Validate and canonicalize this backend in the provided compilation environment.
+    pub fn validate_in(
+        &self,
+        env: &crate::spec::SpecEnvironment,
+    ) -> crate::spec::SpecResult<crate::spec::ValidatedRateBackend> {
+        crate::spec::core::validate_rate_backend_in(self, env)
+    }
+
+    /// Validate and canonicalize this backend using the default environment.
+    pub fn validate(&self) -> crate::spec::SpecResult<crate::spec::ValidatedRateBackend> {
+        self.validate_in(&crate::spec::SpecEnvironment::default())
+    }
+
+    /// Validate and compile this backend in the provided compilation environment.
+    pub fn compile_in(
+        &self,
+        env: &crate::spec::SpecEnvironment,
+    ) -> crate::spec::SpecResult<crate::spec::CompiledRateBackend> {
+        self.validate_in(env)?.compile()
+    }
+
+    /// Validate and compile this backend using the default environment.
+    pub fn compile(&self) -> crate::spec::SpecResult<crate::spec::CompiledRateBackend> {
+        self.validate()?.compile()
+    }
 }
 
 #[cfg(feature = "backend-zpaq")]
@@ -481,6 +507,32 @@ impl CompressionBackend {
     /// Serialize this backend into canonical JSON value form.
     pub fn to_canonical_json_value(&self) -> crate::spec::SpecResult<serde_json::Value> {
         crate::spec::compression_backend_to_json_value(self)
+    }
+
+    /// Validate and canonicalize this backend in the provided compilation environment.
+    pub fn validate_in(
+        &self,
+        env: &crate::spec::SpecEnvironment,
+    ) -> crate::spec::SpecResult<crate::spec::ValidatedCompressionBackend> {
+        crate::spec::core::validate_compression_backend_in(self, env)
+    }
+
+    /// Validate and canonicalize this backend using the default environment.
+    pub fn validate(&self) -> crate::spec::SpecResult<crate::spec::ValidatedCompressionBackend> {
+        self.validate_in(&crate::spec::SpecEnvironment::default())
+    }
+
+    /// Validate and compile this backend in the provided compilation environment.
+    pub fn compile_in(
+        &self,
+        env: &crate::spec::SpecEnvironment,
+    ) -> crate::spec::SpecResult<crate::spec::CompiledCompressionBackend> {
+        self.validate_in(env)?.compile()
+    }
+
+    /// Validate and compile this backend using the default environment.
+    pub fn compile(&self) -> crate::spec::SpecResult<crate::spec::CompiledCompressionBackend> {
+        self.validate()?.compile()
     }
 }
 

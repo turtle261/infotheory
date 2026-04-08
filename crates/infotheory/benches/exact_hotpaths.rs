@@ -1,7 +1,9 @@
 #![cfg(all(feature = "backend-rwkv", feature = "backend-mamba"))]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend};
+use infotheory::api::{
+    CompiledRateBackend, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend,
+};
 use infotheory::backends::ctw::FacContextTree;
 use infotheory::backends::llm_policy::OptimizerKind;
 use infotheory::coders::CoderType;
@@ -95,7 +97,7 @@ fn mamba_cfg() -> mamba1::Config {
     }
 }
 
-fn two_json_backend() -> RateBackend {
+fn two_json_backend() -> CompiledRateBackend {
     let spec = MixtureSpec::new(
         MixtureKind::Neural,
         vec![
@@ -132,6 +134,8 @@ fn two_json_backend() -> RateBackend {
     RateBackend::Mixture {
         spec: Arc::new(spec),
     }
+    .compile()
+    .expect("compile two.json benchmark backend")
 }
 
 fn bench_rwkv_direct(c: &mut Criterion) {

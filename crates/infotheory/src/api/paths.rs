@@ -146,7 +146,10 @@ pub fn try_ncd_paths_backend(
         || std::fs::read(x).map_err(InfotheoryError::from),
         || std::fs::read(y).map_err(InfotheoryError::from),
     );
-    try_ncd_bytes_backend(&bx?, &by?, backend, variant)
+    let compiled = backend
+        .compile()
+        .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;
+    try_ncd_bytes_backend(&bx?, &by?, &compiled, variant)
 }
 
 /// Compute an `n x n` pairwise NCD matrix (row-major) for file paths.

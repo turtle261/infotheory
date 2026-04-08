@@ -1,8 +1,9 @@
 //! Generation-focused public API surface.
 
 use super::context::RateBackendSession;
-use super::types::{GenerationConfig, GenerationStrategy, RateBackend};
+use super::types::{GenerationConfig, GenerationStrategy};
 use crate::error::{InfotheoryError, InfotheoryResult};
+use crate::spec::CompiledRateBackend;
 
 use crate::with_default_ctx;
 
@@ -153,7 +154,7 @@ pub(crate) fn try_generate_rate_backend_chain(
     prefix_parts: &[&[u8]],
     bytes: usize,
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
     config: GenerationConfig,
 ) -> InfotheoryResult<Vec<u8>> {
     if bytes == 0 {
@@ -185,7 +186,7 @@ pub(crate) fn generate_rate_backend_chain(
     prefix_parts: &[&[u8]],
     bytes: usize,
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
     config: GenerationConfig,
 ) -> Vec<u8> {
     try_generate_rate_backend_chain(prefix_parts, bytes, max_order, backend, config)

@@ -8,12 +8,11 @@ use super::metrics::{
     try_cross_entropy_rate_backend, try_entropy_rate_backend, try_joint_entropy_rate_backend,
     try_mutual_information_rate_backend, try_ned_rate_backend, try_nte_rate_backend,
 };
-use super::types::{
-    CompressionBackend, GenerationConfig, GenerationUpdateMode, RateBackend, validate_rate_backend,
-};
+use super::types::{CompressionBackend, GenerationConfig, GenerationUpdateMode, RateBackend};
 use crate::aligned_prefix;
 use crate::error::{InfotheoryError, InfotheoryResult};
 use crate::mixture::OnlineBytePredictor;
+use crate::spec::{CompiledCompressionBackend, CompiledRateBackend};
 
 /// Returns the current default information theory context for this thread.
 pub fn get_default_ctx() -> InfotheoryCtx {
@@ -26,12 +25,19 @@ pub fn set_default_ctx(ctx: InfotheoryCtx) {
 }
 
 /// Reusable execution context holding default rate and compression backends.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct InfotheoryCtx {
     /// Default rate backend for entropy/rate metrics.
-    pub rate_backend: RateBackend,
+    pub rate_backend: CompiledRateBackend,
     /// Default compression backend for NCD/compression primitives.
-    pub compression_backend: CompressionBackend,
+    pub compression_backend: CompiledCompressionBackend,
+}
+
+impl Default for InfotheoryCtx {
+    fn default() -> Self {
+        Self::from_specs(RateBackend::default(), CompressionBackend::default())
+            .unwrap_or_else(|err| panic!("failed to build default infotheory context: {err}"))
+    }
 }
 
 /// Stateful rate-backend session for fitting, conditioning, and continuation.
@@ -42,11 +48,10 @@ pub struct RateBackendSession {
 impl RateBackendSession {
     /// Create a session from an explicit backend.
     pub fn from_backend(
-        backend: RateBackend,
+        backend: CompiledRateBackend,
         max_order: i64,
         total_symbols: Option<u64>,
     ) -> InfotheoryResult<Self> {
-        validate_rate_backend(&backend)?;
         let mut predictor =
             crate::runtime::build_rate_backend_predictor_default(&backend, max_order)
                 .map_err(InfotheoryError::invalid_backend_config)?;
@@ -54,6 +59,18 @@ impl RateBackendSession {
             .begin_stream(total_symbols)
             .map_err(InfotheoryError::runtime)?;
         Ok(Self { predictor })
+    }
+
+    /// Create a session from a wrapper backend spec.
+    pub fn from_spec(
+        backend: RateBackend,
+        max_order: i64,
+        total_symbols: Option<u64>,
+    ) -> InfotheoryResult<Self> {
+        let compiled = backend
+            .compile()
+            .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;
+        Self::from_backend(compiled, max_order, total_symbols)
     }
 
     /// Observe bytes while adapting/fitting the model.
@@ -123,21 +140,40 @@ impl RateBackendSession {
 
 impl InfotheoryCtx {
     /// Create a context from explicit rate and compression backends.
-    pub fn new(rate_backend: RateBackend, compression_backend: CompressionBackend) -> Self {
+    pub fn new(
+        rate_backend: CompiledRateBackend,
+        compression_backend: CompiledCompressionBackend,
+    ) -> Self {
         Self {
             rate_backend,
             compression_backend,
         }
     }
 
+    /// Create a context from wrapper backend specs.
+    pub fn from_specs(
+        rate_backend: RateBackend,
+        compression_backend: CompressionBackend,
+    ) -> InfotheoryResult<Self> {
+        Ok(Self {
+            rate_backend: rate_backend
+                .compile()
+                .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?,
+            compression_backend: compression_backend
+                .compile()
+                .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?,
+        })
+    }
+
     /// Create a context with ROSA+ rate backend and ZPAQ compression backend.
     pub fn with_zpaq(method: impl Into<String>) -> Self {
-        Self {
-            rate_backend: RateBackend::RosaPlus,
-            compression_backend: CompressionBackend::Zpaq {
+        Self::from_specs(
+            RateBackend::RosaPlus,
+            CompressionBackend::Zpaq {
                 method: method.into(),
             },
-        }
+        )
+        .unwrap_or_else(|err| panic!("failed to build zpaq context: {err}"))
     }
 
     /// Compressed length of one byte slice under this context's compressor.

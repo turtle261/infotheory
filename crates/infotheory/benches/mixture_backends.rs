@@ -1,5 +1,6 @@
 use infotheory::api::{
-    MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend, try_entropy_rate_backend,
+    CompiledRateBackend, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend,
+    try_entropy_rate_backend,
 };
 use std::env;
 use std::hint::black_box;
@@ -71,7 +72,9 @@ fn bench_kind(
 ) -> Duration {
     let backend = RateBackend::Mixture {
         spec: Arc::new(make_spec(kind)),
-    };
+    }
+    .compile()
+    .expect("compile mixture backend");
 
     for _ in 0..warmup_iters {
         let h = entropy_rate_backend(data, -1, &backend);
@@ -124,6 +127,6 @@ fn main() {
     }
     println!("total elapsed: {:.3} s", total.as_secs_f64());
 }
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
     try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
 }

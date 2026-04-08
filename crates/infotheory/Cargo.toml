@@ -116,6 +116,10 @@ name = "exact_hotpaths"
 harness = false
 required-features = ["backend-rwkv", "backend-mamba"]
 
+[[bench]]
+name = "compiled_plan_overhead"
+harness = false
+
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"

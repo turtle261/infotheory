@@ -31,9 +31,9 @@
     )
 )]
 
-#[cfg(feature = "backend-calibrated")]
-use crate::api::CalibratedSpec;
-use crate::api::{MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend};
+#[cfg(test)]
+use crate::api::MixtureSpec;
+use crate::api::{MixtureKind, MixtureScheduleMode, RateBackend};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
@@ -56,6 +56,7 @@ use crate::mambazip;
 use crate::neural_mix::{NeuralHistoryState, NeuralMixCore};
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
+use crate::spec::CompiledRateBackend;
 use std::sync::Arc;
 
 /// Default minimum probability floor to avoid log(0).
@@ -73,12 +74,6 @@ fn clamp_prob(p: f64, min_prob: f64) -> f64 {
 #[inline]
 fn clamp_unit_prob(p: f64, min_prob: f64) -> f64 {
     clamp_prob(p, min_prob).min(1.0 - min_prob)
-}
-
-#[cfg(feature = "backend-calibrated")]
-#[inline]
-fn build_calibrator(spec: &CalibratedSpec) -> CalibratorCore {
-    CalibratorCore::new(spec.context, spec.bins, spec.learning_rate, spec.bias_clip)
 }
 
 #[inline]
@@ -674,224 +669,23 @@ fn restore_fac_ctw_checkpoint(
 }
 
 impl RateBackendPredictor {
+    /// Create a new online predictor from a compiled rate backend plan.
+    pub fn try_from_compiled(
+        backend: &CompiledRateBackend,
+        max_order: i64,
+        min_prob: f64,
+    ) -> Result<Self, String> {
+        crate::runtime::build_rate_backend_predictor(backend, max_order, min_prob)
+    }
+
     /// Create a new online predictor from a rate backend configuration.
     pub fn try_from_backend(
         backend: RateBackend,
         max_order: i64,
         min_prob: f64,
     ) -> Result<Self, String> {
-        crate::api::validate_rate_backend(&backend).map_err(|err| err.to_string())?;
-        Ok(match backend {
-            #[cfg(feature = "backend-rosa")]
-            RateBackend::RosaPlus => {
-                let mut model = RosaPlus::new(max_order, false, 0, 42);
-                model.build_lm_full_bytes_no_finalize_endpos();
-                Self::Rosa {
-                    model,
-                    min_prob,
-                    checkpoint_journal: Vec::new(),
-                    checkpoint_depth: 0,
-                }
-            }
-            #[cfg(not(feature = "backend-rosa"))]
-            RateBackend::RosaPlus => {
-                return Err(
-                    "backend 'rosaplus' requires infotheory feature 'backend-rosa'".to_string(),
-                );
-            }
-            #[cfg(feature = "backend-match")]
-            RateBackend::Match {
-                hash_bits,
-                min_len,
-                max_len,
-                base_mix,
-                confidence_scale,
-            } => Self::Match {
-                model: MatchModel::new_contiguous(
-                    hash_bits,
-                    min_len,
-                    max_len,
-                    base_mix,
-                    confidence_scale,
-                ),
-                min_prob,
-            },
-            #[cfg(not(feature = "backend-match"))]
-            RateBackend::Match { .. } => {
-                return Err(
-                    "backend 'match' requires infotheory feature 'backend-match'".to_string(),
-                );
-            }
-            #[cfg(feature = "backend-match")]
-            RateBackend::SparseMatch {
-                hash_bits,
-                min_len,
-                max_len,
-                gap_min,
-                gap_max,
-                base_mix,
-                confidence_scale,
-            } => Self::SparseMatch {
-                model: SparseMatchModel::new(
-                    hash_bits,
-                    min_len,
-                    max_len,
-                    gap_min,
-                    gap_max,
-                    base_mix,
-                    confidence_scale,
-                ),
-                min_prob,
-            },
-            #[cfg(not(feature = "backend-match"))]
-            RateBackend::SparseMatch { .. } => {
-                return Err(
-                    "backend 'sparse-match' requires infotheory feature 'backend-match'"
-                        .to_string(),
-                );
-            }
-            #[cfg(feature = "backend-ppmd")]
-            RateBackend::Ppmd { order, memory_mb } => Self::Ppmd {
-                model: PpmdModel::new(order, memory_mb),
-                min_prob,
-            },
-            #[cfg(not(feature = "backend-ppmd"))]
-            RateBackend::Ppmd { .. } => {
-                return Err("backend 'ppmd' requires infotheory feature 'backend-ppmd'".to_string());
-            }
-            #[cfg(feature = "backend-sequitur")]
-            RateBackend::Sequitur { context_bytes } => Self::Sequitur {
-                model: SequiturModel::new(context_bytes),
-                min_prob,
-            },
-            #[cfg(not(feature = "backend-sequitur"))]
-            RateBackend::Sequitur { .. } => {
-                return Err(
-                    "backend 'sequitur' requires infotheory feature 'backend-sequitur'".to_string(),
-                );
-            }
-            #[cfg(feature = "backend-ctw")]
-            RateBackend::Ctw { depth } => {
-                let tree = FacContextTree::new(depth, 8);
-                Self::Ctw {
-                    tree,
-                    min_prob,
-                    checkpoint_journal: Vec::new(),
-                    checkpoint_depth: 0,
-                }
-            }
-            #[cfg(not(feature = "backend-ctw"))]
-            RateBackend::Ctw { .. } => {
-                return Err("backend 'ctw' requires infotheory feature 'backend-ctw'".to_string());
-            }
-            #[cfg(feature = "backend-ctw")]
-            RateBackend::FacCtw {
-                base_depth,
-                num_percept_bits: _,
-                encoding_bits,
-            } => {
-                let bits_per_symbol = encoding_bits.clamp(1, 8);
-                let tree = FacContextTree::new(base_depth, bits_per_symbol);
-                Self::FacCtw {
-                    tree,
-                    bits_per_symbol,
-                    min_prob,
-                    checkpoint_journal: Vec::new(),
-                    checkpoint_depth: 0,
-                }
-            }
-            #[cfg(not(feature = "backend-ctw"))]
-            RateBackend::FacCtw { .. } => {
-                return Err(
-                    "backend 'fac-ctw' requires infotheory feature 'backend-ctw'".to_string(),
-                );
-            }
-            #[cfg(feature = "backend-rwkv")]
-            RateBackend::Rwkv7Method { method } => {
-                let mut compressor = rwkvzip::Compressor::new_from_method(&method)
-                    .map_err(|e| format!("invalid rwkv method '{method}': {e}"))?;
-                compressor.reset_and_prime();
-                Self::Rwkv7 {
-                    pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
-                    compressor,
-                    primed: true,
-                    min_prob,
-                }
-            }
-            #[cfg(feature = "backend-mamba")]
-            RateBackend::MambaMethod { method } => {
-                let mut compressor = mambazip::Compressor::new_from_method(&method)
-                    .map_err(|e| format!("invalid mamba method '{method}': {e}"))?;
-                let bias = compressor.online_bias_snapshot();
-                let logits =
-                    compressor
-                        .model
-                        .forward(&mut compressor.scratch, 0, &mut compressor.state);
-                mambazip::Compressor::logits_to_pdf(
-                    logits,
-                    bias.as_deref(),
-                    &mut compressor.pdf_buffer,
-                );
-                Self::Mamba {
-                    pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
-                    compressor,
-                    primed: true,
-                    min_prob,
-                }
-            }
-            #[cfg(feature = "backend-zpaq")]
-            RateBackend::Zpaq { method } => {
-                let model = ZpaqRateModel::new(method, min_prob);
-                Self::Zpaq { model }
-            }
-            #[cfg(not(feature = "backend-zpaq"))]
-            RateBackend::Zpaq { .. } => {
-                return Err("backend 'zpaq' requires infotheory feature 'backend-zpaq'".to_string());
-            }
-            #[cfg(feature = "backend-mixture")]
-            RateBackend::Mixture { spec } => {
-                let experts = spec.build_experts();
-                let runtime = build_mixture_runtime(spec.as_ref(), &experts)
-                    .map_err(|e| format!("MixtureSpec invalid: {e}"))?;
-                Self::Mixture { runtime }
-            }
-            #[cfg(not(feature = "backend-mixture"))]
-            RateBackend::Mixture { .. } => {
-                return Err(
-                    "backend 'mixture' requires infotheory feature 'backend-mixture'".to_string(),
-                );
-            }
-            #[cfg(feature = "backend-particle")]
-            RateBackend::Particle { spec } => {
-                let runtime = crate::backends::particle::ParticleRuntime::new(spec.as_ref());
-                Self::Particle { runtime }
-            }
-            #[cfg(not(feature = "backend-particle"))]
-            RateBackend::Particle { .. } => {
-                return Err(
-                    "backend 'particle' requires infotheory feature 'backend-particle'".to_string(),
-                );
-            }
-            #[cfg(feature = "backend-calibrated")]
-            RateBackend::Calibrated { spec } => Self::Calibrated {
-                base: Box::new(Self::try_from_backend(
-                    spec.base.clone(),
-                    max_order,
-                    min_prob,
-                )?),
-                core: build_calibrator(spec.as_ref()),
-                pdf: [1.0 / 256.0; 256],
-                valid: false,
-                min_prob,
-            },
-            #[cfg(not(feature = "backend-calibrated"))]
-            RateBackend::Calibrated { .. } => {
-                return Err(
-                    "backend 'calibrated' requires infotheory feature 'backend-calibrated'"
-                        .to_string(),
-                );
-            }
-        })
+        let compiled = backend.compile().map_err(|err| err.to_string())?;
+        Self::try_from_compiled(&compiled, max_order, min_prob)
     }
 
     /// Create a new online predictor from a rate backend configuration.
@@ -900,80 +694,23 @@ impl RateBackendPredictor {
             .unwrap_or_else(|err| panic!("failed to build RateBackendPredictor: {err}"))
     }
 
+    /// Create a new online predictor from a compiled rate backend plan.
+    pub fn from_compiled(backend: &CompiledRateBackend, max_order: i64, min_prob: f64) -> Self {
+        Self::try_from_compiled(backend, max_order, min_prob)
+            .unwrap_or_else(|err| panic!("failed to build RateBackendPredictor: {err}"))
+    }
+
     /// Human-readable default name for a backend + config.
     pub fn default_name(backend: &RateBackend, max_order: i64) -> String {
-        match backend {
-            #[cfg(feature = "backend-rosa")]
-            RateBackend::RosaPlus => format!("rosa(mo={})", max_order),
-            #[cfg(not(feature = "backend-rosa"))]
-            RateBackend::RosaPlus => "rosaplus(disabled)".to_string(),
-            #[cfg(feature = "backend-match")]
-            RateBackend::Match { .. } => "match".to_string(),
-            #[cfg(not(feature = "backend-match"))]
-            RateBackend::Match { .. } => "match(disabled)".to_string(),
-            #[cfg(feature = "backend-match")]
-            RateBackend::SparseMatch { .. } => "sparse-match".to_string(),
-            #[cfg(not(feature = "backend-match"))]
-            RateBackend::SparseMatch { .. } => "sparse-match(disabled)".to_string(),
-            #[cfg(feature = "backend-ppmd")]
-            RateBackend::Ppmd { order, memory_mb } => {
-                format!("ppmd(o={},m={}MiB)", order, memory_mb)
-            }
-            #[cfg(not(feature = "backend-ppmd"))]
-            RateBackend::Ppmd { .. } => "ppmd(disabled)".to_string(),
-            #[cfg(feature = "backend-sequitur")]
-            RateBackend::Sequitur { context_bytes } => {
-                format!("sequitur(ctx={context_bytes})")
-            }
-            #[cfg(not(feature = "backend-sequitur"))]
-            RateBackend::Sequitur { .. } => "sequitur(disabled)".to_string(),
-            #[cfg(feature = "backend-ctw")]
-            RateBackend::Ctw { depth } => format!("ctw(d={})", depth),
-            #[cfg(not(feature = "backend-ctw"))]
-            RateBackend::Ctw { .. } => "ctw(disabled)".to_string(),
-            #[cfg(feature = "backend-ctw")]
-            RateBackend::FacCtw {
-                base_depth,
-                encoding_bits,
-                ..
-            } => format!("fac-ctw(d={},b={})", base_depth, encoding_bits),
-            #[cfg(not(feature = "backend-ctw"))]
-            RateBackend::FacCtw { .. } => "fac-ctw(disabled)".to_string(),
-            #[cfg(feature = "backend-rwkv")]
-            RateBackend::Rwkv7Method { method } => format!("rwkv7({method})"),
-            #[cfg(feature = "backend-mamba")]
-            RateBackend::MambaMethod { method } => format!("mamba({method})"),
-            #[cfg(feature = "backend-zpaq")]
-            RateBackend::Zpaq { method } => format!("zpaq(m={})", method),
-            #[cfg(not(feature = "backend-zpaq"))]
-            RateBackend::Zpaq { .. } => "zpaq(disabled)".to_string(),
-            #[cfg(feature = "backend-mixture")]
-            RateBackend::Mixture { spec } => {
-                let kind = match spec.kind {
-                    MixtureKind::Bayes => "bayes",
-                    MixtureKind::FadingBayes => "fading",
-                    MixtureKind::Switching => "switch",
-                    MixtureKind::Convex => "convex",
-                    MixtureKind::Mdl => "mdl",
-                    MixtureKind::Neural => "neural",
-                };
-                format!("mix({})", kind)
-            }
-            #[cfg(not(feature = "backend-mixture"))]
-            RateBackend::Mixture { .. } => "mixture(disabled)".to_string(),
-            #[cfg(feature = "backend-particle")]
-            RateBackend::Particle { spec } => {
-                format!("particle(n={},c={})", spec.num_particles, spec.num_cells)
-            }
-            #[cfg(not(feature = "backend-particle"))]
-            RateBackend::Particle { .. } => "particle(disabled)".to_string(),
-            #[cfg(feature = "backend-calibrated")]
-            RateBackend::Calibrated { spec } => {
-                format!("calibrated({})", Self::default_name(&spec.base, max_order))
-            }
-            #[cfg(not(feature = "backend-calibrated"))]
-            RateBackend::Calibrated { .. } => "calibrated(disabled)".to_string(),
-        }
+        backend
+            .compile()
+            .map(|compiled| compiled.default_name(max_order))
+            .unwrap_or_else(|_| {
+                backend
+                    .descriptor()
+                    .map(|descriptor| format!("{}(invalid)", descriptor.canonical))
+                    .unwrap_or_else(|_| "backend(invalid)".to_string())
+            })
     }
 
     pub(crate) fn checkpoint(&mut self) -> RateBackendPredictorCheckpoint {
@@ -1997,6 +1734,23 @@ impl ExpertConfig {
         })
     }
 
+    /// Expert from a compiled rate backend plan. `max_order` applies to ROSA.
+    pub fn from_compiled_rate_backend(
+        name: Option<String>,
+        log_prior: f64,
+        backend: CompiledRateBackend,
+        max_order: i64,
+    ) -> Self {
+        let name = name.unwrap_or_else(|| backend.display_label(max_order));
+        Self::new(name, log_prior, move || {
+            Box::new(RateBackendPredictor::from_compiled(
+                &backend,
+                max_order,
+                DEFAULT_MIN_PROB,
+            ))
+        })
+    }
+
     /// ROSA expert (uniform prior).
     pub fn rosa(name: impl Into<String>, max_order: i64) -> Self {
         let name = name.into();
@@ -2108,6 +1862,34 @@ impl ExpertConfig {
             cum_log_loss: 0.0,
         }
     }
+}
+
+#[cfg(feature = "backend-mixture")]
+pub(crate) fn expert_configs_from_compiled_mixture(
+    backend: &CompiledRateBackend,
+    max_order_fallback: i64,
+) -> Result<Vec<ExpertConfig>, String> {
+    let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = backend.plan() else {
+        return Err("compiled backend is not a mixture backend".to_string());
+    };
+    Ok(experts
+        .iter()
+        .map(|expert| {
+            let compiled =
+                crate::spec::core::compiled_rate_backend_from_plan(expert.backend.clone())
+                    .map_err(|err| err.to_string())?;
+            Ok(ExpertConfig::from_compiled_rate_backend(
+                expert.name.clone(),
+                expert.log_prior,
+                compiled,
+                if expert.max_order >= 0 {
+                    expert.max_order
+                } else {
+                    max_order_fallback
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?)
 }
 
 #[derive(Clone)]
@@ -3381,41 +3163,63 @@ fn finish_expert_stream(experts: &mut [ExpertState]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn build_mixture_runtime(
     spec: &MixtureSpec,
     experts: &[ExpertConfig],
 ) -> Result<MixtureRuntime, String> {
     spec.validate().map_err(|err| err.to_string())?;
-    match spec.kind {
+    build_mixture_runtime_from_fields(spec.kind, spec.schedule, spec.alpha, spec.decay, experts)
+}
+
+#[cfg(feature = "backend-mixture")]
+pub(crate) fn build_mixture_runtime_from_compiled(
+    backend: &CompiledRateBackend,
+    experts: &[ExpertConfig],
+) -> Result<MixtureRuntime, String> {
+    let crate::spec::core::RateBackendPlan::Mixture {
+        kind,
+        schedule,
+        alpha,
+        decay,
+        ..
+    } = backend.plan()
+    else {
+        return Err("compiled backend is not a mixture backend".to_string());
+    };
+    build_mixture_runtime_from_fields(*kind, *schedule, *alpha, *decay, experts)
+}
+
+fn build_mixture_runtime_from_fields(
+    kind: MixtureKind,
+    schedule: MixtureScheduleMode,
+    alpha: f64,
+    decay: Option<f64>,
+    experts: &[ExpertConfig],
+) -> Result<MixtureRuntime, String> {
+    match kind {
         MixtureKind::Bayes => Ok(MixtureRuntime::Bayes(BayesMixture::new(experts))),
         MixtureKind::FadingBayes => {
-            let decay = spec
-                .decay
-                .ok_or_else(|| "fading Bayes mixture requires decay".to_string())?;
+            let decay = decay.ok_or_else(|| "fading Bayes mixture requires decay".to_string())?;
             Ok(MixtureRuntime::Fading(FadingBayesMixture::new(
                 experts, decay,
             )))
         }
         MixtureKind::Switching => Ok(MixtureRuntime::Switching(SwitchingMixture::new(
-            experts,
-            spec.alpha,
-            spec.schedule,
+            experts, alpha, schedule,
         ))),
         MixtureKind::Convex => Ok(MixtureRuntime::Convex(ConvexMixture::new(
-            experts,
-            spec.alpha,
-            spec.schedule,
+            experts, alpha, schedule,
         ))),
         MixtureKind::Mdl => Ok(MixtureRuntime::Mdl(MdlSelector::new(experts))),
-        MixtureKind::Neural => Ok(MixtureRuntime::Neural(NeuralMixture::new(
-            experts, spec.alpha,
-        ))),
+        MixtureKind::Neural => Ok(MixtureRuntime::Neural(NeuralMixture::new(experts, alpha))),
     }
 }
 
 #[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 mod tests {
     use super::*;
+    use crate::api::CalibratedSpec;
     use std::sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},

@@ -2,8 +2,8 @@
 
 use rayon::prelude::*;
 
-use super::types::CompressionBackend;
 use crate::error::{InfotheoryError, InfotheoryResult};
+use crate::spec::CompiledCompressionBackend;
 
 use crate::runtime::CompressionRuntime;
 use crate::{try_zpaq_compress_size_bytes, with_default_ctx};
@@ -11,7 +11,7 @@ use crate::{try_zpaq_compress_size_bytes, with_default_ctx};
 /// Compute compressed size (bytes) for a logical concatenation of `parts` using `backend`.
 pub fn try_compress_size_chain_backend(
     parts: &[&[u8]],
-    backend: &CompressionBackend,
+    backend: &CompiledCompressionBackend,
 ) -> InfotheoryResult<u64> {
     let mut runtime = crate::runtime::build_compression_runtime(backend)
         .map_err(InfotheoryError::invalid_backend_config)?;
@@ -21,7 +21,7 @@ pub fn try_compress_size_chain_backend(
 /// Compute compressed size (bytes) for `data` using `backend`.
 pub fn try_compress_size_backend(
     data: &[u8],
-    backend: &CompressionBackend,
+    backend: &CompiledCompressionBackend,
 ) -> InfotheoryResult<u64> {
     let mut runtime = crate::runtime::build_compression_runtime(backend)
         .map_err(InfotheoryError::invalid_backend_config)?;
@@ -31,7 +31,7 @@ pub fn try_compress_size_backend(
 /// Compress `data` with `backend` and return encoded bytes.
 pub fn try_compress_bytes_backend(
     data: &[u8],
-    backend: &CompressionBackend,
+    backend: &CompiledCompressionBackend,
 ) -> InfotheoryResult<Vec<u8>> {
     let mut runtime = crate::runtime::build_compression_runtime(backend)
         .map_err(InfotheoryError::invalid_backend_config)?;
@@ -41,7 +41,7 @@ pub fn try_compress_bytes_backend(
 /// Decompress `input` with `backend` and return decoded bytes.
 pub fn try_decompress_bytes_backend(
     input: &[u8],
-    backend: &CompressionBackend,
+    backend: &CompiledCompressionBackend,
 ) -> InfotheoryResult<Vec<u8>> {
     let mut runtime = crate::runtime::build_compression_runtime(backend)
         .map_err(InfotheoryError::invalid_backend_config)?;
@@ -108,9 +108,11 @@ pub fn try_ncd_bytes(
     method: &str,
     variant: NcdVariant,
 ) -> InfotheoryResult<f64> {
-    let backend = CompressionBackend::Zpaq {
+    let backend = crate::api::CompressionBackend::Zpaq {
         method: method.to_string(),
-    };
+    }
+    .compile()
+    .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;
     try_ncd_bytes_backend(x, y, &backend, variant)
 }
 
@@ -124,7 +126,7 @@ pub fn try_ncd_bytes_default(x: &[u8], y: &[u8], variant: NcdVariant) -> Infothe
 pub fn try_ncd_bytes_backend(
     x: &[u8],
     y: &[u8],
-    backend: &CompressionBackend,
+    backend: &CompiledCompressionBackend,
     variant: NcdVariant,
 ) -> InfotheoryResult<f64> {
     let (cx, cy) = rayon::join(

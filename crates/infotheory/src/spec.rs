@@ -1,5 +1,13 @@
 //! Canonical backend/spec parsing shared by Rust, CLI, and Python surfaces.
 
+pub mod core;
+
+pub use self::core::{
+    AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
+    CompressionBackendCapabilities, MethodBackendFamily, RateBackendCapabilities,
+    RateBackendTraceStrategy, SpecEnvironment, ValidatedCompressionBackend, ValidatedRateBackend,
+};
+
 use crate::api::{
     CalibratedSpec, CalibrationContextKind, CompressionBackend, MAX_MIXTURE_NESTING,
     MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, ParticleSpec, RateBackend,
@@ -1329,6 +1337,16 @@ pub fn parse_rate_backend_name_method(
     }
 }
 
+/// Parse and compile a shorthand CLI/Python-style rate backend.
+pub fn compile_rate_backend_name_method(
+    name: &str,
+    method: Option<&str>,
+    options: &RateBackendShorthandOptions,
+) -> SpecResult<CompiledRateBackend> {
+    let env = SpecEnvironment::new(options.base_dir.clone());
+    parse_rate_backend_name_method(name, method, options)?.compile_in(&env)
+}
+
 /// Build a compression backend from shorthand CLI/Python-style
 /// `name` + optional `method` inputs.
 pub fn parse_compression_backend_name_method(
@@ -1396,6 +1414,17 @@ pub fn parse_compression_backend_name_method(
             }
         }
     }
+}
+
+/// Parse and compile a shorthand CLI/Python-style compression backend.
+pub fn compile_compression_backend_name_method(
+    name: &str,
+    method: Option<&str>,
+    rate_backend: Option<RateBackend>,
+    options: &CompressionBackendShorthandOptions,
+) -> SpecResult<CompiledCompressionBackend> {
+    let env = SpecEnvironment::new(options.base_dir.clone());
+    parse_compression_backend_name_method(name, method, rate_backend, options)?.compile_in(&env)
 }
 
 #[cfg(test)]
@@ -1471,6 +1500,47 @@ mod tests {
             #[cfg(not(feature = "backend-rwkv"))]
             crate::runtime::RateBackendKind::Rwkv7 => None,
         }
+    }
+
+    #[test]
+    fn shorthand_rate_aliases_compile_to_identical_canonical_bytes() {
+        let opts = RateBackendShorthandOptions::default();
+        let rosa =
+            compile_rate_backend_name_method("rosa", None, &opts).expect("compile rosa alias");
+        let rosaplus = compile_rate_backend_name_method("rosaplus", None, &opts)
+            .expect("compile rosaplus canonical");
+        assert_eq!(
+            rosa.canonical_bytes().as_slice(),
+            rosaplus.canonical_bytes().as_slice()
+        );
+        assert_eq!(
+            rosa.canonical_spec().to_canonical_json().unwrap(),
+            rosaplus.canonical_spec().to_canonical_json().unwrap()
+        );
+    }
+
+    #[test]
+    fn shorthand_compression_aliases_compile_to_identical_canonical_bytes() {
+        let opts = CompressionBackendShorthandOptions {
+            default_rate_backend: Some(RateBackend::Ctw { depth: 8 }),
+            ..CompressionBackendShorthandOptions::default()
+        };
+        let rate_ac = compile_compression_backend_name_method("rate_ac", None, None, &opts)
+            .expect("compile rate_ac alias");
+        let rate_ac_canonical =
+            compile_compression_backend_name_method("rate-ac", None, None, &opts)
+                .expect("compile rate-ac canonical");
+        assert_eq!(
+            rate_ac.canonical_bytes().as_slice(),
+            rate_ac_canonical.canonical_bytes().as_slice()
+        );
+        assert_eq!(
+            rate_ac.canonical_spec().to_canonical_json().unwrap(),
+            rate_ac_canonical
+                .canonical_spec()
+                .to_canonical_json()
+                .unwrap()
+        );
     }
 
     fn sample_enabled_leaf_rate_backend() -> Option<RateBackend> {

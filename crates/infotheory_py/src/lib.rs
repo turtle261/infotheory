@@ -1,9 +1,10 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use infotheory::api::{
-    self, CalibratedSpec, CalibrationContextKind, CompressionBackend, GenerationConfig,
-    GenerationStrategy, GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec, MixtureKind,
-    MixtureScheduleMode, MixtureSpec, NcdVariant, ParticleSpec, RateBackend, RateBackendSession,
+    self, CalibratedSpec, CalibrationContextKind, CompiledCompressionBackend, CompiledRateBackend,
+    CompressionBackend, GenerationConfig, GenerationStrategy, GenerationUpdateMode, InfotheoryCtx,
+    MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, NcdVariant, ParticleSpec,
+    RateBackend, RateBackendSession,
 };
 use infotheory::error::InfotheoryError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -57,6 +58,16 @@ fn py_hasattr_or_fatal(obj: &Bound<'_, PyAny>, name: &str, where_: &'static str)
 
 fn py_spec_value_error(err: infotheory::spec::SpecError) -> PyErr {
     PyValueError::new_err(err.to_string())
+}
+
+fn compile_rate_backend(backend: RateBackend) -> PyResult<CompiledRateBackend> {
+    backend.compile().map_err(py_spec_value_error)
+}
+
+fn compile_compression_backend(
+    backend: CompressionBackend,
+) -> PyResult<CompiledCompressionBackend> {
+    backend.compile().map_err(py_spec_value_error)
 }
 
 fn py_infotheory_error(err: InfotheoryError) -> PyErr {
@@ -945,14 +956,16 @@ impl PyInfotheoryCtx {
     fn new(
         rate_backend: Option<&PyRateBackend>,
         compression_backend: Option<&PyCompressionBackend>,
-    ) -> Self {
-        let rb = rate_backend.map(|b| b.inner.clone()).unwrap_or_default();
-        let cb = compression_backend
-            .map(|b| b.inner.clone())
-            .unwrap_or_default();
-        Self {
+    ) -> PyResult<Self> {
+        let rb = compile_rate_backend(rate_backend.map(|b| b.inner.clone()).unwrap_or_default())?;
+        let cb = compile_compression_backend(
+            compression_backend
+                .map(|b| b.inner.clone())
+                .unwrap_or_default(),
+        )?;
+        Ok(Self {
             inner: InfotheoryCtx::new(rb, cb),
-        }
+        })
     }
 
     fn entropy_rate_bytes(&self, py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
@@ -1275,7 +1288,7 @@ impl PyInfotheoryCtx {
         let v = parse_ncd_variant(variant.as_deref().unwrap_or("vitanyi"))?;
         py.detach(|| {
             py_try(|| {
-                api::try_ncd_paths_backend(x, y, &self.inner.compression_backend, v)
+                api::try_ncd_paths_backend(x, y, self.inner.compression_backend.canonical_spec(), v)
                     .map_err(py_infotheory_error)
             })
         })
@@ -1288,9 +1301,12 @@ impl PyRateBackendSession {
     #[pyo3(signature = (backend, max_order=-1, total_symbols=None))]
     fn new(backend: &PyRateBackend, max_order: i64, total_symbols: Option<u64>) -> PyResult<Self> {
         py_try(|| {
-            let inner =
-                RateBackendSession::from_backend(backend.inner.clone(), max_order, total_symbols)
-                    .map_err(py_infotheory_error)?;
+            let inner = RateBackendSession::from_backend(
+                compile_rate_backend(backend.inner.clone())?,
+                max_order,
+                total_symbols,
+            )
+            .map_err(py_infotheory_error)?;
             Ok(Self {
                 inner: Arc::new(Mutex::new(inner)),
             })
@@ -1477,6 +1493,14 @@ fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
     infotheory::backends::normalize_file_roundtrip_backend(backend)
 }
 
+fn compiled_compression_backend_from_py(
+    backend: Option<&Bound<'_, PyAny>>,
+    method: Option<&str>,
+    rate_backend: Option<RateBackend>,
+) -> PyResult<CompiledCompressionBackend> {
+    compile_compression_backend(compression_backend_from_py(backend, method, rate_backend)?)
+}
+
 fn rate_backend_from_py(
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
@@ -1493,6 +1517,13 @@ fn rate_backend_from_py(
         ));
     }
     Ok(RateBackend::default())
+}
+
+fn compiled_rate_backend_from_py(
+    backend: Option<&Bound<'_, PyAny>>,
+    method: Option<&str>,
+) -> PyResult<CompiledRateBackend> {
+    compile_rate_backend(rate_backend_from_py(backend, method)?)
 }
 
 #[pyfunction]
@@ -1521,7 +1552,7 @@ fn ncd_bytes(
     backend: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
-    let cb = compression_backend_from_py(backend, Some(method), None)?;
+    let cb = compiled_compression_backend_from_py(backend, Some(method), None)?;
     py.detach(|| py_try(|| api::try_ncd_bytes_backend(x, y, &cb, v).map_err(py_infotheory_error)))
 }
 
@@ -1551,7 +1582,7 @@ fn ncd_bytes_with_backend(
     variant: &str,
 ) -> PyResult<f64> {
     let v = parse_ncd_variant(variant)?;
-    let cb = compression_backend_from_py(backend, method, None)?;
+    let cb = compiled_compression_backend_from_py(backend, method, None)?;
     py.detach(|| py_try(|| api::try_ncd_bytes_backend(x, y, &cb, v).map_err(py_infotheory_error)))
 }
 
@@ -1894,7 +1925,7 @@ fn compress_size_backend(
     rate_method: Option<&str>,
 ) -> PyResult<u64> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
-    let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
+    let cb = compiled_compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
     py.detach(|| {
         py_try(|| {
             infotheory::api::try_compress_size_backend(data, &cb)
@@ -1914,7 +1945,7 @@ fn compress_size_chain_backend(
     rate_method: Option<&str>,
 ) -> PyResult<u64> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
-    let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
+    let cb = compiled_compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
     let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
     py.detach(|| {
         py_try(|| {
@@ -1935,7 +1966,7 @@ fn compress_bytes_backend<'py>(
     rate_method: Option<&str>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
-    let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
+    let cb = compiled_compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
     let out = py.detach(|| {
         py_try(|| {
             infotheory::api::try_compress_bytes_backend(data, &cb).map_err(py_infotheory_error)
@@ -1955,7 +1986,7 @@ fn decompress_bytes_backend<'py>(
     rate_method: Option<&str>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
-    let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
+    let cb = compiled_compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
     let out = py.detach(|| {
         py_try(|| {
             infotheory::api::try_decompress_bytes_backend(input, &cb).map_err(py_infotheory_error)
@@ -1976,8 +2007,12 @@ fn compress_file(
     rate_method: Option<&str>,
 ) -> PyResult<()> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
-    let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
-    let cb = file_roundtrip_backend(&cb);
+    let cb = file_roundtrip_backend(&compression_backend_from_py(
+        compression_backend,
+        Some(method),
+        Some(rb),
+    )?);
+    let cb = compile_compression_backend(cb)?;
     py.detach(|| {
         py_try(|| {
             let input = std::fs::read(input_path).map_err(|e| {
@@ -2005,8 +2040,12 @@ fn decompress_file(
     rate_method: Option<&str>,
 ) -> PyResult<()> {
     let rb = rate_backend_from_py(rate_backend, rate_method)?;
-    let cb = compression_backend_from_py(compression_backend, Some(method), Some(rb))?;
-    let cb = file_roundtrip_backend(&cb);
+    let cb = file_roundtrip_backend(&compression_backend_from_py(
+        compression_backend,
+        Some(method),
+        Some(rb),
+    )?);
+    let cb = compile_compression_backend(cb)?;
     py.detach(|| {
         py_try(|| {
             let input = std::fs::read(input_path).map_err(|e| {
@@ -2035,10 +2074,11 @@ fn generate_bytes<'py>(
 ) -> PyResult<Bound<'py, PyBytes>> {
     let cfg = generation_config_from_py(config)?;
     let out = if let Some(backend) = backend {
-        let rb = rate_backend_from_py(Some(backend), method)?;
+        let rb = compiled_rate_backend_from_py(Some(backend), method)?;
+        let cb = compile_compression_backend(CompressionBackend::default())?;
         py.detach(|| {
             py_try(|| {
-                let ctx = InfotheoryCtx::new(rb, CompressionBackend::default());
+                let ctx = InfotheoryCtx::new(rb, cb);
                 ctx.try_generate_bytes_with_config(prompt, bytes, max_order, cfg)
                     .map_err(py_infotheory_error)
             })
@@ -2068,10 +2108,11 @@ fn generate_bytes_conditional_chain<'py>(
     let cfg = generation_config_from_py(config)?;
     let refs: Vec<&[u8]> = prefix_parts.iter().map(Vec::as_slice).collect();
     let out = if let Some(backend) = backend {
-        let rb = rate_backend_from_py(Some(backend), method)?;
+        let rb = compiled_rate_backend_from_py(Some(backend), method)?;
+        let cb = compile_compression_backend(CompressionBackend::default())?;
         py.detach(|| {
             py_try(|| {
-                let ctx = InfotheoryCtx::new(rb, CompressionBackend::default());
+                let ctx = InfotheoryCtx::new(rb, cb);
                 ctx.try_generate_bytes_conditional_chain_with_config(&refs, bytes, max_order, cfg)
                     .map_err(py_infotheory_error)
             })
@@ -2096,7 +2137,7 @@ fn entropy_rate_backend(
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
-    let rb = rate_backend_from_py(backend, method)?;
+    let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
         py_try(|| api::try_entropy_rate_backend(data, max_order, &rb).map_err(py_infotheory_error))
     })
@@ -2111,7 +2152,7 @@ fn biased_entropy_rate_backend(
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
-    let rb = rate_backend_from_py(backend, method)?;
+    let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
         py_try(|| {
             api::try_biased_entropy_rate_backend(data, max_order, &rb).map_err(py_infotheory_error)
@@ -2129,7 +2170,7 @@ fn cross_entropy_rate_backend(
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
-    let rb = rate_backend_from_py(backend, method)?;
+    let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
         py_try(|| {
             api::try_cross_entropy_rate_backend(test_data, train_data, max_order, &rb)
@@ -2148,7 +2189,7 @@ fn joint_entropy_rate_backend(
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
-    let rb = rate_backend_from_py(backend, method)?;
+    let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
         py_try(|| {
             api::try_joint_entropy_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error)
@@ -2166,7 +2207,7 @@ fn mutual_information_rate_backend(
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
-    let rb = rate_backend_from_py(backend, method)?;
+    let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
         py_try(|| {
             api::try_mutual_information_rate_backend(x, y, max_order, &rb)
@@ -2185,7 +2226,7 @@ fn ned_rate_backend(
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
-    let rb = rate_backend_from_py(backend, method)?;
+    let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
         py_try(|| api::try_ned_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error))
     })
@@ -2201,7 +2242,7 @@ fn nte_rate_backend(
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
-    let rb = rate_backend_from_py(backend, method)?;
+    let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
         py_try(|| api::try_nte_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error))
     })
@@ -2246,7 +2287,7 @@ fn ncd_matrix_bytes_with_backend(
     variant: &str,
 ) -> PyResult<Vec<f64>> {
     let v = parse_ncd_variant(variant)?;
-    let cb = compression_backend_from_py(backend, method, None)?;
+    let cb = compiled_compression_backend_from_py(backend, method, None)?;
     py.detach(|| {
         py_try(|| {
             let n = datas.len();
@@ -4768,8 +4809,9 @@ fn search(
     compression_backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<Vec<(String, usize, usize, f64)>> {
-    let rb = rate_backend_from_py(rate_backend, method)?;
-    let cb = compression_backend_from_py(compression_backend, method, Some(rb.clone()))?;
+    let raw_rb = rate_backend_from_py(rate_backend, method)?;
+    let rb = compile_rate_backend(raw_rb.clone())?;
+    let cb = compiled_compression_backend_from_py(compression_backend, method, Some(raw_rb))?;
     let q = query.to_string();
     let tp = target_path.to_string();
     let gran = granularity

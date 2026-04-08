@@ -1,7 +1,9 @@
 #[cfg(feature = "backend-zpaq")]
-use infotheory::api::{CompressionBackend, NcdVariant, try_ncd_bytes_backend};
+use infotheory::api::{
+    CompressionBackend, NcdVariant, try_ncd_bytes_backend as try_ncd_bytes_backend_compiled,
+};
 #[cfg(any(feature = "backend-rosa", feature = "backend-ctw"))]
-use infotheory::api::{RateBackend, try_entropy_rate_backend};
+use infotheory::api::{RateBackend, try_entropy_rate_backend as try_entropy_rate_backend_compiled};
 use infotheory::api::{marginal_entropy_bytes, try_mutual_information_bytes};
 use infotheory::axioms;
 use infotheory::datagen;
@@ -10,6 +12,27 @@ const TOLERANCE_ENTROPY: f64 = 0.1;
 const TOLERANCE_MI: f64 = 0.2;
 #[cfg(feature = "backend-zpaq")]
 const TOLERANCE_NCD: f64 = 0.1;
+
+#[cfg(any(feature = "backend-rosa", feature = "backend-ctw"))]
+fn try_entropy_rate_backend(
+    data: &[u8],
+    max_order: i64,
+    backend: &RateBackend,
+) -> Result<f64, String> {
+    let compiled = backend.compile().map_err(|err| err.to_string())?;
+    try_entropy_rate_backend_compiled(data, max_order, &compiled).map_err(|err| err.to_string())
+}
+
+#[cfg(feature = "backend-zpaq")]
+fn try_ncd_bytes_backend(
+    x: &[u8],
+    y: &[u8],
+    backend: &CompressionBackend,
+    variant: NcdVariant,
+) -> Result<f64, String> {
+    let compiled = backend.compile().map_err(|err| err.to_string())?;
+    try_ncd_bytes_backend_compiled(x, y, &compiled, variant).map_err(|err| err.to_string())
+}
 
 // ============================================================================
 // Entropy Tests

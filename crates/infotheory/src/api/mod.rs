@@ -14,6 +14,11 @@ pub use self::types::{
     MixtureScheduleMode, MixtureSpec, ParticleSpec, RateBackend, parse_mixture_kind_name,
     parse_mixture_schedule_name, validate_compression_backend, validate_rate_backend,
 };
+pub use crate::spec::{
+    AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
+    CompressionBackendCapabilities, MethodBackendFamily, RateBackendCapabilities,
+    RateBackendTraceStrategy, SpecEnvironment, ValidatedCompressionBackend, ValidatedRateBackend,
+};
 
 pub use self::compression::{
     NcdVariant, try_compress_bytes_backend, try_compress_size_backend,

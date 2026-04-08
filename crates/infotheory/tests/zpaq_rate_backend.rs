@@ -12,6 +12,7 @@ fn zpaq_rate_backend_compresses_copy_data() {
     let backend = RateBackend::Zpaq {
         method: "2".to_string(),
     };
+    let backend = backend.compile().expect("compile zpaq rate backend");
     let rate = try_entropy_rate_backend(&data, -1, &backend).expect("entropy rate");
     assert!(
         rate < 0.5,

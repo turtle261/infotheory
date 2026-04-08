@@ -1,5 +1,6 @@
 use infotheory::api::{
-    MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend, try_entropy_rate_backend,
+    CompiledRateBackend, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend,
+    try_entropy_rate_backend,
 };
 use infotheory::coders::ac::softmax_pdf_floor_inplace;
 use std::env;
@@ -55,7 +56,9 @@ fn make_experts() -> Vec<MixtureExpertSpec> {
 fn bench_neural_mixture(data: &[u8], warmup_iters: usize, bench_iters: usize) {
     let backend = RateBackend::Mixture {
         spec: Arc::new(MixtureSpec::new(MixtureKind::Neural, make_experts()).with_alpha(ALPHA)),
-    };
+    }
+    .compile()
+    .expect("compile neural mixture backend");
 
     for _ in 0..warmup_iters {
         let h = entropy_rate_backend(data, -1, &backend);
@@ -125,6 +128,6 @@ fn main() {
     bench_neural_mixture(&data, warmup_iters, bench_iters);
     bench_ac_softmax_floor_256(warmup_iters * 128, bench_iters * 20_000);
 }
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
     try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
 }

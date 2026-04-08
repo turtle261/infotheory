@@ -66,7 +66,7 @@ use std::time::Instant;
 #[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 use crate::cli::load_expert_spec;
 use crate::cli::{
-    aiqi_backend_label, build_ctx, file_roundtrip_backend, load_mixture_spec,
+    aiqi_backend_label, build_ctx, file_roundtrip_compiled_backend, load_mixture_spec,
     maybe_export_online_model, parse_compression_backend, parse_observation_key_mode_for_env,
     parse_observation_stream_len_for_env, parse_rate_backend, parse_vm_stats_backend, read_file,
     read_stdin_all_for_generate, run_batch_mode, validate_obs_stream_len,
@@ -74,17 +74,18 @@ use crate::cli::{
 };
 #[cfg(feature = "backend-sequitur")]
 use crate::cli::{bytes_to_hex, parse_hex_bytes};
+#[cfg(test)]
+use crate::cli::{
+    file_roundtrip_backend, parse_observation_key_mode, parse_observation_key_mode_for_vm,
+    parse_observation_key_mode_str, parse_observation_stream_len,
+    parse_observation_stream_len_for_vm, process_json_line,
+};
 #[cfg(feature = "vm")]
 use crate::cli::{
     parse_nyx_actions, parse_nyx_environment_config, parse_nyx_filter,
     parse_nyx_observation_pad_byte, parse_nyx_observation_policy,
     parse_nyx_observation_stream_mode, parse_nyx_protocol_config, parse_nyx_reward_policy,
     parse_nyx_reward_shaping, parse_nyx_trace_config, parse_shared_memory_policy,
-};
-#[cfg(test)]
-use crate::cli::{
-    parse_observation_key_mode, parse_observation_key_mode_for_vm, parse_observation_key_mode_str,
-    parse_observation_stream_len, parse_observation_stream_len_for_vm, process_json_line,
 };
 #[cfg(feature = "backend-rosa")]
 use infotheory::search;
@@ -94,7 +95,12 @@ fn cli_unwrap<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T
     result.unwrap_or_else(|err| panic!("{context} failed: {err}"))
 }
 
-fn ncd_bytes_backend(x: &[u8], y: &[u8], backend: &CompressionBackend, variant: NcdVariant) -> f64 {
+fn ncd_bytes_backend(
+    x: &[u8],
+    y: &[u8],
+    backend: &CompiledCompressionBackend,
+    variant: NcdVariant,
+) -> f64 {
     cli_unwrap(
         try_ncd_bytes_backend(x, y, backend, variant),
         "ncd_bytes_backend",
@@ -1308,7 +1314,7 @@ fn main() {
             let in_path = file1.unwrap_or_exit("Error: 'compress' requires <input> <output>");
             let out_path = file2.unwrap_or_exit("Error: 'compress' requires <input> <output>");
             let data = read_file(&in_path);
-            let backend = file_roundtrip_backend(&ctx.compression_backend);
+            let backend = file_roundtrip_compiled_backend(&ctx.compression_backend);
             let compressed = match infotheory::api::try_compress_bytes_backend(&data, &backend) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1335,7 +1341,7 @@ fn main() {
             let in_path = file1.unwrap_or_exit("Error: 'decompress' requires <input> <output>");
             let out_path = file2.unwrap_or_exit("Error: 'decompress' requires <input> <output>");
             let input = read_file(&in_path);
-            let backend = file_roundtrip_backend(&ctx.compression_backend);
+            let backend = file_roundtrip_compiled_backend(&ctx.compression_backend);
             let decoded = match infotheory::api::try_decompress_bytes_backend(&input, &backend) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1764,15 +1770,15 @@ mod tests {
         )
         .ctx;
 
-        match ctx.compression_backend {
+        match ctx.compression_backend.canonical_spec() {
             CompressionBackend::Rate {
                 rate_backend,
                 coder,
                 framing,
             } => {
                 assert!(matches!(rate_backend, RateBackend::Rwkv7Method { .. }));
-                assert_eq!(coder, rwkvzip::CoderType::AC);
-                assert_eq!(framing, infotheory::compression::FramingMode::Raw);
+                assert_eq!(*coder, infotheory::coders::CoderType::AC);
+                assert_eq!(*framing, infotheory::compression::FramingMode::Raw);
             }
             _ => panic!("expected rate-coded RWKV backend for cfg: method"),
         }
@@ -1958,7 +1964,10 @@ mod tests {
             Some(expert_path.to_str().expect("utf8 path")),
         );
         assert_eq!(built.expert_spec_max_order, Some(32));
-        assert!(matches!(built.ctx.rate_backend, RateBackend::RosaPlus));
+        assert!(matches!(
+            built.ctx.rate_backend.canonical_spec(),
+            RateBackend::RosaPlus
+        ));
 
         let _ = std::fs::remove_file(&expert_path);
     }

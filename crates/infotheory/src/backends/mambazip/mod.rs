@@ -577,6 +577,28 @@ pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
     );
 }
 
+/// Convert a parsed method specification back into canonical method syntax.
+pub fn canonical_method_string(spec: &MethodSpec) -> String {
+    match spec {
+        MethodSpec::File { path, policy } => {
+            let mut method = format!("file:{}", path.display());
+            if let Some(policy) = policy {
+                method.push_str(";policy:");
+                method.push_str(&policy.canonical());
+            }
+            method
+        }
+        MethodSpec::Online { cfg, policy } => {
+            let mut method = cfg_to_method_string(cfg);
+            if let Some(policy) = policy {
+                method.push_str(";policy:");
+                method.push_str(&policy.canonical());
+            }
+            method
+        }
+    }
+}
+
 /// Framing header for mambazip streams.
 #[derive(Debug, Clone)]
 pub struct Header {
@@ -1085,7 +1107,13 @@ impl Compressor {
 
     /// Create compressor from method string.
     pub fn new_from_method(method: &str) -> Result<Self> {
-        match parse_method_spec(method)? {
+        let spec = parse_method_spec(method)?;
+        Self::new_from_method_spec(&spec)
+    }
+
+    /// Create compressor from a parsed method specification.
+    pub fn new_from_method_spec(spec: &MethodSpec) -> Result<Self> {
+        match spec.clone() {
             MethodSpec::File { path, policy } => {
                 let mut c = Self::new(&path)?;
                 if let Some(policy) = policy {
@@ -1146,11 +1174,10 @@ impl Compressor {
                     Arc::new(Model::new_random(mcfg, cfg.seed)?)
                 };
                 let mut c = Self::new_from_model(model);
-                let mut canonical_method = cfg_to_method_string(&cfg);
-                if let Some(policy) = policy.as_ref() {
-                    canonical_method.push_str(";policy:");
-                    canonical_method.push_str(&policy.canonical());
-                }
+                let canonical_method = canonical_method_string(&MethodSpec::Online {
+                    cfg: cfg.clone(),
+                    policy: policy.clone(),
+                });
                 c.online = Some(OnlineRuntime::new(
                     cfg,
                     canonical_method,

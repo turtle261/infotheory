@@ -19,7 +19,6 @@ use crate::aixi::model::ZpaqPredictor;
 #[cfg(feature = "backend-ctw")]
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor};
 use crate::aixi::model::{Predictor, RateBackendBitPredictor};
-use crate::aixi::rate_backend::{adapt_rate_backend_for_bit_tokens, rate_backend_contains_zpaq};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::validate_zpaq_rate_method;
 
@@ -130,7 +129,8 @@ impl AgentConfig {
         if let Some(rate_backend) = &self.rate_backend {
             validate_rate_backend(rate_backend)
                 .map_err(|err| format!("invalid rate_backend: {err}"))?;
-            if rate_backend_contains_zpaq(rate_backend) {
+            let compiled = rate_backend.compile().map_err(|err| err.to_string())?;
+            if compiled.contains_zpaq() {
                 return Err(
                     "MC-AIXI strict generic rate_backend support requires reversible action conditioning; configured rate_backend contains zpaq which does not provide the reversible action conditioning required by \"A Monte-Carlo AIXI Approximation\""
                         .to_string(),
@@ -356,8 +356,13 @@ impl Agent {
 
 fn build_model(config: &AgentConfig) -> Result<Box<dyn Predictor>, String> {
     if let Some(rate_backend) = config.rate_backend.clone() {
-        let bit_backend = adapt_rate_backend_for_bit_tokens(rate_backend);
-        let predictor = RateBackendBitPredictor::new(bit_backend, config.rate_backend_max_order)?;
+        let bit_backend = rate_backend
+            .compile()
+            .map_err(|err| err.to_string())?
+            .adapt_for_bit_tokens()
+            .map_err(|err| err.to_string())?;
+        let predictor =
+            RateBackendBitPredictor::from_compiled(bit_backend, config.rate_backend_max_order)?;
         return Ok(Box::new(predictor));
     }
 

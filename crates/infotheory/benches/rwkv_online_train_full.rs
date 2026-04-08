@@ -1,7 +1,7 @@
 #![cfg(feature = "backend-rwkv")]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use infotheory::api::{RateBackend, try_entropy_rate_backend};
+use infotheory::api::{CompiledRateBackend, RateBackend, try_entropy_rate_backend};
 use std::time::Duration;
 
 const DATA_LEN: usize = 64 * 1024;
@@ -26,10 +26,14 @@ fn bench_rwkv_online_train_full(c: &mut Criterion) {
     let data = bench_data();
     let infer = backend(
         "cfg:hidden=128,layers=2,intermediate=256,decay_rank=16,a_rank=16,v_rank=16,g_rank=16,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
-    );
+    )
+    .compile()
+    .expect("compile rwkv infer backend");
     let train_full = backend(
         "cfg:hidden=128,layers=2,intermediate=256,decay_rank=16,a_rank=16,v_rank=16,g_rank=16,seed=7,train=adam,lr=0.001,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)",
-    );
+    )
+    .compile()
+    .expect("compile rwkv train backend");
 
     let mut group = c.benchmark_group("rwkv_online_train_full");
     group.throughput(Throughput::Bytes(data.len() as u64));
@@ -68,6 +72,6 @@ criterion_group! {
     targets = bench_rwkv_online_train_full
 }
 criterion_main!(rwkv_online_train_full);
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
+fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
     try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
 }

@@ -23,7 +23,8 @@
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::environment::Environment;
 use crate::api::{
-    RateBackend, marginal_entropy_bytes, try_cross_entropy_rate_backend, try_entropy_rate_backend,
+    CompiledRateBackend, RateBackend, marginal_entropy_bytes, try_cross_entropy_rate_backend,
+    try_entropy_rate_backend,
 };
 use crate::backends::ctw::{ContextTree, FacContextTree};
 use crate::backends::rosaplus::RosaPlus;
@@ -663,13 +664,13 @@ enum TraceModel {
         model: ZpaqRateModel,
     },
     Mixture {
-        backend: RateBackend,
+        backend: CompiledRateBackend,
         model: crate::mixture::RateBackendPredictor,
     },
 }
 
 impl TraceModel {
-    fn predictor_backed(backend: RateBackend) -> Self {
+    fn predictor_backed(backend: CompiledRateBackend) -> Self {
         let mut model = crate::runtime::build_rate_backend_predictor(&backend, -1, 2f64.powi(-24))
             .unwrap_or_else(|e| panic!("predictor-backed init failed: {e}"));
         model
@@ -678,7 +679,7 @@ impl TraceModel {
         TraceModel::Mixture { backend, model }
     }
 
-    fn new(backend: &RateBackend, max_order: i64) -> Self {
+    fn new(backend: &CompiledRateBackend, max_order: i64) -> Self {
         match crate::runtime::rate_backend_trace_model_strategy(backend) {
             crate::runtime::TraceModelStrategy::Rosa => {
                 let mut model = RosaPlus::new(max_order, false, 0, 42);
@@ -689,7 +690,7 @@ impl TraceModel {
                 TraceModel::predictor_backed(backend.clone())
             }
             crate::runtime::TraceModelStrategy::Ctw => {
-                let RateBackend::Ctw { depth } = backend else {
+                let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
                     unreachable!("trace-model strategy mismatch for ctw");
                 };
                 TraceModel::Ctw {
@@ -697,11 +698,11 @@ impl TraceModel {
                 }
             }
             crate::runtime::TraceModelStrategy::FacCtw => {
-                let RateBackend::FacCtw {
+                let crate::spec::core::RateBackendPlan::FacCtw {
                     base_depth,
                     num_percept_bits: _,
                     encoding_bits,
-                } = backend
+                } = backend.plan()
                 else {
                     unreachable!("trace-model strategy mismatch for fac-ctw");
                 };
@@ -712,7 +713,7 @@ impl TraceModel {
                 }
             }
             crate::runtime::TraceModelStrategy::Zpaq => {
-                let RateBackend::Zpaq { method } = backend else {
+                let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
                     unreachable!("trace-model strategy mismatch for zpaq");
                 };
                 TraceModel::Zpaq {
@@ -720,12 +721,12 @@ impl TraceModel {
                 }
             }
             crate::runtime::TraceModelStrategy::Mamba => {
-                let method = crate::runtime::rate_backend_method(
-                    backend,
-                    crate::runtime::MethodBackendKind::Mamba,
-                )
-                .expect("mamba trace strategy should expose a method");
-                let compressor = MambaCompressor::new_from_method(method)
+                let crate::spec::core::RateBackendPlan::Mamba { parsed_method, .. } =
+                    backend.plan()
+                else {
+                    unreachable!("trace-model strategy mismatch for mamba");
+                };
+                let compressor = MambaCompressor::new_from_method_spec(parsed_method)
                     .unwrap_or_else(|e| panic!("invalid mamba method for vm trace model: {e}"));
                 TraceModel::Mamba {
                     compressor,
@@ -733,12 +734,12 @@ impl TraceModel {
                 }
             }
             crate::runtime::TraceModelStrategy::Rwkv7 => {
-                let method = crate::runtime::rate_backend_method(
-                    backend,
-                    crate::runtime::MethodBackendKind::Rwkv7,
-                )
-                .expect("rwkv7 trace strategy should expose a method");
-                let compressor = Compressor::new_from_method(method)
+                let crate::spec::core::RateBackendPlan::Rwkv7 { parsed_method, .. } =
+                    backend.plan()
+                else {
+                    unreachable!("trace-model strategy mismatch for rwkv7");
+                };
+                let compressor = Compressor::new_from_method_spec(parsed_method)
                     .unwrap_or_else(|e| panic!("invalid rwkv7 method for vm trace model: {e}"));
                 TraceModel::Rwkv7 {
                     compressor,
@@ -907,6 +908,8 @@ struct FuzzState {
 pub struct NyxVmEnvironment {
     /// Configuration.
     config: NyxVmConfig,
+    /// Compiled entropy/scoring backend used by VM reward logic.
+    compiled_stats_backend: CompiledRateBackend,
     /// The nyx-lite VM instance.
     vm: NyxVM,
     /// Base snapshot for episode resets.
@@ -978,10 +981,15 @@ impl NyxVmEnvironment {
             ));
         }
 
+        let compiled_stats_backend = config
+            .stats_backend
+            .compile()
+            .map_err(|err| anyhow::anyhow!("invalid vm stats_backend: {err}"))?;
+
         // Initialize trace model if needed
         let trace_model = match &reward_shaping {
             Some(NyxRewardShaping::TraceEntropy { max_order, .. }) => {
-                Some(TraceModel::new(&config.stats_backend, *max_order))
+                Some(TraceModel::new(&compiled_stats_backend, *max_order))
             }
             _ => None,
         };
@@ -996,7 +1004,7 @@ impl NyxVmEnvironment {
                 let h = if *max_order == 0 {
                     marginal_entropy_bytes(baseline_bytes)
                 } else {
-                    try_entropy_rate_backend(baseline_bytes, *max_order, &config.stats_backend)
+                    try_entropy_rate_backend(baseline_bytes, *max_order, &compiled_stats_backend)
                         .expect("validated vm stats backend should score baseline entropy")
                 };
                 Some(h)
@@ -1029,6 +1037,7 @@ impl NyxVmEnvironment {
 
         let mut env = Self {
             config,
+            compiled_stats_backend,
             vm,
             base_snapshot: None,
             shared_vaddr: None,
@@ -1492,7 +1501,7 @@ impl NyxVmEnvironment {
         let h_rate = if filter.max_order == 0 {
             h_marg
         } else {
-            try_entropy_rate_backend(payload, filter.max_order, &self.config.stats_backend)
+            try_entropy_rate_backend(payload, filter.max_order, &self.compiled_stats_backend)
                 .expect("validated vm stats backend should score payload entropy")
         };
 
@@ -1507,7 +1516,7 @@ impl NyxVmEnvironment {
                 payload,
                 prior,
                 filter.max_order,
-                &self.config.stats_backend,
+                &self.compiled_stats_backend,
             )
             .expect("validated vm stats backend should score novelty")
         } else {
@@ -1573,7 +1582,7 @@ impl NyxVmEnvironment {
                     let h_obs = if *max_order == 0 {
                         marginal_entropy_bytes(data)
                     } else {
-                        try_entropy_rate_backend(data, *max_order, &self.config.stats_backend)
+                        try_entropy_rate_backend(data, *max_order, &self.compiled_stats_backend)
                             .expect("validated vm stats backend should score observation entropy")
                     };
                     let h_base = self.baseline_entropy.unwrap_or(0.0);

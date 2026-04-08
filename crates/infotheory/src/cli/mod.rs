@@ -868,10 +868,15 @@ pub(super) fn validate_obs_stream_len(expected: usize, actual: usize) -> anyhow:
 
 pub(super) fn aiqi_backend_label(config: &AiqiConfig) -> String {
     if let Some(rate_backend) = &config.rate_backend {
-        let name = infotheory::mixture::RateBackendPredictor::default_name(
-            rate_backend,
-            config.rate_backend_max_order,
-        );
+        let name = rate_backend
+            .compile()
+            .map(|compiled| compiled.default_name(config.rate_backend_max_order))
+            .unwrap_or_else(|_| {
+                infotheory::mixture::RateBackendPredictor::default_name(
+                    rate_backend,
+                    config.rate_backend_max_order,
+                )
+            });
         format!("rate_backend={name}")
     } else {
         format!("algorithm={}", config.algorithm)
@@ -951,7 +956,10 @@ pub(super) fn build_ctx(
     });
 
     BuiltCtx {
-        ctx: InfotheoryCtx::new(rate_backend, compression_backend),
+        ctx: InfotheoryCtx::from_specs(rate_backend, compression_backend).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }),
         expert_spec_max_order,
     }
 }
@@ -1022,8 +1030,15 @@ pub(super) fn read_stdin_all_for_generate() -> Vec<u8> {
     data
 }
 
+#[cfg(test)]
 pub(super) fn file_roundtrip_backend(backend: &CompressionBackend) -> CompressionBackend {
     infotheory::backends::normalize_file_roundtrip_backend(backend)
+}
+
+pub(super) fn file_roundtrip_compiled_backend(
+    backend: &infotheory::spec::CompiledCompressionBackend,
+) -> infotheory::spec::CompiledCompressionBackend {
+    infotheory::backends::normalize_file_roundtrip_compiled_backend(backend)
 }
 
 pub(super) fn maybe_export_online_model(
@@ -1040,12 +1055,12 @@ pub(super) fn maybe_export_online_model(
 
     #[cfg(feature = "backend-rwkv")]
     {
-        let rwkv_method = infotheory::backends::rate_backend_method_string(
+        let rwkv_method = infotheory::backends::rate_backend_method_string_compiled(
             &ctx.rate_backend,
             infotheory::backends::MethodBackendFamily::Rwkv7,
         )
         .or_else(|| {
-            infotheory::backends::compression_backend_method_string(
+            infotheory::backends::compression_backend_method_string_compiled(
                 &ctx.compression_backend,
                 infotheory::backends::MethodBackendFamily::Rwkv7,
             )
@@ -1060,12 +1075,12 @@ pub(super) fn maybe_export_online_model(
 
     #[cfg(feature = "backend-mamba")]
     {
-        let mamba_method = infotheory::backends::rate_backend_method_string(
+        let mamba_method = infotheory::backends::rate_backend_method_string_compiled(
             &ctx.rate_backend,
             infotheory::backends::MethodBackendFamily::Mamba,
         )
         .or_else(|| {
-            infotheory::backends::compression_backend_method_string(
+            infotheory::backends::compression_backend_method_string_compiled(
                 &ctx.compression_backend,
                 infotheory::backends::MethodBackendFamily::Mamba,
             )

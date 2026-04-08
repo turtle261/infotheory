@@ -23,11 +23,9 @@
 
 use anyhow::{Result, bail};
 
-#[cfg(feature = "backend-calibrated")]
-use crate::api::CalibratedSpec;
-use crate::api::{
-    MixtureKind, MixtureScheduleMode, MixtureSpec, RateBackend, validate_rate_backend,
-};
+use crate::api::{MixtureKind, MixtureScheduleMode};
+#[cfg(test)]
+use crate::api::{MixtureSpec, RateBackend};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
@@ -58,18 +56,13 @@ use crate::mixture::{
 use crate::neural_mix::NeuralMixCore;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
+use crate::spec::CompiledRateBackend;
 use rayon::{ThreadPool, prelude::*};
 
 const FRAMED_MAGIC: u32 = 0x4354_4946; // "FITC"
 const FRAMED_VERSION: u8 = 1;
 const PDF_MIN: f64 = DEFAULT_MIN_PROB;
 const DIAGNOSTIC_PARALLEL_THRESHOLD: usize = 4;
-
-#[cfg(feature = "backend-calibrated")]
-#[inline]
-fn build_calibrator(spec: &CalibratedSpec) -> CalibratorCore {
-    CalibratorCore::new(spec.context, spec.bins, spec.learning_rate, spec.bias_clip)
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Wire format mode for rate-coded payloads.
@@ -161,7 +154,7 @@ pub(crate) struct CtwPredictor {
 
 #[cfg(feature = "backend-ctw")]
 impl CtwPredictor {
-    fn new_ctw(depth: usize) -> Self {
+    pub(crate) fn new_ctw(depth: usize) -> Self {
         Self {
             tree: FacContextTree::new(depth, 8),
             bits_per_symbol: 8,
@@ -172,7 +165,7 @@ impl CtwPredictor {
         }
     }
 
-    fn new_fac(base_depth: usize, bits_per_symbol: usize) -> Self {
+    pub(crate) fn new_fac(base_depth: usize, bits_per_symbol: usize) -> Self {
         Self {
             tree: FacContextTree::new(base_depth, bits_per_symbol),
             bits_per_symbol,
@@ -351,7 +344,7 @@ pub(crate) struct RosaPredictor {
 
 #[cfg(feature = "backend-rosa")]
 impl RosaPredictor {
-    fn new(max_order: i64) -> Self {
+    pub(crate) fn new(max_order: i64) -> Self {
         let mut model = RosaPlus::new(max_order, false, 0, 42);
         model.build_lm_full_bytes_no_finalize_endpos();
         Self {
@@ -432,7 +425,7 @@ pub(crate) struct ZpaqPredictor {
 
 #[cfg(feature = "backend-zpaq")]
 impl ZpaqPredictor {
-    fn new(method: String) -> Self {
+    pub(crate) fn new(method: String) -> Self {
         Self {
             method,
             history: Vec::new(),
@@ -465,8 +458,14 @@ impl ZpaqPredictor {
 
 #[cfg(feature = "backend-mamba")]
 impl MambaPredictor {
+    #[cfg(test)]
     fn from_method(method: &str) -> Result<Self> {
-        let compressor = mambazip::Compressor::new_from_method(method)?;
+        let spec = mambazip::parse_method_spec(method)?;
+        Self::from_method_spec(&spec)
+    }
+
+    pub(crate) fn from_method_spec(method: &mambazip::MethodSpec) -> Result<Self> {
+        let compressor = mambazip::Compressor::new_from_method_spec(method)?;
         let vocab = compressor.vocab_size();
         Ok(Self {
             compressor,
@@ -535,8 +534,14 @@ impl MambaPredictor {
 
 #[cfg(feature = "backend-rwkv")]
 impl RwkvPredictor {
+    #[cfg(test)]
     fn from_method(method: &str) -> Result<Self> {
-        let compressor = rwkvzip::Compressor::new_from_method(method)?;
+        let spec = rwkvzip::parse_method_spec(method)?;
+        Self::from_method_spec(&spec)
+    }
+
+    pub(crate) fn from_method_spec(method: &rwkvzip::MethodSpec) -> Result<Self> {
+        let compressor = rwkvzip::Compressor::new_from_method_spec(method)?;
         Ok(Self {
             compressor,
             primed: false,
@@ -641,17 +646,34 @@ pub(crate) struct MixturePredictor {
 }
 
 impl MixturePredictor {
-    fn new(spec: &MixtureSpec) -> Result<Self> {
-        spec.validate().map_err(anyhow::Error::msg)?;
-        let mut experts = Vec::with_capacity(spec.experts.len());
-        for e in &spec.experts {
+    pub(crate) fn new_from_compiled(backend: &CompiledRateBackend, max_order: i64) -> Result<Self> {
+        let crate::spec::core::RateBackendPlan::Mixture {
+            kind,
+            schedule,
+            alpha,
+            decay,
+            experts: plan_experts,
+            ..
+        } = backend.plan()
+        else {
+            bail!("compiled backend is not a mixture backend");
+        };
+        let mut experts = Vec::with_capacity(plan_experts.len());
+        for expert_plan in plan_experts.iter() {
+            let compiled =
+                crate::spec::core::compiled_rate_backend_from_plan(expert_plan.backend.clone())
+                    .map_err(anyhow::Error::msg)?;
             experts.push(MixExpert {
                 predictor: Box::new(crate::runtime::build_rate_pdf_predictor(
-                    &e.backend,
-                    e.max_order,
+                    &compiled,
+                    if expert_plan.max_order >= 0 {
+                        expert_plan.max_order
+                    } else {
+                        max_order
+                    },
                 )?),
-                log_weight: e.log_prior,
-                log_prior: e.log_prior,
+                log_weight: expert_plan.log_prior,
+                log_prior: expert_plan.log_prior,
                 cum_log_loss: 0.0,
             });
         }
@@ -667,7 +689,7 @@ impl MixturePredictor {
             *weight = weight.clamp(PDF_MIN, 1.0 - PDF_MIN);
         }
 
-        let base_lr = spec.alpha.abs().clamp(1e-6, 1.0);
+        let base_lr = alpha.abs().clamp(1e-6, 1.0);
         let effective_lr = (base_lr * 25.0).clamp(1e-6, 1.0);
         let analyzer = TextContextAnalyzer::new();
         let mut neural = NeuralMixCore::new(
@@ -679,19 +701,19 @@ impl MixturePredictor {
         );
         neural.set_context_state(analyzer.state());
         Ok(Self {
-            kind: spec.kind,
-            schedule: spec.schedule,
-            alpha: spec.alpha,
-            decay: spec.decay.unwrap_or(1.0).clamp(0.0, 1.0),
+            kind: *kind,
+            schedule: *schedule,
+            alpha: *alpha,
+            decay: decay.unwrap_or(1.0).clamp(0.0, 1.0),
             experts,
             prior_weights,
             neural,
             analyzer,
-            neural_logps: vec![0.0; spec.experts.len()],
-            neural_bit_modes: vec![0; spec.experts.len()],
-            neural_lo: vec![0; spec.experts.len()],
-            neural_hi: vec![256; spec.experts.len()],
-            neural_pdf_cdf_rows: vec![vec![0.0; 257]; spec.experts.len()],
+            neural_logps: vec![0.0; plan_experts.len()],
+            neural_bit_modes: vec![0; plan_experts.len()],
+            neural_lo: vec![0; plan_experts.len()],
+            neural_hi: vec![256; plan_experts.len()],
+            neural_pdf_cdf_rows: vec![vec![0.0; 257]; plan_experts.len()],
             scratch: Vec::new(),
             scratch2: Vec::new(),
             projection_scratch: Vec::new(),
@@ -1368,9 +1390,15 @@ pub(crate) struct DiagnosticRatePredictor {
 }
 
 impl DiagnosticRatePredictor {
+    #[cfg(test)]
     pub(crate) fn from_rate_backend(backend: RateBackend, max_order: i64) -> Result<Self> {
+        let compiled = backend.compile().map_err(anyhow::Error::msg)?;
+        Self::from_compiled(&compiled, max_order)
+    }
+
+    pub(crate) fn from_compiled(backend: &CompiledRateBackend, max_order: i64) -> Result<Self> {
         Ok(Self {
-            inner: crate::runtime::build_rate_pdf_predictor(&backend, max_order)?,
+            inner: crate::runtime::build_rate_pdf_predictor(backend, max_order)?,
         })
     }
 
@@ -1449,136 +1477,15 @@ pub(crate) enum RatePdfPredictor {
 }
 
 impl RatePdfPredictor {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_compiled(backend: &CompiledRateBackend, max_order: i64) -> Result<Self> {
+        crate::runtime::build_rate_pdf_predictor(backend, max_order)
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_rate_backend(backend: RateBackend, max_order: i64) -> Result<Self> {
-        validate_rate_backend(&backend).map_err(anyhow::Error::msg)?;
-        match backend {
-            #[cfg(feature = "backend-rosa")]
-            RateBackend::RosaPlus => Ok(Self::Rosa(RosaPredictor::new(max_order))),
-            #[cfg(not(feature = "backend-rosa"))]
-            RateBackend::RosaPlus => {
-                bail!("backend 'rosaplus' requires infotheory feature 'backend-rosa'")
-            }
-            #[cfg(feature = "backend-match")]
-            RateBackend::Match {
-                hash_bits,
-                min_len,
-                max_len,
-                base_mix,
-                confidence_scale,
-            } => Ok(Self::Match {
-                model: MatchModel::new_contiguous(
-                    hash_bits,
-                    min_len,
-                    max_len,
-                    base_mix,
-                    confidence_scale,
-                ),
-            }),
-            #[cfg(not(feature = "backend-match"))]
-            RateBackend::Match { .. } => {
-                bail!("backend 'match' requires infotheory feature 'backend-match'")
-            }
-            #[cfg(feature = "backend-match")]
-            RateBackend::SparseMatch {
-                hash_bits,
-                min_len,
-                max_len,
-                gap_min,
-                gap_max,
-                base_mix,
-                confidence_scale,
-            } => Ok(Self::SparseMatch {
-                model: SparseMatchModel::new(
-                    hash_bits,
-                    min_len,
-                    max_len,
-                    gap_min,
-                    gap_max,
-                    base_mix,
-                    confidence_scale,
-                ),
-            }),
-            #[cfg(not(feature = "backend-match"))]
-            RateBackend::SparseMatch { .. } => {
-                bail!("backend 'sparse-match' requires infotheory feature 'backend-match'")
-            }
-            #[cfg(feature = "backend-ppmd")]
-            RateBackend::Ppmd { order, memory_mb } => Ok(Self::Ppmd {
-                model: PpmdModel::new(order, memory_mb),
-            }),
-            #[cfg(not(feature = "backend-ppmd"))]
-            RateBackend::Ppmd { .. } => {
-                bail!("backend 'ppmd' requires infotheory feature 'backend-ppmd'")
-            }
-            #[cfg(feature = "backend-sequitur")]
-            RateBackend::Sequitur { context_bytes } => Ok(Self::Sequitur {
-                model: SequiturModel::new(context_bytes),
-            }),
-            #[cfg(not(feature = "backend-sequitur"))]
-            RateBackend::Sequitur { .. } => {
-                bail!("backend 'sequitur' requires infotheory feature 'backend-sequitur'")
-            }
-            #[cfg(feature = "backend-ctw")]
-            RateBackend::Ctw { depth } => Ok(Self::Ctw(CtwPredictor::new_ctw(depth))),
-            #[cfg(not(feature = "backend-ctw"))]
-            RateBackend::Ctw { .. } => {
-                bail!("backend 'ctw' requires infotheory feature 'backend-ctw'")
-            }
-            #[cfg(feature = "backend-ctw")]
-            RateBackend::FacCtw {
-                base_depth,
-                num_percept_bits: _,
-                encoding_bits,
-            } => {
-                let bits = encoding_bits.clamp(1, 8);
-                Ok(Self::FacCtw(CtwPredictor::new_fac(base_depth, bits)))
-            }
-            #[cfg(not(feature = "backend-ctw"))]
-            RateBackend::FacCtw { .. } => {
-                bail!("backend 'fac-ctw' requires infotheory feature 'backend-ctw'")
-            }
-            #[cfg(feature = "backend-mamba")]
-            RateBackend::MambaMethod { method } => {
-                Ok(Self::Mamba(MambaPredictor::from_method(&method)?))
-            }
-            #[cfg(feature = "backend-rwkv")]
-            RateBackend::Rwkv7Method { method } => {
-                Ok(Self::Rwkv(RwkvPredictor::from_method(&method)?))
-            }
-            #[cfg(feature = "backend-zpaq")]
-            RateBackend::Zpaq { method } => Ok(Self::Zpaq(ZpaqPredictor::new(method))),
-            #[cfg(not(feature = "backend-zpaq"))]
-            RateBackend::Zpaq { .. } => {
-                bail!("backend 'zpaq' requires infotheory feature 'backend-zpaq'")
-            }
-            #[cfg(feature = "backend-mixture")]
-            RateBackend::Mixture { spec } => {
-                Ok(Self::Mixture(MixturePredictor::new(spec.as_ref())?))
-            }
-            #[cfg(not(feature = "backend-mixture"))]
-            RateBackend::Mixture { .. } => {
-                bail!("backend 'mixture' requires infotheory feature 'backend-mixture'")
-            }
-            #[cfg(feature = "backend-particle")]
-            RateBackend::Particle { spec } => Ok(Self::Particle(
-                crate::backends::particle::ParticleRuntime::new(spec.as_ref()),
-            )),
-            #[cfg(not(feature = "backend-particle"))]
-            RateBackend::Particle { .. } => {
-                bail!("backend 'particle' requires infotheory feature 'backend-particle'")
-            }
-            #[cfg(feature = "backend-calibrated")]
-            RateBackend::Calibrated { spec } => Ok(Self::Calibrated {
-                base: Box::new(Self::from_rate_backend(spec.base.clone(), max_order)?),
-                core: build_calibrator(spec.as_ref()),
-                pdf: vec![1.0 / 256.0; 256],
-                valid: false,
-            }),
-            #[cfg(not(feature = "backend-calibrated"))]
-            RateBackend::Calibrated { .. } => {
-                bail!("backend 'calibrated' requires infotheory feature 'backend-calibrated'")
-            }
-        }
+        let compiled = backend.compile().map_err(anyhow::Error::msg)?;
+        Self::from_compiled(&compiled, max_order)
     }
 
     fn begin_stream(&mut self, total_len: usize) -> Result<()> {
@@ -2076,7 +1983,7 @@ fn decode_payload_rans(
 /// with payload metadata and CRC for safer transport/storage.
 pub fn compress_rate_bytes(
     data: &[u8],
-    rate_backend: &RateBackend,
+    rate_backend: &CompiledRateBackend,
     max_order: i64,
     coder: CoderType,
     framing: FramingMode,
@@ -2101,7 +2008,7 @@ pub fn compress_rate_bytes(
 /// Return compressed size (in bytes) for `data` using rate coding.
 pub fn compress_rate_size(
     data: &[u8],
-    rate_backend: &RateBackend,
+    rate_backend: &CompiledRateBackend,
     max_order: i64,
     coder: CoderType,
     framing: FramingMode,
@@ -2113,7 +2020,7 @@ pub fn compress_rate_size(
 /// Return compressed size (in bytes) for concatenated slices under one stream.
 pub fn compress_rate_size_chain(
     parts: &[&[u8]],
-    rate_backend: &RateBackend,
+    rate_backend: &CompiledRateBackend,
     max_order: i64,
     coder: CoderType,
     framing: FramingMode,
@@ -2129,7 +2036,7 @@ pub fn compress_rate_size_chain(
 /// Decompress bytes produced by [`compress_rate_bytes`].
 pub fn decompress_rate_bytes(
     input: &[u8],
-    rate_backend: &RateBackend,
+    rate_backend: &CompiledRateBackend,
     max_order: i64,
     _coder: CoderType,
     framing: FramingMode,
@@ -2392,6 +2299,60 @@ fn _zpaq_marker(_: &ZpaqRateModel) {}
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn compiled_rate_backend(backend: &RateBackend) -> CompiledRateBackend {
+        backend
+            .compile()
+            .unwrap_or_else(|err| panic!("failed to compile rate backend for test: {err}"))
+    }
+
+    fn compress_rate_bytes(
+        data: &[u8],
+        rate_backend: &RateBackend,
+        max_order: i64,
+        coder: CoderType,
+        framing: FramingMode,
+    ) -> Result<Vec<u8>> {
+        super::compress_rate_bytes(
+            data,
+            &compiled_rate_backend(rate_backend),
+            max_order,
+            coder,
+            framing,
+        )
+    }
+
+    fn compress_rate_size(
+        data: &[u8],
+        rate_backend: &RateBackend,
+        max_order: i64,
+        coder: CoderType,
+        framing: FramingMode,
+    ) -> Result<u64> {
+        super::compress_rate_size(
+            data,
+            &compiled_rate_backend(rate_backend),
+            max_order,
+            coder,
+            framing,
+        )
+    }
+
+    fn decompress_rate_bytes(
+        input: &[u8],
+        rate_backend: &RateBackend,
+        max_order: i64,
+        coder: CoderType,
+        framing: FramingMode,
+    ) -> Result<Vec<u8>> {
+        super::decompress_rate_bytes(
+            input,
+            &compiled_rate_backend(rate_backend),
+            max_order,
+            coder,
+            framing,
+        )
+    }
 
     fn assert_pdf_close(lhs: &[f64], rhs: &[f64], tol: f64) {
         assert_eq!(lhs.len(), rhs.len());
@@ -3118,6 +3079,34 @@ mod tests {
 
     #[cfg(feature = "backend-rwkv")]
     #[test]
+    fn compiled_rwkv_rate_pdf_predictor_preserves_backend_pdf_exactly() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
+        let backend = RateBackend::Rwkv7Method {
+            method: method.to_string(),
+        }
+        .compile()
+        .expect("compiled rwkv backend");
+        let spec = rwkvzip::parse_method_spec(method).expect("parsed rwkv spec");
+        let mut predictor =
+            RatePdfPredictor::from_compiled(&backend, -1).expect("compiled rwkv predictor");
+        let mut direct =
+            rwkvzip::Compressor::new_from_method_spec(&spec).expect("rwkv backend from spec");
+        let mut pdf = vec![0.0; direct.vocab_size()];
+
+        let predicted = predictor.pdf_next().expect("predictor pdf").to_vec();
+        direct.forward_to_pdf(0, &mut pdf);
+        assert_pdf_close(&predicted, &pdf, 1e-18);
+
+        predictor.update(b'x').expect("predictor update");
+        direct
+            .online_update_from_pdf(b'x', &pdf)
+            .expect("backend update");
+        direct.forward_to_pdf(u32::from(b'x'), &mut pdf);
+        assert_pdf_close(predictor.pdf_next().expect("predictor pdf"), &pdf, 1e-18);
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
     fn rwkv_rate_predictor_matches_backend_after_partial_tbptt_stream() {
         let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=29,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=8,clip=0,momentum=0.9)";
         let data = b"abcdefghij";
@@ -3216,6 +3205,34 @@ mod tests {
             .expect("backend update");
         backend.forward_to_pdf(u32::from(b'x'), &mut direct);
         assert_pdf_close(predictor.pdf_next(), &direct, 1e-18);
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn compiled_mamba_rate_pdf_predictor_preserves_backend_pdf_exactly() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
+        let backend = RateBackend::MambaMethod {
+            method: method.to_string(),
+        }
+        .compile()
+        .expect("compiled mamba backend");
+        let spec = mambazip::parse_method_spec(method).expect("parsed mamba spec");
+        let mut predictor =
+            RatePdfPredictor::from_compiled(&backend, -1).expect("compiled mamba predictor");
+        let mut direct =
+            mambazip::Compressor::new_from_method_spec(&spec).expect("mamba backend from spec");
+        let mut pdf = vec![0.0; direct.vocab_size()];
+
+        let predicted = predictor.pdf_next().expect("predictor pdf").to_vec();
+        direct.forward_to_pdf(0, &mut pdf);
+        assert_pdf_close(&predicted, &pdf, 1e-18);
+
+        predictor.update(b'x').expect("predictor update");
+        direct
+            .online_update_from_pdf(b'x', &pdf)
+            .expect("backend update");
+        direct.forward_to_pdf(u32::from(b'x'), &mut pdf);
+        assert_pdf_close(predictor.pdf_next().expect("predictor pdf"), &pdf, 1e-18);
     }
 
     #[test]

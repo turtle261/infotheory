@@ -99,7 +99,7 @@ pub mod search;
 pub(crate) mod simd_math;
 /// Shared backend/spec parsing and loading helpers.
 pub mod spec;
-use crate::api::RateBackend;
+use crate::api::CompiledRateBackend;
 #[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 pub(crate) use crate::api::{
     CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureSpec,
@@ -107,8 +107,8 @@ pub(crate) use crate::api::{
 };
 #[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 use crate::api::{
-    CompressionBackend, GenerationConfig, InfotheoryCtx, NcdVariant, RateBackendSession,
-    d_kl_bytes, try_biased_entropy_rate_backend, try_conditional_entropy_bytes,
+    CompressionBackend, GenerationConfig, InfotheoryCtx, NcdVariant, RateBackend,
+    RateBackendSession, d_kl_bytes, try_biased_entropy_rate_backend, try_conditional_entropy_bytes,
     try_conditional_entropy_rate_bytes, try_cross_entropy_rate_backend, try_entropy_rate_backend,
     try_entropy_rate_bytes, try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes,
     try_mutual_information_bytes, try_ncd_bytes,
@@ -294,18 +294,17 @@ pub fn validate_zpaq_rate_method(method: &str) -> InfotheoryResult<()> {
 }
 
 #[cfg(feature = "backend-rwkv")]
-pub(crate) fn with_rwkv_method_tls<R>(
+pub(crate) fn with_rwkv_method_spec_tls<R>(
     method: &str,
+    spec: &rwkvzip::MethodSpec,
     f: impl FnOnce(&mut rwkvzip::Compressor) -> R,
 ) -> R {
     RWKV_METHOD_TLS.with(|cell| {
         let mut map = cell.borrow_mut();
-        // Keep a per-method template compressor for fast cloning while ensuring
-        // each call gets isolated mutable runtime state (no cross-call leakage).
         let mut comp = if let Some(template) = map.get(method) {
             template.clone()
         } else {
-            let template = rwkvzip::Compressor::new_from_method(method).unwrap_or_else(|e| {
+            let template = rwkvzip::Compressor::new_from_method_spec(spec).unwrap_or_else(|e| {
                 panic!("invalid rwkv method '{method}': {e:#}");
             });
             map.insert(method.to_string(), template.clone());
@@ -317,8 +316,9 @@ pub(crate) fn with_rwkv_method_tls<R>(
 }
 
 #[cfg(feature = "backend-mamba")]
-pub(crate) fn with_mamba_method_tls<R>(
+pub(crate) fn with_mamba_method_spec_tls<R>(
     method: &str,
+    spec: &mambazip::MethodSpec,
     f: impl FnOnce(&mut mambazip::Compressor) -> R,
 ) -> R {
     MAMBA_METHOD_TLS.with(|cell| {
@@ -326,7 +326,7 @@ pub(crate) fn with_mamba_method_tls<R>(
         let mut comp = if let Some(template) = map.get(method) {
             template.clone()
         } else {
-            let template = mambazip::Compressor::new_from_method(method).unwrap_or_else(|e| {
+            let template = mambazip::Compressor::new_from_method_spec(spec).unwrap_or_else(|e| {
                 panic!("invalid mamba method '{method}': {e:#}");
             });
             map.insert(method.to_string(), template.clone());
@@ -341,7 +341,7 @@ pub(crate) fn try_prequential_rate_backend(
     data: &[u8],
     prefix_parts: &[&[u8]],
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     if data.is_empty() {
         return Ok(0.0);
@@ -378,13 +378,13 @@ pub(crate) fn try_frozen_plugin_rate_backend(
     score_data: &[u8],
     fit_parts: &[&[u8]],
     max_order: i64,
-    backend: &RateBackend,
+    backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     if score_data.is_empty() {
         return Ok(0.0);
     }
     #[cfg(feature = "backend-rosa")]
-    if matches!(backend, RateBackend::RosaPlus) {
+    if matches!(backend.plan(), crate::spec::core::RateBackendPlan::RosaPlus) {
         let mut model = RosaPlus::new(max_order, false, 0, 42);
         let fit_total = fit_parts.iter().map(|part| part.len()).sum::<usize>();
         if fit_total > 0 {
@@ -406,9 +406,13 @@ pub(crate) fn try_frozen_plugin_rate_backend(
         return Ok(model.cross_entropy(score_data));
     }
     #[cfg(feature = "backend-rwkv")]
-    match backend {
-        RateBackend::Rwkv7Method { method } => {
-            return with_rwkv_method_tls(method, |c| {
+    match backend.plan() {
+        crate::spec::core::RateBackendPlan::Rwkv7 {
+            method,
+            parsed_method,
+            ..
+        } => {
+            return with_rwkv_method_spec_tls(method, parsed_method, |c| {
                 c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
                     .map_err(|e| {
                         InfotheoryError::runtime(format!(
@@ -420,9 +424,13 @@ pub(crate) fn try_frozen_plugin_rate_backend(
         _ => {}
     }
     #[cfg(feature = "backend-mamba")]
-    match backend {
-        RateBackend::MambaMethod { method } => {
-            return with_mamba_method_tls(method, |c| {
+    match backend.plan() {
+        crate::spec::core::RateBackendPlan::Mamba {
+            method,
+            parsed_method,
+            ..
+        } => {
+            return with_mamba_method_spec_tls(method, parsed_method, |c| {
                 c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
                     .map_err(|e| {
                         InfotheoryError::runtime(format!(
@@ -500,7 +508,37 @@ mod tests {
 
     #[cfg(not(feature = "backend-zpaq"))]
     fn compress_size_backend(data: &[u8], backend: &CompressionBackend) -> u64 {
-        crate::api::try_compress_size_backend(data, backend).expect("compress_size_backend")
+        let compiled = backend
+            .compile()
+            .unwrap_or_else(|err| panic!("failed to compile compression backend for test: {err}"));
+        crate::api::try_compress_size_backend(data, &compiled).expect("compress_size_backend")
+    }
+
+    fn compiled_rate_backend(backend: &RateBackend) -> crate::spec::CompiledRateBackend {
+        backend
+            .compile()
+            .unwrap_or_else(|err| panic!("failed to compile rate backend for test: {err}"))
+    }
+
+    fn ctx(rate_backend: RateBackend, compression_backend: CompressionBackend) -> InfotheoryCtx {
+        InfotheoryCtx::from_specs(rate_backend, compression_backend)
+            .unwrap_or_else(|err| panic!("failed to build infotheory test context: {err}"))
+    }
+
+    fn generate_rate_backend_chain(
+        prefix_parts: &[&[u8]],
+        bytes: usize,
+        max_order: i64,
+        backend: &RateBackend,
+        config: GenerationConfig,
+    ) -> Vec<u8> {
+        crate::api::generation::generate_rate_backend_chain(
+            prefix_parts,
+            bytes,
+            max_order,
+            &compiled_rate_backend(backend),
+            config,
+        )
     }
 
     fn ncd_bytes(x: &[u8], y: &[u8], method: &str, variant: NcdVariant) -> f64 {
@@ -512,11 +550,12 @@ mod tests {
     }
 
     fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
-        try_entropy_rate_backend(data, max_order, backend).expect("entropy_rate_backend")
+        try_entropy_rate_backend(data, max_order, &compiled_rate_backend(backend))
+            .expect("entropy_rate_backend")
     }
 
     fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
-        try_biased_entropy_rate_backend(data, max_order, backend)
+        try_biased_entropy_rate_backend(data, max_order, &compiled_rate_backend(backend))
             .expect("biased_entropy_rate_backend")
     }
 
@@ -526,8 +565,13 @@ mod tests {
         max_order: i64,
         backend: &RateBackend,
     ) -> f64 {
-        try_cross_entropy_rate_backend(test_data, train_data, max_order, backend)
-            .expect("cross_entropy_rate_backend")
+        try_cross_entropy_rate_backend(
+            test_data,
+            train_data,
+            max_order,
+            &compiled_rate_backend(backend),
+        )
+        .expect("cross_entropy_rate_backend")
     }
 
     fn joint_entropy_rate_backend(
@@ -536,7 +580,7 @@ mod tests {
         max_order: i64,
         backend: &RateBackend,
     ) -> f64 {
-        try_joint_entropy_rate_backend(x, y, max_order, backend)
+        try_joint_entropy_rate_backend(x, y, max_order, &compiled_rate_backend(backend))
             .expect("joint_entropy_rate_backend")
     }
 
@@ -565,7 +609,8 @@ mod tests {
     }
 
     fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
-        crate::api::try_nte_rate_backend(x, y, max_order, backend).expect("nte_rate_backend")
+        crate::api::try_nte_rate_backend(x, y, max_order, &compiled_rate_backend(backend))
+            .expect("nte_rate_backend")
     }
 
     fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -> f64 {
@@ -651,14 +696,14 @@ mod tests {
         label: &str,
     ) {
         let prompt = continuation_prompt();
-        let a = crate::api::generation::generate_rate_backend_chain(
+        let a = generate_rate_backend_chain(
             &[prompt],
             bytes,
             max_order,
             &backend,
             GenerationConfig::default(),
         );
-        let b = crate::api::generation::generate_rate_backend_chain(
+        let b = generate_rate_backend_chain(
             &[prompt],
             bytes,
             max_order,
@@ -684,20 +729,8 @@ mod tests {
     ) {
         let prompt = continuation_prompt();
         let config = GenerationConfig::sampled_frozen(42);
-        let a = crate::api::generation::generate_rate_backend_chain(
-            &[prompt],
-            bytes,
-            max_order,
-            &backend,
-            config,
-        );
-        let b = crate::api::generation::generate_rate_backend_chain(
-            &[prompt],
-            bytes,
-            max_order,
-            &backend,
-            config,
-        );
+        let a = generate_rate_backend_chain(&[prompt], bytes, max_order, &backend, config);
+        let b = generate_rate_backend_chain(&[prompt], bytes, max_order, &backend, config);
         assert_eq!(
             a, b,
             "{label} sampled generation should be deterministic for a fixed seed"
@@ -742,10 +775,7 @@ mod tests {
         let y = b"the quick brown fox jumps over the lazy dog";
         let max_order = 8;
         let prev = get_default_ctx();
-        set_default_ctx(InfotheoryCtx::new(
-            RateBackend::RosaPlus,
-            CompressionBackend::default(),
-        ));
+        set_default_ctx(ctx(RateBackend::RosaPlus, CompressionBackend::default()));
 
         let h_x = entropy_rate_bytes(x, max_order);
         let h_xy = joint_entropy_rate_bytes(x, y, max_order);
@@ -766,10 +796,7 @@ mod tests {
     fn resistance_identity_is_one() {
         let x = b"some repeated repeated repeated text";
         let prev = get_default_ctx();
-        set_default_ctx(InfotheoryCtx::new(
-            RateBackend::RosaPlus,
-            CompressionBackend::default(),
-        ));
+        set_default_ctx(ctx(RateBackend::RosaPlus, CompressionBackend::default()));
         let r0 = resistance_to_transformation_bytes(x, x, 0);
         let r8 = resistance_to_transformation_bytes(x, x, 8);
         assert!((r0 - 1.0).abs() < 1e-12);
@@ -812,7 +839,7 @@ mod tests {
         let h_rosa = entropy_rate_bytes(x, 8);
 
         // Switch to CTW
-        set_default_ctx(InfotheoryCtx::new(
+        set_default_ctx(ctx(
             RateBackend::Ctw { depth: 16 },
             CompressionBackend::default(),
         ));
@@ -872,7 +899,7 @@ mod tests {
         // We test that the clamp upper bound is at least > 1.0 for cases where VI > max(H)
 
         // Use CTW backend for rate-based test
-        set_default_ctx(InfotheoryCtx::new(
+        set_default_ctx(ctx(
             RateBackend::Ctw { depth: 8 },
             CompressionBackend::default(),
         ));
@@ -898,7 +925,7 @@ mod tests {
     #[test]
     fn ctw_empty_data_returns_zero() {
         // Verify empty data doesn't cause division-by-zero or NaN
-        set_default_ctx(InfotheoryCtx::new(
+        set_default_ctx(ctx(
             RateBackend::Ctw { depth: 16 },
             CompressionBackend::default(),
         ));
@@ -980,14 +1007,14 @@ mod tests {
         let bytes = 8usize;
         let max_order = -1;
 
-        let flat = crate::api::generation::generate_rate_backend_chain(
+        let flat = generate_rate_backend_chain(
             &[prompt],
             bytes,
             max_order,
             &backend,
             GenerationConfig::default(),
         );
-        let chained = crate::api::generation::generate_rate_backend_chain(
+        let chained = generate_rate_backend_chain(
             &[front, back],
             bytes,
             max_order,
@@ -1036,7 +1063,7 @@ mod tests {
 
     #[test]
     fn rosaplus_sampled_generation_predicts_green_continuation() {
-        let out = crate::api::generation::generate_rate_backend_chain(
+        let out = generate_rate_backend_chain(
             &[continuation_prompt()],
             8,
             -1,
@@ -1054,13 +1081,13 @@ mod tests {
             memory_mb: 8,
         };
         let mut session =
-            RateBackendSession::from_backend(backend.clone(), -1, Some((prompt.len() + 8) as u64))
+            RateBackendSession::from_spec(backend.clone(), -1, Some((prompt.len() + 8) as u64))
                 .expect("session init");
         session.observe(prompt);
         let from_session = session.generate_bytes(8, GenerationConfig::sampled_frozen(42));
         session.finish().expect("session finish");
 
-        let ctx = InfotheoryCtx::new(backend, CompressionBackend::default());
+        let ctx = ctx(backend, CompressionBackend::default());
         let from_ctx = ctx
             .try_generate_bytes_with_config(prompt, 8, -1, GenerationConfig::sampled_frozen(42))
             .expect("ctx generation");
@@ -1118,7 +1145,7 @@ mod tests {
 
     #[test]
     fn rosa_conditional_chain_matches_concatenated_prefix_scoring() {
-        let ctx = InfotheoryCtx::new(RateBackend::RosaPlus, CompressionBackend::default());
+        let ctx = ctx(RateBackend::RosaPlus, CompressionBackend::default());
         let prefix_parts: [&[u8]; 3] = [b"universal ", b"prior ", b"slice"];
         let data = b"query payload";
 
@@ -1218,7 +1245,7 @@ mod tests {
     #[test]
     fn rwkv_method_conditional_chain_is_stable_across_calls() {
         let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=22,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:infer";
-        let ctx = InfotheoryCtx::new(
+        let ctx = ctx(
             RateBackend::Rwkv7Method {
                 method: method.to_string(),
             },
@@ -1353,23 +1380,25 @@ mod minimal_tests {
     use crate::api::CompressionBackend;
 
     #[cfg(not(feature = "backend-zpaq"))]
-    fn compress_size_backend(data: &[u8], backend: &CompressionBackend) -> u64 {
-        crate::api::try_compress_size_backend(data, backend).expect("compress_size_backend")
-    }
-
-    #[cfg(not(feature = "backend-zpaq"))]
     #[test]
-    #[should_panic(expected = "requires infotheory feature 'backend-zpaq'")]
-    fn explicit_zpaq_backend_fails_loudly() {
+    fn explicit_zpaq_backend_fails_to_compile_without_feature() {
         let backend = CompressionBackend::Zpaq {
             method: "5".to_string(),
         };
-        let _ = compress_size_backend(b"abc", &backend);
+        let err = backend
+            .compile()
+            .err()
+            .expect("zpaq backend should fail loudly at compile boundary");
+        assert!(
+            err.to_string()
+                .contains("requires infotheory feature 'backend-zpaq'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(not(feature = "backend-zpaq"))]
     #[test]
-    fn default_compression_backend_reports_missing_rate_backend_when_none_are_enabled() {
+    fn default_compression_backend_fails_to_compile_when_no_rate_backends_are_enabled() {
         let backend = CompressionBackend::default();
         assert!(matches!(
             &backend,
@@ -1379,8 +1408,10 @@ mod minimal_tests {
                 ..
             }
         ));
-        let err = crate::api::try_compress_size_backend(b"abc", &backend)
-            .expect_err("default backend should fail loudly when no rate backends are enabled");
+        let err = backend
+            .compile()
+            .err()
+            .expect("default backend should fail loudly at compile boundary");
         assert!(
             err.to_string().contains("requires infotheory feature"),
             "unexpected error: {err}"

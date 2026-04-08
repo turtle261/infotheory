@@ -11,7 +11,6 @@ use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 #[cfg(feature = "backend-ctw")]
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor};
 use crate::aixi::model::{Predictor, RateBackendBitPredictor};
-use crate::aixi::rate_backend::rate_backend_contains_zpaq;
 use crate::api::{RateBackend, validate_rate_backend};
 
 /// Configuration parameters for an AIQI agent.
@@ -837,8 +836,13 @@ fn build_predictor(
     #[allow(unused_variables)] return_bits: usize,
 ) -> Result<Box<dyn Predictor>, String> {
     if let Some(rate_backend) = config.rate_backend.clone() {
-        let bit_backend = adapt_rate_backend_for_bit_tokens(rate_backend);
-        let predictor = RateBackendBitPredictor::new(bit_backend, config.rate_backend_max_order)?;
+        let bit_backend = rate_backend
+            .compile()
+            .map_err(|err| err.to_string())?
+            .adapt_for_bit_tokens()
+            .map_err(|err| err.to_string())?;
+        let predictor =
+            RateBackendBitPredictor::from_compiled(bit_backend, config.rate_backend_max_order)?;
         return Ok(Box::new(predictor));
     }
 
@@ -870,8 +874,12 @@ fn build_predictor(
                 let max_order = config
                     .rosa_max_order
                     .unwrap_or(config.rate_backend_max_order);
-                let bit_backend = adapt_rate_backend_for_bit_tokens(RateBackend::RosaPlus);
-                let predictor = RateBackendBitPredictor::new(bit_backend, max_order)?;
+                let bit_backend = RateBackend::RosaPlus
+                    .compile()
+                    .map_err(|err| err.to_string())?
+                    .adapt_for_bit_tokens()
+                    .map_err(|err| err.to_string())?;
+                let predictor = RateBackendBitPredictor::from_compiled(bit_backend, max_order)?;
                 Ok(Box::new(predictor))
             }
             #[cfg(not(feature = "backend-rosa"))]
@@ -885,10 +893,17 @@ fn build_predictor(
                 "algorithm=rwkv requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
                     .to_string()
             })?;
-            let bit_backend = adapt_rate_backend_for_bit_tokens(RateBackend::Rwkv7Method {
+            let bit_backend = RateBackend::Rwkv7Method {
                 method: format!("file:{path}"),
-            });
-            let predictor = RateBackendBitPredictor::new(bit_backend, config.rate_backend_max_order)?;
+            }
+            .compile()
+            .map_err(|err| err.to_string())?
+            .adapt_for_bit_tokens()
+            .map_err(|err| err.to_string())?;
+            let predictor = RateBackendBitPredictor::from_compiled(
+                bit_backend,
+                config.rate_backend_max_order,
+            )?;
             Ok(Box::new(predictor))
         }
         #[cfg(not(feature = "backend-rwkv"))]
@@ -901,12 +916,11 @@ fn build_predictor(
     }
 }
 
-fn adapt_rate_backend_for_bit_tokens(backend: RateBackend) -> RateBackend {
-    crate::aixi::rate_backend::adapt_rate_backend_for_bit_tokens(backend)
-}
-
 fn rate_backend_supports_aiqi_frozen_conditioning(backend: &RateBackend) -> bool {
-    !rate_backend_contains_zpaq(backend)
+    backend
+        .compile()
+        .map(|compiled| compiled.supports_frozen_conditioning())
+        .unwrap_or(false)
 }
 
 fn aiqi_requires_generic_planner(config: &AiqiConfig) -> bool {

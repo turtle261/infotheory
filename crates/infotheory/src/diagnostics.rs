@@ -2,9 +2,11 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend};
+use crate::api::{CompiledRateBackend, MixtureSpec, RateBackend};
+#[cfg(test)]
+use crate::api::{MixtureExpertSpec, MixtureKind};
 use crate::compression::{AcLogLossNodeValue, DiagnosticRatePredictor};
-use crate::mixture::RateBackendPredictor;
+use crate::spec::core::{RateBackendPlan, RateBackendPlanExpert, compiled_rate_backend_from_plan};
 use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -138,73 +140,10 @@ fn bits_from_prob(prob: f64) -> f64 {
     -prob.max(crate::mixture::DEFAULT_MIN_PROB).log2()
 }
 
-fn mixture_kind_label(kind: MixtureKind) -> &'static str {
-    match kind {
-        MixtureKind::Bayes => "mixture:bayes",
-        MixtureKind::FadingBayes => "mixture:fading-bayes",
-        MixtureKind::Switching => "mixture:switching",
-        MixtureKind::Convex => "mixture:convex",
-        MixtureKind::Mdl => "mixture:mdl",
-        MixtureKind::Neural => "mixture:neural",
-    }
-}
-
-fn backend_label(expert: &MixtureExpertSpec) -> String {
-    match &expert.backend {
-        RateBackend::RosaPlus => format!("rosaplus(max_order={})", expert.max_order),
-        RateBackend::Match {
-            hash_bits,
-            min_len,
-            max_len,
-            base_mix,
-            confidence_scale,
-        } => format!(
-            "match(hash_bits={hash_bits},min_len={min_len},max_len={max_len},base_mix={base_mix},confidence_scale={confidence_scale})"
-        ),
-        RateBackend::SparseMatch {
-            hash_bits,
-            min_len,
-            max_len,
-            gap_min,
-            gap_max,
-            base_mix,
-            confidence_scale,
-        } => format!(
-            "sparse-match(hash_bits={hash_bits},min_len={min_len},max_len={max_len},gap_min={gap_min},gap_max={gap_max},base_mix={base_mix},confidence_scale={confidence_scale})"
-        ),
-        RateBackend::Ppmd { order, memory_mb } => {
-            format!("ppmd(order={order},memory_mb={memory_mb})")
-        }
-        RateBackend::Sequitur { context_bytes } => {
-            format!("sequitur(context_bytes={context_bytes})")
-        }
-        RateBackend::Ctw { depth } => format!("ctw(depth={depth})"),
-        RateBackend::FacCtw {
-            base_depth,
-            num_percept_bits,
-            encoding_bits,
-        } => format!(
-            "fac-ctw(base_depth={base_depth},num_percept_bits={num_percept_bits},encoding_bits={encoding_bits})"
-        ),
-        #[cfg(feature = "backend-mamba")]
-        #[cfg(feature = "backend-mamba")]
-        RateBackend::MambaMethod { method } => format!("mamba(method={method})"),
-        #[cfg(feature = "backend-rwkv")]
-        RateBackend::Rwkv7Method { method } => format!("rwkv7(method={method})"),
-        RateBackend::Zpaq { method } => format!("zpaq(method={method})"),
-        RateBackend::Mixture { spec } => mixture_kind_label(spec.kind).to_string(),
-        RateBackend::Particle { spec } => format!(
-            "particle(num_particles={},num_cells={})",
-            spec.num_particles, spec.num_cells
-        ),
-        RateBackend::Calibrated { spec } => format!(
-            "calibrated(context={:?},bins={},learning_rate={},bias_clip={})",
-            spec.context, spec.bins, spec.learning_rate, spec.bias_clip
-        ),
-    }
-}
-
-fn flatten_mixture_spec(spec: &MixtureSpec) -> FlatSchema {
+fn flatten_compiled_mixture(backend: &CompiledRateBackend) -> FlatSchema {
+    let RateBackendPlan::Mixture { experts, .. } = backend.plan() else {
+        unreachable!("compiled diagnostic root must be a mixture backend");
+    };
     let mut schema = FlatSchema {
         nodes: vec![FlatNodeMeta {
             id: 0,
@@ -212,7 +151,7 @@ fn flatten_mixture_spec(spec: &MixtureSpec) -> FlatSchema {
             depth: 0,
             path: "0:root".to_string(),
             display_name: "root".to_string(),
-            backend_label: mixture_kind_label(spec.kind).to_string(),
+            backend_label: backend.display_label(-1),
             is_mixture: true,
             is_leaf: false,
             is_root_child: false,
@@ -220,22 +159,40 @@ fn flatten_mixture_spec(spec: &MixtureSpec) -> FlatSchema {
         non_root_ids: Vec::new(),
         root_child_ids: Vec::new(),
     };
-    flatten_experts(&mut schema, &spec.experts, 0, 1, "0:root", true);
+    flatten_experts(&mut schema, experts.as_ref(), 0, 1, "0:root", true);
     schema
+}
+
+#[cfg(test)]
+fn flatten_mixture_spec(spec: &MixtureSpec) -> FlatSchema {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(spec.clone()),
+    }
+    .compile()
+    .unwrap_or_else(|err| panic!("failed to compile diagnostic mixture schema: {err}"));
+    flatten_compiled_mixture(&backend)
 }
 
 fn flatten_experts(
     schema: &mut FlatSchema,
-    experts: &[MixtureExpertSpec],
+    experts: &[RateBackendPlanExpert],
     parent_id: usize,
     depth: usize,
     parent_path: &str,
     root_level: bool,
 ) {
     for expert in experts {
-        let raw_display_name = expert.name.clone().unwrap_or_else(|| {
-            RateBackendPredictor::default_name(&expert.backend, expert.max_order)
-        });
+        let backend =
+            compiled_rate_backend_from_plan(expert.backend.clone()).unwrap_or_else(|err| {
+                panic!(
+                    "failed to compile diagnostic mixture expert '{}': {err}",
+                    expert.name.as_deref().unwrap_or("<unnamed>")
+                )
+            });
+        let raw_display_name = expert
+            .name
+            .clone()
+            .unwrap_or_else(|| backend.default_name(expert.max_order));
         let display_name = sanitize_tsv_text(&raw_display_name);
         let node_id = schema.nodes.len();
         let path = format!(
@@ -243,14 +200,14 @@ fn flatten_experts(
             node_id,
             sanitize_path_segment(&display_name)
         );
-        let is_mixture = matches!(expert.backend, RateBackend::Mixture { .. });
+        let is_mixture = matches!(expert.backend.as_ref(), RateBackendPlan::Mixture { .. });
         let meta = FlatNodeMeta {
             id: node_id,
             parent_id: Some(parent_id),
             depth,
             path,
             display_name,
-            backend_label: sanitize_tsv_text(&backend_label(expert)),
+            backend_label: sanitize_tsv_text(&backend.display_label(expert.max_order)),
             is_mixture,
             is_leaf: !is_mixture,
             is_root_child: root_level,
@@ -260,9 +217,16 @@ fn flatten_experts(
         if root_level {
             schema.root_child_ids.push(node_id);
         }
-        if let RateBackend::Mixture { spec } = &expert.backend {
+        if let RateBackendPlan::Mixture { experts, .. } = expert.backend.as_ref() {
             let node_path = schema.nodes[node_id].path.clone();
-            flatten_experts(schema, &spec.experts, node_id, depth + 1, &node_path, false);
+            flatten_experts(
+                schema,
+                experts.as_ref(),
+                node_id,
+                depth + 1,
+                &node_path,
+                false,
+            );
         }
     }
 }
@@ -323,7 +287,12 @@ pub fn run_ac_log_loss_mixture_bytes(
     let trace_path = out_prefix.with_extension("trace.tsv");
     let nodes_path = out_prefix.with_extension("nodes.tsv");
     let summary_path = out_prefix.with_extension("summary.tsv");
-    let schema = flatten_mixture_spec(spec);
+    let compiled_backend = RateBackend::Mixture {
+        spec: Arc::new(spec.clone()),
+    }
+    .compile()
+    .map_err(anyhow::Error::msg)?;
+    let schema = flatten_compiled_mixture(&compiled_backend);
     write_nodes_tsv(&nodes_path, &schema)?;
 
     let threads = parse_diagnostic_threads_from_env()?;
@@ -338,12 +307,7 @@ pub fn run_ac_log_loss_mixture_bytes(
         None
     };
 
-    let mut predictor = DiagnosticRatePredictor::from_rate_backend(
-        RateBackend::Mixture {
-            spec: Arc::new(spec.clone()),
-        },
-        -1,
-    )?;
+    let mut predictor = DiagnosticRatePredictor::from_compiled(&compiled_backend, -1)?;
     predictor.begin_stream(data.len())?;
 
     let trace_file = File::create(&trace_path)
@@ -701,6 +665,7 @@ mod tests {
         let backend = RateBackend::Mixture {
             spec: Arc::new(spec),
         };
+        let backend = backend.compile().expect("compiled mixture backend");
         let encoded = crate::compression::compress_rate_bytes(
             data,
             &backend,
