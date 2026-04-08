@@ -59,7 +59,9 @@ pub enum BackendAvailability {
 /// Method-backed neural backend family shared by CLI-facing integration helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MethodBackendFamily {
+    /// Mamba-family method strings and compiled plans.
     Mamba,
+    /// RWKV7-family method strings and compiled plans.
     Rwkv7,
 }
 

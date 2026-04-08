@@ -10,7 +10,12 @@ Estimate core measures using both **Marginal** (distribution-based) and **Rate**
 - **Resistance**: Information preservation under noise/transform.
 
 ### 2. Multi-Backend Predictive Engine
-The core model class in the library is `RateBackend`. A `RateBackend` is the predictive model object used by entropy-rate estimators, rate-coded compression, generation, and the agent world-model interface.
+The library exposes two layers for predictive backends:
+
+- `RateBackend` / `CompressionBackend`: wrapper ASTs and compatibility specs used by CLI, JSON, and Python-facing surfaces.
+- `CompiledRateBackend` / `CompiledCompressionBackend`: canonicalized, validated, immutable execution plans used by the generic Rust API.
+
+In other words, wrapper specs are the configuration layer, and compiled plans are the execution layer. This keeps parsing, canonicalization, feature validation, and method-string resolution out of hot runtime paths.
 
 Switch between different `RateBackend` families seamlessly:
 - **ROSA+ (Rapid Online Suffix Automaton + Witten Bell)**: A fast statistical LM. Default backend. 
@@ -19,7 +24,7 @@ Switch between different `RateBackend` families seamlessly:
 - **Mamba (Neural Network)**: Deterministic CPU-first Mamba-1 backend with online mode + export.
 - **RWKV (Neural Network)**: Portable SIMD RWKV7 CPU inference backend (`wide`-based).
 
-The same `RateBackend` model class also supports ensemble world models. `RateBackend::Mixture` combines `RateBackend` experts into a single predictive model: `Bayes`, `Switching`, and `Convex` follow *On Ensemble Techniques for AIXI Approximation*, while `FadingBayes`, `Mdl`, and `Neural` are extensions implemented in this repository.
+The same `RateBackend` wrapper family also supports ensemble world models. `RateBackend::Mixture` combines `RateBackend` experts into a single predictive model: `Bayes`, `Switching`, and `Convex` follow *On Ensemble Techniques for AIXI Approximation*, while `FadingBayes`, `Mdl`, and `Neural` are extensions implemented in this repository.
 
 ### 3. Integrated MC-AIXI Agent
 Includes a full implementation of the **Monte Carlo AIXI (MC-AIXI)** agent described by Hutter et al. It approximates incomputable AIXI with Monte-Carlo Tree Search and can use the library's `RateBackend` model class, including mixture-based ensemble world models, as its world model.
@@ -97,6 +102,43 @@ Add the dependency in your `Cargo.toml`:
 infotheory = { path = "." } # Replace with a git or crates.io source as needed.
 ```
 
+### Library API layering
+
+The generic Rust API is compiled-plan-first. Typical library usage is:
+
+```rust
+use infotheory::api::{
+    CompiledRateBackend, CompressionBackend, InfotheoryCtx, RateBackend,
+};
+
+let rate_backend: CompiledRateBackend = RateBackend::Ctw { depth: 16 }
+    .compile()
+    .expect("valid backend");
+
+let compression_backend = CompressionBackend::Rate {
+    rate_backend: RateBackend::Ctw { depth: 16 },
+    coder: infotheory::coders::CoderType::AC,
+    framing: infotheory::compression::FramingMode::Raw,
+}
+.compile()
+.expect("valid compression backend");
+
+let ctx = InfotheoryCtx::new(rate_backend.clone(), compression_backend)
+    .expect("ctx");
+
+let bits = ctx.try_entropy_rate_bytes(b"abracadabra", 16).expect("entropy");
+assert!(bits.is_finite());
+```
+
+For callers that still start from wrapper specs, compatibility helpers remain available:
+
+- `RateBackend::validate()` / `CompressionBackend::validate()`
+- `RateBackend::compile()` / `CompressionBackend::compile()`
+- `InfotheoryCtx::from_specs(...)`
+
+`ValidatedRateBackend`, `ValidatedCompressionBackend`, `CompiledRateBackend`,
+and `CompiledCompressionBackend` are all re-exported from `infotheory::api`.
+
 ### Building Nyx-Lite
 The VM backend is optional (`--features vm`) and depends on `vendor/nyx-lite` (and its vendored submodule code). Build it with:
 ```bash
@@ -153,6 +195,9 @@ CLI:
 
 For rate-coded metrics, raw framing is used by default to avoid framing overhead.
 Explicit `compress_bytes_backend` / `decompress_bytes_backend` APIs support framed payloads for roundtrip verification.
+
+For direct Rust usage, those compression APIs take `CompiledCompressionBackend`.
+Compile once up front and reuse the compiled plan when you care about minimizing repeated setup overhead.
 
 ### AC Log-Loss Diagnostics
 

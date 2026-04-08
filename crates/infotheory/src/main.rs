@@ -65,6 +65,8 @@ use std::time::Instant;
 
 #[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
 use crate::cli::load_expert_spec;
+#[cfg(feature = "vm")]
+use crate::cli::parse_nyx_environment_config;
 use crate::cli::{
     aiqi_backend_label, build_ctx, file_roundtrip_compiled_backend, load_mixture_spec,
     maybe_export_online_model, parse_compression_backend, parse_observation_key_mode_for_env,
@@ -79,13 +81,6 @@ use crate::cli::{
     file_roundtrip_backend, parse_observation_key_mode, parse_observation_key_mode_for_vm,
     parse_observation_key_mode_str, parse_observation_stream_len,
     parse_observation_stream_len_for_vm, process_json_line,
-};
-#[cfg(feature = "vm")]
-use crate::cli::{
-    parse_nyx_actions, parse_nyx_environment_config, parse_nyx_filter,
-    parse_nyx_observation_pad_byte, parse_nyx_observation_policy,
-    parse_nyx_observation_stream_mode, parse_nyx_protocol_config, parse_nyx_reward_policy,
-    parse_nyx_reward_shaping, parse_nyx_trace_config, parse_shared_memory_policy,
 };
 #[cfg(feature = "backend-rosa")]
 use infotheory::search;

@@ -9,6 +9,7 @@ TIME_CMD=/usr/bin/time
 BENCH_SUITE=${INFOTHEORY_BENCH_SUITE:-two-json}
 COMP_BACKEND=${INFOTHEORY_BENCH_COMPRESSION_BACKEND:-rate-ac}
 BENCH_FEATURES=${INFOTHEORY_BENCH_FEATURES:-cli}
+BENCH_BUILD_MODE=${INFOTHEORY_BENCH_BUILD_MODE:-${INFOTHEORY_BUILD_MODE:-native}}
 REPEATS=${INFOTHEORY_BENCH_REPEATS:-3}
 WARMUPS=${INFOTHEORY_BENCH_WARMUPS:-1}
 SIZES=${INFOTHEORY_BENCH_SIZES:-"4096 16384 65536 262144 1048576 2097152 4194304 10000000"}
@@ -86,6 +87,7 @@ Environment:
   INFOTHEORY_BENCH_SIZES="4096 16384 ... 10000000"
   INFOTHEORY_BENCH_SUBJECTS=rwkv
   INFOTHEORY_BENCH_FEATURES="cli backend-rwkv"
+  INFOTHEORY_BENCH_BUILD_MODE=native|portable
   INFOTHEORY_BENCH_CPU=11
   INFOTHEORY_BENCH_COMPRESSION_BACKEND=rate-ac
   INFOTHEORY_BENCH_WORKDIR_ROOT=/var/tmp
@@ -129,7 +131,36 @@ case " ${BENCH_FEATURES} " in
   *" cli "*) ;;
   *) BENCH_FEATURES="cli ${BENCH_FEATURES}" ;;
 esac
-BENCH_BUILD_MODE=${INFOTHEORY_CLI_BENCH_BUILD_MODE:-${INFOTHEORY_BUILD_MODE:-native}}
+
+case "${BENCH_BUILD_MODE}" in
+  native|portable) ;;
+  *)
+    fail "INFOTHEORY_BENCH_BUILD_MODE (or INFOTHEORY_BUILD_MODE fallback) must be 'native' or 'portable'"
+    ;;
+esac
+
+portable_rustflags() {
+  case "$(uname -s)" in
+    Linux|FreeBSD|OpenBSD) printf '%s' "-C target-cpu=generic -C link-arg=-fuse-ld=lld" ;;
+    *) printf '%s' "-C target-cpu=generic" ;;
+  esac
+}
+
+build_infotheory_cli() {
+  if [ "${BENCH_BUILD_MODE}" = "portable" ]; then
+    bench_rustflags=$(portable_rustflags)
+    (
+      cd "${ROOT_DIR}" && \
+      CARGO_INCREMENTAL=0 \
+      CARGO_BUILD_RUSTFLAGS="${bench_rustflags}" \
+      RUSTDOCFLAGS="${RUSTDOCFLAGS:-${bench_rustflags}}" \
+      cargo build --release --features "${BENCH_FEATURES}" --bin infotheory --locked
+    )
+    return 0
+  fi
+
+  (cd "${ROOT_DIR}" && CARGO_INCREMENTAL=0 cargo build --release --features "${BENCH_FEATURES}" --bin infotheory --locked)
+}
 
 case "${REPEATS}" in
   ''|*[!0-9]*)
@@ -284,7 +315,7 @@ PY
 CPU=$(choose_cpu)
 
 say "[bench] Building release CLI binary with features: ${BENCH_FEATURES}"
-(cd "${ROOT_DIR}" && CARGO_INCREMENTAL=0 cargo build --release --features "${BENCH_FEATURES}" --bin infotheory --locked)
+build_infotheory_cli
 [ -x "${BIN_PATH}" ] || fail "Expected built binary at ${BIN_PATH}"
 
 python3 - "${SUITE_SPEC_PATH}" "${ROOT_DIR}" "${WORK_DIR}" "${SUITE_DISPLAY}" > "${SUBJECTS_TSV}" <<'PY'

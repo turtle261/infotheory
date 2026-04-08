@@ -101,7 +101,7 @@ fn ncd_from_sizes(cx: u64, cy: u64, cxy: u64, cyx: Option<u64>, variant: NcdVari
 /// Compute NCD for byte slices with a ZPAQ `method` string.
 ///
 /// This is a convenience wrapper around [`try_ncd_bytes_backend`] with
-/// [`CompressionBackend::Zpaq`].
+/// [`crate::api::CompressionBackend::Zpaq`].
 pub fn try_ncd_bytes(
     x: &[u8],
     y: &[u8],

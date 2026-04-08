@@ -320,3 +320,11 @@ def test_compare_bench_two_json_rejects_mismatched_suite_spec_digest(
     )
     assert proc.returncode != 0
     assert "suite spec digest mismatch" in proc.stderr
+
+
+def test_bench_two_json_build_mode_namespace_is_bench_scoped():
+    script_text = (_repo_root() / "scripts/bench_two_json.sh").read_text(encoding="utf-8")
+
+    assert "INFOTHEORY_CLI_BENCH_BUILD_MODE" not in script_text
+    assert "INFOTHEORY_BENCH_BUILD_MODE" in script_text
+    assert "CARGO_BUILD_RUSTFLAGS" in script_text

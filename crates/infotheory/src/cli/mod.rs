@@ -373,7 +373,7 @@ pub(super) fn parse_nyx_reward_shaping(
             let baseline_path = v["baseline_path"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("vm_reward_shaping.baseline_path is required"))?;
-            let baseline_path = crate::spec::resolve_spec_path(base_dir, baseline_path);
+            let baseline_path = infotheory::spec::resolve_spec_path(base_dir, baseline_path);
             let baseline_bytes = std::fs::read(&baseline_path)?;
             let max_order = v["max_order"].as_i64().unwrap_or(8);
             let scale = v["scale"].as_f64().unwrap_or(10.0);
