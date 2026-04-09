@@ -1637,10 +1637,6 @@ Examples:
 mod tests {
     use super::*;
     use serde_json::json;
-    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
-    use std::any::Any;
-    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
-    use std::panic;
     #[cfg(any(
         feature = "all-backends",
         feature = "backend-mamba",
@@ -1849,17 +1845,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
-    fn panic_message(payload: Box<dyn Any + Send>) -> String {
-        if let Some(s) = payload.downcast_ref::<String>() {
-            return s.clone();
-        }
-        if let Some(s) = payload.downcast_ref::<&str>() {
-            return (*s).to_string();
-        }
-        "non-string panic payload".to_string()
-    }
-
     #[cfg(feature = "backend-mamba")]
     #[test]
     fn parse_mixture_expert_resolves_mamba_model_path_relative_to_base_dir() {
@@ -1872,14 +1857,14 @@ mod tests {
             "kind": "mamba",
             "model_path": rel_path
         });
-        let panic = panic::catch_unwind(|| {
-            let _ = parse_mixture_expert_value(&expert, &base_dir, 4);
-        })
-        .expect_err("missing model should panic during load");
-        let msg = panic_message(panic);
+        let err = match parse_mixture_expert_value(&expert, &base_dir, 4) {
+            Ok(_) => panic!("missing model should return an error"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
         assert!(
             msg.contains(&expected),
-            "panic should mention resolved absolute model path. expected substring: {expected}, got: {msg}"
+            "error should mention resolved absolute model path. expected substring: {expected}, got: {msg}"
         );
         let _ = std::fs::remove_dir_all(&base_dir);
     }
@@ -1896,14 +1881,14 @@ mod tests {
             "kind": "rwkv7",
             "model_path": rel_path
         });
-        let panic = panic::catch_unwind(|| {
-            let _ = parse_mixture_expert_value(&expert, &base_dir, 4);
-        })
-        .expect_err("missing model should panic during load");
-        let msg = panic_message(panic);
+        let err = match parse_mixture_expert_value(&expert, &base_dir, 4) {
+            Ok(_) => panic!("missing model should return an error"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
         assert!(
             msg.contains(&expected),
-            "panic should mention resolved absolute model path. expected substring: {expected}, got: {msg}"
+            "error should mention resolved absolute model path. expected substring: {expected}, got: {msg}"
         );
         let _ = std::fs::remove_dir_all(&base_dir);
     }

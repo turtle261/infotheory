@@ -750,7 +750,12 @@ impl Model {
 
     /// Load model from safetensors file.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let weights = Weights::load(path.as_ref()).context("Failed to load model weights")?;
+        let weights = Weights::load(path.as_ref()).with_context(|| {
+            format!(
+                "Failed to load model weights from {}",
+                path.as_ref().display()
+            )
+        })?;
 
         // Infer config from weights
         let emb = weights.require("model.embeddings.weight")?;
