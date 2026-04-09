@@ -5,19 +5,7 @@
 //! - an entropy coder (`AC` or `rANS`),
 //! - optional framing metadata for robust decompression.
 #![cfg_attr(
-    not(all(
-        feature = "backend-rosa",
-        feature = "backend-ctw",
-        feature = "backend-match",
-        feature = "backend-ppmd",
-        feature = "backend-sequitur",
-        feature = "backend-mixture",
-        feature = "backend-particle",
-        feature = "backend-calibrated",
-        feature = "backend-zpaq",
-        feature = "backend-rwkv",
-        feature = "backend-mamba"
-    )),
+    not(feature = "all-backends"),
     allow(dead_code, unused_imports, unused_variables, unused_mut)
 )]
 
@@ -2295,7 +2283,7 @@ fn apply_switching_weights(
 #[cfg(feature = "backend-zpaq")]
 fn _zpaq_marker(_: &ZpaqRateModel) {}
 
-#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+#[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
     use std::sync::Arc;

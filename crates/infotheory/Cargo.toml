@@ -21,19 +21,7 @@ wide = "1.1.1"
 
 [features]
 default = ["default-backends"]
-default-backends = [
-    "backend-rosa",
-    "backend-ctw",
-    "backend-match",
-    "backend-ppmd",
-    "backend-sequitur",
-    "backend-mixture",
-    "backend-particle",
-    "backend-calibrated",
-    "backend-mamba",
-    "backend-rwkv",
-    "backend-zpaq",
-]
+default-backends = ["all-backends"]
 all-backends = [
     "backend-rosa",
     "backend-ctw",

@@ -9,19 +9,7 @@
 //! The mixture primitives here power `RateBackend::Mixture`, enabling Bayes, fading Bayes,
 //! switching, and MDL-style selectors to be used anywhere a rate backend is accepted.
 #![cfg_attr(
-    not(all(
-        feature = "backend-rosa",
-        feature = "backend-ctw",
-        feature = "backend-match",
-        feature = "backend-ppmd",
-        feature = "backend-sequitur",
-        feature = "backend-mixture",
-        feature = "backend-particle",
-        feature = "backend-calibrated",
-        feature = "backend-zpaq",
-        feature = "backend-rwkv",
-        feature = "backend-mamba"
-    )),
+    not(feature = "all-backends"),
     allow(
         dead_code,
         unused_imports,
@@ -3216,7 +3204,7 @@ fn build_mixture_runtime_from_fields(
     }
 }
 
-#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+#[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
     use crate::api::CalibratedSpec;

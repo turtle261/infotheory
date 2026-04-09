@@ -331,47 +331,57 @@ fn canonicalize_explicit_file_method(
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn rwkv_file_method(path: &Path) -> String {
-    format!("file:{}", path.display())
+fn rwkv_file_method(path: &Path) -> SpecResult<String> {
+    crate::rwkvzip::canonical_method_string(&crate::rwkvzip::MethodSpec::File {
+        path: path.to_path_buf(),
+        policy: None,
+    })
+    .map_err(|err| SpecError::new(err.to_string()))
 }
 
 #[cfg(feature = "backend-mamba")]
-fn mamba_file_method(path: &Path) -> String {
-    format!("file:{}", path.display())
+fn mamba_file_method(path: &Path) -> SpecResult<String> {
+    crate::mambazip::canonical_method_string(&crate::mambazip::MethodSpec::File {
+        path: path.to_path_buf(),
+        policy: None,
+    })
+    .map_err(|err| SpecError::new(err.to_string()))
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn validate_rwkv_method_eager(method: &str) {
-    let _ =
-        crate::rwkvzip::Compressor::new_from_method(method).unwrap_or_else(|err| panic!("{err:#}"));
+fn validate_rwkv_method_eager(method: &str) -> SpecResult<()> {
+    crate::rwkvzip::Compressor::new_from_method(method)
+        .map(|_| ())
+        .map_err(|err| SpecError::new(err.to_string()))
 }
 
 #[cfg(feature = "backend-mamba")]
-fn validate_mamba_method_eager(method: &str) {
-    let _ = crate::mambazip::Compressor::new_from_method(method)
-        .unwrap_or_else(|err| panic!("{err:#}"));
+fn validate_mamba_method_eager(method: &str) -> SpecResult<()> {
+    crate::mambazip::Compressor::new_from_method(method)
+        .map(|_| ())
+        .map_err(|err| SpecError::new(err.to_string()))
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn normalize_rwkv_path_method(base_dir: &Path, model_path: &str) -> String {
+fn normalize_rwkv_path_method(base_dir: &Path, model_path: &str) -> SpecResult<String> {
     let full = resolve_spec_path(base_dir, model_path);
-    let method = rwkv_file_method(&full);
-    validate_rwkv_method_eager(&method);
-    method
+    let method = rwkv_file_method(&full)?;
+    validate_rwkv_method_eager(&method)?;
+    Ok(method)
 }
 
 #[cfg(feature = "backend-mamba")]
-fn normalize_mamba_path_method(base_dir: &Path, model_path: &str) -> String {
+fn normalize_mamba_path_method(base_dir: &Path, model_path: &str) -> SpecResult<String> {
     let full = resolve_spec_path(base_dir, model_path);
-    let method = mamba_file_method(&full);
-    validate_mamba_method_eager(&method);
-    method
+    let method = mamba_file_method(&full)?;
+    validate_mamba_method_eager(&method)?;
+    Ok(method)
 }
 
 #[cfg(feature = "backend-rwkv")]
 fn normalize_rwkv_method_for_base_dir(base_dir: &Path, method: &str) -> SpecResult<String> {
     if let Some(canonical) = canonicalize_explicit_file_method(base_dir, method, "rwkv")? {
-        validate_rwkv_method_eager(&canonical);
+        validate_rwkv_method_eager(&canonical)?;
         Ok(canonical)
     } else {
         Ok(method.to_string())
@@ -381,7 +391,7 @@ fn normalize_rwkv_method_for_base_dir(base_dir: &Path, method: &str) -> SpecResu
 #[cfg(feature = "backend-mamba")]
 fn normalize_mamba_method_for_base_dir(base_dir: &Path, method: &str) -> SpecResult<String> {
     if let Some(canonical) = canonicalize_explicit_file_method(base_dir, method, "mamba")? {
-        validate_mamba_method_eager(&canonical);
+        validate_mamba_method_eager(&canonical)?;
         Ok(canonical)
     } else {
         Ok(method.to_string())
@@ -406,7 +416,7 @@ pub fn parse_rwkv7_compression_backend_method(
                     "rwkv7 compression backend requires a method string or a configured model path",
                 )
             })?;
-            normalize_rwkv_path_method(&options.base_dir, model_path)
+            normalize_rwkv_path_method(&options.base_dir, model_path)?
         };
         let parsed = crate::rwkvzip::parse_method_spec(&method).map_err(|err| {
             SpecError::new(format!(
@@ -810,7 +820,7 @@ pub fn parse_rate_backend_json(
                             SpecError::new("mamba backend requires 'method' or 'model_path'")
                         })?;
                     Ok(RateBackend::MambaMethod {
-                        method: normalize_mamba_path_method(base_dir, model_path),
+                        method: normalize_mamba_path_method(base_dir, model_path)?,
                     })
                 }
             }
@@ -834,7 +844,7 @@ pub fn parse_rate_backend_json(
                             SpecError::new("rwkv7 backend requires 'method' or 'model_path'")
                         })?;
                     Ok(RateBackend::Rwkv7Method {
-                        method: normalize_rwkv_path_method(base_dir, model_path),
+                        method: normalize_rwkv_path_method(base_dir, model_path)?,
                     })
                 }
             }
@@ -1264,7 +1274,7 @@ pub fn parse_rate_backend_name_method(
                     })
                 } else if let Some(path) = options.default_mamba_model_path.as_deref() {
                     Ok(RateBackend::MambaMethod {
-                        method: normalize_mamba_path_method(&options.base_dir, path),
+                        method: normalize_mamba_path_method(&options.base_dir, path)?,
                     })
                 } else {
                     Err(SpecError::new(
@@ -1286,7 +1296,7 @@ pub fn parse_rate_backend_name_method(
                     })
                 } else if let Some(path) = options.default_rwkv_model_path.as_deref() {
                     Ok(RateBackend::Rwkv7Method {
-                        method: normalize_rwkv_path_method(&options.base_dir, path),
+                        method: normalize_rwkv_path_method(&options.base_dir, path)?,
                     })
                 } else {
                     Err(SpecError::new(
@@ -1389,7 +1399,7 @@ pub fn parse_compression_backend_name_method(
                             )
                         })?;
                         Ok(CompressionBackend::Rwkv7 {
-                            method: normalize_rwkv_path_method(&options.base_dir, model_path),
+                            method: normalize_rwkv_path_method(&options.base_dir, model_path)?,
                             coder: crate::backends::parse_rwkv7_coder(m)
                                 .expect("coder alias already validated"),
                         })
@@ -1436,7 +1446,6 @@ mod tests {
         MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend,
     };
     #[cfg(any(
-        feature = "default-backends",
         feature = "all-backends",
         feature = "backend-rwkv",
         feature = "backend-mamba"
@@ -1721,7 +1730,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
+    #[cfg(feature = "all-backends")]
     #[test]
     fn rate_backend_json_roundtrip_handles_nested_specs() {
         let backend = RateBackend::Calibrated {
@@ -1774,7 +1783,7 @@ mod tests {
         assert_eq!(json, roundtrip);
     }
 
-    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
+    #[cfg(feature = "all-backends")]
     #[test]
     fn compression_backend_json_roundtrip_handles_rate_wrappers() {
         let backend = CompressionBackend::Rate {
@@ -1803,7 +1812,7 @@ mod tests {
         assert_eq!(json, roundtrip);
     }
 
-    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
+    #[cfg(feature = "all-backends")]
     #[test]
     fn parse_compression_backend_name_method_uses_shared_shorthand_defaults() {
         let rate_backend = RateBackend::Ppmd {

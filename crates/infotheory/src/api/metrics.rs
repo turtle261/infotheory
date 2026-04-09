@@ -103,7 +103,7 @@ pub fn try_biased_entropy_rate_backend(
 ) -> InfotheoryResult<f64> {
     if !backend.capabilities().supports_biased_entropy {
         Err(InfotheoryError::unsupported(
-            "biased/plugin entropy is not supported for zpaq rate backends in 1.1.1",
+            "biased/plugin entropy is not supported for zpaq rate backends",
         ))
     } else {
         crate::try_frozen_plugin_rate_backend(data, &[data], max_order, backend)

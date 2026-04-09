@@ -1,5 +1,10 @@
-use crate::api::{InfotheoryCtx, marginal_entropy_bytes, try_cross_entropy_bytes};
+use crate::api::{
+    CompressionBackend, InfotheoryCtx, RateBackend, marginal_entropy_bytes, try_cross_entropy_bytes,
+};
 use crate::backends::rosaplus::RosaPlus;
+use crate::coders::CoderType;
+use crate::compression::FramingMode;
+use crate::error::{InfotheoryError, InfotheoryResult};
 #[cfg(feature = "backend-rwkv")]
 use crate::spec::MethodBackendFamily;
 use crate::spec::RateBackendTraceStrategy;
@@ -29,26 +34,28 @@ fn stage0_prefilter(
     mut candidates: Vec<Snippet>,
     opts: &SearchOptions,
     debug: bool,
-) -> Vec<Snippet> {
+) -> InfotheoryResult<Vec<Snippet>> {
     let n = candidates.len();
     if n == 0 {
-        return candidates;
+        return Ok(candidates);
     }
 
     let frac = opts.stage0_keep_frac.clamp(0.0, 1.0);
     if frac >= 1.0 {
-        return candidates;
+        return Ok(candidates);
     }
 
     // Option A: Unigram (i.i.d.) likelihood-gain proxy.
     // score0(x) = H0(Q) - H0(Q|X)
     // where H0(Q|X) is computed as cross-entropy of Q under X's unigram model.
     let h0_q = marginal_entropy_bytes(query_bytes);
-    candidates.par_iter_mut().for_each(|s| {
-        let h0_q_x = try_cross_entropy_bytes(query_bytes, &s.content, 0)
-            .expect("stage-0 search cross entropy should be infallible");
+    candidates.par_iter_mut().try_for_each(|s| {
+        let h0_q_x = try_cross_entropy_bytes(query_bytes, &s.content, 0).map_err(|err| {
+            InfotheoryError::runtime(format!("stage-0 search scoring failed: {err}"))
+        })?;
         s.score = h0_q - h0_q_x;
-    });
+        Ok::<(), InfotheoryError>(())
+    })?;
 
     let mut keep = ((n as f64) * frac).ceil() as usize;
     keep = keep.max(opts.top_k).min(n);
@@ -71,7 +78,7 @@ fn stage0_prefilter(
         );
     }
 
-    candidates
+    Ok(candidates)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -124,20 +131,32 @@ impl Default for SearchOptions {
             max_order: 8,
             top_k: 50,
             stage0_keep_frac: 0.2,
-            ctx: InfotheoryCtx::with_zpaq("5"),
+            ctx: InfotheoryCtx::from_specs(
+                RateBackend::RosaPlus,
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::RosaPlus,
+                    coder: CoderType::AC,
+                    framing: FramingMode::Raw,
+                },
+            )
+            .expect("search defaults should compile in backend-rosa builds"),
         }
     }
 }
 
 /// Run search with default options and print top shell extraction commands.
-pub fn run_search(query: &str, target_path: &str) {
-    run_search_with_options(query, target_path, &SearchOptions::default());
+pub fn run_search(query: &str, target_path: &str) -> InfotheoryResult<()> {
+    run_search_with_options(query, target_path, &SearchOptions::default())
 }
 
 /// Run search with explicit options and print top shell extraction commands.
-pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOptions) {
+pub fn run_search_with_options(
+    query: &str,
+    target_path: &str,
+    opts: &SearchOptions,
+) -> InfotheoryResult<()> {
     let debug = std::env::var("DEBUG_SEARCH").is_ok();
-    let results = search_with_options(query, target_path, opts);
+    let results = search_with_options(query, target_path, opts)?;
     for (i, snippet) in results.iter().take(5).enumerate() {
         if debug {
             println!(
@@ -154,6 +173,7 @@ pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOpti
             snippet.path.display()
         );
     }
+    Ok(())
 }
 
 /// Run the full 3-stage search pipeline and return ranked results.
@@ -161,12 +181,15 @@ pub fn run_search_with_options(query: &str, target_path: &str, opts: &SearchOpti
 /// The returned `Vec<Snippet>` is sorted by descending score, truncated
 /// to `opts.top_k` entries.  Each snippet carries its file path, line
 /// range, content bytes, and final KMI-reranked score.
-pub fn search_with_options(query: &str, target_path: &str, opts: &SearchOptions) -> Vec<Snippet> {
+pub fn search_with_options(
+    query: &str,
+    target_path: &str,
+    opts: &SearchOptions,
+) -> InfotheoryResult<Vec<Snippet>> {
     let debug = std::env::var("DEBUG_SEARCH").is_ok();
     let query_bytes = resolve_query_bytes(query);
     if query_bytes.is_empty() {
-        eprintln!("Error: Query is empty.");
-        return Vec::new();
+        return Err(InfotheoryError::runtime("search query is empty"));
     }
 
     if debug {
@@ -181,14 +204,16 @@ pub fn search_with_options(query: &str, target_path: &str, opts: &SearchOptions)
 
     let candidates = collect_candidates(target_path, opts.granularity);
     if candidates.is_empty() {
-        eprintln!("No accessible files found in target '{}'.", target_path);
-        return Vec::new();
+        return Err(InfotheoryError::runtime(format!(
+            "no accessible files found in target '{target_path}'"
+        )));
     }
 
-    let candidates = stage0_prefilter(query_bytes.as_slice(), candidates, opts, debug);
+    let candidates = stage0_prefilter(query_bytes.as_slice(), candidates, opts, debug)?;
     if candidates.is_empty() {
-        eprintln!("No candidates remain after Stage-0 prefilter.");
-        return Vec::new();
+        return Err(InfotheoryError::runtime(
+            "no candidates remain after the stage-0 prefilter",
+        ));
     }
     if debug {
         println!("Found {} candidates. Filtering...", candidates.len());
@@ -196,9 +221,9 @@ pub fn search_with_options(query: &str, target_path: &str, opts: &SearchOptions)
 
     // Stage 1: Filter
     let mut scored_candidates = if let Some(prior_path) = opts.universal_prior.as_deref() {
-        stage1_filter_with_universal_prior(&query_bytes, prior_path, candidates, opts)
+        stage1_filter_with_universal_prior(&query_bytes, prior_path, candidates, opts)?
     } else {
-        stage1_filter_no_prior(&query_bytes, candidates, opts)
+        stage1_filter_no_prior(&query_bytes, candidates, opts)?
     };
 
     let top_k_size = opts.top_k.min(scored_candidates.len());
@@ -227,14 +252,14 @@ pub fn search_with_options(query: &str, target_path: &str, opts: &SearchOptions)
     }
 
     // Stage 2: Rerank
-    stage2_rerank_kmi(&query_bytes, top_candidates, opts);
+    stage2_rerank_kmi(&query_bytes, top_candidates, opts)?;
     top_candidates.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    scored_candidates
+    Ok(scored_candidates)
 }
 
 fn resolve_query_bytes(query: &str) -> Vec<u8> {
@@ -250,21 +275,23 @@ fn stage1_filter_no_prior(
     query_bytes: &[u8],
     candidates: Vec<Snippet>,
     opts: &SearchOptions,
-) -> Vec<Snippet> {
+) -> InfotheoryResult<Vec<Snippet>> {
     let h_q = opts
         .ctx
         .try_entropy_rate_bytes(query_bytes, opts.max_order)
-        .expect("search entropy scoring should use a validated backend");
+        .map_err(|err| InfotheoryError::runtime(format!("stage-1 search entropy failed: {err}")))?;
 
-    let scored: Vec<Snippet> = candidates
+    let scored: InfotheoryResult<Vec<Snippet>> = candidates
         .into_par_iter()
         .map(|mut snippet| {
             let h_q_x = opts
                 .ctx
                 .try_cross_entropy_rate_bytes(query_bytes, &snippet.content, opts.max_order)
-                .expect("search cross entropy scoring should use a validated backend");
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("stage-1 search cross entropy failed: {err}"))
+                })?;
             snippet.score = h_q - h_q_x;
-            snippet
+            Ok(snippet)
         })
         .collect();
 
@@ -277,12 +304,15 @@ fn stage1_filter_with_universal_prior(
     prior_path: &str,
     candidates: Vec<Snippet>,
     opts: &SearchOptions,
-) -> Vec<Snippet> {
+) -> InfotheoryResult<Vec<Snippet>> {
     #[cfg(feature = "backend-rwkv")]
     if let Some((mut base, prior_snapshot)) = rwkv_prior_snapshot(opts, prior_path) {
         let h_u_q = {
             base.restore_runtime(&prior_snapshot);
-            base.cross_entropy_from_current(query_bytes).unwrap_or(0.0)
+            base.cross_entropy_from_current(query_bytes)
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("stage-1 rwkv prior scoring failed: {err}"))
+                })?
         };
         return candidates
             .into_par_iter()
@@ -290,10 +320,19 @@ fn stage1_filter_with_universal_prior(
                 || base.clone(),
                 |m: &mut crate::rwkvzip::Compressor, mut snippet| {
                     m.restore_runtime(&prior_snapshot);
-                    let _ = m.absorb_chain(&[snippet.content.as_slice()]);
-                    let h_ux_q = m.cross_entropy_from_current(query_bytes).unwrap_or(0.0);
+                    m.absorb_chain(&[snippet.content.as_slice()])
+                        .map_err(|err| {
+                            InfotheoryError::runtime(format!(
+                                "stage-1 rwkv candidate absorption failed: {err}"
+                            ))
+                        })?;
+                    let h_ux_q = m.cross_entropy_from_current(query_bytes).map_err(|err| {
+                        InfotheoryError::runtime(format!(
+                            "stage-1 rwkv candidate scoring failed: {err}"
+                        ))
+                    })?;
                     snippet.score = h_u_q - h_ux_q;
-                    snippet
+                    Ok(snippet)
                 },
             )
             .collect();
@@ -304,7 +343,11 @@ fn stage1_filter_with_universal_prior(
         let h_u_q = opts
             .ctx
             .try_cross_entropy_conditional_chain(&[prior_prefix.as_slice()], query_bytes)
-            .expect("search conditional-chain scoring should use a validated backend");
+            .map_err(|err| {
+                InfotheoryError::runtime(format!(
+                    "stage-1 conditional-chain prior scoring failed: {err}"
+                ))
+            })?;
         return candidates
             .into_par_iter()
             .map(|mut snippet| {
@@ -314,9 +357,13 @@ fn stage1_filter_with_universal_prior(
                         &[prior_prefix.as_slice(), snippet.content.as_slice()],
                         query_bytes,
                     )
-                    .expect("search conditional-chain scoring should use a validated backend");
+                    .map_err(|err| {
+                        InfotheoryError::runtime(format!(
+                            "stage-1 conditional-chain candidate scoring failed: {err}"
+                        ))
+                    })?;
                 snippet.score = h_u_q - h_ux_q;
-                snippet
+                Ok(snippet)
             })
             .collect();
     }
@@ -348,7 +395,7 @@ fn stage1_filter_with_universal_prior(
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
-        .expect("failed to build rayon pool");
+        .map_err(|err| InfotheoryError::runtime(format!("failed to build rayon pool: {err}")))?;
 
     pool.install(|| {
         candidates
@@ -361,7 +408,7 @@ fn stage1_filter_with_universal_prior(
                     let h_ux_q = m.cross_entropy_cps(&query_cps);
                     m.rollback_tx(tx);
                     snippet.score = h_u_q - h_ux_q;
-                    snippet
+                    Ok(snippet)
                 },
             )
             .collect()
@@ -415,7 +462,11 @@ fn linux_mem_available_bytes() -> Option<u64> {
     None
 }
 
-fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &SearchOptions) {
+fn stage2_rerank_kmi(
+    query_bytes: &[u8],
+    top_candidates: &mut [Snippet],
+    opts: &SearchOptions,
+) -> InfotheoryResult<()> {
     let prior_prefix: Option<Vec<u8>> =
         match (opts.universal_prior.as_deref(), opts.stage2_prior_mode) {
             (None, _) => None,
@@ -424,49 +475,65 @@ fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &
                 Some(corpus_bytes(prior_path, SearchGranularity::File))
             }
             (Some(prior_path), Stage2PriorMode::Summarize) => {
-                Some(summarize_prior_for_query(query_bytes, prior_path, opts))
+                Some(summarize_prior_for_query(query_bytes, prior_path, opts)?)
             }
         };
 
     let cq = if let Some(prefix) = prior_prefix.as_deref() {
         opts.ctx
             .try_compress_size_chain(&[prefix, query_bytes])
-            .expect("search compression scoring should use a valid compression backend")
+            .map_err(|err| {
+                InfotheoryError::runtime(format!("stage-2 query compression failed: {err}"))
+            })?
     } else {
         opts.ctx
             .try_compress_size_chain(&[query_bytes])
-            .expect("search compression scoring should use a valid compression backend")
+            .map_err(|err| {
+                InfotheoryError::runtime(format!("stage-2 query compression failed: {err}"))
+            })?
     };
 
-    top_candidates.par_iter_mut().for_each(|snippet| {
+    top_candidates.par_iter_mut().try_for_each(|snippet| {
         let cx = if let Some(prefix) = prior_prefix.as_deref() {
             opts.ctx
                 .try_compress_size_chain(&[prefix, snippet.content.as_slice()])
-                .expect("search compression scoring should use a valid compression backend")
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("stage-2 candidate compression failed: {err}"))
+                })?
         } else {
             opts.ctx
                 .try_compress_size_chain(&[snippet.content.as_slice()])
-                .expect("search compression scoring should use a valid compression backend")
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("stage-2 candidate compression failed: {err}"))
+                })?
         };
 
         let c1 = if let Some(prefix) = prior_prefix.as_deref() {
             opts.ctx
                 .try_compress_size_chain(&[prefix, snippet.content.as_slice(), query_bytes])
-                .expect("search compression scoring should use a valid compression backend")
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("stage-2 joint compression failed: {err}"))
+                })?
         } else {
             opts.ctx
                 .try_compress_size_chain(&[snippet.content.as_slice(), query_bytes])
-                .expect("search compression scoring should use a valid compression backend")
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("stage-2 joint compression failed: {err}"))
+                })?
         };
 
         let c2 = if let Some(prefix) = prior_prefix.as_deref() {
             opts.ctx
                 .try_compress_size_chain(&[prefix, query_bytes, snippet.content.as_slice()])
-                .expect("search compression scoring should use a valid compression backend")
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("stage-2 joint compression failed: {err}"))
+                })?
         } else {
             opts.ctx
                 .try_compress_size_chain(&[query_bytes, snippet.content.as_slice()])
-                .expect("search compression scoring should use a valid compression backend")
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("stage-2 joint compression failed: {err}"))
+                })?
         };
 
         let c_joint = c1.min(c2);
@@ -475,41 +542,59 @@ fn stage2_rerank_kmi(query_bytes: &[u8], top_candidates: &mut [Snippet], opts: &
         } else {
             (cq as f64 + cx as f64 - c_joint as f64).max(0.0)
         };
-    });
+        Ok::<(), InfotheoryError>(())
+    })?;
+    Ok(())
 }
 
 fn summarize_prior_for_query(
     query_bytes: &[u8],
     prior_path: &str,
     opts: &SearchOptions,
-) -> Vec<u8> {
+) -> InfotheoryResult<Vec<u8>> {
     // Prior-less search inside the prior corpus itself.
     // We approximate K(q|x) via conditional compression: min(C(xq),C(qx)) - C(x), and select the MIN.
     let candidates = collect_candidates(prior_path, opts.granularity);
     if candidates.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let cq = opts
         .ctx
         .try_compress_size_chain(&[query_bytes])
-        .expect("search compression scoring should use a valid compression backend");
+        .map_err(|err| {
+            InfotheoryError::runtime(format!(
+                "prior summarization query compression failed: {err}"
+            ))
+        })?;
 
     let mut best: Option<(f64, Vec<u8>)> = None;
     for c in candidates {
         let cx = opts
             .ctx
             .try_compress_size_chain(&[c.content.as_slice()])
-            .expect("search compression scoring should use a valid compression backend");
+            .map_err(|err| {
+                InfotheoryError::runtime(format!(
+                    "prior summarization candidate compression failed: {err}"
+                ))
+            })?;
 
         let cxq = opts
             .ctx
             .try_compress_size_chain(&[c.content.as_slice(), query_bytes])
-            .expect("search compression scoring should use a valid compression backend");
+            .map_err(|err| {
+                InfotheoryError::runtime(format!(
+                    "prior summarization joint compression failed: {err}"
+                ))
+            })?;
         let cqx = opts
             .ctx
             .try_compress_size_chain(&[query_bytes, c.content.as_slice()])
-            .expect("search compression scoring should use a valid compression backend");
+            .map_err(|err| {
+                InfotheoryError::runtime(format!(
+                    "prior summarization joint compression failed: {err}"
+                ))
+            })?;
         let c_joint = cxq.min(cqx);
         if c_joint == u64::MAX {
             continue;
@@ -521,11 +606,11 @@ fn summarize_prior_for_query(
         let is_better = match &best {
             None => true,
             Some((best_k, best_bytes)) => {
-                let best_cx = opts
-                    .ctx
-                    .try_compress_size(best_bytes)
-                    .expect("search compression scoring should use a valid compression backend")
-                    as f64;
+                let best_cx = opts.ctx.try_compress_size(best_bytes).map_err(|err| {
+                    InfotheoryError::runtime(format!(
+                        "prior summarization tie-break compression failed: {err}"
+                    ))
+                })? as f64;
                 (candidate_key.0, candidate_key.1) < (*best_k, best_cx)
             }
         };
@@ -534,7 +619,7 @@ fn summarize_prior_for_query(
         }
     }
 
-    best.map(|(_, b)| b).unwrap_or_default()
+    Ok(best.map(|(_, b)| b).unwrap_or_default())
 }
 
 fn train_rosa_on_corpus(m: &mut RosaPlus, corpus_path: &str, granularity: SearchGranularity) {
@@ -735,6 +820,8 @@ fn file_to_candidates(path: &Path, granularity: SearchGranularity) -> Vec<Snippe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::error::InfotheoryError;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(prefix: &str) -> PathBuf {
@@ -815,11 +902,68 @@ mod tests {
             stage0_keep_frac: 0.1,
             ..SearchOptions::default()
         };
-        let kept = stage0_prefilter(b"candidate", candidates, &opts, false);
+        let kept = stage0_prefilter(b"candidate", candidates, &opts, false)
+            .expect("stage0 prefilter should succeed");
         assert!(
             kept.len() >= 4,
             "stage0 must keep at least top_k candidates, got {}",
             kept.len()
         );
+    }
+
+    #[test]
+    fn search_with_options_returns_error_for_empty_query() {
+        let path = temp_path("search-empty").with_extension("txt");
+        fs::write(&path, b"content").expect("write search target");
+        let err = search_with_options(
+            "",
+            path.to_string_lossy().as_ref(),
+            &SearchOptions::default(),
+        )
+        .expect_err("empty query should return an error");
+        assert!(err.to_string().contains("query is empty"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_with_options_returns_error_for_missing_target() {
+        let err = search_with_options(
+            "needle",
+            "/definitely/missing/infotheory-search-target",
+            &SearchOptions::default(),
+        )
+        .expect_err("missing target should return an error");
+        assert!(err.to_string().contains("no accessible files found"));
+    }
+
+    #[cfg(feature = "backend-zpaq")]
+    #[test]
+    fn search_with_options_surfaces_runtime_backend_errors() {
+        let path = temp_path("search-runtime").with_extension("txt");
+        fs::write(&path, b"haystack").expect("write search target");
+
+        let ctx = InfotheoryCtx::from_specs(
+            RateBackend::RosaPlus,
+            CompressionBackend::Zpaq {
+                method: "definitely-invalid-zpaq-method".to_string(),
+            },
+        )
+        .expect("context should compile");
+
+        let opts = SearchOptions {
+            top_k: 1,
+            ctx,
+            ..SearchOptions::default()
+        };
+        let err = search_with_options("needle", path.to_string_lossy().as_ref(), &opts)
+            .expect_err("invalid compression method should surface as a search error");
+        assert!(matches!(
+            err,
+            InfotheoryError::Runtime(_)
+                | InfotheoryError::Unsupported(_)
+                | InfotheoryError::InvalidBackendConfig(_)
+        ));
+
+        let _ = fs::remove_file(path);
     }
 }

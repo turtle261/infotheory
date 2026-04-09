@@ -1,19 +1,4 @@
-#![cfg_attr(
-    not(all(
-        feature = "backend-rosa",
-        feature = "backend-ctw",
-        feature = "backend-match",
-        feature = "backend-ppmd",
-        feature = "backend-sequitur",
-        feature = "backend-mixture",
-        feature = "backend-particle",
-        feature = "backend-calibrated",
-        feature = "backend-zpaq",
-        feature = "backend-rwkv",
-        feature = "backend-mamba"
-    )),
-    allow(dead_code)
-)]
+#![cfg_attr(not(feature = "all-backends"), allow(dead_code))]
 
 use crate::backends::text_context::NeuralContextState;
 pub(crate) use crate::backends::text_context::NeuralHistoryState;

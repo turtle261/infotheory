@@ -1,7 +1,4 @@
-#![cfg(all(
-    feature = "cli",
-    any(feature = "default-backends", feature = "all-backends")
-))]
+#![cfg(all(feature = "cli", feature = "all-backends"))]
 
 use std::fs;
 use std::io::Write;

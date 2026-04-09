@@ -96,16 +96,17 @@ pub(crate) mod runtime;
 /// Information-theoretic code search pipeline (3-stage: prefilter, filter, KMI rerank).
 #[cfg(feature = "backend-rosa")]
 pub mod search;
+#[cfg(feature = "backend-particle")]
 pub(crate) mod simd_math;
 /// Shared backend/spec parsing and loading helpers.
 pub mod spec;
 use crate::api::CompiledRateBackend;
-#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+#[cfg(all(test, feature = "all-backends"))]
 pub(crate) use crate::api::{
     CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureSpec,
     ParticleSpec,
 };
-#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+#[cfg(all(test, feature = "all-backends"))]
 use crate::api::{
     CompressionBackend, GenerationConfig, InfotheoryCtx, NcdVariant, RateBackend,
     RateBackendSession, d_kl_bytes, try_biased_entropy_rate_backend, try_conditional_entropy_bytes,
@@ -113,7 +114,7 @@ use crate::api::{
     try_entropy_rate_bytes, try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes,
     try_mutual_information_bytes, try_ncd_bytes,
 };
-#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+#[cfg(all(test, feature = "all-backends"))]
 use crate::api::{
     joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes, nhd_bytes, tvd_bytes,
 };
@@ -155,7 +156,7 @@ use crate::mixture::OnlineBytePredictor;
 use std::cell::RefCell;
 #[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
 use std::collections::HashMap;
-#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+#[cfg(all(test, feature = "all-backends"))]
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -502,7 +503,7 @@ pub(crate) fn try_frozen_plugin_rate_backend(
 /// * 0 means the transformation destroyed all information (e.g. mapping everything to a constant).
 ///
 /// Assumes X and T(X) are aligned.
-#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+#[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
 
@@ -1361,7 +1362,6 @@ mod tests {
 #[cfg(all(
     test,
     not(any(
-        feature = "default-backends",
         feature = "all-backends",
         feature = "backend-rosa",
         feature = "backend-ctw",

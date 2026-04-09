@@ -815,7 +815,7 @@ impl Predictor for MambaPredictor {
     }
 }
 
-#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+#[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
 

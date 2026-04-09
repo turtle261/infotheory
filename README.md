@@ -123,8 +123,7 @@ let compression_backend = CompressionBackend::Rate {
 .compile()
 .expect("valid compression backend");
 
-let ctx = InfotheoryCtx::new(rate_backend.clone(), compression_backend)
-    .expect("ctx");
+let ctx = InfotheoryCtx::new(rate_backend.clone(), compression_backend);
 
 let bits = ctx.try_entropy_rate_bytes(b"abracadabra", 16).expect("entropy");
 assert!(bits.is_finite());
@@ -222,6 +221,8 @@ Mamba and RWKV can be configured with either a model file or compact method stri
 - `file:/abs/or/relative/model.safetensors`
 - `file:/abs/or/relative/model.safetensors;policy:...`
 - `cfg:key=value,...[;policy:...]`
+
+`file:` method paths may not contain `;` because `;policy:` is the reserved method delimiter.
 
 Supported `cfg:` keys:
 - RWKV7: `hidden,layers,intermediate,decay_rank,a_rank,v_rank,g_rank,seed,train,lr,stride`

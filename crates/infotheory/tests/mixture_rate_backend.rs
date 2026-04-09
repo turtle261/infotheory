@@ -1,4 +1,4 @@
-#![cfg(any(feature = "default-backends", feature = "all-backends"))]
+#![cfg(feature = "all-backends")]
 
 use infotheory::api::{
     CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureScheduleMode,

@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(schema.nodes[4].parent_id, Some(2));
     }
 
-    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
+    #[cfg(feature = "all-backends")]
     #[test]
     fn diagnostic_snapshot_matches_root_pdf_and_oracle_minimum() {
         let spec = test_nested_spec();
@@ -646,7 +646,7 @@ mod tests {
         predictor.finish_stream().expect("finish stream");
     }
 
-    #[cfg(any(feature = "default-backends", feature = "all-backends"))]
+    #[cfg(feature = "all-backends")]
     #[test]
     fn diagnostic_ac_payload_matches_raw_ac_compression_size() {
         let spec = test_nested_spec();

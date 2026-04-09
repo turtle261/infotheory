@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 /// Position expression used in policy schedules.
@@ -367,6 +367,28 @@ pub fn split_method_policy_segments(method: &str) -> Result<(String, Option<Stri
     }
 
     Ok((base, policy))
+}
+
+/// Render a `file:<path>[;policy:...]` method string after validating that the
+/// path is representable in the delimiter-based wire syntax.
+pub fn canonical_file_method_string(
+    family: &str,
+    path: &Path,
+    policy: Option<&LlmPolicy>,
+) -> Result<String> {
+    let rendered = path.to_string_lossy();
+    if rendered.contains(';') {
+        bail!(
+            "{family} file paths may not contain ';' because method strings reserve ';policy:' as a delimiter"
+        );
+    }
+
+    let mut method = format!("file:{rendered}");
+    if let Some(policy) = policy {
+        method.push_str(";policy:");
+        method.push_str(&policy.canonical());
+    }
+    Ok(method)
 }
 
 /// Parse a `policy:...` string into [`LlmPolicy`].

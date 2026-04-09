@@ -667,6 +667,9 @@ fn parse_cfg_positional(csv: &str) -> Result<OnlineConfig> {
 /// - `cfg:key=value,...[;policy:...]`
 /// - positional `cfg` CSV
 /// - existing model path
+///
+/// `file:` method paths may not contain `;` because method strings reserve
+/// `;policy:` as the only delimiter after the path segment.
 pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
     let (base, policy_segment) = split_method_policy_segments(method)?;
     let parse_policy = |s: &str| llm_policy::parse_policy_segment(s, RWKV_TRAIN_SCOPES);
@@ -681,6 +684,7 @@ pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
         if p.as_os_str().is_empty() {
             bail!("empty file path in rwkv method");
         }
+        llm_policy::canonical_file_method_string("rwkv", &p, policy.as_ref())?;
         if policy.as_ref().and_then(|p| p.load_from.as_ref()).is_some() {
             bail!("rwkv method cannot use policy load_from together with file:<path>");
         }
@@ -747,15 +751,10 @@ pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
 }
 
 /// Convert a parsed method specification back into canonical method syntax.
-pub fn canonical_method_string(spec: &MethodSpec) -> String {
+pub fn canonical_method_string(spec: &MethodSpec) -> Result<String> {
     match spec {
         MethodSpec::File { path, policy } => {
-            let mut method = format!("file:{}", path.display());
-            if let Some(policy) = policy {
-                method.push_str(";policy:");
-                method.push_str(&policy.canonical());
-            }
-            method
+            llm_policy::canonical_file_method_string("rwkv", path, policy.as_ref())
         }
         MethodSpec::Online { cfg, policy } => {
             let mut method = cfg_to_method_string(cfg);
@@ -763,7 +762,7 @@ pub fn canonical_method_string(spec: &MethodSpec) -> String {
                 method.push_str(";policy:");
                 method.push_str(&policy.canonical());
             }
-            method
+            Ok(method)
         }
     }
 }
@@ -984,8 +983,10 @@ impl Compressor {
             MethodSpec::File { path, policy } => {
                 let mut c = Self::new(&path)?;
                 if let Some(policy) = policy {
-                    let canonical_method =
-                        format!("file:{};policy:{}", path.display(), policy.canonical());
+                    let canonical_method = canonical_method_string(&MethodSpec::File {
+                        path: path.clone(),
+                        policy: Some(policy.clone()),
+                    })?;
                     let hidden = c.model.config().hidden_size;
                     let mut online = c.online.take().unwrap_or_else(|| {
                         OnlineRuntime::new(
@@ -1040,7 +1041,7 @@ impl Compressor {
                 let canonical_method = canonical_method_string(&MethodSpec::Online {
                     cfg: cfg.clone(),
                     policy: policy.clone(),
-                });
+                })?;
                 c.online = Some(OnlineRuntime::new(
                     cfg,
                     canonical_method,
@@ -1615,9 +1616,13 @@ impl Compressor {
             if opt_sidecar.exists() {
                 let _ = fs::remove_file(&opt_sidecar);
             }
+            let canonical_method = canonical_method_string(&MethodSpec::File {
+                path: model_path.to_path_buf(),
+                policy: None,
+            })?;
             json!({
                 "version": 1,
-                "method": format!("file:{}", model_path.display()),
+                "method": canonical_method,
                 "training_mode": "none",
                 "tokens_processed": 0,
             })
@@ -1652,11 +1657,15 @@ impl Compressor {
                     .map(|x| x.as_f64().unwrap_or(0.0) as f32)
                     .collect::<Vec<f32>>()
             });
+        let default_method = canonical_method_string(&MethodSpec::File {
+            path: model_path.to_path_buf(),
+            policy: None,
+        })?;
         let method = v
             .get("method")
             .and_then(|m| m.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("file:{}", model_path.display()));
+            .unwrap_or(default_method);
         let has_full_adam = v
             .get("has_full_adam")
             .and_then(|x| x.as_bool())
@@ -2330,6 +2339,16 @@ mod tests {
         }
 
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn canonical_method_string_rejects_delimiter_bearing_file_paths() {
+        let err = canonical_method_string(&MethodSpec::File {
+            path: PathBuf::from("/tmp/rwkv;policy:model.safetensors"),
+            policy: None,
+        })
+        .expect_err("delimiter-bearing file path should be rejected");
+        assert!(err.to_string().contains("may not contain ';'"));
     }
 
     #[test]

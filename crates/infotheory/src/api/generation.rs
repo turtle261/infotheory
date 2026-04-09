@@ -241,3 +241,63 @@ pub fn try_generate_bytes_conditional_chain_with_config(
         ctx.try_generate_bytes_conditional_chain_with_config(prefix_parts, bytes, max_order, config)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sparse_logps(entries: &[(u8, f64)]) -> [f64; 256] {
+        let mut logps = [f64::NEG_INFINITY; 256];
+        for &(byte, logp) in entries {
+            logps[byte as usize] = logp;
+        }
+        logps
+    }
+
+    #[test]
+    fn greedy_generation_picks_argmax() {
+        let logps = sparse_logps(&[(7, -0.2), (42, -1.0)]);
+        let mut rng = GenerationRng::new(123);
+        let picked = pick_generated_byte(&logps, GenerationConfig::greedy_frozen(), &mut rng);
+        assert_eq!(picked, 7);
+    }
+
+    #[test]
+    fn nonpositive_temperature_falls_back_to_argmax() {
+        let logps = sparse_logps(&[(3, -0.1), (11, -0.3)]);
+        let mut rng = GenerationRng::new(7);
+        let mut config = GenerationConfig::sampled_frozen(7);
+        config.temperature = 0.0;
+        let picked = pick_generated_byte(&logps, config, &mut rng);
+        assert_eq!(picked, 3);
+    }
+
+    #[test]
+    fn top_k_sampling_respects_truncation() {
+        let logps = sparse_logps(&[(9, -0.01), (10, -0.02), (11, -0.03)]);
+        let mut rng = GenerationRng::new(99);
+        let mut config = GenerationConfig::sampled_frozen(99);
+        config.top_k = 1;
+        let picked = pick_generated_byte(&logps, config, &mut rng);
+        assert_eq!(picked, 9);
+    }
+
+    #[test]
+    fn top_p_sampling_keeps_only_minimal_prefix_mass() {
+        let logps = sparse_logps(&[(5, 0.0), (6, -1.5), (7, -3.0)]);
+        let mut rng = GenerationRng::new(5);
+        let mut config = GenerationConfig::sampled_frozen(5);
+        config.top_p = 0.5;
+        let picked = pick_generated_byte(&logps, config, &mut rng);
+        assert_eq!(picked, 5);
+    }
+
+    #[test]
+    fn nonfinite_log_probs_do_not_panic() {
+        let mut logps = [f64::NEG_INFINITY; 256];
+        logps[0] = f64::NAN;
+        let mut rng = GenerationRng::new(17);
+        let picked = pick_generated_byte(&logps, GenerationConfig::sampled_frozen(17), &mut rng);
+        assert_eq!(picked, 0);
+    }
+}

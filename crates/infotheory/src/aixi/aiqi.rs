@@ -1051,7 +1051,7 @@ fn argmax_with_fixed_tie_break(values: &[f64]) -> usize {
     best_idx
 }
 
-#[cfg(all(test, any(feature = "default-backends", feature = "all-backends")))]
+#[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};

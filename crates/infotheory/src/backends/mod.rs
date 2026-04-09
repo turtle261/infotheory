@@ -11,6 +11,7 @@ pub mod calibration;
 #[cfg(feature = "backend-ctw")]
 pub mod ctw;
 /// Shared policy parser/compiler for online LLM backends.
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
 pub mod llm_policy;
 /// Mamba-1 based rate/compression backend.
 #[cfg(feature = "backend-mamba")]

@@ -696,8 +696,10 @@ pub(crate) fn compile_rate_plan_mamba(
             let normalized = super::normalize_mamba_method_for_base_dir(env.base_dir(), method)?;
             let parsed_method = crate::mambazip::parse_method_spec(&normalized)
                 .map_err(|err| SpecError::new(err.to_string()))?;
+            let method = crate::mambazip::canonical_method_string(&parsed_method)
+                .map_err(|err| SpecError::new(err.to_string()))?;
             Ok(RateBackendPlan::Mamba {
-                method: crate::mambazip::canonical_method_string(&parsed_method),
+                method,
                 asset: mamba_asset_ref(&parsed_method),
                 parsed_method,
             })
@@ -726,8 +728,10 @@ pub(crate) fn compile_rate_plan_rwkv7(
             let normalized = super::normalize_rwkv_method_for_base_dir(env.base_dir(), method)?;
             let parsed_method = crate::rwkvzip::parse_method_spec(&normalized)
                 .map_err(|err| SpecError::new(err.to_string()))?;
+            let method = crate::rwkvzip::canonical_method_string(&parsed_method)
+                .map_err(|err| SpecError::new(err.to_string()))?;
             Ok(RateBackendPlan::Rwkv7 {
-                method: crate::rwkvzip::canonical_method_string(&parsed_method),
+                method,
                 asset: rwkv_asset_ref(&parsed_method),
                 parsed_method,
             })
@@ -846,8 +850,10 @@ pub(crate) fn compile_compression_plan_rwkv7(
             let normalized = super::normalize_rwkv_method_for_base_dir(env.base_dir(), method)?;
             let parsed_method = crate::rwkvzip::parse_method_spec(&normalized)
                 .map_err(|err| SpecError::new(err.to_string()))?;
+            let method = crate::rwkvzip::canonical_method_string(&parsed_method)
+                .map_err(|err| SpecError::new(err.to_string()))?;
             Ok(CompressionBackendPlan::Rwkv7 {
-                method: crate::rwkvzip::canonical_method_string(&parsed_method),
+                method,
                 asset: rwkv_asset_ref(&parsed_method),
                 parsed_method,
                 coder: *coder,
