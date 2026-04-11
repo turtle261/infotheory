@@ -548,7 +548,8 @@ impl Default for NyxVmConfig {
             action_source: NyxActionSource::Literal(vec![]),
             action_filter: None,
             protocol: NyxProtocolConfig::default(),
-            stats_backend: RateBackend::default(),
+            stats_backend: RateBackend::try_default()
+                .expect("vm feature enables at least one default rate backend"),
             trace: None,
             debug_mode: false,
             crash_log: None,
@@ -2117,7 +2118,8 @@ mod tests {
         ];
 
         for backend in backends {
-            let mut model = TraceModel::new(&backend, 4);
+            let compiled = backend.compile().expect("compiled trace backend");
+            let mut model = TraceModel::new(&compiled, 4);
             let bits = model.update_and_score(b"trace payload");
             assert!(bits.is_finite() && bits >= 0.0, "bits={bits}");
             model.reset();

@@ -538,15 +538,15 @@ pub fn run_ac_log_loss_mixture_bytes(
 mod tests {
     use super::*;
 
-    fn test_nested_spec() -> MixtureSpec {
+    fn test_nested_spec(base: RateBackend) -> MixtureSpec {
         MixtureSpec::new(
             MixtureKind::Switching,
             vec![
                 MixtureExpertSpec {
-                    name: Some("ctw".to_string()),
+                    name: Some("leaf-a".to_string()),
                     log_prior: 0.0,
                     max_order: -1,
-                    backend: RateBackend::Ctw { depth: 6 },
+                    backend: base.clone(),
                 },
                 MixtureExpertSpec {
                     name: Some("nested".to_string()),
@@ -557,23 +557,16 @@ mod tests {
                             MixtureKind::Bayes,
                             vec![
                                 MixtureExpertSpec {
-                                    name: Some("fac".to_string()),
+                                    name: Some("leaf-b".to_string()),
                                     log_prior: 0.0,
                                     max_order: -1,
-                                    backend: RateBackend::FacCtw {
-                                        base_depth: 5,
-                                        num_percept_bits: 8,
-                                        encoding_bits: 8,
-                                    },
+                                    backend: base.clone(),
                                 },
                                 MixtureExpertSpec {
-                                    name: Some("ppmd".to_string()),
+                                    name: Some("leaf-c".to_string()),
                                     log_prior: 0.0,
                                     max_order: -1,
-                                    backend: RateBackend::Ppmd {
-                                        order: 4,
-                                        memory_mb: 8,
-                                    },
+                                    backend: base,
                                 },
                             ],
                         )),
@@ -586,7 +579,10 @@ mod tests {
 
     #[test]
     fn flatten_schema_includes_submixtures_and_descendants_in_preorder() {
-        let schema = flatten_mixture_spec(&test_nested_spec());
+        let Some(base) = crate::runtime::first_enabled_default_rate_backend_spec() else {
+            return;
+        };
+        let schema = flatten_mixture_spec(&test_nested_spec(base));
         assert_eq!(schema.nodes.len(), 5);
         assert_eq!(schema.nodes[0].display_name, "root");
         assert_eq!(schema.root_child_ids, vec![1, 2]);
@@ -600,7 +596,7 @@ mod tests {
     #[cfg(feature = "all-backends")]
     #[test]
     fn diagnostic_snapshot_matches_root_pdf_and_oracle_minimum() {
-        let spec = test_nested_spec();
+        let spec = test_nested_spec(RateBackend::Ctw { depth: 6 });
         let mut predictor = DiagnosticRatePredictor::from_rate_backend(
             RateBackend::Mixture {
                 spec: Arc::new(spec.clone()),
@@ -649,7 +645,7 @@ mod tests {
     #[cfg(feature = "all-backends")]
     #[test]
     fn diagnostic_ac_payload_matches_raw_ac_compression_size() {
-        let spec = test_nested_spec();
+        let spec = test_nested_spec(RateBackend::Ctw { depth: 6 });
         let data = b"payload bits raw diagnostic parity";
         let stamp = format!(
             "infotheory_ac_diag_{}_{}",

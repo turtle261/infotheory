@@ -374,13 +374,13 @@ fn parse_compression_backend(
 ) -> PyResult<CompressionBackend> {
     #[cfg(feature = "backend-rwkv")]
     let mut opts = infotheory::spec::CompressionBackendShorthandOptions {
-        default_rate_backend: Some(rate_backend.unwrap_or_default()),
+        default_rate_backend: rate_backend.clone(),
         default_framing: infotheory::compression::FramingMode::Framed,
         ..Default::default()
     };
     #[cfg(not(feature = "backend-rwkv"))]
     let opts = infotheory::spec::CompressionBackendShorthandOptions {
-        default_rate_backend: Some(rate_backend.unwrap_or_default()),
+        default_rate_backend: rate_backend,
         default_framing: infotheory::compression::FramingMode::Framed,
         ..Default::default()
     };
@@ -957,12 +957,14 @@ impl PyInfotheoryCtx {
         rate_backend: Option<&PyRateBackend>,
         compression_backend: Option<&PyCompressionBackend>,
     ) -> PyResult<Self> {
-        let rb = compile_rate_backend(rate_backend.map(|b| b.inner.clone()).unwrap_or_default())?;
-        let cb = compile_compression_backend(
-            compression_backend
-                .map(|b| b.inner.clone())
-                .unwrap_or_default(),
-        )?;
+        let rb = compile_rate_backend(match rate_backend {
+            Some(backend) => backend.inner.clone(),
+            None => RateBackend::try_default().map_err(py_infotheory_error)?,
+        })?;
+        let cb = compile_compression_backend(match compression_backend {
+            Some(backend) => backend.inner.clone(),
+            None => CompressionBackend::try_default().map_err(py_infotheory_error)?,
+        })?;
         Ok(Self {
             inner: InfotheoryCtx::new(rb, cb),
         })
@@ -1357,10 +1359,10 @@ impl PyRateBackendSession {
 }
 
 #[pyfunction]
-fn get_default_ctx() -> PyInfotheoryCtx {
-    PyInfotheoryCtx {
-        inner: api::get_default_ctx(),
-    }
+fn get_default_ctx() -> PyResult<PyInfotheoryCtx> {
+    Ok(PyInfotheoryCtx {
+        inner: api::get_default_ctx().map_err(py_infotheory_error)?,
+    })
 }
 
 #[pyfunction]
@@ -1516,7 +1518,7 @@ fn rate_backend_from_py(
             "rate backend must be RateBackend or string",
         ));
     }
-    Ok(RateBackend::default())
+    RateBackend::try_default().map_err(py_infotheory_error)
 }
 
 fn compiled_rate_backend_from_py(
@@ -2075,7 +2077,9 @@ fn generate_bytes<'py>(
     let cfg = generation_config_from_py(config)?;
     let out = if let Some(backend) = backend {
         let rb = compiled_rate_backend_from_py(Some(backend), method)?;
-        let cb = compile_compression_backend(CompressionBackend::default())?;
+        let cb = compile_compression_backend(
+            CompressionBackend::try_default().map_err(py_infotheory_error)?,
+        )?;
         py.detach(|| {
             py_try(|| {
                 let ctx = InfotheoryCtx::new(rb, cb);
@@ -2109,7 +2113,9 @@ fn generate_bytes_conditional_chain<'py>(
     let refs: Vec<&[u8]> = prefix_parts.iter().map(Vec::as_slice).collect();
     let out = if let Some(backend) = backend {
         let rb = compiled_rate_backend_from_py(Some(backend), method)?;
-        let cb = compile_compression_backend(CompressionBackend::default())?;
+        let cb = compile_compression_backend(
+            CompressionBackend::try_default().map_err(py_infotheory_error)?,
+        )?;
         py.detach(|| {
             py_try(|| {
                 let ctx = InfotheoryCtx::new(rb, cb);
@@ -4832,7 +4838,8 @@ fn search(
                 stage0_keep_frac,
                 ctx: InfotheoryCtx::new(rb, cb),
             };
-            let results = infotheory::search::search_with_options(&q, &tp, &opts);
+            let results = infotheory::search::search_with_options(&q, &tp, &opts)
+                .map_err(py_infotheory_error)?;
             Ok(results
                 .into_iter()
                 .map(|s| {

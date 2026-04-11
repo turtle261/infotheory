@@ -751,6 +751,65 @@ fn compression_backend_feature_error(kind: CompressionBackendKind) -> String {
         .unwrap_or_else(|err| err)
 }
 
+pub(crate) fn default_rate_backend_spec(kind: RateBackendKind) -> Option<RateBackend> {
+    match kind {
+        RateBackendKind::RosaPlus => Some(RateBackend::RosaPlus),
+        RateBackendKind::Match => Some(RateBackend::Match {
+            hash_bits: 18,
+            min_len: 4,
+            max_len: 96,
+            base_mix: 0.02,
+            confidence_scale: 1.0,
+        }),
+        RateBackendKind::SparseMatch => Some(RateBackend::SparseMatch {
+            hash_bits: 17,
+            min_len: 3,
+            max_len: 48,
+            gap_min: 1,
+            gap_max: 2,
+            base_mix: 0.05,
+            confidence_scale: 1.0,
+        }),
+        RateBackendKind::Ppmd => Some(RateBackend::Ppmd {
+            order: 6,
+            memory_mb: 16,
+        }),
+        RateBackendKind::Sequitur => Some(RateBackend::Sequitur { context_bytes: 32 }),
+        RateBackendKind::Ctw => Some(RateBackend::Ctw { depth: 8 }),
+        RateBackendKind::FacCtw => Some(RateBackend::FacCtw {
+            base_depth: 8,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+        }),
+        RateBackendKind::Zpaq => Some(RateBackend::Zpaq {
+            method: "2".to_string(),
+        }),
+        RateBackendKind::Particle => Some(RateBackend::Particle {
+            spec: Arc::new(crate::api::ParticleSpec::default()),
+        }),
+        RateBackendKind::Mixture | RateBackendKind::Calibrated => None,
+        #[cfg(feature = "backend-mamba")]
+        RateBackendKind::Mamba => Some(RateBackend::MambaMethod {
+            method: "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+        }),
+        #[cfg(not(feature = "backend-mamba"))]
+        RateBackendKind::Mamba => None,
+        #[cfg(feature = "backend-rwkv")]
+        RateBackendKind::Rwkv7 => Some(RateBackend::Rwkv7Method {
+            method: "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer".to_string(),
+        }),
+        #[cfg(not(feature = "backend-rwkv"))]
+        RateBackendKind::Rwkv7 => None,
+    }
+}
+
+pub(crate) fn first_enabled_default_rate_backend_spec() -> Option<RateBackend> {
+    RATE_BACKEND_REGISTRY
+        .iter()
+        .filter(|descriptor| descriptor.enabled)
+        .find_map(|descriptor| default_rate_backend_spec(descriptor.kind))
+}
+
 pub(crate) fn rate_backend_kernel(kind: RateBackendKind) -> &'static RateBackendKernel {
     RATE_BACKEND_KERNELS
         .iter()

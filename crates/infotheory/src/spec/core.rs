@@ -2074,22 +2074,15 @@ mod tests {
     #[test]
     fn canonical_rate_plan_bytes_are_prefix_free_for_sample_corpus() {
         let env = SpecEnvironment::default();
-        let samples = [
-            RateBackend::RosaPlus,
-            RateBackend::Ctw { depth: 8 },
-            RateBackend::Match {
-                hash_bits: 20,
-                min_len: 4,
-                max_len: 255,
-                base_mix: 0.02,
-                confidence_scale: 1.0,
-            },
-            RateBackend::FacCtw {
-                base_depth: 6,
-                num_percept_bits: 8,
-                encoding_bits: 8,
-            },
-        ];
+        let samples: Vec<_> = crate::runtime::RATE_BACKEND_REGISTRY
+            .iter()
+            .filter(|descriptor| descriptor.enabled)
+            .filter_map(|descriptor| crate::runtime::default_rate_backend_spec(descriptor.kind))
+            .take(4)
+            .collect();
+        if samples.len() < 2 {
+            return;
+        }
         let encodings: Vec<_> = samples
             .iter()
             .map(|backend| {
@@ -2110,11 +2103,14 @@ mod tests {
 
     #[test]
     fn compiled_rate_backend_clone_is_o1_arc_backed() {
-        let compiled =
-            validate_rate_backend_in(&RateBackend::RosaPlus, &SpecEnvironment::default())
-                .unwrap()
-                .compile()
-                .unwrap();
+        let Some(default_backend) = crate::runtime::first_enabled_default_rate_backend_spec()
+        else {
+            return;
+        };
+        let compiled = validate_rate_backend_in(&default_backend, &SpecEnvironment::default())
+            .unwrap()
+            .compile()
+            .unwrap();
         let cloned = compiled.clone();
         assert!(Arc::ptr_eq(&compiled.plan, &cloned.plan));
         assert!(Arc::ptr_eq(
@@ -2123,6 +2119,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "backend-ctw")]
     #[test]
     fn bit_token_adaptation_rewrites_ctw_family_without_revalidation_failure() {
         let compiled =

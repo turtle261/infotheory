@@ -438,8 +438,11 @@ mod tests {
 
     #[test]
     fn normalize_file_roundtrip_compiled_backend_forces_framed_rate_payloads() {
+        let Some(rate_backend) = crate::runtime::first_enabled_default_rate_backend_spec() else {
+            return;
+        };
         let rate = crate::api::CompressionBackend::Rate {
-            rate_backend: crate::api::RateBackend::default(),
+            rate_backend,
             coder: CoderType::RANS,
             framing: crate::compression::FramingMode::Raw,
         }
@@ -454,14 +457,17 @@ mod tests {
             _ => panic!("expected normalized compiled rate backend"),
         }
 
-        let zpaq = crate::api::CompressionBackend::Zpaq {
-            method: "5".to_string(),
-        }
-        .compile()
-        .expect("compiled zpaq");
-        match normalize_file_roundtrip_compiled_backend(&zpaq).canonical_spec() {
-            crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
-            _ => panic!("expected compiled zpaq backend to remain unchanged"),
+        #[cfg(feature = "backend-zpaq")]
+        {
+            let zpaq = crate::api::CompressionBackend::Zpaq {
+                method: "5".to_string(),
+            }
+            .compile()
+            .expect("compiled zpaq");
+            match normalize_file_roundtrip_compiled_backend(&zpaq).canonical_spec() {
+                crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
+                _ => panic!("expected compiled zpaq backend to remain unchanged"),
+            }
         }
     }
 

@@ -384,15 +384,37 @@ jobs:
 
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-rosa
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-ctw
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-match
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-ppmd
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-sequitur
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-mixture
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-particle
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-calibrated
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-zpaq
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-rwkv
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-mamba
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features all-backends
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --features cli
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features cli
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features "cli all-backends"
             RUSTFLAGS="-D warnings" cargo check -p zpaq_rs --locked
             RUSTFLAGS="-D warnings" cargo check -p benchman --locked
 
             cargo test -p infotheory --release --locked
-            cargo test -p infotheory --release --no-default-features --locked
+            cargo test -p infotheory --release --no-default-features --features all-backends --locked
+            cargo test -p infotheory --release --no-default-features rate_backend_aliases_share_registry_resolution_and_feature_errors --locked
+            cargo test -p infotheory --release --no-default-features compression_backend_aliases_share_registry_resolution_and_feature_errors --locked
+            cargo test -p infotheory --release --no-default-features --features backend-ctw --test api_surface --locked
+            cargo test -p infotheory --release --no-default-features --features backend-rosa --test compression_validation --locked
+            cargo test -p infotheory --release --no-default-features --features backend-rosa --test api_surface --locked
+            cargo test -p infotheory --release --no-default-features --features backend-zpaq --test api_surface --locked
+            cargo test -p infotheory --release --no-default-features --features backend-rwkv parse_compression_backend_name_method_wraps_rwkv_cfg_methods_as_rate_backend --locked
+            cargo test -p infotheory --release --no-default-features --features backend-rwkv parse_compression_backend_json_wraps_rwkv_cfg_methods_as_rate_backend --locked
+            cargo test -p infotheory --release --no-default-features --features backend-mamba parse_compression_backend_json_wraps_mamba_cfg_rate_backend --locked
             cargo test -p infotheory --release --features cli --locked
-            cargo test -p infotheory --release --no-default-features --features cli --locked
+            cargo test -p infotheory --release --no-default-features --features "cli all-backends" --locked
             cargo test -p zpaq_rs --release --locked
             cargo test -p benchman --release --locked
 
@@ -522,15 +544,37 @@ jobs:
 
               RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --locked
               RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-rosa --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-ctw --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-match --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-ppmd --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-sequitur --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-mixture --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-particle --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-calibrated --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-zpaq --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-rwkv --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-mamba --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features all-backends --locked
               RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --features cli --locked
               RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features cli --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features "cli all-backends" --locked
               RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p zpaq_rs --target "$TARGET" --locked
               RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p benchman --target "$TARGET" --locked
 
               RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --locked
-              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features all-backends --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features rate_backend_aliases_share_registry_resolution_and_feature_errors --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features compression_backend_aliases_share_registry_resolution_and_feature_errors --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-ctw --test api_surface --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-rosa --test compression_validation --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-rosa --test api_surface --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-zpaq --test api_surface --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-rwkv parse_compression_backend_name_method_wraps_rwkv_cfg_methods_as_rate_backend --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-rwkv parse_compression_backend_json_wraps_rwkv_cfg_methods_as_rate_backend --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-mamba parse_compression_backend_json_wraps_mamba_cfg_rate_backend --locked
               RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --features cli --locked
-              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features cli --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features "cli all-backends" --locked
               RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p zpaq_rs --release --target "$TARGET" --locked
               RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p benchman --release --target "$TARGET" --locked
 

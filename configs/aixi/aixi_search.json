@@ -17,9 +17,9 @@
         ],
         "actions": [
             "ls -F",
-            "ls src/",
-            "cat src/main.rs",
-            "grep -i 'ai' src/main.rs",
+            "ls crates/infotheory/src/",
+            "cat crates/infotheory/src/main.rs",
+            "grep -i 'ai' crates/infotheory/src/main.rs",
             "echo 'Scanning complete.'"
         ],
         "reward_pattern": "run_aixi_mode",

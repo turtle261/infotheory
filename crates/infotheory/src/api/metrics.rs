@@ -198,13 +198,24 @@ pub fn try_conditional_entropy_rate_bytes(
 #[inline(always)]
 /// Fallible conditional entropy estimate with default context backend selection.
 pub fn try_conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
-    with_default_ctx(|ctx| ctx.try_conditional_entropy_bytes(x, y, max_order))
+    if max_order == 0 {
+        let (x, y) = aligned_prefix(x, y);
+        let h_xy = joint_marginal_entropy_bytes(x, y);
+        let h_y = marginal_entropy_bytes(y);
+        Ok((h_xy - h_y).max(0.0))
+    } else {
+        with_default_ctx(|ctx| ctx.try_conditional_entropy_bytes(x, y, max_order))
+    }
 }
 
 #[inline(always)]
 /// Fallible mutual-information estimate `I(X;Y)` with default context backend selection.
 pub fn try_mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
-    with_default_ctx(|ctx| ctx.try_mutual_information_bytes(x, y, max_order))
+    if max_order == 0 {
+        Ok(mutual_information_marg_bytes(x, y))
+    } else {
+        with_default_ctx(|ctx| ctx.try_mutual_information_bytes(x, y, max_order))
+    }
 }
 
 /// Marginal (histogram) mutual information estimate `I(X;Y)` on aligned prefixes.
@@ -229,7 +240,11 @@ pub fn try_mutual_information_rate_bytes(
 #[inline(always)]
 /// Fallible normalized entropy distance (NED) estimate with default context backend.
 pub fn try_ned_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
-    with_default_ctx(|ctx| ctx.try_ned_bytes(x, y, max_order))
+    if max_order == 0 {
+        Ok(ned_marg_bytes(x, y))
+    } else {
+        with_default_ctx(|ctx| ctx.try_ned_bytes(x, y, max_order))
+    }
 }
 
 /// Marginal (histogram) normalized entropy distance:
@@ -257,7 +272,11 @@ pub fn try_ned_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResul
 #[inline(always)]
 /// Fallible constructive NED estimate with the default context backend.
 pub fn try_ned_cons_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
-    with_default_ctx(|ctx| ctx.try_ned_cons_bytes(x, y, max_order))
+    if max_order == 0 {
+        Ok(ned_cons_marg_bytes(x, y))
+    } else {
+        with_default_ctx(|ctx| ctx.try_ned_cons_bytes(x, y, max_order))
+    }
 }
 
 /// Marginal constructive normalized entropy distance:
@@ -283,7 +302,11 @@ pub fn try_ned_cons_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> Infotheory
 #[inline(always)]
 /// Fallible normalized transform-effort (NTE/VI-based) estimate with default context backend.
 pub fn try_nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
-    with_default_ctx(|ctx| ctx.try_nte_bytes(x, y, max_order))
+    if max_order == 0 {
+        Ok(nte_marg_bytes(x, y))
+    } else {
+        with_default_ctx(|ctx| ctx.try_nte_bytes(x, y, max_order))
+    }
 }
 
 /// Marginal (histogram) NTE estimate using variation of information normalized by `max(Hx, Hy)`.
@@ -365,7 +388,23 @@ pub fn try_cross_entropy_bytes(
     train_data: &[u8],
     max_order: i64,
 ) -> InfotheoryResult<f64> {
-    with_default_ctx(|ctx| ctx.try_cross_entropy_bytes(test_data, train_data, max_order))
+    if max_order == 0 {
+        if test_data.is_empty() {
+            return Ok(0.0);
+        }
+        let p_x = byte_histogram(test_data);
+        let p_y = byte_histogram(train_data);
+        let mut h = 0.0f64;
+        for i in 0..256 {
+            if p_x[i] > 0.0 {
+                let q_y = p_y[i].max(1e-12);
+                h -= p_x[i] * q_y.log2();
+            }
+        }
+        Ok(h)
+    } else {
+        with_default_ctx(|ctx| ctx.try_cross_entropy_bytes(test_data, train_data, max_order))
+    }
 }
 
 #[inline(always)]
@@ -424,7 +463,11 @@ pub fn js_div_bytes(x: &[u8], y: &[u8]) -> f64 {
 /// Fallible intrinsic dependence estimate:
 /// `(H_marginal(X) - H_rate(X)) / H_marginal(X)`.
 pub fn try_intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> InfotheoryResult<f64> {
-    with_default_ctx(|ctx| ctx.try_intrinsic_dependence_bytes(data, max_order))
+    if max_order == 0 {
+        Ok(0.0)
+    } else {
+        with_default_ctx(|ctx| ctx.try_intrinsic_dependence_bytes(data, max_order))
+    }
 }
 
 #[inline(always)]
@@ -435,5 +478,15 @@ pub fn try_resistance_to_transformation_bytes(
     tx: &[u8],
     max_order: i64,
 ) -> InfotheoryResult<f64> {
-    with_default_ctx(|ctx| ctx.try_resistance_to_transformation_bytes(x, tx, max_order))
+    if max_order == 0 {
+        let (x, tx) = aligned_prefix(x, tx);
+        let h_x = marginal_entropy_bytes(x);
+        if h_x < 1e-9 {
+            Ok(0.0)
+        } else {
+            Ok((mutual_information_marg_bytes(x, tx) / h_x).clamp(0.0, 1.0))
+        }
+    } else {
+        with_default_ctx(|ctx| ctx.try_resistance_to_transformation_bytes(x, tx, max_order))
+    }
 }

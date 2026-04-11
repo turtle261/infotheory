@@ -170,22 +170,34 @@ thread_local! {
 }
 
 thread_local! {
-    static DEFAULT_CTX: RefCell<api::InfotheoryCtx> = RefCell::new(api::InfotheoryCtx::default());
+    static DEFAULT_CTX: RefCell<Option<api::InfotheoryCtx>> = const { RefCell::new(None) };
 }
 
 /// Returns the current default information theory context for the thread.
-pub(crate) fn get_default_ctx() -> api::InfotheoryCtx {
-    DEFAULT_CTX.with(|ctx| ctx.borrow().clone())
+pub(crate) fn get_default_ctx() -> InfotheoryResult<api::InfotheoryCtx> {
+    DEFAULT_CTX.with(|ctx| {
+        let mut slot = ctx.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(api::InfotheoryCtx::try_default()?);
+        }
+        Ok(slot
+            .as_ref()
+            .expect("default context initialized above")
+            .clone())
+    })
 }
 
 /// Sets the default information theory context for the thread.
 pub(crate) fn set_default_ctx(ctx: api::InfotheoryCtx) {
-    DEFAULT_CTX.with(|c| *c.borrow_mut() = ctx);
+    DEFAULT_CTX.with(|c| *c.borrow_mut() = Some(ctx));
 }
 
 #[inline(always)]
-pub(crate) fn with_default_ctx<R>(f: impl FnOnce(&api::InfotheoryCtx) -> R) -> R {
-    DEFAULT_CTX.with(|ctx| f(&ctx.borrow()))
+pub(crate) fn with_default_ctx<R>(
+    f: impl FnOnce(&api::InfotheoryCtx) -> InfotheoryResult<R>,
+) -> InfotheoryResult<R> {
+    let ctx = get_default_ctx()?;
+    f(&ctx)
 }
 
 #[inline(always)]
@@ -526,6 +538,16 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to build infotheory test context: {err}"))
     }
 
+    fn default_compression_backend() -> CompressionBackend {
+        CompressionBackend::try_default()
+            .unwrap_or_else(|err| panic!("failed to select default compression backend: {err}"))
+    }
+
+    fn default_ctx() -> InfotheoryCtx {
+        InfotheoryCtx::try_default()
+            .unwrap_or_else(|err| panic!("failed to build default test context: {err}"))
+    }
+
     fn generate_rate_backend_chain(
         prefix_parts: &[&[u8]],
         bytes: usize,
@@ -775,8 +797,8 @@ mod tests {
         let x = b"the quick brown fox jumps over the lazy dog";
         let y = b"the quick brown fox jumps over the lazy dog";
         let max_order = 8;
-        let prev = get_default_ctx();
-        set_default_ctx(ctx(RateBackend::RosaPlus, CompressionBackend::default()));
+        let prev = get_default_ctx().expect("default ctx");
+        set_default_ctx(ctx(RateBackend::RosaPlus, default_compression_backend()));
 
         let h_x = entropy_rate_bytes(x, max_order);
         let h_xy = joint_entropy_rate_bytes(x, y, max_order);
@@ -796,8 +818,8 @@ mod tests {
     #[test]
     fn resistance_identity_is_one() {
         let x = b"some repeated repeated repeated text";
-        let prev = get_default_ctx();
-        set_default_ctx(ctx(RateBackend::RosaPlus, CompressionBackend::default()));
+        let prev = get_default_ctx().expect("default ctx");
+        set_default_ctx(ctx(RateBackend::RosaPlus, default_compression_backend()));
         let r0 = resistance_to_transformation_bytes(x, x, 0);
         let r8 = resistance_to_transformation_bytes(x, x, 8);
         assert!((r0 - 1.0).abs() < 1e-12);
@@ -824,7 +846,7 @@ mod tests {
     fn marginal_cross_entropy_empty_test_is_zero() {
         let empty: &[u8] = &[];
         let y = b"abc";
-        let ctx = InfotheoryCtx::with_zpaq("5");
+        let ctx = InfotheoryCtx::try_with_zpaq("5").expect("zpaq ctx");
         assert_eq!(
             ctx.try_cross_entropy_bytes(empty, y, 0)
                 .expect("cross entropy bytes"),
@@ -842,7 +864,7 @@ mod tests {
         // Switch to CTW
         set_default_ctx(ctx(
             RateBackend::Ctw { depth: 16 },
-            CompressionBackend::default(),
+            default_compression_backend(),
         ));
 
         let h_ctw = entropy_rate_bytes(x, 8);
@@ -851,7 +873,7 @@ mod tests {
         assert!(h_ctw > 0.0);
 
         // Reset to default
-        set_default_ctx(InfotheoryCtx::default());
+        set_default_ctx(default_ctx());
         let h_rosa_back = entropy_rate_bytes(x, 8);
         assert!((h_rosa - h_rosa_back).abs() < 1e-12);
     }
@@ -902,7 +924,7 @@ mod tests {
         // Use CTW backend for rate-based test
         set_default_ctx(ctx(
             RateBackend::Ctw { depth: 8 },
-            CompressionBackend::default(),
+            default_compression_backend(),
         ));
 
         // Generate two completely different patterns - should have high VI
@@ -920,7 +942,7 @@ mod tests {
         );
 
         // Reset context
-        set_default_ctx(InfotheoryCtx::default());
+        set_default_ctx(default_ctx());
     }
 
     #[test]
@@ -928,7 +950,7 @@ mod tests {
         // Verify empty data doesn't cause division-by-zero or NaN
         set_default_ctx(ctx(
             RateBackend::Ctw { depth: 16 },
-            CompressionBackend::default(),
+            default_compression_backend(),
         ));
 
         let empty: &[u8] = &[];
@@ -936,7 +958,7 @@ mod tests {
         assert_eq!(h, 0.0, "empty data should return 0.0 entropy");
 
         // Reset
-        set_default_ctx(InfotheoryCtx::default());
+        set_default_ctx(default_ctx());
     }
 
     #[test]
@@ -1088,7 +1110,7 @@ mod tests {
         let from_session = session.generate_bytes(8, GenerationConfig::sampled_frozen(42));
         session.finish().expect("session finish");
 
-        let ctx = ctx(backend, CompressionBackend::default());
+        let ctx = ctx(backend, default_compression_backend());
         let from_ctx = ctx
             .try_generate_bytes_with_config(prompt, 8, -1, GenerationConfig::sampled_frozen(42))
             .expect("ctx generation");
@@ -1146,7 +1168,7 @@ mod tests {
 
     #[test]
     fn rosa_conditional_chain_matches_concatenated_prefix_scoring() {
-        let ctx = ctx(RateBackend::RosaPlus, CompressionBackend::default());
+        let ctx = ctx(RateBackend::RosaPlus, default_compression_backend());
         let prefix_parts: [&[u8]; 3] = [b"universal ", b"prior ", b"slice"];
         let data = b"query payload";
 
@@ -1250,7 +1272,7 @@ mod tests {
             RateBackend::Rwkv7Method {
                 method: method.to_string(),
             },
-            CompressionBackend::default(),
+            default_compression_backend(),
         );
 
         let prefix = b"universal prior slice";
@@ -1376,8 +1398,7 @@ mod tests {
     ))
 ))]
 mod minimal_tests {
-    #[cfg(not(feature = "backend-zpaq"))]
-    use crate::api::CompressionBackend;
+    use crate::api::{CompressionBackend, RateBackend};
 
     #[cfg(not(feature = "backend-zpaq"))]
     #[test]
@@ -1396,24 +1417,29 @@ mod minimal_tests {
         );
     }
 
+    #[test]
+    fn default_rate_backend_selection_fails_when_no_rate_backends_are_enabled() {
+        let err = match RateBackend::try_default() {
+            Ok(_) => panic!("no default rate backend should exist"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("no default rate backend is available in this build"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[cfg(not(feature = "backend-zpaq"))]
     #[test]
-    fn default_compression_backend_fails_to_compile_when_no_rate_backends_are_enabled() {
-        let backend = CompressionBackend::default();
-        assert!(matches!(
-            &backend,
-            CompressionBackend::Rate {
-                coder: crate::coders::CoderType::AC,
-                framing: crate::compression::FramingMode::Raw,
-                ..
-            }
-        ));
-        let err = backend
-            .compile()
-            .err()
-            .expect("default backend should fail loudly at compile boundary");
+    fn default_compression_backend_selection_fails_when_no_rate_backends_are_enabled() {
+        let err = match CompressionBackend::try_default() {
+            Ok(_) => panic!("no default compression backend exists"),
+            Err(err) => err,
+        };
         assert!(
-            err.to_string().contains("requires infotheory feature"),
+            err.to_string()
+                .contains("no default rate backend is available in this build"),
             "unexpected error: {err}"
         );
     }

@@ -65,9 +65,9 @@ The suite includes:
   `calibrated`, `mamba`, and `rwkv7` string parsing (`python/tests/test_api_surface.py`)
 - Compression/decompression roundtrip checks in Rust and Python
 - VM stats-backend parsing and predictor-backed trace-model coverage for the new
-  backends (`src/main.rs`, `src/aixi/vm_nyx.rs`)
-- Deterministic fixture hash checks (`tests/roundtrip_hashes.rs`, `python/tests/test_golden_hashes.py`)
-- RWKV method parsing/canonicalization tests (`tests/rwkv_method_canonicalization.rs`)
+  backends (`crates/infotheory/src/main.rs`, `crates/infotheory/src/aixi/vm_nyx.rs`)
+- Deterministic fixture hash checks (`crates/infotheory/tests/roundtrip_hashes.rs`, `python/tests/test_golden_hashes.py`)
+- RWKV method parsing/canonicalization tests (`crates/infotheory/tests/rwkv_method_canonicalization.rs`)
 
 These tests are designed to catch semantic drift and output regressions across
 interfaces.

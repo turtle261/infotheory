@@ -1,6 +1,7 @@
 //! Public type definitions for the spec-first API surface.
 
 use crate::coders::CoderType;
+use crate::error::{InfotheoryError, InfotheoryResult};
 use std::sync::Arc;
 
 /// How generated symbols should update the model state.
@@ -372,27 +373,25 @@ pub struct ParticleSpec {
     pub seed: u64,
 }
 
-#[allow(clippy::derivable_impls)]
-impl Default for RateBackend {
-    fn default() -> Self {
-        #[cfg(feature = "backend-rosa")]
-        {
-            RateBackend::RosaPlus
-        }
-        #[cfg(all(not(feature = "backend-rosa"), feature = "backend-zpaq"))]
-        {
-            RateBackend::Zpaq {
-                method: "1".to_string(),
-            }
-        }
-        #[cfg(all(not(feature = "backend-rosa"), not(feature = "backend-zpaq")))]
-        {
-            RateBackend::Ctw { depth: 16 }
-        }
-    }
-}
-
 impl RateBackend {
+    /// Returns the current build's implicit default rate backend.
+    pub fn try_default() -> InfotheoryResult<Self> {
+        crate::runtime::first_enabled_default_rate_backend_spec().ok_or_else(|| {
+            let mut requested = Vec::new();
+            for descriptor in crate::runtime::RATE_BACKEND_REGISTRY {
+                if let Some(feature) = descriptor.feature
+                    && !requested.contains(&feature)
+                {
+                    requested.push(feature);
+                }
+            }
+            InfotheoryError::unsupported(format!(
+                "no default rate backend is available in this build; enable one of: {}",
+                requested.join(", ")
+            ))
+        })
+    }
+
     /// Stable internal backend identity.
     pub(crate) fn kind(&self) -> crate::runtime::RateBackendKind {
         match self {
@@ -458,27 +457,28 @@ impl RateBackend {
     }
 }
 
-#[cfg(feature = "backend-zpaq")]
-impl Default for CompressionBackend {
-    fn default() -> Self {
-        CompressionBackend::Zpaq {
-            method: "5".to_string(),
+impl CompressionBackend {
+    /// Returns the current build's implicit default compression backend.
+    pub fn try_default() -> InfotheoryResult<Self> {
+        if crate::runtime::COMPRESSION_BACKEND_REGISTRY
+            .iter()
+            .any(|descriptor| {
+                descriptor.enabled
+                    && descriptor.kind == crate::runtime::CompressionBackendKind::Zpaq
+            })
+        {
+            return Ok(CompressionBackend::Zpaq {
+                method: "5".to_string(),
+            });
         }
-    }
-}
 
-#[cfg(not(feature = "backend-zpaq"))]
-impl Default for CompressionBackend {
-    fn default() -> Self {
-        CompressionBackend::Rate {
-            rate_backend: RateBackend::default(),
+        Ok(CompressionBackend::Rate {
+            rate_backend: RateBackend::try_default()?,
             coder: crate::coders::CoderType::AC,
             framing: crate::compression::FramingMode::Raw,
-        }
+        })
     }
-}
 
-impl CompressionBackend {
     /// Stable internal backend identity.
     pub(crate) fn kind(&self) -> crate::runtime::CompressionBackendKind {
         match self {
@@ -535,9 +535,6 @@ impl CompressionBackend {
         self.validate()?.compile()
     }
 }
-
-use crate::error::{InfotheoryError, InfotheoryResult};
-
 /// Parse a mixture kind name with the shared alias table used across CLI, Python, and WASM.
 pub fn parse_mixture_kind_name(kind: &str) -> Result<MixtureKind, String> {
     match kind.trim().to_ascii_lowercase().as_str() {

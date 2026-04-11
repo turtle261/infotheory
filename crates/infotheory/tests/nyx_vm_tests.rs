@@ -526,7 +526,7 @@ mod vm_integration_tests {
             ]),
             action_filter: None,
             protocol: NyxProtocolConfig::default(),
-            stats_backend: RateBackend::default(),
+            stats_backend: RateBackend::try_default().expect("vm default stats backend"),
             trace: None,
             debug_mode: true,
             crash_log: None,
@@ -650,7 +650,7 @@ fn test_complete_experiment_config() {
             reject_reward: Some(-1),
         }),
         protocol: NyxProtocolConfig::default(),
-        stats_backend: RateBackend::default(),
+        stats_backend: RateBackend::try_default().expect("vm default stats backend"),
         trace: Some(NyxTraceConfig {
             shared_region_name: Some("trace".to_string()),
             max_bytes: 1024,

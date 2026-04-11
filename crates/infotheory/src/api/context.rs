@@ -15,7 +15,7 @@ use crate::mixture::OnlineBytePredictor;
 use crate::spec::{CompiledCompressionBackend, CompiledRateBackend};
 
 /// Returns the current default information theory context for this thread.
-pub fn get_default_ctx() -> InfotheoryCtx {
+pub fn get_default_ctx() -> InfotheoryResult<InfotheoryCtx> {
     crate::get_default_ctx()
 }
 
@@ -31,13 +31,6 @@ pub struct InfotheoryCtx {
     pub rate_backend: CompiledRateBackend,
     /// Default compression backend for NCD/compression primitives.
     pub compression_backend: CompiledCompressionBackend,
-}
-
-impl Default for InfotheoryCtx {
-    fn default() -> Self {
-        Self::from_specs(RateBackend::default(), CompressionBackend::default())
-            .unwrap_or_else(|err| panic!("failed to build default infotheory context: {err}"))
-    }
 }
 
 /// Stateful rate-backend session for fitting, conditioning, and continuation.
@@ -139,6 +132,14 @@ impl RateBackendSession {
 }
 
 impl InfotheoryCtx {
+    /// Create the current build's implicit default context.
+    pub fn try_default() -> InfotheoryResult<Self> {
+        Self::from_specs(
+            RateBackend::try_default()?,
+            CompressionBackend::try_default()?,
+        )
+    }
+
     /// Create a context from explicit rate and compression backends.
     pub fn new(
         rate_backend: CompiledRateBackend,
@@ -166,14 +167,13 @@ impl InfotheoryCtx {
     }
 
     /// Create a context with ROSA+ rate backend and ZPAQ compression backend.
-    pub fn with_zpaq(method: impl Into<String>) -> Self {
+    pub fn try_with_zpaq(method: impl Into<String>) -> InfotheoryResult<Self> {
         Self::from_specs(
             RateBackend::RosaPlus,
             CompressionBackend::Zpaq {
                 method: method.into(),
             },
         )
-        .unwrap_or_else(|err| panic!("failed to build zpaq context: {err}"))
     }
 
     /// Compressed length of one byte slice under this context's compressor.

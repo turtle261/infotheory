@@ -401,10 +401,13 @@ use infotheory::*;
 let h = entropy_rate_bytes(data, 8);
 
 // Switch the entire thread to use CTW for all subsequent calls
-set_default_ctx(InfotheoryCtx::new(
-    RateBackend::Ctw { depth: 32 },
-    CompressionBackend::default()
-));
+set_default_ctx(
+    InfotheoryCtx::from_specs(
+        RateBackend::Ctw { depth: 32 },
+        CompressionBackend::try_default().expect("default compression backend"),
+    )
+    .expect("ctw context"),
+);
 ```
 
 ---

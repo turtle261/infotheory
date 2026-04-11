@@ -71,10 +71,13 @@ mod ctw_surface {
         let backend = RateBackend::Ctw { depth: 8 };
         let compiled = backend.compile().expect("compiled ctw backend");
 
-        let prev = get_default_ctx();
+        let prev = get_default_ctx().expect("default ctx");
         set_default_ctx(
-            InfotheoryCtx::from_specs(backend.clone(), CompressionBackend::default())
-                .expect("ctw context"),
+            InfotheoryCtx::from_specs(
+                backend.clone(),
+                CompressionBackend::try_default().expect("default compression backend"),
+            )
+            .expect("ctw context"),
         );
 
         assert!(try_entropy_rate_backend(x, -1, &compiled).expect("entropy rate") >= 0.0);
@@ -153,8 +156,11 @@ mod rosa_surface {
     fn api_surface_generation_session_and_config_are_callable() {
         let prompt = b"If a frog is green, dogs are red.\nIf a toad is green, cats are red.\nIf a dog is green, frogs are red.\nIf a cat is green, toads are red.\nIf a frog is red, dogs are green.\nIf a toad is red, cats are green.\nIf a dog is red, frogs are green.\nIf a cat is red, toads are ";
         let backend = RateBackend::RosaPlus;
-        let ctx =
-            InfotheoryCtx::from_specs(backend.clone(), CompressionBackend::default()).expect("ctx");
+        let ctx = InfotheoryCtx::from_specs(
+            backend.clone(),
+            CompressionBackend::try_default().expect("default compression backend"),
+        )
+        .expect("ctx");
         let cfg = GenerationConfig::sampled_frozen(42);
 
         let direct = ctx
