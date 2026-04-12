@@ -51,6 +51,9 @@ use infotheory::mambazip;
 use infotheory::rwkvzip;
 #[cfg(feature = "backend-sequitur")]
 use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
+use infotheory::spec::{
+    self, BuiltinEnvironmentSpec, ControllerSpec, EnvironmentSpec, PlannerRunSpec, SpecDocument,
+};
 #[cfg(feature = "vm")]
 use nyx_lite::SharedMemoryPolicy;
 use std::env;
@@ -317,13 +320,292 @@ fn parse_mixture_expert_value(
     infotheory::spec::parse_mixture_expert_value(v, base_dir, depth).map_err(anyhow::Error::msg)
 }
 
+fn is_canonical_spec_document(value: &serde_json::Value) -> bool {
+    value["schema_version"].as_u64().is_some() && value["kind"].as_str().is_some()
+}
+
+fn observation_key_mode_name(mode: ObservationKeyMode) -> &'static str {
+    match mode {
+        ObservationKeyMode::First => "first",
+        ObservationKeyMode::Last => "last",
+        ObservationKeyMode::FullStream => "full-stream",
+        ObservationKeyMode::StreamHash => "stream-hash",
+    }
+}
+
+fn builtin_environment_name(spec: BuiltinEnvironmentSpec) -> &'static str {
+    match spec {
+        BuiltinEnvironmentSpec::CoinFlip => "coin-flip",
+        BuiltinEnvironmentSpec::CtwTest => "ctw-test",
+        BuiltinEnvironmentSpec::ExtendedTiger => "extended-tiger",
+        BuiltinEnvironmentSpec::TicTacToe => "tictactoe",
+        BuiltinEnvironmentSpec::BiasedRockPaperScissor => "biased-rock-paper-scissor",
+        BuiltinEnvironmentSpec::KuhnPoker => "kuhn-poker",
+    }
+}
+
+#[cfg(feature = "vm")]
+fn resolve_spec_asset_path(
+    assets: &[infotheory::spec::AssetBinding],
+    id: &str,
+    config_dir: &Path,
+) -> anyhow::Result<String> {
+    let binding = assets
+        .iter()
+        .find(|binding| binding.id == id)
+        .ok_or_else(|| anyhow::anyhow!("planner_run references unknown asset id '{id}'"))?;
+    let full = infotheory::spec::resolve_spec_path(config_dir, &binding.path);
+    Ok(full.display().to_string())
+}
+
+#[cfg(feature = "vm")]
+fn vm_environment_spec_to_legacy_json(
+    vm: &infotheory::spec::VmEnvironmentSpec,
+    assets: &[infotheory::spec::AssetBinding],
+    config_dir: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let firecracker_config =
+        resolve_spec_asset_path(assets, &vm.firecracker_config_asset, config_dir)?;
+    let shared_memory_policy = match vm.shared_memory_policy {
+        infotheory::spec::SharedMemoryPolicySpec::Preserve => "preserve",
+        infotheory::spec::SharedMemoryPolicySpec::Snapshot => "snapshot",
+    };
+    let reward_policy = match &vm.reward_policy {
+        infotheory::spec::VmRewardPolicySpec::FromGuest => serde_json::json!({
+            "mode": "guest",
+        }),
+        infotheory::spec::VmRewardPolicySpec::Pattern {
+            pattern,
+            base_reward,
+            bonus_reward,
+        } => serde_json::json!({
+            "mode": "pattern",
+            "pattern": pattern,
+            "base_reward": base_reward,
+            "bonus_reward": bonus_reward,
+        }),
+    };
+    let reward_shaping = match &vm.reward_shaping {
+        Some(infotheory::spec::VmRewardShapingSpec::EntropyReduction {
+            baseline_asset,
+            max_order,
+            scale,
+            crash_bonus,
+            timeout_bonus,
+        }) => Some(serde_json::json!({
+            "mode": "entropy-reduction",
+            "baseline_path": resolve_spec_asset_path(assets, baseline_asset, config_dir)?,
+            "max_order": max_order,
+            "scale": scale,
+            "crash_bonus": crash_bonus,
+            "timeout_bonus": timeout_bonus,
+        })),
+        Some(infotheory::spec::VmRewardShapingSpec::TraceEntropy {
+            max_order,
+            scale,
+            normalize,
+        }) => Some(serde_json::json!({
+            "mode": "trace-entropy",
+            "max_order": max_order,
+            "scale": scale,
+            "normalize": normalize,
+        })),
+        None => None,
+    };
+    let actions = match &vm.action_source {
+        infotheory::spec::VmRuntimeActionSourceSpec::Literal {
+            names,
+            payloads,
+            encoding,
+        } => serde_json::json!({
+            "mode": "literal",
+            "actions": payloads.iter().enumerate().map(|(index, payload)| serde_json::json!({
+                "name": names.get(index).cloned().flatten(),
+                "payload": payload,
+                "encoding": encoding,
+            })).collect::<Vec<_>>(),
+        }),
+        infotheory::spec::VmRuntimeActionSourceSpec::Fuzz {
+            seeds,
+            encoding,
+            mutators,
+            min_len,
+            max_len,
+            dictionary,
+            rng_seed,
+        } => serde_json::json!({
+            "mode": "fuzz",
+            "seed_inputs": seeds,
+            "seed_encoding": encoding,
+            "mutators": mutators,
+            "min_len": min_len,
+            "max_len": max_len,
+            "dictionary": dictionary,
+            "dict_encoding": encoding,
+            "rng_seed": rng_seed,
+        }),
+    };
+    let filter = vm
+        .action_filter
+        .as_ref()
+        .map(|filter| -> anyhow::Result<serde_json::Value> {
+            let novelty_prior_path = filter
+                .novelty_prior_asset
+                .as_ref()
+                .map(|id| resolve_spec_asset_path(assets, id, config_dir))
+                .transpose()?;
+            Ok(serde_json::json!({
+                "min_entropy": filter.min_entropy,
+                "max_entropy": filter.max_entropy,
+                "min_intrinsic_dependence": filter.min_intrinsic_dependence,
+                "min_novelty": filter.min_novelty,
+                "novelty_prior_path": novelty_prior_path,
+                "max_order": filter.max_order,
+                "reject_reward": filter.reject_reward,
+            }))
+        })
+        .transpose()?;
+    let trace = vm.trace.as_ref().map(|trace| {
+        serde_json::json!({
+            "shared_region_name": trace.shared_region_name,
+            "max_bytes": trace.max_bytes,
+            "reset_on_episode": trace.reset_on_episode,
+        })
+    });
+
+    Ok(serde_json::json!({
+        "firecracker_config": firecracker_config,
+        "instance_id": vm.instance_id,
+        "shared_region_name": vm.shared_region_name,
+        "shared_region_size": vm.shared_region_size,
+        "shared_memory_policy": shared_memory_policy,
+        "step_timeout_ms": vm.step_timeout_ms,
+        "boot_timeout_ms": vm.boot_timeout_ms,
+        "episode_steps": vm.episode_steps,
+        "step_cost": vm.step_cost,
+        "debug": vm.debug_mode,
+        "protocol": {
+            "action_prefix": vm.action_prefix,
+            "action_suffix": vm.action_suffix,
+            "obs_prefix": vm.obs_prefix,
+            "rew_prefix": vm.rew_prefix,
+            "done_prefix": vm.done_prefix,
+            "data_prefix": vm.data_prefix,
+            "wire_encoding": vm.wire_encoding,
+        },
+        "stats_backend": spec::rate_backend_to_json_value(&vm.stats_backend).map_err(anyhow::Error::msg)?,
+        "trace": trace,
+        "actions": actions,
+        "observation": {
+            "mode": vm.observation_policy,
+            "stream_len": vm.observation_stream_len,
+            "stream_mode": vm.observation_stream_mode,
+            "pad_byte": vm.observation_pad_byte,
+        },
+        "reward": reward_policy,
+        "reward_shaping": reward_shaping,
+        "filter": filter,
+    }))
+}
+
+fn planner_run_spec_to_legacy_json(
+    spec: &PlannerRunSpec,
+    _config_dir: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::json!({
+        "observation_bits": spec.interface.observation_bits,
+        "observation_stream_len": spec.interface.observation_stream_len,
+        "observation_key_mode": observation_key_mode_name(spec.interface.observation_key_mode),
+        "reward_bits": spec.interface.reward_bits,
+        "agent_actions": spec.interface.agent_actions,
+        "reward_offset": spec.interface.reward_offset,
+        "random_seed": spec.runtime.random_seed,
+        "learn_cycles": spec.runtime.learn_cycles,
+        "eval_cycles": spec.runtime.eval_cycles,
+        "terminate-lifetime": spec.runtime.terminate_lifetime,
+        "log_every": spec.runtime.log_every,
+        "perf": spec.runtime.perf,
+        "vm_perf_only": spec.runtime.vm_perf_only,
+        "explore_epsilon": spec.runtime.explore_epsilon,
+        "explore_gamma": spec.runtime.explore_gamma,
+    });
+
+    match &spec.environment {
+        EnvironmentSpec::Builtin { builtin } => {
+            value["environment"] = serde_json::json!(builtin_environment_name(*builtin));
+        }
+        #[cfg(feature = "vm")]
+        EnvironmentSpec::NyxVm(vm) => {
+            value["environment"] = serde_json::json!("vm");
+            value["vm_config"] = vm_environment_spec_to_legacy_json(vm, &spec.assets, _config_dir)?;
+        }
+    }
+
+    match &spec.controller {
+        ControllerSpec::McAixi(inner) => {
+            value["planner"] = serde_json::json!("mc-aixi");
+            value["algorithm"] = serde_json::json!("ctw");
+            value["rate_backend"] =
+                spec::rate_backend_to_json_value(&inner.predictor).map_err(anyhow::Error::msg)?;
+            value["rate_backend_max_order"] = serde_json::json!(inner.predictor_max_order);
+            value["agent_horizon"] = serde_json::json!(inner.agent_horizon);
+            value["num_simulations"] = serde_json::json!(inner.num_simulations);
+            value["exploration_exploitation_ratio"] =
+                serde_json::json!(inner.exploration_exploitation_ratio);
+            value["discount_gamma"] = serde_json::json!(inner.discount_gamma);
+        }
+        ControllerSpec::AiqiDiscounted(inner) => {
+            value["planner"] = serde_json::json!("aiqi");
+            value["algorithm"] = serde_json::json!("ac-ctw");
+            value["aiqi_rate_backend"] =
+                spec::rate_backend_to_json_value(&inner.predictor).map_err(anyhow::Error::msg)?;
+            value["rate_backend_max_order"] = serde_json::json!(inner.predictor_max_order);
+            value["discount_gamma"] = serde_json::json!(inner.discount_gamma);
+            value["return_horizon"] = serde_json::json!(inner.return_horizon);
+            value["return_bins"] = serde_json::json!(inner.return_bins);
+            value["augmentation_period"] = serde_json::json!(inner.augmentation_period);
+            value["history_prune_keep_steps"] = serde_json::json!(inner.history_prune_keep_steps);
+            value["baseline_exploration"] = serde_json::json!(inner.baseline_exploration);
+        }
+        ControllerSpec::AiqiWarmstartExactJh(_) => {
+            return Err(anyhow::anyhow!(
+                "planner_run controller kind 'aiqi_warmstart_exact_jh' is not executable from the CLI yet"
+            ));
+        }
+    }
+
+    Ok(value)
+}
+
 fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     let mut file = File::open(config_path)?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     let v: serde_json::Value = serde_json::from_str(&content)?;
     let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
+    if is_canonical_spec_document(&v) {
+        return match infotheory::spec::load_spec_document(config_path)
+            .map_err(anyhow::Error::msg)?
+        {
+            SpecDocument::PlannerRun(spec) => {
+                let legacy = planner_run_spec_to_legacy_json(&spec, config_dir)?;
+                run_aixi_mode_value(&legacy, config_dir)
+            }
+            SpecDocument::Tune(_) => Err(anyhow::anyhow!(
+                "aixi expects a planner_run document, found kind 'tune'"
+            )),
+            SpecDocument::RateBackend(_) => Err(anyhow::anyhow!(
+                "aixi expects a planner_run document, found kind 'rate_backend'"
+            )),
+            SpecDocument::CompressionBackend(_) => Err(anyhow::anyhow!(
+                "aixi expects a planner_run document, found kind 'compression_backend'"
+            )),
+        };
+    }
+    run_aixi_mode_value(&v, config_dir)
+}
 
+fn run_aixi_mode_value(v: &serde_json::Value, config_dir: &Path) -> anyhow::Result<()> {
     let env_name = v["environment"].as_str().unwrap_or("coin-flip");
     let mut env: Box<dyn Environment> = match env_name {
         "coin-flip" => Box::new(CoinFlip::new(0.9)),
@@ -2222,5 +2504,268 @@ mod tests {
             }
             _ => panic!("expected fac-ctw backend"),
         }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn run_aixi_mode_rejects_non_planner_spec_documents() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "infotheory-spec-kind-{}-{nanos}.json",
+            std::process::id()
+        ));
+        let doc = infotheory::spec::SpecDocument::Tune(infotheory::spec::TuneSpec {
+            assets: vec![infotheory::spec::AssetBinding {
+                id: "dataset".to_string(),
+                path: "input.bin".to_string(),
+            }],
+            input_asset: "dataset".to_string(),
+            baseline_candidate: CompressionBackend::Rate {
+                rate_backend: RateBackend::Ctw { depth: 8 },
+                coder: infotheory::coders::CoderType::AC,
+                framing: infotheory::compression::FramingMode::Framed,
+            },
+            controller: infotheory::spec::TuneControllerSpec::AnnealedHillClimbing(
+                infotheory::spec::AnnealedHillClimbingTuneControllerSpec {
+                    max_mutation_radius: 1,
+                },
+            ),
+            bounds: infotheory::spec::TuneBoundsSpec {
+                allowed_backends: vec!["ctw".to_string()],
+                forbidden_backends: vec![],
+                parameter_ranges: vec![],
+                max_experts: 2,
+                max_mixture_nesting_depth: 1,
+                min_experts: Some(1),
+                allow_duplicate_experts: Some(false),
+                required_experts: vec![],
+                forbidden_expert_pairs: vec![],
+            },
+            eval_time_limit_seconds: 1.0,
+            time_budget_seconds: 2.0,
+            min_throughput_bytes_per_second: 1.0,
+            max_memory_bytes: 1024,
+            output_config_path: "best.json".to_string(),
+            seed: 7,
+            report_path: None,
+        });
+        std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
+            .expect("write temp spec");
+
+        let err = run_aixi_mode(path.to_str().expect("utf8 path"))
+            .expect_err("non planner spec should be rejected");
+        assert!(err.to_string().contains("planner_run document"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(not(feature = "backend-ctw"))]
+    #[test]
+    fn run_aixi_mode_surfaces_backend_validation_for_non_planner_documents() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "infotheory-canonical-non-planner-no-ctw-{nanos}.json"
+        ));
+        let doc = infotheory::spec::SpecDocument::Tune(infotheory::spec::TuneSpec {
+            assets: vec![infotheory::spec::AssetBinding {
+                id: "dataset".to_string(),
+                path: "input.bin".to_string(),
+            }],
+            input_asset: "dataset".to_string(),
+            baseline_candidate: CompressionBackend::Rate {
+                rate_backend: RateBackend::Ctw { depth: 8 },
+                coder: infotheory::coders::CoderType::AC,
+                framing: infotheory::compression::FramingMode::Framed,
+            },
+            controller: infotheory::spec::TuneControllerSpec::AnnealedHillClimbing(
+                infotheory::spec::AnnealedHillClimbingTuneControllerSpec {
+                    max_mutation_radius: 1,
+                },
+            ),
+            bounds: infotheory::spec::TuneBoundsSpec {
+                allowed_backends: vec!["ctw".to_string()],
+                forbidden_backends: vec![],
+                parameter_ranges: vec![],
+                max_experts: 2,
+                max_mixture_nesting_depth: 1,
+                min_experts: Some(1),
+                allow_duplicate_experts: Some(false),
+                required_experts: vec![],
+                forbidden_expert_pairs: vec![],
+            },
+            eval_time_limit_seconds: 1.0,
+            time_budget_seconds: 2.0,
+            min_throughput_bytes_per_second: 1.0,
+            max_memory_bytes: 1024,
+            output_config_path: "best.json".to_string(),
+            seed: 7,
+            report_path: None,
+        });
+        std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
+            .expect("write temp spec");
+
+        let err = run_aixi_mode(path.to_str().expect("utf8 path"))
+            .expect_err("missing backend feature should be surfaced");
+        assert!(
+            err.to_string()
+                .contains("requires infotheory feature 'backend-ctw'"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn run_aixi_mode_accepts_canonical_planner_run_documents() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "infotheory-planner-run-{}-{nanos}.json",
+            std::process::id()
+        ));
+        let doc = infotheory::spec::SpecDocument::PlannerRun(infotheory::spec::PlannerRunSpec {
+            assets: Vec::new(),
+            environment: infotheory::spec::EnvironmentSpec::Builtin {
+                builtin: infotheory::spec::BuiltinEnvironmentSpec::CoinFlip,
+            },
+            interface: infotheory::spec::PlannerInterfaceSpec {
+                observation_bits: 1,
+                observation_stream_len: 1,
+                observation_key_mode: ObservationKeyMode::FullStream,
+                reward_bits: 1,
+                agent_actions: 2,
+                min_reward: 0,
+                max_reward: 1,
+                reward_offset: 0,
+            },
+            controller: infotheory::spec::ControllerSpec::McAixi(
+                infotheory::spec::McAixiControllerSpec {
+                    predictor: RateBackend::Ctw { depth: 8 },
+                    predictor_max_order: 8,
+                    agent_horizon: 1,
+                    num_simulations: 1,
+                    exploration_exploitation_ratio: 1.0,
+                    discount_gamma: 1.0,
+                },
+            ),
+            runtime: infotheory::spec::PlannerRuntimeSpec {
+                random_seed: Some(7),
+                learn_cycles: Some(1),
+                eval_cycles: Some(0),
+                terminate_lifetime: 1,
+                log_every: 1,
+                perf: false,
+                vm_perf_only: false,
+                explore_epsilon: 0.0,
+                explore_gamma: 1.0,
+            },
+        });
+        std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
+            .expect("write temp planner spec");
+
+        run_aixi_mode(path.to_str().expect("utf8 path"))
+            .expect("canonical planner_run document should execute");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(all(feature = "vm", feature = "backend-ctw"))]
+    #[test]
+    fn planner_run_spec_to_legacy_json_preserves_canonical_vm_observation_modes() {
+        let spec = infotheory::spec::PlannerRunSpec {
+            assets: vec![infotheory::spec::AssetBinding {
+                id: "firecracker".to_string(),
+                path: "dummy-firecracker.json".to_string(),
+            }],
+            environment: infotheory::spec::EnvironmentSpec::NyxVm(
+                infotheory::spec::VmEnvironmentSpec {
+                    firecracker_config_asset: "firecracker".to_string(),
+                    instance_id: "vm-test".to_string(),
+                    shared_region_name: "shared".to_string(),
+                    shared_region_size: 4096,
+                    shared_memory_policy: infotheory::spec::SharedMemoryPolicySpec::Snapshot,
+                    step_timeout_ms: 100,
+                    boot_timeout_ms: 1_000,
+                    episode_steps: 4,
+                    step_cost: 0,
+                    observation_policy: "output_hash".to_string(),
+                    observation_bits: 8,
+                    observation_stream_len: 16,
+                    observation_stream_mode: "pad_truncate".to_string(),
+                    observation_pad_byte: 0,
+                    reward_bits: 8,
+                    reward_policy: infotheory::spec::VmRewardPolicySpec::FromGuest,
+                    reward_shaping: None,
+                    action_source: infotheory::spec::VmRuntimeActionSourceSpec::Literal {
+                        names: vec![Some("noop".to_string())],
+                        payloads: vec!["00".to_string()],
+                        encoding: "hex".to_string(),
+                    },
+                    action_filter: None,
+                    action_prefix: "ACT ".to_string(),
+                    action_suffix: "\n".to_string(),
+                    obs_prefix: "OBS ".to_string(),
+                    rew_prefix: "REW ".to_string(),
+                    done_prefix: "DONE ".to_string(),
+                    data_prefix: "DATA ".to_string(),
+                    wire_encoding: "hex".to_string(),
+                    stats_backend: RateBackend::Ctw { depth: 8 },
+                    trace: None,
+                    debug_mode: false,
+                },
+            ),
+            interface: infotheory::spec::PlannerInterfaceSpec {
+                observation_bits: 8,
+                observation_stream_len: 16,
+                observation_key_mode: ObservationKeyMode::FullStream,
+                reward_bits: 8,
+                agent_actions: 1,
+                min_reward: 0,
+                max_reward: 255,
+                reward_offset: 0,
+            },
+            controller: infotheory::spec::ControllerSpec::AiqiDiscounted(
+                infotheory::spec::AiqiDiscountedControllerSpec {
+                    predictor: RateBackend::Ctw { depth: 8 },
+                    predictor_max_order: 8,
+                    discount_gamma: 0.99,
+                    return_horizon: 2,
+                    return_bins: 8,
+                    augmentation_period: 2,
+                    history_prune_keep_steps: None,
+                    baseline_exploration: 0.0,
+                },
+            ),
+            runtime: infotheory::spec::PlannerRuntimeSpec {
+                random_seed: Some(7),
+                learn_cycles: Some(1),
+                eval_cycles: Some(0),
+                terminate_lifetime: 1,
+                log_every: 1,
+                perf: false,
+                vm_perf_only: false,
+                explore_epsilon: 0.0,
+                explore_gamma: 1.0,
+            },
+        };
+
+        let legacy = planner_run_spec_to_legacy_json(&spec, Path::new(".")).expect("legacy json");
+        let parsed = crate::cli::parse_nyx_observation_policy(&legacy["vm_config"]["observation"]);
+        assert!(matches!(parsed, NyxObservationPolicy::OutputHash));
     }
 }

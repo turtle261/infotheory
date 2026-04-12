@@ -41,6 +41,11 @@ use crate::mambazip::Compressor as MambaCompressor;
 use crate::mixture::OnlineBytePredictor;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip::Compressor;
+use crate::spec::{
+    AssetBinding, EnvironmentSpec, SharedMemoryPolicySpec, SpecEnvironment, VmActionFilterSpec,
+    VmEnvironmentSpec, VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec,
+    VmTraceSpec,
+};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::fs::OpenOptions;
@@ -101,6 +106,13 @@ impl PayloadEncoding {
             Self::Utf8 => String::from_utf8_lossy(bytes).to_string(),
             Self::Hex => hex_encode(bytes),
         }
+    }
+}
+
+fn payload_encoding_name(encoding: PayloadEncoding) -> &'static str {
+    match encoding {
+        PayloadEncoding::Utf8 => "utf8",
+        PayloadEncoding::Hex => "hex",
     }
 }
 
@@ -289,6 +301,18 @@ pub enum FuzzMutator {
     Havoc,
 }
 
+fn fuzz_mutator_name(mutator: &FuzzMutator) -> &'static str {
+    match mutator {
+        FuzzMutator::FlipBit => "flip_bit",
+        FuzzMutator::FlipByte => "flip_byte",
+        FuzzMutator::InsertByte => "insert_byte",
+        FuzzMutator::DeleteByte => "delete_byte",
+        FuzzMutator::SpliceSeed => "splice_seed",
+        FuzzMutator::ResetSeed => "reset_seed",
+        FuzzMutator::Havoc => "havoc",
+    }
+}
+
 /// Fuzzing configuration for action generation.
 #[derive(Clone, Debug)]
 pub struct NyxFuzzConfig {
@@ -332,6 +356,15 @@ pub enum NyxObservationPolicy {
     SharedMemory,
 }
 
+fn nyx_observation_policy_name(policy: NyxObservationPolicy) -> &'static str {
+    match policy {
+        NyxObservationPolicy::FromGuest => "from_guest",
+        NyxObservationPolicy::OutputHash => "output_hash",
+        NyxObservationPolicy::RawOutput => "raw_output",
+        NyxObservationPolicy::SharedMemory => "shared_memory",
+    }
+}
+
 /// Stream normalization mode.
 #[derive(Clone, Copy, Debug)]
 pub enum NyxObservationStreamMode {
@@ -341,6 +374,14 @@ pub enum NyxObservationStreamMode {
     Pad,
     /// Only truncate long streams.
     Truncate,
+}
+
+fn nyx_observation_stream_mode_name(mode: NyxObservationStreamMode) -> &'static str {
+    match mode {
+        NyxObservationStreamMode::PadTruncate => "pad_truncate",
+        NyxObservationStreamMode::Pad => "pad",
+        NyxObservationStreamMode::Truncate => "truncate",
+    }
 }
 
 // ============================================================================
@@ -565,6 +606,194 @@ impl Default for NyxVmConfig {
     }
 }
 
+impl NyxVmConfig {
+    fn validate_runtime_invariants(&self) -> Result<(), String> {
+        if self.firecracker_config.trim().is_empty() {
+            return Err("firecracker_config path must be set".to_string());
+        }
+        if self.episode_steps == 0 {
+            return Err("episode_steps must be > 0".to_string());
+        }
+        if matches!(self.observation_policy, NyxObservationPolicy::RawOutput)
+            && self.observation_stream_len == 0
+        {
+            return Err("observation_stream_len must be > 0 for RawOutput policy".to_string());
+        }
+        if matches!(
+            self.reward_shaping,
+            Some(NyxRewardShaping::TraceEntropy { .. })
+        ) && self.trace.is_none()
+        {
+            return Err(
+                "vm_trace must be configured for vm_reward_shaping.mode=trace-entropy".to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Validate this VM configuration for direct runtime construction.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_runtime_invariants()
+    }
+
+    /// Validate that this VM configuration is representable by canonical spec documents.
+    pub fn validate_canonical_spec_compatibility(&self) -> Result<(), String> {
+        self.validate_runtime_invariants()?;
+
+        let encoding = self.protocol.wire_encoding;
+        let firecracker_asset = "firecracker_config".to_string();
+        let mut assets = vec![AssetBinding {
+            id: firecracker_asset.clone(),
+            path: self.firecracker_config.clone(),
+        }];
+        let reward_shaping = match &self.reward_shaping {
+            Some(NyxRewardShaping::EntropyReduction {
+                baseline_bytes: _,
+                max_order,
+                scale,
+                crash_bonus,
+                timeout_bonus,
+            }) => {
+                let asset_id = "reward_shaping_baseline".to_string();
+                assets.push(AssetBinding {
+                    id: asset_id.clone(),
+                    path: "inline://reward_shaping_baseline".to_string(),
+                });
+                Some(VmRewardShapingSpec::EntropyReduction {
+                    baseline_asset: asset_id,
+                    max_order: *max_order,
+                    scale: *scale,
+                    crash_bonus: *crash_bonus,
+                    timeout_bonus: *timeout_bonus,
+                })
+            }
+            Some(NyxRewardShaping::TraceEntropy {
+                max_order,
+                scale,
+                normalize,
+            }) => Some(VmRewardShapingSpec::TraceEntropy {
+                max_order: *max_order,
+                scale: *scale,
+                normalize: *normalize,
+            }),
+            None => None,
+        };
+        let action_filter = self.action_filter.as_ref().map(|filter| {
+            let novelty_prior_asset = filter.novelty_prior.as_ref().map(|_| {
+                let asset_id = "action_filter_novelty_prior".to_string();
+                assets.push(AssetBinding {
+                    id: asset_id.clone(),
+                    path: "inline://action_filter_novelty_prior".to_string(),
+                });
+                asset_id
+            });
+            VmActionFilterSpec {
+                min_entropy: filter.min_entropy,
+                max_entropy: filter.max_entropy,
+                min_intrinsic_dependence: filter.min_intrinsic_dependence,
+                min_novelty: filter.min_novelty,
+                novelty_prior_asset,
+                max_order: filter.max_order,
+                reject_reward: filter.reject_reward,
+            }
+        });
+        let action_source = match &self.action_source {
+            NyxActionSource::Literal(actions) => VmRuntimeActionSourceSpec::Literal {
+                names: actions.iter().map(|action| action.name.clone()).collect(),
+                payloads: actions
+                    .iter()
+                    .map(|action| encoding.encode(&action.payload))
+                    .collect(),
+                encoding: payload_encoding_name(encoding).to_string(),
+            },
+            NyxActionSource::Fuzz(fuzz) => VmRuntimeActionSourceSpec::Fuzz {
+                seeds: fuzz
+                    .seeds
+                    .iter()
+                    .map(|seed| encoding.encode(seed))
+                    .collect(),
+                encoding: payload_encoding_name(encoding).to_string(),
+                mutators: fuzz
+                    .mutators
+                    .iter()
+                    .map(fuzz_mutator_name)
+                    .map(str::to_string)
+                    .collect(),
+                min_len: fuzz.min_len,
+                max_len: fuzz.max_len,
+                dictionary: fuzz
+                    .dictionary
+                    .iter()
+                    .map(|entry| encoding.encode(entry))
+                    .collect(),
+                rng_seed: fuzz.rng_seed,
+            },
+        };
+        let reward_policy = match &self.reward_policy {
+            NyxRewardPolicy::FromGuest => VmRewardPolicySpec::FromGuest,
+            NyxRewardPolicy::Pattern {
+                pattern,
+                base_reward,
+                bonus_reward,
+            } => VmRewardPolicySpec::Pattern {
+                pattern: pattern.clone(),
+                base_reward: *base_reward,
+                bonus_reward: *bonus_reward,
+            },
+            NyxRewardPolicy::Custom(_) => {
+                return Err(
+                    "custom Nyx reward callbacks are not representable in canonical specs"
+                        .to_string(),
+                );
+            }
+        };
+        let environment = EnvironmentSpec::NyxVm(VmEnvironmentSpec {
+            firecracker_config_asset: firecracker_asset,
+            instance_id: self.instance_id.clone(),
+            shared_region_name: self.shared_region_name.clone(),
+            shared_region_size: self.shared_region_size,
+            shared_memory_policy: match self.shared_memory_policy {
+                SharedMemoryPolicy::Preserve => SharedMemoryPolicySpec::Preserve,
+                SharedMemoryPolicy::Snapshot => SharedMemoryPolicySpec::Snapshot,
+            },
+            step_timeout_ms: self.step_timeout.as_millis() as u64,
+            boot_timeout_ms: self.boot_timeout.as_millis() as u64,
+            episode_steps: self.episode_steps,
+            step_cost: self.step_cost,
+            observation_policy: nyx_observation_policy_name(self.observation_policy).to_string(),
+            observation_bits: self.observation_bits,
+            observation_stream_len: self.observation_stream_len,
+            observation_stream_mode: nyx_observation_stream_mode_name(self.observation_stream_mode)
+                .to_string(),
+            observation_pad_byte: self.observation_pad_byte,
+            reward_bits: self.reward_bits,
+            reward_policy,
+            reward_shaping,
+            action_source,
+            action_filter,
+            action_prefix: self.protocol.action_prefix.clone(),
+            action_suffix: self.protocol.action_suffix.clone(),
+            obs_prefix: self.protocol.obs_prefix.clone(),
+            rew_prefix: self.protocol.rew_prefix.clone(),
+            done_prefix: self.protocol.done_prefix.clone(),
+            data_prefix: self.protocol.data_prefix.clone(),
+            wire_encoding: payload_encoding_name(self.protocol.wire_encoding).to_string(),
+            stats_backend: self.stats_backend.clone(),
+            trace: self.trace.as_ref().map(|trace| VmTraceSpec {
+                shared_region_name: trace.shared_region_name.clone(),
+                max_bytes: trace.max_bytes,
+                reset_on_episode: trace.reset_on_episode,
+            }),
+            debug_mode: self.debug_mode,
+        });
+        environment
+            .validate_in(&assets, &SpecEnvironment::default())
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+}
+
 // ============================================================================
 // Step Result
 // ============================================================================
@@ -690,6 +919,7 @@ impl TraceModel {
         #[cfg(not(feature = "backend-rosa"))]
         let _ = max_order;
 
+        #[allow(unreachable_patterns)]
         match crate::runtime::rate_backend_trace_model_strategy(backend) {
             #[cfg(feature = "backend-rosa")]
             crate::runtime::TraceModelStrategy::Rosa => {
@@ -972,20 +1202,7 @@ pub struct NyxVmEnvironment {
 impl NyxVmEnvironment {
     /// Creates a new NyxVmEnvironment with the given configuration.
     pub fn new(config: NyxVmConfig) -> anyhow::Result<Self> {
-        // Validate configuration
-        if config.firecracker_config.is_empty() {
-            return Err(anyhow::anyhow!("firecracker_config path must be set"));
-        }
-        if config.episode_steps == 0 {
-            return Err(anyhow::anyhow!("episode_steps must be > 0"));
-        }
-        if matches!(config.observation_policy, NyxObservationPolicy::RawOutput)
-            && config.observation_stream_len == 0
-        {
-            return Err(anyhow::anyhow!(
-                "observation_stream_len must be > 0 for RawOutput policy"
-            ));
-        }
+        config.validate().map_err(anyhow::Error::msg)?;
 
         // Load Firecracker config and resolve relative paths
         let fc_config_raw = std::fs::read_to_string(&config.firecracker_config)
@@ -999,14 +1216,6 @@ impl NyxVmEnvironment {
 
         // Initialize reward shaping
         let reward_shaping = config.reward_shaping.clone();
-
-        if matches!(reward_shaping, Some(NyxRewardShaping::TraceEntropy { .. }))
-            && config.trace.is_none()
-        {
-            return Err(anyhow::anyhow!(
-                "vm_trace must be configured for vm_reward_shaping.mode=trace-entropy"
-            ));
-        }
 
         let compiled_stats_backend = config
             .stats_backend
@@ -2088,6 +2297,29 @@ mod tests {
 
         assert_eq!(utf8.decode("test").unwrap(), data);
         assert_eq!(hex.decode("74657374").unwrap(), data);
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn validate_allows_custom_reward_callbacks_for_runtime_configs() {
+        let mut config = NyxVmConfig::default();
+        config.firecracker_config = "dummy-firecracker.json".to_string();
+        config.reward_policy = NyxRewardPolicy::Custom(Arc::new(|_| 0));
+        config
+            .validate()
+            .expect("custom reward callbacks should remain valid for direct runtime configs");
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn validate_canonical_spec_compatibility_rejects_custom_reward_callbacks() {
+        let mut config = NyxVmConfig::default();
+        config.firecracker_config = "dummy-firecracker.json".to_string();
+        config.reward_policy = NyxRewardPolicy::Custom(Arc::new(|_| 0));
+        let err = config
+            .validate_canonical_spec_compatibility()
+            .expect_err("custom reward callbacks are not canonical");
+        assert!(err.contains("not representable in canonical specs"));
     }
 
     #[cfg(feature = "all-backends")]

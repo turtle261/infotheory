@@ -317,13 +317,23 @@ pub(super) fn parse_nyx_fuzz_mutator(name: &str) -> Option<NyxFuzzMutator> {
 }
 
 #[cfg(feature = "vm")]
-pub(super) fn parse_nyx_observation_policy(v: &serde_json::Value) -> NyxObservationPolicy {
-    match v["mode"].as_str().unwrap_or("guest") {
-        "raw" | "raw-bytes" | "bytes" | "stream" => NyxObservationPolicy::RawOutput,
-        "hash" | "output-hash" => NyxObservationPolicy::OutputHash,
-        "shared-memory" | "shared_mem" | "shared" => NyxObservationPolicy::SharedMemory,
+fn parse_nyx_observation_policy_str(mode: &str) -> NyxObservationPolicy {
+    match mode {
+        "guest" | "from-guest" | "from_guest" => NyxObservationPolicy::FromGuest,
+        "raw" | "raw-bytes" | "raw-output" | "raw_output" | "bytes" | "stream" => {
+            NyxObservationPolicy::RawOutput
+        }
+        "hash" | "output-hash" | "output_hash" => NyxObservationPolicy::OutputHash,
+        "shared-memory" | "shared_memory" | "shared_mem" | "shared" => {
+            NyxObservationPolicy::SharedMemory
+        }
         _ => NyxObservationPolicy::FromGuest,
     }
+}
+
+#[cfg(feature = "vm")]
+pub(super) fn parse_nyx_observation_policy(v: &serde_json::Value) -> NyxObservationPolicy {
+    parse_nyx_observation_policy_str(v["mode"].as_str().unwrap_or("guest"))
 }
 
 #[cfg(feature = "vm")]
@@ -1505,6 +1515,33 @@ pub(super) fn run_batch_mode() {
         match line {
             Ok(l) => println!("{}", process_json_line(&l)),
             Err(_) => continue,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "vm"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_nyx_observation_policy_accepts_canonical_and_legacy_aliases() {
+        let cases = [
+            ("from_guest", NyxObservationPolicy::FromGuest),
+            ("output_hash", NyxObservationPolicy::OutputHash),
+            ("raw_output", NyxObservationPolicy::RawOutput),
+            ("shared_memory", NyxObservationPolicy::SharedMemory),
+            ("output-hash", NyxObservationPolicy::OutputHash),
+            ("raw", NyxObservationPolicy::RawOutput),
+            ("shared-memory", NyxObservationPolicy::SharedMemory),
+        ];
+
+        for (mode, expected) in cases {
+            let parsed = parse_nyx_observation_policy(&json!({ "mode": mode }));
+            assert!(
+                std::mem::discriminant(&parsed) == std::mem::discriminant(&expected),
+                "mode {mode} parsed as {parsed:?}"
+            );
         }
     }
 }

@@ -4674,6 +4674,10 @@ impl PyNyxVmConfig {
     fn set_reward_bits(&mut self, bits: usize) {
         self.inner.reward_bits = bits;
     }
+
+    fn validate(&self) -> PyResult<()> {
+        self.inner.validate().map_err(PyValueError::new_err)
+    }
 }
 
 #[cfg(feature = "vm")]
@@ -4687,6 +4691,7 @@ struct PyNyxVmEnvironment {
 impl PyNyxVmEnvironment {
     #[new]
     fn new(config: &PyNyxVmConfig) -> PyResult<Self> {
+        config.inner.validate().map_err(PyValueError::new_err)?;
         let env = infotheory::aixi::vm_nyx::NyxVmEnvironment::new(config.inner.clone())
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner: env })

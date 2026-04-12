@@ -1,11 +1,24 @@
 //! Canonical backend/spec parsing shared by Rust, CLI, and Python surfaces.
 
 pub mod core;
+mod document;
 
 pub use self::core::{
     AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
     CompressionBackendCapabilities, MethodBackendFamily, RateBackendCapabilities,
     RateBackendTraceStrategy, SpecEnvironment, ValidatedCompressionBackend, ValidatedRateBackend,
+};
+pub use self::document::{
+    AiqiDiscountedControllerSpec, AiqiDiscountedTuneControllerSpec,
+    AnnealedHillClimbingTuneControllerSpec, AssetBinding, AssetId, BuiltinEnvironmentSpec,
+    CompiledPlannerController, CompiledPlannerRunSpec, CompiledTuneController, CompiledTuneSpec,
+    ControllerSpec, EnvironmentSpec, McAixiControllerSpec, McAixiFacCtwTuneControllerSpec,
+    PlannerInterfaceSpec, PlannerRunDocument, PlannerRunSpec, PlannerRuntimeSpec,
+    ResolvedAssetBinding, SharedMemoryPolicySpec, SpecDocument, TuneBoundsSpec, TuneControllerKind,
+    TuneControllerSpec, TuneDocument, TuneParameterRangeSpec, TuneSpec, ValidatedPlannerRunSpec,
+    ValidatedTuneSpec, VmActionFilterSpec, VmEnvironmentSpec, VmRewardPolicySpec,
+    VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec, WarmStartExactJhControllerSpec,
+    WarmStartExactJhTuneControllerSpec, load_spec_document,
 };
 
 use crate::api::{

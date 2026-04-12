@@ -20,6 +20,10 @@ use crate::aixi::model::ZpaqPredictor;
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor};
 use crate::aixi::model::{Predictor, RateBackendBitPredictor};
 use crate::api::{RateBackend, validate_rate_backend};
+use crate::spec::{
+    BuiltinEnvironmentSpec, ControllerSpec, EnvironmentSpec, McAixiControllerSpec,
+    PlannerInterfaceSpec, PlannerRunSpec, PlannerRuntimeSpec,
+};
 use crate::validate_zpaq_rate_method;
 #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
 use std::path::PathBuf;
@@ -83,6 +87,124 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    fn canonical_predictor_backend(&self) -> Result<RateBackend, String> {
+        if let Some(rate_backend) = &self.rate_backend {
+            return Ok(rate_backend.clone());
+        }
+
+        match self.algorithm.as_str() {
+            "ctw" | "fac-ctw" => Ok(RateBackend::FacCtw {
+                base_depth: self.ct_depth,
+                num_percept_bits: (self.observation_bits * self.observation_stream_len.max(1))
+                    + self.reward_bits,
+                encoding_bits: 1,
+            }),
+            "ac-ctw" | "ctw-context-tree" => Ok(RateBackend::Ctw {
+                depth: self.ct_depth,
+            }),
+            "rosa" => Ok(RateBackend::RosaPlus),
+            #[cfg(feature = "backend-rwkv")]
+            "rwkv" => {
+                if let Some(method) = self
+                    .rwkv_method
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Ok(RateBackend::Rwkv7Method {
+                        method: method.to_string(),
+                    })
+                } else {
+                    let path = self.rwkv_model_path.as_ref().ok_or_else(|| {
+                        "algorithm=rwkv requires rwkv_model_path or rwkv_method when no rate_backend override is configured"
+                            .to_string()
+                    })?;
+                    let method = crate::rwkvzip::canonical_method_string(
+                        &crate::rwkvzip::MethodSpec::File {
+                            path: PathBuf::from(path),
+                            policy: None,
+                        },
+                    )
+                    .map_err(|err| format!("Invalid RWKV model path for AIXI: {err}"))?;
+                    Ok(RateBackend::Rwkv7Method { method })
+                }
+            }
+            #[cfg(not(feature = "backend-rwkv"))]
+            "rwkv" => Err("algorithm=rwkv requires backend-rwkv feature".to_string()),
+            #[cfg(feature = "backend-mamba")]
+            "mamba" => {
+                if let Some(method) = self
+                    .mamba_method
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Ok(RateBackend::MambaMethod {
+                        method: method.to_string(),
+                    })
+                } else {
+                    let path = self.mamba_model_path.as_ref().ok_or_else(|| {
+                        "algorithm=mamba requires mamba_model_path or mamba_method when no rate_backend override is configured"
+                            .to_string()
+                    })?;
+                    let method = crate::mambazip::canonical_method_string(
+                        &crate::mambazip::MethodSpec::File {
+                            path: PathBuf::from(path),
+                            policy: None,
+                        },
+                    )
+                    .map_err(|err| format!("Invalid Mamba model path for AIXI: {err}"))?;
+                    Ok(RateBackend::MambaMethod { method })
+                }
+            }
+            #[cfg(not(feature = "backend-mamba"))]
+            "mamba" => Err("algorithm=mamba requires backend-mamba feature".to_string()),
+            "zpaq" => Ok(RateBackend::Zpaq {
+                method: self.zpaq_method.clone().unwrap_or_else(|| "1".to_string()),
+            }),
+            other => Err(format!("Unknown algorithm: {other}")),
+        }
+    }
+
+    fn canonical_planner_run_spec(&self) -> Result<PlannerRunSpec, String> {
+        let predictor = self.canonical_predictor_backend()?;
+        Ok(PlannerRunSpec {
+            assets: Vec::new(),
+            environment: EnvironmentSpec::Builtin {
+                builtin: BuiltinEnvironmentSpec::CoinFlip,
+            },
+            interface: PlannerInterfaceSpec {
+                observation_bits: self.observation_bits,
+                observation_stream_len: self.observation_stream_len.max(1),
+                observation_key_mode: self.observation_key_mode,
+                reward_bits: self.reward_bits,
+                agent_actions: self.agent_actions,
+                min_reward: self.min_reward,
+                max_reward: self.max_reward,
+                reward_offset: self.reward_offset,
+            },
+            controller: ControllerSpec::McAixi(McAixiControllerSpec {
+                predictor,
+                predictor_max_order: self.rate_backend_max_order,
+                agent_horizon: self.agent_horizon,
+                num_simulations: self.num_simulations,
+                exploration_exploitation_ratio: self.exploration_exploitation_ratio,
+                discount_gamma: self.discount_gamma,
+            }),
+            runtime: PlannerRuntimeSpec {
+                random_seed: self.random_seed,
+                learn_cycles: None,
+                eval_cycles: None,
+                terminate_lifetime: 1,
+                log_every: 1,
+                perf: false,
+                vm_perf_only: false,
+                explore_epsilon: 0.0,
+                explore_gamma: 1.0,
+            },
+        })
+    }
+
     /// Validate configuration constraints for MC-AIXI.
     pub fn validate(&self) -> Result<(), String> {
         if self.agent_actions == 0 {
@@ -194,6 +316,9 @@ impl AgentConfig {
             other => return Err(format!("Unknown algorithm: {other}")),
         }
 
+        self.canonical_planner_run_spec()?
+            .validate()
+            .map_err(|err| err.to_string())?;
         Ok(())
     }
 }

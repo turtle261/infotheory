@@ -1,8 +1,24 @@
+#[cfg(any(
+    feature = "backend-ctw",
+    feature = "backend-mixture",
+    feature = "backend-zpaq",
+    feature = "backend-calibrated",
+    feature = "backend-rwkv",
+    feature = "backend-mamba"
+))]
 use infotheory::api::{
     CompressionBackend, GenerationConfig, InfotheoryCtx, NcdVariant, RateBackend,
     RateBackendSession, try_compress_bytes_backend, try_decompress_bytes_backend,
 };
 
+#[cfg(any(
+    feature = "backend-ctw",
+    feature = "backend-mixture",
+    feature = "backend-zpaq",
+    feature = "backend-calibrated",
+    feature = "backend-rwkv",
+    feature = "backend-mamba"
+))]
 fn assert_close(label: &str, left: f64, right: f64) {
     let diff = (left - right).abs();
     assert!(
@@ -11,6 +27,14 @@ fn assert_close(label: &str, left: f64, right: f64) {
     );
 }
 
+#[cfg(any(
+    feature = "backend-ctw",
+    feature = "backend-mixture",
+    feature = "backend-zpaq",
+    feature = "backend-calibrated",
+    feature = "backend-rwkv",
+    feature = "backend-mamba"
+))]
 fn assert_ctx_parity(
     rate_backend: RateBackend,
     compression_backend: CompressionBackend,
