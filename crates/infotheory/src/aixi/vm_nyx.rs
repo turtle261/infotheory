@@ -26,8 +26,11 @@ use crate::api::{
     CompiledRateBackend, RateBackend, marginal_entropy_bytes, try_cross_entropy_rate_backend,
     try_entropy_rate_backend,
 };
+#[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{ContextTree, FacContextTree};
+#[cfg(feature = "backend-rosa")]
 use crate::backends::rosaplus::RosaPlus;
+#[cfg(feature = "backend-zpaq")]
 use crate::backends::zpaq_rate::ZpaqRateModel;
 #[cfg(feature = "backend-rwkv")]
 use crate::coders::softmax_pdf_inplace;
@@ -525,6 +528,12 @@ pub struct NyxVmConfig {
     pub crash_log: Option<String>,
 }
 
+fn default_vm_stats_backend() -> RateBackend {
+    // Keep the VM default explicit so `vm` can be combined with a narrow
+    // backend slice instead of inheriting the crate-wide implicit default.
+    RateBackend::Ctw { depth: 20 }
+}
+
 impl Default for NyxVmConfig {
     fn default() -> Self {
         Self {
@@ -548,8 +557,7 @@ impl Default for NyxVmConfig {
             action_source: NyxActionSource::Literal(vec![]),
             action_filter: None,
             protocol: NyxProtocolConfig::default(),
-            stats_backend: RateBackend::try_default()
-                .expect("vm feature enables at least one default rate backend"),
+            stats_backend: default_vm_stats_backend(),
             trace: None,
             debug_mode: false,
             crash_log: None,
@@ -641,13 +649,11 @@ impl From<ExitReason> for NyxExitKind {
 
 /// Predictive model for trace-based reward computation.
 enum TraceModel {
-    Rosa {
-        model: RosaPlus,
-        max_order: i64,
-    },
-    Ctw {
-        tree: ContextTree,
-    },
+    #[cfg(feature = "backend-rosa")]
+    Rosa { model: RosaPlus, max_order: i64 },
+    #[cfg(feature = "backend-ctw")]
+    Ctw { tree: ContextTree },
+    #[cfg(feature = "backend-ctw")]
     FacCtw {
         tree: FacContextTree,
         bits_per_symbol: usize,
@@ -657,13 +663,13 @@ enum TraceModel {
         compressor: MambaCompressor,
         primed: bool,
     },
+    #[cfg(feature = "backend-rwkv")]
     Rwkv7 {
         compressor: Compressor,
         primed: bool,
     },
-    Zpaq {
-        model: ZpaqRateModel,
-    },
+    #[cfg(feature = "backend-zpaq")]
+    Zpaq { model: ZpaqRateModel },
     Mixture {
         backend: CompiledRateBackend,
         model: crate::mixture::RateBackendPredictor,
@@ -681,7 +687,11 @@ impl TraceModel {
     }
 
     fn new(backend: &CompiledRateBackend, max_order: i64) -> Self {
+        #[cfg(not(feature = "backend-rosa"))]
+        let _ = max_order;
+
         match crate::runtime::rate_backend_trace_model_strategy(backend) {
+            #[cfg(feature = "backend-rosa")]
             crate::runtime::TraceModelStrategy::Rosa => {
                 let mut model = RosaPlus::new(max_order, false, 0, 42);
                 model.build_lm_full_bytes_no_finalize_endpos();
@@ -690,6 +700,7 @@ impl TraceModel {
             crate::runtime::TraceModelStrategy::PredictorBacked => {
                 TraceModel::predictor_backed(backend.clone())
             }
+            #[cfg(feature = "backend-ctw")]
             crate::runtime::TraceModelStrategy::Ctw => {
                 let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
                     unreachable!("trace-model strategy mismatch for ctw");
@@ -698,6 +709,7 @@ impl TraceModel {
                     tree: ContextTree::new(*depth),
                 }
             }
+            #[cfg(feature = "backend-ctw")]
             crate::runtime::TraceModelStrategy::FacCtw => {
                 let crate::spec::core::RateBackendPlan::FacCtw {
                     base_depth,
@@ -713,6 +725,7 @@ impl TraceModel {
                     bits_per_symbol,
                 }
             }
+            #[cfg(feature = "backend-zpaq")]
             crate::runtime::TraceModelStrategy::Zpaq => {
                 let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
                     unreachable!("trace-model strategy mismatch for zpaq");
@@ -721,6 +734,7 @@ impl TraceModel {
                     model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
                 }
             }
+            #[cfg(feature = "backend-mamba")]
             crate::runtime::TraceModelStrategy::Mamba => {
                 let crate::spec::core::RateBackendPlan::Mamba { parsed_method, .. } =
                     backend.plan()
@@ -734,6 +748,7 @@ impl TraceModel {
                     primed: false,
                 }
             }
+            #[cfg(feature = "backend-rwkv")]
             crate::runtime::TraceModelStrategy::Rwkv7 => {
                 let crate::spec::core::RateBackendPlan::Rwkv7 { parsed_method, .. } =
                     backend.plan()
@@ -747,27 +762,33 @@ impl TraceModel {
                     primed: false,
                 }
             }
+            _ => unreachable!("trace-model strategy requires an unavailable backend feature"),
         }
     }
 
     fn reset(&mut self) {
         match self {
+            #[cfg(feature = "backend-rosa")]
             TraceModel::Rosa { model, max_order } => {
                 let mut fresh = RosaPlus::new(*max_order, false, 0, 42);
                 fresh.build_lm_full_bytes_no_finalize_endpos();
                 *model = fresh;
             }
+            #[cfg(feature = "backend-ctw")]
             TraceModel::Ctw { tree } => tree.clear(),
+            #[cfg(feature = "backend-ctw")]
             TraceModel::FacCtw { tree, .. } => tree.clear(),
             #[cfg(feature = "backend-mamba")]
             TraceModel::Mamba { compressor, primed } => {
                 compressor.state.reset();
                 *primed = false;
             }
+            #[cfg(feature = "backend-rwkv")]
             TraceModel::Rwkv7 { compressor, primed } => {
                 compressor.state.reset();
                 *primed = false;
             }
+            #[cfg(feature = "backend-zpaq")]
             TraceModel::Zpaq { model } => {
                 model.reset();
             }
@@ -787,6 +808,7 @@ impl TraceModel {
             return 0.0;
         }
         match self {
+            #[cfg(feature = "backend-rosa")]
             TraceModel::Rosa { model, .. } => {
                 let mut bits = 0.0;
                 for &b in data {
@@ -796,6 +818,7 @@ impl TraceModel {
                 }
                 bits
             }
+            #[cfg(feature = "backend-ctw")]
             TraceModel::Ctw { tree } => {
                 let log_before = tree.get_log_block_probability();
                 for &b in data {
@@ -807,6 +830,7 @@ impl TraceModel {
                 let log_delta = log_after - log_before;
                 -log_delta / std::f64::consts::LN_2
             }
+            #[cfg(feature = "backend-ctw")]
             TraceModel::FacCtw {
                 tree,
                 bits_per_symbol,
@@ -854,6 +878,7 @@ impl TraceModel {
                 }
                 bits
             }
+            #[cfg(feature = "backend-rwkv")]
             TraceModel::Rwkv7 { compressor, primed } => {
                 if !*primed {
                     let vocab_size = compressor.vocab_size();
@@ -878,6 +903,7 @@ impl TraceModel {
                 }
                 bits
             }
+            #[cfg(feature = "backend-zpaq")]
             TraceModel::Zpaq { model } => model.update_and_score(data),
             TraceModel::Mixture { model, .. } => {
                 let mut bits = 0.0;
@@ -2064,8 +2090,14 @@ mod tests {
         assert_eq!(hex.decode("74657374").unwrap(), data);
     }
 
+    #[cfg(feature = "all-backends")]
     #[test]
     fn trace_model_supports_predictor_backed_backends() {
+        use crate::api::{
+            CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureSpec,
+            ParticleSpec,
+        };
+
         let backends = vec![
             RateBackend::Match {
                 hash_bits: 20,
@@ -2088,26 +2120,26 @@ mod tests {
                 memory_mb: 8,
             },
             RateBackend::Calibrated {
-                spec: Arc::new(crate::CalibratedSpec {
+                spec: Arc::new(CalibratedSpec {
                     base: RateBackend::Ctw { depth: 8 },
-                    context: crate::CalibrationContextKind::Text,
+                    context: CalibrationContextKind::Text,
                     bins: 33,
                     learning_rate: 0.02,
                     bias_clip: 4.0,
                 }),
             },
             RateBackend::Particle {
-                spec: Arc::new(crate::ParticleSpec {
+                spec: Arc::new(ParticleSpec {
                     num_particles: 4,
                     num_cells: 4,
                     cell_dim: 8,
-                    ..crate::ParticleSpec::default()
+                    ..ParticleSpec::default()
                 }),
             },
             RateBackend::Mixture {
-                spec: Arc::new(crate::MixtureSpec::new(
-                    crate::MixtureKind::Bayes,
-                    vec![crate::MixtureExpertSpec {
+                spec: Arc::new(MixtureSpec::new(
+                    MixtureKind::Bayes,
+                    vec![MixtureExpertSpec {
                         name: Some("ctw".to_string()),
                         log_prior: 0.0,
                         max_order: -1,

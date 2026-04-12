@@ -47,7 +47,7 @@ backend-mamba = []
 backend-rwkv = []
 backend-zpaq = ["dep:zpaq_rs"]
 cli = []
-vm = ["dep:nyx-lite", "all-backends"]
+vm = ["dep:nyx-lite"]
 
 [[bin]]
 name = "infotheory"

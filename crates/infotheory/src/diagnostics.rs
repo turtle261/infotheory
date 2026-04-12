@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 
 use crate::api::{CompiledRateBackend, MixtureSpec, RateBackend};
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-mixture"))]
 use crate::api::{MixtureExpertSpec, MixtureKind};
 use crate::compression::{AcLogLossNodeValue, DiagnosticRatePredictor};
 use crate::spec::core::{RateBackendPlan, RateBackendPlanExpert, compiled_rate_backend_from_plan};
@@ -163,7 +163,7 @@ fn flatten_compiled_mixture(backend: &CompiledRateBackend) -> FlatSchema {
     schema
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-mixture"))]
 fn flatten_mixture_spec(spec: &MixtureSpec) -> FlatSchema {
     let backend = RateBackend::Mixture {
         spec: Arc::new(spec.clone()),
@@ -534,10 +534,11 @@ pub fn run_ac_log_loss_mixture_bytes(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-mixture"))]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "backend-mixture")]
     fn test_nested_spec(base: RateBackend) -> MixtureSpec {
         MixtureSpec::new(
             MixtureKind::Switching,
@@ -577,6 +578,7 @@ mod tests {
         .with_alpha(0.2)
     }
 
+    #[cfg(feature = "backend-mixture")]
     #[test]
     fn flatten_schema_includes_submixtures_and_descendants_in_preorder() {
         let Some(base) = crate::runtime::first_enabled_default_rate_backend_spec() else {

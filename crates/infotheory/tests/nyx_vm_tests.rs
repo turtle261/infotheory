@@ -18,6 +18,10 @@ use infotheory::api::RateBackend;
 use std::sync::Arc;
 use std::time::Duration;
 
+fn vm_test_stats_backend() -> RateBackend {
+    RateBackend::Ctw { depth: 20 }
+}
+
 // ============================================================================
 // Configuration Tests
 // ============================================================================
@@ -31,6 +35,10 @@ fn test_default_config() {
     assert_eq!(config.episode_steps, 100);
     assert_eq!(config.observation_stream_len, 64);
     assert!(config.firecracker_config.is_empty());
+    assert!(matches!(
+        config.stats_backend,
+        RateBackend::Ctw { depth: 20 }
+    ));
 }
 
 #[test]
@@ -384,7 +392,9 @@ fn test_fuzz_mutator_variants() {
 mod info_theory_properties {
     #[allow(unused_imports)]
     use super::*;
-    use infotheory::api::{marginal_entropy_bytes, try_entropy_rate_bytes};
+    use infotheory::api::marginal_entropy_bytes;
+    #[cfg(feature = "backend-rosa")]
+    use infotheory::api::try_entropy_rate_bytes;
 
     #[test]
     fn test_entropy_bounds() {
@@ -405,6 +415,7 @@ mod info_theory_properties {
         );
     }
 
+    #[cfg(feature = "backend-rosa")]
     #[test]
     fn test_rate_entropy_less_than_marginal() {
         // For structured data, H_rate <= H_marginal
@@ -426,7 +437,7 @@ mod info_theory_properties {
 /// These tests require a running Firecracker VM with proper setup.
 /// They are marked with #[ignore] and can be run with:
 /// cargo test -- --ignored
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-ctw"))]
 mod vm_integration_tests {
     #[allow(unused_imports)]
     use super::*;
@@ -479,6 +490,7 @@ mod vm_integration_tests {
         config_path
     }
 
+    #[cfg(feature = "backend-ctw")]
     fn get_test_vm_config(test_name: &str) -> Option<NyxVmConfig> {
         let root = get_project_root();
         let kernel_path = root.join("vmlinux-6.1.58");
@@ -526,13 +538,14 @@ mod vm_integration_tests {
             ]),
             action_filter: None,
             protocol: NyxProtocolConfig::default(),
-            stats_backend: RateBackend::try_default().expect("vm default stats backend"),
+            stats_backend: vm_test_stats_backend(),
             trace: None,
             debug_mode: true,
             crash_log: None,
         })
     }
 
+    #[cfg(feature = "backend-ctw")]
     #[test]
     fn test_vm_boot_and_snapshot() {
         if !check_kvm_available() {
@@ -563,6 +576,7 @@ mod vm_integration_tests {
         }
     }
 
+    #[cfg(feature = "backend-ctw")]
     #[test]
     fn test_vm_action_execution() {
         if !check_kvm_available() {
@@ -650,7 +664,7 @@ fn test_complete_experiment_config() {
             reject_reward: Some(-1),
         }),
         protocol: NyxProtocolConfig::default(),
-        stats_backend: RateBackend::try_default().expect("vm default stats backend"),
+        stats_backend: vm_test_stats_backend(),
         trace: Some(NyxTraceConfig {
             shared_region_name: Some("trace".to_string()),
             max_bytes: 1024,

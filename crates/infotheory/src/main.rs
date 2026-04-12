@@ -1732,11 +1732,7 @@ mod tests {
         }"#;
         let out = process_json_line(line);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("output should be json");
-        if cfg!(any(
-            feature = "backend-rosa",
-            feature = "backend-zpaq",
-            feature = "backend-ctw"
-        )) {
+        if infotheory::api::RateBackend::try_default().is_ok() {
             assert!(parsed.get("h0").and_then(|v| v.as_f64()).unwrap_or(-1.0) >= 0.0);
             assert_eq!(parsed.get("len").and_then(|v| v.as_u64()), Some(12));
         } else {
@@ -1745,7 +1741,8 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .expect("backend-free build should return structured batch error");
             assert!(
-                err.contains("metrics failed") && err.contains("requires infotheory feature"),
+                err.contains("metrics failed")
+                    && err.contains("no default rate backend is available in this build"),
                 "unexpected error: {err}"
             );
         }
@@ -2109,7 +2106,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "vm")]
+    #[cfg(all(feature = "vm", feature = "all-backends"))]
     #[test]
     fn parse_vm_stats_backend_supports_new_backends_and_rejects_unknowns() {
         let root = json!({
@@ -2202,7 +2199,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "vm")]
+    #[cfg(all(feature = "vm", feature = "backend-ctw"))]
     #[test]
     fn parse_vm_stats_backend_preserves_fac_ctw_vm_defaults() {
         let root = json!({

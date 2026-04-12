@@ -221,9 +221,11 @@ jobs:
           cargo test -p infotheory --features cli --no-run --locked
           cargo test -p infotheory --no-default-features --features "cli all-backends" --no-run --locked
 
-      - name: VM feature check
+      - name: VM feature slices
         if: ${{ matrix.run_vm }}
-        run: cargo test -p infotheory --features vm --no-run --locked
+        run: |
+          cargo test -p infotheory --no-default-features --features vm --no-run --locked
+          cargo test -p infotheory --no-default-features --features "vm backend-ctw" --no-run --locked
 
       - name: Test matrix
         env:
@@ -242,6 +244,7 @@ jobs:
           cargo test -p infotheory --release --no-default-features --features backend-rwkv parse_compression_backend_json_wraps_rwkv_cfg_methods_as_rate_backend --locked
           cargo test -p infotheory --release --no-default-features --features backend-mamba parse_compression_backend_json_wraps_mamba_cfg_rate_backend --locked
           cargo test -p infotheory --release --features cli --locked
+          cargo test -p infotheory --release --no-default-features --features cli --bin infotheory --locked
           cargo test -p infotheory --release --no-default-features --features "cli all-backends" --locked
           cargo test -p zpaq_rs --release --locked
           cargo test -p benchman --release --locked
@@ -250,7 +253,7 @@ jobs:
         if: ${{ matrix.run_vm }}
         env:
           RUSTDOCFLAGS: ${{ matrix.rustdocflags }}
-        run: cargo test -p infotheory --release --features vm --locked
+        run: cargo test -p infotheory --release --no-default-features --features "vm backend-ctw" --locked
 
       - name: Build release CLI binary
         run: |
