@@ -150,6 +150,9 @@ pub fn resolve_spec_path(base_dir: &Path, path: &str) -> PathBuf {
     resolve_spec_path_buf(base_dir, Path::new(path))
 }
 
+/// Resolve a spec path against a base directory when the path is already parsed.
+///
+/// Absolute paths are returned unchanged; relative paths are joined to `base_dir`.
 pub fn resolve_spec_path_buf(base_dir: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
