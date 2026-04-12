@@ -12,6 +12,8 @@ use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::model::{CtwPredictor, FacCtwPredictor};
 use crate::aixi::model::{Predictor, RateBackendBitPredictor};
 use crate::api::{RateBackend, validate_rate_backend};
+#[cfg(feature = "backend-rwkv")]
+use std::path::PathBuf;
 
 /// Configuration parameters for an AIQI agent.
 #[derive(Clone)]
@@ -893,8 +895,13 @@ fn build_predictor(
                 "algorithm=rwkv requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
                     .to_string()
             })?;
+            let method = crate::rwkvzip::canonical_method_string(&crate::rwkvzip::MethodSpec::File {
+                path: PathBuf::from(path),
+                policy: None,
+            })
+            .map_err(|err| format!("Invalid RWKV model path for AIQI: {err}"))?;
             let bit_backend = RateBackend::Rwkv7Method {
-                method: format!("file:{path}"),
+                method,
             }
             .compile()
             .map_err(|err| err.to_string())?

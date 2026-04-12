@@ -32,8 +32,13 @@ impl GenerationRng {
     }
 
     fn next_f64(&mut self) -> f64 {
-        (self.next_u64() as f64) / (u64::MAX as f64)
+        unit_interval_from_u64(self.next_u64())
     }
+}
+
+#[inline(always)]
+fn unit_interval_from_u64(bits: u64) -> f64 {
+    ((bits >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
 }
 
 #[inline(always)]
@@ -299,5 +304,11 @@ mod tests {
         let mut rng = GenerationRng::new(17);
         let picked = pick_generated_byte(&logps, GenerationConfig::sampled_frozen(17), &mut rng);
         assert_eq!(picked, 0);
+    }
+
+    #[test]
+    fn unit_interval_mapping_excludes_one() {
+        assert_eq!(unit_interval_from_u64(0), 0.0);
+        assert!(unit_interval_from_u64(u64::MAX) < 1.0);
     }
 }

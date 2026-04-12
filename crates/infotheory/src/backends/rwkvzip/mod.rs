@@ -663,13 +663,13 @@ fn parse_cfg_positional(csv: &str) -> Result<OnlineConfig> {
 ///
 /// Supported formats:
 /// - `file:/path/to/model.safetensors`
+/// - `file:/path/to/model%3Bv1.safetensors`
 /// - `file:/path/to/model.safetensors;policy:...`
 /// - `cfg:key=value,...[;policy:...]`
 /// - positional `cfg` CSV
 /// - existing model path
 ///
-/// `file:` method paths may not contain `;` because method strings reserve
-/// `;policy:` as the only delimiter after the path segment.
+/// `file:` methods percent-encode reserved delimiters inside the path segment.
 pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
     let (base, policy_segment) = split_method_policy_segments(method)?;
     let parse_policy = |s: &str| llm_policy::parse_policy_segment(s, RWKV_TRAIN_SCOPES);
@@ -680,11 +680,11 @@ pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
         .context("failed to parse rwkv policy segment")?;
 
     if let Some(path) = base.strip_prefix("file:") {
-        let p = PathBuf::from(path.trim());
+        let p = llm_policy::parse_method_file_path(path.trim());
         if p.as_os_str().is_empty() {
             bail!("empty file path in rwkv method");
         }
-        llm_policy::canonical_file_method_string("rwkv", &p, policy.as_ref())?;
+        llm_policy::canonical_file_method_string(&p, policy.as_ref())?;
         if policy.as_ref().and_then(|p| p.load_from.as_ref()).is_some() {
             bail!("rwkv method cannot use policy load_from together with file:<path>");
         }
@@ -754,7 +754,7 @@ pub fn parse_method_spec(method: &str) -> Result<MethodSpec> {
 pub fn canonical_method_string(spec: &MethodSpec) -> Result<String> {
     match spec {
         MethodSpec::File { path, policy } => {
-            llm_policy::canonical_file_method_string("rwkv", path, policy.as_ref())
+            llm_policy::canonical_file_method_string(path, policy.as_ref())
         }
         MethodSpec::Online { cfg, policy } => {
             let mut method = cfg_to_method_string(cfg);
@@ -2342,13 +2342,32 @@ mod tests {
     }
 
     #[test]
-    fn canonical_method_string_rejects_delimiter_bearing_file_paths() {
-        let err = canonical_method_string(&MethodSpec::File {
-            path: PathBuf::from("/tmp/rwkv;policy:model.safetensors"),
+    fn parse_method_spec_accepts_raw_semicolons_in_file_paths() {
+        match parse_method_spec("file:/tmp/rwkv;v1.safetensors").expect("file path parse") {
+            MethodSpec::File { path, policy } => {
+                assert_eq!(path, PathBuf::from("/tmp/rwkv;v1.safetensors"));
+                assert!(policy.is_none());
+            }
+            _ => panic!("expected file method"),
+        }
+    }
+
+    #[test]
+    fn canonical_method_string_escapes_delimiter_bearing_file_paths() {
+        let method = canonical_method_string(&MethodSpec::File {
+            path: PathBuf::from("/tmp/rwkv;policy:model%v1.safetensors"),
             policy: None,
         })
-        .expect_err("delimiter-bearing file path should be rejected");
-        assert!(err.to_string().contains("may not contain ';'"));
+        .expect("delimiter-bearing file path should canonicalize");
+        assert_eq!(method, "file:/tmp/rwkv%3Bpolicy:model%25v1.safetensors");
+
+        match parse_method_spec(&method).expect("canonical method should parse") {
+            MethodSpec::File { path, policy } => {
+                assert_eq!(path, PathBuf::from("/tmp/rwkv;policy:model%v1.safetensors"));
+                assert!(policy.is_none());
+            }
+            _ => panic!("expected file method"),
+        }
     }
 
     #[test]

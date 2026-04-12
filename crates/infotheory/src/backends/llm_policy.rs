@@ -344,6 +344,23 @@ pub fn split_method_policy_segments(method: &str) -> Result<(String, Option<Stri
     if trimmed.is_empty() {
         bail!("empty method string");
     }
+    if let Some((base, policy)) = trimmed.split_once(";policy:")
+        && base.trim_start().starts_with("file:")
+    {
+        let base = base.trim().to_string();
+        if base.is_empty() {
+            bail!("method is missing cfg/file segment");
+        }
+        return Ok((base, Some(policy.trim().to_string())));
+    }
+    if trimmed.starts_with("file:") {
+        if let Some(token) = ambiguous_file_segment_token(trimmed) {
+            bail!(
+                "ambiguous file method segment ';{token}:'; use ';policy:' for policy or encode literal ';' in file paths as '%3B'"
+            );
+        }
+        return Ok((trimmed.to_string(), None));
+    }
     let mut iter = trimmed.split(';');
     let base = iter.next().unwrap_or_default().trim().to_string();
     if base.is_empty() {
@@ -369,21 +386,83 @@ pub fn split_method_policy_segments(method: &str) -> Result<(String, Option<Stri
     Ok((base, policy))
 }
 
-/// Render a `file:<path>[;policy:...]` method string after validating that the
-/// path is representable in the delimiter-based wire syntax.
-pub fn canonical_file_method_string(
-    family: &str,
-    path: &Path,
-    policy: Option<&LlmPolicy>,
-) -> Result<String> {
-    let rendered = path.to_string_lossy();
-    if rendered.contains(';') {
-        bail!(
-            "{family} file paths may not contain ';' because method strings reserve ';policy:' as a delimiter"
-        );
+fn ambiguous_file_segment_token(method: &str) -> Option<&str> {
+    let path = method.strip_prefix("file:")?;
+    let bytes = path.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b';' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        match bytes.get(j) {
+            Some(b'a'..=b'z' | b'A'..=b'Z' | b'_') => {}
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        j += 1;
+        while matches!(
+            bytes.get(j),
+            Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')
+        ) {
+            j += 1;
+        }
+        if matches!(bytes.get(j), Some(b':')) {
+            return std::str::from_utf8(&bytes[start..j]).ok();
+        }
+        i += 1;
     }
+    None
+}
 
-    let mut method = format!("file:{rendered}");
+/// Percent-encode reserved delimiter characters inside a method `file:` path.
+pub(crate) fn render_method_file_path(path: &Path) -> String {
+    let rendered = path.to_string_lossy();
+    let mut out = String::with_capacity(rendered.len());
+    for ch in rendered.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            ';' => out.push_str("%3B"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Decode percent-encoded delimiter characters inside a method `file:` path.
+pub(crate) fn parse_method_file_path(path: &str) -> PathBuf {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            match (bytes[i + 1], bytes[i + 2]) {
+                (b'2', b'5') => {
+                    out.push(b'%');
+                    i += 3;
+                    continue;
+                }
+                (b'3', b'B' | b'b') => {
+                    out.push(b';');
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    PathBuf::from(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Render a `file:<path>[;policy:...]` method string using the shared delimiter-safe encoding.
+pub fn canonical_file_method_string(path: &Path, policy: Option<&LlmPolicy>) -> Result<String> {
+    let mut method = format!("file:{}", render_method_file_path(path));
     if let Some(policy) = policy {
         method.push_str(";policy:");
         method.push_str(&policy.canonical());
@@ -901,5 +980,36 @@ mod tests {
                 .expect("split");
         assert_eq!(base, "cfg:hidden=64");
         assert_eq!(pol.as_deref(), Some("schedule=0..100:infer"));
+    }
+
+    #[test]
+    fn split_method_policy_preserves_file_path_semicolons() {
+        let (base, pol) =
+            split_method_policy_segments("file:/tmp/model;v1.safetensors").expect("split");
+        assert_eq!(base, "file:/tmp/model;v1.safetensors");
+        assert_eq!(pol, None);
+    }
+
+    #[test]
+    fn method_file_path_roundtrips_reserved_delimiters() {
+        let path = Path::new("/tmp/model;policy:v1%done.safetensors");
+        let rendered = render_method_file_path(path);
+        assert_eq!(rendered, "/tmp/model%3Bpolicy:v1%25done.safetensors");
+        assert_eq!(parse_method_file_path(&rendered), path);
+    }
+
+    #[test]
+    fn method_file_path_preserves_unowned_percent_sequences() {
+        let path = "/tmp/model%2Fv1.safetensors";
+        assert_eq!(parse_method_file_path(path), Path::new(path));
+    }
+
+    #[test]
+    fn split_method_policy_rejects_ambiguous_file_suffixes() {
+        let err = split_method_policy_segments("file:/tmp/model;polciy:train").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ambiguous file method segment ';polciy:'")
+        );
     }
 }

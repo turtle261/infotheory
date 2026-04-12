@@ -1,9 +1,5 @@
-use crate::api::{
-    CompressionBackend, InfotheoryCtx, RateBackend, marginal_entropy_bytes, try_cross_entropy_bytes,
-};
+use crate::api::{InfotheoryCtx, marginal_entropy_bytes, try_cross_entropy_bytes};
 use crate::backends::rosaplus::RosaPlus;
-use crate::coders::CoderType;
-use crate::compression::FramingMode;
 use crate::error::{InfotheoryError, InfotheoryResult};
 #[cfg(feature = "backend-rwkv")]
 use crate::spec::MethodBackendFamily;
@@ -122,31 +118,58 @@ pub struct SearchOptions {
     pub ctx: InfotheoryCtx,
 }
 
-impl Default for SearchOptions {
-    fn default() -> Self {
-        Self {
+/// Default rate backend name used by CLI search when no backend flags are supplied.
+pub const DEFAULT_SEARCH_RATE_BACKEND_NAME: &str = "rosaplus";
+/// Default compression backend name used by CLI search when no backend flags are supplied.
+#[cfg(feature = "backend-zpaq")]
+pub const DEFAULT_SEARCH_COMPRESSION_BACKEND_NAME: &str = "zpaq";
+/// Default compression backend name used by CLI search when no backend flags are supplied.
+#[cfg(not(feature = "backend-zpaq"))]
+pub const DEFAULT_SEARCH_COMPRESSION_BACKEND_NAME: &str = "rate-ac";
+
+fn default_search_ctx() -> InfotheoryResult<InfotheoryCtx> {
+    #[cfg(feature = "backend-zpaq")]
+    {
+        return InfotheoryCtx::try_with_zpaq("5");
+    }
+    #[cfg(not(feature = "backend-zpaq"))]
+    {
+        InfotheoryCtx::from_specs(
+            crate::api::RateBackend::RosaPlus,
+            crate::api::CompressionBackend::Rate {
+                rate_backend: crate::api::RateBackend::RosaPlus,
+                coder: crate::coders::CoderType::AC,
+                framing: crate::compression::FramingMode::Raw,
+            },
+        )
+    }
+}
+
+impl SearchOptions {
+    /// Build the default search configuration for the current feature slice.
+    pub fn try_default() -> InfotheoryResult<Self> {
+        Ok(Self {
             granularity: SearchGranularity::Snippet,
             universal_prior: None,
             stage2_prior_mode: Stage2PriorMode::Use,
             max_order: 8,
             top_k: 50,
             stage0_keep_frac: 0.2,
-            ctx: InfotheoryCtx::from_specs(
-                RateBackend::RosaPlus,
-                CompressionBackend::Rate {
-                    rate_backend: RateBackend::RosaPlus,
-                    coder: CoderType::AC,
-                    framing: FramingMode::Raw,
-                },
-            )
-            .expect("search defaults should compile in backend-rosa builds"),
-        }
+            ctx: default_search_ctx()?,
+        })
+    }
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self::try_default().expect("search defaults should compile in backend-rosa builds")
     }
 }
 
 /// Run search with default options and print top shell extraction commands.
 pub fn run_search(query: &str, target_path: &str) -> InfotheoryResult<()> {
-    run_search_with_options(query, target_path, &SearchOptions::default())
+    let opts = SearchOptions::try_default()?;
+    run_search_with_options(query, target_path, &opts)
 }
 
 /// Run search with explicit options and print top shell extraction commands.
@@ -965,5 +988,28 @@ mod tests {
         ));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_defaults_match_feature_slice_defaults() {
+        let opts = SearchOptions::try_default().expect("search defaults");
+        match opts.ctx.compression_backend.canonical_spec() {
+            #[cfg(feature = "backend-zpaq")]
+            crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
+            crate::api::CompressionBackend::Rate {
+                rate_backend,
+                coder,
+                framing,
+            } => {
+                assert!(cfg!(not(feature = "backend-zpaq")));
+                assert!(matches!(rate_backend, &crate::api::RateBackend::RosaPlus));
+                assert_eq!(*coder, crate::coders::CoderType::AC);
+                assert_eq!(*framing, crate::compression::FramingMode::Raw);
+            }
+            other => panic!(
+                "unexpected default search compression backend: {:?}",
+                other.kind()
+            ),
+        }
     }
 }

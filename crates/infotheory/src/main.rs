@@ -841,8 +841,9 @@ fn search_command(args: &[String]) {
     }
 
     let mut opts = search::SearchOptions::default();
-    let mut rate_backend = "rosaplus".to_string();
-    let compression_backend = "zpaq".to_string();
+    let mut rate_backend = infotheory::search::DEFAULT_SEARCH_RATE_BACKEND_NAME.to_string();
+    let compression_backend =
+        infotheory::search::DEFAULT_SEARCH_COMPRESSION_BACKEND_NAME.to_string();
     let mut method: Option<String> = None;
     let mut expert_spec_path: Option<String> = None;
     let mut stage2_prior_mode: Option<search::Stage2PriorMode> = None;
@@ -878,7 +879,9 @@ fn search_command(args: &[String]) {
                 let v = args
                     .get(i)
                     .unwrap_or_exit("Error: --rate-backend requires a value");
-                rate_backend = parse_rate_backend(v).unwrap_or("rosaplus").to_string();
+                rate_backend = parse_rate_backend(v)
+                    .unwrap_or(infotheory::search::DEFAULT_SEARCH_RATE_BACKEND_NAME)
+                    .to_string();
             }
             "--method" => {
                 i += 1;
@@ -1850,7 +1853,7 @@ mod tests {
     fn parse_mixture_expert_resolves_mamba_model_path_relative_to_base_dir() {
         let base_dir = unique_temp_path("infotheory-mamba-relpath", "");
         std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
-        let rel_path = "weights/model.safetensors";
+        let rel_path = "weights/model;v1.safetensors";
         let expected = base_dir.join(rel_path).to_string_lossy().to_string();
         let expert = json!({
             "name": "mamba-relative",
@@ -1874,7 +1877,7 @@ mod tests {
     fn parse_mixture_expert_resolves_rwkv_model_path_relative_to_base_dir() {
         let base_dir = unique_temp_path("infotheory-rwkv-relpath", "");
         std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
-        let rel_path = "weights/model.safetensors";
+        let rel_path = "weights/model;v1.safetensors";
         let expected = base_dir.join(rel_path).to_string_lossy().to_string();
         let expert = json!({
             "name": "rwkv-relative",

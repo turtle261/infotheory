@@ -147,7 +147,10 @@ impl Default for CompressionBackendShorthandOptions {
 
 /// Resolve a relative spec path against a base directory.
 pub fn resolve_spec_path(base_dir: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
+    resolve_spec_path_buf(base_dir, Path::new(path))
+}
+
+pub fn resolve_spec_path_buf(base_dir: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -305,35 +308,30 @@ fn framing_mode_name(mode: crate::compression::FramingMode) -> &'static str {
 }
 
 #[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
-fn split_method_policy_suffix(method: &str) -> (&str, Option<&str>) {
-    if let Some((base, policy)) = method.split_once(";policy:") {
-        (base, Some(policy))
-    } else {
-        (method, None)
-    }
-}
-
-#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
 fn canonicalize_explicit_file_method(
     base_dir: &Path,
     method: &str,
     backend_label: &str,
 ) -> SpecResult<Option<String>> {
-    let (base, policy) = split_method_policy_suffix(method);
+    let (base, policy) = crate::backends::llm_policy::split_method_policy_segments(method)
+        .map_err(|err| SpecError::new(err.to_string()))?;
     let Some(path) = base.strip_prefix("file:") else {
         return Ok(None);
     };
-    let path = path.trim();
-    if path.is_empty() {
+    let path = crate::backends::llm_policy::parse_method_file_path(path.trim());
+    if path.as_os_str().is_empty() {
         return Err(SpecError::new(format!(
             "empty file path in {backend_label} method"
         )));
     }
-    let full = resolve_spec_path(base_dir, path);
-    let mut canonical = format!("file:{}", full.display());
+    let full = resolve_spec_path_buf(base_dir, &path);
+    let mut canonical = format!(
+        "file:{}",
+        crate::backends::llm_policy::render_method_file_path(&full)
+    );
     if let Some(policy) = policy {
         canonical.push_str(";policy:");
-        canonical.push_str(policy);
+        canonical.push_str(policy.trim());
     }
     Ok(Some(canonical))
 }
@@ -1882,6 +1880,34 @@ mod tests {
             }
             _ => panic!("expected rate-coded RWKV backend"),
         }
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn normalize_rwkv_method_for_base_dir_decodes_reserved_file_escapes_once() {
+        let base_dir = Path::new("/tmp/spec-base");
+        let method = "file:weights/model%3Bv1%25done.safetensors";
+        let normalized = canonicalize_explicit_file_method(base_dir, method, "rwkv")
+            .expect("canonicalize rwkv method")
+            .expect("file method");
+        assert_eq!(
+            normalized,
+            "file:/tmp/spec-base/weights/model%3Bv1%25done.safetensors"
+        );
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn normalize_rwkv_method_for_base_dir_rejects_ambiguous_file_suffixes() {
+        let err = normalize_rwkv_method_for_base_dir(
+            Path::new("/tmp/spec-base"),
+            "file:weights/model;polciy:infer",
+        )
+        .unwrap_err();
+        assert!(
+            err.message
+                .contains("ambiguous file method segment ';polciy:'")
+        );
     }
 
     #[cfg(feature = "backend-mamba")]

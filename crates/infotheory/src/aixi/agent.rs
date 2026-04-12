@@ -21,6 +21,8 @@ use crate::aixi::model::{CtwPredictor, FacCtwPredictor};
 use crate::aixi::model::{Predictor, RateBackendBitPredictor};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::validate_zpaq_rate_method;
+#[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
+use std::path::PathBuf;
 
 /// Configuration parameters for an AIXI agent.
 #[derive(Clone)]
@@ -421,7 +423,13 @@ fn build_model(config: &AgentConfig) -> Result<Box<dyn Predictor>, String> {
                 let path = config.rwkv_model_path.as_ref().ok_or_else(|| {
                     "RWKV model path required when rwkv_method is not configured".to_string()
                 })?;
-                let predictor = RwkvPredictor::from_method(&format!("file:{path}"))
+                let method =
+                    crate::rwkvzip::canonical_method_string(&crate::rwkvzip::MethodSpec::File {
+                        path: PathBuf::from(path),
+                        policy: None,
+                    })
+                    .map_err(|err| format!("Invalid RWKV model path for AIXI: {err}"))?;
+                let predictor = RwkvPredictor::from_method(&method)
                     .map_err(|err| format!("Invalid RWKV model path for AIXI: {err}"))?;
                 Ok(Box::new(predictor))
             }
@@ -443,7 +451,13 @@ fn build_model(config: &AgentConfig) -> Result<Box<dyn Predictor>, String> {
                 let path = config.mamba_model_path.as_ref().ok_or_else(|| {
                     "Mamba model path required when mamba_method is not configured".to_string()
                 })?;
-                let predictor = MambaPredictor::from_method(&format!("file:{path}"))
+                let method =
+                    crate::mambazip::canonical_method_string(&crate::mambazip::MethodSpec::File {
+                        path: PathBuf::from(path),
+                        policy: None,
+                    })
+                    .map_err(|err| format!("Invalid Mamba model path for AIXI: {err}"))?;
+                let predictor = MambaPredictor::from_method(&method)
                     .map_err(|err| format!("Invalid Mamba model path for AIXI: {err}"))?;
                 Ok(Box::new(predictor))
             }
