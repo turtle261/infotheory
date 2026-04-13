@@ -778,7 +778,13 @@ fn search_command(args: &[String]) {
         return;
     }
 
-    let mut opts = search::SearchOptions::default();
+    let mut opts = match search::SearchOptions::try_default() {
+        Ok(opts) => opts,
+        Err(err) => {
+            eprintln!("Error: search defaults unavailable in this build: {err}");
+            std::process::exit(1);
+        }
+    };
     let mut rate_backend = infotheory::search::DEFAULT_SEARCH_RATE_BACKEND_NAME.to_string();
     let compression_backend =
         infotheory::search::DEFAULT_SEARCH_COMPRESSION_BACKEND_NAME.to_string();
@@ -1624,10 +1630,10 @@ mod tests {
     #[test]
     fn file_roundtrip_backend_keeps_zpaq_unchanged() {
         let b = CompressionBackend::Zpaq {
-            method: "5".to_string(),
+            method: infotheory::api::ZpaqMethodSpec::literal("5"),
         };
         let out = file_roundtrip_backend(&b);
-        assert!(matches!(out, CompressionBackend::Zpaq { method } if method == "5"));
+        assert!(matches!(out, CompressionBackend::Zpaq { method } if method.value() == "5"));
     }
 
     #[cfg(feature = "all-backends")]

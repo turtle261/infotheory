@@ -79,7 +79,8 @@ fn individual_backends() -> Vec<(&'static str, CompiledRateBackend)> {
         (
             "rwkv64x64",
             compile_rate_backend(RateBackend::Rwkv7Method {
-                method: RWKV_BENCH_METHOD.to_string(),
+                method: infotheory::rwkvzip::parse_method_spec(RWKV_BENCH_METHOD)
+                    .expect("rwkv benchmark method must be valid"),
             }),
         ),
         (
@@ -106,7 +107,8 @@ fn mixture_backends() -> Vec<(&'static str, CompiledRateBackend)> {
     let rwkv = make_expert(
         "rwkv64x64",
         RateBackend::Rwkv7Method {
-            method: RWKV_BENCH_METHOD.to_string(),
+            method: infotheory::rwkvzip::parse_method_spec(RWKV_BENCH_METHOD)
+                .expect("rwkv benchmark method must be valid"),
         },
     );
     let particle = make_expert(

@@ -18,7 +18,8 @@ fn bench_data() -> Vec<u8> {
 
 fn backend(method: &str) -> RateBackend {
     RateBackend::Rwkv7Method {
-        method: method.to_string(),
+        method: infotheory::rwkvzip::parse_method_spec(method)
+            .expect("rwkv benchmark method must be valid"),
     }
 }
 

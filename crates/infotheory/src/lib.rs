@@ -1062,7 +1062,7 @@ mod tests {
     #[test]
     fn generate_bytes_api_is_deterministic_for_rwkv_method() {
         let backend = RateBackend::Rwkv7Method {
-            method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+            method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
         };
         assert_deterministic_generate_for_backend(backend, -1, 8, "rwkv7");
     }
@@ -1079,7 +1079,7 @@ mod tests {
     #[test]
     fn sampled_generation_is_deterministic_for_rwkv_method() {
         let backend = RateBackend::Rwkv7Method {
-            method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+            method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
         };
         assert_sampled_generate_for_backend(backend, -1, 8, "rwkv7");
     }
@@ -1209,7 +1209,7 @@ mod tests {
     fn rwkv_method_entropy_is_stable_across_calls() {
         let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=21,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:infer";
         let backend = RateBackend::Rwkv7Method {
-            method: method.to_string(),
+            method: crate::rwkvzip::parse_method_spec(method).expect("rwkv method spec"),
         };
         let data = b"rwkv method entropy stability regression sample";
 
@@ -1225,7 +1225,8 @@ mod tests {
     #[test]
     fn rwkv_method_without_policy_is_accepted_by_public_api() {
         let backend = RateBackend::Rwkv7Method {
-            method: "cfg:hidden=64,layers=1,intermediate=64".to_string(),
+            method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64")
+                .expect("rwkv method spec"),
         };
         let data = b"rwkv method without policy";
         let h1 = entropy_rate_backend(data, -1, &backend);
@@ -1238,7 +1239,7 @@ mod tests {
     #[test]
     fn rwkv_infer_only_plugin_collapses_to_single_pass_entropy() {
         let backend = RateBackend::Rwkv7Method {
-            method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=25,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+            method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=25,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
         };
         let data = b"rwkv infer-only plugin equality sample";
         let h = entropy_rate_backend(data, -1, &backend);
@@ -1253,7 +1254,7 @@ mod tests {
     #[test]
     fn rwkv_method_biased_entropy_is_stable_across_calls_with_training_policy() {
         let backend = RateBackend::Rwkv7Method {
-            method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=23,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.0)".to_string(),
+            method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=23,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.0)").expect("rwkv method spec"),
         };
         let data = b"rwkv plugin stability sample";
         let h1 = biased_entropy_rate_backend(data, -1, &backend);
@@ -1270,7 +1271,7 @@ mod tests {
         let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=22,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:infer";
         let ctx = ctx(
             RateBackend::Rwkv7Method {
-                method: method.to_string(),
+                method: crate::rwkvzip::parse_method_spec(method).expect("rwkv method spec"),
             },
             default_compression_backend(),
         );
@@ -1293,7 +1294,8 @@ mod tests {
     #[test]
     fn mamba_method_without_policy_is_accepted_by_public_api() {
         let backend = RateBackend::MambaMethod {
-            method: "cfg:hidden=64,layers=1,intermediate=96".to_string(),
+            method: crate::mambazip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=96")
+                .expect("mamba method spec"),
         };
         let data = b"mamba method without policy";
         let h1 = entropy_rate_backend(data, -1, &backend);
@@ -1306,7 +1308,7 @@ mod tests {
     #[test]
     fn mamba_infer_only_plugin_collapses_to_single_pass_entropy() {
         let backend = RateBackend::MambaMethod {
-            method: "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+            method: crate::mambazip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("mamba method spec"),
         };
         let data = b"mamba infer-only plugin equality sample";
         let h = entropy_rate_backend(data, -1, &backend);
@@ -1321,7 +1323,7 @@ mod tests {
     #[test]
     fn mamba_method_biased_entropy_is_stable_across_calls_with_training_policy() {
         let backend = RateBackend::MambaMethod {
-            method: "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=24,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.0)".to_string(),
+            method: crate::mambazip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=24,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.0)").expect("mamba method spec"),
         };
         let data = b"mamba plugin stability sample";
         let h1 = biased_entropy_rate_backend(data, -1, &backend);
@@ -1404,7 +1406,7 @@ mod minimal_tests {
     #[test]
     fn explicit_zpaq_backend_fails_to_compile_without_feature() {
         let backend = CompressionBackend::Zpaq {
-            method: "5".to_string(),
+            method: crate::api::ZpaqMethodSpec::literal("5"),
         };
         let err = backend
             .compile()

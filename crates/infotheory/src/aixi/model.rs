@@ -639,10 +639,7 @@ pub(crate) fn build_mc_aixi_predictor(
         RateBackend::Ctw { depth } => Ok(Box::new(CtwPredictor::new(*depth))),
         #[cfg(feature = "backend-rosa")]
         RateBackend::RosaPlus => Ok(Box::new(RosaPredictor::new(max_order))),
-        _ => Ok(Box::new(RateBackendBitPredictor::from_compiled(
-            backend.clone(),
-            max_order,
-        )?)),
+        _ => Ok(Box::new(build_compiled_bit_predictor(backend, max_order)?)),
     }
 }
 
@@ -659,11 +656,22 @@ pub(crate) fn build_aiqi_predictor(
         RateBackend::FacCtw { base_depth, .. } => {
             Ok(Box::new(FacCtwPredictor::new(*base_depth, return_bits)))
         }
-        _ => Ok(Box::new(RateBackendBitPredictor::from_compiled(
-            backend.clone(),
-            max_order,
-        )?)),
+        _ => Ok(Box::new(build_compiled_bit_predictor(backend, max_order)?)),
     }
+}
+
+fn build_compiled_bit_predictor(
+    backend: &CompiledRateBackend,
+    max_order: i64,
+) -> Result<RateBackendBitPredictor, String> {
+    let bit_backend = if backend.supports_bit_token_adaptation() {
+        backend
+            .adapt_for_bit_tokens()
+            .map_err(|err| err.to_string())?
+    } else {
+        backend.clone()
+    };
+    RateBackendBitPredictor::from_compiled(bit_backend, max_order)
 }
 
 #[cfg(feature = "backend-rwkv")]

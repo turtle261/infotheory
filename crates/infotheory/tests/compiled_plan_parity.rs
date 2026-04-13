@@ -200,10 +200,10 @@ fn compiled_ctx_matches_wrapper_ctx_for_calibrated_backend() {
 #[test]
 fn compiled_ctx_matches_wrapper_ctx_for_zpaq_rate_and_compression() {
     let rate = RateBackend::Zpaq {
-        method: "1".to_string(),
+        method: infotheory::api::ZpaqMethodSpec::literal("1"),
     };
     let compression = CompressionBackend::Zpaq {
-        method: "1".to_string(),
+        method: infotheory::api::ZpaqMethodSpec::literal("1"),
     };
     assert_ctx_parity(rate, compression, false);
 }
@@ -213,10 +213,10 @@ fn compiled_ctx_matches_wrapper_ctx_for_zpaq_rate_and_compression() {
 fn compiled_ctx_matches_wrapper_ctx_for_rwkv_backends() {
     let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
     let rate = RateBackend::Rwkv7Method {
-        method: method.to_string(),
+        method: infotheory::rwkvzip::parse_method_spec(method).expect("rwkv method spec"),
     };
     let compression = CompressionBackend::Rwkv7 {
-        method: method.to_string(),
+        method: infotheory::rwkvzip::parse_method_spec(method).expect("rwkv method spec"),
         coder: infotheory::coders::CoderType::AC,
     };
     assert_ctx_parity(rate, compression, false);
@@ -227,7 +227,7 @@ fn compiled_ctx_matches_wrapper_ctx_for_rwkv_backends() {
 fn compiled_ctx_matches_wrapper_ctx_for_mamba_rate_backend() {
     let method = "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
     let rate = RateBackend::MambaMethod {
-        method: method.to_string(),
+        method: infotheory::mambazip::parse_method_spec(method).expect("mamba method spec"),
     };
     let compression = CompressionBackend::Rate {
         rate_backend: rate.clone(),

@@ -4,6 +4,41 @@ use crate::coders::CoderType;
 use crate::error::{InfotheoryError, InfotheoryResult};
 use std::sync::Arc;
 
+/// Typed ZPAQ method specification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ZpaqMethodSpec {
+    /// Literal ZPAQ method string.
+    Literal { value: String },
+}
+
+impl ZpaqMethodSpec {
+    /// Construct a literal ZPAQ method specification.
+    pub fn literal(value: impl Into<String>) -> Self {
+        Self::Literal {
+            value: value.into(),
+        }
+    }
+
+    /// Return the canonical method string.
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Literal { value } => value,
+        }
+    }
+}
+
+impl From<String> for ZpaqMethodSpec {
+    fn from(value: String) -> Self {
+        Self::literal(value)
+    }
+}
+
+impl From<&str> for ZpaqMethodSpec {
+    fn from(value: &str) -> Self {
+        Self::literal(value)
+    }
+}
+
 /// How generated symbols should update the model state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenerationUpdateMode {
@@ -123,21 +158,21 @@ pub enum RateBackend {
         context_bytes: usize,
     },
     #[cfg(feature = "backend-mamba")]
-    /// Mamba method string (e.g. `file:...` or `cfg:...[;policy:...]`) resolved lazily.
+    /// Typed Mamba method specification.
     MambaMethod {
-        /// Mamba method string.
-        method: String,
+        /// Mamba method specification.
+        method: crate::mambazip::MethodSpec,
     },
     #[cfg(feature = "backend-rwkv")]
-    /// RWKV7 method string (e.g. `file:...` or `cfg:...[;policy:...]`) resolved lazily.
+    /// Typed RWKV7 method specification.
     Rwkv7Method {
-        /// RWKV7 method string.
-        method: String,
+        /// RWKV7 method specification.
+        method: crate::rwkvzip::MethodSpec,
     },
     /// ZPAQ compression-based rate model (streamable methods only).
     Zpaq {
-        /// ZPAQ method string (streamable modes only for rate estimation).
-        method: String,
+        /// Typed ZPAQ method specification.
+        method: ZpaqMethodSpec,
     },
     /// Online mixture over `RateBackend` experts.
     ///
@@ -179,14 +214,14 @@ pub enum RateBackend {
 pub enum CompressionBackend {
     /// ZPAQ compressor with explicit method string.
     Zpaq {
-        /// ZPAQ method (for example `"1"` or `"5"`).
-        method: String,
+        /// Typed ZPAQ method specification.
+        method: ZpaqMethodSpec,
     },
     #[cfg(feature = "backend-rwkv")]
-    /// RWKV7 compressor configured by canonical method string.
+    /// RWKV7 compressor configured by typed method specification.
     Rwkv7 {
-        /// RWKV7 method string (for example `file:...` or `cfg:...[;policy:...]`).
-        method: String,
+        /// RWKV7 method specification.
+        method: crate::rwkvzip::MethodSpec,
         /// Entropy coder used for coding model PDFs.
         coder: CoderType,
     },
@@ -468,7 +503,7 @@ impl CompressionBackend {
             })
         {
             return Ok(CompressionBackend::Zpaq {
-                method: "5".to_string(),
+                method: ZpaqMethodSpec::literal("5"),
             });
         }
 

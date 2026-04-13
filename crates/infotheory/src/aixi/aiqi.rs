@@ -112,14 +112,12 @@ impl AiqiConfig {
                     "algorithm=rwkv requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
                         .to_string()
                 })?;
-                let method = crate::rwkvzip::canonical_method_string(
-                    &crate::rwkvzip::MethodSpec::File {
+                Ok(RateBackend::Rwkv7Method {
+                    method: crate::rwkvzip::MethodSpec::File {
                         path: PathBuf::from(path),
                         policy: None,
                     },
-                )
-                .map_err(|err| format!("Invalid RWKV model path for AIQI: {err}"))?;
-                Ok(RateBackend::Rwkv7Method { method })
+                })
             }
             #[cfg(not(feature = "backend-rwkv"))]
             "rwkv" => Err("algorithm=rwkv requires backend-rwkv feature".to_string()),
@@ -273,13 +271,29 @@ impl AiqiConfig {
     }
 }
 
-impl AiqiConfig {
-    fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+#[derive(Clone)]
+struct AiqiRuntimeConfig {
+    observation_bits: usize,
+    observation_stream_len: usize,
+    reward_bits: usize,
+    agent_actions: usize,
+    min_reward: Reward,
+    max_reward: Reward,
+    reward_offset: Reward,
+    discount_gamma: f64,
+    return_horizon: usize,
+    return_bins: usize,
+    augmentation_period: usize,
+    history_prune_keep_steps: Option<usize>,
+    baseline_exploration: f64,
+    random_seed: Option<u64>,
+}
+
+impl AiqiRuntimeConfig {
+    fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
         let interface = compiled.interface();
         let runtime = compiled.runtime();
         let (
-            predictor,
-            predictor_max_order,
             discount_gamma,
             return_horizon,
             return_bins,
@@ -288,17 +302,14 @@ impl AiqiConfig {
             baseline_exploration,
         ) = match compiled.controller() {
             CompiledPlannerController::AiqiDiscounted {
-                predictor,
-                predictor_max_order,
                 discount_gamma,
                 return_horizon,
                 return_bins,
                 augmentation_period,
                 history_prune_keep_steps,
                 baseline_exploration,
+                ..
             } => (
-                predictor,
-                *predictor_max_order,
                 *discount_gamma,
                 *return_horizon,
                 *return_bins,
@@ -313,20 +324,8 @@ impl AiqiConfig {
                 );
             }
         };
-        let (algorithm, ct_depth, rate_backend) = match predictor.canonical_spec() {
-            RateBackend::Ctw { depth } => ("ctw".to_string(), *depth, None),
-            RateBackend::FacCtw { base_depth, .. } => ("fac-ctw".to_string(), *base_depth, None),
-            RateBackend::RosaPlus => ("rosa".to_string(), 0, None),
-            other => (
-                predictor.canonical_name().to_string(),
-                0,
-                Some(other.clone()),
-            ),
-        };
 
         Ok(Self {
-            algorithm,
-            ct_depth,
             observation_bits: interface.observation_bits,
             observation_stream_len: interface.observation_stream_len.max(1),
             reward_bits: interface.reward_bits,
@@ -341,11 +340,6 @@ impl AiqiConfig {
             history_prune_keep_steps,
             baseline_exploration,
             random_seed: runtime.random_seed,
-            rate_backend,
-            rate_backend_max_order: predictor_max_order,
-            rwkv_model_path: None,
-            rosa_max_order: None,
-            zpaq_method: None,
         })
     }
 }
@@ -366,7 +360,7 @@ struct PhaseModel {
 
 /// AIQI agent with phase-indexed augmented return predictors.
 pub struct AiqiAgent {
-    config: AiqiConfig,
+    config: AiqiRuntimeConfig,
     phases: Vec<PhaseModel>,
     steps: Vec<StepRecord>,
     return_bins_by_step: Vec<Option<u64>>,
@@ -384,21 +378,22 @@ pub struct AiqiAgent {
 impl AiqiAgent {
     /// Construct a new AIQI agent.
     pub fn new(config: AiqiConfig) -> Result<Self, String> {
+        config.validate_runtime_invariants()?;
         let compiled = config.compile_planner_run_spec()?;
-        Self::from_compiled_config(config, &compiled)
+        let runtime = AiqiRuntimeConfig::from_compiled(&compiled)?;
+        Self::from_compiled_config(runtime, &compiled)
     }
 
     /// Construct a new AIQI agent directly from a compiled planner-run spec.
     pub fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
-        let config = AiqiConfig::from_compiled_planner_run(compiled)?;
+        let config = AiqiRuntimeConfig::from_compiled(compiled)?;
         Self::from_compiled_config(config, compiled)
     }
 
     fn from_compiled_config(
-        config: AiqiConfig,
+        config: AiqiRuntimeConfig,
         compiled: &CompiledPlannerRunSpec,
     ) -> Result<Self, String> {
-        config.validate_runtime_invariants()?;
         let (predictor, predictor_max_order, augmentation_period, return_bins) =
             match compiled.controller() {
                 CompiledPlannerController::AiqiDiscounted {
@@ -422,12 +417,11 @@ impl AiqiAgent {
             };
         let action_bits = compiled.action_bits();
         let return_bits = bits_for_cardinality(return_bins);
-        let use_generic_planner = aiqi_requires_generic_planner(&config);
-        let distribution_uses_training_updates = config.rate_backend.is_none()
-            && matches!(
-                config.algorithm.as_str(),
-                "ctw" | "fac-ctw" | "ac-ctw" | "ctw-context-tree"
-            );
+        let use_generic_planner = aiqi_requires_generic_planner_backend(predictor.canonical_spec());
+        let distribution_uses_training_updates = matches!(
+            predictor.canonical_spec(),
+            RateBackend::Ctw { .. } | RateBackend::FacCtw { .. }
+        );
 
         let mut phases = Vec::with_capacity(augmentation_period);
         for _ in 0..augmentation_period {
@@ -906,7 +900,7 @@ impl AiqiAgent {
 }
 
 fn push_step_tokens_history(
-    config: &AiqiConfig,
+    config: &AiqiRuntimeConfig,
     history_base_step: usize,
     steps: &[StepRecord],
     return_bins_by_step: &[Option<u64>],
@@ -930,7 +924,7 @@ fn push_step_tokens_history(
 }
 
 fn push_augmented_step_tokens_commit(
-    config: &AiqiConfig,
+    config: &AiqiRuntimeConfig,
     history_base_step: usize,
     steps: &[StepRecord],
     return_bins_by_step: &[Option<u64>],
@@ -982,7 +976,7 @@ fn push_action_tokens_commit_history(
 }
 
 fn push_percept_tokens_history(
-    config: &AiqiConfig,
+    config: &AiqiRuntimeConfig,
     history_base_step: usize,
     steps: &[StepRecord],
     predictor: &mut dyn Predictor,
@@ -1003,7 +997,7 @@ fn push_percept_tokens_history(
 }
 
 fn push_percept_tokens_commit_history(
-    config: &AiqiConfig,
+    config: &AiqiRuntimeConfig,
     history_base_step: usize,
     steps: &[StepRecord],
     predictor: &mut dyn Predictor,
@@ -1030,12 +1024,11 @@ fn rate_backend_supports_aiqi_frozen_conditioning(backend: &RateBackend) -> bool
         .unwrap_or(false)
 }
 
-fn aiqi_requires_generic_planner(config: &AiqiConfig) -> bool {
-    config.rate_backend.is_some()
-        || !matches!(
-            config.algorithm.as_str(),
-            "ctw" | "fac-ctw" | "ac-ctw" | "ctw-context-tree"
-        )
+fn aiqi_requires_generic_planner_backend(backend: &RateBackend) -> bool {
+    !matches!(
+        backend,
+        RateBackend::Ctw { .. } | RateBackend::FacCtw { .. }
+    )
 }
 
 fn max_value_for_bits(bits: usize) -> u64 {
@@ -1152,6 +1145,8 @@ fn argmax_with_fixed_tie_break(values: &[f64]) -> usize {
 #[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
+    use crate::aixi::environment::{CtwTest, Environment};
+    use crate::api::{MixtureKind, MixtureSpec};
     use std::sync::{Arc, Mutex};
 
     fn basic_config() -> AiqiConfig {
@@ -1178,6 +1173,62 @@ mod tests {
             rosa_max_order: None,
             zpaq_method: None,
         }
+    }
+
+    fn generic_mixture_config() -> AiqiConfig {
+        AiqiConfig {
+            rate_backend: Some(RateBackend::Mixture {
+                spec: Arc::new(
+                    MixtureSpec::new(
+                        MixtureKind::Bayes,
+                        vec![
+                            crate::api::MixtureExpertSpec {
+                                name: Some("ctw".to_string()),
+                                log_prior: 0.0,
+                                max_order: -1,
+                                backend: RateBackend::Ctw { depth: 8 },
+                            },
+                            crate::api::MixtureExpertSpec {
+                                name: Some("match".to_string()),
+                                log_prior: 0.0,
+                                max_order: -1,
+                                backend: RateBackend::Match {
+                                    hash_bits: 16,
+                                    min_len: 2,
+                                    max_len: 16,
+                                    base_mix: 0.05,
+                                    confidence_scale: 1.0,
+                                },
+                            },
+                        ],
+                    )
+                    .with_alpha(0.03),
+                ),
+            }),
+            random_seed: Some(11),
+            baseline_exploration: 0.01,
+            ..basic_config()
+        }
+    }
+
+    fn run_ctw_trace(agent: &mut AiqiAgent, cycles: usize) -> (Vec<Action>, i64) {
+        let mut env = CtwTest::new();
+        let mut actions = Vec::with_capacity(cycles);
+        let mut total_reward = 0i64;
+
+        for _ in 0..cycles {
+            let action = agent.get_planned_action();
+            actions.push(action);
+            env.perform_action(action);
+            let obs_stream = env.drain_observations();
+            let reward = env.get_reward();
+            agent
+                .observe_transition(action, &obs_stream, reward)
+                .expect("transition should be accepted");
+            total_reward += reward;
+        }
+
+        (actions, total_reward)
     }
 
     #[derive(Clone, Default)]
@@ -1356,7 +1407,7 @@ mod tests {
     fn config_rejects_zpaq_rate_backend_in_strict_mode() {
         let mut cfg = basic_config();
         cfg.rate_backend = Some(RateBackend::Zpaq {
-            method: "1".to_string(),
+            method: crate::api::ZpaqMethodSpec::literal("1"),
         });
         let err = cfg
             .validate()
@@ -1613,5 +1664,20 @@ mod tests {
             snapshot.commit_update_history > 0,
             "generic planner should keep action/percept conditioning frozen"
         );
+    }
+
+    #[test]
+    fn compiled_aiqi_runtime_matches_legacy_config_for_generic_mixture_backend() {
+        let config = generic_mixture_config();
+        let compiled = config
+            .compile_planner_run_spec()
+            .expect("generic planner run should compile");
+        let mut legacy = AiqiAgent::new(config).expect("legacy aiqi config");
+        let mut canonical =
+            AiqiAgent::from_compiled_planner_run(&compiled).expect("compiled aiqi config");
+
+        let legacy_trace = run_ctw_trace(&mut legacy, 32);
+        let canonical_trace = run_ctw_trace(&mut canonical, 32);
+        assert_eq!(canonical_trace, legacy_trace);
     }
 }

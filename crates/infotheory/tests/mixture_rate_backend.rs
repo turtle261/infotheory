@@ -72,7 +72,7 @@ fn mixture_single_sequitur_expert_matches_backend() {
 fn rwkv_mixture_single_expert_matches_backend_with_tbptt() {
     let data = b"abcdefghij";
     let base = RateBackend::Rwkv7Method {
-        method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=37,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=8,clip=0,momentum=0.9)".to_string(),
+        method: infotheory::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=37,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=8,clip=0,momentum=0.9)").expect("rwkv method spec"),
     };
     let base_rate = try_entropy_rate_backend(data, -1, &base).expect("base rate");
 
@@ -296,7 +296,7 @@ fn neural_mixture_supports_nested_mixture_expert() {
                 log_prior: 0.0,
                 max_order: -1,
                 backend: RateBackend::Zpaq {
-                    method: "1".to_string(),
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
                 },
             },
         ],

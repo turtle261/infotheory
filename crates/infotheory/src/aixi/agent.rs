@@ -103,21 +103,20 @@ impl AgentConfig {
                     .filter(|value| !value.is_empty())
                 {
                     Ok(RateBackend::Rwkv7Method {
-                        method: method.to_string(),
+                        method: crate::rwkvzip::parse_method_spec(method)
+                            .map_err(|err| format!("Invalid RWKV method for AIXI: {err}"))?,
                     })
                 } else {
                     let path = self.rwkv_model_path.as_ref().ok_or_else(|| {
                         "algorithm=rwkv requires rwkv_model_path or rwkv_method when no rate_backend override is configured"
                             .to_string()
                     })?;
-                    let method = crate::rwkvzip::canonical_method_string(
-                        &crate::rwkvzip::MethodSpec::File {
+                    Ok(RateBackend::Rwkv7Method {
+                        method: crate::rwkvzip::MethodSpec::File {
                             path: PathBuf::from(path),
                             policy: None,
                         },
-                    )
-                    .map_err(|err| format!("Invalid RWKV model path for AIXI: {err}"))?;
-                    Ok(RateBackend::Rwkv7Method { method })
+                    })
                 }
             }
             #[cfg(not(feature = "backend-rwkv"))]
@@ -131,27 +130,28 @@ impl AgentConfig {
                     .filter(|value| !value.is_empty())
                 {
                     Ok(RateBackend::MambaMethod {
-                        method: method.to_string(),
+                        method: crate::mambazip::parse_method_spec(method)
+                            .map_err(|err| format!("Invalid Mamba method for AIXI: {err}"))?,
                     })
                 } else {
                     let path = self.mamba_model_path.as_ref().ok_or_else(|| {
                         "algorithm=mamba requires mamba_model_path or mamba_method when no rate_backend override is configured"
                             .to_string()
                     })?;
-                    let method = crate::mambazip::canonical_method_string(
-                        &crate::mambazip::MethodSpec::File {
+                    Ok(RateBackend::MambaMethod {
+                        method: crate::mambazip::MethodSpec::File {
                             path: PathBuf::from(path),
                             policy: None,
                         },
-                    )
-                    .map_err(|err| format!("Invalid Mamba model path for AIXI: {err}"))?;
-                    Ok(RateBackend::MambaMethod { method })
+                    })
                 }
             }
             #[cfg(not(feature = "backend-mamba"))]
             "mamba" => Err("algorithm=mamba requires backend-mamba feature".to_string()),
             "zpaq" => Ok(RateBackend::Zpaq {
-                method: self.zpaq_method.clone().unwrap_or_else(|| "1".to_string()),
+                method: crate::api::ZpaqMethodSpec::literal(
+                    self.zpaq_method.clone().unwrap_or_else(|| "1".to_string()),
+                ),
             }),
             other => Err(format!("Unknown algorithm: {other}")),
         }
@@ -304,55 +304,49 @@ impl AgentConfig {
     }
 }
 
-impl AgentConfig {
-    fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+#[derive(Clone)]
+struct AgentRuntimeConfig {
+    agent_horizon: usize,
+    observation_bits: usize,
+    observation_stream_len: usize,
+    observation_key_mode: ObservationKeyMode,
+    reward_bits: usize,
+    agent_actions: usize,
+    num_simulations: usize,
+    exploration_exploitation_ratio: f64,
+    discount_gamma: f64,
+    min_reward: Reward,
+    max_reward: Reward,
+    reward_offset: Reward,
+    random_seed: Option<u64>,
+}
+
+impl AgentRuntimeConfig {
+    fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
         let interface = compiled.interface();
         let runtime = compiled.runtime();
-        let (
-            predictor,
-            predictor_max_order,
-            agent_horizon,
-            num_simulations,
-            exploration_exploitation_ratio,
-            discount_gamma,
-        ) = match compiled.controller() {
-            CompiledPlannerController::McAixi {
-                predictor,
-                predictor_max_order,
-                agent_horizon,
-                num_simulations,
-                exploration_exploitation_ratio,
-                discount_gamma,
-            } => (
-                predictor,
-                *predictor_max_order,
-                *agent_horizon,
-                *num_simulations,
-                *exploration_exploitation_ratio,
-                *discount_gamma,
-            ),
-            _ => {
-                return Err(
-                    "compiled planner run does not contain an MC-AIXI controller".to_string(),
-                );
-            }
-        };
-        let (algorithm, ct_depth) = match predictor.canonical_spec() {
-            RateBackend::FacCtw { base_depth, .. } => ("fac-ctw".to_string(), *base_depth),
-            RateBackend::Ctw { depth } => ("ctw".to_string(), *depth),
-            other => (
-                predictor.canonical_name().to_string(),
-                match other {
-                    RateBackend::FacCtw { base_depth, .. } => *base_depth,
-                    RateBackend::Ctw { depth } => *depth,
-                    _ => 0,
-                },
-            ),
-        };
+        let (agent_horizon, num_simulations, exploration_exploitation_ratio, discount_gamma) =
+            match compiled.controller() {
+                CompiledPlannerController::McAixi {
+                    agent_horizon,
+                    num_simulations,
+                    exploration_exploitation_ratio,
+                    discount_gamma,
+                    ..
+                } => (
+                    *agent_horizon,
+                    *num_simulations,
+                    *exploration_exploitation_ratio,
+                    *discount_gamma,
+                ),
+                _ => {
+                    return Err(
+                        "compiled planner run does not contain an MC-AIXI controller".to_string(),
+                    );
+                }
+            };
 
         Ok(Self {
-            algorithm,
-            ct_depth,
             agent_horizon,
             observation_bits: interface.observation_bits,
             observation_stream_len: interface.observation_stream_len.max(1),
@@ -366,14 +360,6 @@ impl AgentConfig {
             max_reward: interface.max_reward,
             reward_offset: interface.reward_offset,
             random_seed: runtime.random_seed,
-            rate_backend: Some(predictor.canonical_spec().clone()),
-            rate_backend_max_order: predictor_max_order,
-            rwkv_model_path: None,
-            rwkv_method: None,
-            mamba_model_path: None,
-            mamba_method: None,
-            rosa_max_order: None,
-            zpaq_method: None,
         })
     }
 }
@@ -389,7 +375,7 @@ pub struct Agent {
     /// The MCTS planner, temporarily taken during search.
     planner: Option<SearchTree>,
     /// Configuration settings.
-    config: AgentConfig,
+    config: AgentRuntimeConfig,
 
     /// Total number of interaction cycles.
     age: u64,
@@ -416,21 +402,22 @@ impl Agent {
 
     /// Creates a new `Agent` with the given configuration, returning a validation error on failure.
     pub fn try_new(config: AgentConfig) -> Result<Self, String> {
+        config.validate_runtime_invariants()?;
         let compiled = config.compile_planner_run_spec()?;
-        Self::from_compiled_config(config, &compiled)
+        let runtime = AgentRuntimeConfig::from_compiled(&compiled)?;
+        Self::from_compiled_config(runtime, &compiled)
     }
 
     /// Creates a new `Agent` from a compiled planner-run spec.
     pub fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
-        let config = AgentConfig::from_compiled_planner_run(compiled)?;
+        let config = AgentRuntimeConfig::from_compiled(compiled)?;
         Self::from_compiled_config(config, compiled)
     }
 
     fn from_compiled_config(
-        config: AgentConfig,
+        config: AgentRuntimeConfig,
         compiled: &CompiledPlannerRunSpec,
     ) -> Result<Self, String> {
-        config.validate_runtime_invariants()?;
         let (predictor, predictor_max_order) = match compiled.controller() {
             CompiledPlannerController::McAixi {
                 predictor,
@@ -678,6 +665,10 @@ impl AgentSimulator for Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "all-backends")]
+    use crate::aixi::environment::{CtwTest, Environment};
+    #[cfg(feature = "all-backends")]
+    use crate::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -750,10 +741,8 @@ mod tests {
         }
     }
 
-    fn basic_config() -> AgentConfig {
-        AgentConfig {
-            algorithm: "ac-ctw".to_string(),
-            ct_depth: 8,
+    fn basic_runtime_config() -> AgentRuntimeConfig {
+        AgentRuntimeConfig {
             agent_horizon: 2,
             observation_bits: 2,
             observation_stream_len: 2,
@@ -767,19 +756,11 @@ mod tests {
             max_reward: 3,
             reward_offset: 2,
             random_seed: Some(7),
-            rate_backend: None,
-            rate_backend_max_order: 8,
-            rwkv_model_path: None,
-            rwkv_method: None,
-            mamba_model_path: None,
-            mamba_method: None,
-            rosa_max_order: None,
-            zpaq_method: None,
         }
     }
 
     fn test_agent(model: Box<dyn Predictor>) -> Agent {
-        let config = basic_config();
+        let config = basic_runtime_config();
         let action_bits = if config.agent_actions <= 1 {
             1
         } else {
@@ -796,6 +777,83 @@ mod tests {
             obs_buffer: Vec::with_capacity(128),
             sym_buffer: Vec::with_capacity(64),
         }
+    }
+
+    #[cfg(feature = "all-backends")]
+    fn generic_mixture_config() -> AgentConfig {
+        AgentConfig {
+            algorithm: "ignored-by-rate-backend".to_string(),
+            ct_depth: 8,
+            agent_horizon: 5,
+            observation_bits: 1,
+            observation_stream_len: 1,
+            observation_key_mode: ObservationKeyMode::FullStream,
+            reward_bits: 1,
+            agent_actions: 2,
+            num_simulations: 60,
+            exploration_exploitation_ratio: 1.4,
+            discount_gamma: 1.0,
+            min_reward: 0,
+            max_reward: 1,
+            reward_offset: 0,
+            random_seed: Some(2026),
+            rate_backend: Some(RateBackend::Mixture {
+                spec: Arc::new(
+                    MixtureSpec::new(
+                        MixtureKind::Convex,
+                        vec![
+                            MixtureExpertSpec {
+                                name: Some("ctw".to_string()),
+                                log_prior: 0.0,
+                                max_order: -1,
+                                backend: RateBackend::Ctw { depth: 8 },
+                            },
+                            MixtureExpertSpec {
+                                name: Some("rosa".to_string()),
+                                log_prior: 0.0,
+                                max_order: 8,
+                                backend: RateBackend::RosaPlus,
+                            },
+                        ],
+                    )
+                    .with_alpha(1.25),
+                ),
+            }),
+            rate_backend_max_order: 8,
+            rwkv_model_path: None,
+            rwkv_method: None,
+            mamba_model_path: None,
+            mamba_method: None,
+            rosa_max_order: Some(8),
+            zpaq_method: None,
+        }
+    }
+
+    #[cfg(feature = "all-backends")]
+    fn run_ctw_trace(agent: &mut Agent, cycles: usize) -> (Vec<Action>, i64) {
+        let mut env = CtwTest::new();
+        let mut actions = Vec::with_capacity(cycles);
+        let mut total_reward = 0i64;
+        let mut obs_stream = env.drain_observations();
+        let mut prev_rew = env.get_reward();
+        let mut prev_act = 0;
+
+        for _ in 0..cycles {
+            agent.model_update_percept_stream(&obs_stream, prev_rew);
+            let action = agent.get_planned_action(&obs_stream, prev_rew, prev_act);
+            actions.push(action);
+            agent.model_update_action_external(action);
+
+            env.perform_action(action);
+            obs_stream = env.drain_observations();
+            let rew = env.get_reward();
+            agent.model_update_percept_stream(&obs_stream, rew);
+            total_reward += rew;
+            prev_rew = rew;
+            prev_act = action;
+        }
+
+        (actions, total_reward)
     }
 
     #[test]
@@ -826,5 +884,21 @@ mod tests {
         assert_eq!(snapshot.rollback_scope, 1);
         assert_eq!(snapshot.revert, 0);
         assert_eq!(snapshot.pop_history, 0);
+    }
+
+    #[cfg(feature = "all-backends")]
+    #[test]
+    fn compiled_mcaixi_runtime_matches_legacy_config_for_generic_mixture_backend() {
+        let config = generic_mixture_config();
+        let compiled = config
+            .compile_planner_run_spec()
+            .expect("generic planner run should compile");
+        let mut legacy = Agent::try_new(config).expect("legacy config agent");
+        let mut canonical =
+            Agent::from_compiled_planner_run(&compiled).expect("compiled planner-run agent");
+
+        let legacy_trace = run_ctw_trace(&mut legacy, 32);
+        let canonical_trace = run_ctw_trace(&mut canonical, 32);
+        assert_eq!(canonical_trace, legacy_trace);
     }
 }

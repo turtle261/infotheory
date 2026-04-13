@@ -1,7 +1,6 @@
-#![cfg_attr(not(feature = "all-backends"), allow(dead_code))]
-
 use wide::f64x4;
 
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn dot_wide(lhs: &[f64], rhs: &[f64]) -> f64 {
     let n = lhs.len().min(rhs.len());
@@ -22,6 +21,7 @@ pub(crate) fn dot_wide(lhs: &[f64], rhs: &[f64]) -> f64 {
     out
 }
 
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn max_wide(xs: &[f64]) -> f64 {
     if xs.is_empty() {
@@ -45,6 +45,7 @@ pub(crate) fn max_wide(xs: &[f64]) -> f64 {
     max_v
 }
 
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn logsumexp_wide(xs: &[f64]) -> f64 {
     let max_v = max_wide(xs);
@@ -58,6 +59,7 @@ pub(crate) fn logsumexp_wide(xs: &[f64]) -> f64 {
     max_v + sum.ln()
 }
 
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn axpy_wide(dst: &mut [f64], alpha: f64, src: &[f64]) {
     let n = dst.len().min(src.len());

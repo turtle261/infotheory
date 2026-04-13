@@ -11,8 +11,9 @@ pub use self::context::{InfotheoryCtx, RateBackendSession, get_default_ctx, set_
 pub use self::types::{
     CalibratedSpec, CalibrationContextKind, CompressionBackend, GenerationConfig,
     GenerationStrategy, GenerationUpdateMode, MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind,
-    MixtureScheduleMode, MixtureSpec, ParticleSpec, RateBackend, parse_mixture_kind_name,
-    parse_mixture_schedule_name, validate_compression_backend, validate_rate_backend,
+    MixtureScheduleMode, MixtureSpec, ParticleSpec, RateBackend, ZpaqMethodSpec,
+    parse_mixture_kind_name, parse_mixture_schedule_name, validate_compression_backend,
+    validate_rate_backend,
 };
 pub use crate::spec::{
     AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,

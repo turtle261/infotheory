@@ -149,7 +149,7 @@ Notes:
 
 ### Additional notes
 Platform caveats:
-- **OpenBSD/NetBSD**: kernel W^X policies can break ZPAQ JIT at runtime. Set `CARGO_FEATURE_NOJIT=true`.
+- **OpenBSD/NetBSD**: kernel W^X policies can break ZPAQ JIT at runtime. Set `ZPAQ_NOJIT=1`.
 - **NetBSD**: release LTO is problematic in common toolchains; disable release LTO if needed (see `.cargo/config.toml` comments).
 - **MacOS**: Supported on both Intel and Apple Silicon natively.
 
@@ -222,7 +222,7 @@ Mamba and RWKV can be configured with either a model file or compact method stri
 - `file:/abs/or/relative/model.safetensors;policy:...`
 - `cfg:key=value,...[;policy:...]`
 
-`file:` method paths may not contain `;` because `;policy:` is the reserved method delimiter.
+`file:` method paths may contain reserved delimiters like `;` when they are percent-escaped in canonical form; raw `file:...;policy:...` strings are accepted and normalized for you.
 
 Supported `cfg:` keys:
 - RWKV7: `hidden,layers,intermediate,decay_rank,a_rank,v_rank,g_rank,seed,train,lr,stride`

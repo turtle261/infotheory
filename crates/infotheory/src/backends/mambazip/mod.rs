@@ -1144,14 +1144,11 @@ impl Compressor {
 
     /// Create compressor from a parsed method specification.
     pub fn new_from_method_spec(spec: &MethodSpec) -> Result<Self> {
-        match spec.clone() {
+        match spec {
             MethodSpec::File { path, policy } => {
-                let mut c = Self::new(&path)?;
-                if let Some(policy) = policy {
-                    let canonical_method = canonical_method_string(&MethodSpec::File {
-                        path: path.clone(),
-                        policy: Some(policy.clone()),
-                    })?;
+                let mut c = Self::new(path)?;
+                if let Some(policy) = policy.as_ref() {
+                    let canonical_method = canonical_method_string(spec)?;
                     let hidden = c.model.config().hidden_size;
                     let mut online = c.online.take().unwrap_or_else(|| {
                         OnlineRuntime::new(
@@ -1163,7 +1160,7 @@ impl Compressor {
                         )
                     });
                     online.canonical_method = canonical_method;
-                    online.policy = Some(policy);
+                    online.policy = Some(policy.clone());
                     online.needs_full_trace = online
                         .policy
                         .as_ref()
@@ -1207,14 +1204,11 @@ impl Compressor {
                     Arc::new(Model::new_random(mcfg, cfg.seed)?)
                 };
                 let mut c = Self::new_from_model(model);
-                let canonical_method = canonical_method_string(&MethodSpec::Online {
-                    cfg: cfg.clone(),
-                    policy: policy.clone(),
-                })?;
+                let canonical_method = canonical_method_string(spec)?;
                 c.online = Some(OnlineRuntime::new(
-                    cfg,
+                    cfg.clone(),
                     canonical_method,
-                    policy,
+                    policy.clone(),
                     VOCAB_SIZE,
                     c.model.config().hidden_size,
                 ));

@@ -20,7 +20,8 @@ fn bench_data() -> Vec<u8> {
 
 fn mamba_backend() -> RateBackend {
     RateBackend::MambaMethod {
-        method: "cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4,dt_rank=16,train=none,seed=7;policy:schedule=0..100:infer".to_string(),
+        method: infotheory::mambazip::parse_method_spec("cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4,dt_rank=16,train=none,seed=7;policy:schedule=0..100:infer")
+            .expect("mamba benchmark method must be valid"),
     }
 }
 

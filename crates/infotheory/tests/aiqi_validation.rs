@@ -91,7 +91,7 @@ fn aiqi_config_allows_algorithm_zpaq_when_rate_backend_overrides() {
 fn aiqi_config_rejects_zpaq_rate_backend_in_strict_mode() {
     let mut cfg = base_config();
     cfg.rate_backend = Some(RateBackend::Zpaq {
-        method: "1".to_string(),
+        method: infotheory::api::ZpaqMethodSpec::literal("1"),
     });
     let err = cfg
         .validate()
@@ -262,7 +262,7 @@ fn aiqi_seeded_policy_is_reproducible() {
 fn rate_backend_bit_predictor_rejects_zpaq_backend() {
     let err = match RateBackendBitPredictor::new(
         RateBackend::Zpaq {
-            method: "1".to_string(),
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
         },
         8,
     ) {

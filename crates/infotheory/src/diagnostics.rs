@@ -140,7 +140,7 @@ fn bits_from_prob(prob: f64) -> f64 {
     -prob.max(crate::mixture::DEFAULT_MIN_PROB).log2()
 }
 
-fn flatten_compiled_mixture(backend: &CompiledRateBackend) -> FlatSchema {
+fn flatten_compiled_mixture(backend: &CompiledRateBackend) -> Result<FlatSchema> {
     let RateBackendPlan::Mixture { experts, .. } = backend.plan() else {
         unreachable!("compiled diagnostic root must be a mixture backend");
     };
@@ -159,8 +159,8 @@ fn flatten_compiled_mixture(backend: &CompiledRateBackend) -> FlatSchema {
         non_root_ids: Vec::new(),
         root_child_ids: Vec::new(),
     };
-    flatten_experts(&mut schema, experts.as_ref(), 0, 1, "0:root", true);
-    schema
+    flatten_experts(&mut schema, experts.as_ref(), 0, 1, "0:root", true)?;
+    Ok(schema)
 }
 
 #[cfg(all(test, feature = "backend-mixture"))]
@@ -171,6 +171,7 @@ fn flatten_mixture_spec(spec: &MixtureSpec) -> FlatSchema {
     .compile()
     .unwrap_or_else(|err| panic!("failed to compile diagnostic mixture schema: {err}"));
     flatten_compiled_mixture(&backend)
+        .unwrap_or_else(|err| panic!("failed to flatten diagnostic mixture schema: {err}"))
 }
 
 fn flatten_experts(
@@ -180,15 +181,15 @@ fn flatten_experts(
     depth: usize,
     parent_path: &str,
     root_level: bool,
-) {
+) -> Result<()> {
     for expert in experts {
         let backend =
-            compiled_rate_backend_from_plan(expert.backend.clone()).unwrap_or_else(|err| {
-                panic!(
-                    "failed to compile diagnostic mixture expert '{}': {err}",
+            compiled_rate_backend_from_plan(expert.backend.clone()).with_context(|| {
+                format!(
+                    "failed to compile diagnostic mixture expert '{}'",
                     expert.name.as_deref().unwrap_or("<unnamed>")
                 )
-            });
+            })?;
         let raw_display_name = expert
             .name
             .clone()
@@ -226,9 +227,10 @@ fn flatten_experts(
                 depth + 1,
                 &node_path,
                 false,
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 fn write_nodes_tsv(path: &Path, schema: &FlatSchema) -> Result<()> {
@@ -292,7 +294,7 @@ pub fn run_ac_log_loss_mixture_bytes(
     }
     .compile()
     .map_err(anyhow::Error::msg)?;
-    let schema = flatten_compiled_mixture(&compiled_backend);
+    let schema = flatten_compiled_mixture(&compiled_backend)?;
     write_nodes_tsv(&nodes_path, &schema)?;
 
     let threads = parse_diagnostic_threads_from_env()?;

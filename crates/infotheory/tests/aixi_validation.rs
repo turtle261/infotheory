@@ -566,7 +566,7 @@ fn agent_config_rejects_zpaq_rate_backend_in_strict_mode() {
                 log_prior: 0.0,
                 max_order: -1,
                 backend: RateBackend::Zpaq {
-                    method: "1".to_string(),
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
                 },
             }],
         )),

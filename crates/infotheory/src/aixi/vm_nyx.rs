@@ -43,8 +43,9 @@ use crate::mixture::OnlineBytePredictor;
 use crate::rwkvzip::Compressor;
 use crate::spec::{
     AssetBinding, AssetRef, EnvironmentSpec, ResolvedAssetBinding, SharedMemoryPolicySpec,
-    SpecEnvironment, VmActionFilterSpec, VmEnvironmentSpec, VmRewardPolicySpec,
-    VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec,
+    SpecEnvironment, VmActionFilterSpec, VmEnvironmentSpec, VmFuzzMutatorSpec,
+    VmObservationPolicySpec, VmObservationStreamModeSpec, VmPayloadEncodingSpec,
+    VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec,
 };
 use serde_json::Value;
 use std::borrow::Cow;
@@ -106,13 +107,6 @@ impl PayloadEncoding {
             Self::Utf8 => String::from_utf8_lossy(bytes).to_string(),
             Self::Hex => hex_encode(bytes),
         }
-    }
-}
-
-fn payload_encoding_name(encoding: PayloadEncoding) -> &'static str {
-    match encoding {
-        PayloadEncoding::Utf8 => "utf8",
-        PayloadEncoding::Hex => "hex",
     }
 }
 
@@ -301,31 +295,6 @@ pub enum FuzzMutator {
     Havoc,
 }
 
-fn fuzz_mutator_name(mutator: &FuzzMutator) -> &'static str {
-    match mutator {
-        FuzzMutator::FlipBit => "flip_bit",
-        FuzzMutator::FlipByte => "flip_byte",
-        FuzzMutator::InsertByte => "insert_byte",
-        FuzzMutator::DeleteByte => "delete_byte",
-        FuzzMutator::SpliceSeed => "splice_seed",
-        FuzzMutator::ResetSeed => "reset_seed",
-        FuzzMutator::Havoc => "havoc",
-    }
-}
-
-fn parse_fuzz_mutator_name(name: &str) -> Result<FuzzMutator, String> {
-    match name {
-        "flip_bit" | "flipbit" => Ok(FuzzMutator::FlipBit),
-        "flip_byte" | "flipbyte" => Ok(FuzzMutator::FlipByte),
-        "insert_byte" | "insertbyte" => Ok(FuzzMutator::InsertByte),
-        "delete_byte" | "deletebyte" => Ok(FuzzMutator::DeleteByte),
-        "splice_seed" | "splice-seed" | "splice" => Ok(FuzzMutator::SpliceSeed),
-        "reset_seed" | "reset-seed" | "reset" => Ok(FuzzMutator::ResetSeed),
-        "havoc" => Ok(FuzzMutator::Havoc),
-        other => Err(format!("unknown VM fuzz mutator '{other}'")),
-    }
-}
-
 /// Fuzzing configuration for action generation.
 #[derive(Clone, Debug)]
 pub struct NyxFuzzConfig {
@@ -369,25 +338,6 @@ pub enum NyxObservationPolicy {
     SharedMemory,
 }
 
-fn nyx_observation_policy_name(policy: NyxObservationPolicy) -> &'static str {
-    match policy {
-        NyxObservationPolicy::FromGuest => "from_guest",
-        NyxObservationPolicy::OutputHash => "output_hash",
-        NyxObservationPolicy::RawOutput => "raw_output",
-        NyxObservationPolicy::SharedMemory => "shared_memory",
-    }
-}
-
-fn parse_nyx_observation_policy_name(name: &str) -> Result<NyxObservationPolicy, String> {
-    match name {
-        "from_guest" | "guest" | "from-guest" => Ok(NyxObservationPolicy::FromGuest),
-        "output_hash" | "hash" | "output-hash" => Ok(NyxObservationPolicy::OutputHash),
-        "raw_output" | "raw" | "raw-output" => Ok(NyxObservationPolicy::RawOutput),
-        "shared_memory" | "shared-memory" | "shm" => Ok(NyxObservationPolicy::SharedMemory),
-        other => Err(format!("unknown VM observation_policy '{other}'")),
-    }
-}
-
 /// Stream normalization mode.
 #[derive(Clone, Copy, Debug)]
 pub enum NyxObservationStreamMode {
@@ -397,23 +347,6 @@ pub enum NyxObservationStreamMode {
     Pad,
     /// Only truncate long streams.
     Truncate,
-}
-
-fn nyx_observation_stream_mode_name(mode: NyxObservationStreamMode) -> &'static str {
-    match mode {
-        NyxObservationStreamMode::PadTruncate => "pad_truncate",
-        NyxObservationStreamMode::Pad => "pad",
-        NyxObservationStreamMode::Truncate => "truncate",
-    }
-}
-
-fn parse_nyx_observation_stream_mode_name(name: &str) -> Result<NyxObservationStreamMode, String> {
-    match name {
-        "pad_truncate" | "pad-truncate" => Ok(NyxObservationStreamMode::PadTruncate),
-        "pad" => Ok(NyxObservationStreamMode::Pad),
-        "truncate" => Ok(NyxObservationStreamMode::Truncate),
-        other => Err(format!("unknown VM observation_stream_mode '{other}'")),
-    }
 }
 
 // ============================================================================
@@ -737,7 +670,10 @@ impl NyxVmConfig {
                     .iter()
                     .map(|action| encoding.encode(&action.payload))
                     .collect(),
-                encoding: payload_encoding_name(encoding).to_string(),
+                encoding: match encoding {
+                    PayloadEncoding::Utf8 => VmPayloadEncodingSpec::Utf8,
+                    PayloadEncoding::Hex => VmPayloadEncodingSpec::Hex,
+                },
             },
             NyxActionSource::Fuzz(fuzz) => VmRuntimeActionSourceSpec::Fuzz {
                 seeds: fuzz
@@ -745,12 +681,22 @@ impl NyxVmConfig {
                     .iter()
                     .map(|seed| encoding.encode(seed))
                     .collect(),
-                encoding: payload_encoding_name(encoding).to_string(),
+                encoding: match encoding {
+                    PayloadEncoding::Utf8 => VmPayloadEncodingSpec::Utf8,
+                    PayloadEncoding::Hex => VmPayloadEncodingSpec::Hex,
+                },
                 mutators: fuzz
                     .mutators
                     .iter()
-                    .map(fuzz_mutator_name)
-                    .map(str::to_string)
+                    .map(|mutator| match mutator {
+                        FuzzMutator::FlipBit => VmFuzzMutatorSpec::FlipBit,
+                        FuzzMutator::FlipByte => VmFuzzMutatorSpec::FlipByte,
+                        FuzzMutator::InsertByte => VmFuzzMutatorSpec::InsertByte,
+                        FuzzMutator::DeleteByte => VmFuzzMutatorSpec::DeleteByte,
+                        FuzzMutator::SpliceSeed => VmFuzzMutatorSpec::SpliceSeed,
+                        FuzzMutator::ResetSeed => VmFuzzMutatorSpec::ResetSeed,
+                        FuzzMutator::Havoc => VmFuzzMutatorSpec::Havoc,
+                    })
                     .collect(),
                 min_len: fuzz.min_len,
                 max_len: fuzz.max_len,
@@ -793,11 +739,19 @@ impl NyxVmConfig {
             boot_timeout_ms: self.boot_timeout.as_millis() as u64,
             episode_steps: self.episode_steps,
             step_cost: self.step_cost,
-            observation_policy: nyx_observation_policy_name(self.observation_policy).to_string(),
+            observation_policy: match self.observation_policy {
+                NyxObservationPolicy::FromGuest => VmObservationPolicySpec::FromGuest,
+                NyxObservationPolicy::OutputHash => VmObservationPolicySpec::OutputHash,
+                NyxObservationPolicy::RawOutput => VmObservationPolicySpec::RawOutput,
+                NyxObservationPolicy::SharedMemory => VmObservationPolicySpec::SharedMemory,
+            },
             observation_bits: self.observation_bits,
             observation_stream_len: self.observation_stream_len,
-            observation_stream_mode: nyx_observation_stream_mode_name(self.observation_stream_mode)
-                .to_string(),
+            observation_stream_mode: match self.observation_stream_mode {
+                NyxObservationStreamMode::PadTruncate => VmObservationStreamModeSpec::PadTruncate,
+                NyxObservationStreamMode::Pad => VmObservationStreamModeSpec::Pad,
+                NyxObservationStreamMode::Truncate => VmObservationStreamModeSpec::Truncate,
+            },
             observation_pad_byte: self.observation_pad_byte,
             reward_bits: self.reward_bits,
             reward_policy,
@@ -810,7 +764,10 @@ impl NyxVmConfig {
             rew_prefix: self.protocol.rew_prefix.clone(),
             done_prefix: self.protocol.done_prefix.clone(),
             data_prefix: self.protocol.data_prefix.clone(),
-            wire_encoding: payload_encoding_name(self.protocol.wire_encoding).to_string(),
+            wire_encoding: match self.protocol.wire_encoding {
+                PayloadEncoding::Utf8 => VmPayloadEncodingSpec::Utf8,
+                PayloadEncoding::Hex => VmPayloadEncodingSpec::Hex,
+            },
             stats_backend: self.stats_backend.clone(),
             trace: self.trace.as_ref().map(|trace| VmTraceSpec {
                 shared_region_name: trace.shared_region_name.clone(),
@@ -830,8 +787,10 @@ impl NyxVmConfig {
         spec: &VmEnvironmentSpec,
         resolved_assets: &[ResolvedAssetBinding],
     ) -> Result<Self, String> {
-        let wire_encoding = PayloadEncoding::parse(&spec.wire_encoding)
-            .ok_or_else(|| format!("unknown VM wire_encoding '{}'", spec.wire_encoding))?;
+        let wire_encoding = match spec.wire_encoding {
+            VmPayloadEncodingSpec::Utf8 => PayloadEncoding::Utf8,
+            VmPayloadEncodingSpec::Hex => PayloadEncoding::Hex,
+        };
         let reward_policy = match &spec.reward_policy {
             VmRewardPolicySpec::FromGuest => NyxRewardPolicy::FromGuest,
             VmRewardPolicySpec::Pattern {
@@ -875,8 +834,10 @@ impl NyxVmConfig {
                 payloads,
                 encoding,
             } => {
-                let encoding = PayloadEncoding::parse(encoding)
-                    .ok_or_else(|| format!("unknown VM literal action encoding '{encoding}'"))?;
+                let encoding = match encoding {
+                    VmPayloadEncodingSpec::Utf8 => PayloadEncoding::Utf8,
+                    VmPayloadEncodingSpec::Hex => PayloadEncoding::Hex,
+                };
                 let mut actions = Vec::with_capacity(payloads.len());
                 for (index, payload) in payloads.iter().enumerate() {
                     actions.push(NyxActionSpec {
@@ -897,8 +858,10 @@ impl NyxVmConfig {
                 dictionary,
                 rng_seed,
             } => {
-                let encoding = PayloadEncoding::parse(encoding)
-                    .ok_or_else(|| format!("unknown VM fuzz encoding '{encoding}'"))?;
+                let encoding = match encoding {
+                    VmPayloadEncodingSpec::Utf8 => PayloadEncoding::Utf8,
+                    VmPayloadEncodingSpec::Hex => PayloadEncoding::Hex,
+                };
                 NyxActionSource::Fuzz(NyxFuzzConfig {
                     seeds: seeds
                         .iter()
@@ -910,8 +873,16 @@ impl NyxVmConfig {
                         .collect::<Result<Vec<_>, _>>()?,
                     mutators: mutators
                         .iter()
-                        .map(|name| parse_fuzz_mutator_name(name))
-                        .collect::<Result<Vec<_>, _>>()?,
+                        .map(|mutator| match mutator {
+                            VmFuzzMutatorSpec::FlipBit => Ok(FuzzMutator::FlipBit),
+                            VmFuzzMutatorSpec::FlipByte => Ok(FuzzMutator::FlipByte),
+                            VmFuzzMutatorSpec::InsertByte => Ok(FuzzMutator::InsertByte),
+                            VmFuzzMutatorSpec::DeleteByte => Ok(FuzzMutator::DeleteByte),
+                            VmFuzzMutatorSpec::SpliceSeed => Ok(FuzzMutator::SpliceSeed),
+                            VmFuzzMutatorSpec::ResetSeed => Ok(FuzzMutator::ResetSeed),
+                            VmFuzzMutatorSpec::Havoc => Ok(FuzzMutator::Havoc),
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
                     min_len: *min_len,
                     max_len: *max_len,
                     dictionary: dictionary
@@ -964,12 +935,19 @@ impl NyxVmConfig {
             boot_timeout: Duration::from_millis(spec.boot_timeout_ms),
             episode_steps: spec.episode_steps,
             step_cost: spec.step_cost,
-            observation_policy: parse_nyx_observation_policy_name(&spec.observation_policy)?,
+            observation_policy: match spec.observation_policy {
+                VmObservationPolicySpec::FromGuest => NyxObservationPolicy::FromGuest,
+                VmObservationPolicySpec::OutputHash => NyxObservationPolicy::OutputHash,
+                VmObservationPolicySpec::RawOutput => NyxObservationPolicy::RawOutput,
+                VmObservationPolicySpec::SharedMemory => NyxObservationPolicy::SharedMemory,
+            },
             observation_bits: spec.observation_bits,
             observation_stream_len: spec.observation_stream_len,
-            observation_stream_mode: parse_nyx_observation_stream_mode_name(
-                &spec.observation_stream_mode,
-            )?,
+            observation_stream_mode: match spec.observation_stream_mode {
+                VmObservationStreamModeSpec::PadTruncate => NyxObservationStreamMode::PadTruncate,
+                VmObservationStreamModeSpec::Pad => NyxObservationStreamMode::Pad,
+                VmObservationStreamModeSpec::Truncate => NyxObservationStreamMode::Truncate,
+            },
             observation_pad_byte: spec.observation_pad_byte,
             reward_bits: spec.reward_bits,
             reward_policy,
@@ -1132,16 +1110,16 @@ enum TraceModel {
 }
 
 impl TraceModel {
-    fn predictor_backed(backend: CompiledRateBackend) -> Self {
+    fn predictor_backed(backend: CompiledRateBackend) -> anyhow::Result<Self> {
         let mut model = crate::runtime::build_rate_backend_predictor(&backend, -1, 2f64.powi(-24))
-            .unwrap_or_else(|e| panic!("predictor-backed init failed: {e}"));
+            .map_err(|e| anyhow::anyhow!("predictor-backed init failed: {e}"))?;
         model
             .begin_stream(None)
-            .unwrap_or_else(|e| panic!("predictor-backed stream init failed: {e}"));
-        TraceModel::Mixture { backend, model }
+            .map_err(|e| anyhow::anyhow!("predictor-backed stream init failed: {e}"))?;
+        Ok(TraceModel::Mixture { backend, model })
     }
 
-    fn new(backend: &CompiledRateBackend, max_order: i64) -> Self {
+    fn new(backend: &CompiledRateBackend, max_order: i64) -> anyhow::Result<Self> {
         #[cfg(not(feature = "backend-rosa"))]
         let _ = max_order;
 
@@ -1151,7 +1129,7 @@ impl TraceModel {
             crate::runtime::TraceModelStrategy::Rosa => {
                 let mut model = RosaPlus::new(max_order, false, 0, 42);
                 model.build_lm_full_bytes_no_finalize_endpos();
-                TraceModel::Rosa { model, max_order }
+                Ok(TraceModel::Rosa { model, max_order })
             }
             crate::runtime::TraceModelStrategy::PredictorBacked => {
                 TraceModel::predictor_backed(backend.clone())
@@ -1161,9 +1139,9 @@ impl TraceModel {
                 let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
                     unreachable!("trace-model strategy mismatch for ctw");
                 };
-                TraceModel::Ctw {
+                Ok(TraceModel::Ctw {
                     tree: ContextTree::new(*depth),
-                }
+                })
             }
             #[cfg(feature = "backend-ctw")]
             crate::runtime::TraceModelStrategy::FacCtw => {
@@ -1176,19 +1154,19 @@ impl TraceModel {
                     unreachable!("trace-model strategy mismatch for fac-ctw");
                 };
                 let bits_per_symbol = (*encoding_bits).clamp(1, 8);
-                TraceModel::FacCtw {
+                Ok(TraceModel::FacCtw {
                     tree: FacContextTree::new(*base_depth, bits_per_symbol),
                     bits_per_symbol,
-                }
+                })
             }
             #[cfg(feature = "backend-zpaq")]
             crate::runtime::TraceModelStrategy::Zpaq => {
                 let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
                     unreachable!("trace-model strategy mismatch for zpaq");
                 };
-                TraceModel::Zpaq {
+                Ok(TraceModel::Zpaq {
                     model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
-                }
+                })
             }
             #[cfg(feature = "backend-mamba")]
             crate::runtime::TraceModelStrategy::Mamba => {
@@ -1198,11 +1176,11 @@ impl TraceModel {
                     unreachable!("trace-model strategy mismatch for mamba");
                 };
                 let compressor = MambaCompressor::new_from_method_spec(parsed_method)
-                    .unwrap_or_else(|e| panic!("invalid mamba method for vm trace model: {e}"));
-                TraceModel::Mamba {
+                    .map_err(|e| anyhow::anyhow!("invalid mamba method for vm trace model: {e}"))?;
+                Ok(TraceModel::Mamba {
                     compressor,
                     primed: false,
-                }
+                })
             }
             #[cfg(feature = "backend-rwkv")]
             crate::runtime::TraceModelStrategy::Rwkv7 => {
@@ -1212,17 +1190,17 @@ impl TraceModel {
                     unreachable!("trace-model strategy mismatch for rwkv7");
                 };
                 let compressor = Compressor::new_from_method_spec(parsed_method)
-                    .unwrap_or_else(|e| panic!("invalid rwkv7 method for vm trace model: {e}"));
-                TraceModel::Rwkv7 {
+                    .map_err(|e| anyhow::anyhow!("invalid rwkv7 method for vm trace model: {e}"))?;
+                Ok(TraceModel::Rwkv7 {
                     compressor,
                     primed: false,
-                }
+                })
             }
             _ => unreachable!("trace-model strategy requires an unavailable backend feature"),
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "backend-rosa")]
             TraceModel::Rosa { model, max_order } => {
@@ -1250,12 +1228,13 @@ impl TraceModel {
             }
             TraceModel::Mixture { backend, model } => {
                 *model = crate::runtime::build_rate_backend_predictor(backend, -1, 2f64.powi(-24))
-                    .unwrap_or_else(|e| panic!("mixture model reset failed: {e}"));
+                    .map_err(|e| anyhow::anyhow!("mixture model reset failed: {e}"))?;
                 model
                     .begin_stream(None)
-                    .unwrap_or_else(|e| panic!("mixture stream init failed: {e}"));
+                    .map_err(|e| anyhow::anyhow!("mixture stream init failed: {e}"))?;
             }
         }
+        Ok(())
     }
 
     /// Update the model with new data and return the surprise (bits).
@@ -1450,9 +1429,10 @@ impl NyxVmEnvironment {
 
         // Initialize trace model if needed
         let trace_model = match &reward_shaping {
-            Some(NyxRewardShaping::TraceEntropy { max_order, .. }) => {
-                Some(TraceModel::new(&compiled_stats_backend, *max_order))
-            }
+            Some(NyxRewardShaping::TraceEntropy { max_order, .. }) => Some(
+                TraceModel::new(&compiled_stats_backend, *max_order)
+                    .map_err(|err| anyhow::anyhow!("failed to initialize trace model: {err}"))?,
+            ),
             _ => None,
         };
 
@@ -1467,7 +1447,11 @@ impl NyxVmEnvironment {
                     marginal_entropy_bytes(baseline_bytes)
                 } else {
                     try_entropy_rate_backend(baseline_bytes, *max_order, &compiled_stats_backend)
-                        .expect("validated vm stats backend should score baseline entropy")
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "validated vm stats_backend failed to score baseline entropy: {err}"
+                            )
+                        })?
                 };
                 Some(h)
             }
@@ -1633,7 +1617,9 @@ impl NyxVmEnvironment {
             && trace_cfg.reset_on_episode
             && let Some(model) = &mut self.trace_model
         {
-            model.reset();
+            model
+                .reset()
+                .map_err(|err| anyhow::anyhow!("failed to reset trace model: {err}"))?;
         }
 
         self.step_in_episode = 0;
@@ -1918,36 +1904,38 @@ impl NyxVmEnvironment {
     }
 
     /// Applies action filtering, returning reject reward if filtered.
-    fn filter_action(&self, payload: &[u8]) -> Option<i64> {
-        let filter = self.config.action_filter.as_ref()?;
+    fn filter_action(&self, payload: &[u8]) -> anyhow::Result<Option<i64>> {
+        let Some(filter) = self.config.action_filter.as_ref() else {
+            return Ok(None);
+        };
         if payload.is_empty() {
-            return filter.reject_reward;
+            return Ok(filter.reject_reward);
         }
 
-        let (entropy, intrinsic, novelty) = self.compute_filter_metrics(payload, filter);
+        let (entropy, intrinsic, novelty) = self.compute_filter_metrics(payload, filter)?;
 
         if let Some(min_entropy) = filter.min_entropy
             && entropy < min_entropy
         {
-            return filter.reject_reward;
+            return Ok(filter.reject_reward);
         }
         if let Some(max_entropy) = filter.max_entropy
             && entropy > max_entropy
         {
-            return filter.reject_reward;
+            return Ok(filter.reject_reward);
         }
         if let Some(min_intrinsic) = filter.min_intrinsic_dependence
             && intrinsic < min_intrinsic
         {
-            return filter.reject_reward;
+            return Ok(filter.reject_reward);
         }
         if let Some(min_novelty) = filter.min_novelty
             && filter.novelty_prior.is_some()
             && novelty < min_novelty
         {
-            return filter.reject_reward;
+            return Ok(filter.reject_reward);
         }
-        None
+        Ok(None)
     }
 
     fn wrap_action_payload(&self, payload: &[u8]) -> Vec<u8> {
@@ -1958,13 +1946,19 @@ impl NyxVmEnvironment {
         wrapped
     }
 
-    fn compute_filter_metrics(&self, payload: &[u8], filter: &NyxActionFilter) -> (f64, f64, f64) {
+    fn compute_filter_metrics(
+        &self,
+        payload: &[u8],
+        filter: &NyxActionFilter,
+    ) -> anyhow::Result<(f64, f64, f64)> {
         let h_marg = marginal_entropy_bytes(payload);
         let h_rate = if filter.max_order == 0 {
             h_marg
         } else {
             try_entropy_rate_backend(payload, filter.max_order, &self.compiled_stats_backend)
-                .expect("validated vm stats backend should score payload entropy")
+                .map_err(|err| {
+                    anyhow::anyhow!("vm stats backend failed to score payload entropy: {err}")
+                })?
         };
 
         let intrinsic = if h_marg < 1e-9 {
@@ -1980,16 +1974,16 @@ impl NyxVmEnvironment {
                 filter.max_order,
                 &self.compiled_stats_backend,
             )
-            .expect("validated vm stats backend should score novelty")
+            .map_err(|err| anyhow::anyhow!("vm stats backend failed to score novelty: {err}"))?
         } else {
             0.0
         };
 
-        (h_rate, intrinsic, novelty)
+        Ok((h_rate, intrinsic, novelty))
     }
 
     /// Computes reward from step result.
-    fn compute_reward(&mut self, result: &NyxStepResult) -> Reward {
+    fn compute_reward(&mut self, result: &NyxStepResult) -> anyhow::Result<Reward> {
         let base_reward = match &self.config.reward_policy {
             NyxRewardPolicy::FromGuest => result.parsed_rew.unwrap_or(0),
             NyxRewardPolicy::Pattern {
@@ -2009,7 +2003,7 @@ impl NyxVmEnvironment {
         };
 
         let shaping_reward = if let Some(shaping) = self.reward_shaping.clone() {
-            self.compute_reward_shaping(&shaping, result)
+            self.compute_reward_shaping(&shaping, result)?
         } else {
             0
         };
@@ -2019,15 +2013,15 @@ impl NyxVmEnvironment {
         reward = reward.saturating_sub(self.config.step_cost);
         let min_reward = self.min_reward();
         let max_reward = self.max_reward();
-        reward.clamp(min_reward, max_reward)
+        Ok(reward.clamp(min_reward, max_reward))
     }
 
     fn compute_reward_shaping(
         &mut self,
         shaping: &NyxRewardShaping,
         result: &NyxStepResult,
-    ) -> Reward {
-        match shaping {
+    ) -> anyhow::Result<Reward> {
+        Ok(match shaping {
             NyxRewardShaping::EntropyReduction {
                 max_order,
                 scale,
@@ -2045,7 +2039,11 @@ impl NyxVmEnvironment {
                         marginal_entropy_bytes(data)
                     } else {
                         try_entropy_rate_backend(data, *max_order, &self.compiled_stats_backend)
-                            .expect("validated vm stats backend should score observation entropy")
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "vm stats backend failed to score observation entropy: {err}"
+                                )
+                            })?
                     };
                     let h_base = self.baseline_entropy.unwrap_or(0.0);
                     let er = (h_base - h_obs) * scale;
@@ -2084,7 +2082,7 @@ impl NyxVmEnvironment {
                 };
                 (bits * scale).round() as i64
             }
-        }
+        })
     }
 
     fn mask_observation(&self, value: u64) -> u64 {
@@ -2197,10 +2195,13 @@ impl NyxVmEnvironment {
     }
 
     /// Resets trace model.
-    pub fn reset_trace_model(&mut self) {
+    pub fn reset_trace_model(&mut self) -> anyhow::Result<()> {
         if let Some(model) = &mut self.trace_model {
-            model.reset();
+            model
+                .reset()
+                .map_err(|err| anyhow::anyhow!("failed to reset trace model: {err}"))?;
         }
+        Ok(())
     }
 
     /// Logs crashes and interesting behaviors to file.
@@ -2275,16 +2276,33 @@ impl Environment for NyxVmEnvironment {
         };
 
         // Check action filter
-        if let Some(reject_reward) = self.filter_action(&payload) {
-            self.obs = 0;
-            self.rew = reject_reward.clamp(self.min_reward(), self.max_reward());
-            self.obs_stream.clear();
-            self.obs_stream.push(0);
-            self.step_in_episode = (self.step_in_episode + 1) % self.config.episode_steps;
-            if self.step_in_episode == 0 {
-                self.needs_reset = true;
+        match self.filter_action(&payload) {
+            Ok(Some(reject_reward)) => {
+                self.obs = 0;
+                self.rew = reject_reward.clamp(self.min_reward(), self.max_reward());
+                self.obs_stream.clear();
+                self.obs_stream.push(0);
+                self.step_in_episode = (self.step_in_episode + 1) % self.config.episode_steps;
+                if self.step_in_episode == 0 {
+                    self.needs_reset = true;
+                }
+                return;
             }
-            return;
+            Ok(None) => {}
+            Err(e) => {
+                if self.config.debug_mode {
+                    eprintln!("[NyxVm] Action filter scoring failed: {}", e);
+                }
+                self.obs = 0;
+                self.rew = self.min_reward();
+                self.obs_stream.clear();
+                self.obs_stream.push(0);
+                self.step_in_episode = (self.step_in_episode + 1) % self.config.episode_steps;
+                if self.step_in_episode == 0 {
+                    self.needs_reset = true;
+                }
+                return;
+            }
         }
 
         // Run the step
@@ -2310,7 +2328,15 @@ impl Environment for NyxVmEnvironment {
         // Process results
         self.obs_stream = self.build_observation_stream(&result);
         self.obs = self.obs_stream.first().copied().unwrap_or(0);
-        self.rew = self.compute_reward(&result);
+        self.rew = match self.compute_reward(&result) {
+            Ok(reward) => reward,
+            Err(e) => {
+                if self.config.debug_mode {
+                    eprintln!("[NyxVm] Reward computation failed: {}", e);
+                }
+                self.min_reward()
+            }
+        };
 
         // Log crashes and interesting behaviors
         self.log_crash(&payload, &result, self.rew);
@@ -2580,10 +2606,10 @@ mod tests {
             boot_timeout_ms: 1_250,
             episode_steps: 8,
             step_cost: -1,
-            observation_policy: "output_hash".to_string(),
+            observation_policy: VmObservationPolicySpec::OutputHash,
             observation_bits: 8,
             observation_stream_len: 16,
-            observation_stream_mode: "pad_truncate".to_string(),
+            observation_stream_mode: VmObservationStreamModeSpec::PadTruncate,
             observation_pad_byte: 0x7f,
             reward_bits: 8,
             reward_policy: VmRewardPolicySpec::Pattern {
@@ -2601,7 +2627,7 @@ mod tests {
             action_source: VmRuntimeActionSourceSpec::Literal {
                 names: vec![Some("hi".to_string())],
                 payloads: vec!["6869".to_string()],
-                encoding: "hex".to_string(),
+                encoding: VmPayloadEncodingSpec::Hex,
             },
             action_filter: Some(VmActionFilterSpec {
                 min_entropy: Some(0.1),
@@ -2618,7 +2644,7 @@ mod tests {
             rew_prefix: "REW ".to_string(),
             done_prefix: "DONE ".to_string(),
             data_prefix: "DATA ".to_string(),
-            wire_encoding: "utf8".to_string(),
+            wire_encoding: VmPayloadEncodingSpec::Utf8,
             stats_backend: RateBackend::Ctw { depth: 8 },
             trace: Some(VmTraceSpec {
                 shared_region_name: Some("trace".to_string()),
@@ -2728,18 +2754,18 @@ mod tests {
             boot_timeout_ms: 1_250,
             episode_steps: 8,
             step_cost: -1,
-            observation_policy: "hash".to_string(),
+            observation_policy: VmObservationPolicySpec::OutputHash,
             observation_bits: 8,
             observation_stream_len: 16,
-            observation_stream_mode: "pad-truncate".to_string(),
+            observation_stream_mode: VmObservationStreamModeSpec::PadTruncate,
             observation_pad_byte: 0x00,
             reward_bits: 8,
             reward_policy: VmRewardPolicySpec::FromGuest,
             reward_shaping: None,
             action_source: VmRuntimeActionSourceSpec::Fuzz {
                 seeds: vec!["seed".to_string()],
-                encoding: "text".to_string(),
-                mutators: vec!["flipbit".to_string(), "splice".to_string()],
+                encoding: VmPayloadEncodingSpec::Utf8,
+                mutators: vec![VmFuzzMutatorSpec::FlipBit, VmFuzzMutatorSpec::SpliceSeed],
                 min_len: 1,
                 max_len: 8,
                 dictionary: vec!["dict".to_string()],
@@ -2752,7 +2778,7 @@ mod tests {
             rew_prefix: "REW ".to_string(),
             done_prefix: "DONE ".to_string(),
             data_prefix: "DATA ".to_string(),
-            wire_encoding: "text".to_string(),
+            wire_encoding: VmPayloadEncodingSpec::Utf8,
             stats_backend: RateBackend::Ctw { depth: 8 },
             trace: None,
             debug_mode: false,
@@ -2850,10 +2876,10 @@ mod tests {
 
         for backend in backends {
             let compiled = backend.compile().expect("compiled trace backend");
-            let mut model = TraceModel::new(&compiled, 4);
+            let mut model = TraceModel::new(&compiled, 4).expect("trace model should initialize");
             let bits = model.update_and_score(b"trace payload");
             assert!(bits.is_finite() && bits >= 0.0, "bits={bits}");
-            model.reset();
+            model.reset().expect("trace model should reset");
             let bits_after_reset = model.update_and_score(b"trace payload");
             assert!(
                 bits_after_reset.is_finite() && bits_after_reset >= 0.0,

@@ -796,7 +796,9 @@ impl PyRateBackend {
         infotheory::spec::resolve_enabled_rate_backend_name("zpaq").map_err(py_spec_value_error)?;
         Ok(Self {
             inner: RateBackend::Zpaq {
-                method: method.unwrap_or_else(|| "2".to_string()),
+                method: infotheory::api::ZpaqMethodSpec::literal(
+                    method.unwrap_or_else(|| "2".to_string()),
+                ),
             },
         })
     }
@@ -879,7 +881,9 @@ impl PyCompressionBackend {
             .map_err(py_spec_value_error)?;
         Ok(Self {
             inner: CompressionBackend::Zpaq {
-                method: method.unwrap_or_else(|| "5".to_string()),
+                method: infotheory::api::ZpaqMethodSpec::literal(
+                    method.unwrap_or_else(|| "5".to_string()),
+                ),
             },
         })
     }

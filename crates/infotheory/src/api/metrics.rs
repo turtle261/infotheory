@@ -282,6 +282,7 @@ pub fn try_ned_cons_bytes(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResul
 /// Marginal constructive normalized entropy distance:
 /// `(H(X,Y) - min(H(X), H(Y))) / H(X,Y)`.
 pub fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let (x, y) = aligned_prefix(x, y);
     let h_x = marginal_entropy_bytes(x);
     let h_y = marginal_entropy_bytes(y);
     let h_xy = joint_marginal_entropy_bytes(x, y);

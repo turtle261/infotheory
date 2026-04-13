@@ -2,9 +2,8 @@
 
 use super::core::{AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend};
 use super::{
-    SpecEnvironment, SpecError, SpecResult, compression_backend_to_canonical_json,
-    compression_backend_to_json_value, parse_compression_backend_json, parse_rate_backend_json,
-    rate_backend_to_canonical_json, rate_backend_to_json_value,
+    SpecEnvironment, SpecError, SpecResult, compression_backend_to_json_value,
+    parse_compression_backend_json, parse_rate_backend_json, rate_backend_to_json_value,
 };
 use crate::aixi::common::{
     ObservationKeyMode, bits_for_cardinality, validate_reward_encoding_bounds,
@@ -142,6 +141,58 @@ pub struct VmTraceSpec {
     pub reset_on_episode: bool,
 }
 
+/// Canonical observation derivation modes for VM environments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmObservationPolicySpec {
+    /// Parse observations from the guest protocol.
+    FromGuest,
+    /// Hash guest output into the observation stream.
+    OutputHash,
+    /// Use raw guest output bytes directly.
+    RawOutput,
+    /// Read observations from shared memory.
+    SharedMemory,
+}
+
+/// Canonical normalization modes for VM observation streams.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmObservationStreamModeSpec {
+    /// Pad short streams and truncate long streams.
+    PadTruncate,
+    /// Only pad short streams.
+    Pad,
+    /// Only truncate long streams.
+    Truncate,
+}
+
+/// Canonical payload encodings for VM action and protocol payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmPayloadEncodingSpec {
+    /// Interpret payload strings as UTF-8 text.
+    Utf8,
+    /// Interpret payload strings as hexadecimal bytes.
+    Hex,
+}
+
+/// Canonical fuzz mutator choices for VM action generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmFuzzMutatorSpec {
+    /// Flip one random bit.
+    FlipBit,
+    /// Flip one random byte.
+    FlipByte,
+    /// Insert one random byte.
+    InsertByte,
+    /// Delete one random byte.
+    DeleteByte,
+    /// Splice in bytes from another seed.
+    SpliceSeed,
+    /// Reset to a seed input.
+    ResetSeed,
+    /// Apply a short random mutation sequence.
+    Havoc,
+}
+
 /// Canonical runtime action source for VM environments.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VmRuntimeActionSourceSpec {
@@ -152,16 +203,16 @@ pub enum VmRuntimeActionSourceSpec {
         /// Action payloads encoded with the selected payload encoding.
         payloads: Vec<String>,
         /// Payload encoding applied to all literals.
-        encoding: String,
+        encoding: VmPayloadEncodingSpec,
     },
     /// Mutation-based fuzzing configuration.
     Fuzz {
         /// Seed inputs encoded with the selected payload encoding.
         seeds: Vec<String>,
         /// Payload encoding applied to seeds and dictionary entries.
-        encoding: String,
+        encoding: VmPayloadEncodingSpec,
         /// Enabled mutators by canonical name.
-        mutators: Vec<String>,
+        mutators: Vec<VmFuzzMutatorSpec>,
         /// Minimum generated payload length.
         min_len: usize,
         /// Maximum generated payload length.
@@ -195,13 +246,13 @@ pub struct VmEnvironmentSpec {
     /// Per-step cost subtracted from rewards.
     pub step_cost: i64,
     /// Observation derivation mode.
-    pub observation_policy: String,
+    pub observation_policy: VmObservationPolicySpec,
     /// Observation bit width.
     pub observation_bits: usize,
     /// Observation stream length.
     pub observation_stream_len: usize,
     /// Observation stream normalization mode.
-    pub observation_stream_mode: String,
+    pub observation_stream_mode: VmObservationStreamModeSpec,
     /// Padding byte for short observation streams.
     pub observation_pad_byte: u8,
     /// Reward bit width.
@@ -227,7 +278,7 @@ pub struct VmEnvironmentSpec {
     /// Protocol data prefix.
     pub data_prefix: String,
     /// Payload encoding label (`utf8` or `hex`).
-    pub wire_encoding: String,
+    pub wire_encoding: VmPayloadEncodingSpec,
     /// Rate backend used for entropy/statistics estimation.
     pub stats_backend: RateBackend,
     /// Optional trace configuration.
@@ -1320,12 +1371,12 @@ fn canonicalize_controller_spec(
 }
 
 #[cfg(feature = "vm")]
-fn canonicalize_vm_observation_policy_name(name: &str) -> SpecResult<String> {
+fn canonicalize_vm_observation_policy_name(name: &str) -> SpecResult<VmObservationPolicySpec> {
     match name {
-        "from_guest" | "guest" | "from-guest" => Ok("from_guest".to_string()),
-        "output_hash" | "hash" | "output-hash" => Ok("output_hash".to_string()),
-        "raw_output" | "raw" | "raw-output" => Ok("raw_output".to_string()),
-        "shared_memory" | "shared-memory" | "shm" => Ok("shared_memory".to_string()),
+        "from_guest" | "guest" | "from-guest" => Ok(VmObservationPolicySpec::FromGuest),
+        "output_hash" | "hash" | "output-hash" => Ok(VmObservationPolicySpec::OutputHash),
+        "raw_output" | "raw" | "raw-output" => Ok(VmObservationPolicySpec::RawOutput),
+        "shared_memory" | "shared-memory" | "shm" => Ok(VmObservationPolicySpec::SharedMemory),
         other => Err(SpecError::new(format!(
             "unknown VM observation_policy '{other}'"
         ))),
@@ -1333,11 +1384,13 @@ fn canonicalize_vm_observation_policy_name(name: &str) -> SpecResult<String> {
 }
 
 #[cfg(feature = "vm")]
-fn canonicalize_vm_observation_stream_mode_name(name: &str) -> SpecResult<String> {
+fn canonicalize_vm_observation_stream_mode_name(
+    name: &str,
+) -> SpecResult<VmObservationStreamModeSpec> {
     match name {
-        "pad_truncate" | "pad-truncate" => Ok("pad_truncate".to_string()),
-        "pad" => Ok("pad".to_string()),
-        "truncate" => Ok("truncate".to_string()),
+        "pad_truncate" | "pad-truncate" => Ok(VmObservationStreamModeSpec::PadTruncate),
+        "pad" => Ok(VmObservationStreamModeSpec::Pad),
+        "truncate" => Ok(VmObservationStreamModeSpec::Truncate),
         other => Err(SpecError::new(format!(
             "unknown VM observation_stream_mode '{other}'"
         ))),
@@ -1345,10 +1398,13 @@ fn canonicalize_vm_observation_stream_mode_name(name: &str) -> SpecResult<String
 }
 
 #[cfg(feature = "vm")]
-fn canonicalize_vm_payload_encoding(name: &str, field_name: &str) -> SpecResult<String> {
+fn canonicalize_vm_payload_encoding(
+    name: &str,
+    field_name: &str,
+) -> SpecResult<VmPayloadEncodingSpec> {
     match name {
-        "utf8" | "text" => Ok("utf8".to_string()),
-        "hex" => Ok("hex".to_string()),
+        "utf8" | "text" => Ok(VmPayloadEncodingSpec::Utf8),
+        "hex" => Ok(VmPayloadEncodingSpec::Hex),
         other => Err(SpecError::new(format!(
             "unknown VM payload encoding '{other}' for {field_name}"
         ))),
@@ -1356,15 +1412,15 @@ fn canonicalize_vm_payload_encoding(name: &str, field_name: &str) -> SpecResult<
 }
 
 #[cfg(feature = "vm")]
-fn canonicalize_vm_fuzz_mutator_name(name: &str) -> SpecResult<String> {
+fn canonicalize_vm_fuzz_mutator_name(name: &str) -> SpecResult<VmFuzzMutatorSpec> {
     match name {
-        "flip_bit" | "flipbit" => Ok("flip_bit".to_string()),
-        "flip_byte" | "flipbyte" => Ok("flip_byte".to_string()),
-        "insert_byte" | "insertbyte" => Ok("insert_byte".to_string()),
-        "delete_byte" | "deletebyte" => Ok("delete_byte".to_string()),
-        "splice_seed" | "splice-seed" | "splice" => Ok("splice_seed".to_string()),
-        "reset_seed" | "reset-seed" | "reset" => Ok("reset_seed".to_string()),
-        "havoc" => Ok("havoc".to_string()),
+        "flip_bit" | "flipbit" => Ok(VmFuzzMutatorSpec::FlipBit),
+        "flip_byte" | "flipbyte" => Ok(VmFuzzMutatorSpec::FlipByte),
+        "insert_byte" | "insertbyte" => Ok(VmFuzzMutatorSpec::InsertByte),
+        "delete_byte" | "deletebyte" => Ok(VmFuzzMutatorSpec::DeleteByte),
+        "splice_seed" | "splice-seed" | "splice" => Ok(VmFuzzMutatorSpec::SpliceSeed),
+        "reset_seed" | "reset-seed" | "reset" => Ok(VmFuzzMutatorSpec::ResetSeed),
+        "havoc" => Ok(VmFuzzMutatorSpec::Havoc),
         other => Err(SpecError::new(format!("unknown VM fuzz mutator '{other}'"))),
     }
 }
@@ -1381,10 +1437,7 @@ fn canonicalize_vm_action_source(
         } => Ok(VmRuntimeActionSourceSpec::Literal {
             names: names.clone(),
             payloads: payloads.clone(),
-            encoding: canonicalize_vm_payload_encoding(
-                encoding,
-                "environment.action_source.encoding",
-            )?,
+            encoding: *encoding,
         }),
         VmRuntimeActionSourceSpec::Fuzz {
             seeds,
@@ -1412,14 +1465,8 @@ fn canonicalize_vm_action_source(
             }
             Ok(VmRuntimeActionSourceSpec::Fuzz {
                 seeds: seeds.clone(),
-                encoding: canonicalize_vm_payload_encoding(
-                    encoding,
-                    "environment.action_source.encoding",
-                )?,
-                mutators: mutators
-                    .iter()
-                    .map(|name| canonicalize_vm_fuzz_mutator_name(name))
-                    .collect::<SpecResult<Vec<_>>>()?,
+                encoding: *encoding,
+                mutators: mutators.clone(),
                 min_len: *min_len,
                 max_len: *max_len,
                 dictionary: dictionary.clone(),
@@ -1451,11 +1498,6 @@ fn canonicalize_vm_environment_spec(
         return Err(SpecError::new("environment.episode_steps must be >= 1"));
     }
     let mut canonical = vm.clone();
-    canonical.observation_policy = canonicalize_vm_observation_policy_name(&vm.observation_policy)?;
-    canonical.observation_stream_mode =
-        canonicalize_vm_observation_stream_mode_name(&vm.observation_stream_mode)?;
-    canonical.wire_encoding =
-        canonicalize_vm_payload_encoding(&vm.wire_encoding, "environment.protocol.wire_encoding")?;
     canonical.action_source = canonicalize_vm_action_source(&vm.action_source)?;
     Ok(canonical)
 }
@@ -1664,10 +1706,10 @@ fn environment_spec_to_json_value(spec: &EnvironmentSpec) -> SpecResult<serde_js
             "boot_timeout_ms": vm.boot_timeout_ms,
             "episode_steps": vm.episode_steps,
             "step_cost": vm.step_cost,
-            "observation_policy": vm.observation_policy,
+            "observation_policy": vm_observation_policy_name(vm.observation_policy),
             "observation_bits": vm.observation_bits,
             "observation_stream_len": vm.observation_stream_len,
-            "observation_stream_mode": vm.observation_stream_mode,
+            "observation_stream_mode": vm_observation_stream_mode_name(vm.observation_stream_mode),
             "observation_pad_byte": vm.observation_pad_byte,
             "reward_bits": vm.reward_bits,
             "reward_policy": vm_reward_policy_to_json_value(&vm.reward_policy),
@@ -1681,7 +1723,7 @@ fn environment_spec_to_json_value(spec: &EnvironmentSpec) -> SpecResult<serde_js
                 "rew_prefix": vm.rew_prefix,
                 "done_prefix": vm.done_prefix,
                 "data_prefix": vm.data_prefix,
-                "wire_encoding": vm.wire_encoding,
+                "wire_encoding": vm_payload_encoding_name(vm.wire_encoding),
             },
             "stats_backend": rate_backend_to_json_value(&vm.stats_backend)?,
             "trace": vm.trace.as_ref().map(vm_trace_to_json_value),
@@ -1860,7 +1902,7 @@ fn vm_action_source_to_json_value(spec: &VmRuntimeActionSourceSpec) -> serde_jso
             encoding,
         } => serde_json::json!({
             "kind": "literal",
-            "encoding": encoding,
+            "encoding": vm_payload_encoding_name(*encoding),
             "actions": payloads.iter().enumerate().map(|(idx, payload)| serde_json::json!({
                 "name": names.get(idx).cloned().flatten(),
                 "payload": payload,
@@ -1876,9 +1918,9 @@ fn vm_action_source_to_json_value(spec: &VmRuntimeActionSourceSpec) -> serde_jso
             rng_seed,
         } => serde_json::json!({
             "kind": "fuzz",
-            "encoding": encoding,
+            "encoding": vm_payload_encoding_name(*encoding),
             "seeds": seeds,
-            "mutators": mutators,
+            "mutators": mutators.iter().map(|mutator| vm_fuzz_mutator_name(*mutator)).collect::<Vec<_>>(),
             "min_len": min_len,
             "max_len": max_len,
             "dictionary": dictionary,
@@ -2039,12 +2081,18 @@ fn parse_environment_spec(
             boot_timeout_ms: value["boot_timeout_ms"].as_u64().unwrap_or(30_000),
             episode_steps: value["episode_steps"].as_u64().unwrap_or(100) as usize,
             step_cost: value["step_cost"].as_i64().unwrap_or(0),
-            observation_policy: optional_string(&value["observation_policy"])
-                .unwrap_or_else(|| "shared_memory".to_string()),
+            observation_policy: canonicalize_vm_observation_policy_name(
+                value["observation_policy"]
+                    .as_str()
+                    .unwrap_or("shared_memory"),
+            )?,
             observation_bits: value["observation_bits"].as_u64().unwrap_or(8) as usize,
             observation_stream_len: value["observation_stream_len"].as_u64().unwrap_or(64) as usize,
-            observation_stream_mode: optional_string(&value["observation_stream_mode"])
-                .unwrap_or_else(|| "pad_truncate".to_string()),
+            observation_stream_mode: canonicalize_vm_observation_stream_mode_name(
+                value["observation_stream_mode"]
+                    .as_str()
+                    .unwrap_or("pad_truncate"),
+            )?,
             observation_pad_byte: value["observation_pad_byte"].as_u64().unwrap_or(0) as u8,
             reward_bits: value["reward_bits"].as_u64().unwrap_or(8) as usize,
             reward_policy: parse_vm_reward_policy(&value["reward_policy"])?,
@@ -2075,10 +2123,10 @@ fn parse_environment_spec(
                 .as_str()
                 .unwrap_or("DATA ")
                 .to_string(),
-            wire_encoding: value["protocol"]["wire_encoding"]
-                .as_str()
-                .unwrap_or("hex")
-                .to_string(),
+            wire_encoding: canonicalize_vm_payload_encoding(
+                value["protocol"]["wire_encoding"].as_str().unwrap_or("hex"),
+                "environment.protocol.wire_encoding",
+            )?,
             stats_backend: parse_rate_backend_json(
                 &value["stats_backend"],
                 base_dir,
@@ -2366,7 +2414,10 @@ fn parse_optional_vm_reward_shaping(
 fn parse_vm_action_source(value: &serde_json::Value) -> SpecResult<VmRuntimeActionSourceSpec> {
     match value["kind"].as_str().unwrap_or("literal") {
         "literal" => {
-            let encoding = value["encoding"].as_str().unwrap_or("utf8").to_string();
+            let encoding = canonicalize_vm_payload_encoding(
+                value["encoding"].as_str().unwrap_or("utf8"),
+                "environment.action_source.encoding",
+            )?;
             let actions = value["actions"]
                 .as_array()
                 .ok_or_else(|| SpecError::new("environment.action_source.actions is required"))?;
@@ -2387,8 +2438,14 @@ fn parse_vm_action_source(value: &serde_json::Value) -> SpecResult<VmRuntimeActi
         }
         "fuzz" => Ok(VmRuntimeActionSourceSpec::Fuzz {
             seeds: string_list(&value["seeds"])?,
-            encoding: value["encoding"].as_str().unwrap_or("utf8").to_string(),
-            mutators: string_list(&value["mutators"])?,
+            encoding: canonicalize_vm_payload_encoding(
+                value["encoding"].as_str().unwrap_or("utf8"),
+                "environment.action_source.encoding",
+            )?,
+            mutators: string_list(&value["mutators"])?
+                .into_iter()
+                .map(|name| canonicalize_vm_fuzz_mutator_name(&name))
+                .collect::<SpecResult<Vec<_>>>()?,
             min_len: value["min_len"].as_u64().unwrap_or(1) as usize,
             max_len: value["max_len"].as_u64().unwrap_or(4096) as usize,
             dictionary: string_list(&value["dictionary"])?,
@@ -2445,11 +2502,11 @@ fn encode_spec_document_payload(doc: &SpecDocument) -> Vec<u8> {
         }
         SpecDocument::RateBackend(backend) => {
             out.push(2);
-            push_string(&mut out, &backend.to_canonical_json().unwrap_or_default());
+            encode_rate_backend(&mut out, backend);
         }
         SpecDocument::CompressionBackend(backend) => {
             out.push(3);
-            push_string(&mut out, &backend.to_canonical_json().unwrap_or_default());
+            encode_compression_backend(&mut out, backend);
         }
     }
     out
@@ -2473,27 +2530,13 @@ fn decode_spec_document(bytes: &[u8], base_dir: &Path) -> SpecResult<SpecDocumen
             base_dir,
         )?)),
         1 => Ok(SpecDocument::Tune(decode_tune_spec(&mut cursor, base_dir)?)),
-        2 => {
-            let json = cursor.read_string()?;
-            let value: serde_json::Value = serde_json::from_str(&json)?;
-            Ok(SpecDocument::RateBackend(parse_rate_backend_json(
-                &value,
-                base_dir,
-                crate::api::MAX_MIXTURE_NESTING,
-            )?))
-        }
-        3 => {
-            let json = cursor.read_string()?;
-            let value: serde_json::Value = serde_json::from_str(&json)?;
-            Ok(SpecDocument::CompressionBackend(
-                parse_compression_backend_json(
-                    &value,
-                    base_dir,
-                    None,
-                    crate::compression::FramingMode::Framed,
-                )?,
-            ))
-        }
+        2 => Ok(SpecDocument::RateBackend(decode_rate_backend(
+            &mut cursor,
+            base_dir,
+        )?)),
+        3 => Ok(SpecDocument::CompressionBackend(
+            decode_compression_backend(&mut cursor, base_dir)?,
+        )),
         tag => Err(SpecError::new(format!("unknown spec document tag '{tag}'"))),
     }
 }
@@ -2519,10 +2562,7 @@ fn decode_planner_run(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<Pl
 fn encode_tune_spec(spec: &TuneSpec, out: &mut Vec<u8>) {
     encode_assets(&spec.assets, out);
     push_string(out, &spec.input_asset);
-    push_string(
-        out,
-        &compression_backend_to_canonical_json(&spec.baseline_candidate).unwrap_or_default(),
-    );
+    encode_compression_backend(out, &spec.baseline_candidate);
     encode_tune_controller(&spec.controller, out);
     encode_tune_bounds(&spec.bounds, out);
     push_f64(out, spec.eval_time_limit_seconds);
@@ -2537,17 +2577,10 @@ fn encode_tune_spec(spec: &TuneSpec, out: &mut Vec<u8>) {
 fn decode_tune_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<TuneSpec> {
     let assets = decode_assets(cursor)?;
     let input_asset = cursor.read_string()?;
-    let baseline_json = cursor.read_string()?;
-    let baseline_value: serde_json::Value = serde_json::from_str(&baseline_json)?;
     Ok(TuneSpec {
         assets,
         input_asset,
-        baseline_candidate: parse_compression_backend_json(
-            &baseline_value,
-            base_dir,
-            None,
-            crate::compression::FramingMode::Framed,
-        )?,
+        baseline_candidate: decode_compression_backend(cursor, base_dir)?,
         controller: decode_tune_controller(cursor)?,
         bounds: decode_tune_bounds(cursor)?,
         eval_time_limit_seconds: cursor.read_f64()?,
@@ -2580,6 +2613,672 @@ fn decode_assets(cursor: &mut Cursor<'_>) -> SpecResult<Vec<AssetBinding>> {
     Ok(assets)
 }
 
+fn encode_zpaq_method_spec(out: &mut Vec<u8>, method: &crate::api::ZpaqMethodSpec) {
+    match method {
+        crate::api::ZpaqMethodSpec::Literal { value } => {
+            out.push(0);
+            push_string(out, value);
+        }
+    }
+}
+
+fn decode_zpaq_method_spec(cursor: &mut Cursor<'_>) -> SpecResult<crate::api::ZpaqMethodSpec> {
+    match cursor.read_u8()? {
+        0 => Ok(crate::api::ZpaqMethodSpec::literal(cursor.read_string()?)),
+        tag => Err(SpecError::new(format!(
+            "unknown zpaq method spec tag '{tag}'"
+        ))),
+    }
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn encode_llm_position_expr(out: &mut Vec<u8>, expr: &crate::backends::llm_policy::PositionExpr) {
+    match expr {
+        crate::backends::llm_policy::PositionExpr::Bytes(value) => {
+            out.push(0);
+            push_u64(out, *value);
+        }
+        crate::backends::llm_policy::PositionExpr::Percent(value) => {
+            out.push(1);
+            push_f64(out, *value);
+        }
+    }
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn decode_llm_position_expr(
+    cursor: &mut Cursor<'_>,
+) -> SpecResult<crate::backends::llm_policy::PositionExpr> {
+    match cursor.read_u8()? {
+        0 => Ok(crate::backends::llm_policy::PositionExpr::Bytes(
+            cursor.read_u64()?,
+        )),
+        1 => Ok(crate::backends::llm_policy::PositionExpr::Percent(
+            cursor.read_f64()?,
+        )),
+        tag => Err(SpecError::new(format!(
+            "unknown llm position expr tag '{tag}'"
+        ))),
+    }
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn encode_optimizer_kind(out: &mut Vec<u8>, kind: crate::backends::llm_policy::OptimizerKind) {
+    out.push(match kind {
+        crate::backends::llm_policy::OptimizerKind::Sgd => 0,
+        crate::backends::llm_policy::OptimizerKind::Adam => 1,
+    });
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn decode_optimizer_kind(
+    cursor: &mut Cursor<'_>,
+) -> SpecResult<crate::backends::llm_policy::OptimizerKind> {
+    match cursor.read_u8()? {
+        0 => Ok(crate::backends::llm_policy::OptimizerKind::Sgd),
+        1 => Ok(crate::backends::llm_policy::OptimizerKind::Adam),
+        tag => Err(SpecError::new(format!(
+            "unknown optimizer kind tag '{tag}'"
+        ))),
+    }
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn encode_train_scope_set(out: &mut Vec<u8>, scope: &crate::backends::llm_policy::TrainScopeSet) {
+    push_bool(out, scope.all);
+    push_string_list(out, &scope.names);
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn decode_train_scope_set(
+    cursor: &mut Cursor<'_>,
+) -> SpecResult<crate::backends::llm_policy::TrainScopeSet> {
+    Ok(crate::backends::llm_policy::TrainScopeSet {
+        all: cursor.read_bool()?,
+        names: cursor.read_string_list()?,
+    })
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn encode_policy_action(out: &mut Vec<u8>, action: &crate::backends::llm_policy::PolicyAction) {
+    match action {
+        crate::backends::llm_policy::PolicyAction::Infer => out.push(0),
+        crate::backends::llm_policy::PolicyAction::Train(train) => {
+            out.push(1);
+            encode_train_scope_set(out, &train.scope);
+            encode_optimizer_kind(out, train.optimizer);
+            push_f64(out, train.hyper.lr as f64);
+            push_u64(out, train.hyper.stride as u64);
+            push_u64(out, train.hyper.bptt as u64);
+            push_f64(out, train.hyper.clip as f64);
+            push_f64(out, train.hyper.momentum as f64);
+        }
+    }
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn decode_policy_action(
+    cursor: &mut Cursor<'_>,
+) -> SpecResult<crate::backends::llm_policy::PolicyAction> {
+    match cursor.read_u8()? {
+        0 => Ok(crate::backends::llm_policy::PolicyAction::Infer),
+        1 => Ok(crate::backends::llm_policy::PolicyAction::Train(
+            crate::backends::llm_policy::TrainAction {
+                scope: decode_train_scope_set(cursor)?,
+                optimizer: decode_optimizer_kind(cursor)?,
+                hyper: crate::backends::llm_policy::OptimizerHyperParams {
+                    lr: cursor.read_f64()? as f32,
+                    stride: cursor.read_u64()? as usize,
+                    bptt: cursor.read_u64()? as usize,
+                    clip: cursor.read_f64()? as f32,
+                    momentum: cursor.read_f64()? as f32,
+                },
+            },
+        )),
+        tag => Err(SpecError::new(format!("unknown policy action tag '{tag}'"))),
+    }
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn encode_llm_policy(out: &mut Vec<u8>, policy: Option<&crate::backends::llm_policy::LlmPolicy>) {
+    match policy {
+        Some(policy) => {
+            out.push(1);
+            push_option_string(
+                out,
+                policy
+                    .load_from
+                    .as_ref()
+                    .map(|path| path.to_string_lossy())
+                    .as_deref(),
+            );
+            push_u64(out, policy.schedule.len() as u64);
+            for rule in &policy.schedule {
+                match rule {
+                    crate::backends::llm_policy::ScheduleRule::Interval(rule) => {
+                        out.push(0);
+                        encode_llm_position_expr(out, &rule.start);
+                        encode_llm_position_expr(out, &rule.end);
+                        encode_policy_action(out, &rule.action);
+                    }
+                    crate::backends::llm_policy::ScheduleRule::Repeat(rule) => {
+                        out.push(1);
+                        encode_llm_position_expr(out, &rule.start);
+                        encode_llm_position_expr(out, &rule.end);
+                        encode_llm_position_expr(out, &rule.period);
+                        push_u64(out, rule.pattern.len() as u64);
+                        for segment in &rule.pattern {
+                            encode_llm_position_expr(out, &segment.span);
+                            encode_policy_action(out, &segment.action);
+                        }
+                    }
+                }
+            }
+        }
+        None => out.push(0),
+    }
+}
+
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+fn decode_llm_policy(
+    cursor: &mut Cursor<'_>,
+) -> SpecResult<Option<crate::backends::llm_policy::LlmPolicy>> {
+    if cursor.read_u8()? == 0 {
+        return Ok(None);
+    }
+    let load_from = cursor.read_option_string()?.map(std::path::PathBuf::from);
+    let rule_len = cursor.read_u64()? as usize;
+    let mut schedule = Vec::with_capacity(rule_len);
+    for _ in 0..rule_len {
+        match cursor.read_u8()? {
+            0 => schedule.push(crate::backends::llm_policy::ScheduleRule::Interval(
+                crate::backends::llm_policy::PolicyRule {
+                    start: decode_llm_position_expr(cursor)?,
+                    end: decode_llm_position_expr(cursor)?,
+                    action: decode_policy_action(cursor)?,
+                },
+            )),
+            1 => {
+                let start = decode_llm_position_expr(cursor)?;
+                let end = decode_llm_position_expr(cursor)?;
+                let period = decode_llm_position_expr(cursor)?;
+                let pattern_len = cursor.read_u64()? as usize;
+                let mut pattern = Vec::with_capacity(pattern_len);
+                for _ in 0..pattern_len {
+                    pattern.push(crate::backends::llm_policy::RepeatSegment {
+                        span: decode_llm_position_expr(cursor)?,
+                        action: decode_policy_action(cursor)?,
+                    });
+                }
+                schedule.push(crate::backends::llm_policy::ScheduleRule::Repeat(
+                    crate::backends::llm_policy::RepeatRule {
+                        start,
+                        end,
+                        period,
+                        pattern,
+                    },
+                ));
+            }
+            tag => {
+                return Err(SpecError::new(format!(
+                    "unknown llm policy schedule tag '{tag}'"
+                )));
+            }
+        }
+    }
+    Ok(Some(crate::backends::llm_policy::LlmPolicy {
+        load_from,
+        schedule,
+    }))
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn encode_rwkv_method_spec(out: &mut Vec<u8>, method: &crate::rwkvzip::MethodSpec) {
+    match method {
+        crate::rwkvzip::MethodSpec::File { path, policy } => {
+            out.push(0);
+            push_string(out, &path.to_string_lossy());
+            encode_llm_policy(out, policy.as_ref());
+        }
+        crate::rwkvzip::MethodSpec::Online { cfg, policy } => {
+            out.push(1);
+            push_u64(out, cfg.hidden as u64);
+            push_u64(out, cfg.layers as u64);
+            push_u64(out, cfg.intermediate as u64);
+            push_u64(out, cfg.decay_rank as u64);
+            push_u64(out, cfg.a_rank as u64);
+            push_u64(out, cfg.v_rank as u64);
+            push_u64(out, cfg.g_rank as u64);
+            push_u64(out, cfg.seed);
+            out.push(match cfg.train_mode {
+                crate::rwkvzip::OnlineTrainMode::None => 0,
+                crate::rwkvzip::OnlineTrainMode::Sgd => 1,
+                crate::rwkvzip::OnlineTrainMode::Adam => 2,
+            });
+            push_f64(out, cfg.lr as f64);
+            push_u64(out, cfg.stride as u64);
+            encode_llm_policy(out, policy.as_ref());
+        }
+    }
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn decode_rwkv_method_spec(cursor: &mut Cursor<'_>) -> SpecResult<crate::rwkvzip::MethodSpec> {
+    match cursor.read_u8()? {
+        0 => Ok(crate::rwkvzip::MethodSpec::File {
+            path: std::path::PathBuf::from(cursor.read_string()?),
+            policy: decode_llm_policy(cursor)?,
+        }),
+        1 => Ok(crate::rwkvzip::MethodSpec::Online {
+            cfg: crate::rwkvzip::OnlineConfig {
+                hidden: cursor.read_u64()? as usize,
+                layers: cursor.read_u64()? as usize,
+                intermediate: cursor.read_u64()? as usize,
+                decay_rank: cursor.read_u64()? as usize,
+                a_rank: cursor.read_u64()? as usize,
+                v_rank: cursor.read_u64()? as usize,
+                g_rank: cursor.read_u64()? as usize,
+                seed: cursor.read_u64()?,
+                train_mode: match cursor.read_u8()? {
+                    0 => crate::rwkvzip::OnlineTrainMode::None,
+                    1 => crate::rwkvzip::OnlineTrainMode::Sgd,
+                    2 => crate::rwkvzip::OnlineTrainMode::Adam,
+                    tag => {
+                        return Err(SpecError::new(format!(
+                            "unknown rwkv online train mode tag '{tag}'"
+                        )));
+                    }
+                },
+                lr: cursor.read_f64()? as f32,
+                stride: cursor.read_u64()? as usize,
+            },
+            policy: decode_llm_policy(cursor)?,
+        }),
+        tag => Err(SpecError::new(format!(
+            "unknown rwkv method spec tag '{tag}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "backend-mamba")]
+fn encode_mamba_method_spec(out: &mut Vec<u8>, method: &crate::mambazip::MethodSpec) {
+    match method {
+        crate::mambazip::MethodSpec::File { path, policy } => {
+            out.push(0);
+            push_string(out, &path.to_string_lossy());
+            encode_llm_policy(out, policy.as_ref());
+        }
+        crate::mambazip::MethodSpec::Online { cfg, policy } => {
+            out.push(1);
+            push_u64(out, cfg.hidden as u64);
+            push_u64(out, cfg.layers as u64);
+            push_u64(out, cfg.intermediate as u64);
+            push_u64(out, cfg.state as u64);
+            push_u64(out, cfg.conv as u64);
+            push_u64(out, cfg.dt_rank as u64);
+            push_u64(out, cfg.seed);
+            out.push(match cfg.train_mode {
+                crate::mambazip::OnlineTrainMode::None => 0,
+                crate::mambazip::OnlineTrainMode::Sgd => 1,
+                crate::mambazip::OnlineTrainMode::Adam => 2,
+            });
+            push_f64(out, cfg.lr as f64);
+            push_u64(out, cfg.stride as u64);
+            encode_llm_policy(out, policy.as_ref());
+        }
+    }
+}
+
+#[cfg(feature = "backend-mamba")]
+fn decode_mamba_method_spec(cursor: &mut Cursor<'_>) -> SpecResult<crate::mambazip::MethodSpec> {
+    match cursor.read_u8()? {
+        0 => Ok(crate::mambazip::MethodSpec::File {
+            path: std::path::PathBuf::from(cursor.read_string()?),
+            policy: decode_llm_policy(cursor)?,
+        }),
+        1 => Ok(crate::mambazip::MethodSpec::Online {
+            cfg: crate::mambazip::OnlineConfig {
+                hidden: cursor.read_u64()? as usize,
+                layers: cursor.read_u64()? as usize,
+                intermediate: cursor.read_u64()? as usize,
+                state: cursor.read_u64()? as usize,
+                conv: cursor.read_u64()? as usize,
+                dt_rank: cursor.read_u64()? as usize,
+                seed: cursor.read_u64()?,
+                train_mode: match cursor.read_u8()? {
+                    0 => crate::mambazip::OnlineTrainMode::None,
+                    1 => crate::mambazip::OnlineTrainMode::Sgd,
+                    2 => crate::mambazip::OnlineTrainMode::Adam,
+                    tag => {
+                        return Err(SpecError::new(format!(
+                            "unknown mamba online train mode tag '{tag}'"
+                        )));
+                    }
+                },
+                lr: cursor.read_f64()? as f32,
+                stride: cursor.read_u64()? as usize,
+            },
+            policy: decode_llm_policy(cursor)?,
+        }),
+        tag => Err(SpecError::new(format!(
+            "unknown mamba method spec tag '{tag}'"
+        ))),
+    }
+}
+
+fn encode_rate_backend(out: &mut Vec<u8>, backend: &RateBackend) {
+    match backend {
+        RateBackend::RosaPlus => out.push(0),
+        RateBackend::Match {
+            hash_bits,
+            min_len,
+            max_len,
+            base_mix,
+            confidence_scale,
+        } => {
+            out.push(1);
+            push_u64(out, *hash_bits as u64);
+            push_u64(out, *min_len as u64);
+            push_u64(out, *max_len as u64);
+            push_f64(out, *base_mix);
+            push_f64(out, *confidence_scale);
+        }
+        RateBackend::SparseMatch {
+            hash_bits,
+            min_len,
+            max_len,
+            gap_min,
+            gap_max,
+            base_mix,
+            confidence_scale,
+        } => {
+            out.push(2);
+            push_u64(out, *hash_bits as u64);
+            push_u64(out, *min_len as u64);
+            push_u64(out, *max_len as u64);
+            push_u64(out, *gap_min as u64);
+            push_u64(out, *gap_max as u64);
+            push_f64(out, *base_mix);
+            push_f64(out, *confidence_scale);
+        }
+        RateBackend::Ppmd { order, memory_mb } => {
+            out.push(3);
+            push_u64(out, *order as u64);
+            push_u64(out, *memory_mb as u64);
+        }
+        RateBackend::Sequitur { context_bytes } => {
+            out.push(4);
+            push_u64(out, *context_bytes as u64);
+        }
+        RateBackend::Ctw { depth } => {
+            out.push(5);
+            push_u64(out, *depth as u64);
+        }
+        RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits,
+            encoding_bits,
+        } => {
+            out.push(6);
+            push_u64(out, *base_depth as u64);
+            push_u64(out, *num_percept_bits as u64);
+            push_u64(out, *encoding_bits as u64);
+        }
+        RateBackend::Zpaq { method } => {
+            out.push(7);
+            encode_zpaq_method_spec(out, method);
+        }
+        #[cfg(feature = "backend-mamba")]
+        RateBackend::MambaMethod { method } => {
+            out.push(8);
+            encode_mamba_method_spec(out, method);
+        }
+        #[cfg(feature = "backend-rwkv")]
+        RateBackend::Rwkv7Method { method } => {
+            out.push(9);
+            encode_rwkv_method_spec(out, method);
+        }
+        RateBackend::Mixture { spec } => {
+            out.push(10);
+            out.push(mixture_kind_tag(spec.kind));
+            out.push(mixture_schedule_tag(spec.schedule));
+            push_f64(out, spec.alpha);
+            push_option_f64(out, spec.decay);
+            push_u64(out, spec.experts.len() as u64);
+            for expert in &spec.experts {
+                push_option_string(out, expert.name.as_deref());
+                push_f64(out, expert.log_prior);
+                push_i64(out, expert.max_order);
+                encode_rate_backend(out, &expert.backend);
+            }
+        }
+        RateBackend::Particle { spec } => {
+            out.push(11);
+            encode_particle_spec(out, spec.as_ref());
+        }
+        RateBackend::Calibrated { spec } => {
+            out.push(12);
+            out.push(calibration_context_tag(spec.context));
+            push_u64(out, spec.bins as u64);
+            push_f64(out, spec.learning_rate);
+            push_f64(out, spec.bias_clip);
+            encode_rate_backend(out, &spec.base);
+        }
+    }
+}
+
+fn decode_rate_backend(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<RateBackend> {
+    let _ = base_dir;
+    match cursor.read_u8()? {
+        0 => Ok(RateBackend::RosaPlus),
+        1 => Ok(RateBackend::Match {
+            hash_bits: cursor.read_u64()? as usize,
+            min_len: cursor.read_u64()? as usize,
+            max_len: cursor.read_u64()? as usize,
+            base_mix: cursor.read_f64()?,
+            confidence_scale: cursor.read_f64()?,
+        }),
+        2 => Ok(RateBackend::SparseMatch {
+            hash_bits: cursor.read_u64()? as usize,
+            min_len: cursor.read_u64()? as usize,
+            max_len: cursor.read_u64()? as usize,
+            gap_min: cursor.read_u64()? as usize,
+            gap_max: cursor.read_u64()? as usize,
+            base_mix: cursor.read_f64()?,
+            confidence_scale: cursor.read_f64()?,
+        }),
+        3 => Ok(RateBackend::Ppmd {
+            order: cursor.read_u64()? as usize,
+            memory_mb: cursor.read_u64()? as usize,
+        }),
+        4 => Ok(RateBackend::Sequitur {
+            context_bytes: cursor.read_u64()? as usize,
+        }),
+        5 => Ok(RateBackend::Ctw {
+            depth: cursor.read_u64()? as usize,
+        }),
+        6 => Ok(RateBackend::FacCtw {
+            base_depth: cursor.read_u64()? as usize,
+            num_percept_bits: cursor.read_u64()? as usize,
+            encoding_bits: cursor.read_u64()? as usize,
+        }),
+        7 => Ok(RateBackend::Zpaq {
+            method: decode_zpaq_method_spec(cursor)?,
+        }),
+        #[cfg(feature = "backend-mamba")]
+        8 => Ok(RateBackend::MambaMethod {
+            method: decode_mamba_method_spec(cursor)?,
+        }),
+        #[cfg(not(feature = "backend-mamba"))]
+        8 => Err(SpecError::new(
+            "binary mamba backend requires the 'backend-mamba' feature",
+        )),
+        #[cfg(feature = "backend-rwkv")]
+        9 => Ok(RateBackend::Rwkv7Method {
+            method: decode_rwkv_method_spec(cursor)?,
+        }),
+        #[cfg(not(feature = "backend-rwkv"))]
+        9 => Err(SpecError::new(
+            "binary rwkv backend requires the 'backend-rwkv' feature",
+        )),
+        10 => {
+            let kind = decode_mixture_kind(cursor.read_u8()?)?;
+            let schedule = decode_mixture_schedule(cursor.read_u8()?)?;
+            let alpha = cursor.read_f64()?;
+            let decay = cursor.read_option_f64()?;
+            let expert_len = cursor.read_u64()? as usize;
+            let mut experts = Vec::with_capacity(expert_len);
+            for _ in 0..expert_len {
+                experts.push(crate::api::MixtureExpertSpec {
+                    name: cursor.read_option_string()?,
+                    log_prior: cursor.read_f64()?,
+                    max_order: cursor.read_i64()?,
+                    backend: decode_rate_backend(cursor, base_dir)?,
+                });
+            }
+            Ok(RateBackend::Mixture {
+                spec: Arc::new(crate::api::MixtureSpec {
+                    kind,
+                    schedule,
+                    alpha,
+                    decay,
+                    experts,
+                }),
+            })
+        }
+        11 => Ok(RateBackend::Particle {
+            spec: Arc::new(decode_particle_spec(cursor)?),
+        }),
+        12 => Ok(RateBackend::Calibrated {
+            spec: Arc::new(crate::api::CalibratedSpec {
+                context: decode_calibration_context(cursor.read_u8()?)?,
+                bins: cursor.read_u64()? as usize,
+                learning_rate: cursor.read_f64()?,
+                bias_clip: cursor.read_f64()?,
+                base: decode_rate_backend(cursor, base_dir)?,
+            }),
+        }),
+        tag => Err(SpecError::new(format!("unknown rate backend tag '{tag}'"))),
+    }
+}
+
+fn encode_compression_backend(out: &mut Vec<u8>, backend: &CompressionBackend) {
+    match backend {
+        CompressionBackend::Zpaq { method } => {
+            out.push(0);
+            encode_zpaq_method_spec(out, method);
+        }
+        #[cfg(feature = "backend-rwkv")]
+        CompressionBackend::Rwkv7 { method, coder } => {
+            out.push(1);
+            encode_rwkv_method_spec(out, method);
+            out.push(coder_tag(*coder));
+        }
+        CompressionBackend::Rate {
+            rate_backend,
+            coder,
+            framing,
+        } => {
+            out.push(2);
+            out.push(coder_tag(*coder));
+            out.push(framing_tag(*framing));
+            encode_rate_backend(out, rate_backend);
+        }
+    }
+}
+
+fn decode_compression_backend(
+    cursor: &mut Cursor<'_>,
+    base_dir: &Path,
+) -> SpecResult<CompressionBackend> {
+    match cursor.read_u8()? {
+        0 => Ok(CompressionBackend::Zpaq {
+            method: decode_zpaq_method_spec(cursor)?,
+        }),
+        #[cfg(feature = "backend-rwkv")]
+        1 => Ok(CompressionBackend::Rwkv7 {
+            method: decode_rwkv_method_spec(cursor)?,
+            coder: decode_coder(cursor.read_u8()?)?,
+        }),
+        #[cfg(not(feature = "backend-rwkv"))]
+        1 => Err(SpecError::new(
+            "binary rwkv compression backend requires the 'backend-rwkv' feature",
+        )),
+        2 => Ok(CompressionBackend::Rate {
+            coder: decode_coder(cursor.read_u8()?)?,
+            framing: decode_framing(cursor.read_u8()?)?,
+            rate_backend: decode_rate_backend(cursor, base_dir)?,
+        }),
+        tag => Err(SpecError::new(format!(
+            "unknown compression backend tag '{tag}'"
+        ))),
+    }
+}
+
+fn encode_particle_spec(out: &mut Vec<u8>, spec: &crate::api::ParticleSpec) {
+    push_u64(out, spec.num_particles as u64);
+    push_u64(out, spec.context_window as u64);
+    push_u64(out, spec.unroll_steps as u64);
+    push_u64(out, spec.num_cells as u64);
+    push_u64(out, spec.cell_dim as u64);
+    push_u64(out, spec.num_rules as u64);
+    push_u64(out, spec.selector_hidden as u64);
+    push_u64(out, spec.rule_hidden as u64);
+    push_u64(out, spec.noise_dim as u64);
+    push_bool(out, spec.deterministic);
+    push_bool(out, spec.enable_noise);
+    push_f64(out, spec.noise_scale);
+    push_u64(out, spec.noise_anneal_steps as u64);
+    push_f64(out, spec.learning_rate_readout);
+    push_f64(out, spec.learning_rate_selector);
+    push_f64(out, spec.learning_rate_rule);
+    push_u64(out, spec.bptt_depth as u64);
+    push_f64(out, spec.optimizer_momentum);
+    push_f64(out, spec.grad_clip);
+    push_f64(out, spec.state_clip);
+    push_f64(out, spec.forget_lambda);
+    push_f64(out, spec.resample_threshold);
+    push_f64(out, spec.mutate_fraction);
+    push_f64(out, spec.mutate_scale);
+    push_bool(out, spec.mutate_model_params);
+    push_u64(out, spec.diagnostics_interval as u64);
+    push_f64(out, spec.min_prob);
+    push_u64(out, spec.seed);
+}
+
+fn decode_particle_spec(cursor: &mut Cursor<'_>) -> SpecResult<crate::api::ParticleSpec> {
+    Ok(crate::api::ParticleSpec {
+        num_particles: cursor.read_u64()? as usize,
+        context_window: cursor.read_u64()? as usize,
+        unroll_steps: cursor.read_u64()? as usize,
+        num_cells: cursor.read_u64()? as usize,
+        cell_dim: cursor.read_u64()? as usize,
+        num_rules: cursor.read_u64()? as usize,
+        selector_hidden: cursor.read_u64()? as usize,
+        rule_hidden: cursor.read_u64()? as usize,
+        noise_dim: cursor.read_u64()? as usize,
+        deterministic: cursor.read_bool()?,
+        enable_noise: cursor.read_bool()?,
+        noise_scale: cursor.read_f64()?,
+        noise_anneal_steps: cursor.read_u64()? as usize,
+        learning_rate_readout: cursor.read_f64()?,
+        learning_rate_selector: cursor.read_f64()?,
+        learning_rate_rule: cursor.read_f64()?,
+        bptt_depth: cursor.read_u64()? as usize,
+        optimizer_momentum: cursor.read_f64()?,
+        grad_clip: cursor.read_f64()?,
+        state_clip: cursor.read_f64()?,
+        forget_lambda: cursor.read_f64()?,
+        resample_threshold: cursor.read_f64()?,
+        mutate_fraction: cursor.read_f64()?,
+        mutate_scale: cursor.read_f64()?,
+        mutate_model_params: cursor.read_bool()?,
+        diagnostics_interval: cursor.read_u64()? as usize,
+        min_prob: cursor.read_f64()?,
+        seed: cursor.read_u64()?,
+    })
+}
+
 fn encode_environment_spec(spec: &EnvironmentSpec, out: &mut Vec<u8>) {
     match spec {
         EnvironmentSpec::Builtin { builtin } => {
@@ -2598,10 +3297,10 @@ fn encode_environment_spec(spec: &EnvironmentSpec, out: &mut Vec<u8>) {
             push_u64(out, vm.boot_timeout_ms);
             push_u64(out, vm.episode_steps as u64);
             push_i64(out, vm.step_cost);
-            push_string(out, &vm.observation_policy);
+            out.push(vm_observation_policy_tag(vm.observation_policy));
             push_u64(out, vm.observation_bits as u64);
             push_u64(out, vm.observation_stream_len as u64);
-            push_string(out, &vm.observation_stream_mode);
+            out.push(vm_observation_stream_mode_tag(vm.observation_stream_mode));
             out.push(vm.observation_pad_byte);
             push_u64(out, vm.reward_bits as u64);
             encode_vm_reward_policy(&vm.reward_policy, out);
@@ -2626,11 +3325,8 @@ fn encode_environment_spec(spec: &EnvironmentSpec, out: &mut Vec<u8>) {
             push_string(out, &vm.rew_prefix);
             push_string(out, &vm.done_prefix);
             push_string(out, &vm.data_prefix);
-            push_string(out, &vm.wire_encoding);
-            push_string(
-                out,
-                &rate_backend_to_canonical_json(&vm.stats_backend).unwrap_or_default(),
-            );
+            out.push(vm_payload_encoding_tag(vm.wire_encoding));
+            encode_rate_backend(out, &vm.stats_backend);
             match &vm.trace {
                 Some(trace) => {
                     out.push(1);
@@ -2664,10 +3360,10 @@ fn decode_environment_spec(
             let boot_timeout_ms = cursor.read_u64()?;
             let episode_steps = cursor.read_u64()? as usize;
             let step_cost = cursor.read_i64()?;
-            let observation_policy = cursor.read_string()?;
+            let observation_policy = decode_vm_observation_policy(cursor.read_u8()?)?;
             let observation_bits = cursor.read_u64()? as usize;
             let observation_stream_len = cursor.read_u64()? as usize;
-            let observation_stream_mode = cursor.read_string()?;
+            let observation_stream_mode = decode_vm_observation_stream_mode(cursor.read_u8()?)?;
             let observation_pad_byte = cursor.read_u8()?;
             let reward_bits = cursor.read_u64()? as usize;
             let reward_policy = decode_vm_reward_policy(cursor)?;
@@ -2688,11 +3384,8 @@ fn decode_environment_spec(
             let rew_prefix = cursor.read_string()?;
             let done_prefix = cursor.read_string()?;
             let data_prefix = cursor.read_string()?;
-            let wire_encoding = cursor.read_string()?;
-            let backend_json = cursor.read_string()?;
-            let backend_value: serde_json::Value = serde_json::from_str(&backend_json)?;
-            let stats_backend =
-                parse_rate_backend_json(&backend_value, base_dir, crate::api::MAX_MIXTURE_NESTING)?;
+            let wire_encoding = decode_vm_payload_encoding(cursor.read_u8()?)?;
+            let stats_backend = decode_rate_backend(cursor, base_dir)?;
             let trace = if cursor.read_u8()? == 1 {
                 Some(decode_vm_trace(cursor)?)
             } else {
@@ -2767,10 +3460,7 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
     match spec {
         ControllerSpec::McAixi(inner) => {
             out.push(0);
-            push_string(
-                out,
-                &rate_backend_to_canonical_json(&inner.predictor).unwrap_or_default(),
-            );
+            encode_rate_backend(out, &inner.predictor);
             push_i64(out, inner.predictor_max_order);
             push_u64(out, inner.agent_horizon as u64);
             push_u64(out, inner.num_simulations as u64);
@@ -2779,10 +3469,7 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
         }
         ControllerSpec::AiqiDiscounted(inner) => {
             out.push(1);
-            push_string(
-                out,
-                &rate_backend_to_canonical_json(&inner.predictor).unwrap_or_default(),
-            );
+            encode_rate_backend(out, &inner.predictor);
             push_i64(out, inner.predictor_max_order);
             push_f64(out, inner.discount_gamma);
             push_u64(out, inner.return_horizon as u64);
@@ -2793,10 +3480,7 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
         }
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             out.push(2);
-            push_string(
-                out,
-                &rate_backend_to_canonical_json(&inner.predictor).unwrap_or_default(),
-            );
+            encode_rate_backend(out, &inner.predictor);
             push_i64(out, inner.predictor_max_order);
             push_u64(out, inner.return_horizon as u64);
             push_u64(out, inner.return_bins as u64);
@@ -2809,61 +3493,37 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
 
 fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<ControllerSpec> {
     match cursor.read_u8()? {
-        0 => {
-            let json = cursor.read_string()?;
-            let value: serde_json::Value = serde_json::from_str(&json)?;
-            Ok(ControllerSpec::McAixi(McAixiControllerSpec {
-                predictor: parse_rate_backend_json(
-                    &value,
-                    base_dir,
-                    crate::api::MAX_MIXTURE_NESTING,
-                )?,
+        0 => Ok(ControllerSpec::McAixi(McAixiControllerSpec {
+            predictor: decode_rate_backend(cursor, base_dir)?,
+            predictor_max_order: cursor.read_i64()?,
+            agent_horizon: cursor.read_u64()? as usize,
+            num_simulations: cursor.read_u64()? as usize,
+            exploration_exploitation_ratio: cursor.read_f64()?,
+            discount_gamma: cursor.read_f64()?,
+        })),
+        1 => Ok(ControllerSpec::AiqiDiscounted(
+            AiqiDiscountedControllerSpec {
+                predictor: decode_rate_backend(cursor, base_dir)?,
                 predictor_max_order: cursor.read_i64()?,
-                agent_horizon: cursor.read_u64()? as usize,
-                num_simulations: cursor.read_u64()? as usize,
-                exploration_exploitation_ratio: cursor.read_f64()?,
                 discount_gamma: cursor.read_f64()?,
-            }))
-        }
-        1 => {
-            let json = cursor.read_string()?;
-            let value: serde_json::Value = serde_json::from_str(&json)?;
-            Ok(ControllerSpec::AiqiDiscounted(
-                AiqiDiscountedControllerSpec {
-                    predictor: parse_rate_backend_json(
-                        &value,
-                        base_dir,
-                        crate::api::MAX_MIXTURE_NESTING,
-                    )?,
-                    predictor_max_order: cursor.read_i64()?,
-                    discount_gamma: cursor.read_f64()?,
-                    return_horizon: cursor.read_u64()? as usize,
-                    return_bins: cursor.read_u64()? as usize,
-                    augmentation_period: cursor.read_u64()? as usize,
-                    history_prune_keep_steps: cursor.read_option_u64()?.map(|n| n as usize),
-                    baseline_exploration: cursor.read_f64()?,
-                },
-            ))
-        }
-        2 => {
-            let json = cursor.read_string()?;
-            let value: serde_json::Value = serde_json::from_str(&json)?;
-            Ok(ControllerSpec::AiqiWarmstartExactJh(
-                WarmStartExactJhControllerSpec {
-                    predictor: parse_rate_backend_json(
-                        &value,
-                        base_dir,
-                        crate::api::MAX_MIXTURE_NESTING,
-                    )?,
-                    predictor_max_order: cursor.read_i64()?,
-                    return_horizon: cursor.read_u64()? as usize,
-                    return_bins: cursor.read_u64()? as usize,
-                    label_phase_period: cursor.read_u64()? as usize,
-                    teacher_dataset_asset: cursor.read_string()?,
-                    planner_simulations_per_step: cursor.read_u64()? as usize,
-                },
-            ))
-        }
+                return_horizon: cursor.read_u64()? as usize,
+                return_bins: cursor.read_u64()? as usize,
+                augmentation_period: cursor.read_u64()? as usize,
+                history_prune_keep_steps: cursor.read_option_u64()?.map(|n| n as usize),
+                baseline_exploration: cursor.read_f64()?,
+            },
+        )),
+        2 => Ok(ControllerSpec::AiqiWarmstartExactJh(
+            WarmStartExactJhControllerSpec {
+                predictor: decode_rate_backend(cursor, base_dir)?,
+                predictor_max_order: cursor.read_i64()?,
+                return_horizon: cursor.read_u64()? as usize,
+                return_bins: cursor.read_u64()? as usize,
+                label_phase_period: cursor.read_u64()? as usize,
+                teacher_dataset_asset: cursor.read_string()?,
+                planner_simulations_per_step: cursor.read_u64()? as usize,
+            },
+        )),
         tag => Err(SpecError::new(format!("unknown controller tag '{tag}'"))),
     }
 }
@@ -3120,7 +3780,7 @@ fn encode_vm_action_source(spec: &VmRuntimeActionSourceSpec, out: &mut Vec<u8>) 
             encoding,
         } => {
             out.push(0);
-            push_string(out, encoding);
+            out.push(vm_payload_encoding_tag(*encoding));
             push_u64(out, payloads.len() as u64);
             for (idx, payload) in payloads.iter().enumerate() {
                 push_option_string(out, names.get(idx).cloned().flatten().as_deref());
@@ -3137,9 +3797,12 @@ fn encode_vm_action_source(spec: &VmRuntimeActionSourceSpec, out: &mut Vec<u8>) 
             rng_seed,
         } => {
             out.push(1);
-            push_string(out, encoding);
+            out.push(vm_payload_encoding_tag(*encoding));
             push_string_list(out, seeds);
-            push_string_list(out, mutators);
+            push_u64(out, mutators.len() as u64);
+            for mutator in mutators {
+                out.push(vm_fuzz_mutator_tag(*mutator));
+            }
             push_u64(out, *min_len as u64);
             push_u64(out, *max_len as u64);
             push_string_list(out, dictionary);
@@ -3152,7 +3815,7 @@ fn encode_vm_action_source(spec: &VmRuntimeActionSourceSpec, out: &mut Vec<u8>) 
 fn decode_vm_action_source(cursor: &mut Cursor<'_>) -> SpecResult<VmRuntimeActionSourceSpec> {
     match cursor.read_u8()? {
         0 => {
-            let encoding = cursor.read_string()?;
+            let encoding = decode_vm_payload_encoding(cursor.read_u8()?)?;
             let len = cursor.read_u64()? as usize;
             let mut names = Vec::with_capacity(len);
             let mut payloads = Vec::with_capacity(len);
@@ -3166,15 +3829,24 @@ fn decode_vm_action_source(cursor: &mut Cursor<'_>) -> SpecResult<VmRuntimeActio
                 encoding,
             })
         }
-        1 => Ok(VmRuntimeActionSourceSpec::Fuzz {
-            seeds: cursor.read_string_list()?,
-            encoding: cursor.read_string()?,
-            mutators: cursor.read_string_list()?,
-            min_len: cursor.read_u64()? as usize,
-            max_len: cursor.read_u64()? as usize,
-            dictionary: cursor.read_string_list()?,
-            rng_seed: cursor.read_u64()?,
-        }),
+        1 => {
+            let encoding = decode_vm_payload_encoding(cursor.read_u8()?)?;
+            let seeds = cursor.read_string_list()?;
+            let mutators_len = cursor.read_u64()? as usize;
+            let mut mutators = Vec::with_capacity(mutators_len);
+            for _ in 0..mutators_len {
+                mutators.push(decode_vm_fuzz_mutator(cursor.read_u8()?)?);
+            }
+            Ok(VmRuntimeActionSourceSpec::Fuzz {
+                seeds,
+                encoding,
+                mutators,
+                min_len: cursor.read_u64()? as usize,
+                max_len: cursor.read_u64()? as usize,
+                dictionary: cursor.read_string_list()?,
+                rng_seed: cursor.read_u64()?,
+            })
+        }
         tag => Err(SpecError::new(format!(
             "unknown vm action source tag '{tag}'"
         ))),
@@ -3315,6 +3987,99 @@ fn builtin_environment_name(env: BuiltinEnvironmentSpec) -> &'static str {
     }
 }
 
+fn coder_tag(coder: crate::coders::CoderType) -> u8 {
+    match coder {
+        crate::coders::CoderType::AC => 0,
+        crate::coders::CoderType::RANS => 1,
+    }
+}
+
+fn decode_coder(tag: u8) -> SpecResult<crate::coders::CoderType> {
+    match tag {
+        0 => Ok(crate::coders::CoderType::AC),
+        1 => Ok(crate::coders::CoderType::RANS),
+        _ => Err(SpecError::new(format!("unknown coder tag '{tag}'"))),
+    }
+}
+
+fn framing_tag(framing: crate::compression::FramingMode) -> u8 {
+    match framing {
+        crate::compression::FramingMode::Raw => 0,
+        crate::compression::FramingMode::Framed => 1,
+    }
+}
+
+fn decode_framing(tag: u8) -> SpecResult<crate::compression::FramingMode> {
+    match tag {
+        0 => Ok(crate::compression::FramingMode::Raw),
+        1 => Ok(crate::compression::FramingMode::Framed),
+        _ => Err(SpecError::new(format!("unknown framing tag '{tag}'"))),
+    }
+}
+
+fn mixture_kind_tag(kind: crate::api::MixtureKind) -> u8 {
+    match kind {
+        crate::api::MixtureKind::Bayes => 0,
+        crate::api::MixtureKind::FadingBayes => 1,
+        crate::api::MixtureKind::Switching => 2,
+        crate::api::MixtureKind::Convex => 3,
+        crate::api::MixtureKind::Mdl => 4,
+        crate::api::MixtureKind::Neural => 5,
+    }
+}
+
+fn decode_mixture_kind(tag: u8) -> SpecResult<crate::api::MixtureKind> {
+    match tag {
+        0 => Ok(crate::api::MixtureKind::Bayes),
+        1 => Ok(crate::api::MixtureKind::FadingBayes),
+        2 => Ok(crate::api::MixtureKind::Switching),
+        3 => Ok(crate::api::MixtureKind::Convex),
+        4 => Ok(crate::api::MixtureKind::Mdl),
+        5 => Ok(crate::api::MixtureKind::Neural),
+        _ => Err(SpecError::new(format!("unknown mixture kind tag '{tag}'"))),
+    }
+}
+
+fn mixture_schedule_tag(schedule: crate::api::MixtureScheduleMode) -> u8 {
+    match schedule {
+        crate::api::MixtureScheduleMode::Default => 0,
+        crate::api::MixtureScheduleMode::Theorem => 1,
+    }
+}
+
+fn decode_mixture_schedule(tag: u8) -> SpecResult<crate::api::MixtureScheduleMode> {
+    match tag {
+        0 => Ok(crate::api::MixtureScheduleMode::Default),
+        1 => Ok(crate::api::MixtureScheduleMode::Theorem),
+        _ => Err(SpecError::new(format!(
+            "unknown mixture schedule tag '{tag}'"
+        ))),
+    }
+}
+
+fn calibration_context_tag(context: crate::api::CalibrationContextKind) -> u8 {
+    match context {
+        crate::api::CalibrationContextKind::Global => 0,
+        crate::api::CalibrationContextKind::ByteClass => 1,
+        crate::api::CalibrationContextKind::Text => 2,
+        crate::api::CalibrationContextKind::Repeat => 3,
+        crate::api::CalibrationContextKind::TextRepeat => 4,
+    }
+}
+
+fn decode_calibration_context(tag: u8) -> SpecResult<crate::api::CalibrationContextKind> {
+    match tag {
+        0 => Ok(crate::api::CalibrationContextKind::Global),
+        1 => Ok(crate::api::CalibrationContextKind::ByteClass),
+        2 => Ok(crate::api::CalibrationContextKind::Text),
+        3 => Ok(crate::api::CalibrationContextKind::Repeat),
+        4 => Ok(crate::api::CalibrationContextKind::TextRepeat),
+        _ => Err(SpecError::new(format!(
+            "unknown calibration context tag '{tag}'"
+        ))),
+    }
+}
+
 fn builtin_environment_tag(env: BuiltinEnvironmentSpec) -> u8 {
     match env {
         BuiltinEnvironmentSpec::CoinFlip => 0,
@@ -3374,6 +4139,138 @@ fn decode_shared_memory_policy(tag: u8) -> SpecResult<SharedMemoryPolicySpec> {
         1 => Ok(SharedMemoryPolicySpec::Snapshot),
         _ => Err(SpecError::new(format!(
             "unknown shared memory policy tag '{tag}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "vm")]
+fn vm_observation_policy_name(policy: VmObservationPolicySpec) -> &'static str {
+    match policy {
+        VmObservationPolicySpec::FromGuest => "from_guest",
+        VmObservationPolicySpec::OutputHash => "output_hash",
+        VmObservationPolicySpec::RawOutput => "raw_output",
+        VmObservationPolicySpec::SharedMemory => "shared_memory",
+    }
+}
+
+#[cfg(feature = "vm")]
+fn vm_observation_policy_tag(policy: VmObservationPolicySpec) -> u8 {
+    match policy {
+        VmObservationPolicySpec::FromGuest => 0,
+        VmObservationPolicySpec::OutputHash => 1,
+        VmObservationPolicySpec::RawOutput => 2,
+        VmObservationPolicySpec::SharedMemory => 3,
+    }
+}
+
+#[cfg(feature = "vm")]
+fn decode_vm_observation_policy(tag: u8) -> SpecResult<VmObservationPolicySpec> {
+    match tag {
+        0 => Ok(VmObservationPolicySpec::FromGuest),
+        1 => Ok(VmObservationPolicySpec::OutputHash),
+        2 => Ok(VmObservationPolicySpec::RawOutput),
+        3 => Ok(VmObservationPolicySpec::SharedMemory),
+        _ => Err(SpecError::new(format!(
+            "unknown VM observation policy tag '{tag}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "vm")]
+fn vm_observation_stream_mode_name(mode: VmObservationStreamModeSpec) -> &'static str {
+    match mode {
+        VmObservationStreamModeSpec::PadTruncate => "pad_truncate",
+        VmObservationStreamModeSpec::Pad => "pad",
+        VmObservationStreamModeSpec::Truncate => "truncate",
+    }
+}
+
+#[cfg(feature = "vm")]
+fn vm_observation_stream_mode_tag(mode: VmObservationStreamModeSpec) -> u8 {
+    match mode {
+        VmObservationStreamModeSpec::PadTruncate => 0,
+        VmObservationStreamModeSpec::Pad => 1,
+        VmObservationStreamModeSpec::Truncate => 2,
+    }
+}
+
+#[cfg(feature = "vm")]
+fn decode_vm_observation_stream_mode(tag: u8) -> SpecResult<VmObservationStreamModeSpec> {
+    match tag {
+        0 => Ok(VmObservationStreamModeSpec::PadTruncate),
+        1 => Ok(VmObservationStreamModeSpec::Pad),
+        2 => Ok(VmObservationStreamModeSpec::Truncate),
+        _ => Err(SpecError::new(format!(
+            "unknown VM observation stream mode tag '{tag}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "vm")]
+fn vm_payload_encoding_name(encoding: VmPayloadEncodingSpec) -> &'static str {
+    match encoding {
+        VmPayloadEncodingSpec::Utf8 => "utf8",
+        VmPayloadEncodingSpec::Hex => "hex",
+    }
+}
+
+#[cfg(feature = "vm")]
+fn vm_payload_encoding_tag(encoding: VmPayloadEncodingSpec) -> u8 {
+    match encoding {
+        VmPayloadEncodingSpec::Utf8 => 0,
+        VmPayloadEncodingSpec::Hex => 1,
+    }
+}
+
+#[cfg(feature = "vm")]
+fn decode_vm_payload_encoding(tag: u8) -> SpecResult<VmPayloadEncodingSpec> {
+    match tag {
+        0 => Ok(VmPayloadEncodingSpec::Utf8),
+        1 => Ok(VmPayloadEncodingSpec::Hex),
+        _ => Err(SpecError::new(format!(
+            "unknown VM payload encoding tag '{tag}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "vm")]
+fn vm_fuzz_mutator_name(mutator: VmFuzzMutatorSpec) -> &'static str {
+    match mutator {
+        VmFuzzMutatorSpec::FlipBit => "flip_bit",
+        VmFuzzMutatorSpec::FlipByte => "flip_byte",
+        VmFuzzMutatorSpec::InsertByte => "insert_byte",
+        VmFuzzMutatorSpec::DeleteByte => "delete_byte",
+        VmFuzzMutatorSpec::SpliceSeed => "splice_seed",
+        VmFuzzMutatorSpec::ResetSeed => "reset_seed",
+        VmFuzzMutatorSpec::Havoc => "havoc",
+    }
+}
+
+#[cfg(feature = "vm")]
+fn vm_fuzz_mutator_tag(mutator: VmFuzzMutatorSpec) -> u8 {
+    match mutator {
+        VmFuzzMutatorSpec::FlipBit => 0,
+        VmFuzzMutatorSpec::FlipByte => 1,
+        VmFuzzMutatorSpec::InsertByte => 2,
+        VmFuzzMutatorSpec::DeleteByte => 3,
+        VmFuzzMutatorSpec::SpliceSeed => 4,
+        VmFuzzMutatorSpec::ResetSeed => 5,
+        VmFuzzMutatorSpec::Havoc => 6,
+    }
+}
+
+#[cfg(feature = "vm")]
+fn decode_vm_fuzz_mutator(tag: u8) -> SpecResult<VmFuzzMutatorSpec> {
+    match tag {
+        0 => Ok(VmFuzzMutatorSpec::FlipBit),
+        1 => Ok(VmFuzzMutatorSpec::FlipByte),
+        2 => Ok(VmFuzzMutatorSpec::InsertByte),
+        3 => Ok(VmFuzzMutatorSpec::DeleteByte),
+        4 => Ok(VmFuzzMutatorSpec::SpliceSeed),
+        5 => Ok(VmFuzzMutatorSpec::ResetSeed),
+        6 => Ok(VmFuzzMutatorSpec::Havoc),
+        _ => Err(SpecError::new(format!(
+            "unknown VM fuzz mutator tag '{tag}'"
         ))),
     }
 }
@@ -3497,7 +4394,6 @@ fn push_option_i64(out: &mut Vec<u8>, value: Option<i64>) {
     }
 }
 
-#[cfg(feature = "vm")]
 fn push_option_f64(out: &mut Vec<u8>, value: Option<f64>) {
     match value {
         Some(value) => {
@@ -3600,7 +4496,6 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    #[cfg(feature = "vm")]
     fn read_option_f64(&mut self) -> SpecResult<Option<f64>> {
         if self.read_u8()? == 1 {
             Ok(Some(self.read_f64()?))
@@ -3712,6 +4607,30 @@ mod tests {
 
     #[cfg(feature = "backend-ctw")]
     #[test]
+    fn standalone_backend_documents_roundtrip_without_embedded_json_fragments() {
+        let rate = SpecDocument::RateBackend(RateBackend::Ctw { depth: 8 });
+        let compression = SpecDocument::CompressionBackend(CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 8 },
+            coder: crate::coders::CoderType::AC,
+            framing: crate::compression::FramingMode::Framed,
+        });
+
+        for doc in [rate, compression] {
+            let expected = doc.to_canonical_json().expect("json");
+            let bytes = doc.to_binary();
+            assert!(
+                !bytes
+                    .windows(br#""kind""#.len())
+                    .any(|window| window == br#""kind""#),
+                "binary document should not embed canonical JSON object keys: {bytes:?}"
+            );
+            let reparsed = SpecDocument::from_binary(&bytes, Path::new(".")).expect("binary");
+            assert_eq!(reparsed.to_canonical_json().expect("parsed json"), expected);
+        }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
     fn planner_run_compile_exposes_compiled_predictor_and_action_bits() {
         let compiled = sample_planner_run()
             .compile()
@@ -3749,7 +4668,7 @@ mod tests {
         let mut spec = sample_planner_run();
         spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
             predictor: RateBackend::Zpaq {
-                method: "1".to_string(),
+                method: crate::api::ZpaqMethodSpec::literal("1"),
             },
             predictor_max_order: 8,
             agent_horizon: 1,
@@ -3773,7 +4692,7 @@ mod tests {
         let mut spec = sample_planner_run();
         spec.controller = ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Zpaq {
-                method: "1".to_string(),
+                method: crate::api::ZpaqMethodSpec::literal("1"),
             },
             predictor_max_order: 8,
             discount_gamma: 0.99,
@@ -3810,18 +4729,18 @@ mod tests {
                 boot_timeout_ms: 1_000,
                 episode_steps: 4,
                 step_cost: 0,
-                observation_policy: "hash".to_string(),
+                observation_policy: VmObservationPolicySpec::OutputHash,
                 observation_bits: 8,
                 observation_stream_len: 16,
-                observation_stream_mode: "pad-truncate".to_string(),
+                observation_stream_mode: VmObservationStreamModeSpec::PadTruncate,
                 observation_pad_byte: 0,
                 reward_bits: 8,
                 reward_policy: VmRewardPolicySpec::FromGuest,
                 reward_shaping: None,
                 action_source: VmRuntimeActionSourceSpec::Fuzz {
                     seeds: vec!["seed".to_string()],
-                    encoding: "text".to_string(),
-                    mutators: vec!["flipbit".to_string(), "splice".to_string()],
+                    encoding: VmPayloadEncodingSpec::Utf8,
+                    mutators: vec![VmFuzzMutatorSpec::FlipBit, VmFuzzMutatorSpec::SpliceSeed],
                     min_len: 1,
                     max_len: 16,
                     dictionary: vec!["tok".to_string()],
@@ -3834,7 +4753,7 @@ mod tests {
                 rew_prefix: "REW ".to_string(),
                 done_prefix: "DONE ".to_string(),
                 data_prefix: "DATA ".to_string(),
-                wire_encoding: "text".to_string(),
+                wire_encoding: VmPayloadEncodingSpec::Utf8,
                 stats_backend: RateBackend::Ctw { depth: 8 },
                 trace: None,
                 debug_mode: false,
@@ -3880,17 +4799,20 @@ mod tests {
         let EnvironmentSpec::NyxVm(vm) = &compiled.canonical_spec().environment else {
             panic!("expected vm environment");
         };
-        assert_eq!(vm.observation_policy, "output_hash");
-        assert_eq!(vm.observation_stream_mode, "pad_truncate");
-        assert_eq!(vm.wire_encoding, "utf8");
+        assert_eq!(vm.observation_policy, VmObservationPolicySpec::OutputHash);
+        assert_eq!(
+            vm.observation_stream_mode,
+            VmObservationStreamModeSpec::PadTruncate
+        );
+        assert_eq!(vm.wire_encoding, VmPayloadEncodingSpec::Utf8);
         match &vm.action_source {
             VmRuntimeActionSourceSpec::Fuzz {
                 encoding, mutators, ..
             } => {
-                assert_eq!(encoding, "utf8");
+                assert_eq!(*encoding, VmPayloadEncodingSpec::Utf8);
                 assert_eq!(
                     mutators,
-                    &vec!["flip_bit".to_string(), "splice_seed".to_string()]
+                    &vec![VmFuzzMutatorSpec::FlipBit, VmFuzzMutatorSpec::SpliceSeed]
                 );
             }
             other => panic!("expected fuzz action source, got {other:?}"),
@@ -3899,12 +4821,67 @@ mod tests {
 
     #[cfg(all(feature = "backend-ctw", feature = "vm"))]
     #[test]
-    fn planner_run_compile_rejects_unknown_vm_enum_names() {
-        let mut unknown_policy = sample_vm_planner_run();
-        if let EnvironmentSpec::NyxVm(vm) = &mut unknown_policy.environment {
-            vm.observation_policy = "nope".to_string();
+    fn planner_run_binary_roundtrip_preserves_vm_fuzz_action_source_layout() {
+        let spec = sample_vm_planner_run();
+        let expected_json = SpecDocument::PlannerRun(spec.clone())
+            .to_canonical_json()
+            .expect("json");
+        let bytes = SpecDocument::PlannerRun(spec.clone()).to_binary();
+        let reparsed = SpecDocument::from_binary(&bytes, Path::new(".")).expect("binary");
+        let reparsed_json = reparsed.to_canonical_json().expect("json");
+
+        assert_eq!(reparsed_json, expected_json);
+
+        let SpecDocument::PlannerRun(reparsed_spec) = reparsed else {
+            panic!("expected planner_run document");
+        };
+
+        let EnvironmentSpec::NyxVm(vm) = reparsed_spec.environment else {
+            panic!("expected vm environment");
+        };
+        match vm.action_source {
+            VmRuntimeActionSourceSpec::Fuzz {
+                seeds,
+                encoding,
+                mutators,
+                min_len,
+                max_len,
+                dictionary,
+                rng_seed,
+            } => {
+                assert_eq!(seeds, vec!["seed".to_string()]);
+                assert_eq!(encoding, VmPayloadEncodingSpec::Utf8);
+                assert_eq!(
+                    mutators,
+                    vec![VmFuzzMutatorSpec::FlipBit, VmFuzzMutatorSpec::SpliceSeed]
+                );
+                assert_eq!(min_len, 1);
+                assert_eq!(max_len, 16);
+                assert_eq!(dictionary, vec!["tok".to_string()]);
+                assert_eq!(rng_seed, 7);
+            }
+            other => panic!("expected fuzz action source, got {other:?}"),
         }
-        let err = match unknown_policy.compile() {
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "vm"))]
+    #[test]
+    fn planner_run_compile_rejects_unknown_vm_enum_names() {
+        let unknown = sample_vm_planner_run();
+        let value: serde_json::Value = serde_json::json!({
+            "schema_version": SPEC_DOCUMENT_SCHEMA_VERSION,
+            "kind": "planner_run",
+            "assets": unknown.assets.iter().map(asset_binding_to_json_value).collect::<Vec<_>>(),
+            "environment": {
+                "kind": "nyx_vm",
+                "firecracker_config_asset": "firecracker",
+                "observation_policy": "nope"
+            },
+            "interface": interface_spec_to_json_value(&unknown.interface),
+            "controller": controller_spec_to_json_value(&unknown.controller).expect("controller json"),
+            "runtime": runtime_spec_to_json_value(&unknown.runtime),
+        });
+        let err = match SpecDocument::parse_json_value(&value, Path::new(".")) {
             Ok(_) => panic!("unknown observation policy must fail"),
             Err(err) => err,
         };
@@ -3913,11 +4890,12 @@ mod tests {
             "{err}"
         );
 
-        let mut unknown_encoding = sample_vm_planner_run();
-        if let EnvironmentSpec::NyxVm(vm) = &mut unknown_encoding.environment {
-            vm.wire_encoding = "base64".to_string();
-        }
-        let err = match unknown_encoding.compile() {
+        let mut unknown_encoding_value = sample_vm_planner_run()
+            .to_canonical_json_value()
+            .expect("canonical json");
+        unknown_encoding_value["environment"]["protocol"]["wire_encoding"] =
+            serde_json::json!("base64");
+        let err = match SpecDocument::parse_json_value(&unknown_encoding_value, Path::new(".")) {
             Ok(_) => panic!("unknown wire encoding must fail"),
             Err(err) => err,
         };
@@ -3926,19 +4904,12 @@ mod tests {
             "{err}"
         );
 
-        let mut unknown_mutator = sample_vm_planner_run();
-        if let EnvironmentSpec::NyxVm(vm) = &mut unknown_mutator.environment {
-            vm.action_source = VmRuntimeActionSourceSpec::Fuzz {
-                seeds: vec!["seed".to_string()],
-                encoding: "utf8".to_string(),
-                mutators: vec!["invalid-mutator".to_string()],
-                min_len: 1,
-                max_len: 16,
-                dictionary: Vec::new(),
-                rng_seed: 1,
-            };
-        }
-        let err = match unknown_mutator.compile() {
+        let mut unknown_mutator_value = sample_vm_planner_run()
+            .to_canonical_json_value()
+            .expect("canonical json");
+        unknown_mutator_value["environment"]["action_source"]["mutators"] =
+            serde_json::json!(["invalid-mutator"]);
+        let err = match SpecDocument::parse_json_value(&unknown_mutator_value, Path::new(".")) {
             Ok(_) => panic!("unknown mutator must fail"),
             Err(err) => err,
         };

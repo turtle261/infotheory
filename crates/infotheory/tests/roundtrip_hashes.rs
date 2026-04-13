@@ -26,7 +26,7 @@ fn zpaq_roundtrip_fixture_a_and_hash_stability() {
     ))
     .expect("failed to read fixture_a");
     let backend = CompressionBackend::Zpaq {
-        method: "5".to_string(),
+        method: infotheory::api::ZpaqMethodSpec::literal("5"),
     };
     let backend = backend.compile().expect("compile zpaq backend");
     let compressed = try_compress_bytes_backend(&input, &backend).expect("compress failed");
@@ -47,7 +47,7 @@ fn zpaq_roundtrip_fixture_b_and_hash_stability() {
     ))
     .expect("failed to read fixture_b");
     let backend = CompressionBackend::Zpaq {
-        method: "5".to_string(),
+        method: infotheory::api::ZpaqMethodSpec::literal("5"),
     };
     let backend = backend.compile().expect("compile zpaq backend");
     let compressed = try_compress_bytes_backend(&input, &backend).expect("compress failed");

@@ -675,10 +675,10 @@ pub(crate) fn compile_rate_plan_zpaq(
 ) -> SpecResult<RateBackendPlan> {
     match backend {
         RateBackend::Zpaq { method } => {
-            crate::validate_zpaq_rate_method(method)
+            crate::validate_zpaq_rate_method(method.value())
                 .map_err(|err| SpecError::new(err.to_string()))?;
             Ok(RateBackendPlan::Zpaq {
-                method: method.clone(),
+                method: method.value().to_string(),
             })
         }
         _ => unreachable!("zpaq kernel used with non-zpaq backend"),
@@ -693,9 +693,8 @@ pub(crate) fn compile_rate_plan_mamba(
 ) -> SpecResult<RateBackendPlan> {
     match backend {
         RateBackend::MambaMethod { method } => {
-            let normalized = super::normalize_mamba_method_for_base_dir(env.base_dir(), method)?;
-            let parsed_method = crate::mambazip::parse_method_spec(&normalized)
-                .map_err(|err| SpecError::new(err.to_string()))?;
+            let parsed_method =
+                super::normalize_mamba_method_spec_for_base_dir(env.base_dir(), method)?;
             let method = crate::mambazip::canonical_method_string(&parsed_method)
                 .map_err(|err| SpecError::new(err.to_string()))?;
             Ok(RateBackendPlan::Mamba {
@@ -725,9 +724,8 @@ pub(crate) fn compile_rate_plan_rwkv7(
 ) -> SpecResult<RateBackendPlan> {
     match backend {
         RateBackend::Rwkv7Method { method } => {
-            let normalized = super::normalize_rwkv_method_for_base_dir(env.base_dir(), method)?;
-            let parsed_method = crate::rwkvzip::parse_method_spec(&normalized)
-                .map_err(|err| SpecError::new(err.to_string()))?;
+            let parsed_method =
+                super::normalize_rwkv_method_spec_for_base_dir(env.base_dir(), method)?;
             let method = crate::rwkvzip::canonical_method_string(&parsed_method)
                 .map_err(|err| SpecError::new(err.to_string()))?;
             Ok(RateBackendPlan::Rwkv7 {
@@ -833,9 +831,17 @@ pub(crate) fn compile_compression_plan_zpaq(
     _env: &SpecEnvironment,
 ) -> SpecResult<CompressionBackendPlan> {
     match backend {
-        CompressionBackend::Zpaq { method } => Ok(CompressionBackendPlan::Zpaq {
-            method: method.clone(),
-        }),
+        CompressionBackend::Zpaq { method } => {
+            crate::zpaq_compress_to_vec(&[], method.value()).map_err(|err| {
+                SpecError::new(format!(
+                    "invalid zpaq compression method '{}': {err}",
+                    method.value()
+                ))
+            })?;
+            Ok(CompressionBackendPlan::Zpaq {
+                method: method.value().to_string(),
+            })
+        }
         _ => unreachable!("zpaq compression kernel used with non-zpaq backend"),
     }
 }
@@ -847,9 +853,8 @@ pub(crate) fn compile_compression_plan_rwkv7(
 ) -> SpecResult<CompressionBackendPlan> {
     match backend {
         CompressionBackend::Rwkv7 { method, coder } => {
-            let normalized = super::normalize_rwkv_method_for_base_dir(env.base_dir(), method)?;
-            let parsed_method = crate::rwkvzip::parse_method_spec(&normalized)
-                .map_err(|err| SpecError::new(err.to_string()))?;
+            let parsed_method =
+                super::normalize_rwkv_method_spec_for_base_dir(env.base_dir(), method)?;
             let method = crate::rwkvzip::canonical_method_string(&parsed_method)
                 .map_err(|err| SpecError::new(err.to_string()))?;
             Ok(CompressionBackendPlan::Rwkv7 {
@@ -1038,7 +1043,7 @@ pub(crate) fn rate_plan_to_wrapper_zpaq(plan: &RateBackendPlan) -> RateBackend {
         unreachable!("zpaq wrapper kernel used with non-zpaq plan");
     };
     RateBackend::Zpaq {
-        method: method.clone(),
+        method: crate::api::ZpaqMethodSpec::literal(method),
     }
 }
 
@@ -1048,7 +1053,8 @@ pub(crate) fn rate_plan_to_wrapper_mamba(plan: &RateBackendPlan) -> RateBackend 
         unreachable!("mamba wrapper kernel used with non-mamba plan");
     };
     RateBackend::MambaMethod {
-        method: method.clone(),
+        method: crate::mambazip::parse_method_spec(method)
+            .expect("compiled mamba plan must retain a valid canonical method"),
     }
 }
 
@@ -1063,7 +1069,8 @@ pub(crate) fn rate_plan_to_wrapper_rwkv7(plan: &RateBackendPlan) -> RateBackend 
         unreachable!("rwkv7 wrapper kernel used with non-rwkv7 plan");
     };
     RateBackend::Rwkv7Method {
-        method: method.clone(),
+        method: crate::rwkvzip::parse_method_spec(method)
+            .expect("compiled rwkv plan must retain a valid canonical method"),
     }
 }
 
@@ -1140,7 +1147,7 @@ pub(crate) fn compression_plan_to_wrapper_zpaq(
         unreachable!("zpaq compression wrapper kernel used with non-zpaq plan");
     };
     CompressionBackend::Zpaq {
-        method: method.clone(),
+        method: crate::api::ZpaqMethodSpec::literal(method),
     }
 }
 
@@ -1152,7 +1159,8 @@ pub(crate) fn compression_plan_to_wrapper_rwkv7(
         unreachable!("rwkv7 compression wrapper kernel used with non-rwkv7 plan");
     };
     CompressionBackend::Rwkv7 {
-        method: method.clone(),
+        method: crate::rwkvzip::parse_method_spec(method)
+            .expect("compiled rwkv compression plan must retain a valid canonical method"),
         coder: *coder,
     }
 }
@@ -2157,7 +2165,7 @@ mod tests {
                         log_prior: -0.1,
                         max_order: -1,
                         backend: RateBackend::Zpaq {
-                            method: "1".to_string(),
+                            method: crate::api::ZpaqMethodSpec::literal("1"),
                         },
                     },
                 ],

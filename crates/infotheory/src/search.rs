@@ -128,21 +128,7 @@ pub const DEFAULT_SEARCH_COMPRESSION_BACKEND_NAME: &str = "zpaq";
 pub const DEFAULT_SEARCH_COMPRESSION_BACKEND_NAME: &str = "rate-ac";
 
 fn default_search_ctx() -> InfotheoryResult<InfotheoryCtx> {
-    #[cfg(feature = "backend-zpaq")]
-    {
-        return InfotheoryCtx::try_with_zpaq("5");
-    }
-    #[cfg(not(feature = "backend-zpaq"))]
-    {
-        InfotheoryCtx::from_specs(
-            crate::api::RateBackend::RosaPlus,
-            crate::api::CompressionBackend::Rate {
-                rate_backend: crate::api::RateBackend::RosaPlus,
-                coder: crate::coders::CoderType::AC,
-                framing: crate::compression::FramingMode::Raw,
-            },
-        )
-    }
+    InfotheoryCtx::try_default()
 }
 
 impl SearchOptions {
@@ -157,12 +143,6 @@ impl SearchOptions {
             stage0_keep_frac: 0.2,
             ctx: default_search_ctx()?,
         })
-    }
-}
-
-impl Default for SearchOptions {
-    fn default() -> Self {
-        Self::try_default().expect("search defaults should compile in backend-rosa builds")
     }
 }
 
@@ -923,7 +903,7 @@ mod tests {
         let opts = SearchOptions {
             top_k: 4,
             stage0_keep_frac: 0.1,
-            ..SearchOptions::default()
+            ..SearchOptions::try_default().expect("search defaults")
         };
         let kept = stage0_prefilter(b"candidate", candidates, &opts, false)
             .expect("stage0 prefilter should succeed");
@@ -938,22 +918,20 @@ mod tests {
     fn search_with_options_returns_error_for_empty_query() {
         let path = temp_path("search-empty").with_extension("txt");
         fs::write(&path, b"content").expect("write search target");
-        let err = search_with_options(
-            "",
-            path.to_string_lossy().as_ref(),
-            &SearchOptions::default(),
-        )
-        .expect_err("empty query should return an error");
+        let opts = SearchOptions::try_default().expect("search defaults");
+        let err = search_with_options("", path.to_string_lossy().as_ref(), &opts)
+            .expect_err("empty query should return an error");
         assert!(err.to_string().contains("query is empty"));
         let _ = fs::remove_file(path);
     }
 
     #[test]
     fn search_with_options_returns_error_for_missing_target() {
+        let opts = SearchOptions::try_default().expect("search defaults");
         let err = search_with_options(
             "needle",
             "/definitely/missing/infotheory-search-target",
-            &SearchOptions::default(),
+            &opts,
         )
         .expect_err("missing target should return an error");
         assert!(err.to_string().contains("no accessible files found"));
@@ -968,7 +946,7 @@ mod tests {
         let ctx = InfotheoryCtx::from_specs(
             RateBackend::RosaPlus,
             CompressionBackend::Zpaq {
-                method: "definitely-invalid-zpaq-method".to_string(),
+                method: crate::api::ZpaqMethodSpec::literal("definitely-invalid-zpaq-method"),
             },
         )
         .expect("context should compile");
@@ -976,7 +954,7 @@ mod tests {
         let opts = SearchOptions {
             top_k: 1,
             ctx,
-            ..SearchOptions::default()
+            ..SearchOptions::try_default().expect("search defaults")
         };
         let err = search_with_options("needle", path.to_string_lossy().as_ref(), &opts)
             .expect_err("invalid compression method should surface as a search error");
@@ -995,7 +973,7 @@ mod tests {
         let opts = SearchOptions::try_default().expect("search defaults");
         match opts.ctx.compression_backend.canonical_spec() {
             #[cfg(feature = "backend-zpaq")]
-            crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
+            crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method.value(), "5"),
             crate::api::CompressionBackend::Rate {
                 rate_backend,
                 coder,

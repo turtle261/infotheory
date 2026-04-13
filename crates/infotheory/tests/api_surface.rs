@@ -234,7 +234,7 @@ mod zpaq_surface {
         let paths = [sx.as_str(), sy.as_str()];
 
         let backend = CompressionBackend::Zpaq {
-            method: "1".to_string(),
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
         };
         let compiled = backend.compile().expect("compiled zpaq backend");
 

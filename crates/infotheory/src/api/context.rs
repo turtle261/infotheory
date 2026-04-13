@@ -171,7 +171,7 @@ impl InfotheoryCtx {
         Self::from_specs(
             RateBackend::RosaPlus,
             CompressionBackend::Zpaq {
-                method: method.into(),
+                method: crate::api::ZpaqMethodSpec::literal(method.into()),
             },
         )
     }

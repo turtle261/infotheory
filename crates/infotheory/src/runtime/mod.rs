@@ -782,7 +782,7 @@ pub(crate) fn default_rate_backend_spec(kind: RateBackendKind) -> Option<RateBac
             encoding_bits: 8,
         }),
         RateBackendKind::Zpaq => Some(RateBackend::Zpaq {
-            method: "2".to_string(),
+            method: crate::api::ZpaqMethodSpec::literal("2"),
         }),
         RateBackendKind::Particle => Some(RateBackend::Particle {
             spec: Arc::new(crate::api::ParticleSpec::default()),
@@ -790,13 +790,60 @@ pub(crate) fn default_rate_backend_spec(kind: RateBackendKind) -> Option<RateBac
         RateBackendKind::Mixture | RateBackendKind::Calibrated => None,
         #[cfg(feature = "backend-mamba")]
         RateBackendKind::Mamba => Some(RateBackend::MambaMethod {
-            method: "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+            method: crate::mambazip::MethodSpec::Online {
+                cfg: crate::mambazip::OnlineConfig {
+                    hidden: 64,
+                    layers: 1,
+                    intermediate: 96,
+                    state: 16,
+                    conv: 4,
+                    dt_rank: 16,
+                    seed: 26,
+                    train_mode: crate::mambazip::OnlineTrainMode::None,
+                    lr: 0.0,
+                    stride: 1,
+                },
+                policy: Some(crate::backends::llm_policy::LlmPolicy {
+                    load_from: None,
+                    schedule: vec![crate::backends::llm_policy::ScheduleRule::Interval(
+                        crate::backends::llm_policy::PolicyRule {
+                            start: crate::backends::llm_policy::PositionExpr::Bytes(0),
+                            end: crate::backends::llm_policy::PositionExpr::Bytes(100),
+                            action: crate::backends::llm_policy::PolicyAction::Infer,
+                        },
+                    )],
+                }),
+            },
         }),
         #[cfg(not(feature = "backend-mamba"))]
         RateBackendKind::Mamba => None,
         #[cfg(feature = "backend-rwkv")]
         RateBackendKind::Rwkv7 => Some(RateBackend::Rwkv7Method {
-            method: "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer".to_string(),
+            method: crate::rwkvzip::MethodSpec::Online {
+                cfg: crate::rwkvzip::OnlineConfig {
+                    hidden: 64,
+                    layers: 1,
+                    intermediate: 64,
+                    decay_rank: 32,
+                    a_rank: 32,
+                    v_rank: 32,
+                    g_rank: 64,
+                    seed: 0,
+                    train_mode: crate::rwkvzip::OnlineTrainMode::Sgd,
+                    lr: 0.01,
+                    stride: 1,
+                },
+                policy: Some(crate::backends::llm_policy::LlmPolicy {
+                    load_from: None,
+                    schedule: vec![crate::backends::llm_policy::ScheduleRule::Interval(
+                        crate::backends::llm_policy::PolicyRule {
+                            start: crate::backends::llm_policy::PositionExpr::Bytes(0),
+                            end: crate::backends::llm_policy::PositionExpr::Bytes(100),
+                            action: crate::backends::llm_policy::PolicyAction::Infer,
+                        },
+                    )],
+                }),
+            },
         }),
         #[cfg(not(feature = "backend-rwkv"))]
         RateBackendKind::Rwkv7 => None,

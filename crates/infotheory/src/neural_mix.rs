@@ -1,9 +1,8 @@
-#![cfg_attr(not(feature = "all-backends"), allow(dead_code))]
-
 use crate::backends::text_context::NeuralContextState;
 pub(crate) use crate::backends::text_context::NeuralHistoryState;
 
 /// Shared two-stage bytewise neural mixer core used by runtime and compression predictors.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct NeuralMixCore {
     stage1_tables: Vec<Vec<f64>>,
@@ -23,6 +22,7 @@ pub(crate) struct NeuralMixCore {
     evaluated: bool,
 }
 
+#[allow(dead_code)]
 impl NeuralMixCore {
     const STAGE1_CONTEXTS: usize = 4;
     const STAGE1_TABLE_SIZES: [usize; Self::STAGE1_CONTEXTS] = [1, 256, 4096, 4096];

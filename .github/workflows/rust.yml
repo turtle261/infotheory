@@ -366,14 +366,14 @@ jobs:
             OS="$(uname -s)"
             case "$OS" in
               NetBSD)
-                export CARGO_FEATURE_NOJIT=1
+                export ZPAQ_NOJIT=1
                 export CARGO_PROFILE_RELEASE_LTO=off
                 if ! command -v clang >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
                   export CARGO_TARGET_X86_64_UNKNOWN_NETBSD_LINKER=cc
                 fi
                 ;;
               OpenBSD)
-                export CARGO_FEATURE_NOJIT=1
+                export ZPAQ_NOJIT=1
                 ;;
               FreeBSD)
                 :
@@ -381,10 +381,6 @@ jobs:
             esac
 
             export RUSTDOCFLAGS="${{ matrix.rustdocflags }}"
-            if [ "${CARGO_FEATURE_NOJIT:-}" = "1" ]; then
-              export ZPAQ_NOJIT=1
-            fi
-
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-rosa

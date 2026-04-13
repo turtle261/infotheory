@@ -1511,7 +1511,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             #[cfg(feature = "backend-zpaq")]
             RateBackendPredictor::Zpaq { .. } => {
-                Err("plugin entropy is not supported for zpaq rate backends in 1.1.1".to_string())
+                Err("plugin entropy is not supported for zpaq rate backends".to_string())
             }
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.reset_frozen(total_symbols),
@@ -1783,7 +1783,8 @@ impl ExpertConfig {
     #[cfg(feature = "backend-rwkv")]
     pub fn rwkv(name: impl Into<String>, method: impl Into<String>) -> Self {
         let name = name.into();
-        let method = method.into();
+        let method = crate::rwkvzip::parse_method_spec(&method.into())
+            .expect("rwkv expert method must be a valid RWKV method spec");
         Self::uniform(name, move || {
             Box::new(RateBackendPredictor::from_backend(
                 RateBackend::Rwkv7Method {
@@ -1799,7 +1800,8 @@ impl ExpertConfig {
     #[cfg(feature = "backend-mamba")]
     pub fn mamba(name: impl Into<String>, method: impl Into<String>) -> Self {
         let name = name.into();
-        let method = method.into();
+        let method = crate::mambazip::parse_method_spec(&method.into())
+            .expect("mamba expert method must be a valid Mamba method spec");
         Self::uniform(name, move || {
             Box::new(RateBackendPredictor::from_backend(
                 RateBackend::MambaMethod {
@@ -1814,7 +1816,7 @@ impl ExpertConfig {
     /// ZPAQ expert (uniform prior).
     pub fn zpaq(name: impl Into<String>, method: impl Into<String>) -> Self {
         let name = name.into();
-        let method = method.into();
+        let method = crate::api::ZpaqMethodSpec::literal(method.into());
         Self::uniform(name, move || {
             Box::new(RateBackendPredictor::from_backend(
                 RateBackend::Zpaq {
@@ -3706,7 +3708,7 @@ mod tests {
         assert_fill_matches_symbol_queries(
             "rwkv7",
             RateBackend::Rwkv7Method {
-                method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+                method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
             },
         );
     }
@@ -3897,7 +3899,7 @@ mod tests {
     #[test]
     fn zpaq_fill_log_probs_does_not_drift_history() {
         let backend = RateBackend::Zpaq {
-            method: "1".to_string(),
+            method: crate::api::ZpaqMethodSpec::literal("1"),
         };
         let mut baseline =
             RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);

@@ -109,7 +109,7 @@ pub fn try_ncd_bytes(
     variant: NcdVariant,
 ) -> InfotheoryResult<f64> {
     let backend = crate::api::CompressionBackend::Zpaq {
-        method: method.to_string(),
+        method: crate::api::ZpaqMethodSpec::literal(method),
     }
     .compile()
     .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;

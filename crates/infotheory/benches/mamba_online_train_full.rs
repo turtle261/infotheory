@@ -18,7 +18,8 @@ fn bench_data() -> Vec<u8> {
 
 fn backend(method: &str) -> RateBackend {
     RateBackend::MambaMethod {
-        method: method.to_string(),
+        method: infotheory::mambazip::parse_method_spec(method)
+            .expect("mamba benchmark method must be valid"),
     }
 }
 

@@ -49,6 +49,9 @@ pub fn try_get_bytes_from_paths(paths: &[&str]) -> InfotheoryResult<Vec<Vec<u8>>
 
 #[inline(always)]
 /// Read all files once, then compress each buffer with single-stream ZPAQ.
+///
+/// "Sequential" here refers to the codec mode per buffer, not to overall
+/// execution: the per-buffer compressions still run in parallel across inputs.
 pub fn try_get_sequential_compressed_sizes_from_sequential_paths(
     paths: &[&str],
     method: &str,
@@ -76,6 +79,9 @@ pub fn try_get_parallel_compressed_sizes_from_sequential_paths(
 
 #[inline(always)]
 /// Compress each file path independently with single-stream ZPAQ.
+///
+/// "Sequential" here refers to the codec mode per file, not to overall
+/// execution: the per-file compressions still run in parallel across inputs.
 pub fn try_get_sequential_compressed_sizes_from_parallel_paths(
     paths: &[&str],
     method: &str,

@@ -2707,7 +2707,7 @@ mod tests {
                     log_prior: 0.0,
                     max_order: -1,
                     backend: RateBackend::Zpaq {
-                        method: "1".to_string(),
+                        method: crate::api::ZpaqMethodSpec::literal("1"),
                     },
                 },
             ],
@@ -2764,7 +2764,7 @@ mod tests {
                     log_prior: 0.0,
                     max_order: -1,
                     backend: RateBackend::Zpaq {
-                        method: "1".to_string(),
+                        method: crate::api::ZpaqMethodSpec::literal("1"),
                     },
                 },
             ],
@@ -3003,7 +3003,7 @@ mod tests {
         assert_cached_cdf_fast_bitwise_matches_pdf_rows(
             RatePdfPredictor::from_rate_backend(
                 RateBackend::Rwkv7Method {
-                    method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+                    method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
                 },
                 -1,
             )
@@ -3013,7 +3013,7 @@ mod tests {
         assert_cached_cdf_fast_bitwise_matches_pdf_rows(
             RatePdfPredictor::from_rate_backend(
                 RateBackend::MambaMethod {
-                    method: "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+                    method: crate::mambazip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("mamba method spec"),
                 },
                 -1,
             )
@@ -3036,7 +3036,7 @@ mod tests {
     fn roundtrip_rate_rwkv_method_cfg() {
         let data = b"rwkv cfg method backend";
         let backend = RateBackend::Rwkv7Method {
-            method: "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer".to_string(),
+            method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
         };
         let enc =
             compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
@@ -3070,7 +3070,7 @@ mod tests {
     fn compiled_rwkv_rate_pdf_predictor_preserves_backend_pdf_exactly() {
         let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
         let backend = RateBackend::Rwkv7Method {
-            method: method.to_string(),
+            method: crate::rwkvzip::parse_method_spec(method).expect("rwkv method spec"),
         }
         .compile()
         .expect("compiled rwkv backend");
@@ -3143,7 +3143,9 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let backend = RateBackend::Rwkv7Method { method };
+        let backend = RateBackend::Rwkv7Method {
+            method: crate::rwkvzip::parse_method_spec(&method).expect("rwkv method spec"),
+        };
         let seed = include_bytes!("../../../../README.md");
         let target_len = 2_097_152usize;
         let mut data = Vec::with_capacity(target_len);
@@ -3200,7 +3202,7 @@ mod tests {
     fn compiled_mamba_rate_pdf_predictor_preserves_backend_pdf_exactly() {
         let method = "cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer";
         let backend = RateBackend::MambaMethod {
-            method: method.to_string(),
+            method: crate::mambazip::parse_method_spec(method).expect("mamba method spec"),
         }
         .compile()
         .expect("compiled mamba backend");

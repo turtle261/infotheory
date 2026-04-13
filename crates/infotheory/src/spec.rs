@@ -16,9 +16,10 @@ pub use self::document::{
     PlannerInterfaceSpec, PlannerRunDocument, PlannerRunSpec, PlannerRuntimeSpec,
     ResolvedAssetBinding, SharedMemoryPolicySpec, SpecDocument, TuneBoundsSpec, TuneControllerKind,
     TuneControllerSpec, TuneDocument, TuneParameterRangeSpec, TuneSpec, ValidatedPlannerRunSpec,
-    ValidatedTuneSpec, VmActionFilterSpec, VmEnvironmentSpec, VmRewardPolicySpec,
-    VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec, WarmStartExactJhControllerSpec,
-    WarmStartExactJhTuneControllerSpec, load_spec_document,
+    ValidatedTuneSpec, VmActionFilterSpec, VmEnvironmentSpec, VmFuzzMutatorSpec,
+    VmObservationPolicySpec, VmObservationStreamModeSpec, VmPayloadEncodingSpec,
+    VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec,
+    WarmStartExactJhControllerSpec, WarmStartExactJhTuneControllerSpec, load_spec_document,
 };
 
 use crate::api::{
@@ -353,24 +354,6 @@ fn canonicalize_explicit_file_method(
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn rwkv_file_method(path: &Path) -> SpecResult<String> {
-    crate::rwkvzip::canonical_method_string(&crate::rwkvzip::MethodSpec::File {
-        path: path.to_path_buf(),
-        policy: None,
-    })
-    .map_err(|err| SpecError::new(err.to_string()))
-}
-
-#[cfg(feature = "backend-mamba")]
-fn mamba_file_method(path: &Path) -> SpecResult<String> {
-    crate::mambazip::canonical_method_string(&crate::mambazip::MethodSpec::File {
-        path: path.to_path_buf(),
-        policy: None,
-    })
-    .map_err(|err| SpecError::new(err.to_string()))
-}
-
-#[cfg(feature = "backend-rwkv")]
 fn validate_rwkv_method_eager(method: &str) -> SpecResult<()> {
     crate::rwkvzip::Compressor::new_from_method(method)
         .map(|_| ())
@@ -385,44 +368,427 @@ fn validate_mamba_method_eager(method: &str) -> SpecResult<()> {
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn normalize_rwkv_path_method(base_dir: &Path, model_path: &str) -> SpecResult<String> {
-    let full = resolve_spec_path(base_dir, model_path);
-    let method = rwkv_file_method(&full)?;
-    validate_rwkv_method_eager(&method)?;
-    Ok(method)
-}
-
-#[cfg(feature = "backend-mamba")]
-fn normalize_mamba_path_method(base_dir: &Path, model_path: &str) -> SpecResult<String> {
-    let full = resolve_spec_path(base_dir, model_path);
-    let method = mamba_file_method(&full)?;
-    validate_mamba_method_eager(&method)?;
-    Ok(method)
+fn normalize_rwkv_method_spec_for_base_dir(
+    base_dir: &Path,
+    method: &crate::rwkvzip::MethodSpec,
+) -> SpecResult<crate::rwkvzip::MethodSpec> {
+    let normalized = match method {
+        crate::rwkvzip::MethodSpec::File { path, policy } => crate::rwkvzip::MethodSpec::File {
+            path: resolve_spec_path(base_dir, &path.to_string_lossy()),
+            policy: policy.clone(),
+        },
+        crate::rwkvzip::MethodSpec::Online { cfg, policy } => crate::rwkvzip::MethodSpec::Online {
+            cfg: cfg.clone(),
+            policy: policy.clone(),
+        },
+    };
+    let canonical = crate::rwkvzip::canonical_method_string(&normalized)
+        .map_err(|err| SpecError::new(err.to_string()))?;
+    validate_rwkv_method_eager(&canonical)?;
+    Ok(normalized)
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn normalize_rwkv_method_for_base_dir(base_dir: &Path, method: &str) -> SpecResult<String> {
+fn normalize_rwkv_path_method(
+    base_dir: &Path,
+    model_path: &str,
+) -> SpecResult<crate::rwkvzip::MethodSpec> {
+    normalize_rwkv_method_spec_for_base_dir(
+        base_dir,
+        &crate::rwkvzip::MethodSpec::File {
+            path: PathBuf::from(model_path),
+            policy: None,
+        },
+    )
+}
+
+#[cfg(feature = "backend-mamba")]
+fn normalize_mamba_method_spec_for_base_dir(
+    base_dir: &Path,
+    method: &crate::mambazip::MethodSpec,
+) -> SpecResult<crate::mambazip::MethodSpec> {
+    let normalized = match method {
+        crate::mambazip::MethodSpec::File { path, policy } => crate::mambazip::MethodSpec::File {
+            path: resolve_spec_path(base_dir, &path.to_string_lossy()),
+            policy: policy.clone(),
+        },
+        crate::mambazip::MethodSpec::Online { cfg, policy } => {
+            crate::mambazip::MethodSpec::Online {
+                cfg: cfg.clone(),
+                policy: policy.clone(),
+            }
+        }
+    };
+    let canonical = crate::mambazip::canonical_method_string(&normalized)
+        .map_err(|err| SpecError::new(err.to_string()))?;
+    validate_mamba_method_eager(&canonical)?;
+    Ok(normalized)
+}
+
+#[cfg(feature = "backend-mamba")]
+fn normalize_mamba_path_method(
+    base_dir: &Path,
+    model_path: &str,
+) -> SpecResult<crate::mambazip::MethodSpec> {
+    normalize_mamba_method_spec_for_base_dir(
+        base_dir,
+        &crate::mambazip::MethodSpec::File {
+            path: PathBuf::from(model_path),
+            policy: None,
+        },
+    )
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn normalize_rwkv_method_for_base_dir(
+    base_dir: &Path,
+    method: &str,
+) -> SpecResult<crate::rwkvzip::MethodSpec> {
     if let Some(canonical) = canonicalize_explicit_file_method(base_dir, method, "rwkv")? {
-        validate_rwkv_method_eager(&canonical)?;
-        Ok(canonical)
+        let parsed = crate::rwkvzip::parse_method_spec(&canonical)
+            .map_err(|err| SpecError::new(err.to_string()))?;
+        normalize_rwkv_method_spec_for_base_dir(base_dir, &parsed)
     } else {
-        Ok(method.to_string())
+        let parsed = crate::rwkvzip::parse_method_spec(method)
+            .map_err(|err| SpecError::new(err.to_string()))?;
+        normalize_rwkv_method_spec_for_base_dir(base_dir, &parsed)
     }
 }
 
 #[cfg(feature = "backend-mamba")]
-fn normalize_mamba_method_for_base_dir(base_dir: &Path, method: &str) -> SpecResult<String> {
+fn normalize_mamba_method_for_base_dir(
+    base_dir: &Path,
+    method: &str,
+) -> SpecResult<crate::mambazip::MethodSpec> {
     if let Some(canonical) = canonicalize_explicit_file_method(base_dir, method, "mamba")? {
-        validate_mamba_method_eager(&canonical)?;
-        Ok(canonical)
+        let parsed = crate::mambazip::parse_method_spec(&canonical)
+            .map_err(|err| SpecError::new(err.to_string()))?;
+        normalize_mamba_method_spec_for_base_dir(base_dir, &parsed)
     } else {
-        Ok(method.to_string())
+        let parsed = crate::mambazip::parse_method_spec(method)
+            .map_err(|err| SpecError::new(err.to_string()))?;
+        normalize_mamba_method_spec_for_base_dir(base_dir, &parsed)
+    }
+}
+
+#[cfg(feature = "backend-rwkv")]
+const RWKV_POLICY_SCOPES: &[&str] = &[
+    "embed",
+    "pre_norm",
+    "attn_norm",
+    "ffn_norm",
+    "attn",
+    "ffn",
+    "head",
+    "bias",
+    "all",
+    "none",
+];
+
+#[cfg(feature = "backend-mamba")]
+const MAMBA_POLICY_SCOPES: &[&str] = &[
+    "embed",
+    "layer_norm",
+    "mixer_conv",
+    "mixer_ssm",
+    "mixer_proj",
+    "head",
+    "bias",
+    "all",
+    "none",
+];
+
+fn zpaq_method_to_json_value(method: &crate::api::ZpaqMethodSpec) -> serde_json::Value {
+    match method {
+        crate::api::ZpaqMethodSpec::Literal { value } => serde_json::json!({
+            "kind": "literal",
+            "value": value,
+        }),
+    }
+}
+
+fn parse_zpaq_method_json_value(
+    value: &serde_json::Value,
+    default: &str,
+) -> SpecResult<crate::api::ZpaqMethodSpec> {
+    if value.is_null() {
+        return Ok(crate::api::ZpaqMethodSpec::literal(default));
+    }
+    if let Some(method) = value.as_str() {
+        return Ok(crate::api::ZpaqMethodSpec::literal(method));
+    }
+
+    let kind = value["kind"]
+        .as_str()
+        .ok_or_else(|| SpecError::new("zpaq method.kind is required for object form"))?;
+    if kind != "literal" {
+        return Err(SpecError::new(format!("unknown zpaq method kind '{kind}'")));
+    }
+
+    let method = value["value"]
+        .as_str()
+        .ok_or_else(|| SpecError::new("zpaq method.value must be a string"))?;
+    Ok(crate::api::ZpaqMethodSpec::literal(method))
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn rwkv_online_config_to_json_value(cfg: &crate::rwkvzip::OnlineConfig) -> serde_json::Value {
+    serde_json::json!({
+        "hidden": cfg.hidden,
+        "layers": cfg.layers,
+        "intermediate": cfg.intermediate,
+        "decay_rank": cfg.decay_rank,
+        "a_rank": cfg.a_rank,
+        "v_rank": cfg.v_rank,
+        "g_rank": cfg.g_rank,
+        "seed": cfg.seed,
+        "train_mode": match cfg.train_mode {
+            crate::rwkvzip::OnlineTrainMode::None => "none",
+            crate::rwkvzip::OnlineTrainMode::Sgd => "sgd",
+            crate::rwkvzip::OnlineTrainMode::Adam => "adam",
+        },
+        "lr": cfg.lr,
+        "stride": cfg.stride,
+    })
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn rwkv_online_config_from_json_value(
+    value: &serde_json::Value,
+) -> SpecResult<crate::rwkvzip::OnlineConfig> {
+    let defaults = crate::rwkvzip::OnlineConfig::default();
+    let train_mode = match value["train_mode"].as_str().unwrap_or("none") {
+        "none" => crate::rwkvzip::OnlineTrainMode::None,
+        "sgd" => crate::rwkvzip::OnlineTrainMode::Sgd,
+        "adam" => crate::rwkvzip::OnlineTrainMode::Adam,
+        other => {
+            return Err(SpecError::new(format!("unknown rwkv train_mode '{other}'")));
+        }
+    };
+    Ok(crate::rwkvzip::OnlineConfig {
+        hidden: value["hidden"].as_u64().unwrap_or(defaults.hidden as u64) as usize,
+        layers: value["layers"].as_u64().unwrap_or(defaults.layers as u64) as usize,
+        intermediate: value["intermediate"]
+            .as_u64()
+            .unwrap_or(defaults.intermediate as u64) as usize,
+        decay_rank: value["decay_rank"]
+            .as_u64()
+            .unwrap_or(defaults.decay_rank as u64) as usize,
+        a_rank: value["a_rank"].as_u64().unwrap_or(defaults.a_rank as u64) as usize,
+        v_rank: value["v_rank"].as_u64().unwrap_or(defaults.v_rank as u64) as usize,
+        g_rank: value["g_rank"].as_u64().unwrap_or(defaults.g_rank as u64) as usize,
+        seed: value["seed"].as_u64().unwrap_or(defaults.seed),
+        train_mode,
+        lr: value["lr"].as_f64().unwrap_or(defaults.lr as f64) as f32,
+        stride: value["stride"].as_u64().unwrap_or(defaults.stride as u64) as usize,
+    })
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn rwkv_method_to_json_value(method: &crate::rwkvzip::MethodSpec) -> SpecResult<serde_json::Value> {
+    Ok(match method {
+        crate::rwkvzip::MethodSpec::File { path, policy } => serde_json::json!({
+            "kind": "file",
+            "path": path.to_string_lossy(),
+            "policy": policy.as_ref().map(crate::backends::llm_policy::LlmPolicy::canonical),
+        }),
+        crate::rwkvzip::MethodSpec::Online { cfg, policy } => serde_json::json!({
+            "kind": "online",
+            "cfg": rwkv_online_config_to_json_value(&cfg),
+            "policy": policy.as_ref().map(crate::backends::llm_policy::LlmPolicy::canonical),
+        }),
+    })
+}
+
+#[cfg(feature = "backend-rwkv")]
+fn parse_rwkv_method_json_value(
+    value: &serde_json::Value,
+    base_dir: &Path,
+) -> SpecResult<crate::rwkvzip::MethodSpec> {
+    if let Some(method) = value.as_str() {
+        return normalize_rwkv_method_for_base_dir(base_dir, method);
+    }
+    match value["kind"].as_str().unwrap_or("file") {
+        "file" => {
+            let path = value["path"]
+                .as_str()
+                .ok_or_else(|| SpecError::new("rwkv method.path is required"))?;
+            let policy = value["policy"]
+                .as_str()
+                .map(|raw| {
+                    crate::backends::llm_policy::parse_policy_segment(raw, RWKV_POLICY_SCOPES)
+                })
+                .transpose()
+                .map_err(|err| SpecError::new(err.to_string()))?;
+            normalize_rwkv_method_spec_for_base_dir(
+                base_dir,
+                &crate::rwkvzip::MethodSpec::File {
+                    path: resolve_spec_path(base_dir, path),
+                    policy,
+                },
+            )
+        }
+        "online" => {
+            let cfg = rwkv_online_config_from_json_value(&value["cfg"])?;
+            let policy = value["policy"]
+                .as_str()
+                .map(|raw| {
+                    crate::backends::llm_policy::parse_policy_segment(raw, RWKV_POLICY_SCOPES)
+                })
+                .transpose()
+                .map_err(|err| SpecError::new(err.to_string()))?;
+            normalize_rwkv_method_spec_for_base_dir(
+                base_dir,
+                &crate::rwkvzip::MethodSpec::Online { cfg, policy },
+            )
+        }
+        other => Err(SpecError::new(format!(
+            "unknown rwkv method kind '{other}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "backend-mamba")]
+fn mamba_online_config_to_json_value(cfg: &crate::mambazip::OnlineConfig) -> serde_json::Value {
+    serde_json::json!({
+        "hidden": cfg.hidden,
+        "layers": cfg.layers,
+        "intermediate": cfg.intermediate,
+        "state": cfg.state,
+        "conv": cfg.conv,
+        "dt_rank": cfg.dt_rank,
+        "seed": cfg.seed,
+        "train_mode": match cfg.train_mode {
+            crate::mambazip::OnlineTrainMode::None => "none",
+            crate::mambazip::OnlineTrainMode::Sgd => "sgd",
+            crate::mambazip::OnlineTrainMode::Adam => "adam",
+        },
+        "lr": cfg.lr,
+        "stride": cfg.stride,
+    })
+}
+
+#[cfg(feature = "backend-mamba")]
+fn mamba_online_config_from_json_value(
+    value: &serde_json::Value,
+) -> SpecResult<crate::mambazip::OnlineConfig> {
+    let defaults = crate::mambazip::OnlineConfig::default();
+    let train_mode = match value["train_mode"].as_str().unwrap_or("none") {
+        "none" => crate::mambazip::OnlineTrainMode::None,
+        "sgd" => crate::mambazip::OnlineTrainMode::Sgd,
+        "adam" => crate::mambazip::OnlineTrainMode::Adam,
+        other => {
+            return Err(SpecError::new(format!(
+                "unknown mamba train_mode '{other}'"
+            )));
+        }
+    };
+    Ok(crate::mambazip::OnlineConfig {
+        hidden: value["hidden"].as_u64().unwrap_or(defaults.hidden as u64) as usize,
+        layers: value["layers"].as_u64().unwrap_or(defaults.layers as u64) as usize,
+        intermediate: value["intermediate"]
+            .as_u64()
+            .unwrap_or(defaults.intermediate as u64) as usize,
+        state: value["state"].as_u64().unwrap_or(defaults.state as u64) as usize,
+        conv: value["conv"].as_u64().unwrap_or(defaults.conv as u64) as usize,
+        dt_rank: value["dt_rank"].as_u64().unwrap_or(defaults.dt_rank as u64) as usize,
+        seed: value["seed"].as_u64().unwrap_or(defaults.seed),
+        train_mode,
+        lr: value["lr"].as_f64().unwrap_or(defaults.lr as f64) as f32,
+        stride: value["stride"].as_u64().unwrap_or(defaults.stride as u64) as usize,
+    })
+}
+
+#[cfg(feature = "backend-mamba")]
+fn mamba_method_to_json_value(
+    method: &crate::mambazip::MethodSpec,
+) -> SpecResult<serde_json::Value> {
+    Ok(match method {
+        crate::mambazip::MethodSpec::File { path, policy } => serde_json::json!({
+            "kind": "file",
+            "path": path.to_string_lossy(),
+            "policy": policy.as_ref().map(crate::backends::llm_policy::LlmPolicy::canonical),
+        }),
+        crate::mambazip::MethodSpec::Online { cfg, policy } => serde_json::json!({
+            "kind": "online",
+            "cfg": mamba_online_config_to_json_value(&cfg),
+            "policy": policy.as_ref().map(crate::backends::llm_policy::LlmPolicy::canonical),
+        }),
+    })
+}
+
+#[cfg(feature = "backend-mamba")]
+fn parse_mamba_method_json_value(
+    value: &serde_json::Value,
+    base_dir: &Path,
+) -> SpecResult<crate::mambazip::MethodSpec> {
+    if let Some(method) = value.as_str() {
+        return normalize_mamba_method_for_base_dir(base_dir, method);
+    }
+    match value["kind"].as_str().unwrap_or("file") {
+        "file" => {
+            let path = value["path"]
+                .as_str()
+                .ok_or_else(|| SpecError::new("mamba method.path is required"))?;
+            let policy = value["policy"]
+                .as_str()
+                .map(|raw| {
+                    crate::backends::llm_policy::parse_policy_segment(raw, MAMBA_POLICY_SCOPES)
+                })
+                .transpose()
+                .map_err(|err| SpecError::new(err.to_string()))?;
+            normalize_mamba_method_spec_for_base_dir(
+                base_dir,
+                &crate::mambazip::MethodSpec::File {
+                    path: resolve_spec_path(base_dir, path),
+                    policy,
+                },
+            )
+        }
+        "online" => {
+            let cfg = mamba_online_config_from_json_value(&value["cfg"])?;
+            let policy = value["policy"]
+                .as_str()
+                .map(|raw| {
+                    crate::backends::llm_policy::parse_policy_segment(raw, MAMBA_POLICY_SCOPES)
+                })
+                .transpose()
+                .map_err(|err| SpecError::new(err.to_string()))?;
+            normalize_mamba_method_spec_for_base_dir(
+                base_dir,
+                &crate::mambazip::MethodSpec::Online { cfg, policy },
+            )
+        }
+        other => Err(SpecError::new(format!(
+            "unknown mamba method kind '{other}'"
+        ))),
     }
 }
 
 /// Parse an RWKV7 compression backend from a method string or configured model path,
 /// preserving the shared direct-vs-rate-coded lowering semantics across CLI, JSON,
 /// and binding surfaces.
+#[cfg(feature = "backend-rwkv")]
+fn lower_rwkv7_compression_backend_method(
+    method: crate::rwkvzip::MethodSpec,
+    coder: crate::coders::CoderType,
+    framing: crate::compression::FramingMode,
+) -> CompressionBackend {
+    match method {
+        crate::rwkvzip::MethodSpec::File { policy: None, .. } => {
+            CompressionBackend::Rwkv7 { method, coder }
+        }
+        crate::rwkvzip::MethodSpec::File {
+            policy: Some(_), ..
+        }
+        | crate::rwkvzip::MethodSpec::Online { .. } => CompressionBackend::Rate {
+            rate_backend: RateBackend::Rwkv7Method { method },
+            coder,
+            framing,
+        },
+    }
+}
+
 pub fn parse_rwkv7_compression_backend_method(
     method: Option<&str>,
     coder: crate::coders::CoderType,
@@ -440,24 +806,11 @@ pub fn parse_rwkv7_compression_backend_method(
             })?;
             normalize_rwkv_path_method(&options.base_dir, model_path)?
         };
-        let parsed = crate::rwkvzip::parse_method_spec(&method).map_err(|err| {
-            SpecError::new(format!(
-                "invalid rwkv7 compression method '{method}': {err}"
-            ))
-        })?;
-        match parsed {
-            crate::rwkvzip::MethodSpec::File { policy: None, .. } => {
-                Ok(CompressionBackend::Rwkv7 { method, coder })
-            }
-            crate::rwkvzip::MethodSpec::File {
-                policy: Some(_), ..
-            }
-            | crate::rwkvzip::MethodSpec::Online { .. } => Ok(CompressionBackend::Rate {
-                rate_backend: RateBackend::Rwkv7Method { method },
-                coder,
-                framing: options.default_framing,
-            }),
-        }
+        Ok(lower_rwkv7_compression_backend_method(
+            method,
+            coder,
+            options.default_framing,
+        ))
     }
     #[cfg(not(feature = "backend-rwkv"))]
     {
@@ -597,16 +950,16 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
         #[cfg(feature = "backend-mamba")]
         RateBackend::MambaMethod { method } => Ok(serde_json::json!({
             "kind": canonical,
-            "method": method,
+            "method": mamba_method_to_json_value(method)?,
         })),
         #[cfg(feature = "backend-rwkv")]
         RateBackend::Rwkv7Method { method } => Ok(serde_json::json!({
             "kind": canonical,
-            "method": method,
+            "method": rwkv_method_to_json_value(method)?,
         })),
         RateBackend::Zpaq { method } => Ok(serde_json::json!({
             "kind": canonical,
-            "method": method,
+            "method": zpaq_method_to_json_value(method),
         })),
         RateBackend::Mixture { spec } => Ok(serde_json::json!({
             "kind": canonical,
@@ -645,12 +998,12 @@ pub fn compression_backend_to_json_value(
     match backend {
         CompressionBackend::Zpaq { method } => Ok(serde_json::json!({
             "kind": canonical,
-            "method": method,
+            "method": zpaq_method_to_json_value(method),
         })),
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { method, coder } => Ok(serde_json::json!({
             "kind": canonical,
-            "method": method,
+            "method": rwkv_method_to_json_value(method)?,
             "coder": match coder {
                 crate::coders::CoderType::AC => "ac",
                 crate::coders::CoderType::RANS => "rans",
@@ -823,14 +1176,19 @@ pub fn parse_rate_backend_json(
             context_bytes: v["context_bytes"].as_u64().unwrap_or(64) as usize,
         }),
         crate::runtime::RateBackendKind::Zpaq => {
-            let method = v["method"].as_str().unwrap_or("2").to_string();
-            validate_zpaq_rate_method(&method).map_err(|err| SpecError::new(err.to_string()))?;
+            let method = parse_zpaq_method_json_value(&v["method"], "2")?;
+            validate_zpaq_rate_method(method.value())
+                .map_err(|err| SpecError::new(err.to_string()))?;
             Ok(RateBackend::Zpaq { method })
         }
         crate::runtime::RateBackendKind::Mamba => {
             #[cfg(feature = "backend-mamba")]
             {
-                if let Some(method) = v["method"].as_str().or_else(|| v["mamba_method"].as_str()) {
+                if !v["method"].is_null() {
+                    Ok(RateBackend::MambaMethod {
+                        method: parse_mamba_method_json_value(&v["method"], base_dir)?,
+                    })
+                } else if let Some(method) = v["mamba_method"].as_str() {
                     Ok(RateBackend::MambaMethod {
                         method: normalize_mamba_method_for_base_dir(base_dir, method)?,
                     })
@@ -854,7 +1212,11 @@ pub fn parse_rate_backend_json(
         crate::runtime::RateBackendKind::Rwkv7 => {
             #[cfg(feature = "backend-rwkv")]
             {
-                if let Some(method) = v["method"].as_str().or_else(|| v["rwkv_method"].as_str()) {
+                if !v["method"].is_null() {
+                    Ok(RateBackend::Rwkv7Method {
+                        method: parse_rwkv_method_json_value(&v["method"], base_dir)?,
+                    })
+                } else if let Some(method) = v["rwkv_method"].as_str() {
                     Ok(RateBackend::Rwkv7Method {
                         method: normalize_rwkv_method_for_base_dir(base_dir, method)?,
                     })
@@ -951,9 +1313,16 @@ pub fn parse_compression_backend_json(
         .unwrap_or(default_framing);
 
     match kind {
-        crate::runtime::CompressionBackendKind::Zpaq => Ok(CompressionBackend::Zpaq {
-            method: v["method"].as_str().unwrap_or("5").to_string(),
-        }),
+        crate::runtime::CompressionBackendKind::Zpaq => {
+            let method = parse_zpaq_method_json_value(&v["method"], "5")?;
+            crate::zpaq_compress_to_vec(&[], method.value()).map_err(|err| {
+                SpecError::new(format!(
+                    "invalid zpaq compression method '{}': {err}",
+                    method.value()
+                ))
+            })?;
+            Ok(CompressionBackend::Zpaq { method })
+        }
         crate::runtime::CompressionBackendKind::RateAc
         | crate::runtime::CompressionBackendKind::RateRans => {
             let rate_backend = if let Some(rate_backend_v) = v.get("rate_backend") {
@@ -984,13 +1353,24 @@ pub fn parse_compression_backend_json(
                 } else {
                     crate::coders::CoderType::AC
                 };
-                let method = v["method"].as_str().or_else(|| v["rwkv_method"].as_str());
+                let parsed_method = if !v["method"].is_null() {
+                    Some(parse_rwkv_method_json_value(&v["method"], base_dir)?)
+                } else {
+                    None
+                };
                 let model_path = v["rwkv_model_path"]
                     .as_str()
                     .or_else(|| v["model_path"].as_str());
-                if method.is_none() && model_path.is_none() {
+                if parsed_method.is_none()
+                    && v["rwkv_method"].as_str().is_none()
+                    && model_path.is_none()
+                {
                     Err(SpecError::new(
                         "rwkv7 compression backend requires 'method' or 'model_path'",
+                    ))
+                } else if let Some(method) = parsed_method {
+                    Ok(lower_rwkv7_compression_backend_method(
+                        method, coder, framing,
                     ))
                 } else {
                     let opts = CompressionBackendShorthandOptions {
@@ -999,7 +1379,7 @@ pub fn parse_compression_backend_json(
                         default_rwkv_model_path: model_path.map(ToOwned::to_owned),
                         ..Default::default()
                     };
-                    parse_rwkv7_compression_backend_method(method, coder, &opts)
+                    parse_rwkv7_compression_backend_method(v["rwkv_method"].as_str(), coder, &opts)
                 }
             }
             #[cfg(not(feature = "backend-rwkv"))]
@@ -1285,7 +1665,9 @@ pub fn parse_rate_backend_name_method(
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| options.zpaq_method.clone());
             validate_zpaq_rate_method(&method).map_err(|err| SpecError::new(err.to_string()))?;
-            Ok(RateBackend::Zpaq { method })
+            Ok(RateBackend::Zpaq {
+                method: crate::api::ZpaqMethodSpec::literal(method),
+            })
         }
         crate::runtime::RateBackendKind::Mamba => {
             #[cfg(feature = "backend-mamba")]
@@ -1391,11 +1773,17 @@ pub fn parse_compression_backend_name_method(
     let method = method.filter(|value| !value.is_empty());
 
     match kind {
-        crate::runtime::CompressionBackendKind::Zpaq => Ok(CompressionBackend::Zpaq {
-            method: method
+        crate::runtime::CompressionBackendKind::Zpaq => {
+            let method = method
                 .map(ToOwned::to_owned)
-                .unwrap_or_else(|| options.zpaq_method.clone()),
-        }),
+                .unwrap_or_else(|| options.zpaq_method.clone());
+            crate::zpaq_compress_to_vec(&[], &method).map_err(|err| {
+                SpecError::new(format!("invalid zpaq compression method '{method}': {err}"))
+            })?;
+            Ok(CompressionBackend::Zpaq {
+                method: crate::api::ZpaqMethodSpec::literal(method),
+            })
+        }
         crate::runtime::CompressionBackendKind::RateAc => Ok(CompressionBackend::Rate {
             rate_backend: rate_backend
                 .or_else(|| options.default_rate_backend.clone())
@@ -1591,7 +1979,7 @@ mod tests {
 
         if cfg!(feature = "backend-zpaq") {
             backends.push(CompressionBackend::Zpaq {
-                method: "5".to_string(),
+                method: crate::api::ZpaqMethodSpec::literal("5"),
             });
         }
 
@@ -1831,7 +2219,7 @@ mod tests {
         }
 
         match zpaq {
-            CompressionBackend::Zpaq { method } => assert_eq!(method, "5"),
+            CompressionBackend::Zpaq { method } => assert_eq!(method.value(), "5"),
             _ => panic!("unexpected zpaq backend"),
         }
     }
@@ -1900,6 +2288,47 @@ mod tests {
 
     #[cfg(feature = "backend-rwkv")]
     #[test]
+    fn parse_compression_backend_json_wraps_typed_rwkv_methods_as_rate_backend() {
+        let json = serde_json::json!({
+            "kind": "rwkv7",
+            "method": {
+                "kind": "online",
+                "cfg": {
+                    "hidden": 64,
+                    "intermediate": 64,
+                    "layers": 1,
+                    "train_mode": "sgd",
+                    "lr": 0.01
+                },
+                "policy": "schedule=0..100:infer"
+            },
+            "coder": "ac",
+            "framing": "framed"
+        });
+
+        let backend = parse_compression_backend_json(
+            &json,
+            Path::new("."),
+            None,
+            crate::compression::FramingMode::Raw,
+        )
+        .expect("parse typed rwkv compression backend json");
+
+        match backend {
+            CompressionBackend::Rate {
+                rate_backend: RateBackend::Rwkv7Method { .. },
+                coder,
+                framing,
+            } => {
+                assert_eq!(coder, CoderType::AC);
+                assert_eq!(framing, crate::compression::FramingMode::Framed);
+            }
+            _ => panic!("expected rate-coded RWKV backend"),
+        }
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
     fn normalize_rwkv_method_for_base_dir_decodes_reserved_file_escapes_once() {
         let base_dir = Path::new("/tmp/spec-base");
         let method = "file:weights/model%3Bv1%25done.safetensors";
@@ -1957,5 +2386,135 @@ mod tests {
             }
             _ => panic!("expected rate-coded mamba backend"),
         }
+    }
+
+    #[cfg(feature = "backend-zpaq")]
+    #[test]
+    fn canonical_json_emits_typed_zpaq_method_objects() {
+        let rate = serde_json::from_str::<serde_json::Value>(
+            &rate_backend_to_canonical_json(&RateBackend::Zpaq {
+                method: crate::api::ZpaqMethodSpec::literal("5"),
+            })
+            .expect("rate json"),
+        )
+        .expect("valid rate json");
+        assert_eq!(rate["kind"], "zpaq");
+        assert_eq!(rate["method"]["kind"], "literal");
+        assert_eq!(rate["method"]["value"], "5");
+
+        let compression = serde_json::from_str::<serde_json::Value>(
+            &compression_backend_to_canonical_json(&CompressionBackend::Zpaq {
+                method: crate::api::ZpaqMethodSpec::literal("5"),
+            })
+            .expect("compression json"),
+        )
+        .expect("valid compression json");
+        assert_eq!(compression["kind"], "zpaq");
+        assert_eq!(compression["method"]["kind"], "literal");
+        assert_eq!(compression["method"]["value"], "5");
+    }
+
+    #[cfg(feature = "backend-zpaq")]
+    #[test]
+    fn parse_typed_zpaq_method_objects_are_strictly_validated() {
+        let err = parse_rate_backend_json(
+            &serde_json::json!({
+                "kind": "zpaq",
+                "method": {"kind": "literal"}
+            }),
+            Path::new("."),
+            MAX_MIXTURE_NESTING,
+        )
+        .err()
+        .expect("missing typed zpaq value must fail");
+        assert!(err.message.contains("method.value"), "{err}");
+
+        let err = parse_rate_backend_json(
+            &serde_json::json!({
+                "kind": "zpaq",
+                "method": {"value": "2"}
+            }),
+            Path::new("."),
+            MAX_MIXTURE_NESTING,
+        )
+        .err()
+        .expect("missing typed zpaq kind must fail");
+        assert!(err.message.contains("method.kind"), "{err}");
+
+        let err = parse_compression_backend_json(
+            &serde_json::json!({
+                "kind": "zpaq",
+                "method": {"kind": "nonliteral", "value": "5"}
+            }),
+            Path::new("."),
+            None,
+            crate::compression::FramingMode::Framed,
+        )
+        .err()
+        .expect("unknown typed zpaq kind must fail");
+        assert!(err.message.contains("unknown zpaq method kind"), "{err}");
+    }
+
+    #[cfg(feature = "backend-zpaq")]
+    #[test]
+    fn parse_zpaq_method_accepts_legacy_string_compatibility_input() {
+        let rate = parse_rate_backend_json(
+            &serde_json::json!({"kind": "zpaq", "method": "2"}),
+            Path::new("."),
+            MAX_MIXTURE_NESTING,
+        )
+        .expect("legacy rate method string should parse");
+        assert!(matches!(rate, RateBackend::Zpaq { method } if method.value() == "2"));
+
+        let compression = parse_compression_backend_json(
+            &serde_json::json!({"kind": "zpaq"}),
+            Path::new("."),
+            None,
+            crate::compression::FramingMode::Framed,
+        )
+        .expect("missing method should use default compression method");
+        assert!(
+            matches!(compression, CompressionBackend::Zpaq { method } if method.value() == "5")
+        );
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn canonical_json_emits_typed_rwkv_method_objects() {
+        let value = serde_json::from_str::<serde_json::Value>(
+            &rate_backend_to_canonical_json(&RateBackend::Rwkv7Method {
+                method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,intermediate=64,layers=1")
+                    .expect("rwkv method spec"),
+            })
+            .expect("rate json"),
+        )
+        .expect("valid rate json");
+
+        assert_eq!(value["kind"], "rwkv7");
+        assert_eq!(value["method"]["kind"], "online");
+        assert_eq!(value["method"]["cfg"]["hidden"], 64);
+        assert_eq!(value["method"]["cfg"]["layers"], 1);
+        assert_eq!(value["method"]["cfg"]["intermediate"], 64);
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn canonical_json_emits_typed_mamba_method_objects() {
+        let value = serde_json::from_str::<serde_json::Value>(
+            &rate_backend_to_canonical_json(&RateBackend::MambaMethod {
+                method: crate::mambazip::parse_method_spec(
+                    "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16",
+                )
+                .expect("mamba method spec"),
+            })
+            .expect("rate json"),
+        )
+        .expect("valid rate json");
+
+        assert_eq!(value["kind"], "mamba");
+        assert_eq!(value["method"]["kind"], "online");
+        assert_eq!(value["method"]["cfg"]["hidden"], 64);
+        assert_eq!(value["method"]["cfg"]["layers"], 1);
+        assert_eq!(value["method"]["cfg"]["intermediate"], 96);
     }
 }
