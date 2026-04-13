@@ -624,6 +624,48 @@ impl Predictor for RateBackendBitPredictor {
     }
 }
 
+/// Build the predictor used by the MC-AIXI runtime from a compiled backend.
+pub(crate) fn build_mc_aixi_predictor(
+    backend: &CompiledRateBackend,
+    max_order: i64,
+    #[allow(unused_variables)] percept_bits: usize,
+) -> Result<Box<dyn Predictor>, String> {
+    match backend.canonical_spec() {
+        #[cfg(feature = "backend-ctw")]
+        RateBackend::FacCtw { base_depth, .. } => {
+            Ok(Box::new(FacCtwPredictor::new(*base_depth, percept_bits)))
+        }
+        #[cfg(feature = "backend-ctw")]
+        RateBackend::Ctw { depth } => Ok(Box::new(CtwPredictor::new(*depth))),
+        #[cfg(feature = "backend-rosa")]
+        RateBackend::RosaPlus => Ok(Box::new(RosaPredictor::new(max_order))),
+        _ => Ok(Box::new(RateBackendBitPredictor::from_compiled(
+            backend.clone(),
+            max_order,
+        )?)),
+    }
+}
+
+/// Build the predictor used by the AIQI runtime from a compiled backend.
+pub(crate) fn build_aiqi_predictor(
+    backend: &CompiledRateBackend,
+    max_order: i64,
+    #[allow(unused_variables)] return_bits: usize,
+) -> Result<Box<dyn Predictor>, String> {
+    match backend.canonical_spec() {
+        #[cfg(feature = "backend-ctw")]
+        RateBackend::Ctw { depth } => Ok(Box::new(CtwPredictor::new(*depth))),
+        #[cfg(feature = "backend-ctw")]
+        RateBackend::FacCtw { base_depth, .. } => {
+            Ok(Box::new(FacCtwPredictor::new(*base_depth, return_bits)))
+        }
+        _ => Ok(Box::new(RateBackendBitPredictor::from_compiled(
+            backend.clone(),
+            max_order,
+        )?)),
+    }
+}
+
 #[cfg(feature = "backend-rwkv")]
 use crate::coders::softmax_pdf_floor_inplace;
 

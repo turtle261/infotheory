@@ -31,19 +31,20 @@
 
 mod cli;
 
-use infotheory::aixi::agent::{Agent, AgentConfig};
-use infotheory::aixi::aiqi::{AiqiAgent, AiqiConfig};
-use infotheory::aixi::common::{ObservationKeyMode, RandomGenerator};
+use infotheory::aixi::agent::Agent;
+use infotheory::aixi::aiqi::AiqiAgent;
+use infotheory::aixi::common::RandomGenerator;
 use infotheory::aixi::environment::{
     BiasedRockPaperScissor, CoinFlip, CtwTest, Environment, ExtendedTiger, KuhnPoker, TicTacToe,
 };
-#[cfg(feature = "vm")]
+#[cfg(all(test, feature = "vm"))]
 use infotheory::aixi::vm_nyx::{
     FuzzMutator as NyxFuzzMutator, NyxActionFilter, NyxActionSource, NyxActionSpec, NyxFuzzConfig,
     NyxObservationPolicy, NyxObservationStreamMode, NyxProtocolConfig, NyxRewardPolicy,
-    NyxRewardShaping, NyxTraceConfig, NyxVmConfig, NyxVmEnvironment,
-    PayloadEncoding as NyxPayloadEncoding,
+    NyxRewardShaping, NyxTraceConfig, PayloadEncoding as NyxPayloadEncoding,
 };
+#[cfg(feature = "vm")]
+use infotheory::aixi::vm_nyx::{NyxVmConfig, NyxVmEnvironment};
 use infotheory::api::*;
 #[cfg(feature = "backend-mamba")]
 use infotheory::mambazip;
@@ -52,39 +53,41 @@ use infotheory::rwkvzip;
 #[cfg(feature = "backend-sequitur")]
 use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
 use infotheory::spec::{
-    self, BuiltinEnvironmentSpec, ControllerSpec, EnvironmentSpec, PlannerRunSpec, SpecDocument,
+    self, BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec,
+    PlannerRuntimeSpec, SpecDocument,
 };
-#[cfg(feature = "vm")]
+#[cfg(all(test, feature = "vm"))]
 use nyx_lite::SharedMemoryPolicy;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 #[cfg(feature = "vm")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(not(feature = "vm"))]
 use std::time::Instant;
 
 #[cfg(all(test, feature = "all-backends"))]
 use crate::cli::load_expert_spec;
-#[cfg(feature = "vm")]
-use crate::cli::parse_nyx_environment_config;
+#[cfg(all(test, feature = "vm"))]
+use crate::cli::parse_vm_stats_backend;
 use crate::cli::{
-    aiqi_backend_label, build_ctx, file_roundtrip_compiled_backend, load_mixture_spec,
-    maybe_export_online_model, parse_compression_backend, parse_observation_key_mode_for_env,
-    parse_observation_stream_len_for_env, parse_rate_backend, parse_vm_stats_backend, read_file,
-    read_stdin_all_for_generate, run_batch_mode, validate_obs_stream_len,
-    validate_observation_config,
+    build_ctx, file_roundtrip_compiled_backend, load_mixture_spec, maybe_export_online_model,
+    parse_compression_backend, parse_rate_backend, read_file, read_stdin_all_for_generate,
+    run_batch_mode, validate_obs_stream_len,
 };
 #[cfg(feature = "backend-sequitur")]
 use crate::cli::{bytes_to_hex, parse_hex_bytes};
 #[cfg(test)]
 use crate::cli::{
-    file_roundtrip_backend, parse_observation_key_mode, parse_observation_key_mode_for_vm,
-    parse_observation_key_mode_str, parse_observation_stream_len,
-    parse_observation_stream_len_for_vm, process_json_line,
+    file_roundtrip_backend, parse_observation_key_mode, parse_observation_key_mode_for_env,
+    parse_observation_key_mode_for_vm, parse_observation_key_mode_str,
+    parse_observation_stream_len, parse_observation_stream_len_for_env,
+    parse_observation_stream_len_for_vm, process_json_line, validate_observation_config,
 };
+#[cfg(test)]
+use infotheory::aixi::common::ObservationKeyMode;
 #[cfg(feature = "backend-rosa")]
 use infotheory::search;
 
@@ -183,9 +186,9 @@ struct AixiRunLogger {
 }
 
 impl AixiRunLogger {
-    fn new(v: &serde_json::Value) -> anyhow::Result<Option<Self>> {
-        let bits01_path = v["trace_bits01_path"].as_str();
-        let jsonl_path = v["trace_jsonl_path"].as_str();
+    fn new(v: Option<&serde_json::Value>) -> anyhow::Result<Option<Self>> {
+        let bits01_path = v.and_then(|value| value["trace_bits01_path"].as_str());
+        let jsonl_path = v.and_then(|value| value["trace_jsonl_path"].as_str());
         if bits01_path.is_none() && jsonl_path.is_none() {
             return Ok(None);
         }
@@ -202,7 +205,9 @@ impl AixiRunLogger {
         } else {
             None
         };
-        let flush_every = v["trace_flush_every"].as_u64().unwrap_or(1024) as usize;
+        let flush_every = v
+            .and_then(|value| value["trace_flush_every"].as_u64())
+            .unwrap_or(1024) as usize;
 
         Ok(Some(Self {
             bits01,
@@ -324,15 +329,6 @@ fn is_canonical_spec_document(value: &serde_json::Value) -> bool {
     value["schema_version"].as_u64().is_some() && value["kind"].as_str().is_some()
 }
 
-fn observation_key_mode_name(mode: ObservationKeyMode) -> &'static str {
-    match mode {
-        ObservationKeyMode::First => "first",
-        ObservationKeyMode::Last => "last",
-        ObservationKeyMode::FullStream => "full-stream",
-        ObservationKeyMode::StreamHash => "stream-hash",
-    }
-}
-
 fn builtin_environment_name(spec: BuiltinEnvironmentSpec) -> &'static str {
     match spec {
         BuiltinEnvironmentSpec::CoinFlip => "coin-flip",
@@ -344,764 +340,424 @@ fn builtin_environment_name(spec: BuiltinEnvironmentSpec) -> &'static str {
     }
 }
 
-#[cfg(feature = "vm")]
-fn resolve_spec_asset_path(
-    assets: &[infotheory::spec::AssetBinding],
-    id: &str,
-    config_dir: &Path,
-) -> anyhow::Result<String> {
-    let binding = assets
-        .iter()
-        .find(|binding| binding.id == id)
-        .ok_or_else(|| anyhow::anyhow!("planner_run references unknown asset id '{id}'"))?;
-    let full = infotheory::spec::resolve_spec_path(config_dir, &binding.path);
-    Ok(full.display().to_string())
+fn legacy_planner_config_error(path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "legacy aixi JSON configs are no longer executable; convert '{}' to a canonical planner_run document with top-level 'schema_version' and 'kind'",
+        path
+    )
 }
 
-#[cfg(feature = "vm")]
-fn vm_environment_spec_to_legacy_json(
-    vm: &infotheory::spec::VmEnvironmentSpec,
-    assets: &[infotheory::spec::AssetBinding],
-    config_dir: &Path,
-) -> anyhow::Result<serde_json::Value> {
-    let firecracker_config =
-        resolve_spec_asset_path(assets, &vm.firecracker_config_asset, config_dir)?;
-    let shared_memory_policy = match vm.shared_memory_policy {
-        infotheory::spec::SharedMemoryPolicySpec::Preserve => "preserve",
-        infotheory::spec::SharedMemoryPolicySpec::Snapshot => "snapshot",
-    };
-    let reward_policy = match &vm.reward_policy {
-        infotheory::spec::VmRewardPolicySpec::FromGuest => serde_json::json!({
-            "mode": "guest",
-        }),
-        infotheory::spec::VmRewardPolicySpec::Pattern {
-            pattern,
-            base_reward,
-            bonus_reward,
-        } => serde_json::json!({
-            "mode": "pattern",
-            "pattern": pattern,
-            "base_reward": base_reward,
-            "bonus_reward": bonus_reward,
-        }),
-    };
-    let reward_shaping = match &vm.reward_shaping {
-        Some(infotheory::spec::VmRewardShapingSpec::EntropyReduction {
-            baseline_asset,
-            max_order,
-            scale,
-            crash_bonus,
-            timeout_bonus,
-        }) => Some(serde_json::json!({
-            "mode": "entropy-reduction",
-            "baseline_path": resolve_spec_asset_path(assets, baseline_asset, config_dir)?,
-            "max_order": max_order,
-            "scale": scale,
-            "crash_bonus": crash_bonus,
-            "timeout_bonus": timeout_bonus,
-        })),
-        Some(infotheory::spec::VmRewardShapingSpec::TraceEntropy {
-            max_order,
-            scale,
-            normalize,
-        }) => Some(serde_json::json!({
-            "mode": "trace-entropy",
-            "max_order": max_order,
-            "scale": scale,
-            "normalize": normalize,
-        })),
-        None => None,
-    };
-    let actions = match &vm.action_source {
-        infotheory::spec::VmRuntimeActionSourceSpec::Literal {
-            names,
-            payloads,
-            encoding,
-        } => serde_json::json!({
-            "mode": "literal",
-            "actions": payloads.iter().enumerate().map(|(index, payload)| serde_json::json!({
-                "name": names.get(index).cloned().flatten(),
-                "payload": payload,
-                "encoding": encoding,
-            })).collect::<Vec<_>>(),
-        }),
-        infotheory::spec::VmRuntimeActionSourceSpec::Fuzz {
-            seeds,
-            encoding,
-            mutators,
-            min_len,
-            max_len,
-            dictionary,
-            rng_seed,
-        } => serde_json::json!({
-            "mode": "fuzz",
-            "seed_inputs": seeds,
-            "seed_encoding": encoding,
-            "mutators": mutators,
-            "min_len": min_len,
-            "max_len": max_len,
-            "dictionary": dictionary,
-            "dict_encoding": encoding,
-            "rng_seed": rng_seed,
-        }),
-    };
-    let filter = vm
-        .action_filter
-        .as_ref()
-        .map(|filter| -> anyhow::Result<serde_json::Value> {
-            let novelty_prior_path = filter
-                .novelty_prior_asset
-                .as_ref()
-                .map(|id| resolve_spec_asset_path(assets, id, config_dir))
-                .transpose()?;
-            Ok(serde_json::json!({
-                "min_entropy": filter.min_entropy,
-                "max_entropy": filter.max_entropy,
-                "min_intrinsic_dependence": filter.min_intrinsic_dependence,
-                "min_novelty": filter.min_novelty,
-                "novelty_prior_path": novelty_prior_path,
-                "max_order": filter.max_order,
-                "reject_reward": filter.reject_reward,
-            }))
-        })
-        .transpose()?;
-    let trace = vm.trace.as_ref().map(|trace| {
-        serde_json::json!({
-            "shared_region_name": trace.shared_region_name,
-            "max_bytes": trace.max_bytes,
-            "reset_on_episode": trace.reset_on_episode,
-        })
-    });
-
-    Ok(serde_json::json!({
-        "firecracker_config": firecracker_config,
-        "instance_id": vm.instance_id,
-        "shared_region_name": vm.shared_region_name,
-        "shared_region_size": vm.shared_region_size,
-        "shared_memory_policy": shared_memory_policy,
-        "step_timeout_ms": vm.step_timeout_ms,
-        "boot_timeout_ms": vm.boot_timeout_ms,
-        "episode_steps": vm.episode_steps,
-        "step_cost": vm.step_cost,
-        "debug": vm.debug_mode,
-        "protocol": {
-            "action_prefix": vm.action_prefix,
-            "action_suffix": vm.action_suffix,
-            "obs_prefix": vm.obs_prefix,
-            "rew_prefix": vm.rew_prefix,
-            "done_prefix": vm.done_prefix,
-            "data_prefix": vm.data_prefix,
-            "wire_encoding": vm.wire_encoding,
-        },
-        "stats_backend": spec::rate_backend_to_json_value(&vm.stats_backend).map_err(anyhow::Error::msg)?,
-        "trace": trace,
-        "actions": actions,
-        "observation": {
-            "mode": vm.observation_policy,
-            "stream_len": vm.observation_stream_len,
-            "stream_mode": vm.observation_stream_mode,
-            "pad_byte": vm.observation_pad_byte,
-        },
-        "reward": reward_policy,
-        "reward_shaping": reward_shaping,
-        "filter": filter,
-    }))
+#[derive(Clone, Copy)]
+enum PlannerPhase {
+    Learn,
+    Eval,
 }
 
-fn planner_run_spec_to_legacy_json(
-    spec: &PlannerRunSpec,
-    _config_dir: &Path,
-) -> anyhow::Result<serde_json::Value> {
-    let mut value = serde_json::json!({
-        "observation_bits": spec.interface.observation_bits,
-        "observation_stream_len": spec.interface.observation_stream_len,
-        "observation_key_mode": observation_key_mode_name(spec.interface.observation_key_mode),
-        "reward_bits": spec.interface.reward_bits,
-        "agent_actions": spec.interface.agent_actions,
-        "reward_offset": spec.interface.reward_offset,
-        "random_seed": spec.runtime.random_seed,
-        "learn_cycles": spec.runtime.learn_cycles,
-        "eval_cycles": spec.runtime.eval_cycles,
-        "terminate-lifetime": spec.runtime.terminate_lifetime,
-        "log_every": spec.runtime.log_every,
-        "perf": spec.runtime.perf,
-        "vm_perf_only": spec.runtime.vm_perf_only,
-        "explore_epsilon": spec.runtime.explore_epsilon,
-        "explore_gamma": spec.runtime.explore_gamma,
-    });
-
-    match &spec.environment {
-        EnvironmentSpec::Builtin { builtin } => {
-            value["environment"] = serde_json::json!(builtin_environment_name(*builtin));
-        }
-        #[cfg(feature = "vm")]
-        EnvironmentSpec::NyxVm(vm) => {
-            value["environment"] = serde_json::json!("vm");
-            value["vm_config"] = vm_environment_spec_to_legacy_json(vm, &spec.assets, _config_dir)?;
-        }
-    }
-
-    match &spec.controller {
-        ControllerSpec::McAixi(inner) => {
-            value["planner"] = serde_json::json!("mc-aixi");
-            value["algorithm"] = serde_json::json!("ctw");
-            value["rate_backend"] =
-                spec::rate_backend_to_json_value(&inner.predictor).map_err(anyhow::Error::msg)?;
-            value["rate_backend_max_order"] = serde_json::json!(inner.predictor_max_order);
-            value["agent_horizon"] = serde_json::json!(inner.agent_horizon);
-            value["num_simulations"] = serde_json::json!(inner.num_simulations);
-            value["exploration_exploitation_ratio"] =
-                serde_json::json!(inner.exploration_exploitation_ratio);
-            value["discount_gamma"] = serde_json::json!(inner.discount_gamma);
-        }
-        ControllerSpec::AiqiDiscounted(inner) => {
-            value["planner"] = serde_json::json!("aiqi");
-            value["algorithm"] = serde_json::json!("ac-ctw");
-            value["aiqi_rate_backend"] =
-                spec::rate_backend_to_json_value(&inner.predictor).map_err(anyhow::Error::msg)?;
-            value["rate_backend_max_order"] = serde_json::json!(inner.predictor_max_order);
-            value["discount_gamma"] = serde_json::json!(inner.discount_gamma);
-            value["return_horizon"] = serde_json::json!(inner.return_horizon);
-            value["return_bins"] = serde_json::json!(inner.return_bins);
-            value["augmentation_period"] = serde_json::json!(inner.augmentation_period);
-            value["history_prune_keep_steps"] = serde_json::json!(inner.history_prune_keep_steps);
-            value["baseline_exploration"] = serde_json::json!(inner.baseline_exploration);
-        }
-        ControllerSpec::AiqiWarmstartExactJh(_) => {
-            return Err(anyhow::anyhow!(
-                "planner_run controller kind 'aiqi_warmstart_exact_jh' is not executable from the CLI yet"
-            ));
-        }
-    }
-
-    Ok(value)
+struct PlannerRunSchedule {
+    learn_cycles: usize,
+    eval_cycles: usize,
+    log_every: usize,
+    perf: bool,
+    vm_perf_only: bool,
+    explore_epsilon: f64,
+    explore_gamma: f64,
 }
 
-fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
-    let mut file = File::open(config_path)?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    let v: serde_json::Value = serde_json::from_str(&content)?;
-    let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
-    if is_canonical_spec_document(&v) {
-        return match infotheory::spec::load_spec_document(config_path)
-            .map_err(anyhow::Error::msg)?
-        {
-            SpecDocument::PlannerRun(spec) => {
-                let legacy = planner_run_spec_to_legacy_json(&spec, config_dir)?;
-                run_aixi_mode_value(&legacy, config_dir)
-            }
-            SpecDocument::Tune(_) => Err(anyhow::anyhow!(
-                "aixi expects a planner_run document, found kind 'tune'"
-            )),
-            SpecDocument::RateBackend(_) => Err(anyhow::anyhow!(
-                "aixi expects a planner_run document, found kind 'rate_backend'"
-            )),
-            SpecDocument::CompressionBackend(_) => Err(anyhow::anyhow!(
-                "aixi expects a planner_run document, found kind 'compression_backend'"
-            )),
+impl PlannerRunSchedule {
+    fn from_runtime(runtime: &PlannerRuntimeSpec) -> Self {
+        let terminate_lifetime = runtime.terminate_lifetime;
+        let (learn_cycles, eval_cycles) = match (runtime.learn_cycles, runtime.eval_cycles) {
+            (Some(learn), Some(eval)) => (learn, eval),
+            (Some(learn), None) => (learn, 0usize),
+            (None, Some(eval)) => (terminate_lifetime, eval),
+            (None, None) => (terminate_lifetime, 0usize),
         };
-    }
-    run_aixi_mode_value(&v, config_dir)
-}
-
-fn run_aixi_mode_value(v: &serde_json::Value, config_dir: &Path) -> anyhow::Result<()> {
-    let env_name = v["environment"].as_str().unwrap_or("coin-flip");
-    let mut env: Box<dyn Environment> = match env_name {
-        "coin-flip" => Box::new(CoinFlip::new(0.9)),
-        "ctw-test" | "ctwtest" => Box::new(CtwTest::new()),
-        "extended-tiger" => Box::new(ExtendedTiger::new()),
-        "tictactoe" => Box::new(TicTacToe::new()),
-        "biased-rock-paper-scissor" => Box::new(BiasedRockPaperScissor::new()),
-        "kuhn-poker" => Box::new(KuhnPoker::new()),
-        "external" => {
-            return Err(anyhow::anyhow!(
-                "environment=external (ProcessEnvironment) has been removed for security reasons. \
-                Use NyxVmEnvironment with --features vm for secure sandboxed environments."
-            ));
+        Self {
+            learn_cycles,
+            eval_cycles,
+            log_every: runtime.log_every,
+            perf: runtime.perf,
+            vm_perf_only: runtime.vm_perf_only,
+            explore_epsilon: runtime.explore_epsilon,
+            explore_gamma: runtime.explore_gamma,
         }
-        "vm" | "nyx" | "nyx-vm" => {
-            #[cfg(not(feature = "vm"))]
-            {
-                return Err(anyhow::anyhow!(
-                    "VM environments require the `vm` feature (enable with --features vm)"
-                ));
-            }
-            #[cfg(feature = "vm")]
-            {
-                let observation_bits = v["observation_bits"].as_u64().unwrap_or(16) as usize;
-                let reward_bits = v["reward_bits"].as_u64().unwrap_or(8) as usize;
-                let agent_horizon = v["agent_horizon"].as_u64().unwrap_or(3) as usize;
-                let vm_cfg = parse_nyx_environment_config(
-                    &v,
-                    observation_bits,
-                    reward_bits,
-                    agent_horizon,
-                    config_dir,
-                )?;
-                Box::new(NyxVmEnvironment::new(vm_cfg)?)
-            }
-        }
-        _ => return Err(anyhow::anyhow!("Unknown environment: {}", env_name)),
-    };
-
-    // Use the run seed for environment stochasticity as well, so environment
-    // trajectories are reproducible across repeated runs.
-    let run_random_seed = v["random_seed"].as_u64().or_else(|| v["rng_seed"].as_u64());
-    if let Some(seed) = run_random_seed {
-        env.set_random_seed(seed);
     }
 
-    let log_every = v["log_every"].as_u64().unwrap_or(1) as usize;
-    let perf = v["perf"].as_bool().unwrap_or(false);
-    let vm_perf_only = v["vm_perf_only"].as_bool().unwrap_or(false);
-
-    if vm_perf_only {
-        let cycles = v["perf_cycles"]
-            .as_u64()
-            .or_else(|| v["terminate-lifetime"].as_u64())
-            .unwrap_or(1000) as usize;
-        let observation_stream_len = parse_observation_stream_len_for_env(&v, env_name);
-        let mut obs_stream = env.drain_observations();
-        validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
-        let mut obs = obs_stream.first().copied().unwrap_or(0);
-        let mut rew = env.get_reward();
-        let start = Instant::now();
-        for t in 0..cycles {
-            if log_every > 0 && t % log_every == 0 {
-                println!("Cycle {}: Obs={}, Rew={}", t, obs, rew);
-            }
-            env.perform_action(0);
-            obs_stream = env.drain_observations();
-            validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
-            obs = obs_stream.first().copied().unwrap_or(0);
-            rew = env.get_reward();
-        }
-        if perf {
-            let elapsed = start.elapsed().as_secs_f64().max(1e-9);
-            let cps = cycles as f64 / elapsed;
-            println!("Perf cycles/s: {:.2}", cps);
-        }
-        return Ok(());
-    }
-
-    let observation_bits = v["observation_bits"]
-        .as_u64()
-        .map(|n| n as usize)
-        .unwrap_or_else(|| env.get_observation_bits());
-    let observation_stream_len = parse_observation_stream_len_for_env(&v, env_name);
-    let observation_key_mode = parse_observation_key_mode_for_env(&v, env_name);
-    validate_observation_config(env_name, &v, observation_stream_len, observation_key_mode)?;
-    let reward_bits = v["reward_bits"]
-        .as_u64()
-        .map(|n| n as usize)
-        .unwrap_or_else(|| env.get_reward_bits());
-    let agent_actions = v["agent_actions"]
-        .as_u64()
-        .map(|n| n as usize)
-        .unwrap_or_else(|| env.get_num_actions());
-    let min_reward = env.min_reward();
-    let max_reward = env.max_reward();
-    let reward_offset = v["reward_offset"]
-        .as_i64()
-        .unwrap_or_else(|| (-min_reward).max(0));
-    let discount_gamma = v["discount_gamma"].as_f64().unwrap_or(1.0);
-    if !(0.0..=1.0).contains(&discount_gamma) {
-        return Err(anyhow::anyhow!(
-            "discount_gamma must be in [0, 1] (got {})",
-            discount_gamma
-        ));
-    }
-
-    let planner = v["planner"]
-        .as_str()
-        .or_else(|| v["solver"].as_str())
-        .unwrap_or("mc-aixi");
-    let planner_norm = planner.to_ascii_lowercase();
-    if !matches!(planner_norm.as_str(), "mc-aixi" | "aiqi") {
-        return Err(anyhow::anyhow!(
-            "Unknown planner/solver '{}'. Supported values: mc-aixi, aiqi",
-            planner
-        ));
-    }
-    if planner_norm.as_str() == "aiqi" {
-        let aiqi_random_seed = v["aiqi_random_seed"].as_u64().or(run_random_seed);
-        let aiqi_rate_backend = if !v["aiqi_rate_backend"].is_null() {
-            Some(parse_vm_stats_backend(
-                &v["aiqi_rate_backend"],
-                &v,
-                config_dir,
-            )?)
-        } else if !v["rate_backend"].is_null() {
-            Some(parse_vm_stats_backend(&v["rate_backend"], &v, config_dir)?)
-        } else {
-            None
-        };
-
-        let aiqi_discount_gamma = if v["discount_gamma"].is_null() {
-            0.99
-        } else {
-            discount_gamma
-        };
-
-        let aiqi_config = AiqiConfig {
-            algorithm: v["algorithm"].as_str().unwrap_or("ac-ctw").to_string(),
-            ct_depth: v["ct_depth"].as_u64().unwrap_or(20) as usize,
-            observation_bits,
-            observation_stream_len,
-            reward_bits,
-            agent_actions,
-            min_reward,
-            max_reward,
-            reward_offset,
-            discount_gamma: aiqi_discount_gamma,
-            return_horizon: v["return_horizon"]
-                .as_u64()
-                .or_else(|| v["agent_horizon"].as_u64())
-                .unwrap_or(3) as usize,
-            return_bins: v["return_bins"]
-                .as_u64()
-                .or_else(|| v["aiqi_bins"].as_u64())
-                .unwrap_or(16) as usize,
-            augmentation_period: v["augmentation_period"]
-                .as_u64()
-                .or_else(|| v["aiqi_period"].as_u64())
-                .or_else(|| v["return_horizon"].as_u64())
-                .or_else(|| v["agent_horizon"].as_u64())
-                .unwrap_or(3) as usize,
-            history_prune_keep_steps: v["history_prune_keep_steps"]
-                .as_u64()
-                .or_else(|| v["aiqi_history_prune_keep_steps"].as_u64())
-                .map(|n| n as usize),
-            baseline_exploration: v["baseline_exploration"]
-                .as_f64()
-                .or_else(|| v["tau"].as_f64())
-                .unwrap_or(0.01),
-            random_seed: aiqi_random_seed,
-            rate_backend: aiqi_rate_backend,
-            rate_backend_max_order: v["rate_backend_max_order"]
-                .as_i64()
-                .or_else(|| v["max_order"].as_i64())
-                .or_else(|| v["rosa_max_order"].as_i64())
-                .unwrap_or(20),
-            rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
-            rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
-            zpaq_method: v["zpaq_method"].as_str().map(|s| s.to_string()),
-        };
-        let aiqi_backend_desc = aiqi_backend_label(&aiqi_config);
-        let mut aiqi = AiqiAgent::new(aiqi_config).map_err(|e| anyhow::anyhow!(e))?;
-
-        println!(
-            "AIQI initialized ({}) for {} environment.",
-            aiqi_backend_desc, env_name
-        );
-
-        let learn_cycles = v["learn_cycles"].as_u64().map(|n| n as usize);
-        let eval_cycles = v["eval_cycles"].as_u64().map(|n| n as usize);
-        let cycles = v["terminate-lifetime"].as_u64().unwrap_or(20) as usize;
-
-        let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
-            (Some(l), Some(e)) => (l, e),
-            (Some(l), None) => (l, 0usize),
-            (None, Some(e)) => (cycles, e),
-            (None, None) => (cycles, 0usize),
-        };
-
-        let mut obs_stream = env.drain_observations();
-        validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
-        let mut rew = env.get_reward();
-        let mut learn_total_reward: i64 = 0;
-        let mut eval_total_reward: i64 = 0;
-
-        let explore_epsilon = v["explore_epsilon"].as_f64().unwrap_or(0.0);
-        let explore_gamma = v["explore_gamma"].as_f64().unwrap_or(1.0);
-
-        let mut trace_logger = AixiRunLogger::new(&v)?;
-
-        let learn_start = Instant::now();
-        for t in 0..learn_cycles {
-            let extra_explore_p = if explore_epsilon > 0.0 {
-                (explore_epsilon * explore_gamma.powi(t as i32)).min(1.0)
-            } else {
-                0.0
-            };
-
-            let action = aiqi.get_planned_action_with_extra_exploration(extra_explore_p);
-            if log_every > 0 && t % log_every == 0 {
-                println!(
-                    "Cycle {}: Action={} Obs={:?} Rew={}",
-                    t, action, obs_stream, rew
-                );
-            }
-
-            if let Some(l) = trace_logger.as_mut() {
-                let action_bits = env.get_action_bits();
-                l.log_action(action, action_bits)?;
-            }
-
-            env.perform_action(action);
-            obs_stream = env.drain_observations();
-            validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
-            rew = env.get_reward();
-
-            if let Some(l) = trace_logger.as_mut() {
-                l.log_percept(
-                    &obs_stream,
-                    rew,
-                    observation_bits,
-                    reward_bits,
-                    reward_offset,
-                )?;
-                l.next_step()?;
-            }
-
-            aiqi.observe_transition(action, &obs_stream, rew)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            learn_total_reward += rew;
-        }
-
-        if perf && learn_cycles > 0 {
-            let elapsed = learn_start.elapsed().as_secs_f64().max(1e-9);
-            let cps = learn_cycles as f64 / elapsed;
-            println!("Learn cycles/s: {:.2}", cps);
-        }
-
-        if eval_cycles > 0 {
-            let eval_start = Instant::now();
-            for t in 0..eval_cycles {
-                let step = learn_cycles + t;
-                let action = aiqi.get_planned_action();
-                if log_every > 0 && step % log_every == 0 {
-                    println!(
-                        "Cycle {}: Action={} Obs={:?} Rew={}",
-                        step, action, obs_stream, rew
-                    );
-                }
-
-                if let Some(l) = trace_logger.as_mut() {
-                    let action_bits = env.get_action_bits();
-                    l.log_action(action, action_bits)?;
-                }
-
-                env.perform_action(action);
-                obs_stream = env.drain_observations();
-                validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
-                rew = env.get_reward();
-
-                if let Some(l) = trace_logger.as_mut() {
-                    l.log_percept(
-                        &obs_stream,
-                        rew,
-                        observation_bits,
-                        reward_bits,
-                        reward_offset,
-                    )?;
-                    l.next_step()?;
-                }
-
-                aiqi.observe_transition(action, &obs_stream, rew)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                eval_total_reward += rew;
-            }
-
-            if perf && eval_cycles > 0 {
-                let elapsed = eval_start.elapsed().as_secs_f64().max(1e-9);
-                let cps = eval_cycles as f64 / elapsed;
-                println!("Eval cycles/s: {:.2}", cps);
-            }
-
-            let avg = (eval_total_reward as f64) / (eval_cycles as f64);
-            println!("Eval Total Reward: {}", eval_total_reward);
-            println!("Eval Average Reward per Cycle: {:.6}", avg);
-        }
-
-        println!("Total Reward: {}", learn_total_reward);
-        return Ok(());
-    }
-
-    let mcaixi_random_seed = v["mcaixi_random_seed"].as_u64().or(run_random_seed);
-    let config = AgentConfig {
-        algorithm: v["algorithm"].as_str().unwrap_or("ctw").to_string(),
-        ct_depth: v["ct_depth"].as_u64().unwrap_or(20) as usize,
-        agent_horizon: v["agent_horizon"].as_u64().unwrap_or(3) as usize,
-        observation_bits,
-        observation_stream_len,
-        observation_key_mode,
-        reward_bits,
-        agent_actions,
-        num_simulations: v["num_simulations"].as_u64().unwrap_or(50) as usize,
-        exploration_exploitation_ratio: v["exploration_exploitation_ratio"].as_f64().unwrap_or(1.4),
-        discount_gamma,
-        min_reward,
-        max_reward,
-        reward_offset,
-        random_seed: mcaixi_random_seed,
-        rate_backend: if !v["rate_backend"].is_null() {
-            Some(parse_vm_stats_backend(&v["rate_backend"], &v, config_dir)?)
-        } else {
-            None
-        },
-        rate_backend_max_order: v["rate_backend_max_order"]
-            .as_i64()
-            .or_else(|| v["max_order"].as_i64())
-            .or_else(|| v["rosa_max_order"].as_i64())
-            .unwrap_or(20),
-        rwkv_model_path: v["rwkv_model_path"].as_str().map(|s| s.to_string()),
-        rwkv_method: v["rwkv_method"].as_str().map(|s| s.to_string()),
-        mamba_model_path: v["mamba_model_path"].as_str().map(|s| s.to_string()),
-        mamba_method: v["mamba_method"].as_str().map(|s| s.to_string()),
-        rosa_max_order: v["rosa_max_order"].as_u64().map(|n| n as i64),
-        zpaq_method: v["zpaq_method"].as_str().map(|s| s.to_string()),
-    };
-
-    let mut agent = Agent::try_new(config).map_err(|err| anyhow::anyhow!(err))?;
-    println!(
-        "Agent initialized with {} algorithm for {} environment.",
-        v["algorithm"].as_str().unwrap_or("ctw"),
-        env_name
-    );
-
-    let learn_cycles = v["learn_cycles"].as_u64().map(|n| n as usize);
-    let eval_cycles = v["eval_cycles"].as_u64().map(|n| n as usize);
-    let cycles = v["terminate-lifetime"].as_u64().unwrap_or(20) as usize;
-
-    let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
-        (Some(l), Some(e)) => (l, e),
-        (Some(l), None) => (l, 0usize),
-        (None, Some(e)) => (cycles, e),
-        (None, None) => (cycles, 0usize),
-    };
-
-    let mut total_reward = 0;
-    let mut prev_action = 0;
-    let mut obs_stream = env.drain_observations();
-    validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
-    let mut obs_repr = agent.observation_repr_from_stream(&obs_stream);
-    let mut rew = env.get_reward();
-
-    let explore_epsilon = v["explore_epsilon"].as_f64().unwrap_or(0.0);
-    let explore_gamma = v["explore_gamma"].as_f64().unwrap_or(1.0);
-    let mut explore_rng = if let Some(seed) = mcaixi_random_seed {
-        RandomGenerator::from_seed(seed).fork_with(0x4558504c4f52455f)
-    } else {
-        RandomGenerator::new()
-    };
-
-    // Optional trace logger: can emit a RWKV-friendly stream (0/1 bytes) and/or JSONL metadata.
-    // NOTE: The bits are emitted in the same order the agent consumes them:
-    // percept bits (obs stream + reward) first, then action bits.
-    let mut trace_logger = AixiRunLogger::new(&v)?;
-
-    let learn_start = Instant::now();
-    for t in 0..learn_cycles {
-        if log_every > 0 && t % log_every == 0 {
-            println!("Cycle {}: Obs={:?}, Rew={}", t, obs_repr, rew);
-        }
-        if let Some(l) = trace_logger.as_mut() {
-            l.log_percept(
-                &obs_stream,
-                rew,
-                observation_bits,
-                reward_bits,
-                reward_offset,
-            )?;
-        }
-        agent.model_update_percept_stream(&obs_stream, rew);
-
-        let explore_p = if explore_epsilon > 0.0 {
-            explore_epsilon * explore_gamma.powi(t as i32)
+    fn extra_exploration(&self, step: usize) -> f64 {
+        if self.explore_epsilon > 0.0 {
+            (self.explore_epsilon * self.explore_gamma.powi(step as i32)).min(1.0)
         } else {
             0.0
-        };
-        let action = if explore_p > 0.0 && explore_rng.gen_bool(explore_p.min(1.0)) {
-            explore_rng.gen_range(agent_actions) as u64
-        } else {
-            agent.get_planned_action(&obs_stream, rew, prev_action)
-        };
-        if log_every > 0 && t % log_every == 0 {
-            println!("Cycle {}: Planned Action={}", t, action);
         }
+    }
+}
 
-        if let Some(l) = trace_logger.as_mut() {
-            // Mirror the agent's action encoding (same number of bits).
-            let action_bits = env.get_action_bits();
-            l.log_action(action, action_bits)?;
-        }
-        agent.model_update_action_external(action);
-        env.perform_action(action);
-        obs_stream = env.drain_observations();
-        validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
-        obs_repr = agent.observation_repr_from_stream(&obs_stream);
-        rew = env.get_reward();
-        prev_action = action;
-        total_reward += rew;
+struct PlannerExecutionContext {
+    env: Box<dyn Environment>,
+    observation_bits: usize,
+    observation_stream_len: usize,
+    reward_bits: usize,
+    reward_offset: i64,
+    agent_actions: usize,
+    obs_stream: Vec<u64>,
+    rew: i64,
+    trace_logger: Option<AixiRunLogger>,
+}
 
-        if let Some(l) = trace_logger.as_mut() {
-            l.next_step()?;
+impl PlannerExecutionContext {
+    fn new(
+        compiled: &CompiledPlannerRunSpec,
+        mut env: Box<dyn Environment>,
+        cli_overlay: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Self> {
+        let obs_stream = env.drain_observations();
+        validate_obs_stream_len(
+            compiled.interface().observation_stream_len,
+            obs_stream.len(),
+        )?;
+        let rew = env.get_reward();
+        Ok(Self {
+            observation_bits: compiled.interface().observation_bits,
+            observation_stream_len: compiled.interface().observation_stream_len,
+            reward_bits: compiled.interface().reward_bits,
+            reward_offset: compiled.interface().reward_offset,
+            agent_actions: compiled.interface().agent_actions,
+            trace_logger: AixiRunLogger::new(cli_overlay)?,
+            env,
+            obs_stream,
+            rew,
+        })
+    }
+
+    fn perform_action(&mut self, action: u64) -> anyhow::Result<i64> {
+        self.env.perform_action(action);
+        self.obs_stream = self.env.drain_observations();
+        validate_obs_stream_len(self.observation_stream_len, self.obs_stream.len())?;
+        self.rew = self.env.get_reward();
+        Ok(self.rew)
+    }
+}
+
+enum PlannerControllerRuntime {
+    McAixi {
+        agent: Agent,
+        prev_action: u64,
+        explore_rng: RandomGenerator,
+    },
+    AiqiDiscounted {
+        agent: AiqiAgent,
+    },
+}
+
+impl PlannerControllerRuntime {
+    fn from_compiled(compiled: &CompiledPlannerRunSpec) -> anyhow::Result<Self> {
+        match compiled.controller() {
+            CompiledPlannerController::McAixi { .. } => {
+                let agent =
+                    Agent::from_compiled_planner_run(compiled).map_err(anyhow::Error::msg)?;
+                let explore_rng = if let Some(seed) = compiled.runtime().random_seed {
+                    RandomGenerator::from_seed(seed).fork_with(0x4558_504c_4f52_455f)
+                } else {
+                    RandomGenerator::new()
+                };
+                Ok(Self::McAixi {
+                    agent,
+                    prev_action: 0,
+                    explore_rng,
+                })
+            }
+            CompiledPlannerController::AiqiDiscounted { .. } => Ok(Self::AiqiDiscounted {
+                agent: AiqiAgent::from_compiled_planner_run(compiled)
+                    .map_err(anyhow::Error::msg)?,
+            }),
+            CompiledPlannerController::AiqiWarmstartExactJh { .. } => Err(anyhow::anyhow!(
+                "planner_run controller kind 'aiqi_warmstart_exact_jh' is not executable from the CLI yet"
+            )),
         }
     }
 
-    if perf && learn_cycles > 0 {
+    fn run_cycle(
+        &mut self,
+        phase: PlannerPhase,
+        step: usize,
+        schedule: &PlannerRunSchedule,
+        ctx: &mut PlannerExecutionContext,
+    ) -> anyhow::Result<i64> {
+        match self {
+            Self::McAixi {
+                agent,
+                prev_action,
+                explore_rng,
+            } => {
+                let obs_repr = agent.observation_repr_from_stream(&ctx.obs_stream);
+                if schedule.log_every > 0 && step % schedule.log_every == 0 {
+                    println!("Cycle {}: Obs={:?}, Rew={}", step, obs_repr, ctx.rew);
+                }
+                if let Some(logger) = ctx.trace_logger.as_mut() {
+                    logger.log_percept(
+                        &ctx.obs_stream,
+                        ctx.rew,
+                        ctx.observation_bits,
+                        ctx.reward_bits,
+                        ctx.reward_offset,
+                    )?;
+                }
+                agent.model_update_percept_stream(&ctx.obs_stream, ctx.rew);
+
+                let action = match phase {
+                    PlannerPhase::Learn => {
+                        let explore_p = schedule.extra_exploration(step);
+                        if explore_p > 0.0 && explore_rng.gen_bool(explore_p) {
+                            explore_rng.gen_range(ctx.agent_actions) as u64
+                        } else {
+                            agent.get_planned_action(&ctx.obs_stream, ctx.rew, *prev_action)
+                        }
+                    }
+                    PlannerPhase::Eval => {
+                        agent.get_planned_action(&ctx.obs_stream, ctx.rew, *prev_action)
+                    }
+                };
+                if schedule.log_every > 0 && step % schedule.log_every == 0 {
+                    println!("Cycle {}: Planned Action={}", step, action);
+                }
+                if let Some(logger) = ctx.trace_logger.as_mut() {
+                    logger.log_action(action, ctx.env.get_action_bits())?;
+                }
+                agent.model_update_action_external(action);
+                let reward = ctx.perform_action(action)?;
+                *prev_action = action;
+                if let Some(logger) = ctx.trace_logger.as_mut() {
+                    logger.next_step()?;
+                }
+                Ok(reward)
+            }
+            Self::AiqiDiscounted { agent } => {
+                let action = match phase {
+                    PlannerPhase::Learn => agent.get_planned_action_with_extra_exploration(
+                        schedule.extra_exploration(step),
+                    ),
+                    PlannerPhase::Eval => agent.get_planned_action(),
+                };
+                if schedule.log_every > 0 && step % schedule.log_every == 0 {
+                    println!(
+                        "Cycle {}: Action={} Obs={:?} Rew={}",
+                        step, action, ctx.obs_stream, ctx.rew
+                    );
+                }
+                if let Some(logger) = ctx.trace_logger.as_mut() {
+                    logger.log_action(action, ctx.env.get_action_bits())?;
+                }
+                let reward = ctx.perform_action(action)?;
+                if let Some(logger) = ctx.trace_logger.as_mut() {
+                    logger.log_percept(
+                        &ctx.obs_stream,
+                        ctx.rew,
+                        ctx.observation_bits,
+                        ctx.reward_bits,
+                        ctx.reward_offset,
+                    )?;
+                    logger.next_step()?;
+                }
+                agent
+                    .observe_transition(action, &ctx.obs_stream, ctx.rew)
+                    .map_err(anyhow::Error::msg)?;
+                Ok(reward)
+            }
+        }
+    }
+}
+
+fn controller_backend_label(controller: &CompiledPlannerController) -> String {
+    match controller {
+        CompiledPlannerController::McAixi {
+            predictor,
+            predictor_max_order,
+            ..
+        }
+        | CompiledPlannerController::AiqiDiscounted {
+            predictor,
+            predictor_max_order,
+            ..
+        }
+        | CompiledPlannerController::AiqiWarmstartExactJh {
+            predictor,
+            predictor_max_order,
+            ..
+        } => predictor.display_label(*predictor_max_order),
+    }
+}
+
+fn build_builtin_environment(spec: BuiltinEnvironmentSpec) -> Box<dyn Environment> {
+    match spec {
+        BuiltinEnvironmentSpec::CoinFlip => Box::new(CoinFlip::new(0.9)),
+        BuiltinEnvironmentSpec::CtwTest => Box::new(CtwTest::new()),
+        BuiltinEnvironmentSpec::ExtendedTiger => Box::new(ExtendedTiger::new()),
+        BuiltinEnvironmentSpec::TicTacToe => Box::new(TicTacToe::new()),
+        BuiltinEnvironmentSpec::BiasedRockPaperScissor => Box::new(BiasedRockPaperScissor::new()),
+        BuiltinEnvironmentSpec::KuhnPoker => Box::new(KuhnPoker::new()),
+    }
+}
+
+#[cfg(feature = "vm")]
+fn build_planner_environment(
+    compiled: &CompiledPlannerRunSpec,
+) -> anyhow::Result<(Box<dyn Environment>, &'static str)> {
+    match &compiled.canonical_spec().environment {
+        spec::EnvironmentSpec::Builtin { builtin } => Ok((
+            build_builtin_environment(*builtin),
+            builtin_environment_name(*builtin),
+        )),
+        spec::EnvironmentSpec::NyxVm(vm) => {
+            let config = NyxVmConfig::from_environment_spec(vm, compiled.resolved_assets())
+                .map_err(anyhow::Error::msg)?;
+            Ok((Box::new(NyxVmEnvironment::new(config)?), "vm"))
+        }
+    }
+}
+
+#[cfg(not(feature = "vm"))]
+fn build_planner_environment(
+    compiled: &CompiledPlannerRunSpec,
+) -> anyhow::Result<(Box<dyn Environment>, &'static str)> {
+    match &compiled.canonical_spec().environment {
+        spec::EnvironmentSpec::Builtin { builtin } => Ok((
+            build_builtin_environment(*builtin),
+            builtin_environment_name(*builtin),
+        )),
+    }
+}
+
+fn validate_action_alphabet(
+    compiled: &CompiledPlannerRunSpec,
+    env: &dyn Environment,
+) -> anyhow::Result<()> {
+    let actual = env.get_num_actions();
+    let expected = compiled.interface().agent_actions;
+    if actual != expected {
+        return Err(anyhow::anyhow!(
+            "action_alphabet_mismatch: planner interface declares {} actions but environment exposes {}",
+            expected,
+            actual
+        ));
+    }
+    Ok(())
+}
+
+fn run_vm_perf_only(
+    schedule: &PlannerRunSchedule,
+    ctx: &mut PlannerExecutionContext,
+) -> anyhow::Result<()> {
+    let mut obs = ctx.obs_stream.first().copied().unwrap_or(0);
+    let mut rew = ctx.rew;
+    let start = Instant::now();
+    for step in 0..schedule.learn_cycles {
+        if schedule.log_every > 0 && step % schedule.log_every == 0 {
+            println!("Cycle {}: Obs={}, Rew={}", step, obs, rew);
+        }
+        ctx.perform_action(0)?;
+        obs = ctx.obs_stream.first().copied().unwrap_or(0);
+        rew = ctx.rew;
+    }
+    if schedule.perf && schedule.learn_cycles > 0 {
+        let elapsed = start.elapsed().as_secs_f64().max(1e-9);
+        let cps = schedule.learn_cycles as f64 / elapsed;
+        println!("Perf cycles/s: {:.2}", cps);
+    }
+    Ok(())
+}
+
+fn run_compiled_planner_run(
+    compiled: &CompiledPlannerRunSpec,
+    cli_overlay: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let schedule = PlannerRunSchedule::from_runtime(compiled.runtime());
+    let mut controller = PlannerControllerRuntime::from_compiled(compiled)?;
+    let (mut env, env_name) = build_planner_environment(compiled)?;
+    if let Some(seed) = compiled.runtime().random_seed {
+        env.set_random_seed(seed);
+    }
+    validate_action_alphabet(compiled, env.as_ref())?;
+    let mut ctx = PlannerExecutionContext::new(compiled, env, cli_overlay)?;
+
+    match compiled.controller() {
+        CompiledPlannerController::McAixi { .. } => println!(
+            "Agent initialized with {} algorithm for {} environment.",
+            controller_backend_label(compiled.controller()),
+            env_name
+        ),
+        CompiledPlannerController::AiqiDiscounted { .. } => println!(
+            "AIQI initialized ({}) for {} environment.",
+            controller_backend_label(compiled.controller()),
+            env_name
+        ),
+        CompiledPlannerController::AiqiWarmstartExactJh { .. } => unreachable!(),
+    }
+
+    if schedule.vm_perf_only {
+        return run_vm_perf_only(&schedule, &mut ctx);
+    }
+
+    let learn_start = Instant::now();
+    let mut learn_total_reward = 0i64;
+    for step in 0..schedule.learn_cycles {
+        learn_total_reward +=
+            controller.run_cycle(PlannerPhase::Learn, step, &schedule, &mut ctx)?;
+    }
+    if schedule.perf && schedule.learn_cycles > 0 {
         let elapsed = learn_start.elapsed().as_secs_f64().max(1e-9);
-        let cps = learn_cycles as f64 / elapsed;
+        let cps = schedule.learn_cycles as f64 / elapsed;
         println!("Learn cycles/s: {:.2}", cps);
     }
 
-    if eval_cycles > 0 {
-        let mut eval_total_reward: i64 = 0;
+    if schedule.eval_cycles > 0 {
         let eval_start = Instant::now();
-        for t in 0..eval_cycles {
-            let step = learn_cycles + t;
-            if log_every > 0 && step % log_every == 0 {
-                println!("Cycle {}: Obs={:?}, Rew={}", step, obs_repr, rew);
-            }
-            if let Some(l) = trace_logger.as_mut() {
-                l.log_percept(
-                    &obs_stream,
-                    rew,
-                    observation_bits,
-                    reward_bits,
-                    reward_offset,
-                )?;
-            }
-            agent.model_update_percept_stream(&obs_stream, rew);
-
-            let action = agent.get_planned_action(&obs_stream, rew, prev_action);
-            if log_every > 0 && step % log_every == 0 {
-                println!("Cycle {}: Planned Action={}", step, action);
-            }
-
-            if let Some(l) = trace_logger.as_mut() {
-                let action_bits = env.get_action_bits();
-                l.log_action(action, action_bits)?;
-            }
-            agent.model_update_action_external(action);
-            env.perform_action(action);
-            obs_stream = env.drain_observations();
-            validate_obs_stream_len(observation_stream_len, obs_stream.len())?;
-            obs_repr = agent.observation_repr_from_stream(&obs_stream);
-            rew = env.get_reward();
-            prev_action = action;
-            eval_total_reward += rew;
-
-            if let Some(l) = trace_logger.as_mut() {
-                l.next_step()?;
-            }
+        let mut eval_total_reward = 0i64;
+        for offset in 0..schedule.eval_cycles {
+            let step = schedule.learn_cycles + offset;
+            eval_total_reward +=
+                controller.run_cycle(PlannerPhase::Eval, step, &schedule, &mut ctx)?;
         }
-
-        if perf && eval_cycles > 0 {
+        if schedule.perf {
             let elapsed = eval_start.elapsed().as_secs_f64().max(1e-9);
-            let cps = eval_cycles as f64 / elapsed;
+            let cps = schedule.eval_cycles as f64 / elapsed;
             println!("Eval cycles/s: {:.2}", cps);
         }
-
-        let avg = (eval_total_reward as f64) / (eval_cycles as f64);
+        let avg = (eval_total_reward as f64) / (schedule.eval_cycles as f64);
         println!("Eval Total Reward: {}", eval_total_reward);
         println!("Eval Average Reward per Cycle: {:.6}", avg);
     }
 
-    println!("Total Reward: {}", total_reward);
+    println!("Total Reward: {}", learn_total_reward);
     Ok(())
+}
+
+fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
+    let raw = std::fs::read(config_path)?;
+    let json_overlay = serde_json::from_slice::<serde_json::Value>(&raw).ok();
+    if let Some(value) = json_overlay.as_ref() {
+        if !is_canonical_spec_document(value) {
+            return Err(legacy_planner_config_error(config_path));
+        }
+    }
+
+    let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
+    match infotheory::spec::load_spec_document(config_path).map_err(anyhow::Error::msg)? {
+        SpecDocument::PlannerRun(spec) => {
+            let compiled = spec
+                .compile_in(&spec::SpecEnvironment::new(config_dir))
+                .map_err(anyhow::Error::msg)?;
+            run_compiled_planner_run(&compiled, json_overlay.as_ref())
+        }
+        SpecDocument::Tune(_) => Err(anyhow::anyhow!(
+            "aixi expects a planner_run document, found kind 'tune'"
+        )),
+        SpecDocument::RateBackend(_) => Err(anyhow::anyhow!(
+            "aixi expects a planner_run document, found kind 'rate_backend'"
+        )),
+        SpecDocument::CompressionBackend(_) => Err(anyhow::anyhow!(
+            "aixi expects a planner_run document, found kind 'compression_backend'"
+        )),
+    }
 }
 
 #[cfg(feature = "backend-rosa")]
@@ -2684,71 +2340,42 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(all(feature = "vm", feature = "backend-ctw"))]
+    #[cfg(feature = "backend-ctw")]
     #[test]
-    fn planner_run_spec_to_legacy_json_preserves_canonical_vm_observation_modes() {
-        let spec = infotheory::spec::PlannerRunSpec {
-            assets: vec![infotheory::spec::AssetBinding {
-                id: "firecracker".to_string(),
-                path: "dummy-firecracker.json".to_string(),
-            }],
-            environment: infotheory::spec::EnvironmentSpec::NyxVm(
-                infotheory::spec::VmEnvironmentSpec {
-                    firecracker_config_asset: "firecracker".to_string(),
-                    instance_id: "vm-test".to_string(),
-                    shared_region_name: "shared".to_string(),
-                    shared_region_size: 4096,
-                    shared_memory_policy: infotheory::spec::SharedMemoryPolicySpec::Snapshot,
-                    step_timeout_ms: 100,
-                    boot_timeout_ms: 1_000,
-                    episode_steps: 4,
-                    step_cost: 0,
-                    observation_policy: "output_hash".to_string(),
-                    observation_bits: 8,
-                    observation_stream_len: 16,
-                    observation_stream_mode: "pad_truncate".to_string(),
-                    observation_pad_byte: 0,
-                    reward_bits: 8,
-                    reward_policy: infotheory::spec::VmRewardPolicySpec::FromGuest,
-                    reward_shaping: None,
-                    action_source: infotheory::spec::VmRuntimeActionSourceSpec::Literal {
-                        names: vec![Some("noop".to_string())],
-                        payloads: vec!["00".to_string()],
-                        encoding: "hex".to_string(),
-                    },
-                    action_filter: None,
-                    action_prefix: "ACT ".to_string(),
-                    action_suffix: "\n".to_string(),
-                    obs_prefix: "OBS ".to_string(),
-                    rew_prefix: "REW ".to_string(),
-                    done_prefix: "DONE ".to_string(),
-                    data_prefix: "DATA ".to_string(),
-                    wire_encoding: "hex".to_string(),
-                    stats_backend: RateBackend::Ctw { depth: 8 },
-                    trace: None,
-                    debug_mode: false,
-                },
-            ),
+    fn run_aixi_mode_rejects_unrepresentable_reward_ranges_in_canonical_specs() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "infotheory-planner-run-invalid-reward-{}-{nanos}.json",
+            std::process::id()
+        ));
+        let doc = infotheory::spec::SpecDocument::PlannerRun(infotheory::spec::PlannerRunSpec {
+            assets: Vec::new(),
+            environment: infotheory::spec::EnvironmentSpec::Builtin {
+                builtin: infotheory::spec::BuiltinEnvironmentSpec::CoinFlip,
+            },
             interface: infotheory::spec::PlannerInterfaceSpec {
-                observation_bits: 8,
-                observation_stream_len: 16,
+                observation_bits: 1,
+                observation_stream_len: 1,
                 observation_key_mode: ObservationKeyMode::FullStream,
-                reward_bits: 8,
-                agent_actions: 1,
+                reward_bits: 1,
+                agent_actions: 2,
                 min_reward: 0,
-                max_reward: 255,
+                max_reward: 100,
                 reward_offset: 0,
             },
-            controller: infotheory::spec::ControllerSpec::AiqiDiscounted(
-                infotheory::spec::AiqiDiscountedControllerSpec {
+            controller: infotheory::spec::ControllerSpec::McAixi(
+                infotheory::spec::McAixiControllerSpec {
                     predictor: RateBackend::Ctw { depth: 8 },
                     predictor_max_order: 8,
-                    discount_gamma: 0.99,
-                    return_horizon: 2,
-                    return_bins: 8,
-                    augmentation_period: 2,
-                    history_prune_keep_steps: None,
-                    baseline_exploration: 0.0,
+                    agent_horizon: 1,
+                    num_simulations: 1,
+                    exploration_exploitation_ratio: 1.0,
+                    discount_gamma: 1.0,
                 },
             ),
             runtime: infotheory::spec::PlannerRuntimeSpec {
@@ -2762,10 +2389,57 @@ mod tests {
                 explore_epsilon: 0.0,
                 explore_gamma: 1.0,
             },
-        };
+        });
+        std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
+            .expect("write temp planner spec");
 
-        let legacy = planner_run_spec_to_legacy_json(&spec, Path::new(".")).expect("legacy json");
-        let parsed = crate::cli::parse_nyx_observation_policy(&legacy["vm_config"]["observation"]);
-        assert!(matches!(parsed, NyxObservationPolicy::OutputHash));
+        let err = run_aixi_mode(path.to_str().expect("utf8 path"))
+            .expect_err("invalid reward interface should be rejected");
+        assert!(err.to_string().contains("reward_bits too small"), "{err}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_aixi_mode_rejects_legacy_planner_json_documents() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "infotheory-legacy-planner-{}-{nanos}.json",
+            std::process::id()
+        ));
+        let legacy = serde_json::json!({
+            "environment": "coin-flip",
+            "planner": "mc-aixi",
+            "algorithm": "ctw",
+            "ct_depth": 8,
+            "agent_horizon": 1,
+            "observation_bits": 1,
+            "observation_stream_len": 1,
+            "observation_key_mode": "full-stream",
+            "reward_bits": 1,
+            "agent_actions": 2,
+            "num_simulations": 1,
+            "discount_gamma": 1.0,
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("legacy planner json"),
+        )
+        .expect("write temp legacy planner config");
+
+        let err = run_aixi_mode(path.to_str().expect("utf8 path"))
+            .expect_err("legacy planner json should be rejected");
+        let message = err.to_string();
+        assert!(message.contains("legacy aixi JSON configs are no longer executable"));
+        assert!(message.contains("planner_run"));
+        assert!(message.contains("schema_version"));
+        assert!(message.contains("kind"));
+
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -42,9 +42,9 @@ use crate::mixture::OnlineBytePredictor;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip::Compressor;
 use crate::spec::{
-    AssetBinding, EnvironmentSpec, SharedMemoryPolicySpec, SpecEnvironment, VmActionFilterSpec,
-    VmEnvironmentSpec, VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec,
-    VmTraceSpec,
+    AssetBinding, AssetRef, EnvironmentSpec, ResolvedAssetBinding, SharedMemoryPolicySpec,
+    SpecEnvironment, VmActionFilterSpec, VmEnvironmentSpec, VmRewardPolicySpec,
+    VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec,
 };
 use serde_json::Value;
 use std::borrow::Cow;
@@ -313,6 +313,19 @@ fn fuzz_mutator_name(mutator: &FuzzMutator) -> &'static str {
     }
 }
 
+fn parse_fuzz_mutator_name(name: &str) -> Result<FuzzMutator, String> {
+    match name {
+        "flip_bit" | "flipbit" => Ok(FuzzMutator::FlipBit),
+        "flip_byte" | "flipbyte" => Ok(FuzzMutator::FlipByte),
+        "insert_byte" | "insertbyte" => Ok(FuzzMutator::InsertByte),
+        "delete_byte" | "deletebyte" => Ok(FuzzMutator::DeleteByte),
+        "splice_seed" | "splice-seed" | "splice" => Ok(FuzzMutator::SpliceSeed),
+        "reset_seed" | "reset-seed" | "reset" => Ok(FuzzMutator::ResetSeed),
+        "havoc" => Ok(FuzzMutator::Havoc),
+        other => Err(format!("unknown VM fuzz mutator '{other}'")),
+    }
+}
+
 /// Fuzzing configuration for action generation.
 #[derive(Clone, Debug)]
 pub struct NyxFuzzConfig {
@@ -365,6 +378,16 @@ fn nyx_observation_policy_name(policy: NyxObservationPolicy) -> &'static str {
     }
 }
 
+fn parse_nyx_observation_policy_name(name: &str) -> Result<NyxObservationPolicy, String> {
+    match name {
+        "from_guest" | "guest" | "from-guest" => Ok(NyxObservationPolicy::FromGuest),
+        "output_hash" | "hash" | "output-hash" => Ok(NyxObservationPolicy::OutputHash),
+        "raw_output" | "raw" | "raw-output" => Ok(NyxObservationPolicy::RawOutput),
+        "shared_memory" | "shared-memory" | "shm" => Ok(NyxObservationPolicy::SharedMemory),
+        other => Err(format!("unknown VM observation_policy '{other}'")),
+    }
+}
+
 /// Stream normalization mode.
 #[derive(Clone, Copy, Debug)]
 pub enum NyxObservationStreamMode {
@@ -381,6 +404,15 @@ fn nyx_observation_stream_mode_name(mode: NyxObservationStreamMode) -> &'static 
         NyxObservationStreamMode::PadTruncate => "pad_truncate",
         NyxObservationStreamMode::Pad => "pad",
         NyxObservationStreamMode::Truncate => "truncate",
+    }
+}
+
+fn parse_nyx_observation_stream_mode_name(name: &str) -> Result<NyxObservationStreamMode, String> {
+    match name {
+        "pad_truncate" | "pad-truncate" => Ok(NyxObservationStreamMode::PadTruncate),
+        "pad" => Ok(NyxObservationStreamMode::Pad),
+        "truncate" => Ok(NyxObservationStreamMode::Truncate),
+        other => Err(format!("unknown VM observation_stream_mode '{other}'")),
     }
 }
 
@@ -792,6 +824,200 @@ impl NyxVmConfig {
             .map(|_| ())
             .map_err(|err| err.to_string())
     }
+
+    /// Build a runtime VM configuration from a canonical planner environment spec.
+    pub fn from_environment_spec(
+        spec: &VmEnvironmentSpec,
+        resolved_assets: &[ResolvedAssetBinding],
+    ) -> Result<Self, String> {
+        let wire_encoding = PayloadEncoding::parse(&spec.wire_encoding)
+            .ok_or_else(|| format!("unknown VM wire_encoding '{}'", spec.wire_encoding))?;
+        let reward_policy = match &spec.reward_policy {
+            VmRewardPolicySpec::FromGuest => NyxRewardPolicy::FromGuest,
+            VmRewardPolicySpec::Pattern {
+                pattern,
+                base_reward,
+                bonus_reward,
+            } => NyxRewardPolicy::Pattern {
+                pattern: pattern.clone(),
+                base_reward: *base_reward,
+                bonus_reward: *bonus_reward,
+            },
+        };
+        let reward_shaping = match &spec.reward_shaping {
+            Some(VmRewardShapingSpec::EntropyReduction {
+                baseline_asset,
+                max_order,
+                scale,
+                crash_bonus,
+                timeout_bonus,
+            }) => Some(NyxRewardShaping::EntropyReduction {
+                baseline_bytes: read_resolved_asset_bytes(resolved_assets, baseline_asset)?,
+                max_order: *max_order,
+                scale: *scale,
+                crash_bonus: *crash_bonus,
+                timeout_bonus: *timeout_bonus,
+            }),
+            Some(VmRewardShapingSpec::TraceEntropy {
+                max_order,
+                scale,
+                normalize,
+            }) => Some(NyxRewardShaping::TraceEntropy {
+                max_order: *max_order,
+                scale: *scale,
+                normalize: *normalize,
+            }),
+            None => None,
+        };
+        let action_source = match &spec.action_source {
+            VmRuntimeActionSourceSpec::Literal {
+                names,
+                payloads,
+                encoding,
+            } => {
+                let encoding = PayloadEncoding::parse(encoding)
+                    .ok_or_else(|| format!("unknown VM literal action encoding '{encoding}'"))?;
+                let mut actions = Vec::with_capacity(payloads.len());
+                for (index, payload) in payloads.iter().enumerate() {
+                    actions.push(NyxActionSpec {
+                        name: names.get(index).cloned().flatten(),
+                        payload: encoding
+                            .decode(payload)
+                            .map_err(|err| format!("invalid literal action payload: {err}"))?,
+                    });
+                }
+                NyxActionSource::Literal(actions)
+            }
+            VmRuntimeActionSourceSpec::Fuzz {
+                seeds,
+                encoding,
+                mutators,
+                min_len,
+                max_len,
+                dictionary,
+                rng_seed,
+            } => {
+                let encoding = PayloadEncoding::parse(encoding)
+                    .ok_or_else(|| format!("unknown VM fuzz encoding '{encoding}'"))?;
+                NyxActionSource::Fuzz(NyxFuzzConfig {
+                    seeds: seeds
+                        .iter()
+                        .map(|seed| {
+                            encoding
+                                .decode(seed)
+                                .map_err(|err| format!("invalid VM fuzz seed: {err}"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    mutators: mutators
+                        .iter()
+                        .map(|name| parse_fuzz_mutator_name(name))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    min_len: *min_len,
+                    max_len: *max_len,
+                    dictionary: dictionary
+                        .iter()
+                        .map(|entry| {
+                            encoding
+                                .decode(entry)
+                                .map_err(|err| format!("invalid VM fuzz dictionary entry: {err}"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    rng_seed: *rng_seed,
+                })
+            }
+        };
+        let action_filter = spec
+            .action_filter
+            .as_ref()
+            .map(|filter| -> Result<NyxActionFilter, String> {
+                Ok(NyxActionFilter {
+                    min_entropy: filter.min_entropy,
+                    max_entropy: filter.max_entropy,
+                    min_intrinsic_dependence: filter.min_intrinsic_dependence,
+                    min_novelty: filter.min_novelty,
+                    novelty_prior: filter
+                        .novelty_prior_asset
+                        .as_ref()
+                        .map(|id| read_resolved_asset_bytes(resolved_assets, id))
+                        .transpose()?,
+                    max_order: filter.max_order,
+                    reject_reward: filter.reject_reward,
+                })
+            })
+            .transpose()?;
+
+        let config = Self {
+            firecracker_config: resolved_asset_path(
+                resolved_assets,
+                &spec.firecracker_config_asset,
+            )?
+            .to_string_lossy()
+            .into_owned(),
+            instance_id: spec.instance_id.clone(),
+            shared_region_name: spec.shared_region_name.clone(),
+            shared_region_size: spec.shared_region_size,
+            shared_memory_policy: match spec.shared_memory_policy {
+                SharedMemoryPolicySpec::Preserve => SharedMemoryPolicy::Preserve,
+                SharedMemoryPolicySpec::Snapshot => SharedMemoryPolicy::Snapshot,
+            },
+            step_timeout: Duration::from_millis(spec.step_timeout_ms),
+            boot_timeout: Duration::from_millis(spec.boot_timeout_ms),
+            episode_steps: spec.episode_steps,
+            step_cost: spec.step_cost,
+            observation_policy: parse_nyx_observation_policy_name(&spec.observation_policy)?,
+            observation_bits: spec.observation_bits,
+            observation_stream_len: spec.observation_stream_len,
+            observation_stream_mode: parse_nyx_observation_stream_mode_name(
+                &spec.observation_stream_mode,
+            )?,
+            observation_pad_byte: spec.observation_pad_byte,
+            reward_bits: spec.reward_bits,
+            reward_policy,
+            reward_shaping,
+            action_source,
+            action_filter,
+            protocol: NyxProtocolConfig {
+                action_prefix: spec.action_prefix.clone(),
+                action_suffix: spec.action_suffix.clone(),
+                obs_prefix: spec.obs_prefix.clone(),
+                rew_prefix: spec.rew_prefix.clone(),
+                done_prefix: spec.done_prefix.clone(),
+                data_prefix: spec.data_prefix.clone(),
+                wire_encoding,
+            },
+            stats_backend: spec.stats_backend.clone(),
+            trace: spec.trace.as_ref().map(|trace| NyxTraceConfig {
+                shared_region_name: trace.shared_region_name.clone(),
+                max_bytes: trace.max_bytes,
+                reset_on_episode: trace.reset_on_episode,
+            }),
+            debug_mode: spec.debug_mode,
+            crash_log: None,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn resolved_asset_path<'a>(
+    resolved_assets: &'a [ResolvedAssetBinding],
+    id: &str,
+) -> Result<&'a Path, String> {
+    let binding = resolved_assets
+        .iter()
+        .find(|binding| binding.id == id)
+        .ok_or_else(|| format!("planner_run references unknown asset id '{id}'"))?;
+    match &binding.asset {
+        AssetRef::Filesystem(path) => Ok(path.as_path()),
+    }
+}
+
+fn read_resolved_asset_bytes(
+    resolved_assets: &[ResolvedAssetBinding],
+    id: &str,
+) -> Result<Vec<u8>, String> {
+    let path = resolved_asset_path(resolved_assets, id)?;
+    std::fs::read(path).map_err(|err| format!("failed to read asset '{}': {err}", path.display()))
 }
 
 // ============================================================================
@@ -2320,6 +2546,247 @@ mod tests {
             .validate_canonical_spec_compatibility()
             .expect_err("custom reward callbacks are not canonical");
         assert!(err.contains("not representable in canonical specs"));
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn from_environment_spec_builds_runtime_vm_config_without_legacy_json() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "infotheory-vm-spec-runtime-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+
+        let firecracker_path = root.join("firecracker.json");
+        let baseline_path = root.join("baseline.bin");
+        let novelty_path = root.join("novelty.bin");
+        std::fs::write(&firecracker_path, b"{\"boot-source\":{}}").expect("firecracker config");
+        std::fs::write(&baseline_path, b"baseline-bytes").expect("baseline asset");
+        std::fs::write(&novelty_path, b"novelty-bytes").expect("novelty asset");
+
+        let spec = VmEnvironmentSpec {
+            firecracker_config_asset: "firecracker".to_string(),
+            instance_id: "vm-test".to_string(),
+            shared_region_name: "shared".to_string(),
+            shared_region_size: 4096,
+            shared_memory_policy: SharedMemoryPolicySpec::Snapshot,
+            step_timeout_ms: 125,
+            boot_timeout_ms: 1_250,
+            episode_steps: 8,
+            step_cost: -1,
+            observation_policy: "output_hash".to_string(),
+            observation_bits: 8,
+            observation_stream_len: 16,
+            observation_stream_mode: "pad_truncate".to_string(),
+            observation_pad_byte: 0x7f,
+            reward_bits: 8,
+            reward_policy: VmRewardPolicySpec::Pattern {
+                pattern: "win".to_string(),
+                base_reward: 1,
+                bonus_reward: 4,
+            },
+            reward_shaping: Some(VmRewardShapingSpec::EntropyReduction {
+                baseline_asset: "baseline".to_string(),
+                max_order: 7,
+                scale: 0.25,
+                crash_bonus: Some(5),
+                timeout_bonus: Some(6),
+            }),
+            action_source: VmRuntimeActionSourceSpec::Literal {
+                names: vec![Some("hi".to_string())],
+                payloads: vec!["6869".to_string()],
+                encoding: "hex".to_string(),
+            },
+            action_filter: Some(VmActionFilterSpec {
+                min_entropy: Some(0.1),
+                max_entropy: Some(2.0),
+                min_intrinsic_dependence: Some(0.05),
+                min_novelty: Some(0.2),
+                novelty_prior_asset: Some("novelty".to_string()),
+                max_order: 5,
+                reject_reward: Some(-3),
+            }),
+            action_prefix: "ACT ".to_string(),
+            action_suffix: "\n".to_string(),
+            obs_prefix: "OBS ".to_string(),
+            rew_prefix: "REW ".to_string(),
+            done_prefix: "DONE ".to_string(),
+            data_prefix: "DATA ".to_string(),
+            wire_encoding: "utf8".to_string(),
+            stats_backend: RateBackend::Ctw { depth: 8 },
+            trace: Some(VmTraceSpec {
+                shared_region_name: Some("trace".to_string()),
+                max_bytes: 256,
+                reset_on_episode: true,
+            }),
+            debug_mode: true,
+        };
+        let assets = vec![
+            ResolvedAssetBinding {
+                id: "firecracker".to_string(),
+                asset: AssetRef::Filesystem(firecracker_path.clone()),
+            },
+            ResolvedAssetBinding {
+                id: "baseline".to_string(),
+                asset: AssetRef::Filesystem(baseline_path.clone()),
+            },
+            ResolvedAssetBinding {
+                id: "novelty".to_string(),
+                asset: AssetRef::Filesystem(novelty_path.clone()),
+            },
+        ];
+
+        let config = NyxVmConfig::from_environment_spec(&spec, &assets)
+            .expect("canonical VM spec should build runtime config");
+
+        assert_eq!(
+            config.firecracker_config,
+            firecracker_path.display().to_string()
+        );
+        assert!(matches!(
+            config.observation_policy,
+            NyxObservationPolicy::OutputHash
+        ));
+        assert!(matches!(
+            config.observation_stream_mode,
+            NyxObservationStreamMode::PadTruncate
+        ));
+        assert!(matches!(
+            config.reward_policy,
+            NyxRewardPolicy::Pattern {
+                ref pattern,
+                base_reward: 1,
+                bonus_reward: 4,
+            } if pattern == "win"
+        ));
+        assert!(matches!(
+            config.protocol.wire_encoding,
+            PayloadEncoding::Utf8
+        ));
+        assert!(matches!(
+            config.stats_backend,
+            RateBackend::Ctw { depth: 8 }
+        ));
+        match &config.action_source {
+            NyxActionSource::Literal(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].name.as_deref(), Some("hi"));
+                assert_eq!(actions[0].payload, b"hi");
+            }
+            other => panic!("expected literal actions, got {other:?}"),
+        }
+        match &config.reward_shaping {
+            Some(NyxRewardShaping::EntropyReduction { baseline_bytes, .. }) => {
+                assert_eq!(baseline_bytes, b"baseline-bytes");
+            }
+            other => panic!("expected entropy-reduction shaping, got {other:?}"),
+        }
+        match &config.action_filter {
+            Some(filter) => {
+                assert_eq!(filter.novelty_prior.as_deref(), Some(&b"novelty-bytes"[..]));
+            }
+            None => panic!("expected action filter"),
+        }
+
+        let _ = std::fs::remove_file(firecracker_path);
+        let _ = std::fs::remove_file(baseline_path);
+        let _ = std::fs::remove_file(novelty_path);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn from_environment_spec_accepts_vm_alias_names() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "infotheory-vm-spec-aliases-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+
+        let firecracker_path = root.join("firecracker.json");
+        std::fs::write(&firecracker_path, b"{\"boot-source\":{}}").expect("firecracker config");
+
+        let spec = VmEnvironmentSpec {
+            firecracker_config_asset: "firecracker".to_string(),
+            instance_id: "vm-test".to_string(),
+            shared_region_name: "shared".to_string(),
+            shared_region_size: 4096,
+            shared_memory_policy: SharedMemoryPolicySpec::Snapshot,
+            step_timeout_ms: 125,
+            boot_timeout_ms: 1_250,
+            episode_steps: 8,
+            step_cost: -1,
+            observation_policy: "hash".to_string(),
+            observation_bits: 8,
+            observation_stream_len: 16,
+            observation_stream_mode: "pad-truncate".to_string(),
+            observation_pad_byte: 0x00,
+            reward_bits: 8,
+            reward_policy: VmRewardPolicySpec::FromGuest,
+            reward_shaping: None,
+            action_source: VmRuntimeActionSourceSpec::Fuzz {
+                seeds: vec!["seed".to_string()],
+                encoding: "text".to_string(),
+                mutators: vec!["flipbit".to_string(), "splice".to_string()],
+                min_len: 1,
+                max_len: 8,
+                dictionary: vec!["dict".to_string()],
+                rng_seed: 7,
+            },
+            action_filter: None,
+            action_prefix: "ACT ".to_string(),
+            action_suffix: "\n".to_string(),
+            obs_prefix: "OBS ".to_string(),
+            rew_prefix: "REW ".to_string(),
+            done_prefix: "DONE ".to_string(),
+            data_prefix: "DATA ".to_string(),
+            wire_encoding: "text".to_string(),
+            stats_backend: RateBackend::Ctw { depth: 8 },
+            trace: None,
+            debug_mode: false,
+        };
+        let assets = vec![ResolvedAssetBinding {
+            id: "firecracker".to_string(),
+            asset: AssetRef::Filesystem(firecracker_path.clone()),
+        }];
+
+        let config =
+            NyxVmConfig::from_environment_spec(&spec, &assets).expect("aliases should parse");
+        assert!(matches!(
+            config.observation_policy,
+            NyxObservationPolicy::OutputHash
+        ));
+        assert!(matches!(
+            config.observation_stream_mode,
+            NyxObservationStreamMode::PadTruncate
+        ));
+        assert!(matches!(
+            config.protocol.wire_encoding,
+            PayloadEncoding::Utf8
+        ));
+        match &config.action_source {
+            NyxActionSource::Fuzz(fuzz) => {
+                assert_eq!(fuzz.seeds, vec![b"seed".to_vec()]);
+                assert!(matches!(fuzz.mutators[0], FuzzMutator::FlipBit));
+                assert!(matches!(fuzz.mutators[1], FuzzMutator::SpliceSeed));
+            }
+            other => panic!("expected fuzz action source, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(firecracker_path);
+        let _ = std::fs::remove_dir(root);
     }
 
     #[cfg(feature = "all-backends")]

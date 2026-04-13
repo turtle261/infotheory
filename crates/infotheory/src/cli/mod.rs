@@ -1,7 +1,11 @@
 use super::*;
 use infotheory::error::InfotheoryResult;
+#[cfg(all(test, feature = "vm"))]
+use std::time::Duration;
 
 #[cfg(feature = "vm")]
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn parse_shared_memory_policy(v: Option<&str>) -> SharedMemoryPolicy {
     match v.unwrap_or("snapshot") {
         "preserve" | "keep" => SharedMemoryPolicy::Preserve,
@@ -10,6 +14,8 @@ pub(super) fn parse_shared_memory_policy(v: Option<&str>) -> SharedMemoryPolicy 
 }
 
 #[cfg(feature = "vm")]
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn parse_nyx_environment_config(
     v: &serde_json::Value,
     observation_bits: usize,
@@ -148,6 +154,7 @@ pub(super) fn parse_nyx_environment_config(
     })
 }
 
+#[cfg(all(test, feature = "vm"))]
 pub(super) fn parse_vm_stats_backend(
     cfg: &serde_json::Value,
     root: &serde_json::Value,
@@ -159,6 +166,8 @@ pub(super) fn parse_vm_stats_backend(
 }
 
 #[cfg(feature = "vm")]
+#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn parse_nyx_trace_config(
     v: &serde_json::Value,
 ) -> anyhow::Result<Option<NyxTraceConfig>> {
@@ -189,6 +198,8 @@ pub(super) fn parse_nyx_trace_config(
 }
 
 #[cfg(feature = "vm")]
+#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn parse_nyx_protocol_config(v: &serde_json::Value) -> NyxProtocolConfig {
     let mut cfg = NyxProtocolConfig::default();
     if let Some(s) = v["action_prefix"].as_str() {
@@ -218,6 +229,8 @@ pub(super) fn parse_nyx_protocol_config(v: &serde_json::Value) -> NyxProtocolCon
 }
 
 #[cfg(feature = "vm")]
+#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActionSource> {
     let mode = v["mode"].as_str().unwrap_or("literal");
     match mode {
@@ -303,6 +316,8 @@ pub(super) fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActi
 }
 
 #[cfg(feature = "vm")]
+#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn parse_nyx_fuzz_mutator(name: &str) -> Option<NyxFuzzMutator> {
     match name {
         "flip_bit" | "flipbit" => Some(NyxFuzzMutator::FlipBit),
@@ -317,6 +332,7 @@ pub(super) fn parse_nyx_fuzz_mutator(name: &str) -> Option<NyxFuzzMutator> {
 }
 
 #[cfg(feature = "vm")]
+#[cfg(test)]
 fn parse_nyx_observation_policy_str(mode: &str) -> NyxObservationPolicy {
     match mode {
         "guest" | "from-guest" | "from_guest" => NyxObservationPolicy::FromGuest,
@@ -332,11 +348,14 @@ fn parse_nyx_observation_policy_str(mode: &str) -> NyxObservationPolicy {
 }
 
 #[cfg(feature = "vm")]
+#[cfg(test)]
 pub(super) fn parse_nyx_observation_policy(v: &serde_json::Value) -> NyxObservationPolicy {
     parse_nyx_observation_policy_str(v["mode"].as_str().unwrap_or("guest"))
 }
 
 #[cfg(feature = "vm")]
+#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn parse_nyx_observation_stream_mode(v: &serde_json::Value) -> NyxObservationStreamMode {
     match v["stream_mode"].as_str().unwrap_or("pad-truncate") {
         "pad" => NyxObservationStreamMode::Pad,
@@ -346,11 +365,15 @@ pub(super) fn parse_nyx_observation_stream_mode(v: &serde_json::Value) -> NyxObs
 }
 
 #[cfg(feature = "vm")]
+#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn parse_nyx_observation_pad_byte(v: &serde_json::Value) -> u8 {
     v["pad_byte"].as_u64().unwrap_or(0) as u8
 }
 
 #[cfg(feature = "vm")]
+#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn parse_nyx_reward_policy(v: &serde_json::Value) -> anyhow::Result<NyxRewardPolicy> {
     match v["mode"].as_str().unwrap_or("guest") {
         "pattern" => {
@@ -371,6 +394,8 @@ pub(super) fn parse_nyx_reward_policy(v: &serde_json::Value) -> anyhow::Result<N
 }
 
 #[cfg(feature = "vm")]
+#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn parse_nyx_reward_shaping(
     v: &serde_json::Value,
     base_dir: &Path,
@@ -413,6 +438,8 @@ pub(super) fn parse_nyx_reward_shaping(
 }
 
 #[cfg(feature = "vm")]
+#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn parse_nyx_filter(
     v: &serde_json::Value,
     step_cost: i64,
@@ -487,6 +514,7 @@ pub(super) fn load_expert_spec(path: &str) -> anyhow::Result<MixtureExpertSpec> 
     infotheory::spec::load_expert_spec(path).map_err(anyhow::Error::msg)
 }
 
+#[cfg(all(test, feature = "vm"))]
 pub(super) fn vm_stats_backend_spec_value(
     root: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
@@ -562,6 +590,7 @@ pub(super) fn vm_stats_backend_spec_value(
     Ok(spec)
 }
 
+#[cfg(all(test, feature = "vm"))]
 pub(super) fn normalize_vm_stats_backend_spec(
     cfg: &serde_json::Value,
     root: &serde_json::Value,
@@ -717,14 +746,17 @@ pub(super) fn normalize_vm_stats_backend_spec(
     Ok(spec)
 }
 
+#[cfg(test)]
 pub(super) fn parse_observation_stream_len(v: &serde_json::Value) -> usize {
     v["observation_stream_len"].as_u64().unwrap_or(1) as usize
 }
 
+#[cfg(test)]
 pub(super) fn parse_observation_key_mode(v: &serde_json::Value) -> ObservationKeyMode {
     parse_observation_key_mode_str(v["observation_key_mode"].as_str().unwrap_or("full"))
 }
 
+#[cfg(test)]
 pub(super) fn parse_observation_key_mode_str(s: &str) -> ObservationKeyMode {
     match s {
         "full" | "full-stream" | "stream" => ObservationKeyMode::FullStream,
@@ -734,6 +766,7 @@ pub(super) fn parse_observation_key_mode_str(s: &str) -> ObservationKeyMode {
     }
 }
 
+#[cfg(test)]
 pub(super) fn parse_observation_stream_len_for_env(v: &serde_json::Value, env_name: &str) -> usize {
     if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" {
         if v["vm_observation"].is_null() {
@@ -746,6 +779,7 @@ pub(super) fn parse_observation_stream_len_for_env(v: &serde_json::Value, env_na
     }
 }
 
+#[cfg(test)]
 pub(super) fn parse_observation_key_mode_for_env(
     v: &serde_json::Value,
     env_name: &str,
@@ -761,6 +795,7 @@ pub(super) fn parse_observation_key_mode_for_env(
     }
 }
 
+#[cfg(test)]
 pub(super) fn parse_observation_key_mode_for_vm(v: &serde_json::Value) -> ObservationKeyMode {
     if v.is_null() {
         return ObservationKeyMode::FullStream;
@@ -772,6 +807,7 @@ pub(super) fn parse_observation_key_mode_for_vm(v: &serde_json::Value) -> Observ
     )
 }
 
+#[cfg(test)]
 pub(super) fn parse_observation_stream_len_for_vm(v: &serde_json::Value) -> usize {
     if v.is_null() {
         return 1;
@@ -782,10 +818,12 @@ pub(super) fn parse_observation_stream_len_for_vm(v: &serde_json::Value) -> usiz
         .unwrap_or(1) as usize
 }
 
+#[cfg(test)]
 fn extract_observation_stream_len_raw(v: &serde_json::Value) -> Option<usize> {
     v["observation_stream_len"].as_u64().map(|n| n as usize)
 }
 
+#[cfg(test)]
 fn extract_vm_observation_stream_len_raw(v: &serde_json::Value) -> Option<usize> {
     if v.is_null() {
         return None;
@@ -796,12 +834,14 @@ fn extract_vm_observation_stream_len_raw(v: &serde_json::Value) -> Option<usize>
         .map(|n| n as usize)
 }
 
+#[cfg(test)]
 fn extract_observation_key_mode_raw(v: &serde_json::Value) -> Option<ObservationKeyMode> {
     v["observation_key_mode"]
         .as_str()
         .map(parse_observation_key_mode_str)
 }
 
+#[cfg(test)]
 fn extract_vm_observation_key_mode_raw(v: &serde_json::Value) -> Option<ObservationKeyMode> {
     if v.is_null() {
         return None;
@@ -812,6 +852,7 @@ fn extract_vm_observation_key_mode_raw(v: &serde_json::Value) -> Option<Observat
         .map(parse_observation_key_mode_str)
 }
 
+#[cfg(test)]
 pub(super) fn validate_observation_config(
     env_name: &str,
     v: &serde_json::Value,
@@ -874,23 +915,6 @@ pub(super) fn validate_obs_stream_len(expected: usize, actual: usize) -> anyhow:
         ));
     }
     Ok(())
-}
-
-pub(super) fn aiqi_backend_label(config: &AiqiConfig) -> String {
-    if let Some(rate_backend) = &config.rate_backend {
-        let name = rate_backend
-            .compile()
-            .map(|compiled| compiled.default_name(config.rate_backend_max_order))
-            .unwrap_or_else(|_| {
-                infotheory::mixture::RateBackendPredictor::default_name(
-                    rate_backend,
-                    config.rate_backend_max_order,
-                )
-            });
-        format!("rate_backend={name}")
-    } else {
-        format!("algorithm={}", config.algorithm)
-    }
 }
 
 pub(super) struct BuiltCtx {

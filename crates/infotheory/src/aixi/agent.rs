@@ -5,24 +5,15 @@
 
 use crate::aixi::common::{
     Action, ObservationKeyMode, PerceptVal, RandomGenerator, Reward, decode, encode,
-    observation_repr_from_stream,
+    observation_repr_from_stream, validate_reward_encoding_bounds,
 };
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
-#[cfg(feature = "backend-mamba")]
-use crate::aixi::model::MambaPredictor;
-#[cfg(feature = "backend-rosa")]
-use crate::aixi::model::RosaPredictor;
-#[cfg(feature = "backend-rwkv")]
-use crate::aixi::model::RwkvPredictor;
-#[cfg(feature = "backend-zpaq")]
-use crate::aixi::model::ZpaqPredictor;
-#[cfg(feature = "backend-ctw")]
-use crate::aixi::model::{CtwPredictor, FacCtwPredictor};
-use crate::aixi::model::{Predictor, RateBackendBitPredictor};
+use crate::aixi::model::{Predictor, build_mc_aixi_predictor};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
-    BuiltinEnvironmentSpec, ControllerSpec, EnvironmentSpec, McAixiControllerSpec,
-    PlannerInterfaceSpec, PlannerRunSpec, PlannerRuntimeSpec,
+    BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec,
+    EnvironmentSpec, McAixiControllerSpec, PlannerInterfaceSpec, PlannerRunSpec,
+    PlannerRuntimeSpec,
 };
 use crate::validate_zpaq_rate_method;
 #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
@@ -205,8 +196,13 @@ impl AgentConfig {
         })
     }
 
-    /// Validate configuration constraints for MC-AIXI.
-    pub fn validate(&self) -> Result<(), String> {
+    fn compile_planner_run_spec(&self) -> Result<CompiledPlannerRunSpec, String> {
+        self.canonical_planner_run_spec()?
+            .compile()
+            .map_err(|err| err.to_string())
+    }
+
+    fn validate_runtime_invariants(&self) -> Result<(), String> {
         if self.agent_actions == 0 {
             return Err("agent_actions must be >= 1".to_string());
         }
@@ -225,30 +221,12 @@ impl AgentConfig {
                 self.discount_gamma
             ));
         }
-        if self.max_reward < self.min_reward {
-            return Err(format!(
-                "max_reward must be >= min_reward (got {} < {})",
-                self.max_reward, self.min_reward
-            ));
-        }
-
-        let min_shifted = (self.min_reward as i128) + (self.reward_offset as i128);
-        let max_shifted = (self.max_reward as i128) + (self.reward_offset as i128);
-        if min_shifted < 0 {
-            return Err(format!(
-                "reward_offset too small: min_reward + reward_offset must be >= 0 (got {})",
-                min_shifted
-            ));
-        }
-        if self.reward_bits < 64 {
-            let max_enc = (1u128 << self.reward_bits) - 1;
-            if (max_shifted as u128) > max_enc {
-                return Err(format!(
-                    "reward_bits too small for configured reward range: max shifted reward {} exceeds {}",
-                    max_shifted, max_enc
-                ));
-            }
-        }
+        validate_reward_encoding_bounds(
+            self.min_reward,
+            self.max_reward,
+            self.reward_offset,
+            self.reward_bits,
+        )?;
 
         if let Some(rate_backend) = &self.rate_backend {
             validate_rate_backend(rate_backend)
@@ -316,10 +294,87 @@ impl AgentConfig {
             other => return Err(format!("Unknown algorithm: {other}")),
         }
 
-        self.canonical_planner_run_spec()?
-            .validate()
-            .map_err(|err| err.to_string())?;
         Ok(())
+    }
+
+    /// Validate configuration constraints for MC-AIXI.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_runtime_invariants()?;
+        self.compile_planner_run_spec().map(|_| ())
+    }
+}
+
+impl AgentConfig {
+    fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+        let interface = compiled.interface();
+        let runtime = compiled.runtime();
+        let (
+            predictor,
+            predictor_max_order,
+            agent_horizon,
+            num_simulations,
+            exploration_exploitation_ratio,
+            discount_gamma,
+        ) = match compiled.controller() {
+            CompiledPlannerController::McAixi {
+                predictor,
+                predictor_max_order,
+                agent_horizon,
+                num_simulations,
+                exploration_exploitation_ratio,
+                discount_gamma,
+            } => (
+                predictor,
+                *predictor_max_order,
+                *agent_horizon,
+                *num_simulations,
+                *exploration_exploitation_ratio,
+                *discount_gamma,
+            ),
+            _ => {
+                return Err(
+                    "compiled planner run does not contain an MC-AIXI controller".to_string(),
+                );
+            }
+        };
+        let (algorithm, ct_depth) = match predictor.canonical_spec() {
+            RateBackend::FacCtw { base_depth, .. } => ("fac-ctw".to_string(), *base_depth),
+            RateBackend::Ctw { depth } => ("ctw".to_string(), *depth),
+            other => (
+                predictor.canonical_name().to_string(),
+                match other {
+                    RateBackend::FacCtw { base_depth, .. } => *base_depth,
+                    RateBackend::Ctw { depth } => *depth,
+                    _ => 0,
+                },
+            ),
+        };
+
+        Ok(Self {
+            algorithm,
+            ct_depth,
+            agent_horizon,
+            observation_bits: interface.observation_bits,
+            observation_stream_len: interface.observation_stream_len.max(1),
+            observation_key_mode: interface.observation_key_mode,
+            reward_bits: interface.reward_bits,
+            agent_actions: interface.agent_actions,
+            num_simulations,
+            exploration_exploitation_ratio,
+            discount_gamma,
+            min_reward: interface.min_reward,
+            max_reward: interface.max_reward,
+            reward_offset: interface.reward_offset,
+            random_seed: runtime.random_seed,
+            rate_backend: Some(predictor.canonical_spec().clone()),
+            rate_backend_max_order: predictor_max_order,
+            rwkv_model_path: None,
+            rwkv_method: None,
+            mamba_model_path: None,
+            mamba_method: None,
+            rosa_max_order: None,
+            zpaq_method: None,
+        })
     }
 }
 
@@ -361,21 +416,37 @@ impl Agent {
 
     /// Creates a new `Agent` with the given configuration, returning a validation error on failure.
     pub fn try_new(config: AgentConfig) -> Result<Self, String> {
-        config.validate()?;
+        let compiled = config.compile_planner_run_spec()?;
+        Self::from_compiled_config(config, &compiled)
+    }
 
-        let mut action_bits = 0;
-        let mut c = 1;
-        let mut i = 1;
-        while i < config.agent_actions {
-            i *= 2;
-            action_bits = c;
-            c += 1;
-        }
-        if config.agent_actions == 1 {
-            action_bits = 1;
-        }
+    /// Creates a new `Agent` from a compiled planner-run spec.
+    pub fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+        let config = AgentConfig::from_compiled_planner_run(compiled)?;
+        Self::from_compiled_config(config, compiled)
+    }
 
-        let model = build_model(&config)?;
+    fn from_compiled_config(
+        config: AgentConfig,
+        compiled: &CompiledPlannerRunSpec,
+    ) -> Result<Self, String> {
+        config.validate_runtime_invariants()?;
+        let (predictor, predictor_max_order) = match compiled.controller() {
+            CompiledPlannerController::McAixi {
+                predictor,
+                predictor_max_order,
+                ..
+            } => (predictor, *predictor_max_order),
+            _ => {
+                return Err(
+                    "compiled planner run is not an MC-AIXI controller configuration".to_string(),
+                );
+            }
+        };
+        let percept_bits = (compiled.interface().observation_bits
+            * compiled.interface().observation_stream_len.max(1))
+            + compiled.interface().reward_bits;
+        let model = build_mc_aixi_predictor(predictor, predictor_max_order, percept_bits)?;
 
         let rng = if let Some(seed) = config.random_seed {
             RandomGenerator::from_seed(seed)
@@ -389,7 +460,7 @@ impl Agent {
             config,
             age: 0,
             total_reward: 0.0,
-            action_bits,
+            action_bits: compiled.action_bits(),
             rng,
             obs_buffer: Vec::with_capacity(128),
             sym_buffer: Vec::with_capacity(64),
@@ -478,131 +549,6 @@ impl Agent {
         for &sym in &self.sym_buffer {
             self.model.commit_update_history(sym);
         }
-    }
-}
-
-fn build_model(config: &AgentConfig) -> Result<Box<dyn Predictor>, String> {
-    if let Some(rate_backend) = config.rate_backend.clone() {
-        let bit_backend = rate_backend
-            .compile()
-            .map_err(|err| err.to_string())?
-            .adapt_for_bit_tokens()
-            .map_err(|err| err.to_string())?;
-        let predictor =
-            RateBackendBitPredictor::from_compiled(bit_backend, config.rate_backend_max_order)?;
-        return Ok(Box::new(predictor));
-    }
-
-    match config.algorithm.as_str() {
-        // FAC-CTW is the default and recommended CTW variant in
-        // "A Monte-Carlo AIXI Approximation".
-        "ctw" | "fac-ctw" => {
-            #[cfg(feature = "backend-ctw")]
-            {
-                let obs_len = config.observation_stream_len.max(1);
-                let percept_bits = (config.observation_bits * obs_len) + config.reward_bits;
-                Ok(Box::new(FacCtwPredictor::new(
-                    config.ct_depth,
-                    percept_bits,
-                )))
-            }
-            #[cfg(not(feature = "backend-ctw"))]
-            {
-                Err("CTW backends are disabled at compile time".to_string())
-            }
-        }
-        // AC-CTW is the legacy single-tree variant
-        "ac-ctw" | "ctw-context-tree" => {
-            #[cfg(feature = "backend-ctw")]
-            {
-                Ok(Box::new(CtwPredictor::new(config.ct_depth)))
-            }
-            #[cfg(not(feature = "backend-ctw"))]
-            {
-                Err("CTW backends are disabled at compile time".to_string())
-            }
-        }
-        "rosa" => {
-            #[cfg(feature = "backend-rosa")]
-            {
-                let max_order = config.rosa_max_order.unwrap_or(20);
-                Ok(Box::new(RosaPredictor::new(max_order)))
-            }
-            #[cfg(not(feature = "backend-rosa"))]
-            {
-                Err("ROSA backend is disabled at compile time".to_string())
-            }
-        }
-        #[cfg(feature = "backend-rwkv")]
-        "rwkv" => {
-            if let Some(method) = config
-                .rwkv_method
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-            {
-                let predictor = RwkvPredictor::from_method(method)
-                    .map_err(|err| format!("Invalid RWKV method for AIXI: {err}"))?;
-                Ok(Box::new(predictor))
-            } else {
-                let path = config.rwkv_model_path.as_ref().ok_or_else(|| {
-                    "RWKV model path required when rwkv_method is not configured".to_string()
-                })?;
-                let method =
-                    crate::rwkvzip::canonical_method_string(&crate::rwkvzip::MethodSpec::File {
-                        path: PathBuf::from(path),
-                        policy: None,
-                    })
-                    .map_err(|err| format!("Invalid RWKV model path for AIXI: {err}"))?;
-                let predictor = RwkvPredictor::from_method(&method)
-                    .map_err(|err| format!("Invalid RWKV model path for AIXI: {err}"))?;
-                Ok(Box::new(predictor))
-            }
-        }
-        #[cfg(not(feature = "backend-rwkv"))]
-        "rwkv" => Err("RWKV backend disabled at compile time".to_string()),
-        #[cfg(feature = "backend-mamba")]
-        "mamba" => {
-            if let Some(method) = config
-                .mamba_method
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-            {
-                let predictor = MambaPredictor::from_method(method)
-                    .map_err(|err| format!("Invalid Mamba method for AIXI: {err}"))?;
-                Ok(Box::new(predictor))
-            } else {
-                let path = config.mamba_model_path.as_ref().ok_or_else(|| {
-                    "Mamba model path required when mamba_method is not configured".to_string()
-                })?;
-                let method =
-                    crate::mambazip::canonical_method_string(&crate::mambazip::MethodSpec::File {
-                        path: PathBuf::from(path),
-                        policy: None,
-                    })
-                    .map_err(|err| format!("Invalid Mamba model path for AIXI: {err}"))?;
-                let predictor = MambaPredictor::from_method(&method)
-                    .map_err(|err| format!("Invalid Mamba model path for AIXI: {err}"))?;
-                Ok(Box::new(predictor))
-            }
-        }
-        #[cfg(not(feature = "backend-mamba"))]
-        "mamba" => Err("Mamba backend disabled at compile time".to_string()),
-        #[cfg(feature = "backend-zpaq")]
-        "zpaq" => {
-            let method = config
-                .zpaq_method
-                .clone()
-                .unwrap_or_else(|| "1".to_string());
-            if let Err(err) = validate_zpaq_rate_method(&method) {
-                return Err(format!("Invalid zpaq method for AIXI: {err}"));
-            }
-            Ok(Box::new(ZpaqPredictor::new(method, 2f64.powi(-24))))
-        }
-        #[cfg(not(feature = "backend-zpaq"))]
-        "zpaq" => Err("ZPAQ backend disabled at compile time".to_string()),
-        _ => Err(format!("Unknown algorithm: {}", config.algorithm)),
     }
 }
 

@@ -6,7 +6,9 @@ use super::{
     compression_backend_to_json_value, parse_compression_backend_json, parse_rate_backend_json,
     rate_backend_to_canonical_json, rate_backend_to_json_value,
 };
-use crate::aixi::common::ObservationKeyMode;
+use crate::aixi::common::{
+    ObservationKeyMode, bits_for_cardinality, validate_reward_encoding_bounds,
+};
 use crate::api::{CompressionBackend, RateBackend};
 use std::collections::HashMap;
 use std::fmt;
@@ -927,19 +929,6 @@ fn resolve_asset_bindings(
         .into()
 }
 
-fn bits_for_cardinality(cardinality: usize) -> usize {
-    if cardinality <= 1 {
-        return 1;
-    }
-    let mut bits = 0usize;
-    let mut value = cardinality - 1;
-    while value > 0 {
-        bits += 1;
-        value >>= 1;
-    }
-    bits
-}
-
 fn compile_planner_controller(
     spec: &ControllerSpec,
     env: &SpecEnvironment,
@@ -1204,9 +1193,13 @@ fn canonicalize_interface_spec(spec: &PlannerInterfaceSpec) -> SpecResult<Planne
     if spec.reward_bits == 0 {
         return Err(SpecError::new("reward_bits must be >= 1"));
     }
-    if spec.max_reward < spec.min_reward {
-        return Err(SpecError::new("max_reward must be >= min_reward"));
-    }
+    validate_reward_encoding_bounds(
+        spec.min_reward,
+        spec.max_reward,
+        spec.reward_offset,
+        spec.reward_bits,
+    )
+    .map_err(SpecError::new)?;
     Ok(spec.clone())
 }
 
@@ -1233,7 +1226,12 @@ fn canonicalize_controller_spec(
                 env.base_dir(),
                 crate::api::MAX_MIXTURE_NESTING,
             )?;
-            predictor.validate_in(env)?;
+            let validated_predictor = predictor.validate_in(env)?;
+            if validated_predictor.capabilities().contains_zpaq {
+                return Err(SpecError::new(
+                    "MC-AIXI strict generic rate_backend support requires reversible action conditioning; configured rate_backend contains zpaq which does not provide the reversible action conditioning required by \"A Monte-Carlo AIXI Approximation\"",
+                ));
+            }
             Ok(ControllerSpec::McAixi(McAixiControllerSpec {
                 predictor,
                 predictor_max_order: inner.predictor_max_order,
@@ -1266,7 +1264,15 @@ fn canonicalize_controller_spec(
                 env.base_dir(),
                 crate::api::MAX_MIXTURE_NESTING,
             )?;
-            predictor.validate_in(env)?;
+            let validated_predictor = predictor.validate_in(env)?;
+            if !validated_predictor
+                .capabilities()
+                .supports_frozen_conditioning
+            {
+                return Err(SpecError::new(
+                    "AIQI strict mode requires frozen context updates; configured rate_backend contains zpaq which does not provide strict frozen conditioning",
+                ));
+            }
             Ok(ControllerSpec::AiqiDiscounted(
                 AiqiDiscountedControllerSpec {
                     predictor,
@@ -1313,6 +1319,147 @@ fn canonicalize_controller_spec(
     }
 }
 
+#[cfg(feature = "vm")]
+fn canonicalize_vm_observation_policy_name(name: &str) -> SpecResult<String> {
+    match name {
+        "from_guest" | "guest" | "from-guest" => Ok("from_guest".to_string()),
+        "output_hash" | "hash" | "output-hash" => Ok("output_hash".to_string()),
+        "raw_output" | "raw" | "raw-output" => Ok("raw_output".to_string()),
+        "shared_memory" | "shared-memory" | "shm" => Ok("shared_memory".to_string()),
+        other => Err(SpecError::new(format!(
+            "unknown VM observation_policy '{other}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "vm")]
+fn canonicalize_vm_observation_stream_mode_name(name: &str) -> SpecResult<String> {
+    match name {
+        "pad_truncate" | "pad-truncate" => Ok("pad_truncate".to_string()),
+        "pad" => Ok("pad".to_string()),
+        "truncate" => Ok("truncate".to_string()),
+        other => Err(SpecError::new(format!(
+            "unknown VM observation_stream_mode '{other}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "vm")]
+fn canonicalize_vm_payload_encoding(name: &str, field_name: &str) -> SpecResult<String> {
+    match name {
+        "utf8" | "text" => Ok("utf8".to_string()),
+        "hex" => Ok("hex".to_string()),
+        other => Err(SpecError::new(format!(
+            "unknown VM payload encoding '{other}' for {field_name}"
+        ))),
+    }
+}
+
+#[cfg(feature = "vm")]
+fn canonicalize_vm_fuzz_mutator_name(name: &str) -> SpecResult<String> {
+    match name {
+        "flip_bit" | "flipbit" => Ok("flip_bit".to_string()),
+        "flip_byte" | "flipbyte" => Ok("flip_byte".to_string()),
+        "insert_byte" | "insertbyte" => Ok("insert_byte".to_string()),
+        "delete_byte" | "deletebyte" => Ok("delete_byte".to_string()),
+        "splice_seed" | "splice-seed" | "splice" => Ok("splice_seed".to_string()),
+        "reset_seed" | "reset-seed" | "reset" => Ok("reset_seed".to_string()),
+        "havoc" => Ok("havoc".to_string()),
+        other => Err(SpecError::new(format!("unknown VM fuzz mutator '{other}'"))),
+    }
+}
+
+#[cfg(feature = "vm")]
+fn canonicalize_vm_action_source(
+    source: &VmRuntimeActionSourceSpec,
+) -> SpecResult<VmRuntimeActionSourceSpec> {
+    match source {
+        VmRuntimeActionSourceSpec::Literal {
+            names,
+            payloads,
+            encoding,
+        } => Ok(VmRuntimeActionSourceSpec::Literal {
+            names: names.clone(),
+            payloads: payloads.clone(),
+            encoding: canonicalize_vm_payload_encoding(
+                encoding,
+                "environment.action_source.encoding",
+            )?,
+        }),
+        VmRuntimeActionSourceSpec::Fuzz {
+            seeds,
+            encoding,
+            mutators,
+            min_len,
+            max_len,
+            dictionary,
+            rng_seed,
+        } => {
+            if seeds.is_empty() {
+                return Err(SpecError::new(
+                    "environment.action_source.seeds must include at least one seed in fuzz mode",
+                ));
+            }
+            if mutators.is_empty() {
+                return Err(SpecError::new(
+                    "environment.action_source.mutators must include at least one mutator in fuzz mode",
+                ));
+            }
+            if min_len > max_len {
+                return Err(SpecError::new(
+                    "environment.action_source.min_len cannot exceed max_len",
+                ));
+            }
+            Ok(VmRuntimeActionSourceSpec::Fuzz {
+                seeds: seeds.clone(),
+                encoding: canonicalize_vm_payload_encoding(
+                    encoding,
+                    "environment.action_source.encoding",
+                )?,
+                mutators: mutators
+                    .iter()
+                    .map(|name| canonicalize_vm_fuzz_mutator_name(name))
+                    .collect::<SpecResult<Vec<_>>>()?,
+                min_len: *min_len,
+                max_len: *max_len,
+                dictionary: dictionary.clone(),
+                rng_seed: *rng_seed,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "vm")]
+fn canonicalize_vm_environment_spec(
+    vm: &VmEnvironmentSpec,
+    assets: &[AssetBinding],
+    env: &SpecEnvironment,
+) -> SpecResult<VmEnvironmentSpec> {
+    ensure_asset_exists(assets, &vm.firecracker_config_asset)?;
+    vm.stats_backend.validate_in(env)?;
+    if let Some(shape) = &vm.reward_shaping
+        && let VmRewardShapingSpec::EntropyReduction { baseline_asset, .. } = shape
+    {
+        ensure_asset_exists(assets, baseline_asset)?;
+    }
+    if let Some(filter) = &vm.action_filter
+        && let Some(asset) = &filter.novelty_prior_asset
+    {
+        ensure_asset_exists(assets, asset)?;
+    }
+    if vm.episode_steps == 0 {
+        return Err(SpecError::new("environment.episode_steps must be >= 1"));
+    }
+    let mut canonical = vm.clone();
+    canonical.observation_policy = canonicalize_vm_observation_policy_name(&vm.observation_policy)?;
+    canonical.observation_stream_mode =
+        canonicalize_vm_observation_stream_mode_name(&vm.observation_stream_mode)?;
+    canonical.wire_encoding =
+        canonicalize_vm_payload_encoding(&vm.wire_encoding, "environment.protocol.wire_encoding")?;
+    canonical.action_source = canonicalize_vm_action_source(&vm.action_source)?;
+    Ok(canonical)
+}
+
 fn canonicalize_environment_spec(
     spec: &EnvironmentSpec,
     _assets: &[AssetBinding],
@@ -1321,21 +1468,9 @@ fn canonicalize_environment_spec(
     match spec {
         EnvironmentSpec::Builtin { builtin } => Ok(EnvironmentSpec::Builtin { builtin: *builtin }),
         #[cfg(feature = "vm")]
-        EnvironmentSpec::NyxVm(vm) => {
-            ensure_asset_exists(_assets, &vm.firecracker_config_asset)?;
-            vm.stats_backend.validate_in(_env)?;
-            if let Some(shape) = &vm.reward_shaping
-                && let VmRewardShapingSpec::EntropyReduction { baseline_asset, .. } = shape
-            {
-                ensure_asset_exists(_assets, baseline_asset)?;
-            }
-            if let Some(filter) = &vm.action_filter
-                && let Some(asset) = &filter.novelty_prior_asset
-            {
-                ensure_asset_exists(_assets, asset)?;
-            }
-            Ok(EnvironmentSpec::NyxVm(vm.clone()))
-        }
+        EnvironmentSpec::NyxVm(vm) => Ok(EnvironmentSpec::NyxVm(canonicalize_vm_environment_spec(
+            vm, _assets, _env,
+        )?)),
     }
 }
 
@@ -3591,6 +3726,223 @@ mod tests {
             }
             _ => panic!("expected compiled aiqi controller"),
         }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn planner_run_compile_rejects_unrepresentable_reward_ranges() {
+        let mut spec = sample_planner_run();
+        spec.interface.reward_bits = 1;
+        spec.interface.min_reward = 0;
+        spec.interface.max_reward = 100;
+        spec.interface.reward_offset = 0;
+        let err = match spec.compile() {
+            Ok(_) => panic!("unrepresentable rewards must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("reward_bits too small"), "{err}");
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "backend-zpaq"))]
+    #[test]
+    fn planner_run_compile_rejects_mcaixi_predictors_with_zpaq_conditioning() {
+        let mut spec = sample_planner_run();
+        spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
+            predictor: RateBackend::Zpaq {
+                method: "1".to_string(),
+            },
+            predictor_max_order: 8,
+            agent_horizon: 1,
+            num_simulations: 1,
+            exploration_exploitation_ratio: 1.0,
+            discount_gamma: 1.0,
+        });
+        let err = match spec.compile() {
+            Ok(_) => panic!("MC-AIXI zpaq backend must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("reversible action conditioning"),
+            "{err}"
+        );
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "backend-zpaq"))]
+    #[test]
+    fn planner_run_compile_rejects_aiqi_predictors_without_frozen_conditioning() {
+        let mut spec = sample_planner_run();
+        spec.controller = ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
+            predictor: RateBackend::Zpaq {
+                method: "1".to_string(),
+            },
+            predictor_max_order: 8,
+            discount_gamma: 0.99,
+            return_horizon: 2,
+            return_bins: 8,
+            augmentation_period: 2,
+            history_prune_keep_steps: None,
+            baseline_exploration: 0.01,
+        });
+        let err = match spec.compile() {
+            Ok(_) => panic!("AIQI zpaq backend must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("strict frozen conditioning"),
+            "{err}"
+        );
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "vm"))]
+    fn sample_vm_planner_run() -> PlannerRunSpec {
+        PlannerRunSpec {
+            assets: vec![AssetBinding {
+                id: "firecracker".to_string(),
+                path: "dummy-firecracker.json".to_string(),
+            }],
+            environment: EnvironmentSpec::NyxVm(VmEnvironmentSpec {
+                firecracker_config_asset: "firecracker".to_string(),
+                instance_id: "vm-test".to_string(),
+                shared_region_name: "shared".to_string(),
+                shared_region_size: 4096,
+                shared_memory_policy: SharedMemoryPolicySpec::Snapshot,
+                step_timeout_ms: 100,
+                boot_timeout_ms: 1_000,
+                episode_steps: 4,
+                step_cost: 0,
+                observation_policy: "hash".to_string(),
+                observation_bits: 8,
+                observation_stream_len: 16,
+                observation_stream_mode: "pad-truncate".to_string(),
+                observation_pad_byte: 0,
+                reward_bits: 8,
+                reward_policy: VmRewardPolicySpec::FromGuest,
+                reward_shaping: None,
+                action_source: VmRuntimeActionSourceSpec::Fuzz {
+                    seeds: vec!["seed".to_string()],
+                    encoding: "text".to_string(),
+                    mutators: vec!["flipbit".to_string(), "splice".to_string()],
+                    min_len: 1,
+                    max_len: 16,
+                    dictionary: vec!["tok".to_string()],
+                    rng_seed: 7,
+                },
+                action_filter: None,
+                action_prefix: "ACT ".to_string(),
+                action_suffix: "\n".to_string(),
+                obs_prefix: "OBS ".to_string(),
+                rew_prefix: "REW ".to_string(),
+                done_prefix: "DONE ".to_string(),
+                data_prefix: "DATA ".to_string(),
+                wire_encoding: "text".to_string(),
+                stats_backend: RateBackend::Ctw { depth: 8 },
+                trace: None,
+                debug_mode: false,
+            }),
+            interface: PlannerInterfaceSpec {
+                observation_bits: 8,
+                observation_stream_len: 16,
+                observation_key_mode: ObservationKeyMode::FullStream,
+                reward_bits: 8,
+                agent_actions: 1,
+                min_reward: 0,
+                max_reward: 255,
+                reward_offset: 0,
+            },
+            controller: ControllerSpec::McAixi(McAixiControllerSpec {
+                predictor: RateBackend::Ctw { depth: 8 },
+                predictor_max_order: 8,
+                agent_horizon: 1,
+                num_simulations: 1,
+                exploration_exploitation_ratio: 1.0,
+                discount_gamma: 1.0,
+            }),
+            runtime: PlannerRuntimeSpec {
+                random_seed: Some(7),
+                learn_cycles: Some(1),
+                eval_cycles: Some(0),
+                terminate_lifetime: 1,
+                log_every: 1,
+                perf: false,
+                vm_perf_only: false,
+                explore_epsilon: 0.0,
+                explore_gamma: 1.0,
+            },
+        }
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "vm"))]
+    #[test]
+    fn planner_run_compile_normalizes_vm_aliases_to_canonical_names() {
+        let compiled = sample_vm_planner_run()
+            .compile()
+            .expect("vm planner run should compile");
+        let EnvironmentSpec::NyxVm(vm) = &compiled.canonical_spec().environment else {
+            panic!("expected vm environment");
+        };
+        assert_eq!(vm.observation_policy, "output_hash");
+        assert_eq!(vm.observation_stream_mode, "pad_truncate");
+        assert_eq!(vm.wire_encoding, "utf8");
+        match &vm.action_source {
+            VmRuntimeActionSourceSpec::Fuzz {
+                encoding, mutators, ..
+            } => {
+                assert_eq!(encoding, "utf8");
+                assert_eq!(
+                    mutators,
+                    &vec!["flip_bit".to_string(), "splice_seed".to_string()]
+                );
+            }
+            other => panic!("expected fuzz action source, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "vm"))]
+    #[test]
+    fn planner_run_compile_rejects_unknown_vm_enum_names() {
+        let mut unknown_policy = sample_vm_planner_run();
+        if let EnvironmentSpec::NyxVm(vm) = &mut unknown_policy.environment {
+            vm.observation_policy = "nope".to_string();
+        }
+        let err = match unknown_policy.compile() {
+            Ok(_) => panic!("unknown observation policy must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unknown VM observation_policy"),
+            "{err}"
+        );
+
+        let mut unknown_encoding = sample_vm_planner_run();
+        if let EnvironmentSpec::NyxVm(vm) = &mut unknown_encoding.environment {
+            vm.wire_encoding = "base64".to_string();
+        }
+        let err = match unknown_encoding.compile() {
+            Ok(_) => panic!("unknown wire encoding must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unknown VM payload encoding"),
+            "{err}"
+        );
+
+        let mut unknown_mutator = sample_vm_planner_run();
+        if let EnvironmentSpec::NyxVm(vm) = &mut unknown_mutator.environment {
+            vm.action_source = VmRuntimeActionSourceSpec::Fuzz {
+                seeds: vec!["seed".to_string()],
+                encoding: "utf8".to_string(),
+                mutators: vec!["invalid-mutator".to_string()],
+                min_len: 1,
+                max_len: 16,
+                dictionary: Vec::new(),
+                rng_seed: 1,
+            };
+        }
+        let err = match unknown_mutator.compile() {
+            Ok(_) => panic!("unknown mutator must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unknown VM fuzz mutator"), "{err}");
     }
 
     #[cfg(feature = "backend-ctw")]

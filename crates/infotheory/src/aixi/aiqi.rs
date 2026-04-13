@@ -7,14 +7,16 @@
 //! for return horizon `H` and period `N >= H`, each phase model only inserts
 //! returns at indices `i % N == phase`.
 
-use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
-#[cfg(feature = "backend-ctw")]
-use crate::aixi::model::{CtwPredictor, FacCtwPredictor};
-use crate::aixi::model::{Predictor, RateBackendBitPredictor};
+use crate::aixi::common::{
+    Action, PerceptVal, RandomGenerator, Reward, bits_for_cardinality,
+    validate_reward_encoding_bounds,
+};
+use crate::aixi::model::{Predictor, build_aiqi_predictor};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
-    AiqiDiscountedControllerSpec, BuiltinEnvironmentSpec, ControllerSpec, EnvironmentSpec,
-    PlannerInterfaceSpec, PlannerRunSpec, PlannerRuntimeSpec,
+    AiqiDiscountedControllerSpec, BuiltinEnvironmentSpec, CompiledPlannerController,
+    CompiledPlannerRunSpec, ControllerSpec, EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec,
+    PlannerRuntimeSpec,
 };
 #[cfg(feature = "backend-rwkv")]
 use std::path::PathBuf;
@@ -170,8 +172,13 @@ impl AiqiConfig {
         })
     }
 
-    /// Validate configuration constraints.
-    pub fn validate(&self) -> Result<(), String> {
+    fn compile_planner_run_spec(&self) -> Result<CompiledPlannerRunSpec, String> {
+        self.canonical_planner_run_spec()?
+            .compile()
+            .map_err(|err| err.to_string())
+    }
+
+    fn validate_runtime_invariants(&self) -> Result<(), String> {
         if self.agent_actions == 0 {
             return Err("agent_actions must be >= 1".to_string());
         }
@@ -205,12 +212,12 @@ impl AiqiConfig {
                 self.baseline_exploration
             ));
         }
-        if self.max_reward < self.min_reward {
-            return Err(format!(
-                "max_reward must be >= min_reward (got {} < {})",
-                self.max_reward, self.min_reward
-            ));
-        }
+        validate_reward_encoding_bounds(
+            self.min_reward,
+            self.max_reward,
+            self.reward_offset,
+            self.reward_bits,
+        )?;
 
         // `rate_backend` takes precedence over `algorithm`; only validate
         // algorithm choices when no backend override is configured.
@@ -256,29 +263,90 @@ impl AiqiConfig {
                 }
             }
         }
-
-        let min_shifted = (self.min_reward as i128) + (self.reward_offset as i128);
-        let max_shifted = (self.max_reward as i128) + (self.reward_offset as i128);
-        if min_shifted < 0 {
-            return Err(format!(
-                "reward_offset too small: min_reward + reward_offset must be >= 0 (got {})",
-                min_shifted
-            ));
-        }
-        if self.reward_bits < 64 {
-            let max_enc = (1u128 << self.reward_bits) - 1;
-            if (max_shifted as u128) > max_enc {
-                return Err(format!(
-                    "reward_bits too small for configured reward range: max shifted reward {} exceeds {}",
-                    max_shifted, max_enc
-                ));
-            }
-        }
-
-        self.canonical_planner_run_spec()?
-            .validate()
-            .map_err(|err| err.to_string())?;
         Ok(())
+    }
+
+    /// Validate configuration constraints.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_runtime_invariants()?;
+        self.compile_planner_run_spec().map(|_| ())
+    }
+}
+
+impl AiqiConfig {
+    fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+        let interface = compiled.interface();
+        let runtime = compiled.runtime();
+        let (
+            predictor,
+            predictor_max_order,
+            discount_gamma,
+            return_horizon,
+            return_bins,
+            augmentation_period,
+            history_prune_keep_steps,
+            baseline_exploration,
+        ) = match compiled.controller() {
+            CompiledPlannerController::AiqiDiscounted {
+                predictor,
+                predictor_max_order,
+                discount_gamma,
+                return_horizon,
+                return_bins,
+                augmentation_period,
+                history_prune_keep_steps,
+                baseline_exploration,
+            } => (
+                predictor,
+                *predictor_max_order,
+                *discount_gamma,
+                *return_horizon,
+                *return_bins,
+                *augmentation_period,
+                *history_prune_keep_steps,
+                *baseline_exploration,
+            ),
+            _ => {
+                return Err(
+                    "compiled planner run does not contain a discounted AIQI controller"
+                        .to_string(),
+                );
+            }
+        };
+        let (algorithm, ct_depth, rate_backend) = match predictor.canonical_spec() {
+            RateBackend::Ctw { depth } => ("ctw".to_string(), *depth, None),
+            RateBackend::FacCtw { base_depth, .. } => ("fac-ctw".to_string(), *base_depth, None),
+            RateBackend::RosaPlus => ("rosa".to_string(), 0, None),
+            other => (
+                predictor.canonical_name().to_string(),
+                0,
+                Some(other.clone()),
+            ),
+        };
+
+        Ok(Self {
+            algorithm,
+            ct_depth,
+            observation_bits: interface.observation_bits,
+            observation_stream_len: interface.observation_stream_len.max(1),
+            reward_bits: interface.reward_bits,
+            agent_actions: interface.agent_actions,
+            min_reward: interface.min_reward,
+            max_reward: interface.max_reward,
+            reward_offset: interface.reward_offset,
+            discount_gamma,
+            return_horizon,
+            return_bins,
+            augmentation_period,
+            history_prune_keep_steps,
+            baseline_exploration,
+            random_seed: runtime.random_seed,
+            rate_backend,
+            rate_backend_max_order: predictor_max_order,
+            rwkv_model_path: None,
+            rosa_max_order: None,
+            zpaq_method: None,
+        })
     }
 }
 
@@ -316,10 +384,44 @@ pub struct AiqiAgent {
 impl AiqiAgent {
     /// Construct a new AIQI agent.
     pub fn new(config: AiqiConfig) -> Result<Self, String> {
-        config.validate()?;
+        let compiled = config.compile_planner_run_spec()?;
+        Self::from_compiled_config(config, &compiled)
+    }
 
-        let action_bits = bits_for_cardinality(config.agent_actions);
-        let return_bits = bits_for_cardinality(config.return_bins);
+    /// Construct a new AIQI agent directly from a compiled planner-run spec.
+    pub fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+        let config = AiqiConfig::from_compiled_planner_run(compiled)?;
+        Self::from_compiled_config(config, compiled)
+    }
+
+    fn from_compiled_config(
+        config: AiqiConfig,
+        compiled: &CompiledPlannerRunSpec,
+    ) -> Result<Self, String> {
+        config.validate_runtime_invariants()?;
+        let (predictor, predictor_max_order, augmentation_period, return_bins) =
+            match compiled.controller() {
+                CompiledPlannerController::AiqiDiscounted {
+                    predictor,
+                    predictor_max_order,
+                    augmentation_period,
+                    return_bins,
+                    ..
+                } => (
+                    predictor,
+                    *predictor_max_order,
+                    *augmentation_period,
+                    *return_bins,
+                ),
+                _ => {
+                    return Err(
+                        "compiled planner run is not a discounted AIQI controller configuration"
+                            .to_string(),
+                    );
+                }
+            };
+        let action_bits = compiled.action_bits();
+        let return_bits = bits_for_cardinality(return_bins);
         let use_generic_planner = aiqi_requires_generic_planner(&config);
         let distribution_uses_training_updates = config.rate_backend.is_none()
             && matches!(
@@ -327,10 +429,10 @@ impl AiqiAgent {
                 "ctw" | "fac-ctw" | "ac-ctw" | "ctw-context-tree"
             );
 
-        let mut phases = Vec::with_capacity(config.augmentation_period);
-        for _ in 0..config.augmentation_period {
+        let mut phases = Vec::with_capacity(augmentation_period);
+        for _ in 0..augmentation_period {
             phases.push(PhaseModel {
-                predictor: build_predictor(&config, return_bits)?,
+                predictor: build_aiqi_predictor(predictor, predictor_max_order, return_bits)?,
                 last_augmented_step: 0,
             });
         }
@@ -921,96 +1023,6 @@ fn push_percept_tokens_commit_history(
         )
 }
 
-fn build_predictor(
-    config: &AiqiConfig,
-    #[allow(unused_variables)] return_bits: usize,
-) -> Result<Box<dyn Predictor>, String> {
-    if let Some(rate_backend) = config.rate_backend.clone() {
-        let bit_backend = rate_backend
-            .compile()
-            .map_err(|err| err.to_string())?
-            .adapt_for_bit_tokens()
-            .map_err(|err| err.to_string())?;
-        let predictor =
-            RateBackendBitPredictor::from_compiled(bit_backend, config.rate_backend_max_order)?;
-        return Ok(Box::new(predictor));
-    }
-
-    match config.algorithm.as_str() {
-        "ctw" | "ac-ctw" | "ctw-context-tree" => {
-            #[cfg(feature = "backend-ctw")]
-            {
-                Ok(Box::new(CtwPredictor::new(config.ct_depth)))
-            }
-            #[cfg(not(feature = "backend-ctw"))]
-            {
-                Err("algorithm=ctw requires backend-ctw feature".to_string())
-            }
-        }
-        "fac-ctw" => {
-            #[cfg(feature = "backend-ctw")]
-            {
-                // AIQI-FAC-CTW extension: factorized return-bit modeling.
-                Ok(Box::new(FacCtwPredictor::new(config.ct_depth, return_bits)))
-            }
-            #[cfg(not(feature = "backend-ctw"))]
-            {
-                Err("algorithm=fac-ctw requires backend-ctw feature".to_string())
-            }
-        }
-        "rosa" => {
-            #[cfg(feature = "backend-rosa")]
-            {
-                let max_order = config
-                    .rosa_max_order
-                    .unwrap_or(config.rate_backend_max_order);
-                let bit_backend = RateBackend::RosaPlus
-                    .compile()
-                    .map_err(|err| err.to_string())?
-                    .adapt_for_bit_tokens()
-                    .map_err(|err| err.to_string())?;
-                let predictor = RateBackendBitPredictor::from_compiled(bit_backend, max_order)?;
-                Ok(Box::new(predictor))
-            }
-            #[cfg(not(feature = "backend-rosa"))]
-            {
-                Err("algorithm=rosa requires backend-rosa feature".to_string())
-            }
-        }
-        #[cfg(feature = "backend-rwkv")]
-        "rwkv" => {
-            let path = config.rwkv_model_path.as_ref().ok_or_else(|| {
-                "algorithm=rwkv requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
-                    .to_string()
-            })?;
-            let method = crate::rwkvzip::canonical_method_string(&crate::rwkvzip::MethodSpec::File {
-                path: PathBuf::from(path),
-                policy: None,
-            })
-            .map_err(|err| format!("Invalid RWKV model path for AIQI: {err}"))?;
-            let bit_backend = RateBackend::Rwkv7Method {
-                method,
-            }
-            .compile()
-            .map_err(|err| err.to_string())?
-            .adapt_for_bit_tokens()
-            .map_err(|err| err.to_string())?;
-            let predictor = RateBackendBitPredictor::from_compiled(
-                bit_backend,
-                config.rate_backend_max_order,
-            )?;
-            Ok(Box::new(predictor))
-        }
-        #[cfg(not(feature = "backend-rwkv"))]
-        "rwkv" => Err("algorithm=rwkv requires backend-rwkv feature".to_string()),
-        "zpaq" => Err(
-            "AIQI strict mode does not support algorithm=zpaq; configure a backend with strict frozen conditioning"
-                .to_string(),
-        ),
-        _ => Err(format!("Unknown AIQI algorithm: {}", config.algorithm)),
-    }
-}
-
 fn rate_backend_supports_aiqi_frozen_conditioning(backend: &RateBackend) -> bool {
     backend
         .compile()
@@ -1024,15 +1036,6 @@ fn aiqi_requires_generic_planner(config: &AiqiConfig) -> bool {
             config.algorithm.as_str(),
             "ctw" | "fac-ctw" | "ac-ctw" | "ctw-context-tree"
         )
-}
-
-fn bits_for_cardinality(cardinality: usize) -> usize {
-    let n = cardinality.max(1);
-    let mut bits = 0usize;
-    while (1usize << bits) < n {
-        bits += 1;
-    }
-    bits.max(1)
 }
 
 fn max_value_for_bits(bits: usize) -> u64 {

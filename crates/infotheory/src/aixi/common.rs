@@ -28,6 +28,48 @@ pub enum ObservationKeyMode {
     StreamHash,
 }
 
+/// Compute the minimum number of bits required to encode a finite cardinality.
+pub(crate) fn bits_for_cardinality(cardinality: usize) -> usize {
+    let n = cardinality.max(1);
+    let bits = (usize::BITS - (n - 1).leading_zeros()) as usize;
+    bits.max(1)
+}
+
+/// Validate that shifted rewards are representable in the configured bit width.
+pub(crate) fn validate_reward_encoding_bounds(
+    min_reward: i64,
+    max_reward: i64,
+    reward_offset: i64,
+    reward_bits: usize,
+) -> Result<(), String> {
+    if max_reward < min_reward {
+        return Err(format!(
+            "max_reward must be >= min_reward (got {} < {})",
+            max_reward, min_reward
+        ));
+    }
+
+    let min_shifted = (min_reward as i128) + (reward_offset as i128);
+    let max_shifted = (max_reward as i128) + (reward_offset as i128);
+    if min_shifted < 0 {
+        return Err(format!(
+            "reward_offset too small: min_reward + reward_offset must be >= 0 (got {})",
+            min_shifted
+        ));
+    }
+    if reward_bits < 64 {
+        let max_enc = (1u128 << reward_bits) - 1;
+        if (max_shifted as u128) > max_enc {
+            return Err(format!(
+                "reward_bits too small for configured reward range: max shifted reward {} exceeds {}",
+                max_shifted, max_enc
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Compute a percept key from an observation stream.
 pub fn observation_key_from_stream(
     mode: ObservationKeyMode,
@@ -317,5 +359,20 @@ mod tests {
         let h1 = observation_key_from_stream(ObservationKeyMode::StreamHash, &obs, 64);
         let h2 = observation_key_from_stream(ObservationKeyMode::StreamHash, &obs, 128);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn bits_for_cardinality_covers_extreme_sizes_without_overflow() {
+        assert_eq!(bits_for_cardinality(0), 1);
+        assert_eq!(bits_for_cardinality(1), 1);
+        assert_eq!(bits_for_cardinality(2), 1);
+        assert_eq!(bits_for_cardinality(3), 2);
+        assert_eq!(bits_for_cardinality(usize::MAX), usize::BITS as usize);
+    }
+
+    #[test]
+    fn validate_reward_encoding_bounds_rejects_unrepresentable_ranges() {
+        let err = validate_reward_encoding_bounds(0, 100, 0, 1).expect_err("must fail");
+        assert!(err.contains("reward_bits too small"), "{err}");
     }
 }
