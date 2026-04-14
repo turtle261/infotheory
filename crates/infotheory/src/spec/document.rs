@@ -4524,6 +4524,7 @@ impl<'a> Cursor<'a> {
         Ok(items)
     }
 
+    #[cfg(feature = "vm")]
     fn has_remaining(&self) -> bool {
         self.pos < self.bytes.len()
     }

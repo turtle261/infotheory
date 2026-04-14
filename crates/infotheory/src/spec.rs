@@ -789,6 +789,11 @@ fn lower_rwkv7_compression_backend_method(
     }
 }
 
+/// Parse RWKV7 compression backend shorthand into a canonical backend configuration.
+///
+/// When `method` is empty or absent, this falls back to
+/// [`CompressionBackendShorthandOptions::default_rwkv_model_path`].
+/// If the `backend-rwkv` feature is disabled, this returns a spec error.
 pub fn parse_rwkv7_compression_backend_method(
     method: Option<&str>,
     coder: crate::coders::CoderType,

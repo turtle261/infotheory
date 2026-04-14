@@ -8,7 +8,10 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ZpaqMethodSpec {
     /// Literal ZPAQ method string.
-    Literal { value: String },
+    Literal {
+        /// ZPAQ method string accepted by the backend.
+        value: String,
+    },
 }
 
 impl ZpaqMethodSpec {
