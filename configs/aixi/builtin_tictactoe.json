@@ -1,16 +1,43 @@
 {
-    "environment": "tictactoe",
-    "algorithm": "fac-ctw",
-    "ct_depth": 32,
+  "assets": [],
+  "controller": {
     "agent_horizon": 4,
-    "observation_bits": 18,
-    "reward_bits": 3,
-    "agent_actions": 9,
-    "reward_offset": 3,
-    "num_simulations": 500,
+    "discount_gamma": 1,
     "exploration_exploitation_ratio": 1.4,
+    "kind": "mc_aixi",
+    "num_simulations": 500,
+    "predictor": {
+      "base_depth": 32,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "num_percept_bits": 21
+    },
+    "predictor_max_order": 20
+  },
+  "environment": {
+    "kind": "builtin",
+    "name": "tic_tac_toe"
+  },
+  "interface": {
+    "agent_actions": 9,
+    "max_reward": 2,
+    "min_reward": -3,
+    "observation_bits": 18,
+    "observation_key_mode": "full_stream",
+    "observation_stream_len": 1,
+    "reward_bits": 3,
+    "reward_offset": 3
+  },
+  "kind": "planner_run",
+  "runtime": {
+    "eval_cycles": 5000,
     "explore_epsilon": 0.9999,
     "explore_gamma": 0.999999,
     "learn_cycles": 500000,
-    "eval_cycles": 5000
+    "log_every": 1,
+    "perf": false,
+    "terminate_lifetime": 20,
+    "vm_perf_only": false
+  },
+  "schema_version": 1
 }

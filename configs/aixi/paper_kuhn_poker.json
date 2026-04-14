@@ -1,18 +1,43 @@
 {
-  "environment": "kuhn-poker",
-  "algorithm": "fac-ctw",
-  "ct_depth": 16,
-  "trace_bit01_path": "runs/kuhnpoker.bits01.bin",
-  "trace_jsonl_path": "runs/kuhnpoker.trace.jsonl",
-  "agent_horizon": 2,
-  "observation_bits": 4,
-  "reward_bits": 3,
-  "agent_actions": 2,
-  "reward_offset": 2,
-  "num_simulations": 200,
-  "exploration_exploitation_ratio": 1.4,
-  "explore_epsilon": 0.99,
-  "explore_gamma": 0.9999,
-  "learn_cycles": 25000,
-  "eval_cycles": 200
+  "assets": [],
+  "controller": {
+    "agent_horizon": 2,
+    "discount_gamma": 1,
+    "exploration_exploitation_ratio": 1.4,
+    "kind": "mc_aixi",
+    "num_simulations": 200,
+    "predictor": {
+      "base_depth": 16,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "num_percept_bits": 7
+    },
+    "predictor_max_order": 20
+  },
+  "environment": {
+    "kind": "builtin",
+    "name": "kuhn_poker"
+  },
+  "interface": {
+    "agent_actions": 2,
+    "max_reward": 2,
+    "min_reward": -2,
+    "observation_bits": 4,
+    "observation_key_mode": "full_stream",
+    "observation_stream_len": 1,
+    "reward_bits": 3,
+    "reward_offset": 2
+  },
+  "kind": "planner_run",
+  "runtime": {
+    "eval_cycles": 200,
+    "explore_epsilon": 0.99,
+    "explore_gamma": 0.9999,
+    "learn_cycles": 25000,
+    "log_every": 1,
+    "perf": false,
+    "terminate_lifetime": 20,
+    "vm_perf_only": false
+  },
+  "schema_version": 1
 }

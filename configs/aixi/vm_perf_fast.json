@@ -1,48 +1,87 @@
 {
-    "algorithm": "ctw",
-    "environment": "vm",
-    "ct_depth": 8,
-    "agent_horizon": 1,
-    "observation_bits": 8,
-    "observation_stream_len": 1,
-    "observation_key_mode": "first",
-    "reward_bits": 8,
-    "num_simulations": 0,
-    "exploration_exploitation_ratio": 1.0,
-    "discount_gamma": 1.0,
-    "terminate-lifetime": 20000,
-    "perf_cycles": 2000,
-    "log_every": 0,
-    "perf": true,
-    "vm_perf_only": true,
-    "vm_config": {
-        "firecracker_config": "../../vendor/nyx-lite/vm_image/vmconfig.json",
-        "instance_id": "aixi-nyx",
-        "shared_region_name": "shared",
-        "shared_region_size": 4096,
-        "shared_memory_policy": "snapshot",
-        "episode_steps": 1000,
-        "step_cost": 0,
-        "boot_timeout_ms": 30000,
-        "step_timeout_ms": 50,
-        "verbose": false
-    },
-    "vm_actions": {
-        "mode": "literal",
-        "actions": [
-            {
-                "name": "ping",
-                "payload": "PING",
-                "encoding": "utf8"
-            }
-        ]
-    },
-    "vm_observation": {
-        "mode": "from-guest",
-        "stream_len": 1,
-        "stream_mode": "pad-truncate"
-    },
-    "vm_reward": {
-        "mode": "from-guest"
+  "assets": [
+    {
+      "id": "firecracker",
+      "path": "..\/..\/vendor\/nyx-lite\/vm_image\/vmconfig.json"
     }
+  ],
+  "controller": {
+    "agent_horizon": 1,
+    "discount_gamma": 1,
+    "exploration_exploitation_ratio": 1,
+    "kind": "mc_aixi",
+    "num_simulations": 1,
+    "predictor": {
+      "base_depth": 8,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "num_percept_bits": 16
+    },
+    "predictor_max_order": 20
+  },
+  "environment": {
+    "action_source": {
+      "actions": [
+        {
+          "name": "ping",
+          "payload": "50494e47"
+        }
+      ],
+      "encoding": "hex",
+      "kind": "literal"
+    },
+    "boot_timeout_ms": 30000,
+    "debug_mode": false,
+    "episode_steps": 1000,
+    "firecracker_config_asset": "firecracker",
+    "instance_id": "aixi-nyx",
+    "kind": "nyx_vm",
+    "observation_bits": 8,
+    "observation_pad_byte": 0,
+    "observation_policy": "from_guest",
+    "observation_stream_len": 1,
+    "observation_stream_mode": "pad_truncate",
+    "protocol": {
+      "action_prefix": "ACT ",
+      "action_suffix": "\n",
+      "data_prefix": "DATA ",
+      "done_prefix": "DONE ",
+      "obs_prefix": "OBS ",
+      "rew_prefix": "REW ",
+      "wire_encoding": "hex"
+    },
+    "reward_bits": 8,
+    "reward_policy": {
+      "kind": "from_guest"
+    },
+    "shared_memory_policy": "snapshot",
+    "shared_region_name": "shared",
+    "shared_region_size": 4096,
+    "stats_backend": {
+      "depth": 8,
+      "kind": "ctw"
+    },
+    "step_cost": 0,
+    "step_timeout_ms": 50
+  },
+  "interface": {
+    "agent_actions": 1,
+    "max_reward": 127,
+    "min_reward": -128,
+    "observation_bits": 8,
+    "observation_key_mode": "full_stream",
+    "observation_stream_len": 1,
+    "reward_bits": 8,
+    "reward_offset": 128
+  },
+  "kind": "planner_run",
+  "runtime": {
+    "explore_epsilon": 0,
+    "explore_gamma": 1,
+    "log_every": 1,
+    "perf": true,
+    "terminate_lifetime": 2000,
+    "vm_perf_only": true
+  },
+  "schema_version": 1
 }

@@ -306,6 +306,21 @@ cmd_clean() {
   say "[clean] Done"
 }
 
+cmd_legacy_aixi_convert() {
+  [ $# -eq 1 ] || fail "Usage: ./projman.sh legacy_aixi_convert <input_file>"
+
+  lua_cmd=""
+  if command -v luajit >/dev/null 2>&1; then
+    lua_cmd="luajit"
+  elif command -v lua >/dev/null 2>&1; then
+    lua_cmd="lua"
+  else
+    fail "Missing required command: luajit or lua"
+  fi
+
+  (cd "$ROOT_DIR" && "$lua_cmd" "$ROOT_DIR/scripts/legacy_aixi_convert.lua" "$1")
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./projman.sh <command>
@@ -324,6 +339,7 @@ Commands:
   test_full   Run init-vm, code_test, and lean_test.
   test_all    Alias for test_full.
   clean       Clean build artifacts (cargo clean, lake clean, VM images/initramfs). Keeps vmlinux-6.1.58.
+  legacy_aixi_convert <input_file>  Convert legacy AIXI JSON config to canonical planner_run JSON and write to stdout. External configs print: External configs were deprecated.
 
 Environment variables:
   INFOTHEORY_BUILD_MODE=native|portable  Controls local cargo invocations in projman. `native` uses the repository's default target-cpu=native configuration; `portable` overrides local builds/tests to use generic CPU codegen like CI/release builds.
@@ -348,6 +364,7 @@ case "$cmd" in
   test_full) shift; cmd_test_full "$@" ;;
   test_all) shift; cmd_test_all "$@" ;;
   clean) shift; cmd_clean "$@" ;;
+  legacy_aixi_convert) shift; cmd_legacy_aixi_convert "$@" ;;
   -h|--help|help|'') usage ;;
   *) usage; fail "Unknown command: $cmd" ;;
 esac

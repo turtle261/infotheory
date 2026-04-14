@@ -1,17 +1,43 @@
 {
-  "environment": "biased-rock-paper-scissor",
-  "algorithm": "fac-ctw",
-  "ct_depth": 32,
-  "agent_horizon": 4,
-  "observation_bits": 2,
-  "reward_bits": 2,
-  "agent_actions": 3,
-  "reward_offset": 1,
-  "num_simulations": 120,
-  "exploration_exploitation_ratio": 0.6,
-  "explore_epsilon": 0.995,
-  "explore_gamma": 0.999,
-  "learn_cycles": 3000,
-  "eval_cycles": 200,
-  "log_every": 50
+  "assets": [],
+  "controller": {
+    "agent_horizon": 4,
+    "discount_gamma": 1,
+    "exploration_exploitation_ratio": 0.6,
+    "kind": "mc_aixi",
+    "num_simulations": 120,
+    "predictor": {
+      "base_depth": 32,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "num_percept_bits": 4
+    },
+    "predictor_max_order": 20
+  },
+  "environment": {
+    "kind": "builtin",
+    "name": "biased_rock_paper_scissor"
+  },
+  "interface": {
+    "agent_actions": 3,
+    "max_reward": 1,
+    "min_reward": -1,
+    "observation_bits": 2,
+    "observation_key_mode": "full_stream",
+    "observation_stream_len": 1,
+    "reward_bits": 2,
+    "reward_offset": 1
+  },
+  "kind": "planner_run",
+  "runtime": {
+    "eval_cycles": 200,
+    "explore_epsilon": 0.995,
+    "explore_gamma": 0.999,
+    "learn_cycles": 3000,
+    "log_every": 50,
+    "perf": false,
+    "terminate_lifetime": 20,
+    "vm_perf_only": false
+  },
+  "schema_version": 1
 }

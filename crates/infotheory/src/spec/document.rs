@@ -285,6 +285,8 @@ pub struct VmEnvironmentSpec {
     pub trace: Option<VmTraceSpec>,
     /// Whether to enable verbose VM diagnostics.
     pub debug_mode: bool,
+    /// Optional crash log path for VM exits.
+    pub crash_log: Option<String>,
 }
 
 /// Canonical planner-visible environment specification.
@@ -1728,6 +1730,7 @@ fn environment_spec_to_json_value(spec: &EnvironmentSpec) -> SpecResult<serde_js
             "stats_backend": rate_backend_to_json_value(&vm.stats_backend)?,
             "trace": vm.trace.as_ref().map(vm_trace_to_json_value),
             "debug_mode": vm.debug_mode,
+            "crash_log": vm.crash_log,
         })),
     }
 }
@@ -2134,6 +2137,7 @@ fn parse_environment_spec(
             )?,
             trace: parse_optional_vm_trace(&value["trace"])?,
             debug_mode: value["debug_mode"].as_bool().unwrap_or(false),
+            crash_log: optional_string(&value["crash_log"]),
         })),
         #[cfg(not(feature = "vm"))]
         "nyx_vm" => Err(SpecError::new(
@@ -3335,6 +3339,7 @@ fn encode_environment_spec(spec: &EnvironmentSpec, out: &mut Vec<u8>) {
                 None => out.push(0),
             }
             push_bool(out, vm.debug_mode);
+            push_option_string(out, vm.crash_log.as_deref());
         }
     }
 }
@@ -3392,6 +3397,11 @@ fn decode_environment_spec(
                 None
             };
             let debug_mode = cursor.read_bool()?;
+            let crash_log = if cursor.has_remaining() {
+                cursor.read_option_string()?
+            } else {
+                None
+            };
             Ok(EnvironmentSpec::NyxVm(VmEnvironmentSpec {
                 firecracker_config_asset: baseline,
                 instance_id,
@@ -3422,6 +3432,7 @@ fn decode_environment_spec(
                 stats_backend,
                 trace,
                 debug_mode,
+                crash_log,
             }))
         }
         #[cfg(not(feature = "vm"))]
@@ -4512,6 +4523,10 @@ impl<'a> Cursor<'a> {
         }
         Ok(items)
     }
+
+    fn has_remaining(&self) -> bool {
+        self.pos < self.bytes.len()
+    }
 }
 
 impl fmt::Debug for ValidatedPlannerRunSpec {
@@ -4757,6 +4772,7 @@ mod tests {
                 stats_backend: RateBackend::Ctw { depth: 8 },
                 trace: None,
                 debug_mode: false,
+                crash_log: None,
             }),
             interface: PlannerInterfaceSpec {
                 observation_bits: 8,

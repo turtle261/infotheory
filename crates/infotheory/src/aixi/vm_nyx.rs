@@ -775,6 +775,7 @@ impl NyxVmConfig {
                 reset_on_episode: trace.reset_on_episode,
             }),
             debug_mode: self.debug_mode,
+            crash_log: self.crash_log.clone(),
         });
         environment
             .validate_in(&assets, &SpecEnvironment::default())
@@ -970,7 +971,7 @@ impl NyxVmConfig {
                 reset_on_episode: trace.reset_on_episode,
             }),
             debug_mode: spec.debug_mode,
-            crash_log: None,
+            crash_log: spec.crash_log.clone(),
         };
         config.validate()?;
         Ok(config)
@@ -2652,6 +2653,7 @@ mod tests {
                 reset_on_episode: true,
             }),
             debug_mode: true,
+            crash_log: Some("/tmp/vm-crash.jsonl".to_string()),
         };
         let assets = vec![
             ResolvedAssetBinding {
@@ -2675,6 +2677,7 @@ mod tests {
             config.firecracker_config,
             firecracker_path.display().to_string()
         );
+        assert_eq!(config.crash_log.as_deref(), Some("/tmp/vm-crash.jsonl"));
         assert!(matches!(
             config.observation_policy,
             NyxObservationPolicy::OutputHash
@@ -2782,6 +2785,7 @@ mod tests {
             stats_backend: RateBackend::Ctw { depth: 8 },
             trace: None,
             debug_mode: false,
+            crash_log: None,
         };
         let assets = vec![ResolvedAssetBinding {
             id: "firecracker".to_string(),
