@@ -48,6 +48,14 @@ vm_artifacts_present() {
   [ -f "$ROOT_DIR/vmlinux-6.1.58" ] && [ -f "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage/rootfs.ext4" ] && [ -f "$ROOT_DIR/vendor/nyx-lite/guest/aixi_initramfs.cpio" ]
 }
 
+cmd_check_nyx_lite_standalone() {
+  say "[check-vm-builder] Checking standalone nyx-lite build_rootfs compile..."
+  need_cmd cargo
+  (cd "$ROOT_DIR" && \
+    cargo check -q --manifest-path "$ROOT_DIR/vendor/nyx-lite/Cargo.toml" --bin build_rootfs)
+  say "[check-vm-builder] Done"
+}
+
 cmd_init_vm() {
   say "[init-vm] Fetching/building VM artifacts..."
   need_cmd cargo
@@ -88,7 +96,7 @@ cmd_init_vm() {
   need_cmd mke2fs
   say "[init-vm] Building vendor/nyx-lite/vm_image/dockerimage/rootfs.ext4 via RootfsBuilder (no sudo)"
   (cd "$ROOT_DIR" && \
-    cargo run -q -p nyx-lite --bin build_rootfs -- \
+    cargo run -q --manifest-path "$ROOT_DIR/vendor/nyx-lite/Cargo.toml" --bin build_rootfs -- \
       "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage/Dockerfile" \
       "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage" \
       "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage/rootfs.ext4" \
@@ -150,6 +158,7 @@ cmd_lean_test() {
 }
 
 cmd_test_full() {
+  cmd_check_nyx_lite_standalone
   cmd_init_vm
   cmd_code_test
   cmd_lean_test
