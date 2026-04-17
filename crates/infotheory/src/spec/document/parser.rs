@@ -4,10 +4,10 @@ use super::{
     AiqiDiscountedControllerSpec, AiqiDiscountedTuneControllerSpec,
     AnnealedHillClimbingTuneControllerSpec, AssetBinding, ControllerSpec, EnvironmentSpec,
     McAixiControllerSpec, McAixiFacCtwTuneControllerSpec, PlannerInterfaceSpec, PlannerRunSpec,
-    PlannerRuntimeSpec, SpecDocument, SpecError, SpecResult, TuneBoundsSpec, TuneControllerSpec,
-    TuneParameterRangeSpec, TuneSpec, WarmStartExactJhControllerSpec,
-    WarmStartExactJhTuneControllerSpec, parse_compression_backend_json,
-    parse_rate_backend_json, SPEC_DOCUMENT_SCHEMA_VERSION,
+    PlannerRuntimeSpec, SPEC_DOCUMENT_SCHEMA_VERSION, SpecDocument, SpecError, SpecResult,
+    TuneBoundsSpec, TuneControllerSpec, TuneParameterRangeSpec, TuneSpec,
+    WarmStartExactJhControllerSpec, WarmStartExactJhTuneControllerSpec,
+    parse_compression_backend_json, parse_rate_backend_json,
 };
 
 #[cfg(feature = "vm")]
@@ -153,8 +153,7 @@ fn parse_environment_spec(
                     .unwrap_or("shared_memory"),
             )?,
             observation_bits: value["observation_bits"].as_u64().unwrap_or(8) as usize,
-            observation_stream_len: value["observation_stream_len"].as_u64().unwrap_or(64)
-                as usize,
+            observation_stream_len: value["observation_stream_len"].as_u64().unwrap_or(64) as usize,
             observation_stream_mode: super::canonicalize_vm_observation_stream_mode_name(
                 value["observation_stream_mode"]
                     .as_str()

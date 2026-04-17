@@ -1,8 +1,10 @@
 //! Canonical top-level specification document schema types.
 
-use crate::spec::core::{AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend};
 use crate::aixi::common::ObservationKeyMode;
 use crate::api::{CompressionBackend, RateBackend};
+use crate::spec::core::{
+    AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 

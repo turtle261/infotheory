@@ -2,13 +2,16 @@
 
 use super::{
     AssetBinding, ControllerSpec, EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec,
-    PlannerRuntimeSpec, SpecDocument, SpecResult, TuneBoundsSpec, TuneControllerSpec,
-    TuneParameterRangeSpec, TuneSpec, SPEC_DOCUMENT_SCHEMA_VERSION,
-    compression_backend_to_json_value, rate_backend_to_json_value,
+    PlannerRuntimeSpec, SPEC_DOCUMENT_SCHEMA_VERSION, SpecDocument, SpecResult, TuneBoundsSpec,
+    TuneControllerSpec, TuneParameterRangeSpec, TuneSpec, compression_backend_to_json_value,
+    rate_backend_to_json_value,
 };
 
 #[cfg(feature = "vm")]
-use super::{VmActionFilterSpec, VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec};
+use super::{
+    VmActionFilterSpec, VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec,
+    VmTraceSpec,
+};
 
 pub(super) fn spec_document_to_json_value(doc: &SpecDocument) -> SpecResult<serde_json::Value> {
     match doc {

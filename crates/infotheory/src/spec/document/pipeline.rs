@@ -4,8 +4,8 @@ use super::{
     AssetBinding, CompiledPlannerController, CompiledPlannerRunSpec, CompiledTuneController,
     CompiledTuneSpec, ControllerSpec, EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec,
     PlannerRuntimeSpec, ResolvedAssetBinding, SpecEnvironment, SpecError, SpecResult,
-    TuneBoundsSpec, TuneControllerSpec, TuneSpec, ValidatedPlannerRunSpec, ValidatedTuneSpec,
-    TUNE_CANONICALIZATION_CLASSIFICATION_VERSION, compression_backend_to_json_value,
+    TUNE_CANONICALIZATION_CLASSIFICATION_VERSION, TuneBoundsSpec, TuneControllerSpec, TuneSpec,
+    ValidatedPlannerRunSpec, ValidatedTuneSpec, compression_backend_to_json_value,
     parse_compression_backend_json, parse_rate_backend_json, rate_backend_to_json_value,
 };
 use crate::aixi::common::{bits_for_cardinality, validate_reward_encoding_bounds};
@@ -155,7 +155,10 @@ pub(super) fn canonicalize_planner_run(
     })
 }
 
-pub(super) fn canonicalize_tune_spec(spec: &TuneSpec, env: &SpecEnvironment) -> SpecResult<TuneSpec> {
+pub(super) fn canonicalize_tune_spec(
+    spec: &TuneSpec,
+    env: &SpecEnvironment,
+) -> SpecResult<TuneSpec> {
     validate_asset_bindings(&spec.assets)?;
     ensure_asset_exists(&spec.assets, &spec.input_asset)?;
     let baseline = parse_compression_backend_json(
@@ -369,21 +372,26 @@ fn canonicalize_controller_spec(
                 crate::api::MAX_MIXTURE_NESTING,
             )?;
             let validated_predictor = predictor.validate_in(env)?;
-            if !validated_predictor.capabilities().supports_frozen_conditioning {
+            if !validated_predictor
+                .capabilities()
+                .supports_frozen_conditioning
+            {
                 return Err(SpecError::new(
                     "AIQI strict mode requires frozen context updates; configured rate_backend contains zpaq which does not provide strict frozen conditioning",
                 ));
             }
-            Ok(ControllerSpec::AiqiDiscounted(super::AiqiDiscountedControllerSpec {
-                predictor,
-                predictor_max_order: inner.predictor_max_order,
-                discount_gamma: inner.discount_gamma,
-                return_horizon: inner.return_horizon,
-                return_bins: inner.return_bins,
-                augmentation_period: inner.augmentation_period,
-                history_prune_keep_steps: inner.history_prune_keep_steps,
-                baseline_exploration: inner.baseline_exploration,
-            }))
+            Ok(ControllerSpec::AiqiDiscounted(
+                super::AiqiDiscountedControllerSpec {
+                    predictor,
+                    predictor_max_order: inner.predictor_max_order,
+                    discount_gamma: inner.discount_gamma,
+                    return_horizon: inner.return_horizon,
+                    return_bins: inner.return_bins,
+                    augmentation_period: inner.augmentation_period,
+                    history_prune_keep_steps: inner.history_prune_keep_steps,
+                    baseline_exploration: inner.baseline_exploration,
+                },
+            ))
         }
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             if inner.return_horizon == 0 {
@@ -503,9 +511,9 @@ pub(super) fn canonicalize_environment_spec(
     match spec {
         EnvironmentSpec::Builtin { builtin } => Ok(EnvironmentSpec::Builtin { builtin: *builtin }),
         #[cfg(feature = "vm")]
-        EnvironmentSpec::NyxVm(vm) => {
-            Ok(EnvironmentSpec::NyxVm(canonicalize_vm_environment_spec(vm, _assets, _env)?))
-        }
+        EnvironmentSpec::NyxVm(vm) => Ok(EnvironmentSpec::NyxVm(canonicalize_vm_environment_spec(
+            vm, _assets, _env,
+        )?)),
     }
 }
 
@@ -592,7 +600,8 @@ fn canonicalize_tune_bounds(bounds: &TuneBoundsSpec) -> TuneBoundsSpec {
     required.dedup();
     let mut parameter_ranges = bounds.parameter_ranges.clone();
     parameter_ranges.sort_by(|a, b| a.parameter.cmp(&b.parameter));
-    parameter_ranges.dedup_by(|a, b| a.parameter == b.parameter && a.min == b.min && a.max == b.max);
+    parameter_ranges
+        .dedup_by(|a, b| a.parameter == b.parameter && a.min == b.min && a.max == b.max);
     let mut forbidden_pairs = bounds
         .forbidden_expert_pairs
         .iter()

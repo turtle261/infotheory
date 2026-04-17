@@ -18,14 +18,14 @@ const DOCUMENT_MAGIC: &[u8; 4] = b"itsd";
 const DOCUMENT_BINARY_VERSION: u8 = 1;
 const TUNE_CANONICALIZATION_CLASSIFICATION_VERSION: &str = "bounds-v1";
 
-mod types;
 mod io;
 mod parser;
 mod pipeline;
 mod serializer;
+mod types;
 
-pub use types::*;
 pub use io::load_spec_document;
+pub use types::*;
 
 impl ValidatedPlannerRunSpec {
     /// Canonical validated planner-run spec.
