@@ -38,7 +38,7 @@ uv run pytest \
 crate (library + CLI tests).
 
 ```bash
-cargo llvm-cov -p infotheory --tests --features cli --locked --summary-only
+cargo llvm-cov -p infotheory --tests --features "cli all-backends" --locked --summary-only
 ```
 
 CI enforces a minimum line coverage threshold for this command.
