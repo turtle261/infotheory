@@ -200,14 +200,21 @@ cmd_bench_cli() {
   [ $# -ge 1 ] || fail "Usage: ./projman.sh bench cli <baseline-commit> [preset]"
   need_cmd bash
   validate_build_mode
+  cli_build_mode=$(build_mode)
   case "${1:-}" in
     -h|--help)
-      (cd "$ROOT_DIR" && bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@")
+      (cd "$ROOT_DIR" && INFOTHEORY_CLI_BENCH_BUILD_MODE="$cli_build_mode" bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@")
+      return 0
+      ;;
+    --plan)
+      say "[bench_cli] Rendering hyperfine CLI plan (build mode: ${cli_build_mode})..."
+      (cd "$ROOT_DIR" && INFOTHEORY_CLI_BENCH_BUILD_MODE="$cli_build_mode" bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@")
+      say "[bench_cli] Done"
       return 0
       ;;
   esac
-  say "[bench_cli] Running hyperfine CLI comparison against baseline '$1' (build mode: $(build_mode))..."
-  (cd "$ROOT_DIR" && bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@" && "$ROOT_DIR/scripts/summarize_interpret.sh")
+  say "[bench_cli] Running hyperfine CLI comparison against baseline '$1' (build mode: ${cli_build_mode})..."
+  (cd "$ROOT_DIR" && INFOTHEORY_CLI_BENCH_BUILD_MODE="$cli_build_mode" bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@" && "$ROOT_DIR/scripts/summarize_interpret.sh")
   say "[bench_cli] Done"
 }
 
@@ -353,7 +360,7 @@ Commands:
 Environment variables:
   INFOTHEORY_BUILD_MODE=native|portable  Controls local cargo invocations in projman. `native` uses the repository's default target-cpu=native configuration; `portable` overrides local builds/tests to use generic CPU codegen like CI/release builds.
   INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv, INFOTHEORY_BENCH_SUITE=extra, and INFOTHEORY_BENCH_BUILD_MODE=native|portable.
-  INFOTHEORY_CLI_BENCH_*  Passed through to scripts/bench_cli_hyperfine.sh for baseline/current CLI benchmark tuning and input selection, including INFOTHEORY_CLI_BENCH_BUILD_MODE=native|portable.
+  INFOTHEORY_CLI_BENCH_*  Passed through to scripts/bench_cli_hyperfine.sh for baseline/current CLI benchmark tuning and input selection. For `projman.sh bench cli`, INFOTHEORY_BUILD_MODE is canonical and is forwarded as INFOTHEORY_CLI_BENCH_BUILD_MODE.
   INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv, INFOTHEORY_PLOT_SUMMARY_TSV=..., and INFOTHEORY_PLOT_SUITE=extra.
   INFOTHEORY_BASELINE_SUMMARY_TSV / INFOTHEORY_BENCH_RAW_TSV  Also read by benchman for baseline overlays and raw inspector detail.
   SKIP_DOCKER=1   Skip docker rootfs.ext4 build during init-vm.

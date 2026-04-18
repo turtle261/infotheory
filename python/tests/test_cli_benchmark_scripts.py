@@ -50,15 +50,23 @@ def _resolve_bash_executable() -> str:
     pytest.skip("GNU bash executable is required on Windows for benchmark script tests")
 
 
-def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     if cmd and cmd[0] == "bash":
         cmd = [_resolve_bash_executable(), *cmd[1:]]
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
     return subprocess.run(
         cmd,
         cwd=_repo_root(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=merged_env,
     )
 
 
@@ -187,6 +195,32 @@ def test_cli_bench_plan_quick_keeps_full_matrix_with_faster_defaults():
     assert int(plan["cases"]) == 40
     assert int(plan["roundtrip_cases"]) == 14
     assert len(cases) == 40
+
+
+def test_projman_cli_plan_mode_skips_summary_lookup_error():
+    proc = _run(
+        ["bash", "projman.sh", "bench", "cli", "--plan", "quick"],
+        env={"INFOTHEORY_BUILD_MODE": "portable"},
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    plan, _ = _parse_plan(proc.stdout)
+    assert plan["preset"] == "quick"
+    assert "no summary.tsv found under /var/tmp/infotheory_bench" not in proc.stderr
+
+
+def test_projman_cli_plan_uses_canonical_build_mode_knob():
+    proc = _run(
+        ["bash", "projman.sh", "bench", "cli", "--plan", "quick"],
+        env={
+            "INFOTHEORY_BUILD_MODE": "portable",
+            "INFOTHEORY_CLI_BENCH_BUILD_MODE": "invalid",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    plan, _ = _parse_plan(proc.stdout)
+    assert plan["preset"] == "quick"
 
 
 def test_summarize_interpret_supports_extended_summary_schema(tmp_path: pathlib.Path):

@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::aixi::common::ObservationKeyMode;
-use crate::api::{CompressionBackend, RateBackend};
+#[cfg(feature = "backend-ctw")]
+use crate::api::CompressionBackend;
+use crate::api::RateBackend;
 
 #[cfg(feature = "backend-ctw")]
 fn sample_planner_run() -> PlannerRunSpec {
