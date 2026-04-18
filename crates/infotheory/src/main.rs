@@ -1589,7 +1589,7 @@ mod tests {
         feature = "backend-mamba",
         feature = "backend-rwkv"
     ))]
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     #[cfg(any(
         feature = "all-backends",
         feature = "backend-mamba",

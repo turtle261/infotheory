@@ -21,7 +21,15 @@ serde_json = "1.0.149"
 
 [features]
 default = ["default-backends"]
-default-backends = [
+# Grouped capability topology.
+default-backends = ["capability-default"]
+capability-default = [
+    "capability-statistical",
+    "capability-neural",
+    "capability-archive",
+]
+capability-statistical = [
+    "infotheory/capability-statistical",
     "backend-rosa",
     "backend-ctw",
     "backend-match",
@@ -30,23 +38,20 @@ default-backends = [
     "backend-mixture",
     "backend-particle",
     "backend-calibrated",
+]
+capability-neural = [
+    "infotheory/capability-neural",
     "backend-mamba",
     "backend-rwkv",
+]
+capability-archive = [
+    "infotheory/capability-archive",
     "backend-zpaq",
 ]
-all-backends = [
-    "backend-rosa",
-    "backend-ctw",
-    "backend-match",
-    "backend-ppmd",
-    "backend-sequitur",
-    "backend-mixture",
-    "backend-particle",
-    "backend-calibrated",
-    "backend-mamba",
-    "backend-rwkv",
-    "backend-zpaq",
-]
+capability-vm = ["infotheory/capability-vm"]
+
+# Legacy compatibility aliases.
+all-backends = ["capability-default"]
 python-extension = ["pyo3/extension-module"]
 backend-rosa = ["infotheory/backend-rosa"]
 backend-ctw = ["infotheory/backend-ctw"]
@@ -59,7 +64,7 @@ backend-calibrated = ["infotheory/backend-calibrated"]
 backend-mamba = ["infotheory/backend-mamba"]
 backend-rwkv = ["infotheory/backend-rwkv"]
 backend-zpaq = ["infotheory/backend-zpaq"]
-vm = ["infotheory/vm"]
+vm = ["capability-vm"]
 
 [lints]
 workspace = true

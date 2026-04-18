@@ -512,37 +512,29 @@ pub(crate) fn validate_compression_backend_in(
 pub(crate) fn compiled_rate_backend_from_plan(
     plan: Arc<RateBackendPlan>,
 ) -> SpecResult<CompiledRateBackend> {
-    Ok(compiled_rate_backend_from_plan_unchecked(plan))
+    let canonical_spec = Arc::new(rate_plan_to_wrapper(plan.as_ref()));
+    crate::api::validate_rate_backend(canonical_spec.as_ref())
+        .map_err(|err| SpecError::new(err.to_string()))?;
+    Ok(CompiledRateBackend {
+        canonical_bytes: encode_rate_backend_plan(plan.as_ref()),
+        capabilities: rate_backend_capabilities(plan.as_ref()),
+        canonical_spec,
+        plan,
+    })
 }
 
 pub(crate) fn compiled_compression_backend_from_plan(
     plan: Arc<CompressionBackendPlan>,
 ) -> SpecResult<CompiledCompressionBackend> {
-    Ok(compiled_compression_backend_from_plan_unchecked(plan))
-}
-
-pub(crate) fn compiled_rate_backend_from_plan_unchecked(
-    plan: Arc<RateBackendPlan>,
-) -> CompiledRateBackend {
-    let canonical_spec = Arc::new(rate_plan_to_wrapper(plan.as_ref()));
-    CompiledRateBackend {
-        canonical_bytes: encode_rate_backend_plan(plan.as_ref()),
-        capabilities: rate_backend_capabilities(plan.as_ref()),
-        canonical_spec,
-        plan,
-    }
-}
-
-pub(crate) fn compiled_compression_backend_from_plan_unchecked(
-    plan: Arc<CompressionBackendPlan>,
-) -> CompiledCompressionBackend {
     let canonical_spec = Arc::new(compression_plan_to_wrapper(plan.as_ref()));
-    CompiledCompressionBackend {
+    crate::api::validate_compression_backend(canonical_spec.as_ref())
+        .map_err(|err| SpecError::new(err.to_string()))?;
+    Ok(CompiledCompressionBackend {
         canonical_bytes: encode_compression_backend_plan(plan.as_ref()),
         capabilities: compression_backend_capabilities(plan.as_ref()),
         canonical_spec,
         plan,
-    }
+    })
 }
 
 pub(crate) fn compile_rate_plan_rosa(

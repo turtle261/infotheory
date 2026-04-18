@@ -5,8 +5,7 @@ use super::{
     CompiledTuneSpec, ControllerSpec, EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec,
     PlannerRuntimeSpec, ResolvedAssetBinding, SpecEnvironment, SpecError, SpecResult,
     TUNE_CANONICALIZATION_CLASSIFICATION_VERSION, TuneBoundsSpec, TuneControllerSpec, TuneSpec,
-    ValidatedPlannerRunSpec, ValidatedTuneSpec, compression_backend_to_json_value,
-    parse_compression_backend_json, parse_rate_backend_json, rate_backend_to_json_value,
+    ValidatedPlannerRunSpec, ValidatedTuneSpec,
 };
 use crate::aixi::common::{bits_for_cardinality, validate_reward_encoding_bounds};
 use crate::spec::core::AssetRef;
@@ -161,12 +160,11 @@ pub(super) fn canonicalize_tune_spec(
 ) -> SpecResult<TuneSpec> {
     validate_asset_bindings(&spec.assets)?;
     ensure_asset_exists(&spec.assets, &spec.input_asset)?;
-    let baseline = parse_compression_backend_json(
-        &compression_backend_to_json_value(&spec.baseline_candidate)?,
-        env.base_dir(),
-        None,
-        crate::compression::FramingMode::Framed,
-    )?;
+    let baseline = spec
+        .baseline_candidate
+        .validate_in(env)?
+        .canonical_spec()
+        .clone();
     let controller = canonicalize_tune_controller(&spec.controller, &spec.assets, env)?;
     validate_tune_bounds(&spec.bounds)?;
     Ok(TuneSpec {
@@ -328,12 +326,8 @@ fn canonicalize_controller_spec(
             if !(0.0..=1.0).contains(&inner.discount_gamma) {
                 return Err(SpecError::new("discount_gamma must be in [0, 1]"));
             }
-            let predictor = parse_rate_backend_json(
-                &rate_backend_to_json_value(&inner.predictor)?,
-                env.base_dir(),
-                crate::api::MAX_MIXTURE_NESTING,
-            )?;
-            let validated_predictor = predictor.validate_in(env)?;
+            let validated_predictor = inner.predictor.validate_in(env)?;
+            let predictor = validated_predictor.canonical_spec().clone();
             if validated_predictor.capabilities().contains_zpaq {
                 return Err(SpecError::new(
                     "MC-AIXI strict generic rate_backend support requires reversible action conditioning; configured rate_backend contains zpaq which does not provide the reversible action conditioning required by \"A Monte-Carlo AIXI Approximation\"",
@@ -366,12 +360,8 @@ fn canonicalize_controller_spec(
             if !(0.0 < inner.baseline_exploration && inner.baseline_exploration <= 1.0) {
                 return Err(SpecError::new("baseline_exploration must be in (0, 1]"));
             }
-            let predictor = parse_rate_backend_json(
-                &rate_backend_to_json_value(&inner.predictor)?,
-                env.base_dir(),
-                crate::api::MAX_MIXTURE_NESTING,
-            )?;
-            let validated_predictor = predictor.validate_in(env)?;
+            let validated_predictor = inner.predictor.validate_in(env)?;
+            let predictor = validated_predictor.canonical_spec().clone();
             if !validated_predictor
                 .capabilities()
                 .supports_frozen_conditioning
@@ -405,12 +395,8 @@ fn canonicalize_controller_spec(
                     "label_phase_period must be >= return_horizon",
                 ));
             }
-            let predictor = parse_rate_backend_json(
-                &rate_backend_to_json_value(&inner.predictor)?,
-                env.base_dir(),
-                crate::api::MAX_MIXTURE_NESTING,
-            )?;
-            predictor.validate_in(env)?;
+            let validated_predictor = inner.predictor.validate_in(env)?;
+            let predictor = validated_predictor.canonical_spec().clone();
             Ok(ControllerSpec::AiqiWarmstartExactJh(
                 super::WarmStartExactJhControllerSpec {
                     predictor,

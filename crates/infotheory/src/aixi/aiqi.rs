@@ -12,11 +12,11 @@ use crate::aixi::common::{
     validate_reward_encoding_bounds,
 };
 use crate::aixi::model::{Predictor, build_aiqi_predictor};
+use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_coin_flip_planner_run_spec};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
-    AiqiDiscountedControllerSpec, BuiltinEnvironmentSpec, CompiledPlannerController,
-    CompiledPlannerRunSpec, ControllerSpec, EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec,
-    PlannerRuntimeSpec,
+    AiqiDiscountedControllerSpec, CompiledPlannerController, CompiledPlannerRunSpec,
+    ControllerSpec, PlannerRunSpec,
 };
 #[cfg(feature = "backend-rwkv")]
 use std::path::PathBuf;
@@ -131,14 +131,10 @@ impl AiqiConfig {
 
     fn canonical_planner_run_spec(&self) -> Result<PlannerRunSpec, String> {
         let predictor = self.canonical_predictor_backend()?;
-        Ok(PlannerRunSpec {
-            assets: Vec::new(),
-            environment: EnvironmentSpec::Builtin {
-                builtin: BuiltinEnvironmentSpec::CoinFlip,
-            },
-            interface: PlannerInterfaceSpec {
+        Ok(build_coin_flip_planner_run_spec(
+            PlannerInterfaceConfig {
                 observation_bits: self.observation_bits,
-                observation_stream_len: self.observation_stream_len.max(1),
+                observation_stream_len: self.observation_stream_len,
                 observation_key_mode: crate::aixi::common::ObservationKeyMode::FullStream,
                 reward_bits: self.reward_bits,
                 agent_actions: self.agent_actions,
@@ -146,7 +142,7 @@ impl AiqiConfig {
                 max_reward: self.max_reward,
                 reward_offset: self.reward_offset,
             },
-            controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
+            ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
                 predictor,
                 predictor_max_order: self.rate_backend_max_order,
                 discount_gamma: self.discount_gamma,
@@ -156,18 +152,8 @@ impl AiqiConfig {
                 history_prune_keep_steps: self.history_prune_keep_steps,
                 baseline_exploration: self.baseline_exploration,
             }),
-            runtime: PlannerRuntimeSpec {
-                random_seed: self.random_seed,
-                learn_cycles: None,
-                eval_cycles: None,
-                terminate_lifetime: 1,
-                log_every: 1,
-                perf: false,
-                vm_perf_only: false,
-                explore_epsilon: 0.0,
-                explore_gamma: 1.0,
-            },
-        })
+            self.random_seed,
+        ))
     }
 
     fn compile_planner_run_spec(&self) -> Result<CompiledPlannerRunSpec, String> {

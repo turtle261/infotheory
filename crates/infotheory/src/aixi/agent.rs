@@ -9,11 +9,11 @@ use crate::aixi::common::{
 };
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
 use crate::aixi::model::{Predictor, build_mc_aixi_predictor};
+use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_coin_flip_planner_run_spec};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
-    BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec,
-    EnvironmentSpec, McAixiControllerSpec, PlannerInterfaceSpec, PlannerRunSpec,
-    PlannerRuntimeSpec,
+    CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec, McAixiControllerSpec,
+    PlannerRunSpec,
 };
 use crate::validate_zpaq_rate_method;
 #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
@@ -159,14 +159,10 @@ impl AgentConfig {
 
     fn canonical_planner_run_spec(&self) -> Result<PlannerRunSpec, String> {
         let predictor = self.canonical_predictor_backend()?;
-        Ok(PlannerRunSpec {
-            assets: Vec::new(),
-            environment: EnvironmentSpec::Builtin {
-                builtin: BuiltinEnvironmentSpec::CoinFlip,
-            },
-            interface: PlannerInterfaceSpec {
+        Ok(build_coin_flip_planner_run_spec(
+            PlannerInterfaceConfig {
                 observation_bits: self.observation_bits,
-                observation_stream_len: self.observation_stream_len.max(1),
+                observation_stream_len: self.observation_stream_len,
                 observation_key_mode: self.observation_key_mode,
                 reward_bits: self.reward_bits,
                 agent_actions: self.agent_actions,
@@ -174,7 +170,7 @@ impl AgentConfig {
                 max_reward: self.max_reward,
                 reward_offset: self.reward_offset,
             },
-            controller: ControllerSpec::McAixi(McAixiControllerSpec {
+            ControllerSpec::McAixi(McAixiControllerSpec {
                 predictor,
                 predictor_max_order: self.rate_backend_max_order,
                 agent_horizon: self.agent_horizon,
@@ -182,18 +178,8 @@ impl AgentConfig {
                 exploration_exploitation_ratio: self.exploration_exploitation_ratio,
                 discount_gamma: self.discount_gamma,
             }),
-            runtime: PlannerRuntimeSpec {
-                random_seed: self.random_seed,
-                learn_cycles: None,
-                eval_cycles: None,
-                terminate_lifetime: 1,
-                log_every: 1,
-                perf: false,
-                vm_perf_only: false,
-                explore_epsilon: 0.0,
-                explore_gamma: 1.0,
-            },
-        })
+            self.random_seed,
+        ))
     }
 
     fn compile_planner_run_spec(&self) -> Result<CompiledPlannerRunSpec, String> {

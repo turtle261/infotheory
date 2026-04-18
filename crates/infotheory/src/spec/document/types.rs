@@ -4,6 +4,7 @@ use crate::aixi::common::ObservationKeyMode;
 use crate::api::{CompressionBackend, RateBackend};
 use crate::spec::core::{
     AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
+    ValidatedCompressionBackend, ValidatedRateBackend,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -668,6 +669,16 @@ pub enum SpecDocument {
     CompressionBackend(CompressionBackend),
 }
 
+/// Parsed top-level spec document paired with its parse base directory.
+///
+/// This is the first stage of the canonical pipeline:
+/// parse -> validate -> compile.
+#[derive(Clone)]
+pub struct ParsedSpecDocument {
+    pub(super) document: SpecDocument,
+    pub(super) base_dir: PathBuf,
+}
+
 /// Canonicalized and validated planner-run document.
 #[derive(Clone)]
 pub struct ValidatedPlannerRunSpec {
@@ -682,4 +693,36 @@ pub struct ValidatedTuneSpec {
     pub(super) canonical_spec: Arc<TuneSpec>,
     pub(super) canonical_bytes: CanonicalBytes,
     pub(super) base_dir: PathBuf,
+}
+
+/// Validated top-level spec document.
+///
+/// This is the second stage of the canonical pipeline and can be compiled into
+/// runtime-ready plans/backends.
+#[derive(Clone)]
+pub enum ValidatedSpecDocument {
+    /// Validated planner-run document.
+    PlannerRun(ValidatedPlannerRunSpec),
+    /// Validated tune document.
+    Tune(ValidatedTuneSpec),
+    /// Validated standalone rate-backend document.
+    RateBackend(ValidatedRateBackend),
+    /// Validated standalone compression-backend document.
+    CompressionBackend(ValidatedCompressionBackend),
+}
+
+/// Compiled top-level spec document.
+///
+/// This is the final stage of the canonical pipeline and is executable by
+/// runtime adapters.
+#[derive(Clone)]
+pub enum CompiledSpecDocument {
+    /// Compiled planner-run document.
+    PlannerRun(CompiledPlannerRunSpec),
+    /// Compiled tune document.
+    Tune(CompiledTuneSpec),
+    /// Compiled standalone rate-backend document.
+    RateBackend(CompiledRateBackend),
+    /// Compiled standalone compression-backend document.
+    CompressionBackend(CompiledCompressionBackend),
 }

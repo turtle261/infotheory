@@ -21,8 +21,14 @@ wide = "1.1.1"
 
 [features]
 default = ["default-backends"]
-default-backends = ["all-backends"]
-all-backends = [
+# Grouped capability topology.
+default-backends = ["capability-default"]
+capability-default = [
+    "capability-statistical",
+    "capability-neural",
+    "capability-archive",
+]
+capability-statistical = [
     "backend-rosa",
     "backend-ctw",
     "backend-match",
@@ -31,10 +37,18 @@ all-backends = [
     "backend-mixture",
     "backend-particle",
     "backend-calibrated",
+]
+capability-neural = [
     "backend-mamba",
     "backend-rwkv",
+]
+capability-archive = [
     "backend-zpaq",
 ]
+capability-vm = ["vm"]
+
+# Legacy compatibility aliases.
+all-backends = ["capability-default"]
 backend-rosa = []
 backend-ctw = []
 backend-match = []

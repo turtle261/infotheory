@@ -35,6 +35,17 @@ use crate::spec::core::{
 use crate::spec::{CompiledCompressionBackend, CompiledRateBackend, SpecResult};
 use std::sync::Arc;
 
+mod pdf_predictor_builders;
+mod predictor_builders;
+mod registry;
+
+#[allow(unused_imports)]
+use registry::{compression_backend_feature_error, rate_backend_feature_error};
+pub(crate) use registry::{
+    describe_compression_backend_kind, describe_rate_backend_kind,
+    find_backend_descriptor_in_registry,
+};
+
 /// Stable internal identity for each rate-backend family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum RateBackendKind {
@@ -323,8 +334,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
-        build_predictor: build_predictor_rosa,
-        build_pdf_predictor: build_pdf_predictor_rosa,
+        build_predictor: predictor_builders::build_predictor_rosa,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_rosa,
         entropy_rate: entropy_rosa,
         joint_entropy_rate: joint_entropy_rosa,
         conditional_chain_rate: conditional_chain_rosa,
@@ -347,8 +358,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
-        build_predictor: build_predictor_match,
-        build_pdf_predictor: build_pdf_predictor_match,
+        build_predictor: predictor_builders::build_predictor_match,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_match,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
         conditional_chain_rate: conditional_chain_prequential,
@@ -371,8 +382,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
-        build_predictor: build_predictor_sparse_match,
-        build_pdf_predictor: build_pdf_predictor_sparse_match,
+        build_predictor: predictor_builders::build_predictor_sparse_match,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_sparse_match,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
         conditional_chain_rate: conditional_chain_prequential,
@@ -395,8 +406,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
-        build_predictor: build_predictor_ppmd,
-        build_pdf_predictor: build_pdf_predictor_ppmd,
+        build_predictor: predictor_builders::build_predictor_ppmd,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_ppmd,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
         conditional_chain_rate: conditional_chain_prequential,
@@ -419,8 +430,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
-        build_predictor: build_predictor_sequitur,
-        build_pdf_predictor: build_pdf_predictor_sequitur,
+        build_predictor: predictor_builders::build_predictor_sequitur,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_sequitur,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
         conditional_chain_rate: conditional_chain_prequential,
@@ -443,8 +454,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_ctw,
-        build_predictor: build_predictor_ctw,
-        build_pdf_predictor: build_pdf_predictor_ctw,
+        build_predictor: predictor_builders::build_predictor_ctw,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_ctw,
         entropy_rate: entropy_ctw,
         joint_entropy_rate: joint_entropy_ctw,
         conditional_chain_rate: conditional_chain_ctw,
@@ -467,8 +478,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_fac_ctw,
-        build_predictor: build_predictor_fac_ctw,
-        build_pdf_predictor: build_pdf_predictor_fac_ctw,
+        build_predictor: predictor_builders::build_predictor_fac_ctw,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_fac_ctw,
         entropy_rate: entropy_fac_ctw,
         joint_entropy_rate: joint_entropy_fac_ctw,
         conditional_chain_rate: conditional_chain_fac_ctw,
@@ -491,8 +502,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_true,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_false,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
-        build_predictor: build_predictor_zpaq,
-        build_pdf_predictor: build_pdf_predictor_zpaq,
+        build_predictor: predictor_builders::build_predictor_zpaq,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_zpaq,
         entropy_rate: entropy_zpaq,
         joint_entropy_rate: joint_entropy_zpaq,
         conditional_chain_rate: conditional_chain_zpaq,
@@ -515,8 +526,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_mixture,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_mixture,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_mixture,
-        build_predictor: build_predictor_mixture,
-        build_pdf_predictor: build_pdf_predictor_mixture,
+        build_predictor: predictor_builders::build_predictor_mixture,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_mixture,
         entropy_rate: entropy_mixture,
         joint_entropy_rate: joint_entropy_mixture,
         conditional_chain_rate: conditional_chain_mixture,
@@ -539,8 +550,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
-        build_predictor: build_predictor_particle,
-        build_pdf_predictor: build_pdf_predictor_particle,
+        build_predictor: predictor_builders::build_predictor_particle,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_particle,
         entropy_rate: entropy_particle,
         joint_entropy_rate: joint_entropy_particle,
         conditional_chain_rate: conditional_chain_particle,
@@ -563,8 +574,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_calibrated,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_calibrated,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_calibrated,
-        build_predictor: build_predictor_calibrated,
-        build_pdf_predictor: build_pdf_predictor_calibrated,
+        build_predictor: predictor_builders::build_predictor_calibrated,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_calibrated,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
         conditional_chain_rate: conditional_chain_prequential,
@@ -587,8 +598,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
-        build_predictor: build_predictor_mamba,
-        build_pdf_predictor: build_pdf_predictor_mamba,
+        build_predictor: predictor_builders::build_predictor_mamba,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_mamba,
         entropy_rate: entropy_mamba,
         joint_entropy_rate: joint_entropy_mamba,
         conditional_chain_rate: conditional_chain_mamba,
@@ -611,8 +622,8 @@ define_rate_backend_catalog! {
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
         supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
         adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
-        build_predictor: build_predictor_rwkv,
-        build_pdf_predictor: build_pdf_predictor_rwkv,
+        build_predictor: predictor_builders::build_predictor_rwkv,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_rwkv,
         entropy_rate: entropy_rwkv,
         joint_entropy_rate: joint_entropy_rwkv,
         conditional_chain_rate: conditional_chain_rwkv,
@@ -672,83 +683,6 @@ define_compression_backend_catalog! {
         supports_decompression: true,
         build_runtime: build_compression_runtime_rate,
     },
-}
-
-pub(crate) fn find_backend_descriptor_in_registry<K: Copy + Eq>(
-    registry: &'static [BackendDescriptor<K>],
-    input: &str,
-) -> Option<&'static BackendDescriptor<K>> {
-    let key = input.trim().to_ascii_lowercase();
-    registry
-        .iter()
-        .find(|descriptor| descriptor.aliases.iter().any(|alias| *alias == key))
-}
-
-fn backend_descriptor_by_kind<K: Copy + Eq>(
-    registry: &'static [BackendDescriptor<K>],
-    kind: K,
-) -> Option<&'static BackendDescriptor<K>> {
-    registry.iter().find(|descriptor| descriptor.kind == kind)
-}
-
-fn backend_descriptor_by_kind_checked<K: Copy + Eq>(
-    registry: &'static [BackendDescriptor<K>],
-    kind: K,
-    registry_name: &'static str,
-) -> Result<&'static BackendDescriptor<K>, String>
-where
-    K: std::fmt::Debug,
-{
-    backend_descriptor_by_kind(registry, kind).ok_or_else(|| {
-        format!(
-            "internal backend registry mismatch: backend '{kind:?}' is missing from {registry_name}"
-        )
-    })
-}
-
-pub(crate) fn describe_rate_backend_kind(
-    kind: RateBackendKind,
-) -> Result<&'static RateBackendDescriptor, String> {
-    backend_descriptor_by_kind_checked(RATE_BACKEND_REGISTRY, kind, "RATE_BACKEND_REGISTRY")
-}
-
-pub(crate) fn describe_compression_backend_kind(
-    kind: CompressionBackendKind,
-) -> Result<&'static CompressionBackendDescriptor, String> {
-    backend_descriptor_by_kind_checked(
-        COMPRESSION_BACKEND_REGISTRY,
-        kind,
-        "COMPRESSION_BACKEND_REGISTRY",
-    )
-}
-
-#[allow(dead_code)]
-fn rate_backend_feature_error(kind: RateBackendKind) -> String {
-    describe_rate_backend_kind(kind)
-        .map(|descriptor| match descriptor.feature {
-            Some(feature) => format!(
-                "backend '{}' requires infotheory feature '{}'",
-                descriptor.canonical, feature
-            ),
-            None => format!("backend '{}' is unavailable", descriptor.canonical),
-        })
-        .unwrap_or_else(|err| err)
-}
-
-#[allow(dead_code)]
-fn compression_backend_feature_error(kind: CompressionBackendKind) -> String {
-    describe_compression_backend_kind(kind)
-        .map(|descriptor| match descriptor.feature {
-            Some(feature) => format!(
-                "compression backend '{}' requires infotheory feature '{}'",
-                descriptor.canonical, feature
-            ),
-            None => format!(
-                "compression backend '{}' is unavailable",
-                descriptor.canonical
-            ),
-        })
-        .unwrap_or_else(|err| err)
 }
 
 pub(crate) fn default_rate_backend_spec(kind: RateBackendKind) -> Option<RateBackend> {
@@ -1007,706 +941,6 @@ pub(crate) fn rate_backend_trace_model_strategy(
         PublicTraceStrategy::Mamba => TraceModelStrategy::Mamba,
         PublicTraceStrategy::Rwkv7 => TraceModelStrategy::Rwkv7,
     }
-}
-
-#[cfg(feature = "backend-rosa")]
-fn build_predictor_rosa(
-    _backend: &CompiledRateBackend,
-    max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let mut model = RosaPlus::new(max_order, false, 0, 42);
-    model.build_lm_full_bytes_no_finalize_endpos();
-    Ok(crate::mixture::RateBackendPredictor::Rosa {
-        model,
-        min_prob,
-        checkpoint_journal: Vec::new(),
-        checkpoint_depth: 0,
-    })
-}
-
-#[cfg(not(feature = "backend-rosa"))]
-fn build_predictor_rosa(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::RosaPlus))
-}
-
-#[cfg(feature = "backend-match")]
-fn build_predictor_match(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::Match {
-        hash_bits,
-        min_len,
-        max_len,
-        base_mix,
-        confidence_scale,
-    } = backend.plan()
-    else {
-        unreachable!("match kernel used with non-match plan")
-    };
-    Ok(crate::mixture::RateBackendPredictor::Match {
-        model: MatchModel::new_contiguous(
-            *hash_bits,
-            *min_len,
-            *max_len,
-            *base_mix,
-            *confidence_scale,
-        ),
-        min_prob,
-    })
-}
-
-#[cfg(not(feature = "backend-match"))]
-fn build_predictor_match(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Match))
-}
-
-#[cfg(feature = "backend-match")]
-fn build_predictor_sparse_match(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::SparseMatch {
-        hash_bits,
-        min_len,
-        max_len,
-        gap_min,
-        gap_max,
-        base_mix,
-        confidence_scale,
-    } = backend.plan()
-    else {
-        unreachable!("sparse-match kernel used with non-sparse-match plan")
-    };
-    Ok(crate::mixture::RateBackendPredictor::SparseMatch {
-        model: SparseMatchModel::new(
-            *hash_bits,
-            *min_len,
-            *max_len,
-            *gap_min,
-            *gap_max,
-            *base_mix,
-            *confidence_scale,
-        ),
-        min_prob,
-    })
-}
-
-#[cfg(not(feature = "backend-match"))]
-fn build_predictor_sparse_match(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::SparseMatch))
-}
-
-#[cfg(feature = "backend-ppmd")]
-fn build_predictor_ppmd(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::Ppmd { order, memory_mb } = backend.plan() else {
-        unreachable!("ppmd kernel used with non-ppmd plan")
-    };
-    Ok(crate::mixture::RateBackendPredictor::Ppmd {
-        model: PpmdModel::new(*order, *memory_mb),
-        min_prob,
-    })
-}
-
-#[cfg(not(feature = "backend-ppmd"))]
-fn build_predictor_ppmd(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Ppmd))
-}
-
-#[cfg(feature = "backend-sequitur")]
-fn build_predictor_sequitur(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::Sequitur { context_bytes } = backend.plan() else {
-        unreachable!("sequitur kernel used with non-sequitur plan")
-    };
-    Ok(crate::mixture::RateBackendPredictor::Sequitur {
-        model: SequiturModel::new(*context_bytes),
-        min_prob,
-    })
-}
-
-#[cfg(not(feature = "backend-sequitur"))]
-fn build_predictor_sequitur(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Sequitur))
-}
-
-#[cfg(feature = "backend-ctw")]
-fn build_predictor_ctw(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
-        unreachable!("ctw kernel used with non-ctw plan")
-    };
-    Ok(crate::mixture::RateBackendPredictor::Ctw {
-        tree: FacContextTree::new(*depth, 8),
-        min_prob,
-        checkpoint_journal: Vec::new(),
-        checkpoint_depth: 0,
-    })
-}
-
-#[cfg(not(feature = "backend-ctw"))]
-fn build_predictor_ctw(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Ctw))
-}
-
-#[cfg(feature = "backend-ctw")]
-fn build_predictor_fac_ctw(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::FacCtw {
-        base_depth,
-        num_percept_bits: _,
-        encoding_bits,
-    } = backend.plan()
-    else {
-        unreachable!("fac-ctw kernel used with non-fac-ctw plan")
-    };
-    let bits_per_symbol = (*encoding_bits).clamp(1, 8);
-    Ok(crate::mixture::RateBackendPredictor::FacCtw {
-        tree: FacContextTree::new(*base_depth, bits_per_symbol),
-        bits_per_symbol,
-        min_prob,
-        checkpoint_journal: Vec::new(),
-        checkpoint_depth: 0,
-    })
-}
-
-#[cfg(not(feature = "backend-ctw"))]
-fn build_predictor_fac_ctw(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::FacCtw))
-}
-
-#[cfg(feature = "backend-rwkv")]
-fn build_predictor_rwkv(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::Rwkv7 { parsed_method, .. } = backend.plan() else {
-        unreachable!("rwkv kernel used with non-rwkv plan")
-    };
-    let mut compressor = rwkvzip::Compressor::new_from_method_spec(parsed_method)
-        .map_err(|e| format!("invalid rwkv method: {e}"))?;
-    compressor.reset_and_prime();
-    Ok(crate::mixture::RateBackendPredictor::Rwkv7 {
-        pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
-        compressor,
-        primed: true,
-        min_prob,
-    })
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-fn build_predictor_rwkv(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Rwkv7))
-}
-
-#[cfg(feature = "backend-mamba")]
-fn build_predictor_mamba(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::Mamba { parsed_method, .. } = backend.plan() else {
-        unreachable!("mamba kernel used with non-mamba plan")
-    };
-    let mut compressor = mambazip::Compressor::new_from_method_spec(parsed_method)
-        .map_err(|e| format!("invalid mamba method: {e}"))?;
-    let bias = compressor.online_bias_snapshot();
-    let logits = compressor
-        .model
-        .forward(&mut compressor.scratch, 0, &mut compressor.state);
-    mambazip::Compressor::logits_to_pdf(logits, bias.as_deref(), &mut compressor.pdf_buffer);
-    Ok(crate::mixture::RateBackendPredictor::Mamba {
-        pdf_scratch: vec![0.0; compressor.pdf_buffer.len()],
-        compressor,
-        primed: true,
-        min_prob,
-    })
-}
-
-#[cfg(not(feature = "backend-mamba"))]
-fn build_predictor_mamba(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Mamba))
-}
-
-#[cfg(feature = "backend-zpaq")]
-fn build_predictor_zpaq(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
-        unreachable!("zpaq kernel used with non-zpaq plan")
-    };
-    Ok(crate::mixture::RateBackendPredictor::Zpaq {
-        model: ZpaqRateModel::new(method.clone(), min_prob),
-    })
-}
-
-#[cfg(not(feature = "backend-zpaq"))]
-fn build_predictor_zpaq(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Zpaq))
-}
-
-#[cfg(feature = "backend-mixture")]
-fn build_predictor_mixture(
-    backend: &CompiledRateBackend,
-    max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let experts = crate::mixture::expert_configs_from_compiled_mixture(backend, max_order)?;
-    let runtime = crate::mixture::build_mixture_runtime_from_compiled(backend, &experts)
-        .map_err(|e| format!("MixtureSpec invalid: {e}"))?;
-    Ok(crate::mixture::RateBackendPredictor::Mixture { runtime })
-}
-
-#[cfg(not(feature = "backend-mixture"))]
-fn build_predictor_mixture(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Mixture))
-}
-
-#[cfg(feature = "backend-particle")]
-fn build_predictor_particle(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
-        unreachable!("particle kernel used with non-particle plan")
-    };
-    Ok(crate::mixture::RateBackendPredictor::Particle {
-        runtime: ParticleRuntime::new(spec),
-    })
-}
-
-#[cfg(not(feature = "backend-particle"))]
-fn build_predictor_particle(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Particle))
-}
-
-#[cfg(feature = "backend-calibrated")]
-fn build_predictor_calibrated(
-    backend: &CompiledRateBackend,
-    max_order: i64,
-    min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let crate::spec::core::RateBackendPlan::Calibrated {
-        context,
-        bins,
-        learning_rate,
-        bias_clip,
-        base,
-    } = backend.plan()
-    else {
-        unreachable!("calibrated kernel used with non-calibrated plan")
-    };
-    let base_backend = crate::spec::core::compiled_rate_backend_from_plan_unchecked(base.clone());
-    Ok(crate::mixture::RateBackendPredictor::Calibrated {
-        base: Box::new(build_rate_backend_predictor_via_kernel(
-            &base_backend,
-            max_order,
-            min_prob,
-        )?),
-        core: CalibratorCore::new(*context, *bins, *learning_rate, *bias_clip),
-        pdf: [1.0 / 256.0; 256],
-        valid: false,
-        min_prob,
-    })
-}
-
-#[cfg(not(feature = "backend-calibrated"))]
-fn build_predictor_calibrated(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-    _min_prob: f64,
-) -> Result<crate::mixture::RateBackendPredictor, String> {
-    Err(rate_backend_feature_error(RateBackendKind::Calibrated))
-}
-
-#[cfg(feature = "backend-rosa")]
-fn build_pdf_predictor_rosa(
-    _backend: &CompiledRateBackend,
-    max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    Ok(crate::compression::RatePdfPredictor::Rosa(
-        crate::compression::RosaPredictor::new(max_order),
-    ))
-}
-
-#[cfg(not(feature = "backend-rosa"))]
-fn build_pdf_predictor_rosa(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::RosaPlus))
-}
-
-#[cfg(feature = "backend-match")]
-fn build_pdf_predictor_match(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::Match {
-        hash_bits,
-        min_len,
-        max_len,
-        base_mix,
-        confidence_scale,
-    } = backend.plan()
-    else {
-        unreachable!("match kernel used with non-match plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::Match {
-        model: MatchModel::new_contiguous(
-            *hash_bits,
-            *min_len,
-            *max_len,
-            *base_mix,
-            *confidence_scale,
-        ),
-    })
-}
-
-#[cfg(not(feature = "backend-match"))]
-fn build_pdf_predictor_match(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Match))
-}
-
-#[cfg(feature = "backend-match")]
-fn build_pdf_predictor_sparse_match(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::SparseMatch {
-        hash_bits,
-        min_len,
-        max_len,
-        gap_min,
-        gap_max,
-        base_mix,
-        confidence_scale,
-    } = backend.plan()
-    else {
-        unreachable!("sparse-match kernel used with non-sparse-match plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::SparseMatch {
-        model: SparseMatchModel::new(
-            *hash_bits,
-            *min_len,
-            *max_len,
-            *gap_min,
-            *gap_max,
-            *base_mix,
-            *confidence_scale,
-        ),
-    })
-}
-
-#[cfg(not(feature = "backend-match"))]
-fn build_pdf_predictor_sparse_match(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!(
-        "{}",
-        rate_backend_feature_error(RateBackendKind::SparseMatch)
-    )
-}
-
-#[cfg(feature = "backend-ppmd")]
-fn build_pdf_predictor_ppmd(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::Ppmd { order, memory_mb } = backend.plan() else {
-        unreachable!("ppmd kernel used with non-ppmd plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::Ppmd {
-        model: PpmdModel::new(*order, *memory_mb),
-    })
-}
-
-#[cfg(not(feature = "backend-ppmd"))]
-fn build_pdf_predictor_ppmd(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Ppmd))
-}
-
-#[cfg(feature = "backend-sequitur")]
-fn build_pdf_predictor_sequitur(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::Sequitur { context_bytes } = backend.plan() else {
-        unreachable!("sequitur kernel used with non-sequitur plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::Sequitur {
-        model: SequiturModel::new(*context_bytes),
-    })
-}
-
-#[cfg(not(feature = "backend-sequitur"))]
-fn build_pdf_predictor_sequitur(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Sequitur))
-}
-
-#[cfg(feature = "backend-ctw")]
-fn build_pdf_predictor_ctw(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
-        unreachable!("ctw kernel used with non-ctw plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::Ctw(
-        crate::compression::CtwPredictor::new_ctw(*depth),
-    ))
-}
-
-#[cfg(not(feature = "backend-ctw"))]
-fn build_pdf_predictor_ctw(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Ctw))
-}
-
-#[cfg(feature = "backend-ctw")]
-fn build_pdf_predictor_fac_ctw(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::FacCtw {
-        base_depth,
-        num_percept_bits: _,
-        encoding_bits,
-    } = backend.plan()
-    else {
-        unreachable!("fac-ctw kernel used with non-fac-ctw plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::FacCtw(
-        crate::compression::CtwPredictor::new_fac(*base_depth, (*encoding_bits).clamp(1, 8)),
-    ))
-}
-
-#[cfg(not(feature = "backend-ctw"))]
-fn build_pdf_predictor_fac_ctw(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::FacCtw))
-}
-
-#[cfg(feature = "backend-mamba")]
-fn build_pdf_predictor_mamba(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::Mamba { parsed_method, .. } = backend.plan() else {
-        unreachable!("mamba kernel used with non-mamba plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::Mamba(
-        crate::compression::MambaPredictor::from_method_spec(parsed_method)?,
-    ))
-}
-
-#[cfg(not(feature = "backend-mamba"))]
-fn build_pdf_predictor_mamba(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Mamba))
-}
-
-#[cfg(feature = "backend-rwkv")]
-fn build_pdf_predictor_rwkv(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::Rwkv7 { parsed_method, .. } = backend.plan() else {
-        unreachable!("rwkv kernel used with non-rwkv plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::Rwkv(
-        crate::compression::RwkvPredictor::from_method_spec(parsed_method)?,
-    ))
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-fn build_pdf_predictor_rwkv(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Rwkv7))
-}
-
-#[cfg(feature = "backend-zpaq")]
-fn build_pdf_predictor_zpaq(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
-        unreachable!("zpaq kernel used with non-zpaq plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::Zpaq(
-        crate::compression::ZpaqPredictor::new(method.clone()),
-    ))
-}
-
-#[cfg(not(feature = "backend-zpaq"))]
-fn build_pdf_predictor_zpaq(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Zpaq))
-}
-
-#[cfg(feature = "backend-mixture")]
-fn build_pdf_predictor_mixture(
-    backend: &CompiledRateBackend,
-    max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    Ok(crate::compression::RatePdfPredictor::Mixture(
-        crate::compression::MixturePredictor::new_from_compiled(backend, max_order)?,
-    ))
-}
-
-#[cfg(not(feature = "backend-mixture"))]
-fn build_pdf_predictor_mixture(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Mixture))
-}
-
-#[cfg(feature = "backend-particle")]
-fn build_pdf_predictor_particle(
-    backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
-        unreachable!("particle kernel used with non-particle plan")
-    };
-    Ok(crate::compression::RatePdfPredictor::Particle(
-        ParticleRuntime::new(spec),
-    ))
-}
-
-#[cfg(not(feature = "backend-particle"))]
-fn build_pdf_predictor_particle(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Particle))
-}
-
-#[cfg(feature = "backend-calibrated")]
-fn build_pdf_predictor_calibrated(
-    backend: &CompiledRateBackend,
-    max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    let crate::spec::core::RateBackendPlan::Calibrated {
-        context,
-        bins,
-        learning_rate,
-        bias_clip,
-        base,
-    } = backend.plan()
-    else {
-        unreachable!("calibrated kernel used with non-calibrated plan")
-    };
-    let base_backend = crate::spec::core::compiled_rate_backend_from_plan_unchecked(base.clone());
-    Ok(crate::compression::RatePdfPredictor::Calibrated {
-        base: Box::new(build_rate_pdf_predictor_via_kernel(
-            &base_backend,
-            max_order,
-        )?),
-        core: CalibratorCore::new(*context, *bins, *learning_rate, *bias_clip),
-        pdf: vec![1.0 / 256.0; 256],
-        valid: false,
-    })
-}
-
-#[cfg(not(feature = "backend-calibrated"))]
-fn build_pdf_predictor_calibrated(
-    _backend: &CompiledRateBackend,
-    _max_order: i64,
-) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    anyhow::bail!(
-        "{}",
-        rate_backend_feature_error(RateBackendKind::Calibrated)
-    )
 }
 
 fn entropy_prequential(
@@ -2416,9 +1650,8 @@ fn build_compression_runtime_rate(
         unreachable!("rate compression kernel used with non-rate compression plan")
     };
     Ok(CompressionRuntimeHandle::Rate {
-        rate_backend: crate::spec::core::compiled_rate_backend_from_plan_unchecked(
-            rate_backend.clone(),
-        ),
+        rate_backend: crate::spec::core::compiled_rate_backend_from_plan(rate_backend.clone())
+            .map_err(|err| format!("failed to compile rate compression backend plan: {err}"))?,
         coder: *coder,
         framing: *framing,
     })
@@ -3215,7 +2448,7 @@ mod tests {
 
     #[test]
     fn missing_descriptor_reports_registry_mismatch_error() {
-        let err = backend_descriptor_by_kind_checked(
+        let err = registry::backend_descriptor_by_kind_checked(
             &[],
             RateBackendKind::RosaPlus,
             "RATE_BACKEND_REGISTRY",
