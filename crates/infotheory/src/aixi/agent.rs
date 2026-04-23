@@ -9,7 +9,7 @@ use crate::aixi::common::{
 };
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
 use crate::aixi::model::{Predictor, build_mc_aixi_predictor};
-use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_coin_flip_planner_run_spec};
+use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
     CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec, McAixiControllerSpec,
@@ -159,7 +159,7 @@ impl AgentConfig {
 
     fn canonical_planner_run_spec(&self) -> Result<PlannerRunSpec, String> {
         let predictor = self.canonical_predictor_backend()?;
-        Ok(build_coin_flip_planner_run_spec(
+        Ok(build_default_planner_run_spec(
             PlannerInterfaceConfig {
                 observation_bits: self.observation_bits,
                 observation_stream_len: self.observation_stream_len,
@@ -652,7 +652,9 @@ impl AgentSimulator for Agent {
 mod tests {
     use super::*;
     #[cfg(feature = "all-backends")]
-    use crate::aixi::environment::{CtwTest, Environment};
+    use crate::aixi::environment::Environment;
+    #[cfg(feature = "all-backends")]
+    use crate::aixi::test_envs::DeterministicBinaryEnv;
     #[cfg(feature = "all-backends")]
     use crate::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend};
     use std::sync::{Arc, Mutex};
@@ -817,7 +819,7 @@ mod tests {
 
     #[cfg(feature = "all-backends")]
     fn run_ctw_trace(agent: &mut Agent, cycles: usize) -> (Vec<Action>, i64) {
-        let mut env = CtwTest::new();
+        let mut env = DeterministicBinaryEnv::default();
         let mut actions = Vec::with_capacity(cycles);
         let mut total_reward = 0i64;
         let mut obs_stream = env.drain_observations();

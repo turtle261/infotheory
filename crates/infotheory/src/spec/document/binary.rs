@@ -1420,11 +1420,12 @@ fn decode_vm_trace(cursor: &mut Cursor<'_>) -> SpecResult<VmTraceSpec> {
 pub(super) fn builtin_environment_name(env: BuiltinEnvironmentSpec) -> &'static str {
     match env {
         BuiltinEnvironmentSpec::CoinFlip => "coin_flip",
-        BuiltinEnvironmentSpec::CtwTest => "ctw_test",
-        BuiltinEnvironmentSpec::ExtendedTiger => "extended_tiger",
-        BuiltinEnvironmentSpec::TicTacToe => "tic_tac_toe",
         BuiltinEnvironmentSpec::BiasedRockPaperScissor => "biased_rock_paper_scissor",
         BuiltinEnvironmentSpec::KuhnPoker => "kuhn_poker",
+        BuiltinEnvironmentSpec::ExtendedTiger => "extended_tiger",
+        BuiltinEnvironmentSpec::TicTacToe => "tic_tac_toe",
+        BuiltinEnvironmentSpec::Blackjack => "blackjack",
+        BuiltinEnvironmentSpec::Platformer => "platformer",
     }
 }
 
@@ -1524,22 +1525,27 @@ fn decode_calibration_context(tag: u8) -> SpecResult<crate::api::CalibrationCont
 fn builtin_environment_tag(env: BuiltinEnvironmentSpec) -> u8 {
     match env {
         BuiltinEnvironmentSpec::CoinFlip => 0,
-        BuiltinEnvironmentSpec::CtwTest => 1,
         BuiltinEnvironmentSpec::ExtendedTiger => 2,
         BuiltinEnvironmentSpec::TicTacToe => 3,
         BuiltinEnvironmentSpec::BiasedRockPaperScissor => 4,
         BuiltinEnvironmentSpec::KuhnPoker => 5,
+        BuiltinEnvironmentSpec::Blackjack => 6,
+        BuiltinEnvironmentSpec::Platformer => 7,
     }
 }
 
 fn decode_builtin_environment(tag: u8) -> SpecResult<BuiltinEnvironmentSpec> {
     match tag {
         0 => Ok(BuiltinEnvironmentSpec::CoinFlip),
-        1 => Ok(BuiltinEnvironmentSpec::CtwTest),
+        1 => Err(SpecError::new(
+            "builtin environment tag '1' (ctw_test) is no longer supported",
+        )),
         2 => Ok(BuiltinEnvironmentSpec::ExtendedTiger),
         3 => Ok(BuiltinEnvironmentSpec::TicTacToe),
         4 => Ok(BuiltinEnvironmentSpec::BiasedRockPaperScissor),
         5 => Ok(BuiltinEnvironmentSpec::KuhnPoker),
+        6 => Ok(BuiltinEnvironmentSpec::Blackjack),
+        7 => Ok(BuiltinEnvironmentSpec::Platformer),
         _ => Err(SpecError::new(format!(
             "unknown builtin environment tag '{tag}'"
         ))),

@@ -31,3 +31,7 @@ build/
 # Local compiled extension dropped into source package by maturin develop
 python/infotheory_rs/_core*.so
 python/infotheory_rs/_core*.pyd
+
+
+# Hutter's Papers
+docs/hutter

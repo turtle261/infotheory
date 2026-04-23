@@ -2,8 +2,101 @@ import infotheory_rs as ait
 import pytest
 
 
+class ToyCoinFlipEnv:
+    def __init__(self, p: float = 0.5, random_seed: int | None = None):
+        self.p = p
+        self.state = 0
+        self.reward = 0
+        self.finished = False
+        self.rng = random_seed if random_seed is not None else 1
+        self._gen_next()
+
+    def _next_u64(self) -> int:
+        x = self.rng if self.rng != 0 else 0xCAFEBABEDEADBEEF
+        x ^= (x >> 12) & 0xFFFFFFFFFFFFFFFF
+        x ^= (x << 25) & 0xFFFFFFFFFFFFFFFF
+        x ^= (x >> 27) & 0xFFFFFFFFFFFFFFFF
+        self.rng = x & 0xFFFFFFFFFFFFFFFF
+        return (self.rng * 0x2545F4914F6CDD1D) & 0xFFFFFFFFFFFFFFFF
+
+    def _gen_bool(self, p: float) -> bool:
+        return (self._next_u64() >> 11) / float(1 << 53) < p
+
+    def _gen_next(self) -> None:
+        self.state = 1 if self._gen_bool(self.p) else 0
+
+    def set_random_seed(self, seed: int) -> None:
+        self.rng = seed if seed != 0 else 0xCAFEBABEDEADBEEF
+        self.reward = 0
+        self._gen_next()
+
+    def perform_action(self, action: int):
+        self._gen_next()
+        self.reward = 1 if action == self.state else 0
+
+    def get_observation(self) -> int:
+        return self.state
+
+    def get_reward(self) -> int:
+        return self.reward
+
+    def is_finished(self) -> bool:
+        return self.finished
+
+    def drain_observations(self) -> list[int]:
+        return [self.state]
+
+    def get_observation_bits(self) -> int:
+        return 1
+
+    def get_reward_bits(self) -> int:
+        return 1
+
+    def get_action_bits(self) -> int:
+        return 1
+
+
+class ToyCtwTestEnv:
+    def __init__(self):
+        self.cycle = 0
+        self.last_action = 0
+        self.obs = 0
+        self.reward = 0
+        self.finished = False
+
+    def perform_action(self, action: int):
+        if self.cycle == 0:
+            self.obs = 0
+        else:
+            self.obs = (self.last_action + 1) % 2
+        self.reward = 1 if action == self.obs else 0
+        self.last_action = action
+        self.cycle += 1
+
+    def get_observation(self) -> int:
+        return self.obs
+
+    def get_reward(self) -> int:
+        return self.reward
+
+    def is_finished(self) -> bool:
+        return self.finished
+
+    def drain_observations(self) -> list[int]:
+        return [self.obs]
+
+    def get_observation_bits(self) -> int:
+        return 1
+
+    def get_reward_bits(self) -> int:
+        return 1
+
+    def get_action_bits(self) -> int:
+        return 1
+
+
 def test_aixi_env_smoke():
-    env = ait.CoinFlipEnv(0.5)
+    env = ToyCoinFlipEnv(0.5)
     env.perform_action(0)
     assert env.get_observation() in (0, 1)
     assert isinstance(env.get_reward(), int)
@@ -53,7 +146,7 @@ def test_aiqi_config_and_agent_smoke():
 
 
 def test_run_aiqi_with_environment_smoke():
-    env = ait.CoinFlipEnv(0.7)
+    env = ToyCoinFlipEnv(0.7)
     cfg = ait.AiqiConfig(
         algorithm="ac-ctw",
         ct_depth=6,
@@ -86,7 +179,7 @@ def test_run_aiqi_with_environment_smoke():
 
 
 def test_run_aiqi_with_generic_rate_backend_smoke():
-    env = ait.CoinFlipEnv(0.7)
+    env = ToyCoinFlipEnv(0.7)
     cfg = ait.AiqiConfig(
         algorithm="ac-ctw",
         ct_depth=6,
@@ -120,7 +213,7 @@ def test_run_aiqi_with_generic_rate_backend_smoke():
 
 
 def test_run_mcaixi_with_generic_mixture_rate_backend_smoke():
-    env = ait.CoinFlipEnv(0.7)
+    env = ToyCoinFlipEnv(0.7)
     mixture = ait.RateBackend.mixture(
         ait.MixtureSpec(
             ait.MixtureKind.Convex,
@@ -272,7 +365,7 @@ def test_aiqi_optional_history_pruning_smoke():
         baseline_exploration=0.01,
     )
     agent = ait.AiqiAgent(cfg)
-    env = ait.CoinFlipEnv(0.7)
+    env = ToyCoinFlipEnv(0.7)
     for _ in range(64):
         action = agent.get_planned_action()
         env.perform_action(action)
@@ -299,7 +392,7 @@ def test_mcaixi_seed_reproducibility_with_deterministic_env():
     )
 
     s1 = ait.run_agent_with_environment(
-        ait.CtwTestEnv(),
+        ToyCtwTestEnv(),
         cfg,
         learn_cycles=40,
         eval_cycles=20,
@@ -309,7 +402,7 @@ def test_mcaixi_seed_reproducibility_with_deterministic_env():
         check_finished=False,
     )
     s2 = ait.run_agent_with_environment(
-        ait.CtwTestEnv(),
+        ToyCtwTestEnv(),
         cfg,
         learn_cycles=40,
         eval_cycles=20,
@@ -345,7 +438,7 @@ def test_aiqi_seed_reproducibility_with_deterministic_env():
     )
 
     s1 = ait.run_aiqi_with_environment(
-        ait.CtwTestEnv(),
+        ToyCtwTestEnv(),
         cfg,
         learn_cycles=40,
         eval_cycles=20,
@@ -355,7 +448,7 @@ def test_aiqi_seed_reproducibility_with_deterministic_env():
         check_finished=False,
     )
     s2 = ait.run_aiqi_with_environment(
-        ait.CtwTestEnv(),
+        ToyCtwTestEnv(),
         cfg,
         learn_cycles=40,
         eval_cycles=20,

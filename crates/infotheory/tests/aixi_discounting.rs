@@ -1,3 +1,5 @@
+#![cfg(feature = "aixi")]
+
 use infotheory::aixi::common::{Action, ObservationKeyMode, Reward};
 use infotheory::aixi::mcts::AgentSimulator;
 

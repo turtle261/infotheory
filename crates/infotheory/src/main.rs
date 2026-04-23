@@ -34,9 +34,9 @@ mod cli;
 use infotheory::aixi::agent::Agent;
 use infotheory::aixi::aiqi::AiqiAgent;
 use infotheory::aixi::common::RandomGenerator;
-use infotheory::aixi::environment::{
-    BiasedRockPaperScissor, CoinFlip, CtwTest, Environment, ExtendedTiger, KuhnPoker, TicTacToe,
-};
+use infotheory::aixi::environment::Environment;
+#[cfg(feature = "aixi-gameengine")]
+use infotheory::aixi::gameengine::build_builtin_environment as build_gameengine_builtin_environment;
 #[cfg(all(test, feature = "vm"))]
 use infotheory::aixi::vm_nyx::{
     FuzzMutator as NyxFuzzMutator, NyxActionFilter, NyxActionSource, NyxActionSpec, NyxFuzzConfig,
@@ -331,12 +331,13 @@ fn is_canonical_spec_document(value: &serde_json::Value) -> bool {
 
 fn builtin_environment_name(spec: BuiltinEnvironmentSpec) -> &'static str {
     match spec {
-        BuiltinEnvironmentSpec::CoinFlip => "coin-flip",
-        BuiltinEnvironmentSpec::CtwTest => "ctw-test",
-        BuiltinEnvironmentSpec::ExtendedTiger => "extended-tiger",
-        BuiltinEnvironmentSpec::TicTacToe => "tictactoe",
-        BuiltinEnvironmentSpec::BiasedRockPaperScissor => "biased-rock-paper-scissor",
-        BuiltinEnvironmentSpec::KuhnPoker => "kuhn-poker",
+        BuiltinEnvironmentSpec::CoinFlip => "coin_flip",
+        BuiltinEnvironmentSpec::BiasedRockPaperScissor => "biased_rock_paper_scissor",
+        BuiltinEnvironmentSpec::KuhnPoker => "kuhn_poker",
+        BuiltinEnvironmentSpec::ExtendedTiger => "extended_tiger",
+        BuiltinEnvironmentSpec::TicTacToe => "tic_tac_toe",
+        BuiltinEnvironmentSpec::Blackjack => "blackjack",
+        BuiltinEnvironmentSpec::Platformer => "platformer",
     }
 }
 
@@ -587,14 +588,17 @@ fn controller_backend_label(controller: &CompiledPlannerController) -> String {
     }
 }
 
-fn build_builtin_environment(spec: BuiltinEnvironmentSpec) -> Box<dyn Environment> {
-    match spec {
-        BuiltinEnvironmentSpec::CoinFlip => Box::new(CoinFlip::new(0.9)),
-        BuiltinEnvironmentSpec::CtwTest => Box::new(CtwTest::new()),
-        BuiltinEnvironmentSpec::ExtendedTiger => Box::new(ExtendedTiger::new()),
-        BuiltinEnvironmentSpec::TicTacToe => Box::new(TicTacToe::new()),
-        BuiltinEnvironmentSpec::BiasedRockPaperScissor => Box::new(BiasedRockPaperScissor::new()),
-        BuiltinEnvironmentSpec::KuhnPoker => Box::new(KuhnPoker::new()),
+fn build_builtin_environment(spec: BuiltinEnvironmentSpec) -> anyhow::Result<Box<dyn Environment>> {
+    #[cfg(feature = "aixi-gameengine")]
+    {
+        return build_gameengine_builtin_environment(spec).map_err(anyhow::Error::msg);
+    }
+    #[cfg(not(feature = "aixi-gameengine"))]
+    {
+        Err(anyhow::anyhow!(
+            "builtin environment '{}' requires feature 'aixi-gameengine'",
+            builtin_environment_name(spec)
+        ))
     }
 }
 
@@ -604,7 +608,7 @@ fn build_planner_environment(
 ) -> anyhow::Result<(Box<dyn Environment>, &'static str)> {
     match &compiled.canonical_spec().environment {
         spec::EnvironmentSpec::Builtin { builtin } => Ok((
-            build_builtin_environment(*builtin),
+            build_builtin_environment(*builtin)?,
             builtin_environment_name(*builtin),
         )),
         spec::EnvironmentSpec::NyxVm(vm) => {
@@ -621,7 +625,7 @@ fn build_planner_environment(
 ) -> anyhow::Result<(Box<dyn Environment>, &'static str)> {
     match &compiled.canonical_spec().environment {
         spec::EnvironmentSpec::Builtin { builtin } => Ok((
-            build_builtin_environment(*builtin),
+            build_builtin_environment(*builtin)?,
             builtin_environment_name(*builtin),
         )),
     }
@@ -2303,17 +2307,17 @@ mod tests {
         let doc = infotheory::spec::SpecDocument::PlannerRun(infotheory::spec::PlannerRunSpec {
             assets: Vec::new(),
             environment: infotheory::spec::EnvironmentSpec::Builtin {
-                builtin: infotheory::spec::BuiltinEnvironmentSpec::CoinFlip,
+                builtin: infotheory::spec::BuiltinEnvironmentSpec::TicTacToe,
             },
             interface: infotheory::spec::PlannerInterfaceSpec {
-                observation_bits: 1,
+                observation_bits: 18,
                 observation_stream_len: 1,
                 observation_key_mode: ObservationKeyMode::FullStream,
-                reward_bits: 1,
-                agent_actions: 2,
-                min_reward: 0,
-                max_reward: 1,
-                reward_offset: 0,
+                reward_bits: 3,
+                agent_actions: 9,
+                min_reward: -3,
+                max_reward: 2,
+                reward_offset: 3,
             },
             controller: infotheory::spec::ControllerSpec::McAixi(
                 infotheory::spec::McAixiControllerSpec {
@@ -2362,17 +2366,17 @@ mod tests {
         let doc = infotheory::spec::SpecDocument::PlannerRun(infotheory::spec::PlannerRunSpec {
             assets: Vec::new(),
             environment: infotheory::spec::EnvironmentSpec::Builtin {
-                builtin: infotheory::spec::BuiltinEnvironmentSpec::CoinFlip,
+                builtin: infotheory::spec::BuiltinEnvironmentSpec::TicTacToe,
             },
             interface: infotheory::spec::PlannerInterfaceSpec {
-                observation_bits: 1,
+                observation_bits: 18,
                 observation_stream_len: 1,
                 observation_key_mode: ObservationKeyMode::FullStream,
-                reward_bits: 1,
-                agent_actions: 2,
-                min_reward: 0,
+                reward_bits: 3,
+                agent_actions: 9,
+                min_reward: -3,
                 max_reward: 100,
-                reward_offset: 0,
+                reward_offset: 3,
             },
             controller: infotheory::spec::ControllerSpec::McAixi(
                 infotheory::spec::McAixiControllerSpec {

@@ -12,7 +12,7 @@ use crate::aixi::common::{
     validate_reward_encoding_bounds,
 };
 use crate::aixi::model::{Predictor, build_aiqi_predictor};
-use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_coin_flip_planner_run_spec};
+use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
     AiqiDiscountedControllerSpec, CompiledPlannerController, CompiledPlannerRunSpec,
@@ -131,7 +131,7 @@ impl AiqiConfig {
 
     fn canonical_planner_run_spec(&self) -> Result<PlannerRunSpec, String> {
         let predictor = self.canonical_predictor_backend()?;
-        Ok(build_coin_flip_planner_run_spec(
+        Ok(build_default_planner_run_spec(
             PlannerInterfaceConfig {
                 observation_bits: self.observation_bits,
                 observation_stream_len: self.observation_stream_len,
@@ -1131,7 +1131,8 @@ fn argmax_with_fixed_tie_break(values: &[f64]) -> usize {
 #[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
-    use crate::aixi::environment::{CtwTest, Environment};
+    use crate::aixi::environment::Environment;
+    use crate::aixi::test_envs::DeterministicBinaryEnv;
     use crate::api::{MixtureKind, MixtureSpec};
     use std::sync::{Arc, Mutex};
 
@@ -1198,7 +1199,7 @@ mod tests {
     }
 
     fn run_ctw_trace(agent: &mut AiqiAgent, cycles: usize) -> (Vec<Action>, i64) {
-        let mut env = CtwTest::new();
+        let mut env = DeterministicBinaryEnv::default();
         let mut actions = Vec::with_capacity(cycles);
         let mut total_reward = 0i64;
 

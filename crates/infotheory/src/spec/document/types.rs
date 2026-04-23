@@ -33,18 +33,20 @@ pub struct ResolvedAssetBinding {
 /// Built-in non-VM environment choices available to planner runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuiltinEnvironmentSpec {
-    /// Bernoulli coin-flip environment.
+    /// GameEngine biased coin-flip environment.
     CoinFlip,
-    /// Action-conditional CTW test environment.
-    CtwTest,
-    /// Extended Tiger POMDP.
-    ExtendedTiger,
-    /// Tic-tac-toe environment.
-    TicTacToe,
-    /// Biased rock-paper-scissor environment.
+    /// GameEngine biased rock-paper-scissor environment.
     BiasedRockPaperScissor,
-    /// Kuhn poker environment.
+    /// GameEngine Kuhn poker environment.
     KuhnPoker,
+    /// GameEngine extended tiger environment.
+    ExtendedTiger,
+    /// GameEngine tic-tac-toe environment.
+    TicTacToe,
+    /// GameEngine blackjack environment.
+    Blackjack,
+    /// GameEngine platformer environment.
+    Platformer,
 }
 
 /// Shared-memory persistence policy for Nyx VM environments.

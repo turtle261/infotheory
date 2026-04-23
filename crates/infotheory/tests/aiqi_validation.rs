@@ -1,12 +1,14 @@
-#![cfg(feature = "all-backends")]
+#![cfg(all(feature = "aixi", feature = "all-backends"))]
 
 //! AIQI validation tests.
 
 use infotheory::aixi::aiqi::{AiqiAgent, AiqiConfig};
-use infotheory::aixi::environment::{CoinFlip, CtwTest, Environment};
+use infotheory::aixi::environment::Environment;
+mod support;
 use infotheory::aixi::model::RateBackendBitPredictor;
 use infotheory::api::{MixtureKind, MixtureSpec, RateBackend};
 use std::sync::Arc;
+use support::aixi_envs::{DeterministicBinaryEnv, SeededCoinFlipEnv};
 
 fn base_config() -> AiqiConfig {
     AiqiConfig {
@@ -115,7 +117,7 @@ fn aiqi_config_rejects_invalid_programmatic_mixture_rate_backend() {
 #[test]
 fn aiqi_coinflip_smoke_runs() {
     let mut agent = AiqiAgent::new(base_config()).expect("valid AIQI config");
-    let mut env = CoinFlip::new(0.8);
+    let mut env = SeededCoinFlipEnv::new(0.8);
 
     let mut total_reward = 0i64;
     for _ in 0..64 {
@@ -142,7 +144,7 @@ fn aiqi_learns_ctw_test_pattern() {
     cfg.baseline_exploration = 1e-6;
 
     let mut agent = AiqiAgent::new(cfg).expect("valid AIQI config");
-    let mut env = CtwTest::new();
+    let mut env = DeterministicBinaryEnv::new();
 
     let mut total_reward = 0i64;
     for _ in 0..120 {
@@ -158,7 +160,7 @@ fn aiqi_learns_ctw_test_pattern() {
 
     assert!(
         total_reward > 50,
-        "AIQI failed to learn CtwTest pattern; total_reward={total_reward}"
+        "AIQI failed to learn DeterministicBinaryEnv pattern; total_reward={total_reward}"
     );
 }
 
@@ -175,7 +177,7 @@ fn aiqi_with_generic_rate_backend_smoke_runs() {
     cfg.rate_backend_max_order = 8;
 
     let mut agent = AiqiAgent::new(cfg).expect("valid AIQI config");
-    let mut env = CoinFlip::new(0.7);
+    let mut env = SeededCoinFlipEnv::new(0.7);
 
     for _ in 0..24 {
         let action = agent.get_planned_action();
@@ -197,7 +199,7 @@ fn aiqi_with_rosa_generic_planner_smoke_runs() {
     cfg.rosa_max_order = Some(8);
 
     let mut agent = AiqiAgent::new(cfg).expect("valid AIQI config");
-    let mut env = CoinFlip::new(0.7);
+    let mut env = SeededCoinFlipEnv::new(0.7);
 
     for _ in 0..24 {
         let action = agent.get_planned_action();
@@ -220,7 +222,7 @@ fn aiqi_optional_history_pruning_smoke_runs() {
     cfg.history_prune_keep_steps = Some(16);
 
     let mut agent = AiqiAgent::new(cfg).expect("valid AIQI config");
-    let mut env = CoinFlip::new(0.7);
+    let mut env = SeededCoinFlipEnv::new(0.7);
 
     for _ in 0..128 {
         let action = agent.get_planned_action();

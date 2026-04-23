@@ -4,3 +4,6 @@
 [submodule "zpaq_rs"]
 	path = vendor/zpaq_rs
 	url = https://github.com/turtle261/zpaq-rs
+[submodule "gameengine"]
+	path = vendor/gameengine
+	url = https://github.com/turtle261/gameengine.git

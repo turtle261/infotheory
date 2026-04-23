@@ -49,6 +49,105 @@ fn sample_planner_run() -> PlannerRunSpec {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
+fn planner_run_parser_accepts_canonical_builtin_names() {
+    let names = [
+        ("coin_flip", BuiltinEnvironmentSpec::CoinFlip),
+        (
+            "biased_rock_paper_scissor",
+            BuiltinEnvironmentSpec::BiasedRockPaperScissor,
+        ),
+        ("kuhn_poker", BuiltinEnvironmentSpec::KuhnPoker),
+        ("extended_tiger", BuiltinEnvironmentSpec::ExtendedTiger),
+        ("tic_tac_toe", BuiltinEnvironmentSpec::TicTacToe),
+        ("blackjack", BuiltinEnvironmentSpec::Blackjack),
+        ("platformer", BuiltinEnvironmentSpec::Platformer),
+    ];
+
+    for (name, expected_builtin) in names {
+        let mut value = sample_planner_run()
+            .to_canonical_json_value()
+            .expect("planner run json");
+        value["environment"]["name"] = serde_json::Value::String(name.to_string());
+
+        let parsed = SpecDocument::parse_json_value(&value, Path::new(".")).expect("parse");
+        let SpecDocument::PlannerRun(planner_run) = parsed else {
+            panic!("expected planner run document for builtin '{name}'");
+        };
+        match planner_run.environment {
+            EnvironmentSpec::Builtin { builtin } => assert_eq!(builtin, expected_builtin),
+            #[cfg(feature = "vm")]
+            EnvironmentSpec::NyxVm(_) => {
+                panic!("expected builtin environment for alias '{name}'");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn planner_run_parser_rejects_noncanonical_builtin_names() {
+    for name in [
+        "coin-flip",
+        "biased_coinflip",
+        "biased_rps",
+        "kuhn-poker",
+        "extended-poker",
+        "extended_poker",
+        "extended-tiger",
+        "tic-tac-toe",
+        "tictactoe",
+    ] {
+        let mut value = sample_planner_run()
+            .to_canonical_json_value()
+            .expect("planner run json");
+        value["environment"]["name"] = serde_json::Value::String(name.to_string());
+
+        let err = match SpecDocument::parse_json_value(&value, Path::new(".")) {
+            Ok(_) => panic!("noncanonical builtin name '{name}' must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unknown builtin environment"),
+            "unexpected parser error for '{name}': {err}"
+        );
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn planner_run_binary_roundtrip_covers_canonical_builtins() {
+    let builtins = [
+        BuiltinEnvironmentSpec::CoinFlip,
+        BuiltinEnvironmentSpec::BiasedRockPaperScissor,
+        BuiltinEnvironmentSpec::KuhnPoker,
+        BuiltinEnvironmentSpec::ExtendedTiger,
+        BuiltinEnvironmentSpec::TicTacToe,
+        BuiltinEnvironmentSpec::Blackjack,
+        BuiltinEnvironmentSpec::Platformer,
+    ];
+
+    for builtin in builtins {
+        let mut spec = sample_planner_run();
+        spec.environment = EnvironmentSpec::Builtin { builtin };
+        let bytes = SpecDocument::PlannerRun(spec).to_binary();
+        let parsed = SpecDocument::from_binary(&bytes, Path::new(".")).expect("binary parse");
+        let SpecDocument::PlannerRun(parsed_run) = parsed else {
+            panic!("expected planner run document for builtin {builtin:?}");
+        };
+        match parsed_run.environment {
+            EnvironmentSpec::Builtin {
+                builtin: parsed_builtin,
+            } => assert_eq!(parsed_builtin, builtin),
+            #[cfg(feature = "vm")]
+            EnvironmentSpec::NyxVm(_) => {
+                panic!("expected builtin environment for builtin {builtin:?}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
 fn planner_run_json_roundtrip_is_stable() {
     let spec = sample_planner_run();
     let expected = spec.to_canonical_json().expect("json");
@@ -562,7 +661,7 @@ fn planner_run_validation_reports_missing_backend_feature() {
     let spec = PlannerRunSpec {
         assets: Vec::new(),
         environment: EnvironmentSpec::Builtin {
-            builtin: BuiltinEnvironmentSpec::CoinFlip,
+            builtin: BuiltinEnvironmentSpec::TicTacToe,
         },
         interface: PlannerInterfaceSpec {
             observation_bits: 1,

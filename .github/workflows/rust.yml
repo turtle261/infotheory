@@ -51,13 +51,17 @@ jobs:
       - name: Clippy (default + CLI)
         run: |
           cargo clippy -p zpaq_rs --locked
+          cargo clippy --manifest-path vendor/gameengine/Cargo.toml --features builtin --locked
           cargo clippy -p infotheory --lib --bins --features cli --locked
+          cargo clippy -p infotheory --lib --no-default-features --features aixi-gameengine --locked
           cargo clippy -p infotheory --lib --bins --no-default-features --features cli --locked
 
       - name: Warnings gate (default + no-default CLI)
         run: |
           RUSTFLAGS="-D warnings" cargo check -p zpaq_rs --locked
+          RUSTFLAGS="-D warnings" cargo check --manifest-path vendor/gameengine/Cargo.toml --features builtin --locked
           RUSTFLAGS="-D warnings" cargo check -p infotheory --features cli --locked
+          RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features aixi-gameengine --locked
           RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features cli --locked
 
       - name: Install coverage tooling
@@ -196,8 +200,11 @@ jobs:
           cargo check -p infotheory --no-default-features --features backend-rwkv --locked
           cargo check -p infotheory --no-default-features --features backend-mamba --locked
           cargo check -p infotheory --no-default-features --features all-backends --locked
+          cargo check -p infotheory --no-default-features --features aixi-gameengine --locked
+          cargo check -p infotheory --no-default-features --features "aixi-gameengine all-backends" --locked
           cargo check -p infotheory --no-default-features --features cli --locked
           cargo check -p infotheory --features cli --locked
+          cargo check --manifest-path vendor/gameengine/Cargo.toml --features builtin --locked
           cargo check -p zpaq_rs --locked
           cargo check -p benchman --locked
 
@@ -217,9 +224,12 @@ jobs:
           cargo test -p infotheory --no-default-features --features backend-rwkv --no-run --locked
           cargo test -p infotheory --no-default-features --features backend-mamba --no-run --locked
           cargo test -p infotheory --no-default-features --features all-backends --no-run --locked
+          cargo test -p infotheory --no-default-features --features aixi-gameengine --no-run --locked
+          cargo test -p infotheory --no-default-features --features "aixi-gameengine all-backends" --no-run --locked
           cargo test -p infotheory --no-default-features --features cli --no-run --locked
           cargo test -p infotheory --features cli --no-run --locked
           cargo test -p infotheory --no-default-features --features "cli all-backends" --no-run --locked
+          cargo test --manifest-path vendor/gameengine/Cargo.toml --features builtin --no-run --locked
 
       - name: VM feature slices
         if: ${{ matrix.run_vm }}
@@ -246,6 +256,8 @@ jobs:
           cargo test -p infotheory --release --features cli --locked
           cargo test -p infotheory --release --no-default-features --features cli --bin infotheory --locked
           cargo test -p infotheory --release --no-default-features --features "cli all-backends" --locked
+          cargo test -p infotheory --release --no-default-features --features aixi-gameengine --locked
+          cargo test --manifest-path vendor/gameengine/Cargo.toml --release --features builtin --locked
           cargo test -p zpaq_rs --release --locked
           cargo test -p benchman --release --locked
 

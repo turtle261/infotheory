@@ -70,6 +70,9 @@
 //! let mi_marg = mutual_information_marg_bytes(x, y);
 //! ```
 
+#[cfg(test)]
+extern crate self as infotheory;
+
 /// AIXI planning components, environments, and model abstractions.
 pub mod aixi;
 /// Public spec-first API reexports.

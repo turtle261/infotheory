@@ -34,8 +34,13 @@ impl PlannerInterfaceConfig {
     }
 }
 
-/// Build the canonical planner-run spec used by AIXI-family agents for built-in CoinFlip.
-pub(crate) fn build_coin_flip_planner_run_spec(
+/// Build the canonical planner-run spec used by AIXI-family agents.
+///
+/// The builtin environment is a minimal placeholder for programmatic
+/// `AgentConfig`/`AiqiConfig` construction: these callers provide the actual
+/// environment object at execution time, while the interface section below is
+/// the authoritative contract the agent uses.
+pub(crate) fn build_default_planner_run_spec(
     interface: PlannerInterfaceConfig,
     controller: ControllerSpec,
     random_seed: Option<u64>,

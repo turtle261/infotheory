@@ -1,4 +1,4 @@
-#![cfg(feature = "all-backends")]
+#![cfg(all(feature = "aixi", feature = "all-backends"))]
 
 //! AIXI Module Validation Tests
 //!
@@ -6,12 +6,14 @@
 
 use infotheory::aixi::agent::{Agent, AgentConfig};
 use infotheory::aixi::common::{Action, ObservationKeyMode};
-use infotheory::aixi::environment::{CoinFlip, CtwTest, Environment};
+use infotheory::aixi::environment::Environment;
+mod support;
 use infotheory::aixi::model::{CtwPredictor, Predictor, RateBackendBitPredictor, RosaPredictor};
 use infotheory::api::{
     MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend,
 };
 use std::sync::Arc;
+use support::aixi_envs::{DeterministicBinaryEnv, SeededCoinFlipEnv};
 
 // ============================================================================
 // Predictor Consistency Tests
@@ -248,8 +250,8 @@ fn rate_backend_bit_predictor_roundtrips_sequitur_backend() {
 
 #[test]
 fn ctw_test_env_is_deterministic() {
-    let mut env1 = CtwTest::new();
-    let mut env2 = CtwTest::new();
+    let mut env1 = DeterministicBinaryEnv::new();
+    let mut env2 = DeterministicBinaryEnv::new();
 
     for i in 0..50 {
         let action = (i % 2) as Action;
@@ -405,20 +407,20 @@ fn agent_solves_ctw_test_environment() {
     };
 
     let mut agent = Agent::new(config);
-    let env = CtwTest::new();
+    let env = DeterministicBinaryEnv::new();
 
     let cycles = 100;
     let total_reward = run_agent_env(&mut agent, env, cycles);
 
     println!(
-        "Agent Total Reward on CtwTest (100 cycles): {}",
+        "Agent Total Reward on DeterministicBinaryEnv (100 cycles): {}",
         total_reward
     );
 
     // Agent should learn pattern and get reasonable reward
     assert!(
         total_reward > 50.0,
-        "Agent failed to learn CtwTest pattern. Reward: {total_reward}"
+        "Agent failed to learn DeterministicBinaryEnv pattern. Reward: {total_reward}"
     );
 }
 
@@ -451,7 +453,7 @@ fn agent_regret_sublinear_coinflip() {
     };
 
     let mut agent = Agent::new(config);
-    let env = CoinFlip::new(0.8);
+    let env = SeededCoinFlipEnv::new(0.8);
 
     let cycles = 500;
     let total_reward = run_agent_env(&mut agent, env, cycles);
@@ -461,7 +463,7 @@ fn agent_regret_sublinear_coinflip() {
     let regret_per_step = regret / cycles as f64;
 
     println!(
-        "CoinFlip(0.8): Reward={total_reward}, Opt={expected_optimal}, Regret/step={regret_per_step:.4}"
+        "SeededCoinFlipEnv(0.8): Reward={total_reward}, Opt={expected_optimal}, Regret/step={regret_per_step:.4}"
     );
 
     // Regret should be reasonable (< 0.25 per step)
@@ -498,8 +500,8 @@ fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
 
     let mut a = Agent::new(config.clone());
     let mut b = Agent::new(config);
-    let mut env_a = CtwTest::new();
-    let mut env_b = CtwTest::new();
+    let mut env_a = DeterministicBinaryEnv::new();
+    let mut env_b = DeterministicBinaryEnv::new();
 
     let mut obs_a = env_a.drain_observations();
     let mut obs_b = env_b.drain_observations();
@@ -609,10 +611,10 @@ fn agent_with_generic_mixture_backends_smoke_runs() {
     ] {
         let mut agent =
             Agent::try_new(generic_agent_config(mixture_backend(kind))).expect("valid mixture");
-        let total_reward = run_agent_env(&mut agent, CtwTest::new(), 48);
+        let total_reward = run_agent_env(&mut agent, DeterministicBinaryEnv::new(), 48);
         assert!(
             total_reward > 16.0,
-            "{label} mixture backend reward too low on CtwTest: {total_reward}"
+            "{label} mixture backend reward too low on DeterministicBinaryEnv: {total_reward}"
         );
     }
 }

@@ -20,7 +20,7 @@ rayon = "1.11.0"
 serde_json = "1.0.149"
 
 [features]
-default = ["default-backends"]
+default = ["default-backends", "aixi"]
 # Grouped capability topology.
 default-backends = ["capability-default"]
 capability-default = [
@@ -49,10 +49,14 @@ capability-archive = [
     "backend-zpaq",
 ]
 capability-vm = ["infotheory/capability-vm"]
+aixi = ["infotheory/aixi"]
+aixi-gameengine = ["aixi", "infotheory/aixi-gameengine"]
+aixi-gameengine-physics = ["aixi-gameengine", "infotheory/aixi-gameengine-physics"]
+aixi-vm = ["vm"]
 
 # Legacy compatibility aliases.
 all-backends = ["capability-default"]
-python-extension = ["pyo3/extension-module"]
+python-extension = ["pyo3/extension-module", "aixi"]
 backend-rosa = ["infotheory/backend-rosa"]
 backend-ctw = ["infotheory/backend-ctw"]
 backend-match = ["infotheory/backend-match"]
@@ -64,7 +68,7 @@ backend-calibrated = ["infotheory/backend-calibrated"]
 backend-mamba = ["infotheory/backend-mamba"]
 backend-rwkv = ["infotheory/backend-rwkv"]
 backend-zpaq = ["infotheory/backend-zpaq"]
-vm = ["capability-vm"]
+vm = ["aixi", "infotheory/aixi-vm"]
 
 [lints]
 workspace = true

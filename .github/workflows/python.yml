@@ -76,6 +76,19 @@ jobs:
         run: |
           "$VENV_PY" -m pytest --cov=infotheory_rs --cov-report=term-missing --cov-report=xml:target/python-coverage.xml --cov-fail-under=100 python/tests
 
+      - name: Python GameEngine smoke (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VIRTUAL_ENV: .venv
+          CC: clang
+          CXX: clang++
+          RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
+        run: |
+          export PATH=".venv/bin:$PATH"
+          .venv/bin/python -m maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --features python-extension,all-backends,aixi-gameengine
+          .venv/bin/python -m pytest -q python/tests/test_aixi_gameengine.py
+
       - name: Upload Python coverage artifact
         uses: actions/upload-artifact@v4
         with:

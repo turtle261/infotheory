@@ -623,14 +623,16 @@ fn required_i64(value: &serde_json::Value, label: &str) -> SpecResult<i64> {
 
 fn parse_builtin_environment(name: &str) -> SpecResult<super::BuiltinEnvironmentSpec> {
     match name {
-        "coin_flip" | "coin-flip" => Ok(super::BuiltinEnvironmentSpec::CoinFlip),
-        "ctw_test" | "ctw-test" => Ok(super::BuiltinEnvironmentSpec::CtwTest),
-        "extended_tiger" | "extended-tiger" => Ok(super::BuiltinEnvironmentSpec::ExtendedTiger),
-        "tic_tac_toe" | "tictactoe" => Ok(super::BuiltinEnvironmentSpec::TicTacToe),
-        "biased_rock_paper_scissor" | "biased-rock-paper-scissor" => {
-            Ok(super::BuiltinEnvironmentSpec::BiasedRockPaperScissor)
-        }
-        "kuhn_poker" | "kuhn-poker" => Ok(super::BuiltinEnvironmentSpec::KuhnPoker),
+        "coin_flip" => Ok(super::BuiltinEnvironmentSpec::CoinFlip),
+        "biased_rock_paper_scissor" => Ok(super::BuiltinEnvironmentSpec::BiasedRockPaperScissor),
+        "kuhn_poker" => Ok(super::BuiltinEnvironmentSpec::KuhnPoker),
+        "extended_tiger" => Ok(super::BuiltinEnvironmentSpec::ExtendedTiger),
+        "ctw_test" => Err(SpecError::new(
+            "builtin environment 'ctw_test' is no longer supported",
+        )),
+        "tic_tac_toe" => Ok(super::BuiltinEnvironmentSpec::TicTacToe),
+        "blackjack" => Ok(super::BuiltinEnvironmentSpec::Blackjack),
+        "platformer" => Ok(super::BuiltinEnvironmentSpec::Platformer),
         other => Err(SpecError::new(format!(
             "unknown builtin environment '{other}'"
         ))),
