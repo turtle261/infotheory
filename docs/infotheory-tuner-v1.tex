@@ -1,0 +1,3128 @@
+
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+
+% Core packages
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{tikz-cd}
+\usepackage{multicol}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{hyperref}
+
+% Paragraphs
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.7\baselineskip}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+\newtheorem{assumption}{Assumption}
+
+\title{Constrained Dataset Predictive Tuning:\\A Formal Algorithmic Specification}
+\author{Noah Cashin}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Purpose and Scope}\label{sec:purpose-scope}
+
+This document specifies a constrained predictive/compression tuning capability for a fixed dataset.
+The specification is intended to be:
+\begin{itemize}
+    \item mathematically precise,
+    \item directly implementable in \texttt{infotheory},
+    \item optimizer-agnostic at the interface layer,
+    \item runtime-selectable between annealed hill climbing,
+    MC-AIXI(FAC-CTW), discounted AIQI, and a distinct exact
+    warm-start controller, and
+    \item mathematically explicit about objective alignment in each controller path.
+\end{itemize}
+
+This capability is \emph{not} an unconstrained architecture search engine nor a replacement for normal compression execution; it is a bounded optimization wrapper over the same compression semantics.
+
+\section{Formal Problem Statement}\label{sec:formal-problem}
+
+\subsection{Objects}
+
+Let:
+\begin{itemize}
+    \item $x \in \{0,\dots,255\}^{n}$ denote the dataset bytes loaded from \texttt{input\_path},
+    \item $\mathcal{Z}$ denote the full configuration space,
+    \item $B$ denote the user-provided bounds specification,
+    \item $H$ denote the fixed deployability profile (hardware/evaluator methodology and resource accounting),
+    \item $z_0 \in \mathcal{Z}$ denote the validated baseline configuration,
+    \item $T_{\mathrm{eval}} > 0$ denote the hard per-candidate wall-clock limit,
+    \item $T_{\mathrm{total}} > 0$ denotes the hard total tuning wall-clock budget,
+    \item $\theta_{\min}>0$ denote the required minimum throughput (bytes/s),
+    \item $\mu_{\max}>0$ denote the required memory cap (bytes).
+\end{itemize}
+
+Define the bounded-valid candidate set:
+\[
+\mathcal{F}(B,H):=\{z \in \mathcal{Z}:\ \mathrm{Valid}_{B,H}(z)=1\}.
+\]
+
+For each candidate $z$, evaluation returns
+\[
+M(z) = (\mathrm{status}(z), c(z), \ell(z), \tau(z), \mu(z), \operatorname{diag}(z)),
+\]
+where
+\begin{itemize}
+    \item $\mathrm{status}(z) \in \{\mathrm{success},\mathrm{timeout},\mathrm{invalid},\mathrm{error}\}$,
+    \item $c(z) \in \mathbb{N}$ is compressed size in bytes (defined on success),
+    \item $\ell(z) \in \mathbb{R}_{\ge 0}$ is cumulative negative log-loss (diagnostic),
+    \item $\tau(z) \in \mathbb{R}_{\ge 0}$ is elapsed wall-clock time,
+    \item $\mu(z) \in \mathbb{R}_{\ge 0}$ is measured peak memory usage,
+    \item $\operatorname{diag}(z)$ is optional diagnostics (including invalid-reason tags).
+\end{itemize}
+
+\begin{remark}[Peak-memory measurement semantics]
+Each candidate evaluation is executed in its own isolated evaluator instance.
+
+Preferred definition: $\mu(z)$ is the peak memory usage attributed to that
+instance by the operating-system or container memory controller (for example,
+cgroup peak memory usage) over the lifetime of the evaluation.
+
+Fallback definition when such accounting is unavailable: the evaluator must run
+as a single process, and $\mu(z)$ is the operating-system reported peak RSS of
+that process.
+
+Naive summation of RSS across a multi-process tree is not normative, because it
+can double-count shared pages.
+\end{remark}
+
+Timeout semantics are hard:
+\[
+\tau(z) \ge T_{\mathrm{eval}} \implies \mathrm{status}(z)=\mathrm{timeout}.
+\]
+
+For successful candidates, define throughput
+\[
+\theta(z):=
+\begin{cases}
+\dfrac{n}{\tau(z)}, & \mathrm{status}(z)=\mathrm{success},\ \tau(z)>0,\\[4pt]
++\infty, & \mathrm{status}(z)=\mathrm{success},\ \tau(z)=0.
+\end{cases}
+\]
+Define the equivalent throughput runtime cap
+\[
+\tau_{\theta}:=\frac{n}{\theta_{\min}}.
+\]
+Then, for successful candidates,
+\[
+\theta(z)\ge\theta_{\min}
+\iff
+\tau(z)\le\tau_{\theta}.
+\]
+
+\subsection{Primary Objective}
+
+Define model-code length by canonical bytes
+\[
+L_B(z):=\big|\operatorname{ser}(\operatorname{canon}(z))\big|.
+\]
+
+For successful candidates, define dataset code length
+\[
+C_x(z):=c(z).
+\]
+
+Define the deployable set
+\[
+\mathcal{F}^{\mathrm{dep}}(B,H):=
+\left\{z\in\mathcal{F}(B,H):\ \mathrm{status}(z)=\mathrm{success}\ \land\ \theta(z)\ge\theta_{\min}\ \land\ \mu(z)\le\mu_{\max}\right\}.
+\]
+
+The normative objective is the totalized deployable two-part MDL criterion
+\[
+\mathcal{J}_H(z;x)=
+\begin{cases}
+L_B(z)+C_x(z), & z\in\mathcal{F}^{\mathrm{dep}}(B,H),\\[3pt]
++\infty, & \text{otherwise.}
+\end{cases}
+\]
+
+The primary optimization problem is
+\[
+\min_{z\in\mathcal{F}(B,H)}\mathcal{J}_H(z;x).
+\]
+
+\begin{remark}[Operational length units and reporting]
+Operational length quantities in this specification are stored and reported in
+bytes: $c(z)$, $L_B(z)$, $C_x(z)$, and $\mathcal{J}_H(z;x)$.
+Bit-normalized quantities are introduced only in
+Section~\ref{sec:restricted-mixture} for semantic/theoretical statements via
+the conversion $\text{bits}=8\times\text{bytes}$.
+\end{remark}
+
+\subsection{Deterministic Incumbent Key and Output Semantics}
+
+For each evaluated candidate $z$, define the deterministic key
+\[
+K(z):=\big(\mathcal{J}_H(z;x),\operatorname{ser}(\operatorname{canon}(z))\big),
+\]
+ordered lexicographically, where $\operatorname{canon}:\mathcal{Z}\to\mathcal{Z}$
+and $\operatorname{ser}:\mathcal{Z}\to\{0,\dots,255\}^*$ are defined in
+Section~\ref{sec:canon-cache}.
+
+For byte strings, use standard lexicographic byte order with strict-prefix
+rule: $u\prec_{\mathrm{bytes}} v$ if either (i) at the first differing byte,
+$u$ has the smaller byte, or (ii) $u$ is a strict prefix of $v$.
+
+Let
+\[
+\mathcal{S}_t:=\left\{z:\ z\text{ has been evaluated by step }t\ \text{and }z\in\mathcal{F}^{\mathrm{dep}}(B,H)\right\}.
+\]
+The incumbent is
+\[
+b_t:=\arg\min_{z\in\mathcal{S}_t}K(z).
+\]
+Write $\prec_K$ for lexicographic order on key tuples, i.e.
+$K(z_1)\prec_K K(z_2)$ iff the tuple of $z_1$ is lexicographically smaller than that of $z_2$.
+
+\begin{proposition}[Uniqueness of incumbent under finite deployable evaluated set]
+If $\mathcal{S}_t$ is finite and nonempty, then $b_t$ exists and is unique.
+\end{proposition}
+
+\begin{proof}
+By construction, $\prec_{\mathrm{bytes}}$ is a total order on
+$\{0,\dots,255\}^*$. Hence lexicographic order on
+$\big(\mathbb{R}_{\ge 0}\sqcup\{+\infty\}\big)\times\{0,\dots,255\}^*$ is total. A finite
+nonempty totally ordered set has a unique minimum.
+\end{proof}
+
+This key preserves the primary optimization semantics: $\mathcal{J}_H$ is
+primary, and deterministic canonical bytes are a tie-break only.
+
+\section{Input Contract and Defaults}\label{sec:input-contract}
+
+\subsection{Required fields}
+
+\begin{itemize}
+    \item \texttt{input\_path: Path}
+    \item \texttt{baseline\_config\_path: Path}
+    \item \texttt{algorithm: ControllerKind}
+    \item \texttt{bounds: BoundsSpec}
+    \item \texttt{eval\_time\_limit\_seconds: f64}
+    \item \texttt{time\_budget\_seconds: f64}
+    \item \texttt{min\_throughput\_bytes\_per\_second: f64} with constraint $>0$
+    \item \texttt{max\_memory\_bytes: u64} with constraint $>0$
+    \item \texttt{output\_config\_path: Path}
+    \item \texttt{seed: u64}
+\end{itemize}
+
+Define the throughput floor parameter by
+\[
+\theta_{\min}:=\texttt{min\_throughput\_bytes\_per\_second}\in\mathbb{R}_{>0}.
+\]
+
+Define the memory-cap parameter by
+\[
+\mu_{\max}:=\texttt{max\_memory\_bytes}\in\mathbb{R}_{>0}.
+\]
+
+Define runtime controller kind by
+\[
+\texttt{ControllerKind}\in
+\left\{
+\begin{aligned}
+&\texttt{"annealed\_hill\_climbing"},\ \texttt{"mc\_aixi\_fac\_ctw"},\\
+&\texttt{"aiqi\_discounted"},\ \texttt{"aiqi\_warmstart\_exact\_jh"}
+\end{aligned}
+\right\}.
+\]
+
+Runtime dispatch is normative:
+\begin{itemize}
+    \item if \texttt{algorithm = "annealed\_hill\_climbing"}, execute
+    Section~\ref{sec:ahc-runtime},
+    \item if \texttt{algorithm} is \texttt{mc\_aixi\_fac\_ctw},
+    \texttt{aiqi\_discounted}, or
+    \texttt{aiqi\_warmstart\_exact\allowbreak\_jh},
+    execute
+    Section~\ref{sec:aixi-runtime}.
+\end{itemize}
+
+Controller-specific required fields:
+\begin{itemize}
+    \item for \texttt{mc\_aixi\_fac\_ctw}, \texttt{aiqi\_discounted}, and
+    \texttt{aiqi\_warmstart\_exact\allowbreak\_jh}:
+    \begin{itemize}
+        \item \texttt{agent\_actions}
+        \item \texttt{observation\_bits}
+        \item \texttt{observation\_stream\_len}
+        \item \texttt{reward\_bits}
+        \item \texttt{min\_reward}
+        \item \texttt{max\_reward}
+        \item \texttt{reward\_offset}
+        \item \texttt{planner\_simulations\_per\_step}\((\in\mathbb{N},\ge 1)\)
+    \end{itemize}
+    \item for \texttt{aiqi\_discounted} additionally:
+    \begin{itemize}
+        \item \texttt{return\_horizon}\(\in\mathbb{N},\ge 1\)
+        \item \texttt{return\_bins}\(\in\mathbb{N},\text{power of two}\)
+        \item \texttt{discount\_factor}\(\in[0,1)\)
+    \end{itemize}
+    \item for \texttt{aiqi\_warmstart\_exact\allowbreak\_jh} additionally:
+    \begin{itemize}
+        \item \texttt{return\_horizon}\(\in\mathbb{N},\ge 1\)
+        \item \texttt{warmstart\_teacher\_dataset\_path: Path}
+        (initial same-task teacher data)
+        \item \texttt{label\_phase\_period}
+        \((\in\mathbb{N},\ge\texttt{return\_horizon})\)
+    \end{itemize}
+    \item for \texttt{"annealed\_hill\_climbing"}:
+    \texttt{max\_mutation\_radius}.
+\end{itemize}
+
+\subsection{Normative input precondition: deployable baseline}\label{subsec:baseline-precondition}
+
+After loading and canonicalizing the baseline candidate
+\[
+z_0^{\mathrm{can}}:=\operatorname{canon}(z_0),
+\]
+the runtime must perform the normative baseline evaluation before entering any
+controller loop and require
+\[
+\mathrm{status}(z_0^{\mathrm{can}})=\mathrm{success}
+\quad\land\quad
+\theta(z_0^{\mathrm{can}})\ge\theta_{\min}
+\quad\land\quad
+\mu(z_0^{\mathrm{can}})\le\mu_{\max}.
+\]
+If this precondition fails, execution must abort with no optimization steps
+performed. This precondition is normative for all controller choices.
+
+\subsection{Execution controls}
+
+Recommended controls include:
+\begin{itemize}
+    \item \texttt{max\_evaluations}
+    \item \texttt{cpu\_affinity}
+    \item \texttt{threads}
+    \item \texttt{warmup\_baseline\_runs}
+    \item \texttt{self\_improvement\_rounds}
+    \item \texttt{max\_mutation\_radius}
+    \item \texttt{stagnation\_reset\_evals}
+    \item \texttt{log\_path}
+    \item \texttt{diagnostic\_chunk\_bytes}
+    \item \texttt{report\_path} for detailed report output
+\end{itemize}
+
+For \texttt{"annealed\_hill\_climbing"}, \texttt{max\_mutation\_radius} is
+normative and required.
+
+Define baseline warmup count by
+\[
+w_{\mathrm{base}}:=\texttt{warmup\_baseline\_runs}\in\mathbb{N}_0.
+\]
+Warmup semantics are normative:
+\begin{itemize}
+    \item execute exactly $w_{\mathrm{base}}$ baseline warmup evaluations before
+    the single normative baseline evaluation,
+    \item warmup runs use the same evaluator path and timeout
+    $\min(T_{\mathrm{eval}},T_{\mathrm{total}})$ as baseline evaluation,
+    \item warmup runs are excluded from optimization metrics, incumbent updates,
+    cache insertion, and the evaluation counter $k$,
+    \item only the post-warmup baseline evaluation defines baseline
+    $M(z_0^{\mathrm{can}})$ for optimization.
+\end{itemize}
+Warmup policy is evaluator-relevant and must be included in
+$\eta_{\mathrm{eval}}$ and provenance.
+
+Define stagnation-reset threshold by
+\[
+\kappa_{\mathrm{stag}}:=\texttt{stagnation\_reset\_evals}\in\mathbb{N}.
+\]
+
+Define the mutation-radius cap by
+\[
+r_{\mathrm{mut}}^{\max}:=\texttt{max\_mutation\_radius}\in\mathbb{N},
+\qquad
+r_{\mathrm{mut}}^{\max}\ge 1.
+\]
+This is an annealer execution-control parameter.
+
+For the optional bounded same-task teacher-refresh wrapper around
+\texttt{aiqi\_warmstart\_exact\allowbreak\_jh}, define
+\[
+R_{\mathrm{si}}:=\texttt{self\_improvement\_rounds}\in\mathbb{N},
+\qquad
+R_{\mathrm{si}}\ge 1,
+\]
+with default $R_{\mathrm{si}}=1$.
+If $R_{\mathrm{si}}>1$, interpret $T_{\mathrm{total}}$ as the single
+outer-loop wall-clock budget and use deterministic equal-split round deadlines
+\[
+\Delta_r^{\mathrm{si}}:=\frac{r}{R_{\mathrm{si}}}T_{\mathrm{total}},
+\qquad r=0,\dots,R_{\mathrm{si}}.
+\]
+The warm-start exact-$\mathcal{J}_H$ controller then executes the bounded
+same-task trace-refresh wrapper of
+Section~\ref{sec:aiqi-warmstart-self-improve}; all rounds remain on the same
+$(B,H,x)$ task and are evaluated against the same deployable objective
+$\mathcal{J}_H$.
+
+These controls affect runtime behavior and reproducibility, not the candidate search space.
+
+\section{Bounds, Validity, and Canonicalization}
+
+\subsection{Normative bounds}
+
+In addition to backend/method inclusion and parameter ranges, the bounds model must include:
+\begin{itemize}
+    \item \texttt{max\_experts: usize},
+    \item \texttt{max\_mixture\_nesting\_depth: usize}.
+\end{itemize}
+
+Strongly recommended optional bounds are:
+\begin{itemize}
+    \item \texttt{min\_experts}
+    \item \texttt{allow\_duplicate\_experts}
+    \item \texttt{required\_experts}
+    \item \texttt{forbidden\_expert\_pairs}
+\end{itemize}
+
+\subsection{Candidate validity predicate}
+
+Define $\mathrm{Valid}_{B,H}(z)=1$ iff all hold:
+\begin{enumerate}
+    \item schema conformance,
+    \item bounds conformance,
+    \item backend/library validation,
+    \item referenced backend/method availability in the current build,
+    \item every external reference in $z$ is a canonical identifier for a
+    member of the shared side-information registry
+    $\mathcal{S}_H^{\mathrm{side}}$; raw filesystem paths, URLs, and
+    undeclared external assets are forbidden,
+    \item mixture nesting depth $\le$ \texttt{max\_mixture\_nesting\_depth},
+    \item per-node expert count in required interval.
+\end{enumerate}
+
+Invalid candidates are never evaluated.
+
+\subsection{Canonical representation and cache key}\label{sec:canon-cache}
+
+All candidates are canonicalized deterministically before hashing,
+comparison, caching, evaluation, or output:
+\begin{itemize}
+    \item canonical backend naming,
+    \item deterministic key ordering,
+    \item order normalization only where semantics are order-insensitive,
+    \item preservation of expert order where semantics are order-sensitive,
+    \item removal of redundant defaults only when semantics-preserving,
+    \item deterministic serialization bytes.
+\end{itemize}
+
+Let
+\[
+\chi_B:\mathcal{P}_{\mathrm{struct}}\to\{\mathrm{sensitive},\mathrm{insensitive}\}
+\]
+be the order-sensitivity classification over canonicalizable structure paths.
+This classification is fixed by the backend schema/compiler contract for a
+given build and bounds profile. Two compliant implementations must use the same
+$\chi_B$; its identifier/version (or hash commitment) must be recorded in
+provenance.
+
+Define two distinct typed maps:
+\[
+\operatorname{canon}:\mathcal{Z}\to\mathcal{Z},
+\qquad
+\operatorname{ser}:\mathcal{Z}\to\{0,\dots,255\}^*.
+\]
+Here $\operatorname{canon}$ is an idempotent semantic canonicalizer
+($\operatorname{canon}(\operatorname{canon}(z))=\operatorname{canon}(z)$), and
+$\operatorname{ser}$ is deterministic byte serialization of a canonical
+candidate.
+
+Define canonical internal code map
+\[
+\kappa_B(z):=\operatorname{ser}(\operatorname{canon}(z)).
+\]
+This map is normative (not merely a cache utility): it defines
+$L_B(z)=|\kappa_B(z)|$ in Section~\ref{sec:formal-problem} and objective
+tie-breaking keys throughout this document. Required semantic properties are:
+\begin{itemize}
+    \item injective coding on canonical candidates
+    $(\operatorname{canon}(z_1)=\operatorname{canon}(z_2)\iff
+    \kappa_B(z_1)=\kappa_B(z_2))$,
+    \item prefix-free code image over canonical candidates.
+\end{itemize}
+
+\begin{remark}[Side-information policy]
+Let $H$ include a fixed shared side-information registry
+\[
+\mathcal{S}_H^{\mathrm{side}}=\{s_1,\dots,s_m\},
+\]
+available identically to encoder and decoder.
+
+A candidate may reference shared side-information only through canonical
+identifiers for members of $\mathcal{S}_H^{\mathrm{side}}$. The identifier, if
+present, is part of the serialized candidate code $\kappa_B(z)$ and therefore
+contributes to $L_B(z)$; the contents of the referenced shared asset do not
+contribute to $L_B(z)$ because they are fixed by $H$.
+
+Any candidate-specific external file, model weights, dictionary, URL, raw
+filesystem path, or other undeclared external asset is forbidden. If evaluation
+attempts to access such an asset, the candidate is invalid with diagnostic
+reason \texttt{undeclared\_external\_asset}.
+\end{remark}
+
+Define canonical cache key
+\[
+\mathrm{Key}_{\mathrm{cache}}(z,\eta_{\mathrm{eval}},x):=
+\Big(\operatorname{ser}(\operatorname{canon}(z)),\eta_{\mathrm{eval}},\operatorname{Hash}(x)\Big),
+\]
+where $\eta_{\mathrm{eval}}$ are evaluator-relevant execution controls and
+$\operatorname{Hash}(x)$ is dataset identity hash. All cache lookups and inserts use this key.
+
+Reference pseudocode:
+\begin{verbatim}
+function CanonAndSerialize(z):
+    z_can <- canon(z)
+    b     <- ser(z_can)
+    return (z_can, b)
+
+function CacheKey(z, eta_eval, x):
+    (_, b) <- CanonAndSerialize(z)
+    return (b, eta_eval, Hash(x))
+\end{verbatim}
+
+The deployable objective is operational.
+The next section formalizes restricted mixture, MDL/MAP,
+and optional universality semantics on the deployable semantic subclass.
+
+\section{Restricted mixture semantics and truncated-universality dominance}
+\label{sec:restricted-mixture}
+
+This section formalizes three Solomonoff-adjacent statements for the deployable
+candidate class:
+\begin{enumerate}
+    \item a restricted Bayesian/Solomonoff-style mixture over the bounded
+    deployable semantic class,
+    \item exact MDL/MAP equivalence and the dominant-term upper bound on bounded
+    mixture codelength,
+    \item an optional truncated-universality dominance theorem when the class
+    contains a constant-overhead embedding of a truncated universal program
+    family.
+\end{enumerate}
+
+\subsection{Semantic deployable class and code-length prior}
+
+Operational and runtime lengths are byte-valued throughout this manuscript.
+Implementation reports record these lengths in bytes. For MDL/MAP and mixture
+statements in this semantic subsection, description lengths are expressed in
+bits. Define the bit-normalized quantities
+\[
+L_B^{\mathrm{bit}}(z):=8L_B(z),
+\qquad
+C_x^{\mathrm{bit}}(z):=8C_x(z),
+\qquad
+\mathcal{J}_H^{\mathrm{bit}}(z;x):=L_B^{\mathrm{bit}}(z)+C_x^{\mathrm{bit}}(z).
+\]
+On this manuscript's byte-based operational convention,
+$\mathcal{J}_H^{\mathrm{bit}}(z;x)=8\,\mathcal{J}_H(z;x)$ on
+$\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$.
+
+\begin{remark}[Operational versus semantic normalization]
+The operational objective $\mathcal{J}_H$ is specified in byte units. The
+restricted-mixture and MDL/MAP statements use the bit-normalized objective
+$\mathcal{J}_H^{\mathrm{bit}}$. On $\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$,
+$\mathcal{J}_H^{\mathrm{bit}}(z;x)=8\,\mathcal{J}_H(z;x)$, so minimizers are
+identical.
+\end{remark}
+
+Let
+\[
+\mathcal{F}^{\rho,\mathrm{dep}}(B,H)
+:=
+\left\{
+z\in\mathcal{F}^{\mathrm{dep}}(B,H):
+\begin{aligned}[t]
+&z \text{ induces a computable predictive semimeasure }\\
+&\rho_z:\{0,\dots,255\}^*\to[0,1]
+\end{aligned}
+\right\}.
+\]
+Assume $\mathcal{F}^{\rho,\mathrm{dep}}(B,H)\neq\varnothing$.
+
+For each $z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$, define the code-length
+prior mass
+\[
+\pi_B(z):=2^{-L_B^{\mathrm{bit}}(z)}.
+\]
+
+Define the total semantic prior mass
+\[
+Z_B^{\rho,\mathrm{dep}}
+:=
+\sum_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)} \pi_B(z).
+\]
+
+\begin{proposition}[Kraft bound on semantic deployable prior mass]
+\label{prop:kraft-semantic}
+If the exact internal code image is prefix-free, then
+\[
+0< Z_B^{\rho,\mathrm{dep}} \le 1.
+\]
+\end{proposition}
+
+\begin{proof}
+Positivity holds because
+$\mathcal{F}^{\rho,\mathrm{dep}}(B,H)\neq\varnothing$ and each term
+$2^{-L_B^{\mathrm{bit}}(z)}$ is strictly positive.
+Because each byte is represented by a fixed 8-bit block, a prefix-free code
+over byte strings induces a prefix-free binary code with bitlength
+$L_B^{\mathrm{bit}}(z)=8L_B(z)$. The upper bound follows from the Kraft
+inequality for prefix-free binary codes, applied to the semantic deployable
+subclass.
+\end{proof}
+
+Define the \emph{unnormalized Solomonoff-style bounded mixture}
+\[
+\widetilde{\xi}_{B,H}(x)
+:=
+\sum_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
+2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x).
+\]
+
+Define the \emph{normalized restricted Bayesian mixture}
+\[
+\xi_{B,H}(x)
+:=
+\sum_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
+w_B(z)\rho_z(x),
+\qquad
+w_B(z):=\frac{2^{-L_B^{\mathrm{bit}}(z)}}{Z_B^{\rho,\mathrm{dep}}}.
+\]
+
+\begin{proposition}[Semimeasure and mixture properties]
+\label{prop:mixture-semimeasure}
+If each $\rho_z$ is a semimeasure, then:
+\begin{enumerate}
+    \item $\widetilde{\xi}_{B,H}$ is a semimeasure,
+    \item $\xi_{B,H}$ is a semimeasure,
+    \item $\{w_B(z)\}_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}$ is a proper
+    probability distribution on the semantic deployable class.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+Each claim follows from nonnegative linearity. Since
+$Z_B^{\rho,\mathrm{dep}}\in(0,1]$ by
+Proposition~\ref{prop:kraft-semantic},
+the normalized weights are well-defined, nonnegative, and sum to $1$.
+A nonnegative weighted sum of semimeasures is again a semimeasure.
+\end{proof}
+
+\begin{remark}[Scope of the restricted-mixture statement]
+This outer restricted-mixture statement is a statement about the candidate class
+as a whole, equipped with the exact code-length prior
+$2^{-L_B^{\mathrm{bit}}(z)}$. It does
+not follow merely from the fact that some individual candidates are themselves
+Bayesian mixtures or ensembles internally.
+\end{remark}
+
+\subsection{MDL/MAP equivalence and dominant-term principle}
+
+Assume in this subsection the idealized exact-coding semantics
+\[
+C_x^{\mathrm{bit}}(z) = -\log_2 \rho_z(x)
+\qquad
+\text{for each } z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)
+\]
+Use extended-real convention
+\[
+-\log_2 0 := +\infty.
+\]
+Hence all MDL/MAP statements below are interpreted in
+$\mathbb{R}_{\ge 0}\sqcup\{+\infty\}$.
+Equivalently, the deployable objective on the semantic deployable class is
+\[
+\mathcal{J}_H^{\mathrm{bit}}(z;x)=L_B^{\mathrm{bit}}(z)-\log_2 \rho_z(x).
+\]
+
+\begin{proposition}[Exact MDL/MAP equivalence]
+\label{prop:mdl-map}
+For fixed data $x$, minimizing $\mathcal{J}_H^{\mathrm{bit}}(z;x)$ over
+$z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$ is equivalent to maximizing
+\[
+2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x),
+\]
+and equivalently to maximizing
+\[
+w_B(z)\rho_z(x).
+\]
+That is,
+\[
+\arg\min_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}\mathcal{J}_H^{\mathrm{bit}}(z;x)
+=
+\arg\max_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
+2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)
+=
+\arg\max_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
+w_B(z)\rho_z(x).
+\]
+\end{proposition}
+
+\begin{proof}
+For every $z$ in the semantic deployable class,
+\[
+\mathcal{J}_H^{\mathrm{bit}}(z;x)
+=
+L_B^{\mathrm{bit}}(z)-\log_2\rho_z(x)
+=
+-\log_2\!\bigl(2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)\bigr).
+\]
+For each $z$, one has
+$2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)\in[0,1]$. With the convention
+$-\log_2 0:=+\infty$, the map $y\mapsto -\log_2 y$ is strictly
+order-reversing on $[0,1]$. Hence minimizing
+$\mathcal{J}_H^{\mathrm{bit}}(z;x)$ is equivalent to maximizing
+$2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)$.
+Because $w_B(z)=2^{-L_B^{\mathrm{bit}}(z)}/Z_B^{\rho,\mathrm{dep}}$ and
+$Z_B^{\rho,\mathrm{dep}}$ is constant in $z$, the same argmax is obtained for
+$w_B(z)\rho_z(x)$.
+\end{proof}
+
+\begin{proposition}[Dominant-term upper bound for bounded mixture codelength]
+\label{prop:dominant-term}
+For every byte string $x$,
+\[
+-\log_2 \widetilde{\xi}_{B,H}(x)
+\le
+\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)} \mathcal{J}_H^{\mathrm{bit}}(z;x).
+\]
+Consequently,
+\[
+-\log_2 \xi_{B,H}(x)
+\le
+\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)} \mathcal{J}_H^{\mathrm{bit}}(z;x).
+\]
+\end{proposition}
+
+\begin{proof}
+For every fixed
+$z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$,
+\[
+\widetilde{\xi}_{B,H}(x)
+=
+\sum_{z'}2^{-L_B^{\mathrm{bit}}(z')}\rho_{z'}(x)
+\ge
+2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)
+=
+2^{-\mathcal{J}_H^{\mathrm{bit}}(z;x)}.
+\]
+Applying $-\log_2$ yields
+\[
+-\log_2 \widetilde{\xi}_{B,H}(x)\le \mathcal{J}_H^{\mathrm{bit}}(z;x).
+\]
+Taking the infimum over $z$ proves the first inequality.
+
+For the normalized mixture,
+\[
+\xi_{B,H}(x)=\frac{\widetilde{\xi}_{B,H}(x)}{Z_B^{\rho,\mathrm{dep}}},
+\]
+hence
+\[
+-\log_2 \xi_{B,H}(x)
+=
+-\log_2 \widetilde{\xi}_{B,H}(x)+\log_2 Z_B^{\rho,\mathrm{dep}}
+\le
+-\log_2 \widetilde{\xi}_{B,H}(x),
+\]
+because $Z_B^{\rho,\mathrm{dep}}\le 1$. Combine with the first inequality.
+\end{proof}
+
+\begin{remark}[Normalized-mixture strengthening]
+Because $\xi_{B,H}(x)=\widetilde{\xi}_{B,H}(x)/Z_B^{\rho,\mathrm{dep}}$ with
+$Z_B^{\rho,\mathrm{dep}}\le 1$, one has
+$\xi_{B,H}(x)\ge\widetilde{\xi}_{B,H}(x)$ and therefore
+$-\log_2\xi_{B,H}(x)\le-\log_2\widetilde{\xi}_{B,H}(x)$.
+Thus the normalized mixture gives a bound at least as strong as the
+unnormalized one.
+\end{remark}
+
+\begin{remark}[Meaning of the dominant-term statement]
+Proposition~\ref{prop:dominant-term} gives the precise link between the exact
+restricted mixture and the dominant-term MDL principle on the bounded class:
+the best two-part code length upper bounds the bounded mixture codelength. No
+reverse inequality with a constant additive gap is claimed without additional
+assumptions.
+\end{remark}
+
+\subsection{Optional truncated-universality dominance}
+
+Fix a universal prefix machine $U$ and truncation parameters
+\[
+K\in\mathbb{N},
+\qquad
+T_U>0,
+\qquad
+M_U>0.
+\]
+
+Let
+\[
+\mathcal{P}_{K,T_U,M_U}^H
+\]
+denote the set of all programs $p$ such that:
+\begin{enumerate}
+    \item $|p|\le K$,
+    \item under the fixed profile $H$, program $p$ induces a computable
+    predictive semimeasure $\nu_p^H$,
+    \item the induced predictor is itself deployable under the same resource
+    contract encoded by $H$ (including throughput and memory requirements),
+    \item the program's universal-family execution remains within truncation
+    limits $T_U$ and $M_U$.
+\end{enumerate}
+
+\begin{assumption}[Constant-overhead embedding of the truncated universal family]
+\label{ass:universal-embed}
+There exist a constant $c_U\ge 0$ and an injective map
+\[
+\iota:\mathcal{P}_{K,T_U,M_U}^H
+\to
+\mathcal{F}^{\rho,\mathrm{dep}}(B,H),
+\qquad
+p\mapsto z_p,
+\]
+such that for every $p\in\mathcal{P}_{K,T_U,M_U}^H$,
+\[
+\rho_{z_p}=\nu_p^H
+\qquad\text{and}\qquad
+L_B^{\mathrm{bit}}(z_p)\le |p|+c_U.
+\]
+\end{assumption}
+
+\begin{theorem}[Truncated-universal dominance]
+\label{thm:truncated-universal-dominance}
+Under Assumption~\ref{ass:universal-embed}, for every byte string $x$,
+\[
+\widetilde{\xi}_{B,H}(x)
+\ge
+2^{-c_U}
+\sum_{p\in\mathcal{P}_{K,T_U,M_U}^H}
+2^{-|p|}\nu_p^H(x).
+\]
+Consequently,
+\[
+\xi_{B,H}(x)
+\ge
+2^{-c_U}
+\sum_{p\in\mathcal{P}_{K,T_U,M_U}^H}
+2^{-|p|}\nu_p^H(x).
+\]
+\end{theorem}
+
+\begin{proof}
+By definition of $\widetilde{\xi}_{B,H}$ and the inclusion
+$z_p=\iota(p)\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$,
+\[
+\widetilde{\xi}_{B,H}(x)
+=
+\sum_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
+2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)
+\ge
+\sum_{p\in\mathcal{P}_{K,T_U,M_U}^H}
+2^{-L_B^{\mathrm{bit}}(z_p)}\rho_{z_p}(x).
+\]
+Using Assumption~\ref{ass:universal-embed},
+\[
+2^{-L_B^{\mathrm{bit}}(z_p)}\rho_{z_p}(x)
+\ge
+2^{-(|p|+c_U)}\nu_p^H(x)
+=
+2^{-c_U}2^{-|p|}\nu_p^H(x).
+\]
+Summing over $p$ proves the first inequality.
+
+For the normalized mixture,
+\[
+\xi_{B,H}(x)=\widetilde{\xi}_{B,H}(x)/Z_B^{\rho,\mathrm{dep}}
+\ge \widetilde{\xi}_{B,H}(x),
+\]
+because $Z_B^{\rho,\mathrm{dep}}\le 1$ by
+Proposition~\ref{prop:kraft-semantic}. Hence the same lower bound holds for
+$\xi_{B,H}$.
+\end{proof}
+
+\begin{corollary}[Truncated-universal deployable MDL baseline]
+\label{cor:truncated-universal-baseline}
+Under the exact-coding assumption of the previous subsection and
+Assumption~\ref{ass:universal-embed}, for every byte string $x$,
+\[
+\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}\mathcal{J}_H^{\mathrm{bit}}(z;x)
+\le
+c_U
++
+\inf_{p\in\mathcal{P}_{K,T_U,M_U}^H}
+\bigl(|p|-\log_2 \nu_p^H(x)\bigr).
+\]
+\end{corollary}
+
+\begin{proof}
+For each $p\in\mathcal{P}_{K,T_U,M_U}^H$, let $z_p=\iota(p)$. Then
+\[
+\mathcal{J}_H^{\mathrm{bit}}(z_p;x)
+=
+L_B^{\mathrm{bit}}(z_p)-\log_2\rho_{z_p}(x)
+\le
+|p|+c_U-\log_2 \nu_p^H(x).
+\]
+Taking the infimum over $p$ gives
+\[
+\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}\mathcal{J}_H^{\mathrm{bit}}(z;x)
+\le
+\inf_{p\in\mathcal{P}_{K,T_U,M_U}^H}
+\mathcal{J}_H^{\mathrm{bit}}(z_p;x)
+\le
+c_U
++
+\inf_{p\in\mathcal{P}_{K,T_U,M_U}^H}
+\bigl(|p|-\log_2 \nu_p^H(x)\bigr).
+\]
+\end{proof}
+
+\begin{remark}[Meaning of the universality claim]
+Theorem~\ref{thm:truncated-universal-dominance} is a class-richness statement.
+It does not claim that the runtime optimizer must explicitly execute the
+universal family on every run. It states that if the deployable candidate class
+contains a constant-overhead encoding of the truncated universal family, then
+the induced bounded mixture and the deployable MDL optimum inherit a formal
+truncated-universality baseline.
+\end{remark}
+
+\section{Mutation Grammar and Search Neighborhood}
+
+Let $\mathcal{N}_B(z)$ denote the legal finite neighborhood induced by bounds compiler $B$.
+Mutations are generated from this grammar only, never by unconstrained raw JSON edits.
+
+Allowed mutation families include: mixture-kind change, expert add/remove/replace, local parameter mutation, reorder, optional expert toggle, local nested mutation, incumbent substructure copy, and reset-to-incumbent.
+
+For integer parameter $p\in[L,U]$, with elapsed fraction $u\in[0,1]$,
+temperature $T(u)$, and mutation-radius cap $r_{\mathrm{mut}}^{\max}$, use local radius
+\[
+r(u)=\max\!\left(1,\left\lfloor r_{\mathrm{mut}}^{\max}\frac{T(u)}{T_0}\right\rfloor\right),
+\]
+then propose
+\[
+\Delta p \in \{-r(u),\ldots,-1,+1,\ldots,+r(u)\},
+\]
+clipped to $[L,U]$.
+
+\subsection{Finite action compilation for planner exposure}\label{sec:action-compile}
+
+For planner exposure, the bounded mutation grammar is compiled by a
+deterministic compiler $\operatorname{compile}_B$ parameterized by $B$.
+Define compiled action-cardinality
+\[
+N_B^{\mathrm{compile}}(B):=\big|\operatorname{compile}_B(B)\big|\in\mathbb{N},
+\qquad
+N_B^{\mathrm{compile}}(B)\ge 1,
+\]
+and planner-visible indexed action alphabet
+\[
+\mathcal{A}_B=\{0,\dots,N_B^{\mathrm{compile}}(B)-1\},
+\qquad
+|\mathcal{A}_B|=N_B^{\mathrm{compile}}(B).
+\]
+For planner-exposed controller configurations, cardinality consistency is
+normative:
+\[
+N_B^{\mathrm{compile}}(B)=\texttt{agent\_actions}.
+\]
+After compiling $\mathcal{A}_B$ from $B$, initialization must verify
+\[
+|\mathcal{A}_B|=\texttt{agent\_actions}.
+\]
+On mismatch, initialization aborts with configuration error
+\texttt{action\_alphabet\_mismatch}.
+Each action index selects one compiled mutation template. The template decoder
+is state-aware so that grammar families such as incumbent-copy,
+reset-to-incumbent, and temperature-scaled local mutation remain representable.
+
+Let $\mathcal{S}_B$ denote the annealer proposal-state space (including
+proposal source, incumbent, elapsed time, and mutation RNG state), and let
+$s_t\in\mathcal{S}_B$ denote the current proposal state. Action decoding is
+specified by totalized state-aware semantics
+\[
+\mu_B^{\mathrm{tot}}:\mathcal{A}_B\times\mathcal{S}_B\to\mathcal{Z}\times\{0,1\},
+\qquad
+(a_t,s_t)\mapsto(\tilde z_t,\iota_t),
+\]
+where $\iota_t=1$ marks an inapplicable mutation primitive at state $s_t$.
+If an implementation models decoder randomness explicitly rather than through
+RNG state inside $s_t$, the equivalent form is a total Markov kernel
+$\mu_B^{\mathrm{tot}}(\cdot\mid a_t,s_t)\in\Delta(\mathcal{Z}\times\{0,1\})$.
+
+For this specification, the action-selection distribution is fixed to
+\emph{uniform} over the compiled finite alphabet:
+\[
+\pi_T(a\mid s,B):=\frac{1}{N_B^{\mathrm{compile}}(B)},
+\qquad
+a\in\mathcal{A}_B.
+\]
+The subscript $T$ is retained for interface compatibility; in this
+specification temperature dependence enters through state in
+$\mu_B^{\mathrm{tot}}$ rather than through non-uniform action weights.
+
+Define proposal-outcome kernel
+\[
+\widehat q_T(z,\iota\mid s,B)
+:=
+\sum_{a\in\mathcal{A}_B}
+\pi_T(a\mid s,B)
+\mathbf{1}\!\left\{\mu_B^{\mathrm{tot}}(a,s)=(z,\iota)\right\},
+\]
+and induced canonical-candidate marginal
+\[
+q_T(z'\mid s,B)
+:=
+\sum_{(z,\iota)\in\mathcal{Z}\times\{0,1\}}
+\widehat q_T(z,\iota\mid s,B)
+\mathbf{1}\!\left\{\operatorname{canon}(z)=z'\right\}.
+\]
+Here $s$ is the current annealer proposal state.
+If stochastic decoder form is used, replace indicator terms above by the
+corresponding kernel masses from $\mu_B^{\mathrm{tot}}(\cdot\mid a,s)$.
+
+\section{Annealed Hill Climbing Algorithm}\label{sec:ahc-runtime}
+
+\subsection{State and initialization}
+
+State variables: current candidate $z_{\mathrm{cur}}$, best candidate
+$z_{\mathrm{best}}$, elapsed wall time $t$, evaluation counter $k$, and
+stagnation counter $n_{\mathrm{stag}}\in\mathbb{N}_0$.
+
+Initialization requirements:
+\begin{enumerate}
+    \item load and canonicalize baseline candidate $z_0^{\mathrm{can}}:=\operatorname{canon}(z_0)$,
+    \item execute $w_{\mathrm{base}}$ warmup baseline runs per the execution-control semantics above,
+    \item evaluate $z_0^{\mathrm{can}}$ once normatively with timeout $\min(T_{\mathrm{eval}},T_{\mathrm{total}})$,
+    \item enforce the baseline deployability precondition from
+    Section~\ref{subsec:baseline-precondition}; abort immediately if baseline
+    is non-deployable (fails success status, throughput floor, or memory cap),
+    \item set $z_{\mathrm{cur}}=z_{\mathrm{best}}=z_0^{\mathrm{can}}$ and $n_{\mathrm{stag}}\leftarrow 0$.
+\end{enumerate}
+
+\subsection{Cooling schedule}
+
+With elapsed fraction
+\[
+u=\min\!\left(1,\frac{t}{T_{\mathrm{total}}}\right),
+\]
+use log-linear cooling
+\[
+T(u)=T_{\min}\left(\frac{T_0}{T_{\min}}\right)^{1-u},
+\]
+default $T_0=1.0$, $T_{\min}=10^{-3}$.
+
+\subsection{Transition rule}
+
+At each loop iteration:
+\begin{enumerate}
+    \item compute remaining budget $B_t:=T_{\mathrm{total}}-t$;
+    if $B_t\le 0$ then terminate immediately,
+    \item compute $T(u)$,
+    \item sample action $a_t\sim\pi_T(\cdot\mid s_t,B)$, decode
+    $(\tilde z',\iota')=\mu_B^{\mathrm{tot}}(a_t,s_t)$, and canonicalize
+    $\hat z':=\operatorname{canon}(\tilde z')$,
+    \item if $\iota'=1$, assign $M(\hat z')$ status invalid with diagnostic
+    reason \texttt{inapplicable\_action} without starting compression execution,
+    \item else if $\hat z'$ fails $\mathrm{Valid}_{B,H}$, assign $M(\hat z')$
+    status invalid with diagnostic reason \texttt{candidate\_invalid} without
+    starting compression execution,
+    \item else for cache lookup use
+    $\mathrm{Key}_{\mathrm{cache}}(\hat z',\eta_{\mathrm{eval}},x)$;
+    on cache miss evaluate with per-candidate timeout
+    \[
+    T_t^{\mathrm{eval}}:=\min(T_{\mathrm{eval}},B_t),
+    \]
+    \item set $K_{\mathrm{pre}}:=K(z_{\mathrm{best}})$; if
+    $\mathcal{J}_H(\hat z';x)<+\infty$ and
+    $K(\hat z')\prec_K K_{\mathrm{pre}}$, update
+    $z_{\mathrm{best}}\leftarrow \hat z'$,
+    \item if $\mathcal{J}_H(\hat z';x)<+\infty$, accept as current via Metropolis criterion:
+    \[
+    P_{\mathrm{accept}}=
+    \begin{cases}
+    1, & \mathcal{J}_H(\hat z';x)\le \mathcal{J}_H(z_{\mathrm{cur}};x),\\
+    \exp\!\left(-\dfrac{\mathcal{J}_H(\hat z';x)-\mathcal{J}_H(z_{\mathrm{cur}};x)}{T(u)}\right), & \mathcal{J}_H(\hat z';x)>\mathcal{J}_H(z_{\mathrm{cur}};x),
+    \end{cases}
+    \]
+    and non-deployable candidates ($\mathcal{J}_H(\hat z';x)=+\infty$) are rejected,
+    setting $z_{\mathrm{cur}}\leftarrow\hat z'$ on acceptance,
+    \item update stagnation counter by
+    \[
+    n_{\mathrm{stag}}\leftarrow
+    \begin{cases}
+    0,
+    & \mathcal{J}_H(\hat z';x)<+\infty\ \land\ K(\hat z')\prec_K K_{\mathrm{pre}},\\
+    n_{\mathrm{stag}}+1,
+    & \mathcal{J}_H(\hat z';x)<+\infty\ \land\ \neg\big(K(\hat z')\prec_K K_{\mathrm{pre}}\big),\\
+    n_{\mathrm{stag}},
+    & \mathcal{J}_H(\hat z';x)=+\infty,
+    \end{cases}
+    \]
+    \item if $n_{\mathrm{stag}}\ge\kappa_{\mathrm{stag}}$, set
+    $z_{\mathrm{cur}}\leftarrow z_{\mathrm{best}}$ and
+    $n_{\mathrm{stag}}\leftarrow 0$.
+\end{enumerate}
+
+\subsection{Termination}
+
+Terminate when any condition holds:
+\begin{itemize}
+    \item elapsed wall-clock reaches the global deadline
+    $T_{\mathrm{total}}$,
+    \item \texttt{max\_evaluations} reached,
+    \item neighborhood exhaustion is proven,
+    \item unrecoverable evaluator failure occurs.
+\end{itemize}
+
+Hard-budget enforcement is normative: no candidate evaluation may run with a
+timeout exceeding remaining global budget, and no new blocking evaluation may
+start once $B_t\le 0$.
+
+Output must include:
+\begin{itemize}
+    \item deterministic serialized $z_{\mathrm{best}}$ at \texttt{output\_config\_path},
+    \item structured report at optional \texttt{report\_path}.
+\end{itemize}
+
+\section{Reward and Observation (Future Environment Compatibility)}\label{sec:reward-observation}
+
+This section specifies the single normative planner-reward path.
+Candidate validity, evaluator semantics, objective-feasibility semantics
+(including throughput and memory deployability constraints), and output
+definition remain shared across controller choices.
+
+\subsection{Objective-aligned planner reward path}
+
+For exact objective alignment under planner controllers, use
+incumbent-objective-difference reward
+\[
+R_t^{\mathcal{J}}:=\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+1};x),
+\]
+where $\mathcal{J}_H$ is the deployable objective from
+Section~\ref{sec:formal-problem}. This preserves exact objective ordering.
+
+For fixed finite horizon $m\in\mathbb{N}$, the exact cumulative-improvement
+target is
+\[
+G_t^{(m)}:=\sum_{k=0}^{m-1}R_{t+k}^{\mathcal{J}}
+=\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+m};x),
+\]
+so finite-horizon planner targets are exact objective decreases over $m$
+executed steps.
+
+With incumbent $b$ before evaluating $z$, define diagnostic deltas
+\[
+\delta_c(z\mid b)=\frac{c(b)-c(z)}{\max(c(b),1)},
+\qquad
+\delta_v(z\mid b)=\frac{\tau(b)-\tau(z)}{\max(\tau(b),\varepsilon)},
+\]
+with fixed $\varepsilon>0$ (default $\varepsilon=10^{-9}$).
+
+For total observation semantics, define
+\[
+n_+:=\max(|x|,1).
+\]
+Use reserved failure symbols
+\[
+\bot_c,\bot_\ell,\bot_\tau,\bot_{\delta_c},\bot_{\delta_v}.
+\]
+
+Let $\Sigma_B$ be a finite signature alphabet and define deterministic
+signature map
+\[
+\sigma:\mathcal{Z}\to\Sigma_B.
+\]
+
+Define totalized diagnostics:
+\[
+\tilde c(z)=
+\begin{cases}
+ c(z)/n_+, & \mathrm{status}(z)=\mathrm{success},\\
+ \bot_c, & \text{otherwise,}
+\end{cases}
+\qquad
+\tilde \ell(z)=
+\begin{cases}
+ \ell(z)/n_+, & \mathrm{status}(z)=\mathrm{success},\\
+ \bot_\ell, & \text{otherwise,}
+\end{cases}
+\]
+\[
+\tilde \tau(z)=
+\begin{cases}
+\tau(z)/T_{\mathrm{eval}}, & \mathrm{status}(z)=\mathrm{success},\\
+1, & \mathrm{status}(z)=\mathrm{timeout},\\
+\bot_\tau, & \text{otherwise,}
+\end{cases}
+\]
+\[
+\tilde\delta_c(z\mid b)=
+\begin{cases}
+\delta_c(z\mid b), & \mathrm{status}(z)=\mathrm{success},\\
+\bot_{\delta_c}, & \text{otherwise,}
+\end{cases}
+\qquad
+\tilde\delta_v(z\mid b)=
+\begin{cases}
+\delta_v(z\mid b), & \mathrm{status}(z)=\mathrm{success},\\
+\bot_{\delta_v}, & \text{otherwise.}
+\end{cases}
+\]
+
+Define typed value spaces
+\[
+\mathcal{V}_c:=\mathbb{R}_{\ge 0}\sqcup\{\bot_c\},
+\quad
+\mathcal{V}_{\ell}:=\mathbb{R}_{\ge 0}\sqcup\{\bot_\ell\},
+\quad
+\mathcal{V}_{\tau}:=[0,1]\sqcup\{\bot_\tau\},
+\]
+\[
+\mathcal{V}_{\delta_c}:=\mathbb{R}\sqcup\{\bot_{\delta_c}\},
+\qquad
+\mathcal{V}_{\delta_v}:=\mathbb{R}\sqcup\{\bot_{\delta_v}\}.
+\]
+Then raw observation codomain is
+\[
+\mathcal{O}^{\mathrm{raw}}_B:=
+\{0,1\}\times\mathcal{V}_c\times\mathcal{V}_{\ell}\times\mathcal{V}_{\tau}
+\times\mathcal{V}_{\delta_c}\times\mathcal{V}_{\delta_v}\times\Sigma_B\times\{0,1\}.
+\]
+
+The raw observation payload is
+\[
+o^{\mathrm{raw}}(z\mid b,d_t)=
+\Big(
+\mathbf{1}_{\mathrm{fail}},
+\tilde c(z),
+\tilde \ell(z),
+\tilde \tau(z),
+\tilde\delta_c(z\mid b),
+\tilde\delta_v(z\mid b),
+\sigma(z),
+d_t
+\Big),
+\qquad
+o^{\mathrm{raw}}(z\mid b,d_t)\in\mathcal{O}^{\mathrm{raw}}_B,
+\]
+where $\mathbf{1}_{\mathrm{fail}}=1$ for timeout/invalid/error or for successful candidates with
+$\theta(z)<\theta_{\min}$ or $\mu(z)>\mu_{\max}$, and $0$ otherwise,
+and $d_t\in\{0,1\}$ is terminal indicator emitted by this environment.
+
+Using planner parameters
+$(L_O,b_O,\mathcal{R}_B,r_{\min},r_{\max})$ from
+Section~\ref{sec:aixi-embedding}, define deterministic adapter maps:
+\[
+\Pi_R:\mathbb{R}\to\mathcal{R}_B,
+\qquad
+\Pi_R(r):=\operatorname{clip}_{[r_{\min},r_{\max}]}
+\!\left(\left\lfloor r+\tfrac{1}{2}\right\rfloor\right),
+\]
+\[
+\Psi_O:=\Psi_O^{\eta_O},
+\qquad
+\Psi_O^{\eta_O}:\mathcal{O}^{\mathrm{raw}}_B\to\mathcal{O}_B^{L_O},
+\]
+for a fixed observation-adapter specification
+\[
+\eta_O:=(\text{field order},\text{sentinel coding},\text{quantization/clipping},\text{packing rule},L_O,b_O).
+\]
+where
+\[
+\operatorname{clip}_{[L,U]}(x):=\min\!\big(\max(x,L),U\big).
+\]
+Admissibility requirements are
+\[
+\Pi_R(r)\in [r_{\min},r_{\max}]\cap\mathbb{Z}
+\quad\text{for all }r\in\mathbb{R},
+\]
+\[
+0\le (\Psi_O(o))_i\le 2^{b_O}-1
+\quad\text{for all }o\in\mathcal{O}^{\mathrm{raw}}_B,\ i\in\{1,\dots,L_O\},
+\]
+with the degenerate case $(\Psi_O(o))_i=0$ when $b_O=0$.
+For reproducible planner behavior, $\eta_O$ is fixed for a run and must be
+recorded (or hash-committed) in provenance.
+
+\begin{remark}[Adapter boundary]
+The maps $\Pi_R$ and $\Psi_O$ are the generic raw-environment interfaces in
+this section. The exact planner-state embedding in
+Section~\ref{sec:aixi-embedding} uses the stronger specialized notation
+$\Psi_H$ and $Q_R$: there the observation channel encodes planner state
+directly and the reward already lies in $\mathcal{R}_B$. This is a
+specialization of the same objective-difference reward path, not a change in
+planner semantics.
+\end{remark}
+
+\section{Core Properties}
+
+\begin{proposition}[Feasibility safety]
+Any returned $z_{\mathrm{best}}$ is a deployable evaluated candidate satisfying
+bounds, timeout feasibility, minimum-throughput, and memory-cap constraints.
+\end{proposition}
+
+\begin{proof}
+$z_{\mathrm{best}}$ starts at a deployable baseline and is updated only with
+deployable candidates under $K$. Timeout/invalid/error and successful but
+non-deployable candidates never enter $\mathcal{S}_t$.
+\end{proof}
+
+\begin{proposition}[Monotone incumbent key]
+Across best updates, the incumbent key $K(z_{\mathrm{best}})$ is strictly decreasing in lexicographic order.
+\end{proposition}
+
+\begin{proof}
+By update rule, $z_{\mathrm{best}}$ changes only when $K(z')\prec_K K(z_{\mathrm{best}})$. Hence each update is a strict decrease in $K$.
+\end{proof}
+
+\begin{proposition}[Objective monotonicity under key updates]
+Across best updates, incumbent objective is non-increasing: if
+$z_{\mathrm{best}}$ changes from $z$ to $z'$, then
+$\mathcal{J}_H(z';x)\le\mathcal{J}_H(z;x)$.
+\end{proposition}
+
+\begin{proof}
+The incumbent updates only when
+$K(z')=(\mathcal{J}_H(z';x),\operatorname{ser}(\operatorname{canon}(z')))$ is
+lexicographically smaller than
+$K(z)=(\mathcal{J}_H(z;x),\operatorname{ser}(\operatorname{canon}(z)))$.
+Hence $\mathcal{J}_H(z';x)\le\mathcal{J}_H(z;x)$.
+\end{proof}
+
+\begin{remark}[Conditional replay determinism guarantee]
+If evaluator behavior, timeout clock semantics, RNG stream, build/features, and
+execution controls are fixed and deterministic, then the tuning trace and final
+output are deterministic.
+\end{remark}
+
+\begin{remark}
+Wall-clock jitter can perturb timeout boundaries in practice. Therefore reproducibility is a normative requirement and should be recorded with timing and environment metadata.
+\end{remark}
+
+\section{Annealed-Controller Assumptions and Non-Asymptotic Guarantees}\label{sec:annealed-guarantees}
+
+Unless explicitly stated otherwise, this section applies to the
+\texttt{"annealed\_hill\_climbing"} runtime path from
+Section~\ref{sec:ahc-runtime}.
+
+\begin{assumption}[Finite grammar and computable validity]\label{ass:finite-grammar-validity}
+For every valid candidate $z$, the neighborhood $\mathcal{N}_B(z)$ is finite and effectively enumerable; canonicalization and validity checks terminate.
+\end{assumption}
+
+\begin{assumption}[Positive proposal support for annealed controller]\label{ass:positive-proposal-support}
+Let $z_{\mathrm{src}}(s)$ be the proposal-source component of state $s$. For
+each reachable proposal state $s$ and each
+$z'\in \mathcal{N}_B\big(z_{\mathrm{src}}(s)\big)$, there exists at least one action
+$a\in\mathcal{A}_B$ and candidate $z\in\mathcal{Z}$ such that either
+\[
+\mu_B^{\mathrm{tot}}(a,s)=(z,0)
+\]
+in deterministic form, or
+\[
+\mu_B^{\mathrm{tot}}\big((z,0)\mid a,s\big)>0
+\]
+in stochastic form, and $\operatorname{canon}(z)=z'$. Under the specified
+uniform policy
+$\pi_T(a\mid s,B)=1/N_B^{\mathrm{compile}}(B)$, this implies
+$q_T(z'\mid s,B)>0$.
+\end{assumption}
+
+\begin{assumption}[Per-iteration overhead lower bound]\label{ass:iter-overhead-lb}
+There exists $h_{\min}>0$ such that each loop iteration consumes at least $h_{\min}$ wall-clock seconds including proposal, canonicalization, validation, cache lookup, and bookkeeping.
+\end{assumption}
+
+\begin{proposition}[Finite-horizon iteration bound]\label{prop:finite-iter-bound}
+Let $N_{\mathrm{iter}}$ be total loop iterations before termination by time budget $T_{\mathrm{total}}$. Under Assumption~\ref{ass:iter-overhead-lb},
+\[
+N_{\mathrm{iter}}\le\left\lfloor\frac{T_{\mathrm{total}}}{h_{\min}}\right\rfloor.
+\]
+Hence all diagnostic counts (attempted proposals, invalids, cache hits, cache misses, successes) are finite and budget-bounded.
+\end{proposition}
+
+\begin{proposition}[Annealed finite-horizon improvement probability lower bound]\label{prop:finite-horizon-improve}
+Fix horizon $H\in\mathbb{N}$. Suppose at each of the first $H$ deployable
+evaluation opportunities, conditional on past history, the probability of
+producing a strictly better incumbent is at least $p_*>0$. Then
+\[
+\mathbb{P}(\text{at least one incumbent improvement by }H)\ge 1-(1-p_*)^H.
+\]
+Consequently, the probability of no improvement by horizon $H$ decays at least geometrically.
+\end{proposition}
+
+\begin{proposition}[Non-asymptotic acceptance envelope]\label{prop:accept-envelope}
+For a deployable uphill proposal with objective gap
+$\Delta\mathcal{J}=\mathcal{J}_H(z';x)-\mathcal{J}_H(z_{\mathrm{cur}};x)>0$ at
+elapsed fraction $u$, acceptance probability is
+\[
+\mathbb{P}_{\mathrm{accept}}(u)=\exp\!\left(-\frac{\Delta\mathcal{J}}{T(u)}\right).
+\]
+With log-linear cooling and $T_{\min}\le T(u)\le T_0$, this implies
+\[
+\exp\!\left(-\frac{\Delta\mathcal{J}}{T_{\min}}\right)
+\le
+\mathbb{P}_{\mathrm{accept}}(u)
+\le
+\exp\!\left(-\frac{\Delta\mathcal{J}}{T_0}\right),
+\]
+and $\mathbb{P}_{\mathrm{accept}}(u)$ is monotone decreasing in elapsed fraction
+$u$ (strictly on $u\in[0,1)$).
+\end{proposition}
+
+\begin{remark}
+These are finite-time statements: they do not claim global optimality under finite budgets. They characterize the expected behavior envelope and make engineering trade-offs explicit.
+\end{remark}
+
+\subsection{Idealized asymptotic theorem (explicitly out-of-budget scope)}\label{sec:annealed-asymptotic-scope}
+
+The guarantees above are finite-time and budget-respecting. The theorem below
+is deliberately scope-delimited: it describes an idealized infinite-opportunity
+annealed process and is not a production guarantee under finite-budget runtime.
+
+\begin{assumption}[Finite feasible candidate key space]\label{ass:finite-success-key-space}
+The deployable set $\mathcal{F}^{\mathrm{dep}}(B,H)$ is finite and
+nonempty.
+\end{assumption}
+
+\begin{assumption}[Infinite deployable opportunities]\label{ass:infinite-success-opportunities}
+Index deployable evaluation opportunities by $h\in\mathbb{N}$ and let $b_h$
+denote the incumbent after opportunity $h$. The process admits infinitely many
+such opportunities almost surely.
+\end{assumption}
+
+\begin{assumption}[Uniform one-step improvement support]\label{ass:uniform-improvement-support}
+There exists $p_{\mathrm{imp}}\in(0,1]$ such that for every deployable opportunity
+index $h$, conditional on any realized history with incumbent $b_h$ not globally
+minimal in $K$ over $\mathcal{F}^{\mathrm{dep}}(B,H)$, the probability of a strict
+incumbent-key improvement at the next deployable opportunity is at least
+$p_{\mathrm{imp}}$.
+\end{assumption}
+
+Define incumbent rank by
+\[
+\operatorname{rank}_K(b):=
+\big|\{z\in\mathcal{F}^{\mathrm{dep}}(B,H):K(z)\prec_K K(b)\}\big|.
+\]
+Then $\operatorname{rank}_K(b)=0$ iff $b$ is globally $K$-minimal.
+
+\begin{theorem}[Idealized almost-sure eventual global-optimum hit]\label{thm:idealized-asymptotic-hit}
+Under Assumptions~\ref{ass:finite-success-key-space}--\ref{ass:uniform-improvement-support},
+\[
+\mathbb{P}\!\big(\exists h\in\mathbb{N}:\operatorname{rank}_K(b_h)=0\big)=1.
+\]
+Moreover, for any realized history with $\operatorname{rank}_K(b_h)>0$ and any
+$H\in\mathbb{N}$,
+\[
+\mathbb{P}\!\big(\operatorname{rank}_K(b_{h+j})=\operatorname{rank}_K(b_h)\ \forall j=1,\dots,H\mid\mathcal{H}_h\big)
+\le (1-p_{\mathrm{imp}})^H,
+\]
+where $\mathcal{H}_h$ denotes history up to deployable opportunity $h$.
+\end{theorem}
+
+\begin{proof}
+If $\operatorname{rank}_K(b_h)>0$, Assumption~\ref{ass:uniform-improvement-support}
+implies conditional probability at least $p_{\mathrm{imp}}$ of a strict rank
+drop at the next deployable opportunity. Therefore the probability of no rank
+drop for $H$ consecutive deployable opportunities is at most
+$(1-p_{\mathrm{imp}})^H$, proving the finite-horizon bound. Letting
+$H\to\infty$ gives probability $0$ of never dropping rank from any positive
+rank state. Since rank is a nonnegative integer that strictly decreases on
+every incumbent improvement and is bounded above by
+$|\mathcal{F}^{\mathrm{dep}}(B,H)|-1$, only finitely many drops are needed to
+reach rank $0$. Hence rank $0$ is reached almost surely.
+\end{proof}
+
+\begin{remark}
+Theorem~\ref{thm:idealized-asymptotic-hit} is an idealized asymptotic statement.
+Finite-budget runtime with hard deadline $T_{\mathrm{total}}$ and optional
+\texttt{max\_evaluations} remains governed by the non-asymptotic statements in
+this section.
+\end{remark}
+
+\section{Computational Complexity}\label{sec:computational-complexity}
+
+Let:
+\begin{itemize}
+    \item $n=|x|$ dataset bytes,
+    \item $N$ attempted proposals,
+    \item $U\le N$ unique canonical candidates evaluated or cache-hit,
+    \item $|z|$ canonical candidate representation size,
+    \item $C_{\mathrm{comp}}(n,z)$ compression runtime.
+\end{itemize}
+
+Per proposal attempt, overhead is
+\[
+O\big(C_{\mathrm{mut}}(z,B)+C_{\mathrm{canon}}(|z|)+C_{\mathrm{valid}}(z,B)+C_{\mathrm{hash}}(|z|)\big),
+\]
+with $C_{\mathrm{canon}}(|z|)=O(|z|\log|z|)$ under key sorting, and $C_{\mathrm{hash}}(|z|)=O(|z|)$.
+
+For cache misses, evaluation cost is bounded by hard timeout:
+\[
+C_{\mathrm{eval}}(z) \le
+\min\{C_{\mathrm{comp}}(n,z),T_t^{\mathrm{eval}}\}+C_{\mathrm{kill}},
+\qquad
+T_t^{\mathrm{eval}}\le T_{\mathrm{total}}-t.
+\]
+
+Hence evaluation runtime is globally deadline-bounded by design, with only
+constant finalization overhead after the deadline check:
+\[
+\mathrm{Runtime} \le T_{\mathrm{total}} + O(C_{\mathrm{finalize}}).
+\]
+
+Memory complexity is dominated by cache:
+\[
+O\big(U\cdot(|\operatorname{ser}(\operatorname{canon}(z))|+|M(z)|)\big).
+\]
+
+For the MC-AIXI/AIQI-family runtime path, let $N_{\mathrm{dec}}$ be the number of
+real decision steps and let
+\[
+N_{\mathrm{sim}}:=\sum_{t=0}^{N_{\mathrm{dec}}-1}N_{\mathrm{sim},t}
+\]
+be total planner-internal simulations, where $N_{\mathrm{sim},t}$ is
+simulations at decision step $t$ (bounded by
+\texttt{planner\_simulations\_per\_step}). If
+$C_{\mathrm{sim}}(t)$ denotes per-simulation planner compute at step $t$, then
+controller-internal planning overhead is
+\[
+O\!\left(\sum_{t=0}^{N_{\mathrm{dec}}-1}N_{\mathrm{sim},t}\,C_{\mathrm{sim}}(t)\right)
+=O\big(N_{\mathrm{sim}}\,\overline C_{\mathrm{sim}}\big),
+\]
+with $\overline C_{\mathrm{sim}}$ the average per-simulation planner cost.
+This term affects search-control compute only and does not alter evaluator,
+validity, or output semantics.
+
+\section{Implementation Constraints for \texttt{infotheory}}
+
+\subsection{Semantic equivalence to normal compression path}
+
+Evaluation must preserve the same semantics as normal compression invocation (e.g., the existing mixture JSON path via \texttt{--rate-backend mixture} with \texttt{--method} file input). Library-internal calls are acceptable only if behavior is equivalent.
+
+\subsection{CLI exposure}
+
+Expose capability as
+\begin{verbatim}
+infotheory tune <spec.json>
+\end{verbatim}
+with file-based specification, consistent with other JSON-configured modes.
+
+\subsection{Required report and provenance fields}
+
+The structured report should record at minimum:
+\begin{itemize}
+    \item baseline and best metrics ($c,\tau,\mu,\mathcal{J}_H$),
+    \item operational length quantities are recorded in bytes
+    ($c,L_B,C_x,\mathcal{J}_H$),
+    \item any optional semantic bit-normalized quantities are explicitly
+    labeled and computed as $8\times$ the corresponding byte quantities,
+    \item deltas and evaluation counters,
+    \item timeout, invalid, and successful-but-nondeployable counts,
+    \item final best objective,
+    \item final best-move reward,
+    \item crate/tool version,
+    \item feature set (if available),
+    \item seed,
+    \item configured throughput floor $\theta_{\min}$ and derived runtime cap $\tau_{\theta}=n/\theta_{\min}$,
+    \item configured memory cap $\mu_{\max}$,
+    \item dataset path and dataset content hash,
+    \item baseline config hash,
+    \item initial teacher-dataset provenance/hash (if used),
+    \item warmup policy and warmup count $w_{\mathrm{base}}$,
+    \item self-improvement round count $R_{\mathrm{si}}$ and realized per-round trace counts (if enabled),
+    \item bounds hash,
+    \item canonicalization order-classification identifier/version (or hash commitment),
+    \item observation-adapter or exact-state encoder specification (or hash commitment),
+    \item output config hash.
+\end{itemize}
+
+\subsection{Cache key requirements}
+
+Use the canonical key definition from Section~\ref{sec:canon-cache}:
+\[
+\mathrm{Key}_{\mathrm{cache}}(z,\eta_{\mathrm{eval}},x)=
+\Big(\operatorname{ser}(\operatorname{canon}(z)),\eta_{\mathrm{eval}},\operatorname{Hash}(x)\Big).
+\]
+
+For all controller paths, before evaluating a canonical candidate $\hat z$, the runtime must query the cache key above instantiated at $(\hat z,\eta_{\mathrm{eval}},x)$. On cache hit, the cached evaluator output $M(\hat z)$ is reused and no new compression execution occurs. Any state-relative reward or observation components are recomputed from that cached evaluator output and the current runtime state. This ensures reasonable performance, without affecting behaviour under hardware determinism assumptions.
+
+\section{Expected Theoretical Behavior}\label{sec:expected-theoretical-behavior}
+
+Under fixed hard budgets and bounded mutation grammar, this method is a practical anytime algorithm:
+\begin{itemize}
+    \item it is guaranteed to return a deployable incumbent (baseline or better),
+    \item it enforces throughput and memory limits as hard deployability constraints,
+    \item it never promotes infeasible outcomes,
+    \item it trades early exploration for late exploitation through temperature decay,
+    \item it preserves exact objective semantics via $\mathcal{J}_H$ on the deployable region.
+\end{itemize}
+
+The exact-$\mathcal{J}_H$ statement applies to the annealed hill-climbing
+controller and to planner controllers under the objective-aligned
+objective-difference reward path from
+Section~\ref{sec:reward-observation}.
+
+No claim of global optimality is made under finite budgets. The exact guarantee is that uphill moves have strictly positive acceptance probability under annealing:
+\[
+\Delta\mathcal{J}>0,\ T(u)>0
+\implies
+\mathbb{P}_{\mathrm{accept}}(u)=\exp(-\Delta\mathcal{J}/T(u))>0,
+\]
+whereas deterministic hill climbing assigns probability $0$ to uphill moves.
+
+The asymptotic claims in this document are:
+\begin{itemize}
+    \item the annealed idealized eventual-hit theorem
+    (Theorem~\ref{thm:idealized-asymptotic-hit}), conditional on
+    Section~\ref{sec:annealed-asymptotic-scope}, and
+    \item the planner-side MC-AIXI asymptotic convergence result
+    (Theorem~\ref{thm:planner-convergence-mcaixi}, with
+    Proposition~\ref{prop:planner-convergence-optset} giving the broader
+    set-valued non-unique optimal-sequence variant), conditional on
+    Section~\ref{sec:planner-convergence-mcaixi}.
+\end{itemize}
+Both are assumption-conditional asymptotic statements and are outside
+finite-budget runtime guarantees.
+
+\section{Exact planner-state embedding for MC-AIXI(FAC-CTW) under a fixed hardware profile}\label{sec:aixi-embedding}
+
+This section formalizes a planner-facing environment whose dynamics are Markov
+by construction, while separating two logically distinct use-cases:
+\begin{enumerate}
+    \item a budget-free finite-horizon planning variant for direct
+    $\rho$UCT / MC-AIXI consistency statements, and
+    \item an optional reset-augmented continuing variant for stationary/ergodic
+    finite-state Markov analysis.
+\end{enumerate}
+All finite-MDP and observed-Markov claims in this section are conditional on
+Assumptions~\ref{ass:finite-Z}--\ref{ass:no-hidden}.
+
+\subsection{Fixed-profile semantics}
+
+Fix a hardware/evaluator profile
+\[
+\begin{aligned}
+H=\bigl(&\text{machine class},\text{CPU pinning policy},\text{RAM cap},\\
+&\text{build/features},\eta_{\mathrm{eval}},\\
+&\text{wall-clock timing methodology},\text{seed policy}\bigr).
+\end{aligned}
+\]
+All planner-facing semantics below are defined relative to $H$.
+
+\begin{assumption}[Finite planner-exposed candidate domain]\label{ass:finite-Z}
+The planner-exposed canonical candidate set
+\[
+\mathcal{Z}_H^{\mathrm{can}} \subseteq \mathcal{Z}
+\]
+is finite.
+\end{assumption}
+
+\begin{remark}
+Assumption~\ref{ass:finite-Z} is normative for this embedding. Any parameter
+that would otherwise range over an infinite or continuous set must be
+explicitly discretized before planner exposure; this discretization is part of
+$B$ and part of the canonicalization contract.
+\end{remark}
+
+Define status alphabet
+\[
+\mathcal{S}_{\mathrm{status}}
+:=
+\{\mathrm{success},\mathrm{timeout},\mathrm{invalid},\mathrm{error}\}.
+\]
+Let $\mathcal{D}_H$ be a finite diagnostic codomain containing distinguished
+token
+\[
+d_{\mathrm{inapp}}:=\texttt{inapplicable\_action},
+\]
+and let $\bot_c,\bot_\ell,\bot_\tau,\bot_\mu$ denote failure sentinels for
+undefined size/log-loss/time/memory fields. Define evaluator codomain
+\[
+\mathcal{Y}_H
+:=
+\mathcal{S}_{\mathrm{status}}
+\times (\mathbb{N}\sqcup\{\bot_c\})
+\times (\mathbb{R}_{\ge 0}\sqcup\{\bot_\ell\})
+\times (\mathbb{R}_{\ge 0}\sqcup\{\bot_\tau\})
+\times (\mathbb{R}_{\ge 0}\sqcup\{\bot_\mu\})
+\times \mathcal{D}_H.
+\]
+
+\begin{assumption}[Profile-fixed semantic evaluator]\label{ass:det-eval}
+There exists a deterministic semantic evaluator
+\[
+M_H^\circ:\mathcal{Z}_H^{\mathrm{can}}\to\mathcal{Y}_H,
+\qquad
+M_H^\circ(z)=\big(\mathrm{status}_H(z),c_H(z),\ell_H(z),\tau_H(z),\mu_H(z),\operatorname{diag}_H(z)\big),
+\]
+with:
+\begin{itemize}
+    \item $\mathrm{status}_H(z)\in\mathcal{S}_{\mathrm{status}}$,
+    \item $c_H(z)\in\mathbb{N}$ on success and $c_H(z)=\bot_c$ otherwise,
+    \item $\ell_H(z)\in\mathbb{R}_{\ge 0}$ on success and
+    $\ell_H(z)=\bot_\ell$ otherwise,
+    \item $\tau_H(z)\in\mathbb{R}_{\ge 0}$ on success and
+    $\tau_H(z)=\bot_\tau$ otherwise,
+    \item $\mu_H(z)\in\mathbb{R}_{\ge 0}$ on success and
+    $\mu_H(z)=\bot_\mu$ otherwise,
+    \item $\operatorname{diag}_H(z)\in\mathcal{D}_H$.
+\end{itemize}
+This is the fixed-profile specialization of the six-field evaluator contract
+from Section~\ref{sec:formal-problem}. Here $\tau_H(z)$ denotes elapsed
+wall-clock time in the same unit family as $\tau(z)$, $T_{\mathrm{eval}}$,
+and $T_{\mathrm{total}}$. Any additional deterministic profile costs (for
+example, PMU cycles) may be recorded in $\operatorname{diag}_H(z)$, but are
+not denoted by $\tau_H(z)$.
+\end{assumption}
+
+For successful candidates under profile $H$, define throughput
+\[
+\theta_H(z):=
+\begin{cases}
+\dfrac{n}{\tau_H(z)}, & \mathrm{status}_H(z)=\mathrm{success},\ \tau_H(z)>0,\\[4pt]
++\infty, & \mathrm{status}_H(z)=\mathrm{success},\ \tau_H(z)=0.
+\end{cases}
+\]
+
+\begin{remark}
+Assumption~\ref{ass:det-eval} does not remove hardware from the model. It
+incorporates hardware methodology into $H$; once $H$ is fixed, evaluator
+semantics are required to be deterministic relative to that profile.
+\end{remark}
+
+\begin{assumption}[Deployable baseline initialization]\label{ass:baseline-succ}
+This is the fixed-profile restatement of the normative input precondition from
+Section~\ref{subsec:baseline-precondition}.
+
+In a conforming runtime, $b_0$ is the incumbent produced by the single
+post-warmup evaluation of $z_0^{\mathrm{can}}$.
+
+The initial incumbent $b_0\in\mathcal{Z}_H^{\mathrm{can}}$ satisfies
+\[
+\mathrm{status}_H(b_0)=\mathrm{success}
+\quad\land\quad
+\theta_H(b_0)\ge\theta_{\min}
+\quad\land\quad
+\mu_H(b_0)\le\mu_{\max}.
+\]
+\end{assumption}
+
+Define the deployable canonical subset
+\[
+\mathcal{Z}_{H,\mathrm{dep}}^{\mathrm{can}}:=
+\left\{z\in\mathcal{Z}_H^{\mathrm{can}}:\ \mathrm{status}_H(z)=\mathrm{success}\ \land\ \theta_H(z)\ge\theta_{\min}\ \land\ \mu_H(z)\le\mu_{\max}\right\}.
+\]
+By Assumption~\ref{ass:baseline-succ}, this set is nonempty.
+
+Define profile-fixed two-part objective components
+\[
+C_x(z):=c_H(z),
+\qquad
+L_B(z):=\big|\operatorname{ser}(z)\big|,
+\]
+and objective
+\[
+\mathcal{J}_H(z;x):=
+\begin{cases}
+L_B(z)+C_x(z),
+& z\in\mathcal{Z}_{H,\mathrm{dep}}^{\mathrm{can}},\\[3pt]
++\infty,
+& \text{otherwise.}
+\end{cases}
+\]
+This enforces a single deployability-gated objective in the planner path:
+non-deployable candidates receive $+\infty$ exactly as timeout/invalid/error
+outcomes.
+
+Define incumbent key
+\[
+K_H(z):=\big(\mathcal{J}_H(z;x),\operatorname{ser}(z)\big),
+\]
+ordered lexicographically.
+
+\subsection{State, action, and omitted-variable discipline}
+
+Fix planner-interface integer parameters
+\[
+\begin{aligned}
+N_B&:=\texttt{agent\_actions}=N_B^{\mathrm{compile}}(B)\in\mathbb{N},\ N_B\ge 1,\\
+b_O&:=\texttt{observation\_bits}\in\mathbb{N}_0,\\
+L_O&:=\max(1,\texttt{observation\_stream\_len}),\\
+b_R&:=\texttt{reward\_bits}\in\mathbb{N},\ b_R\ge 1,\\
+r_{\min}&:=\texttt{min\_reward}\in\mathbb{Z},\\
+r_{\max}&:=\texttt{max\_reward}\in\mathbb{Z},\ r_{\max}>r_{\min},\\
+\rho_{\mathrm{off}}&:=\texttt{reward\_offset}\in\mathbb{Z}.
+\end{aligned}
+\]
+Define
+\[
+\mathcal{A}_B=\{0,\dots,N_B-1\},
+\qquad
+\mathcal{O}_B=\{0,\dots,2^{b_O}-1\}
+\]
+(with $\mathcal{O}_B=\{0\}$ when $b_O=0$), and
+\[
+\mathcal{R}_B:=\{r\in\mathbb{Z}:r_{\min}\le r\le r_{\max}\},
+\qquad
+\mathcal{R}_B^{\mathrm{enc}}:=\{0,\dots,2^{b_R}-1\}.
+\]
+Initialization must verify cardinality consistency
+\[
+|\mathcal{A}_B|=\texttt{agent\_actions}
+\]
+after compiling the action alphabet from $B$; on mismatch, initialization aborts
+with configuration error \texttt{action\_alphabet\_mismatch}.
+
+Let $\Theta_H$ be the complete \emph{finite} auxiliary-state set containing
+exactly the remaining variables, if any, that influence future planner-facing
+dynamics and are not functions of proposal source and incumbent alone.
+
+\begin{assumption}[No hidden state outside chosen state tuple]\label{ass:no-hidden}
+Every implementation variable that influences future emitted observation,
+emitted reward, or decoded candidate is either:
+\begin{enumerate}
+    \item included in $\Theta_H$, or
+    \item planner-facing inert: changing it while holding the chosen state tuple
+    fixed leaves all future emitted transitions/rewards/observations unchanged.
+\end{enumerate}
+\end{assumption}
+
+Define planner state space
+\[
+\mathcal{S}_H:=
+\mathcal{Z}_H^{\mathrm{can}}\times \mathcal{Z}_{H,\mathrm{dep}}^{\mathrm{can}}\times \Theta_H,
+\]
+with state $s=(u,b,\theta)$ where $u$ is proposal source, $b$ incumbent,
+$\theta$ auxiliary state.
+
+Action decoding is the total deterministic map
+\[
+\mu_B^{\mathrm{tot}}:\mathcal{A}_B\times\mathcal{S}_H\to
+\mathcal{Z}_H^{\mathrm{can}}\times\{0,1\},
+\qquad
+(a,s)\mapsto(\tilde z,\iota),
+\]
+followed by canonicalization
+\[
+z(a,s):=\operatorname{canon}(\tilde z).
+\]
+Canonical inapplicable-action semantics are invalid-without-evaluation:
+when $\iota=1$, no evaluator execution is performed and no compression run is
+started.
+
+Let
+\[
+y_H(a,s):=
+\begin{cases}
+\bigl(\mathrm{invalid},\bot_c,\bot_\ell,\bot_\tau,\bot_\mu,d_{\mathrm{inapp}}\bigr),
+& \iota=1,\\[3pt]
+M_H^\circ\bigl(z(a,s)\bigr),
+& \iota=0.
+\end{cases}
+\]
+Define exact-objective feasibility predicate
+\[
+\mathrm{Feas}_H(z):=\mathbf{1}\{\mathrm{status}_H(z)=\mathrm{success}\ \land\ \theta_H(z)\ge\theta_{\min}\ \land\ \mu_H(z)\le\mu_{\max}\}.
+\]
+Define incumbent update
+\[
+\operatorname{Inc}_H(s,a):=
+\begin{cases}
+z(a,s),
+& \iota=0\ \land\ \mathrm{Feas}_H(z(a,s))=1
+\ \land\
+K_H(z(a,s))\prec_K K_H(b),\\[3pt]
+b,
+& \text{otherwise.}
+\end{cases}
+\]
+
+Let
+\[
+U_H:\mathcal{S}_H\times\mathcal{A}_B\to\mathcal{S}_H
+\]
+be the deterministic next-state map, required to satisfy
+\[
+\pi_b\bigl(U_H(s,a)\bigr)=\operatorname{Inc}_H(s,a),
+\]
+where $\pi_b(u,b,\theta)=b$ extracts the incumbent component.
+
+\subsection{Objective-aligned reward}
+
+Define planner-semantic reward by incumbent objective decrease:
+\[
+r_H(s,a):=\mathcal{J}_H\!\bigl(\pi_b(s);x\bigr)-\mathcal{J}_H\!\bigl(\pi_b(U_H(s,a));x\bigr).
+\]
+On any realized planner trajectory with $b_t=\pi_b(s_t)$, this agrees
+stepwise with Section~\ref{sec:reward-observation}'s reward
+$R_t^{\mathcal{J}}$.
+This is finite and well-defined on reachable trajectories because incumbent
+components are always deployable.
+
+\begin{proposition}[Undiscounted telescoping identity]\label{prop:telescoping}
+For every finite trajectory
+\[
+s_0,a_0,s_1,a_1,\dots,s_m,
+\qquad
+s_{t+1}=U_H(s_t,a_t),
+\]
+we have
+\[
+\sum_{t=0}^{m-1} r_H(s_t,a_t)
+=
+\mathcal{J}_H\!\bigl(\pi_b(s_0);x\bigr)-\mathcal{J}_H\!\bigl(\pi_b(s_m);x\bigr).
+\]
+\end{proposition}
+
+\begin{proof}
+Immediate from summing
+\[
+r_H(s_t,a_t)=\mathcal{J}_H\!\bigl(\pi_b(s_t);x\bigr)-\mathcal{J}_H\!\bigl(\pi_b(s_{t+1});x\bigr).
+\]
+\end{proof}
+
+\subsection{Observation encoding and exact observed-Markov path}
+
+\begin{proposition}[Baseline-derived reachable reward bound]
+\label{prop:reward-bound}
+Under Assumption~\ref{ass:baseline-succ}, every reachable planner-semantic
+reward satisfies
+\[
+0\le r_H(s,a)\le \overline R_H,
+\qquad
+\overline R_H:=\mathcal{J}_H(b_0;x).
+\]
+\end{proposition}
+
+\begin{proof}
+Along every reachable trajectory from $s_0$, incumbent updates never worsen the
+key and therefore never increase the incumbent objective. Hence for every
+reachable state $s$,
+\[
+0\le \mathcal{J}_H\!\bigl(\pi_b(s);x\bigr)\le \mathcal{J}_H(b_0;x)=\overline R_H.
+\]
+Also,
+\[
+\mathcal{J}_H\!\bigl(\pi_b(U_H(s,a));x\bigr)
+\le
+\mathcal{J}_H\!\bigl(\pi_b(s);x\bigr),
+\]
+so
+\[
+0
+\le
+r_H(s,a)
+=
+\mathcal{J}_H\!\bigl(\pi_b(s);x\bigr)-\mathcal{J}_H\!\bigl(\pi_b(U_H(s,a));x\bigr)
+\le
+\overline R_H.
+\]
+\end{proof}
+
+Choose deterministic state encoder
+\[
+\Psi_H:\mathcal{S}_H\to\mathcal{O}_B^{L_O}.
+\]
+
+\begin{definition}[Exact-state observation path]
+The embedding uses the \emph{exact-state observation path} if $\Psi_H$ is
+injective.
+\end{definition}
+
+A sufficient cardinality condition is
+\[
+2^{b_OL_O}\ge |\mathcal{S}_H|.
+\]
+
+\begin{remark}[Normative reward-encoding safety check]
+\label{rem:reward-encoding-safety}
+Initialization must verify
+\[
+r_{\min}\le 0,
+\qquad
+r_{\max}\ge \overline R_H,
+\qquad
+\rho_{\mathrm{off}}=-r_{\min},
+\qquad
+r_{\max}-r_{\min}\le 2^{b_R}-1.
+\]
+If this check fails, initialization aborts with configuration error
+\texttt{reward\_encoding\_unsafe}. By
+Proposition~\ref{prop:reward-bound}, this implies the finite realized reward
+set satisfies
+\[
+\{r_H(s,a):(s,a)\in\mathcal{S}_H\times\mathcal{A}_B\}\subseteq\mathcal{R}_B,
+\]
+and that $Q_R$ is exact on all reachable rewards.
+\end{remark}
+
+Define exact reward encoder
+\[
+Q_R(r):=r+\rho_{\mathrm{off}},
+\]
+with admissibility condition
+\[
+0\le Q_R(r)\le 2^{b_R}-1
+\quad\text{for all }r\in\mathcal{R}_B.
+\]
+
+The emitted percept is
+\[
+x_{t+1}^{\mathrm{enc}}=
+\bigl(\Psi_H(s_{t+1}),Q_R(r_H(s_t,a_t))\bigr)
+\in\mathcal{O}_B^{L_O}\times\mathcal{R}_B^{\mathrm{enc}}.
+\]
+
+\begin{proposition}[Finite MDP by construction]\label{prop:finite-mdp}
+Under Assumptions~\ref{ass:finite-Z}--\ref{ass:no-hidden}, the induced
+planner-facing process is a finite time-homogeneous MDP
+\[
+\mathfrak{M}_H:=(\mathcal{S}_H,\mathcal{A}_B,T_H,R_H),
+\]
+with deterministic transition kernel
+\[
+T_H(s'\mid s,a):=\mathbf{1}\{U_H(s,a)=s'\},
+\]
+and reward function
+\[
+R_H(s,a,s'):=r_H(s,a).
+\]
+\end{proposition}
+
+\begin{proof}
+By Assumption~\ref{ass:no-hidden}, every variable affecting future
+planner-facing emissions is either part of $s$ or planner-facing inert. Hence
+$s_{t+1}$ and $r_t$ are functions only of $(s_t,a_t)$. Since
+$\mathcal{S}_H$ and $\mathcal{A}_B$ are finite, the process is a finite
+time-homogeneous MDP.
+\end{proof}
+
+\begin{proposition}[Exact observed $1$-Markov path]\label{prop:obs-1-markov}
+If the exact-state observation path is used, then the emitted percept process is
+observed $1$-Markov:
+\[
+\Pr\!\bigl(x_{t+1}^{\mathrm{enc}}\mid a_t,x_{1:t}^{\mathrm{enc}},a_{1:t-1}\bigr)
+=
+\Pr\!\bigl(x_{t+1}^{\mathrm{enc}}\mid a_t,x_t^{\mathrm{enc}}\bigr).
+\]
+\end{proposition}
+
+\begin{proof}
+Injectivity of $\Psi_H$ implies $x_t^{\mathrm{enc}}$ determines $s_t$
+uniquely. Apply Proposition~\ref{prop:finite-mdp}.
+\end{proof}
+
+\subsection{Budget-free finite-horizon planning variant}
+
+In the budget-free variant, no countdown or terminal flag is part of
+environment state. The planning horizon $m\in\mathbb{N}$ is an external planner
+parameter. Proposition~\ref{prop:finite-mdp} then yields a finite
+(time-homogeneous) MDP for every fixed planning horizon $m$.
+
+\subsection{Conditional planner convergence on exact finite-horizon MC-AIXI path}\label{sec:planner-convergence-mcaixi}
+
+Define the globally $K_H$-optimal deployable candidate
+\[
+z_H^{\star}:=\arg\min_{z\in\mathcal{Z}_{H,\mathrm{dep}}^{\mathrm{can}}}K_H(z),
+\]
+which is unique by finiteness and total ordering of $K_H$.
+
+For fixed horizon $m\in\mathbb{N}$ and action sequence
+$a_{0:m-1}\in\mathcal{A}_B^m$, define the deterministic rollout
+\[
+s_0^{a}:=s_0,
+\qquad
+s_{t+1}^{a}:=U_H(s_t^{a},a_t),
+\quad t=0,\dots,m-1,
+\]
+and deterministic undiscounted return
+\[
+G_m(s_0,a_{0:m-1})
+:=
+\sum_{t=0}^{m-1} r_H(s_t^{a},a_t).
+\]
+
+\begin{assumption}[Planner-convergence regime]\label{ass:planner-conv-regime}
+The planner is MC-AIXI(FAC-CTW) with $\rho$UCT on the exact model
+$\mathfrak{M}_H=(\mathcal{S}_H,\mathcal{A}_B,T_H,R_H)$,
+using objective-aligned reward $r_H$, deterministic undiscounted
+finite-horizon return $G_m$,
+and the budget-free finite-horizon variant of this section.
+\end{assumption}
+
+\begin{assumption}[Horizon-$m$ attainability with unique optimal action path]\label{ass:planner-conv-unique-path}
+There exists $m\in\mathbb{N}$ and a unique action sequence
+$a_{0:m-1}^{\star}\in\mathcal{A}_B^m$. Define optimal-prefix states by
+\[
+s_0^{\star}:=s_0,
+\qquad
+s_{t+1}^{\star}:=U_H(s_t^{\star},a_t^{\star}),
+\quad t=0,\dots,m-1.
+\]
+Then:
+\begin{enumerate}
+    \item $\pi_b(s_m^{\star})=z_H^{\star}$, and
+    \item for every other sequence $a_{0:m-1}\neq a_{0:m-1}^{\star}$,
+    \[
+    G_m(s_0,a_{0:m-1}^{\star}) > G_m(s_0,a_{0:m-1}),
+    \]
+\end{enumerate}
+\end{assumption}
+
+\begin{assumption}[Per-decision asymptotic root-action consistency]\label{ass:planner-conv-root-consistency}
+For each simulation budget $N\in\mathbb{N}$, let
+$S_t^{(N)}\in\mathcal{S}_H$ be the closed-loop state process defined by
+\[
+S_0^{(N)}:=s_0,
+\qquad
+S_{t+1}^{(N)}:=U_H\big(S_t^{(N)},a_t^{(N)}\big),
+\]
+where $a_t^{(N)}$ is the root action selected at step $t$ using $N$
+planner-internal simulations. For each $t\in\{0,\dots,m-1\}$,
+\[
+\mathbb{P}\!\big(a_t^{(N)}=a_t^{\star}\mid S_t^{(N)}=s_t^{\star}\big)
+\xrightarrow[N\to\infty]{}1.
+\]
+\end{assumption}
+
+\begin{theorem}[Conditional MC-AIXI convergence to $z_H^{\star}$]\label{thm:planner-convergence-mcaixi}
+Under Assumptions~\ref{ass:planner-conv-regime}--\ref{ass:planner-conv-root-consistency}
+and Proposition~\ref{prop:finite-mdp},
+consider the closed-loop process indexed by simulation budget $N$, and define
+$b_t^{(N)}:=\pi_b\big(S_t^{(N)}\big)$. Then
+\[
+\mathbb{P}\!\big(b_m^{(N)}=z_H^{\star}\big)\xrightarrow[N\to\infty]{}1.
+\]
+\end{theorem}
+
+For the non-unique maximizer case, see Proposition~\ref{prop:planner-convergence-optset}.
+
+\begin{proof}
+We prove by induction that
+\[
+\mathbb{P}\!\big(S_t^{(N)}=s_t^{\star}\big)\xrightarrow[N\to\infty]{}1
+\quad\text{for each }t=0,\dots,m.
+\]
+Base case $t=0$ is immediate from $S_0^{(N)}=s_0=s_0^{\star}$.
+
+Induction step: assume
+$\mathbb{P}(S_t^{(N)}=s_t^{\star})\to 1$ for some $t<m$.
+Then
+\[
+\begin{aligned}
+\mathbb{P}\!\big(S_{t+1}^{(N)}=s_{t+1}^{\star}\big)
+&\ge
+\mathbb{P}\!\big(S_t^{(N)}=s_t^{\star},\ a_t^{(N)}=a_t^{\star}\big)\\
+&=
+\mathbb{P}\!\big(S_t^{(N)}=s_t^{\star}\big)
+\,\mathbb{P}\!\big(a_t^{(N)}=a_t^{\star}\mid S_t^{(N)}=s_t^{\star}\big).
+\end{aligned}
+\]
+The first factor tends to $1$ by induction hypothesis and the second by
+Assumption~\ref{ass:planner-conv-root-consistency}, so
+\[
+\liminf_{N\to\infty}\mathbb{P}\!\big(S_{t+1}^{(N)}=s_{t+1}^{\star}\big)\ge 1.
+\]
+Hence
+$\mathbb{P}(S_{t+1}^{(N)}=s_{t+1}^{\star})\to 1$.
+
+By induction,
+$\mathbb{P}(S_m^{(N)}=s_m^{\star})\to 1$.
+From Assumption~\ref{ass:planner-conv-unique-path}, $\pi_b(s_m^{\star})=z_H^{\star}$, so
+\[
+\mathbb{P}\!\big(b_m^{(N)}=z_H^{\star}\big)
+\ge
+\mathbb{P}\!\big(S_m^{(N)}=s_m^{\star}\big)
+\xrightarrow[N\to\infty]{}1,
+\]
+which proves the claim.
+\end{proof}
+
+\begin{proposition}[Optimal-action-set variant (non-unique optimal sequences)]\label{prop:planner-convergence-optset}
+In the setting of Theorem~\ref{thm:planner-convergence-mcaixi}, replace
+Assumption~\ref{ass:planner-conv-unique-path} by the following:
+\begin{enumerate}
+    \item define
+    \[
+    \mathcal{A}_m^{\star}:=
+    \arg\max_{a_{0:m-1}\in\mathcal{A}_B^m}G_m(s_0,a_{0:m-1}),
+    \]
+    which may be non-singleton;
+    \item for each sequence $a_{0:m-1}$ define deterministic trajectory
+    \[
+    s_0^{a}:=s_0,
+    \qquad
+    s_{t+1}^{a}:=U_H(s_t^{a},a_t),
+    \quad t=0,\dots,m-1,
+    \]
+    and require
+    \[
+    \pi_b(s_m^{a})=z_H^{\star}
+    \quad\text{for all }a_{0:m-1}\in\mathcal{A}_m^{\star}.
+    \]
+\end{enumerate}
+For each $t\in\{0,\dots,m\}$ define
+\[
+\mathcal{S}_t^{\star}:=\{s_t^{a}:a_{0:m-1}\in\mathcal{A}_m^{\star}\}.
+\]
+For each $t\in\{0,\dots,m-1\}$ and $s\in\mathcal{S}_t^{\star}$ define
+\[
+\mathcal{U}_t^{\star}(s):=\{a\in\mathcal{A}_B:U_H(s,a)\in\mathcal{S}_{t+1}^{\star}\}.
+\]
+Assume also that for each $t\in\{0,\dots,m-1\}$,
+\[
+\inf_{s\in\mathcal{S}_t^{\star}}
+\mathbb{P}\!\big(a_t^{(N)}\in\mathcal{U}_t^{\star}(s)\mid S_t^{(N)}=s\big)
+\xrightarrow[N\to\infty]{}1.
+\]
+Then
+\[
+\mathbb{P}\!\big(b_m^{(N)}=z_H^{\star}\big)\xrightarrow[N\to\infty]{}1.
+\]
+\end{proposition}
+
+\begin{proof}
+Let
+\[
+F_t^{(N)}:=\{S_t^{(N)}\in\mathcal{S}_t^{\star}\},
+\qquad t=0,\dots,m.
+\]
+Since $S_0^{(N)}=s_0$ and $s_0\in\mathcal{S}_0^{\star}$,
+$\mathbb{P}(F_0^{(N)})=1$.
+
+If $F_t^{(N)}$ occurs and
+$a_t^{(N)}\in\mathcal{U}_t^{\star}(S_t^{(N)})$, then by definition of
+$\mathcal{U}_t^{\star}$ we have $S_{t+1}^{(N)}\in\mathcal{S}_{t+1}^{\star}$,
+hence
+\[
+\mathbb{P}(F_{t+1}^{(N)})
+\ge
+\mathbb{P}(F_t^{(N)})
+\inf_{s\in\mathcal{S}_t^{\star}}
+\mathbb{P}\!\big(a_t^{(N)}\in\mathcal{U}_t^{\star}(s)\mid S_t^{(N)}=s\big).
+\]
+By the assumed uniform conditional consistency, the multiplicative factor tends
+to $1$ for each fixed $t$, so induction on $t$ gives
+$\mathbb{P}(F_m^{(N)})\to 1$.
+
+By common-terminal-incumbent optimality,
+$\pi_b(s)=z_H^{\star}$ for every $s\in\mathcal{S}_m^{\star}$, therefore
+\[
+\mathbb{P}\!\big(b_m^{(N)}=z_H^{\star}\big)
+\ge
+\mathbb{P}(F_m^{(N)})
+\xrightarrow[N\to\infty]{}1.
+\]
+\end{proof}
+
+\begin{remark}[Informal takeaway for planner convergence]
+Assumption~\ref{ass:planner-conv-unique-path} is a stronger-than-ideal
+single-path sufficient condition used for the clean theorem statement. The
+broader interpretation is set-valued: what matters is asymptotic selection of
+actions that remain inside the optimal action set leading to the common
+terminal incumbent $z_H^{\star}$, as formalized in
+Proposition~\ref{prop:planner-convergence-optset}.
+\end{remark}
+
+\begin{remark}
+Theorem~\ref{thm:planner-convergence-mcaixi} and
+Proposition~\ref{prop:planner-convergence-optset} are asymptotic-in-simulations
+statements for the exact objective-aligned undiscounted finite-horizon
+MC-AIXI path. They are not finite-budget runtime guarantees and are not, by
+themselves, convergence theorems for runtime \texttt{aiqi\_discounted} or
+runtime \texttt{aiqi\_warmstart\_exact\allowbreak\_jh} under finite simulation budgets
+and optional exploratory/non-greedy control.
+Their theorem target is $b_m^{(N)}$ (incumbent after exactly $m$ executed planner
+steps), not the runtime output
+$z^\star=\arg\min_{z\in\mathcal{S}_{\mathrm{term}}^{\mathrm{dep}}}K_H(z)$ from
+Section~\ref{sec:aixi-runtime} under wall-clock-bounded termination.
+\end{remark}
+
+\subsection{Optional budgeted/episodic variant}
+
+To model explicit per-episode bounds, add deterministic countdown component
+\[
+d_t\in\{0,\dots,D_{\max}\}
+\]
+to $\Theta_H$ and update it inside $U_H$. The Markov property is preserved because the
+countdown is inside state.
+
+\subsection{Optional reset-augmented continuing variant}
+
+Let $\mathsf{Term}:\mathcal{S}_H\to\{0,1\}$ be a terminal predicate and $\nu$ a
+restart distribution on $\mathcal{S}_H$. Define
+\[
+\widetilde T_H(s'\mid s,a):=
+\begin{cases}
+T_H(s'\mid s,a), & \mathsf{Term}(s)=0,\\[3pt]
+\nu(s'), & \mathsf{Term}(s)=1.
+\end{cases}
+\]
+Optionally define lazy kernel
+\[
+\widetilde T_H^{(\lambda)}:=\lambda I+(1-\lambda)\widetilde T_H,
+\qquad
+\lambda\in(0,1).
+\]
+For any fixed action-selection policy, if the induced finite chain is
+irreducible then the lazy chain is aperiodic and therefore ergodic.
+
+\subsection{Runtime controller path for MC-AIXI and AIQI-family controllers}\label{sec:aixi-runtime}
+
+This subsection is implementation-normative: it specifies runtime execution
+when \texttt{algorithm} is \texttt{mc\_aixi\_fac\_ctw},
+\texttt{aiqi\_discounted}, or
+\texttt{aiqi\_warmstart\_exact\allowbreak\_jh}.
+
+Given the same input contract and evaluator definitions used by
+Section~\ref{sec:ahc-runtime}, define
+\[
+N_{\mathrm{sim}}^{\max}:=\texttt{planner\_simulations\_per\_step}\in\mathbb{N},
+\qquad N_{\mathrm{sim}}^{\max}\ge 1,
+\]
+and apply the following execution contract.
+
+\paragraph{Shared initialization contract.}
+\begin{enumerate}
+    \item compile planner action alphabet $\mathcal{A}_B$ from $B$ and verify
+    cardinality consistency
+    \[
+    |\mathcal{A}_B|=\texttt{agent\_actions};
+    \]
+    on mismatch, abort initialization with configuration error
+    \texttt{action\_alphabet\_mismatch},
+    \item after the normative baseline evaluation, verify the exact
+    reward-encoding safety check from
+    Remark~\ref{rem:reward-encoding-safety}; on failure, abort initialization
+    with configuration error \texttt{reward\_encoding\allowbreak\_unsafe},
+    \item instantiate planner-facing environment state $s_0\in\mathcal{S}_H$
+    with the post-warmup baseline incumbent satisfying the normative baseline
+    precondition from Section~\ref{subsec:baseline-precondition}
+    (equivalently Assumption~\ref{ass:baseline-succ} in the fixed-profile
+    analysis).
+\end{enumerate}
+
+\paragraph{Controller-specific internal policy contract.}
+Initialize controller-specific internal state by
+\[
+\begin{aligned}
+u_0^{\mathrm{mc}}&\ \text{(MC-AIXI/FAC-CTW)},\\
+u_0^{\mathrm{aiqi,disc}}&\ \text{(discounted variant)},\\
+u_0^{\mathrm{aiqi,warm}}&\ \text{(warm-start exact variant)}.
+\end{aligned}
+\]
+Apply seeded randomized tie-breaking for MC-AIXI; apply deterministic
+lowest-index greedy tie-breaking for \texttt{aiqi\_discounted}
+(Section~\ref{sec:aiqi-discounted-contract}) and for the exact-greedy
+warm-start path (Section~\ref{sec:aiqi-warmstart-exact-jh}); explicit
+exploration parameters are heuristic. At each decision step $t$, allocate
+planner-internal simulation count
+\[
+N_{\mathrm{sim},t}\in\{1,\dots,N_{\mathrm{sim}}^{\max}\}
+\]
+as permitted by remaining wall-clock budget, run those internal simulations,
+and then select external action $a_t\in\mathcal{A}_B$ from the current
+controller state.
+
+For \texttt{algorithm = aiqi\_warmstart\_exact\allowbreak\_jh} with
+$R_{\mathrm{si}}>1$, this single-pass execution is used as the per-round
+kernel inside the bounded same-task trace-refresh wrapper of
+Section~\ref{sec:aiqi-warmstart-self-improve}. The global wall-clock budget
+remains $T_{\mathrm{total}}$, the next round starts from the current outer
+incumbent, and the final output is still the minimum-$K_H$ deployable candidate
+over all real evaluations performed across all rounds.
+
+\paragraph{Shared environment, termination, and output contract.}
+\begin{enumerate}
+    \item environment applies deterministic transition
+    $s_{t+1}=U_H(s_t,a_t)$ and emits encoded percept
+    \[
+    x_{t+1}^{\mathrm{enc}}=
+    \bigl(\Psi_H(s_{t+1}),Q_R(r_H(s_t,a_t))\bigr),
+    \]
+    with canonical inapplicable-action semantics inherited from
+    Section~\ref{sec:aixi-embedding}: when decoder flag $\iota=1$, the emitted
+    outcome is invalid with diagnostic token
+    \texttt{inapplicable\_action}, no evaluator execution occurs, and no
+    compression run is started,
+    \item planner updates its internal state using
+    $(a_t,x_{t+1}^{\mathrm{enc}})$ and repeats until termination criteria are
+    met,
+    \item termination criteria are the same normative criteria used by the
+    tuning runtime (global deadline, \texttt{max\_evaluations} if set,
+    neighborhood exhaustion when provable, unrecoverable evaluator failure),
+    \item final output candidate is
+    \[
+    z^\star=\arg\min_{z\in\mathcal{S}_{\mathrm{term}}^{\mathrm{dep}}}K_H(z),
+    \]
+    where
+    \[
+    \mathcal{S}_{\mathrm{term}}^{\mathrm{dep}}:=
+    \left\{z\in\mathcal{Z}_H^{\mathrm{can}}:\
+    \begin{aligned}[t]
+    &z\text{ evaluated before termination},\\
+    &\mathrm{status}_H(z)=\mathrm{success},\\
+    &\theta_H(z)\ge\theta_{\min},\ \mu_H(z)\le\mu_{\max}
+    \end{aligned}
+    \right\}.
+    \]
+\end{enumerate}
+Controller-specific search-control dynamics may differ, but scoring/output
+semantics and candidate-validity semantics remain shared.
+
+\subsection{Normative discounted AIQI controller contract}
+\label{sec:aiqi-discounted-contract}
+
+This subsection is normative for
+\texttt{algorithm = aiqi\_discounted}. It defines a
+discounted/bin-quantized heuristic controller path and does \emph{not} provide
+exact-$\mathcal{J}_H$ guarantees for finite-horizon objective alignment.
+
+Define controller parameters
+\[
+H_{\mathrm{ret}}:=\texttt{return\_horizon}\in\mathbb{N},\ H_{\mathrm{ret}}\ge 1,
+\qquad
+\gamma:=\texttt{discount\_factor}\in[0,1),
+\]
+\[
+M:=\texttt{return\_bins}\in\mathbb{N},
+\qquad
+M\text{ is a power of two}.
+\]
+
+Define clamp on unit interval
+\[
+\operatorname{clamp}_{[0,1]}(x):=\min\!\bigl(\max(x,0),1\bigr).
+\]
+For semantic rewards $r_t\in\mathcal{R}_B$, define normalized clipped reward
+\[
+\hat r_t:=\operatorname{clamp}_{[0,1]}\!\left(
+\frac{r_t-r_{\min}}{r_{\max}-r_{\min}}
+\right),
+\]
+and discounted finite-horizon target
+\[
+G_{t,H_{\mathrm{ret}}}^{(\gamma)}:=
+\operatorname{clamp}_{[0,1]}\!\left(
+(1-\gamma)\sum_{k=0}^{H_{\mathrm{ret}}-1}\gamma^k\hat r_{t+k}
+\right).
+\]
+
+Define return-bin quantizer
+\[
+Q_{\mathrm{return}}(G):=
+\min\!\left(\left\lfloor M G\right\rfloor,\ M-1\right),
+\qquad
+G\in[0,1].
+\]
+The discounted controller predicts/optimizes the distribution of
+$Q_{\mathrm{return}}(G_{t,H_{\mathrm{ret}}}^{(\gamma)})$, not exact
+$\mathcal{J}_H$-improvement targets.
+
+Greedy action ties are broken deterministically by lowest action index; any
+explicit exploration parameter is heuristic and outside exact-$\mathcal{J}_H$
+claims.
+
+\subsection{MC-AIXI-warm-started model-free exact-\texorpdfstring{$\mathcal{J}_H$}{J\_H} controller}
+\label{sec:aiqi-warmstart-exact-jh}
+
+This subsection defines a model-free controller path whose $m$-step prediction
+target is exactly aligned with the deployable tuning objective $\mathcal{J}_H$
+via terminal-incumbent improvement, while using MC-AIXI-generated teacher data
+to initialize the label predictor. It is inspired by the delayed-label
+phase-predictor structure of AIQI, but it does \emph{not} use discounted return
+targets and does \emph{not} invoke the discounted AIQI theorem directly.
+It is normative for \texttt{algorithm = aiqi\_warmstart\_exact\allowbreak\_jh}.
+
+\paragraph{Setup.}
+Fix the same planner-facing finite interaction contract as in
+Section~\ref{sec:reward-observation}: finite action alphabet
+$\mathcal{A}_B$, finite encoded observation alphabet, deterministic incumbent
+key, and the objective-aligned reward
+\[
+R_t^{\mathcal{J}}:=\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+1};x).
+\]
+Define
+\[
+m:=\texttt{return\_horizon}\in\mathbb{N},\qquad m\ge 1.
+\]
+
+Define the exact $m$-step cumulative improvement target
+\[
+G_t^{(m)}
+:=
+\sum_{k=0}^{m-1} R_{t+k}^{\mathcal{J}}.
+\]
+Because the reward is incumbent-objective difference, this telescopes exactly:
+\[
+G_t^{(m)}
+=
+\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+m};x).
+\]
+Hence maximizing expected $G_t^{(m)}$ is equivalent to minimizing the expected
+terminal incumbent objective after $m$ further planner steps.
+
+\begin{remark}[Integer-valued exact target]
+Operationally, $\mathcal{J}_H$ is byte-valued, so
+$R_t^{\mathcal{J}}\in\mathbb{Z}_{\ge 0}$ and
+$G_t^{(m)}\in\mathbb{Z}_{\ge 0}$.
+A safe finite label alphabet is therefore
+\[
+\mathcal{G}_m:=\{0,1,\dots,\overline G_m\},
+\qquad
+\overline G_m:=\mathcal{J}_H(b_0;x),
+\]
+since $\mathcal{J}_H(b_{t+m};x)\ge 0$ and incumbents never worsen.
+Any tighter finite upper bound may be used instead.
+\end{remark}
+
+\paragraph{Initial teacher dataset and admissible same-task trace sources.}
+Let
+\[
+\mathcal{D}_{\mathrm{teach}}
+=
+\bigl\{
+(h_{<t}^{(i)},a_t^{(i)},G_t^{(m),(i)})
+\bigr\}_{i=1}^{N_{\mathrm{teach}}}
+\]
+be the initial teacher dataset.
+
+\begin{definition}[Admissible same-task teacher dataset]
+\label{def:admissible-teacher}
+Fix the exact-$\mathcal{J}_H$ interaction contract of this subsection.
+A finite dataset $\mathcal{D}_{\mathrm{teach}}$ is \emph{admissible} if every
+record is collected from a realized controller trajectory on the same
+$(B,H,x)$-induced tuning environment under the same finite planner-visible
+history/action contract, and each label is computed from the realized
+incumbent path by
+\[
+G_t^{(m),(i)}
+=
+\mathcal{J}_H(b_t^{(i)};x)-\mathcal{J}_H(b_{t+m}^{(i)};x).
+\]
+\end{definition}
+
+MC-AIXI executed trajectories are the canonical source of an initial admissible
+dataset. Prior executions of the exact-$\mathcal{J}_H$ controller are also
+admissible. More generally, any controller can supply teacher traces exactly
+when its realized trajectory is exposed through the same action/history
+contract and the same exact label semantics above. Operationally, the initial
+admissible dataset is provided by
+\texttt{warmstart\_teacher\_dataset\_path}.
+
+\begin{remark}[Which other controllers qualify]
+Annealed hill climbing or another optimizer is not directly reusable here
+unless an explicit semantics-preserving adapter exposes its realized trace
+through the same compiled action alphabet, same history convention, and same
+exact label definition $G_t^{(m)}$. Without that contract match, its traces are
+non-admissible for this controller path.
+\end{remark}
+
+\paragraph{Phase-indexed delayed-label construction.}
+Define augmentation period
+\[
+N:=\texttt{label\_phase\_period}\in\mathbb{N},\qquad N\ge m.
+\]
+For each phase $n\in\{0,\dots,N-1\}$, define the phase-restricted teacher set
+\[
+\mathcal{D}_{\mathrm{teach}}^{(n)}
+:=
+\left\{
+(h_{<t}^{(i)},a_t^{(i)},G_t^{(m),(i)}):
+\ t \equiv n \pmod N
+\right\}.
+\]
+For each phase $n$, define a predictive distribution
+\[
+\psi_n(\,\cdot\,\mid h_{<t}a_t)
+\in
+\Delta(\mathcal{G}_m),
+\]
+where $\Delta(\mathcal{G}_m)$ denotes the probability simplex on
+$\mathcal{G}_m$.
+
+The initialization (warm-start) of $\psi_n$ from
+$\mathcal{D}_{\mathrm{teach}}^{(n)}$ is controller-internal and may be implemented
+by any deterministic finite-alphabet predictive mechanism, provided the resulting
+predictor is a well-defined conditional distribution on $\mathcal{G}_m$.
+Examples include exact count tables, CTW-style pseudocount initialization on an
+augmented label sequence, or any other deterministic finite-alphabet Bayesian or
+MDL-compatible predictor.
+
+Define the unified phase predictor
+\[
+\psi(\,\cdot\,\mid h_{<t}a_t):=
+\psi_{t\bmod N}(\,\cdot\,\mid h_{<t}a_t).
+\]
+
+\paragraph{Warm-started action-value estimate.}
+Define the exact-$\mathcal{J}_H$ model-free action-value estimate
+\[
+\widehat Q_m(h_{<t},a)
+:=
+\mathbb{E}_{\psi}\!\left[G_t^{(m)}\mid h_{<t},a\right]
+=
+\sum_{g\in\mathcal{G}_m} g\,\psi(g\mid h_{<t}a).
+\]
+
+\paragraph{True conditional law and exact action-value.}
+For each history-action pair, define the true conditional law of the exact
+$m$-step label by
+\[
+p_t(\,\cdot\,\mid h_{<t},a)
+:=
+\mathbb{P}\!\left(G_t^{(m)}\in\,\cdot\,\mid h_{<t},a\right)
+\in
+\Delta(\mathcal{G}_m),
+\]
+and the corresponding exact action-value by
+\[
+Q_t^\star(h_{<t},a)
+:=
+\mathbb{E}_{p_t}\!\left[G_t^{(m)}\mid h_{<t},a\right]
+=
+\sum_{g\in\mathcal{G}_m} g\,p_t(g\mid h_{<t},a).
+\]
+For $p,q\in\Delta(\mathcal{G}_m)$, write total variation distance as
+\[
+\|p-q\|_{\mathrm{TV}}
+:=
+\sup_{A\subseteq\mathcal{G}_m}|p(A)-q(A)|
+=
+\frac{1}{2}\sum_{g\in\mathcal{G}_m}|p(g)-q(g)|.
+\]
+
+\paragraph{Deployment policy.}
+The greedy deployment rule for this controller is
+\[
+\hat a_t
+\in
+\arg\max_{a\in\mathcal{A}_B}\widehat Q_m(h_{<t},a),
+\]
+with deterministic tie-breaking (e.g.\ lowest-index maximizing action).
+
+Optionally, one may use an exploration schedule
+\[
+\varepsilon_t\in[0,1],
+\]
+and select actions by
+\[
+\pi_t(a\mid h_{<t})
+=
+(1-\varepsilon_t)\mathbf{1}[a=\hat a_t]
++
+\varepsilon_t\,u_{\mathcal{A}_B}(a),
+\]
+where $u_{\mathcal{A}_B}$ is the uniform distribution on $\mathcal{A}_B$.
+However, the exact action-selection claim below applies only to the greedy case
+$\varepsilon_t=0$.
+
+\paragraph{Online update.}
+After execution reveals the realized label $G_t^{(m)}$, the active phase
+predictor $\psi_{t\bmod N}$ may be updated online using that label.
+Online updating is optional for semantic exactness but useful for correcting
+teacher-induced distribution shift.
+
+\begin{proposition}[Exact finite-horizon objective alignment]
+\label{prop:aiqi-warmstart-exact-jh}
+For every history $h_{<t}$ and action $a\in\mathcal{A}_B$,
+\[
+\mathbb{E}\!\left[G_t^{(m)}\mid h_{<t},a\right]
+=
+\mathcal{J}_H(b_t;x)
+-
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},a\right].
+\]
+Consequently,
+\[
+\arg\max_{a\in\mathcal{A}_B}
+\mathbb{E}\!\left[G_t^{(m)}\mid h_{<t},a\right]
+=
+\arg\min_{a\in\mathcal{A}_B}
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},a\right].
+\]
+Therefore, if $\psi(\cdot\mid h_{<t}a)$ equals the true conditional law of
+$G_t^{(m)}$ given $(h_{<t},a)$, then the greedy rule
+$\hat a_t\in\arg\max_a \widehat Q_m(h_{<t},a)$ is exactly optimal for the
+current decision with respect to the finite-horizon terminal-incumbent
+objective at horizon $m$.
+\end{proposition}
+
+\begin{proof}
+By definition,
+\[
+G_t^{(m)}
+=
+\sum_{k=0}^{m-1}R_{t+k}^{\mathcal{J}}
+=
+\sum_{k=0}^{m-1}
+\left(
+\mathcal{J}_H(b_{t+k};x)-\mathcal{J}_H(b_{t+k+1};x)
+\right),
+\]
+which telescopes to
+\[
+G_t^{(m)}
+=
+\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+m};x).
+\]
+Condition on $(h_{<t},a)$ and take expectations. Since
+$\mathcal{J}_H(b_t;x)$ is fixed given $h_{<t}$, maximizing the expected
+cumulative improvement is equivalent to minimizing the expected terminal
+objective at horizon $m$.
+\end{proof}
+
+\begin{theorem}[Approximate finite-horizon greedy optimality under total-variation predictor error]
+\label{thm:aiqi-warmstart-tv-robust}
+Fix a history $h_{<t}$ and suppose
+\[
+\sup_{a\in\mathcal{A}_B}
+\left\|
+\psi(\cdot\mid h_{<t}a)-p_t(\cdot\mid h_{<t},a)
+\right\|_{\mathrm{TV}}
+\le \delta_t.
+\]
+Let
+\[
+a_t^\star\in\arg\max_{a\in\mathcal{A}_B}Q_t^\star(h_{<t},a),
+\qquad
+\hat a_t\in\arg\max_{a\in\mathcal{A}_B}\widehat Q_m(h_{<t},a),
+\]
+where $\hat a_t$ uses the deterministic tie-breaking rule above. Then
+\[
+\sup_{a\in\mathcal{A}_B}
+\left|
+\widehat Q_m(h_{<t},a)-Q_t^\star(h_{<t},a)
+\right|
+\le
+\overline G_m\,\delta_t,
+\]
+and
+\[
+Q_t^\star(h_{<t},a_t^\star)-Q_t^\star(h_{<t},\hat a_t)
+\le
+2\overline G_m\,\delta_t.
+\]
+Equivalently,
+\[
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},\hat a_t\right]
+-
+\min_{a\in\mathcal{A}_B}
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},a\right]
+\le
+2\overline G_m\,\delta_t.
+\]
+\end{theorem}
+
+\begin{proof}
+Fix any action $a\in\mathcal{A}_B$. Since
+$G_t^{(m)}\in\mathcal{G}_m\subseteq[0,\overline G_m]$, the bounded-function
+characterization of total variation on a finite alphabet gives
+\[
+\begin{aligned}
+\left|
+\widehat Q_m(h_{<t},a)-Q_t^\star(h_{<t},a)
+\right|
+&=
+\left|
+\mathbb{E}_{\psi}\!\left[G_t^{(m)}\mid h_{<t},a\right]
+-
+\mathbb{E}_{p_t}\!\left[G_t^{(m)}\mid h_{<t},a\right]
+\right|\\
+&\le
+\overline G_m
+\left\|
+\psi(\cdot\mid h_{<t}a)-p_t(\cdot\mid h_{<t},a)
+\right\|_{\mathrm{TV}}.
+\end{aligned}
+\]
+Taking the supremum over actions yields
+\[
+\sup_{a\in\mathcal{A}_B}
+\left|
+\widehat Q_m(h_{<t},a)-Q_t^\star(h_{<t},a)
+\right|
+\le
+\overline G_m\,\delta_t.
+\]
+For the greedy-action suboptimality bound, write
+\[
+\begin{aligned}
+Q_t^\star(h_{<t},a_t^\star)-Q_t^\star(h_{<t},\hat a_t)
+&=
+\bigl(Q_t^\star(h_{<t},a_t^\star)-\widehat Q_m(h_{<t},a_t^\star)\bigr)\\
+&\quad+
+\bigl(\widehat Q_m(h_{<t},a_t^\star)-\widehat Q_m(h_{<t},\hat a_t)\bigr)\\
+&\quad+
+\bigl(\widehat Q_m(h_{<t},\hat a_t)-Q_t^\star(h_{<t},\hat a_t)\bigr).
+\end{aligned}
+\]
+The middle term is nonpositive because $\hat a_t$ maximizes
+$\widehat Q_m(h_{<t},\cdot)$, so
+\[
+Q_t^\star(h_{<t},a_t^\star)-Q_t^\star(h_{<t},\hat a_t)
+\le
+2\sup_{a\in\mathcal{A}_B}
+\left|
+\widehat Q_m(h_{<t},a)-Q_t^\star(h_{<t},a)
+\right|
+\le
+2\overline G_m\,\delta_t.
+\]
+By Proposition~\ref{prop:aiqi-warmstart-exact-jh}, for every action $a$,
+\[
+Q_t^\star(h_{<t},a)
+=
+\mathcal{J}_H(b_t;x)
+-
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},a\right].
+\]
+Substituting this identity into the previous inequality cancels the common term
+$\mathcal{J}_H(b_t;x)$ and yields the terminal-objective bound.
+\end{proof}
+
+\begin{corollary}[Exact action identification under a true action gap]
+\label{cor:aiqi-warmstart-gap}
+Assume $|\mathcal{A}_B|\ge 2$, and let $a_t^\star$ be the deterministic
+lowest-index maximizer of $Q_t^\star(h_{<t},\cdot)$. Define the true action gap by
+\[
+\Delta_t(h_{<t})
+:=
+Q_t^\star(h_{<t},a_t^\star)
+-
+\max_{a\in\mathcal{A}_B\setminus\{a_t^\star\}}Q_t^\star(h_{<t},a).
+\]
+If
+\[
+\sup_{a\in\mathcal{A}_B}
+\left|
+\widehat Q_m(h_{<t},a)-Q_t^\star(h_{<t},a)
+\right|
+<
+\frac{\Delta_t(h_{<t})}{2},
+\]
+then $\hat a_t=a_t^\star$.
+\end{corollary}
+
+\begin{proof}
+For any action $a\neq a_t^\star$,
+\[
+\begin{aligned}
+\widehat Q_m(h_{<t},a_t^\star)-\widehat Q_m(h_{<t},a)
+&\ge
+Q_t^\star(h_{<t},a_t^\star)-Q_t^\star(h_{<t},a)\\
+&\quad-
+2\sup_{a'\in\mathcal{A}_B}
+\left|
+\widehat Q_m(h_{<t},a')-Q_t^\star(h_{<t},a')
+\right|\\
+&>
+\Delta_t(h_{<t})-2\cdot\frac{\Delta_t(h_{<t})}{2}
+=0.
+\end{aligned}
+\]
+Hence $\widehat Q_m(h_{<t},a_t^\star)>\widehat Q_m(h_{<t},a)$ for every
+$a\neq a_t^\star$, so $a_t^\star$ is the unique maximizer of
+$\widehat Q_m(h_{<t},\cdot)$. Therefore the deterministic greedy rule selects
+$\hat a_t=a_t^\star$.
+\end{proof}
+
+\begin{remark}[Scope of the approximate-law result]
+Theorem~\ref{thm:aiqi-warmstart-tv-robust} and
+Corollary~\ref{cor:aiqi-warmstart-gap} are local finite-horizon robustness
+statements. They do not constitute a long-run convergence theorem for the
+runtime warm-start exact-$\mathcal{J}_H$ controller under finite simulations or
+exploration.
+\end{remark}
+
+\begin{remark}[Role of admissible teacher data]
+Initial MC-AIXI traces, prior exact-$\mathcal{J}_H$ reruns, or other
+admissible same-task traces do not change the objective. Their role is only to
+initialize or refine $\psi$ away from the cold-start regime. Thus the
+controller remains model-free at deployment time, even when some teacher traces
+were generated by a model-based controller.
+\end{remark}
+
+\begin{remark}[Claim boundary]
+This subsection gives an exact finite-horizon objective-alignment statement for
+the current decision step, not a discounted-return asymptotic
+$\varepsilon$-optimality statement. If $\varepsilon_t>0$, then the executed
+policy is exploratory and therefore is not exactly greedy at that decision
+step. If one wants the executed action to coincide with the greedy rule
+analyzed here, use $\varepsilon_t=0$ at deployment; exact optimality at that
+step additionally requires the predictor-equality premise in
+Proposition~\ref{prop:aiqi-warmstart-exact-jh}.
+\end{remark}
+
+\begin{remark}[Implementation-conformance split]
+Conforming implementations must keep the controller kinds
+\texttt{aiqi\_discounted} and \texttt{aiqi\_warmstart\_exact\allowbreak\_jh}
+distinct. Reusing discounted return-bin targets under the exact warm-start
+controller key is non-conforming to this specification. Likewise, any bounded
+self-improvement trace-refresh wrapper may merge only admissible same-task
+exact-label traces as defined above; reusing differently encoded or surrogate-
+labeled traces is non-conforming.
+\end{remark}
+
+\subsection{Optional bounded same-task trace-refresh self-improvement loop}
+\label{sec:aiqi-warmstart-self-improve}
+
+This subsection defines an optional bounded wrapper around
+\texttt{aiqi\_warmstart\_exact\allowbreak\_jh}. It reuses the same exact
+label mechanism on the original tuning task; it does \emph{not} introduce any
+auxiliary objective.
+
+Let
+\[
+R_{\mathrm{si}}:=\texttt{self\_improvement\_rounds}\in\mathbb{N},
+\qquad
+R_{\mathrm{si}}\ge 1,
+\]
+with default $R_{\mathrm{si}}=1$.
+When $R_{\mathrm{si}}>1$, interpret $T_{\mathrm{total}}$ as the single
+outer-loop wall-clock budget and define deterministic round deadlines
+\[
+\Delta_r^{\mathrm{si}}:=\frac{r}{R_{\mathrm{si}}}T_{\mathrm{total}},
+\qquad r=0,\dots,R_{\mathrm{si}}.
+\]
+
+Let the round-$r$ teacher dataset be $\mathcal{D}^{(r)}$, with initial dataset
+$\mathcal{D}^{(0)}:=\mathcal{D}_{\mathrm{teach}}$, and define
+\[
+\beta_0:=b_0,
+\qquad
+\mathcal{S}_0^{\mathrm{meta}}:=\{\beta_0\}.
+\]
+For each round $r\in\{0,\dots,R_{\mathrm{si}}-1\}$:
+\begin{enumerate}
+    \item initialize the phase predictors from $\mathcal{D}^{(r)}$,
+    \item initialize the round-$r$ controller with incumbent $\beta_r$ and
+    execute the exact-$\mathcal{J}_H$ controller on the same $(B,H,x)$ task
+    until the earlier of global termination and wall-clock deadline
+    $\Delta_{r+1}^{\mathrm{si}}$,
+    \item let $L_r\in\mathbb{N}_0$ be the number of executed actions in round
+    $r$, and define the realized labeled round-trace set
+    \[
+    \mathcal{T}^{(r)}
+    :=
+    \left\{
+    (h_{<t}^{(r)},a_t^{(r)},G_t^{(m),(r)}):\ 0\le t\le L_r-m
+    \right\},
+    \]
+    with $\mathcal{T}^{(r)}:=\varnothing$ when $L_r<m$,
+    \item let $\mathcal{E}_r^{\mathrm{dep}}$ be the set of deployable
+    candidates actually evaluated in round $r$, and update
+    \[
+    \mathcal{D}^{(r+1)}:=\operatorname{Merge}\!\bigl(\mathcal{D}^{(r)},\mathcal{T}^{(r)}\bigr),
+    \qquad
+    \mathcal{S}_{r+1}^{\mathrm{meta}}:=\mathcal{S}_r^{\mathrm{meta}}\cup \mathcal{E}_r^{\mathrm{dep}},
+    \]
+    where $\operatorname{Merge}$ is any deterministic deduplicating union rule,
+    \item define the next outer incumbent by
+    \[
+    \beta_{r+1}:=\arg\min_{z\in\mathcal{S}_{r+1}^{\mathrm{meta}}}K_H(z).
+    \]
+\end{enumerate}
+At termination the wrapper returns $\beta_{R_{\mathrm{si}}}$.
+
+\begin{proposition}[Same-task safety of bounded trace refresh]
+\label{prop:aiqi-warmstart-self-improve-safe}
+For the bounded same-task trace-refresh loop above:
+\begin{enumerate}
+    \item each round uses the same exact label $G_t^{(m)}$ and the same
+    finite-horizon terminal-incumbent objective as
+    Proposition~\ref{prop:aiqi-warmstart-exact-jh},
+    \item every teacher record added through $\mathcal{T}^{(r)}$ is extracted
+    from a realized trajectory on the original task and therefore does not
+    require any auxiliary evaluation objective,
+    \item the outer incumbent sequence is monotone:
+    \[
+    K_H(\beta_{r+1})\preceq_K K_H(\beta_r)
+    \quad\text{and hence}\quad
+    \mathcal{J}_H(\beta_{r+1};x)\le \mathcal{J}_H(\beta_r;x)
+    \]
+    for all $r\in\{0,\dots,R_{\mathrm{si}}-1\}$.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+By Definition~\ref{def:admissible-teacher}, $\mathcal{D}^{(0)}$ is an
+admissible same-task teacher dataset. By construction, every record in each
+$\mathcal{T}^{(r)}$ is a realized same-task exact label, so deterministic
+merging preserves admissibility by induction over $r$. Hence part (1) follows:
+each round is the same exact-$\mathcal{J}_H$ controller applied to a different
+admissible warm start. Part (2) is immediate from the definition of
+$\mathcal{T}^{(r)}$. For part (3), the sets
+$\mathcal{S}_r^{\mathrm{meta}}$ are nested by construction, and $\beta_r$ is the
+unique minimum of $K_H$ on $\mathcal{S}_r^{\mathrm{meta}}$. Enlarging the set
+cannot worsen that minimum.
+\end{proof}
+
+\begin{theorem}[Conditional bounded self-improvement under predictor refinement]
+\label{thm:aiqi-warmstart-self-improve}
+Fix two rounds $r<s$ and a history $h_{<t}$ that occurs identically in both
+rounds. Let $\psi^{(r)}$ and $\psi^{(s)}$ be the corresponding round-specific
+unified phase predictors. If
+\[
+\sup_{a\in\mathcal{A}_B}
+\left\|
+\psi^{(s)}(\cdot\mid h_{<t}a)-p_t(\cdot\mid h_{<t},a)
+\right\|_{\mathrm{TV}}
+\le
+\sup_{a\in\mathcal{A}_B}
+\left\|
+\psi^{(r)}(\cdot\mid h_{<t}a)-p_t(\cdot\mid h_{<t},a)
+\right\|_{\mathrm{TV}},
+\]
+then at $h_{<t}$ the value-error bound and terminal-objective excess bound from
+Theorem~\ref{thm:aiqi-warmstart-tv-robust} under round $s$ are no larger than
+under round $r$. If the displayed inequality is strict, both bounds are strict.
+\end{theorem}
+
+\begin{proof}
+Apply Theorem~\ref{thm:aiqi-warmstart-tv-robust} with
+\[
+\delta_t^{(r)}:=
+\sup_{a\in\mathcal{A}_B}
+\left\|
+\psi^{(r)}(\cdot\mid h_{<t}a)-p_t(\cdot\mid h_{<t},a)
+\right\|_{\mathrm{TV}},
+\]
+and the analogous definition of $\delta_t^{(s)}$. The bounds there are
+$\overline G_m\delta_t$ for value error and $2\overline G_m\delta_t$ for
+terminal-objective excess, so monotonicity and strictness follow immediately.
+\end{proof}
+
+\begin{corollary}[Advantage over bounded non-refresh reruns]
+\label{cor:aiqi-warmstart-self-improve-vs-restart}
+Consider a comparison procedure that reruns the same exact-$\mathcal{J}_H$
+controller for the same bounded round deadlines but always reinitializes from
+$\mathcal{D}^{(0)}$ instead of using $\mathcal{D}^{(r)}$. If for some later
+round $s$ and some revisited history $h_{<t}$,
+\[
+\sup_{a\in\mathcal{A}_B}
+\left\|
+\psi^{(s)}(\cdot\mid h_{<t}a)-p_t(\cdot\mid h_{<t},a)
+\right\|_{\mathrm{TV}}
+<
+\sup_{a\in\mathcal{A}_B}
+\left\|
+\psi^{(0)}(\cdot\mid h_{<t}a)-p_t(\cdot\mid h_{<t},a)
+\right\|_{\mathrm{TV}},
+\]
+then the trace-refresh loop has a strictly smaller local finite-horizon
+terminal-objective excess bound at $h_{<t}$ than the non-refresh rerun.
+\end{corollary}
+
+\begin{proof}
+Apply Theorem~\ref{thm:aiqi-warmstart-self-improve} with round $r=0$. The
+comparison procedure uses the same exact controller and the same objective;
+only the predictor initialization differs.
+\end{proof}
+
+\begin{remark}[Self-improvement claim]
+This is a bounded same-task self-improvement statement, not a universal
+wall-clock dominance theorem. The exact claim is: every round is a real tuning
+run on the original task, best-so-far deployable objective never worsens, and
+later reruns can have strictly tighter same-state finite-horizon bounds
+whenever accumulated real traces reduce predictor error on revisited histories.
+\end{remark}
+
+\subsection{Correspondence to Veness et al. and strict claim boundary}
+
+The finite-horizon path above is exactly the structural move used for
+$\rho$UCT consistency (Kocsis--Szepesv\'ari, 2006) as invoked by Veness et al.
+(2010): interpret histories as Markov states, then apply finite-horizon MDP
+consistency.
+The explicit planner-convergence results in this document are
+Theorem~\ref{thm:planner-convergence-mcaixi} and, for the broader set-valued
+non-unique optimal-sequence case,
+Proposition~\ref{prop:planner-convergence-optset}. The theorem's unique-path
+assumption is a stronger sufficient hypothesis, not the main informal
+takeaway; the assumptions are isolated in
+Section~\ref{sec:planner-convergence-mcaixi}.
+
+Any bounded-mixture or truncated-universal approximation used inside planner
+model classes is a search-control/modeling choice only: deployability
+predicate, evaluator semantics, incumbent key, and output definition remain
+fixed by $(B,H)$ and $\mathcal{J}_H$.
+
+The reset-augmented continuing path is the correct route when one additionally
+wants stationary/ergodic finite-state Markov structure. Under injective
+$\Psi_H$, this is the observed $n=1$ case of stationary/ergodic $n$-Markov
+analysis.
+
+Consistent with Veness et al. (2010), self-optimizing discussion for
+MC-AIXI(FAC-CTW) carries an explicit rigor caveat: FAC-CTW with KT leaves is
+not literally a countable Bayesian mixture, so the final self-optimizing claim
+is supportive but not fully rigorous in that exact implementation model.
+
+\begin{proposition}[Optimizer-invariant semantics]
+Changing only the optimizer/controller (annealed hill climbing,
+$\rho$UCT/MC-AIXI, discounted AIQI, or warm-start exact-$\mathcal{J}_H$
+AIQI-style) can change traversal/search-control dynamics, but
+cannot change candidate-validity rules, evaluator semantics, incumbent ordering
+key, or final output definition once a trajectory is fixed.
+\end{proposition}
+
+\begin{proof}
+These objects are defined independently of the optimizer transition/controller
+law; changing the optimizer changes only which candidates are visited.
+Scoring and output are then evaluated by the same fixed definitions on the
+realized trajectory.
+\end{proof}
+
+\section{Conclusion}\label{sec:conclusion}
+
+This specification defines a complete constrained tuning capability for
+\texttt{infotheory}. It formalizes a single deployable two-part objective
+$\mathcal{J}_H(z;x)=L_B(z)+C_x(z)$ with hard deployability constraints
+(throughput and memory caps),
+mutation grammar, annealed hill-climbing runtime,
+MC-AIXI and AIQI-family runtime environment paths,
+reward--observation interface, reproducibility requirements, and complexity
+profile (including planner-internal simulation budget $N_{\mathrm{sim}}$). It is implementation-guiding for runtime-selectable controller
+execution across annealed hill climbing, MC-AIXI(FAC-CTW),
+the discounted AIQI controller and the warm-start exact-$\mathcal{J}_H$
+controller, with the
+explicit objective-aligned planner reward interface via
+incumbent objective-difference reward. Finite-budget
+guarantees are non-asymptotic (Section~\ref{sec:annealed-guarantees}); the
+asymptotic theorems are assumption-conditional and out-of-budget scope:
+Theorem~\ref{thm:idealized-asymptotic-hit} for annealed idealized dynamics and
+Theorem~\ref{thm:planner-convergence-mcaixi} together with
+Proposition~\ref{prop:planner-convergence-optset} for exact objective-aligned
+undiscounted finite-horizon MC-AIXI planning, with the proposition capturing
+the broader set-valued non-unique optimal-sequence case. The planner-convergence theorem
+is specific to that MC-AIXI regime and is not a direct convergence theorem for
+runtime discounted AIQI or runtime warm-start exact-$\mathcal{J}_H$ control
+with finite simulations or exploratory/non-greedy control.
+The MC-AIXI-warm-started model-free path is exact only in the local
+finite-horizon sense above: with greedy deployment and an exact predictor, the
+current action is optimal for the horizon-$m$ terminal-incumbent objective.
+It is not the discounted AIQI theorem path; it is a new exact-$\mathcal{J}_H$
+controller inspired by AIQI's delayed-label prediction construction.
+The same exact mechanism also supports an optional bounded same-task
+trace-refresh self-improvement loop: reruns remain on the original deployable
+objective, reuse realized exact labels as teacher data, preserve monotone
+best-so-far semantics, and can strictly tighten later local finite-horizon
+bounds relative to bounded non-refresh reruns when predictor error decreases on
+revisited histories.
+
+Section~\ref{sec:restricted-mixture} adds the precise semantic layer: a
+restricted Bayesian mixture over the bounded deployable semantic class, exact
+deployable MDL/MAP equivalence with dominant-term codelength upper bound, and
+an optional truncated-universality dominance baseline under the explicit
+constant-overhead embedding assumption.
+
+\end{document}
