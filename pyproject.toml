@@ -35,7 +35,7 @@ module-name = "infotheory_rs._core"
 python-source = "python"
 profile = "python-release"
 editable-profile = "python-release"
-features = ["python-extension", "all-backends"]
+features = ["python-extension", "all-backends", "aixi-gameengine"]
 include = [
   { path = "python/infotheory_rs/**/*.py", format = ["sdist", "wheel"] },
 ]

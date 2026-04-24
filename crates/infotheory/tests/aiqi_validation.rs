@@ -3,6 +3,7 @@
 //! AIQI validation tests.
 
 use infotheory::aixi::aiqi::{AiqiAgent, AiqiConfig};
+use infotheory::aixi::common::DEFAULT_RANDOM_SEED;
 use infotheory::aixi::environment::Environment;
 mod support;
 use infotheory::aixi::model::RateBackendBitPredictor;
@@ -258,6 +259,67 @@ fn aiqi_seeded_policy_is_reproducible() {
         b.observe_transition(act_b, &obs, rew)
             .expect("transition should be accepted");
     }
+}
+
+#[test]
+fn aiqi_omitted_seed_matches_explicit_default_seed() {
+    let mut cfg_omitted = base_config();
+    cfg_omitted.random_seed = None;
+    cfg_omitted.baseline_exploration = 0.2;
+    let mut cfg_explicit = cfg_omitted.clone();
+    cfg_explicit.random_seed = Some(DEFAULT_RANDOM_SEED);
+
+    let mut a = AiqiAgent::new(cfg_omitted).expect("agent with omitted seed");
+    let mut b = AiqiAgent::new(cfg_explicit).expect("agent with explicit default seed");
+
+    assert_eq!(a.resolved_random_seed(), DEFAULT_RANDOM_SEED);
+    assert_eq!(b.resolved_random_seed(), DEFAULT_RANDOM_SEED);
+
+    for step in 0..96usize {
+        let act_a = a.get_planned_action();
+        let act_b = b.get_planned_action();
+        assert_eq!(act_a, act_b, "action mismatch at step {step}");
+
+        let obs = [((step + 1) % 2) as u64];
+        let rew = (step % 2) as i64;
+        a.observe_transition(act_a, &obs, rew)
+            .expect("transition should be accepted");
+        b.observe_transition(act_b, &obs, rew)
+            .expect("transition should be accepted");
+    }
+}
+
+#[test]
+fn aiqi_different_seeds_can_change_exploration_trace() {
+    let mut cfg_a = base_config();
+    cfg_a.baseline_exploration = 0.45;
+    cfg_a.random_seed = Some(11);
+    let mut cfg_b = cfg_a.clone();
+    cfg_b.random_seed = Some(12);
+
+    let mut a = AiqiAgent::new(cfg_a).expect("agent A");
+    let mut b = AiqiAgent::new(cfg_b).expect("agent B");
+
+    let mut diverged = false;
+    for step in 0..128usize {
+        let act_a = a.get_planned_action();
+        let act_b = b.get_planned_action();
+        if act_a != act_b {
+            diverged = true;
+            break;
+        }
+        let obs = [(step % 2) as u64];
+        let rew = ((step + 1) % 2) as i64;
+        a.observe_transition(act_a, &obs, rew)
+            .expect("transition should be accepted");
+        b.observe_transition(act_b, &obs, rew)
+            .expect("transition should be accepted");
+    }
+
+    assert!(
+        diverged,
+        "different random_seed values should be able to produce different exploratory traces"
+    );
 }
 
 #[test]

@@ -117,6 +117,7 @@ def test_agent_config_and_agent_smoke():
         reward_offset=0,
     )
     agent = ait.Agent(cfg)
+    assert agent.resolved_random_seed() == 0
     action = agent.get_planned_action([0], 0, 0)
     assert action in (0, 1)
 
@@ -139,6 +140,7 @@ def test_aiqi_config_and_agent_smoke():
         baseline_exploration=0.01,
     )
     agent = ait.AiqiAgent(cfg)
+    assert agent.resolved_random_seed() == 0
     action = agent.get_planned_action()
     assert action in (0, 1)
     agent.observe_transition(action, [0], 1)
@@ -176,6 +178,7 @@ def test_run_aiqi_with_environment_smoke():
     assert summary["learn_cycles_completed"] == 6
     assert summary["eval_cycles_completed"] == 4
     assert isinstance(summary["eval_average_reward"], float)
+    assert summary["resolved_random_seed"] == 0
 
 
 def test_run_aiqi_with_generic_rate_backend_smoke():
@@ -263,6 +266,91 @@ def test_run_mcaixi_with_generic_mixture_rate_backend_smoke():
     assert summary["learn_cycles_completed"] == 4
     assert summary["eval_cycles_completed"] == 2
     assert summary["last_action"] in (0, 1)
+    assert summary["resolved_random_seed"] == 77
+
+
+def test_run_agent_omitted_seed_matches_explicit_default_seed():
+    cfg_omitted = ait.AgentConfig(
+        algorithm="ctw",
+        ct_depth=8,
+        agent_horizon=4,
+        observation_bits=1,
+        observation_stream_len=1,
+        reward_bits=1,
+        agent_actions=2,
+        num_simulations=40,
+        min_reward=0,
+        max_reward=1,
+        reward_offset=0,
+    )
+    cfg_explicit = ait.AgentConfig(
+        algorithm="ctw",
+        ct_depth=8,
+        agent_horizon=4,
+        observation_bits=1,
+        observation_stream_len=1,
+        reward_bits=1,
+        agent_actions=2,
+        num_simulations=40,
+        min_reward=0,
+        max_reward=1,
+        reward_offset=0,
+        random_seed=0,
+    )
+
+    s1 = ait.run_agent_with_environment(ToyCtwTestEnv(), cfg_omitted, learn_cycles=24, eval_cycles=8)
+    s2 = ait.run_agent_with_environment(ToyCtwTestEnv(), cfg_explicit, learn_cycles=24, eval_cycles=8)
+
+    assert s1["resolved_random_seed"] == 0
+    assert s2["resolved_random_seed"] == 0
+    assert s1["learn_total_reward"] == s2["learn_total_reward"]
+    assert s1["eval_total_reward"] == s2["eval_total_reward"]
+    assert s1["last_action"] == s2["last_action"]
+
+
+def test_run_aiqi_omitted_seed_matches_explicit_default_seed():
+    cfg_omitted = ait.AiqiConfig(
+        algorithm="ac-ctw",
+        ct_depth=8,
+        observation_bits=1,
+        observation_stream_len=1,
+        reward_bits=1,
+        agent_actions=2,
+        min_reward=0,
+        max_reward=1,
+        reward_offset=0,
+        discount_gamma=0.99,
+        return_horizon=4,
+        return_bins=16,
+        augmentation_period=4,
+        baseline_exploration=0.2,
+    )
+    cfg_explicit = ait.AiqiConfig(
+        algorithm="ac-ctw",
+        ct_depth=8,
+        observation_bits=1,
+        observation_stream_len=1,
+        reward_bits=1,
+        agent_actions=2,
+        min_reward=0,
+        max_reward=1,
+        reward_offset=0,
+        discount_gamma=0.99,
+        return_horizon=4,
+        return_bins=16,
+        augmentation_period=4,
+        baseline_exploration=0.2,
+        random_seed=0,
+    )
+
+    s1 = ait.run_aiqi_with_environment(ToyCtwTestEnv(), cfg_omitted, learn_cycles=24, eval_cycles=8)
+    s2 = ait.run_aiqi_with_environment(ToyCtwTestEnv(), cfg_explicit, learn_cycles=24, eval_cycles=8)
+
+    assert s1["resolved_random_seed"] == 0
+    assert s2["resolved_random_seed"] == 0
+    assert s1["learn_total_reward"] == s2["learn_total_reward"]
+    assert s1["eval_total_reward"] == s2["eval_total_reward"]
+    assert s1["last_action"] == s2["last_action"]
 
 
 def test_aiqi_rejects_zpaq_algorithm_in_strict_mode():

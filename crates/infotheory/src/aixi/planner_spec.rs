@@ -1,6 +1,6 @@
 //! Shared planner-run spec builder utilities for AIXI/AIQI controllers.
 
-use crate::aixi::common::ObservationKeyMode;
+use crate::aixi::common::{ObservationKeyMode, resolve_random_seed};
 use crate::spec::{
     BuiltinEnvironmentSpec, ControllerSpec, EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec,
     PlannerRuntimeSpec,
@@ -53,7 +53,7 @@ pub(crate) fn build_default_planner_run_spec(
         interface: interface.into_spec(),
         controller,
         runtime: PlannerRuntimeSpec {
-            random_seed,
+            random_seed: Some(resolve_random_seed(random_seed)),
             learn_cycles: None,
             eval_cycles: None,
             terminate_lifetime: 1,

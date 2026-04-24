@@ -1,7 +1,7 @@
 //! Tests for canonical top-level specification documents.
 
 use super::*;
-use crate::aixi::common::ObservationKeyMode;
+use crate::aixi::common::{DEFAULT_RANDOM_SEED, ObservationKeyMode};
 #[cfg(feature = "backend-ctw")]
 use crate::api::CompressionBackend;
 use crate::api::RateBackend;
@@ -174,6 +174,54 @@ fn planner_run_binary_roundtrip_is_stable() {
         }
         _ => panic!("expected planner run document"),
     }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn planner_run_omitted_runtime_seed_canonicalizes_to_default_seed() {
+    let mut spec = sample_planner_run();
+    spec.runtime.random_seed = None;
+
+    let compiled = spec.compile().expect("compile");
+    assert_eq!(
+        compiled.runtime().random_seed,
+        Some(DEFAULT_RANDOM_SEED),
+        "runtime.random_seed should canonicalize to deterministic default",
+    );
+    assert_eq!(
+        compiled.canonical_spec().runtime.random_seed,
+        Some(DEFAULT_RANDOM_SEED),
+        "canonical spec should preserve the resolved default seed",
+    );
+
+    let canonical_value = compiled
+        .canonical_spec()
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    assert_eq!(
+        canonical_value["runtime"]["random_seed"],
+        serde_json::Value::from(DEFAULT_RANDOM_SEED),
+        "canonical JSON should expose resolved runtime.random_seed",
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn planner_run_resolved_seed_survives_binary_roundtrip() {
+    let mut spec = sample_planner_run();
+    spec.runtime.random_seed = None;
+
+    let compiled = spec.compile().expect("compile");
+    let bytes = SpecDocument::PlannerRun(compiled.canonical_spec().clone()).to_binary();
+    let parsed = SpecDocument::from_binary(&bytes, Path::new(".")).expect("from binary");
+    let SpecDocument::PlannerRun(roundtripped) = parsed else {
+        panic!("expected planner_run document");
+    };
+    let roundtripped_compiled = roundtripped.compile().expect("recompile");
+    assert_eq!(
+        roundtripped_compiled.runtime().random_seed,
+        Some(DEFAULT_RANDOM_SEED),
+    );
 }
 
 #[cfg(feature = "backend-ctw")]

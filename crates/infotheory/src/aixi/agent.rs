@@ -5,7 +5,7 @@
 
 use crate::aixi::common::{
     Action, ObservationKeyMode, PerceptVal, RandomGenerator, Reward, decode, encode,
-    observation_repr_from_stream, validate_reward_encoding_bounds,
+    observation_repr_from_stream, resolve_random_seed, validate_reward_encoding_bounds,
 };
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
 use crate::aixi::model::{Predictor, build_mc_aixi_predictor};
@@ -54,7 +54,7 @@ pub struct AgentConfig {
     pub reward_offset: Reward,
     /// Optional deterministic RNG seed for planning/simulation behavior.
     ///
-    /// When `None`, a fresh runtime-derived seed is used.
+    /// When `None`, planner runtime canonicalizes this to seed `0`.
     pub random_seed: Option<u64>,
     /// Optional generic rate backend override.
     ///
@@ -304,7 +304,7 @@ struct AgentRuntimeConfig {
     min_reward: Reward,
     max_reward: Reward,
     reward_offset: Reward,
-    random_seed: Option<u64>,
+    random_seed: u64,
 }
 
 impl AgentRuntimeConfig {
@@ -345,7 +345,7 @@ impl AgentRuntimeConfig {
             min_reward: interface.min_reward,
             max_reward: interface.max_reward,
             reward_offset: interface.reward_offset,
-            random_seed: runtime.random_seed,
+            random_seed: resolve_random_seed(runtime.random_seed),
         })
     }
 }
@@ -421,11 +421,7 @@ impl Agent {
             + compiled.interface().reward_bits;
         let model = build_mc_aixi_predictor(predictor, predictor_max_order, percept_bits)?;
 
-        let rng = if let Some(seed) = config.random_seed {
-            RandomGenerator::from_seed(seed)
-        } else {
-            RandomGenerator::new()
-        };
+        let rng = RandomGenerator::from_seed(config.random_seed);
 
         Ok(Self {
             model,
@@ -458,6 +454,11 @@ impl Agent {
     pub fn reset(&mut self) {
         self.age = 0;
         self.total_reward = 0.0;
+    }
+
+    /// Returns the resolved deterministic seed used by this agent.
+    pub fn resolved_random_seed(&self) -> u64 {
+        self.config.random_seed
     }
 
     /// Primary interface for decision making.
@@ -743,7 +744,7 @@ mod tests {
             min_reward: -2,
             max_reward: 3,
             reward_offset: 2,
-            random_seed: Some(7),
+            random_seed: 7,
         }
     }
 

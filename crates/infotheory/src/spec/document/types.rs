@@ -385,6 +385,8 @@ pub enum ControllerSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlannerRuntimeSpec {
     /// Seed used for planner/environment stochasticity.
+    ///
+    /// `None` canonicalizes to `Some(0)` during validation/compilation.
     pub random_seed: Option<u64>,
     /// Number of learning cycles.
     pub learn_cycles: Option<usize>,

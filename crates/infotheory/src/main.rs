@@ -33,7 +33,7 @@ mod cli;
 
 use infotheory::aixi::agent::Agent;
 use infotheory::aixi::aiqi::AiqiAgent;
-use infotheory::aixi::common::RandomGenerator;
+use infotheory::aixi::common::{EXPLORE_RANDOM_SALT, RandomGenerator, resolve_random_seed};
 use infotheory::aixi::environment::Environment;
 #[cfg(feature = "aixi-gameengine")]
 use infotheory::aixi::gameengine::build_builtin_environment as build_gameengine_builtin_environment;
@@ -456,11 +456,9 @@ impl PlannerControllerRuntime {
             CompiledPlannerController::McAixi { .. } => {
                 let agent =
                     Agent::from_compiled_planner_run(compiled).map_err(anyhow::Error::msg)?;
-                let explore_rng = if let Some(seed) = compiled.runtime().random_seed {
-                    RandomGenerator::from_seed(seed).fork_with(0x4558_504c_4f52_455f)
-                } else {
-                    RandomGenerator::new()
-                };
+                let explore_rng =
+                    RandomGenerator::from_seed(resolve_random_seed(compiled.runtime().random_seed))
+                        .fork_with(EXPLORE_RANDOM_SALT);
                 Ok(Self::McAixi {
                     agent,
                     prev_action: 0,
@@ -677,9 +675,7 @@ fn run_compiled_planner_run(
     let schedule = PlannerRunSchedule::from_runtime(compiled.runtime());
     let mut controller = PlannerControllerRuntime::from_compiled(compiled)?;
     let (mut env, env_name) = build_planner_environment(compiled)?;
-    if let Some(seed) = compiled.runtime().random_seed {
-        env.set_random_seed(seed);
-    }
+    env.set_random_seed(resolve_random_seed(compiled.runtime().random_seed));
     validate_action_alphabet(compiled, env.as_ref())?;
     let mut ctx = PlannerExecutionContext::new(compiled, env, cli_overlay)?;
 

@@ -1471,7 +1471,7 @@ impl NyxVmEnvironment {
                 let seed = fuzz.seeds[0].clone();
                 Some(FuzzState {
                     current: seed,
-                    rng: RandomGenerator::new().fork_with(fuzz.rng_seed),
+                    rng: RandomGenerator::from_seed(fuzz.rng_seed),
                 })
             }
             NyxActionSource::Literal(actions) => {
@@ -2550,6 +2550,54 @@ mod tests {
 
         assert_eq!(utf8.decode("test").unwrap(), data);
         assert_eq!(hex.decode("74657374").unwrap(), data);
+    }
+
+    fn fuzz_cfg_with_seed(rng_seed: u64) -> NyxFuzzConfig {
+        NyxFuzzConfig {
+            seeds: vec![b"seed-alpha".to_vec(), b"seed-beta".to_vec()],
+            mutators: vec![
+                FuzzMutator::FlipBit,
+                FuzzMutator::FlipByte,
+                FuzzMutator::InsertByte,
+                FuzzMutator::DeleteByte,
+                FuzzMutator::SpliceSeed,
+                FuzzMutator::ResetSeed,
+                FuzzMutator::Havoc,
+            ],
+            min_len: 1,
+            max_len: 32,
+            dictionary: vec![b"DICT".to_vec(), b"TOK".to_vec()],
+            rng_seed,
+        }
+    }
+
+    fn fuzz_payload_sequence(config: &NyxFuzzConfig, steps: usize) -> Vec<Vec<u8>> {
+        let mut current = config.seeds[0].clone();
+        let mut rng = RandomGenerator::from_seed(config.rng_seed);
+        let mut out = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let mut input = current.clone();
+            let idx = rng.gen_range(config.mutators.len());
+            let mutator = &config.mutators[idx];
+            apply_mutator(mutator, &mut input, config, &mut rng);
+            current = input.clone();
+            out.push(input);
+        }
+        out
+    }
+
+    #[test]
+    fn fuzz_mutation_sequence_is_reproducible_for_identical_rng_seed() {
+        let a = fuzz_payload_sequence(&fuzz_cfg_with_seed(77), 64);
+        let b = fuzz_payload_sequence(&fuzz_cfg_with_seed(77), 64);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fuzz_mutation_sequence_changes_for_different_rng_seed() {
+        let a = fuzz_payload_sequence(&fuzz_cfg_with_seed(77), 64);
+        let b = fuzz_payload_sequence(&fuzz_cfg_with_seed(78), 64);
+        assert_ne!(a, b);
     }
 
     #[cfg(feature = "vm")]

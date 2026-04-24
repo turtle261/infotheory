@@ -12,6 +12,18 @@ pub type Action = u64;
 /// Represents a reward received by the agent from the environment.
 pub type Reward = i64;
 
+/// Shared default seed for deterministic AIXI/AIQI planner-runtime behavior.
+pub const DEFAULT_RANDOM_SEED: u64 = 0;
+
+/// Salt used to derive exploration RNG streams from the planner seed.
+pub const EXPLORE_RANDOM_SALT: u64 = 0x4558_504c_4f52_455f;
+
+/// Resolve an optional planner/runtime seed to the canonical deterministic seed.
+#[inline]
+pub fn resolve_random_seed(seed: Option<u64>) -> u64 {
+    seed.unwrap_or(DEFAULT_RANDOM_SEED)
+}
+
 /// A generic value for a percept component (either an observation or a reward).
 pub type PerceptVal = u64;
 
@@ -166,11 +178,17 @@ impl RandomGenerator {
         0xCAFEBABEDEADBEEF
     }
 
-    /// Creates a new `RandomGenerator` with a fresh seed.
+    /// Creates a new `RandomGenerator` with the canonical deterministic seed.
     pub fn new() -> Self {
-        let seed = Self::initial_seed();
-        let state = if seed == 0 { 0xCAFEBABEDEADBEEF } else { seed };
-        Self { state }
+        Self::from_seed(DEFAULT_RANDOM_SEED)
+    }
+
+    /// Creates a new `RandomGenerator` from runtime entropy.
+    ///
+    /// This is an explicit opt-in escape hatch for callers that need
+    /// non-deterministic sampling.
+    pub fn from_entropy() -> Self {
+        Self::from_seed(Self::initial_seed())
     }
 
     /// Creates a new `RandomGenerator` from an explicit seed.
@@ -374,5 +392,37 @@ mod tests {
     fn validate_reward_encoding_bounds_rejects_unrepresentable_ranges() {
         let err = validate_reward_encoding_bounds(0, 100, 0, 1).expect_err("must fail");
         assert!(err.contains("reward_bits too small"), "{err}");
+    }
+
+    #[test]
+    fn random_generator_default_is_deterministic_seed_zero() {
+        let mut via_new = RandomGenerator::new();
+        let mut via_seed = RandomGenerator::from_seed(DEFAULT_RANDOM_SEED);
+        for _ in 0..32 {
+            assert_eq!(via_new.next_u64(), via_seed.next_u64());
+        }
+    }
+
+    #[test]
+    fn random_generator_fork_with_is_stable() {
+        let base = RandomGenerator::from_seed(17);
+        let mut a = base.fork_with(99);
+        let mut b = base.fork_with(99);
+        for _ in 0..32 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn random_generator_entropy_is_explicit_opt_in() {
+        let mut deterministic = RandomGenerator::new();
+        let mut explicit = RandomGenerator::from_seed(DEFAULT_RANDOM_SEED);
+        for _ in 0..16 {
+            assert_eq!(deterministic.next_u64(), explicit.next_u64());
+        }
+
+        // Entropy path should be callable explicitly and produce a valid stream.
+        let mut entropy_rng = RandomGenerator::from_entropy();
+        let _ = entropy_rng.next_u64();
     }
 }

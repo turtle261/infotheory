@@ -2460,6 +2460,13 @@ impl PyRandomGenerator {
             inner: infotheory::aixi::common::RandomGenerator::new(),
         }
     }
+
+    #[staticmethod]
+    fn from_entropy() -> Self {
+        Self {
+            inner: infotheory::aixi::common::RandomGenerator::from_entropy(),
+        }
+    }
     fn next_u64(&mut self) -> u64 {
         self.inner.next_u64()
     }
@@ -3253,6 +3260,7 @@ fn validate_observation_stream_len(expected: usize, actual: usize) -> PyResult<(
 }
 
 struct AixiRunSummary {
+    resolved_random_seed: u64,
     learn_total_reward: i64,
     eval_total_reward: i64,
     eval_average_reward: f64,
@@ -3311,13 +3319,14 @@ fn run_agent_with_environment<'py>(
     let summary = py.detach(|| {
         py_try(|| {
             use infotheory::aixi::agent::Agent;
-            use infotheory::aixi::common::RandomGenerator;
+            use infotheory::aixi::common::{
+                EXPLORE_RANDOM_SALT, RandomGenerator, resolve_random_seed,
+            };
             use infotheory::aixi::environment::Environment;
 
             let mut env = PyEnvironmentShim::new(environment);
-            if let Some(seed) = config.inner.random_seed {
-                env.set_random_seed(seed);
-            }
+            let resolved_seed = resolve_random_seed(config.inner.random_seed);
+            env.set_random_seed(resolved_seed);
             let mut agent = Agent::try_new(config.inner.clone()).map_err(PyValueError::new_err)?;
 
             let observation_stream_len = config.inner.observation_stream_len.max(1);
@@ -3334,11 +3343,8 @@ fn run_agent_with_environment<'py>(
             let mut obs_stream = env.drain_observations();
             validate_observation_stream_len(observation_stream_len, obs_stream.len())?;
             let mut reward = env.get_reward();
-            let mut explore_rng = if let Some(seed) = config.inner.random_seed {
-                RandomGenerator::from_seed(seed).fork_with(0x4558504c4f52455f)
-            } else {
-                RandomGenerator::new()
-            };
+            let mut explore_rng =
+                RandomGenerator::from_seed(resolved_seed).fork_with(EXPLORE_RANDOM_SALT);
 
             let learn_start = Instant::now();
             let mut learn_cycles_completed = 0usize;
@@ -3417,6 +3423,7 @@ fn run_agent_with_environment<'py>(
             };
 
             Ok(AixiRunSummary {
+                resolved_random_seed: agent.resolved_random_seed(),
                 learn_total_reward,
                 eval_total_reward,
                 eval_average_reward,
@@ -3434,6 +3441,7 @@ fn run_agent_with_environment<'py>(
     })?;
 
     let out = PyDict::new(py);
+    out.set_item("resolved_random_seed", summary.resolved_random_seed)?;
     out.set_item("learn_total_reward", summary.learn_total_reward)?;
     out.set_item("eval_total_reward", summary.eval_total_reward)?;
     out.set_item("eval_average_reward", summary.eval_average_reward)?;
@@ -3485,12 +3493,12 @@ fn run_aiqi_with_environment<'py>(
     let summary = py.detach(|| {
         py_try(|| {
             use infotheory::aixi::aiqi::AiqiAgent;
+            use infotheory::aixi::common::resolve_random_seed;
             use infotheory::aixi::environment::Environment;
 
             let mut env = PyEnvironmentShim::new(environment);
-            if let Some(seed) = config.inner.random_seed {
-                env.set_random_seed(seed);
-            }
+            let resolved_seed = resolve_random_seed(config.inner.random_seed);
+            env.set_random_seed(resolved_seed);
             let mut agent = AiqiAgent::new(config.inner.clone()).map_err(PyValueError::new_err)?;
 
             let observation_stream_len = config.inner.observation_stream_len.max(1);
@@ -3583,6 +3591,7 @@ fn run_aiqi_with_environment<'py>(
             };
 
             Ok(AixiRunSummary {
+                resolved_random_seed: agent.resolved_random_seed(),
                 learn_total_reward,
                 eval_total_reward,
                 eval_average_reward,
@@ -3600,6 +3609,7 @@ fn run_aiqi_with_environment<'py>(
     })?;
 
     let out = PyDict::new(py);
+    out.set_item("resolved_random_seed", summary.resolved_random_seed)?;
     out.set_item("learn_total_reward", summary.learn_total_reward)?;
     out.set_item("eval_total_reward", summary.eval_total_reward)?;
     out.set_item("eval_average_reward", summary.eval_average_reward)?;
@@ -3894,6 +3904,10 @@ impl PyAgent {
     fn model_update_action_external(&mut self, action: u64) {
         self.inner.model_update_action_external(action)
     }
+
+    fn resolved_random_seed(&self) -> u64 {
+        self.inner.resolved_random_seed()
+    }
 }
 
 #[pyclass(name = "AiqiAgent", unsendable)]
@@ -3939,6 +3953,10 @@ impl PyAiqiAgent {
         self.inner
             .observe_transition(action, &observations, reward)
             .map_err(PyValueError::new_err)
+    }
+
+    fn resolved_random_seed(&self) -> u64 {
+        self.inner.resolved_random_seed()
     }
 }
 
@@ -4232,11 +4250,10 @@ fn new_gameengine_builtin(
     builtin: infotheory::spec::BuiltinEnvironmentSpec,
     random_seed: Option<u64>,
 ) -> PyResult<Box<dyn infotheory::aixi::environment::Environment>> {
-    let mut env = infotheory::aixi::gameengine::build_builtin_environment(builtin)
-        .map_err(PyRuntimeError::new_err)?;
-    if let Some(seed) = random_seed {
-        env.set_random_seed(seed);
-    }
+    let resolved_seed = infotheory::aixi::common::resolve_random_seed(random_seed);
+    let env =
+        infotheory::aixi::gameengine::build_builtin_environment_with_seed(builtin, resolved_seed)
+            .map_err(PyRuntimeError::new_err)?;
     Ok(env)
 }
 
@@ -4395,38 +4412,38 @@ impl CoinFlipEnv {
     }
 }
 
+#[cfg(feature = "aixi-gameengine")]
 define_gameengine_env_class!(
-    #[cfg(feature = "aixi-gameengine")]
     BiasedRockPaperScissorEnv,
     "BiasedRockPaperScissorEnv",
     infotheory::spec::BuiltinEnvironmentSpec::BiasedRockPaperScissor
 );
+#[cfg(feature = "aixi-gameengine")]
 define_gameengine_env_class!(
-    #[cfg(feature = "aixi-gameengine")]
     KuhnPokerEnv,
     "KuhnPokerEnv",
     infotheory::spec::BuiltinEnvironmentSpec::KuhnPoker
 );
+#[cfg(feature = "aixi-gameengine")]
 define_gameengine_env_class!(
-    #[cfg(feature = "aixi-gameengine")]
     ExtendedTigerEnv,
     "ExtendedTigerEnv",
     infotheory::spec::BuiltinEnvironmentSpec::ExtendedTiger
 );
+#[cfg(feature = "aixi-gameengine")]
 define_gameengine_env_class!(
-    #[cfg(feature = "aixi-gameengine")]
     TicTacToeEnv,
     "TicTacToeEnv",
     infotheory::spec::BuiltinEnvironmentSpec::TicTacToe
 );
+#[cfg(feature = "aixi-gameengine")]
 define_gameengine_env_class!(
-    #[cfg(feature = "aixi-gameengine")]
     BlackjackEnv,
     "BlackjackEnv",
     infotheory::spec::BuiltinEnvironmentSpec::Blackjack
 );
+#[cfg(feature = "aixi-gameengine-physics")]
 define_gameengine_env_class!(
-    #[cfg(feature = "aixi-gameengine-physics")]
     PlatformerEnv,
     "PlatformerEnv",
     infotheory::spec::BuiltinEnvironmentSpec::Platformer

@@ -8,7 +8,7 @@
 //! returns at indices `i % N == phase`.
 
 use crate::aixi::common::{
-    Action, PerceptVal, RandomGenerator, Reward, bits_for_cardinality,
+    Action, PerceptVal, RandomGenerator, Reward, bits_for_cardinality, resolve_random_seed,
     validate_reward_encoding_bounds,
 };
 use crate::aixi::model::{Predictor, build_aiqi_predictor};
@@ -70,7 +70,7 @@ pub struct AiqiConfig {
     pub baseline_exploration: f64,
     /// Optional deterministic RNG seed for action selection/exploration.
     ///
-    /// When `None`, a fresh runtime-derived seed is used.
+    /// When `None`, planner runtime canonicalizes this to seed `0`.
     pub random_seed: Option<u64>,
     /// Optional generic rate backend.
     ///
@@ -272,7 +272,7 @@ struct AiqiRuntimeConfig {
     augmentation_period: usize,
     history_prune_keep_steps: Option<usize>,
     baseline_exploration: f64,
-    random_seed: Option<u64>,
+    random_seed: u64,
 }
 
 impl AiqiRuntimeConfig {
@@ -325,7 +325,7 @@ impl AiqiRuntimeConfig {
             augmentation_period,
             history_prune_keep_steps,
             baseline_exploration,
-            random_seed: runtime.random_seed,
+            random_seed: resolve_random_seed(runtime.random_seed),
         })
     }
 }
@@ -417,11 +417,7 @@ impl AiqiAgent {
             });
         }
 
-        let rng = if let Some(seed) = config.random_seed {
-            RandomGenerator::from_seed(seed)
-        } else {
-            RandomGenerator::new()
-        };
+        let rng = RandomGenerator::from_seed(config.random_seed);
 
         Ok(Self {
             action_bits,
@@ -446,6 +442,11 @@ impl AiqiAgent {
     /// Returns the configured number of actions.
     pub fn num_actions(&self) -> usize {
         self.config.agent_actions
+    }
+
+    /// Returns the resolved deterministic seed used by this AIQI agent.
+    pub fn resolved_random_seed(&self) -> u64 {
+        self.config.random_seed
     }
 
     /// Select the next action from the current history.

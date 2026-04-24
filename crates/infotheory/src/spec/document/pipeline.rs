@@ -7,7 +7,9 @@ use super::{
     TUNE_CANONICALIZATION_CLASSIFICATION_VERSION, TuneBoundsSpec, TuneControllerSpec, TuneSpec,
     ValidatedPlannerRunSpec, ValidatedTuneSpec,
 };
-use crate::aixi::common::{bits_for_cardinality, validate_reward_encoding_bounds};
+use crate::aixi::common::{
+    bits_for_cardinality, resolve_random_seed, validate_reward_encoding_bounds,
+};
 use crate::spec::core::AssetRef;
 use std::collections::HashMap;
 use std::path::Path;
@@ -516,7 +518,9 @@ fn canonicalize_runtime_spec(spec: &PlannerRuntimeSpec) -> SpecResult<PlannerRun
     if spec.explore_gamma <= 0.0 {
         return Err(SpecError::new("explore_gamma must be > 0"));
     }
-    Ok(spec.clone())
+    let mut canonical = spec.clone();
+    canonical.random_seed = Some(resolve_random_seed(spec.random_seed));
+    Ok(canonical)
 }
 
 fn validate_tune_bounds(bounds: &TuneBoundsSpec) -> SpecResult<()> {

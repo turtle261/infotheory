@@ -3,6 +3,7 @@
 //! This adapter is behind the `aixi-gameengine` feature and keeps core AIXI
 //! independent from bundled environments.
 
+use crate::aixi::common::DEFAULT_RANDOM_SEED;
 use crate::aixi::common::{Action, PerceptVal, Reward};
 use crate::aixi::environment::Environment;
 use crate::spec::BuiltinEnvironmentSpec;
@@ -14,8 +15,6 @@ use gameengine::builtin::{
     KuhnPoker, TicTacToe,
 };
 use gameengine::{ActionToken, AixiEnvironment as GameEngineAixiEnvironment, DefaultEnvironment};
-
-const DEFAULT_GAMEENGINE_SEED: u64 = 0;
 
 /// Generic adapter from a GameEngine AIXI environment to Infotheory's AIXI trait.
 pub struct GameEngineEnvironment<E, const MAX_WORDS: usize>
@@ -204,85 +203,65 @@ pub fn build_coin_flip_environment(
 pub fn build_builtin_environment(
     builtin: BuiltinEnvironmentSpec,
 ) -> Result<Box<dyn Environment>, String> {
+    build_builtin_environment_with_seed(builtin, DEFAULT_RANDOM_SEED)
+}
+
+/// Builds a boxed AIXI environment from the canonical builtin enum and explicit seed.
+pub fn build_builtin_environment_with_seed(
+    builtin: BuiltinEnvironmentSpec,
+    seed: u64,
+) -> Result<Box<dyn Environment>, String> {
     match builtin {
-        BuiltinEnvironmentSpec::CoinFlip => build_coin_flip_environment_from_config(
-            BiasedCoinFlipConfig::default(),
-            DEFAULT_GAMEENGINE_SEED,
-        ),
+        BuiltinEnvironmentSpec::CoinFlip => {
+            build_coin_flip_environment_from_config(BiasedCoinFlipConfig::default(), seed)
+        }
         BuiltinEnvironmentSpec::BiasedRockPaperScissor => {
             let game = BiasedRockPaperScissor;
             let spec = game.compact_spec();
-            let env = DefaultEnvironment::<BiasedRockPaperScissor, 1>::new_for_agent(
-                game,
-                DEFAULT_GAMEENGINE_SEED,
-                0,
-            );
+            let env = DefaultEnvironment::<BiasedRockPaperScissor, 1>::new_for_agent(game, seed, 0);
             Ok(Box::new(BiasedRpsEnvironment::from_environment(
-                env,
-                spec,
-                DEFAULT_GAMEENGINE_SEED,
+                env, spec, seed,
             )?))
         }
         BuiltinEnvironmentSpec::KuhnPoker => {
             let game = KuhnPoker;
             let spec = game.compact_spec();
-            let env =
-                DefaultEnvironment::<KuhnPoker, 1>::new_for_agent(game, DEFAULT_GAMEENGINE_SEED, 0);
+            let env = DefaultEnvironment::<KuhnPoker, 1>::new_for_agent(game, seed, 0);
             Ok(Box::new(KuhnPokerEnvironment::from_environment(
-                env,
-                spec,
-                DEFAULT_GAMEENGINE_SEED,
+                env, spec, seed,
             )?))
         }
         BuiltinEnvironmentSpec::ExtendedTiger => {
             let game = ExtendedTiger;
             let spec = game.compact_spec();
-            let env = DefaultEnvironment::<ExtendedTiger, 1>::new_for_agent(
-                game,
-                DEFAULT_GAMEENGINE_SEED,
-                0,
-            );
+            let env = DefaultEnvironment::<ExtendedTiger, 1>::new_for_agent(game, seed, 0);
             Ok(Box::new(ExtendedTigerEnvironment::from_environment(
-                env,
-                spec,
-                DEFAULT_GAMEENGINE_SEED,
+                env, spec, seed,
             )?))
         }
         BuiltinEnvironmentSpec::TicTacToe => {
             let game = TicTacToe;
             let spec = game.compact_spec();
-            let env =
-                DefaultEnvironment::<TicTacToe, 1>::new_for_agent(game, DEFAULT_GAMEENGINE_SEED, 0);
+            let env = DefaultEnvironment::<TicTacToe, 1>::new_for_agent(game, seed, 0);
             Ok(Box::new(TicTacToeEnvironment::from_environment(
-                env,
-                spec,
-                DEFAULT_GAMEENGINE_SEED,
+                env, spec, seed,
             )?))
         }
         BuiltinEnvironmentSpec::Blackjack => {
             let game = Blackjack;
             let spec = game.compact_spec();
-            let env =
-                DefaultEnvironment::<Blackjack, 4>::new_for_agent(game, DEFAULT_GAMEENGINE_SEED, 0);
+            let env = DefaultEnvironment::<Blackjack, 4>::new_for_agent(game, seed, 0);
             Ok(Box::new(BlackjackEnvironment::from_environment(
-                env,
-                spec,
-                DEFAULT_GAMEENGINE_SEED,
+                env, spec, seed,
             )?))
         }
         #[cfg(feature = "aixi-gameengine-physics")]
         BuiltinEnvironmentSpec::Platformer => {
             let game = Platformer::default();
             let spec = game.compact_spec();
-            let env = DefaultEnvironment::<Platformer, 1>::new_for_agent(
-                game,
-                DEFAULT_GAMEENGINE_SEED,
-                0,
-            );
+            let env = DefaultEnvironment::<Platformer, 1>::new_for_agent(game, seed, 0);
             Ok(Box::new(PlatformerEnvironment::from_environment(
-                env,
-                spec,
-                DEFAULT_GAMEENGINE_SEED,
+                env, spec, seed,
             )?))
         }
         #[cfg(not(feature = "aixi-gameengine-physics"))]
@@ -324,5 +303,24 @@ mod tests {
             .err()
             .expect("zero denominator must fail");
         assert!(err.contains("invalid coin-flip bias"));
+    }
+
+    #[test]
+    fn default_builtin_environment_matches_explicit_default_seed() {
+        let mut implicit =
+            build_builtin_environment(BuiltinEnvironmentSpec::CoinFlip).expect("builtin env");
+        let mut explicit = build_builtin_environment_with_seed(BuiltinEnvironmentSpec::CoinFlip, 0)
+            .expect("seeded builtin env");
+
+        let mut implicit_trace = Vec::new();
+        let mut explicit_trace = Vec::new();
+        for &action in &[0u64, 1, 1, 0, 1, 0, 0, 1] {
+            implicit.perform_action(action);
+            explicit.perform_action(action);
+            implicit_trace.push((implicit.get_observation(), implicit.get_reward()));
+            explicit_trace.push((explicit.get_observation(), explicit.get_reward()));
+        }
+
+        assert_eq!(implicit_trace, explicit_trace);
     }
 }

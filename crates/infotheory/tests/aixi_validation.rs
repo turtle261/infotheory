@@ -5,7 +5,7 @@
 //! Tests for predictors, environments, and agents.
 
 use infotheory::aixi::agent::{Agent, AgentConfig};
-use infotheory::aixi::common::{Action, ObservationKeyMode};
+use infotheory::aixi::common::{Action, DEFAULT_RANDOM_SEED, ObservationKeyMode};
 use infotheory::aixi::environment::Environment;
 mod support;
 use infotheory::aixi::model::{CtwPredictor, Predictor, RateBackendBitPredictor, RosaPredictor};
@@ -533,6 +533,77 @@ fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
         prev_a = act_a;
         prev_b = act_b;
     }
+}
+
+#[test]
+fn agent_omitted_seed_matches_explicit_default_seed() {
+    let mut cfg_omitted = generic_agent_config(RateBackend::Ctw { depth: 8 });
+    cfg_omitted.random_seed = None;
+    let mut cfg_explicit = cfg_omitted.clone();
+    cfg_explicit.random_seed = Some(DEFAULT_RANDOM_SEED);
+
+    let mut a = Agent::try_new(cfg_omitted).expect("agent with omitted seed");
+    let mut b = Agent::try_new(cfg_explicit).expect("agent with explicit default seed");
+
+    assert_eq!(a.resolved_random_seed(), DEFAULT_RANDOM_SEED);
+    assert_eq!(b.resolved_random_seed(), DEFAULT_RANDOM_SEED);
+
+    let mut env_a = DeterministicBinaryEnv::new();
+    let mut env_b = DeterministicBinaryEnv::new();
+
+    let mut obs_a = env_a.drain_observations();
+    let mut obs_b = env_b.drain_observations();
+    let mut rew_a = env_a.get_reward();
+    let mut rew_b = env_b.get_reward();
+    let mut prev_a = 0u64;
+    let mut prev_b = 0u64;
+
+    for step in 0..64usize {
+        a.model_update_percept_stream(&obs_a, rew_a);
+        b.model_update_percept_stream(&obs_b, rew_b);
+
+        let act_a = a.get_planned_action(&obs_a, rew_a, prev_a);
+        let act_b = b.get_planned_action(&obs_b, rew_b, prev_b);
+        assert_eq!(act_a, act_b, "action mismatch at step {step}");
+
+        a.model_update_action_external(act_a);
+        b.model_update_action_external(act_b);
+
+        env_a.perform_action(act_a);
+        env_b.perform_action(act_b);
+        obs_a = env_a.drain_observations();
+        obs_b = env_b.drain_observations();
+        rew_a = env_a.get_reward();
+        rew_b = env_b.get_reward();
+        prev_a = act_a;
+        prev_b = act_b;
+    }
+}
+
+#[test]
+fn agent_different_seeds_can_change_stochastic_trace() {
+    let mut seed_pair = None;
+    for left in 1u64..256 {
+        let left_draw = infotheory::aixi::common::RandomGenerator::from_seed(left).gen_range(2);
+        for right in (left + 1)..256 {
+            let right_draw =
+                infotheory::aixi::common::RandomGenerator::from_seed(right).gen_range(2);
+            if left_draw != right_draw {
+                seed_pair = Some((left, right, left_draw, right_draw));
+                break;
+            }
+        }
+        if seed_pair.is_some() {
+            break;
+        }
+    }
+    let (left_seed, right_seed, left_draw, right_draw) =
+        seed_pair.expect("expected to find a seed pair with different first draws");
+    assert_ne!(left_draw, right_draw);
+
+    let mut left_rng = infotheory::aixi::common::RandomGenerator::from_seed(left_seed);
+    let mut right_rng = infotheory::aixi::common::RandomGenerator::from_seed(right_seed);
+    assert_ne!(left_rng.gen_range(2), right_rng.gen_range(2));
 }
 
 #[test]

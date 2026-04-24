@@ -556,8 +556,7 @@ impl SearchTree {
         self.prune_tree(agent, prev_obs_stream, prev_rew, prev_act);
 
         let h = agent.horizon();
-        let threads = rayon::current_num_threads().max(1);
-        if samples < 2 || threads < 2 {
+        if samples < 2 {
             let root = self.root.as_mut().unwrap();
             for _ in 0..samples {
                 agent.begin_simulation();
@@ -566,23 +565,27 @@ impl SearchTree {
             return root.best_action(agent);
         }
 
-        let workers = threads.min(samples);
-        let base = samples / workers;
-        let extra = samples % workers;
-        let mut agents = Vec::with_capacity(workers);
-        for i in 0..workers {
-            let seed = agent.gen_f64().to_bits() ^ (i as u64);
-            agents.push(agent.boxed_clone_with_seed(seed));
+        // Use a fixed logical shard schedule so outcomes do not depend on
+        // Rayon worker count.
+        let shard_count = samples.min(32);
+        let base_iterations = samples / shard_count;
+        let extra_iterations = samples % shard_count;
+        let planner_seed = agent.gen_f64().to_bits();
+
+        let mut shards = Vec::with_capacity(shard_count);
+        for shard_index in 0..shard_count {
+            let iterations = base_iterations + usize::from(shard_index < extra_iterations);
+            let shard_seed =
+                planner_seed ^ ((shard_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            shards.push((iterations, agent.boxed_clone_with_seed(shard_seed)));
         }
 
         let results: Vec<SearchNode> = {
             let snapshot = self.root.as_ref().expect("search tree root");
-            agents
+            shards
                 .into_par_iter()
-                .enumerate()
-                .map(|(i, mut local_agent)| {
+                .map(|(iterations, mut local_agent)| {
                     let mut local_root = SearchNode::new(snapshot.is_chance_node);
-                    let iterations = base + usize::from(i < extra);
                     for _ in 0..iterations {
                         local_agent.begin_simulation();
                         local_root.sample_delta(Some(snapshot), local_agent.as_mut(), h, h);
@@ -1090,5 +1093,37 @@ mod tests {
         assert_eq!(parallel_visits, 8);
         assert!(parallel_action < 2);
         assert!(visited_children > 0);
+    }
+
+    #[test]
+    fn parallel_search_is_thread_count_independent() {
+        fn run_with_threads(threads: usize) -> (Action, u32, Vec<u32>) {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            pool.install(|| {
+                let mut agent = DeterministicRewardAgent {
+                    last_action: 0,
+                    emit_reward: false,
+                };
+                let mut tree = SearchTree::new();
+                let action = tree.search(&mut agent, &[0], 0, 0, 64);
+                let root = tree.root.as_ref().expect("root");
+                let child_visits = root
+                    .action_children
+                    .iter()
+                    .map(|child| child.as_ref().map_or(0, |node| node.visits))
+                    .collect::<Vec<_>>();
+                (action, root.visits, child_visits)
+            })
+        }
+
+        let one = run_with_threads(1);
+        let two = run_with_threads(2);
+        let four = run_with_threads(4);
+
+        assert_eq!(one, two);
+        assert_eq!(two, four);
     }
 }

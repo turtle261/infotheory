@@ -6,6 +6,7 @@ use super::{
     parse_compression_backend_json, parse_rate_backend_json, rate_backend_to_json_value,
 };
 use crate::aixi::common::ObservationKeyMode;
+use crate::aixi::common::resolve_random_seed;
 use crate::api::{CompressionBackend, RateBackend};
 use std::fmt;
 use std::path::Path;
@@ -351,6 +352,11 @@ impl CompiledPlannerRunSpec {
     /// Operational runtime controls.
     pub fn runtime(&self) -> &PlannerRuntimeSpec {
         &self.runtime
+    }
+
+    /// Returns the canonical resolved planner runtime seed.
+    pub fn resolved_random_seed(&self) -> u64 {
+        resolve_random_seed(self.runtime.random_seed)
     }
 
     /// Compiled planner controller.
