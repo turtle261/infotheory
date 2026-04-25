@@ -12,29 +12,29 @@ use std::sync::Arc;
 use support::aixi_envs::{DeterministicBinaryEnv, SeededCoinFlipEnv};
 
 fn base_config() -> AiqiConfig {
-    AiqiConfig {
-        algorithm: "ac-ctw".to_string(),
-        ct_depth: 8,
-        observation_bits: 1,
-        observation_stream_len: 1,
-        reward_bits: 1,
-        agent_actions: 2,
-        min_reward: 0,
-        max_reward: 1,
-        reward_offset: 0,
-        discount_gamma: 0.99,
-        return_horizon: 2,
-        return_bins: 8,
-        augmentation_period: 2,
-        history_prune_keep_steps: None,
-        baseline_exploration: 0.01,
-        random_seed: Some(11),
-        rate_backend: None,
-        rate_backend_max_order: 20,
-        rwkv_model_path: None,
-        rosa_max_order: None,
-        zpaq_method: None,
-    }
+    let mut cfg = AiqiConfig::default();
+    cfg.algorithm = "ctw".to_string();
+    cfg.ct_depth = 8;
+    cfg.observation_bits = 1;
+    cfg.observation_stream_len = 1;
+    cfg.reward_bits = 1;
+    cfg.agent_actions = 2;
+    cfg.min_reward = 0;
+    cfg.max_reward = 1;
+    cfg.reward_offset = 0;
+    cfg.discount_gamma = 0.99;
+    cfg.return_horizon = 2;
+    cfg.return_bins = 8;
+    cfg.augmentation_period = 2;
+    cfg.history_prune_keep_steps = None;
+    cfg.baseline_exploration = 0.01;
+    cfg.random_seed = Some(11);
+    cfg.rate_backend = None;
+    cfg.rate_backend_max_order = 20;
+    cfg.rwkv_model_path = None;
+    cfg.rosa_max_order = None;
+    cfg.zpaq_method = None;
+    cfg
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn aiqi_with_generic_rate_backend_smoke_runs() {
 #[test]
 fn aiqi_with_rosa_generic_planner_smoke_runs() {
     let mut cfg = base_config();
-    cfg.algorithm = "rosa".to_string();
+    cfg.algorithm = "rosaplus".to_string();
     cfg.rosa_max_order = Some(8);
 
     let mut agent = AiqiAgent::new(cfg).expect("valid AIQI config");
@@ -340,21 +340,25 @@ fn rate_backend_bit_predictor_rejects_zpaq_backend() {
 #[test]
 fn aiqi_config_rejects_rwkv_without_model_path_when_no_rate_backend() {
     let mut cfg = base_config();
-    cfg.algorithm = "rwkv".to_string();
+    cfg.algorithm = "rwkv7".to_string();
     cfg.rwkv_model_path = None;
     cfg.rate_backend = None;
 
-    let err = cfg
-        .validate()
-        .expect_err("algorithm=rwkv without path and without rate_backend override must fail");
-    assert!(err.contains("rwkv_model_path"));
+    let err = match AiqiAgent::new(cfg) {
+        Ok(_) => panic!("expected rwkv7 config to fail without a model path"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("rwkv_model_path") || err.contains("backend-rwkv"),
+        "unexpected error: {err}"
+    );
 }
 
 #[cfg(feature = "backend-rwkv")]
 #[test]
 fn aiqi_config_allows_rwkv_without_model_path_with_rate_backend_override() {
     let mut cfg = base_config();
-    cfg.algorithm = "rwkv".to_string();
+    cfg.algorithm = "rwkv7".to_string();
     cfg.rwkv_model_path = None;
     cfg.rate_backend = Some(RateBackend::RosaPlus);
 

@@ -33,36 +33,36 @@ fn bench_data() -> &'static [u8] {
 }
 
 fn particle_spec_from_example() -> ParticleSpec {
-    ParticleSpec {
-        num_particles: 8,
-        context_window: 64,
-        unroll_steps: 2,
-        num_cells: 6,
-        cell_dim: 12,
-        num_rules: 2,
-        selector_hidden: 32,
-        rule_hidden: 32,
-        noise_dim: 8,
-        deterministic: true,
-        enable_noise: true,
-        noise_scale: 0.08,
-        noise_anneal_steps: 8192,
-        learning_rate_readout: 0.0003,
-        learning_rate_selector: 0.0,
-        learning_rate_rule: 0.0,
-        bptt_depth: 1,
-        optimizer_momentum: 0.05,
-        grad_clip: 1.0,
-        state_clip: 8.0,
-        forget_lambda: 0.0,
-        resample_threshold: 0.5,
-        mutate_fraction: 0.25,
-        mutate_scale: 0.01,
-        mutate_model_params: false,
-        diagnostics_interval: 0,
-        min_prob: 2f64.powi(-24),
-        seed: 42,
-    }
+    let mut spec = ParticleSpec::default();
+    spec.num_particles = 8;
+    spec.context_window = 64;
+    spec.unroll_steps = 2;
+    spec.num_cells = 6;
+    spec.cell_dim = 12;
+    spec.num_rules = 2;
+    spec.selector_hidden = 32;
+    spec.rule_hidden = 32;
+    spec.noise_dim = 8;
+    spec.deterministic = true;
+    spec.enable_noise = true;
+    spec.noise_scale = 0.08;
+    spec.noise_anneal_steps = 8192;
+    spec.learning_rate_readout = 0.0003;
+    spec.learning_rate_selector = 0.0;
+    spec.learning_rate_rule = 0.0;
+    spec.bptt_depth = 1;
+    spec.optimizer_momentum = 0.05;
+    spec.grad_clip = 1.0;
+    spec.state_clip = 8.0;
+    spec.forget_lambda = 0.0;
+    spec.resample_threshold = 0.5;
+    spec.mutate_fraction = 0.25;
+    spec.mutate_scale = 0.01;
+    spec.mutate_model_params = false;
+    spec.diagnostics_interval = 0;
+    spec.min_prob = 2f64.powi(-24);
+    spec.seed = 42;
+    spec
 }
 
 fn compile_rate_backend(backend: RateBackend) -> CompiledRateBackend {
@@ -93,12 +93,7 @@ fn individual_backends() -> Vec<(&'static str, CompiledRateBackend)> {
 }
 
 fn make_expert(name: &str, backend: RateBackend) -> MixtureExpertSpec {
-    MixtureExpertSpec {
-        name: Some(name.to_string()),
-        log_prior: 0.0,
-        max_order: -1,
-        backend,
-    }
+    MixtureExpertSpec::new(backend).with_name(name)
 }
 
 fn mixture_backends() -> Vec<(&'static str, CompiledRateBackend)> {

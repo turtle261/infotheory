@@ -34,22 +34,13 @@ fn source_data(expand_factor: usize) -> Vec<u8> {
 
 fn make_experts() -> Vec<MixtureExpertSpec> {
     vec![
-        MixtureExpertSpec {
-            name: Some("fac".to_string()),
-            log_prior: 0.0,
-            max_order: -1,
-            backend: RateBackend::FacCtw {
-                base_depth: 16,
-                encoding_bits: 8,
-                num_percept_bits: 8,
-            },
-        },
-        MixtureExpertSpec {
-            name: Some("rosa".to_string()),
-            log_prior: 0.0,
-            max_order: -1,
-            backend: RateBackend::RosaPlus,
-        },
+        MixtureExpertSpec::new(RateBackend::FacCtw {
+            base_depth: 16,
+            encoding_bits: 8,
+            num_percept_bits: 8,
+        })
+        .with_name("fac"),
+        MixtureExpertSpec::new(RateBackend::RosaPlus).with_name("rosa"),
     ]
 }
 

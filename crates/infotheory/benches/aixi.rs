@@ -61,30 +61,32 @@ mod bench_impl {
         let warmup = env_usize("AIXI_BENCH_WARMUP", 200);
         let env_name = "blackjack";
 
-        let base_cfg = |algorithm: &str| AgentConfig {
-            algorithm: algorithm.to_string(),
-            ct_depth: 32,
-            agent_horizon: 5,
-            observation_bits: 64,
-            observation_stream_len: 4,
-            observation_key_mode: infotheory::aixi::common::ObservationKeyMode::FullStream,
-            reward_bits: 2,
-            agent_actions: 2,
-            num_simulations: 400,
-            exploration_exploitation_ratio: 1.4,
-            discount_gamma: 1.0,
-            min_reward: -1,
-            max_reward: 1,
-            reward_offset: 1,
-            random_seed: Some(1),
-            rate_backend: None,
-            rate_backend_max_order: 20,
-            rwkv_model_path: None,
-            rwkv_method: None,
-            mamba_model_path: None,
-            mamba_method: None,
-            rosa_max_order: Some(20),
-            zpaq_method: None,
+        let base_cfg = |algorithm: &str| {
+            let mut cfg = AgentConfig::default();
+            cfg.algorithm = algorithm.to_string();
+            cfg.ct_depth = 32;
+            cfg.agent_horizon = 5;
+            cfg.observation_bits = 64;
+            cfg.observation_stream_len = 4;
+            cfg.observation_key_mode = infotheory::aixi::common::ObservationKeyMode::FullStream;
+            cfg.reward_bits = 2;
+            cfg.agent_actions = 2;
+            cfg.num_simulations = 400;
+            cfg.exploration_exploitation_ratio = 1.4;
+            cfg.discount_gamma = 1.0;
+            cfg.min_reward = -1;
+            cfg.max_reward = 1;
+            cfg.reward_offset = 1;
+            cfg.random_seed = Some(1);
+            cfg.rate_backend = None;
+            cfg.rate_backend_max_order = 20;
+            cfg.rwkv_model_path = None;
+            cfg.rwkv_method = None;
+            cfg.mamba_model_path = None;
+            cfg.mamba_method = None;
+            cfg.rosa_max_order = Some(20);
+            cfg.zpaq_method = None;
+            cfg
         };
 
         let make_mixture =
@@ -93,17 +95,20 @@ mod bench_impl {
                     MixtureSpec::new(
                         kind,
                         vec![
-                            MixtureExpertSpec {
-                                name: Some("ctw".to_string()),
-                                log_prior: 0.0,
-                                max_order: -1,
-                                backend: RateBackend::Ctw { depth: 32 },
+                            {
+                                let mut expert =
+                                    MixtureExpertSpec::new(RateBackend::Ctw { depth: 32 });
+                                expert.name = Some("ctw".to_string());
+                                expert.log_prior = 0.0;
+                                expert.max_order = -1;
+                                expert
                             },
-                            MixtureExpertSpec {
-                                name: Some("rosa".to_string()),
-                                log_prior: 0.0,
-                                max_order: 20,
-                                backend: RateBackend::RosaPlus,
+                            {
+                                let mut expert = MixtureExpertSpec::new(RateBackend::RosaPlus);
+                                expert.name = Some("rosa".to_string());
+                                expert.log_prior = 0.0;
+                                expert.max_order = 20;
+                                expert
                             },
                         ],
                     )
@@ -120,7 +125,7 @@ mod bench_impl {
 
         let benches = [
             ("fac-ctw", base_cfg("fac-ctw")),
-            ("rosa", base_cfg("rosa")),
+            ("rosaplus", base_cfg("rosaplus")),
             ("rate-ctw", rate_backend_cfg(RateBackend::Ctw { depth: 32 })),
             ("rate-rosa", rate_backend_cfg(RateBackend::RosaPlus)),
             (

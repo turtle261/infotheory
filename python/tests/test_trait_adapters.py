@@ -205,8 +205,8 @@ def test_search_with_simulator_adapter():
     assert action in (0, 1)
 
 
-def test_search_with_simulator_accepts_cli_observation_key_aliases():
-    for mode in ("full", "full-stream", "stream-hash"):
+def test_search_with_simulator_accepts_canonical_observation_key_names():
+    for mode in ("full_stream", "stream_hash"):
         action = ait.search_with_simulator(DummySimWithKeyMode(mode), [0], 0, 0, 4)
         assert action in (0, 1)
 

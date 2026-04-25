@@ -16,7 +16,7 @@ pub use self::types::{
     validate_rate_backend,
 };
 pub use crate::spec::{
-    AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
+    AssetRef, CanonicalBytes, CanonicalJson, CompiledCompressionBackend, CompiledRateBackend,
     CompressionBackendCapabilities, MethodBackendFamily, RateBackendCapabilities,
     RateBackendTraceStrategy, SpecEnvironment, ValidatedCompressionBackend, ValidatedRateBackend,
 };

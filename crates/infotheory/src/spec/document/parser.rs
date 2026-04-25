@@ -654,10 +654,8 @@ fn parse_observation_key_mode(name: &str) -> SpecResult<crate::aixi::common::Obs
     match name {
         "first" => Ok(crate::aixi::common::ObservationKeyMode::First),
         "last" => Ok(crate::aixi::common::ObservationKeyMode::Last),
-        "stream_hash" | "stream-hash" => Ok(crate::aixi::common::ObservationKeyMode::StreamHash),
-        "full_stream" | "full-stream" | "full" => {
-            Ok(crate::aixi::common::ObservationKeyMode::FullStream)
-        }
+        "stream_hash" => Ok(crate::aixi::common::ObservationKeyMode::StreamHash),
+        "full_stream" => Ok(crate::aixi::common::ObservationKeyMode::FullStream),
         other => Err(SpecError::new(format!(
             "unknown observation key mode '{other}'"
         ))),

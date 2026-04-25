@@ -101,23 +101,25 @@ fn nested_generic_backend() -> RateBackend {
     let inner = MixtureSpec::new(
         MixtureKind::Bayes,
         vec![
-            MixtureExpertSpec {
-                name: Some("ctw".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Ctw { depth: 6 },
+            {
+                let mut expert = MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 });
+                expert.name = Some("ctw".to_string());
+                expert.log_prior = 0.0;
+                expert.max_order = -1;
+                expert
             },
-            MixtureExpertSpec {
-                name: Some("match".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Match {
+            {
+                let mut expert = MixtureExpertSpec::new(RateBackend::Match {
                     hash_bits: 18,
                     min_len: 2,
                     max_len: 32,
                     base_mix: 0.05,
                     confidence_scale: 1.0,
-                },
+                });
+                expert.name = Some("match".to_string());
+                expert.log_prior = 0.0;
+                expert.max_order = -1;
+                expert
             },
         ],
     )
@@ -125,22 +127,24 @@ fn nested_generic_backend() -> RateBackend {
     let outer = MixtureSpec::new(
         MixtureKind::Convex,
         vec![
-            MixtureExpertSpec {
-                name: Some("nested".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Mixture {
+            {
+                let mut expert = MixtureExpertSpec::new(RateBackend::Mixture {
                     spec: Arc::new(inner),
-                },
+                });
+                expert.name = Some("nested".to_string());
+                expert.log_prior = 0.0;
+                expert.max_order = -1;
+                expert
             },
-            MixtureExpertSpec {
-                name: Some("ppmd".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Ppmd {
+            {
+                let mut expert = MixtureExpertSpec::new(RateBackend::Ppmd {
                     order: 4,
                     memory_mb: 8,
-                },
+                });
+                expert.name = Some("ppmd".to_string());
+                expert.log_prior = 0.0;
+                expert.max_order = -1;
+                expert
             },
         ],
     )
@@ -308,46 +312,48 @@ fn run_agent_env<T: Environment>(agent: &mut Agent, mut env: T, cycles: usize) -
 }
 
 fn generic_agent_config(rate_backend: RateBackend) -> AgentConfig {
-    AgentConfig {
-        algorithm: "ignored-by-rate-backend".into(),
-        ct_depth: 8,
-        agent_horizon: 5,
-        observation_bits: 1,
-        observation_stream_len: 1,
-        observation_key_mode: ObservationKeyMode::FullStream,
-        reward_bits: 1,
-        agent_actions: 2,
-        num_simulations: 60,
-        exploration_exploitation_ratio: 1.4,
-        discount_gamma: 1.0,
-        min_reward: 0,
-        max_reward: 1,
-        reward_offset: 0,
-        random_seed: Some(2026),
-        rate_backend: Some(rate_backend),
-        rate_backend_max_order: 8,
-        rwkv_model_path: None,
-        rwkv_method: None,
-        mamba_model_path: None,
-        mamba_method: None,
-        rosa_max_order: Some(8),
-        zpaq_method: None,
-    }
+    let mut cfg = AgentConfig::default();
+    cfg.algorithm = "ignored-by-rate-backend".into();
+    cfg.ct_depth = 8;
+    cfg.agent_horizon = 5;
+    cfg.observation_bits = 1;
+    cfg.observation_stream_len = 1;
+    cfg.observation_key_mode = ObservationKeyMode::FullStream;
+    cfg.reward_bits = 1;
+    cfg.agent_actions = 2;
+    cfg.num_simulations = 60;
+    cfg.exploration_exploitation_ratio = 1.4;
+    cfg.discount_gamma = 1.0;
+    cfg.min_reward = 0;
+    cfg.max_reward = 1;
+    cfg.reward_offset = 0;
+    cfg.random_seed = Some(2026);
+    cfg.rate_backend = Some(rate_backend);
+    cfg.rate_backend_max_order = 8;
+    cfg.rwkv_model_path = None;
+    cfg.rwkv_method = None;
+    cfg.mamba_model_path = None;
+    cfg.mamba_method = None;
+    cfg.rosa_max_order = Some(8);
+    cfg.zpaq_method = None;
+    cfg
 }
 
 fn mixture_backend(kind: MixtureKind) -> RateBackend {
     let experts = vec![
-        MixtureExpertSpec {
-            name: Some("ctw".to_string()),
-            log_prior: 0.0,
-            max_order: -1,
-            backend: RateBackend::Ctw { depth: 8 },
+        {
+            let mut expert = MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 });
+            expert.name = Some("ctw".to_string());
+            expert.log_prior = 0.0;
+            expert.max_order = -1;
+            expert
         },
-        MixtureExpertSpec {
-            name: Some("rosa".to_string()),
-            log_prior: 0.0,
-            max_order: 8,
-            backend: RateBackend::RosaPlus,
+        {
+            let mut expert = MixtureExpertSpec::new(RateBackend::RosaPlus);
+            expert.name = Some("rosa".to_string());
+            expert.log_prior = 0.0;
+            expert.max_order = 8;
+            expert
         },
     ];
     let alpha = match kind {
@@ -366,11 +372,12 @@ fn deeply_nested_bayes_backend(depth: usize) -> RateBackend {
         backend = RateBackend::Mixture {
             spec: Arc::new(MixtureSpec::new(
                 MixtureKind::Bayes,
-                vec![MixtureExpertSpec {
-                    name: Some(format!("level-{level}")),
-                    log_prior: 0.0,
-                    max_order: -1,
-                    backend,
+                vec![{
+                    let mut expert = MixtureExpertSpec::new(backend);
+                    expert.name = Some(format!("level-{level}"));
+                    expert.log_prior = 0.0;
+                    expert.max_order = -1;
+                    expert
                 }],
             )),
         };
@@ -380,31 +387,30 @@ fn deeply_nested_bayes_backend(depth: usize) -> RateBackend {
 
 #[test]
 fn agent_solves_ctw_test_environment() {
-    let config = AgentConfig {
-        algorithm: "ctw".into(),
-        ct_depth: 8,
-        agent_horizon: 8, // Increased from 4
-        observation_bits: 1,
-        observation_stream_len: 1,
-        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::FullStream,
-        reward_bits: 1,
-        agent_actions: 2,
-        num_simulations: 200, // Increased from 50
-        exploration_exploitation_ratio: 2.0,
-        discount_gamma: 1.0,
-        min_reward: 0,
-        max_reward: 1,
-        reward_offset: 0,
-        random_seed: Some(17),
-        rate_backend: None,
-        rate_backend_max_order: 20,
-        rwkv_model_path: None,
-        rwkv_method: None,
-        mamba_model_path: None,
-        mamba_method: None,
-        rosa_max_order: None,
-        zpaq_method: None,
-    };
+    let mut config = AgentConfig::default();
+    config.algorithm = "fac-ctw".into();
+    config.ct_depth = 8;
+    config.agent_horizon = 8;
+    config.observation_bits = 1;
+    config.observation_stream_len = 1;
+    config.observation_key_mode = infotheory::aixi::common::ObservationKeyMode::FullStream;
+    config.reward_bits = 1;
+    config.agent_actions = 2;
+    config.num_simulations = 200;
+    config.exploration_exploitation_ratio = 2.0;
+    config.discount_gamma = 1.0;
+    config.min_reward = 0;
+    config.max_reward = 1;
+    config.reward_offset = 0;
+    config.random_seed = Some(17);
+    config.rate_backend = None;
+    config.rate_backend_max_order = 20;
+    config.rwkv_model_path = None;
+    config.rwkv_method = None;
+    config.mamba_model_path = None;
+    config.mamba_method = None;
+    config.rosa_max_order = None;
+    config.zpaq_method = None;
 
     let mut agent = Agent::new(config);
     let env = DeterministicBinaryEnv::new();
@@ -426,31 +432,30 @@ fn agent_solves_ctw_test_environment() {
 
 #[test]
 fn agent_regret_sublinear_coinflip() {
-    let config = AgentConfig {
-        algorithm: "ctw".into(),
-        ct_depth: 4,
-        agent_horizon: 4, // Increased from 2
-        observation_bits: 1,
-        observation_stream_len: 1,
-        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::FullStream,
-        reward_bits: 1,
-        agent_actions: 2,
-        num_simulations: 100, // Increased from 20
-        exploration_exploitation_ratio: 1.0,
-        discount_gamma: 1.0,
-        min_reward: 0,
-        max_reward: 1,
-        reward_offset: 0,
-        random_seed: Some(23),
-        rate_backend: None,
-        rate_backend_max_order: 20,
-        rwkv_model_path: None,
-        rwkv_method: None,
-        mamba_model_path: None,
-        mamba_method: None,
-        rosa_max_order: None,
-        zpaq_method: None,
-    };
+    let mut config = AgentConfig::default();
+    config.algorithm = "fac-ctw".into();
+    config.ct_depth = 4;
+    config.agent_horizon = 4;
+    config.observation_bits = 1;
+    config.observation_stream_len = 1;
+    config.observation_key_mode = infotheory::aixi::common::ObservationKeyMode::FullStream;
+    config.reward_bits = 1;
+    config.agent_actions = 2;
+    config.num_simulations = 100;
+    config.exploration_exploitation_ratio = 1.0;
+    config.discount_gamma = 1.0;
+    config.min_reward = 0;
+    config.max_reward = 1;
+    config.reward_offset = 0;
+    config.random_seed = Some(23);
+    config.rate_backend = None;
+    config.rate_backend_max_order = 20;
+    config.rwkv_model_path = None;
+    config.rwkv_method = None;
+    config.mamba_model_path = None;
+    config.mamba_method = None;
+    config.rosa_max_order = None;
+    config.zpaq_method = None;
 
     let mut agent = Agent::new(config);
     let env = SeededCoinFlipEnv::new(0.8);
@@ -472,31 +477,30 @@ fn agent_regret_sublinear_coinflip() {
 
 #[test]
 fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
-    let config = AgentConfig {
-        algorithm: "ctw".into(),
-        ct_depth: 8,
-        agent_horizon: 6,
-        observation_bits: 1,
-        observation_stream_len: 1,
-        observation_key_mode: infotheory::aixi::common::ObservationKeyMode::FullStream,
-        reward_bits: 1,
-        agent_actions: 2,
-        num_simulations: 80,
-        exploration_exploitation_ratio: 1.4,
-        discount_gamma: 1.0,
-        min_reward: 0,
-        max_reward: 1,
-        reward_offset: 0,
-        random_seed: Some(12345),
-        rate_backend: None,
-        rate_backend_max_order: 20,
-        rwkv_model_path: None,
-        rwkv_method: None,
-        mamba_model_path: None,
-        mamba_method: None,
-        rosa_max_order: None,
-        zpaq_method: None,
-    };
+    let mut config = AgentConfig::default();
+    config.algorithm = "fac-ctw".into();
+    config.ct_depth = 8;
+    config.agent_horizon = 6;
+    config.observation_bits = 1;
+    config.observation_stream_len = 1;
+    config.observation_key_mode = infotheory::aixi::common::ObservationKeyMode::FullStream;
+    config.reward_bits = 1;
+    config.agent_actions = 2;
+    config.num_simulations = 80;
+    config.exploration_exploitation_ratio = 1.4;
+    config.discount_gamma = 1.0;
+    config.min_reward = 0;
+    config.max_reward = 1;
+    config.reward_offset = 0;
+    config.random_seed = Some(12345);
+    config.rate_backend = None;
+    config.rate_backend_max_order = 20;
+    config.rwkv_model_path = None;
+    config.rwkv_method = None;
+    config.mamba_model_path = None;
+    config.mamba_method = None;
+    config.rosa_max_order = None;
+    config.zpaq_method = None;
 
     let mut a = Agent::new(config.clone());
     let mut b = Agent::new(config);
@@ -634,13 +638,14 @@ fn agent_config_rejects_zpaq_rate_backend_in_strict_mode() {
     let cfg = generic_agent_config(RateBackend::Mixture {
         spec: Arc::new(MixtureSpec::new(
             MixtureKind::Bayes,
-            vec![MixtureExpertSpec {
-                name: Some("bad-zpaq".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Zpaq {
+            vec![{
+                let mut expert = MixtureExpertSpec::new(RateBackend::Zpaq {
                     method: infotheory::api::ZpaqMethodSpec::literal("1"),
-                },
+                });
+                expert.name = Some("bad-zpaq".to_string());
+                expert.log_prior = 0.0;
+                expert.max_order = -1;
+                expert
             }],
         )),
     });

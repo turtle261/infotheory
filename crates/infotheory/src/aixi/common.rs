@@ -29,6 +29,7 @@ pub type PerceptVal = u64;
 
 /// Strategy for mapping an observation stream into a single percept key for tree search.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ObservationKeyMode {
     /// Use the full observation stream as the key (paper-accurate expectimax).
     FullStream,

@@ -110,10 +110,8 @@ fn assert_ctx_parity(
     }
 
     if check_generation {
-        let cfg = GenerationConfig {
-            seed: 7,
-            ..GenerationConfig::default()
-        };
+        let mut cfg = GenerationConfig::default();
+        cfg.seed = 7;
         let compat = compat_ctx
             .try_generate_bytes_with_config(prompt, 16, -1, cfg)
             .unwrap();
@@ -147,23 +145,23 @@ fn compiled_ctx_matches_wrapper_ctx_for_mixture_backend() {
         spec: std::sync::Arc::new(infotheory::api::MixtureSpec::new(
             infotheory::api::MixtureKind::Bayes,
             vec![
-                infotheory::api::MixtureExpertSpec {
-                    name: Some("ctw".to_string()),
-                    log_prior: 0.0,
-                    max_order: -1,
-                    backend: RateBackend::Ctw { depth: 8 },
+                {
+                    let mut expert =
+                        infotheory::api::MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 });
+                    expert.name = Some("ctw".to_string());
+                    expert
                 },
-                infotheory::api::MixtureExpertSpec {
-                    name: Some("match".to_string()),
-                    log_prior: -0.2,
-                    max_order: -1,
-                    backend: RateBackend::Match {
+                {
+                    let mut expert = infotheory::api::MixtureExpertSpec::new(RateBackend::Match {
                         hash_bits: 18,
                         min_len: 4,
                         max_len: 64,
                         base_mix: 0.02,
                         confidence_scale: 1.0,
-                    },
+                    });
+                    expert.name = Some("match".to_string());
+                    expert.log_prior = -0.2;
+                    expert
                 },
             ],
         )),
@@ -180,13 +178,10 @@ fn compiled_ctx_matches_wrapper_ctx_for_mixture_backend() {
 #[test]
 fn compiled_ctx_matches_wrapper_ctx_for_calibrated_backend() {
     let rate = RateBackend::Calibrated {
-        spec: std::sync::Arc::new(infotheory::api::CalibratedSpec {
-            base: RateBackend::Ctw { depth: 8 },
-            context: infotheory::api::CalibrationContextKind::Text,
-            bins: 33,
-            learning_rate: 0.02,
-            bias_clip: 4.0,
-        }),
+        spec: std::sync::Arc::new(infotheory::api::CalibratedSpec::new(
+            RateBackend::Ctw { depth: 8 },
+            infotheory::api::CalibrationContextKind::Text,
+        )),
     };
     let compression = CompressionBackend::Rate {
         rate_backend: rate.clone(),

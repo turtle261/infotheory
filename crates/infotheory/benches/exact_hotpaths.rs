@@ -101,33 +101,20 @@ fn two_json_backend() -> CompiledRateBackend {
     let spec = MixtureSpec::new(
         MixtureKind::Neural,
         vec![
-            MixtureExpertSpec {
-                name: Some("ctw".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Ctw { depth: 24 },
-            },
-            MixtureExpertSpec {
-                name: Some("ppmd".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Ppmd {
-                    order: 10,
-                    memory_mb: 64,
-                },
-            },
-            MixtureExpertSpec {
-                name: Some("match".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Match {
-                    hash_bits: 20,
-                    min_len: 4,
-                    max_len: 255,
-                    base_mix: 0.02,
-                    confidence_scale: 1.0,
-                },
-            },
+            MixtureExpertSpec::new(RateBackend::Ctw { depth: 24 }).with_name("ctw"),
+            MixtureExpertSpec::new(RateBackend::Ppmd {
+                order: 10,
+                memory_mb: 64,
+            })
+            .with_name("ppmd"),
+            MixtureExpertSpec::new(RateBackend::Match {
+                hash_bits: 20,
+                min_len: 4,
+                max_len: 255,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            })
+            .with_name("match"),
         ],
     )
     .with_alpha(0.03);

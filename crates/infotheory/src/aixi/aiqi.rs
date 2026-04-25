@@ -23,14 +23,20 @@ use std::path::PathBuf;
 
 /// Configuration parameters for an AIQI agent.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AiqiConfig {
     /// Predictive backend.
     ///
-    /// - `ac-ctw` / `ctw` / `ctw-context-tree`: AIQI-CTW path from
+    /// Canonical names with their accepted aliases:
+    ///
+    /// - `"ac-ctw"` (alias `"ctw"`): single-tree AIQI-CTW path from
     ///   "A Model-Free Universal AI".
-    /// - `fac-ctw`: factorized CTW extension.
-    /// - `rosa` / `rwkv`: pluggable predictor extensions.
-    /// - `zpaq`: intentionally unsupported for AIQI strict conditioning.
+    /// - `"fac-ctw"`: factorized CTW extension.
+    /// - `"rosaplus"` (alias `"rosa"`): ROSA+ pluggable predictor.
+    /// - `"rwkv7"`: RWKV-7 file-backed predictor (requires `backend-rwkv`).
+    /// - `"zpaq"`: intentionally unsupported for AIQI strict conditioning.
+    ///
+    /// The alias mapping is identical for [`crate::aixi::agent::AgentConfig`].
     pub algorithm: String,
     /// Context depth for CTW/FAC-CTW backends.
     pub ct_depth: usize,
@@ -81,13 +87,41 @@ pub struct AiqiConfig {
     pub rate_backend_max_order: i64,
     /// Optional RWKV model path.
     ///
-    /// Required only when selecting `algorithm="rwkv"` and no `rate_backend`
+    /// Required only when selecting `algorithm="rwkv7"` and no `rate_backend`
     /// override is configured.
     pub rwkv_model_path: Option<String>,
     /// Optional ROSA max order.
     pub rosa_max_order: Option<i64>,
     /// Optional ZPAQ method string.
     pub zpaq_method: Option<String>,
+}
+
+impl Default for AiqiConfig {
+    fn default() -> Self {
+        Self {
+            algorithm: "ctw".to_string(),
+            ct_depth: 8,
+            observation_bits: 1,
+            observation_stream_len: 1,
+            reward_bits: 1,
+            agent_actions: 2,
+            min_reward: 0,
+            max_reward: 1,
+            reward_offset: 0,
+            discount_gamma: 0.99,
+            return_horizon: 4,
+            return_bins: 8,
+            augmentation_period: 4,
+            history_prune_keep_steps: None,
+            baseline_exploration: 0.01,
+            random_seed: None,
+            rate_backend: None,
+            rate_backend_max_order: 8,
+            rwkv_model_path: None,
+            rosa_max_order: None,
+            zpaq_method: None,
+        }
+    }
 }
 
 impl AiqiConfig {
@@ -97,7 +131,7 @@ impl AiqiConfig {
         }
 
         match self.algorithm.as_str() {
-            "ctw" | "ac-ctw" | "ctw-context-tree" => Ok(RateBackend::Ctw {
+            "ctw" | "ac-ctw" => Ok(RateBackend::Ctw {
                 depth: self.ct_depth,
             }),
             "fac-ctw" => Ok(RateBackend::FacCtw {
@@ -105,11 +139,11 @@ impl AiqiConfig {
                 num_percept_bits: bits_for_cardinality(self.return_bins),
                 encoding_bits: 1,
             }),
-            "rosa" => Ok(RateBackend::RosaPlus),
+            "rosa" | "rosaplus" => Ok(RateBackend::RosaPlus),
             #[cfg(feature = "backend-rwkv")]
-            "rwkv" => {
+            "rwkv7" => {
                 let path = self.rwkv_model_path.as_ref().ok_or_else(|| {
-                    "algorithm=rwkv requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
+                    "algorithm=rwkv7 requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
                         .to_string()
                 })?;
                 Ok(RateBackend::Rwkv7Method {
@@ -120,7 +154,7 @@ impl AiqiConfig {
                 })
             }
             #[cfg(not(feature = "backend-rwkv"))]
-            "rwkv" => Err("algorithm=rwkv requires backend-rwkv feature".to_string()),
+            "rwkv7" => Err("algorithm=rwkv7 requires backend-rwkv feature".to_string()),
             "zpaq" => Err(
                 "AIQI strict mode does not support algorithm=zpaq; configure a backend with strict frozen conditioning"
                     .to_string(),
@@ -207,7 +241,7 @@ impl AiqiConfig {
         // algorithm choices when no backend override is configured.
         if self.rate_backend.is_none() {
             match self.algorithm.as_str() {
-                "ctw" | "fac-ctw" | "ac-ctw" | "ctw-context-tree" | "rosa" => {}
+                "ctw" | "ac-ctw" | "fac-ctw" | "rosa" | "rosaplus" => {}
                 "zpaq" => {
                     return Err(
                         "AIQI strict mode does not support algorithm=zpaq: zpaq backends do not provide strict frozen conditioning"
@@ -215,10 +249,10 @@ impl AiqiConfig {
                     )
                 }
                 #[cfg(feature = "backend-rwkv")]
-                "rwkv" => {}
+                "rwkv7" => {}
                 #[cfg(not(feature = "backend-rwkv"))]
-                "rwkv" => {
-                    return Err("algorithm=rwkv requires backend-rwkv feature".to_string())
+                "rwkv7" => {
+                    return Err("algorithm=rwkv7 requires backend-rwkv feature".to_string())
                 }
                 other => return Err(format!("Unknown AIQI algorithm: {other}")),
             }
@@ -236,12 +270,12 @@ impl AiqiConfig {
         }
 
         #[cfg(feature = "backend-rwkv")]
-        if self.rate_backend.is_none() && self.algorithm == "rwkv" {
+        if self.rate_backend.is_none() && self.algorithm == "rwkv7" {
             match self.rwkv_model_path.as_deref() {
                 Some(path) if !path.trim().is_empty() => {}
                 _ => {
                     return Err(
-                        "algorithm=rwkv requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
+                        "algorithm=rwkv7 requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
                             .to_string(),
                     )
                 }
@@ -254,6 +288,15 @@ impl AiqiConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.validate_runtime_invariants()?;
         self.compile_planner_run_spec().map(|_| ())
+    }
+
+    /// Test-only accessor for the private `canonical_predictor_backend` mapping.
+    ///
+    /// Used by cross-config alias-symmetry tests in [`crate::aixi::agent`].
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn canonical_predictor_backend_for_test(&self) -> Result<RateBackend, String> {
+        self.canonical_predictor_backend()
     }
 }
 

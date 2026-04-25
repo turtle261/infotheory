@@ -8,6 +8,7 @@ use super::{
 use crate::aixi::common::ObservationKeyMode;
 use crate::aixi::common::resolve_random_seed;
 use crate::api::{CompressionBackend, RateBackend};
+use crate::spec::CanonicalJson;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -170,17 +171,6 @@ impl PlannerRunSpec {
     pub fn compile(&self) -> SpecResult<CompiledPlannerRunSpec> {
         self.compile_in(&SpecEnvironment::default())
     }
-
-    /// Serialize this planner-run spec to deterministic canonical JSON.
-    pub fn to_canonical_json(&self) -> SpecResult<String> {
-        serde_json::to_string_pretty(&serializer::planner_run_to_json_value(self)?)
-            .map_err(SpecError::from)
-    }
-
-    /// Serialize this planner-run spec to canonical JSON value form.
-    pub fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value> {
-        serializer::planner_run_to_json_value(self)
-    }
 }
 
 impl EnvironmentSpec {
@@ -196,6 +186,36 @@ impl EnvironmentSpec {
     /// Validate and canonicalize this environment spec using the default environment.
     pub fn validate(&self, assets: &[AssetBinding]) -> SpecResult<EnvironmentSpec> {
         self.validate_in(assets, &SpecEnvironment::default())
+    }
+
+    /// Stable canonical kind name for this environment variant.
+    ///
+    /// Used by tooling that prints canonical names without dispatching on the
+    /// payload of each variant.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Builtin { .. } => "builtin",
+            #[cfg(feature = "vm")]
+            Self::NyxVm(_) => "vm",
+        }
+    }
+}
+
+impl BuiltinEnvironmentSpec {
+    /// Stable canonical name string for this builtin environment.
+    ///
+    /// This is the canonical document/CLI identifier used in serialized specs;
+    /// it does not change when new builtins are added.
+    pub fn canonical_name(&self) -> &'static str {
+        match self {
+            Self::CoinFlip => "coin_flip",
+            Self::BiasedRockPaperScissor => "biased_rock_paper_scissor",
+            Self::KuhnPoker => "kuhn_poker",
+            Self::ExtendedTiger => "extended_tiger",
+            Self::TicTacToe => "tic_tac_toe",
+            Self::Blackjack => "blackjack",
+            Self::Platformer => "platformer",
+        }
     }
 }
 
@@ -226,31 +246,9 @@ impl TuneSpec {
     pub fn compile(&self) -> SpecResult<CompiledTuneSpec> {
         self.compile_in(&SpecEnvironment::default())
     }
-
-    /// Serialize this tune request to deterministic canonical JSON.
-    pub fn to_canonical_json(&self) -> SpecResult<String> {
-        serde_json::to_string_pretty(&serializer::tune_spec_to_json_value(self)?)
-            .map_err(SpecError::from)
-    }
-
-    /// Serialize this tune request to canonical JSON value form.
-    pub fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value> {
-        serializer::tune_spec_to_json_value(self)
-    }
 }
 
 impl SpecDocument {
-    /// Serialize this document to deterministic canonical JSON.
-    pub fn to_canonical_json(&self) -> SpecResult<String> {
-        let value = self.to_canonical_json_value()?;
-        serde_json::to_string_pretty(&value).map_err(SpecError::from)
-    }
-
-    /// Serialize this document to canonical JSON value form.
-    pub fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value> {
-        serializer::spec_document_to_json_value(self)
-    }
-
     /// Encode this document in the versioned binary document envelope.
     pub fn to_binary(&self) -> Vec<u8> {
         binary::encode_spec_document_payload(self)
@@ -315,6 +313,34 @@ impl SpecDocument {
     pub fn compile(&self) -> SpecResult<CompiledSpecDocument> {
         self.compile_in(&SpecEnvironment::default())
     }
+
+    /// Stable canonical kind name (matches the document's `"kind"` JSON field).
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::PlannerRun(_) => "planner_run",
+            Self::Tune(_) => "tune",
+            Self::RateBackend(_) => "rate_backend",
+            Self::CompressionBackend(_) => "compression_backend",
+        }
+    }
+}
+
+impl CanonicalJson for PlannerRunSpec {
+    fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value> {
+        serializer::planner_run_to_json_value(self)
+    }
+}
+
+impl CanonicalJson for TuneSpec {
+    fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value> {
+        serializer::tune_spec_to_json_value(self)
+    }
+}
+
+impl CanonicalJson for SpecDocument {
+    fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value> {
+        serializer::spec_document_to_json_value(self)
+    }
 }
 
 impl CompiledPlannerController {
@@ -325,6 +351,38 @@ impl CompiledPlannerController {
             Self::AiqiDiscounted { predictor, .. } => predictor,
             Self::AiqiWarmstartExactJh { predictor, .. } => predictor,
         }
+    }
+
+    /// Predictor `max_order` hint shared across all controller variants.
+    pub fn predictor_max_order(&self) -> i64 {
+        match self {
+            Self::McAixi {
+                predictor_max_order,
+                ..
+            }
+            | Self::AiqiDiscounted {
+                predictor_max_order,
+                ..
+            }
+            | Self::AiqiWarmstartExactJh {
+                predictor_max_order,
+                ..
+            } => *predictor_max_order,
+        }
+    }
+
+    /// Stable canonical kind name string for this controller variant.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::McAixi { .. } => "mc_aixi",
+            Self::AiqiDiscounted { .. } => "aiqi_discounted",
+            Self::AiqiWarmstartExactJh { .. } => "aiqi_warmstart_exact_jh",
+        }
+    }
+
+    /// Human-readable predictor backend label, including any `max_order` hint.
+    pub fn backend_label(&self) -> String {
+        self.predictor().display_label(self.predictor_max_order())
     }
 }
 
@@ -410,10 +468,10 @@ impl CompiledTuneSpec {
 #[cfg(feature = "vm")]
 fn canonicalize_vm_observation_policy_name(name: &str) -> SpecResult<VmObservationPolicySpec> {
     match name {
-        "from_guest" | "guest" | "from-guest" => Ok(VmObservationPolicySpec::FromGuest),
-        "output_hash" | "hash" | "output-hash" => Ok(VmObservationPolicySpec::OutputHash),
-        "raw_output" | "raw" | "raw-output" => Ok(VmObservationPolicySpec::RawOutput),
-        "shared_memory" | "shared-memory" | "shm" => Ok(VmObservationPolicySpec::SharedMemory),
+        "from_guest" => Ok(VmObservationPolicySpec::FromGuest),
+        "output_hash" => Ok(VmObservationPolicySpec::OutputHash),
+        "raw_output" => Ok(VmObservationPolicySpec::RawOutput),
+        "shared_memory" => Ok(VmObservationPolicySpec::SharedMemory),
         other => Err(SpecError::new(format!(
             "unknown VM observation_policy '{other}'"
         ))),
@@ -425,7 +483,7 @@ fn canonicalize_vm_observation_stream_mode_name(
     name: &str,
 ) -> SpecResult<VmObservationStreamModeSpec> {
     match name {
-        "pad_truncate" | "pad-truncate" => Ok(VmObservationStreamModeSpec::PadTruncate),
+        "pad_truncate" => Ok(VmObservationStreamModeSpec::PadTruncate),
         "pad" => Ok(VmObservationStreamModeSpec::Pad),
         "truncate" => Ok(VmObservationStreamModeSpec::Truncate),
         other => Err(SpecError::new(format!(
@@ -440,7 +498,7 @@ fn canonicalize_vm_payload_encoding(
     field_name: &str,
 ) -> SpecResult<VmPayloadEncodingSpec> {
     match name {
-        "utf8" | "text" => Ok(VmPayloadEncodingSpec::Utf8),
+        "utf8" => Ok(VmPayloadEncodingSpec::Utf8),
         "hex" => Ok(VmPayloadEncodingSpec::Hex),
         other => Err(SpecError::new(format!(
             "unknown VM payload encoding '{other}' for {field_name}"
@@ -451,12 +509,12 @@ fn canonicalize_vm_payload_encoding(
 #[cfg(feature = "vm")]
 fn canonicalize_vm_fuzz_mutator_name(name: &str) -> SpecResult<VmFuzzMutatorSpec> {
     match name {
-        "flip_bit" | "flipbit" => Ok(VmFuzzMutatorSpec::FlipBit),
-        "flip_byte" | "flipbyte" => Ok(VmFuzzMutatorSpec::FlipByte),
-        "insert_byte" | "insertbyte" => Ok(VmFuzzMutatorSpec::InsertByte),
-        "delete_byte" | "deletebyte" => Ok(VmFuzzMutatorSpec::DeleteByte),
-        "splice_seed" | "splice-seed" | "splice" => Ok(VmFuzzMutatorSpec::SpliceSeed),
-        "reset_seed" | "reset-seed" | "reset" => Ok(VmFuzzMutatorSpec::ResetSeed),
+        "flip_bit" => Ok(VmFuzzMutatorSpec::FlipBit),
+        "flip_byte" => Ok(VmFuzzMutatorSpec::FlipByte),
+        "insert_byte" => Ok(VmFuzzMutatorSpec::InsertByte),
+        "delete_byte" => Ok(VmFuzzMutatorSpec::DeleteByte),
+        "splice_seed" => Ok(VmFuzzMutatorSpec::SpliceSeed),
+        "reset_seed" => Ok(VmFuzzMutatorSpec::ResetSeed),
         "havoc" => Ok(VmFuzzMutatorSpec::Havoc),
         other => Err(SpecError::new(format!("unknown VM fuzz mutator '{other}'"))),
     }

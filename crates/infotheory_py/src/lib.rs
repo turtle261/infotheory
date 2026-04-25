@@ -94,7 +94,7 @@ fn parse_ncd_variant(s: &str) -> PyResult<NcdVariant> {
 fn parse_framing_mode(s: &str) -> PyResult<infotheory::compression::FramingMode> {
     match s.to_ascii_lowercase().as_str() {
         "raw" => Ok(infotheory::compression::FramingMode::Raw),
-        "framed" | "frame" => Ok(infotheory::compression::FramingMode::Framed),
+        "framed" => Ok(infotheory::compression::FramingMode::Framed),
         _ => Err(PyValueError::new_err(format!(
             "unknown framing '{s}' (expected 'raw' or 'framed')"
         ))),
@@ -112,15 +112,15 @@ fn parse_observation_key_mode(
         match s.to_ascii_lowercase().as_str() {
             "first" => return Ok(infotheory::aixi::common::ObservationKeyMode::First),
             "last" => return Ok(infotheory::aixi::common::ObservationKeyMode::Last),
-            "streamhash" | "stream_hash" | "stream-hash" | "hash" => {
+            "stream_hash" => {
                 return Ok(infotheory::aixi::common::ObservationKeyMode::StreamHash);
             }
-            "full" | "stream" | "fullstream" | "full_stream" | "full-stream" => {
+            "full_stream" => {
                 return Ok(infotheory::aixi::common::ObservationKeyMode::FullStream);
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown ObservationKeyMode '{s}' (expected one of: first, last, hash/stream_hash/stream-hash, full/full-stream/full_stream/fullstream/stream)"
+                    "unknown ObservationKeyMode '{s}' (expected one of: first, last, stream_hash, full_stream)"
                 )));
             }
         }
@@ -137,7 +137,7 @@ fn parse_generation_strategy_value(py_obj: &Bound<'_, PyAny>) -> PyResult<Genera
     if let Ok(s) = py_obj.extract::<String>() {
         return match s.to_ascii_lowercase().as_str() {
             "greedy" => Ok(GenerationStrategy::Greedy),
-            "sample" | "sampled" => Ok(GenerationStrategy::Sample),
+            "sample" => Ok(GenerationStrategy::Sample),
             _ => Err(PyValueError::new_err(format!(
                 "unknown GenerationStrategy '{s}' (expected 'greedy' or 'sample')"
             ))),
@@ -206,6 +206,7 @@ impl PyGenerationStrategy {
         match self.inner {
             GenerationStrategy::Greedy => "GenerationStrategy.Greedy",
             GenerationStrategy::Sample => "GenerationStrategy.Sample",
+            _ => unreachable!("non-exhaustive GenerationStrategy variant not exposed by bindings"),
         }
     }
 }
@@ -238,6 +239,9 @@ impl PyGenerationUpdateMode {
         match self.inner {
             GenerationUpdateMode::Adaptive => "GenerationUpdateMode.Adaptive",
             GenerationUpdateMode::Frozen => "GenerationUpdateMode.Frozen",
+            _ => {
+                unreachable!("non-exhaustive GenerationUpdateMode variant not exposed by bindings")
+            }
         }
     }
 }
@@ -334,12 +338,10 @@ impl PyGenerationConfig {
 fn parse_calibration_context_kind_alias(s: &str) -> Option<CalibrationContextKind> {
     match s.trim().to_ascii_lowercase().as_str() {
         "global" => Some(CalibrationContextKind::Global),
-        "byteclass" | "byte-class" | "byte_class" | "class" => {
-            Some(CalibrationContextKind::ByteClass)
-        }
+        "byteclass" => Some(CalibrationContextKind::ByteClass),
         "text" => Some(CalibrationContextKind::Text),
         "repeat" => Some(CalibrationContextKind::Repeat),
-        "textrepeat" | "text-repeat" | "text_repeat" => Some(CalibrationContextKind::TextRepeat),
+        "textrepeat" => Some(CalibrationContextKind::TextRepeat),
         _ => None,
     }
 }
@@ -372,20 +374,12 @@ fn parse_compression_backend(
     method: Option<&str>,
     rate_backend: Option<RateBackend>,
 ) -> PyResult<CompressionBackend> {
+    let mut opts = infotheory::spec::CompressionBackendShorthandOptions::default();
+    opts.default_rate_backend = rate_backend;
+    opts.default_framing = infotheory::compression::FramingMode::Framed;
+
     #[cfg(feature = "backend-rwkv")]
-    let mut opts = infotheory::spec::CompressionBackendShorthandOptions {
-        default_rate_backend: rate_backend.clone(),
-        default_framing: infotheory::compression::FramingMode::Framed,
-        ..Default::default()
-    };
-    #[cfg(not(feature = "backend-rwkv"))]
-    let opts = infotheory::spec::CompressionBackendShorthandOptions {
-        default_rate_backend: rate_backend,
-        default_framing: infotheory::compression::FramingMode::Framed,
-        ..Default::default()
-    };
-    #[cfg(feature = "backend-rwkv")]
-    if name.trim().eq_ignore_ascii_case("rwkv7") || name.trim().eq_ignore_ascii_case("rwkv") {
+    if name.trim().eq_ignore_ascii_case("rwkv7") {
         if let Ok(path) = std::env::var("RWKV7_MODEL_PATH") {
             opts.default_rwkv_model_path = Some(path);
         }
@@ -482,14 +476,11 @@ impl PyMixtureExpertSpec {
     #[new]
     #[pyo3(signature = (backend, max_order=-1, log_prior=0.0, name=None))]
     fn new(backend: &PyRateBackend, max_order: i64, log_prior: f64, name: Option<String>) -> Self {
-        Self {
-            inner: MixtureExpertSpec {
-                name,
-                log_prior,
-                max_order,
-                backend: backend.inner.clone(),
-            },
-        }
+        let mut inner = MixtureExpertSpec::new(backend.inner.clone());
+        inner.name = name;
+        inner.log_prior = log_prior;
+        inner.max_order = max_order;
+        Self { inner }
     }
 }
 
@@ -592,36 +583,35 @@ impl PyParticleSpec {
         min_prob: f64,
         seed: u64,
     ) -> PyResult<Self> {
-        let spec = ParticleSpec {
-            num_particles,
-            context_window,
-            unroll_steps,
-            num_cells,
-            cell_dim,
-            num_rules,
-            selector_hidden,
-            rule_hidden,
-            noise_dim,
-            deterministic,
-            enable_noise,
-            noise_scale,
-            noise_anneal_steps,
-            learning_rate_readout,
-            learning_rate_selector,
-            learning_rate_rule,
-            bptt_depth,
-            optimizer_momentum,
-            grad_clip,
-            state_clip,
-            forget_lambda,
-            resample_threshold,
-            mutate_fraction,
-            mutate_scale,
-            mutate_model_params,
-            diagnostics_interval,
-            min_prob,
-            seed,
-        };
+        let mut spec = ParticleSpec::default();
+        spec.num_particles = num_particles;
+        spec.context_window = context_window;
+        spec.unroll_steps = unroll_steps;
+        spec.num_cells = num_cells;
+        spec.cell_dim = cell_dim;
+        spec.num_rules = num_rules;
+        spec.selector_hidden = selector_hidden;
+        spec.rule_hidden = rule_hidden;
+        spec.noise_dim = noise_dim;
+        spec.deterministic = deterministic;
+        spec.enable_noise = enable_noise;
+        spec.noise_scale = noise_scale;
+        spec.noise_anneal_steps = noise_anneal_steps;
+        spec.learning_rate_readout = learning_rate_readout;
+        spec.learning_rate_selector = learning_rate_selector;
+        spec.learning_rate_rule = learning_rate_rule;
+        spec.bptt_depth = bptt_depth;
+        spec.optimizer_momentum = optimizer_momentum;
+        spec.grad_clip = grad_clip;
+        spec.state_clip = state_clip;
+        spec.forget_lambda = forget_lambda;
+        spec.resample_threshold = resample_threshold;
+        spec.mutate_fraction = mutate_fraction;
+        spec.mutate_scale = mutate_scale;
+        spec.mutate_model_params = mutate_model_params;
+        spec.diagnostics_interval = diagnostics_interval;
+        spec.min_prob = min_prob;
+        spec.seed = seed;
         spec.validate()
             .map_err(|e| PyValueError::new_err(format!("invalid ParticleSpec: {e}")))?;
         Ok(Self { inner: spec })
@@ -690,6 +680,9 @@ impl PyCalibrationContextKind {
             CalibrationContextKind::Text => "CalibrationContextKind.Text",
             CalibrationContextKind::Repeat => "CalibrationContextKind.Repeat",
             CalibrationContextKind::TextRepeat => "CalibrationContextKind.TextRepeat",
+            _ => unreachable!(
+                "non-exhaustive CalibrationContextKind variant not exposed by bindings"
+            ),
         }
     }
 }
@@ -845,18 +838,17 @@ impl PyRateBackend {
         learning_rate: f64,
         bias_clip: f64,
     ) -> PyResult<Self> {
+        let context_kind = context
+            .map(parse_calibration_context_kind_value)
+            .transpose()?
+            .unwrap_or(CalibrationContextKind::Text);
+        let mut cal_spec = CalibratedSpec::new(base_backend.inner.clone(), context_kind);
+        cal_spec.bins = bins;
+        cal_spec.learning_rate = learning_rate;
+        cal_spec.bias_clip = bias_clip;
         Ok(Self {
             inner: RateBackend::Calibrated {
-                spec: Arc::new(CalibratedSpec {
-                    base: base_backend.inner.clone(),
-                    context: context
-                        .map(parse_calibration_context_kind_value)
-                        .transpose()?
-                        .unwrap_or(CalibrationContextKind::Text),
-                    bins,
-                    learning_rate,
-                    bias_clip,
-                }),
+                spec: Arc::new(cal_spec),
             },
         })
     }
@@ -920,10 +912,8 @@ impl PyCompressionBackend {
     fn rwkv7(method: Option<String>, coder: &str) -> PyResult<Self> {
         let coder = infotheory::backends::parse_rwkv7_coder(coder)
             .ok_or_else(|| PyValueError::new_err("coder must be 'ac' or 'rans'"))?;
-        let mut opts = infotheory::spec::CompressionBackendShorthandOptions {
-            default_framing: infotheory::compression::FramingMode::Framed,
-            ..Default::default()
-        };
+        let mut opts = infotheory::spec::CompressionBackendShorthandOptions::default();
+        opts.default_framing = infotheory::compression::FramingMode::Framed;
         if let Ok(path) = std::env::var("RWKV7_MODEL_PATH") {
             opts.default_rwkv_model_path = Some(path);
         }
@@ -3748,33 +3738,29 @@ impl PyAgentConfig {
         rosa_max_order: Option<i64>,
         zpaq_method: Option<String>,
     ) -> PyResult<Self> {
-        let inner = infotheory::aixi::agent::AgentConfig {
-            algorithm,
-            ct_depth,
-            agent_horizon,
-            observation_bits,
-            observation_stream_len,
-            observation_key_mode: observation_key_mode
-                .map(|m| m.inner)
-                .unwrap_or(infotheory::aixi::common::ObservationKeyMode::FullStream),
-            reward_bits,
-            agent_actions,
-            num_simulations,
-            exploration_exploitation_ratio,
-            discount_gamma,
-            min_reward,
-            max_reward,
-            reward_offset,
-            random_seed,
-            rate_backend: rate_backend.map(|rb| rb.inner.clone()),
-            rate_backend_max_order,
-            rwkv_model_path,
-            rwkv_method: None,
-            mamba_model_path: None,
-            mamba_method: None,
-            rosa_max_order,
-            zpaq_method,
-        };
+        let mut inner = infotheory::aixi::agent::AgentConfig::default();
+        inner.algorithm = algorithm;
+        inner.ct_depth = ct_depth;
+        inner.agent_horizon = agent_horizon;
+        inner.observation_bits = observation_bits;
+        inner.observation_stream_len = observation_stream_len;
+        inner.observation_key_mode = observation_key_mode
+            .map(|m| m.inner)
+            .unwrap_or(infotheory::aixi::common::ObservationKeyMode::FullStream);
+        inner.reward_bits = reward_bits;
+        inner.agent_actions = agent_actions;
+        inner.num_simulations = num_simulations;
+        inner.exploration_exploitation_ratio = exploration_exploitation_ratio;
+        inner.discount_gamma = discount_gamma;
+        inner.min_reward = min_reward;
+        inner.max_reward = max_reward;
+        inner.reward_offset = reward_offset;
+        inner.random_seed = random_seed;
+        inner.rate_backend = rate_backend.map(|rb| rb.inner.clone());
+        inner.rate_backend_max_order = rate_backend_max_order;
+        inner.rwkv_model_path = rwkv_model_path;
+        inner.rosa_max_order = rosa_max_order;
+        inner.zpaq_method = zpaq_method;
         inner.validate().map_err(PyValueError::new_err)?;
         Ok(Self { inner })
     }
@@ -3785,7 +3771,7 @@ impl PyAiqiConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
-        algorithm="ac-ctw".to_string(),
+        algorithm="ctw".to_string(),
         ct_depth=16,
         observation_bits=8,
         observation_stream_len=1,
@@ -3830,29 +3816,28 @@ impl PyAiqiConfig {
         rosa_max_order: Option<i64>,
         zpaq_method: Option<String>,
     ) -> PyResult<Self> {
-        let inner = infotheory::aixi::aiqi::AiqiConfig {
-            algorithm,
-            ct_depth,
-            observation_bits,
-            observation_stream_len,
-            reward_bits,
-            agent_actions,
-            min_reward,
-            max_reward,
-            reward_offset,
-            discount_gamma,
-            return_horizon,
-            return_bins,
-            augmentation_period: augmentation_period.unwrap_or(return_horizon),
-            history_prune_keep_steps,
-            baseline_exploration,
-            random_seed,
-            rate_backend: rate_backend.map(|rb| rb.inner.clone()),
-            rate_backend_max_order,
-            rwkv_model_path,
-            rosa_max_order,
-            zpaq_method,
-        };
+        let mut inner = infotheory::aixi::aiqi::AiqiConfig::default();
+        inner.algorithm = algorithm;
+        inner.ct_depth = ct_depth;
+        inner.observation_bits = observation_bits;
+        inner.observation_stream_len = observation_stream_len;
+        inner.reward_bits = reward_bits;
+        inner.agent_actions = agent_actions;
+        inner.min_reward = min_reward;
+        inner.max_reward = max_reward;
+        inner.reward_offset = reward_offset;
+        inner.discount_gamma = discount_gamma;
+        inner.return_horizon = return_horizon;
+        inner.return_bins = return_bins;
+        inner.augmentation_period = augmentation_period.unwrap_or(return_horizon);
+        inner.history_prune_keep_steps = history_prune_keep_steps;
+        inner.baseline_exploration = baseline_exploration;
+        inner.random_seed = random_seed;
+        inner.rate_backend = rate_backend.map(|rb| rb.inner.clone());
+        inner.rate_backend_max_order = rate_backend_max_order;
+        inner.rwkv_model_path = rwkv_model_path;
+        inner.rosa_max_order = rosa_max_order;
+        inner.zpaq_method = zpaq_method;
         inner.validate().map_err(PyValueError::new_err)?;
         Ok(Self { inner })
     }
@@ -4896,46 +4881,22 @@ mod tests {
                 infotheory::aixi::common::ObservationKeyMode::StreamHash
             );
 
-            let stream_hash_hyphen = pyo3::types::PyString::new(py, "stream-hash");
-            let parsed_hash_hyphen =
-                PyAgentSimulatorShim::parse_key_mode(stream_hash_hyphen.as_any());
-            assert_eq!(
-                parsed_hash_hyphen,
-                infotheory::aixi::common::ObservationKeyMode::StreamHash
-            );
-
-            let full_stream = pyo3::types::PyString::new(py, "fullstream");
+            let full_stream = pyo3::types::PyString::new(py, "full_stream");
             let parsed_full = PyAgentSimulatorShim::parse_key_mode(full_stream.as_any());
             assert_eq!(
                 parsed_full,
-                infotheory::aixi::common::ObservationKeyMode::FullStream
-            );
-
-            let full_stream_hyphen = pyo3::types::PyString::new(py, "full-stream");
-            let parsed_full_hyphen =
-                PyAgentSimulatorShim::parse_key_mode(full_stream_hyphen.as_any());
-            assert_eq!(
-                parsed_full_hyphen,
-                infotheory::aixi::common::ObservationKeyMode::FullStream
-            );
-
-            let full = pyo3::types::PyString::new(py, "full");
-            let parsed_full_alias = PyAgentSimulatorShim::parse_key_mode(full.as_any());
-            assert_eq!(
-                parsed_full_alias,
                 infotheory::aixi::common::ObservationKeyMode::FullStream
             );
         });
     }
 
     #[test]
-    fn parse_framing_mode_accepts_aliases() {
+    fn parse_framing_mode_accepts_canonical_names() {
         let raw = parse_framing_mode("raw").expect("raw framing");
         let framed = parse_framing_mode("framed").expect("framed framing");
-        let framed_alias = parse_framing_mode("frame").expect("frame alias");
         assert_eq!(raw, infotheory::compression::FramingMode::Raw);
         assert_eq!(framed, infotheory::compression::FramingMode::Framed);
-        assert_eq!(framed_alias, infotheory::compression::FramingMode::Framed);
+        assert!(parse_framing_mode("frame").is_err());
         assert!(parse_framing_mode("nope").is_err());
     }
 

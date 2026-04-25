@@ -158,23 +158,25 @@ fn nested_mixture_backend() -> RateBackend {
         spec: Arc::new(MixtureSpec::new(
             MixtureKind::Bayes,
             vec![
-                MixtureExpertSpec {
-                    name: Some("ctw".to_string()),
-                    log_prior: 0.0,
-                    max_order: -1,
-                    backend: RateBackend::Ctw { depth: 8 },
+                {
+                    let mut expert = MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 });
+                    expert.name = Some("ctw".to_string());
+                    expert.log_prior = 0.0;
+                    expert.max_order = -1;
+                    expert
                 },
-                MixtureExpertSpec {
-                    name: Some("match".to_string()),
-                    log_prior: -0.15,
-                    max_order: -1,
-                    backend: RateBackend::Match {
+                {
+                    let mut expert = MixtureExpertSpec::new(RateBackend::Match {
                         hash_bits: 18,
                         min_len: 4,
                         max_len: 64,
                         base_mix: 0.02,
                         confidence_scale: 1.0,
-                    },
+                    });
+                    expert.name = Some("match".to_string());
+                    expert.log_prior = -0.15;
+                    expert.max_order = -1;
+                    expert
                 },
             ],
         )),

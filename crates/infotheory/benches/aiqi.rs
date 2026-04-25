@@ -13,44 +13,46 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn base_cfg(algorithm: &str) -> AiqiConfig {
-    AiqiConfig {
-        algorithm: algorithm.to_string(),
-        ct_depth: 12,
-        observation_bits: 1,
-        observation_stream_len: 1,
-        reward_bits: 1,
-        agent_actions: 2,
-        min_reward: 0,
-        max_reward: 1,
-        reward_offset: 0,
-        discount_gamma: 0.99,
-        return_horizon: 4,
-        return_bins: 8,
-        augmentation_period: 4,
-        history_prune_keep_steps: None,
-        baseline_exploration: 1e-12,
-        random_seed: Some(7),
-        rate_backend: None,
-        rate_backend_max_order: 8,
-        rwkv_model_path: None,
-        rosa_max_order: Some(8),
-        zpaq_method: None,
-    }
+    let mut cfg = AiqiConfig::default();
+    cfg.algorithm = algorithm.to_string();
+    cfg.ct_depth = 12;
+    cfg.observation_bits = 1;
+    cfg.observation_stream_len = 1;
+    cfg.reward_bits = 1;
+    cfg.agent_actions = 2;
+    cfg.min_reward = 0;
+    cfg.max_reward = 1;
+    cfg.reward_offset = 0;
+    cfg.discount_gamma = 0.99;
+    cfg.return_horizon = 4;
+    cfg.return_bins = 8;
+    cfg.augmentation_period = 4;
+    cfg.history_prune_keep_steps = None;
+    cfg.baseline_exploration = 1e-12;
+    cfg.random_seed = Some(7);
+    cfg.rate_backend = None;
+    cfg.rate_backend_max_order = 8;
+    cfg.rwkv_model_path = None;
+    cfg.rosa_max_order = None;
+    cfg.zpaq_method = None;
+    cfg
 }
 
 fn mixture_backend() -> RateBackend {
     let experts = vec![
-        MixtureExpertSpec {
-            name: Some("ctw".to_string()),
-            log_prior: 0.0,
-            max_order: -1,
-            backend: RateBackend::Ctw { depth: 10 },
+        {
+            let mut expert = MixtureExpertSpec::new(RateBackend::Ctw { depth: 10 });
+            expert.name = Some("ctw".to_string());
+            expert.log_prior = 0.0;
+            expert.max_order = -1;
+            expert
         },
-        MixtureExpertSpec {
-            name: Some("rosa".to_string()),
-            log_prior: 0.0,
-            max_order: 8,
-            backend: RateBackend::RosaPlus,
+        {
+            let mut expert = MixtureExpertSpec::new(RateBackend::RosaPlus);
+            expert.name = Some("rosa".to_string());
+            expert.log_prior = 0.0;
+            expert.max_order = 8;
+            expert
         },
     ];
     RateBackend::Mixture {
@@ -80,8 +82,8 @@ fn main() {
     };
 
     let benches = [
-        ("ac-ctw", base_cfg("ac-ctw")),
-        ("rosa", base_cfg("rosa")),
+        ("ctw", base_cfg("ctw")),
+        ("rosaplus", base_cfg("rosaplus")),
         ("rate-rosa", rate_backend_cfg(RateBackend::RosaPlus)),
         ("mix-bayes", rate_backend_cfg(mixture_backend())),
     ];

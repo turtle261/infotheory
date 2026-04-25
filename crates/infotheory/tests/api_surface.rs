@@ -1,6 +1,7 @@
 use infotheory::api::{
     MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend, RateBackendSession,
 };
+use infotheory::spec::CanonicalJson;
 use std::sync::Arc;
 
 #[test]
@@ -28,11 +29,10 @@ fn api_surface_spec_types_serialize_canonically() {
 
     let mixture = MixtureSpec::new(
         MixtureKind::Bayes,
-        vec![MixtureExpertSpec {
-            name: Some("ctw".to_string()),
-            log_prior: 0.0,
-            max_order: -1,
-            backend: backend.clone(),
+        vec![{
+            let mut expert = MixtureExpertSpec::new(backend.clone());
+            expert.name = Some("ctw".to_string());
+            expert
         }],
     );
     let mix_json = mixture.to_canonical_json().expect("mixture json");

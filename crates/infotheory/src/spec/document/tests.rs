@@ -5,6 +5,7 @@ use crate::aixi::common::{DEFAULT_RANDOM_SEED, ObservationKeyMode};
 #[cfg(feature = "backend-ctw")]
 use crate::api::CompressionBackend;
 use crate::api::RateBackend;
+use crate::spec::CanonicalJson;
 
 #[cfg(feature = "backend-ctw")]
 fn sample_planner_run() -> PlannerRunSpec {
@@ -749,4 +750,51 @@ fn planner_run_validation_reports_missing_backend_feature() {
             .contains("requires infotheory feature 'backend-ctw'"),
         "{err}"
     );
+}
+
+#[test]
+fn builtin_environment_canonical_names_round_trip() {
+    use BuiltinEnvironmentSpec::*;
+    let cases: &[(BuiltinEnvironmentSpec, &str)] = &[
+        (CoinFlip, "coin_flip"),
+        (BiasedRockPaperScissor, "biased_rock_paper_scissor"),
+        (KuhnPoker, "kuhn_poker"),
+        (ExtendedTiger, "extended_tiger"),
+        (TicTacToe, "tic_tac_toe"),
+        (Blackjack, "blackjack"),
+        (Platformer, "platformer"),
+    ];
+    for (variant, expected) in cases {
+        assert_eq!(
+            variant.canonical_name(),
+            *expected,
+            "canonical_name() for {variant:?}"
+        );
+    }
+}
+
+#[test]
+fn spec_document_kind_str_matches_serialized_kind_field() {
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::coders::CoderType;
+    use crate::compression::FramingMode;
+
+    let rate = SpecDocument::RateBackend(RateBackend::Ctw { depth: 4 });
+    assert_eq!(rate.kind_str(), "rate_backend");
+
+    let compression = SpecDocument::CompressionBackend(CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 4 },
+        coder: CoderType::AC,
+        framing: FramingMode::Framed,
+    });
+    assert_eq!(compression.kind_str(), "compression_backend");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn environment_spec_kind_str_is_stable() {
+    let spec = EnvironmentSpec::Builtin {
+        builtin: BuiltinEnvironmentSpec::CoinFlip,
+    };
+    assert_eq!(spec.kind_str(), "builtin");
 }

@@ -367,7 +367,7 @@ define_rate_backend_catalog! {
     backend {
         kind: SparseMatch,
         canonical: "sparse-match",
-        aliases: ["sparse-match", "sparse_match", "sparsematch"],
+        aliases: ["sparse-match"],
         feature: "backend-match",
         compile_plan: crate::spec::core::compile_rate_plan_sparse_match,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_sparse_match,
@@ -391,7 +391,7 @@ define_rate_backend_catalog! {
     backend {
         kind: Ppmd,
         canonical: "ppmd",
-        aliases: ["ppmd", "ppm"],
+        aliases: ["ppmd"],
         feature: "backend-ppmd",
         compile_plan: crate::spec::core::compile_rate_plan_ppmd,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_ppmd,
@@ -463,7 +463,7 @@ define_rate_backend_catalog! {
     backend {
         kind: FacCtw,
         canonical: "fac-ctw",
-        aliases: ["fac-ctw", "facctw"],
+        aliases: ["fac-ctw"],
         feature: "backend-ctw",
         compile_plan: crate::spec::core::compile_rate_plan_fac_ctw,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_fac_ctw,
@@ -511,7 +511,7 @@ define_rate_backend_catalog! {
     backend {
         kind: Mixture,
         canonical: "mixture",
-        aliases: ["mixture", "mix"],
+        aliases: ["mixture"],
         feature: "backend-mixture",
         compile_plan: crate::spec::core::compile_rate_plan_mixture,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_mixture,
@@ -535,7 +535,7 @@ define_rate_backend_catalog! {
     backend {
         kind: Particle,
         canonical: "particle",
-        aliases: ["particle", "particles"],
+        aliases: ["particle"],
         feature: "backend-particle",
         compile_plan: crate::spec::core::compile_rate_plan_particle,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_particle,
@@ -559,7 +559,7 @@ define_rate_backend_catalog! {
     backend {
         kind: Calibrated,
         canonical: "calibrated",
-        aliases: ["calibrated", "cal"],
+        aliases: ["calibrated"],
         feature: "backend-calibrated",
         compile_plan: crate::spec::core::compile_rate_plan_calibrated,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_calibrated,
@@ -583,7 +583,7 @@ define_rate_backend_catalog! {
     backend {
         kind: Mamba,
         canonical: "mamba",
-        aliases: ["mamba", "mamba1"],
+        aliases: ["mamba"],
         feature: "backend-mamba",
         compile_plan: crate::spec::core::compile_rate_plan_mamba,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_mamba,
@@ -607,7 +607,7 @@ define_rate_backend_catalog! {
     backend {
         kind: Rwkv7,
         canonical: "rwkv7",
-        aliases: ["rwkv7", "rwkv"],
+        aliases: ["rwkv7"],
         feature: "backend-rwkv",
         compile_plan: crate::spec::core::compile_rate_plan_rwkv7,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_rwkv7,
@@ -647,7 +647,7 @@ define_compression_backend_catalog! {
     backend {
         kind: Rwkv7,
         canonical: "rwkv7",
-        aliases: ["rwkv7", "rwkv"],
+        aliases: ["rwkv7"],
         feature: "backend-rwkv",
         compile_plan: crate::spec::core::compile_compression_plan_rwkv7,
         to_wrapper: crate::spec::core::compression_plan_to_wrapper_rwkv7,
@@ -660,7 +660,7 @@ define_compression_backend_catalog! {
     backend {
         kind: RateAc,
         canonical: "rate-ac",
-        aliases: ["rate-ac", "rate_ac", "rateac"],
+        aliases: ["rate-ac"],
         feature: none,
         compile_plan: crate::spec::core::compile_compression_plan_rate,
         to_wrapper: crate::spec::core::compression_plan_to_wrapper_rate,
@@ -673,7 +673,7 @@ define_compression_backend_catalog! {
     backend {
         kind: RateRans,
         canonical: "rate-rans",
-        aliases: ["rate-rans", "rate_rans", "raterans"],
+        aliases: ["rate-rans"],
         feature: none,
         compile_plan: crate::spec::core::compile_compression_plan_rate,
         to_wrapper: crate::spec::core::compression_plan_to_wrapper_rate,
@@ -2375,16 +2375,22 @@ mod tests {
             .expect("rosa descriptor");
         assert_eq!(rosa.canonical, "rosaplus");
 
-        let mix = find_backend_descriptor_in_registry(RATE_BACKEND_REGISTRY, "mix")
+        let mixture = find_backend_descriptor_in_registry(RATE_BACKEND_REGISTRY, "mixture")
             .expect("mixture descriptor");
-        assert_eq!(mix.canonical, "mixture");
+        assert_eq!(mixture.canonical, "mixture");
+
+        let missing = find_backend_descriptor_in_registry(RATE_BACKEND_REGISTRY, "mix");
+        assert!(missing.is_none(), "legacy alias 'mix' must be rejected");
     }
 
     #[test]
     fn compression_registry_resolves_aliases() {
-        let ac = find_backend_descriptor_in_registry(COMPRESSION_BACKEND_REGISTRY, "rate_ac")
+        let ac = find_backend_descriptor_in_registry(COMPRESSION_BACKEND_REGISTRY, "rate-ac")
             .expect("rate-ac descriptor");
         assert_eq!(ac.canonical, "rate-ac");
+
+        let missing = find_backend_descriptor_in_registry(COMPRESSION_BACKEND_REGISTRY, "rate_ac");
+        assert!(missing.is_none(), "legacy alias 'rate_ac' must be rejected");
     }
 
     #[test]

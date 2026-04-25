@@ -23,12 +23,7 @@ fn mixture_single_expert_matches_backend() {
 
     let spec = MixtureSpec::new(
         MixtureKind::Bayes,
-        vec![MixtureExpertSpec {
-            name: None,
-            log_prior: 0.0,
-            max_order: -1,
-            backend: base.clone(),
-        }],
+        vec![MixtureExpertSpec::new(base.clone())],
     );
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(spec),
@@ -49,12 +44,7 @@ fn mixture_single_sequitur_expert_matches_backend() {
 
     let spec = MixtureSpec::new(
         MixtureKind::Bayes,
-        vec![MixtureExpertSpec {
-            name: Some("sequitur".to_string()),
-            log_prior: 0.0,
-            max_order: -1,
-            backend: base.clone(),
-        }],
+        vec![MixtureExpertSpec::new(base.clone()).with_name("sequitur")],
     );
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(spec),
@@ -78,12 +68,7 @@ fn rwkv_mixture_single_expert_matches_backend_with_tbptt() {
 
     let spec = MixtureSpec::new(
         MixtureKind::Bayes,
-        vec![MixtureExpertSpec {
-            name: Some("rwkv".to_string()),
-            log_prior: 0.0,
-            max_order: -1,
-            backend: base.clone(),
-        }],
+        vec![MixtureExpertSpec::new(base.clone()).with_name("rwkv")],
     );
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(spec),
@@ -104,23 +89,16 @@ fn mixture_recursive_expert_matches_backend() {
 
     let inner = MixtureSpec::new(
         MixtureKind::Bayes,
-        vec![MixtureExpertSpec {
-            name: Some("ctw".to_string()),
-            log_prior: 0.0,
-            max_order: -1,
-            backend: base.clone(),
-        }],
+        vec![MixtureExpertSpec::new(base.clone()).with_name("ctw")],
     );
     let outer = MixtureSpec::new(
         MixtureKind::Bayes,
-        vec![MixtureExpertSpec {
-            name: Some("inner".to_string()),
-            log_prior: 0.0,
-            max_order: -1,
-            backend: RateBackend::Mixture {
+        vec![
+            MixtureExpertSpec::new(RateBackend::Mixture {
                 spec: Arc::new(inner),
-            },
-        }],
+            })
+            .with_name("inner"),
+        ],
     );
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(outer),
@@ -141,12 +119,7 @@ fn neural_mixture_single_expert_matches_backend() {
 
     let spec = MixtureSpec::new(
         MixtureKind::Neural,
-        vec![MixtureExpertSpec {
-            name: None,
-            log_prior: 0.0,
-            max_order: -1,
-            backend: base.clone(),
-        }],
+        vec![MixtureExpertSpec::new(base.clone())],
     )
     .with_alpha(0.05);
     let mix_backend = RateBackend::Mixture {
@@ -168,12 +141,7 @@ fn convex_mixture_single_expert_matches_backend() {
 
     let spec = MixtureSpec::new(
         MixtureKind::Convex,
-        vec![MixtureExpertSpec {
-            name: None,
-            log_prior: 0.0,
-            max_order: -1,
-            backend: base.clone(),
-        }],
+        vec![MixtureExpertSpec::new(base.clone())],
     )
     .with_alpha(1.25);
     let mix_backend = RateBackend::Mixture {
@@ -193,24 +161,15 @@ fn switching_theorem_schedule_backend_executes() {
     let spec = MixtureSpec::new(
         MixtureKind::Switching,
         vec![
-            MixtureExpertSpec {
-                name: Some("ctw".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Ctw { depth: 8 },
-            },
-            MixtureExpertSpec {
-                name: Some("match".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Match {
-                    hash_bits: 18,
-                    min_len: 3,
-                    max_len: 96,
-                    base_mix: 0.03,
-                    confidence_scale: 1.0,
-                },
-            },
+            MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 }).with_name("ctw"),
+            MixtureExpertSpec::new(RateBackend::Match {
+                hash_bits: 18,
+                min_len: 3,
+                max_len: 96,
+                base_mix: 0.03,
+                confidence_scale: 1.0,
+            })
+            .with_name("match"),
         ],
     )
     .with_schedule(MixtureScheduleMode::Theorem)
@@ -228,22 +187,13 @@ fn convex_theorem_schedule_backend_executes() {
     let spec = MixtureSpec::new(
         MixtureKind::Convex,
         vec![
-            MixtureExpertSpec {
-                name: Some("ctw".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Ctw { depth: 8 },
-            },
-            MixtureExpertSpec {
-                name: Some("fac".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::FacCtw {
-                    base_depth: 8,
-                    num_percept_bits: 8,
-                    encoding_bits: 8,
-                },
-            },
+            MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 }).with_name("ctw"),
+            MixtureExpertSpec::new(RateBackend::FacCtw {
+                base_depth: 8,
+                num_percept_bits: 8,
+                encoding_bits: 8,
+            })
+            .with_name("fac"),
         ],
     )
     .with_schedule(MixtureScheduleMode::Theorem)
@@ -261,44 +211,27 @@ fn neural_mixture_supports_nested_mixture_expert() {
     let inner = MixtureSpec::new(
         MixtureKind::Bayes,
         vec![
-            MixtureExpertSpec {
-                name: Some("ctw".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Ctw { depth: 8 },
-            },
-            MixtureExpertSpec {
-                name: Some("fac".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::FacCtw {
-                    base_depth: 8,
-                    num_percept_bits: 8,
-                    encoding_bits: 8,
-                },
-            },
+            MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 }).with_name("ctw"),
+            MixtureExpertSpec::new(RateBackend::FacCtw {
+                base_depth: 8,
+                num_percept_bits: 8,
+                encoding_bits: 8,
+            })
+            .with_name("fac"),
         ],
     );
 
     let outer = MixtureSpec::new(
         MixtureKind::Neural,
         vec![
-            MixtureExpertSpec {
-                name: Some("nested".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Mixture {
-                    spec: Arc::new(inner),
-                },
-            },
-            MixtureExpertSpec {
-                name: Some("zpaq".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Zpaq {
-                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
-                },
-            },
+            MixtureExpertSpec::new(RateBackend::Mixture {
+                spec: Arc::new(inner),
+            })
+            .with_name("nested"),
+            MixtureExpertSpec::new(RateBackend::Zpaq {
+                method: infotheory::api::ZpaqMethodSpec::literal("1"),
+            })
+            .with_name("zpaq"),
         ],
     )
     .with_alpha(0.03);
@@ -316,45 +249,28 @@ fn convex_mixture_supports_nested_mixture_expert() {
     let inner = MixtureSpec::new(
         MixtureKind::Bayes,
         vec![
-            MixtureExpertSpec {
-                name: Some("ctw".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Ctw { depth: 8 },
-            },
-            MixtureExpertSpec {
-                name: Some("fac".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::FacCtw {
-                    base_depth: 8,
-                    num_percept_bits: 8,
-                    encoding_bits: 8,
-                },
-            },
+            MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 }).with_name("ctw"),
+            MixtureExpertSpec::new(RateBackend::FacCtw {
+                base_depth: 8,
+                num_percept_bits: 8,
+                encoding_bits: 8,
+            })
+            .with_name("fac"),
         ],
     );
 
     let outer = MixtureSpec::new(
         MixtureKind::Convex,
         vec![
-            MixtureExpertSpec {
-                name: Some("nested".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Mixture {
-                    spec: Arc::new(inner),
-                },
-            },
-            MixtureExpertSpec {
-                name: Some("ppmd".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Ppmd {
-                    order: 6,
-                    memory_mb: 8,
-                },
-            },
+            MixtureExpertSpec::new(RateBackend::Mixture {
+                spec: Arc::new(inner),
+            })
+            .with_name("nested"),
+            MixtureExpertSpec::new(RateBackend::Ppmd {
+                order: 6,
+                memory_mb: 8,
+            })
+            .with_name("ppmd"),
         ],
     )
     .with_alpha(1.25);
@@ -403,32 +319,21 @@ fn neural_mixture_supports_calibrated_expert() {
     let spec = MixtureSpec::new(
         MixtureKind::Neural,
         vec![
-            MixtureExpertSpec {
-                name: Some("cal".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Calibrated {
-                    spec: Arc::new(CalibratedSpec {
-                        base: RateBackend::Ctw { depth: 8 },
-                        context: CalibrationContextKind::Text,
-                        bins: 33,
-                        learning_rate: 0.02,
-                        bias_clip: 4.0,
-                    }),
-                },
-            },
-            MixtureExpertSpec {
-                name: Some("match".to_string()),
-                log_prior: 0.0,
-                max_order: -1,
-                backend: RateBackend::Match {
-                    hash_bits: 20,
-                    min_len: 4,
-                    max_len: 255,
-                    base_mix: 0.02,
-                    confidence_scale: 1.0,
-                },
-            },
+            MixtureExpertSpec::new(RateBackend::Calibrated {
+                spec: Arc::new(CalibratedSpec::new(
+                    RateBackend::Ctw { depth: 8 },
+                    CalibrationContextKind::Text,
+                )),
+            })
+            .with_name("cal"),
+            MixtureExpertSpec::new(RateBackend::Match {
+                hash_bits: 20,
+                min_len: 4,
+                max_len: 255,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            })
+            .with_name("match"),
         ],
     )
     .with_alpha(0.03);

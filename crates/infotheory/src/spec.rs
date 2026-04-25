@@ -37,6 +37,17 @@ use std::sync::Arc;
 /// Result type used by the shared spec/parsing layer.
 pub type SpecResult<T> = Result<T, SpecError>;
 
+/// Trait for deterministic canonical JSON serialization.
+pub trait CanonicalJson {
+    /// Serialize this value into canonical JSON value form.
+    fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value>;
+
+    /// Serialize this value into deterministic canonical JSON text.
+    fn to_canonical_json(&self) -> SpecResult<String> {
+        serde_json::to_string_pretty(&self.to_canonical_json_value()?).map_err(SpecError::from)
+    }
+}
+
 /// Lightweight error type for spec/config parsing and loading.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpecError {
@@ -86,6 +97,7 @@ impl From<serde_json::Error> for SpecError {
 
 /// Defaults for shorthand backend parsing such as CLI `--rate-backend ... --method ...`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct RateBackendShorthandOptions {
     /// Base directory used to resolve relative spec/model paths.
     pub base_dir: PathBuf,
@@ -135,6 +147,7 @@ impl Default for RateBackendShorthandOptions {
 /// Defaults for shorthand compression-backend parsing such as
 /// CLI/Python `--compression-backend ... --method ...`.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct CompressionBackendShorthandOptions {
     /// Base directory used to resolve relative model/spec paths.
     pub base_dir: PathBuf,
@@ -160,15 +173,11 @@ impl Default for CompressionBackendShorthandOptions {
     }
 }
 
-/// Resolve a relative spec path against a base directory.
-pub fn resolve_spec_path(base_dir: &Path, path: &str) -> PathBuf {
-    resolve_spec_path_buf(base_dir, Path::new(path))
-}
-
-/// Resolve a spec path against a base directory when the path is already parsed.
+/// Resolve a spec path against a base directory.
 ///
 /// Absolute paths are returned unchanged; relative paths are joined to `base_dir`.
-pub fn resolve_spec_path_buf(base_dir: &Path, path: &Path) -> PathBuf {
+pub fn resolve_spec_path(base_dir: &Path, path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -257,12 +266,10 @@ pub fn load_json_value_from_path(
 fn parse_calibration_context_kind(value: Option<&str>) -> SpecResult<CalibrationContextKind> {
     match value.unwrap_or("text").trim().to_ascii_lowercase().as_str() {
         "global" => Ok(CalibrationContextKind::Global),
-        "byteclass" | "byte-class" | "byte_class" | "class" => {
-            Ok(CalibrationContextKind::ByteClass)
-        }
+        "byteclass" => Ok(CalibrationContextKind::ByteClass),
         "text" => Ok(CalibrationContextKind::Text),
         "repeat" => Ok(CalibrationContextKind::Repeat),
-        "textrepeat" | "text-repeat" | "text_repeat" => Ok(CalibrationContextKind::TextRepeat),
+        "textrepeat" => Ok(CalibrationContextKind::TextRepeat),
         other => Err(SpecError::new(format!(
             "unknown calibration context '{other}'"
         ))),
@@ -284,7 +291,7 @@ fn parse_framing_mode(value: Option<&str>) -> SpecResult<crate::compression::Fra
         .to_ascii_lowercase()
         .as_str()
     {
-        "framed" | "frame" => Ok(crate::compression::FramingMode::Framed),
+        "framed" => Ok(crate::compression::FramingMode::Framed),
         "raw" => Ok(crate::compression::FramingMode::Raw),
         other => Err(SpecError::new(format!("unknown framing mode '{other}'"))),
     }
@@ -342,7 +349,7 @@ fn canonicalize_explicit_file_method(
             "empty file path in {backend_label} method"
         )));
     }
-    let full = resolve_spec_path_buf(base_dir, &path);
+    let full = resolve_spec_path(base_dir, &path);
     let mut canonical = format!(
         "file:{}",
         crate::backends::llm_policy::render_method_file_path(&full)
@@ -375,7 +382,7 @@ fn normalize_rwkv_method_spec_for_base_dir(
 ) -> SpecResult<crate::rwkvzip::MethodSpec> {
     let normalized = match method {
         crate::rwkvzip::MethodSpec::File { path, policy } => crate::rwkvzip::MethodSpec::File {
-            path: resolve_spec_path(base_dir, &path.to_string_lossy()),
+            path: resolve_spec_path(base_dir, path),
             policy: policy.clone(),
         },
         crate::rwkvzip::MethodSpec::Online { cfg, policy } => crate::rwkvzip::MethodSpec::Online {
@@ -410,7 +417,7 @@ fn normalize_mamba_method_spec_for_base_dir(
 ) -> SpecResult<crate::mambazip::MethodSpec> {
     let normalized = match method {
         crate::mambazip::MethodSpec::File { path, policy } => crate::mambazip::MethodSpec::File {
-            path: resolve_spec_path(base_dir, &path.to_string_lossy()),
+            path: resolve_spec_path(base_dir, path),
             policy: policy.clone(),
         },
         crate::mambazip::MethodSpec::Online { cfg, policy } => {
@@ -1025,17 +1032,6 @@ pub fn compression_backend_to_json_value(
             "framing": framing_mode_name(*framing),
         })),
     }
-}
-
-/// Serialize a `RateBackend` to deterministic canonical JSON text.
-pub fn rate_backend_to_canonical_json(backend: &RateBackend) -> SpecResult<String> {
-    serde_json::to_string_pretty(&rate_backend_to_json_value(backend)?).map_err(SpecError::from)
-}
-
-/// Serialize a `CompressionBackend` to deterministic canonical JSON text.
-pub fn compression_backend_to_canonical_json(backend: &CompressionBackend) -> SpecResult<String> {
-    serde_json::to_string_pretty(&compression_backend_to_json_value(backend)?)
-        .map_err(SpecError::from)
 }
 
 /// Parse a `ParticleSpec` from JSON.
@@ -1897,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn shorthand_compression_aliases_compile_to_identical_canonical_bytes() {
+    fn shorthand_compression_requires_canonical_names() {
         let Some(default_rate_backend) = sample_enabled_leaf_rate_backend() else {
             return;
         };
@@ -1905,21 +1901,22 @@ mod tests {
             default_rate_backend: Some(default_rate_backend),
             ..CompressionBackendShorthandOptions::default()
         };
-        let rate_ac = compile_compression_backend_name_method("rate_ac", None, None, &opts)
-            .expect("compile rate_ac alias");
-        let rate_ac_canonical =
-            compile_compression_backend_name_method("rate-ac", None, None, &opts)
-                .expect("compile rate-ac canonical");
+        let canonical = compile_compression_backend_name_method("rate-ac", None, None, &opts)
+            .expect("compile rate-ac canonical");
+        let canonical_kind = canonical.canonical_spec().kind();
         assert_eq!(
-            rate_ac.canonical_bytes().as_slice(),
-            rate_ac_canonical.canonical_bytes().as_slice()
+            canonical_kind,
+            crate::runtime::CompressionBackendKind::RateAc
         );
-        assert_eq!(
-            rate_ac.canonical_spec().to_canonical_json().unwrap(),
-            rate_ac_canonical
-                .canonical_spec()
-                .to_canonical_json()
-                .unwrap()
+
+        let err = match compile_compression_backend_name_method("rate_ac", None, None, &opts) {
+            Ok(_) => panic!("legacy alias must be rejected"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown compression backend") || msg.contains("not available"),
+            "unexpected error: {msg}"
         );
     }
 
@@ -2398,9 +2395,10 @@ mod tests {
     #[test]
     fn canonical_json_emits_typed_zpaq_method_objects() {
         let rate = serde_json::from_str::<serde_json::Value>(
-            &rate_backend_to_canonical_json(&RateBackend::Zpaq {
+            &RateBackend::Zpaq {
                 method: crate::api::ZpaqMethodSpec::literal("5"),
-            })
+            }
+            .to_canonical_json()
             .expect("rate json"),
         )
         .expect("valid rate json");
@@ -2409,9 +2407,10 @@ mod tests {
         assert_eq!(rate["method"]["value"], "5");
 
         let compression = serde_json::from_str::<serde_json::Value>(
-            &compression_backend_to_canonical_json(&CompressionBackend::Zpaq {
+            &CompressionBackend::Zpaq {
                 method: crate::api::ZpaqMethodSpec::literal("5"),
-            })
+            }
+            .to_canonical_json()
             .expect("compression json"),
         )
         .expect("valid compression json");
@@ -2488,10 +2487,11 @@ mod tests {
     #[test]
     fn canonical_json_emits_typed_rwkv_method_objects() {
         let value = serde_json::from_str::<serde_json::Value>(
-            &rate_backend_to_canonical_json(&RateBackend::Rwkv7Method {
+            &RateBackend::Rwkv7Method {
                 method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,intermediate=64,layers=1")
                     .expect("rwkv method spec"),
-            })
+            }
+            .to_canonical_json()
             .expect("rate json"),
         )
         .expect("valid rate json");
@@ -2507,12 +2507,13 @@ mod tests {
     #[test]
     fn canonical_json_emits_typed_mamba_method_objects() {
         let value = serde_json::from_str::<serde_json::Value>(
-            &rate_backend_to_canonical_json(&RateBackend::MambaMethod {
+            &RateBackend::MambaMethod {
                 method: crate::mambazip::parse_method_spec(
                     "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16",
                 )
                 .expect("mamba method spec"),
-            })
+            }
+            .to_canonical_json()
             .expect("rate json"),
         )
         .expect("valid rate json");

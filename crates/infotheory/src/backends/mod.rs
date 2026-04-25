@@ -261,7 +261,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_rate_backend_name_canonicalizes_aliases() {
+    fn resolve_rate_backend_name_enforces_canonical_names() {
         let rosa = if cfg!(feature = "backend-rosa") {
             BackendAvailability::Enabled("rosaplus")
         } else {
@@ -296,9 +296,17 @@ mod tests {
         };
 
         assert_eq!(resolve_rate_backend_name("  Rosa  "), Some(rosa));
-        assert_eq!(resolve_rate_backend_name("facctw"), Some(fac_ctw));
-        assert_eq!(resolve_rate_backend_name("mix"), Some(mixture));
+        assert_eq!(resolve_rate_backend_name("fac-ctw"), Some(fac_ctw));
+        assert_eq!(resolve_rate_backend_name("mixture"), Some(mixture));
         assert_eq!(resolve_rate_backend_name("sequitur"), Some(sequitur));
+
+        assert_eq!(resolve_rate_backend_name("facctw"), None);
+        assert_eq!(resolve_rate_backend_name("mix"), None);
+        assert_eq!(resolve_rate_backend_name("sparsematch"), None);
+        assert_eq!(resolve_rate_backend_name("ppm"), None);
+        assert_eq!(resolve_rate_backend_name("cal"), None);
+        assert_eq!(resolve_rate_backend_name("mamba1"), None);
+        assert_eq!(resolve_rate_backend_name("rwkv"), None);
         assert_eq!(resolve_rate_backend_name("unknown"), None);
     }
 
@@ -326,7 +334,7 @@ mod tests {
             );
         } else {
             assert_eq!(
-                resolve_rate_backend_name("rwkv"),
+                resolve_rate_backend_name("rwkv7"),
                 Some(BackendAvailability::Disabled {
                     canonical: "rwkv7",
                     feature: "backend-rwkv",
@@ -336,7 +344,7 @@ mod tests {
 
         if cfg!(feature = "backend-mamba") {
             assert_eq!(
-                resolve_rate_backend_name("mamba1"),
+                resolve_rate_backend_name("mamba"),
                 Some(BackendAvailability::Enabled("mamba"))
             );
         } else {
@@ -351,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_compression_backend_name_canonicalizes_aliases() {
+    fn resolve_compression_backend_name_enforces_canonical_names() {
         assert_eq!(resolve_compression_backend_name("unknown"), None);
 
         if cfg!(feature = "backend-zpaq") {
@@ -370,20 +378,26 @@ mod tests {
         }
 
         assert_eq!(
-            resolve_compression_backend_name("rate_ac"),
+            resolve_compression_backend_name("rate-ac"),
             Some(BackendAvailability::Enabled("rate-ac"))
         );
         assert_eq!(
-            resolve_compression_backend_name("raterans"),
+            resolve_compression_backend_name("rate-rans"),
             Some(BackendAvailability::Enabled("rate-rans"))
         );
 
+        assert_eq!(resolve_compression_backend_name("rate_ac"), None);
+        assert_eq!(resolve_compression_backend_name("raterans"), None);
+        assert_eq!(resolve_compression_backend_name("rate_rans"), None);
+
         if cfg!(feature = "backend-rwkv") {
             assert_eq!(
-                resolve_compression_backend_name("rwkv"),
+                resolve_compression_backend_name("rwkv7"),
                 Some(BackendAvailability::Enabled("rwkv7"))
             );
         }
+
+        assert_eq!(resolve_compression_backend_name("rwkv"), None);
     }
 
     #[test]

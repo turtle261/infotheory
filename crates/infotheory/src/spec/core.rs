@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 /// Compilation environment for backend/spec validation and canonicalization.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct SpecEnvironment {
     base_dir: PathBuf,
 }
@@ -37,6 +38,7 @@ impl SpecEnvironment {
 
 /// Typed external asset reference captured by a validated/compiled spec.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
 pub enum AssetRef {
     /// Filesystem-backed asset resolved relative to a [`SpecEnvironment`].
     Filesystem(PathBuf),
@@ -79,6 +81,7 @@ impl From<Vec<u8>> for CanonicalBytes {
 
 /// Shared execution family for method-backed neural backends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
 pub enum MethodBackendFamily {
     /// Mamba family.
     Mamba,
@@ -88,6 +91,7 @@ pub enum MethodBackendFamily {
 
 /// Trace-model execution strategy used by VM/AIXI adapters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
 pub enum RateBackendTraceStrategy {
     /// Direct ROSA-specific strategy.
     Rosa,
@@ -107,6 +111,7 @@ pub enum RateBackendTraceStrategy {
 
 /// Shared capability metadata for rate backends.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct RateBackendCapabilities {
     /// Canonical backend family name.
     pub canonical_name: &'static str,
@@ -130,6 +135,7 @@ pub struct RateBackendCapabilities {
 
 /// Shared capability metadata for compression backends.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct CompressionBackendCapabilities {
     /// Canonical backend family name.
     pub canonical_name: &'static str,

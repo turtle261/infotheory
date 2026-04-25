@@ -14,6 +14,7 @@ pub type AssetId = String;
 
 /// Filesystem binding for a named external asset referenced by a spec document.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct AssetBinding {
     /// Stable asset identifier used inside canonical specs.
     pub id: AssetId,
@@ -23,6 +24,7 @@ pub struct AssetBinding {
 
 /// Resolved runtime asset binding derived from a canonical asset identifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ResolvedAssetBinding {
     /// Stable asset identifier used inside canonical specs.
     pub id: AssetId,
@@ -32,6 +34,7 @@ pub struct ResolvedAssetBinding {
 
 /// Built-in non-VM environment choices available to planner runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum BuiltinEnvironmentSpec {
     /// GameEngine biased coin-flip environment.
     CoinFlip,
@@ -51,6 +54,7 @@ pub enum BuiltinEnvironmentSpec {
 
 /// Shared-memory persistence policy for Nyx VM environments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SharedMemoryPolicySpec {
     /// Preserve the region across resets.
     Preserve,
@@ -60,6 +64,7 @@ pub enum SharedMemoryPolicySpec {
 
 /// Reward shaping configuration for VM environments.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum VmRewardShapingSpec {
     /// Entropy reduction relative to a baseline asset.
     EntropyReduction {
@@ -87,6 +92,7 @@ pub enum VmRewardShapingSpec {
 
 /// Reward policy for canonical VM environment specs.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum VmRewardPolicySpec {
     /// Parse reward directly from the guest protocol.
     FromGuest,
@@ -103,6 +109,7 @@ pub enum VmRewardPolicySpec {
 
 /// Optional information-theoretic action filtering for VM runs.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct VmActionFilterSpec {
     /// Minimum entropy threshold.
     pub min_entropy: Option<f64>,
@@ -122,6 +129,7 @@ pub struct VmActionFilterSpec {
 
 /// Optional VM trace collection settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct VmTraceSpec {
     /// Shared-memory region name carrying trace bytes.
     pub shared_region_name: Option<String>,
@@ -133,6 +141,7 @@ pub struct VmTraceSpec {
 
 /// Canonical observation derivation modes for VM environments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum VmObservationPolicySpec {
     /// Parse observations from the guest protocol.
     FromGuest,
@@ -146,6 +155,7 @@ pub enum VmObservationPolicySpec {
 
 /// Canonical normalization modes for VM observation streams.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum VmObservationStreamModeSpec {
     /// Pad short streams and truncate long streams.
     PadTruncate,
@@ -157,6 +167,7 @@ pub enum VmObservationStreamModeSpec {
 
 /// Canonical payload encodings for VM action and protocol payloads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum VmPayloadEncodingSpec {
     /// Interpret payload strings as UTF-8 text.
     Utf8,
@@ -166,6 +177,7 @@ pub enum VmPayloadEncodingSpec {
 
 /// Canonical fuzz mutator choices for VM action generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum VmFuzzMutatorSpec {
     /// Flip one random bit.
     FlipBit,
@@ -185,6 +197,7 @@ pub enum VmFuzzMutatorSpec {
 
 /// Canonical runtime action source for VM environments.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum VmRuntimeActionSourceSpec {
     /// Inline literal action payloads.
     Literal {
@@ -216,6 +229,7 @@ pub enum VmRuntimeActionSourceSpec {
 
 /// Canonical Nyx/Firecracker environment configuration.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct VmEnvironmentSpec {
     /// Asset identifier pointing at the Firecracker JSON config.
     pub firecracker_config_asset: AssetId,
@@ -281,6 +295,7 @@ pub struct VmEnvironmentSpec {
 
 /// Canonical planner-visible environment specification.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum EnvironmentSpec {
     /// Built-in Rust environment.
     Builtin {
@@ -294,6 +309,7 @@ pub enum EnvironmentSpec {
 
 /// Planner observation/reward/action interface contract.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct PlannerInterfaceSpec {
     /// Observation bit width.
     pub observation_bits: usize,
@@ -315,6 +331,7 @@ pub struct PlannerInterfaceSpec {
 
 /// MC-AIXI controller configuration using a unified rate-backend predictor.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct McAixiControllerSpec {
     /// Predictive backend used by the planner model.
     pub predictor: RateBackend,
@@ -332,6 +349,7 @@ pub struct McAixiControllerSpec {
 
 /// Discounted AIQI controller configuration.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AiqiDiscountedControllerSpec {
     /// Predictive backend used by the return model.
     pub predictor: RateBackend,
@@ -353,6 +371,7 @@ pub struct AiqiDiscountedControllerSpec {
 
 /// Warm-start exact-\u{1d4a5}_H controller configuration.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct WarmStartExactJhControllerSpec {
     /// Predictive backend used by the return model.
     pub predictor: RateBackend,
@@ -372,6 +391,7 @@ pub struct WarmStartExactJhControllerSpec {
 
 /// Canonical planner controller selection.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum ControllerSpec {
     /// Monte Carlo AIXI.
     McAixi(McAixiControllerSpec),
@@ -383,6 +403,7 @@ pub enum ControllerSpec {
 
 /// Operational planner-run controls that do not change predictor semantics.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct PlannerRuntimeSpec {
     /// Seed used for planner/environment stochasticity.
     ///
@@ -408,6 +429,7 @@ pub struct PlannerRuntimeSpec {
 
 /// Canonical planner-run specification.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct PlannerRunSpec {
     /// External asset bindings referenced by this run.
     pub assets: Vec<AssetBinding>,
@@ -423,6 +445,7 @@ pub struct PlannerRunSpec {
 
 /// Tuning controller kind specified by the formal tuner document.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum TuneControllerKind {
     /// Annealed hill climbing.
     AnnealedHillClimbing,
@@ -436,6 +459,7 @@ pub enum TuneControllerKind {
 
 /// Annealed hill-climbing controller settings for tuning.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct AnnealedHillClimbingTuneControllerSpec {
     /// Maximum mutation radius applied to a candidate step.
     pub max_mutation_radius: usize,
@@ -443,6 +467,7 @@ pub struct AnnealedHillClimbingTuneControllerSpec {
 
 /// MC-AIXI(FAC-CTW) controller settings for tuning.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct McAixiFacCtwTuneControllerSpec {
     /// Planner/environment observation/reward/action contract.
     pub interface: PlannerInterfaceSpec,
@@ -452,6 +477,7 @@ pub struct McAixiFacCtwTuneControllerSpec {
 
 /// Discounted AIQI controller settings for tuning.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct AiqiDiscountedTuneControllerSpec {
     /// Planner/environment observation/reward/action contract.
     pub interface: PlannerInterfaceSpec,
@@ -467,6 +493,7 @@ pub struct AiqiDiscountedTuneControllerSpec {
 
 /// Warm-start exact-J_H controller settings for tuning.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct WarmStartExactJhTuneControllerSpec {
     /// Planner/environment observation/reward/action contract.
     pub interface: PlannerInterfaceSpec,
@@ -482,6 +509,7 @@ pub struct WarmStartExactJhTuneControllerSpec {
 
 /// Runtime-selectable controller configuration for the tuning runtime.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum TuneControllerSpec {
     /// Annealed hill climbing.
     AnnealedHillClimbing(AnnealedHillClimbingTuneControllerSpec),
@@ -507,6 +535,7 @@ impl TuneControllerSpec {
 
 /// Bounded numeric range for a named canonical tuning parameter.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct TuneParameterRangeSpec {
     /// Canonical parameter path or name.
     pub parameter: String,
@@ -518,6 +547,7 @@ pub struct TuneParameterRangeSpec {
 
 /// Canonical bounds specification for the future tuning runtime.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct TuneBoundsSpec {
     /// Allowed canonical backend names.
     pub allowed_backends: Vec<String>,
@@ -541,6 +571,7 @@ pub struct TuneBoundsSpec {
 
 /// Canonical future-facing tune request document.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct TuneSpec {
     /// External asset bindings referenced by this request.
     pub assets: Vec<AssetBinding>,
@@ -570,6 +601,7 @@ pub struct TuneSpec {
 
 /// Compiled planner controller with precompiled predictor backends.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum CompiledPlannerController {
     /// MC-AIXI controller.
     McAixi {
@@ -626,6 +658,7 @@ pub enum CompiledPlannerController {
 
 /// Compiled planner-run specification with resolved assets and compiled backends.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct CompiledPlannerRunSpec {
     pub(super) canonical_spec: Arc<PlannerRunSpec>,
     pub(super) canonical_bytes: CanonicalBytes,
@@ -638,6 +671,7 @@ pub struct CompiledPlannerRunSpec {
 
 /// Compiled tuning controller configuration.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum CompiledTuneController {
     /// Annealed hill climbing.
     AnnealedHillClimbing(AnnealedHillClimbingTuneControllerSpec),
@@ -651,6 +685,7 @@ pub enum CompiledTuneController {
 
 /// Compiled tune request with resolved assets and compiled baseline candidate.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct CompiledTuneSpec {
     pub(super) canonical_spec: Arc<TuneSpec>,
     pub(super) canonical_bytes: CanonicalBytes,
@@ -662,6 +697,7 @@ pub struct CompiledTuneSpec {
 
 /// Universal top-level spec document.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum SpecDocument {
     /// Planner-run configuration document.
     PlannerRun(PlannerRunSpec),
@@ -678,6 +714,7 @@ pub enum SpecDocument {
 /// This is the first stage of the canonical pipeline:
 /// parse -> validate -> compile.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ParsedSpecDocument {
     pub(super) document: SpecDocument,
     pub(super) base_dir: PathBuf,
@@ -685,6 +722,7 @@ pub struct ParsedSpecDocument {
 
 /// Canonicalized and validated planner-run document.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ValidatedPlannerRunSpec {
     pub(super) canonical_spec: Arc<PlannerRunSpec>,
     pub(super) canonical_bytes: CanonicalBytes,
@@ -693,6 +731,7 @@ pub struct ValidatedPlannerRunSpec {
 
 /// Canonicalized and validated tune request document.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ValidatedTuneSpec {
     pub(super) canonical_spec: Arc<TuneSpec>,
     pub(super) canonical_bytes: CanonicalBytes,
@@ -704,6 +743,7 @@ pub struct ValidatedTuneSpec {
 /// This is the second stage of the canonical pipeline and can be compiled into
 /// runtime-ready plans/backends.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum ValidatedSpecDocument {
     /// Validated planner-run document.
     PlannerRun(ValidatedPlannerRunSpec),
@@ -720,6 +760,7 @@ pub enum ValidatedSpecDocument {
 /// This is the final stage of the canonical pipeline and is executable by
 /// runtime adapters.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum CompiledSpecDocument {
     /// Compiled planner-run document.
     PlannerRun(CompiledPlannerRunSpec),

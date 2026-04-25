@@ -206,10 +206,12 @@ def test_bit_and_observation_helpers():
     assert isinstance(
         ait.observation_key_from_stream(ait.ObservationKeyMode.StreamHash, stream, 8), int
     )
-    assert isinstance(ait.observation_key_from_stream("stream-hash", stream, 8), int)
-    assert isinstance(ait.observation_key_from_stream("hash", stream, 8), int)
-    assert isinstance(ait.observation_repr_from_stream("full", stream, 8), list)
-    assert isinstance(ait.observation_repr_from_stream("full-stream", stream, 8), list)
+    assert isinstance(ait.observation_key_from_stream("stream_hash", stream, 8), int)
+    with pytest.raises(ValueError):
+        ait.observation_key_from_stream("stream-hash", stream, 8)
+    assert isinstance(ait.observation_repr_from_stream("full_stream", stream, 8), list)
+    with pytest.raises(ValueError):
+        ait.observation_repr_from_stream("full-stream", stream, 8)
     assert isinstance(ait.observation_repr_from_stream("last", stream, 8), list)
 
 

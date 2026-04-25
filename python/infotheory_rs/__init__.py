@@ -188,7 +188,7 @@ class AgentSimulatorABC(ABC):
         return 1
 
     def observation_key_mode(self):
-        return "fullstream"
+        return "full_stream"
 
     @abstractmethod
     def get_num_reward_bits(self) -> int: ...

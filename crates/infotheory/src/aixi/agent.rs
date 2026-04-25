@@ -21,8 +21,20 @@ use std::path::PathBuf;
 
 /// Configuration parameters for an AIXI agent.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AgentConfig {
-    /// The predictive algorithm to use ("ctw", "rosa", "rwkv", "mamba", "zpaq").
+    /// The predictive algorithm to use.
+    ///
+    /// Canonical names with their accepted aliases:
+    ///
+    /// - `"ac-ctw"` (alias `"ctw"`): single-tree Context Tree Weighting predictor.
+    /// - `"fac-ctw"`: factorized CTW predictor used by canonical MC-AIXI.
+    /// - `"rosaplus"` (alias `"rosa"`): ROSA+ predictor.
+    /// - `"rwkv7"`: RWKV-7 method-string predictor (requires `backend-rwkv`).
+    /// - `"mamba"`: Mamba method-string predictor (requires `backend-mamba`).
+    /// - `"zpaq"`: ZPAQ method-string predictor.
+    ///
+    /// The alias mapping is identical for [`crate::aixi::aiqi::AiqiConfig`].
     pub algorithm: String,
     /// Context depth for the CTW model.
     pub ct_depth: usize,
@@ -63,7 +75,7 @@ pub struct AgentConfig {
     pub rate_backend: Option<RateBackend>,
     /// Max-order hint for `rate_backend` constructors that use it (for example ROSA).
     pub rate_backend_max_order: i64,
-    /// Path to the RWKV model weights (if using "rwkv").
+    /// Path to the RWKV model weights (if using "rwkv7").
     pub rwkv_model_path: Option<String>,
     /// Optional RWKV method string for hosted/browser-safe construction.
     pub rwkv_method: Option<String>,
@@ -77,6 +89,36 @@ pub struct AgentConfig {
     pub zpaq_method: Option<String>,
 }
 
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            algorithm: "ctw".to_string(),
+            ct_depth: 8,
+            agent_horizon: 5,
+            observation_bits: 1,
+            observation_stream_len: 1,
+            observation_key_mode: ObservationKeyMode::FullStream,
+            reward_bits: 1,
+            agent_actions: 2,
+            num_simulations: 100,
+            exploration_exploitation_ratio: 1.0,
+            discount_gamma: 1.0,
+            min_reward: 0,
+            max_reward: 1,
+            reward_offset: 0,
+            random_seed: None,
+            rate_backend: None,
+            rate_backend_max_order: 8,
+            rwkv_model_path: None,
+            rwkv_method: None,
+            mamba_model_path: None,
+            mamba_method: None,
+            rosa_max_order: None,
+            zpaq_method: None,
+        }
+    }
+}
+
 impl AgentConfig {
     fn canonical_predictor_backend(&self) -> Result<RateBackend, String> {
         if let Some(rate_backend) = &self.rate_backend {
@@ -84,18 +126,18 @@ impl AgentConfig {
         }
 
         match self.algorithm.as_str() {
-            "ctw" | "fac-ctw" => Ok(RateBackend::FacCtw {
+            "ctw" | "ac-ctw" => Ok(RateBackend::Ctw {
+                depth: self.ct_depth,
+            }),
+            "fac-ctw" => Ok(RateBackend::FacCtw {
                 base_depth: self.ct_depth,
                 num_percept_bits: (self.observation_bits * self.observation_stream_len.max(1))
                     + self.reward_bits,
                 encoding_bits: 1,
             }),
-            "ac-ctw" | "ctw-context-tree" => Ok(RateBackend::Ctw {
-                depth: self.ct_depth,
-            }),
-            "rosa" => Ok(RateBackend::RosaPlus),
+            "rosa" | "rosaplus" => Ok(RateBackend::RosaPlus),
             #[cfg(feature = "backend-rwkv")]
-            "rwkv" => {
+            "rwkv7" => {
                 if let Some(method) = self
                     .rwkv_method
                     .as_deref()
@@ -108,7 +150,7 @@ impl AgentConfig {
                     })
                 } else {
                     let path = self.rwkv_model_path.as_ref().ok_or_else(|| {
-                        "algorithm=rwkv requires rwkv_model_path or rwkv_method when no rate_backend override is configured"
+                        "algorithm=rwkv7 requires rwkv_model_path or rwkv_method when no rate_backend override is configured"
                             .to_string()
                     })?;
                     Ok(RateBackend::Rwkv7Method {
@@ -120,7 +162,7 @@ impl AgentConfig {
                 }
             }
             #[cfg(not(feature = "backend-rwkv"))]
-            "rwkv" => Err("algorithm=rwkv requires backend-rwkv feature".to_string()),
+            "rwkv7" => Err("algorithm=rwkv7 requires backend-rwkv feature".to_string()),
             #[cfg(feature = "backend-mamba")]
             "mamba" => {
                 if let Some(method) = self
@@ -228,9 +270,9 @@ impl AgentConfig {
         }
 
         match self.algorithm.as_str() {
-            "ctw" | "fac-ctw" | "ac-ctw" | "ctw-context-tree" | "rosa" => {}
+            "ctw" | "fac-ctw" | "ac-ctw" | "rosa" | "rosaplus" => {}
             #[cfg(feature = "backend-rwkv")]
-            "rwkv" => {
+            "rwkv7" => {
                 let has_method = self
                     .rwkv_method
                     .as_deref()
@@ -243,13 +285,13 @@ impl AgentConfig {
                     .is_some_and(|v| !v.is_empty());
                 if !(has_method || has_path) {
                     return Err(
-                        "algorithm=rwkv requires rwkv_model_path or rwkv_method when no rate_backend override is configured"
+                        "algorithm=rwkv7 requires rwkv_model_path or rwkv_method when no rate_backend override is configured"
                             .to_string(),
                     );
                 }
             }
             #[cfg(not(feature = "backend-rwkv"))]
-            "rwkv" => return Err("algorithm=rwkv requires backend-rwkv feature".to_string()),
+            "rwkv7" => return Err("algorithm=rwkv7 requires backend-rwkv feature".to_string()),
             #[cfg(feature = "backend-mamba")]
             "mamba" => {
                 let has_method = self
@@ -873,6 +915,103 @@ mod tests {
         assert_eq!(snapshot.rollback_scope, 1);
         assert_eq!(snapshot.revert, 0);
         assert_eq!(snapshot.pop_history, 0);
+    }
+
+    /// Stable shape-only descriptor for a `RateBackend` variant, used for
+    /// alias-equivalence assertions without requiring `Debug` on the enum.
+    fn backend_shape(backend: &crate::api::RateBackend) -> &'static str {
+        use crate::api::RateBackend;
+        match backend {
+            RateBackend::Ctw { .. } => "ctw",
+            RateBackend::FacCtw { .. } => "fac-ctw",
+            RateBackend::RosaPlus => "rosaplus",
+            _ => "other",
+        }
+    }
+
+    // We deliberately mutate fields after `Default::default()` here: it is the
+    // forward-compatible construction pattern for `#[non_exhaustive]` configs
+    // (a future added field automatically picks up its default value rather
+    // than silently breaking the test).
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn algorithm_aliases_match_canonical_names_in_mc_aixi() {
+        let mut cfg = AgentConfig::default();
+        cfg.algorithm = "ac-ctw".into();
+        let canonical = cfg.canonical_predictor_backend().expect("ac-ctw");
+
+        cfg.algorithm = "ctw".into();
+        let aliased = cfg.canonical_predictor_backend().expect("ctw alias");
+        assert_eq!(
+            backend_shape(&canonical),
+            backend_shape(&aliased),
+            "MC-AIXI: 'ctw' must alias to single-tree 'ac-ctw'"
+        );
+
+        cfg.algorithm = "rosaplus".into();
+        let canonical_rosa = cfg.canonical_predictor_backend().expect("rosaplus");
+        cfg.algorithm = "rosa".into();
+        let aliased_rosa = cfg.canonical_predictor_backend().expect("rosa alias");
+        assert_eq!(
+            backend_shape(&canonical_rosa),
+            backend_shape(&aliased_rosa),
+            "MC-AIXI: 'rosa' must alias to canonical 'rosaplus'"
+        );
+
+        // Sanity: `fac-ctw` is a *separate* backend, not an alias of `ctw`.
+        cfg.algorithm = "fac-ctw".into();
+        let fac = cfg.canonical_predictor_backend().expect("fac-ctw");
+        assert_ne!(
+            backend_shape(&canonical),
+            backend_shape(&fac),
+            "MC-AIXI: 'fac-ctw' must NOT alias to 'ctw'"
+        );
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn alias_semantics_are_symmetric_between_mc_aixi_and_aiqi() {
+        // MC-AIXI-side mapping for `ctw`.
+        let mut agent_cfg = AgentConfig::default();
+        agent_cfg.algorithm = "ctw".into();
+        let agent_ctw = agent_cfg.canonical_predictor_backend().expect("agent ctw");
+
+        // The corresponding AIQI-side mapping must be in the same `RateBackend`
+        // discriminant family. We use the public `validate` path with a
+        // freshly-constructed AiqiConfig to avoid touching internals.
+        let mut aiqi_cfg = crate::aixi::aiqi::AiqiConfig::default();
+        aiqi_cfg.algorithm = "ctw".into();
+        let aiqi_ctw = aiqi_cfg
+            .canonical_predictor_backend_for_test()
+            .expect("aiqi ctw");
+
+        assert_eq!(
+            backend_shape(&agent_ctw),
+            "ctw",
+            "MC-AIXI: 'ctw' must produce a single-tree CTW backend"
+        );
+        assert_eq!(
+            backend_shape(&aiqi_ctw),
+            "ctw",
+            "AIQI: 'ctw' must produce a single-tree CTW backend"
+        );
+
+        agent_cfg.algorithm = "rosa".into();
+        aiqi_cfg.algorithm = "rosa".into();
+        let agent_rosa = agent_cfg.canonical_predictor_backend().expect("agent rosa");
+        let aiqi_rosa = aiqi_cfg
+            .canonical_predictor_backend_for_test()
+            .expect("aiqi rosa");
+        assert_eq!(
+            backend_shape(&agent_rosa),
+            "rosaplus",
+            "MC-AIXI: 'rosa' must produce ROSA+"
+        );
+        assert_eq!(
+            backend_shape(&aiqi_rosa),
+            "rosaplus",
+            "AIQI: 'rosa' must produce ROSA+"
+        );
     }
 
     #[cfg(feature = "all-backends")]

@@ -8,7 +8,7 @@ use std::time::Duration;
 #[allow(dead_code)]
 pub(super) fn parse_shared_memory_policy(v: Option<&str>) -> SharedMemoryPolicy {
     match v.unwrap_or("snapshot") {
-        "preserve" | "keep" => SharedMemoryPolicy::Preserve,
+        "preserve" => SharedMemoryPolicy::Preserve,
         _ => SharedMemoryPolicy::Snapshot,
     }
 }
@@ -60,7 +60,7 @@ pub(super) fn parse_nyx_environment_config(
         &vm["protocol"]
     } else {
         &v["vm_protocol"]
-    });
+    })?;
     let stats_backend = parse_vm_stats_backend(
         if !vm["stats_backend"].is_null() {
             &vm["stats_backend"]
@@ -84,7 +84,7 @@ pub(super) fn parse_nyx_environment_config(
         &vm["observation"]
     } else {
         &v["vm_observation"]
-    });
+    })?;
     let observation_stream_len =
         parse_observation_stream_len_for_vm(if !vm["observation"].is_null() {
             &vm["observation"]
@@ -96,7 +96,7 @@ pub(super) fn parse_nyx_environment_config(
             &vm["observation"]
         } else {
             &v["vm_observation"]
-        });
+        })?;
     let observation_stream_pad_byte =
         parse_nyx_observation_pad_byte(if !vm["observation"].is_null() {
             &vm["observation"]
@@ -126,32 +126,32 @@ pub(super) fn parse_nyx_environment_config(
         step_cost,
     )?;
 
-    Ok(NyxVmConfig {
-        firecracker_config,
-        instance_id,
-        shared_region_name,
-        shared_region_size,
-        shared_memory_policy,
-        step_timeout: Duration::from_millis(step_timeout_ms),
-        boot_timeout: Duration::from_millis(boot_timeout_ms),
-        episode_steps,
-        step_cost,
-        observation_policy,
-        observation_bits,
-        observation_stream_len,
-        observation_stream_mode,
-        observation_pad_byte: observation_stream_pad_byte,
-        reward_bits,
-        reward_policy,
-        reward_shaping,
-        action_source,
-        action_filter,
-        protocol,
-        stats_backend,
-        trace,
-        debug_mode,
-        crash_log: vm["crash_log"].as_str().map(|s| s.to_string()),
-    })
+    let mut cfg = NyxVmConfig::default();
+    cfg.firecracker_config = firecracker_config;
+    cfg.instance_id = instance_id;
+    cfg.shared_region_name = shared_region_name;
+    cfg.shared_region_size = shared_region_size;
+    cfg.shared_memory_policy = shared_memory_policy;
+    cfg.step_timeout = Duration::from_millis(step_timeout_ms);
+    cfg.boot_timeout = Duration::from_millis(boot_timeout_ms);
+    cfg.episode_steps = episode_steps;
+    cfg.step_cost = step_cost;
+    cfg.observation_policy = observation_policy;
+    cfg.observation_bits = observation_bits;
+    cfg.observation_stream_len = observation_stream_len;
+    cfg.observation_stream_mode = observation_stream_mode;
+    cfg.observation_pad_byte = observation_stream_pad_byte;
+    cfg.reward_bits = reward_bits;
+    cfg.reward_policy = reward_policy;
+    cfg.reward_shaping = reward_shaping;
+    cfg.action_source = action_source;
+    cfg.action_filter = action_filter;
+    cfg.protocol = protocol;
+    cfg.stats_backend = stats_backend;
+    cfg.trace = trace;
+    cfg.debug_mode = debug_mode;
+    cfg.crash_log = vm["crash_log"].as_str().map(|s| s.to_string());
+    Ok(cfg)
 }
 
 #[cfg(all(test, feature = "vm"))]
@@ -178,10 +178,8 @@ pub(super) fn parse_nyx_trace_config(
     let reset_on_episode = v["reset_on_episode"].as_bool().unwrap_or(false);
     let shared_region_name = v["shared_region_name"]
         .as_str()
-        .or_else(|| v["shared_region"].as_str())
-        .or_else(|| v["name"].as_str())
         .or_else(|| {
-            if v["mode"].as_str() == Some("shared-memory") {
+            if v["mode"].as_str() == Some("shared_memory") {
                 Some("trace")
             } else {
                 None
@@ -190,17 +188,19 @@ pub(super) fn parse_nyx_trace_config(
         .map(|s| s.to_string())
         .or(Some("trace".to_string()));
 
-    Ok(Some(NyxTraceConfig {
-        shared_region_name,
-        max_bytes,
-        reset_on_episode,
-    }))
+    let mut trace = NyxTraceConfig::new();
+    trace.shared_region_name = shared_region_name;
+    trace.max_bytes = max_bytes;
+    trace.reset_on_episode = reset_on_episode;
+    Ok(Some(trace))
 }
 
 #[cfg(feature = "vm")]
 #[allow(dead_code)]
 #[cfg(test)]
-pub(super) fn parse_nyx_protocol_config(v: &serde_json::Value) -> NyxProtocolConfig {
+pub(super) fn parse_nyx_protocol_config(
+    v: &serde_json::Value,
+) -> anyhow::Result<NyxProtocolConfig> {
     let mut cfg = NyxProtocolConfig::default();
     if let Some(s) = v["action_prefix"].as_str() {
         cfg.action_prefix = s.to_string();
@@ -221,11 +221,11 @@ pub(super) fn parse_nyx_protocol_config(v: &serde_json::Value) -> NyxProtocolCon
         cfg.data_prefix = s.to_string();
     }
     if let Some(s) = v["wire_encoding"].as_str() {
-        if let Some(enc) = NyxPayloadEncoding::parse(s) {
-            cfg.wire_encoding = enc;
-        }
+        cfg.wire_encoding = s
+            .parse::<NyxPayloadEncoding>()
+            .map_err(|_| anyhow::anyhow!("unknown VM wire_encoding '{s}'"))?;
     }
-    cfg
+    Ok(cfg)
 }
 
 #[cfg(feature = "vm")]
@@ -236,9 +236,15 @@ pub(super) fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActi
     match mode {
         "fuzz" => {
             let fuzz = if v["fuzz"].is_null() { v } else { &v["fuzz"] };
+            let seed_encoding_label = fuzz["seed_encoding"].as_str().unwrap_or("utf8");
             let seed_encoding =
-                NyxPayloadEncoding::parse(fuzz["seed_encoding"].as_str().unwrap_or("utf8"))
-                    .unwrap_or(NyxPayloadEncoding::Utf8);
+                seed_encoding_label
+                    .parse::<NyxPayloadEncoding>()
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "unknown vm_actions.fuzz.seed_encoding '{seed_encoding_label}'"
+                        )
+                    })?;
             let mut seeds = Vec::new();
             if let Some(arr) = fuzz["seed_paths"].as_array() {
                 for item in arr {
@@ -268,9 +274,15 @@ pub(super) fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActi
             }
             let min_len = fuzz["min_len"].as_u64().unwrap_or(1) as usize;
             let max_len = fuzz["max_len"].as_u64().unwrap_or(4096) as usize;
+            let dict_encoding_label = fuzz["dict_encoding"].as_str().unwrap_or("utf8");
             let dict_encoding =
-                NyxPayloadEncoding::parse(fuzz["dict_encoding"].as_str().unwrap_or("utf8"))
-                    .unwrap_or(NyxPayloadEncoding::Utf8);
+                dict_encoding_label
+                    .parse::<NyxPayloadEncoding>()
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "unknown vm_actions.fuzz.dict_encoding '{dict_encoding_label}'"
+                        )
+                    })?;
             let mut dictionary = Vec::new();
             if let Some(arr) = fuzz["dictionary"].as_array() {
                 for item in arr {
@@ -280,14 +292,13 @@ pub(super) fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActi
                 }
             }
             let rng_seed = fuzz["rng_seed"].as_u64().unwrap_or(0);
-            Ok(NyxActionSource::Fuzz(NyxFuzzConfig {
-                seeds,
-                mutators,
-                min_len,
-                max_len,
-                dictionary,
-                rng_seed,
-            }))
+            let mut fuzz_cfg = NyxFuzzConfig::new(seeds);
+            fuzz_cfg.mutators = mutators;
+            fuzz_cfg.min_len = min_len;
+            fuzz_cfg.max_len = max_len;
+            fuzz_cfg.dictionary = dictionary;
+            fuzz_cfg.rng_seed = rng_seed;
+            Ok(NyxActionSource::Fuzz(fuzz_cfg))
         }
         _ => {
             let mut actions = Vec::new();
@@ -295,19 +306,18 @@ pub(super) fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActi
                 for item in arr {
                     if let Some(text) = item.as_str() {
                         let payload = NyxPayloadEncoding::Utf8.decode(text)?;
-                        actions.push(NyxActionSpec {
-                            name: None,
-                            payload,
-                        });
+                        actions.push(NyxActionSpec::new(payload));
                         continue;
                     }
                     let payload = item["payload"].as_str().unwrap_or_default();
-                    let encoding =
-                        NyxPayloadEncoding::parse(item["encoding"].as_str().unwrap_or("utf8"))
-                            .unwrap_or(NyxPayloadEncoding::Utf8);
+                    let encoding_label = item["encoding"].as_str().unwrap_or("utf8");
+                    let encoding = encoding_label.parse::<NyxPayloadEncoding>().map_err(|_| {
+                        anyhow::anyhow!("unknown vm_actions[].encoding '{encoding_label}'")
+                    })?;
                     let payload = encoding.decode(payload)?;
-                    let name = item["name"].as_str().map(|s| s.to_string());
-                    actions.push(NyxActionSpec { name, payload });
+                    let mut spec = NyxActionSpec::new(payload);
+                    spec.name = item["name"].as_str().map(|s| s.to_string());
+                    actions.push(spec);
                 }
             }
             Ok(NyxActionSource::Literal(actions))
@@ -320,12 +330,12 @@ pub(super) fn parse_nyx_actions(v: &serde_json::Value) -> anyhow::Result<NyxActi
 #[cfg(test)]
 pub(super) fn parse_nyx_fuzz_mutator(name: &str) -> Option<NyxFuzzMutator> {
     match name {
-        "flip_bit" | "flipbit" => Some(NyxFuzzMutator::FlipBit),
-        "flip_byte" | "flipbyte" => Some(NyxFuzzMutator::FlipByte),
-        "insert" | "insert_byte" => Some(NyxFuzzMutator::InsertByte),
-        "delete" | "delete_byte" => Some(NyxFuzzMutator::DeleteByte),
-        "splice" | "splice_seed" => Some(NyxFuzzMutator::SpliceSeed),
-        "reset" | "reset_seed" => Some(NyxFuzzMutator::ResetSeed),
+        "flip_bit" => Some(NyxFuzzMutator::FlipBit),
+        "flip_byte" => Some(NyxFuzzMutator::FlipByte),
+        "insert_byte" => Some(NyxFuzzMutator::InsertByte),
+        "delete_byte" => Some(NyxFuzzMutator::DeleteByte),
+        "splice_seed" => Some(NyxFuzzMutator::SpliceSeed),
+        "reset_seed" => Some(NyxFuzzMutator::ResetSeed),
         "havoc" => Some(NyxFuzzMutator::Havoc),
         _ => None,
     }
@@ -333,34 +343,35 @@ pub(super) fn parse_nyx_fuzz_mutator(name: &str) -> Option<NyxFuzzMutator> {
 
 #[cfg(feature = "vm")]
 #[cfg(test)]
-fn parse_nyx_observation_policy_str(mode: &str) -> NyxObservationPolicy {
+fn parse_nyx_observation_policy_str(mode: &str) -> anyhow::Result<NyxObservationPolicy> {
     match mode {
-        "guest" | "from-guest" | "from_guest" => NyxObservationPolicy::FromGuest,
-        "raw" | "raw-bytes" | "raw-output" | "raw_output" | "bytes" | "stream" => {
-            NyxObservationPolicy::RawOutput
-        }
-        "hash" | "output-hash" | "output_hash" => NyxObservationPolicy::OutputHash,
-        "shared-memory" | "shared_memory" | "shared_mem" | "shared" => {
-            NyxObservationPolicy::SharedMemory
-        }
-        _ => NyxObservationPolicy::FromGuest,
+        "from_guest" => Ok(NyxObservationPolicy::FromGuest),
+        "raw_output" => Ok(NyxObservationPolicy::RawOutput),
+        "output_hash" => Ok(NyxObservationPolicy::OutputHash),
+        "shared_memory" => Ok(NyxObservationPolicy::SharedMemory),
+        other => Err(anyhow::anyhow!("unknown VM observation policy '{other}'")),
     }
 }
 
 #[cfg(feature = "vm")]
 #[cfg(test)]
-pub(super) fn parse_nyx_observation_policy(v: &serde_json::Value) -> NyxObservationPolicy {
-    parse_nyx_observation_policy_str(v["mode"].as_str().unwrap_or("guest"))
+pub(super) fn parse_nyx_observation_policy(
+    v: &serde_json::Value,
+) -> anyhow::Result<NyxObservationPolicy> {
+    parse_nyx_observation_policy_str(v["mode"].as_str().unwrap_or("from_guest"))
 }
 
 #[cfg(feature = "vm")]
 #[allow(dead_code)]
 #[cfg(test)]
-pub(super) fn parse_nyx_observation_stream_mode(v: &serde_json::Value) -> NyxObservationStreamMode {
-    match v["stream_mode"].as_str().unwrap_or("pad-truncate") {
-        "pad" => NyxObservationStreamMode::Pad,
-        "truncate" => NyxObservationStreamMode::Truncate,
-        _ => NyxObservationStreamMode::PadTruncate,
+pub(super) fn parse_nyx_observation_stream_mode(
+    v: &serde_json::Value,
+) -> anyhow::Result<NyxObservationStreamMode> {
+    match v["stream_mode"].as_str().unwrap_or("pad_truncate") {
+        "pad" => Ok(NyxObservationStreamMode::Pad),
+        "truncate" => Ok(NyxObservationStreamMode::Truncate),
+        "pad_truncate" => Ok(NyxObservationStreamMode::PadTruncate),
+        other => Err(anyhow::anyhow!("unknown observation stream mode '{other}'")),
     }
 }
 
@@ -404,7 +415,7 @@ pub(super) fn parse_nyx_reward_shaping(
         return Ok(None);
     }
     match v["mode"].as_str().unwrap_or("none") {
-        "entropy-reduction" | "entropy_reduction" => {
+        "entropy_reduction" => {
             let baseline_path = v["baseline_path"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("vm_reward_shaping.baseline_path is required"))?;
@@ -422,7 +433,7 @@ pub(super) fn parse_nyx_reward_shaping(
                 timeout_bonus,
             }))
         }
-        "trace-entropy" | "trace_entropy" => {
+        "trace_entropy" => {
             let max_order = v["max_order"].as_i64().unwrap_or(8);
             let scale = v["scale"].as_f64().unwrap_or(1.0);
             let normalize = v["normalize"].as_bool().unwrap_or(false);
@@ -432,8 +443,8 @@ pub(super) fn parse_nyx_reward_shaping(
                 normalize,
             }))
         }
-        "none" | "off" => Ok(None),
-        _ => Ok(None),
+        "none" => Ok(None),
+        other => Err(anyhow::anyhow!("unknown vm_reward_shaping.mode '{other}'")),
     }
 }
 
@@ -453,15 +464,15 @@ pub(super) fn parse_nyx_filter(
         None
     };
     let reject_reward = v["reject_reward"].as_i64().or_else(|| Some(-step_cost));
-    Ok(Some(NyxActionFilter {
-        min_entropy: v["min_entropy"].as_f64(),
-        max_entropy: v["max_entropy"].as_f64(),
-        min_intrinsic_dependence: v["min_intrinsic_dependence"].as_f64(),
-        min_novelty: v["min_novelty"].as_f64(),
-        novelty_prior,
-        max_order: v["max_order"].as_i64().unwrap_or(8),
-        reject_reward,
-    }))
+    let mut filter = NyxActionFilter::new();
+    filter.min_entropy = v["min_entropy"].as_f64();
+    filter.max_entropy = v["max_entropy"].as_f64();
+    filter.min_intrinsic_dependence = v["min_intrinsic_dependence"].as_f64();
+    filter.min_novelty = v["min_novelty"].as_f64();
+    filter.novelty_prior = novelty_prior;
+    filter.max_order = v["max_order"].as_i64().unwrap_or(8);
+    filter.reject_reward = reject_reward;
+    Ok(Some(filter))
 }
 
 #[cfg(feature = "backend-rwkv")]
@@ -521,7 +532,7 @@ pub(super) fn vm_stats_backend_spec_value(
     let algo = root["algorithm"].as_str().unwrap_or("ctw");
     let ct_depth = root["ct_depth"].as_u64().unwrap_or(20) as usize;
     let spec = match algo {
-        "ctw" | "ac-ctw" | "ctw-context-tree" => serde_json::json!({
+        "ctw" | "ac-ctw" => serde_json::json!({
             "kind": "ctw",
             "depth": ct_depth,
         }),
@@ -535,7 +546,7 @@ pub(super) fn vm_stats_backend_spec_value(
             "kind": "sequitur",
             "context_bytes": root["context_bytes"].as_u64().unwrap_or(64) as usize,
         }),
-        "mamba" | "mamba1" => {
+        "mamba" => {
             #[cfg(feature = "backend-mamba")]
             {
                 serde_json::json!({
@@ -554,7 +565,7 @@ pub(super) fn vm_stats_backend_spec_value(
             }
         }
         "rosa" | "rosaplus" => serde_json::json!({ "kind": "rosaplus" }),
-        "rwkv" | "rwkv7" => {
+        "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
                 serde_json::json!({
@@ -576,7 +587,7 @@ pub(super) fn vm_stats_backend_spec_value(
             "kind": "zpaq",
             "method": root["method"].as_str().unwrap_or("2"),
         }),
-        "mixture" | "mix" => {
+        "mixture" => {
             let spec_path = root["mixture_spec"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("mixture stats backend requires mixture_spec"))?;
@@ -585,7 +596,7 @@ pub(super) fn vm_stats_backend_spec_value(
                 "spec_path": spec_path,
             })
         }
-        _ => serde_json::json!({ "kind": "rosaplus" }),
+        other => return Err(anyhow::anyhow!("unknown stats backend algorithm '{other}'")),
     };
     Ok(spec)
 }
@@ -752,17 +763,20 @@ pub(super) fn parse_observation_stream_len(v: &serde_json::Value) -> usize {
 }
 
 #[cfg(test)]
-pub(super) fn parse_observation_key_mode(v: &serde_json::Value) -> ObservationKeyMode {
-    parse_observation_key_mode_str(v["observation_key_mode"].as_str().unwrap_or("full"))
+pub(super) fn parse_observation_key_mode(
+    v: &serde_json::Value,
+) -> anyhow::Result<ObservationKeyMode> {
+    parse_observation_key_mode_str(v["observation_key_mode"].as_str().unwrap_or("full_stream"))
 }
 
 #[cfg(test)]
-pub(super) fn parse_observation_key_mode_str(s: &str) -> ObservationKeyMode {
+pub(super) fn parse_observation_key_mode_str(s: &str) -> anyhow::Result<ObservationKeyMode> {
     match s {
-        "full" | "full-stream" | "stream" => ObservationKeyMode::FullStream,
-        "last" => ObservationKeyMode::Last,
-        "hash" | "stream-hash" => ObservationKeyMode::StreamHash,
-        _ => ObservationKeyMode::First,
+        "first" => Ok(ObservationKeyMode::First),
+        "full_stream" => Ok(ObservationKeyMode::FullStream),
+        "last" => Ok(ObservationKeyMode::Last),
+        "stream_hash" => Ok(ObservationKeyMode::StreamHash),
+        other => Err(anyhow::anyhow!("unknown observation key mode '{other}'")),
     }
 }
 
@@ -783,7 +797,7 @@ pub(super) fn parse_observation_stream_len_for_env(v: &serde_json::Value, env_na
 pub(super) fn parse_observation_key_mode_for_env(
     v: &serde_json::Value,
     env_name: &str,
-) -> ObservationKeyMode {
+) -> anyhow::Result<ObservationKeyMode> {
     if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" {
         if v["vm_observation"].is_null() {
             parse_observation_key_mode(v)
@@ -796,14 +810,16 @@ pub(super) fn parse_observation_key_mode_for_env(
 }
 
 #[cfg(test)]
-pub(super) fn parse_observation_key_mode_for_vm(v: &serde_json::Value) -> ObservationKeyMode {
+pub(super) fn parse_observation_key_mode_for_vm(
+    v: &serde_json::Value,
+) -> anyhow::Result<ObservationKeyMode> {
     if v.is_null() {
-        return ObservationKeyMode::FullStream;
+        return Ok(ObservationKeyMode::FullStream);
     }
     parse_observation_key_mode_str(
         v["key_mode"]
             .as_str()
-            .unwrap_or_else(|| v["observation_key_mode"].as_str().unwrap_or("full")),
+            .unwrap_or_else(|| v["observation_key_mode"].as_str().unwrap_or("full_stream")),
     )
 }
 
@@ -839,6 +855,9 @@ fn extract_observation_key_mode_raw(v: &serde_json::Value) -> Option<Observation
     v["observation_key_mode"]
         .as_str()
         .map(parse_observation_key_mode_str)
+        .transpose()
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -850,6 +869,9 @@ fn extract_vm_observation_key_mode_raw(v: &serde_json::Value) -> Option<Observat
         .as_str()
         .or_else(|| v["observation_key_mode"].as_str())
         .map(parse_observation_key_mode_str)
+        .transpose()
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -888,7 +910,7 @@ pub(super) fn validate_observation_config(
     }
     if observation_stream_len > 1 && matches!(observation_key_mode, ObservationKeyMode::First) {
         eprintln!(
-            "Warning: observation_key_mode=first collapses multi-symbol observation streams; prefer \"full\" for paper-accurate expectimax."
+            "Warning: observation_key_mode=first collapses multi-symbol observation streams; prefer \"full_stream\" for paper-accurate expectimax."
         );
     }
     if observation_stream_len > 1 && !matches!(observation_key_mode, ObservationKeyMode::FullStream)
@@ -935,11 +957,9 @@ pub(super) fn build_ctx(
         });
         (spec.backend, Some(spec.max_order))
     } else {
-        let shorthand = infotheory::spec::RateBackendShorthandOptions {
-            base_dir: std::path::PathBuf::from("."),
-            particle_default_if_missing_method: false,
-            ..Default::default()
-        };
+        let mut shorthand = infotheory::spec::RateBackendShorthandOptions::default();
+        shorthand.base_dir = std::path::PathBuf::from(".");
+        shorthand.particle_default_if_missing_method = false;
         #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
         let shorthand = {
             let mut shorthand = shorthand;
@@ -964,11 +984,9 @@ pub(super) fn build_ctx(
     };
 
     #[allow(unused_mut)]
-    let mut compression_opts = infotheory::spec::CompressionBackendShorthandOptions {
-        default_rate_backend: Some(rate_backend.clone()),
-        default_framing: infotheory::compression::FramingMode::Raw,
-        ..Default::default()
-    };
+    let mut compression_opts = infotheory::spec::CompressionBackendShorthandOptions::default();
+    compression_opts.default_rate_backend = Some(rate_backend.clone());
+    compression_opts.default_framing = infotheory::compression::FramingMode::Raw;
     #[cfg(feature = "backend-rwkv")]
     if compression_backend == "rwkv7"
         && (method.is_none()
@@ -1549,23 +1567,28 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parse_nyx_observation_policy_accepts_canonical_and_legacy_aliases() {
+    fn parse_nyx_observation_policy_accepts_canonical_names() {
         let cases = [
             ("from_guest", NyxObservationPolicy::FromGuest),
             ("output_hash", NyxObservationPolicy::OutputHash),
             ("raw_output", NyxObservationPolicy::RawOutput),
             ("shared_memory", NyxObservationPolicy::SharedMemory),
-            ("output-hash", NyxObservationPolicy::OutputHash),
-            ("raw", NyxObservationPolicy::RawOutput),
-            ("shared-memory", NyxObservationPolicy::SharedMemory),
         ];
 
         for (mode, expected) in cases {
-            let parsed = parse_nyx_observation_policy(&json!({ "mode": mode }));
+            let parsed =
+                parse_nyx_observation_policy(&json!({ "mode": mode })).expect("parse mode");
             assert!(
                 std::mem::discriminant(&parsed) == std::mem::discriminant(&expected),
                 "mode {mode} parsed as {parsed:?}"
             );
         }
+
+        let err = parse_nyx_observation_policy(&json!({ "mode": "guest" }))
+            .expect_err("legacy alias should be rejected");
+        assert!(
+            err.to_string().contains("unknown VM observation policy"),
+            "unexpected error: {err}"
+        );
     }
 }

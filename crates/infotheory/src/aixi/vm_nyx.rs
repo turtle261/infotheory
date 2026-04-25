@@ -66,6 +66,7 @@ pub use nyx_lite::{ExitReason, NyxVM, SharedMemoryPolicy};
 
 /// Payload encoding for wire protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PayloadEncoding {
     /// Treat payloads as UTF-8/text bytes.
     Utf8,
@@ -74,25 +75,6 @@ pub enum PayloadEncoding {
 }
 
 impl PayloadEncoding {
-    /// Parse a payload encoding label.
-    ///
-    /// Accepted values are `utf8`, `text`, and `hex`.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        Self::parse(s)
-    }
-
-    /// Parse a payload encoding label.
-    ///
-    /// Accepted values are `utf8`, `text`, and `hex`.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "utf8" | "text" => Some(Self::Utf8),
-            "hex" => Some(Self::Hex),
-            _ => None,
-        }
-    }
-
     /// Decode a wire payload string into raw bytes using this encoding.
     pub fn decode(self, s: &str) -> anyhow::Result<Vec<u8>> {
         match self {
@@ -114,7 +96,11 @@ impl std::str::FromStr for PayloadEncoding {
     type Err = &'static str;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse(s).ok_or("unknown payload encoding")
+        match s {
+            "utf8" => Ok(Self::Utf8),
+            "hex" => Ok(Self::Hex),
+            _ => Err("unknown payload encoding"),
+        }
     }
 }
 
@@ -232,6 +218,7 @@ const SHARED_PAYLOAD_OFFSET: u64 = 16;
 
 /// Protocol configuration for structured communication.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct NyxProtocolConfig {
     /// Prefix for action messages.
     pub action_prefix: String,
@@ -269,6 +256,7 @@ impl Default for NyxProtocolConfig {
 
 /// A single action specification.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct NyxActionSpec {
     /// Optional human-readable name.
     pub name: Option<String>,
@@ -276,8 +264,33 @@ pub struct NyxActionSpec {
     pub payload: Vec<u8>,
 }
 
+impl NyxActionSpec {
+    /// Create an action specification with no explicit name.
+    pub fn new(payload: Vec<u8>) -> Self {
+        Self {
+            name: None,
+            payload,
+        }
+    }
+
+    /// Create an action specification with a human-readable name.
+    pub fn named(name: impl Into<String>, payload: Vec<u8>) -> Self {
+        Self {
+            name: Some(name.into()),
+            payload,
+        }
+    }
+}
+
+impl Default for NyxActionSpec {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
 /// Fuzzing mutator types.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum FuzzMutator {
     /// Flip one random bit.
     FlipBit,
@@ -297,6 +310,7 @@ pub enum FuzzMutator {
 
 /// Fuzzing configuration for action generation.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct NyxFuzzConfig {
     /// Corpus used for seed/reset/splice operations.
     pub seeds: Vec<Vec<u8>>,
@@ -312,8 +326,29 @@ pub struct NyxFuzzConfig {
     pub rng_seed: u64,
 }
 
+impl NyxFuzzConfig {
+    /// Create fuzzing configuration with sensible defaults.
+    pub fn new(seeds: Vec<Vec<u8>>) -> Self {
+        Self {
+            seeds,
+            mutators: vec![FuzzMutator::Havoc],
+            min_len: 1,
+            max_len: 4096,
+            dictionary: Vec::new(),
+            rng_seed: 0,
+        }
+    }
+}
+
+impl Default for NyxFuzzConfig {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
 /// Source of actions for the environment.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum NyxActionSource {
     /// Fixed set of action payloads.
     Literal(Vec<NyxActionSpec>),
@@ -327,6 +362,7 @@ pub enum NyxActionSource {
 
 /// How observations are derived from guest output.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum NyxObservationPolicy {
     /// Parse structured OBS/REW/DONE messages from guest.
     FromGuest,
@@ -340,6 +376,7 @@ pub enum NyxObservationPolicy {
 
 /// Stream normalization mode.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum NyxObservationStreamMode {
     /// Pad short streams, truncate long ones.
     PadTruncate,
@@ -355,6 +392,7 @@ pub enum NyxObservationStreamMode {
 
 /// How rewards are computed.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum NyxRewardPolicy {
     /// Parse reward from guest response.
     FromGuest,
@@ -373,6 +411,7 @@ pub enum NyxRewardPolicy {
 
 /// Optional reward shaping (additive to base reward).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum NyxRewardShaping {
     /// Entropy reduction vs baseline.
     EntropyReduction {
@@ -423,6 +462,7 @@ impl std::fmt::Debug for NyxRewardPolicy {
 
 /// Information-theoretic action filtering.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct NyxActionFilter {
     /// Minimum entropy threshold.
     pub min_entropy: Option<f64>,
@@ -440,12 +480,34 @@ pub struct NyxActionFilter {
     pub reject_reward: Option<i64>,
 }
 
+impl NyxActionFilter {
+    /// Create an action filter with no active constraints.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for NyxActionFilter {
+    fn default() -> Self {
+        Self {
+            min_entropy: None,
+            max_entropy: None,
+            min_intrinsic_dependence: None,
+            min_novelty: None,
+            novelty_prior: None,
+            max_order: 8,
+            reject_reward: None,
+        }
+    }
+}
+
 // ============================================================================
 // Trace Configuration
 // ============================================================================
 
 /// Configuration for trace collection and analysis.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct NyxTraceConfig {
     /// Shared memory region name for trace data.
     pub shared_region_name: Option<String>,
@@ -455,12 +517,30 @@ pub struct NyxTraceConfig {
     pub reset_on_episode: bool,
 }
 
+impl NyxTraceConfig {
+    /// Create trace configuration with defaults used by the CLI parser.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for NyxTraceConfig {
+    fn default() -> Self {
+        Self {
+            shared_region_name: Some("trace".to_string()),
+            max_bytes: 1_000_000,
+            reset_on_episode: false,
+        }
+    }
+}
+
 // ============================================================================
 // Main Configuration
 // ============================================================================
 
 /// Complete configuration for the nyx-lite VM environment.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct NyxVmConfig {
     /// Path to Firecracker JSON config.
     pub firecracker_config: String,

@@ -52,6 +52,8 @@ use infotheory::mambazip;
 use infotheory::rwkvzip;
 #[cfg(feature = "backend-sequitur")]
 use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
+#[cfg(test)]
+use infotheory::spec::CanonicalJson;
 use infotheory::spec::{
     self, BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec,
     PlannerRuntimeSpec, SpecDocument,
@@ -330,15 +332,7 @@ fn is_canonical_spec_document(value: &serde_json::Value) -> bool {
 }
 
 fn builtin_environment_name(spec: BuiltinEnvironmentSpec) -> &'static str {
-    match spec {
-        BuiltinEnvironmentSpec::CoinFlip => "coin_flip",
-        BuiltinEnvironmentSpec::BiasedRockPaperScissor => "biased_rock_paper_scissor",
-        BuiltinEnvironmentSpec::KuhnPoker => "kuhn_poker",
-        BuiltinEnvironmentSpec::ExtendedTiger => "extended_tiger",
-        BuiltinEnvironmentSpec::TicTacToe => "tic_tac_toe",
-        BuiltinEnvironmentSpec::Blackjack => "blackjack",
-        BuiltinEnvironmentSpec::Platformer => "platformer",
-    }
+    spec.canonical_name()
 }
 
 fn legacy_planner_config_error(path: &str) -> anyhow::Error {
@@ -472,6 +466,10 @@ impl PlannerControllerRuntime {
             CompiledPlannerController::AiqiWarmstartExactJh { .. } => Err(anyhow::anyhow!(
                 "planner_run controller kind 'aiqi_warmstart_exact_jh' is not executable from the CLI yet"
             )),
+            other => Err(anyhow::anyhow!(
+                "planner_run controller kind '{}' is not executable from the CLI",
+                other.kind_str()
+            )),
         }
     }
 
@@ -567,23 +565,7 @@ impl PlannerControllerRuntime {
 }
 
 fn controller_backend_label(controller: &CompiledPlannerController) -> String {
-    match controller {
-        CompiledPlannerController::McAixi {
-            predictor,
-            predictor_max_order,
-            ..
-        }
-        | CompiledPlannerController::AiqiDiscounted {
-            predictor,
-            predictor_max_order,
-            ..
-        }
-        | CompiledPlannerController::AiqiWarmstartExactJh {
-            predictor,
-            predictor_max_order,
-            ..
-        } => predictor.display_label(*predictor_max_order),
-    }
+    controller.backend_label()
 }
 
 fn build_builtin_environment(spec: BuiltinEnvironmentSpec) -> anyhow::Result<Box<dyn Environment>> {
@@ -604,7 +586,8 @@ fn build_builtin_environment(spec: BuiltinEnvironmentSpec) -> anyhow::Result<Box
 fn build_planner_environment(
     compiled: &CompiledPlannerRunSpec,
 ) -> anyhow::Result<(Box<dyn Environment>, &'static str)> {
-    match &compiled.canonical_spec().environment {
+    let environment = &compiled.canonical_spec().environment;
+    match environment {
         spec::EnvironmentSpec::Builtin { builtin } => Ok((
             build_builtin_environment(*builtin)?,
             builtin_environment_name(*builtin),
@@ -614,6 +597,10 @@ fn build_planner_environment(
                 .map_err(anyhow::Error::msg)?;
             Ok((Box::new(NyxVmEnvironment::new(config)?), "vm"))
         }
+        other => Err(anyhow::anyhow!(
+            "unsupported environment variant '{}' in this build",
+            other.kind_str()
+        )),
     }
 }
 
@@ -621,10 +608,15 @@ fn build_planner_environment(
 fn build_planner_environment(
     compiled: &CompiledPlannerRunSpec,
 ) -> anyhow::Result<(Box<dyn Environment>, &'static str)> {
-    match &compiled.canonical_spec().environment {
+    let environment = &compiled.canonical_spec().environment;
+    match environment {
         spec::EnvironmentSpec::Builtin { builtin } => Ok((
             build_builtin_environment(*builtin)?,
             builtin_environment_name(*builtin),
+        )),
+        other => Err(anyhow::anyhow!(
+            "unsupported environment variant '{}' in this build",
+            other.kind_str()
         )),
     }
 }
@@ -690,7 +682,15 @@ fn run_compiled_planner_run(
             controller_backend_label(compiled.controller()),
             env_name
         ),
-        CompiledPlannerController::AiqiWarmstartExactJh { .. } => unreachable!(),
+        // Other controller kinds are filtered out by
+        // `PlannerControllerRuntime::from_compiled` returning Err before reaching
+        // this point. We use `unreachable!` (with a helpful message via
+        // `kind_str`) so any future bug that lets such a variant slip through
+        // panics with a clear diagnostic rather than silently misbehaving.
+        other => unreachable!(
+            "PlannerControllerRuntime::from_compiled should reject controller kind '{}'",
+            other.kind_str()
+        ),
     }
 
     if schedule.vm_perf_only {
@@ -741,21 +741,17 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     }
 
     let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
-    match infotheory::spec::load_spec_document(config_path).map_err(anyhow::Error::msg)? {
+    let document = infotheory::spec::load_spec_document(config_path).map_err(anyhow::Error::msg)?;
+    match document {
         SpecDocument::PlannerRun(spec) => {
             let compiled = spec
                 .compile_in(&spec::SpecEnvironment::new(config_dir))
                 .map_err(anyhow::Error::msg)?;
             run_compiled_planner_run(&compiled, json_overlay.as_ref())
         }
-        SpecDocument::Tune(_) => Err(anyhow::anyhow!(
-            "aixi expects a planner_run document, found kind 'tune'"
-        )),
-        SpecDocument::RateBackend(_) => Err(anyhow::anyhow!(
-            "aixi expects a planner_run document, found kind 'rate_backend'"
-        )),
-        SpecDocument::CompressionBackend(_) => Err(anyhow::anyhow!(
-            "aixi expects a planner_run document, found kind 'compression_backend'"
+        other => Err(anyhow::anyhow!(
+            "aixi expects a planner_run document, found kind '{}'",
+            other.kind_str()
         )),
     }
 }
@@ -1724,28 +1720,37 @@ mod tests {
         #[cfg(feature = "backend-rosa")]
         assert_eq!(parse_rate_backend("rosa"), Some("rosaplus"));
         #[cfg(feature = "backend-ctw")]
-        assert_eq!(parse_rate_backend("facctw"), Some("fac-ctw"));
+        assert_eq!(parse_rate_backend("fac-ctw"), Some("fac-ctw"));
         #[cfg(feature = "backend-match")]
-        assert_eq!(parse_rate_backend("sparsematch"), Some("sparse-match"));
+        assert_eq!(parse_rate_backend("sparse-match"), Some("sparse-match"));
         #[cfg(feature = "backend-ppmd")]
-        assert_eq!(parse_rate_backend("ppm"), Some("ppmd"));
+        assert_eq!(parse_rate_backend("ppmd"), Some("ppmd"));
         #[cfg(feature = "backend-calibrated")]
-        assert_eq!(parse_rate_backend("cal"), Some("calibrated"));
+        assert_eq!(parse_rate_backend("calibrated"), Some("calibrated"));
+        assert_eq!(parse_rate_backend("facctw"), None);
+        assert_eq!(parse_rate_backend("sparsematch"), None);
+        assert_eq!(parse_rate_backend("ppm"), None);
+        assert_eq!(parse_rate_backend("cal"), None);
         assert_eq!(parse_rate_backend("unknown"), None);
 
         assert_eq!(parse_compression_backend("unknown"), None);
         #[cfg(feature = "backend-zpaq")]
         assert_eq!(parse_compression_backend("zpaq"), Some("zpaq"));
-        assert_eq!(parse_compression_backend("rate_ac"), Some("rate-ac"));
-        assert_eq!(parse_compression_backend("raterans"), Some("rate-rans"));
+        assert_eq!(parse_compression_backend("rate-ac"), Some("rate-ac"));
+        assert_eq!(parse_compression_backend("rate-rans"), Some("rate-rans"));
+        assert_eq!(parse_compression_backend("rate_ac"), None);
+        assert_eq!(parse_compression_backend("raterans"), None);
+        assert_eq!(parse_compression_backend("rate_rans"), None);
         #[cfg(feature = "backend-rwkv")]
         {
-            assert_eq!(parse_compression_backend("rwkv"), Some("rwkv7"));
+            assert_eq!(parse_compression_backend("rwkv7"), Some("rwkv7"));
         }
+        assert_eq!(parse_compression_backend("rwkv"), None);
         #[cfg(feature = "backend-mamba")]
         {
-            assert_eq!(parse_rate_backend("mamba1"), Some("mamba"));
+            assert_eq!(parse_rate_backend("mamba"), Some("mamba"));
         }
+        assert_eq!(parse_rate_backend("mamba1"), None);
     }
 
     #[cfg(feature = "all-backends")]
@@ -1900,29 +1905,26 @@ mod tests {
     fn parse_observation_helpers_cover_vm_and_non_vm_cases() {
         let base = json!({
             "observation_stream_len": 3,
-            "observation_key_mode": "stream-hash"
+            "observation_key_mode": "stream_hash"
         });
         assert_eq!(parse_observation_stream_len(&base), 3);
         assert_eq!(
-            parse_observation_key_mode(&base),
+            parse_observation_key_mode(&base).expect("parse stream_hash mode"),
             ObservationKeyMode::StreamHash
         );
         assert_eq!(
-            parse_observation_key_mode_str("full"),
+            parse_observation_key_mode_str("full_stream").expect("parse full_stream"),
             ObservationKeyMode::FullStream
         );
         assert_eq!(
-            parse_observation_key_mode_str("last"),
+            parse_observation_key_mode_str("last").expect("parse last"),
             ObservationKeyMode::Last
         );
-        assert_eq!(
-            parse_observation_key_mode_str("unknown"),
-            ObservationKeyMode::First
-        );
+        assert!(parse_observation_key_mode_str("unknown").is_err());
 
         let vm = json!({
             "observation_stream_len": 2,
-            "observation_key_mode": "full",
+            "observation_key_mode": "full_stream",
             "vm_observation": {
                 "stream_len": 2,
                 "key_mode": "last"
@@ -1933,16 +1935,16 @@ mod tests {
             2
         );
         assert_eq!(
-            parse_observation_key_mode_for_vm(&vm["vm_observation"]),
+            parse_observation_key_mode_for_vm(&vm["vm_observation"]).expect("parse vm mode"),
             ObservationKeyMode::Last
         );
         assert_eq!(parse_observation_stream_len_for_env(&vm, "vm"), 2);
         assert_eq!(
-            parse_observation_key_mode_for_env(&vm, "vm"),
+            parse_observation_key_mode_for_env(&vm, "vm").expect("parse vm env mode"),
             ObservationKeyMode::Last
         );
         assert_eq!(
-            parse_observation_key_mode_for_env(&vm, "coin"),
+            parse_observation_key_mode_for_env(&vm, "coin").expect("parse non-vm mode"),
             ObservationKeyMode::FullStream
         );
 
@@ -1957,7 +1959,7 @@ mod tests {
         assert!(err.to_string().contains("conflicts"));
 
         let mismatch_mode = json!({
-            "observation_key_mode": "full",
+            "observation_key_mode": "full_stream",
             "vm_observation": {
                 "key_mode": "last"
             }
@@ -1971,11 +1973,11 @@ mod tests {
     #[test]
     fn parse_mixture_kind_and_spec_validation() {
         assert_eq!(
-            parse_mixture_kind("bayes-mix").expect("bayes alias"),
+            parse_mixture_kind("bayes").expect("bayes kind"),
             MixtureKind::Bayes
         );
         assert_eq!(
-            parse_mixture_kind("switch").expect("switch alias"),
+            parse_mixture_kind("switching").expect("switching kind"),
             MixtureKind::Switching
         );
         assert_eq!(
@@ -1986,6 +1988,8 @@ mod tests {
             parse_mixture_kind("neural").expect("neural kind"),
             MixtureKind::Neural
         );
+        assert!(parse_mixture_kind("bayes-mix").is_err());
+        assert!(parse_mixture_kind("switch").is_err());
         assert!(parse_mixture_kind("nonsense").is_err());
         assert_eq!(
             parse_mixture_schedule("theorem").expect("theorem schedule"),
@@ -2152,7 +2156,7 @@ mod tests {
             "observation_bits": 13,
             "reward_bits": 5
         });
-        let parsed = parse_vm_stats_backend(&json!({"name":"facctw"}), &root, Path::new("."))
+        let parsed = parse_vm_stats_backend(&json!({"name":"fac-ctw"}), &root, Path::new("."))
             .expect("fac-ctw backend should parse");
         match parsed {
             RateBackend::FacCtw {
@@ -2181,41 +2185,50 @@ mod tests {
             "infotheory-spec-kind-{}-{nanos}.json",
             std::process::id()
         ));
-        let doc = infotheory::spec::SpecDocument::Tune(infotheory::spec::TuneSpec {
-            assets: vec![infotheory::spec::AssetBinding {
-                id: "dataset".to_string(),
-                path: "input.bin".to_string(),
-            }],
-            input_asset: "dataset".to_string(),
-            baseline_candidate: CompressionBackend::Rate {
-                rate_backend: RateBackend::Ctw { depth: 8 },
-                coder: infotheory::coders::CoderType::AC,
-                framing: infotheory::compression::FramingMode::Framed,
-            },
-            controller: infotheory::spec::TuneControllerSpec::AnnealedHillClimbing(
-                infotheory::spec::AnnealedHillClimbingTuneControllerSpec {
-                    max_mutation_radius: 1,
+        let doc_value = json!({
+            "schema_version": 1,
+            "kind": "tune",
+            "assets": [
+                {
+                    "id": "dataset",
+                    "path": "input.bin"
+                }
+            ],
+            "input_asset": "dataset",
+            "baseline_candidate": {
+                "kind": "rate-ac",
+                "rate_backend": {
+                    "kind": "ctw",
+                    "depth": 8
                 },
-            ),
-            bounds: infotheory::spec::TuneBoundsSpec {
-                allowed_backends: vec!["ctw".to_string()],
-                forbidden_backends: vec![],
-                parameter_ranges: vec![],
-                max_experts: 2,
-                max_mixture_nesting_depth: 1,
-                min_experts: Some(1),
-                allow_duplicate_experts: Some(false),
-                required_experts: vec![],
-                forbidden_expert_pairs: vec![],
+                "coder": "ac",
+                "framing": "framed"
             },
-            eval_time_limit_seconds: 1.0,
-            time_budget_seconds: 2.0,
-            min_throughput_bytes_per_second: 1.0,
-            max_memory_bytes: 1024,
-            output_config_path: "best.json".to_string(),
-            seed: 7,
-            report_path: None,
+            "controller": {
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1
+            },
+            "bounds": {
+                "allowed_backends": ["ctw"],
+                "forbidden_backends": [],
+                "parameter_ranges": [],
+                "max_experts": 2,
+                "max_mixture_nesting_depth": 1,
+                "min_experts": 1,
+                "allow_duplicate_experts": false,
+                "required_experts": [],
+                "forbidden_expert_pairs": []
+            },
+            "eval_time_limit_seconds": 1.0,
+            "time_budget_seconds": 2.0,
+            "min_throughput_bytes_per_second": 1.0,
+            "max_memory_bytes": 1024,
+            "output_config_path": "best.json",
+            "seed": 7,
+            "report_path": null
         });
+        let doc = infotheory::spec::SpecDocument::parse_json_value(&doc_value, Path::new("."))
+            .expect("canonical tune document");
         std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
             .expect("write temp spec");
 
@@ -2238,41 +2251,50 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "infotheory-canonical-non-planner-no-ctw-{nanos}.json"
         ));
-        let doc = infotheory::spec::SpecDocument::Tune(infotheory::spec::TuneSpec {
-            assets: vec![infotheory::spec::AssetBinding {
-                id: "dataset".to_string(),
-                path: "input.bin".to_string(),
-            }],
-            input_asset: "dataset".to_string(),
-            baseline_candidate: CompressionBackend::Rate {
-                rate_backend: RateBackend::Ctw { depth: 8 },
-                coder: infotheory::coders::CoderType::AC,
-                framing: infotheory::compression::FramingMode::Framed,
-            },
-            controller: infotheory::spec::TuneControllerSpec::AnnealedHillClimbing(
-                infotheory::spec::AnnealedHillClimbingTuneControllerSpec {
-                    max_mutation_radius: 1,
+        let doc_value = json!({
+            "schema_version": 1,
+            "kind": "tune",
+            "assets": [
+                {
+                    "id": "dataset",
+                    "path": "input.bin"
+                }
+            ],
+            "input_asset": "dataset",
+            "baseline_candidate": {
+                "kind": "rate-ac",
+                "rate_backend": {
+                    "kind": "ctw",
+                    "depth": 8
                 },
-            ),
-            bounds: infotheory::spec::TuneBoundsSpec {
-                allowed_backends: vec!["ctw".to_string()],
-                forbidden_backends: vec![],
-                parameter_ranges: vec![],
-                max_experts: 2,
-                max_mixture_nesting_depth: 1,
-                min_experts: Some(1),
-                allow_duplicate_experts: Some(false),
-                required_experts: vec![],
-                forbidden_expert_pairs: vec![],
+                "coder": "ac",
+                "framing": "framed"
             },
-            eval_time_limit_seconds: 1.0,
-            time_budget_seconds: 2.0,
-            min_throughput_bytes_per_second: 1.0,
-            max_memory_bytes: 1024,
-            output_config_path: "best.json".to_string(),
-            seed: 7,
-            report_path: None,
+            "controller": {
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1
+            },
+            "bounds": {
+                "allowed_backends": ["ctw"],
+                "forbidden_backends": [],
+                "parameter_ranges": [],
+                "max_experts": 2,
+                "max_mixture_nesting_depth": 1,
+                "min_experts": 1,
+                "allow_duplicate_experts": false,
+                "required_experts": [],
+                "forbidden_expert_pairs": []
+            },
+            "eval_time_limit_seconds": 1.0,
+            "time_budget_seconds": 2.0,
+            "min_throughput_bytes_per_second": 1.0,
+            "max_memory_bytes": 1024,
+            "output_config_path": "best.json",
+            "seed": 7,
+            "report_path": null
         });
+        let doc = infotheory::spec::SpecDocument::parse_json_value(&doc_value, Path::new("."))
+            .expect("canonical tune document");
         std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
             .expect("write temp spec");
 
@@ -2287,7 +2309,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(feature = "backend-ctw")]
+    #[cfg(all(feature = "backend-ctw", feature = "aixi-gameengine"))]
     #[test]
     fn run_aixi_mode_accepts_canonical_planner_run_documents() {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2300,43 +2322,50 @@ mod tests {
             "infotheory-planner-run-{}-{nanos}.json",
             std::process::id()
         ));
-        let doc = infotheory::spec::SpecDocument::PlannerRun(infotheory::spec::PlannerRunSpec {
-            assets: Vec::new(),
-            environment: infotheory::spec::EnvironmentSpec::Builtin {
-                builtin: infotheory::spec::BuiltinEnvironmentSpec::TicTacToe,
+        let doc_value = json!({
+            "schema_version": 1,
+            "kind": "planner_run",
+            "assets": [],
+            "environment": {
+                "kind": "builtin",
+                "name": "coin_flip"
             },
-            interface: infotheory::spec::PlannerInterfaceSpec {
-                observation_bits: 18,
-                observation_stream_len: 1,
-                observation_key_mode: ObservationKeyMode::FullStream,
-                reward_bits: 3,
-                agent_actions: 9,
-                min_reward: -3,
-                max_reward: 2,
-                reward_offset: 3,
+            "interface": {
+                "observation_bits": 18,
+                "observation_stream_len": 1,
+                "observation_key_mode": "full_stream",
+                "reward_bits": 3,
+                "agent_actions": 9,
+                "min_reward": -3,
+                "max_reward": 2,
+                "reward_offset": 3
             },
-            controller: infotheory::spec::ControllerSpec::McAixi(
-                infotheory::spec::McAixiControllerSpec {
-                    predictor: RateBackend::Ctw { depth: 8 },
-                    predictor_max_order: 8,
-                    agent_horizon: 1,
-                    num_simulations: 1,
-                    exploration_exploitation_ratio: 1.0,
-                    discount_gamma: 1.0,
+            "controller": {
+                "kind": "mc_aixi",
+                "predictor": {
+                    "kind": "ctw",
+                    "depth": 8
                 },
-            ),
-            runtime: infotheory::spec::PlannerRuntimeSpec {
-                random_seed: Some(7),
-                learn_cycles: Some(1),
-                eval_cycles: Some(0),
-                terminate_lifetime: 1,
-                log_every: 1,
-                perf: false,
-                vm_perf_only: false,
-                explore_epsilon: 0.0,
-                explore_gamma: 1.0,
+                "predictor_max_order": 8,
+                "agent_horizon": 1,
+                "num_simulations": 1,
+                "exploration_exploitation_ratio": 1.0,
+                "discount_gamma": 1.0
             },
+            "runtime": {
+                "random_seed": 7,
+                "learn_cycles": 1,
+                "eval_cycles": 0,
+                "terminate_lifetime": 1,
+                "log_every": 1,
+                "perf": false,
+                "vm_perf_only": false,
+                "explore_epsilon": 0.0,
+                "explore_gamma": 1.0
+            }
         });
+        let doc = infotheory::spec::SpecDocument::parse_json_value(&doc_value, Path::new("."))
+            .expect("canonical planner document");
         std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
             .expect("write temp planner spec");
 
@@ -2346,7 +2375,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(feature = "backend-ctw")]
+    #[cfg(all(feature = "backend-ctw", feature = "aixi-gameengine"))]
     #[test]
     fn run_aixi_mode_rejects_unrepresentable_reward_ranges_in_canonical_specs() {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2359,43 +2388,50 @@ mod tests {
             "infotheory-planner-run-invalid-reward-{}-{nanos}.json",
             std::process::id()
         ));
-        let doc = infotheory::spec::SpecDocument::PlannerRun(infotheory::spec::PlannerRunSpec {
-            assets: Vec::new(),
-            environment: infotheory::spec::EnvironmentSpec::Builtin {
-                builtin: infotheory::spec::BuiltinEnvironmentSpec::TicTacToe,
+        let doc_value = json!({
+            "schema_version": 1,
+            "kind": "planner_run",
+            "assets": [],
+            "environment": {
+                "kind": "builtin",
+                "name": "coin_flip"
             },
-            interface: infotheory::spec::PlannerInterfaceSpec {
-                observation_bits: 18,
-                observation_stream_len: 1,
-                observation_key_mode: ObservationKeyMode::FullStream,
-                reward_bits: 3,
-                agent_actions: 9,
-                min_reward: -3,
-                max_reward: 100,
-                reward_offset: 3,
+            "interface": {
+                "observation_bits": 18,
+                "observation_stream_len": 1,
+                "observation_key_mode": "full_stream",
+                "reward_bits": 3,
+                "agent_actions": 9,
+                "min_reward": -3,
+                "max_reward": 100,
+                "reward_offset": 3
             },
-            controller: infotheory::spec::ControllerSpec::McAixi(
-                infotheory::spec::McAixiControllerSpec {
-                    predictor: RateBackend::Ctw { depth: 8 },
-                    predictor_max_order: 8,
-                    agent_horizon: 1,
-                    num_simulations: 1,
-                    exploration_exploitation_ratio: 1.0,
-                    discount_gamma: 1.0,
+            "controller": {
+                "kind": "mc_aixi",
+                "predictor": {
+                    "kind": "ctw",
+                    "depth": 8
                 },
-            ),
-            runtime: infotheory::spec::PlannerRuntimeSpec {
-                random_seed: Some(7),
-                learn_cycles: Some(1),
-                eval_cycles: Some(0),
-                terminate_lifetime: 1,
-                log_every: 1,
-                perf: false,
-                vm_perf_only: false,
-                explore_epsilon: 0.0,
-                explore_gamma: 1.0,
+                "predictor_max_order": 8,
+                "agent_horizon": 1,
+                "num_simulations": 1,
+                "exploration_exploitation_ratio": 1.0,
+                "discount_gamma": 1.0
             },
+            "runtime": {
+                "random_seed": 7,
+                "learn_cycles": 1,
+                "eval_cycles": 0,
+                "terminate_lifetime": 1,
+                "log_every": 1,
+                "perf": false,
+                "vm_perf_only": false,
+                "explore_epsilon": 0.0,
+                "explore_gamma": 1.0
+            }
         });
+        let doc = infotheory::spec::SpecDocument::parse_json_value(&doc_value, Path::new("."))
+            .expect("canonical planner document");
         std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
             .expect("write temp planner spec");
 
@@ -2426,7 +2462,7 @@ mod tests {
             "agent_horizon": 1,
             "observation_bits": 1,
             "observation_stream_len": 1,
-            "observation_key_mode": "full-stream",
+            "observation_key_mode": "full_stream",
             "reward_bits": 1,
             "agent_actions": 2,
             "num_simulations": 1,

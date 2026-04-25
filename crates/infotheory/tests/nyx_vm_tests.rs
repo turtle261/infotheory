@@ -15,6 +15,7 @@
 
 use infotheory::aixi::vm_nyx::*;
 use infotheory::api::RateBackend;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -109,14 +110,8 @@ fn test_hex_decode_error_invalid_char() {
 #[test]
 fn test_literal_action_source() {
     let actions = vec![
-        NyxActionSpec {
-            name: Some("ping".to_string()),
-            payload: b"PING".to_vec(),
-        },
-        NyxActionSpec {
-            name: Some("pong".to_string()),
-            payload: b"PONG".to_vec(),
-        },
+        NyxActionSpec::named("ping", b"PING".to_vec()),
+        NyxActionSpec::named("pong", b"PONG".to_vec()),
     ];
 
     let source = NyxActionSource::Literal(actions.clone());
@@ -132,14 +127,12 @@ fn test_literal_action_source() {
 
 #[test]
 fn test_fuzz_config() {
-    let config = NyxFuzzConfig {
-        seeds: vec![b"seed1".to_vec(), b"seed2".to_vec()],
-        mutators: vec![FuzzMutator::FlipBit, FuzzMutator::FlipByte],
-        min_len: 1,
-        max_len: 1024,
-        dictionary: vec![b"dict1".to_vec()],
-        rng_seed: 42,
-    };
+    let mut config = NyxFuzzConfig::new(vec![b"seed1".to_vec(), b"seed2".to_vec()]);
+    config.mutators = vec![FuzzMutator::FlipBit, FuzzMutator::FlipByte];
+    config.min_len = 1;
+    config.max_len = 1024;
+    config.dictionary = vec![b"dict1".to_vec()];
+    config.rng_seed = 42;
 
     assert_eq!(config.seeds.len(), 2);
     assert_eq!(config.mutators.len(), 2);
@@ -235,15 +228,14 @@ fn test_reward_policy_custom() {
 
 #[test]
 fn test_action_filter() {
-    let filter = NyxActionFilter {
-        min_entropy: Some(1.0),
-        max_entropy: Some(7.5),
-        min_intrinsic_dependence: Some(0.1),
-        min_novelty: Some(0.5),
-        novelty_prior: Some(vec![0, 1, 2, 3]),
-        max_order: 8,
-        reject_reward: Some(-10),
-    };
+    let mut filter = NyxActionFilter::new();
+    filter.min_entropy = Some(1.0);
+    filter.max_entropy = Some(7.5);
+    filter.min_intrinsic_dependence = Some(0.1);
+    filter.min_novelty = Some(0.5);
+    filter.novelty_prior = Some(vec![0, 1, 2, 3]);
+    filter.max_order = 8;
+    filter.reject_reward = Some(-10);
 
     assert_eq!(filter.min_entropy, Some(1.0));
     assert_eq!(filter.max_entropy, Some(7.5));
@@ -317,11 +309,10 @@ fn test_hypercall_constants() {
 
 #[test]
 fn test_trace_config() {
-    let config = NyxTraceConfig {
-        shared_region_name: Some("trace_buffer".to_string()),
-        max_bytes: 4096,
-        reset_on_episode: true,
-    };
+    let mut config = NyxTraceConfig::new();
+    config.shared_region_name = Some("trace_buffer".to_string());
+    config.max_bytes = 4096;
+    config.reset_on_episode = true;
 
     assert_eq!(config.shared_region_name, Some("trace_buffer".to_string()));
     assert_eq!(config.max_bytes, 4096);
@@ -334,35 +325,17 @@ fn test_trace_config() {
 
 #[test]
 fn test_payload_encoding_from_str() {
-    // Inherent parser should work without importing `std::str::FromStr`.
+    // Canonical parser is `std::str::FromStr`.
     assert!(matches!(
         PayloadEncoding::from_str("utf8"),
-        Some(PayloadEncoding::Utf8)
-    ));
-    assert!(matches!(
-        PayloadEncoding::from_str("text"),
-        Some(PayloadEncoding::Utf8)
+        Ok(PayloadEncoding::Utf8)
     ));
     assert!(matches!(
         PayloadEncoding::from_str("hex"),
-        Some(PayloadEncoding::Hex)
+        Ok(PayloadEncoding::Hex)
     ));
-    assert!(PayloadEncoding::from_str("unknown").is_none());
-
-    // `parse` remains equivalent aliasing behavior.
-    assert!(matches!(
-        PayloadEncoding::parse("utf8"),
-        Some(PayloadEncoding::Utf8)
-    ));
-    assert!(matches!(
-        PayloadEncoding::parse("text"),
-        Some(PayloadEncoding::Utf8)
-    ));
-    assert!(matches!(
-        PayloadEncoding::parse("hex"),
-        Some(PayloadEncoding::Hex)
-    ));
-    assert!(PayloadEncoding::parse("unknown").is_none());
+    assert!(PayloadEncoding::from_str("unknown").is_err());
+    assert!(PayloadEncoding::from_str("text").is_err());
 }
 
 // ============================================================================
@@ -507,42 +480,35 @@ mod vm_integration_tests {
 
         let fc_config_path = create_firecracker_config(&kernel_path, &initrd_path, test_name);
 
-        Some(NyxVmConfig {
-            firecracker_config: fc_config_path.to_string_lossy().to_string(),
-            instance_id: format!("test-vm-{}-{}", std::process::id(), test_name),
-            shared_region_name: "shared".to_string(),
-            shared_region_size: 4096,
-            shared_memory_policy: SharedMemoryPolicy::Snapshot,
-            step_timeout: Duration::from_millis(500),
-            boot_timeout: Duration::from_secs(30),
-            episode_steps: 10,
-            step_cost: 1,
-            // With proper agent initrd, we can use SharedMemory policy
-            observation_policy: NyxObservationPolicy::SharedMemory,
-            observation_bits: 8,
-            observation_stream_len: 1,
-            observation_stream_mode: NyxObservationStreamMode::PadTruncate,
-            observation_pad_byte: 0,
-            reward_bits: 8,
-            reward_policy: NyxRewardPolicy::FromGuest,
-            reward_shaping: None,
-            action_source: NyxActionSource::Literal(vec![
-                NyxActionSpec {
-                    name: Some("nop".to_string()),
-                    payload: vec![],
-                },
-                NyxActionSpec {
-                    name: Some("act".to_string()),
-                    payload: vec![0x01],
-                },
-            ]),
-            action_filter: None,
-            protocol: NyxProtocolConfig::default(),
-            stats_backend: vm_test_stats_backend(),
-            trace: None,
-            debug_mode: true,
-            crash_log: None,
-        })
+        let mut config = NyxVmConfig::default();
+        config.firecracker_config = fc_config_path.to_string_lossy().to_string();
+        config.instance_id = format!("test-vm-{}-{}", std::process::id(), test_name);
+        config.shared_region_name = "shared".to_string();
+        config.shared_region_size = 4096;
+        config.shared_memory_policy = SharedMemoryPolicy::Snapshot;
+        config.step_timeout = Duration::from_millis(500);
+        config.boot_timeout = Duration::from_secs(30);
+        config.episode_steps = 10;
+        config.step_cost = 1;
+        config.observation_policy = NyxObservationPolicy::SharedMemory;
+        config.observation_bits = 8;
+        config.observation_stream_len = 1;
+        config.observation_stream_mode = NyxObservationStreamMode::PadTruncate;
+        config.observation_pad_byte = 0;
+        config.reward_bits = 8;
+        config.reward_policy = NyxRewardPolicy::FromGuest;
+        config.reward_shaping = None;
+        config.action_source = NyxActionSource::Literal(vec![
+            NyxActionSpec::named("nop", vec![]),
+            NyxActionSpec::named("act", vec![0x01]),
+        ]);
+        config.action_filter = None;
+        config.protocol = NyxProtocolConfig::default();
+        config.stats_backend = vm_test_stats_backend();
+        config.trace = None;
+        config.debug_mode = true;
+        config.crash_log = None;
+        Some(config)
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -622,57 +588,46 @@ fn test_config_builder_pattern() {
 /// Test complete configuration for a typical experiment
 #[test]
 fn test_complete_experiment_config() {
-    let config = NyxVmConfig {
-        firecracker_config: "/path/to/config.json".to_string(),
-        instance_id: "experiment-1".to_string(),
-        shared_region_name: "shared".to_string(),
-        shared_region_size: 4096,
-        shared_memory_policy: SharedMemoryPolicy::Snapshot,
-        step_timeout: Duration::from_millis(100),
-        boot_timeout: Duration::from_secs(30),
-        episode_steps: 100,
-        step_cost: 1,
-        observation_policy: NyxObservationPolicy::SharedMemory,
-        observation_bits: 8,
-        observation_stream_len: 64,
-        observation_stream_mode: NyxObservationStreamMode::PadTruncate,
-        observation_pad_byte: 0,
-        reward_bits: 8,
-        reward_policy: NyxRewardPolicy::FromGuest,
-        reward_shaping: Some(NyxRewardShaping::TraceEntropy {
-            max_order: 8,
-            scale: 1.0,
-            normalize: true,
-        }),
-        action_source: NyxActionSource::Literal(vec![
-            NyxActionSpec {
-                name: Some("nop".to_string()),
-                payload: vec![],
-            },
-            NyxActionSpec {
-                name: Some("action1".to_string()),
-                payload: b"A".to_vec(),
-            },
-        ]),
-        action_filter: Some(NyxActionFilter {
-            min_entropy: Some(0.5),
-            max_entropy: None,
-            min_intrinsic_dependence: None,
-            min_novelty: None,
-            novelty_prior: None,
-            max_order: 4,
-            reject_reward: Some(-1),
-        }),
-        protocol: NyxProtocolConfig::default(),
-        stats_backend: vm_test_stats_backend(),
-        trace: Some(NyxTraceConfig {
-            shared_region_name: Some("trace".to_string()),
-            max_bytes: 1024,
-            reset_on_episode: true,
-        }),
-        debug_mode: false,
-        crash_log: None,
-    };
+    let mut config = NyxVmConfig::default();
+    config.firecracker_config = "/path/to/config.json".to_string();
+    config.instance_id = "experiment-1".to_string();
+    config.shared_region_name = "shared".to_string();
+    config.shared_region_size = 4096;
+    config.shared_memory_policy = SharedMemoryPolicy::Snapshot;
+    config.step_timeout = Duration::from_millis(100);
+    config.boot_timeout = Duration::from_secs(30);
+    config.episode_steps = 100;
+    config.step_cost = 1;
+    config.observation_policy = NyxObservationPolicy::SharedMemory;
+    config.observation_bits = 8;
+    config.observation_stream_len = 64;
+    config.observation_stream_mode = NyxObservationStreamMode::PadTruncate;
+    config.observation_pad_byte = 0;
+    config.reward_bits = 8;
+    config.reward_policy = NyxRewardPolicy::FromGuest;
+    config.reward_shaping = Some(NyxRewardShaping::TraceEntropy {
+        max_order: 8,
+        scale: 1.0,
+        normalize: true,
+    });
+    config.action_source = NyxActionSource::Literal(vec![
+        NyxActionSpec::named("nop", vec![]),
+        NyxActionSpec::named("action1", b"A".to_vec()),
+    ]);
+    let mut action_filter = NyxActionFilter::new();
+    action_filter.min_entropy = Some(0.5);
+    action_filter.max_order = 4;
+    action_filter.reject_reward = Some(-1);
+    config.action_filter = Some(action_filter);
+    config.protocol = NyxProtocolConfig::default();
+    config.stats_backend = vm_test_stats_backend();
+    let mut trace = NyxTraceConfig::new();
+    trace.shared_region_name = Some("trace".to_string());
+    trace.max_bytes = 1024;
+    trace.reset_on_episode = true;
+    config.trace = Some(trace);
+    config.debug_mode = false;
+    config.crash_log = None;
 
     assert_eq!(config.episode_steps, 100);
     assert_eq!(config.step_cost, 1);
