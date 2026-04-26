@@ -8,38 +8,253 @@
 //! returns at indices `i % N == phase`.
 
 use crate::aixi::common::{
-    Action, PerceptVal, RandomGenerator, Reward, bits_for_cardinality, resolve_random_seed,
-    validate_reward_encoding_bounds,
+    Action, PerceptVal, RandomGenerator, Reward, RewardEncodingError, bits_for_cardinality,
+    resolve_random_seed, validate_reward_encoding_bounds,
 };
-use crate::aixi::model::{Predictor, build_aiqi_predictor};
+use crate::aixi::model::{Predictor, PredictorBuildError, build_aiqi_predictor};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
     AiqiDiscountedControllerSpec, CompiledPlannerController, CompiledPlannerRunSpec,
-    ControllerSpec, PlannerRunSpec,
+    ControllerSpec, PlannerRunSpec, SpecError,
 };
-#[cfg(feature = "backend-rwkv")]
-use std::path::PathBuf;
+use std::error::Error;
+use std::fmt;
+
+/// Error returned by AIQI configuration validation, construction, and transition ingestion.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AiqiError {
+    /// `agent_actions` was zero.
+    AgentActionsZero,
+    /// `return_horizon` was zero.
+    ReturnHorizonZero,
+    /// `return_bins` was zero.
+    ReturnBinsZero,
+    /// `return_bins` was not a power of two.
+    ReturnBinsNotPowerOfTwo {
+        /// The configured return bin count.
+        return_bins: usize,
+    },
+    /// The augmentation period was smaller than the return horizon.
+    AugmentationPeriodTooShort {
+        /// The configured augmentation period.
+        augmentation_period: usize,
+        /// The configured return horizon.
+        return_horizon: usize,
+    },
+    /// The discount factor was outside `(0, 1)`.
+    InvalidDiscountGamma {
+        /// The invalid discount factor value.
+        value: f64,
+    },
+    /// The baseline exploration probability was outside `(0, 1]`.
+    InvalidBaselineExploration {
+        /// The invalid baseline exploration value.
+        value: f64,
+    },
+    /// The configured reward range is not representable.
+    RewardEncoding(RewardEncodingError),
+    /// The configured rate backend failed validation.
+    InvalidRateBackend(crate::error::InfotheoryError),
+    /// The configured rate backend violates AIQI runtime requirements.
+    UnsupportedRateBackend {
+        /// Human-readable explanation of why the backend is unsupported.
+        reason: &'static str,
+    },
+    /// Planner-run spec compilation failed.
+    Spec(SpecError),
+    /// The compiled planner-run controller kind was not discounted AIQI.
+    ControllerKindMismatch,
+    /// Predictor construction failed.
+    Predictor(PredictorBuildError),
+    /// An observed action was outside the configured action alphabet.
+    ActionOutOfRange {
+        /// The out-of-range action token.
+        action: Action,
+        /// The configured action alphabet cardinality.
+        agent_actions: usize,
+    },
+    /// The observation stream length did not match the configured interface.
+    ObservationStreamLengthMismatch {
+        /// Expected observation stream length.
+        expected: usize,
+        /// Actual observation stream length.
+        actual: usize,
+    },
+    /// An observed reward was outside the configured reward range.
+    RewardOutOfRange {
+        /// Out-of-range reward value.
+        reward: Reward,
+        /// Minimum configured reward.
+        min_reward: Reward,
+        /// Maximum configured reward.
+        max_reward: Reward,
+    },
+    /// An observation value exceeded the configured observation bit width.
+    ObservationValueOutOfRange {
+        /// Out-of-range observation value.
+        observation: PerceptVal,
+        /// Configured observation bit width.
+        observation_bits: usize,
+        /// Maximum representable observation value for `observation_bits`.
+        maximum: PerceptVal,
+    },
+    /// A shifted observed reward became negative.
+    NegativeEncodedReward {
+        /// Original reward value.
+        reward: Reward,
+        /// Configured reward offset.
+        reward_offset: Reward,
+    },
+    /// A shifted observed reward exceeded the configured reward bit capacity.
+    EncodedRewardTooLarge {
+        /// Shifted reward value after applying offset.
+        shifted_reward: i128,
+        /// Configured reward bit width.
+        reward_bits: usize,
+        /// Maximum representable encoded reward for `reward_bits`.
+        maximum_encoded: u128,
+    },
+    /// A requested global step is no longer present in retained history.
+    HistoryIndexOutOfRange {
+        /// Requested global step index.
+        global_step: usize,
+        /// First retained global step index.
+        history_base_step: usize,
+        /// Last observed global step index.
+        total_steps_observed: usize,
+    },
+    /// A phase-model update required a return bin that has not been computed.
+    MissingReturnBin {
+        /// Global step whose return bin was missing.
+        step: usize,
+        /// Augmentation phase that required the return bin.
+        phase: usize,
+    },
+}
+
+impl fmt::Display for AiqiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AgentActionsZero => f.write_str("agent_actions must be >= 1"),
+            Self::ReturnHorizonZero => f.write_str("return_horizon must be >= 1"),
+            Self::ReturnBinsZero => f.write_str("return_bins must be >= 1"),
+            Self::ReturnBinsNotPowerOfTwo { return_bins } => write!(
+                f,
+                "return_bins must be a power of two for exact binary return encoding, got {return_bins}"
+            ),
+            Self::AugmentationPeriodTooShort {
+                augmentation_period,
+                return_horizon,
+            } => write!(
+                f,
+                "augmentation_period must be >= return_horizon (got N={augmentation_period}, H={return_horizon})"
+            ),
+            Self::InvalidDiscountGamma { value } => write!(
+                f,
+                "discount_gamma must be in (0, 1) for AIQI as defined in \"A Model-Free Universal AI\", got {value}"
+            ),
+            Self::InvalidBaselineExploration { value } => write!(
+                f,
+                "baseline_exploration (tau) must be in (0, 1] for AIQI as defined in \"A Model-Free Universal AI\", got {value}"
+            ),
+            Self::RewardEncoding(err) => write!(f, "{err}"),
+            Self::InvalidRateBackend(err) => write!(f, "invalid rate_backend: {err}"),
+            Self::UnsupportedRateBackend { reason } => f.write_str(reason),
+            Self::Spec(err) => write!(f, "{err}"),
+            Self::ControllerKindMismatch => {
+                f.write_str("compiled planner run does not contain a discounted AIQI controller")
+            }
+            Self::Predictor(err) => write!(f, "{err}"),
+            Self::ActionOutOfRange {
+                action,
+                agent_actions,
+            } => write!(
+                f,
+                "action out of range: action={action} but agent_actions={agent_actions}"
+            ),
+            Self::ObservationStreamLengthMismatch { expected, actual } => write!(
+                f,
+                "observation stream length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::RewardOutOfRange {
+                reward,
+                min_reward,
+                max_reward,
+            } => write!(
+                f,
+                "reward out of configured range: reward={reward} not in [{min_reward}, {max_reward}]"
+            ),
+            Self::ObservationValueOutOfRange {
+                observation,
+                observation_bits,
+                maximum,
+            } => write!(
+                f,
+                "observation value {observation} does not fit observation_bits={observation_bits} (max={maximum})"
+            ),
+            Self::NegativeEncodedReward {
+                reward,
+                reward_offset,
+            } => write!(
+                f,
+                "encoded reward became negative after offset: reward={reward} offset={reward_offset}"
+            ),
+            Self::EncodedRewardTooLarge {
+                shifted_reward,
+                reward_bits,
+                maximum_encoded,
+            } => write!(
+                f,
+                "encoded reward {shifted_reward} exceeds reward_bits={reward_bits} capacity {maximum_encoded}"
+            ),
+            Self::HistoryIndexOutOfRange {
+                global_step,
+                history_base_step,
+                total_steps_observed,
+            } => write!(
+                f,
+                "global step {global_step} out of retained history range [{history_base_step}, {total_steps_observed}]"
+            ),
+            Self::MissingReturnBin { step, phase } => write!(
+                f,
+                "missing return bin for step {step} in phase {phase} while pushing augmented history"
+            ),
+        }
+    }
+}
+
+impl Error for AiqiError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RewardEncoding(err) => Some(err),
+            Self::InvalidRateBackend(err) => Some(err),
+            Self::Spec(err) => Some(err),
+            Self::Predictor(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<RewardEncodingError> for AiqiError {
+    fn from(value: RewardEncodingError) -> Self {
+        Self::RewardEncoding(value)
+    }
+}
+
+impl From<SpecError> for AiqiError {
+    fn from(value: SpecError) -> Self {
+        Self::Spec(value)
+    }
+}
 
 /// Configuration parameters for an AIQI agent.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AiqiConfig {
     /// Predictive backend.
-    ///
-    /// Canonical names with their accepted aliases:
-    ///
-    /// - `"ac-ctw"` (alias `"ctw"`): single-tree AIQI-CTW path from
-    ///   "A Model-Free Universal AI".
-    /// - `"fac-ctw"`: factorized CTW extension.
-    /// - `"rosaplus"` (alias `"rosa"`): ROSA+ pluggable predictor.
-    /// - `"rwkv7"`: RWKV-7 file-backed predictor (requires `backend-rwkv`).
-    /// - `"zpaq"`: intentionally unsupported for AIQI strict conditioning.
-    ///
-    /// The alias mapping is identical for [`crate::aixi::agent::AgentConfig`].
-    pub algorithm: String,
-    /// Context depth for CTW/FAC-CTW backends.
-    pub ct_depth: usize,
+    pub rate_backend: RateBackend,
     /// Number of bits used to encode observations.
     pub observation_bits: usize,
     /// Number of observation symbols per environment step.
@@ -78,29 +293,14 @@ pub struct AiqiConfig {
     ///
     /// When `None`, planner runtime canonicalizes this to seed `0`.
     pub random_seed: Option<u64>,
-    /// Optional generic rate backend.
-    ///
-    /// When set, this takes precedence over `algorithm` and routes AIQI
-    /// prediction through the shared `RateBackend` abstraction.
-    pub rate_backend: Option<RateBackend>,
     /// Max-order hint for `rate_backend` constructors that use it (for example ROSA).
     pub rate_backend_max_order: i64,
-    /// Optional RWKV model path.
-    ///
-    /// Required only when selecting `algorithm="rwkv7"` and no `rate_backend`
-    /// override is configured.
-    pub rwkv_model_path: Option<String>,
-    /// Optional ROSA max order.
-    pub rosa_max_order: Option<i64>,
-    /// Optional ZPAQ method string.
-    pub zpaq_method: Option<String>,
 }
 
 impl Default for AiqiConfig {
     fn default() -> Self {
         Self {
-            algorithm: "ctw".to_string(),
-            ct_depth: 8,
+            rate_backend: RateBackend::Ctw { depth: 8 },
             observation_bits: 1,
             observation_stream_len: 1,
             reward_bits: 1,
@@ -115,57 +315,19 @@ impl Default for AiqiConfig {
             history_prune_keep_steps: None,
             baseline_exploration: 0.01,
             random_seed: None,
-            rate_backend: None,
             rate_backend_max_order: 8,
-            rwkv_model_path: None,
-            rosa_max_order: None,
-            zpaq_method: None,
         }
     }
 }
 
 impl AiqiConfig {
-    fn canonical_predictor_backend(&self) -> Result<RateBackend, String> {
-        if let Some(rate_backend) = &self.rate_backend {
-            return Ok(rate_backend.clone());
-        }
-
-        match self.algorithm.as_str() {
-            "ctw" | "ac-ctw" => Ok(RateBackend::Ctw {
-                depth: self.ct_depth,
-            }),
-            "fac-ctw" => Ok(RateBackend::FacCtw {
-                base_depth: self.ct_depth,
-                num_percept_bits: bits_for_cardinality(self.return_bins),
-                encoding_bits: 1,
-            }),
-            "rosa" | "rosaplus" => Ok(RateBackend::RosaPlus),
-            #[cfg(feature = "backend-rwkv")]
-            "rwkv7" => {
-                let path = self.rwkv_model_path.as_ref().ok_or_else(|| {
-                    "algorithm=rwkv7 requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
-                        .to_string()
-                })?;
-                Ok(RateBackend::Rwkv7Method {
-                    method: crate::rwkvzip::MethodSpec::File {
-                        path: PathBuf::from(path),
-                        policy: None,
-                    },
-                })
-            }
-            #[cfg(not(feature = "backend-rwkv"))]
-            "rwkv7" => Err("algorithm=rwkv7 requires backend-rwkv feature".to_string()),
-            "zpaq" => Err(
-                "AIQI strict mode does not support algorithm=zpaq; configure a backend with strict frozen conditioning"
-                    .to_string(),
-            ),
-            other => Err(format!("Unknown AIQI algorithm: {other}")),
-        }
+    fn canonical_predictor_backend(&self) -> RateBackend {
+        self.rate_backend.clone()
     }
 
-    fn canonical_planner_run_spec(&self) -> Result<PlannerRunSpec, String> {
-        let predictor = self.canonical_predictor_backend()?;
-        Ok(build_default_planner_run_spec(
+    fn canonical_planner_run_spec(&self) -> PlannerRunSpec {
+        let predictor = self.canonical_predictor_backend();
+        build_default_planner_run_spec(
             PlannerInterfaceConfig {
                 observation_bits: self.observation_bits,
                 observation_stream_len: self.observation_stream_len,
@@ -187,48 +349,45 @@ impl AiqiConfig {
                 baseline_exploration: self.baseline_exploration,
             }),
             self.random_seed,
-        ))
+        )
     }
 
-    fn compile_planner_run_spec(&self) -> Result<CompiledPlannerRunSpec, String> {
-        self.canonical_planner_run_spec()?
+    fn compile_planner_run_spec(&self) -> Result<CompiledPlannerRunSpec, AiqiError> {
+        self.canonical_planner_run_spec()
             .compile()
-            .map_err(|err| err.to_string())
+            .map_err(AiqiError::from)
     }
 
-    fn validate_runtime_invariants(&self) -> Result<(), String> {
+    fn validate_runtime_invariants(&self) -> Result<(), AiqiError> {
         if self.agent_actions == 0 {
-            return Err("agent_actions must be >= 1".to_string());
+            return Err(AiqiError::AgentActionsZero);
         }
         if self.return_horizon == 0 {
-            return Err("return_horizon must be >= 1".to_string());
+            return Err(AiqiError::ReturnHorizonZero);
         }
         if self.return_bins == 0 {
-            return Err("return_bins must be >= 1".to_string());
+            return Err(AiqiError::ReturnBinsZero);
         }
         if !self.return_bins.is_power_of_two() {
-            return Err(format!(
-                "return_bins must be a power of two for exact binary return encoding, got {}",
-                self.return_bins
-            ));
+            return Err(AiqiError::ReturnBinsNotPowerOfTwo {
+                return_bins: self.return_bins,
+            });
         }
         if self.augmentation_period < self.return_horizon {
-            return Err(format!(
-                "augmentation_period must be >= return_horizon (got N={}, H={})",
-                self.augmentation_period, self.return_horizon
-            ));
+            return Err(AiqiError::AugmentationPeriodTooShort {
+                augmentation_period: self.augmentation_period,
+                return_horizon: self.return_horizon,
+            });
         }
         if !(0.0 < self.discount_gamma && self.discount_gamma < 1.0) {
-            return Err(format!(
-                "discount_gamma must be in (0, 1) for AIQI as defined in \"A Model-Free Universal AI\", got {}",
-                self.discount_gamma
-            ));
+            return Err(AiqiError::InvalidDiscountGamma {
+                value: self.discount_gamma,
+            });
         }
         if !(0.0 < self.baseline_exploration && self.baseline_exploration <= 1.0) {
-            return Err(format!(
-                "baseline_exploration (tau) must be in (0, 1] for AIQI as defined in \"A Model-Free Universal AI\", got {}",
-                self.baseline_exploration
-            ));
+            return Err(AiqiError::InvalidBaselineExploration {
+                value: self.baseline_exploration,
+            });
         }
         validate_reward_encoding_bounds(
             self.min_reward,
@@ -237,55 +396,17 @@ impl AiqiConfig {
             self.reward_bits,
         )?;
 
-        // `rate_backend` takes precedence over `algorithm`; only validate
-        // algorithm choices when no backend override is configured.
-        if self.rate_backend.is_none() {
-            match self.algorithm.as_str() {
-                "ctw" | "ac-ctw" | "fac-ctw" | "rosa" | "rosaplus" => {}
-                "zpaq" => {
-                    return Err(
-                        "AIQI strict mode does not support algorithm=zpaq: zpaq backends do not provide strict frozen conditioning"
-                            .to_string(),
-                    )
-                }
-                #[cfg(feature = "backend-rwkv")]
-                "rwkv7" => {}
-                #[cfg(not(feature = "backend-rwkv"))]
-                "rwkv7" => {
-                    return Err("algorithm=rwkv7 requires backend-rwkv feature".to_string())
-                }
-                other => return Err(format!("Unknown AIQI algorithm: {other}")),
-            }
-        }
-
-        if let Some(rate_backend) = &self.rate_backend {
-            validate_rate_backend(rate_backend)
-                .map_err(|err| format!("invalid rate_backend: {err}"))?;
-            if !rate_backend_supports_aiqi_frozen_conditioning(rate_backend) {
-                return Err(
-                    "AIQI strict mode requires frozen context updates; configured rate_backend contains zpaq which does not provide strict frozen conditioning"
-                        .to_string(),
-                );
-            }
-        }
-
-        #[cfg(feature = "backend-rwkv")]
-        if self.rate_backend.is_none() && self.algorithm == "rwkv7" {
-            match self.rwkv_model_path.as_deref() {
-                Some(path) if !path.trim().is_empty() => {}
-                _ => {
-                    return Err(
-                        "algorithm=rwkv7 requires rwkv_model_path when no rate_backend override is configured; for method-string RWKV configure rate_backend rwkv/rwkv7"
-                            .to_string(),
-                    )
-                }
-            }
+        validate_rate_backend(&self.rate_backend).map_err(AiqiError::InvalidRateBackend)?;
+        if !rate_backend_supports_aiqi_frozen_conditioning(&self.rate_backend) {
+            return Err(AiqiError::UnsupportedRateBackend {
+                reason: "AIQI strict mode requires frozen context updates; configured rate_backend contains zpaq which does not provide strict frozen conditioning",
+            });
         }
         Ok(())
     }
 
     /// Validate configuration constraints.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), AiqiError> {
         self.validate_runtime_invariants()?;
         self.compile_planner_run_spec().map(|_| ())
     }
@@ -295,7 +416,7 @@ impl AiqiConfig {
     /// Used by cross-config alias-symmetry tests in [`crate::aixi::agent`].
     #[doc(hidden)]
     #[cfg(test)]
-    pub(crate) fn canonical_predictor_backend_for_test(&self) -> Result<RateBackend, String> {
+    pub(crate) fn canonical_predictor_backend_for_test(&self) -> RateBackend {
         self.canonical_predictor_backend()
     }
 }
@@ -319,7 +440,7 @@ struct AiqiRuntimeConfig {
 }
 
 impl AiqiRuntimeConfig {
-    fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+    fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, AiqiError> {
         let interface = compiled.interface();
         let runtime = compiled.runtime();
         let (
@@ -346,12 +467,7 @@ impl AiqiRuntimeConfig {
                 *history_prune_keep_steps,
                 *baseline_exploration,
             ),
-            _ => {
-                return Err(
-                    "compiled planner run does not contain a discounted AIQI controller"
-                        .to_string(),
-                );
-            }
+            _ => return Err(AiqiError::ControllerKindMismatch),
         };
 
         Ok(Self {
@@ -406,7 +522,7 @@ pub struct AiqiAgent {
 
 impl AiqiAgent {
     /// Construct a new AIQI agent.
-    pub fn new(config: AiqiConfig) -> Result<Self, String> {
+    pub fn new(config: AiqiConfig) -> Result<Self, AiqiError> {
         config.validate_runtime_invariants()?;
         let compiled = config.compile_planner_run_spec()?;
         let runtime = AiqiRuntimeConfig::from_compiled(&compiled)?;
@@ -414,7 +530,7 @@ impl AiqiAgent {
     }
 
     /// Construct a new AIQI agent directly from a compiled planner-run spec.
-    pub fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+    pub fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, AiqiError> {
         let config = AiqiRuntimeConfig::from_compiled(compiled)?;
         Self::from_compiled_config(config, compiled)
     }
@@ -422,7 +538,7 @@ impl AiqiAgent {
     fn from_compiled_config(
         config: AiqiRuntimeConfig,
         compiled: &CompiledPlannerRunSpec,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, AiqiError> {
         let (predictor, predictor_max_order, augmentation_period, return_bins) =
             match compiled.controller() {
                 CompiledPlannerController::AiqiDiscounted {
@@ -437,12 +553,7 @@ impl AiqiAgent {
                     *augmentation_period,
                     *return_bins,
                 ),
-                _ => {
-                    return Err(
-                        "compiled planner run is not a discounted AIQI controller configuration"
-                            .to_string(),
-                    );
-                }
+                _ => return Err(AiqiError::ControllerKindMismatch),
             };
         let action_bits = compiled.action_bits();
         let return_bits = bits_for_cardinality(return_bins);
@@ -455,7 +566,8 @@ impl AiqiAgent {
         let mut phases = Vec::with_capacity(augmentation_period);
         for _ in 0..augmentation_period {
             phases.push(PhaseModel {
-                predictor: build_aiqi_predictor(predictor, predictor_max_order, return_bits)?,
+                predictor: build_aiqi_predictor(predictor, predictor_max_order, return_bits)
+                    .map_err(AiqiError::Predictor)?,
                 last_augmented_step: 0,
             });
         }
@@ -534,54 +646,56 @@ impl AiqiAgent {
         action: Action,
         observations: &[PerceptVal],
         reward: Reward,
-    ) -> Result<(), String> {
+    ) -> Result<(), AiqiError> {
         if action as usize >= self.config.agent_actions {
-            return Err(format!(
-                "action out of range: action={} but agent_actions={}",
-                action, self.config.agent_actions
-            ));
+            return Err(AiqiError::ActionOutOfRange {
+                action,
+                agent_actions: self.config.agent_actions,
+            });
         }
 
         let expected_obs = self.config.observation_stream_len.max(1);
         if observations.len() != expected_obs {
-            return Err(format!(
-                "observation stream length mismatch: expected {}, got {}",
-                expected_obs,
-                observations.len()
-            ));
+            return Err(AiqiError::ObservationStreamLengthMismatch {
+                expected: expected_obs,
+                actual: observations.len(),
+            });
         }
 
         if reward < self.config.min_reward || reward > self.config.max_reward {
-            return Err(format!(
-                "reward out of configured range: reward={} not in [{}, {}]",
-                reward, self.config.min_reward, self.config.max_reward
-            ));
+            return Err(AiqiError::RewardOutOfRange {
+                reward,
+                min_reward: self.config.min_reward,
+                max_reward: self.config.max_reward,
+            });
         }
 
         let obs_max = max_value_for_bits(self.config.observation_bits);
         for &obs in observations {
             if obs > obs_max {
-                return Err(format!(
-                    "observation value {} does not fit observation_bits={} (max={})",
-                    obs, self.config.observation_bits, obs_max
-                ));
+                return Err(AiqiError::ObservationValueOutOfRange {
+                    observation: obs,
+                    observation_bits: self.config.observation_bits,
+                    maximum: obs_max,
+                });
             }
         }
 
         let rew_shifted = (reward as i128) + (self.config.reward_offset as i128);
         if rew_shifted < 0 {
-            return Err(format!(
-                "encoded reward became negative after offset: reward={} offset={}",
-                reward, self.config.reward_offset
-            ));
+            return Err(AiqiError::NegativeEncodedReward {
+                reward,
+                reward_offset: self.config.reward_offset,
+            });
         }
         if self.config.reward_bits < 64 {
             let max_enc = (1u128 << self.config.reward_bits) - 1;
             if (rew_shifted as u128) > max_enc {
-                return Err(format!(
-                    "encoded reward {} exceeds reward_bits={} capacity {}",
-                    rew_shifted, self.config.reward_bits, max_enc
-                ));
+                return Err(AiqiError::EncodedRewardTooLarge {
+                    shifted_reward: rew_shifted,
+                    reward_bits: self.config.reward_bits,
+                    maximum_encoded: max_enc,
+                });
             }
         }
 
@@ -598,7 +712,7 @@ impl AiqiAgent {
         Ok(())
     }
 
-    fn maybe_learn_new_return(&mut self) -> Result<(), String> {
+    fn maybe_learn_new_return(&mut self) -> Result<(), AiqiError> {
         let t = self.total_steps_observed;
         let h = self.config.return_horizon;
         if t < h {
@@ -808,7 +922,7 @@ impl AiqiAgent {
         &mut self,
         phase: usize,
         target_step: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), AiqiError> {
         let config = &self.config;
         let steps = &self.steps;
         let return_bins_by_step = &self.return_bins_by_step;
@@ -873,12 +987,13 @@ impl AiqiAgent {
         bin
     }
 
-    fn local_index(&self, global_step: usize) -> Result<usize, String> {
+    fn local_index(&self, global_step: usize) -> Result<usize, AiqiError> {
         if global_step < self.history_base_step || global_step > self.total_steps_observed {
-            return Err(format!(
-                "global step {} out of retained history range [{}, {}]",
-                global_step, self.history_base_step, self.total_steps_observed
-            ));
+            return Err(AiqiError::HistoryIndexOutOfRange {
+                global_step,
+                history_base_step: self.history_base_step,
+                total_steps_observed: self.total_steps_observed,
+            });
         }
         Ok(global_step - self.history_base_step)
     }
@@ -963,19 +1078,15 @@ fn push_augmented_step_tokens_commit(
     predictor: &mut dyn Predictor,
     phase: usize,
     idx: usize,
-) -> Result<usize, String> {
+) -> Result<usize, AiqiError> {
     let mut pushed = 0usize;
     pushed +=
         push_action_tokens_commit_history(history_base_step, steps, action_bits, predictor, idx);
 
     if idx % config.augmentation_period == phase {
         let local_idx = idx - history_base_step;
-        let bin = return_bins_by_step[local_idx].ok_or_else(|| {
-            format!(
-                "missing return bin for step {} in phase {} while pushing augmented history",
-                idx, phase
-            )
-        })?;
+        let bin = return_bins_by_step[local_idx]
+            .ok_or(AiqiError::MissingReturnBin { step: idx, phase })?;
         pushed += push_encoded_bits_commit(predictor, bin, return_bits);
     }
 
@@ -1182,8 +1293,7 @@ mod tests {
 
     fn basic_config() -> AiqiConfig {
         AiqiConfig {
-            algorithm: "ac-ctw".to_string(),
-            ct_depth: 8,
+            rate_backend: RateBackend::Ctw { depth: 8 },
             observation_bits: 1,
             observation_stream_len: 1,
             reward_bits: 1,
@@ -1198,17 +1308,13 @@ mod tests {
             history_prune_keep_steps: None,
             baseline_exploration: 0.01,
             random_seed: Some(7),
-            rate_backend: None,
             rate_backend_max_order: 20,
-            rwkv_model_path: None,
-            rosa_max_order: None,
-            zpaq_method: None,
         }
     }
 
     fn generic_mixture_config() -> AiqiConfig {
         AiqiConfig {
-            rate_backend: Some(RateBackend::Mixture {
+            rate_backend: RateBackend::Mixture {
                 spec: Arc::new(
                     MixtureSpec::new(
                         MixtureKind::Bayes,
@@ -1235,7 +1341,7 @@ mod tests {
                     )
                     .with_alpha(0.03),
                 ),
-            }),
+            },
             random_seed: Some(11),
             baseline_exploration: 0.01,
             ..basic_config()
@@ -1411,7 +1517,13 @@ mod tests {
         let err = cfg
             .validate()
             .expect_err("N < H must be rejected to match \"A Model-Free Universal AI\"");
-        assert!(err.contains("augmentation_period"));
+        assert!(matches!(
+            err,
+            AiqiError::AugmentationPeriodTooShort {
+                augmentation_period: 1,
+                return_horizon: 2
+            }
+        ));
     }
 
     #[test]
@@ -1421,29 +1533,22 @@ mod tests {
         let err = cfg
             .validate()
             .expect_err("non-power-of-two return_bins should be rejected");
-        assert!(err.contains("power of two"));
-    }
-
-    #[test]
-    fn config_rejects_zpaq_algorithm_in_strict_mode() {
-        let mut cfg = basic_config();
-        cfg.algorithm = "zpaq".to_string();
-        let err = cfg
-            .validate()
-            .expect_err("strict AIQI must reject zpaq algorithm mode");
-        assert!(err.contains("strict mode"));
+        assert!(matches!(
+            err,
+            AiqiError::ReturnBinsNotPowerOfTwo { return_bins: 3 }
+        ));
     }
 
     #[test]
     fn config_rejects_zpaq_rate_backend_in_strict_mode() {
         let mut cfg = basic_config();
-        cfg.rate_backend = Some(RateBackend::Zpaq {
+        cfg.rate_backend = RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
-        });
+        };
         let err = cfg
             .validate()
             .expect_err("strict AIQI must reject zpaq rate backend");
-        assert!(err.contains("strict frozen conditioning"));
+        assert!(matches!(err, AiqiError::UnsupportedRateBackend { .. }));
     }
 
     #[test]
@@ -1453,14 +1558,20 @@ mod tests {
         let err = cfg
             .validate()
             .expect_err("gamma=1 must be rejected for strict paper AIQI");
-        assert!(err.contains("discount_gamma"));
+        assert!(matches!(
+            err,
+            AiqiError::InvalidDiscountGamma { value: 1.0 }
+        ));
 
         cfg = basic_config();
         cfg.baseline_exploration = 0.0;
         let err = cfg
             .validate()
             .expect_err("tau=0 must be rejected for strict paper AIQI");
-        assert!(err.contains("baseline_exploration"));
+        assert!(matches!(
+            err,
+            AiqiError::InvalidBaselineExploration { value: 0.0 }
+        ));
     }
 
     #[test]
@@ -1479,8 +1590,12 @@ mod tests {
     #[test]
     fn fac_ctw_predictor_uses_return_bit_width() {
         let mut cfg = basic_config();
-        cfg.algorithm = "fac-ctw".to_string();
         cfg.return_bins = 8; // return_bits=3
+        cfg.rate_backend = RateBackend::FacCtw {
+            base_depth: 8,
+            num_percept_bits: bits_for_cardinality(cfg.return_bins),
+            encoding_bits: 1,
+        };
 
         let agent = AiqiAgent::new(cfg).expect("valid aiqi config");
         let name = agent.phases[0].predictor.model_name();
@@ -1492,27 +1607,11 @@ mod tests {
 
     #[test]
     fn ac_ctw_path_uses_single_tree_predictor() {
-        let mut cfg = basic_config();
-        cfg.algorithm = "ac-ctw".to_string();
-
-        let agent = AiqiAgent::new(cfg).expect("valid aiqi config");
+        let agent = AiqiAgent::new(basic_config()).expect("valid aiqi config");
         let name = agent.phases[0].predictor.model_name();
         assert!(
             name.starts_with("AC-CTW"),
             "ac-ctw should map to the single-tree CTW predictor, model_name={name}"
-        );
-    }
-
-    #[test]
-    fn ctw_alias_matches_ac_ctw_predictor() {
-        let mut cfg = basic_config();
-        cfg.algorithm = "ctw".to_string();
-
-        let agent = AiqiAgent::new(cfg).expect("valid aiqi config");
-        let name = agent.phases[0].predictor.model_name();
-        assert!(
-            name.starts_with("AC-CTW"),
-            "ctw alias should map to paper AIQI-CTW predictor, model_name={name}"
         );
     }
 
@@ -1561,10 +1660,7 @@ mod tests {
 
     #[test]
     fn ac_ctw_rollout_uses_training_updates() {
-        let mut cfg = basic_config();
-        cfg.algorithm = "ac-ctw".to_string();
-
-        let agent = AiqiAgent::new(cfg).expect("valid aiqi config");
+        let agent = AiqiAgent::new(basic_config()).expect("valid aiqi config");
         assert!(
             agent.distribution_uses_training_updates,
             "ac-ctw should use update/revert during return distribution rollout"
@@ -1653,13 +1749,13 @@ mod tests {
     #[test]
     fn generic_planner_trains_on_returns_and_freezes_conditioning_tokens() {
         let mut cfg = basic_config();
-        cfg.rate_backend = Some(RateBackend::Match {
+        cfg.rate_backend = RateBackend::Match {
             hash_bits: 16,
             min_len: 2,
             max_len: 16,
             base_mix: 0.05,
             confidence_scale: 1.0,
-        });
+        };
 
         let mut agent = AiqiAgent::new(cfg).expect("valid aiqi config");
         let counts = Arc::new(Mutex::new(SharedCallCounts::default()));

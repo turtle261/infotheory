@@ -60,6 +60,10 @@ fn py_spec_value_error(err: infotheory::spec::SpecError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
+fn py_value_error(err: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(err.to_string())
+}
+
 fn compile_rate_backend(backend: RateBackend) -> PyResult<CompiledRateBackend> {
     backend.compile().map_err(py_spec_value_error)
 }
@@ -3304,7 +3308,7 @@ fn run_agent_with_environment<'py>(
             "AgentConfig.agent_actions must be >= 1 for run_agent_with_environment",
         ));
     }
-    config.inner.validate().map_err(PyValueError::new_err)?;
+    config.inner.validate().map_err(py_value_error)?;
 
     let summary = py.detach(|| {
         py_try(|| {
@@ -3317,7 +3321,7 @@ fn run_agent_with_environment<'py>(
             let mut env = PyEnvironmentShim::new(environment);
             let resolved_seed = resolve_random_seed(config.inner.random_seed);
             env.set_random_seed(resolved_seed);
-            let mut agent = Agent::try_new(config.inner.clone()).map_err(PyValueError::new_err)?;
+            let mut agent = Agent::try_new(config.inner.clone()).map_err(py_value_error)?;
 
             let observation_stream_len = config.inner.observation_stream_len.max(1);
             let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
@@ -3489,7 +3493,7 @@ fn run_aiqi_with_environment<'py>(
             let mut env = PyEnvironmentShim::new(environment);
             let resolved_seed = resolve_random_seed(config.inner.random_seed);
             env.set_random_seed(resolved_seed);
-            let mut agent = AiqiAgent::new(config.inner.clone()).map_err(PyValueError::new_err)?;
+            let mut agent = AiqiAgent::new(config.inner.clone()).map_err(py_value_error)?;
 
             let observation_stream_len = config.inner.observation_stream_len.max(1);
             let (learn_cycles, eval_cycles) = match (learn_cycles, eval_cycles) {
@@ -3523,7 +3527,7 @@ fn run_aiqi_with_environment<'py>(
 
                 agent
                     .observe_transition(action, &next_obs_stream, next_reward)
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(py_value_error)?;
 
                 obs_stream = next_obs_stream;
                 reward = next_reward;
@@ -3548,7 +3552,7 @@ fn run_aiqi_with_environment<'py>(
 
                 agent
                     .observe_transition(action, &next_obs_stream, next_reward)
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(py_value_error)?;
 
                 obs_stream = next_obs_stream;
                 reward = next_reward;
@@ -3695,8 +3699,7 @@ impl PyAgentConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
-        algorithm="fac-ctw".to_string(),
-        ct_depth=16,
+        rate_backend,
         agent_horizon=6,
         observation_bits=8,
         observation_stream_len=1,
@@ -3710,15 +3713,10 @@ impl PyAgentConfig {
         max_reward=127,
         reward_offset=128,
         random_seed=None,
-        rate_backend=None,
-        rate_backend_max_order=20,
-        rwkv_model_path=None,
-        rosa_max_order=None,
-        zpaq_method=None
+        rate_backend_max_order=20
     ))]
     fn new(
-        algorithm: String,
-        ct_depth: usize,
+        rate_backend: &PyRateBackend,
         agent_horizon: usize,
         observation_bits: usize,
         observation_stream_len: usize,
@@ -3732,15 +3730,10 @@ impl PyAgentConfig {
         max_reward: i64,
         reward_offset: i64,
         random_seed: Option<u64>,
-        rate_backend: Option<&PyRateBackend>,
         rate_backend_max_order: i64,
-        rwkv_model_path: Option<String>,
-        rosa_max_order: Option<i64>,
-        zpaq_method: Option<String>,
     ) -> PyResult<Self> {
         let mut inner = infotheory::aixi::agent::AgentConfig::default();
-        inner.algorithm = algorithm;
-        inner.ct_depth = ct_depth;
+        inner.rate_backend = rate_backend.inner.clone();
         inner.agent_horizon = agent_horizon;
         inner.observation_bits = observation_bits;
         inner.observation_stream_len = observation_stream_len;
@@ -3756,12 +3749,8 @@ impl PyAgentConfig {
         inner.max_reward = max_reward;
         inner.reward_offset = reward_offset;
         inner.random_seed = random_seed;
-        inner.rate_backend = rate_backend.map(|rb| rb.inner.clone());
         inner.rate_backend_max_order = rate_backend_max_order;
-        inner.rwkv_model_path = rwkv_model_path;
-        inner.rosa_max_order = rosa_max_order;
-        inner.zpaq_method = zpaq_method;
-        inner.validate().map_err(PyValueError::new_err)?;
+        inner.validate().map_err(py_value_error)?;
         Ok(Self { inner })
     }
 }
@@ -3771,8 +3760,7 @@ impl PyAiqiConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
-        algorithm="ctw".to_string(),
-        ct_depth=16,
+        rate_backend,
         observation_bits=8,
         observation_stream_len=1,
         reward_bits=8,
@@ -3787,15 +3775,10 @@ impl PyAiqiConfig {
         history_prune_keep_steps=None,
         baseline_exploration=0.01,
         random_seed=None,
-        rate_backend=None,
-        rate_backend_max_order=20,
-        rwkv_model_path=None,
-        rosa_max_order=None,
-        zpaq_method=None
+        rate_backend_max_order=20
     ))]
     fn new(
-        algorithm: String,
-        ct_depth: usize,
+        rate_backend: &PyRateBackend,
         observation_bits: usize,
         observation_stream_len: usize,
         reward_bits: usize,
@@ -3810,15 +3793,10 @@ impl PyAiqiConfig {
         history_prune_keep_steps: Option<usize>,
         baseline_exploration: f64,
         random_seed: Option<u64>,
-        rate_backend: Option<&PyRateBackend>,
         rate_backend_max_order: i64,
-        rwkv_model_path: Option<String>,
-        rosa_max_order: Option<i64>,
-        zpaq_method: Option<String>,
     ) -> PyResult<Self> {
         let mut inner = infotheory::aixi::aiqi::AiqiConfig::default();
-        inner.algorithm = algorithm;
-        inner.ct_depth = ct_depth;
+        inner.rate_backend = rate_backend.inner.clone();
         inner.observation_bits = observation_bits;
         inner.observation_stream_len = observation_stream_len;
         inner.reward_bits = reward_bits;
@@ -3833,12 +3811,8 @@ impl PyAiqiConfig {
         inner.history_prune_keep_steps = history_prune_keep_steps;
         inner.baseline_exploration = baseline_exploration;
         inner.random_seed = random_seed;
-        inner.rate_backend = rate_backend.map(|rb| rb.inner.clone());
         inner.rate_backend_max_order = rate_backend_max_order;
-        inner.rwkv_model_path = rwkv_model_path;
-        inner.rosa_max_order = rosa_max_order;
-        inner.zpaq_method = zpaq_method;
-        inner.validate().map_err(PyValueError::new_err)?;
+        inner.validate().map_err(py_value_error)?;
         Ok(Self { inner })
     }
 }
@@ -3854,7 +3828,7 @@ impl PyAgent {
     fn new(config: &PyAgentConfig) -> PyResult<Self> {
         py_try(|| {
             let inner = infotheory::aixi::agent::Agent::try_new(config.inner.clone())
-                .map_err(PyValueError::new_err)?;
+                .map_err(py_value_error)?;
             Ok(Self { inner })
         })
     }
@@ -3906,7 +3880,7 @@ impl PyAiqiAgent {
     fn new(config: &PyAiqiConfig) -> PyResult<Self> {
         py_try(|| {
             let inner = infotheory::aixi::aiqi::AiqiAgent::new(config.inner.clone())
-                .map_err(PyValueError::new_err)?;
+                .map_err(py_value_error)?;
             Ok(Self { inner })
         })
     }
@@ -3937,7 +3911,7 @@ impl PyAiqiAgent {
     ) -> PyResult<()> {
         self.inner
             .observe_transition(action, &observations, reward)
-            .map_err(PyValueError::new_err)
+            .map_err(py_value_error)
     }
 
     fn resolved_random_seed(&self) -> u64 {
@@ -4481,7 +4455,7 @@ impl PyNyxVmConfig {
     }
 
     fn validate(&self) -> PyResult<()> {
-        self.inner.validate().map_err(PyValueError::new_err)
+        self.inner.validate().map_err(py_value_error)
     }
 }
 
@@ -4496,7 +4470,7 @@ struct PyNyxVmEnvironment {
 impl PyNyxVmEnvironment {
     #[new]
     fn new(config: &PyNyxVmConfig) -> PyResult<Self> {
-        config.inner.validate().map_err(PyValueError::new_err)?;
+        config.inner.validate().map_err(py_value_error)?;
         let env = infotheory::aixi::vm_nyx::NyxVmEnvironment::new(config.inner.clone())
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner: env })

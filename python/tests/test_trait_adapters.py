@@ -142,8 +142,7 @@ class RunnerTupleEnv(ait.EnvironmentABC):
 
 def _test_agent_config() -> ait.AgentConfig:
     return ait.AgentConfig(
-        algorithm="ac-ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         agent_horizon=2,
         observation_bits=1,
         observation_stream_len=1,

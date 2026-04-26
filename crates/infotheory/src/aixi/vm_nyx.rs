@@ -34,6 +34,7 @@ use crate::backends::rosaplus::RosaPlus;
 use crate::backends::zpaq_rate::ZpaqRateModel;
 #[cfg(feature = "backend-rwkv")]
 use crate::coders::softmax_pdf_inplace;
+use crate::error::{InfotheoryError, InfotheoryResult};
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip;
 #[cfg(feature = "backend-mamba")]
@@ -652,38 +653,44 @@ impl Default for NyxVmConfig {
 }
 
 impl NyxVmConfig {
-    fn validate_runtime_invariants(&self) -> Result<(), String> {
+    fn validate_runtime_invariants(&self) -> InfotheoryResult<()> {
         if self.firecracker_config.trim().is_empty() {
-            return Err("firecracker_config path must be set".to_string());
+            return Err(InfotheoryError::invalid_backend_config(
+                "firecracker_config path must be set",
+            ));
         }
         if self.episode_steps == 0 {
-            return Err("episode_steps must be > 0".to_string());
+            return Err(InfotheoryError::invalid_backend_config(
+                "episode_steps must be > 0",
+            ));
         }
         if matches!(self.observation_policy, NyxObservationPolicy::RawOutput)
             && self.observation_stream_len == 0
         {
-            return Err("observation_stream_len must be > 0 for RawOutput policy".to_string());
+            return Err(InfotheoryError::invalid_backend_config(
+                "observation_stream_len must be > 0 for RawOutput policy",
+            ));
         }
         if matches!(
             self.reward_shaping,
             Some(NyxRewardShaping::TraceEntropy { .. })
         ) && self.trace.is_none()
         {
-            return Err(
-                "vm_trace must be configured for vm_reward_shaping.mode=trace-entropy".to_string(),
-            );
+            return Err(InfotheoryError::invalid_backend_config(
+                "vm_trace must be configured for vm_reward_shaping.mode=trace-entropy",
+            ));
         }
 
         Ok(())
     }
 
     /// Validate this VM configuration for direct runtime construction.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> InfotheoryResult<()> {
         self.validate_runtime_invariants()
     }
 
     /// Validate that this VM configuration is representable by canonical spec documents.
-    pub fn validate_canonical_spec_compatibility(&self) -> Result<(), String> {
+    pub fn validate_canonical_spec_compatibility(&self) -> InfotheoryResult<()> {
         self.validate_runtime_invariants()?;
 
         let encoding = self.protocol.wire_encoding;
@@ -800,10 +807,9 @@ impl NyxVmConfig {
                 bonus_reward: *bonus_reward,
             },
             NyxRewardPolicy::Custom(_) => {
-                return Err(
-                    "custom Nyx reward callbacks are not representable in canonical specs"
-                        .to_string(),
-                );
+                return Err(InfotheoryError::invalid_backend_config(
+                    "custom Nyx reward callbacks are not representable in canonical specs",
+                ));
             }
         };
         let environment = EnvironmentSpec::NyxVm(VmEnvironmentSpec {
@@ -860,14 +866,14 @@ impl NyxVmConfig {
         environment
             .validate_in(&assets, &SpecEnvironment::default())
             .map(|_| ())
-            .map_err(|err| err.to_string())
+            .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))
     }
 
     /// Build a runtime VM configuration from a canonical planner environment spec.
     pub fn from_environment_spec(
         spec: &VmEnvironmentSpec,
         resolved_assets: &[ResolvedAssetBinding],
-    ) -> Result<Self, String> {
+    ) -> InfotheoryResult<Self> {
         let wire_encoding = match spec.wire_encoding {
             VmPayloadEncodingSpec::Utf8 => PayloadEncoding::Utf8,
             VmPayloadEncodingSpec::Hex => PayloadEncoding::Hex,
@@ -923,9 +929,11 @@ impl NyxVmConfig {
                 for (index, payload) in payloads.iter().enumerate() {
                     actions.push(NyxActionSpec {
                         name: names.get(index).cloned().flatten(),
-                        payload: encoding
-                            .decode(payload)
-                            .map_err(|err| format!("invalid literal action payload: {err}"))?,
+                        payload: encoding.decode(payload).map_err(|err| {
+                            InfotheoryError::invalid_backend_config(format!(
+                                "invalid literal action payload: {err}"
+                            ))
+                        })?,
                     });
                 }
                 NyxActionSource::Literal(actions)
@@ -947,9 +955,11 @@ impl NyxVmConfig {
                     seeds: seeds
                         .iter()
                         .map(|seed| {
-                            encoding
-                                .decode(seed)
-                                .map_err(|err| format!("invalid VM fuzz seed: {err}"))
+                            encoding.decode(seed).map_err(|err| {
+                                InfotheoryError::invalid_backend_config(format!(
+                                    "invalid VM fuzz seed: {err}"
+                                ))
+                            })
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                     mutators: mutators
@@ -963,15 +973,17 @@ impl NyxVmConfig {
                             VmFuzzMutatorSpec::ResetSeed => Ok(FuzzMutator::ResetSeed),
                             VmFuzzMutatorSpec::Havoc => Ok(FuzzMutator::Havoc),
                         })
-                        .collect::<Result<Vec<_>, String>>()?,
+                        .collect::<Result<Vec<_>, InfotheoryError>>()?,
                     min_len: *min_len,
                     max_len: *max_len,
                     dictionary: dictionary
                         .iter()
                         .map(|entry| {
-                            encoding
-                                .decode(entry)
-                                .map_err(|err| format!("invalid VM fuzz dictionary entry: {err}"))
+                            encoding.decode(entry).map_err(|err| {
+                                InfotheoryError::invalid_backend_config(format!(
+                                    "invalid VM fuzz dictionary entry: {err}"
+                                ))
+                            })
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                     rng_seed: *rng_seed,
@@ -981,7 +993,7 @@ impl NyxVmConfig {
         let action_filter = spec
             .action_filter
             .as_ref()
-            .map(|filter| -> Result<NyxActionFilter, String> {
+            .map(|filter| -> InfotheoryResult<NyxActionFilter> {
                 Ok(NyxActionFilter {
                     min_entropy: filter.min_entropy,
                     max_entropy: filter.max_entropy,
@@ -1061,11 +1073,15 @@ impl NyxVmConfig {
 fn resolved_asset_path<'a>(
     resolved_assets: &'a [ResolvedAssetBinding],
     id: &str,
-) -> Result<&'a Path, String> {
+) -> InfotheoryResult<&'a Path> {
     let binding = resolved_assets
         .iter()
         .find(|binding| binding.id == id)
-        .ok_or_else(|| format!("planner_run references unknown asset id '{id}'"))?;
+        .ok_or_else(|| {
+            InfotheoryError::invalid_backend_config(format!(
+                "planner_run references unknown asset id '{id}'"
+            ))
+        })?;
     match &binding.asset {
         AssetRef::Filesystem(path) => Ok(path.as_path()),
     }
@@ -1074,9 +1090,14 @@ fn resolved_asset_path<'a>(
 fn read_resolved_asset_bytes(
     resolved_assets: &[ResolvedAssetBinding],
     id: &str,
-) -> Result<Vec<u8>, String> {
+) -> InfotheoryResult<Vec<u8>> {
     let path = resolved_asset_path(resolved_assets, id)?;
-    std::fs::read(path).map_err(|err| format!("failed to read asset '{}': {err}", path.display()))
+    std::fs::read(path).map_err(|err| {
+        InfotheoryError::invalid_backend_config(format!(
+            "failed to read asset '{}': {err}",
+            path.display()
+        ))
+    })
 }
 
 // ============================================================================
@@ -2700,7 +2721,11 @@ mod tests {
         let err = config
             .validate_canonical_spec_compatibility()
             .expect_err("custom reward callbacks are not canonical");
-        assert!(err.contains("not representable in canonical specs"));
+        assert!(matches!(
+            err,
+            InfotheoryError::InvalidBackendConfig(message)
+                if message.contains("not representable in canonical specs")
+        ));
     }
 
     #[cfg(feature = "vm")]

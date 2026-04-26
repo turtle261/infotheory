@@ -439,7 +439,7 @@ define_rate_backend_catalog! {
     backend {
         kind: Ctw,
         canonical: "ctw",
-        aliases: ["ctw"],
+        aliases: ["ctw", "ac-ctw"],
         feature: "backend-ctw",
         compile_plan: crate::spec::core::compile_rate_plan_ctw,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_ctw,

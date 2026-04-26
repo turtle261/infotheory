@@ -529,10 +529,23 @@ pub(super) fn load_expert_spec(path: &str) -> anyhow::Result<MixtureExpertSpec> 
 pub(super) fn vm_stats_backend_spec_value(
     root: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
-    let algo = root["algorithm"].as_str().unwrap_or("ctw");
+    let raw_kind = root["algorithm"].as_str().unwrap_or("ctw");
+    let resolved = match infotheory::backends::resolve_rate_backend_name(raw_kind) {
+        Some(infotheory::backends::BackendAvailability::Enabled(name)) => name,
+        Some(infotheory::backends::BackendAvailability::Disabled { canonical, feature }) => {
+            return Err(anyhow::anyhow!(
+                "rate backend '{canonical}' requires infotheory feature '{feature}'"
+            ));
+        }
+        None => {
+            return Err(anyhow::anyhow!(
+                "unknown stats backend algorithm '{raw_kind}'"
+            ));
+        }
+    };
     let ct_depth = root["ct_depth"].as_u64().unwrap_or(20) as usize;
-    let spec = match algo {
-        "ctw" | "ac-ctw" => serde_json::json!({
+    let spec = match resolved {
+        "ctw" => serde_json::json!({
             "kind": "ctw",
             "depth": ct_depth,
         }),
@@ -564,7 +577,7 @@ pub(super) fn vm_stats_backend_spec_value(
                 ));
             }
         }
-        "rosa" | "rosaplus" => serde_json::json!({ "kind": "rosaplus" }),
+        "rosaplus" => serde_json::json!({ "kind": "rosaplus" }),
         "rwkv7" => {
             #[cfg(feature = "backend-rwkv")]
             {
@@ -620,11 +633,7 @@ pub(super) fn normalize_vm_stats_backend_spec(
         ));
     };
 
-    let raw_kind = spec["kind"]
-        .as_str()
-        .or_else(|| spec["name"].as_str())
-        .or_else(|| spec["rate_backend"].as_str())
-        .unwrap_or("rosaplus");
+    let raw_kind = spec["kind"].as_str().unwrap_or("rosaplus");
 
     let resolved = match infotheory::backends::resolve_rate_backend_name(raw_kind) {
         Some(infotheory::backends::BackendAvailability::Enabled(name)) => name,
@@ -643,18 +652,16 @@ pub(super) fn normalize_vm_stats_backend_spec(
         "kind".to_string(),
         serde_json::Value::String(resolved.to_string()),
     );
-    obj.remove("name");
-    obj.remove("rate_backend");
 
     match resolved {
         "ctw" => {
-            if !obj.contains_key("depth") && !obj.contains_key("ct_depth") {
-                obj.insert("ct_depth".to_string(), serde_json::json!(32usize));
+            if !obj.contains_key("depth") {
+                obj.insert("depth".to_string(), serde_json::json!(32usize));
             }
         }
         "fac-ctw" => {
-            if !obj.contains_key("base_depth") && !obj.contains_key("ct_depth") {
-                obj.insert("ct_depth".to_string(), serde_json::json!(32usize));
+            if !obj.contains_key("base_depth") {
+                obj.insert("base_depth".to_string(), serde_json::json!(32usize));
             }
             if !obj.contains_key("encoding_bits") {
                 obj.insert("encoding_bits".to_string(), serde_json::json!(8usize));
@@ -668,13 +675,10 @@ pub(super) fn normalize_vm_stats_backend_spec(
                 );
             }
         }
-        "mamba" => {
+        "mamba" =>
+        {
             #[cfg(feature = "backend-mamba")]
-            if !obj.contains_key("method")
-                && !obj.contains_key("mamba_method")
-                && !obj.contains_key("mamba_model_path")
-                && !obj.contains_key("model_path")
-            {
+            if !obj.contains_key("method") && !obj.contains_key("model_path") {
                 obj.insert(
                     "model_path".to_string(),
                     serde_json::Value::String(
@@ -686,13 +690,10 @@ pub(super) fn normalize_vm_stats_backend_spec(
                 );
             }
         }
-        "rwkv7" => {
+        "rwkv7" =>
+        {
             #[cfg(feature = "backend-rwkv")]
-            if !obj.contains_key("method")
-                && !obj.contains_key("rwkv_method")
-                && !obj.contains_key("rwkv_model_path")
-                && !obj.contains_key("model_path")
-            {
+            if !obj.contains_key("method") && !obj.contains_key("model_path") {
                 obj.insert(
                     "model_path".to_string(),
                     serde_json::Value::String(
@@ -705,7 +706,7 @@ pub(super) fn normalize_vm_stats_backend_spec(
             }
         }
         "zpaq" => {
-            if !obj.contains_key("method") && !obj.contains_key("zpaq_method") {
+            if !obj.contains_key("method") {
                 obj.insert(
                     "method".to_string(),
                     serde_json::Value::String(root["method"].as_str().unwrap_or("2").to_string()),
@@ -715,8 +716,6 @@ pub(super) fn normalize_vm_stats_backend_spec(
         "mixture" => {
             if !obj.contains_key("spec")
                 && !obj.contains_key("spec_path")
-                && !obj.contains_key("path")
-                && !obj.contains_key("mixture_spec")
                 && let Some(path) = root["mixture_spec"].as_str()
             {
                 obj.insert(
@@ -728,8 +727,6 @@ pub(super) fn normalize_vm_stats_backend_spec(
         "particle" => {
             if !obj.contains_key("spec")
                 && !obj.contains_key("spec_path")
-                && !obj.contains_key("path")
-                && !obj.contains_key("particle_spec")
                 && let Some(path) = root["particle_spec"].as_str()
             {
                 obj.insert(
@@ -741,8 +738,6 @@ pub(super) fn normalize_vm_stats_backend_spec(
         "calibrated" => {
             if !obj.contains_key("spec")
                 && !obj.contains_key("spec_path")
-                && !obj.contains_key("path")
-                && !obj.contains_key("calibrated_spec")
                 && let Some(path) = root["calibrated_spec"].as_str()
             {
                 obj.insert(
@@ -782,7 +777,7 @@ pub(super) fn parse_observation_key_mode_str(s: &str) -> anyhow::Result<Observat
 
 #[cfg(test)]
 pub(super) fn parse_observation_stream_len_for_env(v: &serde_json::Value, env_name: &str) -> usize {
-    if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" {
+    if env_name == "vm" {
         if v["vm_observation"].is_null() {
             parse_observation_stream_len(v)
         } else {
@@ -798,7 +793,7 @@ pub(super) fn parse_observation_key_mode_for_env(
     v: &serde_json::Value,
     env_name: &str,
 ) -> anyhow::Result<ObservationKeyMode> {
-    if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" {
+    if env_name == "vm" {
         if v["vm_observation"].is_null() {
             parse_observation_key_mode(v)
         } else {
@@ -884,7 +879,7 @@ pub(super) fn validate_observation_config(
     if observation_stream_len == 0 {
         return Err(anyhow::anyhow!("observation_stream_len must be > 0"));
     }
-    if env_name == "vm" || env_name == "nyx" || env_name == "nyx-vm" {
+    if env_name == "vm" {
         if let (Some(top_len), Some(vm_len)) = (
             extract_observation_stream_len_raw(v),
             extract_vm_observation_stream_len_raw(&v["vm_observation"]),

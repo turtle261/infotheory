@@ -53,7 +53,7 @@ cargo +nightly rustdoc -p infotheory --all-features -- \
   > /tmp/rustdoc_cov.json
 ```
 
-CI enforces a minimum documented-item percentage using this report.
+CI currently enforces full documented-item coverage (100%) using this report.
 
 ## Golden and Parity Tests
 

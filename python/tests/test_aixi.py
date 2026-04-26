@@ -104,8 +104,7 @@ def test_aixi_env_smoke():
 
 def test_agent_config_and_agent_smoke():
     cfg = ait.AgentConfig(
-        algorithm="fac-ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         agent_horizon=2,
         observation_bits=1,
         observation_stream_len=1,
@@ -124,8 +123,7 @@ def test_agent_config_and_agent_smoke():
 
 def test_aiqi_config_and_agent_smoke():
     cfg = ait.AiqiConfig(
-        algorithm="ac-ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         observation_bits=1,
         observation_stream_len=1,
         reward_bits=1,
@@ -150,8 +148,7 @@ def test_aiqi_config_and_agent_smoke():
 def test_run_aiqi_with_environment_smoke():
     env = ToyCoinFlipEnv(0.7)
     cfg = ait.AiqiConfig(
-        algorithm="ac-ctw",
-        ct_depth=6,
+        rate_backend=ait.RateBackend.ctw(6),
         observation_bits=1,
         observation_stream_len=1,
         reward_bits=1,
@@ -184,8 +181,6 @@ def test_run_aiqi_with_environment_smoke():
 def test_run_aiqi_with_generic_rate_backend_smoke():
     env = ToyCoinFlipEnv(0.7)
     cfg = ait.AiqiConfig(
-        algorithm="ac-ctw",
-        ct_depth=6,
         observation_bits=1,
         observation_stream_len=1,
         reward_bits=1,
@@ -235,8 +230,7 @@ def test_run_mcaixi_with_generic_mixture_rate_backend_smoke():
         )
     )
     cfg = ait.AgentConfig(
-        algorithm="zpaq",
-        ct_depth=6,
+        rate_backend=mixture,
         agent_horizon=2,
         observation_bits=1,
         observation_stream_len=1,
@@ -249,9 +243,7 @@ def test_run_mcaixi_with_generic_mixture_rate_backend_smoke():
         max_reward=1,
         reward_offset=0,
         random_seed=77,
-        rate_backend=mixture,
         rate_backend_max_order=8,
-        zpaq_method="1",
     )
     summary = ait.run_agent_with_environment(
         env,
@@ -271,8 +263,7 @@ def test_run_mcaixi_with_generic_mixture_rate_backend_smoke():
 
 def test_run_agent_omitted_seed_matches_explicit_default_seed():
     cfg_omitted = ait.AgentConfig(
-        algorithm="ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         agent_horizon=4,
         observation_bits=1,
         observation_stream_len=1,
@@ -284,8 +275,7 @@ def test_run_agent_omitted_seed_matches_explicit_default_seed():
         reward_offset=0,
     )
     cfg_explicit = ait.AgentConfig(
-        algorithm="ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         agent_horizon=4,
         observation_bits=1,
         observation_stream_len=1,
@@ -310,8 +300,7 @@ def test_run_agent_omitted_seed_matches_explicit_default_seed():
 
 def test_run_aiqi_omitted_seed_matches_explicit_default_seed():
     cfg_omitted = ait.AiqiConfig(
-        algorithm="ac-ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         observation_bits=1,
         observation_stream_len=1,
         reward_bits=1,
@@ -326,8 +315,7 @@ def test_run_aiqi_omitted_seed_matches_explicit_default_seed():
         baseline_exploration=0.2,
     )
     cfg_explicit = ait.AiqiConfig(
-        algorithm="ac-ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         observation_bits=1,
         observation_stream_len=1,
         reward_bits=1,
@@ -356,8 +344,7 @@ def test_run_aiqi_omitted_seed_matches_explicit_default_seed():
 def test_aiqi_rejects_zpaq_algorithm_in_strict_mode():
     with pytest.raises(ValueError, match="strict mode"):
         ait.AiqiConfig(
-            algorithm="zpaq",
-            ct_depth=6,
+            rate_backend=ait.RateBackend.zpaq("1"),
             observation_bits=1,
             observation_stream_len=1,
             reward_bits=1,
@@ -376,8 +363,7 @@ def test_aiqi_rejects_zpaq_algorithm_in_strict_mode():
 def test_aiqi_rejects_non_power_of_two_return_bins():
     with pytest.raises(ValueError, match="power of two"):
         ait.AiqiConfig(
-            algorithm="ac-ctw",
-            ct_depth=6,
+            rate_backend=ait.RateBackend.ctw(6),
             observation_bits=1,
             observation_stream_len=1,
             reward_bits=1,
@@ -396,8 +382,7 @@ def test_aiqi_rejects_non_power_of_two_return_bins():
 def test_aiqi_rejects_zpaq_rate_backend_in_strict_mode():
     with pytest.raises(ValueError, match="strict frozen conditioning"):
         ait.AiqiConfig(
-            algorithm="ac-ctw",
-            ct_depth=6,
+            rate_backend=ait.RateBackend.zpaq("1"),
             observation_bits=1,
             observation_stream_len=1,
             reward_bits=1,
@@ -410,7 +395,6 @@ def test_aiqi_rejects_zpaq_rate_backend_in_strict_mode():
             return_bins=8,
             augmentation_period=2,
             baseline_exploration=0.01,
-            rate_backend=ait.RateBackend.zpaq("1"),
             rate_backend_max_order=8,
         )
 
@@ -418,8 +402,7 @@ def test_aiqi_rejects_zpaq_rate_backend_in_strict_mode():
 def test_mcaixi_rejects_zpaq_rate_backend_in_strict_mode():
     with pytest.raises(ValueError, match="A Monte-Carlo AIXI Approximation"):
         ait.AgentConfig(
-            algorithm="fac-ctw",
-            ct_depth=6,
+            rate_backend=ait.RateBackend.zpaq("1"),
             agent_horizon=2,
             observation_bits=1,
             observation_stream_len=1,
@@ -429,15 +412,13 @@ def test_mcaixi_rejects_zpaq_rate_backend_in_strict_mode():
             min_reward=0,
             max_reward=1,
             reward_offset=0,
-            rate_backend=ait.RateBackend.zpaq("1"),
             rate_backend_max_order=8,
         )
 
 
 def test_aiqi_optional_history_pruning_smoke():
     cfg = ait.AiqiConfig(
-        algorithm="ac-ctw",
-        ct_depth=6,
+        rate_backend=ait.RateBackend.ctw(6),
         observation_bits=1,
         observation_stream_len=1,
         reward_bits=1,
@@ -463,8 +444,7 @@ def test_aiqi_optional_history_pruning_smoke():
 
 def test_mcaixi_seed_reproducibility_with_deterministic_env():
     cfg = ait.AgentConfig(
-        algorithm="ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         agent_horizon=4,
         observation_bits=1,
         observation_stream_len=1,
@@ -508,8 +488,7 @@ def test_mcaixi_seed_reproducibility_with_deterministic_env():
 
 def test_aiqi_seed_reproducibility_with_deterministic_env():
     cfg = ait.AiqiConfig(
-        algorithm="ac-ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         observation_bits=1,
         observation_stream_len=1,
         reward_bits=1,

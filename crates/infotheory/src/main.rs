@@ -571,7 +571,7 @@ fn controller_backend_label(controller: &CompiledPlannerController) -> String {
 fn build_builtin_environment(spec: BuiltinEnvironmentSpec) -> anyhow::Result<Box<dyn Environment>> {
     #[cfg(feature = "aixi-gameengine")]
     {
-        return build_gameengine_builtin_environment(spec).map_err(anyhow::Error::msg);
+        return build_gameengine_builtin_environment(spec).map_err(anyhow::Error::new);
     }
     #[cfg(not(feature = "aixi-gameengine"))]
     {
@@ -1409,7 +1409,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        "id" | "intrinsic_dep" => {
+        "id" => {
             let f1 = file1.unwrap_or_exit("Error: 'id' requires a file");
             let max_order = pos_arg3
                 .and_then(|s| s.parse().ok())
@@ -1509,7 +1509,7 @@ Primitives:
     xe, cross_entropy <f1> <f2> [max_order] Cross Entropy H(X,Y) - H(Y)? (Check def)
     ce, conditional_entropy <f1> <f2>       Conditional Entropy H(X|Y)
     joint_entropy, h_xy <f1> <f2>           Joint Entropy H(X,Y)
-    id, intrinsic_dep <file> [max_order]    Intrinsic Dependence
+    id <file> [max_order]                   Intrinsic Dependence
 
   Distance & Divergence:
     ncd <f1> <f2> [method]                  Normalized Compression Distance (Vitanyi)
@@ -1964,7 +1964,7 @@ mod tests {
                 "key_mode": "last"
             }
         });
-        let err = validate_observation_config("nyx", &mismatch_mode, 1, ObservationKeyMode::Last)
+        let err = validate_observation_config("vm", &mismatch_mode, 1, ObservationKeyMode::Last)
             .expect_err("mismatched vm key mode should fail");
         assert!(err.to_string().contains("conflicts"));
     }
@@ -2066,12 +2066,12 @@ mod tests {
         let base_dir = Path::new(".");
 
         let matched =
-            parse_vm_stats_backend(&json!({"name":"match","hash_bits":18}), &root, base_dir)
+            parse_vm_stats_backend(&json!({"kind":"match","hash_bits":18}), &root, base_dir)
                 .expect("match backend should parse");
         assert!(matches!(matched, RateBackend::Match { hash_bits: 18, .. }));
 
         let sparse = parse_vm_stats_backend(
-            &json!({"name":"sparse-match","gap_min":2,"gap_max":4}),
+            &json!({"kind":"sparse-match","gap_min":2,"gap_max":4}),
             &root,
             base_dir,
         )
@@ -2085,12 +2085,12 @@ mod tests {
             }
         ));
 
-        let ppmd = parse_vm_stats_backend(&json!({"name":"ppmd","order":12}), &root, base_dir)
+        let ppmd = parse_vm_stats_backend(&json!({"kind":"ppmd","order":12}), &root, base_dir)
             .expect("ppmd backend should parse");
         assert!(matches!(ppmd, RateBackend::Ppmd { order: 12, .. }));
 
         let sequitur = parse_vm_stats_backend(
-            &json!({"name":"sequitur","context_bytes":72}),
+            &json!({"kind":"sequitur","context_bytes":72}),
             &root,
             base_dir,
         )
@@ -2102,7 +2102,7 @@ mod tests {
 
         let particle = parse_vm_stats_backend(
             &json!({
-                "name":"particle",
+                "kind":"particle",
                 "spec":{"num_particles":4,"num_cells":4,"cell_dim":8}
             }),
             &root,
@@ -2113,7 +2113,7 @@ mod tests {
 
         let mixture = parse_vm_stats_backend(
             &json!({
-                "name":"mixture",
+                "kind":"mixture",
                 "spec":{"kind":"bayes","experts":[{"kind":"match"}]}
             }),
             &root,
@@ -2124,7 +2124,7 @@ mod tests {
 
         let calibrated = parse_vm_stats_backend(
             &json!({
-                "name":"calibrated",
+                "kind":"calibrated",
                 "base":{"kind":"ctw","depth":8},
                 "context":"text",
                 "bins":17,
@@ -2156,7 +2156,7 @@ mod tests {
             "observation_bits": 13,
             "reward_bits": 5
         });
-        let parsed = parse_vm_stats_backend(&json!({"name":"fac-ctw"}), &root, Path::new("."))
+        let parsed = parse_vm_stats_backend(&json!({"kind":"fac-ctw"}), &root, Path::new("."))
             .expect("fac-ctw backend should parse");
         match parsed {
             RateBackend::FacCtw {

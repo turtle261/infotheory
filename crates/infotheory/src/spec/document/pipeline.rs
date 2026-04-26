@@ -306,7 +306,7 @@ fn canonicalize_interface_spec(spec: &PlannerInterfaceSpec) -> SpecResult<Planne
         spec.reward_offset,
         spec.reward_bits,
     )
-    .map_err(SpecError::new)?;
+    .map_err(|err| SpecError::new(err.to_string()))?;
     Ok(spec.clone())
 }
 

@@ -61,10 +61,9 @@ mod bench_impl {
         let warmup = env_usize("AIXI_BENCH_WARMUP", 200);
         let env_name = "blackjack";
 
-        let base_cfg = |algorithm: &str| {
+        let base_cfg = |backend: RateBackend| {
             let mut cfg = AgentConfig::default();
-            cfg.algorithm = algorithm.to_string();
-            cfg.ct_depth = 32;
+            cfg.rate_backend = backend;
             cfg.agent_horizon = 5;
             cfg.observation_bits = 64;
             cfg.observation_stream_len = 4;
@@ -78,14 +77,7 @@ mod bench_impl {
             cfg.max_reward = 1;
             cfg.reward_offset = 1;
             cfg.random_seed = Some(1);
-            cfg.rate_backend = None;
             cfg.rate_backend_max_order = 20;
-            cfg.rwkv_model_path = None;
-            cfg.rwkv_method = None;
-            cfg.mamba_model_path = None;
-            cfg.mamba_method = None;
-            cfg.rosa_max_order = Some(20);
-            cfg.zpaq_method = None;
             cfg
         };
 
@@ -118,14 +110,21 @@ mod bench_impl {
             };
 
         let rate_backend_cfg = |backend: RateBackend| {
-            let mut cfg = base_cfg("mixture");
-            cfg.rate_backend = Some(backend);
+            let mut cfg = base_cfg(RateBackend::Ctw { depth: 32 });
+            cfg.rate_backend = backend;
             cfg
         };
 
         let benches = [
-            ("fac-ctw", base_cfg("fac-ctw")),
-            ("rosaplus", base_cfg("rosaplus")),
+            (
+                "fac-ctw",
+                base_cfg(RateBackend::FacCtw {
+                    base_depth: 32,
+                    num_percept_bits: 258,
+                    encoding_bits: 1,
+                }),
+            ),
+            ("rosaplus", base_cfg(RateBackend::RosaPlus)),
             ("rate-ctw", rate_backend_cfg(RateBackend::Ctw { depth: 32 })),
             ("rate-rosa", rate_backend_cfg(RateBackend::RosaPlus)),
             (

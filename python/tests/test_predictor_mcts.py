@@ -12,8 +12,7 @@ def test_predictor_wrappers_smoke():
 
 def test_search_tree_smoke():
     cfg = ait.AgentConfig(
-        algorithm="fac-ctw",
-        ct_depth=8,
+        rate_backend=ait.RateBackend.ctw(8),
         agent_horizon=2,
         observation_bits=1,
         observation_stream_len=1,

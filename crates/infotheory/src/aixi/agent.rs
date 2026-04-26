@@ -4,40 +4,114 @@
 //! (Predictor) and a planner (SearchTree) to form a complete autonomous entity.
 
 use crate::aixi::common::{
-    Action, ObservationKeyMode, PerceptVal, RandomGenerator, Reward, decode, encode,
-    observation_repr_from_stream, resolve_random_seed, validate_reward_encoding_bounds,
+    Action, ObservationKeyMode, PerceptVal, RandomGenerator, Reward, RewardEncodingError, decode,
+    encode, observation_repr_from_stream, resolve_random_seed, validate_reward_encoding_bounds,
 };
 use crate::aixi::mcts::{AgentSimulator, SearchTree};
-use crate::aixi::model::{Predictor, build_mc_aixi_predictor};
+use crate::aixi::model::{Predictor, PredictorBuildError, build_mc_aixi_predictor};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
     CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec, McAixiControllerSpec,
-    PlannerRunSpec,
+    PlannerRunSpec, SpecError,
 };
-use crate::validate_zpaq_rate_method;
-#[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
-use std::path::PathBuf;
+use std::error::Error;
+use std::fmt;
+
+/// Error returned by MC-AIXI configuration validation and construction.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AgentError {
+    /// `agent_actions` was zero.
+    AgentActionsZero,
+    /// `agent_horizon` was zero.
+    AgentHorizonZero,
+    /// `num_simulations` was zero.
+    NumSimulationsZero,
+    /// The UCT exploration/exploitation constant was non-positive.
+    InvalidExplorationExploitationRatio {
+        /// The invalid exploration/exploitation ratio value.
+        value: f64,
+    },
+    /// The configured MC-AIXI discount factor was outside `[0, 1]`.
+    InvalidDiscountGamma {
+        /// The invalid discount factor value.
+        value: f64,
+    },
+    /// The configured reward range is not representable.
+    RewardEncoding(RewardEncodingError),
+    /// The configured rate backend failed validation.
+    InvalidRateBackend(crate::error::InfotheoryError),
+    /// The configured rate backend violates MC-AIXI runtime requirements.
+    UnsupportedRateBackend {
+        /// Human-readable explanation of why the backend is unsupported.
+        reason: &'static str,
+    },
+    /// Planner-run spec compilation failed.
+    Spec(SpecError),
+    /// The compiled planner-run controller kind was not MC-AIXI.
+    ControllerKindMismatch,
+    /// Predictor construction failed.
+    Predictor(PredictorBuildError),
+}
+
+impl fmt::Display for AgentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AgentActionsZero => f.write_str("agent_actions must be >= 1"),
+            Self::AgentHorizonZero => f.write_str("agent_horizon must be >= 1"),
+            Self::NumSimulationsZero => f.write_str("num_simulations must be >= 1"),
+            Self::InvalidExplorationExploitationRatio { value: _ } => {
+                f.write_str("exploration_exploitation_ratio must be > 0")
+            }
+            Self::InvalidDiscountGamma { value } => {
+                write!(
+                    f,
+                    "discount_gamma must be in [0, 1] for MC-AIXI, got {value}"
+                )
+            }
+            Self::RewardEncoding(err) => write!(f, "{err}"),
+            Self::InvalidRateBackend(err) => write!(f, "invalid rate_backend: {err}"),
+            Self::UnsupportedRateBackend { reason } => f.write_str(reason),
+            Self::Spec(err) => write!(f, "{err}"),
+            Self::ControllerKindMismatch => {
+                f.write_str("compiled planner run does not contain an MC-AIXI controller")
+            }
+            Self::Predictor(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl Error for AgentError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RewardEncoding(err) => Some(err),
+            Self::InvalidRateBackend(err) => Some(err),
+            Self::Spec(err) => Some(err),
+            Self::Predictor(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<RewardEncodingError> for AgentError {
+    fn from(value: RewardEncodingError) -> Self {
+        Self::RewardEncoding(value)
+    }
+}
+
+impl From<SpecError> for AgentError {
+    fn from(value: SpecError) -> Self {
+        Self::Spec(value)
+    }
+}
 
 /// Configuration parameters for an AIXI agent.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AgentConfig {
-    /// The predictive algorithm to use.
-    ///
-    /// Canonical names with their accepted aliases:
-    ///
-    /// - `"ac-ctw"` (alias `"ctw"`): single-tree Context Tree Weighting predictor.
-    /// - `"fac-ctw"`: factorized CTW predictor used by canonical MC-AIXI.
-    /// - `"rosaplus"` (alias `"rosa"`): ROSA+ predictor.
-    /// - `"rwkv7"`: RWKV-7 method-string predictor (requires `backend-rwkv`).
-    /// - `"mamba"`: Mamba method-string predictor (requires `backend-mamba`).
-    /// - `"zpaq"`: ZPAQ method-string predictor.
-    ///
-    /// The alias mapping is identical for [`crate::aixi::aiqi::AiqiConfig`].
-    pub algorithm: String,
-    /// Context depth for the CTW model.
-    pub ct_depth: usize,
+    /// Predictive backend used by MC-AIXI.
+    pub rate_backend: RateBackend,
     /// Planning horizon for MCTS.
     pub agent_horizon: usize,
     /// Number of bits used to encode observations.
@@ -68,32 +142,14 @@ pub struct AgentConfig {
     ///
     /// When `None`, planner runtime canonicalizes this to seed `0`.
     pub random_seed: Option<u64>,
-    /// Optional generic rate backend override.
-    ///
-    /// When set, this takes precedence over `algorithm` and routes MC-AIXI
-    /// through the shared `RateBackend` abstraction.
-    pub rate_backend: Option<RateBackend>,
     /// Max-order hint for `rate_backend` constructors that use it (for example ROSA).
     pub rate_backend_max_order: i64,
-    /// Path to the RWKV model weights (if using "rwkv7").
-    pub rwkv_model_path: Option<String>,
-    /// Optional RWKV method string for hosted/browser-safe construction.
-    pub rwkv_method: Option<String>,
-    /// Path to the Mamba model weights (if using "mamba").
-    pub mamba_model_path: Option<String>,
-    /// Optional Mamba method string for hosted/browser-safe construction.
-    pub mamba_method: Option<String>,
-    /// Maximum Markov order for the ROSA model (if using "rosa").
-    pub rosa_max_order: Option<i64>,
-    /// ZPAQ method string for the rate model (if using "zpaq").
-    pub zpaq_method: Option<String>,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            algorithm: "ctw".to_string(),
-            ct_depth: 8,
+            rate_backend: RateBackend::Ctw { depth: 8 },
             agent_horizon: 5,
             observation_bits: 1,
             observation_stream_len: 1,
@@ -107,101 +163,19 @@ impl Default for AgentConfig {
             max_reward: 1,
             reward_offset: 0,
             random_seed: None,
-            rate_backend: None,
             rate_backend_max_order: 8,
-            rwkv_model_path: None,
-            rwkv_method: None,
-            mamba_model_path: None,
-            mamba_method: None,
-            rosa_max_order: None,
-            zpaq_method: None,
         }
     }
 }
 
 impl AgentConfig {
-    fn canonical_predictor_backend(&self) -> Result<RateBackend, String> {
-        if let Some(rate_backend) = &self.rate_backend {
-            return Ok(rate_backend.clone());
-        }
-
-        match self.algorithm.as_str() {
-            "ctw" | "ac-ctw" => Ok(RateBackend::Ctw {
-                depth: self.ct_depth,
-            }),
-            "fac-ctw" => Ok(RateBackend::FacCtw {
-                base_depth: self.ct_depth,
-                num_percept_bits: (self.observation_bits * self.observation_stream_len.max(1))
-                    + self.reward_bits,
-                encoding_bits: 1,
-            }),
-            "rosa" | "rosaplus" => Ok(RateBackend::RosaPlus),
-            #[cfg(feature = "backend-rwkv")]
-            "rwkv7" => {
-                if let Some(method) = self
-                    .rwkv_method
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    Ok(RateBackend::Rwkv7Method {
-                        method: crate::rwkvzip::parse_method_spec(method)
-                            .map_err(|err| format!("Invalid RWKV method for AIXI: {err}"))?,
-                    })
-                } else {
-                    let path = self.rwkv_model_path.as_ref().ok_or_else(|| {
-                        "algorithm=rwkv7 requires rwkv_model_path or rwkv_method when no rate_backend override is configured"
-                            .to_string()
-                    })?;
-                    Ok(RateBackend::Rwkv7Method {
-                        method: crate::rwkvzip::MethodSpec::File {
-                            path: PathBuf::from(path),
-                            policy: None,
-                        },
-                    })
-                }
-            }
-            #[cfg(not(feature = "backend-rwkv"))]
-            "rwkv7" => Err("algorithm=rwkv7 requires backend-rwkv feature".to_string()),
-            #[cfg(feature = "backend-mamba")]
-            "mamba" => {
-                if let Some(method) = self
-                    .mamba_method
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    Ok(RateBackend::MambaMethod {
-                        method: crate::mambazip::parse_method_spec(method)
-                            .map_err(|err| format!("Invalid Mamba method for AIXI: {err}"))?,
-                    })
-                } else {
-                    let path = self.mamba_model_path.as_ref().ok_or_else(|| {
-                        "algorithm=mamba requires mamba_model_path or mamba_method when no rate_backend override is configured"
-                            .to_string()
-                    })?;
-                    Ok(RateBackend::MambaMethod {
-                        method: crate::mambazip::MethodSpec::File {
-                            path: PathBuf::from(path),
-                            policy: None,
-                        },
-                    })
-                }
-            }
-            #[cfg(not(feature = "backend-mamba"))]
-            "mamba" => Err("algorithm=mamba requires backend-mamba feature".to_string()),
-            "zpaq" => Ok(RateBackend::Zpaq {
-                method: crate::api::ZpaqMethodSpec::literal(
-                    self.zpaq_method.clone().unwrap_or_else(|| "1".to_string()),
-                ),
-            }),
-            other => Err(format!("Unknown algorithm: {other}")),
-        }
+    fn canonical_predictor_backend(&self) -> RateBackend {
+        self.rate_backend.clone()
     }
 
-    fn canonical_planner_run_spec(&self) -> Result<PlannerRunSpec, String> {
-        let predictor = self.canonical_predictor_backend()?;
-        Ok(build_default_planner_run_spec(
+    fn canonical_planner_run_spec(&self) -> PlannerRunSpec {
+        let predictor = self.canonical_predictor_backend();
+        build_default_planner_run_spec(
             PlannerInterfaceConfig {
                 observation_bits: self.observation_bits,
                 observation_stream_len: self.observation_stream_len,
@@ -221,33 +195,34 @@ impl AgentConfig {
                 discount_gamma: self.discount_gamma,
             }),
             self.random_seed,
-        ))
+        )
     }
 
-    fn compile_planner_run_spec(&self) -> Result<CompiledPlannerRunSpec, String> {
-        self.canonical_planner_run_spec()?
+    fn compile_planner_run_spec(&self) -> Result<CompiledPlannerRunSpec, AgentError> {
+        self.canonical_planner_run_spec()
             .compile()
-            .map_err(|err| err.to_string())
+            .map_err(AgentError::from)
     }
 
-    fn validate_runtime_invariants(&self) -> Result<(), String> {
+    fn validate_runtime_invariants(&self) -> Result<(), AgentError> {
         if self.agent_actions == 0 {
-            return Err("agent_actions must be >= 1".to_string());
+            return Err(AgentError::AgentActionsZero);
         }
         if self.agent_horizon == 0 {
-            return Err("agent_horizon must be >= 1".to_string());
+            return Err(AgentError::AgentHorizonZero);
         }
         if self.num_simulations == 0 {
-            return Err("num_simulations must be >= 1".to_string());
+            return Err(AgentError::NumSimulationsZero);
         }
         if self.exploration_exploitation_ratio <= 0.0 {
-            return Err("exploration_exploitation_ratio must be > 0".to_string());
+            return Err(AgentError::InvalidExplorationExploitationRatio {
+                value: self.exploration_exploitation_ratio,
+            });
         }
         if !(0.0..=1.0).contains(&self.discount_gamma) {
-            return Err(format!(
-                "discount_gamma must be in [0, 1] for MC-AIXI, got {}",
-                self.discount_gamma
-            ));
+            return Err(AgentError::InvalidDiscountGamma {
+                value: self.discount_gamma,
+            });
         }
         validate_reward_encoding_bounds(
             self.min_reward,
@@ -256,77 +231,19 @@ impl AgentConfig {
             self.reward_bits,
         )?;
 
-        if let Some(rate_backend) = &self.rate_backend {
-            validate_rate_backend(rate_backend)
-                .map_err(|err| format!("invalid rate_backend: {err}"))?;
-            let compiled = rate_backend.compile().map_err(|err| err.to_string())?;
-            if compiled.contains_zpaq() {
-                return Err(
-                    "MC-AIXI strict generic rate_backend support requires reversible action conditioning; configured rate_backend contains zpaq which does not provide the reversible action conditioning required by \"A Monte-Carlo AIXI Approximation\""
-                        .to_string(),
-                );
-            }
-            return Ok(());
-        }
-
-        match self.algorithm.as_str() {
-            "ctw" | "fac-ctw" | "ac-ctw" | "rosa" | "rosaplus" => {}
-            #[cfg(feature = "backend-rwkv")]
-            "rwkv7" => {
-                let has_method = self
-                    .rwkv_method
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|v| !v.is_empty());
-                let has_path = self
-                    .rwkv_model_path
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|v| !v.is_empty());
-                if !(has_method || has_path) {
-                    return Err(
-                        "algorithm=rwkv7 requires rwkv_model_path or rwkv_method when no rate_backend override is configured"
-                            .to_string(),
-                    );
-                }
-            }
-            #[cfg(not(feature = "backend-rwkv"))]
-            "rwkv7" => return Err("algorithm=rwkv7 requires backend-rwkv feature".to_string()),
-            #[cfg(feature = "backend-mamba")]
-            "mamba" => {
-                let has_method = self
-                    .mamba_method
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|v| !v.is_empty());
-                let has_path = self
-                    .mamba_model_path
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|v| !v.is_empty());
-                if !(has_method || has_path) {
-                    return Err(
-                        "algorithm=mamba requires mamba_model_path or mamba_method when no rate_backend override is configured"
-                            .to_string(),
-                    );
-                }
-            }
-            #[cfg(not(feature = "backend-mamba"))]
-            "mamba" => return Err("algorithm=mamba requires backend-mamba feature".to_string()),
-            "zpaq" => {
-                let method = self.zpaq_method.as_deref().unwrap_or("1");
-                if let Err(err) = validate_zpaq_rate_method(method) {
-                    return Err(format!("Invalid zpaq method for AIXI: {err}"));
-                }
-            }
-            other => return Err(format!("Unknown algorithm: {other}")),
+        validate_rate_backend(&self.rate_backend).map_err(AgentError::InvalidRateBackend)?;
+        let compiled = self.rate_backend.compile().map_err(AgentError::from)?;
+        if compiled.contains_zpaq() {
+            return Err(AgentError::UnsupportedRateBackend {
+                reason: "MC-AIXI strict generic rate_backend support requires reversible action conditioning; configured rate_backend contains zpaq which does not provide the reversible action conditioning required by \"A Monte-Carlo AIXI Approximation\"",
+            });
         }
 
         Ok(())
     }
 
     /// Validate configuration constraints for MC-AIXI.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), AgentError> {
         self.validate_runtime_invariants()?;
         self.compile_planner_run_spec().map(|_| ())
     }
@@ -350,7 +267,7 @@ struct AgentRuntimeConfig {
 }
 
 impl AgentRuntimeConfig {
-    fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+    fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, AgentError> {
         let interface = compiled.interface();
         let runtime = compiled.runtime();
         let (agent_horizon, num_simulations, exploration_exploitation_ratio, discount_gamma) =
@@ -367,11 +284,7 @@ impl AgentRuntimeConfig {
                     *exploration_exploitation_ratio,
                     *discount_gamma,
                 ),
-                _ => {
-                    return Err(
-                        "compiled planner run does not contain an MC-AIXI controller".to_string(),
-                    );
-                }
+                _ => return Err(AgentError::ControllerKindMismatch),
             };
 
         Ok(Self {
@@ -429,7 +342,7 @@ impl Agent {
     }
 
     /// Creates a new `Agent` with the given configuration, returning a validation error on failure.
-    pub fn try_new(config: AgentConfig) -> Result<Self, String> {
+    pub fn try_new(config: AgentConfig) -> Result<Self, AgentError> {
         config.validate_runtime_invariants()?;
         let compiled = config.compile_planner_run_spec()?;
         let runtime = AgentRuntimeConfig::from_compiled(&compiled)?;
@@ -437,7 +350,9 @@ impl Agent {
     }
 
     /// Creates a new `Agent` from a compiled planner-run spec.
-    pub fn from_compiled_planner_run(compiled: &CompiledPlannerRunSpec) -> Result<Self, String> {
+    pub fn from_compiled_planner_run(
+        compiled: &CompiledPlannerRunSpec,
+    ) -> Result<Self, AgentError> {
         let config = AgentRuntimeConfig::from_compiled(compiled)?;
         Self::from_compiled_config(config, compiled)
     }
@@ -445,23 +360,20 @@ impl Agent {
     fn from_compiled_config(
         config: AgentRuntimeConfig,
         compiled: &CompiledPlannerRunSpec,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, AgentError> {
         let (predictor, predictor_max_order) = match compiled.controller() {
             CompiledPlannerController::McAixi {
                 predictor,
                 predictor_max_order,
                 ..
             } => (predictor, *predictor_max_order),
-            _ => {
-                return Err(
-                    "compiled planner run is not an MC-AIXI controller configuration".to_string(),
-                );
-            }
+            _ => return Err(AgentError::ControllerKindMismatch),
         };
         let percept_bits = (compiled.interface().observation_bits
             * compiled.interface().observation_stream_len.max(1))
             + compiled.interface().reward_bits;
-        let model = build_mc_aixi_predictor(predictor, predictor_max_order, percept_bits)?;
+        let model = build_mc_aixi_predictor(predictor, predictor_max_order, percept_bits)
+            .map_err(AgentError::Predictor)?;
 
         let rng = RandomGenerator::from_seed(config.random_seed);
 
@@ -813,22 +725,7 @@ mod tests {
     #[cfg(feature = "all-backends")]
     fn generic_mixture_config() -> AgentConfig {
         AgentConfig {
-            algorithm: "ignored-by-rate-backend".to_string(),
-            ct_depth: 8,
-            agent_horizon: 5,
-            observation_bits: 1,
-            observation_stream_len: 1,
-            observation_key_mode: ObservationKeyMode::FullStream,
-            reward_bits: 1,
-            agent_actions: 2,
-            num_simulations: 60,
-            exploration_exploitation_ratio: 1.4,
-            discount_gamma: 1.0,
-            min_reward: 0,
-            max_reward: 1,
-            reward_offset: 0,
-            random_seed: Some(2026),
-            rate_backend: Some(RateBackend::Mixture {
+            rate_backend: RateBackend::Mixture {
                 spec: Arc::new(
                     MixtureSpec::new(
                         MixtureKind::Convex,
@@ -849,14 +746,21 @@ mod tests {
                     )
                     .with_alpha(1.25),
                 ),
-            }),
+            },
+            agent_horizon: 5,
+            observation_bits: 1,
+            observation_stream_len: 1,
+            observation_key_mode: ObservationKeyMode::FullStream,
+            reward_bits: 1,
+            agent_actions: 2,
+            num_simulations: 60,
+            exploration_exploitation_ratio: 1.4,
+            discount_gamma: 1.0,
+            min_reward: 0,
+            max_reward: 1,
+            reward_offset: 0,
+            random_seed: Some(2026),
             rate_backend_max_order: 8,
-            rwkv_model_path: None,
-            rwkv_method: None,
-            mamba_model_path: None,
-            mamba_method: None,
-            rosa_max_order: Some(8),
-            zpaq_method: None,
         }
     }
 
@@ -929,61 +833,15 @@ mod tests {
         }
     }
 
-    // We deliberately mutate fields after `Default::default()` here: it is the
-    // forward-compatible construction pattern for `#[non_exhaustive]` configs
-    // (a future added field automatically picks up its default value rather
-    // than silently breaking the test).
-    #[allow(clippy::field_reassign_with_default)]
     #[test]
-    fn algorithm_aliases_match_canonical_names_in_mc_aixi() {
-        let mut cfg = AgentConfig::default();
-        cfg.algorithm = "ac-ctw".into();
-        let canonical = cfg.canonical_predictor_backend().expect("ac-ctw");
-
-        cfg.algorithm = "ctw".into();
-        let aliased = cfg.canonical_predictor_backend().expect("ctw alias");
-        assert_eq!(
-            backend_shape(&canonical),
-            backend_shape(&aliased),
-            "MC-AIXI: 'ctw' must alias to single-tree 'ac-ctw'"
-        );
-
-        cfg.algorithm = "rosaplus".into();
-        let canonical_rosa = cfg.canonical_predictor_backend().expect("rosaplus");
-        cfg.algorithm = "rosa".into();
-        let aliased_rosa = cfg.canonical_predictor_backend().expect("rosa alias");
-        assert_eq!(
-            backend_shape(&canonical_rosa),
-            backend_shape(&aliased_rosa),
-            "MC-AIXI: 'rosa' must alias to canonical 'rosaplus'"
-        );
-
-        // Sanity: `fac-ctw` is a *separate* backend, not an alias of `ctw`.
-        cfg.algorithm = "fac-ctw".into();
-        let fac = cfg.canonical_predictor_backend().expect("fac-ctw");
-        assert_ne!(
-            backend_shape(&canonical),
-            backend_shape(&fac),
-            "MC-AIXI: 'fac-ctw' must NOT alias to 'ctw'"
-        );
-    }
-
-    #[allow(clippy::field_reassign_with_default)]
-    #[test]
-    fn alias_semantics_are_symmetric_between_mc_aixi_and_aiqi() {
-        // MC-AIXI-side mapping for `ctw`.
+    fn explicit_rate_backend_semantics_are_symmetric_between_mc_aixi_and_aiqi() {
         let mut agent_cfg = AgentConfig::default();
-        agent_cfg.algorithm = "ctw".into();
-        let agent_ctw = agent_cfg.canonical_predictor_backend().expect("agent ctw");
+        agent_cfg.rate_backend = crate::api::RateBackend::Ctw { depth: 8 };
+        let agent_ctw = agent_cfg.canonical_predictor_backend();
 
-        // The corresponding AIQI-side mapping must be in the same `RateBackend`
-        // discriminant family. We use the public `validate` path with a
-        // freshly-constructed AiqiConfig to avoid touching internals.
         let mut aiqi_cfg = crate::aixi::aiqi::AiqiConfig::default();
-        aiqi_cfg.algorithm = "ctw".into();
-        let aiqi_ctw = aiqi_cfg
-            .canonical_predictor_backend_for_test()
-            .expect("aiqi ctw");
+        aiqi_cfg.rate_backend = crate::api::RateBackend::Ctw { depth: 8 };
+        let aiqi_ctw = aiqi_cfg.canonical_predictor_backend_for_test();
 
         assert_eq!(
             backend_shape(&agent_ctw),
@@ -996,12 +854,10 @@ mod tests {
             "AIQI: 'ctw' must produce a single-tree CTW backend"
         );
 
-        agent_cfg.algorithm = "rosa".into();
-        aiqi_cfg.algorithm = "rosa".into();
-        let agent_rosa = agent_cfg.canonical_predictor_backend().expect("agent rosa");
-        let aiqi_rosa = aiqi_cfg
-            .canonical_predictor_backend_for_test()
-            .expect("aiqi rosa");
+        agent_cfg.rate_backend = crate::api::RateBackend::RosaPlus;
+        aiqi_cfg.rate_backend = crate::api::RateBackend::RosaPlus;
+        let agent_rosa = agent_cfg.canonical_predictor_backend();
+        let aiqi_rosa = aiqi_cfg.canonical_predictor_backend_for_test();
         assert_eq!(
             backend_shape(&agent_rosa),
             "rosaplus",

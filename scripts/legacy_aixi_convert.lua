@@ -288,7 +288,7 @@ local function parse_vm_observation_stream_len(value)
 end
 
 local function parse_observation_stream_len_for_env(root, env_name)
-    if env_name == "vm" or env_name == "nyx" or env_name == "nyx-vm" then
+    if env_name == "vm" then
         if type(root.vm_observation) == "table" then
             return parse_vm_observation_stream_len(root.vm_observation)
         end
@@ -298,7 +298,7 @@ local function parse_observation_stream_len_for_env(root, env_name)
 end
 
 local function parse_observation_key_mode_for_env(root, env_name)
-    if env_name == "vm" or env_name == "nyx" or env_name == "nyx-vm" then
+    if env_name == "vm" then
         if type(root.vm_observation) == "table" then
             local vm_obs = root.vm_observation
             local mode = vm_obs.key_mode or vm_obs.observation_key_mode or "full"
@@ -1407,7 +1407,7 @@ local function convert_legacy(root, input_path)
     local environment
     local env_defaults
 
-    if env_raw == "vm" or env_raw == "nyx" or env_raw == "nyx-vm" then
+    if env_raw == "vm" then
         local vm_env, vm_info = convert_legacy_vm_environment(root, base_dir, assets)
         environment = vm_env
         local min_reward, max_reward = signed_reward_bounds(vm_info.reward_bits)

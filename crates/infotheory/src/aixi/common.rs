@@ -1,5 +1,8 @@
 //! Common types and utilities for the AIXI implementation.
 
+use std::error::Error;
+use std::fmt;
+
 /// Represents a single bit (0 or 1) in the agent's interaction history.
 pub type Symbol = bool;
 
@@ -48,35 +51,90 @@ pub(crate) fn bits_for_cardinality(cardinality: usize) -> usize {
     bits.max(1)
 }
 
+/// Error returned when the configured reward range cannot be encoded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RewardEncodingError {
+    /// The configured maximum reward is below the configured minimum reward.
+    MaxBelowMin {
+        /// Configured maximum reward.
+        max_reward: i64,
+        /// Configured minimum reward.
+        min_reward: i64,
+    },
+    /// The configured reward offset makes the minimum encoded reward negative.
+    NegativeShiftedMinimum {
+        /// Shifted minimum reward (`min_reward + reward_offset`).
+        shifted_minimum: i128,
+    },
+    /// The configured reward bit width cannot represent the shifted maximum reward.
+    RewardBitsTooSmall {
+        /// Shifted maximum reward (`max_reward + reward_offset`).
+        shifted_maximum: i128,
+        /// Configured reward bit width.
+        reward_bits: usize,
+        /// Maximum representable encoded reward for `reward_bits`.
+        maximum_encoded: u128,
+    },
+}
+
+impl fmt::Display for RewardEncodingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MaxBelowMin {
+                max_reward,
+                min_reward,
+            } => write!(
+                f,
+                "max_reward must be >= min_reward (got {max_reward} < {min_reward})"
+            ),
+            Self::NegativeShiftedMinimum { shifted_minimum } => write!(
+                f,
+                "reward_offset too small: min_reward + reward_offset must be >= 0 (got {shifted_minimum})"
+            ),
+            Self::RewardBitsTooSmall {
+                shifted_maximum,
+                reward_bits: _,
+                maximum_encoded,
+            } => write!(
+                f,
+                "reward_bits too small for configured reward range: max shifted reward {shifted_maximum} exceeds {maximum_encoded}"
+            ),
+        }
+    }
+}
+
+impl Error for RewardEncodingError {}
+
 /// Validate that shifted rewards are representable in the configured bit width.
 pub(crate) fn validate_reward_encoding_bounds(
     min_reward: i64,
     max_reward: i64,
     reward_offset: i64,
     reward_bits: usize,
-) -> Result<(), String> {
+) -> Result<(), RewardEncodingError> {
     if max_reward < min_reward {
-        return Err(format!(
-            "max_reward must be >= min_reward (got {} < {})",
-            max_reward, min_reward
-        ));
+        return Err(RewardEncodingError::MaxBelowMin {
+            max_reward,
+            min_reward,
+        });
     }
 
     let min_shifted = (min_reward as i128) + (reward_offset as i128);
     let max_shifted = (max_reward as i128) + (reward_offset as i128);
     if min_shifted < 0 {
-        return Err(format!(
-            "reward_offset too small: min_reward + reward_offset must be >= 0 (got {})",
-            min_shifted
-        ));
+        return Err(RewardEncodingError::NegativeShiftedMinimum {
+            shifted_minimum: min_shifted,
+        });
     }
     if reward_bits < 64 {
         let max_enc = (1u128 << reward_bits) - 1;
         if (max_shifted as u128) > max_enc {
-            return Err(format!(
-                "reward_bits too small for configured reward range: max shifted reward {} exceeds {}",
-                max_shifted, max_enc
-            ));
+            return Err(RewardEncodingError::RewardBitsTooSmall {
+                shifted_maximum: max_shifted,
+                reward_bits,
+                maximum_encoded: max_enc,
+            });
         }
     }
 
@@ -392,7 +450,10 @@ mod tests {
     #[test]
     fn validate_reward_encoding_bounds_rejects_unrepresentable_ranges() {
         let err = validate_reward_encoding_bounds(0, 100, 0, 1).expect_err("must fail");
-        assert!(err.contains("reward_bits too small"), "{err}");
+        assert!(matches!(
+            err,
+            RewardEncodingError::RewardBitsTooSmall { .. }
+        ));
     }
 
     #[test]

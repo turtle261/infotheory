@@ -4,11 +4,13 @@
 //!
 //! Tests for predictors, environments, and agents.
 
-use infotheory::aixi::agent::{Agent, AgentConfig};
+use infotheory::aixi::agent::{Agent, AgentConfig, AgentError};
 use infotheory::aixi::common::{Action, DEFAULT_RANDOM_SEED, ObservationKeyMode};
 use infotheory::aixi::environment::Environment;
 mod support;
-use infotheory::aixi::model::{CtwPredictor, Predictor, RateBackendBitPredictor, RosaPredictor};
+use infotheory::aixi::model::{
+    CtwPredictor, Predictor, RateBackendBitPredictor, RateBackendBitPredictorConfig, RosaPredictor,
+};
 use infotheory::api::{
     MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend,
 };
@@ -169,8 +171,9 @@ fn assert_snapshot_eq(actual: (f64, f64), expected: (f64, f64), label: &str) {
 
 #[test]
 fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
-    let mut predictor =
-        RateBackendBitPredictor::new(nested_generic_backend(), 8).expect("valid predictor");
+    let config =
+        RateBackendBitPredictorConfig::compile(nested_generic_backend(), 8, 1e-12).expect("config");
+    let mut predictor = RateBackendBitPredictor::new(config).expect("valid predictor");
 
     let initial = predictor_snapshot(&mut predictor);
 
@@ -209,9 +212,13 @@ fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
 
 #[test]
 fn rate_backend_bit_predictor_roundtrips_sequitur_backend() {
-    let mut predictor =
-        RateBackendBitPredictor::new(RateBackend::Sequitur { context_bytes: 32 }, 8)
-            .expect("valid sequitur predictor");
+    let config = RateBackendBitPredictorConfig::compile(
+        RateBackend::Sequitur { context_bytes: 32 },
+        8,
+        1e-12,
+    )
+    .expect("config");
+    let mut predictor = RateBackendBitPredictor::new(config).expect("valid sequitur predictor");
 
     let initial = predictor_snapshot(&mut predictor);
 
@@ -313,8 +320,7 @@ fn run_agent_env<T: Environment>(agent: &mut Agent, mut env: T, cycles: usize) -
 
 fn generic_agent_config(rate_backend: RateBackend) -> AgentConfig {
     let mut cfg = AgentConfig::default();
-    cfg.algorithm = "ignored-by-rate-backend".into();
-    cfg.ct_depth = 8;
+    cfg.rate_backend = rate_backend;
     cfg.agent_horizon = 5;
     cfg.observation_bits = 1;
     cfg.observation_stream_len = 1;
@@ -328,14 +334,7 @@ fn generic_agent_config(rate_backend: RateBackend) -> AgentConfig {
     cfg.max_reward = 1;
     cfg.reward_offset = 0;
     cfg.random_seed = Some(2026);
-    cfg.rate_backend = Some(rate_backend);
     cfg.rate_backend_max_order = 8;
-    cfg.rwkv_model_path = None;
-    cfg.rwkv_method = None;
-    cfg.mamba_model_path = None;
-    cfg.mamba_method = None;
-    cfg.rosa_max_order = Some(8);
-    cfg.zpaq_method = None;
     cfg
 }
 
@@ -388,8 +387,11 @@ fn deeply_nested_bayes_backend(depth: usize) -> RateBackend {
 #[test]
 fn agent_solves_ctw_test_environment() {
     let mut config = AgentConfig::default();
-    config.algorithm = "fac-ctw".into();
-    config.ct_depth = 8;
+    config.rate_backend = RateBackend::FacCtw {
+        base_depth: 8,
+        num_percept_bits: 2,
+        encoding_bits: 1,
+    };
     config.agent_horizon = 8;
     config.observation_bits = 1;
     config.observation_stream_len = 1;
@@ -403,14 +405,7 @@ fn agent_solves_ctw_test_environment() {
     config.max_reward = 1;
     config.reward_offset = 0;
     config.random_seed = Some(17);
-    config.rate_backend = None;
     config.rate_backend_max_order = 20;
-    config.rwkv_model_path = None;
-    config.rwkv_method = None;
-    config.mamba_model_path = None;
-    config.mamba_method = None;
-    config.rosa_max_order = None;
-    config.zpaq_method = None;
 
     let mut agent = Agent::new(config);
     let env = DeterministicBinaryEnv::new();
@@ -433,8 +428,11 @@ fn agent_solves_ctw_test_environment() {
 #[test]
 fn agent_regret_sublinear_coinflip() {
     let mut config = AgentConfig::default();
-    config.algorithm = "fac-ctw".into();
-    config.ct_depth = 4;
+    config.rate_backend = RateBackend::FacCtw {
+        base_depth: 4,
+        num_percept_bits: 2,
+        encoding_bits: 1,
+    };
     config.agent_horizon = 4;
     config.observation_bits = 1;
     config.observation_stream_len = 1;
@@ -448,14 +446,7 @@ fn agent_regret_sublinear_coinflip() {
     config.max_reward = 1;
     config.reward_offset = 0;
     config.random_seed = Some(23);
-    config.rate_backend = None;
     config.rate_backend_max_order = 20;
-    config.rwkv_model_path = None;
-    config.rwkv_method = None;
-    config.mamba_model_path = None;
-    config.mamba_method = None;
-    config.rosa_max_order = None;
-    config.zpaq_method = None;
 
     let mut agent = Agent::new(config);
     let env = SeededCoinFlipEnv::new(0.8);
@@ -478,8 +469,11 @@ fn agent_regret_sublinear_coinflip() {
 #[test]
 fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
     let mut config = AgentConfig::default();
-    config.algorithm = "fac-ctw".into();
-    config.ct_depth = 8;
+    config.rate_backend = RateBackend::FacCtw {
+        base_depth: 8,
+        num_percept_bits: 2,
+        encoding_bits: 1,
+    };
     config.agent_horizon = 6;
     config.observation_bits = 1;
     config.observation_stream_len = 1;
@@ -493,14 +487,7 @@ fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
     config.max_reward = 1;
     config.reward_offset = 0;
     config.random_seed = Some(12345);
-    config.rate_backend = None;
     config.rate_backend_max_order = 20;
-    config.rwkv_model_path = None;
-    config.rwkv_method = None;
-    config.mamba_model_path = None;
-    config.mamba_method = None;
-    config.rosa_max_order = None;
-    config.zpaq_method = None;
 
     let mut a = Agent::new(config.clone());
     let mut b = Agent::new(config);
@@ -611,24 +598,13 @@ fn agent_different_seeds_can_change_stochastic_trace() {
 }
 
 #[test]
-fn agent_config_allows_unknown_algorithm_when_rate_backend_overrides() {
+fn agent_config_accepts_explicit_programmatic_rate_backend() {
     let cfg = generic_agent_config(RateBackend::Ppmd {
         order: 4,
         memory_mb: 8,
     });
     assert!(cfg.validate().is_ok());
-    let mut agent = Agent::try_new(cfg).expect("rate_backend override should be valid");
-    let action = agent.get_planned_action(&[0], 0, 0);
-    assert!(action < 2);
-}
-
-#[test]
-fn agent_config_allows_algorithm_zpaq_when_rate_backend_overrides() {
-    let mut cfg = generic_agent_config(RateBackend::Ctw { depth: 8 });
-    cfg.algorithm = "zpaq".to_string();
-    cfg.zpaq_method = Some("1".to_string());
-    assert!(cfg.validate().is_ok());
-    let mut agent = Agent::try_new(cfg).expect("rate_backend override should bypass legacy zpaq");
+    let mut agent = Agent::try_new(cfg).expect("explicit rate_backend should be valid");
     let action = agent.get_planned_action(&[0], 0, 0);
     assert!(action < 2);
 }
@@ -652,8 +628,7 @@ fn agent_config_rejects_zpaq_rate_backend_in_strict_mode() {
     let err = cfg
         .validate()
         .expect_err("zpaq-backed generic MC-AIXI should be rejected");
-    assert!(err.contains("A Monte-Carlo AIXI Approximation"));
-    assert!(err.contains("zpaq"));
+    assert!(matches!(err, AgentError::UnsupportedRateBackend { .. }));
 }
 
 #[test]
@@ -664,8 +639,7 @@ fn agent_config_rejects_invalid_programmatic_mixture_rate_backend() {
     let err = cfg
         .validate()
         .expect_err("empty mixture backend should be rejected");
-    assert!(err.contains("invalid rate_backend"));
-    assert!(err.contains("must include at least one expert"));
+    assert!(matches!(err, AgentError::InvalidRateBackend(_)));
 }
 
 #[test]
@@ -674,8 +648,7 @@ fn agent_config_rejects_programmatic_mixture_nesting_overflow() {
     let err = cfg
         .validate()
         .expect_err("overly deep nested mixture should be rejected");
-    assert!(err.contains("invalid rate_backend"));
-    assert!(err.contains("nesting too deep"));
+    assert!(matches!(err, AgentError::InvalidRateBackend(_)));
 }
 
 #[test]

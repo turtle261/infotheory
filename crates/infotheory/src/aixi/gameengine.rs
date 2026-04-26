@@ -16,6 +16,64 @@ use gameengine::builtin::{
 };
 use gameengine::{ActionToken, AixiEnvironment as GameEngineAixiEnvironment, DefaultEnvironment};
 
+/// Errors surfaced by GameEngine-backed AIXI environment construction/runtime reset.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum GameEngineEnvironmentError {
+    /// Underlying GameEngine reset failed.
+    ResetFailed(String),
+    /// Environment produced an observation stream that violates compact spec shape.
+    PerceptStreamLengthMismatch {
+        /// Actual observation stream length emitted by the environment.
+        actual: usize,
+        /// Expected observation stream length from compact spec.
+        expected: usize,
+    },
+    /// Coin-flip bias violates the domain invariant.
+    InvalidCoinFlipBias {
+        /// Configured coin-flip head numerator.
+        head_numerator: u64,
+        /// Configured coin-flip head denominator.
+        head_denominator: u64,
+    },
+    /// Requested builtin requires an optional feature that is disabled.
+    MissingFeature {
+        /// Builtin environment that was requested.
+        builtin: BuiltinEnvironmentSpec,
+        /// Missing feature gate required for `builtin`.
+        feature: &'static str,
+    },
+}
+
+impl std::fmt::Display for GameEngineEnvironmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResetFailed(err) => {
+                write!(f, "failed to reset GameEngine environment: {err}")
+            }
+            Self::PerceptStreamLengthMismatch { actual, expected } => write!(
+                f,
+                "GameEngine percept stream length {actual} does not match compact spec length {expected}"
+            ),
+            Self::InvalidCoinFlipBias {
+                head_numerator,
+                head_denominator,
+            } => write!(
+                f,
+                "invalid coin-flip bias: expected 0 <= numerator <= denominator (got {head_numerator}/{head_denominator})"
+            ),
+            Self::MissingFeature { builtin, feature } => write!(
+                f,
+                "builtin environment '{}' requires feature '{}'",
+                builtin.canonical_name(),
+                feature
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GameEngineEnvironmentError {}
+
 /// Generic adapter from a GameEngine AIXI environment to Infotheory's AIXI trait.
 pub struct GameEngineEnvironment<E, const MAX_WORDS: usize>
 where
@@ -38,10 +96,10 @@ where
         mut env: E,
         spec: gameengine::CompactSpec,
         seed: u64,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, GameEngineEnvironmentError> {
         let initial = env
             .reset_seed(seed)
-            .map_err(|err| format!("failed to reset GameEngine environment: {err}"))?;
+            .map_err(|err| GameEngineEnvironmentError::ResetFailed(err.to_string()))?;
         let mut adapter = Self {
             env,
             spec,
@@ -54,14 +112,16 @@ where
         Ok(adapter)
     }
 
-    fn apply_percept(&mut self, percept: gameengine::Percept<MAX_WORDS>) -> Result<(), String> {
+    fn apply_percept(
+        &mut self,
+        percept: gameengine::Percept<MAX_WORDS>,
+    ) -> Result<(), GameEngineEnvironmentError> {
         let words = percept.observation_bits.words();
         if words.len() != self.spec.observation_stream_len {
-            return Err(format!(
-                "GameEngine percept stream length {} does not match compact spec length {}",
-                words.len(),
-                self.spec.observation_stream_len
-            ));
+            return Err(GameEngineEnvironmentError::PerceptStreamLengthMismatch {
+                actual: words.len(),
+                expected: self.spec.observation_stream_len,
+            });
         }
 
         self.observation_stream.clear();
@@ -72,11 +132,11 @@ where
         Ok(())
     }
 
-    fn reset_with_seed(&mut self, seed: u64) -> Result<(), String> {
+    fn reset_with_seed(&mut self, seed: u64) -> Result<(), GameEngineEnvironmentError> {
         let percept = self
             .env
             .reset_seed(seed)
-            .map_err(|err| format!("failed to reset GameEngine environment: {err}"))?;
+            .map_err(|err| GameEngineEnvironmentError::ResetFailed(err.to_string()))?;
         self.apply_percept(percept)
     }
 }
@@ -172,9 +232,12 @@ type PlatformerEnvironment = GameEngineEnvironment<DefaultEnvironment<Platformer
 fn build_coin_flip_environment_from_config(
     config: BiasedCoinFlipConfig,
     seed: u64,
-) -> Result<Box<dyn Environment>, String> {
+) -> Result<Box<dyn Environment>, GameEngineEnvironmentError> {
     if !config.invariant() {
-        return Err("invalid coin-flip bias: expected 0 <= numerator <= denominator".to_string());
+        return Err(GameEngineEnvironmentError::InvalidCoinFlipBias {
+            head_numerator: config.head_numerator,
+            head_denominator: config.head_denominator,
+        });
     }
     let game = BiasedCoinFlip::new(config);
     let spec = game.compact_spec();
@@ -189,7 +252,7 @@ pub fn build_coin_flip_environment(
     head_numerator: u64,
     head_denominator: u64,
     seed: u64,
-) -> Result<Box<dyn Environment>, String> {
+) -> Result<Box<dyn Environment>, GameEngineEnvironmentError> {
     build_coin_flip_environment_from_config(
         BiasedCoinFlipConfig {
             head_numerator,
@@ -202,7 +265,7 @@ pub fn build_coin_flip_environment(
 /// Builds a boxed AIXI environment from the canonical builtin enum.
 pub fn build_builtin_environment(
     builtin: BuiltinEnvironmentSpec,
-) -> Result<Box<dyn Environment>, String> {
+) -> Result<Box<dyn Environment>, GameEngineEnvironmentError> {
     build_builtin_environment_with_seed(builtin, DEFAULT_RANDOM_SEED)
 }
 
@@ -210,7 +273,7 @@ pub fn build_builtin_environment(
 pub fn build_builtin_environment_with_seed(
     builtin: BuiltinEnvironmentSpec,
     seed: u64,
-) -> Result<Box<dyn Environment>, String> {
+) -> Result<Box<dyn Environment>, GameEngineEnvironmentError> {
     match builtin {
         BuiltinEnvironmentSpec::CoinFlip => {
             build_coin_flip_environment_from_config(BiasedCoinFlipConfig::default(), seed)
@@ -265,10 +328,10 @@ pub fn build_builtin_environment_with_seed(
             )?))
         }
         #[cfg(not(feature = "aixi-gameengine-physics"))]
-        BuiltinEnvironmentSpec::Platformer => Err(
-            "builtin environment 'platformer' requires feature 'aixi-gameengine-physics'"
-                .to_string(),
-        ),
+        BuiltinEnvironmentSpec::Platformer => Err(GameEngineEnvironmentError::MissingFeature {
+            builtin: BuiltinEnvironmentSpec::Platformer,
+            feature: "aixi-gameengine-physics",
+        }),
     }
 }
 
@@ -295,14 +358,29 @@ mod tests {
 
     #[test]
     fn invalid_coin_flip_bias_is_rejected() {
-        let err = build_coin_flip_environment(2, 1, 0)
-            .err()
-            .expect("invalid ratio must fail");
-        assert!(err.contains("invalid coin-flip bias"));
-        let err = build_coin_flip_environment(0, 0, 0)
-            .err()
-            .expect("zero denominator must fail");
-        assert!(err.contains("invalid coin-flip bias"));
+        let err = match build_coin_flip_environment(2, 1, 0) {
+            Ok(_) => panic!("invalid ratio must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            GameEngineEnvironmentError::InvalidCoinFlipBias {
+                head_numerator: 2,
+                head_denominator: 1,
+            }
+        ));
+
+        let err = match build_coin_flip_environment(0, 0, 0) {
+            Ok(_) => panic!("zero denominator must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            GameEngineEnvironmentError::InvalidCoinFlipBias {
+                head_numerator: 0,
+                head_denominator: 0,
+            }
+        ));
     }
 
     #[test]

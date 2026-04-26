@@ -1126,24 +1126,16 @@ pub fn parse_rate_backend_json(
 
     let raw_kind = v["kind"]
         .as_str()
-        .or_else(|| v["type"].as_str())
-        .or_else(|| v["backend"].as_str())
         .ok_or_else(|| SpecError::new("backend spec missing 'kind'"))?;
     let kind = resolve_enabled_rate_backend_kind(raw_kind)?;
 
     match kind {
         crate::runtime::RateBackendKind::RosaPlus => Ok(RateBackend::RosaPlus),
         crate::runtime::RateBackendKind::Ctw => Ok(RateBackend::Ctw {
-            depth: v["depth"]
-                .as_u64()
-                .or_else(|| v["ct_depth"].as_u64())
-                .unwrap_or(16) as usize,
+            depth: v["depth"].as_u64().unwrap_or(16) as usize,
         }),
         crate::runtime::RateBackendKind::FacCtw => {
-            let base_depth = v["base_depth"]
-                .as_u64()
-                .or_else(|| v["ct_depth"].as_u64())
-                .unwrap_or(16) as usize;
+            let base_depth = v["base_depth"].as_u64().unwrap_or(16) as usize;
             let encoding_bits = v["encoding_bits"].as_u64().unwrap_or(8) as usize;
             let num_percept_bits = v["num_percept_bits"]
                 .as_u64()
@@ -1190,17 +1182,10 @@ pub fn parse_rate_backend_json(
                     Ok(RateBackend::MambaMethod {
                         method: parse_mamba_method_json_value(&v["method"], base_dir)?,
                     })
-                } else if let Some(method) = v["mamba_method"].as_str() {
-                    Ok(RateBackend::MambaMethod {
-                        method: normalize_mamba_method_for_base_dir(base_dir, method)?,
-                    })
                 } else {
-                    let model_path = v["mamba_model_path"]
-                        .as_str()
-                        .or_else(|| v["model_path"].as_str())
-                        .ok_or_else(|| {
-                            SpecError::new("mamba backend requires 'method' or 'model_path'")
-                        })?;
+                    let model_path = v["model_path"].as_str().ok_or_else(|| {
+                        SpecError::new("mamba backend requires 'method' or 'model_path'")
+                    })?;
                     Ok(RateBackend::MambaMethod {
                         method: normalize_mamba_path_method(base_dir, model_path)?,
                     })
@@ -1218,17 +1203,10 @@ pub fn parse_rate_backend_json(
                     Ok(RateBackend::Rwkv7Method {
                         method: parse_rwkv_method_json_value(&v["method"], base_dir)?,
                     })
-                } else if let Some(method) = v["rwkv_method"].as_str() {
-                    Ok(RateBackend::Rwkv7Method {
-                        method: normalize_rwkv_method_for_base_dir(base_dir, method)?,
-                    })
                 } else {
-                    let model_path = v["rwkv_model_path"]
-                        .as_str()
-                        .or_else(|| v["model_path"].as_str())
-                        .ok_or_else(|| {
-                            SpecError::new("rwkv7 backend requires 'method' or 'model_path'")
-                        })?;
+                    let model_path = v["model_path"].as_str().ok_or_else(|| {
+                        SpecError::new("rwkv7 backend requires 'method' or 'model_path'")
+                    })?;
                     Ok(RateBackend::Rwkv7Method {
                         method: normalize_rwkv_path_method(base_dir, model_path)?,
                     })
@@ -1242,11 +1220,7 @@ pub fn parse_rate_backend_json(
         crate::runtime::RateBackendKind::Mixture => {
             let spec = if let Some(spec_v) = v.get("spec").filter(|value| value.is_object()) {
                 parse_mixture_spec_value(spec_v, base_dir, depth - 1)?
-            } else if let Some(path) = v["spec_path"]
-                .as_str()
-                .or_else(|| v["path"].as_str())
-                .or_else(|| v["spec"].as_str())
-            {
+            } else if let Some(path) = v["spec_path"].as_str() {
                 let full = resolve_spec_path(base_dir, path);
                 load_mixture_spec_with_depth(full.to_string_lossy().as_ref(), depth - 1)?
             } else {
@@ -1259,11 +1233,7 @@ pub fn parse_rate_backend_json(
         crate::runtime::RateBackendKind::Particle => {
             let spec = if let Some(spec_v) = v.get("spec").filter(|value| value.is_object()) {
                 parse_particle_spec_value(spec_v)?
-            } else if let Some(path) = v["spec_path"]
-                .as_str()
-                .or_else(|| v["path"].as_str())
-                .or_else(|| v["spec"].as_str())
-            {
+            } else if let Some(path) = v["spec_path"].as_str() {
                 let full = resolve_spec_path(base_dir, path);
                 load_particle_spec(full.to_string_lossy().as_ref())?
             } else {
@@ -1278,11 +1248,7 @@ pub fn parse_rate_backend_json(
         crate::runtime::RateBackendKind::Calibrated => {
             let spec = if let Some(spec_v) = v.get("spec").filter(|value| value.is_object()) {
                 parse_calibrated_spec_value(spec_v, base_dir, depth - 1)?
-            } else if let Some(path) = v["spec_path"]
-                .as_str()
-                .or_else(|| v["path"].as_str())
-                .or_else(|| v["spec"].as_str())
-            {
+            } else if let Some(path) = v["spec_path"].as_str() {
                 let full = resolve_spec_path(base_dir, path);
                 load_calibrated_spec(full.to_string_lossy().as_ref())?
             } else {
@@ -1304,8 +1270,6 @@ pub fn parse_compression_backend_json(
 ) -> SpecResult<CompressionBackend> {
     let raw_kind = v["kind"]
         .as_str()
-        .or_else(|| v["type"].as_str())
-        .or_else(|| v["backend"].as_str())
         .ok_or_else(|| SpecError::new("compression backend spec missing 'kind'"))?;
     let kind = resolve_enabled_compression_backend_kind(raw_kind)?;
     let framing = v["framing"]
@@ -1360,13 +1324,8 @@ pub fn parse_compression_backend_json(
                 } else {
                     None
                 };
-                let model_path = v["rwkv_model_path"]
-                    .as_str()
-                    .or_else(|| v["model_path"].as_str());
-                if parsed_method.is_none()
-                    && v["rwkv_method"].as_str().is_none()
-                    && model_path.is_none()
-                {
+                let model_path = v["model_path"].as_str();
+                if parsed_method.is_none() && model_path.is_none() {
                     Err(SpecError::new(
                         "rwkv7 compression backend requires 'method' or 'model_path'",
                     ))
@@ -1381,7 +1340,7 @@ pub fn parse_compression_backend_json(
                         default_rwkv_model_path: model_path.map(ToOwned::to_owned),
                         ..Default::default()
                     };
-                    parse_rwkv7_compression_backend_method(v["rwkv_method"].as_str(), coder, &opts)
+                    parse_rwkv7_compression_backend_method(None, coder, &opts)
                 }
             }
             #[cfg(not(feature = "backend-rwkv"))]
@@ -1406,7 +1365,7 @@ pub fn parse_calibrated_spec_value(
 
     let base_backend = if let Some(base_v) = v.get("base") {
         parse_rate_backend_json(base_v, base_dir, depth - 1)?
-    } else if let Some(path) = v["base_path"].as_str().or_else(|| v["path"].as_str()) {
+    } else if let Some(path) = v["base_path"].as_str() {
         let (value, full) = load_json_value_from_path(base_dir, path, "calibrated base backend")?;
         parse_rate_backend_json(&value, full.parent().unwrap_or(base_dir), depth - 1)?
     } else {

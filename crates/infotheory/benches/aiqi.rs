@@ -12,10 +12,9 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn base_cfg(algorithm: &str) -> AiqiConfig {
+fn base_cfg(backend: RateBackend) -> AiqiConfig {
     let mut cfg = AiqiConfig::default();
-    cfg.algorithm = algorithm.to_string();
-    cfg.ct_depth = 12;
+    cfg.rate_backend = backend;
     cfg.observation_bits = 1;
     cfg.observation_stream_len = 1;
     cfg.reward_bits = 1;
@@ -30,11 +29,7 @@ fn base_cfg(algorithm: &str) -> AiqiConfig {
     cfg.history_prune_keep_steps = None;
     cfg.baseline_exploration = 1e-12;
     cfg.random_seed = Some(7);
-    cfg.rate_backend = None;
     cfg.rate_backend_max_order = 8;
-    cfg.rwkv_model_path = None;
-    cfg.rosa_max_order = None;
-    cfg.zpaq_method = None;
     cfg
 }
 
@@ -75,17 +70,10 @@ fn main() {
     let iterations = env_usize("AIQI_BENCH_ITERS", 1_000);
     let seed_steps = env_usize("AIQI_BENCH_HISTORY", 128);
 
-    let rate_backend_cfg = |backend: RateBackend| {
-        let mut cfg = base_cfg("ignored-by-rate-backend");
-        cfg.rate_backend = Some(backend);
-        cfg
-    };
-
     let benches = [
-        ("ctw", base_cfg("ctw")),
-        ("rosaplus", base_cfg("rosaplus")),
-        ("rate-rosa", rate_backend_cfg(RateBackend::RosaPlus)),
-        ("mix-bayes", rate_backend_cfg(mixture_backend())),
+        ("ctw", base_cfg(RateBackend::Ctw { depth: 12 })),
+        ("rosaplus", base_cfg(RateBackend::RosaPlus)),
+        ("mix-bayes", base_cfg(mixture_backend())),
     ];
 
     println!(

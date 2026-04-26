@@ -297,7 +297,10 @@ Planner switch in config:
 ```json
 {
   "planner": "aiqi",
-  "algorithm": "ac-ctw",
+  "rate_backend": {
+    "kind": "ctw",
+    "depth": 8
+  },
   "random_seed": 12345,
   "discount_gamma": 0.99,
   "return_horizon": 6,
@@ -314,7 +317,7 @@ Both planners also accept a `rate_backend` object using the same `RateBackend` s
 {
   "planner": "aiqi",
   "rate_backend": {
-    "name": "ppmd",
+    "kind": "ppmd",
     "order": 10,
     "memory_mb": 64
   },
@@ -322,14 +325,15 @@ Both planners also accept a `rate_backend` object using the same `RateBackend` s
 }
 ```
 
+Canonical planner configs should use `rate_backend` directly. Configs made for Infotheory versions prior to 1.2.0 should be ran through the conversion tool:  `./projman.sh legacy_aixi_convert <input_file>`
+
 Example MC-AIXI convex mixture override:
 
 ```json
 {
   "planner": "mc-aixi",
-  "algorithm": "fac-ctw",
   "rate_backend": {
-    "name": "mixture",
+    "kind": "mixture",
     "spec": {
       "kind": "convex",
       "alpha": 1.25,
@@ -367,7 +371,7 @@ Benchmark correctness notes:
 - MC-AIXI tree search uses the same UCB scaling convention as common MC-AIXI reference implementations, the uniform-max tie-breaking rule from *A Monte-Carlo AIXI Approximation*, and chance-node cache keys that include reward as well as observation so environments with repeated observations but different rewards are handled correctly.
 
 VM config highlights:
-- **Environment**: Use `"environment": "nyx-vm"` or `"vm"` (requires `vm` feature).
+- **Environment**: Use `"environment": "vm"` (requires `vm` feature).
 - **Core Config**:
   - `vm_config.kernel_image_path`: Path to `vmlinux` kernel.
   - `vm_config.rootfs_image_path`: Path to `rootfs.ext4`.
