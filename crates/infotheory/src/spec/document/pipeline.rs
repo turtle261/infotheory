@@ -8,7 +8,8 @@ use super::{
     ValidatedPlannerRunSpec, ValidatedTuneSpec,
 };
 use crate::aixi::common::{
-    bits_for_cardinality, resolve_random_seed, validate_reward_encoding_bounds,
+    MctsStrategy, bits_for_cardinality, resolve_random_seed, validate_reward_encoding_bounds,
+    warn_parallel_uct_workers_one_once,
 };
 use crate::spec::core::AssetRef;
 use std::collections::HashMap;
@@ -42,6 +43,7 @@ fn compile_planner_controller(
             predictor_max_order: inner.predictor_max_order,
             agent_horizon: inner.agent_horizon,
             num_simulations: inner.num_simulations,
+            mcts_strategy: inner.mcts_strategy,
             exploration_exploitation_ratio: inner.exploration_exploitation_ratio,
             discount_gamma: inner.discount_gamma,
         }),
@@ -65,6 +67,31 @@ fn compile_planner_controller(
                 teacher_dataset_asset: inner.teacher_dataset_asset.clone(),
                 planner_simulations_per_step: inner.planner_simulations_per_step,
             })
+        }
+    }
+}
+
+fn validate_mc_aixi_mcts_strategy(strategy: MctsStrategy) -> SpecResult<()> {
+    match strategy {
+        MctsStrategy::RhoUct => Ok(()),
+        MctsStrategy::ParallelUct {
+            workers,
+            bu_uct_m_max,
+        } => {
+            // `workers` is type-enforced non-zero by `NonZeroUsize`; only the
+            // `workers == 1` warning and the BU-UCT threshold range remain
+            // checkable at this layer.
+            if workers.get() == 1 {
+                warn_parallel_uct_workers_one_once();
+            }
+            if let Some(m_max) = bu_uct_m_max {
+                if !(0.0 < m_max && m_max < 1.0) {
+                    return Err(SpecError::new(
+                        "controller.mcts_strategy.bu_uct_m_max must be in (0, 1)",
+                    ));
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -322,6 +349,7 @@ fn canonicalize_controller_spec(
             if inner.num_simulations == 0 {
                 return Err(SpecError::new("num_simulations must be >= 1"));
             }
+            validate_mc_aixi_mcts_strategy(inner.mcts_strategy)?;
             if inner.exploration_exploitation_ratio <= 0.0 {
                 return Err(SpecError::new("exploration_exploitation_ratio must be > 0"));
             }
@@ -340,6 +368,7 @@ fn canonicalize_controller_spec(
                 predictor_max_order: inner.predictor_max_order,
                 agent_horizon: inner.agent_horizon,
                 num_simulations: inner.num_simulations,
+                mcts_strategy: inner.mcts_strategy,
                 exploration_exploitation_ratio: inner.exploration_exploitation_ratio,
                 discount_gamma: inner.discount_gamma,
             }))

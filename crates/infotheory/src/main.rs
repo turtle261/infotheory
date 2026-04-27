@@ -2349,6 +2349,9 @@ mod tests {
                 "predictor_max_order": 8,
                 "agent_horizon": 1,
                 "num_simulations": 1,
+                "mcts_strategy": {
+                    "kind": "rho_uct"
+                },
                 "exploration_exploitation_ratio": 1.0,
                 "discount_gamma": 1.0
             },
@@ -2415,6 +2418,9 @@ mod tests {
                 "predictor_max_order": 8,
                 "agent_horizon": 1,
                 "num_simulations": 1,
+                "mcts_strategy": {
+                    "kind": "rho_uct"
+                },
                 "exploration_exploitation_ratio": 1.0,
                 "discount_gamma": 1.0
             },

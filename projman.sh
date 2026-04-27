@@ -174,6 +174,11 @@ cmd_bench() {
     cmd_bench_cli "$@"
     return 0
   fi
+  if [ "${1:-}" = "mcts" ]; then
+    shift
+    cmd_bench_mcts "$@"
+    return 0
+  fi
 
   suite=${INFOTHEORY_BENCH_SUITE:-two-json}
   case "${1:-}" in
@@ -216,6 +221,28 @@ cmd_bench_cli() {
   say "[bench_cli] Running hyperfine CLI comparison against baseline '$1' (build mode: ${cli_build_mode})..."
   (cd "$ROOT_DIR" && INFOTHEORY_CLI_BENCH_BUILD_MODE="$cli_build_mode" bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@" && "$ROOT_DIR/scripts/summarize_interpret.sh")
   say "[bench_cli] Done"
+}
+
+cmd_bench_mcts() {
+  [ $# -ge 1 ] || fail "Usage: ./projman.sh bench mcts <baseline-commit> [--root <artifacts-dir>]"
+  baseline_commit="$1"
+  shift
+  need_cmd cargo
+  need_cmd git
+  need_cmd python3
+  validate_build_mode
+  mcts_build_mode=$(build_mode)
+  say "[bench_mcts] Running MCTS planner regression benchmark against baseline '${baseline_commit}' (build mode: ${mcts_build_mode})..."
+  if [ "$mcts_build_mode" = "portable" ]; then
+    pf=$(portable_rustflags)
+    (cd "$ROOT_DIR" && \
+      CARGO_BUILD_RUSTFLAGS="$pf" \
+      RUSTDOCFLAGS="${RUSTDOCFLAGS:-$pf}" \
+      python3 "$ROOT_DIR/scripts/bench_mcts_regression.py" --baseline "$baseline_commit" "$@")
+  else
+    (cd "$ROOT_DIR" && python3 "$ROOT_DIR/scripts/bench_mcts_regression.py" --baseline "$baseline_commit" "$@")
+  fi
+  say "[bench_mcts] Done"
 }
 
 cmd_bench_aixi_competitors() {
@@ -344,6 +371,7 @@ Usage: ./projman.sh <command>
 Commands:
   bench [suite]  Run benchmark suite (`two-json` default, or `extra`). Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV for the selected suite by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
   bench cli <baseline-commit> [preset]  Build baseline vs dirty current trees and compare CLI workloads with hyperfine. Presets: `default` (signal-focused defaults) and `quick` (same matrix with lighter defaults). Writes artifacts under /var/tmp/infotheory_bench/.
+  bench mcts <baseline-commit> [--root <dir>]  Run Criterion planner benchmarks (`mcts_planners`) on a baseline worktree and current tree, then enforce Tranche 3.5 Part 1 regression gates (rho_uct >=5%, parallel >=10% fail).
   bench_aixi_competitors  Run reproducible Guix time-machine benchmark for Infotheory MC-AIXI (Rust+Python) vs PyAIXI and C++ MC-AIXI. Fails fast if Guix is unavailable.
   plot [suite]   Open benchmark results in the benchman TUI for the selected suite (`two-json` default, or `extra`). Not included in test_all.
   tui [suite]    Build and launch the interactive benchmark TUI (`benchman`) for the selected suite (`two-json` default, or `extra`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.

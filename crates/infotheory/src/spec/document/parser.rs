@@ -9,6 +9,8 @@ use super::{
     WarmStartExactJhControllerSpec, WarmStartExactJhTuneControllerSpec,
     parse_compression_backend_json, parse_rate_backend_json,
 };
+use crate::aixi::common::MctsStrategy;
+use std::num::NonZeroUsize;
 
 #[cfg(feature = "vm")]
 use super::{
@@ -249,6 +251,10 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                 as usize,
             num_simulations: required_u64(&value["num_simulations"], "controller.num_simulations")?
                 as usize,
+            mcts_strategy: parse_mcts_strategy(
+                value.get("mcts_strategy"),
+                "controller.mcts_strategy",
+            )?,
             exploration_exploitation_ratio: required_f64(
                 &value["exploration_exploitation_ratio"],
                 "controller.exploration_exploitation_ratio",
@@ -311,6 +317,46 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
             },
         )),
         other => Err(SpecError::new(format!("unknown controller kind '{other}'"))),
+    }
+}
+
+fn parse_mcts_strategy(value: Option<&serde_json::Value>, label: &str) -> SpecResult<MctsStrategy> {
+    // Absent field defaults to the canonical sequential planner so older
+    // documents that predate `mcts_strategy` continue to parse cleanly.
+    let Some(value) = value else {
+        return Ok(MctsStrategy::RhoUct);
+    };
+    // The canonical, serializer-emitted form is always an object with a
+    // `kind` field. Strings are not accepted: there is exactly one way to
+    // spell each strategy in the schema.
+    let Some(object) = value.as_object() else {
+        return Err(SpecError::new(format!(
+            "{label} must be an object with a 'kind' field"
+        )));
+    };
+    let kind = object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| SpecError::new(format!("{label}.kind is required")))?;
+    match kind {
+        "rho_uct" => Ok(MctsStrategy::RhoUct),
+        "parallel_uct" => {
+            let workers_raw = required_u64(&value["workers"], &format!("{label}.workers"))?;
+            let workers = NonZeroUsize::new(workers_raw as usize)
+                .ok_or_else(|| SpecError::new(format!("{label}.workers must be >= 1")))?;
+            let bu_uct_m_max = match object.get("bu_uct_m_max") {
+                Some(raw) if raw.is_null() => None,
+                Some(raw) => Some(required_f64(raw, &format!("{label}.bu_uct_m_max"))?),
+                None => None,
+            };
+            Ok(MctsStrategy::ParallelUct {
+                workers,
+                bu_uct_m_max,
+            })
+        }
+        other => Err(SpecError::new(format!(
+            "unknown MCTS strategy kind '{other}'"
+        ))),
     }
 }
 

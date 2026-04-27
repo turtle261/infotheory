@@ -1,11 +1,22 @@
 //! Tests for canonical top-level specification documents.
 
 use super::*;
-use crate::aixi::common::{DEFAULT_RANDOM_SEED, ObservationKeyMode};
+use crate::aixi::common::{
+    DEFAULT_RANDOM_SEED, MctsStrategy, ObservationKeyMode,
+    parallel_uct_workers_one_warning_count_for_tests,
+    reset_parallel_uct_workers_one_warning_for_tests,
+};
 #[cfg(feature = "backend-ctw")]
 use crate::api::CompressionBackend;
 use crate::api::RateBackend;
 use crate::spec::CanonicalJson;
+#[cfg(feature = "backend-ctw")]
+use std::num::NonZeroUsize;
+
+#[cfg(feature = "backend-ctw")]
+fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).expect("test fixture worker count must be non-zero")
+}
 
 #[cfg(feature = "backend-ctw")]
 fn sample_planner_run() -> PlannerRunSpec {
@@ -46,6 +57,21 @@ fn sample_planner_run() -> PlannerRunSpec {
             explore_gamma: 1.0,
         },
     }
+}
+
+#[cfg(feature = "backend-ctw")]
+fn sample_mc_aixi_planner_run(mcts_strategy: MctsStrategy) -> PlannerRunSpec {
+    let mut spec = sample_planner_run();
+    spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
+        predictor: RateBackend::Ctw { depth: 8 },
+        predictor_max_order: 8,
+        agent_horizon: 2,
+        num_simulations: 4,
+        mcts_strategy,
+        exploration_exploitation_ratio: 1.0,
+        discount_gamma: 0.95,
+    });
+    spec
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -175,6 +201,218 @@ fn planner_run_binary_roundtrip_is_stable() {
         }
         _ => panic!("expected planner run document"),
     }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn mc_aixi_missing_mcts_strategy_canonicalizes_to_explicit_rho_uct() {
+    let spec = sample_mc_aixi_planner_run(MctsStrategy::RhoUct);
+    let mut value = SpecDocument::PlannerRun(spec)
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    value["controller"]
+        .as_object_mut()
+        .expect("controller object")
+        .remove("mcts_strategy");
+
+    let parsed = SpecDocument::parse_json_value(&value, Path::new(".")).expect("parse");
+    let SpecDocument::PlannerRun(parsed_run) = parsed else {
+        panic!("expected planner run document");
+    };
+    let ControllerSpec::McAixi(inner) = &parsed_run.controller else {
+        panic!("expected MC-AIXI controller");
+    };
+    assert_eq!(inner.mcts_strategy, MctsStrategy::RhoUct);
+
+    let canonical = parsed_run
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    assert_eq!(
+        canonical["controller"]["mcts_strategy"],
+        serde_json::json!({ "kind": "rho_uct" })
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn mc_aixi_parallel_uct_binary_roundtrip_preserves_strategy() {
+    let spec = sample_mc_aixi_planner_run(MctsStrategy::ParallelUct {
+        workers: nz(16),
+        bu_uct_m_max: Some(0.8),
+    });
+    let expected = SpecDocument::PlannerRun(spec.clone())
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    let bytes = SpecDocument::PlannerRun(spec).to_binary();
+    let reparsed = SpecDocument::from_binary(&bytes, Path::new(".")).expect("binary parse");
+    let SpecDocument::PlannerRun(parsed_run) = reparsed else {
+        panic!("expected planner run document");
+    };
+    assert_eq!(
+        parsed_run
+            .to_canonical_json_value()
+            .expect("canonical json value"),
+        expected
+    );
+    let ControllerSpec::McAixi(inner) = parsed_run.controller else {
+        panic!("expected MC-AIXI controller");
+    };
+    assert_eq!(
+        inner.mcts_strategy,
+        MctsStrategy::ParallelUct {
+            workers: nz(16),
+            bu_uct_m_max: Some(0.8),
+        }
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn mc_aixi_parallel_uct_json_roundtrip_preserves_strategy() {
+    let spec = sample_mc_aixi_planner_run(MctsStrategy::ParallelUct {
+        workers: nz(16),
+        bu_uct_m_max: None,
+    });
+    let expected = SpecDocument::PlannerRun(spec.clone())
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    let parsed =
+        SpecDocument::parse_json_value(&expected, Path::new(".")).expect("canonical json parse");
+    let SpecDocument::PlannerRun(parsed_run) = parsed else {
+        panic!("expected planner run document");
+    };
+    assert_eq!(
+        parsed_run
+            .to_canonical_json_value()
+            .expect("canonical json value"),
+        expected
+    );
+    let ControllerSpec::McAixi(inner) = parsed_run.controller else {
+        panic!("expected MC-AIXI controller");
+    };
+    assert_eq!(
+        inner.mcts_strategy,
+        MctsStrategy::ParallelUct {
+            workers: nz(16),
+            bu_uct_m_max: None,
+        }
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn mc_aixi_parallel_uct_parser_rejects_zero_workers_in_canonical_json() {
+    // `workers == 0` is type-prevented in `MctsStrategy::ParallelUct` itself
+    // (`NonZeroUsize`), so the only surface where it can still be expressed
+    // is the document layer. Verify the canonical-JSON parser rejects it
+    // with a stable, label-prefixed error message.
+    let mut spec = sample_mc_aixi_planner_run(MctsStrategy::ParallelUct {
+        workers: nz(1),
+        bu_uct_m_max: None,
+    });
+    // Take a valid canonical JSON value, then mutate `workers` to 0.
+    let mut value = SpecDocument::PlannerRun(spec.clone())
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    value["controller"]["mcts_strategy"]["workers"] = serde_json::json!(0);
+    let err = match SpecDocument::parse_json_value(&value, Path::new(".")) {
+        Ok(_) => panic!("workers=0 must be rejected at parse time"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("controller.mcts_strategy.workers must be >= 1"),
+        "{err}"
+    );
+    // Sanity check: an unrelated mutation (validating `bu_uct_m_max`) still
+    // routes through the spec-pipeline validation layer.
+    spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
+        predictor: RateBackend::Ctw { depth: 8 },
+        predictor_max_order: 8,
+        agent_horizon: 2,
+        num_simulations: 4,
+        mcts_strategy: MctsStrategy::ParallelUct {
+            workers: nz(4),
+            bu_uct_m_max: Some(1.0),
+        },
+        exploration_exploitation_ratio: 1.0,
+        discount_gamma: 0.95,
+    });
+    let err = match spec.compile() {
+        Ok(_) => panic!("invalid bu_uct_m_max must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("controller.mcts_strategy.bu_uct_m_max must be in (0, 1)"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn mc_aixi_parallel_uct_rejects_invalid_bu_threshold() {
+    for invalid in [0.0, 1.0, -0.25, 1.25] {
+        let spec = sample_mc_aixi_planner_run(MctsStrategy::ParallelUct {
+            workers: nz(4),
+            bu_uct_m_max: Some(invalid),
+        });
+        let err = match spec.compile() {
+            Ok(_) => panic!("invalid bu_uct_m_max={invalid} must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("controller.mcts_strategy.bu_uct_m_max must be in (0, 1)"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn mc_aixi_parallel_uct_canonical_json_rejects_string_shorthand_for_rho_uct() {
+    // The canonical schema requires the object form for every strategy. The
+    // serializer always emits `{ "kind": "rho_uct" }` (or the parallel_uct
+    // object), so the parser must symmetrically refuse string shorthands.
+    let mut value = SpecDocument::PlannerRun(sample_mc_aixi_planner_run(MctsStrategy::RhoUct))
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    value["controller"]["mcts_strategy"] = serde_json::json!("rho_uct");
+    let err = match SpecDocument::parse_json_value(&value, Path::new(".")) {
+        Ok(_) => panic!("string shorthand must be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("controller.mcts_strategy must be an object with a 'kind' field"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn mc_aixi_parallel_uct_workers_one_warns_once_across_repeated_initialization() {
+    reset_parallel_uct_workers_one_warning_for_tests();
+    let spec = sample_mc_aixi_planner_run(MctsStrategy::ParallelUct {
+        workers: nz(1),
+        bu_uct_m_max: None,
+    });
+
+    spec.compile().expect("workers=1 should compile");
+    assert_eq!(
+        parallel_uct_workers_one_warning_count_for_tests(),
+        1,
+        "workers=1 should emit exactly one warning during first initialization"
+    );
+
+    spec.compile()
+        .expect("workers=1 should keep compiling on subsequent initialization");
+    assert_eq!(
+        parallel_uct_workers_one_warning_count_for_tests(),
+        1,
+        "workers=1 warning must remain one-time across repeated initialization"
+    );
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -360,6 +598,7 @@ fn planner_run_compile_rejects_mcaixi_predictors_with_zpaq_conditioning() {
         predictor_max_order: 8,
         agent_horizon: 1,
         num_simulations: 1,
+        mcts_strategy: MctsStrategy::RhoUct,
         exploration_exploitation_ratio: 1.0,
         discount_gamma: 1.0,
     });
@@ -461,6 +700,7 @@ fn sample_vm_planner_run() -> PlannerRunSpec {
             predictor_max_order: 8,
             agent_horizon: 1,
             num_simulations: 1,
+            mcts_strategy: MctsStrategy::RhoUct,
             exploration_exploitation_ratio: 1.0,
             discount_gamma: 1.0,
         }),

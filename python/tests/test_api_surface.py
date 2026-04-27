@@ -30,6 +30,7 @@ def test_expected_public_surface_symbols_present():
         "RateBackend",
         "CompressionBackend",
         "InfotheoryCtx",
+        "MctsStrategy",
         "GenerationStrategy",
         "GenerationUpdateMode",
         "GenerationConfig",

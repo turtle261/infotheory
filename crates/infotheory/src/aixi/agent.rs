@@ -1,13 +1,17 @@
 //! The core AIXI agent implementation.
 //!
 //! This module defines the `Agent` struct, which ties together a world model
-//! (Predictor) and a planner (SearchTree) to form a complete autonomous entity.
+//! (Predictor) and an explicit MCTS planner state to form a complete autonomous
+//! entity.
 
 use crate::aixi::common::{
-    Action, ObservationKeyMode, PerceptVal, RandomGenerator, Reward, RewardEncodingError, decode,
-    encode, observation_repr_from_stream, resolve_random_seed, validate_reward_encoding_bounds,
+    Action, MctsStrategy, ObservationKeyMode, PerceptVal, RandomGenerator, Reward,
+    RewardEncodingError, decode, encode, observation_repr_from_stream, resolve_random_seed,
+    validate_reward_encoding_bounds, warn_parallel_uct_workers_one_once,
 };
-use crate::aixi::mcts::{AgentSimulator, SearchTree};
+use crate::aixi::mcts::{
+    AgentSimulator, ParallelUctPlanner, ParallelUctPlannerInitError, RhoUctPlanner,
+};
 use crate::aixi::model::{Predictor, PredictorBuildError, build_mc_aixi_predictor};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
 use crate::api::{RateBackend, validate_rate_backend};
@@ -53,6 +57,8 @@ pub enum AgentError {
     ControllerKindMismatch,
     /// Predictor construction failed.
     Predictor(PredictorBuildError),
+    /// Parallel UCT planner construction failed (e.g. invalid `bu_uct_m_max`).
+    ParallelUctPlannerInit(ParallelUctPlannerInitError),
 }
 
 impl fmt::Display for AgentError {
@@ -78,6 +84,9 @@ impl fmt::Display for AgentError {
                 f.write_str("compiled planner run does not contain an MC-AIXI controller")
             }
             Self::Predictor(err) => write!(f, "{err}"),
+            Self::ParallelUctPlannerInit(err) => {
+                write!(f, "parallel_uct planner construction failed: {err}")
+            }
         }
     }
 }
@@ -89,6 +98,7 @@ impl Error for AgentError {
             Self::InvalidRateBackend(err) => Some(err),
             Self::Spec(err) => Some(err),
             Self::Predictor(err) => Some(err),
+            Self::ParallelUctPlannerInit(err) => Some(err),
             _ => None,
         }
     }
@@ -103,6 +113,12 @@ impl From<RewardEncodingError> for AgentError {
 impl From<SpecError> for AgentError {
     fn from(value: SpecError) -> Self {
         Self::Spec(value)
+    }
+}
+
+impl From<ParallelUctPlannerInitError> for AgentError {
+    fn from(value: ParallelUctPlannerInitError) -> Self {
+        Self::ParallelUctPlannerInit(value)
     }
 }
 
@@ -126,6 +142,8 @@ pub struct AgentConfig {
     pub agent_actions: usize,
     /// Number of MCTS simulations per planning step.
     pub num_simulations: usize,
+    /// Explicit MCTS strategy.
+    pub mcts_strategy: MctsStrategy,
     /// Constant governing exploration vs exploitation in UCT.
     pub exploration_exploitation_ratio: f64,
     /// Discount factor for future rewards (1.0 = undiscounted).
@@ -157,6 +175,7 @@ impl Default for AgentConfig {
             reward_bits: 1,
             agent_actions: 2,
             num_simulations: 100,
+            mcts_strategy: MctsStrategy::RhoUct,
             exploration_exploitation_ratio: 1.0,
             discount_gamma: 1.0,
             min_reward: 0,
@@ -191,6 +210,7 @@ impl AgentConfig {
                 predictor_max_order: self.rate_backend_max_order,
                 agent_horizon: self.agent_horizon,
                 num_simulations: self.num_simulations,
+                mcts_strategy: self.mcts_strategy,
                 exploration_exploitation_ratio: self.exploration_exploitation_ratio,
                 discount_gamma: self.discount_gamma,
             }),
@@ -213,6 +233,26 @@ impl AgentConfig {
         }
         if self.num_simulations == 0 {
             return Err(AgentError::NumSimulationsZero);
+        }
+        match self.mcts_strategy {
+            MctsStrategy::RhoUct => {}
+            MctsStrategy::ParallelUct {
+                workers,
+                bu_uct_m_max,
+            } => {
+                // `workers` is `NonZeroUsize`, so the `>= 1` invariant is
+                // type-enforced and no runtime check is needed here.
+                if workers.get() == 1 {
+                    warn_parallel_uct_workers_one_once();
+                }
+                if let Some(m_max) = bu_uct_m_max {
+                    if !(0.0 < m_max && m_max < 1.0) {
+                        return Err(AgentError::Spec(SpecError::new(
+                            "controller.mcts_strategy.bu_uct_m_max must be in (0, 1)",
+                        )));
+                    }
+                }
+            }
         }
         if self.exploration_exploitation_ratio <= 0.0 {
             return Err(AgentError::InvalidExplorationExploitationRatio {
@@ -258,6 +298,7 @@ struct AgentRuntimeConfig {
     reward_bits: usize,
     agent_actions: usize,
     num_simulations: usize,
+    mcts_strategy: MctsStrategy,
     exploration_exploitation_ratio: f64,
     discount_gamma: f64,
     min_reward: Reward,
@@ -270,22 +311,29 @@ impl AgentRuntimeConfig {
     fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, AgentError> {
         let interface = compiled.interface();
         let runtime = compiled.runtime();
-        let (agent_horizon, num_simulations, exploration_exploitation_ratio, discount_gamma) =
-            match compiled.controller() {
-                CompiledPlannerController::McAixi {
-                    agent_horizon,
-                    num_simulations,
-                    exploration_exploitation_ratio,
-                    discount_gamma,
-                    ..
-                } => (
-                    *agent_horizon,
-                    *num_simulations,
-                    *exploration_exploitation_ratio,
-                    *discount_gamma,
-                ),
-                _ => return Err(AgentError::ControllerKindMismatch),
-            };
+        let (
+            agent_horizon,
+            num_simulations,
+            mcts_strategy,
+            exploration_exploitation_ratio,
+            discount_gamma,
+        ) = match compiled.controller() {
+            CompiledPlannerController::McAixi {
+                agent_horizon,
+                num_simulations,
+                mcts_strategy,
+                exploration_exploitation_ratio,
+                discount_gamma,
+                ..
+            } => (
+                *agent_horizon,
+                *num_simulations,
+                *mcts_strategy,
+                *exploration_exploitation_ratio,
+                *discount_gamma,
+            ),
+            _ => return Err(AgentError::ControllerKindMismatch),
+        };
 
         Ok(Self {
             agent_horizon,
@@ -295,6 +343,7 @@ impl AgentRuntimeConfig {
             reward_bits: interface.reward_bits,
             agent_actions: interface.agent_actions,
             num_simulations,
+            mcts_strategy,
             exploration_exploitation_ratio,
             discount_gamma,
             min_reward: interface.min_reward,
@@ -302,6 +351,51 @@ impl AgentRuntimeConfig {
             reward_offset: interface.reward_offset,
             random_seed: resolve_random_seed(runtime.random_seed),
         })
+    }
+}
+
+enum PlannerState {
+    RhoUct(RhoUctPlanner),
+    ParallelUct(ParallelUctPlanner),
+}
+
+impl PlannerState {
+    /// Construct the planner backend selected by `strategy`.
+    ///
+    /// `workers == 0` is type-prevented by [`MctsStrategy::ParallelUct`]. The
+    /// only remaining failure mode is an out-of-range `bu_uct_m_max`, which
+    /// is surfaced via [`AgentError::ParallelUctPlannerInit`]. Callers must
+    /// chain this through `?` (typically from `Agent::from_compiled_config`)
+    /// rather than panicking at construction time.
+    fn new(strategy: MctsStrategy) -> Result<Self, AgentError> {
+        match strategy {
+            MctsStrategy::RhoUct => Ok(Self::RhoUct(RhoUctPlanner::new())),
+            MctsStrategy::ParallelUct {
+                workers,
+                bu_uct_m_max,
+            } => Ok(Self::ParallelUct(ParallelUctPlanner::new(
+                workers,
+                bu_uct_m_max,
+            )?)),
+        }
+    }
+
+    fn search(
+        &mut self,
+        agent: &mut dyn AgentSimulator,
+        prev_obs_stream: &[PerceptVal],
+        prev_rew: Reward,
+        prev_act: Action,
+        samples: usize,
+    ) -> Action {
+        match self {
+            Self::RhoUct(planner) => {
+                planner.search(agent, prev_obs_stream, prev_rew, prev_act, samples)
+            }
+            Self::ParallelUct(planner) => {
+                planner.search_validated(agent, prev_obs_stream, prev_rew, prev_act, samples)
+            }
+        }
     }
 }
 
@@ -314,7 +408,7 @@ pub struct Agent {
     /// The world model used for prediction.
     model: Box<dyn Predictor>,
     /// The MCTS planner, temporarily taken during search.
-    planner: Option<SearchTree>,
+    planner: Option<PlannerState>,
     /// Configuration settings.
     config: AgentRuntimeConfig,
 
@@ -377,9 +471,10 @@ impl Agent {
 
         let rng = RandomGenerator::from_seed(config.random_seed);
 
+        let planner = PlannerState::new(config.mcts_strategy)?;
         Ok(Self {
             model,
-            planner: Some(SearchTree::new()),
+            planner: Some(planner),
             config,
             age: 0,
             total_reward: 0.0,
@@ -693,6 +788,7 @@ mod tests {
             reward_bits: 3,
             agent_actions: 4,
             num_simulations: 2,
+            mcts_strategy: MctsStrategy::RhoUct,
             exploration_exploitation_ratio: 1.0,
             discount_gamma: 0.95,
             min_reward: -2,
@@ -712,7 +808,10 @@ mod tests {
         Agent {
             action_bits,
             model,
-            planner: Some(SearchTree::new()),
+            planner: Some(
+                PlannerState::new(config.mcts_strategy)
+                    .expect("test fixture mcts_strategy must be valid"),
+            ),
             config,
             age: 0,
             total_reward: 0.0,
@@ -754,6 +853,7 @@ mod tests {
             reward_bits: 1,
             agent_actions: 2,
             num_simulations: 60,
+            mcts_strategy: MctsStrategy::RhoUct,
             exploration_exploitation_ratio: 1.4,
             discount_gamma: 1.0,
             min_reward: 0,

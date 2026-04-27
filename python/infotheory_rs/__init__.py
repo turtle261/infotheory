@@ -16,8 +16,10 @@ Callback error policy:
 from . import _core as _c
 from abc import ABC, abstractmethod
 
+_REMOVED_PUBLIC_SYMBOLS = frozenset({"SearchNode"})
+
 for _name in dir(_c):
-    if not _name.startswith("_"):
+    if not _name.startswith("_") and _name not in _REMOVED_PUBLIC_SYMBOLS:
         globals()[_name] = getattr(_c, _name)
 
 

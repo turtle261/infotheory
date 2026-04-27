@@ -134,6 +134,40 @@ fn parse_observation_key_mode(
     ))
 }
 
+fn default_mcts_strategy() -> infotheory::aixi::common::MctsStrategy {
+    infotheory::aixi::common::MctsStrategy::RhoUct
+}
+
+fn resolve_mcts_strategy(
+    mcts_strategy: Option<&PyMctsStrategy>,
+) -> infotheory::aixi::common::MctsStrategy {
+    mcts_strategy
+        .map(|strategy| strategy.inner)
+        .unwrap_or_else(default_mcts_strategy)
+}
+
+fn format_mcts_strategy(strategy: infotheory::aixi::common::MctsStrategy) -> String {
+    match strategy {
+        infotheory::aixi::common::MctsStrategy::RhoUct => "MctsStrategy.rho_uct()".to_string(),
+        infotheory::aixi::common::MctsStrategy::ParallelUct {
+            workers,
+            bu_uct_m_max,
+        } => {
+            let workers = workers.get();
+            match bu_uct_m_max {
+                Some(m_max) => {
+                    format!("MctsStrategy.parallel_uct(workers={workers}, bu_uct_m_max={m_max})")
+                }
+                None => format!("MctsStrategy.parallel_uct(workers={workers})"),
+            }
+        }
+        // `MctsStrategy` is `#[non_exhaustive]` so additional variants may be
+        // introduced by future tranches without breaking this binding; surface
+        // a stable fallback that exposes only the canonical kind string.
+        other => format!("MctsStrategy(kind={:?})", other.kind_str()),
+    }
+}
+
 fn parse_generation_strategy_value(py_obj: &Bound<'_, PyAny>) -> PyResult<GenerationStrategy> {
     if let Ok(strategy) = py_obj.extract::<PyRef<'_, PyGenerationStrategy>>() {
         return Ok(strategy.inner);
@@ -3619,8 +3653,54 @@ fn run_aiqi_with_environment<'py>(
     Ok(out)
 }
 
+enum PySearchPlannerState {
+    RhoUct(infotheory::aixi::mcts::RhoUctPlanner),
+    ParallelUct(infotheory::aixi::mcts::ParallelUctPlanner),
+}
+
+impl PySearchPlannerState {
+    fn new(strategy: infotheory::aixi::common::MctsStrategy) -> PyResult<Self> {
+        match strategy {
+            infotheory::aixi::common::MctsStrategy::RhoUct => {
+                Ok(Self::RhoUct(infotheory::aixi::mcts::RhoUctPlanner::new()))
+            }
+            infotheory::aixi::common::MctsStrategy::ParallelUct {
+                workers,
+                bu_uct_m_max,
+            } => infotheory::aixi::mcts::ParallelUctPlanner::new(workers, bu_uct_m_max)
+                .map(Self::ParallelUct)
+                .map_err(py_value_error),
+            // `MctsStrategy` is `#[non_exhaustive]`. Future variants must be
+            // explicitly mapped to a concrete planner; until then, surface a
+            // stable Python `ValueError` instead of silently picking a default.
+            other => Err(PyValueError::new_err(format!(
+                "unsupported MctsStrategy variant '{}': not implemented in this binding",
+                other.kind_str()
+            ))),
+        }
+    }
+
+    fn search(
+        &mut self,
+        agent: &mut dyn infotheory::aixi::mcts::AgentSimulator,
+        prev_obs_stream: &[u64],
+        prev_rew: i64,
+        prev_act: u64,
+        num_simulations: usize,
+    ) -> PyResult<u64> {
+        match self {
+            Self::RhoUct(planner) => {
+                Ok(planner.search(agent, prev_obs_stream, prev_rew, prev_act, num_simulations))
+            }
+            Self::ParallelUct(planner) => planner
+                .search(agent, prev_obs_stream, prev_rew, prev_act, num_simulations)
+                .map_err(py_value_error),
+        }
+    }
+}
+
 #[pyfunction]
-#[pyo3(signature = (simulator, prev_obs_stream, prev_rew, prev_act, num_simulations))]
+#[pyo3(signature = (simulator, prev_obs_stream, prev_rew, prev_act, num_simulations, mcts_strategy=None))]
 fn search_with_simulator(
     py: Python<'_>,
     simulator: Py<PyAny>,
@@ -3628,18 +3708,20 @@ fn search_with_simulator(
     prev_rew: i64,
     prev_act: u64,
     num_simulations: usize,
+    mcts_strategy: Option<&PyMctsStrategy>,
 ) -> PyResult<u64> {
+    let strategy = resolve_mcts_strategy(mcts_strategy);
     py.detach(|| {
         py_try(|| {
             let mut sim = PyAgentSimulatorShim::new(simulator);
-            let mut tree = infotheory::aixi::mcts::SearchTree::new();
-            Ok(tree.search(
+            let mut planner = PySearchPlannerState::new(strategy)?;
+            planner.search(
                 &mut sim,
                 &prev_obs_stream,
                 prev_rew,
                 prev_act,
                 num_simulations,
-            ))
+            )
         })
     })
 }
@@ -3682,6 +3764,79 @@ impl PyObservationKeyMode {
     }
 }
 
+#[pyclass(name = "MctsStrategy", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyMctsStrategy {
+    inner: infotheory::aixi::common::MctsStrategy,
+}
+
+#[pymethods]
+impl PyMctsStrategy {
+    #[staticmethod]
+    fn rho_uct() -> Self {
+        Self {
+            inner: infotheory::aixi::common::MctsStrategy::RhoUct,
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (workers, bu_uct_m_max=None))]
+    fn parallel_uct(workers: usize, bu_uct_m_max: Option<f64>) -> PyResult<Self> {
+        // `workers >= 1` is type-enforced inside the Rust strategy enum via
+        // `NonZeroUsize`, so we lift the Python integer through the smart
+        // constructor here and surface a Python-friendly `ValueError` if the
+        // caller passed zero.
+        let workers = std::num::NonZeroUsize::new(workers).ok_or_else(|| {
+            PyValueError::new_err("MctsStrategy.parallel_uct(workers=...) must be >= 1")
+        })?;
+        // Construct (and validate) a planner once to ensure `bu_uct_m_max`
+        // is in range; the strategy itself only stores the parameters.
+        infotheory::aixi::mcts::ParallelUctPlanner::new(workers, bu_uct_m_max)
+            .map_err(py_value_error)?;
+        Ok(Self {
+            inner: infotheory::aixi::common::MctsStrategy::ParallelUct {
+                workers,
+                bu_uct_m_max,
+            },
+        })
+    }
+
+    #[getter]
+    fn kind(&self) -> &'static str {
+        self.inner.kind_str()
+    }
+
+    #[getter]
+    fn workers(&self) -> Option<usize> {
+        match self.inner {
+            infotheory::aixi::common::MctsStrategy::RhoUct => None,
+            infotheory::aixi::common::MctsStrategy::ParallelUct { workers, .. } => {
+                Some(workers.get())
+            }
+            // `MctsStrategy` is `#[non_exhaustive]`; unknown future variants
+            // expose `None` rather than guessing a worker count.
+            _ => None,
+        }
+    }
+
+    #[getter]
+    fn bu_uct_m_max(&self) -> Option<f64> {
+        match self.inner {
+            infotheory::aixi::common::MctsStrategy::RhoUct => None,
+            infotheory::aixi::common::MctsStrategy::ParallelUct { bu_uct_m_max, .. } => {
+                bu_uct_m_max
+            }
+            // `MctsStrategy` is `#[non_exhaustive]`; unknown future variants
+            // expose `None` rather than fabricating a threshold.
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format_mcts_strategy(self.inner)
+    }
+}
+
 #[pyclass(name = "AgentConfig", from_py_object)]
 #[derive(Clone)]
 struct PyAgentConfig {
@@ -3707,6 +3862,7 @@ impl PyAgentConfig {
         reward_bits=8,
         agent_actions=2,
         num_simulations=256,
+        mcts_strategy=None,
         exploration_exploitation_ratio=1.41,
         discount_gamma=1.0,
         min_reward=-128,
@@ -3724,6 +3880,7 @@ impl PyAgentConfig {
         reward_bits: usize,
         agent_actions: usize,
         num_simulations: usize,
+        mcts_strategy: Option<&PyMctsStrategy>,
         exploration_exploitation_ratio: f64,
         discount_gamma: f64,
         min_reward: i64,
@@ -3743,6 +3900,7 @@ impl PyAgentConfig {
         inner.reward_bits = reward_bits;
         inner.agent_actions = agent_actions;
         inner.num_simulations = num_simulations;
+        inner.mcts_strategy = resolve_mcts_strategy(mcts_strategy);
         inner.exploration_exploitation_ratio = exploration_exploitation_ratio;
         inner.discount_gamma = discount_gamma;
         inner.min_reward = min_reward;
@@ -4152,38 +4310,36 @@ impl PyRwkvPredictor {
     }
 }
 
-#[pyclass(name = "SearchNode")]
-struct PySearchNode {
-    inner: infotheory::aixi::mcts::SearchNode,
-}
-
-#[pymethods]
-impl PySearchNode {
-    #[new]
-    #[pyo3(signature = (is_chance_node=false))]
-    fn new(is_chance_node: bool) -> Self {
-        Self {
-            inner: infotheory::aixi::mcts::SearchNode::new(is_chance_node),
-        }
-    }
-
-    fn best_action(&self, agent: &mut PyAgent) -> u64 {
-        self.inner.best_action(&mut agent.inner)
-    }
-}
-
 #[pyclass(name = "SearchTree")]
 struct PySearchTree {
-    inner: infotheory::aixi::mcts::SearchTree,
+    strategy: infotheory::aixi::common::MctsStrategy,
+    inner: PySearchPlannerState,
 }
 
 #[pymethods]
 impl PySearchTree {
     #[new]
-    fn new() -> Self {
-        Self {
-            inner: infotheory::aixi::mcts::SearchTree::new(),
+    #[pyo3(signature = (mcts_strategy=None))]
+    fn new(mcts_strategy: Option<&PyMctsStrategy>) -> PyResult<Self> {
+        let strategy = resolve_mcts_strategy(mcts_strategy);
+        Ok(Self {
+            strategy,
+            inner: PySearchPlannerState::new(strategy)?,
+        })
+    }
+
+    #[getter]
+    fn mcts_strategy(&self) -> PyMctsStrategy {
+        PyMctsStrategy {
+            inner: self.strategy,
         }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SearchTree(mcts_strategy={})",
+            format_mcts_strategy(self.strategy)
+        )
     }
 
     fn search(
@@ -4193,7 +4349,7 @@ impl PySearchTree {
         prev_rew: i64,
         prev_act: u64,
         num_simulations: usize,
-    ) -> u64 {
+    ) -> PyResult<u64> {
         self.inner.search(
             &mut agent.inner,
             &prev_obs_stream,
@@ -4212,7 +4368,7 @@ fn new_gameengine_builtin(
     let resolved_seed = infotheory::aixi::common::resolve_random_seed(random_seed);
     let env =
         infotheory::aixi::gameengine::build_builtin_environment_with_seed(builtin, resolved_seed)
-            .map_err(PyRuntimeError::new_err)?;
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
     Ok(env)
 }
 
@@ -4318,7 +4474,7 @@ impl CoinFlipEnv {
                 head_denominator,
                 seed,
             )
-            .map_err(PyRuntimeError::new_err)?,
+            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?,
         })
     }
 
@@ -4656,6 +4812,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCalibrationContextKind>()?;
     m.add_class::<PyNcdVariant>()?;
     m.add_class::<PyObservationKeyMode>()?;
+    m.add_class::<PyMctsStrategy>()?;
     m.add_class::<PyRandomGenerator>()?;
     m.add_class::<PyAgentConfig>()?;
     m.add_class::<PyAiqiConfig>()?;
@@ -4671,7 +4828,6 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyZpaqPredictor>()?;
     #[cfg(feature = "backend-rwkv")]
     m.add_class::<PyRwkvPredictor>()?;
-    m.add_class::<PySearchNode>()?;
     m.add_class::<PySearchTree>()?;
     #[cfg(feature = "aixi-gameengine")]
     m.add_class::<CoinFlipEnv>()?;
@@ -4974,5 +5130,22 @@ mod tests {
             }
             _ => panic!("expected rate backend"),
         }
+    }
+
+    #[cfg(all(feature = "aixi-gameengine", not(feature = "aixi-gameengine-physics")))]
+    #[test]
+    fn new_gameengine_builtin_maps_missing_feature_to_py_runtime_error() {
+        with_python_initialized(|_py| {
+            let err = match new_gameengine_builtin(
+                infotheory::spec::BuiltinEnvironmentSpec::Platformer,
+                Some(0),
+            ) {
+                Ok(_) => panic!("missing optional builtin feature must surface as a Python error"),
+                Err(err) => err,
+            };
+            let rendered = err.to_string();
+            assert!(rendered.contains("RuntimeError"));
+            assert!(rendered.contains("requires feature 'aixi-gameengine-physics'"));
+        });
     }
 }

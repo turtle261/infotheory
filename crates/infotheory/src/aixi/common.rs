@@ -2,6 +2,10 @@
 
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroUsize;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Represents a single bit (0 or 1) in the agent's interaction history.
 pub type Symbol = bool;
@@ -42,6 +46,79 @@ pub enum ObservationKeyMode {
     Last,
     /// Hash the entire observation stream into a single key.
     StreamHash,
+}
+
+/// Explicit MC-AIXI Monte Carlo Tree Search strategy.
+///
+/// `rho_uct` is the default sequential planner described in
+/// "A Monte-Carlo AIXI Approximation". `parallel_uct` enables an explicit
+/// parallel planner family whose exact behavior is controlled by the worker
+/// count and optional BU-UCT threshold.
+///
+/// The `#[non_exhaustive]` attribute reserves room for additional strategy
+/// variants (e.g. the supplementary BU-UCT scheduler) without breaking
+/// downstream `match` arms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum MctsStrategy {
+    /// Sequential \rhoUCT / UCT planning.
+    RhoUct,
+    /// Explicit parallel UCT planning.
+    ParallelUct {
+        /// Number of logical rollout workers (type-enforced non-zero).
+        workers: NonZeroUsize,
+        /// Optional BU-UCT threshold parameter `m_max`.
+        ///
+        /// `None` selects WU-UCT behavior. `Some(x)` enables BU-UCT
+        /// thresholding with `x in (0, 1)`.
+        bu_uct_m_max: Option<f64>,
+    },
+}
+
+impl MctsStrategy {
+    /// Stable canonical document/API kind string for this planner strategy.
+    pub const fn kind_str(self) -> &'static str {
+        match self {
+            Self::RhoUct => "rho_uct",
+            Self::ParallelUct { .. } => "parallel_uct",
+        }
+    }
+}
+
+impl Default for MctsStrategy {
+    fn default() -> Self {
+        Self::RhoUct
+    }
+}
+
+static PARALLEL_UCT_WORKERS_ONE_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static PARALLEL_UCT_WORKERS_ONE_WARNING_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Emit the `parallel_uct(workers = 1)` warning at most once per process.
+pub(crate) fn warn_parallel_uct_workers_one_once() -> bool {
+    let emitted = PARALLEL_UCT_WORKERS_ONE_WARNING_EMITTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+    if emitted {
+        #[cfg(test)]
+        PARALLEL_UCT_WORKERS_ONE_WARNING_COUNT.fetch_add(1, Ordering::SeqCst);
+        eprintln!(
+            "Warning: MC-AIXI parallel_uct configured with workers=1; prefer workers >= 2 or switch to rho_uct."
+        );
+    }
+    emitted
+}
+
+#[cfg(test)]
+pub(crate) fn reset_parallel_uct_workers_one_warning_for_tests() {
+    PARALLEL_UCT_WORKERS_ONE_WARNING_EMITTED.store(false, Ordering::SeqCst);
+    PARALLEL_UCT_WORKERS_ONE_WARNING_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn parallel_uct_workers_one_warning_count_for_tests() -> usize {
+    PARALLEL_UCT_WORKERS_ONE_WARNING_COUNT.load(Ordering::SeqCst)
 }
 
 /// Compute the minimum number of bits required to encode a finite cardinality.
@@ -463,6 +540,14 @@ mod tests {
         for _ in 0..32 {
             assert_eq!(via_new.next_u64(), via_seed.next_u64());
         }
+    }
+
+    #[test]
+    fn parallel_uct_workers_one_warning_emits_once() {
+        reset_parallel_uct_workers_one_warning_for_tests();
+        assert!(warn_parallel_uct_workers_one_once());
+        assert!(!warn_parallel_uct_workers_one_once());
+        assert_eq!(parallel_uct_workers_one_warning_count_for_tests(), 1);
     }
 
     #[test]

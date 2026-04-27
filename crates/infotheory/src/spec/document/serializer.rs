@@ -6,6 +6,7 @@ use super::{
     TuneControllerSpec, TuneParameterRangeSpec, TuneSpec, compression_backend_to_json_value,
     rate_backend_to_json_value,
 };
+use crate::aixi::common::MctsStrategy;
 
 #[cfg(feature = "vm")]
 use super::{
@@ -134,6 +135,7 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
             "predictor_max_order": inner.predictor_max_order,
             "agent_horizon": inner.agent_horizon,
             "num_simulations": inner.num_simulations,
+            "mcts_strategy": mcts_strategy_to_json_value(inner.mcts_strategy),
             "exploration_exploitation_ratio": inner.exploration_exploitation_ratio,
             "discount_gamma": inner.discount_gamma,
         })),
@@ -158,6 +160,22 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
             "teacher_dataset_asset": inner.teacher_dataset_asset,
             "planner_simulations_per_step": inner.planner_simulations_per_step,
         })),
+    }
+}
+
+fn mcts_strategy_to_json_value(strategy: MctsStrategy) -> serde_json::Value {
+    match strategy {
+        MctsStrategy::RhoUct => serde_json::json!({
+            "kind": "rho_uct",
+        }),
+        MctsStrategy::ParallelUct {
+            workers,
+            bu_uct_m_max,
+        } => serde_json::json!({
+            "kind": "parallel_uct",
+            "workers": workers.get(),
+            "bu_uct_m_max": bu_uct_m_max,
+        }),
     }
 }
 

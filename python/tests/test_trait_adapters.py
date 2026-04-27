@@ -1,6 +1,7 @@
 import infotheory_rs as ait
 import os
 import pathlib
+import pytest
 import subprocess
 import sys
 
@@ -102,6 +103,11 @@ class DummySimWithKeyMode(DummySim):
 
     def observation_key_mode(self):
         return self._mode
+
+
+class ZeroHorizonSim(DummySim):
+    def horizon(self) -> int:
+        return 0
 
 
 class RunnerTupleEnv(ait.EnvironmentABC):
@@ -214,7 +220,7 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[2]
 
 
-def test_search_with_simulator_respects_rayon_num_threads_env():
+def test_search_with_simulator_defaults_to_sequential_rho_uct():
     code = """
 import infotheory_rs as ait
 class ProbeSim(ait.AgentSimulatorABC):
@@ -254,7 +260,66 @@ print(sim.seed_clone_calls)
         text=True,
     )
     assert proc.returncode == 0, proc.stderr
+    assert int(proc.stdout.strip()) == 0
+
+
+def test_search_with_simulator_parallel_uct_uses_seeded_clones():
+    code = """
+import infotheory_rs as ait
+class ProbeSim(ait.AgentSimulatorABC):
+    def __init__(self):
+        self._rng = ait.RandomGenerator()
+        self._obs = 0
+        self.seed_clone_calls = 0
+    def get_num_actions(self) -> int: return 2
+    def get_num_observation_bits(self) -> int: return 1
+    def get_num_reward_bits(self) -> int: return 1
+    def horizon(self) -> int: return 2
+    def max_reward(self) -> int: return 1
+    def min_reward(self) -> int: return 0
+    def model_update_action(self, action: int): self._obs = action & 1
+    def gen_percept_and_update(self, bits: int) -> int: return self._obs if bits == 1 else 0
+    def model_revert(self, steps: int): return None
+    def gen_range(self, end: int) -> int: return self._rng.gen_range(end)
+    def gen_f64(self) -> float: return self._rng.gen_f64()
+    def boxed_clone_with_seed(self, seed: int):
+        self.seed_clone_calls += 1
+        c = ProbeSim()
+        c._rng = self._rng.fork_with(seed)
+        c._obs = self._obs
+        return c
+sim = ProbeSim()
+ait.search_with_simulator(
+    sim,
+    [0],
+    0,
+    0,
+    8,
+    mcts_strategy=ait.MctsStrategy.parallel_uct(2),
+)
+print(sim.seed_clone_calls)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_repo_root(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
     assert int(proc.stdout.strip()) >= 1
+
+
+def test_search_with_simulator_parallel_uct_rejects_zero_horizon():
+    with pytest.raises(ValueError, match=r"parallel_uct requires agent.horizon\(\) >= 1"):
+        ait.search_with_simulator(
+            ZeroHorizonSim(),
+            [0],
+            0,
+            0,
+            1,
+            mcts_strategy=ait.MctsStrategy.parallel_uct(2),
+        )
 
 
 def test_predictor_callback_exception_is_fatal():

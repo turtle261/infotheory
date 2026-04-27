@@ -121,6 +121,29 @@ def test_agent_config_and_agent_smoke():
     assert action in (0, 1)
 
 
+@pytest.mark.parametrize(
+    "mcts_strategy",
+    [ait.MctsStrategy.parallel_uct(2), ait.MctsStrategy.parallel_uct(2, 0.8)],
+)
+def test_agent_config_and_agent_support_explicit_parallel_mcts(mcts_strategy):
+    cfg = ait.AgentConfig(
+        rate_backend=ait.RateBackend.ctw(8),
+        agent_horizon=2,
+        observation_bits=1,
+        observation_stream_len=1,
+        reward_bits=1,
+        agent_actions=2,
+        num_simulations=8,
+        mcts_strategy=mcts_strategy,
+        min_reward=0,
+        max_reward=1,
+        reward_offset=0,
+    )
+    agent = ait.Agent(cfg)
+    action = agent.get_planned_action([0], 0, 0)
+    assert action in (0, 1)
+
+
 def test_aiqi_config_and_agent_smoke():
     cfg = ait.AiqiConfig(
         rate_backend=ait.RateBackend.ctw(8),

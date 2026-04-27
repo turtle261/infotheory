@@ -1,6 +1,6 @@
 //! Canonical top-level specification document schema types.
 
-use crate::aixi::common::ObservationKeyMode;
+use crate::aixi::common::{MctsStrategy, ObservationKeyMode};
 use crate::api::{CompressionBackend, RateBackend};
 use crate::spec::core::{
     AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
@@ -341,6 +341,8 @@ pub struct McAixiControllerSpec {
     pub agent_horizon: usize,
     /// Number of simulations per planning step.
     pub num_simulations: usize,
+    /// Explicit MCTS strategy used by the planner.
+    pub mcts_strategy: MctsStrategy,
     /// UCT exploration constant.
     pub exploration_exploitation_ratio: f64,
     /// Reward discount factor.
@@ -613,6 +615,8 @@ pub enum CompiledPlannerController {
         agent_horizon: usize,
         /// Number of simulations per planning step.
         num_simulations: usize,
+        /// Explicit MCTS strategy used by the planner.
+        mcts_strategy: MctsStrategy,
         /// UCT exploration constant.
         exploration_exploitation_ratio: f64,
         /// Reward discount factor.

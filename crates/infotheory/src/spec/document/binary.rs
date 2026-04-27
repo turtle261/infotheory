@@ -988,6 +988,7 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
             push_i64(out, inner.predictor_max_order);
             push_u64(out, inner.agent_horizon as u64);
             push_u64(out, inner.num_simulations as u64);
+            encode_mcts_strategy(out, inner.mcts_strategy);
             push_f64(out, inner.exploration_exploitation_ratio);
             push_f64(out, inner.discount_gamma);
         }
@@ -1022,6 +1023,7 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
             predictor_max_order: cursor.read_i64()?,
             agent_horizon: cursor.read_u64()? as usize,
             num_simulations: cursor.read_u64()? as usize,
+            mcts_strategy: decode_mcts_strategy(cursor)?,
             exploration_exploitation_ratio: cursor.read_f64()?,
             discount_gamma: cursor.read_f64()?,
         })),
@@ -1049,6 +1051,40 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
             },
         )),
         tag => Err(SpecError::new(format!("unknown controller tag '{tag}'"))),
+    }
+}
+
+fn encode_mcts_strategy(out: &mut Vec<u8>, strategy: crate::aixi::common::MctsStrategy) {
+    use crate::aixi::common::MctsStrategy;
+    match strategy {
+        MctsStrategy::RhoUct => out.push(0),
+        MctsStrategy::ParallelUct {
+            workers,
+            bu_uct_m_max,
+        } => {
+            out.push(1);
+            push_u64(out, workers.get() as u64);
+            push_option_f64(out, bu_uct_m_max);
+        }
+    }
+}
+
+fn decode_mcts_strategy(cursor: &mut Cursor<'_>) -> SpecResult<crate::aixi::common::MctsStrategy> {
+    use crate::aixi::common::MctsStrategy;
+    use std::num::NonZeroUsize;
+    match cursor.read_u8()? {
+        0 => Ok(MctsStrategy::RhoUct),
+        1 => {
+            let workers_raw = cursor.read_u64()?;
+            let workers = NonZeroUsize::new(workers_raw as usize).ok_or_else(|| {
+                SpecError::new("binary mcts_strategy parallel_uct workers must be >= 1")
+            })?;
+            Ok(MctsStrategy::ParallelUct {
+                workers,
+                bu_uct_m_max: cursor.read_option_f64()?,
+            })
+        }
+        tag => Err(SpecError::new(format!("unknown MCTS strategy tag '{tag}'"))),
     }
 }
 
