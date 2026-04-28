@@ -2,11 +2,13 @@ use super::*;
 
 #[cfg(feature = "backend-rosa")]
 pub(super) fn build_predictor_rosa(
-    _backend: &CompiledRateBackend,
-    max_order: i64,
+    backend: &CompiledRateBackend,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let mut model = RosaPlus::new(max_order, false, 0, 42);
+    let crate::spec::core::RateBackendPlan::RosaPlus { max_order } = backend.plan() else {
+        unreachable!("rosa kernel used with non-rosa plan")
+    };
+    let mut model = RosaPlus::new(*max_order, false, 0, 42);
     model.build_lm_full_bytes_no_finalize_endpos();
     Ok(crate::mixture::RateBackendPredictor::Rosa {
         model,
@@ -19,7 +21,6 @@ pub(super) fn build_predictor_rosa(
 #[cfg(not(feature = "backend-rosa"))]
 pub(super) fn build_predictor_rosa(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::RosaPlus))
@@ -28,7 +29,6 @@ pub(super) fn build_predictor_rosa(
 #[cfg(feature = "backend-match")]
 pub(super) fn build_predictor_match(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::Match {
@@ -56,7 +56,6 @@ pub(super) fn build_predictor_match(
 #[cfg(not(feature = "backend-match"))]
 pub(super) fn build_predictor_match(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Match))
@@ -65,7 +64,6 @@ pub(super) fn build_predictor_match(
 #[cfg(feature = "backend-match")]
 pub(super) fn build_predictor_sparse_match(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::SparseMatch {
@@ -97,7 +95,6 @@ pub(super) fn build_predictor_sparse_match(
 #[cfg(not(feature = "backend-match"))]
 pub(super) fn build_predictor_sparse_match(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::SparseMatch))
@@ -106,7 +103,6 @@ pub(super) fn build_predictor_sparse_match(
 #[cfg(feature = "backend-ppmd")]
 pub(super) fn build_predictor_ppmd(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::Ppmd { order, memory_mb } = backend.plan() else {
@@ -121,7 +117,6 @@ pub(super) fn build_predictor_ppmd(
 #[cfg(not(feature = "backend-ppmd"))]
 pub(super) fn build_predictor_ppmd(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Ppmd))
@@ -130,7 +125,6 @@ pub(super) fn build_predictor_ppmd(
 #[cfg(feature = "backend-sequitur")]
 pub(super) fn build_predictor_sequitur(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::Sequitur { context_bytes } = backend.plan() else {
@@ -145,7 +139,6 @@ pub(super) fn build_predictor_sequitur(
 #[cfg(not(feature = "backend-sequitur"))]
 pub(super) fn build_predictor_sequitur(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Sequitur))
@@ -154,7 +147,6 @@ pub(super) fn build_predictor_sequitur(
 #[cfg(feature = "backend-ctw")]
 pub(super) fn build_predictor_ctw(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
@@ -171,7 +163,6 @@ pub(super) fn build_predictor_ctw(
 #[cfg(not(feature = "backend-ctw"))]
 pub(super) fn build_predictor_ctw(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Ctw))
@@ -180,7 +171,6 @@ pub(super) fn build_predictor_ctw(
 #[cfg(feature = "backend-ctw")]
 pub(super) fn build_predictor_fac_ctw(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::FacCtw {
@@ -204,7 +194,6 @@ pub(super) fn build_predictor_fac_ctw(
 #[cfg(not(feature = "backend-ctw"))]
 pub(super) fn build_predictor_fac_ctw(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::FacCtw))
@@ -213,7 +202,6 @@ pub(super) fn build_predictor_fac_ctw(
 #[cfg(feature = "backend-rwkv")]
 pub(super) fn build_predictor_rwkv(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::Rwkv7 { parsed_method, .. } = backend.plan() else {
@@ -233,7 +221,6 @@ pub(super) fn build_predictor_rwkv(
 #[cfg(not(feature = "backend-rwkv"))]
 pub(super) fn build_predictor_rwkv(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Rwkv7))
@@ -242,7 +229,6 @@ pub(super) fn build_predictor_rwkv(
 #[cfg(feature = "backend-mamba")]
 pub(super) fn build_predictor_mamba(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::Mamba { parsed_method, .. } = backend.plan() else {
@@ -266,7 +252,6 @@ pub(super) fn build_predictor_mamba(
 #[cfg(not(feature = "backend-mamba"))]
 pub(super) fn build_predictor_mamba(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Mamba))
@@ -275,7 +260,6 @@ pub(super) fn build_predictor_mamba(
 #[cfg(feature = "backend-zpaq")]
 pub(super) fn build_predictor_zpaq(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
@@ -289,7 +273,6 @@ pub(super) fn build_predictor_zpaq(
 #[cfg(not(feature = "backend-zpaq"))]
 pub(super) fn build_predictor_zpaq(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Zpaq))
@@ -298,10 +281,9 @@ pub(super) fn build_predictor_zpaq(
 #[cfg(feature = "backend-mixture")]
 pub(super) fn build_predictor_mixture(
     backend: &CompiledRateBackend,
-    max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
-    let experts = crate::mixture::expert_configs_from_compiled_mixture(backend, max_order)?;
+    let experts = crate::mixture::expert_configs_from_compiled_mixture(backend)?;
     let runtime = crate::mixture::build_mixture_runtime_from_compiled(backend, &experts)
         .map_err(|e| format!("MixtureSpec invalid: {e}"))?;
     Ok(crate::mixture::RateBackendPredictor::Mixture { runtime })
@@ -310,7 +292,6 @@ pub(super) fn build_predictor_mixture(
 #[cfg(not(feature = "backend-mixture"))]
 pub(super) fn build_predictor_mixture(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Mixture))
@@ -319,7 +300,6 @@ pub(super) fn build_predictor_mixture(
 #[cfg(feature = "backend-particle")]
 pub(super) fn build_predictor_particle(
     backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
@@ -333,7 +313,6 @@ pub(super) fn build_predictor_particle(
 #[cfg(not(feature = "backend-particle"))]
 pub(super) fn build_predictor_particle(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Particle))
@@ -342,7 +321,6 @@ pub(super) fn build_predictor_particle(
 #[cfg(feature = "backend-calibrated")]
 pub(super) fn build_predictor_calibrated(
     backend: &CompiledRateBackend,
-    max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     let crate::spec::core::RateBackendPlan::Calibrated {
@@ -360,7 +338,6 @@ pub(super) fn build_predictor_calibrated(
     Ok(crate::mixture::RateBackendPredictor::Calibrated {
         base: Box::new(build_rate_backend_predictor_via_kernel(
             &base_backend,
-            max_order,
             min_prob,
         )?),
         core: CalibratorCore::new(*context, *bins, *learning_rate, *bias_clip),
@@ -373,7 +350,6 @@ pub(super) fn build_predictor_calibrated(
 #[cfg(not(feature = "backend-calibrated"))]
 pub(super) fn build_predictor_calibrated(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
     _min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     Err(rate_backend_feature_error(RateBackendKind::Calibrated))

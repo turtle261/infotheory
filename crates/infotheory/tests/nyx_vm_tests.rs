@@ -192,7 +192,6 @@ fn test_reward_policy_pattern() {
 fn test_reward_shaping_entropy() {
     let shaping = NyxRewardShaping::EntropyReduction {
         baseline_bytes: vec![0u8; 100],
-        max_order: 8,
         scale: 1.0,
         crash_bonus: None,
         timeout_bonus: None,
@@ -204,7 +203,6 @@ fn test_reward_shaping_entropy() {
 #[test]
 fn test_reward_shaping_trace() {
     let shaping = NyxRewardShaping::TraceEntropy {
-        max_order: 4,
         scale: 2.0,
         normalize: true,
     };
@@ -234,7 +232,6 @@ fn test_action_filter() {
     filter.min_intrinsic_dependence = Some(0.1);
     filter.min_novelty = Some(0.5);
     filter.novelty_prior = Some(vec![0, 1, 2, 3]);
-    filter.max_order = 8;
     filter.reject_reward = Some(-10);
 
     assert_eq!(filter.min_entropy, Some(1.0));
@@ -357,7 +354,6 @@ fn test_fuzz_mutator_variants() {
     assert_eq!(mutators.len(), 7);
 }
 
-// ============================================================================
 // Information-Theoretic Properties Tests
 // ============================================================================
 
@@ -365,7 +361,7 @@ fn test_fuzz_mutator_variants() {
 mod info_theory_properties {
     #[allow(unused_imports)]
     use super::*;
-    use infotheory::api::marginal_entropy_bytes;
+    use infotheory::api::empirical_entropy_bytes;
     #[cfg(feature = "backend-rosa")]
     use infotheory::api::try_entropy_rate_bytes;
 
@@ -373,7 +369,7 @@ mod info_theory_properties {
     fn test_entropy_bounds() {
         // Maximum entropy for bytes is 8 bits
         let uniform_data: Vec<u8> = (0..=255).cycle().take(1024).collect();
-        let h = marginal_entropy_bytes(&uniform_data);
+        let h = empirical_entropy_bytes(&uniform_data);
         assert!(h <= 8.0 + 1e-6, "Entropy should not exceed 8 bits per byte");
         assert!(h >= 0.0, "Entropy should be non-negative");
     }
@@ -381,24 +377,24 @@ mod info_theory_properties {
     #[test]
     fn test_constant_data_low_entropy() {
         let constant_data = vec![42u8; 1000];
-        let h = marginal_entropy_bytes(&constant_data);
+        let h = empirical_entropy_bytes(&constant_data);
         assert!(
             h < 0.01,
-            "Constant data should have near-zero marginal entropy"
+            "Constant data should have near-zero empirical entropy"
         );
     }
 
     #[cfg(feature = "backend-rosa")]
     #[test]
-    fn test_rate_entropy_less_than_marginal() {
-        // For structured data, H_rate <= H_marginal
+    fn test_rate_entropy_less_than_empirical() {
+        // For structured data, H_rate <= H_empirical
         let pattern = b"ABCABCABCABCABCABC";
-        let h_marg = marginal_entropy_bytes(pattern);
-        let h_rate = try_entropy_rate_bytes(pattern, 8).expect("entropy rate");
+        let h_empirical = empirical_entropy_bytes(pattern);
+        let h_rate = try_entropy_rate_bytes(pattern).expect("entropy rate");
 
         assert!(
-            h_rate <= h_marg + 1e-6,
-            "Entropy rate should not exceed marginal entropy for patterned data"
+            h_rate <= h_empirical + 1e-6,
+            "Rate entropy should not exceed empirical entropy for structured data"
         );
     }
 }
@@ -606,7 +602,6 @@ fn test_complete_experiment_config() {
     config.reward_bits = 8;
     config.reward_policy = NyxRewardPolicy::FromGuest;
     config.reward_shaping = Some(NyxRewardShaping::TraceEntropy {
-        max_order: 8,
         scale: 1.0,
         normalize: true,
     });
@@ -616,7 +611,6 @@ fn test_complete_experiment_config() {
     ]);
     let mut action_filter = NyxActionFilter::new();
     action_filter.min_entropy = Some(0.5);
-    action_filter.max_order = 4;
     action_filter.reject_reward = Some(-1);
     config.action_filter = Some(action_filter);
     config.protocol = NyxProtocolConfig::default();

@@ -246,7 +246,6 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                 base_dir,
                 crate::api::MAX_MIXTURE_NESTING,
             )?,
-            predictor_max_order: value["predictor_max_order"].as_i64().unwrap_or(20),
             agent_horizon: required_u64(&value["agent_horizon"], "controller.agent_horizon")?
                 as usize,
             num_simulations: required_u64(&value["num_simulations"], "controller.num_simulations")?
@@ -268,7 +267,6 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     base_dir,
                     crate::api::MAX_MIXTURE_NESTING,
                 )?,
-                predictor_max_order: value["predictor_max_order"].as_i64().unwrap_or(20),
                 discount_gamma: required_f64(
                     &value["discount_gamma"],
                     "controller.discount_gamma",
@@ -297,7 +295,6 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     base_dir,
                     crate::api::MAX_MIXTURE_NESTING,
                 )?,
-                predictor_max_order: value["predictor_max_order"].as_i64().unwrap_or(20),
                 return_horizon: required_u64(&value["return_horizon"], "controller.return_horizon")?
                     as usize,
                 return_bins: required_u64(&value["return_bins"], "controller.return_bins")?
@@ -504,13 +501,11 @@ fn parse_optional_vm_reward_shaping(
                 &value["baseline_asset"],
                 "environment.reward_shaping.baseline_asset",
             )?,
-            max_order: value["max_order"].as_i64().unwrap_or(8),
             scale: value["scale"].as_f64().unwrap_or(1.0),
             crash_bonus: value["crash_bonus"].as_i64(),
             timeout_bonus: value["timeout_bonus"].as_i64(),
         },
         "trace_entropy" => VmRewardShapingSpec::TraceEntropy {
-            max_order: value["max_order"].as_i64().unwrap_or(8),
             scale: value["scale"].as_f64().unwrap_or(1.0),
             normalize: value["normalize"].as_bool().unwrap_or(false),
         },
@@ -583,7 +578,6 @@ fn parse_optional_vm_action_filter(
         min_intrinsic_dependence: value["min_intrinsic_dependence"].as_f64(),
         min_novelty: value["min_novelty"].as_f64(),
         novelty_prior_asset: optional_string(&value["novelty_prior_asset"]),
-        max_order: value["max_order"].as_i64().unwrap_or(8),
         reject_reward: value["reject_reward"].as_i64(),
     }))
 }

@@ -87,7 +87,6 @@ fn batch_metrics_output_hash_stability() {
             serde_json::json!({
                 "op": "metrics",
                 "text": "abracadabra",
-                "max_order": 3,
             })
         )
         .expect("failed to write payload");

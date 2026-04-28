@@ -1,7 +1,7 @@
 [
   {
     "name": "metrics abracadabra",
-    "input": {"op":"metrics","text":"abracadabra","max_order":3},
+    "input": {"op":"metrics","text":"abracadabra"},
     "expected": {"h0":2.040373,"h_rate":1.763318,"id":0.135787,"len":11},
     "float_tolerance": 1e-6
   },
@@ -13,19 +13,19 @@
   },
   {
     "name": "rosa distance abracadabra alakazam",
-    "input": {"op":"rosa_dist","text1":"abracadabra","text2":"alakazam","max_order":3},
-    "expected": {"rosa_dist":0.360834},
+    "input": {"op":"rosa_dist","text1":"abracadabra","text2":"alakazam"},
+    "expected": {"rosa_dist":1.000000},
     "float_tolerance": 1e-6
   },
   {
     "name": "cross entropy abracadabra alakazam",
-    "input": {"op":"cross_entropy","text_x":"abracadabra","text_y":"alakazam","max_order":3},
+    "input": {"op":"cross_entropy","text_x":"abracadabra","text_y":"alakazam"},
     "expected": {"cross_entropy":1.778111},
     "float_tolerance": 1e-6
   },
   {
     "name": "batch metrics triple",
-    "input": {"op":"batch_metrics","texts":["abracadabra","alakazam",""],"max_order":3},
+    "input": {"op":"batch_metrics","texts":["abracadabra","alakazam",""]},
     "expected": {
       "results": [
         {"h0":2.040373,"h_rate":1.763318,"id":0.135787,"len":11},
@@ -50,11 +50,11 @@
   },
   {
     "name": "rosa matrix trio",
-    "input": {"op":"rosa_matrix","texts":["abracadabra","alakazam","xyzxyz"],"max_order":3},
+    "input": {"op":"rosa_matrix","texts":["abracadabra","alakazam","xyzxyz"]},
     "expected": {
       "matrix": [
-        [0.000000,0.360834,1.000000],
-        [0.360834,0.000000,1.000000],
+        [0.000000,1.000000,1.000000],
+        [1.000000,0.000000,1.000000],
         [1.000000,1.000000,0.000000]
       ],
       "n": 3

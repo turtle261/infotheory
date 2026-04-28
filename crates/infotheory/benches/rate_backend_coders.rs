@@ -71,7 +71,10 @@ fn compile_rate_backend(backend: RateBackend) -> CompiledRateBackend {
 
 fn individual_backends() -> Vec<(&'static str, CompiledRateBackend)> {
     vec![
-        ("rosaplus-o-1", compile_rate_backend(RateBackend::RosaPlus)),
+        (
+            "rosaplus-o-1",
+            compile_rate_backend(RateBackend::RosaPlus { max_order: -1 }),
+        ),
         (
             "ctw-d6",
             compile_rate_backend(RateBackend::Ctw { depth: CTW_DEPTH }),
@@ -97,7 +100,7 @@ fn make_expert(name: &str, backend: RateBackend) -> MixtureExpertSpec {
 }
 
 fn mixture_backends() -> Vec<(&'static str, CompiledRateBackend)> {
-    let rosa = make_expert("rosa", RateBackend::RosaPlus);
+    let rosa = make_expert("rosa", RateBackend::RosaPlus { max_order: -1 });
     let ctw = make_expert("ctw", RateBackend::Ctw { depth: CTW_DEPTH });
     let rwkv = make_expert(
         "rwkv64x64",
@@ -159,9 +162,8 @@ fn bench_matrix(c: &mut Criterion) {
                 &backend,
                 |b, rate_backend| {
                     b.iter(|| {
-                        let out =
-                            compress_rate_bytes(data, rate_backend, -1, coder, FramingMode::Raw)
-                                .expect("compression benchmark failed");
+                        let out = compress_rate_bytes(data, rate_backend, coder, FramingMode::Raw)
+                            .expect("compression benchmark failed");
                         criterion::black_box(out.len())
                     });
                 },
@@ -180,9 +182,8 @@ fn bench_matrix(c: &mut Criterion) {
                 &backend,
                 |b, rate_backend| {
                     b.iter(|| {
-                        let out =
-                            compress_rate_bytes(data, rate_backend, -1, coder, FramingMode::Raw)
-                                .expect("mixture compression benchmark failed");
+                        let out = compress_rate_bytes(data, rate_backend, coder, FramingMode::Raw)
+                            .expect("mixture compression benchmark failed");
                         criterion::black_box(out.len())
                     });
                 },

@@ -40,7 +40,7 @@ fn make_experts() -> Vec<MixtureExpertSpec> {
             num_percept_bits: 8,
         })
         .with_name("fac"),
-        MixtureExpertSpec::new(RateBackend::RosaPlus).with_name("rosa"),
+        MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: -1 }).with_name("rosa"),
     ]
 }
 
@@ -68,14 +68,14 @@ fn bench_kind(
     .expect("compile mixture backend");
 
     for _ in 0..warmup_iters {
-        let h = entropy_rate_backend(data, -1, &backend);
+        let h = entropy_rate_backend(data, &backend);
         black_box(h);
     }
 
     let start = Instant::now();
     let mut sink = 0.0;
     for _ in 0..bench_iters {
-        let h = entropy_rate_backend(data, -1, &backend);
+        let h = entropy_rate_backend(data, &backend);
         sink += h;
     }
     black_box(sink);
@@ -118,6 +118,6 @@ fn main() {
     }
     println!("total elapsed: {:.3} s", total.as_secs_f64());
 }
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
-    try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
+fn entropy_rate_backend(data: &[u8], backend: &CompiledRateBackend) -> f64 {
+    try_entropy_rate_backend(data, backend).expect("entropy rate")
 }

@@ -322,7 +322,7 @@ fn bench_two_json_end_to_end(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(data.len() as u64));
     group.bench_with_input(BenchmarkId::new("rate_ac", data.len()), &data, |b, d| {
         b.iter(|| {
-            let encoded = compress_rate_bytes(d, &backend, -1, CoderType::AC, FramingMode::Raw)
+            let encoded = compress_rate_bytes(d, &backend, CoderType::AC, FramingMode::Raw)
                 .expect("two.json compression bench failed");
             criterion::black_box(encoded.len())
         });

@@ -16,8 +16,7 @@
       "encoding_bits": 8,
       "kind": "fac-ctw",
       "num_percept_bits": 528
-    },
-    "predictor_max_order": 20
+    }
   },
   "environment": {
     "action_source": {

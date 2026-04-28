@@ -40,7 +40,6 @@ fn compile_planner_controller(
     match spec {
         ControllerSpec::McAixi(inner) => Ok(CompiledPlannerController::McAixi {
             predictor: inner.predictor.validate_in(env)?.compile()?,
-            predictor_max_order: inner.predictor_max_order,
             agent_horizon: inner.agent_horizon,
             num_simulations: inner.num_simulations,
             mcts_strategy: inner.mcts_strategy,
@@ -49,7 +48,6 @@ fn compile_planner_controller(
         }),
         ControllerSpec::AiqiDiscounted(inner) => Ok(CompiledPlannerController::AiqiDiscounted {
             predictor: inner.predictor.validate_in(env)?.compile()?,
-            predictor_max_order: inner.predictor_max_order,
             discount_gamma: inner.discount_gamma,
             return_horizon: inner.return_horizon,
             return_bins: inner.return_bins,
@@ -60,7 +58,6 @@ fn compile_planner_controller(
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             Ok(CompiledPlannerController::AiqiWarmstartExactJh {
                 predictor: inner.predictor.validate_in(env)?.compile()?,
-                predictor_max_order: inner.predictor_max_order,
                 return_horizon: inner.return_horizon,
                 return_bins: inner.return_bins,
                 label_phase_period: inner.label_phase_period,
@@ -365,7 +362,6 @@ fn canonicalize_controller_spec(
             }
             Ok(ControllerSpec::McAixi(super::McAixiControllerSpec {
                 predictor,
-                predictor_max_order: inner.predictor_max_order,
                 agent_horizon: inner.agent_horizon,
                 num_simulations: inner.num_simulations,
                 mcts_strategy: inner.mcts_strategy,
@@ -404,7 +400,6 @@ fn canonicalize_controller_spec(
             Ok(ControllerSpec::AiqiDiscounted(
                 super::AiqiDiscountedControllerSpec {
                     predictor,
-                    predictor_max_order: inner.predictor_max_order,
                     discount_gamma: inner.discount_gamma,
                     return_horizon: inner.return_horizon,
                     return_bins: inner.return_bins,
@@ -431,7 +426,6 @@ fn canonicalize_controller_spec(
             Ok(ControllerSpec::AiqiWarmstartExactJh(
                 super::WarmStartExactJhControllerSpec {
                     predictor,
-                    predictor_max_order: inner.predictor_max_order,
                     return_horizon: inner.return_horizon,
                     return_bins: inner.return_bins,
                     label_phase_period: inner.label_phase_period,

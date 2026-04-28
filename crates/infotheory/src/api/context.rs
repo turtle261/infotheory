@@ -3,10 +3,9 @@
 use super::compression::{NcdVariant, try_ncd_bytes_backend};
 use super::generation::{GenerationRng, pick_generated_byte, try_generate_rate_backend_chain};
 use super::metrics::{
-    byte_histogram, joint_marginal_entropy_bytes, marginal_entropy_bytes,
-    mutual_information_marg_bytes, ned_marg_bytes, nte_marg_bytes, try_biased_entropy_rate_backend,
-    try_cross_entropy_rate_backend, try_entropy_rate_backend, try_joint_entropy_rate_backend,
-    try_mutual_information_rate_backend, try_ned_rate_backend, try_nte_rate_backend,
+    empirical_entropy_bytes, try_biased_entropy_rate_backend, try_cross_entropy_rate_backend,
+    try_entropy_rate_backend, try_joint_entropy_rate_backend, try_mutual_information_rate_backend,
+    try_ned_rate_backend, try_nte_rate_backend,
 };
 use super::types::{CompressionBackend, GenerationConfig, GenerationUpdateMode, RateBackend};
 use crate::aligned_prefix;
@@ -40,14 +39,15 @@ pub struct RateBackendSession {
 
 impl RateBackendSession {
     /// Create a session from an explicit backend.
+    ///
+    /// Algorithmic configuration (such as ROSA's `max_order`) lives inside the
+    /// backend's variant; the session does not take it as an argument.
     pub fn from_backend(
         backend: CompiledRateBackend,
-        max_order: i64,
         total_symbols: Option<u64>,
     ) -> InfotheoryResult<Self> {
-        let mut predictor =
-            crate::runtime::build_rate_backend_predictor_default(&backend, max_order)
-                .map_err(InfotheoryError::invalid_backend_config)?;
+        let mut predictor = crate::runtime::build_rate_backend_predictor_default(&backend)
+            .map_err(InfotheoryError::invalid_backend_config)?;
         predictor
             .begin_stream(total_symbols)
             .map_err(InfotheoryError::runtime)?;
@@ -55,15 +55,11 @@ impl RateBackendSession {
     }
 
     /// Create a session from a wrapper backend spec.
-    pub fn from_spec(
-        backend: RateBackend,
-        max_order: i64,
-        total_symbols: Option<u64>,
-    ) -> InfotheoryResult<Self> {
+    pub fn from_spec(backend: RateBackend, total_symbols: Option<u64>) -> InfotheoryResult<Self> {
         let compiled = backend
             .compile()
             .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;
-        Self::from_backend(compiled, max_order, total_symbols)
+        Self::from_backend(compiled, total_symbols)
     }
 
     /// Observe bytes while adapting/fitting the model.
@@ -166,10 +162,10 @@ impl InfotheoryCtx {
         })
     }
 
-    /// Create a context with ROSA+ rate backend and ZPAQ compression backend.
+    /// Create a context with adaptive ROSA+ rate backend and ZPAQ compression backend.
     pub fn try_with_zpaq(method: impl Into<String>) -> InfotheoryResult<Self> {
         Self::from_specs(
-            RateBackend::RosaPlus,
+            RateBackend::RosaPlus { max_order: -1 },
             CompressionBackend::Zpaq {
                 method: crate::api::ZpaqMethodSpec::literal(method.into()),
             },
@@ -189,24 +185,19 @@ impl InfotheoryCtx {
     /// Create a stateful session for the active rate backend.
     pub fn rate_backend_session(
         &self,
-        max_order: i64,
         total_symbols: Option<u64>,
     ) -> InfotheoryResult<RateBackendSession> {
-        RateBackendSession::from_backend(self.rate_backend.clone(), max_order, total_symbols)
+        RateBackendSession::from_backend(self.rate_backend.clone(), total_symbols)
     }
 
     /// Fallible entropy-rate estimate for `data` under this context's rate backend.
-    pub fn try_entropy_rate_bytes(&self, data: &[u8], max_order: i64) -> InfotheoryResult<f64> {
-        try_entropy_rate_backend(data, max_order, &self.rate_backend)
+    pub fn try_entropy_rate_bytes(&self, data: &[u8]) -> InfotheoryResult<f64> {
+        try_entropy_rate_backend(data, &self.rate_backend)
     }
 
     /// Fallible biased entropy-rate estimate (plugin variant) for `data`.
-    pub fn try_biased_entropy_rate_bytes(
-        &self,
-        data: &[u8],
-        max_order: i64,
-    ) -> InfotheoryResult<f64> {
-        try_biased_entropy_rate_backend(data, max_order, &self.rate_backend)
+    pub fn try_biased_entropy_rate_bytes(&self, data: &[u8]) -> InfotheoryResult<f64> {
+        try_biased_entropy_rate_backend(data, &self.rate_backend)
     }
 
     /// Fallible cross entropy of `test_data` under model trained on `train_data`.
@@ -214,64 +205,36 @@ impl InfotheoryCtx {
         &self,
         test_data: &[u8],
         train_data: &[u8],
-        max_order: i64,
     ) -> InfotheoryResult<f64> {
-        try_cross_entropy_rate_backend(test_data, train_data, max_order, &self.rate_backend)
+        try_cross_entropy_rate_backend(test_data, train_data, &self.rate_backend)
     }
 
-    /// Cross entropy with order-0 fast-path fallback when `max_order == 0`.
+    /// Cross entropy under the active rate backend.
     pub fn try_cross_entropy_bytes(
         &self,
         test_data: &[u8],
         train_data: &[u8],
-        max_order: i64,
     ) -> InfotheoryResult<f64> {
-        if max_order == 0 {
-            if test_data.is_empty() {
-                return Ok(0.0);
-            }
-            let p_x = byte_histogram(test_data);
-            let p_y = byte_histogram(train_data);
-            let mut h = 0.0f64;
-            for i in 0..256 {
-                if p_x[i] > 0.0 {
-                    let q_y = p_y[i].max(1e-12);
-                    h -= p_x[i] * q_y.log2();
-                }
-            }
-            Ok(h)
-        } else {
-            self.try_cross_entropy_rate_bytes(test_data, train_data, max_order)
-        }
+        self.try_cross_entropy_rate_bytes(test_data, train_data)
     }
 
     /// Fallible joint entropy-rate estimate `H(X,Y)` under aligned-prefix semantics.
-    pub fn try_joint_entropy_rate_bytes(
-        &self,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> InfotheoryResult<f64> {
+    pub fn try_joint_entropy_rate_bytes(&self, x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
         let (x, y) = aligned_prefix(x, y);
         if x.is_empty() {
             return Ok(0.0);
         }
-        try_joint_entropy_rate_backend(x, y, max_order, &self.rate_backend)
+        try_joint_entropy_rate_backend(x, y, &self.rate_backend)
     }
 
     /// Fallible conditional entropy-rate estimate `H(X|Y)`.
-    pub fn try_conditional_entropy_rate_bytes(
-        &self,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> InfotheoryResult<f64> {
+    pub fn try_conditional_entropy_rate_bytes(&self, x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
         let (x, y) = aligned_prefix(x, y);
         if x.is_empty() {
             return Ok(0.0);
         }
-        let h_xy = self.try_joint_entropy_rate_bytes(x, y, max_order)?;
-        let h_y = self.try_entropy_rate_bytes(y, max_order)?;
+        let h_xy = self.try_joint_entropy_rate_bytes(x, y)?;
+        let h_y = self.try_entropy_rate_bytes(y)?;
         Ok((h_xy - h_y).max(0.0))
     }
 
@@ -290,13 +253,8 @@ impl InfotheoryCtx {
     }
 
     /// Generate a continuation from `prompt` with [`GenerationConfig::default()`].
-    pub fn try_generate_bytes(
-        &self,
-        prompt: &[u8],
-        bytes: usize,
-        max_order: i64,
-    ) -> InfotheoryResult<Vec<u8>> {
-        self.try_generate_bytes_with_config(prompt, bytes, max_order, GenerationConfig::default())
+    pub fn try_generate_bytes(&self, prompt: &[u8], bytes: usize) -> InfotheoryResult<Vec<u8>> {
+        self.try_generate_bytes_with_config(prompt, bytes, GenerationConfig::default())
     }
 
     /// Fallible continuation generation from `prompt` using an explicit config.
@@ -304,10 +262,9 @@ impl InfotheoryCtx {
         &self,
         prompt: &[u8],
         bytes: usize,
-        max_order: i64,
         config: GenerationConfig,
     ) -> InfotheoryResult<Vec<u8>> {
-        try_generate_rate_backend_chain(&[prompt], bytes, max_order, &self.rate_backend, config)
+        try_generate_rate_backend_chain(&[prompt], bytes, &self.rate_backend, config)
     }
 
     /// Generate a continuation after conditioning on an explicit chain of prefix parts.
@@ -315,12 +272,10 @@ impl InfotheoryCtx {
         &self,
         prefix_parts: &[&[u8]],
         bytes: usize,
-        max_order: i64,
     ) -> InfotheoryResult<Vec<u8>> {
         self.try_generate_bytes_conditional_chain_with_config(
             prefix_parts,
             bytes,
-            max_order,
             GenerationConfig::default(),
         )
     }
@@ -330,10 +285,9 @@ impl InfotheoryCtx {
         &self,
         prefix_parts: &[&[u8]],
         bytes: usize,
-        max_order: i64,
         config: GenerationConfig,
     ) -> InfotheoryResult<Vec<u8>> {
-        try_generate_rate_backend_chain(prefix_parts, bytes, max_order, &self.rate_backend, config)
+        try_generate_rate_backend_chain(prefix_parts, bytes, &self.rate_backend, config)
     }
 
     /// NCD between byte slices using this context's compression backend.
@@ -342,73 +296,34 @@ impl InfotheoryCtx {
     }
 
     /// Rate-backend mutual information estimate.
-    pub fn try_mutual_information_rate_bytes(
-        &self,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> InfotheoryResult<f64> {
-        try_mutual_information_rate_backend(x, y, max_order, &self.rate_backend)
+    pub fn try_mutual_information_rate_bytes(&self, x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
+        try_mutual_information_rate_backend(x, y, &self.rate_backend)
     }
 
-    /// Mutual information with `max_order == 0` marginal fast-path.
-    pub fn try_mutual_information_bytes(
-        &self,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> InfotheoryResult<f64> {
-        if max_order == 0 {
-            Ok(mutual_information_marg_bytes(x, y))
-        } else {
-            self.try_mutual_information_rate_bytes(x, y, max_order)
-        }
+    /// Mutual information under the active rate backend.
+    pub fn try_mutual_information_bytes(&self, x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
+        self.try_mutual_information_rate_bytes(x, y)
     }
 
-    /// Conditional entropy with aligned-prefix semantics.
-    pub fn try_conditional_entropy_bytes(
-        &self,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> InfotheoryResult<f64> {
+    /// Conditional entropy `H(X|Y)` under the active rate backend.
+    pub fn try_conditional_entropy_bytes(&self, x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
         let (x, y) = aligned_prefix(x, y);
-        if max_order == 0 {
-            let h_xy = joint_marginal_entropy_bytes(x, y);
-            let h_y = marginal_entropy_bytes(y);
-            Ok((h_xy - h_y).max(0.0))
-        } else {
-            let h_xy = self.try_joint_entropy_rate_bytes(x, y, max_order)?;
-            let h_y = self.try_entropy_rate_bytes(y, max_order)?;
-            Ok((h_xy - h_y).max(0.0))
-        }
+        let h_xy = self.try_joint_entropy_rate_bytes(x, y)?;
+        let h_y = self.try_entropy_rate_bytes(y)?;
+        Ok((h_xy - h_y).max(0.0))
     }
 
-    /// Normalized entropy distance (NED) under this context.
-    pub fn try_ned_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
-        if max_order == 0 {
-            Ok(ned_marg_bytes(x, y))
-        } else {
-            try_ned_rate_backend(x, y, max_order, &self.rate_backend)
-        }
+    /// Normalized entropy distance (NED) under this context's rate backend.
+    pub fn try_ned_bytes(&self, x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
+        try_ned_rate_backend(x, y, &self.rate_backend)
     }
 
-    /// Conservative NED normalization variant.
-    pub fn try_ned_cons_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
+    /// Conservative NED normalization variant under this context's rate backend.
+    pub fn try_ned_cons_bytes(&self, x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
         let (x, y) = aligned_prefix(x, y);
-        let (h_x, h_y, h_xy) = if max_order == 0 {
-            (
-                marginal_entropy_bytes(x),
-                marginal_entropy_bytes(y),
-                joint_marginal_entropy_bytes(x, y),
-            )
-        } else {
-            (
-                self.try_entropy_rate_bytes(x, max_order)?,
-                self.try_entropy_rate_bytes(y, max_order)?,
-                self.try_joint_entropy_rate_bytes(x, y, max_order)?,
-            )
-        };
+        let h_x = self.try_entropy_rate_bytes(x)?;
+        let h_y = self.try_entropy_rate_bytes(y)?;
+        let h_xy = self.try_joint_entropy_rate_bytes(x, y)?;
         let min_h = h_x.min(h_y);
         if h_xy == 0.0 {
             Ok(0.0)
@@ -417,46 +332,35 @@ impl InfotheoryCtx {
         }
     }
 
-    /// Normalized transform effort (NTE) under this context.
-    pub fn try_nte_bytes(&self, x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
-        if max_order == 0 {
-            Ok(nte_marg_bytes(x, y))
-        } else {
-            try_nte_rate_backend(x, y, max_order, &self.rate_backend)
-        }
+    /// Normalized transform effort (NTE) under this context's rate backend.
+    pub fn try_nte_bytes(&self, x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
+        try_nte_rate_backend(x, y, &self.rate_backend)
     }
 
-    /// Intrinsic dependence score in `[0,1]`.
-    pub fn try_intrinsic_dependence_bytes(
-        &self,
-        data: &[u8],
-        max_order: i64,
-    ) -> InfotheoryResult<f64> {
-        let h_marginal = marginal_entropy_bytes(data);
-        if h_marginal < 1e-9 {
+    /// Intrinsic dependence score in `[0,1]` driven by `(H₀(X) - Ĥ(X)) / H₀(X)`,
+    /// where `H₀` is the order-0 / empirical entropy and `Ĥ` is the entropy rate
+    /// produced by this context's rate backend.
+    pub fn try_intrinsic_dependence_bytes(&self, data: &[u8]) -> InfotheoryResult<f64> {
+        let h_empirical = empirical_entropy_bytes(data);
+        if h_empirical < 1e-9 {
             return Ok(0.0);
         }
-        let h_rate = self.try_entropy_rate_bytes(data, max_order)?;
-        Ok(((h_marginal - h_rate) / h_marginal).clamp(0.0, 1.0))
+        let h_rate = self.try_entropy_rate_bytes(data)?;
+        Ok(((h_empirical - h_rate) / h_empirical).clamp(0.0, 1.0))
     }
 
-    /// Resistance-to-transformation ratio `I(X;T(X))/H(X)` in `[0,1]`.
+    /// Resistance-to-transformation ratio `I(X;T(X))/H(X)` in `[0,1]` under this context's rate backend.
     pub fn try_resistance_to_transformation_bytes(
         &self,
         x: &[u8],
         tx: &[u8],
-        max_order: i64,
     ) -> InfotheoryResult<f64> {
         let (x, tx) = aligned_prefix(x, tx);
-        let h_x = if max_order == 0 {
-            marginal_entropy_bytes(x)
-        } else {
-            self.try_entropy_rate_bytes(x, max_order)?
-        };
+        let h_x = self.try_entropy_rate_bytes(x)?;
         if h_x < 1e-9 {
             return Ok(0.0);
         }
-        let mi = self.try_mutual_information_bytes(x, tx, max_order)?;
+        let mi = self.try_mutual_information_bytes(x, tx)?;
         Ok((mi / h_x).clamp(0.0, 1.0))
     }
 }

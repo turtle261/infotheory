@@ -77,7 +77,6 @@ mod bench_impl {
             cfg.max_reward = 1;
             cfg.reward_offset = 1;
             cfg.random_seed = Some(1);
-            cfg.rate_backend_max_order = 20;
             cfg
         };
 
@@ -92,14 +91,13 @@ mod bench_impl {
                                     MixtureExpertSpec::new(RateBackend::Ctw { depth: 32 });
                                 expert.name = Some("ctw".to_string());
                                 expert.log_prior = 0.0;
-                                expert.max_order = -1;
                                 expert
                             },
                             {
-                                let mut expert = MixtureExpertSpec::new(RateBackend::RosaPlus);
+                                let mut expert =
+                                    MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: 20 });
                                 expert.name = Some("rosa".to_string());
                                 expert.log_prior = 0.0;
-                                expert.max_order = 20;
                                 expert
                             },
                         ],
@@ -124,9 +122,15 @@ mod bench_impl {
                     encoding_bits: 1,
                 }),
             ),
-            ("rosaplus", base_cfg(RateBackend::RosaPlus)),
+            (
+                "rosaplus",
+                base_cfg(RateBackend::RosaPlus { max_order: 20 }),
+            ),
             ("rate-ctw", rate_backend_cfg(RateBackend::Ctw { depth: 32 })),
-            ("rate-rosa", rate_backend_cfg(RateBackend::RosaPlus)),
+            (
+                "rate-rosa",
+                rate_backend_cfg(RateBackend::RosaPlus { max_order: 20 }),
+            ),
             (
                 "mix-bayes",
                 rate_backend_cfg(make_mixture(

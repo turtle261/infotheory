@@ -151,13 +151,14 @@ pub struct CompressionBackendCapabilities {
 pub(crate) struct RateBackendPlanExpert {
     pub name: Option<String>,
     pub log_prior: f64,
-    pub max_order: i64,
     pub backend: Arc<RateBackendPlan>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum RateBackendPlan {
-    RosaPlus,
+    RosaPlus {
+        max_order: i64,
+    },
     Match {
         hash_bits: usize,
         min_len: usize,
@@ -226,7 +227,7 @@ pub(crate) enum RateBackendPlan {
 impl RateBackendPlan {
     pub(crate) fn kind(&self) -> crate::runtime::RateBackendKind {
         match self {
-            RateBackendPlan::RosaPlus => crate::runtime::RateBackendKind::RosaPlus,
+            RateBackendPlan::RosaPlus { .. } => crate::runtime::RateBackendKind::RosaPlus,
             RateBackendPlan::Match { .. } => crate::runtime::RateBackendKind::Match,
             RateBackendPlan::SparseMatch { .. } => crate::runtime::RateBackendKind::SparseMatch,
             RateBackendPlan::Ppmd { .. } => crate::runtime::RateBackendKind::Ppmd,
@@ -308,13 +309,13 @@ impl ValidatedRateBackend {
     }
 
     /// Human-readable backend label derived from the compiled plan.
-    pub fn display_label(&self, max_order: i64) -> String {
-        rate_backend_plan_display_label(self.plan.as_ref(), max_order)
+    pub fn display_label(&self) -> String {
+        rate_backend_plan_display_label(self.plan.as_ref())
     }
 
     /// Short default backend name for logs, diagnostics, and model labels.
-    pub fn default_name(&self, max_order: i64) -> String {
-        rate_backend_plan_default_name(self.plan.as_ref(), max_order)
+    pub fn default_name(&self) -> String {
+        rate_backend_plan_default_name(self.plan.as_ref())
     }
 
     /// Compile the validated spec into an immutable runtime plan.
@@ -390,13 +391,13 @@ impl CompiledRateBackend {
     }
 
     /// Compile-friendly backend display label.
-    pub fn display_label(&self, max_order: i64) -> String {
-        rate_backend_plan_display_label(self.plan.as_ref(), max_order)
+    pub fn display_label(&self) -> String {
+        rate_backend_plan_display_label(self.plan.as_ref())
     }
 
     /// Short default backend name for logs, diagnostics, and model labels.
-    pub fn default_name(&self, max_order: i64) -> String {
-        rate_backend_plan_default_name(self.plan.as_ref(), max_order)
+    pub fn default_name(&self) -> String {
+        rate_backend_plan_default_name(self.plan.as_ref())
     }
 
     /// Canonical backend family name.
@@ -549,7 +550,9 @@ pub(crate) fn compile_rate_plan_rosa(
     _depth: usize,
 ) -> SpecResult<RateBackendPlan> {
     match backend {
-        RateBackend::RosaPlus => Ok(RateBackendPlan::RosaPlus),
+        RateBackend::RosaPlus { max_order } => Ok(RateBackendPlan::RosaPlus {
+            max_order: *max_order,
+        }),
         _ => unreachable!("rosa kernel used with non-rosa backend"),
     }
 }
@@ -760,7 +763,6 @@ pub(crate) fn compile_rate_plan_mixture(
             Ok(RateBackendPlanExpert {
                 name: expert.name.clone(),
                 log_prior: expert.log_prior,
-                max_order: expert.max_order,
                 backend: Arc::new(build_rate_plan(&expert.backend, env, depth - 1)?),
             })
         })
@@ -775,7 +777,6 @@ pub(crate) fn compile_rate_plan_mixture(
             .map(|expert| MixtureExpertSpec {
                 name: expert.name.clone(),
                 log_prior: expert.log_prior,
-                max_order: expert.max_order,
                 backend: rate_plan_to_wrapper(expert.backend.as_ref()),
             })
             .collect(),
@@ -944,10 +945,12 @@ fn build_compression_plan(
 }
 
 pub(crate) fn rate_plan_to_wrapper_rosa(plan: &RateBackendPlan) -> RateBackend {
-    let RateBackendPlan::RosaPlus = plan else {
+    let RateBackendPlan::RosaPlus { max_order } = plan else {
         unreachable!("rosa wrapper kernel used with non-rosa plan");
     };
-    RateBackend::RosaPlus
+    RateBackend::RosaPlus {
+        max_order: *max_order,
+    }
 }
 
 pub(crate) fn rate_plan_to_wrapper_match(plan: &RateBackendPlan) -> RateBackend {
@@ -1099,7 +1102,6 @@ pub(crate) fn rate_plan_to_wrapper_mixture(plan: &RateBackendPlan) -> RateBacken
                 .map(|expert| MixtureExpertSpec {
                     name: expert.name.clone(),
                     log_prior: expert.log_prior,
-                    max_order: expert.max_order,
                     backend: rate_plan_to_wrapper(expert.backend.as_ref()),
                 })
                 .collect(),
@@ -1287,7 +1289,6 @@ pub(crate) fn adapt_rate_plan_mixture(plan: &RateBackendPlan) -> RateBackendPlan
             .map(|expert| RateBackendPlanExpert {
                 name: expert.name.clone(),
                 log_prior: expert.log_prior,
-                max_order: expert.max_order,
                 backend: Arc::new(adapt_rate_plan_for_bit_tokens(expert.backend.as_ref())),
             })
             .collect::<Vec<_>>()
@@ -1315,21 +1316,21 @@ pub(crate) fn adapt_rate_plan_calibrated(plan: &RateBackendPlan) -> RateBackendP
     }
 }
 
-pub(crate) fn rate_plan_display_label_rosa(plan: &RateBackendPlan, max_order: i64) -> String {
-    let RateBackendPlan::RosaPlus = plan else {
+pub(crate) fn rate_plan_display_label_rosa(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::RosaPlus { max_order } = plan else {
         unreachable!("rosa label kernel used with non-rosa plan");
     };
     format!("rosaplus(max_order={max_order})")
 }
 
-pub(crate) fn rate_plan_default_name_rosa(plan: &RateBackendPlan, max_order: i64) -> String {
-    let RateBackendPlan::RosaPlus = plan else {
+pub(crate) fn rate_plan_default_name_rosa(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::RosaPlus { max_order } = plan else {
         unreachable!("rosa default-name kernel used with non-rosa plan");
     };
     format!("rosa(mo={max_order})")
 }
 
-pub(crate) fn rate_plan_display_label_match(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_match(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Match {
         hash_bits,
         min_len,
@@ -1345,17 +1346,14 @@ pub(crate) fn rate_plan_display_label_match(plan: &RateBackendPlan, _max_order: 
     )
 }
 
-pub(crate) fn rate_plan_default_name_match(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_match(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Match { .. } = plan else {
         unreachable!("match default-name kernel used with non-match plan");
     };
     "match".to_string()
 }
 
-pub(crate) fn rate_plan_display_label_sparse_match(
-    plan: &RateBackendPlan,
-    _max_order: i64,
-) -> String {
+pub(crate) fn rate_plan_display_label_sparse_match(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::SparseMatch {
         hash_bits,
         min_len,
@@ -1373,59 +1371,56 @@ pub(crate) fn rate_plan_display_label_sparse_match(
     )
 }
 
-pub(crate) fn rate_plan_default_name_sparse_match(
-    plan: &RateBackendPlan,
-    _max_order: i64,
-) -> String {
+pub(crate) fn rate_plan_default_name_sparse_match(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::SparseMatch { .. } = plan else {
         unreachable!("sparse-match default-name kernel used with non-sparse-match plan");
     };
     "sparse-match".to_string()
 }
 
-pub(crate) fn rate_plan_display_label_ppmd(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_ppmd(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Ppmd { order, memory_mb } = plan else {
         unreachable!("ppmd label kernel used with non-ppmd plan");
     };
     format!("ppmd(order={order},memory_mb={memory_mb})")
 }
 
-pub(crate) fn rate_plan_default_name_ppmd(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_ppmd(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Ppmd { order, memory_mb } = plan else {
         unreachable!("ppmd default-name kernel used with non-ppmd plan");
     };
     format!("ppmd(o={order},m={memory_mb}MiB)")
 }
 
-pub(crate) fn rate_plan_display_label_sequitur(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_sequitur(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Sequitur { context_bytes } = plan else {
         unreachable!("sequitur label kernel used with non-sequitur plan");
     };
     format!("sequitur(context_bytes={context_bytes})")
 }
 
-pub(crate) fn rate_plan_default_name_sequitur(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_sequitur(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Sequitur { context_bytes } = plan else {
         unreachable!("sequitur default-name kernel used with non-sequitur plan");
     };
     format!("sequitur(ctx={context_bytes})")
 }
 
-pub(crate) fn rate_plan_display_label_ctw(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_ctw(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Ctw { depth } = plan else {
         unreachable!("ctw label kernel used with non-ctw plan");
     };
     format!("ctw(depth={depth})")
 }
 
-pub(crate) fn rate_plan_default_name_ctw(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_ctw(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Ctw { depth } = plan else {
         unreachable!("ctw default-name kernel used with non-ctw plan");
     };
     format!("ctw(d={depth})")
 }
 
-pub(crate) fn rate_plan_display_label_fac_ctw(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_fac_ctw(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::FacCtw {
         base_depth,
         num_percept_bits,
@@ -1439,7 +1434,7 @@ pub(crate) fn rate_plan_display_label_fac_ctw(plan: &RateBackendPlan, _max_order
     )
 }
 
-pub(crate) fn rate_plan_default_name_fac_ctw(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_fac_ctw(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::FacCtw {
         base_depth,
         encoding_bits,
@@ -1451,14 +1446,14 @@ pub(crate) fn rate_plan_default_name_fac_ctw(plan: &RateBackendPlan, _max_order:
     format!("fac-ctw(d={base_depth},b={encoding_bits})")
 }
 
-pub(crate) fn rate_plan_display_label_zpaq(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_zpaq(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Zpaq { method } = plan else {
         unreachable!("zpaq label kernel used with non-zpaq plan");
     };
     format!("zpaq(method={method})")
 }
 
-pub(crate) fn rate_plan_default_name_zpaq(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_zpaq(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Zpaq { method } = plan else {
         unreachable!("zpaq default-name kernel used with non-zpaq plan");
     };
@@ -1466,7 +1461,7 @@ pub(crate) fn rate_plan_default_name_zpaq(plan: &RateBackendPlan, _max_order: i6
 }
 
 #[cfg(feature = "backend-mamba")]
-pub(crate) fn rate_plan_display_label_mamba(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_mamba(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Mamba { method, .. } = plan else {
         unreachable!("mamba label kernel used with non-mamba plan");
     };
@@ -1474,12 +1469,12 @@ pub(crate) fn rate_plan_display_label_mamba(plan: &RateBackendPlan, _max_order: 
 }
 
 #[cfg(not(feature = "backend-mamba"))]
-pub(crate) fn rate_plan_display_label_mamba(_plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_mamba(_plan: &RateBackendPlan) -> String {
     unreachable!("mamba label kernel should never be used without backend-mamba")
 }
 
 #[cfg(feature = "backend-mamba")]
-pub(crate) fn rate_plan_default_name_mamba(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_mamba(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Mamba { method, .. } = plan else {
         unreachable!("mamba default-name kernel used with non-mamba plan");
     };
@@ -1487,12 +1482,12 @@ pub(crate) fn rate_plan_default_name_mamba(plan: &RateBackendPlan, _max_order: i
 }
 
 #[cfg(not(feature = "backend-mamba"))]
-pub(crate) fn rate_plan_default_name_mamba(_plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_mamba(_plan: &RateBackendPlan) -> String {
     unreachable!("mamba default-name kernel should never be used without backend-mamba")
 }
 
 #[cfg(feature = "backend-rwkv")]
-pub(crate) fn rate_plan_display_label_rwkv7(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_rwkv7(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Rwkv7 { method, .. } = plan else {
         unreachable!("rwkv7 label kernel used with non-rwkv7 plan");
     };
@@ -1500,12 +1495,12 @@ pub(crate) fn rate_plan_display_label_rwkv7(plan: &RateBackendPlan, _max_order: 
 }
 
 #[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn rate_plan_display_label_rwkv7(_plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_rwkv7(_plan: &RateBackendPlan) -> String {
     unreachable!("rwkv7 label kernel should never be used without backend-rwkv")
 }
 
 #[cfg(feature = "backend-rwkv")]
-pub(crate) fn rate_plan_default_name_rwkv7(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_rwkv7(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Rwkv7 { method, .. } = plan else {
         unreachable!("rwkv7 default-name kernel used with non-rwkv7 plan");
     };
@@ -1513,11 +1508,11 @@ pub(crate) fn rate_plan_default_name_rwkv7(plan: &RateBackendPlan, _max_order: i
 }
 
 #[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn rate_plan_default_name_rwkv7(_plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_rwkv7(_plan: &RateBackendPlan) -> String {
     unreachable!("rwkv7 default-name kernel should never be used without backend-rwkv")
 }
 
-pub(crate) fn rate_plan_display_label_mixture(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_mixture(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Mixture { kind, .. } = plan else {
         unreachable!("mixture label kernel used with non-mixture plan");
     };
@@ -1531,7 +1526,7 @@ pub(crate) fn rate_plan_display_label_mixture(plan: &RateBackendPlan, _max_order
     }
 }
 
-pub(crate) fn rate_plan_default_name_mixture(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_mixture(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Mixture { kind, .. } = plan else {
         unreachable!("mixture default-name kernel used with non-mixture plan");
     };
@@ -1546,7 +1541,7 @@ pub(crate) fn rate_plan_default_name_mixture(plan: &RateBackendPlan, _max_order:
     format!("mix({kind})")
 }
 
-pub(crate) fn rate_plan_display_label_particle(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_display_label_particle(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Particle { spec } = plan else {
         unreachable!("particle label kernel used with non-particle plan");
     };
@@ -1556,17 +1551,14 @@ pub(crate) fn rate_plan_display_label_particle(plan: &RateBackendPlan, _max_orde
     )
 }
 
-pub(crate) fn rate_plan_default_name_particle(plan: &RateBackendPlan, _max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_particle(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Particle { spec } = plan else {
         unreachable!("particle default-name kernel used with non-particle plan");
     };
     format!("particle(n={},c={})", spec.num_particles, spec.num_cells)
 }
 
-pub(crate) fn rate_plan_display_label_calibrated(
-    plan: &RateBackendPlan,
-    _max_order: i64,
-) -> String {
+pub(crate) fn rate_plan_display_label_calibrated(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Calibrated {
         context,
         bins,
@@ -1582,13 +1574,13 @@ pub(crate) fn rate_plan_display_label_calibrated(
     )
 }
 
-pub(crate) fn rate_plan_default_name_calibrated(plan: &RateBackendPlan, max_order: i64) -> String {
+pub(crate) fn rate_plan_default_name_calibrated(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Calibrated { base, .. } = plan else {
         unreachable!("calibrated default-name kernel used with non-calibrated plan");
     };
     format!(
         "calibrated({})",
-        rate_backend_plan_default_name(base.as_ref(), max_order)
+        rate_backend_plan_default_name(base.as_ref())
     )
 }
 
@@ -1628,10 +1620,11 @@ pub(crate) fn compression_plan_display_label_rate(plan: &CompressionBackendPlan)
 }
 
 pub(crate) fn encode_rate_payload_rosa(plan: &RateBackendPlan, out: &mut Vec<u8>) {
-    let RateBackendPlan::RosaPlus = plan else {
+    let RateBackendPlan::RosaPlus { max_order } = plan else {
         unreachable!("rosa encoder kernel used with non-rosa plan");
     };
     out.push(0);
+    push_i64(out, *max_order);
 }
 
 pub(crate) fn encode_rate_payload_match(plan: &RateBackendPlan, out: &mut Vec<u8>) {
@@ -1774,7 +1767,6 @@ pub(crate) fn encode_rate_payload_mixture(plan: &RateBackendPlan, out: &mut Vec<
     for expert in experts.iter() {
         push_option_string(out, expert.name.as_deref());
         push_f64(out, expert.log_prior);
-        push_i64(out, expert.max_order);
         encode_rate_backend_payload(expert.backend.as_ref(), out);
     }
 }
@@ -1873,12 +1865,12 @@ fn rate_plan_contains_zpaq(plan: &RateBackendPlan) -> bool {
     (crate::runtime::rate_backend_kernel(plan.kind()).contains_zpaq)(plan)
 }
 
-fn rate_backend_plan_display_label(plan: &RateBackendPlan, max_order: i64) -> String {
-    crate::runtime::rate_backend_display_label_via_kernel(plan, max_order)
+fn rate_backend_plan_display_label(plan: &RateBackendPlan) -> String {
+    crate::runtime::rate_backend_display_label_via_kernel(plan)
 }
 
-fn rate_backend_plan_default_name(plan: &RateBackendPlan, max_order: i64) -> String {
-    crate::runtime::rate_backend_default_name_via_kernel(plan, max_order)
+fn rate_backend_plan_default_name(plan: &RateBackendPlan) -> String {
+    crate::runtime::rate_backend_default_name_via_kernel(plan)
 }
 
 fn adapt_rate_plan_for_bit_tokens(plan: &RateBackendPlan) -> RateBackendPlan {
@@ -2155,13 +2147,11 @@ mod tests {
                     MixtureExpertSpec {
                         name: Some("ctw".to_string()),
                         log_prior: 0.0,
-                        max_order: -1,
                         backend: RateBackend::Ctw { depth: 6 },
                     },
                     MixtureExpertSpec {
                         name: Some("zpaq".to_string()),
                         log_prior: -0.1,
-                        max_order: -1,
                         backend: RateBackend::Zpaq {
                             method: crate::api::ZpaqMethodSpec::literal("1"),
                         },

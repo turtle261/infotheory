@@ -58,22 +58,22 @@ fn assert_ctx_parity(
 
     assert_close(
         "entropy",
-        compat_ctx.try_entropy_rate_bytes(prompt, -1).unwrap(),
-        compiled_ctx.try_entropy_rate_bytes(prompt, -1).unwrap(),
+        compat_ctx.try_entropy_rate_bytes(prompt).unwrap(),
+        compiled_ctx.try_entropy_rate_bytes(prompt).unwrap(),
     );
     assert_close(
         "cross-entropy",
         compat_ctx
-            .try_cross_entropy_rate_bytes(prompt, train, -1)
+            .try_cross_entropy_rate_bytes(prompt, train)
             .unwrap(),
         compiled_ctx
-            .try_cross_entropy_rate_bytes(prompt, train, -1)
+            .try_cross_entropy_rate_bytes(prompt, train)
             .unwrap(),
     );
     assert_close(
         "joint-entropy",
-        compat_ctx.try_joint_entropy_rate_bytes(x, y, -1).unwrap(),
-        compiled_ctx.try_joint_entropy_rate_bytes(x, y, -1).unwrap(),
+        compat_ctx.try_joint_entropy_rate_bytes(x, y).unwrap(),
+        compiled_ctx.try_joint_entropy_rate_bytes(x, y).unwrap(),
     );
     assert_close(
         "ncd",
@@ -92,9 +92,9 @@ fn assert_ctx_parity(
     assert_eq!(dec, prompt, "decompressed payload mismatch");
 
     let mut compat_session =
-        RateBackendSession::from_spec(rate_backend, -1, Some(train.len() as u64)).unwrap();
+        RateBackendSession::from_spec(rate_backend, Some(train.len() as u64)).unwrap();
     let mut compiled_session =
-        RateBackendSession::from_backend(compiled_rate, -1, Some(train.len() as u64)).unwrap();
+        RateBackendSession::from_backend(compiled_rate, Some(train.len() as u64)).unwrap();
     compat_session.observe(train);
     compiled_session.observe(train);
     let mut compat_logps = [0.0; 256];
@@ -113,10 +113,10 @@ fn assert_ctx_parity(
         let mut cfg = GenerationConfig::default();
         cfg.seed = 7;
         let compat = compat_ctx
-            .try_generate_bytes_with_config(prompt, 16, -1, cfg)
+            .try_generate_bytes_with_config(prompt, 16, cfg)
             .unwrap();
         let compiled = compiled_ctx
-            .try_generate_bytes_with_config(prompt, 16, -1, cfg)
+            .try_generate_bytes_with_config(prompt, 16, cfg)
             .unwrap();
         assert_eq!(compat, compiled, "generation drift");
     }

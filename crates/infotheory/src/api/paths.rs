@@ -168,55 +168,55 @@ pub fn try_ncd_matrix_paths(
     try_ncd_matrix_bytes(&datas, method, variant)
 }
 
-/// Compute normalized entropy distance (NED) for two files.
-pub fn try_ned_paths(x: &str, y: &str, max_order: i64) -> InfotheoryResult<f64> {
+/// Compute normalized entropy distance (NED) for two files using the default rate backend.
+pub fn try_ned_paths(x: &str, y: &str) -> InfotheoryResult<f64> {
     let (bx, by) = try_read_path_pair(x, y)?;
-    try_ned_bytes(&bx, &by, max_order)
+    try_ned_bytes(&bx, &by)
 }
 
-/// Compute normalized transform effort (NTE) for two files.
-pub fn try_nte_paths(x: &str, y: &str, max_order: i64) -> InfotheoryResult<f64> {
+/// Compute normalized transform effort (NTE) for two files using the default rate backend.
+pub fn try_nte_paths(x: &str, y: &str) -> InfotheoryResult<f64> {
     let (bx, by) = try_read_path_pair(x, y)?;
-    try_nte_bytes(&bx, &by, max_order)
+    try_nte_bytes(&bx, &by)
 }
 
-/// Compute total variation distance (TVD) between marginal byte distributions of two files.
-pub fn try_tvd_paths(x: &str, y: &str, max_order: i64) -> InfotheoryResult<f64> {
+/// Compute total variation distance (TVD) between the byte distributions of two files.
+pub fn try_tvd_paths(x: &str, y: &str) -> InfotheoryResult<f64> {
     let (bx, by) = try_read_path_pair(x, y)?;
-    Ok(tvd_bytes(&bx, &by, max_order))
+    Ok(tvd_bytes(&bx, &by))
 }
 
-/// Compute normalized Hellinger distance (NHD) between marginal byte distributions of two files.
-pub fn try_nhd_paths(x: &str, y: &str, max_order: i64) -> InfotheoryResult<f64> {
+/// Compute normalized Hellinger distance (NHD) between the byte distributions of two files.
+pub fn try_nhd_paths(x: &str, y: &str) -> InfotheoryResult<f64> {
     let (bx, by) = try_read_path_pair(x, y)?;
-    Ok(nhd_bytes(&bx, &by, max_order))
+    Ok(nhd_bytes(&bx, &by))
 }
 
-/// Compute mutual information estimate for two files.
-pub fn try_mutual_information_paths(x: &str, y: &str, max_order: i64) -> InfotheoryResult<f64> {
+/// Compute mutual information estimate for two files using the default rate backend.
+pub fn try_mutual_information_paths(x: &str, y: &str) -> InfotheoryResult<f64> {
     let (bx, by) = try_read_path_pair(x, y)?;
-    try_mutual_information_bytes(&bx, &by, max_order)
+    try_mutual_information_bytes(&bx, &by)
 }
 
-/// Compute conditional entropy estimate `H(X|Y)` for two files.
-pub fn try_conditional_entropy_paths(x: &str, y: &str, max_order: i64) -> InfotheoryResult<f64> {
+/// Compute conditional entropy estimate `H(X|Y)` for two files using the default rate backend.
+pub fn try_conditional_entropy_paths(x: &str, y: &str) -> InfotheoryResult<f64> {
     let (bx, by) = try_read_path_pair(x, y)?;
-    try_conditional_entropy_bytes(&bx, &by, max_order)
+    try_conditional_entropy_bytes(&bx, &by)
 }
 
-/// Compute cross-entropy estimate `H_train(test)` for two files.
-pub fn try_cross_entropy_paths(x: &str, y: &str, max_order: i64) -> InfotheoryResult<f64> {
+/// Compute cross-entropy estimate `H_train(test)` for two files using the default rate backend.
+pub fn try_cross_entropy_paths(x: &str, y: &str) -> InfotheoryResult<f64> {
     let (bx, by) = try_read_path_pair(x, y)?;
-    try_cross_entropy_bytes(&bx, &by, max_order)
+    try_cross_entropy_bytes(&bx, &by)
 }
 
-/// Compute KL divergence between marginal byte histograms of two files.
+/// Compute KL divergence between the byte histograms of two files.
 pub fn try_kl_divergence_paths(x: &str, y: &str) -> InfotheoryResult<f64> {
     let (bx, by) = try_read_path_pair(x, y)?;
     Ok(d_kl_bytes(&bx, &by))
 }
 
-/// Compute Jensen-Shannon divergence between marginal byte histograms of two files.
+/// Compute Jensen-Shannon divergence between the byte histograms of two files.
 pub fn try_js_divergence_paths(x: &str, y: &str) -> InfotheoryResult<f64> {
     let (bx, by) = try_read_path_pair(x, y)?;
     Ok(js_div_bytes(&bx, &by))

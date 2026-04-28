@@ -107,7 +107,6 @@ fn nested_generic_backend() -> RateBackend {
                 let mut expert = MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 });
                 expert.name = Some("ctw".to_string());
                 expert.log_prior = 0.0;
-                expert.max_order = -1;
                 expert
             },
             {
@@ -120,7 +119,6 @@ fn nested_generic_backend() -> RateBackend {
                 });
                 expert.name = Some("match".to_string());
                 expert.log_prior = 0.0;
-                expert.max_order = -1;
                 expert
             },
         ],
@@ -135,7 +133,6 @@ fn nested_generic_backend() -> RateBackend {
                 });
                 expert.name = Some("nested".to_string());
                 expert.log_prior = 0.0;
-                expert.max_order = -1;
                 expert
             },
             {
@@ -145,7 +142,6 @@ fn nested_generic_backend() -> RateBackend {
                 });
                 expert.name = Some("ppmd".to_string());
                 expert.log_prior = 0.0;
-                expert.max_order = -1;
                 expert
             },
         ],
@@ -172,7 +168,7 @@ fn assert_snapshot_eq(actual: (f64, f64), expected: (f64, f64), label: &str) {
 #[test]
 fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
     let config =
-        RateBackendBitPredictorConfig::compile(nested_generic_backend(), 8, 1e-12).expect("config");
+        RateBackendBitPredictorConfig::compile(nested_generic_backend(), 1e-12).expect("config");
     let mut predictor = RateBackendBitPredictor::new(config).expect("valid predictor");
 
     let initial = predictor_snapshot(&mut predictor);
@@ -212,12 +208,9 @@ fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
 
 #[test]
 fn rate_backend_bit_predictor_roundtrips_sequitur_backend() {
-    let config = RateBackendBitPredictorConfig::compile(
-        RateBackend::Sequitur { context_bytes: 32 },
-        8,
-        1e-12,
-    )
-    .expect("config");
+    let config =
+        RateBackendBitPredictorConfig::compile(RateBackend::Sequitur { context_bytes: 32 }, 1e-12)
+            .expect("config");
     let mut predictor = RateBackendBitPredictor::new(config).expect("valid sequitur predictor");
 
     let initial = predictor_snapshot(&mut predictor);
@@ -334,7 +327,6 @@ fn generic_agent_config(rate_backend: RateBackend) -> AgentConfig {
     cfg.max_reward = 1;
     cfg.reward_offset = 0;
     cfg.random_seed = Some(2026);
-    cfg.rate_backend_max_order = 8;
     cfg
 }
 
@@ -344,14 +336,12 @@ fn mixture_backend(kind: MixtureKind) -> RateBackend {
             let mut expert = MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 });
             expert.name = Some("ctw".to_string());
             expert.log_prior = 0.0;
-            expert.max_order = -1;
             expert
         },
         {
-            let mut expert = MixtureExpertSpec::new(RateBackend::RosaPlus);
+            let mut expert = MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: 8 });
             expert.name = Some("rosa".to_string());
             expert.log_prior = 0.0;
-            expert.max_order = 8;
             expert
         },
     ];
@@ -375,7 +365,6 @@ fn deeply_nested_bayes_backend(depth: usize) -> RateBackend {
                     let mut expert = MixtureExpertSpec::new(backend);
                     expert.name = Some(format!("level-{level}"));
                     expert.log_prior = 0.0;
-                    expert.max_order = -1;
                     expert
                 }],
             )),
@@ -405,7 +394,6 @@ fn agent_solves_ctw_test_environment() {
     config.max_reward = 1;
     config.reward_offset = 0;
     config.random_seed = Some(17);
-    config.rate_backend_max_order = 20;
 
     let mut agent = Agent::new(config);
     let env = DeterministicBinaryEnv::new();
@@ -446,7 +434,6 @@ fn agent_regret_sublinear_coinflip() {
     config.max_reward = 1;
     config.reward_offset = 0;
     config.random_seed = Some(23);
-    config.rate_backend_max_order = 20;
 
     let mut agent = Agent::new(config);
     let env = SeededCoinFlipEnv::new(0.8);
@@ -487,7 +474,6 @@ fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
     config.max_reward = 1;
     config.reward_offset = 0;
     config.random_seed = Some(12345);
-    config.rate_backend_max_order = 20;
 
     let mut a = Agent::new(config.clone());
     let mut b = Agent::new(config);
@@ -620,7 +606,6 @@ fn agent_config_rejects_zpaq_rate_backend_in_strict_mode() {
                 });
                 expert.name = Some("bad-zpaq".to_string());
                 expert.log_prior = 0.0;
-                expert.max_order = -1;
                 expert
             }],
         )),

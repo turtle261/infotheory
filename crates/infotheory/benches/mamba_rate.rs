@@ -36,7 +36,7 @@ fn bench_mamba(c: &mut Criterion) {
         &data,
         |b, d| {
             b.iter(|| {
-                let h = entropy_rate_backend(d, -1, &backend);
+                let h = entropy_rate_backend(d, &backend);
                 criterion::black_box(h)
             });
         },
@@ -52,7 +52,7 @@ fn bench_mamba(c: &mut Criterion) {
             &data,
             |b, d| {
                 b.iter(|| {
-                    let out = compress_rate_bytes(d, &backend, -1, coder, FramingMode::Raw)
+                    let out = compress_rate_bytes(d, &backend, coder, FramingMode::Raw)
                         .expect("mamba rate compression benchmark failed");
                     criterion::black_box(out.len())
                 });
@@ -71,6 +71,6 @@ criterion_group! {
     targets = bench_mamba
 }
 criterion_main!(mamba_rate);
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
-    try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
+fn entropy_rate_backend(data: &[u8], backend: &CompiledRateBackend) -> f64 {
+    try_entropy_rate_backend(data, backend).expect("entropy rate")
 }

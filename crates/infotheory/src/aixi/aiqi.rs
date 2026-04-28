@@ -293,8 +293,6 @@ pub struct AiqiConfig {
     ///
     /// When `None`, planner runtime canonicalizes this to seed `0`.
     pub random_seed: Option<u64>,
-    /// Max-order hint for `rate_backend` constructors that use it (for example ROSA).
-    pub rate_backend_max_order: i64,
 }
 
 impl Default for AiqiConfig {
@@ -315,7 +313,6 @@ impl Default for AiqiConfig {
             history_prune_keep_steps: None,
             baseline_exploration: 0.01,
             random_seed: None,
-            rate_backend_max_order: 8,
         }
     }
 }
@@ -340,7 +337,6 @@ impl AiqiConfig {
             },
             ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
                 predictor,
-                predictor_max_order: self.rate_backend_max_order,
                 discount_gamma: self.discount_gamma,
                 return_horizon: self.return_horizon,
                 return_bins: self.return_bins,
@@ -539,22 +535,15 @@ impl AiqiAgent {
         config: AiqiRuntimeConfig,
         compiled: &CompiledPlannerRunSpec,
     ) -> Result<Self, AiqiError> {
-        let (predictor, predictor_max_order, augmentation_period, return_bins) =
-            match compiled.controller() {
-                CompiledPlannerController::AiqiDiscounted {
-                    predictor,
-                    predictor_max_order,
-                    augmentation_period,
-                    return_bins,
-                    ..
-                } => (
-                    predictor,
-                    *predictor_max_order,
-                    *augmentation_period,
-                    *return_bins,
-                ),
-                _ => return Err(AiqiError::ControllerKindMismatch),
-            };
+        let (predictor, augmentation_period, return_bins) = match compiled.controller() {
+            CompiledPlannerController::AiqiDiscounted {
+                predictor,
+                augmentation_period,
+                return_bins,
+                ..
+            } => (predictor, *augmentation_period, *return_bins),
+            _ => return Err(AiqiError::ControllerKindMismatch),
+        };
         let action_bits = compiled.action_bits();
         let return_bits = bits_for_cardinality(return_bins);
         let use_generic_planner = aiqi_requires_generic_planner_backend(predictor.canonical_spec());
@@ -566,7 +555,7 @@ impl AiqiAgent {
         let mut phases = Vec::with_capacity(augmentation_period);
         for _ in 0..augmentation_period {
             phases.push(PhaseModel {
-                predictor: build_aiqi_predictor(predictor, predictor_max_order, return_bits)
+                predictor: build_aiqi_predictor(predictor, return_bits)
                     .map_err(AiqiError::Predictor)?,
                 last_augmented_step: 0,
             });
@@ -1308,7 +1297,6 @@ mod tests {
             history_prune_keep_steps: None,
             baseline_exploration: 0.01,
             random_seed: Some(7),
-            rate_backend_max_order: 20,
         }
     }
 
@@ -1322,13 +1310,11 @@ mod tests {
                             crate::api::MixtureExpertSpec {
                                 name: Some("ctw".to_string()),
                                 log_prior: 0.0,
-                                max_order: -1,
                                 backend: RateBackend::Ctw { depth: 8 },
                             },
                             crate::api::MixtureExpertSpec {
                                 name: Some("match".to_string()),
                                 log_prior: 0.0,
-                                max_order: -1,
                                 backend: RateBackend::Match {
                                     hash_bits: 16,
                                     min_len: 2,

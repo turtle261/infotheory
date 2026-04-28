@@ -61,7 +61,6 @@ def test_generation_session_fill_log_probs_and_reset_frozen():
     cfg = ait.GenerationConfig.sampled_frozen(7)
     session = ait.RateBackendSession(
         ait.RateBackend.ctw(32),
-        max_order=32,
         total_symbols=len(PROMPT) + 8,
     )
 
@@ -74,7 +73,6 @@ def test_generation_session_fill_log_probs_and_reset_frozen():
 
     twin = ait.RateBackendSession(
         ait.RateBackend.ctw(32),
-        max_order=32,
         total_symbols=len(PROMPT) + 8,
     )
     twin.observe(PROMPT[:64])
@@ -89,25 +87,23 @@ def test_generation_session_fill_log_probs_and_reset_frozen():
 def test_generation_is_deterministic_across_core_backends():
     cfg = ait.GenerationConfig.sampled_frozen(42)
     cases = [
-        ("ctw", ait.RateBackend.ctw(32), 32),
-        ("rosaplus", ait.RateBackend.rosaplus(), -1),
-        ("match", ait.RateBackend.match(), -1),
-        ("ppmd", ait.RateBackend.ppmd(order=10, memory_mb=8), -1),
-        ("rwkv7", ait.RateBackend.rwkv7(_rwkv7_cfg_method()), -1),
+        ("ctw", ait.RateBackend.ctw(32)),
+        ("rosaplus", ait.RateBackend.rosaplus()),
+        ("match", ait.RateBackend.match()),
+        ("ppmd", ait.RateBackend.ppmd(order=10, memory_mb=8)),
+        ("rwkv7", ait.RateBackend.rwkv7(_rwkv7_cfg_method())),
     ]
 
-    for name, backend, max_order in cases:
+    for name, backend in cases:
         first = ait.generate_bytes(
             PROMPT,
             8,
-            max_order=max_order,
             backend=backend,
             config=cfg,
         )
         second = ait.generate_bytes(
             PROMPT,
             8,
-            max_order=max_order,
             backend=backend,
             config=cfg,
         )

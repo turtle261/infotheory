@@ -63,6 +63,10 @@ pub enum SharedMemoryPolicySpec {
 }
 
 /// Reward shaping configuration for VM environments.
+///
+/// Algorithmic configuration for the entropy estimator (such as ROSA's
+/// `max_order`) lives inside the active rate backend's variant; the shaping
+/// spec only carries shaping-policy parameters.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum VmRewardShapingSpec {
@@ -70,8 +74,6 @@ pub enum VmRewardShapingSpec {
     EntropyReduction {
         /// Asset identifier providing baseline bytes.
         baseline_asset: AssetId,
-        /// Max order hint for the entropy estimator.
-        max_order: i64,
         /// Linear scale applied to the shaping reward.
         scale: f64,
         /// Optional bonus applied on crash exits.
@@ -81,8 +83,6 @@ pub enum VmRewardShapingSpec {
     },
     /// Trace entropy shaping using online trace bytes.
     TraceEntropy {
-        /// Max order hint for the entropy estimator.
-        max_order: i64,
         /// Linear scale applied to the shaping reward.
         scale: f64,
         /// Whether to normalize by trace length.
@@ -108,6 +108,10 @@ pub enum VmRewardPolicySpec {
 }
 
 /// Optional information-theoretic action filtering for VM runs.
+///
+/// Algorithmic configuration for the entropy estimator (such as ROSA's
+/// `max_order`) lives inside the active rate backend's variant; the filter
+/// spec only carries filter-policy thresholds.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct VmActionFilterSpec {
@@ -121,8 +125,6 @@ pub struct VmActionFilterSpec {
     pub min_novelty: Option<f64>,
     /// Optional prior asset used for novelty scoring.
     pub novelty_prior_asset: Option<AssetId>,
-    /// Max-order hint for entropy estimators.
-    pub max_order: i64,
     /// Reward assigned when an action is rejected.
     pub reject_reward: Option<i64>,
 }
@@ -335,8 +337,6 @@ pub struct PlannerInterfaceSpec {
 pub struct McAixiControllerSpec {
     /// Predictive backend used by the planner model.
     pub predictor: RateBackend,
-    /// Max-order hint for backends that use it.
-    pub predictor_max_order: i64,
     /// Planning horizon.
     pub agent_horizon: usize,
     /// Number of simulations per planning step.
@@ -355,8 +355,6 @@ pub struct McAixiControllerSpec {
 pub struct AiqiDiscountedControllerSpec {
     /// Predictive backend used by the return model.
     pub predictor: RateBackend,
-    /// Max-order hint for backends that use it.
-    pub predictor_max_order: i64,
     /// Discount factor used for return construction.
     pub discount_gamma: f64,
     /// Return horizon.
@@ -377,8 +375,6 @@ pub struct AiqiDiscountedControllerSpec {
 pub struct WarmStartExactJhControllerSpec {
     /// Predictive backend used by the return model.
     pub predictor: RateBackend,
-    /// Max-order hint for backends that use it.
-    pub predictor_max_order: i64,
     /// Return horizon in planner steps.
     pub return_horizon: usize,
     /// Exact return-label alphabet size.
@@ -609,8 +605,6 @@ pub enum CompiledPlannerController {
     McAixi {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
-        /// Max-order hint used by the predictor adapter.
-        predictor_max_order: i64,
         /// Planning horizon.
         agent_horizon: usize,
         /// Number of simulations per planning step.
@@ -626,8 +620,6 @@ pub enum CompiledPlannerController {
     AiqiDiscounted {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
-        /// Max-order hint used by the predictor adapter.
-        predictor_max_order: i64,
         /// Discount factor used for return construction.
         discount_gamma: f64,
         /// Return horizon.
@@ -645,8 +637,6 @@ pub enum CompiledPlannerController {
     AiqiWarmstartExactJh {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
-        /// Max-order hint used by the predictor adapter.
-        predictor_max_order: i64,
         /// Return horizon.
         return_horizon: usize,
         /// Number of return bins.

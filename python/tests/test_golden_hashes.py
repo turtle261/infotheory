@@ -48,7 +48,7 @@ def test_zpaq_roundtrip_and_hash_fixture_b():
 
 
 def test_batch_metrics_output_hash_stability():
-    line = _batch_line({"op": "metrics", "text": "abracadabra", "max_order": 3})
+    line = _batch_line({"op": "metrics", "text": "abracadabra"})
     assert line == '{"h0":2.040373,"h_rate":1.763318,"id":0.135787,"len":11}'
     assert (
         hashlib.sha256(line.encode("utf-8")).hexdigest()

@@ -2,18 +2,19 @@ use super::*;
 
 #[cfg(feature = "backend-rosa")]
 pub(super) fn build_pdf_predictor_rosa(
-    _backend: &CompiledRateBackend,
-    max_order: i64,
+    backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
+    let crate::spec::core::RateBackendPlan::RosaPlus { max_order } = backend.plan() else {
+        unreachable!("rosa kernel used with non-rosa plan")
+    };
     Ok(crate::compression::RatePdfPredictor::Rosa(
-        crate::compression::RosaPredictor::new(max_order),
+        crate::compression::RosaPredictor::new(*max_order),
     ))
 }
 
 #[cfg(not(feature = "backend-rosa"))]
 pub(super) fn build_pdf_predictor_rosa(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::RosaPlus))
 }
@@ -21,7 +22,6 @@ pub(super) fn build_pdf_predictor_rosa(
 #[cfg(feature = "backend-match")]
 pub(super) fn build_pdf_predictor_match(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::Match {
         hash_bits,
@@ -47,7 +47,6 @@ pub(super) fn build_pdf_predictor_match(
 #[cfg(not(feature = "backend-match"))]
 pub(super) fn build_pdf_predictor_match(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Match))
 }
@@ -55,7 +54,6 @@ pub(super) fn build_pdf_predictor_match(
 #[cfg(feature = "backend-match")]
 pub(super) fn build_pdf_predictor_sparse_match(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::SparseMatch {
         hash_bits,
@@ -85,7 +83,6 @@ pub(super) fn build_pdf_predictor_sparse_match(
 #[cfg(not(feature = "backend-match"))]
 pub(super) fn build_pdf_predictor_sparse_match(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!(
         "{}",
@@ -96,7 +93,6 @@ pub(super) fn build_pdf_predictor_sparse_match(
 #[cfg(feature = "backend-ppmd")]
 pub(super) fn build_pdf_predictor_ppmd(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::Ppmd { order, memory_mb } = backend.plan() else {
         unreachable!("ppmd kernel used with non-ppmd plan")
@@ -109,7 +105,6 @@ pub(super) fn build_pdf_predictor_ppmd(
 #[cfg(not(feature = "backend-ppmd"))]
 pub(super) fn build_pdf_predictor_ppmd(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Ppmd))
 }
@@ -117,7 +112,6 @@ pub(super) fn build_pdf_predictor_ppmd(
 #[cfg(feature = "backend-sequitur")]
 pub(super) fn build_pdf_predictor_sequitur(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::Sequitur { context_bytes } = backend.plan() else {
         unreachable!("sequitur kernel used with non-sequitur plan")
@@ -130,7 +124,6 @@ pub(super) fn build_pdf_predictor_sequitur(
 #[cfg(not(feature = "backend-sequitur"))]
 pub(super) fn build_pdf_predictor_sequitur(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Sequitur))
 }
@@ -138,7 +131,6 @@ pub(super) fn build_pdf_predictor_sequitur(
 #[cfg(feature = "backend-ctw")]
 pub(super) fn build_pdf_predictor_ctw(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
         unreachable!("ctw kernel used with non-ctw plan")
@@ -151,7 +143,6 @@ pub(super) fn build_pdf_predictor_ctw(
 #[cfg(not(feature = "backend-ctw"))]
 pub(super) fn build_pdf_predictor_ctw(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Ctw))
 }
@@ -159,7 +150,6 @@ pub(super) fn build_pdf_predictor_ctw(
 #[cfg(feature = "backend-ctw")]
 pub(super) fn build_pdf_predictor_fac_ctw(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::FacCtw {
         base_depth,
@@ -177,7 +167,6 @@ pub(super) fn build_pdf_predictor_fac_ctw(
 #[cfg(not(feature = "backend-ctw"))]
 pub(super) fn build_pdf_predictor_fac_ctw(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::FacCtw))
 }
@@ -185,7 +174,6 @@ pub(super) fn build_pdf_predictor_fac_ctw(
 #[cfg(feature = "backend-mamba")]
 pub(super) fn build_pdf_predictor_mamba(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::Mamba { parsed_method, .. } = backend.plan() else {
         unreachable!("mamba kernel used with non-mamba plan")
@@ -198,7 +186,6 @@ pub(super) fn build_pdf_predictor_mamba(
 #[cfg(not(feature = "backend-mamba"))]
 pub(super) fn build_pdf_predictor_mamba(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Mamba))
 }
@@ -206,7 +193,6 @@ pub(super) fn build_pdf_predictor_mamba(
 #[cfg(feature = "backend-rwkv")]
 pub(super) fn build_pdf_predictor_rwkv(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::Rwkv7 { parsed_method, .. } = backend.plan() else {
         unreachable!("rwkv kernel used with non-rwkv plan")
@@ -219,7 +205,6 @@ pub(super) fn build_pdf_predictor_rwkv(
 #[cfg(not(feature = "backend-rwkv"))]
 pub(super) fn build_pdf_predictor_rwkv(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Rwkv7))
 }
@@ -227,7 +212,6 @@ pub(super) fn build_pdf_predictor_rwkv(
 #[cfg(feature = "backend-zpaq")]
 pub(super) fn build_pdf_predictor_zpaq(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
         unreachable!("zpaq kernel used with non-zpaq plan")
@@ -240,7 +224,6 @@ pub(super) fn build_pdf_predictor_zpaq(
 #[cfg(not(feature = "backend-zpaq"))]
 pub(super) fn build_pdf_predictor_zpaq(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Zpaq))
 }
@@ -248,17 +231,15 @@ pub(super) fn build_pdf_predictor_zpaq(
 #[cfg(feature = "backend-mixture")]
 pub(super) fn build_pdf_predictor_mixture(
     backend: &CompiledRateBackend,
-    max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     Ok(crate::compression::RatePdfPredictor::Mixture(
-        crate::compression::MixturePredictor::new_from_compiled(backend, max_order)?,
+        crate::compression::MixturePredictor::new_from_compiled(backend)?,
     ))
 }
 
 #[cfg(not(feature = "backend-mixture"))]
 pub(super) fn build_pdf_predictor_mixture(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Mixture))
 }
@@ -266,7 +247,6 @@ pub(super) fn build_pdf_predictor_mixture(
 #[cfg(feature = "backend-particle")]
 pub(super) fn build_pdf_predictor_particle(
     backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
         unreachable!("particle kernel used with non-particle plan")
@@ -279,7 +259,6 @@ pub(super) fn build_pdf_predictor_particle(
 #[cfg(not(feature = "backend-particle"))]
 pub(super) fn build_pdf_predictor_particle(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!("{}", rate_backend_feature_error(RateBackendKind::Particle))
 }
@@ -287,7 +266,6 @@ pub(super) fn build_pdf_predictor_particle(
 #[cfg(feature = "backend-calibrated")]
 pub(super) fn build_pdf_predictor_calibrated(
     backend: &CompiledRateBackend,
-    max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     let crate::spec::core::RateBackendPlan::Calibrated {
         context,
@@ -302,10 +280,7 @@ pub(super) fn build_pdf_predictor_calibrated(
     let base_backend = crate::spec::core::compiled_rate_backend_from_plan(base.clone())
         .map_err(|err| anyhow::anyhow!("failed to compile calibrated base backend plan: {err}"))?;
     Ok(crate::compression::RatePdfPredictor::Calibrated {
-        base: Box::new(build_rate_pdf_predictor_via_kernel(
-            &base_backend,
-            max_order,
-        )?),
+        base: Box::new(build_rate_pdf_predictor_via_kernel(&base_backend)?),
         core: CalibratorCore::new(*context, *bins, *learning_rate, *bias_clip),
         pdf: vec![1.0 / 256.0; 256],
         valid: false,
@@ -315,7 +290,6 @@ pub(super) fn build_pdf_predictor_calibrated(
 #[cfg(not(feature = "backend-calibrated"))]
 pub(super) fn build_pdf_predictor_calibrated(
     _backend: &CompiledRateBackend,
-    _max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     anyhow::bail!(
         "{}",

@@ -22,7 +22,7 @@ fn experts() -> Vec<MixtureExpertSpec> {
             num_percept_bits: 8,
         })
         .with_name("fac"),
-        MixtureExpertSpec::new(RateBackend::RosaPlus).with_name("rosa"),
+        MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: -1 }).with_name("rosa"),
     ]
 }
 
@@ -36,21 +36,21 @@ fn run_one(name: &str, kind: MixtureKind, bytes: &[u8]) {
     let backend = backend(kind).compile().expect("compile mixture backend");
 
     for _ in 0..WARMUP_ITERS {
-        let h = entropy_rate_backend(bytes, -1, &backend);
+        let h = entropy_rate_backend(bytes, &backend);
         black_box(h);
     }
 
     let start = Instant::now();
     let mut sum = 0.0;
     for _ in 0..BENCH_ITERS {
-        sum += entropy_rate_backend(bytes, -1, &backend);
+        sum += entropy_rate_backend(bytes, &backend);
     }
     black_box(sum);
     let elapsed = start.elapsed().as_secs_f64();
 
     let ms = elapsed * 1e3 / (BENCH_ITERS as f64);
     let mib_s = ((bytes.len() * BENCH_ITERS) as f64) / elapsed / (1024.0 * 1024.0);
-    let h = entropy_rate_backend(bytes, -1, &backend);
+    let h = entropy_rate_backend(bytes, &backend);
     println!(
         "{name:>7}: {:>9.3} ms/iter | {:>8.3} MiB/s | H={:.9}",
         ms, mib_s, h
@@ -67,6 +67,6 @@ fn main() {
     run_one("switch", MixtureKind::Switching, &bytes);
     run_one("bayes", MixtureKind::Bayes, &bytes);
 }
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
-    try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
+fn entropy_rate_backend(data: &[u8], backend: &CompiledRateBackend) -> f64 {
+    try_entropy_rate_backend(data, backend).expect("entropy rate")
 }

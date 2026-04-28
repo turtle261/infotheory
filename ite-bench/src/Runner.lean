@@ -107,15 +107,11 @@ private def oracleGenFromOutcome (key : String) (outcome : OracleOutcome) : IO (
   return (outcome.bundle, v)
 
 private def mkParams
-    (maxOrder : Option String := none)
     (rateBackend : Option String := none)
     (ncdBackend : Option String := none)
     (method : Option String := none) : EstimatorParams :=
   Id.run do
     let mut strings := HashMap.empty
-    match maxOrder with
-    | some v => strings := strings.insert "max_order" v
-    | none => pure ()
     match rateBackend with
     | some v => strings := strings.insert "rate_backend" v
     | none => pure ()
@@ -194,7 +190,7 @@ private def runSuite : IO Bool := do
     let (bundleH, truthHX) ← oracleGenFromOutcome "H_X" outcomeInd
     let (bundleMI, truthMI) ← oracleGenFromOutcome "I_XY" outcomeInd
 
-    let paramsMarg := mkParams (some "0")
+    let paramsMarg := mkParams
     let repHX ← verifyAccuracyWith est (fun _ => pure (bundleH, truthHX)) .shannonEntropy r paramsMarg 30
     let repMI ← verifyAccuracyWith est (fun _ => pure (bundleMI, truthMI)) .mutualInformation r paramsMarg 30
 
@@ -326,7 +322,7 @@ private def runSuite : IO Bool := do
     -- Entropy rate: binary Markov chain
     let outcomeMarkov ← (binaryMarkovOracle 0.9 0.8).generate r 60000
     let (bundleRate, truthRate) ← oracleGenFromOutcome "H_RATE" outcomeMarkov
-    let paramsRate := mkParams (some "-1")
+    let paramsRate := mkParams
     let repRate ← verifyAccuracyWith est (fun _ => pure (bundleRate, truthRate)) .entropyRate r paramsRate 20
     let tolRate := ToleranceDefaults.defaults.quantity .entropyRate r
     IO.println s!"[ACCURACY] Markov H_rate MAE={repRate.mae} maxAbs={repRate.maxAbsError} (tol={tolRate}, strictScale={strictScale}, allowed={strictScale*tolRate})"
@@ -335,7 +331,7 @@ private def runSuite : IO Bool := do
       IO.println "[FAIL] Entropy rate exceeded tolerance"
 
     -- Entropy rate with CTW backend and explicit depth
-    let paramsRateCtw := mkParams (some "-1") (some "ctw") none (some "16")
+    let paramsRateCtw := mkParams (some "ctw") none (some "16")
     let repRateCtw ← verifyAccuracyWith est (fun _ => pure (bundleRate, truthRate)) .entropyRate r paramsRateCtw 10
     IO.println s!"[ACCURACY] Markov H_rate (CTW) MAE={repRateCtw.mae} maxAbs={repRateCtw.maxAbsError} (tol={tolRate}, strictScale={strictScale}, allowed={strictScale*tolRate})"
     if repRateCtw.maxAbsError > strictScale * tolRate then
@@ -365,7 +361,7 @@ private def runSuite : IO Bool := do
       for i in [:pattern.size] do
         copyData := copyData.push (pattern.get! i)
     let copyBundle : SampleBundle := { bytesX := some copyData }
-    let paramsZpaq := mkParams (some "-1") (some "zpaq") none (some "2")
+    let paramsZpaq := mkParams (some "zpaq") none (some "2")
     let zpaqRate ← runEstimateIO est .entropyRate copyBundle paramsZpaq
     IO.println s!"[ACCURACY] ZPAQ H_rate on copy-like data = {zpaqRate}"
     if zpaqRate > 0.3 then

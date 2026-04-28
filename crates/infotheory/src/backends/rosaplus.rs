@@ -1640,12 +1640,7 @@ impl RosaPlus {
         self.sam.finalize_endpos();
         self.lm = LM::default();
         self.lm.build_alphabet(&self.sam);
-        let mo = if self.max_order < 0 {
-            -1
-        } else {
-            self.max_order
-        };
-        self.lm.build_counts(&self.sam, mo);
+        self.lm.build_counts(&self.sam, self.max_order);
         self.lm_built = true;
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
     }
@@ -1659,12 +1654,7 @@ impl RosaPlus {
     pub fn build_lm_no_finalize_endpos(&mut self) {
         self.lm = LM::default();
         self.lm.build_alphabet(&self.sam);
-        let mo = if self.max_order < 0 {
-            -1
-        } else {
-            self.max_order
-        };
-        self.lm.build_counts(&self.sam, mo);
+        self.lm.build_counts(&self.sam, self.max_order);
         self.lm_built = true;
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
     }
@@ -1700,12 +1690,7 @@ impl RosaPlus {
         }
 
         // Counts
-        let mo = if self.max_order < 0 {
-            -1
-        } else {
-            self.max_order
-        };
-        self.lm.build_counts(&self.sam, mo);
+        self.lm.build_counts(&self.sam, self.max_order);
         self.lm_built = true;
         self.dist.resize(BYTE_ALPHA_N, 0.0);
     }
@@ -2522,9 +2507,9 @@ impl RosaPlus {
         -total_log_prob / (data.len() as f64)
     }
 
-    /// Returns the marginal (unigram) distribution over the training data.
+    /// Returns the unigram distribution over the training data.
     /// Output: Vec of (codepoint, probability) pairs, sorted by codepoint.
-    pub fn marginal_distribution(&self) -> Vec<(u32, f64)> {
+    pub fn unigram_distribution(&self) -> Vec<(u32, f64)> {
         if self.lm.total_uni == 0 {
             return Vec::new();
         }
@@ -2541,9 +2526,9 @@ impl RosaPlus {
         result
     }
 
-    /// Compute the marginal entropy H(X) from the unigram distribution.
+    /// Compute the unigram entropy H(X) from the observed symbol frequencies.
     /// Returns bits per symbol.
-    pub fn marginal_entropy(&self) -> f64 {
+    pub fn unigram_entropy(&self) -> f64 {
         if self.lm.total_uni == 0 {
             return 0.0;
         }

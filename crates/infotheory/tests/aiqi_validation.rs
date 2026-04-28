@@ -30,7 +30,6 @@ fn base_config() -> AiqiConfig {
     cfg.history_prune_keep_steps = None;
     cfg.baseline_exploration = 0.01;
     cfg.random_seed = Some(11);
-    cfg.rate_backend_max_order = 20;
     cfg
 }
 
@@ -146,7 +145,6 @@ fn aiqi_with_generic_rate_backend_smoke_runs() {
         base_mix: 0.05,
         confidence_scale: 1.0,
     };
-    cfg.rate_backend_max_order = 8;
 
     let mut agent = AiqiAgent::new(cfg).expect("valid AIQI config");
     let mut env = SeededCoinFlipEnv::new(0.7);
@@ -167,7 +165,7 @@ fn aiqi_with_generic_rate_backend_smoke_runs() {
 #[test]
 fn aiqi_with_rosa_generic_planner_smoke_runs() {
     let mut cfg = base_config();
-    cfg.rate_backend = RateBackend::RosaPlus;
+    cfg.rate_backend = RateBackend::RosaPlus { max_order: 20 };
 
     let mut agent = AiqiAgent::new(cfg).expect("valid AIQI config");
     let mut env = SeededCoinFlipEnv::new(0.7);
@@ -298,7 +296,6 @@ fn rate_backend_bit_predictor_rejects_zpaq_backend() {
         RateBackend::Zpaq {
             method: infotheory::api::ZpaqMethodSpec::literal("1"),
         },
-        8,
         1e-12,
     )
     .expect("zpaq compiles before bit-predictor capability check");

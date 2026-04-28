@@ -217,7 +217,6 @@ def test_run_aiqi_with_generic_rate_backend_smoke():
         augmentation_period=2,
         baseline_exploration=0.01,
         rate_backend=ait.RateBackend.ppmd(order=4, memory_mb=8),
-        rate_backend_max_order=8,
     )
     summary = ait.run_aiqi_with_environment(
         env,
@@ -239,12 +238,9 @@ def test_run_mcaixi_with_generic_mixture_rate_backend_smoke():
         ait.MixtureSpec(
             ait.MixtureKind.Convex,
             [
-                ait.MixtureExpertSpec(
-                    ait.RateBackend.ctw(6), max_order=-1, log_prior=0.0, name="ctw"
-                ),
+                ait.MixtureExpertSpec(ait.RateBackend.ctw(6), log_prior=0.0, name="ctw"),
                 ait.MixtureExpertSpec(
                     ait.RateBackend.ppmd(order=4, memory_mb=8),
-                    max_order=-1,
                     log_prior=0.0,
                     name="ppmd",
                 ),
@@ -266,7 +262,6 @@ def test_run_mcaixi_with_generic_mixture_rate_backend_smoke():
         max_reward=1,
         reward_offset=0,
         random_seed=77,
-        rate_backend_max_order=8,
     )
     summary = ait.run_agent_with_environment(
         env,
@@ -418,7 +413,6 @@ def test_aiqi_rejects_zpaq_rate_backend_in_strict_mode():
             return_bins=8,
             augmentation_period=2,
             baseline_exploration=0.01,
-            rate_backend_max_order=8,
         )
 
 
@@ -435,7 +429,6 @@ def test_mcaixi_rejects_zpaq_rate_backend_in_strict_mode():
             min_reward=0,
             max_reward=1,
             reward_offset=0,
-            rate_backend_max_order=8,
         )
 
 

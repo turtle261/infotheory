@@ -658,41 +658,33 @@ fn restore_fac_ctw_checkpoint(
 
 impl RateBackendPredictor {
     /// Create a new online predictor from a compiled rate backend plan.
-    pub fn try_from_compiled(
-        backend: &CompiledRateBackend,
-        max_order: i64,
-        min_prob: f64,
-    ) -> Result<Self, String> {
-        crate::runtime::build_rate_backend_predictor(backend, max_order, min_prob)
+    pub fn try_from_compiled(backend: &CompiledRateBackend, min_prob: f64) -> Result<Self, String> {
+        crate::runtime::build_rate_backend_predictor(backend, min_prob)
     }
 
     /// Create a new online predictor from a rate backend configuration.
-    pub fn try_from_backend(
-        backend: RateBackend,
-        max_order: i64,
-        min_prob: f64,
-    ) -> Result<Self, String> {
+    pub fn try_from_backend(backend: RateBackend, min_prob: f64) -> Result<Self, String> {
         let compiled = backend.compile().map_err(|err| err.to_string())?;
-        Self::try_from_compiled(&compiled, max_order, min_prob)
+        Self::try_from_compiled(&compiled, min_prob)
     }
 
     /// Create a new online predictor from a rate backend configuration.
-    pub fn from_backend(backend: RateBackend, max_order: i64, min_prob: f64) -> Self {
-        Self::try_from_backend(backend, max_order, min_prob)
+    pub fn from_backend(backend: RateBackend, min_prob: f64) -> Self {
+        Self::try_from_backend(backend, min_prob)
             .unwrap_or_else(|err| panic!("failed to build RateBackendPredictor: {err}"))
     }
 
     /// Create a new online predictor from a compiled rate backend plan.
-    pub fn from_compiled(backend: &CompiledRateBackend, max_order: i64, min_prob: f64) -> Self {
-        Self::try_from_compiled(backend, max_order, min_prob)
+    pub fn from_compiled(backend: &CompiledRateBackend, min_prob: f64) -> Self {
+        Self::try_from_compiled(backend, min_prob)
             .unwrap_or_else(|err| panic!("failed to build RateBackendPredictor: {err}"))
     }
 
-    /// Human-readable default name for a backend + config.
-    pub fn default_name(backend: &RateBackend, max_order: i64) -> String {
+    /// Human-readable default name for a backend.
+    pub fn default_name(backend: &RateBackend) -> String {
         backend
             .compile()
-            .map(|compiled| compiled.default_name(max_order))
+            .map(|compiled| compiled.default_name())
             .unwrap_or_else(|_| {
                 backend
                     .descriptor()
@@ -1705,47 +1697,39 @@ impl ExpertConfig {
         Self::new(name, 0.0, builder)
     }
 
-    /// Expert from a `RateBackend` configuration. `max_order` applies to ROSA.
-    pub fn from_rate_backend(
-        name: Option<String>,
-        log_prior: f64,
-        backend: RateBackend,
-        max_order: i64,
-    ) -> Self {
-        let name = name.unwrap_or_else(|| RateBackendPredictor::default_name(&backend, max_order));
+    /// Expert from a `RateBackend` configuration. ROSA's `max_order` lives inside
+    /// the [`RateBackend::RosaPlus`] variant.
+    pub fn from_rate_backend(name: Option<String>, log_prior: f64, backend: RateBackend) -> Self {
+        let name = name.unwrap_or_else(|| RateBackendPredictor::default_name(&backend));
         Self::new(name, log_prior, move || {
             Box::new(RateBackendPredictor::from_backend(
                 backend.clone(),
-                max_order,
                 DEFAULT_MIN_PROB,
             ))
         })
     }
 
-    /// Expert from a compiled rate backend plan. `max_order` applies to ROSA.
+    /// Expert from a compiled rate backend plan.
     pub fn from_compiled_rate_backend(
         name: Option<String>,
         log_prior: f64,
         backend: CompiledRateBackend,
-        max_order: i64,
     ) -> Self {
-        let name = name.unwrap_or_else(|| backend.display_label(max_order));
+        let name = name.unwrap_or_else(|| backend.display_label());
         Self::new(name, log_prior, move || {
             Box::new(RateBackendPredictor::from_compiled(
                 &backend,
-                max_order,
                 DEFAULT_MIN_PROB,
             ))
         })
     }
 
-    /// ROSA expert (uniform prior).
+    /// ROSA expert (uniform prior) with explicit `max_order`.
     pub fn rosa(name: impl Into<String>, max_order: i64) -> Self {
         let name = name.into();
         Self::uniform(name, move || {
             Box::new(RateBackendPredictor::from_backend(
-                RateBackend::RosaPlus,
-                max_order,
+                RateBackend::RosaPlus { max_order },
                 DEFAULT_MIN_PROB,
             ))
         })
@@ -1757,7 +1741,6 @@ impl ExpertConfig {
         Self::uniform(name, move || {
             Box::new(RateBackendPredictor::from_backend(
                 RateBackend::Ctw { depth },
-                -1,
                 DEFAULT_MIN_PROB,
             ))
         })
@@ -1773,7 +1756,6 @@ impl ExpertConfig {
                     num_percept_bits: encoding_bits,
                     encoding_bits,
                 },
-                -1,
                 DEFAULT_MIN_PROB,
             ))
         })
@@ -1790,7 +1772,6 @@ impl ExpertConfig {
                 RateBackend::Rwkv7Method {
                     method: method.clone(),
                 },
-                -1,
                 DEFAULT_MIN_PROB,
             ))
         })
@@ -1807,7 +1788,6 @@ impl ExpertConfig {
                 RateBackend::MambaMethod {
                     method: method.clone(),
                 },
-                -1,
                 DEFAULT_MIN_PROB,
             ))
         })
@@ -1822,7 +1802,6 @@ impl ExpertConfig {
                 RateBackend::Zpaq {
                     method: method.clone(),
                 },
-                -1,
                 DEFAULT_MIN_PROB,
             ))
         })
@@ -1857,7 +1836,6 @@ impl ExpertConfig {
 #[cfg(feature = "backend-mixture")]
 pub(crate) fn expert_configs_from_compiled_mixture(
     backend: &CompiledRateBackend,
-    max_order_fallback: i64,
 ) -> Result<Vec<ExpertConfig>, String> {
     let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = backend.plan() else {
         return Err("compiled backend is not a mixture backend".to_string());
@@ -1872,11 +1850,6 @@ pub(crate) fn expert_configs_from_compiled_mixture(
                 expert.name.clone(),
                 expert.log_prior,
                 compiled,
-                if expert.max_order >= 0 {
-                    expert.max_order
-                } else {
-                    max_order_fallback
-                },
             ))
         })
         .collect::<Result<Vec<_>, String>>()?)
@@ -3548,9 +3521,8 @@ mod tests {
     }
 
     fn assert_log_prob_update_matches_separate(label: &str, backend: RateBackend) {
-        let mut separate =
-            RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
-        let mut combined = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+        let mut separate = RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB);
+        let mut combined = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
         let data = b"combined step check data";
 
         for &b in data {
@@ -3580,8 +3552,8 @@ mod tests {
     }
 
     fn assert_fill_matches_symbol_queries(label: &str, backend: RateBackend) {
-        let mut bulk = RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
-        let mut queried = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+        let mut bulk = RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB);
+        let mut queried = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
         let data = b"continuation consistency prompt";
 
         bulk.begin_stream(Some(data.len() as u64))
@@ -3614,8 +3586,8 @@ mod tests {
         let condition = b"If a cat is red, toads are \n";
         let total = (fit.len() + condition.len()) as u64;
 
-        let mut bulk = RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
-        let mut queried = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+        let mut bulk = RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB);
+        let mut queried = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
 
         bulk.begin_stream(Some(total)).expect("bulk begin");
         queried.begin_stream(Some(total)).expect("query begin");
@@ -3647,7 +3619,7 @@ mod tests {
 
     #[test]
     fn predictor_log_prob_update_matches_separate_update_for_rosa_backend() {
-        assert_log_prob_update_matches_separate("rosa", RateBackend::RosaPlus);
+        assert_log_prob_update_matches_separate("rosa", RateBackend::RosaPlus { max_order: -1 });
     }
 
     #[test]
@@ -3669,7 +3641,7 @@ mod tests {
 
     #[test]
     fn predictor_fill_matches_symbol_queries_for_rosa_backend() {
-        assert_fill_matches_symbol_queries("rosa", RateBackend::RosaPlus);
+        assert_fill_matches_symbol_queries("rosa", RateBackend::RosaPlus { max_order: -1 });
     }
 
     #[test]
@@ -3715,7 +3687,10 @@ mod tests {
 
     #[test]
     fn predictor_fill_matches_symbol_queries_for_rosa_backend_after_frozen_conditioning() {
-        assert_fill_matches_symbol_queries_after_frozen_conditioning("rosa", RateBackend::RosaPlus);
+        assert_fill_matches_symbol_queries_after_frozen_conditioning(
+            "rosa",
+            RateBackend::RosaPlus { max_order: -1 },
+        );
     }
 
     #[test]
@@ -3728,7 +3703,6 @@ mod tests {
                 base_mix: 0.02,
                 confidence_scale: 1.0,
             },
-            -1,
             DEFAULT_MIN_PROB,
         );
 
@@ -3760,7 +3734,6 @@ mod tests {
                 base_mix: 0.02,
                 confidence_scale: 1.0,
             },
-            -1,
             DEFAULT_MIN_PROB,
         );
 
@@ -3886,7 +3859,6 @@ mod tests {
             vec![crate::MixtureExpertSpec {
                 name: Some("begin-aware".to_string()),
                 log_prior: 0.0,
-                max_order: -1,
                 backend: RateBackend::Ctw { depth: 1 },
             }],
         );
@@ -3901,9 +3873,8 @@ mod tests {
         let backend = RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
         };
-        let mut baseline =
-            RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
-        let mut probe = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+        let mut baseline = RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB);
+        let mut probe = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
 
         let history = b"history for zpaq predictor";
         for &b in history {
@@ -3929,8 +3900,7 @@ mod tests {
     }
 
     fn assert_checkpoint_roundtrip_restores_predictor(backend: RateBackend, history: &[u8]) {
-        let mut predictor =
-            RateBackendPredictor::from_backend(backend.clone(), -1, DEFAULT_MIN_PROB);
+        let mut predictor = RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB);
         predictor.begin_stream(None).expect("begin stream");
         for &byte in history {
             predictor.update(byte);
@@ -3967,15 +3937,17 @@ mod tests {
     #[test]
     fn rosa_checkpoint_restores_exact_predictor_state() {
         assert_checkpoint_roundtrip_restores_predictor(
-            RateBackend::RosaPlus,
+            RateBackend::RosaPlus { max_order: -1 },
             b"rosa checkpoint base history",
         );
     }
 
     #[test]
     fn rosa_checkpoint_uses_compact_journal_marker() {
-        let mut predictor =
-            RateBackendPredictor::from_backend(RateBackend::RosaPlus, -1, DEFAULT_MIN_PROB);
+        let mut predictor = RateBackendPredictor::from_backend(
+            RateBackend::RosaPlus { max_order: -1 },
+            DEFAULT_MIN_PROB,
+        );
         match predictor.checkpoint() {
             RateBackendPredictorCheckpoint::Rosa { journal_len } => {
                 assert_eq!(journal_len, 0);
@@ -4022,7 +3994,7 @@ mod tests {
     }
 
     fn assert_predictor_log_probs_normalize_to_one(backend: RateBackend) {
-        let mut predictor = RateBackendPredictor::from_backend(backend, -1, DEFAULT_MIN_PROB);
+        let mut predictor = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
         for &b in b"normalization corpus for ctw/fac predictor checks" {
             predictor.update(b);
         }

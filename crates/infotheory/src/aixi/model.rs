@@ -437,7 +437,6 @@ impl Predictor for ZpaqPredictor {
 /// backend coverage over rollback efficiency.
 pub struct RateBackendBitPredictor {
     backend: CompiledRateBackend,
-    max_order: i64,
     min_prob: f64,
     predictor: RateBackendPredictor,
     journal: Vec<RateBackendJournalEntry>,
@@ -528,8 +527,6 @@ impl From<SpecError> for RateBackendBitPredictorError {
 pub struct RateBackendBitPredictorConfig {
     /// Compiled backend used by the bit-level adapter.
     pub backend: CompiledRateBackend,
-    /// Max-order hint for backends that use one.
-    pub max_order: i64,
     /// Probability floor used when normalizing binary probabilities.
     pub min_prob: f64,
 }
@@ -538,7 +535,6 @@ impl RateBackendBitPredictorConfig {
     /// Compile a rate backend into a bit-predictor configuration.
     pub fn compile(
         backend: RateBackend,
-        max_order: i64,
         min_prob: f64,
     ) -> Result<Self, RateBackendBitPredictorError> {
         let compiled = backend
@@ -546,7 +542,6 @@ impl RateBackendBitPredictorConfig {
             .map_err(RateBackendBitPredictorError::from)?;
         Ok(Self {
             backend: compiled,
-            max_order,
             min_prob,
         })
     }
@@ -575,23 +570,17 @@ impl RateBackendBitPredictor {
     pub fn new(
         config: RateBackendBitPredictorConfig,
     ) -> Result<Self, RateBackendBitPredictorError> {
-        let RateBackendBitPredictorConfig {
-            backend,
-            max_order,
-            min_prob,
-        } = config;
+        let RateBackendBitPredictorConfig { backend, min_prob } = config;
         if backend.contains_zpaq() {
             return Err(RateBackendBitPredictorError::UnsupportedZpaq);
         }
-        let mut predictor =
-            crate::runtime::build_rate_backend_predictor(&backend, max_order, min_prob)
-                .map_err(RateBackendBitPredictorError::Runtime)?;
+        let mut predictor = crate::runtime::build_rate_backend_predictor(&backend, min_prob)
+            .map_err(RateBackendBitPredictorError::Runtime)?;
         predictor
             .begin_stream(None)
             .map_err(RateBackendBitPredictorError::StreamStart)?;
         Ok(Self {
             backend,
-            max_order,
             min_prob,
             predictor,
             journal: Vec::new(),
@@ -607,7 +596,6 @@ impl RateBackendBitPredictor {
     fn clone_state(&self) -> Self {
         Self {
             backend: self.backend.clone(),
-            max_order: self.max_order,
             min_prob: self.min_prob,
             predictor: self.predictor.clone(),
             journal: self.journal.clone(),
@@ -706,10 +694,7 @@ impl Predictor for RateBackendBitPredictor {
     }
 
     fn model_name(&self) -> String {
-        format!(
-            "RateBackendBits({})",
-            self.backend.default_name(self.max_order)
-        )
+        format!("RateBackendBits({})", self.backend.default_name())
     }
 
     fn boxed_clone(&self) -> Box<dyn Predictor> {
@@ -720,7 +705,6 @@ impl Predictor for RateBackendBitPredictor {
 /// Build the predictor used by the MC-AIXI runtime from a compiled backend.
 pub(crate) fn build_mc_aixi_predictor(
     backend: &CompiledRateBackend,
-    max_order: i64,
     #[allow(unused_variables)] percept_bits: usize,
 ) -> Result<Box<dyn Predictor>, PredictorBuildError> {
     match backend.canonical_spec() {
@@ -731,15 +715,14 @@ pub(crate) fn build_mc_aixi_predictor(
         #[cfg(feature = "backend-ctw")]
         RateBackend::Ctw { depth } => Ok(Box::new(CtwPredictor::new(*depth))),
         #[cfg(feature = "backend-rosa")]
-        RateBackend::RosaPlus => Ok(Box::new(RosaPredictor::new(max_order))),
-        _ => Ok(Box::new(build_compiled_bit_predictor(backend, max_order)?)),
+        RateBackend::RosaPlus { max_order } => Ok(Box::new(RosaPredictor::new(*max_order))),
+        _ => Ok(Box::new(build_compiled_bit_predictor(backend)?)),
     }
 }
 
 /// Build the predictor used by the AIQI runtime from a compiled backend.
 pub(crate) fn build_aiqi_predictor(
     backend: &CompiledRateBackend,
-    max_order: i64,
     #[allow(unused_variables)] return_bits: usize,
 ) -> Result<Box<dyn Predictor>, PredictorBuildError> {
     match backend.canonical_spec() {
@@ -749,13 +732,12 @@ pub(crate) fn build_aiqi_predictor(
         RateBackend::FacCtw { base_depth, .. } => {
             Ok(Box::new(FacCtwPredictor::new(*base_depth, return_bits)))
         }
-        _ => Ok(Box::new(build_compiled_bit_predictor(backend, max_order)?)),
+        _ => Ok(Box::new(build_compiled_bit_predictor(backend)?)),
     }
 }
 
 fn build_compiled_bit_predictor(
     backend: &CompiledRateBackend,
-    max_order: i64,
 ) -> Result<RateBackendBitPredictor, PredictorBuildError> {
     let bit_backend = if backend.supports_bit_token_adaptation() {
         backend
@@ -766,7 +748,6 @@ fn build_compiled_bit_predictor(
     };
     RateBackendBitPredictor::new(RateBackendBitPredictorConfig {
         backend: bit_backend,
-        max_order,
         min_prob: DEFAULT_MIN_PROB,
     })
     .map_err(PredictorBuildError::BitPredictor)
@@ -1006,15 +987,15 @@ mod tests {
         signature
     }
 
-    fn bit_predictor(backend: RateBackend, max_order: i64) -> RateBackendBitPredictor {
-        let config = RateBackendBitPredictorConfig::compile(backend, max_order, DEFAULT_MIN_PROB)
+    fn bit_predictor(backend: RateBackend) -> RateBackendBitPredictor {
+        let config = RateBackendBitPredictorConfig::compile(backend, DEFAULT_MIN_PROB)
             .expect("rate backend bit predictor config should compile");
         RateBackendBitPredictor::new(config).expect("rate backend predictor should initialize")
     }
 
     #[test]
     fn committed_rate_backend_updates_do_not_grow_journal() {
-        let mut predictor = bit_predictor(RateBackend::RosaPlus, 8);
+        let mut predictor = bit_predictor(RateBackend::RosaPlus { max_order: 8 });
 
         for idx in 0..512usize {
             predictor.commit_update((idx & 1) == 0);
@@ -1029,7 +1010,7 @@ mod tests {
 
     #[test]
     fn reversible_rate_backend_update_paths_round_trip_exactly() {
-        let mut predictor = bit_predictor(RateBackend::RosaPlus, 8);
+        let mut predictor = bit_predictor(RateBackend::RosaPlus { max_order: 8 });
         for &bit in &[true, false, true, true, false, false, true] {
             predictor.commit_update(bit);
         }
@@ -1070,7 +1051,7 @@ mod tests {
 
     #[test]
     fn long_committed_history_does_not_contaminate_clone_rollback_state() {
-        let mut predictor = bit_predictor(RateBackend::RosaPlus, 8);
+        let mut predictor = bit_predictor(RateBackend::RosaPlus { max_order: 8 });
 
         for idx in 0..2048usize {
             predictor.commit_update((idx & 7) < 3);
@@ -1101,7 +1082,7 @@ mod tests {
 
     #[test]
     fn rollback_scope_restores_simulation_state_without_growing_journal() {
-        let mut predictor = bit_predictor(RateBackend::RosaPlus, 8);
+        let mut predictor = bit_predictor(RateBackend::RosaPlus { max_order: 8 });
         for &bit in &[true, false, true, false, true] {
             predictor.commit_update(bit);
         }
@@ -1128,7 +1109,7 @@ mod tests {
 
     #[test]
     fn cloned_predictor_carries_only_active_scope_snapshots() {
-        let mut predictor = bit_predictor(RateBackend::RosaPlus, 8);
+        let mut predictor = bit_predictor(RateBackend::RosaPlus { max_order: 8 });
         for idx in 0..1024usize {
             predictor.commit_update((idx & 3) == 0);
         }
@@ -1148,30 +1129,24 @@ mod tests {
     #[test]
     fn generic_rate_backend_bit_predictors_normalize_binary_mass() {
         assert_binary_predictor_normalizes(
-            Box::new(bit_predictor(RateBackend::RosaPlus, 8)),
+            Box::new(bit_predictor(RateBackend::RosaPlus { max_order: 8 })),
             "generic-rosa",
         );
         assert_binary_predictor_normalizes(
-            Box::new(bit_predictor(
-                RateBackend::Ppmd {
-                    order: 4,
-                    memory_mb: 8,
-                },
-                8,
-            )),
+            Box::new(bit_predictor(RateBackend::Ppmd {
+                order: 4,
+                memory_mb: 8,
+            })),
             "generic-ppmd",
         );
         assert_binary_predictor_normalizes(
-            Box::new(bit_predictor(
-                RateBackend::Match {
-                    hash_bits: 16,
-                    min_len: 2,
-                    max_len: 32,
-                    base_mix: 0.05,
-                    confidence_scale: 1.0,
-                },
-                8,
-            )),
+            Box::new(bit_predictor(RateBackend::Match {
+                hash_bits: 16,
+                min_len: 2,
+                max_len: 32,
+                base_mix: 0.05,
+                confidence_scale: 1.0,
+            })),
             "generic-match",
         );
     }

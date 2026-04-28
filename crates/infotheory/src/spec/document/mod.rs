@@ -353,24 +353,6 @@ impl CompiledPlannerController {
         }
     }
 
-    /// Predictor `max_order` hint shared across all controller variants.
-    pub fn predictor_max_order(&self) -> i64 {
-        match self {
-            Self::McAixi {
-                predictor_max_order,
-                ..
-            }
-            | Self::AiqiDiscounted {
-                predictor_max_order,
-                ..
-            }
-            | Self::AiqiWarmstartExactJh {
-                predictor_max_order,
-                ..
-            } => *predictor_max_order,
-        }
-    }
-
     /// Stable canonical kind name string for this controller variant.
     pub fn kind_str(&self) -> &'static str {
         match self {
@@ -380,9 +362,12 @@ impl CompiledPlannerController {
         }
     }
 
-    /// Human-readable predictor backend label, including any `max_order` hint.
+    /// Human-readable predictor backend label.
+    ///
+    /// Backend-local algorithm parameters (such as ROSA's `max_order`) are
+    /// derived from the backend's variant directly.
     pub fn backend_label(&self) -> String {
-        self.predictor().display_label(self.predictor_max_order())
+        self.predictor().display_label()
     }
 }
 

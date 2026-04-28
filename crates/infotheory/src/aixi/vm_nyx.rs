@@ -23,7 +23,7 @@
 use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::environment::Environment;
 use crate::api::{
-    CompiledRateBackend, RateBackend, marginal_entropy_bytes, try_cross_entropy_rate_backend,
+    CompiledRateBackend, RateBackend, empirical_entropy_bytes, try_cross_entropy_rate_backend,
     try_entropy_rate_backend,
 };
 #[cfg(feature = "backend-ctw")]
@@ -411,6 +411,10 @@ pub enum NyxRewardPolicy {
 }
 
 /// Optional reward shaping (additive to base reward).
+///
+/// Algorithmic configuration for the entropy estimator (such as ROSA's
+/// `max_order`) lives inside the active `stats_backend`'s
+/// [`crate::api::RateBackend`] variant.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum NyxRewardShaping {
@@ -418,8 +422,6 @@ pub enum NyxRewardShaping {
     EntropyReduction {
         /// Reference bytes used as baseline data distribution.
         baseline_bytes: Vec<u8>,
-        /// Max order passed to entropy estimators.
-        max_order: i64,
         /// Scaling factor applied to the shaping term.
         scale: f64,
         /// Optional additive bonus when guest crashes.
@@ -429,8 +431,6 @@ pub enum NyxRewardShaping {
     },
     /// Entropy of trace data (online learning).
     TraceEntropy {
-        /// Max order passed to trace entropy estimation.
-        max_order: i64,
         /// Scaling factor applied to the shaping term.
         scale: f64,
         /// If true, normalize by trace length.
@@ -462,6 +462,10 @@ impl std::fmt::Debug for NyxRewardPolicy {
 // ============================================================================
 
 /// Information-theoretic action filtering.
+///
+/// Algorithmic configuration for the entropy estimator (such as ROSA's
+/// `max_order`) lives inside the active `stats_backend`'s
+/// [`crate::api::RateBackend`] variant.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct NyxActionFilter {
@@ -475,8 +479,6 @@ pub struct NyxActionFilter {
     pub min_novelty: Option<f64>,
     /// Prior corpus for novelty computation.
     pub novelty_prior: Option<Vec<u8>>,
-    /// Max order for entropy estimation.
-    pub max_order: i64,
     /// Reward to assign when action is rejected.
     pub reject_reward: Option<i64>,
 }
@@ -496,7 +498,6 @@ impl Default for NyxActionFilter {
             min_intrinsic_dependence: None,
             min_novelty: None,
             novelty_prior: None,
-            max_order: 8,
             reject_reward: None,
         }
     }
@@ -702,7 +703,6 @@ impl NyxVmConfig {
         let reward_shaping = match &self.reward_shaping {
             Some(NyxRewardShaping::EntropyReduction {
                 baseline_bytes: _,
-                max_order,
                 scale,
                 crash_bonus,
                 timeout_bonus,
@@ -714,21 +714,17 @@ impl NyxVmConfig {
                 });
                 Some(VmRewardShapingSpec::EntropyReduction {
                     baseline_asset: asset_id,
-                    max_order: *max_order,
                     scale: *scale,
                     crash_bonus: *crash_bonus,
                     timeout_bonus: *timeout_bonus,
                 })
             }
-            Some(NyxRewardShaping::TraceEntropy {
-                max_order,
-                scale,
-                normalize,
-            }) => Some(VmRewardShapingSpec::TraceEntropy {
-                max_order: *max_order,
-                scale: *scale,
-                normalize: *normalize,
-            }),
+            Some(NyxRewardShaping::TraceEntropy { scale, normalize }) => {
+                Some(VmRewardShapingSpec::TraceEntropy {
+                    scale: *scale,
+                    normalize: *normalize,
+                })
+            }
             None => None,
         };
         let action_filter = self.action_filter.as_ref().map(|filter| {
@@ -746,7 +742,6 @@ impl NyxVmConfig {
                 min_intrinsic_dependence: filter.min_intrinsic_dependence,
                 min_novelty: filter.min_novelty,
                 novelty_prior_asset,
-                max_order: filter.max_order,
                 reject_reward: filter.reject_reward,
             }
         });
@@ -893,26 +888,21 @@ impl NyxVmConfig {
         let reward_shaping = match &spec.reward_shaping {
             Some(VmRewardShapingSpec::EntropyReduction {
                 baseline_asset,
-                max_order,
                 scale,
                 crash_bonus,
                 timeout_bonus,
             }) => Some(NyxRewardShaping::EntropyReduction {
                 baseline_bytes: read_resolved_asset_bytes(resolved_assets, baseline_asset)?,
-                max_order: *max_order,
                 scale: *scale,
                 crash_bonus: *crash_bonus,
                 timeout_bonus: *timeout_bonus,
             }),
-            Some(VmRewardShapingSpec::TraceEntropy {
-                max_order,
-                scale,
-                normalize,
-            }) => Some(NyxRewardShaping::TraceEntropy {
-                max_order: *max_order,
-                scale: *scale,
-                normalize: *normalize,
-            }),
+            Some(VmRewardShapingSpec::TraceEntropy { scale, normalize }) => {
+                Some(NyxRewardShaping::TraceEntropy {
+                    scale: *scale,
+                    normalize: *normalize,
+                })
+            }
             None => None,
         };
         let action_source = match &spec.action_source {
@@ -1004,7 +994,6 @@ impl NyxVmConfig {
                         .as_ref()
                         .map(|id| read_resolved_asset_bytes(resolved_assets, id))
                         .transpose()?,
-                    max_order: filter.max_order,
                     reject_reward: filter.reject_reward,
                 })
             })
@@ -1186,6 +1175,9 @@ impl From<ExitReason> for NyxExitKind {
 enum TraceModel {
     #[cfg(feature = "backend-rosa")]
     Rosa { model: RosaPlus, max_order: i64 },
+    // `max_order` is preserved here so that `reset()` can rebuild a fresh
+    // `RosaPlus` with the same `max_order` configured by the active backend
+    // variant; it is read once at construction from `RateBackendPlan::RosaPlus`.
     #[cfg(feature = "backend-ctw")]
     Ctw { tree: ContextTree },
     #[cfg(feature = "backend-ctw")]
@@ -1213,7 +1205,7 @@ enum TraceModel {
 
 impl TraceModel {
     fn predictor_backed(backend: CompiledRateBackend) -> anyhow::Result<Self> {
-        let mut model = crate::runtime::build_rate_backend_predictor(&backend, -1, 2f64.powi(-24))
+        let mut model = crate::runtime::build_rate_backend_predictor(&backend, 2f64.powi(-24))
             .map_err(|e| anyhow::anyhow!("predictor-backed init failed: {e}"))?;
         model
             .begin_stream(None)
@@ -1221,17 +1213,21 @@ impl TraceModel {
         Ok(TraceModel::Mixture { backend, model })
     }
 
-    fn new(backend: &CompiledRateBackend, max_order: i64) -> anyhow::Result<Self> {
-        #[cfg(not(feature = "backend-rosa"))]
-        let _ = max_order;
-
+    fn new(backend: &CompiledRateBackend) -> anyhow::Result<Self> {
         #[allow(unreachable_patterns)]
         match crate::runtime::rate_backend_trace_model_strategy(backend) {
             #[cfg(feature = "backend-rosa")]
             crate::runtime::TraceModelStrategy::Rosa => {
-                let mut model = RosaPlus::new(max_order, false, 0, 42);
+                let crate::spec::core::RateBackendPlan::RosaPlus { max_order } = backend.plan()
+                else {
+                    unreachable!("rosa trace strategy used with non-rosa backend")
+                };
+                let mut model = RosaPlus::new(*max_order, false, 0, 42);
                 model.build_lm_full_bytes_no_finalize_endpos();
-                Ok(TraceModel::Rosa { model, max_order })
+                Ok(TraceModel::Rosa {
+                    model,
+                    max_order: *max_order,
+                })
             }
             crate::runtime::TraceModelStrategy::PredictorBacked => {
                 TraceModel::predictor_backed(backend.clone())
@@ -1329,7 +1325,7 @@ impl TraceModel {
                 model.reset();
             }
             TraceModel::Mixture { backend, model } => {
-                *model = crate::runtime::build_rate_backend_predictor(backend, -1, 2f64.powi(-24))
+                *model = crate::runtime::build_rate_backend_predictor(backend, 2f64.powi(-24))
                     .map_err(|e| anyhow::anyhow!("mixture model reset failed: {e}"))?;
                 model
                     .begin_stream(None)
@@ -1531,8 +1527,8 @@ impl NyxVmEnvironment {
 
         // Initialize trace model if needed
         let trace_model = match &reward_shaping {
-            Some(NyxRewardShaping::TraceEntropy { max_order, .. }) => Some(
-                TraceModel::new(&compiled_stats_backend, *max_order)
+            Some(NyxRewardShaping::TraceEntropy { .. }) => Some(
+                TraceModel::new(&compiled_stats_backend)
                     .map_err(|err| anyhow::anyhow!("failed to initialize trace model: {err}"))?,
             ),
             _ => None,
@@ -1540,21 +1536,14 @@ impl NyxVmEnvironment {
 
         // Compute baseline entropy if needed
         let baseline_entropy = match &reward_shaping {
-            Some(NyxRewardShaping::EntropyReduction {
-                baseline_bytes,
-                max_order,
-                ..
-            }) => {
-                let h = if *max_order == 0 {
-                    marginal_entropy_bytes(baseline_bytes)
-                } else {
-                    try_entropy_rate_backend(baseline_bytes, *max_order, &compiled_stats_backend)
-                        .map_err(|err| {
-                            anyhow::anyhow!(
-                                "validated vm stats_backend failed to score baseline entropy: {err}"
-                            )
-                        })?
-                };
+            Some(NyxRewardShaping::EntropyReduction { baseline_bytes, .. }) => {
+                let h = try_entropy_rate_backend(baseline_bytes, &compiled_stats_backend).map_err(
+                    |err| {
+                        anyhow::anyhow!(
+                            "validated vm stats_backend failed to score baseline entropy: {err}"
+                        )
+                    },
+                )?;
                 Some(h)
             }
             _ => None,
@@ -2053,15 +2042,11 @@ impl NyxVmEnvironment {
         payload: &[u8],
         filter: &NyxActionFilter,
     ) -> anyhow::Result<(f64, f64, f64)> {
-        let h_marg = marginal_entropy_bytes(payload);
-        let h_rate = if filter.max_order == 0 {
-            h_marg
-        } else {
-            try_entropy_rate_backend(payload, filter.max_order, &self.compiled_stats_backend)
-                .map_err(|err| {
-                    anyhow::anyhow!("vm stats backend failed to score payload entropy: {err}")
-                })?
-        };
+        let h_marg = empirical_entropy_bytes(payload);
+        let h_rate =
+            try_entropy_rate_backend(payload, &self.compiled_stats_backend).map_err(|err| {
+                anyhow::anyhow!("vm stats backend failed to score payload entropy: {err}")
+            })?;
 
         let intrinsic = if h_marg < 1e-9 {
             0.0
@@ -2070,13 +2055,8 @@ impl NyxVmEnvironment {
         };
 
         let novelty = if let Some(ref prior) = filter.novelty_prior {
-            try_cross_entropy_rate_backend(
-                payload,
-                prior,
-                filter.max_order,
-                &self.compiled_stats_backend,
-            )
-            .map_err(|err| anyhow::anyhow!("vm stats backend failed to score novelty: {err}"))?
+            try_cross_entropy_rate_backend(payload, prior, &self.compiled_stats_backend)
+                .map_err(|err| anyhow::anyhow!("vm stats backend failed to score novelty: {err}"))?
         } else {
             0.0
         };
@@ -2125,7 +2105,6 @@ impl NyxVmEnvironment {
     ) -> anyhow::Result<Reward> {
         Ok(match shaping {
             NyxRewardShaping::EntropyReduction {
-                max_order,
                 scale,
                 crash_bonus,
                 timeout_bonus,
@@ -2137,16 +2116,12 @@ impl NyxVmEnvironment {
                     } else {
                         &result.shared_memory
                     };
-                    let h_obs = if *max_order == 0 {
-                        marginal_entropy_bytes(data)
-                    } else {
-                        try_entropy_rate_backend(data, *max_order, &self.compiled_stats_backend)
-                            .map_err(|err| {
-                                anyhow::anyhow!(
-                                    "vm stats backend failed to score observation entropy: {err}"
-                                )
-                            })?
-                    };
+                    let h_obs = try_entropy_rate_backend(data, &self.compiled_stats_backend)
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "vm stats backend failed to score observation entropy: {err}"
+                            )
+                        })?;
                     let h_base = self.baseline_entropy.unwrap_or(0.0);
                     let er = (h_base - h_obs) * scale;
                     er.round() as i64
@@ -2773,7 +2748,6 @@ mod tests {
             },
             reward_shaping: Some(VmRewardShapingSpec::EntropyReduction {
                 baseline_asset: "baseline".to_string(),
-                max_order: 7,
                 scale: 0.25,
                 crash_bonus: Some(5),
                 timeout_bonus: Some(6),
@@ -2789,7 +2763,6 @@ mod tests {
                 min_intrinsic_dependence: Some(0.05),
                 min_novelty: Some(0.2),
                 novelty_prior_asset: Some("novelty".to_string()),
-                max_order: 5,
                 reject_reward: Some(-3),
             }),
             action_prefix: "ACT ".to_string(),
@@ -3024,7 +2997,6 @@ mod tests {
                     vec![MixtureExpertSpec {
                         name: Some("ctw".to_string()),
                         log_prior: 0.0,
-                        max_order: -1,
                         backend: RateBackend::Ctw { depth: 8 },
                     }],
                 )),
@@ -3033,7 +3005,7 @@ mod tests {
 
         for backend in backends {
             let compiled = backend.compile().expect("compiled trace backend");
-            let mut model = TraceModel::new(&compiled, 4).expect("trace model should initialize");
+            let mut model = TraceModel::new(&compiled).expect("trace model should initialize");
             let bits = model.update_and_score(b"trace payload");
             assert!(bits.is_finite() && bits >= 0.0, "bits={bits}");
             model.reset().expect("trace model should reset");

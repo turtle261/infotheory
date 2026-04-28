@@ -1,4 +1,4 @@
-use crate::api::{InfotheoryCtx, marginal_entropy_bytes, try_cross_entropy_bytes};
+use crate::api::{InfotheoryCtx, empirical_cross_entropy_bytes, empirical_entropy_bytes};
 use crate::backends::rosaplus::RosaPlus;
 use crate::error::{InfotheoryError, InfotheoryResult};
 #[cfg(feature = "backend-rwkv")]
@@ -43,12 +43,10 @@ fn stage0_prefilter(
 
     // Option A: Unigram (i.i.d.) likelihood-gain proxy.
     // score0(x) = H0(Q) - H0(Q|X)
-    // where H0(Q|X) is computed as cross-entropy of Q under X's unigram model.
-    let h0_q = marginal_entropy_bytes(query_bytes);
+    // where H0(Q|X) is the empirical cross-entropy of Q under X's unigram model.
+    let h0_q = empirical_entropy_bytes(query_bytes);
     candidates.par_iter_mut().try_for_each(|s| {
-        let h0_q_x = try_cross_entropy_bytes(query_bytes, &s.content, 0).map_err(|err| {
-            InfotheoryError::runtime(format!("stage-0 search scoring failed: {err}"))
-        })?;
+        let h0_q_x = empirical_cross_entropy_bytes(query_bytes, &s.content);
         s.score = h0_q - h0_q_x;
         Ok::<(), InfotheoryError>(())
     })?;
@@ -108,13 +106,14 @@ pub struct SearchOptions {
     pub universal_prior: Option<String>,
     /// Whether/how Stage-2 reranking uses universal prior context.
     pub stage2_prior_mode: Stage2PriorMode,
-    /// Maximum model order used by entropy-rate estimators.
-    pub max_order: i64,
     /// Number of final results to keep.
     pub top_k: usize,
     /// Fraction of candidates retained by the unigram prefilter.
     pub stage0_keep_frac: f64,
     /// Fully configured information-theory context/backend bundle.
+    ///
+    /// Algorithm-specific configuration (such as ROSA's `max_order`) lives
+    /// inside the rate backend's variant and is read from it when needed.
     pub ctx: InfotheoryCtx,
 }
 
@@ -138,7 +137,6 @@ impl SearchOptions {
             granularity: SearchGranularity::Snippet,
             universal_prior: None,
             stage2_prior_mode: Stage2PriorMode::Use,
-            max_order: 8,
             top_k: 50,
             stage0_keep_frac: 0.2,
             ctx: default_search_ctx()?,
@@ -281,7 +279,7 @@ fn stage1_filter_no_prior(
 ) -> InfotheoryResult<Vec<Snippet>> {
     let h_q = opts
         .ctx
-        .try_entropy_rate_bytes(query_bytes, opts.max_order)
+        .try_entropy_rate_bytes(query_bytes)
         .map_err(|err| InfotheoryError::runtime(format!("stage-1 search entropy failed: {err}")))?;
 
     let scored: InfotheoryResult<Vec<Snippet>> = candidates
@@ -289,7 +287,7 @@ fn stage1_filter_no_prior(
         .map(|mut snippet| {
             let h_q_x = opts
                 .ctx
-                .try_cross_entropy_rate_bytes(query_bytes, &snippet.content, opts.max_order)
+                .try_cross_entropy_rate_bytes(query_bytes, &snippet.content)
                 .map_err(|err| {
                     InfotheoryError::runtime(format!("stage-1 search cross entropy failed: {err}"))
                 })?;
@@ -645,7 +643,7 @@ fn prior_cache_path(prior_path: &str, max_order: i64) -> Option<PathBuf> {
 
     let mut hasher = DefaultHasher::new();
     // Cache format/version (bump when training or serialization semantics change).
-    (4u32).hash(&mut hasher);
+    (5u32).hash(&mut hasher);
     prior_path.hash(&mut hasher);
     max_order.hash(&mut hasher);
     // file-granularity is baked into the cache key (we always use it for prior training)
@@ -655,8 +653,16 @@ fn prior_cache_path(prior_path: &str, max_order: i64) -> Option<PathBuf> {
 }
 
 fn load_or_train_prior_model(prior_path: &str, opts: &SearchOptions) -> RosaPlus {
+    // This path is only reached when the backend's trace strategy is Rosa,
+    // so the plan is guaranteed to be RosaPlus.
+    let crate::spec::core::RateBackendPlan::RosaPlus { max_order } = opts.ctx.rate_backend.plan()
+    else {
+        unreachable!("load_or_train_prior_model called with non-ROSA backend")
+    };
+    let max_order: i64 = *max_order;
+
     // Load cached prior model if present.
-    if let Some(cache_path) = prior_cache_path(prior_path, opts.max_order) {
+    if let Some(cache_path) = prior_cache_path(prior_path, max_order) {
         if let Some(parent) = cache_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -672,7 +678,7 @@ fn load_or_train_prior_model(prior_path: &str, opts: &SearchOptions) -> RosaPlus
         }
 
         // Train + save.
-        let mut m = RosaPlus::new(opts.max_order, false, 0, 42);
+        let mut m = RosaPlus::new(max_order, false, 0, 42);
         train_rosa_on_corpus(&mut m, prior_path, SearchGranularity::File);
         // Build a fixed-byte alphabet LM once so the saved model is the full state.
         m.build_lm_full_bytes_no_finalize_endpos();
@@ -681,7 +687,7 @@ fn load_or_train_prior_model(prior_path: &str, opts: &SearchOptions) -> RosaPlus
     }
 
     // Fallback: no cache location available.
-    let mut m = RosaPlus::new(opts.max_order, false, 0, 42);
+    let mut m = RosaPlus::new(max_order, false, 0, 42);
     train_rosa_on_corpus(&mut m, prior_path, SearchGranularity::File);
     m
 }
@@ -944,7 +950,7 @@ mod tests {
         fs::write(&path, b"haystack").expect("write search target");
 
         let ctx = InfotheoryCtx::from_specs(
-            RateBackend::RosaPlus,
+            RateBackend::RosaPlus { max_order: -1 },
             CompressionBackend::Zpaq {
                 method: crate::api::ZpaqMethodSpec::literal("definitely-invalid-zpaq-method"),
             },
@@ -980,7 +986,10 @@ mod tests {
                 framing,
             } => {
                 assert!(cfg!(not(feature = "backend-zpaq")));
-                assert!(matches!(rate_backend, &crate::api::RateBackend::RosaPlus));
+                assert!(matches!(
+                    rate_backend,
+                    &crate::api::RateBackend::RosaPlus { .. }
+                ));
                 assert_eq!(*coder, crate::coders::CoderType::AC);
                 assert_eq!(*framing, crate::compression::FramingMode::Raw);
             }

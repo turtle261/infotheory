@@ -421,27 +421,20 @@ pub(super) fn parse_nyx_reward_shaping(
                 .ok_or_else(|| anyhow::anyhow!("vm_reward_shaping.baseline_path is required"))?;
             let baseline_path = infotheory::spec::resolve_spec_path(base_dir, baseline_path);
             let baseline_bytes = std::fs::read(&baseline_path)?;
-            let max_order = v["max_order"].as_i64().unwrap_or(8);
             let scale = v["scale"].as_f64().unwrap_or(10.0);
             let crash_bonus = v["crash_bonus"].as_i64();
             let timeout_bonus = v["timeout_bonus"].as_i64();
             Ok(Some(NyxRewardShaping::EntropyReduction {
                 baseline_bytes,
-                max_order,
                 scale,
                 crash_bonus,
                 timeout_bonus,
             }))
         }
         "trace_entropy" => {
-            let max_order = v["max_order"].as_i64().unwrap_or(8);
             let scale = v["scale"].as_f64().unwrap_or(1.0);
             let normalize = v["normalize"].as_bool().unwrap_or(false);
-            Ok(Some(NyxRewardShaping::TraceEntropy {
-                max_order,
-                scale,
-                normalize,
-            }))
+            Ok(Some(NyxRewardShaping::TraceEntropy { scale, normalize }))
         }
         "none" => Ok(None),
         other => Err(anyhow::anyhow!("unknown vm_reward_shaping.mode '{other}'")),
@@ -470,7 +463,6 @@ pub(super) fn parse_nyx_filter(
     filter.min_intrinsic_dependence = v["min_intrinsic_dependence"].as_f64();
     filter.min_novelty = v["min_novelty"].as_f64();
     filter.novelty_prior = novelty_prior;
-    filter.max_order = v["max_order"].as_i64().unwrap_or(8);
     filter.reject_reward = reject_reward;
     Ok(Some(filter))
 }
@@ -936,7 +928,6 @@ pub(super) fn validate_obs_stream_len(expected: usize, actual: usize) -> anyhow:
 
 pub(super) struct BuiltCtx {
     pub(super) ctx: InfotheoryCtx,
-    pub(super) expert_spec_max_order: Option<i64>,
 }
 
 pub(super) fn build_ctx(
@@ -945,12 +936,12 @@ pub(super) fn build_ctx(
     method: Option<&str>,
     expert_spec_path: Option<&str>,
 ) -> BuiltCtx {
-    let (rate_backend, expert_spec_max_order) = if let Some(path) = expert_spec_path {
+    let rate_backend = if let Some(path) = expert_spec_path {
         let spec = load_expert_spec(path).unwrap_or_else(|e| {
             eprintln!("Error: failed to load expert spec '{path}': {e}");
             std::process::exit(1);
         });
-        (spec.backend, Some(spec.max_order))
+        spec.backend
     } else {
         let mut shorthand = infotheory::spec::RateBackendShorthandOptions::default();
         shorthand.base_dir = std::path::PathBuf::from(".");
@@ -968,14 +959,11 @@ pub(super) fn build_ctx(
             }
             shorthand
         };
-        (
-            infotheory::spec::parse_rate_backend_name_method(rate_backend, method, &shorthand)
-                .unwrap_or_else(|e| {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }),
-            None,
-        )
+        infotheory::spec::parse_rate_backend_name_method(rate_backend, method, &shorthand)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            })
     };
 
     #[allow(unused_mut)]
@@ -1007,7 +995,6 @@ pub(super) fn build_ctx(
             eprintln!("Error: {e}");
             std::process::exit(1);
         }),
-        expert_spec_max_order,
     }
 }
 
@@ -1157,9 +1144,9 @@ fn json_error(message: impl std::fmt::Display) -> String {
     .to_string()
 }
 
-fn try_metrics_summary(data: &[u8], max_order: i64) -> InfotheoryResult<(f64, f64, f64, usize)> {
-    let h0 = marginal_entropy_bytes(data);
-    let h_rate = try_entropy_rate_bytes(data, max_order)?;
+fn try_metrics_summary(data: &[u8]) -> InfotheoryResult<(f64, f64, f64, usize)> {
+    let h0 = empirical_entropy_bytes(data);
+    let h_rate = try_entropy_rate_bytes(data)?;
     let id = if h0 < 1e-9 {
         0.0
     } else {
@@ -1175,15 +1162,15 @@ fn format_metrics_json(h0: f64, h_rate: f64, id: f64, len: usize) -> String {
     )
 }
 
-fn rosa_distance(x: &[u8], y: &[u8], max_order: i64) -> InfotheoryResult<f64> {
+fn rosa_distance(x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
     if x.is_empty() || y.is_empty() {
         return Ok(1.0);
     }
 
-    let h_x_x = try_biased_entropy_rate_bytes(x, max_order)?;
-    let h_y_y = try_biased_entropy_rate_bytes(y, max_order)?;
-    let h_y_x = try_cross_entropy_rate_bytes(x, y, max_order)?;
-    let h_x_y = try_cross_entropy_rate_bytes(y, x, max_order)?;
+    let h_x_x = try_biased_entropy_rate_bytes(x)?;
+    let h_y_y = try_biased_entropy_rate_bytes(y)?;
+    let h_y_x = try_cross_entropy_rate_bytes(x, y)?;
+    let h_x_y = try_cross_entropy_rate_bytes(y, x)?;
 
     if h_x_x < 1e-9 || h_y_y < 1e-9 {
         return Ok(1.0);
@@ -1217,14 +1204,13 @@ pub(super) fn process_json_line(line: &str) -> String {
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
             let data = text.as_bytes();
 
             if data.is_empty() {
                 return r#"{"error":"empty text"}"#.to_string();
             }
 
-            match try_metrics_summary(data, max_order) {
+            match try_metrics_summary(data) {
                 Ok((h0, h_rate, id, len)) => format_metrics_json(h0, h_rate, id, len),
                 Err(err) => json_error(format!("metrics failed: {err}")),
             }
@@ -1235,10 +1221,9 @@ pub(super) fn process_json_line(line: &str) -> String {
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             match std::fs::read(&path) {
-                Ok(data) => match try_metrics_summary(&data, max_order) {
+                Ok(data) => match try_metrics_summary(&data) {
                     Ok((h0, h_rate, id, len)) => format_metrics_json(h0, h_rate, id, len),
                     Err(err) => json_error(format!("metrics_file failed: {err}")),
                 },
@@ -1330,7 +1315,6 @@ pub(super) fn process_json_line(line: &str) -> String {
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             let x = text1.as_bytes();
             let y = text2.as_bytes();
@@ -1338,7 +1322,7 @@ pub(super) fn process_json_line(line: &str) -> String {
                 return r#"{"error":"empty text(s)"}"#.to_string();
             }
 
-            match rosa_distance(x, y, max_order) {
+            match rosa_distance(x, y) {
                 Ok(dist) => format!(r#"{{"rosa_dist":{:.6}}}"#, dist),
                 Err(err) => json_error(format!("rosa_dist failed: {err}")),
             }
@@ -1354,7 +1338,6 @@ pub(super) fn process_json_line(line: &str) -> String {
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             let x = text_x.as_bytes();
             let y = text_y.as_bytes();
@@ -1362,7 +1345,7 @@ pub(super) fn process_json_line(line: &str) -> String {
                 return r#"{"error":"empty text(s)"}"#.to_string();
             }
 
-            match try_cross_entropy_rate_bytes(x, y, max_order) {
+            match try_cross_entropy_rate_bytes(x, y) {
                 Ok(xe) => format!(r#"{{"cross_entropy":{:.6}}}"#, xe),
                 Err(err) => json_error(format!("cross_entropy failed: {err}")),
             }
@@ -1377,7 +1360,6 @@ pub(super) fn process_json_line(line: &str) -> String {
                         .collect()
                 })
                 .unwrap_or_default();
-            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             let results: Vec<String> = texts
                 .iter()
@@ -1386,7 +1368,7 @@ pub(super) fn process_json_line(line: &str) -> String {
                     if data.is_empty() {
                         r#"{"h0":0,"h_rate":0,"id":0,"len":0}"#.to_string()
                     } else {
-                        match try_metrics_summary(data, max_order) {
+                        match try_metrics_summary(data) {
                             Ok((h0, h_rate, id, len)) => format_metrics_json(h0, h_rate, id, len),
                             Err(err) => serde_json::json!({
                                 "error": format!("{err}"),
@@ -1456,7 +1438,6 @@ pub(super) fn process_json_line(line: &str) -> String {
                         .collect()
                 })
                 .unwrap_or_default();
-            let max_order = v.get("max_order").and_then(|x| x.as_i64()).unwrap_or(-1);
 
             let n = texts.len();
             let datas: Vec<&[u8]> = texts.iter().map(|t| t.as_bytes()).collect();
@@ -1466,7 +1447,7 @@ pub(super) fn process_json_line(line: &str) -> String {
                     let d = if i == j {
                         0.0
                     } else {
-                        match rosa_distance(datas[i], datas[j], max_order) {
+                        match rosa_distance(datas[i], datas[j]) {
                             Ok(dist) => dist,
                             Err(err) => {
                                 return json_error(format!("rosa_matrix failed: {err}"));
@@ -1506,12 +1487,12 @@ pub(super) fn process_json_line(line: &str) -> String {
                 return format!(r#"{{"pass":false,"reason":"too_short","len":{}}}"#, len);
             }
 
-            let h0 = marginal_entropy_bytes(data);
+            let h0 = empirical_entropy_bytes(data);
             if h0 < h0_threshold {
                 return format!(r#"{{"pass":false,"reason":"low_entropy","h0":{:.4}}}"#, h0);
             }
 
-            let h_rate = match try_entropy_rate_bytes(data, -1) {
+            let h_rate = match try_entropy_rate_bytes(data) {
                 Ok(h_rate) => h_rate,
                 Err(err) => return json_error(format!("spam_check failed: {err}")),
             };

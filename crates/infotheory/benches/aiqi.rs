@@ -29,7 +29,6 @@ fn base_cfg(backend: RateBackend) -> AiqiConfig {
     cfg.history_prune_keep_steps = None;
     cfg.baseline_exploration = 1e-12;
     cfg.random_seed = Some(7);
-    cfg.rate_backend_max_order = 8;
     cfg
 }
 
@@ -39,14 +38,12 @@ fn mixture_backend() -> RateBackend {
             let mut expert = MixtureExpertSpec::new(RateBackend::Ctw { depth: 10 });
             expert.name = Some("ctw".to_string());
             expert.log_prior = 0.0;
-            expert.max_order = -1;
             expert
         },
         {
-            let mut expert = MixtureExpertSpec::new(RateBackend::RosaPlus);
+            let mut expert = MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: 8 });
             expert.name = Some("rosa".to_string());
             expert.log_prior = 0.0;
-            expert.max_order = 8;
             expert
         },
     ];
@@ -72,7 +69,7 @@ fn main() {
 
     let benches = [
         ("ctw", base_cfg(RateBackend::Ctw { depth: 12 })),
-        ("rosaplus", base_cfg(RateBackend::RosaPlus)),
+        ("rosaplus", base_cfg(RateBackend::RosaPlus { max_order: 8 })),
         ("mix-bayes", base_cfg(mixture_backend())),
     ];
 

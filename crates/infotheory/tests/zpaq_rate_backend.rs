@@ -13,7 +13,7 @@ fn zpaq_rate_backend_compresses_copy_data() {
         method: infotheory::api::ZpaqMethodSpec::literal("2"),
     };
     let backend = backend.compile().expect("compile zpaq rate backend");
-    let rate = try_entropy_rate_backend(&data, -1, &backend).expect("entropy rate");
+    let rate = try_entropy_rate_backend(&data, &backend).expect("entropy rate");
     assert!(
         rate < 0.5,
         "expected low entropy rate for copy-like data, got {rate:.4}"

@@ -132,7 +132,6 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
         ControllerSpec::McAixi(inner) => Ok(serde_json::json!({
             "kind": "mc_aixi",
             "predictor": rate_backend_to_json_value(&inner.predictor)?,
-            "predictor_max_order": inner.predictor_max_order,
             "agent_horizon": inner.agent_horizon,
             "num_simulations": inner.num_simulations,
             "mcts_strategy": mcts_strategy_to_json_value(inner.mcts_strategy),
@@ -142,7 +141,6 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
         ControllerSpec::AiqiDiscounted(inner) => Ok(serde_json::json!({
             "kind": "aiqi_discounted",
             "predictor": rate_backend_to_json_value(&inner.predictor)?,
-            "predictor_max_order": inner.predictor_max_order,
             "discount_gamma": inner.discount_gamma,
             "return_horizon": inner.return_horizon,
             "return_bins": inner.return_bins,
@@ -153,7 +151,6 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
         ControllerSpec::AiqiWarmstartExactJh(inner) => Ok(serde_json::json!({
             "kind": "aiqi_warmstart_exact_jh",
             "predictor": rate_backend_to_json_value(&inner.predictor)?,
-            "predictor_max_order": inner.predictor_max_order,
             "return_horizon": inner.return_horizon,
             "return_bins": inner.return_bins,
             "label_phase_period": inner.label_phase_period,
@@ -267,25 +264,18 @@ fn vm_reward_shaping_to_json_value(spec: &VmRewardShapingSpec) -> serde_json::Va
     match spec {
         VmRewardShapingSpec::EntropyReduction {
             baseline_asset,
-            max_order,
             scale,
             crash_bonus,
             timeout_bonus,
         } => serde_json::json!({
             "kind": "entropy_reduction",
             "baseline_asset": baseline_asset,
-            "max_order": max_order,
             "scale": scale,
             "crash_bonus": crash_bonus,
             "timeout_bonus": timeout_bonus,
         }),
-        VmRewardShapingSpec::TraceEntropy {
-            max_order,
-            scale,
-            normalize,
-        } => serde_json::json!({
+        VmRewardShapingSpec::TraceEntropy { scale, normalize } => serde_json::json!({
             "kind": "trace_entropy",
-            "max_order": max_order,
             "scale": scale,
             "normalize": normalize,
         }),
@@ -336,7 +326,6 @@ fn vm_action_filter_to_json_value(spec: &VmActionFilterSpec) -> serde_json::Valu
         "min_intrinsic_dependence": spec.min_intrinsic_dependence,
         "min_novelty": spec.min_novelty,
         "novelty_prior_asset": spec.novelty_prior_asset,
-        "max_order": spec.max_order,
         "reject_reward": spec.reject_reward,
     })
 }

@@ -151,7 +151,7 @@ fn flatten_compiled_mixture(backend: &CompiledRateBackend) -> Result<FlatSchema>
             depth: 0,
             path: "0:root".to_string(),
             display_name: "root".to_string(),
-            backend_label: backend.display_label(-1),
+            backend_label: backend.display_label(),
             is_mixture: true,
             is_leaf: false,
             is_root_child: false,
@@ -193,7 +193,7 @@ fn flatten_experts(
         let raw_display_name = expert
             .name
             .clone()
-            .unwrap_or_else(|| backend.default_name(expert.max_order));
+            .unwrap_or_else(|| backend.default_name());
         let display_name = sanitize_tsv_text(&raw_display_name);
         let node_id = schema.nodes.len();
         let path = format!(
@@ -208,7 +208,7 @@ fn flatten_experts(
             depth,
             path,
             display_name,
-            backend_label: sanitize_tsv_text(&backend.display_label(expert.max_order)),
+            backend_label: sanitize_tsv_text(&backend.display_label()),
             is_mixture,
             is_leaf: !is_mixture,
             is_root_child: root_level,
@@ -309,7 +309,7 @@ pub fn run_ac_log_loss_mixture_bytes(
         None
     };
 
-    let mut predictor = DiagnosticRatePredictor::from_compiled(&compiled_backend, -1)?;
+    let mut predictor = DiagnosticRatePredictor::from_compiled(&compiled_backend)?;
     predictor.begin_stream(data.len())?;
 
     let trace_file = File::create(&trace_path)
@@ -548,13 +548,11 @@ mod tests {
                 MixtureExpertSpec {
                     name: Some("leaf-a".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: base.clone(),
                 },
                 MixtureExpertSpec {
                     name: Some("nested".to_string()),
                     log_prior: -0.1,
-                    max_order: -1,
                     backend: RateBackend::Mixture {
                         spec: Arc::new(MixtureSpec::new(
                             MixtureKind::Bayes,
@@ -562,13 +560,11 @@ mod tests {
                                 MixtureExpertSpec {
                                     name: Some("leaf-b".to_string()),
                                     log_prior: 0.0,
-                                    max_order: -1,
                                     backend: base.clone(),
                                 },
                                 MixtureExpertSpec {
                                     name: Some("leaf-c".to_string()),
                                     log_prior: 0.0,
-                                    max_order: -1,
                                     backend: base,
                                 },
                             ],
@@ -601,12 +597,9 @@ mod tests {
     #[test]
     fn diagnostic_snapshot_matches_root_pdf_and_oracle_minimum() {
         let spec = test_nested_spec(RateBackend::Ctw { depth: 6 });
-        let mut predictor = DiagnosticRatePredictor::from_rate_backend(
-            RateBackend::Mixture {
-                spec: Arc::new(spec.clone()),
-            },
-            -1,
-        )
+        let mut predictor = DiagnosticRatePredictor::from_rate_backend(RateBackend::Mixture {
+            spec: Arc::new(spec.clone()),
+        })
         .expect("predictor");
         let data = b"nested diagnostic payload";
         predictor.begin_stream(data.len()).expect("begin stream");
@@ -669,7 +662,6 @@ mod tests {
         let encoded = crate::compression::compress_rate_bytes(
             data,
             &backend,
-            -1,
             crate::coders::CoderType::AC,
             crate::compression::FramingMode::Raw,
         )

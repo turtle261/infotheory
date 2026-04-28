@@ -512,12 +512,11 @@ struct PyMixtureExpertSpec {
 #[pymethods]
 impl PyMixtureExpertSpec {
     #[new]
-    #[pyo3(signature = (backend, max_order=-1, log_prior=0.0, name=None))]
-    fn new(backend: &PyRateBackend, max_order: i64, log_prior: f64, name: Option<String>) -> Self {
+    #[pyo3(signature = (backend, log_prior=0.0, name=None))]
+    fn new(backend: &PyRateBackend, log_prior: f64, name: Option<String>) -> Self {
         let mut inner = MixtureExpertSpec::new(backend.inner.clone());
         inner.name = name;
         inner.log_prior = log_prior;
-        inner.max_order = max_order;
         Self { inner }
     }
 }
@@ -734,9 +733,10 @@ struct PyRateBackend {
 #[pymethods]
 impl PyRateBackend {
     #[staticmethod]
-    fn rosaplus() -> Self {
+    #[pyo3(signature = (max_order=-1))]
+    fn rosaplus(max_order: i64) -> Self {
         Self {
-            inner: RateBackend::RosaPlus,
+            inner: RateBackend::RosaPlus { max_order },
         }
     }
 
@@ -975,12 +975,6 @@ struct PyInfotheoryCtx {
     inner: InfotheoryCtx,
 }
 
-#[pyclass(name = "RateBackendSession", from_py_object)]
-#[derive(Clone)]
-struct PyRateBackendSession {
-    inner: Arc<Mutex<RateBackendSession>>,
-}
-
 #[pymethods]
 impl PyInfotheoryCtx {
     #[new]
@@ -1002,26 +996,21 @@ impl PyInfotheoryCtx {
         })
     }
 
-    fn entropy_rate_bytes(&self, py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
+    fn entropy_rate_bytes(&self, py: Python<'_>, data: &[u8]) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_entropy_rate_bytes(data, max_order)
+                    .try_entropy_rate_bytes(data)
                     .map_err(py_infotheory_error)
             })
         })
     }
 
-    fn biased_entropy_rate_bytes(
-        &self,
-        py: Python<'_>,
-        data: &[u8],
-        max_order: i64,
-    ) -> PyResult<f64> {
+    fn biased_entropy_rate_bytes(&self, py: Python<'_>, data: &[u8]) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_biased_entropy_rate_bytes(data, max_order)
+                    .try_biased_entropy_rate_bytes(data)
                     .map_err(py_infotheory_error)
             })
         })
@@ -1053,12 +1042,11 @@ impl PyInfotheoryCtx {
         py: Python<'_>,
         test_data: &[u8],
         train_data: &[u8],
-        max_order: i64,
     ) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_cross_entropy_rate_bytes(test_data, train_data, max_order)
+                    .try_cross_entropy_rate_bytes(test_data, train_data)
                     .map_err(py_infotheory_error)
             })
         })
@@ -1069,44 +1057,31 @@ impl PyInfotheoryCtx {
         py: Python<'_>,
         test_data: &[u8],
         train_data: &[u8],
-        max_order: i64,
     ) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_cross_entropy_bytes(test_data, train_data, max_order)
+                    .try_cross_entropy_bytes(test_data, train_data)
                     .map_err(py_infotheory_error)
             })
         })
     }
 
-    fn joint_entropy_rate_bytes(
-        &self,
-        py: Python<'_>,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> PyResult<f64> {
+    fn joint_entropy_rate_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_joint_entropy_rate_bytes(x, y, max_order)
+                    .try_joint_entropy_rate_bytes(x, y)
                     .map_err(py_infotheory_error)
             })
         })
     }
 
-    fn conditional_entropy_rate_bytes(
-        &self,
-        py: Python<'_>,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> PyResult<f64> {
+    fn conditional_entropy_rate_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_conditional_entropy_rate_bytes(x, y, max_order)
+                    .try_conditional_entropy_rate_bytes(x, y)
                     .map_err(py_infotheory_error)
             })
         })
@@ -1128,94 +1103,59 @@ impl PyInfotheoryCtx {
         })
     }
 
-    fn mutual_information_rate_bytes(
-        &self,
-        py: Python<'_>,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> PyResult<f64> {
+    fn mutual_information_rate_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_mutual_information_rate_bytes(x, y, max_order)
+                    .try_mutual_information_rate_bytes(x, y)
                     .map_err(py_infotheory_error)
             })
         })
     }
 
-    fn mutual_information_bytes(
-        &self,
-        py: Python<'_>,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> PyResult<f64> {
+    fn mutual_information_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_mutual_information_bytes(x, y, max_order)
+                    .try_mutual_information_bytes(x, y)
                     .map_err(py_infotheory_error)
             })
         })
     }
 
-    fn conditional_entropy_bytes(
-        &self,
-        py: Python<'_>,
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-    ) -> PyResult<f64> {
+    fn conditional_entropy_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_conditional_entropy_bytes(x, y, max_order)
+                    .try_conditional_entropy_bytes(x, y)
                     .map_err(py_infotheory_error)
             })
         })
     }
 
-    fn ned_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
+    fn ned_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
+        py.detach(|| py_try(|| self.inner.try_ned_bytes(x, y).map_err(py_infotheory_error)))
+    }
+
+    fn ned_cons_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_ned_bytes(x, y, max_order)
+                    .try_ned_cons_bytes(x, y)
                     .map_err(py_infotheory_error)
             })
         })
     }
 
-    fn ned_cons_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-        py.detach(|| {
-            py_try(|| {
-                self.inner
-                    .try_ned_cons_bytes(x, y, max_order)
-                    .map_err(py_infotheory_error)
-            })
-        })
+    fn nte_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
+        py.detach(|| py_try(|| self.inner.try_nte_bytes(x, y).map_err(py_infotheory_error)))
     }
 
-    fn nte_bytes(&self, py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
+    fn intrinsic_dependence_bytes(&self, py: Python<'_>, data: &[u8]) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_nte_bytes(x, y, max_order)
-                    .map_err(py_infotheory_error)
-            })
-        })
-    }
-
-    fn intrinsic_dependence_bytes(
-        &self,
-        py: Python<'_>,
-        data: &[u8],
-        max_order: i64,
-    ) -> PyResult<f64> {
-        py.detach(|| {
-            py_try(|| {
-                self.inner
-                    .try_intrinsic_dependence_bytes(data, max_order)
+                    .try_intrinsic_dependence_bytes(data)
                     .map_err(py_infotheory_error)
             })
         })
@@ -1226,44 +1166,41 @@ impl PyInfotheoryCtx {
         py: Python<'_>,
         x: &[u8],
         tx: &[u8],
-        max_order: i64,
     ) -> PyResult<f64> {
         py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_resistance_to_transformation_bytes(x, tx, max_order)
+                    .try_resistance_to_transformation_bytes(x, tx)
                     .map_err(py_infotheory_error)
             })
         })
     }
 
-    #[pyo3(signature = (prompt, bytes, max_order=-1, config=None))]
+    #[pyo3(signature = (prompt, bytes, config=None))]
     fn generate_bytes<'py>(
         &self,
         py: Python<'py>,
         prompt: &[u8],
         bytes: usize,
-        max_order: i64,
         config: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let cfg = generation_config_from_py(config)?;
         let out: Vec<u8> = py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_generate_bytes_with_config(prompt, bytes, max_order, cfg)
+                    .try_generate_bytes_with_config(prompt, bytes, cfg)
                     .map_err(py_infotheory_error)
             })
         })?;
         Ok(PyBytes::new(py, &out))
     }
 
-    #[pyo3(signature = (prefix_parts, bytes, max_order=-1, config=None))]
+    #[pyo3(signature = (prefix_parts, bytes, config=None))]
     fn generate_bytes_conditional_chain<'py>(
         &self,
         py: Python<'py>,
         prefix_parts: Vec<Vec<u8>>,
         bytes: usize,
-        max_order: i64,
         config: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let cfg = generation_config_from_py(config)?;
@@ -1271,22 +1208,18 @@ impl PyInfotheoryCtx {
         let out: Vec<u8> = py.detach(|| {
             py_try(|| {
                 self.inner
-                    .try_generate_bytes_conditional_chain_with_config(&refs, bytes, max_order, cfg)
+                    .try_generate_bytes_conditional_chain_with_config(&refs, bytes, cfg)
                     .map_err(py_infotheory_error)
             })
         })?;
         Ok(PyBytes::new(py, &out))
     }
 
-    #[pyo3(signature = (max_order=-1, total_symbols=None))]
-    fn rate_backend_session(
-        &self,
-        max_order: i64,
-        total_symbols: Option<u64>,
-    ) -> PyResult<PyRateBackendSession> {
+    #[pyo3(signature = (total_symbols=None))]
+    fn rate_backend_session(&self, total_symbols: Option<u64>) -> PyResult<PyRateBackendSession> {
         let inner = self
             .inner
-            .rate_backend_session(max_order, total_symbols)
+            .rate_backend_session(total_symbols)
             .map_err(py_infotheory_error)?;
         Ok(PyRateBackendSession {
             inner: Arc::new(Mutex::new(inner)),
@@ -1329,15 +1262,20 @@ impl PyInfotheoryCtx {
     }
 }
 
+#[pyclass(name = "RateBackendSession", from_py_object)]
+#[derive(Clone)]
+struct PyRateBackendSession {
+    inner: Arc<Mutex<RateBackendSession>>,
+}
+
 #[pymethods]
 impl PyRateBackendSession {
     #[new]
-    #[pyo3(signature = (backend, max_order=-1, total_symbols=None))]
-    fn new(backend: &PyRateBackend, max_order: i64, total_symbols: Option<u64>) -> PyResult<Self> {
+    #[pyo3(signature = (backend, total_symbols=None))]
+    fn new(backend: &PyRateBackend, total_symbols: Option<u64>) -> PyResult<Self> {
         py_try(|| {
             let inner = RateBackendSession::from_backend(
                 compile_rate_backend(backend.inner.clone())?,
-                max_order,
                 total_symbols,
             )
             .map_err(py_infotheory_error)?;
@@ -1450,15 +1388,15 @@ fn verify_non_negativity(x: &[u8], y: &[u8]) -> bool {
 
 #[pyfunction]
 fn verify_mi_nonnegative(x: &[u8], y: &[u8]) -> bool {
-    infotheory::axioms::verify_mi_nonnegative(api::mutual_information_marg_bytes, x, y)
+    infotheory::axioms::verify_mi_nonnegative(api::empirical_mutual_information_bytes, x, y)
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, tolerance=1e-9))]
 fn verify_subadditivity(x: &[u8], y: &[u8], tolerance: f64) -> bool {
     infotheory::axioms::verify_subadditivity(
-        api::joint_marginal_entropy_bytes,
-        api::marginal_entropy_bytes,
+        api::empirical_joint_entropy_bytes,
+        api::empirical_entropy_bytes,
         x,
         y,
         tolerance,
@@ -1469,8 +1407,8 @@ fn verify_subadditivity(x: &[u8], y: &[u8], tolerance: f64) -> bool {
 #[pyo3(signature = (x, y, tolerance=1e-9))]
 fn verify_conditioning_reduces_entropy(x: &[u8], y: &[u8], tolerance: f64) -> bool {
     infotheory::axioms::verify_conditioning_reduces_entropy(
-        |a, b| api::try_conditional_entropy_bytes(a, b, 6).unwrap_or(f64::NAN),
-        api::marginal_entropy_bytes,
+        |a, b| api::try_conditional_entropy_bytes(a, b).unwrap_or(f64::NAN),
+        api::empirical_entropy_bytes,
         x,
         y,
         tolerance,
@@ -1481,9 +1419,9 @@ fn verify_conditioning_reduces_entropy(x: &[u8], y: &[u8], tolerance: f64) -> bo
 #[pyo3(signature = (x, y, tolerance=1e-9))]
 fn verify_chain_rule(x: &[u8], y: &[u8], tolerance: f64) -> bool {
     infotheory::axioms::verify_chain_rule(
-        |a, b| api::try_joint_entropy_rate_bytes(a, b, 6).unwrap_or(f64::NAN),
-        |a| api::try_entropy_rate_bytes(a, 6).unwrap_or(f64::NAN),
-        |a, b| api::try_conditional_entropy_rate_bytes(a, b, 6).unwrap_or(f64::NAN),
+        |a, b| api::try_joint_entropy_rate_bytes(a, b).unwrap_or(f64::NAN),
+        |a| api::try_entropy_rate_bytes(a).unwrap_or(f64::NAN),
+        |a, b| api::try_conditional_entropy_rate_bytes(a, b).unwrap_or(f64::NAN),
         x,
         y,
         tolerance,
@@ -1501,7 +1439,7 @@ fn verify_ncd_bounds(x: &[u8], y: &[u8]) -> bool {
 
 #[pyfunction]
 fn verify_entropy_bounds(data: &[u8]) -> bool {
-    infotheory::axioms::verify_entropy_bounds(api::marginal_entropy_bytes, data)
+    infotheory::axioms::verify_entropy_bounds(api::empirical_entropy_bytes, data)
 }
 
 fn compression_backend_from_py(
@@ -1628,91 +1566,85 @@ fn ncd_bytes_default(py: Python<'_>, x: &[u8], y: &[u8], variant: &str) -> PyRes
 }
 
 #[pyfunction]
-fn entropy_rate_bytes(py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
-    py.detach(|| {
-        py_try(|| api::try_entropy_rate_bytes(data, max_order).map_err(py_infotheory_error))
-    })
+fn entropy_rate_bytes(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_entropy_rate_bytes(data).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
-fn biased_entropy_rate_bytes(py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
-    py.detach(|| {
-        py_try(|| api::try_biased_entropy_rate_bytes(data, max_order).map_err(py_infotheory_error))
-    })
+fn biased_entropy_rate_bytes(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_biased_entropy_rate_bytes(data).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
-fn marginal_entropy_bytes(data: &[u8]) -> f64 {
-    api::marginal_entropy_bytes(data)
+fn empirical_entropy_bytes(data: &[u8]) -> f64 {
+    api::empirical_entropy_bytes(data)
 }
 
 #[pyfunction]
-fn joint_marginal_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
-    api::joint_marginal_entropy_bytes(x, y)
+fn empirical_joint_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_joint_entropy_bytes(x, y)
 }
 
-macro_rules! py_metric_bytes_3 {
+macro_rules! py_metric_bytes_2 {
     ($fn_name:ident, $target:path) => {
         #[pyfunction]
-        fn $fn_name(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-            py.detach(|| py_try(|| Ok($target(x, y, max_order))))
+        fn $fn_name(py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
+            py.detach(|| py_try(|| Ok($target(x, y))))
         }
     };
 }
 
-macro_rules! py_metric_bytes_3_try {
+macro_rules! py_metric_bytes_2_try {
     ($fn_name:ident, $target:path) => {
         #[pyfunction]
-        fn $fn_name(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-            py.detach(|| py_try(|| $target(x, y, max_order).map_err(py_infotheory_error)))
+        fn $fn_name(py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
+            py.detach(|| py_try(|| $target(x, y).map_err(py_infotheory_error)))
         }
     };
 }
 
-macro_rules! py_metric_paths_3_try {
+macro_rules! py_metric_paths_2_try {
     ($fn_name:ident, $target:path) => {
         #[pyfunction]
-        fn $fn_name(py: Python<'_>, x: &str, y: &str, max_order: i64) -> PyResult<f64> {
+        fn $fn_name(py: Python<'_>, x: &str, y: &str) -> PyResult<f64> {
             py.detach(|| {
-                py_try(|| {
-                    $target(x, y, max_order).map_err(|e| PyRuntimeError::new_err(e.to_string()))
-                })
+                py_try(|| $target(x, y).map_err(|e| PyRuntimeError::new_err(e.to_string())))
             })
         }
     };
 }
 
-py_metric_bytes_3_try!(joint_entropy_rate_bytes, api::try_joint_entropy_rate_bytes);
-py_metric_bytes_3_try!(
+py_metric_bytes_2_try!(joint_entropy_rate_bytes, api::try_joint_entropy_rate_bytes);
+py_metric_bytes_2_try!(
     conditional_entropy_rate_bytes,
     api::try_conditional_entropy_rate_bytes
 );
-py_metric_bytes_3_try!(
+py_metric_bytes_2_try!(
     conditional_entropy_bytes,
     api::try_conditional_entropy_bytes
 );
-py_metric_bytes_3_try!(mutual_information_bytes, api::try_mutual_information_bytes);
-py_metric_bytes_3_try!(
+py_metric_bytes_2_try!(mutual_information_bytes, api::try_mutual_information_bytes);
+py_metric_bytes_2_try!(
     mutual_information_rate_bytes,
     api::try_mutual_information_rate_bytes
 );
-py_metric_bytes_3_try!(ned_bytes, api::try_ned_bytes);
-py_metric_bytes_3_try!(nte_bytes, api::try_nte_bytes);
-py_metric_bytes_3!(tvd_bytes, api::tvd_bytes);
-py_metric_bytes_3!(nhd_bytes, api::nhd_bytes);
-py_metric_bytes_3_try!(cross_entropy_bytes, api::try_cross_entropy_bytes);
-py_metric_bytes_3_try!(cross_entropy_rate_bytes, api::try_cross_entropy_rate_bytes);
+py_metric_bytes_2_try!(ned_bytes, api::try_ned_bytes);
+py_metric_bytes_2_try!(nte_bytes, api::try_nte_bytes);
+py_metric_bytes_2!(tvd_bytes, api::tvd_bytes);
+py_metric_bytes_2!(nhd_bytes, api::nhd_bytes);
+py_metric_bytes_2_try!(cross_entropy_bytes, api::try_cross_entropy_bytes);
+py_metric_bytes_2_try!(cross_entropy_rate_bytes, api::try_cross_entropy_rate_bytes);
 
-py_metric_paths_3_try!(ned_paths, api::try_ned_paths);
-py_metric_paths_3_try!(nte_paths, api::try_nte_paths);
-py_metric_paths_3_try!(tvd_paths, api::try_tvd_paths);
-py_metric_paths_3_try!(nhd_paths, api::try_nhd_paths);
-py_metric_paths_3_try!(mutual_information_paths, api::try_mutual_information_paths);
-py_metric_paths_3_try!(
+py_metric_paths_2_try!(ned_paths, api::try_ned_paths);
+py_metric_paths_2_try!(nte_paths, api::try_nte_paths);
+py_metric_paths_2_try!(tvd_paths, api::try_tvd_paths);
+py_metric_paths_2_try!(nhd_paths, api::try_nhd_paths);
+py_metric_paths_2_try!(mutual_information_paths, api::try_mutual_information_paths);
+py_metric_paths_2_try!(
     conditional_entropy_paths,
     api::try_conditional_entropy_paths
 );
-py_metric_paths_3_try!(cross_entropy_paths, api::try_cross_entropy_paths);
+py_metric_paths_2_try!(cross_entropy_paths, api::try_cross_entropy_paths);
 
 #[pyfunction]
 fn d_kl_bytes(x: &[u8], y: &[u8]) -> f64 {
@@ -1735,67 +1667,55 @@ fn js_divergence_paths(py: Python<'_>, x: &str, y: &str) -> PyResult<f64> {
 }
 
 #[pyfunction]
-fn intrinsic_dependence_bytes(py: Python<'_>, data: &[u8], max_order: i64) -> PyResult<f64> {
+fn intrinsic_dependence_bytes(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_intrinsic_dependence_bytes(data).map_err(py_infotheory_error)))
+}
+
+#[pyfunction]
+fn resistance_to_transformation_bytes(py: Python<'_>, x: &[u8], tx: &[u8]) -> PyResult<f64> {
     py.detach(|| {
-        py_try(|| api::try_intrinsic_dependence_bytes(data, max_order).map_err(py_infotheory_error))
+        py_try(|| api::try_resistance_to_transformation_bytes(x, tx).map_err(py_infotheory_error))
     })
 }
 
 #[pyfunction]
-fn resistance_to_transformation_bytes(
-    py: Python<'_>,
-    x: &[u8],
-    tx: &[u8],
-    max_order: i64,
-) -> PyResult<f64> {
-    py.detach(|| {
-        py_try(|| {
-            api::try_resistance_to_transformation_bytes(x, tx, max_order)
-                .map_err(py_infotheory_error)
-        })
-    })
+fn empirical_mutual_information_bytes(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_mutual_information_bytes(x, y)
 }
 
 #[pyfunction]
-fn mutual_information_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
-    api::mutual_information_marg_bytes(x, y)
+fn empirical_ned_bytes(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_ned_bytes(x, y)
 }
 
 #[pyfunction]
-fn ned_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
-    api::ned_marg_bytes(x, y)
+fn ned_rate_bytes(py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_ned_rate_bytes(x, y).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
-fn ned_rate_bytes(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-    py.detach(|| py_try(|| api::try_ned_rate_bytes(x, y, max_order).map_err(py_infotheory_error)))
+fn ned_cons_bytes(py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_ned_cons_bytes(x, y).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
-fn ned_cons_bytes(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-    py.detach(|| py_try(|| api::try_ned_cons_bytes(x, y, max_order).map_err(py_infotheory_error)))
+fn empirical_ned_cons_bytes(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_ned_cons_bytes(x, y)
 }
 
 #[pyfunction]
-fn ned_cons_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
-    api::ned_cons_marg_bytes(x, y)
+fn ned_cons_rate_bytes(py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_ned_cons_rate_bytes(x, y).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
-fn ned_cons_rate_bytes(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-    py.detach(|| {
-        py_try(|| api::try_ned_cons_rate_bytes(x, y, max_order).map_err(py_infotheory_error))
-    })
+fn empirical_nte_bytes(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_nte_bytes(x, y)
 }
 
 #[pyfunction]
-fn nte_marg_bytes(x: &[u8], y: &[u8]) -> f64 {
-    api::nte_marg_bytes(x, y)
-}
-
-#[pyfunction]
-fn nte_rate_bytes(py: Python<'_>, x: &[u8], y: &[u8], max_order: i64) -> PyResult<f64> {
-    py.detach(|| py_try(|| api::try_nte_rate_bytes(x, y, max_order).map_err(py_infotheory_error)))
+fn nte_rate_bytes(py: Python<'_>, x: &[u8], y: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_nte_rate_bytes(x, y).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -2096,12 +2016,11 @@ fn decompress_file(
 }
 
 #[pyfunction]
-#[pyo3(signature = (prompt, bytes, max_order=-1, backend=None, method=None, config=None))]
+#[pyo3(signature = (prompt, bytes, backend=None, method=None, config=None))]
 fn generate_bytes<'py>(
     py: Python<'py>,
     prompt: &[u8],
     bytes: usize,
-    max_order: i64,
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
     config: Option<&Bound<'_, PyAny>>,
@@ -2115,15 +2034,14 @@ fn generate_bytes<'py>(
         py.detach(|| {
             py_try(|| {
                 let ctx = InfotheoryCtx::new(rb, cb);
-                ctx.try_generate_bytes_with_config(prompt, bytes, max_order, cfg)
+                ctx.try_generate_bytes_with_config(prompt, bytes, cfg)
                     .map_err(py_infotheory_error)
             })
         })?
     } else {
         py.detach(|| {
             py_try(|| {
-                api::try_generate_bytes_with_config(prompt, bytes, max_order, cfg)
-                    .map_err(py_infotheory_error)
+                api::try_generate_bytes_with_config(prompt, bytes, cfg).map_err(py_infotheory_error)
             })
         })?
     };
@@ -2131,12 +2049,11 @@ fn generate_bytes<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (prefix_parts, bytes, max_order=-1, backend=None, method=None, config=None))]
+#[pyo3(signature = (prefix_parts, bytes, backend=None, method=None, config=None))]
 fn generate_bytes_conditional_chain<'py>(
     py: Python<'py>,
     prefix_parts: Vec<Vec<u8>>,
     bytes: usize,
-    max_order: i64,
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
     config: Option<&Bound<'_, PyAny>>,
@@ -2151,14 +2068,14 @@ fn generate_bytes_conditional_chain<'py>(
         py.detach(|| {
             py_try(|| {
                 let ctx = InfotheoryCtx::new(rb, cb);
-                ctx.try_generate_bytes_conditional_chain_with_config(&refs, bytes, max_order, cfg)
+                ctx.try_generate_bytes_conditional_chain_with_config(&refs, bytes, cfg)
                     .map_err(py_infotheory_error)
             })
         })?
     } else {
         py.detach(|| {
             py_try(|| {
-                api::try_generate_bytes_conditional_chain_with_config(&refs, bytes, max_order, cfg)
+                api::try_generate_bytes_conditional_chain_with_config(&refs, bytes, cfg)
                     .map_err(py_infotheory_error)
             })
         })?
@@ -2167,123 +2084,103 @@ fn generate_bytes_conditional_chain<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (data, max_order, backend=None, method=None))]
+#[pyo3(signature = (data, backend=None, method=None))]
 fn entropy_rate_backend(
     py: Python<'_>,
     data: &[u8],
-    max_order: i64,
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = compiled_rate_backend_from_py(backend, method)?;
-    py.detach(|| {
-        py_try(|| api::try_entropy_rate_backend(data, max_order, &rb).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_entropy_rate_backend(data, &rb).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
-#[pyo3(signature = (data, max_order, backend=None, method=None))]
+#[pyo3(signature = (data, backend=None, method=None))]
 fn biased_entropy_rate_backend(
     py: Python<'_>,
     data: &[u8],
-    max_order: i64,
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
-        py_try(|| {
-            api::try_biased_entropy_rate_backend(data, max_order, &rb).map_err(py_infotheory_error)
-        })
+        py_try(|| api::try_biased_entropy_rate_backend(data, &rb).map_err(py_infotheory_error))
     })
 }
 
 #[pyfunction]
-#[pyo3(signature = (test_data, train_data, max_order, backend=None, method=None))]
+#[pyo3(signature = (test_data, train_data, backend=None, method=None))]
 fn cross_entropy_rate_backend(
     py: Python<'_>,
     test_data: &[u8],
     train_data: &[u8],
-    max_order: i64,
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
         py_try(|| {
-            api::try_cross_entropy_rate_backend(test_data, train_data, max_order, &rb)
+            api::try_cross_entropy_rate_backend(test_data, train_data, &rb)
                 .map_err(py_infotheory_error)
         })
     })
 }
 
 #[pyfunction]
-#[pyo3(signature = (x, y, max_order, backend=None, method=None))]
+#[pyo3(signature = (x, y, backend=None, method=None))]
 fn joint_entropy_rate_backend(
     py: Python<'_>,
     x: &[u8],
     y: &[u8],
-    max_order: i64,
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
-        py_try(|| {
-            api::try_joint_entropy_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error)
-        })
+        py_try(|| api::try_joint_entropy_rate_backend(x, y, &rb).map_err(py_infotheory_error))
     })
 }
 
 #[pyfunction]
-#[pyo3(signature = (x, y, max_order, backend=None, method=None))]
+#[pyo3(signature = (x, y, backend=None, method=None))]
 fn mutual_information_rate_backend(
     py: Python<'_>,
     x: &[u8],
     y: &[u8],
-    max_order: i64,
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = compiled_rate_backend_from_py(backend, method)?;
     py.detach(|| {
-        py_try(|| {
-            api::try_mutual_information_rate_backend(x, y, max_order, &rb)
-                .map_err(py_infotheory_error)
-        })
+        py_try(|| api::try_mutual_information_rate_backend(x, y, &rb).map_err(py_infotheory_error))
     })
 }
 
 #[pyfunction]
-#[pyo3(signature = (x, y, max_order, backend=None, method=None))]
+#[pyo3(signature = (x, y, backend=None, method=None))]
 fn ned_rate_backend(
     py: Python<'_>,
     x: &[u8],
     y: &[u8],
-    max_order: i64,
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = compiled_rate_backend_from_py(backend, method)?;
-    py.detach(|| {
-        py_try(|| api::try_ned_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_ned_rate_backend(x, y, &rb).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
-#[pyo3(signature = (x, y, max_order, backend=None, method=None))]
+#[pyo3(signature = (x, y, backend=None, method=None))]
 fn nte_rate_backend(
     py: Python<'_>,
     x: &[u8],
     y: &[u8],
-    max_order: i64,
     backend: Option<&Bound<'_, PyAny>>,
     method: Option<&str>,
 ) -> PyResult<f64> {
     let rb = compiled_rate_backend_from_py(backend, method)?;
-    py.detach(|| {
-        py_try(|| api::try_nte_rate_backend(x, y, max_order, &rb).map_err(py_infotheory_error))
-    })
+    py.detach(|| py_try(|| api::try_nte_rate_backend(x, y, &rb).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -3868,8 +3765,7 @@ impl PyAgentConfig {
         min_reward=-128,
         max_reward=127,
         reward_offset=128,
-        random_seed=None,
-        rate_backend_max_order=20
+        random_seed=None
     ))]
     fn new(
         rate_backend: &PyRateBackend,
@@ -3887,7 +3783,6 @@ impl PyAgentConfig {
         max_reward: i64,
         reward_offset: i64,
         random_seed: Option<u64>,
-        rate_backend_max_order: i64,
     ) -> PyResult<Self> {
         let mut inner = infotheory::aixi::agent::AgentConfig::default();
         inner.rate_backend = rate_backend.inner.clone();
@@ -3907,7 +3802,6 @@ impl PyAgentConfig {
         inner.max_reward = max_reward;
         inner.reward_offset = reward_offset;
         inner.random_seed = random_seed;
-        inner.rate_backend_max_order = rate_backend_max_order;
         inner.validate().map_err(py_value_error)?;
         Ok(Self { inner })
     }
@@ -3932,8 +3826,7 @@ impl PyAiqiConfig {
         augmentation_period=None,
         history_prune_keep_steps=None,
         baseline_exploration=0.01,
-        random_seed=None,
-        rate_backend_max_order=20
+        random_seed=None
     ))]
     fn new(
         rate_backend: &PyRateBackend,
@@ -3951,7 +3844,6 @@ impl PyAiqiConfig {
         history_prune_keep_steps: Option<usize>,
         baseline_exploration: f64,
         random_seed: Option<u64>,
-        rate_backend_max_order: i64,
     ) -> PyResult<Self> {
         let mut inner = infotheory::aixi::aiqi::AiqiConfig::default();
         inner.rate_backend = rate_backend.inner.clone();
@@ -3969,7 +3861,6 @@ impl PyAiqiConfig {
         inner.history_prune_keep_steps = history_prune_keep_steps;
         inner.baseline_exploration = baseline_exploration;
         inner.random_seed = random_seed;
-        inner.rate_backend_max_order = rate_backend_max_order;
         inner.validate().map_err(py_value_error)?;
         Ok(Self { inner })
     }
@@ -4734,7 +4625,6 @@ impl PyStage2PriorMode {
     granularity=None,
     universal_prior=None,
     stage2_prior_mode=None,
-    max_order=8,
     top_k=50,
     stage0_keep_frac=0.2,
     rate_backend=None,
@@ -4748,7 +4638,6 @@ fn search(
     granularity: Option<&PySearchGranularity>,
     universal_prior: Option<String>,
     stage2_prior_mode: Option<&PyStage2PriorMode>,
-    max_order: i64,
     top_k: usize,
     stage0_keep_frac: f64,
     rate_backend: Option<&Bound<'_, PyAny>>,
@@ -4773,7 +4662,6 @@ fn search(
                 granularity: gran,
                 universal_prior,
                 stage2_prior_mode: s2pm,
-                max_order,
                 top_k,
                 stage0_keep_frac,
                 ctx: InfotheoryCtx::new(rb, cb),
@@ -4899,29 +4787,29 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ncd_matrix_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(ncd_matrix_paths_with_backend, m)?)?;
     m.add_function(wrap_pyfunction!(ncd_matrix_bytes_with_backend, m)?)?;
-    m.add_function(wrap_pyfunction!(marginal_entropy_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_entropy_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(entropy_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(entropy_rate_backend, m)?)?;
     m.add_function(wrap_pyfunction!(biased_entropy_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(biased_entropy_rate_backend, m)?)?;
-    m.add_function(wrap_pyfunction!(joint_marginal_entropy_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_joint_entropy_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(joint_entropy_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(joint_entropy_rate_backend, m)?)?;
     m.add_function(wrap_pyfunction!(conditional_entropy_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(conditional_entropy_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(mutual_information_bytes, m)?)?;
-    m.add_function(wrap_pyfunction!(mutual_information_marg_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_mutual_information_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(mutual_information_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(mutual_information_rate_backend, m)?)?;
     m.add_function(wrap_pyfunction!(ned_bytes, m)?)?;
-    m.add_function(wrap_pyfunction!(ned_marg_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_ned_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(ned_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(ned_rate_backend, m)?)?;
     m.add_function(wrap_pyfunction!(ned_cons_bytes, m)?)?;
-    m.add_function(wrap_pyfunction!(ned_cons_marg_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_ned_cons_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(ned_cons_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(nte_bytes, m)?)?;
-    m.add_function(wrap_pyfunction!(nte_marg_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_nte_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(nte_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(nte_rate_backend, m)?)?;
     m.add_function(wrap_pyfunction!(tvd_bytes, m)?)?;

@@ -1153,21 +1153,18 @@ local function mc_predictor_from_algorithm(root, interface)
                 num_percept_bits = percept_bits,
                 encoding_bits = 8,
             },
-            predictor_max_order = legacy_max_order(root),
         }
     end
 
     if algo == "ac-ctw" or algo == "ctw-context-tree" then
         return {
             predictor = { kind = "ctw", depth = ct_depth },
-            predictor_max_order = legacy_max_order(root),
         }
     end
 
     if algo == "rosa" or algo == "rosaplus" then
         return {
-            predictor = { kind = "rosaplus" },
-            predictor_max_order = as_int(root.rosa_max_order, "rosa_max_order") or 20,
+            predictor = { kind = "rosaplus", max_order = as_int(root.rosa_max_order, "rosa_max_order") or legacy_max_order(root) or -1 },
         }
     end
 
@@ -1176,7 +1173,6 @@ local function mc_predictor_from_algorithm(root, interface)
         if method ~= nil then
             return {
                 predictor = { kind = "rwkv7", method = method },
-                predictor_max_order = legacy_max_order(root),
             }
         end
         local model_path = root.rwkv_model_path
@@ -1185,7 +1181,6 @@ local function mc_predictor_from_algorithm(root, interface)
         end
         return {
             predictor = { kind = "rwkv7", model_path = model_path },
-            predictor_max_order = legacy_max_order(root),
         }
     end
 
@@ -1194,7 +1189,6 @@ local function mc_predictor_from_algorithm(root, interface)
         if method ~= nil then
             return {
                 predictor = { kind = "mamba", method = method },
-                predictor_max_order = legacy_max_order(root),
             }
         end
         local model_path = root.mamba_model_path
@@ -1203,7 +1197,6 @@ local function mc_predictor_from_algorithm(root, interface)
         end
         return {
             predictor = { kind = "mamba", model_path = model_path },
-            predictor_max_order = legacy_max_order(root),
         }
     end
 
@@ -1213,7 +1206,6 @@ local function mc_predictor_from_algorithm(root, interface)
                 kind = "zpaq",
                 method = tostring(root.zpaq_method or "1"),
             },
-            predictor_max_order = legacy_max_order(root),
         }
     end
 
@@ -1227,7 +1219,6 @@ local function aiqi_predictor_from_algorithm(root, return_bits)
     if algo == "ctw" or algo == "ac-ctw" or algo == "ctw-context-tree" then
         return {
             predictor = { kind = "ctw", depth = ct_depth },
-            predictor_max_order = legacy_max_order(root),
         }
     end
 
@@ -1239,15 +1230,12 @@ local function aiqi_predictor_from_algorithm(root, return_bits)
                 num_percept_bits = return_bits,
                 encoding_bits = 8,
             },
-            predictor_max_order = legacy_max_order(root),
         }
     end
 
     if algo == "rosa" or algo == "rosaplus" then
-        local max_order = as_int(root.rosa_max_order, "rosa_max_order") or legacy_max_order(root)
         return {
-            predictor = { kind = "rosaplus" },
-            predictor_max_order = max_order,
+            predictor = { kind = "rosaplus", max_order = as_int(root.rosa_max_order, "rosa_max_order") or legacy_max_order(root) or -1 },
         }
     end
 
@@ -1256,7 +1244,6 @@ local function aiqi_predictor_from_algorithm(root, return_bits)
         if method ~= nil then
             return {
                 predictor = { kind = "rwkv7", method = method },
-                predictor_max_order = legacy_max_order(root),
             }
         end
         local model_path = root.rwkv_model_path
@@ -1265,7 +1252,6 @@ local function aiqi_predictor_from_algorithm(root, return_bits)
         end
         return {
             predictor = { kind = "rwkv7", model_path = model_path },
-            predictor_max_order = legacy_max_order(root),
         }
     end
 
@@ -1274,7 +1260,6 @@ local function aiqi_predictor_from_algorithm(root, return_bits)
         if method ~= nil then
             return {
                 predictor = { kind = "mamba", method = method },
-                predictor_max_order = legacy_max_order(root),
             }
         end
         local model_path = root.mamba_model_path
@@ -1283,7 +1268,6 @@ local function aiqi_predictor_from_algorithm(root, return_bits)
         end
         return {
             predictor = { kind = "mamba", model_path = model_path },
-            predictor_max_order = legacy_max_order(root),
         }
     end
 
@@ -1498,9 +1482,11 @@ local function convert_legacy(root, input_path)
 
         local predictor_pair
         if predictor_override ~= nil then
+            if predictor_override.kind == "rosaplus" and predictor_override.max_order == nil then
+                predictor_override.max_order = legacy_max_order(root) or -1
+            end
             predictor_pair = {
                 predictor = predictor_override,
-                predictor_max_order = legacy_max_order(root),
             }
         else
             predictor_pair = mc_predictor_from_algorithm(root, interface)
@@ -1509,7 +1495,6 @@ local function convert_legacy(root, input_path)
         controller = {
             kind = "mc_aixi",
             predictor = predictor_pair.predictor,
-            predictor_max_order = predictor_pair.predictor_max_order,
             agent_horizon = int_with_default_min(root.agent_horizon, "agent_horizon", 3, 1),
             num_simulations = int_with_default_min(root.num_simulations, "num_simulations", 50, 1),
             exploration_exploitation_ratio = positive_num_with_default(root.exploration_exploitation_ratio, "exploration_exploitation_ratio", 1.4),
@@ -1565,9 +1550,11 @@ local function convert_legacy(root, input_path)
 
         local predictor_pair
         if predictor_override ~= nil then
+            if predictor_override.kind == "rosaplus" and predictor_override.max_order == nil then
+                predictor_override.max_order = legacy_max_order(root) or -1
+            end
             predictor_pair = {
                 predictor = predictor_override,
-                predictor_max_order = legacy_max_order(root),
             }
         else
             predictor_pair = aiqi_predictor_from_algorithm(root, return_bins)
@@ -1576,7 +1563,6 @@ local function convert_legacy(root, input_path)
         controller = {
             kind = "aiqi_discounted",
             predictor = predictor_pair.predictor,
-            predictor_max_order = predictor_pair.predictor_max_order,
             discount_gamma = open_unit_num_with_default(discount_gamma, "discount_gamma", 0.99),
             return_horizon = return_horizon,
             return_bins = return_bins,

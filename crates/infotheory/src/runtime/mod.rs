@@ -258,17 +258,17 @@ macro_rules! define_compression_backend_catalog {
 }
 
 type RateBackendPredictorBuilder =
-    fn(&CompiledRateBackend, i64, f64) -> Result<crate::mixture::RateBackendPredictor, String>;
+    fn(&CompiledRateBackend, f64) -> Result<crate::mixture::RateBackendPredictor, String>;
 type RatePdfPredictorBuilder =
-    fn(&CompiledRateBackend, i64) -> anyhow::Result<crate::compression::RatePdfPredictor>;
-type RateEntropyFn = fn(&[u8], i64, &CompiledRateBackend) -> InfotheoryResult<f64>;
-type RateJointEntropyFn = fn(&[u8], &[u8], i64, &CompiledRateBackend) -> InfotheoryResult<f64>;
+    fn(&CompiledRateBackend) -> anyhow::Result<crate::compression::RatePdfPredictor>;
+type RateEntropyFn = fn(&[u8], &CompiledRateBackend) -> InfotheoryResult<f64>;
+type RateJointEntropyFn = fn(&[u8], &[u8], &CompiledRateBackend) -> InfotheoryResult<f64>;
 type RateConditionalChainFn = fn(&[&[u8]], &[u8], &CompiledRateBackend) -> InfotheoryResult<f64>;
 type RatePlanCompiler = fn(&RateBackend, &SpecEnvironment, usize) -> SpecResult<RateBackendPlan>;
 type RateWrapperBuilder = fn(&RateBackendPlan) -> RateBackend;
 type RatePayloadEncoder = fn(&RateBackendPlan, &mut Vec<u8>);
-type RateDisplayLabelFn = fn(&RateBackendPlan, i64) -> String;
-type RateDefaultNameFn = fn(&RateBackendPlan, i64) -> String;
+type RateDisplayLabelFn = fn(&RateBackendPlan) -> String;
+type RateDefaultNameFn = fn(&RateBackendPlan) -> String;
 type RateContainsZpaqFn = fn(&RateBackendPlan) -> bool;
 type RateSupportsBitTokenAdaptationFn = fn(&RateBackendPlan) -> bool;
 type RateBitTokenAdapter = fn(&RateBackendPlan) -> RateBackendPlan;
@@ -687,7 +687,7 @@ define_compression_backend_catalog! {
 
 pub(crate) fn default_rate_backend_spec(kind: RateBackendKind) -> Option<RateBackend> {
     match kind {
-        RateBackendKind::RosaPlus => Some(RateBackend::RosaPlus),
+        RateBackendKind::RosaPlus => Some(RateBackend::RosaPlus { max_order: -1 }),
         RateBackendKind::Match => Some(RateBackend::Match {
             hash_bits: 18,
             min_len: 4,
@@ -857,18 +857,12 @@ pub(crate) fn encode_compression_backend_payload_via_kernel(
     (compression_backend_kernel(plan.kind()).encode_payload)(plan, out);
 }
 
-pub(crate) fn rate_backend_display_label_via_kernel(
-    plan: &RateBackendPlan,
-    max_order: i64,
-) -> String {
-    (rate_backend_kernel(plan.kind()).display_label)(plan, max_order)
+pub(crate) fn rate_backend_display_label_via_kernel(plan: &RateBackendPlan) -> String {
+    (rate_backend_kernel(plan.kind()).display_label)(plan)
 }
 
-pub(crate) fn rate_backend_default_name_via_kernel(
-    plan: &RateBackendPlan,
-    max_order: i64,
-) -> String {
-    (rate_backend_kernel(plan.kind()).default_name)(plan, max_order)
+pub(crate) fn rate_backend_default_name_via_kernel(plan: &RateBackendPlan) -> String {
+    (rate_backend_kernel(plan.kind()).default_name)(plan)
 }
 
 pub(crate) fn compression_backend_display_label_via_kernel(
@@ -883,7 +877,7 @@ pub(crate) fn rate_backend_capabilities_via_kernel(
     let kernel = rate_backend_kernel(plan.kind());
     RateBackendCapabilities {
         canonical_name: rate_backend_canonical_name(plan.kind()),
-        display_label: Arc::<str>::from((kernel.display_label)(plan, -1)),
+        display_label: Arc::<str>::from((kernel.display_label)(plan)),
         trace_strategy: kernel.trace_strategy,
         supports_biased_entropy: kernel.supports_biased_entropy,
         supports_frozen_conditioning: kernel.supports_frozen_conditioning,
@@ -943,25 +937,20 @@ pub(crate) fn rate_backend_trace_model_strategy(
     }
 }
 
-fn entropy_prequential(
-    data: &[u8],
-    max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    crate::try_prequential_rate_backend(data, &[], max_order, backend)
+fn entropy_prequential(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
+    crate::try_prequential_rate_backend(data, &[], backend)
 }
 
 fn joint_entropy_prequential(
     x: &[u8],
     y: &[u8],
-    max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     if x.is_empty() || y.is_empty() {
         return Ok(0.0);
     }
     let joint = interleave_aligned_bytes(x, y);
-    entropy_prequential(&joint, max_order, backend).map(|bits| bits * 2.0)
+    entropy_prequential(&joint, backend).map(|bits| bits * 2.0)
 }
 
 fn conditional_chain_prequential(
@@ -969,47 +958,40 @@ fn conditional_chain_prequential(
     data: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    crate::try_prequential_rate_backend(data, prefix_parts, -1, backend)
+    crate::try_prequential_rate_backend(data, prefix_parts, backend)
 }
 
 #[cfg(feature = "backend-rosa")]
-fn entropy_rosa(
-    data: &[u8],
-    max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_rosa(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     if data.is_empty() {
         return Ok(0.0);
     }
-    let mut model = RosaPlus::new(max_order, false, 0, 42);
+    let crate::spec::core::RateBackendPlan::RosaPlus { max_order } = backend.plan() else {
+        unreachable!("rosa kernel used with non-rosa plan")
+    };
+    let mut model = RosaPlus::new(*max_order, false, 0, 42);
     Ok(model.predictive_entropy_rate(data))
 }
 
 #[cfg(not(feature = "backend-rosa"))]
-fn entropy_rosa(
-    _data: &[u8],
-    _max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_rosa(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
         RateBackendKind::RosaPlus,
     )))
 }
 
 #[cfg(feature = "backend-rosa")]
-fn joint_entropy_rosa(
-    x: &[u8],
-    y: &[u8],
-    max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn joint_entropy_rosa(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     if x.is_empty() || y.is_empty() {
         return Ok(0.0);
     }
+    let crate::spec::core::RateBackendPlan::RosaPlus { max_order } = backend.plan() else {
+        unreachable!("rosa kernel used with non-rosa plan")
+    };
     let joint_symbols: Vec<u32> = (0..x.len())
         .map(|idx| (x[idx] as u32) * 256 + (y[idx] as u32))
         .collect();
-    let mut model = RosaPlus::new(max_order, false, 0, 42);
+    let mut model = RosaPlus::new(*max_order, false, 0, 42);
     Ok(model.entropy_rate_cps(&joint_symbols))
 }
 
@@ -1017,7 +999,6 @@ fn joint_entropy_rosa(
 fn joint_entropy_rosa(
     _x: &[u8],
     _y: &[u8],
-    _max_order: i64,
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
@@ -1030,15 +1011,11 @@ fn conditional_chain_rosa(
     data: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    crate::try_frozen_plugin_rate_backend(data, prefix_parts, -1, backend)
+    crate::try_frozen_plugin_rate_backend(data, prefix_parts, backend)
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn entropy_rwkv(
-    data: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_rwkv(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Rwkv7 {
         method,
         parsed_method,
@@ -1055,23 +1032,14 @@ fn entropy_rwkv(
 }
 
 #[cfg(not(feature = "backend-rwkv"))]
-fn entropy_rwkv(
-    _data: &[u8],
-    _max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_rwkv(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
         RateBackendKind::Rwkv7,
     )))
 }
 
 #[cfg(feature = "backend-rwkv")]
-fn joint_entropy_rwkv(
-    x: &[u8],
-    y: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn joint_entropy_rwkv(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Rwkv7 {
         method,
         parsed_method,
@@ -1091,7 +1059,6 @@ fn joint_entropy_rwkv(
 fn joint_entropy_rwkv(
     _x: &[u8],
     _y: &[u8],
-    _max_order: i64,
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
@@ -1135,11 +1102,7 @@ fn conditional_chain_rwkv(
 }
 
 #[cfg(feature = "backend-mamba")]
-fn entropy_mamba(
-    data: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_mamba(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Mamba {
         method,
         parsed_method,
@@ -1156,23 +1119,14 @@ fn entropy_mamba(
 }
 
 #[cfg(not(feature = "backend-mamba"))]
-fn entropy_mamba(
-    _data: &[u8],
-    _max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_mamba(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
         RateBackendKind::Mamba,
     )))
 }
 
 #[cfg(feature = "backend-mamba")]
-fn joint_entropy_mamba(
-    x: &[u8],
-    y: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn joint_entropy_mamba(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Mamba {
         method,
         parsed_method,
@@ -1194,7 +1148,6 @@ fn joint_entropy_mamba(
 fn joint_entropy_mamba(
     _x: &[u8],
     _y: &[u8],
-    _max_order: i64,
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
@@ -1238,11 +1191,7 @@ fn conditional_chain_mamba(
 }
 
 #[cfg(feature = "backend-zpaq")]
-fn entropy_zpaq(
-    data: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_zpaq(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
         unreachable!("zpaq kernel used with non-zpaq plan")
     };
@@ -1250,23 +1199,14 @@ fn entropy_zpaq(
 }
 
 #[cfg(not(feature = "backend-zpaq"))]
-fn entropy_zpaq(
-    _data: &[u8],
-    _max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_zpaq(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
         RateBackendKind::Zpaq,
     )))
 }
 
 #[cfg(feature = "backend-zpaq")]
-fn joint_entropy_zpaq(
-    x: &[u8],
-    y: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn joint_entropy_zpaq(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
         unreachable!("zpaq kernel used with non-zpaq plan")
     };
@@ -1277,7 +1217,6 @@ fn joint_entropy_zpaq(
 fn joint_entropy_zpaq(
     _x: &[u8],
     _y: &[u8],
-    _max_order: i64,
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
@@ -1309,20 +1248,12 @@ fn conditional_chain_zpaq(
 }
 
 #[cfg(feature = "backend-mixture")]
-fn entropy_mixture(
-    data: &[u8],
-    max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    mixture_entropy_rate_bits(data, backend, max_order)
+fn entropy_mixture(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
+    mixture_entropy_rate_bits(data, backend)
 }
 
 #[cfg(not(feature = "backend-mixture"))]
-fn entropy_mixture(
-    _data: &[u8],
-    _max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_mixture(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
         RateBackendKind::Mixture,
     )))
@@ -1332,17 +1263,15 @@ fn entropy_mixture(
 fn joint_entropy_mixture(
     x: &[u8],
     y: &[u8],
-    max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    mixture_joint_entropy_rate_bits(x, y, backend, max_order)
+    mixture_joint_entropy_rate_bits(x, y, backend)
 }
 
 #[cfg(not(feature = "backend-mixture"))]
 fn joint_entropy_mixture(
     _x: &[u8],
     _y: &[u8],
-    _max_order: i64,
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
@@ -1371,11 +1300,7 @@ fn conditional_chain_mixture(
 }
 
 #[cfg(feature = "backend-particle")]
-fn entropy_particle(
-    data: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_particle(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
         unreachable!("particle kernel used with non-particle plan")
     };
@@ -1383,11 +1308,7 @@ fn entropy_particle(
 }
 
 #[cfg(not(feature = "backend-particle"))]
-fn entropy_particle(
-    _data: &[u8],
-    _max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_particle(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
         RateBackendKind::Particle,
     )))
@@ -1397,7 +1318,6 @@ fn entropy_particle(
 fn joint_entropy_particle(
     x: &[u8],
     y: &[u8],
-    _max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
@@ -1410,7 +1330,6 @@ fn joint_entropy_particle(
 fn joint_entropy_particle(
     _x: &[u8],
     _y: &[u8],
-    _max_order: i64,
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
@@ -1442,11 +1361,7 @@ fn conditional_chain_particle(
 }
 
 #[cfg(feature = "backend-ctw")]
-fn entropy_ctw(
-    data: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_ctw(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
         unreachable!("ctw kernel used with non-ctw plan")
     };
@@ -1454,23 +1369,14 @@ fn entropy_ctw(
 }
 
 #[cfg(not(feature = "backend-ctw"))]
-fn entropy_ctw(
-    _data: &[u8],
-    _max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_ctw(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
         RateBackendKind::Ctw,
     )))
 }
 
 #[cfg(feature = "backend-ctw")]
-fn joint_entropy_ctw(
-    x: &[u8],
-    y: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn joint_entropy_ctw(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
         unreachable!("ctw kernel used with non-ctw plan")
     };
@@ -1481,7 +1387,6 @@ fn joint_entropy_ctw(
 fn joint_entropy_ctw(
     _x: &[u8],
     _y: &[u8],
-    _max_order: i64,
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
@@ -1513,11 +1418,7 @@ fn conditional_chain_ctw(
 }
 
 #[cfg(feature = "backend-ctw")]
-fn entropy_fac_ctw(
-    data: &[u8],
-    _max_order: i64,
-    backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_fac_ctw(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::FacCtw {
         base_depth,
         num_percept_bits: _,
@@ -1530,11 +1431,7 @@ fn entropy_fac_ctw(
 }
 
 #[cfg(not(feature = "backend-ctw"))]
-fn entropy_fac_ctw(
-    _data: &[u8],
-    _max_order: i64,
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
+fn entropy_fac_ctw(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
         RateBackendKind::FacCtw,
     )))
@@ -1544,7 +1441,6 @@ fn entropy_fac_ctw(
 fn joint_entropy_fac_ctw(
     x: &[u8],
     y: &[u8],
-    _max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     let crate::spec::core::RateBackendPlan::FacCtw {
@@ -1562,7 +1458,6 @@ fn joint_entropy_fac_ctw(
 fn joint_entropy_fac_ctw(
     _x: &[u8],
     _y: &[u8],
-    _max_order: i64,
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     Err(InfotheoryError::unsupported(rate_backend_feature_error(
@@ -1659,44 +1554,15 @@ fn build_compression_runtime_rate(
 
 fn build_rate_backend_predictor_via_kernel(
     backend: &CompiledRateBackend,
-    max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
-    (rate_backend_kernel(backend.plan().kind()).build_predictor)(backend, max_order, min_prob)
+    (rate_backend_kernel(backend.plan().kind()).build_predictor)(backend, min_prob)
 }
 
 fn build_rate_pdf_predictor_via_kernel(
     backend: &CompiledRateBackend,
-    max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    (rate_backend_kernel(backend.plan().kind()).build_pdf_predictor)(backend, max_order)
-}
-
-/// Shared byte-level runtime predictor trait.
-pub trait BytePredictor: crate::mixture::OnlineBytePredictor {}
-
-impl<T> BytePredictor for T where T: crate::mixture::OnlineBytePredictor + ?Sized {}
-
-/// Runtime predictors that support checkpoint/rollback.
-#[allow(dead_code)]
-pub trait CheckpointablePredictor {
-    /// Concrete checkpoint type.
-    type Checkpoint: Clone;
-
-    /// Snapshot the current runtime state.
-    fn checkpoint(&mut self) -> Self::Checkpoint;
-
-    /// Restore a previous snapshot.
-    fn restore_checkpoint(&mut self, checkpoint: &Self::Checkpoint);
-}
-
-/// Shared runtime factory trait for byte-level predictors.
-pub trait PredictorFactory {
-    /// Predictor type produced by this factory.
-    type Predictor: BytePredictor + CheckpointablePredictor;
-
-    /// Build a predictor runtime from a spec object.
-    fn build_predictor(&self, max_order: i64, min_prob: f64) -> Result<Self::Predictor, String>;
+    (rate_backend_kernel(backend.plan().kind()).build_pdf_predictor)(backend)
 }
 
 /// Shared runtime trait for compression-capable backends.
@@ -1721,26 +1587,6 @@ pub trait CompressionFactory {
 
     /// Build a compression runtime from a spec object.
     fn build_compression_runtime(&self) -> Result<Self::Runtime, String>;
-}
-
-impl CheckpointablePredictor for crate::mixture::RateBackendPredictor {
-    type Checkpoint = crate::mixture::RateBackendPredictorCheckpoint;
-
-    fn checkpoint(&mut self) -> Self::Checkpoint {
-        crate::mixture::RateBackendPredictor::checkpoint(self)
-    }
-
-    fn restore_checkpoint(&mut self, checkpoint: &Self::Checkpoint) {
-        crate::mixture::RateBackendPredictor::restore_checkpoint(self, checkpoint);
-    }
-}
-
-impl PredictorFactory for CompiledRateBackend {
-    type Predictor = crate::mixture::RateBackendPredictor;
-
-    fn build_predictor(&self, max_order: i64, min_prob: f64) -> Result<Self::Predictor, String> {
-        build_rate_backend_predictor_via_kernel(self, max_order, min_prob)
-    }
 }
 
 struct SliceChainReader<'a> {
@@ -1824,7 +1670,7 @@ impl CompressionRuntime for CompressionRuntimeHandle {
                 rate_backend,
                 coder,
                 framing,
-            } => crate::compression::compress_rate_size(data, rate_backend, -1, *coder, *framing)
+            } => crate::compression::compress_rate_size(data, rate_backend, *coder, *framing)
                 .map_err(|err| {
                     InfotheoryError::runtime(format!("rate-coded compression failed: {err:#}"))
                 }),
@@ -1851,16 +1697,14 @@ impl CompressionRuntime for CompressionRuntimeHandle {
                 rate_backend,
                 coder,
                 framing,
-            } => crate::compression::compress_rate_size_chain(
-                parts,
-                rate_backend,
-                -1,
-                *coder,
-                *framing,
-            )
-            .map_err(|err| {
-                InfotheoryError::runtime(format!("rate-coded chain compression failed: {err:#}"))
-            }),
+            } => {
+                crate::compression::compress_rate_size_chain(parts, rate_backend, *coder, *framing)
+                    .map_err(|err| {
+                        InfotheoryError::runtime(format!(
+                            "rate-coded chain compression failed: {err:#}"
+                        ))
+                    })
+            }
         }
     }
 
@@ -1885,7 +1729,7 @@ impl CompressionRuntime for CompressionRuntimeHandle {
                 rate_backend,
                 coder,
                 framing,
-            } => crate::compression::compress_rate_bytes(data, rate_backend, -1, *coder, *framing)
+            } => crate::compression::compress_rate_bytes(data, rate_backend, *coder, *framing)
                 .map_err(|err| {
                     InfotheoryError::runtime(format!("rate-coded byte compression failed: {err:#}"))
                 }),
@@ -1912,14 +1756,10 @@ impl CompressionRuntime for CompressionRuntimeHandle {
                 rate_backend,
                 coder,
                 framing,
-            } => {
-                crate::compression::decompress_rate_bytes(input, rate_backend, -1, *coder, *framing)
-                    .map_err(|err| {
-                        InfotheoryError::runtime(format!(
-                            "rate-coded decompression failed: {err:#}"
-                        ))
-                    })
-            }
+            } => crate::compression::decompress_rate_bytes(input, rate_backend, *coder, *framing)
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("rate-coded decompression failed: {err:#}"))
+                }),
         }
     }
 }
@@ -1947,26 +1787,23 @@ pub(crate) fn try_describe_compression_backend(
 /// Shared spec -> predictor runtime builder using the default probability floor.
 pub(crate) fn build_rate_backend_predictor(
     backend: &CompiledRateBackend,
-    max_order: i64,
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
-    backend.build_predictor(max_order, min_prob)
+    build_rate_backend_predictor_via_kernel(backend, min_prob)
 }
 
 /// Shared spec -> predictor runtime builder using the library's default probability floor.
 pub(crate) fn build_rate_backend_predictor_default(
     backend: &CompiledRateBackend,
-    max_order: i64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
-    build_rate_backend_predictor(backend, max_order, crate::mixture::DEFAULT_MIN_PROB)
+    build_rate_backend_predictor(backend, crate::mixture::DEFAULT_MIN_PROB)
 }
 
 /// Shared spec -> compression predictor runtime builder.
 pub(crate) fn build_rate_pdf_predictor(
     backend: &CompiledRateBackend,
-    max_order: i64,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    build_rate_pdf_predictor_via_kernel(backend, max_order)
+    build_rate_pdf_predictor_via_kernel(backend)
 }
 
 /// Shared spec -> compression runtime builder.
@@ -2016,25 +1853,19 @@ fn zpaq_joint_entropy_rate_bits(method: &str, x: &[u8], y: &[u8]) -> InfotheoryR
 #[cfg(feature = "backend-mixture")]
 fn build_compiled_mixture_runtime(
     backend: &CompiledRateBackend,
-    max_order_fallback: i64,
 ) -> Result<crate::mixture::MixtureRuntime, InfotheoryError> {
-    let experts =
-        crate::mixture::expert_configs_from_compiled_mixture(backend, max_order_fallback)?;
+    let experts = crate::mixture::expert_configs_from_compiled_mixture(backend)?;
     crate::mixture::build_mixture_runtime_from_compiled(backend, &experts).map_err(|err| {
         InfotheoryError::invalid_backend_config(format!("MixtureSpec invalid: {err}"))
     })
 }
 
 #[cfg(feature = "backend-mixture")]
-fn mixture_entropy_rate_bits(
-    data: &[u8],
-    backend: &CompiledRateBackend,
-    max_order: i64,
-) -> InfotheoryResult<f64> {
+fn mixture_entropy_rate_bits(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     if data.is_empty() {
         return Ok(0.0);
     }
-    let mut mix = build_compiled_mixture_runtime(backend, max_order)?;
+    let mut mix = build_compiled_mixture_runtime(backend)?;
     mix.begin_stream(Some(data.len() as u64))
         .map_err(|err| InfotheoryError::runtime(format!("Mixture stream init failed: {err}")))?;
     let mut bits = 0.0;
@@ -2052,13 +1883,12 @@ fn mixture_joint_entropy_rate_bits(
     x: &[u8],
     y: &[u8],
     backend: &CompiledRateBackend,
-    max_order: i64,
 ) -> InfotheoryResult<f64> {
     if x.is_empty() || y.is_empty() {
         return Ok(0.0);
     }
     let joint = interleave_aligned_bytes(x, y);
-    let mut mix = build_compiled_mixture_runtime(backend, max_order)?;
+    let mut mix = build_compiled_mixture_runtime(backend)?;
     mix.begin_stream(Some(joint.len() as u64))
         .map_err(|err| InfotheoryError::runtime(format!("Mixture stream init failed: {err}")))?;
     let mut bits = 0.0;
@@ -2080,7 +1910,7 @@ fn mixture_conditional_chain_rate_bits(
     if data.is_empty() {
         return Ok(0.0);
     }
-    let mut mix = build_compiled_mixture_runtime(backend, -1)?;
+    let mut mix = build_compiled_mixture_runtime(backend)?;
     let total = prefix_parts
         .iter()
         .map(|part| part.len() as u64)
@@ -2283,24 +2113,21 @@ fn fac_ctw_conditional_chain_rate_bits(
 
 fn execute_entropy_rate_backend(
     data: &[u8],
-    max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    (rate_backend_kernel(backend.plan().kind()).entropy_rate)(data, max_order, backend)
+    (rate_backend_kernel(backend.plan().kind()).entropy_rate)(data, backend)
 }
 
 pub(crate) fn try_entropy_rate_backend_direct(
     data: &[u8],
-    max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    execute_entropy_rate_backend(data, max_order, backend)
+    execute_entropy_rate_backend(data, backend)
 }
 
 pub(crate) fn try_cross_entropy_rate_backend_direct(
     test_data: &[u8],
     train_data: &[u8],
-    max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     if backend.plan().kind() == RateBackendKind::Zpaq {
@@ -2310,13 +2137,12 @@ pub(crate) fn try_cross_entropy_rate_backend_direct(
             backend,
         );
     }
-    crate::try_frozen_plugin_rate_backend(test_data, &[train_data], max_order, backend)
+    crate::try_frozen_plugin_rate_backend(test_data, &[train_data], backend)
 }
 
 pub(crate) fn try_joint_entropy_rate_backend_direct(
     x: &[u8],
     y: &[u8],
-    max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     if x.is_empty() || y.is_empty() {
@@ -2326,7 +2152,7 @@ pub(crate) fn try_joint_entropy_rate_backend_direct(
     let x = &x[..n];
     let y = &y[..n];
 
-    (rate_backend_kernel(backend.plan().kind()).joint_entropy_rate)(x, y, max_order, backend)
+    (rate_backend_kernel(backend.plan().kind()).joint_entropy_rate)(x, y, backend)
 }
 
 pub(crate) fn try_cross_entropy_conditional_chain_backend(
@@ -2436,7 +2262,7 @@ mod tests {
     #[test]
     fn describe_compression_backend_uses_canonical_lookup_not_positional_indices() {
         let ac = try_describe_compression_backend(&CompressionBackend::Rate {
-            rate_backend: RateBackend::RosaPlus,
+            rate_backend: RateBackend::RosaPlus { max_order: -1 },
             coder: crate::coders::CoderType::AC,
             framing: crate::compression::FramingMode::Framed,
         })
@@ -2444,7 +2270,7 @@ mod tests {
         assert_eq!(ac.canonical, "rate-ac");
 
         let rans = try_describe_compression_backend(&CompressionBackend::Rate {
-            rate_backend: RateBackend::RosaPlus,
+            rate_backend: RateBackend::RosaPlus { max_order: -1 },
             coder: crate::coders::CoderType::RANS,
             framing: crate::compression::FramingMode::Framed,
         })

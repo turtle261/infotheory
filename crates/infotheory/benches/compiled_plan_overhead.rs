@@ -66,7 +66,7 @@ fn bench_case(c: &mut Criterion, label: &str, rate_backend: RateBackend, data: &
         data,
         |b, d| {
             b.iter(|| {
-                try_entropy_rate_backend(black_box(d), -1, black_box(&compiled_rate))
+                try_entropy_rate_backend(black_box(d), black_box(&compiled_rate))
                     .expect("compiled entropy benchmark");
             });
         },
@@ -79,7 +79,7 @@ fn bench_case(c: &mut Criterion, label: &str, rate_backend: RateBackend, data: &
                 let compiled = black_box(&rate_backend)
                     .compile()
                     .expect("compile-each-call rate backend");
-                try_entropy_rate_backend(black_box(d), -1, black_box(&compiled))
+                try_entropy_rate_backend(black_box(d), black_box(&compiled))
                     .expect("compile-each-call entropy benchmark");
             });
         },
@@ -121,7 +121,7 @@ fn bench_case(c: &mut Criterion, label: &str, rate_backend: RateBackend, data: &
         |b, d| {
             b.iter(|| {
                 let mut session =
-                    RateBackendSession::from_backend(black_box(compiled_rate.clone()), -1, None)
+                    RateBackendSession::from_backend(black_box(compiled_rate.clone()), None)
                         .expect("compiled session benchmark");
                 session.observe(black_box(d));
                 let mut log_probs = [0.0; 256];
@@ -136,7 +136,7 @@ fn bench_case(c: &mut Criterion, label: &str, rate_backend: RateBackend, data: &
         |b, d| {
             b.iter(|| {
                 let mut session =
-                    RateBackendSession::from_spec(black_box(rate_backend.clone()), -1, None)
+                    RateBackendSession::from_spec(black_box(rate_backend.clone()), None)
                         .expect("compile-each-call session benchmark");
                 session.observe(black_box(d));
                 let mut log_probs = [0.0; 256];
@@ -162,7 +162,6 @@ fn nested_mixture_backend() -> RateBackend {
                     let mut expert = MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 });
                     expert.name = Some("ctw".to_string());
                     expert.log_prior = 0.0;
-                    expert.max_order = -1;
                     expert
                 },
                 {
@@ -175,7 +174,6 @@ fn nested_mixture_backend() -> RateBackend {
                     });
                     expert.name = Some("match".to_string());
                     expert.log_prior = -0.15;
-                    expert.max_order = -1;
                     expert
                 },
             ],

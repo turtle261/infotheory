@@ -4,7 +4,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use infotheory::api::{
-    NcdVariant, marginal_entropy_bytes, try_biased_entropy_rate_bytes,
+    NcdVariant, empirical_entropy_bytes, try_biased_entropy_rate_bytes,
     try_cross_entropy_rate_bytes, try_entropy_rate_bytes, try_ncd_matrix_bytes, try_ncd_paths,
 };
 use serde_json::Value;
@@ -51,11 +51,11 @@ fn assert_close(actual: f64, expected: f64, tol: f64, label: &str) {
     );
 }
 
-fn rosa_distance_like_cli(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    let h_x_x = try_biased_entropy_rate_bytes(x, max_order).expect("biased entropy x");
-    let h_y_y = try_biased_entropy_rate_bytes(y, max_order).expect("biased entropy y");
-    let h_y_x = try_cross_entropy_rate_bytes(x, y, max_order).expect("cross entropy y|x");
-    let h_x_y = try_cross_entropy_rate_bytes(y, x, max_order).expect("cross entropy x|y");
+fn rosa_distance_like_cli(x: &[u8], y: &[u8]) -> f64 {
+    let h_x_x = try_biased_entropy_rate_bytes(x).expect("biased entropy x");
+    let h_y_y = try_biased_entropy_rate_bytes(y).expect("biased entropy y");
+    let h_y_x = try_cross_entropy_rate_bytes(x, y).expect("cross entropy y|x");
+    let h_x_y = try_cross_entropy_rate_bytes(y, x).expect("cross entropy x|y");
     if h_x_x < 1e-9 || h_y_y < 1e-9 {
         return 1.0;
     }
@@ -65,16 +65,14 @@ fn rosa_distance_like_cli(x: &[u8], y: &[u8], max_order: i64) -> f64 {
 #[test]
 fn metrics_text_parity_with_library() {
     let text = "entropy parity text";
-    let max_order = 5;
     let out = run_batch(&serde_json::json!({
         "op": "metrics",
         "text": text,
-        "max_order": max_order,
     }));
 
     let data = text.as_bytes();
-    let h0 = marginal_entropy_bytes(data);
-    let h_rate = try_entropy_rate_bytes(data, max_order).expect("h_rate");
+    let h0 = empirical_entropy_bytes(data);
+    let h_rate = try_entropy_rate_bytes(data).expect("h_rate");
     let id = ((h0 - h_rate) / h0).clamp(0.0, 1.0);
 
     assert_close(as_f64(&out, "h0"), h0, 1e-6, "h0");
@@ -94,11 +92,10 @@ fn metrics_file_parity_with_library() {
     let out = run_batch(&serde_json::json!({
         "op": "metrics_file",
         "path": fixture,
-        "max_order": 3,
     }));
 
-    let h0 = marginal_entropy_bytes(&bytes);
-    let h_rate = try_entropy_rate_bytes(&bytes, 3).expect("h_rate");
+    let h0 = empirical_entropy_bytes(&bytes);
+    let h_rate = try_entropy_rate_bytes(&bytes).expect("h_rate");
     let id = if h0 < 1e-9 {
         0.0
     } else {
@@ -134,15 +131,12 @@ fn ncd_file_parity_with_library() {
 fn cross_entropy_parity_with_library() {
     let x = "abracadabra";
     let y = "alakazam";
-    let max_order = 3;
     let out = run_batch(&serde_json::json!({
         "op": "cross_entropy",
         "text_x": x,
         "text_y": y,
-        "max_order": max_order,
     }));
-    let rust_val =
-        try_cross_entropy_rate_bytes(x.as_bytes(), y.as_bytes(), max_order).expect("cross entropy");
+    let rust_val = try_cross_entropy_rate_bytes(x.as_bytes(), y.as_bytes()).expect("cross entropy");
     assert_close(
         as_f64(&out, "cross_entropy"),
         rust_val,
@@ -154,11 +148,9 @@ fn cross_entropy_parity_with_library() {
 #[test]
 fn batch_metrics_parity_with_library() {
     let texts = vec!["abracadabra", "alakazam", "xyzxyz"];
-    let max_order = 4;
     let out = run_batch(&serde_json::json!({
         "op": "batch_metrics",
         "texts": texts,
-        "max_order": max_order,
     }));
     let rows = out
         .get("results")
@@ -168,8 +160,8 @@ fn batch_metrics_parity_with_library() {
 
     for (idx, text) in texts.iter().enumerate() {
         let data = text.as_bytes();
-        let h0 = marginal_entropy_bytes(data);
-        let h_rate = try_entropy_rate_bytes(data, max_order).expect("h_rate");
+        let h0 = empirical_entropy_bytes(data);
+        let h_rate = try_entropy_rate_bytes(data).expect("h_rate");
         let id = if h0 < 1e-9 {
             0.0
         } else {
@@ -215,11 +207,9 @@ fn ncd_matrix_parity_with_library() {
 #[test]
 fn rosa_matrix_parity_with_library_formula() {
     let texts = vec!["abracadabra", "alakazam", "xyzxyz"];
-    let max_order = 3;
     let out = run_batch(&serde_json::json!({
         "op": "rosa_matrix",
         "texts": texts,
-        "max_order": max_order,
     }));
     let n = out.get("n").and_then(Value::as_u64).expect("missing n") as usize;
     let matrix = out
@@ -235,7 +225,7 @@ fn rosa_matrix_parity_with_library_formula() {
             let expected = if i == j {
                 0.0
             } else {
-                rosa_distance_like_cli(texts[i].as_bytes(), texts[j].as_bytes(), max_order)
+                rosa_distance_like_cli(texts[i].as_bytes(), texts[j].as_bytes())
             };
             assert_close(val, expected, 1e-6, "rosa_matrix");
         }

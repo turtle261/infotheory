@@ -1,12 +1,12 @@
 import infotheory_rs as ait
 
 
-def test_import_and_core_metrics():
+def test_smoke_import_and_basic_calls():
     assert isinstance(ait.vm_enabled(), bool)
     x = b"abracadabra"
     y = b"alakazam"
-    assert ait.marginal_entropy_bytes(x) >= 0.0
-    assert ait.mutual_information_bytes(x, y, 0) >= 0.0
+    assert ait.empirical_entropy_bytes(x) >= 0.0
+    assert ait.mutual_information_bytes(x, y) >= 0.0
 
 
 def test_backend_and_ctx_usage():

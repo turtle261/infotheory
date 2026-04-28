@@ -9,7 +9,7 @@ fn api_surface_rate_backend_session_rejects_invalid_programmatic_mixture() {
     let backend = RateBackend::Mixture {
         spec: Arc::new(MixtureSpec::new(MixtureKind::Bayes, vec![])),
     };
-    let err = match RateBackendSession::from_spec(backend, -1, None) {
+    let err = match RateBackendSession::from_spec(backend, None) {
         Ok(_) => panic!("invalid mixture backend should be rejected before runtime construction"),
         Err(err) => err,
     };
@@ -49,10 +49,10 @@ fn api_surface_spec_types_serialize_canonically() {
 #[cfg(feature = "backend-ctw")]
 mod ctw_surface {
     use infotheory::api::{
-        CompressionBackend, InfotheoryCtx, RateBackend, d_kl_bytes, get_default_ctx,
-        joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes,
-        mutual_information_marg_bytes, ned_cons_marg_bytes, ned_marg_bytes, nhd_bytes,
-        nte_marg_bytes, set_default_ctx, try_biased_entropy_rate_backend,
+        CompressionBackend, InfotheoryCtx, RateBackend, d_kl_bytes, empirical_cross_entropy_bytes,
+        empirical_entropy_bytes, empirical_joint_entropy_bytes, empirical_mutual_information_bytes,
+        empirical_ned_bytes, empirical_ned_cons_bytes, empirical_nte_bytes, get_default_ctx,
+        js_div_bytes, nhd_bytes, set_default_ctx, try_biased_entropy_rate_backend,
         try_biased_entropy_rate_bytes, try_conditional_entropy_bytes,
         try_conditional_entropy_rate_bytes, try_cross_entropy_bytes,
         try_cross_entropy_rate_backend, try_cross_entropy_rate_bytes, try_entropy_rate_backend,
@@ -80,67 +80,55 @@ mod ctw_surface {
             .expect("ctw context"),
         );
 
-        assert!(try_entropy_rate_backend(x, -1, &compiled).expect("entropy rate") >= 0.0);
+        assert!(try_entropy_rate_backend(x, &compiled).expect("entropy rate") >= 0.0);
+        assert!(try_biased_entropy_rate_backend(x, &compiled).expect("biased entropy rate") >= 0.0);
         assert!(
-            try_biased_entropy_rate_backend(x, -1, &compiled).expect("biased entropy rate") >= 0.0
+            try_cross_entropy_rate_backend(x, y, &compiled).expect("cross entropy rate") >= 0.0
         );
         assert!(
-            try_cross_entropy_rate_backend(x, y, -1, &compiled).expect("cross entropy rate") >= 0.0
+            try_joint_entropy_rate_backend(x, y, &compiled).expect("joint entropy rate") >= 0.0
         );
-        assert!(
-            try_joint_entropy_rate_backend(x, y, -1, &compiled).expect("joint entropy rate") >= 0.0
-        );
-        assert!(try_mutual_information_rate_backend(x, y, -1, &compiled).expect("mi rate") >= 0.0);
-        assert!(
-            (0.0..=1.0).contains(&try_ned_rate_backend(x, y, -1, &compiled).expect("ned rate"))
-        );
-        assert!(
-            (0.0..=2.0).contains(&try_nte_rate_backend(x, y, -1, &compiled).expect("nte rate"))
-        );
+        assert!(try_mutual_information_rate_backend(x, y, &compiled).expect("mi rate") >= 0.0);
+        assert!((0.0..=1.0).contains(&try_ned_rate_backend(x, y, &compiled).expect("ned rate")));
+        assert!((0.0..=2.0).contains(&try_nte_rate_backend(x, y, &compiled).expect("nte rate")));
 
-        assert!(marginal_entropy_bytes(x) >= 0.0);
-        assert!(joint_marginal_entropy_bytes(x, y) >= 0.0);
-        assert!(try_entropy_rate_bytes(x, -1).expect("entropy rate bytes") >= 0.0);
-        assert!(try_biased_entropy_rate_bytes(x, -1).expect("biased entropy rate bytes") >= 0.0);
-        assert!(try_joint_entropy_rate_bytes(x, y, -1).expect("joint entropy rate bytes") >= 0.0);
+        assert!(empirical_entropy_bytes(x) >= 0.0);
+        assert!(empirical_joint_entropy_bytes(x, y) >= 0.0);
+        assert!(try_entropy_rate_bytes(x).expect("entropy rate bytes") >= 0.0);
+        assert!(try_biased_entropy_rate_bytes(x).expect("biased entropy rate bytes") >= 0.0);
+        assert!(try_joint_entropy_rate_bytes(x, y).expect("joint entropy rate bytes") >= 0.0);
         assert!(
-            try_conditional_entropy_rate_bytes(x, y, -1).expect("conditional entropy rate bytes")
+            try_conditional_entropy_rate_bytes(x, y).expect("conditional entropy rate bytes")
                 >= 0.0
         );
-        assert!(try_conditional_entropy_bytes(x, y, 0).expect("conditional entropy bytes") >= 0.0);
-        assert!(try_mutual_information_bytes(x, y, 0).expect("mutual information bytes") >= 0.0);
-        assert!(mutual_information_marg_bytes(x, y) >= 0.0);
+        assert!(try_conditional_entropy_bytes(x, y).expect("conditional entropy bytes") >= 0.0);
+        assert!(try_mutual_information_bytes(x, y).expect("mutual information bytes") >= 0.0);
+        assert!(empirical_mutual_information_bytes(x, y) >= 0.0);
         assert!(
-            try_mutual_information_rate_bytes(x, y, -1).expect("mutual information rate bytes")
-                >= 0.0
+            try_mutual_information_rate_bytes(x, y).expect("mutual information rate bytes") >= 0.0
         );
-        assert!((0.0..=1.0).contains(&try_ned_bytes(x, y, 0).expect("ned bytes")));
-        assert!((0.0..=1.0).contains(&ned_marg_bytes(x, y)));
-        assert!((0.0..=1.0).contains(&try_ned_rate_bytes(x, y, -1).expect("ned rate bytes")));
-        assert!((0.0..=1.0).contains(&try_ned_cons_bytes(x, y, 0).expect("ned cons bytes")));
-        assert!((0.0..=1.0).contains(&ned_cons_marg_bytes(x, y)));
-        assert!(
-            (0.0..=1.0).contains(&try_ned_cons_rate_bytes(x, y, -1).expect("ned cons rate bytes"))
-        );
-        assert!((0.0..=2.0).contains(&try_nte_bytes(x, y, 0).expect("nte bytes")));
-        assert!((0.0..=2.0).contains(&nte_marg_bytes(x, y)));
-        assert!((0.0..=2.0).contains(&try_nte_rate_bytes(x, y, -1).expect("nte rate bytes")));
-        assert!((0.0..=1.0).contains(&tvd_bytes(x, y, 0)));
-        assert!((0.0..=1.0).contains(&nhd_bytes(x, y, 0)));
-        assert!(try_cross_entropy_bytes(x, y, 0).expect("cross entropy bytes") >= 0.0);
-        assert!(try_cross_entropy_rate_bytes(x, y, -1).expect("cross entropy rate bytes") >= 0.0);
+        assert!((0.0..=1.0).contains(&try_ned_bytes(x, y).expect("ned bytes")));
+        assert!((0.0..=1.0).contains(&empirical_ned_bytes(x, y)));
+        assert!((0.0..=1.0).contains(&try_ned_rate_bytes(x, y).expect("ned rate bytes")));
+        assert!((0.0..=1.0).contains(&try_ned_cons_bytes(x, y).expect("ned cons bytes")));
+        assert!((0.0..=1.0).contains(&empirical_ned_cons_bytes(x, y)));
+        assert!((0.0..=1.0).contains(&try_ned_cons_rate_bytes(x, y).expect("ned cons rate bytes")));
+        assert!((0.0..=2.0).contains(&try_nte_bytes(x, y).expect("nte bytes")));
+        assert!((0.0..=2.0).contains(&empirical_nte_bytes(x, y)));
+        assert!((0.0..=2.0).contains(&try_nte_rate_bytes(x, y).expect("nte rate bytes")));
+        assert!((0.0..=1.0).contains(&tvd_bytes(x, y)));
+        assert!((0.0..=1.0).contains(&nhd_bytes(x, y)));
+        assert!(try_cross_entropy_bytes(x, y).expect("cross entropy bytes") >= 0.0);
+        assert!(empirical_cross_entropy_bytes(x, y) >= 0.0);
+        assert!(try_cross_entropy_rate_bytes(x, y).expect("cross entropy rate bytes") >= 0.0);
         assert!(d_kl_bytes(x, y) >= 0.0);
         assert!(js_div_bytes(x, y) >= 0.0);
         assert!(
-            (0.0..=1.0)
-                .contains(&try_intrinsic_dependence_bytes(x, -1).expect("intrinsic dependence"))
+            (0.0..=1.0).contains(&try_intrinsic_dependence_bytes(x).expect("intrinsic dependence"))
         );
-        assert!(
-            (0.0..=1.0).contains(
-                &try_resistance_to_transformation_bytes(x, y, -1)
-                    .expect("resistance to transformation")
-            )
-        );
+        assert!((0.0..=1.0).contains(
+            &try_resistance_to_transformation_bytes(x, y).expect("resistance to transformation")
+        ));
 
         set_default_ctx(prev);
     }
@@ -155,7 +143,7 @@ mod rosa_surface {
     #[test]
     fn api_surface_generation_session_and_config_are_callable() {
         let prompt = b"If a frog is green, dogs are red.\nIf a toad is green, cats are red.\nIf a dog is green, frogs are red.\nIf a cat is green, toads are red.\nIf a frog is red, dogs are green.\nIf a toad is red, cats are green.\nIf a dog is red, frogs are green.\nIf a cat is red, toads are ";
-        let backend = RateBackend::RosaPlus;
+        let backend = RateBackend::RosaPlus { max_order: -1 };
         let ctx = InfotheoryCtx::from_specs(
             backend.clone(),
             CompressionBackend::try_default().expect("default compression backend"),
@@ -164,12 +152,12 @@ mod rosa_surface {
         let cfg = GenerationConfig::sampled_frozen(42);
 
         let direct = ctx
-            .try_generate_bytes_with_config(prompt, 8, -1, cfg)
+            .try_generate_bytes_with_config(prompt, 8, cfg)
             .expect("direct generation");
         assert_eq!(direct.len(), 8);
 
         let mut session =
-            RateBackendSession::from_spec(backend, -1, Some((prompt.len() + direct.len()) as u64))
+            RateBackendSession::from_spec(backend, Some((prompt.len() + direct.len()) as u64))
                 .expect("session init");
         session.observe(prompt);
         let from_session = session.generate_bytes(8, cfg);
@@ -297,15 +285,13 @@ mod zpaq_surface {
         let mp = try_ncd_matrix_paths(&paths, "1", NcdVariant::Cons).expect("matrix ncd paths");
         assert_eq!(mp.len(), 4);
 
-        assert!(try_ned_paths(&sx, &sy, 0).expect("ned paths") >= 0.0);
-        assert!(try_nte_paths(&sx, &sy, 0).expect("nte paths") >= 0.0);
-        assert!(try_tvd_paths(&sx, &sy, 0).expect("tvd paths") >= 0.0);
-        assert!(try_nhd_paths(&sx, &sy, 0).expect("nhd paths") >= 0.0);
-        assert!(try_mutual_information_paths(&sx, &sy, 0).expect("mi paths") >= 0.0);
-        assert!(
-            try_conditional_entropy_paths(&sx, &sy, 0).expect("conditional entropy paths") >= 0.0
-        );
-        assert!(try_cross_entropy_paths(&sx, &sy, 0).expect("cross entropy paths") >= 0.0);
+        assert!(try_ned_paths(&sx, &sy).expect("ned paths") >= 0.0);
+        assert!(try_nte_paths(&sx, &sy).expect("nte paths") >= 0.0);
+        assert!(try_tvd_paths(&sx, &sy).expect("tvd paths") >= 0.0);
+        assert!(try_nhd_paths(&sx, &sy).expect("nhd paths") >= 0.0);
+        assert!(try_mutual_information_paths(&sx, &sy).expect("mi paths") >= 0.0);
+        assert!(try_conditional_entropy_paths(&sx, &sy).expect("conditional entropy paths") >= 0.0);
+        assert!(try_cross_entropy_paths(&sx, &sy).expect("cross entropy paths") >= 0.0);
         assert!(try_kl_divergence_paths(&sx, &sy).expect("kl paths") >= 0.0);
         assert!(try_js_divergence_paths(&sx, &sy).expect("js paths") >= 0.0);
 
@@ -338,13 +324,13 @@ mod zpaq_surface {
         );
 
         for err in [
-            try_ned_paths(&missing, &missing, 0).expect_err("ned paths should error"),
-            try_nte_paths(&missing, &missing, 0).expect_err("nte paths should error"),
-            try_nhd_paths(&missing, &missing, 0).expect_err("nhd paths should error"),
-            try_mutual_information_paths(&missing, &missing, 0).expect_err("mi paths should error"),
-            try_conditional_entropy_paths(&missing, &missing, 0)
+            try_ned_paths(&missing, &missing).expect_err("ned paths should error"),
+            try_nte_paths(&missing, &missing).expect_err("nte paths should error"),
+            try_nhd_paths(&missing, &missing).expect_err("nhd paths should error"),
+            try_mutual_information_paths(&missing, &missing).expect_err("mi paths should error"),
+            try_conditional_entropy_paths(&missing, &missing)
                 .expect_err("conditional entropy paths should error"),
-            try_cross_entropy_paths(&missing, &missing, 0)
+            try_cross_entropy_paths(&missing, &missing)
                 .expect_err("cross entropy paths should error"),
             try_kl_divergence_paths(&missing, &missing).expect_err("kl paths should error"),
             try_js_divergence_paths(&missing, &missing).expect_err("jsd paths should error"),

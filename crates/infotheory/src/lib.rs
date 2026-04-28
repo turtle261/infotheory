@@ -5,18 +5,62 @@
 //! This crate provides a comprehensive suite of information-theoretic primitives for
 //! quantifying complexity, dependence, and similarity between data sequences.
 //!
-//! It implements two primary classes of estimators:
-//! 1.  **Compression-based (Kolmogorov Complexity)**: Using the ZPAQ compression algorithm to estimate
-//!     Normalized Compression Distance (NCD).
-//! 2.  **Entropy-based (Shannon Information)**: Using both exact marginal histograms (for i.i.d. data)
-//!     and the ROSA (Rapid Online Suffix Automaton) predictive language model (for sequential data)
-//!     to estimate Entropy, Mutual Information, and related distances.
+//! It implements two complementary classes of estimators:
+//! 1.  **Algorithmic information theory (predictive / Kolmogorov
+//!     complexity)**: estimates `K(·)`-flavored quantities by treating a
+//!     model as a description-length functional — either a compressor
+//!     `C(·)` or a sequential predictor used as a prequential code
+//!     `-log₂ p(x_t | x_{<t})` — and taking the resulting code length as
+//!     a finite, computable proxy for Kolmogorov complexity. Compression
+//!     and prediction are unified in the library: any
+//!     [`crate::api::RateBackend`] can drive the predictive metrics
+//!     directly *and* power the generic rate-coded compressor
+//!     `CompressionBackend::Rate`. The class carries the broadest
+//!     surface in the library — the Normalized Compression Distance
+//!     (NCD) family with its normalization variants and pairwise
+//!     matrices, raw and chained compressed-size primitives, the entropy
+//!     rate `Ĥ(X)`, joint and conditional entropy rates, cross-entropy,
+//!     mutual information, normalized entropy distance (NED), normalized
+//!     transform effort (NTE), intrinsic dependence, and resistance to
+//!     transformation. Compressors are pluggable through
+//!     [`crate::api::CompressionBackend`] (a dedicated ZPAQ family, an
+//!     optional RWKV7 compressor, and the rate-coded compressor wrapping
+//!     any rate backend). Rate backends are pluggable through
+//!     [`crate::api::RateBackend`] — CTW, FAC-CTW, ROSA+, PPMD, Sequitur,
+//!     contiguous and sparse local-match models, online RWKV7 and Mamba
+//!     neural backends, calibrated wrappers, particle-filter backends,
+//!     ZPAQ-as-rate, and arbitrary mixture / ensemble compositions
+//!     thereof — and are interchangeable wherever a `RateBackend` is
+//!     consumed.
+//! 2.  **Shannon information theory (empirical / IID plug-in)**:
+//!     estimates classical Shannon quantities directly from observed
+//!     byte frequencies, with no learned model. The class is model-free:
+//!     it plugs the empirical distribution into Shannon's formulae and
+//!     returns an order-0 / IID estimator. It supplies the order-0
+//!     entropy `H₀(X)`, joint and conditional `H₀`, `I₀(X;Y)`, and the
+//!     `empirical_*` analogues of NED, NTE, cross-entropy, and
+//!     resistance, plus the classical divergences and distances over
+//!     byte distributions: total variation distance (TVD), normalized
+//!     Hellinger distance (NHD), Kullback–Leibler divergence (KL), and
+//!     Jensen–Shannon divergence (JSD). These are useful as model-free
+//!     baselines, axiom test fixtures, and as the appropriate estimator
+//!     when higher-order structure is absent by construction.
+//!
+//! Many of the same underlying quantities — entropy, mutual information,
+//! NED, NTE, cross-entropy, resistance — are exposed in *both* classes,
+//! so a caller can pick between an algorithmic / model-driven estimate
+//! and a model-free Shannon plug-in for the same target. The algorithmic
+//! side is correspondingly broader: it carries the entire backend and
+//! compressor ecosystem and the metrics (NCD, compressed-size, the
+//! entropy *rate*) that have no order-0 plug-in counterpart.
 //!
 //! ## Mathematical Primitives
 //!
-//! The library implements the following core measures. For sequential data, "Rate" variants
-//! use the ROSA model to estimate `Ĥ(X)` (entropy rate), while "Marginal" variants
-//! treat data as a bag-of-bytes (i.i.d.) and compute `H(X)` from histograms.
+//! The library implements the following core measures. For sequential data,
+//! `*_rate_*` and explicit-backend variants use the configured
+//! [`crate::api::RateBackend`] to estimate the entropy rate `Ĥ(X)`, while
+//! `empirical_*` variants compute the order-0 plug-in `H₀(X)` from byte
+//! histograms.
 //!
 //! ### 1. Normalized Compression Distance (NCD)
 //! Approximates the Normalized Information Distance (NID) using a compressor `C`.
@@ -45,9 +89,11 @@
 //! *   **Jensen-Shannon Divergence (JSD)**: Symmetrized and smoothed KL divergence.
 //!
 //! ### 6. Intrinsic Dependence (ID)
-//! Measures the redundancy within a sequence, comparing marginal entropy to entropy rate.
+//! Measures sequential redundancy by comparing the order-0 / empirical
+//! entropy `H₀(X)` against the entropy rate `Ĥ(X)` produced by the
+//! configured rate backend.
 //!
-//! `ID(X) = (H_marginal(X) - H_rate(X)) / H_marginal(X)`
+//! `ID(X) = (H₀(X) - Ĥ(X)) / H₀(X)`
 //!
 //! ### 7. Resistance to Transformation
 //! Quantifies how much information is preserved after a transformation `T` is applied.
@@ -57,17 +103,19 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use infotheory::api::{mutual_information_marg_bytes, try_ncd_paths, NcdVariant};
+//! use infotheory::api::{empirical_mutual_information_bytes, try_ncd_paths, NcdVariant};
 //!
 //! let x = b"some data sequence";
 //! let y = b"another data sequence";
 //!
-//! // Compression-based distance
+//! // Compression-based distance using ZPAQ method "5". For other compression
+//! // backends (rate-coded AC/rANS, RWKV7, ...), use try_ncd_paths_backend or
+//! // try_ncd_bytes_backend with an explicit api::CompressionBackend.
 //! let ncd = try_ncd_paths("file1.txt", "file2.txt", "5", NcdVariant::Vitanyi)
 //!     .expect("ncd");
 //!
-//! // Entropy-based mutual information (Marginal / i.i.d.)
-//! let mi_marg = mutual_information_marg_bytes(x, y);
+//! // Order-0 / IID Shannon mutual information (model-free plug-in baseline).
+//! let mi = empirical_mutual_information_bytes(x, y);
 //! ```
 
 #[cfg(test)]
@@ -112,14 +160,14 @@ pub(crate) use crate::api::{
 #[cfg(all(test, feature = "all-backends"))]
 use crate::api::{
     CompressionBackend, GenerationConfig, InfotheoryCtx, NcdVariant, RateBackend,
-    RateBackendSession, d_kl_bytes, try_biased_entropy_rate_backend, try_conditional_entropy_bytes,
+    RateBackendSession, d_kl_bytes, try_biased_entropy_rate_backend,
     try_conditional_entropy_rate_bytes, try_cross_entropy_rate_backend, try_entropy_rate_backend,
     try_entropy_rate_bytes, try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes,
     try_mutual_information_bytes, try_ncd_bytes,
 };
 #[cfg(all(test, feature = "all-backends"))]
 use crate::api::{
-    joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes, nhd_bytes, tvd_bytes,
+    empirical_entropy_bytes, empirical_joint_entropy_bytes, js_div_bytes, nhd_bytes, tvd_bytes,
 };
 use crate::error::{InfotheoryError, InfotheoryResult};
 /// CTW and FAC-CTW backend types.
@@ -356,7 +404,6 @@ pub(crate) fn with_mamba_method_spec_tls<R>(
 pub(crate) fn try_prequential_rate_backend(
     data: &[u8],
     prefix_parts: &[&[u8]],
-    max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     if data.is_empty() {
@@ -367,8 +414,8 @@ pub(crate) fn try_prequential_rate_backend(
         .map(|p| p.len() as u64)
         .sum::<u64>()
         .saturating_add(data.len() as u64);
-    let mut predictor = crate::runtime::build_rate_backend_predictor_default(backend, max_order)
-        .map_err(|e| {
+    let mut predictor =
+        crate::runtime::build_rate_backend_predictor_default(backend).map_err(|e| {
             InfotheoryError::runtime(format!("rate backend predictor init failed: {e}"))
         })?;
     predictor
@@ -393,15 +440,14 @@ pub(crate) fn try_prequential_rate_backend(
 pub(crate) fn try_frozen_plugin_rate_backend(
     score_data: &[u8],
     fit_parts: &[&[u8]],
-    max_order: i64,
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     if score_data.is_empty() {
         return Ok(0.0);
     }
     #[cfg(feature = "backend-rosa")]
-    if matches!(backend.plan(), crate::spec::core::RateBackendPlan::RosaPlus) {
-        let mut model = RosaPlus::new(max_order, false, 0, 42);
+    if let crate::spec::core::RateBackendPlan::RosaPlus { max_order } = backend.plan() {
+        let mut model = RosaPlus::new(*max_order, false, 0, 42);
         let fit_total = fit_parts.iter().map(|part| part.len()).sum::<usize>();
         if fit_total > 0 {
             model.reserve_for_stream(fit_total);
@@ -459,8 +505,8 @@ pub(crate) fn try_frozen_plugin_rate_backend(
     }
 
     let fit_total = fit_parts.iter().map(|part| part.len() as u64).sum::<u64>();
-    let mut predictor = crate::runtime::build_rate_backend_predictor_default(backend, max_order)
-        .map_err(|e| {
+    let mut predictor =
+        crate::runtime::build_rate_backend_predictor_default(backend).map_err(|e| {
             InfotheoryError::runtime(format!("rate backend predictor init failed: {e}"))
         })?;
     predictor
@@ -490,34 +536,6 @@ pub(crate) fn try_frozen_plugin_rate_backend(
     Ok(bits / (score_data.len() as f64))
 }
 
-// ============================================================
-// Entropy-Based Distance Primitives (via ROSA)
-// ============================================================
-//
-// These use ROSA's Witten-Bell language model to estimate entropy
-// and compute information-theoretic distances.
-
-/// Compute entropy rate `Ĥ(X)` in bits/symbol using ROSA LM.
-///
-/// This uses ROSA's context-conditional Witten-Bell model to estimate
-/// the entropy rate, which accounts for sequential dependencies.
-///
-/// The estimator is **prequential** (predictive sequential): it sums the negative log-probability
-/// of each symbol `x_t` given its past context `x_{<t}`, estimated from the model trained on `x_{<t}`.
-///
-/// `Ĥ(X) = -1/N * Σ log2 P(x_t | x_{t-k}^{t-1})`
-///
-/// Primitive 7: Resistance under Allowed Transformations.
-///
-/// Measures how much information is preserved after a transformation `T` is applied to `X`.
-///
-/// `Resistance(X, T) = I(X; T(X)) / H(X)`
-///
-/// Range `[0,1]` (with guard for `H(X)=0`).
-/// * 1 means perfectly resistant (identity transformation).
-/// * 0 means the transformation destroyed all information (e.g. mapping everything to a constant).
-///
-/// Assumes X and T(X) are aligned.
 #[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
@@ -554,14 +572,12 @@ mod tests {
     fn generate_rate_backend_chain(
         prefix_parts: &[&[u8]],
         bytes: usize,
-        max_order: i64,
         backend: &RateBackend,
         config: GenerationConfig,
     ) -> Vec<u8> {
         crate::api::generation::generate_rate_backend_chain(
             prefix_parts,
             bytes,
-            max_order,
             &compiled_rate_backend(backend),
             config,
         )
@@ -571,76 +587,57 @@ mod tests {
         try_ncd_bytes(x, y, method, variant).expect("ncd_bytes")
     }
 
-    fn entropy_rate_bytes(data: &[u8], max_order: i64) -> f64 {
-        try_entropy_rate_bytes(data, max_order).expect("entropy_rate_bytes")
+    fn entropy_rate_bytes(data: &[u8]) -> f64 {
+        try_entropy_rate_bytes(data).expect("entropy_rate_bytes")
     }
 
-    fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
-        try_entropy_rate_backend(data, max_order, &compiled_rate_backend(backend))
+    fn entropy_rate_backend(data: &[u8], backend: &RateBackend) -> f64 {
+        try_entropy_rate_backend(data, &compiled_rate_backend(backend))
             .expect("entropy_rate_backend")
     }
 
-    fn biased_entropy_rate_backend(data: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
-        try_biased_entropy_rate_backend(data, max_order, &compiled_rate_backend(backend))
+    fn biased_entropy_rate_backend(data: &[u8], backend: &RateBackend) -> f64 {
+        try_biased_entropy_rate_backend(data, &compiled_rate_backend(backend))
             .expect("biased_entropy_rate_backend")
     }
 
     fn cross_entropy_rate_backend(
         test_data: &[u8],
         train_data: &[u8],
-        max_order: i64,
         backend: &RateBackend,
     ) -> f64 {
-        try_cross_entropy_rate_backend(
-            test_data,
-            train_data,
-            max_order,
-            &compiled_rate_backend(backend),
-        )
-        .expect("cross_entropy_rate_backend")
+        try_cross_entropy_rate_backend(test_data, train_data, &compiled_rate_backend(backend))
+            .expect("cross_entropy_rate_backend")
     }
 
-    fn joint_entropy_rate_backend(
-        x: &[u8],
-        y: &[u8],
-        max_order: i64,
-        backend: &RateBackend,
-    ) -> f64 {
-        try_joint_entropy_rate_backend(x, y, max_order, &compiled_rate_backend(backend))
+    fn joint_entropy_rate_backend(x: &[u8], y: &[u8], backend: &RateBackend) -> f64 {
+        try_joint_entropy_rate_backend(x, y, &compiled_rate_backend(backend))
             .expect("joint_entropy_rate_backend")
     }
 
-    fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-        try_joint_entropy_rate_bytes(x, y, max_order).expect("joint_entropy_rate_bytes")
+    fn joint_entropy_rate_bytes(x: &[u8], y: &[u8]) -> f64 {
+        try_joint_entropy_rate_bytes(x, y).expect("joint_entropy_rate_bytes")
     }
 
-    fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-        try_conditional_entropy_rate_bytes(x, y, max_order).expect("conditional_entropy_rate_bytes")
+    fn conditional_entropy_rate_bytes(x: &[u8], y: &[u8]) -> f64 {
+        try_conditional_entropy_rate_bytes(x, y).expect("conditional_entropy_rate_bytes")
     }
 
-    fn mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-        try_mutual_information_bytes(x, y, max_order).expect("mutual_information_bytes")
+    fn mutual_information_bytes(x: &[u8], y: &[u8]) -> f64 {
+        try_mutual_information_bytes(x, y).expect("mutual_information_bytes")
     }
 
-    fn conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-        try_conditional_entropy_bytes(x, y, max_order).expect("conditional_entropy_bytes")
+    fn ned_bytes(x: &[u8], y: &[u8]) -> f64 {
+        crate::api::try_ned_bytes(x, y).expect("ned_bytes")
     }
 
-    fn ned_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-        crate::api::try_ned_bytes(x, y, max_order).expect("ned_bytes")
-    }
-
-    fn nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-        crate::api::try_nte_bytes(x, y, max_order).expect("nte_bytes")
-    }
-
-    fn nte_rate_backend(x: &[u8], y: &[u8], max_order: i64, backend: &RateBackend) -> f64 {
-        crate::api::try_nte_rate_backend(x, y, max_order, &compiled_rate_backend(backend))
+    fn nte_rate_backend(x: &[u8], y: &[u8], backend: &RateBackend) -> f64 {
+        crate::api::try_nte_rate_backend(x, y, &compiled_rate_backend(backend))
             .expect("nte_rate_backend")
     }
 
-    fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -> f64 {
-        crate::api::try_resistance_to_transformation_bytes(x, tx, max_order)
+    fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8]) -> f64 {
+        crate::api::try_resistance_to_transformation_bytes(x, tx)
             .expect("resistance_to_transformation_bytes")
     }
 
@@ -681,13 +678,11 @@ mod tests {
                     MixtureExpertSpec {
                         name: Some("match".to_string()),
                         log_prior: 0.0,
-                        max_order: -1,
                         backend: test_match_backend(),
                     },
                     MixtureExpertSpec {
                         name: Some("ppmd".to_string()),
                         log_prior: 0.0,
-                        max_order: -1,
                         backend: test_ppmd_backend(),
                     },
                 ],
@@ -715,27 +710,12 @@ mod tests {
         b"If a frog is green, dogs are red.\nIf a toad is green, cats are red.\nIf a dog is green, frogs are red.\nIf a cat is green, toads are red.\nIf a frog is red, dogs are green.\nIf a toad is red, cats are green.\nIf a dog is red, frogs are green.\nIf a cat is red, toads are \n"
     }
 
-    fn assert_deterministic_generate_for_backend(
-        backend: RateBackend,
-        max_order: i64,
-        bytes: usize,
-        label: &str,
-    ) {
+    fn assert_deterministic_generate_for_backend(backend: RateBackend, bytes: usize, label: &str) {
         let prompt = continuation_prompt();
-        let a = generate_rate_backend_chain(
-            &[prompt],
-            bytes,
-            max_order,
-            &backend,
-            GenerationConfig::default(),
-        );
-        let b = generate_rate_backend_chain(
-            &[prompt],
-            bytes,
-            max_order,
-            &backend,
-            GenerationConfig::default(),
-        );
+        let a =
+            generate_rate_backend_chain(&[prompt], bytes, &backend, GenerationConfig::default());
+        let b =
+            generate_rate_backend_chain(&[prompt], bytes, &backend, GenerationConfig::default());
         assert_eq!(
             a, b,
             "{label} generation should be deterministic for identical input"
@@ -747,16 +727,11 @@ mod tests {
         );
     }
 
-    fn assert_sampled_generate_for_backend(
-        backend: RateBackend,
-        max_order: i64,
-        bytes: usize,
-        label: &str,
-    ) {
+    fn assert_sampled_generate_for_backend(backend: RateBackend, bytes: usize, label: &str) {
         let prompt = continuation_prompt();
         let config = GenerationConfig::sampled_frozen(42);
-        let a = generate_rate_backend_chain(&[prompt], bytes, max_order, &backend, config);
-        let b = generate_rate_backend_chain(&[prompt], bytes, max_order, &backend, config);
+        let a = generate_rate_backend_chain(&[prompt], bytes, &backend, config);
+        let b = generate_rate_backend_chain(&[prompt], bytes, &backend, config);
         assert_eq!(
             a, b,
             "{label} sampled generation should be deterministic for a fixed seed"
@@ -777,20 +752,20 @@ mod tests {
     }
 
     #[test]
-    fn shannon_identities_marginal_aligned() {
+    fn shannon_identities_empirical_aligned() {
         let x = b"abracadabra";
         let y = b"abracadabra";
 
-        let h = marginal_entropy_bytes(x);
-        let mi = mutual_information_bytes(x, y, 0);
-        let h_xy = joint_marginal_entropy_bytes(x, y);
-        let h_x_given_y = conditional_entropy_bytes(x, y, 0);
-        let ned = ned_bytes(x, y, 0);
-        let nte = nte_bytes(x, y, 0);
+        let h_x = empirical_entropy_bytes(x);
+        let mi = crate::api::empirical_mutual_information_bytes(x, y);
+        let h_xy = empirical_joint_entropy_bytes(x, y);
+        let h_x_given_y = (h_xy - h_x).max(0.0);
+        let ned = crate::api::empirical_ned_bytes(x, y);
+        let nte = crate::api::empirical_nte_bytes(x, y);
 
-        assert!((h_xy - h).abs() < 1e-12);
+        assert!((h_xy - h_x).abs() < 1e-12);
         assert!(h_x_given_y.abs() < 1e-12);
-        assert!((mi - h).abs() < 1e-12);
+        assert!((mi - h_x).abs() < 1e-12);
         assert!(ned.abs() < 1e-12);
         assert!(nte.abs() < 1e-12);
     }
@@ -799,15 +774,17 @@ mod tests {
     fn shannon_identities_rate_aligned_reasonable() {
         let x = b"the quick brown fox jumps over the lazy dog";
         let y = b"the quick brown fox jumps over the lazy dog";
-        let max_order = 8;
         let prev = get_default_ctx().expect("default ctx");
-        set_default_ctx(ctx(RateBackend::RosaPlus, default_compression_backend()));
+        set_default_ctx(ctx(
+            RateBackend::RosaPlus { max_order: 8 },
+            default_compression_backend(),
+        ));
 
-        let h_x = entropy_rate_bytes(x, max_order);
-        let h_xy = joint_entropy_rate_bytes(x, y, max_order);
-        let h_x_given_y = conditional_entropy_rate_bytes(x, y, max_order);
-        let mi = mutual_information_bytes(x, y, max_order);
-        let ned = ned_bytes(x, y, max_order);
+        let h_x = entropy_rate_bytes(x);
+        let h_xy = joint_entropy_rate_bytes(x, y);
+        let h_x_given_y = conditional_entropy_rate_bytes(x, y);
+        let mi = mutual_information_bytes(x, y);
+        let ned = ned_bytes(x, y);
 
         // Finite-sample estimators won't be exact; allow reasonable tolerance.
         let tol = 0.2;
@@ -822,23 +799,24 @@ mod tests {
     fn resistance_identity_is_one() {
         let x = b"some repeated repeated repeated text";
         let prev = get_default_ctx().expect("default ctx");
-        set_default_ctx(ctx(RateBackend::RosaPlus, default_compression_backend()));
-        let r0 = resistance_to_transformation_bytes(x, x, 0);
-        let r8 = resistance_to_transformation_bytes(x, x, 8);
-        assert!((r0 - 1.0).abs() < 1e-12);
-        assert!((r8 - 1.0).abs() < 1e-6);
+        set_default_ctx(ctx(
+            RateBackend::RosaPlus { max_order: 8 },
+            default_compression_backend(),
+        ));
+        let r = resistance_to_transformation_bytes(x, x);
+        assert!((r - 1.0).abs() < 1e-6);
         set_default_ctx(prev);
     }
 
     #[test]
-    fn marginal_metrics_empty_inputs_are_zero() {
+    fn empirical_metrics_empty_inputs_are_zero() {
         let empty: &[u8] = &[];
         let x = b"abc";
 
-        assert_eq!(tvd_bytes(empty, x, 0), 0.0);
-        assert_eq!(tvd_bytes(x, empty, 0), 0.0);
-        assert_eq!(nhd_bytes(empty, x, 0), 0.0);
-        assert_eq!(nhd_bytes(x, empty, 0), 0.0);
+        assert_eq!(tvd_bytes(empty, x), 0.0);
+        assert_eq!(tvd_bytes(x, empty), 0.0);
+        assert_eq!(nhd_bytes(empty, x), 0.0);
+        assert_eq!(nhd_bytes(x, empty), 0.0);
         assert_eq!(d_kl_bytes(empty, x), 0.0);
         assert_eq!(d_kl_bytes(x, empty), 0.0);
         assert_eq!(js_div_bytes(empty, x), 0.0);
@@ -846,15 +824,10 @@ mod tests {
     }
 
     #[test]
-    fn marginal_cross_entropy_empty_test_is_zero() {
+    fn empirical_cross_entropy_empty_test_is_zero() {
         let empty: &[u8] = &[];
         let y = b"abc";
-        let ctx = InfotheoryCtx::try_with_zpaq("5").expect("zpaq ctx");
-        assert_eq!(
-            ctx.try_cross_entropy_bytes(empty, y, 0)
-                .expect("cross entropy bytes"),
-            0.0
-        );
+        assert_eq!(crate::api::empirical_cross_entropy_bytes(empty, y), 0.0);
     }
 
     #[test]
@@ -862,7 +835,7 @@ mod tests {
         let x = b"hello world context";
 
         // Default is RosaPlus
-        let h_rosa = entropy_rate_bytes(x, 8);
+        let h_rosa = entropy_rate_bytes(x);
 
         // Switch to CTW
         set_default_ctx(ctx(
@@ -870,14 +843,14 @@ mod tests {
             default_compression_backend(),
         ));
 
-        let h_ctw = entropy_rate_bytes(x, 8);
+        let h_ctw = entropy_rate_bytes(x);
 
         // They should generally be different, but most importantly, CTW worked
         assert!(h_ctw > 0.0);
 
         // Reset to default
         set_default_ctx(default_ctx());
-        let h_rosa_back = entropy_rate_bytes(x, 8);
+        let h_rosa_back = entropy_rate_bytes(x);
         assert!((h_rosa - h_rosa_back).abs() < 1e-12);
     }
 
@@ -918,8 +891,8 @@ mod tests {
         // Test that NTE is properly clamped to [0, 2] instead of [0, 1]
         // For independent sequences with similar entropy, NTE can approach 2.0
         //
-        // Note: For *marginal* NTE, due to how joint entropy works for aligned pairs,
-        // it's mathematically bounded differently. The fix for NTE clamping primarily
+        // Note: For *empirical* (order-0) NTE, due to how joint entropy works for aligned
+        // pairs, it's mathematically bounded differently. The fix for NTE clamping primarily
         // affects *rate*-based NTE where VI can truly be 2*max(H).
         //
         // We test that the clamp upper bound is at least > 1.0 for cases where VI > max(H)
@@ -934,7 +907,7 @@ mod tests {
         let x: Vec<u8> = (0..200).map(|i| (i % 2) as u8).collect(); // 010101...
         let y: Vec<u8> = (0..200).map(|i| ((i + 1) % 2) as u8).collect(); // 101010...
 
-        let nte_rate = nte_rate_backend(&x, &y, -1, &RateBackend::Ctw { depth: 8 });
+        let nte_rate = nte_rate_backend(&x, &y, &RateBackend::Ctw { depth: 8 });
 
         // With the fix, NTE should not be clamped to 1.0
         // It may or may not exceed 1.0 depending on the specifics, but it should be allowed to
@@ -957,7 +930,7 @@ mod tests {
         ));
 
         let empty: &[u8] = &[];
-        let h = entropy_rate_bytes(empty, -1);
+        let h = entropy_rate_bytes(empty);
         assert_eq!(h, 0.0, "empty data should return 0.0 entropy");
 
         // Reset
@@ -981,18 +954,18 @@ mod tests {
 
         for (name, backend) in cases {
             assert_eq!(
-                joint_entropy_rate_backend(b"", b"nonempty", -1, &backend),
+                joint_entropy_rate_backend(b"", b"nonempty", &backend),
                 0.0,
                 "{name} should return 0.0 for empty aligned pairs"
             );
             assert_eq!(
-                joint_entropy_rate_backend(b"nonempty", b"", -1, &backend),
+                joint_entropy_rate_backend(b"nonempty", b"", &backend),
                 0.0,
                 "{name} should return 0.0 when alignment truncates to empty"
             );
 
-            let aligned = joint_entropy_rate_backend(b"abcd", b"wxyz", -1, &backend);
-            let truncated = joint_entropy_rate_backend(b"abcdextra", b"wxyz", -1, &backend);
+            let aligned = joint_entropy_rate_backend(b"abcd", b"wxyz", &backend);
+            let truncated = joint_entropy_rate_backend(b"abcdextra", b"wxyz", &backend);
             assert!(
                 (aligned - truncated).abs() < 1e-12,
                 "{name} should score only the aligned prefix: aligned={aligned} truncated={truncated}"
@@ -1013,8 +986,8 @@ mod tests {
         ];
 
         for (name, backend) in cases {
-            let h1 = biased_entropy_rate_backend(data, -1, &backend);
-            let h2 = biased_entropy_rate_backend(data, -1, &backend);
+            let h1 = biased_entropy_rate_backend(data, &backend);
+            let h2 = biased_entropy_rate_backend(data, &backend);
             assert!(h1.is_finite(), "{name} biased entropy should be finite");
             assert!(
                 (h1 - h2).abs() < 1e-12,
@@ -1031,19 +1004,12 @@ mod tests {
         let back = &prompt[split_at..];
         let backend = RateBackend::Ctw { depth: 32 };
         let bytes = 8usize;
-        let max_order = -1;
 
-        let flat = generate_rate_backend_chain(
-            &[prompt],
-            bytes,
-            max_order,
-            &backend,
-            GenerationConfig::default(),
-        );
+        let flat =
+            generate_rate_backend_chain(&[prompt], bytes, &backend, GenerationConfig::default());
         let chained = generate_rate_backend_chain(
             &[front, back],
             bytes,
-            max_order,
             &backend,
             GenerationConfig::default(),
         );
@@ -1055,10 +1021,14 @@ mod tests {
 
     #[test]
     fn generate_bytes_api_is_deterministic_for_ctw_rosa_match_ppmd() {
-        assert_deterministic_generate_for_backend(RateBackend::Ctw { depth: 32 }, -1, 8, "ctw");
-        assert_deterministic_generate_for_backend(RateBackend::RosaPlus, -1, 8, "rosaplus");
-        assert_deterministic_generate_for_backend(test_match_backend(), -1, 8, "match");
-        assert_deterministic_generate_for_backend(test_ppmd_backend(), -1, 8, "ppmd");
+        assert_deterministic_generate_for_backend(RateBackend::Ctw { depth: 32 }, 8, "ctw");
+        assert_deterministic_generate_for_backend(
+            RateBackend::RosaPlus { max_order: -1 },
+            8,
+            "rosaplus",
+        );
+        assert_deterministic_generate_for_backend(test_match_backend(), 8, "match");
+        assert_deterministic_generate_for_backend(test_ppmd_backend(), 8, "ppmd");
     }
 
     #[cfg(feature = "backend-rwkv")]
@@ -1067,15 +1037,15 @@ mod tests {
         let backend = RateBackend::Rwkv7Method {
             method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
         };
-        assert_deterministic_generate_for_backend(backend, -1, 8, "rwkv7");
+        assert_deterministic_generate_for_backend(backend, 8, "rwkv7");
     }
 
     #[test]
     fn sampled_generation_is_deterministic_for_ctw_rosa_match_ppmd() {
-        assert_sampled_generate_for_backend(RateBackend::Ctw { depth: 32 }, -1, 8, "ctw");
-        assert_sampled_generate_for_backend(RateBackend::RosaPlus, -1, 8, "rosaplus");
-        assert_sampled_generate_for_backend(test_match_backend(), -1, 8, "match");
-        assert_sampled_generate_for_backend(test_ppmd_backend(), -1, 8, "ppmd");
+        assert_sampled_generate_for_backend(RateBackend::Ctw { depth: 32 }, 8, "ctw");
+        assert_sampled_generate_for_backend(RateBackend::RosaPlus { max_order: -1 }, 8, "rosaplus");
+        assert_sampled_generate_for_backend(test_match_backend(), 8, "match");
+        assert_sampled_generate_for_backend(test_ppmd_backend(), 8, "ppmd");
     }
 
     #[cfg(feature = "backend-rwkv")]
@@ -1084,7 +1054,7 @@ mod tests {
         let backend = RateBackend::Rwkv7Method {
             method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
         };
-        assert_sampled_generate_for_backend(backend, -1, 8, "rwkv7");
+        assert_sampled_generate_for_backend(backend, 8, "rwkv7");
     }
 
     #[test]
@@ -1092,8 +1062,7 @@ mod tests {
         let out = generate_rate_backend_chain(
             &[continuation_prompt()],
             8,
-            -1,
-            &RateBackend::RosaPlus,
+            &RateBackend::RosaPlus { max_order: -1 },
             GenerationConfig::sampled_frozen(42),
         );
         assert_eq!(out, b" green.\n");
@@ -1107,7 +1076,7 @@ mod tests {
             memory_mb: 8,
         };
         let mut session =
-            RateBackendSession::from_spec(backend.clone(), -1, Some((prompt.len() + 8) as u64))
+            RateBackendSession::from_spec(backend.clone(), Some((prompt.len() + 8) as u64))
                 .expect("session init");
         session.observe(prompt);
         let from_session = session.generate_bytes(8, GenerationConfig::sampled_frozen(42));
@@ -1115,7 +1084,7 @@ mod tests {
 
         let ctx = ctx(backend, default_compression_backend());
         let from_ctx = ctx
-            .try_generate_bytes_with_config(prompt, 8, -1, GenerationConfig::sampled_frozen(42))
+            .try_generate_bytes_with_config(prompt, 8, GenerationConfig::sampled_frozen(42))
             .expect("ctx generation");
         assert_eq!(from_session, from_ctx);
     }
@@ -1124,8 +1093,8 @@ mod tests {
     fn biased_entropy_ctw_uses_frozen_plugin_scoring() {
         let backend = RateBackend::Ctw { depth: 8 };
         let data = b"AAAAAAAA";
-        let plugin = biased_entropy_rate_backend(data, -1, &backend);
-        let prequential = entropy_rate_backend(data, -1, &backend);
+        let plugin = biased_entropy_rate_backend(data, &backend);
+        let prequential = entropy_rate_backend(data, &backend);
         assert!(
             plugin + 1e-9 < prequential,
             "expected plugin scoring to beat prequential scoring: plugin={plugin} prequential={prequential}"
@@ -1135,9 +1104,9 @@ mod tests {
     #[test]
     fn rosa_plugin_entropy_matches_direct_model_api() {
         let data = b"abracadabra";
-        let backend = RateBackend::RosaPlus;
+        let backend = RateBackend::RosaPlus { max_order: 3 };
 
-        let plugin = biased_entropy_rate_backend(data, 3, &backend);
+        let plugin = biased_entropy_rate_backend(data, &backend);
 
         let mut direct = RosaPlus::new(3, false, 0, 42);
         direct.train_example(data);
@@ -1154,9 +1123,9 @@ mod tests {
     fn rosa_plugin_cross_entropy_matches_direct_model_api() {
         let train = b"alakazam";
         let test = b"abracadabra";
-        let backend = RateBackend::RosaPlus;
+        let backend = RateBackend::RosaPlus { max_order: 3 };
 
-        let plugin = cross_entropy_rate_backend(test, train, 3, &backend);
+        let plugin = cross_entropy_rate_backend(test, train, &backend);
 
         let mut direct = RosaPlus::new(3, false, 0, 42);
         direct.train_example(train);
@@ -1171,7 +1140,10 @@ mod tests {
 
     #[test]
     fn rosa_conditional_chain_matches_concatenated_prefix_scoring() {
-        let ctx = ctx(RateBackend::RosaPlus, default_compression_backend());
+        let ctx = ctx(
+            RateBackend::RosaPlus { max_order: -1 },
+            default_compression_backend(),
+        );
         let prefix_parts: [&[u8]; 3] = [b"universal ", b"prior ", b"slice"];
         let data = b"query payload";
 
@@ -1179,7 +1151,11 @@ mod tests {
             .try_cross_entropy_conditional_chain(&prefix_parts, data)
             .expect("conditional-chain cross entropy");
         let flat_prefix: Vec<u8> = prefix_parts.concat();
-        let flat = cross_entropy_rate_backend(data, &flat_prefix, -1, &RateBackend::RosaPlus);
+        let flat = cross_entropy_rate_backend(
+            data,
+            &flat_prefix,
+            &RateBackend::RosaPlus { max_order: -1 },
+        );
 
         assert!(
             (chained - flat).abs() < 1e-12,
@@ -1194,9 +1170,9 @@ mod tests {
         let theoretical_h = crate::datagen::bernoulli_entropy(p);
         assert!((theoretical_h - 1.0).abs() < 1e-10);
 
-        // Generate data and check marginal entropy is close to theoretical
+        // Generate data and check empirical entropy is close to theoretical
         let data = crate::datagen::bernoulli(10000, p, 42);
-        let estimated_h = marginal_entropy_bytes(&data);
+        let estimated_h = empirical_entropy_bytes(&data);
 
         // Should be close to 1.0 bit (since values are 0 or 1)
         assert!(
@@ -1216,8 +1192,8 @@ mod tests {
         };
         let data = b"rwkv method entropy stability regression sample";
 
-        let h1 = entropy_rate_backend(data, -1, &backend);
-        let h2 = entropy_rate_backend(data, -1, &backend);
+        let h1 = entropy_rate_backend(data, &backend);
+        let h2 = entropy_rate_backend(data, &backend);
         assert!(
             (h1 - h2).abs() < 1e-12,
             "rwkv method entropy leaked mutable state across calls: h1={h1}, h2={h2}"
@@ -1232,8 +1208,8 @@ mod tests {
                 .expect("rwkv method spec"),
         };
         let data = b"rwkv method without policy";
-        let h1 = entropy_rate_backend(data, -1, &backend);
-        let h2 = biased_entropy_rate_backend(data, -1, &backend);
+        let h1 = entropy_rate_backend(data, &backend);
+        let h2 = biased_entropy_rate_backend(data, &backend);
         assert!(h1.is_finite());
         assert!(h2.is_finite());
     }
@@ -1245,8 +1221,8 @@ mod tests {
             method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=25,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
         };
         let data = b"rwkv infer-only plugin equality sample";
-        let h = entropy_rate_backend(data, -1, &backend);
-        let plugin = biased_entropy_rate_backend(data, -1, &backend);
+        let h = entropy_rate_backend(data, &backend);
+        let plugin = biased_entropy_rate_backend(data, &backend);
         assert!(
             (h - plugin).abs() < 1e-12,
             "infer-only rwkv plugin should equal single-pass entropy: h={h}, plugin={plugin}"
@@ -1260,8 +1236,8 @@ mod tests {
             method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=23,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.0)").expect("rwkv method spec"),
         };
         let data = b"rwkv plugin stability sample";
-        let h1 = biased_entropy_rate_backend(data, -1, &backend);
-        let h2 = biased_entropy_rate_backend(data, -1, &backend);
+        let h1 = biased_entropy_rate_backend(data, &backend);
+        let h2 = biased_entropy_rate_backend(data, &backend);
         assert!(
             (h1 - h2).abs() < 1e-12,
             "rwkv method biased entropy leaked mutable state across calls: h1={h1}, h2={h2}"
@@ -1301,8 +1277,8 @@ mod tests {
                 .expect("mamba method spec"),
         };
         let data = b"mamba method without policy";
-        let h1 = entropy_rate_backend(data, -1, &backend);
-        let h2 = biased_entropy_rate_backend(data, -1, &backend);
+        let h1 = entropy_rate_backend(data, &backend);
+        let h2 = biased_entropy_rate_backend(data, &backend);
         assert!(h1.is_finite());
         assert!(h2.is_finite());
     }
@@ -1314,8 +1290,8 @@ mod tests {
             method: crate::mambazip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("mamba method spec"),
         };
         let data = b"mamba infer-only plugin equality sample";
-        let h = entropy_rate_backend(data, -1, &backend);
-        let plugin = biased_entropy_rate_backend(data, -1, &backend);
+        let h = entropy_rate_backend(data, &backend);
+        let plugin = biased_entropy_rate_backend(data, &backend);
         assert!(
             (h - plugin).abs() < 1e-12,
             "infer-only mamba plugin should equal single-pass entropy: h={h}, plugin={plugin}"
@@ -1329,8 +1305,8 @@ mod tests {
             method: crate::mambazip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=24,train=sgd,lr=0.01,stride=1;policy:schedule=0..100:train(scope=head+bias,opt=sgd,lr=0.01,stride=1,bptt=1,clip=0,momentum=0.0)").expect("mamba method spec"),
         };
         let data = b"mamba plugin stability sample";
-        let h1 = biased_entropy_rate_backend(data, -1, &backend);
-        let h2 = biased_entropy_rate_backend(data, -1, &backend);
+        let h1 = biased_entropy_rate_backend(data, &backend);
+        let h2 = biased_entropy_rate_backend(data, &backend);
         assert!(
             (h1 - h2).abs() < 1e-12,
             "mamba method biased entropy leaked mutable state across calls: h1={h1}, h2={h2}"
@@ -1341,7 +1317,7 @@ mod tests {
     fn particle_entropy_rate_in_valid_range() {
         let rb = test_particle_backend();
         let data = b"hello world particle backend test";
-        let rate = entropy_rate_backend(data, -1, &rb);
+        let rate = entropy_rate_backend(data, &rb);
         assert!(
             rate > 0.0 && rate < 8.0,
             "particle entropy rate out of (0, 8) range: {rate}"
@@ -1353,8 +1329,8 @@ mod tests {
         let rb = test_particle_backend();
         let train = b"ABCABC";
         let test = b"ABC";
-        let h1 = cross_entropy_rate_backend(test, train, -1, &rb);
-        let h2 = cross_entropy_rate_backend(test, train, -1, &rb);
+        let h1 = cross_entropy_rate_backend(test, train, &rb);
+        let h2 = cross_entropy_rate_backend(test, train, &rb);
         assert!(
             (h1 - h2).abs() < 1e-12,
             "particle cross entropy not deterministic: h1={h1}, h2={h2}"
@@ -1366,7 +1342,7 @@ mod tests {
         let rb = RateBackend::Particle {
             spec: Arc::new(ParticleSpec::default()),
         };
-        let rate = entropy_rate_backend(b"", -1, &rb);
+        let rate = entropy_rate_backend(b"", &rb);
         assert!(
             rate == 0.0,
             "particle entropy rate for empty input should be 0.0, got {rate}"
@@ -1378,7 +1354,7 @@ mod tests {
         let rb = test_particle_backend();
         let x = b"AAAA";
         let y = b"BBBB";
-        let joint = joint_entropy_rate_backend(x, y, -1, &rb);
+        let joint = joint_entropy_rate_backend(x, y, &rb);
         assert!(
             joint > 0.0 && joint < 16.0,
             "particle joint entropy rate out of range: {joint}"

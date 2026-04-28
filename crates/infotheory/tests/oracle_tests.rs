@@ -1,10 +1,10 @@
+use infotheory::api::empirical_entropy_bytes;
 #[cfg(feature = "backend-zpaq")]
 use infotheory::api::{
     CompressionBackend, NcdVariant, try_ncd_bytes_backend as try_ncd_bytes_backend_compiled,
 };
 #[cfg(any(feature = "backend-rosa", feature = "backend-ctw"))]
 use infotheory::api::{RateBackend, try_entropy_rate_backend as try_entropy_rate_backend_compiled};
-use infotheory::api::{marginal_entropy_bytes, try_mutual_information_bytes};
 use infotheory::axioms;
 use infotheory::datagen;
 
@@ -14,13 +14,9 @@ const TOLERANCE_MI: f64 = 0.2;
 const TOLERANCE_NCD: f64 = 0.1;
 
 #[cfg(any(feature = "backend-rosa", feature = "backend-ctw"))]
-fn try_entropy_rate_backend(
-    data: &[u8],
-    max_order: i64,
-    backend: &RateBackend,
-) -> Result<f64, String> {
+fn try_entropy_rate_backend(data: &[u8], backend: &RateBackend) -> Result<f64, String> {
     let compiled = backend.compile().map_err(|err| err.to_string())?;
-    try_entropy_rate_backend_compiled(data, max_order, &compiled).map_err(|err| err.to_string())
+    try_entropy_rate_backend_compiled(data, &compiled).map_err(|err| err.to_string())
 }
 
 #[cfg(feature = "backend-zpaq")]
@@ -45,8 +41,8 @@ fn entropy_vs_theoretical_bernoulli() {
         let n = 20_000;
         let data = datagen::bernoulli(n, p, 42);
 
-        // Use order-0 entropy (marginal) since it's IID
-        let estimated = marginal_entropy_bytes(&data);
+        // Use order-0 entropy (empirical/IID Shannon plug-in)
+        let estimated = empirical_entropy_bytes(&data);
         let theoretical = datagen::bernoulli_entropy(p);
 
         println!(
@@ -61,7 +57,10 @@ fn entropy_vs_theoretical_bernoulli() {
         );
 
         // Also verify bounds axiom
-        assert!(axioms::verify_entropy_bounds(marginal_entropy_bytes, &data));
+        assert!(axioms::verify_entropy_bounds(
+            empirical_entropy_bytes,
+            &data
+        ));
     }
 }
 
@@ -77,8 +76,8 @@ fn mi_independent_is_zero() {
     let x: Vec<u8> = x.iter().map(|b| b & 0x0F).collect();
     let y: Vec<u8> = y.iter().map(|b| b & 0x0F).collect();
 
-    // Order-0 MI for IID data
-    let mi = try_mutual_information_bytes(&x, &y, 0).expect("mi");
+    // Use empirical (order-0 IID) mutual information for IID data
+    let mi = infotheory::api::empirical_mutual_information_bytes(&x, &y);
 
     println!("Independent MI (16-sym): {:.4}", mi);
 
@@ -90,7 +89,7 @@ fn mi_independent_is_zero() {
 
     // Check non-negativity axiom
     assert!(axioms::verify_mi_nonnegative(
-        |a, b| try_mutual_information_bytes(a, b, 0).expect("mi"),
+        |a, b| infotheory::api::empirical_mutual_information_bytes(a, b),
         &x,
         &y
     ));
@@ -107,8 +106,8 @@ fn rosa_matches_theoretical_markov_entropy() {
     let theoretical = datagen::markov_1_binary_entropy_rate(p00, p11);
 
     // ROSA
-    let backend = RateBackend::RosaPlus;
-    let estimated = try_entropy_rate_backend(&data, 20, &backend).expect("entropy rate");
+    let backend = RateBackend::RosaPlus { max_order: 20 };
+    let estimated = try_entropy_rate_backend(&data, &backend).expect("entropy rate");
 
     println!(
         "ROSA Markov: Est={:.4}, Theory={:.4}",
@@ -131,8 +130,8 @@ fn mi_deterministic_equals_entropy() {
     // Let's use Y = X + 1 (wrapping)
     let (x, y) = datagen::deterministic_func(n, 42, |b| b.wrapping_add(1));
 
-    let mi = try_mutual_information_bytes(&x, &y, 0).expect("mi");
-    let h_y = marginal_entropy_bytes(&y);
+    let mi = infotheory::api::empirical_mutual_information_bytes(&x, &y);
+    let h_y = empirical_entropy_bytes(&y);
 
     println!("Deterministic: MI={:.4}, H(Y)={:.4}", mi, h_y);
 
@@ -147,8 +146,8 @@ fn mi_identical_equals_entropy() {
     let n = 10_000;
     let (x, y) = datagen::identical_pair(n, 42);
 
-    let mi = try_mutual_information_bytes(&x, &y, 0).expect("mi");
-    let h_x = marginal_entropy_bytes(&x);
+    let mi = infotheory::api::empirical_mutual_information_bytes(&x, &y);
+    let h_x = empirical_entropy_bytes(&x);
 
     println!("Identical: MI={:.4}, H(X)={:.4}", mi, h_x);
 
@@ -240,7 +239,7 @@ fn ctw_matches_theoretical_markov_entropy() {
 
     // Use CTW with sufficient depth to capture Markov-1
     let backend = RateBackend::Ctw { depth: 8 };
-    let estimated = try_entropy_rate_backend(&data, -1, &backend).expect("entropy rate");
+    let estimated = try_entropy_rate_backend(&data, &backend).expect("entropy rate");
 
     println!(
         "CTW Markov: Est={:.4}, Theory={:.4}",

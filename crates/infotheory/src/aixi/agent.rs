@@ -160,8 +160,6 @@ pub struct AgentConfig {
     ///
     /// When `None`, planner runtime canonicalizes this to seed `0`.
     pub random_seed: Option<u64>,
-    /// Max-order hint for `rate_backend` constructors that use it (for example ROSA).
-    pub rate_backend_max_order: i64,
 }
 
 impl Default for AgentConfig {
@@ -182,7 +180,6 @@ impl Default for AgentConfig {
             max_reward: 1,
             reward_offset: 0,
             random_seed: None,
-            rate_backend_max_order: 8,
         }
     }
 }
@@ -207,7 +204,6 @@ impl AgentConfig {
             },
             ControllerSpec::McAixi(McAixiControllerSpec {
                 predictor,
-                predictor_max_order: self.rate_backend_max_order,
                 agent_horizon: self.agent_horizon,
                 num_simulations: self.num_simulations,
                 mcts_strategy: self.mcts_strategy,
@@ -455,19 +451,15 @@ impl Agent {
         config: AgentRuntimeConfig,
         compiled: &CompiledPlannerRunSpec,
     ) -> Result<Self, AgentError> {
-        let (predictor, predictor_max_order) = match compiled.controller() {
-            CompiledPlannerController::McAixi {
-                predictor,
-                predictor_max_order,
-                ..
-            } => (predictor, *predictor_max_order),
+        let predictor = match compiled.controller() {
+            CompiledPlannerController::McAixi { predictor, .. } => predictor,
             _ => return Err(AgentError::ControllerKindMismatch),
         };
         let percept_bits = (compiled.interface().observation_bits
             * compiled.interface().observation_stream_len.max(1))
             + compiled.interface().reward_bits;
-        let model = build_mc_aixi_predictor(predictor, predictor_max_order, percept_bits)
-            .map_err(AgentError::Predictor)?;
+        let model =
+            build_mc_aixi_predictor(predictor, percept_bits).map_err(AgentError::Predictor)?;
 
         let rng = RandomGenerator::from_seed(config.random_seed);
 
@@ -832,14 +824,12 @@ mod tests {
                             MixtureExpertSpec {
                                 name: Some("ctw".to_string()),
                                 log_prior: 0.0,
-                                max_order: -1,
                                 backend: RateBackend::Ctw { depth: 8 },
                             },
                             MixtureExpertSpec {
                                 name: Some("rosa".to_string()),
                                 log_prior: 0.0,
-                                max_order: 8,
-                                backend: RateBackend::RosaPlus,
+                                backend: RateBackend::RosaPlus { max_order: 8 },
                             },
                         ],
                     )
@@ -860,7 +850,6 @@ mod tests {
             max_reward: 1,
             reward_offset: 0,
             random_seed: Some(2026),
-            rate_backend_max_order: 8,
         }
     }
 
@@ -928,7 +917,7 @@ mod tests {
         match backend {
             RateBackend::Ctw { .. } => "ctw",
             RateBackend::FacCtw { .. } => "fac-ctw",
-            RateBackend::RosaPlus => "rosaplus",
+            RateBackend::RosaPlus { .. } => "rosaplus",
             _ => "other",
         }
     }
@@ -954,8 +943,8 @@ mod tests {
             "AIQI: 'ctw' must produce a single-tree CTW backend"
         );
 
-        agent_cfg.rate_backend = crate::api::RateBackend::RosaPlus;
-        aiqi_cfg.rate_backend = crate::api::RateBackend::RosaPlus;
+        agent_cfg.rate_backend = crate::api::RateBackend::RosaPlus { max_order: -1 };
+        aiqi_cfg.rate_backend = crate::api::RateBackend::RosaPlus { max_order: -1 };
         let agent_rosa = agent_cfg.canonical_predictor_backend();
         let aiqi_rosa = aiqi_cfg.canonical_predictor_backend_for_test();
         assert_eq!(

@@ -37,7 +37,6 @@ fn sample_planner_run() -> PlannerRunSpec {
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
-            predictor_max_order: 8,
             discount_gamma: 0.99,
             return_horizon: 2,
             return_bins: 8,
@@ -64,7 +63,6 @@ fn sample_mc_aixi_planner_run(mcts_strategy: MctsStrategy) -> PlannerRunSpec {
     let mut spec = sample_planner_run();
     spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
         predictor: RateBackend::Ctw { depth: 8 },
-        predictor_max_order: 8,
         agent_horizon: 2,
         num_simulations: 4,
         mcts_strategy,
@@ -328,7 +326,6 @@ fn mc_aixi_parallel_uct_parser_rejects_zero_workers_in_canonical_json() {
     // routes through the spec-pipeline validation layer.
     spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
         predictor: RateBackend::Ctw { depth: 8 },
-        predictor_max_order: 8,
         agent_horizon: 2,
         num_simulations: 4,
         mcts_strategy: MctsStrategy::ParallelUct {
@@ -595,7 +592,6 @@ fn planner_run_compile_rejects_mcaixi_predictors_with_zpaq_conditioning() {
         predictor: RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
         },
-        predictor_max_order: 8,
         agent_horizon: 1,
         num_simulations: 1,
         mcts_strategy: MctsStrategy::RhoUct,
@@ -620,7 +616,6 @@ fn planner_run_compile_rejects_aiqi_predictors_without_frozen_conditioning() {
         predictor: RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
         },
-        predictor_max_order: 8,
         discount_gamma: 0.99,
         return_horizon: 2,
         return_bins: 8,
@@ -697,7 +692,6 @@ fn sample_vm_planner_run() -> PlannerRunSpec {
         },
         controller: ControllerSpec::McAixi(McAixiControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
-            predictor_max_order: 8,
             agent_horizon: 1,
             num_simulations: 1,
             mcts_strategy: MctsStrategy::RhoUct,
@@ -964,7 +958,6 @@ fn planner_run_validation_reports_missing_backend_feature() {
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
-            predictor_max_order: 8,
             discount_gamma: 0.99,
             return_horizon: 2,
             return_bins: 8,

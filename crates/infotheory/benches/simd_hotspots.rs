@@ -40,7 +40,7 @@ fn make_experts() -> Vec<MixtureExpertSpec> {
             num_percept_bits: 8,
         })
         .with_name("fac"),
-        MixtureExpertSpec::new(RateBackend::RosaPlus).with_name("rosa"),
+        MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: -1 }).with_name("rosa"),
     ]
 }
 
@@ -52,14 +52,14 @@ fn bench_neural_mixture(data: &[u8], warmup_iters: usize, bench_iters: usize) {
     .expect("compile neural mixture backend");
 
     for _ in 0..warmup_iters {
-        let h = entropy_rate_backend(data, -1, &backend);
+        let h = entropy_rate_backend(data, &backend);
         black_box(h);
     }
 
     let start = Instant::now();
     let mut sink = 0.0;
     for _ in 0..bench_iters {
-        sink += entropy_rate_backend(data, -1, &backend);
+        sink += entropy_rate_backend(data, &backend);
     }
     black_box(sink);
     let elapsed = start.elapsed().as_secs_f64();
@@ -119,6 +119,6 @@ fn main() {
     bench_neural_mixture(&data, warmup_iters, bench_iters);
     bench_ac_softmax_floor_256(warmup_iters * 128, bench_iters * 20_000);
 }
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
-    try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
+fn entropy_rate_backend(data: &[u8], backend: &CompiledRateBackend) -> f64 {
+    try_entropy_rate_backend(data, backend).expect("entropy rate")
 }

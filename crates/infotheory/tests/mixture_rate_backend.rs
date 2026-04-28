@@ -6,20 +6,16 @@ use infotheory::api::{
 };
 use std::sync::Arc;
 
-fn try_entropy_rate_backend(
-    data: &[u8],
-    max_order: i64,
-    backend: &RateBackend,
-) -> Result<f64, String> {
+fn try_entropy_rate_backend(data: &[u8], backend: &RateBackend) -> Result<f64, String> {
     let compiled = backend.compile().map_err(|err| err.to_string())?;
-    try_entropy_rate_backend_compiled(data, max_order, &compiled).map_err(|err| err.to_string())
+    try_entropy_rate_backend_compiled(data, &compiled).map_err(|err| err.to_string())
 }
 
 #[test]
 fn mixture_single_expert_matches_backend() {
     let data = b"abababababababababababababababab";
     let base = RateBackend::Ctw { depth: 8 };
-    let base_rate = try_entropy_rate_backend(data, -1, &base).expect("base rate");
+    let base_rate = try_entropy_rate_backend(data, &base).expect("base rate");
 
     let spec = MixtureSpec::new(
         MixtureKind::Bayes,
@@ -28,7 +24,7 @@ fn mixture_single_expert_matches_backend() {
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(spec),
     };
-    let mix_rate = try_entropy_rate_backend(data, -1, &mix_backend).expect("mix rate");
+    let mix_rate = try_entropy_rate_backend(data, &mix_backend).expect("mix rate");
 
     assert!(
         (mix_rate - base_rate).abs() < 1e-6,
@@ -40,7 +36,7 @@ fn mixture_single_expert_matches_backend() {
 fn mixture_single_sequitur_expert_matches_backend() {
     let data = b"abcabcabcabcabcabc";
     let base = RateBackend::Sequitur { context_bytes: 32 };
-    let base_rate = try_entropy_rate_backend(data, -1, &base).expect("base rate");
+    let base_rate = try_entropy_rate_backend(data, &base).expect("base rate");
 
     let spec = MixtureSpec::new(
         MixtureKind::Bayes,
@@ -49,7 +45,7 @@ fn mixture_single_sequitur_expert_matches_backend() {
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(spec),
     };
-    let mix_rate = try_entropy_rate_backend(data, -1, &mix_backend).expect("mix rate");
+    let mix_rate = try_entropy_rate_backend(data, &mix_backend).expect("mix rate");
 
     assert!(
         (mix_rate - base_rate).abs() < 1e-6,
@@ -64,7 +60,7 @@ fn rwkv_mixture_single_expert_matches_backend_with_tbptt() {
     let base = RateBackend::Rwkv7Method {
         method: infotheory::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=37,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=8,clip=0,momentum=0.9)").expect("rwkv method spec"),
     };
-    let base_rate = try_entropy_rate_backend(data, -1, &base).expect("base rate");
+    let base_rate = try_entropy_rate_backend(data, &base).expect("base rate");
 
     let spec = MixtureSpec::new(
         MixtureKind::Bayes,
@@ -73,7 +69,7 @@ fn rwkv_mixture_single_expert_matches_backend_with_tbptt() {
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(spec),
     };
-    let mix_rate = try_entropy_rate_backend(data, -1, &mix_backend).expect("mix rate");
+    let mix_rate = try_entropy_rate_backend(data, &mix_backend).expect("mix rate");
 
     assert!(
         (mix_rate - base_rate).abs() < 1e-6,
@@ -85,7 +81,7 @@ fn rwkv_mixture_single_expert_matches_backend_with_tbptt() {
 fn mixture_recursive_expert_matches_backend() {
     let data = b"01010101010101010101010101010101";
     let base = RateBackend::Ctw { depth: 8 };
-    let base_rate = try_entropy_rate_backend(data, -1, &base).expect("base rate");
+    let base_rate = try_entropy_rate_backend(data, &base).expect("base rate");
 
     let inner = MixtureSpec::new(
         MixtureKind::Bayes,
@@ -103,7 +99,7 @@ fn mixture_recursive_expert_matches_backend() {
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(outer),
     };
-    let mix_rate = try_entropy_rate_backend(data, -1, &mix_backend).expect("mix rate");
+    let mix_rate = try_entropy_rate_backend(data, &mix_backend).expect("mix rate");
 
     assert!(
         (mix_rate - base_rate).abs() < 1e-6,
@@ -115,7 +111,7 @@ fn mixture_recursive_expert_matches_backend() {
 fn neural_mixture_single_expert_matches_backend() {
     let data = b"abababababababababababababababab";
     let base = RateBackend::Ctw { depth: 8 };
-    let base_rate = try_entropy_rate_backend(data, -1, &base).expect("base rate");
+    let base_rate = try_entropy_rate_backend(data, &base).expect("base rate");
 
     let spec = MixtureSpec::new(
         MixtureKind::Neural,
@@ -125,7 +121,7 @@ fn neural_mixture_single_expert_matches_backend() {
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(spec),
     };
-    let mix_rate = try_entropy_rate_backend(data, -1, &mix_backend).expect("mix rate");
+    let mix_rate = try_entropy_rate_backend(data, &mix_backend).expect("mix rate");
 
     assert!(
         (mix_rate - base_rate).abs() < 1e-6,
@@ -137,7 +133,7 @@ fn neural_mixture_single_expert_matches_backend() {
 fn convex_mixture_single_expert_matches_backend() {
     let data = b"abababababababababababababababab";
     let base = RateBackend::Ctw { depth: 8 };
-    let base_rate = try_entropy_rate_backend(data, -1, &base).expect("base rate");
+    let base_rate = try_entropy_rate_backend(data, &base).expect("base rate");
 
     let spec = MixtureSpec::new(
         MixtureKind::Convex,
@@ -147,7 +143,7 @@ fn convex_mixture_single_expert_matches_backend() {
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(spec),
     };
-    let mix_rate = try_entropy_rate_backend(data, -1, &mix_backend).expect("mix rate");
+    let mix_rate = try_entropy_rate_backend(data, &mix_backend).expect("mix rate");
 
     assert!(
         (mix_rate - base_rate).abs() < 1e-6,
@@ -177,7 +173,7 @@ fn switching_theorem_schedule_backend_executes() {
     let backend = RateBackend::Mixture {
         spec: Arc::new(spec),
     };
-    let rate = try_entropy_rate_backend(data, -1, &backend).expect("rate");
+    let rate = try_entropy_rate_backend(data, &backend).expect("rate");
     assert!(rate.is_finite() && rate >= 0.0, "rate={rate}");
 }
 
@@ -201,7 +197,7 @@ fn convex_theorem_schedule_backend_executes() {
     let backend = RateBackend::Mixture {
         spec: Arc::new(spec),
     };
-    let rate = try_entropy_rate_backend(data, -1, &backend).expect("rate");
+    let rate = try_entropy_rate_backend(data, &backend).expect("rate");
     assert!(rate.is_finite() && rate >= 0.0, "rate={rate}");
 }
 
@@ -239,7 +235,7 @@ fn neural_mixture_supports_nested_mixture_expert() {
     let backend = RateBackend::Mixture {
         spec: Arc::new(outer),
     };
-    let rate = try_entropy_rate_backend(data, -1, &backend).expect("rate");
+    let rate = try_entropy_rate_backend(data, &backend).expect("rate");
     assert!(rate.is_finite() && rate >= 0.0, "rate={rate}");
 }
 
@@ -278,7 +274,7 @@ fn convex_mixture_supports_nested_mixture_expert() {
     let backend = RateBackend::Mixture {
         spec: Arc::new(outer),
     };
-    let rate = try_entropy_rate_backend(data, -1, &backend).expect("rate");
+    let rate = try_entropy_rate_backend(data, &backend).expect("rate");
     assert!(rate.is_finite() && rate >= 0.0, "rate={rate}");
 }
 
@@ -308,7 +304,7 @@ fn new_backends_have_finite_entropy_rates() {
         },
     ];
     for backend in backends {
-        let rate = try_entropy_rate_backend(data, -1, &backend).expect("rate");
+        let rate = try_entropy_rate_backend(data, &backend).expect("rate");
         assert!(rate.is_finite() && rate >= 0.0, "rate={rate}");
     }
 }
@@ -340,6 +336,6 @@ fn neural_mixture_supports_calibrated_expert() {
     let backend = RateBackend::Mixture {
         spec: Arc::new(spec),
     };
-    let rate = try_entropy_rate_backend(data, -1, &backend).expect("rate");
+    let rate = try_entropy_rate_backend(data, &backend).expect("rate");
     assert!(rate.is_finite() && rate >= 0.0, "rate={rate}");
 }

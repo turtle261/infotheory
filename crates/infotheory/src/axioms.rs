@@ -68,44 +68,44 @@ where
 /// Verify subadditivity: H(X,Y) ≤ H(X) + H(Y).
 ///
 /// This is equivalent to I(X;Y) ≥ 0.
-pub fn verify_subadditivity<FJoint, FMarg>(
+pub fn verify_subadditivity<FJoint, FEmpirical>(
     joint_entropy: FJoint,
-    marginal_entropy: FMarg,
+    empirical_entropy: FEmpirical,
     x: &[u8],
     y: &[u8],
     tolerance: f64,
 ) -> bool
 where
     FJoint: Fn(&[u8], &[u8]) -> f64,
-    FMarg: Fn(&[u8]) -> f64,
+    FEmpirical: Fn(&[u8]) -> f64,
 {
     let h_xy = joint_entropy(x, y);
-    let h_x = marginal_entropy(x);
-    let h_y = marginal_entropy(y);
+    let h_x = empirical_entropy(x);
+    let h_y = empirical_entropy(y);
     h_xy <= (h_x + h_y + tolerance)
 }
 
 /// Verify conditioning reduces entropy: H(X|Y) ≤ H(X).
-pub fn verify_conditioning_reduces_entropy<FCond, FMarg>(
+pub fn verify_conditioning_reduces_entropy<FCond, FEmpirical>(
     conditional_entropy: FCond,
-    marginal_entropy: FMarg,
+    empirical_entropy: FEmpirical,
     x: &[u8],
     y: &[u8],
     tolerance: f64,
 ) -> bool
 where
     FCond: Fn(&[u8], &[u8]) -> f64,
-    FMarg: Fn(&[u8]) -> f64,
+    FEmpirical: Fn(&[u8]) -> f64,
 {
     let h_x_given_y = conditional_entropy(x, y);
-    let h_x = marginal_entropy(x);
+    let h_x = empirical_entropy(x);
     h_x_given_y <= (h_x + tolerance)
 }
 
 /// Verify chain rule: H(X,Y) = H(X) + H(Y|X).
-pub fn verify_chain_rule<FJoint, FMarg, FCond>(
+pub fn verify_chain_rule<FJoint, FEmpirical, FCond>(
     joint: FJoint,
-    marginal: FMarg,
+    empirical: FEmpirical,
     conditional: FCond,
     x: &[u8],
     y: &[u8],
@@ -113,11 +113,11 @@ pub fn verify_chain_rule<FJoint, FMarg, FCond>(
 ) -> bool
 where
     FJoint: Fn(&[u8], &[u8]) -> f64,
-    FMarg: Fn(&[u8]) -> f64,
+    FEmpirical: Fn(&[u8]) -> f64,
     FCond: Fn(&[u8], &[u8]) -> f64, // H(Y|X)
 {
     let h_xy = joint(x, y);
-    let h_x = marginal(x);
+    let h_x = empirical(x);
     let h_y_given_x = conditional(y, x);
 
     (h_xy - (h_x + h_y_given_x)).abs() <= tolerance

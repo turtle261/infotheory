@@ -634,7 +634,7 @@ pub(crate) struct MixturePredictor {
 }
 
 impl MixturePredictor {
-    pub(crate) fn new_from_compiled(backend: &CompiledRateBackend, max_order: i64) -> Result<Self> {
+    pub(crate) fn new_from_compiled(backend: &CompiledRateBackend) -> Result<Self> {
         let crate::spec::core::RateBackendPlan::Mixture {
             kind,
             schedule,
@@ -652,14 +652,7 @@ impl MixturePredictor {
                 crate::spec::core::compiled_rate_backend_from_plan(expert_plan.backend.clone())
                     .map_err(anyhow::Error::msg)?;
             experts.push(MixExpert {
-                predictor: Box::new(crate::runtime::build_rate_pdf_predictor(
-                    &compiled,
-                    if expert_plan.max_order >= 0 {
-                        expert_plan.max_order
-                    } else {
-                        max_order
-                    },
-                )?),
+                predictor: Box::new(crate::runtime::build_rate_pdf_predictor(&compiled)?),
                 log_weight: expert_plan.log_prior,
                 log_prior: expert_plan.log_prior,
                 cum_log_loss: 0.0,
@@ -1379,14 +1372,14 @@ pub(crate) struct DiagnosticRatePredictor {
 
 impl DiagnosticRatePredictor {
     #[cfg(test)]
-    pub(crate) fn from_rate_backend(backend: RateBackend, max_order: i64) -> Result<Self> {
+    pub(crate) fn from_rate_backend(backend: RateBackend) -> Result<Self> {
         let compiled = backend.compile().map_err(anyhow::Error::msg)?;
-        Self::from_compiled(&compiled, max_order)
+        Self::from_compiled(&compiled)
     }
 
-    pub(crate) fn from_compiled(backend: &CompiledRateBackend, max_order: i64) -> Result<Self> {
+    pub(crate) fn from_compiled(backend: &CompiledRateBackend) -> Result<Self> {
         Ok(Self {
-            inner: crate::runtime::build_rate_pdf_predictor(backend, max_order)?,
+            inner: crate::runtime::build_rate_pdf_predictor(backend)?,
         })
     }
 
@@ -1466,14 +1459,14 @@ pub(crate) enum RatePdfPredictor {
 
 impl RatePdfPredictor {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_compiled(backend: &CompiledRateBackend, max_order: i64) -> Result<Self> {
-        crate::runtime::build_rate_pdf_predictor(backend, max_order)
+    pub(crate) fn from_compiled(backend: &CompiledRateBackend) -> Result<Self> {
+        crate::runtime::build_rate_pdf_predictor(backend)
     }
 
     #[cfg(test)]
-    pub(crate) fn from_rate_backend(backend: RateBackend, max_order: i64) -> Result<Self> {
+    pub(crate) fn from_rate_backend(backend: RateBackend) -> Result<Self> {
         let compiled = backend.compile().map_err(anyhow::Error::msg)?;
-        Self::from_compiled(&compiled, max_order)
+        Self::from_compiled(&compiled)
     }
 
     fn begin_stream(&mut self, total_len: usize) -> Result<()> {
@@ -1972,11 +1965,10 @@ fn decode_payload_rans(
 pub fn compress_rate_bytes(
     data: &[u8],
     rate_backend: &CompiledRateBackend,
-    max_order: i64,
     coder: CoderType,
     framing: FramingMode,
 ) -> Result<Vec<u8>> {
-    let mut predictor = crate::runtime::build_rate_pdf_predictor(rate_backend, max_order)?;
+    let mut predictor = crate::runtime::build_rate_pdf_predictor(rate_backend)?;
     let payload = match coder {
         CoderType::AC => encode_payload_ac(data, &mut predictor)?,
         CoderType::RANS => encode_payload_rans(data, &mut predictor)?,
@@ -1997,11 +1989,10 @@ pub fn compress_rate_bytes(
 pub fn compress_rate_size(
     data: &[u8],
     rate_backend: &CompiledRateBackend,
-    max_order: i64,
     coder: CoderType,
     framing: FramingMode,
 ) -> Result<u64> {
-    let encoded = compress_rate_bytes(data, rate_backend, max_order, coder, framing)?;
+    let encoded = compress_rate_bytes(data, rate_backend, coder, framing)?;
     Ok(encoded.len() as u64)
 }
 
@@ -2009,7 +2000,6 @@ pub fn compress_rate_size(
 pub fn compress_rate_size_chain(
     parts: &[&[u8]],
     rate_backend: &CompiledRateBackend,
-    max_order: i64,
     coder: CoderType,
     framing: FramingMode,
 ) -> Result<u64> {
@@ -2018,14 +2008,13 @@ pub fn compress_rate_size_chain(
     for p in parts {
         data.extend_from_slice(p);
     }
-    compress_rate_size(&data, rate_backend, max_order, coder, framing)
+    compress_rate_size(&data, rate_backend, coder, framing)
 }
 
 /// Decompress bytes produced by [`compress_rate_bytes`].
 pub fn decompress_rate_bytes(
     input: &[u8],
     rate_backend: &CompiledRateBackend,
-    max_order: i64,
     _coder: CoderType,
     framing: FramingMode,
 ) -> Result<Vec<u8>> {
@@ -2042,7 +2031,7 @@ pub fn decompress_rate_bytes(
     };
 
     let _ = coder;
-    let mut predictor = crate::runtime::build_rate_pdf_predictor(rate_backend, max_order)?;
+    let mut predictor = crate::runtime::build_rate_pdf_predictor(rate_backend)?;
     let decoded = match coder {
         CoderType::AC => decode_payload_ac(payload, out_len, &mut predictor)?,
         CoderType::RANS => decode_payload_rans(payload, out_len, &mut predictor)?,
@@ -2297,49 +2286,28 @@ mod tests {
     fn compress_rate_bytes(
         data: &[u8],
         rate_backend: &RateBackend,
-        max_order: i64,
         coder: CoderType,
         framing: FramingMode,
     ) -> Result<Vec<u8>> {
-        super::compress_rate_bytes(
-            data,
-            &compiled_rate_backend(rate_backend),
-            max_order,
-            coder,
-            framing,
-        )
+        super::compress_rate_bytes(data, &compiled_rate_backend(rate_backend), coder, framing)
     }
 
     fn compress_rate_size(
         data: &[u8],
         rate_backend: &RateBackend,
-        max_order: i64,
         coder: CoderType,
         framing: FramingMode,
     ) -> Result<u64> {
-        super::compress_rate_size(
-            data,
-            &compiled_rate_backend(rate_backend),
-            max_order,
-            coder,
-            framing,
-        )
+        super::compress_rate_size(data, &compiled_rate_backend(rate_backend), coder, framing)
     }
 
     fn decompress_rate_bytes(
         input: &[u8],
         rate_backend: &RateBackend,
-        max_order: i64,
         coder: CoderType,
         framing: FramingMode,
     ) -> Result<Vec<u8>> {
-        super::decompress_rate_bytes(
-            input,
-            &compiled_rate_backend(rate_backend),
-            max_order,
-            coder,
-            framing,
-        )
+        super::decompress_rate_bytes(input, &compiled_rate_backend(rate_backend), coder, framing)
     }
 
     fn assert_pdf_close(lhs: &[f64], rhs: &[f64], tol: f64) {
@@ -2542,10 +2510,9 @@ mod tests {
     fn roundtrip_rate_ac_ctw() {
         let data = b"ctw backend roundtrip payload";
         let backend = RateBackend::Ctw { depth: 8 };
-        let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
-            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -2574,10 +2541,10 @@ mod tests {
                 memory_mb: 8,
             },
         ] {
-            let enc = compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed)
-                .unwrap();
-            let dec = decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed)
-                .unwrap();
+            let enc =
+                compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+            let dec =
+                decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
             assert_eq!(dec, data);
         }
     }
@@ -2595,9 +2562,9 @@ mod tests {
             order: 12,
             memory_mb: 256,
         };
-        let enc = compress_rate_bytes(&data, &backend, -1, CoderType::AC, FramingMode::Framed)
+        let enc = compress_rate_bytes(&data, &backend, CoderType::AC, FramingMode::Framed)
             .expect("ppmd high-order compression");
-        let dec = decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed)
+        let dec = decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed)
             .expect("ppmd high-order decompression");
         assert_eq!(dec, data);
     }
@@ -2614,10 +2581,9 @@ mod tests {
                 bias_clip: 4.0,
             }),
         };
-        let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
-            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -2629,7 +2595,6 @@ mod tests {
             vec![crate::MixtureExpertSpec {
                 name: Some("ctw".to_string()),
                 log_prior: 0.0,
-                max_order: -1,
                 backend: RateBackend::Ctw { depth: 8 },
             }],
         )
@@ -2637,10 +2602,9 @@ mod tests {
         let backend = RateBackend::Mixture {
             spec: Arc::new(spec),
         };
-        let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
-            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -2652,7 +2616,6 @@ mod tests {
             vec![crate::MixtureExpertSpec {
                 name: Some("ctw".to_string()),
                 log_prior: 0.0,
-                max_order: -1,
                 backend: RateBackend::Ctw { depth: 8 },
             }],
         )
@@ -2660,10 +2623,9 @@ mod tests {
         let backend = RateBackend::Mixture {
             spec: Arc::new(spec),
         };
-        let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
-            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -2676,13 +2638,11 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("ctw".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::Ctw { depth: 6 },
                 },
                 crate::MixtureExpertSpec {
                     name: Some("fac".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::FacCtw {
                         base_depth: 6,
                         num_percept_bits: 8,
@@ -2697,7 +2657,6 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("nested".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::Mixture {
                         spec: Arc::new(nested),
                     },
@@ -2705,7 +2664,6 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("zpaq".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::Zpaq {
                         method: crate::api::ZpaqMethodSpec::literal("1"),
                     },
@@ -2718,9 +2676,9 @@ mod tests {
             spec: Arc::new(root),
         };
         let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::RANS, FramingMode::Framed).unwrap();
-        let dec = decompress_rate_bytes(&enc, &backend, -1, CoderType::RANS, FramingMode::Framed)
-            .unwrap();
+            compress_rate_bytes(data, &backend, CoderType::RANS, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, CoderType::RANS, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -2733,13 +2691,11 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("ctw".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::Ctw { depth: 6 },
                 },
                 crate::MixtureExpertSpec {
                     name: Some("fac".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::FacCtw {
                         base_depth: 6,
                         num_percept_bits: 8,
@@ -2754,7 +2710,6 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("nested".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::Mixture {
                         spec: Arc::new(inner),
                     },
@@ -2762,7 +2717,6 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("zpaq".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::Zpaq {
                         method: crate::api::ZpaqMethodSpec::literal("1"),
                     },
@@ -2774,10 +2728,9 @@ mod tests {
         let backend = RateBackend::Mixture {
             spec: Arc::new(root),
         };
-        let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
-            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -2785,7 +2738,7 @@ mod tests {
         let backend = RateBackend::Mixture {
             spec: Arc::new(spec.clone()),
         };
-        let mut predictor = RatePdfPredictor::from_rate_backend(backend, -1).unwrap();
+        let mut predictor = RatePdfPredictor::from_rate_backend(backend).unwrap();
         let experts = spec.build_experts();
         let mut runtime = crate::mixture::build_mixture_runtime(&spec, &experts).unwrap();
 
@@ -2807,13 +2760,11 @@ mod tests {
             crate::MixtureExpertSpec {
                 name: Some("ctw".to_string()),
                 log_prior: 0.0,
-                max_order: -1,
                 backend: RateBackend::Ctw { depth: 7 },
             },
             crate::MixtureExpertSpec {
                 name: Some("fac".to_string()),
                 log_prior: -0.7,
-                max_order: -1,
                 backend: RateBackend::FacCtw {
                     base_depth: 7,
                     num_percept_bits: 8,
@@ -2912,7 +2863,6 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("nested".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::Mixture {
                         spec: Arc::new(nested),
                     },
@@ -2920,7 +2870,6 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("ppmd".to_string()),
                     log_prior: -0.2,
-                    max_order: -1,
                     backend: RateBackend::Ppmd {
                         order: 5,
                         memory_mb: 8,
@@ -2974,49 +2923,37 @@ mod tests {
     #[test]
     fn cached_cdf_fast_bitwise_matches_pdf_rows_for_specialized_predictors() {
         assert_cached_cdf_fast_bitwise_matches_pdf_rows(
-            RatePdfPredictor::from_rate_backend(RateBackend::RosaPlus, -1).unwrap(),
+            RatePdfPredictor::from_rate_backend(RateBackend::RosaPlus { max_order: -1 }).unwrap(),
         );
         assert_cached_cdf_fast_bitwise_matches_pdf_rows(
-            RatePdfPredictor::from_rate_backend(
-                RateBackend::Ppmd {
-                    order: 6,
-                    memory_mb: 8,
-                },
-                -1,
-            )
+            RatePdfPredictor::from_rate_backend(RateBackend::Ppmd {
+                order: 6,
+                memory_mb: 8,
+            })
             .unwrap(),
         );
         assert_cached_cdf_fast_bitwise_matches_pdf_rows(
-            RatePdfPredictor::from_rate_backend(
-                RateBackend::Match {
-                    hash_bits: 20,
-                    min_len: 4,
-                    max_len: 255,
-                    base_mix: 0.02,
-                    confidence_scale: 1.0,
-                },
-                -1,
-            )
+            RatePdfPredictor::from_rate_backend(RateBackend::Match {
+                hash_bits: 20,
+                min_len: 4,
+                max_len: 255,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            })
             .unwrap(),
         );
         #[cfg(feature = "backend-rwkv")]
         assert_cached_cdf_fast_bitwise_matches_pdf_rows(
-            RatePdfPredictor::from_rate_backend(
-                RateBackend::Rwkv7Method {
-                    method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
-                },
-                -1,
-            )
+            RatePdfPredictor::from_rate_backend(RateBackend::Rwkv7Method {
+                method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
+            })
             .unwrap(),
         );
         #[cfg(feature = "backend-mamba")]
         assert_cached_cdf_fast_bitwise_matches_pdf_rows(
-            RatePdfPredictor::from_rate_backend(
-                RateBackend::MambaMethod {
-                    method: crate::mambazip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("mamba method spec"),
-                },
-                -1,
-            )
+            RatePdfPredictor::from_rate_backend(RateBackend::MambaMethod {
+                method: crate::mambazip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,state=8,conv=3,dt_rank=4,seed=7,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("mamba method spec"),
+            })
             .unwrap(),
         );
     }
@@ -3024,10 +2961,10 @@ mod tests {
     #[test]
     fn raw_size_not_larger_than_framed_size() {
         let data = b"raw/framed size check payload";
-        let backend = RateBackend::RosaPlus;
-        let raw = compress_rate_size(data, &backend, 8, CoderType::AC, FramingMode::Raw).unwrap();
+        let backend = RateBackend::RosaPlus { max_order: 8 };
+        let raw = compress_rate_size(data, &backend, CoderType::AC, FramingMode::Raw).unwrap();
         let framed =
-            compress_rate_size(data, &backend, 8, CoderType::AC, FramingMode::Framed).unwrap();
+            compress_rate_size(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert!(framed >= raw);
     }
 
@@ -3038,10 +2975,9 @@ mod tests {
         let backend = RateBackend::Rwkv7Method {
             method: crate::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=11,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer").expect("rwkv method spec"),
         };
-        let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
-            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -3076,7 +3012,7 @@ mod tests {
         .expect("compiled rwkv backend");
         let spec = rwkvzip::parse_method_spec(method).expect("parsed rwkv spec");
         let mut predictor =
-            RatePdfPredictor::from_compiled(&backend, -1).expect("compiled rwkv predictor");
+            RatePdfPredictor::from_compiled(&backend).expect("compiled rwkv predictor");
         let mut direct =
             rwkvzip::Compressor::new_from_method_spec(&spec).expect("rwkv backend from spec");
         let mut pdf = vec![0.0; direct.vocab_size()];
@@ -3154,10 +3090,9 @@ mod tests {
             data.extend_from_slice(&seed[..seed.len().min(remaining)]);
         }
 
-        let enc =
-            compress_rate_bytes(&data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc = compress_rate_bytes(&data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
-            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -3208,7 +3143,7 @@ mod tests {
         .expect("compiled mamba backend");
         let spec = mambazip::parse_method_spec(method).expect("parsed mamba spec");
         let mut predictor =
-            RatePdfPredictor::from_compiled(&backend, -1).expect("compiled mamba predictor");
+            RatePdfPredictor::from_compiled(&backend).expect("compiled mamba predictor");
         let mut direct =
             mambazip::Compressor::new_from_method_spec(&spec).expect("mamba backend from spec");
         let mut pdf = vec![0.0; direct.vocab_size()];
@@ -3242,10 +3177,9 @@ mod tests {
         let backend = RateBackend::Particle {
             spec: Arc::new(spec),
         };
-        let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
-            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -3267,9 +3201,9 @@ mod tests {
             spec: Arc::new(spec),
         };
         let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::RANS, FramingMode::Framed).unwrap();
-        let dec = decompress_rate_bytes(&enc, &backend, -1, CoderType::RANS, FramingMode::Framed)
-            .unwrap();
+            compress_rate_bytes(data, &backend, CoderType::RANS, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, CoderType::RANS, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 
@@ -3292,7 +3226,6 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("particle".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::Particle {
                         spec: Arc::new(particle_spec),
                     },
@@ -3300,7 +3233,6 @@ mod tests {
                 crate::MixtureExpertSpec {
                     name: Some("ctw".to_string()),
                     log_prior: 0.0,
-                    max_order: -1,
                     backend: RateBackend::Ctw { depth: 6 },
                 },
             ],
@@ -3309,10 +3241,9 @@ mod tests {
             spec: Arc::new(spec),
         };
         let data = b"mixture with particle expert roundtrip";
-        let enc =
-            compress_rate_bytes(data, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
-            decompress_rate_bytes(&enc, &backend, -1, CoderType::AC, FramingMode::Framed).unwrap();
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         assert_eq!(dec, data);
     }
 }

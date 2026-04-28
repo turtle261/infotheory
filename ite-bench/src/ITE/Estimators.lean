@@ -128,8 +128,6 @@ def infotheoryEstimator (binPath : FilePath := FilePath.mk "../target/release/in
           let params := _params
           let paramString (k : String) : Option String :=
             params.strings[k]?
-          let maxOrderStr : Option String :=
-            paramString "max_order"
           let rateBackendStr := paramString "rate_backend"
           let ncdBackendStr := paramString "ncd_backend"
           let methodStr := paramString "method"
@@ -146,20 +144,15 @@ def infotheoryEstimator (binPath : FilePath := FilePath.mk "../target/release/in
               | none => args
             args
 
-          let withMaxOrder (args : Array String) : Array String :=
-            match maxOrderStr with
-            | some mo => args.push mo
-            | none => args
-
           let runUnary (primName : String) (path : FilePath) : IO (Except String Float) := do
-            let args := withCommonFlags <| withMaxOrder #[primName, path.toString]
+            let args := withCommonFlags #[primName, path.toString]
             let out ← IO.Process.output { cmd := binPath.toString, args := args }
             if out.exitCode ≠ 0 then
               return .error s!"infotheory call failed: {out.stderr}"
             return parseFloatSimple out.stdout
 
           let runBinary (primName : String) (p1 p2 : FilePath) : IO (Except String Float) := do
-            let args := withCommonFlags <| withMaxOrder #[primName, p1.toString, p2.toString]
+            let args := withCommonFlags #[primName, p1.toString, p2.toString]
             let out ← IO.Process.output { cmd := binPath.toString, args := args }
             if out.exitCode ≠ 0 then
               return .error s!"infotheory call failed: {out.stderr}"

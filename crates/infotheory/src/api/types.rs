@@ -121,7 +121,15 @@ impl GenerationConfig {
 #[non_exhaustive]
 pub enum RateBackend {
     /// ROSA+ suffix-automaton estimator.
-    RosaPlus,
+    ///
+    /// `max_order < 0` enables ROSA's adaptive order selection over the full
+    /// suffix automaton; `max_order >= 0` caps the predictive context length.
+    RosaPlus {
+        /// Maximum context length used by the ROSA predictor.
+        ///
+        /// `< 0` means "adaptive / full SAM"; `>= 0` is a fixed cap.
+        max_order: i64,
+    },
     /// Local contiguous match predictor.
     Match {
         /// Number of retained hash bits for suffix lookup.
@@ -362,6 +370,10 @@ impl CalibratedSpec {
 }
 
 /// Expert specification for mixture backends.
+///
+/// Algorithm-specific configuration (such as ROSA's `max_order`) lives inside
+/// the expert's [`RateBackend`] variant; the expert spec itself only carries
+/// mixture-level metadata.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct MixtureExpertSpec {
@@ -369,8 +381,6 @@ pub struct MixtureExpertSpec {
     pub name: Option<String>,
     /// Log prior weight (natural log). Uniform priors can be `0.0`.
     pub log_prior: f64,
-    /// Max order for ROSA experts (ignored for other backends).
-    pub max_order: i64,
     /// Underlying backend for this expert.
     pub backend: RateBackend,
 }
@@ -381,7 +391,6 @@ impl MixtureExpertSpec {
         Self {
             name: None,
             log_prior: 0.0,
-            max_order: -1,
             backend,
         }
     }
@@ -404,13 +413,6 @@ impl MixtureExpertSpec {
     #[must_use]
     pub fn with_log_prior(mut self, log_prior: f64) -> Self {
         self.log_prior = log_prior;
-        self
-    }
-
-    /// Set the ROSA `max_order` hint (ignored by non-ROSA backends).
-    #[must_use]
-    pub fn with_max_order(mut self, max_order: i64) -> Self {
-        self.max_order = max_order;
         self
     }
 }
@@ -519,7 +521,7 @@ impl RateBackend {
     /// Stable internal backend identity.
     pub(crate) fn kind(&self) -> crate::runtime::RateBackendKind {
         match self {
-            RateBackend::RosaPlus => crate::runtime::RateBackendKind::RosaPlus,
+            RateBackend::RosaPlus { .. } => crate::runtime::RateBackendKind::RosaPlus,
             RateBackend::Match { .. } => crate::runtime::RateBackendKind::Match,
             RateBackend::SparseMatch { .. } => crate::runtime::RateBackendKind::SparseMatch,
             RateBackend::Ppmd { .. } => crate::runtime::RateBackendKind::Ppmd,
@@ -705,7 +707,6 @@ impl MixtureSpec {
                     spec.name.clone(),
                     spec.log_prior,
                     spec.backend.clone(),
-                    spec.max_order,
                 )
             })
             .collect()
@@ -1013,8 +1014,7 @@ mod tests {
         let expert = MixtureExpertSpec {
             name: Some("placeholder".to_string()),
             log_prior: 0.0,
-            max_order: -1,
-            backend: RateBackend::RosaPlus,
+            backend: RateBackend::RosaPlus { max_order: -1 },
         };
 
         for &decay in &[0.0, 1.0] {

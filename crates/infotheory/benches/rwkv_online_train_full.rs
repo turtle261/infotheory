@@ -44,7 +44,7 @@ fn bench_rwkv_online_train_full(c: &mut Criterion) {
         &infer,
         |b, backend| {
             b.iter(|| {
-                let h = entropy_rate_backend(&data, -1, backend);
+                let h = entropy_rate_backend(&data, backend);
                 criterion::black_box(h)
             });
         },
@@ -55,7 +55,7 @@ fn bench_rwkv_online_train_full(c: &mut Criterion) {
         &train_full,
         |b, backend| {
             b.iter(|| {
-                let h = entropy_rate_backend(&data, -1, backend);
+                let h = entropy_rate_backend(&data, backend);
                 criterion::black_box(h)
             });
         },
@@ -73,6 +73,6 @@ criterion_group! {
     targets = bench_rwkv_online_train_full
 }
 criterion_main!(rwkv_online_train_full);
-fn entropy_rate_backend(data: &[u8], max_order: i64, backend: &CompiledRateBackend) -> f64 {
-    try_entropy_rate_backend(data, max_order, backend).expect("entropy rate")
+fn entropy_rate_backend(data: &[u8], backend: &CompiledRateBackend) -> f64 {
+    try_entropy_rate_backend(data, backend).expect("entropy rate")
 }

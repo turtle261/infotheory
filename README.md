@@ -1,7 +1,7 @@
 # InfoTheory
 
 ### 1. Unified Information Estimation
-Estimate core measures using both **Marginal** (distribution-based) and **Rate** (predictive-based) approaches:
+Estimate core measures using both **Empirical** (aka Marginal/IID) and **Rate** (predictive-based) approaches:
 - **NCD (Normalized Compression Distance)**: Approximates information distance using compression.
 - **MI (Mutual Information)**: Quantifies shared information between sequences.
 - **NED (Normalized Entropy Distance)**: A metric distance based on mutual information.
@@ -125,7 +125,7 @@ let compression_backend = CompressionBackend::Rate {
 
 let ctx = InfotheoryCtx::new(rate_backend.clone(), compression_backend);
 
-let bits = ctx.try_entropy_rate_bytes(b"abracadabra", 16).expect("entropy");
+let bits = ctx.try_entropy_rate_bytes(b"abracadabra").expect("entropy");
 assert!(bits.is_finite());
 ```
 
@@ -167,8 +167,8 @@ The `infotheory` binary provides a powerful interface for file analysis.
 
 ### Primitives
 ```bash
-# Calculate Mutual Information (ROSA backend, order 8)
-./infotheory mi file1.txt file2.txt 8
+# Calculate Mutual Information (Empirical IID Shannon plugin)
+./infotheory mi file1.txt file2.txt
 
 # Use CTW backend for NTE (Normalized Transform Effort)
 ./infotheory nte file1.txt file2.txt --rate-backend ctw
@@ -320,8 +320,7 @@ Both planners also accept a `rate_backend` object using the same `RateBackend` s
     "kind": "ppmd",
     "order": 10,
     "memory_mb": 64
-  },
-  "rate_backend_max_order": 8
+  }
 }
 ```
 
@@ -342,8 +341,7 @@ Example MC-AIXI convex mixture override:
         {"name": "ppmd", "kind": "ppmd", "order": 8, "memory_mb": 16}
       ]
     }
-  },
-  "rate_backend_max_order": 8
+  }
 }
 ```
 
@@ -402,7 +400,7 @@ VM config highlights:
 use infotheory::*;
 
 // Entropy rate of a sequence (uses ROSA by default)
-let h = entropy_rate_bytes(data, 8);
+let h = try_entropy_rate_bytes(data).unwrap();
 
 // Switch the entire thread to use CTW for all subsequent calls
 set_default_ctx(
@@ -462,7 +460,7 @@ cal_backend = ait.RateBackend.calibrated(
     ait.CalibrationContextKind.Text,
 )
 
-assert ait.entropy_rate_backend(b"abracadabra", 4, backend=match_backend) >= 0.0
+assert ait.entropy_rate_backend(b"abracadabra", backend=match_backend) >= 0.0
 framed = ait.CompressionBackend.rate_rans(particle_backend, "framed")
 blob = ait.compress_bytes_backend(b"payload", compression_backend=framed)
 assert ait.decompress_bytes_backend(blob, compression_backend=framed) == b"payload"

@@ -28,11 +28,11 @@ def _close(a: float, b: float, tol: float = 1e-6) -> None:
 def test_metrics_and_cross_entropy_parity():
     x = "abracadabra"
     y = "alakazam"
-    metrics = _batch({"op": "metrics", "text": x, "max_order": 3})
-    _close(metrics["h0"], ait.marginal_entropy_bytes(x.encode()))
-    _close(metrics["h_rate"], ait.entropy_rate_bytes(x.encode(), 3))
-    cross = _batch({"op": "cross_entropy", "text_x": x, "text_y": y, "max_order": 3})
-    _close(cross["cross_entropy"], ait.cross_entropy_rate_bytes(x.encode(), y.encode(), 3))
+    metrics = _batch({"op": "metrics", "text": x})
+    _close(metrics["h0"], ait.empirical_entropy_bytes(x.encode()))
+    _close(metrics["h_rate"], ait.entropy_rate_bytes(x.encode()))
+    cross = _batch({"op": "cross_entropy", "text_x": x, "text_y": y})
+    _close(cross["cross_entropy"], ait.cross_entropy_rate_bytes(x.encode(), y.encode()))
 
 
 def test_ncd_file_and_matrix_parity(tmp_path):

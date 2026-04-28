@@ -158,7 +158,6 @@ pub(crate) fn pick_generated_byte(
 pub(crate) fn try_generate_rate_backend_chain(
     prefix_parts: &[&[u8]],
     bytes: usize,
-    max_order: i64,
     backend: &CompiledRateBackend,
     config: GenerationConfig,
 ) -> InfotheoryResult<Vec<u8>> {
@@ -171,8 +170,8 @@ pub(crate) fn try_generate_rate_backend_chain(
         .map(|p| p.len() as u64)
         .sum::<u64>()
         .saturating_add(bytes as u64);
-    let mut session = RateBackendSession::from_backend(backend.clone(), max_order, Some(total))
-        .map_err(|e| {
+    let mut session =
+        RateBackendSession::from_backend(backend.clone(), Some(total)).map_err(|e| {
             InfotheoryError::runtime(format!("rate backend generation init failed: {e}"))
         })?;
     for &part in prefix_parts {
@@ -190,11 +189,10 @@ pub(crate) fn try_generate_rate_backend_chain(
 pub(crate) fn generate_rate_backend_chain(
     prefix_parts: &[&[u8]],
     bytes: usize,
-    max_order: i64,
     backend: &CompiledRateBackend,
     config: GenerationConfig,
 ) -> Vec<u8> {
-    try_generate_rate_backend_chain(prefix_parts, bytes, max_order, backend, config)
+    try_generate_rate_backend_chain(prefix_parts, bytes, backend, config)
         .expect("generate_rate_backend_chain")
 }
 
@@ -203,12 +201,8 @@ pub(crate) fn generate_rate_backend_chain(
 ///
 /// The default is deterministic frozen sampling with seed `42`.
 #[inline(always)]
-pub fn try_generate_bytes(
-    prompt: &[u8],
-    bytes: usize,
-    max_order: i64,
-) -> InfotheoryResult<Vec<u8>> {
-    with_default_ctx(|ctx| ctx.try_generate_bytes(prompt, bytes, max_order))
+pub fn try_generate_bytes(prompt: &[u8], bytes: usize) -> InfotheoryResult<Vec<u8>> {
+    with_default_ctx(|ctx| ctx.try_generate_bytes(prompt, bytes))
 }
 
 /// Generate a continuation from `prompt` using the current default context.
@@ -216,10 +210,9 @@ pub fn try_generate_bytes(
 pub fn try_generate_bytes_with_config(
     prompt: &[u8],
     bytes: usize,
-    max_order: i64,
     config: GenerationConfig,
 ) -> InfotheoryResult<Vec<u8>> {
-    with_default_ctx(|ctx| ctx.try_generate_bytes_with_config(prompt, bytes, max_order, config))
+    with_default_ctx(|ctx| ctx.try_generate_bytes_with_config(prompt, bytes, config))
 }
 
 /// Generate a continuation after conditioning on an explicit chain of prefix parts
@@ -228,9 +221,8 @@ pub fn try_generate_bytes_with_config(
 pub fn try_generate_bytes_conditional_chain(
     prefix_parts: &[&[u8]],
     bytes: usize,
-    max_order: i64,
 ) -> InfotheoryResult<Vec<u8>> {
-    with_default_ctx(|ctx| ctx.try_generate_bytes_conditional_chain(prefix_parts, bytes, max_order))
+    with_default_ctx(|ctx| ctx.try_generate_bytes_conditional_chain(prefix_parts, bytes))
 }
 
 /// Generate a continuation after conditioning on an explicit chain of prefix parts
@@ -239,11 +231,10 @@ pub fn try_generate_bytes_conditional_chain(
 pub fn try_generate_bytes_conditional_chain_with_config(
     prefix_parts: &[&[u8]],
     bytes: usize,
-    max_order: i64,
     config: GenerationConfig,
 ) -> InfotheoryResult<Vec<u8>> {
     with_default_ctx(|ctx| {
-        ctx.try_generate_bytes_conditional_chain_with_config(prefix_parts, bytes, max_order, config)
+        ctx.try_generate_bytes_conditional_chain_with_config(prefix_parts, bytes, config)
     })
 }
 

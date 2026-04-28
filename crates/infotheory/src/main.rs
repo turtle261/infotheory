@@ -8,7 +8,7 @@
 //!
 //! ### Single-file mode:
 //! ```bash
-//! infotheory <primitive> <file1> <file2> [method/max_order]
+//! infotheory <primitive> <file1> <file2>
 //! ```
 //!
 //! ### Search mode:
@@ -110,66 +110,66 @@ fn ncd_bytes_backend(
     )
 }
 
-fn intrinsic_dependence_bytes(data: &[u8], max_order: i64) -> f64 {
+fn intrinsic_dependence_bytes(data: &[u8]) -> f64 {
     cli_unwrap(
-        try_intrinsic_dependence_bytes(data, max_order),
+        try_intrinsic_dependence_bytes(data),
         "intrinsic_dependence_bytes",
     )
 }
 
-fn mutual_information_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+fn mutual_information_bytes(x: &[u8], y: &[u8]) -> f64 {
     cli_unwrap(
-        try_mutual_information_bytes(x, y, max_order),
+        try_mutual_information_bytes(x, y),
         "mutual_information_bytes",
     )
 }
 
-fn conditional_entropy_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+fn conditional_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
     cli_unwrap(
-        try_conditional_entropy_bytes(x, y, max_order),
+        try_conditional_entropy_bytes(x, y),
         "conditional_entropy_bytes",
     )
 }
 
-fn cross_entropy_bytes(test_data: &[u8], train_data: &[u8], max_order: i64) -> f64 {
+fn cross_entropy_bytes(test_data: &[u8], train_data: &[u8]) -> f64 {
     cli_unwrap(
-        try_cross_entropy_bytes(test_data, train_data, max_order),
+        try_cross_entropy_bytes(test_data, train_data),
         "cross_entropy_bytes",
     )
 }
 
-fn joint_entropy_rate_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
+fn joint_entropy_rate_bytes(x: &[u8], y: &[u8]) -> f64 {
     cli_unwrap(
-        try_joint_entropy_rate_bytes(x, y, max_order),
+        try_joint_entropy_rate_bytes(x, y),
         "joint_entropy_rate_bytes",
     )
 }
 
-fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8], max_order: i64) -> f64 {
+fn resistance_to_transformation_bytes(x: &[u8], tx: &[u8]) -> f64 {
     cli_unwrap(
-        try_resistance_to_transformation_bytes(x, tx, max_order),
+        try_resistance_to_transformation_bytes(x, tx),
         "resistance_to_transformation_bytes",
     )
 }
 
-fn ned_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    cli_unwrap(try_ned_bytes(x, y, max_order), "ned_bytes")
+fn ned_bytes(x: &[u8], y: &[u8]) -> f64 {
+    cli_unwrap(try_ned_bytes(x, y), "ned_bytes")
 }
 
-fn ned_cons_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    cli_unwrap(try_ned_cons_bytes(x, y, max_order), "ned_cons_bytes")
+fn ned_cons_bytes(x: &[u8], y: &[u8]) -> f64 {
+    cli_unwrap(try_ned_cons_bytes(x, y), "ned_cons_bytes")
 }
 
-fn nte_bytes(x: &[u8], y: &[u8], max_order: i64) -> f64 {
-    cli_unwrap(try_nte_bytes(x, y, max_order), "nte_bytes")
+fn nte_bytes(x: &[u8], y: &[u8]) -> f64 {
+    cli_unwrap(try_nte_bytes(x, y), "nte_bytes")
 }
 
-fn tvd_paths(x: &str, y: &str, max_order: i64) -> f64 {
-    cli_unwrap(try_tvd_paths(x, y, max_order), "tvd_paths")
+fn tvd_paths(x: &str, y: &str) -> f64 {
+    cli_unwrap(try_tvd_paths(x, y), "tvd_paths")
 }
 
-fn nhd_paths(x: &str, y: &str, max_order: i64) -> f64 {
-    cli_unwrap(try_nhd_paths(x, y, max_order), "nhd_paths")
+fn nhd_paths(x: &str, y: &str) -> f64 {
+    cli_unwrap(try_nhd_paths(x, y), "nhd_paths")
 }
 
 fn kl_divergence_paths(x: &str, y: &str) -> f64 {
@@ -806,10 +806,6 @@ fn search_command(args: &[String]) {
                 i += 1;
                 opts.universal_prior = args.get(i).cloned();
             }
-            "--max-order" => {
-                i += 1;
-                opts.max_order = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(-1);
-            }
             "--top-k" => {
                 i += 1;
                 opts.top_k = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -1237,7 +1233,6 @@ fn main() {
         expert_spec_path.as_deref(),
     );
     let ctx = built_ctx.ctx;
-    let expert_spec_max_order = built_ctx.expert_spec_max_order;
     set_default_ctx(ctx.clone());
 
     match primitive.as_str() {
@@ -1309,39 +1304,18 @@ fn main() {
             }
         }
         "generate" => {
-            // Disambiguate positional args for `generate [file] [max_order]`.
-            // When stdin is piped and the first positional looks like an integer,
-            // treat it as max_order (not a file path).
             let stdin_is_piped = !io::stdin().is_terminal();
-            let (file_path, explicit_max_order) = match (file1.as_deref(), file2.as_deref()) {
-                // `generate <file> <max_order>` — both present
-                (Some(f), Some(mo)) => (Some(f), mo.parse::<i64>().ok()),
-                // `generate <arg>` — single positional:
-                //   if stdin is piped and it parses as an integer, it's max_order
-                //   otherwise it's a file path
-                (Some(arg), None) if stdin_is_piped && arg.parse::<i64>().is_ok() => {
-                    (None, arg.parse::<i64>().ok())
-                }
-                (Some(f), None) => (Some(f), None),
-                // No positionals at all
-                (None, _) => (None, None),
+            let file_path = match (file1.as_deref(), file2.as_deref()) {
+                (Some(f), _) if !(stdin_is_piped && f.parse::<i64>().is_ok()) => Some(f),
+                _ => None,
             };
-            let max_order = explicit_max_order
-                .or(pos_arg3.as_deref().and_then(|s| s.parse().ok()))
-                .or(expert_spec_max_order)
-                .unwrap_or(-1);
             let input = if let Some(path) = file_path {
                 read_file(path)
             } else {
                 read_stdin_all_for_generate()
             };
             let generated = cli_unwrap(
-                ctx.try_generate_bytes_with_config(
-                    &input,
-                    generate_len_bytes,
-                    max_order,
-                    generate_config,
-                ),
+                ctx.try_generate_bytes_with_config(&input, generate_len_bytes, generate_config),
                 "generate_bytes_with_config",
             );
             if let Err(e) = io::stdout().write_all(&generated) {
@@ -1383,22 +1357,18 @@ fn main() {
         }
         "entropy" | "h" | "entropy_rate" | "h_rate" => {
             let f1 = file1.unwrap_or_exit("Error: 'h' requires a file");
-            let default_order = if primitive.contains("rate") || rate_backend_specified {
-                expert_spec_max_order.unwrap_or(-1)
-            } else {
-                0
-            };
-            let max_order = pos_arg3
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default_order);
             let data = read_file(&f1);
-            if max_order == 0 && !primitive.contains("rate") && !rate_backend_specified {
-                println!("{}", marginal_entropy_bytes(&data));
+            // `h`/`entropy` -> empirical (zero-order, IID) Shannon entropy.
+            // `h_rate`/`entropy_rate` -> algorithmic entropy rate via active rate backend.
+            // The `rate_backend_specified` flag promotes `h`/`entropy` to the
+            // algorithmic path so that `--rate-backend X h file` behaves intuitively.
+            if !primitive.contains("rate") && !rate_backend_specified {
+                println!("{}", empirical_entropy_bytes(&data));
             } else {
                 println!(
                     "{}",
                     cli_unwrap(
-                        ctx.try_entropy_rate_bytes(&data, max_order),
+                        ctx.try_entropy_rate_bytes(&data),
                         "InfotheoryCtx::try_entropy_rate_bytes",
                     )
                 );
@@ -1411,11 +1381,8 @@ fn main() {
         }
         "id" => {
             let f1 = file1.unwrap_or_exit("Error: 'id' requires a file");
-            let max_order = pos_arg3
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(expert_spec_max_order.unwrap_or(-1));
             let data = read_file(&f1);
-            println!("{:.6}", intrinsic_dependence_bytes(&data, max_order));
+            println!("{:.6}", intrinsic_dependence_bytes(&data));
             if let Err(e) = maybe_export_online_model(model_export_path.as_deref(), &ctx, &[&data])
             {
                 eprintln!("Error exporting online model: {e}");
@@ -1425,33 +1392,42 @@ fn main() {
         other => {
             let f1 = file1.unwrap_or_exit("Error: requires two files");
             let f2 = file2.unwrap_or_exit("Error: requires two files");
-            let default_order = if rate_backend_specified {
-                expert_spec_max_order.unwrap_or(-1)
-            } else {
-                0
-            };
-            let max_order = pos_arg3
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default_order);
             let b1 = read_file(&f1);
             let b2 = read_file(&f2);
+            // For two-file primitives the `_rate_specified` flag promotes the
+            // empirical helpers to algorithmic rate-backend variants whenever the
+            // user explicitly requested a rate backend on the command line.
             let res = match other {
-                "ned" => ned_bytes(&b1, &b2, max_order),
-                "ned_cons" => ned_cons_bytes(&b1, &b2, max_order),
-                "nte" => nte_bytes(&b1, &b2, max_order),
-                "mi" | "mutual_info" => mutual_information_bytes(&b1, &b2, max_order),
-                "ce" | "conditional_entropy" => conditional_entropy_bytes(&b1, &b2, max_order),
-                "xe" | "cross_entropy" => cross_entropy_bytes(&b1, &b2, max_order),
-                "joint_entropy" | "h_xy" => {
-                    if max_order == 0 {
-                        joint_marginal_entropy_bytes(&b1, &b2)
-                    } else {
-                        joint_entropy_rate_bytes(&b1, &b2, max_order)
-                    }
+                "ned" if rate_backend_specified => ned_bytes(&b1, &b2),
+                "ned" => empirical_ned_bytes(&b1, &b2),
+                "ned_cons" if rate_backend_specified => ned_cons_bytes(&b1, &b2),
+                "ned_cons" => empirical_ned_cons_bytes(&b1, &b2),
+                "nte" if rate_backend_specified => nte_bytes(&b1, &b2),
+                "nte" => empirical_nte_bytes(&b1, &b2),
+                "mi" | "mutual_info" if rate_backend_specified => {
+                    mutual_information_bytes(&b1, &b2)
                 }
-                "rt" | "resistance" => resistance_to_transformation_bytes(&b1, &b2, max_order),
-                "tvd" => tvd_paths(&f1, &f2, max_order),
-                "nhd" => nhd_paths(&f1, &f2, max_order),
+                "mi" | "mutual_info" => empirical_mutual_information_bytes(&b1, &b2),
+                "ce" | "conditional_entropy" if rate_backend_specified => {
+                    conditional_entropy_bytes(&b1, &b2)
+                }
+                "ce" | "conditional_entropy" => {
+                    let h_xy = empirical_joint_entropy_bytes(&b1, &b2);
+                    let h_y = empirical_entropy_bytes(&b2);
+                    (h_xy - h_y).max(0.0)
+                }
+                "xe" | "cross_entropy" if rate_backend_specified => cross_entropy_bytes(&b1, &b2),
+                "xe" | "cross_entropy" => empirical_cross_entropy_bytes(&b1, &b2),
+                "joint_entropy" | "h_xy" if rate_backend_specified => {
+                    joint_entropy_rate_bytes(&b1, &b2)
+                }
+                "joint_entropy" | "h_xy" => empirical_joint_entropy_bytes(&b1, &b2),
+                "rt" | "resistance" if rate_backend_specified => {
+                    resistance_to_transformation_bytes(&b1, &b2)
+                }
+                "rt" | "resistance" => empirical_resistance_to_transformation_bytes(&b1, &b2),
+                "tvd" => tvd_paths(&f1, &f2),
+                "nhd" => nhd_paths(&f1, &f2),
                 "kl" | "kl_divergence" => kl_divergence_paths(&f1, &f2),
                 "js" | "js_divergence" => js_divergence_paths(&f1, &f2),
                 _ => {
@@ -1503,30 +1479,30 @@ Usage: infotheory <primitive> [args...] [options]
 
 Primitives:
   Entropy & Information:
-    h, entropy <file> [max_order]           Entropy (marginal if order=0, rate if >0)
-    h_rate, entropy_rate <file> [max_order] Force entropy rate estimation
-    mi, mutual_info <f1> <f2> [max_order]   Mutual Information I(X;Y)
-    xe, cross_entropy <f1> <f2> [max_order] Cross Entropy H(X,Y) - H(Y)? (Check def)
-    ce, conditional_entropy <f1> <f2>       Conditional Entropy H(X|Y)
-    joint_entropy, h_xy <f1> <f2>           Joint Entropy H(X,Y)
-    id <file> [max_order]                   Intrinsic Dependence
+    h, entropy <file>                       Empirical (order-0/IID) Shannon entropy; with --rate-backend uses the rate backend
+    h_rate, entropy_rate <file>             Algorithmic entropy rate via the active rate backend
+    mi, mutual_info <f1> <f2>               Mutual information I(X;Y) (empirical; rate-backend if --rate-backend)
+    xe, cross_entropy <f1> <f2>             Cross entropy (empirical; rate-backend if --rate-backend)
+    ce, conditional_entropy <f1> <f2>       Conditional entropy H(X|Y) (empirical; rate-backend if --rate-backend)
+    joint_entropy, h_xy <f1> <f2>           Joint entropy H(X,Y) (empirical; rate-backend if --rate-backend)
+    id <file>                               Intrinsic dependence ID(X) using the active rate backend
 
   Distance & Divergence:
     ncd <f1> <f2> [method]                  Normalized Compression Distance (Vitanyi)
     ncd_sym, ncd_cons, ncd_sym_cons         NCD variants (Symmetric, Conservative, etc.)
-    ned <f1> <f2> [max_order]               Normalized Entropy Distance
-    nte <f1> <f2> [max_order]               Normalized Transform Effort
-    kl, kl_divergence <f1> <f2>             Kullback-Leibler Divergence
-    js, js_divergence <f1> <f2>             Jensen-Shannon Divergence
-    tvd <f1> <f2>                           Total Variation Distance
-    nhd <f1> <f2>                           Normalized Hellinger Distance
-    rt, resistance <f1> <f2>                Resistance to Transformation
+    ned <f1> <f2>                           Normalized entropy distance (empirical; rate-backend if --rate-backend)
+    nte <f1> <f2>                           Normalized transform effort (empirical; rate-backend if --rate-backend)
+    kl, kl_divergence <f1> <f2>             Kullback-Leibler divergence (empirical histograms)
+    js, js_divergence <f1> <f2>             Jensen-Shannon divergence (empirical histograms)
+    tvd <f1> <f2>                           Total variation distance (empirical histograms)
+    nhd <f1> <f2>                           Normalized Hellinger distance (empirical histograms)
+    rt, resistance <f1> <f2>                Resistance to transformation
 
   Tools:
     search <query> <target> [options]       Search target using info-theoretic ranking
     aixi <config.json>                      Run AIXI agent
     batch                                   Run in JSON-L batch mode
-    generate [file] [max_order]             Generate continuation from file or piped stdin
+    generate [file]                         Generate continuation from file or piped stdin
     compress <in> <out>                     Compress file using selected compression backend
     decompress <in> <out>                   Decompress file using selected compression backend
     ac-log-loss <input> --mixture <spec.json> --out-prefix <prefix>
@@ -1873,7 +1849,7 @@ mod tests {
 
     #[cfg(feature = "all-backends")]
     #[test]
-    fn build_ctx_propagates_expert_spec_max_order_default() {
+    fn build_ctx_loads_expert_spec_with_rosa_max_order() {
         let expert_path = unique_temp_path("infotheory-expert-spec-rosa", ".json");
         std::fs::write(
             &expert_path,
@@ -1892,10 +1868,9 @@ mod tests {
             None,
             Some(expert_path.to_str().expect("utf8 path")),
         );
-        assert_eq!(built.expert_spec_max_order, Some(32));
         assert!(matches!(
             built.ctx.rate_backend.canonical_spec(),
-            RateBackend::RosaPlus
+            RateBackend::RosaPlus { max_order: 32 }
         ));
 
         let _ = std::fs::remove_file(&expert_path);
@@ -2331,14 +2306,14 @@ mod tests {
                 "name": "coin_flip"
             },
             "interface": {
-                "observation_bits": 18,
+                "observation_bits": 1,
                 "observation_stream_len": 1,
                 "observation_key_mode": "full_stream",
-                "reward_bits": 3,
-                "agent_actions": 9,
-                "min_reward": -3,
-                "max_reward": 2,
-                "reward_offset": 3
+                "reward_bits": 1,
+                "agent_actions": 2,
+                "min_reward": 0,
+                "max_reward": 1,
+                "reward_offset": 0
             },
             "controller": {
                 "kind": "mc_aixi",
@@ -2346,7 +2321,6 @@ mod tests {
                     "kind": "ctw",
                     "depth": 8
                 },
-                "predictor_max_order": 8,
                 "agent_horizon": 1,
                 "num_simulations": 1,
                 "mcts_strategy": {
@@ -2400,14 +2374,14 @@ mod tests {
                 "name": "coin_flip"
             },
             "interface": {
-                "observation_bits": 18,
+                "observation_bits": 1,
                 "observation_stream_len": 1,
                 "observation_key_mode": "full_stream",
-                "reward_bits": 3,
-                "agent_actions": 9,
-                "min_reward": -3,
+                "reward_bits": 1,
+                "agent_actions": 2,
+                "min_reward": 0,
                 "max_reward": 100,
-                "reward_offset": 3
+                "reward_offset": 0
             },
             "controller": {
                 "kind": "mc_aixi",
@@ -2415,7 +2389,6 @@ mod tests {
                     "kind": "ctw",
                     "depth": 8
                 },
-                "predictor_max_order": 8,
                 "agent_horizon": 1,
                 "num_simulations": 1,
                 "mcts_strategy": {

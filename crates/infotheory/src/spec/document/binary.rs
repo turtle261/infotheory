@@ -485,7 +485,10 @@ fn decode_mamba_method_spec(cursor: &mut Cursor<'_>) -> SpecResult<crate::mambaz
 
 fn encode_rate_backend(out: &mut Vec<u8>, backend: &RateBackend) {
     match backend {
-        RateBackend::RosaPlus => out.push(0),
+        RateBackend::RosaPlus { max_order } => {
+            out.push(0);
+            push_i64(out, *max_order);
+        }
         RateBackend::Match {
             hash_bits,
             min_len,
@@ -565,7 +568,6 @@ fn encode_rate_backend(out: &mut Vec<u8>, backend: &RateBackend) {
             for expert in &spec.experts {
                 push_option_string(out, expert.name.as_deref());
                 push_f64(out, expert.log_prior);
-                push_i64(out, expert.max_order);
                 encode_rate_backend(out, &expert.backend);
             }
         }
@@ -587,7 +589,9 @@ fn encode_rate_backend(out: &mut Vec<u8>, backend: &RateBackend) {
 fn decode_rate_backend(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<RateBackend> {
     let _ = base_dir;
     match cursor.read_u8()? {
-        0 => Ok(RateBackend::RosaPlus),
+        0 => Ok(RateBackend::RosaPlus {
+            max_order: cursor.read_i64()?,
+        }),
         1 => Ok(RateBackend::Match {
             hash_bits: cursor.read_u64()? as usize,
             min_len: cursor.read_u64()? as usize,
@@ -649,7 +653,6 @@ fn decode_rate_backend(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<R
                 experts.push(crate::api::MixtureExpertSpec {
                     name: cursor.read_option_string()?,
                     log_prior: cursor.read_f64()?,
-                    max_order: cursor.read_i64()?,
                     backend: decode_rate_backend(cursor, base_dir)?,
                 });
             }
@@ -985,7 +988,6 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
         ControllerSpec::McAixi(inner) => {
             out.push(0);
             encode_rate_backend(out, &inner.predictor);
-            push_i64(out, inner.predictor_max_order);
             push_u64(out, inner.agent_horizon as u64);
             push_u64(out, inner.num_simulations as u64);
             encode_mcts_strategy(out, inner.mcts_strategy);
@@ -995,7 +997,6 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
         ControllerSpec::AiqiDiscounted(inner) => {
             out.push(1);
             encode_rate_backend(out, &inner.predictor);
-            push_i64(out, inner.predictor_max_order);
             push_f64(out, inner.discount_gamma);
             push_u64(out, inner.return_horizon as u64);
             push_u64(out, inner.return_bins as u64);
@@ -1006,7 +1007,6 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             out.push(2);
             encode_rate_backend(out, &inner.predictor);
-            push_i64(out, inner.predictor_max_order);
             push_u64(out, inner.return_horizon as u64);
             push_u64(out, inner.return_bins as u64);
             push_u64(out, inner.label_phase_period as u64);
@@ -1020,7 +1020,6 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
     match cursor.read_u8()? {
         0 => Ok(ControllerSpec::McAixi(McAixiControllerSpec {
             predictor: decode_rate_backend(cursor, base_dir)?,
-            predictor_max_order: cursor.read_i64()?,
             agent_horizon: cursor.read_u64()? as usize,
             num_simulations: cursor.read_u64()? as usize,
             mcts_strategy: decode_mcts_strategy(cursor)?,
@@ -1030,7 +1029,6 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
         1 => Ok(ControllerSpec::AiqiDiscounted(
             AiqiDiscountedControllerSpec {
                 predictor: decode_rate_backend(cursor, base_dir)?,
-                predictor_max_order: cursor.read_i64()?,
                 discount_gamma: cursor.read_f64()?,
                 return_horizon: cursor.read_u64()? as usize,
                 return_bins: cursor.read_u64()? as usize,
@@ -1042,7 +1040,6 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
         2 => Ok(ControllerSpec::AiqiWarmstartExactJh(
             WarmStartExactJhControllerSpec {
                 predictor: decode_rate_backend(cursor, base_dir)?,
-                predictor_max_order: cursor.read_i64()?,
                 return_horizon: cursor.read_u64()? as usize,
                 return_bins: cursor.read_u64()? as usize,
                 label_phase_period: cursor.read_u64()? as usize,
@@ -1285,25 +1282,18 @@ fn encode_vm_reward_shaping(spec: &VmRewardShapingSpec, out: &mut Vec<u8>) {
     match spec {
         VmRewardShapingSpec::EntropyReduction {
             baseline_asset,
-            max_order,
             scale,
             crash_bonus,
             timeout_bonus,
         } => {
             out.push(0);
             push_string(out, baseline_asset);
-            push_i64(out, *max_order);
             push_f64(out, *scale);
             push_option_i64(out, *crash_bonus);
             push_option_i64(out, *timeout_bonus);
         }
-        VmRewardShapingSpec::TraceEntropy {
-            max_order,
-            scale,
-            normalize,
-        } => {
+        VmRewardShapingSpec::TraceEntropy { scale, normalize } => {
             out.push(1);
-            push_i64(out, *max_order);
             push_f64(out, *scale);
             push_bool(out, *normalize);
         }
@@ -1315,13 +1305,11 @@ fn decode_vm_reward_shaping(cursor: &mut Cursor<'_>) -> SpecResult<VmRewardShapi
     match cursor.read_u8()? {
         0 => Ok(VmRewardShapingSpec::EntropyReduction {
             baseline_asset: cursor.read_string()?,
-            max_order: cursor.read_i64()?,
             scale: cursor.read_f64()?,
             crash_bonus: cursor.read_option_i64()?,
             timeout_bonus: cursor.read_option_i64()?,
         }),
         1 => Ok(VmRewardShapingSpec::TraceEntropy {
-            max_order: cursor.read_i64()?,
             scale: cursor.read_f64()?,
             normalize: cursor.read_bool()?,
         }),
@@ -1420,7 +1408,6 @@ fn encode_vm_action_filter(spec: &VmActionFilterSpec, out: &mut Vec<u8>) {
     push_option_f64(out, spec.min_intrinsic_dependence);
     push_option_f64(out, spec.min_novelty);
     push_option_string(out, spec.novelty_prior_asset.as_deref());
-    push_i64(out, spec.max_order);
     push_option_i64(out, spec.reject_reward);
 }
 
@@ -1432,7 +1419,6 @@ fn decode_vm_action_filter(cursor: &mut Cursor<'_>) -> SpecResult<VmActionFilter
         min_intrinsic_dependence: cursor.read_option_f64()?,
         min_novelty: cursor.read_option_f64()?,
         novelty_prior_asset: cursor.read_option_string()?,
-        max_order: cursor.read_i64()?,
         reject_reward: cursor.read_option_i64()?,
     })
 }

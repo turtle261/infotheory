@@ -882,9 +882,6 @@ pub fn mixture_expert_spec_to_json_value(
         object.insert("name".to_string(), serde_json::Value::String(name.clone()));
     }
     object.insert("log_prior".to_string(), serde_json::json!(spec.log_prior));
-    if spec.max_order >= 0 || matches!(spec.backend, RateBackend::RosaPlus) {
-        object.insert("max_order".to_string(), serde_json::json!(spec.max_order));
-    }
     Ok(value)
 }
 
@@ -918,7 +915,10 @@ pub fn calibrated_spec_to_json_value(spec: &CalibratedSpec) -> SpecResult<serde_
 pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_json::Value> {
     let canonical = backend.descriptor().map_err(SpecError::new)?.canonical;
     match backend {
-        RateBackend::RosaPlus => Ok(serde_json::json!({ "kind": canonical })),
+        RateBackend::RosaPlus { max_order } => Ok(serde_json::json!({
+            "kind": canonical,
+            "max_order": max_order,
+        })),
         RateBackend::Match {
             hash_bits,
             min_len,
@@ -1130,7 +1130,12 @@ pub fn parse_rate_backend_json(
     let kind = resolve_enabled_rate_backend_kind(raw_kind)?;
 
     match kind {
-        crate::runtime::RateBackendKind::RosaPlus => Ok(RateBackend::RosaPlus),
+        crate::runtime::RateBackendKind::RosaPlus => Ok(RateBackend::RosaPlus {
+            max_order: v["max_order"]
+                .as_i64()
+                .or_else(|| v["order"].as_i64())
+                .unwrap_or(-1),
+        }),
         crate::runtime::RateBackendKind::Ctw => Ok(RateBackend::Ctw {
             depth: v["depth"].as_u64().unwrap_or(16) as usize,
         }),
@@ -1394,14 +1399,6 @@ pub fn parse_mixture_expert_value(
     }
 
     let backend = parse_rate_backend_json(v, base_dir, depth - 1)?;
-    let max_order = if matches!(backend, RateBackend::RosaPlus) {
-        v["max_order"]
-            .as_i64()
-            .or_else(|| v["order"].as_i64())
-            .unwrap_or(8)
-    } else {
-        -1
-    };
 
     Ok(MixtureExpertSpec {
         name: v["name"].as_str().map(|s| s.to_string()),
@@ -1409,7 +1406,6 @@ pub fn parse_mixture_expert_value(
             .as_f64()
             .or_else(|| v["prior"].as_f64())
             .unwrap_or(0.0),
-        max_order,
         backend,
     })
 }
@@ -1578,7 +1574,11 @@ pub fn parse_rate_backend_name_method(
     let method = method.filter(|value| !value.is_empty());
 
     match kind {
-        crate::runtime::RateBackendKind::RosaPlus => Ok(RateBackend::RosaPlus),
+        crate::runtime::RateBackendKind::RosaPlus => Ok(RateBackend::RosaPlus {
+            max_order: method
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(-1),
+        }),
         crate::runtime::RateBackendKind::Match => Ok(RateBackend::Match {
             hash_bits: 20,
             min_len: 4,
@@ -1904,7 +1904,6 @@ mod tests {
                                 vec![MixtureExpertSpec {
                                     name: Some("leaf".to_string()),
                                     log_prior: 0.0,
-                                    max_order: -1,
                                     backend: base,
                                 }],
                             )),
@@ -2070,19 +2069,16 @@ mod tests {
                                 MixtureExpertSpec {
                                     name: Some("rosa".to_string()),
                                     log_prior: -0.2,
-                                    max_order: 8,
-                                    backend: RateBackend::RosaPlus,
+                                    backend: RateBackend::RosaPlus { max_order: 8 },
                                 },
                                 MixtureExpertSpec {
                                     name: Some("ctw".to_string()),
                                     log_prior: -1.4,
-                                    max_order: -1,
                                     backend: RateBackend::Ctw { depth: 12 },
                                 },
                                 MixtureExpertSpec {
                                     name: Some("particle".to_string()),
                                     log_prior: -2.0,
-                                    max_order: -1,
                                     backend: RateBackend::Particle {
                                         spec: Arc::new(ParticleSpec {
                                             num_particles: 4,

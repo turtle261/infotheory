@@ -7,14 +7,14 @@ use infotheory::compression::FramingMode;
 #[test]
 fn validate_compression_backend_accepts_rate_ac_and_rate_rans_without_rwkv_feature() {
     let ac = CompressionBackend::Rate {
-        rate_backend: RateBackend::RosaPlus,
+        rate_backend: RateBackend::RosaPlus { max_order: -1 },
         coder: CoderType::AC,
         framing: FramingMode::Framed,
     };
     validate_compression_backend(&ac).expect("rate-ac validation should not panic or fail");
 
     let rans = CompressionBackend::Rate {
-        rate_backend: RateBackend::RosaPlus,
+        rate_backend: RateBackend::RosaPlus { max_order: -1 },
         coder: CoderType::RANS,
         framing: FramingMode::Framed,
     };

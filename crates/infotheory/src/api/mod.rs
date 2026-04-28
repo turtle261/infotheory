@@ -31,16 +31,18 @@ pub use self::generation::{
     try_generate_bytes_conditional_chain_with_config, try_generate_bytes_with_config,
 };
 pub use self::metrics::{
-    d_kl_bytes, joint_marginal_entropy_bytes, js_div_bytes, marginal_entropy_bytes,
-    mutual_information_marg_bytes, ned_cons_marg_bytes, ned_marg_bytes, nhd_bytes, nte_marg_bytes,
-    try_biased_entropy_rate_backend, try_biased_entropy_rate_bytes, try_conditional_entropy_bytes,
-    try_conditional_entropy_rate_bytes, try_cross_entropy_bytes, try_cross_entropy_rate_backend,
-    try_cross_entropy_rate_bytes, try_entropy_rate_backend, try_entropy_rate_bytes,
-    try_intrinsic_dependence_bytes, try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes,
-    try_mutual_information_bytes, try_mutual_information_rate_backend,
-    try_mutual_information_rate_bytes, try_ned_bytes, try_ned_cons_bytes, try_ned_cons_rate_bytes,
-    try_ned_rate_backend, try_ned_rate_bytes, try_nte_bytes, try_nte_rate_backend,
-    try_nte_rate_bytes, try_resistance_to_transformation_bytes, tvd_bytes,
+    d_kl_bytes, empirical_cross_entropy_bytes, empirical_entropy_bytes,
+    empirical_joint_entropy_bytes, empirical_mutual_information_bytes, empirical_ned_bytes,
+    empirical_ned_cons_bytes, empirical_nte_bytes, empirical_resistance_to_transformation_bytes,
+    js_div_bytes, nhd_bytes, try_biased_entropy_rate_backend, try_biased_entropy_rate_bytes,
+    try_conditional_entropy_bytes, try_conditional_entropy_rate_bytes, try_cross_entropy_bytes,
+    try_cross_entropy_rate_backend, try_cross_entropy_rate_bytes, try_entropy_rate_backend,
+    try_entropy_rate_bytes, try_intrinsic_dependence_bytes, try_joint_entropy_rate_backend,
+    try_joint_entropy_rate_bytes, try_mutual_information_bytes,
+    try_mutual_information_rate_backend, try_mutual_information_rate_bytes, try_ned_bytes,
+    try_ned_cons_bytes, try_ned_cons_rate_bytes, try_ned_rate_backend, try_ned_rate_bytes,
+    try_nte_bytes, try_nte_rate_backend, try_nte_rate_bytes,
+    try_resistance_to_transformation_bytes, tvd_bytes,
 };
 pub use self::paths::{
     try_conditional_entropy_paths, try_cross_entropy_paths, try_get_bytes_from_paths,

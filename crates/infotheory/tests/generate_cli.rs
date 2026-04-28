@@ -91,11 +91,12 @@ fn generate_cli_rosaplus_predicts_green_from_file_and_stdin() {
     let _ = fs::remove_file(prompt_path);
 }
 
-/// When stdin is piped and the sole positional parses as an integer,
-/// the CLI should interpret it as `max_order` (not try to open it as a file).
+/// When stdin is piped and the sole positional parses as an integer the CLI
+/// must not treat it as a file path: with all `max_order` plumbing removed,
+/// the integer positional is dropped and the prompt is read from stdin.
 #[test]
-fn generate_cli_stdin_with_max_order_positional() {
-    let from_stdin_with_order = run_generate(
+fn generate_cli_stdin_with_integer_positional_reads_prompt_from_stdin() {
+    let from_stdin = run_generate(
         &[
             "generate",
             "8",
@@ -110,9 +111,9 @@ fn generate_cli_stdin_with_max_order_positional() {
         Some(PROMPT),
     );
     assert_eq!(
-        from_stdin_with_order.len(),
+        from_stdin.len(),
         4,
-        "should interpret '8' as max_order and read prompt from stdin"
+        "integer positional with piped stdin must read prompt from stdin"
     );
 }
 
@@ -253,7 +254,7 @@ fn generate_cli_supports_expert_spec_and_mixture_spec() {
         let mut experts = experts;
         experts.push(json!({
             "name": "rwkv",
-            "kind": "rwkv",
+            "kind": "rwkv7",
             "method": "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
             "log_prior": 0.0
         }));
