@@ -35,8 +35,23 @@ impl fmt::Display for ParallelUctPlannerInitError {
 
 impl std::error::Error for ParallelUctPlannerInitError {}
 
+/// Search-time errors for [`ParallelUctPlanner::search`].
+///
+/// These are contract violations detected at the public boundary before any
+/// rollout work is dispatched.
+///
+/// Note that `samples == 0` is always accepted (even when `agent.horizon() == 0`):
+/// the retained root is pruned to the supplied percept history and an action is
+/// selected from whatever completed root statistics are already available.
+/// If no completed root action values exist (e.g. on a fresh tree), the
+/// returned action is chosen uniformly at random from the action alphabet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParallelUctSearchError {
+    /// `samples > 0` was requested but `agent.horizon() == 0`.
+    ///
+    /// A positive simulation budget over a zero-step horizon has no
+    /// well-defined rollout depth, so the planner refuses the call rather
+    /// than silently returning an arbitrary action.
     PositiveSamplesRequirePositiveHorizon,
 }
 
@@ -89,6 +104,51 @@ impl ParallelUctPlanner {
         })
     }
 
+    /// Run a parallel UCT search and return the recommended next action.
+    ///
+    /// This is the validated public entry point. It enforces the planner's
+    /// search-time contract before delegating to the internal driver shared
+    /// with the in-crate, already-validated MC-AIXI call sites.
+    ///
+    /// # Parameters
+    ///
+    /// - `agent`: simulator providing the action alphabet, planning horizon,
+    ///   reward bounds, and rollout state. Mutated through the simulator's
+    ///   own contract during expansion and rollouts.
+    /// - `prev_obs_stream`: most recent observation, decomposed into its
+    ///   per-bit `PerceptVal` symbols, used to root the search tree.
+    /// - `prev_rew`: reward delivered alongside `prev_obs_stream`.
+    /// - `prev_act`: action that produced `(prev_obs_stream, prev_rew)`.
+    /// - `samples`: simulation budget (number of rollouts). `0` is a valid
+    ///   request: it prunes the retained root to the supplied percept history
+    ///   and then selects an action from the currently retained completed root
+    ///   statistics without launching any rollouts.
+    ///
+    ///   If no completed root action values are available, the returned action
+    ///   is chosen uniformly at random from the action alphabet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParallelUctSearchError::PositiveSamplesRequirePositiveHorizon`]
+    /// when `samples > 0` and `agent.horizon() == 0`. No worker tasks are
+    /// spawned and no planner search state is mutated when the contract fails.
+    ///
+    /// # Concurrency and cost
+    ///
+    /// Dispatch parallelism is capped by `workers` (fixed at construction; see
+    /// [`ParallelUctPlanner::new`]) and by the requested `samples` (small
+    /// budgets may use fewer worker tasks). Completed rollout batches are
+    /// evaluated through Rayon. A successful positive-budget call performs
+    /// exactly `samples` rollout dispatches, each bounded by `agent.horizon()`,
+    /// and applies their updates in deterministic completion-epoch order.
+    ///
+    /// # Randomness
+    ///
+    /// `search` consumes randomness from `agent` to seed per-task simulator
+    /// clones and to break ties between equal-valued actions (and, when no
+    /// completed root statistics exist, to fall back to a uniform random
+    /// action). As a result, even a `samples == 0` call may advance the
+    /// simulator RNG state.
     pub fn search(
         &mut self,
         agent: &mut dyn AgentSimulator,
