@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::aixi::common::{
-    DEFAULT_RANDOM_SEED, MctsStrategy, ObservationKeyMode,
+    ActionAlphabet, DEFAULT_RANDOM_SEED, MctsStrategy, ObservationKeyMode,
     parallel_uct_workers_one_warning_count_for_tests,
     reset_parallel_uct_workers_one_warning_for_tests,
 };
@@ -18,6 +18,10 @@ fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("test fixture worker count must be non-zero")
 }
 
+fn action_alphabet(n: usize) -> ActionAlphabet {
+    ActionAlphabet::try_from_usize(n).expect("test fixture action alphabet must be non-zero")
+}
+
 #[cfg(feature = "backend-ctw")]
 fn sample_planner_run() -> PlannerRunSpec {
     PlannerRunSpec {
@@ -30,7 +34,7 @@ fn sample_planner_run() -> PlannerRunSpec {
             observation_stream_len: 1,
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 1,
-            agent_actions: 2,
+            agent_actions: action_alphabet(2),
             min_reward: 0,
             max_reward: 1,
             reward_offset: 0,
@@ -136,6 +140,25 @@ fn planner_run_parser_rejects_noncanonical_builtin_names() {
             "unexpected parser error for '{name}': {err}"
         );
     }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn planner_run_parser_rejects_zero_action_alphabet() {
+    let mut value = sample_planner_run()
+        .to_canonical_json_value()
+        .expect("planner run json");
+    value["interface"]["agent_actions"] = serde_json::json!(0);
+
+    let err = match SpecDocument::parse_json_value(&value, Path::new(".")) {
+        Ok(_) => panic!("agent_actions=0 must be rejected at parse time"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("interface.agent_actions must be >= 1"),
+        "unexpected parser error: {err}"
+    );
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -685,7 +708,7 @@ fn sample_vm_planner_run() -> PlannerRunSpec {
             observation_stream_len: 16,
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 8,
-            agent_actions: 1,
+            agent_actions: action_alphabet(1),
             min_reward: 0,
             max_reward: 255,
             reward_offset: 0,
@@ -951,7 +974,7 @@ fn planner_run_validation_reports_missing_backend_feature() {
             observation_stream_len: 1,
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 1,
-            agent_actions: 2,
+            agent_actions: action_alphabet(2),
             min_reward: 0,
             max_reward: 1,
             reward_offset: 0,

@@ -4,7 +4,9 @@
 //! provided through optional integrations (for example `aixi-gameengine` and
 //! `aixi-vm`) or by user-defined implementations.
 
-use crate::aixi::common::{Action, PerceptVal, Reward};
+use crate::aixi::common::{
+    Action, ActionAlphabet, PerceptVal, Reward, action_alphabet_from_action_bits,
+};
 
 /// Interface for an agent's environment.
 pub trait Environment {
@@ -40,8 +42,8 @@ pub trait Environment {
     fn set_random_seed(&mut self, _seed: u64) {}
 
     /// Returns the total number of valid actions available.
-    fn get_num_actions(&self) -> usize {
-        1usize << self.get_action_bits()
+    fn get_num_actions(&self) -> ActionAlphabet {
+        action_alphabet_from_action_bits(self.get_action_bits())
     }
 
     /// Returns the maximum possible reward value in this environment.

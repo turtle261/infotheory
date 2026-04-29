@@ -20,7 +20,7 @@
 //! - **Configurable**: Pluggable reward policies, action sources, observation modes
 //! - **Information-Theoretic**: Built-in support for entropy-based metrics
 
-use crate::aixi::common::{Action, PerceptVal, RandomGenerator, Reward};
+use crate::aixi::common::{Action, ActionAlphabet, PerceptVal, RandomGenerator, Reward};
 use crate::aixi::environment::Environment;
 use crate::api::{
     CompiledRateBackend, RateBackend, empirical_entropy_bytes, try_cross_entropy_rate_backend,
@@ -2467,8 +2467,9 @@ impl Environment for NyxVmEnvironment {
         (n as f64).log2().ceil() as usize
     }
 
-    fn get_num_actions(&self) -> usize {
-        self.action_count()
+    fn get_num_actions(&self) -> ActionAlphabet {
+        ActionAlphabet::try_from_usize(self.action_count())
+            .expect("vm environment must expose a non-empty action alphabet")
     }
 
     fn max_reward(&self) -> Reward {

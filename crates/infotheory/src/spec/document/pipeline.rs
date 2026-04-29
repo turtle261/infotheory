@@ -132,7 +132,7 @@ pub(super) fn compile_validated_planner_run_spec(
         interface: validated.canonical_spec().interface.clone(),
         runtime: validated.canonical_spec().runtime.clone(),
         controller: compile_planner_controller(&validated.canonical_spec().controller, &env)?,
-        action_bits: bits_for_cardinality(validated.canonical_spec().interface.agent_actions),
+        action_bits: bits_for_cardinality(validated.canonical_spec().interface.agent_actions.get()),
     })
 }
 
@@ -315,9 +315,6 @@ fn ensure_asset_exists(bindings: &[AssetBinding], id: &str) -> SpecResult<()> {
 }
 
 fn canonicalize_interface_spec(spec: &PlannerInterfaceSpec) -> SpecResult<PlannerInterfaceSpec> {
-    if spec.agent_actions == 0 {
-        return Err(SpecError::new("agent_actions must be >= 1"));
-    }
     if spec.observation_stream_len == 0 {
         return Err(SpecError::new("observation_stream_len must be >= 1"));
     }

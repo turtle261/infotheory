@@ -1,6 +1,6 @@
 //! Canonical top-level specification document schema types.
 
-use crate::aixi::common::{MctsStrategy, ObservationKeyMode};
+use crate::aixi::common::{ActionAlphabet, MctsStrategy, ObservationKeyMode};
 use crate::api::{CompressionBackend, RateBackend};
 use crate::spec::core::{
     AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
@@ -322,7 +322,7 @@ pub struct PlannerInterfaceSpec {
     /// Reward bit width.
     pub reward_bits: usize,
     /// Action alphabet cardinality.
-    pub agent_actions: usize,
+    pub agent_actions: ActionAlphabet,
     /// Minimum instantaneous reward.
     pub min_reward: i64,
     /// Maximum instantaneous reward.

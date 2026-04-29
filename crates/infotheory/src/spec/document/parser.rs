@@ -9,7 +9,7 @@ use super::{
     WarmStartExactJhControllerSpec, WarmStartExactJhTuneControllerSpec,
     parse_compression_backend_json, parse_rate_backend_json,
 };
-use crate::aixi::common::MctsStrategy;
+use crate::aixi::common::{ActionAlphabet, MctsStrategy};
 use std::num::NonZeroUsize;
 
 #[cfg(feature = "vm")]
@@ -215,6 +215,10 @@ fn parse_environment_spec(
 }
 
 fn parse_interface_spec(value: &serde_json::Value) -> SpecResult<PlannerInterfaceSpec> {
+    let agent_actions_raw =
+        required_u64(&value["agent_actions"], "interface.agent_actions")? as usize;
+    let agent_actions = ActionAlphabet::try_from_usize(agent_actions_raw)
+        .map_err(|_| SpecError::new("interface.agent_actions must be >= 1"))?;
     Ok(PlannerInterfaceSpec {
         observation_bits: required_u64(&value["observation_bits"], "interface.observation_bits")?
             as usize,
@@ -228,7 +232,7 @@ fn parse_interface_spec(value: &serde_json::Value) -> SpecResult<PlannerInterfac
                 .unwrap_or("full_stream"),
         )?,
         reward_bits: required_u64(&value["reward_bits"], "interface.reward_bits")? as usize,
-        agent_actions: required_u64(&value["agent_actions"], "interface.agent_actions")? as usize,
+        agent_actions,
         min_reward: required_i64(&value["min_reward"], "interface.min_reward")?,
         max_reward: required_i64(&value["max_reward"], "interface.max_reward")?,
         reward_offset: required_i64(&value["reward_offset"], "interface.reward_offset")?,

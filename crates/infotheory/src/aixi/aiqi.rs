@@ -8,8 +8,8 @@
 //! returns at indices `i % N == phase`.
 
 use crate::aixi::common::{
-    Action, PerceptVal, RandomGenerator, Reward, RewardEncodingError, bits_for_cardinality,
-    resolve_random_seed, validate_reward_encoding_bounds,
+    Action, ActionAlphabet, PerceptVal, RandomGenerator, Reward, RewardEncodingError,
+    bits_for_cardinality, resolve_random_seed, validate_reward_encoding_bounds,
 };
 use crate::aixi::model::{Predictor, PredictorBuildError, build_aiqi_predictor};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
@@ -25,8 +25,6 @@ use std::fmt;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum AiqiError {
-    /// `agent_actions` was zero.
-    AgentActionsZero,
     /// `return_horizon` was zero.
     ReturnHorizonZero,
     /// `return_bins` was zero.
@@ -73,7 +71,7 @@ pub enum AiqiError {
         /// The out-of-range action token.
         action: Action,
         /// The configured action alphabet cardinality.
-        agent_actions: usize,
+        agent_actions: ActionAlphabet,
     },
     /// The observation stream length did not match the configured interface.
     ObservationStreamLengthMismatch {
@@ -137,7 +135,6 @@ pub enum AiqiError {
 impl fmt::Display for AiqiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AgentActionsZero => f.write_str("agent_actions must be >= 1"),
             Self::ReturnHorizonZero => f.write_str("return_horizon must be >= 1"),
             Self::ReturnBinsZero => f.write_str("return_bins must be >= 1"),
             Self::ReturnBinsNotPowerOfTwo { return_bins } => write!(
@@ -262,7 +259,7 @@ pub struct AiqiConfig {
     /// Number of bits used to encode rewards.
     pub reward_bits: usize,
     /// Number of valid actions.
-    pub agent_actions: usize,
+    pub agent_actions: ActionAlphabet,
     /// Minimum possible environment reward.
     pub min_reward: Reward,
     /// Maximum possible environment reward.
@@ -302,7 +299,8 @@ impl Default for AiqiConfig {
             observation_bits: 1,
             observation_stream_len: 1,
             reward_bits: 1,
-            agent_actions: 2,
+            agent_actions: ActionAlphabet::try_from_usize(2)
+                .expect("default action alphabet must be non-zero"),
             min_reward: 0,
             max_reward: 1,
             reward_offset: 0,
@@ -355,9 +353,6 @@ impl AiqiConfig {
     }
 
     fn validate_runtime_invariants(&self) -> Result<(), AiqiError> {
-        if self.agent_actions == 0 {
-            return Err(AiqiError::AgentActionsZero);
-        }
         if self.return_horizon == 0 {
             return Err(AiqiError::ReturnHorizonZero);
         }
@@ -422,7 +417,7 @@ struct AiqiRuntimeConfig {
     observation_bits: usize,
     observation_stream_len: usize,
     reward_bits: usize,
-    agent_actions: usize,
+    agent_actions: ActionAlphabet,
     min_reward: Reward,
     max_reward: Reward,
     reward_offset: Reward,
@@ -583,8 +578,8 @@ impl AiqiAgent {
         self.total_steps_observed
     }
 
-    /// Returns the configured number of actions.
-    pub fn num_actions(&self) -> usize {
+    /// Returns the configured action alphabet cardinality.
+    pub fn num_actions(&self) -> ActionAlphabet {
         self.config.agent_actions
     }
 
@@ -602,7 +597,7 @@ impl AiqiAgent {
                 .rng
                 .gen_bool(self.config.baseline_exploration.clamp(0.0, 1.0))
         {
-            self.rng.gen_range(self.config.agent_actions) as u64
+            self.rng.gen_range(self.config.agent_actions.get()) as u64
         } else {
             greedy_action
         }
@@ -620,7 +615,7 @@ impl AiqiAgent {
         let q_values = self.estimate_q_values();
         let greedy_action = argmax_with_fixed_tie_break(&q_values) as u64;
         if effective > 0.0 && self.rng.gen_bool(effective) {
-            self.rng.gen_range(self.config.agent_actions) as u64
+            self.rng.gen_range(self.config.agent_actions.get()) as u64
         } else {
             greedy_action
         }
@@ -636,7 +631,7 @@ impl AiqiAgent {
         observations: &[PerceptVal],
         reward: Reward,
     ) -> Result<(), AiqiError> {
-        if action as usize >= self.config.agent_actions {
+        if action as usize >= self.config.agent_actions.get() {
             return Err(AiqiError::ActionOutOfRange {
                 action,
                 agent_actions: self.config.agent_actions,
@@ -732,7 +727,7 @@ impl AiqiAgent {
         let action_bits = self.action_bits;
         let return_bits = self.return_bits;
 
-        let mut q_values = vec![0.0; self.config.agent_actions];
+        let mut q_values = vec![0.0; self.config.agent_actions.get()];
         let mut pushed_fast_forward = 0usize;
 
         {
@@ -755,7 +750,7 @@ impl AiqiAgent {
                 }
             }
 
-            for action in 0..self.config.agent_actions {
+            for action in 0..self.config.agent_actions.get() {
                 let pushed_action = push_encoded_bits_history(
                     model.predictor.as_mut(),
                     action as u64,
@@ -803,8 +798,8 @@ impl AiqiAgent {
             }
         }
 
-        let mut q_values = vec![0.0; self.config.agent_actions];
-        for action in 0..self.config.agent_actions {
+        let mut q_values = vec![0.0; self.config.agent_actions.get()];
+        for action in 0..self.config.agent_actions.get() {
             let mut action_predictor = context_predictor.boxed_clone();
             let _ = push_encoded_bits_commit_history(
                 action_predictor.as_mut(),
@@ -1286,7 +1281,8 @@ mod tests {
             observation_bits: 1,
             observation_stream_len: 1,
             reward_bits: 1,
-            agent_actions: 2,
+            agent_actions: ActionAlphabet::try_from_usize(2)
+                .expect("test fixture action alphabet must be non-zero"),
             min_reward: 0,
             max_reward: 1,
             reward_offset: 0,
@@ -1765,7 +1761,7 @@ mod tests {
 
         let q_values = agent.estimate_q_values_generic();
 
-        assert_eq!(q_values.len(), agent.config.agent_actions);
+        assert_eq!(q_values.len(), agent.config.agent_actions.get());
         let snapshot = counts.lock().unwrap().clone();
         assert_eq!(snapshot.update, 0);
         assert_eq!(snapshot.update_history, 0);

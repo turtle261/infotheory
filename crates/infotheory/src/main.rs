@@ -33,7 +33,9 @@ mod cli;
 
 use infotheory::aixi::agent::Agent;
 use infotheory::aixi::aiqi::AiqiAgent;
-use infotheory::aixi::common::{EXPLORE_RANDOM_SALT, RandomGenerator, resolve_random_seed};
+use infotheory::aixi::common::{
+    ActionAlphabet, EXPLORE_RANDOM_SALT, RandomGenerator, resolve_random_seed,
+};
 use infotheory::aixi::environment::Environment;
 #[cfg(feature = "aixi-gameengine")]
 use infotheory::aixi::gameengine::build_builtin_environment as build_gameengine_builtin_environment;
@@ -393,7 +395,7 @@ struct PlannerExecutionContext {
     observation_stream_len: usize,
     reward_bits: usize,
     reward_offset: i64,
-    agent_actions: usize,
+    agent_actions: ActionAlphabet,
     obs_stream: Vec<u64>,
     rew: i64,
     trace_logger: Option<AixiRunLogger>,
@@ -505,7 +507,7 @@ impl PlannerControllerRuntime {
                     PlannerPhase::Learn => {
                         let explore_p = schedule.extra_exploration(step);
                         if explore_p > 0.0 && explore_rng.gen_bool(explore_p) {
-                            explore_rng.gen_range(ctx.agent_actions) as u64
+                            explore_rng.gen_range(ctx.agent_actions.get()) as u64
                         } else {
                             agent.get_planned_action(&ctx.obs_stream, ctx.rew, *prev_action)
                         }

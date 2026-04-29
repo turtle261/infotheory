@@ -2,6 +2,8 @@ use super::{
     AgentSimulator, PerceptMap, PerceptOutcome, best_action_from_action_values,
     choose_uniform_unvisited, ensure_action_slots, prune_key, random_rollout,
 };
+#[cfg(test)]
+use crate::aixi::common::ActionAlphabet;
 use crate::aixi::common::{Action, PerceptVal, Reward};
 
 /// Sequential `rho_uct` planner state.
@@ -148,10 +150,10 @@ impl RhoUctNode {
         remaining_horizon: usize,
     ) -> (&mut RhoUctNode, Action) {
         let num_actions = agent.get_num_actions();
-        ensure_action_slots(&mut self.action_children, num_actions);
+        ensure_action_slots(&mut self.action_children, num_actions.get());
 
         let action_idx = if let Some(unvisited) =
-            choose_uniform_unvisited(agent, &self.action_children, num_actions)
+            choose_uniform_unvisited(agent, &self.action_children, num_actions.get())
         {
             self.action_children[unvisited] = Some(RhoUctNode::new(true));
             unvisited
@@ -246,8 +248,9 @@ mod tests {
     }
 
     impl AgentSimulator for DummyAgent {
-        fn get_num_actions(&self) -> usize {
-            self.num_actions
+        fn get_num_actions(&self) -> ActionAlphabet {
+            ActionAlphabet::try_from_usize(self.num_actions)
+                .expect("test fixture action alphabet must be valid")
         }
 
         fn get_num_observation_bits(&self) -> usize {
@@ -555,8 +558,8 @@ mod tests {
     }
 
     impl AgentSimulator for DeterministicRewardAgent {
-        fn get_num_actions(&self) -> usize {
-            2
+        fn get_num_actions(&self) -> ActionAlphabet {
+            ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid")
         }
 
         fn get_num_observation_bits(&self) -> usize {

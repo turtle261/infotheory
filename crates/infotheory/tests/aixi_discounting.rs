@@ -1,6 +1,6 @@
 #![cfg(feature = "aixi")]
 
-use infotheory::aixi::common::{Action, ObservationKeyMode, Reward};
+use infotheory::aixi::common::{Action, ActionAlphabet, ObservationKeyMode, Reward};
 use infotheory::aixi::mcts::AgentSimulator;
 
 struct NormRewardHarness {
@@ -19,8 +19,8 @@ fn approx_eq(a: f64, b: f64, eps: f64) {
 }
 
 impl AgentSimulator for NormRewardHarness {
-    fn get_num_actions(&self) -> usize {
-        2
+    fn get_num_actions(&self) -> ActionAlphabet {
+        ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid")
     }
 
     fn get_num_observation_bits(&self) -> usize {

@@ -120,7 +120,7 @@ fn interface_spec_to_json_value(spec: &PlannerInterfaceSpec) -> serde_json::Valu
         "observation_stream_len": spec.observation_stream_len,
         "observation_key_mode": super::observation_key_mode_name(spec.observation_key_mode),
         "reward_bits": spec.reward_bits,
-        "agent_actions": spec.agent_actions,
+        "agent_actions": spec.agent_actions.get(),
         "min_reward": spec.min_reward,
         "max_reward": spec.max_reward,
         "reward_offset": spec.reward_offset,

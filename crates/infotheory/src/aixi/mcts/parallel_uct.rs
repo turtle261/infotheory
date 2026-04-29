@@ -2,6 +2,8 @@ use super::{
     AgentSimulator, PerceptMap, PerceptOutcome, best_action_from_action_values,
     choose_uniform_unvisited, ensure_action_slots, prune_key, random_rollout,
 };
+#[cfg(test)]
+use crate::aixi::common::ActionAlphabet;
 use crate::aixi::common::{Action, PerceptVal, Reward};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -262,7 +264,7 @@ fn best_action<M: ModeState>(
     agent: &mut dyn AgentSimulator,
 ) -> Action {
     let Some(root) = root else {
-        return agent.gen_range(agent.get_num_actions().max(1)) as Action;
+        return agent.gen_range(agent.get_num_actions().get()) as Action;
     };
     best_action_from_action_values(
         root.action_edges
@@ -382,10 +384,10 @@ fn choose_bootstrap_action<M: ModeState>(
     agent: &mut dyn AgentSimulator,
 ) -> usize {
     let num_actions = agent.get_num_actions();
-    ensure_action_slots(&mut root.action_edges, num_actions);
+    ensure_action_slots(&mut root.action_edges, num_actions.get());
 
     let mut unvisited = Vec::new();
-    for action_idx in 0..num_actions {
+    for action_idx in 0..num_actions.get() {
         match root.action_edges.get(action_idx).and_then(Option::as_ref) {
             None => unvisited.push(action_idx),
             Some(edge) if edge.completed_n() == 0 && edge.effective_visits() == 0 => {
@@ -440,20 +442,21 @@ fn dispatch_rollout_into<M: ModeState>(
     }
 
     let num_actions = agent.get_num_actions();
-    ensure_action_slots(&mut node.action_edges, num_actions);
+    ensure_action_slots(&mut node.action_edges, num_actions.get());
 
-    let action_idx =
-        if let Some(unvisited) = choose_uniform_unvisited(agent, &node.action_edges, num_actions) {
-            node.action_edges[unvisited] = Some(M::Edge::new());
-            unvisited
-        } else {
-            let Some(action_idx) =
-                select_existing_action(node, agent, remaining_horizon, workers, bu_uct_m_max)
-            else {
-                return remaining_horizon;
-            };
-            action_idx
+    let action_idx = if let Some(unvisited) =
+        choose_uniform_unvisited(agent, &node.action_edges, num_actions.get())
+    {
+        node.action_edges[unvisited] = Some(M::Edge::new());
+        unvisited
+    } else {
+        let Some(action_idx) =
+            select_existing_action(node, agent, remaining_horizon, workers, bu_uct_m_max)
+        else {
+            return remaining_horizon;
         };
+        action_idx
+    };
 
     agent.model_update_action(action_idx as Action);
     let (observations, immediate_reward) = agent.gen_percepts_and_update();
@@ -987,8 +990,8 @@ mod tests {
     }
 
     impl AgentSimulator for DeterministicRewardAgent {
-        fn get_num_actions(&self) -> usize {
-            2
+        fn get_num_actions(&self) -> ActionAlphabet {
+            ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid")
         }
 
         fn get_num_observation_bits(&self) -> usize {
@@ -1056,8 +1059,9 @@ mod tests {
     }
 
     impl AgentSimulator for ThresholdProbeAgent {
-        fn get_num_actions(&self) -> usize {
-            self.num_actions
+        fn get_num_actions(&self) -> ActionAlphabet {
+            ActionAlphabet::try_from_usize(self.num_actions)
+                .expect("test fixture action alphabet must be valid")
         }
 
         fn get_num_observation_bits(&self) -> usize {
@@ -1131,8 +1135,8 @@ mod tests {
     }
 
     impl AgentSimulator for CounterAgent {
-        fn get_num_actions(&self) -> usize {
-            2
+        fn get_num_actions(&self) -> ActionAlphabet {
+            ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid")
         }
 
         fn get_num_observation_bits(&self) -> usize {
@@ -1217,8 +1221,8 @@ mod tests {
     }
 
     impl AgentSimulator for SeedRecordingAgent {
-        fn get_num_actions(&self) -> usize {
-            2
+        fn get_num_actions(&self) -> ActionAlphabet {
+            ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid")
         }
 
         fn get_num_observation_bits(&self) -> usize {

@@ -4,7 +4,7 @@
 //! independent from bundled environments.
 
 use crate::aixi::common::DEFAULT_RANDOM_SEED;
-use crate::aixi::common::{Action, PerceptVal, Reward};
+use crate::aixi::common::{Action, ActionAlphabet, PerceptVal, Reward};
 use crate::aixi::environment::Environment;
 use crate::spec::BuiltinEnvironmentSpec;
 use gameengine::GameAuthoring;
@@ -207,8 +207,9 @@ where
         }
     }
 
-    fn get_num_actions(&self) -> usize {
-        self.spec.action_count as usize
+    fn get_num_actions(&self) -> ActionAlphabet {
+        ActionAlphabet::try_from_usize(self.spec.action_count as usize)
+            .expect("gameengine environments must expose a non-empty action alphabet")
     }
 
     fn max_reward(&self) -> Reward {

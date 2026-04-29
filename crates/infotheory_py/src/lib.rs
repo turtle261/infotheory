@@ -146,6 +146,17 @@ fn resolve_mcts_strategy(
         .unwrap_or_else(default_mcts_strategy)
 }
 
+fn py_action_alphabet_from_usize(
+    value: usize,
+    context: &'static str,
+) -> PyResult<infotheory::aixi::common::ActionAlphabet> {
+    infotheory::aixi::common::ActionAlphabet::try_from_usize(value).map_err(|_| {
+        PyValueError::new_err(format!(
+            "{context} must be >= 1 (action alphabet must be non-empty)"
+        ))
+    })
+}
+
 fn format_mcts_strategy(strategy: infotheory::aixi::common::MctsStrategy) -> String {
     match strategy {
         infotheory::aixi::common::MctsStrategy::RhoUct => "MctsStrategy.rho_uct()".to_string(),
@@ -2788,13 +2799,25 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
 
 struct PyAgentSimulatorShim {
     obj: Mutex<Py<PyAny>>,
+    // Structural simulator invariant cached once at the Python boundary.
+    action_alphabet: infotheory::aixi::common::ActionAlphabet,
 }
 
 impl PyAgentSimulatorShim {
-    fn new(obj: Py<PyAny>) -> Self {
-        Self {
+    fn try_new(obj: Py<PyAny>) -> PyResult<Self> {
+        // Validate the action alphabet at construction so downstream planner
+        // code can rely on a non-empty action set without repeated callbacks.
+        let action_alphabet = Python::attach(|py| {
+            let n = obj
+                .bind(py)
+                .call_method0("get_num_actions")?
+                .extract::<usize>()?;
+            py_action_alphabet_from_usize(n, "AgentSimulator.get_num_actions()")
+        })?;
+        Ok(Self {
             obj: Mutex::new(obj),
-        }
+            action_alphabet,
+        })
     }
 
     fn parse_key_mode(py_obj: &Bound<'_, PyAny>) -> infotheory::aixi::common::ObservationKeyMode {
@@ -2838,18 +2861,8 @@ impl PyAgentSimulatorShim {
 }
 
 impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
-    fn get_num_actions(&self) -> usize {
-        Python::attach(|py| {
-            let guard = lock_recover(&self.obj);
-            py_result_or_fatal(
-                py,
-                "AgentSimulator.get_num_actions",
-                guard
-                    .bind(py)
-                    .call_method0("get_num_actions")
-                    .and_then(|v| v.extract::<usize>()),
-            )
-        })
+    fn get_num_actions(&self) -> infotheory::aixi::common::ActionAlphabet {
+        self.action_alphabet
     }
 
     fn get_num_observation_bits(&self) -> usize {
@@ -3126,7 +3139,10 @@ impl infotheory::aixi::mcts::AgentSimulator for PyAgentSimulatorShim {
             }),
             CloneDecision::Fallback(src) => Self::clone_py_obj(&src),
         };
-        Box::new(Self::new(cloned))
+        Box::new(Self {
+            obj: Mutex::new(cloned),
+            action_alphabet: self.action_alphabet,
+        })
     }
 }
 
@@ -3234,11 +3250,6 @@ fn run_agent_with_environment<'py>(
             "explore_gamma must be in [0, 1] for run_agent_with_environment",
         ));
     }
-    if config.inner.agent_actions == 0 {
-        return Err(PyValueError::new_err(
-            "AgentConfig.agent_actions must be >= 1 for run_agent_with_environment",
-        ));
-    }
     config.inner.validate().map_err(py_value_error)?;
 
     let summary = py.detach(|| {
@@ -3283,7 +3294,7 @@ fn run_agent_with_environment<'py>(
                 };
 
                 let action = if explore_p > 0.0 && explore_rng.gen_bool(explore_p.min(1.0)) {
-                    explore_rng.gen_range(config.inner.agent_actions) as u64
+                    explore_rng.gen_range(config.inner.agent_actions.get()) as u64
                 } else {
                     agent.get_planned_action(&obs_stream, reward, prev_action)
                 };
@@ -3610,7 +3621,7 @@ fn search_with_simulator(
     let strategy = resolve_mcts_strategy(mcts_strategy);
     py.detach(|| {
         py_try(|| {
-            let mut sim = PyAgentSimulatorShim::new(simulator);
+            let mut sim = PyAgentSimulatorShim::try_new(simulator)?;
             let mut planner = PySearchPlannerState::new(strategy)?;
             planner.search(
                 &mut sim,
@@ -3793,7 +3804,8 @@ impl PyAgentConfig {
             .map(|m| m.inner)
             .unwrap_or(infotheory::aixi::common::ObservationKeyMode::FullStream);
         inner.reward_bits = reward_bits;
-        inner.agent_actions = agent_actions;
+        inner.agent_actions =
+            py_action_alphabet_from_usize(agent_actions, "AgentConfig.agent_actions")?;
         inner.num_simulations = num_simulations;
         inner.mcts_strategy = resolve_mcts_strategy(mcts_strategy);
         inner.exploration_exploitation_ratio = exploration_exploitation_ratio;
@@ -3850,7 +3862,8 @@ impl PyAiqiConfig {
         inner.observation_bits = observation_bits;
         inner.observation_stream_len = observation_stream_len;
         inner.reward_bits = reward_bits;
-        inner.agent_actions = agent_actions;
+        inner.agent_actions =
+            py_action_alphabet_from_usize(agent_actions, "AiqiConfig.agent_actions")?;
         inner.min_reward = min_reward;
         inner.max_reward = max_reward;
         inner.reward_offset = reward_offset;
@@ -3939,7 +3952,7 @@ impl PyAiqiAgent {
     }
 
     fn num_actions(&self) -> usize {
-        self.inner.num_actions()
+        self.inner.num_actions().get()
     }
 
     fn get_planned_action(&mut self) -> u64 {
@@ -4311,7 +4324,7 @@ macro_rules! define_gameengine_env_class {
             }
 
             fn get_num_actions(&self) -> usize {
-                self.inner.get_num_actions()
+                self.inner.get_num_actions().get()
             }
 
             fn min_reward(&self) -> i64 {
@@ -4386,7 +4399,7 @@ impl CoinFlipEnv {
     }
 
     fn get_num_actions(&self) -> usize {
-        self.inner.get_num_actions()
+        self.inner.get_num_actions().get()
     }
 
     fn min_reward(&self) -> i64 {
@@ -5034,6 +5047,28 @@ mod tests {
             let rendered = err.to_string();
             assert!(rendered.contains("RuntimeError"));
             assert!(rendered.contains("requires feature 'aixi-gameengine-physics'"));
+        });
+    }
+
+    #[test]
+    fn search_with_simulator_rejects_zero_action_alphabet_at_python_boundary() {
+        with_python_initialized(|py| {
+            let simulator = py
+                .eval(
+                    pyo3::ffi::c_str!("type('BadSim', (), {'get_num_actions': lambda self: 0})()"),
+                    None,
+                    None,
+                )
+                .expect("construct zero-action simulator")
+                .unbind();
+            let strategy = PyMctsStrategy::parallel_uct(2, None).expect("valid strategy");
+            let err = search_with_simulator(py, simulator, vec![0], 0, 0, 1, Some(&strategy))
+                .expect_err("zero-action simulator must be rejected");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("AgentSimulator.get_num_actions() must be >= 1"),
+                "unexpected error message: {rendered}"
+            );
         });
     }
 }

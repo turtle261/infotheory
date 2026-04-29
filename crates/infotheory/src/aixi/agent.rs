@@ -5,7 +5,7 @@
 //! entity.
 
 use crate::aixi::common::{
-    Action, MctsStrategy, ObservationKeyMode, PerceptVal, RandomGenerator, Reward,
+    Action, ActionAlphabet, MctsStrategy, ObservationKeyMode, PerceptVal, RandomGenerator, Reward,
     RewardEncodingError, decode, encode, observation_repr_from_stream, resolve_random_seed,
     validate_reward_encoding_bounds, warn_parallel_uct_workers_one_once,
 };
@@ -26,8 +26,6 @@ use std::fmt;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum AgentError {
-    /// `agent_actions` was zero.
-    AgentActionsZero,
     /// `agent_horizon` was zero.
     AgentHorizonZero,
     /// `num_simulations` was zero.
@@ -64,7 +62,6 @@ pub enum AgentError {
 impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AgentActionsZero => f.write_str("agent_actions must be >= 1"),
             Self::AgentHorizonZero => f.write_str("agent_horizon must be >= 1"),
             Self::NumSimulationsZero => f.write_str("num_simulations must be >= 1"),
             Self::InvalidExplorationExploitationRatio { value: _ } => {
@@ -138,8 +135,8 @@ pub struct AgentConfig {
     pub observation_key_mode: ObservationKeyMode,
     /// Number of bits used to encode rewards.
     pub reward_bits: usize,
-    /// Number of possible actions.
-    pub agent_actions: usize,
+    /// Cardinality of the action alphabet.
+    pub agent_actions: ActionAlphabet,
     /// Number of MCTS simulations per planning step.
     pub num_simulations: usize,
     /// Explicit MCTS strategy.
@@ -171,7 +168,8 @@ impl Default for AgentConfig {
             observation_stream_len: 1,
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 1,
-            agent_actions: 2,
+            agent_actions: ActionAlphabet::try_from_usize(2)
+                .expect("default action alphabet must be non-zero"),
             num_simulations: 100,
             mcts_strategy: MctsStrategy::RhoUct,
             exploration_exploitation_ratio: 1.0,
@@ -221,9 +219,6 @@ impl AgentConfig {
     }
 
     fn validate_runtime_invariants(&self) -> Result<(), AgentError> {
-        if self.agent_actions == 0 {
-            return Err(AgentError::AgentActionsZero);
-        }
         if self.agent_horizon == 0 {
             return Err(AgentError::AgentHorizonZero);
         }
@@ -292,7 +287,7 @@ struct AgentRuntimeConfig {
     observation_stream_len: usize,
     observation_key_mode: ObservationKeyMode,
     reward_bits: usize,
-    agent_actions: usize,
+    agent_actions: ActionAlphabet,
     num_simulations: usize,
     mcts_strategy: MctsStrategy,
     exploration_exploitation_ratio: f64,
@@ -568,7 +563,7 @@ impl Agent {
 }
 
 impl AgentSimulator for Agent {
-    fn get_num_actions(&self) -> usize {
+    fn get_num_actions(&self) -> ActionAlphabet {
         self.config.agent_actions
     }
 
@@ -778,7 +773,8 @@ mod tests {
             observation_stream_len: 2,
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 3,
-            agent_actions: 4,
+            agent_actions: ActionAlphabet::try_from_usize(4)
+                .expect("test fixture action alphabet must be non-zero"),
             num_simulations: 2,
             mcts_strategy: MctsStrategy::RhoUct,
             exploration_exploitation_ratio: 1.0,
@@ -792,11 +788,7 @@ mod tests {
 
     fn test_agent(model: Box<dyn Predictor>) -> Agent {
         let config = basic_runtime_config();
-        let action_bits = if config.agent_actions <= 1 {
-            1
-        } else {
-            (usize::BITS - (config.agent_actions - 1).leading_zeros()) as usize
-        };
+        let action_bits = config.agent_actions.action_bits();
         Agent {
             action_bits,
             model,
@@ -841,7 +833,8 @@ mod tests {
             observation_stream_len: 1,
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 1,
-            agent_actions: 2,
+            agent_actions: ActionAlphabet::try_from_usize(2)
+                .expect("test fixture action alphabet must be non-zero"),
             num_simulations: 60,
             mcts_strategy: MctsStrategy::RhoUct,
             exploration_exploitation_ratio: 1.4,

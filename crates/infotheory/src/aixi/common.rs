@@ -13,6 +13,65 @@ pub type Symbol = bool;
 /// A list of symbols, used to represent encoded observations, rewards, or actions.
 pub type SymbolList = Vec<Symbol>;
 
+/// Cardinality of an agent/environment action alphabet `|A|`.
+///
+/// This domain type makes the core AIXI/AIQI invariant explicit: planners,
+/// environments, and simulator shims operate over a non-empty action alphabet.
+/// The value `0` is therefore unrepresentable once a value has crossed an API
+/// boundary into the validated internal domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ActionAlphabet(NonZeroUsize);
+
+impl ActionAlphabet {
+    /// Construct an action alphabet cardinality from a known non-zero value.
+    pub const fn new(value: NonZeroUsize) -> Self {
+        Self(value)
+    }
+
+    /// Validate and construct an action alphabet cardinality from a raw `usize`.
+    pub fn try_from_usize(value: usize) -> Result<Self, ZeroActionAlphabetError> {
+        NonZeroUsize::new(value)
+            .map(Self)
+            .ok_or(ZeroActionAlphabetError)
+    }
+
+    /// Return the underlying cardinality.
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    /// Return the minimum bit width required to encode the action alphabet.
+    pub fn action_bits(self) -> usize {
+        bits_for_cardinality(self.get())
+    }
+}
+
+impl TryFrom<usize> for ActionAlphabet {
+    type Error = ZeroActionAlphabetError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Self::try_from_usize(value)
+    }
+}
+
+impl fmt::Display for ActionAlphabet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+/// Error returned when attempting to construct an empty action alphabet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZeroActionAlphabetError;
+
+impl fmt::Display for ZeroActionAlphabetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("action alphabet cardinality must be >= 1")
+    }
+}
+
+impl Error for ZeroActionAlphabetError {}
+
 /// Represents an action that the agent can perform.
 pub type Action = u64;
 
@@ -126,6 +185,15 @@ pub(crate) fn bits_for_cardinality(cardinality: usize) -> usize {
     let n = cardinality.max(1);
     let bits = (usize::BITS - (n - 1).leading_zeros()) as usize;
     bits.max(1)
+}
+
+pub(crate) fn action_alphabet_from_action_bits(action_bits: usize) -> ActionAlphabet {
+    let shift = u32::try_from(action_bits).expect("action bit width must fit within u32");
+    let cardinality = 1usize
+        .checked_shl(shift)
+        .expect("environment action bit width must be < usize::BITS");
+    ActionAlphabet::try_from_usize(cardinality)
+        .expect("1 << action_bits must always produce a non-zero action alphabet")
 }
 
 /// Error returned when the configured reward range cannot be encoded.
@@ -522,6 +590,14 @@ mod tests {
         assert_eq!(bits_for_cardinality(2), 1);
         assert_eq!(bits_for_cardinality(3), 2);
         assert_eq!(bits_for_cardinality(usize::MAX), usize::BITS as usize);
+    }
+
+    #[test]
+    fn action_alphabet_rejects_zero_cardinality() {
+        assert_eq!(
+            ActionAlphabet::try_from_usize(0).expect_err("zero actions must be rejected"),
+            ZeroActionAlphabetError
+        );
     }
 
     #[test]

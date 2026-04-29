@@ -8,7 +8,7 @@ mod parallel_uct;
 mod rho_uct;
 
 use crate::aixi::common::{
-    Action, ObservationKeyMode, PerceptVal, Reward, observation_repr_from_stream,
+    Action, ActionAlphabet, ObservationKeyMode, PerceptVal, Reward, observation_repr_from_stream,
 };
 
 pub use parallel_uct::{ParallelUctPlanner, ParallelUctPlannerInitError, ParallelUctSearchError};
@@ -61,7 +61,7 @@ pub(crate) fn prune_key(
 /// imagined percepts during planning.
 pub trait AgentSimulator: Send {
     /// Returns the number of possible actions the agent can perform.
-    fn get_num_actions(&self) -> usize;
+    fn get_num_actions(&self) -> ActionAlphabet;
 
     /// Returns the bit-width used to encode observations.
     fn get_num_observation_bits(&self) -> usize;
@@ -201,7 +201,7 @@ pub(crate) fn discounted_horizon_sum(gamma: f64, horizon: usize) -> f64 {
 }
 
 pub(crate) fn random_rollout(agent: &mut dyn AgentSimulator, horizon: usize) -> f64 {
-    let num_actions = agent.get_num_actions();
+    let num_actions = agent.get_num_actions().get();
     let gamma = agent.discount_gamma().clamp(0.0, 1.0);
     let mut total_reward = 0.0;
     let mut discount = 1.0;
@@ -243,7 +243,7 @@ pub(crate) fn choose_uniform_unvisited<T>(
 
 pub(crate) fn best_action_from_action_values(
     action_values: impl Iterator<Item = (usize, f64)>,
-    num_actions: usize,
+    num_actions: ActionAlphabet,
     agent: &mut dyn AgentSimulator,
 ) -> Action {
     let mut best_actions = Vec::new();
@@ -262,7 +262,7 @@ pub(crate) fn best_action_from_action_values(
     }
 
     if best_actions.is_empty() {
-        return agent.gen_range(num_actions.max(1)) as Action;
+        return agent.gen_range(num_actions.get()) as Action;
     }
 
     best_actions[agent.gen_range(best_actions.len())]

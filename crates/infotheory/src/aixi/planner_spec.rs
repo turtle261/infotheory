@@ -1,6 +1,6 @@
 //! Shared planner-run spec builder utilities for AIXI/AIQI controllers.
 
-use crate::aixi::common::{ObservationKeyMode, resolve_random_seed};
+use crate::aixi::common::{ActionAlphabet, ObservationKeyMode, resolve_random_seed};
 use crate::spec::{
     BuiltinEnvironmentSpec, ControllerSpec, EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec,
     PlannerRuntimeSpec,
@@ -13,7 +13,7 @@ pub(crate) struct PlannerInterfaceConfig {
     pub observation_stream_len: usize,
     pub observation_key_mode: ObservationKeyMode,
     pub reward_bits: usize,
-    pub agent_actions: usize,
+    pub agent_actions: ActionAlphabet,
     pub min_reward: i64,
     pub max_reward: i64,
     pub reward_offset: i64,
