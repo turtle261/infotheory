@@ -32,8 +32,10 @@ use crate::backends::match_model::MatchModel;
 use crate::backends::ppmd::PpmdModel;
 #[cfg(feature = "backend-rosa")]
 use crate::backends::rosaplus::{RosaPlus, RosaTx};
+#[cfg(all(feature = "backend-sequitur", any(feature = "aixi", test)))]
+use crate::backends::sequitur::SequiturCheckpoint;
 #[cfg(feature = "backend-sequitur")]
-use crate::backends::sequitur::{SequiturCheckpoint, SequiturModel};
+use crate::backends::sequitur::SequiturModel;
 #[cfg(feature = "backend-match")]
 use crate::backends::sparse_match::SparseMatchModel;
 use crate::backends::text_context::TextContextAnalyzer;
@@ -564,6 +566,7 @@ pub enum RateBackendPredictor {
     },
 }
 
+#[cfg(any(feature = "aixi", test))]
 #[derive(Clone)]
 /// Checkpoint snapshot used for temporary predictor rollback.
 ///
@@ -619,6 +622,7 @@ pub enum RosaPredictorUndo {
 }
 
 #[derive(Clone)]
+#[cfg(any(feature = "aixi", test))]
 #[cfg(feature = "backend-calibrated")]
 /// Internal checkpoint payload for [`RateBackendPredictor::Calibrated`].
 ///
@@ -632,6 +636,7 @@ pub struct CalibratedPredictorCheckpoint {
 }
 
 #[cfg(feature = "backend-ctw")]
+#[cfg(any(feature = "aixi", test))]
 fn restore_fac_ctw_checkpoint(
     tree: &mut FacContextTree,
     bits_per_symbol: usize,
@@ -693,6 +698,7 @@ impl RateBackendPredictor {
             })
     }
 
+    #[cfg(any(feature = "aixi", test))]
     pub(crate) fn checkpoint(&mut self) -> RateBackendPredictorCheckpoint {
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -751,6 +757,7 @@ impl RateBackendPredictor {
         }
     }
 
+    #[cfg(any(feature = "aixi", test))]
     pub(crate) fn restore_checkpoint(&mut self, checkpoint: &RateBackendPredictorCheckpoint) {
         match (self, checkpoint) {
             #[cfg(feature = "backend-rosa")]
@@ -851,6 +858,7 @@ impl RateBackendPredictor {
         }
     }
 
+    #[cfg(any(feature = "aixi", test))]
     pub(crate) fn clear_checkpoints_if_supported(&mut self) {
         match self {
             #[cfg(feature = "backend-rosa")]

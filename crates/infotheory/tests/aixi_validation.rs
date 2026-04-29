@@ -5,7 +5,7 @@
 //! Tests for predictors, environments, and agents.
 
 use infotheory::aixi::agent::{Agent, AgentConfig, AgentError};
-use infotheory::aixi::common::{Action, DEFAULT_RANDOM_SEED, ObservationKeyMode};
+use infotheory::aixi::common::{Action, ActionAlphabet, DEFAULT_RANDOM_SEED, ObservationKeyMode};
 use infotheory::aixi::environment::Environment;
 mod support;
 use infotheory::aixi::model::{
@@ -319,7 +319,8 @@ fn generic_agent_config(rate_backend: RateBackend) -> AgentConfig {
     cfg.observation_stream_len = 1;
     cfg.observation_key_mode = ObservationKeyMode::FullStream;
     cfg.reward_bits = 1;
-    cfg.agent_actions = 2;
+    cfg.agent_actions =
+        ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid");
     cfg.num_simulations = 60;
     cfg.exploration_exploitation_ratio = 1.4;
     cfg.discount_gamma = 1.0;
@@ -386,7 +387,8 @@ fn agent_solves_ctw_test_environment() {
     config.observation_stream_len = 1;
     config.observation_key_mode = infotheory::aixi::common::ObservationKeyMode::FullStream;
     config.reward_bits = 1;
-    config.agent_actions = 2;
+    config.agent_actions =
+        ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid");
     config.num_simulations = 200;
     config.exploration_exploitation_ratio = 2.0;
     config.discount_gamma = 1.0;
@@ -426,7 +428,8 @@ fn agent_regret_sublinear_coinflip() {
     config.observation_stream_len = 1;
     config.observation_key_mode = infotheory::aixi::common::ObservationKeyMode::FullStream;
     config.reward_bits = 1;
-    config.agent_actions = 2;
+    config.agent_actions =
+        ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid");
     config.num_simulations = 100;
     config.exploration_exploitation_ratio = 1.0;
     config.discount_gamma = 1.0;
@@ -466,7 +469,8 @@ fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
     config.observation_stream_len = 1;
     config.observation_key_mode = infotheory::aixi::common::ObservationKeyMode::FullStream;
     config.reward_bits = 1;
-    config.agent_actions = 2;
+    config.agent_actions =
+        ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid");
     config.num_simulations = 80;
     config.exploration_exploitation_ratio = 1.4;
     config.discount_gamma = 1.0;

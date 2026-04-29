@@ -187,6 +187,7 @@ pub(crate) fn bits_for_cardinality(cardinality: usize) -> usize {
     bits.max(1)
 }
 
+#[cfg(feature = "aixi")]
 pub(crate) fn action_alphabet_from_action_bits(action_bits: usize) -> ActionAlphabet {
     let shift = u32::try_from(action_bits).expect("action bit width must fit within u32");
     let cardinality = 1usize

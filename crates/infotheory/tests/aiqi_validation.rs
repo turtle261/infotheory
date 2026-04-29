@@ -3,7 +3,7 @@
 //! AIQI validation tests.
 
 use infotheory::aixi::aiqi::{AiqiAgent, AiqiConfig, AiqiError};
-use infotheory::aixi::common::DEFAULT_RANDOM_SEED;
+use infotheory::aixi::common::{ActionAlphabet, DEFAULT_RANDOM_SEED};
 use infotheory::aixi::environment::Environment;
 mod support;
 use infotheory::aixi::model::{
@@ -19,7 +19,8 @@ fn base_config() -> AiqiConfig {
     cfg.observation_bits = 1;
     cfg.observation_stream_len = 1;
     cfg.reward_bits = 1;
-    cfg.agent_actions = 2;
+    cfg.agent_actions =
+        ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid");
     cfg.min_reward = 0;
     cfg.max_reward = 1;
     cfg.reward_offset = 0;

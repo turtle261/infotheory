@@ -11,6 +11,7 @@ use crate::backends::ctw::{ContextTree, FacContextTree};
 use crate::backends::rosaplus::{RosaPlus, RosaTx};
 #[cfg(feature = "backend-zpaq")]
 use crate::backends::zpaq_rate::ZpaqRateModel;
+#[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
 use crate::error::{InfotheoryError, InfotheoryResult};
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip::{Compressor as MambaCompressor, Model as MambaModel, State as MambaState};

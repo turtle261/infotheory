@@ -160,7 +160,7 @@ cmd_lean_test() {
 cmd_test_full() {
   cmd_check_nyx_lite_standalone
   cmd_init_vm
-  cmd_code_test
+  BUILD_CLI=1 cmd_code_test
   cmd_lean_test
 }
 

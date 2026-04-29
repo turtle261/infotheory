@@ -1886,6 +1886,7 @@ impl RosaPlus {
         self.sam.last
     }
 
+    #[cfg(any(feature = "aixi", test))]
     /// Restore a previously recorded predictive cursor state.
     pub(crate) fn restore_conditioning_cursor(&mut self, cursor: i32) {
         self.sam.last = cursor;
