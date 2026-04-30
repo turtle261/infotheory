@@ -1559,6 +1559,22 @@ mod non_vm_tests {
         serde_json::from_str(line).expect("output should be valid json")
     }
 
+    fn has_default_rate_backend() -> bool {
+        RateBackend::try_default().is_ok()
+    }
+
+    fn assert_backend_unavailable_error(output: &Value) {
+        let err = output["error"]
+            .as_str()
+            .expect("output should contain an error string");
+        assert!(
+            err.contains("no default rate backend is available in this build")
+                || err.contains("requires infotheory feature 'backend-zpaq'")
+                || err.contains("CompressionBackend::Zpaq is unavailable"),
+            "unexpected backend-availability error: {output}"
+        );
+    }
+
     #[test]
     fn hex_helpers_roundtrip_and_reject_invalid_inputs() {
         let parsed = parse_hex_bytes("00 ff_10\n7A").expect("hex string should parse");
@@ -1604,18 +1620,30 @@ mod non_vm_tests {
 
     #[test]
     fn process_json_line_handles_metrics_batch_and_spam_semantics() {
+        let has_rate_backend = has_default_rate_backend();
         let metrics = parse_json_output(&process_json_line(
             r#"{ "op": "metrics", "text": "banana bandana" }"#,
         ));
-        assert_eq!(metrics["len"], 14);
-        assert!(metrics["h0"].as_f64().expect("h0") >= 0.0);
-        assert!(metrics["h_rate"].as_f64().expect("h_rate") >= 0.0);
+        if has_rate_backend {
+            assert_eq!(metrics["len"], 14);
+            assert!(metrics["h0"].as_f64().expect("h0") >= 0.0);
+            assert!(metrics["h_rate"].as_f64().expect("h_rate") >= 0.0);
+        } else {
+            assert_backend_unavailable_error(&metrics);
+        }
 
         let batch = parse_json_output(&process_json_line(
             r#"{ "op": "batch_metrics", "texts": ["abcabcabc", ""] }"#,
         ));
         let results = batch["results"].as_array().expect("batch results");
         assert_eq!(results.len(), 2);
+        if has_rate_backend {
+            assert_eq!(results[0]["len"], 9);
+            assert!(results[0]["h_rate"].as_f64().expect("h_rate") >= 0.0);
+        } else {
+            assert_backend_unavailable_error(&results[0]);
+            assert_eq!(results[0]["len"], 9);
+        }
         assert_eq!(results[1]["len"], 0);
         assert_eq!(results[1]["h_rate"], 0);
 
@@ -1629,12 +1657,17 @@ mod non_vm_tests {
         let pass = parse_json_output(&process_json_line(
             r#"{ "op": "spam_check", "text": "bananas foster waffle cartography", "min_len": 8, "h0_min": 0.0, "h_rate_min": 0.0, "id_max": 1.0 }"#,
         ));
-        assert_eq!(pass["pass"], true);
-        assert_eq!(pass["len"], 33);
+        if has_rate_backend {
+            assert_eq!(pass["pass"], true);
+            assert_eq!(pass["len"], 33);
+        } else {
+            assert_backend_unavailable_error(&pass);
+        }
     }
 
     #[test]
     fn process_json_line_emits_structured_matrix_and_file_results() {
+        let has_rate_backend = has_default_rate_backend();
         let file_path = unique_temp_path("metrics-file", "txt");
         fs::write(&file_path, b"structured metrics fixture").expect("write metrics file");
 
@@ -1642,53 +1675,78 @@ mod non_vm_tests {
             r#"{{ "op": "metrics_file", "path": "{}" }}"#,
             file_path.display()
         )));
-        assert_eq!(metrics_file["len"], 26);
-        assert!(metrics_file["id"].as_f64().expect("id") >= 0.0);
+        if has_rate_backend {
+            assert_eq!(metrics_file["len"], 26);
+            assert!(metrics_file["id"].as_f64().expect("id") >= 0.0);
+        } else {
+            assert_backend_unavailable_error(&metrics_file);
+        }
 
         let ncd_matrix = parse_json_output(&process_json_line(
             r#"{ "op": "ncd_matrix", "texts": ["aaaa", "aaab"] }"#,
         ));
-        assert_eq!(ncd_matrix["n"], 2);
-        let matrix = ncd_matrix["matrix"].as_array().expect("matrix rows");
-        assert_eq!(matrix.len(), 2);
-        assert_eq!(matrix[0][0], 0.0);
-        assert_eq!(matrix[1][1], 0.0);
+        if has_rate_backend {
+            assert_eq!(ncd_matrix["n"], 2);
+            let matrix = ncd_matrix["matrix"].as_array().expect("matrix rows");
+            assert_eq!(matrix.len(), 2);
+            assert_eq!(matrix[0][0], 0.0);
+            assert_eq!(matrix[1][1], 0.0);
+        } else {
+            assert_backend_unavailable_error(&ncd_matrix);
+        }
 
         let rosa_matrix = parse_json_output(&process_json_line(
             r#"{ "op": "rosa_matrix", "texts": ["alpha alpha", "alpha beta"] }"#,
         ));
-        assert_eq!(rosa_matrix["n"], 2);
-        let rosa_rows = rosa_matrix["matrix"].as_array().expect("rosa matrix rows");
-        assert_eq!(rosa_rows.len(), 2);
-        assert_eq!(rosa_rows[0][0], 0.0);
-        assert_eq!(rosa_rows[1][1], 0.0);
+        if has_rate_backend {
+            assert_eq!(rosa_matrix["n"], 2);
+            let rosa_rows = rosa_matrix["matrix"].as_array().expect("rosa matrix rows");
+            assert_eq!(rosa_rows.len(), 2);
+            assert_eq!(rosa_rows[0][0], 0.0);
+            assert_eq!(rosa_rows[1][1], 0.0);
+        } else {
+            assert_backend_unavailable_error(&rosa_matrix);
+        }
 
         let _ = fs::remove_file(file_path);
     }
 
     #[test]
     fn process_json_line_covers_pairwise_ops_and_contract_errors() {
+        let has_rate_backend = has_default_rate_backend();
         let ncd = parse_json_output(&process_json_line(
             r#"{ "op": "ncd", "text1": "abracadabra", "text2": "alakazam", "method": "5", "variant": "sym_cons" }"#,
         ));
-        assert!(ncd["ncd"].as_f64().expect("ncd value").is_finite());
+        if has_rate_backend {
+            assert!(ncd["ncd"].as_f64().expect("ncd value").is_finite());
+        } else {
+            assert_backend_unavailable_error(&ncd);
+        }
 
         let cross = parse_json_output(&process_json_line(
             r#"{ "op": "cross_entropy", "text_x": "abracadabra", "text_y": "alakazam" }"#,
         ));
-        assert!(
-            cross["cross_entropy"]
-                .as_f64()
-                .expect("cross entropy value")
-                .is_finite()
-        );
+        if has_rate_backend {
+            assert!(
+                cross["cross_entropy"]
+                    .as_f64()
+                    .expect("cross entropy value")
+                    .is_finite()
+            );
+        } else {
+            assert_backend_unavailable_error(&cross);
+        }
 
         let rosa = parse_json_output(&process_json_line(
             r#"{ "op": "rosa_dist", "text1": "alpha alpha alpha", "text2": "alpha beta alpha" }"#,
         ));
-        let rosa_dist = rosa["rosa_dist"].as_f64().expect("rosa distance value");
-        assert!(rosa_dist.is_finite());
-        assert!((0.0..=1.0).contains(&rosa_dist));
+        if has_rate_backend {
+            let rosa_dist = rosa["rosa_dist"].as_f64().expect("rosa distance value");
+            assert!(rosa_dist.is_finite());
+            assert!((0.0..=1.0).contains(&rosa_dist));
+        } else {
+            assert_backend_unavailable_error(&rosa);
+        }
 
         let left_path = unique_temp_path("ncd-left", "txt");
         let right_path = unique_temp_path("ncd-right", "txt");
@@ -1700,12 +1758,16 @@ mod non_vm_tests {
             left_path.display(),
             right_path.display()
         )));
-        assert!(
-            ncd_files["ncd"]
-                .as_f64()
-                .expect("ncd file value")
-                .is_finite()
-        );
+        if has_rate_backend {
+            assert!(
+                ncd_files["ncd"]
+                    .as_f64()
+                    .expect("ncd file value")
+                    .is_finite()
+            );
+        } else {
+            assert_backend_unavailable_error(&ncd_files);
+        }
 
         let empty_ncd = parse_json_output(&process_json_line(
             r#"{ "op": "ncd", "text1": "", "text2": "non-empty" }"#,
@@ -1742,6 +1804,7 @@ mod non_vm_tests {
 
     #[test]
     fn process_json_line_spam_check_reasons_cover_entropy_guards() {
+        let has_rate_backend = has_default_rate_backend();
         let low_entropy = parse_json_output(&process_json_line(
             r#"{ "op": "spam_check", "text": "aaaaaaaaaaaa", "min_len": 4, "h0_min": 3.0, "h_rate_min": 0.0, "id_max": 1.0 }"#,
         ));
@@ -1751,14 +1814,22 @@ mod non_vm_tests {
         let low_entropy_rate = parse_json_output(&process_json_line(
             r#"{ "op": "spam_check", "text": "abcdefghijklmno", "min_len": 4, "h0_min": 0.0, "h_rate_min": 1000.0, "id_max": 1.0 }"#,
         ));
-        assert_eq!(low_entropy_rate["pass"], false);
-        assert_eq!(low_entropy_rate["reason"], "low_entropy_rate");
+        if has_rate_backend {
+            assert_eq!(low_entropy_rate["pass"], false);
+            assert_eq!(low_entropy_rate["reason"], "low_entropy_rate");
+        } else {
+            assert_backend_unavailable_error(&low_entropy_rate);
+        }
 
         let high_redundancy = parse_json_output(&process_json_line(
             r#"{ "op": "spam_check", "text": "abababababababab", "min_len": 4, "h0_min": 0.0, "h_rate_min": 0.0, "id_max": -1.0 }"#,
         ));
-        assert_eq!(high_redundancy["pass"], false);
-        assert_eq!(high_redundancy["reason"], "high_redundancy");
+        if has_rate_backend {
+            assert_eq!(high_redundancy["pass"], false);
+            assert_eq!(high_redundancy["reason"], "high_redundancy");
+        } else {
+            assert_backend_unavailable_error(&high_redundancy);
+        }
     }
 }
 
