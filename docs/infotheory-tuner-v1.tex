@@ -30,19 +30,26 @@
 
 \section{Purpose and Scope}\label{sec:purpose-scope}
 
-This document specifies a constrained predictive/compression tuning capability for a fixed dataset.
+This document specifies a constrained predictive/compression tuning capability
+for a fixed dataset. The dataset may be either a passive-byte string or a
+canonical causal prediction dataset whose context and target channels are typed
+and evaluator-normalized.
 The specification is intended to be:
 \begin{itemize}
     \item mathematically precise,
     \item directly implementable in \texttt{infotheory},
     \item optimizer-agnostic at the interface layer,
+    \item semantically unified across passive compression and active
+    environment-model tuning by one causal-conditional evaluator,
     \item runtime-selectable between annealed hill climbing,
     MC-AIXI(FAC-CTW), discounted AIQI, and a distinct exact
     warm-start controller, and
     \item mathematically explicit about objective alignment in each controller path.
 \end{itemize}
 
-This capability is \emph{not} an unconstrained architecture search engine nor a replacement for normal compression execution; it is a bounded optimization wrapper over the same compression semantics.
+This capability is \emph{not} an unconstrained architecture search engine or a
+replacement for normal compression execution. It is a bounded optimization
+wrapper over the same compression semantics.
 
 \section{Formal Problem Statement}\label{sec:formal-problem}
 
@@ -50,14 +57,20 @@ This capability is \emph{not} an unconstrained architecture search engine nor a 
 
 Let:
 \begin{itemize}
-    \item $x \in \{0,\dots,255\}^{n}$ denote the dataset bytes loaded from \texttt{input\_path},
+    \item $d$ denote the canonical dataset object loaded from
+    \texttt{input\_path},
+    \item $x \in \{0,\dots,255\}^{n}$ denote the passive-byte specialization
+    of $d$ when \texttt{dataset\_kind} selects the passive-bytes mode,
+    \item $N_H(d)\in\mathbb{R}_{>0}$ denote the profile-fixed dataset-size
+    functional used for throughput normalization,
     \item $\mathcal{Z}$ denote the full configuration space,
     \item $B$ denote the user-provided bounds specification,
     \item $H$ denote the fixed deployability profile (hardware/evaluator methodology and resource accounting),
     \item $z_0 \in \mathcal{Z}$ denote the validated baseline configuration,
     \item $T_{\mathrm{eval}} > 0$ denote the hard per-candidate wall-clock limit,
     \item $T_{\mathrm{total}} > 0$ denotes the hard total tuning wall-clock budget,
-    \item $\theta_{\min}>0$ denote the required minimum throughput (bytes/s),
+    \item $\theta_{\min}>0$ denote the required minimum throughput floor in
+    dataset-size units per second,
     \item $\mu_{\max}>0$ denote the required memory cap (bytes).
 \end{itemize}
 
@@ -68,13 +81,18 @@ Define the bounded-valid candidate set:
 
 For each candidate $z$, evaluation returns
 \[
-M(z) = (\mathrm{status}(z), c(z), \ell(z), \tau(z), \mu(z), \operatorname{diag}(z)),
+M(z) = (\mathrm{status}(z), c_{\mathrm{phys}}(z), \ell(z), \tau(z), \mu(z), \operatorname{diag}(z)),
 \]
 where
 \begin{itemize}
     \item $\mathrm{status}(z) \in \{\mathrm{success},\mathrm{timeout},\mathrm{invalid},\mathrm{error}\}$,
-    \item $c(z) \in \mathbb{N}$ is compressed size in bytes (defined on success),
-    \item $\ell(z) \in \mathbb{R}_{\ge 0}$ is cumulative negative log-loss (diagnostic),
+    \item $c_{\mathrm{phys}}(z)\in\mathbb{N}_0\sqcup\{\bot_c\}$ is the
+    physical compressed size in bytes of a material encoded artifact when such
+    an artifact exists under the selected evaluator path, with distinguished
+    sentinel $\bot_c$ meaning ``not materialized/undefined'',
+    \item $\ell(z) \in \mathbb{R}_{\ge 0}$ is cumulative negative log-loss in
+    bits on the charged target stream under the same conditioning semantics;
+    this is the normative target-loss quantity for optimization,
     \item $\tau(z) \in \mathbb{R}_{\ge 0}$ is elapsed wall-clock time,
     \item $\mu(z) \in \mathbb{R}_{\ge 0}$ is measured peak memory usage,
     \item $\operatorname{diag}(z)$ is optional diagnostics (including invalid-reason tags).
@@ -104,13 +122,13 @@ For successful candidates, define throughput
 \[
 \theta(z):=
 \begin{cases}
-\dfrac{n}{\tau(z)}, & \mathrm{status}(z)=\mathrm{success},\ \tau(z)>0,\\[4pt]
+\dfrac{N_H(d)}{\tau(z)}, & \mathrm{status}(z)=\mathrm{success},\ \tau(z)>0,\\[4pt]
 +\infty, & \mathrm{status}(z)=\mathrm{success},\ \tau(z)=0.
 \end{cases}
 \]
 Define the equivalent throughput runtime cap
 \[
-\tau_{\theta}:=\frac{n}{\theta_{\min}}.
+\tau_{\theta}:=\frac{N_H(d)}{\theta_{\min}}.
 \]
 Then, for successful candidates,
 \[
@@ -119,16 +137,19 @@ Then, for successful candidates,
 \tau(z)\le\tau_{\theta}.
 \]
 
+\begin{remark}[Passive opening and causal generalization]
+The opening problem statement writes the operational objective first for the
+passive-byte specialization, where $d=x$ and $N_H(d)=n$, so throughput is
+measured in bytes/s. Section~\ref{sec:causal-evaluator} gives the strictly more
+general causal-conditional evaluator, under which passive-byte tuning is
+recovered as the singleton-action, target-only special case.
+\end{remark}
+
 \subsection{Primary Objective}
 
 Define model-code length by canonical bytes
 \[
 L_B(z):=\big|\operatorname{ser}(\operatorname{canon}(z))\big|.
-\]
-
-For successful candidates, define dataset code length
-\[
-C_x(z):=c(z).
 \]
 
 Define the deployable set
@@ -137,33 +158,36 @@ Define the deployable set
 \left\{z\in\mathcal{F}(B,H):\ \mathrm{status}(z)=\mathrm{success}\ \land\ \theta(z)\ge\theta_{\min}\ \land\ \mu(z)\le\mu_{\max}\right\}.
 \]
 
-The normative objective is the totalized deployable two-part MDL criterion
+The normative objective is the totalized deployable two-part MDL criterion in
+bits
 \[
-\mathcal{J}_H(z;x)=
+\mathcal{J}_H(z;d)=
 \begin{cases}
-L_B(z)+C_x(z), & z\in\mathcal{F}^{\mathrm{dep}}(B,H),\\[3pt]
+8L_B(z)+\ell(z), & z\in\mathcal{F}^{\mathrm{dep}}(B,H),\\[3pt]
 +\infty, & \text{otherwise.}
 \end{cases}
 \]
 
 The primary optimization problem is
 \[
-\min_{z\in\mathcal{F}(B,H)}\mathcal{J}_H(z;x).
+\min_{z\in\mathcal{F}(B,H)}\mathcal{J}_H(z;d).
 \]
 
-\begin{remark}[Operational length units and reporting]
-Operational length quantities in this specification are stored and reported in
-bytes: $c(z)$, $L_B(z)$, $C_x(z)$, and $\mathcal{J}_H(z;x)$.
-Bit-normalized quantities are introduced only in
-Section~\ref{sec:restricted-mixture} for semantic/theoretical statements via
-the conversion $\text{bits}=8\times\text{bytes}$.
+\begin{remark}[Operational units and reporting]
+The optimizer uses the bit-valued objective $\mathcal{J}_H(z;d)=8L_B(z)+\ell(z)$.
+Model-code length $L_B(z)$ is still reported in bytes. Physical compressed
+bytes $c_{\mathrm{phys}}(z)$ are reporting-only and may be absent
+($\bot_c$) for evaluators that compute target log-loss without materializing a
+byte artifact. In passive exact-encoding paths, one may additionally report the
+finite-coder relation $8c_{\mathrm{phys}}(z)=\ell(z)+\varepsilon_{\mathrm{code}}(z)$,
+but this identity is not normative for general causal datasets.
 \end{remark}
 
 \subsection{Deterministic Incumbent Key and Output Semantics}
 
 For each evaluated candidate $z$, define the deterministic key
 \[
-K(z):=\big(\mathcal{J}_H(z;x),\operatorname{ser}(\operatorname{canon}(z))\big),
+K(z):=\big(\mathcal{J}_H(z;d),\operatorname{ser}(\operatorname{canon}(z))\big),
 \]
 ordered lexicographically, where $\operatorname{canon}:\mathcal{Z}\to\mathcal{Z}$
 and $\operatorname{ser}:\mathcal{Z}\to\{0,\dots,255\}^*$ are defined in
@@ -204,6 +228,8 @@ primary, and deterministic canonical bytes are a tie-break only.
 
 \begin{itemize}
     \item \texttt{input\_path: Path}
+    \item \texttt{dataset\_kind: DatasetKind}
+    \item \texttt{objective\_target: ObjectiveTarget}
     \item \texttt{baseline\_config\_path: Path}
     \item \texttt{algorithm: ControllerKind}
     \item \texttt{bounds: BoundsSpec}
@@ -220,10 +246,62 @@ Define the throughput floor parameter by
 \theta_{\min}:=\texttt{min\_throughput\_bytes\_per\_second}\in\mathbb{R}_{>0}.
 \]
 
+\begin{remark}[Legacy passive-byte field name]
+The input field name \texttt{min\_throughput\_bytes\_}\allowbreak\texttt{per\_second} uses legacy
+passive-byte terminology. Semantically, $\theta_{\min}$ is measured in the same
+dataset-size units per second as $N_H(d)$; in passive-byte mode, $N_H(d)=n$
+and the units are bytes/s.
+\end{remark}
+
 Define the memory-cap parameter by
 \[
 \mu_{\max}:=\texttt{max\_memory\_bytes}\in\mathbb{R}_{>0}.
 \]
+
+Define dataset mode by
+\[
+\texttt{DatasetKind}\in
+\left\{
+\begin{aligned}
+&\texttt{"passive\_bytes"},\ \texttt{"interactive\_trace"},\\
+&\texttt{"causal\_prefix\_dataset"}
+\end{aligned}
+\right\}.
+\]
+
+Define evaluator target semantics by
+\[
+\texttt{ObjectiveTarget}\in
+\left\{
+\begin{aligned}
+&\texttt{"passive\_ac"},\\
+&\texttt{"interactive\_causal\_ac"},\\
+&\texttt{"planner\_}\allowbreak\texttt{deployable\_}\allowbreak\texttt{model"}
+\end{aligned}
+\right\}.
+\]
+
+Compatibility rules are normative:
+\begin{itemize}
+    \item if \texttt{dataset\_kind} selects the passive-bytes mode, then
+    \texttt{input\_path} loads a raw byte string, and the normative default
+    \texttt{objective\_target} is \texttt{"passive\_ac"},
+    \item if \texttt{dataset\_kind} selects the interactive-trace mode, then
+    \texttt{input\_path} loads a canonical typed causal trace, and
+    \texttt{objective\_target} must select either the interactive-causal-AC
+    mode or the planner-deployable-model mode,
+    \item if \texttt{dataset\_kind} selects the causal-prefix-dataset mode, then
+    \texttt{input\_path} loads a canonical finite causal prediction dataset
+    (equivalently, a prefix tree/DAG of prediction examples), and
+    \texttt{objective\_target} must select either the interactive-causal-AC
+    mode or the planner-deployable-model mode,
+    \item if \texttt{objective\_target} selects the
+    planner-deployable-model mode, it
+    preserves the same causal code-length objective as
+    \texttt{"interactive\_causal\_ac"}; it changes only deployability
+    constraints and diagnostics as specified in
+    Section~\ref{sec:causal-evaluator}.
+\end{itemize}
 
 Define runtime controller kind by
 \[
@@ -232,6 +310,18 @@ Define runtime controller kind by
 \begin{aligned}
 &\texttt{"annealed\_hill\_climbing"},\ \texttt{"mc\_aixi\_fac\_ctw"},\\
 &\texttt{"aiqi\_discounted"},\ \texttt{"aiqi\_warmstart\_exact\_jh"}
+\end{aligned}
+\right\}.
+\]
+
+Define planner reward mode by
+\[
+\texttt{PlannerRewardMode}\in
+\left\{
+\begin{aligned}
+&\texttt{"exact\_objective\_difference"},\\
+&\texttt{"normalized\_clipped\_improvement"},\\
+&\texttt{"quantized\_objective\_difference"}
 \end{aligned}
 \right\}.
 \]
@@ -255,25 +345,58 @@ Controller-specific required fields:
         \item \texttt{agent\_actions}
         \item \texttt{observation\_bits}
         \item \texttt{observation\_stream\_len}
+        \item \texttt{planner\_reward\_mode: PlannerRewardMode}
+        \item \texttt{planner\_simulations\_per\_step}\((\in\mathbb{N},\ge 1)\)
+    \end{itemize}
+    \item for all planner reward modes additionally:
+    \begin{itemize}
         \item \texttt{reward\_bits}
+    \end{itemize}
+    \item for reward mode
+    \texttt{exact\_objective\_difference} optionally, when using the
+    legacy affine integer exact-encoding shortcut:
+    \begin{itemize}
         \item \texttt{min\_reward}
         \item \texttt{max\_reward}
         \item \texttt{reward\_offset}
-        \item \texttt{planner\_simulations\_per\_step}\((\in\mathbb{N},\ge 1)\)
     \end{itemize}
     \item for \texttt{aiqi\_discounted} additionally:
     \begin{itemize}
+        \item \texttt{planner\_reward\_mode} must be
+        \texttt{"normalized\_clipped\_}\allowbreak\texttt{improvement"}
         \item \texttt{return\_horizon}\(\in\mathbb{N},\ge 1\)
         \item \texttt{return\_bins}\(\in\mathbb{N},\text{power of two}\)
         \item \texttt{discount\_factor}\(\in[0,1)\)
+        \item \texttt{reward\_bits} defines the finite immediate-reward symbol channel
+        used to encode normalized clipped one-step improvement rewards.
+        \item \texttt{min\_reward} and \texttt{max\_reward} define the
+        clipping interval, with \texttt{max\_reward > min\_reward}
     \end{itemize}
     \item for \texttt{aiqi\_warmstart\_exact\allowbreak\_jh} additionally:
     \begin{itemize}
+        \item \texttt{planner\_reward\_mode} must be one of the two
+        objective-difference modes defined above
         \item \texttt{return\_horizon}\(\in\mathbb{N},\ge 1\)
         \item \texttt{warmstart\_teacher\_dataset\_path: Path}
         (initial same-task teacher data)
         \item \texttt{label\_phase\_period}
         \((\in\mathbb{N},\ge\texttt{return\_horizon})\)
+    \end{itemize}
+    \item for \texttt{mc\_aixi\_fac\_ctw} additionally,
+    \texttt{planner\_reward\_mode} must be the exact
+    objective-difference mode defined above.
+    \item for
+    \texttt{objective\_target} selects the planner-deployable-model mode
+    additionally:
+    \begin{itemize}
+        \item \texttt{min\_predicts\_per\_second}\((\in\mathbb{R}_{>0})\)
+        \item \texttt{max\_model\_state\_bytes}\((\in\mathbb{N},>0)\)
+        \item \texttt{max\_clone\_nanoseconds}\((\in\mathbb{N},>0)\)
+        \item \texttt{max\_snapshot\_bytes}\((\in\mathbb{N},>0)\)
+        \item \texttt{max\_update\_nanoseconds}\((\in\mathbb{N},>0)\)
+        \item \texttt{max\_restore\_nanoseconds}\((\in\mathbb{N},>0)\)
+        \item \texttt{required\_sampling: bool}
+        \item \texttt{required\_log\_prob: bool}
     \end{itemize}
     \item for \texttt{"annealed\_hill\_climbing"}:
     \texttt{max\_mutation\_radius}.
@@ -364,10 +487,423 @@ outer-loop wall-clock budget and use deterministic equal-split round deadlines
 The warm-start exact-$\mathcal{J}_H$ controller then executes the bounded
 same-task trace-refresh wrapper of
 Section~\ref{sec:aiqi-warmstart-self-improve}; all rounds remain on the same
-$(B,H,x)$ task and are evaluated against the same deployable objective
+$(B,H,d)$ task and are evaluated against the same deployable objective
 $\mathcal{J}_H$.
 
 These controls affect runtime behavior and reproducibility, not the candidate search space.
+
+\section{Dataset modes and causal-conditional evaluator}
+\label{sec:causal-evaluator}
+
+This section gives the unified evaluator abstraction behind passive-byte
+compression and active environment-model tuning. It does not change the
+searched object: every candidate still denotes a predictor. What changes is the
+dataset lowering and, when requested, the deployability profile.
+
+\subsection{Unified chronological predictor object}
+
+Let $\mathcal{A}$ be a finite action alphabet and let $\mathcal{X}$ be a
+finite percept alphabet. In the interactive setting, a percept is a coded tuple
+\[
+x_t=(o_t,r_t,d_t)\in\mathcal{X},
+\]
+where $o_t$ is observation, $r_t$ is reward, and $d_t$ is the terminal flag.
+
+A candidate $z\in\mathcal{Z}$ denotes a chronological conditional predictor
+\[
+\rho_z(x_t\mid h_{<t},a_t),
+\qquad
+h_{<t}=(x_0,a_1,x_1,\dots,a_{t-1},x_{t-1}),
+\]
+or the equivalent history convention compiled into the evaluator and fixed by
+$H$.
+
+Define a finite causal prediction dataset
+\[
+D=\{(h_i,a_i,x_i,w_i)\}_{i=1}^N,
+\]
+where each $h_i$ is a finite action--percept history, $a_i\in\mathcal{A}$,
+$x_i\in\mathcal{X}$, and $w_i\in\mathbb{R}_{>0}$ is the example weight or
+multiplicity. Define the idealized causal code length in bits by
+\[
+C_D^{\mathrm{bit}}(z)
+:=
+\sum_{i=1}^{N}
+w_i\bigl[-\log_2 \rho_z(x_i\mid h_i,a_i)\bigr].
+\]
+The operational evaluator reports the corresponding target loss in bits
+$\ell_D(z)$ through the same six-field contract as
+Section~\ref{sec:formal-problem}; when a material encoded artifact exists, it
+may additionally report its physical byte size
+$c_{D,\mathrm{phys}}(z)=c_{\mathrm{phys}}(z)$. When the dataset is clear from
+context, we write $\ell(z)$ and $c_{\mathrm{phys}}(z)$.
+
+Define the dataset-relative deployable score by
+\[
+\mathcal{J}_H^{\mathrm{causal}}(z;D)
+:=
+\begin{cases}
+8L_B(z)+\ell_D(z), & z\in\mathcal{F}_{D}^{\mathrm{dep}}(B,H),\\[3pt]
++\infty, & \text{otherwise.}
+\end{cases}
+\]
+Here $\mathcal{F}_{D}^{\mathrm{dep}}(B,H)$ is the deployable set induced by the
+same status/time/memory interface as before, with the dataset-specific target
+stream and any profile-fixed throughput convention attached to $H$.
+
+\begin{proposition}[Passive and interactive tuning share one MDL schema]
+\label{prop:causal-mdl-unification}
+Let $D$ be a finite causal prediction dataset and let each candidate
+$z\in\mathcal{Z}$ denote a chronological conditional predictor $\rho_z$.
+Then the deployability-gated two-part score
+$\mathcal{J}_H^{\mathrm{causal}}(z;D)$ is the exact analogue of the ordinary
+passive compression tuner objective. If $\mathcal{A}=\{\bot\}$ and $D$ is the
+passive-byte sequence $x_{1:n}$ lowered as target-only byte events, then
+\[
+C_D^{\mathrm{bit}}(z)
+=
+-\sum_{t=1}^{n}\log_2\rho_z(x_t\mid x_{<t}),
+\]
+and $\mathcal{J}_H^{\mathrm{causal}}(z;D)$ reduces to
+$\mathcal{J}_H(z;d)$ from Section~\ref{sec:formal-problem}.
+\end{proposition}
+
+\begin{proof}
+In the singleton-action case, every $a_t$ is fixed to $\bot$, so the
+chronological predictor reduces to the ordinary sequential predictor
+$\rho_z(x_t\mid x_{<t})$. The target-only lowering therefore yields exactly the
+usual sequential log-loss/codelength on the passive-byte stream. Since the
+two-part score still adds the same model code length $L_B(z)$ and uses the same
+deployability gating, the passive objective is recovered without changing the
+searched object.
+\end{proof}
+
+\begin{proposition}[Expected causal log-loss is entropy plus causal KL]
+\label{prop:causal-kl}
+Fix a finite horizon $T$, a data-collection policy $\pi$, and a true
+environment law $\nu(\cdot\mid h,a)$ on the same action/percept alphabets.
+Adopt the conventions $A_0:=\bot$ and $H_{<0}:=\varnothing$ for the initial
+percept term.
+Then for every candidate predictor $\rho_z$,
+\[
+\mathbb{E}_{\pi,\nu}
+\left[
+\sum_{t=0}^{T}
+-\log_2 \rho_z(X_t\mid H_{<t},A_t)
+\right]
+=
+H_{\pi,\nu}^{(T)}(X\mid A)
++
+D_{\mathrm{KL}}^{\pi,T}(\nu\|\rho_z),
+\]
+where
+\[
+H_{\pi,\nu}^{(T)}(X\mid A)
+:=
+\mathbb{E}_{\pi,\nu}
+\left[
+\sum_{t=0}^{T}
+-\log_2 \nu(X_t\mid H_{<t},A_t)
+\right]
+\]
+and
+\[
+D_{\mathrm{KL}}^{\pi,T}(\nu\|\rho_z)
+:=
+\mathbb{E}_{\pi,\nu}
+\left[
+\sum_{t=0}^{T}
+\log_2
+\frac{\nu(X_t\mid H_{<t},A_t)}{\rho_z(X_t\mid H_{<t},A_t)}
+\right].
+\]
+Hence minimizing expected causal log-loss is equivalent to minimizing causal
+KL divergence on the history--action distribution induced by the data-collection
+policy.
+\end{proposition}
+
+\begin{proof}
+Add and subtract
+$\log_2 \nu(X_t\mid H_{<t},A_t)$ inside the summand and use linearity of
+expectation:
+\[
+-\log_2 \rho_z
+=
+-\log_2 \nu
++
+\log_2\frac{\nu}{\rho_z}.
+\]
+Summing over $t=0,\dots,T$ and taking expectation gives the stated entropy plus
+KL decomposition. The entropy term does not depend on $z$, so the optimizer is
+equivalently minimizing the causal KL term.
+\end{proof}
+
+\subsection{Typed causal event-stream evaluator}
+\label{subsec:typed-causal-eval}
+
+Let $\mathcal{C}_H$ be the finite set of channel identifiers compiled into the
+evaluator profile and let $\mathcal{Q}_H$ be the finite set of target-domain
+tags. A canonical causal evaluation stream is a finite sequence of events of
+the form
+\[
+\texttt{Context}(c,b),
+\qquad
+\texttt{ObserveTargetNoScore}(c,q,b),
+\qquad
+\texttt{Target}(c,q,b),
+\]
+with $c\in\mathcal{C}_H$, $q\in\mathcal{Q}_H$, and
+$b\in\{0,\dots,255\}^*$. Context events are conditioning side information;
+\texttt{ObserveTargetNoScore} events replay previously realized targets at zero
+coding cost; target events are the objects whose code length is charged.
+
+Well-formed causal streams are governed by the profile-fixed event grammar and
+target-domain support rules compiled into $H$. For each event prefix
+$e_{<t}=(e_1,\dots,e_{t-1})$, let
+\[
+\Gamma_H(e_{<t})
+\subseteq
+\bigl(\{\texttt{Context}\}\times\mathcal{C}_H\bigr)
+\cup
+\bigl(\{\texttt{ObserveTargetNoScore}\}\times\mathcal{C}_H\times\mathcal{Q}_H\bigr)
+\cup
+\bigl(\{\texttt{Target}\}\times\mathcal{C}_H\times\mathcal{Q}_H\bigr)
+\]
+denote the finite set of admissible next structural event descriptors. For each
+admissible replay-or-target descriptor
+$(\chi,c,q)\in\Gamma_H(e_{<t})$ with
+$\chi\in\{\texttt{ObserveTargetNoScore},\texttt{Target}\}$, let
+\[
+\Sigma_H(e_{<t},c,q)\subseteq\{0,\dots,255\}^*
+\]
+denote the corresponding admissible target-payload set. A target event
+or replay event with payload $b$ is well formed at prefix $e_{<t}$ iff its
+descriptor lies in $\Gamma_H(e_{<t})$ and
+$b\in\Sigma_H(e_{<t},c,q)$. Canonical lowerings are conforming only if every
+event satisfies these grammar and support constraints.
+
+Normative evaluator semantics are:
+\begin{itemize}
+    \item on \texttt{Context}$(c,b)$, the evaluator conditions the model state
+    on $(c,b)$ at zero coding cost,
+    \item on \texttt{ObserveTargetNoScore}$(c,q,b)$, the evaluator observes the
+    target payload $b$ under domain $q$ at zero coding cost so that future
+    conditionals may depend on it,
+    \item on \texttt{Target}$(c,q,b)$, the evaluator scores $b$ under the
+    predictor normalized over the admissible target domain $q$, adds that score
+    to the cumulative target codelength/log-loss, and then observes $b$ so that
+    future conditionals may depend on it,
+    \item encoder and decoder share the same structural event typing, channel
+    identifiers, codec specification, and reset convention via $H$.
+\end{itemize}
+
+Reference pseudocode:
+\begin{verbatim}
+function ScoreCausalStream(z, E):
+    reset scorer state
+    bits <- 0
+    for event in E:
+        if event = Context(channel, bytes):
+            condition(channel, bytes)          # zero bits
+        else if event = ObserveTargetNoScore(channel, domain, bytes):
+            observe_target(channel, domain, bytes)
+        else if event = Target(channel, domain, bytes):
+            bits <- bits + score_target(channel, domain, bytes)
+            observe_target(channel, domain, bytes)
+    return bits
+\end{verbatim}
+
+Equivalently, fix a well-formed event stream $E=(e_1,\dots,e_m)$. At any
+target step, the evaluator uses a target-domain conditional. Concretely, if
+$e_t=\texttt{Target}(c_t,q_t,b_t)$, then
+\[
+P_{z,H}(b_t\mid e_{<t};c_t,q_t),
+\qquad
+\sum_{b\in\Sigma_H(e_{<t},c_t,q_t)}
+P_{z,H}(b\mid e_{<t};c_t,q_t)=1.
+\]
+Context and \texttt{ObserveTargetNoScore} events contribute unit factor and
+zero code length. The induced
+event-stream likelihood is therefore
+\[
+\rho_{z,H}^{\mathrm{ev}}(E)
+:=
+\prod_{t:\,e_t=\texttt{Target}(c_t,q_t,b_t)}
+P_{z,H}(b_t\mid e_{<t};c_t,q_t),
+\]
+with exact target codelength
+\[
+C_E^{\mathrm{bit}}(z)=-\log_2 \rho_{z,H}^{\mathrm{ev}}(E).
+\]
+This is the likelihood object used later in the restricted-mixture statements.
+
+\begin{remark}[Target-domain normalization is normative]
+The probability at a target step must be normalized over the admissible symbol
+set for that target domain, not over impossible event categories. In
+particular, when the next charged object is a percept token or percept field,
+the evaluator must not waste probability mass on action markers, separators,
+reset tokens, or unrelated channel tags known impossible at that position.
+Typed target-domain normalization is therefore part of semantic correctness,
+not merely an implementation convenience.
+\end{remark}
+
+\begin{remark}[Canonical decode boundaries and variable-length targets]
+Every charged target payload must have a canonical decode boundary. If a target
+domain permits variable-length payloads, then either the length is charged as
+part of the target payload itself or the length is declared as structural side
+information in $H$. Allowing the decoder to recover payload length for free
+without one of these two mechanisms is non-conforming because it undercharges
+the target stream.
+\end{remark}
+
+\begin{remark}[Single-channel backend adapters]
+Existing single-channel byte-sequential backends, including
+\texttt{RateBackend}-style interfaces, are conforming only through an adapter
+that supplies zero-cost structural conditioning (for example, role/channel tags
+or equivalent side information) and charges bits only for target events.
+Simple concatenation of action bytes and percept bytes into one charged stream
+is non-conforming for environment-model evaluation because it incorrectly makes
+the model spend probability mass on the agent policy.
+In passive-ac mode, any structural tags used by such an adapter must be
+disabled or semantically inert with respect to predictor state so that passive
+compression remains identical to the ordinary untagged passive byte path unless
+an explicit tagged-passive profile is selected.
+\end{remark}
+
+\subsection{Normative dataset kinds and canonical lowerings}
+
+The evaluator accepts exactly one canonical dataset object, selected by
+\texttt{dataset\_kind}, and lowers it to a typed causal event stream.
+
+\paragraph{Passive bytes.}
+If \texttt{dataset\_kind} selects the passive-bytes mode, then
+\texttt{input\_path} loads a raw byte string
+$x=x_1\dots x_n\in\{0,\dots,255\}^{n}$. The canonical lowering is the target
+only stream
+\[
+\texttt{Target}(\texttt{passive\_byte},\texttt{byte},x_1),\dots,
+\texttt{Target}(\texttt{passive\_byte},\texttt{byte},x_n).
+\]
+This is exactly the ordinary passive compression path.
+
+\paragraph{Interactive trace.}
+If \texttt{dataset\_kind} selects the interactive-trace mode, then
+\texttt{input\_path} loads a canonical typed causal trace. Its file header must
+fix at least:
+\begin{itemize}
+    \item schema version,
+    \item environment identifier and environment-configuration hash,
+    \item codec hash and reset convention,
+    \item compiled action alphabet and percept schema,
+    \item reward and terminal encoding,
+    \item collection-policy provenance.
+\end{itemize}
+For an episode with initial percept $x_0$ and steps
+$a_1,x_1,\dots,a_T,x_T$, the canonical lowering is: score the initial percept
+fields as targets; then for each $t=1,\dots,T$, condition on the action and
+score the percept fields. If the percept codec factors observation, reward, and
+terminal as separate target channels, a step lowers conceptually to
+\[
+\texttt{Context}(\texttt{action},\operatorname{enc}(a_t)),
+\quad
+\texttt{Target}(\texttt{observation},q_o,\operatorname{enc}(o_t)),
+\]
+\[
+\texttt{Target}(\texttt{reward},q_r,\operatorname{enc}(r_t)),
+\quad
+\texttt{Target}(\texttt{terminal},q_d,\operatorname{enc}(d_t)).
+\]
+Packing these into one percept target is also conforming if the codec is fixed,
+canonical, and shared by encoder and decoder via $H$.
+
+\paragraph{Causal prefix dataset.}
+If \texttt{dataset\_kind} selects the causal-prefix mode, then
+\texttt{input\_path} loads a canonical finite causal prediction dataset.
+Equivalently, it loads a prefix tree/DAG of histories with weighted
+action--percept examples. Each example stores $(h_i,a_i,x_i,w_i)$ and is
+scored by first resetting evaluator state, then replaying $h_i$ using
+zero-cost structural conditioning and zero-cost percept observation,
+then conditioning on $a_i$, and finally charging only the target percept
+$x_i$ with multiplicative weight $w_i$. Multiple actions may therefore be
+scored from the same prefix without sibling-branch leakage. A linear trace is
+the special case with one realized successor per prefix.
+
+\begin{remark}[Replay primitive required for causal-prefix datasets]
+A conforming evaluator must provide an explicit zero-cost replay primitive for
+previous target observations, equivalently an event form such as
+\texttt{ObserveTargetNoScore}. Replaying prefix percepts by streaming them as
+charged targets is non-conforming, and replaying distinct prefix examples in a
+single unreset sequential stream is non-conforming because it leaks sibling
+branch information across examples.
+\end{remark}
+
+\begin{remark}[Normative dataset-size functional $N_H(d)$]
+The throughput denominator $N_H(d)$ is fixed by dataset kind and evaluator
+profile:
+\begin{itemize}
+    \item in passive-byte mode, $N_H(d)=|x|$,
+    \item in interactive-trace mode, $N_H(d)$ is the total target size of the
+    lowered charged target events only, excluding zero-cost context/action
+    events,
+    \item in causal-prefix mode,
+    $N_H(d)=\sum_i w_i\,\operatorname{target\_size}_H(x_i)$.
+\end{itemize}
+The target-size functional $\operatorname{target\_size}_H$ is part of $H$ and
+must be declared in provenance; permitted choices include encoded target bytes,
+target symbols, target fields, or weighted encoded bytes.
+\end{remark}
+
+\begin{remark}[Actions are side information, not charged targets]
+For interactive datasets, the correct environment-model codelength is the
+causal-conditional codelength of percept targets given actions and prior
+history. Actions are evaluator-known side information unless the specification
+explicitly chooses to model the policy itself. The environment-model objective
+therefore codes percepts conditioned on actions; it does not compress the raw
+action/percept concatenation as an undifferentiated byte stream.
+\end{remark}
+
+\subsection{Planner deployability profile and claim boundary}
+
+If \texttt{objective\_target} selects the planner-deployable-model mode, the
+primary score
+remains the same predictor-aligned two-part objective
+\[
+8L_B(z)+\ell_D(z).
+\]
+Realized planner return is a secondary diagnostic only; it is not part of the
+primary tuner objective.
+
+The planner-oriented profile $H_{\mathrm{planner}}$ may additionally constrain:
+\begin{itemize}
+    \item minimum prediction throughput,
+    \item maximum model-state bytes,
+    \item maximum clone latency,
+    \item maximum snapshot bytes,
+    \item maximum update latency,
+    \item maximum restore latency,
+    \item whether sampling support is required,
+    \item whether exact log-probability queries are required.
+\end{itemize}
+These constraints change feasibility and diagnostics, but not the objective
+being minimized.
+
+\begin{remark}[Coverage boundary for MC-AIXI world-model tuning]
+A single linear interactive trace measures on-policy predictive quality only on
+the conditioned histories and actions that actually occurred. This is exactly
+aligned with MC-AIXI world-model likelihood on those visited conditionals, but
+it is not automatically a guarantee of good counterfactual planning quality on
+actions absent or rare in the dataset. When the environment is cloneable or
+snapshotable, the stronger causal-prefix-dataset mode with branch-all-
+actions or other full-support collection is the preferred data source for
+planner-oriented tuning.
+\end{remark}
+
+\begin{remark}[Relation to later passive-byte semantics]
+The later sections on bounded search, caching, and planner controllers first
+instantiate the passive-byte specialization on the fixed dataset $x$. The
+present section extends those semantics to a unified causal dataset mode. It
+does not fork candidate meaning or replace the passive objective.
+\end{remark}
 
 \section{Bounds, Validity, and Canonicalization}
 
@@ -474,11 +1010,31 @@ reason \texttt{undeclared\_external\_asset}.
 
 Define canonical cache key
 \[
-\mathrm{Key}_{\mathrm{cache}}(z,\eta_{\mathrm{eval}},x):=
-\Big(\operatorname{ser}(\operatorname{canon}(z)),\eta_{\mathrm{eval}},\operatorname{Hash}(x)\Big),
+\mathrm{Key}_{\mathrm{cache}}(z,\eta_{\mathrm{eval}},d):=
+\Big(\operatorname{ser}(\operatorname{canon}(z)),\eta_{\mathrm{eval}},\operatorname{Hash}(d)\Big),
 \]
 where $\eta_{\mathrm{eval}}$ are evaluator-relevant execution controls and
-$\operatorname{Hash}(x)$ is dataset identity hash. All cache lookups and inserts use this key.
+$\operatorname{Hash}(d)$ is the canonical dataset identity hash for the object
+loaded from \texttt{input\_path}. In passive-byte mode, $d=x$. All cache
+lookups and inserts use this key.
+
+Normatively,
+$\eta_{\mathrm{eval}}$ must include every evaluator-side choice that can affect
+metrics or semantics, including at minimum:
+\begin{itemize}
+    \item \texttt{dataset\_kind} and \texttt{objective\_target},
+    \item dataset-lowering version and codec hash,
+    \item event-grammar and target-domain-support rules (or their hash
+    commitments),
+    \item the declared target-size functional underlying $N_H(d)$,
+    \item passive structural-tag policy and adapter semantics,
+    \item weighted-prefix replay semantics,
+    \item whether physical byte artifacts are materialized,
+    \item planner deployability profile switches,
+    \item build/features, evaluator determinism settings, and warmup policy.
+\end{itemize}
+Two evaluations that differ on any such item are semantically distinct and must
+not collide in cache.
 
 Reference pseudocode:
 \begin{verbatim}
@@ -487,9 +1043,9 @@ function CanonAndSerialize(z):
     b     <- ser(z_can)
     return (z_can, b)
 
-function CacheKey(z, eta_eval, x):
+function CacheKey(z, eta_eval, d):
     (_, b) <- CanonAndSerialize(z)
-    return (b, eta_eval, Hash(x))
+    return (b, eta_eval, Hash(d))
 \end{verbatim}
 
 The deployable objective is operational.
@@ -513,27 +1069,53 @@ candidate class:
 
 \subsection{Semantic deployable class and code-length prior}
 
-Operational and runtime lengths are byte-valued throughout this manuscript.
-Implementation reports record these lengths in bytes. For MDL/MAP and mixture
-statements in this semantic subsection, description lengths are expressed in
-bits. Define the bit-normalized quantities
+Fix a canonical dataset object $D$ admissible under $H$, let $\Lambda_H$
+denote the deterministic canonical lowering operator from
+Section~\ref{subsec:typed-causal-eval}, and write
+\[
+E_H(D):=\Lambda_H(D).
+\]
+Let $\sigma_H(D)$ denote the
+corresponding structural skeleton: the lowered event stream with target
+payloads deleted but with target positions, context events, channel
+identifiers, domain tags, codec specification, and reset convention retained.
+Let
+\[
+y_H(D)=(b_1,\dots,b_{N(D)})
+\]
+be the ordered sequence of target payloads extracted from $E_H(D)$. For every
+candidate $z$, write
+\[
+\rho_{z,H}(D):=\rho_{z,H}^{\sigma_H(D)}\bigl(y_H(D)\bigr)\in[0,1]
+\]
+for the skeleton-conditioned likelihood induced by the typed causal evaluator.
+In passive-byte mode this is exactly the ordinary sequential likelihood of the
+byte string under the candidate predictor.
+
+Write $\ell_D(z):=\ell(z)$ for the operational target loss in bits on the
+fixed dataset $D$, and write
+\[
+\mathcal{J}_H(z;D):=8L_B(z)+\ell_D(z)
+\]
+on the deployable semantic subclass.
+
+Operational optimization already uses bit units. Model-code length remains
+reported in bytes, while target loss is reported in bits. For MDL/MAP and
+mixture statements in this semantic subsection, define the auxiliary quantities
 \[
 L_B^{\mathrm{bit}}(z):=8L_B(z),
 \qquad
-C_x^{\mathrm{bit}}(z):=8C_x(z),
+C_D^{\mathrm{bit}}(z):=\ell_D(z),
 \qquad
-\mathcal{J}_H^{\mathrm{bit}}(z;x):=L_B^{\mathrm{bit}}(z)+C_x^{\mathrm{bit}}(z).
+\mathcal{J}_H^{\mathrm{bit}}(z;D):=\mathcal{J}_H(z;D).
 \]
-On this manuscript's byte-based operational convention,
-$\mathcal{J}_H^{\mathrm{bit}}(z;x)=8\,\mathcal{J}_H(z;x)$ on
-$\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$.
 
 \begin{remark}[Operational versus semantic normalization]
-The operational objective $\mathcal{J}_H$ is specified in byte units. The
-restricted-mixture and MDL/MAP statements use the bit-normalized objective
-$\mathcal{J}_H^{\mathrm{bit}}$. On $\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$,
-$\mathcal{J}_H^{\mathrm{bit}}(z;x)=8\,\mathcal{J}_H(z;x)$, so minimizers are
-identical.
+The operational objective $\mathcal{J}_H$ is already specified in bits. The
+notation $\mathcal{J}_H^{\mathrm{bit}}$ is retained in this subsection only to
+match the surrounding Solomonoff/MDL formulas; numerically,
+$\mathcal{J}_H^{\mathrm{bit}}(z;D)=\mathcal{J}_H(z;D)$ on
+$\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$.
 \end{remark}
 
 Let
@@ -543,8 +1125,8 @@ Let
 \left\{
 z\in\mathcal{F}^{\mathrm{dep}}(B,H):
 \begin{aligned}[t]
-&z \text{ induces a computable predictive semimeasure }\\
-&\rho_z:\{0,\dots,255\}^*\to[0,1]
+&z \text{ induces, for every $H$-admissible structural skeleton $\sigma$,}\\
+&\text{a computable predictive semimeasure } \rho_{z,H}^{\sigma}
 \end{aligned}
 \right\}.
 \]
@@ -584,28 +1166,47 @@ subclass.
 
 Define the \emph{unnormalized Solomonoff-style bounded mixture}
 \[
-\widetilde{\xi}_{B,H}(x)
+\widetilde{\xi}_{B,H}(D)
 :=
 \sum_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
-2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x).
+2^{-L_B^{\mathrm{bit}}(z)}\rho_{z,H}(D).
 \]
 
 Define the \emph{normalized restricted Bayesian mixture}
 \[
-\xi_{B,H}(x)
+\xi_{B,H}(D)
 :=
 \sum_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
-w_B(z)\rho_z(x),
+w_B(z)\rho_{z,H}(D),
 \qquad
 w_B(z):=\frac{2^{-L_B^{\mathrm{bit}}(z)}}{Z_B^{\rho,\mathrm{dep}}}.
 \]
 
+For each fixed $H$-admissible structural skeleton $\sigma$, define the
+corresponding skeleton-conditioned mixtures
+\[
+\widetilde{\xi}_{B,H}^{\sigma}(y)
+:=
+\sum_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
+2^{-L_B^{\mathrm{bit}}(z)}\rho_{z,H}^{\sigma}(y),
+\]
+\[
+\xi_{B,H}^{\sigma}(y)
+:=
+\sum_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
+w_B(z)\rho_{z,H}^{\sigma}(y).
+\]
+Thus
+$\widetilde{\xi}_{B,H}(D)=\widetilde{\xi}_{B,H}^{\sigma_H(D)}(y_H(D))$ and
+$\xi_{B,H}(D)=\xi_{B,H}^{\sigma_H(D)}(y_H(D))$.
+
 \begin{proposition}[Semimeasure and mixture properties]
 \label{prop:mixture-semimeasure}
-If each $\rho_z$ is a semimeasure, then:
+If each $\rho_{z,H}^{\sigma}$ is a semimeasure for every fixed
+$H$-admissible structural skeleton $\sigma$, then for every such $\sigma$:
 \begin{enumerate}
-    \item $\widetilde{\xi}_{B,H}$ is a semimeasure,
-    \item $\xi_{B,H}$ is a semimeasure,
+    \item $\widetilde{\xi}_{B,H}^{\sigma}$ is a semimeasure,
+    \item $\xi_{B,H}^{\sigma}$ is a semimeasure,
     \item $\{w_B(z)\}_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}$ is a proper
     probability distribution on the semantic deployable class.
 \end{enumerate}
@@ -631,7 +1232,7 @@ Bayesian mixtures or ensembles internally.
 
 Assume in this subsection the idealized exact-coding semantics
 \[
-C_x^{\mathrm{bit}}(z) = -\log_2 \rho_z(x)
+C_D^{\mathrm{bit}}(z) = -\log_2 \rho_{z,H}(D)
 \qquad
 \text{for each } z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)
 \]
@@ -643,65 +1244,65 @@ Hence all MDL/MAP statements below are interpreted in
 $\mathbb{R}_{\ge 0}\sqcup\{+\infty\}$.
 Equivalently, the deployable objective on the semantic deployable class is
 \[
-\mathcal{J}_H^{\mathrm{bit}}(z;x)=L_B^{\mathrm{bit}}(z)-\log_2 \rho_z(x).
+\mathcal{J}_H^{\mathrm{bit}}(z;D)=L_B^{\mathrm{bit}}(z)-\log_2 \rho_{z,H}(D).
 \]
 
 \begin{proposition}[Exact MDL/MAP equivalence]
 \label{prop:mdl-map}
-For fixed data $x$, minimizing $\mathcal{J}_H^{\mathrm{bit}}(z;x)$ over
+For fixed dataset $D$, minimizing $\mathcal{J}_H^{\mathrm{bit}}(z;D)$ over
 $z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$ is equivalent to maximizing
 \[
-2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x),
+2^{-L_B^{\mathrm{bit}}(z)}\rho_{z,H}(D),
 \]
 and equivalently to maximizing
 \[
-w_B(z)\rho_z(x).
+w_B(z)\rho_{z,H}(D).
 \]
 That is,
 \[
-\arg\min_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}\mathcal{J}_H^{\mathrm{bit}}(z;x)
+\arg\min_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}\mathcal{J}_H^{\mathrm{bit}}(z;D)
 =
 \arg\max_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
-2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)
+2^{-L_B^{\mathrm{bit}}(z)}\rho_{z,H}(D)
 =
 \arg\max_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
-w_B(z)\rho_z(x).
+w_B(z)\rho_{z,H}(D).
 \]
 \end{proposition}
 
 \begin{proof}
 For every $z$ in the semantic deployable class,
 \[
-\mathcal{J}_H^{\mathrm{bit}}(z;x)
+\mathcal{J}_H^{\mathrm{bit}}(z;D)
 =
-L_B^{\mathrm{bit}}(z)-\log_2\rho_z(x)
+L_B^{\mathrm{bit}}(z)-\log_2\rho_{z,H}(D)
 =
--\log_2\!\bigl(2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)\bigr).
+-\log_2\!\bigl(2^{-L_B^{\mathrm{bit}}(z)}\rho_{z,H}(D)\bigr).
 \]
 For each $z$, one has
-$2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)\in[0,1]$. With the convention
+$2^{-L_B^{\mathrm{bit}}(z)}\rho_{z,H}(D)\in[0,1]$. With the convention
 $-\log_2 0:=+\infty$, the map $y\mapsto -\log_2 y$ is strictly
 order-reversing on $[0,1]$. Hence minimizing
-$\mathcal{J}_H^{\mathrm{bit}}(z;x)$ is equivalent to maximizing
-$2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)$.
+$\mathcal{J}_H^{\mathrm{bit}}(z;D)$ is equivalent to maximizing
+$2^{-L_B^{\mathrm{bit}}(z)}\rho_{z,H}(D)$.
 Because $w_B(z)=2^{-L_B^{\mathrm{bit}}(z)}/Z_B^{\rho,\mathrm{dep}}$ and
 $Z_B^{\rho,\mathrm{dep}}$ is constant in $z$, the same argmax is obtained for
-$w_B(z)\rho_z(x)$.
+$w_B(z)\rho_{z,H}(D)$.
 \end{proof}
 
 \begin{proposition}[Dominant-term upper bound for bounded mixture codelength]
 \label{prop:dominant-term}
-For every byte string $x$,
+For every canonical dataset object $D$ admissible under $H$,
 \[
--\log_2 \widetilde{\xi}_{B,H}(x)
+-\log_2 \widetilde{\xi}_{B,H}(D)
 \le
-\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)} \mathcal{J}_H^{\mathrm{bit}}(z;x).
+\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)} \mathcal{J}_H^{\mathrm{bit}}(z;D).
 \]
 Consequently,
 \[
--\log_2 \xi_{B,H}(x)
+-\log_2 \xi_{B,H}(D)
 \le
-\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)} \mathcal{J}_H^{\mathrm{bit}}(z;x).
+\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)} \mathcal{J}_H^{\mathrm{bit}}(z;D).
 \]
 \end{proposition}
 
@@ -709,40 +1310,43 @@ Consequently,
 For every fixed
 $z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$,
 \[
-\widetilde{\xi}_{B,H}(x)
+\widetilde{\xi}_{B,H}(D)
 =
-\sum_{z'}2^{-L_B^{\mathrm{bit}}(z')}\rho_{z'}(x)
+\sum_{z'}2^{-L_B^{\mathrm{bit}}(z')}\rho_{z',H}(D)
 \ge
-2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)
+2^{-L_B^{\mathrm{bit}}(z)}\rho_{z,H}(D)
 =
-2^{-\mathcal{J}_H^{\mathrm{bit}}(z;x)}.
+2^{-\mathcal{J}_H^{\mathrm{bit}}(z;D)}.
 \]
 Applying $-\log_2$ yields
 \[
--\log_2 \widetilde{\xi}_{B,H}(x)\le \mathcal{J}_H^{\mathrm{bit}}(z;x).
+-\log_2 \widetilde{\xi}_{B,H}(D)\le \mathcal{J}_H^{\mathrm{bit}}(z;D).
 \]
 Taking the infimum over $z$ proves the first inequality.
 
 For the normalized mixture,
 \[
-\xi_{B,H}(x)=\frac{\widetilde{\xi}_{B,H}(x)}{Z_B^{\rho,\mathrm{dep}}},
+\xi_{B,H}(D)=\frac{\widetilde{\xi}_{B,H}(D)}{Z_B^{\rho,\mathrm{dep}}},
 \]
 hence
 \[
--\log_2 \xi_{B,H}(x)
+-\log_2 \xi_{B,H}(D)
 =
--\log_2 \widetilde{\xi}_{B,H}(x)+\log_2 Z_B^{\rho,\mathrm{dep}}
+-\log_2 \widetilde{\xi}_{B,H}(D)+\log_2 Z_B^{\rho,\mathrm{dep}}
 \le
--\log_2 \widetilde{\xi}_{B,H}(x),
+-\log_2 \widetilde{\xi}_{B,H}(D),
 \]
 because $Z_B^{\rho,\mathrm{dep}}\le 1$. Combine with the first inequality.
 \end{proof}
 
 \begin{remark}[Normalized-mixture strengthening]
-Because $\xi_{B,H}(x)=\widetilde{\xi}_{B,H}(x)/Z_B^{\rho,\mathrm{dep}}$ with
-$Z_B^{\rho,\mathrm{dep}}\le 1$, one has
-$\xi_{B,H}(x)\ge\widetilde{\xi}_{B,H}(x)$ and therefore
-$-\log_2\xi_{B,H}(x)\le-\log_2\widetilde{\xi}_{B,H}(x)$.
+Because
+\[
+\xi_{B,H}(D)=\widetilde{\xi}_{B,H}(D)/Z_B^{\rho,\mathrm{dep}}
+\ge\widetilde{\xi}_{B,H}(D)
+\]
+when $Z_B^{\rho,\mathrm{dep}}\le 1$, one has
+$-\log_2\xi_{B,H}(D)\le-\log_2\widetilde{\xi}_{B,H}(D)$.
 Thus the normalized mixture gives a bound at least as strong as the
 unnormalized one.
 \end{remark}
@@ -774,12 +1378,18 @@ denote the set of all programs $p$ such that:
 \begin{enumerate}
     \item $|p|\le K$,
     \item under the fixed profile $H$, program $p$ induces a computable
-    predictive semimeasure $\nu_p^H$,
+    predictive semimeasure $\nu_{p,H}^{\sigma}$ on every $H$-admissible
+    structural skeleton $\sigma$,
     \item the induced predictor is itself deployable under the same resource
     contract encoded by $H$ (including throughput and memory requirements),
     \item the program's universal-family execution remains within truncation
     limits $T_U$ and $M_U$.
 \end{enumerate}
+
+For the fixed dataset $D$, abbreviate
+\[
+\nu_p^H(D):=\nu_{p,H}^{\sigma_H(D)}\bigl(y_H(D)\bigr).
+\]
 
 \begin{assumption}[Constant-overhead embedding of the truncated universal family]
 \label{ass:universal-embed}
@@ -793,7 +1403,8 @@ p\mapsto z_p,
 \]
 such that for every $p\in\mathcal{P}_{K,T_U,M_U}^H$,
 \[
-\rho_{z_p}=\nu_p^H
+\rho_{z_p,H}^{\sigma}=\nu_{p,H}^{\sigma}
+\qquad\text{for every $H$-admissible structural skeleton } \sigma,
 \qquad\text{and}\qquad
 L_B^{\mathrm{bit}}(z_p)\le |p|+c_U.
 \]
@@ -801,21 +1412,22 @@ L_B^{\mathrm{bit}}(z_p)\le |p|+c_U.
 
 \begin{theorem}[Truncated-universal dominance]
 \label{thm:truncated-universal-dominance}
-Under Assumption~\ref{ass:universal-embed}, for every byte string $x$,
+Under Assumption~\ref{ass:universal-embed}, for every canonical dataset object
+$D$ admissible under $H$,
 \[
-\widetilde{\xi}_{B,H}(x)
+\widetilde{\xi}_{B,H}(D)
 \ge
 2^{-c_U}
 \sum_{p\in\mathcal{P}_{K,T_U,M_U}^H}
-2^{-|p|}\nu_p^H(x).
+2^{-|p|}\nu_p^H(D).
 \]
 Consequently,
 \[
-\xi_{B,H}(x)
+\xi_{B,H}(D)
 \ge
 2^{-c_U}
 \sum_{p\in\mathcal{P}_{K,T_U,M_U}^H}
-2^{-|p|}\nu_p^H(x).
+2^{-|p|}\nu_p^H(D).
 \]
 \end{theorem}
 
@@ -823,28 +1435,28 @@ Consequently,
 By definition of $\widetilde{\xi}_{B,H}$ and the inclusion
 $z_p=\iota(p)\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)$,
 \[
-\widetilde{\xi}_{B,H}(x)
+\widetilde{\xi}_{B,H}(D)
 =
 \sum_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}
-2^{-L_B^{\mathrm{bit}}(z)}\rho_z(x)
+2^{-L_B^{\mathrm{bit}}(z)}\rho_{z,H}(D)
 \ge
 \sum_{p\in\mathcal{P}_{K,T_U,M_U}^H}
-2^{-L_B^{\mathrm{bit}}(z_p)}\rho_{z_p}(x).
+2^{-L_B^{\mathrm{bit}}(z_p)}\rho_{z_p,H}(D).
 \]
 Using Assumption~\ref{ass:universal-embed},
 \[
-2^{-L_B^{\mathrm{bit}}(z_p)}\rho_{z_p}(x)
+2^{-L_B^{\mathrm{bit}}(z_p)}\rho_{z_p,H}(D)
 \ge
-2^{-(|p|+c_U)}\nu_p^H(x)
+2^{-(|p|+c_U)}\nu_p^H(D)
 =
-2^{-c_U}2^{-|p|}\nu_p^H(x).
+2^{-c_U}2^{-|p|}\nu_p^H(D).
 \]
 Summing over $p$ proves the first inequality.
 
 For the normalized mixture,
 \[
-\xi_{B,H}(x)=\widetilde{\xi}_{B,H}(x)/Z_B^{\rho,\mathrm{dep}}
-\ge \widetilde{\xi}_{B,H}(x),
+\xi_{B,H}(D)=\widetilde{\xi}_{B,H}(D)/Z_B^{\rho,\mathrm{dep}}
+\ge \widetilde{\xi}_{B,H}(D),
 \]
 because $Z_B^{\rho,\mathrm{dep}}\le 1$ by
 Proposition~\ref{prop:kraft-semantic}. Hence the same lower bound holds for
@@ -854,37 +1466,38 @@ $\xi_{B,H}$.
 \begin{corollary}[Truncated-universal deployable MDL baseline]
 \label{cor:truncated-universal-baseline}
 Under the exact-coding assumption of the previous subsection and
-Assumption~\ref{ass:universal-embed}, for every byte string $x$,
+Assumption~\ref{ass:universal-embed}, for every canonical dataset object $D$
+admissible under $H$,
 \[
-\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}\mathcal{J}_H^{\mathrm{bit}}(z;x)
+\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}\mathcal{J}_H^{\mathrm{bit}}(z;D)
 \le
 c_U
 +
 \inf_{p\in\mathcal{P}_{K,T_U,M_U}^H}
-\bigl(|p|-\log_2 \nu_p^H(x)\bigr).
+\bigl(|p|-\log_2 \nu_p^H(D)\bigr).
 \]
 \end{corollary}
 
 \begin{proof}
 For each $p\in\mathcal{P}_{K,T_U,M_U}^H$, let $z_p=\iota(p)$. Then
 \[
-\mathcal{J}_H^{\mathrm{bit}}(z_p;x)
+\mathcal{J}_H^{\mathrm{bit}}(z_p;D)
 =
-L_B^{\mathrm{bit}}(z_p)-\log_2\rho_{z_p}(x)
+L_B^{\mathrm{bit}}(z_p)-\log_2\rho_{z_p,H}(D)
 \le
-|p|+c_U-\log_2 \nu_p^H(x).
+|p|+c_U-\log_2 \nu_p^H(D).
 \]
 Taking the infimum over $p$ gives
 \[
-\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}\mathcal{J}_H^{\mathrm{bit}}(z;x)
+\inf_{z\in\mathcal{F}^{\rho,\mathrm{dep}}(B,H)}\mathcal{J}_H^{\mathrm{bit}}(z;D)
 \le
 \inf_{p\in\mathcal{P}_{K,T_U,M_U}^H}
-\mathcal{J}_H^{\mathrm{bit}}(z_p;x)
+\mathcal{J}_H^{\mathrm{bit}}(z_p;D)
 \le
 c_U
 +
 \inf_{p\in\mathcal{P}_{K,T_U,M_U}^H}
-\bigl(|p|-\log_2 \nu_p^H(x)\bigr).
+\bigl(|p|-\log_2 \nu_p^H(D)\bigr).
 \]
 \end{proof}
 
@@ -943,8 +1556,9 @@ After compiling $\mathcal{A}_B$ from $B$, initialization must verify
 On mismatch, initialization aborts with configuration error
 \texttt{action\_alphabet\_mismatch}.
 Each action index selects one compiled mutation template. The template decoder
-is state-aware so that grammar families such as incumbent-copy,
-reset-to-incumbent, and temperature-scaled local mutation remain representable.
+depends on state, so grammar families such as incumbent copying,
+reset-to-incumbent moves, and temperature-scaled local mutations remain
+representable.
 
 Let $\mathcal{S}_B$ denote the annealer proposal-state space (including
 proposal source, incumbent, elapsed time, and mutation RNG state), and let
@@ -1038,35 +1652,35 @@ At each loop iteration:
     status invalid with diagnostic reason \texttt{candidate\_invalid} without
     starting compression execution,
     \item else for cache lookup use
-    $\mathrm{Key}_{\mathrm{cache}}(\hat z',\eta_{\mathrm{eval}},x)$;
+    $\mathrm{Key}_{\mathrm{cache}}(\hat z',\eta_{\mathrm{eval}},d)$;
     on cache miss evaluate with per-candidate timeout
     \[
     T_t^{\mathrm{eval}}:=\min(T_{\mathrm{eval}},B_t),
     \]
     \item set $K_{\mathrm{pre}}:=K(z_{\mathrm{best}})$; if
-    $\mathcal{J}_H(\hat z';x)<+\infty$ and
+    $\mathcal{J}_H(\hat z';d)<+\infty$ and
     $K(\hat z')\prec_K K_{\mathrm{pre}}$, update
     $z_{\mathrm{best}}\leftarrow \hat z'$,
-    \item if $\mathcal{J}_H(\hat z';x)<+\infty$, accept as current via Metropolis criterion:
+    \item if $\mathcal{J}_H(\hat z';d)<+\infty$, accept as current via Metropolis criterion:
     \[
     P_{\mathrm{accept}}=
     \begin{cases}
-    1, & \mathcal{J}_H(\hat z';x)\le \mathcal{J}_H(z_{\mathrm{cur}};x),\\
-    \exp\!\left(-\dfrac{\mathcal{J}_H(\hat z';x)-\mathcal{J}_H(z_{\mathrm{cur}};x)}{T(u)}\right), & \mathcal{J}_H(\hat z';x)>\mathcal{J}_H(z_{\mathrm{cur}};x),
+    1, & \mathcal{J}_H(\hat z';d)\le \mathcal{J}_H(z_{\mathrm{cur}};d),\\
+    \exp\!\left(-\dfrac{\mathcal{J}_H(\hat z';d)-\mathcal{J}_H(z_{\mathrm{cur}};d)}{T(u)}\right), & \mathcal{J}_H(\hat z';d)>\mathcal{J}_H(z_{\mathrm{cur}};d),
     \end{cases}
     \]
-    and non-deployable candidates ($\mathcal{J}_H(\hat z';x)=+\infty$) are rejected,
+    and non-deployable candidates ($\mathcal{J}_H(\hat z';d)=+\infty$) are rejected,
     setting $z_{\mathrm{cur}}\leftarrow\hat z'$ on acceptance,
     \item update stagnation counter by
     \[
     n_{\mathrm{stag}}\leftarrow
     \begin{cases}
     0,
-    & \mathcal{J}_H(\hat z';x)<+\infty\ \land\ K(\hat z')\prec_K K_{\mathrm{pre}},\\
+    & \mathcal{J}_H(\hat z';d)<+\infty\ \land\ K(\hat z')\prec_K K_{\mathrm{pre}},\\
     n_{\mathrm{stag}}+1,
-    & \mathcal{J}_H(\hat z';x)<+\infty\ \land\ \neg\big(K(\hat z')\prec_K K_{\mathrm{pre}}\big),\\
+    & \mathcal{J}_H(\hat z';d)<+\infty\ \land\ \neg\big(K(\hat z')\prec_K K_{\mathrm{pre}}\big),\\
     n_{\mathrm{stag}},
-    & \mathcal{J}_H(\hat z';x)=+\infty,
+    & \mathcal{J}_H(\hat z';d)=+\infty,
     \end{cases}
     \]
     \item if $n_{\mathrm{stag}}\ge\kappa_{\mathrm{stag}}$, set
@@ -1097,17 +1711,165 @@ Output must include:
 
 \section{Reward and Observation (Future Environment Compatibility)}\label{sec:reward-observation}
 
-This section specifies the single normative planner-reward path.
+This section specifies the normative planner-reward modes.
 Candidate validity, evaluator semantics, objective-feasibility semantics
 (including throughput and memory deployability constraints), and output
 definition remain shared across controller choices.
 
-\subsection{Objective-aligned planner reward path}
+\subsection{Planner reward modes and encoded reward semantics}
+
+Planner controllers expose one of the following reward modes:
+\begin{itemize}
+    \item \texttt{exact\_objective\_difference}: exact incumbent-objective
+    decrease in the same bit-valued objective $\mathcal{J}_H$ used by the tuner,
+    encoded by a finite injective reward-symbol map;
+    \item \texttt{normalized\_clipped\_improvement}: normalized and clipped
+    incumbent-improvement reward used by the discounted AIQI controller;
+    \item \texttt{quantized\_objective\_difference}: declared deterministic
+    quantization of objective-difference reward for finite-alphabet controller
+    interfaces.
+\end{itemize}
+
+Let
+\[
+r_H^{\mathcal J}(s,a)
+:=
+\mathcal{J}_H(\pi_b(s);d)
+-
+\mathcal{J}_H(\pi_b(U_H(s,a));d)
+\]
+denote the underlying objective-improvement signal. Along reachable
+trajectories this quantity is nonnegative and finite.
+
+A planner-facing implementation must define a reward encoder
+\[
+\Omega_H:\mathbb{R}_{\ge 0}\to \mathcal{R}_B^{\mathrm{enc}}
+\]
+and a semantic reward decoder
+\[
+V_H:\mathcal{R}_B^{\mathrm{enc}}\to\mathbb{R}_{\ge 0}
+\]
+according to the selected reward mode.
+
+For \texttt{exact\_objective\_difference}, the implementation must fix a
+finite canonical scalar representation
+\[
+\mathbb{V}_H^{\mathcal J}\subset\mathbb{R}_{\ge 0}
+\]
+for objective values and objective differences. Examples include a fixed-width
+IEEE-754 representation with non-finite values forbidden, a fixed-point rational
+lattice, or another deterministic finite numeric code declared by $H$.
+
+Conformance requires that every deployable objective value emitted by the
+evaluator lies in this representation:
+\[
+\mathcal{J}_H(z;d)\in\mathbb{V}_H^{\mathcal J}
+\qquad
+\text{for every planner-exposed deployable candidate }z.
+\]
+The representation must also be closed under the objective-difference operation
+used by the planner on reachable incumbent transitions:
+\[
+\mathcal{J}_H(b;d)-\mathcal{J}_H(b';d)\in\mathbb{V}_H^{\mathcal J}
+\]
+whenever $b,b'$ are reachable incumbents and
+$\mathcal{J}_H(b';d)\le \mathcal{J}_H(b;d)$.
+
+The exact reward encoder is then a finite injective code for this scalar
+representation:
+\[
+\Omega_H:\mathbb{V}_H^{\mathcal J}\hookrightarrow
+\{0,\dots,2^{b_R}-1\},
+\]
+with semantic decoder
+\[
+V_H:\{0,\dots,2^{b_R}-1\}\to\mathbb{R}_{\ge 0}
+\]
+satisfying
+\[
+V_H(\Omega_H(r))=r
+\qquad
+\text{for every represented reachable reward }r.
+\]
+Initialization must abort with configuration error
+\texttt{reward\_encoding\_unsafe} if the declared representation is not finite,
+if $2^{b_R}$ is too small for the declared representation, or if the evaluator
+cannot guarantee that all exact-mode objective values and differences are
+represented exactly.
+
+The interval fields \texttt{min\_reward}, \texttt{max\_reward}, and
+\texttt{reward\_offset} are optional legacy conveniences for the special case
+where $\mathbb{V}_H^{\mathcal J}$ is an integer interval encoded by an affine
+integer map; they are not the general exact reward semantics.
+
+For \texttt{quantized\_objective\_difference}, the implementation must declare
+a deterministic quantizer
+\[
+Q_H^{\mathrm{quant}}:\mathbb{R}_{\ge 0}\to\{0,\dots,2^{b_R}-1\}
+\]
+and a corresponding representative-value decoder
+\[
+V_H^{\mathrm{quant}}:\{0,\dots,2^{b_R}-1\}\to\mathbb{R}_{\ge 0}.
+\]
+The emitted reward symbol is
+\[
+\Omega_H(r):=Q_H^{\mathrm{quant}}(r),
+\]
+and the planner's semantic reward value is
+\[
+V_H(\Omega_H(r)):=V_H^{\mathrm{quant}}(Q_H^{\mathrm{quant}}(r)).
+\]
+This mode is implementable for arbitrary real-valued objectives, but exact
+$\mathcal{J}_H$ planner theorems apply only to the quantized objective induced
+by $V_H^{\mathrm{quant}}\circ Q_H^{\mathrm{quant}}$, not to the original
+real-valued objective unless the quantizer is exact on the reachable reward set.
+
+For \texttt{normalized\_clipped\_improvement}, define
+\[
+\operatorname{clamp}_{[0,1]}(x):=\min\!\bigl(\max(x,0),1\bigr)
+\]
+and
+\[
+\widehat r_H(r)
+:=
+\operatorname{clamp}_{[0,1]}
+\left(
+\frac{r-r_{\min}}{r_{\max}-r_{\min}}
+\right),
+\qquad r_{\max}>r_{\min}.
+\]
+The implementation must define a finite immediate-reward encoder
+\[
+\Omega_H^{\mathrm{clip}}:[0,1]\to\{0,\dots,2^{b_R}-1\}
+\]
+and representative-value decoder
+\[
+V_H^{\mathrm{clip}}:\{0,\dots,2^{b_R}-1\}\to[0,1].
+\]
+The emitted reward symbol is
+\[
+\Omega_H(r):=\Omega_H^{\mathrm{clip}}(\widehat r_H(r)),
+\]
+and the semantic one-step reward value consumed by the discounted controller is
+\[
+V_H(\Omega_H(r))
+:=
+V_H^{\mathrm{clip}}\!\left(\Omega_H^{\mathrm{clip}}(\widehat r_H(r))\right).
+\]
+This mode is the normative reward mode for
+\texttt{aiqi\_discounted}. It does not require an exact reward alphabet large
+enough to injectively encode $\mathbb{V}_H^{\mathcal J}$, and it does not
+support exact $\mathcal{J}_H$ planner theorems.
+
+Only \texttt{exact\_objective\_difference}, with the injective finite reward
+encoder above, supports the exact $\mathcal{J}_H$ planner theorems below.
+
+\subsection{Exact objective-aligned planner reward path}
 
 For exact objective alignment under planner controllers, use
 incumbent-objective-difference reward
 \[
-R_t^{\mathcal{J}}:=\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+1};x),
+R_t^{\mathcal{J}}:=\mathcal{J}_H(b_t;d)-\mathcal{J}_H(b_{t+1};d),
 \]
 where $\mathcal{J}_H$ is the deployable objective from
 Section~\ref{sec:formal-problem}. This preserves exact objective ordering.
@@ -1116,14 +1878,15 @@ For fixed finite horizon $m\in\mathbb{N}$, the exact cumulative-improvement
 target is
 \[
 G_t^{(m)}:=\sum_{k=0}^{m-1}R_{t+k}^{\mathcal{J}}
-=\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+m};x),
+=\mathcal{J}_H(b_t;d)-\mathcal{J}_H(b_{t+m};d),
 \]
 so finite-horizon planner targets are exact objective decreases over $m$
 executed steps.
 
-With incumbent $b$ before evaluating $z$, define diagnostic deltas
+With incumbent $b$ before evaluating $z$, define diagnostic deltas whenever
+physical compressed bytes are available for both candidates:
 \[
-\delta_c(z\mid b)=\frac{c(b)-c(z)}{\max(c(b),1)},
+\delta_c(z\mid b)=\frac{c_{\mathrm{phys}}(b)-c_{\mathrm{phys}}(z)}{\max(c_{\mathrm{phys}}(b),1)},
 \qquad
 \delta_v(z\mid b)=\frac{\tau(b)-\tau(z)}{\max(\tau(b),\varepsilon)},
 \]
@@ -1131,7 +1894,7 @@ with fixed $\varepsilon>0$ (default $\varepsilon=10^{-9}$).
 
 For total observation semantics, define
 \[
-n_+:=\max(|x|,1).
+N_{H,+}(d):=\max(N_H(d),1).
 \]
 Use reserved failure symbols
 \[
@@ -1148,13 +1911,15 @@ Define totalized diagnostics:
 \[
 \tilde c(z)=
 \begin{cases}
- c(z)/n_+, & \mathrm{status}(z)=\mathrm{success},\\
+ c_{\mathrm{phys}}(z)/N_{H,+}(d),
+ & \mathrm{status}(z)=\mathrm{success}\ \land\ c_{\mathrm{phys}}(z)\neq\bot_c,\\
  \bot_c, & \text{otherwise,}
 \end{cases}
-\qquad
+\]
+\[
 \tilde \ell(z)=
 \begin{cases}
- \ell(z)/n_+, & \mathrm{status}(z)=\mathrm{success},\\
+ \ell(z)/N_{H,+}(d), & \mathrm{status}(z)=\mathrm{success},\\
  \bot_\ell, & \text{otherwise,}
 \end{cases}
 \]
@@ -1169,7 +1934,10 @@ Define totalized diagnostics:
 \[
 \tilde\delta_c(z\mid b)=
 \begin{cases}
-\delta_c(z\mid b), & \mathrm{status}(z)=\mathrm{success},\\
+\delta_c(z\mid b),
+& \mathrm{status}(z)=\mathrm{success}
+\ \land\ c_{\mathrm{phys}}(z)\neq\bot_c
+\ \land\ c_{\mathrm{phys}}(b)\neq\bot_c,\\
 \bot_{\delta_c}, & \text{otherwise,}
 \end{cases}
 \qquad
@@ -1220,15 +1988,7 @@ where $\mathbf{1}_{\mathrm{fail}}=1$ for timeout/invalid/error or for successful
 $\theta(z)<\theta_{\min}$ or $\mu(z)>\mu_{\max}$, and $0$ otherwise,
 and $d_t\in\{0,1\}$ is terminal indicator emitted by this environment.
 
-Using planner parameters
-$(L_O,b_O,\mathcal{R}_B,r_{\min},r_{\max})$ from
-Section~\ref{sec:aixi-embedding}, define deterministic adapter maps:
-\[
-\Pi_R:\mathbb{R}\to\mathcal{R}_B,
-\qquad
-\Pi_R(r):=\operatorname{clip}_{[r_{\min},r_{\max}]}
-\!\left(\left\lfloor r+\tfrac{1}{2}\right\rfloor\right),
-\]
+Define deterministic observation adapter
 \[
 \Psi_O:=\Psi_O^{\eta_O},
 \qquad
@@ -1236,33 +1996,26 @@ Section~\ref{sec:aixi-embedding}, define deterministic adapter maps:
 \]
 for a fixed observation-adapter specification
 \[
-\eta_O:=(\text{field order},\text{sentinel coding},\text{quantization/clipping},\text{packing rule},L_O,b_O).
+\eta_O:=(\text{field order},\text{sentinel coding},\text{quantization/clipping},
+\text{packing rule},L_O,b_O).
 \]
-where
-\[
-\operatorname{clip}_{[L,U]}(x):=\min\!\big(\max(x,L),U\big).
-\]
-Admissibility requirements are
-\[
-\Pi_R(r)\in [r_{\min},r_{\max}]\cap\mathbb{Z}
-\quad\text{for all }r\in\mathbb{R},
-\]
+Admissibility requires
 \[
 0\le (\Psi_O(o))_i\le 2^{b_O}-1
 \quad\text{for all }o\in\mathcal{O}^{\mathrm{raw}}_B,\ i\in\{1,\dots,L_O\},
 \]
 with the degenerate case $(\Psi_O(o))_i=0$ when $b_O=0$.
 For reproducible planner behavior, $\eta_O$ is fixed for a run and must be
-recorded (or hash-committed) in provenance.
+recorded or hash-committed in provenance.
 
 \begin{remark}[Adapter boundary]
-The maps $\Pi_R$ and $\Psi_O$ are the generic raw-environment interfaces in
-this section. The exact planner-state embedding in
-Section~\ref{sec:aixi-embedding} uses the stronger specialized notation
-$\Psi_H$ and $Q_R$: there the observation channel encodes planner state
-directly and the reward already lies in $\mathcal{R}_B$. This is a
-specialization of the same objective-difference reward path, not a change in
-planner semantics.
+The generic raw-observation adapter $\Psi_O$ is separate from the planner
+reward encoder $\Omega_H$ and semantic decoder $V_H$. The exact planner-state
+embedding in Section~\ref{sec:aixi-embedding} may use the stronger specialized
+state encoder $\Psi_H$ for observations, while reward symbols are always
+emitted through the selected reward-mode encoder $\Omega_H$. No separate
+integer reward adapter $\Pi_R$ or affine encoder $Q_R$ is part of the general
+semantics.
 \end{remark}
 
 \section{Core Properties}
@@ -1289,15 +2042,15 @@ By update rule, $z_{\mathrm{best}}$ changes only when $K(z')\prec_K K(z_{\mathrm
 \begin{proposition}[Objective monotonicity under key updates]
 Across best updates, incumbent objective is non-increasing: if
 $z_{\mathrm{best}}$ changes from $z$ to $z'$, then
-$\mathcal{J}_H(z';x)\le\mathcal{J}_H(z;x)$.
+$\mathcal{J}_H(z';d)\le\mathcal{J}_H(z;d)$.
 \end{proposition}
 
 \begin{proof}
 The incumbent updates only when
-$K(z')=(\mathcal{J}_H(z';x),\operatorname{ser}(\operatorname{canon}(z')))$ is
+$K(z')=(\mathcal{J}_H(z';d),\operatorname{ser}(\operatorname{canon}(z')))$ is
 lexicographically smaller than
-$K(z)=(\mathcal{J}_H(z;x),\operatorname{ser}(\operatorname{canon}(z)))$.
-Hence $\mathcal{J}_H(z';x)\le\mathcal{J}_H(z;x)$.
+$K(z)=(\mathcal{J}_H(z;d),\operatorname{ser}(\operatorname{canon}(z)))$.
+Hence $\mathcal{J}_H(z';d)\le\mathcal{J}_H(z;d)$.
 \end{proof}
 
 \begin{remark}[Conditional replay determinism guarantee]
@@ -1334,8 +2087,13 @@ in deterministic form, or
 \]
 in stochastic form, and $\operatorname{canon}(z)=z'$. Under the specified
 uniform policy
-$\pi_T(a\mid s,B)=1/N_B^{\mathrm{compile}}(B)$, this implies
-$q_T(z'\mid s,B)>0$.
+\[
+\pi_T(a\mid s,B)=1/N_B^{\mathrm{compile}}(B),
+\]
+this implies
+\[
+q_T(z'\mid s,B)>0.
+\]
 \end{assumption}
 
 \begin{assumption}[Per-iteration overhead lower bound]\label{ass:iter-overhead-lb}
@@ -1362,7 +2120,7 @@ Consequently, the probability of no improvement by horizon $H$ decays at least g
 
 \begin{proposition}[Non-asymptotic acceptance envelope]\label{prop:accept-envelope}
 For a deployable uphill proposal with objective gap
-$\Delta\mathcal{J}=\mathcal{J}_H(z';x)-\mathcal{J}_H(z_{\mathrm{cur}};x)>0$ at
+$\Delta\mathcal{J}=\mathcal{J}_H(z';d)-\mathcal{J}_H(z_{\mathrm{cur}};d)>0$ at
 elapsed fraction $u$, acceptance probability is
 \[
 \mathbb{P}_{\mathrm{accept}}(u)=\exp\!\left(-\frac{\Delta\mathcal{J}}{T(u)}\right).
@@ -1453,11 +2211,14 @@ this section.
 
 Let:
 \begin{itemize}
-    \item $n=|x|$ dataset bytes,
+    \item $d$ the fixed canonical dataset object,
+    \item $S_H(d)$ the size of the lowered charged event stream under profile
+    $H$,
+    \item $N_H(d)$ the declared throughput denominator,
     \item $N$ attempted proposals,
     \item $U\le N$ unique canonical candidates evaluated or cache-hit,
     \item $|z|$ canonical candidate representation size,
-    \item $C_{\mathrm{comp}}(n,z)$ compression runtime.
+    \item $C_{\mathrm{eval}}(d,z)$ evaluator runtime on dataset $d$.
 \end{itemize}
 
 Per proposal attempt, overhead is
@@ -1469,7 +2230,7 @@ with $C_{\mathrm{canon}}(|z|)=O(|z|\log|z|)$ under key sorting, and $C_{\mathrm{
 For cache misses, evaluation cost is bounded by hard timeout:
 \[
 C_{\mathrm{eval}}(z) \le
-\min\{C_{\mathrm{comp}}(n,z),T_t^{\mathrm{eval}}\}+C_{\mathrm{kill}},
+\min\{C_{\mathrm{eval}}(d,z),T_t^{\mathrm{eval}}\}+C_{\mathrm{kill}},
 \qquad
 T_t^{\mathrm{eval}}\le T_{\mathrm{total}}-t.
 \]
@@ -1521,11 +2282,15 @@ with file-based specification, consistent with other JSON-configured modes.
 
 The structured report should record at minimum:
 \begin{itemize}
-    \item baseline and best metrics ($c,\tau,\mu,\mathcal{J}_H$),
-    \item operational length quantities are recorded in bytes
-    ($c,L_B,C_x,\mathcal{J}_H$),
-    \item any optional semantic bit-normalized quantities are explicitly
-    labeled and computed as $8\times$ the corresponding byte quantities,
+    \item baseline and best metrics
+    ($c_{\mathrm{phys}},\ell,\tau,\mu,\mathcal{J}_H$),
+    \item operational reporting quantities are recorded with units explicitly:
+    physical compressed bytes $c_{\mathrm{phys}}$ when defined,
+    model-code bytes $L_B$, target-loss bits $\ell$, and objective bits
+    $\mathcal{J}_H$,
+    \item if a physical encoded artifact exists, any finite-coder relation
+    between $8c_{\mathrm{phys}}$ and $\ell$ must be labeled as diagnostic only
+    and not treated as the normative objective identity,
     \item deltas and evaluation counters,
     \item timeout, invalid, and successful-but-nondeployable counts,
     \item final best objective,
@@ -1533,7 +2298,9 @@ The structured report should record at minimum:
     \item crate/tool version,
     \item feature set (if available),
     \item seed,
-    \item configured throughput floor $\theta_{\min}$ and derived runtime cap $\tau_{\theta}=n/\theta_{\min}$,
+    \item configured throughput floor $\theta_{\min}$ and derived runtime cap
+    $\tau_{\theta}=N_H(d)/\theta_{\min}$, with $\tau_{\theta}=n/\theta_{\min}$
+    in passive-byte mode,
     \item configured memory cap $\mu_{\max}$,
     \item dataset path and dataset content hash,
     \item baseline config hash,
@@ -1550,11 +2317,18 @@ The structured report should record at minimum:
 
 Use the canonical key definition from Section~\ref{sec:canon-cache}:
 \[
-\mathrm{Key}_{\mathrm{cache}}(z,\eta_{\mathrm{eval}},x)=
-\Big(\operatorname{ser}(\operatorname{canon}(z)),\eta_{\mathrm{eval}},\operatorname{Hash}(x)\Big).
+\mathrm{Key}_{\mathrm{cache}}(z,\eta_{\mathrm{eval}},d)=
+\Big(\operatorname{ser}(\operatorname{canon}(z)),\eta_{\mathrm{eval}},\operatorname{Hash}(d)\Big).
 \]
 
-For all controller paths, before evaluating a canonical candidate $\hat z$, the runtime must query the cache key above instantiated at $(\hat z,\eta_{\mathrm{eval}},x)$. On cache hit, the cached evaluator output $M(\hat z)$ is reused and no new compression execution occurs. Any state-relative reward or observation components are recomputed from that cached evaluator output and the current runtime state. This ensures reasonable performance, without affecting behaviour under hardware determinism assumptions.
+For all controller paths, before evaluating a canonical candidate $\hat z$, the
+runtime must query the cache key above instantiated at
+$(\hat z,\eta_{\mathrm{eval}},d)$. On cache hit, the cached evaluator output
+$M(\hat z)$ is reused and no new compression execution occurs. Any
+state-relative reward or observation components are recomputed from that cached
+evaluator output and the current runtime state. This ensures reasonable
+performance, without affecting behaviour under hardware determinism
+assumptions.
 
 \section{Expected Theoretical Behavior}\label{sec:expected-theoretical-behavior}
 
@@ -1619,6 +2393,26 @@ H=\bigl(&\text{machine class},\text{CPU pinning policy},\text{RAM cap},\\
 \]
 All planner-facing semantics below are defined relative to $H$.
 
+Unless explicitly stated otherwise, this section applies to the fixed canonical
+dataset object $d$ selected by the input contract. The planner-facing exact
+objective is always
+\[
+\mathcal{J}_H(z;d)=8L_B(z)+\ell_H(z)
+\]
+on deployable candidates, where $\ell_H(z)$ is the evaluator's target loss in
+bits under the selected passive or causal lowering. Physical compressed bytes,
+when present, are diagnostic only. The passive-byte exact-encoding case is the
+special case in which a material encoder also reports
+$c_{\mathrm{phys}}(z)$ and a finite-coder overhead relation between
+$8c_{\mathrm{phys}}(z)$ and $\ell_H(z)$.
+
+The exact MC-AIXI convergence claims below require a finite planner-exposed
+candidate domain, deterministic evaluator semantics, exact-state observation
+when observed-Markov claims are invoked, and exact finite reward encoding of
+objective differences as specified in
+Remark~\ref{rem:reward-encoding-safety}. They do not require $d$ to be a
+passive-byte dataset.
+
 \begin{assumption}[Finite planner-exposed candidate domain]\label{ass:finite-Z}
 The planner-exposed canonical candidate set
 \[
@@ -1651,7 +2445,7 @@ undefined size/log-loss/time/memory fields. Define evaluator codomain
 \mathcal{Y}_H
 :=
 \mathcal{S}_{\mathrm{status}}
-\times (\mathbb{N}\sqcup\{\bot_c\})
+\times (\mathbb{N}_0\sqcup\{\bot_c\})
 \times (\mathbb{R}_{\ge 0}\sqcup\{\bot_\ell\})
 \times (\mathbb{R}_{\ge 0}\sqcup\{\bot_\tau\})
 \times (\mathbb{R}_{\ge 0}\sqcup\{\bot_\mu\})
@@ -1668,7 +2462,8 @@ M_H^\circ(z)=\big(\mathrm{status}_H(z),c_H(z),\ell_H(z),\tau_H(z),\mu_H(z),\oper
 with:
 \begin{itemize}
     \item $\mathrm{status}_H(z)\in\mathcal{S}_{\mathrm{status}}$,
-    \item $c_H(z)\in\mathbb{N}$ on success and $c_H(z)=\bot_c$ otherwise,
+    \item $c_H(z)\in\mathbb{N}_0\sqcup\{\bot_c\}$, with $c_H(z)\in\mathbb{N}_0$
+    exactly when a material encoded artifact is produced under profile $H$,
     \item $\ell_H(z)\in\mathbb{R}_{\ge 0}$ on success and
     $\ell_H(z)=\bot_\ell$ otherwise,
     \item $\tau_H(z)\in\mathbb{R}_{\ge 0}$ on success and
@@ -1682,14 +2477,17 @@ from Section~\ref{sec:formal-problem}. Here $\tau_H(z)$ denotes elapsed
 wall-clock time in the same unit family as $\tau(z)$, $T_{\mathrm{eval}}$,
 and $T_{\mathrm{total}}$. Any additional deterministic profile costs (for
 example, PMU cycles) may be recorded in $\operatorname{diag}_H(z)$, but are
-not denoted by $\tau_H(z)$.
+not denoted by $\tau_H(z)$. No equality between $\ell_H(z)$ and physical
+compressed bytes is assumed. When a material encoded artifact exists, its
+physical byte length $c_H(z)$ is diagnostic/reporting only. The exact planner
+objective uses $\ell_H(z)$ directly.
 \end{assumption}
 
 For successful candidates under profile $H$, define throughput
 \[
 \theta_H(z):=
 \begin{cases}
-\dfrac{n}{\tau_H(z)}, & \mathrm{status}_H(z)=\mathrm{success},\ \tau_H(z)>0,\\[4pt]
+\dfrac{N_H(d)}{\tau_H(z)}, & \mathrm{status}_H(z)=\mathrm{success},\ \tau_H(z)>0,\\[4pt]
 +\infty, & \mathrm{status}_H(z)=\mathrm{success},\ \tau_H(z)=0.
 \end{cases}
 \]
@@ -1724,17 +2522,15 @@ Define the deployable canonical subset
 \]
 By Assumption~\ref{ass:baseline-succ}, this set is nonempty.
 
-Define profile-fixed two-part objective components
+Define the profile-fixed two-part objective
 \[
-C_x(z):=c_H(z),
-\qquad
 L_B(z):=\big|\operatorname{ser}(z)\big|,
 \]
 and objective
 \[
-\mathcal{J}_H(z;x):=
+\mathcal{J}_H(z;d):=
 \begin{cases}
-L_B(z)+C_x(z),
+8L_B(z)+\ell_H(z),
 & z\in\mathcal{Z}_{H,\mathrm{dep}}^{\mathrm{can}},\\[3pt]
 +\infty,
 & \text{otherwise.}
@@ -1742,11 +2538,16 @@ L_B(z)+C_x(z),
 \]
 This enforces a single deployability-gated objective in the planner path:
 non-deployable candidates receive $+\infty$ exactly as timeout/invalid/error
-outcomes.
+outcomes. On the deployable region, physical byte size $c_H(z)$, when present,
+is a diagnostic/reporting quantity. The planner objective is
+\[
+\mathcal{J}_H(z;d)=8L_B(z)+\ell_H(z),
+\]
+with no general equality assumed between $\ell_H(z)$ and $8c_H(z)$.
 
 Define incumbent key
 \[
-K_H(z):=\big(\mathcal{J}_H(z;x),\operatorname{ser}(z)\big),
+K_H(z):=\big(\mathcal{J}_H(z;d),\operatorname{ser}(z)\big),
 \]
 ordered lexicographically.
 
@@ -1757,11 +2558,7 @@ Fix planner-interface integer parameters
 \begin{aligned}
 N_B&:=\texttt{agent\_actions}=N_B^{\mathrm{compile}}(B)\in\mathbb{N},\ N_B\ge 1,\\
 b_O&:=\texttt{observation\_bits}\in\mathbb{N}_0,\\
-L_O&:=\max(1,\texttt{observation\_stream\_len}),\\
-b_R&:=\texttt{reward\_bits}\in\mathbb{N},\ b_R\ge 1,\\
-r_{\min}&:=\texttt{min\_reward}\in\mathbb{Z},\\
-r_{\max}&:=\texttt{max\_reward}\in\mathbb{Z},\ r_{\max}>r_{\min},\\
-\rho_{\mathrm{off}}&:=\texttt{reward\_offset}\in\mathbb{Z}.
+L_O&:=\max(1,\texttt{observation\_stream\_len}).
 \end{aligned}
 \]
 Define
@@ -1770,12 +2567,29 @@ Define
 \qquad
 \mathcal{O}_B=\{0,\dots,2^{b_O}-1\}
 \]
-(with $\mathcal{O}_B=\{0\}$ when $b_O=0$), and
+(with $\mathcal{O}_B=\{0\}$ when $b_O=0$).
+
+For all planner reward modes, define
 \[
-\mathcal{R}_B:=\{r\in\mathbb{Z}:r_{\min}\le r\le r_{\max}\},
+b_R:=\texttt{reward\_bits}\in\mathbb{N},\qquad b_R\ge 1,
 \qquad
 \mathcal{R}_B^{\mathrm{enc}}:=\{0,\dots,2^{b_R}-1\}.
 \]
+For \texttt{normalized\_clipped\_improvement}, the clipping fields
+\texttt{min\_reward} and \texttt{max\_reward} define only the normalization
+interval used by Section~\ref{sec:aiqi-discounted-contract}; they do not define
+an exact integer reward interval.
+
+For the legacy affine integer exact-encoding shortcut, additionally define
+\[
+r_{\min}:=\texttt{min\_reward}\in\mathbb{Z},
+\qquad
+r_{\max}:=\texttt{max\_reward}\in\mathbb{Z},
+\qquad
+\rho_{\mathrm{off}}:=\texttt{reward\_offset}\in\mathbb{Z},
+\]
+with $r_{\max}>r_{\min}$. This shortcut is optional and is subsumed by the
+general finite reward encoder $\Omega_H$.
 Initialization must verify cardinality consistency
 \[
 |\mathcal{A}_B|=\texttt{agent\_actions}
@@ -1861,7 +2675,7 @@ where $\pi_b(u,b,\theta)=b$ extracts the incumbent component.
 
 Define planner-semantic reward by incumbent objective decrease:
 \[
-r_H(s,a):=\mathcal{J}_H\!\bigl(\pi_b(s);x\bigr)-\mathcal{J}_H\!\bigl(\pi_b(U_H(s,a));x\bigr).
+r_H(s,a):=\mathcal{J}_H\!\bigl(\pi_b(s);d\bigr)-\mathcal{J}_H\!\bigl(\pi_b(U_H(s,a));d\bigr).
 \]
 On any realized planner trajectory with $b_t=\pi_b(s_t)$, this agrees
 stepwise with Section~\ref{sec:reward-observation}'s reward
@@ -1880,14 +2694,14 @@ we have
 \[
 \sum_{t=0}^{m-1} r_H(s_t,a_t)
 =
-\mathcal{J}_H\!\bigl(\pi_b(s_0);x\bigr)-\mathcal{J}_H\!\bigl(\pi_b(s_m);x\bigr).
+\mathcal{J}_H\!\bigl(\pi_b(s_0);d\bigr)-\mathcal{J}_H\!\bigl(\pi_b(s_m);d\bigr).
 \]
 \end{proposition}
 
 \begin{proof}
 Immediate from summing
 \[
-r_H(s_t,a_t)=\mathcal{J}_H\!\bigl(\pi_b(s_t);x\bigr)-\mathcal{J}_H\!\bigl(\pi_b(s_{t+1});x\bigr).
+r_H(s_t,a_t)=\mathcal{J}_H\!\bigl(\pi_b(s_t);d\bigr)-\mathcal{J}_H\!\bigl(\pi_b(s_{t+1});d\bigr).
 \]
 \end{proof}
 
@@ -1900,7 +2714,7 @@ reward satisfies
 \[
 0\le r_H(s,a)\le \overline R_H,
 \qquad
-\overline R_H:=\mathcal{J}_H(b_0;x).
+\overline R_H:=\mathcal{J}_H(b_0;d).
 \]
 \end{proposition}
 
@@ -1909,13 +2723,13 @@ Along every reachable trajectory from $s_0$, incumbent updates never worsen the
 key and therefore never increase the incumbent objective. Hence for every
 reachable state $s$,
 \[
-0\le \mathcal{J}_H\!\bigl(\pi_b(s);x\bigr)\le \mathcal{J}_H(b_0;x)=\overline R_H.
+0\le \mathcal{J}_H\!\bigl(\pi_b(s);d\bigr)\le \mathcal{J}_H(b_0;d)=\overline R_H.
 \]
 Also,
 \[
-\mathcal{J}_H\!\bigl(\pi_b(U_H(s,a));x\bigr)
+\mathcal{J}_H\!\bigl(\pi_b(U_H(s,a));d\bigr)
 \le
-\mathcal{J}_H\!\bigl(\pi_b(s);x\bigr),
+\mathcal{J}_H\!\bigl(\pi_b(s);d\bigr),
 \]
 so
 \[
@@ -1923,7 +2737,7 @@ so
 \le
 r_H(s,a)
 =
-\mathcal{J}_H\!\bigl(\pi_b(s);x\bigr)-\mathcal{J}_H\!\bigl(\pi_b(U_H(s,a));x\bigr)
+\mathcal{J}_H\!\bigl(\pi_b(s);d\bigr)-\mathcal{J}_H\!\bigl(\pi_b(U_H(s,a));d\bigr)
 \le
 \overline R_H.
 \]
@@ -1944,44 +2758,51 @@ A sufficient cardinality condition is
 2^{b_OL_O}\ge |\mathcal{S}_H|.
 \]
 
-\begin{remark}[Normative reward-encoding safety check]
+\begin{remark}[Normative exact reward-encoding safety check]
 \label{rem:reward-encoding-safety}
-Initialization must verify
-\[
-r_{\min}\le 0,
-\qquad
-r_{\max}\ge \overline R_H,
-\qquad
-\rho_{\mathrm{off}}=-r_{\min},
-\qquad
-r_{\max}-r_{\min}\le 2^{b_R}-1.
-\]
+For \texttt{planner\_reward\_mode = "exact\_objective\_difference"},
+initialization must verify that the declared canonical scalar representation
+$\mathbb{V}_H^{\mathcal J}$ is finite, that the encoded reward alphabet has
+sufficient cardinality to injectively encode it,
+and that the evaluator guarantees exact representability of all exact-mode
+objective values and reachable incumbent objective differences. It must then
+construct the corresponding injective encoder $\Omega_H$ and decoder $V_H$.
 If this check fails, initialization aborts with configuration error
-\texttt{reward\_encoding\_unsafe}. By
-Proposition~\ref{prop:reward-bound}, this implies the finite realized reward
-set satisfies
+\texttt{reward\_encoding\_unsafe}.
+
+The older affine integer condition
 \[
-\{r_H(s,a):(s,a)\in\mathcal{S}_H\times\mathcal{A}_B\}\subseteq\mathcal{R}_B,
+r_{\min}\le 0,\qquad
+r_{\max}\ge \overline R_H,\qquad
+\rho_{\mathrm{off}}=-r_{\min},\qquad
+r_{\max}-r_{\min}\le 2^{b_R}-1
 \]
-and that $Q_R$ is exact on all reachable rewards.
+is merely a sufficient implementation shortcut for the special case where all
+reachable objective differences are integers in the configured interval. It is
+not the general exact reward-encoding contract.
+
+For \texttt{planner\_reward\_mode = "quantized\_objective\_difference"}, the
+runtime uses the declared quantizer contract from
+Section~\ref{sec:reward-observation}; exact $\mathcal{J}_H$ theorem claims do
+not apply unless that quantizer is injective on the reachable reward set and its
+decoder is exact there.
+
+For \texttt{planner\_reward\_mode = "normalized\_clipped\_improvement"}, the
+runtime verifies only the normalized-clipping preconditions required by
+Section~\ref{sec:aiqi-discounted-contract}.
 \end{remark}
 
-Define exact reward encoder
-\[
-Q_R(r):=r+\rho_{\mathrm{off}},
-\]
-with admissibility condition
-\[
-0\le Q_R(r)\le 2^{b_R}-1
-\quad\text{for all }r\in\mathcal{R}_B.
-\]
-
-The emitted percept is
+For any reward mode with finite encoded reward alphabet, the emitted percept is
 \[
 x_{t+1}^{\mathrm{enc}}=
-\bigl(\Psi_H(s_{t+1}),Q_R(r_H(s_t,a_t))\bigr)
-\in\mathcal{O}_B^{L_O}\times\mathcal{R}_B^{\mathrm{enc}}.
+\bigl(\Psi_H(s_{t+1}),\Omega_H(r_H(s_t,a_t))\bigr),
 \]
+and the planner's semantic reward value for that symbol is
+\[
+V_H(\Omega_H(r_H(s_t,a_t))).
+\]
+In exact-objective-difference mode this semantic value equals
+$r_H(s_t,a_t)$ on every reachable transition.
 
 \begin{proposition}[Finite MDP by construction]\label{prop:finite-mdp}
 Under Assumptions~\ref{ass:finite-Z}--\ref{ass:no-hidden}, the induced
@@ -2031,9 +2852,14 @@ parameter. Proposition~\ref{prop:finite-mdp} then yields a finite
 
 \subsection{Conditional planner convergence on exact finite-horizon MC-AIXI path}\label{sec:planner-convergence-mcaixi}
 
-Define the globally $K_H$-optimal deployable candidate
+Define the objective-optimal deployable set
 \[
-z_H^{\star}:=\arg\min_{z\in\mathcal{Z}_{H,\mathrm{dep}}^{\mathrm{can}}}K_H(z),
+\mathcal{Z}_{H,\mathrm{obj}}^{\star}:=
+\arg\min_{z\in\mathcal{Z}_{H,\mathrm{dep}}^{\mathrm{can}}}\mathcal{J}_H(z;d),
+\]
+and its deterministic tie-broken representative
+\[
+z_H^{\star}:=\arg\min_{z\in\mathcal{Z}_{H,\mathrm{obj}}^{\star}}K_H(z),
 \]
 which is unique by finiteness and total ordering of $K_H$.
 
@@ -2071,7 +2897,7 @@ s_{t+1}^{\star}:=U_H(s_t^{\star},a_t^{\star}),
 \]
 Then:
 \begin{enumerate}
-    \item $\pi_b(s_m^{\star})=z_H^{\star}$, and
+    \item $\pi_b(s_m^{\star})\in\mathcal{Z}_{H,\mathrm{obj}}^{\star}$, and
     \item for every other sequence $a_{0:m-1}\neq a_{0:m-1}^{\star}$,
     \[
     G_m(s_0,a_{0:m-1}^{\star}) > G_m(s_0,a_{0:m-1}),
@@ -2095,13 +2921,14 @@ planner-internal simulations. For each $t\in\{0,\dots,m-1\}$,
 \]
 \end{assumption}
 
-\begin{theorem}[Conditional MC-AIXI convergence to $z_H^{\star}$]\label{thm:planner-convergence-mcaixi}
+\begin{theorem}[Conditional MC-AIXI convergence to the objective-optimal set]\label{thm:planner-convergence-mcaixi}
 Under Assumptions~\ref{ass:planner-conv-regime}--\ref{ass:planner-conv-root-consistency}
 and Proposition~\ref{prop:finite-mdp},
 consider the closed-loop process indexed by simulation budget $N$, and define
 $b_t^{(N)}:=\pi_b\big(S_t^{(N)}\big)$. Then
 \[
-\mathbb{P}\!\big(b_m^{(N)}=z_H^{\star}\big)\xrightarrow[N\to\infty]{}1.
+\mathbb{P}\!\big(b_m^{(N)}\in\mathcal{Z}_{H,\mathrm{obj}}^{\star}\big)
+\xrightarrow[N\to\infty]{}1.
 \]
 \end{theorem}
 
@@ -2138,9 +2965,10 @@ $\mathbb{P}(S_{t+1}^{(N)}=s_{t+1}^{\star})\to 1$.
 
 By induction,
 $\mathbb{P}(S_m^{(N)}=s_m^{\star})\to 1$.
-From Assumption~\ref{ass:planner-conv-unique-path}, $\pi_b(s_m^{\star})=z_H^{\star}$, so
+From Assumption~\ref{ass:planner-conv-unique-path},
+$\pi_b(s_m^{\star})\in\mathcal{Z}_{H,\mathrm{obj}}^{\star}$, so
 \[
-\mathbb{P}\!\big(b_m^{(N)}=z_H^{\star}\big)
+\mathbb{P}\!\big(b_m^{(N)}\in\mathcal{Z}_{H,\mathrm{obj}}^{\star}\big)
 \ge
 \mathbb{P}\!\big(S_m^{(N)}=s_m^{\star}\big)
 \xrightarrow[N\to\infty]{}1,
@@ -2167,7 +2995,7 @@ Assumption~\ref{ass:planner-conv-unique-path} by the following:
     \]
     and require
     \[
-    \pi_b(s_m^{a})=z_H^{\star}
+    \pi_b(s_m^{a})\in\mathcal{Z}_{H,\mathrm{obj}}^{\star}
     \quad\text{for all }a_{0:m-1}\in\mathcal{A}_m^{\star}.
     \]
 \end{enumerate}
@@ -2187,7 +3015,8 @@ Assume also that for each $t\in\{0,\dots,m-1\}$,
 \]
 Then
 \[
-\mathbb{P}\!\big(b_m^{(N)}=z_H^{\star}\big)\xrightarrow[N\to\infty]{}1.
+\mathbb{P}\!\big(b_m^{(N)}\in\mathcal{Z}_{H,\mathrm{obj}}^{\star}\big)
+\xrightarrow[N\to\infty]{}1.
 \]
 \end{proposition}
 
@@ -2216,9 +3045,10 @@ to $1$ for each fixed $t$, so induction on $t$ gives
 $\mathbb{P}(F_m^{(N)})\to 1$.
 
 By common-terminal-incumbent optimality,
-$\pi_b(s)=z_H^{\star}$ for every $s\in\mathcal{S}_m^{\star}$, therefore
+$\pi_b(s)\in\mathcal{Z}_{H,\mathrm{obj}}^{\star}$ for every
+$s\in\mathcal{S}_m^{\star}$, therefore
 \[
-\mathbb{P}\!\big(b_m^{(N)}=z_H^{\star}\big)
+\mathbb{P}\!\big(b_m^{(N)}\in\mathcal{Z}_{H,\mathrm{obj}}^{\star}\big)
 \ge
 \mathbb{P}(F_m^{(N)})
 \xrightarrow[N\to\infty]{}1.
@@ -2230,7 +3060,9 @@ Assumption~\ref{ass:planner-conv-unique-path} is a stronger-than-ideal
 single-path sufficient condition used for the clean theorem statement. The
 broader interpretation is set-valued: what matters is asymptotic selection of
 actions that remain inside the optimal action set leading to the common
-terminal incumbent $z_H^{\star}$, as formalized in
+terminal objective-optimal set $\mathcal{Z}_{H,\mathrm{obj}}^{\star}$, with
+$z_H^{\star}$ retained only as the deterministic final tie-broken
+representative, as formalized in
 Proposition~\ref{prop:planner-convergence-optset}.
 \end{remark}
 
@@ -2301,10 +3133,23 @@ and apply the following execution contract.
     \]
     on mismatch, abort initialization with configuration error
     \texttt{action\_alphabet\_mismatch},
-    \item after the normative baseline evaluation, verify the exact
-    reward-encoding safety check from
-    Remark~\ref{rem:reward-encoding-safety}; on failure, abort initialization
-    with configuration error \texttt{reward\_encoding\allowbreak\_unsafe},
+    \item after the normative baseline evaluation:
+    \begin{itemize}
+        \item if \texttt{planner\_reward\_mode} is
+        \texttt{"exact\_objective\_difference"}, verify the exact
+        reward-encoding safety check from
+        Remark~\ref{rem:reward-encoding-safety}; on failure, abort
+        initialization with configuration error
+        \texttt{reward\_encoding\allowbreak\_unsafe},
+        \item if \texttt{planner\_reward\_mode} is
+        \texttt{"quantized\_objective\_difference"}, verify that the declared
+        quantizer and representative-value decoder are deterministic, total on
+        reachable objective differences, and recorded in provenance,
+        \item if \texttt{planner\_reward\_mode} is
+        \texttt{"normalized\_clipped\_}\allowbreak\texttt{improvement"}, verify
+        only the discounted-controller clipping precondition
+        \texttt{max\_reward > min\_reward}.
+    \end{itemize}
     \item instantiate planner-facing environment state $s_0\in\mathcal{S}_H$
     with the post-warmup baseline incumbent satisfying the normative baseline
     precondition from Section~\ref{subsec:baseline-precondition}
@@ -2348,7 +3193,7 @@ over all real evaluations performed across all rounds.
     $s_{t+1}=U_H(s_t,a_t)$ and emits encoded percept
     \[
     x_{t+1}^{\mathrm{enc}}=
-    \bigl(\Psi_H(s_{t+1}),Q_R(r_H(s_t,a_t))\bigr),
+    \bigl(\Psi_H(s_{t+1}),\Omega_H(r_H(s_t,a_t))\bigr),
     \]
     with canonical inapplicable-action semantics inherited from
     Section~\ref{sec:aixi-embedding}: when decoder flag $\iota=1$, the emitted
@@ -2370,7 +3215,7 @@ over all real evaluations performed across all rounds.
     \mathcal{S}_{\mathrm{term}}^{\mathrm{dep}}:=
     \left\{z\in\mathcal{Z}_H^{\mathrm{can}}:\
     \begin{aligned}[t]
-    &z\text{ evaluated before termination},\\
+    &z\text{ evaluated or cache-reused before termination},\\
     &\mathrm{status}_H(z)=\mathrm{success},\\
     &\theta_H(z)\ge\theta_{\min},\ \mu_H(z)\le\mu_{\max}
     \end{aligned}
@@ -2387,6 +3232,8 @@ This subsection is normative for
 \texttt{algorithm = aiqi\_discounted}. It defines a
 discounted/bin-quantized heuristic controller path and does \emph{not} provide
 exact-$\mathcal{J}_H$ guarantees for finite-horizon objective alignment.
+It requires
+\texttt{planner\_reward\_mode = "normalized\_clipped\_improvement"}.
 
 Define controller parameters
 \[
@@ -2404,13 +3251,29 @@ Define clamp on unit interval
 \[
 \operatorname{clamp}_{[0,1]}(x):=\min\!\bigl(\max(x,0),1\bigr).
 \]
-For semantic rewards $r_t\in\mathcal{R}_B$, define normalized clipped reward
+Let
 \[
-\hat r_t:=\operatorname{clamp}_{[0,1]}\!\left(
-\frac{r_t-r_{\min}}{r_{\max}-r_{\min}}
-\right),
+r_t:=\mathcal{J}_H(b_t;d)-\mathcal{J}_H(b_{t+1};d)
 \]
-and discounted finite-horizon target
+denote the underlying incumbent-improvement source signal. Under
+\texttt{planner\_reward\_mode = "normalized\_clipped\_improvement"}, the
+discounted controller observes the finite reward symbol
+\[
+\Omega_H(r_t)
+=
+\Omega_H^{\mathrm{clip}}
+\left(
+\operatorname{clamp}_{[0,1]}
+\left(
+\frac{r_t-r_{\min}}{r_{\max}-r_{\min}}
+\right)
+\right)
+\]
+and uses the decoded representative value
+\[
+\hat r_t:=V_H(\Omega_H(r_t))\in[0,1].
+\]
+The discounted finite-horizon target is
 \[
 G_{t,H_{\mathrm{ret}}}^{(\gamma)}:=
 \operatorname{clamp}_{[0,1]}\!\left(
@@ -2443,6 +3306,13 @@ to initialize the label predictor. It is inspired by the delayed-label
 phase-predictor structure of AIQI, but it does \emph{not} use discounted return
 targets and does \emph{not} invoke the discounted AIQI theorem directly.
 It is normative for \texttt{algorithm = aiqi\_warmstart\_exact\allowbreak\_jh}.
+Its exact finite-horizon objective-alignment claims are stated for the same
+deployable objective $\mathcal{J}_H(\cdot;d)$ as the tuning runtime on the
+fixed same-task environment induced by $(B,H,d)$.
+Conforming implementations may also expose
+\texttt{planner\_reward\_mode = "quantized\_objective\_difference"}, but
+the exact theorem statements below concern
+\texttt{"exact\_objective\_difference"}.
 
 \paragraph{Setup.}
 Fix the same planner-facing finite interaction contract as in
@@ -2450,7 +3320,7 @@ Section~\ref{sec:reward-observation}: finite action alphabet
 $\mathcal{A}_B$, finite encoded observation alphabet, deterministic incumbent
 key, and the objective-aligned reward
 \[
-R_t^{\mathcal{J}}:=\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+1};x).
+R_t^{\mathcal{J}}:=\mathcal{J}_H(b_t;d)-\mathcal{J}_H(b_{t+1};d).
 \]
 Define
 \[
@@ -2467,23 +3337,39 @@ Because the reward is incumbent-objective difference, this telescopes exactly:
 \[
 G_t^{(m)}
 =
-\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+m};x).
+\mathcal{J}_H(b_t;d)-\mathcal{J}_H(b_{t+m};d).
 \]
 Hence maximizing expected $G_t^{(m)}$ is equivalent to minimizing the expected
 terminal incumbent objective after $m$ further planner steps.
 
-\begin{remark}[Integer-valued exact target]
-Operationally, $\mathcal{J}_H$ is byte-valued, so
-$R_t^{\mathcal{J}}\in\mathbb{Z}_{\ge 0}$ and
-$G_t^{(m)}\in\mathbb{Z}_{\ge 0}$.
-A safe finite label alphabet is therefore
+\begin{remark}[Finite exact target encoding]
+The exact $m$-step improvement label
 \[
-\mathcal{G}_m:=\{0,1,\dots,\overline G_m\},
-\qquad
-\overline G_m:=\mathcal{J}_H(b_0;x),
+G_t^{(m)}
+=
+\mathcal{J}_H(b_t;d)-\mathcal{J}_H(b_{t+m};d)
 \]
-since $\mathcal{J}_H(b_{t+m};x)\ge 0$ and incumbents never worsen.
-Any tighter finite upper bound may be used instead.
+is represented using the same finite canonical scalar representation
+$\mathbb{V}_H^{\mathcal J}$ used by the exact reward encoder. Define the exact
+label alphabet by the encoded scalar values
+\[
+\mathcal{G}_H^{\mathrm{enc}}:=\Omega_H(\mathbb{V}_H^{\mathcal J}).
+\]
+A realized label is stored as the pair
+\[
+\bigl(\Omega_H(G_t^{(m)}),\;V_H(\Omega_H(G_t^{(m)}))\bigr),
+\]
+or equivalently as the encoded symbol together with the declared decoder
+$V_H$. It is not necessary to enumerate all deployable incumbent pairs before
+runtime. Conforming implementations may represent predictors over
+$\mathcal{G}_H^{\mathrm{enc}}$ sparsely or through a byte/symbol sequence model.
+
+For analysis, let
+\[
+\overline G_m:=\mathcal{J}_H(b_0;d),
+\]
+which is a valid upper bound because incumbents never worsen and objectives are
+nonnegative.
 \end{remark}
 
 \paragraph{Initial teacher dataset and admissible same-task trace sources.}
@@ -2502,13 +3388,13 @@ be the initial teacher dataset.
 Fix the exact-$\mathcal{J}_H$ interaction contract of this subsection.
 A finite dataset $\mathcal{D}_{\mathrm{teach}}$ is \emph{admissible} if every
 record is collected from a realized controller trajectory on the same
-$(B,H,x)$-induced tuning environment under the same finite planner-visible
+$(B,H,d)$-induced tuning environment under the same finite planner-visible
 history/action contract, and each label is computed from the realized
 incumbent path by
 \[
 G_t^{(m),(i)}
 =
-\mathcal{J}_H(b_t^{(i)};x)-\mathcal{J}_H(b_{t+m}^{(i)};x).
+\mathcal{J}_H(b_t^{(i)};d)-\mathcal{J}_H(b_{t+m}^{(i)};d).
 \]
 \end{definition}
 
@@ -2546,18 +3432,18 @@ For each phase $n$, define a predictive distribution
 \[
 \psi_n(\,\cdot\,\mid h_{<t}a_t)
 \in
-\Delta(\mathcal{G}_m),
+\Delta(\mathcal{G}_H^{\mathrm{enc}}),
 \]
-where $\Delta(\mathcal{G}_m)$ denotes the probability simplex on
-$\mathcal{G}_m$.
+where $\Delta(\mathcal{G}_H^{\mathrm{enc}})$ denotes the probability simplex on the finite
+encoded exact label alphabet.
 
 The initialization (warm-start) of $\psi_n$ from
 $\mathcal{D}_{\mathrm{teach}}^{(n)}$ is controller-internal and may be implemented
-by any deterministic finite-alphabet predictive mechanism, provided the resulting
-predictor is a well-defined conditional distribution on $\mathcal{G}_m$.
-Examples include exact count tables, CTW-style pseudocount initialization on an
-augmented label sequence, or any other deterministic finite-alphabet Bayesian or
-MDL-compatible predictor.
+by any deterministic predictive mechanism for the encoded exact label alphabet,
+provided the resulting predictor is a well-defined conditional distribution on
+$\mathcal{G}_H^{\mathrm{enc}}$. Examples include exact count tables, CTW-style pseudocount
+initialization on an augmented label sequence, or any other deterministic
+finite-alphabet Bayesian or MDL-compatible predictor.
 
 Define the unified phase predictor
 \[
@@ -2572,7 +3458,8 @@ Define the exact-$\mathcal{J}_H$ model-free action-value estimate
 :=
 \mathbb{E}_{\psi}\!\left[G_t^{(m)}\mid h_{<t},a\right]
 =
-\sum_{g\in\mathcal{G}_m} g\,\psi(g\mid h_{<t}a).
+\sum_{\gamma\in\mathcal{G}_H^{\mathrm{enc}}}
+V_H(\gamma)\,\psi(\gamma\mid h_{<t}a).
 \]
 
 \paragraph{True conditional law and exact action-value.}
@@ -2583,7 +3470,7 @@ p_t(\,\cdot\,\mid h_{<t},a)
 :=
 \mathbb{P}\!\left(G_t^{(m)}\in\,\cdot\,\mid h_{<t},a\right)
 \in
-\Delta(\mathcal{G}_m),
+\Delta(\mathcal{G}_H^{\mathrm{enc}}),
 \]
 and the corresponding exact action-value by
 \[
@@ -2591,15 +3478,14 @@ Q_t^\star(h_{<t},a)
 :=
 \mathbb{E}_{p_t}\!\left[G_t^{(m)}\mid h_{<t},a\right]
 =
-\sum_{g\in\mathcal{G}_m} g\,p_t(g\mid h_{<t},a).
+\sum_{\gamma\in\mathcal{G}_H^{\mathrm{enc}}}
+V_H(\gamma)\,p_t(\gamma\mid h_{<t},a).
 \]
-For $p,q\in\Delta(\mathcal{G}_m)$, write total variation distance as
+For $p,q\in\Delta(\mathcal{G}_H^{\mathrm{enc}})$, write total variation distance as
 \[
 \|p-q\|_{\mathrm{TV}}
 :=
-\sup_{A\subseteq\mathcal{G}_m}|p(A)-q(A)|
-=
-\frac{1}{2}\sum_{g\in\mathcal{G}_m}|p(g)-q(g)|.
+\frac12\sum_{\gamma\in\mathcal{G}_H^{\mathrm{enc}}}|p(\gamma)-q(\gamma)|.
 \]
 
 \paragraph{Deployment policy.}
@@ -2639,9 +3525,9 @@ For every history $h_{<t}$ and action $a\in\mathcal{A}_B$,
 \[
 \mathbb{E}\!\left[G_t^{(m)}\mid h_{<t},a\right]
 =
-\mathcal{J}_H(b_t;x)
+\mathcal{J}_H(b_t;d)
 -
-\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},a\right].
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};d)\mid h_{<t},a\right].
 \]
 Consequently,
 \[
@@ -2649,7 +3535,7 @@ Consequently,
 \mathbb{E}\!\left[G_t^{(m)}\mid h_{<t},a\right]
 =
 \arg\min_{a\in\mathcal{A}_B}
-\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},a\right].
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};d)\mid h_{<t},a\right].
 \]
 Therefore, if $\psi(\cdot\mid h_{<t}a)$ equals the true conditional law of
 $G_t^{(m)}$ given $(h_{<t},a)$, then the greedy rule
@@ -2667,17 +3553,17 @@ G_t^{(m)}
 =
 \sum_{k=0}^{m-1}
 \left(
-\mathcal{J}_H(b_{t+k};x)-\mathcal{J}_H(b_{t+k+1};x)
+\mathcal{J}_H(b_{t+k};d)-\mathcal{J}_H(b_{t+k+1};d)
 \right),
 \]
 which telescopes to
 \[
 G_t^{(m)}
 =
-\mathcal{J}_H(b_t;x)-\mathcal{J}_H(b_{t+m};x).
+\mathcal{J}_H(b_t;d)-\mathcal{J}_H(b_{t+m};d).
 \]
 Condition on $(h_{<t},a)$ and take expectations. Since
-$\mathcal{J}_H(b_t;x)$ is fixed given $h_{<t}$, maximizing the expected
+$\mathcal{J}_H(b_t;d)$ is fixed given $h_{<t}$, maximizing the expected
 cumulative improvement is equivalent to minimizing the expected terminal
 objective at horizon $m$.
 \end{proof}
@@ -2715,18 +3601,18 @@ Q_t^\star(h_{<t},a_t^\star)-Q_t^\star(h_{<t},\hat a_t)
 \]
 Equivalently,
 \[
-\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},\hat a_t\right]
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};d)\mid h_{<t},\hat a_t\right]
 -
 \min_{a\in\mathcal{A}_B}
-\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},a\right]
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};d)\mid h_{<t},a\right]
 \le
 2\overline G_m\,\delta_t.
 \]
 \end{theorem}
 
 \begin{proof}
-Fix any action $a\in\mathcal{A}_B$. Since
-$G_t^{(m)}\in\mathcal{G}_m\subseteq[0,\overline G_m]$, the bounded-function
+Fix any action $a\in\mathcal{A}_B$. Since the decoded label value
+$V_H(\Omega_H(G_t^{(m)}))$ lies in $[0,\overline G_m]$, the bounded-function
 characterization of total variation on a finite alphabet gives
 \[
 \begin{aligned}
@@ -2783,12 +3669,12 @@ By Proposition~\ref{prop:aiqi-warmstart-exact-jh}, for every action $a$,
 \[
 Q_t^\star(h_{<t},a)
 =
-\mathcal{J}_H(b_t;x)
+\mathcal{J}_H(b_t;d)
 -
-\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};x)\mid h_{<t},a\right].
+\mathbb{E}\!\left[\mathcal{J}_H(b_{t+m};d)\mid h_{<t},a\right].
 \]
 Substituting this identity into the previous inequality cancels the common term
-$\mathcal{J}_H(b_t;x)$ and yields the terminal-objective bound.
+$\mathcal{J}_H(b_t;d)$ and yields the terminal-objective bound.
 \end{proof}
 
 \begin{corollary}[Exact action identification under a true action gap]
@@ -2907,7 +3793,7 @@ For each round $r\in\{0,\dots,R_{\mathrm{si}}-1\}$:
 \begin{enumerate}
     \item initialize the phase predictors from $\mathcal{D}^{(r)}$,
     \item initialize the round-$r$ controller with incumbent $\beta_r$ and
-    execute the exact-$\mathcal{J}_H$ controller on the same $(B,H,x)$ task
+    execute the exact-$\mathcal{J}_H$ controller on the same $(B,H,d)$ task
     until the earlier of global termination and wall-clock deadline
     $\Delta_{r+1}^{\mathrm{si}}$,
     \item let $L_r\in\mathbb{N}_0$ be the number of executed actions in round
@@ -2949,7 +3835,7 @@ For the bounded same-task trace-refresh loop above:
     \[
     K_H(\beta_{r+1})\preceq_K K_H(\beta_r)
     \quad\text{and hence}\quad
-    \mathcal{J}_H(\beta_{r+1};x)\le \mathcal{J}_H(\beta_r;x)
+    \mathcal{J}_H(\beta_{r+1};d)\le \mathcal{J}_H(\beta_r;d)
     \]
     for all $r\in\{0,\dots,R_{\mathrm{si}}-1\}$.
 \end{enumerate}
@@ -3086,16 +3972,15 @@ realized trajectory.
 
 This specification defines a complete constrained tuning capability for
 \texttt{infotheory}. It formalizes a single deployable two-part objective
-$\mathcal{J}_H(z;x)=L_B(z)+C_x(z)$ with hard deployability constraints
+$\mathcal{J}_H(z;d)=8L_B(z)+\ell(z)$ with hard deployability constraints
 (throughput and memory caps),
 mutation grammar, annealed hill-climbing runtime,
 MC-AIXI and AIQI-family runtime environment paths,
 reward--observation interface, reproducibility requirements, and complexity
-profile (including planner-internal simulation budget $N_{\mathrm{sim}}$). It is implementation-guiding for runtime-selectable controller
+profile (including planner-internal simulation budget $N_{\mathrm{sim}}$). It directly guides runtime-selectable controller
 execution across annealed hill climbing, MC-AIXI(FAC-CTW),
-the discounted AIQI controller and the warm-start exact-$\mathcal{J}_H$
-controller, with the
-explicit objective-aligned planner reward interface via
+the discounted AIQI controller, and the warm-start exact-$\mathcal{J}_H$
+controller, with the explicit objective-aligned planner reward interface via
 incumbent objective-difference reward. Finite-budget
 guarantees are non-asymptotic (Section~\ref{sec:annealed-guarantees}); the
 asymptotic theorems are assumption-conditional and out-of-budget scope:
@@ -3124,5 +4009,13 @@ restricted Bayesian mixture over the bounded deployable semantic class, exact
 deployable MDL/MAP equivalence with dominant-term codelength upper bound, and
 an optional truncated-universality dominance baseline under the explicit
 constant-overhead embedding assumption.
+
+The manuscript now also specifies a single causal-conditional semantics for the evaluator:
+passive-byte compression is the singleton-action special case, while
+interactive-trace and causal-prefix datasets code percept targets conditioned on
+zero-cost action/context channels. This preserves one searched object
+$z\mapsto\rho_z$ across ordinary compression and environment-model tuning, and
+it keeps planner-oriented deployment constraints in $H$ without replacing the
+primary predictor-aligned codelength objective by return.
 
 \end{document}
