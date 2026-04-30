@@ -57,16 +57,22 @@ wrapper over the same compression semantics.
 
 Let:
 \begin{itemize}
-    \item $d$ denote the canonical dataset object loaded from
-    \texttt{input\_path},
+    \item $\mathcal{A}_{\mathrm{doc}}$ denote the finite asset-binding map
+    carried by the validated top-level tune document,
+    \item $d$ denote the canonical dataset object loaded from the asset
+    identified by \texttt{input\_asset} through
+    $\mathcal{A}_{\mathrm{doc}}$,
     \item $x \in \{0,\dots,255\}^{n}$ denote the passive-byte specialization
-    of $d$ when \texttt{dataset\_kind} selects the passive-bytes mode,
+    of $d$ when the validated dataset object is classified as passive-byte
+    data,
     \item $N_H(d)\in\mathbb{R}_{>0}$ denote the profile-fixed dataset-size
     functional used for throughput normalization,
-    \item $\mathcal{Z}$ denote the full configuration space,
+    \item $\mathcal{Z}$ denote the full configuration space of canonical
+    \texttt{CompressionBackend} candidates admitted by the tuning grammar,
     \item $B$ denote the user-provided bounds specification,
     \item $H$ denote the fixed deployability profile (hardware/evaluator methodology and resource accounting),
-    \item $z_0 \in \mathcal{Z}$ denote the validated baseline configuration,
+    \item $z_0 \in \mathcal{Z}$ denote the validated baseline candidate
+    embedded in \texttt{baseline\_candidate},
     \item $T_{\mathrm{eval}} > 0$ denote the hard per-candidate wall-clock limit,
     \item $T_{\mathrm{total}} > 0$ denotes the hard total tuning wall-clock budget,
     \item $\theta_{\min}>0$ denote the required minimum throughput floor in
@@ -78,6 +84,14 @@ Define the bounded-valid candidate set:
 \[
 \mathcal{F}(B,H):=\{z \in \mathcal{Z}:\ \mathrm{Valid}_{B,H}(z)=1\}.
 \]
+
+Each $z\in\mathcal{Z}$ is a canonical compression candidate. Evaluation is
+normatively defined by compiling the same candidate through the shared
+\texttt{infotheory} backend/spec pipeline used for ordinary compression
+execution. When the compiled candidate exposes an explicit predictive
+factorization, write $\rho_z$ for the induced chronological predictor. When the
+candidate is given by a direct compression path, $\rho_z$ denotes the
+candidate's normative predictive/codelength semantics under profile $H$.
 
 For each candidate $z$, evaluation returns
 \[
@@ -152,6 +166,14 @@ Define model-code length by canonical bytes
 L_B(z):=\big|\operatorname{ser}(\operatorname{canon}(z))\big|.
 \]
 
+\begin{remark}[Candidate code length versus outer request metadata]
+For the canonical tune document, $L_B(z)$ is measured on the canonical bytes
+of the candidate object $z$ alone, equivalently the canonical bytes of the
+embedded \texttt{CompressionBackend}. Top-level request metadata such as
+\texttt{output\_config\_path}, \texttt{report\_path}, asset bindings, dataset
+identifiers, and executor-side controls do not contribute to $L_B(z)$.
+\end{remark}
+
 Define the deployable set
 \[
 \mathcal{F}^{\mathrm{dep}}(B,H):=
@@ -199,7 +221,7 @@ $u$ has the smaller byte, or (ii) $u$ is a strict prefix of $v$.
 
 Let
 \[
-\mathcal{S}_t:=\left\{z:\ z\text{ has been evaluated by step }t\ \text{and }z\in\mathcal{F}^{\mathrm{dep}}(B,H)\right\}.
+\mathcal{S}_t:=\left\{z:\ z\text{ has been evaluated or cache-reused by step }t\ \text{and }z\in\mathcal{F}^{\mathrm{dep}}(B,H)\right\}.
 \]
 The incumbent is
 \[
@@ -224,15 +246,22 @@ primary, and deterministic canonical bytes are a tie-break only.
 
 \section{Input Contract and Defaults}\label{sec:input-contract}
 
-\subsection{Required fields}
+\subsection{Canonical tune document}
 
+The normative top-level request is a validated \texttt{SpecDocument::Tune}
+document. It may be serialized as canonical JSON or as the versioned binary
+\texttt{itsd} envelope; both encodings denote the same tune request.
+
+Required top-level fields are:
 \begin{itemize}
-    \item \texttt{input\_path: Path}
-    \item \texttt{dataset\_kind: DatasetKind}
-    \item \texttt{objective\_target: ObjectiveTarget}
-    \item \texttt{baseline\_config\_path: Path}
-    \item \texttt{algorithm: ControllerKind}
-    \item \texttt{bounds: BoundsSpec}
+    \item \texttt{schema\_version: 1}
+    \item \texttt{kind: "tune"}
+    \item \texttt{assets: [AssetBinding]} (possibly empty, but required when
+    an asset identifier is referenced)
+    \item \texttt{input\_asset: AssetId}
+    \item \texttt{baseline\_candidate: CompressionBackend}
+    \item \texttt{controller: TuneControllerSpec}
+    \item \texttt{bounds: TuneBoundsSpec}
     \item \texttt{eval\_time\_limit\_seconds: f64}
     \item \texttt{time\_budget\_seconds: f64}
     \item \texttt{min\_throughput\_bytes\_per\_second: f64} with constraint $>0$
@@ -240,6 +269,15 @@ primary, and deterministic canonical bytes are a tie-break only.
     \item \texttt{output\_config\_path: Path}
     \item \texttt{seed: u64}
 \end{itemize}
+
+Optional top-level fields are:
+\begin{itemize}
+    \item \texttt{report\_path: Option<Path>}
+\end{itemize}
+
+Each \texttt{AssetBinding} is a pair \texttt{(id, path)}. Relative asset paths
+are resolved against the tune document base directory; absolute paths are
+preserved.
 
 Define the throughput floor parameter by
 \[
@@ -258,9 +296,16 @@ Define the memory-cap parameter by
 \mu_{\max}:=\texttt{max\_memory\_bytes}\in\mathbb{R}_{>0}.
 \]
 
-Define dataset mode by
+\subsection{Derived semantic classifiers and controller kinds}
+
+The canonical tune document does \emph{not} carry independent
+\texttt{dataset\_kind}, \texttt{objective\_target}, or
+\texttt{planner\_reward\_mode} fields. These are derived semantic classifiers
+after document validation.
+
+Define the internal dataset classifier by
 \[
-\texttt{DatasetKind}\in
+\operatorname{DatasetKind}(d)\in
 \left\{
 \begin{aligned}
 &\texttt{"passive\_bytes"},\ \texttt{"interactive\_trace"},\\
@@ -269,9 +314,9 @@ Define dataset mode by
 \right\}.
 \]
 
-Define evaluator target semantics by
+Define the derived evaluator-target classifier by
 \[
-\texttt{ObjectiveTarget}\in
+\operatorname{ObjectiveTarget}(d,H)\in
 \left\{
 \begin{aligned}
 &\texttt{"passive\_ac"},\\
@@ -281,31 +326,36 @@ Define evaluator target semantics by
 \right\}.
 \]
 
-Compatibility rules are normative:
+Compatibility and derivation rules are normative:
 \begin{itemize}
-    \item if \texttt{dataset\_kind} selects the passive-bytes mode, then
-    \texttt{input\_path} loads a raw byte string, and the normative default
-    \texttt{objective\_target} is \texttt{"passive\_ac"},
-    \item if \texttt{dataset\_kind} selects the interactive-trace mode, then
-    \texttt{input\_path} loads a canonical typed causal trace, and
-    \texttt{objective\_target} must select either the interactive-causal-AC
-    mode or the planner-deployable-model mode,
-    \item if \texttt{dataset\_kind} selects the causal-prefix-dataset mode, then
-    \texttt{input\_path} loads a canonical finite causal prediction dataset
-    (equivalently, a prefix tree/DAG of prediction examples), and
-    \texttt{objective\_target} must select either the interactive-causal-AC
-    mode or the planner-deployable-model mode,
-    \item if \texttt{objective\_target} selects the
-    planner-deployable-model mode, it
-    preserves the same causal code-length objective as
-    \texttt{"interactive\_causal\_ac"}; it changes only deployability
-    constraints and diagnostics as specified in
-    Section~\ref{sec:causal-evaluator}.
+    \item if \texttt{input\_asset} resolves to a raw byte string, then
+    $\operatorname{DatasetKind}(d)=\texttt{"passive\_bytes"}$ and the default
+    derived evaluator target is \texttt{"passive\_ac"},
+    \item if \texttt{input\_asset} resolves to a canonical typed causal trace,
+    then
+    $\operatorname{DatasetKind}(d)=\texttt{"interactive\_trace"}$ and the
+    default derived evaluator target is \texttt{"interactive\_causal\_ac"},
+    \item if \texttt{input\_asset} resolves to a canonical finite causal
+    prediction dataset, then
+    $\operatorname{DatasetKind}(d)=\texttt{"causal\_prefix\_dataset"}$ and the
+    default derived evaluator target is \texttt{"interactive\_causal\_ac"},
+    \item \texttt{controller.kind} selects the search controller only; it does
+    not by itself change the dataset classifier or the primary evaluator
+    target,
+    \item a planner-facing controller may optimize candidates on either passive
+    or causal datasets, because the planner-facing environment is the tuner
+    search process over candidates rather than necessarily the external dataset
+    being scored,
+    \item the derived evaluator target is upgraded to
+    \texttt{"planner\_deployable\_model"} only when the fixed deployability
+    profile $H$ requests planner-deployability constraints for the returned
+    candidate; this upgrade changes feasibility constraints and diagnostics,
+    but not the primary objective $8L_B(z)+\ell(z)$.
 \end{itemize}
 
 Define runtime controller kind by
 \[
-\texttt{ControllerKind}\in
+\texttt{controller.kind}\in
 \left\{
 \begin{aligned}
 &\texttt{"annealed\_hill\_climbing"},\ \texttt{"mc\_aixi\_fac\_ctw"},\\
@@ -314,97 +364,149 @@ Define runtime controller kind by
 \right\}.
 \]
 
-Define planner reward mode by
-\[
-\texttt{PlannerRewardMode}\in
-\left\{
-\begin{aligned}
-&\texttt{"exact\_objective\_difference"},\\
-&\texttt{"normalized\_clipped\_improvement"},\\
-&\texttt{"quantized\_objective\_difference"}
-\end{aligned}
-\right\}.
-\]
-
 Runtime dispatch is normative:
 \begin{itemize}
-    \item if \texttt{algorithm = "annealed\_hill\_climbing"}, execute
+    \item if \texttt{controller.kind = "annealed\_hill\_climbing"}, execute
     Section~\ref{sec:ahc-runtime},
-    \item if \texttt{algorithm} is \texttt{mc\_aixi\_fac\_ctw},
-    \texttt{aiqi\_discounted}, or
-    \texttt{aiqi\_warmstart\_exact\allowbreak\_jh},
-    execute
+    \item if \texttt{controller.kind} is
+    \texttt{mc\_aixi\_fac\_ctw}, \texttt{aiqi\_discounted}, or
+    \texttt{aiqi\_warmstart\_exact\allowbreak\_jh}, execute
     Section~\ref{sec:aixi-runtime}.
 \end{itemize}
 
-Controller-specific required fields:
+Planner-facing controllers additionally carry a
+\texttt{PlannerInterfaceSpec} subobject
+\[
+\texttt{interface}=
+(\texttt{observation\_bits},\texttt{observation\_stream\_len},
+\texttt{observation\_key\_mode},\texttt{reward\_bits},
+\texttt{agent\_actions},\texttt{min\_reward},\texttt{max\_reward},
+\texttt{reward\_offset}),
+\]
+where these fields are part of the current shared public type:
 \begin{itemize}
-    \item for \texttt{mc\_aixi\_fac\_ctw}, \texttt{aiqi\_discounted}, and
-    \texttt{aiqi\_warmstart\_exact\allowbreak\_jh}:
-    \begin{itemize}
-        \item \texttt{agent\_actions}
-        \item \texttt{observation\_bits}
-        \item \texttt{observation\_stream\_len}
-        \item \texttt{planner\_reward\_mode: PlannerRewardMode}
-        \item \texttt{planner\_simulations\_per\_step}\((\in\mathbb{N},\ge 1)\)
-    \end{itemize}
-    \item for all planner reward modes additionally:
-    \begin{itemize}
-        \item \texttt{reward\_bits}
-    \end{itemize}
-    \item for reward mode
-    \texttt{exact\_objective\_difference} optionally, when using the
-    legacy affine integer exact-encoding shortcut:
-    \begin{itemize}
-        \item \texttt{min\_reward}
-        \item \texttt{max\_reward}
-        \item \texttt{reward\_offset}
-    \end{itemize}
-    \item for \texttt{aiqi\_discounted} additionally:
-    \begin{itemize}
-        \item \texttt{planner\_reward\_mode} must be
-        \texttt{"normalized\_clipped\_}\allowbreak\texttt{improvement"}
-        \item \texttt{return\_horizon}\(\in\mathbb{N},\ge 1\)
-        \item \texttt{return\_bins}\(\in\mathbb{N},\text{power of two}\)
-        \item \texttt{discount\_factor}\(\in[0,1)\)
-        \item \texttt{reward\_bits} defines the finite immediate-reward symbol channel
-        used to encode normalized clipped one-step improvement rewards.
-        \item \texttt{min\_reward} and \texttt{max\_reward} define the
-        clipping interval, with \texttt{max\_reward > min\_reward}
-    \end{itemize}
-    \item for \texttt{aiqi\_warmstart\_exact\allowbreak\_jh} additionally:
-    \begin{itemize}
-        \item \texttt{planner\_reward\_mode} must be one of the two
-        objective-difference modes defined above
-        \item \texttt{return\_horizon}\(\in\mathbb{N},\ge 1\)
-        \item \texttt{warmstart\_teacher\_dataset\_path: Path}
-        (initial same-task teacher data)
-        \item \texttt{label\_phase\_period}
-        \((\in\mathbb{N},\ge\texttt{return\_horizon})\)
-    \end{itemize}
-    \item for \texttt{mc\_aixi\_fac\_ctw} additionally,
-    \texttt{planner\_reward\_mode} must be the exact
-    objective-difference mode defined above.
-    \item for
-    \texttt{objective\_target} selects the planner-deployable-model mode
-    additionally:
-    \begin{itemize}
-        \item \texttt{min\_predicts\_per\_second}\((\in\mathbb{R}_{>0})\)
-        \item \texttt{max\_model\_state\_bytes}\((\in\mathbb{N},>0)\)
-        \item \texttt{max\_clone\_nanoseconds}\((\in\mathbb{N},>0)\)
-        \item \texttt{max\_snapshot\_bytes}\((\in\mathbb{N},>0)\)
-        \item \texttt{max\_update\_nanoseconds}\((\in\mathbb{N},>0)\)
-        \item \texttt{max\_restore\_nanoseconds}\((\in\mathbb{N},>0)\)
-        \item \texttt{required\_sampling: bool}
-        \item \texttt{required\_log\_prob: bool}
-    \end{itemize}
-    \item for \texttt{"annealed\_hill\_climbing"}:
-    \texttt{max\_mutation\_radius}.
+    \item \texttt{agent\_actions} is a non-zero action-alphabet cardinality,
+    \item \texttt{observation\_key\_mode} is one of
+    \texttt{"first"}, \texttt{"last"}, \texttt{"stream\_hash"}, or
+    \texttt{"full\_stream"},
+    \item \texttt{reward\_bits} declares the finite encoded reward-alphabet
+    width,
+    \item because the current shared public type includes them,
+    \texttt{min\_reward}, \texttt{max\_reward}, and
+    \texttt{reward\_offset} are always syntactically present in v1 and must
+    satisfy the shared document-validation bounds for shifted reward
+    encodability.
 \end{itemize}
+
+The field \texttt{observation\_key\_mode} specifies the planner-visible
+branching key derived from the encoded observation stream $o_{1:m}$. This
+branching key is a runtime search-tree representation, distinct from the fixed
+encoded observation stream itself and distinct from the exact-state encoder
+$\Psi_H$ of Section~\ref{sec:aixi-embedding}. For the built-in modes, write
+\[
+\widehat{\mathcal O}_B:=\{0,\dots,2^{64}-1\},
+\qquad
+\mathcal{K}_B^{(L_O)}:=\bigsqcup_{\ell=1}^{L_O}\widehat{\mathcal O}_B^\ell.
+\]
+Then each built-in \texttt{observation\_key\_mode} deterministically maps a
+validated encoded observation stream to an element of
+$\mathcal{K}_B^{(L_O)}$:
+\begin{itemize}
+    \item \texttt{"full\_stream"} returns the full stream
+    $(o_1,\dots,o_m)$ unchanged and is the paper-accurate expectimax mode,
+    \item \texttt{"first"} returns the singleton key $(o_1)$, or $(0)$ on the
+    empty stream,
+    \item \texttt{"last"} returns the singleton key $(o_m)$, or $(0)$ on the
+    empty stream,
+    \item \texttt{"stream\_hash"} masks each symbol to the declared
+    \texttt{observation\_bits}, initializes $h_0:=0$, updates
+    $h_{i+1}:=\operatorname{rotl}_7(h_i)\oplus(o_i\wedge \mathrm{mask})$, and
+    returns the singleton key $(h_m)$.
+\end{itemize}
+Here $\operatorname{rotl}_7$ denotes 64-bit left rotation by seven positions.
+For the hash mode, write $b_O:=\texttt{observation\_bits}$; then
+$\mathrm{mask}=0$ when $b_O=0$, $\mathrm{mask}=2^{b_O}-1$ when
+$1\le b_O<64$, and $\mathrm{mask}=2^{64}-1$ when $b_O\ge 64$.
+Under the standard planner interface, a conforming upstream observation adapter
+emits exactly $L_O$ encoded observation symbols per external decision step, so
+the built-in \texttt{"full\_stream"} mode returns an element of
+$\widehat{\mathcal O}_B^{L_O}$ while the other built-in modes return singleton
+keys in $\widehat{\mathcal O}_B^1$. All non-\texttt{"full\_stream"} modes are
+lossy single-key projections of a possibly longer observation stream. Among the
+built-in modes, only \texttt{"full\_stream"} is eligible for the exact-state
+observation path by default; any other mode requires a proof that the induced
+projection is injective on the planner state space relevant to the theorem
+being claimed. The precise observation adapter specification $\eta_O$,
+including any upstream encoding of raw environment observations into the stream
+consumed here and any fixed-length validation rule, must be recorded in
+provenance.
+
+For normalized-clipped-improvement semantics and for the legacy affine integer
+exact-encoding shortcut, the interface triple
+\[
+(\texttt{min\_reward},\texttt{max\_reward},\texttt{reward\_offset})
+\]
+carries the operative reward interval and unsigned-shift encoding semantics.
+For general exact-objective-difference semantics, this triple does not by
+itself define the exact scalar representation.
+
+For exact-objective-difference semantics, the implementation must additionally
+fix or derive a finite canonical scalar representation
+\[
+\mathbb{V}_H^{\mathcal J}
+\]
+for exact objective values and objective differences. This representation may
+be supplied by fixed evaluator numeric semantics, by an implementation-internal
+declaration, or by the deployability profile $H$, but it must be recorded in
+provenance. The interface triple above is not the general exact reward
+representation.
+
+Controller-specific required fields are:
+\begin{itemize}
+    \item for \texttt{controller.kind = "annealed\_hill\_climbing"}:
+    \texttt{controller.max\_mutation\_radius}\((\in\mathbb{N},\ge 1)\),
+    \item for \texttt{controller.kind = "mc\_aixi\_fac\_ctw"}:
+    \texttt{controller.interface} and
+    \texttt{controller.planner\_simulations\_per\_step}\((\in\mathbb{N},\ge 1)\).
+    This tuning controller uses the canonical sequential $\rho$UCT path; the
+    tune document does not expose a separate \texttt{mcts\_strategy} field,
+    \item for \texttt{controller.kind = "aiqi\_discounted"}:
+    \texttt{controller.interface},
+    \texttt{controller.planner\_simulations\_per\_step}\((\in\mathbb{N},\ge 1)\),
+    \texttt{controller.return\_horizon}\((\in\mathbb{N},\ge 1)\),
+    \texttt{controller.return\_bins}\((\in\mathbb{N},\text{power of two})\),
+    and \texttt{controller.discount\_factor}\((\in[0,1))\),
+    \item for \texttt{controller.kind = "aiqi\_warmstart\_exact\allowbreak\_jh"}:
+    \texttt{controller.interface},
+    \texttt{controller.planner\_simulations\_per\_step}\((\in\mathbb{N},\ge 1)\),
+    \texttt{controller.return\_horizon}\((\in\mathbb{N},\ge 1)\),
+    \texttt{controller.warmstart\_teacher\_dataset\_asset: AssetId},
+    and
+    \texttt{controller.label\_phase\_period}\((\in\mathbb{N},\ge\texttt{return\_horizon})\).
+    The canonical tune document does not surface a separate
+    \texttt{return\_bins} field for this controller; its exact label alphabet
+    is induced by the exact scalar representation and the declared interface
+    reward encoding.
+\end{itemize}
+
+Planner reward semantics are derived from the controller family:
+\begin{itemize}
+    \item \texttt{"mc\_aixi\_fac\_ctw"} and
+    \texttt{"aiqi\_warmstart\_exact\_jh"} induce
+    \texttt{"exact\_objective\_difference"} semantics,
+    \item \texttt{"aiqi\_discounted"} induces
+    \texttt{"normalized\_clipped\_improvement"} semantics.
+\end{itemize}
+
+If an implementation additionally offers a quantized objective-difference
+variant for an exact-family planner environment, that choice is an internal
+execution-profile declaration recorded in provenance rather than a distinct
+top-level tune-document field.
 
 \subsection{Normative input precondition: deployable baseline}\label{subsec:baseline-precondition}
 
-After loading and canonicalizing the baseline candidate
+After validating the top-level tune document, loading $d$ from
+\texttt{input\_asset}, and canonicalizing the embedded baseline candidate
 \[
 z_0^{\mathrm{can}}:=\operatorname{canon}(z_0),
 \]
@@ -422,27 +524,35 @@ performed. This precondition is normative for all controller choices.
 
 \subsection{Execution controls}
 
-Recommended controls include:
+The canonical tune document above is the normative candidate-facing input
+surface. An implementation may additionally expose executor-side controls that
+do not change candidate identity, such as:
 \begin{itemize}
     \item \texttt{max\_evaluations}
     \item \texttt{cpu\_affinity}
     \item \texttt{threads}
     \item \texttt{warmup\_baseline\_runs}
     \item \texttt{self\_improvement\_rounds}
-    \item \texttt{max\_mutation\_radius}
     \item \texttt{stagnation\_reset\_evals}
     \item \texttt{log\_path}
     \item \texttt{diagnostic\_chunk\_bytes}
-    \item \texttt{report\_path} for detailed report output
+    \item executor-local logging destinations
 \end{itemize}
 
-For \texttt{"annealed\_hill\_climbing"}, \texttt{max\_mutation\_radius} is
-normative and required.
+These controls belong to the executor profile rather than to the canonical
+candidate/request surface, unless an implementation explicitly lifts them into
+an outer wrapper format. They must be recorded in provenance whenever they can
+affect metrics or runtime behavior.
+
+For \texttt{controller.kind = "annealed\_hill\_climbing"},
+\texttt{controller.max\_mutation\_radius} is normative and required.
 
 Define baseline warmup count by
 \[
 w_{\mathrm{base}}:=\texttt{warmup\_baseline\_runs}\in\mathbb{N}_0.
 \]
+When this executor-side control is not exposed, the default is
+$w_{\mathrm{base}}=0$.
 Warmup semantics are normative:
 \begin{itemize}
     \item execute exactly $w_{\mathrm{base}}$ baseline warmup evaluations before
@@ -457,14 +567,19 @@ Warmup semantics are normative:
 Warmup policy is evaluator-relevant and must be included in
 $\eta_{\mathrm{eval}}$ and provenance.
 
-Define stagnation-reset threshold by
+Define stagnation reset threshold by
 \[
-\kappa_{\mathrm{stag}}:=\texttt{stagnation\_reset\_evals}\in\mathbb{N}.
+\kappa_{\mathrm{stag}}:=
+\begin{cases}
+\texttt{stagnation\_reset\_evals}, & \text{if exposed by the executor profile},\\
++\infty, & \text{otherwise.}
+\end{cases}
 \]
+When $\kappa_{\mathrm{stag}}=+\infty$, stagnation reset is disabled.
 
 Define the mutation-radius cap by
 \[
-r_{\mathrm{mut}}^{\max}:=\texttt{max\_mutation\_radius}\in\mathbb{N},
+r_{\mathrm{mut}}^{\max}:=\texttt{controller.max\_mutation\_radius}\in\mathbb{N},
 \qquad
 r_{\mathrm{mut}}^{\max}\ge 1.
 \]
@@ -497,10 +612,12 @@ These controls affect runtime behavior and reproducibility, not the candidate se
 
 This section gives the unified evaluator abstraction behind passive-byte
 compression and active environment-model tuning. It does not change the
-searched object: every candidate still denotes a predictor. What changes is the
-dataset lowering and, when requested, the deployability profile.
+searched object: every candidate still denotes a canonical compression backend
+whose predictive semantics are scored by one causal-conditional evaluator.
+What changes is the dataset lowering and, when requested, the deployability
+profile.
 
-\subsection{Unified chronological predictor object}
+\subsection{Unified chronological compression candidate and induced predictor}
 
 Let $\mathcal{A}$ be a finite action alphabet and let $\mathcal{X}$ be a
 finite percept alphabet. In the interactive setting, a percept is a coded tuple
@@ -509,7 +626,8 @@ x_t=(o_t,r_t,d_t)\in\mathcal{X},
 \]
 where $o_t$ is observation, $r_t$ is reward, and $d_t$ is the terminal flag.
 
-A candidate $z\in\mathcal{Z}$ denotes a chronological conditional predictor
+A candidate $z\in\mathcal{Z}$ denotes a compiled compression backend with an
+induced chronological conditional predictor
 \[
 \rho_z(x_t\mid h_{<t},a_t),
 \qquad
@@ -554,7 +672,7 @@ stream and any profile-fixed throughput convention attached to $H$.
 \begin{proposition}[Passive and interactive tuning share one MDL schema]
 \label{prop:causal-mdl-unification}
 Let $D$ be a finite causal prediction dataset and let each candidate
-$z\in\mathcal{Z}$ denote a chronological conditional predictor $\rho_z$.
+$z\in\mathcal{Z}$ induce a chronological conditional predictor $\rho_z$.
 Then the deployability-gated two-part score
 $\mathcal{J}_H^{\mathrm{causal}}(z;D)$ is the exact analogue of the ordinary
 passive compression tuner objective. If $\mathcal{A}=\{\bot\}$ and $D$ is the
@@ -584,7 +702,7 @@ Fix a finite horizon $T$, a data-collection policy $\pi$, and a true
 environment law $\nu(\cdot\mid h,a)$ on the same action/percept alphabets.
 Adopt the conventions $A_0:=\bot$ and $H_{<0}:=\varnothing$ for the initial
 percept term.
-Then for every candidate predictor $\rho_z$,
+Then for every induced candidate predictor $\rho_z$,
 \[
 \mathbb{E}_{\pi,\nu}
 \left[
@@ -772,12 +890,13 @@ an explicit tagged-passive profile is selected.
 
 \subsection{Normative dataset kinds and canonical lowerings}
 
-The evaluator accepts exactly one canonical dataset object, selected by
-\texttt{dataset\_kind}, and lowers it to a typed causal event stream.
+The evaluator accepts exactly one canonical dataset object loaded from
+\texttt{input\_asset}. After validation, that object determines one of three
+internal dataset classifications and lowers to a typed causal event stream.
 
 \paragraph{Passive bytes.}
-If \texttt{dataset\_kind} selects the passive-bytes mode, then
-\texttt{input\_path} loads a raw byte string
+If \texttt{input\_asset} resolves to raw byte data, then the dataset is the raw
+byte string
 $x=x_1\dots x_n\in\{0,\dots,255\}^{n}$. The canonical lowering is the target
 only stream
 \[
@@ -787,8 +906,8 @@ only stream
 This is exactly the ordinary passive compression path.
 
 \paragraph{Interactive trace.}
-If \texttt{dataset\_kind} selects the interactive-trace mode, then
-\texttt{input\_path} loads a canonical typed causal trace. Its file header must
+If \texttt{input\_asset} resolves to a canonical typed causal trace, its file
+header must
 fix at least:
 \begin{itemize}
     \item schema version,
@@ -817,9 +936,8 @@ Packing these into one percept target is also conforming if the codec is fixed,
 canonical, and shared by encoder and decoder via $H$.
 
 \paragraph{Causal prefix dataset.}
-If \texttt{dataset\_kind} selects the causal-prefix mode, then
-\texttt{input\_path} loads a canonical finite causal prediction dataset.
-Equivalently, it loads a prefix tree/DAG of histories with weighted
+If \texttt{input\_asset} resolves to a canonical finite causal prediction
+dataset, then it loads a prefix tree/DAG of histories with weighted
 action--percept examples. Each example stores $(h_i,a_i,x_i,w_i)$ and is
 scored by first resetting evaluator state, then replaying $h_i$ using
 zero-cost structural conditioning and zero-cost percept observation,
@@ -864,9 +982,13 @@ action/percept concatenation as an undifferentiated byte stream.
 
 \subsection{Planner deployability profile and claim boundary}
 
-If \texttt{objective\_target} selects the planner-deployable-model mode, the
-primary score
-remains the same predictor-aligned two-part objective
+When the fixed deployability profile $H$ requests planner-deployability
+constraints for the returned candidate, the derived evaluator target is the
+planner-deployable-model mode. This upgrade is independent of the
+search-controller choice: planner-family controllers may optimize either
+passive-byte or causal datasets without thereby forcing planner-deployable
+output semantics. The primary score remains the same candidate-aligned two-part
+codelength objective
 \[
 8L_B(z)+\ell_D(z).
 \]
@@ -923,20 +1045,32 @@ Strongly recommended optional bounds are:
     \item \texttt{forbidden\_expert\_pairs}
 \end{itemize}
 
+The canonical names used in \texttt{allowed\_backends},
+\texttt{forbidden\_backends}, \texttt{required\_experts}, and
+\texttt{forbidden\_expert\_pairs} are \texttt{infotheory}'s canonical backend
+family names from the validated registry. On generic rate-coded compressors,
+these names refer to the nested rate-backend graph; on direct compression
+families with no nested rate backend, they refer to the compression-backend
+family itself. Parameter-range identifiers are canonical candidate-parameter
+paths over the candidate abstract syntax tree.
+
 \subsection{Candidate validity predicate}
 
 Define $\mathrm{Valid}_{B,H}(z)=1$ iff all hold:
 \begin{enumerate}
     \item schema conformance,
     \item bounds conformance,
-    \item backend/library validation,
+    \item backend/library validation and successful compilation under the
+    current build,
     \item referenced backend/method availability in the current build,
-    \item every external reference in $z$ is a canonical identifier for a
-    member of the shared side-information registry
-    $\mathcal{S}_H^{\mathrm{side}}$; raw filesystem paths, URLs, and
-    undeclared external assets are forbidden,
+    \item every outer-request asset reference is declared in the top-level
+    \texttt{assets} list, and $z$ itself contains no candidate-local
+    filesystem path, URL, \texttt{spec\_path} indirection, \texttt{model\_path}
+    field, or \texttt{file:...} method reference,
     \item mixture nesting depth $\le$ \texttt{max\_mixture\_nesting\_depth},
-    \item per-node expert count in required interval.
+    \item per-node expert count in required interval,
+    \item any controller-induced or deployability-profile-induced backend
+    capability predicates required by the selected planner semantics hold.
 \end{enumerate}
 
 Invalid candidates are never evaluated.
@@ -989,23 +1123,20 @@ tie-breaking keys throughout this document. Required semantic properties are:
     \item prefix-free code image over canonical candidates.
 \end{itemize}
 
-\begin{remark}[Side-information policy]
-Let $H$ include a fixed shared side-information registry
-\[
-\mathcal{S}_H^{\mathrm{side}}=\{s_1,\dots,s_m\},
-\]
-available identically to encoder and decoder.
+\begin{remark}[Top-level assets versus candidate-local assets]
+The validated tune document may carry a finite top-level asset map
+$\mathcal{A}_{\mathrm{doc}}$ for outer-request data. In tuner v1, these assets
+are reserved for the canonical dataset object referenced by
+\texttt{input\_asset} and, when present, the warm-start teacher dataset
+referenced by \texttt{warmstart\_teacher\_dataset\_asset}. These outer assets
+are fixed by the request and do not contribute to $L_B(z)$.
 
-A candidate may reference shared side-information only through canonical
-identifiers for members of $\mathcal{S}_H^{\mathrm{side}}$. The identifier, if
-present, is part of the serialized candidate code $\kappa_B(z)$ and therefore
-contributes to $L_B(z)$; the contents of the referenced shared asset do not
-contribute to $L_B(z)$ because they are fixed by $H$.
-
-Any candidate-specific external file, model weights, dictionary, URL, raw
-filesystem path, or other undeclared external asset is forbidden. If evaluation
-attempts to access such an asset, the candidate is invalid with diagnostic
-reason \texttt{undeclared\_external\_asset}.
+Candidate-local external files, model weights, dictionaries, URLs, raw
+filesystem paths, \texttt{spec\_path} indirections, \texttt{model\_path}
+fields, and \texttt{file:...} method references are forbidden inside the tuned
+candidate search space. If evaluation encounters such a candidate-local asset
+reference, the candidate is invalid with diagnostic reason
+\texttt{candidate\_external\_asset\_forbidden}.
 \end{remark}
 
 Define canonical cache key
@@ -1015,14 +1146,14 @@ Define canonical cache key
 \]
 where $\eta_{\mathrm{eval}}$ are evaluator-relevant execution controls and
 $\operatorname{Hash}(d)$ is the canonical dataset identity hash for the object
-loaded from \texttt{input\_path}. In passive-byte mode, $d=x$. All cache
+loaded from \texttt{input\_asset}. In passive-byte mode, $d=x$. All cache
 lookups and inserts use this key.
 
 Normatively,
 $\eta_{\mathrm{eval}}$ must include every evaluator-side choice that can affect
 metrics or semantics, including at minimum:
 \begin{itemize}
-    \item \texttt{dataset\_kind} and \texttt{objective\_target},
+    \item the derived dataset classifier and derived evaluator target,
     \item dataset-lowering version and codec hash,
     \item event-grammar and target-domain-support rules (or their hash
     commitments),
@@ -1031,7 +1162,8 @@ metrics or semantics, including at minimum:
     \item weighted-prefix replay semantics,
     \item whether physical byte artifacts are materialized,
     \item planner deployability profile switches,
-    \item build/features, evaluator determinism settings, and warmup policy.
+    \item build/features, evaluator determinism settings, warmup policy, and
+    candidate canonicalization classification/version.
 \end{itemize}
 Two evaluations that differ on any such item are semantically distinct and must
 not collide in cache.
@@ -1090,7 +1222,7 @@ candidate $z$, write
 \]
 for the skeleton-conditioned likelihood induced by the typed causal evaluator.
 In passive-byte mode this is exactly the ordinary sequential likelihood of the
-byte string under the candidate predictor.
+byte string under the candidate's induced predictor.
 
 Write $\ell_D(z):=\ell(z)$ for the operational target loss in bits on the
 fixed dataset $D$, and write
@@ -1711,14 +1843,14 @@ Output must include:
 
 \section{Reward and Observation (Future Environment Compatibility)}\label{sec:reward-observation}
 
-This section specifies the normative planner-reward modes.
+This section specifies the normative planner-reward semantics.
 Candidate validity, evaluator semantics, objective-feasibility semantics
 (including throughput and memory deployability constraints), and output
 definition remain shared across controller choices.
 
-\subsection{Planner reward modes and encoded reward semantics}
+\subsection{Planner reward semantics and encoded reward symbols}
 
-Planner controllers expose one of the following reward modes:
+Planner-facing controllers induce one of the following reward semantics:
 \begin{itemize}
     \item \texttt{exact\_objective\_difference}: exact incumbent-objective
     decrease in the same bit-valued objective $\mathcal{J}_H$ used by the tuner,
@@ -1729,6 +1861,17 @@ Planner controllers expose one of the following reward modes:
     quantization of objective-difference reward for finite-alphabet controller
     interfaces.
 \end{itemize}
+
+The canonical tune document does not expose these as an independent top-level
+field. In the normative tuning surface,
+\texttt{"mc\_aixi\_fac\_ctw"} and
+\texttt{"aiqi\_warmstart\_exact\_jh"} induce
+\texttt{"exact\_objective\_difference"} semantics, whereas
+\texttt{"aiqi\_discounted"} induces
+\texttt{"normalized\_clipped\_improvement"} semantics. A quantized
+objective-difference variant, if an implementation offers one internally, is an
+execution-profile declaration recorded in provenance rather than a distinct
+tune-document field.
 
 Let
 \[
@@ -1749,9 +1892,9 @@ and a semantic reward decoder
 \[
 V_H:\mathcal{R}_B^{\mathrm{enc}}\to\mathbb{R}_{\ge 0}
 \]
-according to the selected reward mode.
+according to the controller-induced reward semantics.
 
-For \texttt{exact\_objective\_difference}, the implementation must fix a
+For exact-objective-difference semantics, the implementation must fix a
 finite canonical scalar representation
 \[
 \mathbb{V}_H^{\mathcal J}\subset\mathbb{R}_{\ge 0}
@@ -1759,6 +1902,16 @@ finite canonical scalar representation
 for objective values and objective differences. Examples include a fixed-width
 IEEE-754 representation with non-finite values forbidden, a fixed-point rational
 lattice, or another deterministic finite numeric code declared by $H$.
+
+\begin{remark}[Exactness is relative to the declared scalar semantics]
+For exact-objective-difference semantics, ``exact'' means exact with respect to
+the finite scalar representation $\mathbb{V}_H^{\mathcal J}$ declared by $H$.
+If the evaluator uses canonical IEEE-754 arithmetic, then non-finite values are
+forbidden, rounding behavior must be deterministic, and theorem claims concern
+the induced finite floating-point objective. If exact rational or fixed-point
+arithmetic is selected instead, theorem claims concern that representation.
+Implementations must not silently mix scalar representations within one run.
+\end{remark}
 
 Conformance requires that every deployable objective value emitted by the
 evaluator lies in this representation:
@@ -1797,12 +1950,13 @@ if $2^{b_R}$ is too small for the declared representation, or if the evaluator
 cannot guarantee that all exact-mode objective values and differences are
 represented exactly.
 
-The interval fields \texttt{min\_reward}, \texttt{max\_reward}, and
-\texttt{reward\_offset} are optional legacy conveniences for the special case
-where $\mathbb{V}_H^{\mathcal J}$ is an integer interval encoded by an affine
-integer map; they are not the general exact reward semantics.
+The syntactically present interface fields \texttt{min\_reward},
+\texttt{max\_reward}, and \texttt{reward\_offset} are legacy conveniences for
+the special case where $\mathbb{V}_H^{\mathcal J}$ is an integer interval
+encoded by an affine integer map; they are not the general exact reward
+semantics.
 
-For \texttt{quantized\_objective\_difference}, the implementation must declare
+For quantized objective-difference semantics, the implementation must declare
 a deterministic quantizer
 \[
 Q_H^{\mathrm{quant}}:\mathbb{R}_{\ge 0}\to\{0,\dots,2^{b_R}-1\}
@@ -1824,7 +1978,7 @@ $\mathcal{J}_H$ planner theorems apply only to the quantized objective induced
 by $V_H^{\mathrm{quant}}\circ Q_H^{\mathrm{quant}}$, not to the original
 real-valued objective unless the quantizer is exact on the reachable reward set.
 
-For \texttt{normalized\_clipped\_improvement}, define
+For normalized-clipped-improvement semantics, define
 \[
 \operatorname{clamp}_{[0,1]}(x):=\min\!\bigl(\max(x,0),1\bigr)
 \]
@@ -1856,7 +2010,7 @@ V_H(\Omega_H(r))
 :=
 V_H^{\mathrm{clip}}\!\left(\Omega_H^{\mathrm{clip}}(\widehat r_H(r))\right).
 \]
-This mode is the normative reward mode for
+This mode is the normative reward semantics for
 \texttt{aiqi\_discounted}. It does not require an exact reward alphabet large
 enough to injectively encode $\mathbb{V}_H^{\mathcal J}$, and it does not
 support exact $\mathcal{J}_H$ planner theorems.
@@ -2021,7 +2175,7 @@ semantics.
 \section{Core Properties}
 
 \begin{proposition}[Feasibility safety]
-Any returned $z_{\mathrm{best}}$ is a deployable evaluated candidate satisfying
+Any returned $z_{\mathrm{best}}$ is a deployable evaluated or cache-reused candidate satisfying
 bounds, timeout feasibility, minimum-throughput, and memory-cap constraints.
 \end{proposition}
 
@@ -2266,17 +2420,23 @@ validity, or output semantics.
 
 \section{Implementation Constraints for \texttt{infotheory}}
 
-\subsection{Semantic equivalence to normal compression path}
+\subsection{Semantic equivalence to the shared spec/runtime pipeline}
 
-Evaluation must preserve the same semantics as normal compression invocation (e.g., the existing mixture JSON path via \texttt{--rate-backend mixture} with \texttt{--method} file input). Library-internal calls are acceptable only if behavior is equivalent.
+Evaluation must preserve the same semantics as compiling and executing the same
+candidate through the shared \texttt{CompressionBackend}/\texttt{SpecDocument}
+validation and runtime pipeline. The tuner must not introduce a second
+candidate parser, a second method-normalization path, or a second canonicalizer
+for backend graphs. Library-internal calls are acceptable only if they are
+behaviorally equivalent to the standalone compiled backend path.
 
 \subsection{CLI exposure}
 
 Expose capability as
 \begin{verbatim}
-infotheory tune <spec.json>
+infotheory tune <spec.json|spec.itsd>
 \end{verbatim}
-with file-based specification, consistent with other JSON-configured modes.
+with one canonical \texttt{"kind": "tune"} top-level document, consistent
+with the shared spec-document loader.
 
 \subsection{Required report and provenance fields}
 
@@ -2302,15 +2462,16 @@ The structured report should record at minimum:
     $\tau_{\theta}=N_H(d)/\theta_{\min}$, with $\tau_{\theta}=n/\theta_{\min}$
     in passive-byte mode,
     \item configured memory cap $\mu_{\max}$,
-    \item dataset path and dataset content hash,
-    \item baseline config hash,
-    \item initial teacher-dataset provenance/hash (if used),
+    \item input asset identifier, resolved dataset path, and dataset content hash,
+    \item baseline candidate canonical hash and baseline candidate model bytes
+    $L_B(z_0)$,
+    \item initial teacher-dataset asset identifier and provenance/hash (if used),
     \item warmup policy and warmup count $w_{\mathrm{base}}$,
     \item self-improvement round count $R_{\mathrm{si}}$ and realized per-round trace counts (if enabled),
     \item bounds hash,
-    \item canonicalization order-classification identifier/version (or hash commitment),
+    \item candidate canonicalization classification identifier/version (or hash commitment),
     \item observation-adapter or exact-state encoder specification (or hash commitment),
-    \item output config hash.
+    \item output candidate canonical hash and output config path.
 \end{itemize}
 
 \subsection{Cache key requirements}
@@ -2569,7 +2730,7 @@ Define
 \]
 (with $\mathcal{O}_B=\{0\}$ when $b_O=0$).
 
-For all planner reward modes, define
+For all planner reward semantics, define
 \[
 b_R:=\texttt{reward\_bits}\in\mathbb{N},\qquad b_R\ge 1,
 \qquad
@@ -2760,7 +2921,7 @@ A sufficient cardinality condition is
 
 \begin{remark}[Normative exact reward-encoding safety check]
 \label{rem:reward-encoding-safety}
-For \texttt{planner\_reward\_mode = "exact\_objective\_difference"},
+For exact-objective-difference semantics,
 initialization must verify that the declared canonical scalar representation
 $\mathbb{V}_H^{\mathcal J}$ is finite, that the encoded reward alphabet has
 sufficient cardinality to injectively encode it,
@@ -2781,18 +2942,18 @@ is merely a sufficient implementation shortcut for the special case where all
 reachable objective differences are integers in the configured interval. It is
 not the general exact reward-encoding contract.
 
-For \texttt{planner\_reward\_mode = "quantized\_objective\_difference"}, the
+For quantized objective-difference semantics, the
 runtime uses the declared quantizer contract from
 Section~\ref{sec:reward-observation}; exact $\mathcal{J}_H$ theorem claims do
 not apply unless that quantizer is injective on the reachable reward set and its
 decoder is exact there.
 
-For \texttt{planner\_reward\_mode = "normalized\_clipped\_improvement"}, the
+For normalized-clipped-improvement semantics, the
 runtime verifies only the normalized-clipping preconditions required by
 Section~\ref{sec:aiqi-discounted-contract}.
 \end{remark}
 
-For any reward mode with finite encoded reward alphabet, the emitted percept is
+For any planner reward semantics with finite encoded reward alphabet, the emitted percept is
 \[
 x_{t+1}^{\mathrm{enc}}=
 \bigl(\Psi_H(s_{t+1}),\Omega_H(r_H(s_t,a_t))\bigr),
@@ -3112,7 +3273,7 @@ irreducible then the lazy chain is aperiodic and therefore ergodic.
 \subsection{Runtime controller path for MC-AIXI and AIQI-family controllers}\label{sec:aixi-runtime}
 
 This subsection is implementation-normative: it specifies runtime execution
-when \texttt{algorithm} is \texttt{mc\_aixi\_fac\_ctw},
+when \texttt{controller.kind} is \texttt{mc\_aixi\_fac\_ctw},
 \texttt{aiqi\_discounted}, or
 \texttt{aiqi\_warmstart\_exact\allowbreak\_jh}.
 
@@ -3135,18 +3296,19 @@ and apply the following execution contract.
     \texttt{action\_alphabet\_mismatch},
     \item after the normative baseline evaluation:
     \begin{itemize}
-        \item if \texttt{planner\_reward\_mode} is
-        \texttt{"exact\_objective\_difference"}, verify the exact
+        \item if \texttt{controller.kind} is
+        \texttt{"mc\_aixi\_fac\_ctw"} or
+        \texttt{"aiqi\_warmstart\_exact\_jh"}, verify the exact
         reward-encoding safety check from
         Remark~\ref{rem:reward-encoding-safety}; on failure, abort
         initialization with configuration error
         \texttt{reward\_encoding\allowbreak\_unsafe},
-        \item if \texttt{planner\_reward\_mode} is
-        \texttt{"quantized\_objective\_difference"}, verify that the declared
+        \item if the implementation declares an internal
+        quantized-objective-difference variant for an exact-family controller,
+        verify that the declared
         quantizer and representative-value decoder are deterministic, total on
         reachable objective differences, and recorded in provenance,
-        \item if \texttt{planner\_reward\_mode} is
-        \texttt{"normalized\_clipped\_}\allowbreak\texttt{improvement"}, verify
+        \item if \texttt{controller.kind} is \texttt{"aiqi\_discounted"}, verify
         only the discounted-controller clipping precondition
         \texttt{max\_reward > min\_reward}.
     \end{itemize}
@@ -3179,7 +3341,7 @@ as permitted by remaining wall-clock budget, run those internal simulations,
 and then select external action $a_t\in\mathcal{A}_B$ from the current
 controller state.
 
-For \texttt{algorithm = aiqi\_warmstart\_exact\allowbreak\_jh} with
+For \texttt{controller.kind = aiqi\_warmstart\_exact\allowbreak\_jh} with
 $R_{\mathrm{si}}>1$, this single-pass execution is used as the per-round
 kernel inside the bounded same-task trace-refresh wrapper of
 Section~\ref{sec:aiqi-warmstart-self-improve}. The global wall-clock budget
@@ -3229,11 +3391,11 @@ semantics and candidate-validity semantics remain shared.
 \label{sec:aiqi-discounted-contract}
 
 This subsection is normative for
-\texttt{algorithm = aiqi\_discounted}. It defines a
+\texttt{controller.kind = aiqi\_discounted}. It defines a
 discounted/bin-quantized heuristic controller path and does \emph{not} provide
 exact-$\mathcal{J}_H$ guarantees for finite-horizon objective alignment.
-It requires
-\texttt{planner\_reward\_mode = "normalized\_clipped\_improvement"}.
+It uses the controller-induced
+\texttt{"normalized\_clipped\_improvement"} reward semantics.
 
 Define controller parameters
 \[
@@ -3256,7 +3418,7 @@ Let
 r_t:=\mathcal{J}_H(b_t;d)-\mathcal{J}_H(b_{t+1};d)
 \]
 denote the underlying incumbent-improvement source signal. Under
-\texttt{planner\_reward\_mode = "normalized\_clipped\_improvement"}, the
+the normalized-clipped-improvement reward semantics, the
 discounted controller observes the finite reward symbol
 \[
 \Omega_H(r_t)
@@ -3305,12 +3467,13 @@ via terminal-incumbent improvement, while using MC-AIXI-generated teacher data
 to initialize the label predictor. It is inspired by the delayed-label
 phase-predictor structure of AIQI, but it does \emph{not} use discounted return
 targets and does \emph{not} invoke the discounted AIQI theorem directly.
-It is normative for \texttt{algorithm = aiqi\_warmstart\_exact\allowbreak\_jh}.
+It is normative for
+\texttt{controller.kind = aiqi\_warmstart\_exact\allowbreak\_jh}.
 Its exact finite-horizon objective-alignment claims are stated for the same
 deployable objective $\mathcal{J}_H(\cdot;d)$ as the tuning runtime on the
 fixed same-task environment induced by $(B,H,d)$.
 Conforming implementations may also expose
-\texttt{planner\_reward\_mode = "quantized\_objective\_difference"}, but
+an internal \texttt{"quantized\_objective\_difference"} variant, but
 the exact theorem statements below concern
 \texttt{"exact\_objective\_difference"}.
 
@@ -3404,7 +3567,7 @@ admissible. More generally, any controller can supply teacher traces exactly
 when its realized trajectory is exposed through the same action/history
 contract and the same exact label semantics above. Operationally, the initial
 admissible dataset is provided by
-\texttt{warmstart\_teacher\_dataset\_path}.
+\texttt{warmstart\_teacher\_dataset\_asset}.
 
 \begin{remark}[Which other controllers qualify]
 Annealed hill climbing or another optimizer is not directly reusable here
@@ -4014,8 +4177,9 @@ The manuscript now also specifies a single causal-conditional semantics for the 
 passive-byte compression is the singleton-action special case, while
 interactive-trace and causal-prefix datasets code percept targets conditioned on
 zero-cost action/context channels. This preserves one searched object
-$z\mapsto\rho_z$ across ordinary compression and environment-model tuning, and
+$z\mapsto(\text{canonical compression candidate},\rho_z)$ across ordinary
+compression and environment-model tuning, and
 it keeps planner-oriented deployment constraints in $H$ without replacing the
-primary predictor-aligned codelength objective by return.
+primary candidate-aligned codelength objective by return.
 
 \end{document}
