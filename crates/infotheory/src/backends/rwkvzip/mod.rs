@@ -2670,4 +2670,156 @@ mod tests {
             .unwrap();
         assert!(score.is_finite());
     }
+
+    #[test]
+    fn conditional_chain_matches_single_prefix_api() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=47,train=none,lr=0.001,stride=1;policy:schedule=0..100:infer";
+        let prefix_a = b"alpha ";
+        let prefix_b = b"beta ";
+        let data = b"gamma delta";
+
+        let mut chained = Compressor::new_from_method(method).unwrap();
+        let chain_score = chained
+            .cross_entropy_conditional_chain(&[prefix_a.as_slice(), prefix_b.as_slice()], data)
+            .unwrap();
+
+        let mut single = Compressor::new_from_method(method).unwrap();
+        let mut merged_prefix = Vec::new();
+        merged_prefix.extend_from_slice(prefix_a);
+        merged_prefix.extend_from_slice(prefix_b);
+        let single_score = single
+            .cross_entropy_conditional(&merged_prefix, data)
+            .unwrap();
+
+        assert!(
+            (chain_score - single_score).abs() < 1e-12,
+            "chain and single-prefix APIs should agree"
+        );
+    }
+
+    #[test]
+    fn joint_cross_entropy_aligned_min_is_symmetric_and_empty_safe() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=53,train=none,lr=0.001,stride=1;policy:schedule=0..100:infer";
+        let x = b"abracadabra";
+        let y = b"alakazam___";
+
+        let mut a = Compressor::new_from_method(method).unwrap();
+        let xy = a.joint_cross_entropy_aligned_min(x, y).unwrap();
+        assert!(xy.is_finite());
+
+        let mut b = Compressor::new_from_method(method).unwrap();
+        let yx = b.joint_cross_entropy_aligned_min(y, x).unwrap();
+        assert!((xy - yx).abs() < 1e-12, "joint score should be symmetric");
+
+        let mut empty = Compressor::new_from_method(method).unwrap();
+        assert_eq!(empty.joint_cross_entropy_aligned_min(b"", y).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn pdf_forwarding_and_cached_pdf_views_stay_in_sync() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=59,train=none,lr=0.001,stride=1;policy:schedule=0..100:infer";
+        let mut forward = Compressor::new_from_method(method).unwrap();
+        let mut cached = Compressor::new_from_method(method).unwrap();
+
+        forward.reset_and_prime();
+        cached.reset_and_prime();
+
+        let mut forwarded_pdf = vec![0.0; forward.vocab_size()];
+        forward.forward_to_pdf(u32::from(b'a'), &mut forwarded_pdf);
+
+        cached.forward_to_internal_pdf(u32::from(b'a'));
+        let mut cached_pdf = vec![0.0; cached.vocab_size()];
+        cached.copy_current_pdf_to(&mut cached_pdf);
+
+        assert_eq!(forwarded_pdf.len(), 256);
+        let sum: f64 = forwarded_pdf.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "pdf should remain normalized");
+        for (lhs, rhs) in forwarded_pdf.iter().zip(cached_pdf.iter()) {
+            assert!(
+                (lhs - rhs).abs() < 1e-12,
+                "cached and forwarded pdfs diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn online_bias_accessors_and_adaptation_flags_match_policy() {
+        let infer_method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=61,train=none,lr=0.001,stride=1;policy:schedule=0..100:infer";
+        let train_method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=67,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=head,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
+
+        let mut infer = Compressor::new_from_method(infer_method).unwrap();
+        infer.reset_and_prime();
+        infer.forward_to_internal_pdf(u32::from(b'z'));
+        let infer_bias = infer
+            .online_bias_snapshot()
+            .expect("online method should expose bias vector");
+        let infer_bias_slice = infer
+            .online_bias_slice()
+            .expect("online method should expose bias slice");
+        assert_eq!(infer_bias.as_slice(), infer_bias_slice);
+        assert!(
+            !infer.can_adapt_online(),
+            "infer-only policy should not adapt"
+        );
+
+        let train = Compressor::new_from_method(train_method).unwrap();
+        assert!(train.can_adapt_online(), "train policy should adapt");
+    }
+
+    #[test]
+    fn compress_size_chain_matches_materialized_output_and_roundtrips() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=71,train=none,lr=0.001,stride=1;policy:schedule=0..100:infer";
+        let parts: [&[u8]; 3] = [b"chain ", b"compression ", b"fixture"];
+
+        let mut sized = Compressor::new_from_method(method).unwrap();
+        let predicted = sized.compress_size_chain(&parts, CoderType::AC).unwrap();
+
+        let mut materialized = Compressor::new_from_method(method).unwrap();
+        let mut buf = Vec::new();
+        materialized
+            .compress_chain_into(&parts, CoderType::AC, &mut buf)
+            .unwrap();
+        assert_eq!(predicted, buf.len() as u64);
+
+        let mut decoder = Compressor::new_from_method(method).unwrap();
+        let decoded = decoder.decompress(&buf).unwrap();
+        assert_eq!(decoded, b"chain compression fixture");
+    }
+
+    #[test]
+    fn decompress_reports_crc_and_truncation_corruption() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=73,train=none,lr=0.001,stride=1;policy:schedule=0..100:infer";
+        let data = b"corruption-fixture";
+
+        let mut ac = Compressor::new_from_method(method).unwrap();
+        let mut ac_bytes = ac.compress(data, CoderType::AC).unwrap();
+        let crc_offset = Header::SIZE - 4;
+        ac_bytes[crc_offset] ^= 0x01;
+
+        let mut ac_decoder = Compressor::new_from_method(method).unwrap();
+        let ac_err = ac_decoder
+            .decompress(&ac_bytes)
+            .expect_err("corrupt AC stream must fail");
+        let ac_msg = format!("{ac_err:#}");
+        assert!(
+            ac_msg.contains("CRC32 mismatch"),
+            "unexpected AC corruption error: {ac_msg}"
+        );
+
+        let mut rans = Compressor::new_from_method(method).unwrap();
+        let rans_bytes = rans.compress(data, CoderType::RANS).unwrap();
+        let truncated = &rans_bytes[..rans_bytes.len() - 1];
+
+        let mut rans_decoder = Compressor::new_from_method(method).unwrap();
+        let rans_err = rans_decoder
+            .decompress(truncated)
+            .expect_err("truncated rANS stream must fail");
+        let rans_msg = format!("{rans_err:#}");
+        assert!(
+            rans_msg.contains("Truncated block data")
+                || rans_msg.contains("rANS data too short")
+                || rans_msg.contains("failed to fill whole buffer"),
+            "unexpected rANS truncation error: {rans_msg}"
+        );
+    }
 }

@@ -42,3 +42,78 @@ pub fn load_spec_document(path: &str) -> SpecResult<SpecDocument> {
     })?;
     SpecDocument::parse_json_value(&value, base_dir)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::RateBackend;
+    use crate::spec::CanonicalJson;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(prefix: &str, ext: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("infotheory-spec-io-{prefix}-{nanos}.{ext}"))
+    }
+
+    #[test]
+    fn load_spec_document_detects_json_extension() {
+        let path = temp_path("json", "json");
+        let expected = SpecDocument::RateBackend(RateBackend::Ctw { depth: 8 });
+        std::fs::write(&path, expected.to_canonical_json().expect("json"))
+            .expect("write json spec");
+
+        let parsed = load_spec_document(path.to_string_lossy().as_ref()).expect("load json spec");
+        assert_eq!(
+            parsed.to_canonical_json().expect("parsed json"),
+            expected.to_canonical_json().expect("expected json")
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_spec_document_detects_binary_extension_and_magic() {
+        let path = temp_path("binary", "itsd");
+        let expected = SpecDocument::RateBackend(RateBackend::Ctw { depth: 12 });
+        std::fs::write(&path, expected.to_binary()).expect("write binary spec");
+
+        let parsed =
+            load_spec_document(path.to_string_lossy().as_ref()).expect("load binary extension");
+        assert_eq!(
+            parsed.to_canonical_json().expect("parsed json"),
+            expected.to_canonical_json().expect("expected json")
+        );
+
+        let magic_path = temp_path("magic", "bin");
+        std::fs::write(&magic_path, expected.to_binary()).expect("write magic-detected binary");
+        let magic_parsed =
+            load_spec_document(magic_path.to_string_lossy().as_ref()).expect("load binary magic");
+        assert_eq!(
+            magic_parsed.to_canonical_json().expect("parsed json"),
+            expected.to_canonical_json().expect("expected json")
+        );
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(magic_path);
+    }
+
+    #[test]
+    fn load_spec_document_reports_non_json_non_binary_payloads_directly() {
+        let path = temp_path("invalid", "txt");
+        std::fs::write(&path, b"not json and not binary").expect("write invalid payload");
+
+        let err = match load_spec_document(path.to_string_lossy().as_ref()) {
+            Ok(_) => panic!("invalid payload must fail"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("expected JSON or binary 'itsd' envelope"));
+        assert!(msg.contains(path.to_string_lossy().as_ref()));
+
+        let _ = std::fs::remove_file(path);
+    }
+}

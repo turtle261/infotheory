@@ -119,3 +119,95 @@ pub(crate) fn affine3_wide(
         i += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(lhs: f64, rhs: f64, tol: f64) {
+        let delta: f64 = (lhs - rhs).abs();
+        assert!(
+            delta <= tol,
+            "lhs={lhs}, rhs={rhs}, delta={delta}, tol={tol}"
+        );
+    }
+
+    #[test]
+    fn dot_and_axpy_cover_vector_and_scalar_tails() {
+        let lhs: Vec<f64> = vec![1.0, -2.0, 3.0, 4.0, 5.0, 9.0];
+        let rhs: Vec<f64> = vec![0.5, 2.0, -1.0, 0.25, -3.0];
+        let dot: f64 = dot_wide(&lhs, &rhs);
+        let expected_dot: f64 = lhs.iter().zip(rhs.iter()).map(|(a, b)| a * b).sum::<f64>();
+        assert_close(dot, expected_dot, 1e-12);
+
+        let mut dst: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let src: Vec<f64> = vec![10.0, -1.0, 2.0, 0.5, -4.0];
+        axpy_wide(&mut dst, 0.25, &src);
+        let expected_dst: Vec<f64> = vec![
+            1.0 + 0.25 * 10.0,
+            2.0 + 0.25 * -1.0,
+            3.0 + 0.25 * 2.0,
+            4.0 + 0.25 * 0.5,
+            5.0 + 0.25 * -4.0,
+            6.0,
+        ];
+        assert_eq!(dst, expected_dst);
+    }
+
+    #[test]
+    fn max_and_logsumexp_cover_empty_and_finite_inputs() {
+        assert_eq!(max_wide(&[]), f64::NEG_INFINITY);
+        assert_eq!(logsumexp_wide(&[]), f64::NEG_INFINITY);
+
+        let xs: Vec<f64> = vec![-3.0, -1.0, -2.0, -4.0, -0.5];
+        assert_close(max_wide(&xs), -0.5, 1e-12);
+
+        let max_v: f64 = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let expected_lse: f64 = max_v + xs.iter().map(|v| (v - max_v).exp()).sum::<f64>().ln();
+        assert_close(logsumexp_wide(&xs), expected_lse, 1e-12);
+    }
+
+    #[test]
+    fn affine3_wide_matches_scalar_reference() {
+        let bias: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let src0: Vec<f64> = vec![0.0, 1.0, 0.5, -1.0, 2.0, 1.5];
+        let src1: Vec<f64> = vec![2.0, 0.0, -1.0, 1.0, 0.5, -0.5];
+        let src2: Vec<f64> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.5];
+        let weights: [f64; 3] = [0.25, -0.5, 1.5];
+        let mut dst: Vec<f64> = vec![0.0; bias.len()];
+
+        affine3_wide(&mut dst, &bias, weights, &src0, &src1, &src2);
+
+        let expected: Vec<f64> = (0..bias.len())
+            .map(|i| bias[i] + weights[0] * src0[i] + weights[1] * src1[i] + weights[2] * src2[i])
+            .collect();
+        assert_eq!(dst, expected);
+    }
+
+    #[test]
+    fn affine3_wide_panics_on_short_inputs() {
+        let mut dst: Vec<f64> = vec![0.0; 4];
+        let bias: Vec<f64> = vec![0.0; 4];
+        let src: Vec<f64> = vec![0.0; 4];
+
+        let short_bias = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            affine3_wide(&mut dst, &bias[..3], [1.0, 1.0, 1.0], &src, &src, &src);
+        }));
+        assert!(short_bias.is_err());
+
+        let short_src0 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            affine3_wide(&mut dst, &bias, [1.0, 1.0, 1.0], &src[..3], &src, &src);
+        }));
+        assert!(short_src0.is_err());
+
+        let short_src1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            affine3_wide(&mut dst, &bias, [1.0, 1.0, 1.0], &src, &src[..3], &src);
+        }));
+        assert!(short_src1.is_err());
+
+        let short_src2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            affine3_wide(&mut dst, &bias, [1.0, 1.0, 1.0], &src, &src, &src[..3]);
+        }));
+        assert!(short_src2.is_err());
+    }
+}

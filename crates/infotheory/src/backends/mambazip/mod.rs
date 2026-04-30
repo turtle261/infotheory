@@ -750,6 +750,8 @@ pub struct Compressor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
 
     fn temp_path(prefix: &str, ext: &str) -> PathBuf {
         let now = std::time::SystemTime::now()
@@ -757,6 +759,119 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}_{}_{}.{}", std::process::id(), now, ext))
+    }
+
+    #[test]
+    fn online_config_to_mamba_config_clamps_invalid_minima() {
+        let cfg = OnlineConfig {
+            hidden: 0,
+            layers: 0,
+            intermediate: 0,
+            state: 0,
+            conv: 0,
+            dt_rank: 0,
+            seed: 7,
+            train_mode: OnlineTrainMode::None,
+            lr: 0.25,
+            stride: 0,
+        };
+        let mcfg = cfg.to_mamba_config().expect("validated config");
+        assert_eq!(mcfg.vocab_size, VOCAB_SIZE);
+        assert_eq!(mcfg.hidden_size, 16);
+        assert_eq!(mcfg.num_layers, 1);
+        assert_eq!(mcfg.inner_size, 16);
+        assert_eq!(mcfg.state_size, 1);
+        assert_eq!(mcfg.conv_kernel, 1);
+        assert_eq!(mcfg.dt_rank, 1);
+    }
+
+    #[test]
+    fn helper_parsers_and_method_rendering_are_canonical() {
+        assert_eq!(
+            optimizer_sidecar_path(Path::new("/tmp/model.safetensors")),
+            PathBuf::from("/tmp/model.opt.safetensors")
+        );
+        assert!(matches!(
+            parse_train_mode_token("off").expect("off"),
+            OnlineTrainMode::None
+        ));
+        assert!(matches!(
+            parse_train_mode_token("1").expect("sgd"),
+            OnlineTrainMode::Sgd
+        ));
+        assert!(matches!(
+            parse_train_mode_token("adam").expect("adam"),
+            OnlineTrainMode::Adam
+        ));
+        assert!(
+            parse_train_mode_token("mystery")
+                .expect_err("invalid mode")
+                .to_string()
+                .contains("unknown train mode")
+        );
+
+        let rendered = cfg_to_method_string(&OnlineConfig {
+            hidden: 64,
+            layers: 2,
+            intermediate: 96,
+            state: 8,
+            conv: 3,
+            dt_rank: 4,
+            seed: 9,
+            train_mode: OnlineTrainMode::Sgd,
+            lr: 0.125,
+            stride: 0,
+        });
+        assert_eq!(
+            rendered,
+            "cfg:hidden=64,layers=2,intermediate=96,state=8,conv=3,dt_rank=4,seed=9,train=sgd,lr=0.125,stride=1"
+        );
+    }
+
+    #[test]
+    fn policy_helpers_detect_adam_and_full_trace_requirements() {
+        let infer = llm_policy::parse_policy_segment("schedule=0..10:infer", MAMBA_TRAIN_SCOPES)
+            .expect("infer policy");
+        assert!(!policy_uses_adam(&infer));
+        assert!(!policy_needs_full_trace(&infer));
+
+        let head_adam = llm_policy::parse_policy_segment(
+            "schedule=0..10:train(scope=head+bias,opt=adam,lr=0.002,stride=1,bptt=1,clip=0,momentum=0.9)",
+            MAMBA_TRAIN_SCOPES,
+        )
+        .expect("head adam policy");
+        assert!(policy_uses_adam(&head_adam));
+        assert!(!policy_needs_full_trace(&head_adam));
+
+        let mixer_proj = llm_policy::parse_policy_segment(
+            "schedule=0..10:train(scope=mixer_proj,opt=sgd,lr=0.002,stride=1,bptt=1,clip=0,momentum=0.9)",
+            MAMBA_TRAIN_SCOPES,
+        )
+        .expect("mixer policy");
+        assert!(!policy_uses_adam(&mixer_proj));
+        assert!(policy_needs_full_trace(&mixer_proj));
+    }
+
+    #[test]
+    fn parse_method_spec_rejects_invalid_cfg_and_file_load_from_combinations() {
+        assert!(
+            parse_method_spec("cfg:hidden=64,unknown=1")
+                .expect_err("unknown key")
+                .to_string()
+                .contains("unknown mamba cfg key")
+        );
+        assert!(
+            parse_method_spec("cfg:64,96,2,sgd,123")
+                .expect_err("short positional cfg")
+                .to_string()
+                .contains("expects 6 or 7 values")
+        );
+        assert!(
+            parse_method_spec("file:/tmp/model.safetensors;policy:load_from=/tmp/base.safetensors,schedule=0..10:infer")
+                .expect_err("file + load_from")
+                .to_string()
+                .contains("cannot use policy load_from together with file:<path>")
+        );
     }
 
     #[test]
@@ -854,6 +969,45 @@ mod tests {
     }
 
     #[test]
+    fn export_without_online_state_cleans_stale_optimizer_sidecar() {
+        let cfg = Config {
+            vocab_size: 256,
+            hidden_size: 32,
+            num_layers: 1,
+            inner_size: 48,
+            state_size: 8,
+            conv_kernel: 3,
+            dt_rank: 4,
+            layer_norm_eps: 1e-5,
+        };
+        let model = Arc::new(Model::new_random(cfg, 1337).expect("random model"));
+        let compressor = Compressor::new_from_model(model);
+        let model_path = temp_path("mamba_plain_export", "safetensors");
+        let opt_path = optimizer_sidecar_path(&model_path);
+        std::fs::write(&opt_path, b"stale optimizer").expect("seed stale optimizer");
+
+        compressor.export_online(&model_path).expect("export");
+        assert!(
+            !opt_path.exists(),
+            "plain export should remove stale optimizer sidecar"
+        );
+
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(model_path.with_extension("json")).expect("read sidecar"),
+        )
+        .expect("parse sidecar");
+        assert_eq!(sidecar["training_mode"], json!("none"));
+        assert!(
+            sidecar["method"]
+                .as_str()
+                .is_some_and(|method| method.starts_with("file:"))
+        );
+
+        std::fs::remove_file(&model_path).ok();
+        std::fs::remove_file(model_path.with_extension("json")).ok();
+    }
+
+    #[test]
     fn export_reload_roundtrip_reproducible() {
         let cfg = Config {
             vocab_size: 256,
@@ -885,6 +1039,52 @@ mod tests {
 
         let _ = std::fs::remove_file(&base);
         let _ = std::fs::remove_file(base.with_extension("json"));
+    }
+
+    #[test]
+    fn loading_sidecar_requires_optimizer_when_exact_resume_is_requested() {
+        let cfg = Config {
+            vocab_size: 256,
+            hidden_size: 32,
+            num_layers: 1,
+            inner_size: 48,
+            state_size: 8,
+            conv_kernel: 3,
+            dt_rank: 4,
+            layer_norm_eps: 1e-5,
+        };
+        let model_path = temp_path("mamba_missing_opt", "safetensors");
+        Model::new_random(cfg, 4242)
+            .expect("random model")
+            .save_safetensors(&model_path)
+            .expect("save model");
+        let method = canonical_method_string(&MethodSpec::File {
+            path: model_path.clone(),
+            policy: None,
+        })
+        .expect("canonical file method");
+        let sidecar = json!({
+            "version": 1,
+            "method": method,
+            "training_mode": "adam",
+            "tokens_processed": 3,
+            "has_full_adam": true,
+            "output_bias": [0.0, 1.0, 2.0],
+        });
+        std::fs::write(
+            model_path.with_extension("json"),
+            serde_json::to_vec_pretty(&sidecar).expect("encode sidecar"),
+        )
+        .expect("write sidecar");
+
+        let err = match Compressor::new(&model_path) {
+            Ok(_) => panic!("missing optimizer sidecar should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("missing optimizer sidecar"));
+
+        std::fs::remove_file(&model_path).ok();
+        std::fs::remove_file(model_path.with_extension("json")).ok();
     }
 
     #[test]

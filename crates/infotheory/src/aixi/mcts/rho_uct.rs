@@ -637,4 +637,178 @@ mod tests {
             "sequential rho_uct should accumulate completed action visits directly in the shared tree"
         );
     }
+
+    #[derive(Clone)]
+    struct RolloutProbeAgent {
+        num_actions: usize,
+        revert_calls: usize,
+        last_revert_steps: usize,
+        action_updates: usize,
+    }
+
+    impl AgentSimulator for RolloutProbeAgent {
+        fn get_num_actions(&self) -> ActionAlphabet {
+            ActionAlphabet::try_from_usize(self.num_actions)
+                .expect("test fixture action alphabet must be valid")
+        }
+
+        fn get_num_observation_bits(&self) -> usize {
+            1
+        }
+
+        fn get_num_reward_bits(&self) -> usize {
+            1
+        }
+
+        fn horizon(&self) -> usize {
+            3
+        }
+
+        fn max_reward(&self) -> Reward {
+            1
+        }
+
+        fn min_reward(&self) -> Reward {
+            0
+        }
+
+        fn get_explore_exploit_ratio(&self) -> f64 {
+            0.0
+        }
+
+        fn model_update_action(&mut self, _action: Action) {
+            self.action_updates += 1;
+        }
+
+        fn gen_percept_and_update(&mut self, _bits: usize) -> u64 {
+            0
+        }
+
+        fn model_revert(&mut self, steps: usize) {
+            self.revert_calls += 1;
+            self.last_revert_steps = steps;
+        }
+
+        fn gen_range(&mut self, _end: usize) -> usize {
+            0
+        }
+
+        fn gen_f64(&mut self) -> f64 {
+            0.0
+        }
+
+        fn boxed_clone_with_seed(&self, _seed: u64) -> Box<dyn AgentSimulator> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn rho_uct_first_visit_decision_node_rolls_out_before_tree_expansion() {
+        let mut root = RhoUctNode::new(false);
+        let mut agent = RolloutProbeAgent {
+            num_actions: 2,
+            revert_calls: 0,
+            last_revert_steps: 0,
+            action_updates: 0,
+        };
+
+        let reward = root.sample(&mut agent, 3, 3);
+        assert_eq!(reward, 0.0);
+        assert_eq!(root.visits, 1);
+        assert!(
+            root.action_children.is_empty(),
+            "first-visit decision-node handling should perform a rollout without eagerly expanding action edges"
+        );
+        assert!(
+            agent.action_updates > 0,
+            "rollout should still simulate actions before backup"
+        );
+        assert_eq!(agent.revert_calls, 1);
+        assert_eq!(agent.last_revert_steps, 3);
+    }
+
+    #[derive(Clone)]
+    struct ChanceNodeProbeAgent {
+        sequence: [u64; 2],
+        cursor: usize,
+        revert_calls: usize,
+    }
+
+    impl AgentSimulator for ChanceNodeProbeAgent {
+        fn get_num_actions(&self) -> ActionAlphabet {
+            ActionAlphabet::try_from_usize(2).expect("test fixture action alphabet must be valid")
+        }
+
+        fn get_num_observation_bits(&self) -> usize {
+            1
+        }
+
+        fn get_num_reward_bits(&self) -> usize {
+            1
+        }
+
+        fn horizon(&self) -> usize {
+            1
+        }
+
+        fn max_reward(&self) -> Reward {
+            1
+        }
+
+        fn min_reward(&self) -> Reward {
+            0
+        }
+
+        fn discount_gamma(&self) -> f64 {
+            0.5
+        }
+
+        fn get_explore_exploit_ratio(&self) -> f64 {
+            0.0
+        }
+
+        fn model_update_action(&mut self, _action: Action) {}
+
+        fn gen_percept_and_update(&mut self, _bits: usize) -> u64 {
+            let idx = self.cursor.min(self.sequence.len().saturating_sub(1));
+            self.cursor = self.cursor.saturating_add(1);
+            self.sequence[idx]
+        }
+
+        fn model_revert(&mut self, _steps: usize) {
+            self.revert_calls += 1;
+        }
+
+        fn gen_range(&mut self, _end: usize) -> usize {
+            0
+        }
+
+        fn gen_f64(&mut self) -> f64 {
+            0.0
+        }
+
+        fn boxed_clone_with_seed(&self, _seed: u64) -> Box<dyn AgentSimulator> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn rho_uct_chance_node_sampling_backs_up_immediate_reward() {
+        let mut node = RhoUctNode::new(true);
+        let mut agent = ChanceNodeProbeAgent {
+            sequence: [0, 1],
+            cursor: 0,
+            revert_calls: 0,
+        };
+
+        let reward = node.sample(&mut agent, 1, 1);
+        assert_eq!(reward, 1.0);
+        assert_eq!(node.visits, 1);
+        assert!((node.mean - 1.0).abs() < 1e-12);
+        assert_eq!(node.percept_children.len(), 1);
+        assert_eq!(
+            agent.revert_calls, 1,
+            "chance-node child sample should terminate at horizon and revert once"
+        );
+    }
 }

@@ -85,3 +85,55 @@ impl From<&str> for InfotheoryError {
         Self::Runtime(value.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructors_and_display_messages_are_stable() {
+        assert_eq!(
+            InfotheoryError::invalid_backend_config("bad depth").to_string(),
+            "invalid backend configuration: bad depth"
+        );
+        assert_eq!(
+            InfotheoryError::runtime("decoder stalled").to_string(),
+            "runtime failure: decoder stalled"
+        );
+        assert_eq!(
+            InfotheoryError::unsupported("requires vm").to_string(),
+            "unsupported operation: requires vm"
+        );
+    }
+
+    #[test]
+    fn source_and_from_conversions_preserve_error_context() {
+        let io = std::io::Error::other("disk broke");
+        let io_error = InfotheoryError::from(io);
+        assert!(io_error.to_string().contains("i/o failure: disk broke"));
+        assert!(io_error.source().is_some());
+
+        let spec = crate::spec::SpecError::new("bad spec");
+        let spec_error = InfotheoryError::from(spec.clone());
+        assert_eq!(spec_error.to_string(), "spec error: bad spec");
+        assert_eq!(
+            spec_error
+                .source()
+                .expect("spec error should retain source")
+                .to_string(),
+            spec.to_string()
+        );
+
+        let runtime_from_string = InfotheoryError::from("runtime text");
+        assert_eq!(
+            runtime_from_string.to_string(),
+            "runtime failure: runtime text"
+        );
+
+        let runtime_from_owned = InfotheoryError::from(String::from("owned runtime"));
+        assert_eq!(
+            runtime_from_owned.to_string(),
+            "runtime failure: owned runtime"
+        );
+    }
+}

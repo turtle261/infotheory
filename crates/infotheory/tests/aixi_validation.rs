@@ -311,6 +311,28 @@ fn run_agent_env<T: Environment>(agent: &mut Agent, mut env: T, cycles: usize) -
     total_reward
 }
 
+fn agent_action_trace_on_deterministic_env(mut agent: Agent, steps: usize) -> Vec<Action> {
+    let mut env = DeterministicBinaryEnv::new();
+    let mut obs_stream = env.drain_observations();
+    let mut prev_rew = env.get_reward();
+    let mut prev_act = 0u64;
+    let mut actions = Vec::with_capacity(steps);
+
+    for _ in 0..steps {
+        agent.model_update_percept_stream(&obs_stream, prev_rew);
+        let action = agent.get_planned_action(&obs_stream, prev_rew, prev_act);
+        actions.push(action);
+
+        agent.model_update_action_external(action);
+        env.perform_action(action);
+        obs_stream = env.drain_observations();
+        prev_rew = env.get_reward();
+        prev_act = action;
+    }
+
+    actions
+}
+
 fn generic_agent_config(rate_backend: RateBackend) -> AgentConfig {
     let mut cfg = AgentConfig::default();
     cfg.rate_backend = rate_backend;
@@ -653,6 +675,67 @@ fn agent_with_generic_mixture_backends_smoke_runs() {
         assert!(
             total_reward > 16.0,
             "{label} mixture backend reward too low on DeterministicBinaryEnv: {total_reward}"
+        );
+    }
+}
+
+#[test]
+fn agent_solves_deterministic_env_with_generic_ctw_backend() {
+    let mut cfg = generic_agent_config(RateBackend::Ctw { depth: 10 });
+    cfg.agent_horizon = 8;
+    cfg.num_simulations = 140;
+
+    let mut agent = Agent::try_new(cfg).expect("valid generic CTW configuration");
+    let total_reward = run_agent_env(&mut agent, DeterministicBinaryEnv::new(), 120);
+
+    assert!(
+        total_reward > 70.0,
+        "generic CTW MC-AIXI should learn DeterministicBinaryEnv, got total_reward={total_reward}"
+    );
+}
+
+#[test]
+fn agent_solves_deterministic_env_with_generic_fac_ctw_backend() {
+    let mut cfg = generic_agent_config(RateBackend::FacCtw {
+        base_depth: 10,
+        num_percept_bits: 2,
+        encoding_bits: 1,
+    });
+    cfg.agent_horizon = 8;
+    cfg.num_simulations = 140;
+
+    let mut agent = Agent::try_new(cfg).expect("valid generic FAC-CTW configuration");
+    let total_reward = run_agent_env(&mut agent, DeterministicBinaryEnv::new(), 120);
+
+    assert!(
+        total_reward > 70.0,
+        "generic FAC-CTW MC-AIXI should learn DeterministicBinaryEnv, got total_reward={total_reward}"
+    );
+}
+
+#[test]
+fn generic_mixture_world_models_are_seed_deterministic() {
+    for (kind, label) in [
+        (MixtureKind::Bayes, "bayes"),
+        (MixtureKind::Switching, "switching"),
+        (MixtureKind::Convex, "convex"),
+    ] {
+        let mut cfg = generic_agent_config(mixture_backend(kind));
+        cfg.random_seed = Some(88172645463393265);
+        cfg.num_simulations = 80;
+        cfg.agent_horizon = 6;
+
+        let trace_a = agent_action_trace_on_deterministic_env(
+            Agent::try_new(cfg.clone()).expect("valid mixture agent A"),
+            64,
+        );
+        let trace_b = agent_action_trace_on_deterministic_env(
+            Agent::try_new(cfg).expect("valid mixture agent B"),
+            64,
+        );
+        assert_eq!(
+            trace_a, trace_b,
+            "{label} mixture world model should be deterministic under identical seed and history"
         );
     }
 }

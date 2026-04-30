@@ -663,6 +663,93 @@ mod tests {
     }
 
     #[test]
+    fn test_pdf_helpers_roundtrip_and_size_estimate_match() {
+        let pdf: Vec<f64> = vec![0.5, 0.3, 0.15, 0.05];
+        let symbols: Vec<usize> = vec![0, 1, 0, 2, 1, 0, 3, 0, 1, 0, 2];
+
+        let mut enc = RansEncoder::new();
+        for &sym in symbols.iter().rev() {
+            enc.encode_pdf(&pdf, sym);
+        }
+        let estimated: usize = enc.size_estimate();
+        let encoded: Vec<u8> = enc.finish();
+        assert_eq!(estimated, encoded.len());
+
+        let mut dec = RansDecoder::new(&encoded).expect("decode state");
+        for &expected in &symbols {
+            let got: usize = dec.decode_pdf(&pdf).expect("decode symbol");
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn test_decoder_rejects_short_input() {
+        let err = match RansDecoder::new(&[1, 2, 3]) {
+            Ok(_) => panic!("short rANS payload must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("rANS input too short"));
+    }
+
+    #[test]
+    fn test_blocked_encoder_finish_empty_and_decoder_contract_errors() {
+        let empty_blocks: Vec<Vec<u8>> = BlockedRansEncoder::new().finish();
+        assert!(empty_blocks.is_empty());
+
+        let bogus_block: [u8; 4] = [0, 0, 0, 0];
+        let mismatch_err = match BlockedRansDecoder::new(vec![&bogus_block], 0) {
+            Ok(_) => panic!("zero symbols must require zero blocks"),
+            Err(err) => err,
+        };
+        assert!(
+            mismatch_err
+                .to_string()
+                .contains("blocked rANS expected 0 blocks"),
+            "unexpected mismatch error: {mismatch_err}"
+        );
+
+        let cdf: Vec<u32> = quantize_pdf_to_rans_cdf(&[1.0]);
+        let mut empty_decoder =
+            BlockedRansDecoder::new(Vec::new(), 0).expect("empty stream descriptor is valid");
+        let exhausted_err = empty_decoder
+            .decode(&cdf)
+            .expect_err("decoding from empty stream must fail");
+        assert!(
+            exhausted_err
+                .to_string()
+                .contains("No more blocks to decode"),
+            "unexpected exhausted error: {exhausted_err}"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_simd_roundtrip_and_constructor_guard() {
+        let pdf: Vec<f64> = vec![1.0];
+        let cdf: Vec<u32> = quantize_pdf_to_rans_cdf(&pdf);
+        let symbols: Vec<usize> = vec![0usize; 64];
+
+        let mut enc = SimdRansEncoder::new();
+        for &sym in symbols.iter().rev() {
+            enc.encode(&cdf_for_symbol(&cdf, sym));
+        }
+        let encoded: Vec<u8> = enc.finish();
+
+        let short_len: usize = RANS_LANES * 4 - 1;
+        let short_err = match SimdRansDecoder::new(&encoded[..short_len]) {
+            Ok(_) => panic!("short SIMD rANS payload must fail"),
+            Err(err) => err,
+        };
+        assert!(short_err.to_string().contains("SIMD rANS input too short"));
+
+        let mut dec = SimdRansDecoder::new(&encoded).expect("simd decoder");
+        for &expected in &symbols {
+            let got: usize = dec.decode(&cdf).expect("simd decode symbol");
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
     fn test_blocked_rans_roundtrip_across_block_boundary() {
         let pdf = vec![0.5, 0.25, 0.125, 0.125];
         let cdf = quantize_pdf_to_rans_cdf(&pdf);

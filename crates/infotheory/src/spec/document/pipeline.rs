@@ -660,3 +660,423 @@ fn clean_optional_string(value: Option<&str>) -> Option<String> {
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "backend-ctw")]
+    use crate::aixi::common::MctsStrategy;
+    use crate::aixi::common::{ActionAlphabet, ObservationKeyMode};
+    #[cfg(feature = "backend-ctw")]
+    use crate::api::{CompressionBackend, RateBackend};
+    #[cfg(feature = "backend-ctw")]
+    use std::num::NonZeroUsize;
+
+    fn action_alphabet(n: usize) -> ActionAlphabet {
+        ActionAlphabet::try_from_usize(n).expect("test action alphabet must be non-zero")
+    }
+
+    fn sample_interface() -> PlannerInterfaceSpec {
+        PlannerInterfaceSpec {
+            observation_bits: 8,
+            observation_stream_len: 1,
+            observation_key_mode: ObservationKeyMode::FullStream,
+            reward_bits: 8,
+            agent_actions: action_alphabet(2),
+            min_reward: 0,
+            max_reward: 1,
+            reward_offset: 0,
+        }
+    }
+
+    #[test]
+    fn asset_binding_validation_and_sorting_are_stable() {
+        let sorted = canonicalize_assets(&[
+            AssetBinding {
+                id: "b".to_string(),
+                path: "b.bin".to_string(),
+            },
+            AssetBinding {
+                id: "a".to_string(),
+                path: "a.bin".to_string(),
+            },
+        ]);
+        assert_eq!(sorted[0].id, "a");
+        assert_eq!(sorted[1].id, "b");
+
+        validate_asset_bindings(&[
+            AssetBinding {
+                id: "dataset".to_string(),
+                path: "one.bin".to_string(),
+            },
+            AssetBinding {
+                id: "dataset".to_string(),
+                path: "one.bin".to_string(),
+            },
+        ])
+        .expect("duplicate identical bindings are benign");
+
+        let err = validate_asset_bindings(&[AssetBinding {
+            id: " ".to_string(),
+            path: "x".to_string(),
+        }])
+        .expect_err("blank asset id must fail");
+        assert!(err.to_string().contains("asset id cannot be empty"));
+
+        let err = validate_asset_bindings(&[AssetBinding {
+            id: "dataset".to_string(),
+            path: " ".to_string(),
+        }])
+        .expect_err("blank asset path must fail");
+        assert!(
+            err.to_string()
+                .contains("asset 'dataset' path cannot be empty")
+        );
+
+        let err = validate_asset_bindings(&[
+            AssetBinding {
+                id: "dataset".to_string(),
+                path: "one.bin".to_string(),
+            },
+            AssetBinding {
+                id: "dataset".to_string(),
+                path: "two.bin".to_string(),
+            },
+        ])
+        .expect_err("conflicting asset bindings must fail");
+        assert!(
+            err.to_string()
+                .contains("asset 'dataset' is bound to more than one path")
+        );
+
+        ensure_asset_exists(
+            &[AssetBinding {
+                id: "dataset".to_string(),
+                path: "one.bin".to_string(),
+            }],
+            "dataset",
+        )
+        .expect("known asset id");
+        let err = ensure_asset_exists(&[], "missing").expect_err("missing asset must fail");
+        assert!(err.to_string().contains("unknown asset id 'missing'"));
+    }
+
+    #[test]
+    fn interface_runtime_and_scalar_validators_enforce_contracts() {
+        canonicalize_interface_spec(&sample_interface()).expect("valid interface");
+
+        let mut bad_interface = sample_interface();
+        bad_interface.observation_stream_len = 0;
+        let err = canonicalize_interface_spec(&bad_interface)
+            .expect_err("zero observation stream length must fail");
+        assert!(
+            err.to_string()
+                .contains("observation_stream_len must be >= 1")
+        );
+
+        bad_interface = sample_interface();
+        bad_interface.reward_bits = 0;
+        let err =
+            canonicalize_interface_spec(&bad_interface).expect_err("zero reward bits must fail");
+        assert!(err.to_string().contains("reward_bits must be >= 1"));
+
+        let runtime = canonicalize_runtime_spec(&PlannerRuntimeSpec {
+            random_seed: None,
+            learn_cycles: None,
+            eval_cycles: None,
+            terminate_lifetime: 4,
+            log_every: 2,
+            perf: false,
+            vm_perf_only: false,
+            explore_epsilon: 0.0,
+            explore_gamma: 1.0,
+        })
+        .expect("valid runtime");
+        assert_eq!(runtime.random_seed, Some(resolve_random_seed(None)));
+
+        let err = canonicalize_runtime_spec(&PlannerRuntimeSpec {
+            terminate_lifetime: 0,
+            ..runtime.clone()
+        })
+        .expect_err("zero terminate_lifetime must fail");
+        assert!(err.to_string().contains("terminate_lifetime must be >= 1"));
+
+        let err = canonicalize_runtime_spec(&PlannerRuntimeSpec {
+            log_every: 0,
+            ..runtime.clone()
+        })
+        .expect_err("zero log_every must fail");
+        assert!(err.to_string().contains("log_every must be >= 1"));
+
+        let err = canonicalize_runtime_spec(&PlannerRuntimeSpec {
+            explore_epsilon: -0.1,
+            ..runtime.clone()
+        })
+        .expect_err("negative explore_epsilon must fail");
+        assert!(err.to_string().contains("explore_epsilon must be >= 0"));
+
+        let err = canonicalize_runtime_spec(&PlannerRuntimeSpec {
+            explore_gamma: 0.0,
+            ..runtime
+        })
+        .expect_err("non-positive explore_gamma must fail");
+        assert!(err.to_string().contains("explore_gamma must be > 0"));
+
+        assert_eq!(finite_positive(0.5, "x").expect("positive finite"), 0.5);
+        assert!(finite_positive(f64::INFINITY, "x").is_err());
+        assert_eq!(nonzero_u64(7, "y").expect("nonzero"), 7);
+        assert!(nonzero_u64(0, "y").is_err());
+        assert_eq!(
+            clean_optional_string(Some("  trimmed  ")),
+            Some("trimmed".to_string())
+        );
+        assert_eq!(clean_optional_string(Some("   ")), None);
+        assert_eq!(clean_optional_string(None), None);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn planner_controller_validation_covers_mc_aixi_and_aiqi_contracts() {
+        let env = SpecEnvironment::default();
+        let workers = NonZeroUsize::new(2).expect("non-zero workers");
+
+        canonicalize_controller_spec(
+            &ControllerSpec::McAixi(super::super::McAixiControllerSpec {
+                predictor: RateBackend::Ctw { depth: 4 },
+                agent_horizon: 2,
+                num_simulations: 8,
+                mcts_strategy: MctsStrategy::ParallelUct {
+                    workers,
+                    bu_uct_m_max: Some(0.5),
+                },
+                exploration_exploitation_ratio: 1.0,
+                discount_gamma: 0.8,
+            }),
+            &env,
+        )
+        .expect("valid MC-AIXI controller");
+
+        let err = match canonicalize_controller_spec(
+            &ControllerSpec::McAixi(super::super::McAixiControllerSpec {
+                predictor: RateBackend::Ctw { depth: 4 },
+                agent_horizon: 0,
+                num_simulations: 8,
+                mcts_strategy: MctsStrategy::RhoUct,
+                exploration_exploitation_ratio: 1.0,
+                discount_gamma: 0.8,
+            }),
+            &env,
+        ) {
+            Ok(_) => panic!("zero horizon must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("agent_horizon must be >= 1"));
+
+        let err = match canonicalize_controller_spec(
+            &ControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedControllerSpec {
+                predictor: RateBackend::Ctw { depth: 4 },
+                discount_gamma: 1.0,
+                return_horizon: 2,
+                return_bins: 8,
+                augmentation_period: 2,
+                history_prune_keep_steps: None,
+                baseline_exploration: 0.1,
+            }),
+            &env,
+        ) {
+            Ok(_) => panic!("discount_gamma=1 must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("discount_gamma must be in (0, 1)"));
+
+        let warmstart = canonicalize_controller_spec(
+            &ControllerSpec::AiqiWarmstartExactJh(super::super::WarmStartExactJhControllerSpec {
+                predictor: RateBackend::Ctw { depth: 4 },
+                return_horizon: 2,
+                return_bins: 8,
+                label_phase_period: 3,
+                teacher_dataset_asset: "  teacher-ds  ".to_string(),
+                planner_simulations_per_step: 5,
+            }),
+            &env,
+        )
+        .expect("valid warmstart controller");
+        match warmstart {
+            ControllerSpec::AiqiWarmstartExactJh(inner) => {
+                assert_eq!(inner.teacher_dataset_asset, "teacher-ds");
+            }
+            _ => panic!("expected warmstart controller"),
+        }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn tune_controller_and_bounds_validation_cover_semantic_errors() {
+        let assets = vec![AssetBinding {
+            id: "teacher".to_string(),
+            path: "teacher.bin".to_string(),
+        }];
+        let env = SpecEnvironment::default();
+
+        let annealed = canonicalize_tune_controller(
+            &TuneControllerSpec::AnnealedHillClimbing(
+                super::super::AnnealedHillClimbingTuneControllerSpec {
+                    max_mutation_radius: 2,
+                },
+            ),
+            &assets,
+            &env,
+        )
+        .expect("valid annealed controller");
+        assert!(matches!(
+            annealed,
+            TuneControllerSpec::AnnealedHillClimbing(_)
+        ));
+
+        let err = canonicalize_tune_controller(
+            &TuneControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedTuneControllerSpec {
+                interface: sample_interface(),
+                planner_simulations_per_step: 2,
+                return_horizon: 2,
+                return_bins: 3,
+                discount_factor: 0.5,
+            }),
+            &assets,
+            &env,
+        )
+        .expect_err("non-power-of-two bins must fail");
+        assert!(
+            err.to_string()
+                .contains("return_bins must be a power of two")
+        );
+
+        let err = canonicalize_tune_controller(
+            &TuneControllerSpec::AiqiWarmstartExactJh(
+                super::super::WarmStartExactJhTuneControllerSpec {
+                    interface: sample_interface(),
+                    planner_simulations_per_step: 2,
+                    return_horizon: 2,
+                    warmstart_teacher_dataset_asset: "missing".to_string(),
+                    label_phase_period: 3,
+                },
+            ),
+            &assets,
+            &env,
+        )
+        .expect_err("missing teacher asset must fail");
+        assert!(err.to_string().contains("unknown asset id 'missing'"));
+
+        validate_tune_bounds(&TuneBoundsSpec {
+            allowed_backends: vec!["ctw".to_string()],
+            forbidden_backends: vec!["zpaq".to_string()],
+            parameter_ranges: vec![super::super::TuneParameterRangeSpec {
+                parameter: "alpha".to_string(),
+                min: 0.1,
+                max: 0.2,
+            }],
+            max_experts: 4,
+            max_mixture_nesting_depth: 2,
+            min_experts: Some(1),
+            allow_duplicate_experts: Some(false),
+            required_experts: vec!["ctw".to_string()],
+            forbidden_expert_pairs: vec![("zpaq".to_string(), "ctw".to_string())],
+        })
+        .expect("valid bounds");
+
+        let canonical = canonicalize_tune_bounds(&TuneBoundsSpec {
+            allowed_backends: vec!["ctw".to_string(), "ctw".to_string(), "rosa".to_string()],
+            forbidden_backends: vec!["zpaq".to_string(), "zpaq".to_string()],
+            parameter_ranges: vec![
+                super::super::TuneParameterRangeSpec {
+                    parameter: "beta".to_string(),
+                    min: 0.2,
+                    max: 0.4,
+                },
+                super::super::TuneParameterRangeSpec {
+                    parameter: "alpha".to_string(),
+                    min: 0.1,
+                    max: 0.3,
+                },
+            ],
+            max_experts: 4,
+            max_mixture_nesting_depth: 2,
+            min_experts: Some(1),
+            allow_duplicate_experts: Some(false),
+            required_experts: vec!["rosa".to_string(), "rosa".to_string()],
+            forbidden_expert_pairs: vec![
+                ("zpaq".to_string(), "ctw".to_string()),
+                ("ctw".to_string(), "zpaq".to_string()),
+            ],
+        });
+        assert_eq!(canonical.allowed_backends, vec!["ctw", "rosa"]);
+        assert_eq!(canonical.forbidden_backends, vec!["zpaq"]);
+        assert_eq!(canonical.required_experts, vec!["rosa"]);
+        assert_eq!(
+            canonical.forbidden_expert_pairs,
+            vec![("ctw".to_string(), "zpaq".to_string())]
+        );
+
+        let err = validate_tune_bounds(&TuneBoundsSpec {
+            allowed_backends: vec!["ctw".to_string()],
+            forbidden_backends: vec!["ctw".to_string()],
+            parameter_ranges: vec![],
+            max_experts: 4,
+            max_mixture_nesting_depth: 2,
+            min_experts: Some(1),
+            allow_duplicate_experts: None,
+            required_experts: vec![],
+            forbidden_expert_pairs: vec![],
+        })
+        .expect_err("overlapping allow/forbid bounds must fail");
+        assert!(
+            err.to_string()
+                .contains("allowed_backends and forbidden_backends cannot overlap")
+        );
+
+        let compiled = compile_tune_controller(&TuneControllerSpec::AnnealedHillClimbing(
+            super::super::AnnealedHillClimbingTuneControllerSpec {
+                max_mutation_radius: 2,
+            },
+        ));
+        assert!(matches!(
+            compiled,
+            CompiledTuneController::AnnealedHillClimbing(_)
+        ));
+
+        let baseline = CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 4 },
+            coder: crate::coders::CoderType::AC,
+            framing: crate::compression::FramingMode::Framed,
+        };
+        let tune = TuneSpec {
+            assets: assets.clone(),
+            input_asset: "teacher".to_string(),
+            baseline_candidate: baseline,
+            controller: TuneControllerSpec::AnnealedHillClimbing(
+                super::super::AnnealedHillClimbingTuneControllerSpec {
+                    max_mutation_radius: 2,
+                },
+            ),
+            bounds: TuneBoundsSpec {
+                allowed_backends: vec!["ctw".to_string()],
+                forbidden_backends: vec![],
+                parameter_ranges: vec![],
+                max_experts: 4,
+                max_mixture_nesting_depth: 2,
+                min_experts: Some(1),
+                allow_duplicate_experts: Some(false),
+                required_experts: vec![],
+                forbidden_expert_pairs: vec![],
+            },
+            eval_time_limit_seconds: 1.0,
+            time_budget_seconds: 5.0,
+            min_throughput_bytes_per_second: 1.0,
+            max_memory_bytes: 1024,
+            output_config_path: " out.json ".to_string(),
+            seed: 9,
+            report_path: Some(" report.json ".to_string()),
+        };
+        let compiled = compile_tune_spec(&tune, Path::new(".")).expect("compile tune spec");
+        assert_eq!(compiled.canonical_spec().output_config_path, "out.json");
+    }
+}

@@ -531,6 +531,62 @@ impl TuneControllerSpec {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn action_alphabet(n: usize) -> ActionAlphabet {
+        ActionAlphabet::try_from_usize(n).expect("test action alphabet must be non-zero")
+    }
+
+    fn sample_interface() -> PlannerInterfaceSpec {
+        PlannerInterfaceSpec {
+            observation_bits: 8,
+            observation_stream_len: 1,
+            observation_key_mode: ObservationKeyMode::FullStream,
+            reward_bits: 8,
+            agent_actions: action_alphabet(2),
+            min_reward: 0,
+            max_reward: 1,
+            reward_offset: 0,
+        }
+    }
+
+    #[test]
+    fn tune_controller_kind_matches_each_variant() {
+        let annealed =
+            TuneControllerSpec::AnnealedHillClimbing(AnnealedHillClimbingTuneControllerSpec {
+                max_mutation_radius: 3,
+            });
+        assert_eq!(annealed.kind(), TuneControllerKind::AnnealedHillClimbing);
+
+        let mc_aixi = TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
+            interface: sample_interface(),
+            planner_simulations_per_step: 8,
+        });
+        assert_eq!(mc_aixi.kind(), TuneControllerKind::McAixiFacCtw);
+
+        let aiqi = TuneControllerSpec::AiqiDiscounted(AiqiDiscountedTuneControllerSpec {
+            interface: sample_interface(),
+            planner_simulations_per_step: 8,
+            return_horizon: 2,
+            return_bins: 8,
+            discount_factor: 0.5,
+        });
+        assert_eq!(aiqi.kind(), TuneControllerKind::AiqiDiscounted);
+
+        let warmstart =
+            TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
+                interface: sample_interface(),
+                planner_simulations_per_step: 8,
+                return_horizon: 2,
+                warmstart_teacher_dataset_asset: "teacher".to_string(),
+                label_phase_period: 3,
+            });
+        assert_eq!(warmstart.kind(), TuneControllerKind::AiqiWarmstartExactJh);
+    }
+}
+
 /// Bounded numeric range for a named canonical tuning parameter.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]

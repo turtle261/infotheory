@@ -705,3 +705,224 @@ fn parse_observation_key_mode(name: &str) -> SpecResult<crate::aixi::common::Obs
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_spec_document_json_value_rejects_bad_schema_and_unknown_kind() {
+        let err = match parse_spec_document_json_value(
+            &serde_json::json!({
+                "schema_version": 0,
+                "kind": "planner_run",
+            }),
+            Path::new("."),
+        ) {
+            Ok(_) => panic!("unsupported schema version must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("unsupported spec document schema_version")
+        );
+
+        let err = match parse_spec_document_json_value(
+            &serde_json::json!({
+                "schema_version": SPEC_DOCUMENT_SCHEMA_VERSION,
+                "kind": "unknown",
+            }),
+            Path::new("."),
+        ) {
+            Ok(_) => panic!("unknown document kind must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("unknown spec document kind 'unknown'")
+        );
+    }
+
+    #[test]
+    fn parse_mcts_strategy_enforces_canonical_object_shape() {
+        assert_eq!(
+            parse_mcts_strategy(None, "controller.mcts_strategy")
+                .expect("missing strategy should default"),
+            MctsStrategy::RhoUct
+        );
+
+        let err = parse_mcts_strategy(
+            Some(&serde_json::json!("rho_uct")),
+            "controller.mcts_strategy",
+        )
+        .expect_err("string shorthand must fail");
+        assert!(
+            err.to_string()
+                .contains("controller.mcts_strategy must be an object with a 'kind' field")
+        );
+
+        let err = parse_mcts_strategy(Some(&serde_json::json!({})), "controller.mcts_strategy")
+            .expect_err("missing kind must fail");
+        assert!(
+            err.to_string()
+                .contains("controller.mcts_strategy.kind is required")
+        );
+
+        let err = parse_mcts_strategy(
+            Some(&serde_json::json!({
+                "kind": "parallel_uct",
+                "workers": 0,
+            })),
+            "controller.mcts_strategy",
+        )
+        .expect_err("zero workers must fail");
+        assert!(
+            err.to_string()
+                .contains("controller.mcts_strategy.workers must be >= 1")
+        );
+    }
+
+    #[test]
+    fn parse_runtime_spec_applies_document_defaults() {
+        let runtime = parse_runtime_spec(&serde_json::json!({})).expect("runtime defaults");
+        assert_eq!(runtime.random_seed, None);
+        assert_eq!(runtime.learn_cycles, None);
+        assert_eq!(runtime.eval_cycles, None);
+        assert_eq!(runtime.terminate_lifetime, 20);
+        assert_eq!(runtime.log_every, 1);
+        assert!(!runtime.perf);
+        assert!(!runtime.vm_perf_only);
+        assert_eq!(runtime.explore_epsilon, 0.0);
+        assert_eq!(runtime.explore_gamma, 1.0);
+    }
+
+    #[test]
+    fn parse_tune_bounds_and_list_helpers_cover_optional_shape_contracts() {
+        let parsed = parse_tune_bounds_spec(&serde_json::json!({
+            "allowed_backends": ["ctw"],
+            "forbidden_backends": ["zpaq"],
+            "parameter_ranges": [{
+                "parameter": "mixture.alpha",
+                "min": 0.1,
+                "max": 0.5,
+            }],
+            "max_experts": 4,
+            "max_mixture_nesting_depth": 2,
+            "min_experts": 1,
+            "allow_duplicate_experts": false,
+            "required_experts": ["ctw"],
+            "forbidden_expert_pairs": [["ctw", "zpaq"]],
+        }))
+        .expect("valid tune bounds");
+        assert_eq!(parsed.allowed_backends, vec!["ctw"]);
+        assert_eq!(
+            parsed.forbidden_expert_pairs,
+            vec![("ctw".into(), "zpaq".into())]
+        );
+
+        let err =
+            string_list(&serde_json::json!(["ctw", 7])).expect_err("mixed string list must fail");
+        assert!(err.to_string().contains("expected string list item"));
+
+        let err =
+            pair_list(&serde_json::json!(["ctw"])).expect_err("non-array pair item must fail");
+        assert!(
+            err.to_string()
+                .contains("forbidden_expert_pairs entries must be arrays")
+        );
+
+        let err = pair_list(&serde_json::json!([["ctw"]])).expect_err("short pair item must fail");
+        assert!(
+            err.to_string()
+                .contains("forbidden_expert_pairs entries must have length 2")
+        );
+    }
+
+    #[test]
+    fn parse_tune_controller_variants_cover_semantic_contracts() {
+        let interface = serde_json::json!({
+            "observation_bits": 1,
+            "observation_stream_len": 1,
+            "observation_key_mode": "full_stream",
+            "reward_bits": 1,
+            "agent_actions": 2,
+            "min_reward": 0,
+            "max_reward": 1,
+            "reward_offset": 0,
+        });
+
+        let fac = parse_tune_controller_spec(&serde_json::json!({
+            "kind": "mc_aixi_fac_ctw",
+            "interface": interface.clone(),
+            "planner_simulations_per_step": 16,
+        }))
+        .expect("mc_aixi_fac_ctw controller should parse");
+        assert!(matches!(fac, TuneControllerSpec::McAixiFacCtw(_)));
+
+        let discounted = parse_tune_controller_spec(&serde_json::json!({
+            "kind": "aiqi_discounted",
+            "interface": interface.clone(),
+            "planner_simulations_per_step": 32,
+            "return_horizon": 4,
+            "return_bins": 8,
+            "discount_factor": 0.95,
+        }))
+        .expect("aiqi_discounted controller should parse");
+        assert!(matches!(discounted, TuneControllerSpec::AiqiDiscounted(_)));
+
+        let warmstart = parse_tune_controller_spec(&serde_json::json!({
+            "kind": "aiqi_warmstart_exact_jh",
+            "interface": interface,
+            "planner_simulations_per_step": 48,
+            "return_horizon": 3,
+            "warmstart_teacher_dataset_asset": "teacher",
+            "label_phase_period": 2,
+        }))
+        .expect("aiqi_warmstart_exact_jh controller should parse");
+        assert!(matches!(
+            warmstart,
+            TuneControllerSpec::AiqiWarmstartExactJh(_)
+        ));
+
+        let err = parse_tune_controller_spec(&serde_json::json!({
+            "kind": "definitely_unknown_tune_controller"
+        }))
+        .expect_err("unknown tune controller kind must fail");
+        assert!(err.to_string().contains("unknown tune controller kind"));
+    }
+
+    #[test]
+    fn list_and_range_helpers_return_empty_for_non_array_inputs() {
+        let empty_ranges = parse_tune_parameter_ranges(&serde_json::json!({"not": "array"}))
+            .expect("non-array parameter_ranges should default to empty");
+        assert!(empty_ranges.is_empty());
+
+        let empty_strings =
+            string_list(&serde_json::json!("ctw")).expect("non-array string list should default");
+        assert!(empty_strings.is_empty());
+
+        let empty_pairs =
+            pair_list(&serde_json::json!("ctw,zpaq")).expect("non-array pair list should default");
+        assert!(empty_pairs.is_empty());
+    }
+
+    #[test]
+    fn canonical_name_parsers_reject_removed_or_unknown_aliases() {
+        let err =
+            parse_builtin_environment("ctw_test").expect_err("removed builtin alias must fail");
+        assert!(err.to_string().contains("no longer supported"));
+
+        assert_eq!(
+            parse_observation_key_mode("first").expect("first"),
+            crate::aixi::common::ObservationKeyMode::First
+        );
+        assert_eq!(
+            parse_observation_key_mode("full_stream").expect("full_stream"),
+            crate::aixi::common::ObservationKeyMode::FullStream
+        );
+
+        let err = parse_observation_key_mode("streamhash")
+            .expect_err("non-canonical observation alias must fail");
+        assert!(err.to_string().contains("unknown observation key mode"));
+    }
+}

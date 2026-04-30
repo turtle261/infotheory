@@ -54,8 +54,6 @@ use infotheory::mambazip;
 use infotheory::rwkvzip;
 #[cfg(feature = "backend-sequitur")]
 use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
-#[cfg(test)]
-use infotheory::spec::CanonicalJson;
 use infotheory::spec::{
     self, BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec,
     PlannerRuntimeSpec, SpecDocument,
@@ -1558,37 +1556,12 @@ Examples:
 mod tests {
     use super::*;
     use serde_json::json;
-    #[cfg(any(
-        feature = "all-backends",
-        feature = "backend-mamba",
-        feature = "backend-rwkv"
-    ))]
     use std::path::PathBuf;
-    #[cfg(any(
-        feature = "all-backends",
-        feature = "backend-mamba",
-        feature = "backend-rwkv"
-    ))]
     use std::sync::atomic::{AtomicU64, Ordering};
-    #[cfg(any(
-        feature = "all-backends",
-        feature = "backend-mamba",
-        feature = "backend-rwkv"
-    ))]
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[cfg(any(
-        feature = "all-backends",
-        feature = "backend-mamba",
-        feature = "backend-rwkv"
-    ))]
     static TEMP_TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    #[cfg(any(
-        feature = "all-backends",
-        feature = "backend-mamba",
-        feature = "backend-rwkv"
-    ))]
     fn unique_temp_path(prefix: &str, suffix: &str) -> PathBuf {
         let counter = TEMP_TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -1599,6 +1572,107 @@ mod tests {
             "{prefix}-{}-{nanos}-{counter}{suffix}",
             std::process::id()
         ))
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    fn action_alphabet(n: usize) -> ActionAlphabet {
+        ActionAlphabet::try_from_usize(n).expect("test action alphabet must be non-zero")
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    fn sample_compiled_planner_run() -> CompiledPlannerRunSpec {
+        let document = SpecDocument::parse_json_value(
+            &json!({
+                "schema_version": 1,
+                "kind": "planner_run",
+                "assets": [],
+                "environment": {
+                    "kind": "builtin",
+                    "name": "coin_flip"
+                },
+                "interface": {
+                    "observation_bits": 2,
+                    "observation_stream_len": 1,
+                    "observation_key_mode": "full_stream",
+                    "reward_bits": 4,
+                    "agent_actions": action_alphabet(2).get(),
+                    "min_reward": -1,
+                    "max_reward": 1,
+                    "reward_offset": 1
+                },
+                "controller": {
+                    "kind": "aiqi_discounted",
+                    "predictor": {
+                        "kind": "ctw",
+                        "depth": 4
+                    },
+                    "discount_gamma": 0.5,
+                    "return_horizon": 2,
+                    "return_bins": 8,
+                    "augmentation_period": 2,
+                    "baseline_exploration": 0.1
+                },
+                "runtime": {
+                    "random_seed": 7,
+                    "learn_cycles": 3,
+                    "eval_cycles": 1,
+                    "terminate_lifetime": 3,
+                    "log_every": 1,
+                    "perf": false,
+                    "vm_perf_only": false,
+                    "explore_epsilon": 0.25,
+                    "explore_gamma": 0.5
+                }
+            }),
+            Path::new("."),
+        )
+        .expect("sample planner document");
+        let SpecDocument::PlannerRun(spec) = document else {
+            panic!("expected planner_run document");
+        };
+        spec.compile().expect("sample planner run should compile")
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[derive(Clone, Copy)]
+    struct CountingEnv {
+        observation: u64,
+        reward: i64,
+        reward_bits: usize,
+        action_bits: usize,
+        observation_bits: usize,
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    impl Environment for CountingEnv {
+        fn perform_action(&mut self, action: u64) {
+            self.observation = self.observation.saturating_add(action + 1);
+            self.reward = self.reward.saturating_add(1);
+        }
+
+        fn get_observation(&self) -> u64 {
+            self.observation
+        }
+
+        fn get_reward(&self) -> i64 {
+            self.reward
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn get_observation_bits(&self) -> usize {
+            self.observation_bits
+        }
+
+        fn get_reward_bits(&self) -> usize {
+            self.reward_bits
+        }
+
+        fn get_action_bits(&self) -> usize {
+            self.action_bits
+        }
     }
 
     #[test]
@@ -1638,6 +1712,276 @@ mod tests {
                 .unwrap_or("")
                 .contains("invalid json")
         );
+    }
+
+    #[test]
+    fn canonical_spec_detection_and_legacy_error_messages_are_stable() {
+        assert!(is_canonical_spec_document(&json!({
+            "schema_version": 1,
+            "kind": "planner_run"
+        })));
+        assert!(!is_canonical_spec_document(&json!({
+            "schema_version": 1
+        })));
+        assert_eq!(
+            builtin_environment_name(BuiltinEnvironmentSpec::CoinFlip),
+            "coin_flip"
+        );
+
+        let err = legacy_planner_config_error("/tmp/legacy.json");
+        let msg = err.to_string();
+        assert!(msg.contains("legacy aixi JSON configs are no longer executable"));
+        assert!(msg.contains("/tmp/legacy.json"));
+        assert!(msg.contains("planner_run"));
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn byte_and_path_metric_wrappers_match_basic_identities() {
+        let x = b"banana bandana";
+        let y = b"banana bandana";
+        let z = b"entropy coding";
+        let backend = CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 8 },
+            coder: infotheory::coders::CoderType::AC,
+            framing: infotheory::compression::FramingMode::Raw,
+        }
+        .compile()
+        .expect("ctw compression backend should compile");
+
+        let ncd_same = ncd_bytes_backend(x, y, &backend, NcdVariant::Vitanyi);
+        let ncd_diff = ncd_bytes_backend(x, z, &backend, NcdVariant::Vitanyi);
+        assert!(ncd_same.is_finite() && ncd_diff.is_finite());
+        assert!(
+            ncd_same <= ncd_diff,
+            "identical inputs should not rank farther apart"
+        );
+        assert!(
+            ncd_same < 0.6,
+            "identical inputs should remain relatively close; got {ncd_same}"
+        );
+
+        let id = intrinsic_dependence_bytes(x);
+        assert!(id.is_finite());
+        assert!(id >= 0.0);
+
+        let mi = mutual_information_bytes(x, y);
+        assert!(mi.is_finite());
+        assert!(mi >= 0.0);
+
+        let h_y_given_x = conditional_entropy_bytes(y, x);
+        assert!(h_y_given_x.is_finite());
+        assert!(h_y_given_x >= 0.0);
+
+        let cross = cross_entropy_bytes(z, x);
+        assert!(cross.is_finite());
+        assert!(cross >= 0.0);
+
+        let joint = joint_entropy_rate_bytes(x, y);
+        assert!(joint.is_finite());
+        assert!(joint >= 0.0);
+
+        let resistance = resistance_to_transformation_bytes(x, y);
+        assert!(resistance.is_finite());
+        assert!(resistance >= 0.0);
+
+        let ned = ned_bytes(x, y);
+        let ned_cons = ned_cons_bytes(x, y);
+        let nte = nte_bytes(x, y);
+        assert!(ned.is_finite() && ned >= 0.0);
+        assert!(ned_cons.is_finite() && ned_cons >= 0.0);
+        assert!(nte.is_finite() && nte >= 0.0);
+
+        let left = unique_temp_path("metric-left", ".txt");
+        let right = unique_temp_path("metric-right", ".txt");
+        let different = unique_temp_path("metric-different", ".txt");
+        std::fs::write(&left, x).expect("write left file");
+        std::fs::write(&right, y).expect("write right file");
+        std::fs::write(&different, z).expect("write different file");
+
+        let tvd_same = tvd_paths(left.to_str().expect("utf8"), right.to_str().expect("utf8"));
+        let tvd_diff = tvd_paths(
+            left.to_str().expect("utf8"),
+            different.to_str().expect("utf8"),
+        );
+        assert!(tvd_same.is_finite() && tvd_diff.is_finite());
+        assert!(tvd_same <= tvd_diff);
+
+        let nhd_same = nhd_paths(left.to_str().expect("utf8"), right.to_str().expect("utf8"));
+        let nhd_diff = nhd_paths(
+            left.to_str().expect("utf8"),
+            different.to_str().expect("utf8"),
+        );
+        assert!(nhd_same.is_finite() && nhd_diff.is_finite());
+        assert!(nhd_same <= nhd_diff);
+
+        let kl_same =
+            kl_divergence_paths(left.to_str().expect("utf8"), right.to_str().expect("utf8"));
+        let js_same =
+            js_divergence_paths(left.to_str().expect("utf8"), right.to_str().expect("utf8"));
+        assert!(kl_same.is_finite() && kl_same >= 0.0);
+        assert!(js_same.is_finite() && js_same >= 0.0);
+
+        let _ = std::fs::remove_file(left);
+        let _ = std::fs::remove_file(right);
+        let _ = std::fs::remove_file(different);
+    }
+
+    #[test]
+    fn aixi_run_logger_handles_disabled_and_single_sink_modes() {
+        assert!(
+            AixiRunLogger::new(None)
+                .expect("logger creation should succeed")
+                .is_none()
+        );
+
+        let bits_path = unique_temp_path("aixi-trace-only-bits", ".bin");
+        let jsonl_path = unique_temp_path("aixi-trace-only-jsonl", ".jsonl");
+
+        let bits_overlay = json!({
+            "trace_bits01_path": bits_path,
+        });
+        let mut bits_logger = AixiRunLogger::new(Some(&bits_overlay))
+            .expect("bits logger")
+            .expect("bits logger should be enabled");
+        bits_logger.log_action(1, 1).expect("log action to bits");
+        bits_logger.next_step().expect("advance bits step");
+        drop(bits_logger);
+        let bits = std::fs::read(&bits_path).expect("read bits trace");
+        assert!(!bits.is_empty());
+
+        let jsonl_overlay = json!({
+            "trace_jsonl_path": jsonl_path,
+            "trace_flush_every": 2
+        });
+        let mut jsonl_logger = AixiRunLogger::new(Some(&jsonl_overlay))
+            .expect("jsonl logger")
+            .expect("jsonl logger should be enabled");
+        jsonl_logger
+            .log_percept(&[3], 1, 2, 4, 1)
+            .expect("log percept to jsonl");
+        jsonl_logger.next_step().expect("advance jsonl step");
+        drop(jsonl_logger);
+        let jsonl = std::fs::read_to_string(&jsonl_path).expect("read jsonl trace");
+        assert!(jsonl.contains("\"kind\":\"percept\""));
+
+        let _ = std::fs::remove_file(bits_path);
+        let _ = std::fs::remove_file(jsonl_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn planner_run_schedule_derives_cycles_and_extra_exploration() {
+        let compiled = sample_compiled_planner_run();
+        let mut runtime = compiled.runtime().clone();
+        runtime.learn_cycles = None;
+        runtime.eval_cycles = Some(3);
+        runtime.terminate_lifetime = 5;
+        runtime.log_every = 2;
+        runtime.perf = true;
+        runtime.explore_epsilon = 0.4;
+        runtime.explore_gamma = 0.5;
+        let schedule = PlannerRunSchedule::from_runtime(&runtime);
+        assert_eq!(schedule.learn_cycles, 5);
+        assert_eq!(schedule.eval_cycles, 3);
+        assert_eq!(schedule.log_every, 2);
+        assert!(schedule.perf);
+        assert!((schedule.extra_exploration(0) - 0.4).abs() < 1e-12);
+        assert!((schedule.extra_exploration(2) - 0.1).abs() < 1e-12);
+
+        let mut no_explore_runtime = runtime.clone();
+        no_explore_runtime.learn_cycles = Some(1);
+        no_explore_runtime.eval_cycles = None;
+        no_explore_runtime.terminate_lifetime = 1;
+        no_explore_runtime.explore_epsilon = 0.0;
+        no_explore_runtime.explore_gamma = 0.25;
+        let no_explore = PlannerRunSchedule::from_runtime(&no_explore_runtime);
+        assert_eq!(no_explore.extra_exploration(99), 0.0);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn planner_execution_context_and_vm_perf_only_update_environment_state() {
+        let compiled = sample_compiled_planner_run();
+        let env = Box::new(CountingEnv {
+            observation: 1,
+            reward: -1,
+            reward_bits: 4,
+            action_bits: 1,
+            observation_bits: 2,
+        });
+        validate_action_alphabet(&compiled, env.as_ref()).expect("matching action alphabet");
+
+        let mut ctx = PlannerExecutionContext::new(&compiled, env, None).expect("context");
+        assert_eq!(ctx.obs_stream, vec![1]);
+        assert_eq!(ctx.rew, -1);
+
+        let reward = ctx.perform_action(0).expect("perform action");
+        assert_eq!(reward, 0);
+        assert_eq!(ctx.obs_stream, vec![2]);
+        assert_eq!(ctx.rew, 0);
+
+        let schedule = PlannerRunSchedule {
+            learn_cycles: 2,
+            eval_cycles: 0,
+            log_every: 0,
+            perf: false,
+            vm_perf_only: true,
+            explore_epsilon: 0.0,
+            explore_gamma: 1.0,
+        };
+        run_vm_perf_only(&schedule, &mut ctx).expect("vm perf only run");
+        assert_eq!(ctx.obs_stream, vec![4]);
+        assert_eq!(ctx.rew, 2);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn validate_action_alphabet_reports_mismatch() {
+        let compiled = sample_compiled_planner_run();
+        let env = CountingEnv {
+            observation: 0,
+            reward: 0,
+            reward_bits: 4,
+            action_bits: 2,
+            observation_bits: 2,
+        };
+        let err = validate_action_alphabet(&compiled, &env)
+            .expect_err("mismatched action bits must fail");
+        assert!(err.to_string().contains("action_alphabet_mismatch"));
+        assert!(err.to_string().contains("2 actions"));
+        assert!(err.to_string().contains("4"));
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn aixi_run_logger_writes_bits_and_jsonl_records() {
+        let bits_path = unique_temp_path("aixi-trace-bits", ".bin");
+        let jsonl_path = unique_temp_path("aixi-trace-jsonl", ".jsonl");
+        let overlay = json!({
+            "trace_bits01_path": bits_path,
+            "trace_jsonl_path": jsonl_path,
+            "trace_flush_every": 1
+        });
+
+        let mut logger = AixiRunLogger::new(Some(&overlay))
+            .expect("logger setup")
+            .expect("logger should be enabled");
+        logger.log_action(1, 2).expect("log action");
+        logger.log_percept(&[2], 1, 2, 4, 0).expect("log percept");
+        logger.next_step().expect("advance step");
+        drop(logger);
+
+        let bits = std::fs::read(&bits_path).expect("read bits trace");
+        assert!(!bits.is_empty());
+        assert!(bits.iter().all(|byte| *byte == 0 || *byte == 1));
+
+        let jsonl = std::fs::read_to_string(&jsonl_path).expect("read jsonl trace");
+        assert!(jsonl.contains("\"kind\":\"action\""));
+        assert!(jsonl.contains("\"kind\":\"percept\""));
+
+        let _ = std::fs::remove_file(bits_path);
+        let _ = std::fs::remove_file(jsonl_path);
     }
 
     #[test]
@@ -2270,10 +2614,11 @@ mod tests {
             "seed": 7,
             "report_path": null
         });
-        let doc = infotheory::spec::SpecDocument::parse_json_value(&doc_value, Path::new("."))
-            .expect("canonical tune document");
-        std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
-            .expect("write temp spec");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&doc_value).expect("serialize canonical json"),
+        )
+        .expect("write temp spec");
 
         let err = run_aixi_mode(path.to_str().expect("utf8 path"))
             .expect_err("missing backend feature should be surfaced");

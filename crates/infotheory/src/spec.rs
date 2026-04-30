@@ -1824,8 +1824,21 @@ mod tests {
         feature = "backend-mamba"
     ))]
     use crate::coders::CoderType;
+    use std::fs;
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "infotheory-spec-tests-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
 
     fn sample_self_contained_rate_backend(
         kind: crate::runtime::RateBackendKind,
@@ -2478,5 +2491,773 @@ mod tests {
         assert_eq!(value["method"]["cfg"]["hidden"], 64);
         assert_eq!(value["method"]["cfg"]["layers"], 1);
         assert_eq!(value["method"]["cfg"]["intermediate"], 96);
+    }
+
+    #[test]
+    fn helper_parsers_and_name_renderers_use_canonical_forms() {
+        assert_eq!(
+            resolve_spec_path(Path::new("/tmp/base"), "child/spec.json"),
+            Path::new("/tmp/base").join("child/spec.json")
+        );
+        assert_eq!(
+            resolve_spec_path(Path::new("/tmp/base"), Path::new("/tmp/absolute.json")),
+            Path::new("/tmp/absolute.json")
+        );
+
+        assert_eq!(
+            parse_calibration_context_kind(None).expect("default calibration context"),
+            CalibrationContextKind::Text
+        );
+        assert_eq!(
+            parse_calibration_context_kind(Some("repeat")).expect("repeat context"),
+            CalibrationContextKind::Repeat
+        );
+        assert!(parse_calibration_context_kind(Some("legacy")).is_err());
+
+        assert_eq!(
+            parse_mixture_kind("switching").expect("switching"),
+            MixtureKind::Switching
+        );
+        assert_eq!(
+            parse_mixture_schedule("theorem").expect("theorem schedule"),
+            MixtureScheduleMode::Theorem
+        );
+        assert_eq!(mixture_kind_name(MixtureKind::Neural), "neural");
+        assert_eq!(
+            mixture_schedule_name(MixtureScheduleMode::Default),
+            "default"
+        );
+        assert_eq!(
+            calibration_context_kind_name(CalibrationContextKind::Text),
+            "text"
+        );
+
+        assert_eq!(
+            parse_framing_mode(None).expect("default framing"),
+            crate::compression::FramingMode::Framed
+        );
+        assert_eq!(
+            parse_framing_mode(Some("raw")).expect("raw framing"),
+            crate::compression::FramingMode::Raw
+        );
+        assert!(parse_framing_mode(Some("legacy")).is_err());
+        assert_eq!(
+            framing_mode_name(crate::compression::FramingMode::Framed),
+            "framed"
+        );
+
+        let zpaq_json = zpaq_method_to_json_value(&crate::api::ZpaqMethodSpec::literal("3"));
+        assert_eq!(zpaq_json["kind"], "literal");
+        assert_eq!(
+            parse_zpaq_method_json_value(&zpaq_json, "5")
+                .expect("typed zpaq method")
+                .value(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn load_json_value_from_path_reports_read_and_parse_context() {
+        let dir = unique_temp_dir("load-json");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let valid = dir.join("valid.json");
+        let invalid = dir.join("invalid.json");
+        fs::write(&valid, br#"{ "alpha": 1 }"#).expect("write valid json");
+        fs::write(&invalid, b"{ invalid").expect("write invalid json");
+
+        let (value, full) =
+            load_json_value_from_path(&dir, "valid.json", "spec fixture").expect("load valid");
+        assert_eq!(value["alpha"], 1);
+        assert_eq!(full, valid);
+
+        let err = load_json_value_from_path(&dir, "missing.json", "spec fixture")
+            .expect_err("missing json must fail");
+        assert!(err.to_string().contains("failed to read spec fixture"));
+        assert!(err.to_string().contains("missing.json"));
+
+        let err = load_json_value_from_path(&dir, "invalid.json", "spec fixture")
+            .expect_err("invalid json must fail");
+        assert!(err.to_string().contains("invalid spec fixture JSON"));
+        assert!(err.to_string().contains("invalid.json"));
+
+        let _ = fs::remove_file(valid);
+        let _ = fs::remove_file(invalid);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn shorthand_rate_backend_parsers_load_file_backed_specs_and_respect_particle_default_policy() {
+        let dir = unique_temp_dir("backend-files");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let mixture_path = dir.join("mixture.json");
+        let calibrated_path = dir.join("calibrated.json");
+        let particle_path = dir.join("particle.json");
+
+        let mixture = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![MixtureExpertSpec {
+                name: Some("ctw".to_string()),
+                log_prior: 0.0,
+                backend: RateBackend::Ctw { depth: 4 },
+            }],
+        );
+        let calibrated = CalibratedSpec {
+            base: RateBackend::Ctw { depth: 5 },
+            context: CalibrationContextKind::Text,
+            bins: 17,
+            learning_rate: 0.05,
+            bias_clip: 3.0,
+        };
+        let particle = ParticleSpec::default();
+
+        fs::write(
+            &mixture_path,
+            mixture.to_canonical_json().expect("mixture canonical json"),
+        )
+        .expect("write mixture spec");
+        fs::write(
+            &calibrated_path,
+            calibrated
+                .to_canonical_json()
+                .expect("calibrated canonical json"),
+        )
+        .expect("write calibrated spec");
+        fs::write(
+            &particle_path,
+            particle
+                .to_canonical_json()
+                .expect("particle canonical json"),
+        )
+        .expect("write particle spec");
+
+        let options = RateBackendShorthandOptions {
+            base_dir: dir.clone(),
+            particle_default_if_missing_method: false,
+            ..RateBackendShorthandOptions::default()
+        };
+
+        let mixture_result =
+            parse_rate_backend_name_method("mixture", Some("mixture.json"), &options);
+        #[cfg(feature = "backend-mixture")]
+        {
+            let mixture_backend = mixture_result.expect("mixture shorthand should load JSON file");
+            assert!(matches!(mixture_backend, RateBackend::Mixture { .. }));
+        }
+        #[cfg(not(feature = "backend-mixture"))]
+        {
+            let err = match mixture_result {
+                Ok(_) => {
+                    panic!("mixture shorthand should fail when feature is disabled")
+                }
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("backend 'mixture' requires infotheory feature 'backend-mixture'"),
+                "unexpected mixture error: {err}"
+            );
+        }
+
+        let particle_result =
+            parse_rate_backend_name_method("particle", Some("particle.json"), &options);
+        #[cfg(feature = "backend-particle")]
+        {
+            let particle_backend =
+                particle_result.expect("particle shorthand should load JSON file");
+            assert!(matches!(particle_backend, RateBackend::Particle { .. }));
+        }
+        #[cfg(not(feature = "backend-particle"))]
+        {
+            let err = match particle_result {
+                Ok(_) => {
+                    panic!("particle shorthand should fail when feature is disabled")
+                }
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("backend 'particle' requires infotheory feature 'backend-particle'"),
+                "unexpected particle error: {err}"
+            );
+        }
+
+        let calibrated_result =
+            parse_rate_backend_name_method("calibrated", Some("calibrated.json"), &options);
+        #[cfg(feature = "backend-calibrated")]
+        {
+            let calibrated_backend =
+                calibrated_result.expect("calibrated shorthand should load JSON file");
+            assert!(matches!(calibrated_backend, RateBackend::Calibrated { .. }));
+        }
+        #[cfg(not(feature = "backend-calibrated"))]
+        {
+            let err = match calibrated_result {
+                Ok(_) => {
+                    panic!("calibrated shorthand should fail when feature is disabled")
+                }
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(
+                    "backend 'calibrated' requires infotheory feature 'backend-calibrated'"
+                ),
+                "unexpected calibrated error: {err}"
+            );
+        }
+
+        let particle_missing_method_result =
+            parse_rate_backend_name_method("particle", None, &options);
+        #[cfg(feature = "backend-particle")]
+        {
+            let err = match particle_missing_method_result {
+                Ok(_) => {
+                    panic!("particle shorthand should require path when disabled")
+                }
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("particle backend requires a path to a ParticleSpec JSON file"),
+                "unexpected particle missing-method error: {err}"
+            );
+        }
+        #[cfg(not(feature = "backend-particle"))]
+        {
+            let err = match particle_missing_method_result {
+                Ok(_) => {
+                    panic!("particle shorthand without feature should report capability error")
+                }
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("backend 'particle' requires infotheory feature 'backend-particle'"),
+                "unexpected particle feature error: {err}"
+            );
+        }
+
+        let _ = fs::remove_file(mixture_path);
+        let _ = fs::remove_file(calibrated_path);
+        let _ = fs::remove_file(particle_path);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn parse_particle_spec_value_preserves_defaults_and_rejects_mixture_shapes() {
+        let defaults = ParticleSpec::default();
+        let parsed = parse_particle_spec_value(&serde_json::json!({
+            "num_particles": defaults.num_particles + 7,
+            "deterministic": !defaults.deterministic,
+        }))
+        .expect("particle subset should parse with defaults");
+        assert_eq!(parsed.num_particles, defaults.num_particles + 7);
+        assert_eq!(parsed.context_window, defaults.context_window);
+        assert_eq!(parsed.seed, defaults.seed);
+        assert_eq!(parsed.deterministic, !defaults.deterministic);
+
+        let err = parse_particle_spec_value(&serde_json::json!({
+            "kind": "mixture",
+            "num_particles": 8,
+        }))
+        .expect_err("mixture-looking kind must be rejected");
+        assert!(
+            err.to_string()
+                .contains("looks like a mixture spec (kind='mixture')"),
+            "unexpected error: {err}"
+        );
+
+        let err = parse_particle_spec_value(&serde_json::json!({
+            "experts": [],
+        }))
+        .expect_err("mixture-shaped object must be rejected");
+        assert!(
+            err.to_string()
+                .contains("looks like a mixture spec (found 'experts')"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "all-backends")]
+    #[test]
+    fn load_sidecar_specs_report_read_and_json_error_context() {
+        let dir = unique_temp_dir("load-sidecar-errors");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let particle_invalid = dir.join("particle-invalid.json");
+        let calibrated_invalid = dir.join("calibrated-invalid.json");
+        let expert_invalid = dir.join("expert-invalid.json");
+        fs::write(&particle_invalid, b"{ invalid").expect("write invalid particle json");
+        fs::write(&calibrated_invalid, b"{ invalid").expect("write invalid calibrated json");
+        fs::write(&expert_invalid, b"{ invalid").expect("write invalid expert json");
+
+        let missing_particle = dir.join("particle-missing.json");
+        let err = match load_particle_spec(missing_particle.to_str().expect("utf8 path")) {
+            Ok(_) => panic!("missing particle spec should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("failed to read particle spec"),
+            "{err}"
+        );
+
+        let err = match load_particle_spec(particle_invalid.to_str().expect("utf8 path")) {
+            Ok(_) => panic!("invalid particle spec JSON should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("invalid particle spec JSON"),
+            "{err}"
+        );
+
+        let missing_calibrated = dir.join("calibrated-missing.json");
+        let err = match load_calibrated_spec(missing_calibrated.to_str().expect("utf8 path")) {
+            Ok(_) => panic!("missing calibrated spec should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("failed to read calibrated spec"),
+            "{err}"
+        );
+
+        let err = match load_calibrated_spec(calibrated_invalid.to_str().expect("utf8 path")) {
+            Ok(_) => panic!("invalid calibrated spec JSON should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("invalid calibrated spec JSON"),
+            "{err}"
+        );
+
+        let missing_expert = dir.join("expert-missing.json");
+        let err = match load_expert_spec(missing_expert.to_str().expect("utf8 path")) {
+            Ok(_) => panic!("missing expert spec should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("failed to read expert spec"),
+            "{err}"
+        );
+
+        let err = match load_expert_spec(expert_invalid.to_str().expect("utf8 path")) {
+            Ok(_) => panic!("invalid expert spec JSON should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("invalid expert spec JSON"),
+            "{err}"
+        );
+
+        let _ = fs::remove_file(particle_invalid);
+        let _ = fs::remove_file(calibrated_invalid);
+        let _ = fs::remove_file(expert_invalid);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[cfg(feature = "all-backends")]
+    #[test]
+    fn shorthand_rate_backend_parser_covers_leaf_defaults_and_model_path_contracts() {
+        let options = RateBackendShorthandOptions::default();
+
+        let sparse_match = parse_rate_backend_name_method("sparse-match", None, &options)
+            .expect("sparse-match shorthand should parse");
+        match sparse_match {
+            RateBackend::SparseMatch {
+                hash_bits,
+                min_len,
+                max_len,
+                gap_min,
+                gap_max,
+                base_mix,
+                confidence_scale,
+            } => {
+                assert_eq!(hash_bits, 19);
+                assert_eq!(min_len, 3);
+                assert_eq!(max_len, 64);
+                assert_eq!(gap_min, 1);
+                assert_eq!(gap_max, 2);
+                assert!((base_mix - 0.05).abs() < f64::EPSILON);
+                assert!((confidence_scale - 1.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected sparse-match backend"),
+        }
+
+        let fac_ctw = parse_rate_backend_name_method("fac-ctw", Some("11"), &options)
+            .expect("fac-ctw shorthand should parse");
+        match fac_ctw {
+            RateBackend::FacCtw {
+                base_depth,
+                num_percept_bits,
+                encoding_bits,
+            } => {
+                assert_eq!(base_depth, 11);
+                assert_eq!(num_percept_bits, options.fac_ctw_num_percept_bits);
+                assert_eq!(encoding_bits, options.fac_ctw_encoding_bits);
+            }
+            _ => panic!("expected fac-ctw backend"),
+        }
+
+        let zpaq = parse_rate_backend_name_method("zpaq", None, &options)
+            .expect("zpaq shorthand should parse");
+        assert!(
+            matches!(zpaq, RateBackend::Zpaq { method } if method.value() == options.zpaq_method)
+        );
+
+        let particle = parse_rate_backend_name_method("particle", None, &options)
+            .expect("particle shorthand should use default spec");
+        assert!(matches!(particle, RateBackend::Particle { .. }));
+
+        let mixture_err = match parse_rate_backend_name_method("mixture", None, &options) {
+            Ok(_) => panic!("mixture shorthand without path should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            mixture_err
+                .to_string()
+                .contains("mixture backend requires a path to a MixtureSpec JSON file"),
+            "{mixture_err}"
+        );
+
+        let calibrated_err = match parse_rate_backend_name_method("calibrated", None, &options) {
+            Ok(_) => panic!("calibrated shorthand without path should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            calibrated_err
+                .to_string()
+                .contains("calibrated backend requires a path to a CalibratedSpec JSON file"),
+            "{calibrated_err}"
+        );
+
+        let mamba_err = match parse_rate_backend_name_method("mamba", None, &options) {
+            Ok(_) => panic!("mamba shorthand without method/model path should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            mamba_err
+                .to_string()
+                .contains("mamba backend requires method string"),
+            "{mamba_err}"
+        );
+
+        let rwkv_err = match parse_rate_backend_name_method("rwkv7", None, &options) {
+            Ok(_) => panic!("rwkv shorthand without method/model path should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            rwkv_err
+                .to_string()
+                .contains("rwkv backend requires method string"),
+            "{rwkv_err}"
+        );
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn parse_rate_backend_json_loads_nested_spec_paths_relative_to_base_dir() {
+        let dir = unique_temp_dir("nested-backend-specs");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let nested_dir = dir.join("nested");
+        fs::create_dir_all(&nested_dir).expect("create nested dir");
+
+        let particle_path = nested_dir.join("particle.json");
+        let calibrated_path = nested_dir.join("calibrated.json");
+        let mixture_path = nested_dir.join("mixture.json");
+
+        let particle = ParticleSpec {
+            num_particles: 11,
+            context_window: 19,
+            ..ParticleSpec::default()
+        };
+        let calibrated = CalibratedSpec {
+            base: RateBackend::Ctw { depth: 9 },
+            context: CalibrationContextKind::Repeat,
+            bins: 21,
+            learning_rate: 0.03,
+            bias_clip: 2.5,
+        };
+        let mixture = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![MixtureExpertSpec {
+                name: Some("ctw-nine".to_string()),
+                log_prior: -0.5,
+                backend: RateBackend::Ctw { depth: 9 },
+            }],
+        );
+
+        fs::write(
+            &particle_path,
+            particle.to_canonical_json().expect("particle json"),
+        )
+        .expect("write particle spec");
+        fs::write(
+            &calibrated_path,
+            calibrated.to_canonical_json().expect("calibrated json"),
+        )
+        .expect("write calibrated spec");
+        fs::write(
+            &mixture_path,
+            mixture.to_canonical_json().expect("mixture json"),
+        )
+        .expect("write mixture spec");
+
+        let particle_result = parse_rate_backend_json(
+            &serde_json::json!({
+                "kind": "particle",
+                "spec_path": "nested/particle.json",
+            }),
+            &dir,
+            MAX_MIXTURE_NESTING,
+        );
+        #[cfg(feature = "backend-particle")]
+        {
+            let particle_backend =
+                particle_result.expect("particle spec_path should resolve relative to base dir");
+            match particle_backend {
+                RateBackend::Particle { spec } => {
+                    assert_eq!(spec.num_particles, 11);
+                    assert_eq!(spec.context_window, 19);
+                }
+                _ => panic!("expected particle backend"),
+            }
+        }
+        #[cfg(not(feature = "backend-particle"))]
+        {
+            let err = match particle_result {
+                Ok(_) => panic!("particle backend should report feature gate in this slice"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("backend 'particle' requires infotheory feature 'backend-particle'"),
+                "unexpected particle error: {err}"
+            );
+        }
+
+        let calibrated_result = parse_rate_backend_json(
+            &serde_json::json!({
+                "kind": "calibrated",
+                "spec_path": "nested/calibrated.json",
+            }),
+            &dir,
+            MAX_MIXTURE_NESTING,
+        );
+        #[cfg(feature = "backend-calibrated")]
+        {
+            let calibrated_backend = calibrated_result
+                .expect("calibrated spec_path should resolve relative to base dir");
+            match calibrated_backend {
+                RateBackend::Calibrated { spec } => {
+                    assert_eq!(spec.bins, 21);
+                    assert_eq!(spec.context, CalibrationContextKind::Repeat);
+                    match spec.base {
+                        RateBackend::Ctw { depth } => assert_eq!(depth, 9),
+                        _ => panic!("expected ctw base backend"),
+                    }
+                }
+                _ => panic!("expected calibrated backend"),
+            }
+        }
+        #[cfg(not(feature = "backend-calibrated"))]
+        {
+            let err = match calibrated_result {
+                Ok(_) => panic!("calibrated backend should report feature gate in this slice"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(
+                    "backend 'calibrated' requires infotheory feature 'backend-calibrated'"
+                ),
+                "unexpected calibrated error: {err}"
+            );
+        }
+
+        let mixture_result = parse_rate_backend_json(
+            &serde_json::json!({
+                "kind": "mixture",
+                "spec_path": "nested/mixture.json",
+            }),
+            &dir,
+            MAX_MIXTURE_NESTING,
+        );
+        #[cfg(feature = "backend-mixture")]
+        {
+            let mixture_backend =
+                mixture_result.expect("mixture spec_path should resolve relative to base dir");
+            match mixture_backend {
+                RateBackend::Mixture { spec } => {
+                    assert_eq!(spec.kind, MixtureKind::Bayes);
+                    assert_eq!(spec.experts.len(), 1);
+                    assert_eq!(spec.experts[0].name.as_deref(), Some("ctw-nine"));
+                }
+                _ => panic!("expected mixture backend"),
+            }
+        }
+        #[cfg(not(feature = "backend-mixture"))]
+        {
+            let err = match mixture_result {
+                Ok(_) => panic!("mixture backend should report feature gate in this slice"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("backend 'mixture' requires infotheory feature 'backend-mixture'"),
+                "unexpected mixture error: {err}"
+            );
+        }
+
+        let _ = fs::remove_file(particle_path);
+        let _ = fs::remove_file(calibrated_path);
+        let _ = fs::remove_file(mixture_path);
+        let _ = fs::remove_dir(nested_dir);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn parse_rwkv7_compression_backend_json_requires_method_or_model_path() {
+        let err = match parse_compression_backend_json(
+            &serde_json::json!({
+                "kind": "rwkv7",
+            }),
+            Path::new("."),
+            None,
+            crate::compression::FramingMode::Framed,
+        ) {
+            Ok(_) => panic!("rwkv7 compression json without method/model_path must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("rwkv7 compression backend requires 'method' or 'model_path'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn parse_rwkv7_compression_backend_json_lowers_typed_method_and_coder() {
+        let backend = parse_compression_backend_json(
+            &serde_json::json!({
+                "kind": "rwkv7",
+                "coder": "rans",
+                "framing": "raw",
+                "method": {
+                    "kind": "online",
+                    "cfg": {
+                        "hidden": 64,
+                        "layers": 1,
+                        "intermediate": 64,
+                        "decay_rank": 8,
+                        "a_rank": 8,
+                        "v_rank": 8,
+                        "g_rank": 8,
+                        "seed": 5,
+                        "train": "none",
+                        "lr": 0.01,
+                        "stride": 2
+                    },
+                    "policy": "schedule=0..100:infer"
+                }
+            }),
+            Path::new("."),
+            None,
+            crate::compression::FramingMode::Framed,
+        )
+        .expect("typed rwkv7 compression backend should parse");
+
+        match backend {
+            CompressionBackend::Rate {
+                rate_backend,
+                coder,
+                framing,
+            } => {
+                assert_eq!(coder, crate::coders::CoderType::RANS);
+                assert_eq!(framing, crate::compression::FramingMode::Raw);
+                match rate_backend {
+                    RateBackend::Rwkv7Method { method } => match method {
+                        crate::rwkvzip::MethodSpec::Online { cfg, policy } => {
+                            assert_eq!(cfg.hidden, 64);
+                            assert_eq!(cfg.layers, 1);
+                            assert_eq!(cfg.stride, 2);
+                            assert!(policy.is_some(), "policy should be preserved");
+                        }
+                        _ => panic!("expected online rwkv method"),
+                    },
+                    _ => panic!("expected rwkv7 rate backend"),
+                }
+            }
+            CompressionBackend::Rwkv7 { method, coder } => {
+                assert_eq!(coder, crate::coders::CoderType::RANS);
+                match method {
+                    crate::rwkvzip::MethodSpec::Online { cfg, policy } => {
+                        assert_eq!(cfg.hidden, 64);
+                        assert_eq!(cfg.layers, 1);
+                        assert_eq!(cfg.stride, 2);
+                        assert!(policy.is_some(), "policy should be preserved");
+                    }
+                    _ => panic!("expected online rwkv method"),
+                }
+            }
+            _ => panic!("expected rwkv7-derived compression backend"),
+        }
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn parse_rwkv7_compression_shorthand_coder_alias_requires_or_uses_model_path() {
+        let base_dir = unique_temp_dir("rwkv-coder-alias");
+        fs::create_dir_all(&base_dir).expect("create temp dir");
+
+        let missing_path_options = CompressionBackendShorthandOptions {
+            base_dir: base_dir.clone(),
+            ..CompressionBackendShorthandOptions::default()
+        };
+        let err = match parse_compression_backend_name_method(
+            "rwkv7",
+            Some("ac"),
+            None,
+            &missing_path_options,
+        ) {
+            Ok(_) => panic!("coder alias without default model path should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(
+                "rwkv7 compression backend requires a configured model path when only a coder alias is provided"
+            ),
+            "{err}"
+        );
+
+        let with_path_options = CompressionBackendShorthandOptions {
+            base_dir: base_dir.clone(),
+            default_rwkv_model_path: Some("weights/model.safetensors".to_string()),
+            ..CompressionBackendShorthandOptions::default()
+        };
+        let with_path_err = match parse_compression_backend_name_method(
+            "rwkv7",
+            Some("rans"),
+            None,
+            &with_path_options,
+        ) {
+            Ok(_) => panic!("missing RWKV model weights should fail deterministically"),
+            Err(err) => err,
+        };
+        assert!(
+            with_path_err
+                .to_string()
+                .contains("Failed to load model weights"),
+            "{with_path_err}"
+        );
+        assert!(
+            with_path_err
+                .to_string()
+                .contains("weights/model.safetensors"),
+            "{with_path_err}"
+        );
+
+        let _ = fs::remove_dir(base_dir);
     }
 }

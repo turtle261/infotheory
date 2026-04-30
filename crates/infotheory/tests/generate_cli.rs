@@ -211,6 +211,31 @@ fn generate_cli_rwkv_emits_requested_bytes() {
     let _ = fs::remove_file(prompt_path);
 }
 
+#[cfg(feature = "backend-mamba")]
+#[test]
+fn generate_cli_mamba_emits_requested_bytes() {
+    let prompt_path = write_temp_file("mamba_prompt", "txt", PROMPT);
+    let path_str = prompt_path.to_string_lossy().to_string();
+    let out = run_generate(
+        &[
+            "generate",
+            &path_str,
+            "--rate-backend",
+            "mamba",
+            "--method",
+            "cfg:hidden=64,layers=1,intermediate=96,state=16,conv=4,dt_rank=16,seed=26,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
+            "--bytes",
+            "8",
+            "--sample",
+            "--seed",
+            "42",
+        ],
+        None,
+    );
+    assert_eq!(out.len(), 8);
+    let _ = fs::remove_file(prompt_path);
+}
+
 #[test]
 fn generate_cli_supports_expert_spec_and_mixture_spec() {
     let prompt_path = write_temp_file("spec_prompt", "txt", PROMPT);

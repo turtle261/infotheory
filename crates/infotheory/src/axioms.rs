@@ -148,3 +148,115 @@ where
     let h = entropy(data);
     (-1e-12..=8.0 + 1e-12).contains(&h)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hamming_distance(x: &[u8], y: &[u8]) -> f64 {
+        x.iter().zip(y.iter()).filter(|(a, b)| a != b).count() as f64
+    }
+
+    #[test]
+    fn metric_axiom_verifiers_distinguish_valid_from_invalid_cases() {
+        let x = b"abc";
+        let y = b"abd";
+        let z = b"acd";
+
+        assert!(verify_identity(hamming_distance, x, 0.0));
+        assert!(!verify_identity(|_, _| 0.2, x, 0.1));
+
+        assert!(verify_symmetry(hamming_distance, x, y, 0.0));
+        assert!(!verify_symmetry(
+            |lhs, rhs| {
+                if lhs == rhs {
+                    0.0
+                } else if lhs == x && rhs == y {
+                    1.0
+                } else {
+                    3.0
+                }
+            },
+            x,
+            y,
+            0.0
+        ));
+
+        assert!(verify_triangle_inequality(hamming_distance, x, y, z, 0.0));
+        assert!(!verify_triangle_inequality(
+            |lhs, rhs| { if lhs == x && rhs == z { 5.0 } else { 1.0 } },
+            x,
+            y,
+            z,
+            0.0
+        ));
+
+        assert!(verify_non_negativity(hamming_distance, x, y));
+        assert!(verify_non_negativity(|_, _| -5e-13, x, y));
+        assert!(!verify_non_negativity(|_, _| -1e-6, x, y));
+    }
+
+    #[test]
+    fn information_inequality_verifiers_cover_positive_and_negative_examples() {
+        let x = b"left";
+        let y = b"right";
+
+        let empirical = |data: &[u8]| data.len() as f64;
+        let joint = |lhs: &[u8], rhs: &[u8]| (lhs.len() + rhs.len()) as f64 - 0.5;
+        let conditional = |lhs: &[u8], _rhs: &[u8]| lhs.len() as f64 - 0.25;
+
+        assert!(verify_mi_nonnegative(|_, _| 0.0, x, y));
+        assert!(!verify_mi_nonnegative(|_, _| -1e-6, x, y));
+
+        assert!(verify_subadditivity(joint, empirical, x, y, 0.0));
+        assert!(!verify_subadditivity(
+            |lhs, rhs| (lhs.len() + rhs.len()) as f64 + 2.0,
+            empirical,
+            x,
+            y,
+            0.0
+        ));
+
+        assert!(verify_conditioning_reduces_entropy(
+            conditional,
+            empirical,
+            x,
+            y,
+            0.0
+        ));
+        assert!(!verify_conditioning_reduces_entropy(
+            |lhs, _rhs| lhs.len() as f64 + 1.0,
+            empirical,
+            x,
+            y,
+            0.0
+        ));
+
+        assert!(verify_chain_rule(joint, empirical, conditional, x, y, 0.5));
+        assert!(!verify_chain_rule(
+            |lhs, rhs| (lhs.len() + rhs.len()) as f64 + 3.0,
+            empirical,
+            conditional,
+            x,
+            y,
+            0.0
+        ));
+    }
+
+    #[test]
+    fn bound_verifiers_allow_expected_slack_only() {
+        let x = b"x";
+        let y = b"y";
+
+        assert!(verify_ncd_bounds(|_, _| 0.0, x, y));
+        assert!(verify_ncd_bounds(|_, _| 1.1, x, y));
+        assert!(!verify_ncd_bounds(|_, _| 1.100_001, x, y));
+        assert!(!verify_ncd_bounds(|_, _| -1e-6, x, y));
+
+        assert!(verify_entropy_bounds(|_| 0.0, x));
+        assert!(verify_entropy_bounds(|_| 8.0, x));
+        assert!(verify_entropy_bounds(|_| -5e-13, x));
+        assert!(!verify_entropy_bounds(|_| 8.1, x));
+        assert!(!verify_entropy_bounds(|_| -1e-6, x));
+    }
+}

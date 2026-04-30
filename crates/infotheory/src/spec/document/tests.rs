@@ -1,17 +1,31 @@
 //! Tests for canonical top-level specification documents.
 
 use super::*;
+#[cfg(any(feature = "backend-ctw", feature = "all-backends"))]
+use crate::aixi::common::MctsStrategy;
+use crate::aixi::common::{ActionAlphabet, ObservationKeyMode};
+#[cfg(feature = "backend-ctw")]
 use crate::aixi::common::{
-    ActionAlphabet, DEFAULT_RANDOM_SEED, MctsStrategy, ObservationKeyMode,
-    parallel_uct_workers_one_warning_count_for_tests,
+    DEFAULT_RANDOM_SEED, parallel_uct_workers_one_warning_count_for_tests,
     reset_parallel_uct_workers_one_warning_for_tests,
 };
 #[cfg(feature = "backend-ctw")]
 use crate::api::CompressionBackend;
 use crate::api::RateBackend;
-use crate::spec::CanonicalJson;
+#[cfg(feature = "all-backends")]
+use crate::api::{
+    CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureScheduleMode,
+    MixtureSpec, ParticleSpec,
+};
+#[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
+use crate::backends::llm_policy::{
+    LlmPolicy, OptimizerHyperParams, OptimizerKind, PolicyAction, PolicyRule, PositionExpr,
+    RepeatRule, RepeatSegment, ScheduleRule, TrainAction, TrainScopeSet,
+};
 #[cfg(feature = "backend-ctw")]
 use std::num::NonZeroUsize;
+#[cfg(feature = "all-backends")]
+use std::sync::Arc;
 
 #[cfg(feature = "backend-ctw")]
 fn nz(n: usize) -> NonZeroUsize {
@@ -20,6 +34,49 @@ fn nz(n: usize) -> NonZeroUsize {
 
 fn action_alphabet(n: usize) -> ActionAlphabet {
     ActionAlphabet::try_from_usize(n).expect("test fixture action alphabet must be non-zero")
+}
+
+#[cfg(feature = "backend-ctw")]
+fn sample_tune_spec() -> TuneSpec {
+    TuneSpec {
+        assets: vec![AssetBinding {
+            id: "dataset".to_string(),
+            path: "input.bin".to_string(),
+        }],
+        input_asset: "dataset".to_string(),
+        baseline_candidate: CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 8 },
+            coder: crate::coders::CoderType::AC,
+            framing: crate::compression::FramingMode::Framed,
+        },
+        controller: TuneControllerSpec::AnnealedHillClimbing(
+            AnnealedHillClimbingTuneControllerSpec {
+                max_mutation_radius: 2,
+            },
+        ),
+        bounds: TuneBoundsSpec {
+            allowed_backends: vec!["ctw".to_string()],
+            forbidden_backends: vec!["zpaq".to_string()],
+            parameter_ranges: vec![TuneParameterRangeSpec {
+                parameter: "mixture.alpha".to_string(),
+                min: 0.1,
+                max: 0.5,
+            }],
+            max_experts: 4,
+            max_mixture_nesting_depth: 2,
+            min_experts: Some(1),
+            allow_duplicate_experts: Some(false),
+            required_experts: vec!["ctw".to_string()],
+            forbidden_expert_pairs: vec![],
+        },
+        eval_time_limit_seconds: 1.0,
+        time_budget_seconds: 10.0,
+        min_throughput_bytes_per_second: 1024.0,
+        max_memory_bytes: 1 << 20,
+        output_config_path: "best.json".to_string(),
+        seed: 7,
+        report_path: Some("report.json".to_string()),
+    }
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -485,6 +542,57 @@ fn planner_run_resolved_seed_survives_binary_roundtrip() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
+fn staged_document_and_compiled_planner_accessors_preserve_metadata() {
+    let base_dir = Path::new("/tmp/infotheory-stage-planner");
+    let spec = sample_planner_run();
+    let value = SpecDocument::PlannerRun(spec.clone())
+        .to_canonical_json_value()
+        .expect("planner json value");
+    let parsed =
+        SpecDocument::parse_json_value_staged(&value, base_dir).expect("staged planner parse");
+
+    assert_eq!(parsed.base_dir(), base_dir);
+    assert!(matches!(parsed.document(), SpecDocument::PlannerRun(_)));
+    assert!(matches!(
+        parsed.clone().into_document(),
+        SpecDocument::PlannerRun(_)
+    ));
+
+    let validated = parsed.validate().expect("staged planner validate");
+    assert!(!validated.canonical_bytes().is_empty());
+    let compiled_doc = validated.compile().expect("staged planner compile");
+    assert_eq!(
+        compiled_doc.canonical_bytes().as_slice(),
+        validated.canonical_bytes().as_slice()
+    );
+
+    match compiled_doc {
+        CompiledSpecDocument::PlannerRun(compiled) => {
+            assert_eq!(
+                compiled
+                    .canonical_spec()
+                    .to_canonical_json()
+                    .expect("canonical json"),
+                spec.compile()
+                    .expect("direct planner compile")
+                    .canonical_spec()
+                    .to_canonical_json()
+                    .expect("direct canonical json")
+            );
+            assert_eq!(compiled.resolved_assets().len(), 0);
+            assert_eq!(compiled.interface().agent_actions.get(), 2);
+            assert_eq!(compiled.runtime().random_seed, Some(7));
+            assert_eq!(compiled.resolved_random_seed(), 7);
+            assert_eq!(compiled.action_bits(), 1);
+            assert_eq!(compiled.controller().kind_str(), "aiqi_discounted");
+            assert_eq!(compiled.controller().backend_label(), "ctw(depth=8)");
+        }
+        _ => panic!("expected compiled planner document"),
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
 fn staged_pipeline_matches_direct_planner_compile() {
     let spec = sample_planner_run();
     let value = SpecDocument::PlannerRun(spec.clone())
@@ -552,6 +660,31 @@ fn staged_pipeline_supports_standalone_backend_documents() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
+fn tune_validation_and_compilation_accessors_surface_baseline_metadata() {
+    let spec = sample_tune_spec();
+    let validated = spec.validate().expect("validated tune spec");
+    assert_eq!(validated.canonical_spec().input_asset, "dataset");
+    assert!(!validated.canonical_bytes().is_empty());
+
+    let compiled = validated.compile().expect("compiled tune spec");
+    assert_eq!(compiled.canonical_spec().input_asset, "dataset");
+    assert_eq!(compiled.resolved_assets().len(), 1);
+    assert_eq!(compiled.resolved_assets()[0].id, "dataset");
+    let crate::spec::AssetRef::Filesystem(path) = &compiled.resolved_assets()[0].asset;
+    assert!(path.ends_with("input.bin"));
+    assert!(matches!(
+        compiled.controller(),
+        CompiledTuneController::AnnealedHillClimbing(_)
+    ));
+    assert_eq!(compiled.candidate_canonicalization_version(), "bounds-v1");
+    assert_eq!(
+        compiled.baseline_candidate_model_bytes(),
+        compiled.baseline_candidate().canonical_bytes().len()
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
 fn standalone_backend_documents_roundtrip_without_embedded_json_fragments() {
     let rate = SpecDocument::RateBackend(RateBackend::Ctw { depth: 8 });
     let compression = SpecDocument::CompressionBackend(CompressionBackend::Rate {
@@ -572,6 +705,582 @@ fn standalone_backend_documents_roundtrip_without_embedded_json_fragments() {
         let reparsed = SpecDocument::from_binary(&bytes, Path::new(".")).expect("binary");
         assert_eq!(reparsed.to_canonical_json().expect("parsed json"), expected);
     }
+}
+
+#[cfg(feature = "all-backends")]
+#[test]
+fn standalone_rate_backend_documents_cover_all_binary_backend_tags() {
+    let rate_docs = vec![
+        SpecDocument::RateBackend(RateBackend::RosaPlus { max_order: 32 }),
+        SpecDocument::RateBackend(RateBackend::Match {
+            hash_bits: 18,
+            min_len: 2,
+            max_len: 32,
+            base_mix: 0.05,
+            confidence_scale: 1.0,
+        }),
+        SpecDocument::RateBackend(RateBackend::SparseMatch {
+            hash_bits: 18,
+            min_len: 2,
+            max_len: 32,
+            gap_min: 1,
+            gap_max: 4,
+            base_mix: 0.05,
+            confidence_scale: 1.0,
+        }),
+        SpecDocument::RateBackend(RateBackend::Ppmd {
+            order: 6,
+            memory_mb: 8,
+        }),
+        SpecDocument::RateBackend(RateBackend::Sequitur { context_bytes: 64 }),
+        SpecDocument::RateBackend(RateBackend::Ctw { depth: 12 }),
+        SpecDocument::RateBackend(RateBackend::FacCtw {
+            base_depth: 10,
+            num_percept_bits: 8,
+            encoding_bits: 1,
+        }),
+        SpecDocument::RateBackend(RateBackend::Zpaq {
+            method: crate::api::ZpaqMethodSpec::literal("1"),
+        }),
+        SpecDocument::RateBackend(RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 })],
+            )),
+        }),
+        SpecDocument::RateBackend(RateBackend::Mixture {
+            spec: Arc::new(
+                MixtureSpec::new(
+                    MixtureKind::FadingBayes,
+                    vec![MixtureExpertSpec::new(RateBackend::Match {
+                        hash_bits: 16,
+                        min_len: 2,
+                        max_len: 16,
+                        base_mix: 0.05,
+                        confidence_scale: 1.0,
+                    })],
+                )
+                .with_decay(0.97),
+            ),
+        }),
+        SpecDocument::RateBackend(RateBackend::Mixture {
+            spec: Arc::new(
+                MixtureSpec::new(
+                    MixtureKind::Switching,
+                    vec![MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })],
+                )
+                .with_schedule(MixtureScheduleMode::Theorem),
+            ),
+        }),
+        SpecDocument::RateBackend(RateBackend::Mixture {
+            spec: Arc::new(
+                MixtureSpec::new(
+                    MixtureKind::Convex,
+                    vec![MixtureExpertSpec::new(RateBackend::Ppmd {
+                        order: 5,
+                        memory_mb: 4,
+                    })],
+                )
+                .with_alpha(1.25)
+                .with_schedule(MixtureScheduleMode::Theorem),
+            ),
+        }),
+        SpecDocument::RateBackend(RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Mdl,
+                vec![MixtureExpertSpec::new(RateBackend::Sequitur {
+                    context_bytes: 48,
+                })],
+            )),
+        }),
+        SpecDocument::RateBackend(RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Neural,
+                vec![MixtureExpertSpec::new(RateBackend::FacCtw {
+                    base_depth: 8,
+                    num_percept_bits: 8,
+                    encoding_bits: 1,
+                })],
+            )),
+        }),
+        SpecDocument::RateBackend(RateBackend::Particle {
+            spec: Arc::new(ParticleSpec::default()),
+        }),
+        SpecDocument::RateBackend(RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec {
+                context: CalibrationContextKind::Text,
+                bins: 17,
+                learning_rate: 0.05,
+                bias_clip: 3.0,
+                base: RateBackend::Ctw { depth: 8 },
+            }),
+        }),
+    ];
+
+    for doc in rate_docs {
+        let expected = doc.to_canonical_json().expect("json");
+        let reparsed = SpecDocument::from_binary(&doc.to_binary(), Path::new(".")).expect("binary");
+        assert_eq!(reparsed.to_canonical_json().expect("parsed json"), expected);
+    }
+}
+
+#[cfg(feature = "all-backends")]
+#[test]
+fn standalone_compression_backend_documents_cover_binary_coder_variants() {
+    let docs = vec![
+        SpecDocument::CompressionBackend(CompressionBackend::Zpaq {
+            method: crate::api::ZpaqMethodSpec::literal("5"),
+        }),
+        SpecDocument::CompressionBackend(CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 8 },
+            coder: crate::coders::CoderType::AC,
+            framing: crate::compression::FramingMode::Raw,
+        }),
+        SpecDocument::CompressionBackend(CompressionBackend::Rate {
+            rate_backend: RateBackend::Mixture {
+                spec: Arc::new(MixtureSpec::new(
+                    MixtureKind::Bayes,
+                    vec![MixtureExpertSpec::new(RateBackend::FacCtw {
+                        base_depth: 8,
+                        num_percept_bits: 8,
+                        encoding_bits: 1,
+                    })],
+                )),
+            },
+            coder: crate::coders::CoderType::RANS,
+            framing: crate::compression::FramingMode::Framed,
+        }),
+    ];
+
+    for doc in docs {
+        let expected = doc.to_canonical_json().expect("json");
+        let reparsed = SpecDocument::from_binary(&doc.to_binary(), Path::new(".")).expect("binary");
+        assert_eq!(reparsed.to_canonical_json().expect("parsed json"), expected);
+    }
+}
+
+#[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
+fn sample_llm_policy() -> LlmPolicy {
+    LlmPolicy {
+        load_from: Some("checkpoint;v1.safetensors".into()),
+        schedule: vec![
+            ScheduleRule::Interval(PolicyRule {
+                start: PositionExpr::Bytes(0),
+                end: PositionExpr::Percent(0.5),
+                action: PolicyAction::Infer,
+            }),
+            ScheduleRule::Repeat(RepeatRule {
+                start: PositionExpr::Bytes(10),
+                end: PositionExpr::Bytes(200),
+                period: PositionExpr::Bytes(6),
+                pattern: vec![
+                    RepeatSegment {
+                        span: PositionExpr::Bytes(2),
+                        action: PolicyAction::Train(TrainAction {
+                            scope: TrainScopeSet {
+                                all: false,
+                                names: vec!["head".to_string(), "bias".to_string()],
+                            },
+                            optimizer: OptimizerKind::Adam,
+                            hyper: OptimizerHyperParams {
+                                lr: 0.01,
+                                stride: 2,
+                                bptt: 4,
+                                clip: 1.5,
+                                momentum: 0.9,
+                            },
+                        }),
+                    },
+                    RepeatSegment {
+                        span: PositionExpr::Percent(0.5),
+                        action: PolicyAction::Train(TrainAction {
+                            scope: TrainScopeSet::all(),
+                            optimizer: OptimizerKind::Sgd,
+                            hyper: OptimizerHyperParams {
+                                lr: 0.005,
+                                stride: 1,
+                                bptt: 1,
+                                clip: 0.0,
+                                momentum: 0.2,
+                            },
+                        }),
+                    },
+                ],
+            }),
+        ],
+    }
+}
+
+#[cfg(feature = "backend-rwkv")]
+#[test]
+fn standalone_rwkv_method_documents_roundtrip_file_and_online_policies() {
+    let file_doc = SpecDocument::RateBackend(RateBackend::Rwkv7Method {
+        method: crate::rwkvzip::MethodSpec::File {
+            path: "models/rwkv;demo.safetensors".into(),
+            policy: Some(sample_llm_policy()),
+        },
+    });
+    let online_doc = SpecDocument::CompressionBackend(CompressionBackend::Rwkv7 {
+        method: crate::rwkvzip::MethodSpec::Online {
+            cfg: crate::rwkvzip::OnlineConfig {
+                hidden: 64,
+                layers: 1,
+                intermediate: 64,
+                decay_rank: 8,
+                a_rank: 8,
+                v_rank: 8,
+                g_rank: 8,
+                seed: 17,
+                train_mode: crate::rwkvzip::OnlineTrainMode::Adam,
+                lr: 0.01,
+                stride: 3,
+            },
+            policy: Some(sample_llm_policy()),
+        },
+        coder: crate::coders::CoderType::RANS,
+    });
+
+    for doc in [file_doc, online_doc] {
+        let expected = doc.to_canonical_json().expect("json");
+        let reparsed = SpecDocument::from_binary(&doc.to_binary(), Path::new(".")).expect("binary");
+        assert_eq!(reparsed.to_canonical_json().expect("parsed json"), expected);
+    }
+}
+
+#[cfg(feature = "backend-mamba")]
+#[test]
+fn standalone_mamba_method_documents_roundtrip_file_and_online_policies() {
+    let file_doc = SpecDocument::RateBackend(RateBackend::MambaMethod {
+        method: crate::mambazip::MethodSpec::File {
+            path: "models/mamba;demo.safetensors".into(),
+            policy: Some(sample_llm_policy()),
+        },
+    });
+    let online_doc = SpecDocument::RateBackend(RateBackend::MambaMethod {
+        method: crate::mambazip::MethodSpec::Online {
+            cfg: crate::mambazip::OnlineConfig {
+                hidden: 64,
+                layers: 2,
+                intermediate: 96,
+                state: 8,
+                conv: 4,
+                dt_rank: 8,
+                seed: 23,
+                train_mode: crate::mambazip::OnlineTrainMode::Sgd,
+                lr: 0.02,
+                stride: 2,
+            },
+            policy: Some(sample_llm_policy()),
+        },
+    });
+
+    for doc in [file_doc, online_doc] {
+        let expected = doc.to_canonical_json().expect("json");
+        let reparsed = SpecDocument::from_binary(&doc.to_binary(), Path::new(".")).expect("binary");
+        assert_eq!(reparsed.to_canonical_json().expect("parsed json"), expected);
+    }
+}
+
+#[cfg(feature = "all-backends")]
+#[test]
+fn planner_and_tune_documents_roundtrip_all_controller_variants() {
+    let interface = PlannerInterfaceSpec {
+        observation_bits: 2,
+        observation_stream_len: 2,
+        observation_key_mode: ObservationKeyMode::StreamHash,
+        reward_bits: 2,
+        agent_actions: action_alphabet(3),
+        min_reward: 0,
+        max_reward: 3,
+        reward_offset: 0,
+    };
+
+    let planner_docs = vec![
+        SpecDocument::PlannerRun(PlannerRunSpec {
+            assets: vec![],
+            environment: EnvironmentSpec::Builtin {
+                builtin: BuiltinEnvironmentSpec::CoinFlip,
+            },
+            interface: interface.clone(),
+            controller: ControllerSpec::McAixi(McAixiControllerSpec {
+                predictor: RateBackend::FacCtw {
+                    base_depth: 8,
+                    num_percept_bits: 8,
+                    encoding_bits: 1,
+                },
+                agent_horizon: 4,
+                num_simulations: 12,
+                mcts_strategy: MctsStrategy::ParallelUct {
+                    workers: nz(3),
+                    bu_uct_m_max: Some(0.5),
+                },
+                exploration_exploitation_ratio: 1.1,
+                discount_gamma: 0.95,
+            }),
+            runtime: PlannerRuntimeSpec {
+                random_seed: None,
+                learn_cycles: Some(5),
+                eval_cycles: Some(3),
+                terminate_lifetime: 8,
+                log_every: 2,
+                perf: true,
+                vm_perf_only: false,
+                explore_epsilon: 0.2,
+                explore_gamma: 0.9,
+            },
+        }),
+        SpecDocument::PlannerRun(PlannerRunSpec {
+            assets: vec![],
+            environment: EnvironmentSpec::Builtin {
+                builtin: BuiltinEnvironmentSpec::Blackjack,
+            },
+            interface: interface.clone(),
+            controller: ControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhControllerSpec {
+                predictor: RateBackend::Mixture {
+                    spec: Arc::new(
+                        MixtureSpec::new(
+                            MixtureKind::Switching,
+                            vec![
+                                MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 }),
+                                MixtureExpertSpec::new(RateBackend::FacCtw {
+                                    base_depth: 6,
+                                    num_percept_bits: 8,
+                                    encoding_bits: 1,
+                                }),
+                            ],
+                        )
+                        .with_schedule(MixtureScheduleMode::Theorem),
+                    ),
+                },
+                return_horizon: 4,
+                return_bins: 16,
+                label_phase_period: 6,
+                teacher_dataset_asset: "teacher".to_string(),
+                planner_simulations_per_step: 9,
+            }),
+            runtime: PlannerRuntimeSpec {
+                random_seed: Some(19),
+                learn_cycles: None,
+                eval_cycles: Some(4),
+                terminate_lifetime: 7,
+                log_every: 1,
+                perf: false,
+                vm_perf_only: false,
+                explore_epsilon: 0.0,
+                explore_gamma: 1.0,
+            },
+        }),
+    ];
+
+    for doc in planner_docs {
+        let expected = doc.to_canonical_json().expect("json");
+        let reparsed = SpecDocument::from_binary(&doc.to_binary(), Path::new(".")).expect("binary");
+        assert_eq!(reparsed.to_canonical_json().expect("parsed json"), expected);
+    }
+
+    let bounds = TuneBoundsSpec {
+        allowed_backends: vec!["ctw".to_string(), "fac-ctw".to_string()],
+        forbidden_backends: vec!["zpaq".to_string()],
+        parameter_ranges: vec![TuneParameterRangeSpec {
+            parameter: "mixture.alpha".to_string(),
+            min: 0.01,
+            max: 0.5,
+        }],
+        max_experts: 4,
+        max_mixture_nesting_depth: 2,
+        min_experts: Some(1),
+        allow_duplicate_experts: Some(false),
+        required_experts: vec!["ctw".to_string()],
+        forbidden_expert_pairs: vec![("ppmd".to_string(), "sequitur".to_string())],
+    };
+
+    let tune_docs = vec![
+        SpecDocument::Tune(TuneSpec {
+            assets: vec![],
+            input_asset: "dataset".to_string(),
+            baseline_candidate: CompressionBackend::Rate {
+                rate_backend: RateBackend::Ctw { depth: 8 },
+                coder: crate::coders::CoderType::AC,
+                framing: crate::compression::FramingMode::Framed,
+            },
+            controller: TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
+                interface: interface.clone(),
+                planner_simulations_per_step: 10,
+            }),
+            bounds: bounds.clone(),
+            eval_time_limit_seconds: 1.5,
+            time_budget_seconds: 20.0,
+            min_throughput_bytes_per_second: 2048.0,
+            max_memory_bytes: 1 << 20,
+            output_config_path: "mcaixi.json".to_string(),
+            seed: 11,
+            report_path: None,
+        }),
+        SpecDocument::Tune(TuneSpec {
+            assets: vec![],
+            input_asset: "dataset".to_string(),
+            baseline_candidate: CompressionBackend::Rate {
+                rate_backend: RateBackend::FacCtw {
+                    base_depth: 8,
+                    num_percept_bits: 8,
+                    encoding_bits: 1,
+                },
+                coder: crate::coders::CoderType::RANS,
+                framing: crate::compression::FramingMode::Raw,
+            },
+            controller: TuneControllerSpec::AiqiDiscounted(AiqiDiscountedTuneControllerSpec {
+                interface: interface.clone(),
+                planner_simulations_per_step: 12,
+                return_horizon: 5,
+                return_bins: 16,
+                discount_factor: 0.97,
+            }),
+            bounds: bounds.clone(),
+            eval_time_limit_seconds: 2.0,
+            time_budget_seconds: 30.0,
+            min_throughput_bytes_per_second: 4096.0,
+            max_memory_bytes: 1 << 21,
+            output_config_path: "aiqi.json".to_string(),
+            seed: 13,
+            report_path: Some("aiqi-report.json".to_string()),
+        }),
+        SpecDocument::Tune(TuneSpec {
+            assets: vec![AssetBinding {
+                id: "teacher".to_string(),
+                path: "teacher.bin".to_string(),
+            }],
+            input_asset: "dataset".to_string(),
+            baseline_candidate: CompressionBackend::Rate {
+                rate_backend: RateBackend::Match {
+                    hash_bits: 16,
+                    min_len: 2,
+                    max_len: 16,
+                    base_mix: 0.05,
+                    confidence_scale: 1.0,
+                },
+                coder: crate::coders::CoderType::AC,
+                framing: crate::compression::FramingMode::Framed,
+            },
+            controller: TuneControllerSpec::AiqiWarmstartExactJh(
+                WarmStartExactJhTuneControllerSpec {
+                    interface,
+                    planner_simulations_per_step: 7,
+                    return_horizon: 4,
+                    warmstart_teacher_dataset_asset: "teacher".to_string(),
+                    label_phase_period: 5,
+                },
+            ),
+            bounds,
+            eval_time_limit_seconds: 3.0,
+            time_budget_seconds: 40.0,
+            min_throughput_bytes_per_second: 1024.0,
+            max_memory_bytes: 1 << 22,
+            output_config_path: "warmstart.json".to_string(),
+            seed: 17,
+            report_path: Some("warmstart-report.json".to_string()),
+        }),
+    ];
+
+    for doc in tune_docs {
+        let expected = doc.to_canonical_json().expect("json");
+        let reparsed = SpecDocument::from_binary(&doc.to_binary(), Path::new(".")).expect("binary");
+        assert_eq!(reparsed.to_canonical_json().expect("parsed json"), expected);
+    }
+}
+
+#[cfg(feature = "all-backends")]
+#[test]
+fn binary_spec_document_corruption_reports_precise_envelope_errors() {
+    let rate_doc = SpecDocument::RateBackend(RateBackend::Ctw { depth: 8 });
+
+    let mut bad_magic = rate_doc.to_binary();
+    bad_magic[0] ^= 0x01;
+    let err = match SpecDocument::from_binary(&bad_magic, Path::new(".")) {
+        Ok(_) => panic!("corrupted magic must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("invalid spec document magic"));
+
+    let mut bad_version = rate_doc.to_binary();
+    bad_version[4] = 99;
+    let err = match SpecDocument::from_binary(&bad_version, Path::new(".")) {
+        Ok(_) => panic!("unknown version must be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("unsupported spec document binary version")
+    );
+
+    let mut bad_doc_tag = rate_doc.to_binary();
+    bad_doc_tag[5] = 99;
+    let err = match SpecDocument::from_binary(&bad_doc_tag, Path::new(".")) {
+        Ok(_) => panic!("unknown top-level tag must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("unknown spec document tag"));
+
+    let mut bad_rate_tag = rate_doc.to_binary();
+    bad_rate_tag[6] = 99;
+    let err = match SpecDocument::from_binary(&bad_rate_tag, Path::new(".")) {
+        Ok(_) => panic!("unknown rate backend tag must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("unknown rate backend tag"));
+
+    let mut bad_compression_coder = SpecDocument::CompressionBackend(CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 8 },
+        coder: crate::coders::CoderType::AC,
+        framing: crate::compression::FramingMode::Raw,
+    })
+    .to_binary();
+    bad_compression_coder[7] = 99;
+    let err = match SpecDocument::from_binary(&bad_compression_coder, Path::new(".")) {
+        Ok(_) => panic!("unknown coder tag must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("unknown coder tag"));
+
+    let mut bad_compression_framing = SpecDocument::CompressionBackend(CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 8 },
+        coder: crate::coders::CoderType::AC,
+        framing: crate::compression::FramingMode::Raw,
+    })
+    .to_binary();
+    bad_compression_framing[8] = 99;
+    let err = match SpecDocument::from_binary(&bad_compression_framing, Path::new(".")) {
+        Ok(_) => panic!("unknown framing tag must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("unknown framing tag"));
+
+    let mut bad_mixture_kind = SpecDocument::RateBackend(RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })],
+        )),
+    })
+    .to_binary();
+    bad_mixture_kind[7] = 99;
+    let err = match SpecDocument::from_binary(&bad_mixture_kind, Path::new(".")) {
+        Ok(_) => panic!("unknown mixture kind must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("unknown mixture kind tag"));
+
+    let mut bad_mixture_schedule = SpecDocument::RateBackend(RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Switching,
+            vec![MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })],
+        )),
+    })
+    .to_binary();
+    bad_mixture_schedule[8] = 99;
+    let err = match SpecDocument::from_binary(&bad_mixture_schedule, Path::new(".")) {
+        Ok(_) => panic!("unknown mixture schedule must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("unknown mixture schedule tag"));
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -857,45 +1566,7 @@ fn planner_run_compile_rejects_unknown_vm_enum_names() {
 #[cfg(feature = "backend-ctw")]
 #[test]
 fn tune_document_binary_roundtrip_is_stable() {
-    let spec = TuneSpec {
-        assets: vec![AssetBinding {
-            id: "dataset".to_string(),
-            path: "input.bin".to_string(),
-        }],
-        input_asset: "dataset".to_string(),
-        baseline_candidate: CompressionBackend::Rate {
-            rate_backend: RateBackend::Ctw { depth: 8 },
-            coder: crate::coders::CoderType::AC,
-            framing: crate::compression::FramingMode::Framed,
-        },
-        controller: TuneControllerSpec::AnnealedHillClimbing(
-            AnnealedHillClimbingTuneControllerSpec {
-                max_mutation_radius: 2,
-            },
-        ),
-        bounds: TuneBoundsSpec {
-            allowed_backends: vec!["ctw".to_string()],
-            forbidden_backends: vec!["zpaq".to_string()],
-            parameter_ranges: vec![TuneParameterRangeSpec {
-                parameter: "mixture.alpha".to_string(),
-                min: 0.1,
-                max: 0.5,
-            }],
-            max_experts: 4,
-            max_mixture_nesting_depth: 2,
-            min_experts: Some(1),
-            allow_duplicate_experts: Some(false),
-            required_experts: vec!["ctw".to_string()],
-            forbidden_expert_pairs: vec![],
-        },
-        eval_time_limit_seconds: 1.0,
-        time_budget_seconds: 10.0,
-        min_throughput_bytes_per_second: 1024.0,
-        max_memory_bytes: 1 << 20,
-        output_config_path: "best.json".to_string(),
-        seed: 7,
-        report_path: Some("report.json".to_string()),
-    };
+    let spec = sample_tune_spec();
     let expected = spec.to_canonical_json().expect("json");
     let bytes = SpecDocument::Tune(spec.clone()).to_binary();
     let reparsed = SpecDocument::from_binary(&bytes, Path::new(".")).expect("binary");
@@ -910,41 +1581,12 @@ fn tune_document_binary_roundtrip_is_stable() {
 #[cfg(feature = "backend-ctw")]
 #[test]
 fn tune_compile_model_bytes_ignore_outer_request_controls() {
-    let base = TuneSpec {
-        assets: vec![AssetBinding {
-            id: "dataset".to_string(),
-            path: "input.bin".to_string(),
-        }],
-        input_asset: "dataset".to_string(),
-        baseline_candidate: CompressionBackend::Rate {
-            rate_backend: RateBackend::Ctw { depth: 8 },
-            coder: crate::coders::CoderType::AC,
-            framing: crate::compression::FramingMode::Framed,
-        },
-        controller: TuneControllerSpec::AnnealedHillClimbing(
-            AnnealedHillClimbingTuneControllerSpec {
-                max_mutation_radius: 2,
-            },
-        ),
-        bounds: TuneBoundsSpec {
-            allowed_backends: vec!["ctw".to_string()],
-            forbidden_backends: vec![],
-            parameter_ranges: vec![],
-            max_experts: 4,
-            max_mixture_nesting_depth: 2,
-            min_experts: Some(1),
-            allow_duplicate_experts: Some(false),
-            required_experts: vec![],
-            forbidden_expert_pairs: vec![],
-        },
-        eval_time_limit_seconds: 1.0,
-        time_budget_seconds: 10.0,
-        min_throughput_bytes_per_second: 1024.0,
-        max_memory_bytes: 1 << 20,
-        output_config_path: "best-a.json".to_string(),
-        seed: 7,
-        report_path: Some("report-a.json".to_string()),
-    };
+    let mut base = sample_tune_spec();
+    base.bounds.forbidden_backends = vec![];
+    base.bounds.parameter_ranges = vec![];
+    base.bounds.required_experts = vec![];
+    base.report_path = Some("report-a.json".to_string());
+    base.output_config_path = "best-a.json".to_string();
     let mut other = base.clone();
     other.output_config_path = "best-b.json".to_string();
     other.report_path = Some("report-b.json".to_string());

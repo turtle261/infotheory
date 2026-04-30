@@ -1537,6 +1537,231 @@ pub(super) fn run_batch_mode() {
     }
 }
 
+#[cfg(test)]
+mod non_vm_tests {
+    use super::*;
+    use serde_json::Value;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(label: &str, ext: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "infotheory-cli-tests-{label}-{}-{nonce}.{ext}",
+            std::process::id()
+        ))
+    }
+
+    fn parse_json_output(line: &str) -> Value {
+        serde_json::from_str(line).expect("output should be valid json")
+    }
+
+    #[test]
+    fn hex_helpers_roundtrip_and_reject_invalid_inputs() {
+        let parsed = parse_hex_bytes("00 ff_10\n7A").expect("hex string should parse");
+        assert_eq!(parsed, vec![0x00, 0xff, 0x10, 0x7a]);
+        assert_eq!(bytes_to_hex(&parsed), "00ff107a");
+
+        let err = parse_hex_bytes("abc").expect_err("odd hex digit count must fail");
+        assert!(
+            err.to_string()
+                .contains("hex input must have an even number of digits"),
+            "unexpected error: {err}"
+        );
+
+        let err = parse_hex_bytes("0g").expect_err("invalid digit must fail");
+        assert!(
+            err.to_string().contains("invalid hex digit 'g'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn process_json_line_reports_help_and_input_errors() {
+        let help = parse_json_output(&process_json_line(r#"{ "op": "help" }"#));
+        let ops = help["ops"].as_array().expect("help ops array");
+        assert!(ops.iter().any(|value| value == "metrics"));
+        assert!(ops.iter().any(|value| value == "spam_check"));
+
+        let empty = parse_json_output(&process_json_line("   "));
+        assert_eq!(empty["error"], "empty input");
+
+        let invalid = parse_json_output(&process_json_line("{ invalid"));
+        assert!(
+            invalid["error"]
+                .as_str()
+                .expect("error string")
+                .contains("invalid json"),
+            "unexpected invalid-json output: {invalid}"
+        );
+
+        let unknown = parse_json_output(&process_json_line(r#"{ "op": "nope" }"#));
+        assert_eq!(unknown["error"], "unknown op: nope");
+    }
+
+    #[test]
+    fn process_json_line_handles_metrics_batch_and_spam_semantics() {
+        let metrics = parse_json_output(&process_json_line(
+            r#"{ "op": "metrics", "text": "banana bandana" }"#,
+        ));
+        assert_eq!(metrics["len"], 14);
+        assert!(metrics["h0"].as_f64().expect("h0") >= 0.0);
+        assert!(metrics["h_rate"].as_f64().expect("h_rate") >= 0.0);
+
+        let batch = parse_json_output(&process_json_line(
+            r#"{ "op": "batch_metrics", "texts": ["abcabcabc", ""] }"#,
+        ));
+        let results = batch["results"].as_array().expect("batch results");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1]["len"], 0);
+        assert_eq!(results[1]["h_rate"], 0);
+
+        let too_short = parse_json_output(&process_json_line(
+            r#"{ "op": "spam_check", "text": "tiny", "min_len": 10 }"#,
+        ));
+        assert_eq!(too_short["pass"], false);
+        assert_eq!(too_short["reason"], "too_short");
+        assert_eq!(too_short["len"], 4);
+
+        let pass = parse_json_output(&process_json_line(
+            r#"{ "op": "spam_check", "text": "bananas foster waffle cartography", "min_len": 8, "h0_min": 0.0, "h_rate_min": 0.0, "id_max": 1.0 }"#,
+        ));
+        assert_eq!(pass["pass"], true);
+        assert_eq!(pass["len"], 33);
+    }
+
+    #[test]
+    fn process_json_line_emits_structured_matrix_and_file_results() {
+        let file_path = unique_temp_path("metrics-file", "txt");
+        fs::write(&file_path, b"structured metrics fixture").expect("write metrics file");
+
+        let metrics_file = parse_json_output(&process_json_line(&format!(
+            r#"{{ "op": "metrics_file", "path": "{}" }}"#,
+            file_path.display()
+        )));
+        assert_eq!(metrics_file["len"], 26);
+        assert!(metrics_file["id"].as_f64().expect("id") >= 0.0);
+
+        let ncd_matrix = parse_json_output(&process_json_line(
+            r#"{ "op": "ncd_matrix", "texts": ["aaaa", "aaab"] }"#,
+        ));
+        assert_eq!(ncd_matrix["n"], 2);
+        let matrix = ncd_matrix["matrix"].as_array().expect("matrix rows");
+        assert_eq!(matrix.len(), 2);
+        assert_eq!(matrix[0][0], 0.0);
+        assert_eq!(matrix[1][1], 0.0);
+
+        let rosa_matrix = parse_json_output(&process_json_line(
+            r#"{ "op": "rosa_matrix", "texts": ["alpha alpha", "alpha beta"] }"#,
+        ));
+        assert_eq!(rosa_matrix["n"], 2);
+        let rosa_rows = rosa_matrix["matrix"].as_array().expect("rosa matrix rows");
+        assert_eq!(rosa_rows.len(), 2);
+        assert_eq!(rosa_rows[0][0], 0.0);
+        assert_eq!(rosa_rows[1][1], 0.0);
+
+        let _ = fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn process_json_line_covers_pairwise_ops_and_contract_errors() {
+        let ncd = parse_json_output(&process_json_line(
+            r#"{ "op": "ncd", "text1": "abracadabra", "text2": "alakazam", "method": "5", "variant": "sym_cons" }"#,
+        ));
+        assert!(ncd["ncd"].as_f64().expect("ncd value").is_finite());
+
+        let cross = parse_json_output(&process_json_line(
+            r#"{ "op": "cross_entropy", "text_x": "abracadabra", "text_y": "alakazam" }"#,
+        ));
+        assert!(
+            cross["cross_entropy"]
+                .as_f64()
+                .expect("cross entropy value")
+                .is_finite()
+        );
+
+        let rosa = parse_json_output(&process_json_line(
+            r#"{ "op": "rosa_dist", "text1": "alpha alpha alpha", "text2": "alpha beta alpha" }"#,
+        ));
+        let rosa_dist = rosa["rosa_dist"].as_f64().expect("rosa distance value");
+        assert!(rosa_dist.is_finite());
+        assert!((0.0..=1.0).contains(&rosa_dist));
+
+        let left_path = unique_temp_path("ncd-left", "txt");
+        let right_path = unique_temp_path("ncd-right", "txt");
+        fs::write(&left_path, b"left fixture bytes").expect("write left fixture");
+        fs::write(&right_path, b"right fixture bytes").expect("write right fixture");
+
+        let ncd_files = parse_json_output(&process_json_line(&format!(
+            r#"{{ "op": "ncd_files", "path1": "{}", "path2": "{}", "method": "5", "variant": "cons" }}"#,
+            left_path.display(),
+            right_path.display()
+        )));
+        assert!(
+            ncd_files["ncd"]
+                .as_f64()
+                .expect("ncd file value")
+                .is_finite()
+        );
+
+        let empty_ncd = parse_json_output(&process_json_line(
+            r#"{ "op": "ncd", "text1": "", "text2": "non-empty" }"#,
+        ));
+        assert_eq!(empty_ncd["error"], "empty text(s)");
+
+        let empty_cross = parse_json_output(&process_json_line(
+            r#"{ "op": "cross_entropy", "text_x": "", "text_y": "non-empty" }"#,
+        ));
+        assert_eq!(empty_cross["error"], "empty text(s)");
+
+        let empty_rosa = parse_json_output(&process_json_line(
+            r#"{ "op": "rosa_dist", "text1": "", "text2": "non-empty" }"#,
+        ));
+        assert_eq!(empty_rosa["error"], "empty text(s)");
+
+        let empty_metrics =
+            parse_json_output(&process_json_line(r#"{ "op": "metrics", "text": "" }"#));
+        assert_eq!(empty_metrics["error"], "empty text");
+
+        let missing_metrics_file = parse_json_output(&process_json_line(
+            r#"{ "op": "metrics_file", "path": "/definitely/missing/file/path" }"#,
+        ));
+        assert!(
+            missing_metrics_file["error"]
+                .as_str()
+                .expect("metrics_file error string")
+                .contains("failed to read file")
+        );
+
+        let _ = fs::remove_file(left_path);
+        let _ = fs::remove_file(right_path);
+    }
+
+    #[test]
+    fn process_json_line_spam_check_reasons_cover_entropy_guards() {
+        let low_entropy = parse_json_output(&process_json_line(
+            r#"{ "op": "spam_check", "text": "aaaaaaaaaaaa", "min_len": 4, "h0_min": 3.0, "h_rate_min": 0.0, "id_max": 1.0 }"#,
+        ));
+        assert_eq!(low_entropy["pass"], false);
+        assert_eq!(low_entropy["reason"], "low_entropy");
+
+        let low_entropy_rate = parse_json_output(&process_json_line(
+            r#"{ "op": "spam_check", "text": "abcdefghijklmno", "min_len": 4, "h0_min": 0.0, "h_rate_min": 1000.0, "id_max": 1.0 }"#,
+        ));
+        assert_eq!(low_entropy_rate["pass"], false);
+        assert_eq!(low_entropy_rate["reason"], "low_entropy_rate");
+
+        let high_redundancy = parse_json_output(&process_json_line(
+            r#"{ "op": "spam_check", "text": "abababababababab", "min_len": 4, "h0_min": 0.0, "h_rate_min": 0.0, "id_max": -1.0 }"#,
+        ));
+        assert_eq!(high_redundancy["pass"], false);
+        assert_eq!(high_redundancy["reason"], "high_redundancy");
+    }
+}
+
 #[cfg(all(test, feature = "vm"))]
 mod tests {
     use super::*;

@@ -69,7 +69,7 @@ jobs:
 
       - name: Rust line coverage gate (CLI + library parity suite)
         run: |
-          cargo llvm-cov -p infotheory --tests --features "cli all-backends" --locked --summary-only --fail-under-lines 75
+          cargo llvm-cov -p infotheory --tests --features "cli all-backends" --locked --summary-only --fail-under-lines 85
 
       - name: Rustdoc coverage gate
         run: |

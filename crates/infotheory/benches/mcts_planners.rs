@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use infotheory::aixi::common::{Action, Reward};
+use infotheory::aixi::common::{Action, ActionAlphabet, Reward};
 use infotheory::aixi::mcts::{AgentSimulator, ParallelUctPlanner, RhoUctPlanner};
 use rayon::ThreadPool;
 use std::num::NonZeroUsize;
@@ -53,8 +53,9 @@ impl BenchAgent {
 }
 
 impl AgentSimulator for BenchAgent {
-    fn get_num_actions(&self) -> usize {
-        self.num_actions
+    fn get_num_actions(&self) -> ActionAlphabet {
+        ActionAlphabet::try_from_usize(self.num_actions)
+            .expect("benchmark action alphabet must be non-zero")
     }
 
     fn get_num_observation_bits(&self) -> usize {

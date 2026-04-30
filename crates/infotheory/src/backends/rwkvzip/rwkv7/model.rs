@@ -6044,6 +6044,7 @@ fn init_const(t: &mut Tensor1D, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn test_cfg() -> Config {
         Config {
@@ -6060,6 +6061,14 @@ mod tests {
             v_low_rank: 8,
             g_low_rank: 8,
         }
+    }
+
+    fn temp_path(prefix: &str, ext: &str) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}_{}_{}.{}", std::process::id(), now, ext))
     }
 
     fn softmax_loss(logits: &[f32], target: u8) -> f64 {
@@ -6199,6 +6208,201 @@ mod tests {
         assert_eq!(cfg.num_layers, 12);
         assert_eq!(cfg.num_heads, 4);
         assert_eq!(cfg.head_dim, 64);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_config_shapes() {
+        let zero_vocab = Config {
+            vocab_size: 0,
+            ..test_cfg()
+        };
+        assert!(
+            zero_vocab
+                .validate()
+                .expect_err("zero vocab must fail")
+                .to_string()
+                .contains("vocab_size must be > 0")
+        );
+
+        let bad_head_dim = Config {
+            head_dim: 32,
+            hidden_size: 32,
+            ..test_cfg()
+        };
+        assert!(
+            bad_head_dim
+                .validate()
+                .expect_err("bad head_dim must fail")
+                .to_string()
+                .contains("head_dim must be 64")
+        );
+
+        let bad_hidden = Config {
+            hidden_size: 128,
+            ..test_cfg()
+        };
+        assert!(
+            bad_hidden
+                .validate()
+                .expect_err("hidden mismatch must fail")
+                .to_string()
+                .contains("hidden_size must equal num_heads * head_dim")
+        );
+
+        let zero_layers = Config {
+            num_layers: 0,
+            ..test_cfg()
+        };
+        assert!(
+            zero_layers
+                .validate()
+                .expect_err("zero layers must fail")
+                .to_string()
+                .contains("num_layers must be > 0")
+        );
+
+        let zero_intermediate = Config {
+            intermediate_size: 0,
+            ..test_cfg()
+        };
+        assert!(
+            zero_intermediate
+                .validate()
+                .expect_err("zero intermediate must fail")
+                .to_string()
+                .contains("intermediate_size must be > 0")
+        );
+    }
+
+    #[test]
+    fn state_reset_clears_forward_mutation() {
+        let cfg = test_cfg();
+        cfg.validate().expect("valid cfg");
+        let model = Model::new_random(cfg.clone(), 0x5151).expect("random model");
+        let mut state = model.new_state();
+        let mut scratch = ScratchBuffers::new(&cfg);
+
+        let _ = model.forward(&mut scratch, 7, &mut state);
+        let _ = model.forward(&mut scratch, 11, &mut state);
+        assert!(state.v_first_set, "forward pass should initialize v_first");
+        assert!(
+            state.layers[0]
+                .att_state
+                .as_slice()
+                .iter()
+                .any(|&v| v != 0.0),
+            "forward pass should mutate recurrent state"
+        );
+
+        state.reset();
+        assert!(!state.v_first_set);
+        assert!(state.v_first.as_slice().iter().all(|&v| v == 0.0));
+        for layer in &state.layers {
+            assert!(layer.att_x_prev.as_slice().iter().all(|&v| v == 0.0));
+            assert!(layer.att_state.as_slice().iter().all(|&v| v == 0.0));
+            assert!(layer.ffn_x_prev.as_slice().iter().all(|&v| v == 0.0));
+        }
+    }
+
+    #[test]
+    fn train_scope_mask_reports_expected_semantics() {
+        let none = TrainScopeMask::default();
+        assert!(!none.trains_non_head_params());
+        assert!(!none.trains_any_params());
+
+        let head_only = TrainScopeMask {
+            head: true,
+            ..TrainScopeMask::default()
+        };
+        assert!(!head_only.trains_non_head_params());
+        assert!(head_only.trains_any_params());
+
+        let all = TrainScopeMask::all();
+        assert!(all.embed);
+        assert!(all.pre_norm);
+        assert!(all.attn_norm);
+        assert!(all.ffn_norm);
+        assert!(all.attn);
+        assert!(all.ffn);
+        assert!(all.head);
+        assert!(all.bias);
+        assert!(all.trains_non_head_params());
+        assert!(all.trains_any_params());
+    }
+
+    #[test]
+    fn save_load_safetensors_roundtrip_preserves_forward_bits() {
+        let cfg = Config {
+            num_layers: 2,
+            intermediate_size: 128,
+            decay_low_rank: 16,
+            a_low_rank: 16,
+            v_low_rank: 16,
+            g_low_rank: 32,
+            ..test_cfg()
+        };
+        cfg.validate().expect("valid cfg");
+        let model = Model::new_random(cfg.clone(), 0xBEEF_CAFE).expect("random model");
+        let path = temp_path("rwkv_roundtrip", "safetensors");
+        model.save_safetensors(&path).expect("save model");
+        let loaded = Model::load(&path).expect("load model");
+
+        assert_eq!(loaded.config().vocab_size, model.config().vocab_size);
+        assert_eq!(loaded.config().hidden_size, model.config().hidden_size);
+        assert_eq!(loaded.config().num_layers, model.config().num_layers);
+
+        let mut original_state = model.new_state();
+        let mut loaded_state = loaded.new_state();
+        let mut original_scratch = ScratchBuffers::new(&cfg);
+        let mut loaded_scratch = ScratchBuffers::new(&cfg);
+        for &token in &[0u32, 7, 31, 99, 255] {
+            let original_logits = model.forward(&mut original_scratch, token, &mut original_state);
+            let loaded_logits = loaded.forward(&mut loaded_scratch, token, &mut loaded_state);
+            for (&lhs, &rhs) in original_logits.iter().zip(loaded_logits.iter()) {
+                assert_eq!(lhs.to_bits(), rhs.to_bits());
+            }
+        }
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn save_load_full_adam_roundtrip_preserves_selected_moments() {
+        let cfg = test_cfg();
+        cfg.validate().expect("valid cfg");
+        let model = Model::new_random(cfg, 0xACED).expect("random model");
+        let mut adam = model.new_full_adam_state();
+        adam.embeddings.m[0] = 1.25;
+        adam.embeddings.v[1] = 2.5;
+        adam.ln_out_w.m[2] = -3.0;
+        adam.blocks[0].attn.x_r.m[3] = 4.5;
+        adam.blocks[0].ffn.key_w.v[4] = 5.75;
+
+        let path = temp_path("rwkv_adam", "safetensors");
+        model
+            .save_full_adam_safetensors(&adam, &path)
+            .expect("save adam");
+        let loaded = model.load_full_adam_safetensors(&path).expect("load adam");
+
+        assert_eq!(
+            loaded.embeddings.m[0].to_bits(),
+            adam.embeddings.m[0].to_bits()
+        );
+        assert_eq!(
+            loaded.embeddings.v[1].to_bits(),
+            adam.embeddings.v[1].to_bits()
+        );
+        assert_eq!(loaded.ln_out_w.m[2].to_bits(), adam.ln_out_w.m[2].to_bits());
+        assert_eq!(
+            loaded.blocks[0].attn.x_r.m[3].to_bits(),
+            adam.blocks[0].attn.x_r.m[3].to_bits()
+        );
+        assert_eq!(
+            loaded.blocks[0].ffn.key_w.v[4].to_bits(),
+            adam.blocks[0].ffn.key_w.v[4].to_bits()
+        );
+
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -6432,6 +6636,121 @@ mod tests {
         assert!(
             after < before,
             "expected SGD TBPTT step to reduce mean loss: before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn head_only_bptt1_update_succeeds_without_full_trace() {
+        let cfg = test_cfg();
+        cfg.validate().expect("valid cfg");
+        let mut model = Model::new_random(cfg.clone(), 0xAAAA_5555).expect("random model");
+        let mut scratch = ScratchBuffers::new(&cfg);
+        let mut state = model.new_state();
+        scratch.set_capture_train_trace(false);
+
+        let logits = model.forward(&mut scratch, 9, &mut state).to_vec();
+        let mut pdf = vec![0.0f64; cfg.vocab_size];
+        super::super::super::softmax_pdf_floor_with_bias(&logits, None, &mut pdf);
+        let before = model.lm_head_weights()[0];
+        let mut adam_t = 0usize;
+        let scope = TrainScopeMask {
+            head: true,
+            ..TrainScopeMask::default()
+        };
+
+        model
+            .online_train_step_bptt1(
+                &mut scratch,
+                &state,
+                7,
+                &pdf,
+                scope,
+                OptimizerKind::Sgd,
+                1e-3,
+                0.0,
+                &mut adam_t,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("head-only update");
+
+        assert_ne!(model.lm_head_weights()[0].to_bits(), before.to_bits());
+    }
+
+    #[test]
+    fn full_training_bptt1_requires_captured_trace() {
+        let cfg = test_cfg();
+        cfg.validate().expect("valid cfg");
+        let mut model = Model::new_random(cfg.clone(), 0x1234).expect("random model");
+        let mut scratch = ScratchBuffers::new(&cfg);
+        let mut state = model.new_state();
+        scratch.set_capture_train_trace(false);
+
+        let logits = model.forward(&mut scratch, 4, &mut state).to_vec();
+        let mut pdf = vec![0.0f64; cfg.vocab_size];
+        super::super::super::softmax_pdf_floor_with_bias(&logits, None, &mut pdf);
+
+        let err = model
+            .online_train_step_bptt1(
+                &mut scratch,
+                &state,
+                3,
+                &pdf,
+                TrainScopeMask {
+                    attn: true,
+                    ..TrainScopeMask::default()
+                },
+                OptimizerKind::Sgd,
+                1e-3,
+                0.0,
+                &mut 0usize,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err("non-head training should require trace");
+        assert!(err.to_string().contains("full training trace is missing"));
+    }
+
+    #[test]
+    fn adam_full_training_requires_explicit_adam_state() {
+        let cfg = test_cfg();
+        cfg.validate().expect("valid cfg");
+        let mut model = Model::new_random(cfg.clone(), 0xCAFE).expect("random model");
+        let mut scratch = ScratchBuffers::new(&cfg);
+        let mut state = model.new_state();
+        scratch.set_capture_train_trace(true);
+
+        let logits = model.forward(&mut scratch, 5, &mut state).to_vec();
+        let mut pdf = vec![0.0f64; cfg.vocab_size];
+        super::super::super::softmax_pdf_floor_with_bias(&logits, None, &mut pdf);
+
+        let err = model
+            .online_train_step_bptt1(
+                &mut scratch,
+                &state,
+                6,
+                &pdf,
+                TrainScopeMask {
+                    attn: true,
+                    ..TrainScopeMask::default()
+                },
+                OptimizerKind::Adam,
+                1e-3,
+                0.0,
+                &mut 0usize,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err("adam full training should require optimizer state");
+        assert!(
+            err.to_string()
+                .contains("Adam full-training state is missing")
         );
     }
 }

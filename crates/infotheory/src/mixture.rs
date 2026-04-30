@@ -3223,7 +3223,7 @@ mod tests {
             let p = if symbol == 0 {
                 self.prob_zero
             } else {
-                1.0 - self.prob_zero
+                (1.0 - self.prob_zero) / 255.0
             };
             p.ln()
         }
@@ -4028,5 +4028,230 @@ mod tests {
             num_percept_bits: 8,
             encoding_bits: 8,
         });
+    }
+
+    #[test]
+    fn expert_config_helpers_expose_names_priors_and_predictor_builders() {
+        let cfg = ExpertConfig::from_rate_backend(
+            Some("ctw-four".to_string()),
+            -0.75,
+            RateBackend::Ctw { depth: 4 },
+        );
+        assert_eq!(cfg.name(), "ctw-four");
+        assert!((cfg.log_prior() + 0.75).abs() < 1e-12);
+        let mut predictor = cfg.build_predictor();
+        let logp = predictor.log_prob(b'a');
+        assert!(logp.is_finite());
+
+        let uniform = ExpertConfig::uniform("always-zero", || Box::new(AlwaysPredict { byte: 0 }));
+        assert_eq!(uniform.name(), "always-zero");
+        assert_eq!(uniform.log_prior(), 0.0);
+
+        let zpaq = ExpertConfig::zpaq("zpaq-one", "1");
+        assert_eq!(zpaq.name(), "zpaq-one");
+        assert_eq!(zpaq.log_prior(), 0.0);
+        let mut zpaq_predictor = zpaq.build_predictor();
+        assert!(zpaq_predictor.log_prob(b'b').is_finite());
+    }
+
+    fn assert_runtime_variant_contracts(spec: MixtureSpec, expected_names: &[&str], symbol: u8) {
+        let configs = vec![
+            ExpertConfig::new(expected_names[0].to_string(), 0.75f64.ln(), move || {
+                Box::new(FixedProbPredict { prob_zero: 0.8 })
+            }),
+            ExpertConfig::new(expected_names[1].to_string(), 0.25f64.ln(), move || {
+                Box::new(FixedProbPredict { prob_zero: 0.35 })
+            }),
+        ];
+        let mut runtime = build_mixture_runtime(&spec, &configs).expect("runtime should build");
+
+        runtime.begin_stream(Some(8)).expect("begin stream");
+        let peek = runtime.peek_log_prob(symbol);
+        assert!(peek.is_finite());
+
+        let mut row = [f64::NEG_INFINITY; 256];
+        runtime.fill_log_probs(&mut row);
+        let mass: f64 = row.iter().map(|lp| lp.exp()).sum();
+        assert!(
+            (mass - 1.0).abs() < 1e-8,
+            "mixture runtime PDF must normalize; mass={mass}"
+        );
+
+        let stepped = runtime.step(symbol);
+        assert!(stepped.is_finite());
+        runtime.update_frozen(symbol.wrapping_add(1));
+        runtime.finish_stream().expect("finish stream");
+        runtime.reset_frozen(Some(3)).expect("reset frozen");
+        runtime
+            .begin_stream(Some(3))
+            .expect("begin stream after reset");
+
+        match &mut runtime {
+            MixtureRuntime::Bayes(m) => {
+                assert_eq!(m.expert_names(), expected_names);
+                assert_eq!(m.expert_log_losses().len(), 2);
+                assert_eq!(m.total_log_loss(), 0.0);
+                let (_, posterior) = m.max_posterior();
+                assert!((0.0..=1.0).contains(&posterior));
+            }
+            MixtureRuntime::Fading(m) => {
+                assert_eq!(m.expert_names(), expected_names);
+                assert_eq!(m.total_log_loss(), 0.0);
+                let posterior_mass: f64 = m.posterior().into_iter().sum();
+                assert!((posterior_mass - 1.0).abs() < 1e-10);
+            }
+            MixtureRuntime::Switching(m) => {
+                assert_eq!(m.expert_names(), expected_names);
+                assert_eq!(m.expert_log_losses().len(), 2);
+                assert_eq!(m.total_log_loss(), 0.0);
+                let (_, posterior) = m.max_posterior();
+                assert!((0.0..=1.0).contains(&posterior));
+            }
+            MixtureRuntime::Convex(m) => {
+                let weight_sum: f64 = m.lambda.iter().sum();
+                assert!((weight_sum - 1.0).abs() < 1e-10);
+                assert_eq!(m.total_log_loss, 0.0);
+            }
+            MixtureRuntime::Mdl(m) => {
+                assert_eq!(m.expert_names(), expected_names);
+                assert_eq!(m.expert_log_losses().len(), 2);
+                assert_eq!(m.total_log_loss(), 0.0);
+                assert!(m.best_index() < 2);
+            }
+            MixtureRuntime::Neural(m) => {
+                assert_eq!(m.total_log_loss(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_variants_support_stream_fill_and_reset_contracts() {
+        assert_runtime_variant_contracts(
+            MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 }).with_name("left"),
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 5 }).with_name("right"),
+                ],
+            ),
+            &["left", "right"],
+            0,
+        );
+
+        assert_runtime_variant_contracts(
+            MixtureSpec::new(
+                MixtureKind::FadingBayes,
+                vec![
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                        .with_name("fade-a"),
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 5 })
+                        .with_name("fade-b"),
+                ],
+            )
+            .with_decay(0.93),
+            &["fade-a", "fade-b"],
+            0,
+        );
+
+        assert_runtime_variant_contracts(
+            MixtureSpec::new(
+                MixtureKind::Switching,
+                vec![
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                        .with_name("switch-a"),
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 5 })
+                        .with_name("switch-b"),
+                ],
+            )
+            .with_schedule(MixtureScheduleMode::Theorem),
+            &["switch-a", "switch-b"],
+            1,
+        );
+
+        assert_runtime_variant_contracts(
+            MixtureSpec::new(
+                MixtureKind::Convex,
+                vec![
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                        .with_name("convex-a"),
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 5 })
+                        .with_name("convex-b"),
+                ],
+            )
+            .with_schedule(MixtureScheduleMode::Theorem)
+            .with_alpha(1.25),
+            &["convex-a", "convex-b"],
+            0,
+        );
+
+        assert_runtime_variant_contracts(
+            MixtureSpec::new(
+                MixtureKind::Mdl,
+                vec![
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 }).with_name("mdl-a"),
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 5 }).with_name("mdl-b"),
+                ],
+            ),
+            &["mdl-a", "mdl-b"],
+            0,
+        );
+
+        assert_runtime_variant_contracts(
+            MixtureSpec::new(
+                MixtureKind::Neural,
+                vec![
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                        .with_name("neural-a"),
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 5 })
+                        .with_name("neural-b"),
+                ],
+            )
+            .with_alpha(0.04),
+            &["neural-a", "neural-b"],
+            0,
+        );
+    }
+
+    #[cfg(feature = "backend-mixture")]
+    #[test]
+    fn compiled_mixture_helpers_roundtrip_expert_configs_and_runtime() {
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 3 })
+                    .with_name("compiled-ctw")
+                    .with_log_prior(-0.5),
+                crate::MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: 7 })
+                    .with_name("compiled-rosa")
+                    .with_log_prior(-1.25),
+            ],
+        );
+        let compiled = RateBackend::Mixture {
+            spec: Arc::new(spec.clone()),
+        }
+        .compile()
+        .expect("mixture backend should compile");
+
+        let configs =
+            expert_configs_from_compiled_mixture(&compiled).expect("compiled mixture configs");
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].name(), "compiled-ctw");
+        assert_eq!(configs[1].name(), "compiled-rosa");
+        assert!((configs[0].log_prior() + 0.5).abs() < 1e-12);
+        assert!((configs[1].log_prior() + 1.25).abs() < 1e-12);
+        assert!(
+            configs
+                .iter()
+                .all(|cfg| cfg.build_predictor().log_prob(b'x').is_finite())
+        );
+
+        let mut runtime = build_mixture_runtime_from_compiled(&compiled, &configs)
+            .expect("compiled mixture runtime should build");
+        runtime.begin_stream(Some(4)).expect("begin stream");
+        assert!(runtime.peek_log_prob(0).is_finite());
+        let mut row = [f64::NEG_INFINITY; 256];
+        runtime.fill_log_probs(&mut row);
+        let mass: f64 = row.iter().map(|lp| lp.exp()).sum();
+        assert!((mass - 1.0).abs() < 1e-8);
     }
 }

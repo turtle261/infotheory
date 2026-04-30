@@ -829,7 +829,7 @@ fn file_to_candidates(path: &Path, granularity: SearchGranularity) -> Vec<Snippe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{CompressionBackend, RateBackend};
+    use crate::api::{CompressionBackend, InfotheoryCtx, RateBackend};
     use crate::error::InfotheoryError;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -839,6 +839,22 @@ mod tests {
             .expect("clock before epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("infotheory-search-{prefix}-{nanos}"))
+    }
+
+    fn write_text(path: &Path, text: &str) {
+        fs::write(path, text.as_bytes()).expect("write temp text fixture");
+    }
+
+    fn ctw_search_ctx() -> InfotheoryCtx {
+        InfotheoryCtx::from_specs(
+            RateBackend::Ctw { depth: 10 },
+            CompressionBackend::Rate {
+                rate_backend: RateBackend::Ctw { depth: 10 },
+                coder: crate::coders::CoderType::AC,
+                framing: crate::compression::FramingMode::Raw,
+            },
+        )
+        .expect("ctw search context should compile")
     }
 
     #[test]
@@ -921,6 +937,36 @@ mod tests {
     }
 
     #[test]
+    fn stage0_prefilter_full_fraction_is_noop() {
+        let candidates = vec![
+            Snippet {
+                path: PathBuf::from("a.txt"),
+                start_line: 1,
+                end_line: 1,
+                content: b"alpha beta".to_vec(),
+                score: 0.0,
+            },
+            Snippet {
+                path: PathBuf::from("b.txt"),
+                start_line: 2,
+                end_line: 3,
+                content: b"gamma delta".to_vec(),
+                score: 0.0,
+            },
+        ];
+        let opts = SearchOptions {
+            stage0_keep_frac: 1.0,
+            top_k: 1,
+            ..SearchOptions::try_default().expect("search defaults")
+        };
+        let kept = stage0_prefilter(b"alpha", candidates.clone(), &opts, false)
+            .expect("prefilter should succeed");
+        assert_eq!(kept.len(), candidates.len());
+        assert_eq!(kept[0].path, candidates[0].path);
+        assert_eq!(kept[1].path, candidates[1].path);
+    }
+
+    #[test]
     fn search_with_options_returns_error_for_empty_query() {
         let path = temp_path("search-empty").with_extension("txt");
         fs::write(&path, b"content").expect("write search target");
@@ -941,6 +987,162 @@ mod tests {
         )
         .expect_err("missing target should return an error");
         assert!(err.to_string().contains("no accessible files found"));
+    }
+
+    #[test]
+    fn stage1_filter_no_prior_prefers_exact_match_candidate() {
+        let opts = SearchOptions {
+            granularity: SearchGranularity::File,
+            top_k: 2,
+            stage0_keep_frac: 1.0,
+            ctx: ctw_search_ctx(),
+            ..SearchOptions::try_default().expect("search defaults")
+        };
+        let candidates = vec![
+            Snippet {
+                path: PathBuf::from("noise.txt"),
+                start_line: 1,
+                end_line: 1,
+                content: b"background entropy without the query phrase".to_vec(),
+                score: 0.0,
+            },
+            Snippet {
+                path: PathBuf::from("match.txt"),
+                start_line: 1,
+                end_line: 1,
+                content: b"needle exact stage one phrase repeated needle exact stage one phrase"
+                    .to_vec(),
+                score: 0.0,
+            },
+        ];
+        let scored = stage1_filter_no_prior(b"needle exact stage one phrase", candidates, &opts)
+            .expect("stage1 without prior should succeed");
+        assert_eq!(scored.len(), 2);
+        assert!(
+            scored[1].score > scored[0].score,
+            "exact match candidate should score above unrelated content"
+        );
+    }
+
+    #[test]
+    fn stage1_filter_with_universal_prior_prefers_prior_consistent_candidate() {
+        let prior_root = temp_path("stage1-prior");
+        fs::create_dir_all(&prior_root).expect("create prior dir");
+        write_text(
+            &prior_root.join("prior.txt"),
+            "predictive coding exact phrase context\npredictive coding exact phrase context\n",
+        );
+
+        let opts = SearchOptions {
+            granularity: SearchGranularity::File,
+            universal_prior: Some(prior_root.to_string_lossy().to_string()),
+            stage2_prior_mode: Stage2PriorMode::Use,
+            top_k: 2,
+            stage0_keep_frac: 1.0,
+            ctx: ctw_search_ctx(),
+        };
+        let candidates = vec![
+            Snippet {
+                path: PathBuf::from("noise.txt"),
+                start_line: 1,
+                end_line: 1,
+                content: b"background corpus without predictive coding context".to_vec(),
+                score: 0.0,
+            },
+            Snippet {
+                path: PathBuf::from("match.txt"),
+                start_line: 1,
+                end_line: 1,
+                content: b"predictive coding exact phrase continuation".to_vec(),
+                score: 0.0,
+            },
+        ];
+
+        let scored = stage1_filter_with_universal_prior(
+            b"predictive coding exact phrase",
+            prior_root.to_string_lossy().as_ref(),
+            candidates,
+            &opts,
+        )
+        .expect("stage1 with prior should succeed");
+        assert_eq!(scored.len(), 2);
+        assert!(
+            scored[1].score > scored[0].score,
+            "prior-consistent candidate should outrank unrelated content"
+        );
+
+        let _ = fs::remove_dir_all(prior_root);
+    }
+
+    #[test]
+    fn search_with_options_snippet_granularity_prefers_matching_window() {
+        let path = temp_path("snippet-search").with_extension("txt");
+        let mut text = String::new();
+        for i in 0..80 {
+            if i == 41 {
+                text.push_str("needle exact snippet phrase lives here\n");
+            } else {
+                text.push_str(&format!("background line {i}\n"));
+            }
+        }
+        fs::write(&path, text.as_bytes()).expect("write snippet corpus");
+
+        let opts = SearchOptions {
+            granularity: SearchGranularity::Snippet,
+            top_k: 1,
+            stage0_keep_frac: 1.0,
+            ctx: ctw_search_ctx(),
+            ..SearchOptions::try_default().expect("search defaults")
+        };
+        let results = search_with_options(
+            "needle exact snippet phrase",
+            path.to_string_lossy().as_ref(),
+            &opts,
+        )
+        .expect("snippet search should succeed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, path);
+        assert!(results[0].start_line <= 42 && results[0].end_line >= 42);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_with_options_file_granularity_truncates_and_sorts_results() {
+        let root = temp_path("file-search");
+        fs::create_dir_all(&root).expect("create target dir");
+        let best = root.join("best.txt");
+        let second = root.join("second.txt");
+        let noise = root.join("noise.txt");
+        write_text(
+            &best,
+            "needle exact file phrase\nneedle exact file phrase\nneedle exact file phrase\n",
+        );
+        write_text(&second, "needle exact file\npartial overlap only\n");
+        write_text(&noise, "completely unrelated material\n");
+
+        let opts = SearchOptions {
+            granularity: SearchGranularity::File,
+            top_k: 2,
+            stage0_keep_frac: 1.0,
+            ctx: ctw_search_ctx(),
+            ..SearchOptions::try_default().expect("search defaults")
+        };
+        let results = search_with_options(
+            "needle exact file phrase",
+            root.to_string_lossy().as_ref(),
+            &opts,
+        )
+        .expect("file search should succeed");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].path, best);
+        assert!(results[0].score >= results[1].score);
+        assert_ne!(
+            results[1].path, noise,
+            "noise candidate should be truncated away"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(feature = "backend-zpaq")]
@@ -998,5 +1200,270 @@ mod tests {
                 other.kind()
             ),
         }
+    }
+
+    #[test]
+    fn search_with_universal_prior_modes_keeps_exact_match_first_for_generic_rate_backend() {
+        let target_root = temp_path("prior-modes-target");
+        let prior_root = temp_path("prior-modes-prior");
+        fs::create_dir_all(&target_root).expect("create target dir");
+        fs::create_dir_all(&prior_root).expect("create prior dir");
+
+        let relevant_path = target_root.join("relevant.txt");
+        let distractor_path = target_root.join("distractor.txt");
+        write_text(
+            &relevant_path,
+            "needle signal exact match\nneedle signal exact match\nneedle signal exact match\n",
+        );
+        write_text(
+            &distractor_path,
+            "unrelated noise\nentropy without the exact query phrase\n",
+        );
+        write_text(
+            &prior_root.join("prior.txt"),
+            "needle signal context\nbackground corpus bytes\n",
+        );
+
+        for mode in [
+            Stage2PriorMode::Disable,
+            Stage2PriorMode::Use,
+            Stage2PriorMode::Summarize,
+        ] {
+            let opts = SearchOptions {
+                granularity: SearchGranularity::File,
+                universal_prior: Some(prior_root.to_string_lossy().to_string()),
+                stage2_prior_mode: mode,
+                top_k: 2,
+                stage0_keep_frac: 1.0,
+                ctx: ctw_search_ctx(),
+            };
+            let results = search_with_options(
+                "needle signal exact match",
+                target_root.to_string_lossy().as_ref(),
+                &opts,
+            )
+            .expect("search with prior should succeed");
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].path, relevant_path);
+            assert!(
+                results[0].score >= results[1].score,
+                "results must remain score-sorted after reranking for mode {mode:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(target_root);
+        let _ = fs::remove_dir_all(prior_root);
+    }
+
+    #[cfg(feature = "backend-rosa")]
+    #[test]
+    fn search_with_rosa_prior_model_training_ranks_relevant_file_first() {
+        let target_root = temp_path("rosa-prior-target");
+        let prior_root = temp_path("rosa-prior-corpus");
+        fs::create_dir_all(&target_root).expect("create target dir");
+        fs::create_dir_all(&prior_root).expect("create prior dir");
+
+        let relevant_path = target_root.join("relevant.txt");
+        write_text(
+            &relevant_path,
+            "predictive coding with exact entropy reduction signal\n\
+             predictive coding with exact entropy reduction signal\n\
+             predictive coding with exact entropy reduction signal\n",
+        );
+        write_text(
+            &target_root.join("noise.txt"),
+            "generic unrelated text that should not outrank the exact match\n",
+        );
+        write_text(
+            &prior_root.join("prior_a.txt"),
+            "predictive coding prior corpus\nentropy reduction prior corpus\n",
+        );
+        write_text(
+            &prior_root.join("prior_b.txt"),
+            "additional prior conditioning bytes for the rosa branch\n",
+        );
+
+        let mut opts = SearchOptions::try_default().expect("search defaults");
+        opts.granularity = SearchGranularity::File;
+        opts.universal_prior = Some(prior_root.to_string_lossy().to_string());
+        opts.stage2_prior_mode = Stage2PriorMode::Use;
+        opts.top_k = 2;
+        opts.stage0_keep_frac = 1.0;
+
+        let first = search_with_options(
+            "predictive coding exact entropy reduction signal",
+            target_root.to_string_lossy().as_ref(),
+            &opts,
+        )
+        .expect("rosa prior search should succeed");
+        let second = search_with_options(
+            "predictive coding exact entropy reduction signal",
+            target_root.to_string_lossy().as_ref(),
+            &opts,
+        )
+        .expect("repeated rosa prior search should stay valid");
+
+        assert_eq!(first[0].path, relevant_path);
+        assert_eq!(second[0].path, relevant_path);
+        assert!(
+            first[0].score.is_finite() && second[0].score.is_finite(),
+            "rosa prior branch must produce finite scores"
+        );
+
+        let _ = fs::remove_dir_all(target_root);
+        let _ = fs::remove_dir_all(prior_root);
+    }
+
+    #[test]
+    fn corpus_bytes_and_prior_cache_helpers_are_stable() {
+        let root = temp_path("corpus-root");
+        fs::create_dir_all(&root).expect("create corpus dir");
+        write_text(&root.join("a.txt"), "alpha");
+        write_text(&root.join("b.txt"), "beta");
+
+        let bytes = corpus_bytes(root.to_string_lossy().as_ref(), SearchGranularity::File);
+        assert!(bytes.windows(5).any(|window| window == b"alpha"));
+        assert!(bytes.windows(4).any(|window| window == b"beta"));
+        assert!(bytes.windows(2).any(|window| window == b"\n\n"));
+
+        let cache_a = prior_cache_path(root.to_string_lossy().as_ref(), 7).expect("cache path");
+        let cache_b = prior_cache_path(root.to_string_lossy().as_ref(), 7).expect("cache path");
+        let cache_c = prior_cache_path(root.to_string_lossy().as_ref(), 9).expect("cache path");
+        assert_eq!(cache_a, cache_b);
+        assert_ne!(cache_a, cache_c);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn summarize_prior_for_query_returns_empty_when_prior_corpus_is_empty() {
+        let root = temp_path("empty-prior");
+        fs::create_dir_all(&root).expect("create empty prior dir");
+        let opts = SearchOptions {
+            granularity: SearchGranularity::File,
+            top_k: 1,
+            stage0_keep_frac: 1.0,
+            ctx: ctw_search_ctx(),
+            ..SearchOptions::try_default().expect("search defaults")
+        };
+        let summary = summarize_prior_for_query(b"query", root.to_string_lossy().as_ref(), &opts)
+            .expect("summarization should succeed");
+        assert!(summary.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn summarize_prior_for_query_and_stage2_rerank_prefer_relevant_content() {
+        let prior_root = temp_path("prior-summary");
+        fs::create_dir_all(&prior_root).expect("create prior dir");
+        write_text(
+            &prior_root.join("relevant.txt"),
+            "needle exact search phrase appears here\nneedle exact search phrase appears here\n",
+        );
+        write_text(
+            &prior_root.join("noise.txt"),
+            "background corpus bytes with unrelated content\n",
+        );
+
+        let opts = SearchOptions {
+            granularity: SearchGranularity::File,
+            universal_prior: Some(prior_root.to_string_lossy().to_string()),
+            stage2_prior_mode: Stage2PriorMode::Summarize,
+            top_k: 2,
+            stage0_keep_frac: 1.0,
+            ctx: ctw_search_ctx(),
+        };
+        let query = b"needle exact search phrase";
+        let summary =
+            summarize_prior_for_query(query, prior_root.to_string_lossy().as_ref(), &opts)
+                .expect("prior summary");
+        assert!(
+            String::from_utf8_lossy(&summary).contains("needle exact search phrase"),
+            "summary should select the relevant prior candidate"
+        );
+
+        let mut snippets = vec![
+            Snippet {
+                path: prior_root.join("noise.txt"),
+                start_line: 1,
+                end_line: 1,
+                content: b"completely unrelated background".to_vec(),
+                score: 0.0,
+            },
+            Snippet {
+                path: prior_root.join("relevant.txt"),
+                start_line: 1,
+                end_line: 1,
+                content: b"needle exact search phrase repeated".to_vec(),
+                score: 0.0,
+            },
+        ];
+        stage2_rerank_kmi(query, &mut snippets, &opts).expect("stage2 rerank");
+        snippets.sort_by(|lhs, rhs| rhs.score.total_cmp(&lhs.score));
+        assert_eq!(snippets[0].path, prior_root.join("relevant.txt"));
+
+        let _ = fs::remove_dir_all(prior_root);
+    }
+
+    #[cfg(feature = "backend-rosa")]
+    #[test]
+    fn load_or_train_prior_model_creates_and_reuses_cache() {
+        let prior_root = temp_path("rosa-cache-corpus");
+        let cache_root = temp_path("rosa-cache-home");
+        fs::create_dir_all(&prior_root).expect("create prior dir");
+        fs::create_dir_all(&cache_root).expect("create cache dir");
+        write_text(
+            &prior_root.join("prior.txt"),
+            "predictive coding prior text\npredictive coding prior text\n",
+        );
+
+        let old_cache = std::env::var("XDG_CACHE_HOME").ok();
+        // Test-only process environment override. This test does not spawn
+        // threads or retain references into the environment across mutation.
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", &cache_root);
+        }
+
+        let opts = SearchOptions {
+            granularity: SearchGranularity::File,
+            universal_prior: Some(prior_root.to_string_lossy().to_string()),
+            stage2_prior_mode: Stage2PriorMode::Use,
+            top_k: 1,
+            stage0_keep_frac: 1.0,
+            ctx: InfotheoryCtx::from_specs(
+                RateBackend::RosaPlus { max_order: 7 },
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::RosaPlus { max_order: 7 },
+                    coder: crate::coders::CoderType::AC,
+                    framing: crate::compression::FramingMode::Raw,
+                },
+            )
+            .expect("rosa search context"),
+        };
+
+        let prior_path = prior_root.to_string_lossy().to_string();
+        let cache_path = prior_cache_path(&prior_path, 7).expect("cache path");
+        assert!(!cache_path.exists());
+
+        let first = load_or_train_prior_model(&prior_path, &opts);
+        assert!(cache_path.exists(), "training should populate cache");
+        let second = load_or_train_prior_model(&prior_path, &opts);
+        assert_eq!(first.lm_alpha_n(), 256);
+        assert_eq!(second.lm_alpha_n(), 256);
+
+        match old_cache {
+            Some(value) => unsafe {
+                // Restore the original process environment after the isolated
+                // cache-path test finishes.
+                std::env::set_var("XDG_CACHE_HOME", value);
+            },
+            None => unsafe {
+                // Restore the pre-test absence of `XDG_CACHE_HOME`.
+                std::env::remove_var("XDG_CACHE_HOME");
+            },
+        }
+
+        let _ = fs::remove_dir_all(prior_root);
+        let _ = fs::remove_dir_all(cache_root);
     }
 }

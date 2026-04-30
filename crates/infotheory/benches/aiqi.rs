@@ -1,4 +1,5 @@
 use infotheory::aixi::aiqi::{AiqiAgent, AiqiConfig};
+use infotheory::aixi::common::ActionAlphabet;
 use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -18,7 +19,8 @@ fn base_cfg(backend: RateBackend) -> AiqiConfig {
     cfg.observation_bits = 1;
     cfg.observation_stream_len = 1;
     cfg.reward_bits = 1;
-    cfg.agent_actions = 2;
+    cfg.agent_actions =
+        ActionAlphabet::try_from_usize(2).expect("benchmark action alphabet must be non-zero");
     cfg.min_reward = 0;
     cfg.max_reward = 1;
     cfg.reward_offset = 0;

@@ -2167,6 +2167,28 @@ pub(crate) fn try_cross_entropy_conditional_chain_backend(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::io::Read;
+
+    use crate::api::{CompressionBackend, RateBackend};
+    #[cfg(feature = "backend-mixture")]
+    use crate::api::{MixtureExpertSpec, MixtureKind, MixtureSpec};
+    #[cfg(feature = "backend-mixture")]
+    use std::sync::Arc;
+
+    #[cfg(any(
+        feature = "backend-ctw",
+        feature = "backend-mixture",
+        feature = "backend-rwkv",
+        feature = "backend-mamba",
+        feature = "all-backends"
+    ))]
+    fn compiled_rate_backend(backend: &RateBackend) -> CompiledRateBackend {
+        backend.compile().expect("compiled rate backend")
+    }
+
+    fn compiled_compression_backend(backend: &CompressionBackend) -> CompiledCompressionBackend {
+        backend.compile().expect("compiled compression backend")
+    }
 
     fn assert_registry_is_injective<K>(registry: &[BackendDescriptor<K>], label: &str)
     where
@@ -2288,5 +2310,200 @@ mod tests {
         .expect_err("missing descriptor should return an error");
         assert!(err.contains("internal backend registry mismatch"));
         assert!(err.contains("RosaPlus"));
+    }
+
+    #[test]
+    fn registry_descriptors_round_trip_and_feature_messages_are_stable() {
+        let rosa = find_backend_descriptor_in_registry(RATE_BACKEND_REGISTRY, "  ROSA  ")
+            .expect("trimmed case-insensitive alias should resolve");
+        assert_eq!(rosa.canonical, "rosaplus");
+
+        for descriptor in RATE_BACKEND_REGISTRY {
+            let described = describe_rate_backend_kind(descriptor.kind)
+                .expect("rate descriptor kind lookup must succeed");
+            assert_eq!(described.canonical, descriptor.canonical);
+        }
+
+        for descriptor in COMPRESSION_BACKEND_REGISTRY {
+            let described = describe_compression_backend_kind(descriptor.kind)
+                .expect("compression descriptor kind lookup must succeed");
+            assert_eq!(described.canonical, descriptor.canonical);
+        }
+
+        let rate_with_feature = RATE_BACKEND_REGISTRY
+            .iter()
+            .find(|descriptor| descriptor.feature.is_some())
+            .expect("at least one feature-gated rate backend");
+        let rate_feature_message = registry::rate_backend_feature_error(rate_with_feature.kind);
+        assert!(rate_feature_message.contains(rate_with_feature.canonical));
+        assert!(rate_feature_message.contains("requires infotheory feature"));
+
+        if let Some(rate_without_feature) = RATE_BACKEND_REGISTRY
+            .iter()
+            .find(|descriptor| descriptor.feature.is_none())
+        {
+            let rate_unavailable_message =
+                registry::rate_backend_feature_error(rate_without_feature.kind);
+            assert!(rate_unavailable_message.contains(rate_without_feature.canonical));
+            assert!(rate_unavailable_message.contains("is unavailable"));
+        }
+
+        let compression_with_feature = COMPRESSION_BACKEND_REGISTRY
+            .iter()
+            .find(|descriptor| descriptor.feature.is_some())
+            .expect("at least one feature-gated compression backend");
+        let compression_feature_message =
+            registry::compression_backend_feature_error(compression_with_feature.kind);
+        assert!(compression_feature_message.contains(compression_with_feature.canonical));
+        assert!(compression_feature_message.contains("requires infotheory feature"));
+
+        let compression_without_feature = COMPRESSION_BACKEND_REGISTRY
+            .iter()
+            .find(|descriptor| descriptor.feature.is_none())
+            .expect("at least one always-enabled compression backend");
+        let compression_unavailable_message =
+            registry::compression_backend_feature_error(compression_without_feature.kind);
+        assert!(compression_unavailable_message.contains(compression_without_feature.canonical));
+        assert!(compression_unavailable_message.contains("is unavailable"));
+    }
+
+    #[test]
+    fn interleave_aligned_bytes_uses_shorter_input_and_preserves_pair_order() {
+        let interleaved = interleave_aligned_bytes(&[1, 2, 3], &[9, 8]);
+        assert_eq!(interleaved, vec![1, 9, 2, 8]);
+    }
+
+    #[test]
+    fn slice_chain_reader_reads_across_empty_and_nonempty_parts() {
+        let parts: [&[u8]; 4] = [b"ab", b"", b"c", b"def"];
+        let mut reader = SliceChainReader::new(&parts);
+        let mut out = [0u8; 6];
+
+        let first = reader.read(&mut out[..3]).expect("first read");
+        let second = reader.read(&mut out[3..]).expect("second read");
+        let eof = reader.read(&mut out[0..1]).expect("eof read");
+
+        assert_eq!(first, 3);
+        assert_eq!(second, 3);
+        assert_eq!(eof, 0);
+        assert_eq!(&out, b"abcdef");
+    }
+
+    #[test]
+    fn rate_runtime_chain_matches_concatenated_stream_and_roundtrips() {
+        let backend = compiled_compression_backend(&CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 5 },
+            coder: crate::coders::CoderType::AC,
+            framing: crate::compression::FramingMode::Framed,
+        });
+        let mut runtime = build_compression_runtime(&backend).expect("rate runtime");
+        let parts: [&[u8]; 3] = [b"alpha", b"-", b"beta"];
+        let joined = b"alpha-beta";
+
+        let chain_size = runtime.compress_size_chain(&parts).expect("chain size");
+        let joined_size = runtime.compress_size(joined).expect("joined size");
+        assert_eq!(chain_size, joined_size);
+
+        let encoded = runtime.compress_bytes(joined).expect("compress bytes");
+        let decoded = runtime
+            .decompress_bytes(&encoded)
+            .expect("decompress bytes");
+        assert_eq!(decoded, joined);
+    }
+
+    #[cfg(feature = "backend-zpaq")]
+    #[test]
+    fn zpaq_runtime_helpers_cover_empty_and_conditioned_paths() {
+        let backend = compiled_rate_backend(&RateBackend::Zpaq {
+            method: crate::api::ZpaqMethodSpec::literal("2"),
+        });
+        assert_eq!(
+            zpaq_conditional_chain_rate_bits("2", &[b"prefix"], b"").expect("empty zpaq chain"),
+            0.0
+        );
+
+        let entropy = entropy_zpaq(b"banana", &backend).expect("zpaq entropy");
+        let joint = joint_entropy_zpaq(b"banana", b"bandit", &backend).expect("zpaq joint");
+        let cond = conditional_chain_zpaq(&[b"ban"], b"ana", &backend).expect("zpaq conditional");
+        assert!(entropy.is_finite() && entropy >= 0.0);
+        assert!(joint.is_finite() && joint >= 0.0);
+        assert!(cond.is_finite() && cond >= 0.0);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn ctw_family_runtime_entropy_helpers_are_finite() {
+        let ctw = compiled_rate_backend(&RateBackend::Ctw { depth: 5 });
+        let fac = compiled_rate_backend(&RateBackend::FacCtw {
+            base_depth: 5,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+        });
+
+        let ctw_entropy = entropy_ctw(b"abracadabra", &ctw).expect("ctw entropy");
+        let ctw_joint = joint_entropy_ctw(b"aaaa", b"bbbb", &ctw).expect("ctw joint");
+        let ctw_cond = conditional_chain_ctw(&[b"abra"], b"cad", &ctw).expect("ctw conditional");
+        assert!(ctw_entropy.is_finite() && ctw_entropy >= 0.0);
+        assert!(ctw_joint.is_finite() && ctw_joint >= 0.0);
+        assert!(ctw_cond.is_finite() && ctw_cond >= 0.0);
+
+        let fac_entropy = entropy_fac_ctw(b"abracadabra", &fac).expect("fac entropy");
+        let fac_joint = joint_entropy_fac_ctw(b"aaaa", b"bbbb", &fac).expect("fac joint");
+        let fac_cond =
+            conditional_chain_fac_ctw(&[b"abra"], b"cad", &fac).expect("fac conditional");
+        assert!(fac_entropy.is_finite() && fac_entropy >= 0.0);
+        assert!(fac_joint.is_finite() && fac_joint >= 0.0);
+        assert!(fac_cond.is_finite() && fac_cond >= 0.0);
+    }
+
+    #[cfg(feature = "backend-mixture")]
+    #[test]
+    fn mixture_runtime_entropy_helpers_are_finite() {
+        let mixture = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })],
+            )),
+        };
+        let backend = compiled_rate_backend(&mixture);
+
+        let entropy = entropy_mixture(b"mixture bytes", &backend).expect("mixture entropy");
+        let joint = joint_entropy_mixture(b"abcd", b"wxyz", &backend).expect("mixture joint");
+        let cond =
+            conditional_chain_mixture(&[b"mix"], b"ture", &backend).expect("mixture conditional");
+        assert!(entropy.is_finite() && entropy >= 0.0);
+        assert!(joint.is_finite() && joint >= 0.0);
+        assert!(cond.is_finite() && cond >= 0.0);
+    }
+
+    #[cfg(feature = "backend-rwkv")]
+    #[test]
+    fn rwkv_runtime_entropy_helpers_are_finite() {
+        let backend = compiled_rate_backend(
+            &default_rate_backend_spec(RateBackendKind::Rwkv7).expect("default rwkv spec"),
+        );
+
+        let entropy = entropy_rwkv(b"rwkv bytes", &backend).expect("rwkv entropy");
+        let joint = joint_entropy_rwkv(b"abc", b"xyz", &backend).expect("rwkv joint");
+        let cond = conditional_chain_rwkv(&[b"seed"], b"more", &backend).expect("rwkv conditional");
+        assert!(entropy.is_finite() && entropy >= 0.0);
+        assert!(joint.is_finite() && joint >= 0.0);
+        assert!(cond.is_finite() && cond >= 0.0);
+    }
+
+    #[cfg(feature = "backend-mamba")]
+    #[test]
+    fn mamba_runtime_entropy_helpers_are_finite() {
+        let backend = compiled_rate_backend(
+            &default_rate_backend_spec(RateBackendKind::Mamba).expect("default mamba spec"),
+        );
+
+        let entropy = entropy_mamba(b"mamba bytes", &backend).expect("mamba entropy");
+        let joint = joint_entropy_mamba(b"abc", b"xyz", &backend).expect("mamba joint");
+        let cond =
+            conditional_chain_mamba(&[b"seed"], b"more", &backend).expect("mamba conditional");
+        assert!(entropy.is_finite() && entropy >= 0.0);
+        assert!(joint.is_finite() && joint >= 0.0);
+        assert!(cond.is_finite() && cond >= 0.0);
     }
 }

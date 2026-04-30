@@ -34,6 +34,50 @@ fn base_config() -> AiqiConfig {
     cfg
 }
 
+fn aiqi_mixture_backend(kind: MixtureKind) -> RateBackend {
+    let experts = vec![
+        {
+            let mut expert = infotheory::api::MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 });
+            expert.name = Some("ctw".to_string());
+            expert.log_prior = 0.0;
+            expert
+        },
+        {
+            let mut expert = infotheory::api::MixtureExpertSpec::new(RateBackend::FacCtw {
+                base_depth: 8,
+                num_percept_bits: 8,
+                encoding_bits: 1,
+            });
+            expert.name = Some("fac-ctw".to_string());
+            expert.log_prior = 0.0;
+            expert
+        },
+    ];
+    let alpha = match kind {
+        MixtureKind::Switching => 0.05,
+        MixtureKind::Convex => 1.25,
+        _ => 0.03,
+    };
+    RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(kind, experts).with_alpha(alpha)),
+    }
+}
+
+fn run_aiqi_env<T: Environment>(agent: &mut AiqiAgent, mut env: T, cycles: usize) -> i64 {
+    let mut total_reward = 0i64;
+    for _ in 0..cycles {
+        let action = agent.get_planned_action();
+        env.perform_action(action);
+        let obs_stream = env.drain_observations();
+        let rew = env.get_reward();
+        agent
+            .observe_transition(action, &obs_stream, rew)
+            .expect("transition must be accepted");
+        total_reward += rew;
+    }
+    total_reward
+}
+
 #[test]
 fn aiqi_config_rejects_period_shorter_than_horizon() {
     let mut cfg = base_config();
@@ -305,4 +349,81 @@ fn rate_backend_bit_predictor_rejects_zpaq_backend() {
         Err(err) => err,
     };
     assert!(matches!(err, RateBackendBitPredictorError::UnsupportedZpaq));
+}
+
+#[test]
+fn aiqi_learns_ctw_pattern_with_fac_ctw_world_model() {
+    let mut cfg = base_config();
+    cfg.discount_gamma = 0.7;
+    cfg.return_horizon = 4;
+    cfg.augmentation_period = 4;
+    cfg.baseline_exploration = 1e-6;
+    cfg.rate_backend = RateBackend::FacCtw {
+        base_depth: 10,
+        num_percept_bits: 8,
+        encoding_bits: 1,
+    };
+
+    let mut agent = AiqiAgent::new(cfg).expect("valid AIQI FAC-CTW config");
+    let total_reward = run_aiqi_env(&mut agent, DeterministicBinaryEnv::new(), 120);
+    assert!(
+        total_reward > 50,
+        "AIQI FAC-CTW world model failed to learn deterministic pattern; total_reward={total_reward}"
+    );
+}
+
+#[test]
+fn aiqi_mixture_world_models_learn_deterministic_pattern() {
+    for (kind, label) in [
+        (MixtureKind::Bayes, "bayes"),
+        (MixtureKind::Switching, "switching"),
+        (MixtureKind::Convex, "convex"),
+    ] {
+        let mut cfg = base_config();
+        cfg.discount_gamma = 0.8;
+        cfg.return_horizon = 4;
+        cfg.augmentation_period = 4;
+        cfg.baseline_exploration = 0.01;
+        cfg.rate_backend = aiqi_mixture_backend(kind);
+
+        let mut agent = AiqiAgent::new(cfg).expect("valid AIQI mixture config");
+        let total_reward = run_aiqi_env(&mut agent, DeterministicBinaryEnv::new(), 96);
+        assert!(
+            total_reward > 35,
+            "{label} AIQI mixture world model reward too low on deterministic pattern: {total_reward}"
+        );
+    }
+}
+
+#[test]
+fn aiqi_mixture_world_models_are_seed_deterministic() {
+    for (kind, label) in [
+        (MixtureKind::Bayes, "bayes"),
+        (MixtureKind::Switching, "switching"),
+        (MixtureKind::Convex, "convex"),
+    ] {
+        let mut cfg = base_config();
+        cfg.rate_backend = aiqi_mixture_backend(kind);
+        cfg.baseline_exploration = 0.3;
+        cfg.random_seed = Some(20260429);
+
+        let mut a = AiqiAgent::new(cfg.clone()).expect("mixture agent A");
+        let mut b = AiqiAgent::new(cfg).expect("mixture agent B");
+
+        for step in 0..96usize {
+            let act_a = a.get_planned_action();
+            let act_b = b.get_planned_action();
+            assert_eq!(
+                act_a, act_b,
+                "{label} action mismatch at step {step} under equal seed/history"
+            );
+
+            let obs = [((step + 1) % 2) as u64];
+            let rew = (step % 2) as i64;
+            a.observe_transition(act_a, &obs, rew)
+                .expect("transition should be accepted");
+            b.observe_transition(act_b, &obs, rew)
+                .expect("transition should be accepted");
+        }
+    }
 }

@@ -72,3 +72,90 @@ pub trait Environment {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct DummyEnv {
+        observation: PerceptVal,
+        reward: Reward,
+        observation_bits: usize,
+        reward_bits: usize,
+        action_bits: usize,
+        finished: bool,
+    }
+
+    impl Environment for DummyEnv {
+        fn perform_action(&mut self, _action: Action) {}
+
+        fn get_observation(&self) -> PerceptVal {
+            self.observation
+        }
+
+        fn get_reward(&self) -> Reward {
+            self.reward
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+
+        fn get_observation_bits(&self) -> usize {
+            self.observation_bits
+        }
+
+        fn get_reward_bits(&self) -> usize {
+            self.reward_bits
+        }
+
+        fn get_action_bits(&self) -> usize {
+            self.action_bits
+        }
+    }
+
+    #[test]
+    fn default_environment_helpers_are_consistent() {
+        let mut env = DummyEnv {
+            observation: 7,
+            reward: -2,
+            observation_bits: 3,
+            reward_bits: 4,
+            action_bits: 2,
+            finished: false,
+        };
+
+        env.set_random_seed(1234);
+        env.perform_action(1);
+
+        assert_eq!(env.drain_observations(), vec![7]);
+        assert_eq!(env.get_num_actions().get(), 4);
+        assert_eq!(env.max_reward(), 7);
+        assert_eq!(env.min_reward(), -8);
+        assert_eq!(env.get_reward(), -2);
+        assert!(!env.is_finished());
+        assert_eq!(env.get_observation_bits(), 3);
+    }
+
+    #[test]
+    fn reward_bound_helpers_cover_zero_and_wide_bit_ranges() {
+        let zero_bits = DummyEnv {
+            observation: 0,
+            reward: 0,
+            observation_bits: 1,
+            reward_bits: 0,
+            action_bits: 1,
+            finished: false,
+        };
+        assert_eq!(zero_bits.min_reward(), 0);
+        assert_eq!(zero_bits.max_reward(), 0);
+
+        let wide_bits = DummyEnv {
+            reward_bits: 64,
+            ..zero_bits
+        };
+        assert_eq!(wide_bits.min_reward(), i64::MIN);
+        assert_eq!(wide_bits.max_reward(), i64::MAX);
+    }
+}
