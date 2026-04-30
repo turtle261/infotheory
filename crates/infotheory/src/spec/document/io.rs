@@ -46,7 +46,9 @@ pub fn load_spec_document(path: &str) -> SpecResult<SpecDocument> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "backend-ctw")]
     use crate::api::RateBackend;
+    #[cfg(feature = "backend-ctw")]
     use crate::spec::CanonicalJson;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -59,6 +61,7 @@ mod tests {
         std::env::temp_dir().join(format!("infotheory-spec-io-{prefix}-{nanos}.{ext}"))
     }
 
+    #[cfg(feature = "backend-ctw")]
     #[test]
     fn load_spec_document_detects_json_extension() {
         let path = temp_path("json", "json");
@@ -75,6 +78,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "backend-ctw")]
     #[test]
     fn load_spec_document_detects_binary_extension_and_magic() {
         let path = temp_path("binary", "itsd");

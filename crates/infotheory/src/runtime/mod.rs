@@ -2187,6 +2187,7 @@ mod tests {
         backend.compile().expect("compiled rate backend")
     }
 
+    #[cfg(feature = "backend-ctw")]
     fn compiled_compression_backend(backend: &CompressionBackend) -> CompiledCompressionBackend {
         backend.compile().expect("compiled compression backend")
     }
@@ -2390,6 +2391,7 @@ mod tests {
         assert_eq!(&out, b"abcdef");
     }
 
+    #[cfg(feature = "backend-ctw")]
     #[test]
     fn rate_runtime_chain_matches_concatenated_stream_and_roundtrips() {
         let backend = compiled_compression_backend(&CompressionBackend::Rate {
