@@ -830,6 +830,7 @@ fn file_to_candidates(path: &Path, granularity: SearchGranularity) -> Vec<Snippe
 mod tests {
     use super::*;
     use crate::api::{CompressionBackend, InfotheoryCtx, RateBackend};
+    #[cfg(feature = "backend-zpaq")]
     use crate::error::InfotheoryError;
     use std::time::{SystemTime, UNIX_EPOCH};
 

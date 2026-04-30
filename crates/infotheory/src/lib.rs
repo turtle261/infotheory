@@ -1379,7 +1379,9 @@ mod tests {
     ))
 ))]
 mod minimal_tests {
-    use crate::api::{CompressionBackend, RateBackend};
+    #[cfg(not(feature = "backend-zpaq"))]
+    use crate::api::CompressionBackend;
+    use crate::api::RateBackend;
 
     #[cfg(not(feature = "backend-zpaq"))]
     #[test]

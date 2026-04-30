@@ -2177,6 +2177,7 @@ mod tests {
 
     #[cfg(any(
         feature = "backend-ctw",
+        feature = "backend-zpaq",
         feature = "backend-mixture",
         feature = "backend-rwkv",
         feature = "backend-mamba",
