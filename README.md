@@ -99,44 +99,45 @@ Add the dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-infotheory = { path = "." } # Replace with a git or crates.io source as needed.
+# From git (current development):
+# infotheory = { git = "https://github.com/turtle261/infotheory", branch = "main" }
+
+# From crates.io (when released):
+# infotheory = "1.2"
+
+# With feature selection:
+# infotheory = { version = "1.2", features = ["cli", "aixi"] } # Infotheory is highly configurable at the feature-level, you can compile in what you need.
 ```
 
 ### Library API layering
 
-The generic Rust API is compiled-plan-first. Typical library usage is:
+The generic Rust API is compiled-plan-first. Internally, specs are validated and canonicalized once, then compiled to immutable execution plans. Typical library usage is:
 
 ```rust
-use infotheory::api::{
-    CompiledRateBackend, CompressionBackend, InfotheoryCtx, RateBackend,
-};
+use infotheory::api::{CompressionBackend, InfotheoryCtx, RateBackend};
 
-let rate_backend: CompiledRateBackend = RateBackend::Ctw { depth: 16 }
-    .compile()
-    .expect("valid backend");
+let ctx = InfotheoryCtx::from_specs(
+    RateBackend::Ctw { depth: 16 },
+    CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 16 },
+        coder: infotheory::coders::CoderType::AC,
+        framing: infotheory::compression::FramingMode::Raw,
+    },
+)?;
 
-let compression_backend = CompressionBackend::Rate {
-    rate_backend: RateBackend::Ctw { depth: 16 },
-    coder: infotheory::coders::CoderType::AC,
-    framing: infotheory::compression::FramingMode::Raw,
-}
-.compile()
-.expect("valid compression backend");
-
-let ctx = InfotheoryCtx::new(rate_backend.clone(), compression_backend);
-
-let bits = ctx.try_entropy_rate_bytes(b"abracadabra").expect("entropy");
+let bits = ctx.try_entropy_rate_bytes(b"abracadabra")?;
 assert!(bits.is_finite());
 ```
 
-For callers that still start from wrapper specs, compatibility helpers remain available:
+`InfotheoryCtx::from_specs()` handles validation and compilation internally, ensuring a single consistent compiled plan across both rate and compression backends. The compiled backends are also accessible via `ctx.rate_backend` and `ctx.compression_backend` if you need explicit pre-compiled access for repeated operations.
 
-- `RateBackend::validate()` / `CompressionBackend::validate()`
-- `RateBackend::compile()` / `CompressionBackend::compile()`
-- `InfotheoryCtx::from_specs(...)`
+For advanced use cases, explicit validation and compilation helpers are available:
 
-`ValidatedRateBackend`, `ValidatedCompressionBackend`, `CompiledRateBackend`,
-and `CompiledCompressionBackend` are all re-exported from `infotheory::api`.
+- `RateBackend::validate()` / `CompressionBackend::validate()` — produce `ValidatedRateBackend` / `ValidatedCompressionBackend`
+- `RateBackend::compile()` / `CompressionBackend::compile()` — produce `CompiledRateBackend` / `CompiledCompressionBackend`
+- `InfotheoryCtx::new(compiled_rate, compiled_compression)` — construct context from pre-compiled backends
+
+All validated and compiled types are re-exported from `infotheory::api`.
 
 ### Building Nyx-Lite
 The VM backend is optional (`--features vm`) and depends on `vendor/nyx-lite` (and its vendored submodule code). Build it with:
@@ -283,8 +284,8 @@ Optional online export after processing input:
 ```
 
 This writes:
-- `rwkv_online.safetensors`
-- `rwkv_online.json` (sidecar with resolved config + metadata)
+- `mamba_online.safetensors`
+- `mamba_online.json` (sidecar with resolved config + metadata)
 
 ### AIXI Agent Mode
 ```bash
