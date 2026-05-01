@@ -127,10 +127,14 @@ Naive summation of RSS across a multi-process tree is not normative, because it
 can double-count shared pages.
 \end{remark}
 
-Timeout semantics are hard:
+Timeout semantics are hard relative to the effective evaluator limit
+$T_{\mathrm{eff}}$ used for that call:
 \[
-\tau(z) \ge T_{\mathrm{eval}} \implies \mathrm{status}(z)=\mathrm{timeout}.
+\tau(z) \ge T_{\mathrm{eff}} \implies \mathrm{status}(z)=\mathrm{timeout}.
 \]
+For full per-candidate evaluations,
+$T_{\mathrm{eff}}=T_{\mathrm{eval}}$. In remaining-budget-truncated runtime
+calls, $T_{\mathrm{eff}}=\min(T_{\mathrm{eval}},B_t)$.
 
 For successful candidates, define throughput
 \[
@@ -380,23 +384,23 @@ Planner-facing controllers additionally carry a
 \texttt{interface}=
 (\texttt{observation\_bits},\texttt{observation\_stream\_len},
 \texttt{observation\_key\_mode},\texttt{reward\_bits},
-\texttt{agent\_actions},\texttt{min\_reward},\texttt{max\_reward},
-\texttt{reward\_offset}),
+\texttt{agent\_actions}),
 \]
-where these fields are part of the current shared public type:
+where:
 \begin{itemize}
     \item \texttt{agent\_actions} is a non-zero action-alphabet cardinality,
     \item \texttt{observation\_key\_mode} is one of
     \texttt{"first"}, \texttt{"last"}, \texttt{"stream\_hash"}, or
     \texttt{"full\_stream"},
     \item \texttt{reward\_bits} declares the finite encoded reward-alphabet
-    width,
-    \item because the current shared public type includes them,
-    \texttt{min\_reward}, \texttt{max\_reward}, and
-    \texttt{reward\_offset} are always syntactically present in v1 and must
-    satisfy the shared document-validation bounds for shifted reward
-    encodability.
+    width; write $b_R:=\texttt{reward\_bits}$.
 \end{itemize}
+
+The shared planner interface does not contain
+\texttt{min\_reward}, \texttt{max\_reward}, or
+\texttt{reward\_offset}. Those fields belonged to the unreleased affine
+integer reward-encoding design, where objective improvements were encoded by a
+shifted integer interval. That design is not part of the v1 public surface.
 
 The field \texttt{observation\_key\_mode} specifies the planner-visible
 branching key derived from the encoded observation stream $o_{1:m}$. This
@@ -439,16 +443,10 @@ projection is injective on the planner state space relevant to the theorem
 being claimed. The precise observation adapter specification $\eta_O$,
 including any upstream encoding of raw environment observations into the stream
 consumed here and any fixed-length validation rule, must be recorded in
-provenance.
-
-For normalized-clipped-improvement semantics and for the legacy affine integer
-exact-encoding shortcut, the interface triple
-\[
-(\texttt{min\_reward},\texttt{max\_reward},\texttt{reward\_offset})
-\]
-carries the operative reward interval and unsigned-shift encoding semantics.
-For general exact-objective-difference semantics, this triple does not by
-itself define the exact scalar representation.
+provenance. This public observation/keying interface does not by itself
+certify the exact-state observation path; that requires a theorem-side
+encoder $\Psi_H$ together with the injectivity/certification contract stated
+later in Section~\ref{sec:aixi-embedding}.
 
 For exact-objective-difference semantics, the implementation must additionally
 fix or derive a finite canonical scalar representation
@@ -458,8 +456,22 @@ fix or derive a finite canonical scalar representation
 for exact objective values and objective differences. This representation may
 be supplied by fixed evaluator numeric semantics, by an implementation-internal
 declaration, or by the deployability profile $H$, but it must be recorded in
-provenance. The interface triple above is not the general exact reward
-representation.
+provenance, together with an injective reward encoder $\Omega_H$ and semantic
+decoder $V_H$. The exact reward semantics are therefore not defined by any
+interval/offset triple.
+
+For \texttt{aiqi\_discounted}, normalized-clipped-improvement semantics are
+parameterized by the explicit controller clipping fields
+\[
+\begin{aligned}
+r_{\min}^{\mathrm{clip}}&:=\texttt{controller.min\_improvement},\\
+r_{\max}^{\mathrm{clip}}&:=\texttt{controller.max\_improvement},\\
+r_{\max}^{\mathrm{clip}}&>r_{\min}^{\mathrm{clip}}.
+\end{aligned}
+\]
+These parameters are specific to the discounted controller. They determine only
+the discounted controller's normalization interval and are not part of exact
+objective-difference semantics.
 
 Controller-specific required fields are:
 \begin{itemize}
@@ -475,7 +487,10 @@ Controller-specific required fields are:
     \texttt{controller.planner\_simulations\_per\_step}\((\in\mathbb{N},\ge 1)\),
     \texttt{controller.return\_horizon}\((\in\mathbb{N},\ge 1)\),
     \texttt{controller.return\_bins}\((\in\mathbb{N},\text{power of two})\),
-    and \texttt{controller.discount\_factor}\((\in[0,1))\),
+    \texttt{controller.discount\_factor}\((\in[0,1))\),
+    \texttt{controller.min\_improvement}, and
+    \texttt{controller.max\_improvement} with constraint
+    \texttt{controller.max\_improvement > controller.min\_improvement},
     \item for \texttt{controller.kind = "aiqi\_warmstart\_exact\allowbreak\_jh"}:
     \texttt{controller.interface},
     \texttt{controller.planner\_simulations\_per\_step}\((\in\mathbb{N},\ge 1)\),
@@ -529,6 +544,7 @@ surface. An implementation may additionally expose executor-side controls that
 do not change candidate identity, such as:
 \begin{itemize}
     \item \texttt{max\_evaluations}
+    \item \texttt{annealer\_kernel\_profile}
     \item \texttt{cpu\_affinity}
     \item \texttt{threads}
     \item \texttt{warmup\_baseline\_runs}
@@ -584,6 +600,32 @@ r_{\mathrm{mut}}^{\max}:=\texttt{controller.max\_mutation\_radius}\in\mathbb{N},
 r_{\mathrm{mut}}^{\max}\ge 1.
 \]
 This is an annealer execution-control parameter.
+
+If an implementation exposes an executor-side annealer-kernel selector,
+interpret it as an execution-profile choice rather than as part of the
+canonical candidate/request document. When this selector is not exposed, the
+default profile is
+\[
+\texttt{reversible\_elementary\_metropolis}.
+\]
+This default kernel uses only certified reversible elementary edits from
+Section~\ref{sec:reversible-annealer-kernel} and ordinary Metropolis
+acceptance. It does not require explicit computation of proposal masses
+$q_T$.
+
+An implementation may additionally expose
+\[
+\texttt{compiled\_uniform\_metropolis\_hastings}
+\]
+as a certified variant, but only if it computes exact canonical proposal
+masses $q_T$ for the selected mutation grammar.
+
+Any alternative annealer kernel, including non-uniform action weights,
+adaptive proposal mixtures, incumbent-substructure copy,
+reset-to-incumbent, greedy repair, or a different acceptance law, is a
+heuristic-mode execution variant. It must be recorded in provenance and does
+not inherit the default annealer detailed-balance or proposal-kernel formulas
+unless separately specified and re-derived.
 
 For the optional bounded same-task teacher-refresh wrapper around
 \texttt{aiqi\_warmstart\_exact\allowbreak\_jh}, define
@@ -794,7 +836,9 @@ $\chi\in\{\texttt{ObserveTargetNoScore},\texttt{Target}\}$, let
 \[
 \Sigma_H(e_{<t},c,q)\subseteq\{0,\dots,255\}^*
 \]
-denote the corresponding admissible target-payload set. A target event
+denote the corresponding admissible target-payload set; by profile
+requirement this set is finite and nonempty whenever
+$(\chi,c,q)\in\Gamma_H(e_{<t})$. A target event
 or replay event with payload $b$ is well formed at prefix $e_{<t}$ iff its
 descriptor lies in $\Gamma_H(e_{<t})$ and
 $b\in\Sigma_H(e_{<t},c,q)$. Canonical lowerings are conforming only if every
@@ -834,6 +878,7 @@ function ScoreCausalStream(z, E):
 Equivalently, fix a well-formed event stream $E=(e_1,\dots,e_m)$. At any
 target step, the evaluator uses a target-domain conditional. Concretely, if
 $e_t=\texttt{Target}(c_t,q_t,b_t)$, then
+$\Sigma_H(e_{<t},c_t,q_t)$ is finite and nonempty, and
 \[
 P_{z,H}(b_t\mid e_{<t};c_t,q_t),
 \qquad
@@ -863,6 +908,15 @@ the evaluator must not waste probability mass on action markers, separators,
 reset tokens, or unrelated channel tags known impossible at that position.
 Typed target-domain normalization is therefore part of semantic correctness,
 not merely an implementation convenience.
+\end{remark}
+
+\begin{remark}[Finiteness of target domains is part of the profile]
+The target-domain normalization above is a finite-summation semantics.
+Accordingly, whenever a target or replay descriptor is admissible at a prefix,
+$H$ must determine a finite admissible payload set
+$\Sigma_H(e_{<t},c,q)$. Infinite or implementation-implicit supports are
+non-conforming unless they are first compiled into an equivalent finite
+canonical domain before scoring.
 \end{remark}
 
 \begin{remark}[Canonical decode boundaries and variable-length targets]
@@ -945,6 +999,17 @@ then conditioning on $a_i$, and finally charging only the target percept
 $x_i$ with multiplicative weight $w_i$. Multiple actions may therefore be
 scored from the same prefix without sibling-branch leakage. A linear trace is
 the special case with one realized successor per prefix.
+
+\begin{remark}[Exact-controller restriction on causal-prefix weights]
+For exact-objective-difference controller modes, the weights $w_i$ must be
+encoded either as positive integers or as fixed-point rationals with a declared
+finite denominator that is part of the canonical dataset encoding and profile
+provenance. Arbitrary floating-point weights are permitted for operational
+heuristic evaluation, but they disable exact scalar reward certification unless
+the selected finite scalar representation $\mathbb{V}_H^{\mathcal J}$
+explicitly represents all resulting objective values and objective
+differences.
+\end{remark}
 
 \begin{remark}[Replay primitive required for causal-prefix datasets]
 A conforming evaluator must provide an explicit zero-cost replay primitive for
@@ -1160,6 +1225,7 @@ metrics or semantics, including at minimum:
     \item the declared target-size functional underlying $N_H(d)$,
     \item passive structural-tag policy and adapter semantics,
     \item weighted-prefix replay semantics,
+    \item the effective evaluator timeout actually used for the call,
     \item whether physical byte artifacts are materialized,
     \item planner deployability profile switches,
     \item build/features, evaluator determinism settings, warmup policy, and
@@ -1167,6 +1233,23 @@ metrics or semantics, including at minimum:
 \end{itemize}
 Two evaluations that differ on any such item are semantically distinct and must
 not collide in cache.
+
+\begin{remark}[Budget-truncated evaluations and cache soundness]
+At runtime the effective timeout used for a candidate evaluation is
+\[
+T_{\mathrm{eff}}:=\min(T_{\mathrm{eval}},B_t).
+\]
+Because evaluator status, elapsed time, and deployability can change when
+$T_{\mathrm{eff}}$ changes, outcomes obtained with different effective
+timeouts are not semantically interchangeable unless the candidate completed
+successfully before both limits and all reported metrics are identical.
+
+Therefore a conforming implementation must treat $T_{\mathrm{eff}}$ as part of
+$\eta_{\mathrm{eval}}$ for cache keying. In particular, a timeout observed
+with $T_{\mathrm{eff}}<T_{\mathrm{eval}}$ must not be reused as evidence that
+the candidate would time out under the full per-candidate limit
+$T_{\mathrm{eval}}$.
+\end{remark}
 
 Reference pseudocode:
 \begin{verbatim}
@@ -1647,18 +1730,154 @@ truncated-universality baseline.
 Let $\mathcal{N}_B(z)$ denote the legal finite neighborhood induced by bounds compiler $B$.
 Mutations are generated from this grammar only, never by unconstrained raw JSON edits.
 
-Allowed mutation families include: mixture-kind change, expert add/remove/replace, local parameter mutation, reorder, optional expert toggle, local nested mutation, incumbent substructure copy, and reset-to-incumbent.
+The bounded mutation grammar is partitioned into two classes:
+\begin{enumerate}
+    \item \emph{certified reversible elementary edits}, used by the default
+    annealed Metropolis kernel,
+    \item \emph{heuristic macro moves}, useful for search but outside the
+    default detailed-balance contract.
+\end{enumerate}
+Certified reversible elementary edits may include local integer-parameter
+steps, finite enum replacements with explicit inverse descriptors,
+expert add/remove pairs carrying slot and expert identity, swaps,
+optional-component toggles, and other local edits whose inverse is compiled
+explicitly. Heuristic macro moves may include incumbent-substructure copy,
+reset-to-incumbent, greedy repair, adaptive large jumps, and any mutation whose
+reverse probability is not certified by the grammar compiler.
 
-For integer parameter $p\in[L,U]$, with elapsed fraction $u\in[0,1]$,
-temperature $T(u)$, and mutation-radius cap $r_{\mathrm{mut}}^{\max}$, use local radius
+For integer parameter $p\in[L,U]$, the certified elementary descriptor set
+contains signed integer-step descriptors
 \[
-r(u)=\max\!\left(1,\left\lfloor r_{\mathrm{mut}}^{\max}\frac{T(u)}{T_0}\right\rfloor\right),
+\Delta p\in
+\{-r_{\mathrm{mut}}^{\max},\ldots,-1,+1,\ldots,+r_{\mathrm{mut}}^{\max}\}.
 \]
-then propose
+The descriptor with step $\Delta p$ has inverse descriptor $-\Delta p$.
+
+At elapsed fraction $u\in[0,1]$, define the active local radius
 \[
-\Delta p \in \{-r(u),\ldots,-1,+1,\ldots,+r(u)\},
+r(u)=
+\max\!\left(
+1,
+\left\lfloor
+r_{\mathrm{mut}}^{\max}\frac{T(u)}{T_0}
+\right\rfloor
+\right).
 \]
-clipped to $[L,U]$.
+For the default certified reversible kernel, at elapsed fraction $u$ a signed
+integer-step descriptor is applicable at state $z$ only if both
+\[
+|\Delta p|\le r(u)
+\qquad\text{and}\qquad
+p+\Delta p\in[L,U].
+\]
+If either condition fails, then
+\[
+A_{B,u}(e,z)=z.
+\]
+Thus inactive or boundary-crossing integer edits become self-loop proposals.
+
+A non-self integer edit is therefore permitted only at fixed elapsed fraction
+$u$ when
+\[
+|\Delta p|\le r(u)
+\quad\text{and}\quad
+p+\Delta p\in[L,U],
+\]
+in which case its inverse is the descriptor with step $-\Delta p$. Since
+$|\Delta p|\le r(u)$ iff $|-\Delta p|\le r(u)$, and
+\[
+p+\Delta p\in[L,U]
+\quad\Longleftrightarrow\quad
+(p+\Delta p)-\Delta p=p\in[L,U],
+\]
+the elementary reversibility condition is preserved.
+
+Clipped integer mutation is permitted only in heuristic annealer profiles or
+in the optional Metropolis--Hastings profile with exact proposal-mass
+accounting. It is not part of the default certified reversible elementary
+kernel.
+
+\subsection{Certified reversible elementary annealer kernel}
+\label{sec:reversible-annealer-kernel}
+
+The default v1 annealer kernel is a reversible elementary-edit kernel. Define
+the canonical candidate image
+\[
+\mathcal{Z}^{\mathrm{can}}:=\operatorname{canon}(\mathcal{Z}).
+\]
+The bounds compiler constructs a finite edit-descriptor set
+\[
+\mathcal{E}_B
+\]
+equipped with an involution
+\[
+\operatorname{inv}:\mathcal{E}_B\to\mathcal{E}_B,
+\qquad
+\operatorname{inv}(\operatorname{inv}(e))=e.
+\]
+The edit sampling law $p_B$ satisfies
+\[
+p_B(e)=p_B(\operatorname{inv}(e))
+\qquad\text{for all }e\in\mathcal{E}_B.
+\]
+
+Each edit descriptor induces a total canonical transition at elapsed fraction
+$u$:
+\[
+A_{B,u}:\mathcal{E}_B\times\mathcal{Z}^{\mathrm{can}}
+\to
+\mathcal{Z}^{\mathrm{can}}.
+\]
+If an edit is inapplicable at $z$, inactive at elapsed fraction $u$, or would
+leave the certified schema/bounds-valid elementary-edit family, then
+\[
+A_{B,u}(e,z)=z.
+\]
+Here ``valid'' refers only to static candidate validity under
+$\mathrm{Valid}_{B,H}$ before evaluator execution. It does not assert
+deployability; timeout, throughput, memory, and success status are still
+determined only by the evaluator.
+Thus inapplicable, inactive, or uncertified elementary edits become self-loop
+proposals rather than invalid evaluated candidates.
+
+For every fixed $u\in[0,1]$ and every non-self transition, the edit compiler
+must satisfy
+\[
+A_{B,u}(e,z)=z'\ne z
+\quad\Longleftrightarrow\quad
+A_{B,u}(\operatorname{inv}(e),z')=z.
+\]
+
+For fixed elapsed fraction $u$, the induced proposal kernel is
+\[
+q_{B,u}(z'\mid z)
+:=
+\sum_{e\in\mathcal{E}_B}
+p_B(e)\mathbf{1}\!\left\{A_{B,u}(e,z)=z'\right\}.
+\]
+By inverse symmetry and the fixed-$u$ reversibility condition,
+\[
+q_{B,u}(z'\mid z)=q_{B,u}(z\mid z')
+\]
+for all canonical candidates $z,z'$. Therefore the default annealer uses the
+ordinary Metropolis acceptance rule at the current elapsed fraction $u$
+without a Hastings correction.
+
+Because $u$ changes over runtime, the annealer is a time-inhomogeneous
+Metropolis process. No stationary-distribution claim is made for the full
+cooling schedule.
+
+\begin{remark}[Heuristic macro moves]
+An implementation may additionally expose non-reversible macro moves such as
+reset-to-incumbent, incumbent-substructure copy, greedy repair, adaptive large
+jumps, or arbitrary-valid-subcandidate replacement. These moves are permitted
+only under a heuristic annealer profile or as a separately reported heuristic
+phase. They do not participate in the certified reversible Metropolis kernel
+and do not support detailed-balance or stationary-distribution claims. They
+may still be useful for anytime optimization, but their guarantees are limited
+to feasibility safety and incumbent monotonicity under the surrounding runtime
+contract.
+\end{remark}
 
 \subsection{Finite action compilation for planner exposure}\label{sec:action-compile}
 
@@ -1717,6 +1936,12 @@ The subscript $T$ is retained for interface compatibility; in this
 specification temperature dependence enters through state in
 $\mu_B^{\mathrm{tot}}$ rather than through non-uniform action weights.
 
+This subsection defines the finite indexed action alphabet used by
+planner-exposed controller configurations. The same compilation may also be
+used by the optional certified annealer profile
+\texttt{compiled\_uniform\_metropolis\_hastings}, but it is not the default
+v1 annealer kernel.
+
 Define proposal-outcome kernel
 \[
 \widehat q_T(z,\iota\mid s,B)
@@ -1736,6 +1961,16 @@ q_T(z'\mid s,B)
 Here $s$ is the current annealer proposal state.
 If stochastic decoder form is used, replace indicator terms above by the
 corresponding kernel masses from $\mu_B^{\mathrm{tot}}(\cdot\mid a,s)$.
+
+\begin{remark}[Optional Metropolis--Hastings annealer kernel]
+The more general compiled-uniform Metropolis--Hastings kernel is permitted
+only when the implementation computes exact canonical proposal masses
+$q_T(z'\mid s,B)$. This certified variant may include state-aware macro moves,
+but its correctness depends on exact accounting for inapplicable actions,
+canonicalization collisions, stochastic decoder choices, and reverse-source
+states. It is therefore an optional certified profile rather than the default
+v1 annealer kernel.
+\end{remark}
 
 \section{Annealed Hill Climbing Algorithm}\label{sec:ahc-runtime}
 
@@ -1768,6 +2003,15 @@ T(u)=T_{\min}\left(\frac{T_0}{T_{\min}}\right)^{1-u},
 \]
 default $T_0=1.0$, $T_{\min}=10^{-3}$.
 
+\begin{remark}[Temperature units]
+The annealing temperature $T(u)$ has the same units as the objective:
+bits. Therefore the ratio
+\[
+\Delta\mathcal{J}/T(u)
+\]
+is dimensionless.
+\end{remark}
+
 \subsection{Transition rule}
 
 At each loop iteration:
@@ -1775,31 +2019,37 @@ At each loop iteration:
     \item compute remaining budget $B_t:=T_{\mathrm{total}}-t$;
     if $B_t\le 0$ then terminate immediately,
     \item compute $T(u)$,
-    \item sample action $a_t\sim\pi_T(\cdot\mid s_t,B)$, decode
-    $(\tilde z',\iota')=\mu_B^{\mathrm{tot}}(a_t,s_t)$, and canonicalize
-    $\hat z':=\operatorname{canon}(\tilde z')$,
-    \item if $\iota'=1$, assign $M(\hat z')$ status invalid with diagnostic
-    reason \texttt{inapplicable\_action} without starting compression execution,
-    \item else if $\hat z'$ fails $\mathrm{Valid}_{B,H}$, assign $M(\hat z')$
-    status invalid with diagnostic reason \texttt{candidate\_invalid} without
-    starting compression execution,
-    \item else for cache lookup use
-    $\mathrm{Key}_{\mathrm{cache}}(\hat z',\eta_{\mathrm{eval}},d)$;
-    on cache miss evaluate with per-candidate timeout
+    \item sample elementary edit $e_t\sim p_B$ and set
+    \[
+    \hat z':=A_{B,u}(e_t,z_{\mathrm{cur}}),
+    \]
+    \item if $\hat z'=z_{\mathrm{cur}}$, count a self-loop proposal and
+    continue to the next loop iteration with no evaluation,
+    \item else if $\hat z'$ fails $\mathrm{Valid}_{B,H}$, assign
+    $M(\hat z')$ status invalid with diagnostic reason
+    \texttt{candidate\_invalid} without starting compression execution,
+    reject it as current, and continue to the next loop iteration,
+    \item else define effective evaluation timeout
     \[
     T_t^{\mathrm{eval}}:=\min(T_{\mathrm{eval}},B_t),
     \]
+    and for cache lookup use
+    $\mathrm{Key}_{\mathrm{cache}}(\hat z',\eta_{\mathrm{eval}}^{(t)},d)$,
+    where $\eta_{\mathrm{eval}}^{(t)}$ is the evaluator profile including
+    $T_t^{\mathrm{eval}}$; on cache miss evaluate with per-candidate timeout
+    $T_t^{\mathrm{eval}}$,
     \item set $K_{\mathrm{pre}}:=K(z_{\mathrm{best}})$; if
     $\mathcal{J}_H(\hat z';d)<+\infty$ and
     $K(\hat z')\prec_K K_{\mathrm{pre}}$, update
     $z_{\mathrm{best}}\leftarrow \hat z'$,
-    \item if $\mathcal{J}_H(\hat z';d)<+\infty$, accept as current via Metropolis criterion:
+    \item if $\mathcal{J}_H(\hat z';d)<+\infty$, accept as current via the
+    ordinary Metropolis criterion:
     \[
     P_{\mathrm{accept}}=
-    \begin{cases}
-    1, & \mathcal{J}_H(\hat z';d)\le \mathcal{J}_H(z_{\mathrm{cur}};d),\\
-    \exp\!\left(-\dfrac{\mathcal{J}_H(\hat z';d)-\mathcal{J}_H(z_{\mathrm{cur}};d)}{T(u)}\right), & \mathcal{J}_H(\hat z';d)>\mathcal{J}_H(z_{\mathrm{cur}};d),
-    \end{cases}
+    \min\!\left(
+    1,
+    \exp\!\left(-\dfrac{\mathcal{J}_H(\hat z';d)-\mathcal{J}_H(z_{\mathrm{cur}};d)}{T(u)}\right)
+    \right),
     \]
     and non-deployable candidates ($\mathcal{J}_H(\hat z';d)=+\infty$) are rejected,
     setting $z_{\mathrm{cur}}\leftarrow\hat z'$ on acceptance,
@@ -1884,15 +2134,29 @@ r_H^{\mathcal J}(s,a)
 denote the underlying objective-improvement signal. Along reachable
 trajectories this quantity is nonnegative and finite.
 
-A planner-facing implementation must define a reward encoder
+A planner-facing implementation must define a controller-specific reward
+encoding domain
 \[
-\Omega_H:\mathbb{R}_{\ge 0}\to \mathcal{R}_B^{\mathrm{enc}}
+\mathcal{D}_H^R\subseteq\mathbb{R}_{\ge 0},
+\]
+a reward encoder
+\[
+\Omega_H:\mathcal{D}_H^R\to \mathcal{R}_B^{\mathrm{enc}}
 \]
 and a semantic reward decoder
 \[
 V_H:\mathcal{R}_B^{\mathrm{enc}}\to\mathbb{R}_{\ge 0}
 \]
-according to the controller-induced reward semantics.
+according to the controller-induced reward semantics. For
+exact-objective-difference semantics, \(\mathcal{D}_H^R\) is the represented
+reachable subset of the finite scalar representation
+\(\mathbb{V}_H^{\mathcal J}\) defined below. For
+normalized-clipped-improvement semantics, \(\mathcal{D}_H^R=[0,1]\) after
+clipping and normalization. For quantized objective-difference semantics, one
+may take \(\mathcal{D}_H^R=\mathbb{R}_{\ge 0}\). When later formulas write
+\(\Omega_H(r)\) directly on the underlying objective-improvement signal, that
+notation denotes the controller-specific composite map obtained after any
+required deterministic preprocessing.
 
 For exact-objective-difference semantics, the implementation must fix a
 finite canonical scalar representation
@@ -1950,12 +2214,6 @@ if $2^{b_R}$ is too small for the declared representation, or if the evaluator
 cannot guarantee that all exact-mode objective values and differences are
 represented exactly.
 
-The syntactically present interface fields \texttt{min\_reward},
-\texttt{max\_reward}, and \texttt{reward\_offset} are legacy conveniences for
-the special case where $\mathbb{V}_H^{\mathcal J}$ is an integer interval
-encoded by an affine integer map; they are not the general exact reward
-semantics.
-
 For quantized objective-difference semantics, the implementation must declare
 a deterministic quantizer
 \[
@@ -1978,19 +2236,27 @@ $\mathcal{J}_H$ planner theorems apply only to the quantized objective induced
 by $V_H^{\mathrm{quant}}\circ Q_H^{\mathrm{quant}}$, not to the original
 real-valued objective unless the quantizer is exact on the reachable reward set.
 
-For normalized-clipped-improvement semantics, define
+For normalized-clipped-improvement semantics, define the unit-interval clamp
 \[
 \operatorname{clamp}_{[0,1]}(x):=\min\!\bigl(\max(x,0),1\bigr)
 \]
-and
+and the controller-specific clipping parameters
+\[
+\begin{aligned}
+r_{\min}^{\mathrm{clip}}&:=\texttt{controller.min\_improvement},\\
+r_{\max}^{\mathrm{clip}}&:=\texttt{controller.max\_improvement},\\
+r_{\max}^{\mathrm{clip}}&>r_{\min}^{\mathrm{clip}}.
+\end{aligned}
+\]
+Then define the normalized clipped improvement by
 \[
 \widehat r_H(r)
 :=
 \operatorname{clamp}_{[0,1]}
 \left(
-\frac{r-r_{\min}}{r_{\max}-r_{\min}}
+\frac{r-r_{\min}^{\mathrm{clip}}}{r_{\max}^{\mathrm{clip}}-r_{\min}^{\mathrm{clip}}}
 \right),
-\qquad r_{\max}>r_{\min}.
+\qquad r_{\max}^{\mathrm{clip}}>r_{\min}^{\mathrm{clip}}.
 \]
 The implementation must define a finite immediate-reward encoder
 \[
@@ -2227,28 +2493,32 @@ Section~\ref{sec:ahc-runtime}.
 For every valid candidate $z$, the neighborhood $\mathcal{N}_B(z)$ is finite and effectively enumerable; canonicalization and validity checks terminate.
 \end{assumption}
 
-\begin{assumption}[Positive proposal support for annealed controller]\label{ass:positive-proposal-support}
-Let $z_{\mathrm{src}}(s)$ be the proposal-source component of state $s$. For
-each reachable proposal state $s$ and each
-$z'\in \mathcal{N}_B\big(z_{\mathrm{src}}(s)\big)$, there exists at least one action
-$a\in\mathcal{A}_B$ and candidate $z\in\mathcal{Z}$ such that either
+\begin{assumption}[Positive reversible proposal support for default annealer]\label{ass:positive-proposal-support}
+For each reachable canonical current candidate $z$, elapsed fraction $u$, and
+certified active neighboring candidate $z'$ reachable by the elementary-edit
+compiler at that elapsed fraction, there exists at least one descriptor
+$e\in\mathcal{E}_B$ such that
 \[
-\mu_B^{\mathrm{tot}}(a,s)=(z,0)
+A_{B,u}(e,z)=z'.
 \]
-in deterministic form, or
+Equivalently,
 \[
-\mu_B^{\mathrm{tot}}\big((z,0)\mid a,s\big)>0
+q_{B,u}(z'\mid z)>0.
 \]
-in stochastic form, and $\operatorname{canon}(z)=z'$. Under the specified
-uniform policy
+By symmetry of the certified reversible kernel at fixed $u$,
 \[
-\pi_T(a\mid s,B)=1/N_B^{\mathrm{compile}}(B),
-\]
-this implies
-\[
-q_T(z'\mid s,B)>0.
+q_{B,u}(z'\mid z)=q_{B,u}(z\mid z').
 \]
 \end{assumption}
+
+\begin{remark}[Symmetry removes the Hastings correction]
+Under the default reversible elementary kernel of
+Section~\ref{sec:reversible-annealer-kernel}, positive proposal support for a
+non-self transition at fixed elapsed fraction $u$ automatically implies the
+same positive support in the reverse direction at that same $u$. Therefore the
+acceptance rule depends only on the objective difference and temperature; no
+reverse-source proposal-mass accounting is required.
+\end{remark}
 
 \begin{assumption}[Per-iteration overhead lower bound]\label{ass:iter-overhead-lb}
 There exists $h_{\min}>0$ such that each loop iteration consumes at least $h_{\min}$ wall-clock seconds including proposal, canonicalization, validation, cache lookup, and bookkeeping.
@@ -2272,23 +2542,37 @@ producing a strictly better incumbent is at least $p_*>0$. Then
 Consequently, the probability of no improvement by horizon $H$ decays at least geometrically.
 \end{proposition}
 
-\begin{proposition}[Non-asymptotic acceptance envelope]\label{prop:accept-envelope}
-For a deployable uphill proposal with objective gap
-$\Delta\mathcal{J}=\mathcal{J}_H(z';d)-\mathcal{J}_H(z_{\mathrm{cur}};d)>0$ at
-elapsed fraction $u$, acceptance probability is
+\begin{proposition}[Non-asymptotic Metropolis acceptance envelope]\label{prop:accept-envelope}
+For a deployable proposal $z'$ from current candidate $z_{\mathrm{cur}}$ at
+elapsed fraction $u$ under the default reversible elementary kernel, let
 \[
-\mathbb{P}_{\mathrm{accept}}(u)=\exp\!\left(-\frac{\Delta\mathcal{J}}{T(u)}\right).
+\Delta\mathcal{J}:=\mathcal{J}_H(z';d)-\mathcal{J}_H(z_{\mathrm{cur}};d).
 \]
-With log-linear cooling and $T_{\min}\le T(u)\le T_0$, this implies
+Then
+\[
+\mathbb{P}_{\mathrm{accept}}(u)=
+\min\!\left(1,
+\exp\!\left(-\dfrac{\Delta\mathcal{J}}{T(u)}\right)
+\right).
+\]
+
+For an uphill proposal with $\Delta\mathcal{J}>0$,
+\[
+\mathbb{P}_{\mathrm{accept}}(u)=
+\exp\!\left(-\frac{\Delta\mathcal{J}}{T(u)}\right).
+\]
+If $T_0>T_{\min}>0$ and
+\[
+T(u)=T_{\min}\left(\frac{T_0}{T_{\min}}\right)^{1-u},
+\]
+then $\mathbb{P}_{\mathrm{accept}}(u)$ is non-increasing in $u$, and
 \[
 \exp\!\left(-\frac{\Delta\mathcal{J}}{T_{\min}}\right)
 \le
 \mathbb{P}_{\mathrm{accept}}(u)
 \le
-\exp\!\left(-\frac{\Delta\mathcal{J}}{T_0}\right),
+\exp\!\left(-\frac{\Delta\mathcal{J}}{T_0}\right).
 \]
-and $\mathbb{P}_{\mathrm{accept}}(u)$ is monotone decreasing in elapsed fraction
-$u$ (strictly on $u\in[0,1)$).
 \end{proposition}
 
 \begin{remark}
@@ -2458,6 +2742,8 @@ The structured report should record at minimum:
     \item crate/tool version,
     \item feature set (if available),
     \item seed,
+    \item timing-certification tier and determinism/deadline certificate (if
+    theorem certification is claimed),
     \item configured throughput floor $\theta_{\min}$ and derived runtime cap
     $\tau_{\theta}=N_H(d)/\theta_{\min}$, with $\tau_{\theta}=n/\theta_{\min}$
     in passive-byte mode,
@@ -2470,7 +2756,9 @@ The structured report should record at minimum:
     \item self-improvement round count $R_{\mathrm{si}}$ and realized per-round trace counts (if enabled),
     \item bounds hash,
     \item candidate canonicalization classification identifier/version (or hash commitment),
-    \item observation-adapter or exact-state encoder specification (or hash commitment),
+    \item observation-adapter specification (or hash commitment), theorem-side
+    exact-state encoder specification (or hash commitment), and provenance flag
+    for exact-state observation certification,
     \item output candidate canonical hash and output config path.
 \end{itemize}
 
@@ -2481,6 +2769,10 @@ Use the canonical key definition from Section~\ref{sec:canon-cache}:
 \mathrm{Key}_{\mathrm{cache}}(z,\eta_{\mathrm{eval}},d)=
 \Big(\operatorname{ser}(\operatorname{canon}(z)),\eta_{\mathrm{eval}},\operatorname{Hash}(d)\Big).
 \]
+
+In runtime loops with remaining-budget truncation,
+$\eta_{\mathrm{eval}}$ must include the effective evaluation timeout
+$T_{\mathrm{eff}}=\min(T_{\mathrm{eval}},B_t)$ used for that call.
 
 For all controller paths, before evaluating a canonical candidate $\hat z$, the
 runtime must query the cache key above instantiated at
@@ -2507,13 +2799,18 @@ controller and to planner controllers under the objective-aligned
 objective-difference reward path from
 Section~\ref{sec:reward-observation}.
 
-No claim of global optimality is made under finite budgets. The exact guarantee is that uphill moves have strictly positive acceptance probability under annealing:
+No claim of global optimality is made under finite budgets. Under the default
+reversible elementary Metropolis rule, any deployable uphill move reachable by
+the certified proposal grammar has strictly positive acceptance probability:
 \[
-\Delta\mathcal{J}>0,\ T(u)>0
+\Delta\mathcal{J}>0,\ T(u)>0,\ q_{B,u}(z'\mid z_{\mathrm{cur}})>0
 \implies
-\mathbb{P}_{\mathrm{accept}}(u)=\exp(-\Delta\mathcal{J}/T(u))>0,
+\mathbb{P}_{\mathrm{accept}}(u)=
+\exp(-\Delta\mathcal{J}/T(u))>0.
 \]
-whereas deterministic hill climbing assigns probability $0$ to uphill moves.
+Thus the default certified annealer retains the usual Metropolis uphill-move
+mechanism, whereas deterministic hill climbing assigns probability $0$ to
+uphill moves.
 
 The asymptotic claims in this document are:
 \begin{itemize}
@@ -2549,10 +2846,31 @@ Fix a hardware/evaluator profile
 \begin{aligned}
 H=\bigl(&\text{machine class},\text{CPU pinning policy},\text{RAM cap},\\
 &\text{build/features},\eta_{\mathrm{eval}},\\
-&\text{wall-clock timing methodology},\text{seed policy}\bigr).
+&\text{wall-clock timing methodology},\text{timing certification tier},\\
+&\text{determinism/deadline certificate},\text{seed policy}\bigr).
 \end{aligned}
 \]
 All planner-facing semantics below are defined relative to $H$.
+
+\begin{definition}[Timing-certification tier]
+The evaluator profile $H$ declares one of the following timing tiers:
+\begin{enumerate}
+    \item \texttt{best\_effort}: ordinary operating-system timing; suitable for
+    heuristic tuning and reporting, but not for theorem-certified
+    wall-clock-dependent claims;
+    \item \texttt{isolated}: CPU affinity, fixed governor, controlled
+    background load, memory limits, and reproducibility metadata;
+    \item \texttt{real\_time}: real-time scheduler or hard-real-time operating
+    system with declared deadline, preemption, memory-locking, and interrupt
+    isolation policy;
+    \item \texttt{deterministic\_table}: evaluator metrics are taken from a
+    frozen semantic table $M_H^\circ$, not measured online.
+\end{enumerate}
+Planner theorems involving wall-clock-dependent observations, rewards, or
+transitions may be certified only under \texttt{real\_time} with a recorded
+determinism/deadline certificate, or under
+\texttt{deterministic\_table}.
+\end{definition}
 
 Unless explicitly stated otherwise, this section applies to the fixed canonical
 dataset object $d$ selected by the input contract. The planner-facing exact
@@ -2568,8 +2886,9 @@ $c_{\mathrm{phys}}(z)$ and a finite-coder overhead relation between
 $8c_{\mathrm{phys}}(z)$ and $\ell_H(z)$.
 
 The exact MC-AIXI convergence claims below require a finite planner-exposed
-candidate domain, deterministic evaluator semantics, exact-state observation
-when observed-Markov claims are invoked, and exact finite reward encoding of
+candidate domain, deterministic evaluator semantics, theorem-certified timing
+for any wall-clock-dependent quantities, exact-state observation when
+observed-Markov claims are invoked, and exact finite reward encoding of
 objective differences as specified in
 Remark~\ref{rem:reward-encoding-safety}. They do not require $d$ to be a
 passive-byte dataset.
@@ -2643,6 +2962,27 @@ compressed bytes is assumed. When a material encoded artifact exists, its
 physical byte length $c_H(z)$ is diagnostic/reporting only. The exact planner
 objective uses $\ell_H(z)$ directly.
 \end{assumption}
+
+\begin{remark}[Deterministic timing requirement for theorem mode]
+The exact finite-MDP, exact observed-Markov, and planner-convergence claims
+require $M_H^\circ$ to be a deterministic semantic map. Ordinary wall-clock
+measurements are admissible for operational tuning, but they are not by
+themselves theorem-certified semantic values.
+
+For theorem-certified runs, the implementation must therefore use either:
+\begin{enumerate}
+    \item timing tier \texttt{real\_time} with a recorded
+    determinism/deadline certificate, meaning a real-time scheduler or hard
+    real-time operating system together with declared deadline, interrupt,
+    memory-locking, and preemption policy; or
+    \item timing tier \texttt{deterministic\_table}, where evaluator outputs
+    are taken from a frozen semantic table fixed before planner interaction.
+\end{enumerate}
+Timing tiers \texttt{best\_effort} and \texttt{isolated} remain conforming for
+operational tuning and reporting, but any wall-clock-dependent exact-MDP,
+exact observed-Markov, or planner-convergence claim is then reported as
+uncertified.
+\end{remark}
 
 For successful candidates under profile $H$, define throughput
 \[
@@ -2736,21 +3076,18 @@ b_R:=\texttt{reward\_bits}\in\mathbb{N},\qquad b_R\ge 1,
 \qquad
 \mathcal{R}_B^{\mathrm{enc}}:=\{0,\dots,2^{b_R}-1\}.
 \]
-For \texttt{normalized\_clipped\_improvement}, the clipping fields
-\texttt{min\_reward} and \texttt{max\_reward} define only the normalization
-interval used by Section~\ref{sec:aiqi-discounted-contract}; they do not define
-an exact integer reward interval.
-
-For the legacy affine integer exact-encoding shortcut, additionally define
+For \texttt{normalized\_clipped\_improvement}, additionally fix the
+controller-specific clipping parameters
 \[
-r_{\min}:=\texttt{min\_reward}\in\mathbb{Z},
-\qquad
-r_{\max}:=\texttt{max\_reward}\in\mathbb{Z},
-\qquad
-\rho_{\mathrm{off}}:=\texttt{reward\_offset}\in\mathbb{Z},
+\begin{aligned}
+r_{\min}^{\mathrm{clip}}&:=\texttt{controller.min\_improvement},\\
+r_{\max}^{\mathrm{clip}}&:=\texttt{controller.max\_improvement},\\
+r_{\max}^{\mathrm{clip}}&>r_{\min}^{\mathrm{clip}}.
+\end{aligned}
 \]
-with $r_{\max}>r_{\min}$. This shortcut is optional and is subsumed by the
-general finite reward encoder $\Omega_H$.
+These parameters determine only the normalization interval used by
+Section~\ref{sec:aiqi-discounted-contract}; they are not part of exact
+objective-difference semantics.
 Initialization must verify cardinality consistency
 \[
 |\mathcal{A}_B|=\texttt{agent\_actions}
@@ -2761,6 +3098,26 @@ with configuration error \texttt{action\_alphabet\_mismatch}.
 Let $\Theta_H$ be the complete \emph{finite} auxiliary-state set containing
 exactly the remaining variables, if any, that influence future planner-facing
 dynamics and are not functions of proposal source and incumbent alone.
+
+\begin{remark}[Cache and budget variables are state unless theorem-inert]
+For runtime planner-controller execution, cache contents, the set of evaluated
+or cache-reused candidates, remaining wall-clock budget, evaluation counters,
+controller RNG state, proposal RNG state, and any pending delayed-label
+buffers can influence future emitted observations, rewards, termination, or
+final output.
+
+Therefore, for any theorem claiming the finite-MDP or observed-Markov path, a
+conforming implementation must do exactly one of the following:
+\begin{enumerate}
+    \item include these variables explicitly in $\Theta_H$; or
+    \item prove and record in provenance that they are planner-facing inert
+    under the theorem semantics, for example because the theorem model uses a
+    fixed semantic evaluator table $M_H^\circ$, ignores cache-hit timing as an
+    observation, and uses the budget-free finite-horizon variant.
+\end{enumerate}
+Absent one of these two conditions, the finite-MDP and exact observed-Markov
+claims are disabled for that run.
+\end{remark}
 
 \begin{assumption}[No hidden state outside chosen state tuple]\label{ass:no-hidden}
 Every implementation variable that influences future emitted observation,
@@ -2914,6 +3271,50 @@ The embedding uses the \emph{exact-state observation path} if $\Psi_H$ is
 injective.
 \end{definition}
 
+\begin{definition}[Exact-state observation certificate]
+A run has an \emph{exact-state observation certificate} if the implementation
+constructs, records in provenance, and validates a theorem-side encoder
+\[
+\Psi_H:\mathcal{S}_H\to\mathcal{O}_B^{L_O}
+\]
+and verifies that $\Psi_H$ is injective on the planner state space relevant to
+the claimed theorem.
+
+The public observation pipeline
+\[
+(\texttt{observation\_bits},
+\texttt{observation\_stream\_len},
+\texttt{observation\_key\_mode},
+\Psi_O)
+\]
+is the runtime observation/keying interface. It does not by itself license the
+exact observed-Markov claims unless it is also used to construct an injective
+$\Psi_H$, or unless an implementation supplies a separate injective $\Psi_H$
+and records the relationship between the public pipeline and $\Psi_H$ in
+provenance.
+\end{definition}
+
+\begin{remark}[Runtime bridge for exact-state claims]
+At planner-controller initialization, the implementation must set a provenance
+flag
+\[
+\texttt{exact\allowbreak\_state\allowbreak\_observation\allowbreak\_certified}
+\in\{\texttt{true},\texttt{false}\}.
+\]
+It may set this flag to \texttt{true} only after constructing a concrete
+$\Psi_H$ and verifying its injectivity on the relevant finite state space, or
+after loading a proof/certificate accepted by the implementation.
+
+If the flag is \texttt{false}, the run may still execute normally, but reports
+must not claim the exact observed-$1$-Markov path or any theorem that depends
+on injective $\Psi_H$.
+
+Among built-in public key modes, \texttt{"full\_stream"} is the only default
+candidate for this certificate. The modes \texttt{"first"},
+\texttt{"last"}, and \texttt{"stream\_hash"} are lossy unless a separate
+injectivity proof is supplied for the concrete finite state space.
+\end{remark}
+
 A sufficient cardinality condition is
 \[
 2^{b_OL_O}\ge |\mathcal{S}_H|.
@@ -2931,16 +3332,10 @@ construct the corresponding injective encoder $\Omega_H$ and decoder $V_H$.
 If this check fails, initialization aborts with configuration error
 \texttt{reward\_encoding\_unsafe}.
 
-The older affine integer condition
-\[
-r_{\min}\le 0,\qquad
-r_{\max}\ge \overline R_H,\qquad
-\rho_{\mathrm{off}}=-r_{\min},\qquad
-r_{\max}-r_{\min}\le 2^{b_R}-1
-\]
-is merely a sufficient implementation shortcut for the special case where all
-reachable objective differences are integers in the configured interval. It is
-not the general exact reward-encoding contract.
+A shifted integer-interval encoder is merely a sufficient implementation
+shortcut for the special case where all reachable objective differences are
+already known to lie in a finite integer interval. It is not the general exact
+reward-encoding contract and is not part of the normative document surface.
 
 For quantized objective-difference semantics, the
 runtime uses the declared quantizer contract from
@@ -3310,8 +3705,36 @@ and apply the following execution contract.
         reachable objective differences, and recorded in provenance,
         \item if \texttt{controller.kind} is \texttt{"aiqi\_discounted"}, verify
         only the discounted-controller clipping precondition
-        \texttt{max\_reward > min\_reward}.
+        \[
+        r_{\max}^{\mathrm{clip}}>r_{\min}^{\mathrm{clip}},
+        \]
+        equivalently
+        \[
+        \texttt{controller.max\_improvement}
+        >
+        \texttt{controller.min\_improvement}.
+        \]
     \end{itemize}
+    \item construct or classify the theorem-side observation encoder
+    $\Psi_H:\mathcal{S}_H\to\mathcal{O}_B^{L_O}$ and record provenance flag
+    \texttt{exact\allowbreak\_state\allowbreak\_observation\allowbreak\_certified}. This flag may be set to
+    \texttt{true} only if the implementation has constructed a concrete
+    $\Psi_H$ and verified injectivity on the relevant finite state space, or
+    has loaded an accepted proof/certificate of that injectivity. If the flag
+    is \texttt{false}, runtime may continue, but reports must not claim the
+    exact observed-$1$-Markov path or any theorem requiring injective
+    $\Psi_H$. If theorem-facing reports request such claims without the
+    certificate, initialization must either abort with configuration error
+    \texttt{exact\allowbreak\_state\allowbreak\_observation\allowbreak\_uncertified} or continue with those
+    claims disabled,
+    \item if theorem-facing reports request exact finite-MDP,
+    exact observed-Markov, or planner-convergence certification, verify that
+    the timing-certification tier in $H$ is either
+    \texttt{real\_time} with a recorded determinism/deadline certificate or
+    \texttt{deterministic\_table}. Otherwise initialization must either abort
+    with configuration error
+    \texttt{timing\allowbreak\_theorem\allowbreak\_uncertified} or continue
+    with those theorem-facing claims disabled,
     \item instantiate planner-facing environment state $s_0\in\mathcal{S}_H$
     with the post-warmup baseline incumbent satisfying the normative baseline
     precondition from Section~\ref{subsec:baseline-precondition}
@@ -3387,14 +3810,31 @@ over all real evaluations performed across all rounds.
 Controller-specific search-control dynamics may differ, but scoring/output
 semantics and candidate-validity semantics remain shared.
 
+\begin{remark}[Heuristic-mode boundary for controller execution]
+Within the planner-controller family, two kinds of runs are permitted by this
+specification. Exact-theorem-facing runs are those that satisfy the explicit
+certification conditions stated later for reward encoding, state exposure,
+timing, and the exact warm-start controller path. Heuristic-mode runs are
+still conforming controller executions, but they are outside those theorem
+certifications; this includes the discounted/bin-quantized
+\texttt{aiqi\_discounted} path, any planner run using explicit exploration
+parameters, and any annealer run that leaves the certified reversible
+elementary Metropolis kernel or the optional certified
+\texttt{compiled\_uniform\_metropolis\_hastings} profile in favor of
+heuristic macro moves, adaptive proposals, or non-certified acceptance laws.
+This boundary affects theorem-facing claims only: deployability semantics,
+candidate scoring, invalid/inapplicable handling, and final output selection
+remain shared unless a section explicitly states otherwise.
+\end{remark}
+
 \subsection{Normative discounted AIQI controller contract}
 \label{sec:aiqi-discounted-contract}
 
 This subsection is normative for
 \texttt{controller.kind = aiqi\_discounted}. It defines a
-discounted/bin-quantized heuristic controller path and does \emph{not} provide
-exact-$\mathcal{J}_H$ guarantees for finite-horizon objective alignment.
-It uses the controller-induced
+discounted, bin-quantized heuristic controller path. It does \emph{not}
+provide exact-$\mathcal{J}_H$ finite-horizon objective-alignment guarantees.
+The controller uses the induced
 \texttt{"normalized\_clipped\_improvement"} reward semantics.
 
 Define controller parameters
@@ -3408,6 +3848,14 @@ M:=\texttt{return\_bins}\in\mathbb{N},
 \qquad
 M\text{ is a power of two}.
 \]
+\[
+\begin{aligned}
+r_{\min}^{\mathrm{clip}}&:=\texttt{controller.min\_improvement},\\
+r_{\max}^{\mathrm{clip}}&:=\texttt{controller.max\_improvement},\\
+r_{\max}^{\mathrm{clip}}&>r_{\min}^{\mathrm{clip}}.
+\end{aligned}
+\]
+These are the explicit clipping parameters for the discounted controller.
 
 Define clamp on unit interval
 \[
@@ -3417,9 +3865,9 @@ Let
 \[
 r_t:=\mathcal{J}_H(b_t;d)-\mathcal{J}_H(b_{t+1};d)
 \]
-denote the underlying incumbent-improvement source signal. Under
-the normalized-clipped-improvement reward semantics, the
-discounted controller observes the finite reward symbol
+denote the underlying incumbent-improvement source signal. Under the
+normalized-clipped-improvement reward semantics, the discounted controller
+clips and normalizes this signal and then observes the finite reward symbol
 \[
 \Omega_H(r_t)
 =
@@ -3427,7 +3875,7 @@ discounted controller observes the finite reward symbol
 \left(
 \operatorname{clamp}_{[0,1]}
 \left(
-\frac{r_t-r_{\min}}{r_{\max}-r_{\min}}
+\frac{r_t-r_{\min}^{\mathrm{clip}}}{r_{\max}^{\mathrm{clip}}-r_{\min}^{\mathrm{clip}}}
 \right)
 \right)
 \]
@@ -4135,7 +4583,9 @@ realized trajectory.
 
 This specification defines a complete constrained tuning capability for
 \texttt{infotheory}. It formalizes a single deployable two-part objective
-$\mathcal{J}_H(z;d)=8L_B(z)+\ell(z)$ with hard deployability constraints
+$\mathcal{J}_H(z;d)=8L_B(z)+\ell(z)$ in the generic evaluator notation, with
+$\ell_H(z)$ denoting the fixed-profile specialization used in the
+planner-controller sections, together with hard deployability constraints
 (throughput and memory caps),
 mutation grammar, annealed hill-climbing runtime,
 MC-AIXI and AIQI-family runtime environment paths,
