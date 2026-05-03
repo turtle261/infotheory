@@ -19,6 +19,7 @@ anyhow = "1.0.100"
 ahash = { version = "0.8.12", default-features = false, features = ["std", "no-rng"] }
 crc32fast = "1.5.0"
 wide = "1.1.1"
+libc = { version = "0.2.177", optional = true }
 
 [features]
 default = ["default-backends", "aixi"]
@@ -48,6 +49,7 @@ capability-archive = [
 ]
 capability-vm = ["aixi-vm"]
 aixi = []
+tuner = ["aixi", "dep:libc"]
 aixi-gameengine = ["aixi", "dep:gameengine", "gameengine/builtin"]
 aixi-gameengine-physics = ["aixi-gameengine", "gameengine/physics"]
 aixi-vm = ["vm"]

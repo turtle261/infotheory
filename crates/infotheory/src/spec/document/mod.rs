@@ -1,6 +1,8 @@
 //! Canonical top-level specification documents for planner runs and tuning.
 
-use super::core::{CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend};
+#[cfg(feature = "tuner")]
+use super::core::CompiledCompressionBackend;
+use super::core::{CanonicalBytes, CompiledRateBackend};
 use super::{
     SpecEnvironment, SpecError, SpecResult, compression_backend_to_json_value,
     parse_compression_backend_json, parse_rate_backend_json, rate_backend_to_json_value,
@@ -18,6 +20,7 @@ pub const SPEC_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 
 const DOCUMENT_MAGIC: &[u8; 4] = b"itsd";
 const DOCUMENT_BINARY_VERSION: u8 = 1;
+#[cfg(feature = "tuner")]
 const TUNE_CANONICALIZATION_CLASSIFICATION_VERSION: &str = "bounds-v1";
 
 mod binary;
@@ -53,6 +56,7 @@ impl ValidatedPlannerRunSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl ValidatedTuneSpec {
     /// Canonical validated tune spec.
     pub fn canonical_spec(&self) -> &TuneSpec {
@@ -66,6 +70,13 @@ impl ValidatedTuneSpec {
 
     /// Compile the validated tune request into resolved assets and compiled backends.
     pub fn compile(&self) -> SpecResult<CompiledTuneSpec> {
+        #[cfg(not(feature = "tuner"))]
+        {
+            return Err(SpecError::new(
+                "tune documents require infotheory built with feature 'tuner'",
+            ));
+        }
+        #[cfg(feature = "tuner")]
         pipeline::compile_validated_tune_spec(self)
     }
 }
@@ -103,6 +114,7 @@ impl ValidatedSpecDocument {
     pub fn canonical_bytes(&self) -> &CanonicalBytes {
         match self {
             Self::PlannerRun(validated) => validated.canonical_bytes(),
+            #[cfg(feature = "tuner")]
             Self::Tune(validated) => validated.canonical_bytes(),
             Self::RateBackend(validated) => validated.canonical_bytes(),
             Self::CompressionBackend(validated) => validated.canonical_bytes(),
@@ -115,6 +127,7 @@ impl ValidatedSpecDocument {
             Self::PlannerRun(validated) => {
                 Ok(CompiledSpecDocument::PlannerRun(validated.compile()?))
             }
+            #[cfg(feature = "tuner")]
             Self::Tune(validated) => Ok(CompiledSpecDocument::Tune(validated.compile()?)),
             Self::RateBackend(validated) => {
                 Ok(CompiledSpecDocument::RateBackend(validated.compile()?))
@@ -131,6 +144,7 @@ impl CompiledSpecDocument {
     pub fn canonical_bytes(&self) -> &CanonicalBytes {
         match self {
             Self::PlannerRun(compiled) => compiled.canonical_bytes(),
+            #[cfg(feature = "tuner")]
             Self::Tune(compiled) => compiled.canonical_bytes(),
             Self::RateBackend(compiled) => compiled.canonical_bytes(),
             Self::CompressionBackend(compiled) => compiled.canonical_bytes(),
@@ -142,6 +156,7 @@ impl CompiledSpecDocument {
 pub type PlannerRunDocument = PlannerRunSpec;
 
 /// Compatibility alias for a tune top-level spec document.
+#[cfg(feature = "tuner")]
 pub type TuneDocument = TuneSpec;
 
 impl PlannerRunSpec {
@@ -208,6 +223,7 @@ impl BuiltinEnvironmentSpec {
     /// it does not change when new builtins are added.
     pub fn canonical_name(&self) -> &'static str {
         match self {
+            Self::TunerBridge => "tuner_bridge",
             Self::CoinFlip => "coin_flip",
             Self::BiasedRockPaperScissor => "biased_rock_paper_scissor",
             Self::KuhnPoker => "kuhn_poker",
@@ -219,17 +235,28 @@ impl BuiltinEnvironmentSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl TuneSpec {
     /// Validate this tune request and return its canonical binary encoding.
     pub fn validate_in(&self, env: &SpecEnvironment) -> SpecResult<ValidatedTuneSpec> {
-        let canonical = pipeline::canonicalize_tune_spec(self, env)?;
-        Ok(ValidatedTuneSpec {
-            canonical_bytes: CanonicalBytes::from(binary::encode_spec_document_payload(
-                &SpecDocument::Tune(canonical.clone()),
-            )),
-            canonical_spec: Arc::new(canonical),
-            base_dir: env.base_dir().to_path_buf(),
-        })
+        #[cfg(not(feature = "tuner"))]
+        {
+            let _ = env;
+            return Err(SpecError::new(
+                "tune documents require infotheory built with feature 'tuner'",
+            ));
+        }
+        #[cfg(feature = "tuner")]
+        {
+            let canonical = pipeline::canonicalize_tune_spec(self, env)?;
+            Ok(ValidatedTuneSpec {
+                canonical_bytes: CanonicalBytes::from(binary::encode_spec_document_payload(
+                    &SpecDocument::Tune(canonical.clone()),
+                )),
+                canonical_spec: Arc::new(canonical),
+                base_dir: env.base_dir().to_path_buf(),
+            })
+        }
     }
 
     /// Validate this tune request using the default compilation environment.
@@ -239,6 +266,14 @@ impl TuneSpec {
 
     /// Validate and compile this tune request using the supplied environment.
     pub fn compile_in(&self, env: &SpecEnvironment) -> SpecResult<CompiledTuneSpec> {
+        #[cfg(not(feature = "tuner"))]
+        {
+            let _ = env;
+            return Err(SpecError::new(
+                "tune documents require infotheory built with feature 'tuner'",
+            ));
+        }
+        #[cfg(feature = "tuner")]
         pipeline::compile_tune_spec(self, env.base_dir())
     }
 
@@ -289,6 +324,7 @@ impl SpecDocument {
     pub fn validate_in(&self, env: &SpecEnvironment) -> SpecResult<ValidatedSpecDocument> {
         match self {
             Self::PlannerRun(spec) => Ok(ValidatedSpecDocument::PlannerRun(spec.validate_in(env)?)),
+            #[cfg(feature = "tuner")]
             Self::Tune(spec) => Ok(ValidatedSpecDocument::Tune(spec.validate_in(env)?)),
             Self::RateBackend(backend) => Ok(ValidatedSpecDocument::RateBackend(
                 backend.validate_in(env)?,
@@ -318,6 +354,7 @@ impl SpecDocument {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::PlannerRun(_) => "planner_run",
+            #[cfg(feature = "tuner")]
             Self::Tune(_) => "tune",
             Self::RateBackend(_) => "rate_backend",
             Self::CompressionBackend(_) => "compression_backend",
@@ -331,8 +368,16 @@ impl CanonicalJson for PlannerRunSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl CanonicalJson for TuneSpec {
     fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value> {
+        #[cfg(not(feature = "tuner"))]
+        {
+            return Err(SpecError::new(
+                "tune documents require infotheory built with feature 'tuner'",
+            ));
+        }
+        #[cfg(feature = "tuner")]
         serializer::tune_spec_to_json_value(self)
     }
 }
@@ -413,6 +458,7 @@ impl CompiledPlannerRunSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl CompiledTuneSpec {
     /// Canonical tune request used to build this compiled form.
     pub fn canonical_spec(&self) -> &TuneSpec {
@@ -513,6 +559,7 @@ impl fmt::Debug for ValidatedPlannerRunSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl fmt::Debug for ValidatedTuneSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValidatedTuneSpec")

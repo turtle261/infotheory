@@ -36,6 +36,8 @@ pub enum GameEngineEnvironmentError {
         /// Configured coin-flip head denominator.
         head_denominator: u64,
     },
+    /// The internal tuner bridge was requested as a standalone runtime environment.
+    TunerBridgeOnly,
     /// Requested builtin requires an optional feature that is disabled.
     MissingFeature {
         /// Builtin environment that was requested.
@@ -61,6 +63,9 @@ impl std::fmt::Display for GameEngineEnvironmentError {
             } => write!(
                 f,
                 "invalid coin-flip bias: expected 0 <= numerator <= denominator (got {head_numerator}/{head_denominator})"
+            ),
+            Self::TunerBridgeOnly => f.write_str(
+                "builtin environment 'tuner_bridge' is an internal tuner planner bridge and cannot be run as a standalone GameEngine environment",
             ),
             Self::MissingFeature { builtin, feature } => write!(
                 f,
@@ -276,6 +281,7 @@ pub fn build_builtin_environment_with_seed(
     seed: u64,
 ) -> Result<Box<dyn Environment>, GameEngineEnvironmentError> {
     match builtin {
+        BuiltinEnvironmentSpec::TunerBridge => Err(GameEngineEnvironmentError::TunerBridgeOnly),
         BuiltinEnvironmentSpec::CoinFlip => {
             build_coin_flip_environment_from_config(BiasedCoinFlipConfig::default(), seed)
         }

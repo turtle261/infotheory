@@ -1499,6 +1499,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "gameengine",
+ "libc",
  "num_cpus",
  "nyx-lite",
  "once_cell",

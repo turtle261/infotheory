@@ -50,6 +50,7 @@ capability-archive = [
 ]
 capability-vm = ["infotheory/capability-vm"]
 aixi = ["infotheory/aixi"]
+tuner = ["infotheory/tuner"]
 aixi-gameengine = ["aixi", "infotheory/aixi-gameengine"]
 aixi-gameengine-physics = ["aixi-gameengine", "infotheory/aixi-gameengine-physics"]
 aixi-vm = ["vm"]

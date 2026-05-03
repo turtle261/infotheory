@@ -9,18 +9,21 @@ pub use self::core::{
     RateBackendTraceStrategy, SpecEnvironment, ValidatedCompressionBackend, ValidatedRateBackend,
 };
 pub use self::document::{
-    AiqiDiscountedControllerSpec, AiqiDiscountedTuneControllerSpec,
-    AnnealedHillClimbingTuneControllerSpec, AssetBinding, AssetId, BuiltinEnvironmentSpec,
-    CompiledPlannerController, CompiledPlannerRunSpec, CompiledSpecDocument,
-    CompiledTuneController, CompiledTuneSpec, ControllerSpec, EnvironmentSpec,
-    McAixiControllerSpec, McAixiFacCtwTuneControllerSpec, ParsedSpecDocument, PlannerInterfaceSpec,
+    AiqiDiscountedControllerSpec, AssetBinding, AssetId, BuiltinEnvironmentSpec,
+    CompiledPlannerController, CompiledPlannerRunSpec, CompiledSpecDocument, ControllerSpec,
+    EnvironmentSpec, McAixiControllerSpec, ParsedSpecDocument, PlannerInterfaceSpec,
     PlannerRunDocument, PlannerRunSpec, PlannerRuntimeSpec, ResolvedAssetBinding,
-    SharedMemoryPolicySpec, SpecDocument, TuneBoundsSpec, TuneControllerKind, TuneControllerSpec,
-    TuneDocument, TuneParameterRangeSpec, TuneSpec, ValidatedPlannerRunSpec, ValidatedSpecDocument,
-    ValidatedTuneSpec, VmActionFilterSpec, VmEnvironmentSpec, VmFuzzMutatorSpec,
-    VmObservationPolicySpec, VmObservationStreamModeSpec, VmPayloadEncodingSpec,
-    VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec,
-    WarmStartExactJhControllerSpec, WarmStartExactJhTuneControllerSpec, load_spec_document,
+    SharedMemoryPolicySpec, SpecDocument, ValidatedPlannerRunSpec, ValidatedSpecDocument,
+    VmActionFilterSpec, VmEnvironmentSpec, VmFuzzMutatorSpec, VmObservationPolicySpec,
+    VmObservationStreamModeSpec, VmPayloadEncodingSpec, VmRewardPolicySpec, VmRewardShapingSpec,
+    VmRuntimeActionSourceSpec, VmTraceSpec, WarmStartExactJhControllerSpec, load_spec_document,
+};
+#[cfg(feature = "tuner")]
+pub use self::document::{
+    AiqiDiscountedTuneControllerSpec, AnnealedHillClimbingTuneControllerSpec,
+    CompiledTuneController, CompiledTuneSpec, McAixiFacCtwTuneControllerSpec, TuneBoundsSpec,
+    TuneControllerKind, TuneControllerSpec, TuneDocument, TuneParameterRangeSpec,
+    TunePlannerInterfaceSpec, TuneSpec, ValidatedTuneSpec, WarmStartExactJhTuneControllerSpec,
 };
 
 use crate::api::{

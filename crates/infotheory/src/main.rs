@@ -47,6 +47,7 @@ use infotheory::aixi::vm_nyx::{
 };
 #[cfg(feature = "vm")]
 use infotheory::aixi::vm_nyx::{NyxVmConfig, NyxVmEnvironment};
+use infotheory::aixi::warmstart::{WarmStartExactJhAgent, WarmStartExactJhTeacherDataset};
 use infotheory::api::*;
 #[cfg(feature = "backend-mamba")]
 use infotheory::mambazip;
@@ -55,7 +56,7 @@ use infotheory::rwkvzip;
 #[cfg(feature = "backend-sequitur")]
 use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
 use infotheory::spec::{
-    self, BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec,
+    self, AssetRef, BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec,
     PlannerRuntimeSpec, SpecDocument,
 };
 #[cfg(all(test, feature = "vm"))]
@@ -92,6 +93,8 @@ use crate::cli::{
 use infotheory::aixi::common::ObservationKeyMode;
 #[cfg(feature = "backend-rosa")]
 use infotheory::search;
+#[cfg(feature = "tuner")]
+use infotheory::tuner;
 
 #[track_caller]
 fn cli_unwrap<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
@@ -442,6 +445,9 @@ enum PlannerControllerRuntime {
     AiqiDiscounted {
         agent: AiqiAgent,
     },
+    WarmStartExactJh {
+        agent: WarmStartExactJhAgent,
+    },
 }
 
 impl PlannerControllerRuntime {
@@ -463,9 +469,17 @@ impl PlannerControllerRuntime {
                 agent: AiqiAgent::from_compiled_planner_run(compiled)
                     .map_err(anyhow::Error::msg)?,
             }),
-            CompiledPlannerController::AiqiWarmstartExactJh { .. } => Err(anyhow::anyhow!(
-                "planner_run controller kind 'aiqi_warmstart_exact_jh' is not executable from the CLI yet"
-            )),
+            CompiledPlannerController::AiqiWarmstartExactJh {
+                teacher_dataset_asset,
+                ..
+            } => {
+                let teacher =
+                    load_warmstart_exact_jh_teacher_dataset(compiled, teacher_dataset_asset)?;
+                Ok(Self::WarmStartExactJh {
+                    agent: WarmStartExactJhAgent::from_compiled_planner_run(compiled, teacher)
+                        .map_err(anyhow::Error::msg)?,
+                })
+            }
             other => Err(anyhow::anyhow!(
                 "planner_run controller kind '{}' is not executable from the CLI",
                 other.kind_str()
@@ -560,8 +574,66 @@ impl PlannerControllerRuntime {
                     .map_err(anyhow::Error::msg)?;
                 Ok(reward)
             }
+            Self::WarmStartExactJh { agent } => {
+                let action = match phase {
+                    PlannerPhase::Learn => agent.get_planned_action_with_extra_exploration(
+                        schedule.extra_exploration(step),
+                    ),
+                    PlannerPhase::Eval => agent.get_planned_action(),
+                };
+                if schedule.log_every > 0 && step % schedule.log_every == 0 {
+                    println!(
+                        "Cycle {}: Action={} Obs={:?} Rew={}",
+                        step, action, ctx.obs_stream, ctx.rew
+                    );
+                }
+                if let Some(logger) = ctx.trace_logger.as_mut() {
+                    logger.log_action(action, ctx.env.get_action_bits())?;
+                }
+                let reward = ctx.perform_action(action)?;
+                if let Some(logger) = ctx.trace_logger.as_mut() {
+                    logger.log_percept(
+                        &ctx.obs_stream,
+                        ctx.rew,
+                        ctx.observation_bits,
+                        ctx.reward_bits,
+                        ctx.reward_offset,
+                    )?;
+                    logger.next_step()?;
+                }
+                agent
+                    .observe_transition(action, &ctx.obs_stream, ctx.rew)
+                    .map_err(anyhow::Error::msg)?;
+                Ok(reward)
+            }
         }
     }
+}
+
+fn load_warmstart_exact_jh_teacher_dataset(
+    compiled: &CompiledPlannerRunSpec,
+    asset_id: &str,
+) -> anyhow::Result<WarmStartExactJhTeacherDataset> {
+    let binding = compiled
+        .resolved_assets()
+        .iter()
+        .find(|entry| entry.id == asset_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown warm-start teacher_dataset_asset '{asset_id}'"))?;
+    let path = match &binding.asset {
+        AssetRef::Filesystem(path) => path,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported warm-start teacher_dataset_asset reference kind"
+            ));
+        }
+    };
+    let bytes = std::fs::read(path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to read warm-start teacher_dataset_asset '{}': {err}",
+            path.display()
+        )
+    })?;
+    WarmStartExactJhTeacherDataset::from_json_slice(&bytes).map_err(anyhow::Error::msg)
 }
 
 fn controller_backend_label(controller: &CompiledPlannerController) -> String {
@@ -756,6 +828,23 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "tuner")]
+fn run_tune_mode(args: &[String]) {
+    match tuner::parse_tune_command_args(args).and_then(|request| tuner::run_tune(&request)) {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!("Error: tune failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(feature = "tuner"))]
+fn run_tune_mode(_args: &[String]) {
+    eprintln!("Error: 'tune' requires infotheory built with feature 'tuner'");
+    std::process::exit(1);
+}
+
 #[cfg(feature = "backend-rosa")]
 fn search_command(args: &[String]) {
     if args.len() < 4 {
@@ -895,6 +984,10 @@ fn main() {
     let primitive = &args[1];
     if primitive == "batch" {
         run_batch_mode();
+        return;
+    }
+    if primitive == "tune" {
+        run_tune_mode(&args);
         return;
     }
 
@@ -1501,6 +1594,7 @@ Primitives:
   Tools:
     search <query> <target> [options]       Search target using info-theoretic ranking
     aixi <config.json>                      Run AIXI agent
+    tune <spec.json|spec.itsd> [options]    Run tuner with executor-side controls
     batch                                   Run in JSON-L batch mode
     generate [file]                         Generate continuation from file or piped stdin
     compress <in> <out>                     Compress file using selected compression backend
@@ -1533,6 +1627,51 @@ Options:
   --temperature <x>       Sampling temperature (default: 1.0)
   --top-k <n>             Sample only from the top-k bytes (0 disables)
   --top-p <p>             Nucleus sampling threshold in (0, 1]
+  --exec-config <path>    Tune executor profile JSON (for `tune`)
+  --max-evaluations <n>   Optional tuning evaluation cap (for `tune`)
+  --annealer-kernel-profile <name>
+                          Tune annealer profile: reversible_elementary_metropolis|compiled_uniform_metropolis_hastings
+  --cpu-affinity <csv>    CPU affinity (comma-separated core ids, for `tune`)
+  --threads <n>           Executor thread hint for tuning runs (for `tune`)
+  --warmup-baseline-runs <n>
+                          Baseline warmup runs before normative baseline eval (for `tune`)
+  --self-improvement-rounds <n>
+                          Optional bounded online delayed-label update rounds (for `tune`)
+  --stagnation-reset-evals <n>
+                          Optional stagnation reset threshold (for `tune`)
+  --log-path <path>       Optional JSONL executor event log output (for `tune`)
+  --diagnostic-chunk-bytes <n>
+                          Diagnostic report chunk size over charged target bytes (for `tune`)
+  --rss-mode <mode>       Memory accounting mode: process_rss_peak|backend_reported|hybrid_strict_max (for `tune`)
+  --planner-deployable-model
+                          Use executor-side planner deployability diagnostics in the evaluator profile (for `tune`)
+  --warmstart-trace-refresh
+                          Rebuild warm-start exact-J_H from merged same-task live traces between rounds (for `tune`)
+  --timing-tier <tier>    Theorem timing tier: best_effort|isolated|real_time|deterministic_table (for `tune`)
+  --determinism-deadline-certificate <ref>
+                          Determinism/deadline certification reference (for `tune`)
+  --deterministic-evaluator-table <ref>
+                          Verified deterministic evaluator table JSON path (for `tune`)
+  --finite-planner-state-certificate <ref>
+                          Verified finite planner-state certificate JSON path (for `tune`)
+  --no-hidden-state-certificate <ref>
+                          Verified no-hidden/inert-state certificate JSON path (for `tune`)
+  --exact-reward-encoding-certificate <ref>
+                          Verified exact reward encoding certificate JSON path (for `tune`)
+  --exact-state-observation-certificate <ref>
+                          Verified exact-state observation certificate JSON path (for `tune`)
+  --observation-adapter-spec-ref <ref>
+                          Observation adapter spec reference (for `tune`)
+  --exact-state-encoder-spec-ref <ref>
+                          Exact-state encoder specification reference (for `tune`)
+  --scalar-representation-ref <ref>
+                          Scalar representation specification reference (for `tune`)
+  --claim-exact-finite-mdp
+                          Request theorem-facing exact finite-MDP claim path (for `tune`)
+  --claim-exact-observed-markov
+                          Request theorem-facing exact observed-Markov claim path (for `tune`)
+  --claim-planner-convergence
+                          Request theorem-facing planner convergence claim path (for `tune`)
 
 Examples:
   infotheory ncd file1.txt file2.txt --compression-backend zpaq --method 5
@@ -2493,7 +2632,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "backend-ctw")]
+    #[cfg(all(feature = "backend-ctw", feature = "tuner"))]
     #[test]
     fn run_aixi_mode_rejects_non_planner_spec_documents() {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2560,7 +2699,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(not(feature = "backend-ctw"))]
+    #[cfg(all(not(feature = "backend-ctw"), feature = "tuner"))]
     #[test]
     fn run_aixi_mode_surfaces_backend_validation_for_non_planner_documents() {
         use std::time::{SystemTime, UNIX_EPOCH};

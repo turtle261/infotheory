@@ -84,7 +84,12 @@ fn cli_usage_and_unknown_primitive_paths_are_stable() {
 
     let help = run_cli(&["--help"], None);
     assert!(help.status.success());
-    assert!(stderr_string(&help).contains("Usage: infotheory"));
+    let help_text = stderr_string(&help);
+    assert!(help_text.contains("Usage: infotheory"));
+    assert!(help_text.contains("--exec-config"));
+    assert!(help_text.contains("--cpu-affinity"));
+    assert!(help_text.contains("--rss-mode"));
+    assert!(help_text.contains("--determinism-deadline-certificate"));
 
     let a_path = temp_path("unknown_a", "txt");
     let b_path = temp_path("unknown_b", "txt");

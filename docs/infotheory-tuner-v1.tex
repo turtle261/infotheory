@@ -583,6 +583,62 @@ Warmup semantics are normative:
 Warmup policy is evaluator-relevant and must be included in
 $\eta_{\mathrm{eval}}$ and provenance.
 
+\subsection{Evaluation counting semantics}
+
+When exposed, \texttt{max\_evaluations} must satisfy
+\[
+E_{\max}:=\texttt{max\_evaluations}\in\mathbb{N},\qquad E_{\max}\ge 1.
+\]
+A value of zero is invalid and must be rejected during executor-profile
+validation.
+
+The executor-side control \texttt{max\_evaluations} determines the maximum
+number of non-warmup candidate results admitted into the search/controller
+state. This count includes the single normative baseline result and includes
+post-baseline candidate results obtained either by fresh evaluator execution or
+by cache reuse. It excludes warmup baseline runs, self-loop proposals,
+inapplicable proposals that do not produce a candidate result, and static
+proposal attempts rejected before candidate-result admission.
+
+Let $k$ be this non-warmup admitted-candidate-result counter. Warmup baseline
+runs do not increment $k$. After the single post-warmup normative baseline
+evaluation succeeds and is admitted as the initial current/incumbent candidate,
+initialize
+\[
+k\leftarrow 1.
+\]
+Before admitting any post-baseline candidate result into the controller
+transition, terminate if
+\[
+k\ge E_{\max}.
+\]
+After each admitted post-baseline candidate result, whether obtained by fresh
+evaluator execution or cache reuse, increment
+\[
+k\leftarrow k+1.
+\]
+
+Therefore the maximum number of post-baseline candidate results admitted by the
+executor is
+\[
+E_{\mathrm{opt}}=E_{\max}-1.
+\]
+When $E_{\max}=1$, the executor performs the normative baseline evaluation and
+admits zero post-baseline candidate results. When the executor stops because
+$k\ge E_{\max}$, that stop condition refers to the baseline-inclusive
+non-warmup admitted-candidate-result counter.
+
+Actual evaluator executions are reported separately from $k$. In particular,
+cache-reused candidate results increment $k$ but do not increment the fresh
+evaluator-execution/cache-miss counter. Warmup baseline runs are reported
+separately and are excluded from both $k$ and cache insertion.
+
+An implementation that counts only post-baseline optimization results under
+the same \texttt{max\_evaluations} field is non-conforming to this v1
+semantics. Such behavior may be exposed only under a distinct executor-profile
+field or compatibility wrapper whose provenance states the translation to the
+normative baseline-inclusive convention.
+
 Define stagnation reset threshold by
 \[
 \kappa_{\mathrm{stag}}:=
