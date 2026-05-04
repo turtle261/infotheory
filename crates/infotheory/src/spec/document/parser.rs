@@ -287,28 +287,48 @@ fn parse_environment_spec(
                 .unwrap_or_else(|| "aixi-nyx".to_string()),
             shared_region_name: optional_string(&value["shared_region_name"])
                 .unwrap_or_else(|| "shared".to_string()),
-            shared_region_size: value["shared_region_size"].as_u64().unwrap_or(4096) as usize,
+            shared_region_size: default_usize(
+                &value["shared_region_size"],
+                4096,
+                "environment.shared_region_size",
+            )?,
             shared_memory_policy: parse_shared_memory_policy(
                 value["shared_memory_policy"].as_str().unwrap_or("snapshot"),
             )?,
             step_timeout_ms: value["step_timeout_ms"].as_u64().unwrap_or(100),
             boot_timeout_ms: value["boot_timeout_ms"].as_u64().unwrap_or(30_000),
-            episode_steps: value["episode_steps"].as_u64().unwrap_or(100) as usize,
+            episode_steps: default_usize(
+                &value["episode_steps"],
+                100,
+                "environment.episode_steps",
+            )?,
             step_cost: value["step_cost"].as_i64().unwrap_or(0),
             observation_policy: super::canonicalize_vm_observation_policy_name(
                 value["observation_policy"]
                     .as_str()
                     .unwrap_or("shared_memory"),
             )?,
-            observation_bits: value["observation_bits"].as_u64().unwrap_or(8) as usize,
-            observation_stream_len: value["observation_stream_len"].as_u64().unwrap_or(64) as usize,
+            observation_bits: default_usize(
+                &value["observation_bits"],
+                8,
+                "environment.observation_bits",
+            )?,
+            observation_stream_len: default_usize(
+                &value["observation_stream_len"],
+                64,
+                "environment.observation_stream_len",
+            )?,
             observation_stream_mode: super::canonicalize_vm_observation_stream_mode_name(
                 value["observation_stream_mode"]
                     .as_str()
                     .unwrap_or("pad_truncate"),
             )?,
-            observation_pad_byte: value["observation_pad_byte"].as_u64().unwrap_or(0) as u8,
-            reward_bits: value["reward_bits"].as_u64().unwrap_or(8) as usize,
+            observation_pad_byte: default_u8(
+                &value["observation_pad_byte"],
+                0,
+                "environment.observation_pad_byte",
+            )?,
+            reward_bits: default_usize(&value["reward_bits"], 8, "environment.reward_bits")?,
             reward_policy: parse_vm_reward_policy(&value["reward_policy"])?,
             reward_shaping: parse_optional_vm_reward_shaping(&value["reward_shaping"])?,
             action_source: parse_vm_action_source(&value["action_source"])?,
@@ -361,23 +381,21 @@ fn parse_environment_spec(
 }
 
 fn parse_interface_spec(value: &serde_json::Value) -> SpecResult<PlannerInterfaceSpec> {
-    let agent_actions_raw =
-        required_u64(&value["agent_actions"], "interface.agent_actions")? as usize;
+    let agent_actions_raw = required_usize(&value["agent_actions"], "interface.agent_actions")?;
     let agent_actions = ActionAlphabet::try_from_usize(agent_actions_raw)
         .map_err(|_| SpecError::new("interface.agent_actions must be >= 1"))?;
     Ok(PlannerInterfaceSpec {
-        observation_bits: required_u64(&value["observation_bits"], "interface.observation_bits")?
-            as usize,
-        observation_stream_len: required_u64(
+        observation_bits: required_usize(&value["observation_bits"], "interface.observation_bits")?,
+        observation_stream_len: required_usize(
             &value["observation_stream_len"],
             "interface.observation_stream_len",
-        )? as usize,
+        )?,
         observation_key_mode: parse_observation_key_mode(
             value["observation_key_mode"]
                 .as_str()
                 .unwrap_or("full_stream"),
         )?,
-        reward_bits: required_u64(&value["reward_bits"], "interface.reward_bits")? as usize,
+        reward_bits: required_usize(&value["reward_bits"], "interface.reward_bits")?,
         agent_actions,
         min_reward: required_i64(&value["min_reward"], "interface.min_reward")?,
         max_reward: required_i64(&value["max_reward"], "interface.max_reward")?,
@@ -398,23 +416,21 @@ fn parse_tune_interface_spec(value: &serde_json::Value) -> SpecResult<TunePlanne
         ],
         "controller.interface",
     )?;
-    let agent_actions_raw =
-        required_u64(&value["agent_actions"], "interface.agent_actions")? as usize;
+    let agent_actions_raw = required_usize(&value["agent_actions"], "interface.agent_actions")?;
     let agent_actions = ActionAlphabet::try_from_usize(agent_actions_raw)
         .map_err(|_| SpecError::new("interface.agent_actions must be >= 1"))?;
     Ok(TunePlannerInterfaceSpec {
-        observation_bits: required_u64(&value["observation_bits"], "interface.observation_bits")?
-            as usize,
-        observation_stream_len: required_u64(
+        observation_bits: required_usize(&value["observation_bits"], "interface.observation_bits")?,
+        observation_stream_len: required_usize(
             &value["observation_stream_len"],
             "interface.observation_stream_len",
-        )? as usize,
+        )?,
         observation_key_mode: parse_observation_key_mode(
             value["observation_key_mode"].as_str().ok_or_else(|| {
                 SpecError::new("controller.interface.observation_key_mode is required")
             })?,
         )?,
-        reward_bits: required_u64(&value["reward_bits"], "interface.reward_bits")? as usize,
+        reward_bits: required_usize(&value["reward_bits"], "interface.reward_bits")?,
         agent_actions,
     })
 }
@@ -430,10 +446,11 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                 base_dir,
                 crate::api::MAX_MIXTURE_NESTING,
             )?,
-            agent_horizon: required_u64(&value["agent_horizon"], "controller.agent_horizon")?
-                as usize,
-            num_simulations: required_u64(&value["num_simulations"], "controller.num_simulations")?
-                as usize,
+            agent_horizon: required_usize(&value["agent_horizon"], "controller.agent_horizon")?,
+            num_simulations: required_usize(
+                &value["num_simulations"],
+                "controller.num_simulations",
+            )?,
             mcts_strategy: parse_mcts_strategy(
                 value.get("mcts_strategy"),
                 "controller.mcts_strategy",
@@ -455,17 +472,19 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     &value["discount_gamma"],
                     "controller.discount_gamma",
                 )?,
-                return_horizon: required_u64(&value["return_horizon"], "controller.return_horizon")?
-                    as usize,
-                return_bins: required_u64(&value["return_bins"], "controller.return_bins")?
-                    as usize,
-                augmentation_period: required_u64(
+                return_horizon: required_usize(
+                    &value["return_horizon"],
+                    "controller.return_horizon",
+                )?,
+                return_bins: required_usize(&value["return_bins"], "controller.return_bins")?,
+                augmentation_period: required_usize(
                     &value["augmentation_period"],
                     "controller.augmentation_period",
-                )? as usize,
-                history_prune_keep_steps: value["history_prune_keep_steps"]
-                    .as_u64()
-                    .map(|n| n as usize),
+                )?,
+                history_prune_keep_steps: optional_usize(
+                    &value["history_prune_keep_steps"],
+                    "controller.history_prune_keep_steps",
+                )?,
                 baseline_exploration: required_f64(
                     &value["baseline_exploration"],
                     "controller.baseline_exploration",
@@ -479,22 +498,23 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     base_dir,
                     crate::api::MAX_MIXTURE_NESTING,
                 )?,
-                return_horizon: required_u64(&value["return_horizon"], "controller.return_horizon")?
-                    as usize,
-                return_bins: required_u64(&value["return_bins"], "controller.return_bins")?
-                    as usize,
-                label_phase_period: required_u64(
+                return_horizon: required_usize(
+                    &value["return_horizon"],
+                    "controller.return_horizon",
+                )?,
+                return_bins: required_usize(&value["return_bins"], "controller.return_bins")?,
+                label_phase_period: required_usize(
                     &value["label_phase_period"],
                     "controller.label_phase_period",
-                )? as usize,
+                )?,
                 teacher_dataset_asset: required_string(
                     &value["teacher_dataset_asset"],
                     "controller.teacher_dataset_asset",
                 )?,
-                planner_simulations_per_step: required_u64(
+                planner_simulations_per_step: required_usize(
                     &value["planner_simulations_per_step"],
                     "controller.planner_simulations_per_step",
-                )? as usize,
+                )?,
             },
         )),
         other => Err(SpecError::new(format!("unknown controller kind '{other}'"))),
@@ -522,8 +542,8 @@ fn parse_mcts_strategy(value: Option<&serde_json::Value>, label: &str) -> SpecRe
     match kind {
         "rho_uct" => Ok(MctsStrategy::RhoUct),
         "parallel_uct" => {
-            let workers_raw = required_u64(&value["workers"], &format!("{label}.workers"))?;
-            let workers = NonZeroUsize::new(workers_raw as usize)
+            let workers_raw = required_usize(&value["workers"], &format!("{label}.workers"))?;
+            let workers = NonZeroUsize::new(workers_raw)
                 .ok_or_else(|| SpecError::new(format!("{label}.workers must be >= 1")))?;
             let bu_uct_m_max = match object.get("bu_uct_m_max") {
                 Some(raw) if raw.is_null() => None,
@@ -544,10 +564,14 @@ fn parse_mcts_strategy(value: Option<&serde_json::Value>, label: &str) -> SpecRe
 fn parse_runtime_spec(value: &serde_json::Value) -> SpecResult<PlannerRuntimeSpec> {
     Ok(PlannerRuntimeSpec {
         random_seed: value["random_seed"].as_u64(),
-        learn_cycles: value["learn_cycles"].as_u64().map(|n| n as usize),
-        eval_cycles: value["eval_cycles"].as_u64().map(|n| n as usize),
-        terminate_lifetime: value["terminate_lifetime"].as_u64().unwrap_or(20) as usize,
-        log_every: value["log_every"].as_u64().unwrap_or(1) as usize,
+        learn_cycles: optional_usize(&value["learn_cycles"], "runtime.learn_cycles")?,
+        eval_cycles: optional_usize(&value["eval_cycles"], "runtime.eval_cycles")?,
+        terminate_lifetime: default_usize(
+            &value["terminate_lifetime"],
+            20,
+            "runtime.terminate_lifetime",
+        )?,
+        log_every: default_usize(&value["log_every"], 1, "runtime.log_every")?,
         perf: value["perf"].as_bool().unwrap_or(false),
         vm_perf_only: value["vm_perf_only"].as_bool().unwrap_or(false),
         explore_epsilon: value["explore_epsilon"].as_f64().unwrap_or(0.0),
@@ -582,12 +606,12 @@ fn parse_tune_bounds_spec(value: &serde_json::Value) -> SpecResult<TuneBoundsSpe
             "bounds.forbidden_backends",
         )?,
         parameter_ranges: parse_tune_parameter_ranges(&value["parameter_ranges"])?,
-        max_experts: required_u64(&value["max_experts"], "bounds.max_experts")? as usize,
-        max_mixture_nesting_depth: required_u64(
+        max_experts: required_usize(&value["max_experts"], "bounds.max_experts")?,
+        max_mixture_nesting_depth: required_usize(
             &value["max_mixture_nesting_depth"],
             "bounds.max_mixture_nesting_depth",
-        )? as usize,
-        min_experts: value["min_experts"].as_u64().map(|n| n as usize),
+        )?,
+        min_experts: optional_usize(&value["min_experts"], "bounds.min_experts")?,
         allow_duplicate_experts: value["allow_duplicate_experts"].as_bool(),
         required_experts: optional_tune_string_list(
             value.get("required_experts"),
@@ -642,10 +666,10 @@ fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneContr
             )?;
             Ok(TuneControllerSpec::AnnealedHillClimbing(
                 AnnealedHillClimbingTuneControllerSpec {
-                    max_mutation_radius: required_u64(
+                    max_mutation_radius: required_usize(
                         &value["max_mutation_radius"],
                         "controller.max_mutation_radius",
-                    )? as usize,
+                    )?,
                 },
             ))
         }
@@ -658,10 +682,10 @@ fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneContr
             Ok(TuneControllerSpec::McAixiFacCtw(
                 McAixiFacCtwTuneControllerSpec {
                     interface: parse_tune_interface_spec(&value["interface"])?,
-                    planner_simulations_per_step: required_u64(
+                    planner_simulations_per_step: required_usize(
                         &value["planner_simulations_per_step"],
                         "controller.planner_simulations_per_step",
-                    )? as usize,
+                    )?,
                 },
             ))
         }
@@ -683,16 +707,15 @@ fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneContr
             Ok(TuneControllerSpec::AiqiDiscounted(
                 AiqiDiscountedTuneControllerSpec {
                     interface: parse_tune_interface_spec(&value["interface"])?,
-                    planner_simulations_per_step: required_u64(
+                    planner_simulations_per_step: required_usize(
                         &value["planner_simulations_per_step"],
                         "controller.planner_simulations_per_step",
-                    )? as usize,
-                    return_horizon: required_u64(
+                    )?,
+                    return_horizon: required_usize(
                         &value["return_horizon"],
                         "controller.return_horizon",
-                    )? as usize,
-                    return_bins: required_u64(&value["return_bins"], "controller.return_bins")?
-                        as usize,
+                    )?,
+                    return_bins: required_usize(&value["return_bins"], "controller.return_bins")?,
                     discount_factor: required_f64(
                         &value["discount_factor"],
                         "controller.discount_factor",
@@ -724,22 +747,22 @@ fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneContr
             Ok(TuneControllerSpec::AiqiWarmstartExactJh(
                 WarmStartExactJhTuneControllerSpec {
                     interface: parse_tune_interface_spec(&value["interface"])?,
-                    planner_simulations_per_step: required_u64(
+                    planner_simulations_per_step: required_usize(
                         &value["planner_simulations_per_step"],
                         "controller.planner_simulations_per_step",
-                    )? as usize,
-                    return_horizon: required_u64(
+                    )?,
+                    return_horizon: required_usize(
                         &value["return_horizon"],
                         "controller.return_horizon",
-                    )? as usize,
+                    )?,
                     warmstart_teacher_dataset_asset: required_string(
                         &value["warmstart_teacher_dataset_asset"],
                         "controller.warmstart_teacher_dataset_asset",
                     )?,
-                    label_phase_period: required_u64(
+                    label_phase_period: required_usize(
                         &value["label_phase_period"],
                         "controller.label_phase_period",
-                    )? as usize,
+                    )?,
                 },
             ))
         }
@@ -858,8 +881,8 @@ fn parse_vm_action_source(value: &serde_json::Value) -> SpecResult<VmRuntimeActi
                 .into_iter()
                 .map(|name| super::canonicalize_vm_fuzz_mutator_name(&name))
                 .collect::<SpecResult<Vec<_>>>()?,
-            min_len: value["min_len"].as_u64().unwrap_or(1) as usize,
-            max_len: value["max_len"].as_u64().unwrap_or(4096) as usize,
+            min_len: default_usize(&value["min_len"], 1, "environment.action_source.min_len")?,
+            max_len: default_usize(&value["max_len"], 4096, "environment.action_source.max_len")?,
             dictionary: string_list(&value["dictionary"])?,
             rng_seed: value["rng_seed"].as_u64().unwrap_or(0),
         }),
@@ -893,7 +916,11 @@ fn parse_optional_vm_trace(value: &serde_json::Value) -> SpecResult<Option<VmTra
     }
     Ok(Some(VmTraceSpec {
         shared_region_name: optional_string(&value["shared_region_name"]),
-        max_bytes: value["max_bytes"].as_u64().unwrap_or(1_000_000) as usize,
+        max_bytes: default_usize(
+            &value["max_bytes"],
+            1_000_000,
+            "environment.trace.max_bytes",
+        )?,
         reset_on_episode: value["reset_on_episode"].as_bool().unwrap_or(false),
     }))
 }
@@ -960,6 +987,37 @@ fn required_u64(value: &serde_json::Value, label: &str) -> SpecResult<u64> {
     value
         .as_u64()
         .ok_or_else(|| SpecError::new(format!("{label} is required")))
+}
+
+fn required_usize(value: &serde_json::Value, label: &str) -> SpecResult<usize> {
+    usize::try_from(required_u64(value, label)?)
+        .map_err(|_| SpecError::new(format!("{label} exceeds usize::MAX")))
+}
+
+fn optional_usize(value: &serde_json::Value, label: &str) -> SpecResult<Option<usize>> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        required_usize(value, label).map(Some)
+    }
+}
+
+fn default_usize(value: &serde_json::Value, default: usize, label: &str) -> SpecResult<usize> {
+    if value.is_null() {
+        Ok(default)
+    } else {
+        required_usize(value, label)
+    }
+}
+
+#[cfg(feature = "vm")]
+fn default_u8(value: &serde_json::Value, default: u8, label: &str) -> SpecResult<u8> {
+    if value.is_null() {
+        Ok(default)
+    } else {
+        u8::try_from(required_u64(value, label)?)
+            .map_err(|_| SpecError::new(format!("{label} exceeds u8::MAX")))
+    }
 }
 
 fn required_i64(value: &serde_json::Value, label: &str) -> SpecResult<i64> {

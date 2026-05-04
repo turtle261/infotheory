@@ -1,0 +1,2142 @@
+use super::*;
+#[cfg(feature = "backend-ctw")]
+use crate::aixi::common::{ActionAlphabet, ObservationKeyMode};
+use crate::aixi::warmstart::WarmStartExactJhTransition;
+use crate::api::CompressionBackend;
+#[cfg(feature = "backend-ctw")]
+use crate::api::RateBackend;
+#[cfg(feature = "backend-ctw")]
+use crate::compression::FramingMode;
+#[cfg(feature = "backend-ctw")]
+use crate::spec::{
+    AiqiDiscountedTuneControllerSpec, AnnealedHillClimbingTuneControllerSpec, AssetBinding,
+    McAixiFacCtwTuneControllerSpec, SpecDocument, TuneBoundsSpec, TuneControllerSpec,
+    TunePlannerInterfaceSpec, TuneSpec, WarmStartExactJhTuneControllerSpec,
+};
+#[cfg(feature = "backend-ctw")]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "backend-ctw")]
+fn temp_path(prefix: &str, suffix: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!("infotheory-tuner-{prefix}-{nanos}{suffix}"))
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "libtest entrypoint for spawned tuner evaluator workers"]
+fn __infotheory_tuner_eval_worker() {
+    if std::env::var_os("INFOTHEORY_TUNER_EVAL_REQUEST_PATH").is_none()
+        || std::env::var_os("INFOTHEORY_TUNER_EVAL_RESPONSE_PATH").is_none()
+    {
+        return;
+    }
+    run_tuner_eval_worker_from_env().expect("run tuner evaluator worker from env");
+}
+
+#[cfg(feature = "backend-ctw")]
+fn sample_tune_spec(dataset_path: &str, output_path: &str, report_path: &str) -> TuneSpec {
+    TuneSpec {
+        assets: vec![AssetBinding {
+            id: "dataset".to_string(),
+            path: dataset_path.to_string(),
+        }],
+        input_asset: "dataset".to_string(),
+        baseline_candidate: CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 8 },
+            coder: crate::coders::CoderType::AC,
+            framing: FramingMode::Framed,
+        },
+        controller: TuneControllerSpec::AnnealedHillClimbing(
+            AnnealedHillClimbingTuneControllerSpec {
+                max_mutation_radius: 1,
+            },
+        ),
+        bounds: TuneBoundsSpec {
+            allowed_backends: vec!["ctw".to_string()],
+            forbidden_backends: Vec::new(),
+            parameter_ranges: Vec::new(),
+            max_experts: 2,
+            max_mixture_nesting_depth: 1,
+            min_experts: Some(1),
+            allow_duplicate_experts: Some(false),
+            required_experts: Vec::new(),
+            forbidden_expert_pairs: Vec::new(),
+        },
+        eval_time_limit_seconds: 1.0,
+        time_budget_seconds: 2.0,
+        min_throughput_bytes_per_second: 1.0,
+        max_memory_bytes: u64::MAX,
+        output_config_path: output_path.to_string(),
+        seed: 7,
+        report_path: Some(report_path.to_string()),
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+fn action_alphabet(n: usize) -> ActionAlphabet {
+    ActionAlphabet::try_from_usize(n).expect("test action alphabet must be non-zero")
+}
+
+#[cfg(feature = "backend-ctw")]
+fn causal_dataset_value(codec_hash: &str, payload_key: &str, payload: Value) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("schema_version".to_string(), serde_json::json!(1));
+    object.insert("environment_id".to_string(), serde_json::json!("test-env"));
+    object.insert(
+        "environment_config_crc32".to_string(),
+        serde_json::json!("00000000"),
+    );
+    object.insert("codec_hash".to_string(), serde_json::json!(codec_hash));
+    object.insert(
+        "reset_convention".to_string(),
+        serde_json::json!("reset-before-episode"),
+    );
+    object.insert(
+        "action_alphabet".to_string(),
+        serde_json::json!({"size": 2}),
+    );
+    object.insert(
+        "percept_schema".to_string(),
+        serde_json::json!({
+            "encoding": "bytes",
+            "channels": [{"channel": "percept", "domain": "bytes"}],
+        }),
+    );
+    object.insert(
+        "reward_encoding".to_string(),
+        serde_json::json!({
+            "encoding": "bytes",
+            "channel": "reward",
+            "domain": "binary",
+        }),
+    );
+    object.insert(
+        "terminal_encoding".to_string(),
+        serde_json::json!({
+            "encoding": "bytes",
+            "channel": "terminal",
+            "domain": "binary",
+        }),
+    );
+    object.insert("collection_policy".to_string(), serde_json::json!("test"));
+    object.insert(
+        "target_domains".to_string(),
+        serde_json::json!({
+            "bytes": {"kind": "byte_alphabet"},
+            "binary": {"kind": "enumerated_payloads", "payloads": [[0], [1]]}
+        }),
+    );
+    object.insert(
+        "event_grammar".to_string(),
+        serde_json::json!({
+            "context_channels": ["action"],
+            "observe_target_no_score": [
+                {"channel": "percept", "domain": "bytes"},
+                {"channel": "percept", "domain": "binary"},
+                {"channel": "reward", "domain": "binary"},
+                {"channel": "terminal", "domain": "binary"}
+            ],
+            "target": [
+                {"channel": "percept", "domain": "bytes"},
+                {"channel": "percept", "domain": "binary"},
+                {"channel": "reward", "domain": "binary"},
+                {"channel": "terminal", "domain": "binary"}
+            ]
+        }),
+    );
+    object.insert(payload_key.to_string(), payload);
+    Value::Object(object)
+}
+
+#[cfg(feature = "backend-ctw")]
+fn planner_interface_for_baseline(candidate: &CompressionBackend) -> TunePlannerInterfaceSpec {
+    let json = crate::spec::compression_backend_to_json_value(candidate)
+        .expect("baseline candidate must serialize");
+    let actions = (collect_numeric_leaves(&json).len() * 2).max(1);
+    TunePlannerInterfaceSpec {
+        observation_bits: 8,
+        observation_stream_len: 1,
+        observation_key_mode: ObservationKeyMode::FullStream,
+        reward_bits: 16,
+        agent_actions: action_alphabet(actions),
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn synthesized_planner_bridge_inherits_tune_spec_environment() {
+    let base_dir = temp_path("bridge-base", "");
+    std::fs::create_dir_all(&base_dir).expect("create base dir");
+    let output_path = base_dir.join("best.json");
+    let report_path = base_dir.join("report.json");
+    let mut spec = sample_tune_spec(
+        "relative-dataset.bin",
+        &output_path.to_string_lossy(),
+        &report_path.to_string_lossy(),
+    );
+    spec.controller = TuneControllerSpec::AiqiDiscounted(AiqiDiscountedTuneControllerSpec {
+        interface: TunePlannerInterfaceSpec {
+            observation_bits: 8,
+            observation_stream_len: 1,
+            observation_key_mode: ObservationKeyMode::FullStream,
+            reward_bits: 8,
+            agent_actions: action_alphabet(1),
+        },
+        planner_simulations_per_step: 1,
+        return_horizon: 1,
+        return_bins: 2,
+        discount_factor: 0.5,
+        min_improvement: 0.0,
+        max_improvement: 1.0,
+    });
+    let env = SpecEnvironment::new(&base_dir);
+    let compiled = spec.compile_in(&env).expect("compile tune spec");
+    assert_eq!(compiled.base_dir(), base_dir.as_path());
+
+    let dataset = LoadedDataset {
+        kind: DatasetKind::PassiveBytes,
+        objective_target: ObjectiveTarget::PassiveAc,
+        lowering_version: PASSIVE_DATASET_LOWERING_VERSION,
+        codec_hash: "passive-identity-bytes".to_string(),
+        event_grammar_hash: "passive-target-only-byte-stream".to_string(),
+        target_domain_support_hash: crc32_hex(b"passive-byte-alphabet"),
+        causal_header_profile_hash: crc32_hex(b"passive-none"),
+        target_size_function: "passive-bytes-len",
+        canonical_content_hash: crc32_hex(b"dataset"),
+        lowered_skeleton_hash: crc32_hex(b"passive-bytes-target-only"),
+        resolved_path: base_dir
+            .join("relative-dataset.bin")
+            .to_string_lossy()
+            .to_string(),
+        source_size_bytes: 7,
+        raw_bytes: b"dataset".to_vec(),
+        events: Vec::new(),
+        causal_profile: None,
+        dataset_units: 7.0,
+        target_events: 1,
+    };
+    let verified = VerifiedTheoremInputs::default();
+    let contract =
+        planner_controller_contract(compiled.controller(), &compiled, &dataset, &verified)
+            .expect("planner contract");
+    let reward_encoder = contract
+        .reward_encoder(
+            &dataset,
+            &CandidateEvalResult {
+                status: CandidateEvalStatus::Success,
+                compressed_bytes: 7,
+                elapsed_seconds: 0.1,
+                effective_eval_time_limit_seconds: 1.0,
+                throughput_bytes_per_second: 70.0,
+                peak_memory_bytes: 0,
+                target_loss_bits: 7.0,
+                objective_bits: 7.0,
+                deployable: true,
+            },
+            &verified,
+        )
+        .expect("reward encoder");
+    let planner_run = compile_tuner_planner_run_spec(
+        compiled.controller(),
+        &contract,
+        &reward_encoder,
+        &compiled,
+        &env,
+    )
+    .expect("compile bridge");
+    let binding = planner_run
+        .resolved_assets()
+        .iter()
+        .find(|binding| binding.id == "dataset")
+        .expect("dataset asset binding");
+    let crate::spec::AssetRef::Filesystem(path) = &binding.asset;
+    assert_eq!(path, &base_dir.join("relative-dataset.bin"));
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[cfg(feature = "backend-ctw")]
+fn write_test_exact_reward_certificate(
+    path: &std::path::Path,
+    dataset_path: &std::path::Path,
+    bounds: &TuneBoundsSpec,
+    controller_kind: &str,
+) {
+    let dataset = load_dataset(dataset_path).expect("load dataset for certificate");
+    let evaluator_profile = EvaluatorProfile {
+        dataset_kind: dataset.kind,
+        objective_target: dataset.objective_target,
+        dataset_lowering_version: dataset.lowering_version,
+        dataset_codec_hash: dataset.codec_hash.clone(),
+        event_grammar_hash: dataset.event_grammar_hash.clone(),
+        target_domain_support_hash: dataset.target_domain_support_hash.clone(),
+        causal_header_profile_hash: dataset.causal_header_profile_hash.clone(),
+        target_size_function: dataset.target_size_function,
+        evaluator_interface_version: TUNER_EVALUATOR_INTERFACE_VERSION,
+        candidate_canonicalization_version: "bounds-v1".to_string(),
+        warmup_baseline_runs: 0,
+        diagnostic_chunk_bytes: None,
+        eval_time_limit_seconds: 1.0,
+        evaluator_threads: 1,
+        worker_isolation_mode: "spawn_exec_worker",
+        evaluator_determinism: "deterministic_under_h",
+        rss_mode: PeakMemoryMode::ProcessRssPeak,
+        timing_certification_tier: TimingCertificationTier::BestEffort,
+        build_profile: option_env!("PROFILE").unwrap_or("unknown"),
+        feature_set: compiled_feature_set(),
+    };
+    let reward_cert = serde_json::json!({
+        "schema_version": 1,
+        "kind": "exact_reward_encoding",
+        "dataset_crc32": dataset.canonical_content_hash,
+        "bounds_crc32": bounds_hash(bounds).expect("bounds hash"),
+        "evaluator_profile_crc32": evaluator_profile.hash().expect("profile hash"),
+        "controller_kind": controller_kind,
+        "action_alphabet_size": 2,
+        "encoding": "integer_objective_difference",
+        "scalar_representation": SCALAR_REPRESENTATION_DECLARATION,
+        "reward_bits": 16,
+        "max_reward": 65_535u64,
+    });
+    std::fs::write(
+        path,
+        serde_json::to_vec(&reward_cert).expect("reward cert json"),
+    )
+    .expect("write reward cert");
+}
+
+#[test]
+fn parse_tune_cli_args_and_theorem_flags() {
+    let args = vec![
+        "infotheory".to_string(),
+        "tune".to_string(),
+        "spec.json".to_string(),
+        "--max-evaluations".to_string(),
+        "12".to_string(),
+        "--timing-tier".to_string(),
+        "real_time".to_string(),
+        "--claim-exact-finite-mdp".to_string(),
+    ];
+    let parsed = parse_tune_command_args(&args).expect("parse tune args");
+    assert_eq!(parsed.spec_path, "spec.json");
+    assert_eq!(parsed.execution.max_evaluations, Some(12));
+    assert_eq!(
+        parsed.execution.theorem.timing_certification_tier,
+        TimingCertificationTier::RealTime
+    );
+    assert!(parsed.execution.theorem.claim_exact_finite_mdp);
+}
+
+#[test]
+fn tune_execution_config_accepts_nested_theorem_json() {
+    let value = serde_json::json!({
+        "warmup_baseline_runs": 2,
+        "planner_deployable_model": true,
+        "theorem": {
+            "claim_exact_observed_markov": true,
+            "timing_certification_tier": "isolated"
+        }
+    });
+    let cfg = TuneExecutionConfig::from_json_value(&value).expect("config parse");
+    assert_eq!(cfg.warmup_baseline_runs, 2);
+    assert!(cfg.planner_deployable_model);
+    assert!(cfg.theorem.claim_exact_observed_markov);
+    assert_eq!(
+        cfg.theorem.timing_certification_tier,
+        TimingCertificationTier::Isolated
+    );
+}
+
+#[test]
+fn run_tune_rejects_invalid_execution_config_direct_call() {
+    let request = TuneCommandRequest {
+        spec_path: "nonexistent-spec.json".to_string(),
+        execution: TuneExecutionConfig {
+            threads: Some(0),
+            ..TuneExecutionConfig::default()
+        },
+    };
+    let err = run_tune(&request).expect_err("invalid execution config must fail at run_tune");
+    assert!(err.contains("threads must be >= 1 when set"), "{err}");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn tune_planner_interface_requires_explicit_observation_key_mode() {
+    let mut value = SpecDocument::Tune(sample_tune_spec("dataset.bin", "out.json", "report.json"))
+        .to_canonical_json_value()
+        .expect("canonical tune json");
+    value["controller"] = serde_json::json!({
+        "kind": "mc_aixi_fac_ctw",
+        "interface": {
+            "observation_bits": 8,
+            "observation_stream_len": 1,
+            "reward_bits": 8,
+            "agent_actions": 1
+        },
+        "planner_simulations_per_step": 1
+    });
+    let err = match SpecDocument::parse_json_value(&value, Path::new(".")) {
+        Ok(_) => panic!("missing tune observation_key_mode must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("controller.interface.observation_key_mode is required"),
+        "{err}"
+    );
+}
+
+#[test]
+fn tune_execution_config_rejects_observation_certified_boolean() {
+    let value = serde_json::json!({
+        "theorem": {
+            "exact_state_observation_certified": true
+        }
+    });
+    let err = TuneExecutionConfig::from_json_value(&value)
+        .expect_err("unchecked observation proof boolean must be rejected");
+    assert!(err.contains("unknown execution config field"), "{err}");
+}
+
+#[test]
+fn finite_reward_map_accepts_non_contiguous_injective_symbols() {
+    let value = serde_json::json!({
+        "values": [
+            {"objective_difference": 0, "symbol": 0},
+            {"objective_difference": 3, "symbol": 7}
+        ]
+    });
+    let map = parse_finite_reward_map(value.as_object().expect("object"), 4, 15)
+        .expect("finite reward map");
+    assert_eq!(map.objective_difference_to_symbol.get(&0), Some(&0));
+    assert_eq!(map.objective_difference_to_symbol.get(&3), Some(&7));
+    assert_eq!(map.complete_nonnegative_interval_max, None);
+}
+
+#[test]
+fn finite_reward_map_rejects_reachable_rewards_alias() {
+    let value = serde_json::json!({
+        "reachable_rewards": [
+            {"objective_difference": 0, "symbol": 0},
+            {"objective_difference": 1, "symbol": 1}
+        ]
+    });
+    let err = parse_finite_reward_map(value.as_object().expect("object"), 4, 15)
+        .expect_err("reachable_rewards alias must be rejected");
+    assert!(err.contains("requires a 'values' array"), "{err}");
+}
+
+#[test]
+fn finite_reward_map_rejects_duplicate_symbols() {
+    let value = serde_json::json!({
+        "values": [
+            {"objective_difference": 0, "symbol": 1},
+            {"objective_difference": 2, "symbol": 1}
+        ]
+    });
+    let err = parse_finite_reward_map(value.as_object().expect("object"), 4, 15)
+        .expect_err("duplicate symbol must fail");
+    assert!(err.contains("duplicates reward symbol"), "{err}");
+}
+
+#[test]
+fn finite_reward_map_rejects_incomplete_declared_interval() {
+    let value = serde_json::json!({
+        "complete_nonnegative_interval_max": 3,
+        "values": [
+            {"objective_difference": 0, "symbol": 0},
+            {"objective_difference": 1, "symbol": 1},
+            {"objective_difference": 3, "symbol": 3}
+        ]
+    });
+    let err = parse_finite_reward_map(value.as_object().expect("object"), 4, 15)
+        .expect_err("declared complete interval must contain every difference");
+    assert!(err.contains("missing objective_difference 2"), "{err}");
+}
+
+#[test]
+fn exact_finite_reward_map_encodes_objective_difference_not_symbol_arithmetic() {
+    let encoder = TunerRewardEncoder::ExactIntegerObjectiveDifference {
+        max_reward: 2,
+        objective_difference_to_symbol: Some(BTreeMap::from([(0, 0), (1, 2), (2, 1)])),
+    };
+    assert_eq!(encoder.encode(1.0).expect("mapped reward"), 2);
+    assert_eq!(encoder.encode(2.0).expect("mapped reward"), 1);
+}
+
+#[cfg(all(feature = "backend-ctw", target_os = "linux"))]
+#[test]
+fn cgroup_peak_reader_parses_fixture_file() {
+    let path = temp_path("cgroup-memory-peak", ".txt");
+    fs::write(&path, b"12345\n").expect("write cgroup fixture");
+    assert_eq!(read_u64_from_file(&path).expect("parse cgroup peak"), 12345);
+    fs::write(&path, b"max\n").expect("write cgroup sentinel fixture");
+    let err = read_u64_from_file(&path).expect_err("max sentinel is not a measurement");
+    assert!(err.contains("unbounded sentinel"), "{err}");
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn executor_controls_report_reflects_requested_rss_mode() {
+    let config = TuneExecutionConfig {
+        rss_mode: PeakMemoryMode::HybridStrictMax,
+        ..TuneExecutionConfig::default()
+    };
+    let report = executor_controls_report(&config);
+    assert_eq!(report["rss_mode"]["requested"], "hybrid_strict_max");
+    let effective = report["rss_mode"]["effective_measurement"]
+        .as_str()
+        .expect("effective measurement");
+    assert!(
+        effective == "max_process_rss_peak_cgroup_peak" || effective == "process_rss_peak_fallback",
+        "{effective}"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn evaluator_profile_cache_key_changes_with_execution_profile_only() {
+    let profile_a = EvaluatorProfile {
+        dataset_kind: DatasetKind::PassiveBytes,
+        objective_target: ObjectiveTarget::PassiveAc,
+        dataset_lowering_version: PASSIVE_DATASET_LOWERING_VERSION,
+        dataset_codec_hash: "passive-identity-bytes".to_string(),
+        event_grammar_hash: "passive-target-only-byte-stream".to_string(),
+        target_domain_support_hash: crc32_hex(b"passive-byte-alphabet"),
+        causal_header_profile_hash: crc32_hex(b"passive-none"),
+        target_size_function: "passive-bytes-len",
+        evaluator_interface_version: TUNER_EVALUATOR_INTERFACE_VERSION,
+        candidate_canonicalization_version: "bounds-v1".to_string(),
+        warmup_baseline_runs: 0,
+        diagnostic_chunk_bytes: None,
+        eval_time_limit_seconds: 1.0,
+        evaluator_threads: 1,
+        worker_isolation_mode: "spawn_exec_worker",
+        evaluator_determinism: "deterministic_under_h",
+        rss_mode: PeakMemoryMode::ProcessRssPeak,
+        timing_certification_tier: TimingCertificationTier::BestEffort,
+        build_profile: "test",
+        feature_set: vec!["test"],
+    };
+    let mut profile_b = profile_a.clone();
+    profile_b.warmup_baseline_runs = 3;
+    let mut profile_c = profile_a.clone();
+    profile_c.eval_time_limit_seconds = 0.5;
+    let mut profile_d = profile_a.clone();
+    profile_d.diagnostic_chunk_bytes = Some(4096);
+
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 8 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let candidate_bytes = candidate
+        .compile()
+        .expect("compile candidate")
+        .canonical_bytes()
+        .as_slice()
+        .to_vec();
+    let dataset_hash = crc32_hex(b"same-dataset");
+    let key_a =
+        cache_key_for_candidate(&candidate_bytes, &profile_a, &dataset_hash).expect("cache key a");
+    let key_b =
+        cache_key_for_candidate(&candidate_bytes, &profile_b, &dataset_hash).expect("cache key b");
+    let key_c =
+        cache_key_for_candidate(&candidate_bytes, &profile_c, &dataset_hash).expect("cache key c");
+    let key_d =
+        cache_key_for_candidate(&candidate_bytes, &profile_d, &dataset_hash).expect("cache key d");
+    assert_ne!(key_a, key_b);
+    assert_ne!(key_a, key_c);
+    assert_ne!(key_a, key_d);
+    assert_eq!(key_a.candidate_canonical_bytes, candidate_bytes);
+    assert_eq!(
+        key_b.candidate_canonical_bytes,
+        key_a.candidate_canonical_bytes
+    );
+    assert_eq!(
+        key_c.candidate_canonical_bytes,
+        key_a.candidate_canonical_bytes
+    );
+    assert_eq!(key_b.dataset_identity, key_a.dataset_identity);
+    assert_ne!(key_b.evaluator_profile_bytes, key_a.evaluator_profile_bytes);
+    assert_ne!(key_c.evaluator_profile_bytes, key_a.evaluator_profile_bytes);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn deterministic_table_evaluation_enforces_exact_objective_formula() {
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 4 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    }
+    .compile()
+    .expect("compile candidate");
+    let candidate_crc32 = crc32_hex(candidate.canonical_bytes().as_slice());
+    let model_bytes: usize = 17;
+    let target_loss_bits = 23.5;
+    let table = VerifiedDeterministicEvaluatorTable {
+        base: VerifiedCertificate {
+            ref_value: "test://deterministic-table".to_string(),
+            content_hash: "00000000".to_string(),
+        },
+        rows: HashMap::from([(
+            candidate_crc32,
+            DeterministicEvaluatorRow {
+                status: CandidateEvalStatus::Success,
+                compressed_bytes: 3,
+                target_loss_bits,
+                elapsed_seconds: 0.25,
+                peak_memory_bytes: 16,
+            },
+        )]),
+    };
+    let dataset = LoadedDataset {
+        kind: DatasetKind::PassiveBytes,
+        objective_target: ObjectiveTarget::PassiveAc,
+        lowering_version: PASSIVE_DATASET_LOWERING_VERSION,
+        codec_hash: "passive-identity-bytes".to_string(),
+        event_grammar_hash: "passive-target-only-byte-stream".to_string(),
+        target_domain_support_hash: crc32_hex(b"passive-byte-alphabet"),
+        causal_header_profile_hash: crc32_hex(b"passive-none"),
+        target_size_function: "passive-bytes-len",
+        canonical_content_hash: crc32_hex(b"dataset"),
+        lowered_skeleton_hash: crc32_hex(b"passive-bytes-target-only"),
+        resolved_path: "test://dataset".to_string(),
+        source_size_bytes: 11,
+        raw_bytes: b"hello world".to_vec(),
+        events: Vec::new(),
+        causal_profile: None,
+        dataset_units: 11.0,
+        target_events: 1,
+    };
+
+    let result = table
+        .evaluate(&candidate, &dataset, model_bytes, 1.0, 1024, 1.0)
+        .expect("deterministic table evaluation");
+    assert_eq!(result.status, CandidateEvalStatus::Success);
+    assert_eq!(result.target_loss_bits, target_loss_bits);
+    assert_eq!(
+        result.objective_bits,
+        (model_bytes as f64 * 8.0) + target_loss_bits
+    );
+    assert_eq!(result.throughput_bytes_per_second, 44.0);
+    assert!(result.deployable);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn candidate_bounds_validation_enforces_parameter_ranges() {
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 8 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let bounds = TuneBoundsSpec {
+        allowed_backends: vec!["ctw".to_string()],
+        forbidden_backends: Vec::new(),
+        parameter_ranges: vec![crate::spec::TuneParameterRangeSpec {
+            parameter: "rate_backend.depth".to_string(),
+            min: 4.0,
+            max: 6.0,
+        }],
+        max_experts: 2,
+        max_mixture_nesting_depth: 1,
+        min_experts: Some(1),
+        allow_duplicate_experts: Some(false),
+        required_experts: Vec::new(),
+        forbidden_expert_pairs: Vec::new(),
+    };
+    let err = validate_candidate_against_tune_bounds(&candidate, &bounds)
+        .expect_err("depth out of range must fail");
+    assert!(err.contains("rate_backend.depth"));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn canonical_proposal_kernel_accounts_exact_integer_masses() {
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 2 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let bounds = TuneBoundsSpec {
+        allowed_backends: vec!["ctw".to_string()],
+        forbidden_backends: Vec::new(),
+        parameter_ranges: vec![crate::spec::TuneParameterRangeSpec {
+            parameter: "rate_backend.depth".to_string(),
+            min: 1.0,
+            max: 3.0,
+        }],
+        max_experts: 2,
+        max_mixture_nesting_depth: 1,
+        min_experts: Some(1),
+        allow_duplicate_experts: Some(false),
+        required_experts: Vec::new(),
+        forbidden_expert_pairs: Vec::new(),
+    };
+    let env = SpecEnvironment::new(".");
+    let current = candidate.compile_in(&env).expect("compile current");
+    let current_bytes = current.canonical_bytes().as_slice().to_vec();
+    let kernel = compile_canonical_proposal_kernel(&candidate, &bounds, 1, 1, &env, &current_bytes)
+        .expect("compile proposal kernel");
+    assert_eq!(kernel.total_raw_actions, 2);
+    assert_eq!(kernel.transitions.len(), 2);
+    assert!(
+        kernel
+            .transitions
+            .iter()
+            .all(|proposal| proposal.raw_action_count == 1)
+    );
+
+    let lower = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 1 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let lower_bytes = lower
+        .compile_in(&env)
+        .expect("compile lower")
+        .canonical_bytes()
+        .as_slice()
+        .to_vec();
+    assert_eq!(kernel.proposal_mass_to_canonical_bytes(&lower_bytes), 1);
+
+    let reverse = compile_canonical_proposal_kernel(&lower, &bounds, 1, 1, &env, &lower_bytes)
+        .expect("compile reverse kernel");
+    assert_eq!(reverse.total_raw_actions, 2);
+    assert_eq!(reverse.proposal_mass_to_canonical_bytes(&current_bytes), 1);
+    assert_eq!(reverse.transitions.len(), 1);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn reversible_metropolis_acceptance_uses_objective_bits_temperature() {
+    let proposal = AnnealedProposal {
+        candidate: CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 1 },
+            coder: crate::coders::CoderType::AC,
+            framing: FramingMode::Framed,
+        },
+        forward_raw_action_count: 1,
+        forward_total_raw_actions: 2,
+        reverse_raw_action_count: 1,
+        reverse_total_raw_actions: 2,
+    };
+    let uphill = annealer_acceptance_probability(
+        AnnealerKernelProfile::ReversibleElementaryMetropolis,
+        3.0,
+        2.0,
+        &proposal,
+    )
+    .expect("reversible metropolis probability");
+    assert!((uphill - (-1.5f64).exp()).abs() <= f64::EPSILON);
+    let downhill = annealer_acceptance_probability(
+        AnnealerKernelProfile::ReversibleElementaryMetropolis,
+        -3.0,
+        2.0,
+        &proposal,
+    )
+    .expect("reversible metropolis probability");
+    assert_eq!(downhill, 1.0);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn compiled_uniform_mh_uses_hastings_ratio_for_asymmetric_boundary_mass() {
+    let proposal = AnnealedProposal {
+        candidate: CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 1 },
+            coder: crate::coders::CoderType::AC,
+            framing: FramingMode::Framed,
+        },
+        forward_raw_action_count: 1,
+        forward_total_raw_actions: 2,
+        reverse_raw_action_count: 1,
+        reverse_total_raw_actions: 4,
+    };
+    let probability = annealer_acceptance_probability(
+        AnnealerKernelProfile::CompiledUniformMetropolisHastings,
+        1.0,
+        1.0,
+        &proposal,
+    )
+    .expect("mh probability");
+    let expected = (-1.0f64).exp() * 0.5;
+    assert!((probability - expected).abs() <= f64::EPSILON);
+    let err = annealer_acceptance_probability(
+        AnnealerKernelProfile::ReversibleElementaryMetropolis,
+        1.0,
+        1.0,
+        &proposal,
+    )
+    .expect_err("default profile must reject asymmetric masses");
+    assert!(err.contains("reversibility check"));
+}
+
+#[test]
+fn key_less_uses_canonical_bytes_on_objective_ties() {
+    let eval = CandidateEvalResult {
+        status: CandidateEvalStatus::Success,
+        compressed_bytes: 0,
+        elapsed_seconds: 1.0,
+        effective_eval_time_limit_seconds: 1.0,
+        throughput_bytes_per_second: 1.0,
+        peak_memory_bytes: 1,
+        target_loss_bits: 1.0,
+        objective_bits: 42.0,
+        deployable: true,
+    };
+    let smaller = vec![0x01_u8, 0x02_u8];
+    let larger = vec![0x01_u8, 0x03_u8];
+    assert!(key_less(&eval, &smaller, &eval, &larger));
+    assert!(!key_less(&eval, &larger, &eval, &smaller));
+}
+
+#[test]
+fn key_less_requires_exact_objective_tie_before_byte_tiebreak() {
+    let incumbent = CandidateEvalResult {
+        status: CandidateEvalStatus::Success,
+        compressed_bytes: 0,
+        elapsed_seconds: 1.0,
+        effective_eval_time_limit_seconds: 1.0,
+        throughput_bytes_per_second: 1.0,
+        peak_memory_bytes: 1,
+        target_loss_bits: 1.0,
+        objective_bits: 42.0,
+        deployable: true,
+    };
+    let candidate = CandidateEvalResult {
+        objective_bits: f64::from_bits(incumbent.objective_bits.to_bits() + 1),
+        ..incumbent.clone()
+    };
+    let candidate_bytes = vec![0x01_u8, 0x00_u8];
+    let incumbent_bytes = vec![0x01_u8, 0x01_u8];
+    assert!(
+        !key_less(&candidate, &candidate_bytes, &incumbent, &incumbent_bytes),
+        "byte-order tiebreak must not apply unless objective bits are exactly equal"
+    );
+}
+
+fn decode_observation_optional_f64(bytes: &[u8], field_index: usize) -> Option<f64> {
+    let mut offset = 1usize;
+    for index in 0..5 {
+        let present = bytes[offset];
+        offset += 1;
+        if present == 1 {
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(&bytes[offset..offset + 8]);
+            let value = f64::from_bits(u64::from_le_bytes(raw));
+            offset += 8;
+            if index == field_index {
+                return Some(value);
+            }
+        } else if index == field_index {
+            return None;
+        }
+    }
+    None
+}
+
+#[test]
+fn raw_observation_timeout_sets_tau_one_and_invalid_uses_sentinel() {
+    let incumbent = CandidateEvalResult {
+        status: CandidateEvalStatus::Success,
+        compressed_bytes: 10,
+        elapsed_seconds: 0.5,
+        effective_eval_time_limit_seconds: 1.0,
+        throughput_bytes_per_second: 2.0,
+        peak_memory_bytes: 1,
+        target_loss_bits: 80.0,
+        objective_bits: 100.0,
+        deployable: true,
+    };
+    let timeout = timeout_eval_result(0.25, 1, 0.25);
+    let timeout_observation = TunerRawObservation::from_runtime_step(
+        Some(&incumbent),
+        10.0,
+        Some(&timeout),
+        Some(b"candidate-timeout"),
+        Some(0.25),
+        "evaluator_timeout",
+        false,
+    );
+    assert_eq!(
+        decode_observation_optional_f64(timeout_observation.encoded_bytes(), 2),
+        Some(1.0)
+    );
+    let invalid = CandidateEvalResult {
+        status: CandidateEvalStatus::Invalid,
+        compressed_bytes: 0,
+        elapsed_seconds: 0.0,
+        effective_eval_time_limit_seconds: 1.0,
+        throughput_bytes_per_second: 0.0,
+        peak_memory_bytes: 0,
+        target_loss_bits: f64::INFINITY,
+        objective_bits: f64::INFINITY,
+        deployable: false,
+    };
+    let invalid_observation = TunerRawObservation::from_runtime_step(
+        Some(&incumbent),
+        10.0,
+        Some(&invalid),
+        Some(b"candidate-invalid"),
+        Some(1.0),
+        "evaluator_invalid",
+        false,
+    );
+    assert_eq!(
+        decode_observation_optional_f64(invalid_observation.encoded_bytes(), 2),
+        None
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn planner_percept_encoding_distinguishes_diagnostic_tokens() {
+    let interface = TunePlannerInterfaceSpec {
+        observation_bits: 16,
+        observation_stream_len: 2,
+        observation_key_mode: ObservationKeyMode::FullStream,
+        reward_bits: 8,
+        agent_actions: action_alphabet(2),
+    };
+    let current = vec![1_u8, 2, 3];
+    let incumbent_eval = CandidateEvalResult {
+        status: CandidateEvalStatus::Success,
+        compressed_bytes: 12,
+        elapsed_seconds: 0.25,
+        effective_eval_time_limit_seconds: 1.0,
+        throughput_bytes_per_second: 4.0,
+        peak_memory_bytes: 1,
+        target_loss_bits: 96.0,
+        objective_bits: 128.0,
+        deployable: true,
+    };
+    let inapplicable = encode_tuner_planner_percept(
+        &interface,
+        Some(&incumbent_eval),
+        16.0,
+        0,
+        "inapplicable_action",
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect("inapplicable percept");
+    let invalid = encode_tuner_planner_percept(
+        &interface,
+        Some(&incumbent_eval),
+        16.0,
+        0,
+        "invalid_action_index",
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect("invalid percept");
+    let nondeployable = encode_tuner_planner_percept(
+        &interface,
+        Some(&incumbent_eval),
+        16.0,
+        0,
+        "nondeployable_candidate",
+        Some(&CandidateEvalResult {
+            status: CandidateEvalStatus::Invalid,
+            compressed_bytes: 0,
+            elapsed_seconds: 0.0,
+            effective_eval_time_limit_seconds: 1.0,
+            throughput_bytes_per_second: 0.0,
+            peak_memory_bytes: 0,
+            target_loss_bits: f64::INFINITY,
+            objective_bits: f64::INFINITY,
+            deployable: false,
+        }),
+        Some(&current),
+        Some(1.0),
+        false,
+    )
+    .expect("nondeployable percept");
+    assert_ne!(inapplicable.observations, invalid.observations);
+    assert_ne!(inapplicable.observations, nondeployable.observations);
+    assert_ne!(invalid.observations, nondeployable.observations);
+}
+
+#[test]
+fn theorem_claims_reject_float_planner_mutation_domains() {
+    let actions = vec![
+        PlannerMutationAction::NumericStep {
+            path: "rate_backend.temperature".to_string(),
+            pointer: "/rate_backend/temperature".to_string(),
+            kind: NumericKind::Float,
+            delta: 0.05,
+        },
+        PlannerMutationAction::Noop,
+    ];
+    let mut theorem = TuneTheoremConfig::default();
+    validate_theorem_planner_mutation_domain(&actions, &theorem)
+        .expect("operational run may use float mutation leaves");
+    theorem.claim_exact_finite_mdp = true;
+    let err = validate_theorem_planner_mutation_domain(&actions, &theorem)
+        .expect_err("exact theorem claim must reject float mutation leaves");
+    assert!(err.contains("theorem_finite_state_unsafe"), "{err}");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn theorem_claims_continue_as_uncertified_when_requested_prereqs_are_missing() {
+    let dataset_path = temp_path("dataset-theorem-policy", ".bin");
+    let output_path = temp_path("output-theorem-policy", ".json");
+    let report_path = temp_path("report-theorem-policy", ".json");
+    std::fs::write(&dataset_path, b"theorem policy dataset").expect("write dataset");
+    let mut spec = sample_tune_spec(
+        dataset_path.to_str().expect("dataset path"),
+        output_path.to_str().expect("output path"),
+        report_path.to_str().expect("report path"),
+    );
+    let interface = planner_interface_for_baseline(&spec.baseline_candidate);
+    spec.controller = TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
+        interface,
+        planner_simulations_per_step: 2,
+    });
+    let best_candidate = spec.baseline_candidate.clone();
+    let compiled = spec.compile().expect("compile tune spec");
+    let dataset = load_dataset(&dataset_path).expect("load dataset");
+    let search = SearchSummary {
+        status: "completed_mc_aixi_fac_ctw",
+        warning: None,
+        best_candidate,
+        best_candidate_crc32: "00000000".to_string(),
+        best_eval: CandidateEvalResult {
+            status: CandidateEvalStatus::Success,
+            compressed_bytes: 8,
+            elapsed_seconds: 0.1,
+            effective_eval_time_limit_seconds: 1.0,
+            throughput_bytes_per_second: 10.0,
+            peak_memory_bytes: 1,
+            target_loss_bits: 64.0,
+            objective_bits: 128.0,
+            deployable: true,
+        },
+        cache_key_digest: "00000000".to_string(),
+        cache_hits: 0,
+        cache_misses: 1,
+        candidate_evaluations_executed: 1,
+        non_warmup_candidate_results_seen: 1,
+        post_baseline_candidate_results_seen: 0,
+        proposals_attempted: 0,
+        proposals_invalid: 0,
+        self_loop_proposals: 0,
+        successful_non_deployable: 0,
+        final_best_move_reward: 0.0,
+        controller_report: Value::Null,
+    };
+    let theorem = TuneTheoremConfig {
+        claim_exact_finite_mdp: true,
+        claim_exact_observed_markov: true,
+        claim_planner_convergence: true,
+        ..TuneTheoremConfig::default()
+    };
+
+    let report = theorem_claims_report(
+        &theorem,
+        &VerifiedTheoremInputs::default(),
+        compiled.controller(),
+        &dataset,
+        &search,
+    );
+    for pointer in [
+        "/exact_finite_mdp/status",
+        "/exact_observed_markov/status",
+        "/planner_convergence/status",
+    ] {
+        assert_eq!(
+            report.pointer(pointer).and_then(Value::as_str),
+            Some("uncertified")
+        );
+    }
+    assert!(
+        report["exact_observed_markov"]["missing_prerequisites"]
+            .as_array()
+            .expect("missing prerequisites")
+            .iter()
+            .any(|item| item.as_str() == Some("verified_exact_state_observation_certificate"))
+    );
+
+    let _ = std::fs::remove_file(dataset_path);
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(report_path);
+}
+
+#[test]
+fn candidate_external_asset_references_are_rejected() {
+    let candidate = CompressionBackend::Zpaq {
+        method: crate::api::ZpaqMethodSpec::literal("file:./candidate-model.zpaq"),
+    };
+    let err = reject_candidate_local_external_artifacts(&candidate)
+        .expect_err("external file reference must fail");
+    assert!(err.contains("candidate-local external filesystem/model path"));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn run_tune_writes_output_and_report_for_baseline_pass() {
+    let dataset_path = temp_path("dataset", ".bin");
+    let spec_path = temp_path("spec", ".json");
+    let output_path = temp_path("output", ".json");
+    let report_path = temp_path("report", ".json");
+    std::fs::write(&dataset_path, b"hello baseline").expect("write dataset");
+
+    let spec = sample_tune_spec(
+        dataset_path.to_str().expect("dataset path"),
+        output_path.to_str().expect("output path"),
+        report_path.to_str().expect("report path"),
+    );
+    let spec_json = SpecDocument::Tune(spec)
+        .to_canonical_json()
+        .expect("spec json");
+    std::fs::write(&spec_path, spec_json).expect("write spec");
+
+    let request = TuneCommandRequest {
+        spec_path: spec_path.to_string_lossy().to_string(),
+        execution: TuneExecutionConfig::default(),
+    };
+    run_tune(&request).expect("run tune");
+
+    let output = std::fs::read_to_string(&output_path).expect("output exists");
+    assert!(output.contains("\"kind\": \"rate-ac\""));
+    let report = std::fs::read_to_string(&report_path).expect("report exists");
+    assert!(report.contains("\"kind\": \"tune_report\""));
+
+    let _ = std::fs::remove_file(dataset_path);
+    let _ = std::fs::remove_file(spec_path);
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(report_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn run_tune_fails_when_baseline_not_deployable() {
+    let dataset_path = temp_path("dataset", ".bin");
+    let spec_path = temp_path("spec", ".json");
+    let output_path = temp_path("output", ".json");
+    let report_path = temp_path("report", ".json");
+    std::fs::write(&dataset_path, vec![0u8; 4096]).expect("write dataset");
+
+    let mut spec = sample_tune_spec(
+        dataset_path.to_str().expect("dataset path"),
+        output_path.to_str().expect("output path"),
+        report_path.to_str().expect("report path"),
+    );
+    spec.min_throughput_bytes_per_second = f64::MAX;
+    let spec_json = SpecDocument::Tune(spec)
+        .to_canonical_json()
+        .expect("spec json");
+    std::fs::write(&spec_path, spec_json).expect("write spec");
+
+    let request = TuneCommandRequest {
+        spec_path: spec_path.to_string_lossy().to_string(),
+        execution: TuneExecutionConfig::default(),
+    };
+    let err = run_tune(&request).expect_err("non-deployable baseline must fail");
+    assert!(err.contains("not deployable"));
+
+    let report = std::fs::read_to_string(&report_path).expect("report exists");
+    assert!(report.contains("\"status\": \"baseline_not_deployable\""));
+    assert!(!output_path.exists());
+
+    let _ = std::fs::remove_file(dataset_path);
+    let _ = std::fs::remove_file(spec_path);
+    let _ = std::fs::remove_file(report_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn structured_causal_dataset_objects_lower_into_charged_targets() {
+    let dataset_path = temp_path("dataset-causal", ".json");
+    std::fs::write(
+        &dataset_path,
+        causal_dataset_value(
+            "test-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "context", "channel": "action", "bytes": [1]},
+                {"kind": "observe_target_no_score", "channel": "percept", "domain": "bytes", "bytes": [2]},
+                {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [3, 4]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write dataset");
+
+    let dataset = load_dataset(&dataset_path).expect("causal dataset lowers");
+    assert_eq!(dataset.kind, DatasetKind::InteractiveTrace);
+    assert_eq!(
+        dataset.objective_target,
+        ObjectiveTarget::InteractiveCausalAc
+    );
+    assert_eq!(dataset.lowering_version, INTERACTIVE_TRACE_LOWERING_VERSION);
+    assert_eq!(dataset.codec_hash, "test-codec");
+    assert_eq!(dataset.raw_bytes, vec![3, 4]);
+    assert_eq!(dataset.target_events, 2);
+    assert_eq!(dataset.dataset_units, 2.0);
+    assert!(matches!(
+        &dataset.events[0],
+        LoweredCausalEvent::Context { channel, bytes }
+            if channel == "action" && bytes == &[1]
+    ));
+    assert!(matches!(
+        &dataset.events[1],
+        LoweredCausalEvent::ObserveTargetNoScore {
+            channel,
+            domain,
+            bytes,
+        } if channel == "percept" && domain == "bytes" && bytes == &[2]
+    ));
+    assert!(matches!(
+        &dataset.events[2],
+        LoweredCausalEvent::Target {
+            channel,
+            domain,
+            bytes,
+            weight,
+        } if channel == "percept" && domain == "bytes" && bytes == &[3] && *weight == 1.0
+    ));
+    assert!(matches!(
+        &dataset.events[3],
+        LoweredCausalEvent::Target {
+            channel,
+            domain,
+            bytes,
+            weight,
+        } if channel == "percept" && domain == "bytes" && bytes == &[4] && *weight == 1.0
+    ));
+
+    let _ = std::fs::remove_file(dataset_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn causal_prefix_lowering_resets_examples_and_replays_targets_without_score() {
+    let dataset_path = temp_path("dataset-prefix-semantics", ".json");
+    std::fs::write(
+        &dataset_path,
+        causal_dataset_value(
+            "test-prefix-codec",
+            "examples",
+            serde_json::json!([
+                {
+                    "history": [
+                        {"kind": "observe_target_no_score", "channel": "percept", "domain": "bytes", "bytes": [7]}
+                    ],
+                    "action": [1],
+                    "channel": "percept",
+                    "domain": "bytes",
+                    "target": [8],
+                    "weight": 2.0
+                },
+                {
+                    "action": [0],
+                    "channel": "percept",
+                    "domain": "bytes",
+                    "target": [9]
+                }
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write causal-prefix dataset");
+
+    let dataset = load_dataset(&dataset_path).expect("causal-prefix dataset lowers");
+    assert_eq!(dataset.kind, DatasetKind::CausalPrefixDataset);
+    assert_eq!(dataset.raw_bytes, vec![8, 9]);
+    assert_eq!(dataset.target_events, 2);
+    assert_eq!(dataset.dataset_units, 3.0);
+    assert_eq!(
+        dataset
+            .events
+            .iter()
+            .filter(|event| matches!(event, LoweredCausalEvent::Reset))
+            .count(),
+        2
+    );
+    assert!(matches!(&dataset.events[0], LoweredCausalEvent::Reset));
+    assert!(matches!(
+        &dataset.events[1],
+        LoweredCausalEvent::ObserveTargetNoScore { bytes, .. } if bytes == &[7]
+    ));
+    assert!(matches!(
+        &dataset.events[2],
+        LoweredCausalEvent::Context { channel, bytes }
+            if channel == "action" && bytes == &[1]
+    ));
+    assert!(matches!(
+        &dataset.events[3],
+        LoweredCausalEvent::Target { bytes, weight, .. }
+            if bytes == &[8] && *weight == 2.0
+    ));
+    assert!(matches!(&dataset.events[4], LoweredCausalEvent::Reset));
+    assert!(matches!(
+        &dataset.events[5],
+        LoweredCausalEvent::Context { channel, bytes }
+            if channel == "action" && bytes == &[0]
+    ));
+    assert!(matches!(
+        &dataset.events[6],
+        LoweredCausalEvent::Target { bytes, weight, .. }
+            if bytes == &[9] && *weight == 1.0
+    ));
+
+    let _ = std::fs::remove_file(dataset_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn structured_causal_dataset_rejects_missing_header_and_charged_history() {
+    let missing_header_path = temp_path("dataset-missing-causal-header", ".json");
+    std::fs::write(
+        &missing_header_path,
+        serde_json::json!({
+            "schema_version": 1,
+            "events": [{"kind": "target", "bytes": [1]}]
+        })
+        .to_string(),
+    )
+    .expect("write missing-header dataset");
+    let err = load_dataset(&missing_header_path).expect_err("header must be required");
+    assert!(err.contains("environment_id is required"), "{err}");
+
+    let malformed_structured_path = temp_path("dataset-malformed-structured", ".json");
+    std::fs::write(
+        &malformed_structured_path,
+        serde_json::json!({
+            "schema_version": 1,
+            "codec_hash": "looks-structured"
+        })
+        .to_string(),
+    )
+    .expect("write malformed structured dataset");
+    let err = load_dataset(&malformed_structured_path)
+        .expect_err("structured object must not be passive");
+    assert!(
+        err.contains("must match a canonical tuner causal dataset kind"),
+        "{err}"
+    );
+
+    let charged_history_path = temp_path("dataset-charged-history", ".json");
+    std::fs::write(
+        &charged_history_path,
+        causal_dataset_value(
+            "charged-history",
+            "examples",
+            serde_json::json!([{
+                "history": [{"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [7]}],
+                "action": [1],
+                "channel": "percept",
+                "domain": "bytes",
+                "target": [8]
+            }]),
+        )
+        .to_string(),
+    )
+    .expect("write charged-history dataset");
+    let err = load_dataset(&charged_history_path).expect_err("charged history must fail");
+    assert!(err.contains("observe_target_no_score"), "{err}");
+
+    let _ = std::fs::remove_file(missing_header_path);
+    let _ = std::fs::remove_file(malformed_structured_path);
+    let _ = std::fs::remove_file(charged_history_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn causal_dataset_header_and_event_grammar_are_strict() {
+    let invalid_header_path = temp_path("dataset-invalid-header-types", ".json");
+    std::fs::write(
+        &invalid_header_path,
+        serde_json::json!({
+            "schema_version": 1,
+            "environment_id": 7,
+            "environment_config_crc32": "00000000",
+            "codec_hash": "codec",
+            "reset_convention": "reset-before-episode",
+            "action_alphabet": {"size": 2},
+            "percept_schema": {"encoding": "bytes"},
+            "reward_encoding": {"encoding": "bytes"},
+            "terminal_encoding": {"encoding": "bytes"},
+            "collection_policy": "test",
+            "events": [{"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [1]}]
+        })
+        .to_string(),
+    )
+    .expect("write invalid-header dataset");
+    let err = load_dataset(&invalid_header_path).expect_err("invalid header type must fail");
+    assert!(err.contains("environment_id is required"), "{err}");
+
+    let alias_event_path = temp_path("dataset-alias-event-kind", ".json");
+    std::fs::write(
+        &alias_event_path,
+        causal_dataset_value(
+            "test-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "context", "channel": "action", "bytes": [1]},
+                {"kind": "observe", "channel": "percept", "domain": "bytes", "bytes": [2]},
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write alias-event dataset");
+    let err = load_dataset(&alias_event_path).expect_err("alias event kind must fail");
+    assert!(err.contains("unknown causal event kind"), "{err}");
+
+    let missing_event_grammar_path = temp_path("dataset-missing-event-grammar", ".json");
+    std::fs::write(
+        &missing_event_grammar_path,
+        serde_json::json!({
+            "schema_version": 1,
+            "environment_id": "env",
+            "environment_config_crc32": "00000000",
+            "codec_hash": "codec",
+            "reset_convention": "reset-before-episode",
+            "action_alphabet": {"size": 2},
+            "percept_schema": {"encoding": "bytes", "channels": [{"channel": "percept", "domain": "bytes"}]},
+            "reward_encoding": {"encoding": "bytes", "channel": "reward", "domain": "binary"},
+            "terminal_encoding": {"encoding": "bytes", "channel": "terminal", "domain": "binary"},
+            "collection_policy": "test",
+            "target_domains": {
+                "bytes": {"kind": "byte_alphabet"},
+                "binary": {"kind": "enumerated_payloads", "payloads": [[0], [1]]}
+            },
+            "events": [{"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [1]}]
+        })
+        .to_string(),
+    )
+    .expect("write missing-event-grammar dataset");
+    let err =
+        load_dataset(&missing_event_grammar_path).expect_err("missing event_grammar must fail");
+    assert!(err.contains("requires event_grammar"), "{err}");
+
+    let missing_domain_path = temp_path("dataset-missing-domain", ".json");
+    std::fs::write(
+        &missing_domain_path,
+        causal_dataset_value(
+            "test-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "context", "channel": "action", "bytes": [1]},
+                {"kind": "target", "channel": "percept", "bytes": [2]},
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write missing-domain dataset");
+    let err = load_dataset(&missing_domain_path).expect_err("missing domain must fail");
+    assert!(err.contains(".domain is required"), "{err}");
+
+    let _ = std::fs::remove_file(invalid_header_path);
+    let _ = std::fs::remove_file(alias_event_path);
+    let _ = std::fs::remove_file(missing_event_grammar_path);
+    let _ = std::fs::remove_file(missing_domain_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn byte_alphabet_payloads_expand_to_single_byte_events() {
+    let dataset_path = temp_path("dataset-byte-alphabet-expand", ".json");
+    std::fs::write(
+        &dataset_path,
+        causal_dataset_value(
+            "byte-expand-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "observe_target_no_score", "channel": "percept", "domain": "bytes", "bytes": [3, 4]},
+                {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [7, 8], "weight": 2.0}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write byte-alphabet expansion dataset");
+    let dataset = load_dataset(&dataset_path).expect("dataset lowers");
+    assert!(matches!(
+        &dataset.events[0],
+        LoweredCausalEvent::ObserveTargetNoScore { bytes, .. } if bytes == &[3]
+    ));
+    assert!(matches!(
+        &dataset.events[1],
+        LoweredCausalEvent::ObserveTargetNoScore { bytes, .. } if bytes == &[4]
+    ));
+    assert!(matches!(
+        &dataset.events[2],
+        LoweredCausalEvent::Target { bytes, weight, .. } if bytes == &[7] && *weight == 2.0
+    ));
+    assert!(matches!(
+        &dataset.events[3],
+        LoweredCausalEvent::Target { bytes, weight, .. } if bytes == &[8] && *weight == 2.0
+    ));
+    let _ = std::fs::remove_file(dataset_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn byte_alphabet_empty_payload_is_rejected() {
+    let dataset_path = temp_path("dataset-byte-alphabet-empty", ".json");
+    std::fs::write(
+        &dataset_path,
+        causal_dataset_value(
+            "byte-empty-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": []}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write byte-alphabet empty payload dataset");
+    let err = load_dataset(&dataset_path).expect_err("empty byte-alphabet payload must fail");
+    assert!(err.contains("must contain at least one byte"), "{err}");
+    let _ = std::fs::remove_file(dataset_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn causal_header_cross_checks_enforce_grammar_and_action_contracts() {
+    let undeclared_descriptor_path = temp_path("dataset-undeclared-event-descriptor", ".json");
+    std::fs::write(
+        &undeclared_descriptor_path,
+        causal_dataset_value(
+            "descriptor-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "target", "channel": "other", "domain": "bytes", "bytes": [1]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write undeclared descriptor dataset");
+    let err =
+        load_dataset(&undeclared_descriptor_path).expect_err("undeclared descriptor must fail");
+    assert!(
+        err.contains("not declared in event_grammar.target"),
+        "{err}"
+    );
+
+    let invalid_action_path = temp_path("dataset-invalid-action-context", ".json");
+    std::fs::write(
+        &invalid_action_path,
+        causal_dataset_value(
+            "invalid-action-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "context", "channel": "action", "bytes": [2]},
+                {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [1]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write invalid action dataset");
+    let err = load_dataset(&invalid_action_path).expect_err("invalid action context must fail");
+    assert!(err.contains("outside action_alphabet.size"), "{err}");
+
+    let mut invalid_grammar = causal_dataset_value(
+        "invalid-grammar-codec",
+        "events",
+        serde_json::json!([
+            {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [1]}
+        ]),
+    );
+    let grammar = invalid_grammar
+        .get_mut("event_grammar")
+        .and_then(Value::as_object_mut)
+        .expect("event_grammar object");
+    let targets = grammar
+        .get_mut("target")
+        .and_then(Value::as_array_mut)
+        .expect("target grammar array");
+    targets.push(serde_json::json!({"channel": "ghost", "domain": "ghost"}));
+    let invalid_grammar_path = temp_path("dataset-invalid-grammar-domain", ".json");
+    std::fs::write(
+        &invalid_grammar_path,
+        serde_json::to_string(&invalid_grammar).expect("invalid grammar json"),
+    )
+    .expect("write invalid grammar dataset");
+    let err =
+        load_dataset(&invalid_grammar_path).expect_err("grammar with undeclared domain must fail");
+    assert!(
+        err.contains("event_grammar references undeclared target domain"),
+        "{err}"
+    );
+
+    let _ = std::fs::remove_file(undeclared_descriptor_path);
+    let _ = std::fs::remove_file(invalid_action_path);
+    let _ = std::fs::remove_file(invalid_grammar_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn byte_alphabet_expansion_matches_chain_rule_loss() {
+    let dataset_expanded_from_multibyte = temp_path("dataset-byte-chain-multibyte", ".json");
+    std::fs::write(
+        &dataset_expanded_from_multibyte,
+        causal_dataset_value(
+            "chain-rule-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [65, 66]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write multi-byte dataset");
+    let dataset_explicit_singletons = temp_path("dataset-byte-chain-singletons", ".json");
+    std::fs::write(
+        &dataset_explicit_singletons,
+        causal_dataset_value(
+            "chain-rule-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [65]},
+                {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [66]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write singleton dataset");
+
+    let dataset_a = load_dataset(&dataset_expanded_from_multibyte).expect("load dataset a");
+    let dataset_b = load_dataset(&dataset_explicit_singletons).expect("load dataset b");
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 8 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    }
+    .compile()
+    .expect("compile ctw candidate");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (compressed_a, loss_a) =
+        evaluate_candidate_causal_loss(&candidate, &dataset_a, deadline).expect("eval a");
+    let (compressed_b, loss_b) =
+        evaluate_candidate_causal_loss(&candidate, &dataset_b, deadline).expect("eval b");
+    assert_eq!(compressed_a, compressed_b);
+    assert!(
+        (loss_a - loss_b).abs() < 1.0e-10,
+        "loss_a={loss_a}, loss_b={loss_b}"
+    );
+
+    let _ = std::fs::remove_file(dataset_expanded_from_multibyte);
+    let _ = std::fs::remove_file(dataset_explicit_singletons);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn causal_dataset_domains_are_profile_fixed_and_support_checked() {
+    let dataset_path = temp_path("dataset-enumerated-domain", ".json");
+    std::fs::write(
+        &dataset_path,
+        causal_dataset_value(
+            "test-enumerated-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "context", "channel": "action", "bytes": [1]},
+                {"kind": "target", "channel": "percept", "domain": "binary", "bytes": [1]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write enumerated-domain dataset");
+    let dataset = load_dataset(&dataset_path).expect("enumerated domain dataset lowers");
+    let causal_profile = dataset.causal_profile.as_ref().expect("causal profile");
+    assert!(causal_profile.domains.contains_key("binary"));
+    assert_eq!(
+        dataset.target_domain_support_hash,
+        causal_profile.domain_support_hash
+    );
+    assert_ne!(
+        dataset.target_domain_support_hash,
+        crc32_hex(b"passive-byte-alphabet")
+    );
+
+    let out_of_support_path = temp_path("dataset-enumerated-domain-out", ".json");
+    std::fs::write(
+        &out_of_support_path,
+        causal_dataset_value(
+            "test-enumerated-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "target", "channel": "percept", "domain": "binary", "bytes": [2]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write out-of-support dataset");
+    let err = load_dataset(&out_of_support_path).expect_err("out-of-support target fails");
+    assert!(err.contains("outside target-domain support"), "{err}");
+
+    let _ = std::fs::remove_file(dataset_path);
+    let _ = std::fs::remove_file(out_of_support_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn causal_event_channel_and_domain_affect_skeleton_identity() {
+    let path_a = temp_path("dataset-channel-a", ".json");
+    let path_b = temp_path("dataset-channel-b", ".json");
+    std::fs::write(
+        &path_a,
+        causal_dataset_value(
+            "same-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [7]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write channel a");
+    std::fs::write(
+        &path_b,
+        causal_dataset_value(
+            "same-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "target", "channel": "reward", "domain": "binary", "bytes": [1]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write channel b");
+
+    let dataset_a = load_dataset(&path_a).expect("load channel a");
+    let dataset_b = load_dataset(&path_b).expect("load channel b");
+    assert_ne!(dataset_a.event_grammar_hash, dataset_b.event_grammar_hash);
+    assert_eq!(dataset_a.codec_hash, dataset_b.codec_hash);
+
+    let _ = std::fs::remove_file(path_a);
+    let _ = std::fs::remove_file(path_b);
+}
+
+#[test]
+fn annealer_schedule_matches_normative_log_linear_law() {
+    let mid = annealer_temperature(0.5);
+    let expected_mid = ANNEALER_T_MIN_BITS * (ANNEALER_T0_BITS / ANNEALER_T_MIN_BITS).powf(0.5);
+    assert_eq!(annealer_progress_from_elapsed(0.0, 10.0), 0.0);
+    assert_eq!(annealer_progress_from_elapsed(5.0, 10.0), 0.5);
+    assert_eq!(annealer_progress_from_elapsed(20.0, 10.0), 1.0);
+    assert!((annealer_temperature(0.0) - ANNEALER_T0_BITS).abs() < 1.0e-12);
+    assert!((annealer_temperature(1.0) - ANNEALER_T_MIN_BITS).abs() < 1.0e-12);
+    assert!((mid - expected_mid).abs() < 1.0e-12);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn exact_state_observation_projection_supports_stream_hash() {
+    let interface = PlannerInterfaceSpec {
+        observation_bits: 3,
+        observation_stream_len: 2,
+        observation_key_mode: ObservationKeyMode::StreamHash,
+        reward_bits: 16,
+        min_reward: 0,
+        max_reward: 10,
+        reward_offset: 0,
+        agent_actions: action_alphabet(2),
+    };
+    let projected = project_observation_output("stream_hash", &[9, 2], interface.observation_bits)
+        .expect("stream_hash projection");
+    assert_eq!(projected, vec![130]);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn discounted_aiqi_exact_theorem_claims_remain_uncertified_by_family() {
+    let controller =
+        crate::spec::CompiledTuneController::AiqiDiscounted(AiqiDiscountedTuneControllerSpec {
+            interface: TunePlannerInterfaceSpec {
+                observation_bits: 8,
+                observation_stream_len: 1,
+                observation_key_mode: ObservationKeyMode::FullStream,
+                reward_bits: 16,
+                agent_actions: action_alphabet(2),
+            },
+            planner_simulations_per_step: 1,
+            return_horizon: 1,
+            return_bins: 2,
+            discount_factor: 0.0,
+            min_improvement: 0.0,
+            max_improvement: 1.0,
+        });
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 8 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let search = SearchSummary {
+        status: "test",
+        warning: None,
+        best_candidate: candidate,
+        best_candidate_crc32: "00000000".to_string(),
+        best_eval: CandidateEvalResult {
+            status: CandidateEvalStatus::Success,
+            compressed_bytes: 1,
+            elapsed_seconds: 0.1,
+            effective_eval_time_limit_seconds: 1.0,
+            throughput_bytes_per_second: 10.0,
+            peak_memory_bytes: 1,
+            target_loss_bits: 8.0,
+            objective_bits: 16.0,
+            deployable: true,
+        },
+        cache_key_digest: "00000000".to_string(),
+        cache_hits: 0,
+        cache_misses: 0,
+        candidate_evaluations_executed: 1,
+        non_warmup_candidate_results_seen: 1,
+        post_baseline_candidate_results_seen: 0,
+        proposals_attempted: 0,
+        proposals_invalid: 0,
+        self_loop_proposals: 0,
+        successful_non_deployable: 0,
+        final_best_move_reward: 0.0,
+        controller_report: Value::Null,
+    };
+    let theorem = TuneTheoremConfig {
+        claim_exact_finite_mdp: true,
+        scalar_representation_ref: Some(SCALAR_REPRESENTATION_DECLARATION.to_string()),
+        ..TuneTheoremConfig::default()
+    };
+    let verified = VerifiedTheoremInputs {
+        finite_planner_state: Some(VerifiedCertificate {
+            ref_value: "finite.json".to_string(),
+            content_hash: "00000000".to_string(),
+        }),
+        no_hidden_state: Some(VerifiedCertificate {
+            ref_value: "hidden.json".to_string(),
+            content_hash: "00000000".to_string(),
+        }),
+        exact_reward_encoding: Some(VerifiedExactRewardEncodingCertificate {
+            base: VerifiedCertificate {
+                ref_value: "reward.json".to_string(),
+                content_hash: "00000000".to_string(),
+            },
+            max_reward: 65_535,
+            reward_bits: 16,
+            scalar_representation: SCALAR_REPRESENTATION_DECLARATION.to_string(),
+            mode: VerifiedRewardEncodingMode::IntegerObjectiveDifferenceInterval,
+        }),
+        exact_state_observation: None,
+        determinism_deadline: None,
+        deterministic_table: None,
+    };
+    let missing = exact_finite_mdp_missing_prereqs(&theorem, &verified, &controller, &search);
+    assert!(missing.contains(&"exact_objective_difference_controller"));
+}
+
+#[test]
+fn warmstart_trace_merge_is_content_deduplicated_and_deterministically_ordered() {
+    let mut teacher = WarmStartExactJhTeacherDataset::default();
+    let high_key_trace = WarmStartExactJhTeacherTrace {
+        transitions: vec![WarmStartExactJhTransition {
+            action: 1_u64,
+            observations: vec![2],
+            reward: 3,
+        }],
+    };
+    let low_key_trace = WarmStartExactJhTeacherTrace {
+        transitions: vec![WarmStartExactJhTransition {
+            action: 0_u64,
+            observations: vec![1],
+            reward: 1,
+        }],
+    };
+    teacher.traces.push(high_key_trace.clone());
+
+    merge_warmstart_trace_deterministic(&mut teacher, low_key_trace.clone())
+        .expect("merge distinct trace");
+    let ordered_keys = teacher
+        .traces
+        .iter()
+        .map(warmstart_trace_key)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("trace keys");
+    let mut sorted_keys = ordered_keys.clone();
+    sorted_keys.sort();
+    assert_eq!(ordered_keys, sorted_keys);
+    assert_eq!(teacher.traces.len(), 2);
+
+    merge_warmstart_trace_deterministic(&mut teacher, low_key_trace)
+        .expect("duplicate merge remains idempotent");
+    assert_eq!(teacher.traces.len(), 2);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn run_tune_annealed_reports_search_activity() {
+    let dataset_path = temp_path("dataset-annealed", ".bin");
+    let spec_path = temp_path("spec-annealed", ".json");
+    let output_path = temp_path("output-annealed", ".json");
+    let report_path = temp_path("report-annealed", ".json");
+    std::fs::write(&dataset_path, b"annealed-search-dataset").expect("write dataset");
+
+    let mut spec = sample_tune_spec(
+        dataset_path.to_str().expect("dataset path"),
+        output_path.to_str().expect("output path"),
+        report_path.to_str().expect("report path"),
+    );
+    spec.bounds.parameter_ranges = vec![crate::spec::TuneParameterRangeSpec {
+        parameter: "rate_backend.depth".to_string(),
+        min: 1.0,
+        max: 16.0,
+    }];
+    let spec_json = SpecDocument::Tune(spec)
+        .to_canonical_json()
+        .expect("spec json");
+    std::fs::write(&spec_path, spec_json).expect("write spec");
+
+    let request = TuneCommandRequest {
+        spec_path: spec_path.to_string_lossy().to_string(),
+        execution: TuneExecutionConfig {
+            max_evaluations: Some(3),
+            ..TuneExecutionConfig::default()
+        },
+    };
+    run_tune(&request).expect("run tune");
+
+    let report = std::fs::read_to_string(&report_path).expect("report exists");
+    assert!(report.contains("\"status\": \"completed_annealed\""));
+    assert!(report.contains("\"proposals_attempted\":"));
+    let report_json: Value = serde_json::from_str(&report).expect("report json");
+    assert_eq!(
+        report_json
+            .pointer("/search/baseline_counts_toward_max_evaluations")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let non_warmup_results = report_json
+        .pointer("/search/non_warmup_candidate_results_seen")
+        .and_then(Value::as_u64)
+        .expect("non_warmup_candidate_results_seen");
+    let post_baseline_results = report_json
+        .pointer("/search/post_baseline_candidate_results_seen")
+        .and_then(Value::as_u64)
+        .expect("post_baseline_candidate_results_seen");
+    assert!((1..=3).contains(&non_warmup_results));
+    assert_eq!(post_baseline_results + 1, non_warmup_results);
+    let cache_calls = report_json
+        .pointer("/cache/actual_evaluator_calls_excluding_warmups")
+        .and_then(Value::as_u64)
+        .expect("actual_evaluator_calls_excluding_warmups");
+    assert_eq!(
+        report_json
+            .pointer("/cache/candidate_evaluations_executed")
+            .and_then(Value::as_u64),
+        Some(cache_calls)
+    );
+
+    let _ = std::fs::remove_file(dataset_path);
+    let _ = std::fs::remove_file(spec_path);
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(report_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn planner_family_controller_executes_runtime_path() {
+    let dataset_path = temp_path("dataset-planner", ".bin");
+    let spec_path = temp_path("spec-planner", ".json");
+    let output_path = temp_path("output-planner", ".json");
+    let report_path = temp_path("report-planner", ".json");
+    std::fs::write(&dataset_path, b"planner-controller-dataset").expect("write dataset");
+
+    let mut spec = sample_tune_spec(
+        dataset_path.to_str().expect("dataset path"),
+        output_path.to_str().expect("output path"),
+        report_path.to_str().expect("report path"),
+    );
+    spec.controller = TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
+        interface: planner_interface_for_baseline(&spec.baseline_candidate),
+        planner_simulations_per_step: 8,
+    });
+    let bounds = spec.bounds.clone();
+    let spec_json = SpecDocument::Tune(spec)
+        .to_canonical_json()
+        .expect("spec json");
+    std::fs::write(&spec_path, spec_json).expect("write spec");
+    let reward_cert_path = temp_path("reward-cert-planner", ".json");
+    write_test_exact_reward_certificate(
+        &reward_cert_path,
+        &dataset_path,
+        &bounds,
+        "mc_aixi_fac_ctw",
+    );
+
+    let request = TuneCommandRequest {
+        spec_path: spec_path.to_string_lossy().to_string(),
+        execution: TuneExecutionConfig {
+            theorem: TuneTheoremConfig {
+                exact_reward_encoding_certificate: Some(
+                    reward_cert_path.to_string_lossy().to_string(),
+                ),
+                ..TuneTheoremConfig::default()
+            },
+            ..TuneExecutionConfig::default()
+        },
+    };
+    run_tune(&request).expect("run tune");
+
+    let report = std::fs::read_to_string(&report_path).expect("report exists");
+    assert!(report.contains("\"status\": \"completed_mc_aixi_fac_ctw\""));
+    assert!(report.contains("\"runtime_path\": \"finite_mutation_agent_bridge_mcaixi_fac_ctw\""));
+
+    let _ = std::fs::remove_file(dataset_path);
+    let _ = std::fs::remove_file(spec_path);
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(report_path);
+    let _ = std::fs::remove_file(reward_cert_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn executor_profile_and_dataset_mode_do_not_change_canonical_tune_identity() {
+    let passive_dataset_path = temp_path("dataset-passive", ".bin");
+    let trace_dataset_path = temp_path("dataset-trace", ".json");
+    let prefix_dataset_path = temp_path("dataset-prefix", ".json");
+    let output_path = temp_path("output-identity", ".json");
+    let report_path = temp_path("report-identity", ".json");
+    std::fs::write(&passive_dataset_path, b"identity-passive").expect("write passive");
+    std::fs::write(
+        &trace_dataset_path,
+        causal_dataset_value(
+            "identity-trace-codec",
+            "events",
+            serde_json::json!([
+                {"kind": "context", "channel": "action", "bytes": [1]},
+                {"kind": "target", "channel": "percept", "domain": "bytes", "bytes": [2, 3]}
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write trace");
+    std::fs::write(
+        &prefix_dataset_path,
+        causal_dataset_value(
+            "identity-prefix-codec",
+            "examples",
+            serde_json::json!([
+                {
+                    "history": [{"kind": "observe_target_no_score", "channel": "percept", "domain": "bytes", "bytes": [7]}],
+                    "action": [1],
+                    "channel": "percept",
+                    "domain": "bytes",
+                    "target": [8],
+                    "weight": 2.0
+                }
+            ]),
+        )
+        .to_string(),
+    )
+    .expect("write prefix");
+
+    let dataset_paths = [
+        passive_dataset_path.as_path(),
+        trace_dataset_path.as_path(),
+        prefix_dataset_path.as_path(),
+    ];
+    for dataset_path in dataset_paths {
+        let mut base = sample_tune_spec(
+            dataset_path.to_str().expect("dataset path"),
+            output_path.to_str().expect("output path"),
+            report_path.to_str().expect("report path"),
+        );
+        let interface = planner_interface_for_baseline(&base.baseline_candidate);
+        let controllers = vec![
+            TuneControllerSpec::AnnealedHillClimbing(AnnealedHillClimbingTuneControllerSpec {
+                max_mutation_radius: 1,
+            }),
+            TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
+                interface: interface.clone(),
+                planner_simulations_per_step: 2,
+            }),
+            TuneControllerSpec::AiqiDiscounted(AiqiDiscountedTuneControllerSpec {
+                interface: interface.clone(),
+                planner_simulations_per_step: 2,
+                return_horizon: 1,
+                return_bins: 2,
+                discount_factor: 0.5,
+                min_improvement: 0.0,
+                max_improvement: 1.0,
+            }),
+            TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
+                interface: interface.clone(),
+                planner_simulations_per_step: 2,
+                return_horizon: 1,
+                warmstart_teacher_dataset_asset: "teacher".to_string(),
+                label_phase_period: 1,
+            }),
+        ];
+        for controller in controllers {
+            base.controller = controller;
+            base.assets.retain(|asset| asset.id == "dataset");
+            if matches!(base.controller, TuneControllerSpec::AiqiWarmstartExactJh(_)) {
+                base.assets.push(AssetBinding {
+                    id: "teacher".to_string(),
+                    path: passive_dataset_path.to_string_lossy().to_string(),
+                });
+            }
+            let canonical_a = SpecDocument::Tune(base.clone())
+                .to_canonical_json()
+                .expect("canonical tune a");
+            let mut execution = TuneExecutionConfig {
+                max_evaluations: Some(1),
+                warmup_baseline_runs: 3,
+                ..TuneExecutionConfig::default()
+            };
+            execution.theorem.timing_certification_tier = TimingCertificationTier::RealTime;
+            execution.theorem.determinism_deadline_certificate =
+                Some("cert://deadline".to_string());
+            let canonical_b = SpecDocument::Tune(base.clone())
+                .to_canonical_json()
+                .expect("canonical tune b");
+            assert_eq!(canonical_a, canonical_b);
+            let loaded = load_dataset(dataset_path).expect("dataset mode loads");
+            let profile_a = EvaluatorProfile {
+                dataset_kind: loaded.kind,
+                objective_target: loaded.objective_target,
+                dataset_lowering_version: loaded.lowering_version,
+                dataset_codec_hash: loaded.codec_hash.clone(),
+                event_grammar_hash: loaded.event_grammar_hash.clone(),
+                target_domain_support_hash: loaded.target_domain_support_hash.clone(),
+                causal_header_profile_hash: loaded.causal_header_profile_hash.clone(),
+                target_size_function: loaded.target_size_function,
+                evaluator_interface_version: TUNER_EVALUATOR_INTERFACE_VERSION,
+                candidate_canonicalization_version: "bounds-v1".to_string(),
+                warmup_baseline_runs: 0,
+                diagnostic_chunk_bytes: None,
+                eval_time_limit_seconds: base.eval_time_limit_seconds,
+                evaluator_threads: 1,
+                worker_isolation_mode: "spawn_exec_worker",
+                evaluator_determinism: "deterministic_under_h",
+                rss_mode: PeakMemoryMode::ProcessRssPeak,
+                timing_certification_tier: TimingCertificationTier::BestEffort,
+                build_profile: "test",
+                feature_set: vec!["test"],
+            };
+            let mut profile_b = profile_a.clone();
+            profile_b.warmup_baseline_runs = execution.warmup_baseline_runs;
+            profile_b.timing_certification_tier = execution.theorem.timing_certification_tier;
+            assert_ne!(
+                profile_a.hash().expect("profile a"),
+                profile_b.hash().expect("profile b")
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(passive_dataset_path);
+    let _ = std::fs::remove_file(trace_dataset_path);
+    let _ = std::fs::remove_file(prefix_dataset_path);
+}

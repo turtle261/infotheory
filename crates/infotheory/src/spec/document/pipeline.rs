@@ -154,6 +154,7 @@ pub(super) fn compile_validated_tune_spec(
     Ok(CompiledTuneSpec {
         canonical_spec: validated.canonical_spec.clone(),
         canonical_bytes: validated.canonical_bytes().clone(),
+        base_dir: validated.base_dir.clone(),
         resolved_assets: resolve_asset_bindings(
             &validated.canonical_spec().assets,
             &validated.base_dir,

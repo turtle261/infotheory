@@ -115,6 +115,13 @@ where
 \begin{remark}[Peak-memory measurement semantics]
 Each candidate evaluation is executed in its own isolated evaluator instance.
 
+For strict v1 theorem-facing execution, that isolated evaluator instance is a
+fresh spawned-and-exec'd worker process per candidate evaluation
+(\texttt{spawn\_exec\_worker}). The parent controller runtime is sequential
+(\texttt{parent\_controller\_threads}=1). Optional multithreading is allowed
+inside the evaluator worker only, because its runtime/threadpool state is
+initialized after process creation.
+
 Preferred definition: $\mu(z)$ is the peak memory usage attributed to that
 instance by the operating-system or container memory controller (for example,
 cgroup peak memory usage) over the lifetime of the evaluation.
@@ -122,6 +129,10 @@ cgroup peak memory usage) over the lifetime of the evaluation.
 Fallback definition when such accounting is unavailable: the evaluator must run
 as a single process, and $\mu(z)$ is the operating-system reported peak RSS of
 that process.
+
+Executing complex runtime/library code in a raw post-\texttt{fork()} child
+without an \texttt{exec()} boundary is non-conforming for strict v1
+theorem-facing isolation.
 
 Naive summation of RSS across a multi-process tree is not normative, because it
 can double-count shared pages.
@@ -546,7 +557,7 @@ do not change candidate identity, such as:
     \item \texttt{max\_evaluations}
     \item \texttt{annealer\_kernel\_profile}
     \item \texttt{cpu\_affinity}
-    \item \texttt{threads}
+    \item \texttt{threads} (interpreted as evaluator-worker-internal thread count)
     \item \texttt{warmup\_baseline\_runs}
     \item \texttt{self\_improvement\_rounds}
     \item \texttt{stagnation\_reset\_evals}
@@ -554,6 +565,18 @@ do not change candidate identity, such as:
     \item \texttt{diagnostic\_chunk\_bytes}
     \item executor-local logging destinations
 \end{itemize}
+
+For strict v1 theorem-facing execution, the parent controller is sequential:
+\[
+\texttt{parent\_controller\_threads}=1.
+\]
+When \texttt{threads} is exposed, it controls only evaluator-worker-internal
+threading:
+\[
+\texttt{evaluator\_threads}:=\texttt{threads}\ \text{(default 1)}.
+\]
+The required process-isolation mode is
+\texttt{worker\_isolation\_mode="spawn\_exec\_worker"}.
 
 These controls belong to the executor profile rather than to the canonical
 candidate/request surface, unless an implementation explicitly lifts them into
@@ -1284,6 +1307,7 @@ metrics or semantics, including at minimum:
     \item the effective evaluator timeout actually used for the call,
     \item whether physical byte artifacts are materialized,
     \item planner deployability profile switches,
+    \item worker isolation mode and evaluator-worker thread count,
     \item build/features, evaluator determinism settings, warmup policy, and
     candidate canonicalization classification/version.
 \end{itemize}
@@ -2800,6 +2824,10 @@ The structured report should record at minimum:
     \item seed,
     \item timing-certification tier and determinism/deadline certificate (if
     theorem certification is claimed),
+    \item parent-controller thread count, evaluator-worker thread count, and
+    worker isolation mode,
+    \item evaluator determinism profile declaration (for exact theorem claims:
+    deterministic under $H$),
     \item configured throughput floor $\theta_{\min}$ and derived runtime cap
     $\tau_{\theta}=N_H(d)/\theta_{\min}$, with $\tau_{\theta}=n/\theta_{\min}$
     in passive-byte mode,
@@ -2948,6 +2976,13 @@ observed-Markov claims are invoked, and exact finite reward encoding of
 objective differences as specified in
 Remark~\ref{rem:reward-encoding-safety}. They do not require $d$ to be a
 passive-byte dataset.
+
+If evaluator-worker-internal multithreading is enabled
+(\texttt{evaluator\_threads}>1), any floating-point reduction order or runtime
+effect that could change evaluator outputs must either be made deterministic
+under $H$ or be declared as non-theorem-certified profile behavior. Exact
+theorem claims require deterministic evaluator semantics under the declared
+$H$ profile.
 
 \begin{assumption}[Finite planner-exposed candidate domain]\label{ass:finite-Z}
 The planner-exposed canonical candidate set

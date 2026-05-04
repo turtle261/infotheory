@@ -845,6 +845,20 @@ fn run_tune_mode(_args: &[String]) {
     std::process::exit(1);
 }
 
+#[cfg(feature = "tuner")]
+fn run_tuner_eval_worker_mode() {
+    if let Err(err) = tuner::run_tuner_eval_worker_from_env() {
+        eprintln!("Error: tuner evaluator worker failed: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(feature = "tuner"))]
+fn run_tuner_eval_worker_mode() {
+    eprintln!("Error: tuner evaluator worker requires infotheory built with feature 'tuner'");
+    std::process::exit(1);
+}
+
 #[cfg(feature = "backend-rosa")]
 fn search_command(args: &[String]) {
     if args.len() < 4 {
@@ -982,6 +996,10 @@ fn main() {
     }
 
     let primitive = &args[1];
+    if primitive == "__infotheory-tuner-eval-worker" {
+        run_tuner_eval_worker_mode();
+        return;
+    }
     if primitive == "batch" {
         run_batch_mode();
         return;

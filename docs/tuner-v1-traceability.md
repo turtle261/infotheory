@@ -59,7 +59,7 @@ This checklist maps the normative Tuner V1 implementation obligations in
   deterministic table or verified certificate basis. Implemented by
   `evaluator_execution_model`, `theorem_timing_basis`, and
   `theorem_claims_report`.
-- `evaluator_execution_model: fork_process_isolated_operational` records an
+- `evaluator_execution_model: spawn_exec_worker_process_isolated_operational` records an
   operational Unix evaluator process model. It is not the same claim as theorem
   timing tier `isolated`; timing claims remain uncertified unless
   `theorem_timing_basis` names a verified real-time certificate or deterministic

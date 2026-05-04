@@ -470,6 +470,11 @@ impl CompiledTuneSpec {
         &self.canonical_bytes
     }
 
+    /// Base directory used to resolve relative paths during tune compilation.
+    pub fn base_dir(&self) -> &Path {
+        self.base_dir.as_path()
+    }
+
     /// Resolved assets used when compiling the tune request.
     pub fn resolved_assets(&self) -> &[ResolvedAssetBinding] {
         self.resolved_assets.as_ref()

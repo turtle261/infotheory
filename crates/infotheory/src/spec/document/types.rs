@@ -777,6 +777,7 @@ pub enum CompiledTuneController {
 pub struct CompiledTuneSpec {
     pub(super) canonical_spec: Arc<TuneSpec>,
     pub(super) canonical_bytes: CanonicalBytes,
+    pub(super) base_dir: PathBuf,
     pub(super) resolved_assets: Arc<[ResolvedAssetBinding]>,
     pub(super) baseline_candidate: CompiledCompressionBackend,
     pub(super) controller: CompiledTuneController,

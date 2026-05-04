@@ -16,6 +16,18 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 TRACEABILITY = ROOT / "docs" / "tuner-v1-traceability.md"
 TUNER = ROOT / "crates" / "infotheory" / "src" / "tuner.rs"
+TUNER_MODULE_DIR = ROOT / "crates" / "infotheory" / "src" / "tuner"
+TUNER_SOURCES = (
+    TUNER,
+    TUNER_MODULE_DIR / "annealer.rs",
+    TUNER_MODULE_DIR / "causal_dataset.rs",
+    TUNER_MODULE_DIR / "certificates.rs",
+    TUNER_MODULE_DIR / "config.rs",
+    TUNER_MODULE_DIR / "eval.rs",
+    TUNER_MODULE_DIR / "planner_bridge.rs",
+    TUNER_MODULE_DIR / "report.rs",
+    TUNER_MODULE_DIR / "tests.rs",
+)
 WARMSTART = ROOT / "crates" / "infotheory" / "src" / "aixi" / "warmstart.rs"
 TUNER_TESTS = ROOT / "crates" / "infotheory" / "tests" / "tuner_integration.rs"
 SPEC_TESTS = ROOT / "crates" / "infotheory" / "src" / "spec" / "document" / "tests.rs"
@@ -140,13 +152,15 @@ def ref_exists_as_definition(ref: str, path: Path, haystack: str) -> bool:
 
 def main() -> int:
     doc = TRACEABILITY.read_text(encoding="utf-8")
+    tuner_haystack = "\n".join(path.read_text(encoding="utf-8") for path in TUNER_SOURCES)
     missing: list[str] = []
     for ref, path in REQUIRED_REFS:
         if ref not in doc:
             missing.append(f"{TRACEABILITY.relative_to(ROOT)} does not cite `{ref}`")
-        haystack = path.read_text(encoding="utf-8")
+        haystack = tuner_haystack if path == TUNER else path.read_text(encoding="utf-8")
         if not ref_exists_as_definition(ref, path, haystack):
-            missing.append(f"{path.relative_to(ROOT)} does not define `{ref}`")
+            target = "tuner implementation sources" if path == TUNER else str(path.relative_to(ROOT))
+            missing.append(f"{target} do not define `{ref}`")
     if missing:
         print("Tuner traceability check failed:", file=sys.stderr)
         for item in missing:

@@ -2,7 +2,9 @@
 
 use crc32fast::Hasher;
 use infotheory::spec::{SpecDocument, SpecEnvironment};
-use infotheory::tuner::{TimingCertificationTier, parse_tune_command_args, run_tune};
+use infotheory::tuner::{
+    TimingCertificationTier, parse_tune_command_args, run_tune, run_tuner_eval_worker_from_env,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,6 +82,18 @@ fn bool_at(value: &Value, pointer: &str) -> bool {
         .pointer(pointer)
         .and_then(Value::as_bool)
         .unwrap_or_else(|| panic!("{pointer} must be a boolean in {value}"))
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "libtest entrypoint for spawned tuner evaluator workers"]
+fn __infotheory_tuner_eval_worker() {
+    if std::env::var_os("INFOTHEORY_TUNER_EVAL_REQUEST_PATH").is_none()
+        || std::env::var_os("INFOTHEORY_TUNER_EVAL_RESPONSE_PATH").is_none()
+    {
+        return;
+    }
+    run_tuner_eval_worker_from_env().expect("run tuner evaluator worker from env");
 }
 
 fn interface() -> Value {
@@ -463,6 +477,9 @@ fn evaluator_profile_crc32(dataset_path: &Path, timing: TimingCertificationTier)
         "warmup_baseline_runs": 0,
         "diagnostic_chunk_bytes": null,
         "effective_eval_time_limit_seconds_bits": 1.0f64.to_bits(),
+        "evaluator_threads": 1,
+        "worker_isolation_mode": "spawn_exec_worker",
+        "evaluator_determinism": "deterministic_under_h",
         "rss_mode": "process_rss_peak",
         "timing_certification_tier": timing_label(timing),
         "build_profile": option_env!("PROFILE").unwrap_or("unknown"),
@@ -2784,7 +2801,7 @@ fn tune_cli_accepts_executor_flags_and_writes_report() {
     );
     assert_eq!(
         str_at(&report, "/evaluator_execution_model"),
-        "fork_process_isolated_operational"
+        "spawn_exec_worker_process_isolated_operational"
     );
     assert_eq!(
         str_at(&report, "/theorem_timing_basis"),
