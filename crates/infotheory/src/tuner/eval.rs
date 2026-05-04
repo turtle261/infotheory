@@ -211,7 +211,13 @@ fn parse_candidate_eval_payload(payload: &Value) -> Result<CandidateEvalResult, 
     }
     let throughput_bytes_per_second = object
         .get("throughput_bytes_per_second")
-        .and_then(Value::as_f64)
+        .and_then(|v| {
+            if v.is_null() {
+                Some(f64::INFINITY)
+            } else {
+                v.as_f64()
+            }
+        })
         .ok_or_else(|| "evaluator payload missing throughput_bytes_per_second".to_string())?;
     let peak_memory_bytes = object
         .get("peak_memory_bytes")
@@ -219,11 +225,23 @@ fn parse_candidate_eval_payload(payload: &Value) -> Result<CandidateEvalResult, 
         .ok_or_else(|| "evaluator payload missing peak_memory_bytes".to_string())?;
     let target_loss_bits = object
         .get("target_loss_bits")
-        .and_then(Value::as_f64)
+        .and_then(|v| {
+            if v.is_null() {
+                Some(f64::INFINITY)
+            } else {
+                v.as_f64()
+            }
+        })
         .ok_or_else(|| "evaluator payload missing target_loss_bits".to_string())?;
     let objective_bits = object
         .get("objective_bits")
-        .and_then(Value::as_f64)
+        .and_then(|v| {
+            if v.is_null() {
+                Some(f64::INFINITY)
+            } else {
+                v.as_f64()
+            }
+        })
         .ok_or_else(|| "evaluator payload missing objective_bits".to_string())?;
     let deployable = object
         .get("deployable")
@@ -515,9 +533,13 @@ fn evaluate_candidate_unbounded(
     } else {
         dataset.dataset_units / elapsed_seconds
     };
-    let objective_bits = ((model_bytes as f64) * 8.0) + target_loss_bits;
     let deployable = throughput_bytes_per_second >= min_throughput_bytes_per_second
         && peak_memory_bytes <= max_memory_bytes;
+    let objective_bits = if deployable {
+        ((model_bytes as f64) * 8.0) + target_loss_bits
+    } else {
+        f64::INFINITY
+    };
 
     Ok(CandidateEvalResult {
         status: CandidateEvalStatus::Success,
@@ -751,4 +773,50 @@ pub(super) fn cache_key_for_candidate(
         evaluator_profile_bytes,
         dataset_identity: dataset_hash.to_string(),
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_worker_payload_accepts_null_serialized_infinities() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "status": "success",
+            "compressed_bytes": 0,
+            "elapsed_seconds": 0.0,
+            "effective_eval_time_limit_seconds": 1.0,
+            "throughput_bytes_per_second": null,
+            "peak_memory_bytes": 0,
+            "target_loss_bits": 0.0,
+            "objective_bits": 8.0,
+            "deployable": true
+        });
+
+        let result = parse_candidate_eval_payload(&payload).expect("parse worker payload");
+
+        assert_eq!(result.status, CandidateEvalStatus::Success);
+        assert!(result.throughput_bytes_per_second.is_infinite());
+        assert!(result.throughput_bytes_per_second.is_sign_positive());
+
+        let payload = serde_json::json!({
+            "ok": true,
+            "status": "timeout",
+            "compressed_bytes": 0,
+            "elapsed_seconds": 1.0,
+            "effective_eval_time_limit_seconds": 1.0,
+            "throughput_bytes_per_second": 0.0,
+            "peak_memory_bytes": 0,
+            "target_loss_bits": null,
+            "objective_bits": null,
+            "deployable": false
+        });
+
+        let result = parse_candidate_eval_payload(&payload).expect("parse worker payload");
+
+        assert_eq!(result.status, CandidateEvalStatus::Timeout);
+        assert!(result.target_loss_bits.is_infinite());
+        assert!(result.objective_bits.is_infinite());
+    }
 }

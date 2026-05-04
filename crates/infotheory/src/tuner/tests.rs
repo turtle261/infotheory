@@ -738,12 +738,70 @@ fn reversible_metropolis_acceptance_uses_objective_bits_temperature() {
     assert!((uphill - (-1.5f64).exp()).abs() <= f64::EPSILON);
     let downhill = annealer_acceptance_probability(
         AnnealerKernelProfile::ReversibleElementaryMetropolis,
-        -3.0,
-        2.0,
+        -2.0,
+        3.0,
         &proposal,
     )
     .expect("reversible metropolis probability");
-    assert_eq!(downhill, 1.0);
+    assert!((downhill - 1.0).abs() <= f64::EPSILON);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn metropolis_acceptance_envelope_sweep() {
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    use crate::tuner::AnnealedProposal;
+    use crate::tuner::annealer::annealer_acceptance_probability;
+    use crate::tuner::config::AnnealerKernelProfile;
+
+    let proposal = AnnealedProposal {
+        candidate: CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 1 },
+            coder: crate::coders::CoderType::AC,
+            framing: FramingMode::Framed,
+        },
+        forward_raw_action_count: 1,
+        forward_total_raw_actions: 2,
+        reverse_raw_action_count: 1,
+        reverse_total_raw_actions: 2,
+    };
+
+    let mut previous_probability: Option<f64> = None;
+    for t in 1..=100 {
+        let temp = t as f64;
+        let delta = 2.0;
+        let prob = annealer_acceptance_probability(
+            AnnealerKernelProfile::ReversibleElementaryMetropolis,
+            delta,
+            temp,
+            &proposal,
+        )
+        .unwrap();
+        let expected = (-delta / temp).exp().clamp(0.0, 1.0);
+
+        assert!(
+            (prob - expected).abs() <= f64::EPSILON,
+            "uphill Metropolis probability must equal exp(-delta / temperature): prob={prob}, expected={expected}, temperature={temp}"
+        );
+        if let Some(previous) = previous_probability {
+            assert!(
+                previous < prob,
+                "uphill Metropolis probability must strictly increase with temperature: previous={previous}, current={prob}, temperature={temp}"
+            );
+        }
+        previous_probability = Some(prob);
+
+        let delta_neg = -2.0;
+        let prob_neg = annealer_acceptance_probability(
+            AnnealerKernelProfile::ReversibleElementaryMetropolis,
+            delta_neg,
+            temp,
+            &proposal,
+        )
+        .unwrap();
+        assert_eq!(prob_neg, 1.0, "Negative delta must always be accepted");
+    }
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -2002,7 +2060,7 @@ fn planner_family_controller_executes_runtime_path() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
-fn executor_profile_and_dataset_mode_do_not_change_canonical_tune_identity() {
+fn executor_controls_are_excluded_from_canonical_tune_but_included_in_evaluator_profile() {
     let passive_dataset_path = temp_path("dataset-passive", ".bin");
     let trace_dataset_path = temp_path("dataset-trace", ".json");
     let prefix_dataset_path = temp_path("dataset-prefix", ".json");
@@ -2088,21 +2146,71 @@ fn executor_profile_and_dataset_mode_do_not_change_canonical_tune_identity() {
                     path: passive_dataset_path.to_string_lossy().to_string(),
                 });
             }
-            let canonical_a = SpecDocument::Tune(base.clone())
-                .to_canonical_json()
-                .expect("canonical tune a");
-            let mut execution = TuneExecutionConfig {
-                max_evaluations: Some(1),
-                warmup_baseline_runs: 3,
-                ..TuneExecutionConfig::default()
+            let mut request_a = TuneCommandRequest {
+                spec_path: "spec-a.json".to_string(),
+                execution: TuneExecutionConfig::default(),
             };
-            execution.theorem.timing_certification_tier = TimingCertificationTier::RealTime;
-            execution.theorem.determinism_deadline_certificate =
+            let mut request_b = request_a.clone();
+            request_b.spec_path = "spec-b.json".to_string();
+            request_b.execution.max_evaluations = Some(1);
+            request_b.execution.annealer_kernel_profile =
+                AnnealerKernelProfile::CompiledUniformMetropolisHastings;
+            request_b.execution.warmup_baseline_runs = 3;
+            request_b.execution.diagnostic_chunk_bytes = Some(4096);
+            request_b.execution.theorem.timing_certification_tier =
+                TimingCertificationTier::RealTime;
+            request_b.execution.theorem.determinism_deadline_certificate =
                 Some("cert://deadline".to_string());
-            let canonical_b = SpecDocument::Tune(base.clone())
-                .to_canonical_json()
-                .expect("canonical tune b");
+
+            let canonical_value_a = SpecDocument::Tune(base.clone())
+                .to_canonical_json_value()
+                .expect("canonical tune a");
+            for field in [
+                "max_evaluations",
+                "annealer_kernel_profile",
+                "cpu_affinity",
+                "threads",
+                "warmup_baseline_runs",
+                "self_improvement_rounds",
+                "stagnation_reset_evals",
+                "log_path",
+                "diagnostic_chunk_bytes",
+                "rss_mode",
+                "planner_deployable_model",
+                "warmstart_trace_refresh",
+                "theorem",
+            ] {
+                assert!(
+                    canonical_value_a.get(field).is_none(),
+                    "canonical tune document must not contain executor field '{field}'"
+                );
+            }
+            let spec_path_a = temp_path("identity-spec-a", ".json");
+            let spec_path_b = temp_path("identity-spec-b", ".json");
+            let canonical_text = serde_json::to_vec(&canonical_value_a).expect("canonical json");
+            std::fs::write(&spec_path_a, &canonical_text).expect("write spec a");
+            std::fs::write(&spec_path_b, &canonical_text).expect("write spec b");
+            request_a.spec_path = spec_path_a.to_string_lossy().to_string();
+            request_b.spec_path = spec_path_b.to_string_lossy().to_string();
+            let canonical_a = crate::spec::load_spec_document(&request_a.spec_path)
+                .expect("load spec a")
+                .validate()
+                .expect("validate spec a")
+                .canonical_bytes()
+                .as_slice()
+                .to_vec();
+            let canonical_b = crate::spec::load_spec_document(&request_b.spec_path)
+                .expect("load spec b")
+                .validate()
+                .expect("validate spec b")
+                .canonical_bytes()
+                .as_slice()
+                .to_vec();
+            assert_ne!(request_a.spec_path, request_b.spec_path);
+            assert_ne!(request_a.execution, request_b.execution);
             assert_eq!(canonical_a, canonical_b);
+            let _ = std::fs::remove_file(spec_path_a);
+            let _ = std::fs::remove_file(spec_path_b);
             let loaded = load_dataset(dataset_path).expect("dataset mode loads");
             let profile_a = EvaluatorProfile {
                 dataset_kind: loaded.kind,
@@ -2127,8 +2235,10 @@ fn executor_profile_and_dataset_mode_do_not_change_canonical_tune_identity() {
                 feature_set: vec!["test"],
             };
             let mut profile_b = profile_a.clone();
-            profile_b.warmup_baseline_runs = execution.warmup_baseline_runs;
-            profile_b.timing_certification_tier = execution.theorem.timing_certification_tier;
+            profile_b.warmup_baseline_runs = request_b.execution.warmup_baseline_runs;
+            profile_b.diagnostic_chunk_bytes = request_b.execution.diagnostic_chunk_bytes;
+            profile_b.timing_certification_tier =
+                request_b.execution.theorem.timing_certification_tier;
             assert_ne!(
                 profile_a.hash().expect("profile a"),
                 profile_b.hash().expect("profile b")
@@ -2139,4 +2249,938 @@ fn executor_profile_and_dataset_mode_do_not_change_canonical_tune_identity() {
     let _ = std::fs::remove_file(passive_dataset_path);
     let _ = std::fs::remove_file(trace_dataset_path);
     let _ = std::fs::remove_file(prefix_dataset_path);
+}
+// --- Group 1: Canonicalization and model-code properties ---
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn canon_idempotent() {
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 4 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let c1 = candidate.compile().unwrap();
+    let b1 = c1.canonical_bytes().as_slice().to_vec();
+    let env = crate::spec::SpecEnvironment::new(std::path::Path::new("."));
+    let ast = crate::spec::parse_compression_backend_json(
+        &crate::spec::compression_backend_to_json_value(&c1.canonical_spec()).unwrap(),
+        std::path::Path::new("."),
+        None,
+        FramingMode::Framed,
+    )
+    .unwrap();
+    let c2 = ast.compile_in(&env).unwrap();
+    let b2 = c2.canonical_bytes().as_slice().to_vec();
+    assert_eq!(b1, b2);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn canonical_bytes_prefix_free_on_generated_corpus() {
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    let mut corpus = Vec::new();
+    for depth in 1..=8 {
+        corpus.push(
+            CompressionBackend::Rate {
+                rate_backend: RateBackend::Ctw { depth },
+                coder: crate::coders::CoderType::AC,
+                framing: FramingMode::Framed,
+            }
+            .compile()
+            .unwrap()
+            .canonical_bytes()
+            .as_slice()
+            .to_vec(),
+        );
+    }
+    for i in 0..corpus.len() {
+        for j in 0..corpus.len() {
+            if i != j {
+                assert!(corpus[i] != corpus[j]);
+                assert!(!corpus[i].starts_with(&corpus[j]) && !corpus[j].starts_with(&corpus[i]));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn syntactic_aliases_canonicalize_to_same_model_code_length() {
+    use crate::compression::FramingMode;
+    let canonical_syntax = serde_json::json!({
+        "kind": "rate-ac",
+        "rate_backend": {"kind": "ctw", "depth": 16},
+        "framing": "framed"
+    });
+    let alias_syntax = serde_json::json!({
+        "kind": "rate-ac",
+        "backend_spec": {"kind": "ctw"}
+    });
+    assert_ne!(canonical_syntax, alias_syntax);
+
+    let z1_ast = crate::spec::parse_compression_backend_json(
+        &canonical_syntax,
+        std::path::Path::new("."),
+        None,
+        FramingMode::Framed,
+    )
+    .unwrap();
+    let z2_ast = crate::spec::parse_compression_backend_json(
+        &alias_syntax,
+        std::path::Path::new("."),
+        None,
+        FramingMode::Framed,
+    )
+    .unwrap();
+    let z1 = z1_ast.compile().unwrap();
+    let z2 = z2_ast.compile().unwrap();
+    assert_eq!(
+        z1.canonical_bytes().as_slice(),
+        z2.canonical_bytes().as_slice()
+    );
+    assert_eq!(z1.canonical_bytes().len(), z2.canonical_bytes().len());
+    assert_eq!(
+        8_usize * z1.canonical_bytes().len(),
+        8_usize * z2.canonical_bytes().len()
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn cache_key_includes_effective_timeout() {
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    use crate::tuner::tests::temp_path;
+    use crate::tuner::{EvaluatorProfile, cache_key_for_candidate};
+    use std::time::Instant;
+    let z = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 4 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    }
+    .compile()
+    .unwrap();
+
+    let dataset_path = temp_path("dataset-cache-key", ".bin");
+    std::fs::write(&dataset_path, b"test-data").unwrap();
+    let dataset = crate::tuner::tests::load_dataset(&dataset_path).unwrap();
+    let output_path = temp_path("cache-key-output", ".json");
+    let report_path = temp_path("cache-key-report", ".json");
+    let mut spec = sample_tune_spec(
+        dataset_path.to_str().unwrap(),
+        output_path.to_str().unwrap(),
+        report_path.to_str().unwrap(),
+    );
+    spec.eval_time_limit_seconds = 10.0;
+    spec.time_budget_seconds = 60.0;
+    let full_budget_compiled = spec.compile().unwrap();
+    spec.time_budget_seconds = 9.999;
+    let truncated_budget_compiled = spec.compile().unwrap();
+    let tune_started = Instant::now();
+    let full_effective_limit =
+        effective_eval_limit_seconds(&full_budget_compiled, tune_started, Some(10.0), None);
+    let truncated_effective_limit =
+        effective_eval_limit_seconds(&truncated_budget_compiled, tune_started, Some(10.0), None);
+    assert_eq!(full_effective_limit, 10.0);
+    assert!(truncated_effective_limit > 0.0);
+    assert!(truncated_effective_limit < full_effective_limit);
+
+    let profile1 = EvaluatorProfile {
+        dataset_kind: dataset.kind,
+        objective_target: dataset.objective_target,
+        dataset_lowering_version: dataset.lowering_version,
+        dataset_codec_hash: dataset.codec_hash.clone(),
+        event_grammar_hash: dataset.event_grammar_hash.clone(),
+        target_domain_support_hash: dataset.target_domain_support_hash.clone(),
+        causal_header_profile_hash: dataset.causal_header_profile_hash.clone(),
+        target_size_function: dataset.target_size_function,
+        evaluator_interface_version: crate::tuner::TUNER_EVALUATOR_INTERFACE_VERSION,
+        candidate_canonicalization_version: "bounds-v1".to_string(),
+        warmup_baseline_runs: 0,
+        diagnostic_chunk_bytes: None,
+        eval_time_limit_seconds: full_effective_limit,
+        evaluator_threads: 1,
+        worker_isolation_mode: "spawn_exec_worker",
+        evaluator_determinism: "deterministic_under_h",
+        rss_mode: crate::tuner::PeakMemoryMode::ProcessRssPeak,
+        timing_certification_tier: crate::tuner::TimingCertificationTier::BestEffort,
+        build_profile: "unknown",
+        feature_set: crate::tuner::compiled_feature_set(),
+    };
+
+    let mut profile2 = profile1.clone();
+    profile2.eval_time_limit_seconds = truncated_effective_limit;
+
+    let bytes = z.canonical_bytes().as_slice();
+    let key1 = cache_key_for_candidate(bytes, &profile1, &dataset.canonical_content_hash).unwrap();
+    let key2 = cache_key_for_candidate(bytes, &profile2, &dataset.canonical_content_hash).unwrap();
+    assert_ne!(key1, key2);
+    assert_eq!(
+        key1.candidate_canonical_bytes,
+        key2.candidate_canonical_bytes
+    );
+    assert_eq!(key1.dataset_identity, key2.dataset_identity);
+    assert_ne!(key1.evaluator_profile_bytes, key2.evaluator_profile_bytes);
+    assert_ne!(profile1.hash().unwrap(), profile2.hash().unwrap());
+    let _ = std::fs::remove_file(dataset_path);
+}
+
+// --- Group 3: Deployability and objective-totalization properties ---
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn objective_totalizes_nondeployable_to_infinity_over_randomized_states() {
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    use crate::tuner::eval::evaluate_candidate;
+    use crate::tuner::tests::temp_path;
+    use crate::tuner::{
+        CandidateEvalStatus, DeterministicEvaluatorRow, PeakMemoryMode,
+        VerifiedDeterministicEvaluatorTable,
+    };
+    use std::collections::HashMap;
+
+    let z1 = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 4 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    }
+    .compile()
+    .unwrap();
+    let dataset_path = temp_path("dataset-dep", ".bin");
+    std::fs::write(&dataset_path, b"1234567890123456").unwrap(); // 16 bytes
+    let dataset = crate::tuner::tests::load_dataset(&dataset_path).unwrap();
+    let crc = crate::tuner::crc32_hex(z1.canonical_bytes().as_slice());
+
+    let mut rng = crate::tuner::RandomGenerator::new();
+
+    // Generative test over 100 random states
+    for _ in 0..100 {
+        let status = match rng.next_u64() % 4 {
+            0 => CandidateEvalStatus::Success,
+            1 => CandidateEvalStatus::Timeout,
+            2 => CandidateEvalStatus::Invalid,
+            _ => CandidateEvalStatus::Error,
+        };
+        // Generate random elapsed seconds between 0.001 and 10.0
+        let elapsed = 0.001 + (rng.next_u64() as f64 / u64::MAX as f64) * 9.999;
+        // Generate random peak memory up to 10MB
+        let peak_mem = rng.next_u64() % 10_000_000;
+        // fixed target_loss_bits for simplicity, it's valid
+        let target_loss = 80.0;
+
+        let mut rows = HashMap::new();
+        rows.insert(
+            crc.clone(),
+            DeterministicEvaluatorRow {
+                status: status.clone(),
+                compressed_bytes: 10,
+                elapsed_seconds: elapsed,
+                peak_memory_bytes: peak_mem,
+                target_loss_bits: target_loss,
+            },
+        );
+        let table = VerifiedDeterministicEvaluatorTable {
+            base: crate::tuner::VerifiedCertificate {
+                ref_value: "ref".to_string(),
+                content_hash: "hash".to_string(),
+            },
+            rows,
+        };
+
+        // Strict thresholds
+        let min_tp = 50.0;
+        let max_mem = 2000;
+
+        let res = evaluate_candidate(
+            &z1,
+            &dataset,
+            1,
+            min_tp,
+            max_mem,
+            10.0,
+            PeakMemoryMode::ProcessRssPeak,
+            1,
+            Some(&table),
+        )
+        .unwrap();
+
+        let tp = 16.0 / elapsed;
+        let is_deployable =
+            matches!(status, CandidateEvalStatus::Success) && tp >= min_tp && peak_mem <= max_mem;
+
+        assert_eq!(
+            res.deployable, is_deployable,
+            "deployable flag mismatch for status={:?}, tp={}, mem={}",
+            status, tp, peak_mem
+        );
+        if is_deployable {
+            assert!(
+                res.objective_bits.is_finite(),
+                "deployable candidate must have finite objective"
+            );
+        } else {
+            assert_eq!(
+                res.objective_bits,
+                f64::INFINITY,
+                "non-deployable candidate must totalize to infinity"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(dataset_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn cache_key_is_exact_tuple_of_candidate_profile_and_dataset_identity() {
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    let z1 = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 4 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    }
+    .compile()
+    .unwrap();
+    let z2 = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 5 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    }
+    .compile()
+    .unwrap();
+    let profile1 = EvaluatorProfile {
+        dataset_kind: DatasetKind::PassiveBytes,
+        objective_target: ObjectiveTarget::PassiveAc,
+        dataset_lowering_version: PASSIVE_DATASET_LOWERING_VERSION,
+        dataset_codec_hash: "passive-identity-bytes".to_string(),
+        event_grammar_hash: "passive-target-only-byte-stream".to_string(),
+        target_domain_support_hash: crc32_hex(b"passive-byte-alphabet"),
+        causal_header_profile_hash: crc32_hex(b"passive-none"),
+        target_size_function: "passive-bytes-len",
+        evaluator_interface_version: TUNER_EVALUATOR_INTERFACE_VERSION,
+        candidate_canonicalization_version: "bounds-v1".to_string(),
+        warmup_baseline_runs: 0,
+        diagnostic_chunk_bytes: None,
+        eval_time_limit_seconds: 1.0,
+        evaluator_threads: 1,
+        worker_isolation_mode: "spawn_exec_worker",
+        evaluator_determinism: "deterministic_under_h",
+        rss_mode: PeakMemoryMode::ProcessRssPeak,
+        timing_certification_tier: TimingCertificationTier::BestEffort,
+        build_profile: "test",
+        feature_set: vec!["test"],
+    };
+    let mut profile2 = profile1.clone();
+    profile2.eval_time_limit_seconds = 2.0;
+    let dataset1 = crc32_hex(b"dataset-one");
+    let dataset2 = crc32_hex(b"dataset-two");
+    let z1_bytes = z1.canonical_bytes().as_slice();
+    let z2_bytes = z2.canonical_bytes().as_slice();
+
+    let key = cache_key_for_candidate(z1_bytes, &profile1, &dataset1).unwrap();
+    let same = cache_key_for_candidate(z1_bytes, &profile1, &dataset1).unwrap();
+    let changed_candidate = cache_key_for_candidate(z2_bytes, &profile1, &dataset1).unwrap();
+    let changed_profile = cache_key_for_candidate(z1_bytes, &profile2, &dataset1).unwrap();
+    let changed_dataset = cache_key_for_candidate(z1_bytes, &profile1, &dataset2).unwrap();
+
+    assert_eq!(key, same);
+    assert_ne!(key, changed_candidate);
+    assert_ne!(key, changed_profile);
+    assert_ne!(key, changed_dataset);
+    assert_eq!(key.candidate_canonical_bytes, z1_bytes);
+    assert_eq!(key.dataset_identity, dataset1);
+    assert_ne!(
+        key.evaluator_profile_bytes,
+        changed_profile.evaluator_profile_bytes
+    );
+}
+
+// --- Group 5: Causal evaluator semantic properties ---
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn observe_target_no_score_contributes_zero_bits() {
+    // Property: the action context field (ObserveTargetNoScore) conditions the
+    // predictor state but must itself contribute exactly zero bits to target_loss_bits.
+    //
+    // Pure semantic proof without heuristic numeric bounds:
+    // Evaluate Dataset A: [Observe(0)], Dataset B: [Target(0)],
+    // and Dataset C: [Observe(0), Target(0)].
+    //
+    // We assert:
+    // - loss(A) == 0.0 (an ObserveTargetNoScore event literally costs 0.0 bits)
+    // - loss(C) != loss(B), proving the replay event changed future predictor state.
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    use crate::tuner::eval::evaluate_candidate_causal_loss;
+    use crate::tuner::tests::{causal_dataset_value, temp_path};
+
+    let z = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 8 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    }
+    .compile()
+    .unwrap();
+
+    let path_a = temp_path("causal-obs-a", ".json");
+    std::fs::write(
+        &path_a,
+        causal_dataset_value(
+            "json-causal-byte-events-v1",
+            "events",
+            serde_json::json!([
+                { "kind": "observe_target_no_score", "channel": "percept", "domain": "binary", "bytes": [0] }
+            ]),
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let path_b = temp_path("causal-target-b", ".json");
+    std::fs::write(
+        &path_b,
+        causal_dataset_value(
+            "json-causal-byte-events-v1",
+            "events",
+            serde_json::json!([
+                { "kind": "target", "channel": "percept", "domain": "binary", "bytes": [0] }
+            ]),
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let path_c = temp_path("causal-obs-c", ".json");
+    std::fs::write(
+        &path_c,
+        causal_dataset_value(
+            "json-causal-byte-events-v1",
+            "events",
+            serde_json::json!([
+                { "kind": "observe_target_no_score", "channel": "percept", "domain": "binary", "bytes": [0] },
+                { "kind": "target", "channel": "percept", "domain": "binary", "bytes": [0] }
+            ]),
+        )
+        .to_string(),
+    )
+    .unwrap();
+
+    let ds_a = crate::tuner::tests::load_dataset(&path_a).unwrap();
+    let ds_b = crate::tuner::tests::load_dataset(&path_b).unwrap();
+    let ds_c = crate::tuner::tests::load_dataset(&path_c).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let res_a = evaluate_candidate_causal_loss(&z, &ds_a, deadline).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let res_b = evaluate_candidate_causal_loss(&z, &ds_b, deadline).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let res_c = evaluate_candidate_causal_loss(&z, &ds_c, deadline).unwrap();
+
+    let loss_a: f64 = res_a.1;
+    let loss_b: f64 = res_b.1;
+    let loss_c: f64 = res_c.1;
+
+    assert_eq!(
+        loss_a, 0.0,
+        "An isolated ObserveTargetNoScore event must contribute exactly 0.0 bits"
+    );
+    assert!(
+        loss_b.is_finite() && loss_c.is_finite(),
+        "charged target losses must be finite for the binary target-domain test"
+    );
+    assert_ne!(
+        loss_b.to_bits(),
+        loss_c.to_bits(),
+        "ObserveTargetNoScore must update future predictor state; otherwise replay+target would equal target-only"
+    );
+
+    let _ = std::fs::remove_file(path_a);
+    let _ = std::fs::remove_file(path_b);
+    let _ = std::fs::remove_file(path_c);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn exact_mdl_map_equivalence_over_finite_semantic_class() {
+    let candidates = [
+        (16.0_f64, 2.0_f64.powi(-20)),
+        (24.0_f64, 2.0_f64.powi(-6)),
+        (32.0_f64, 2.0_f64.powi(-1)),
+        (8.0_f64, 0.0_f64),
+    ];
+    let objectives = candidates
+        .iter()
+        .map(|(model_bits, likelihood)| {
+            if *likelihood == 0.0 {
+                f64::INFINITY
+            } else {
+                *model_bits - likelihood.log2()
+            }
+        })
+        .collect::<Vec<_>>();
+    let posterior_scores = candidates
+        .iter()
+        .map(|(model_bits, likelihood)| 2.0_f64.powf(-*model_bits) * *likelihood)
+        .collect::<Vec<_>>();
+    let prior_mass = candidates
+        .iter()
+        .map(|(model_bits, _)| 2.0_f64.powf(-*model_bits))
+        .sum::<f64>();
+    let normalized_scores = candidates
+        .iter()
+        .map(|(model_bits, likelihood)| (2.0_f64.powf(-*model_bits) / prior_mass) * *likelihood)
+        .collect::<Vec<_>>();
+    let argmin_objective = objectives
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(index, _)| index)
+        .unwrap();
+    let argmax_posterior = posterior_scores
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(index, _)| index)
+        .unwrap();
+    let argmax_normalized = normalized_scores
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(index, _)| index)
+        .unwrap();
+    let mixture_codelength = -posterior_scores.iter().sum::<f64>().log2();
+    let best_objective = objectives[argmin_objective];
+
+    assert_eq!(argmin_objective, argmax_posterior);
+    assert_eq!(argmin_objective, argmax_normalized);
+    assert!(mixture_codelength <= best_objective);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn finite_incumbent_oracle_enforces_monotone_key_and_objective() {
+    fn eval(objective_bits: f64, deployable: bool) -> CandidateEvalResult {
+        CandidateEvalResult {
+            status: if deployable {
+                CandidateEvalStatus::Success
+            } else {
+                CandidateEvalStatus::Timeout
+            },
+            compressed_bytes: 0,
+            elapsed_seconds: 1.0,
+            effective_eval_time_limit_seconds: 1.0,
+            throughput_bytes_per_second: if deployable { 1.0 } else { 0.0 },
+            peak_memory_bytes: 0,
+            target_loss_bits: objective_bits,
+            objective_bits,
+            deployable,
+        }
+    }
+
+    let mut best_eval = eval(10.0, true);
+    let mut best_bytes = vec![0x20];
+    let mut updates = vec![(best_eval.clone(), best_bytes.clone())];
+    let candidates = vec![
+        (eval(f64::INFINITY, false), vec![0x00]),
+        (eval(12.0, true), vec![0x00]),
+        (eval(8.0, true), vec![0xff]),
+        (eval(8.0, true), vec![0x01]),
+        (eval(9.0, true), vec![0x00]),
+        (eval(5.0, true), vec![0x80]),
+    ];
+
+    for (candidate_eval, candidate_bytes) in candidates {
+        let old_best_eval = best_eval.clone();
+        let old_best_bytes = best_bytes.clone();
+        let should_update = candidate_eval.deployable
+            && key_less(&candidate_eval, &candidate_bytes, &best_eval, &best_bytes);
+
+        if should_update {
+            assert!(candidate_eval.objective_bits <= old_best_eval.objective_bits);
+            if candidate_eval.objective_bits == old_best_eval.objective_bits {
+                assert!(candidate_bytes < old_best_bytes);
+            }
+            best_eval = candidate_eval;
+            best_bytes = candidate_bytes;
+            updates.push((best_eval.clone(), best_bytes.clone()));
+        } else {
+            assert_eq!(
+                best_eval.objective_bits.to_bits(),
+                old_best_eval.objective_bits.to_bits()
+            );
+            assert_eq!(best_bytes, old_best_bytes);
+        }
+    }
+
+    for pair in updates.windows(2) {
+        let (previous_eval, previous_bytes) = &pair[0];
+        let (next_eval, next_bytes) = &pair[1];
+        assert!(key_less(
+            next_eval,
+            next_bytes,
+            previous_eval,
+            previous_bytes
+        ));
+        assert!(next_eval.objective_bits <= previous_eval.objective_bits);
+    }
+
+    let accepted_current_eval = eval(7.0, true);
+    let accepted_current_bytes = vec![0x00];
+    assert!(!key_less(
+        &accepted_current_eval,
+        &accepted_current_bytes,
+        &best_eval,
+        &best_bytes
+    ));
+    assert!(accepted_current_eval.objective_bits > best_eval.objective_bits);
+    assert_eq!(best_eval.objective_bits, 5.0);
+    assert_eq!(best_bytes, vec![0x80]);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn exact_reward_encoder_telescopes_incumbent_objective_decreases() {
+    fn eval(objective_bits: f64, deployable: bool) -> CandidateEvalResult {
+        CandidateEvalResult {
+            status: if deployable {
+                CandidateEvalStatus::Success
+            } else {
+                CandidateEvalStatus::Timeout
+            },
+            compressed_bytes: 0,
+            elapsed_seconds: 1.0,
+            effective_eval_time_limit_seconds: 1.0,
+            throughput_bytes_per_second: if deployable { 1.0 } else { 0.0 },
+            peak_memory_bytes: 0,
+            target_loss_bits: objective_bits,
+            objective_bits,
+            deployable,
+        }
+    }
+
+    let encoder = TunerRewardEncoder::ExactIntegerObjectiveDifference {
+        max_reward: 20,
+        objective_difference_to_symbol: None,
+    };
+    for reward in 0..=20 {
+        assert_eq!(encoder.encode(reward as f64).unwrap(), reward);
+    }
+
+    let baseline_eval = eval(10.0, true);
+    let baseline_bytes = vec![0x20];
+    let mut best_eval = baseline_eval.clone();
+    let mut best_bytes = baseline_bytes;
+    let mut decoded_reward_sum = 0_i64;
+    let candidates = vec![
+        (eval(12.0, true), vec![0x00]),
+        (eval(7.0, true), vec![0xff]),
+        (eval(7.0, true), vec![0x01]),
+        (eval(f64::INFINITY, false), vec![0x00]),
+        (eval(4.0, true), vec![0x80]),
+    ];
+
+    for (candidate_eval, candidate_bytes) in candidates {
+        let improves_best = candidate_eval.deployable
+            && key_less(&candidate_eval, &candidate_bytes, &best_eval, &best_bytes);
+        let raw_improvement = if improves_best {
+            (best_eval.objective_bits - candidate_eval.objective_bits).max(0.0)
+        } else {
+            0.0
+        };
+        let reward = encoder.encode(raw_improvement).unwrap();
+        decoded_reward_sum = decoded_reward_sum.saturating_add(reward);
+        if improves_best {
+            best_eval = candidate_eval;
+            best_bytes = candidate_bytes;
+        }
+    }
+
+    assert_eq!(
+        decoded_reward_sum as f64,
+        baseline_eval.objective_bits - best_eval.objective_bits
+    );
+    assert_eq!(decoded_reward_sum, 6);
+    assert_eq!(best_eval.objective_bits, 4.0);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn normalized_clipped_improvement_stays_in_unit_interval_and_rejects_degenerate_bounds() {
+    assert_eq!(normalized_clipped_improvement(-1.0, 0.0, 2.0).unwrap(), 0.0);
+    assert_eq!(normalized_clipped_improvement(1.0, 0.0, 2.0).unwrap(), 0.5);
+    assert_eq!(normalized_clipped_improvement(3.0, 0.0, 2.0).unwrap(), 1.0);
+    assert!(normalized_clipped_improvement(1.0, 2.0, 2.0).is_err());
+
+    let encoder = TunerRewardEncoder::NormalizedClipped {
+        min_improvement: 0.0,
+        max_improvement: 2.0,
+        max_reward: 10,
+    };
+    assert_eq!(encoder.encode(-1.0).unwrap(), 0);
+    assert_eq!(encoder.encode(1.0).unwrap(), 5);
+    assert_eq!(encoder.encode(3.0).unwrap(), 10);
+}
+
+// --- Group 6: Reversible elementary kernel properties ---
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn inactive_radius_moves_become_self_loops() {
+    // Property: out-of-radius and boundary-crossing moves must not appear in the
+    // transition kernel — the move is silently absent (a self-loop in MH terms),
+    // never clipped to the nearest valid value.
+    //
+    // We test two distinct cases:
+    //
+    // Case 1 — active_radius=0: no move with any magnitude is within radius, so
+    //   the entire transition map must be empty and sampling yields Exhausted.
+    //
+    // Case 2 — boundary self-loop: candidate is at the lower bound (depth=1), so
+    //   the downward delta=-1 move (depth=0) violates the [1,16] bounds and must
+    //   be ABSENT from transitions. The upward delta=+1 move (depth=2) is valid
+    //   and must be PRESENT. This proves boundary moves self-loop rather than clip.
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    use crate::spec::TuneParameterRangeSpec;
+    use crate::tuner::annealer::{
+        apply_integer_descriptor, collect_numeric_leaves, compile_canonical_proposal_kernel,
+        integer_leaf_bounds,
+    };
+    use crate::tuner::tests::sample_tune_spec;
+
+    let mut bounds = sample_tune_spec("", "", "").bounds;
+    bounds.parameter_ranges = vec![TuneParameterRangeSpec {
+        parameter: "rate_backend.depth".to_string(),
+        min: 1.0,
+        max: 16.0,
+    }];
+    let env = crate::spec::SpecEnvironment::new(std::path::Path::new("."));
+
+    // --- Case 1: active_radius = 0 yields an empty kernel (Exhausted). ---
+    let candidate_mid = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 4 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let compiled_mid = candidate_mid.compile().unwrap();
+    let bytes_mid = compiled_mid.canonical_bytes().as_slice();
+    let kernel_zero_radius =
+        compile_canonical_proposal_kernel(&candidate_mid, &bounds, 3, 0, &env, bytes_mid).unwrap();
+    assert!(
+        kernel_zero_radius.transitions.is_empty(),
+        "active_radius=0 must produce an empty transition map"
+    );
+    let mut rng = crate::tuner::RandomGenerator::new();
+    let draw = crate::tuner::annealer::sample_annealed_proposal(
+        &candidate_mid,
+        &bounds,
+        3,
+        0,
+        &env,
+        &mut rng,
+    )
+    .unwrap();
+    assert!(
+        matches!(draw, crate::tuner::AnnealedProposalDraw::Exhausted),
+        "sampling from empty kernel must yield Exhausted"
+    );
+
+    // --- Case 2: boundary self-loop — candidate at lower bound (depth=1). ---
+    // With active_radius=1 and max_mutation_radius=3, only magnitude-1 moves are
+    // within radius.  depth=1 is the lower bound, so delta=-1 → depth=0 is out of
+    // [1,16] and must be absent.  delta=+1 → depth=2 is valid and must be present.
+    let candidate_lb = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 1 }, // at lower bound
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let compiled_lb = candidate_lb.compile().unwrap();
+    let bytes_lb = compiled_lb.canonical_bytes().as_slice().to_vec();
+    let kernel_lb =
+        compile_canonical_proposal_kernel(&candidate_lb, &bounds, 3, 1, &env, &bytes_lb).unwrap();
+    assert_eq!(
+        kernel_lb.total_raw_actions, 6,
+        "kernel raw action space must retain inactive and boundary self-loop descriptors"
+    );
+    assert_eq!(
+        kernel_lb.transitions.len(),
+        1,
+        "at the lower bound with active radius 1, only the valid upward move may be emitted"
+    );
+    assert_eq!(
+        kernel_lb.proposal_mass_to_canonical_bytes(&bytes_lb),
+        0,
+        "self-loops must not be emitted as explicit current-candidate transitions"
+    );
+
+    assert!(
+        kernel_lb
+            .transitions
+            .iter()
+            .all(|t| t.candidate_canonical_bytes != bytes_lb),
+        "boundary and inactive self-loops must remain implicit, not emitted as clipped current transitions"
+    );
+
+    // The upward move (depth=2) MUST appear in transitions.
+    let depth2_candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 2 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let depth2_bytes = depth2_candidate
+        .compile()
+        .unwrap()
+        .canonical_bytes()
+        .as_slice()
+        .to_vec();
+    let has_depth2 = kernel_lb
+        .transitions
+        .iter()
+        .any(|t| t.candidate_canonical_bytes == depth2_bytes);
+    assert!(
+        has_depth2,
+        "depth=2 (valid +1 from lower bound) must be present in transition kernel"
+    );
+
+    // Direct application: apply_integer_descriptor must return false for the
+    // boundary-crossing delta, confirming no implicit clipping occurs.
+    let json_lb = crate::spec::compression_backend_to_json_value(&candidate_lb).unwrap();
+    let leaves = collect_numeric_leaves(&json_lb);
+    let depth_leaf = leaves
+        .iter()
+        .find(|l| l.path.contains("depth"))
+        .expect("depth leaf");
+    let (min_b, max_b) = integer_leaf_bounds(depth_leaf.kind, Some((1.0, 16.0))).unwrap();
+    let mut json_mut = json_lb.clone();
+    let applied_down = apply_integer_descriptor(&mut json_mut, depth_leaf, min_b, max_b, -1);
+    assert!(
+        !applied_down,
+        "apply_integer_descriptor must return false for depth 1 + delta -1 (out of bounds)"
+    );
+    assert_eq!(
+        json_mut, json_lb,
+        "failed boundary move must leave the candidate JSON unchanged rather than clipping"
+    );
+    let mut json_mut2 = json_lb.clone();
+    let applied_up = apply_integer_descriptor(&mut json_mut2, depth_leaf, min_b, max_b, 1);
+    assert!(
+        applied_up,
+        "apply_integer_descriptor must return true for depth 1 + delta +1 (valid move)"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn finite_evaluator_table_oracle_selects_minimum_deployable_jh() {
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    use crate::tuner::tests::temp_path;
+    use crate::tuner::{
+        CandidateEvalResult, CandidateEvalStatus, DeterministicEvaluatorRow,
+        VerifiedDeterministicEvaluatorTable,
+    };
+    use std::collections::HashMap;
+
+    let ds_path = temp_path("oracle", ".bin");
+    std::fs::write(&ds_path, b"test").unwrap();
+    let loaded = crate::tuner::tests::load_dataset(&ds_path).unwrap();
+
+    let candidates = (1_usize..=8)
+        .map(|depth| {
+            (
+                depth,
+                CompressionBackend::Rate {
+                    rate_backend: RateBackend::Ctw { depth },
+                    coder: crate::coders::CoderType::AC,
+                    framing: FramingMode::Framed,
+                }
+                .compile()
+                .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut rows = HashMap::<String, DeterministicEvaluatorRow>::new();
+    for (depth, candidate) in &candidates {
+        let target_loss_bits = match depth {
+            1 => 130.0,
+            2 => 120.0,
+            3 => 90.0,
+            4 => 80.0,
+            5 => 70.0,
+            6 => 20.0,
+            7 => 1.0,
+            8 => 50.0,
+            _ => unreachable!(),
+        };
+        let peak_memory_bytes = if *depth == 7 { 10_000 } else { 100 };
+        rows.insert(
+            crate::tuner::crc32_hex(candidate.canonical_bytes().as_slice()),
+            DeterministicEvaluatorRow {
+                status: CandidateEvalStatus::Success,
+                compressed_bytes: 10,
+                target_loss_bits,
+                elapsed_seconds: 0.01,
+                peak_memory_bytes,
+            },
+        );
+    }
+    let table = VerifiedDeterministicEvaluatorTable {
+        base: crate::tuner::VerifiedCertificate {
+            ref_value: "test://deterministic-table".to_string(),
+            content_hash: "00000000".to_string(),
+        },
+        rows,
+    };
+
+    let max_memory_bytes: u64 = 1_000;
+    let mut production_best: Option<(usize, CandidateEvalResult, Vec<u8>)> = None;
+    let mut reference_best: Option<(usize, f64, Vec<u8>)> = None;
+    for (depth, candidate) in &candidates {
+        let model_bytes = candidate.canonical_bytes().len();
+        let eval = table
+            .evaluate(candidate, &loaded, model_bytes, 1.0, max_memory_bytes, 1.0)
+            .unwrap();
+        let candidate_bytes = candidate.canonical_bytes().as_slice().to_vec();
+        let reference_objective = if eval.status == CandidateEvalStatus::Success
+            && eval.throughput_bytes_per_second >= 1.0
+            && eval.peak_memory_bytes <= max_memory_bytes
+        {
+            (model_bytes as f64 * 8.0) + eval.target_loss_bits
+        } else {
+            f64::INFINITY
+        };
+
+        if production_best
+            .as_ref()
+            .map(|(_, best_eval, best_bytes)| {
+                key_less(&eval, &candidate_bytes, best_eval, best_bytes)
+            })
+            .unwrap_or(true)
+        {
+            production_best = Some((*depth, eval.clone(), candidate_bytes.clone()));
+        }
+        if reference_best
+            .as_ref()
+            .map(|(_, best_objective, best_bytes)| {
+                reference_objective < *best_objective
+                    || (reference_objective == *best_objective && candidate_bytes < *best_bytes)
+            })
+            .unwrap_or(true)
+        {
+            reference_best = Some((*depth, reference_objective, candidate_bytes));
+        }
+    }
+
+    let production_best = production_best.unwrap();
+    let reference_best = reference_best.unwrap();
+    assert_eq!(production_best.0, reference_best.0);
+    assert_eq!(production_best.0, 6);
+    assert!(production_best.1.deployable);
+
+    let _ = std::fs::remove_file(ds_path);
 }

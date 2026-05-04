@@ -209,9 +209,14 @@ impl VerifiedDeterministicEvaluatorTable {
         } else {
             dataset.dataset_units / row.elapsed_seconds
         };
-        let objective_bits = ((model_bytes as f64) * 8.0) + row.target_loss_bits;
         let deployable = throughput_bytes_per_second >= min_throughput_bytes_per_second
             && row.peak_memory_bytes <= max_memory_bytes;
+        let objective_bits = if deployable {
+            ((model_bytes as f64) * 8.0) + row.target_loss_bits
+        } else {
+            f64::INFINITY
+        };
+
         Ok(CandidateEvalResult {
             status: row.status,
             compressed_bytes: row.compressed_bytes,
