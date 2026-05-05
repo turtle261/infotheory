@@ -15,8 +15,25 @@ pub struct TuneCommandRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct TuneExecutionConfig {
+    /// Maximum number of admitted non-warmup candidate evaluations.
+    ///
+    /// The mandatory normative baseline evaluation counts as the first
+    /// admitted result, so `Some(1)` means baseline-only execution. `None`
+    /// leaves the controller bounded by the tune document's time budget and
+    /// any controller-internal stopping rules.
     pub max_evaluations: Option<usize>,
+    /// Proposal/acceptance kernel selected for annealed-hill-climbing runs.
+    ///
+    /// This is an executor-side implementation choice: it affects runtime
+    /// search behavior and the evaluator profile, but it is intentionally not
+    /// part of canonical `SpecDocument::Tune` candidate identity.
     pub annealer_kernel_profile: AnnealerKernelProfile,
+    /// Best-effort CPU affinity declaration for evaluator worker processes.
+    ///
+    /// The syntax is currently executor-defined and Unix-oriented. Affinity is
+    /// provenance-bearing runtime control rather than a semantic tune-spec
+    /// field; failure to apply it is reported as executor behavior, not as a
+    /// change to the candidate being evaluated.
     pub cpu_affinity: Option<String>,
     /// Optional evaluator-worker internal thread count.
     ///
@@ -30,14 +47,59 @@ pub struct TuneExecutionConfig {
     /// is not established for the chosen backend path, do not enable
     /// multithreaded evaluator workers for theorem-facing runs.
     pub threads: Option<usize>,
+    /// Number of uncharged baseline evaluations run before the normative
+    /// baseline.
+    ///
+    /// Warmups are for process/runtime stabilization. Their evaluation results
+    /// are deliberately excluded from cache population, optimization metrics,
+    /// and `max_evaluations` accounting. The configured warmup count is still
+    /// recorded in the evaluator profile, so changing it changes provenance and
+    /// cache-key identity for the non-warmup evaluations that follow. (changing it changes the evaluator profile cache key)
     pub warmup_baseline_runs: usize,
+    /// Number of deterministic self-improvement rounds for warm-start exact
+    /// `J_H` planner-family controllers.
+    ///
+    /// Non-warmstart controllers ignore values greater than one and report an
+    /// effective single round. A zero value is rejected because the controller
+    /// contract always has at least the baseline/controller initialization
+    /// round.
     pub self_improvement_rounds: usize,
+    /// Optional number of admitted evaluations after which planner-family
+    /// stagnation triggers a deterministic reset to the incumbent state.
     pub stagnation_reset_evals: Option<usize>,
+    /// Optional executor log path.
+    ///
+    /// This path is not canonical tune input. It is recorded only as runtime
+    /// provenance and must not affect candidate bytes, dataset identity, or
+    /// theorem-facing semantic claims.
     pub log_path: Option<String>,
+    /// Optional diagnostic partition size over charged target bytes.
+    ///
+    /// When set, reports include deterministic diagnostic chunks for evaluator
+    /// introspection. The chunking parameter is part of evaluator/cache
+    /// identity because it changes the reported diagnostic profile, even though
+    /// it does not alter canonical candidate bytes.
     pub diagnostic_chunk_bytes: Option<usize>,
+    /// Peak-memory accounting policy used for deployability decisions.
     pub rss_mode: PeakMemoryMode,
+    /// Whether planner-family model-state bytes are included in deployability
+    /// diagnostics and objective-target reporting.
+    ///
+    /// This flag does not make a planner theorem true by itself; it only selects
+    /// the stricter executor accounting/reporting path for planner-backed
+    /// candidates.
     pub planner_deployable_model: bool,
+    /// Whether warm-start exact-`J_H` controllers refresh teacher traces from
+    /// same-task live interaction between self-improvement rounds.
+    ///
+    /// Refresh is deterministic and content-deduplicated, but it is still
+    /// executor policy rather than canonical tune-spec input.
     pub warmstart_trace_refresh: bool,
+    /// Theorem-facing claims and certificate references supplied to the
+    /// executor.
+    ///
+    /// These values declare which claims should be checked and where supporting
+    /// artifacts live. They are not accepted inside canonical `SpecDocument::Tune`.
     pub theorem: TuneTheoremConfig,
 }
 
@@ -45,18 +107,49 @@ pub struct TuneExecutionConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct TuneTheoremConfig {
+    /// Request certification that the tuned planner problem is an exact finite
+    /// MDP under the supplied certificates and evaluator contract.
     pub claim_exact_finite_mdp: bool,
+    /// Request certification that observations expose the Markov state required
+    /// by the exact-MDP claim.
     pub claim_exact_observed_markov: bool,
+    /// Request certification of the planner-convergence claim for the selected
+    /// controller family and timing basis.
     pub claim_planner_convergence: bool,
+    /// Timing evidence tier that theorem reports should require before marking
+    /// timing-dependent claims certified.
     pub timing_certification_tier: TimingCertificationTier,
+    /// Optional certificate reference for deterministic evaluator deadlines.
+    ///
+    /// This is required for `real_time` timing certification and is interpreted
+    /// as an external artifact reference, not an inline proof term.
     pub determinism_deadline_certificate: Option<String>,
+    /// Optional reference identifying the observation adapter specification used
+    /// to lower runtime state into planner observations.
     pub observation_adapter_spec_ref: Option<String>,
+    /// Optional reference identifying an exact finite-state encoder artifact.
     pub exact_state_encoder_spec_ref: Option<String>,
+    /// Optional reference identifying the scalar representation contract used
+    /// for objective and reward quantities.
     pub scalar_representation_ref: Option<String>,
+    /// Optional certificate that the planner's reachable internal state space is
+    /// finite under the selected interface and controller family.
     pub finite_planner_state_certificate: Option<String>,
+    /// Optional certificate that the evaluated planner state has no hidden
+    /// variables outside the declared finite observation/state contract.
     pub no_hidden_state_certificate: Option<String>,
+    /// Optional certificate that objective differences are encoded exactly into
+    /// finite reward symbols for exact-`J_H` controller families.
     pub exact_reward_encoding_certificate: Option<String>,
+    /// Optional certificate that observations are an exact/injective projection
+    /// of the declared finite environment state.
     pub exact_state_observation_certificate: Option<String>,
+    /// Optional deterministic evaluator table used as a certified evaluator
+    /// substitute.
+    ///
+    /// When present and verified, candidate evaluation reads exact rows from the
+    /// table rather than measuring a live worker process. This can support the
+    /// `deterministic_table` timing tier.
     pub deterministic_evaluator_table: Option<String>,
 }
 
@@ -64,7 +157,10 @@ pub struct TuneTheoremConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AnnealerKernelProfile {
+    /// Reversible elementary Metropolis kernel with objective-bit temperature.
     ReversibleElementaryMetropolis,
+    /// Compiled uniform Metropolis-Hastings kernel that accounts for asymmetric
+    /// proposal mass at bounded integer parameter edges.
     CompiledUniformMetropolisHastings,
 }
 
@@ -72,8 +168,13 @@ pub enum AnnealerKernelProfile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PeakMemoryMode {
+    /// Use process resident-set-size peak measurements where the platform
+    /// exposes them.
     ProcessRssPeak,
+    /// Use backend-reported memory when the evaluator path provides it.
     BackendReported,
+    /// Use the maximum of process and backend measurements to avoid optimistic
+    /// deployability reports.
     HybridStrictMax,
 }
 
@@ -81,9 +182,16 @@ pub enum PeakMemoryMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TimingCertificationTier {
+    /// Record timing evidence as best-effort runtime provenance only.
     BestEffort,
+    /// Require isolated-process evaluator execution but not a hard real-time
+    /// deadline certificate.
     Isolated,
+    /// Require deterministic-deadline certification for timing-dependent
+    /// theorem claims.
     RealTime,
+    /// Use a verified deterministic evaluator table as the timing/evaluation
+    /// basis.
     DeterministicTable,
 }
 

@@ -1515,6 +1515,182 @@ mod tests {
     }
 
     #[test]
+    fn teacher_dataset_slice_parser_and_label_count_cover_horizon_windows() {
+        let err = WarmStartExactJhTeacherDataset::from_json_slice(b"{")
+            .expect_err("invalid json must be rejected");
+        assert!(err.to_string().contains("invalid teacher JSON"), "{err}");
+
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "contract": {
+                "task_fingerprint": "test-task",
+                "action_alphabet_size": 2,
+                "observation_bits": 2,
+                "observation_stream_len": 1,
+                "observation_key_mode": "full_stream",
+                "observation_adapter_spec_ref": "test-observation-adapter",
+                "observation_adapter_content_crc32": "test-observation-adapter-crc32",
+                "reward_bits": 2,
+                "min_reward": 0,
+                "max_reward": 3,
+                "return_horizon": 2,
+                "label_phase_period": 2,
+                "scalar_representation": "test-scalar",
+                "exact_reward_encoding_certificate": "test-cert"
+            },
+            "traces": [
+                {"transitions": [
+                    {"action": 0, "observations": [1], "reward": 0},
+                    {"action": 1, "observations": [2], "reward": 3},
+                    {"action": 1, "observations": [2], "reward": 3}
+                ]},
+                {"transitions": [
+                    {"action": 0, "observations": [0], "reward": 1}
+                ]}
+            ]
+        });
+        let bytes = serde_json::to_vec(&value).expect("teacher json");
+        let parsed = WarmStartExactJhTeacherDataset::from_json_slice(&bytes)
+            .expect("teacher dataset should parse from slice");
+
+        assert_eq!(parsed.label_count_for_horizon(0), 0);
+        assert_eq!(parsed.label_count_for_horizon(1), 4);
+        assert_eq!(parsed.label_count_for_horizon(2), 2);
+        assert_eq!(parsed.label_count_for_horizon(4), 0);
+    }
+
+    #[test]
+    fn config_validation_reports_local_contract_errors_before_backend_use() {
+        let mut cfg = config();
+        cfg.return_horizon = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(WarmStartExactJhError::ReturnHorizonZero)
+        ));
+
+        let mut cfg = config();
+        cfg.return_bins = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(WarmStartExactJhError::ReturnBinsZero)
+        ));
+
+        let mut cfg = config();
+        cfg.return_horizon = 2;
+        cfg.label_phase_period = 1;
+        assert!(matches!(
+            cfg.validate(),
+            Err(WarmStartExactJhError::LabelPhasePeriodTooShort { .. })
+        ));
+
+        let mut cfg = config();
+        cfg.planner_simulations_per_step = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(WarmStartExactJhError::PlannerSimulationsZero)
+        ));
+
+        let mut cfg = config();
+        cfg.reward_bits = 1;
+        cfg.max_reward = 4;
+        assert!(matches!(
+            cfg.validate(),
+            Err(WarmStartExactJhError::RewardEncoding(_))
+        ));
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_agent_rejects_teacher_transitions_outside_interface_contract() {
+        let mut invalid = teacher();
+        invalid.traces[0].transitions[0].action = 2;
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher action outside alphabet must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::ActionOutOfRange { .. }
+        ));
+
+        let mut invalid = teacher();
+        invalid.traces[0].transitions[0].observations = vec![1, 2];
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher observation stream length must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::ObservationStreamLengthMismatch { .. }
+        ));
+
+        let mut invalid = teacher();
+        invalid.traces[0].transitions[0].observations = vec![4];
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher observation value must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::ObservationValueOutOfRange { .. }
+        ));
+
+        let mut invalid = teacher();
+        invalid.traces[0].transitions[0].reward = 4;
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher reward outside range must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::RewardOutOfRange { .. }
+        ));
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_agent_delays_live_trace_until_complete_return_horizon() {
+        let mut cfg = config();
+        cfg.return_horizon = 2;
+        cfg.return_bins = 7;
+        cfg.label_phase_period = 2;
+        cfg.random_seed = Some(16);
+        let mut agent =
+            WarmStartExactJhAgent::new(cfg, teacher()).expect("warmstart agent should initialize");
+
+        assert_eq!(agent.teacher_label_count(), 2);
+        assert_eq!(agent.num_actions(), action_alphabet(2));
+        assert_eq!(agent.planner_simulations_per_step(), 3);
+        assert_eq!(agent.resolved_random_seed(), 16);
+        assert!(agent.same_task_live_trace().is_none());
+
+        agent
+            .observe_transition(0, &[1], 1)
+            .expect("first live transition");
+        assert!(agent.same_task_live_trace().is_none());
+
+        agent
+            .observe_transition(1, &[2], 2)
+            .expect("second live transition");
+        let live = agent
+            .same_task_live_trace()
+            .expect("complete live trace should be available");
+        assert_eq!(live.transitions.len(), 2);
+        assert_eq!(live.transitions[0].action, 0);
+        assert_eq!(live.transitions[1].reward, 2);
+
+        let greedy = agent.get_planned_action();
+        let first_exploratory = agent.get_planned_action_with_extra_exploration(1.0);
+        let second_exploratory = agent.get_planned_action_with_extra_exploration(1.0);
+        assert_ne!(
+            first_exploratory, second_exploratory,
+            "test seed must make forced exploration distinguishable from a fixed action"
+        );
+        assert!(first_exploratory != greedy || second_exploratory != greedy);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
     fn warmstart_agent_learns_teacher_labels_and_observes_live_steps() {
         let mut agent = WarmStartExactJhAgent::new(config(), teacher())
             .expect("warmstart agent should initialize");

@@ -2679,7 +2679,6 @@ mod tests {
                     "kind": "ctw",
                     "depth": 8
                 },
-                "coder": "ac",
                 "framing": "framed"
             },
             "controller": {
@@ -2745,7 +2744,6 @@ mod tests {
                     "kind": "ctw",
                     "depth": 8
                 },
-                "coder": "ac",
                 "framing": "framed"
             },
             "controller": {

@@ -352,6 +352,109 @@ fn tune_execution_config_accepts_nested_theorem_json() {
 }
 
 #[test]
+fn tune_execution_config_reports_executor_profile_semantics() {
+    let value = serde_json::json!({
+        "max_evaluations": 7,
+        "annealer_kernel_profile": "compiled_uniform_metropolis_hastings",
+        "cpu_affinity": "0-1",
+        "threads": 2,
+        "warmup_baseline_runs": 1,
+        "self_improvement_rounds": 3,
+        "stagnation_reset_evals": 5,
+        "log_path": "tune.log",
+        "diagnostic_chunk_bytes": 4096,
+        "rss_mode": "hybrid_strict_max",
+        "planner_deployable_model": true,
+        "warmstart_trace_refresh": true,
+        "theorem": {
+            "claim_exact_finite_mdp": true,
+            "claim_exact_observed_markov": true,
+            "claim_planner_convergence": true,
+            "timing_certification_tier": "deterministic_table",
+            "determinism_deadline_certificate": "cert://deadline",
+            "observation_adapter_spec_ref": "adapter://single-channel",
+            "exact_state_encoder_spec_ref": "state://encoder",
+            "scalar_representation_ref": "scalar://finite-f64",
+            "finite_planner_state_certificate": "cert://finite-state",
+            "no_hidden_state_certificate": "cert://no-hidden",
+            "exact_reward_encoding_certificate": "cert://reward",
+            "exact_state_observation_certificate": "cert://observation",
+            "deterministic_evaluator_table": "table://deterministic"
+        }
+    });
+    let cfg = TuneExecutionConfig::from_json_value(&value).expect("config parse");
+
+    assert_eq!(cfg.max_evaluations, Some(7));
+    assert_eq!(
+        cfg.annealer_kernel_profile,
+        AnnealerKernelProfile::CompiledUniformMetropolisHastings
+    );
+    assert_eq!(cfg.evaluator_threads(), 2);
+    assert_eq!(
+        cfg.evaluator_determinism(),
+        "requires_backend_determinism_when_threaded"
+    );
+    assert!(cfg.warmstart_trace_refresh);
+    assert_eq!(
+        cfg.theorem.timing_certification_tier,
+        TimingCertificationTier::DeterministicTable
+    );
+
+    let profile = cfg.to_json_value();
+    assert_eq!(profile["max_evaluations"], serde_json::json!(7));
+    assert_eq!(
+        profile["annealer_kernel_profile"],
+        serde_json::json!("compiled_uniform_metropolis_hastings")
+    );
+    assert_eq!(
+        profile["evaluator_determinism"],
+        serde_json::json!("requires_backend_determinism_when_threaded")
+    );
+    assert_eq!(
+        profile["theorem"]["deterministic_evaluator_table"],
+        serde_json::json!("table://deterministic")
+    );
+
+    let controls = executor_controls_report(&cfg);
+    assert_eq!(
+        controls["cpu_affinity"]["requested"],
+        serde_json::json!("0-1")
+    );
+    assert_eq!(
+        controls["threads"]["worker_isolation_mode"],
+        serde_json::json!("spawn_exec_worker")
+    );
+    assert_eq!(
+        controls["rss_mode"]["requested"],
+        serde_json::json!("hybrid_strict_max")
+    );
+}
+
+#[test]
+fn tune_execution_config_rejects_empty_certificate_references() {
+    for field in [
+        "determinism_deadline_certificate",
+        "observation_adapter_spec_ref",
+        "exact_state_encoder_spec_ref",
+        "scalar_representation_ref",
+        "finite_planner_state_certificate",
+        "no_hidden_state_certificate",
+        "exact_reward_encoding_certificate",
+        "exact_state_observation_certificate",
+        "deterministic_evaluator_table",
+    ] {
+        let mut theorem = serde_json::Map::<String, Value>::new();
+        theorem.insert(field.to_string(), serde_json::json!("   "));
+        let value = serde_json::json!({
+            "theorem": theorem
+        });
+        let err = TuneExecutionConfig::from_json_value(&value)
+            .expect_err("empty theorem reference must be rejected");
+        assert!(err.contains("must be a non-empty string"), "{field}: {err}");
+    }
+}
+
+#[test]
 fn run_tune_rejects_invalid_execution_config_direct_call() {
     let request = TuneCommandRequest {
         spec_path: "nonexistent-spec.json".to_string(),
@@ -401,6 +504,185 @@ fn tune_execution_config_rejects_observation_certified_boolean() {
     let err = TuneExecutionConfig::from_json_value(&value)
         .expect_err("unchecked observation proof boolean must be rejected");
     assert!(err.contains("unknown execution config field"), "{err}");
+}
+
+fn passive_loaded_dataset(raw_bytes: Vec<u8>) -> LoadedDataset {
+    LoadedDataset {
+        kind: DatasetKind::PassiveBytes,
+        objective_target: ObjectiveTarget::PassiveAc,
+        lowering_version: PASSIVE_DATASET_LOWERING_VERSION,
+        codec_hash: "codec".to_string(),
+        event_grammar_hash: "none".to_string(),
+        target_domain_support_hash: "none".to_string(),
+        causal_header_profile_hash: "none".to_string(),
+        target_size_function: "bytes",
+        canonical_content_hash: "content".to_string(),
+        lowered_skeleton_hash: "skeleton".to_string(),
+        resolved_path: "dataset.bin".to_string(),
+        source_size_bytes: raw_bytes.len(),
+        dataset_units: raw_bytes.len() as f64,
+        raw_bytes,
+        events: Vec::new(),
+        causal_profile: None,
+        target_events: 0,
+    }
+}
+
+#[test]
+fn diagnostic_chunking_report_preserves_executor_only_contract() {
+    let dataset = passive_loaded_dataset((0_u8..10).collect::<Vec<u8>>());
+
+    let disabled = diagnostic_chunking_report(&dataset, None);
+    assert_eq!(disabled["enabled"], serde_json::json!(false));
+    assert_eq!(
+        disabled["affects_canonical_candidate_identity"],
+        serde_json::json!(false)
+    );
+    assert_eq!(disabled["chunk_count"], serde_json::json!(0));
+
+    let enabled = diagnostic_chunking_report(&dataset, Some(4));
+    assert_eq!(enabled["enabled"], serde_json::json!(true));
+    assert_eq!(enabled["charged_payload_bytes"], serde_json::json!(10));
+    assert_eq!(enabled["chunk_count"], serde_json::json!(3));
+    assert_eq!(enabled["last_chunk_bytes"], serde_json::json!(2));
+    assert_eq!(enabled["affects_objective"], serde_json::json!(false));
+    assert_eq!(
+        enabled["affects_canonical_candidate_identity"],
+        serde_json::json!(false)
+    );
+}
+
+#[test]
+fn causal_profile_report_describes_domains_and_event_grammar() {
+    let percept_channel = CausalChannelDomain {
+        channel: "obs".to_string(),
+        domain: "byte".to_string(),
+    };
+    let reward_channel = CausalChannelDomain {
+        channel: "reward".to_string(),
+        domain: "reward_symbols".to_string(),
+    };
+    let terminal_channel = CausalChannelDomain {
+        channel: "terminal".to_string(),
+        domain: "terminal_symbols".to_string(),
+    };
+    let mut domains = BTreeMap::<String, CausalTargetDomain>::new();
+    domains.insert("byte".to_string(), CausalTargetDomain::ByteAlphabet);
+    domains.insert(
+        "reward_symbols".to_string(),
+        CausalTargetDomain::EnumeratedPayloads {
+            payloads: vec![vec![0], vec![1]],
+        },
+    );
+    let mut channel_set = BTreeSet::<String>::new();
+    channel_set.insert("obs".to_string());
+    channel_set.insert("reward".to_string());
+    channel_set.insert("terminal".to_string());
+    let mut percept_channels = BTreeSet::<CausalChannelDomain>::new();
+    percept_channels.insert(percept_channel.clone());
+    let mut context_channels = BTreeSet::<String>::new();
+    context_channels.insert("context".to_string());
+    let mut observe_target_no_score = BTreeSet::<CausalChannelDomain>::new();
+    observe_target_no_score.insert(percept_channel.clone());
+    let mut target = BTreeSet::<CausalChannelDomain>::new();
+    target.insert(reward_channel.clone());
+    let profile = CausalEvaluationProfile {
+        domains,
+        channel_set,
+        domain_support_hash: "domain-crc".to_string(),
+        byte_alphabet_symbol_width: 1,
+        header_profile_hash: "header-crc".to_string(),
+        event_grammar: CausalEventGrammar {
+            context_channels,
+            observe_target_no_score,
+            target,
+        },
+        action_alphabet_size: 3,
+        collection_policy: "test-policy".to_string(),
+        percept_channels,
+        reward_channel,
+        terminal_channel,
+    };
+    let mut dataset = passive_loaded_dataset(Vec::new());
+    dataset.kind = DatasetKind::CausalPrefixDataset;
+    dataset.causal_profile = Some(profile);
+
+    let report = causal_profile_report(&dataset);
+    assert_eq!(
+        report["domain_support_crc32"],
+        serde_json::json!("domain-crc")
+    );
+    assert_eq!(
+        report["header_profile_crc32"],
+        serde_json::json!("header-crc")
+    );
+    assert_eq!(report["action_alphabet_size"], serde_json::json!(3));
+    assert_eq!(
+        report["byte_alphabet_expansion_policy"],
+        serde_json::json!("multi_byte_targets_expand_to_single_byte_events")
+    );
+    assert_eq!(
+        report["reward_encoding"],
+        serde_json::json!({"channel": "reward", "domain": "reward_symbols"})
+    );
+    assert_eq!(report["domains"].as_array().expect("domains").len(), 2);
+}
+
+#[test]
+fn theorem_timing_and_evaluator_execution_models_report_verified_basis() {
+    let deterministic_table = VerifiedDeterministicEvaluatorTable {
+        base: VerifiedCertificate {
+            ref_value: "table://deterministic".to_string(),
+            content_hash: "table-crc".to_string(),
+        },
+        rows: HashMap::new(),
+    };
+    let verified_table = VerifiedTheoremInputs {
+        deterministic_table: Some(deterministic_table),
+        ..VerifiedTheoremInputs::default()
+    };
+    let table_theorem = TuneTheoremConfig {
+        timing_certification_tier: TimingCertificationTier::DeterministicTable,
+        ..TuneTheoremConfig::default()
+    };
+    assert_eq!(
+        evaluator_execution_model(verified_table.deterministic_table.as_ref()),
+        "deterministic_table"
+    );
+    assert_eq!(
+        theorem_timing_basis(&table_theorem, &verified_table),
+        "verified_deterministic_evaluator_table"
+    );
+
+    let verified_deadline = VerifiedTheoremInputs {
+        determinism_deadline: Some(VerifiedCertificate {
+            ref_value: "deadline://cert".to_string(),
+            content_hash: "deadline-crc".to_string(),
+        }),
+        ..VerifiedTheoremInputs::default()
+    };
+    let real_time_theorem = TuneTheoremConfig {
+        timing_certification_tier: TimingCertificationTier::RealTime,
+        ..TuneTheoremConfig::default()
+    };
+    assert_eq!(
+        theorem_timing_basis(&real_time_theorem, &verified_deadline),
+        "verified_real_time_deadline_certificate"
+    );
+    assert_eq!(
+        theorem_timing_basis(&real_time_theorem, &VerifiedTheoremInputs::default()),
+        "operational_only_uncertified"
+    );
+
+    let deployability = planner_deployability_report(true, 128, -1.0, false);
+    assert_eq!(
+        deployability["update_latency_seconds"],
+        serde_json::json!(0.0)
+    );
+    assert_eq!(
+        deployability["deployable_under_executor_limits"],
+        serde_json::json!(false)
+    );
 }
 
 #[test]

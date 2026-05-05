@@ -260,6 +260,15 @@ fn parse_candidate_eval_payload(payload: &Value) -> Result<CandidateEvalResult, 
     })
 }
 
+/// Run the process-isolated tuner evaluator worker described by environment.
+///
+/// The parent executor sets `INFOTHEORY_TUNER_EVAL_REQUEST_PATH` to a JSON
+/// request and `INFOTHEORY_TUNER_EVAL_RESPONSE_PATH` to the file where this
+/// worker must write its JSON response. The worker performs exactly one
+/// candidate evaluation, serializes either an `ok: true` result payload or an
+/// `ok: false` error payload, and returns only after the response has been
+/// written. This entrypoint is public so the CLI binary and libtest worker shim
+/// can share the same evaluator contract; it is not a canonical tune-spec API.
 pub fn run_tuner_eval_worker_from_env() -> Result<(), String> {
     let request_path = std::env::var_os("INFOTHEORY_TUNER_EVAL_REQUEST_PATH")
         .ok_or_else(|| "missing INFOTHEORY_TUNER_EVAL_REQUEST_PATH".to_string())?;
