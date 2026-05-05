@@ -204,6 +204,13 @@ impl VerifiedDeterministicEvaluatorTable {
                 deployable: false,
             });
         }
+        if row.elapsed_seconds >= effective_eval_time_limit_seconds {
+            return Ok(timeout_eval_result(
+                row.elapsed_seconds,
+                row.peak_memory_bytes,
+                effective_eval_time_limit_seconds,
+            ));
+        }
         let throughput_bytes_per_second = if row.elapsed_seconds <= 0.0 {
             f64::INFINITY
         } else {

@@ -990,11 +990,11 @@ fn encode_interface_spec(spec: &PlannerInterfaceSpec, out: &mut Vec<u8>) {
 }
 
 fn decode_interface_spec(cursor: &mut Cursor<'_>) -> SpecResult<PlannerInterfaceSpec> {
-    let observation_bits = cursor.read_u64()? as usize;
-    let observation_stream_len = cursor.read_u64()? as usize;
+    let observation_bits = decode_usize_field(cursor, "interface.observation_bits")?;
+    let observation_stream_len = decode_usize_field(cursor, "interface.observation_stream_len")?;
     let observation_key_mode = decode_observation_key_mode(cursor.read_u8()?)?;
-    let reward_bits = cursor.read_u64()? as usize;
-    let agent_actions_raw = cursor.read_u64()? as usize;
+    let reward_bits = decode_usize_field(cursor, "interface.reward_bits")?;
+    let agent_actions_raw = decode_usize_field(cursor, "interface.agent_actions")?;
     let agent_actions = crate::aixi::common::ActionAlphabet::try_from_usize(agent_actions_raw)
         .map_err(|_| SpecError::new("binary interface.agent_actions must be >= 1"))?;
     Ok(PlannerInterfaceSpec {
@@ -1020,11 +1020,11 @@ fn encode_tune_interface_spec(spec: &TunePlannerInterfaceSpec, out: &mut Vec<u8>
 
 #[cfg(feature = "tuner")]
 fn decode_tune_interface_spec(cursor: &mut Cursor<'_>) -> SpecResult<TunePlannerInterfaceSpec> {
-    let observation_bits = cursor.read_u64()? as usize;
-    let observation_stream_len = cursor.read_u64()? as usize;
+    let observation_bits = decode_usize_field(cursor, "interface.observation_bits")?;
+    let observation_stream_len = decode_usize_field(cursor, "interface.observation_stream_len")?;
     let observation_key_mode = decode_observation_key_mode(cursor.read_u8()?)?;
-    let reward_bits = cursor.read_u64()? as usize;
-    let agent_actions_raw = cursor.read_u64()? as usize;
+    let reward_bits = decode_usize_field(cursor, "interface.reward_bits")?;
+    let agent_actions_raw = decode_usize_field(cursor, "interface.agent_actions")?;
     let agent_actions = crate::aixi::common::ActionAlphabet::try_from_usize(agent_actions_raw)
         .map_err(|_| SpecError::new("binary interface.agent_actions must be >= 1"))?;
     Ok(TunePlannerInterfaceSpec {
@@ -1034,6 +1034,11 @@ fn decode_tune_interface_spec(cursor: &mut Cursor<'_>) -> SpecResult<TunePlanner
         reward_bits,
         agent_actions,
     })
+}
+
+fn decode_usize_field(cursor: &mut Cursor<'_>, label: &str) -> SpecResult<usize> {
+    let raw = cursor.read_u64()?;
+    usize::try_from(raw).map_err(|_| SpecError::new(format!("{label} exceeds usize::MAX")))
 }
 
 fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
@@ -2040,5 +2045,73 @@ impl<'a> Cursor<'a> {
     #[cfg(feature = "vm")]
     fn has_remaining(&self) -> bool {
         self.pos < self.bytes.len()
+    }
+}
+
+#[cfg(all(test, feature = "tuner"))]
+mod tests {
+    use super::*;
+
+    fn encode_tune_interface(
+        observation_bits: u64,
+        observation_stream_len: u64,
+        reward_bits: u64,
+        agent_actions: u64,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_u64(&mut bytes, observation_bits);
+        push_u64(&mut bytes, observation_stream_len);
+        bytes.push(observation_key_mode_tag(ObservationKeyMode::FullStream));
+        push_u64(&mut bytes, reward_bits);
+        push_u64(&mut bytes, agent_actions);
+        bytes
+    }
+
+    #[test]
+    fn decode_tune_interface_accepts_platform_usize_max() {
+        let platform_max: u64 = usize::MAX as u64;
+        let bytes = encode_tune_interface(platform_max, platform_max, platform_max, 2);
+        let mut cursor = Cursor::new(&bytes);
+
+        let decoded = decode_tune_interface_spec(&mut cursor).expect("decode tune interface");
+
+        assert_eq!(decoded.observation_bits, usize::MAX);
+        assert_eq!(decoded.observation_stream_len, usize::MAX);
+        assert_eq!(decoded.reward_bits, usize::MAX);
+        assert_eq!(decoded.agent_actions.get(), 2);
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn decode_tune_interface_rejects_observation_bits_exceeding_usize() {
+        let overflow: u64 = (u32::MAX as u64) + 1;
+        let bytes = encode_tune_interface(overflow, 1, 1, 2);
+        let mut cursor = Cursor::new(&bytes);
+
+        let err = decode_tune_interface_spec(&mut cursor)
+            .expect_err("overflowing observation_bits must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("interface.observation_bits exceeds usize::MAX"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn decode_tune_interface_rejects_reward_bits_exceeding_usize() {
+        let overflow: u64 = (u32::MAX as u64) + 1;
+        let bytes = encode_tune_interface(1, 1, overflow, 2);
+        let mut cursor = Cursor::new(&bytes);
+
+        let err = decode_tune_interface_spec(&mut cursor)
+            .expect_err("overflowing reward_bits must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("interface.reward_bits exceeds usize::MAX"),
+            "unexpected error: {err}"
+        );
     }
 }

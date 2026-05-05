@@ -309,7 +309,8 @@ impl TuneExecutionConfig {
             cfg.annealer_kernel_profile =
                 parse_annealer_kernel_profile(required_str(raw, "annealer_kernel_profile")?)?;
         }
-        cfg.cpu_affinity = clean_optional_string(object.get("cpu_affinity"));
+        cfg.cpu_affinity =
+            parse_optional_non_empty_string(object.get("cpu_affinity"), "cpu_affinity")?;
         apply_optional_usize(object.get("threads"), &mut cfg.threads)?;
         if let Some(raw) = object.get("warmup_baseline_runs") {
             cfg.warmup_baseline_runs = required_usize(raw, "warmup_baseline_runs")?;
@@ -321,7 +322,7 @@ impl TuneExecutionConfig {
             object.get("stagnation_reset_evals"),
             &mut cfg.stagnation_reset_evals,
         )?;
-        cfg.log_path = clean_optional_string(object.get("log_path"));
+        cfg.log_path = parse_optional_non_empty_string(object.get("log_path"), "log_path")?;
         apply_optional_usize(
             object.get("diagnostic_chunk_bytes"),
             &mut cfg.diagnostic_chunk_bytes,
@@ -736,14 +737,6 @@ fn parse_timing_tier(raw: &str) -> Result<TimingCertificationTier, String> {
     }
 }
 
-fn clean_optional_string(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 fn parse_optional_non_empty_string(
     value: Option<&Value>,
     label: &str,
@@ -886,5 +879,90 @@ pub(super) fn timing_tier_name(value: TimingCertificationTier) -> &'static str {
         TimingCertificationTier::Isolated => "isolated",
         TimingCertificationTier::RealTime => "real_time",
         TimingCertificationTier::DeterministicTable => "deterministic_table",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- cpu_affinity ---
+
+    #[test]
+    fn execution_config_rejects_non_string_cpu_affinity() {
+        let value = serde_json::json!({ "cpu_affinity": 3 });
+        let err = TuneExecutionConfig::from_json_value(&value)
+            .expect_err("non-string cpu_affinity must be rejected");
+        assert!(
+            err.contains("cpu_affinity"),
+            "error message should name the field; got: {err}"
+        );
+    }
+
+    #[test]
+    fn execution_config_rejects_object_cpu_affinity() {
+        let value = serde_json::json!({ "cpu_affinity": {} });
+        let err = TuneExecutionConfig::from_json_value(&value)
+            .expect_err("object cpu_affinity must be rejected");
+        assert!(
+            err.contains("cpu_affinity"),
+            "error message should name the field; got: {err}"
+        );
+    }
+
+    #[test]
+    fn execution_config_accepts_null_cpu_affinity() {
+        let value = serde_json::json!({ "cpu_affinity": null });
+        let cfg = TuneExecutionConfig::from_json_value(&value)
+            .expect("null cpu_affinity should be accepted as absent");
+        assert_eq!(cfg.cpu_affinity, None);
+    }
+
+    #[test]
+    fn execution_config_accepts_string_cpu_affinity() {
+        let value = serde_json::json!({ "cpu_affinity": "0-3" });
+        let cfg = TuneExecutionConfig::from_json_value(&value)
+            .expect("string cpu_affinity should be accepted");
+        assert_eq!(cfg.cpu_affinity.as_deref(), Some("0-3"));
+    }
+
+    // --- log_path ---
+
+    #[test]
+    fn execution_config_rejects_non_string_log_path() {
+        let value = serde_json::json!({ "log_path": {} });
+        let err = TuneExecutionConfig::from_json_value(&value)
+            .expect_err("non-string log_path must be rejected");
+        assert!(
+            err.contains("log_path"),
+            "error message should name the field; got: {err}"
+        );
+    }
+
+    #[test]
+    fn execution_config_rejects_integer_log_path() {
+        let value = serde_json::json!({ "log_path": 42 });
+        let err = TuneExecutionConfig::from_json_value(&value)
+            .expect_err("integer log_path must be rejected");
+        assert!(
+            err.contains("log_path"),
+            "error message should name the field; got: {err}"
+        );
+    }
+
+    #[test]
+    fn execution_config_accepts_null_log_path() {
+        let value = serde_json::json!({ "log_path": null });
+        let cfg = TuneExecutionConfig::from_json_value(&value)
+            .expect("null log_path should be accepted as absent");
+        assert_eq!(cfg.log_path, None);
+    }
+
+    #[test]
+    fn execution_config_accepts_string_log_path() {
+        let value = serde_json::json!({ "log_path": "/tmp/tune.log" });
+        let cfg = TuneExecutionConfig::from_json_value(&value)
+            .expect("string log_path should be accepted");
+        assert_eq!(cfg.log_path.as_deref(), Some("/tmp/tune.log"));
     }
 }

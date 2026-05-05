@@ -913,6 +913,71 @@ fn deterministic_table_evaluation_enforces_exact_objective_formula() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
+fn deterministic_table_success_row_exceeding_effective_limit_is_timeout() {
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Ctw { depth: 4 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    }
+    .compile()
+    .expect("compile candidate");
+    let candidate_crc32 = crc32_hex(candidate.canonical_bytes().as_slice());
+    let table = VerifiedDeterministicEvaluatorTable {
+        base: VerifiedCertificate {
+            ref_value: "test://deterministic-table".to_string(),
+            content_hash: "00000000".to_string(),
+        },
+        rows: HashMap::from([(
+            candidate_crc32,
+            DeterministicEvaluatorRow {
+                status: CandidateEvalStatus::Success,
+                compressed_bytes: 3,
+                target_loss_bits: 23.5,
+                elapsed_seconds: 2.0,
+                peak_memory_bytes: 16,
+            },
+        )]),
+    };
+    let dataset = LoadedDataset {
+        kind: DatasetKind::PassiveBytes,
+        objective_target: ObjectiveTarget::PassiveAc,
+        lowering_version: PASSIVE_DATASET_LOWERING_VERSION,
+        codec_hash: "passive-identity-bytes".to_string(),
+        event_grammar_hash: "passive-target-only-byte-stream".to_string(),
+        target_domain_support_hash: crc32_hex(b"passive-byte-alphabet"),
+        causal_header_profile_hash: crc32_hex(b"passive-none"),
+        target_size_function: "passive-bytes-len",
+        canonical_content_hash: crc32_hex(b"dataset"),
+        lowered_skeleton_hash: crc32_hex(b"passive-bytes-target-only"),
+        resolved_path: "test://dataset".to_string(),
+        source_size_bytes: 11,
+        raw_bytes: b"hello world".to_vec(),
+        events: Vec::new(),
+        causal_profile: None,
+        dataset_units: 11.0,
+        target_events: 1,
+    };
+
+    let effective_limit_seconds = 1.0;
+    let result = table
+        .evaluate(&candidate, &dataset, 17, 1.0, 1024, effective_limit_seconds)
+        .expect("deterministic table evaluation");
+
+    assert_eq!(result.status, CandidateEvalStatus::Timeout);
+    assert_eq!(result.elapsed_seconds, 2.0);
+    assert_eq!(
+        result.effective_eval_time_limit_seconds,
+        effective_limit_seconds
+    );
+    assert_eq!(result.peak_memory_bytes, 16);
+    assert_eq!(result.target_loss_bits, f64::INFINITY);
+    assert_eq!(result.objective_bits, f64::INFINITY);
+    assert_eq!(result.throughput_bytes_per_second, 0.0);
+    assert!(!result.deployable);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
 fn candidate_bounds_validation_enforces_parameter_ranges() {
     let candidate = CompressionBackend::Rate {
         rate_backend: RateBackend::Ctw { depth: 8 },
