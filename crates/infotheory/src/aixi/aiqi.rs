@@ -370,7 +370,7 @@ impl AiqiConfig {
                 return_horizon: self.return_horizon,
             });
         }
-        if !(0.0..1.0).contains(&self.discount_gamma) {
+        if !(0.0 < self.discount_gamma && self.discount_gamma < 1.0) {
             return Err(AiqiError::InvalidDiscountGamma {
                 value: self.discount_gamma,
             });
@@ -941,7 +941,7 @@ impl AiqiAgent {
         let h = self.config.return_horizon;
         let gamma = self.config.discount_gamma;
 
-        debug_assert!((0.0..1.0).contains(&gamma));
+        debug_assert!(0.0 < gamma && gamma < 1.0);
         let reward_range = (self.config.max_reward - self.config.min_reward) as f64;
 
         // Paper definition: R_{t,H} = (1-gamma) * sum_{k=0}^{H-1} gamma^k r_{t+k}.
