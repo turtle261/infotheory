@@ -530,6 +530,25 @@ pub(super) fn load_exact_state_observation_certificate(
         "exact_state_observation certificate can only be validated for planner-family controllers"
             .to_string()
     })?;
+    let mode_matches = match interface.observation_key_mode {
+        crate::aixi::common::ObservationKeyMode::FullStream => {
+            observation_key_mode == "full_stream"
+        }
+        crate::aixi::common::ObservationKeyMode::First => {
+            observation_key_mode == "first" || observation_key_mode == "first_symbol"
+        }
+        crate::aixi::common::ObservationKeyMode::Last => {
+            observation_key_mode == "last" || observation_key_mode == "last_symbol"
+        }
+        crate::aixi::common::ObservationKeyMode::StreamHash => {
+            observation_key_mode == "stream_hash"
+        }
+    };
+    if !mode_matches {
+        return Err(format!(
+            "exact_state_observation certificate observation_key_mode '{observation_key_mode}' is not compatible with the controller's configured projection"
+        ));
+    }
     let finite_state_count =
         validate_exact_state_observation_artifact(object, observation_key_mode, interface)?;
     Ok(Some(VerifiedExactStateObservationCertificate {
