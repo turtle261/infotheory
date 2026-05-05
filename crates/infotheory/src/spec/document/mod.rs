@@ -70,13 +70,6 @@ impl ValidatedTuneSpec {
 
     /// Compile the validated tune request into resolved assets and compiled backends.
     pub fn compile(&self) -> SpecResult<CompiledTuneSpec> {
-        #[cfg(not(feature = "tuner"))]
-        {
-            return Err(SpecError::new(
-                "tune documents require infotheory built with feature 'tuner'",
-            ));
-        }
-        #[cfg(feature = "tuner")]
         pipeline::compile_validated_tune_spec(self)
     }
 }
@@ -239,24 +232,14 @@ impl BuiltinEnvironmentSpec {
 impl TuneSpec {
     /// Validate this tune request and return its canonical binary encoding.
     pub fn validate_in(&self, env: &SpecEnvironment) -> SpecResult<ValidatedTuneSpec> {
-        #[cfg(not(feature = "tuner"))]
-        {
-            let _ = env;
-            return Err(SpecError::new(
-                "tune documents require infotheory built with feature 'tuner'",
-            ));
-        }
-        #[cfg(feature = "tuner")]
-        {
-            let canonical = pipeline::canonicalize_tune_spec(self, env)?;
-            Ok(ValidatedTuneSpec {
-                canonical_bytes: CanonicalBytes::from(binary::encode_spec_document_payload(
-                    &SpecDocument::Tune(canonical.clone()),
-                )),
-                canonical_spec: Arc::new(canonical),
-                base_dir: env.base_dir().to_path_buf(),
-            })
-        }
+        let canonical = pipeline::canonicalize_tune_spec(self, env)?;
+        Ok(ValidatedTuneSpec {
+            canonical_bytes: CanonicalBytes::from(binary::encode_spec_document_payload(
+                &SpecDocument::Tune(canonical.clone()),
+            )),
+            canonical_spec: Arc::new(canonical),
+            base_dir: env.base_dir().to_path_buf(),
+        })
     }
 
     /// Validate this tune request using the default compilation environment.
@@ -266,14 +249,6 @@ impl TuneSpec {
 
     /// Validate and compile this tune request using the supplied environment.
     pub fn compile_in(&self, env: &SpecEnvironment) -> SpecResult<CompiledTuneSpec> {
-        #[cfg(not(feature = "tuner"))]
-        {
-            let _ = env;
-            return Err(SpecError::new(
-                "tune documents require infotheory built with feature 'tuner'",
-            ));
-        }
-        #[cfg(feature = "tuner")]
         pipeline::compile_tune_spec(self, env.base_dir())
     }
 
@@ -371,13 +346,6 @@ impl CanonicalJson for PlannerRunSpec {
 #[cfg(feature = "tuner")]
 impl CanonicalJson for TuneSpec {
     fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value> {
-        #[cfg(not(feature = "tuner"))]
-        {
-            return Err(SpecError::new(
-                "tune documents require infotheory built with feature 'tuner'",
-            ));
-        }
-        #[cfg(feature = "tuner")]
         serializer::tune_spec_to_json_value(self)
     }
 }
