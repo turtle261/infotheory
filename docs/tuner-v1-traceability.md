@@ -16,7 +16,8 @@ This checklist maps the normative Tuner V1 implementation obligations in
   `canonical_tune_document_rejects_unknown_nested_fields`.
 - Executor-side theorem/certificate fields are strict JSON/CLI inputs and do
   not mutate canonical candidate bytes. Implemented in
-  `TuneExecutionConfig::from_json_value`, `apply_theorem_object`, and
+  `TuneExecutionConfig::from_json_value`,
+  `TuneExecutionConfig::apply_theorem_object`, and
   `parse_tune_command_args`.
 
 ## Objective And Evaluation Semantics

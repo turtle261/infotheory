@@ -74,7 +74,7 @@ The repository also includes **AIQI**, the model-free return-prediction agent in
 #### Platform Caveats:
 - Infotheory is largely developed on, and optimized for Linux with glibc, and on x86_64.
 - When capabilities require platform-specific functionality/optimization, that is first and foremost implemented for Linux. Whenever possible, we aim to extend that to at least Unix (according to cargo's definition of unix) platforms, but where that is not possible, Linux will be the implemented target. Right now, this is evident by the `vm` feature only working on Linux. (Caveat 1)
-- Caveat 2 is that the Tuner has Unix-specific functionalities, with a portable ALTERNATIVE provided that may void conformance to it's specified implementation to work on non-Unix platforms
+- Caveat 2 is that the Tuner has Unix-specific functionalities, with a portable ALTERNATIVE provided that may void conformance to its specified implementation to work on non-Unix platforms
 
 ### Build Prerequisites
 - Rust toolchain (stable): `rustup` recommended.

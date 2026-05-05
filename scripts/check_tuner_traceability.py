@@ -9,8 +9,17 @@ anchor each normative section still exist as definitions in the implementation.
 from __future__ import annotations
 
 from pathlib import Path
-import re
 import sys
+
+try:
+    import tree_sitter
+    import tree_sitter_rust
+except ImportError as _exc:
+    sys.exit(
+        f"check_tuner_traceability: missing dependency: {_exc}\n"
+        "Run with: uv run --no-project --with tree-sitter --with tree-sitter-rust "
+        "python scripts/check_tuner_traceability.py"
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,7 +45,7 @@ SPEC_PARSER = ROOT / "crates" / "infotheory" / "src" / "spec" / "document" / "pa
 
 REQUIRED_REFS: tuple[tuple[str, Path], ...] = (
     ("TuneExecutionConfig::from_json_value", TUNER),
-    ("apply_theorem_object", TUNER),
+    ("TuneExecutionConfig::apply_theorem_object", TUNER),
     ("parse_tune_command_args", TUNER),
     ("VerifiedDeterministicEvaluatorTable", TUNER),
     ("parse_causal_header_profile", TUNER),
@@ -101,71 +110,286 @@ REQUIRED_REFS: tuple[tuple[str, Path], ...] = (
 )
 
 
-def normalize_ref(ref: str) -> str:
-    return ref.split("::")[-1]
+class AstIndex:
+    def __init__(self) -> None:
+        self.functions: set[str] = set()
+        self.structs: set[str] = set()
+        self.enums: set[str] = set()
+        self.struct_fields: set[str] = set()
+        self.enum_variants: set[str] = set()
+        self.impl_methods: set[str] = set()
+        self.test_functions: set[str] = set()
+
+    def merge(self, other: "AstIndex") -> None:
+        self.functions.update(other.functions)
+        self.structs.update(other.structs)
+        self.enums.update(other.enums)
+        self.struct_fields.update(other.struct_fields)
+        self.enum_variants.update(other.enum_variants)
+        self.impl_methods.update(other.impl_methods)
+        self.test_functions.update(other.test_functions)
 
 
-def regex_search(pattern: str, haystack: str) -> bool:
-    return re.search(pattern, haystack, flags=re.MULTILINE | re.DOTALL) is not None
+def rust_language():
+    language = tree_sitter_rust.language()
+    if isinstance(language, tree_sitter.Language):
+        return language
+    return tree_sitter.Language(language)
 
 
-def has_test_function(name: str, haystack: str) -> bool:
-    pattern = rf"#\s*\[\s*test\s*\][\s\S]{{0,512}}\bfn\s+{re.escape(name)}\s*\("
-    return regex_search(pattern, haystack)
+def rust_parser():
+    parser = tree_sitter.Parser()
+    language = rust_language()
+    try:
+        parser.language = language
+    except AttributeError:
+        parser.set_language(language)
+    return parser
 
 
-def has_free_item_or_field(name: str, haystack: str) -> bool:
-    escaped = re.escape(name)
-    patterns = (
-        rf"\bfn\s+{escaped}\s*\(",
-        rf"\bstruct\s+{escaped}\b",
-        rf"\benum\s+{escaped}\b",
-        rf"\b{escaped}\s*:",
-    )
-    return any(regex_search(pattern, haystack) for pattern in patterns)
+def node_text(node) -> str:
+    return node.text.decode("utf-8")
 
 
-def has_impl_method(type_name: str, method_name: str, haystack: str) -> bool:
-    pattern = (
-        rf"\bimpl(?:\s*<[^>]*>)?\s+{re.escape(type_name)}\b[^\{{]*\{{"
-        rf"[\s\S]*?\bfn\s+{re.escape(method_name)}\s*\("
-    )
-    return regex_search(pattern, haystack)
+def normalized_attribute_text(node) -> str:
+    return "".join(node_text(node).split())
 
 
-def has_enum_variant(enum_name: str, variant_name: str, haystack: str) -> bool:
-    pattern = rf"\benum\s+{re.escape(enum_name)}\b[^\{{]*\{{[\s\S]*?\b{re.escape(variant_name)}\b"
-    return regex_search(pattern, haystack)
+def is_test_attribute(node) -> bool:
+    return node.type == "attribute_item" and normalized_attribute_text(node) == "#[test]"
 
 
-def ref_exists_as_definition(ref: str, path: Path, haystack: str) -> bool:
-    leaf = normalize_ref(ref)
+def function_has_test_attribute(node) -> bool:
+    prev = node.prev_named_sibling
+    while prev:
+        if is_test_attribute(prev):
+            return True
+        if prev.type not in ("attribute_item", "line_comment", "block_comment"):
+            return False
+        prev = prev.prev_named_sibling
+    return False
+
+
+def impl_type_name(node) -> str | None:
+    if node.child_by_field_name("trait") is not None:
+        return None
+
+    type_node = node.child_by_field_name("type")
+    if type_node is None:
+        return None
+
+    type_text = "".join(node_text(type_node).split())
+    if "<" in type_text:
+        type_text = type_text.split("<", maxsplit=1)[0]
+    if "::" in type_text:
+        type_text = type_text.rsplit("::", maxsplit=1)[1]
+    return type_text or None
+
+
+def add_struct_fields(idx: AstIndex, node) -> None:
+    body = node.child_by_field_name("body")
+    if body is None or body.type != "field_declaration_list":
+        return
+
+    for child in body.named_children:
+        if child.type != "field_declaration":
+            continue
+        field_name_node = child.child_by_field_name("name")
+        if field_name_node is not None:
+            idx.struct_fields.add(node_text(field_name_node))
+
+
+def add_enum_variants(idx: AstIndex, node, enum_name: str) -> None:
+    body = node.child_by_field_name("body")
+    if body is None or body.type != "enum_variant_list":
+        return
+
+    for child in body.named_children:
+        if child.type != "enum_variant":
+            continue
+        variant_name_node = child.child_by_field_name("name")
+        if variant_name_node is not None:
+            idx.enum_variants.add(f"{enum_name}::{node_text(variant_name_node)}")
+
+
+def add_impl_methods(idx: AstIndex, node) -> None:
+    type_name = impl_type_name(node)
+    if type_name is None:
+        return
+
+    body = node.child_by_field_name("body")
+    if body is None or body.type != "declaration_list":
+        return
+
+    for child in body.named_children:
+        if child.type != "function_item":
+            continue
+        method_name_node = child.child_by_field_name("name")
+        if method_name_node is not None:
+            idx.impl_methods.add(f"{type_name}::{node_text(method_name_node)}")
+
+
+def build_ast_index(source_code: bytes, source_name: str = "<memory>") -> AstIndex:
+    parser = rust_parser()
+    tree = parser.parse(source_code)
+    if tree.root_node.has_error:
+        raise ValueError(f"tree-sitter-rust parse error in {source_name}")
+    idx = AstIndex()
+
+    def visit_item(node) -> None:
+        if node.type == "function_item":
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                name = node_text(name_node)
+                idx.functions.add(name)
+                if function_has_test_attribute(node):
+                    idx.test_functions.add(name)
+        elif node.type == "struct_item":
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                idx.structs.add(node_text(name_node))
+            add_struct_fields(idx, node)
+        elif node.type == "enum_item":
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                name = node_text(name_node)
+                idx.enums.add(name)
+                add_enum_variants(idx, node, name)
+        elif node.type == "impl_item":
+            add_impl_methods(idx, node)
+        elif node.type == "mod_item":
+            body = node.child_by_field_name("body")
+            if body is not None:
+                visit_item_scope(body)
+
+    def visit_item_scope(node) -> None:
+        for child in node.named_children:
+            visit_item(child)
+
+    visit_item_scope(tree.root_node)
+    return idx
+
+
+def ref_exists_as_definition(ref: str, path: Path, idx: AstIndex) -> bool:
     if path in (TUNER_TESTS, SPEC_TESTS):
-        return has_test_function(leaf, haystack)
+        return ref in idx.test_functions
     if "::" not in ref:
-        return has_free_item_or_field(ref, haystack)
-    type_name, member_name = ref.split("::", maxsplit=1)
-    if member_name[:1].isupper():
-        return has_enum_variant(type_name, member_name, haystack)
-    return has_impl_method(type_name, member_name, haystack)
+        return (
+            ref in idx.functions
+            or ref in idx.structs
+            or ref in idx.enums
+            or ref in idx.struct_fields
+        )
+    return ref in idx.enum_variants or ref in idx.impl_methods
+
+
+def require_self_test(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(f"traceability self-test failed: {message}")
+
+
+def run_self_tests() -> None:
+    source = b"""
+    #[test]
+    fn real_test_anchor() {}
+
+    struct Settings {
+        peak_memory_bytes: u64,
+    }
+
+    fn peak_memory_bytes() {}
+
+    enum ObjectiveTarget {
+        PlannerDeployableModel,
+    }
+
+    impl Settings {
+        fn from_json_value() {}
+    }
+
+    trait Decoder {
+        fn trait_only() {}
+    }
+
+    impl Decoder for Settings {
+        fn trait_only() {}
+    }
+
+    fn use_settings() {
+        let x = Settings { peak_memory_bytes: 0 };
+    }
+    """
+    idx = build_ast_index(source)
+    require_self_test("real_test_anchor" in idx.test_functions, "failed to find #[test] function")
+    require_self_test("peak_memory_bytes" in idx.struct_fields, "failed to find struct field")
+    require_self_test("peak_memory_bytes" in idx.functions, "failed to find free function")
+    require_self_test(
+        "ObjectiveTarget::PlannerDeployableModel" in idx.enum_variants,
+        "failed to find enum variant",
+    )
+    require_self_test(
+        "Settings::from_json_value" in idx.impl_methods,
+        "failed to find inherent impl method",
+    )
+    require_self_test(
+        "Settings::trait_only" not in idx.impl_methods,
+        "trait impl method was accepted as inherent method",
+    )
+    require_self_test(
+        "from_json_value" not in idx.functions,
+        "inherent impl method was accepted as free function",
+    )
+
+    source_no_def = b"""
+    fn use_settings() {
+        let x = Settings { peak_memory_bytes: 0 };
+    }
+    """
+    idx_no_def = build_ast_index(source_no_def)
+    require_self_test(
+        "peak_memory_bytes" not in idx_no_def.struct_fields,
+        "struct literal field initializer was accepted as a field definition",
+    )
+    require_self_test(
+        not ref_exists_as_definition("peak_memory_bytes", TUNER, idx_no_def),
+        "struct literal field initializer satisfied plain anchor lookup",
+    )
 
 
 def main() -> int:
+    run_self_tests()
+
     doc = TRACEABILITY.read_text(encoding="utf-8")
-    tuner_haystack = "\n".join(path.read_text(encoding="utf-8") for path in TUNER_SOURCES)
+
+    # Pre-parse indices
+    indices: dict[Path, AstIndex] = {}
+    for path in TUNER_SOURCES:
+        indices[path] = build_ast_index(path.read_bytes(), str(path.relative_to(ROOT)))
+    indices[WARMSTART] = build_ast_index(WARMSTART.read_bytes(), str(WARMSTART.relative_to(ROOT)))
+    indices[TUNER_TESTS] = build_ast_index(TUNER_TESTS.read_bytes(), str(TUNER_TESTS.relative_to(ROOT)))
+    indices[SPEC_TESTS] = build_ast_index(SPEC_TESTS.read_bytes(), str(SPEC_TESTS.relative_to(ROOT)))
+    indices[SPEC_PARSER] = build_ast_index(SPEC_PARSER.read_bytes(), str(SPEC_PARSER.relative_to(ROOT)))
+
+    tuner_aggregate = AstIndex()
+    for path in TUNER_SOURCES:
+        tuner_aggregate.merge(indices[path])
+
     missing: list[str] = []
     for ref, path in REQUIRED_REFS:
         if ref not in doc:
             missing.append(f"{TRACEABILITY.relative_to(ROOT)} does not cite `{ref}`")
-        haystack = tuner_haystack if path == TUNER else path.read_text(encoding="utf-8")
-        if not ref_exists_as_definition(ref, path, haystack):
+
+        idx = tuner_aggregate if path == TUNER else indices[path]
+        if not ref_exists_as_definition(ref, path, idx):
             target = "tuner implementation sources" if path == TUNER else str(path.relative_to(ROOT))
             missing.append(f"{target} do not define `{ref}`")
+
     if missing:
         print("Tuner traceability check failed:", file=sys.stderr)
         for item in missing:
             print(f"- {item}", file=sys.stderr)
         return 1
+
     print(f"Checked {len(REQUIRED_REFS)} Tuner V1 traceability anchors.")
     return 0
 
