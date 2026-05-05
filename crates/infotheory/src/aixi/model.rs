@@ -88,6 +88,30 @@ pub trait Predictor: Send {
 
     /// Creates a boxed clone of this predictor.
     fn boxed_clone(&self) -> Box<dyn Predictor>;
+
+    /// Clear transient conditioning history while preserving all committed learning state.
+    ///
+    /// Called between independent teacher traces during warm-start to prevent the terminal
+    /// conditioning context of one trace from influencing predictions at the start of the next.
+    ///
+    /// # Contract
+    ///
+    /// After a successful call, the predictor must behave as if it were freshly initialized
+    /// with respect to context-dependent predictions (e.g. the sliding-window context suffix
+    /// used to navigate a CTW tree is reset to empty). It must retain **all** committed
+    /// learned model state induced by prior updates, while clearing only transient
+    /// conditioning context. Implementations that clear learned counts (e.g. by calling
+    /// a full `clear()`) violate this contract.
+    ///
+    /// # Errors
+    ///
+    /// Return `Err` only when the backend has no meaningful way to isolate conditioning
+    /// state from learned parameters (e.g. a fully stateful streaming model where the
+    /// two are inseparable). The default no-op is appropriate for backends whose context
+    /// is already isolated or resets naturally.
+    fn reset_conditioning_history(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[inline]
@@ -179,6 +203,11 @@ impl Predictor for CtwPredictor {
             tree: self.tree.clone(),
         })
     }
+
+    fn reset_conditioning_history(&mut self) -> Result<(), String> {
+        self.tree.truncate_history(0);
+        Ok(())
+    }
 }
 
 /// A predictor using the Factorized Action-Conditional CTW (FAC-CTW) algorithm.
@@ -251,6 +280,12 @@ impl Predictor for FacCtwPredictor {
             current_bit: self.current_bit,
             num_bits: self.num_bits,
         })
+    }
+
+    fn reset_conditioning_history(&mut self) -> Result<(), String> {
+        self.tree.reset_history_only();
+        self.current_bit = 0;
+        Ok(())
     }
 }
 
@@ -700,6 +735,12 @@ impl Predictor for RateBackendBitPredictor {
 
     fn boxed_clone(&self) -> Box<dyn Predictor> {
         Box::new(self.clone_state())
+    }
+
+    fn reset_conditioning_history(&mut self) -> Result<(), String> {
+        self.journal.clear();
+        self.rollback_scopes.clear();
+        self.predictor.reset_frozen(None)
     }
 }
 

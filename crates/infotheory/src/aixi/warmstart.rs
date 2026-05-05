@@ -525,6 +525,14 @@ impl WarmStartExactJhAgent {
         for trace in &teacher.traces {
             self.validate_teacher_trace(trace)?;
             label_count = label_count.saturating_add(self.commit_teacher_trace(trace)?);
+            for phase in &mut self.phases {
+                phase
+                    .predictor
+                    .reset_conditioning_history()
+                    .map_err(|reason| WarmStartExactJhError::PredictorConditioningReset {
+                        reason,
+                    })?;
+            }
         }
         if label_count == 0 {
             return Err(WarmStartExactJhError::InvalidTeacherDataset {
@@ -756,6 +764,11 @@ pub enum WarmStartExactJhError {
     Spec(SpecError),
     /// Predictor construction failed.
     Predictor(PredictorBuildError),
+    /// Predictor conditioning history reset failed.
+    PredictorConditioningReset {
+        /// Human-readable reason.
+        reason: String,
+    },
     /// Teacher dataset was malformed or semantically inadmissible.
     InvalidTeacherDataset {
         /// Human-readable reason.
@@ -842,6 +855,12 @@ impl fmt::Display for WarmStartExactJhError {
             Self::UnsupportedRateBackend { reason } => f.write_str(reason),
             Self::Spec(err) => write!(f, "{err}"),
             Self::Predictor(err) => write!(f, "failed to construct predictor: {err}"),
+            Self::PredictorConditioningReset { reason } => {
+                write!(
+                    f,
+                    "failed to reset predictor conditioning history: {reason}"
+                )
+            }
             Self::InvalidTeacherDataset { reason } => {
                 write!(f, "invalid teacher dataset: {reason}")
             }
@@ -896,6 +915,7 @@ impl Error for WarmStartExactJhError {
             Self::InvalidRateBackend(err) => Some(err),
             Self::Spec(err) => Some(err),
             Self::Predictor(err) => Some(err),
+            Self::PredictorConditioningReset { .. } => None,
             _ => None,
         }
     }
@@ -1383,6 +1403,7 @@ fn argmax_with_fixed_tie_break(values: &[f64]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn action_alphabet(n: usize) -> ActionAlphabet {
         ActionAlphabet::try_from_usize(n).expect("test action alphabet must be non-zero")
@@ -1714,5 +1735,111 @@ mod tests {
             err,
             WarmStartExactJhError::ReturnBinsTooSmall { .. }
         ));
+    }
+
+    #[derive(Clone, Default)]
+    struct ResetSpyCounts {
+        reset_calls: usize,
+    }
+
+    #[derive(Clone)]
+    struct ResetSpyPredictor {
+        counts: Arc<Mutex<ResetSpyCounts>>,
+    }
+
+    impl Predictor for ResetSpyPredictor {
+        fn update(&mut self, _sym: bool) {}
+
+        fn update_history(&mut self, _sym: bool) {}
+
+        fn revert(&mut self) {}
+
+        fn pop_history(&mut self) {}
+
+        fn predict_prob(&mut self, sym: bool) -> f64 {
+            if sym { 0.75 } else { 0.25 }
+        }
+
+        fn model_name(&self) -> String {
+            "ResetSpyPredictor".to_string()
+        }
+
+        fn boxed_clone(&self) -> Box<dyn Predictor> {
+            Box::new(self.clone())
+        }
+
+        fn reset_conditioning_history(&mut self) -> Result<(), String> {
+            self.counts
+                .lock()
+                .expect("counts mutex poisoned")
+                .reset_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn warmstart_resets_predictor_conditioning_between_teacher_traces() {
+        let counts = Arc::new(Mutex::new(ResetSpyCounts::default()));
+        let spy = ResetSpyPredictor {
+            counts: counts.clone(),
+        };
+
+        let cfg = WarmStartExactJhRuntimeConfig {
+            observation_bits: 2,
+            observation_stream_len: 1,
+            reward_bits: 2,
+            agent_actions: action_alphabet(2),
+            min_reward: 0,
+            max_reward: 3,
+            reward_offset: 0,
+            return_horizon: 1,
+            return_bins: 4,
+            label_phase_period: 1,
+            planner_simulations_per_step: 3,
+            random_seed: 7,
+        };
+
+        let teacher = WarmStartExactJhTeacherDataset {
+            contract: WarmStartExactJhTeacherContract::default(),
+            traces: vec![
+                WarmStartExactJhTeacherTrace {
+                    transitions: vec![WarmStartExactJhTransition {
+                        action: 0,
+                        observations: vec![1],
+                        reward: 1,
+                    }],
+                },
+                WarmStartExactJhTeacherTrace {
+                    transitions: vec![WarmStartExactJhTransition {
+                        action: 1,
+                        observations: vec![2],
+                        reward: 2,
+                    }],
+                },
+            ],
+        };
+
+        let mut agent = WarmStartExactJhAgent {
+            config: cfg,
+            phases: vec![PhaseModel {
+                predictor: Box::new(spy),
+                last_augmented_step: 0,
+            }],
+            steps: Vec::new(),
+            return_labels_by_step: Vec::new(),
+            total_steps_observed: 0,
+            action_bits: 1,
+            return_bits: 2,
+            teacher_label_count: 0,
+            rng: RandomGenerator::from_seed(7),
+        };
+
+        agent
+            .warm_start_from_teacher(&teacher)
+            .expect("warm-start should succeed");
+
+        let snapshot = counts.lock().expect("counts mutex poisoned").clone();
+        assert_eq!(snapshot.reset_calls, teacher.traces.len());
+        assert_eq!(agent.teacher_label_count(), 2);
     }
 }
