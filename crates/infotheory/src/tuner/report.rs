@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) use crate::aixi::warmstart_contract::observation_key_mode_name;
+
 pub(super) fn executor_controls_report(config: &TuneExecutionConfig) -> Value {
     let cgroup_peak_available = cgroup_peak_memory_bytes().is_some();
     let effective_measurement = match config.rss_mode {
@@ -209,17 +211,6 @@ pub(super) fn planner_deployability_report(
         "exact_log_probability_support": true,
         "deployable_under_executor_limits": deployable_under_executor_limits,
     })
-}
-
-pub(super) fn observation_key_mode_name(
-    mode: crate::aixi::common::ObservationKeyMode,
-) -> &'static str {
-    match mode {
-        crate::aixi::common::ObservationKeyMode::First => "first",
-        crate::aixi::common::ObservationKeyMode::Last => "last",
-        crate::aixi::common::ObservationKeyMode::StreamHash => "stream_hash",
-        crate::aixi::common::ObservationKeyMode::FullStream => "full_stream",
-    }
 }
 
 pub(super) fn controller_kind_name(

@@ -38,3 +38,6 @@ pub(crate) mod test_envs;
 pub mod vm_nyx;
 #[cfg(feature = "aixi")]
 pub mod warmstart;
+#[cfg(feature = "aixi")]
+#[doc(hidden)]
+pub mod warmstart_contract;

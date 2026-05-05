@@ -6,6 +6,10 @@ use crate::aixi::common::{
 };
 use crate::aixi::model::{Predictor, PredictorBuildError, build_aiqi_predictor};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
+use crate::aixi::warmstart_contract::{
+    WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION, observation_key_mode_name,
+    warmstart_exact_jh_planner_task_fingerprint,
+};
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
     CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec, PlannerRunSpec, SpecError,
@@ -104,11 +108,15 @@ impl WarmStartExactJhTeacherDataset {
             .get("schema_version")
             .and_then(Value::as_u64)
             .ok_or_else(|| WarmStartExactJhError::InvalidTeacherDataset {
-                reason: "teacher dataset requires schema_version=1".to_string(),
+                reason: format!(
+                    "teacher dataset requires schema_version={WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION}"
+                ),
             })?;
-        if schema_version != 1 {
+        if schema_version != WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION {
             return Err(WarmStartExactJhError::InvalidTeacherDataset {
-                reason: format!("teacher dataset schema_version must be 1, got {schema_version}"),
+                reason: format!(
+                    "teacher dataset schema_version must be {WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION}, got {schema_version}"
+                ),
             });
         }
         let contract = parse_teacher_contract(object, schema_version)?;
@@ -288,8 +296,10 @@ impl WarmStartExactJhConfig {
 
 #[derive(Clone)]
 struct WarmStartExactJhRuntimeConfig {
+    task_fingerprint: String,
     observation_bits: usize,
     observation_stream_len: usize,
+    observation_key_mode: &'static str,
     reward_bits: usize,
     agent_actions: ActionAlphabet,
     min_reward: Reward,
@@ -303,6 +313,12 @@ struct WarmStartExactJhRuntimeConfig {
 }
 
 impl WarmStartExactJhRuntimeConfig {
+    /// Build a canonicalized runtime contract from a compiled planner run.
+    ///
+    /// The resulting config captures the exact planner/interface contract that
+    /// teacher traces are expected to match. This includes the planner task
+    /// fingerprint plus runtime-visible interface dimensions that must remain
+    /// aligned with any warm-start dataset.
     fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, WarmStartExactJhError> {
         let interface = compiled.interface();
         let runtime = compiled.runtime();
@@ -343,9 +359,17 @@ impl WarmStartExactJhRuntimeConfig {
             return_horizon,
             return_bins,
         )?;
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(compiled).map_err(|err| {
+                WarmStartExactJhError::InvalidTeacherDataset {
+                    reason: format!("failed to compute planner task fingerprint: {err}"),
+                }
+            })?;
         Ok(Self {
+            task_fingerprint,
             observation_bits: interface.observation_bits,
             observation_stream_len: interface.observation_stream_len.max(1),
+            observation_key_mode: observation_key_mode_name(interface.observation_key_mode),
             reward_bits: interface.reward_bits,
             agent_actions: interface.agent_actions,
             min_reward: interface.min_reward,
@@ -357,6 +381,94 @@ impl WarmStartExactJhRuntimeConfig {
             planner_simulations_per_step,
             random_seed: resolve_random_seed(runtime.random_seed),
         })
+    }
+
+    /// Validate that a parsed teacher contract matches the active planner runtime
+    /// contract for this agent configuration.
+    ///
+    /// This comparison is authoritative for schema/contract compatibility and is
+    /// intentionally strict on planner-task fields that influence trace encoding.
+    fn validate_teacher_contract(
+        &self,
+        contract: &WarmStartExactJhTeacherContract,
+    ) -> Result<(), WarmStartExactJhError> {
+        if contract.schema_version != WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: format!(
+                    "teacher schema_version must be {WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION}"
+                ),
+            });
+        }
+        if contract.task_fingerprint != self.task_fingerprint {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: format!(
+                    "teacher task_fingerprint '{}' does not match current planner_run '{}'",
+                    contract.task_fingerprint, self.task_fingerprint
+                ),
+            });
+        }
+        if contract.action_alphabet_size != self.agent_actions.get() {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: format!(
+                    "teacher action_alphabet_size {} does not match configured {}",
+                    contract.action_alphabet_size,
+                    self.agent_actions.get()
+                ),
+            });
+        }
+        if contract.observation_bits != self.observation_bits {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: format!(
+                    "teacher observation_bits {} does not match configured {}",
+                    contract.observation_bits, self.observation_bits
+                ),
+            });
+        }
+        if contract.observation_stream_len != self.observation_stream_len {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: format!(
+                    "teacher observation_stream_len {} does not match configured {}",
+                    contract.observation_stream_len, self.observation_stream_len
+                ),
+            });
+        }
+        if contract.observation_key_mode != self.observation_key_mode {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: "teacher observation_key_mode does not match configured planner interface"
+                    .to_string(),
+            });
+        }
+        if contract.reward_bits != self.reward_bits {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: format!(
+                    "teacher reward_bits {} does not match configured {}",
+                    contract.reward_bits, self.reward_bits
+                ),
+            });
+        }
+        if contract.min_reward != self.min_reward || contract.max_reward != self.max_reward {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: "teacher reward range does not match configured planner interface"
+                    .to_string(),
+            });
+        }
+        if contract.return_horizon != self.return_horizon {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: format!(
+                    "teacher return_horizon {} does not match configured {}",
+                    contract.return_horizon, self.return_horizon
+                ),
+            });
+        }
+        if contract.label_phase_period != self.label_phase_period {
+            return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason: format!(
+                    "teacher label_phase_period {} does not match configured {}",
+                    contract.label_phase_period, self.label_phase_period
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -401,7 +513,10 @@ impl WarmStartExactJhAgent {
         compiled: &CompiledPlannerRunSpec,
         teacher: WarmStartExactJhTeacherDataset,
     ) -> Result<Self, WarmStartExactJhError> {
+        // Validate contract mismatch upfront so invalid metadata fails before costly
+        // predictor allocation and before trace replay.
         let config = WarmStartExactJhRuntimeConfig::from_compiled(compiled)?;
+        config.validate_teacher_contract(&teacher.contract)?;
         let predictor = match compiled.controller() {
             CompiledPlannerController::AiqiWarmstartExactJh { predictor, .. } => predictor,
             _ => return Err(WarmStartExactJhError::ControllerKindMismatch),
@@ -517,6 +632,10 @@ impl WarmStartExactJhAgent {
         self.maybe_learn_new_return()
     }
 
+    /// Warm-start from teacher traces (trace payload validation only).
+    ///
+    /// Contract-level validation is performed before this method is called in the
+    /// constructor hot path; this keeps construction cheap on malformed contracts.
     fn warm_start_from_teacher(
         &mut self,
         teacher: &WarmStartExactJhTeacherDataset,
@@ -1427,22 +1546,29 @@ mod tests {
         }
     }
 
-    fn teacher() -> WarmStartExactJhTeacherDataset {
+    fn teacher_for_config(cfg: &WarmStartExactJhConfig) -> WarmStartExactJhTeacherDataset {
+        let compiled = cfg
+            .compile_planner_run_spec()
+            .expect("test planner run must compile");
+        let task_fingerprint = warmstart_exact_jh_planner_task_fingerprint(&compiled)
+            .expect("test planner fingerprint");
+        let observation_key_mode =
+            observation_key_mode_name(compiled.interface().observation_key_mode);
         WarmStartExactJhTeacherDataset {
             contract: WarmStartExactJhTeacherContract {
-                schema_version: 1,
-                task_fingerprint: "test-task".to_string(),
-                action_alphabet_size: 2,
-                observation_bits: 2,
-                observation_stream_len: 1,
-                observation_key_mode: "full_stream".to_string(),
+                schema_version: WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION,
+                task_fingerprint,
+                action_alphabet_size: cfg.agent_actions.get(),
+                observation_bits: cfg.observation_bits,
+                observation_stream_len: cfg.observation_stream_len.max(1),
+                observation_key_mode: observation_key_mode.to_string(),
                 observation_adapter_spec_ref: "test-observation-adapter".to_string(),
                 observation_adapter_content_crc32: "test-observation-adapter-crc32".to_string(),
-                reward_bits: 2,
-                min_reward: 0,
-                max_reward: 3,
-                return_horizon: 1,
-                label_phase_period: 1,
+                reward_bits: cfg.reward_bits,
+                min_reward: cfg.min_reward,
+                max_reward: cfg.max_reward,
+                return_horizon: cfg.return_horizon,
+                label_phase_period: cfg.label_phase_period,
                 scalar_representation: "test-scalar".to_string(),
                 exact_reward_encoding_certificate: "test-cert".to_string(),
             },
@@ -1466,6 +1592,10 @@ mod tests {
                 ],
             }],
         }
+    }
+
+    fn teacher() -> WarmStartExactJhTeacherDataset {
+        teacher_for_config(&config())
     }
 
     #[test]
@@ -1670,14 +1800,111 @@ mod tests {
 
     #[cfg(feature = "backend-ctw")]
     #[test]
+    fn warmstart_agent_rejects_teacher_contract_task_fingerprint_mismatch() {
+        let mut invalid = teacher();
+        invalid.contract.task_fingerprint = "mismatched-task".to_string();
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher task fingerprint mismatch must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::InvalidTeacherDataset { .. }
+        ));
+        assert!(err.to_string().contains("task_fingerprint"), "{err}");
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_agent_rejects_teacher_contract_interface_mismatch() {
+        let mut invalid = teacher();
+        invalid.contract.action_alphabet_size = 3;
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher contract interface mismatch must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::InvalidTeacherDataset { .. }
+        ));
+        assert!(err.to_string().contains("action_alphabet_size"), "{err}");
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_agent_rejects_teacher_contract_return_horizon_mismatch() {
+        let mut invalid = teacher();
+        invalid.contract.return_horizon = 2;
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher contract return_horizon mismatch must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::InvalidTeacherDataset { .. }
+        ));
+        assert!(err.to_string().contains("return_horizon"), "{err}");
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_agent_rejects_teacher_contract_label_phase_period_mismatch() {
+        let mut invalid = teacher();
+        invalid.contract.label_phase_period = 2;
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher contract label_phase_period mismatch must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::InvalidTeacherDataset { .. }
+        ));
+        assert!(err.to_string().contains("label_phase_period"), "{err}");
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_agent_rejects_teacher_contract_observation_key_mode_mismatch() {
+        let mut invalid = teacher();
+        invalid.contract.observation_key_mode = "definitely-not-a-mode".to_string();
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher contract observation_key_mode mismatch must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::InvalidTeacherDataset { .. }
+        ));
+        assert!(err.to_string().contains("observation_key_mode"), "{err}");
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_agent_rejects_teacher_contract_reward_range_mismatch() {
+        let mut invalid = teacher();
+        invalid.contract.min_reward = -1;
+        invalid.contract.max_reward = 4;
+        let err = match WarmStartExactJhAgent::new(config(), invalid) {
+            Ok(_) => panic!("teacher contract reward range mismatch must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::InvalidTeacherDataset { .. }
+        ));
+        assert!(err.to_string().contains("reward"), "{err}");
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
     fn warmstart_agent_delays_live_trace_until_complete_return_horizon() {
         let mut cfg = config();
         cfg.return_horizon = 2;
         cfg.return_bins = 7;
         cfg.label_phase_period = 2;
         cfg.random_seed = Some(16);
-        let mut agent =
-            WarmStartExactJhAgent::new(cfg, teacher()).expect("warmstart agent should initialize");
+        let mut agent = WarmStartExactJhAgent::new(cfg.clone(), teacher_for_config(&cfg))
+            .expect("warmstart agent should initialize");
 
         assert_eq!(agent.teacher_label_count(), 2);
         assert_eq!(agent.num_actions(), action_alphabet(2));
@@ -1785,8 +2012,10 @@ mod tests {
         };
 
         let cfg = WarmStartExactJhRuntimeConfig {
+            task_fingerprint: "test-task".to_string(),
             observation_bits: 2,
             observation_stream_len: 1,
+            observation_key_mode: "full_stream",
             reward_bits: 2,
             agent_actions: action_alphabet(2),
             min_reward: 0,
@@ -1800,7 +2029,23 @@ mod tests {
         };
 
         let teacher = WarmStartExactJhTeacherDataset {
-            contract: WarmStartExactJhTeacherContract::default(),
+            contract: WarmStartExactJhTeacherContract {
+                schema_version: 1,
+                task_fingerprint: "test-task".to_string(),
+                action_alphabet_size: 2,
+                observation_bits: 2,
+                observation_stream_len: 1,
+                observation_key_mode: "full_stream".to_string(),
+                observation_adapter_spec_ref: "test-observation-adapter".to_string(),
+                observation_adapter_content_crc32: "test-observation-adapter-crc32".to_string(),
+                reward_bits: 2,
+                min_reward: 0,
+                max_reward: 3,
+                return_horizon: 1,
+                label_phase_period: 1,
+                scalar_representation: "test-scalar".to_string(),
+                exact_reward_encoding_certificate: "test-cert".to_string(),
+            },
             traces: vec![
                 WarmStartExactJhTeacherTrace {
                     transitions: vec![WarmStartExactJhTransition {

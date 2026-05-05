@@ -33,8 +33,10 @@ mod cli;
 
 use infotheory::aixi::agent::Agent;
 use infotheory::aixi::aiqi::AiqiAgent;
+#[cfg(test)]
+use infotheory::aixi::common::ObservationKeyMode;
 use infotheory::aixi::common::{
-    ActionAlphabet, EXPLORE_RANDOM_SALT, ObservationKeyMode, RandomGenerator, resolve_random_seed,
+    ActionAlphabet, EXPLORE_RANDOM_SALT, RandomGenerator, resolve_random_seed,
 };
 use infotheory::aixi::environment::Environment;
 #[cfg(feature = "aixi-gameengine")]
@@ -48,6 +50,10 @@ use infotheory::aixi::vm_nyx::{
 #[cfg(feature = "vm")]
 use infotheory::aixi::vm_nyx::{NyxVmConfig, NyxVmEnvironment};
 use infotheory::aixi::warmstart::{WarmStartExactJhAgent, WarmStartExactJhTeacherDataset};
+use infotheory::aixi::warmstart_contract::{
+    WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION, observation_key_mode_name,
+    warmstart_exact_jh_planner_task_fingerprint,
+};
 use infotheory::api::*;
 #[cfg(feature = "backend-mamba")]
 use infotheory::mambazip;
@@ -608,6 +614,10 @@ impl PlannerControllerRuntime {
     }
 }
 
+/// Load a warm-start exact-J_H teacher dataset and validate its planner contract.
+///
+/// This enforces a stable planner-task boundary (fingerprint and schema) before
+/// the data is used by runtime construction.
 fn load_warmstart_exact_jh_teacher_dataset(
     compiled: &CompiledPlannerRunSpec,
     asset_id: &str,
@@ -637,17 +647,23 @@ fn load_warmstart_exact_jh_teacher_dataset(
     Ok(teacher)
 }
 
+/// Validate the parser-level contract fields against a concrete compiled planner run.
+///
+/// The contract comparison intentionally checks task identity, planner interface
+/// dimensions, and planner execution invariants that affect trace encoding.
 fn validate_warmstart_exact_jh_teacher_contract(
     compiled: &CompiledPlannerRunSpec,
     teacher: &WarmStartExactJhTeacherDataset,
 ) -> anyhow::Result<()> {
     let contract = &teacher.contract;
-    if contract.schema_version != 1 {
+    if contract.schema_version != WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION {
         return Err(anyhow::anyhow!(
-            "warm-start teacher schema_version must be 1"
+            "warm-start teacher schema_version must be {}",
+            WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION
         ));
     }
-    let task_fingerprint = warmstart_exact_jh_planner_task_fingerprint(compiled)?;
+    let task_fingerprint =
+        warmstart_exact_jh_planner_task_fingerprint(compiled).map_err(anyhow::Error::new)?;
     if contract.task_fingerprint != task_fingerprint {
         return Err(anyhow::anyhow!(
             "warm-start teacher task_fingerprint '{}' does not match current planner_run '{}'",
@@ -677,7 +693,7 @@ fn validate_warmstart_exact_jh_teacher_contract(
     if contract.action_alphabet_size != interface.agent_actions.get()
         || contract.observation_bits != interface.observation_bits
         || contract.observation_stream_len != interface.observation_stream_len.max(1)
-        || Some(contract.observation_key_mode.as_str())
+        || contract.observation_key_mode
             != observation_key_mode_name(interface.observation_key_mode)
         || contract.reward_bits != interface.reward_bits
         || contract.min_reward != interface.min_reward
@@ -695,36 +711,6 @@ fn validate_warmstart_exact_jh_teacher_contract(
         ));
     }
     Ok(())
-}
-
-fn warmstart_exact_jh_planner_task_fingerprint(
-    compiled: &CompiledPlannerRunSpec,
-) -> anyhow::Result<String> {
-    let payload = serde_json::json!({
-        "planner_run_canonical_crc32": crc32_hex(compiled.canonical_bytes().as_slice()),
-        "controller_kind": compiled.controller().kind_str(),
-        "controller_backend": controller_backend_label(compiled.controller()),
-        "teacher_contract_schema_version": 1,
-    });
-    serde_json::to_vec(&payload)
-        .map(|bytes| crc32_hex(&bytes))
-        .map_err(anyhow::Error::new)
-}
-
-fn crc32_hex(bytes: &[u8]) -> String {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(bytes);
-    format!("{:08x}", hasher.finalize())
-}
-
-fn observation_key_mode_name(mode: ObservationKeyMode) -> Option<&'static str> {
-    match mode {
-        ObservationKeyMode::First => Some("first"),
-        ObservationKeyMode::Last => Some("last"),
-        ObservationKeyMode::StreamHash => Some("stream_hash"),
-        ObservationKeyMode::FullStream => Some("full_stream"),
-        _ => None,
-    }
 }
 
 fn controller_backend_label(controller: &CompiledPlannerController) -> String {
