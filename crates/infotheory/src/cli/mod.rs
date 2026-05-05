@@ -1162,6 +1162,36 @@ fn format_metrics_json(h0: f64, h_rate: f64, id: f64, len: usize) -> String {
     )
 }
 
+fn parse_ncd_variant_name(variant: &str) -> NcdVariant {
+    match variant {
+        "sym" | "sym_vitanyi" => NcdVariant::SymVitanyi,
+        "cons" => NcdVariant::Cons,
+        "sym_cons" => NcdVariant::SymCons,
+        _ => NcdVariant::Vitanyi,
+    }
+}
+
+fn compiled_ncd_backend_from_json(
+    value: &serde_json::Value,
+) -> InfotheoryResult<CompiledCompressionBackend> {
+    let Some(backend_value) = value
+        .get("compression_backend")
+        .or_else(|| value.get("backend"))
+    else {
+        return Ok(get_default_ctx()?.compression_backend);
+    };
+    let backend = infotheory::spec::parse_compression_backend_json(
+        backend_value,
+        Path::new("."),
+        None,
+        infotheory::compression::FramingMode::Raw,
+    )
+    .map_err(|err| infotheory::error::InfotheoryError::invalid_backend_config(err.to_string()))?;
+    backend
+        .compile()
+        .map_err(|err| infotheory::error::InfotheoryError::invalid_backend_config(err.to_string()))
+}
+
 fn rosa_distance(x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
     if x.is_empty() || y.is_empty() {
         return Ok(1.0);
@@ -1258,14 +1288,19 @@ pub(super) fn process_json_line(line: &str) -> String {
                 return r#"{"error":"empty text(s)"}"#.to_string();
             }
 
-            let ncd_variant = match variant.as_str() {
-                "sym" | "sym_vitanyi" => NcdVariant::SymVitanyi,
-                "cons" => NcdVariant::Cons,
-                "sym_cons" => NcdVariant::SymCons,
-                _ => NcdVariant::Vitanyi,
+            let ncd_variant = parse_ncd_variant_name(&variant);
+
+            let ncd_result = if v.get("compression_backend").is_some() || v.get("backend").is_some()
+            {
+                compiled_ncd_backend_from_json(&v)
+                    .and_then(|backend| try_ncd_bytes_backend(x, y, &backend, ncd_variant))
+            } else if cfg!(feature = "backend-zpaq") {
+                try_ncd_bytes(x, y, &method, ncd_variant)
+            } else {
+                try_ncd_bytes_default(x, y, ncd_variant)
             };
 
-            match try_ncd_bytes(x, y, &method, ncd_variant) {
+            match ncd_result {
                 Ok(ncd) => format!(r#"{{"ncd":{:.6}}}"#, ncd),
                 Err(err) => json_error(format!("ncd failed: {err}")),
             }
@@ -1292,14 +1327,23 @@ pub(super) fn process_json_line(line: &str) -> String {
                 .unwrap_or("vitanyi")
                 .to_string();
 
-            let ncd_variant = match variant.as_str() {
-                "sym" | "sym_vitanyi" => NcdVariant::SymVitanyi,
-                "cons" => NcdVariant::Cons,
-                "sym_cons" => NcdVariant::SymCons,
-                _ => NcdVariant::Vitanyi,
+            let ncd_variant = parse_ncd_variant_name(&variant);
+
+            let ncd_result = if v.get("compression_backend").is_some() || v.get("backend").is_some()
+            {
+                compiled_ncd_backend_from_json(&v)
+                    .and_then(|backend| try_ncd_paths_compiled_backend(&path1, &path2, &backend, ncd_variant))
+            } else if cfg!(feature = "backend-zpaq") {
+                try_ncd_paths(&path1, &path2, &method, ncd_variant)
+            } else {
+                let (left, right) = rayon::join(|| std::fs::read(&path1), || std::fs::read(&path2));
+                match (left, right) {
+                    (Ok(left), Ok(right)) => try_ncd_bytes_default(&left, &right, ncd_variant),
+                    (Err(err), _) | (_, Err(err)) => Err(infotheory::error::InfotheoryError::from(err)),
+                }
             };
 
-            match try_ncd_paths(&path1, &path2, &method, ncd_variant) {
+            match ncd_result {
                 Ok(ncd) => format!(r#"{{"ncd":{:.6}}}"#, ncd),
                 Err(err) => json_error(format!("ncd_files failed: {err}")),
             }
@@ -1403,15 +1447,19 @@ pub(super) fn process_json_line(line: &str) -> String {
                 .unwrap_or("vitanyi")
                 .to_string();
 
-            let ncd_variant = match variant.as_str() {
-                "sym" | "sym_vitanyi" => NcdVariant::SymVitanyi,
-                "cons" => NcdVariant::Cons,
-                "sym_cons" => NcdVariant::SymCons,
-                _ => NcdVariant::Vitanyi,
-            };
+            let ncd_variant = parse_ncd_variant_name(&variant);
 
             let datas: Vec<Vec<u8>> = texts.iter().map(|t| t.as_bytes().to_vec()).collect();
-            let matrix = match try_ncd_matrix_bytes(&datas, &method, ncd_variant) {
+            let matrix_result =
+                if v.get("compression_backend").is_some() || v.get("backend").is_some() {
+                    compiled_ncd_backend_from_json(&v)
+                        .and_then(|backend| try_ncd_matrix_bytes_backend(&datas, &backend, ncd_variant))
+                } else if cfg!(feature = "backend-zpaq") {
+                    try_ncd_matrix_bytes(&datas, &method, ncd_variant)
+                } else {
+                    try_ncd_matrix_bytes_default(&datas, ncd_variant)
+                };
+            let matrix = match matrix_result {
                 Ok(matrix) => matrix,
                 Err(err) => return json_error(format!("ncd_matrix failed: {err}")),
             };
@@ -1563,6 +1611,10 @@ mod non_vm_tests {
         RateBackend::try_default().is_ok()
     }
 
+    fn has_default_compression_backend() -> bool {
+        CompressionBackend::try_default().is_ok()
+    }
+
     fn assert_backend_unavailable_error(output: &Value) {
         let err = output["error"]
             .as_str()
@@ -1668,6 +1720,7 @@ mod non_vm_tests {
     #[test]
     fn process_json_line_emits_structured_matrix_and_file_results() {
         let has_rate_backend = has_default_rate_backend();
+        let has_compression_backend = has_default_compression_backend();
         let file_path = unique_temp_path("metrics-file", "txt");
         fs::write(&file_path, b"structured metrics fixture").expect("write metrics file");
 
@@ -1685,7 +1738,7 @@ mod non_vm_tests {
         let ncd_matrix = parse_json_output(&process_json_line(
             r#"{ "op": "ncd_matrix", "texts": ["aaaa", "aaab"] }"#,
         ));
-        if has_rate_backend {
+        if has_compression_backend {
             assert_eq!(ncd_matrix["n"], 2);
             let matrix = ncd_matrix["matrix"].as_array().expect("matrix rows");
             assert_eq!(matrix.len(), 2);
@@ -1714,10 +1767,11 @@ mod non_vm_tests {
     #[test]
     fn process_json_line_covers_pairwise_ops_and_contract_errors() {
         let has_rate_backend = has_default_rate_backend();
+        let has_compression_backend = has_default_compression_backend();
         let ncd = parse_json_output(&process_json_line(
             r#"{ "op": "ncd", "text1": "abracadabra", "text2": "alakazam", "method": "5", "variant": "sym_cons" }"#,
         ));
-        if has_rate_backend {
+        if has_compression_backend {
             assert!(ncd["ncd"].as_f64().expect("ncd value").is_finite());
         } else {
             assert_backend_unavailable_error(&ncd);
@@ -1758,7 +1812,7 @@ mod non_vm_tests {
             left_path.display(),
             right_path.display()
         )));
-        if has_rate_backend {
+        if has_compression_backend {
             assert!(
                 ncd_files["ncd"]
                     .as_f64()
@@ -1830,6 +1884,42 @@ mod non_vm_tests {
         } else {
             assert_backend_unavailable_error(&high_redundancy);
         }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn process_json_line_ncd_accepts_explicit_rate_coded_compression_backend() {
+        let ncd = parse_json_output(&process_json_line(
+            r#"{
+                "op": "ncd",
+                "text1": "abracadabra",
+                "text2": "alakazam",
+                "variant": "sym",
+                "compression_backend": {
+                    "kind": "rate-ac",
+                    "rate_backend": { "kind": "ctw", "depth": 4 },
+                    "framing": "raw"
+                }
+            }"#,
+        ));
+        assert!(ncd["ncd"].as_f64().expect("ncd value").is_finite());
+
+        let matrix = parse_json_output(&process_json_line(
+            r#"{
+                "op": "ncd_matrix",
+                "texts": ["aaaa", "aaab"],
+                "compression_backend": {
+                    "kind": "rate-ac",
+                    "rate_backend": { "kind": "ctw", "depth": 4 },
+                    "framing": "raw"
+                }
+            }"#,
+        ));
+        assert_eq!(matrix["n"], 2);
+        let rows = matrix["matrix"].as_array().expect("matrix rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], 0.0);
+        assert_eq!(rows[1][1], 0.0);
     }
 }
 

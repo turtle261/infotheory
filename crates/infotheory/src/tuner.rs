@@ -1617,7 +1617,7 @@ fn run_annealed_hill_climbing(
             "max_mutation_radius": max_mutation_radius,
             "annealer_kernel_profile": annealer_kernel_profile_name(request.execution.annealer_kernel_profile),
             "proposal_mass_accounting": request.execution.annealer_kernel_profile == AnnealerKernelProfile::CompiledUniformMetropolisHastings,
-            "proposal_action_distribution": "uniform_finite_integer_elementary_descriptors",
+            "proposal_action_distribution": "uniform_finite_bounded_numeric_elementary_descriptors",
         }),
     })
 }

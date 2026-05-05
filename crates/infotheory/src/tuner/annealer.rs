@@ -134,25 +134,19 @@ pub(super) fn compile_canonical_proposal_kernel(
     if !range_map.is_empty() {
         leaves.retain(|leaf| range_map.contains_key(&leaf.path));
     }
-    leaves.retain(|leaf| matches!(leaf.kind, NumericKind::Unsigned | NumericKind::Signed));
-    let total_raw_actions = (leaves.len() as u64)
+    let descriptors = compile_numeric_mutation_descriptors(leaves, &range_map, max_mutation_radius);
+    let total_raw_actions = (descriptors.len() as u64)
         .saturating_mul(2)
         .saturating_mul(max_mutation_radius.max(1) as u64);
     let mut transitions = BTreeMap::<Vec<u8>, CanonicalProposal>::new();
-    for leaf in &leaves {
-        let Some((min_bound, max_bound)) =
-            integer_leaf_bounds(leaf.kind, range_map.get(&leaf.path).copied())
-        else {
-            continue;
-        };
+    for descriptor in &descriptors {
         for magnitude in 1..=max_mutation_radius.max(1) {
-            for sign in [-1i128, 1i128] {
+            for sign in [-1i8, 1i8] {
                 if magnitude > active_radius {
                     continue;
                 }
                 let mut next_json = json.clone();
-                let delta = sign * (magnitude as i128);
-                if !apply_integer_descriptor(&mut next_json, leaf, min_bound, max_bound, delta) {
+                if !apply_numeric_descriptor(&mut next_json, descriptor, magnitude, sign) {
                     continue;
                 }
                 let parsed = match crate::spec::parse_compression_backend_json(
@@ -196,6 +190,56 @@ pub(super) fn compile_canonical_proposal_kernel(
     })
 }
 
+#[derive(Clone)]
+struct NumericMutationDescriptor {
+    leaf: NumericLeaf,
+    domain: NumericMutationDomain,
+}
+
+#[derive(Clone, Copy)]
+enum NumericMutationDomain {
+    Integer {
+        min_bound: i128,
+        max_bound: i128,
+    },
+    Float {
+        min_key: u64,
+        max_key: u64,
+        stride: u64,
+    },
+}
+
+fn compile_numeric_mutation_descriptors(
+    leaves: Vec<NumericLeaf>,
+    range_map: &BTreeMap<String, (f64, f64)>,
+    max_mutation_radius: usize,
+) -> Vec<NumericMutationDescriptor> {
+    leaves
+        .into_iter()
+        .filter_map(|leaf| {
+            let range = range_map.get(&leaf.path).copied();
+            let domain = match leaf.kind {
+                NumericKind::Unsigned | NumericKind::Signed => {
+                    let (min_bound, max_bound) = integer_leaf_bounds(leaf.kind, range)?;
+                    NumericMutationDomain::Integer {
+                        min_bound,
+                        max_bound,
+                    }
+                }
+                NumericKind::Float => {
+                    let (min_key, max_key, stride) = float_leaf_bounds(range, max_mutation_radius)?;
+                    NumericMutationDomain::Float {
+                        min_key,
+                        max_key,
+                        stride,
+                    }
+                }
+            };
+            Some(NumericMutationDescriptor { leaf, domain })
+        })
+        .collect()
+}
+
 pub(super) fn integer_leaf_bounds(
     kind: NumericKind,
     range: Option<(f64, f64)>,
@@ -206,13 +250,96 @@ pub(super) fn integer_leaf_bounds(
         NumericKind::Float => return None,
     };
     let (min, max) = match range {
-        Some((min, max)) => (
-            (min.ceil() as i128).clamp(type_min, type_max),
-            (max.floor() as i128).clamp(type_min, type_max),
-        ),
+        Some((min, max)) => {
+            if !min.is_finite() || !max.is_finite() {
+                return None;
+            }
+            (
+                (min.ceil() as i128).clamp(type_min, type_max),
+                (max.floor() as i128).clamp(type_min, type_max),
+            )
+        }
         None => (type_min, type_max),
     };
     (min <= max).then_some((min, max))
+}
+
+fn float_leaf_bounds(
+    range: Option<(f64, f64)>,
+    max_mutation_radius: usize,
+) -> Option<(u64, u64, u64)> {
+    let (min, max) = range?;
+    if !min.is_finite() || !max.is_finite() || min > max {
+        return None;
+    }
+    let min_key = f64_to_ordered_key(min)?;
+    let max_key = f64_to_ordered_key(max)?;
+    if min_key > max_key {
+        return None;
+    }
+    let span = max_key - min_key;
+    let denominator = (max_mutation_radius.max(1) as u128)
+        .saturating_mul(2)
+        .saturating_add(1);
+    let stride = ((span as u128) / denominator).max(1);
+    Some((min_key, max_key, u64::try_from(stride).unwrap_or(u64::MAX)))
+}
+
+fn f64_to_ordered_key(value: f64) -> Option<u64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let bits = value.to_bits();
+    let sign_mask = 1_u64 << 63;
+    if bits & sign_mask == 0 {
+        Some(bits | sign_mask)
+    } else {
+        Some(!bits)
+    }
+}
+
+fn ordered_key_to_f64(key: u64) -> f64 {
+    let sign_mask = 1_u64 << 63;
+    let bits = if key & sign_mask == 0 {
+        !key
+    } else {
+        key & !sign_mask
+    };
+    f64::from_bits(bits)
+}
+
+fn apply_numeric_descriptor(
+    json: &mut Value,
+    descriptor: &NumericMutationDescriptor,
+    magnitude: usize,
+    sign: i8,
+) -> bool {
+    match descriptor.domain {
+        NumericMutationDomain::Integer {
+            min_bound,
+            max_bound,
+        } => apply_integer_descriptor(
+            json,
+            &descriptor.leaf,
+            min_bound,
+            max_bound,
+            magnitude,
+            sign,
+        ),
+        NumericMutationDomain::Float {
+            min_key,
+            max_key,
+            stride,
+        } => apply_float_descriptor(
+            json,
+            &descriptor.leaf,
+            min_key,
+            max_key,
+            stride,
+            magnitude,
+            sign,
+        ),
+    }
 }
 
 pub(super) fn apply_integer_descriptor(
@@ -220,7 +347,8 @@ pub(super) fn apply_integer_descriptor(
     leaf: &NumericLeaf,
     min_bound: i128,
     max_bound: i128,
-    delta: i128,
+    magnitude: usize,
+    sign: i8,
 ) -> bool {
     let Some(slot) = json.pointer_mut(&leaf.pointer) else {
         return false;
@@ -233,6 +361,10 @@ pub(super) fn apply_integer_descriptor(
     let Some(current) = current else {
         return false;
     };
+    let Ok(magnitude) = i128::try_from(magnitude) else {
+        return false;
+    };
+    let delta = if sign < 0 { -magnitude } else { magnitude };
     let Some(next) = current.checked_add(delta) else {
         return false;
     };
@@ -256,6 +388,56 @@ pub(super) fn apply_integer_descriptor(
         }
         NumericKind::Float => false,
     }
+}
+
+fn apply_float_descriptor(
+    json: &mut Value,
+    leaf: &NumericLeaf,
+    min_key: u64,
+    max_key: u64,
+    stride: u64,
+    magnitude: usize,
+    sign: i8,
+) -> bool {
+    let Some(slot) = json.pointer_mut(&leaf.pointer) else {
+        return false;
+    };
+    let Some(current) = slot.as_f64() else {
+        return false;
+    };
+    let Some(current_key) = f64_to_ordered_key(current) else {
+        return false;
+    };
+    if current_key < min_key || current_key > max_key {
+        return false;
+    }
+    let step = (magnitude as u128).saturating_mul(stride as u128);
+    let Ok(step) = u64::try_from(step) else {
+        return false;
+    };
+    let next_key = if sign < 0 {
+        let Some(value) = current_key.checked_sub(step) else {
+            return false;
+        };
+        value
+    } else {
+        let Some(value) = current_key.checked_add(step) else {
+            return false;
+        };
+        value
+    };
+    if next_key < min_key || next_key > max_key || next_key == current_key {
+        return false;
+    }
+    let next = ordered_key_to_f64(next_key);
+    if !next.is_finite() {
+        return false;
+    }
+    let Some(number) = serde_json::Number::from_f64(next) else {
+        return false;
+    };
+    *slot = Value::Number(number);
+    true
 }
 
 pub(super) fn collect_numeric_leaves(root: &Value) -> Vec<NumericLeaf> {

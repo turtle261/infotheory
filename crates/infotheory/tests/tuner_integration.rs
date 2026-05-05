@@ -2089,7 +2089,7 @@ fn run_tune_reports_compiled_uniform_mh_kernel() {
     );
     assert_eq!(
         str_at(&report, "/search/controller/proposal_action_distribution"),
-        "uniform_finite_integer_elementary_descriptors"
+        "uniform_finite_bounded_numeric_elementary_descriptors"
     );
     assert!(bool_at(
         &report,

@@ -1061,6 +1061,78 @@ fn canonical_proposal_kernel_accounts_exact_integer_masses() {
     assert_eq!(reverse.transitions.len(), 1);
 }
 
+#[cfg(feature = "backend-match")]
+#[test]
+fn canonical_proposal_kernel_explores_bounded_float_only_search_space() {
+    use crate::api::RateBackend;
+    use crate::compression::FramingMode;
+    use crate::spec::{TuneBoundsSpec, TuneParameterRangeSpec};
+
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Match {
+            hash_bits: 18,
+            min_len: 4,
+            max_len: 64,
+            base_mix: 0.02,
+            confidence_scale: 1.0,
+        },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let bounds = TuneBoundsSpec {
+        allowed_backends: vec!["match".to_string()],
+        forbidden_backends: Vec::new(),
+        parameter_ranges: vec![TuneParameterRangeSpec {
+            parameter: "rate_backend.base_mix".to_string(),
+            min: 0.01,
+            max: 0.04,
+        }],
+        max_experts: 2,
+        max_mixture_nesting_depth: 1,
+        min_experts: Some(1),
+        allow_duplicate_experts: Some(false),
+        required_experts: Vec::new(),
+        forbidden_expert_pairs: Vec::new(),
+    };
+    let env = SpecEnvironment::new(".");
+    let current = candidate.compile_in(&env).expect("compile current");
+    let current_bytes = current.canonical_bytes().as_slice().to_vec();
+    let kernel = compile_canonical_proposal_kernel(&candidate, &bounds, 2, 2, &env, &current_bytes)
+        .expect("compile float proposal kernel");
+
+    assert_eq!(kernel.total_raw_actions, 4);
+    assert!(
+        !kernel.transitions.is_empty(),
+        "bounded float-only search spaces must produce non-self proposals"
+    );
+
+    for proposal in &kernel.transitions {
+        let CompressionBackend::Rate {
+            rate_backend: RateBackend::Match { base_mix, .. },
+            ..
+        } = &proposal.candidate
+        else {
+            panic!("expected match proposal");
+        };
+        assert!((0.01..=0.04).contains(base_mix));
+
+        let reverse = compile_canonical_proposal_kernel(
+            &proposal.candidate,
+            &bounds,
+            2,
+            2,
+            &env,
+            &proposal.candidate_canonical_bytes,
+        )
+        .expect("compile reverse float proposal kernel");
+        assert_eq!(reverse.total_raw_actions, 4);
+        assert_eq!(
+            reverse.proposal_mass_to_canonical_bytes(&current_bytes),
+            proposal.raw_action_count
+        );
+    }
+}
+
 #[cfg(feature = "backend-ctw")]
 #[test]
 fn reversible_metropolis_acceptance_uses_objective_bits_temperature() {
@@ -3404,7 +3476,7 @@ fn inactive_radius_moves_become_self_loops() {
         .expect("depth leaf");
     let (min_b, max_b) = integer_leaf_bounds(depth_leaf.kind, Some((1.0, 16.0))).unwrap();
     let mut json_mut = json_lb.clone();
-    let applied_down = apply_integer_descriptor(&mut json_mut, depth_leaf, min_b, max_b, -1);
+    let applied_down = apply_integer_descriptor(&mut json_mut, depth_leaf, min_b, max_b, 1, -1);
     assert!(
         !applied_down,
         "apply_integer_descriptor must return false for depth 1 + delta -1 (out of bounds)"
@@ -3414,7 +3486,7 @@ fn inactive_radius_moves_become_self_loops() {
         "failed boundary move must leave the candidate JSON unchanged rather than clipping"
     );
     let mut json_mut2 = json_lb.clone();
-    let applied_up = apply_integer_descriptor(&mut json_mut2, depth_leaf, min_b, max_b, 1);
+    let applied_up = apply_integer_descriptor(&mut json_mut2, depth_leaf, min_b, max_b, 1, 1);
     assert!(
         applied_up,
         "apply_integer_descriptor must return true for depth 1 + delta +1 (valid move)"

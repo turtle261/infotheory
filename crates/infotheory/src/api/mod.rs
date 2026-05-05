@@ -25,6 +25,7 @@ pub use self::compression::{
     NcdVariant, try_compress_bytes_backend, try_compress_size_backend,
     try_compress_size_chain_backend, try_decompress_bytes_backend, try_ncd_bytes,
     try_ncd_bytes_backend, try_ncd_bytes_default, try_ncd_matrix_bytes,
+    try_ncd_matrix_bytes_backend, try_ncd_matrix_bytes_default,
 };
 pub use self::generation::{
     try_generate_bytes, try_generate_bytes_conditional_chain,
@@ -51,6 +52,7 @@ pub use self::paths::{
     try_get_parallel_compressed_sizes_from_sequential_paths,
     try_get_sequential_compressed_sizes_from_parallel_paths,
     try_get_sequential_compressed_sizes_from_sequential_paths, try_js_divergence_paths,
-    try_kl_divergence_paths, try_mutual_information_paths, try_ncd_matrix_paths, try_ncd_paths,
-    try_ncd_paths_backend, try_ned_paths, try_nhd_paths, try_nte_paths, try_tvd_paths,
+    try_kl_divergence_paths, try_mutual_information_paths, try_ncd_matrix_paths,
+    try_ncd_matrix_paths_backend, try_ncd_paths, try_ncd_paths_backend,
+    try_ncd_paths_compiled_backend, try_ned_paths, try_nhd_paths, try_nte_paths, try_tvd_paths,
 };

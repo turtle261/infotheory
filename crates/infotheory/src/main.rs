@@ -34,7 +34,7 @@ mod cli;
 use infotheory::aixi::agent::Agent;
 use infotheory::aixi::aiqi::AiqiAgent;
 use infotheory::aixi::common::{
-    ActionAlphabet, EXPLORE_RANDOM_SALT, RandomGenerator, resolve_random_seed,
+    ActionAlphabet, EXPLORE_RANDOM_SALT, ObservationKeyMode, RandomGenerator, resolve_random_seed,
 };
 use infotheory::aixi::environment::Environment;
 #[cfg(feature = "aixi-gameengine")]
@@ -89,8 +89,6 @@ use crate::cli::{
     parse_observation_stream_len, parse_observation_stream_len_for_env,
     parse_observation_stream_len_for_vm, process_json_line, validate_observation_config,
 };
-#[cfg(test)]
-use infotheory::aixi::common::ObservationKeyMode;
 #[cfg(feature = "backend-rosa")]
 use infotheory::search;
 #[cfg(feature = "tuner")]
@@ -633,7 +631,100 @@ fn load_warmstart_exact_jh_teacher_dataset(
             path.display()
         )
     })?;
-    WarmStartExactJhTeacherDataset::from_json_slice(&bytes).map_err(anyhow::Error::msg)
+    let teacher =
+        WarmStartExactJhTeacherDataset::from_json_slice(&bytes).map_err(anyhow::Error::msg)?;
+    validate_warmstart_exact_jh_teacher_contract(compiled, &teacher)?;
+    Ok(teacher)
+}
+
+fn validate_warmstart_exact_jh_teacher_contract(
+    compiled: &CompiledPlannerRunSpec,
+    teacher: &WarmStartExactJhTeacherDataset,
+) -> anyhow::Result<()> {
+    let contract = &teacher.contract;
+    if contract.schema_version != 1 {
+        return Err(anyhow::anyhow!(
+            "warm-start teacher schema_version must be 1"
+        ));
+    }
+    let task_fingerprint = warmstart_exact_jh_planner_task_fingerprint(compiled)?;
+    if contract.task_fingerprint != task_fingerprint {
+        return Err(anyhow::anyhow!(
+            "warm-start teacher task_fingerprint '{}' does not match current planner_run '{}'",
+            contract.task_fingerprint,
+            task_fingerprint
+        ));
+    }
+    let interface = compiled.interface();
+    let (return_horizon, label_phase_period, planner_simulations_per_step) =
+        match compiled.controller() {
+            CompiledPlannerController::AiqiWarmstartExactJh {
+                return_horizon,
+                label_phase_period,
+                planner_simulations_per_step,
+                ..
+            } => (
+                *return_horizon,
+                *label_phase_period,
+                *planner_simulations_per_step,
+            ),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "warm-start teacher contract can only be validated for aiqi_warmstart_exact_jh"
+                ));
+            }
+        };
+    if contract.action_alphabet_size != interface.agent_actions.get()
+        || contract.observation_bits != interface.observation_bits
+        || contract.observation_stream_len != interface.observation_stream_len.max(1)
+        || Some(contract.observation_key_mode.as_str())
+            != observation_key_mode_name(interface.observation_key_mode)
+        || contract.reward_bits != interface.reward_bits
+        || contract.min_reward != interface.min_reward
+        || contract.max_reward != interface.max_reward
+        || contract.return_horizon != return_horizon
+        || contract.label_phase_period != label_phase_period
+    {
+        return Err(anyhow::anyhow!(
+            "warm-start teacher planner interface fingerprint does not match compiled planner_run"
+        ));
+    }
+    if planner_simulations_per_step == 0 {
+        return Err(anyhow::anyhow!(
+            "compiled warm-start planner_simulations_per_step must be >= 1"
+        ));
+    }
+    Ok(())
+}
+
+fn warmstart_exact_jh_planner_task_fingerprint(
+    compiled: &CompiledPlannerRunSpec,
+) -> anyhow::Result<String> {
+    let payload = serde_json::json!({
+        "planner_run_canonical_crc32": crc32_hex(compiled.canonical_bytes().as_slice()),
+        "controller_kind": compiled.controller().kind_str(),
+        "controller_backend": controller_backend_label(compiled.controller()),
+        "teacher_contract_schema_version": 1,
+    });
+    serde_json::to_vec(&payload)
+        .map(|bytes| crc32_hex(&bytes))
+        .map_err(anyhow::Error::new)
+}
+
+fn crc32_hex(bytes: &[u8]) -> String {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(bytes);
+    format!("{:08x}", hasher.finalize())
+}
+
+fn observation_key_mode_name(mode: ObservationKeyMode) -> Option<&'static str> {
+    match mode {
+        ObservationKeyMode::First => Some("first"),
+        ObservationKeyMode::Last => Some("last"),
+        ObservationKeyMode::StreamHash => Some("stream_hash"),
+        ObservationKeyMode::FullStream => Some("full_stream"),
+        _ => None,
+    }
 }
 
 fn controller_backend_label(controller: &CompiledPlannerController) -> String {
@@ -1791,6 +1882,103 @@ mod tests {
     }
 
     #[cfg(feature = "backend-ctw")]
+    fn sample_warmstart_compiled_planner_run(teacher_path: &Path) -> CompiledPlannerRunSpec {
+        let document = SpecDocument::parse_json_value(
+            &json!({
+                "schema_version": 1,
+                "kind": "planner_run",
+                "assets": [{
+                    "id": "teacher",
+                    "path": teacher_path.to_string_lossy()
+                }],
+                "environment": {
+                    "kind": "builtin",
+                    "name": "coin_flip"
+                },
+                "interface": {
+                    "observation_bits": 2,
+                    "observation_stream_len": 1,
+                    "observation_key_mode": "full_stream",
+                    "reward_bits": 2,
+                    "agent_actions": action_alphabet(2).get(),
+                    "min_reward": 0,
+                    "max_reward": 3,
+                    "reward_offset": 0
+                },
+                "controller": {
+                    "kind": "aiqi_warmstart_exact_jh",
+                    "predictor": {
+                        "kind": "ctw",
+                        "depth": 4
+                    },
+                    "return_horizon": 1,
+                    "return_bins": 4,
+                    "label_phase_period": 1,
+                    "teacher_dataset_asset": "teacher",
+                    "planner_simulations_per_step": 1
+                },
+                "runtime": {
+                    "random_seed": 7,
+                    "learn_cycles": 1,
+                    "eval_cycles": 1,
+                    "terminate_lifetime": 2,
+                    "log_every": 1,
+                    "perf": false,
+                    "vm_perf_only": false,
+                    "explore_epsilon": 0.0,
+                    "explore_gamma": 1.0
+                }
+            }),
+            Path::new("."),
+        )
+        .expect("sample warmstart planner document");
+        let SpecDocument::PlannerRun(spec) = document else {
+            panic!("expected planner_run document");
+        };
+        spec.compile()
+            .expect("sample warmstart planner run should compile")
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    fn write_warmstart_teacher(
+        path: &Path,
+        task_fingerprint: &str,
+        action_alphabet_size: usize,
+        observation_bits: usize,
+        max_reward: i64,
+    ) {
+        std::fs::write(
+            path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "contract": {
+                    "task_fingerprint": task_fingerprint,
+                    "action_alphabet_size": action_alphabet_size,
+                    "observation_bits": observation_bits,
+                    "observation_stream_len": 1,
+                    "observation_key_mode": "full_stream",
+                    "observation_adapter_spec_ref": "standalone-planner-run",
+                    "observation_adapter_content_crc32": "standalone-planner-run",
+                    "reward_bits": 2,
+                    "min_reward": 0,
+                    "max_reward": max_reward,
+                    "return_horizon": 1,
+                    "label_phase_period": 1,
+                    "scalar_representation": "standalone-planner-run",
+                    "exact_reward_encoding_certificate": "standalone-planner-run"
+                },
+                "traces": [{
+                    "transitions": [
+                        {"action": 0, "observations": [1], "reward": 1}
+                    ]
+                }]
+            }))
+            .expect("serialize warmstart teacher"),
+        )
+        .expect("write warmstart teacher");
+    }
+
+    #[cfg(feature = "backend-ctw")]
     #[derive(Clone, Copy)]
     struct CountingEnv {
         observation: u64,
@@ -1890,6 +2078,56 @@ mod tests {
         assert!(msg.contains("legacy aixi JSON configs are no longer executable"));
         assert!(msg.contains("/tmp/legacy.json"));
         assert!(msg.contains("planner_run"));
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_accepts_matching_compiled_planner_contract() {
+        let teacher_path = unique_temp_path("warmstart-teacher-matching", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2, 3);
+
+        let teacher = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect("matching teacher contract must load");
+        assert_eq!(teacher.contract.task_fingerprint, task_fingerprint);
+        assert_eq!(teacher.traces.len(), 1);
+
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_mismatched_task_fingerprint() {
+        let teacher_path = unique_temp_path("warmstart-teacher-task-mismatch", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        write_warmstart_teacher(&teacher_path, "different-task", 2, 2, 3);
+
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("mismatched teacher task must fail");
+        assert!(err.to_string().contains("task_fingerprint"), "{err}");
+
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_interface_compatible_symbol_range_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-interface-mismatch", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 3, 2, 3);
+
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("same-range but mismatched action alphabet must fail");
+        assert!(
+            err.to_string().contains("planner interface fingerprint"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_file(teacher_path);
     }
 
     #[cfg(feature = "backend-ctw")]

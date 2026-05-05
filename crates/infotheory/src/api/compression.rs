@@ -6,7 +6,7 @@ use crate::error::{InfotheoryError, InfotheoryResult};
 use crate::spec::CompiledCompressionBackend;
 
 use crate::runtime::CompressionRuntime;
-use crate::{try_zpaq_compress_size_bytes, with_default_ctx};
+use crate::with_default_ctx;
 
 /// Compute compressed size (bytes) for a logical concatenation of `parts` using `backend`.
 pub fn try_compress_size_chain_backend(
@@ -156,10 +156,36 @@ pub fn try_ncd_matrix_bytes(
     method: &str,
     variant: NcdVariant,
 ) -> InfotheoryResult<Vec<f64>> {
+    let backend = crate::api::CompressionBackend::Zpaq {
+        method: crate::api::ZpaqMethodSpec::literal(method),
+    }
+    .compile()
+    .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;
+    try_ncd_matrix_bytes_backend(datas, &backend, variant)
+}
+
+/// Compute an `n x n` pairwise NCD matrix (row-major) using the thread-local default context.
+///
+/// `out[i * n + j]` corresponds to `NCD(datas[i], datas[j])`.
+pub fn try_ncd_matrix_bytes_default(
+    datas: &[Vec<u8>],
+    variant: NcdVariant,
+) -> InfotheoryResult<Vec<f64>> {
+    with_default_ctx(|ctx| try_ncd_matrix_bytes_backend(datas, &ctx.compression_backend, variant))
+}
+
+/// Compute an `n x n` pairwise NCD matrix (row-major) with an explicit compression backend.
+///
+/// `out[i * n + j]` corresponds to `NCD(datas[i], datas[j])`.
+pub fn try_ncd_matrix_bytes_backend(
+    datas: &[Vec<u8>],
+    backend: &CompiledCompressionBackend,
+    variant: NcdVariant,
+) -> InfotheoryResult<Vec<f64>> {
     let n = datas.len();
     let cx = datas
         .par_iter()
-        .map(|d| try_zpaq_compress_size_bytes(d, method))
+        .map(|d| try_compress_size_backend(d, backend))
         .collect::<Vec<_>>()
         .into_iter()
         .collect::<InfotheoryResult<Vec<_>>>()?;
@@ -174,20 +200,10 @@ pub fn try_ncd_matrix_bytes(
             let pair_results = pairs
                 .into_par_iter()
                 .map(|(i, j)| -> InfotheoryResult<(usize, usize, f64)> {
-                    let mut buf = Vec::new();
                     let x = &datas[i];
                     let y = &datas[j];
-
-                    buf.reserve(x.len() + y.len());
-                    buf.extend_from_slice(x);
-                    buf.extend_from_slice(y);
-                    let cxy = try_zpaq_compress_size_bytes(&buf, method)?;
-
-                    buf.clear();
-                    buf.reserve(x.len() + y.len());
-                    buf.extend_from_slice(y);
-                    buf.extend_from_slice(x);
-                    let cyx = try_zpaq_compress_size_bytes(&buf, method)?;
+                    let cxy = try_compress_size_chain_backend(&[x, y], backend)?;
+                    let cyx = try_compress_size_chain_backend(&[y, x], backend)?;
 
                     let d = ncd_from_sizes(cx[i], cx[j], cxy, Some(cyx), variant);
                     Ok((i, j, d))
@@ -203,7 +219,6 @@ pub fn try_ncd_matrix_bytes(
             let rows = (0..n)
                 .into_par_iter()
                 .map(|i| -> InfotheoryResult<Vec<(usize, usize, f64)>> {
-                    let mut buf = Vec::new();
                     let x = &datas[i];
                     let mut row = Vec::with_capacity(n);
                     for j in 0..n {
@@ -211,11 +226,7 @@ pub fn try_ncd_matrix_bytes(
                             0.0
                         } else {
                             let y = &datas[j];
-                            buf.clear();
-                            buf.reserve(x.len() + y.len());
-                            buf.extend_from_slice(x);
-                            buf.extend_from_slice(y);
-                            let cxy = try_zpaq_compress_size_bytes(&buf, method)?;
+                            let cxy = try_compress_size_chain_backend(&[x, y], backend)?;
                             ncd_from_sizes(cx[i], cx[j], cxy, None, variant)
                         };
                         row.push((i, j, d));

@@ -2,13 +2,17 @@
 
 use rayon::prelude::*;
 
-use super::compression::{NcdVariant, try_ncd_bytes, try_ncd_bytes_backend, try_ncd_matrix_bytes};
+use super::compression::{
+    NcdVariant, try_ncd_bytes, try_ncd_bytes_backend, try_ncd_matrix_bytes,
+    try_ncd_matrix_bytes_backend,
+};
 use super::metrics::{
     d_kl_bytes, js_div_bytes, nhd_bytes, try_conditional_entropy_bytes, try_cross_entropy_bytes,
     try_mutual_information_bytes, try_ned_bytes, try_nte_bytes, tvd_bytes,
 };
 use super::types::CompressionBackend;
 use crate::error::{InfotheoryError, InfotheoryResult};
+use crate::spec::CompiledCompressionBackend;
 use crate::{NUM_THREADS, try_zpaq_compress_size_bytes, try_zpaq_compress_size_parallel_bytes};
 
 #[inline(always)]
@@ -158,6 +162,21 @@ pub fn try_ncd_paths_backend(
     try_ncd_bytes_backend(&bx?, &by?, &compiled, variant)
 }
 
+#[inline(always)]
+/// Compute NCD for two files with an explicit compiled compression backend.
+pub fn try_ncd_paths_compiled_backend(
+    x: &str,
+    y: &str,
+    backend: &CompiledCompressionBackend,
+    variant: NcdVariant,
+) -> InfotheoryResult<f64> {
+    let (bx, by) = rayon::join(
+        || std::fs::read(x).map_err(InfotheoryError::from),
+        || std::fs::read(y).map_err(InfotheoryError::from),
+    );
+    try_ncd_bytes_backend(&bx?, &by?, backend, variant)
+}
+
 /// Compute an `n x n` pairwise NCD matrix (row-major) for file paths.
 pub fn try_ncd_matrix_paths(
     paths: &[&str],
@@ -166,6 +185,16 @@ pub fn try_ncd_matrix_paths(
 ) -> InfotheoryResult<Vec<f64>> {
     let datas = try_get_bytes_from_paths(paths)?;
     try_ncd_matrix_bytes(&datas, method, variant)
+}
+
+/// Compute an `n x n` pairwise NCD matrix (row-major) for file paths with an explicit compiled compression backend.
+pub fn try_ncd_matrix_paths_backend(
+    paths: &[&str],
+    backend: &CompiledCompressionBackend,
+    variant: NcdVariant,
+) -> InfotheoryResult<Vec<f64>> {
+    let datas = try_get_bytes_from_paths(paths)?;
+    try_ncd_matrix_bytes_backend(&datas, backend, variant)
 }
 
 /// Compute normalized entropy distance (NED) for two files using the default rate backend.
