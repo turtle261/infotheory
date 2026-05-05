@@ -605,7 +605,7 @@ fn parse_tune_bounds_spec(value: &serde_json::Value) -> SpecResult<TuneBoundsSpe
             value.get("forbidden_backends"),
             "bounds.forbidden_backends",
         )?,
-        parameter_ranges: parse_tune_parameter_ranges(&value["parameter_ranges"])?,
+        parameter_ranges: parse_tune_parameter_ranges(value.get("parameter_ranges"))?,
         max_experts: required_usize(&value["max_experts"], "bounds.max_experts")?,
         max_mixture_nesting_depth: required_usize(
             &value["max_mixture_nesting_depth"],
@@ -774,10 +774,13 @@ fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneContr
 
 #[cfg(feature = "tuner")]
 fn parse_tune_parameter_ranges(
-    value: &serde_json::Value,
+    value: Option<&serde_json::Value>,
 ) -> SpecResult<Vec<TuneParameterRangeSpec>> {
-    let Some(items) = value.as_array() else {
+    let Some(raw) = value else {
         return Ok(Vec::new());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(SpecError::new("bounds.parameter_ranges must be an array"));
     };
     items
         .iter()
@@ -1261,6 +1264,32 @@ mod tests {
         }))
         .expect_err("non-array forbidden_expert_pairs must fail");
         assert!(err.to_string().contains("bounds.forbidden_expert_pairs"));
+
+        let parsed_without_ranges = parse_tune_bounds_spec(&serde_json::json!({
+            "allowed_backends": ["ctw"],
+            "forbidden_backends": ["zpaq"],
+            "max_experts": 4,
+            "max_mixture_nesting_depth": 2,
+            "required_experts": ["ctw"],
+            "forbidden_expert_pairs": [["ctw", "zpaq"]],
+        }))
+        .expect("missing parameter_ranges should parse as empty optional list");
+        assert!(parsed_without_ranges.parameter_ranges.is_empty());
+
+        let err = parse_tune_bounds_spec(&serde_json::json!({
+            "allowed_backends": ["ctw"],
+            "forbidden_backends": ["zpaq"],
+            "parameter_ranges": {"bad": "shape"},
+            "max_experts": 4,
+            "max_mixture_nesting_depth": 2,
+            "required_experts": ["ctw"],
+            "forbidden_expert_pairs": [["ctw", "zpaq"]],
+        }))
+        .expect_err("non-array parameter_ranges must fail");
+        assert!(
+            err.to_string()
+                .contains("bounds.parameter_ranges must be an array")
+        );
     }
 
     #[cfg(feature = "tuner")]
@@ -1318,11 +1347,7 @@ mod tests {
 
     #[cfg(feature = "tuner")]
     #[test]
-    fn list_and_range_helpers_preserve_legacy_non_tune_defaults() {
-        let empty_ranges = parse_tune_parameter_ranges(&serde_json::json!({"not": "array"}))
-            .expect("non-array parameter_ranges should default to empty");
-        assert!(empty_ranges.is_empty());
-
+    fn list_helpers_preserve_legacy_non_tune_defaults() {
         let empty_strings =
             string_list(&serde_json::json!("ctw")).expect("non-array string list should default");
         assert!(empty_strings.is_empty());
