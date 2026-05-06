@@ -13,6 +13,7 @@ use crate::spec::{
     McAixiFacCtwTuneControllerSpec, SpecDocument, TuneBoundsSpec, TuneControllerSpec,
     TunePlannerInterfaceSpec, TuneSpec, WarmStartExactJhTuneControllerSpec,
 };
+use crate::tuner::eval::ResolvedMemoryAccountingKind;
 #[cfg(feature = "backend-ctw")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -354,6 +355,9 @@ fn write_test_exact_reward_certificate(
     controller_kind: &str,
 ) {
     let dataset = load_dataset(dataset_path).expect("load dataset for certificate");
+    let execution = TuneExecutionConfig::default();
+    let runtime_profile = resolve_evaluator_runtime_profile(&execution, false)
+        .expect("resolve evaluator runtime profile for certificate");
     let evaluator_profile = EvaluatorProfile {
         dataset_kind: dataset.kind,
         objective_target: dataset.objective_target,
@@ -368,10 +372,18 @@ fn write_test_exact_reward_certificate(
         warmup_baseline_runs: 0,
         diagnostic_chunk_bytes: None,
         eval_time_limit_seconds: 1.0,
-        evaluator_threads: 1,
+        evaluator_threads: execution.evaluator_threads(),
         worker_isolation_mode: "spawn_exec_worker",
-        evaluator_determinism: "deterministic_under_h",
-        rss_mode: PeakMemoryMode::ProcessRssPeak,
+        worker_executable_identity: runtime_profile.worker_executable_identity.clone(),
+        resolved_memory_accounting_kind: runtime_profile.memory_accounting_kind.name(),
+        resolved_memory_accounting_strict_theorem_facing: runtime_profile
+            .strict_theorem_memory_certified(),
+        resolved_evaluator_cgroup_parent: runtime_profile.resolved_cgroup_parent_string(),
+        backend_report_component_policy: runtime_profile
+            .memory_accounting_kind
+            .backend_report_component_policy(),
+        evaluator_determinism: execution.evaluator_determinism(),
+        rss_mode: execution.rss_mode,
         timing_certification_tier: TimingCertificationTier::BestEffort,
         build_profile: option_env!("PROFILE").unwrap_or("unknown"),
         feature_set: compiled_feature_set(),
@@ -407,6 +419,10 @@ fn parse_tune_cli_args_and_theorem_flags() {
         "--timing-tier".to_string(),
         "real_time".to_string(),
         "--claim-exact-finite-mdp".to_string(),
+        "--evaluator-worker-executable".to_string(),
+        "/tmp/infotheory-worker".to_string(),
+        "--evaluator-cgroup-parent".to_string(),
+        "/sys/fs/cgroup/infotheory-tuner".to_string(),
     ];
     let parsed = parse_tune_command_args(&args).expect("parse tune args");
     assert_eq!(parsed.spec_path, "spec.json");
@@ -416,6 +432,14 @@ fn parse_tune_cli_args_and_theorem_flags() {
         TimingCertificationTier::RealTime
     );
     assert!(parsed.execution.theorem.claim_exact_finite_mdp);
+    assert_eq!(
+        parsed.execution.evaluator_worker_executable.as_deref(),
+        Some("/tmp/infotheory-worker")
+    );
+    assert_eq!(
+        parsed.execution.evaluator_cgroup_parent.as_deref(),
+        Some("/sys/fs/cgroup/infotheory-tuner")
+    );
 }
 
 #[test]
@@ -445,6 +469,8 @@ fn tune_execution_config_reports_executor_profile_semantics() {
         "annealer_kernel_profile": "compiled_uniform_metropolis_hastings",
         "cpu_affinity": "0-1",
         "threads": 2,
+        "evaluator_worker_executable": "/tmp/infotheory-worker",
+        "evaluator_cgroup_parent": "/sys/fs/cgroup/infotheory-tuner",
         "warmup_baseline_runs": 1,
         "self_improvement_rounds": 3,
         "stagnation_reset_evals": 5,
@@ -498,11 +524,30 @@ fn tune_execution_config_reports_executor_profile_semantics() {
         serde_json::json!("requires_backend_determinism_when_threaded")
     );
     assert_eq!(
+        profile["evaluator_worker_executable"],
+        serde_json::json!("/tmp/infotheory-worker")
+    );
+    assert_eq!(
+        profile["evaluator_cgroup_parent"],
+        serde_json::json!("/sys/fs/cgroup/infotheory-tuner")
+    );
+    assert_eq!(
         profile["theorem"]["deterministic_evaluator_table"],
         serde_json::json!("table://deterministic")
     );
 
-    let controls = executor_controls_report(&cfg);
+    let controls = executor_controls_report(
+        &cfg,
+        &ResolvedEvaluatorRuntimeProfile {
+            worker_executable: Some(std::path::PathBuf::from("/tmp/infotheory-worker")),
+            worker_executable_identity: Some("crc32:00000000:bytes:0".to_string()),
+            resolved_evaluator_cgroup_parent: Some(std::path::PathBuf::from(
+                "/sys/fs/cgroup/infotheory-tuner",
+            )),
+            memory_accounting_kind:
+                ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss,
+        },
+    );
     assert_eq!(
         controls["cpu_affinity"]["requested"],
         serde_json::json!("0-1")
@@ -539,6 +584,26 @@ fn tune_execution_config_rejects_empty_certificate_references() {
             .expect_err("empty theorem reference must be rejected");
         assert!(err.contains("must be a non-empty string"), "{field}: {err}");
     }
+}
+
+#[test]
+fn tune_execution_config_rejects_empty_worker_executable() {
+    let value = serde_json::json!({
+        "evaluator_worker_executable": "   "
+    });
+    let err = TuneExecutionConfig::from_json_value(&value)
+        .expect_err("empty evaluator_worker_executable must be rejected");
+    assert!(err.contains("evaluator_worker_executable"), "{err}");
+}
+
+#[test]
+fn tune_execution_config_rejects_empty_cgroup_parent() {
+    let value = serde_json::json!({
+        "evaluator_cgroup_parent": "   "
+    });
+    let err = TuneExecutionConfig::from_json_value(&value)
+        .expect_err("empty evaluator_cgroup_parent must be rejected");
+    assert!(err.contains("evaluator_cgroup_parent"), "{err}");
 }
 
 #[test]
@@ -856,14 +921,42 @@ fn executor_controls_report_reflects_requested_rss_mode() {
         rss_mode: PeakMemoryMode::HybridStrictMax,
         ..TuneExecutionConfig::default()
     };
-    let report = executor_controls_report(&config);
+    let report = executor_controls_report(
+        &config,
+        &ResolvedEvaluatorRuntimeProfile {
+            worker_executable: Some(std::path::PathBuf::from("/tmp/worker")),
+            worker_executable_identity: Some("crc32:11111111:bytes:1".to_string()),
+            resolved_evaluator_cgroup_parent: Some(std::path::PathBuf::from("/sys/fs/cgroup/test")),
+            memory_accounting_kind:
+                ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss,
+        },
+    );
     assert_eq!(report["rss_mode"]["requested"], "hybrid_strict_max");
     let effective = report["rss_mode"]["effective_measurement"]
         .as_str()
         .expect("effective measurement");
-    assert!(
-        effective == "max_process_rss_peak_cgroup_peak" || effective == "process_rss_peak_fallback",
-        "{effective}"
+    assert_eq!(effective, "strict_linux_max_process_rss_cgroup_v2_peak");
+}
+
+#[test]
+fn executor_controls_report_uses_explicit_deterministic_table_provenance() {
+    let config = TuneExecutionConfig {
+        rss_mode: PeakMemoryMode::BackendReported,
+        ..TuneExecutionConfig::default()
+    };
+    let report = executor_controls_report(
+        &config,
+        &ResolvedEvaluatorRuntimeProfile {
+            worker_executable: None,
+            worker_executable_identity: None,
+            resolved_evaluator_cgroup_parent: None,
+            memory_accounting_kind: ResolvedMemoryAccountingKind::DeterministicEvaluatorTable,
+        },
+    );
+    assert_eq!(report["rss_mode"]["requested"], "backend_reported");
+    assert_eq!(
+        report["rss_mode"]["effective_measurement"],
+        "deterministic_evaluator_table_row_peak_memory"
     );
 }
 
@@ -886,6 +979,11 @@ fn evaluator_profile_cache_key_changes_with_execution_profile_only() {
         eval_time_limit_seconds: 1.0,
         evaluator_threads: 1,
         worker_isolation_mode: "spawn_exec_worker",
+        worker_executable_identity: None,
+        resolved_memory_accounting_kind: "unix_process_rss_fallback_explicit",
+        resolved_memory_accounting_strict_theorem_facing: false,
+        resolved_evaluator_cgroup_parent: None,
+        backend_report_component_policy: "none",
         evaluator_determinism: "deterministic_under_h",
         rss_mode: PeakMemoryMode::ProcessRssPeak,
         timing_certification_tier: TimingCertificationTier::BestEffort,
@@ -1615,6 +1713,7 @@ fn theorem_claims_continue_as_uncertified_when_requested_prereqs_are_missing() {
         compiled.controller(),
         &dataset,
         &search,
+        false,
     );
     for pointer in [
         "/exact_finite_mdp/status",
@@ -2394,7 +2493,8 @@ fn discounted_aiqi_exact_theorem_claims_remain_uncertified_by_family() {
         determinism_deadline: None,
         deterministic_table: None,
     };
-    let missing = exact_finite_mdp_missing_prereqs(&theorem, &verified, &controller, &search);
+    let missing =
+        exact_finite_mdp_missing_prereqs(&theorem, &verified, &controller, &search, false);
     assert!(missing.contains(&"exact_objective_difference_controller"));
 }
 
@@ -2660,6 +2760,8 @@ fn executor_controls_are_excluded_from_canonical_tune_but_included_in_evaluator_
                 AnnealerKernelProfile::CompiledUniformMetropolisHastings;
             request_b.execution.warmup_baseline_runs = 3;
             request_b.execution.diagnostic_chunk_bytes = Some(4096);
+            request_b.execution.evaluator_cgroup_parent =
+                Some("/sys/fs/cgroup/infotheory-tuner".to_string());
             request_b.execution.theorem.timing_certification_tier =
                 TimingCertificationTier::RealTime;
             request_b.execution.theorem.determinism_deadline_certificate =
@@ -2673,6 +2775,8 @@ fn executor_controls_are_excluded_from_canonical_tune_but_included_in_evaluator_
                 "annealer_kernel_profile",
                 "cpu_affinity",
                 "threads",
+                "evaluator_worker_executable",
+                "evaluator_cgroup_parent",
                 "warmup_baseline_runs",
                 "self_improvement_rounds",
                 "stagnation_reset_evals",
@@ -2731,6 +2835,11 @@ fn executor_controls_are_excluded_from_canonical_tune_but_included_in_evaluator_
                 eval_time_limit_seconds: base.eval_time_limit_seconds,
                 evaluator_threads: 1,
                 worker_isolation_mode: "spawn_exec_worker",
+                worker_executable_identity: None,
+                resolved_memory_accounting_kind: "unix_process_rss_fallback_explicit",
+                resolved_memory_accounting_strict_theorem_facing: false,
+                resolved_evaluator_cgroup_parent: None,
+                backend_report_component_policy: "none",
                 evaluator_determinism: "deterministic_under_h",
                 rss_mode: PeakMemoryMode::ProcessRssPeak,
                 timing_certification_tier: TimingCertificationTier::BestEffort,
@@ -2908,6 +3017,11 @@ fn cache_key_includes_effective_timeout() {
         eval_time_limit_seconds: full_effective_limit,
         evaluator_threads: 1,
         worker_isolation_mode: "spawn_exec_worker",
+        worker_executable_identity: None,
+        resolved_memory_accounting_kind: "unix_process_rss_fallback_explicit",
+        resolved_memory_accounting_strict_theorem_facing: false,
+        resolved_evaluator_cgroup_parent: None,
+        backend_report_component_policy: "none",
         evaluator_determinism: "deterministic_under_h",
         rss_mode: crate::tuner::PeakMemoryMode::ProcessRssPeak,
         timing_certification_tier: crate::tuner::TimingCertificationTier::BestEffort,
@@ -2942,8 +3056,7 @@ fn objective_totalizes_nondeployable_to_infinity_over_randomized_states() {
     use crate::tuner::eval::evaluate_candidate;
     use crate::tuner::tests::temp_path;
     use crate::tuner::{
-        CandidateEvalStatus, DeterministicEvaluatorRow, PeakMemoryMode,
-        VerifiedDeterministicEvaluatorTable,
+        CandidateEvalStatus, DeterministicEvaluatorRow, VerifiedDeterministicEvaluatorTable,
     };
     use std::collections::HashMap;
 
@@ -2960,6 +3073,13 @@ fn objective_totalizes_nondeployable_to_infinity_over_randomized_states() {
     let crc = crate::tuner::crc32_hex(z1.canonical_bytes().as_slice());
 
     let mut rng = crate::tuner::RandomGenerator::new();
+    let runtime_profile = crate::tuner::eval::ResolvedEvaluatorRuntimeProfile {
+        worker_executable: None,
+        worker_executable_identity: None,
+        resolved_evaluator_cgroup_parent: None,
+        memory_accounting_kind:
+            crate::tuner::eval::ResolvedMemoryAccountingKind::DeterministicEvaluatorTable,
+    };
 
     // Generative test over 100 random states
     for _ in 0..100 {
@@ -3006,8 +3126,8 @@ fn objective_totalizes_nondeployable_to_infinity_over_randomized_states() {
             min_tp,
             max_mem,
             10.0,
-            PeakMemoryMode::ProcessRssPeak,
             1,
+            &runtime_profile,
             Some(&table),
         )
         .unwrap();
@@ -3073,6 +3193,11 @@ fn cache_key_is_exact_tuple_of_candidate_profile_and_dataset_identity() {
         eval_time_limit_seconds: 1.0,
         evaluator_threads: 1,
         worker_isolation_mode: "spawn_exec_worker",
+        worker_executable_identity: None,
+        resolved_memory_accounting_kind: "unix_process_rss_fallback_explicit",
+        resolved_memory_accounting_strict_theorem_facing: false,
+        resolved_evaluator_cgroup_parent: None,
+        backend_report_component_policy: "none",
         evaluator_determinism: "deterministic_under_h",
         rss_mode: PeakMemoryMode::ProcessRssPeak,
         timing_certification_tier: TimingCertificationTier::BestEffort,

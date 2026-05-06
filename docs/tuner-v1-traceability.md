@@ -152,12 +152,29 @@ This checklist maps the normative Tuner V1 implementation obligations in
 ## Executor Controls
 
 - `rss_mode` is routed through explicit peak-memory measurement modes:
-  process RSS peak, cgroup-reported peak where available, or a strict maximum
-  of both. Implemented by `peak_memory_bytes`,
-  `cgroup_v2_peak_memory_bytes`, and `cgroup_v1_peak_memory_bytes`. Reports
-  expose the requested mode, effective measurement, and whether cgroup peak
-  memory was available. Deterministic-table peak memory nondeployability is
-  covered by `deterministic_table_peak_memory_can_make_baseline_nondeployable`.
+  explicit Unix process-RSS fallback (`process_rss_peak`), strict Linux
+  cgroup-v2 plus RSS max (`hybrid_strict_max`), and backend-reported
+  diagnostic-only mode (`backend_reported`) with RSS deployability accounting.
+  Strict live mode hard-fails before baseline evaluation unless a delegated
+  cgroup-v2 parent is configured (`evaluator_cgroup_parent`,
+  `--evaluator-cgroup-parent`, or `INFOTHEORY_TUNER_EVAL_CGROUP_PARENT`).
+  Implemented by `resolve_evaluator_runtime_profile`,
+  `ResolvedEvaluatorRuntimeProfile`, `ResolvedMemoryAccountingKind`,
+  `EvaluatorWorkerCgroup`, and `resolve_required_tuner_eval_cgroup_parent`.
+  Reports and theorem-claim gating are derived from the resolved runtime
+  profile rather than ad hoc option checks; fallback RSS modes explicitly mark
+  strict theorem-facing memory accounting uncertified. Cache identity includes
+  worker executable identity plus resolved memory-accounting controls.
+  Root-only setup remains limited to
+  `scripts/delegate_tuner_cgroup_v2.sh setup`, which creates a delegated
+  `session` and `evals` subtree layout; strict tuner runs pass
+  `.../evals` to `--evaluator-cgroup-parent`. On hosts where delegation
+  containment rules prevent unprivileged first-process placement, root-only
+  process placement is performed by
+  `scripts/delegate_tuner_cgroup_v2.sh run-in-session`, while spec parsing,
+  compression, and scoring still run as the tuner user. Deterministic-table peak memory
+  nondeployability is covered by
+  `deterministic_table_peak_memory_can_make_baseline_nondeployable`.
 - `diagnostic_chunk_bytes` is implemented as an executor-side diagnostic
   partition over charged target bytes. It is recorded in executor/evaluator
   profile and provenance, does not affect canonical candidate identity or the

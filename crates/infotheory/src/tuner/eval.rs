@@ -1,5 +1,168 @@
 use super::*;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ResolvedMemoryAccountingKind {
+    DeterministicEvaluatorTable,
+    StrictLinuxCgroupV2PeakMaxProcessRss,
+    UnixProcessRssFallbackExplicit,
+    UnixProcessRssWithBackendReportedDiagnosticOnly,
+}
+
+impl ResolvedMemoryAccountingKind {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::DeterministicEvaluatorTable => "deterministic_evaluator_table_row_peak_memory",
+            Self::StrictLinuxCgroupV2PeakMaxProcessRss => {
+                "strict_linux_max_process_rss_cgroup_v2_peak"
+            }
+            Self::UnixProcessRssFallbackExplicit => "unix_process_rss_fallback_explicit",
+            Self::UnixProcessRssWithBackendReportedDiagnosticOnly => {
+                "unix_process_rss_backend_reported_diagnostic_only"
+            }
+        }
+    }
+
+    pub(super) fn strict_theorem_memory_certified(self) -> bool {
+        matches!(
+            self,
+            Self::DeterministicEvaluatorTable | Self::StrictLinuxCgroupV2PeakMaxProcessRss
+        )
+    }
+
+    fn worker_rss_mode(self) -> PeakMemoryMode {
+        match self {
+            Self::DeterministicEvaluatorTable => PeakMemoryMode::ProcessRssPeak,
+            Self::StrictLinuxCgroupV2PeakMaxProcessRss => PeakMemoryMode::HybridStrictMax,
+            Self::UnixProcessRssFallbackExplicit => PeakMemoryMode::ProcessRssPeak,
+            Self::UnixProcessRssWithBackendReportedDiagnosticOnly => PeakMemoryMode::ProcessRssPeak,
+        }
+    }
+
+    fn requires_per_eval_cgroup(self) -> bool {
+        matches!(self, Self::StrictLinuxCgroupV2PeakMaxProcessRss)
+    }
+
+    pub(super) fn backend_report_component_policy(self) -> &'static str {
+        match self {
+            Self::DeterministicEvaluatorTable => "none_deterministic_table_row",
+            Self::StrictLinuxCgroupV2PeakMaxProcessRss => {
+                "diagnostic_only_combined_with_os_controller_peak"
+            }
+            Self::UnixProcessRssFallbackExplicit => "none",
+            Self::UnixProcessRssWithBackendReportedDiagnosticOnly => {
+                "diagnostic_only_no_strict_os_controller_peak"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedEvaluatorRuntimeProfile {
+    pub(super) worker_executable: Option<PathBuf>,
+    pub(super) worker_executable_identity: Option<String>,
+    pub(super) resolved_evaluator_cgroup_parent: Option<PathBuf>,
+    pub(super) memory_accounting_kind: ResolvedMemoryAccountingKind,
+}
+
+impl ResolvedEvaluatorRuntimeProfile {
+    pub(super) fn strict_theorem_memory_certified(&self) -> bool {
+        self.memory_accounting_kind
+            .strict_theorem_memory_certified()
+    }
+
+    pub(super) fn resolved_cgroup_parent_string(&self) -> Option<String> {
+        self.resolved_evaluator_cgroup_parent
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+    }
+
+    pub(super) fn to_provenance_value(&self) -> Value {
+        serde_json::json!({
+            "worker_executable_identity": self.worker_executable_identity.as_deref(),
+            "memory_accounting_kind": self.memory_accounting_kind.name(),
+            "strict_theorem_memory_certified": self.strict_theorem_memory_certified(),
+            "resolved_evaluator_cgroup_parent": self.resolved_cgroup_parent_string(),
+            "backend_report_component_policy": self.memory_accounting_kind.backend_report_component_policy(),
+        })
+    }
+}
+
+pub(super) fn resolve_evaluator_runtime_profile(
+    execution: &TuneExecutionConfig,
+    deterministic_table_requested: bool,
+) -> Result<ResolvedEvaluatorRuntimeProfile, String> {
+    if deterministic_table_requested {
+        return Ok(ResolvedEvaluatorRuntimeProfile {
+            worker_executable: None,
+            worker_executable_identity: None,
+            resolved_evaluator_cgroup_parent: None,
+            memory_accounting_kind: ResolvedMemoryAccountingKind::DeterministicEvaluatorTable,
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = execution;
+        return Err(
+            "tuner requires a Unix target for process-isolated candidate evaluation".to_string(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        let worker_executable =
+            resolve_tuner_eval_worker_executable(execution.evaluator_worker_executable.as_deref())?;
+        let worker_identity = worker_executable_identity(&worker_executable)?;
+        let memory_accounting_kind = resolve_memory_accounting_kind(execution.rss_mode)?;
+        let resolved_evaluator_cgroup_parent = if memory_accounting_kind.requires_per_eval_cgroup()
+        {
+            Some(resolve_required_tuner_eval_cgroup_parent(
+                execution.evaluator_cgroup_parent.as_deref(),
+            )?)
+        } else {
+            reject_unix_fallback_cgroup_overrides(execution.evaluator_cgroup_parent.as_deref())?;
+            None
+        };
+        Ok(ResolvedEvaluatorRuntimeProfile {
+            worker_executable: Some(worker_executable),
+            worker_executable_identity: Some(worker_identity),
+            resolved_evaluator_cgroup_parent,
+            memory_accounting_kind,
+        })
+    }
+}
+
+fn resolve_memory_accounting_kind(
+    rss_mode: PeakMemoryMode,
+) -> Result<ResolvedMemoryAccountingKind, String> {
+    match rss_mode {
+        PeakMemoryMode::ProcessRssPeak => {
+            Ok(ResolvedMemoryAccountingKind::UnixProcessRssFallbackExplicit)
+        }
+        PeakMemoryMode::BackendReported => {
+            Ok(ResolvedMemoryAccountingKind::UnixProcessRssWithBackendReportedDiagnosticOnly)
+        }
+        PeakMemoryMode::HybridStrictMax => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(
+                    "strict memory-accounting mode (rss_mode=hybrid_strict_max) is Linux-only and requires delegated cgroup-v2 peak accounting"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_candidate(
@@ -9,12 +172,13 @@ pub(super) fn evaluate_candidate(
     min_throughput_bytes_per_second: f64,
     max_memory_bytes: u64,
     effective_eval_time_limit_seconds: f64,
-    rss_mode: PeakMemoryMode,
     evaluator_threads: usize,
+    runtime_profile: &ResolvedEvaluatorRuntimeProfile,
     deterministic_table: Option<&VerifiedDeterministicEvaluatorTable>,
 ) -> Result<CandidateEvalResult, String> {
     if let Some(table) = deterministic_table {
         let _ = evaluator_threads;
+        let _ = runtime_profile;
         return table.evaluate(
             candidate,
             dataset,
@@ -32,8 +196,8 @@ pub(super) fn evaluate_candidate(
         let _ = min_throughput_bytes_per_second;
         let _ = max_memory_bytes;
         let _ = effective_eval_time_limit_seconds;
-        let _ = rss_mode;
         let _ = evaluator_threads;
+        let _ = runtime_profile;
         let _ = deterministic_table;
         return Err(
             "tuner requires a Unix target for process-isolated candidate evaluation".to_string(),
@@ -49,8 +213,8 @@ pub(super) fn evaluate_candidate(
             min_throughput_bytes_per_second,
             max_memory_bytes,
             effective_eval_time_limit_seconds,
-            rss_mode,
             evaluator_threads,
+            runtime_profile,
         )
     }
 }
@@ -64,13 +228,22 @@ fn evaluate_candidate_unix_isolated(
     min_throughput_bytes_per_second: f64,
     max_memory_bytes: u64,
     effective_eval_time_limit_seconds: f64,
-    rss_mode: PeakMemoryMode,
     evaluator_threads: usize,
+    runtime_profile: &ResolvedEvaluatorRuntimeProfile,
 ) -> Result<CandidateEvalResult, String> {
+    let worker_rss_mode = runtime_profile.memory_accounting_kind.worker_rss_mode();
     if effective_eval_time_limit_seconds <= 0.0 {
+        let peak_memory_bytes = match runtime_profile.memory_accounting_kind {
+            ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss => 0,
+            ResolvedMemoryAccountingKind::DeterministicEvaluatorTable
+            | ResolvedMemoryAccountingKind::UnixProcessRssFallbackExplicit
+            | ResolvedMemoryAccountingKind::UnixProcessRssWithBackendReportedDiagnosticOnly => {
+                peak_memory_bytes(PeakMemoryMode::ProcessRssPeak)
+            }
+        };
         return Ok(timeout_eval_result(
             0.0,
-            peak_memory_bytes(rss_mode),
+            peak_memory_bytes,
             effective_eval_time_limit_seconds,
         ));
     }
@@ -85,7 +258,7 @@ fn evaluate_candidate_unix_isolated(
         "min_throughput_bytes_per_second": min_throughput_bytes_per_second,
         "max_memory_bytes": max_memory_bytes,
         "effective_eval_time_limit_seconds": effective_eval_time_limit_seconds,
-        "rss_mode": peak_memory_mode_name(rss_mode),
+        "rss_mode": peak_memory_mode_name(worker_rss_mode),
         "evaluator_threads": evaluator_threads,
     });
     fs::write(
@@ -100,7 +273,23 @@ fn evaluate_candidate_unix_isolated(
         )
     })?;
 
-    let mut command = evaluator_worker_command()?;
+    #[cfg(target_os = "linux")]
+    let evaluation_cgroup = runtime_profile
+        .resolved_evaluator_cgroup_parent
+        .as_deref()
+        .map(|parent| EvaluatorWorkerCgroup::create(parent, dataset.resolved_path.as_str()))
+        .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    let evaluation_cgroup: Option<EvaluatorWorkerCgroup> = {
+        let _ = runtime_profile;
+        None
+    };
+
+    let mut command = evaluator_worker_command(runtime_profile.worker_executable.as_deref())?;
+    #[cfg(target_os = "linux")]
+    if let Some(cgroup) = evaluation_cgroup.as_ref() {
+        cgroup.configure_worker_command(&mut command)?;
+    }
     command
         .env(
             "INFOTHEORY_TUNER_EVAL_REQUEST_PATH",
@@ -130,20 +319,25 @@ fn evaluate_candidate_unix_isolated(
                     .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_string())
                     .filter(|text| !text.is_empty())
                     .unwrap_or_else(|| status.to_string());
-                let _ = temp_paths.cleanup();
                 return Err(format!("evaluator worker exited unsuccessfully: {stderr}"));
             }
             break;
         }
         if started.elapsed() >= timeout {
-            let peak_before_kill =
-                peak_memory_bytes_for_pid(child.id() as libc::pid_t, rss_mode).unwrap_or(0);
+            let peak_before_kill = peak_memory_bytes_for_live_worker(
+                child.id() as libc::pid_t,
+                runtime_profile.memory_accounting_kind,
+                evaluation_cgroup.as_ref(),
+            );
+            #[cfg(target_os = "linux")]
+            if let Some(cgroup) = evaluation_cgroup.as_ref() {
+                let _ = cgroup.kill_all();
+            }
             let _ = child.kill();
             let _ = child.wait();
-            let _ = temp_paths.cleanup();
             return Ok(timeout_eval_result(
                 effective_eval_time_limit_seconds,
-                peak_before_kill,
+                peak_before_kill?,
                 effective_eval_time_limit_seconds,
             ));
         }
@@ -156,13 +350,21 @@ fn evaluate_candidate_unix_isolated(
             temp_paths.response_path.display()
         )
     })?;
-    let _ = temp_paths.cleanup();
     if payload_bytes.is_empty() {
         return Err("candidate evaluation worker returned no payload".to_string());
     }
     let payload: Value = serde_json::from_slice(&payload_bytes)
         .map_err(|err| format!("invalid evaluator payload from child process: {err}"))?;
-    parse_candidate_eval_payload(&payload)
+    let mut result = parse_candidate_eval_payload(&payload)?;
+    apply_authoritative_worker_peak_memory(
+        &mut result,
+        model_bytes,
+        min_throughput_bytes_per_second,
+        max_memory_bytes,
+        runtime_profile.memory_accounting_kind,
+        evaluation_cgroup.as_ref(),
+    )?;
+    Ok(result)
 }
 
 #[cfg(unix)]
@@ -270,6 +472,9 @@ fn parse_candidate_eval_payload(payload: &Value) -> Result<CandidateEvalResult, 
 /// written. This entrypoint is public so the CLI binary and libtest worker shim
 /// can share the same evaluator contract; it is not a canonical tune-spec API.
 pub fn run_tuner_eval_worker_from_env() -> Result<(), String> {
+    if std::env::var_os("INFOTHEORY_TUNER_EVAL_WORKER_PING").as_deref() == Some(OsStr::new("1")) {
+        return Ok(());
+    }
     let request_path = std::env::var_os("INFOTHEORY_TUNER_EVAL_REQUEST_PATH")
         .ok_or_else(|| "missing INFOTHEORY_TUNER_EVAL_REQUEST_PATH".to_string())?;
     let response_path = std::env::var_os("INFOTHEORY_TUNER_EVAL_RESPONSE_PATH")
@@ -462,24 +667,94 @@ impl EvaluatorWorkerTempPaths {
 }
 
 #[cfg(unix)]
-fn evaluator_worker_command() -> Result<std::process::Command, String> {
-    let executable = evaluator_worker_executable()?;
-    let mut command = std::process::Command::new(&executable);
-    if evaluator_worker_executable_is_libtest(&executable) {
-        command
-            .arg("__infotheory_tuner_eval_worker")
-            .arg("--ignored")
-            .arg("--nocapture");
-    } else {
-        command.arg("__infotheory-tuner-eval-worker");
+impl Drop for EvaluatorWorkerTempPaths {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_required_tuner_eval_cgroup_parent(explicit: Option<&str>) -> Result<PathBuf, String> {
+    let explicit_path = explicit.map(PathBuf::from);
+    let env_path = std::env::var_os("INFOTHEORY_TUNER_EVAL_CGROUP_PARENT").map(PathBuf::from);
+    let path = if let Some(path) = explicit_path {
+        path
+    } else if let Some(path) = env_path {
+        path
+    } else {
+        return Err(
+            "strict memory-accounting mode (rss_mode=hybrid_strict_max) requires a delegated cgroup-v2 parent via execution.evaluator_cgroup_parent, --evaluator-cgroup-parent, or INFOTHEORY_TUNER_EVAL_CGROUP_PARENT"
+                .to_string(),
+        );
+    };
+    let canonical = validate_evaluator_cgroup_parent(&path)?;
+    probe_evaluator_cgroup_parent(&canonical)?;
+    Ok(canonical)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_required_tuner_eval_cgroup_parent(explicit: Option<&str>) -> Result<PathBuf, String> {
+    let _ = explicit;
+    Err(
+        "strict memory-accounting mode (rss_mode=hybrid_strict_max) requires Linux cgroup-v2 per-evaluation accounting"
+            .to_string(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reject_unix_fallback_cgroup_overrides(explicit: Option<&str>) -> Result<(), String> {
+    if explicit.is_some() || std::env::var_os("INFOTHEORY_TUNER_EVAL_CGROUP_PARENT").is_some() {
+        return Err("evaluator_cgroup_parent requires Linux cgroup v2".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_unix_fallback_cgroup_overrides(explicit: Option<&str>) -> Result<(), String> {
+    if explicit.is_some() || std::env::var_os("INFOTHEORY_TUNER_EVAL_CGROUP_PARENT").is_some() {
+        return Err(
+            "evaluator_cgroup_parent is only valid for strict Linux cgroup-v2 memory accounting mode (rss_mode=hybrid_strict_max)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn resolve_tuner_eval_worker_executable(
+    explicit: Option<&str>,
+) -> Result<PathBuf, String> {
+    let explicit_path = explicit.map(PathBuf::from);
+    let executable = evaluator_worker_executable(explicit_path.as_deref())?;
+    probe_evaluator_worker_executable(&executable)?;
+    Ok(executable)
+}
+
+#[cfg(not(unix))]
+pub(super) fn resolve_tuner_eval_worker_executable(
+    explicit: Option<&str>,
+) -> Result<PathBuf, String> {
+    let _ = explicit;
+    Err("tuner requires a Unix target for process-isolated candidate evaluation".to_string())
+}
+
+#[cfg(unix)]
+fn evaluator_worker_command(
+    explicit_worker_executable: Option<&Path>,
+) -> Result<std::process::Command, String> {
+    let executable = evaluator_worker_executable(explicit_worker_executable)?;
+    let mut command = std::process::Command::new(&executable);
+    append_evaluator_worker_entrypoint(&mut command, &executable);
     Ok(command)
 }
 
 #[cfg(unix)]
-fn evaluator_worker_executable() -> Result<PathBuf, String> {
+fn evaluator_worker_executable(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
+        return ensure_file_path(path.to_path_buf(), "execution.evaluator_worker_executable");
+    }
     if let Some(path) = std::env::var_os("INFOTHEORY_TUNER_EVAL_WORKER_EXE") {
-        return Ok(PathBuf::from(path));
+        return ensure_file_path(PathBuf::from(path), "INFOTHEORY_TUNER_EVAL_WORKER_EXE");
     }
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_infotheory") {
         let executable = PathBuf::from(path);
@@ -487,8 +762,76 @@ fn evaluator_worker_executable() -> Result<PathBuf, String> {
             return Ok(executable);
         }
     }
-    std::env::current_exe()
-        .map_err(|err| format!("failed to resolve evaluator worker executable: {err}"))
+    let current = std::env::current_exe().map_err(|err| {
+        format!("failed to resolve evaluator worker executable from current_exe: {err}")
+    })?;
+    ensure_file_path(current, "current_exe")
+}
+
+#[cfg(unix)]
+fn ensure_file_path(path: PathBuf, label: &str) -> Result<PathBuf, String> {
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!(
+            "{label} '{}' does not resolve to a file",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn worker_executable_identity(executable: &Path) -> Result<String, String> {
+    let raw = fs::read(executable).map_err(|err| {
+        format!(
+            "failed to read evaluator worker executable '{}' for cache identity: {err}",
+            executable.display()
+        )
+    })?;
+    Ok(format!("crc32:{}:bytes:{}", crc32_hex(&raw), raw.len()))
+}
+
+#[cfg(unix)]
+fn append_evaluator_worker_entrypoint(command: &mut std::process::Command, executable: &Path) {
+    if evaluator_worker_executable_is_libtest(executable) {
+        command
+            .arg("__infotheory_tuner_eval_worker")
+            .arg("--ignored")
+            .arg("--nocapture");
+    } else {
+        command.arg("__infotheory-tuner-eval-worker");
+    }
+}
+
+#[cfg(unix)]
+fn probe_evaluator_worker_executable(executable: &Path) -> Result<(), String> {
+    let mut command = std::process::Command::new(executable);
+    append_evaluator_worker_entrypoint(&mut command, executable);
+    let output = command
+        .env("INFOTHEORY_TUNER_EVAL_WORKER_PING", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to probe evaluator worker executable '{}': {err}",
+                executable.display()
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        output.status.to_string()
+    } else {
+        stderr
+    };
+    Err(format!(
+        "evaluator worker executable '{}' is not compatible with tuner worker entrypoint: {detail}",
+        executable.display()
+    ))
 }
 
 #[cfg(unix)]
@@ -497,6 +840,272 @@ fn evaluator_worker_executable_is_libtest(path: &Path) -> bool {
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         == Some("deps")
+}
+
+#[cfg(target_os = "linux")]
+static EVALUATOR_CGROUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+struct EvaluatorWorkerCgroup {
+    path: PathBuf,
+}
+
+#[cfg(not(target_os = "linux"))]
+struct EvaluatorWorkerCgroup;
+
+#[cfg(target_os = "linux")]
+impl EvaluatorWorkerCgroup {
+    fn create(parent: &Path, label: &str) -> Result<Self, String> {
+        let sequence = EVALUATOR_CGROUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_else(|_| Instant::now().elapsed().as_nanos());
+        let digest = crc32_hex(label.as_bytes());
+        let path = parent.join(format!(
+            "infotheory-eval-{}-{sequence}-{nonce}-{digest}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).map_err(|err| {
+            format!(
+                "failed to create per-evaluation cgroup '{}': {err}",
+                path.display()
+            )
+        })?;
+        let cgroup = Self { path };
+        cgroup.peak_memory_bytes().map_err(|err| {
+            format!(
+                "created cgroup '{}' but could not read cgroup-v2 memory.peak: {err}",
+                cgroup.path.display()
+            )
+        })?;
+        Ok(cgroup)
+    }
+
+    fn configure_worker_command(&self, command: &mut std::process::Command) -> Result<(), String> {
+        let cgroup_procs_path = self.path.join("cgroup.procs");
+        let cgroup_procs = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&cgroup_procs_path)
+            .map_err(|err| {
+                format!(
+                    "failed to open per-evaluation cgroup procs file '{}': {err}",
+                    cgroup_procs_path.display()
+                )
+            })?;
+        // SAFETY: `pre_exec` runs in the forked child immediately before exec.
+        // The closure captures an already-open `cgroup.procs` file descriptor and
+        // performs only async-signal-safe operations: `getpid`, in-bounds pointer
+        // arithmetic over a stack buffer, and `write`. This moves the child into
+        // the dedicated cgroup before the evaluator worker binary is exec'd, so
+        // spec parsing, runtime construction, and compression are all accounted in
+        // the candidate-local memory peak without running them as root.
+        unsafe {
+            command.pre_exec(move || {
+                let pid = libc::getpid();
+                let mut buffer = [0u8; 32];
+                let (start, len) = decimal_pid_line(pid as u64, &mut buffer);
+                let written = libc::write(
+                    cgroup_procs.as_raw_fd(),
+                    buffer.as_ptr().add(start).cast::<libc::c_void>(),
+                    len,
+                );
+                if written == len as isize {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn peak_memory_bytes(&self) -> Result<u64, String> {
+        read_u64_from_file(&self.path.join("memory.peak"))
+    }
+
+    fn kill_all(&self) -> Result<(), String> {
+        let kill_path = self.path.join("cgroup.kill");
+        if !kill_path.exists() {
+            return Ok(());
+        }
+        fs::write(&kill_path, b"1\n").map_err(|err| {
+            format!(
+                "failed to kill evaluator worker cgroup '{}': {err}",
+                kill_path.display()
+            )
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for EvaluatorWorkerCgroup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn decimal_pid_line(mut value: u64, buffer: &mut [u8; 32]) -> (usize, usize) {
+    let mut start = buffer.len() - 1;
+    buffer[start] = b'\n';
+    if value == 0 {
+        start -= 1;
+        buffer[start] = b'0';
+    } else {
+        while value > 0 {
+            start -= 1;
+            buffer[start] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    (start, buffer.len() - start)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_evaluator_cgroup_parent(path: &Path) -> Result<PathBuf, String> {
+    let cgroup_root = Path::new("/sys/fs/cgroup")
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve /sys/fs/cgroup: {err}"))?;
+    let canonical = path.canonicalize().map_err(|err| {
+        format!(
+            "failed to resolve evaluator cgroup parent '{}': {err}",
+            path.display()
+        )
+    })?;
+    if !canonical.starts_with(&cgroup_root) {
+        return Err(format!(
+            "evaluator_cgroup_parent '{}' must be under '{}'",
+            canonical.display(),
+            cgroup_root.display()
+        ));
+    }
+    if !canonical.is_dir() {
+        return Err(format!(
+            "evaluator_cgroup_parent '{}' is not a directory",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_evaluator_cgroup_parent(parent: &Path) -> Result<(), String> {
+    let probe = EvaluatorWorkerCgroup::create(parent, "probe")?;
+    probe.peak_memory_bytes()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn peak_memory_bytes_for_live_worker(
+    pid: libc::pid_t,
+    accounting: ResolvedMemoryAccountingKind,
+    cgroup: Option<&EvaluatorWorkerCgroup>,
+) -> Result<u64, String> {
+    let process = peak_rss_bytes_for_pid(pid).unwrap_or(0);
+    let cgroup_peak = cgroup
+        .map(EvaluatorWorkerCgroup::peak_memory_bytes)
+        .transpose()?;
+    Ok(match accounting {
+        ResolvedMemoryAccountingKind::DeterministicEvaluatorTable => process,
+        ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss => cgroup_peak
+            .ok_or_else(|| {
+                "strict cgroup-v2 accounting expected per-evaluation cgroup peak".to_string()
+            })?
+            .max(process),
+        ResolvedMemoryAccountingKind::UnixProcessRssFallbackExplicit
+        | ResolvedMemoryAccountingKind::UnixProcessRssWithBackendReportedDiagnosticOnly => process,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peak_memory_bytes_for_live_worker(
+    pid: libc::pid_t,
+    accounting: ResolvedMemoryAccountingKind,
+    _cgroup: Option<&EvaluatorWorkerCgroup>,
+) -> Result<u64, String> {
+    let mode = match accounting {
+        ResolvedMemoryAccountingKind::UnixProcessRssFallbackExplicit
+        | ResolvedMemoryAccountingKind::UnixProcessRssWithBackendReportedDiagnosticOnly
+        | ResolvedMemoryAccountingKind::DeterministicEvaluatorTable => {
+            PeakMemoryMode::ProcessRssPeak
+        }
+        ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss => {
+            return Err(
+                "strict Linux cgroup-v2 memory accounting is unavailable on this platform"
+                    .to_string(),
+            );
+        }
+    };
+    Ok(peak_memory_bytes_for_pid(pid, mode).unwrap_or(0))
+}
+
+fn apply_authoritative_worker_peak_memory(
+    result: &mut CandidateEvalResult,
+    model_bytes: usize,
+    min_throughput_bytes_per_second: f64,
+    max_memory_bytes: u64,
+    accounting: ResolvedMemoryAccountingKind,
+    cgroup: Option<&EvaluatorWorkerCgroup>,
+) -> Result<(), String> {
+    apply_authoritative_worker_peak_memory_inner(
+        result,
+        model_bytes,
+        min_throughput_bytes_per_second,
+        max_memory_bytes,
+        accounting,
+        cgroup,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn apply_authoritative_worker_peak_memory_inner(
+    result: &mut CandidateEvalResult,
+    model_bytes: usize,
+    min_throughput_bytes_per_second: f64,
+    max_memory_bytes: u64,
+    accounting: ResolvedMemoryAccountingKind,
+    cgroup: Option<&EvaluatorWorkerCgroup>,
+) -> Result<(), String> {
+    match accounting {
+        ResolvedMemoryAccountingKind::DeterministicEvaluatorTable
+        | ResolvedMemoryAccountingKind::UnixProcessRssFallbackExplicit
+        | ResolvedMemoryAccountingKind::UnixProcessRssWithBackendReportedDiagnosticOnly => {}
+        ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss => {
+            let cgroup_peak = cgroup
+                .ok_or_else(|| {
+                    "strict cgroup-v2 accounting expected per-evaluation cgroup handle".to_string()
+                })?
+                .peak_memory_bytes()?;
+            result.peak_memory_bytes = result.peak_memory_bytes.max(cgroup_peak);
+        }
+    };
+    if result.status == CandidateEvalStatus::Success {
+        result.deployable = result.throughput_bytes_per_second >= min_throughput_bytes_per_second
+            && result.peak_memory_bytes <= max_memory_bytes;
+        result.objective_bits = if result.deployable {
+            ((model_bytes as f64) * 8.0) + result.target_loss_bits
+        } else {
+            f64::INFINITY
+        };
+    } else {
+        result.deployable = false;
+        result.objective_bits = f64::INFINITY;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_authoritative_worker_peak_memory_inner(
+    result: &mut CandidateEvalResult,
+    _model_bytes: usize,
+    _min_throughput_bytes_per_second: f64,
+    _max_memory_bytes: u64,
+    _accounting: ResolvedMemoryAccountingKind,
+    _cgroup: Option<&EvaluatorWorkerCgroup>,
+) -> Result<(), String> {
+    let _ = result;
+    Ok(())
 }
 
 fn evaluate_candidate_unbounded(

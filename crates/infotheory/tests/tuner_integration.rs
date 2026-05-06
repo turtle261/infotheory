@@ -460,7 +460,72 @@ fn dataset_crc32(path: &Path) -> String {
     crc32_hex(&fs::read(path).expect("read dataset for crc32"))
 }
 
-fn evaluator_profile_crc32(dataset_path: &Path, timing: TimingCertificationTier) -> String {
+fn evaluator_profile_crc32_with_runtime_profile_and_worker(
+    dataset_path: &Path,
+    timing: TimingCertificationTier,
+    deterministic_table_requested: bool,
+    worker_executable_override: Option<&Path>,
+) -> String {
+    let (
+        worker_executable_identity,
+        resolved_memory_accounting_kind,
+        resolved_memory_accounting_strict_theorem_facing,
+        resolved_evaluator_cgroup_parent,
+        backend_report_component_policy,
+    ) = if deterministic_table_requested {
+        (
+            None::<String>,
+            "deterministic_evaluator_table_row_peak_memory",
+            true,
+            None::<String>,
+            "none_deterministic_table_row",
+        )
+    } else {
+        let worker_executable = if let Some(path) = worker_executable_override {
+            if !path.is_file() {
+                panic!(
+                    "evaluator_worker_executable '{}' does not resolve to a file",
+                    path.display()
+                );
+            }
+            path.to_path_buf()
+        } else if let Some(path) = std::env::var_os("INFOTHEORY_TUNER_EVAL_WORKER_EXE") {
+            let path = PathBuf::from(path);
+            if !path.is_file() {
+                panic!(
+                    "INFOTHEORY_TUNER_EVAL_WORKER_EXE '{}' does not resolve to a file",
+                    path.display()
+                );
+            }
+            path
+        } else if let Some(path) = std::env::var_os("CARGO_BIN_EXE_infotheory") {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                path
+            } else {
+                std::env::current_exe().expect("resolve current executable for evaluator worker")
+            }
+        } else {
+            std::env::current_exe().expect("resolve current executable for evaluator worker")
+        };
+        let worker_bytes = fs::read(&worker_executable).unwrap_or_else(|err| {
+            panic!(
+                "failed to read evaluator worker executable '{}' for profile hash: {err}",
+                worker_executable.display()
+            )
+        });
+        (
+            Some(format!(
+                "crc32:{}:bytes:{}",
+                crc32_hex(&worker_bytes),
+                worker_bytes.len()
+            )),
+            "unix_process_rss_fallback_explicit",
+            false,
+            None,
+            "none",
+        )
+    };
     let value = json!({
         "dataset_kind": "passive_bytes",
         "objective_target": "passive_ac",
@@ -477,6 +542,11 @@ fn evaluator_profile_crc32(dataset_path: &Path, timing: TimingCertificationTier)
         "effective_eval_time_limit_seconds_bits": 1.0f64.to_bits(),
         "evaluator_threads": 1,
         "worker_isolation_mode": "spawn_exec_worker",
+        "worker_executable_identity": worker_executable_identity,
+        "resolved_memory_accounting_kind": resolved_memory_accounting_kind,
+        "resolved_memory_accounting_strict_theorem_facing": resolved_memory_accounting_strict_theorem_facing,
+        "resolved_evaluator_cgroup_parent": resolved_evaluator_cgroup_parent,
+        "backend_report_component_policy": backend_report_component_policy,
         "evaluator_determinism": "deterministic_under_h",
         "rss_mode": "process_rss_peak",
         "timing_certification_tier": timing_label(timing),
@@ -507,12 +577,45 @@ fn common_certificate(
     timing: TimingCertificationTier,
     controller_kind: &str,
 ) -> Value {
+    common_certificate_with_runtime_profile(kind, dataset_path, timing, controller_kind, false)
+}
+
+fn common_certificate_with_runtime_profile(
+    kind: &str,
+    dataset_path: &Path,
+    timing: TimingCertificationTier,
+    controller_kind: &str,
+    deterministic_table_requested: bool,
+) -> Value {
+    common_certificate_with_runtime_profile_and_worker(
+        kind,
+        dataset_path,
+        timing,
+        controller_kind,
+        deterministic_table_requested,
+        None,
+    )
+}
+
+fn common_certificate_with_runtime_profile_and_worker(
+    kind: &str,
+    dataset_path: &Path,
+    timing: TimingCertificationTier,
+    controller_kind: &str,
+    deterministic_table_requested: bool,
+    worker_executable_override: Option<&Path>,
+) -> Value {
     json!({
         "schema_version": 1,
         "kind": kind,
         "dataset_crc32": dataset_crc32(dataset_path),
         "bounds_crc32": bounds_crc32(),
-        "evaluator_profile_crc32": evaluator_profile_crc32(dataset_path, timing),
+        "evaluator_profile_crc32": evaluator_profile_crc32_with_runtime_profile_and_worker(
+            dataset_path,
+            timing,
+            deterministic_table_requested,
+            worker_executable_override,
+        ),
         "controller_kind": controller_kind,
         "action_alphabet_size": 2,
     })
@@ -525,7 +628,31 @@ fn write_common_certificate(
     timing: TimingCertificationTier,
     controller_kind: &str,
 ) -> String {
-    let value = common_certificate(kind, dataset_path, timing, controller_kind);
+    write_common_certificate_with_runtime_profile(
+        path,
+        kind,
+        dataset_path,
+        timing,
+        controller_kind,
+        false,
+    )
+}
+
+fn write_common_certificate_with_runtime_profile(
+    path: &Path,
+    kind: &str,
+    dataset_path: &Path,
+    timing: TimingCertificationTier,
+    controller_kind: &str,
+    deterministic_table_requested: bool,
+) -> String {
+    let value = common_certificate_with_runtime_profile(
+        kind,
+        dataset_path,
+        timing,
+        controller_kind,
+        deterministic_table_requested,
+    );
     write_json(path, &value);
     crc32_hex(&fs::read(path).expect("read cert"))
 }
@@ -537,11 +664,51 @@ fn write_exact_reward_certificate(
     controller_kind: &str,
     max_reward: u64,
 ) -> String {
-    let mut value = common_certificate(
+    write_exact_reward_certificate_with_runtime_profile(
+        path,
+        dataset_path,
+        timing,
+        controller_kind,
+        max_reward,
+        false,
+    )
+}
+
+fn write_exact_reward_certificate_with_runtime_profile(
+    path: &Path,
+    dataset_path: &Path,
+    timing: TimingCertificationTier,
+    controller_kind: &str,
+    max_reward: u64,
+    deterministic_table_requested: bool,
+) -> String {
+    write_exact_reward_certificate_with_runtime_profile_and_worker(
+        path,
+        dataset_path,
+        timing,
+        controller_kind,
+        max_reward,
+        deterministic_table_requested,
+        None,
+    )
+}
+
+fn write_exact_reward_certificate_with_runtime_profile_and_worker(
+    path: &Path,
+    dataset_path: &Path,
+    timing: TimingCertificationTier,
+    controller_kind: &str,
+    max_reward: u64,
+    deterministic_table_requested: bool,
+    worker_executable_override: Option<&Path>,
+) -> String {
+    let mut value = common_certificate_with_runtime_profile_and_worker(
         "exact_reward_encoding",
         dataset_path,
         timing,
         controller_kind,
+        deterministic_table_requested,
+        worker_executable_override,
     );
     let object = value.as_object_mut().expect("certificate object");
     object.insert(
@@ -567,11 +734,34 @@ fn write_finite_reward_map_certificate(
     complete_nonnegative_interval_max: Option<u64>,
     values: Value,
 ) -> String {
-    let mut value = common_certificate(
+    write_finite_reward_map_certificate_with_runtime_profile(
+        path,
+        dataset_path,
+        timing,
+        controller_kind,
+        max_reward,
+        complete_nonnegative_interval_max,
+        values,
+        false,
+    )
+}
+
+fn write_finite_reward_map_certificate_with_runtime_profile(
+    path: &Path,
+    dataset_path: &Path,
+    timing: TimingCertificationTier,
+    controller_kind: &str,
+    max_reward: u64,
+    complete_nonnegative_interval_max: Option<u64>,
+    values: Value,
+    deterministic_table_requested: bool,
+) -> String {
+    let mut value = common_certificate_with_runtime_profile(
         "exact_reward_encoding",
         dataset_path,
         timing,
         controller_kind,
+        deterministic_table_requested,
     );
     let object = value.as_object_mut().expect("certificate object");
     object.insert("encoding".to_string(), json!("finite_reward_map"));
@@ -599,11 +789,30 @@ fn write_observation_certificate(
     controller_kind: &str,
     finite_planner_state_certificate_crc32: &str,
 ) -> String {
-    let mut value = common_certificate(
+    write_observation_certificate_with_runtime_profile(
+        path,
+        dataset_path,
+        timing,
+        controller_kind,
+        finite_planner_state_certificate_crc32,
+        false,
+    )
+}
+
+fn write_observation_certificate_with_runtime_profile(
+    path: &Path,
+    dataset_path: &Path,
+    timing: TimingCertificationTier,
+    controller_kind: &str,
+    finite_planner_state_certificate_crc32: &str,
+    deterministic_table_requested: bool,
+) -> String {
+    let mut value = common_certificate_with_runtime_profile(
         "exact_state_observation",
         dataset_path,
         timing,
         controller_kind,
+        deterministic_table_requested,
     );
     let object = value.as_object_mut().expect("certificate object");
     object.insert("observation_key_mode".to_string(), json!("full_stream"));
@@ -656,11 +865,12 @@ fn write_deterministic_table_with_peak_memory(
     baseline_candidate_crc32: &str,
     peak_memory_bytes: u64,
 ) -> String {
-    let mut value = common_certificate(
+    let mut value = common_certificate_with_runtime_profile(
         "deterministic_evaluator_table",
         dataset_path,
         TimingCertificationTier::DeterministicTable,
         controller_kind,
+        true,
     );
     let object = value.as_object_mut().expect("certificate object");
     object.insert(
@@ -1107,6 +1317,11 @@ fn tune_executor_accepts_supported_controls() {
     let supported = [
         vec!["--threads", "2"],
         vec!["--cpu-affinity", "0"],
+        vec!["--evaluator-worker-executable", "/tmp/infotheory-worker"],
+        vec![
+            "--evaluator-cgroup-parent",
+            "/sys/fs/cgroup/infotheory-tuner",
+        ],
         vec!["--log-path", "tune.log"],
         vec!["--diagnostic-chunk-bytes", "4096"],
         vec!["--rss-mode", "process_rss_peak"],
@@ -1131,6 +1346,89 @@ fn tune_executor_accepts_supported_controls() {
             "supported executor flags were rejected: {flags:?}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_tune_rejects_unusable_worker_executable() {
+    let dir = temp_dir("invalid_worker_executable");
+    let dataset_path = dir.join("dataset.bin");
+    let spec_path = dir.join("spec.json");
+    let output_path = dir.join("output.json");
+    let report_path = dir.join("report.json");
+    let missing_worker = dir.join("missing-worker-bin");
+    write_passive_dataset(&dataset_path);
+    write_json(
+        &spec_path,
+        &tune_spec(
+            &dataset_path,
+            &output_path,
+            &report_path,
+            json!({
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1
+            }),
+            None,
+        ),
+    );
+    let args = vec![
+        "infotheory".to_string(),
+        "tune".to_string(),
+        path_string(&spec_path),
+        "--max-evaluations".to_string(),
+        "1".to_string(),
+        "--evaluator-worker-executable".to_string(),
+        path_string(&missing_worker),
+    ];
+    let request = parse_tune_command_args(&args).expect("parse tune args");
+    let err = run_tune(&request).expect_err("nonexistent worker executable must fail");
+    assert!(
+        err.contains("execution.evaluator_worker_executable")
+            && err.contains("does not resolve to a file"),
+        "{err}"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_tune_strict_memory_mode_requires_delegated_cgroup_parent() {
+    let dir = temp_dir("strict_memory_requires_cgroup");
+    let dataset_path = dir.join("dataset.bin");
+    let spec_path = dir.join("spec.json");
+    let output_path = dir.join("output.json");
+    let report_path = dir.join("report.json");
+    write_passive_dataset(&dataset_path);
+    write_json(
+        &spec_path,
+        &tune_spec(
+            &dataset_path,
+            &output_path,
+            &report_path,
+            json!({
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1
+            }),
+            None,
+        ),
+    );
+    let args = vec![
+        "infotheory".to_string(),
+        "tune".to_string(),
+        path_string(&spec_path),
+        "--max-evaluations".to_string(),
+        "1".to_string(),
+        "--rss-mode".to_string(),
+        "hybrid_strict_max".to_string(),
+    ];
+    let request = parse_tune_command_args(&args).expect("parse tune args");
+    let err = run_tune(&request)
+        .expect_err("strict memory-accounting mode without cgroup parent must fail");
+    assert!(
+        err.contains("strict memory-accounting mode") && err.contains("delegated cgroup-v2 parent"),
+        "{err}"
+    );
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -1543,33 +1841,37 @@ fn deterministic_table_certificates_can_certify_theorem_claims_when_used() {
     let reward_cert = dir.join("reward.json");
     let observation_cert = dir.join("observation.json");
     let table_cert = dir.join("table.json");
-    let finite_cert_crc32 = write_common_certificate(
+    let finite_cert_crc32 = write_common_certificate_with_runtime_profile(
         &finite_cert,
         "finite_planner_state",
         &dataset_path,
         TimingCertificationTier::DeterministicTable,
         "mc_aixi_fac_ctw",
+        true,
     );
-    write_common_certificate(
+    write_common_certificate_with_runtime_profile(
         &no_hidden_cert,
         "no_hidden_state",
         &dataset_path,
         TimingCertificationTier::DeterministicTable,
         "mc_aixi_fac_ctw",
+        true,
     );
-    write_exact_reward_certificate(
+    write_exact_reward_certificate_with_runtime_profile(
         &reward_cert,
         &dataset_path,
         TimingCertificationTier::DeterministicTable,
         "mc_aixi_fac_ctw",
         65_535,
+        true,
     );
-    write_observation_certificate(
+    write_observation_certificate_with_runtime_profile(
         &observation_cert,
         &dataset_path,
         TimingCertificationTier::DeterministicTable,
         "mc_aixi_fac_ctw",
         &finite_cert_crc32,
+        true,
     );
     write_deterministic_table(
         &table_cert,
@@ -1743,7 +2045,14 @@ fn real_time_timing_certificate_sets_verified_timing_basis() {
     );
     assert_eq!(
         str_at(&report, "/theorem_claims/planner_convergence/status"),
-        "certified"
+        "uncertified"
+    );
+    assert!(
+        report["theorem_claims"]["planner_convergence"]["missing_prerequisites"]
+            .as_array()
+            .expect("missing prereqs")
+            .iter()
+            .any(|item| item.as_str() == Some("strict_theorem_facing_memory_accounting"))
     );
     let _ = fs::remove_dir_all(dir);
 }
@@ -1772,12 +2081,13 @@ fn deterministic_table_peak_memory_can_make_baseline_nondeployable() {
     let (_, baseline_candidate_crc32) = compiled_tune_hashes(&spec_value, &dir);
     let reward_cert = dir.join("reward.json");
     let table_cert = dir.join("table.json");
-    write_exact_reward_certificate(
+    write_exact_reward_certificate_with_runtime_profile(
         &reward_cert,
         &dataset_path,
         TimingCertificationTier::DeterministicTable,
         "mc_aixi_fac_ctw",
         65_535,
+        true,
     );
     write_deterministic_table_with_peak_memory(
         &table_cert,
@@ -2396,7 +2706,7 @@ fn warmstart_exact_jh_rejects_nonidentity_finite_reward_map() {
         })
         .collect::<Vec<_>>();
     let reward_cert_path = dir.join("reward_map.json");
-    let reward_cert_crc32 = write_finite_reward_map_certificate(
+    let reward_cert_crc32 = write_finite_reward_map_certificate_with_runtime_profile(
         &reward_cert_path,
         &dataset_path,
         TimingCertificationTier::DeterministicTable,
@@ -2404,6 +2714,7 @@ fn warmstart_exact_jh_rejects_nonidentity_finite_reward_map() {
         65_535,
         Some(baseline_objective),
         Value::Array(reward_values),
+        true,
     );
     write_teacher(&teacher_path, "placeholder", &reward_cert_crc32);
     let table_path = dir.join("table.json");
@@ -2742,12 +3053,14 @@ fn tune_cli_accepts_executor_flags_and_writes_report() {
     );
     write_json(&spec_path, &spec_value);
     let reward_cert_path = dir.join("reward.json");
-    write_exact_reward_certificate(
+    write_exact_reward_certificate_with_runtime_profile_and_worker(
         &reward_cert_path,
         &dataset_path,
         TimingCertificationTier::DeterministicTable,
         "mc_aixi_fac_ctw",
         65_535,
+        false,
+        Some(Path::new(env!("CARGO_BIN_EXE_infotheory"))),
     );
     let spec_arg = path_string(&spec_path);
     let reward_cert_arg = path_string(&reward_cert_path);
@@ -2782,7 +3095,7 @@ fn tune_cli_accepts_executor_flags_and_writes_report() {
         &report,
         "/provenance/executor_controls/rss_mode/effective_measurement",
     );
-    assert_eq!(effective_measurement, "process_rss_peak");
+    assert_eq!(effective_measurement, "unix_process_rss_fallback_explicit");
     assert_eq!(
         str_at(&report, "/theorem_claims/exact_finite_mdp/status"),
         "uncertified"

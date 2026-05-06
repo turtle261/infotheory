@@ -12,6 +12,7 @@ pub(super) fn run_planner_family_controller(
     baseline_hash: String,
     baseline_bytes: Vec<u8>,
     baseline_key: CandidateCacheKey,
+    runtime_profile: &ResolvedEvaluatorRuntimeProfile,
     cache: &mut HashMap<CandidateCacheKey, CandidateEvalResult>,
 ) -> Result<SearchSummary, String> {
     let contract =
@@ -255,8 +256,8 @@ pub(super) fn run_planner_family_controller(
                     compiled.canonical_spec().min_throughput_bytes_per_second,
                     compiled.canonical_spec().max_memory_bytes,
                     effective_limit,
-                    request.execution.rss_mode,
                     request.execution.evaluator_threads(),
+                    runtime_profile,
                     verified_theorem.deterministic_table.as_ref(),
                 ) {
                     Ok(value) => value,

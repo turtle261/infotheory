@@ -2,17 +2,12 @@ use super::*;
 
 pub(super) use crate::aixi::warmstart_contract::observation_key_mode_name;
 
-pub(super) fn executor_controls_report(config: &TuneExecutionConfig) -> Value {
-    let cgroup_peak_available = cgroup_peak_memory_bytes().is_some();
-    let effective_measurement = match config.rss_mode {
-        PeakMemoryMode::ProcessRssPeak => "process_rss_peak",
-        PeakMemoryMode::BackendReported if cgroup_peak_available => "cgroup_peak_memory",
-        PeakMemoryMode::BackendReported => "process_rss_peak_fallback",
-        PeakMemoryMode::HybridStrictMax if cgroup_peak_available => {
-            "max_process_rss_peak_cgroup_peak"
-        }
-        PeakMemoryMode::HybridStrictMax => "process_rss_peak_fallback",
-    };
+pub(super) fn executor_controls_report(
+    config: &TuneExecutionConfig,
+    runtime_profile: &ResolvedEvaluatorRuntimeProfile,
+) -> Value {
+    let container_peak_available = cgroup_peak_memory_bytes().is_some();
+    let per_eval_cgroup_peak_available = runtime_profile.resolved_evaluator_cgroup_parent.is_some();
     serde_json::json!({
         "cpu_affinity": {
             "requested": config.cpu_affinity,
@@ -24,15 +19,25 @@ pub(super) fn executor_controls_report(config: &TuneExecutionConfig) -> Value {
             "evaluator_threads": config.evaluator_threads(),
             "rayon_global_pool_configured_in_parent": false,
             "worker_isolation_mode": "spawn_exec_worker",
+            "evaluator_worker_executable": config.evaluator_worker_executable,
+            "evaluator_worker_executable_identity": runtime_profile
+                .worker_executable_identity
+                .as_deref(),
+            "evaluator_cgroup_parent_requested": config.evaluator_cgroup_parent,
+            "evaluator_cgroup_parent_resolved": runtime_profile.resolved_cgroup_parent_string(),
             "evaluator_determinism": config.evaluator_determinism(),
         },
         "log_path": config.log_path,
         "diagnostic_chunk_bytes": config.diagnostic_chunk_bytes,
         "rss_mode": {
             "requested": peak_memory_mode_name(config.rss_mode),
-            "effective_measurement": effective_measurement,
-            "cgroup_peak_memory_available": cgroup_peak_available,
-            "backend_peak_memory_report_available": cgroup_peak_available,
+            "effective_measurement": runtime_profile.memory_accounting_kind.name(),
+            "strict_theorem_memory_certified": runtime_profile.strict_theorem_memory_certified(),
+            "per_eval_cgroup_peak_memory_available": per_eval_cgroup_peak_available,
+            "container_peak_memory_visible": container_peak_available,
+            "backend_report_component_policy": runtime_profile
+                .memory_accounting_kind
+                .backend_report_component_policy(),
         },
     })
 }
@@ -262,20 +267,34 @@ pub(super) fn theorem_claims_report(
     controller: &crate::spec::CompiledTuneController,
     dataset: &LoadedDataset,
     search: &SearchSummary,
+    strict_theorem_memory_certified: bool,
 ) -> Value {
     serde_json::json!({
         "exact_finite_mdp": theorem_claim_status(
             theorem.claim_exact_finite_mdp,
-            exact_finite_mdp_missing_prereqs(theorem, verified, controller, search),
+            exact_finite_mdp_missing_prereqs(
+                theorem,
+                verified,
+                controller,
+                search,
+                strict_theorem_memory_certified,
+            ),
             &[
                 "Assumptions finite-Z/no-hidden-state are represented by finite compiled mutation alphabet",
                 "Timing tier is theorem-admissible",
                 "Verified determinism/deadline certificate is present unless verified deterministic_table is used",
+                "Strict theorem-facing memory accounting is certified by resolved evaluator profile",
             ],
         ),
         "exact_observed_markov": theorem_claim_status(
             theorem.claim_exact_observed_markov,
-            exact_observed_markov_missing_prereqs(theorem, verified, controller, search),
+            exact_observed_markov_missing_prereqs(
+                theorem,
+                verified,
+                controller,
+                search,
+                strict_theorem_memory_certified,
+            ),
             &[
                 "All exact finite-MDP prerequisites hold",
                 "Exact-state observation encoder reference is present",
@@ -284,7 +303,13 @@ pub(super) fn theorem_claims_report(
         ),
         "planner_convergence": theorem_claim_status(
             theorem.claim_planner_convergence,
-            planner_convergence_missing_prereqs(theorem, verified, controller, search),
+            planner_convergence_missing_prereqs(
+                theorem,
+                verified,
+                controller,
+                search,
+                strict_theorem_memory_certified,
+            ),
             &[
                 "Controller is MC-AIXI(FAC-CTW)",
                 "Exact finite-MDP prerequisites hold",
@@ -377,6 +402,7 @@ pub(super) fn exact_finite_mdp_missing_prereqs(
     verified: &VerifiedTheoremInputs,
     controller: &crate::spec::CompiledTuneController,
     search: &SearchSummary,
+    strict_theorem_memory_certified: bool,
 ) -> Vec<&'static str> {
     let mut missing = Vec::new();
     match controller {
@@ -401,6 +427,9 @@ pub(super) fn exact_finite_mdp_missing_prereqs(
     if !verified.timing_certified(theorem) {
         missing.push("theorem_certified_timing_or_deterministic_table");
     }
+    if !strict_theorem_memory_certified {
+        missing.push("strict_theorem_facing_memory_accounting");
+    }
     if theorem.scalar_representation_ref.is_none() {
         missing.push("scalar_representation_ref");
     }
@@ -417,8 +446,15 @@ fn exact_observed_markov_missing_prereqs(
     verified: &VerifiedTheoremInputs,
     controller: &crate::spec::CompiledTuneController,
     search: &SearchSummary,
+    strict_theorem_memory_certified: bool,
 ) -> Vec<&'static str> {
-    let mut missing = exact_finite_mdp_missing_prereqs(theorem, verified, controller, search);
+    let mut missing = exact_finite_mdp_missing_prereqs(
+        theorem,
+        verified,
+        controller,
+        search,
+        strict_theorem_memory_certified,
+    );
     if theorem.exact_state_encoder_spec_ref.is_none() {
         missing.push("exact_state_encoder_spec_ref");
     }
@@ -433,8 +469,15 @@ fn planner_convergence_missing_prereqs(
     verified: &VerifiedTheoremInputs,
     controller: &crate::spec::CompiledTuneController,
     search: &SearchSummary,
+    strict_theorem_memory_certified: bool,
 ) -> Vec<&'static str> {
-    let mut missing = exact_finite_mdp_missing_prereqs(theorem, verified, controller, search);
+    let mut missing = exact_finite_mdp_missing_prereqs(
+        theorem,
+        verified,
+        controller,
+        search,
+        strict_theorem_memory_certified,
+    );
     if !matches!(
         controller,
         crate::spec::CompiledTuneController::McAixiFacCtw(_)

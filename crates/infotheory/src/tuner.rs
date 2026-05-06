@@ -57,7 +57,10 @@ use config::{
 #[cfg(test)]
 use eval::evaluate_candidate_causal_loss;
 pub use eval::run_tuner_eval_worker_from_env;
-use eval::{cache_key_for_candidate, error_eval_result, evaluate_candidate, timeout_eval_result};
+use eval::{
+    ResolvedEvaluatorRuntimeProfile, cache_key_for_candidate, error_eval_result,
+    evaluate_candidate, resolve_evaluator_runtime_profile, timeout_eval_result,
+};
 #[cfg(test)]
 use planner_bridge::{
     TunerRawObservation, compile_tuner_planner_run_spec, encode_tuner_planner_percept,
@@ -212,6 +215,11 @@ struct EvaluatorProfile {
     eval_time_limit_seconds: f64,
     evaluator_threads: usize,
     worker_isolation_mode: &'static str,
+    worker_executable_identity: Option<String>,
+    resolved_memory_accounting_kind: &'static str,
+    resolved_memory_accounting_strict_theorem_facing: bool,
+    resolved_evaluator_cgroup_parent: Option<String>,
+    backend_report_component_policy: &'static str,
     evaluator_determinism: &'static str,
     rss_mode: PeakMemoryMode,
     timing_certification_tier: TimingCertificationTier,
@@ -243,6 +251,11 @@ impl EvaluatorProfile {
             "effective_eval_time_limit_seconds": self.eval_time_limit_seconds,
             "evaluator_threads": self.evaluator_threads,
             "worker_isolation_mode": self.worker_isolation_mode,
+            "worker_executable_identity": self.worker_executable_identity.as_deref(),
+            "resolved_memory_accounting_kind": self.resolved_memory_accounting_kind,
+            "resolved_memory_accounting_strict_theorem_facing": self.resolved_memory_accounting_strict_theorem_facing,
+            "resolved_evaluator_cgroup_parent": self.resolved_evaluator_cgroup_parent.as_deref(),
+            "backend_report_component_policy": self.backend_report_component_policy,
             "evaluator_determinism": self.evaluator_determinism,
             "rss_mode": peak_memory_mode_name(self.rss_mode),
             "timing_certification_tier": timing_tier_name(self.timing_certification_tier),
@@ -272,6 +285,11 @@ impl EvaluatorProfile {
             "effective_eval_time_limit_seconds_bits": self.eval_time_limit_seconds.to_bits(),
             "evaluator_threads": self.evaluator_threads,
             "worker_isolation_mode": self.worker_isolation_mode,
+            "worker_executable_identity": self.worker_executable_identity.as_deref(),
+            "resolved_memory_accounting_kind": self.resolved_memory_accounting_kind,
+            "resolved_memory_accounting_strict_theorem_facing": self.resolved_memory_accounting_strict_theorem_facing,
+            "resolved_evaluator_cgroup_parent": self.resolved_evaluator_cgroup_parent.as_deref(),
+            "backend_report_component_policy": self.backend_report_component_policy,
             "evaluator_determinism": self.evaluator_determinism,
             "rss_mode": peak_memory_mode_name(self.rss_mode),
             "timing_certification_tier": timing_tier_name(self.timing_certification_tier),
@@ -887,6 +905,14 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
         Some(compiled.canonical_spec().eval_time_limit_seconds),
         None,
     );
+    let runtime_profile = resolve_evaluator_runtime_profile(
+        &request.execution,
+        request
+            .execution
+            .theorem
+            .deterministic_evaluator_table
+            .is_some(),
+    )?;
     let evaluator_profile = EvaluatorProfile {
         dataset_kind: dataset.kind,
         objective_target: if request.execution.planner_deployable_model {
@@ -909,6 +935,14 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
         eval_time_limit_seconds: initial_eval_limit,
         evaluator_threads: request.execution.evaluator_threads(),
         worker_isolation_mode: "spawn_exec_worker",
+        worker_executable_identity: runtime_profile.worker_executable_identity.clone(),
+        resolved_memory_accounting_kind: runtime_profile.memory_accounting_kind.name(),
+        resolved_memory_accounting_strict_theorem_facing: runtime_profile
+            .strict_theorem_memory_certified(),
+        resolved_evaluator_cgroup_parent: runtime_profile.resolved_cgroup_parent_string(),
+        backend_report_component_policy: runtime_profile
+            .memory_accounting_kind
+            .backend_report_component_policy(),
         evaluator_determinism: request.execution.evaluator_determinism(),
         rss_mode: request.execution.rss_mode,
         timing_certification_tier: request.execution.theorem.timing_certification_tier,
@@ -932,8 +966,8 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
             compiled.canonical_spec().min_throughput_bytes_per_second,
             compiled.canonical_spec().max_memory_bytes,
             initial_eval_limit,
-            request.execution.rss_mode,
             request.execution.evaluator_threads(),
+            &runtime_profile,
             verified_theorem.deterministic_table.as_ref(),
         )?;
     }
@@ -945,8 +979,8 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
         compiled.canonical_spec().min_throughput_bytes_per_second,
         compiled.canonical_spec().max_memory_bytes,
         initial_eval_limit,
-        request.execution.rss_mode,
         request.execution.evaluator_threads(),
+        &runtime_profile,
         verified_theorem.deterministic_table.as_ref(),
     )?;
     let baseline_key = cache_key_for_candidate(
@@ -976,6 +1010,7 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
             baseline_hash.clone(),
             baseline_bytes.clone(),
             baseline_key.clone(),
+            &runtime_profile,
             &mut cache,
         )?
     } else {
@@ -1026,6 +1061,7 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
         compiled.controller(),
         &dataset,
         &search_summary,
+        runtime_profile.strict_theorem_memory_certified(),
     );
     let bounds_hash = bounds_hash(&compiled.canonical_spec().bounds)?;
     let observation_adapter_hash = observation_adapter_content_hash()?;
@@ -1094,6 +1130,7 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
             "evaluator_execution_model": evaluator_execution_model,
             "theorem_timing_basis": theorem_timing_basis,
             "verified_theorem_inputs": verified_theorem.to_json_value(),
+            "resolved_evaluator_runtime_profile": runtime_profile.to_provenance_value(),
             "warmup_policy": {
                 "warmup_baseline_runs": request.execution.warmup_baseline_runs,
                 "excluded_from_cache": true,
@@ -1108,7 +1145,10 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
             "stagnation_policy": {
                 "stagnation_reset_evals": request.execution.stagnation_reset_evals,
             },
-            "executor_controls": executor_controls_report(&request.execution),
+            "executor_controls": executor_controls_report(
+                &request.execution,
+                &runtime_profile,
+            ),
             "diagnostic_chunking": diagnostic_chunking_report(
                 &dataset,
                 request.execution.diagnostic_chunk_bytes,
@@ -1377,6 +1417,7 @@ fn run_controller_search(
     baseline_hash: String,
     baseline_bytes: Vec<u8>,
     baseline_key: CandidateCacheKey,
+    runtime_profile: &ResolvedEvaluatorRuntimeProfile,
     cache: &mut HashMap<CandidateCacheKey, CandidateEvalResult>,
 ) -> Result<SearchSummary, String> {
     match compiled.controller() {
@@ -1392,6 +1433,7 @@ fn run_controller_search(
                 baseline_hash,
                 baseline_bytes,
                 baseline_key,
+                runtime_profile,
                 cache,
                 inner.max_mutation_radius,
             )
@@ -1410,6 +1452,7 @@ fn run_controller_search(
                 baseline_hash,
                 baseline_bytes,
                 baseline_key,
+                runtime_profile,
                 cache,
             )
         }
@@ -1428,6 +1471,7 @@ fn run_annealed_hill_climbing(
     baseline_hash: String,
     baseline_bytes: Vec<u8>,
     baseline_key: CandidateCacheKey,
+    runtime_profile: &ResolvedEvaluatorRuntimeProfile,
     cache: &mut HashMap<CandidateCacheKey, CandidateEvalResult>,
     max_mutation_radius: usize,
 ) -> Result<SearchSummary, String> {
@@ -1531,8 +1575,8 @@ fn run_annealed_hill_climbing(
                 compiled.canonical_spec().min_throughput_bytes_per_second,
                 compiled.canonical_spec().max_memory_bytes,
                 effective_limit,
-                request.execution.rss_mode,
                 request.execution.evaluator_threads(),
+                runtime_profile,
                 verified_theorem.deterministic_table.as_ref(),
             ) {
                 Ok(value) => value,
@@ -1973,10 +2017,11 @@ fn peak_rss_bytes() -> u64 {
 
 fn peak_memory_bytes(mode: PeakMemoryMode) -> u64 {
     let process = peak_rss_bytes();
+    let cgroup = cgroup_peak_memory_bytes();
     match mode {
         PeakMemoryMode::ProcessRssPeak => process,
-        PeakMemoryMode::BackendReported => cgroup_peak_memory_bytes().unwrap_or(process),
-        PeakMemoryMode::HybridStrictMax => cgroup_peak_memory_bytes().unwrap_or(0).max(process),
+        PeakMemoryMode::BackendReported => cgroup.unwrap_or(process),
+        PeakMemoryMode::HybridStrictMax => cgroup.unwrap_or(process).max(process),
     }
 }
 
@@ -2061,18 +2106,6 @@ fn peak_rss_bytes_for_pid(pid: libc::pid_t) -> Option<u64> {
         }
     }
     None
-}
-
-#[cfg(target_os = "linux")]
-fn peak_memory_bytes_for_pid(pid: libc::pid_t, mode: PeakMemoryMode) -> Option<u64> {
-    let process = peak_rss_bytes_for_pid(pid).unwrap_or(0);
-    match mode {
-        PeakMemoryMode::ProcessRssPeak => Some(process),
-        PeakMemoryMode::BackendReported => cgroup_peak_memory_bytes().or(Some(process)),
-        PeakMemoryMode::HybridStrictMax => {
-            Some(cgroup_peak_memory_bytes().unwrap_or(0).max(process))
-        }
-    }
 }
 
 #[cfg(not(target_os = "linux"))]

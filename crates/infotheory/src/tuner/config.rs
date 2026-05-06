@@ -47,6 +47,26 @@ pub struct TuneExecutionConfig {
     /// is not established for the chosen backend path, do not enable
     /// multithreaded evaluator workers for theorem-facing runs.
     pub threads: Option<usize>,
+    /// Optional evaluator-worker executable path used for process isolation.
+    ///
+    /// This path is executor-side only and does not affect canonical tune
+    /// identity. When unset, the runtime resolves a default worker executable
+    /// from process context (`INFOTHEORY_TUNER_EVAL_WORKER_EXE`,
+    /// `CARGO_BIN_EXE_infotheory`, then current executable) and validates that
+    /// it exposes the tuner worker entrypoint.
+    pub evaluator_worker_executable: Option<String>,
+    /// Optional delegated cgroup-v2 parent for per-evaluation worker cgroups.
+    ///
+    /// This is executor-side only and does not affect canonical tune identity.
+    /// This is required only for strict Linux memory-accounting mode
+    /// (`rss_mode = "hybrid_strict_max"`), where candidate deployability memory
+    /// must include per-evaluation cgroup-v2 accounting in addition to process
+    /// RSS. The value must name a delegated cgroup-v2 directory under
+    /// `/sys/fs/cgroup`; the tuner creates one short-lived child cgroup per
+    /// candidate evaluation and moves only the evaluator worker process into
+    /// that child. Parsing, compression, and scoring continue to run as the
+    /// unprivileged tuner user.
+    pub evaluator_cgroup_parent: Option<String>,
     /// Number of uncharged baseline evaluations run before the normative
     /// baseline.
     ///
@@ -168,13 +188,25 @@ pub enum AnnealerKernelProfile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PeakMemoryMode {
-    /// Use process resident-set-size peak measurements where the platform
-    /// exposes them.
+    /// Explicit weak mode: use process resident-set-size peak measurements for
+    /// deployability memory accounting.
+    ///
+    /// This mode is operational and does not certify strict theorem-facing
+    /// memory accounting.
     ProcessRssPeak,
-    /// Use backend-reported memory when the evaluator path provides it.
+    /// Diagnostic-only backend memory mode.
+    ///
+    /// Deployability memory accounting remains process-RSS based, while any
+    /// backend-reported memory component is treated as non-certifying
+    /// diagnostics unless combined with strict OS/controller accounting in
+    /// another mode.
     BackendReported,
-    /// Use the maximum of process and backend measurements to avoid optimistic
-    /// deployability reports.
+    /// Strict Linux mode: use max(process RSS peak, per-evaluation cgroup-v2
+    /// peak memory).
+    ///
+    /// This mode requires delegated cgroup-v2 parent configuration and is the
+    /// strict theorem-facing memory-accounting profile for live worker
+    /// evaluation.
     HybridStrictMax,
 }
 
@@ -202,6 +234,8 @@ impl Default for TuneExecutionConfig {
             annealer_kernel_profile: AnnealerKernelProfile::ReversibleElementaryMetropolis,
             cpu_affinity: None,
             threads: None,
+            evaluator_worker_executable: None,
+            evaluator_cgroup_parent: None,
             warmup_baseline_runs: 0,
             self_improvement_rounds: 1,
             stagnation_reset_evals: None,
@@ -240,6 +274,8 @@ const EXECUTION_CONFIG_FIELDS: &[&str] = &[
     "annealer_kernel_profile",
     "cpu_affinity",
     "threads",
+    "evaluator_worker_executable",
+    "evaluator_cgroup_parent",
     "warmup_baseline_runs",
     "self_improvement_rounds",
     "stagnation_reset_evals",
@@ -312,6 +348,14 @@ impl TuneExecutionConfig {
         cfg.cpu_affinity =
             parse_optional_non_empty_string(object.get("cpu_affinity"), "cpu_affinity")?;
         apply_optional_usize(object.get("threads"), &mut cfg.threads)?;
+        cfg.evaluator_worker_executable = parse_optional_non_empty_string(
+            object.get("evaluator_worker_executable"),
+            "evaluator_worker_executable",
+        )?;
+        cfg.evaluator_cgroup_parent = parse_optional_non_empty_string(
+            object.get("evaluator_cgroup_parent"),
+            "evaluator_cgroup_parent",
+        )?;
         if let Some(raw) = object.get("warmup_baseline_runs") {
             cfg.warmup_baseline_runs = required_usize(raw, "warmup_baseline_runs")?;
         }
@@ -462,6 +506,8 @@ impl TuneExecutionConfig {
             "annealer_kernel_profile": annealer_kernel_profile_name(self.annealer_kernel_profile),
             "cpu_affinity": self.cpu_affinity,
             "threads": self.threads,
+            "evaluator_worker_executable": self.evaluator_worker_executable,
+            "evaluator_cgroup_parent": self.evaluator_cgroup_parent,
             "evaluator_threads": self.evaluator_threads(),
             "parent_controller_threads": 1usize,
             "worker_isolation_mode": "spawn_exec_worker",
@@ -547,6 +593,19 @@ pub fn parse_tune_command_args(args: &[String]) -> Result<TuneCommandRequest, St
             "--threads" => {
                 i += 1;
                 request.execution.threads = Some(parse_cli_usize(args.get(i), "--threads")?);
+            }
+            "--evaluator-worker-executable" => {
+                i += 1;
+                request.execution.evaluator_worker_executable = Some(
+                    parse_cli_non_empty_str(args.get(i), "--evaluator-worker-executable")?
+                        .to_string(),
+                );
+            }
+            "--evaluator-cgroup-parent" => {
+                i += 1;
+                request.execution.evaluator_cgroup_parent = Some(
+                    parse_cli_non_empty_str(args.get(i), "--evaluator-cgroup-parent")?.to_string(),
+                );
             }
             "--warmup-baseline-runs" => {
                 i += 1;

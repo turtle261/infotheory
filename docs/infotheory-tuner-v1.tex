@@ -122,13 +122,32 @@ fresh spawned-and-exec'd worker process per candidate evaluation
 inside the evaluator worker only, because its runtime/threadpool state is
 initialized after process creation.
 
-Preferred definition: $\mu(z)$ is the peak memory usage attributed to that
-instance by the operating-system or container memory controller (for example,
-cgroup peak memory usage) over the lifetime of the evaluation.
+For strict v1 theorem-facing memory accounting, $\mu(z)$ must be measured by an
+operating-system or container memory controller that accounts for the evaluator
+instance over its lifetime. On Linux, the conforming strict profile is
+\texttt{cgroup\_v2\_peak\_required}. If the required controller accounting
+cannot be configured, the evaluator profile is invalid and tuning must abort
+before the normative baseline evaluation.
 
-Fallback definition when such accounting is unavailable: the evaluator must run
-as a single process, and $\mu(z)$ is the operating-system reported peak RSS of
-that process.
+Operationally, cgroup-v2 delegation may require a two-level delegated subtree:
+a session cgroup that contains the long-lived tuner parent process, and a
+separate evaluation-parent cgroup under which per-evaluation worker cgroups are
+created. In delegation-containment terms, placing the first delegated process
+into the subtree may require an action by the delegator/root side before
+unprivileged tuning begins. The strict evaluator parent path passed to
+\texttt{--evaluator-cgroup-parent} should name the evaluation-parent node.
+
+A single-process peak-RSS fallback may be exposed only as an explicit
+non-strict execution profile
+(\texttt{single\_process\_rss\_fallback}). In that profile, the evaluator must
+run as a single process, $\mu(z)$ is the operating-system reported peak RSS of
+that process, and provenance must state that strict theorem-facing memory
+certification is not claimed.
+
+Backend-reported memory may be recorded as a diagnostic or as a supplementary
+component of a hybrid check, but backend-reported memory alone is not a strict
+v1 deployability memory measurement unless separately justified by the
+deployability profile.
 
 Executing complex runtime/library code in a raw post-\texttt{fork()} child
 without an \texttt{exec()} boundary is non-conforming for strict v1
@@ -577,6 +596,16 @@ threading:
 \]
 The required process-isolation mode is
 \texttt{worker\_isolation\_mode="spawn\_exec\_worker"}.
+
+For live worker evaluation, strict theorem-facing memory accounting is Linux
+only (\texttt{hybrid\_strict\_max} with delegated cgroup-v2 parent). The weak
+operational memory profiles (\texttt{process\_rss\_peak} and
+\texttt{backend\_reported} diagnostic mode) remain Unix-only.
+
+For deployment hygiene, root usage should be limited to cgroup delegation and,
+when required by host containment rules, first-process placement into the
+delegated session cgroup. The tuner process itself should run as the
+unprivileged tuner user.
 
 These controls belong to the executor profile rather than to the canonical
 candidate/request surface, unless an implementation explicitly lifts them into

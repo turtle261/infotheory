@@ -1673,6 +1673,10 @@ Options:
                           Tune annealer profile: reversible_elementary_metropolis|compiled_uniform_metropolis_hastings
   --cpu-affinity <csv>    CPU affinity (comma-separated core ids, for `tune`)
   --threads <n>           Executor thread hint for tuning runs (for `tune`)
+  --evaluator-worker-executable <path>
+                          Explicit tuner evaluator worker executable path (for `tune`)
+  --evaluator-cgroup-parent <path>
+                          Delegated cgroup-v2 eval-parent (typically .../infotheory-tuner/evals)
   --warmup-baseline-runs <n>
                           Baseline warmup runs before normative baseline eval (for `tune`)
   --self-improvement-rounds <n>
@@ -1682,7 +1686,10 @@ Options:
   --log-path <path>       Optional JSONL executor event log output (for `tune`)
   --diagnostic-chunk-bytes <n>
                           Diagnostic report chunk size over charged target bytes (for `tune`)
-  --rss-mode <mode>       Memory accounting mode: process_rss_peak|backend_reported|hybrid_strict_max (for `tune`)
+  --rss-mode <mode>       Memory accounting mode:
+                          process_rss_peak (explicit Unix RSS fallback) |
+                          backend_reported (diagnostic backend component, RSS deployability) |
+                          hybrid_strict_max (strict Linux cgroup-v2 + RSS max) (for `tune`)
   --planner-deployable-model
                           Use executor-side planner deployability diagnostics in the evaluator profile (for `tune`)
   --warmstart-trace-refresh
