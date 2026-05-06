@@ -285,7 +285,7 @@ fn canonical_causal_dataset(codec_hash: &str, payload_key: &str, payload: Value)
     Value::Object(object)
 }
 
-fn write_teacher(path: &Path, task_fingerprint: &str, reward_cert_crc32: &str, max_reward: i64) {
+fn write_teacher(path: &Path, task_fingerprint: &str, reward_cert_crc32: &str) {
     write_json(
         path,
         &json!({
@@ -299,8 +299,6 @@ fn write_teacher(path: &Path, task_fingerprint: &str, reward_cert_crc32: &str, m
                 "observation_adapter_spec_ref": "single-channel-conditional-byte-adapter-v1",
                 "observation_adapter_content_crc32": observation_adapter_crc32(),
                 "reward_bits": 16,
-                "min_reward": 0,
-                "max_reward": max_reward,
                 "return_horizon": 1,
                 "label_phase_period": 1,
                 "scalar_representation": "scalar://finite-f64",
@@ -317,7 +315,7 @@ fn write_teacher(path: &Path, task_fingerprint: &str, reward_cert_crc32: &str, m
 }
 
 fn write_placeholder_teacher(path: &Path) {
-    write_teacher(path, "placeholder", "placeholder", 65535);
+    write_teacher(path, "placeholder", "placeholder");
 }
 
 fn timing_label(timing: TimingCertificationTier) -> &'static str {
@@ -680,21 +678,26 @@ fn write_deterministic_table_with_peak_memory(
     crc32_hex(&fs::read(path).expect("read table cert"))
 }
 
-fn warmstart_task_fingerprint(
-    spec_crc32: &str,
-    dataset_path: &Path,
-    controller_kind: &str,
+fn mismatch_marker_value(err: &str, marker: &str) -> Option<String> {
+    let start = err.find(marker)? + marker.len();
+    let rest = &err[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+fn derive_runtime_warmstart_task_fingerprint(
+    args: &[String],
+    teacher_path: &Path,
     reward_cert_crc32: &str,
 ) -> String {
-    let payload = json!({
-        "tune_canonical_crc32": spec_crc32,
-        "dataset_crc32": dataset_crc32(dataset_path),
-        "dataset_kind": "passive_bytes",
-        "bounds_crc32": bounds_crc32(),
-        "controller_kind": controller_kind,
-        "reward_certificate_crc32": reward_cert_crc32,
-    });
-    crc32_hex(&serde_json::to_vec(&payload).expect("teacher fingerprint json"))
+    let request = parse_tune_command_args(args).expect("parse tune args for warmstart probe");
+    write_teacher(teacher_path, "probe", reward_cert_crc32);
+    let err = run_tune(&request)
+        .expect_err("warmstart probe must fail before teacher task_fingerprint is corrected");
+    if let Some(value) = mismatch_marker_value(&err, "current planner_run '") {
+        return value;
+    }
+    panic!("warmstart probe must expose current planner_run fingerprint marker, got: {err}");
 }
 
 fn tune_args(
@@ -746,7 +749,7 @@ fn run_tune_case(
         teacher,
     );
     write_json(&spec_path, &spec_value);
-    let (spec_crc32, _baseline_crc32) = compiled_tune_hashes(&spec_value, dir);
+    let (_spec_crc32, _baseline_crc32) = compiled_tune_hashes(&spec_value, dir);
     let mut args = tune_args(&spec_path, timing, max_evaluations);
     if matches!(case.kind, "mc_aixi_fac_ctw" | "aiqi_warmstart_exact_jh") {
         let reward_cert_path = dir.join(format!("{suffix}_exact_reward.json"));
@@ -760,13 +763,9 @@ fn run_tune_case(
         args.push("--exact-reward-encoding-certificate".to_string());
         args.push(path_string(&reward_cert_path));
         if case.needs_teacher {
-            let task_fingerprint = warmstart_task_fingerprint(
-                &spec_crc32,
-                dataset_path,
-                case.kind,
-                &reward_cert_crc32,
-            );
-            write_teacher(teacher_path, &task_fingerprint, &reward_cert_crc32, 65_535);
+            let task_fingerprint =
+                derive_runtime_warmstart_task_fingerprint(&args, teacher_path, &reward_cert_crc32);
+            write_teacher(teacher_path, &task_fingerprint, &reward_cert_crc32);
         }
     }
     let request = parse_tune_command_args(&args).expect("parse tune args");
@@ -2120,7 +2119,7 @@ fn run_tune_warmstart_self_improvement_reports_equal_split_deadlines() {
         Some(&teacher_path),
     );
     write_json(&spec_path, &spec_value);
-    let (spec_crc32, _) = compiled_tune_hashes(&spec_value, &dir);
+    let (_spec_crc32, _) = compiled_tune_hashes(&spec_value, &dir);
     let reward_cert_path = dir.join("exact_reward.json");
     let reward_cert_crc32 = write_exact_reward_certificate(
         &reward_cert_path,
@@ -2129,13 +2128,6 @@ fn run_tune_warmstart_self_improvement_reports_equal_split_deadlines() {
         "aiqi_warmstart_exact_jh",
         65_535,
     );
-    let task_fingerprint = warmstart_task_fingerprint(
-        &spec_crc32,
-        &dataset_path,
-        "aiqi_warmstart_exact_jh",
-        &reward_cert_crc32,
-    );
-    write_teacher(&teacher_path, &task_fingerprint, &reward_cert_crc32, 65_535);
     let args = [
         "infotheory",
         "tune",
@@ -2152,6 +2144,9 @@ fn run_tune_warmstart_self_improvement_reports_equal_split_deadlines() {
     .iter()
     .map(|item| (*item).to_string())
     .collect::<Vec<_>>();
+    let task_fingerprint =
+        derive_runtime_warmstart_task_fingerprint(&args, &teacher_path, &reward_cert_crc32);
+    write_teacher(&teacher_path, &task_fingerprint, &reward_cert_crc32);
     let request = parse_tune_command_args(&args).expect("parse tune args");
     run_tune(&request).expect("run tune");
     let report = read_json(&report_path);
@@ -2204,7 +2199,7 @@ fn warmstart_trace_refresh_merges_same_task_live_trace() {
         Some(&teacher_path),
     );
     write_json(&spec_path, &spec_value);
-    let (spec_crc32, _) = compiled_tune_hashes(&spec_value, &dir);
+    let (_spec_crc32, _) = compiled_tune_hashes(&spec_value, &dir);
     let reward_cert_path = dir.join("exact_reward.json");
     let reward_cert_crc32 = write_exact_reward_certificate(
         &reward_cert_path,
@@ -2213,13 +2208,7 @@ fn warmstart_trace_refresh_merges_same_task_live_trace() {
         "aiqi_warmstart_exact_jh",
         65_535,
     );
-    let task_fingerprint = warmstart_task_fingerprint(
-        &spec_crc32,
-        &dataset_path,
-        "aiqi_warmstart_exact_jh",
-        &reward_cert_crc32,
-    );
-    write_teacher(&teacher_path, &task_fingerprint, &reward_cert_crc32, 65_535);
+    write_teacher(&teacher_path, "probe", "probe");
     let args = [
         "infotheory",
         "tune",
@@ -2237,6 +2226,9 @@ fn warmstart_trace_refresh_merges_same_task_live_trace() {
     .iter()
     .map(|item| (*item).to_string())
     .collect::<Vec<_>>();
+    let task_fingerprint =
+        derive_runtime_warmstart_task_fingerprint(&args, &teacher_path, &reward_cert_crc32);
+    write_teacher(&teacher_path, &task_fingerprint, &reward_cert_crc32);
     let request = parse_tune_command_args(&args).expect("parse tune args");
     run_tune(&request).expect("run tune");
     let report = read_json(&report_path);
@@ -2275,12 +2267,17 @@ fn warmstart_teacher_fingerprint_mismatch_is_rejected() {
     );
     write_json(&spec_path, &spec_value);
     let reward_cert_path = dir.join("exact_reward.json");
-    write_exact_reward_certificate(
+    let reward_cert_crc32 = write_exact_reward_certificate(
         &reward_cert_path,
         &dataset_path,
         TimingCertificationTier::BestEffort,
         "aiqi_warmstart_exact_jh",
         65_535,
+    );
+    write_teacher(
+        &teacher_path,
+        "mismatched-task-fingerprint",
+        &reward_cert_crc32,
     );
     let args = [
         "infotheory".to_string(),
@@ -2321,7 +2318,7 @@ fn warmstart_teacher_observation_adapter_mismatch_is_rejected() {
         Some(&teacher_path),
     );
     write_json(&spec_path, &spec_value);
-    let (spec_crc32, _) = compiled_tune_hashes(&spec_value, &dir);
+    let (_spec_crc32, _) = compiled_tune_hashes(&spec_value, &dir);
     let reward_cert_path = dir.join("exact_reward.json");
     let reward_cert_crc32 = write_exact_reward_certificate(
         &reward_cert_path,
@@ -2330,16 +2327,7 @@ fn warmstart_teacher_observation_adapter_mismatch_is_rejected() {
         "aiqi_warmstart_exact_jh",
         65_535,
     );
-    let task_fingerprint = warmstart_task_fingerprint(
-        &spec_crc32,
-        &dataset_path,
-        "aiqi_warmstart_exact_jh",
-        &reward_cert_crc32,
-    );
-    write_teacher(&teacher_path, &task_fingerprint, &reward_cert_crc32, 65_535);
-    let mut teacher = read_json(&teacher_path);
-    teacher["contract"]["observation_adapter_content_crc32"] = json!("00000000");
-    write_json(&teacher_path, &teacher);
+    write_teacher(&teacher_path, "probe", "probe");
     let args = [
         "infotheory".to_string(),
         "tune".to_string(),
@@ -2351,6 +2339,12 @@ fn warmstart_teacher_observation_adapter_mismatch_is_rejected() {
         "--exact-reward-encoding-certificate".to_string(),
         path_string(&reward_cert_path),
     ];
+    let task_fingerprint =
+        derive_runtime_warmstart_task_fingerprint(&args, &teacher_path, &reward_cert_crc32);
+    write_teacher(&teacher_path, &task_fingerprint, &reward_cert_crc32);
+    let mut teacher = read_json(&teacher_path);
+    teacher["contract"]["observation_adapter_content_crc32"] = json!("00000000");
+    write_json(&teacher_path, &teacher);
     let request = parse_tune_command_args(&args).expect("parse tune args");
     let err = run_tune(&request).expect_err("observation adapter mismatch must fail");
     assert!(err.contains("observation adapter fingerprint"), "{err}");
@@ -2379,7 +2373,7 @@ fn warmstart_exact_jh_rejects_nonidentity_finite_reward_map() {
         Some(&teacher_path),
     );
     write_json(&spec_path, &spec_value);
-    let (spec_crc32, baseline_candidate_crc32) = compiled_tune_hashes(&spec_value, &dir);
+    let (_spec_crc32, baseline_candidate_crc32) = compiled_tune_hashes(&spec_value, &dir);
     let document = SpecDocument::parse_json_value(&spec_value, &dir).expect("parse tune spec");
     let SpecDocument::Tune(tune) = document else {
         panic!("expected tune spec");
@@ -2411,13 +2405,7 @@ fn warmstart_exact_jh_rejects_nonidentity_finite_reward_map() {
         Some(baseline_objective),
         Value::Array(reward_values),
     );
-    let task_fingerprint = warmstart_task_fingerprint(
-        &spec_crc32,
-        &dataset_path,
-        "aiqi_warmstart_exact_jh",
-        &reward_cert_crc32,
-    );
-    write_teacher(&teacher_path, &task_fingerprint, &reward_cert_crc32, 65_535);
+    write_teacher(&teacher_path, "placeholder", &reward_cert_crc32);
     let table_path = dir.join("table.json");
     write_deterministic_table(
         &table_path,

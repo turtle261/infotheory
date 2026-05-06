@@ -984,9 +984,6 @@ fn encode_interface_spec(spec: &PlannerInterfaceSpec, out: &mut Vec<u8>) {
     out.push(observation_key_mode_tag(spec.observation_key_mode));
     push_u64(out, spec.reward_bits as u64);
     push_u64(out, spec.agent_actions.get() as u64);
-    push_i64(out, spec.min_reward);
-    push_i64(out, spec.max_reward);
-    push_i64(out, spec.reward_offset);
 }
 
 fn decode_interface_spec(cursor: &mut Cursor<'_>) -> SpecResult<PlannerInterfaceSpec> {
@@ -1003,9 +1000,6 @@ fn decode_interface_spec(cursor: &mut Cursor<'_>) -> SpecResult<PlannerInterface
         observation_key_mode,
         reward_bits,
         agent_actions,
-        min_reward: cursor.read_i64()?,
-        max_reward: cursor.read_i64()?,
-        reward_offset: cursor.read_i64()?,
     })
 }
 

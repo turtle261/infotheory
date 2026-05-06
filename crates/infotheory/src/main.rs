@@ -50,10 +50,6 @@ use infotheory::aixi::vm_nyx::{
 #[cfg(feature = "vm")]
 use infotheory::aixi::vm_nyx::{NyxVmConfig, NyxVmEnvironment};
 use infotheory::aixi::warmstart::{WarmStartExactJhAgent, WarmStartExactJhTeacherDataset};
-use infotheory::aixi::warmstart_contract::{
-    WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION, observation_key_mode_name,
-    warmstart_exact_jh_planner_task_fingerprint,
-};
 use infotheory::api::*;
 #[cfg(feature = "backend-mamba")]
 use infotheory::mambazip;
@@ -422,7 +418,7 @@ impl PlannerExecutionContext {
             observation_bits: compiled.interface().observation_bits,
             observation_stream_len: compiled.interface().observation_stream_len,
             reward_bits: compiled.interface().reward_bits,
-            reward_offset: compiled.interface().reward_offset,
+            reward_offset: 0,
             agent_actions: compiled.interface().agent_actions,
             trace_logger: AixiRunLogger::new(cli_overlay)?,
             env,
@@ -655,62 +651,11 @@ fn validate_warmstart_exact_jh_teacher_contract(
     compiled: &CompiledPlannerRunSpec,
     teacher: &WarmStartExactJhTeacherDataset,
 ) -> anyhow::Result<()> {
-    let contract = &teacher.contract;
-    if contract.schema_version != WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION {
-        return Err(anyhow::anyhow!(
-            "warm-start teacher schema_version must be {}",
-            WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION
-        ));
-    }
-    let task_fingerprint =
-        warmstart_exact_jh_planner_task_fingerprint(compiled).map_err(anyhow::Error::new)?;
-    if contract.task_fingerprint != task_fingerprint {
-        return Err(anyhow::anyhow!(
-            "warm-start teacher task_fingerprint '{}' does not match current planner_run '{}'",
-            contract.task_fingerprint,
-            task_fingerprint
-        ));
-    }
-    let interface = compiled.interface();
-    let (return_horizon, label_phase_period, planner_simulations_per_step) =
-        match compiled.controller() {
-            CompiledPlannerController::AiqiWarmstartExactJh {
-                return_horizon,
-                label_phase_period,
-                planner_simulations_per_step,
-                ..
-            } => (
-                *return_horizon,
-                *label_phase_period,
-                *planner_simulations_per_step,
-            ),
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "warm-start teacher contract can only be validated for aiqi_warmstart_exact_jh"
-                ));
-            }
-        };
-    if contract.action_alphabet_size != interface.agent_actions.get()
-        || contract.observation_bits != interface.observation_bits
-        || contract.observation_stream_len != interface.observation_stream_len.max(1)
-        || contract.observation_key_mode
-            != observation_key_mode_name(interface.observation_key_mode)
-        || contract.reward_bits != interface.reward_bits
-        || contract.min_reward != interface.min_reward
-        || contract.max_reward != interface.max_reward
-        || contract.return_horizon != return_horizon
-        || contract.label_phase_period != label_phase_period
-    {
-        return Err(anyhow::anyhow!(
-            "warm-start teacher planner interface fingerprint does not match compiled planner_run"
-        ));
-    }
-    if planner_simulations_per_step == 0 {
-        return Err(anyhow::anyhow!(
-            "compiled warm-start planner_simulations_per_step must be >= 1"
-        ));
-    }
-    Ok(())
+    infotheory::aixi::warmstart::validate_warmstart_teacher_against_compiled_planner_run(
+        compiled,
+        &teacher.contract,
+    )
+    .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 fn controller_backend_label(controller: &CompiledPlannerController) -> String {
@@ -1789,6 +1734,11 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infotheory::aixi::warmstart_contract::{
+        WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF,
+        WARMSTART_STANDALONE_SCALAR_REPRESENTATION, standalone_teacher_provenance_crc32_pair,
+        warmstart_exact_jh_planner_task_fingerprint,
+    };
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1829,10 +1779,7 @@ mod tests {
                     "observation_stream_len": 1,
                     "observation_key_mode": "full_stream",
                     "reward_bits": 4,
-                    "agent_actions": action_alphabet(2).get(),
-                    "min_reward": -1,
-                    "max_reward": 1,
-                    "reward_offset": 1
+                    "agent_actions": action_alphabet(2).get()
                 },
                 "controller": {
                     "kind": "aiqi_discounted",
@@ -1886,10 +1833,7 @@ mod tests {
                     "observation_stream_len": 1,
                     "observation_key_mode": "full_stream",
                     "reward_bits": 2,
-                    "agent_actions": action_alphabet(2).get(),
-                    "min_reward": 0,
-                    "max_reward": 3,
-                    "reward_offset": 0
+                    "agent_actions": action_alphabet(2).get()
                 },
                 "controller": {
                     "kind": "aiqi_warmstart_exact_jh",
@@ -1931,8 +1875,15 @@ mod tests {
         task_fingerprint: &str,
         action_alphabet_size: usize,
         observation_bits: usize,
-        max_reward: i64,
     ) {
+        let reward_bits: usize = 2;
+        let observation_stream_len: usize = 1;
+        let (adapter_crc, reward_cert) = standalone_teacher_provenance_crc32_pair(
+            observation_bits,
+            observation_stream_len,
+            reward_bits,
+        )
+        .expect("standalone teacher provenance crc pair");
         std::fs::write(
             path,
             serde_json::to_vec(&json!({
@@ -1941,17 +1892,15 @@ mod tests {
                     "task_fingerprint": task_fingerprint,
                     "action_alphabet_size": action_alphabet_size,
                     "observation_bits": observation_bits,
-                    "observation_stream_len": 1,
+                    "observation_stream_len": observation_stream_len,
                     "observation_key_mode": "full_stream",
-                    "observation_adapter_spec_ref": "standalone-planner-run",
-                    "observation_adapter_content_crc32": "standalone-planner-run",
-                    "reward_bits": 2,
-                    "min_reward": 0,
-                    "max_reward": max_reward,
+                    "observation_adapter_spec_ref": WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF,
+                    "observation_adapter_content_crc32": adapter_crc,
+                    "reward_bits": reward_bits,
                     "return_horizon": 1,
                     "label_phase_period": 1,
-                    "scalar_representation": "standalone-planner-run",
-                    "exact_reward_encoding_certificate": "standalone-planner-run"
+                    "scalar_representation": WARMSTART_STANDALONE_SCALAR_REPRESENTATION,
+                    "exact_reward_encoding_certificate": reward_cert
                 },
                 "traces": [{
                     "transitions": [
@@ -1962,6 +1911,22 @@ mod tests {
             .expect("serialize warmstart teacher"),
         )
         .expect("write warmstart teacher");
+    }
+
+    /// Mutate one `contract` string field in an on-disk warm-start teacher JSON file.
+    #[cfg(feature = "backend-ctw")]
+    fn mutate_warmstart_teacher_contract_field(path: &Path, field: &str, wrong: &str) {
+        let bytes = std::fs::read(path).expect("read warmstart teacher");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse warmstart teacher json");
+        let contract = doc
+            .as_object_mut()
+            .and_then(|root| root.get_mut("contract"))
+            .and_then(|c| c.as_object_mut())
+            .expect("teacher.contract object");
+        contract.insert(field.to_string(), json!(wrong));
+        std::fs::write(path, serde_json::to_vec(&doc).expect("serialize teacher"))
+            .expect("write warmstart teacher");
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -2073,7 +2038,7 @@ mod tests {
         let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
         let task_fingerprint =
             warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
-        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2, 3);
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
 
         let teacher = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
             .expect("matching teacher contract must load");
@@ -2088,7 +2053,7 @@ mod tests {
     fn warmstart_teacher_loader_rejects_mismatched_task_fingerprint() {
         let teacher_path = unique_temp_path("warmstart-teacher-task-mismatch", ".json");
         let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
-        write_warmstart_teacher(&teacher_path, "different-task", 2, 2, 3);
+        write_warmstart_teacher(&teacher_path, "different-task", 2, 2);
 
         let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
             .expect_err("mismatched teacher task must fail");
@@ -2099,20 +2064,107 @@ mod tests {
 
     #[cfg(feature = "backend-ctw")]
     #[test]
-    fn warmstart_teacher_loader_rejects_interface_compatible_symbol_range_mismatch() {
+    fn warmstart_teacher_loader_rejects_action_alphabet_mismatch() {
         let teacher_path = unique_temp_path("warmstart-teacher-interface-mismatch", ".json");
         let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
         let task_fingerprint =
             warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
-        write_warmstart_teacher(&teacher_path, &task_fingerprint, 3, 2, 3);
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 3, 2);
 
         let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
-            .expect_err("same-range but mismatched action alphabet must fail");
+            .expect_err("mismatched action alphabet must fail");
         assert!(
             err.to_string().contains("planner interface fingerprint"),
             "{err}"
         );
 
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_observation_adapter_spec_ref_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-adapter-ref", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
+        mutate_warmstart_teacher_contract_field(
+            &teacher_path,
+            "observation_adapter_spec_ref",
+            "wrong-adapter-ref",
+        );
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("adapter spec ref mismatch must fail");
+        assert!(
+            err.to_string().contains("observation_adapter_spec_ref"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_observation_adapter_content_crc32_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-adapter-crc", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
+        mutate_warmstart_teacher_contract_field(
+            &teacher_path,
+            "observation_adapter_content_crc32",
+            "deadbeef",
+        );
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("adapter crc mismatch must fail");
+        assert!(
+            err.to_string()
+                .contains("observation_adapter_content_crc32"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_scalar_representation_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-scalar", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
+        mutate_warmstart_teacher_contract_field(
+            &teacher_path,
+            "scalar_representation",
+            "wrong-scalar",
+        );
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("scalar representation mismatch must fail");
+        assert!(err.to_string().contains("scalar_representation"), "{err}");
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_exact_reward_encoding_certificate_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-cert", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
+        mutate_warmstart_teacher_contract_field(
+            &teacher_path,
+            "exact_reward_encoding_certificate",
+            "wrong-cert",
+        );
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("reward certificate mismatch must fail");
+        assert!(
+            err.to_string()
+                .contains("exact_reward_encoding_certificate"),
+            "{err}"
+        );
         let _ = std::fs::remove_file(teacher_path);
     }
 
@@ -3036,10 +3088,7 @@ mod tests {
                 "observation_stream_len": 1,
                 "observation_key_mode": "full_stream",
                 "reward_bits": 1,
-                "agent_actions": 2,
-                "min_reward": 0,
-                "max_reward": 1,
-                "reward_offset": 0
+                "agent_actions": 2
             },
             "controller": {
                 "kind": "mc_aixi",
@@ -3080,7 +3129,7 @@ mod tests {
 
     #[cfg(all(feature = "backend-ctw", feature = "aixi-gameengine"))]
     #[test]
-    fn run_aixi_mode_rejects_unrepresentable_reward_ranges_in_canonical_specs() {
+    fn run_aixi_mode_rejects_legacy_interface_reward_range_fields() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let nanos = SystemTime::now()
@@ -3091,7 +3140,7 @@ mod tests {
             "infotheory-planner-run-invalid-reward-{}-{nanos}.json",
             std::process::id()
         ));
-        let doc_value = json!({
+        let legacy_doc = json!({
             "schema_version": 1,
             "kind": "planner_run",
             "assets": [],
@@ -3135,14 +3184,19 @@ mod tests {
                 "explore_gamma": 1.0
             }
         });
-        let doc = infotheory::spec::SpecDocument::parse_json_value(&doc_value, Path::new("."))
-            .expect("canonical planner document");
-        std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
-            .expect("write temp planner spec");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy_doc).expect("legacy planner json"),
+        )
+        .expect("write temp planner spec");
 
         let err = run_aixi_mode(path.to_str().expect("utf8 path"))
-            .expect_err("invalid reward interface should be rejected");
-        assert!(err.to_string().contains("reward_bits too small"), "{err}");
+            .expect_err("legacy interface reward range fields should be rejected");
+        assert!(
+            err.to_string()
+                .contains("unknown interface field 'min_reward'"),
+            "{err}"
+        );
 
         let _ = std::fs::remove_file(path);
     }

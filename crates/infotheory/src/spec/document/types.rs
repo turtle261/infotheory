@@ -325,12 +325,6 @@ pub struct PlannerInterfaceSpec {
     pub reward_bits: usize,
     /// Action alphabet cardinality.
     pub agent_actions: ActionAlphabet,
-    /// Minimum instantaneous reward.
-    pub min_reward: i64,
-    /// Maximum instantaneous reward.
-    pub max_reward: i64,
-    /// Reward offset used for unsigned encoding.
-    pub reward_offset: i64,
 }
 
 /// Canonical tuning interface contract for planner-visible I/O shape.

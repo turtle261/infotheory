@@ -287,6 +287,45 @@ pub(crate) fn validate_reward_encoding_bounds(
     Ok(())
 }
 
+/// Maximum nonnegative instantaneous reward representable in `reward_bits` channel bits.
+///
+/// For `reward_bits >= 63` this returns [`i64::MAX`] (closed interval policy shared with
+/// [`validate_reward_encoding_bounds`] for wide channels).
+///
+/// Callers that require a strict positive width must use [`max_nonnegative_reward_for_bits`].
+fn max_channel_reward_for_bits(reward_bits: usize) -> Reward {
+    if reward_bits >= 63 {
+        i64::MAX
+    } else {
+        ((1u64 << reward_bits) - 1) as i64
+    }
+}
+
+/// Maximum nonnegative instantaneous reward for a validated planner reward channel.
+///
+/// Returns an error when `reward_bits == 0` (degenerate channel); planner specs require
+/// `reward_bits >= 1` after canonicalization.
+///
+/// Used by the `tuner` feature (reward certificates); default builds omit callers.
+#[cfg_attr(not(feature = "tuner"), allow(dead_code))]
+pub(crate) fn max_nonnegative_reward_for_bits(reward_bits: usize) -> Result<Reward, &'static str> {
+    if reward_bits == 0 {
+        return Err("reward_bits must be >= 1");
+    }
+    Ok(max_channel_reward_for_bits(reward_bits))
+}
+
+/// Derive canonical nonnegative reward-encoding bounds from reward bit width.
+///
+/// This helper is used by programmatic AIXI/AIQI/warmstart constructors now
+/// that planner-interface v1 no longer carries explicit `min/max/offset`.
+///
+/// For `reward_bits == 0`, the degenerate channel encodes only the value `0`.
+#[cfg(feature = "aixi")]
+pub(crate) fn nonnegative_reward_encoding_bounds(reward_bits: usize) -> (Reward, Reward, Reward) {
+    (0, max_channel_reward_for_bits(reward_bits), 0)
+}
+
 /// Compute a percept key from an observation stream.
 pub fn observation_key_from_stream(
     mode: ObservationKeyMode,
@@ -608,6 +647,38 @@ mod tests {
             err,
             RewardEncodingError::RewardBitsTooSmall { .. }
         ));
+    }
+
+    #[test]
+    fn max_nonnegative_reward_for_bits_rejects_zero_width() {
+        assert_eq!(
+            max_nonnegative_reward_for_bits(0).expect_err("zero bits"),
+            "reward_bits must be >= 1"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "aixi")]
+    fn max_nonnegative_reward_for_bits_agrees_with_nonnegative_reward_encoding_bounds() {
+        for reward_bits in [1usize, 8, 62, 63] {
+            let max_ch = max_nonnegative_reward_for_bits(reward_bits).expect("valid bits");
+            let (_min, max_r, _off) = nonnegative_reward_encoding_bounds(reward_bits);
+            assert_eq!(max_ch, max_r, "reward_bits={reward_bits}");
+        }
+        let wide = max_nonnegative_reward_for_bits(64).expect("wide channel");
+        assert_eq!(wide, i64::MAX);
+        assert_eq!(nonnegative_reward_encoding_bounds(64).1, i64::MAX);
+    }
+
+    #[test]
+    fn max_nonnegative_reward_for_bits_boundary_powers() {
+        assert_eq!(max_nonnegative_reward_for_bits(1).unwrap(), 1);
+        assert_eq!(max_nonnegative_reward_for_bits(2).unwrap(), 3);
+        assert_eq!(
+            max_nonnegative_reward_for_bits(62).unwrap(),
+            (1i64 << 62) - 1
+        );
+        assert_eq!(max_nonnegative_reward_for_bits(63).unwrap(), i64::MAX);
     }
 
     #[test]

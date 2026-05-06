@@ -38,6 +38,7 @@ mod config;
 mod eval;
 mod planner_bridge;
 mod report;
+use crate::aixi::common::max_nonnegative_reward_for_bits;
 use annealer::{
     annealer_acceptance_probability, annealer_active_radius, annealer_progress,
     annealer_runtime_path_name, annealer_temperature, collect_numeric_leaves,
@@ -64,8 +65,8 @@ use planner_bridge::{
     validate_theorem_planner_mutation_domain, warmstart_trace_key,
 };
 use planner_bridge::{
-    exact_nonnegative_i64_from_f64, key_less, max_nonnegative_reward_for_bits,
-    normalized_clipped_improvement, run_planner_family_controller,
+    exact_nonnegative_i64_from_f64, key_less, normalized_clipped_improvement,
+    run_planner_family_controller,
 };
 #[cfg(test)]
 use report::exact_finite_mdp_missing_prereqs;
@@ -716,19 +717,11 @@ impl TunerRewardEncoder {
         })
     }
 
-    fn min_reward(&self) -> Reward {
-        0
-    }
-
     fn max_reward(&self) -> Reward {
         match self {
             Self::ExactIntegerObjectiveDifference { max_reward, .. }
             | Self::NormalizedClipped { max_reward, .. } => *max_reward,
         }
-    }
-
-    fn reward_offset(&self) -> Reward {
-        0
     }
 
     fn encode(&self, raw_improvement: f64) -> Result<Reward, String> {

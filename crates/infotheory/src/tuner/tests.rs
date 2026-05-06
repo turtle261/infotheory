@@ -260,6 +260,93 @@ fn synthesized_planner_bridge_inherits_tune_spec_environment() {
 }
 
 #[cfg(feature = "backend-ctw")]
+#[test]
+fn tuner_warmstart_task_fingerprint_binds_input_dataset_content_not_teacher_bytes() {
+    let base_dir = temp_path("warmstart-fingerprint", "");
+    std::fs::create_dir_all(&base_dir).expect("create base dir");
+    let dataset_path = base_dir.join("dataset.bin");
+    let teacher_path = base_dir.join("teacher.json");
+    std::fs::write(&dataset_path, b"dataset-v1").expect("write dataset v1");
+    std::fs::write(&teacher_path, b"teacher-v1").expect("write teacher v1");
+
+    let output_path = base_dir.join("best.json");
+    let report_path = base_dir.join("report.json");
+    let mut spec = sample_tune_spec(
+        "dataset.bin",
+        &output_path.to_string_lossy(),
+        &report_path.to_string_lossy(),
+    );
+    spec.assets.push(AssetBinding {
+        id: "teacher".to_string(),
+        path: "teacher.json".to_string(),
+    });
+    let interface = TunePlannerInterfaceSpec {
+        observation_bits: 8,
+        observation_stream_len: 1,
+        observation_key_mode: ObservationKeyMode::FullStream,
+        reward_bits: 8,
+        agent_actions: action_alphabet(1),
+    };
+    spec.controller =
+        TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
+            interface: interface.clone(),
+            planner_simulations_per_step: 1,
+            return_horizon: 1,
+            warmstart_teacher_dataset_asset: "teacher".to_string(),
+            label_phase_period: 1,
+        });
+
+    let env = SpecEnvironment::new(&base_dir);
+    let compiled = spec.compile_in(&env).expect("compile tune spec");
+    let contract = PlannerControllerContract {
+        interface,
+        planner_simulations_per_step: 1,
+        return_horizon: Some(1),
+        label_phase_period: Some(1),
+        discount_factor: 1.0,
+        reward_semantics: PlannerRewardSemantics::ExactObjectiveDifference,
+        clipping_interval: None,
+        teacher: None,
+        warmstart_self_improvement: true,
+    };
+    let reward_encoder = TunerRewardEncoder::ExactIntegerObjectiveDifference {
+        max_reward: 3,
+        objective_difference_to_symbol: None,
+    };
+    let planner_run = compile_tuner_planner_run_spec(
+        compiled.controller(),
+        &contract,
+        &reward_encoder,
+        &compiled,
+        &env,
+    )
+    .expect("compile warmstart bridge");
+    let fingerprint_v1 =
+        crate::aixi::warmstart_contract::warmstart_exact_jh_planner_task_fingerprint(&planner_run)
+            .expect("fingerprint v1");
+
+    std::fs::write(&teacher_path, b"teacher-v2").expect("write teacher v2");
+    let fingerprint_after_teacher_change =
+        crate::aixi::warmstart_contract::warmstart_exact_jh_planner_task_fingerprint(&planner_run)
+            .expect("fingerprint after teacher change");
+    assert_eq!(
+        fingerprint_v1, fingerprint_after_teacher_change,
+        "teacher dataset bytes are intentionally excluded to avoid a circular task fingerprint"
+    );
+
+    std::fs::write(&dataset_path, b"dataset-v2").expect("write dataset v2");
+    let fingerprint_v2 =
+        crate::aixi::warmstart_contract::warmstart_exact_jh_planner_task_fingerprint(&planner_run)
+            .expect("fingerprint v2");
+    assert_ne!(
+        fingerprint_v1, fingerprint_v2,
+        "same-path input dataset byte changes must invalidate same-task warm-start teachers"
+    );
+
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[cfg(feature = "backend-ctw")]
 fn write_test_exact_reward_certificate(
     path: &std::path::Path,
     dataset_path: &std::path::Path,
@@ -2219,9 +2306,6 @@ fn exact_state_observation_projection_supports_stream_hash() {
         observation_stream_len: 2,
         observation_key_mode: ObservationKeyMode::StreamHash,
         reward_bits: 16,
-        min_reward: 0,
-        max_reward: 10,
-        reward_offset: 0,
         agent_actions: action_alphabet(2),
     };
     let projected = project_observation_output("stream_hash", &[9, 2], interface.observation_bits)

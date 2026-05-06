@@ -9,7 +9,8 @@
 
 use crate::aixi::common::{
     Action, ActionAlphabet, PerceptVal, RandomGenerator, Reward, RewardEncodingError,
-    bits_for_cardinality, resolve_random_seed, validate_reward_encoding_bounds,
+    bits_for_cardinality, nonnegative_reward_encoding_bounds, resolve_random_seed,
+    validate_reward_encoding_bounds,
 };
 use crate::aixi::model::{Predictor, PredictorBuildError, build_aiqi_predictor};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
@@ -329,9 +330,6 @@ impl AiqiConfig {
                 observation_key_mode: crate::aixi::common::ObservationKeyMode::FullStream,
                 reward_bits: self.reward_bits,
                 agent_actions: self.agent_actions,
-                min_reward: self.min_reward,
-                max_reward: self.max_reward,
-                reward_offset: self.reward_offset,
             },
             ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
                 predictor,
@@ -461,14 +459,16 @@ impl AiqiRuntimeConfig {
             _ => return Err(AiqiError::ControllerKindMismatch),
         };
 
+        let (min_reward, max_reward, reward_offset) =
+            nonnegative_reward_encoding_bounds(interface.reward_bits);
         Ok(Self {
             observation_bits: interface.observation_bits,
             observation_stream_len: interface.observation_stream_len.max(1),
             reward_bits: interface.reward_bits,
             agent_actions: interface.agent_actions,
-            min_reward: interface.min_reward,
-            max_reward: interface.max_reward,
-            reward_offset: interface.reward_offset,
+            min_reward,
+            max_reward,
+            reward_offset,
             discount_gamma,
             return_horizon,
             return_bins,

@@ -93,9 +93,6 @@ fn sample_planner_run() -> PlannerRunSpec {
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 1,
             agent_actions: action_alphabet(2),
-            min_reward: 0,
-            max_reward: 1,
-            reward_offset: 0,
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
@@ -1027,9 +1024,6 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
         observation_key_mode: ObservationKeyMode::StreamHash,
         reward_bits: 2,
         agent_actions: action_alphabet(3),
-        min_reward: 0,
-        max_reward: 3,
-        reward_offset: 0,
     };
     let tune_interface = TunePlannerInterfaceSpec {
         observation_bits: 2,
@@ -1349,17 +1343,41 @@ fn planner_run_compile_exposes_compiled_predictor_and_action_bits() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
-fn planner_run_compile_rejects_unrepresentable_reward_ranges() {
-    let mut spec = sample_planner_run();
-    spec.interface.reward_bits = 1;
-    spec.interface.min_reward = 0;
-    spec.interface.max_reward = 100;
-    spec.interface.reward_offset = 0;
-    let err = match spec.compile() {
-        Ok(_) => panic!("unrepresentable rewards must fail"),
+fn planner_run_parser_rejects_legacy_shared_interface_reward_fields() {
+    let err = match SpecDocument::parse_json_value(
+        &serde_json::json!({
+            "schema_version": 1,
+            "kind": "planner_run",
+            "assets": [],
+            "environment": {
+                "kind": "builtin",
+                "name": "coin_flip"
+            },
+            "interface": {
+                "observation_bits": 1,
+                "observation_stream_len": 1,
+                "observation_key_mode": "full_stream",
+                "reward_bits": 1,
+                "agent_actions": 2,
+                "min_reward": 0
+            },
+            "controller": {
+                "kind": "aiqi_discounted",
+                "predictor": {"kind":"ctw","depth":8},
+                "discount_gamma": 0.99,
+                "return_horizon": 2,
+                "return_bins": 8,
+                "augmentation_period": 2,
+                "baseline_exploration": 0.01
+            },
+            "runtime": {}
+        }),
+        std::path::Path::new("."),
+    ) {
+        Ok(_) => panic!("legacy interface reward fields must be rejected"),
         Err(err) => err,
     };
-    assert!(err.to_string().contains("reward_bits too small"), "{err}");
+    assert!(err.to_string().contains("unknown interface field"), "{err}");
 }
 
 #[cfg(all(feature = "backend-ctw", feature = "backend-zpaq"))]
@@ -1464,9 +1482,6 @@ fn sample_vm_planner_run() -> PlannerRunSpec {
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 8,
             agent_actions: action_alphabet(1),
-            min_reward: 0,
-            max_reward: 255,
-            reward_offset: 0,
         },
         controller: ControllerSpec::McAixi(McAixiControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
@@ -1663,9 +1678,6 @@ fn planner_run_validation_reports_missing_backend_feature() {
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 1,
             agent_actions: action_alphabet(2),
-            min_reward: 0,
-            max_reward: 1,
-            reward_offset: 0,
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },

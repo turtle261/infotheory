@@ -37,6 +37,13 @@ pub(super) fn run_planner_family_controller(
         compiled,
         &SpecEnvironment::new(compiled.base_dir()),
     )?;
+    if let Some(teacher) = &contract.teacher {
+        crate::aixi::warmstart::validate_warmstart_teacher_planner_task_fingerprint(
+            &planner_run,
+            &teacher.traces.contract,
+        )
+        .map_err(|err| err.to_string())?;
+    }
     let mut agent_runtime = build_tuner_planner_agent_runtime(
         compiled.controller(),
         &planner_run,
@@ -380,7 +387,7 @@ pub(super) fn run_planner_family_controller(
 pub(super) fn planner_controller_contract(
     controller: &crate::spec::CompiledTuneController,
     compiled: &crate::spec::CompiledTuneSpec,
-    dataset: &LoadedDataset,
+    _dataset: &LoadedDataset,
     verified_theorem: &VerifiedTheoremInputs,
 ) -> Result<PlannerControllerContract, String> {
     match controller {
@@ -427,7 +434,6 @@ pub(super) fn planner_controller_contract(
             }
             let teacher = load_warmstart_teacher_dataset(
                 compiled,
-                dataset,
                 verified_theorem,
                 &inner.warmstart_teacher_dataset_asset,
                 &inner.interface,
@@ -454,7 +460,6 @@ pub(super) fn planner_controller_contract(
 
 fn load_warmstart_teacher_dataset(
     compiled: &crate::spec::CompiledTuneSpec,
-    dataset: &LoadedDataset,
     verified_theorem: &VerifiedTheoremInputs,
     asset_id: &str,
     interface: &crate::spec::TunePlannerInterfaceSpec,
@@ -482,8 +487,6 @@ fn load_warmstart_teacher_dataset(
     let traces = WarmStartExactJhTeacherDataset::from_json_slice(&bytes)
         .map_err(|err| format!("invalid warmstart_teacher_dataset_asset: {err}"))?;
     validate_warmstart_teacher_contract(
-        compiled,
-        dataset,
         verified_theorem,
         interface,
         return_horizon,
@@ -505,8 +508,6 @@ fn load_warmstart_teacher_dataset(
 }
 
 pub(super) fn validate_warmstart_teacher_contract(
-    compiled: &crate::spec::CompiledTuneSpec,
-    dataset: &LoadedDataset,
     verified_theorem: &VerifiedTheoremInputs,
     interface: &crate::spec::TunePlannerInterfaceSpec,
     return_horizon: usize,
@@ -516,13 +517,6 @@ pub(super) fn validate_warmstart_teacher_contract(
     let contract = &teacher.contract;
     if contract.schema_version != 1 {
         return Err("warmstart teacher schema_version must be 1".to_string());
-    }
-    let task_fingerprint = warmstart_task_fingerprint(compiled, dataset, verified_theorem)?;
-    if contract.task_fingerprint != task_fingerprint {
-        return Err(format!(
-            "warmstart teacher task_fingerprint '{}' does not match current task '{}'",
-            contract.task_fingerprint, task_fingerprint
-        ));
     }
     if contract.action_alphabet_size != interface.agent_actions.get()
         || contract.observation_bits != interface.observation_bits
@@ -554,37 +548,12 @@ pub(super) fn validate_warmstart_teacher_contract(
         .ok_or_else(|| {
             "warmstart exact-J_H requires a verified exact_reward_encoding_certificate".to_string()
         })?;
-    if contract.min_reward != 0
-        || contract.max_reward != reward_cert.max_reward
-        || contract.scalar_representation != reward_cert.scalar_representation
+    if contract.scalar_representation != reward_cert.scalar_representation
         || contract.exact_reward_encoding_certificate != reward_cert.base.content_hash
     {
         return Err("warmstart teacher reward/scalar fingerprint does not match verified exact reward encoder".to_string());
     }
     Ok(())
-}
-
-fn warmstart_task_fingerprint(
-    compiled: &crate::spec::CompiledTuneSpec,
-    dataset: &LoadedDataset,
-    verified_theorem: &VerifiedTheoremInputs,
-) -> Result<String, String> {
-    let reward_hash = verified_theorem
-        .exact_reward_encoding
-        .as_ref()
-        .map(|cert| cert.base.content_hash.as_str())
-        .unwrap_or("unverified");
-    let payload = serde_json::json!({
-        "tune_canonical_crc32": crc32_hex(compiled.canonical_bytes().as_slice()),
-        "dataset_crc32": dataset.canonical_content_hash,
-        "dataset_kind": dataset_kind_name(dataset.kind),
-        "bounds_crc32": bounds_hash(&compiled.canonical_spec().bounds)?,
-        "controller_kind": controller_kind_name(compiled.controller()),
-        "reward_certificate_crc32": reward_hash,
-    });
-    serde_json::to_vec(&payload)
-        .map(|bytes| crc32_hex(&bytes))
-        .map_err(|err| format!("failed to encode warmstart task fingerprint: {err}"))
 }
 
 fn compile_planner_mutation_actions(
@@ -758,9 +727,6 @@ pub(super) fn compile_tuner_planner_run_spec(
         observation_key_mode: contract.interface.observation_key_mode,
         reward_bits: contract.interface.reward_bits,
         agent_actions: contract.interface.agent_actions,
-        min_reward: reward_encoder.min_reward(),
-        max_reward: reward_encoder.max_reward(),
-        reward_offset: reward_encoder.reward_offset(),
     };
     let percept_bits = interface
         .observation_bits
@@ -1077,17 +1043,6 @@ fn crc32_u32(bytes: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(bytes);
     hasher.finalize()
-}
-
-pub(super) fn max_nonnegative_reward_for_bits(reward_bits: usize) -> Result<Reward, String> {
-    if reward_bits == 0 {
-        return Err("reward_bits must be >= 1".to_string());
-    }
-    if reward_bits >= 63 {
-        Ok(Reward::MAX)
-    } else {
-        Ok(((1u64 << reward_bits) - 1) as Reward)
-    }
 }
 
 pub(super) fn exact_nonnegative_i64_from_f64(value: f64, label: &str) -> Result<Reward, String> {

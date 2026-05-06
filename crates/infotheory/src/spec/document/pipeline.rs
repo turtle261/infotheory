@@ -11,8 +11,7 @@ use super::{
     TuneBoundsSpec, TuneControllerSpec, TunePlannerInterfaceSpec, TuneSpec, ValidatedTuneSpec,
 };
 use crate::aixi::common::{
-    MctsStrategy, bits_for_cardinality, resolve_random_seed, validate_reward_encoding_bounds,
-    warn_parallel_uct_workers_one_once,
+    MctsStrategy, bits_for_cardinality, resolve_random_seed, warn_parallel_uct_workers_one_once,
 };
 use crate::spec::core::AssetRef;
 use std::collections::HashMap;
@@ -351,13 +350,6 @@ fn canonicalize_interface_spec(spec: &PlannerInterfaceSpec) -> SpecResult<Planne
     if spec.reward_bits == 0 {
         return Err(SpecError::new("reward_bits must be >= 1"));
     }
-    validate_reward_encoding_bounds(
-        spec.min_reward,
-        spec.max_reward,
-        spec.reward_offset,
-        spec.reward_bits,
-    )
-    .map_err(|err| SpecError::new(err.to_string()))?;
     Ok(spec.clone())
 }
 
@@ -720,9 +712,6 @@ mod tests {
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 8,
             agent_actions: action_alphabet(2),
-            min_reward: 0,
-            max_reward: 1,
-            reward_offset: 0,
         }
     }
 

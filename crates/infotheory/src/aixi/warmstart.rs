@@ -7,13 +7,15 @@ use crate::aixi::common::{
 use crate::aixi::model::{Predictor, PredictorBuildError, build_aiqi_predictor};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
 use crate::aixi::warmstart_contract::{
+    WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF, WARMSTART_STANDALONE_SCALAR_REPRESENTATION,
     WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION, observation_key_mode_name,
-    warmstart_exact_jh_planner_task_fingerprint,
+    standalone_exact_reward_encoding_certificate_hash,
+    standalone_observation_adapter_content_crc32, warmstart_exact_jh_planner_task_fingerprint,
 };
 use crate::api::{RateBackend, validate_rate_backend};
 use crate::spec::{
-    CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec, PlannerRunSpec, SpecError,
-    WarmStartExactJhControllerSpec,
+    BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec,
+    EnvironmentSpec, PlannerRunSpec, SpecError, WarmStartExactJhControllerSpec,
 };
 use serde_json::Value;
 use std::error::Error;
@@ -37,6 +39,144 @@ pub struct WarmStartExactJhTransition {
 pub struct WarmStartExactJhTeacherTrace {
     /// Chronological transition sequence.
     pub transitions: Vec<WarmStartExactJhTransition>,
+}
+
+/// Validates standalone planner-run provenance hashes against canonical standalone declarations.
+///
+/// Used by [`WarmStartExactJhRuntimeConfig::validate_teacher_contract`] and by
+/// [`validate_warmstart_teacher_against_compiled_planner_run`].
+pub fn validate_standalone_warmstart_provenance(
+    contract: &WarmStartExactJhTeacherContract,
+    observation_bits: usize,
+    observation_stream_len: usize,
+    reward_bits: usize,
+) -> Result<(), WarmStartExactJhError> {
+    if contract.observation_adapter_spec_ref != WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF {
+        return Err(WarmStartExactJhError::InvalidTeacherDataset {
+            reason: "teacher observation_adapter_spec_ref does not match standalone direct-percept adapter declaration".to_string(),
+        });
+    }
+    let expected_adapter_crc = standalone_observation_adapter_content_crc32(
+        observation_bits,
+        observation_stream_len,
+        reward_bits,
+    )
+    .map_err(|err| WarmStartExactJhError::InvalidTeacherDataset {
+        reason: format!("failed to compute standalone observation adapter content hash: {err}"),
+    })?;
+    if contract.observation_adapter_content_crc32 != expected_adapter_crc {
+        return Err(WarmStartExactJhError::InvalidTeacherDataset {
+            reason: "teacher observation_adapter_content_crc32 does not match canonical standalone adapter spec".to_string(),
+        });
+    }
+    if contract.scalar_representation != WARMSTART_STANDALONE_SCALAR_REPRESENTATION {
+        return Err(WarmStartExactJhError::InvalidTeacherDataset {
+            reason: "teacher scalar_representation does not match standalone nonnegative integer declaration".to_string(),
+        });
+    }
+    let expected_reward_cert = standalone_exact_reward_encoding_certificate_hash(reward_bits)
+        .map_err(|err| WarmStartExactJhError::InvalidTeacherDataset {
+            reason: format!(
+                "failed to compute standalone exact reward encoding certificate hash: {err}"
+            ),
+        })?;
+    if contract.exact_reward_encoding_certificate != expected_reward_cert {
+        return Err(WarmStartExactJhError::InvalidTeacherDataset {
+            reason: "teacher exact_reward_encoding_certificate does not match canonical standalone reward encoder certificate".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates teacher [`WarmStartExactJhTeacherContract::schema_version`] and
+/// [`WarmStartExactJhTeacherContract::task_fingerprint`] against a compiled planner run.
+///
+/// Used by [`validate_warmstart_teacher_against_compiled_planner_run`] (standalone CLI / assets)
+/// and by the tuner-bridge (`tuner/planner_bridge.rs`) once a `CompiledPlannerRunSpec` is
+/// available (after tuner-side planner-run compilation), so mismatches fail before agent construction.
+/// On mismatch the reason string includes
+/// `current planner_run '<hex>'` for stable integration-test probing.
+pub fn validate_warmstart_teacher_planner_task_fingerprint(
+    compiled: &CompiledPlannerRunSpec,
+    contract: &WarmStartExactJhTeacherContract,
+) -> Result<(), WarmStartExactJhError> {
+    if contract.schema_version != WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION {
+        return Err(WarmStartExactJhError::InvalidTeacherDataset {
+            reason: format!(
+                "teacher schema_version must be {WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION}"
+            ),
+        });
+    }
+    let task_fingerprint =
+        warmstart_exact_jh_planner_task_fingerprint(compiled).map_err(|err| {
+            WarmStartExactJhError::InvalidTeacherDataset {
+                reason: format!("failed to compute planner task fingerprint: {err}"),
+            }
+        })?;
+    if contract.task_fingerprint != task_fingerprint {
+        return Err(WarmStartExactJhError::InvalidTeacherDataset {
+            reason: format!(
+                "teacher task_fingerprint '{}' does not match current planner_run '{}'",
+                contract.task_fingerprint, task_fingerprint
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a parsed teacher contract against a compiled standalone [`PlannerRunSpec`] (CLI / asset loader).
+///
+/// This is the single authoritative check for filesystem-loaded teachers before runtime construction.
+pub fn validate_warmstart_teacher_against_compiled_planner_run(
+    compiled: &CompiledPlannerRunSpec,
+    contract: &WarmStartExactJhTeacherContract,
+) -> Result<(), WarmStartExactJhError> {
+    validate_warmstart_teacher_planner_task_fingerprint(compiled, contract)?;
+    let interface = compiled.interface();
+    let (return_horizon, label_phase_period, planner_simulations_per_step) =
+        match compiled.controller() {
+            CompiledPlannerController::AiqiWarmstartExactJh {
+                return_horizon,
+                label_phase_period,
+                planner_simulations_per_step,
+                ..
+            } => (
+                *return_horizon,
+                *label_phase_period,
+                *planner_simulations_per_step,
+            ),
+            _ => {
+                return Err(WarmStartExactJhError::InvalidTeacherDataset {
+                reason:
+                    "warm-start teacher contract can only be validated for aiqi_warmstart_exact_jh"
+                        .to_string(),
+            });
+            }
+        };
+    if contract.action_alphabet_size != interface.agent_actions.get()
+        || contract.observation_bits != interface.observation_bits
+        || contract.observation_stream_len != interface.observation_stream_len.max(1)
+        || contract.observation_key_mode
+            != observation_key_mode_name(interface.observation_key_mode)
+        || contract.reward_bits != interface.reward_bits
+        || contract.return_horizon != return_horizon
+        || contract.label_phase_period != label_phase_period
+    {
+        return Err(WarmStartExactJhError::InvalidTeacherDataset {
+            reason: "teacher planner interface fingerprint does not match compiled planner_run"
+                .to_string(),
+        });
+    }
+    validate_standalone_warmstart_provenance(
+        contract,
+        interface.observation_bits,
+        interface.observation_stream_len.max(1),
+        interface.reward_bits,
+    )?;
+    if planner_simulations_per_step == 0 {
+        return Err(WarmStartExactJhError::PlannerSimulationsZero);
+    }
+    Ok(())
 }
 
 /// Same-task teacher dataset for [`WarmStartExactJhAgent`].
@@ -71,10 +211,6 @@ pub struct WarmStartExactJhTeacherContract {
     pub observation_adapter_content_crc32: String,
     /// Reward bit width.
     pub reward_bits: usize,
-    /// Minimum exact reward accepted by the planner interface.
-    pub min_reward: Reward,
-    /// Maximum exact reward accepted by the planner interface.
-    pub max_reward: Reward,
     /// Return horizon used to compute exact labels.
     pub return_horizon: usize,
     /// Delayed-label phase period.
@@ -175,12 +311,6 @@ pub struct WarmStartExactJhConfig {
     pub reward_bits: usize,
     /// Number of valid actions.
     pub agent_actions: ActionAlphabet,
-    /// Minimum instantaneous exact reward.
-    pub min_reward: Reward,
-    /// Maximum instantaneous exact reward.
-    pub max_reward: Reward,
-    /// Offset applied before encoding instantaneous rewards.
-    pub reward_offset: Reward,
     /// Exact finite-horizon return length H.
     pub return_horizon: usize,
     /// Exact return-label alphabet cardinality.
@@ -202,9 +332,6 @@ impl Default for WarmStartExactJhConfig {
             reward_bits: 1,
             agent_actions: ActionAlphabet::try_from_usize(2)
                 .expect("default action alphabet must be non-zero"),
-            min_reward: 0,
-            max_reward: 1,
-            reward_offset: 0,
             return_horizon: 1,
             return_bins: 2,
             label_phase_period: 1,
@@ -223,9 +350,6 @@ impl WarmStartExactJhConfig {
                 observation_key_mode: crate::aixi::common::ObservationKeyMode::FullStream,
                 reward_bits: self.reward_bits,
                 agent_actions: self.agent_actions,
-                min_reward: self.min_reward,
-                max_reward: self.max_reward,
-                reward_offset: self.reward_offset,
             },
             ControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhControllerSpec {
                 predictor: self.rate_backend.clone(),
@@ -261,15 +385,14 @@ impl WarmStartExactJhConfig {
         if self.planner_simulations_per_step == 0 {
             return Err(WarmStartExactJhError::PlannerSimulationsZero);
         }
-        validate_reward_encoding_bounds(
-            self.min_reward,
-            self.max_reward,
-            self.reward_offset,
+        let (min_reward, max_reward, _reward_offset) = reward_bounds_from_exact_return_bins(
+            self.return_horizon,
+            self.return_bins,
             self.reward_bits,
         )?;
         validate_exact_return_alphabet(
-            self.min_reward,
-            self.max_reward,
+            min_reward,
+            max_reward,
             self.return_horizon,
             self.return_bins,
         )?;
@@ -310,6 +433,13 @@ struct WarmStartExactJhRuntimeConfig {
     label_phase_period: usize,
     planner_simulations_per_step: usize,
     random_seed: u64,
+    provenance_policy: TeacherProvenancePolicy,
+}
+
+#[derive(Clone, Copy)]
+enum TeacherProvenancePolicy {
+    StandalonePlannerRun,
+    ExternallyValidatedTunerBridge,
 }
 
 impl WarmStartExactJhRuntimeConfig {
@@ -320,6 +450,7 @@ impl WarmStartExactJhRuntimeConfig {
     /// fingerprint plus runtime-visible interface dimensions that must remain
     /// aligned with any warm-start dataset.
     fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, WarmStartExactJhError> {
+        let planner = compiled.canonical_spec();
         let interface = compiled.interface();
         let runtime = compiled.runtime();
         let (return_horizon, return_bins, label_phase_period, planner_simulations_per_step) =
@@ -353,18 +484,24 @@ impl WarmStartExactJhRuntimeConfig {
         if planner_simulations_per_step == 0 {
             return Err(WarmStartExactJhError::PlannerSimulationsZero);
         }
-        validate_exact_return_alphabet(
-            interface.min_reward,
-            interface.max_reward,
+        let (min_reward, max_reward, reward_offset) = reward_bounds_from_exact_return_bins(
             return_horizon,
             return_bins,
+            interface.reward_bits,
         )?;
+        validate_exact_return_alphabet(min_reward, max_reward, return_horizon, return_bins)?;
         let task_fingerprint =
             warmstart_exact_jh_planner_task_fingerprint(compiled).map_err(|err| {
                 WarmStartExactJhError::InvalidTeacherDataset {
                     reason: format!("failed to compute planner task fingerprint: {err}"),
                 }
             })?;
+        let provenance_policy = match &planner.environment {
+            EnvironmentSpec::Builtin {
+                builtin: BuiltinEnvironmentSpec::TunerBridge,
+            } => TeacherProvenancePolicy::ExternallyValidatedTunerBridge,
+            _ => TeacherProvenancePolicy::StandalonePlannerRun,
+        };
         Ok(Self {
             task_fingerprint,
             observation_bits: interface.observation_bits,
@@ -372,14 +509,15 @@ impl WarmStartExactJhRuntimeConfig {
             observation_key_mode: observation_key_mode_name(interface.observation_key_mode),
             reward_bits: interface.reward_bits,
             agent_actions: interface.agent_actions,
-            min_reward: interface.min_reward,
-            max_reward: interface.max_reward,
-            reward_offset: interface.reward_offset,
+            min_reward,
+            max_reward,
+            reward_offset,
             return_horizon,
             return_bins,
             label_phase_period,
             planner_simulations_per_step,
             random_seed: resolve_random_seed(runtime.random_seed),
+            provenance_policy,
         })
     }
 
@@ -446,11 +584,16 @@ impl WarmStartExactJhRuntimeConfig {
                 ),
             });
         }
-        if contract.min_reward != self.min_reward || contract.max_reward != self.max_reward {
-            return Err(WarmStartExactJhError::InvalidTeacherDataset {
-                reason: "teacher reward range does not match configured planner interface"
-                    .to_string(),
-            });
+        if matches!(
+            self.provenance_policy,
+            TeacherProvenancePolicy::StandalonePlannerRun
+        ) {
+            validate_standalone_warmstart_provenance(
+                contract,
+                self.observation_bits,
+                self.observation_stream_len,
+                self.reward_bits,
+            )?;
         }
         if contract.return_horizon != self.return_horizon {
             return Err(WarmStartExactJhError::InvalidTeacherDataset {
@@ -470,6 +613,20 @@ impl WarmStartExactJhRuntimeConfig {
         }
         Ok(())
     }
+}
+
+fn reward_bounds_from_exact_return_bins(
+    return_horizon: usize,
+    return_bins: usize,
+    reward_bits: usize,
+) -> Result<(Reward, Reward, Reward), WarmStartExactJhError> {
+    let span = return_bins
+        .checked_sub(1)
+        .ok_or(WarmStartExactJhError::ExactReturnRangeOverflow)?;
+    let max_reward = i64::try_from(span / return_horizon)
+        .map_err(|_| WarmStartExactJhError::ExactReturnRangeOverflow)?;
+    validate_reward_encoding_bounds(0, max_reward, 0, reward_bits)?;
+    Ok((0, max_reward, 0))
 }
 
 #[derive(Clone, Debug)]
@@ -736,7 +893,7 @@ impl WarmStartExactJhAgent {
                     model.predictor.as_mut(),
                     &step.observations,
                     step.reward,
-                );
+                )?;
             }
         }
         Ok(committed)
@@ -780,7 +937,8 @@ impl WarmStartExactJhAgent {
                         model.predictor.as_mut(),
                         phase,
                         idx,
-                    );
+                    )
+                    .expect("warm-start history encoding invariant");
                 }
             }
             for action in 0..self.config.agent_actions.get() {
@@ -1078,8 +1236,6 @@ fn parse_teacher_contract(
             "observation_adapter_content_crc32",
         )?,
         reward_bits: required_teacher_usize(contract, "reward_bits")?,
-        min_reward: required_teacher_i64(contract, "min_reward")?,
-        max_reward: required_teacher_i64(contract, "max_reward")?,
         return_horizon: required_teacher_usize(contract, "return_horizon")?,
         label_phase_period: required_teacher_usize(contract, "label_phase_period")?,
         scalar_representation: required_teacher_string(contract, "scalar_representation")?,
@@ -1114,17 +1270,6 @@ fn required_teacher_usize(
     })?;
     usize::try_from(value).map_err(|_| WarmStartExactJhError::InvalidTeacherDataset {
         reason: format!("teacher contract field '{field}' does not fit usize"),
-    })
-}
-
-fn required_teacher_i64(
-    object: &serde_json::Map<String, Value>,
-    field: &str,
-) -> Result<Reward, WarmStartExactJhError> {
-    object.get(field).and_then(Value::as_i64).ok_or_else(|| {
-        WarmStartExactJhError::InvalidTeacherDataset {
-            reason: format!("teacher contract field '{field}' must be an integer"),
-        }
     })
 }
 
@@ -1321,7 +1466,7 @@ fn push_augmented_step_tokens_commit(
         pushed += push_encoded_bits_commit(predictor, label, return_bits);
     }
     pushed +=
-        push_percept_tokens_commit_history(config, predictor, &step.observations, step.reward);
+        push_percept_tokens_commit_history(config, predictor, &step.observations, step.reward)?;
     Ok(pushed)
 }
 
@@ -1334,7 +1479,7 @@ fn push_step_tokens_history(
     predictor: &mut dyn Predictor,
     phase: usize,
     idx: usize,
-) -> usize {
+) -> Result<usize, WarmStartExactJhError> {
     let step = &steps[idx - 1];
     let mut pushed = 0usize;
     pushed += push_encoded_bits_history(predictor, step.action, action_bits);
@@ -1343,7 +1488,8 @@ fn push_step_tokens_history(
     {
         pushed += push_encoded_bits_history(predictor, label, return_bits);
     }
-    pushed + push_percept_tokens_history(config, predictor, &step.observations, step.reward)
+    pushed += push_percept_tokens_history(config, predictor, &step.observations, step.reward)?;
+    Ok(pushed)
 }
 
 fn push_percept_tokens_commit_history(
@@ -1351,18 +1497,18 @@ fn push_percept_tokens_commit_history(
     predictor: &mut dyn Predictor,
     observations: &[PerceptVal],
     reward: Reward,
-) -> usize {
+) -> Result<usize, WarmStartExactJhError> {
     let mut pushed = 0usize;
     for &observation in observations {
         pushed += push_encoded_bits_commit_history(predictor, observation, config.observation_bits);
     }
-    pushed
-        + push_encoded_reward_commit_history(
-            predictor,
-            reward,
-            config.reward_bits,
-            config.reward_offset,
-        )
+    pushed += push_encoded_reward_commit_history(
+        predictor,
+        reward,
+        config.reward_bits,
+        config.reward_offset,
+    )?;
+    Ok(pushed)
 }
 
 fn push_percept_tokens_history(
@@ -1370,13 +1516,14 @@ fn push_percept_tokens_history(
     predictor: &mut dyn Predictor,
     observations: &[PerceptVal],
     reward: Reward,
-) -> usize {
+) -> Result<usize, WarmStartExactJhError> {
     let mut pushed = 0usize;
     for &observation in observations {
         pushed += push_encoded_bits_history(predictor, observation, config.observation_bits);
     }
-    pushed
-        + push_encoded_reward_history(predictor, reward, config.reward_bits, config.reward_offset)
+    pushed +=
+        push_encoded_reward_history(predictor, reward, config.reward_bits, config.reward_offset)?;
+    Ok(pushed)
 }
 
 fn push_action_tokens_commit_history(
@@ -1423,16 +1570,16 @@ fn push_encoded_reward_history(
     reward: Reward,
     bits: usize,
     offset: Reward,
-) -> usize {
+) -> Result<usize, WarmStartExactJhError> {
+    validate_reward_encoding_bounds(reward, reward, offset, bits)
+        .map_err(WarmStartExactJhError::from)?;
     let shifted = (reward as i128) + (offset as i128);
-    let value = if shifted <= 0 {
-        0
-    } else if shifted > u64::MAX as i128 {
-        u64::MAX
-    } else {
-        shifted as u64
-    };
-    push_encoded_bits_history(predictor, value, bits)
+    debug_assert!(
+        shifted >= 0,
+        "validate_reward_encoding_bounds implies shifted minimum >= 0"
+    );
+    let value = shifted as u64;
+    Ok(push_encoded_bits_history(predictor, value, bits))
 }
 
 fn push_encoded_reward_commit_history(
@@ -1440,16 +1587,16 @@ fn push_encoded_reward_commit_history(
     reward: Reward,
     bits: usize,
     offset: Reward,
-) -> usize {
+) -> Result<usize, WarmStartExactJhError> {
+    validate_reward_encoding_bounds(reward, reward, offset, bits)
+        .map_err(WarmStartExactJhError::from)?;
     let shifted = (reward as i128) + (offset as i128);
-    let value = if shifted <= 0 {
-        0
-    } else if shifted > u64::MAX as i128 {
-        u64::MAX
-    } else {
-        shifted as u64
-    };
-    push_encoded_bits_commit_history(predictor, value, bits)
+    debug_assert!(
+        shifted >= 0,
+        "validate_reward_encoding_bounds implies shifted minimum >= 0"
+    );
+    let value = shifted as u64;
+    Ok(push_encoded_bits_commit_history(predictor, value, bits))
 }
 
 fn predict_return_distribution(
@@ -1522,6 +1669,7 @@ fn argmax_with_fixed_tie_break(values: &[f64]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aixi::warmstart_contract::standalone_teacher_provenance_crc32_pair;
     use std::sync::{Arc, Mutex};
 
     fn action_alphabet(n: usize) -> ActionAlphabet {
@@ -1535,15 +1683,66 @@ mod tests {
             observation_stream_len: 1,
             reward_bits: 2,
             agent_actions: action_alphabet(2),
-            min_reward: 0,
-            max_reward: 3,
-            reward_offset: 0,
             return_horizon: 1,
             return_bins: 4,
             label_phase_period: 1,
             planner_simulations_per_step: 3,
             random_seed: Some(9),
         }
+    }
+
+    #[test]
+    fn reward_bounds_from_exact_return_bins_matches_default_test_config() {
+        let cfg = config();
+        assert_eq!(
+            reward_bounds_from_exact_return_bins(
+                cfg.return_horizon,
+                cfg.return_bins,
+                cfg.reward_bits
+            )
+            .expect("bounds"),
+            (0, 3, 0)
+        );
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn validate_warmstart_teacher_against_compiled_accepts_matching_contract() {
+        let cfg = config();
+        let compiled = cfg.compile_planner_run_spec().expect("compile planner run");
+        let teacher = teacher_for_config(&cfg);
+        validate_warmstart_teacher_against_compiled_planner_run(&compiled, &teacher.contract)
+            .expect("matching teacher must validate");
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn validate_warmstart_teacher_against_compiled_rejects_reward_certificate_crc_mismatch() {
+        let cfg = config();
+        let compiled = cfg.compile_planner_run_spec().expect("compile planner run");
+        let mut teacher = teacher_for_config(&cfg);
+        teacher.contract.exact_reward_encoding_certificate = "00000000".to_string();
+        let err =
+            validate_warmstart_teacher_against_compiled_planner_run(&compiled, &teacher.contract)
+                .expect_err("corrupted certificate hash must fail");
+        assert!(matches!(
+            err,
+            WarmStartExactJhError::InvalidTeacherDataset { .. }
+        ));
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn validate_warmstart_teacher_planner_task_fingerprint_rejects_mismatch_with_stable_markers() {
+        let cfg = config();
+        let compiled = cfg.compile_planner_run_spec().expect("compile planner run");
+        let mut teacher = teacher_for_config(&cfg);
+        teacher.contract.task_fingerprint = "wrong".to_string();
+        let err = validate_warmstart_teacher_planner_task_fingerprint(&compiled, &teacher.contract)
+            .expect_err("wrong fingerprint must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("task_fingerprint"), "{msg}");
+        assert!(msg.contains("current planner_run '"), "{msg}");
     }
 
     fn teacher_for_config(cfg: &WarmStartExactJhConfig) -> WarmStartExactJhTeacherDataset {
@@ -1554,23 +1753,29 @@ mod tests {
             .expect("test planner fingerprint");
         let observation_key_mode =
             observation_key_mode_name(compiled.interface().observation_key_mode);
+        let observation_stream_len = cfg.observation_stream_len.max(1);
+        let (adapter_crc, reward_cert) = standalone_teacher_provenance_crc32_pair(
+            cfg.observation_bits,
+            observation_stream_len,
+            cfg.reward_bits,
+        )
+        .expect("standalone teacher provenance crc pair");
         WarmStartExactJhTeacherDataset {
             contract: WarmStartExactJhTeacherContract {
                 schema_version: WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION,
                 task_fingerprint,
                 action_alphabet_size: cfg.agent_actions.get(),
                 observation_bits: cfg.observation_bits,
-                observation_stream_len: cfg.observation_stream_len.max(1),
+                observation_stream_len,
                 observation_key_mode: observation_key_mode.to_string(),
-                observation_adapter_spec_ref: "test-observation-adapter".to_string(),
-                observation_adapter_content_crc32: "test-observation-adapter-crc32".to_string(),
+                observation_adapter_spec_ref: WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF
+                    .to_string(),
+                observation_adapter_content_crc32: adapter_crc,
                 reward_bits: cfg.reward_bits,
-                min_reward: cfg.min_reward,
-                max_reward: cfg.max_reward,
                 return_horizon: cfg.return_horizon,
                 label_phase_period: cfg.label_phase_period,
-                scalar_representation: "test-scalar".to_string(),
-                exact_reward_encoding_certificate: "test-cert".to_string(),
+                scalar_representation: WARMSTART_STANDALONE_SCALAR_REPRESENTATION.to_string(),
+                exact_reward_encoding_certificate: reward_cert,
             },
             traces: vec![WarmStartExactJhTeacherTrace {
                 transitions: vec![
@@ -1611,8 +1816,6 @@ mod tests {
                 "observation_adapter_spec_ref": "test-observation-adapter",
                 "observation_adapter_content_crc32": "test-observation-adapter-crc32",
                 "reward_bits": 2,
-                "min_reward": 0,
-                "max_reward": 3,
                 "return_horizon": 1,
                 "label_phase_period": 1,
                 "scalar_representation": "test-scalar",
@@ -1641,8 +1844,6 @@ mod tests {
                 "observation_adapter_spec_ref": "test-observation-adapter",
                 "observation_adapter_content_crc32": "test-observation-adapter-crc32",
                 "reward_bits": 2,
-                "min_reward": 0,
-                "max_reward": 3,
                 "return_horizon": 1,
                 "label_phase_period": 1,
                 "scalar_representation": "test-scalar",
@@ -1682,8 +1883,6 @@ mod tests {
                 "observation_adapter_spec_ref": "test-observation-adapter",
                 "observation_adapter_content_crc32": "test-observation-adapter-crc32",
                 "reward_bits": 2,
-                "min_reward": 0,
-                "max_reward": 3,
                 "return_horizon": 2,
                 "label_phase_period": 2,
                 "scalar_representation": "test-scalar",
@@ -1743,7 +1942,6 @@ mod tests {
 
         let mut cfg = config();
         cfg.reward_bits = 1;
-        cfg.max_reward = 4;
         assert!(matches!(
             cfg.validate(),
             Err(WarmStartExactJhError::RewardEncoding(_))
@@ -1880,19 +2078,18 @@ mod tests {
 
     #[cfg(feature = "backend-ctw")]
     #[test]
-    fn warmstart_agent_rejects_teacher_contract_reward_range_mismatch() {
+    fn warmstart_agent_rejects_teacher_contract_scalar_provenance_mismatch() {
         let mut invalid = teacher();
-        invalid.contract.min_reward = -1;
-        invalid.contract.max_reward = 4;
+        invalid.contract.scalar_representation = "different-scalar".to_string();
         let err = match WarmStartExactJhAgent::new(config(), invalid) {
-            Ok(_) => panic!("teacher contract reward range mismatch must fail"),
+            Ok(_) => panic!("teacher contract scalar provenance mismatch must fail"),
             Err(err) => err,
         };
         assert!(matches!(
             err,
             WarmStartExactJhError::InvalidTeacherDataset { .. }
         ));
-        assert!(err.to_string().contains("reward"), "{err}");
+        assert!(err.to_string().contains("scalar_representation"), "{err}");
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -1952,16 +2149,16 @@ mod tests {
     }
 
     #[test]
-    fn exact_return_alphabet_rejects_non_injective_label_space() {
+    fn validate_rejects_reward_bits_too_narrow_for_derived_instantaneous_bounds() {
         let mut cfg = config();
-        cfg.return_horizon = 2;
-        cfg.label_phase_period = 2;
-        cfg.return_bins = 4;
-        let err = cfg.validate().expect_err("range needs seven labels");
-        assert!(matches!(
-            err,
-            WarmStartExactJhError::ReturnBinsTooSmall { .. }
-        ));
+        cfg.return_horizon = 1;
+        cfg.label_phase_period = 1;
+        cfg.return_bins = 100;
+        cfg.reward_bits = 1;
+        let err = cfg
+            .validate()
+            .expect_err("derived max instantaneous reward must fit reward_bits");
+        assert!(matches!(err, WarmStartExactJhError::RewardEncoding(_)));
     }
 
     #[derive(Clone, Default)]
@@ -2026,6 +2223,7 @@ mod tests {
             label_phase_period: 1,
             planner_simulations_per_step: 3,
             random_seed: 7,
+            provenance_policy: TeacherProvenancePolicy::StandalonePlannerRun,
         };
 
         let teacher = WarmStartExactJhTeacherDataset {
@@ -2039,8 +2237,6 @@ mod tests {
                 observation_adapter_spec_ref: "test-observation-adapter".to_string(),
                 observation_adapter_content_crc32: "test-observation-adapter-crc32".to_string(),
                 reward_bits: 2,
-                min_reward: 0,
-                max_reward: 3,
                 return_horizon: 1,
                 label_phase_period: 1,
                 scalar_representation: "test-scalar".to_string(),

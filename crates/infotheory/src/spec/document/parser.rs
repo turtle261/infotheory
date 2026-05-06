@@ -214,7 +214,6 @@ fn ensure_tune_baseline_candidate_is_canonical_json(
     Ok(())
 }
 
-#[cfg(feature = "tuner")]
 fn ensure_known_fields(value: &serde_json::Value, allowed: &[&str], label: &str) -> SpecResult<()> {
     let object = value
         .as_object()
@@ -381,6 +380,17 @@ fn parse_environment_spec(
 }
 
 fn parse_interface_spec(value: &serde_json::Value) -> SpecResult<PlannerInterfaceSpec> {
+    ensure_known_fields(
+        value,
+        &[
+            "observation_bits",
+            "observation_stream_len",
+            "observation_key_mode",
+            "reward_bits",
+            "agent_actions",
+        ],
+        "interface",
+    )?;
     let agent_actions_raw = required_usize(&value["agent_actions"], "interface.agent_actions")?;
     let agent_actions = ActionAlphabet::try_from_usize(agent_actions_raw)
         .map_err(|_| SpecError::new("interface.agent_actions must be >= 1"))?;
@@ -397,9 +407,6 @@ fn parse_interface_spec(value: &serde_json::Value) -> SpecResult<PlannerInterfac
         )?,
         reward_bits: required_usize(&value["reward_bits"], "interface.reward_bits")?,
         agent_actions,
-        min_reward: required_i64(&value["min_reward"], "interface.min_reward")?,
-        max_reward: required_i64(&value["max_reward"], "interface.max_reward")?,
-        reward_offset: required_i64(&value["reward_offset"], "interface.reward_offset")?,
     })
 }
 
@@ -1021,12 +1028,6 @@ fn default_u8(value: &serde_json::Value, default: u8, label: &str) -> SpecResult
         u8::try_from(required_u64(value, label)?)
             .map_err(|_| SpecError::new(format!("{label} exceeds u8::MAX")))
     }
-}
-
-fn required_i64(value: &serde_json::Value, label: &str) -> SpecResult<i64> {
-    value
-        .as_i64()
-        .ok_or_else(|| SpecError::new(format!("{label} is required")))
 }
 
 fn parse_builtin_environment(name: &str) -> SpecResult<super::BuiltinEnvironmentSpec> {
