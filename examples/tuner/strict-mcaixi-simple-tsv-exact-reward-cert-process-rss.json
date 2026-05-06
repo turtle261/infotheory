@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "exact_reward_encoding",
+  "dataset_crc32": "850aac41",
+  "bounds_crc32": "209df9b3",
+  "evaluator_profile_crc32": "092d433e",
+  "controller_kind": "mc_aixi_fac_ctw",
+  "action_alphabet_size": 2,
+  "encoding": "integer_objective_difference",
+  "scalar_representation": "finite-ieee754-f64-nonfinite-forbidden-v1",
+  "reward_bits": 32,
+  "max_reward": 4294967295
+}

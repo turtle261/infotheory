@@ -352,6 +352,14 @@ impl Predictor for RosaPredictor {
             history: self.history.clone(),
         })
     }
+
+    fn reset_conditioning_history(&mut self) -> Result<(), String> {
+        // Preserve trained SAM/LM parameters while dropping transient cursor and
+        // rollback journal state so independent traces start from empty context.
+        self.model.reset_conditioning_cursor();
+        self.history.clear();
+        Ok(())
+    }
 }
 
 /// A predictor using ZPAQ as a streaming rate model.
@@ -1047,6 +1055,34 @@ mod tests {
         assert!(
             predictor.journal.is_empty(),
             "committed history should not retain rollback snapshots"
+        );
+    }
+
+    #[cfg(feature = "backend-rosa")]
+    #[test]
+    fn rosa_predictor_conditioning_reset_clears_cursor_and_rollback_history() {
+        let mut predictor = RosaPredictor::new(8);
+        for &bit in &[true, false, true, true, false] {
+            predictor.commit_update(bit);
+        }
+        assert!(
+            !predictor.history.is_empty(),
+            "precondition: rollback journal should be populated after committed updates"
+        );
+        predictor.model.advance_conditioning_byte(1);
+        predictor.model.advance_conditioning_byte(0);
+
+        predictor
+            .reset_conditioning_history()
+            .expect("rosa conditioning reset should succeed");
+        assert!(
+            predictor.history.is_empty(),
+            "conditioning reset must clear rollback journal state"
+        );
+        assert_eq!(
+            predictor.model.conditioning_cursor(),
+            0,
+            "conditioning reset must return predictive cursor to root state"
         );
     }
 

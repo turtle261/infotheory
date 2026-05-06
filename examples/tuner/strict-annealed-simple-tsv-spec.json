@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "kind": "tune",
+  "assets": [
+    {
+      "id": "dataset",
+      "path": "/home/theo/dev/infotheory/benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
+    }
+  ],
+  "input_asset": "dataset",
+  "baseline_candidate": {
+    "kind": "rate-ac",
+    "rate_backend": {
+      "kind": "ctw",
+      "depth": 12
+    },
+    "framing": "framed"
+  },
+  "controller": {
+    "kind": "annealed_hill_climbing",
+    "max_mutation_radius": 2
+  },
+  "bounds": {
+    "allowed_backends": [
+      "ctw",
+      "fac-ctw",
+      "mixture",
+      "calibrated"
+    ],
+    "forbidden_backends": [],
+    "parameter_ranges": [
+      {
+        "parameter": "rate_backend.depth",
+        "min": 4.0,
+        "max": 28.0
+      }
+    ],
+    "max_experts": 4,
+    "max_mixture_nesting_depth": 2,
+    "min_experts": 1,
+    "allow_duplicate_experts": false,
+    "required_experts": [],
+    "forbidden_expert_pairs": []
+  },
+  "eval_time_limit_seconds": 2.0,
+  "time_budget_seconds": 180.0,
+  "min_throughput_bytes_per_second": 1.0,
+  "max_memory_bytes": 1099511627776,
+  "output_config_path": "strict-annealed-simple-tsv-output.json",
+  "seed": 17,
+  "report_path": "strict-annealed-simple-tsv-report.json"
+}
