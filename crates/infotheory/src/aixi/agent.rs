@@ -297,6 +297,25 @@ struct AgentRuntimeConfig {
 }
 
 impl AgentRuntimeConfig {
+    fn from_config(config: &AgentConfig) -> Self {
+        Self {
+            agent_horizon: config.agent_horizon,
+            observation_bits: config.observation_bits,
+            observation_stream_len: config.observation_stream_len.max(1),
+            observation_key_mode: config.observation_key_mode,
+            reward_bits: config.reward_bits,
+            agent_actions: config.agent_actions,
+            num_simulations: config.num_simulations,
+            mcts_strategy: config.mcts_strategy,
+            exploration_exploitation_ratio: config.exploration_exploitation_ratio,
+            discount_gamma: config.discount_gamma,
+            min_reward: config.min_reward,
+            max_reward: config.max_reward,
+            reward_offset: config.reward_offset,
+            random_seed: resolve_random_seed(config.random_seed),
+        }
+    }
+
     fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, AgentError> {
         let interface = compiled.interface();
         let runtime = compiled.runtime();
@@ -430,7 +449,7 @@ impl Agent {
     pub fn try_new(config: AgentConfig) -> Result<Self, AgentError> {
         config.validate_runtime_invariants()?;
         let compiled = config.compile_planner_run_spec()?;
-        let runtime = AgentRuntimeConfig::from_compiled(&compiled)?;
+        let runtime = AgentRuntimeConfig::from_config(&config);
         Self::from_compiled_config(runtime, &compiled)
     }
 
@@ -950,6 +969,25 @@ mod tests {
             "rosaplus",
             "AIQI: 'rosa' must produce ROSA+"
         );
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn programmatic_mcaixi_preserves_explicit_signed_reward_contract() {
+        let mut config = AgentConfig::default();
+        config.reward_bits = 3;
+        config.min_reward = -2;
+        config.max_reward = 3;
+        config.reward_offset = 2;
+        config.num_simulations = 1;
+
+        let mut agent = Agent::try_new(config).expect("signed reward config should be valid");
+        assert_eq!(agent.config.min_reward, -2);
+        assert_eq!(agent.config.max_reward, 3);
+        assert_eq!(agent.config.reward_offset, 2);
+
+        agent.model_update_percept_stream(&[0], -2);
+        assert_eq!(agent.total_reward, -2.0);
     }
 
     #[cfg(feature = "all-backends")]
