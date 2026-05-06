@@ -423,6 +423,8 @@ fn parse_tune_cli_args_and_theorem_flags() {
         "/tmp/infotheory-worker".to_string(),
         "--evaluator-cgroup-parent".to_string(),
         "/sys/fs/cgroup/infotheory-tuner".to_string(),
+        "--emit-exact-reward-encoding-certificate".to_string(),
+        "emit-reward-cert.json".to_string(),
     ];
     let parsed = parse_tune_command_args(&args).expect("parse tune args");
     assert_eq!(parsed.spec_path, "spec.json");
@@ -439,6 +441,10 @@ fn parse_tune_cli_args_and_theorem_flags() {
     assert_eq!(
         parsed.execution.evaluator_cgroup_parent.as_deref(),
         Some("/sys/fs/cgroup/infotheory-tuner")
+    );
+    assert_eq!(
+        parsed.emit_exact_reward_encoding_certificate.as_deref(),
+        Some("emit-reward-cert.json")
     );
 }
 
@@ -610,6 +616,7 @@ fn tune_execution_config_rejects_empty_cgroup_parent() {
 fn run_tune_rejects_invalid_execution_config_direct_call() {
     let request = TuneCommandRequest {
         spec_path: "nonexistent-spec.json".to_string(),
+        emit_exact_reward_encoding_certificate: None,
         execution: TuneExecutionConfig {
             threads: Some(0),
             ..TuneExecutionConfig::default()
@@ -1769,6 +1776,7 @@ fn run_tune_writes_output_and_report_for_baseline_pass() {
 
     let request = TuneCommandRequest {
         spec_path: spec_path.to_string_lossy().to_string(),
+        emit_exact_reward_encoding_certificate: None,
         execution: TuneExecutionConfig::default(),
     };
     run_tune(&request).expect("run tune");
@@ -1806,6 +1814,7 @@ fn run_tune_fails_when_baseline_not_deployable() {
 
     let request = TuneCommandRequest {
         spec_path: spec_path.to_string_lossy().to_string(),
+        emit_exact_reward_encoding_certificate: None,
         execution: TuneExecutionConfig::default(),
     };
     let err = run_tune(&request).expect_err("non-deployable baseline must fail");
@@ -1818,6 +1827,121 @@ fn run_tune_fails_when_baseline_not_deployable() {
     let _ = std::fs::remove_file(dataset_path);
     let _ = std::fs::remove_file(spec_path);
     let _ = std::fs::remove_file(report_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn run_tune_can_emit_exact_reward_certificate_and_exit() {
+    let dataset_path = temp_path("dataset-emit-reward", ".bin");
+    let spec_path = temp_path("spec-emit-reward", ".json");
+    let output_path = temp_path("output-emit-reward", ".json");
+    let report_path = temp_path("report-emit-reward", ".json");
+    let emitted_cert_path = temp_path("exact-reward-emitted", ".json");
+    std::fs::write(&dataset_path, b"emit-reward-dataset").expect("write dataset");
+
+    let mut spec = sample_tune_spec(
+        dataset_path.to_str().expect("dataset path"),
+        output_path.to_str().expect("output path"),
+        report_path.to_str().expect("report path"),
+    );
+    spec.controller = TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
+        interface: planner_interface_for_baseline(&spec.baseline_candidate),
+        planner_simulations_per_step: 4,
+    });
+    let spec_json = SpecDocument::Tune(spec)
+        .to_canonical_json()
+        .expect("spec json");
+    std::fs::write(&spec_path, spec_json).expect("write spec");
+
+    let request = TuneCommandRequest {
+        spec_path: spec_path.to_string_lossy().to_string(),
+        emit_exact_reward_encoding_certificate: Some(
+            emitted_cert_path.to_string_lossy().to_string(),
+        ),
+        execution: TuneExecutionConfig::default(),
+    };
+    run_tune(&request).expect("emit exact reward certificate");
+
+    let cert_bytes = std::fs::read(&emitted_cert_path).expect("read emitted certificate");
+    let cert: Value = serde_json::from_slice(&cert_bytes).expect("parse emitted certificate");
+    assert_eq!(cert["kind"], serde_json::json!("exact_reward_encoding"));
+    assert_eq!(
+        cert["controller_kind"],
+        serde_json::json!("mc_aixi_fac_ctw")
+    );
+    assert_eq!(
+        cert["encoding"],
+        serde_json::json!("integer_objective_difference")
+    );
+    assert_eq!(
+        cert["scalar_representation"],
+        serde_json::json!(SCALAR_REPRESENTATION_DECLARATION)
+    );
+    assert!(
+        cert["dataset_crc32"].as_str().is_some(),
+        "dataset_crc32 must be emitted"
+    );
+    assert!(
+        cert["bounds_crc32"].as_str().is_some(),
+        "bounds_crc32 must be emitted"
+    );
+    assert!(
+        cert["evaluator_profile_crc32"].as_str().is_some(),
+        "evaluator_profile_crc32 must be emitted"
+    );
+    assert!(
+        !output_path.exists(),
+        "emit mode should not run candidate evaluation or write output config"
+    );
+    assert!(
+        !report_path.exists(),
+        "emit mode should exit before tune report generation"
+    );
+
+    let _ = std::fs::remove_file(dataset_path);
+    let _ = std::fs::remove_file(spec_path);
+    let _ = std::fs::remove_file(emitted_cert_path);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn run_tune_emit_exact_reward_certificate_rejects_non_exact_controller_family() {
+    let dataset_path = temp_path("dataset-emit-reward-nonexact", ".bin");
+    let spec_path = temp_path("spec-emit-reward-nonexact", ".json");
+    let output_path = temp_path("output-emit-reward-nonexact", ".json");
+    let report_path = temp_path("report-emit-reward-nonexact", ".json");
+    let emitted_cert_path = temp_path("exact-reward-emitted-nonexact", ".json");
+    std::fs::write(&dataset_path, b"emit-reward-dataset-nonexact").expect("write dataset");
+    let spec = sample_tune_spec(
+        dataset_path.to_str().expect("dataset path"),
+        output_path.to_str().expect("output path"),
+        report_path.to_str().expect("report path"),
+    );
+    let spec_json = SpecDocument::Tune(spec)
+        .to_canonical_json()
+        .expect("spec json");
+    std::fs::write(&spec_path, spec_json).expect("write spec");
+
+    let request = TuneCommandRequest {
+        spec_path: spec_path.to_string_lossy().to_string(),
+        emit_exact_reward_encoding_certificate: Some(
+            emitted_cert_path.to_string_lossy().to_string(),
+        ),
+        execution: TuneExecutionConfig::default(),
+    };
+    let err = run_tune(&request).expect_err("non-exact family must be rejected");
+    assert!(
+        err.contains("exact reward-encoding certificate emission is only supported"),
+        "{err}"
+    );
+
+    assert!(
+        !emitted_cert_path.exists(),
+        "rejected emitter path must not write a certificate"
+    );
+
+    let _ = std::fs::remove_file(dataset_path);
+    let _ = std::fs::remove_file(spec_path);
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -2561,6 +2685,7 @@ fn run_tune_annealed_reports_search_activity() {
 
     let request = TuneCommandRequest {
         spec_path: spec_path.to_string_lossy().to_string(),
+        emit_exact_reward_encoding_certificate: None,
         execution: TuneExecutionConfig {
             max_evaluations: Some(3),
             ..TuneExecutionConfig::default()
@@ -2638,6 +2763,7 @@ fn planner_family_controller_executes_runtime_path() {
 
     let request = TuneCommandRequest {
         spec_path: spec_path.to_string_lossy().to_string(),
+        emit_exact_reward_encoding_certificate: None,
         execution: TuneExecutionConfig {
             theorem: TuneTheoremConfig {
                 exact_reward_encoding_certificate: Some(
@@ -2751,6 +2877,7 @@ fn executor_controls_are_excluded_from_canonical_tune_but_included_in_evaluator_
             }
             let mut request_a = TuneCommandRequest {
                 spec_path: "spec-a.json".to_string(),
+                emit_exact_reward_encoding_certificate: None,
                 execution: TuneExecutionConfig::default(),
             };
             let mut request_b = request_a.clone();

@@ -7,6 +7,12 @@ use std::fs;
 pub struct TuneCommandRequest {
     /// Canonical tune document path (`.json` or `.itsd`).
     pub spec_path: String,
+    /// Optional output path for emitting an exact reward-encoding certificate.
+    ///
+    /// When set, `tune` resolves the dataset and evaluator profile, writes a
+    /// certificate bound to those hashes, and exits without candidate
+    /// evaluation.
+    pub emit_exact_reward_encoding_certificate: Option<String>,
     /// Non-canonical execution controls and theorem claim inputs.
     pub execution: TuneExecutionConfig,
 }
@@ -547,6 +553,7 @@ pub fn parse_tune_command_args(args: &[String]) -> Result<TuneCommandRequest, St
     }
     let mut request = TuneCommandRequest {
         spec_path: args[2].clone(),
+        emit_exact_reward_encoding_certificate: None,
         execution: TuneExecutionConfig::default(),
     };
     let mut exec_config_path = None::<String>;
@@ -681,6 +688,16 @@ pub fn parse_tune_command_args(args: &[String]) -> Result<TuneCommandRequest, St
                 request.execution.theorem.exact_reward_encoding_certificate = Some(
                     parse_cli_non_empty_str(args.get(i), "--exact-reward-encoding-certificate")?
                         .to_string(),
+                );
+            }
+            "--emit-exact-reward-encoding-certificate" => {
+                i += 1;
+                request.emit_exact_reward_encoding_certificate = Some(
+                    parse_cli_non_empty_str(
+                        args.get(i),
+                        "--emit-exact-reward-encoding-certificate",
+                    )?
+                    .to_string(),
                 );
             }
             "--exact-state-observation-certificate" => {

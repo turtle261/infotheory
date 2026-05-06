@@ -187,6 +187,149 @@ struct CausalEventGrammar {
     target: BTreeSet<CausalChannelDomain>,
 }
 
+struct PreparedTuneContext {
+    compiled: crate::spec::CompiledTuneSpec,
+    dataset: LoadedDataset,
+    runtime_profile: ResolvedEvaluatorRuntimeProfile,
+    evaluator_profile: EvaluatorProfile,
+    initial_eval_limit: f64,
+    tune_started: Instant,
+}
+
+fn prepare_tune_context(request: &TuneCommandRequest) -> Result<PreparedTuneContext, String> {
+    request.execution.validate()?;
+    let config_path = Path::new(&request.spec_path);
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let document = load_spec_document(&request.spec_path).map_err(|err| err.to_string())?;
+    let SpecDocument::Tune(spec) = document else {
+        return Err(format!(
+            "tune expects a tune document, found kind '{}'",
+            document.kind_str()
+        ));
+    };
+    let tune_env = SpecEnvironment::new(config_dir);
+    let compiled = spec.compile_in(&tune_env).map_err(|err| err.to_string())?;
+
+    validate_candidate_against_tune_bounds(
+        compiled.baseline_candidate().canonical_spec(),
+        &compiled.canonical_spec().bounds,
+    )?;
+    reject_candidate_local_external_artifacts(compiled.baseline_candidate().canonical_spec())?;
+
+    let dataset = load_dataset(resolve_input_asset_path(
+        &compiled,
+        &compiled.canonical_spec().input_asset,
+    )?)?;
+    let tune_started = Instant::now();
+    let initial_eval_limit = effective_eval_limit_seconds(
+        &compiled,
+        tune_started,
+        Some(compiled.canonical_spec().eval_time_limit_seconds),
+        None,
+    );
+    let runtime_profile = resolve_evaluator_runtime_profile(
+        &request.execution,
+        request
+            .execution
+            .theorem
+            .deterministic_evaluator_table
+            .is_some(),
+    )?;
+    let evaluator_profile = EvaluatorProfile {
+        dataset_kind: dataset.kind,
+        objective_target: if request.execution.planner_deployable_model {
+            ObjectiveTarget::PlannerDeployableModel
+        } else {
+            dataset.objective_target
+        },
+        dataset_lowering_version: dataset.lowering_version,
+        dataset_codec_hash: dataset.codec_hash.clone(),
+        event_grammar_hash: dataset.event_grammar_hash.clone(),
+        target_domain_support_hash: dataset.target_domain_support_hash.clone(),
+        causal_header_profile_hash: dataset.causal_header_profile_hash.clone(),
+        target_size_function: dataset.target_size_function,
+        evaluator_interface_version: TUNER_EVALUATOR_INTERFACE_VERSION,
+        candidate_canonicalization_version: compiled
+            .candidate_canonicalization_version()
+            .to_string(),
+        warmup_baseline_runs: request.execution.warmup_baseline_runs,
+        diagnostic_chunk_bytes: request.execution.diagnostic_chunk_bytes,
+        eval_time_limit_seconds: initial_eval_limit,
+        evaluator_threads: request.execution.evaluator_threads(),
+        worker_isolation_mode: "spawn_exec_worker",
+        worker_executable_identity: runtime_profile.worker_executable_identity.clone(),
+        resolved_memory_accounting_kind: runtime_profile.memory_accounting_kind.name(),
+        resolved_memory_accounting_strict_theorem_facing: runtime_profile
+            .strict_theorem_memory_certified(),
+        resolved_evaluator_cgroup_parent: runtime_profile.resolved_cgroup_parent_string(),
+        backend_report_component_policy: runtime_profile
+            .memory_accounting_kind
+            .backend_report_component_policy(),
+        evaluator_determinism: request.execution.evaluator_determinism(),
+        rss_mode: request.execution.rss_mode,
+        timing_certification_tier: request.execution.theorem.timing_certification_tier,
+        build_profile: option_env!("PROFILE").unwrap_or("unknown"),
+        feature_set: compiled_feature_set(),
+    };
+
+    Ok(PreparedTuneContext {
+        compiled,
+        dataset,
+        runtime_profile,
+        evaluator_profile,
+        initial_eval_limit,
+        tune_started,
+    })
+}
+
+fn emit_exact_reward_encoding_certificate(
+    request: &TuneCommandRequest,
+    path: &str,
+    prepared: &PreparedTuneContext,
+) -> Result<(), String> {
+    let controller_kind = controller_kind_name(prepared.compiled.controller());
+    if !certificates::controller_requires_exact_objective_difference(controller_kind) {
+        return Err(format!(
+            "exact reward-encoding certificate emission is only supported for exact-objective controller families (mc_aixi_fac_ctw, aiqi_warmstart_exact_jh); found '{controller_kind}'"
+        ));
+    }
+    let scalar_representation = request
+        .execution
+        .theorem
+        .scalar_representation_ref
+        .as_deref()
+        .unwrap_or(SCALAR_REPRESENTATION_DECLARATION);
+    let reward_bits = match prepared.compiled.controller() {
+        crate::spec::CompiledTuneController::McAixiFacCtw(inner) => inner.interface.reward_bits,
+        crate::spec::CompiledTuneController::AiqiWarmstartExactJh(inner) => {
+            inner.interface.reward_bits
+        }
+        crate::spec::CompiledTuneController::AnnealedHillClimbing(_)
+        | crate::spec::CompiledTuneController::AiqiDiscounted(_) => {
+            unreachable!("checked controller kind for exact reward certificate emission")
+        }
+    };
+    let action_alphabet_size = planner_action_count(&prepared.compiled)?;
+    let cert = serde_json::json!({
+        "schema_version": 1,
+        "kind": "exact_reward_encoding",
+        "dataset_crc32": prepared.dataset.canonical_content_hash,
+        "bounds_crc32": bounds_hash(&prepared.compiled.canonical_spec().bounds)?,
+        "evaluator_profile_crc32": prepared.evaluator_profile.hash()?,
+        "controller_kind": controller_kind,
+        "action_alphabet_size": action_alphabet_size,
+        "encoding": "integer_objective_difference",
+        "scalar_representation": scalar_representation,
+        "reward_bits": reward_bits,
+        "max_reward": max_nonnegative_reward_for_bits(reward_bits)?,
+    });
+    let bytes = serde_json::to_vec_pretty(&cert)
+        .map_err(|err| format!("failed to serialize exact reward certificate JSON: {err}"))?;
+    fs::write(path, bytes)
+        .map_err(|err| format!("failed to write exact reward certificate '{}': {err}", path))?;
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct CausalHeaderProfile {
     action_alphabet_size: usize,
@@ -875,80 +1018,19 @@ impl TunerPlannerAgentRuntime {
 /// The runtime enforces canonical/executor separation, baseline deployability
 /// preconditions, and controller-specific bounded search semantics.
 pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
-    request.execution.validate()?;
-    let config_path = Path::new(&request.spec_path);
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    let document = load_spec_document(&request.spec_path).map_err(|err| err.to_string())?;
-    let SpecDocument::Tune(spec) = document else {
-        return Err(format!(
-            "tune expects a tune document, found kind '{}'",
-            document.kind_str()
-        ));
-    };
-    let tune_env = SpecEnvironment::new(config_dir);
-    let compiled = spec.compile_in(&tune_env).map_err(|err| err.to_string())?;
-
-    validate_candidate_against_tune_bounds(
-        compiled.baseline_candidate().canonical_spec(),
-        &compiled.canonical_spec().bounds,
-    )?;
-    reject_candidate_local_external_artifacts(compiled.baseline_candidate().canonical_spec())?;
-
-    let dataset = load_dataset(resolve_input_asset_path(
-        &compiled,
-        &compiled.canonical_spec().input_asset,
-    )?)?;
-    let tune_started = Instant::now();
-    let initial_eval_limit = effective_eval_limit_seconds(
-        &compiled,
+    let prepared = prepare_tune_context(request)?;
+    if let Some(path) = request.emit_exact_reward_encoding_certificate.as_deref() {
+        emit_exact_reward_encoding_certificate(request, path, &prepared)?;
+        return Ok(());
+    }
+    let PreparedTuneContext {
+        compiled,
+        dataset,
+        runtime_profile,
+        evaluator_profile,
+        initial_eval_limit,
         tune_started,
-        Some(compiled.canonical_spec().eval_time_limit_seconds),
-        None,
-    );
-    let runtime_profile = resolve_evaluator_runtime_profile(
-        &request.execution,
-        request
-            .execution
-            .theorem
-            .deterministic_evaluator_table
-            .is_some(),
-    )?;
-    let evaluator_profile = EvaluatorProfile {
-        dataset_kind: dataset.kind,
-        objective_target: if request.execution.planner_deployable_model {
-            ObjectiveTarget::PlannerDeployableModel
-        } else {
-            dataset.objective_target
-        },
-        dataset_lowering_version: dataset.lowering_version,
-        dataset_codec_hash: dataset.codec_hash.clone(),
-        event_grammar_hash: dataset.event_grammar_hash.clone(),
-        target_domain_support_hash: dataset.target_domain_support_hash.clone(),
-        causal_header_profile_hash: dataset.causal_header_profile_hash.clone(),
-        target_size_function: dataset.target_size_function,
-        evaluator_interface_version: TUNER_EVALUATOR_INTERFACE_VERSION,
-        candidate_canonicalization_version: compiled
-            .candidate_canonicalization_version()
-            .to_string(),
-        warmup_baseline_runs: request.execution.warmup_baseline_runs,
-        diagnostic_chunk_bytes: request.execution.diagnostic_chunk_bytes,
-        eval_time_limit_seconds: initial_eval_limit,
-        evaluator_threads: request.execution.evaluator_threads(),
-        worker_isolation_mode: "spawn_exec_worker",
-        worker_executable_identity: runtime_profile.worker_executable_identity.clone(),
-        resolved_memory_accounting_kind: runtime_profile.memory_accounting_kind.name(),
-        resolved_memory_accounting_strict_theorem_facing: runtime_profile
-            .strict_theorem_memory_certified(),
-        resolved_evaluator_cgroup_parent: runtime_profile.resolved_cgroup_parent_string(),
-        backend_report_component_policy: runtime_profile
-            .memory_accounting_kind
-            .backend_report_component_policy(),
-        evaluator_determinism: request.execution.evaluator_determinism(),
-        rss_mode: request.execution.rss_mode,
-        timing_certification_tier: request.execution.theorem.timing_certification_tier,
-        build_profile: option_env!("PROFILE").unwrap_or("unknown"),
-        feature_set: compiled_feature_set(),
-    };
+    } = prepared;
     let verified_theorem = VerifiedTheoremInputs::load(
         &request.execution.theorem,
         &compiled,

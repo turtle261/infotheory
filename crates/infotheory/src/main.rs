@@ -1705,6 +1705,8 @@ Options:
                           Verified no-hidden/inert-state certificate JSON path (for `tune`)
   --exact-reward-encoding-certificate <ref>
                           Verified exact reward encoding certificate JSON path (for `tune`)
+  --emit-exact-reward-encoding-certificate <path>
+                          Emit an exact reward encoding certificate JSON bound to resolved dataset/bounds/evaluator profile and exit (for `tune`)
   --exact-state-observation-certificate <ref>
                           Verified exact-state observation certificate JSON path (for `tune`)
   --observation-adapter-spec-ref <ref>
