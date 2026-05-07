@@ -3812,7 +3812,15 @@ fn inactive_radius_moves_become_self_loops() {
         .expect("depth leaf");
     let (min_b, max_b) = integer_leaf_bounds(depth_leaf.kind, Some((1.0, 16.0))).unwrap();
     let mut json_mut = json_lb.clone();
-    let applied_down = apply_integer_descriptor(&mut json_mut, depth_leaf, min_b, max_b, 1, -1);
+    let applied_down = apply_integer_descriptor(
+        &mut json_mut,
+        depth_leaf,
+        depth_leaf.kind,
+        min_b,
+        max_b,
+        1,
+        -1,
+    );
     assert!(
         !applied_down,
         "apply_integer_descriptor must return false for depth 1 + delta -1 (out of bounds)"
@@ -3822,11 +3830,89 @@ fn inactive_radius_moves_become_self_loops() {
         "failed boundary move must leave the candidate JSON unchanged rather than clipping"
     );
     let mut json_mut2 = json_lb.clone();
-    let applied_up = apply_integer_descriptor(&mut json_mut2, depth_leaf, min_b, max_b, 1, 1);
+    let applied_up = apply_integer_descriptor(
+        &mut json_mut2,
+        depth_leaf,
+        depth_leaf.kind,
+        min_b,
+        max_b,
+        1,
+        1,
+    );
     assert!(
         applied_up,
         "apply_integer_descriptor must return true for depth 1 + delta +1 (valid move)"
     );
+}
+
+#[cfg(feature = "backend-rosa")]
+#[test]
+fn signed_range_keeps_integer_kind_stable_across_zero_for_reversibility() {
+    use crate::api::{CompressionBackend, RateBackend};
+    use crate::compression::FramingMode;
+    use crate::spec::{TuneBoundsSpec, TuneParameterRangeSpec};
+    use crate::tuner::annealer::{compile_canonical_proposal_kernel, sample_annealed_proposal};
+
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::RosaPlus { max_order: -1 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let bounds = TuneBoundsSpec {
+        allowed_backends: vec!["rosaplus".to_string()],
+        forbidden_backends: Vec::new(),
+        parameter_ranges: vec![TuneParameterRangeSpec {
+            parameter: "rate_backend.max_order".to_string(),
+            min: -1.0,
+            max: 8.0,
+        }],
+        max_experts: 2,
+        max_mixture_nesting_depth: 1,
+        min_experts: Some(1),
+        allow_duplicate_experts: Some(false),
+        required_experts: Vec::new(),
+        forbidden_expert_pairs: Vec::new(),
+    };
+    let env = crate::spec::SpecEnvironment::new(".");
+
+    let current = candidate.compile_in(&env).expect("compile current");
+    let current_bytes = current.canonical_bytes().as_slice().to_vec();
+    let kernel = compile_canonical_proposal_kernel(&candidate, &bounds, 1, 1, &env, &current_bytes)
+        .expect("compile proposal kernel");
+    assert!(
+        !kernel.transitions.is_empty(),
+        "kernel must include at least one transition from max_order=-1"
+    );
+
+    let target_zero = CompressionBackend::Rate {
+        rate_backend: RateBackend::RosaPlus { max_order: 0 },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let target_zero_bytes = target_zero
+        .compile_in(&env)
+        .expect("compile max_order=0")
+        .canonical_bytes()
+        .as_slice()
+        .to_vec();
+    let zero_proposal = kernel
+        .transitions
+        .iter()
+        .find(|proposal| proposal.candidate_canonical_bytes == target_zero_bytes)
+        .expect("expected transition from max_order=-1 to max_order=0");
+
+    let reverse =
+        compile_canonical_proposal_kernel(&target_zero, &bounds, 1, 1, &env, &target_zero_bytes)
+            .expect("compile reverse kernel");
+    let reverse_mass = reverse.proposal_mass_to_canonical_bytes(&current_bytes);
+    assert_eq!(
+        reverse_mass, zero_proposal.raw_action_count,
+        "reverse proposal mass must match forward raw action count across -1 <-> 0 boundary"
+    );
+
+    let mut rng = crate::tuner::RandomGenerator::new();
+    let _ = sample_annealed_proposal(&candidate, &bounds, 1, 1, &env, &mut rng)
+        .expect("proposal sampling should not fail on signed boundary transition");
 }
 
 #[cfg(feature = "backend-ctw")]

@@ -78,7 +78,8 @@ use crate::cli::load_expert_spec;
 #[cfg(all(test, feature = "vm"))]
 use crate::cli::parse_vm_stats_backend;
 use crate::cli::{
-    build_ctx, file_roundtrip_compiled_backend, load_mixture_spec, maybe_export_online_model,
+    CliBackendInvocation, CliBackendSourceFlags, build_ctx_invocation,
+    file_roundtrip_compiled_backend, load_mixture_spec, maybe_export_online_model,
     parse_compression_backend, parse_rate_backend, read_file, read_stdin_all_for_generate,
     run_batch_mode, validate_obs_stream_len,
 };
@@ -911,6 +912,11 @@ fn search_command(args: &[String]) {
         infotheory::search::DEFAULT_SEARCH_COMPRESSION_BACKEND_NAME.to_string();
     let mut method: Option<String> = None;
     let mut expert_spec_path: Option<String> = None;
+    let mut rate_backend_json_path: Option<String> = None;
+    let mut compression_backend_json_path: Option<String> = None;
+    let mut explicit_rate_backend_flag: bool = false;
+    let explicit_compression_backend_flag: bool = false;
+    let mut explicit_method_flag: bool = false;
     let mut stage2_prior_mode: Option<search::Stage2PriorMode> = None;
 
     let mut i = 4usize;
@@ -940,17 +946,32 @@ fn search_command(args: &[String]) {
                 let v = args
                     .get(i)
                     .unwrap_or_exit("Error: --rate-backend requires a value");
-                rate_backend = parse_rate_backend(v)
-                    .unwrap_or(infotheory::search::DEFAULT_SEARCH_RATE_BACKEND_NAME)
-                    .to_string();
+                rate_backend = parse_rate_backend_flag_or_exit(v, "--rate-backend");
+                explicit_rate_backend_flag = true;
+            }
+            "--rate-backend-json" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --rate-backend-json requires a path");
+                rate_backend_json_path = Some(v.clone());
+            }
+            "--compression-backend-json" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --compression-backend-json requires a path");
+                compression_backend_json_path = Some(v.clone());
             }
             "--method" => {
                 i += 1;
                 method = args.get(i).cloned();
+                explicit_method_flag = true;
             }
             "--expert-spec" => {
                 i += 1;
                 expert_spec_path = args.get(i).cloned();
+                explicit_rate_backend_flag = true;
             }
             "--stage2-prior-mode" => {
                 i += 1;
@@ -972,12 +993,19 @@ fn search_command(args: &[String]) {
     if let Some(mode) = stage2_prior_mode {
         opts.stage2_prior_mode = mode;
     }
-    opts.ctx = build_ctx(
-        &rate_backend,
-        &compression_backend,
-        method.as_deref(),
-        expert_spec_path.as_deref(),
-    )
+    opts.ctx = build_ctx_invocation(CliBackendInvocation {
+        rate_backend: &rate_backend,
+        compression_backend: &compression_backend,
+        method: method.as_deref(),
+        expert_spec_path: expert_spec_path.as_deref(),
+        rate_backend_json_path: rate_backend_json_path.as_deref(),
+        compression_backend_json_path: compression_backend_json_path.as_deref(),
+        flags: CliBackendSourceFlags {
+            explicit_rate_backend: explicit_rate_backend_flag,
+            explicit_compression_backend: explicit_compression_backend_flag,
+            explicit_method: explicit_method_flag,
+        },
+    })
     .ctx;
     if let Err(err) = search::run_search_with_options(query, target, &opts) {
         eprintln!("Error: search failed: {err}");
@@ -1001,6 +1029,28 @@ impl<T> OptionExt<T> for Option<T> {
             std::process::exit(1);
         })
     }
+}
+
+fn parse_rate_backend_flag_or_exit(value: &str, flag_name: &str) -> String {
+    parse_rate_backend(value)
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "Error: {flag_name} expects a canonical backend name, got '{value}'. If '{value}' is a canonical RateBackend JSON document path, use --rate-backend-json. If '{value}' is a mixture spec path, use --rate-backend mixture --method <path>."
+            );
+            std::process::exit(1);
+        })
+}
+
+fn parse_compression_backend_flag_or_exit(value: &str, flag_name: &str) -> String {
+    parse_compression_backend(value)
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "Error: {flag_name} expects a canonical backend name, got '{value}'. Use --compression-backend-json for a canonical JSON spec path."
+            );
+            std::process::exit(1);
+        })
 }
 
 fn main() {
@@ -1059,6 +1109,11 @@ fn main() {
     let mut compression_backend_str = "zpaq".to_string();
     let mut method_str: Option<String> = None;
     let mut expert_spec_path: Option<String> = None;
+    let mut rate_backend_json_path: Option<String> = None;
+    let mut compression_backend_json_path: Option<String> = None;
+    let mut explicit_rate_backend_flag: bool = false;
+    let mut explicit_compression_backend_flag: bool = false;
+    let mut explicit_method_flag: bool = false;
     let mut model_export_path: Option<String> = None;
     let mut diagnostic_mixture_path: Option<String> = None;
     let mut diagnostic_out_prefix: Option<String> = None;
@@ -1083,8 +1138,24 @@ fn main() {
                 let v = args
                     .get(i)
                     .unwrap_or_exit("Error: --rate-backend requires a value");
-                rate_backend_str = parse_rate_backend(v).unwrap_or("rosaplus").to_string();
+                rate_backend_str = parse_rate_backend_flag_or_exit(v, "--rate-backend");
                 rate_backend_specified = true;
+                explicit_rate_backend_flag = true;
+            }
+            "--rate-backend-json" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --rate-backend-json requires a path");
+                rate_backend_json_path = Some(v.clone());
+                rate_backend_specified = true;
+            }
+            "--compression-backend-json" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --compression-backend-json requires a path");
+                compression_backend_json_path = Some(v.clone());
             }
             "--ncd-backend" => {
                 i += 1;
@@ -1092,7 +1163,8 @@ fn main() {
                     .get(i)
                     .unwrap_or_exit("Error: --compression-backend requires a value");
                 compression_backend_str =
-                    parse_compression_backend(v).unwrap_or("zpaq").to_string();
+                    parse_compression_backend_flag_or_exit(v, "--ncd-backend");
+                explicit_compression_backend_flag = true;
             }
             "--compression-backend" => {
                 i += 1;
@@ -1100,16 +1172,19 @@ fn main() {
                     .get(i)
                     .unwrap_or_exit("Error: --compression-backend requires a value");
                 compression_backend_str =
-                    parse_compression_backend(v).unwrap_or("zpaq").to_string();
+                    parse_compression_backend_flag_or_exit(v, "--compression-backend");
+                explicit_compression_backend_flag = true;
             }
             "--method" => {
                 i += 1;
                 method_str = args.get(i).cloned();
+                explicit_method_flag = true;
             }
             "--expert-spec" => {
                 i += 1;
                 expert_spec_path = args.get(i).cloned();
                 rate_backend_specified = true;
+                explicit_rate_backend_flag = true;
             }
             "--model-export" | "--rwkv-export" => {
                 i += 1;
@@ -1359,12 +1434,19 @@ fn main() {
         }
     }
 
-    let built_ctx = build_ctx(
-        &rate_backend_str,
-        &compression_backend_str,
-        method_str.as_deref(),
-        expert_spec_path.as_deref(),
-    );
+    let built_ctx = build_ctx_invocation(CliBackendInvocation {
+        rate_backend: &rate_backend_str,
+        compression_backend: &compression_backend_str,
+        method: method_str.as_deref(),
+        expert_spec_path: expert_spec_path.as_deref(),
+        rate_backend_json_path: rate_backend_json_path.as_deref(),
+        compression_backend_json_path: compression_backend_json_path.as_deref(),
+        flags: CliBackendSourceFlags {
+            explicit_rate_backend: explicit_rate_backend_flag,
+            explicit_compression_backend: explicit_compression_backend_flag,
+            explicit_method: explicit_method_flag,
+        },
+    });
     let ctx = built_ctx.ctx;
     set_default_ctx(ctx.clone());
 
@@ -1651,6 +1733,12 @@ Options:
   --ncd-backend <name>    Deprecated alias for --compression-backend
   --method <val>          Method/config (e.g. '5' for zpaq, '16' for ctw, mixture spec path,
                           model method: file:/path/model.safetensors[;policy:...] or cfg:key=value,...[;policy:...])
+  --rate-backend-json <path>
+                          Load canonical RateBackend JSON (relative paths resolve against this file's directory).
+                          Incompatible with --rate-backend and --expert-spec. When used with --method, the method applies to the compression backend shorthand.
+  --compression-backend-json <path>
+                          Load canonical CompressionBackend JSON (e.g. tuner output). Incompatible with
+                          --compression-backend, --ncd-backend, --expert-spec, and --method. Optional --rate-backend-json must match the embedded rate model when the compression object includes one.
   --expert-spec <path>    Load one exact standalone expert JSON (same schema as a mixture 'experts' entry)
   --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
   --rwkv-export <path>    Backward-compatible alias for --model-export
@@ -2455,7 +2543,7 @@ mod tests {
     #[cfg(feature = "backend-rwkv")]
     #[test]
     fn build_ctx_rwkv7_compression_accepts_cfg_method() {
-        let ctx = build_ctx(
+        let ctx = crate::cli::build_ctx(
             "rosaplus",
             "rwkv7",
             Some(
@@ -2650,11 +2738,11 @@ mod tests {
         )
         .expect("write temp expert spec");
 
-        let built = build_ctx(
+        let built = crate::cli::build_ctx(
             "rosaplus",
             "zpaq",
             None,
-            Some(expert_path.to_str().expect("utf8 path")),
+            Some(expert_path.to_string_lossy().as_ref()),
         );
         assert!(matches!(
             built.ctx.rate_backend.canonical_spec(),

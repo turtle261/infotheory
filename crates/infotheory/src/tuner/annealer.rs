@@ -199,6 +199,7 @@ struct NumericMutationDescriptor {
 #[derive(Clone, Copy)]
 enum NumericMutationDomain {
     Integer {
+        kind: NumericKind,
         min_bound: i128,
         max_bound: i128,
     },
@@ -220,8 +221,10 @@ fn compile_numeric_mutation_descriptors(
             let range = range_map.get(&leaf.path).copied();
             let domain = match leaf.kind {
                 NumericKind::Unsigned | NumericKind::Signed => {
-                    let (min_bound, max_bound) = integer_leaf_bounds(leaf.kind, range)?;
+                    let effective_kind = effective_integer_kind(leaf.kind, range);
+                    let (min_bound, max_bound) = integer_leaf_bounds(effective_kind, range)?;
                     NumericMutationDomain::Integer {
+                        kind: effective_kind,
                         min_bound,
                         max_bound,
                     }
@@ -316,11 +319,13 @@ fn apply_numeric_descriptor(
 ) -> bool {
     match descriptor.domain {
         NumericMutationDomain::Integer {
+            kind,
             min_bound,
             max_bound,
         } => apply_integer_descriptor(
             json,
             &descriptor.leaf,
+            kind,
             min_bound,
             max_bound,
             magnitude,
@@ -345,6 +350,7 @@ fn apply_numeric_descriptor(
 pub(super) fn apply_integer_descriptor(
     json: &mut Value,
     leaf: &NumericLeaf,
+    kind: NumericKind,
     min_bound: i128,
     max_bound: i128,
     magnitude: usize,
@@ -353,7 +359,7 @@ pub(super) fn apply_integer_descriptor(
     let Some(slot) = json.pointer_mut(&leaf.pointer) else {
         return false;
     };
-    let current = match leaf.kind {
+    let current = match kind {
         NumericKind::Unsigned => slot.as_u64().map(i128::from),
         NumericKind::Signed => slot.as_i64().map(i128::from),
         NumericKind::Float => None,
@@ -371,7 +377,7 @@ pub(super) fn apply_integer_descriptor(
     if next < min_bound || next > max_bound || next == current {
         return false;
     }
-    match leaf.kind {
+    match kind {
         NumericKind::Unsigned => {
             let Ok(value) = u64::try_from(next) else {
                 return false;
@@ -387,6 +393,16 @@ pub(super) fn apply_integer_descriptor(
             true
         }
         NumericKind::Float => false,
+    }
+}
+
+fn effective_integer_kind(kind: NumericKind, range: Option<(f64, f64)>) -> NumericKind {
+    if matches!(kind, NumericKind::Unsigned)
+        && range.is_some_and(|(min, _)| min.is_finite() && min < 0.0)
+    {
+        NumericKind::Signed
+    } else {
+        kind
     }
 }
 

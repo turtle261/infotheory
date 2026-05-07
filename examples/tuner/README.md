@@ -1,125 +1,150 @@
 # Tuner Validation Command Suite
 
-This folder contains copy-paste runnable validation examples.
+This README is a depot for manual validation, as much of it requires root and is not automated.
 
-Dataset choice for TSV examples:
-- `/home/theo/dev/infotheory/benchmarks/6f464811/infotheory-two-json-summary-full.tsv`
-- Reason: it is in-tree and won't be altered and is an appropriate size.
-
-## 1) One-time strict cgroup setup
+Before copy-pasting the commands below, set the repository root once:
 
 ```bash
-cd /home/theo/dev/infotheory
+export INFOTHEORY_REPO=/path/to/infotheory
+```
+
+The tuner, at least for passive compression, outputs a raw CompressionBackend JSON Object.  By the library, you can use parse_compression_backend_json directly on this output.
+
+You can compress with the CompressionBackend object like this:
+```bash
+infotheory compress /input.bin /output.bin --compression-backend-json /path/to/compression_backend.json
+```
+
+## 1) One-time delegated cgroup-v2 setup
+
+```bash
+cd "$INFOTHEORY_REPO"
 sudo ./scripts/delegate_tuner_cgroup_v2.sh setup theo infotheory-tuner
 ```
 
-## 2) Strict Linux (`hybrid_strict_max`) suite
+## 2) Strict smoke checks
 
-Strict smoke (non-MC-AIXI):
+Strict non-MC-AIXI smoke:
 
 ```bash
+cd "$INFOTHEORY_REPO"
 sudo --preserve-env=PATH ./scripts/delegate_tuner_cgroup_v2.sh run-in-session theo infotheory-tuner -- \
   env INFOTHEORY_TUNER_EVAL_CGROUP_PARENT=/sys/fs/cgroup/infotheory-tuner/evals \
   cargo run -p infotheory --no-default-features --features 'tuner cli backend-ctw' -- \
     tune examples/tuner/strict-smoke-spec.json \
     --rss-mode hybrid_strict_max \
+    --evaluator-cgroup-parent /sys/fs/cgroup/infotheory-tuner/evals \
     --max-evaluations 1
 ```
 
-Strict smoke MC-AIXI (fixed certificate):
+Strict MC-AIXI smoke:
 
 ```bash
+cd "$INFOTHEORY_REPO"
 sudo --preserve-env=PATH ./scripts/delegate_tuner_cgroup_v2.sh run-in-session theo infotheory-tuner -- \
   env INFOTHEORY_TUNER_EVAL_CGROUP_PARENT=/sys/fs/cgroup/infotheory-tuner/evals \
   cargo run -p infotheory --no-default-features --features 'tuner cli backend-ctw' -- \
     tune examples/tuner/strict-smoke-mc-aixi-spec.json \
-    --exact-reward-encoding-certificate strict-smoke-mc-aixi-reward-cert.json \
+    --exact-reward-encoding-certificate examples/tuner/strict-smoke-mc-aixi-reward-cert.json \
     --rss-mode hybrid_strict_max \
+    --evaluator-cgroup-parent /sys/fs/cgroup/infotheory-tuner/evals \
     --max-evaluations 1
 ```
 
-Strict annealed simple TSV:
+## 3) Strict TSV examples
+
+Annealed simple TSV:
 
 ```bash
+cd "$INFOTHEORY_REPO"
 sudo --preserve-env=PATH ./scripts/delegate_tuner_cgroup_v2.sh run-in-session theo infotheory-tuner -- \
   env INFOTHEORY_TUNER_EVAL_CGROUP_PARENT=/sys/fs/cgroup/infotheory-tuner/evals \
   cargo run -p infotheory --no-default-features --features 'tuner cli backend-ctw' -- \
     tune examples/tuner/strict-annealed-simple-tsv-spec.json \
     --rss-mode hybrid_strict_max \
+    --evaluator-cgroup-parent /sys/fs/cgroup/infotheory-tuner/evals \
     --max-evaluations 1
 ```
 
-Strict annealed advanced neural-mixture TSV:
+Annealed advanced neural-mixture TSV:
 
 ```bash
+cd "$INFOTHEORY_REPO"
 sudo --preserve-env=PATH ./scripts/delegate_tuner_cgroup_v2.sh run-in-session theo infotheory-tuner -- \
   env INFOTHEORY_TUNER_EVAL_CGROUP_PARENT=/sys/fs/cgroup/infotheory-tuner/evals \
   cargo run -p infotheory --no-default-features --features 'tuner cli backend-ctw backend-mixture' -- \
     tune examples/tuner/strict-annealed-advanced-neural-mixture-tsv-spec.json \
     --rss-mode hybrid_strict_max \
+    --evaluator-cgroup-parent /sys/fs/cgroup/infotheory-tuner/evals \
     --max-evaluations 1
 ```
 
-Strict MC-AIXI advanced neural-mixture TSV:
+MC-AIXI advanced neural-mixture TSV:
 
 ```bash
+cd "$INFOTHEORY_REPO"
 sudo --preserve-env=PATH ./scripts/delegate_tuner_cgroup_v2.sh run-in-session theo infotheory-tuner -- \
   env INFOTHEORY_TUNER_EVAL_CGROUP_PARENT=/sys/fs/cgroup/infotheory-tuner/evals \
   cargo run -p infotheory --no-default-features --features 'tuner cli backend-ctw backend-mixture' -- \
     tune examples/tuner/strict-mcaixi-advanced-neural-mixture-tsv-spec.json \
-    --exact-reward-encoding-certificate strict-mcaixi-advanced-neural-mixture-tsv-exact-reward-cert-hybrid-strict-max.json \
+    --exact-reward-encoding-certificate examples/tuner/strict-mcaixi-advanced-neural-mixture-tsv-exact-reward-cert-hybrid-strict-max.json \
     --rss-mode hybrid_strict_max \
+    --evaluator-cgroup-parent /sys/fs/cgroup/infotheory-tuner/evals \
     --max-evaluations 1
 ```
 
-## 3) MC-AIXI TSV examples (provided certificates are process-RSS profile)
+## 4) Strict three-mode `two.json` comparison artifact
 
-Simple MC-AIXI TSV:
+Walkthrough:
+
+- [walkthrough_improving_config.md](walkthrough_improving_config.md)
+
+Script:
+
+- [benchmark_tuner_two_json_modes.sh](../../scripts/benchmark_tuner_two_json_modes.sh)
+
+Run default strict comparison (subject = `git show HEAD:README.md`):
 
 ```bash
-cargo run -p infotheory --no-default-features --features 'tuner cli backend-ctw' -- \
-  tune examples/tuner/strict-mcaixi-simple-tsv-spec.json \
-  --exact-reward-encoding-certificate strict-mcaixi-simple-tsv-exact-reward-cert-process-rss.json \
-  --rss-mode process_rss_peak \
-  --max-evaluations 1
+cd "$INFOTHEORY_REPO"
+sudo --preserve-env=PATH ./scripts/delegate_tuner_cgroup_v2.sh run-in-session theo infotheory-tuner -- \
+  env INFOTHEORY_TUNER_EVAL_CGROUP_PARENT=/sys/fs/cgroup/infotheory-tuner/evals \
+  ./scripts/benchmark_tuner_two_json_modes.sh
 ```
 
-Advanced MC-AIXI neural-mixture TSV:
+Run strict comparison on explicit subject file:
 
 ```bash
-cargo run -p infotheory --no-default-features --features 'tuner cli backend-ctw backend-mixture' -- \
-  tune examples/tuner/strict-mcaixi-advanced-neural-mixture-tsv-spec.json \
-  --exact-reward-encoding-certificate strict-mcaixi-advanced-neural-mixture-tsv-exact-reward-cert-process-rss.json \
-  --rss-mode process_rss_peak \
-  --max-evaluations 1
+cd "$INFOTHEORY_REPO"
+sudo --preserve-env=PATH ./scripts/delegate_tuner_cgroup_v2.sh run-in-session theo infotheory-tuner -- \
+  env INFOTHEORY_TUNER_EVAL_CGROUP_PARENT=/sys/fs/cgroup/infotheory-tuner/evals \
+  ./scripts/benchmark_tuner_two_json_modes.sh /path/to/input.bin 2 1
 ```
 
-Notes:
-- The two TSV MC-AIXI certificate files bind dataset + bounds + evaluator profile + controller kind.
-- They are intentionally scoped to `process_rss_peak`.
-- `strict-mcaixi-advanced-neural-mixture-tsv-exact-reward-cert-hybrid-strict-max.json` is scoped to strict Linux `hybrid_strict_max`.
-- If you want strict `hybrid_strict_max` for those two TSV MC-AIXI examples, regenerate exact reward certificates under the strict evaluator profile.
+## 5) Emit strict exact reward certificates only
 
-## 4) Emit strict exact-reward certificates from resolved profile (no trial run)
-
-Strict MC-AIXI smoke certificate (emit and exit):
+Strict MC-AIXI smoke cert:
 
 ```bash
+cd "$INFOTHEORY_REPO"
 sudo --preserve-env=PATH ./scripts/delegate_tuner_cgroup_v2.sh run-in-session theo infotheory-tuner -- \
   env INFOTHEORY_TUNER_EVAL_CGROUP_PARENT=/sys/fs/cgroup/infotheory-tuner/evals \
   cargo run -p infotheory --no-default-features --features 'tuner cli backend-ctw' -- \
     tune examples/tuner/strict-smoke-mc-aixi-spec.json \
     --rss-mode hybrid_strict_max \
+    --evaluator-cgroup-parent /sys/fs/cgroup/infotheory-tuner/evals \
     --emit-exact-reward-encoding-certificate examples/tuner/strict-smoke-mc-aixi-reward-cert.json
 ```
 
-Strict MC-AIXI advanced neural-mixture TSV certificate (emit and exit):
+Strict MC-AIXI advanced TSV cert:
 
 ```bash
+cd "$INFOTHEORY_REPO"
 sudo --preserve-env=PATH ./scripts/delegate_tuner_cgroup_v2.sh run-in-session theo infotheory-tuner -- \
   env INFOTHEORY_TUNER_EVAL_CGROUP_PARENT=/sys/fs/cgroup/infotheory-tuner/evals \
   cargo run -p infotheory --no-default-features --features 'tuner cli backend-ctw backend-mixture' -- \
     tune examples/tuner/strict-mcaixi-advanced-neural-mixture-tsv-spec.json \
     --rss-mode hybrid_strict_max \
+    --evaluator-cgroup-parent /sys/fs/cgroup/infotheory-tuner/evals \
     --emit-exact-reward-encoding-certificate examples/tuner/strict-mcaixi-advanced-neural-mixture-tsv-exact-reward-cert-hybrid-strict-max.json
 ```

@@ -207,11 +207,70 @@ fn ensure_tune_baseline_candidate_is_canonical_json(
     let canonical_value =
         compression_backend_to_json_value(parsed).map_err(|err| SpecError::new(err.to_string()))?;
     if source_value != &canonical_value {
-        return Err(SpecError::new(
-            "tune.baseline_candidate must be canonical compression backend JSON with no unknown or alias fields",
-        ));
+        let mismatch =
+            first_json_mismatch_path(source_value, &canonical_value, "baseline_candidate");
+        let mismatch_detail = mismatch
+            .map(|path| format!("; first mismatch at '{path}'"))
+            .unwrap_or_default();
+        return Err(SpecError::new(format!(
+            "tune.baseline_candidate must be canonical compression backend JSON with no unknown or alias fields{mismatch_detail}"
+        )));
     }
     Ok(())
+}
+
+#[cfg(feature = "tuner")]
+fn first_json_mismatch_path(
+    observed: &serde_json::Value,
+    canonical: &serde_json::Value,
+    path: &str,
+) -> Option<String> {
+    match (observed, canonical) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            for key in left.keys() {
+                if !right.contains_key(key) {
+                    return Some(format!("{path}.{key}"));
+                }
+            }
+            for key in right.keys() {
+                let child_path = format!("{path}.{key}");
+                match left.get(key) {
+                    Some(left_child) => {
+                        if let Some(mismatch) =
+                            first_json_mismatch_path(left_child, &right[key], &child_path)
+                        {
+                            return Some(mismatch);
+                        }
+                    }
+                    None => {
+                        return Some(child_path);
+                    }
+                }
+            }
+            None
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            if left.len() != right.len() {
+                return Some(format!("{path}.len"));
+            }
+            for (index, (left_child, right_child)) in left.iter().zip(right.iter()).enumerate() {
+                let child_path = format!("{path}[{index}]");
+                if let Some(mismatch) =
+                    first_json_mismatch_path(left_child, right_child, &child_path)
+                {
+                    return Some(mismatch);
+                }
+            }
+            None
+        }
+        _ => {
+            if observed == canonical {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        }
+    }
 }
 
 fn ensure_known_fields(value: &serde_json::Value, allowed: &[&str], label: &str) -> SpecResult<()> {
@@ -1356,6 +1415,59 @@ mod tests {
         let empty_pairs =
             pair_list(&serde_json::json!("ctw,zpaq")).expect("non-array pair list should default");
         assert!(empty_pairs.is_empty());
+    }
+
+    #[cfg(feature = "tuner")]
+    #[test]
+    fn parse_tune_reports_precise_baseline_canonical_mismatch_path() {
+        let tune = serde_json::json!({
+            "schema_version": SPEC_DOCUMENT_SCHEMA_VERSION,
+            "kind": "tune",
+            "assets": [{ "id": "dataset", "path": "dataset.bin" }],
+            "input_asset": "dataset",
+            "baseline_candidate": {
+                "kind": "rate-ac",
+                "rate_backend": {
+                    "kind": "ctw",
+                    "depth": 16,
+                    "extra_alias_field": 7
+                },
+                "framing": "framed"
+            },
+            "controller": {
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1
+            },
+            "bounds": {
+                "allowed_backends": ["ctw"],
+                "forbidden_backends": [],
+                "parameter_ranges": [],
+                "max_experts": 2,
+                "max_mixture_nesting_depth": 1,
+                "required_experts": [],
+                "forbidden_expert_pairs": []
+            },
+            "eval_time_limit_seconds": 1.0,
+            "time_budget_seconds": 1.0,
+            "min_throughput_bytes_per_second": 1.0,
+            "max_memory_bytes": 1024,
+            "output_config_path": "out.json",
+            "seed": 1
+        });
+        let err = match parse_spec_document_json_value(&tune, Path::new(".")) {
+            Ok(_) => panic!("non-canonical baseline candidate must fail"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("must be canonical compression backend JSON"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message
+                .contains("first mismatch at 'baseline_candidate.rate_backend.extra_alias_field'"),
+            "mismatch path should be explicit: {message}"
+        );
     }
 
     #[test]

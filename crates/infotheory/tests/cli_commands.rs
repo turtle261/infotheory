@@ -952,10 +952,7 @@ fn aixi_cli_reports_missing_gameengine_feature_for_builtin_environments() {
     "observation_stream_len": 1,
     "observation_key_mode": "full_stream",
     "reward_bits": 1,
-    "agent_actions": 2,
-    "min_reward": 0,
-    "max_reward": 1,
-    "reward_offset": 0
+    "agent_actions": 2
   },
   "controller": {
     "kind": "aiqi_discounted",
@@ -1052,4 +1049,267 @@ fn decompress_cli_reports_corruption_instead_of_succeeding() {
     let _ = fs::remove_file(input_path);
     let _ = fs::remove_file(compressed_path);
     let _ = fs::remove_file(corrupt_path);
+}
+
+#[test]
+fn cli_compression_backend_json_roundtrips_rate_ac_ctw() {
+    let cb_path = temp_path("cli_cb_spec", "json");
+    let input_path = temp_path("cli_cb_in", "bin");
+    let comp_path = temp_path("cli_cb_comp", "itc");
+    let out_path = temp_path("cli_cb_out", "bin");
+    let spec = serde_json::json!({
+        "kind": "rate-ac",
+        "framing": "framed",
+        "rate_backend": { "kind": "ctw", "depth": 8 }
+    });
+    fs::write(&cb_path, serde_json::to_vec(&spec).expect("spec json"))
+        .expect("write compression spec");
+    write_temp_file(&input_path, b"hello world json backend roundtrip");
+
+    let compress = run_cli(
+        &[
+            "compress",
+            input_path.to_string_lossy().as_ref(),
+            comp_path.to_string_lossy().as_ref(),
+            "--compression-backend-json",
+            cb_path.to_string_lossy().as_ref(),
+        ],
+        None,
+    );
+    assert!(compress.status.success(), "{}", stderr_string(&compress));
+
+    let decompress = run_cli(
+        &[
+            "decompress",
+            comp_path.to_string_lossy().as_ref(),
+            out_path.to_string_lossy().as_ref(),
+            "--compression-backend-json",
+            cb_path.to_string_lossy().as_ref(),
+        ],
+        None,
+    );
+    assert!(
+        decompress.status.success(),
+        "{}",
+        stderr_string(&decompress)
+    );
+    assert_eq!(
+        fs::read(&out_path).expect("read restored"),
+        b"hello world json backend roundtrip"
+    );
+
+    let _ = fs::remove_file(cb_path);
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(comp_path);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn cli_rate_backend_json_with_rate_ac_compression_name_runs_h_rate() {
+    let rb_path = temp_path("cli_rb_spec", "json");
+    let data_path = temp_path("cli_rb_data", "txt");
+    let spec = serde_json::json!({ "kind": "ctw", "depth": 7 });
+    fs::write(&rb_path, serde_json::to_vec(&spec).expect("rate json")).expect("write rate spec");
+    write_temp_file(&data_path, b"rate json path smoke");
+
+    let out = run_cli(
+        &[
+            "h_rate",
+            data_path.to_string_lossy().as_ref(),
+            "--rate-backend-json",
+            rb_path.to_string_lossy().as_ref(),
+            "--compression-backend",
+            "rate-ac",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr_string(&out));
+    let v = parse_stdout_f64(&out);
+    assert!(v.is_finite() && v >= 0.0);
+
+    let _ = fs::remove_file(rb_path);
+    let _ = fs::remove_file(data_path);
+}
+
+#[test]
+fn cli_rate_backend_json_can_be_combined_with_method_for_zpaq() {
+    let rb_path = temp_path("cli_rb_zpaq_rate", "json");
+    let data_path = temp_path("cli_rb_zpaq_data", "txt");
+    let spec = serde_json::json!({ "kind": "ctw", "depth": 7 });
+    fs::write(&rb_path, serde_json::to_vec(&spec).expect("rate json")).expect("write rate spec");
+    write_temp_file(&data_path, b"rate json with zpaq method");
+
+    let comp_path = temp_path("cli_rb_zpaq_comp", "itc");
+    let out_path = temp_path("cli_rb_zpaq_out", "txt");
+
+    let compress = run_cli(
+        &[
+            "compress",
+            data_path.to_string_lossy().as_ref(),
+            comp_path.to_string_lossy().as_ref(),
+            "--rate-backend-json",
+            rb_path.to_string_lossy().as_ref(),
+            "--compression-backend",
+            "zpaq",
+            "--method",
+            "5",
+        ],
+        None,
+    );
+    assert!(compress.status.success(), "{}", stderr_string(&compress));
+
+    let decompress = run_cli(
+        &[
+            "decompress",
+            comp_path.to_string_lossy().as_ref(),
+            out_path.to_string_lossy().as_ref(),
+            "--rate-backend-json",
+            rb_path.to_string_lossy().as_ref(),
+            "--compression-backend",
+            "zpaq",
+            "--method",
+            "5",
+        ],
+        None,
+    );
+    assert!(
+        decompress.status.success(),
+        "{}",
+        stderr_string(&decompress)
+    );
+    assert_eq!(
+        fs::read(&out_path).expect("read restored"),
+        b"rate json with zpaq method"
+    );
+
+    let _ = fs::remove_file(rb_path);
+    let _ = fs::remove_file(data_path);
+    let _ = fs::remove_file(comp_path);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn cli_rejects_compression_backend_json_with_method() {
+    let cb_path = temp_path("cli_cb_conflict", "json");
+    let spec = serde_json::json!({
+        "kind": "rate-ac",
+        "rate_backend": { "kind": "ctw", "depth": 4 }
+    });
+    fs::write(&cb_path, serde_json::to_vec(&spec).expect("json")).expect("write spec");
+    let data_path = temp_path("cli_cb_conflict_data", "txt");
+    write_temp_file(&data_path, b"x");
+
+    let out = run_cli(
+        &[
+            "h_rate",
+            data_path.to_string_lossy().as_ref(),
+            "--compression-backend-json",
+            cb_path.to_string_lossy().as_ref(),
+            "--method",
+            "5",
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("compression-backend-json") && err.contains("--method"),
+        "stderr={err}"
+    );
+
+    let _ = fs::remove_file(cb_path);
+    let _ = fs::remove_file(data_path);
+}
+
+#[test]
+fn cli_rejects_mismatched_rate_backend_json_with_embedded_rate() {
+    let cb_path = temp_path("cli_cb_embed", "json");
+    let rb_path = temp_path("cli_rb_mismatch", "json");
+    let data_path = temp_path("cli_mismatch_data", "txt");
+    let cb = serde_json::json!({
+        "kind": "rate-ac",
+        "rate_backend": { "kind": "ctw", "depth": 8 }
+    });
+    let rb = serde_json::json!({ "kind": "ctw", "depth": 4 });
+    fs::write(&cb_path, serde_json::to_vec(&cb).unwrap()).expect("cb");
+    fs::write(&rb_path, serde_json::to_vec(&rb).unwrap()).expect("rb");
+    write_temp_file(&data_path, b"zzz");
+
+    let out = run_cli(
+        &[
+            "h_rate",
+            data_path.to_string_lossy().as_ref(),
+            "--compression-backend-json",
+            cb_path.to_string_lossy().as_ref(),
+            "--rate-backend-json",
+            rb_path.to_string_lossy().as_ref(),
+        ],
+        None,
+    );
+    assert!(!out.status.success());
+    let err = stderr_string(&out);
+    assert!(
+        err.contains("does not match") || err.contains("rate-backend-json"),
+        "stderr={err}"
+    );
+
+    let _ = fs::remove_file(cb_path);
+    let _ = fs::remove_file(rb_path);
+    let _ = fs::remove_file(data_path);
+}
+
+#[test]
+fn cli_rejects_unknown_rate_backend_name_in_flag() {
+    let input_path = temp_path("cli_unknown_rate_backend_input", "txt");
+    let out_path = temp_path("cli_unknown_rate_backend_output", "itc");
+    write_temp_file(&input_path, b"unknown rate backend must fail");
+
+    let output = run_cli(
+        &[
+            "compress",
+            input_path.to_string_lossy().as_ref(),
+            out_path.to_string_lossy().as_ref(),
+            "--compression-backend",
+            "rate-ac",
+            "--rate-backend",
+            "/tmp/not-a-backend-name.json",
+        ],
+        None,
+    );
+    assert!(!output.status.success(), "command should fail");
+    let err = stderr_string(&output);
+    assert!(
+        err.contains("--rate-backend") && err.contains("--rate-backend-json"),
+        "stderr={err}"
+    );
+
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn cli_rejects_unknown_compression_backend_name_in_flag() {
+    let input_path = temp_path("cli_unknown_compression_backend_input", "txt");
+    let out_path = temp_path("cli_unknown_compression_backend_output", "itc");
+    write_temp_file(&input_path, b"unknown compression backend must fail");
+
+    let output = run_cli(
+        &[
+            "compress",
+            input_path.to_string_lossy().as_ref(),
+            out_path.to_string_lossy().as_ref(),
+            "--compression-backend",
+            "/tmp/not-a-compression-backend-name.json",
+        ],
+        None,
+    );
+    assert!(!output.status.success(), "command should fail");
+    let err = stderr_string(&output);
+    assert!(
+        err.contains("--compression-backend") && err.contains("--compression-backend-json"),
+        "stderr={err}"
+    );
+
+    let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(out_path);
 }

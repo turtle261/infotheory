@@ -930,42 +930,124 @@ pub(super) struct BuiltCtx {
     pub(super) ctx: InfotheoryCtx,
 }
 
-pub(super) fn build_ctx(
+/// Tracks whether the user supplied CLI flags that conflict with JSON backend specs.
+#[derive(Clone, Copy, Default)]
+pub(super) struct CliBackendSourceFlags {
+    pub explicit_rate_backend: bool,
+    pub explicit_compression_backend: bool,
+    pub explicit_method: bool,
+}
+
+pub(super) struct CliBackendInvocation<'a> {
+    pub rate_backend: &'a str,
+    pub compression_backend: &'a str,
+    pub method: Option<&'a str>,
+    pub expert_spec_path: Option<&'a str>,
+    pub rate_backend_json_path: Option<&'a str>,
+    pub compression_backend_json_path: Option<&'a str>,
+    pub flags: CliBackendSourceFlags,
+}
+
+pub(super) fn load_backend_spec_json(
+    path: &str,
+    label: &str,
+) -> Result<(serde_json::Value, std::path::PathBuf), String> {
+    infotheory::spec::load_json_value_from_path(std::path::Path::new("."), path, label)
+        .map_err(|err| err.to_string())
+}
+
+fn validate_cli_backend_sources(inv: &CliBackendInvocation<'_>) -> Result<(), String> {
+    if inv.compression_backend_json_path.is_some() {
+        if inv.flags.explicit_compression_backend {
+            return Err(
+                "--compression-backend-json cannot be combined with --compression-backend or --ncd-backend"
+                    .to_string(),
+            );
+        }
+        if inv.expert_spec_path.is_some() {
+            return Err(
+                "--compression-backend-json cannot be combined with --expert-spec".to_string(),
+            );
+        }
+        if inv.flags.explicit_method {
+            return Err("--compression-backend-json cannot be combined with --method".to_string());
+        }
+    }
+    if inv.rate_backend_json_path.is_some() {
+        if inv.flags.explicit_rate_backend {
+            return Err(
+                "--rate-backend-json cannot be combined with --rate-backend or --expert-spec"
+                    .to_string(),
+            );
+        }
+        if inv.expert_spec_path.is_some() {
+            return Err("--rate-backend-json cannot be combined with --expert-spec".to_string());
+        }
+
+        // `--method` is permitted alongside `--rate-backend-json` because it parameterizes the
+        // *compression* backend shorthand (e.g. zpaq method), while the rate backend is already
+        // fixed by the JSON spec.
+    }
+    Ok(())
+}
+
+fn assert_rate_backend_json_matches_embedded(
+    embedded: &infotheory::api::RateBackend,
+    from_file: &infotheory::api::RateBackend,
+    rate_json_path: &str,
+    compression_json_path: &str,
+) -> Result<(), String> {
+    let embedded_compiled = embedded.compile().map_err(|err| err.to_string())?;
+    let file_compiled = from_file.compile().map_err(|err| err.to_string())?;
+    if embedded_compiled.canonical_bytes().as_slice() != file_compiled.canonical_bytes().as_slice()
+    {
+        return Err(format!(
+            "--rate-backend-json ({rate_json_path}) does not match the rate model embedded in --compression-backend-json ({compression_json_path})"
+        ));
+    }
+    Ok(())
+}
+
+fn rate_backend_from_cli_shorthand(
     rate_backend: &str,
-    compression_backend: &str,
     method: Option<&str>,
     expert_spec_path: Option<&str>,
-) -> BuiltCtx {
-    let rate_backend = if let Some(path) = expert_spec_path {
+) -> infotheory::api::RateBackend {
+    if let Some(path) = expert_spec_path {
         let spec = load_expert_spec(path).unwrap_or_else(|e| {
             eprintln!("Error: failed to load expert spec '{path}': {e}");
             std::process::exit(1);
         });
-        spec.backend
-    } else {
-        let mut shorthand = infotheory::spec::RateBackendShorthandOptions::default();
-        shorthand.base_dir = std::path::PathBuf::from(".");
-        shorthand.particle_default_if_missing_method = false;
-        #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
-        let shorthand = {
-            let mut shorthand = shorthand;
-            #[cfg(feature = "backend-mamba")]
-            if rate_backend == "mamba" && method.is_none() {
-                shorthand.default_mamba_model_path = Some(mamba_model_path_from_env());
-            }
-            #[cfg(feature = "backend-rwkv")]
-            if rate_backend == "rwkv7" && method.is_none() {
-                shorthand.default_rwkv_model_path = Some(rwkv7_model_path_from_env());
-            }
-            shorthand
-        };
-        infotheory::spec::parse_rate_backend_name_method(rate_backend, method, &shorthand)
-            .unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            })
+        return spec.backend;
+    }
+    let mut shorthand = infotheory::spec::RateBackendShorthandOptions::default();
+    shorthand.base_dir = std::path::PathBuf::from(".");
+    shorthand.particle_default_if_missing_method = false;
+    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
+    let shorthand = {
+        let mut shorthand = shorthand;
+        #[cfg(feature = "backend-mamba")]
+        if rate_backend == "mamba" && method.is_none() {
+            shorthand.default_mamba_model_path = Some(mamba_model_path_from_env());
+        }
+        #[cfg(feature = "backend-rwkv")]
+        if rate_backend == "rwkv7" && method.is_none() {
+            shorthand.default_rwkv_model_path = Some(rwkv7_model_path_from_env());
+        }
+        shorthand
     };
+    infotheory::spec::parse_rate_backend_name_method(rate_backend, method, &shorthand)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        })
+}
 
+fn compression_backend_from_cli_shorthand(
+    rate_backend: &infotheory::api::RateBackend,
+    compression_backend: &str,
+    method: Option<&str>,
+) -> infotheory::api::CompressionBackend {
     #[allow(unused_mut)]
     let mut compression_opts = infotheory::spec::CompressionBackendShorthandOptions::default();
     compression_opts.default_rate_backend = Some(rate_backend.clone());
@@ -979,7 +1061,7 @@ pub(super) fn build_ctx(
     {
         compression_opts.default_rwkv_model_path = Some(rwkv7_model_path_from_env());
     }
-    let compression_backend = infotheory::spec::parse_compression_backend_name_method(
+    infotheory::spec::parse_compression_backend_name_method(
         compression_backend,
         method,
         Some(rate_backend.clone()),
@@ -988,14 +1070,189 @@ pub(super) fn build_ctx(
     .unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         std::process::exit(1);
-    });
+    })
+}
 
-    BuiltCtx {
-        ctx: InfotheoryCtx::from_specs(rate_backend, compression_backend).unwrap_or_else(|e| {
+pub(super) fn build_ctx_invocation(inv: CliBackendInvocation<'_>) -> BuiltCtx {
+    if let Err(err) = validate_cli_backend_sources(&inv) {
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    }
+
+    let default_framing = infotheory::compression::FramingMode::Raw;
+
+    if let Some(cb_path) = inv.compression_backend_json_path {
+        let (val, full_path) = load_backend_spec_json(cb_path, "compression backend spec")
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            });
+        let base_dir = full_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let compression_backend_ast =
+            infotheory::spec::parse_compression_backend_json(&val, base_dir, None, default_framing)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                });
+
+        let rate_from_file: Option<infotheory::api::RateBackend> =
+            if let Some(rb_path) = inv.rate_backend_json_path {
+                let (rv, rfull) = load_backend_spec_json(rb_path, "rate backend spec")
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    });
+                let rbase = rfull.parent().unwrap_or_else(|| std::path::Path::new("."));
+                Some(
+                    infotheory::spec::parse_rate_backend_json(
+                        &rv,
+                        rbase,
+                        infotheory::api::MAX_MIXTURE_NESTING,
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }),
+                )
+            } else {
+                None
+            };
+
+        let rate_backend_ast = match &compression_backend_ast {
+            infotheory::api::CompressionBackend::Rate {
+                rate_backend: emb, ..
+            } => {
+                if let Some(ref from_file) = rate_from_file {
+                    let rate_json_path = inv
+                        .rate_backend_json_path
+                        .expect("rate backend JSON path when secondary file parsed");
+                    if let Err(err) = assert_rate_backend_json_matches_embedded(
+                        emb,
+                        from_file,
+                        rate_json_path,
+                        cb_path,
+                    ) {
+                        eprintln!("Error: {err}");
+                        std::process::exit(1);
+                    }
+                }
+                emb.clone()
+            }
+            #[cfg(feature = "backend-rwkv")]
+            infotheory::api::CompressionBackend::Rwkv7 { method, .. } => {
+                let companion = infotheory::api::RateBackend::Rwkv7Method {
+                    method: method.clone(),
+                };
+                if let Some(ref from_file) = rate_from_file {
+                    let rate_json_path = inv
+                        .rate_backend_json_path
+                        .expect("rate backend JSON path when secondary file parsed");
+                    if let Err(err) = assert_rate_backend_json_matches_embedded(
+                        &companion,
+                        from_file,
+                        rate_json_path,
+                        cb_path,
+                    ) {
+                        eprintln!("Error: {err}");
+                        std::process::exit(1);
+                    }
+                }
+                companion
+            }
+            infotheory::api::CompressionBackend::Zpaq { .. } => {
+                if let Some(from_file) = rate_from_file {
+                    from_file
+                } else {
+                    rate_backend_from_cli_shorthand(
+                        inv.rate_backend,
+                        inv.method,
+                        inv.expert_spec_path,
+                    )
+                }
+            }
+            _ => {
+                eprintln!(
+                    "Error: --compression-backend-json produced a compression backend variant not supported by this CLI build"
+                );
+                std::process::exit(1);
+            }
+        };
+
+        return BuiltCtx {
+            ctx: InfotheoryCtx::from_specs(rate_backend_ast, compression_backend_ast)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }),
+        };
+    }
+
+    if let Some(rb_path) = inv.rate_backend_json_path {
+        let (rv, rfull) =
+            load_backend_spec_json(rb_path, "rate backend spec").unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            });
+        let rbase = rfull.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let rate_backend_ast = infotheory::spec::parse_rate_backend_json(
+            &rv,
+            rbase,
+            infotheory::api::MAX_MIXTURE_NESTING,
+        )
+        .unwrap_or_else(|e| {
             eprintln!("Error: {e}");
             std::process::exit(1);
-        }),
+        });
+        let compression_backend_ast = compression_backend_from_cli_shorthand(
+            &rate_backend_ast,
+            inv.compression_backend,
+            inv.method,
+        );
+        return BuiltCtx {
+            ctx: InfotheoryCtx::from_specs(rate_backend_ast, compression_backend_ast)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }),
+        };
     }
+
+    let rate_backend_ast =
+        rate_backend_from_cli_shorthand(inv.rate_backend, inv.method, inv.expert_spec_path);
+    let compression_backend_ast = compression_backend_from_cli_shorthand(
+        &rate_backend_ast,
+        inv.compression_backend,
+        inv.method,
+    );
+    BuiltCtx {
+        ctx: InfotheoryCtx::from_specs(rate_backend_ast, compression_backend_ast).unwrap_or_else(
+            |e| {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            },
+        ),
+    }
+}
+
+/// Builds a context from shorthand flags only. Prefer [`build_ctx_invocation`] when using JSON specs.
+#[allow(dead_code)]
+pub(super) fn build_ctx(
+    rate_backend: &str,
+    compression_backend: &str,
+    method: Option<&str>,
+    expert_spec_path: Option<&str>,
+) -> BuiltCtx {
+    build_ctx_invocation(CliBackendInvocation {
+        rate_backend,
+        compression_backend,
+        method,
+        expert_spec_path,
+        rate_backend_json_path: None,
+        compression_backend_json_path: None,
+        flags: CliBackendSourceFlags::default(),
+    })
 }
 
 pub(super) fn read_file(path: &str) -> Vec<u8> {
