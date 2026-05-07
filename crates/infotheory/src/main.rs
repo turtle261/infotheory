@@ -1157,15 +1157,6 @@ fn main() {
                     .unwrap_or_exit("Error: --compression-backend-json requires a path");
                 compression_backend_json_path = Some(v.clone());
             }
-            "--ncd-backend" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .unwrap_or_exit("Error: --compression-backend requires a value");
-                compression_backend_str =
-                    parse_compression_backend_flag_or_exit(v, "--ncd-backend");
-                explicit_compression_backend_flag = true;
-            }
             "--compression-backend" => {
                 i += 1;
                 let v = args
@@ -1730,7 +1721,6 @@ Options:
     --rate-backend <name>   Backend for rate estimation: {rate_backends}
   --compression-backend <name>
                           Backend for NCD/compression: {compression_backends}
-  --ncd-backend <name>    Deprecated alias for --compression-backend
   --method <val>          Method/config (e.g. '5' for zpaq, '16' for ctw, mixture spec path,
                           model method: file:/path/model.safetensors[;policy:...] or cfg:key=value,...[;policy:...])
   --rate-backend-json <path>
@@ -1738,7 +1728,7 @@ Options:
                           Incompatible with --rate-backend and --expert-spec. When used with --method, the method applies to the compression backend shorthand.
   --compression-backend-json <path>
                           Load canonical CompressionBackend JSON (e.g. tuner output). Incompatible with
-                          --compression-backend, --ncd-backend, --expert-spec, and --method. Optional --rate-backend-json must match the embedded rate model when the compression object includes one.
+                          --compression-backend, --expert-spec, and --method. Optional --rate-backend-json must match the embedded rate model when the compression object includes one.
   --expert-spec <path>    Load one exact standalone expert JSON (same schema as a mixture 'experts' entry)
   --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
   --rwkv-export <path>    Backward-compatible alias for --model-export

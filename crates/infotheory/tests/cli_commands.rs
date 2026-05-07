@@ -205,7 +205,7 @@ fn direct_cli_primitives_cover_empirical_and_backend_paths() {
             "ncd",
             a.as_str(),
             b.as_str(),
-            "--ncd-backend",
+            "--compression-backend",
             "rate-ac",
             "--rate-backend",
             "ctw",

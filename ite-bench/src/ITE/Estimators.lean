@@ -129,15 +129,15 @@ def infotheoryEstimator (binPath : FilePath := FilePath.mk "../target/release/in
           let paramString (k : String) : Option String :=
             params.strings[k]?
           let rateBackendStr := paramString "rate_backend"
-          let ncdBackendStr := paramString "ncd_backend"
+          let compressionBackendStr := paramString "compression_backend"
           let methodStr := paramString "method"
 
           let withCommonFlags (args : Array String) : Array String :=
             let args := match rateBackendStr with
               | some rb => args.push "--rate-backend" |>.push rb
               | none => args
-            let args := match ncdBackendStr with
-              | some nb => args.push "--ncd-backend" |>.push nb
+            let args := match compressionBackendStr with
+              | some nb => args.push "--compression-backend" |>.push nb
               | none => args
             let args := match methodStr with
               | some m => args.push "--method" |>.push m

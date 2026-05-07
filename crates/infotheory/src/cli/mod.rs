@@ -960,7 +960,7 @@ fn validate_cli_backend_sources(inv: &CliBackendInvocation<'_>) -> Result<(), St
     if inv.compression_backend_json_path.is_some() {
         if inv.flags.explicit_compression_backend {
             return Err(
-                "--compression-backend-json cannot be combined with --compression-backend or --ncd-backend"
+                "--compression-backend-json cannot be combined with --compression-backend"
                     .to_string(),
             );
         }
@@ -1428,7 +1428,7 @@ fn parse_ncd_variant_name(variant: &str) -> NcdVariant {
     }
 }
 
-fn compiled_ncd_backend_from_json(
+fn compiled_compression_backend_from_json(
     value: &serde_json::Value,
 ) -> InfotheoryResult<CompiledCompressionBackend> {
     let Some(backend_value) = value
@@ -1549,7 +1549,7 @@ pub(super) fn process_json_line(line: &str) -> String {
 
             let ncd_result = if v.get("compression_backend").is_some() || v.get("backend").is_some()
             {
-                compiled_ncd_backend_from_json(&v)
+                compiled_compression_backend_from_json(&v)
                     .and_then(|backend| try_ncd_bytes_backend(x, y, &backend, ncd_variant))
             } else if cfg!(feature = "backend-zpaq") {
                 try_ncd_bytes(x, y, &method, ncd_variant)
@@ -1588,7 +1588,7 @@ pub(super) fn process_json_line(line: &str) -> String {
 
             let ncd_result = if v.get("compression_backend").is_some() || v.get("backend").is_some()
             {
-                compiled_ncd_backend_from_json(&v)
+                compiled_compression_backend_from_json(&v)
                     .and_then(|backend| try_ncd_paths_compiled_backend(&path1, &path2, &backend, ncd_variant))
             } else if cfg!(feature = "backend-zpaq") {
                 try_ncd_paths(&path1, &path2, &method, ncd_variant)
@@ -1709,7 +1709,7 @@ pub(super) fn process_json_line(line: &str) -> String {
             let datas: Vec<Vec<u8>> = texts.iter().map(|t| t.as_bytes().to_vec()).collect();
             let matrix_result =
                 if v.get("compression_backend").is_some() || v.get("backend").is_some() {
-                    compiled_ncd_backend_from_json(&v)
+                    compiled_compression_backend_from_json(&v)
                         .and_then(|backend| try_ncd_matrix_bytes_backend(&datas, &backend, ncd_variant))
                 } else if cfg!(feature = "backend-zpaq") {
                     try_ncd_matrix_bytes(&datas, &method, ncd_variant)
