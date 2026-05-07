@@ -4,7 +4,7 @@
   "assets": [
     {
       "id": "dataset",
-      "path": "benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
+      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
     }
   ],
   "input_asset": "dataset",
