@@ -196,7 +196,7 @@ fn generate_cli_rwkv_emits_requested_bytes() {
             "generate",
             &path_str,
             "--rate-backend",
-            "rwkv",
+            "rwkv7",
             "--method",
             "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
             "--bytes",
