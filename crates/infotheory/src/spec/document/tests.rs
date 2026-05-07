@@ -9,6 +9,7 @@ use crate::aixi::common::{
     DEFAULT_RANDOM_SEED, parallel_uct_workers_one_warning_count_for_tests,
     reset_parallel_uct_workers_one_warning_for_tests,
 };
+#[cfg_attr(not(feature = "tuner"), allow(unused_imports))]
 #[cfg(feature = "backend-ctw")]
 use crate::api::CompressionBackend;
 use crate::api::RateBackend;
@@ -36,7 +37,7 @@ fn action_alphabet(n: usize) -> ActionAlphabet {
     ActionAlphabet::try_from_usize(n).expect("test fixture action alphabet must be non-zero")
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "tuner"))]
 fn sample_tune_spec() -> TuneSpec {
     TuneSpec {
         assets: vec![AssetBinding {
@@ -92,9 +93,6 @@ fn sample_planner_run() -> PlannerRunSpec {
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 1,
             agent_actions: action_alphabet(2),
-            min_reward: 0,
-            max_reward: 1,
-            reward_offset: 0,
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
@@ -201,6 +199,24 @@ fn planner_run_parser_rejects_noncanonical_builtin_names() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
+fn planner_run_parser_rejects_internal_tuner_bridge_environment() {
+    let mut value = sample_planner_run()
+        .to_canonical_json_value()
+        .expect("planner run json");
+    value["environment"]["name"] = serde_json::Value::String("tuner_bridge".to_string());
+
+    let err = match SpecDocument::parse_json_value(&value, Path::new(".")) {
+        Ok(_) => panic!("internal tuner_bridge environment must be rejected in planner JSON"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("internal tuner planner bridge"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
 fn planner_run_parser_rejects_zero_action_alphabet() {
     let mut value = sample_planner_run()
         .to_canonical_json_value()
@@ -249,6 +265,24 @@ fn planner_run_binary_roundtrip_covers_canonical_builtins() {
             }
         }
     }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn planner_run_binary_rejects_internal_tuner_bridge_environment() {
+    let mut spec = sample_planner_run();
+    spec.environment = EnvironmentSpec::Builtin {
+        builtin: BuiltinEnvironmentSpec::TunerBridge,
+    };
+    let bytes = SpecDocument::PlannerRun(spec).to_binary();
+    let err = match SpecDocument::from_binary(&bytes, Path::new(".")) {
+        Ok(_) => panic!("internal tuner_bridge must be rejected in public binary planner docs"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("internal tuner planner bridge"),
+        "{err}"
+    );
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -658,7 +692,7 @@ fn staged_pipeline_supports_standalone_backend_documents() {
     }
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "tuner"))]
 #[test]
 fn tune_validation_and_compilation_accessors_surface_baseline_metadata() {
     let spec = sample_tune_spec();
@@ -683,7 +717,7 @@ fn tune_validation_and_compilation_accessors_surface_baseline_metadata() {
     );
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "tuner"))]
 #[test]
 fn standalone_backend_documents_roundtrip_without_embedded_json_fragments() {
     let rate = SpecDocument::RateBackend(RateBackend::Ctw { depth: 8 });
@@ -981,18 +1015,22 @@ fn standalone_mamba_method_documents_roundtrip_file_and_online_policies() {
     }
 }
 
-#[cfg(feature = "all-backends")]
+#[cfg(all(feature = "all-backends", feature = "tuner"))]
 #[test]
 fn planner_and_tune_documents_roundtrip_all_controller_variants() {
-    let interface = PlannerInterfaceSpec {
+    let planner_interface = PlannerInterfaceSpec {
         observation_bits: 2,
         observation_stream_len: 2,
         observation_key_mode: ObservationKeyMode::StreamHash,
         reward_bits: 2,
         agent_actions: action_alphabet(3),
-        min_reward: 0,
-        max_reward: 3,
-        reward_offset: 0,
+    };
+    let tune_interface = TunePlannerInterfaceSpec {
+        observation_bits: 2,
+        observation_stream_len: 2,
+        observation_key_mode: ObservationKeyMode::StreamHash,
+        reward_bits: 2,
+        agent_actions: action_alphabet(3),
     };
 
     let planner_docs = vec![
@@ -1001,7 +1039,7 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
             environment: EnvironmentSpec::Builtin {
                 builtin: BuiltinEnvironmentSpec::CoinFlip,
             },
-            interface: interface.clone(),
+            interface: planner_interface.clone(),
             controller: ControllerSpec::McAixi(McAixiControllerSpec {
                 predictor: RateBackend::FacCtw {
                     base_depth: 8,
@@ -1034,7 +1072,7 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
             environment: EnvironmentSpec::Builtin {
                 builtin: BuiltinEnvironmentSpec::Blackjack,
             },
-            interface: interface.clone(),
+            interface: planner_interface.clone(),
             controller: ControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhControllerSpec {
                 predictor: RateBackend::Mixture {
                     spec: Arc::new(
@@ -1104,7 +1142,7 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
                 framing: crate::compression::FramingMode::Framed,
             },
             controller: TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
-                interface: interface.clone(),
+                interface: tune_interface.clone(),
                 planner_simulations_per_step: 10,
             }),
             bounds: bounds.clone(),
@@ -1129,11 +1167,13 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
                 framing: crate::compression::FramingMode::Raw,
             },
             controller: TuneControllerSpec::AiqiDiscounted(AiqiDiscountedTuneControllerSpec {
-                interface: interface.clone(),
+                interface: tune_interface.clone(),
                 planner_simulations_per_step: 12,
                 return_horizon: 5,
                 return_bins: 16,
                 discount_factor: 0.97,
+                min_improvement: -1.0,
+                max_improvement: 1.0,
             }),
             bounds: bounds.clone(),
             eval_time_limit_seconds: 2.0,
@@ -1163,7 +1203,7 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
             },
             controller: TuneControllerSpec::AiqiWarmstartExactJh(
                 WarmStartExactJhTuneControllerSpec {
-                    interface,
+                    interface: tune_interface,
                     planner_simulations_per_step: 7,
                     return_horizon: 4,
                     warmstart_teacher_dataset_asset: "teacher".to_string(),
@@ -1303,17 +1343,41 @@ fn planner_run_compile_exposes_compiled_predictor_and_action_bits() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
-fn planner_run_compile_rejects_unrepresentable_reward_ranges() {
-    let mut spec = sample_planner_run();
-    spec.interface.reward_bits = 1;
-    spec.interface.min_reward = 0;
-    spec.interface.max_reward = 100;
-    spec.interface.reward_offset = 0;
-    let err = match spec.compile() {
-        Ok(_) => panic!("unrepresentable rewards must fail"),
+fn planner_run_parser_rejects_legacy_shared_interface_reward_fields() {
+    let err = match SpecDocument::parse_json_value(
+        &serde_json::json!({
+            "schema_version": 1,
+            "kind": "planner_run",
+            "assets": [],
+            "environment": {
+                "kind": "builtin",
+                "name": "coin_flip"
+            },
+            "interface": {
+                "observation_bits": 1,
+                "observation_stream_len": 1,
+                "observation_key_mode": "full_stream",
+                "reward_bits": 1,
+                "agent_actions": 2,
+                "min_reward": 0
+            },
+            "controller": {
+                "kind": "aiqi_discounted",
+                "predictor": {"kind":"ctw","depth":8},
+                "discount_gamma": 0.99,
+                "return_horizon": 2,
+                "return_bins": 8,
+                "augmentation_period": 2,
+                "baseline_exploration": 0.01
+            },
+            "runtime": {}
+        }),
+        std::path::Path::new("."),
+    ) {
+        Ok(_) => panic!("legacy interface reward fields must be rejected"),
         Err(err) => err,
     };
-    assert!(err.to_string().contains("reward_bits too small"), "{err}");
+    assert!(err.to_string().contains("unknown interface field"), "{err}");
 }
 
 #[cfg(all(feature = "backend-ctw", feature = "backend-zpaq"))]
@@ -1418,9 +1482,6 @@ fn sample_vm_planner_run() -> PlannerRunSpec {
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 8,
             agent_actions: action_alphabet(1),
-            min_reward: 0,
-            max_reward: 255,
-            reward_offset: 0,
         },
         controller: ControllerSpec::McAixi(McAixiControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
@@ -1563,7 +1624,7 @@ fn planner_run_compile_rejects_unknown_vm_enum_names() {
     assert!(err.to_string().contains("unknown VM fuzz mutator"), "{err}");
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "tuner"))]
 #[test]
 fn tune_document_binary_roundtrip_is_stable() {
     let spec = sample_tune_spec();
@@ -1578,7 +1639,7 @@ fn tune_document_binary_roundtrip_is_stable() {
     }
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "tuner"))]
 #[test]
 fn tune_compile_model_bytes_ignore_outer_request_controls() {
     let mut base = sample_tune_spec();
@@ -1617,9 +1678,6 @@ fn planner_run_validation_reports_missing_backend_feature() {
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 1,
             agent_actions: action_alphabet(2),
-            min_reward: 0,
-            max_reward: 1,
-            reward_offset: 0,
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
@@ -1654,6 +1712,7 @@ fn planner_run_validation_reports_missing_backend_feature() {
 fn builtin_environment_canonical_names_round_trip() {
     use BuiltinEnvironmentSpec::*;
     let cases: &[(BuiltinEnvironmentSpec, &str)] = &[
+        (TunerBridge, "tuner_bridge"),
         (CoinFlip, "coin_flip"),
         (BiasedRockPaperScissor, "biased_rock_paper_scissor"),
         (KuhnPoker, "kuhn_poker"),

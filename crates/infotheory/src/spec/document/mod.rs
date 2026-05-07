@@ -1,6 +1,8 @@
 //! Canonical top-level specification documents for planner runs and tuning.
 
-use super::core::{CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend};
+#[cfg(feature = "tuner")]
+use super::core::CompiledCompressionBackend;
+use super::core::{CanonicalBytes, CompiledRateBackend};
 use super::{
     SpecEnvironment, SpecError, SpecResult, compression_backend_to_json_value,
     parse_compression_backend_json, parse_rate_backend_json, rate_backend_to_json_value,
@@ -18,7 +20,34 @@ pub const SPEC_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 
 const DOCUMENT_MAGIC: &[u8; 4] = b"itsd";
 const DOCUMENT_BINARY_VERSION: u8 = 1;
+#[cfg(feature = "tuner")]
 const TUNE_CANONICALIZATION_CLASSIFICATION_VERSION: &str = "bounds-v1";
+
+#[cfg(feature = "tuner")]
+pub(crate) const CANDIDATE_EXTERNAL_ASSET_FORBIDDEN: &str = "candidate_external_asset_forbidden";
+
+#[cfg(feature = "tuner")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TuneInvalidReason {
+    CandidateExternalAssetForbidden,
+    CandidateOutOfBounds,
+    CandidateCompileError,
+    InvalidActionIndex,
+    InapplicableAction,
+}
+
+#[cfg(feature = "tuner")]
+impl TuneInvalidReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CandidateExternalAssetForbidden => CANDIDATE_EXTERNAL_ASSET_FORBIDDEN,
+            Self::CandidateOutOfBounds => "candidate_out_of_bounds",
+            Self::CandidateCompileError => "candidate_compile_error",
+            Self::InvalidActionIndex => "invalid_action_index",
+            Self::InapplicableAction => "inapplicable_action",
+        }
+    }
+}
 
 mod binary;
 mod io;
@@ -53,6 +82,7 @@ impl ValidatedPlannerRunSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl ValidatedTuneSpec {
     /// Canonical validated tune spec.
     pub fn canonical_spec(&self) -> &TuneSpec {
@@ -103,6 +133,7 @@ impl ValidatedSpecDocument {
     pub fn canonical_bytes(&self) -> &CanonicalBytes {
         match self {
             Self::PlannerRun(validated) => validated.canonical_bytes(),
+            #[cfg(feature = "tuner")]
             Self::Tune(validated) => validated.canonical_bytes(),
             Self::RateBackend(validated) => validated.canonical_bytes(),
             Self::CompressionBackend(validated) => validated.canonical_bytes(),
@@ -115,6 +146,7 @@ impl ValidatedSpecDocument {
             Self::PlannerRun(validated) => {
                 Ok(CompiledSpecDocument::PlannerRun(validated.compile()?))
             }
+            #[cfg(feature = "tuner")]
             Self::Tune(validated) => Ok(CompiledSpecDocument::Tune(validated.compile()?)),
             Self::RateBackend(validated) => {
                 Ok(CompiledSpecDocument::RateBackend(validated.compile()?))
@@ -131,6 +163,7 @@ impl CompiledSpecDocument {
     pub fn canonical_bytes(&self) -> &CanonicalBytes {
         match self {
             Self::PlannerRun(compiled) => compiled.canonical_bytes(),
+            #[cfg(feature = "tuner")]
             Self::Tune(compiled) => compiled.canonical_bytes(),
             Self::RateBackend(compiled) => compiled.canonical_bytes(),
             Self::CompressionBackend(compiled) => compiled.canonical_bytes(),
@@ -142,6 +175,7 @@ impl CompiledSpecDocument {
 pub type PlannerRunDocument = PlannerRunSpec;
 
 /// Compatibility alias for a tune top-level spec document.
+#[cfg(feature = "tuner")]
 pub type TuneDocument = TuneSpec;
 
 impl PlannerRunSpec {
@@ -208,6 +242,7 @@ impl BuiltinEnvironmentSpec {
     /// it does not change when new builtins are added.
     pub fn canonical_name(&self) -> &'static str {
         match self {
+            Self::TunerBridge => "tuner_bridge",
             Self::CoinFlip => "coin_flip",
             Self::BiasedRockPaperScissor => "biased_rock_paper_scissor",
             Self::KuhnPoker => "kuhn_poker",
@@ -219,6 +254,7 @@ impl BuiltinEnvironmentSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl TuneSpec {
     /// Validate this tune request and return its canonical binary encoding.
     pub fn validate_in(&self, env: &SpecEnvironment) -> SpecResult<ValidatedTuneSpec> {
@@ -289,6 +325,7 @@ impl SpecDocument {
     pub fn validate_in(&self, env: &SpecEnvironment) -> SpecResult<ValidatedSpecDocument> {
         match self {
             Self::PlannerRun(spec) => Ok(ValidatedSpecDocument::PlannerRun(spec.validate_in(env)?)),
+            #[cfg(feature = "tuner")]
             Self::Tune(spec) => Ok(ValidatedSpecDocument::Tune(spec.validate_in(env)?)),
             Self::RateBackend(backend) => Ok(ValidatedSpecDocument::RateBackend(
                 backend.validate_in(env)?,
@@ -318,6 +355,7 @@ impl SpecDocument {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::PlannerRun(_) => "planner_run",
+            #[cfg(feature = "tuner")]
             Self::Tune(_) => "tune",
             Self::RateBackend(_) => "rate_backend",
             Self::CompressionBackend(_) => "compression_backend",
@@ -331,6 +369,7 @@ impl CanonicalJson for PlannerRunSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl CanonicalJson for TuneSpec {
     fn to_canonical_json_value(&self) -> SpecResult<serde_json::Value> {
         serializer::tune_spec_to_json_value(self)
@@ -413,6 +452,7 @@ impl CompiledPlannerRunSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl CompiledTuneSpec {
     /// Canonical tune request used to build this compiled form.
     pub fn canonical_spec(&self) -> &TuneSpec {
@@ -422,6 +462,11 @@ impl CompiledTuneSpec {
     /// Deterministic canonical bytes for the tune request document.
     pub fn canonical_bytes(&self) -> &CanonicalBytes {
         &self.canonical_bytes
+    }
+
+    /// Base directory used to resolve relative paths during tune compilation.
+    pub fn base_dir(&self) -> &Path {
+        self.base_dir.as_path()
     }
 
     /// Resolved assets used when compiling the tune request.
@@ -513,6 +558,7 @@ impl fmt::Debug for ValidatedPlannerRunSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 impl fmt::Debug for ValidatedTuneSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValidatedTuneSpec")

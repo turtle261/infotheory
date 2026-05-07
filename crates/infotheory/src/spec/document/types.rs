@@ -36,6 +36,8 @@ pub struct ResolvedAssetBinding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum BuiltinEnvironmentSpec {
+    /// Internal planner environment bridge used by tuner controller execution.
+    TunerBridge,
     /// GameEngine biased coin-flip environment.
     CoinFlip,
     /// GameEngine biased rock-paper-scissor environment.
@@ -323,12 +325,27 @@ pub struct PlannerInterfaceSpec {
     pub reward_bits: usize,
     /// Action alphabet cardinality.
     pub agent_actions: ActionAlphabet,
-    /// Minimum instantaneous reward.
-    pub min_reward: i64,
-    /// Maximum instantaneous reward.
-    pub max_reward: i64,
-    /// Reward offset used for unsigned encoding.
-    pub reward_offset: i64,
+}
+
+/// Canonical tuning interface contract for planner-visible I/O shape.
+///
+/// Unlike [`PlannerInterfaceSpec`], this tune-document interface is limited to
+/// candidate-facing semantics and intentionally excludes reward encoding
+/// bounds that belong to executor/runtime policy.
+#[cfg(feature = "tuner")]
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct TunePlannerInterfaceSpec {
+    /// Observation bit width.
+    pub observation_bits: usize,
+    /// Observation stream length.
+    pub observation_stream_len: usize,
+    /// Observation key projection used by MC-AIXI.
+    pub observation_key_mode: ObservationKeyMode,
+    /// Reward bit width.
+    pub reward_bits: usize,
+    /// Action alphabet cardinality.
+    pub agent_actions: ActionAlphabet,
 }
 
 /// MC-AIXI controller configuration using a unified rate-backend predictor.
@@ -442,6 +459,7 @@ pub struct PlannerRunSpec {
 }
 
 /// Tuning controller kind specified by the formal tuner document.
+#[cfg(feature = "tuner")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TuneControllerKind {
@@ -456,6 +474,7 @@ pub enum TuneControllerKind {
 }
 
 /// Annealed hill-climbing controller settings for tuning.
+#[cfg(feature = "tuner")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct AnnealedHillClimbingTuneControllerSpec {
@@ -464,21 +483,23 @@ pub struct AnnealedHillClimbingTuneControllerSpec {
 }
 
 /// MC-AIXI(FAC-CTW) controller settings for tuning.
+#[cfg(feature = "tuner")]
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct McAixiFacCtwTuneControllerSpec {
     /// Planner/environment observation/reward/action contract.
-    pub interface: PlannerInterfaceSpec,
+    pub interface: TunePlannerInterfaceSpec,
     /// Simulation budget per planner step.
     pub planner_simulations_per_step: usize,
 }
 
 /// Discounted AIQI controller settings for tuning.
+#[cfg(feature = "tuner")]
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct AiqiDiscountedTuneControllerSpec {
     /// Planner/environment observation/reward/action contract.
-    pub interface: PlannerInterfaceSpec,
+    pub interface: TunePlannerInterfaceSpec,
     /// Simulation budget per planner step.
     pub planner_simulations_per_step: usize,
     /// Return horizon.
@@ -487,14 +508,19 @@ pub struct AiqiDiscountedTuneControllerSpec {
     pub return_bins: usize,
     /// Discount factor used to construct returns.
     pub discount_factor: f64,
+    /// Minimum clipped improvement value.
+    pub min_improvement: f64,
+    /// Maximum clipped improvement value.
+    pub max_improvement: f64,
 }
 
 /// Warm-start exact-J_H controller settings for tuning.
+#[cfg(feature = "tuner")]
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct WarmStartExactJhTuneControllerSpec {
     /// Planner/environment observation/reward/action contract.
-    pub interface: PlannerInterfaceSpec,
+    pub interface: TunePlannerInterfaceSpec,
     /// Simulation budget per planner step.
     pub planner_simulations_per_step: usize,
     /// Return horizon.
@@ -506,6 +532,7 @@ pub struct WarmStartExactJhTuneControllerSpec {
 }
 
 /// Runtime-selectable controller configuration for the tuning runtime.
+#[cfg(feature = "tuner")]
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum TuneControllerSpec {
@@ -519,6 +546,7 @@ pub enum TuneControllerSpec {
     AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec),
 }
 
+#[cfg(feature = "tuner")]
 impl TuneControllerSpec {
     /// Controller family tag for this tuning controller configuration.
     pub fn kind(&self) -> TuneControllerKind {
@@ -531,7 +559,7 @@ impl TuneControllerSpec {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tuner"))]
 mod tests {
     use super::*;
 
@@ -539,16 +567,13 @@ mod tests {
         ActionAlphabet::try_from_usize(n).expect("test action alphabet must be non-zero")
     }
 
-    fn sample_interface() -> PlannerInterfaceSpec {
-        PlannerInterfaceSpec {
+    fn sample_tune_interface() -> TunePlannerInterfaceSpec {
+        TunePlannerInterfaceSpec {
             observation_bits: 8,
             observation_stream_len: 1,
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 8,
             agent_actions: action_alphabet(2),
-            min_reward: 0,
-            max_reward: 1,
-            reward_offset: 0,
         }
     }
 
@@ -561,23 +586,25 @@ mod tests {
         assert_eq!(annealed.kind(), TuneControllerKind::AnnealedHillClimbing);
 
         let mc_aixi = TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
-            interface: sample_interface(),
+            interface: sample_tune_interface(),
             planner_simulations_per_step: 8,
         });
         assert_eq!(mc_aixi.kind(), TuneControllerKind::McAixiFacCtw);
 
         let aiqi = TuneControllerSpec::AiqiDiscounted(AiqiDiscountedTuneControllerSpec {
-            interface: sample_interface(),
+            interface: sample_tune_interface(),
             planner_simulations_per_step: 8,
             return_horizon: 2,
             return_bins: 8,
             discount_factor: 0.5,
+            min_improvement: -1.0,
+            max_improvement: 1.0,
         });
         assert_eq!(aiqi.kind(), TuneControllerKind::AiqiDiscounted);
 
         let warmstart =
             TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
-                interface: sample_interface(),
+                interface: sample_tune_interface(),
                 planner_simulations_per_step: 8,
                 return_horizon: 2,
                 warmstart_teacher_dataset_asset: "teacher".to_string(),
@@ -588,6 +615,7 @@ mod tests {
 }
 
 /// Bounded numeric range for a named canonical tuning parameter.
+#[cfg(feature = "tuner")]
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct TuneParameterRangeSpec {
@@ -600,6 +628,7 @@ pub struct TuneParameterRangeSpec {
 }
 
 /// Canonical bounds specification for the future tuning runtime.
+#[cfg(feature = "tuner")]
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct TuneBoundsSpec {
@@ -624,6 +653,7 @@ pub struct TuneBoundsSpec {
 }
 
 /// Canonical future-facing tune request document.
+#[cfg(feature = "tuner")]
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TuneSpec {
@@ -720,6 +750,7 @@ pub struct CompiledPlannerRunSpec {
 }
 
 /// Compiled tuning controller configuration.
+#[cfg(feature = "tuner")]
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum CompiledTuneController {
@@ -734,11 +765,13 @@ pub enum CompiledTuneController {
 }
 
 /// Compiled tune request with resolved assets and compiled baseline candidate.
+#[cfg(feature = "tuner")]
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct CompiledTuneSpec {
     pub(super) canonical_spec: Arc<TuneSpec>,
     pub(super) canonical_bytes: CanonicalBytes,
+    pub(super) base_dir: PathBuf,
     pub(super) resolved_assets: Arc<[ResolvedAssetBinding]>,
     pub(super) baseline_candidate: CompiledCompressionBackend,
     pub(super) controller: CompiledTuneController,
@@ -752,6 +785,7 @@ pub enum SpecDocument {
     /// Planner-run configuration document.
     PlannerRun(PlannerRunSpec),
     /// Tune request document.
+    #[cfg(feature = "tuner")]
     Tune(TuneSpec),
     /// Standalone rate-backend document.
     RateBackend(RateBackend),
@@ -780,11 +814,13 @@ pub struct ValidatedPlannerRunSpec {
 }
 
 /// Canonicalized and validated tune request document.
+#[cfg(feature = "tuner")]
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ValidatedTuneSpec {
     pub(super) canonical_spec: Arc<TuneSpec>,
     pub(super) canonical_bytes: CanonicalBytes,
+    #[cfg(feature = "tuner")]
     pub(super) base_dir: PathBuf,
 }
 
@@ -798,6 +834,7 @@ pub enum ValidatedSpecDocument {
     /// Validated planner-run document.
     PlannerRun(ValidatedPlannerRunSpec),
     /// Validated tune document.
+    #[cfg(feature = "tuner")]
     Tune(ValidatedTuneSpec),
     /// Validated standalone rate-backend document.
     RateBackend(ValidatedRateBackend),
@@ -815,6 +852,7 @@ pub enum CompiledSpecDocument {
     /// Compiled planner-run document.
     PlannerRun(CompiledPlannerRunSpec),
     /// Compiled tune document.
+    #[cfg(feature = "tuner")]
     Tune(CompiledTuneSpec),
     /// Compiled standalone rate-backend document.
     RateBackend(CompiledRateBackend),

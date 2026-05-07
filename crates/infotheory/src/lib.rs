@@ -151,6 +151,9 @@ pub mod search;
 pub(crate) mod simd_math;
 /// Shared backend/spec parsing and loading helpers.
 pub mod spec;
+/// Tuner runtime execution controls and CLI-facing tuning entrypoints.
+#[cfg(feature = "tuner")]
+pub mod tuner;
 use crate::api::CompiledRateBackend;
 #[cfg(all(test, feature = "all-backends"))]
 pub(crate) use crate::api::{

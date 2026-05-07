@@ -1,15 +1,17 @@
 //! Canonical validation and compile pipeline for spec documents.
 
 use super::{
-    AssetBinding, CompiledPlannerController, CompiledPlannerRunSpec, CompiledTuneController,
-    CompiledTuneSpec, ControllerSpec, EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec,
-    PlannerRuntimeSpec, ResolvedAssetBinding, SpecEnvironment, SpecError, SpecResult,
-    TUNE_CANONICALIZATION_CLASSIFICATION_VERSION, TuneBoundsSpec, TuneControllerSpec, TuneSpec,
-    ValidatedPlannerRunSpec, ValidatedTuneSpec,
+    AssetBinding, CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec,
+    EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec, PlannerRuntimeSpec,
+    ResolvedAssetBinding, SpecEnvironment, SpecError, SpecResult, ValidatedPlannerRunSpec,
+};
+#[cfg(feature = "tuner")]
+use super::{
+    CompiledTuneController, CompiledTuneSpec, TUNE_CANONICALIZATION_CLASSIFICATION_VERSION,
+    TuneBoundsSpec, TuneControllerSpec, TunePlannerInterfaceSpec, TuneSpec, ValidatedTuneSpec,
 };
 use crate::aixi::common::{
-    MctsStrategy, bits_for_cardinality, resolve_random_seed, validate_reward_encoding_bounds,
-    warn_parallel_uct_workers_one_once,
+    MctsStrategy, bits_for_cardinality, resolve_random_seed, warn_parallel_uct_workers_one_once,
 };
 use crate::spec::core::AssetRef;
 use std::collections::HashMap;
@@ -93,6 +95,7 @@ fn validate_mc_aixi_mcts_strategy(strategy: MctsStrategy) -> SpecResult<()> {
     }
 }
 
+#[cfg(feature = "tuner")]
 fn compile_tune_controller(spec: &TuneControllerSpec) -> CompiledTuneController {
     match spec {
         TuneControllerSpec::AnnealedHillClimbing(inner) => {
@@ -136,11 +139,13 @@ pub(super) fn compile_validated_planner_run_spec(
     })
 }
 
+#[cfg(feature = "tuner")]
 pub(super) fn compile_tune_spec(spec: &TuneSpec, base_dir: &Path) -> SpecResult<CompiledTuneSpec> {
     let validated = spec.validate_in(&SpecEnvironment::new(base_dir))?;
     compile_validated_tune_spec(&validated)
 }
 
+#[cfg(feature = "tuner")]
 pub(super) fn compile_validated_tune_spec(
     validated: &ValidatedTuneSpec,
 ) -> SpecResult<CompiledTuneSpec> {
@@ -148,6 +153,7 @@ pub(super) fn compile_validated_tune_spec(
     Ok(CompiledTuneSpec {
         canonical_spec: validated.canonical_spec.clone(),
         canonical_bytes: validated.canonical_bytes().clone(),
+        base_dir: validated.base_dir.clone(),
         resolved_assets: resolve_asset_bindings(
             &validated.canonical_spec().assets,
             &validated.base_dir,
@@ -180,6 +186,7 @@ pub(super) fn canonicalize_planner_run(
     })
 }
 
+#[cfg(feature = "tuner")]
 pub(super) fn canonicalize_tune_spec(
     spec: &TuneSpec,
     env: &SpecEnvironment,
@@ -215,6 +222,7 @@ pub(super) fn canonicalize_tune_spec(
     })
 }
 
+#[cfg(feature = "tuner")]
 fn canonicalize_tune_controller(
     controller: &TuneControllerSpec,
     assets: &[AssetBinding],
@@ -228,14 +236,14 @@ fn canonicalize_tune_controller(
             Ok(TuneControllerSpec::AnnealedHillClimbing(inner.clone()))
         }
         TuneControllerSpec::McAixiFacCtw(inner) => {
-            validate_planner_interface_for_tuning(&inner.interface)?;
+            canonicalize_tune_interface_spec(&inner.interface)?;
             if inner.planner_simulations_per_step == 0 {
                 return Err(SpecError::new("planner_simulations_per_step must be >= 1"));
             }
             Ok(TuneControllerSpec::McAixiFacCtw(inner.clone()))
         }
         TuneControllerSpec::AiqiDiscounted(inner) => {
-            validate_planner_interface_for_tuning(&inner.interface)?;
+            canonicalize_tune_interface_spec(&inner.interface)?;
             if inner.planner_simulations_per_step == 0 {
                 return Err(SpecError::new("planner_simulations_per_step must be >= 1"));
             }
@@ -248,10 +256,21 @@ fn canonicalize_tune_controller(
             if !(0.0..1.0).contains(&inner.discount_factor) {
                 return Err(SpecError::new("discount_factor must be in [0, 1)"));
             }
+            if !inner.min_improvement.is_finite() {
+                return Err(SpecError::new("min_improvement must be finite"));
+            }
+            if !inner.max_improvement.is_finite() {
+                return Err(SpecError::new("max_improvement must be finite"));
+            }
+            if inner.max_improvement <= inner.min_improvement {
+                return Err(SpecError::new(
+                    "max_improvement must be greater than min_improvement",
+                ));
+            }
             Ok(TuneControllerSpec::AiqiDiscounted(inner.clone()))
         }
         TuneControllerSpec::AiqiWarmstartExactJh(inner) => {
-            validate_planner_interface_for_tuning(&inner.interface)?;
+            canonicalize_tune_interface_spec(&inner.interface)?;
             if inner.planner_simulations_per_step == 0 {
                 return Err(SpecError::new("planner_simulations_per_step must be >= 1"));
             }
@@ -270,8 +289,17 @@ fn canonicalize_tune_controller(
     }
 }
 
-fn validate_planner_interface_for_tuning(spec: &PlannerInterfaceSpec) -> SpecResult<()> {
-    canonicalize_interface_spec(spec).map(|_| ())
+#[cfg(feature = "tuner")]
+fn canonicalize_tune_interface_spec(
+    spec: &TunePlannerInterfaceSpec,
+) -> SpecResult<TunePlannerInterfaceSpec> {
+    if spec.observation_stream_len == 0 {
+        return Err(SpecError::new("observation_stream_len must be >= 1"));
+    }
+    if spec.reward_bits == 0 {
+        return Err(SpecError::new("reward_bits must be >= 1"));
+    }
+    Ok(spec.clone())
 }
 
 fn canonicalize_assets(bindings: &[AssetBinding]) -> Vec<AssetBinding> {
@@ -306,6 +334,7 @@ fn validate_asset_bindings(bindings: &[AssetBinding]) -> SpecResult<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "tuner", feature = "vm", test))]
 fn ensure_asset_exists(bindings: &[AssetBinding], id: &str) -> SpecResult<()> {
     if bindings.iter().any(|binding| binding.id == id) {
         Ok(())
@@ -321,13 +350,6 @@ fn canonicalize_interface_spec(spec: &PlannerInterfaceSpec) -> SpecResult<Planne
     if spec.reward_bits == 0 {
         return Err(SpecError::new("reward_bits must be >= 1"));
     }
-    validate_reward_encoding_bounds(
-        spec.min_reward,
-        spec.max_reward,
-        spec.reward_offset,
-        spec.reward_bits,
-    )
-    .map_err(|err| SpecError::new(err.to_string()))?;
     Ok(spec.clone())
 }
 
@@ -543,6 +565,7 @@ fn canonicalize_runtime_spec(spec: &PlannerRuntimeSpec) -> SpecResult<PlannerRun
     Ok(canonical)
 }
 
+#[cfg(feature = "tuner")]
 fn validate_tune_bounds(bounds: &TuneBoundsSpec) -> SpecResult<()> {
     if bounds.max_experts == 0 {
         return Err(SpecError::new("max_experts must be >= 1"));
@@ -598,6 +621,7 @@ fn validate_tune_bounds(bounds: &TuneBoundsSpec) -> SpecResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "tuner")]
 fn canonicalize_tune_bounds(bounds: &TuneBoundsSpec) -> TuneBoundsSpec {
     let mut allowed = bounds.allowed_backends.clone();
     allowed.sort();
@@ -638,6 +662,7 @@ fn canonicalize_tune_bounds(bounds: &TuneBoundsSpec) -> TuneBoundsSpec {
     }
 }
 
+#[cfg(feature = "tuner")]
 fn finite_positive(value: f64, label: &str) -> SpecResult<f64> {
     if value.is_finite() && value > 0.0 {
         Ok(value)
@@ -646,6 +671,7 @@ fn finite_positive(value: f64, label: &str) -> SpecResult<f64> {
     }
 }
 
+#[cfg(feature = "tuner")]
 fn nonzero_u64(value: u64, label: &str) -> SpecResult<u64> {
     if value > 0 {
         Ok(value)
@@ -654,6 +680,7 @@ fn nonzero_u64(value: u64, label: &str) -> SpecResult<u64> {
     }
 }
 
+#[cfg(feature = "tuner")]
 fn clean_optional_string(value: Option<&str>) -> Option<String> {
     value.and_then(|text| {
         let trimmed = text.trim();
@@ -667,8 +694,10 @@ mod tests {
     #[cfg(feature = "backend-ctw")]
     use crate::aixi::common::MctsStrategy;
     use crate::aixi::common::{ActionAlphabet, ObservationKeyMode};
+    #[cfg(all(feature = "backend-ctw", feature = "tuner"))]
+    use crate::api::CompressionBackend;
     #[cfg(feature = "backend-ctw")]
-    use crate::api::{CompressionBackend, RateBackend};
+    use crate::api::RateBackend;
     #[cfg(feature = "backend-ctw")]
     use std::num::NonZeroUsize;
 
@@ -683,9 +712,17 @@ mod tests {
             observation_key_mode: ObservationKeyMode::FullStream,
             reward_bits: 8,
             agent_actions: action_alphabet(2),
-            min_reward: 0,
-            max_reward: 1,
-            reward_offset: 0,
+        }
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "tuner"))]
+    fn sample_tune_interface() -> TunePlannerInterfaceSpec {
+        TunePlannerInterfaceSpec {
+            observation_bits: 8,
+            observation_stream_len: 1,
+            observation_key_mode: ObservationKeyMode::FullStream,
+            reward_bits: 8,
+            agent_actions: action_alphabet(2),
         }
     }
 
@@ -822,16 +859,19 @@ mod tests {
         .expect_err("non-positive explore_gamma must fail");
         assert!(err.to_string().contains("explore_gamma must be > 0"));
 
-        assert_eq!(finite_positive(0.5, "x").expect("positive finite"), 0.5);
-        assert!(finite_positive(f64::INFINITY, "x").is_err());
-        assert_eq!(nonzero_u64(7, "y").expect("nonzero"), 7);
-        assert!(nonzero_u64(0, "y").is_err());
-        assert_eq!(
-            clean_optional_string(Some("  trimmed  ")),
-            Some("trimmed".to_string())
-        );
-        assert_eq!(clean_optional_string(Some("   ")), None);
-        assert_eq!(clean_optional_string(None), None);
+        #[cfg(feature = "tuner")]
+        {
+            assert_eq!(finite_positive(0.5, "x").expect("positive finite"), 0.5);
+            assert!(finite_positive(f64::INFINITY, "x").is_err());
+            assert_eq!(nonzero_u64(7, "y").expect("nonzero"), 7);
+            assert!(nonzero_u64(0, "y").is_err());
+            assert_eq!(
+                clean_optional_string(Some("  trimmed  ")),
+                Some("trimmed".to_string())
+            );
+            assert_eq!(clean_optional_string(Some("   ")), None);
+            assert_eq!(clean_optional_string(None), None);
+        }
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -909,7 +949,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "backend-ctw")]
+    #[cfg(all(feature = "backend-ctw", feature = "tuner"))]
     #[test]
     fn tune_controller_and_bounds_validation_cover_semantic_errors() {
         let assets = vec![AssetBinding {
@@ -935,11 +975,13 @@ mod tests {
 
         let err = canonicalize_tune_controller(
             &TuneControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedTuneControllerSpec {
-                interface: sample_interface(),
+                interface: sample_tune_interface(),
                 planner_simulations_per_step: 2,
                 return_horizon: 2,
                 return_bins: 3,
                 discount_factor: 0.5,
+                min_improvement: -1.0,
+                max_improvement: 1.0,
             }),
             &assets,
             &env,
@@ -951,9 +993,73 @@ mod tests {
         );
 
         let err = canonicalize_tune_controller(
+            &TuneControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedTuneControllerSpec {
+                interface: sample_tune_interface(),
+                planner_simulations_per_step: 2,
+                return_horizon: 2,
+                return_bins: 4,
+                discount_factor: 0.5,
+                min_improvement: f64::NAN,
+                max_improvement: 1.0,
+            }),
+            &assets,
+            &env,
+        )
+        .expect_err("NaN min_improvement must fail");
+        assert!(err.to_string().contains("min_improvement must be finite"));
+
+        let err = canonicalize_tune_controller(
+            &TuneControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedTuneControllerSpec {
+                interface: sample_tune_interface(),
+                planner_simulations_per_step: 2,
+                return_horizon: 2,
+                return_bins: 4,
+                discount_factor: 0.5,
+                min_improvement: f64::INFINITY,
+                max_improvement: 1.0,
+            }),
+            &assets,
+            &env,
+        )
+        .expect_err("infinite min_improvement must fail");
+        assert!(err.to_string().contains("min_improvement must be finite"));
+
+        let err = canonicalize_tune_controller(
+            &TuneControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedTuneControllerSpec {
+                interface: sample_tune_interface(),
+                planner_simulations_per_step: 2,
+                return_horizon: 2,
+                return_bins: 4,
+                discount_factor: 0.5,
+                min_improvement: -1.0,
+                max_improvement: f64::NAN,
+            }),
+            &assets,
+            &env,
+        )
+        .expect_err("NaN max_improvement must fail");
+        assert!(err.to_string().contains("max_improvement must be finite"));
+
+        let err = canonicalize_tune_controller(
+            &TuneControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedTuneControllerSpec {
+                interface: sample_tune_interface(),
+                planner_simulations_per_step: 2,
+                return_horizon: 2,
+                return_bins: 4,
+                discount_factor: 0.5,
+                min_improvement: -1.0,
+                max_improvement: f64::INFINITY,
+            }),
+            &assets,
+            &env,
+        )
+        .expect_err("infinite max_improvement must fail");
+        assert!(err.to_string().contains("max_improvement must be finite"));
+
+        let err = canonicalize_tune_controller(
             &TuneControllerSpec::AiqiWarmstartExactJh(
                 super::super::WarmStartExactJhTuneControllerSpec {
-                    interface: sample_interface(),
+                    interface: sample_tune_interface(),
                     planner_simulations_per_step: 2,
                     return_horizon: 2,
                     warmstart_teacher_dataset_asset: "missing".to_string(),

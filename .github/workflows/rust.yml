@@ -43,6 +43,13 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all --check
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Tuner traceability anchors
+        run: |
+          uv run --no-project --with tree-sitter==0.25.2 --with tree-sitter-rust==0.24.2 python scripts/check_tuner_traceability.py
+
       - name: Dependency integrity
         run: |
           cargo update --workspace --locked --dry-run
@@ -55,6 +62,7 @@ jobs:
           cargo clippy -p infotheory --lib --bins --features cli --locked
           cargo clippy -p infotheory --lib --no-default-features --features aixi-gameengine --locked
           cargo clippy -p infotheory --lib --bins --no-default-features --features cli --locked
+          cargo clippy -p infotheory --lib --bins --no-default-features --features "cli tuner backend-ctw" --locked
 
       - name: Warnings gate (default + no-default CLI)
         run: |
@@ -63,6 +71,9 @@ jobs:
           RUSTFLAGS="-D warnings" cargo check -p infotheory --features cli --locked
           RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features aixi-gameengine --locked
           RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features cli --locked
+          RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features "tuner backend-ctw" --locked
+          RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features "cli tuner backend-ctw" --locked
+          RUSTFLAGS="-D warnings" cargo check -p infotheory_py --no-default-features --features "tuner backend-ctw" --locked
 
       - name: Install coverage tooling
         run: cargo install cargo-llvm-cov --locked
@@ -202,6 +213,10 @@ jobs:
           cargo check -p infotheory --no-default-features --features all-backends --locked
           cargo check -p infotheory --no-default-features --features aixi-gameengine --locked
           cargo check -p infotheory --no-default-features --features "aixi-gameengine all-backends" --locked
+          cargo check -p infotheory --no-default-features --features tuner --locked
+          cargo check -p infotheory --no-default-features --features "tuner backend-ctw" --locked
+          cargo check -p infotheory --no-default-features --features "cli tuner backend-ctw" --locked
+          cargo check -p infotheory_py --no-default-features --features "tuner backend-ctw" --locked
           cargo check -p infotheory --no-default-features --features cli --locked
           cargo check -p infotheory --features cli --locked
           cargo check --manifest-path vendor/gameengine/Cargo.toml --features builtin --locked
@@ -226,6 +241,10 @@ jobs:
           cargo test -p infotheory --no-default-features --features all-backends --no-run --locked
           cargo test -p infotheory --no-default-features --features aixi-gameengine --no-run --locked
           cargo test -p infotheory --no-default-features --features "aixi-gameengine all-backends" --no-run --locked
+          cargo test -p infotheory --no-default-features --features tuner --no-run --locked
+          cargo test -p infotheory --no-default-features --features "tuner backend-ctw" --no-run --locked
+          cargo test -p infotheory --no-default-features --features "cli tuner backend-ctw" --no-run --locked
+          cargo test -p infotheory_py --no-default-features --features "tuner backend-ctw" --no-run --locked
           cargo test -p infotheory --no-default-features --features cli --no-run --locked
           cargo test -p infotheory --features cli --no-run --locked
           cargo test -p infotheory --no-default-features --features "cli all-backends" --no-run --locked
@@ -253,6 +272,8 @@ jobs:
           cargo test -p infotheory --release --no-default-features --features backend-rwkv parse_compression_backend_name_method_wraps_rwkv_cfg_methods_as_rate_backend --locked
           cargo test -p infotheory --release --no-default-features --features backend-rwkv parse_compression_backend_json_wraps_rwkv_cfg_methods_as_rate_backend --locked
           cargo test -p infotheory --release --no-default-features --features backend-mamba parse_compression_backend_json_wraps_mamba_cfg_rate_backend --locked
+          cargo test -p infotheory --release --no-default-features --features "tuner backend-ctw" --test tuner_integration --locked
+          cargo test -p infotheory --release --no-default-features --features "cli tuner backend-ctw" --test tuner_integration tune_cli_accepts_executor_flags_and_writes_report --locked
           cargo test -p infotheory --release --features cli --locked
           cargo test -p infotheory --release --no-default-features --features cli --bin infotheory --locked
           cargo test -p infotheory --release --no-default-features --features "cli all-backends" --locked
@@ -412,6 +433,7 @@ jobs:
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --features cli
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features cli
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features "cli all-backends"
+            RUSTFLAGS="-D warnings" cargo check -p infotheory_py --locked --no-default-features --features "tuner backend-ctw"
             RUSTFLAGS="-D warnings" cargo check -p zpaq_rs --locked
             RUSTFLAGS="-D warnings" cargo check -p benchman --locked
 

@@ -2,9 +2,12 @@
 
 use super::{
     AssetBinding, ControllerSpec, EnvironmentSpec, PlannerInterfaceSpec, PlannerRunSpec,
-    PlannerRuntimeSpec, SPEC_DOCUMENT_SCHEMA_VERSION, SpecDocument, SpecResult, TuneBoundsSpec,
-    TuneControllerSpec, TuneParameterRangeSpec, TuneSpec, compression_backend_to_json_value,
-    rate_backend_to_json_value,
+    PlannerRuntimeSpec, SPEC_DOCUMENT_SCHEMA_VERSION, SpecDocument, SpecResult,
+    compression_backend_to_json_value, rate_backend_to_json_value,
+};
+#[cfg(feature = "tuner")]
+use super::{
+    TuneBoundsSpec, TuneControllerSpec, TuneParameterRangeSpec, TunePlannerInterfaceSpec, TuneSpec,
 };
 use crate::aixi::common::MctsStrategy;
 
@@ -17,6 +20,7 @@ use super::{
 pub(super) fn spec_document_to_json_value(doc: &SpecDocument) -> SpecResult<serde_json::Value> {
     match doc {
         SpecDocument::PlannerRun(spec) => planner_run_to_json_value(spec),
+        #[cfg(feature = "tuner")]
         SpecDocument::Tune(spec) => tune_spec_to_json_value(spec),
         SpecDocument::RateBackend(backend) => Ok(serde_json::json!({
             "schema_version": SPEC_DOCUMENT_SCHEMA_VERSION,
@@ -43,6 +47,7 @@ pub(super) fn planner_run_to_json_value(spec: &PlannerRunSpec) -> SpecResult<ser
     }))
 }
 
+#[cfg(feature = "tuner")]
 pub(super) fn tune_spec_to_json_value(spec: &TuneSpec) -> SpecResult<serde_json::Value> {
     Ok(serde_json::json!({
         "schema_version": SPEC_DOCUMENT_SCHEMA_VERSION,
@@ -121,9 +126,17 @@ fn interface_spec_to_json_value(spec: &PlannerInterfaceSpec) -> serde_json::Valu
         "observation_key_mode": super::observation_key_mode_name(spec.observation_key_mode),
         "reward_bits": spec.reward_bits,
         "agent_actions": spec.agent_actions.get(),
-        "min_reward": spec.min_reward,
-        "max_reward": spec.max_reward,
-        "reward_offset": spec.reward_offset,
+    })
+}
+
+#[cfg(feature = "tuner")]
+fn tune_interface_spec_to_json_value(spec: &TunePlannerInterfaceSpec) -> serde_json::Value {
+    serde_json::json!({
+        "observation_bits": spec.observation_bits,
+        "observation_stream_len": spec.observation_stream_len,
+        "observation_key_mode": super::observation_key_mode_name(spec.observation_key_mode),
+        "reward_bits": spec.reward_bits,
+        "agent_actions": spec.agent_actions.get(),
     })
 }
 
@@ -190,6 +203,7 @@ fn runtime_spec_to_json_value(spec: &PlannerRuntimeSpec) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "tuner")]
 fn tune_bounds_to_json_value(bounds: &TuneBoundsSpec) -> serde_json::Value {
     serde_json::json!({
         "allowed_backends": bounds.allowed_backends,
@@ -204,6 +218,7 @@ fn tune_bounds_to_json_value(bounds: &TuneBoundsSpec) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "tuner")]
 fn tune_controller_to_json_value(spec: &TuneControllerSpec) -> serde_json::Value {
     match spec {
         TuneControllerSpec::AnnealedHillClimbing(inner) => serde_json::json!({
@@ -212,20 +227,22 @@ fn tune_controller_to_json_value(spec: &TuneControllerSpec) -> serde_json::Value
         }),
         TuneControllerSpec::McAixiFacCtw(inner) => serde_json::json!({
             "kind": "mc_aixi_fac_ctw",
-            "interface": interface_spec_to_json_value(&inner.interface),
+            "interface": tune_interface_spec_to_json_value(&inner.interface),
             "planner_simulations_per_step": inner.planner_simulations_per_step,
         }),
         TuneControllerSpec::AiqiDiscounted(inner) => serde_json::json!({
             "kind": "aiqi_discounted",
-            "interface": interface_spec_to_json_value(&inner.interface),
+            "interface": tune_interface_spec_to_json_value(&inner.interface),
             "planner_simulations_per_step": inner.planner_simulations_per_step,
             "return_horizon": inner.return_horizon,
             "return_bins": inner.return_bins,
             "discount_factor": inner.discount_factor,
+            "min_improvement": inner.min_improvement,
+            "max_improvement": inner.max_improvement,
         }),
         TuneControllerSpec::AiqiWarmstartExactJh(inner) => serde_json::json!({
             "kind": "aiqi_warmstart_exact_jh",
-            "interface": interface_spec_to_json_value(&inner.interface),
+            "interface": tune_interface_spec_to_json_value(&inner.interface),
             "planner_simulations_per_step": inner.planner_simulations_per_step,
             "return_horizon": inner.return_horizon,
             "warmstart_teacher_dataset_asset": inner.warmstart_teacher_dataset_asset,
@@ -234,6 +251,7 @@ fn tune_controller_to_json_value(spec: &TuneControllerSpec) -> serde_json::Value
     }
 }
 
+#[cfg(feature = "tuner")]
 fn tune_parameter_range_to_json_value(range: &TuneParameterRangeSpec) -> serde_json::Value {
     serde_json::json!({
         "parameter": range.parameter,

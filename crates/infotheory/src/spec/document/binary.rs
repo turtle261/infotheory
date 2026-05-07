@@ -13,6 +13,7 @@ pub(super) fn encode_spec_document_payload(doc: &SpecDocument) -> Vec<u8> {
             out.push(0);
             encode_planner_run(spec, &mut out);
         }
+        #[cfg(feature = "tuner")]
         SpecDocument::Tune(spec) => {
             out.push(1);
             encode_tune_spec(spec, &mut out);
@@ -41,12 +42,17 @@ pub(super) fn decode_spec_document(bytes: &[u8], base_dir: &Path) -> SpecResult<
             "unsupported spec document binary version '{version}'"
         )));
     }
-    match cursor.read_u8()? {
+    let document = match cursor.read_u8()? {
         0 => Ok(SpecDocument::PlannerRun(decode_planner_run(
             &mut cursor,
             base_dir,
         )?)),
+        #[cfg(feature = "tuner")]
         1 => Ok(SpecDocument::Tune(decode_tune_spec(&mut cursor, base_dir)?)),
+        #[cfg(not(feature = "tuner"))]
+        1 => Err(SpecError::new(
+            "tune binary documents require infotheory built with feature 'tuner'",
+        )),
         2 => Ok(SpecDocument::RateBackend(decode_rate_backend(
             &mut cursor,
             base_dir,
@@ -55,7 +61,11 @@ pub(super) fn decode_spec_document(bytes: &[u8], base_dir: &Path) -> SpecResult<
             decode_compression_backend(&mut cursor, base_dir)?,
         )),
         tag => Err(SpecError::new(format!("unknown spec document tag '{tag}'"))),
+    }?;
+    if cursor.has_remaining() {
+        return Err(SpecError::new("unexpected trailing bytes in spec document"));
     }
+    Ok(document)
 }
 
 fn encode_planner_run(spec: &PlannerRunSpec, out: &mut Vec<u8>) {
@@ -67,15 +77,27 @@ fn encode_planner_run(spec: &PlannerRunSpec, out: &mut Vec<u8>) {
 }
 
 fn decode_planner_run(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<PlannerRunSpec> {
-    Ok(PlannerRunSpec {
+    let spec = PlannerRunSpec {
         assets: decode_assets(cursor)?,
         environment: decode_environment_spec(cursor, base_dir)?,
         interface: decode_interface_spec(cursor)?,
         controller: decode_controller_spec(cursor, base_dir)?,
         runtime: decode_runtime_spec(cursor)?,
-    })
+    };
+    if matches!(
+        spec.environment,
+        EnvironmentSpec::Builtin {
+            builtin: BuiltinEnvironmentSpec::TunerBridge
+        }
+    ) {
+        return Err(SpecError::new(
+            "builtin environment 'tuner_bridge' is an internal tuner planner bridge and is not accepted in public binary planner-run documents",
+        ));
+    }
+    Ok(spec)
 }
 
+#[cfg(feature = "tuner")]
 fn encode_tune_spec(spec: &TuneSpec, out: &mut Vec<u8>) {
     encode_assets(&spec.assets, out);
     push_string(out, &spec.input_asset);
@@ -91,6 +113,7 @@ fn encode_tune_spec(spec: &TuneSpec, out: &mut Vec<u8>) {
     push_option_string(out, spec.report_path.as_deref());
 }
 
+#[cfg(feature = "tuner")]
 fn decode_tune_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<TuneSpec> {
     let assets = decode_assets(cursor)?;
     let input_asset = cursor.read_string()?;
@@ -965,17 +988,14 @@ fn encode_interface_spec(spec: &PlannerInterfaceSpec, out: &mut Vec<u8>) {
     out.push(observation_key_mode_tag(spec.observation_key_mode));
     push_u64(out, spec.reward_bits as u64);
     push_u64(out, spec.agent_actions.get() as u64);
-    push_i64(out, spec.min_reward);
-    push_i64(out, spec.max_reward);
-    push_i64(out, spec.reward_offset);
 }
 
 fn decode_interface_spec(cursor: &mut Cursor<'_>) -> SpecResult<PlannerInterfaceSpec> {
-    let observation_bits = cursor.read_u64()? as usize;
-    let observation_stream_len = cursor.read_u64()? as usize;
+    let observation_bits = decode_usize_field(cursor, "interface.observation_bits")?;
+    let observation_stream_len = decode_usize_field(cursor, "interface.observation_stream_len")?;
     let observation_key_mode = decode_observation_key_mode(cursor.read_u8()?)?;
-    let reward_bits = cursor.read_u64()? as usize;
-    let agent_actions_raw = cursor.read_u64()? as usize;
+    let reward_bits = decode_usize_field(cursor, "interface.reward_bits")?;
+    let agent_actions_raw = decode_usize_field(cursor, "interface.agent_actions")?;
     let agent_actions = crate::aixi::common::ActionAlphabet::try_from_usize(agent_actions_raw)
         .map_err(|_| SpecError::new("binary interface.agent_actions must be >= 1"))?;
     Ok(PlannerInterfaceSpec {
@@ -984,10 +1004,39 @@ fn decode_interface_spec(cursor: &mut Cursor<'_>) -> SpecResult<PlannerInterface
         observation_key_mode,
         reward_bits,
         agent_actions,
-        min_reward: cursor.read_i64()?,
-        max_reward: cursor.read_i64()?,
-        reward_offset: cursor.read_i64()?,
     })
+}
+
+#[cfg(feature = "tuner")]
+fn encode_tune_interface_spec(spec: &TunePlannerInterfaceSpec, out: &mut Vec<u8>) {
+    push_u64(out, spec.observation_bits as u64);
+    push_u64(out, spec.observation_stream_len as u64);
+    out.push(observation_key_mode_tag(spec.observation_key_mode));
+    push_u64(out, spec.reward_bits as u64);
+    push_u64(out, spec.agent_actions.get() as u64);
+}
+
+#[cfg(feature = "tuner")]
+fn decode_tune_interface_spec(cursor: &mut Cursor<'_>) -> SpecResult<TunePlannerInterfaceSpec> {
+    let observation_bits = decode_usize_field(cursor, "interface.observation_bits")?;
+    let observation_stream_len = decode_usize_field(cursor, "interface.observation_stream_len")?;
+    let observation_key_mode = decode_observation_key_mode(cursor.read_u8()?)?;
+    let reward_bits = decode_usize_field(cursor, "interface.reward_bits")?;
+    let agent_actions_raw = decode_usize_field(cursor, "interface.agent_actions")?;
+    let agent_actions = crate::aixi::common::ActionAlphabet::try_from_usize(agent_actions_raw)
+        .map_err(|_| SpecError::new("binary interface.agent_actions must be >= 1"))?;
+    Ok(TunePlannerInterfaceSpec {
+        observation_bits,
+        observation_stream_len,
+        observation_key_mode,
+        reward_bits,
+        agent_actions,
+    })
+}
+
+fn decode_usize_field(cursor: &mut Cursor<'_>, label: &str) -> SpecResult<usize> {
+    let raw = cursor.read_u64()?;
+    usize::try_from(raw).map_err(|_| SpecError::new(format!("{label} exceeds usize::MAX")))
 }
 
 fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
@@ -1118,6 +1167,7 @@ fn decode_runtime_spec(cursor: &mut Cursor<'_>) -> SpecResult<PlannerRuntimeSpec
     })
 }
 
+#[cfg(feature = "tuner")]
 fn encode_tune_bounds(bounds: &TuneBoundsSpec, out: &mut Vec<u8>) {
     push_string_list(out, &bounds.allowed_backends);
     push_string_list(out, &bounds.forbidden_backends);
@@ -1145,6 +1195,7 @@ fn encode_tune_bounds(bounds: &TuneBoundsSpec, out: &mut Vec<u8>) {
     }
 }
 
+#[cfg(feature = "tuner")]
 fn decode_tune_bounds(cursor: &mut Cursor<'_>) -> SpecResult<TuneBoundsSpec> {
     let allowed_backends = cursor.read_string_list()?;
     let forbidden_backends = cursor.read_string_list()?;
@@ -1184,6 +1235,7 @@ fn decode_tune_bounds(cursor: &mut Cursor<'_>) -> SpecResult<TuneBoundsSpec> {
     })
 }
 
+#[cfg(feature = "tuner")]
 fn encode_tune_controller(spec: &TuneControllerSpec, out: &mut Vec<u8>) {
     match spec {
         TuneControllerSpec::AnnealedHillClimbing(inner) => {
@@ -1194,22 +1246,24 @@ fn encode_tune_controller(spec: &TuneControllerSpec, out: &mut Vec<u8>) {
         }
         TuneControllerSpec::McAixiFacCtw(inner) => {
             out.push(tune_controller_kind_tag(TuneControllerKind::McAixiFacCtw));
-            encode_interface_spec(&inner.interface, out);
+            encode_tune_interface_spec(&inner.interface, out);
             push_u64(out, inner.planner_simulations_per_step as u64);
         }
         TuneControllerSpec::AiqiDiscounted(inner) => {
             out.push(tune_controller_kind_tag(TuneControllerKind::AiqiDiscounted));
-            encode_interface_spec(&inner.interface, out);
+            encode_tune_interface_spec(&inner.interface, out);
             push_u64(out, inner.planner_simulations_per_step as u64);
             push_u64(out, inner.return_horizon as u64);
             push_u64(out, inner.return_bins as u64);
             push_f64(out, inner.discount_factor);
+            push_f64(out, inner.min_improvement);
+            push_f64(out, inner.max_improvement);
         }
         TuneControllerSpec::AiqiWarmstartExactJh(inner) => {
             out.push(tune_controller_kind_tag(
                 TuneControllerKind::AiqiWarmstartExactJh,
             ));
-            encode_interface_spec(&inner.interface, out);
+            encode_tune_interface_spec(&inner.interface, out);
             push_u64(out, inner.planner_simulations_per_step as u64);
             push_u64(out, inner.return_horizon as u64);
             push_string(out, &inner.warmstart_teacher_dataset_asset);
@@ -1218,6 +1272,7 @@ fn encode_tune_controller(spec: &TuneControllerSpec, out: &mut Vec<u8>) {
     }
 }
 
+#[cfg(feature = "tuner")]
 fn decode_tune_controller(cursor: &mut Cursor<'_>) -> SpecResult<TuneControllerSpec> {
     match decode_tune_controller_kind(cursor.read_u8()?)? {
         TuneControllerKind::AnnealedHillClimbing => Ok(TuneControllerSpec::AnnealedHillClimbing(
@@ -1227,22 +1282,24 @@ fn decode_tune_controller(cursor: &mut Cursor<'_>) -> SpecResult<TuneControllerS
         )),
         TuneControllerKind::McAixiFacCtw => Ok(TuneControllerSpec::McAixiFacCtw(
             McAixiFacCtwTuneControllerSpec {
-                interface: decode_interface_spec(cursor)?,
+                interface: decode_tune_interface_spec(cursor)?,
                 planner_simulations_per_step: cursor.read_u64()? as usize,
             },
         )),
         TuneControllerKind::AiqiDiscounted => Ok(TuneControllerSpec::AiqiDiscounted(
             AiqiDiscountedTuneControllerSpec {
-                interface: decode_interface_spec(cursor)?,
+                interface: decode_tune_interface_spec(cursor)?,
                 planner_simulations_per_step: cursor.read_u64()? as usize,
                 return_horizon: cursor.read_u64()? as usize,
                 return_bins: cursor.read_u64()? as usize,
                 discount_factor: cursor.read_f64()?,
+                min_improvement: cursor.read_f64()?,
+                max_improvement: cursor.read_f64()?,
             },
         )),
         TuneControllerKind::AiqiWarmstartExactJh => Ok(TuneControllerSpec::AiqiWarmstartExactJh(
             WarmStartExactJhTuneControllerSpec {
-                interface: decode_interface_spec(cursor)?,
+                interface: decode_tune_interface_spec(cursor)?,
                 planner_simulations_per_step: cursor.read_u64()? as usize,
                 return_horizon: cursor.read_u64()? as usize,
                 warmstart_teacher_dataset_asset: cursor.read_string()?,
@@ -1448,6 +1505,7 @@ fn decode_vm_trace(cursor: &mut Cursor<'_>) -> SpecResult<VmTraceSpec> {
 
 pub(super) fn builtin_environment_name(env: BuiltinEnvironmentSpec) -> &'static str {
     match env {
+        BuiltinEnvironmentSpec::TunerBridge => "tuner_bridge",
         BuiltinEnvironmentSpec::CoinFlip => "coin_flip",
         BuiltinEnvironmentSpec::BiasedRockPaperScissor => "biased_rock_paper_scissor",
         BuiltinEnvironmentSpec::KuhnPoker => "kuhn_poker",
@@ -1553,6 +1611,7 @@ fn decode_calibration_context(tag: u8) -> SpecResult<crate::api::CalibrationCont
 
 fn builtin_environment_tag(env: BuiltinEnvironmentSpec) -> u8 {
     match env {
+        BuiltinEnvironmentSpec::TunerBridge => 8,
         BuiltinEnvironmentSpec::CoinFlip => 0,
         BuiltinEnvironmentSpec::ExtendedTiger => 2,
         BuiltinEnvironmentSpec::TicTacToe => 3,
@@ -1565,6 +1624,7 @@ fn builtin_environment_tag(env: BuiltinEnvironmentSpec) -> u8 {
 
 fn decode_builtin_environment(tag: u8) -> SpecResult<BuiltinEnvironmentSpec> {
     match tag {
+        8 => Ok(BuiltinEnvironmentSpec::TunerBridge),
         0 => Ok(BuiltinEnvironmentSpec::CoinFlip),
         1 => Err(SpecError::new(
             "builtin environment tag '1' (ctw_test) is no longer supported",
@@ -1770,6 +1830,7 @@ fn decode_observation_key_mode(tag: u8) -> SpecResult<ObservationKeyMode> {
     }
 }
 
+#[cfg(feature = "tuner")]
 fn tune_controller_kind_tag(kind: TuneControllerKind) -> u8 {
     match kind {
         TuneControllerKind::AnnealedHillClimbing => 0,
@@ -1779,6 +1840,7 @@ fn tune_controller_kind_tag(kind: TuneControllerKind) -> u8 {
     }
 }
 
+#[cfg(feature = "tuner")]
 fn decode_tune_controller_kind(tag: u8) -> SpecResult<TuneControllerKind> {
     match tag {
         0 => Ok(TuneControllerKind::AnnealedHillClimbing),
@@ -1857,6 +1919,12 @@ fn push_option_f64(out: &mut Vec<u8>, value: Option<f64>) {
     }
 }
 
+#[cfg(any(
+    feature = "tuner",
+    feature = "vm",
+    feature = "backend-rwkv",
+    feature = "backend-mamba"
+))]
 fn push_string_list(out: &mut Vec<u8>, items: &[String]) {
     push_u64(out, items.len() as u64);
     for item in items {
@@ -1957,6 +2025,12 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    #[cfg(any(
+        feature = "tuner",
+        feature = "vm",
+        feature = "backend-rwkv",
+        feature = "backend-mamba"
+    ))]
     fn read_string_list(&mut self) -> SpecResult<Vec<String>> {
         let len = self.read_u64()? as usize;
         let mut items = Vec::with_capacity(len);
@@ -1966,8 +2040,75 @@ impl<'a> Cursor<'a> {
         Ok(items)
     }
 
-    #[cfg(feature = "vm")]
     fn has_remaining(&self) -> bool {
         self.pos < self.bytes.len()
+    }
+}
+
+#[cfg(all(test, feature = "tuner"))]
+mod tests {
+    use super::*;
+
+    fn encode_tune_interface(
+        observation_bits: u64,
+        observation_stream_len: u64,
+        reward_bits: u64,
+        agent_actions: u64,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_u64(&mut bytes, observation_bits);
+        push_u64(&mut bytes, observation_stream_len);
+        bytes.push(observation_key_mode_tag(ObservationKeyMode::FullStream));
+        push_u64(&mut bytes, reward_bits);
+        push_u64(&mut bytes, agent_actions);
+        bytes
+    }
+
+    #[test]
+    fn decode_tune_interface_accepts_platform_usize_max() {
+        let platform_max: u64 = usize::MAX as u64;
+        let bytes = encode_tune_interface(platform_max, platform_max, platform_max, 2);
+        let mut cursor = Cursor::new(&bytes);
+
+        let decoded = decode_tune_interface_spec(&mut cursor).expect("decode tune interface");
+
+        assert_eq!(decoded.observation_bits, usize::MAX);
+        assert_eq!(decoded.observation_stream_len, usize::MAX);
+        assert_eq!(decoded.reward_bits, usize::MAX);
+        assert_eq!(decoded.agent_actions.get(), 2);
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn decode_tune_interface_rejects_observation_bits_exceeding_usize() {
+        let overflow: u64 = (u32::MAX as u64) + 1;
+        let bytes = encode_tune_interface(overflow, 1, 1, 2);
+        let mut cursor = Cursor::new(&bytes);
+
+        let err = decode_tune_interface_spec(&mut cursor)
+            .expect_err("overflowing observation_bits must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("interface.observation_bits exceeds usize::MAX"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn decode_tune_interface_rejects_reward_bits_exceeding_usize() {
+        let overflow: u64 = (u32::MAX as u64) + 1;
+        let bytes = encode_tune_interface(1, 1, overflow, 2);
+        let mut cursor = Cursor::new(&bytes);
+
+        let err = decode_tune_interface_spec(&mut cursor)
+            .expect_err("overflowing reward_bits must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("interface.reward_bits exceeds usize::MAX"),
+            "unexpected error: {err}"
+        );
     }
 }

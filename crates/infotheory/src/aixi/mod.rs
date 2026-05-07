@@ -36,3 +36,8 @@ pub(crate) mod planner_spec;
 pub(crate) mod test_envs;
 #[cfg(all(feature = "aixi", feature = "vm"))]
 pub mod vm_nyx;
+#[cfg(feature = "aixi")]
+pub mod warmstart;
+#[cfg(feature = "aixi")]
+#[doc(hidden)]
+pub mod warmstart_contract;

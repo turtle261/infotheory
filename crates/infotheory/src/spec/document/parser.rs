@@ -1,13 +1,17 @@
 //! JSON parsing for canonical top-level specification documents.
 
 use super::{
-    AiqiDiscountedControllerSpec, AiqiDiscountedTuneControllerSpec,
-    AnnealedHillClimbingTuneControllerSpec, AssetBinding, ControllerSpec, EnvironmentSpec,
-    McAixiControllerSpec, McAixiFacCtwTuneControllerSpec, PlannerInterfaceSpec, PlannerRunSpec,
-    PlannerRuntimeSpec, SPEC_DOCUMENT_SCHEMA_VERSION, SpecDocument, SpecError, SpecResult,
-    TuneBoundsSpec, TuneControllerSpec, TuneParameterRangeSpec, TuneSpec,
-    WarmStartExactJhControllerSpec, WarmStartExactJhTuneControllerSpec,
-    parse_compression_backend_json, parse_rate_backend_json,
+    AiqiDiscountedControllerSpec, AssetBinding, ControllerSpec, EnvironmentSpec,
+    McAixiControllerSpec, PlannerInterfaceSpec, PlannerRunSpec, PlannerRuntimeSpec,
+    SPEC_DOCUMENT_SCHEMA_VERSION, SpecDocument, SpecError, SpecResult,
+    WarmStartExactJhControllerSpec, parse_compression_backend_json, parse_rate_backend_json,
+};
+#[cfg(feature = "tuner")]
+use super::{
+    AiqiDiscountedTuneControllerSpec, AnnealedHillClimbingTuneControllerSpec,
+    McAixiFacCtwTuneControllerSpec, TuneBoundsSpec, TuneControllerSpec, TuneInvalidReason,
+    TuneParameterRangeSpec, TunePlannerInterfaceSpec, TuneSpec, WarmStartExactJhTuneControllerSpec,
+    compression_backend_to_json_value,
 };
 use crate::aixi::common::{ActionAlphabet, MctsStrategy};
 use std::num::NonZeroUsize;
@@ -36,9 +40,14 @@ pub(super) fn parse_spec_document_json_value(
         "planner_run" => Ok(SpecDocument::PlannerRun(parse_planner_run_json_value(
             value, base_dir,
         )?)),
+        #[cfg(feature = "tuner")]
         "tune" => Ok(SpecDocument::Tune(parse_tune_spec_json_value(
             value, base_dir,
         )?)),
+        #[cfg(not(feature = "tuner"))]
+        "tune" => Err(SpecError::new(
+            "tune documents require infotheory built with feature 'tuner'",
+        )),
         "rate_backend" => Ok(SpecDocument::RateBackend(parse_rate_backend_json(
             &value["backend"],
             base_dir,
@@ -71,16 +80,50 @@ fn parse_planner_run_json_value(
     })
 }
 
+#[cfg(feature = "tuner")]
 fn parse_tune_spec_json_value(value: &serde_json::Value, base_dir: &Path) -> SpecResult<TuneSpec> {
+    ensure_known_fields(
+        value,
+        &[
+            "schema_version",
+            "kind",
+            "assets",
+            "input_asset",
+            "baseline_candidate",
+            "controller",
+            "bounds",
+            "eval_time_limit_seconds",
+            "time_budget_seconds",
+            "min_throughput_bytes_per_second",
+            "max_memory_bytes",
+            "output_config_path",
+            "seed",
+            "report_path",
+        ],
+        "tune",
+    )?;
+    let baseline_candidate_value = value
+        .get("baseline_candidate")
+        .ok_or_else(|| SpecError::new("tune.baseline_candidate is required"))?;
+    reject_tune_candidate_local_external_refs(baseline_candidate_value)?;
+    let baseline_candidate = parse_compression_backend_json(
+        baseline_candidate_value,
+        base_dir,
+        None,
+        crate::compression::FramingMode::Framed,
+    )?;
+    ensure_tune_baseline_candidate_is_canonical_json(
+        baseline_candidate_value,
+        &baseline_candidate,
+    )?;
     Ok(TuneSpec {
-        assets: parse_asset_bindings(&value["assets"])?,
-        input_asset: required_string(&value["input_asset"], "input_asset")?,
-        baseline_candidate: parse_compression_backend_json(
-            &value["baseline_candidate"],
-            base_dir,
-            None,
-            crate::compression::FramingMode::Framed,
+        assets: parse_tune_asset_bindings(
+            value
+                .get("assets")
+                .ok_or_else(|| SpecError::new("tune.assets is required"))?,
         )?,
+        input_asset: required_string(&value["input_asset"], "input_asset")?,
+        baseline_candidate,
         controller: parse_tune_controller_spec(&value["controller"])?,
         bounds: parse_tune_bounds_spec(&value["bounds"])?,
         eval_time_limit_seconds: required_f64(
@@ -99,6 +142,156 @@ fn parse_tune_spec_json_value(value: &serde_json::Value, base_dir: &Path) -> Spe
     })
 }
 
+#[cfg(feature = "tuner")]
+fn reject_tune_candidate_local_external_refs(value: &serde_json::Value) -> SpecResult<()> {
+    fn external_asset_forbidden_error(detail: String) -> SpecError {
+        SpecError::new(format!(
+            "{}: {detail}",
+            TuneInvalidReason::CandidateExternalAssetForbidden.as_str()
+        ))
+    }
+
+    fn visit(value: &serde_json::Value, path: &str) -> SpecResult<()> {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    let next = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if matches!(
+                        key.as_str(),
+                        "spec_path" | "base_path" | "model_path" | "path" | "load_from"
+                    ) {
+                        return Err(external_asset_forbidden_error(format!(
+                            "tune baseline_candidate contains candidate-local external asset field '{next}'"
+                        )));
+                    }
+                    visit(child, &next)?;
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    visit(child, &format!("{path}[{index}]"))?;
+                }
+            }
+            serde_json::Value::String(raw) => {
+                let trimmed = raw.trim_start();
+                if trimmed.starts_with("file:") || trimmed.contains("://") {
+                    return Err(external_asset_forbidden_error(format!(
+                        "tune baseline_candidate contains candidate-local external asset reference at '{path}'"
+                    )));
+                }
+                if raw.split(';').any(|segment| {
+                    segment
+                        .trim_start()
+                        .strip_prefix("policy:")
+                        .is_some_and(|policy| {
+                            policy
+                                .split(',')
+                                .any(|part| part.trim_start().starts_with("load_from="))
+                        })
+                }) {
+                    return Err(external_asset_forbidden_error(format!(
+                        "tune baseline_candidate contains candidate-local policy load_from at '{path}'"
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    visit(value, "baseline_candidate")
+}
+
+#[cfg(feature = "tuner")]
+fn ensure_tune_baseline_candidate_is_canonical_json(
+    source_value: &serde_json::Value,
+    parsed: &crate::api::CompressionBackend,
+) -> SpecResult<()> {
+    let canonical_value =
+        compression_backend_to_json_value(parsed).map_err(|err| SpecError::new(err.to_string()))?;
+    if source_value != &canonical_value {
+        let mismatch =
+            first_json_mismatch_path(source_value, &canonical_value, "baseline_candidate");
+        let mismatch_detail = mismatch
+            .map(|path| format!("; first mismatch at '{path}'"))
+            .unwrap_or_default();
+        return Err(SpecError::new(format!(
+            "tune.baseline_candidate must be canonical compression backend JSON with no unknown or alias fields{mismatch_detail}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tuner")]
+fn first_json_mismatch_path(
+    observed: &serde_json::Value,
+    canonical: &serde_json::Value,
+    path: &str,
+) -> Option<String> {
+    match (observed, canonical) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            for key in left.keys() {
+                if !right.contains_key(key) {
+                    return Some(format!("{path}.{key}"));
+                }
+            }
+            for key in right.keys() {
+                let child_path = format!("{path}.{key}");
+                match left.get(key) {
+                    Some(left_child) => {
+                        if let Some(mismatch) =
+                            first_json_mismatch_path(left_child, &right[key], &child_path)
+                        {
+                            return Some(mismatch);
+                        }
+                    }
+                    None => {
+                        return Some(child_path);
+                    }
+                }
+            }
+            None
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            if left.len() != right.len() {
+                return Some(format!("{path}.len"));
+            }
+            for (index, (left_child, right_child)) in left.iter().zip(right.iter()).enumerate() {
+                let child_path = format!("{path}[{index}]");
+                if let Some(mismatch) =
+                    first_json_mismatch_path(left_child, right_child, &child_path)
+                {
+                    return Some(mismatch);
+                }
+            }
+            None
+        }
+        _ => {
+            if observed == canonical {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        }
+    }
+}
+
+fn ensure_known_fields(value: &serde_json::Value, allowed: &[&str], label: &str) -> SpecResult<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| SpecError::new(format!("{label} document must be an object")))?;
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(SpecError::new(format!("unknown {label} field '{key}'")));
+        }
+    }
+    Ok(())
+}
+
 fn parse_asset_bindings(value: &serde_json::Value) -> SpecResult<Vec<AssetBinding>> {
     let Some(items) = value.as_array() else {
         return Ok(Vec::new());
@@ -106,6 +299,24 @@ fn parse_asset_bindings(value: &serde_json::Value) -> SpecResult<Vec<AssetBindin
     items
         .iter()
         .map(|item| {
+            Ok(AssetBinding {
+                id: required_string(&item["id"], "assets[].id")?,
+                path: required_string(&item["path"], "assets[].path")?,
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "tuner")]
+fn parse_tune_asset_bindings(value: &serde_json::Value) -> SpecResult<Vec<AssetBinding>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| SpecError::new("tune.assets must be an array"))?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            ensure_known_fields(item, &["id", "path"], &format!("tune.assets[{index}]"))?;
             Ok(AssetBinding {
                 id: required_string(&item["id"], "assets[].id")?,
                 path: required_string(&item["path"], "assets[].path")?,
@@ -141,28 +352,48 @@ fn parse_environment_spec(
                 .unwrap_or_else(|| "aixi-nyx".to_string()),
             shared_region_name: optional_string(&value["shared_region_name"])
                 .unwrap_or_else(|| "shared".to_string()),
-            shared_region_size: value["shared_region_size"].as_u64().unwrap_or(4096) as usize,
+            shared_region_size: default_usize(
+                &value["shared_region_size"],
+                4096,
+                "environment.shared_region_size",
+            )?,
             shared_memory_policy: parse_shared_memory_policy(
                 value["shared_memory_policy"].as_str().unwrap_or("snapshot"),
             )?,
             step_timeout_ms: value["step_timeout_ms"].as_u64().unwrap_or(100),
             boot_timeout_ms: value["boot_timeout_ms"].as_u64().unwrap_or(30_000),
-            episode_steps: value["episode_steps"].as_u64().unwrap_or(100) as usize,
+            episode_steps: default_usize(
+                &value["episode_steps"],
+                100,
+                "environment.episode_steps",
+            )?,
             step_cost: value["step_cost"].as_i64().unwrap_or(0),
             observation_policy: super::canonicalize_vm_observation_policy_name(
                 value["observation_policy"]
                     .as_str()
                     .unwrap_or("shared_memory"),
             )?,
-            observation_bits: value["observation_bits"].as_u64().unwrap_or(8) as usize,
-            observation_stream_len: value["observation_stream_len"].as_u64().unwrap_or(64) as usize,
+            observation_bits: default_usize(
+                &value["observation_bits"],
+                8,
+                "environment.observation_bits",
+            )?,
+            observation_stream_len: default_usize(
+                &value["observation_stream_len"],
+                64,
+                "environment.observation_stream_len",
+            )?,
             observation_stream_mode: super::canonicalize_vm_observation_stream_mode_name(
                 value["observation_stream_mode"]
                     .as_str()
                     .unwrap_or("pad_truncate"),
             )?,
-            observation_pad_byte: value["observation_pad_byte"].as_u64().unwrap_or(0) as u8,
-            reward_bits: value["reward_bits"].as_u64().unwrap_or(8) as usize,
+            observation_pad_byte: default_u8(
+                &value["observation_pad_byte"],
+                0,
+                "environment.observation_pad_byte",
+            )?,
+            reward_bits: default_usize(&value["reward_bits"], 8, "environment.reward_bits")?,
             reward_policy: parse_vm_reward_policy(&value["reward_policy"])?,
             reward_shaping: parse_optional_vm_reward_shaping(&value["reward_shaping"])?,
             action_source: parse_vm_action_source(&value["action_source"])?,
@@ -215,27 +446,65 @@ fn parse_environment_spec(
 }
 
 fn parse_interface_spec(value: &serde_json::Value) -> SpecResult<PlannerInterfaceSpec> {
-    let agent_actions_raw =
-        required_u64(&value["agent_actions"], "interface.agent_actions")? as usize;
+    ensure_known_fields(
+        value,
+        &[
+            "observation_bits",
+            "observation_stream_len",
+            "observation_key_mode",
+            "reward_bits",
+            "agent_actions",
+        ],
+        "interface",
+    )?;
+    let agent_actions_raw = required_usize(&value["agent_actions"], "interface.agent_actions")?;
     let agent_actions = ActionAlphabet::try_from_usize(agent_actions_raw)
         .map_err(|_| SpecError::new("interface.agent_actions must be >= 1"))?;
     Ok(PlannerInterfaceSpec {
-        observation_bits: required_u64(&value["observation_bits"], "interface.observation_bits")?
-            as usize,
-        observation_stream_len: required_u64(
+        observation_bits: required_usize(&value["observation_bits"], "interface.observation_bits")?,
+        observation_stream_len: required_usize(
             &value["observation_stream_len"],
             "interface.observation_stream_len",
-        )? as usize,
+        )?,
         observation_key_mode: parse_observation_key_mode(
             value["observation_key_mode"]
                 .as_str()
                 .unwrap_or("full_stream"),
         )?,
-        reward_bits: required_u64(&value["reward_bits"], "interface.reward_bits")? as usize,
+        reward_bits: required_usize(&value["reward_bits"], "interface.reward_bits")?,
         agent_actions,
-        min_reward: required_i64(&value["min_reward"], "interface.min_reward")?,
-        max_reward: required_i64(&value["max_reward"], "interface.max_reward")?,
-        reward_offset: required_i64(&value["reward_offset"], "interface.reward_offset")?,
+    })
+}
+
+#[cfg(feature = "tuner")]
+fn parse_tune_interface_spec(value: &serde_json::Value) -> SpecResult<TunePlannerInterfaceSpec> {
+    ensure_known_fields(
+        value,
+        &[
+            "observation_bits",
+            "observation_stream_len",
+            "observation_key_mode",
+            "reward_bits",
+            "agent_actions",
+        ],
+        "controller.interface",
+    )?;
+    let agent_actions_raw = required_usize(&value["agent_actions"], "interface.agent_actions")?;
+    let agent_actions = ActionAlphabet::try_from_usize(agent_actions_raw)
+        .map_err(|_| SpecError::new("interface.agent_actions must be >= 1"))?;
+    Ok(TunePlannerInterfaceSpec {
+        observation_bits: required_usize(&value["observation_bits"], "interface.observation_bits")?,
+        observation_stream_len: required_usize(
+            &value["observation_stream_len"],
+            "interface.observation_stream_len",
+        )?,
+        observation_key_mode: parse_observation_key_mode(
+            value["observation_key_mode"].as_str().ok_or_else(|| {
+                SpecError::new("controller.interface.observation_key_mode is required")
+            })?,
+        )?,
+        reward_bits: required_usize(&value["reward_bits"], "interface.reward_bits")?,
+        agent_actions,
     })
 }
 
@@ -250,10 +519,11 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                 base_dir,
                 crate::api::MAX_MIXTURE_NESTING,
             )?,
-            agent_horizon: required_u64(&value["agent_horizon"], "controller.agent_horizon")?
-                as usize,
-            num_simulations: required_u64(&value["num_simulations"], "controller.num_simulations")?
-                as usize,
+            agent_horizon: required_usize(&value["agent_horizon"], "controller.agent_horizon")?,
+            num_simulations: required_usize(
+                &value["num_simulations"],
+                "controller.num_simulations",
+            )?,
             mcts_strategy: parse_mcts_strategy(
                 value.get("mcts_strategy"),
                 "controller.mcts_strategy",
@@ -275,17 +545,19 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     &value["discount_gamma"],
                     "controller.discount_gamma",
                 )?,
-                return_horizon: required_u64(&value["return_horizon"], "controller.return_horizon")?
-                    as usize,
-                return_bins: required_u64(&value["return_bins"], "controller.return_bins")?
-                    as usize,
-                augmentation_period: required_u64(
+                return_horizon: required_usize(
+                    &value["return_horizon"],
+                    "controller.return_horizon",
+                )?,
+                return_bins: required_usize(&value["return_bins"], "controller.return_bins")?,
+                augmentation_period: required_usize(
                     &value["augmentation_period"],
                     "controller.augmentation_period",
-                )? as usize,
-                history_prune_keep_steps: value["history_prune_keep_steps"]
-                    .as_u64()
-                    .map(|n| n as usize),
+                )?,
+                history_prune_keep_steps: optional_usize(
+                    &value["history_prune_keep_steps"],
+                    "controller.history_prune_keep_steps",
+                )?,
                 baseline_exploration: required_f64(
                     &value["baseline_exploration"],
                     "controller.baseline_exploration",
@@ -299,22 +571,23 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     base_dir,
                     crate::api::MAX_MIXTURE_NESTING,
                 )?,
-                return_horizon: required_u64(&value["return_horizon"], "controller.return_horizon")?
-                    as usize,
-                return_bins: required_u64(&value["return_bins"], "controller.return_bins")?
-                    as usize,
-                label_phase_period: required_u64(
+                return_horizon: required_usize(
+                    &value["return_horizon"],
+                    "controller.return_horizon",
+                )?,
+                return_bins: required_usize(&value["return_bins"], "controller.return_bins")?,
+                label_phase_period: required_usize(
                     &value["label_phase_period"],
                     "controller.label_phase_period",
-                )? as usize,
+                )?,
                 teacher_dataset_asset: required_string(
                     &value["teacher_dataset_asset"],
                     "controller.teacher_dataset_asset",
                 )?,
-                planner_simulations_per_step: required_u64(
+                planner_simulations_per_step: required_usize(
                     &value["planner_simulations_per_step"],
                     "controller.planner_simulations_per_step",
-                )? as usize,
+                )?,
             },
         )),
         other => Err(SpecError::new(format!("unknown controller kind '{other}'"))),
@@ -342,8 +615,8 @@ fn parse_mcts_strategy(value: Option<&serde_json::Value>, label: &str) -> SpecRe
     match kind {
         "rho_uct" => Ok(MctsStrategy::RhoUct),
         "parallel_uct" => {
-            let workers_raw = required_u64(&value["workers"], &format!("{label}.workers"))?;
-            let workers = NonZeroUsize::new(workers_raw as usize)
+            let workers_raw = required_usize(&value["workers"], &format!("{label}.workers"))?;
+            let workers = NonZeroUsize::new(workers_raw)
                 .ok_or_else(|| SpecError::new(format!("{label}.workers must be >= 1")))?;
             let bu_uct_m_max = match object.get("bu_uct_m_max") {
                 Some(raw) if raw.is_null() => None,
@@ -364,10 +637,14 @@ fn parse_mcts_strategy(value: Option<&serde_json::Value>, label: &str) -> SpecRe
 fn parse_runtime_spec(value: &serde_json::Value) -> SpecResult<PlannerRuntimeSpec> {
     Ok(PlannerRuntimeSpec {
         random_seed: value["random_seed"].as_u64(),
-        learn_cycles: value["learn_cycles"].as_u64().map(|n| n as usize),
-        eval_cycles: value["eval_cycles"].as_u64().map(|n| n as usize),
-        terminate_lifetime: value["terminate_lifetime"].as_u64().unwrap_or(20) as usize,
-        log_every: value["log_every"].as_u64().unwrap_or(1) as usize,
+        learn_cycles: optional_usize(&value["learn_cycles"], "runtime.learn_cycles")?,
+        eval_cycles: optional_usize(&value["eval_cycles"], "runtime.eval_cycles")?,
+        terminate_lifetime: default_usize(
+            &value["terminate_lifetime"],
+            20,
+            "runtime.terminate_lifetime",
+        )?,
+        log_every: default_usize(&value["log_every"], 1, "runtime.log_every")?,
         perf: value["perf"].as_bool().unwrap_or(false),
         vm_perf_only: value["vm_perf_only"].as_bool().unwrap_or(false),
         explore_epsilon: value["explore_epsilon"].as_f64().unwrap_or(0.0),
@@ -375,96 +652,218 @@ fn parse_runtime_spec(value: &serde_json::Value) -> SpecResult<PlannerRuntimeSpe
     })
 }
 
+#[cfg(feature = "tuner")]
 fn parse_tune_bounds_spec(value: &serde_json::Value) -> SpecResult<TuneBoundsSpec> {
+    ensure_known_fields(
+        value,
+        &[
+            "allowed_backends",
+            "forbidden_backends",
+            "parameter_ranges",
+            "max_experts",
+            "max_mixture_nesting_depth",
+            "min_experts",
+            "allow_duplicate_experts",
+            "required_experts",
+            "forbidden_expert_pairs",
+        ],
+        "bounds",
+    )?;
     Ok(TuneBoundsSpec {
-        allowed_backends: string_list(&value["allowed_backends"])?,
-        forbidden_backends: string_list(&value["forbidden_backends"])?,
-        parameter_ranges: parse_tune_parameter_ranges(&value["parameter_ranges"])?,
-        max_experts: required_u64(&value["max_experts"], "bounds.max_experts")? as usize,
-        max_mixture_nesting_depth: required_u64(
+        allowed_backends: optional_tune_string_list(
+            value.get("allowed_backends"),
+            "bounds.allowed_backends",
+        )?,
+        forbidden_backends: optional_tune_string_list(
+            value.get("forbidden_backends"),
+            "bounds.forbidden_backends",
+        )?,
+        parameter_ranges: parse_tune_parameter_ranges(value.get("parameter_ranges"))?,
+        max_experts: required_usize(&value["max_experts"], "bounds.max_experts")?,
+        max_mixture_nesting_depth: required_usize(
             &value["max_mixture_nesting_depth"],
             "bounds.max_mixture_nesting_depth",
-        )? as usize,
-        min_experts: value["min_experts"].as_u64().map(|n| n as usize),
+        )?,
+        min_experts: optional_usize(&value["min_experts"], "bounds.min_experts")?,
         allow_duplicate_experts: value["allow_duplicate_experts"].as_bool(),
-        required_experts: string_list(&value["required_experts"])?,
-        forbidden_expert_pairs: pair_list(&value["forbidden_expert_pairs"])?,
+        required_experts: optional_tune_string_list(
+            value.get("required_experts"),
+            "bounds.required_experts",
+        )?,
+        forbidden_expert_pairs: optional_tune_pair_list(
+            value.get("forbidden_expert_pairs"),
+            "bounds.forbidden_expert_pairs",
+        )?,
     })
 }
 
+#[cfg(feature = "tuner")]
+fn optional_tune_string_list(
+    value: Option<&serde_json::Value>,
+    label: &str,
+) -> SpecResult<Vec<String>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    if !raw.is_array() {
+        return Err(SpecError::new(format!("{label} must be an array")));
+    }
+    string_list(raw).map_err(|err| SpecError::new(format!("{label}: {err}")))
+}
+
+#[cfg(feature = "tuner")]
+fn optional_tune_pair_list(
+    value: Option<&serde_json::Value>,
+    label: &str,
+) -> SpecResult<Vec<(String, String)>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    if !raw.is_array() {
+        return Err(SpecError::new(format!("{label} must be an array")));
+    }
+    pair_list(raw).map_err(|err| SpecError::new(format!("{label}: {err}")))
+}
+
+#[cfg(feature = "tuner")]
 fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneControllerSpec> {
     let kind = value["kind"]
         .as_str()
         .ok_or_else(|| SpecError::new("controller.kind is required"))?;
     match kind {
-        "annealed_hill_climbing" => Ok(TuneControllerSpec::AnnealedHillClimbing(
-            AnnealedHillClimbingTuneControllerSpec {
-                max_mutation_radius: required_u64(
-                    &value["max_mutation_radius"],
-                    "controller.max_mutation_radius",
-                )? as usize,
-            },
-        )),
-        "mc_aixi_fac_ctw" => Ok(TuneControllerSpec::McAixiFacCtw(
-            McAixiFacCtwTuneControllerSpec {
-                interface: parse_interface_spec(&value["interface"])?,
-                planner_simulations_per_step: required_u64(
-                    &value["planner_simulations_per_step"],
-                    "controller.planner_simulations_per_step",
-                )? as usize,
-            },
-        )),
-        "aiqi_discounted" => Ok(TuneControllerSpec::AiqiDiscounted(
-            AiqiDiscountedTuneControllerSpec {
-                interface: parse_interface_spec(&value["interface"])?,
-                planner_simulations_per_step: required_u64(
-                    &value["planner_simulations_per_step"],
-                    "controller.planner_simulations_per_step",
-                )? as usize,
-                return_horizon: required_u64(&value["return_horizon"], "controller.return_horizon")?
-                    as usize,
-                return_bins: required_u64(&value["return_bins"], "controller.return_bins")?
-                    as usize,
-                discount_factor: required_f64(
-                    &value["discount_factor"],
-                    "controller.discount_factor",
-                )?,
-            },
-        )),
-        "aiqi_warmstart_exact_jh" => Ok(TuneControllerSpec::AiqiWarmstartExactJh(
-            WarmStartExactJhTuneControllerSpec {
-                interface: parse_interface_spec(&value["interface"])?,
-                planner_simulations_per_step: required_u64(
-                    &value["planner_simulations_per_step"],
-                    "controller.planner_simulations_per_step",
-                )? as usize,
-                return_horizon: required_u64(&value["return_horizon"], "controller.return_horizon")?
-                    as usize,
-                warmstart_teacher_dataset_asset: required_string(
-                    &value["warmstart_teacher_dataset_asset"],
-                    "controller.warmstart_teacher_dataset_asset",
-                )?,
-                label_phase_period: required_u64(
-                    &value["label_phase_period"],
-                    "controller.label_phase_period",
-                )? as usize,
-            },
-        )),
+        "annealed_hill_climbing" => {
+            ensure_known_fields(
+                value,
+                &["kind", "max_mutation_radius"],
+                "controller.annealed_hill_climbing",
+            )?;
+            Ok(TuneControllerSpec::AnnealedHillClimbing(
+                AnnealedHillClimbingTuneControllerSpec {
+                    max_mutation_radius: required_usize(
+                        &value["max_mutation_radius"],
+                        "controller.max_mutation_radius",
+                    )?,
+                },
+            ))
+        }
+        "mc_aixi_fac_ctw" => {
+            ensure_known_fields(
+                value,
+                &["kind", "interface", "planner_simulations_per_step"],
+                "controller.mc_aixi_fac_ctw",
+            )?;
+            Ok(TuneControllerSpec::McAixiFacCtw(
+                McAixiFacCtwTuneControllerSpec {
+                    interface: parse_tune_interface_spec(&value["interface"])?,
+                    planner_simulations_per_step: required_usize(
+                        &value["planner_simulations_per_step"],
+                        "controller.planner_simulations_per_step",
+                    )?,
+                },
+            ))
+        }
+        "aiqi_discounted" => {
+            ensure_known_fields(
+                value,
+                &[
+                    "kind",
+                    "interface",
+                    "planner_simulations_per_step",
+                    "return_horizon",
+                    "return_bins",
+                    "discount_factor",
+                    "min_improvement",
+                    "max_improvement",
+                ],
+                "controller.aiqi_discounted",
+            )?;
+            Ok(TuneControllerSpec::AiqiDiscounted(
+                AiqiDiscountedTuneControllerSpec {
+                    interface: parse_tune_interface_spec(&value["interface"])?,
+                    planner_simulations_per_step: required_usize(
+                        &value["planner_simulations_per_step"],
+                        "controller.planner_simulations_per_step",
+                    )?,
+                    return_horizon: required_usize(
+                        &value["return_horizon"],
+                        "controller.return_horizon",
+                    )?,
+                    return_bins: required_usize(&value["return_bins"], "controller.return_bins")?,
+                    discount_factor: required_f64(
+                        &value["discount_factor"],
+                        "controller.discount_factor",
+                    )?,
+                    min_improvement: required_f64(
+                        &value["min_improvement"],
+                        "controller.min_improvement",
+                    )?,
+                    max_improvement: required_f64(
+                        &value["max_improvement"],
+                        "controller.max_improvement",
+                    )?,
+                },
+            ))
+        }
+        "aiqi_warmstart_exact_jh" => {
+            ensure_known_fields(
+                value,
+                &[
+                    "kind",
+                    "interface",
+                    "planner_simulations_per_step",
+                    "return_horizon",
+                    "warmstart_teacher_dataset_asset",
+                    "label_phase_period",
+                ],
+                "controller.aiqi_warmstart_exact_jh",
+            )?;
+            Ok(TuneControllerSpec::AiqiWarmstartExactJh(
+                WarmStartExactJhTuneControllerSpec {
+                    interface: parse_tune_interface_spec(&value["interface"])?,
+                    planner_simulations_per_step: required_usize(
+                        &value["planner_simulations_per_step"],
+                        "controller.planner_simulations_per_step",
+                    )?,
+                    return_horizon: required_usize(
+                        &value["return_horizon"],
+                        "controller.return_horizon",
+                    )?,
+                    warmstart_teacher_dataset_asset: required_string(
+                        &value["warmstart_teacher_dataset_asset"],
+                        "controller.warmstart_teacher_dataset_asset",
+                    )?,
+                    label_phase_period: required_usize(
+                        &value["label_phase_period"],
+                        "controller.label_phase_period",
+                    )?,
+                },
+            ))
+        }
         other => Err(SpecError::new(format!(
             "unknown tune controller kind '{other}'"
         ))),
     }
 }
 
+#[cfg(feature = "tuner")]
 fn parse_tune_parameter_ranges(
-    value: &serde_json::Value,
+    value: Option<&serde_json::Value>,
 ) -> SpecResult<Vec<TuneParameterRangeSpec>> {
-    let Some(items) = value.as_array() else {
+    let Some(raw) = value else {
         return Ok(Vec::new());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(SpecError::new("bounds.parameter_ranges must be an array"));
     };
     items
         .iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(index, item)| {
+            ensure_known_fields(
+                item,
+                &["parameter", "min", "max"],
+                &format!("bounds.parameter_ranges[{index}]"),
+            )?;
             Ok(TuneParameterRangeSpec {
                 parameter: required_string(
                     &item["parameter"],
@@ -558,8 +957,8 @@ fn parse_vm_action_source(value: &serde_json::Value) -> SpecResult<VmRuntimeActi
                 .into_iter()
                 .map(|name| super::canonicalize_vm_fuzz_mutator_name(&name))
                 .collect::<SpecResult<Vec<_>>>()?,
-            min_len: value["min_len"].as_u64().unwrap_or(1) as usize,
-            max_len: value["max_len"].as_u64().unwrap_or(4096) as usize,
+            min_len: default_usize(&value["min_len"], 1, "environment.action_source.min_len")?,
+            max_len: default_usize(&value["max_len"], 4096, "environment.action_source.max_len")?,
             dictionary: string_list(&value["dictionary"])?,
             rng_seed: value["rng_seed"].as_u64().unwrap_or(0),
         }),
@@ -593,11 +992,16 @@ fn parse_optional_vm_trace(value: &serde_json::Value) -> SpecResult<Option<VmTra
     }
     Ok(Some(VmTraceSpec {
         shared_region_name: optional_string(&value["shared_region_name"]),
-        max_bytes: value["max_bytes"].as_u64().unwrap_or(1_000_000) as usize,
+        max_bytes: default_usize(
+            &value["max_bytes"],
+            1_000_000,
+            "environment.trace.max_bytes",
+        )?,
         reset_on_episode: value["reset_on_episode"].as_bool().unwrap_or(false),
     }))
 }
 
+#[cfg(any(feature = "tuner", feature = "vm"))]
 fn string_list(value: &serde_json::Value) -> SpecResult<Vec<String>> {
     let Some(items) = value.as_array() else {
         return Ok(Vec::new());
@@ -612,6 +1016,7 @@ fn string_list(value: &serde_json::Value) -> SpecResult<Vec<String>> {
         .collect()
 }
 
+#[cfg(feature = "tuner")]
 fn pair_list(value: &serde_json::Value) -> SpecResult<Vec<(String, String)>> {
     let Some(items) = value.as_array() else {
         return Ok(Vec::new());
@@ -636,6 +1041,7 @@ fn pair_list(value: &serde_json::Value) -> SpecResult<Vec<(String, String)>> {
     Ok(pairs)
 }
 
+#[cfg(any(feature = "tuner", feature = "vm"))]
 fn optional_string(value: &serde_json::Value) -> Option<String> {
     value.as_str().map(|text| text.to_string())
 }
@@ -659,14 +1065,42 @@ fn required_u64(value: &serde_json::Value, label: &str) -> SpecResult<u64> {
         .ok_or_else(|| SpecError::new(format!("{label} is required")))
 }
 
-fn required_i64(value: &serde_json::Value, label: &str) -> SpecResult<i64> {
-    value
-        .as_i64()
-        .ok_or_else(|| SpecError::new(format!("{label} is required")))
+fn required_usize(value: &serde_json::Value, label: &str) -> SpecResult<usize> {
+    usize::try_from(required_u64(value, label)?)
+        .map_err(|_| SpecError::new(format!("{label} exceeds usize::MAX")))
+}
+
+fn optional_usize(value: &serde_json::Value, label: &str) -> SpecResult<Option<usize>> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        required_usize(value, label).map(Some)
+    }
+}
+
+fn default_usize(value: &serde_json::Value, default: usize, label: &str) -> SpecResult<usize> {
+    if value.is_null() {
+        Ok(default)
+    } else {
+        required_usize(value, label)
+    }
+}
+
+#[cfg(feature = "vm")]
+fn default_u8(value: &serde_json::Value, default: u8, label: &str) -> SpecResult<u8> {
+    if value.is_null() {
+        Ok(default)
+    } else {
+        u8::try_from(required_u64(value, label)?)
+            .map_err(|_| SpecError::new(format!("{label} exceeds u8::MAX")))
+    }
 }
 
 fn parse_builtin_environment(name: &str) -> SpecResult<super::BuiltinEnvironmentSpec> {
     match name {
+        "tuner_bridge" => Err(SpecError::new(
+            "builtin environment 'tuner_bridge' is an internal tuner planner bridge and is not accepted in canonical planner-run JSON",
+        )),
         "coin_flip" => Ok(super::BuiltinEnvironmentSpec::CoinFlip),
         "biased_rock_paper_scissor" => Ok(super::BuiltinEnvironmentSpec::BiasedRockPaperScissor),
         "kuhn_poker" => Ok(super::BuiltinEnvironmentSpec::KuhnPoker),
@@ -741,6 +1175,24 @@ mod tests {
             err.to_string()
                 .contains("unknown spec document kind 'unknown'")
         );
+
+        #[cfg(not(feature = "tuner"))]
+        {
+            let result = parse_spec_document_json_value(
+                &serde_json::json!({
+                    "schema_version": SPEC_DOCUMENT_SCHEMA_VERSION,
+                    "kind": "tune",
+                }),
+                Path::new("."),
+            );
+            match result {
+                Ok(_) => panic!("tune must require tuner feature"),
+                Err(err) => assert!(
+                    err.to_string()
+                        .contains("tune documents require infotheory built with feature 'tuner'")
+                ),
+            }
+        }
     }
 
     #[test]
@@ -796,6 +1248,7 @@ mod tests {
         assert_eq!(runtime.explore_gamma, 1.0);
     }
 
+    #[cfg(feature = "tuner")]
     #[test]
     fn parse_tune_bounds_and_list_helpers_cover_optional_shape_contracts() {
         let parsed = parse_tune_bounds_spec(&serde_json::json!({
@@ -836,8 +1289,77 @@ mod tests {
             err.to_string()
                 .contains("forbidden_expert_pairs entries must have length 2")
         );
+
+        let err = parse_tune_bounds_spec(&serde_json::json!({
+            "allowed_backends": "ctw",
+            "forbidden_backends": ["zpaq"],
+            "parameter_ranges": [],
+            "max_experts": 4,
+            "max_mixture_nesting_depth": 2,
+            "required_experts": [],
+            "forbidden_expert_pairs": [],
+        }))
+        .expect_err("non-array allowed_backends must fail");
+        assert!(
+            err.to_string()
+                .contains("bounds.allowed_backends must be an array")
+        );
+
+        let err = parse_tune_bounds_spec(&serde_json::json!({
+            "allowed_backends": ["ctw"],
+            "forbidden_backends": [],
+            "parameter_ranges": [],
+            "max_experts": 4,
+            "max_mixture_nesting_depth": 2,
+            "required_experts": "ctw",
+            "forbidden_expert_pairs": [],
+        }))
+        .expect_err("non-array required_experts must fail");
+        assert!(
+            err.to_string()
+                .contains("bounds.required_experts must be an array")
+        );
+
+        let err = parse_tune_bounds_spec(&serde_json::json!({
+            "allowed_backends": ["ctw"],
+            "forbidden_backends": [],
+            "parameter_ranges": [],
+            "max_experts": 4,
+            "max_mixture_nesting_depth": 2,
+            "required_experts": [],
+            "forbidden_expert_pairs": "ctw,zpaq",
+        }))
+        .expect_err("non-array forbidden_expert_pairs must fail");
+        assert!(err.to_string().contains("bounds.forbidden_expert_pairs"));
+
+        let parsed_without_ranges = parse_tune_bounds_spec(&serde_json::json!({
+            "allowed_backends": ["ctw"],
+            "forbidden_backends": ["zpaq"],
+            "max_experts": 4,
+            "max_mixture_nesting_depth": 2,
+            "required_experts": ["ctw"],
+            "forbidden_expert_pairs": [["ctw", "zpaq"]],
+        }))
+        .expect("missing parameter_ranges should parse as empty optional list");
+        assert!(parsed_without_ranges.parameter_ranges.is_empty());
+
+        let err = parse_tune_bounds_spec(&serde_json::json!({
+            "allowed_backends": ["ctw"],
+            "forbidden_backends": ["zpaq"],
+            "parameter_ranges": {"bad": "shape"},
+            "max_experts": 4,
+            "max_mixture_nesting_depth": 2,
+            "required_experts": ["ctw"],
+            "forbidden_expert_pairs": [["ctw", "zpaq"]],
+        }))
+        .expect_err("non-array parameter_ranges must fail");
+        assert!(
+            err.to_string()
+                .contains("bounds.parameter_ranges must be an array")
+        );
     }
 
+    #[cfg(feature = "tuner")]
     #[test]
     fn parse_tune_controller_variants_cover_semantic_contracts() {
         let interface = serde_json::json!({
@@ -846,9 +1368,6 @@ mod tests {
             "observation_key_mode": "full_stream",
             "reward_bits": 1,
             "agent_actions": 2,
-            "min_reward": 0,
-            "max_reward": 1,
-            "reward_offset": 0,
         });
 
         let fac = parse_tune_controller_spec(&serde_json::json!({
@@ -866,6 +1385,8 @@ mod tests {
             "return_horizon": 4,
             "return_bins": 8,
             "discount_factor": 0.95,
+            "min_improvement": -1.0,
+            "max_improvement": 1.0,
         }))
         .expect("aiqi_discounted controller should parse");
         assert!(matches!(discounted, TuneControllerSpec::AiqiDiscounted(_)));
@@ -891,12 +1412,9 @@ mod tests {
         assert!(err.to_string().contains("unknown tune controller kind"));
     }
 
+    #[cfg(feature = "tuner")]
     #[test]
-    fn list_and_range_helpers_return_empty_for_non_array_inputs() {
-        let empty_ranges = parse_tune_parameter_ranges(&serde_json::json!({"not": "array"}))
-            .expect("non-array parameter_ranges should default to empty");
-        assert!(empty_ranges.is_empty());
-
+    fn list_helpers_preserve_legacy_non_tune_defaults() {
         let empty_strings =
             string_list(&serde_json::json!("ctw")).expect("non-array string list should default");
         assert!(empty_strings.is_empty());
@@ -904,6 +1422,59 @@ mod tests {
         let empty_pairs =
             pair_list(&serde_json::json!("ctw,zpaq")).expect("non-array pair list should default");
         assert!(empty_pairs.is_empty());
+    }
+
+    #[cfg(feature = "tuner")]
+    #[test]
+    fn parse_tune_reports_precise_baseline_canonical_mismatch_path() {
+        let tune = serde_json::json!({
+            "schema_version": SPEC_DOCUMENT_SCHEMA_VERSION,
+            "kind": "tune",
+            "assets": [{ "id": "dataset", "path": "dataset.bin" }],
+            "input_asset": "dataset",
+            "baseline_candidate": {
+                "kind": "rate-ac",
+                "rate_backend": {
+                    "kind": "ctw",
+                    "depth": 16,
+                    "extra_alias_field": 7
+                },
+                "framing": "framed"
+            },
+            "controller": {
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1
+            },
+            "bounds": {
+                "allowed_backends": ["ctw"],
+                "forbidden_backends": [],
+                "parameter_ranges": [],
+                "max_experts": 2,
+                "max_mixture_nesting_depth": 1,
+                "required_experts": [],
+                "forbidden_expert_pairs": []
+            },
+            "eval_time_limit_seconds": 1.0,
+            "time_budget_seconds": 1.0,
+            "min_throughput_bytes_per_second": 1.0,
+            "max_memory_bytes": 1024,
+            "output_config_path": "out.json",
+            "seed": 1
+        });
+        let err = match parse_spec_document_json_value(&tune, Path::new(".")) {
+            Ok(_) => panic!("non-canonical baseline candidate must fail"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("must be canonical compression backend JSON"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message
+                .contains("first mismatch at 'baseline_candidate.rate_backend.extra_alias_field'"),
+            "mismatch path should be explicit: {message}"
+        );
     }
 
     #[test]

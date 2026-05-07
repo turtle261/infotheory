@@ -33,6 +33,8 @@ mod cli;
 
 use infotheory::aixi::agent::Agent;
 use infotheory::aixi::aiqi::AiqiAgent;
+#[cfg(test)]
+use infotheory::aixi::common::ObservationKeyMode;
 use infotheory::aixi::common::{
     ActionAlphabet, EXPLORE_RANDOM_SALT, RandomGenerator, resolve_random_seed,
 };
@@ -47,6 +49,7 @@ use infotheory::aixi::vm_nyx::{
 };
 #[cfg(feature = "vm")]
 use infotheory::aixi::vm_nyx::{NyxVmConfig, NyxVmEnvironment};
+use infotheory::aixi::warmstart::{WarmStartExactJhAgent, WarmStartExactJhTeacherDataset};
 use infotheory::api::*;
 #[cfg(feature = "backend-mamba")]
 use infotheory::mambazip;
@@ -55,7 +58,7 @@ use infotheory::rwkvzip;
 #[cfg(feature = "backend-sequitur")]
 use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
 use infotheory::spec::{
-    self, BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec,
+    self, AssetRef, BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec,
     PlannerRuntimeSpec, SpecDocument,
 };
 #[cfg(all(test, feature = "vm"))]
@@ -75,7 +78,8 @@ use crate::cli::load_expert_spec;
 #[cfg(all(test, feature = "vm"))]
 use crate::cli::parse_vm_stats_backend;
 use crate::cli::{
-    build_ctx, file_roundtrip_compiled_backend, load_mixture_spec, maybe_export_online_model,
+    CliBackendInvocation, CliBackendSourceFlags, build_ctx_invocation,
+    file_roundtrip_compiled_backend, load_mixture_spec, maybe_export_online_model,
     parse_compression_backend, parse_rate_backend, read_file, read_stdin_all_for_generate,
     run_batch_mode, validate_obs_stream_len,
 };
@@ -88,10 +92,10 @@ use crate::cli::{
     parse_observation_stream_len, parse_observation_stream_len_for_env,
     parse_observation_stream_len_for_vm, process_json_line, validate_observation_config,
 };
-#[cfg(test)]
-use infotheory::aixi::common::ObservationKeyMode;
 #[cfg(feature = "backend-rosa")]
 use infotheory::search;
+#[cfg(feature = "tuner")]
+use infotheory::tuner;
 
 #[track_caller]
 fn cli_unwrap<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
@@ -415,7 +419,7 @@ impl PlannerExecutionContext {
             observation_bits: compiled.interface().observation_bits,
             observation_stream_len: compiled.interface().observation_stream_len,
             reward_bits: compiled.interface().reward_bits,
-            reward_offset: compiled.interface().reward_offset,
+            reward_offset: 0,
             agent_actions: compiled.interface().agent_actions,
             trace_logger: AixiRunLogger::new(cli_overlay)?,
             env,
@@ -442,6 +446,9 @@ enum PlannerControllerRuntime {
     AiqiDiscounted {
         agent: AiqiAgent,
     },
+    WarmStartExactJh {
+        agent: WarmStartExactJhAgent,
+    },
 }
 
 impl PlannerControllerRuntime {
@@ -463,9 +470,17 @@ impl PlannerControllerRuntime {
                 agent: AiqiAgent::from_compiled_planner_run(compiled)
                     .map_err(anyhow::Error::msg)?,
             }),
-            CompiledPlannerController::AiqiWarmstartExactJh { .. } => Err(anyhow::anyhow!(
-                "planner_run controller kind 'aiqi_warmstart_exact_jh' is not executable from the CLI yet"
-            )),
+            CompiledPlannerController::AiqiWarmstartExactJh {
+                teacher_dataset_asset,
+                ..
+            } => {
+                let teacher =
+                    load_warmstart_exact_jh_teacher_dataset(compiled, teacher_dataset_asset)?;
+                Ok(Self::WarmStartExactJh {
+                    agent: WarmStartExactJhAgent::from_compiled_planner_run(compiled, teacher)
+                        .map_err(anyhow::Error::msg)?,
+                })
+            }
             other => Err(anyhow::anyhow!(
                 "planner_run controller kind '{}' is not executable from the CLI",
                 other.kind_str()
@@ -560,8 +575,88 @@ impl PlannerControllerRuntime {
                     .map_err(anyhow::Error::msg)?;
                 Ok(reward)
             }
+            Self::WarmStartExactJh { agent } => {
+                let action = match phase {
+                    PlannerPhase::Learn => agent.get_planned_action_with_extra_exploration(
+                        schedule.extra_exploration(step),
+                    ),
+                    PlannerPhase::Eval => agent.get_planned_action(),
+                };
+                if schedule.log_every > 0 && step % schedule.log_every == 0 {
+                    println!(
+                        "Cycle {}: Action={} Obs={:?} Rew={}",
+                        step, action, ctx.obs_stream, ctx.rew
+                    );
+                }
+                if let Some(logger) = ctx.trace_logger.as_mut() {
+                    logger.log_action(action, ctx.env.get_action_bits())?;
+                }
+                let reward = ctx.perform_action(action)?;
+                if let Some(logger) = ctx.trace_logger.as_mut() {
+                    logger.log_percept(
+                        &ctx.obs_stream,
+                        ctx.rew,
+                        ctx.observation_bits,
+                        ctx.reward_bits,
+                        ctx.reward_offset,
+                    )?;
+                    logger.next_step()?;
+                }
+                agent
+                    .observe_transition(action, &ctx.obs_stream, ctx.rew)
+                    .map_err(anyhow::Error::msg)?;
+                Ok(reward)
+            }
         }
     }
+}
+
+/// Load a warm-start exact-J_H teacher dataset and validate its planner contract.
+///
+/// This enforces a stable planner-task boundary (fingerprint and schema) before
+/// the data is used by runtime construction.
+fn load_warmstart_exact_jh_teacher_dataset(
+    compiled: &CompiledPlannerRunSpec,
+    asset_id: &str,
+) -> anyhow::Result<WarmStartExactJhTeacherDataset> {
+    let binding = compiled
+        .resolved_assets()
+        .iter()
+        .find(|entry| entry.id == asset_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown warm-start teacher_dataset_asset '{asset_id}'"))?;
+    let path = match &binding.asset {
+        AssetRef::Filesystem(path) => path,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported warm-start teacher_dataset_asset reference kind"
+            ));
+        }
+    };
+    let bytes = std::fs::read(path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to read warm-start teacher_dataset_asset '{}': {err}",
+            path.display()
+        )
+    })?;
+    let teacher =
+        WarmStartExactJhTeacherDataset::from_json_slice(&bytes).map_err(anyhow::Error::msg)?;
+    validate_warmstart_exact_jh_teacher_contract(compiled, &teacher)?;
+    Ok(teacher)
+}
+
+/// Validate the parser-level contract fields against a concrete compiled planner run.
+///
+/// The contract comparison intentionally checks task identity, planner interface
+/// dimensions, and planner execution invariants that affect trace encoding.
+fn validate_warmstart_exact_jh_teacher_contract(
+    compiled: &CompiledPlannerRunSpec,
+    teacher: &WarmStartExactJhTeacherDataset,
+) -> anyhow::Result<()> {
+    infotheory::aixi::warmstart::validate_warmstart_teacher_against_compiled_planner_run(
+        compiled,
+        &teacher.contract,
+    )
+    .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 fn controller_backend_label(controller: &CompiledPlannerController) -> String {
@@ -756,6 +851,37 @@ fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "tuner")]
+fn run_tune_mode(args: &[String]) {
+    match tuner::parse_tune_command_args(args).and_then(|request| tuner::run_tune(&request)) {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!("Error: tune failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(feature = "tuner"))]
+fn run_tune_mode(_args: &[String]) {
+    eprintln!("Error: 'tune' requires infotheory built with feature 'tuner'");
+    std::process::exit(1);
+}
+
+#[cfg(feature = "tuner")]
+fn run_tuner_eval_worker_mode() {
+    if let Err(err) = tuner::run_tuner_eval_worker_from_env() {
+        eprintln!("Error: tuner evaluator worker failed: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(feature = "tuner"))]
+fn run_tuner_eval_worker_mode() {
+    eprintln!("Error: tuner evaluator worker requires infotheory built with feature 'tuner'");
+    std::process::exit(1);
+}
+
 #[cfg(feature = "backend-rosa")]
 fn search_command(args: &[String]) {
     if args.len() < 4 {
@@ -786,6 +912,11 @@ fn search_command(args: &[String]) {
         infotheory::search::DEFAULT_SEARCH_COMPRESSION_BACKEND_NAME.to_string();
     let mut method: Option<String> = None;
     let mut expert_spec_path: Option<String> = None;
+    let mut rate_backend_json_path: Option<String> = None;
+    let mut compression_backend_json_path: Option<String> = None;
+    let mut explicit_rate_backend_flag: bool = false;
+    let explicit_compression_backend_flag: bool = false;
+    let mut explicit_method_flag: bool = false;
     let mut stage2_prior_mode: Option<search::Stage2PriorMode> = None;
 
     let mut i = 4usize;
@@ -815,17 +946,32 @@ fn search_command(args: &[String]) {
                 let v = args
                     .get(i)
                     .unwrap_or_exit("Error: --rate-backend requires a value");
-                rate_backend = parse_rate_backend(v)
-                    .unwrap_or(infotheory::search::DEFAULT_SEARCH_RATE_BACKEND_NAME)
-                    .to_string();
+                rate_backend = parse_rate_backend_flag_or_exit(v, "--rate-backend");
+                explicit_rate_backend_flag = true;
+            }
+            "--rate-backend-json" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --rate-backend-json requires a path");
+                rate_backend_json_path = Some(v.clone());
+            }
+            "--compression-backend-json" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --compression-backend-json requires a path");
+                compression_backend_json_path = Some(v.clone());
             }
             "--method" => {
                 i += 1;
                 method = args.get(i).cloned();
+                explicit_method_flag = true;
             }
             "--expert-spec" => {
                 i += 1;
                 expert_spec_path = args.get(i).cloned();
+                explicit_rate_backend_flag = true;
             }
             "--stage2-prior-mode" => {
                 i += 1;
@@ -847,12 +993,19 @@ fn search_command(args: &[String]) {
     if let Some(mode) = stage2_prior_mode {
         opts.stage2_prior_mode = mode;
     }
-    opts.ctx = build_ctx(
-        &rate_backend,
-        &compression_backend,
-        method.as_deref(),
-        expert_spec_path.as_deref(),
-    )
+    opts.ctx = build_ctx_invocation(CliBackendInvocation {
+        rate_backend: &rate_backend,
+        compression_backend: &compression_backend,
+        method: method.as_deref(),
+        expert_spec_path: expert_spec_path.as_deref(),
+        rate_backend_json_path: rate_backend_json_path.as_deref(),
+        compression_backend_json_path: compression_backend_json_path.as_deref(),
+        flags: CliBackendSourceFlags {
+            explicit_rate_backend: explicit_rate_backend_flag,
+            explicit_compression_backend: explicit_compression_backend_flag,
+            explicit_method: explicit_method_flag,
+        },
+    })
     .ctx;
     if let Err(err) = search::run_search_with_options(query, target, &opts) {
         eprintln!("Error: search failed: {err}");
@@ -878,6 +1031,28 @@ impl<T> OptionExt<T> for Option<T> {
     }
 }
 
+fn parse_rate_backend_flag_or_exit(value: &str, flag_name: &str) -> String {
+    parse_rate_backend(value)
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "Error: {flag_name} expects a canonical backend name, got '{value}'. If '{value}' is a canonical RateBackend JSON document path, use --rate-backend-json. If '{value}' is a mixture spec path, use --rate-backend mixture --method <path>."
+            );
+            std::process::exit(1);
+        })
+}
+
+fn parse_compression_backend_flag_or_exit(value: &str, flag_name: &str) -> String {
+    parse_compression_backend(value)
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "Error: {flag_name} expects a canonical backend name, got '{value}'. Use --compression-backend-json for a canonical JSON spec path."
+            );
+            std::process::exit(1);
+        })
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -893,8 +1068,16 @@ fn main() {
     }
 
     let primitive = &args[1];
+    if primitive == "__infotheory-tuner-eval-worker" {
+        run_tuner_eval_worker_mode();
+        return;
+    }
     if primitive == "batch" {
         run_batch_mode();
+        return;
+    }
+    if primitive == "tune" {
+        run_tune_mode(&args);
         return;
     }
 
@@ -926,6 +1109,11 @@ fn main() {
     let mut compression_backend_str = "zpaq".to_string();
     let mut method_str: Option<String> = None;
     let mut expert_spec_path: Option<String> = None;
+    let mut rate_backend_json_path: Option<String> = None;
+    let mut compression_backend_json_path: Option<String> = None;
+    let mut explicit_rate_backend_flag: bool = false;
+    let mut explicit_compression_backend_flag: bool = false;
+    let mut explicit_method_flag: bool = false;
     let mut model_export_path: Option<String> = None;
     let mut diagnostic_mixture_path: Option<String> = None;
     let mut diagnostic_out_prefix: Option<String> = None;
@@ -950,16 +1138,24 @@ fn main() {
                 let v = args
                     .get(i)
                     .unwrap_or_exit("Error: --rate-backend requires a value");
-                rate_backend_str = parse_rate_backend(v).unwrap_or("rosaplus").to_string();
+                rate_backend_str = parse_rate_backend_flag_or_exit(v, "--rate-backend");
                 rate_backend_specified = true;
+                explicit_rate_backend_flag = true;
             }
-            "--ncd-backend" => {
+            "--rate-backend-json" => {
                 i += 1;
                 let v = args
                     .get(i)
-                    .unwrap_or_exit("Error: --compression-backend requires a value");
-                compression_backend_str =
-                    parse_compression_backend(v).unwrap_or("zpaq").to_string();
+                    .unwrap_or_exit("Error: --rate-backend-json requires a path");
+                rate_backend_json_path = Some(v.clone());
+                rate_backend_specified = true;
+            }
+            "--compression-backend-json" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .unwrap_or_exit("Error: --compression-backend-json requires a path");
+                compression_backend_json_path = Some(v.clone());
             }
             "--compression-backend" => {
                 i += 1;
@@ -967,16 +1163,19 @@ fn main() {
                     .get(i)
                     .unwrap_or_exit("Error: --compression-backend requires a value");
                 compression_backend_str =
-                    parse_compression_backend(v).unwrap_or("zpaq").to_string();
+                    parse_compression_backend_flag_or_exit(v, "--compression-backend");
+                explicit_compression_backend_flag = true;
             }
             "--method" => {
                 i += 1;
                 method_str = args.get(i).cloned();
+                explicit_method_flag = true;
             }
             "--expert-spec" => {
                 i += 1;
                 expert_spec_path = args.get(i).cloned();
                 rate_backend_specified = true;
+                explicit_rate_backend_flag = true;
             }
             "--model-export" | "--rwkv-export" => {
                 i += 1;
@@ -1226,12 +1425,19 @@ fn main() {
         }
     }
 
-    let built_ctx = build_ctx(
-        &rate_backend_str,
-        &compression_backend_str,
-        method_str.as_deref(),
-        expert_spec_path.as_deref(),
-    );
+    let built_ctx = build_ctx_invocation(CliBackendInvocation {
+        rate_backend: &rate_backend_str,
+        compression_backend: &compression_backend_str,
+        method: method_str.as_deref(),
+        expert_spec_path: expert_spec_path.as_deref(),
+        rate_backend_json_path: rate_backend_json_path.as_deref(),
+        compression_backend_json_path: compression_backend_json_path.as_deref(),
+        flags: CliBackendSourceFlags {
+            explicit_rate_backend: explicit_rate_backend_flag,
+            explicit_compression_backend: explicit_compression_backend_flag,
+            explicit_method: explicit_method_flag,
+        },
+    });
     let ctx = built_ctx.ctx;
     set_default_ctx(ctx.clone());
 
@@ -1501,6 +1707,7 @@ Primitives:
   Tools:
     search <query> <target> [options]       Search target using info-theoretic ranking
     aixi <config.json>                      Run AIXI agent
+    tune <spec.json|spec.itsd> [options]    Run tuner with executor-side controls
     batch                                   Run in JSON-L batch mode
     generate [file]                         Generate continuation from file or piped stdin
     compress <in> <out>                     Compress file using selected compression backend
@@ -1514,9 +1721,14 @@ Options:
     --rate-backend <name>   Backend for rate estimation: {rate_backends}
   --compression-backend <name>
                           Backend for NCD/compression: {compression_backends}
-  --ncd-backend <name>    Deprecated alias for --compression-backend
   --method <val>          Method/config (e.g. '5' for zpaq, '16' for ctw, mixture spec path,
                           model method: file:/path/model.safetensors[;policy:...] or cfg:key=value,...[;policy:...])
+  --rate-backend-json <path>
+                          Load canonical RateBackend JSON (relative paths resolve against this file's directory).
+                          Incompatible with --rate-backend and --expert-spec. When used with --method, the method applies to the compression backend shorthand.
+  --compression-backend-json <path>
+                          Load canonical CompressionBackend JSON (e.g. tuner output). Incompatible with
+                          --compression-backend, --expert-spec, and --method. Optional --rate-backend-json must match the embedded rate model when the compression object includes one.
   --expert-spec <path>    Load one exact standalone expert JSON (same schema as a mixture 'experts' entry)
   --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
   --rwkv-export <path>    Backward-compatible alias for --model-export
@@ -1533,6 +1745,60 @@ Options:
   --temperature <x>       Sampling temperature (default: 1.0)
   --top-k <n>             Sample only from the top-k bytes (0 disables)
   --top-p <p>             Nucleus sampling threshold in (0, 1]
+  --exec-config <path>    Tune executor profile JSON (for `tune`)
+  --max-evaluations <n>   Optional tuning evaluation cap (for `tune`)
+  --annealer-kernel-profile <name>
+                          Tune annealer profile: reversible_elementary_metropolis|compiled_uniform_metropolis_hastings
+  --cpu-affinity <csv>    CPU affinity (comma-separated core ids, for `tune`)
+  --threads <n>           Executor thread hint for tuning runs (for `tune`)
+  --evaluator-worker-executable <path>
+                          Explicit tuner evaluator worker executable path (for `tune`)
+  --evaluator-cgroup-parent <path>
+                          Delegated cgroup-v2 eval-parent (typically .../infotheory-tuner/evals)
+  --warmup-baseline-runs <n>
+                          Baseline warmup runs before normative baseline eval (for `tune`)
+  --self-improvement-rounds <n>
+                          Optional bounded online delayed-label update rounds (for `tune`)
+  --stagnation-reset-evals <n>
+                          Optional stagnation reset threshold (for `tune`)
+  --log-path <path>       Optional JSONL executor event log output (for `tune`)
+  --diagnostic-chunk-bytes <n>
+                          Diagnostic report chunk size over charged target bytes (for `tune`)
+  --rss-mode <mode>       Memory accounting mode:
+                          process_rss_peak (explicit Unix RSS fallback) |
+                          backend_reported (diagnostic backend component, RSS deployability) |
+                          hybrid_strict_max (strict Linux cgroup-v2 + RSS max) (for `tune`)
+  --planner-deployable-model
+                          Use executor-side planner deployability diagnostics in the evaluator profile (for `tune`)
+  --warmstart-trace-refresh
+                          Rebuild warm-start exact-J_H from merged same-task live traces between rounds (for `tune`)
+  --timing-tier <tier>    Theorem timing tier: best_effort|isolated|real_time|deterministic_table (for `tune`)
+  --determinism-deadline-certificate <ref>
+                          Determinism/deadline certification reference (for `tune`)
+  --deterministic-evaluator-table <ref>
+                          Verified deterministic evaluator table JSON path (for `tune`)
+  --finite-planner-state-certificate <ref>
+                          Verified finite planner-state certificate JSON path (for `tune`)
+  --no-hidden-state-certificate <ref>
+                          Verified no-hidden/inert-state certificate JSON path (for `tune`)
+  --exact-reward-encoding-certificate <ref>
+                          Verified exact reward encoding certificate JSON path (for `tune`)
+  --emit-exact-reward-encoding-certificate <path>
+                          Emit an exact reward encoding certificate JSON bound to resolved dataset/bounds/evaluator profile and exit (for `tune`)
+  --exact-state-observation-certificate <ref>
+                          Verified exact-state observation certificate JSON path (for `tune`)
+  --observation-adapter-spec-ref <ref>
+                          Observation adapter spec reference (for `tune`)
+  --exact-state-encoder-spec-ref <ref>
+                          Exact-state encoder specification reference (for `tune`)
+  --scalar-representation-ref <ref>
+                          Scalar representation specification reference (for `tune`)
+  --claim-exact-finite-mdp
+                          Request theorem-facing exact finite-MDP claim path (for `tune`)
+  --claim-exact-observed-markov
+                          Request theorem-facing exact observed-Markov claim path (for `tune`)
+  --claim-planner-convergence
+                          Request theorem-facing planner convergence claim path (for `tune`)
 
 Examples:
   infotheory ncd file1.txt file2.txt --compression-backend zpaq --method 5
@@ -1555,6 +1821,11 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infotheory::aixi::warmstart_contract::{
+        WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF,
+        WARMSTART_STANDALONE_SCALAR_REPRESENTATION, standalone_teacher_provenance_crc32_pair,
+        warmstart_exact_jh_planner_task_fingerprint,
+    };
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1595,10 +1866,7 @@ mod tests {
                     "observation_stream_len": 1,
                     "observation_key_mode": "full_stream",
                     "reward_bits": 4,
-                    "agent_actions": action_alphabet(2).get(),
-                    "min_reward": -1,
-                    "max_reward": 1,
-                    "reward_offset": 1
+                    "agent_actions": action_alphabet(2).get()
                 },
                 "controller": {
                     "kind": "aiqi_discounted",
@@ -1631,6 +1899,121 @@ mod tests {
             panic!("expected planner_run document");
         };
         spec.compile().expect("sample planner run should compile")
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    fn sample_warmstart_compiled_planner_run(teacher_path: &Path) -> CompiledPlannerRunSpec {
+        let document = SpecDocument::parse_json_value(
+            &json!({
+                "schema_version": 1,
+                "kind": "planner_run",
+                "assets": [{
+                    "id": "teacher",
+                    "path": teacher_path.to_string_lossy()
+                }],
+                "environment": {
+                    "kind": "builtin",
+                    "name": "coin_flip"
+                },
+                "interface": {
+                    "observation_bits": 2,
+                    "observation_stream_len": 1,
+                    "observation_key_mode": "full_stream",
+                    "reward_bits": 2,
+                    "agent_actions": action_alphabet(2).get()
+                },
+                "controller": {
+                    "kind": "aiqi_warmstart_exact_jh",
+                    "predictor": {
+                        "kind": "ctw",
+                        "depth": 4
+                    },
+                    "return_horizon": 1,
+                    "return_bins": 4,
+                    "label_phase_period": 1,
+                    "teacher_dataset_asset": "teacher",
+                    "planner_simulations_per_step": 1
+                },
+                "runtime": {
+                    "random_seed": 7,
+                    "learn_cycles": 1,
+                    "eval_cycles": 1,
+                    "terminate_lifetime": 2,
+                    "log_every": 1,
+                    "perf": false,
+                    "vm_perf_only": false,
+                    "explore_epsilon": 0.0,
+                    "explore_gamma": 1.0
+                }
+            }),
+            Path::new("."),
+        )
+        .expect("sample warmstart planner document");
+        let SpecDocument::PlannerRun(spec) = document else {
+            panic!("expected planner_run document");
+        };
+        spec.compile()
+            .expect("sample warmstart planner run should compile")
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    fn write_warmstart_teacher(
+        path: &Path,
+        task_fingerprint: &str,
+        action_alphabet_size: usize,
+        observation_bits: usize,
+    ) {
+        let reward_bits: usize = 2;
+        let observation_stream_len: usize = 1;
+        let (adapter_crc, reward_cert) = standalone_teacher_provenance_crc32_pair(
+            observation_bits,
+            observation_stream_len,
+            reward_bits,
+        )
+        .expect("standalone teacher provenance crc pair");
+        std::fs::write(
+            path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "contract": {
+                    "task_fingerprint": task_fingerprint,
+                    "action_alphabet_size": action_alphabet_size,
+                    "observation_bits": observation_bits,
+                    "observation_stream_len": observation_stream_len,
+                    "observation_key_mode": "full_stream",
+                    "observation_adapter_spec_ref": WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF,
+                    "observation_adapter_content_crc32": adapter_crc,
+                    "reward_bits": reward_bits,
+                    "return_horizon": 1,
+                    "label_phase_period": 1,
+                    "scalar_representation": WARMSTART_STANDALONE_SCALAR_REPRESENTATION,
+                    "exact_reward_encoding_certificate": reward_cert
+                },
+                "traces": [{
+                    "transitions": [
+                        {"action": 0, "observations": [1], "reward": 1}
+                    ]
+                }]
+            }))
+            .expect("serialize warmstart teacher"),
+        )
+        .expect("write warmstart teacher");
+    }
+
+    /// Mutate one `contract` string field in an on-disk warm-start teacher JSON file.
+    #[cfg(feature = "backend-ctw")]
+    fn mutate_warmstart_teacher_contract_field(path: &Path, field: &str, wrong: &str) {
+        let bytes = std::fs::read(path).expect("read warmstart teacher");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse warmstart teacher json");
+        let contract = doc
+            .as_object_mut()
+            .and_then(|root| root.get_mut("contract"))
+            .and_then(|c| c.as_object_mut())
+            .expect("teacher.contract object");
+        contract.insert(field.to_string(), json!(wrong));
+        std::fs::write(path, serde_json::to_vec(&doc).expect("serialize teacher"))
+            .expect("write warmstart teacher");
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -1733,6 +2116,143 @@ mod tests {
         assert!(msg.contains("legacy aixi JSON configs are no longer executable"));
         assert!(msg.contains("/tmp/legacy.json"));
         assert!(msg.contains("planner_run"));
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_accepts_matching_compiled_planner_contract() {
+        let teacher_path = unique_temp_path("warmstart-teacher-matching", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
+
+        let teacher = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect("matching teacher contract must load");
+        assert_eq!(teacher.contract.task_fingerprint, task_fingerprint);
+        assert_eq!(teacher.traces.len(), 1);
+
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_mismatched_task_fingerprint() {
+        let teacher_path = unique_temp_path("warmstart-teacher-task-mismatch", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        write_warmstart_teacher(&teacher_path, "different-task", 2, 2);
+
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("mismatched teacher task must fail");
+        assert!(err.to_string().contains("task_fingerprint"), "{err}");
+
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_action_alphabet_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-interface-mismatch", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 3, 2);
+
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("mismatched action alphabet must fail");
+        assert!(
+            err.to_string().contains("planner interface fingerprint"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_observation_adapter_spec_ref_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-adapter-ref", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
+        mutate_warmstart_teacher_contract_field(
+            &teacher_path,
+            "observation_adapter_spec_ref",
+            "wrong-adapter-ref",
+        );
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("adapter spec ref mismatch must fail");
+        assert!(
+            err.to_string().contains("observation_adapter_spec_ref"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_observation_adapter_content_crc32_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-adapter-crc", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
+        mutate_warmstart_teacher_contract_field(
+            &teacher_path,
+            "observation_adapter_content_crc32",
+            "deadbeef",
+        );
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("adapter crc mismatch must fail");
+        assert!(
+            err.to_string()
+                .contains("observation_adapter_content_crc32"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_scalar_representation_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-scalar", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
+        mutate_warmstart_teacher_contract_field(
+            &teacher_path,
+            "scalar_representation",
+            "wrong-scalar",
+        );
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("scalar representation mismatch must fail");
+        assert!(err.to_string().contains("scalar_representation"), "{err}");
+        let _ = std::fs::remove_file(teacher_path);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_teacher_loader_rejects_exact_reward_encoding_certificate_mismatch() {
+        let teacher_path = unique_temp_path("warmstart-teacher-cert", ".json");
+        let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
+        let task_fingerprint =
+            warmstart_exact_jh_planner_task_fingerprint(&compiled).expect("task fingerprint");
+        write_warmstart_teacher(&teacher_path, &task_fingerprint, 2, 2);
+        mutate_warmstart_teacher_contract_field(
+            &teacher_path,
+            "exact_reward_encoding_certificate",
+            "wrong-cert",
+        );
+        let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
+            .expect_err("reward certificate mismatch must fail");
+        assert!(
+            err.to_string()
+                .contains("exact_reward_encoding_certificate"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(teacher_path);
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -2013,7 +2533,7 @@ mod tests {
     #[cfg(feature = "backend-rwkv")]
     #[test]
     fn build_ctx_rwkv7_compression_accepts_cfg_method() {
-        let ctx = build_ctx(
+        let ctx = crate::cli::build_ctx(
             "rosaplus",
             "rwkv7",
             Some(
@@ -2208,11 +2728,11 @@ mod tests {
         )
         .expect("write temp expert spec");
 
-        let built = build_ctx(
+        let built = crate::cli::build_ctx(
             "rosaplus",
             "zpaq",
             None,
-            Some(expert_path.to_str().expect("utf8 path")),
+            Some(expert_path.to_string_lossy().as_ref()),
         );
         assert!(matches!(
             built.ctx.rate_backend.canonical_spec(),
@@ -2493,7 +3013,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "backend-ctw")]
+    #[cfg(all(feature = "backend-ctw", feature = "tuner"))]
     #[test]
     fn run_aixi_mode_rejects_non_planner_spec_documents() {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2522,7 +3042,6 @@ mod tests {
                     "kind": "ctw",
                     "depth": 8
                 },
-                "coder": "ac",
                 "framing": "framed"
             },
             "controller": {
@@ -2560,7 +3079,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(not(feature = "backend-ctw"))]
+    #[cfg(all(not(feature = "backend-ctw"), feature = "tuner"))]
     #[test]
     fn run_aixi_mode_surfaces_backend_validation_for_non_planner_documents() {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2588,7 +3107,6 @@ mod tests {
                     "kind": "ctw",
                     "depth": 8
                 },
-                "coder": "ac",
                 "framing": "framed"
             },
             "controller": {
@@ -2657,10 +3175,7 @@ mod tests {
                 "observation_stream_len": 1,
                 "observation_key_mode": "full_stream",
                 "reward_bits": 1,
-                "agent_actions": 2,
-                "min_reward": 0,
-                "max_reward": 1,
-                "reward_offset": 0
+                "agent_actions": 2
             },
             "controller": {
                 "kind": "mc_aixi",
@@ -2701,7 +3216,7 @@ mod tests {
 
     #[cfg(all(feature = "backend-ctw", feature = "aixi-gameengine"))]
     #[test]
-    fn run_aixi_mode_rejects_unrepresentable_reward_ranges_in_canonical_specs() {
+    fn run_aixi_mode_rejects_legacy_interface_reward_range_fields() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let nanos = SystemTime::now()
@@ -2712,7 +3227,7 @@ mod tests {
             "infotheory-planner-run-invalid-reward-{}-{nanos}.json",
             std::process::id()
         ));
-        let doc_value = json!({
+        let legacy_doc = json!({
             "schema_version": 1,
             "kind": "planner_run",
             "assets": [],
@@ -2756,14 +3271,19 @@ mod tests {
                 "explore_gamma": 1.0
             }
         });
-        let doc = infotheory::spec::SpecDocument::parse_json_value(&doc_value, Path::new("."))
-            .expect("canonical planner document");
-        std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
-            .expect("write temp planner spec");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy_doc).expect("legacy planner json"),
+        )
+        .expect("write temp planner spec");
 
         let err = run_aixi_mode(path.to_str().expect("utf8 path"))
-            .expect_err("invalid reward interface should be rejected");
-        assert!(err.to_string().contains("reward_bits too small"), "{err}");
+            .expect_err("legacy interface reward range fields should be rejected");
+        assert!(
+            err.to_string()
+                .contains("unknown interface field 'min_reward'"),
+            "{err}"
+        );
 
         let _ = std::fs::remove_file(path);
     }

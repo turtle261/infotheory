@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "kind": "tune",
+  "assets": [
+    {
+      "id": "dataset",
+      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
+    }
+  ],
+  "input_asset": "dataset",
+  "baseline_candidate": {
+    "kind": "rate-ac",
+    "rate_backend": {
+      "kind": "mixture",
+      "spec": {
+        "kind": "neural",
+        "schedule": "default",
+        "alpha": 0.04,
+        "decay": null,
+        "experts": [
+          {
+            "kind": "ctw",
+            "depth": 12,
+            "log_prior": 0.0
+          },
+          {
+            "kind": "fac-ctw",
+            "base_depth": 10,
+            "num_percept_bits": 8,
+            "encoding_bits": 8,
+            "log_prior": 0.0
+          },
+          {
+            "kind": "ctw",
+            "depth": 8,
+            "log_prior": 0.0
+          }
+        ]
+      }
+    },
+    "framing": "framed"
+  },
+  "controller": {
+    "kind": "annealed_hill_climbing",
+    "max_mutation_radius": 3
+  },
+  "bounds": {
+    "allowed_backends": [
+      "ctw",
+      "fac-ctw",
+      "mixture"
+    ],
+    "forbidden_backends": [],
+    "parameter_ranges": [
+      {
+        "parameter": "rate_backend.spec.alpha",
+        "min": 0.01,
+        "max": 0.20
+      },
+      {
+        "parameter": "rate_backend.spec.experts[0].depth",
+        "min": 4.0,
+        "max": 32.0
+      }
+    ],
+    "max_experts": 6,
+    "max_mixture_nesting_depth": 3,
+    "min_experts": 2,
+    "allow_duplicate_experts": false,
+    "required_experts": [],
+    "forbidden_expert_pairs": []
+  },
+  "eval_time_limit_seconds": 90.0,
+  "time_budget_seconds": 300.0,
+  "min_throughput_bytes_per_second": 1.0,
+  "max_memory_bytes": 1099511627776,
+  "output_config_path": "strict-annealed-advanced-neural-mixture-tsv-output.json",
+  "seed": 23,
+  "report_path": "strict-annealed-advanced-neural-mixture-tsv-report.json"
+}

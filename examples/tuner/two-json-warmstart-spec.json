@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "kind": "tune",
+  "assets": [
+    {
+      "id": "dataset",
+      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
+    },
+    {
+      "id": "teacher",
+      "path": "/tmp/infotheory-tuner-two-json/warmstart-teacher.json"
+    }
+  ],
+  "input_asset": "dataset",
+  "baseline_candidate": {
+    "kind": "rate-ac",
+    "rate_backend": {
+      "kind": "mixture",
+      "spec": {
+        "kind": "neural",
+        "schedule": "default",
+        "alpha": 0.03,
+        "decay": null,
+        "experts": [
+          {
+            "kind": "ctw",
+            "log_prior": 0.0,
+            "name": "ctw",
+            "depth": 32
+          },
+          {
+            "kind": "ppmd",
+            "log_prior": 0.0,
+            "name": "ppmd",
+            "order": 12,
+            "memory_mb": 256
+          },
+          {
+            "kind": "rosaplus",
+            "log_prior": 0.0,
+            "name": "rosa",
+            "max_order": -1
+          },
+          {
+            "kind": "match",
+            "log_prior": 0.0,
+            "name": "match",
+            "hash_bits": 20,
+            "min_len": 4,
+            "max_len": 255,
+            "base_mix": 0.02,
+            "confidence_scale": 1.0
+          },
+          {
+            "kind": "rwkv7",
+            "log_prior": 0.0,
+            "name": "rwkv",
+            "method": {
+              "kind": "online",
+              "cfg": {
+                "hidden": 64,
+                "layers": 1,
+                "intermediate": 64,
+                "decay_rank": 16,
+                "a_rank": 16,
+                "v_rank": 16,
+                "g_rank": 16,
+                "seed": 22,
+                "train_mode": "adam",
+                "lr": 0.0008999999845400453,
+                "stride": 1
+              },
+              "policy": "schedule=0..0.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|0.5%..1%:infer|1%..1.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|1.5%..2%:infer|2%..2.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|2.5%..3%:infer|3%..3.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|3.5%..4%:infer|4%..4.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|4.5%..5%:infer|5%..5.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|5.5%..6%:infer|6%..6.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|6.5%..7%:infer|7%..7.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|7.5%..8%:infer|8%..8.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|8.5%..9%:infer|9%..9.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|9.5%..12%:train(scope=all,opt=adam,lr=0.0001,stride=1,bptt=8,clip=0,momentum=0.9)|12%..17%:infer|17%..18%:train(scope=all,opt=adam,lr=0.0001,stride=1,bptt=8,clip=0,momentum=0.9)|18%..100%:infer"
+            }
+          }
+        ]
+      }
+    },
+    "framing": "framed"
+  },
+  "bounds": {
+    "allowed_backends": [
+      "ctw",
+      "ppmd",
+      "rosaplus",
+      "match",
+      "rwkv7",
+      "mixture"
+    ],
+    "forbidden_backends": [],
+    "parameter_ranges": [
+      {
+        "parameter": "rate_backend.spec.alpha",
+        "min": 0.005,
+        "max": 0.2
+      },
+      {
+        "parameter": "rate_backend.spec.experts[0].depth",
+        "min": 8.0,
+        "max": 96.0
+      },
+      {
+        "parameter": "rate_backend.spec.experts[1].order",
+        "min": 4.0,
+        "max": 16.0
+      },
+      {
+        "parameter": "rate_backend.spec.experts[1].memory_mb",
+        "min": 64.0,
+        "max": 768.0
+      },
+      {
+        "parameter": "rate_backend.spec.experts[2].max_order",
+        "min": -1.0,
+        "max": 128.0
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].hash_bits",
+        "min": 16.0,
+        "max": 22.0
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].min_len",
+        "min": 2.0,
+        "max": 16.0
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].max_len",
+        "min": 32.0,
+        "max": 255.0
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].base_mix",
+        "min": 0.005,
+        "max": 0.1
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].confidence_scale",
+        "min": 0.5,
+        "max": 2.0
+      }
+    ],
+    "max_experts": 8,
+    "max_mixture_nesting_depth": 3,
+    "min_experts": 3,
+    "allow_duplicate_experts": false,
+    "required_experts": [
+      "ctw",
+      "ppmd"
+    ],
+    "forbidden_expert_pairs": []
+  },
+  "eval_time_limit_seconds": 2.0,
+  "time_budget_seconds": 1800.0,
+  "min_throughput_bytes_per_second": 1.0,
+  "max_memory_bytes": 1073741824,
+  "seed": 1337,
+  "controller": {
+    "kind": "aiqi_warmstart_exact_jh",
+    "interface": {
+      "observation_bits": 8,
+      "observation_stream_len": 1,
+      "observation_key_mode": "full_stream",
+      "reward_bits": 32,
+      "agent_actions": 20
+    },
+    "planner_simulations_per_step": 24,
+    "return_horizon": 4,
+    "label_phase_period": 8,
+    "warmstart_teacher_dataset_asset": "teacher"
+  },
+  "output_config_path": "/tmp/infotheory-tuner-two-json/warmstart-output.json",
+  "report_path": "/tmp/infotheory-tuner-two-json/warmstart-report.json"
+}

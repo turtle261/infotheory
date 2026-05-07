@@ -9,7 +9,8 @@
 
 use crate::aixi::common::{
     Action, ActionAlphabet, PerceptVal, RandomGenerator, Reward, RewardEncodingError,
-    bits_for_cardinality, resolve_random_seed, validate_reward_encoding_bounds,
+    bits_for_cardinality, nonnegative_reward_encoding_bounds, resolve_random_seed,
+    validate_reward_encoding_bounds,
 };
 use crate::aixi::model::{Predictor, PredictorBuildError, build_aiqi_predictor};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
@@ -329,9 +330,6 @@ impl AiqiConfig {
                 observation_key_mode: crate::aixi::common::ObservationKeyMode::FullStream,
                 reward_bits: self.reward_bits,
                 agent_actions: self.agent_actions,
-                min_reward: self.min_reward,
-                max_reward: self.max_reward,
-                reward_offset: self.reward_offset,
             },
             ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
                 predictor,
@@ -431,6 +429,25 @@ struct AiqiRuntimeConfig {
 }
 
 impl AiqiRuntimeConfig {
+    fn from_config(config: &AiqiConfig) -> Self {
+        Self {
+            observation_bits: config.observation_bits,
+            observation_stream_len: config.observation_stream_len.max(1),
+            reward_bits: config.reward_bits,
+            agent_actions: config.agent_actions,
+            min_reward: config.min_reward,
+            max_reward: config.max_reward,
+            reward_offset: config.reward_offset,
+            discount_gamma: config.discount_gamma,
+            return_horizon: config.return_horizon,
+            return_bins: config.return_bins,
+            augmentation_period: config.augmentation_period,
+            history_prune_keep_steps: config.history_prune_keep_steps,
+            baseline_exploration: config.baseline_exploration,
+            random_seed: resolve_random_seed(config.random_seed),
+        }
+    }
+
     fn from_compiled(compiled: &CompiledPlannerRunSpec) -> Result<Self, AiqiError> {
         let interface = compiled.interface();
         let runtime = compiled.runtime();
@@ -461,14 +478,16 @@ impl AiqiRuntimeConfig {
             _ => return Err(AiqiError::ControllerKindMismatch),
         };
 
+        let (min_reward, max_reward, reward_offset) =
+            nonnegative_reward_encoding_bounds(interface.reward_bits);
         Ok(Self {
             observation_bits: interface.observation_bits,
             observation_stream_len: interface.observation_stream_len.max(1),
             reward_bits: interface.reward_bits,
             agent_actions: interface.agent_actions,
-            min_reward: interface.min_reward,
-            max_reward: interface.max_reward,
-            reward_offset: interface.reward_offset,
+            min_reward,
+            max_reward,
+            reward_offset,
             discount_gamma,
             return_horizon,
             return_bins,
@@ -516,7 +535,7 @@ impl AiqiAgent {
     pub fn new(config: AiqiConfig) -> Result<Self, AiqiError> {
         config.validate_runtime_invariants()?;
         let compiled = config.compile_planner_run_spec()?;
-        let runtime = AiqiRuntimeConfig::from_compiled(&compiled)?;
+        let runtime = AiqiRuntimeConfig::from_config(&config);
         Self::from_compiled_config(runtime, &compiled)
     }
 
@@ -941,7 +960,7 @@ impl AiqiAgent {
         let h = self.config.return_horizon;
         let gamma = self.config.discount_gamma;
 
-        debug_assert!(gamma > 0.0 && gamma < 1.0);
+        debug_assert!(0.0 < gamma && gamma < 1.0);
         let reward_range = (self.config.max_reward - self.config.min_reward) as f64;
 
         // Paper definition: R_{t,H} = (1-gamma) * sum_{k=0}^{H-1} gamma^k r_{t+k}.
@@ -1348,6 +1367,24 @@ mod tests {
         }
 
         (actions, total_reward)
+    }
+
+    #[test]
+    fn programmatic_aiqi_preserves_explicit_signed_reward_contract() {
+        let mut config = basic_config();
+        config.reward_bits = 3;
+        config.min_reward = -2;
+        config.max_reward = 3;
+        config.reward_offset = 2;
+
+        let mut agent = AiqiAgent::new(config).expect("signed reward config should be valid");
+        assert_eq!(agent.config.min_reward, -2);
+        assert_eq!(agent.config.max_reward, 3);
+        assert_eq!(agent.config.reward_offset, 2);
+
+        agent
+            .observe_transition(0, &[0], -2)
+            .expect("signed reward within explicit config bounds should be accepted");
     }
 
     #[derive(Clone, Default)]
@@ -1788,5 +1825,44 @@ mod tests {
         let legacy_trace = run_ctw_trace(&mut legacy, 32);
         let canonical_trace = run_ctw_trace(&mut canonical, 32);
         assert_eq!(canonical_trace, legacy_trace);
+    }
+}
+
+#[cfg(all(test, feature = "backend-ctw"))]
+mod signed_reward_contract_tests {
+    use super::*;
+
+    fn action_alphabet(n: usize) -> ActionAlphabet {
+        ActionAlphabet::try_from_usize(n).expect("test action alphabet must be non-zero")
+    }
+
+    #[test]
+    fn programmatic_aiqi_preserves_explicit_signed_reward_contract_under_ctw() {
+        let config = AiqiConfig {
+            rate_backend: RateBackend::Ctw { depth: 8 },
+            observation_bits: 1,
+            observation_stream_len: 1,
+            reward_bits: 3,
+            agent_actions: action_alphabet(2),
+            min_reward: -2,
+            max_reward: 3,
+            reward_offset: 2,
+            discount_gamma: 0.99,
+            return_horizon: 2,
+            return_bins: 8,
+            augmentation_period: 2,
+            history_prune_keep_steps: None,
+            baseline_exploration: 0.01,
+            random_seed: Some(7),
+        };
+
+        let mut agent = AiqiAgent::new(config).expect("signed reward config should be valid");
+        assert_eq!(agent.config.min_reward, -2);
+        assert_eq!(agent.config.max_reward, 3);
+        assert_eq!(agent.config.reward_offset, 2);
+
+        agent
+            .observe_transition(0, &[0], -2)
+            .expect("signed reward within explicit config bounds should be accepted");
     }
 }

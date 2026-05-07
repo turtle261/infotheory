@@ -14,9 +14,6 @@ pub(crate) struct PlannerInterfaceConfig {
     pub observation_key_mode: ObservationKeyMode,
     pub reward_bits: usize,
     pub agent_actions: ActionAlphabet,
-    pub min_reward: i64,
-    pub max_reward: i64,
-    pub reward_offset: i64,
 }
 
 impl PlannerInterfaceConfig {
@@ -27,9 +24,6 @@ impl PlannerInterfaceConfig {
             observation_key_mode: self.observation_key_mode,
             reward_bits: self.reward_bits,
             agent_actions: self.agent_actions,
-            min_reward: self.min_reward,
-            max_reward: self.max_reward,
-            reward_offset: self.reward_offset,
         }
     }
 }

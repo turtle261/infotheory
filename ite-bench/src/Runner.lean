@@ -108,15 +108,15 @@ private def oracleGenFromOutcome (key : String) (outcome : OracleOutcome) : IO (
 
 private def mkParams
     (rateBackend : Option String := none)
-    (ncdBackend : Option String := none)
+    (compressionBackend : Option String := none)
     (method : Option String := none) : EstimatorParams :=
   Id.run do
     let mut strings := HashMap.empty
     match rateBackend with
     | some v => strings := strings.insert "rate_backend" v
     | none => pure ()
-    match ncdBackend with
-    | some v => strings := strings.insert "ncd_backend" v
+    match compressionBackend with
+    | some v => strings := strings.insert "compression_backend" v
     | none => pure ()
     match method with
     | some v => strings := strings.insert "method" v
