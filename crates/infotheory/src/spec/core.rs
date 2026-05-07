@@ -2069,6 +2069,135 @@ mod tests {
         );
     }
 
+    fn read_varint_prefix(bytes: &[u8]) -> Result<(u64, usize), String> {
+        let mut shift: u32 = 0;
+        let mut out: u64 = 0;
+        let mut index: usize = 0;
+        loop {
+            let byte = *bytes.get(index).ok_or_else(|| {
+                "unexpected end while decoding canonical frame length".to_string()
+            })?;
+            out |= ((byte & 0x7f) as u64) << shift;
+            index = index.saturating_add(1);
+            if byte & 0x80 == 0 {
+                return Ok((out, index));
+            }
+            shift = shift.saturating_add(7);
+            if shift > 63 {
+                return Err("invalid canonical frame varint length".to_string());
+            }
+        }
+    }
+
+    fn parse_framed_canonical_payload(bytes: &[u8]) -> Result<&[u8], String> {
+        let (declared_len_u64, header_len) = read_varint_prefix(bytes)?;
+        let declared_len = usize::try_from(declared_len_u64)
+            .map_err(|_| "canonical frame length exceeds usize::MAX".to_string())?;
+        let payload_end = header_len
+            .checked_add(declared_len)
+            .ok_or_else(|| "canonical frame length overflow".to_string())?;
+        if bytes.len() < payload_end {
+            return Err("truncated canonical frame payload".to_string());
+        }
+        if bytes.len() > payload_end {
+            return Err("canonical frame has trailing bytes".to_string());
+        }
+        Ok(&bytes[header_len..payload_end])
+    }
+
+    fn sample_compression_backend_corpus() -> Vec<CompressionBackend> {
+        let mut out = Vec::<CompressionBackend>::new();
+        let leaf = crate::runtime::first_enabled_default_rate_backend_spec();
+        for descriptor in crate::runtime::COMPRESSION_BACKEND_REGISTRY {
+            if !descriptor.enabled {
+                continue;
+            }
+            match descriptor.kind {
+                crate::runtime::CompressionBackendKind::Zpaq => {
+                    out.push(CompressionBackend::Zpaq {
+                        method: crate::api::ZpaqMethodSpec::literal("5"),
+                    });
+                }
+                crate::runtime::CompressionBackendKind::RateAc => {
+                    if let Some(rate_backend) = leaf.clone() {
+                        out.push(CompressionBackend::Rate {
+                            rate_backend,
+                            coder: crate::coders::CoderType::AC,
+                            framing: crate::compression::FramingMode::Framed,
+                        });
+                    }
+                }
+                crate::runtime::CompressionBackendKind::RateRans => {
+                    if let Some(rate_backend) = leaf.clone() {
+                        out.push(CompressionBackend::Rate {
+                            rate_backend,
+                            coder: crate::coders::CoderType::RANS,
+                            framing: crate::compression::FramingMode::Raw,
+                        });
+                    }
+                }
+                #[cfg(feature = "backend-rwkv")]
+                crate::runtime::CompressionBackendKind::Rwkv7 => {
+                    let options = crate::spec::CompressionBackendShorthandOptions {
+                        default_framing: crate::compression::FramingMode::Raw,
+                        ..Default::default()
+                    };
+                    let candidate = crate::spec::parse_compression_backend_name_method(
+                        "rwkv7",
+                        Some(
+                            "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer",
+                        ),
+                        None,
+                        &options,
+                    )
+                    .expect("rwkv shorthand candidate");
+                    out.push(candidate);
+                }
+                #[cfg(not(feature = "backend-rwkv"))]
+                crate::runtime::CompressionBackendKind::Rwkv7 => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn canonical_compression_code_frame_is_self_delimiting_and_typed() {
+        let env = SpecEnvironment::default();
+        let corpus = sample_compression_backend_corpus();
+        if corpus.is_empty() {
+            return;
+        }
+        for candidate in corpus {
+            let validated =
+                validate_compression_backend_in(&candidate, &env).expect("validate candidate");
+            let bytes = validated.canonical_bytes.as_slice();
+            let payload = parse_framed_canonical_payload(bytes).expect("valid canonical frame");
+            assert!(
+                payload.len() >= 5,
+                "canonical payload must contain magic + version"
+            );
+            assert_eq!(&payload[..4], b"itcb");
+            assert_eq!(payload[4], 1_u8);
+        }
+    }
+
+    #[test]
+    fn canonical_compression_code_frame_rejects_trailing_bytes_in_contract_parser() {
+        let env = SpecEnvironment::default();
+        let Some(candidate) = sample_compression_backend_corpus().into_iter().next() else {
+            return;
+        };
+        let validated = validate_compression_backend_in(&candidate, &env).expect("validate");
+        let bytes = validated.canonical_bytes.as_slice().to_vec();
+        parse_framed_canonical_payload(&bytes).expect("valid canonical frame");
+
+        let mut extended = bytes.clone();
+        extended.extend_from_slice(&[0x00, 0x01]);
+        let err = parse_framed_canonical_payload(&extended)
+            .expect_err("trailing bytes must be rejected by canonical frame parser");
+        assert!(err.contains("trailing bytes"), "{err}");
+    }
+
     #[test]
     fn canonical_rate_plan_bytes_are_prefix_free_for_sample_corpus() {
         let env = SpecEnvironment::default();

@@ -1681,6 +1681,8 @@ fn theorem_claims_continue_as_uncertified_when_requested_prereqs_are_missing() {
     let search = SearchSummary {
         status: "completed_mc_aixi_fac_ctw",
         warning: None,
+        fatal_evaluator_failure: None,
+        fatal_evaluator_failures: 0,
         best_candidate,
         best_candidate_crc32: "00000000".to_string(),
         best_eval: CandidateEvalResult {
@@ -1703,8 +1705,18 @@ fn theorem_claims_continue_as_uncertified_when_requested_prereqs_are_missing() {
         proposals_attempted: 0,
         proposals_invalid: 0,
         self_loop_proposals: 0,
+        invalid_reason_counts: InvalidReasonCounts::default(),
         successful_non_deployable: 0,
+        candidate_result_counts: CandidateResultCounts {
+            success_deployable: 1,
+            success_non_deployable: 0,
+            timeout: 0,
+            invalid: 0,
+            error_recoverable: 0,
+        },
         final_best_move_reward: 0.0,
+        realized_trace_counts_by_round: None,
+        trace_refresh_merges_by_round: None,
         controller_report: Value::Null,
     };
     let theorem = TuneTheoremConfig {
@@ -1752,7 +1764,18 @@ fn candidate_external_asset_references_are_rejected() {
     };
     let err = reject_candidate_local_external_artifacts(&candidate)
         .expect_err("external file reference must fail");
-    assert!(err.contains("candidate-local external filesystem/model path"));
+    assert_eq!(
+        err.reason,
+        TuneInvalidReason::CandidateExternalAssetForbidden
+    );
+    assert!(
+        err.diagnostic
+            .contains(TuneInvalidReason::CandidateExternalAssetForbidden.as_str())
+    );
+    assert!(
+        err.diagnostic
+            .contains("candidate-local external filesystem/model path")
+    );
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -2563,6 +2586,8 @@ fn discounted_aiqi_exact_theorem_claims_remain_uncertified_by_family() {
     let search = SearchSummary {
         status: "test",
         warning: None,
+        fatal_evaluator_failure: None,
+        fatal_evaluator_failures: 0,
         best_candidate: candidate,
         best_candidate_crc32: "00000000".to_string(),
         best_eval: CandidateEvalResult {
@@ -2585,8 +2610,18 @@ fn discounted_aiqi_exact_theorem_claims_remain_uncertified_by_family() {
         proposals_attempted: 0,
         proposals_invalid: 0,
         self_loop_proposals: 0,
+        invalid_reason_counts: InvalidReasonCounts::default(),
         successful_non_deployable: 0,
+        candidate_result_counts: CandidateResultCounts {
+            success_deployable: 1,
+            success_non_deployable: 0,
+            timeout: 0,
+            invalid: 0,
+            error_recoverable: 0,
+        },
         final_best_move_reward: 0.0,
+        realized_trace_counts_by_round: None,
+        trace_refresh_merges_by_round: None,
         controller_report: Value::Null,
     };
     let theorem = TuneTheoremConfig {
@@ -2992,56 +3027,136 @@ fn executor_controls_are_excluded_from_canonical_tune_but_included_in_evaluator_
 // --- Group 1: Canonicalization and model-code properties ---
 
 #[cfg(feature = "backend-ctw")]
-#[test]
-fn canon_idempotent() {
-    use crate::api::{CompressionBackend, RateBackend};
-    use crate::compression::FramingMode;
-    let candidate = CompressionBackend::Rate {
-        rate_backend: RateBackend::Ctw { depth: 4 },
-        coder: crate::coders::CoderType::AC,
-        framing: FramingMode::Framed,
-    };
-    let c1 = candidate.compile().unwrap();
-    let b1 = c1.canonical_bytes().as_slice().to_vec();
-    let env = crate::spec::SpecEnvironment::new(std::path::Path::new("."));
-    let ast = crate::spec::parse_compression_backend_json(
-        &crate::spec::compression_backend_to_json_value(&c1.canonical_spec()).unwrap(),
-        std::path::Path::new("."),
-        None,
-        FramingMode::Framed,
-    )
-    .unwrap();
-    let c2 = ast.compile_in(&env).unwrap();
-    let b2 = c2.canonical_bytes().as_slice().to_vec();
-    assert_eq!(b1, b2);
+fn sample_enabled_leaf_rate_backend_for_canonical_tests() -> Option<RateBackend> {
+    crate::runtime::RATE_BACKEND_REGISTRY
+        .iter()
+        .filter(|descriptor| descriptor.enabled)
+        .find_map(|descriptor| crate::runtime::default_rate_backend_spec(descriptor.kind))
+}
+
+#[cfg(feature = "backend-ctw")]
+fn sample_roundtrip_compression_backends_for_canonical_tests() -> Vec<CompressionBackend> {
+    let mut out = Vec::<CompressionBackend>::new();
+    let leaf = sample_enabled_leaf_rate_backend_for_canonical_tests();
+    for descriptor in crate::runtime::COMPRESSION_BACKEND_REGISTRY {
+        if !descriptor.enabled {
+            continue;
+        }
+        match descriptor.kind {
+            crate::runtime::CompressionBackendKind::Zpaq => out.push(CompressionBackend::Zpaq {
+                method: crate::api::ZpaqMethodSpec::literal("5"),
+            }),
+            crate::runtime::CompressionBackendKind::RateAc => {
+                if let Some(rate_backend) = leaf.clone() {
+                    out.push(CompressionBackend::Rate {
+                        rate_backend,
+                        coder: crate::coders::CoderType::AC,
+                        framing: FramingMode::Framed,
+                    });
+                }
+            }
+            crate::runtime::CompressionBackendKind::RateRans => {
+                if let Some(rate_backend) = leaf.clone() {
+                    out.push(CompressionBackend::Rate {
+                        rate_backend,
+                        coder: crate::coders::CoderType::RANS,
+                        framing: FramingMode::Raw,
+                    });
+                }
+            }
+            #[cfg(feature = "backend-rwkv")]
+            crate::runtime::CompressionBackendKind::Rwkv7 => {
+                let opts = crate::spec::CompressionBackendShorthandOptions {
+                    default_framing: crate::compression::FramingMode::Raw,
+                    ..Default::default()
+                };
+                let rwkv = crate::spec::parse_compression_backend_name_method(
+                    "rwkv7",
+                    Some(
+                        "cfg:hidden=64,intermediate=64,layers=1,train=sgd,lr=0.01;policy:schedule=0..100:infer",
+                    ),
+                    None,
+                    &opts,
+                )
+                .expect("rwkv shorthand should parse");
+                out.push(rwkv);
+            }
+            #[cfg(not(feature = "backend-rwkv"))]
+            crate::runtime::CompressionBackendKind::Rwkv7 => {}
+        }
+    }
+    out
 }
 
 #[cfg(feature = "backend-ctw")]
 #[test]
-fn canonical_bytes_prefix_free_on_generated_corpus() {
-    use crate::api::{CompressionBackend, RateBackend};
-    use crate::compression::FramingMode;
-    let mut corpus = Vec::new();
-    for depth in 1..=8 {
-        corpus.push(
-            CompressionBackend::Rate {
-                rate_backend: RateBackend::Ctw { depth },
-                coder: crate::coders::CoderType::AC,
-                framing: FramingMode::Framed,
-            }
-            .compile()
-            .unwrap()
-            .canonical_bytes()
-            .as_slice()
-            .to_vec(),
+fn canonical_code_roundtrip_and_idempotence_hold_on_enabled_corpus() {
+    use std::path::Path;
+
+    let corpus = sample_roundtrip_compression_backends_for_canonical_tests();
+    assert!(
+        !corpus.is_empty(),
+        "at least one enabled compression backend must be available for canonicalization tests"
+    );
+
+    for candidate in corpus {
+        let compiled = candidate.compile().expect("compile candidate");
+        let canonical_bytes = compiled.canonical_bytes().as_slice().to_vec();
+        let canonical_doc = SpecDocument::CompressionBackend(compiled.canonical_spec().clone());
+        let canonical_doc_bytes = canonical_doc.to_binary();
+
+        let reparsed = SpecDocument::from_binary(&canonical_doc_bytes, Path::new("."))
+            .expect("parse canonical bytes");
+        let recompiled = reparsed.compile().expect("compile reparsed document");
+        let crate::spec::CompiledSpecDocument::CompressionBackend(recompiled_candidate) =
+            recompiled
+        else {
+            panic!("expected compression backend document");
+        };
+
+        assert_eq!(
+            canonical_bytes,
+            recompiled_candidate.canonical_bytes().as_slice()
+        );
+        assert_eq!(
+            canonical_doc.to_canonical_json().expect("canonical json"),
+            SpecDocument::CompressionBackend(recompiled_candidate.canonical_spec().clone())
+                .to_canonical_json()
+                .expect("reparsed canonical json")
         );
     }
-    for i in 0..corpus.len() {
-        for j in 0..corpus.len() {
-            if i != j {
-                assert!(corpus[i] != corpus[j]);
-                assert!(!corpus[i].starts_with(&corpus[j]) && !corpus[j].starts_with(&corpus[i]));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn canonical_code_image_is_injective_and_prefix_free_on_enabled_corpus() {
+    let corpus = sample_roundtrip_compression_backends_for_canonical_tests();
+    let mut image = std::collections::BTreeMap::<Vec<u8>, String>::new();
+
+    for candidate in corpus {
+        let compiled = candidate.compile().expect("compile candidate");
+        let canonical_doc = SpecDocument::CompressionBackend(compiled.canonical_spec().clone());
+        let bytes = compiled.canonical_bytes().as_slice().to_vec();
+        let json = canonical_doc.to_canonical_json().expect("canonical json");
+
+        if let Some(existing) = image.insert(bytes.clone(), json.clone()) {
+            assert_eq!(
+                existing, json,
+                "equal canonical bytes must denote identical canonical candidate JSON"
+            );
+        }
+    }
+
+    let keys = image.keys().cloned().collect::<Vec<Vec<u8>>>();
+    for i in 0..keys.len() {
+        for j in 0..keys.len() {
+            if i == j {
+                continue;
             }
+            assert!(
+                !keys[i].starts_with(&keys[j]),
+                "canonical code image must be prefix-free"
+            );
         }
     }
 }
@@ -3085,6 +3200,135 @@ fn syntactic_aliases_canonicalize_to_same_model_code_length() {
     assert_eq!(
         8_usize * z1.canonical_bytes().len(),
         8_usize * z2.canonical_bytes().len()
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn canonicalization_preserves_order_sensitivity_for_mixture_experts() {
+    use std::sync::Arc;
+
+    let left = CompressionBackend::Rate {
+        rate_backend: RateBackend::Mixture {
+            spec: Arc::new(crate::api::MixtureSpec::new(
+                crate::api::MixtureKind::Bayes,
+                vec![
+                    crate::api::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                        .with_name("left"),
+                    crate::api::MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 })
+                        .with_name("right"),
+                ],
+            )),
+        },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let right = CompressionBackend::Rate {
+        rate_backend: RateBackend::Mixture {
+            spec: Arc::new(crate::api::MixtureSpec::new(
+                crate::api::MixtureKind::Bayes,
+                vec![
+                    crate::api::MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 })
+                        .with_name("right"),
+                    crate::api::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                        .with_name("left"),
+                ],
+            )),
+        },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+
+    let left_bytes = left
+        .compile()
+        .expect("compile left mixture")
+        .canonical_bytes()
+        .as_slice()
+        .to_vec();
+    let right_bytes = right
+        .compile()
+        .expect("compile right mixture")
+        .canonical_bytes()
+        .as_slice()
+        .to_vec();
+    assert_ne!(
+        left_bytes, right_bytes,
+        "expert order is semantic in order-sensitive mixture canonicalization paths"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn canonicalization_is_insensitive_to_json_object_key_order() {
+    use std::path::Path;
+
+    let mut top_a = serde_json::Map::new();
+    top_a.insert("kind".to_string(), serde_json::json!("rate-ac"));
+    let mut rate_a = serde_json::Map::new();
+    rate_a.insert("kind".to_string(), serde_json::json!("ctw"));
+    rate_a.insert("depth".to_string(), serde_json::json!(8));
+    top_a.insert("rate_backend".to_string(), Value::Object(rate_a));
+    top_a.insert("framing".to_string(), serde_json::json!("framed"));
+
+    let mut top_b = serde_json::Map::new();
+    top_b.insert("framing".to_string(), serde_json::json!("framed"));
+    let mut rate_b = serde_json::Map::new();
+    rate_b.insert("depth".to_string(), serde_json::json!(8));
+    rate_b.insert("kind".to_string(), serde_json::json!("ctw"));
+    top_b.insert("rate_backend".to_string(), Value::Object(rate_b));
+    top_b.insert("kind".to_string(), serde_json::json!("rate-ac"));
+
+    let parsed_a = crate::spec::parse_compression_backend_json(
+        &Value::Object(top_a),
+        Path::new("."),
+        None,
+        FramingMode::Framed,
+    )
+    .expect("parse A");
+    let parsed_b = crate::spec::parse_compression_backend_json(
+        &Value::Object(top_b),
+        Path::new("."),
+        None,
+        FramingMode::Framed,
+    )
+    .expect("parse B");
+
+    let bytes_a = parsed_a
+        .compile()
+        .expect("compile A")
+        .canonical_bytes()
+        .as_slice()
+        .to_vec();
+    let bytes_b = parsed_b
+        .compile()
+        .expect("compile B")
+        .canonical_bytes()
+        .as_slice()
+        .to_vec();
+    assert_eq!(bytes_a, bytes_b);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn binary_canonical_deserializer_rejects_trailing_bytes() {
+    use std::path::Path;
+
+    let candidate = sample_roundtrip_compression_backends_for_canonical_tests()
+        .into_iter()
+        .next()
+        .expect("candidate corpus must be non-empty");
+    let compiled = candidate.compile().expect("compile candidate");
+    let mut payload =
+        SpecDocument::CompressionBackend(compiled.canonical_spec().clone()).to_binary();
+    payload.extend_from_slice(&[0x00_u8, 0x01_u8]);
+
+    let err = match SpecDocument::from_binary(&payload, Path::new(".")) {
+        Ok(_) => panic!("trailing bytes must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("unexpected trailing bytes"),
+        "{err}"
     );
 }
 

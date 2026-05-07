@@ -70,6 +70,8 @@ pub(super) fn run_planner_family_controller(
     let mut best_key = baseline_key;
     let mut current_candidate = best_candidate.clone();
     let mut current_eval = baseline_eval;
+    let mut candidate_result_counts = CandidateResultCounts::default();
+    candidate_result_counts.record_admitted_result(&current_eval);
     let mut current_bytes = best_bytes.clone();
     let mut cache_hits: usize = 0;
     let mut cache_misses: usize = 1;
@@ -77,6 +79,7 @@ pub(super) fn run_planner_family_controller(
     let mut proposals_attempted: usize = 0;
     let mut proposals_invalid: usize = 0;
     let mut self_loop_proposals: usize = 0;
+    let mut invalid_reason_counts = InvalidReasonCounts::default();
     let mut successful_non_deployable: usize = 0;
     let mut final_best_move_reward: f64 = 0.0;
     let mut evaluations_seen: usize = 1;
@@ -84,11 +87,14 @@ pub(super) fn run_planner_family_controller(
     let mut stagnation_counter: usize = 0;
     let mut decision_steps: usize = 0;
     let mut warmstart_trace_refresh_merges: usize = 0;
+    let mut fatal_evaluator_failure: Option<String> = None;
     let total_rounds = if contract.warmstart_self_improvement {
         request.execution.self_improvement_rounds.max(1)
     } else {
         1
     };
+    let mut realized_trace_counts_by_round = vec![0usize; total_rounds];
+    let mut trace_refresh_merges_by_round = vec![0usize; total_rounds];
     let trace_refresh_enabled = contract.warmstart_self_improvement
         && request.execution.warmstart_trace_refresh
         && total_rounds > 1;
@@ -98,17 +104,21 @@ pub(super) fn run_planner_family_controller(
         .map(|teacher| teacher.traces.clone());
     let planner_return_bins = planner_return_bins(&planner_run);
 
-    for round in 0..total_rounds {
-        if trace_refresh_enabled
-            && round > 0
-            && let (Some(live_trace), Some(teacher)) = (
-                agent_runtime.same_task_live_trace(),
-                refresh_teacher.as_mut(),
-            )
+    'rounds: for round in 0..total_rounds {
+        if round > 0
+            && let Some(live_trace) = agent_runtime.same_task_live_trace()
         {
-            merge_warmstart_trace_deterministic(teacher, live_trace)?;
-            agent_runtime.rebuild_warmstart_agent(&planner_run, teacher.clone())?;
-            warmstart_trace_refresh_merges = warmstart_trace_refresh_merges.saturating_add(1);
+            let previous_round = round - 1;
+            realized_trace_counts_by_round[previous_round] = live_trace.transitions.len();
+            if trace_refresh_enabled && let Some(teacher) = refresh_teacher.as_mut() {
+                let records_before = teacher_trace_record_count(teacher);
+                merge_warmstart_trace_deterministic(teacher, live_trace)?;
+                let records_after = teacher_trace_record_count(teacher);
+                trace_refresh_merges_by_round[previous_round] =
+                    records_after.saturating_sub(records_before);
+                agent_runtime.rebuild_warmstart_agent(&planner_run, teacher.clone())?;
+                warmstart_trace_refresh_merges = warmstart_trace_refresh_merges.saturating_add(1);
+            }
         }
         let round_deadline_seconds = if contract.warmstart_self_improvement && total_rounds > 1 {
             Some(
@@ -134,12 +144,13 @@ pub(super) fn run_planner_family_controller(
                 .map_err(|_| format!("planner action {action} does not fit usize"))?;
             if action_index >= actions.len() {
                 proposals_invalid = proposals_invalid.saturating_add(1);
+                invalid_reason_counts.record(TuneInvalidReason::InvalidActionIndex);
                 let percept = encode_tuner_planner_percept(
                     &contract.interface,
                     Some(&current_eval),
                     dataset.dataset_units,
                     0,
-                    "invalid_action_index",
+                    TuneInvalidReason::InvalidActionIndex.as_str(),
                     None,
                     None,
                     None,
@@ -153,12 +164,13 @@ pub(super) fn run_planner_family_controller(
                 apply_planner_mutation_action(&current_candidate, &actions[action_index])?
             else {
                 self_loop_proposals = self_loop_proposals.saturating_add(1);
+                invalid_reason_counts.record(TuneInvalidReason::InapplicableAction);
                 let percept = encode_tuner_planner_percept(
                     &contract.interface,
                     Some(&current_eval),
                     dataset.dataset_units,
                     0,
-                    "inapplicable_action",
+                    TuneInvalidReason::InapplicableAction.as_str(),
                     None,
                     None,
                     None,
@@ -168,20 +180,38 @@ pub(super) fn run_planner_family_controller(
                 decision_steps = decision_steps.saturating_add(1);
                 continue;
             };
-            if reject_candidate_local_external_artifacts(&proposed_candidate).is_err()
-                || validate_candidate_against_tune_bounds(
-                    &proposed_candidate,
-                    &compiled.canonical_spec().bounds,
-                )
-                .is_err()
-            {
+            if let Err(err) = reject_candidate_local_external_artifacts(&proposed_candidate) {
                 proposals_invalid = proposals_invalid.saturating_add(1);
+                invalid_reason_counts.record(err.reason);
                 let percept = encode_tuner_planner_percept(
                     &contract.interface,
                     Some(&current_eval),
                     dataset.dataset_units,
                     0,
-                    "candidate_out_of_bounds_or_external_artifact",
+                    err.reason.as_str(),
+                    None,
+                    None,
+                    None,
+                    false,
+                )?;
+                agent_runtime.observe_transition(action, percept)?;
+                decision_steps = decision_steps.saturating_add(1);
+                continue;
+            }
+            if validate_candidate_against_tune_bounds(
+                &proposed_candidate,
+                &compiled.canonical_spec().bounds,
+            )
+            .is_err()
+            {
+                proposals_invalid = proposals_invalid.saturating_add(1);
+                invalid_reason_counts.record(TuneInvalidReason::CandidateOutOfBounds);
+                let percept = encode_tuner_planner_percept(
+                    &contract.interface,
+                    Some(&current_eval),
+                    dataset.dataset_units,
+                    0,
+                    TuneInvalidReason::CandidateOutOfBounds.as_str(),
                     None,
                     None,
                     None,
@@ -195,12 +225,13 @@ pub(super) fn run_planner_family_controller(
                 Ok(value) => value,
                 Err(_) => {
                     proposals_invalid = proposals_invalid.saturating_add(1);
+                    invalid_reason_counts.record(TuneInvalidReason::CandidateCompileError);
                     let percept = encode_tuner_planner_percept(
                         &contract.interface,
                         Some(&current_eval),
                         dataset.dataset_units,
                         0,
-                        "candidate_compile_error",
+                        TuneInvalidReason::CandidateCompileError.as_str(),
                         None,
                         None,
                         None,
@@ -261,7 +292,10 @@ pub(super) fn run_planner_family_controller(
                     verified_theorem.deterministic_table.as_ref(),
                 ) {
                     Ok(value) => value,
-                    Err(_) => error_eval_result(0.0, 0, effective_limit),
+                    Err(CandidateEvalFailure::FatalEvaluatorFailure { diagnostic }) => {
+                        fatal_evaluator_failure = Some(diagnostic);
+                        break 'rounds;
+                    }
                 };
                 cache.insert(cache_key.clone(), evaluated.clone());
                 cache_misses = cache_misses.saturating_add(1);
@@ -269,11 +303,13 @@ pub(super) fn run_planner_family_controller(
                 evaluated
             };
             evaluations_seen = evaluations_seen.saturating_add(1);
+            candidate_result_counts.record_admitted_result(&candidate_eval);
             let incumbent_eval_before_step = current_eval.clone();
             let mut raw_improvement = 0.0f64;
-            if !candidate_eval.deployable {
+            if candidate_eval.status == CandidateEvalStatus::Success && !candidate_eval.deployable {
                 successful_non_deployable = successful_non_deployable.saturating_add(1);
-            } else {
+            }
+            if candidate_eval.deployable {
                 if key_less(
                     &candidate_eval,
                     &candidate_bytes,
@@ -333,9 +369,27 @@ pub(super) fn run_planner_family_controller(
         }
     }
 
+    if contract.warmstart_self_improvement
+        && total_rounds > 0
+        && let Some(live_trace) = agent_runtime.same_task_live_trace()
+    {
+        realized_trace_counts_by_round[total_rounds - 1] = live_trace.transitions.len();
+    }
+
+    let status = if fatal_evaluator_failure.is_some() {
+        "terminated_unrecoverable_evaluator_failure"
+    } else {
+        planner_completed_status(compiled.controller())
+    };
+    let warning = fatal_evaluator_failure
+        .as_ref()
+        .map(|_| "terminated due to unrecoverable evaluator failure".to_string());
+
     Ok(SearchSummary {
-        status: planner_completed_status(compiled.controller()),
-        warning: None,
+        status,
+        warning,
+        fatal_evaluator_failure: fatal_evaluator_failure.clone(),
+        fatal_evaluator_failures: usize::from(fatal_evaluator_failure.is_some()),
         best_candidate,
         best_candidate_crc32: best_hash,
         best_eval,
@@ -348,8 +402,20 @@ pub(super) fn run_planner_family_controller(
         proposals_attempted,
         proposals_invalid,
         self_loop_proposals,
+        invalid_reason_counts,
         successful_non_deployable,
+        candidate_result_counts,
         final_best_move_reward,
+        realized_trace_counts_by_round: if contract.warmstart_self_improvement {
+            Some(realized_trace_counts_by_round.clone())
+        } else {
+            None
+        },
+        trace_refresh_merges_by_round: if contract.warmstart_self_improvement {
+            Some(trace_refresh_merges_by_round.clone())
+        } else {
+            None
+        },
         controller_report: serde_json::json!({
             "kind": controller_kind_name(compiled.controller()),
             "runtime_path": planner_runtime_path_name(compiled.controller()),
@@ -381,6 +447,10 @@ pub(super) fn run_planner_family_controller(
                 None::<&str>
             },
             "warmstart_trace_refresh_merges": warmstart_trace_refresh_merges,
+            "warmstart_trace_refresh_merged_records_total": trace_refresh_merges_by_round
+                .iter()
+                .copied()
+                .sum::<usize>(),
         }),
     })
 }
@@ -506,6 +576,14 @@ fn load_warmstart_teacher_dataset(
         records,
         traces,
     })
+}
+
+fn teacher_trace_record_count(dataset: &WarmStartExactJhTeacherDataset) -> usize {
+    dataset
+        .traces
+        .iter()
+        .map(|trace| trace.transitions.len())
+        .sum()
 }
 
 pub(super) fn validate_warmstart_teacher_contract(

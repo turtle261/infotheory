@@ -42,7 +42,7 @@ pub(super) fn decode_spec_document(bytes: &[u8], base_dir: &Path) -> SpecResult<
             "unsupported spec document binary version '{version}'"
         )));
     }
-    match cursor.read_u8()? {
+    let document = match cursor.read_u8()? {
         0 => Ok(SpecDocument::PlannerRun(decode_planner_run(
             &mut cursor,
             base_dir,
@@ -61,7 +61,11 @@ pub(super) fn decode_spec_document(bytes: &[u8], base_dir: &Path) -> SpecResult<
             decode_compression_backend(&mut cursor, base_dir)?,
         )),
         tag => Err(SpecError::new(format!("unknown spec document tag '{tag}'"))),
+    }?;
+    if cursor.has_remaining() {
+        return Err(SpecError::new("unexpected trailing bytes in spec document"));
     }
+    Ok(document)
 }
 
 fn encode_planner_run(spec: &PlannerRunSpec, out: &mut Vec<u8>) {
@@ -2036,7 +2040,6 @@ impl<'a> Cursor<'a> {
         Ok(items)
     }
 
-    #[cfg(feature = "vm")]
     fn has_remaining(&self) -> bool {
         self.pos < self.bytes.len()
     }

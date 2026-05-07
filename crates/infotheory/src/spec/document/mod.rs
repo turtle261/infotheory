@@ -23,6 +23,32 @@ const DOCUMENT_BINARY_VERSION: u8 = 1;
 #[cfg(feature = "tuner")]
 const TUNE_CANONICALIZATION_CLASSIFICATION_VERSION: &str = "bounds-v1";
 
+#[cfg(feature = "tuner")]
+pub(crate) const CANDIDATE_EXTERNAL_ASSET_FORBIDDEN: &str = "candidate_external_asset_forbidden";
+
+#[cfg(feature = "tuner")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TuneInvalidReason {
+    CandidateExternalAssetForbidden,
+    CandidateOutOfBounds,
+    CandidateCompileError,
+    InvalidActionIndex,
+    InapplicableAction,
+}
+
+#[cfg(feature = "tuner")]
+impl TuneInvalidReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CandidateExternalAssetForbidden => CANDIDATE_EXTERNAL_ASSET_FORBIDDEN,
+            Self::CandidateOutOfBounds => "candidate_out_of_bounds",
+            Self::CandidateCompileError => "candidate_compile_error",
+            Self::InvalidActionIndex => "invalid_action_index",
+            Self::InapplicableAction => "inapplicable_action",
+        }
+    }
+}
+
 mod binary;
 mod io;
 mod parser;

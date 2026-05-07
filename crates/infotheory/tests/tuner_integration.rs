@@ -7,6 +7,8 @@ use infotheory::tuner::{
 };
 use serde_json::{Value, json};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "cli")]
 use std::process::Command;
@@ -1015,6 +1017,35 @@ fn assert_required_report_fields(report: &Value) {
     assert!(f64_at(report, "/baseline/throughput_runtime_cap_seconds").is_finite());
     assert!(f64_at(report, "/baseline/effective_eval_time_limit_seconds").is_finite());
     assert!(u64_at(report, "/cache/candidate_evaluations_executed") >= 1);
+    assert!(u64_at(report, "/search/fatal_evaluator_failures") <= 1);
+    let counted_results = u64_at(report, "/search/candidate_result_counts/success_deployable")
+        + u64_at(
+            report,
+            "/search/candidate_result_counts/success_non_deployable",
+        )
+        + u64_at(report, "/search/candidate_result_counts/timeout")
+        + u64_at(report, "/search/candidate_result_counts/invalid")
+        + u64_at(report, "/search/candidate_result_counts/error_recoverable");
+    assert_eq!(
+        counted_results,
+        u64_at(report, "/search/non_warmup_candidate_results_seen")
+    );
+    let _external_asset_forbidden = u64_at(
+        report,
+        "/search/invalid_reason_counts/candidate_external_asset_forbidden",
+    );
+    assert!(matches!(
+        str_at(report, "/provenance/canonical_code_certification/basis"),
+        "structural_self_delimiting_binary_encoding_plus_tests"
+    ));
+    assert!(bool_at(
+        report,
+        "/provenance/canonical_code_certification/top_level_length_prefix"
+    ));
+    assert!(bool_at(
+        report,
+        "/provenance/canonical_code_certification/trailing_bytes_rejected"
+    ));
     assert!(bool_at(
         report,
         "/baseline/physical_compressed_bytes_diagnostic_only"
@@ -1163,6 +1194,7 @@ fn canonical_tune_document_rejects_unknown_nested_fields() {
 
 #[test]
 fn canonical_tune_document_rejects_candidate_local_external_assets() {
+    const EXTERNAL_ASSET_FORBIDDEN: &str = "candidate_external_asset_forbidden";
     let dir = temp_dir("canonical_rejects_candidate_external_assets");
     let dataset_path = dir.join("dataset.bin");
     let output_path = dir.join("output.json");
@@ -1191,6 +1223,7 @@ fn canonical_tune_document_rejects_candidate_local_external_assets() {
             Ok(_) => panic!("candidate-local external asset field must fail"),
             Err(err) => err,
         };
+        assert!(err.to_string().contains(EXTERNAL_ASSET_FORBIDDEN), "{err}");
         assert!(
             err.to_string().contains("candidate-local external asset"),
             "{err}"
@@ -1212,6 +1245,7 @@ fn canonical_tune_document_rejects_candidate_local_external_assets() {
         Ok(_) => panic!("policy load_from must fail"),
         Err(err) => err,
     };
+    assert!(err.to_string().contains(EXTERNAL_ASSET_FORBIDDEN), "{err}");
     assert!(err.to_string().contains("policy load_from"), "{err}");
 
     let mut rejected = tune_spec(
@@ -1232,6 +1266,7 @@ fn canonical_tune_document_rejects_candidate_local_external_assets() {
         Ok(_) => panic!("method.path candidate-local asset must fail"),
         Err(err) => err,
     };
+    assert!(err.to_string().contains(EXTERNAL_ASSET_FORBIDDEN), "{err}");
     assert!(
         err.to_string()
             .contains("candidate-local external asset field"),
@@ -2352,7 +2387,300 @@ fn run_tune_reports_per_candidate_timeout() {
     assert_eq!(str_at(&report, "/baseline/status"), "timeout");
     assert_eq!(str_at(&report, "/best/status"), "timeout");
     assert!(!bool_at(&report, "/baseline/deployable"));
+    assert_eq!(
+        u64_at(&report, "/search/candidate_result_counts/timeout"),
+        1
+    );
+    assert_eq!(
+        u64_at(
+            &report,
+            "/search/candidate_result_counts/success_non_deployable"
+        ),
+        0
+    );
     assert!(!output_path.exists());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_tune_treats_worker_ok_false_as_unrecoverable_evaluator_failure() {
+    let dir = temp_dir("worker_ok_false_fatal");
+    let dataset_path = dir.join("dataset.bin");
+    let spec_path = dir.join("spec.json");
+    let output_path = dir.join("output.json");
+    let report_path = dir.join("report.json");
+    let worker_path = dir.join("synthetic-worker.sh");
+    write_passive_dataset(&dataset_path);
+    write_json(
+        &spec_path,
+        &tune_spec(
+            &dataset_path,
+            &output_path,
+            &report_path,
+            json!({
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1,
+            }),
+            None,
+        ),
+    );
+    fs::write(
+        &worker_path,
+        br#"#!/bin/sh
+if [ "${INFOTHEORY_TUNER_EVAL_WORKER_PING:-0}" = "1" ]; then
+  exit 0
+fi
+printf '%s\n' '{"ok":false,"error":"synthetic worker setup failure"}' > "$INFOTHEORY_TUNER_EVAL_RESPONSE_PATH"
+exit 0
+"#,
+    )
+    .expect("write synthetic worker script");
+    let mut permissions = fs::metadata(&worker_path)
+        .expect("read worker metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&worker_path, permissions).expect("set worker script executable");
+
+    let args = [
+        "infotheory".to_string(),
+        "tune".to_string(),
+        path_string(&spec_path),
+        "--max-evaluations".to_string(),
+        "1".to_string(),
+        "--evaluator-worker-executable".to_string(),
+        path_string(&worker_path),
+    ];
+    let request = parse_tune_command_args(&args).expect("parse tune args");
+    let err = run_tune(&request).expect_err("worker ok:false must be fatal");
+    assert!(
+        err.contains("unrecoverable evaluator failure during baseline evaluation"),
+        "{err}"
+    );
+    assert!(err.contains("synthetic worker setup failure"), "{err}");
+    if report_path.exists() {
+        let report = read_json(&report_path);
+        assert_ne!(
+            str_at(&report, "/search/termination_reason"),
+            "baseline_not_deployable"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn baseline_candidate_local_error_reports_baseline_not_deployable() {
+    let dir = temp_dir("baseline_candidate_local_error");
+    let dataset_path = dir.join("dataset.bin");
+    let spec_path = dir.join("spec.json");
+    let output_path = dir.join("output.json");
+    let report_path = dir.join("report.json");
+    let worker_path = dir.join("synthetic-worker.sh");
+    write_passive_dataset(&dataset_path);
+    write_json(
+        &spec_path,
+        &tune_spec(
+            &dataset_path,
+            &output_path,
+            &report_path,
+            json!({
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1,
+            }),
+            None,
+        ),
+    );
+    fs::write(
+        &worker_path,
+        br#"#!/bin/sh
+if [ "${INFOTHEORY_TUNER_EVAL_WORKER_PING:-0}" = "1" ]; then
+  exit 0
+fi
+printf '%s\n' '{"ok":true,"status":"error","compressed_bytes":0,"elapsed_seconds":0.0,"effective_eval_time_limit_seconds":1.0,"throughput_bytes_per_second":0.0,"peak_memory_bytes":0,"target_loss_bits":null,"objective_bits":null,"deployable":false}' > "$INFOTHEORY_TUNER_EVAL_RESPONSE_PATH"
+exit 0
+"#,
+    )
+    .expect("write synthetic worker script");
+    let mut permissions = fs::metadata(&worker_path)
+        .expect("read worker metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&worker_path, permissions).expect("set worker script executable");
+
+    let args = [
+        "infotheory".to_string(),
+        "tune".to_string(),
+        path_string(&spec_path),
+        "--max-evaluations".to_string(),
+        "1".to_string(),
+        "--evaluator-worker-executable".to_string(),
+        path_string(&worker_path),
+    ];
+    let request = parse_tune_command_args(&args).expect("parse tune args");
+    let err = run_tune(&request).expect_err("baseline error status must be non-deployable");
+    assert!(
+        err.contains("baseline candidate is not deployable"),
+        "unexpected error: {err}"
+    );
+    let report = read_json(&report_path);
+    assert_eq!(
+        str_at(&report, "/search/termination_reason"),
+        "baseline_not_deployable"
+    );
+    assert_eq!(str_at(&report, "/baseline/status"), "error");
+    assert_eq!(u64_at(&report, "/search/fatal_evaluator_failures"), 0);
+    assert_eq!(
+        u64_at(&report, "/search/candidate_result_counts/error_recoverable"),
+        1
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn baseline_fatal_inner_eval_error_reports_fatal_evaluator_failure() {
+    let dir = temp_dir("baseline_fatal_inner_eval_error");
+    let dataset_path = dir.join("dataset.bin");
+    let spec_path = dir.join("spec.json");
+    let output_path = dir.join("output.json");
+    let report_path = dir.join("report.json");
+    let worker_path = dir.join("synthetic-worker.sh");
+    write_passive_dataset(&dataset_path);
+    write_json(
+        &spec_path,
+        &tune_spec(
+            &dataset_path,
+            &output_path,
+            &report_path,
+            json!({
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1,
+            }),
+            None,
+        ),
+    );
+    fs::write(
+        &worker_path,
+        br#"#!/bin/sh
+if [ "${INFOTHEORY_TUNER_EVAL_WORKER_PING:-0}" = "1" ]; then
+  exit 0
+fi
+printf '%s\n' '{"ok":false,"error":"synthetic inner fatal evaluator failure"}' > "$INFOTHEORY_TUNER_EVAL_RESPONSE_PATH"
+exit 0
+"#,
+    )
+    .expect("write synthetic worker script");
+    let mut permissions = fs::metadata(&worker_path)
+        .expect("read worker metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&worker_path, permissions).expect("set worker script executable");
+
+    let args = [
+        "infotheory".to_string(),
+        "tune".to_string(),
+        path_string(&spec_path),
+        "--max-evaluations".to_string(),
+        "1".to_string(),
+        "--evaluator-worker-executable".to_string(),
+        path_string(&worker_path),
+    ];
+    let request = parse_tune_command_args(&args).expect("parse tune args");
+    let err = run_tune(&request).expect_err("worker fatal must abort baseline");
+    assert!(
+        err.contains("unrecoverable evaluator failure during baseline evaluation"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        err.contains("synthetic inner fatal evaluator failure"),
+        "{err}"
+    );
+    assert!(
+        !report_path.exists(),
+        "fatal baseline evaluator failures should abort before report synthesis"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn run_tune_terminates_on_unrecoverable_evaluator_failure() {
+    let dir = temp_dir("fatal_evaluator_failure");
+    let dataset_path = dir.join("dataset.bin");
+    let spec_path = dir.join("spec.json");
+    let output_path = dir.join("output.json");
+    let report_path = dir.join("report.json");
+    let table_cert_path = dir.join("deterministic_table.json");
+    let reward_cert_path = dir.join("exact_reward.json");
+    write_passive_dataset(&dataset_path);
+    let mc_case = controller_cases()
+        .into_iter()
+        .find(|case| case.kind == "mc_aixi_fac_ctw")
+        .expect("mc_aixi controller case");
+    let spec = tune_spec(
+        &dataset_path,
+        &output_path,
+        &report_path,
+        mc_case.controller,
+        None,
+    );
+    write_json(&spec_path, &spec);
+    let (_spec_crc32, baseline_candidate_crc32) = compiled_tune_hashes(&spec, &dir);
+    write_exact_reward_certificate_with_runtime_profile(
+        &reward_cert_path,
+        &dataset_path,
+        TimingCertificationTier::DeterministicTable,
+        "mc_aixi_fac_ctw",
+        65_535,
+        true,
+    );
+    write_deterministic_table(
+        &table_cert_path,
+        &dataset_path,
+        "mc_aixi_fac_ctw",
+        &baseline_candidate_crc32,
+    );
+
+    let args = [
+        "infotheory",
+        "tune",
+        path_string(&spec_path).as_str(),
+        "--max-evaluations",
+        "2",
+        "--timing-tier",
+        "deterministic_table",
+        "--scalar-representation-ref",
+        "scalar://finite-f64",
+        "--exact-reward-encoding-certificate",
+        path_string(&reward_cert_path).as_str(),
+        "--deterministic-evaluator-table",
+        path_string(&table_cert_path).as_str(),
+    ]
+    .iter()
+    .map(|item| (*item).to_string())
+    .collect::<Vec<_>>();
+    let request = parse_tune_command_args(&args).expect("parse tune args");
+    let err = run_tune(&request).expect_err("missing deterministic-table row must be fatal");
+    assert!(
+        err.contains("unrecoverable evaluator failure"),
+        "unexpected error: {err}"
+    );
+
+    let report = read_json(&report_path);
+    assert_eq!(
+        str_at(&report, "/status"),
+        "terminated_unrecoverable_evaluator_failure"
+    );
+    assert_eq!(
+        str_at(&report, "/search/termination_reason"),
+        "terminated_unrecoverable_evaluator_failure"
+    );
+    assert_eq!(u64_at(&report, "/search/fatal_evaluator_failures"), 1);
+    assert!(
+        str_at(&report, "/search/fatal_evaluator_failure")
+            .contains("deterministic evaluator table missing row"),
+        "fatal diagnostic should retain deterministic table row failure context"
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -2484,6 +2812,16 @@ fn run_tune_warmstart_self_improvement_reports_equal_split_deadlines() {
             .unwrap_or_else(|| panic!("deadline[{index}] must be f64"));
         assert!((observed - expected_value).abs() <= 1.0e-9);
     }
+    let realized =
+        report["provenance"]["self_improvement_policy"]["realized_trace_counts_by_round"]
+            .as_array()
+            .expect("realized trace counts");
+    assert_eq!(realized.len(), 3);
+    let merges = report["provenance"]["self_improvement_policy"]["trace_refresh_merges_by_round"]
+        .as_array()
+        .expect("trace refresh merges");
+    assert_eq!(merges.len(), 3);
+    assert!(merges.iter().all(|value| value.as_u64() == Some(0)));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -2551,6 +2889,16 @@ fn warmstart_trace_refresh_merges_same_task_live_trace() {
         "/provenance/self_improvement_policy/online_delayed_label_update_enabled"
     ));
     assert!(u64_at(&report, "/search/controller/warmstart_trace_refresh_merges") >= 1);
+    let realized =
+        report["provenance"]["self_improvement_policy"]["realized_trace_counts_by_round"]
+            .as_array()
+            .expect("realized trace counts");
+    let merges = report["provenance"]["self_improvement_policy"]["trace_refresh_merges_by_round"]
+        .as_array()
+        .expect("trace refresh merges");
+    assert_eq!(realized.len(), 3);
+    assert_eq!(merges.len(), 3);
+    assert!(merges.iter().any(|value| value.as_u64().unwrap_or(0) > 0));
     let _ = fs::remove_dir_all(dir);
 }
 

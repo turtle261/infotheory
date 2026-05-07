@@ -8,6 +8,8 @@ pub use self::core::{
     CompressionBackendCapabilities, MethodBackendFamily, RateBackendCapabilities,
     RateBackendTraceStrategy, SpecEnvironment, ValidatedCompressionBackend, ValidatedRateBackend,
 };
+#[cfg(feature = "tuner")]
+pub(crate) use self::document::TuneInvalidReason;
 pub use self::document::{
     AiqiDiscountedControllerSpec, AssetBinding, AssetId, BuiltinEnvironmentSpec,
     CompiledPlannerController, CompiledPlannerRunSpec, CompiledSpecDocument, ControllerSpec,

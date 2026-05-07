@@ -175,18 +175,20 @@ pub(super) fn evaluate_candidate(
     evaluator_threads: usize,
     runtime_profile: &ResolvedEvaluatorRuntimeProfile,
     deterministic_table: Option<&VerifiedDeterministicEvaluatorTable>,
-) -> Result<CandidateEvalResult, String> {
+) -> Result<CandidateEvalResult, CandidateEvalFailure> {
     if let Some(table) = deterministic_table {
         let _ = evaluator_threads;
         let _ = runtime_profile;
-        return table.evaluate(
-            candidate,
-            dataset,
-            model_bytes,
-            min_throughput_bytes_per_second,
-            max_memory_bytes,
-            effective_eval_time_limit_seconds,
-        );
+        return table
+            .evaluate(
+                candidate,
+                dataset,
+                model_bytes,
+                min_throughput_bytes_per_second,
+                max_memory_bytes,
+                effective_eval_time_limit_seconds,
+            )
+            .map_err(|diagnostic| CandidateEvalFailure::FatalEvaluatorFailure { diagnostic });
     }
     #[cfg(not(unix))]
     {
@@ -199,9 +201,10 @@ pub(super) fn evaluate_candidate(
         let _ = evaluator_threads;
         let _ = runtime_profile;
         let _ = deterministic_table;
-        return Err(
-            "tuner requires a Unix target for process-isolated candidate evaluation".to_string(),
-        );
+        return Err(CandidateEvalFailure::FatalEvaluatorFailure {
+            diagnostic: "tuner requires a Unix target for process-isolated candidate evaluation"
+                .to_string(),
+        });
     }
 
     #[cfg(unix)]
@@ -230,7 +233,8 @@ fn evaluate_candidate_unix_isolated(
     effective_eval_time_limit_seconds: f64,
     evaluator_threads: usize,
     runtime_profile: &ResolvedEvaluatorRuntimeProfile,
-) -> Result<CandidateEvalResult, String> {
+) -> Result<CandidateEvalResult, CandidateEvalFailure> {
+    let fatal = |diagnostic: String| CandidateEvalFailure::FatalEvaluatorFailure { diagnostic };
     let worker_rss_mode = runtime_profile.memory_accounting_kind.worker_rss_mode();
     if effective_eval_time_limit_seconds <= 0.0 {
         let peak_memory_bytes = match runtime_profile.memory_accounting_kind {
@@ -247,9 +251,14 @@ fn evaluate_candidate_unix_isolated(
             effective_eval_time_limit_seconds,
         ));
     }
-    let temp_paths = EvaluatorWorkerTempPaths::new(dataset.resolved_path.as_str())?;
+    let temp_paths =
+        EvaluatorWorkerTempPaths::new(dataset.resolved_path.as_str()).map_err(fatal)?;
     let candidate_json = crate::spec::compression_backend_to_json_value(candidate.canonical_spec())
-        .map_err(|err| format!("failed to serialize candidate for evaluator worker: {err}"))?;
+        .map_err(|err| {
+            fatal(format!(
+                "failed to serialize candidate for evaluator worker: {err}"
+            ))
+        })?;
     let request = serde_json::json!({
         "candidate": candidate_json,
         "candidate_base_dir": ".",
@@ -264,13 +273,13 @@ fn evaluate_candidate_unix_isolated(
     fs::write(
         &temp_paths.request_path,
         serde_json::to_vec(&request)
-            .map_err(|err| format!("failed to encode evaluator worker request: {err}"))?,
+            .map_err(|err| fatal(format!("failed to encode evaluator worker request: {err}")))?,
     )
     .map_err(|err| {
-        format!(
+        fatal(format!(
             "failed to write evaluator worker request '{}': {err}",
             temp_paths.request_path.display()
-        )
+        ))
     })?;
 
     #[cfg(target_os = "linux")]
@@ -278,17 +287,21 @@ fn evaluate_candidate_unix_isolated(
         .resolved_evaluator_cgroup_parent
         .as_deref()
         .map(|parent| EvaluatorWorkerCgroup::create(parent, dataset.resolved_path.as_str()))
-        .transpose()?;
+        .transpose()
+        .map_err(fatal)?;
     #[cfg(not(target_os = "linux"))]
     let evaluation_cgroup: Option<EvaluatorWorkerCgroup> = {
         let _ = runtime_profile;
         None
     };
 
-    let mut command = evaluator_worker_command(runtime_profile.worker_executable.as_deref())?;
+    let mut command =
+        evaluator_worker_command(runtime_profile.worker_executable.as_deref()).map_err(fatal)?;
     #[cfg(target_os = "linux")]
     if let Some(cgroup) = evaluation_cgroup.as_ref() {
-        cgroup.configure_worker_command(&mut command)?;
+        cgroup
+            .configure_worker_command(&mut command)
+            .map_err(fatal)?;
     }
     command
         .env(
@@ -304,13 +317,13 @@ fn evaluate_candidate_unix_isolated(
         .stderr(std::process::Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|err| format!("failed to spawn evaluator worker process: {err}"))?;
+        .map_err(|err| fatal(format!("failed to spawn evaluator worker process: {err}")))?;
     let started = Instant::now();
     let timeout = Duration::from_secs_f64(effective_eval_time_limit_seconds);
     loop {
         if let Some(status) = child
             .try_wait()
-            .map_err(|err| format!("failed while waiting for evaluator worker: {err}"))?
+            .map_err(|err| fatal(format!("failed while waiting for evaluator worker: {err}")))?
         {
             if !status.success() {
                 let stderr = child
@@ -319,7 +332,9 @@ fn evaluate_candidate_unix_isolated(
                     .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_string())
                     .filter(|text| !text.is_empty())
                     .unwrap_or_else(|| status.to_string());
-                return Err(format!("evaluator worker exited unsuccessfully: {stderr}"));
+                return Err(CandidateEvalFailure::FatalEvaluatorFailure {
+                    diagnostic: format!("evaluator worker exited unsuccessfully: {stderr}"),
+                });
             }
             break;
         }
@@ -337,7 +352,7 @@ fn evaluate_candidate_unix_isolated(
             let _ = child.wait();
             return Ok(timeout_eval_result(
                 effective_eval_time_limit_seconds,
-                peak_before_kill?,
+                peak_before_kill.map_err(fatal)?,
                 effective_eval_time_limit_seconds,
             ));
         }
@@ -345,16 +360,21 @@ fn evaluate_candidate_unix_isolated(
     }
 
     let payload_bytes = fs::read(&temp_paths.response_path).map_err(|err| {
-        format!(
+        fatal(format!(
             "failed to read evaluator worker response '{}': {err}",
             temp_paths.response_path.display()
-        )
+        ))
     })?;
     if payload_bytes.is_empty() {
-        return Err("candidate evaluation worker returned no payload".to_string());
+        return Err(CandidateEvalFailure::FatalEvaluatorFailure {
+            diagnostic: "candidate evaluation worker returned no payload".to_string(),
+        });
     }
-    let payload: Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|err| format!("invalid evaluator payload from child process: {err}"))?;
+    let payload: Value = serde_json::from_slice(&payload_bytes).map_err(|err| {
+        fatal(format!(
+            "invalid evaluator payload from child process: {err}"
+        ))
+    })?;
     let mut result = parse_candidate_eval_payload(&payload)?;
     apply_authoritative_worker_peak_memory(
         &mut result,
@@ -363,53 +383,67 @@ fn evaluate_candidate_unix_isolated(
         max_memory_bytes,
         runtime_profile.memory_accounting_kind,
         evaluation_cgroup.as_ref(),
-    )?;
+    )
+    .map_err(fatal)?;
     Ok(result)
 }
 
 #[cfg(unix)]
-fn parse_candidate_eval_payload(payload: &Value) -> Result<CandidateEvalResult, String> {
+fn parse_candidate_eval_payload(
+    payload: &Value,
+) -> Result<CandidateEvalResult, CandidateEvalFailure> {
+    let fatal = |diagnostic: String| CandidateEvalFailure::FatalEvaluatorFailure { diagnostic };
     let object = payload
         .as_object()
-        .ok_or_else(|| "invalid evaluator payload shape".to_string())?;
+        .ok_or_else(|| fatal("invalid evaluator payload shape".to_string()))?;
     let ok = object
         .get("ok")
         .and_then(Value::as_bool)
-        .ok_or_else(|| "evaluator payload missing boolean 'ok' field".to_string())?;
+        .ok_or_else(|| fatal("evaluator payload missing boolean 'ok' field".to_string()))?;
     if !ok {
-        let err = object
+        let diagnostic = object
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("candidate evaluator failed without error message");
-        return Err(err.to_string());
+            .unwrap_or("candidate evaluator failed without error message")
+            .to_string();
+        return Err(CandidateEvalFailure::FatalEvaluatorFailure { diagnostic });
     }
     let status = match object
         .get("status")
         .and_then(Value::as_str)
-        .ok_or_else(|| "evaluator payload missing status".to_string())?
+        .ok_or_else(|| fatal("evaluator payload missing status".to_string()))?
     {
         "success" => CandidateEvalStatus::Success,
         "timeout" => CandidateEvalStatus::Timeout,
         "invalid" => CandidateEvalStatus::Invalid,
         "error" => CandidateEvalStatus::Error,
-        other => return Err(format!("unknown evaluator status '{other}'")),
+        other => {
+            return Err(CandidateEvalFailure::FatalEvaluatorFailure {
+                diagnostic: format!("unknown evaluator status '{other}'"),
+            });
+        }
     };
     let compressed_bytes = object
         .get("compressed_bytes")
         .and_then(Value::as_u64)
-        .ok_or_else(|| "evaluator payload missing compressed_bytes".to_string())?;
+        .ok_or_else(|| fatal("evaluator payload missing compressed_bytes".to_string()))?;
     let compressed_bytes = usize::try_from(compressed_bytes)
-        .map_err(|_| "evaluator payload compressed_bytes does not fit usize".to_string())?;
+        .map_err(|_| fatal("evaluator payload compressed_bytes does not fit usize".to_string()))?;
     let elapsed_seconds = object
         .get("elapsed_seconds")
         .and_then(Value::as_f64)
-        .ok_or_else(|| "evaluator payload missing elapsed_seconds".to_string())?;
+        .ok_or_else(|| fatal("evaluator payload missing elapsed_seconds".to_string()))?;
     let effective_eval_time_limit_seconds = object
         .get("effective_eval_time_limit_seconds")
         .and_then(Value::as_f64)
-        .ok_or_else(|| "evaluator payload missing effective_eval_time_limit_seconds".to_string())?;
+        .ok_or_else(|| {
+            fatal("evaluator payload missing effective_eval_time_limit_seconds".to_string())
+        })?;
     if !effective_eval_time_limit_seconds.is_finite() || effective_eval_time_limit_seconds < 0.0 {
-        return Err("evaluator payload has invalid effective_eval_time_limit_seconds".to_string());
+        return Err(CandidateEvalFailure::FatalEvaluatorFailure {
+            diagnostic: "evaluator payload has invalid effective_eval_time_limit_seconds"
+                .to_string(),
+        });
     }
     let throughput_bytes_per_second = object
         .get("throughput_bytes_per_second")
@@ -420,11 +454,13 @@ fn parse_candidate_eval_payload(payload: &Value) -> Result<CandidateEvalResult, 
                 v.as_f64()
             }
         })
-        .ok_or_else(|| "evaluator payload missing throughput_bytes_per_second".to_string())?;
+        .ok_or_else(|| {
+            fatal("evaluator payload missing throughput_bytes_per_second".to_string())
+        })?;
     let peak_memory_bytes = object
         .get("peak_memory_bytes")
         .and_then(Value::as_u64)
-        .ok_or_else(|| "evaluator payload missing peak_memory_bytes".to_string())?;
+        .ok_or_else(|| fatal("evaluator payload missing peak_memory_bytes".to_string()))?;
     let target_loss_bits = object
         .get("target_loss_bits")
         .and_then(|v| {
@@ -434,7 +470,7 @@ fn parse_candidate_eval_payload(payload: &Value) -> Result<CandidateEvalResult, 
                 v.as_f64()
             }
         })
-        .ok_or_else(|| "evaluator payload missing target_loss_bits".to_string())?;
+        .ok_or_else(|| fatal("evaluator payload missing target_loss_bits".to_string()))?;
     let objective_bits = object
         .get("objective_bits")
         .and_then(|v| {
@@ -444,11 +480,11 @@ fn parse_candidate_eval_payload(payload: &Value) -> Result<CandidateEvalResult, 
                 v.as_f64()
             }
         })
-        .ok_or_else(|| "evaluator payload missing objective_bits".to_string())?;
+        .ok_or_else(|| fatal("evaluator payload missing objective_bits".to_string()))?;
     let deployable = object
         .get("deployable")
         .and_then(Value::as_bool)
-        .ok_or_else(|| "evaluator payload missing deployable".to_string())?;
+        .ok_or_else(|| fatal("evaluator payload missing deployable".to_string()))?;
     Ok(CandidateEvalResult {
         status,
         compressed_bytes,
@@ -544,7 +580,7 @@ fn run_tuner_eval_worker_request(payload: &Value) -> Result<CandidateEvalResult,
         .num_threads(evaluator_threads)
         .build_global()
         .map_err(|err| format!("failed to initialize evaluator worker thread pool: {err}"))?;
-    evaluate_candidate_unbounded(
+    match evaluate_candidate_unbounded(
         &candidate,
         &dataset,
         model_bytes,
@@ -552,7 +588,15 @@ fn run_tuner_eval_worker_request(payload: &Value) -> Result<CandidateEvalResult,
         max_memory_bytes,
         effective_eval_time_limit_seconds,
         rss_mode,
-    )
+    ) {
+        Ok(result) => Ok(result),
+        Err(WorkerInnerEvalFailure::CandidateLocal { .. }) => Ok(error_eval_result(
+            0.0,
+            peak_memory_bytes(rss_mode),
+            effective_eval_time_limit_seconds,
+        )),
+        Err(WorkerInnerEvalFailure::Fatal { diagnostic }) => Err(diagnostic),
+    }
 }
 
 fn candidate_eval_result_payload(value: &CandidateEvalResult) -> Value {
@@ -1108,6 +1152,26 @@ fn apply_authoritative_worker_peak_memory_inner(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkerInnerEvalFailure {
+    CandidateLocal { diagnostic: String },
+    Fatal { diagnostic: String },
+}
+
+impl WorkerInnerEvalFailure {
+    fn candidate_local(diagnostic: impl Into<String>) -> Self {
+        Self::CandidateLocal {
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    fn fatal(diagnostic: impl Into<String>) -> Self {
+        Self::Fatal {
+            diagnostic: diagnostic.into(),
+        }
+    }
+}
+
 fn evaluate_candidate_unbounded(
     candidate: &crate::spec::CompiledCompressionBackend,
     dataset: &LoadedDataset,
@@ -1116,23 +1180,31 @@ fn evaluate_candidate_unbounded(
     max_memory_bytes: u64,
     effective_eval_time_limit_seconds: f64,
     rss_mode: PeakMemoryMode,
-) -> Result<CandidateEvalResult, String> {
+) -> Result<CandidateEvalResult, WorkerInnerEvalFailure> {
     let before_peak = peak_memory_bytes(rss_mode);
     let start = Instant::now();
     let deadline = start + Duration::from_secs_f64(effective_eval_time_limit_seconds);
     let (compressed_bytes, target_loss_bits) = match dataset.kind {
         DatasetKind::PassiveBytes => {
-            let mut runtime = crate::runtime::build_compression_runtime(candidate)
-                .map_err(|err| format!("failed to build candidate runtime: {err}"))?;
-            let compressed_bytes_u64 = runtime
-                .compress_size(&dataset.raw_bytes)
-                .map_err(|err| format!("candidate evaluation failed: {err}"))?;
-            let compressed_bytes = usize::try_from(compressed_bytes_u64)
-                .map_err(|_| "compressed size does not fit usize on this platform".to_string())?;
+            let mut runtime =
+                crate::runtime::build_compression_runtime(candidate).map_err(|err| {
+                    WorkerInnerEvalFailure::candidate_local(format!(
+                        "failed to build candidate runtime: {err}"
+                    ))
+                })?;
+            let compressed_bytes_u64 =
+                runtime.compress_size(&dataset.raw_bytes).map_err(|err| {
+                    WorkerInnerEvalFailure::candidate_local(format!(
+                        "candidate evaluation failed: {err}"
+                    ))
+                })?;
+            let compressed_bytes = usize::try_from(compressed_bytes_u64).map_err(|_| {
+                WorkerInnerEvalFailure::fatal("compressed size does not fit usize on this platform")
+            })?;
             (compressed_bytes, (compressed_bytes as f64) * 8.0)
         }
         DatasetKind::InteractiveTrace | DatasetKind::CausalPrefixDataset => {
-            evaluate_candidate_causal_loss(candidate, dataset, deadline)?
+            evaluate_candidate_causal_loss_typed(candidate, dataset, deadline)?
         }
     };
     let elapsed_seconds = start.elapsed().as_secs_f64();
@@ -1208,18 +1280,39 @@ pub(super) fn error_eval_result(
     }
 }
 
+#[cfg(test)]
 pub(super) fn evaluate_candidate_causal_loss(
     candidate: &crate::spec::CompiledCompressionBackend,
     dataset: &LoadedDataset,
     deadline: Instant,
 ) -> Result<(usize, f64), String> {
+    evaluate_candidate_causal_loss_typed(candidate, dataset, deadline).map_err(
+        |error| match error {
+            WorkerInnerEvalFailure::CandidateLocal { diagnostic }
+            | WorkerInnerEvalFailure::Fatal { diagnostic } => diagnostic,
+        },
+    )
+}
+
+fn evaluate_candidate_causal_loss_typed(
+    candidate: &crate::spec::CompiledCompressionBackend,
+    dataset: &LoadedDataset,
+    deadline: Instant,
+) -> Result<(usize, f64), WorkerInnerEvalFailure> {
     if let crate::spec::core::CompressionBackendPlan::Rate { rate_backend, .. } = candidate.plan() {
         let causal_profile = dataset.causal_profile.as_ref().ok_or_else(|| {
-            "causal dataset evaluation requires a typed causal profile".to_string()
+            WorkerInnerEvalFailure::fatal(
+                "causal dataset evaluation requires a typed causal profile",
+            )
         })?;
-        let compiled_rate =
-            crate::spec::core::compiled_rate_backend_from_plan(rate_backend.clone())
-                .map_err(|err| format!("failed to compile causal evaluator rate backend: {err}"))?;
+        let compiled_rate = crate::spec::core::compiled_rate_backend_from_plan(
+            rate_backend.clone(),
+        )
+        .map_err(|err| {
+            WorkerInnerEvalFailure::candidate_local(format!(
+                "failed to compile causal evaluator rate backend: {err}"
+            ))
+        })?;
         let mut prefix_parts = Vec::<Vec<u8>>::new();
         let mut target_loss_bits = 0.0f64;
         for event in &dataset.events {
@@ -1252,7 +1345,9 @@ pub(super) fn evaluate_candidate_causal_loss(
                     weight,
                 } => {
                     let support = causal_profile.domains.get(domain).ok_or_else(|| {
-                        format!("target event references undeclared domain '{domain}'")
+                        WorkerInnerEvalFailure::fatal(format!(
+                            "target event references undeclared domain '{domain}'"
+                        ))
                     })?;
                     let descriptor = causal_event_descriptor_bytes("target", channel, Some(domain));
                     let refs = prefix_parts
@@ -1279,10 +1374,9 @@ pub(super) fn evaluate_candidate_causal_loss(
         let compressed_bytes = (target_loss_bits / 8.0).ceil().max(0.0) as usize;
         Ok((compressed_bytes, target_loss_bits))
     } else {
-        Err(
-            "causal dataset evaluation requires a rate backend with conditional target-loss semantics"
-                .to_string(),
-        )
+        Err(WorkerInnerEvalFailure::candidate_local(
+            "causal dataset evaluation requires a rate backend with conditional target-loss semantics",
+        ))
     }
 }
 
@@ -1292,30 +1386,33 @@ fn causal_target_loss_bits(
     target: &[u8],
     support: &CausalTargetDomain,
     compiled_rate: &crate::spec::CompiledRateBackend,
-) -> Result<f64, String> {
+) -> Result<f64, WorkerInnerEvalFailure> {
     let mut descriptor_conditioned = Vec::<&[u8]>::with_capacity(prefix_parts.len() + 1);
     descriptor_conditioned.extend_from_slice(prefix_parts);
     descriptor_conditioned.push(descriptor);
     match support {
         CausalTargetDomain::ByteAlphabet => {
             if target.len() != 1 {
-                return Err(
-                    "byte_alphabet target payloads must be exactly one byte after lowering"
-                        .to_string(),
-                );
+                return Err(WorkerInnerEvalFailure::fatal(
+                    "byte_alphabet target payloads must be exactly one byte after lowering",
+                ));
             }
             crate::runtime::try_cross_entropy_conditional_chain_backend(
                 &descriptor_conditioned,
                 target,
                 compiled_rate,
             )
-            .map_err(|err| format!("causal byte-domain target evaluation failed: {err}"))
+            .map_err(|err| {
+                WorkerInnerEvalFailure::candidate_local(format!(
+                    "causal byte-domain target evaluation failed: {err}"
+                ))
+            })
         }
         CausalTargetDomain::EnumeratedPayloads { payloads } => {
             if !payloads.iter().any(|payload| payload == target) {
-                return Err(
-                    "target payload is outside enumerated target-domain support".to_string()
-                );
+                return Err(WorkerInnerEvalFailure::fatal(
+                    "target payload is outside enumerated target-domain support",
+                ));
             }
             let mut target_loss = None::<f64>;
             let mut log2_terms = Vec::<f64>::with_capacity(payloads.len());
@@ -1326,7 +1423,9 @@ fn causal_target_loss_bits(
                     compiled_rate,
                 )
                 .map_err(|err| {
-                    format!("causal enumerated-domain target evaluation failed: {err}")
+                    WorkerInnerEvalFailure::candidate_local(format!(
+                        "causal enumerated-domain target evaluation failed: {err}"
+                    ))
                 })?;
                 if payload == target {
                     target_loss = Some(loss);
@@ -1335,7 +1434,9 @@ fn causal_target_loss_bits(
             }
             let log2_z = log2_sum_exp(&log2_terms);
             let loss = target_loss.ok_or_else(|| {
-                "target payload is outside enumerated target-domain support".to_string()
+                WorkerInnerEvalFailure::fatal(
+                    "target payload is outside enumerated target-domain support",
+                )
             })?;
             Ok(loss + log2_z)
         }
@@ -1396,6 +1497,38 @@ pub(super) fn cache_key_for_candidate(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::api::{CompressionBackend, RateBackend, ZpaqMethodSpec};
+    use crate::coders::CoderType;
+    use crate::compression::FramingMode;
+    use crate::spec::SpecEnvironment;
+
+    fn compile_candidate(candidate: CompressionBackend) -> crate::spec::CompiledCompressionBackend {
+        candidate
+            .compile_in(&SpecEnvironment::new("."))
+            .expect("compile test candidate")
+    }
+
+    fn causal_dataset_without_profile() -> LoadedDataset {
+        LoadedDataset {
+            kind: DatasetKind::CausalPrefixDataset,
+            objective_target: ObjectiveTarget::InteractiveCausalAc,
+            lowering_version: "causal-prefix-events-v1",
+            codec_hash: "test-codec".to_string(),
+            event_grammar_hash: "test-grammar".to_string(),
+            target_domain_support_hash: "test-domain".to_string(),
+            causal_header_profile_hash: "test-causal-header".to_string(),
+            target_size_function: "causal-target-bits",
+            canonical_content_hash: "test-dataset".to_string(),
+            lowered_skeleton_hash: "test-skeleton".to_string(),
+            resolved_path: ".".to_string(),
+            source_size_bytes: 0,
+            raw_bytes: Vec::new(),
+            events: Vec::new(),
+            causal_profile: None,
+            dataset_units: 1.0,
+            target_events: 0,
+        }
+    }
 
     #[test]
     fn parse_worker_payload_accepts_null_serialized_infinities() {
@@ -1436,5 +1569,145 @@ mod tests {
         assert_eq!(result.status, CandidateEvalStatus::Timeout);
         assert!(result.target_loss_bits.is_infinite());
         assert!(result.objective_bits.is_infinite());
+    }
+
+    #[test]
+    fn parse_worker_payload_ok_false_is_fatal_evaluator_failure() {
+        let payload = serde_json::json!({
+            "ok": false,
+            "error": "worker dataset load failed",
+        });
+
+        let err = parse_candidate_eval_payload(&payload).expect_err("ok:false must be fatal");
+
+        match err {
+            CandidateEvalFailure::FatalEvaluatorFailure { diagnostic } => {
+                assert_eq!(diagnostic, "worker dataset load failed");
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_candidate_unbounded_dataset_invariant_error_is_fatal() {
+        let candidate = compile_candidate(CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 2 },
+            coder: CoderType::AC,
+            framing: FramingMode::Framed,
+        });
+        let dataset = causal_dataset_without_profile();
+
+        let err = evaluate_candidate_unbounded(
+            &candidate,
+            &dataset,
+            0,
+            0.0,
+            u64::MAX,
+            1.0,
+            PeakMemoryMode::ProcessRssPeak,
+        )
+        .expect_err("missing causal profile must be fatal");
+
+        match err {
+            WorkerInnerEvalFailure::Fatal { diagnostic } => {
+                assert!(diagnostic.contains("typed causal profile"), "{diagnostic}");
+            }
+            WorkerInnerEvalFailure::CandidateLocal { diagnostic } => {
+                panic!("expected fatal invariant error, got candidate-local: {diagnostic}");
+            }
+        }
+    }
+
+    #[test]
+    fn causal_profile_invariant_error_is_fatal() {
+        let candidate = compile_candidate(CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 2 },
+            coder: CoderType::AC,
+            framing: FramingMode::Framed,
+        });
+        let dataset = causal_dataset_without_profile();
+        let deadline = Instant::now() + Duration::from_millis(100);
+
+        let err = evaluate_candidate_causal_loss_typed(&candidate, &dataset, deadline)
+            .expect_err("causal profile invariant failure must be fatal");
+
+        match err {
+            WorkerInnerEvalFailure::Fatal { diagnostic } => {
+                assert!(diagnostic.contains("typed causal profile"), "{diagnostic}");
+            }
+            WorkerInnerEvalFailure::CandidateLocal { diagnostic } => {
+                panic!("expected fatal invariant error, got candidate-local: {diagnostic}");
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_backend_rejection_is_recoverable_status_error() {
+        let candidate = compile_candidate(CompressionBackend::Zpaq {
+            method: ZpaqMethodSpec::literal("3"),
+        });
+        let dataset = causal_dataset_without_profile();
+
+        let err = evaluate_candidate_unbounded(
+            &candidate,
+            &dataset,
+            0,
+            0.0,
+            u64::MAX,
+            1.0,
+            PeakMemoryMode::ProcessRssPeak,
+        )
+        .expect_err("candidate/dataset mismatch must be candidate-local");
+
+        match err {
+            WorkerInnerEvalFailure::CandidateLocal { diagnostic } => {
+                assert!(
+                    diagnostic
+                        .contains("requires a rate backend with conditional target-loss semantics"),
+                    "{diagnostic}"
+                );
+            }
+            WorkerInnerEvalFailure::Fatal { diagnostic } => {
+                panic!("expected candidate-local rejection, got fatal: {diagnostic}");
+            }
+        }
+    }
+
+    #[test]
+    fn worker_inner_fatal_error_emits_ok_false_or_fatal_response() {
+        let candidate = compile_candidate(CompressionBackend::Rate {
+            rate_backend: RateBackend::Ctw { depth: 2 },
+            coder: CoderType::AC,
+            framing: FramingMode::Framed,
+        });
+        let candidate_json =
+            crate::spec::compression_backend_to_json_value(candidate.canonical_spec())
+                .expect("serialize candidate");
+        let request = serde_json::json!({
+            "candidate": candidate_json,
+            "candidate_base_dir": ".",
+            "dataset_path": "/path/that/does/not/exist.bin",
+            "model_bytes": 1,
+            "min_throughput_bytes_per_second": 1.0,
+            "max_memory_bytes": 1024,
+            "effective_eval_time_limit_seconds": 1.0,
+            "rss_mode": "process_rss_peak",
+            "evaluator_threads": 1
+        });
+        let payload = match run_tuner_eval_worker_request(&request) {
+            Ok(result) => candidate_eval_result_payload(&result),
+            Err(err) => serde_json::json!({
+                "ok": false,
+                "error": err,
+            }),
+        };
+
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(
+            payload
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.contains("failed to read")),
+            "expected read failure diagnostic in fatal worker response: {payload}"
+        );
     }
 }

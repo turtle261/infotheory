@@ -9,8 +9,8 @@ use super::{
 #[cfg(feature = "tuner")]
 use super::{
     AiqiDiscountedTuneControllerSpec, AnnealedHillClimbingTuneControllerSpec,
-    McAixiFacCtwTuneControllerSpec, TuneBoundsSpec, TuneControllerSpec, TuneParameterRangeSpec,
-    TunePlannerInterfaceSpec, TuneSpec, WarmStartExactJhTuneControllerSpec,
+    McAixiFacCtwTuneControllerSpec, TuneBoundsSpec, TuneControllerSpec, TuneInvalidReason,
+    TuneParameterRangeSpec, TunePlannerInterfaceSpec, TuneSpec, WarmStartExactJhTuneControllerSpec,
     compression_backend_to_json_value,
 };
 use crate::aixi::common::{ActionAlphabet, MctsStrategy};
@@ -144,6 +144,13 @@ fn parse_tune_spec_json_value(value: &serde_json::Value, base_dir: &Path) -> Spe
 
 #[cfg(feature = "tuner")]
 fn reject_tune_candidate_local_external_refs(value: &serde_json::Value) -> SpecResult<()> {
+    fn external_asset_forbidden_error(detail: String) -> SpecError {
+        SpecError::new(format!(
+            "{}: {detail}",
+            TuneInvalidReason::CandidateExternalAssetForbidden.as_str()
+        ))
+    }
+
     fn visit(value: &serde_json::Value, path: &str) -> SpecResult<()> {
         match value {
             serde_json::Value::Object(object) => {
@@ -157,7 +164,7 @@ fn reject_tune_candidate_local_external_refs(value: &serde_json::Value) -> SpecR
                         key.as_str(),
                         "spec_path" | "base_path" | "model_path" | "path" | "load_from"
                     ) {
-                        return Err(SpecError::new(format!(
+                        return Err(external_asset_forbidden_error(format!(
                             "tune baseline_candidate contains candidate-local external asset field '{next}'"
                         )));
                     }
@@ -172,7 +179,7 @@ fn reject_tune_candidate_local_external_refs(value: &serde_json::Value) -> SpecR
             serde_json::Value::String(raw) => {
                 let trimmed = raw.trim_start();
                 if trimmed.starts_with("file:") || trimmed.contains("://") {
-                    return Err(SpecError::new(format!(
+                    return Err(external_asset_forbidden_error(format!(
                         "tune baseline_candidate contains candidate-local external asset reference at '{path}'"
                     )));
                 }
@@ -186,7 +193,7 @@ fn reject_tune_candidate_local_external_refs(value: &serde_json::Value) -> SpecR
                                 .any(|part| part.trim_start().starts_with("load_from="))
                         })
                 }) {
-                    return Err(SpecError::new(format!(
+                    return Err(external_asset_forbidden_error(format!(
                         "tune baseline_candidate contains candidate-local policy load_from at '{path}'"
                     )));
                 }

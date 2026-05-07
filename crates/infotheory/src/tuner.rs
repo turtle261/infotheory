@@ -18,7 +18,7 @@ use crate::spec::{
     AiqiDiscountedControllerSpec, AssetRef, BuiltinEnvironmentSpec, CanonicalJson,
     CompiledPlannerRunSpec, ControllerSpec, EnvironmentSpec, McAixiControllerSpec,
     PlannerInterfaceSpec, PlannerRunSpec, PlannerRuntimeSpec, SpecDocument, SpecEnvironment,
-    WarmStartExactJhControllerSpec, load_spec_document,
+    TuneInvalidReason, WarmStartExactJhControllerSpec, load_spec_document,
 };
 use crc32fast::Hasher;
 use serde_json::Value;
@@ -58,8 +58,8 @@ use config::{
 use eval::evaluate_candidate_causal_loss;
 pub use eval::run_tuner_eval_worker_from_env;
 use eval::{
-    ResolvedEvaluatorRuntimeProfile, cache_key_for_candidate, error_eval_result,
-    evaluate_candidate, resolve_evaluator_runtime_profile, timeout_eval_result,
+    ResolvedEvaluatorRuntimeProfile, cache_key_for_candidate, evaluate_candidate,
+    resolve_evaluator_runtime_profile, timeout_eval_result,
 };
 #[cfg(test)]
 use planner_bridge::{
@@ -214,7 +214,8 @@ fn prepare_tune_context(request: &TuneCommandRequest) -> Result<PreparedTuneCont
         compiled.baseline_candidate().canonical_spec(),
         &compiled.canonical_spec().bounds,
     )?;
-    reject_candidate_local_external_artifacts(compiled.baseline_candidate().canonical_spec())?;
+    reject_candidate_local_external_artifacts(compiled.baseline_candidate().canonical_spec())
+        .map_err(|err| err.diagnostic)?;
 
     let dataset = load_dataset(resolve_input_asset_path(
         &compiled,
@@ -475,6 +476,80 @@ impl CandidateEvalStatus {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CandidateEvalFailure {
+    FatalEvaluatorFailure { diagnostic: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidateInvalidDiagnostic {
+    reason: TuneInvalidReason,
+    diagnostic: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CandidateResultCounts {
+    success_deployable: usize,
+    success_non_deployable: usize,
+    timeout: usize,
+    invalid: usize,
+    error_recoverable: usize,
+}
+
+impl CandidateResultCounts {
+    fn record_admitted_result(&mut self, value: &CandidateEvalResult) {
+        match value.status {
+            CandidateEvalStatus::Success if value.deployable => {
+                self.success_deployable = self.success_deployable.saturating_add(1);
+            }
+            CandidateEvalStatus::Success => {
+                self.success_non_deployable = self.success_non_deployable.saturating_add(1);
+            }
+            CandidateEvalStatus::Timeout => {
+                self.timeout = self.timeout.saturating_add(1);
+            }
+            CandidateEvalStatus::Invalid => {
+                self.invalid = self.invalid.saturating_add(1);
+            }
+            CandidateEvalStatus::Error => {
+                self.error_recoverable = self.error_recoverable.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct InvalidReasonCounts {
+    candidate_external_asset_forbidden: usize,
+    candidate_out_of_bounds: usize,
+    candidate_compile_error: usize,
+    invalid_action_index: usize,
+    inapplicable_action: usize,
+}
+
+impl InvalidReasonCounts {
+    fn record(&mut self, reason: TuneInvalidReason) {
+        match reason {
+            TuneInvalidReason::CandidateExternalAssetForbidden => {
+                self.candidate_external_asset_forbidden =
+                    self.candidate_external_asset_forbidden.saturating_add(1);
+            }
+            TuneInvalidReason::CandidateOutOfBounds => {
+                self.candidate_out_of_bounds = self.candidate_out_of_bounds.saturating_add(1);
+            }
+            TuneInvalidReason::CandidateCompileError => {
+                self.candidate_compile_error = self.candidate_compile_error.saturating_add(1);
+            }
+            TuneInvalidReason::InvalidActionIndex => {
+                self.invalid_action_index = self.invalid_action_index.saturating_add(1);
+            }
+            TuneInvalidReason::InapplicableAction => {
+                self.inapplicable_action = self.inapplicable_action.saturating_add(1);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CandidateTopologyStats {
     backend_families: BTreeSet<String>,
@@ -486,6 +561,8 @@ struct CandidateTopologyStats {
 struct SearchSummary {
     status: &'static str,
     warning: Option<String>,
+    fatal_evaluator_failure: Option<String>,
+    fatal_evaluator_failures: usize,
     best_candidate: crate::api::CompressionBackend,
     best_candidate_crc32: String,
     best_eval: CandidateEvalResult,
@@ -498,8 +575,12 @@ struct SearchSummary {
     proposals_attempted: usize,
     proposals_invalid: usize,
     self_loop_proposals: usize,
+    invalid_reason_counts: InvalidReasonCounts,
     successful_non_deployable: usize,
+    candidate_result_counts: CandidateResultCounts,
     final_best_move_reward: f64,
+    realized_trace_counts_by_round: Option<Vec<usize>>,
+    trace_refresh_merges_by_round: Option<Vec<usize>>,
     controller_report: Value,
 }
 
@@ -1041,7 +1122,7 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
     apply_executor_controls(&request.execution)?;
 
     for _ in 0..request.execution.warmup_baseline_runs {
-        let _ = evaluate_candidate(
+        match evaluate_candidate(
             compiled.baseline_candidate(),
             &dataset,
             compiled.baseline_candidate_model_bytes(),
@@ -1051,10 +1132,17 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
             request.execution.evaluator_threads(),
             &runtime_profile,
             verified_theorem.deterministic_table.as_ref(),
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(CandidateEvalFailure::FatalEvaluatorFailure { diagnostic }) => {
+                return Err(format!(
+                    "unrecoverable evaluator failure during baseline warmup: {diagnostic}"
+                ));
+            }
+        }
     }
 
-    let baseline_eval = evaluate_candidate(
+    let baseline_eval = match evaluate_candidate(
         compiled.baseline_candidate(),
         &dataset,
         compiled.baseline_candidate_model_bytes(),
@@ -1064,7 +1152,14 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
         request.execution.evaluator_threads(),
         &runtime_profile,
         verified_theorem.deterministic_table.as_ref(),
-    )?;
+    ) {
+        Ok(value) => value,
+        Err(CandidateEvalFailure::FatalEvaluatorFailure { diagnostic }) => {
+            return Err(format!(
+                "unrecoverable evaluator failure during baseline evaluation: {diagnostic}"
+            ));
+        }
+    };
     let baseline_key = cache_key_for_candidate(
         compiled.baseline_candidate().canonical_bytes().as_slice(),
         &evaluator_profile,
@@ -1099,6 +1194,8 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
         SearchSummary {
             status: "baseline_not_deployable",
             warning: None,
+            fatal_evaluator_failure: None,
+            fatal_evaluator_failures: 0,
             best_candidate: compiled.canonical_spec().baseline_candidate.clone(),
             best_candidate_crc32: baseline_hash.clone(),
             best_eval: baseline_eval.clone(),
@@ -1111,8 +1208,22 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
             proposals_attempted: 0,
             proposals_invalid: 0,
             self_loop_proposals: 0,
-            successful_non_deployable: if baseline_eval.deployable { 0 } else { 1 },
+            invalid_reason_counts: InvalidReasonCounts::default(),
+            successful_non_deployable: if baseline_eval.status == CandidateEvalStatus::Success
+                && !baseline_eval.deployable
+            {
+                1
+            } else {
+                0
+            },
+            candidate_result_counts: {
+                let mut counts = CandidateResultCounts::default();
+                counts.record_admitted_result(&baseline_eval);
+                counts
+            },
             final_best_move_reward: 0.0,
+            realized_trace_counts_by_round: None,
+            trace_refresh_merges_by_round: None,
             controller_report: serde_json::json!({
                 "kind": controller_kind_name(compiled.controller()),
                 "runtime_path": "baseline_precondition_failed",
@@ -1213,6 +1324,13 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
             "theorem_timing_basis": theorem_timing_basis,
             "verified_theorem_inputs": verified_theorem.to_json_value(),
             "resolved_evaluator_runtime_profile": runtime_profile.to_provenance_value(),
+            "canonical_code_certification": {
+                "basis": "structural_self_delimiting_binary_encoding_plus_tests",
+                "mechanized": false,
+                "sample_corpus_checked": true,
+                "trailing_bytes_rejected": true,
+                "top_level_length_prefix": true,
+            },
             "warmup_policy": {
                 "warmup_baseline_runs": request.execution.warmup_baseline_runs,
                 "excluded_from_cache": true,
@@ -1223,6 +1341,8 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
                 "same_task_trace_refresh_enabled": same_task_trace_refresh_enabled,
                 "online_delayed_label_update_enabled": warmstart_self_improvement_enabled && !same_task_trace_refresh_enabled,
                 "deterministic_round_deadlines_seconds": self_improvement_round_deadlines_seconds,
+                "realized_trace_counts_by_round": search_summary.realized_trace_counts_by_round.clone(),
+                "trace_refresh_merges_by_round": search_summary.trace_refresh_merges_by_round.clone(),
             },
             "stagnation_policy": {
                 "stagnation_reset_evals": request.execution.stagnation_reset_evals,
@@ -1247,10 +1367,27 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
             "cache_misses": search_summary.cache_misses,
         },
         "search": {
+            "termination_reason": search_summary.status,
+            "fatal_evaluator_failures": search_summary.fatal_evaluator_failures,
+            "fatal_evaluator_failure": search_summary.fatal_evaluator_failure.clone(),
             "proposals_attempted": search_summary.proposals_attempted,
             "proposals_invalid": search_summary.proposals_invalid,
             "self_loop_proposals": search_summary.self_loop_proposals,
+            "invalid_reason_counts": {
+                "candidate_external_asset_forbidden": search_summary.invalid_reason_counts.candidate_external_asset_forbidden,
+                "candidate_out_of_bounds": search_summary.invalid_reason_counts.candidate_out_of_bounds,
+                "candidate_compile_error": search_summary.invalid_reason_counts.candidate_compile_error,
+                "invalid_action_index": search_summary.invalid_reason_counts.invalid_action_index,
+                "inapplicable_action": search_summary.invalid_reason_counts.inapplicable_action,
+            },
             "successful_non_deployable": search_summary.successful_non_deployable,
+            "candidate_result_counts": {
+                "success_deployable": search_summary.candidate_result_counts.success_deployable,
+                "success_non_deployable": search_summary.candidate_result_counts.success_non_deployable,
+                "timeout": search_summary.candidate_result_counts.timeout,
+                "invalid": search_summary.candidate_result_counts.invalid,
+                "error_recoverable": search_summary.candidate_result_counts.error_recoverable,
+            },
             "self_improvement_rounds": effective_self_improvement_rounds,
             "max_evaluations": request.execution.max_evaluations,
             "max_evaluations_semantics": "baseline_included_warmups_excluded_cache_hits_included_for_search_steps",
@@ -1344,7 +1481,11 @@ pub fn run_tune(request: &TuneCommandRequest) -> Result<(), String> {
         }),
     )?;
 
-    if search_summary.best_eval.deployable {
+    if let Some(diagnostic) = search_summary.fatal_evaluator_failure.as_deref() {
+        Err(format!(
+            "tuning terminated due to unrecoverable evaluator failure: {diagnostic}"
+        ))
+    } else if search_summary.best_eval.deployable {
         Ok(())
     } else if search_summary.best_eval.status == CandidateEvalStatus::Timeout {
         Err(format!(
@@ -1568,19 +1709,23 @@ fn run_annealed_hill_climbing(
 
     let mut current_candidate = best_candidate.clone();
     let mut current_eval = baseline_eval;
+    let mut candidate_result_counts = CandidateResultCounts::default();
+    candidate_result_counts.record_admitted_result(&current_eval);
     let mut cache_hits: usize = 0;
     let mut cache_misses: usize = 1;
     let mut candidate_evaluations_executed: usize = 1;
     let mut proposals_attempted: usize = 0;
     let mut proposals_invalid: usize = 0;
     let mut self_loop_proposals: usize = 0;
+    let mut invalid_reason_counts = InvalidReasonCounts::default();
     let mut successful_non_deployable: usize = 0;
     let mut final_best_move_reward: f64 = 0.0;
     let mut evaluations_seen: usize = 1;
     let max_evaluations = request.execution.max_evaluations.unwrap_or(usize::MAX);
+    let mut fatal_evaluator_failure: Option<String> = None;
 
     let mut stagnation_counter: usize = 0;
-    loop {
+    'search: loop {
         if evaluations_seen >= max_evaluations {
             break;
         }
@@ -1613,14 +1758,19 @@ fn run_annealed_hill_climbing(
         };
         let proposed_candidate = proposal.candidate.clone();
 
-        if reject_candidate_local_external_artifacts(&proposed_candidate).is_err()
-            || validate_candidate_against_tune_bounds(
-                &proposed_candidate,
-                &compiled.canonical_spec().bounds,
-            )
-            .is_err()
+        if let Err(err) = reject_candidate_local_external_artifacts(&proposed_candidate) {
+            proposals_invalid = proposals_invalid.saturating_add(1);
+            invalid_reason_counts.record(err.reason);
+            continue;
+        }
+        if validate_candidate_against_tune_bounds(
+            &proposed_candidate,
+            &compiled.canonical_spec().bounds,
+        )
+        .is_err()
         {
             proposals_invalid = proposals_invalid.saturating_add(1);
+            invalid_reason_counts.record(TuneInvalidReason::CandidateOutOfBounds);
             continue;
         }
 
@@ -1628,6 +1778,7 @@ fn run_annealed_hill_climbing(
             Ok(value) => value,
             Err(_) => {
                 proposals_invalid = proposals_invalid.saturating_add(1);
+                invalid_reason_counts.record(TuneInvalidReason::CandidateCompileError);
                 continue;
             }
         };
@@ -1662,7 +1813,10 @@ fn run_annealed_hill_climbing(
                 verified_theorem.deterministic_table.as_ref(),
             ) {
                 Ok(value) => value,
-                Err(_) => error_eval_result(0.0, 0, effective_limit),
+                Err(CandidateEvalFailure::FatalEvaluatorFailure { diagnostic }) => {
+                    fatal_evaluator_failure = Some(diagnostic);
+                    break 'search;
+                }
             };
             cache.insert(cache_key.clone(), evaluated.clone());
             cache_misses = cache_misses.saturating_add(1);
@@ -1670,10 +1824,13 @@ fn run_annealed_hill_climbing(
             evaluated
         };
         evaluations_seen = evaluations_seen.saturating_add(1);
+        candidate_result_counts.record_admitted_result(&candidate_eval);
+
+        if candidate_eval.status == CandidateEvalStatus::Success && !candidate_eval.deployable {
+            successful_non_deployable = successful_non_deployable.saturating_add(1);
+        }
 
         if !candidate_eval.deployable {
-            proposals_invalid = proposals_invalid.saturating_add(1);
-            successful_non_deployable = successful_non_deployable.saturating_add(1);
             continue;
         }
 
@@ -1713,9 +1870,20 @@ fn run_annealed_hill_climbing(
         }
     }
 
+    let status = if fatal_evaluator_failure.is_some() {
+        "terminated_unrecoverable_evaluator_failure"
+    } else {
+        "completed_annealed"
+    };
+    let warning = fatal_evaluator_failure
+        .as_ref()
+        .map(|_| "terminated due to unrecoverable evaluator failure".to_string());
+
     Ok(SearchSummary {
-        status: "completed_annealed",
-        warning: None,
+        status,
+        warning,
+        fatal_evaluator_failure: fatal_evaluator_failure.clone(),
+        fatal_evaluator_failures: usize::from(fatal_evaluator_failure.is_some()),
         best_candidate,
         best_candidate_crc32: best_hash,
         best_eval,
@@ -1728,8 +1896,12 @@ fn run_annealed_hill_climbing(
         proposals_attempted,
         proposals_invalid,
         self_loop_proposals,
+        invalid_reason_counts,
         successful_non_deployable,
+        candidate_result_counts,
         final_best_move_reward,
+        realized_trace_counts_by_round: None,
+        trace_refresh_merges_by_round: None,
         controller_report: serde_json::json!({
             "kind": "annealed_hill_climbing",
             "runtime_path": annealer_runtime_path_name(request.execution.annealer_kernel_profile),
@@ -1760,9 +1932,15 @@ fn validate_candidate_against_tune_bounds(
 
 fn reject_candidate_local_external_artifacts(
     candidate: &crate::api::CompressionBackend,
-) -> Result<(), String> {
+) -> Result<(), CandidateInvalidDiagnostic> {
     if candidate_contains_external_artifact(candidate) {
-        Err("candidate-local external filesystem/model path references are not allowed in tune candidates".to_string())
+        Err(CandidateInvalidDiagnostic {
+            reason: TuneInvalidReason::CandidateExternalAssetForbidden,
+            diagnostic: format!(
+                "{}: candidate-local external filesystem/model path references are not allowed in tune candidates",
+                TuneInvalidReason::CandidateExternalAssetForbidden.as_str()
+            ),
+        })
     } else {
         Ok(())
     }
