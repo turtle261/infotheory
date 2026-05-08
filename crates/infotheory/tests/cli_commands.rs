@@ -90,6 +90,7 @@ fn cli_usage_and_unknown_primitive_paths_are_stable() {
     assert!(help_text.contains("--cpu-affinity"));
     assert!(help_text.contains("--rss-mode"));
     assert!(help_text.contains("--determinism-deadline-certificate"));
+    assert!(!help_text.contains("--rwkv-export"));
 
     let a_path = temp_path("unknown_a", "txt");
     let b_path = temp_path("unknown_b", "txt");
@@ -110,6 +111,32 @@ fn cli_usage_and_unknown_primitive_paths_are_stable() {
 
     let _ = fs::remove_file(a_path);
     let _ = fs::remove_file(b_path);
+}
+
+#[test]
+fn cli_rejects_removed_rwkv_export_flag() {
+    let input_path = temp_path("removed_rwkv_export", "txt");
+    write_temp_file(&input_path, b"abracadabra");
+    let input = input_path.to_string_lossy().to_string();
+    let out = run_cli(
+        &[
+            "h",
+            input.as_str(),
+            "--rwkv-export",
+            "/tmp/model.safetensors",
+        ],
+        None,
+    );
+    assert!(
+        !out.status.success(),
+        "removed flag should fail: stderr={}",
+        stderr_string(&out)
+    );
+    assert!(
+        stderr_string(&out).contains("--rwkv-export has been removed; use --model-export instead")
+    );
+
+    let _ = fs::remove_file(input_path);
 }
 
 #[test]

@@ -14,18 +14,18 @@ pub use self::document::{
     AiqiDiscountedControllerSpec, AssetBinding, AssetId, BuiltinEnvironmentSpec,
     CompiledPlannerController, CompiledPlannerRunSpec, CompiledSpecDocument, ControllerSpec,
     EnvironmentSpec, McAixiControllerSpec, ParsedSpecDocument, PlannerInterfaceSpec,
-    PlannerRunDocument, PlannerRunSpec, PlannerRuntimeSpec, ResolvedAssetBinding,
-    SharedMemoryPolicySpec, SpecDocument, ValidatedPlannerRunSpec, ValidatedSpecDocument,
-    VmActionFilterSpec, VmEnvironmentSpec, VmFuzzMutatorSpec, VmObservationPolicySpec,
-    VmObservationStreamModeSpec, VmPayloadEncodingSpec, VmRewardPolicySpec, VmRewardShapingSpec,
-    VmRuntimeActionSourceSpec, VmTraceSpec, WarmStartExactJhControllerSpec, load_spec_document,
+    PlannerRunSpec, PlannerRuntimeSpec, ResolvedAssetBinding, SharedMemoryPolicySpec, SpecDocument,
+    ValidatedPlannerRunSpec, ValidatedSpecDocument, VmActionFilterSpec, VmEnvironmentSpec,
+    VmFuzzMutatorSpec, VmObservationPolicySpec, VmObservationStreamModeSpec, VmPayloadEncodingSpec,
+    VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec,
+    WarmStartExactJhControllerSpec, load_spec_document,
 };
 #[cfg(feature = "tuner")]
 pub use self::document::{
     AiqiDiscountedTuneControllerSpec, AnnealedHillClimbingTuneControllerSpec,
     CompiledTuneController, CompiledTuneSpec, McAixiFacCtwTuneControllerSpec, TuneBoundsSpec,
-    TuneControllerKind, TuneControllerSpec, TuneDocument, TuneParameterRangeSpec,
-    TunePlannerInterfaceSpec, TuneSpec, ValidatedTuneSpec, WarmStartExactJhTuneControllerSpec,
+    TuneControllerKind, TuneControllerSpec, TuneParameterRangeSpec, TunePlannerInterfaceSpec,
+    TuneSpec, ValidatedTuneSpec, WarmStartExactJhTuneControllerSpec,
 };
 
 use crate::api::{
@@ -527,8 +527,10 @@ fn parse_zpaq_method_json_value(
     if value.is_null() {
         return Ok(crate::api::ZpaqMethodSpec::literal(default));
     }
-    if let Some(method) = value.as_str() {
-        return Ok(crate::api::ZpaqMethodSpec::literal(method));
+    if value.is_string() {
+        return Err(SpecError::new(
+            "zpaq method must use object form {'kind':'literal','value':'...'}",
+        ));
     }
 
     let kind = value["kind"]
@@ -2435,14 +2437,19 @@ mod tests {
 
     #[cfg(feature = "backend-zpaq")]
     #[test]
-    fn parse_zpaq_method_accepts_legacy_string_compatibility_input() {
-        let rate = parse_rate_backend_json(
+    fn parse_zpaq_method_requires_typed_object_form() {
+        let err = parse_rate_backend_json(
             &serde_json::json!({"kind": "zpaq", "method": "2"}),
             Path::new("."),
             MAX_MIXTURE_NESTING,
         )
-        .expect("legacy rate method string should parse");
-        assert!(matches!(rate, RateBackend::Zpaq { method } if method.value() == "2"));
+        .err()
+        .expect("legacy zpaq method string must be rejected");
+        assert!(
+            err.message
+                .contains("zpaq method must use object form {'kind':'literal','value':'...'}"),
+            "{err}"
+        );
 
         let compression = parse_compression_backend_json(
             &serde_json::json!({"kind": "zpaq"}),

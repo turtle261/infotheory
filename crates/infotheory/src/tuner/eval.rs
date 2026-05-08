@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ResolvedMemoryAccountingKind {
     DeterministicEvaluatorTable,
+    #[cfg(target_os = "linux")]
     StrictLinuxCgroupV2PeakMaxProcessRss,
     UnixProcessRssFallbackExplicit,
     UnixProcessRssWithBackendReportedDiagnosticOnly,
@@ -20,6 +21,7 @@ impl ResolvedMemoryAccountingKind {
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::DeterministicEvaluatorTable => "deterministic_evaluator_table_row_peak_memory",
+            #[cfg(target_os = "linux")]
             Self::StrictLinuxCgroupV2PeakMaxProcessRss => {
                 "strict_linux_max_process_rss_cgroup_v2_peak"
             }
@@ -31,15 +33,19 @@ impl ResolvedMemoryAccountingKind {
     }
 
     pub(super) fn strict_theorem_memory_certified(self) -> bool {
-        matches!(
-            self,
-            Self::DeterministicEvaluatorTable | Self::StrictLinuxCgroupV2PeakMaxProcessRss
-        )
+        match self {
+            Self::DeterministicEvaluatorTable => true,
+            #[cfg(target_os = "linux")]
+            Self::StrictLinuxCgroupV2PeakMaxProcessRss => true,
+            Self::UnixProcessRssFallbackExplicit
+            | Self::UnixProcessRssWithBackendReportedDiagnosticOnly => false,
+        }
     }
 
     fn worker_rss_mode(self) -> PeakMemoryMode {
         match self {
             Self::DeterministicEvaluatorTable => PeakMemoryMode::ProcessRssPeak,
+            #[cfg(target_os = "linux")]
             Self::StrictLinuxCgroupV2PeakMaxProcessRss => PeakMemoryMode::HybridStrictMax,
             Self::UnixProcessRssFallbackExplicit => PeakMemoryMode::ProcessRssPeak,
             Self::UnixProcessRssWithBackendReportedDiagnosticOnly => PeakMemoryMode::ProcessRssPeak,
@@ -47,12 +53,19 @@ impl ResolvedMemoryAccountingKind {
     }
 
     fn requires_per_eval_cgroup(self) -> bool {
-        matches!(self, Self::StrictLinuxCgroupV2PeakMaxProcessRss)
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::StrictLinuxCgroupV2PeakMaxProcessRss => true,
+            Self::DeterministicEvaluatorTable
+            | Self::UnixProcessRssFallbackExplicit
+            | Self::UnixProcessRssWithBackendReportedDiagnosticOnly => false,
+        }
     }
 
     pub(super) fn backend_report_component_policy(self) -> &'static str {
         match self {
             Self::DeterministicEvaluatorTable => "none_deterministic_table_row",
+            #[cfg(target_os = "linux")]
             Self::StrictLinuxCgroupV2PeakMaxProcessRss => {
                 "diagnostic_only_combined_with_os_controller_peak"
             }
@@ -238,6 +251,7 @@ fn evaluate_candidate_unix_isolated(
     let worker_rss_mode = runtime_profile.memory_accounting_kind.worker_rss_mode();
     if effective_eval_time_limit_seconds <= 0.0 {
         let peak_memory_bytes = match runtime_profile.memory_accounting_kind {
+            #[cfg(target_os = "linux")]
             ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss => 0,
             ResolvedMemoryAccountingKind::DeterministicEvaluatorTable
             | ResolvedMemoryAccountingKind::UnixProcessRssFallbackExplicit
@@ -1073,12 +1087,6 @@ fn peak_memory_bytes_for_live_worker(
         | ResolvedMemoryAccountingKind::UnixProcessRssWithBackendReportedDiagnosticOnly
         | ResolvedMemoryAccountingKind::DeterministicEvaluatorTable => {
             PeakMemoryMode::ProcessRssPeak
-        }
-        ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss => {
-            return Err(
-                "strict Linux cgroup-v2 memory accounting is unavailable on this platform"
-                    .to_string(),
-            );
         }
     };
     Ok(peak_memory_bytes_for_pid(pid, mode).unwrap_or(0))

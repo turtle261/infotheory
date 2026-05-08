@@ -171,13 +171,6 @@ impl CompiledSpecDocument {
     }
 }
 
-/// Compatibility alias for a planner-run top-level spec document.
-pub type PlannerRunDocument = PlannerRunSpec;
-
-/// Compatibility alias for a tune top-level spec document.
-#[cfg(feature = "tuner")]
-pub type TuneDocument = TuneSpec;
-
 impl PlannerRunSpec {
     /// Validate this planner-run spec and return its canonical binary encoding.
     pub fn validate_in(&self, env: &SpecEnvironment) -> SpecResult<ValidatedPlannerRunSpec> {

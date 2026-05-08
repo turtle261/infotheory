@@ -39,8 +39,6 @@ mod pdf_predictor_builders;
 mod predictor_builders;
 mod registry;
 
-#[allow(unused_imports)]
-use registry::{compression_backend_feature_error, rate_backend_feature_error};
 pub(crate) use registry::{
     describe_compression_backend_kind, describe_rate_backend_kind,
     find_backend_descriptor_in_registry,
@@ -73,18 +71,8 @@ pub enum CompressionBackendKind {
     RateRans,
 }
 
-/// Stable identity for method-backed neural families shared by VM glue.
-#[cfg(feature = "vm")]
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum MethodBackendKind {
-    Mamba,
-    Rwkv7,
-}
-
 /// Shared trace-model execution strategy used by VM glue.
 #[cfg(feature = "vm")]
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum TraceModelStrategy {
     Rosa,
@@ -907,22 +895,6 @@ pub(crate) fn adapt_rate_backend_for_bit_tokens_via_kernel(
 }
 
 #[cfg(feature = "vm")]
-#[allow(dead_code)]
-pub(crate) fn rate_backend_method(
-    backend: &CompiledRateBackend,
-    family: MethodBackendKind,
-) -> Option<&str> {
-    match (family, backend.capabilities().method_family) {
-        #[cfg(feature = "backend-rwkv")]
-        (MethodBackendKind::Rwkv7, Some(MethodBackendFamily::Rwkv7)) => backend.method_string(),
-        #[cfg(feature = "backend-mamba")]
-        (MethodBackendKind::Mamba, Some(MethodBackendFamily::Mamba)) => backend.method_string(),
-        _ => None,
-    }
-}
-
-#[cfg(feature = "vm")]
-#[allow(dead_code)]
 pub(crate) fn rate_backend_trace_model_strategy(
     backend: &CompiledRateBackend,
 ) -> TraceModelStrategy {
@@ -935,6 +907,142 @@ pub(crate) fn rate_backend_trace_model_strategy(
         PublicTraceStrategy::Mamba => TraceModelStrategy::Mamba,
         PublicTraceStrategy::Rwkv7 => TraceModelStrategy::Rwkv7,
     }
+}
+
+#[cfg(feature = "backend-rwkv")]
+/// Execute `f` with the RWKV method string + parsed spec from a compiled backend.
+fn with_rwkv_backend_plan<T>(
+    backend: &CompiledRateBackend,
+    f: impl FnOnce(&str, &crate::rwkvzip::MethodSpec) -> InfotheoryResult<T>,
+) -> InfotheoryResult<T> {
+    let crate::spec::core::RateBackendPlan::Rwkv7 {
+        method,
+        parsed_method,
+        ..
+    } = backend.plan()
+    else {
+        unreachable!("rwkv kernel used with non-rwkv plan")
+    };
+    f(method, parsed_method)
+}
+
+#[cfg(feature = "backend-mamba")]
+/// Execute `f` with the Mamba method string + parsed spec from a compiled backend.
+fn with_mamba_backend_plan<T>(
+    backend: &CompiledRateBackend,
+    f: impl FnOnce(&str, &crate::mambazip::MethodSpec) -> InfotheoryResult<T>,
+) -> InfotheoryResult<T> {
+    let crate::spec::core::RateBackendPlan::Mamba {
+        method,
+        parsed_method,
+        ..
+    } = backend.plan()
+    else {
+        unreachable!("mamba kernel used with non-mamba plan")
+    };
+    f(method, parsed_method)
+}
+
+#[cfg(feature = "backend-zpaq")]
+/// Execute `f` with the ZPAQ method string from a compiled backend.
+fn with_zpaq_backend_plan<T>(
+    backend: &CompiledRateBackend,
+    f: impl FnOnce(&str) -> InfotheoryResult<T>,
+) -> InfotheoryResult<T> {
+    let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
+        unreachable!("zpaq kernel used with non-zpaq plan")
+    };
+    f(method)
+}
+
+#[cfg(feature = "backend-particle")]
+/// Execute `f` with the particle spec from a compiled backend.
+fn with_particle_backend_plan<T>(
+    backend: &CompiledRateBackend,
+    f: impl FnOnce(&crate::api::ParticleSpec) -> InfotheoryResult<T>,
+) -> InfotheoryResult<T> {
+    let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
+        unreachable!("particle kernel used with non-particle plan")
+    };
+    f(spec)
+}
+
+#[cfg(feature = "backend-ctw")]
+/// Execute `f` with CTW depth from a compiled backend.
+fn with_ctw_backend_plan<T>(
+    backend: &CompiledRateBackend,
+    f: impl FnOnce(usize) -> InfotheoryResult<T>,
+) -> InfotheoryResult<T> {
+    let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
+        unreachable!("ctw kernel used with non-ctw plan")
+    };
+    f(*depth)
+}
+
+#[cfg(feature = "backend-ctw")]
+/// Execute `f` with FAC-CTW `(base_depth, encoding_bits)` from a compiled backend.
+fn with_fac_ctw_backend_plan<T>(
+    backend: &CompiledRateBackend,
+    f: impl FnOnce(usize, usize) -> InfotheoryResult<T>,
+) -> InfotheoryResult<T> {
+    let crate::spec::core::RateBackendPlan::FacCtw {
+        base_depth,
+        num_percept_bits: _,
+        encoding_bits,
+    } = backend.plan()
+    else {
+        unreachable!("fac-ctw kernel used with non-fac-ctw plan")
+    };
+    f(*base_depth, *encoding_bits)
+}
+
+/// Execute `f` with the ZPAQ compression method from a compiled compression backend.
+fn with_zpaq_compression_plan<T>(
+    backend: &CompiledCompressionBackend,
+    f: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let crate::spec::core::CompressionBackendPlan::Zpaq { method } = backend.plan() else {
+        unreachable!("zpaq compression kernel used with non-zpaq plan")
+    };
+    f(method)
+}
+
+/// Execute `f` with `(rate_backend, coder, framing)` from a rate-coded compression backend.
+fn with_rate_compression_plan<T>(
+    backend: &CompiledCompressionBackend,
+    f: impl FnOnce(
+        &Arc<RateBackendPlan>,
+        crate::coders::CoderType,
+        crate::compression::FramingMode,
+    ) -> Result<T, String>,
+) -> Result<T, String> {
+    let crate::spec::core::CompressionBackendPlan::Rate {
+        rate_backend,
+        coder,
+        framing,
+    } = backend.plan()
+    else {
+        unreachable!("rate compression kernel used with non-rate compression plan")
+    };
+    f(rate_backend, *coder, *framing)
+}
+
+#[cfg(feature = "backend-rwkv")]
+/// Execute `f` with RWKV compression `(method, parsed_method, coder)` from a compiled backend.
+fn with_rwkv_compression_plan<T>(
+    backend: &CompiledCompressionBackend,
+    f: impl FnOnce(&str, &crate::rwkvzip::MethodSpec, crate::coders::CoderType) -> Result<T, String>,
+) -> Result<T, String> {
+    let crate::spec::core::CompressionBackendPlan::Rwkv7 {
+        method,
+        parsed_method,
+        coder,
+        ..
+    } = backend.plan()
+    else {
+        unreachable!("rwkv compression kernel used with non-rwkv compression plan")
+    };
+    f(method, parsed_method, *coder)
 }
 
 fn entropy_prequential(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
@@ -975,9 +1083,9 @@ fn entropy_rosa(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<
 
 #[cfg(not(feature = "backend-rosa"))]
 fn entropy_rosa(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::RosaPlus,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::RosaPlus),
+    ))
 }
 
 #[cfg(feature = "backend-rosa")]
@@ -1001,9 +1109,9 @@ fn joint_entropy_rosa(
     _y: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::RosaPlus,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::RosaPlus),
+    ))
 }
 
 fn conditional_chain_rosa(
@@ -1016,41 +1124,31 @@ fn conditional_chain_rosa(
 
 #[cfg(feature = "backend-rwkv")]
 fn entropy_rwkv(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Rwkv7 {
-        method,
-        parsed_method,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("rwkv kernel used with non-rwkv plan")
-    };
-    crate::with_rwkv_method_spec_tls(method, parsed_method, |c| {
-        c.cross_entropy(data).map_err(|err| {
-            InfotheoryError::runtime(format!("rwkv method entropy scoring failed: {err:#}"))
+    with_rwkv_backend_plan(backend, |method, parsed_method| {
+        crate::with_rwkv_method_spec_tls(method, parsed_method, |c| {
+            c.cross_entropy(data).map_err(|err| {
+                InfotheoryError::runtime(format!("rwkv method entropy scoring failed: {err:#}"))
+            })
         })
     })
 }
 
 #[cfg(not(feature = "backend-rwkv"))]
 fn entropy_rwkv(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Rwkv7,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Rwkv7),
+    ))
 }
 
 #[cfg(feature = "backend-rwkv")]
 fn joint_entropy_rwkv(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Rwkv7 {
-        method,
-        parsed_method,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("rwkv kernel used with non-rwkv plan")
-    };
-    crate::with_rwkv_method_spec_tls(method, parsed_method, |c| {
-        c.joint_cross_entropy_aligned_min(x, y).map_err(|err| {
-            InfotheoryError::runtime(format!("rwkv method joint-entropy scoring failed: {err:#}"))
+    with_rwkv_backend_plan(backend, |method, parsed_method| {
+        crate::with_rwkv_method_spec_tls(method, parsed_method, |c| {
+            c.joint_cross_entropy_aligned_min(x, y).map_err(|err| {
+                InfotheoryError::runtime(format!(
+                    "rwkv method joint-entropy scoring failed: {err:#}"
+                ))
+            })
         })
     })
 }
@@ -1061,9 +1159,9 @@ fn joint_entropy_rwkv(
     _y: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Rwkv7,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Rwkv7),
+    ))
 }
 
 #[cfg(feature = "backend-rwkv")]
@@ -1072,21 +1170,15 @@ fn conditional_chain_rwkv(
     data: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Rwkv7 {
-        method,
-        parsed_method,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("rwkv kernel used with non-rwkv plan")
-    };
-    crate::with_rwkv_method_spec_tls(method, parsed_method, |c| {
-        c.cross_entropy_conditional_chain(prefix_parts, data)
-            .map_err(|err| {
-                InfotheoryError::runtime(format!(
-                    "rwkv method conditional-chain scoring failed: {err:#}"
-                ))
-            })
+    with_rwkv_backend_plan(backend, |method, parsed_method| {
+        crate::with_rwkv_method_spec_tls(method, parsed_method, |c| {
+            c.cross_entropy_conditional_chain(prefix_parts, data)
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!(
+                        "rwkv method conditional-chain scoring failed: {err:#}"
+                    ))
+                })
+        })
     })
 }
 
@@ -1096,50 +1188,38 @@ fn conditional_chain_rwkv(
     _data: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Rwkv7,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Rwkv7),
+    ))
 }
 
 #[cfg(feature = "backend-mamba")]
 fn entropy_mamba(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Mamba {
-        method,
-        parsed_method,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("mamba kernel used with non-mamba plan")
-    };
-    crate::with_mamba_method_spec_tls(method, parsed_method, |c| {
-        c.cross_entropy(data).map_err(|err| {
-            InfotheoryError::runtime(format!("mamba method entropy scoring failed: {err:#}"))
+    with_mamba_backend_plan(backend, |method, parsed_method| {
+        crate::with_mamba_method_spec_tls(method, parsed_method, |c| {
+            c.cross_entropy(data).map_err(|err| {
+                InfotheoryError::runtime(format!("mamba method entropy scoring failed: {err:#}"))
+            })
         })
     })
 }
 
 #[cfg(not(feature = "backend-mamba"))]
 fn entropy_mamba(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Mamba,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Mamba),
+    ))
 }
 
 #[cfg(feature = "backend-mamba")]
 fn joint_entropy_mamba(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Mamba {
-        method,
-        parsed_method,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("mamba kernel used with non-mamba plan")
-    };
-    crate::with_mamba_method_spec_tls(method, parsed_method, |c| {
-        c.joint_cross_entropy_aligned_min(x, y).map_err(|err| {
-            InfotheoryError::runtime(format!(
-                "mamba method joint-entropy scoring failed: {err:#}"
-            ))
+    with_mamba_backend_plan(backend, |method, parsed_method| {
+        crate::with_mamba_method_spec_tls(method, parsed_method, |c| {
+            c.joint_cross_entropy_aligned_min(x, y).map_err(|err| {
+                InfotheoryError::runtime(format!(
+                    "mamba method joint-entropy scoring failed: {err:#}"
+                ))
+            })
         })
     })
 }
@@ -1150,9 +1230,9 @@ fn joint_entropy_mamba(
     _y: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Mamba,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Mamba),
+    ))
 }
 
 #[cfg(feature = "backend-mamba")]
@@ -1161,21 +1241,15 @@ fn conditional_chain_mamba(
     data: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Mamba {
-        method,
-        parsed_method,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("mamba kernel used with non-mamba plan")
-    };
-    crate::with_mamba_method_spec_tls(method, parsed_method, |c| {
-        c.cross_entropy_conditional_chain(prefix_parts, data)
-            .map_err(|err| {
-                InfotheoryError::runtime(format!(
-                    "mamba method conditional-chain scoring failed: {err:#}"
-                ))
-            })
+    with_mamba_backend_plan(backend, |method, parsed_method| {
+        crate::with_mamba_method_spec_tls(method, parsed_method, |c| {
+            c.cross_entropy_conditional_chain(prefix_parts, data)
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!(
+                        "mamba method conditional-chain scoring failed: {err:#}"
+                    ))
+                })
+        })
     })
 }
 
@@ -1185,32 +1259,28 @@ fn conditional_chain_mamba(
     _data: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Mamba,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Mamba),
+    ))
 }
 
 #[cfg(feature = "backend-zpaq")]
 fn entropy_zpaq(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
-        unreachable!("zpaq kernel used with non-zpaq plan")
-    };
-    zpaq_conditional_chain_rate_bits(method, &[], data)
+    with_zpaq_backend_plan(backend, |method| {
+        zpaq_conditional_chain_rate_bits(method, &[], data)
+    })
 }
 
 #[cfg(not(feature = "backend-zpaq"))]
 fn entropy_zpaq(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Zpaq,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Zpaq),
+    ))
 }
 
 #[cfg(feature = "backend-zpaq")]
 fn joint_entropy_zpaq(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
-        unreachable!("zpaq kernel used with non-zpaq plan")
-    };
-    zpaq_joint_entropy_rate_bits(method, x, y)
+    with_zpaq_backend_plan(backend, |method| zpaq_joint_entropy_rate_bits(method, x, y))
 }
 
 #[cfg(not(feature = "backend-zpaq"))]
@@ -1219,9 +1289,9 @@ fn joint_entropy_zpaq(
     _y: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Zpaq,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Zpaq),
+    ))
 }
 
 #[cfg(feature = "backend-zpaq")]
@@ -1230,10 +1300,9 @@ fn conditional_chain_zpaq(
     data: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
-        unreachable!("zpaq kernel used with non-zpaq plan")
-    };
-    zpaq_conditional_chain_rate_bits(method, prefix_parts, data)
+    with_zpaq_backend_plan(backend, |method| {
+        zpaq_conditional_chain_rate_bits(method, prefix_parts, data)
+    })
 }
 
 #[cfg(not(feature = "backend-zpaq"))]
@@ -1242,9 +1311,9 @@ fn conditional_chain_zpaq(
     _data: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Zpaq,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Zpaq),
+    ))
 }
 
 #[cfg(feature = "backend-mixture")]
@@ -1254,9 +1323,9 @@ fn entropy_mixture(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResu
 
 #[cfg(not(feature = "backend-mixture"))]
 fn entropy_mixture(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Mixture,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Mixture),
+    ))
 }
 
 #[cfg(feature = "backend-mixture")]
@@ -1274,9 +1343,9 @@ fn joint_entropy_mixture(
     _y: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Mixture,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Mixture),
+    ))
 }
 
 #[cfg(feature = "backend-mixture")]
@@ -1294,24 +1363,23 @@ fn conditional_chain_mixture(
     _data: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Mixture,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Mixture),
+    ))
 }
 
 #[cfg(feature = "backend-particle")]
 fn entropy_particle(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
-        unreachable!("particle kernel used with non-particle plan")
-    };
-    particle_stream_entropy_rate_bits(data, spec)
+    with_particle_backend_plan(backend, |spec| {
+        particle_stream_entropy_rate_bits(data, spec)
+    })
 }
 
 #[cfg(not(feature = "backend-particle"))]
 fn entropy_particle(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Particle,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Particle),
+    ))
 }
 
 #[cfg(feature = "backend-particle")]
@@ -1320,10 +1388,7 @@ fn joint_entropy_particle(
     y: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
-        unreachable!("particle kernel used with non-particle plan")
-    };
-    particle_joint_entropy_rate_bits(x, y, spec)
+    with_particle_backend_plan(backend, |spec| particle_joint_entropy_rate_bits(x, y, spec))
 }
 
 #[cfg(not(feature = "backend-particle"))]
@@ -1332,9 +1397,9 @@ fn joint_entropy_particle(
     _y: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Particle,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Particle),
+    ))
 }
 
 #[cfg(feature = "backend-particle")]
@@ -1343,10 +1408,9 @@ fn conditional_chain_particle(
     data: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
-        unreachable!("particle kernel used with non-particle plan")
-    };
-    particle_conditional_chain_rate_bits(prefix_parts, data, spec)
+    with_particle_backend_plan(backend, |spec| {
+        particle_conditional_chain_rate_bits(prefix_parts, data, spec)
+    })
 }
 
 #[cfg(not(feature = "backend-particle"))]
@@ -1355,32 +1419,26 @@ fn conditional_chain_particle(
     _data: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Particle,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Particle),
+    ))
 }
 
 #[cfg(feature = "backend-ctw")]
 fn entropy_ctw(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
-        unreachable!("ctw kernel used with non-ctw plan")
-    };
-    ctw_entropy_rate_bits(*depth, data)
+    with_ctw_backend_plan(backend, |depth| ctw_entropy_rate_bits(depth, data))
 }
 
 #[cfg(not(feature = "backend-ctw"))]
 fn entropy_ctw(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Ctw,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Ctw),
+    ))
 }
 
 #[cfg(feature = "backend-ctw")]
 fn joint_entropy_ctw(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
-        unreachable!("ctw kernel used with non-ctw plan")
-    };
-    ctw_joint_entropy_rate_bits(*depth, x, y)
+    with_ctw_backend_plan(backend, |depth| ctw_joint_entropy_rate_bits(depth, x, y))
 }
 
 #[cfg(not(feature = "backend-ctw"))]
@@ -1389,9 +1447,9 @@ fn joint_entropy_ctw(
     _y: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Ctw,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Ctw),
+    ))
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -1400,10 +1458,9 @@ fn conditional_chain_ctw(
     data: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
-        unreachable!("ctw kernel used with non-ctw plan")
-    };
-    ctw_conditional_chain_rate_bits(*depth, prefix_parts, data)
+    with_ctw_backend_plan(backend, |depth| {
+        ctw_conditional_chain_rate_bits(depth, prefix_parts, data)
+    })
 }
 
 #[cfg(not(feature = "backend-ctw"))]
@@ -1412,29 +1469,23 @@ fn conditional_chain_ctw(
     _data: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::Ctw,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::Ctw),
+    ))
 }
 
 #[cfg(feature = "backend-ctw")]
 fn entropy_fac_ctw(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::FacCtw {
-        base_depth,
-        num_percept_bits: _,
-        encoding_bits,
-    } = backend.plan()
-    else {
-        unreachable!("fac-ctw kernel used with non-fac-ctw plan")
-    };
-    fac_ctw_entropy_rate_bits(*base_depth, *encoding_bits, data)
+    with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits| {
+        fac_ctw_entropy_rate_bits(base_depth, encoding_bits, data)
+    })
 }
 
 #[cfg(not(feature = "backend-ctw"))]
 fn entropy_fac_ctw(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::FacCtw,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::FacCtw),
+    ))
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -1443,15 +1494,9 @@ fn joint_entropy_fac_ctw(
     y: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::FacCtw {
-        base_depth,
-        num_percept_bits: _,
-        encoding_bits,
-    } = backend.plan()
-    else {
-        unreachable!("fac-ctw kernel used with non-fac-ctw plan")
-    };
-    fac_ctw_joint_entropy_rate_bits(*base_depth, *encoding_bits, x, y)
+    with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits| {
+        fac_ctw_joint_entropy_rate_bits(base_depth, encoding_bits, x, y)
+    })
 }
 
 #[cfg(not(feature = "backend-ctw"))]
@@ -1460,9 +1505,9 @@ fn joint_entropy_fac_ctw(
     _y: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::FacCtw,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::FacCtw),
+    ))
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -1471,15 +1516,9 @@ fn conditional_chain_fac_ctw(
     data: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    let crate::spec::core::RateBackendPlan::FacCtw {
-        base_depth,
-        num_percept_bits: _,
-        encoding_bits,
-    } = backend.plan()
-    else {
-        unreachable!("fac-ctw kernel used with non-fac-ctw plan")
-    };
-    fac_ctw_conditional_chain_rate_bits(*base_depth, *encoding_bits, prefix_parts, data)
+    with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits| {
+        fac_ctw_conditional_chain_rate_bits(base_depth, encoding_bits, prefix_parts, data)
+    })
 }
 
 #[cfg(not(feature = "backend-ctw"))]
@@ -1488,19 +1527,18 @@ fn conditional_chain_fac_ctw(
     _data: &[u8],
     _backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(rate_backend_feature_error(
-        RateBackendKind::FacCtw,
-    )))
+    Err(InfotheoryError::unsupported(
+        registry::rate_backend_feature_error(RateBackendKind::FacCtw),
+    ))
 }
 
 fn build_compression_runtime_zpaq(
     backend: &CompiledCompressionBackend,
 ) -> Result<CompressionRuntimeHandle, String> {
-    let crate::spec::core::CompressionBackendPlan::Zpaq { method } = backend.plan() else {
-        unreachable!("zpaq compression kernel used with non-zpaq plan")
-    };
-    Ok(CompressionRuntimeHandle::Zpaq {
-        method: method.clone(),
+    with_zpaq_compression_plan(backend, |method| {
+        Ok(CompressionRuntimeHandle::Zpaq {
+            method: method.to_string(),
+        })
     })
 }
 
@@ -1508,19 +1546,12 @@ fn build_compression_runtime_zpaq(
 fn build_compression_runtime_rwkv(
     backend: &CompiledCompressionBackend,
 ) -> Result<CompressionRuntimeHandle, String> {
-    let crate::spec::core::CompressionBackendPlan::Rwkv7 {
-        method,
-        parsed_method,
-        coder,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("rwkv compression kernel used with non-rwkv compression plan")
-    };
-    Ok(CompressionRuntimeHandle::Rwkv7 {
-        method: method.clone(),
-        parsed_method: parsed_method.clone(),
-        coder: *coder,
+    with_rwkv_compression_plan(backend, |method, parsed_method, coder| {
+        Ok(CompressionRuntimeHandle::Rwkv7 {
+            method: method.to_string(),
+            parsed_method: parsed_method.clone(),
+            coder,
+        })
     })
 }
 
@@ -1528,7 +1559,7 @@ fn build_compression_runtime_rwkv(
 fn build_compression_runtime_rwkv(
     _backend: &CompiledCompressionBackend,
 ) -> Result<CompressionRuntimeHandle, String> {
-    Err(compression_backend_feature_error(
+    Err(registry::compression_backend_feature_error(
         CompressionBackendKind::Rwkv7,
     ))
 }
@@ -1536,19 +1567,13 @@ fn build_compression_runtime_rwkv(
 fn build_compression_runtime_rate(
     backend: &CompiledCompressionBackend,
 ) -> Result<CompressionRuntimeHandle, String> {
-    let crate::spec::core::CompressionBackendPlan::Rate {
-        rate_backend,
-        coder,
-        framing,
-    } = backend.plan()
-    else {
-        unreachable!("rate compression kernel used with non-rate compression plan")
-    };
-    Ok(CompressionRuntimeHandle::Rate {
-        rate_backend: crate::spec::core::compiled_rate_backend_from_plan(rate_backend.clone())
-            .map_err(|err| format!("failed to compile rate compression backend plan: {err}"))?,
-        coder: *coder,
-        framing: *framing,
+    with_rate_compression_plan(backend, |rate_backend, coder, framing| {
+        Ok(CompressionRuntimeHandle::Rate {
+            rate_backend: crate::spec::core::compiled_rate_backend_from_plan(rate_backend.clone())
+                .map_err(|err| format!("failed to compile rate compression backend plan: {err}"))?,
+            coder,
+            framing,
+        })
     })
 }
 
@@ -1563,6 +1588,14 @@ fn build_rate_pdf_predictor_via_kernel(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
     (rate_backend_kernel(backend.plan().kind()).build_pdf_predictor)(backend)
+}
+
+#[cfg(feature = "backend-calibrated")]
+pub(super) fn compile_calibrated_base_backend(
+    base: &Arc<RateBackendPlan>,
+) -> Result<CompiledRateBackend, String> {
+    crate::spec::core::compiled_rate_backend_from_plan(base.clone())
+        .map_err(|err| format!("failed to compile calibrated base backend plan: {err}"))
 }
 
 /// Shared runtime trait for compression-capable backends.

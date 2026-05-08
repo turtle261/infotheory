@@ -590,7 +590,10 @@ pub(super) fn vm_stats_backend_spec_value(
         }
         "zpaq" => serde_json::json!({
             "kind": "zpaq",
-            "method": root["method"].as_str().unwrap_or("2"),
+            "method": {
+                "kind": "literal",
+                "value": root["method"].as_str().unwrap_or("2"),
+            },
         }),
         "mixture" => {
             let spec_path = root["mixture_spec"]
@@ -701,7 +704,10 @@ pub(super) fn normalize_vm_stats_backend_spec(
             if !obj.contains_key("method") {
                 obj.insert(
                     "method".to_string(),
-                    serde_json::Value::String(root["method"].as_str().unwrap_or("2").to_string()),
+                    serde_json::json!({
+                        "kind": "literal",
+                        "value": root["method"].as_str().unwrap_or("2"),
+                    }),
                 );
             }
         }

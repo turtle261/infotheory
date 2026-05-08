@@ -53,7 +53,20 @@ pub(crate) fn describe_compression_backend_kind(
     )
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    not(feature = "backend-rosa"),
+    not(feature = "backend-ctw"),
+    not(feature = "backend-match"),
+    not(feature = "backend-ppmd"),
+    not(feature = "backend-sequitur"),
+    not(feature = "backend-zpaq"),
+    not(feature = "backend-mixture"),
+    not(feature = "backend-particle"),
+    not(feature = "backend-calibrated"),
+    not(feature = "backend-mamba"),
+    not(feature = "backend-rwkv")
+))]
 pub(super) fn rate_backend_feature_error(kind: RateBackendKind) -> String {
     describe_rate_backend_kind(kind)
         .map(|descriptor| match descriptor.feature {
@@ -66,7 +79,7 @@ pub(super) fn rate_backend_feature_error(kind: RateBackendKind) -> String {
         .unwrap_or_else(|err| err)
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, not(feature = "backend-rwkv")))]
 pub(super) fn compression_backend_feature_error(kind: CompressionBackendKind) -> String {
     describe_compression_backend_kind(kind)
         .map(|descriptor| match descriptor.feature {

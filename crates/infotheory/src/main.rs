@@ -1177,9 +1177,13 @@ fn main() {
                 rate_backend_specified = true;
                 explicit_rate_backend_flag = true;
             }
-            "--model-export" | "--rwkv-export" => {
+            "--model-export" => {
                 i += 1;
                 model_export_path = args.get(i).cloned();
+            }
+            "--rwkv-export" => {
+                eprintln!("Error: --rwkv-export has been removed; use --model-export instead");
+                std::process::exit(1);
             }
             "--mixture" => {
                 i += 1;
@@ -1731,7 +1735,6 @@ Options:
                           --compression-backend, --expert-spec, and --method. Optional --rate-backend-json must match the embedded rate model when the compression object includes one.
   --expert-spec <path>    Load one exact standalone expert JSON (same schema as a mixture 'experts' entry)
   --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
-  --rwkv-export <path>    Backward-compatible alias for --model-export
   --mixture <path>        Mixture spec for 'ac-log-loss'
   --out-prefix <prefix>   Output prefix for 'ac-log-loss' TSVs
   --hex <hex>             Hex-encoded byte string for 'sequitur-debug' (repeatable)

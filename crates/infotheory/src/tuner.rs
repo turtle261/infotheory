@@ -2394,11 +2394,6 @@ fn peak_rss_bytes_for_pid(pid: libc::pid_t) -> Option<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn peak_rss_bytes_for_pid(_pid: libc::pid_t) -> Option<u64> {
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
 fn peak_memory_bytes_for_pid(_pid: libc::pid_t, _mode: PeakMemoryMode) -> Option<u64> {
     None
 }
