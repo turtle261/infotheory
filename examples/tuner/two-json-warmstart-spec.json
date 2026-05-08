@@ -54,7 +54,7 @@
           {
             "kind": "rwkv7",
             "log_prior": 0.0,
-            "name": "rwkv",
+            "name": "rwkv7",
             "method": {
               "kind": "online",
               "cfg": {

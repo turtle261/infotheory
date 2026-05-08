@@ -321,7 +321,10 @@ pub(super) fn load_exact_reward_certificate(
         VerifiedRewardEncodingMode::IntegerObjectiveDifferenceInterval
     } else {
         let map = parse_finite_reward_map(object, reward_bits, max_reward)?;
-        if controller_requires_exact_objective_difference(controller_kind)
+        if compiled
+            .controller()
+            .exact_objective_difference_controller()
+            .is_some()
             && map.complete_nonnegative_interval_max.is_none()
         {
             return Err(
@@ -341,13 +344,6 @@ pub(super) fn load_exact_reward_certificate(
         scalar_representation: cert_scalar.to_string(),
         mode,
     }))
-}
-
-pub(super) fn controller_requires_exact_objective_difference(controller_kind: &str) -> bool {
-    matches!(
-        controller_kind,
-        "mc_aixi_fac_ctw" | "aiqi_warmstart_exact_jh"
-    )
 }
 
 pub(super) fn parse_finite_reward_map(

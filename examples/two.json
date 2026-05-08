@@ -27,7 +27,7 @@
       "log_prior": 0.0
     },
     {
-      "name": "rwkv",
+      "name": "rwkv7",
       "kind": "rwkv7",
       "method": "cfg:hidden=64,layers=1,intermediate=64,decay_rank=16,a_rank=16,v_rank=16,g_rank=16,seed=22,train=adam,lr=0.0009,stride=1;policy:schedule=0..0.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|0.5%..1%:infer|1%..1.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|1.5%..2%:infer|2%..2.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|2.5%..3%:infer|3%..3.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|3.5%..4%:infer|4%..4.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|4.5%..5%:infer|5%..5.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|5.5%..6%:infer|6%..6.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|6.5%..7%:infer|7%..7.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|7.5%..8%:infer|8%..8.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|8.5%..9%:infer|9%..9.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|9.5%..12%:train(scope=all,opt=adam,lr=0.0001,stride=1,bptt=8,clip=0,momentum=0.9)|12%..17%:infer|17%..18%:train(scope=all,opt=adam,lr=0.0001,stride=1,bptt=8,clip=0,momentum=0.9)|18%..100%:infer",
       "log_prior": 0.0

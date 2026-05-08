@@ -6,7 +6,7 @@ local function die(msg)
 end
 
 local CORE_OPERATIONS  = { h = true, compress = true, decompress = true }
-local CORE_SUBJECTS    = { ppmd = true, ctw = true, rosa = true, rwkv = true, neural_mixture = true }
+local CORE_SUBJECTS    = { ppmd = true, ctw = true, rosa = true, rwkv7 = true, neural_mixture = true }
 local CORE_SIZES       = { ["1048576"] = true, ["4194304"] = true, ["10000000"] = true }
 
 local REQUIRED_COLUMNS = {

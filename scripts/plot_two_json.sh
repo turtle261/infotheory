@@ -24,7 +24,7 @@ case "${PLOT_SUITE}" in
     PLOT_SUITE=two-json
     SUITE_DISPLAY="configs/bench/two.json"
     SUITE_PATH_PREFIX="infotheory-two-json"
-    SUITE_FOCUS_SUBJECTS="neural_mixture rwkv"
+    SUITE_FOCUS_SUBJECTS="neural_mixture rwkv7"
     ;;
   extra)
     PLOT_SUITE=extra
@@ -58,7 +58,7 @@ Environment:
   INFOTHEORY_PLOT_SUITE=two-json|extra
   INFOTHEORY_PLOT_SUMMARY_TSV=/tmp/${SUITE_PATH_PREFIX}-summary-<stamp>.tsv
   INFOTHEORY_BASELINE_SUMMARY_TSV=benchmarks/baselines/${SUITE_PATH_PREFIX}-summary-<stamp>.tsv
-  INFOTHEORY_PLOT_SUBJECTS=rwkv
+  INFOTHEORY_PLOT_SUBJECTS=rwkv7
   INFOTHEORY_PLOT_OUTPUT_DIR=/tmp/plotimgs
   INFOTHEORY_PLOT_WIDTH=2400
   INFOTHEORY_PLOT_HEIGHT=1400

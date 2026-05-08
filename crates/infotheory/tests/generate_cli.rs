@@ -278,7 +278,7 @@ fn generate_cli_supports_expert_spec_and_mixture_spec() {
     let experts = {
         let mut experts = experts;
         experts.push(json!({
-            "name": "rwkv",
+            "name": "rwkv7",
             "kind": "rwkv7",
             "method": "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=31,train=none,lr=0.0,stride=1;policy:schedule=0..100:infer",
             "log_prior": 0.0

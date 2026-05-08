@@ -55,7 +55,7 @@ fn mixture_single_sequitur_expert_matches_backend() {
 
 #[cfg(feature = "backend-rwkv")]
 #[test]
-fn rwkv_mixture_single_expert_matches_backend_with_tbptt() {
+fn rwkv7_mixture_single_expert_matches_backend_with_tbptt() {
     let data = b"abcdefghij";
     let base = RateBackend::Rwkv7Method {
         method: infotheory::rwkvzip::parse_method_spec("cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=37,train=adam,lr=0.0008,stride=1;policy:schedule=0..100:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=8,clip=0,momentum=0.9)").expect("rwkv method spec"),
@@ -64,7 +64,7 @@ fn rwkv_mixture_single_expert_matches_backend_with_tbptt() {
 
     let spec = MixtureSpec::new(
         MixtureKind::Bayes,
-        vec![MixtureExpertSpec::new(base.clone()).with_name("rwkv")],
+        vec![MixtureExpertSpec::new(base.clone()).with_name("rwkv7")],
     );
     let mix_backend = RateBackend::Mixture {
         spec: Arc::new(spec),

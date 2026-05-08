@@ -154,7 +154,7 @@ if not isinstance(experts, list) or len(experts) == 0:
 
 def parse_rwkv_cfg_string(raw: str):
     if not raw.startswith("cfg:"):
-        raise SystemExit("rwkv method must start with 'cfg:' in examples/two.json")
+        raise SystemExit("rwkv7 method must start with 'cfg:' in examples/two.json")
     policy = None
     cfg_part = raw
     if ";policy:" in raw:
@@ -164,17 +164,17 @@ def parse_rwkv_cfg_string(raw: str):
     for field in cfg_fields:
         key, sep, value = field.partition("=")
         if sep != "=":
-            raise SystemExit(f"invalid rwkv cfg field '{field}'")
+            raise SystemExit(f"invalid rwkv7 cfg field '{field}'")
         parsed[key.strip()] = value.strip()
 
     def parse_int(key: str) -> int:
         if key not in parsed:
-            raise SystemExit(f"rwkv cfg missing '{key}'")
+            raise SystemExit(f"rwkv7 cfg missing '{key}'")
         return int(parsed[key], 10)
 
     def parse_float(key: str) -> float:
         if key not in parsed:
-            raise SystemExit(f"rwkv cfg missing '{key}'")
+            raise SystemExit(f"rwkv7 cfg missing '{key}'")
         value64 = float(parsed[key])
         packed = struct.pack("!f", value64)
         return struct.unpack("!f", packed)[0]
@@ -186,7 +186,7 @@ def parse_rwkv_cfg_string(raw: str):
         "adam": "adam",
     }.get(train_raw)
     if train_mode is None:
-        raise SystemExit(f"unsupported rwkv cfg train mode '{train_raw}'")
+        raise SystemExit(f"unsupported rwkv7 cfg train mode '{train_raw}'")
 
     cfg = {
         "hidden": parse_int("hidden"),

@@ -91,6 +91,36 @@ const TUNER_MCAIXI_FAC_CTW_BASE_DEPTH: usize = 8;
 const ANNEALER_T0_BITS: f64 = 1.0;
 const ANNEALER_T_MIN_BITS: f64 = 1.0e-3;
 
+enum ExactObjectiveDifferenceController<'a> {
+    McAixiFacCtw(&'a crate::spec::McAixiFacCtwTuneControllerSpec),
+    AiqiWarmstartExactJh(&'a crate::spec::WarmStartExactJhTuneControllerSpec),
+}
+
+impl ExactObjectiveDifferenceController<'_> {
+    fn reward_bits(&self) -> usize {
+        match self {
+            Self::McAixiFacCtw(controller) => controller.interface.reward_bits,
+            Self::AiqiWarmstartExactJh(controller) => controller.interface.reward_bits,
+        }
+    }
+}
+
+impl crate::spec::CompiledTuneController {
+    fn exact_objective_difference_controller(
+        &self,
+    ) -> Option<ExactObjectiveDifferenceController<'_>> {
+        match self {
+            Self::McAixiFacCtw(controller) => {
+                Some(ExactObjectiveDifferenceController::McAixiFacCtw(controller))
+            }
+            Self::AiqiWarmstartExactJh(controller) => Some(
+                ExactObjectiveDifferenceController::AiqiWarmstartExactJh(controller),
+            ),
+            Self::AnnealedHillClimbing(_) | Self::AiqiDiscounted(_) => None,
+        }
+    }
+}
+
 fn observation_adapter_spec_value() -> Value {
     serde_json::json!({
         "kind": OBSERVATION_ADAPTER_DECLARATION,
@@ -289,27 +319,22 @@ fn emit_exact_reward_encoding_certificate(
     prepared: &PreparedTuneContext,
 ) -> Result<(), String> {
     let controller_kind = controller_kind_name(prepared.compiled.controller());
-    if !certificates::controller_requires_exact_objective_difference(controller_kind) {
-        return Err(format!(
-            "exact reward-encoding certificate emission is only supported for exact-objective controller families (mc_aixi_fac_ctw, aiqi_warmstart_exact_jh); found '{controller_kind}'"
-        ));
-    }
     let scalar_representation = request
         .execution
         .theorem
         .scalar_representation_ref
         .as_deref()
         .unwrap_or(SCALAR_REPRESENTATION_DECLARATION);
-    let reward_bits = match prepared.compiled.controller() {
-        crate::spec::CompiledTuneController::McAixiFacCtw(inner) => inner.interface.reward_bits,
-        crate::spec::CompiledTuneController::AiqiWarmstartExactJh(inner) => {
-            inner.interface.reward_bits
-        }
-        crate::spec::CompiledTuneController::AnnealedHillClimbing(_)
-        | crate::spec::CompiledTuneController::AiqiDiscounted(_) => {
-            unreachable!("checked controller kind for exact reward certificate emission")
-        }
+    let Some(exact_controller) = prepared
+        .compiled
+        .controller()
+        .exact_objective_difference_controller()
+    else {
+        return Err(format!(
+            "exact reward-encoding certificate emission is only supported for exact-objective controller families (mc_aixi_fac_ctw, aiqi_warmstart_exact_jh); found '{controller_kind}'"
+        ));
     };
+    let reward_bits = exact_controller.reward_bits();
     let action_alphabet_size = planner_action_count(&prepared.compiled)?;
     let cert = serde_json::json!({
         "schema_version": 1,

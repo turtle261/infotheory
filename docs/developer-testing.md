@@ -9,16 +9,16 @@ coverage workflows.
 # Rust tests (default features)
 cargo test --locked
 
-# Rust tests with CLI enabled (includes CLI/API parity + search tests)
-cargo test --features cli --locked
+# Rust tests with CLI/API parity + search tests
+cargo test -p infotheory --features "cli all-backends" --locked
 
 # VM-focused Rust tests
 cargo test --features vm --test nyx_vm_tests --locked
 ```
 
 ```bash
-# Build Python extension in editable mode
-uv run maturin develop --release
+# Build Python extension in editable mode using the repo's pyproject/maturin config
+uv run maturin develop
 
 # Python tests
 uv run pytest -q python/tests

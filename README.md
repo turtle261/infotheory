@@ -44,7 +44,7 @@ The repository also includes **AIQI**, the model-free return-prediction agent in
 - `planner: "aiqi"` enables AIQI in `infotheory aixi <config.json>`.
 - `planner: "mc-aixi"` (default) keeps MC-AIXI as the default planner.
 - **Direct AIQI-CTW configuration from *A Model-Free Universal AI***: `algorithm: "ac-ctw"` (or `"ctw"`) selects the AIQI-CTW setup described in *A Model-Free Universal AI*.
-- **Extensions**: AIQI also supports `fac-ctw`, `rosa`, `rwkv`, and generic `rate_backend` predictors, including the same mixture JSON format used elsewhere in the repo.
+- **Extensions**: AIQI also supports `fac-ctw`, `rosa`, `rwkv7`, and generic `rate_backend` predictors, including the same mixture JSON format used elsewhere in the repo.
 - **Why `zpaq` is excluded from AIQI**: AIQI needs exact frozen predictor states while it scores hypothetical actions and return bins, and `zpaq` does not provide that interface.
 - **Validation from *A Model-Free Universal AI***: AIQI enforces `discount_gamma in (0,1)` and `baseline_exploration (tau) in (0,1]`.
 - **Tie-breaking from *A Model-Free Universal AI***: greedy action selection uses a fixed tie-break rule (first maximizing action) to match the fixed tie-breaking assumption in *A Model-Free Universal AI*.
@@ -295,7 +295,7 @@ This writes:
 ### AIXI Agent Mode
 ```bash
 # Run the AIXI agent using config-specified backend
-./infotheory aixi conf/kuhn_poker.json
+./infotheory aixi configs/aixi/paper_kuhn_poker.json
 ```
 
 Planner switch in config:
@@ -442,7 +442,7 @@ This repository now includes PyO3/maturin bindings with package name:
 Quickstart (local, via `uv`):
 
 ```bash
-uv run maturin develop --release
+uv run maturin develop
 uv run python -c "import infotheory_rs as ait; print(ait.ncd_paths('README.md','README.md', backend='zpaq', method='5', variant='vitanyi'))"
 ```
 
@@ -501,7 +501,7 @@ Notes:
 - Built as `abi3-py310` (compatible with Python 3.10+).
 - Published wheels are intended to be portable and exclude `vm` support by default.
 - Linux source builds can opt into VM bindings by enabling the Rust `vm` feature when building the extension.
-  Example: `uv run maturin develop --release --features vm`
+  Example: `uv run maturin develop --features vm`
 - Python trait-callback adapters (`PredictorABC`, `EnvironmentABC`, `AgentSimulatorABC`) are fail-fast:
   unhandled callback exceptions terminate the process after printing traceback context. This prevents
   silently continuing planning/search with invalid fallback values.

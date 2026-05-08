@@ -387,9 +387,9 @@ Commands:
 
 Environment variables:
   INFOTHEORY_BUILD_MODE=native|portable  Controls local cargo invocations in projman. `native` uses the repository's default target-cpu=native configuration; `portable` overrides local builds/tests to use generic CPU codegen like CI/release builds.
-  INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv, INFOTHEORY_BENCH_SUITE=extra, and INFOTHEORY_BENCH_BUILD_MODE=native|portable.
+  INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv7, INFOTHEORY_BENCH_SUITE=extra, and INFOTHEORY_BENCH_BUILD_MODE=native|portable.
   INFOTHEORY_CLI_BENCH_*  Passed through to scripts/bench_cli_hyperfine.sh for baseline/current CLI benchmark tuning and input selection. For `projman.sh bench cli`, INFOTHEORY_BUILD_MODE is canonical and is forwarded as INFOTHEORY_CLI_BENCH_BUILD_MODE.
-  INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv, INFOTHEORY_PLOT_SUMMARY_TSV=..., and INFOTHEORY_PLOT_SUITE=extra.
+  INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv7, INFOTHEORY_PLOT_SUMMARY_TSV=..., and INFOTHEORY_PLOT_SUITE=extra.
   INFOTHEORY_BASELINE_SUMMARY_TSV / INFOTHEORY_BENCH_RAW_TSV  Also read by benchman for baseline overlays and raw inspector detail.
   SKIP_DOCKER=1   Skip docker rootfs.ext4 build during init-vm.
   BUILD_CLI=1     Also build optional infotheory CLI binary (feature: cli) during code_test.

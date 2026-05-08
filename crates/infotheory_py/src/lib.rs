@@ -255,7 +255,7 @@ impl PyGenerationStrategy {
         match self.inner {
             GenerationStrategy::Greedy => "GenerationStrategy.Greedy",
             GenerationStrategy::Sample => "GenerationStrategy.Sample",
-            _ => unreachable!("non-exhaustive GenerationStrategy variant not exposed by bindings"),
+            _ => "GenerationStrategy.<unknown>",
         }
     }
 }
@@ -288,9 +288,7 @@ impl PyGenerationUpdateMode {
         match self.inner {
             GenerationUpdateMode::Adaptive => "GenerationUpdateMode.Adaptive",
             GenerationUpdateMode::Frozen => "GenerationUpdateMode.Frozen",
-            _ => {
-                unreachable!("non-exhaustive GenerationUpdateMode variant not exposed by bindings")
-            }
+            _ => "GenerationUpdateMode.<unknown>",
         }
     }
 }
@@ -728,9 +726,7 @@ impl PyCalibrationContextKind {
             CalibrationContextKind::Text => "CalibrationContextKind.Text",
             CalibrationContextKind::Repeat => "CalibrationContextKind.Repeat",
             CalibrationContextKind::TextRepeat => "CalibrationContextKind.TextRepeat",
-            _ => unreachable!(
-                "non-exhaustive CalibrationContextKind variant not exposed by bindings"
-            ),
+            _ => "CalibrationContextKind.<unknown>",
         }
     }
 }
