@@ -3070,13 +3070,14 @@ mod tests {
     fn roundtrip_rate_rwkv_two_json_method_2m() {
         let two_json: serde_json::Value =
             serde_json::from_str(include_str!("../../../../configs/bench/two.json")).unwrap();
-        let method = two_json["experts"]
+        let experts = two_json["experts"]
             .as_array()
-            .unwrap()
+            .expect("two.json must define experts array");
+        let method = experts
             .iter()
-            .find(|expert| expert["name"].as_str() == Some("rwkv"))
+            .find(|expert| expert["kind"].as_str() == Some("rwkv7"))
             .and_then(|expert| expert["method"].as_str())
-            .unwrap()
+            .expect("two.json must include rwkv7 expert with string method")
             .to_string();
 
         let backend = RateBackend::Rwkv7Method {
