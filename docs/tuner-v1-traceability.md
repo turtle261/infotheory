@@ -97,7 +97,7 @@ This checklist maps the normative Tuner V1 implementation obligations in
   `finite_reward_map_rejects_reachable_rewards_alias`.
 - Exact-objective controller families require finite-map certificates to
   declare `complete_nonnegative_interval_max` during certificate load.
-  Implemented by `controller_requires_exact_objective_difference` and
+  Implemented by `CompiledTuneController::exact_objective_difference_controller` and
   `load_exact_reward_certificate`.
 
 ## Observation Encoding

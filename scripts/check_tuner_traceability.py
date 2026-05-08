@@ -63,7 +63,10 @@ REQUIRED_REFS: tuple[tuple[str, Path], ...] = (
     ("parse_finite_reward_map", TUNER),
     ("finite_reward_map_rejects_reachable_rewards_alias", TUNER),
     ("complete_nonnegative_interval_max", TUNER),
-    ("controller_requires_exact_objective_difference", TUNER),
+    (
+        "CompiledTuneController::exact_objective_difference_controller",
+        TUNER,
+    ),
     ("TunerRawObservation::from_runtime_step", TUNER),
     ("observation_adapter_spec_value", TUNER),
     ("load_exact_state_observation_certificate", TUNER),
