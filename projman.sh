@@ -164,7 +164,15 @@ cmd_test_full() {
   cmd_lean_test
 }
 
+cmd_test_ci() {
+  say "[test_ci] Running local CI preflight script..."
+  need_cmd sh
+  (cd "$ROOT_DIR" && sh "$ROOT_DIR/scripts/test_ci_local.sh" "$@")
+  say "[test_ci] Done"
+}
+
 cmd_test_all() {
+  cmd_test_ci
   cmd_test_full
 }
 
@@ -378,10 +386,11 @@ Commands:
   tui log-loss <prefix>  Build and launch the log-loss diagnostic TUI for <prefix>.trace.tsv / .nodes.tsv / .summary.tsv.
   tui man     Open the local benchman manual via nvim man pager (MANPAGER='nvim +Man!').
   code_test   Build (release) and run Rust tests (release). Uses --features vm iff VM artifacts exist and /dev/kvm is accessible.
+  test_ci     Run fast local CI preflight gates (Rust line coverage, rustdoc coverage, curated feature-gate checks, Python coverage/smoke). Set INFOTHEORY_CI_INCLUDE_VM=1 to include VM slices.
   init-vm     Download/build VM artifacts needed for VM tests (kernel, initramfs, docker rootfs).
   lean_test   Run Lean validation suite (ite-bench). Requires lake.
   test_full   Run init-vm, code_test, and lean_test.
-  test_all    Alias for test_full.
+  test_all    Run test_ci then test_full.
   clean       Clean build artifacts (cargo clean, lake clean, VM images/initramfs). Keeps vmlinux-6.1.58.
   legacy_aixi_convert <input_file>  Convert legacy AIXI JSON config to canonical planner_run JSON and write to stdout. External configs print: External configs were deprecated.
 
@@ -393,6 +402,11 @@ Environment variables:
   INFOTHEORY_BASELINE_SUMMARY_TSV / INFOTHEORY_BENCH_RAW_TSV  Also read by benchman for baseline overlays and raw inspector detail.
   SKIP_DOCKER=1   Skip docker rootfs.ext4 build during init-vm.
   BUILD_CLI=1     Also build optional infotheory CLI binary (feature: cli) during code_test.
+  INFOTHEORY_CI_INCLUDE_VM=1  Include VM feature compile/Python VM smoke slices in test_ci.
+  INFOTHEORY_CI_SKIP_RUST_LINE_COVERAGE=1  Skip only the Rust line coverage gate in test_ci.
+  INFOTHEORY_CI_SKIP_RUSTDOC_COVERAGE=1  Skip only the rustdoc coverage gate in test_ci.
+  INFOTHEORY_CI_SKIP_FEATURE_GATES=1  Skip only curated Rust feature-gate checks in test_ci.
+  INFOTHEORY_CI_SKIP_PYTHON=1  Skip only Python coverage/smoke gates in test_ci.
 EOF
 }
 
@@ -403,6 +417,7 @@ case "$cmd" in
   plot) shift; cmd_plot "$@" ;;
   tui) shift; cmd_tui "$@" ;;
   code_test) shift; cmd_code_test "$@" ;;
+  test_ci) shift; cmd_test_ci "$@" ;;
   init-vm) shift; cmd_init_vm "$@" ;;
   lean_test) shift; cmd_lean_test "$@" ;;
   test_full) shift; cmd_test_full "$@" ;;
