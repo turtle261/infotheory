@@ -198,6 +198,7 @@ pub(crate) fn action_alphabet_from_action_bits(action_bits: usize) -> ActionAlph
 }
 
 /// Error returned when the configured reward range cannot be encoded.
+#[cfg(feature = "aixi")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RewardEncodingError {
@@ -224,6 +225,7 @@ pub enum RewardEncodingError {
     },
 }
 
+#[cfg(feature = "aixi")]
 impl fmt::Display for RewardEncodingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -250,9 +252,11 @@ impl fmt::Display for RewardEncodingError {
     }
 }
 
+#[cfg(feature = "aixi")]
 impl Error for RewardEncodingError {}
 
 /// Validate that shifted rewards are representable in the configured bit width.
+#[cfg(feature = "aixi")]
 pub(crate) fn validate_reward_encoding_bounds(
     min_reward: i64,
     max_reward: i64,
@@ -641,6 +645,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "aixi")]
     fn validate_reward_encoding_bounds_rejects_unrepresentable_ranges() {
         let err = validate_reward_encoding_bounds(0, 100, 0, 1).expect_err("must fail");
         assert!(matches!(
