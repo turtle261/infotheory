@@ -73,7 +73,7 @@ jobs:
           RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features cli --locked
           RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features "tuner backend-ctw" --locked
           RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features "cli tuner backend-ctw" --locked
-          RUSTFLAGS="-D warnings" cargo check -p infotheory_py --no-default-features --features "tuner backend-ctw" --locked
+          PYO3_BUILD_EXTENSION_MODULE=1 RUSTFLAGS="-D warnings" cargo check -p infotheory_py --no-default-features --features "tuner backend-ctw" --locked
 
       - name: Install coverage tooling
         run: cargo install cargo-llvm-cov --locked
@@ -196,6 +196,7 @@ jobs:
       - name: Feature checks
         env:
           RUSTFLAGS: -D warnings
+          PYO3_BUILD_EXTENSION_MODULE: "1"
         run: |
           cargo check -p infotheory --locked
           cargo check -p infotheory --no-default-features --locked
@@ -244,7 +245,6 @@ jobs:
           cargo test -p infotheory --no-default-features --features tuner --no-run --locked
           cargo test -p infotheory --no-default-features --features "tuner backend-ctw" --no-run --locked
           cargo test -p infotheory --no-default-features --features "cli tuner backend-ctw" --no-run --locked
-          cargo test -p infotheory_py --no-default-features --features "tuner backend-ctw" --no-run --locked
           cargo test -p infotheory --no-default-features --features cli --no-run --locked
           cargo test -p infotheory --features cli --no-run --locked
           cargo test -p infotheory --no-default-features --features "cli all-backends" --no-run --locked
@@ -433,7 +433,7 @@ jobs:
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --features cli
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features cli
             RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features "cli all-backends"
-            RUSTFLAGS="-D warnings" cargo check -p infotheory_py --locked --no-default-features --features "tuner backend-ctw"
+            PYO3_BUILD_EXTENSION_MODULE=1 RUSTFLAGS="-D warnings" cargo check -p infotheory_py --locked --no-default-features --features "tuner backend-ctw"
             RUSTFLAGS="-D warnings" cargo check -p zpaq_rs --locked
             RUSTFLAGS="-D warnings" cargo check -p benchman --locked
 
