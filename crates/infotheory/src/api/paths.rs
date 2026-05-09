@@ -27,6 +27,7 @@ fn try_read_path_pair(x: &str, y: &str) -> InfotheoryResult<(Vec<u8>, Vec<u8>)> 
 /// Options for backend-first path compression-size operations.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompressionPathBatchOptions {
+    /// Operation-level parallelism policy used while processing the path batch. (external parellization, doesn't affect compression algorithm itself)
     pub parallelism: OperationParallelism,
 }
 

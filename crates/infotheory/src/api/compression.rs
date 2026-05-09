@@ -28,6 +28,7 @@ impl Default for OperationParallelism {
 /// NCD compute options (operation-level parallelism only).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NcdComputeOptions {
+    /// Operation-level parallelism policy used while computing NCD values. (external parellization, doesn't affect compression algorithm itself)
     pub parallelism: OperationParallelism,
 }
 
