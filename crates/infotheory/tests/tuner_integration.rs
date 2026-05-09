@@ -1313,6 +1313,7 @@ fn canonical_tune_document_requires_assets_array() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn tune_cli_loads_binary_itsd_tune_document() {
     let dir = temp_dir("tune_itsd_cli");
@@ -1344,6 +1345,44 @@ fn tune_cli_loads_binary_itsd_tune_document() {
     let report = read_json(&report_path);
     assert_eq!(str_at(&report, "/kind"), "tune_report");
     assert!(bool_at(&report, "/output/output_written"));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(not(unix))]
+#[test]
+fn run_tune_reports_unix_only_runtime_contract_on_non_unix() {
+    let dir = temp_dir("non_unix_runtime_contract");
+    let dataset_path = dir.join("dataset.bin");
+    let spec_path = dir.join("spec.json");
+    let output_path = dir.join("output.json");
+    let report_path = dir.join("report.json");
+    write_passive_dataset(&dataset_path);
+    write_json(
+        &spec_path,
+        &tune_spec(
+            &dataset_path,
+            &output_path,
+            &report_path,
+            json!({
+                "kind": "annealed_hill_climbing",
+                "max_mutation_radius": 1,
+            }),
+            None,
+        ),
+    );
+    let args = [
+        "infotheory".to_string(),
+        "tune".to_string(),
+        path_string(&spec_path),
+        "--max-evaluations".to_string(),
+        "1".to_string(),
+    ];
+    let request = parse_tune_command_args(&args).expect("parse tune args");
+    let err = run_tune(&request).expect_err("non-unix should reject process-isolated runtime");
+    assert!(
+        err.contains("tuner requires a Unix target for process-isolated candidate evaluation"),
+        "{err}"
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1609,6 +1648,7 @@ fn tune_exec_config_rejects_unknown_fields_and_malformed_theorem() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn tune_executor_rejects_unsupported_certificate_uri_scheme() {
     let dir = temp_dir("unsupported_certificate_uri");
@@ -1646,6 +1686,7 @@ fn tune_executor_rejects_unsupported_certificate_uri_scheme() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn run_tune_records_log_controls() {
     let dir = temp_dir("executor_logging");
@@ -1715,6 +1756,7 @@ fn run_tune_records_log_controls() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn exact_family_controller_rejects_missing_exact_reward_certificate() {
     let dir = temp_dir("missing_exact_reward_certificate");
@@ -1750,6 +1792,7 @@ fn exact_family_controller_rejects_missing_exact_reward_certificate() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn exact_reward_certificate_rejects_unrepresentable_reachable_reward() {
     let dir = temp_dir("bad_exact_reward_certificate");
@@ -1800,6 +1843,7 @@ fn exact_reward_certificate_rejects_unrepresentable_reachable_reward() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn exact_controller_rejects_finite_reward_map_without_complete_interval() {
     let dir = temp_dir("incomplete_finite_reward_map");
@@ -1991,6 +2035,7 @@ fn deterministic_table_certificates_can_certify_theorem_claims_when_used() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn real_time_timing_certificate_sets_verified_timing_basis() {
     let dir = temp_dir("real_time_timing_certified");
@@ -2162,6 +2207,7 @@ fn deterministic_table_peak_memory_can_make_baseline_nondeployable() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn exact_state_observation_certificate_requires_injectivity_basis() {
     let dir = temp_dir("observation_injectivity_rejected");
@@ -2259,6 +2305,7 @@ fn exact_state_observation_certificate_requires_injectivity_basis() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn exact_state_observation_certificate_rejects_duplicate_state_ids() {
     let dir = temp_dir("observation_duplicate_state_id");
@@ -2356,6 +2403,7 @@ fn exact_state_observation_certificate_rejects_duplicate_state_ids() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn run_tune_reports_per_candidate_timeout() {
     let dir = temp_dir("candidate_timeout");
@@ -2690,6 +2738,7 @@ fn run_tune_terminates_on_unrecoverable_evaluator_failure() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn run_tune_reports_compiled_uniform_mh_kernel() {
     let dir = temp_dir("compiled_uniform_mh");
@@ -2741,6 +2790,7 @@ fn run_tune_reports_compiled_uniform_mh_kernel() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn run_tune_warmstart_self_improvement_reports_equal_split_deadlines() {
     let dir = temp_dir("warmstart_self_improvement_deadlines");
@@ -2831,6 +2881,7 @@ fn run_tune_warmstart_self_improvement_reports_equal_split_deadlines() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn warmstart_trace_refresh_merges_same_task_live_trace() {
     let dir = temp_dir("warmstart_trace_refresh");
@@ -2908,6 +2959,7 @@ fn warmstart_trace_refresh_merges_same_task_live_trace() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn warmstart_teacher_fingerprint_mismatch_is_rejected() {
     let dir = temp_dir("warmstart_teacher_mismatch");
@@ -2960,6 +3012,7 @@ fn warmstart_teacher_fingerprint_mismatch_is_rejected() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn warmstart_teacher_observation_adapter_mismatch_is_rejected() {
     let dir = temp_dir("warmstart_teacher_observation_mismatch");
@@ -3099,6 +3152,7 @@ fn warmstart_exact_jh_rejects_nonidentity_finite_reward_map() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn run_tune_planner_controller_timing_matrix_reports_dispatch_and_claim_gating() {
     let dir = temp_dir("controller_timing_matrix");
@@ -3239,6 +3293,7 @@ fn run_tune_planner_controller_timing_matrix_reports_dispatch_and_claim_gating()
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn run_tune_causal_dataset_modes_report_lowering_under_planner_execution() {
     let dir = temp_dir("causal_dataset_modes");
@@ -3341,6 +3396,7 @@ fn run_tune_causal_dataset_modes_report_lowering_under_planner_execution() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn planner_deployable_model_flag_reports_objective_target_and_diagnostics() {
     let dir = temp_dir("planner_deployable_report");

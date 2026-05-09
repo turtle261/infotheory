@@ -2393,7 +2393,7 @@ fn peak_rss_bytes_for_pid(pid: u32) -> Option<u64> {
     None
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn peak_memory_bytes_for_pid(_pid: u32, _mode: PeakMemoryMode) -> Option<u64> {
     None
 }

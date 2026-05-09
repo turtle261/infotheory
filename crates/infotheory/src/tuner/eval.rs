@@ -13,7 +13,9 @@ pub(super) enum ResolvedMemoryAccountingKind {
     DeterministicEvaluatorTable,
     #[cfg(target_os = "linux")]
     StrictLinuxCgroupV2PeakMaxProcessRss,
+    #[cfg(unix)]
     UnixProcessRssFallbackExplicit,
+    #[cfg(unix)]
     UnixProcessRssWithBackendReportedDiagnosticOnly,
 }
 
@@ -25,7 +27,9 @@ impl ResolvedMemoryAccountingKind {
             Self::StrictLinuxCgroupV2PeakMaxProcessRss => {
                 "strict_linux_max_process_rss_cgroup_v2_peak"
             }
+            #[cfg(unix)]
             Self::UnixProcessRssFallbackExplicit => "unix_process_rss_fallback_explicit",
+            #[cfg(unix)]
             Self::UnixProcessRssWithBackendReportedDiagnosticOnly => {
                 "unix_process_rss_backend_reported_diagnostic_only"
             }
@@ -37,11 +41,14 @@ impl ResolvedMemoryAccountingKind {
             Self::DeterministicEvaluatorTable => true,
             #[cfg(target_os = "linux")]
             Self::StrictLinuxCgroupV2PeakMaxProcessRss => true,
-            Self::UnixProcessRssFallbackExplicit
-            | Self::UnixProcessRssWithBackendReportedDiagnosticOnly => false,
+            #[cfg(unix)]
+            Self::UnixProcessRssFallbackExplicit => false,
+            #[cfg(unix)]
+            Self::UnixProcessRssWithBackendReportedDiagnosticOnly => false,
         }
     }
 
+    #[cfg(unix)]
     fn worker_rss_mode(self) -> PeakMemoryMode {
         match self {
             Self::DeterministicEvaluatorTable => PeakMemoryMode::ProcessRssPeak,
@@ -52,6 +59,7 @@ impl ResolvedMemoryAccountingKind {
         }
     }
 
+    #[cfg(unix)]
     fn requires_per_eval_cgroup(self) -> bool {
         match self {
             #[cfg(target_os = "linux")]
@@ -69,7 +77,9 @@ impl ResolvedMemoryAccountingKind {
             Self::StrictLinuxCgroupV2PeakMaxProcessRss => {
                 "diagnostic_only_combined_with_os_controller_peak"
             }
+            #[cfg(unix)]
             Self::UnixProcessRssFallbackExplicit => "none",
+            #[cfg(unix)]
             Self::UnixProcessRssWithBackendReportedDiagnosticOnly => {
                 "diagnostic_only_no_strict_os_controller_peak"
             }
@@ -151,6 +161,7 @@ pub(super) fn resolve_evaluator_runtime_profile(
     }
 }
 
+#[cfg(unix)]
 fn resolve_memory_accounting_kind(
     rss_mode: PeakMemoryMode,
 ) -> Result<ResolvedMemoryAccountingKind, String> {
@@ -731,7 +742,7 @@ impl Drop for EvaluatorWorkerTempPaths {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, target_os = "linux"))]
 fn resolve_required_tuner_eval_cgroup_parent(explicit: Option<&str>) -> Result<PathBuf, String> {
     let explicit_path = explicit.map(PathBuf::from);
     let env_path = std::env::var_os("INFOTHEORY_TUNER_EVAL_CGROUP_PARENT").map(PathBuf::from);
@@ -750,7 +761,7 @@ fn resolve_required_tuner_eval_cgroup_parent(explicit: Option<&str>) -> Result<P
     Ok(canonical)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn resolve_required_tuner_eval_cgroup_parent(explicit: Option<&str>) -> Result<PathBuf, String> {
     let _ = explicit;
     Err(
@@ -759,7 +770,7 @@ fn resolve_required_tuner_eval_cgroup_parent(explicit: Option<&str>) -> Result<P
     )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn reject_unix_fallback_cgroup_overrides(explicit: Option<&str>) -> Result<(), String> {
     if explicit.is_some() || std::env::var_os("INFOTHEORY_TUNER_EVAL_CGROUP_PARENT").is_some() {
         return Err("evaluator_cgroup_parent requires Linux cgroup v2".to_string());
@@ -767,7 +778,7 @@ fn reject_unix_fallback_cgroup_overrides(explicit: Option<&str>) -> Result<(), S
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, target_os = "linux"))]
 fn reject_unix_fallback_cgroup_overrides(explicit: Option<&str>) -> Result<(), String> {
     if explicit.is_some() || std::env::var_os("INFOTHEORY_TUNER_EVAL_CGROUP_PARENT").is_some() {
         return Err(
@@ -786,14 +797,6 @@ pub(super) fn resolve_tuner_eval_worker_executable(
     let executable = evaluator_worker_executable(explicit_path.as_deref())?;
     probe_evaluator_worker_executable(&executable)?;
     Ok(executable)
-}
-
-#[cfg(not(unix))]
-pub(super) fn resolve_tuner_eval_worker_executable(
-    explicit: Option<&str>,
-) -> Result<PathBuf, String> {
-    let _ = explicit;
-    Err("tuner requires a Unix target for process-isolated candidate evaluation".to_string())
 }
 
 #[cfg(unix)]
@@ -908,7 +911,7 @@ struct EvaluatorWorkerCgroup {
     path: PathBuf,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 struct EvaluatorWorkerCgroup;
 
 #[cfg(target_os = "linux")]
@@ -1076,7 +1079,7 @@ fn peak_memory_bytes_for_live_worker(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn peak_memory_bytes_for_live_worker(
     pid: u32,
     accounting: ResolvedMemoryAccountingKind,
@@ -1092,6 +1095,7 @@ fn peak_memory_bytes_for_live_worker(
     Ok(peak_memory_bytes_for_pid(pid, mode).unwrap_or(0))
 }
 
+#[cfg(unix)]
 fn apply_authoritative_worker_peak_memory(
     result: &mut CandidateEvalResult,
     model_bytes: usize,
@@ -1147,7 +1151,7 @@ fn apply_authoritative_worker_peak_memory_inner(
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn apply_authoritative_worker_peak_memory_inner(
     result: &mut CandidateEvalResult,
     _model_bytes: usize,
