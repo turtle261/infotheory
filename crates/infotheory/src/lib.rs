@@ -611,7 +611,7 @@ mod tests {
         let backend = CompressionBackend::zpaq(method)
             .compile()
             .expect("compile zpaq backend");
-        try_ncd_bytes_backend(x, y, &backend, variant).expect("ncd_bytes")
+        crate::api::try_ncd_bytes_backend(x, y, &backend, variant).expect("ncd_bytes")
     }
 
     fn entropy_rate_bytes(data: &[u8]) -> f64 {

@@ -259,8 +259,10 @@ jobs:
       - name: Test matrix
         env:
           RUSTDOCFLAGS: ${{ matrix.rustdocflags }}
-          ZPAQ_NOJIT: ${{ startsWith(matrix.target, 'aarch64-') && '1' || '' }}
         run: |
+          if [[ "${{ startsWith(matrix.target, 'aarch64-') }}" == "true" ]]; then
+            export ZPAQ_NOJIT=1
+          fi
           cargo test -p infotheory --release --locked
           cargo test -p infotheory --release --no-default-features --features all-backends --locked
           cargo test -p infotheory --release --no-default-features rate_backend_aliases_share_registry_resolution_and_feature_errors --locked
