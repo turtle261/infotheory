@@ -2378,7 +2378,7 @@ fn read_u64_from_file(path: &Path) -> Result<u64, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn peak_rss_bytes_for_pid(pid: libc::pid_t) -> Option<u64> {
+fn peak_rss_bytes_for_pid(pid: u32) -> Option<u64> {
     let path = format!("/proc/{pid}/status");
     let status = fs::read_to_string(path).ok()?;
     for line in status.lines() {
@@ -2394,7 +2394,7 @@ fn peak_rss_bytes_for_pid(pid: libc::pid_t) -> Option<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn peak_memory_bytes_for_pid(_pid: libc::pid_t, _mode: PeakMemoryMode) -> Option<u64> {
+fn peak_memory_bytes_for_pid(_pid: u32, _mode: PeakMemoryMode) -> Option<u64> {
     None
 }
 

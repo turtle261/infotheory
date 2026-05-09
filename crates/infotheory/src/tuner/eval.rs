@@ -354,7 +354,7 @@ fn evaluate_candidate_unix_isolated(
         }
         if started.elapsed() >= timeout {
             let peak_before_kill = peak_memory_bytes_for_live_worker(
-                child.id() as libc::pid_t,
+                child.id(),
                 runtime_profile.memory_accounting_kind,
                 evaluation_cgroup.as_ref(),
             );
@@ -1056,7 +1056,7 @@ fn probe_evaluator_cgroup_parent(parent: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn peak_memory_bytes_for_live_worker(
-    pid: libc::pid_t,
+    pid: u32,
     accounting: ResolvedMemoryAccountingKind,
     cgroup: Option<&EvaluatorWorkerCgroup>,
 ) -> Result<u64, String> {
@@ -1078,7 +1078,7 @@ fn peak_memory_bytes_for_live_worker(
 
 #[cfg(not(target_os = "linux"))]
 fn peak_memory_bytes_for_live_worker(
-    pid: libc::pid_t,
+    pid: u32,
     accounting: ResolvedMemoryAccountingKind,
     _cgroup: Option<&EvaluatorWorkerCgroup>,
 ) -> Result<u64, String> {

@@ -23,7 +23,7 @@ fn expected_zpaq_fixture_hashes() -> (&'static str, &'static str) {
     // bytestream as the x86_64 JIT-enabled builds we exercise elsewhere in CI.
     // Keep the roundtrip invariant universal, and pin the known stable output
     // for each platform/codegen mode we ship in CI.
-    #[cfg(all(windows, target_arch = "aarch64"))]
+    #[cfg(windows)]
     {
         (
             "cfa467b7e0d31d9762f8d469daa687b1e0a571896debc3cc42399bd574b43646",
@@ -31,7 +31,7 @@ fn expected_zpaq_fixture_hashes() -> (&'static str, &'static str) {
         )
     }
 
-    #[cfg(not(all(windows, target_arch = "aarch64")))]
+    #[cfg(not(windows))]
     {
         (
             "26ad22d35f5f014d7b99a403af46a0c2b172986352ffee21a03d1f7a39d67498",
