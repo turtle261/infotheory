@@ -259,6 +259,7 @@ jobs:
       - name: Test matrix
         env:
           RUSTDOCFLAGS: ${{ matrix.rustdocflags }}
+        shell: bash
         run: |
           if [[ "${{ startsWith(matrix.target, 'aarch64-') }}" == "true" ]]; then
             export ZPAQ_NOJIT=1

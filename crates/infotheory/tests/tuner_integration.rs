@@ -1459,8 +1459,14 @@ fn run_tune_strict_memory_mode_requires_delegated_cgroup_parent() {
     let request = parse_tune_command_args(&args).expect("parse tune args");
     let err = run_tune(&request)
         .expect_err("strict memory-accounting mode without cgroup parent must fail");
+    #[cfg(target_os = "linux")]
     assert!(
         err.contains("strict memory-accounting mode") && err.contains("delegated cgroup-v2 parent"),
+        "{err}"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        err.contains("strict memory-accounting mode") && err.contains("Linux"),
         "{err}"
     );
     let _ = fs::remove_dir_all(dir);
