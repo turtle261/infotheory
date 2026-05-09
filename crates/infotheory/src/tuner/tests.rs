@@ -17,6 +17,18 @@ use crate::tuner::eval::ResolvedMemoryAccountingKind;
 #[cfg(feature = "backend-ctw")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn strict_mode_test_accounting_kind() -> ResolvedMemoryAccountingKind {
+    #[cfg(target_os = "linux")]
+    {
+        ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Non-Linux targets cannot resolve strict cgroup-v2 accounting.
+        ResolvedMemoryAccountingKind::UnixProcessRssFallbackExplicit
+    }
+}
+
 #[cfg(feature = "backend-ctw")]
 fn temp_path(prefix: &str, suffix: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
@@ -550,8 +562,7 @@ fn tune_execution_config_reports_executor_profile_semantics() {
             resolved_evaluator_cgroup_parent: Some(std::path::PathBuf::from(
                 "/sys/fs/cgroup/infotheory-tuner",
             )),
-            memory_accounting_kind:
-                ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss,
+            memory_accounting_kind: strict_mode_test_accounting_kind(),
         },
     );
     assert_eq!(
@@ -934,15 +945,17 @@ fn executor_controls_report_reflects_requested_rss_mode() {
             worker_executable: Some(std::path::PathBuf::from("/tmp/worker")),
             worker_executable_identity: Some("crc32:11111111:bytes:1".to_string()),
             resolved_evaluator_cgroup_parent: Some(std::path::PathBuf::from("/sys/fs/cgroup/test")),
-            memory_accounting_kind:
-                ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss,
+            memory_accounting_kind: strict_mode_test_accounting_kind(),
         },
     );
     assert_eq!(report["rss_mode"]["requested"], "hybrid_strict_max");
     let effective = report["rss_mode"]["effective_measurement"]
         .as_str()
         .expect("effective measurement");
+    #[cfg(target_os = "linux")]
     assert_eq!(effective, "strict_linux_max_process_rss_cgroup_v2_peak");
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(effective, "unix_process_rss_fallback_explicit");
 }
 
 #[test]
