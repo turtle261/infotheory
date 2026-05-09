@@ -1,4 +1,3 @@
-use super::plan_macros::expect_plan_ref;
 use super::*;
 
 #[cfg(feature = "backend-rosa")]
