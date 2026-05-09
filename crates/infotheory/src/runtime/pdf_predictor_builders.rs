@@ -1,35 +1,12 @@
+use super::plan_macros::expect_plan_ref;
 use super::*;
-
-#[cfg(any(
-    feature = "backend-rosa",
-    feature = "backend-match",
-    feature = "backend-ppmd",
-    feature = "backend-sequitur",
-    feature = "backend-ctw",
-    feature = "backend-rwkv",
-    feature = "backend-mamba",
-    feature = "backend-zpaq",
-    feature = "backend-particle",
-    feature = "backend-calibrated"
-))]
-// Extracts `backend.plan()` into caller-provided bindings.
-// Example:
-// `expect_rate_plan!(backend, RateBackendPlan::Ctw { depth }, "...")`
-// binds `depth` in the caller's scope.
-macro_rules! expect_rate_plan {
-    ($backend:expr, $pattern:pat, $message:literal) => {
-        let $pattern = $backend.plan() else {
-            unreachable!($message)
-        };
-    };
-}
 
 #[cfg(feature = "backend-rosa")]
 pub(super) fn build_pdf_predictor_rosa(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::RosaPlus { max_order },
         "rosa kernel used with non-rosa plan"
     );
@@ -52,8 +29,8 @@ pub(super) fn build_pdf_predictor_rosa(
 pub(super) fn build_pdf_predictor_match(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::Match {
             hash_bits,
             min_len,
@@ -88,8 +65,8 @@ pub(super) fn build_pdf_predictor_match(
 pub(super) fn build_pdf_predictor_sparse_match(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::SparseMatch {
             hash_bits,
             min_len,
@@ -128,8 +105,8 @@ pub(super) fn build_pdf_predictor_sparse_match(
 pub(super) fn build_pdf_predictor_ppmd(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::Ppmd { order, memory_mb },
         "ppmd kernel used with non-ppmd plan"
     );
@@ -152,8 +129,8 @@ pub(super) fn build_pdf_predictor_ppmd(
 pub(super) fn build_pdf_predictor_sequitur(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::Sequitur { context_bytes },
         "sequitur kernel used with non-sequitur plan"
     );
@@ -176,8 +153,8 @@ pub(super) fn build_pdf_predictor_sequitur(
 pub(super) fn build_pdf_predictor_ctw(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::Ctw { depth },
         "ctw kernel used with non-ctw plan"
     );
@@ -200,8 +177,8 @@ pub(super) fn build_pdf_predictor_ctw(
 pub(super) fn build_pdf_predictor_fac_ctw(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::FacCtw {
             base_depth,
             num_percept_bits: _,
@@ -228,8 +205,8 @@ pub(super) fn build_pdf_predictor_fac_ctw(
 pub(super) fn build_pdf_predictor_mamba(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::Mamba { parsed_method, .. },
         "mamba kernel used with non-mamba plan"
     );
@@ -252,8 +229,8 @@ pub(super) fn build_pdf_predictor_mamba(
 pub(super) fn build_pdf_predictor_rwkv(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::Rwkv7 { parsed_method, .. },
         "rwkv kernel used with non-rwkv plan"
     );
@@ -276,8 +253,8 @@ pub(super) fn build_pdf_predictor_rwkv(
 pub(super) fn build_pdf_predictor_zpaq(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::Zpaq { method },
         "zpaq kernel used with non-zpaq plan"
     );
@@ -319,8 +296,8 @@ pub(super) fn build_pdf_predictor_mixture(
 pub(super) fn build_pdf_predictor_particle(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::Particle { spec },
         "particle kernel used with non-particle plan"
     );
@@ -343,8 +320,8 @@ pub(super) fn build_pdf_predictor_particle(
 pub(super) fn build_pdf_predictor_calibrated(
     backend: &CompiledRateBackend,
 ) -> anyhow::Result<crate::compression::RatePdfPredictor> {
-    expect_rate_plan!(
-        backend,
+    expect_plan_ref!(
+        backend.plan(),
         crate::spec::core::RateBackendPlan::Calibrated {
             context,
             bins,

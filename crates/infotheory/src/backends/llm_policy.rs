@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 /// Position expression used in policy schedules.
@@ -419,15 +419,38 @@ fn ambiguous_file_segment_token(method: &str) -> Option<&str> {
     None
 }
 
-/// Percent-encode reserved delimiter characters inside a method `file:` path.
-pub(crate) fn render_method_file_path(path: &Path) -> String {
-    let rendered = path.to_string_lossy();
-    let mut out = String::with_capacity(rendered.len());
-    for ch in rendered.chars() {
+fn push_rendered_path_piece(out: &mut String, piece: &str, normalize_separators: bool) {
+    for ch in piece.chars() {
         match ch {
+            '\\' if normalize_separators => out.push('/'),
             '%' => out.push_str("%25"),
             ';' => out.push_str("%3B"),
             _ => out.push(ch),
+        }
+    }
+}
+
+/// Render a canonical `file:` path using slash separators and delimiter-safe escapes.
+pub(crate) fn render_method_file_path(path: &Path) -> String {
+    let mut out = String::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                push_rendered_path_piece(
+                    &mut out,
+                    prefix.as_os_str().to_string_lossy().as_ref(),
+                    true,
+                );
+            }
+            Component::RootDir => out.push('/'),
+            Component::CurDir => push_rendered_path_piece(&mut out, ".", false),
+            Component::ParentDir => push_rendered_path_piece(&mut out, "..", false),
+            Component::Normal(piece) => {
+                if !out.is_empty() && !out.ends_with('/') {
+                    out.push('/');
+                }
+                push_rendered_path_piece(&mut out, piece.to_string_lossy().as_ref(), false);
+            }
         }
     }
     out
@@ -1002,6 +1025,14 @@ mod tests {
     fn method_file_path_preserves_unowned_percent_sequences() {
         let path = "/tmp/model%2Fv1.safetensors";
         assert_eq!(parse_method_file_path(path), Path::new(path));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn method_file_path_preserves_literal_backslashes_in_unix_components() {
+        let path = Path::new(r"weights\model;snap%done.safetensors");
+        let rendered = render_method_file_path(path);
+        assert_eq!(rendered, r"weights\model%3Bsnap%25done.safetensors");
     }
 
     #[test]

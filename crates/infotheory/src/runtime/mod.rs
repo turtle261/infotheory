@@ -3,6 +3,7 @@
 //! This module is the spec -> runtime boundary for predictor and compression
 //! execution paths.
 
+use self::plan_macros::expect_plan_ref;
 use crate::api::{CompressionBackend, RateBackend};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
@@ -36,6 +37,7 @@ use crate::spec::{CompiledCompressionBackend, CompiledRateBackend, SpecResult};
 use std::sync::Arc;
 
 mod pdf_predictor_builders;
+mod plan_macros;
 mod predictor_builders;
 mod registry;
 
@@ -674,102 +676,7 @@ define_compression_backend_catalog! {
 }
 
 pub(crate) fn default_rate_backend_spec(kind: RateBackendKind) -> Option<RateBackend> {
-    match kind {
-        RateBackendKind::RosaPlus => Some(RateBackend::RosaPlus { max_order: -1 }),
-        RateBackendKind::Match => Some(RateBackend::Match {
-            hash_bits: 18,
-            min_len: 4,
-            max_len: 96,
-            base_mix: 0.02,
-            confidence_scale: 1.0,
-        }),
-        RateBackendKind::SparseMatch => Some(RateBackend::SparseMatch {
-            hash_bits: 17,
-            min_len: 3,
-            max_len: 48,
-            gap_min: 1,
-            gap_max: 2,
-            base_mix: 0.05,
-            confidence_scale: 1.0,
-        }),
-        RateBackendKind::Ppmd => Some(RateBackend::Ppmd {
-            order: 6,
-            memory_mb: 16,
-        }),
-        RateBackendKind::Sequitur => Some(RateBackend::Sequitur { context_bytes: 32 }),
-        RateBackendKind::Ctw => Some(RateBackend::Ctw { depth: 8 }),
-        RateBackendKind::FacCtw => Some(RateBackend::FacCtw {
-            base_depth: 8,
-            num_percept_bits: 8,
-            encoding_bits: 8,
-        }),
-        RateBackendKind::Zpaq => Some(RateBackend::Zpaq {
-            method: crate::api::ZpaqMethodSpec::literal("2"),
-        }),
-        RateBackendKind::Particle => Some(RateBackend::Particle {
-            spec: Arc::new(crate::api::ParticleSpec::default()),
-        }),
-        RateBackendKind::Mixture | RateBackendKind::Calibrated => None,
-        #[cfg(feature = "backend-mamba")]
-        RateBackendKind::Mamba => Some(RateBackend::MambaMethod {
-            method: crate::mambazip::MethodSpec::Online {
-                cfg: crate::mambazip::OnlineConfig {
-                    hidden: 64,
-                    layers: 1,
-                    intermediate: 96,
-                    state: 16,
-                    conv: 4,
-                    dt_rank: 16,
-                    seed: 26,
-                    train_mode: crate::mambazip::OnlineTrainMode::None,
-                    lr: 0.0,
-                    stride: 1,
-                },
-                policy: Some(crate::backends::llm_policy::LlmPolicy {
-                    load_from: None,
-                    schedule: vec![crate::backends::llm_policy::ScheduleRule::Interval(
-                        crate::backends::llm_policy::PolicyRule {
-                            start: crate::backends::llm_policy::PositionExpr::Bytes(0),
-                            end: crate::backends::llm_policy::PositionExpr::Bytes(100),
-                            action: crate::backends::llm_policy::PolicyAction::Infer,
-                        },
-                    )],
-                }),
-            },
-        }),
-        #[cfg(not(feature = "backend-mamba"))]
-        RateBackendKind::Mamba => None,
-        #[cfg(feature = "backend-rwkv")]
-        RateBackendKind::Rwkv7 => Some(RateBackend::Rwkv7Method {
-            method: crate::rwkvzip::MethodSpec::Online {
-                cfg: crate::rwkvzip::OnlineConfig {
-                    hidden: 64,
-                    layers: 1,
-                    intermediate: 64,
-                    decay_rank: 32,
-                    a_rank: 32,
-                    v_rank: 32,
-                    g_rank: 64,
-                    seed: 0,
-                    train_mode: crate::rwkvzip::OnlineTrainMode::Sgd,
-                    lr: 0.01,
-                    stride: 1,
-                },
-                policy: Some(crate::backends::llm_policy::LlmPolicy {
-                    load_from: None,
-                    schedule: vec![crate::backends::llm_policy::ScheduleRule::Interval(
-                        crate::backends::llm_policy::PolicyRule {
-                            start: crate::backends::llm_policy::PositionExpr::Bytes(0),
-                            end: crate::backends::llm_policy::PositionExpr::Bytes(100),
-                            action: crate::backends::llm_policy::PolicyAction::Infer,
-                        },
-                    )],
-                }),
-            },
-        }),
-        #[cfg(not(feature = "backend-rwkv"))]
-        RateBackendKind::Rwkv7 => None,
-    }
+    crate::rate_defaults::runtime_default_rate_backend_spec(kind)
 }
 
 pub(crate) fn first_enabled_default_rate_backend_spec() -> Option<RateBackend> {
@@ -915,14 +822,15 @@ fn with_rwkv_backend_plan<T>(
     backend: &CompiledRateBackend,
     f: impl FnOnce(&str, &crate::rwkvzip::MethodSpec) -> InfotheoryResult<T>,
 ) -> InfotheoryResult<T> {
-    let crate::spec::core::RateBackendPlan::Rwkv7 {
-        method,
-        parsed_method,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("rwkv kernel used with non-rwkv plan")
-    };
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::RateBackendPlan::Rwkv7 {
+            method,
+            parsed_method,
+            ..
+        },
+        "rwkv kernel used with non-rwkv plan"
+    );
     f(method, parsed_method)
 }
 
@@ -932,14 +840,15 @@ fn with_mamba_backend_plan<T>(
     backend: &CompiledRateBackend,
     f: impl FnOnce(&str, &crate::mambazip::MethodSpec) -> InfotheoryResult<T>,
 ) -> InfotheoryResult<T> {
-    let crate::spec::core::RateBackendPlan::Mamba {
-        method,
-        parsed_method,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("mamba kernel used with non-mamba plan")
-    };
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::RateBackendPlan::Mamba {
+            method,
+            parsed_method,
+            ..
+        },
+        "mamba kernel used with non-mamba plan"
+    );
     f(method, parsed_method)
 }
 
@@ -949,9 +858,11 @@ fn with_zpaq_backend_plan<T>(
     backend: &CompiledRateBackend,
     f: impl FnOnce(&str) -> InfotheoryResult<T>,
 ) -> InfotheoryResult<T> {
-    let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
-        unreachable!("zpaq kernel used with non-zpaq plan")
-    };
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::RateBackendPlan::Zpaq { method },
+        "zpaq kernel used with non-zpaq plan"
+    );
     f(method)
 }
 
@@ -961,9 +872,11 @@ fn with_particle_backend_plan<T>(
     backend: &CompiledRateBackend,
     f: impl FnOnce(&crate::api::ParticleSpec) -> InfotheoryResult<T>,
 ) -> InfotheoryResult<T> {
-    let crate::spec::core::RateBackendPlan::Particle { spec } = backend.plan() else {
-        unreachable!("particle kernel used with non-particle plan")
-    };
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::RateBackendPlan::Particle { spec },
+        "particle kernel used with non-particle plan"
+    );
     f(spec)
 }
 
@@ -973,9 +886,11 @@ fn with_ctw_backend_plan<T>(
     backend: &CompiledRateBackend,
     f: impl FnOnce(usize) -> InfotheoryResult<T>,
 ) -> InfotheoryResult<T> {
-    let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
-        unreachable!("ctw kernel used with non-ctw plan")
-    };
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::RateBackendPlan::Ctw { depth },
+        "ctw kernel used with non-ctw plan"
+    );
     f(*depth)
 }
 
@@ -985,14 +900,15 @@ fn with_fac_ctw_backend_plan<T>(
     backend: &CompiledRateBackend,
     f: impl FnOnce(usize, usize) -> InfotheoryResult<T>,
 ) -> InfotheoryResult<T> {
-    let crate::spec::core::RateBackendPlan::FacCtw {
-        base_depth,
-        num_percept_bits: _,
-        encoding_bits,
-    } = backend.plan()
-    else {
-        unreachable!("fac-ctw kernel used with non-fac-ctw plan")
-    };
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::RateBackendPlan::FacCtw {
+            base_depth,
+            num_percept_bits: _,
+            encoding_bits,
+        },
+        "fac-ctw kernel used with non-fac-ctw plan"
+    );
     f(*base_depth, *encoding_bits)
 }
 
@@ -1001,9 +917,11 @@ fn with_zpaq_compression_plan<T>(
     backend: &CompiledCompressionBackend,
     f: impl FnOnce(&str, usize) -> Result<T, String>,
 ) -> Result<T, String> {
-    let crate::spec::core::CompressionBackendPlan::Zpaq { method, threads } = backend.plan() else {
-        unreachable!("zpaq compression kernel used with non-zpaq plan")
-    };
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::CompressionBackendPlan::Zpaq { method, threads },
+        "zpaq compression kernel used with non-zpaq plan"
+    );
     f(method, *threads)
 }
 
@@ -1016,14 +934,15 @@ fn with_rate_compression_plan<T>(
         crate::compression::FramingMode,
     ) -> Result<T, String>,
 ) -> Result<T, String> {
-    let crate::spec::core::CompressionBackendPlan::Rate {
-        rate_backend,
-        coder,
-        framing,
-    } = backend.plan()
-    else {
-        unreachable!("rate compression kernel used with non-rate compression plan")
-    };
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::CompressionBackendPlan::Rate {
+            rate_backend,
+            coder,
+            framing,
+        },
+        "rate compression kernel used with non-rate compression plan"
+    );
     f(rate_backend, *coder, *framing)
 }
 
@@ -1033,15 +952,16 @@ fn with_rwkv_compression_plan<T>(
     backend: &CompiledCompressionBackend,
     f: impl FnOnce(&str, &crate::rwkvzip::MethodSpec, crate::coders::CoderType) -> Result<T, String>,
 ) -> Result<T, String> {
-    let crate::spec::core::CompressionBackendPlan::Rwkv7 {
-        method,
-        parsed_method,
-        coder,
-        ..
-    } = backend.plan()
-    else {
-        unreachable!("rwkv compression kernel used with non-rwkv compression plan")
-    };
+    expect_plan_ref!(
+        backend.plan(),
+        crate::spec::core::CompressionBackendPlan::Rwkv7 {
+            method,
+            parsed_method,
+            coder,
+            ..
+        },
+        "rwkv compression kernel used with non-rwkv compression plan"
+    );
     f(method, parsed_method, *coder)
 }
 

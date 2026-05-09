@@ -134,14 +134,15 @@ impl Default for RateBackendShorthandOptions {
     fn default() -> Self {
         Self {
             base_dir: PathBuf::from("."),
-            ctw_depth: 16,
-            fac_ctw_base_depth: 16,
-            fac_ctw_num_percept_bits: 8,
-            fac_ctw_encoding_bits: 8,
-            ppmd_order: 10,
-            ppmd_memory_mb: 64,
-            sequitur_context_bytes: 64,
-            zpaq_method: "2".to_string(),
+            ctw_depth: crate::rate_defaults::SHORTHAND_DEFAULT_CTW_DEPTH,
+            fac_ctw_base_depth: crate::rate_defaults::SHORTHAND_DEFAULT_FAC_CTW_BASE_DEPTH,
+            fac_ctw_num_percept_bits:
+                crate::rate_defaults::SHORTHAND_DEFAULT_FAC_CTW_NUM_PERCEPT_BITS,
+            fac_ctw_encoding_bits: crate::rate_defaults::SHORTHAND_DEFAULT_FAC_CTW_ENCODING_BITS,
+            ppmd_order: crate::rate_defaults::SHORTHAND_DEFAULT_PPMD_ORDER,
+            ppmd_memory_mb: crate::rate_defaults::SHORTHAND_DEFAULT_PPMD_MEMORY_MB,
+            sequitur_context_bytes: crate::rate_defaults::SHORTHAND_DEFAULT_SEQUITUR_CONTEXT_BYTES,
+            zpaq_method: crate::rate_defaults::SHORTHAND_DEFAULT_ZPAQ_RATE_METHOD.to_string(),
             default_mamba_model_path: None,
             default_rwkv_model_path: None,
             particle_default_if_missing_method: true,
@@ -918,28 +919,29 @@ pub fn calibrated_spec_to_json_value(spec: &CalibratedSpec) -> SpecResult<serde_
     }))
 }
 
-/// Serialize a `RateBackend` into the canonical JSON representation.
-pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_json::Value> {
-    let canonical = backend.descriptor().map_err(SpecError::new)?.canonical;
+fn rate_backend_to_json_leaf_value(
+    canonical: &str,
+    backend: &RateBackend,
+) -> Option<SpecResult<serde_json::Value>> {
     match backend {
-        RateBackend::RosaPlus { max_order } => Ok(serde_json::json!({
+        RateBackend::RosaPlus { max_order } => Some(Ok(serde_json::json!({
             "kind": canonical,
             "max_order": max_order,
-        })),
+        }))),
         RateBackend::Match {
             hash_bits,
             min_len,
             max_len,
             base_mix,
             confidence_scale,
-        } => Ok(serde_json::json!({
+        } => Some(Ok(serde_json::json!({
             "kind": canonical,
             "hash_bits": hash_bits,
             "min_len": min_len,
             "max_len": max_len,
             "base_mix": base_mix,
             "confidence_scale": confidence_scale,
-        })),
+        }))),
         RateBackend::SparseMatch {
             hash_bits,
             min_len,
@@ -948,7 +950,7 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
             gap_max,
             base_mix,
             confidence_scale,
-        } => Ok(serde_json::json!({
+        } => Some(Ok(serde_json::json!({
             "kind": canonical,
             "hash_bits": hash_bits,
             "min_len": min_len,
@@ -957,16 +959,45 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
             "gap_max": gap_max,
             "base_mix": base_mix,
             "confidence_scale": confidence_scale,
-        })),
-        RateBackend::Ppmd { order, memory_mb } => Ok(serde_json::json!({
+        }))),
+        RateBackend::Ppmd { order, memory_mb } => Some(Ok(serde_json::json!({
             "kind": canonical,
             "order": order,
             "memory_mb": memory_mb,
-        })),
-        RateBackend::Sequitur { context_bytes } => Ok(serde_json::json!({
+        }))),
+        RateBackend::Sequitur { context_bytes } => Some(Ok(serde_json::json!({
             "kind": canonical,
             "context_bytes": context_bytes,
-        })),
+        }))),
+        RateBackend::Zpaq { method } => Some(Ok(serde_json::json!({
+            "kind": canonical,
+            "method": zpaq_method_to_json_value(method),
+        }))),
+        RateBackend::Ctw { depth } => Some(Ok(serde_json::json!({
+            "kind": canonical,
+            "depth": depth,
+        }))),
+        RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits,
+            encoding_bits,
+        } => Some(Ok(serde_json::json!({
+            "kind": canonical,
+            "base_depth": base_depth,
+            "num_percept_bits": num_percept_bits,
+            "encoding_bits": encoding_bits,
+        }))),
+        _ => None,
+    }
+}
+
+/// Serialize a `RateBackend` into the canonical JSON representation.
+pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_json::Value> {
+    let canonical = backend.descriptor().map_err(SpecError::new)?.canonical;
+    if let Some(value) = rate_backend_to_json_leaf_value(canonical, backend) {
+        return value;
+    }
+    match backend {
         #[cfg(feature = "backend-mamba")]
         RateBackend::MambaMethod { method } => Ok(serde_json::json!({
             "kind": canonical,
@@ -976,10 +1007,6 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
         RateBackend::Rwkv7Method { method } => Ok(serde_json::json!({
             "kind": canonical,
             "method": rwkv_method_to_json_value(method)?,
-        })),
-        RateBackend::Zpaq { method } => Ok(serde_json::json!({
-            "kind": canonical,
-            "method": zpaq_method_to_json_value(method),
         })),
         RateBackend::Mixture { spec } => Ok(serde_json::json!({
             "kind": canonical,
@@ -993,20 +1020,9 @@ pub fn rate_backend_to_json_value(backend: &RateBackend) -> SpecResult<serde_jso
             "kind": canonical,
             "spec": calibrated_spec_to_json_value(spec.as_ref())?,
         })),
-        RateBackend::Ctw { depth } => Ok(serde_json::json!({
-            "kind": canonical,
-            "depth": depth,
-        })),
-        RateBackend::FacCtw {
-            base_depth,
-            num_percept_bits,
-            encoding_bits,
-        } => Ok(serde_json::json!({
-            "kind": canonical,
-            "base_depth": base_depth,
-            "num_percept_bits": num_percept_bits,
-            "encoding_bits": encoding_bits,
-        })),
+        _ => Err(SpecError::new(
+            "internal backend serialization mismatch for current feature set",
+        )),
     }
 }
 
@@ -1136,58 +1152,11 @@ pub fn parse_rate_backend_json(
         .as_str()
         .ok_or_else(|| SpecError::new("backend spec missing 'kind'"))?;
     let kind = resolve_enabled_rate_backend_kind(raw_kind)?;
+    if let Some(backend) = parse_rate_backend_json_leaf(kind, v)? {
+        return Ok(backend);
+    }
 
     match kind {
-        crate::runtime::RateBackendKind::RosaPlus => Ok(RateBackend::RosaPlus {
-            max_order: v["max_order"]
-                .as_i64()
-                .or_else(|| v["order"].as_i64())
-                .unwrap_or(-1),
-        }),
-        crate::runtime::RateBackendKind::Ctw => Ok(RateBackend::Ctw {
-            depth: v["depth"].as_u64().unwrap_or(16) as usize,
-        }),
-        crate::runtime::RateBackendKind::FacCtw => {
-            let base_depth = v["base_depth"].as_u64().unwrap_or(16) as usize;
-            let encoding_bits = v["encoding_bits"].as_u64().unwrap_or(8) as usize;
-            let num_percept_bits = v["num_percept_bits"]
-                .as_u64()
-                .unwrap_or(encoding_bits as u64) as usize;
-            Ok(RateBackend::FacCtw {
-                base_depth,
-                num_percept_bits,
-                encoding_bits,
-            })
-        }
-        crate::runtime::RateBackendKind::Match => Ok(RateBackend::Match {
-            hash_bits: v["hash_bits"].as_u64().unwrap_or(20) as usize,
-            min_len: v["min_len"].as_u64().unwrap_or(4) as usize,
-            max_len: v["max_len"].as_u64().unwrap_or(255) as usize,
-            base_mix: v["base_mix"].as_f64().unwrap_or(0.02),
-            confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
-        }),
-        crate::runtime::RateBackendKind::SparseMatch => Ok(RateBackend::SparseMatch {
-            hash_bits: v["hash_bits"].as_u64().unwrap_or(19) as usize,
-            min_len: v["min_len"].as_u64().unwrap_or(3) as usize,
-            max_len: v["max_len"].as_u64().unwrap_or(64) as usize,
-            gap_min: v["gap_min"].as_u64().unwrap_or(1) as usize,
-            gap_max: v["gap_max"].as_u64().unwrap_or(2) as usize,
-            base_mix: v["base_mix"].as_f64().unwrap_or(0.05),
-            confidence_scale: v["confidence_scale"].as_f64().unwrap_or(1.0),
-        }),
-        crate::runtime::RateBackendKind::Ppmd => Ok(RateBackend::Ppmd {
-            order: v["order"].as_u64().unwrap_or(10) as usize,
-            memory_mb: v["memory_mb"].as_u64().unwrap_or(64) as usize,
-        }),
-        crate::runtime::RateBackendKind::Sequitur => Ok(RateBackend::Sequitur {
-            context_bytes: v["context_bytes"].as_u64().unwrap_or(64) as usize,
-        }),
-        crate::runtime::RateBackendKind::Zpaq => {
-            let method = parse_zpaq_method_json_value(&v["method"], "2")?;
-            validate_zpaq_rate_method(method.value())
-                .map_err(|err| SpecError::new(err.to_string()))?;
-            Ok(RateBackend::Zpaq { method })
-        }
         crate::runtime::RateBackendKind::Mamba => {
             #[cfg(feature = "backend-mamba")]
             {
@@ -1271,7 +1240,123 @@ pub fn parse_rate_backend_json(
                 spec: Arc::new(spec),
             })
         }
+        _ => Err(SpecError::new(
+            "internal backend parse mismatch for current feature set",
+        )),
     }
+}
+
+fn parse_rate_backend_json_leaf(
+    kind: crate::runtime::RateBackendKind,
+    v: &serde_json::Value,
+) -> SpecResult<Option<RateBackend>> {
+    let backend = match kind {
+        crate::runtime::RateBackendKind::RosaPlus => RateBackend::RosaPlus {
+            max_order: v["max_order"]
+                .as_i64()
+                .or_else(|| v["order"].as_i64())
+                .unwrap_or(-1),
+        },
+        crate::runtime::RateBackendKind::Ctw => RateBackend::Ctw {
+            depth: v["depth"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_CTW_DEPTH as u64)
+                as usize,
+        },
+        crate::runtime::RateBackendKind::FacCtw => {
+            let base_depth = v["base_depth"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_FAC_CTW_BASE_DEPTH as u64)
+                as usize;
+            let encoding_bits = v["encoding_bits"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_FAC_CTW_ENCODING_BITS as u64)
+                as usize;
+            let num_percept_bits = v["num_percept_bits"]
+                .as_u64()
+                .unwrap_or(encoding_bits as u64) as usize;
+            RateBackend::FacCtw {
+                base_depth,
+                num_percept_bits,
+                encoding_bits,
+            }
+        }
+        crate::runtime::RateBackendKind::Match => RateBackend::Match {
+            hash_bits: v["hash_bits"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_MATCH_HASH_BITS as u64)
+                as usize,
+            min_len: v["min_len"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_MATCH_MIN_LEN as u64)
+                as usize,
+            max_len: v["max_len"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_MATCH_MAX_LEN as u64)
+                as usize,
+            base_mix: v["base_mix"]
+                .as_f64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_MATCH_BASE_MIX),
+            confidence_scale: v["confidence_scale"]
+                .as_f64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_MATCH_CONFIDENCE_SCALE),
+        },
+        crate::runtime::RateBackendKind::SparseMatch => RateBackend::SparseMatch {
+            hash_bits: v["hash_bits"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_HASH_BITS as u64)
+                as usize,
+            min_len: v["min_len"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_MIN_LEN as u64)
+                as usize,
+            max_len: v["max_len"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_MAX_LEN as u64)
+                as usize,
+            gap_min: v["gap_min"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_GAP_MIN as u64)
+                as usize,
+            gap_max: v["gap_max"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_GAP_MAX as u64)
+                as usize,
+            base_mix: v["base_mix"]
+                .as_f64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_BASE_MIX),
+            confidence_scale: v["confidence_scale"]
+                .as_f64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_CONFIDENCE_SCALE),
+        },
+        crate::runtime::RateBackendKind::Ppmd => RateBackend::Ppmd {
+            order: v["order"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_PPMD_ORDER as u64)
+                as usize,
+            memory_mb: v["memory_mb"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_PPMD_MEMORY_MB as u64)
+                as usize,
+        },
+        crate::runtime::RateBackendKind::Sequitur => RateBackend::Sequitur {
+            context_bytes: v["context_bytes"]
+                .as_u64()
+                .unwrap_or(crate::rate_defaults::JSON_DEFAULT_SEQUITUR_CONTEXT_BYTES as u64)
+                as usize,
+        },
+        crate::runtime::RateBackendKind::Zpaq => {
+            let method = parse_zpaq_method_json_value(
+                &v["method"],
+                crate::rate_defaults::JSON_DEFAULT_ZPAQ_RATE_METHOD,
+            )?;
+            validate_zpaq_rate_method(method.value())
+                .map_err(|err| SpecError::new(err.to_string()))?;
+            RateBackend::Zpaq { method }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(backend))
 }
 
 /// Parse a canonical compression-backend JSON object.
@@ -1592,64 +1677,11 @@ pub fn parse_rate_backend_name_method(
 ) -> SpecResult<RateBackend> {
     let kind = resolve_enabled_rate_backend_kind(name)?;
     let method = method.filter(|value| !value.is_empty());
+    if let Some(backend) = parse_rate_backend_name_method_leaf(kind, method, options)? {
+        return Ok(backend);
+    }
 
     match kind {
-        crate::runtime::RateBackendKind::RosaPlus => Ok(RateBackend::RosaPlus {
-            max_order: method
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(-1),
-        }),
-        crate::runtime::RateBackendKind::Match => Ok(RateBackend::Match {
-            hash_bits: 20,
-            min_len: 4,
-            max_len: 255,
-            base_mix: 0.02,
-            confidence_scale: 1.0,
-        }),
-        crate::runtime::RateBackendKind::SparseMatch => Ok(RateBackend::SparseMatch {
-            hash_bits: 19,
-            min_len: 3,
-            max_len: 64,
-            gap_min: 1,
-            gap_max: 2,
-            base_mix: 0.05,
-            confidence_scale: 1.0,
-        }),
-        crate::runtime::RateBackendKind::Ppmd => Ok(RateBackend::Ppmd {
-            order: method
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(options.ppmd_order),
-            memory_mb: options.ppmd_memory_mb,
-        }),
-        crate::runtime::RateBackendKind::Sequitur => Ok(RateBackend::Sequitur {
-            context_bytes: method
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(options.sequitur_context_bytes),
-        }),
-        crate::runtime::RateBackendKind::Ctw => Ok(RateBackend::Ctw {
-            depth: method
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(options.ctw_depth),
-        }),
-        crate::runtime::RateBackendKind::FacCtw => {
-            let base_depth = method
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(options.fac_ctw_base_depth);
-            Ok(RateBackend::FacCtw {
-                base_depth,
-                num_percept_bits: options.fac_ctw_num_percept_bits,
-                encoding_bits: options.fac_ctw_encoding_bits,
-            })
-        }
-        crate::runtime::RateBackendKind::Zpaq => {
-            let method = method
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| options.zpaq_method.clone());
-            validate_zpaq_rate_method(&method).map_err(|err| SpecError::new(err.to_string()))?;
-            Ok(RateBackend::Zpaq {
-                method: crate::api::ZpaqMethodSpec::literal(method),
-            })
-        }
         crate::runtime::RateBackendKind::Mamba => {
             #[cfg(feature = "backend-mamba")]
             {
@@ -1729,7 +1761,77 @@ pub fn parse_rate_backend_name_method(
                 spec: Arc::new(load_calibrated_spec(full.to_string_lossy().as_ref())?),
             })
         }
+        _ => Err(SpecError::new(
+            "internal backend shorthand parse mismatch for current feature set",
+        )),
     }
+}
+
+fn parse_rate_backend_name_method_leaf(
+    kind: crate::runtime::RateBackendKind,
+    method: Option<&str>,
+    options: &RateBackendShorthandOptions,
+) -> SpecResult<Option<RateBackend>> {
+    let backend = match kind {
+        crate::runtime::RateBackendKind::RosaPlus => RateBackend::RosaPlus {
+            max_order: method
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(-1),
+        },
+        crate::runtime::RateBackendKind::Match => RateBackend::Match {
+            hash_bits: crate::rate_defaults::JSON_DEFAULT_MATCH_HASH_BITS,
+            min_len: crate::rate_defaults::JSON_DEFAULT_MATCH_MIN_LEN,
+            max_len: crate::rate_defaults::JSON_DEFAULT_MATCH_MAX_LEN,
+            base_mix: crate::rate_defaults::JSON_DEFAULT_MATCH_BASE_MIX,
+            confidence_scale: crate::rate_defaults::JSON_DEFAULT_MATCH_CONFIDENCE_SCALE,
+        },
+        crate::runtime::RateBackendKind::SparseMatch => RateBackend::SparseMatch {
+            hash_bits: crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_HASH_BITS,
+            min_len: crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_MIN_LEN,
+            max_len: crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_MAX_LEN,
+            gap_min: crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_GAP_MIN,
+            gap_max: crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_GAP_MAX,
+            base_mix: crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_BASE_MIX,
+            confidence_scale: crate::rate_defaults::JSON_DEFAULT_SPARSE_MATCH_CONFIDENCE_SCALE,
+        },
+        crate::runtime::RateBackendKind::Ppmd => RateBackend::Ppmd {
+            order: method
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(options.ppmd_order),
+            memory_mb: options.ppmd_memory_mb,
+        },
+        crate::runtime::RateBackendKind::Sequitur => RateBackend::Sequitur {
+            context_bytes: method
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(options.sequitur_context_bytes),
+        },
+        crate::runtime::RateBackendKind::Ctw => RateBackend::Ctw {
+            depth: method
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(options.ctw_depth),
+        },
+        crate::runtime::RateBackendKind::FacCtw => {
+            let base_depth = method
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(options.fac_ctw_base_depth);
+            RateBackend::FacCtw {
+                base_depth,
+                num_percept_bits: options.fac_ctw_num_percept_bits,
+                encoding_bits: options.fac_ctw_encoding_bits,
+            }
+        }
+        crate::runtime::RateBackendKind::Zpaq => {
+            let method = method
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| options.zpaq_method.clone());
+            validate_zpaq_rate_method(&method).map_err(|err| SpecError::new(err.to_string()))?;
+            RateBackend::Zpaq {
+                method: crate::api::ZpaqMethodSpec::literal(method),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(backend))
 }
 
 /// Parse and compile a shorthand CLI/Python-style rate backend.
@@ -2328,6 +2430,20 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "backend-rwkv", windows))]
+    #[test]
+    fn normalize_rwkv_method_for_base_dir_renders_forward_slashes_on_windows() {
+        let base_dir = Path::new(r"C:\tmp\spec-base");
+        let method = "file:weights/model%3Bv1%25done.safetensors";
+        let normalized = canonicalize_explicit_file_method(base_dir, method, "rwkv")
+            .expect("canonicalize rwkv method")
+            .expect("file method");
+        assert_eq!(
+            normalized,
+            "file:C:/tmp/spec-base/weights/model%3Bv1%25done.safetensors"
+        );
+    }
+
     #[cfg(feature = "backend-rwkv")]
     #[test]
     fn normalize_rwkv_method_for_base_dir_rejects_ambiguous_file_suffixes() {
@@ -2796,6 +2912,66 @@ mod tests {
                 .contains("looks like a mixture spec (found 'experts')"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn fac_ctw_default_projections_remain_explicit_and_consistent() {
+        let shorthand = RateBackendShorthandOptions::default();
+        assert_eq!(
+            shorthand.fac_ctw_num_percept_bits,
+            crate::rate_defaults::FAC_CTW_DEFAULT_NUM_PERCEPT_BITS
+        );
+        assert_eq!(
+            shorthand.fac_ctw_encoding_bits,
+            crate::rate_defaults::JSON_DEFAULT_FAC_CTW_ENCODING_BITS
+        );
+
+        let parsed = parse_rate_backend_json(
+            &serde_json::json!({"kind":"fac-ctw"}),
+            Path::new("."),
+            MAX_MIXTURE_NESTING,
+        )
+        .expect("fac-ctw json parse");
+        match parsed {
+            RateBackend::FacCtw {
+                base_depth,
+                num_percept_bits,
+                encoding_bits,
+            } => {
+                assert_eq!(
+                    base_depth,
+                    crate::rate_defaults::JSON_DEFAULT_FAC_CTW_BASE_DEPTH
+                );
+                assert_eq!(
+                    encoding_bits,
+                    crate::rate_defaults::JSON_DEFAULT_FAC_CTW_ENCODING_BITS
+                );
+                assert_eq!(num_percept_bits, encoding_bits);
+            }
+            _ => panic!("expected fac-ctw backend"),
+        }
+
+        let runtime_default =
+            crate::runtime::default_rate_backend_spec(crate::runtime::RateBackendKind::FacCtw)
+                .expect("runtime fac-ctw default");
+        match runtime_default {
+            RateBackend::FacCtw {
+                base_depth,
+                num_percept_bits,
+                encoding_bits,
+            } => {
+                assert_eq!(base_depth, 8);
+                assert_eq!(
+                    encoding_bits,
+                    crate::rate_defaults::JSON_DEFAULT_FAC_CTW_ENCODING_BITS
+                );
+                assert_eq!(
+                    num_percept_bits,
+                    crate::rate_defaults::FAC_CTW_DEFAULT_NUM_PERCEPT_BITS
+                );
+            }
+            _ => panic!("expected runtime fac-ctw default backend"),
+        }
     }
 
     #[cfg(feature = "all-backends")]

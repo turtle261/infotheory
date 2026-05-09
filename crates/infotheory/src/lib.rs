@@ -143,6 +143,7 @@ pub mod error;
 /// Online Bayesian/switching/MDL mixture predictors.
 pub mod mixture;
 pub(crate) mod neural_mix;
+pub(crate) mod rate_defaults;
 /// Shared spec -> runtime builders and backend registry metadata.
 pub(crate) mod runtime;
 /// Information-theoretic code search pipeline (3-stage: prefilter, filter, KMI rerank).
