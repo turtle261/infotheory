@@ -18,6 +18,28 @@ fn sha256_hex(data: &[u8]) -> String {
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn expected_zpaq_fixture_hashes() -> (&'static str, &'static str) {
+    // libzpaq's NOJIT Windows path does not promise the same compressed
+    // bytestream as the x86_64 JIT-enabled builds we exercise elsewhere in CI.
+    // Keep the roundtrip invariant universal, and pin the known stable output
+    // for each platform/codegen mode we ship in CI.
+    #[cfg(all(windows, target_arch = "aarch64"))]
+    {
+        (
+            "cfa467b7e0d31d9762f8d469daa687b1e0a571896debc3cc42399bd574b43646",
+            "c816dea6bf09dc6bad4d7c1fc7bc52658ae89ca3fec1bbf238de71bf7a39e3f0",
+        )
+    }
+
+    #[cfg(not(all(windows, target_arch = "aarch64")))]
+    {
+        (
+            "26ad22d35f5f014d7b99a403af46a0c2b172986352ffee21a03d1f7a39d67498",
+            "df691b88c9c1a9791b57f3e7d70fc05c6bb7a324f71e9b45900696472befb837",
+        )
+    }
+}
+
 #[test]
 fn zpaq_roundtrip_fixture_a_and_hash_stability() {
     let input = std::fs::read(concat!(
@@ -30,9 +52,10 @@ fn zpaq_roundtrip_fixture_a_and_hash_stability() {
     let compressed = try_compress_bytes_backend(&input, &backend).expect("compress failed");
     let restored = try_decompress_bytes_backend(&compressed, &backend).expect("decompress failed");
     assert_eq!(restored, input, "zpaq roundtrip mismatch");
+    let (expected_fixture_a_hash, _) = expected_zpaq_fixture_hashes();
     assert_eq!(
         sha256_hex(&compressed),
-        "26ad22d35f5f014d7b99a403af46a0c2b172986352ffee21a03d1f7a39d67498",
+        expected_fixture_a_hash,
         "compressed bytes hash changed unexpectedly"
     );
 }
@@ -49,9 +72,10 @@ fn zpaq_roundtrip_fixture_b_and_hash_stability() {
     let compressed = try_compress_bytes_backend(&input, &backend).expect("compress failed");
     let restored = try_decompress_bytes_backend(&compressed, &backend).expect("decompress failed");
     assert_eq!(restored, input, "zpaq roundtrip mismatch");
+    let (_, expected_fixture_b_hash) = expected_zpaq_fixture_hashes();
     assert_eq!(
         sha256_hex(&compressed),
-        "df691b88c9c1a9791b57f3e7d70fc05c6bb7a324f71e9b45900696472befb837",
+        expected_fixture_b_hash,
         "compressed bytes hash changed unexpectedly"
     );
 }

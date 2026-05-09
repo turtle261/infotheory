@@ -2926,29 +2926,49 @@ mod tests {
             crate::rate_defaults::JSON_DEFAULT_FAC_CTW_ENCODING_BITS
         );
 
-        let parsed = parse_rate_backend_json(
-            &serde_json::json!({"kind":"fac-ctw"}),
-            Path::new("."),
-            MAX_MIXTURE_NESTING,
-        )
-        .expect("fac-ctw json parse");
-        match parsed {
-            RateBackend::FacCtw {
-                base_depth,
-                num_percept_bits,
-                encoding_bits,
-            } => {
-                assert_eq!(
+        #[cfg(feature = "backend-ctw")]
+        {
+            let parsed = parse_rate_backend_json(
+                &serde_json::json!({"kind":"fac-ctw"}),
+                Path::new("."),
+                MAX_MIXTURE_NESTING,
+            )
+            .expect("fac-ctw json parse");
+            match parsed {
+                RateBackend::FacCtw {
                     base_depth,
-                    crate::rate_defaults::JSON_DEFAULT_FAC_CTW_BASE_DEPTH
-                );
-                assert_eq!(
+                    num_percept_bits,
                     encoding_bits,
-                    crate::rate_defaults::JSON_DEFAULT_FAC_CTW_ENCODING_BITS
-                );
-                assert_eq!(num_percept_bits, encoding_bits);
+                } => {
+                    assert_eq!(
+                        base_depth,
+                        crate::rate_defaults::JSON_DEFAULT_FAC_CTW_BASE_DEPTH
+                    );
+                    assert_eq!(
+                        encoding_bits,
+                        crate::rate_defaults::JSON_DEFAULT_FAC_CTW_ENCODING_BITS
+                    );
+                    assert_eq!(num_percept_bits, encoding_bits);
+                }
+                _ => panic!("expected fac-ctw backend"),
             }
-            _ => panic!("expected fac-ctw backend"),
+        }
+
+        #[cfg(not(feature = "backend-ctw"))]
+        {
+            let err = match parse_rate_backend_json(
+                &serde_json::json!({"kind":"fac-ctw"}),
+                Path::new("."),
+                MAX_MIXTURE_NESTING,
+            ) {
+                Ok(_) => panic!("disabled fac-ctw backend must report a feature error"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("backend 'fac-ctw' requires infotheory feature 'backend-ctw'"),
+                "unexpected fac-ctw feature error: {err}"
+            );
         }
 
         let runtime_default =
