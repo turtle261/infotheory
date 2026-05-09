@@ -1558,7 +1558,10 @@ pub(super) fn process_json_line(line: &str) -> String {
                 compiled_compression_backend_from_json(&v)
                     .and_then(|backend| try_ncd_bytes_backend(x, y, &backend, ncd_variant))
             } else if cfg!(feature = "backend-zpaq") {
-                try_ncd_bytes(x, y, &method, ncd_variant)
+                CompressionBackend::zpaq(method.as_str())
+                .compile()
+                .map_err(|err| infotheory::error::InfotheoryError::invalid_backend_config(err.to_string()))
+                .and_then(|backend| try_ncd_bytes_backend(x, y, &backend, ncd_variant))
             } else {
                 try_ncd_bytes_default(x, y, ncd_variant)
             };
@@ -1597,7 +1600,12 @@ pub(super) fn process_json_line(line: &str) -> String {
                 compiled_compression_backend_from_json(&v)
                     .and_then(|backend| try_ncd_paths_compiled_backend(&path1, &path2, &backend, ncd_variant))
             } else if cfg!(feature = "backend-zpaq") {
-                try_ncd_paths(&path1, &path2, &method, ncd_variant)
+                try_ncd_paths_backend(
+                    &path1,
+                    &path2,
+                    &CompressionBackend::zpaq(method.as_str()),
+                    ncd_variant,
+                )
             } else {
                 let (left, right) = rayon::join(|| std::fs::read(&path1), || std::fs::read(&path2));
                 match (left, right) {
@@ -1718,7 +1726,10 @@ pub(super) fn process_json_line(line: &str) -> String {
                     compiled_compression_backend_from_json(&v)
                         .and_then(|backend| try_ncd_matrix_bytes_backend(&datas, &backend, ncd_variant))
                 } else if cfg!(feature = "backend-zpaq") {
-                    try_ncd_matrix_bytes(&datas, &method, ncd_variant)
+                    CompressionBackend::zpaq(method.as_str())
+                    .compile()
+                    .map_err(|err| infotheory::error::InfotheoryError::invalid_backend_config(err.to_string()))
+                    .and_then(|backend| try_ncd_matrix_bytes_backend(&datas, &backend, ncd_variant))
                 } else {
                     try_ncd_matrix_bytes_default(&datas, ncd_variant)
                 };

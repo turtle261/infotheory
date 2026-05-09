@@ -286,7 +286,7 @@ pub(crate) fn compile_compression_plan_zpaq(
     _env: &SpecEnvironment,
 ) -> SpecResult<CompressionBackendPlan> {
     match backend {
-        CompressionBackend::Zpaq { method } => {
+        CompressionBackend::Zpaq { method, threads } => {
             crate::zpaq_compress_to_vec(&[], method.value()).map_err(|err| {
                 SpecError::new(format!(
                     "invalid zpaq compression method '{}': {err}",
@@ -295,6 +295,7 @@ pub(crate) fn compile_compression_plan_zpaq(
             })?;
             Ok(CompressionBackendPlan::Zpaq {
                 method: method.value().to_string(),
+                threads: threads.get(),
             })
         }
         _ => unreachable!("zpaq compression kernel used with non-zpaq backend"),

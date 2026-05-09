@@ -2155,7 +2155,7 @@ fn collect_numeric_parameter_paths(
 
 fn candidate_contains_external_artifact(candidate: &crate::api::CompressionBackend) -> bool {
     match candidate {
-        crate::api::CompressionBackend::Zpaq { method } => {
+        crate::api::CompressionBackend::Zpaq { method, .. } => {
             zpaq_method_contains_external_file(method)
         }
         #[cfg(feature = "backend-rwkv")]

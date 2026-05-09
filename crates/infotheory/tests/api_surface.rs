@@ -170,18 +170,16 @@ mod rosa_surface {
 #[cfg(feature = "backend-zpaq")]
 mod zpaq_surface {
     use infotheory::api::{
-        CompressionBackend, NcdVariant, try_compress_bytes_backend, try_compress_size_backend,
-        try_compress_size_chain_backend, try_conditional_entropy_paths, try_cross_entropy_paths,
-        try_decompress_bytes_backend, try_get_bytes_from_paths, try_get_compressed_size,
-        try_get_compressed_size_parallel, try_get_compressed_sizes_from_paths,
-        try_get_parallel_compressed_sizes_from_parallel_paths,
-        try_get_parallel_compressed_sizes_from_sequential_paths,
-        try_get_sequential_compressed_sizes_from_parallel_paths,
-        try_get_sequential_compressed_sizes_from_sequential_paths, try_js_divergence_paths,
-        try_kl_divergence_paths, try_mutual_information_paths, try_ncd_bytes,
-        try_ncd_bytes_backend, try_ncd_bytes_default, try_ncd_matrix_bytes, try_ncd_matrix_paths,
-        try_ncd_paths, try_ncd_paths_backend, try_ned_paths, try_nhd_paths, try_nte_paths,
-        try_tvd_paths,
+        CompressionBackend, CompressionPathBatchOptions, NcdVariant, OperationParallelism,
+        try_compress_bytes_backend, try_compress_size_backend, try_compress_size_chain_backend,
+        try_conditional_entropy_paths, try_cross_entropy_paths, try_decompress_bytes_backend,
+        try_get_bytes_from_paths, try_get_compressed_size_path_backend,
+        try_get_compressed_sizes_from_paths_backend,
+        try_get_compressed_sizes_from_paths_backend_with_options, try_js_divergence_paths,
+        try_kl_divergence_paths, try_mutual_information_paths, try_ncd_bytes_backend,
+        try_ncd_bytes_default, try_ncd_matrix_bytes_backend, try_ncd_matrix_paths_backend,
+        try_ncd_paths_backend, try_ncd_paths_compiled_backend, try_ned_paths, try_nhd_paths,
+        try_nte_paths, try_tvd_paths,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -221,9 +219,7 @@ mod zpaq_surface {
         let sy = py.to_string_lossy().to_string();
         let paths = [sx.as_str(), sy.as_str()];
 
-        let backend = CompressionBackend::Zpaq {
-            method: infotheory::api::ZpaqMethodSpec::literal("1"),
-        };
+        let backend = CompressionBackend::zpaq("1");
         let compiled = backend.compile().expect("compiled zpaq backend");
 
         assert!(try_compress_size_backend(x, &compiled).expect("fallible zpaq size") > 0);
@@ -236,9 +232,8 @@ mod zpaq_surface {
         let d = try_decompress_bytes_backend(&c, &compiled).expect("zpaq decompress");
         assert_eq!(d, x);
 
-        assert!(try_get_compressed_size(&sx, "1").expect("fallible file size") > 0);
         assert!(
-            try_get_compressed_size_parallel(&sx, "1", 2).expect("fallible parallel file size") > 0
+            try_get_compressed_size_path_backend(&sx, &compiled).expect("fallible file size") > 0
         );
 
         let bytes_try = try_get_bytes_from_paths(&paths).expect("fallible bytes from paths");
@@ -246,16 +241,25 @@ mod zpaq_surface {
         assert_eq!(bytes_try[0], x);
         assert_eq!(bytes_try[1], y);
 
-        let s0 =
-            try_get_sequential_compressed_sizes_from_sequential_paths(&paths, "1").expect("sizes");
-        let s0p = try_get_parallel_compressed_sizes_from_sequential_paths(&paths, "1", 2)
-            .expect("parallel preload sizes");
-        let s0d = try_get_sequential_compressed_sizes_from_parallel_paths(&paths, "1")
-            .expect("disk sizes");
-        let s0dp = try_get_parallel_compressed_sizes_from_parallel_paths(&paths, "1", 2)
-            .expect("disk parallel sizes");
-        let s0auto = try_get_compressed_sizes_from_paths(&paths, "1").expect("auto sizes");
-        for sizes in [s0, s0p, s0d, s0dp, s0auto] {
+        let s_serial = try_get_compressed_sizes_from_paths_backend_with_options(
+            &paths,
+            &compiled,
+            CompressionPathBatchOptions {
+                parallelism: OperationParallelism::Serial,
+            },
+        )
+        .expect("serial sizes");
+        let s_auto =
+            try_get_compressed_sizes_from_paths_backend(&paths, &compiled).expect("auto sizes");
+        let s_pool = try_get_compressed_sizes_from_paths_backend_with_options(
+            &paths,
+            &compiled,
+            CompressionPathBatchOptions {
+                parallelism: OperationParallelism::Threads(2),
+            },
+        )
+        .expect("pool sizes");
+        for sizes in [s_serial, s_auto, s_pool] {
             assert_eq!(sizes.len(), 2);
             assert!(sizes[0] > 0);
             assert!(sizes[1] > 0);
@@ -265,7 +269,6 @@ mod zpaq_surface {
             try_ncd_bytes_backend(x, y, &compiled, NcdVariant::Vitanyi).expect("fallible ncd")
                 >= 0.0
         );
-        assert!(try_ncd_bytes(x, y, "1", NcdVariant::Vitanyi).expect("ncd bytes") >= 0.0);
         assert!(
             try_ncd_bytes_default(x, y, NcdVariant::SymVitanyi).expect("ncd bytes default") >= 0.0
         );
@@ -273,16 +276,22 @@ mod zpaq_surface {
             try_ncd_bytes_backend(x, y, &compiled, NcdVariant::Cons).expect("ncd bytes backend")
                 >= 0.0
         );
-        assert!(try_ncd_paths(&sx, &sy, "1", NcdVariant::SymCons).expect("ncd paths") >= 0.0);
         assert!(
             try_ncd_paths_backend(&sx, &sy, &backend, NcdVariant::Vitanyi)
                 .expect("fallible file ncd")
                 >= 0.0
         );
-        let m = try_ncd_matrix_bytes(&[x.to_vec(), y.to_vec()], "1", NcdVariant::Vitanyi)
-            .expect("matrix ncd bytes");
+        assert!(
+            try_ncd_paths_compiled_backend(&sx, &sy, &compiled, NcdVariant::SymCons)
+                .expect("ncd paths compiled")
+                >= 0.0
+        );
+        let m =
+            try_ncd_matrix_bytes_backend(&[x.to_vec(), y.to_vec()], &compiled, NcdVariant::Vitanyi)
+                .expect("matrix ncd bytes");
         assert_eq!(m.len(), 4);
-        let mp = try_ncd_matrix_paths(&paths, "1", NcdVariant::Cons).expect("matrix ncd paths");
+        let mp = try_ncd_matrix_paths_backend(&paths, &compiled, NcdVariant::Cons)
+            .expect("matrix ncd paths");
         assert_eq!(mp.len(), 4);
 
         assert!(try_ned_paths(&sx, &sy).expect("ned paths") >= 0.0);
@@ -309,8 +318,12 @@ mod zpaq_surface {
             "infotheory_api_missing_does_not_exist_{unique}.bin"
         ));
         let missing = missing_path.to_string_lossy().to_string();
+        let compiled = CompressionBackend::zpaq("1")
+            .compile()
+            .expect("compile zpaq backend");
 
-        let err = try_get_compressed_size(&missing, "1").expect_err("missing file should error");
+        let err = try_get_compressed_size_path_backend(&missing, &compiled)
+            .expect_err("missing file should error");
         assert!(
             has_not_found_io_error(&err),
             "expected not-found io error, got: {err}"

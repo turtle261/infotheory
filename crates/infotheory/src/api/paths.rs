@@ -3,8 +3,8 @@
 use rayon::prelude::*;
 
 use super::compression::{
-    NcdVariant, try_ncd_bytes, try_ncd_bytes_backend, try_ncd_matrix_bytes,
-    try_ncd_matrix_bytes_backend,
+    NcdComputeOptions, NcdVariant, OperationParallelism, try_compress_size_backend,
+    try_ncd_bytes_backend_with_options, try_ncd_matrix_bytes_backend_with_options,
 };
 use super::metrics::{
     d_kl_bytes, js_div_bytes, nhd_bytes, try_conditional_entropy_bytes, try_cross_entropy_bytes,
@@ -13,7 +13,7 @@ use super::metrics::{
 use super::types::CompressionBackend;
 use crate::error::{InfotheoryError, InfotheoryResult};
 use crate::spec::CompiledCompressionBackend;
-use crate::{NUM_THREADS, try_zpaq_compress_size_bytes, try_zpaq_compress_size_parallel_bytes};
+use rayon::ThreadPoolBuilder;
 
 #[inline(always)]
 fn try_read_path_pair(x: &str, y: &str) -> InfotheoryResult<(Vec<u8>, Vec<u8>)> {
@@ -24,22 +24,19 @@ fn try_read_path_pair(x: &str, y: &str) -> InfotheoryResult<(Vec<u8>, Vec<u8>)> 
     Ok((bx?, by?))
 }
 
-#[inline(always)]
-/// Read `path` and return its compressed size (bytes) using ZPAQ `method`.
-pub fn try_get_compressed_size(path: &str, method: &str) -> InfotheoryResult<u64> {
-    let data = std::fs::read(path)?;
-    try_zpaq_compress_size_bytes(&data, method)
+/// Options for backend-first path compression-size operations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompressionPathBatchOptions {
+    pub parallelism: OperationParallelism,
 }
 
-#[inline(always)]
-/// Read `path` and return its compressed size (bytes) using parallel ZPAQ compression.
-pub fn try_get_compressed_size_parallel(
+/// Read `path` and return its compressed size (bytes) using `backend`.
+pub fn try_get_compressed_size_path_backend(
     path: &str,
-    method: &str,
-    threads: usize,
+    backend: &CompiledCompressionBackend,
 ) -> InfotheoryResult<u64> {
     let data = std::fs::read(path)?;
-    try_zpaq_compress_size_parallel_bytes(&data, method, threads)
+    try_compress_size_backend(&data, backend)
 }
 
 #[inline(always)]
@@ -51,100 +48,57 @@ pub fn try_get_bytes_from_paths(paths: &[&str]) -> InfotheoryResult<Vec<Vec<u8>>
         .collect()
 }
 
-#[inline(always)]
-/// Read all files once, then compress each buffer with single-stream ZPAQ.
-///
-/// "Sequential" here refers to the codec mode per buffer, not to overall
-/// execution: the per-buffer compressions still run in parallel across inputs.
-pub fn try_get_sequential_compressed_sizes_from_sequential_paths(
+/// Compute compressed sizes for `paths` using `backend`.
+pub fn try_get_compressed_sizes_from_paths_backend(
     paths: &[&str],
-    method: &str,
+    backend: &CompiledCompressionBackend,
 ) -> InfotheoryResult<Vec<u64>> {
-    let datas = try_get_bytes_from_paths(paths)?;
-    datas
-        .par_iter()
-        .map(|data| try_zpaq_compress_size_bytes(data, method))
-        .collect()
+    try_get_compressed_sizes_from_paths_backend_with_options(
+        paths,
+        backend,
+        CompressionPathBatchOptions::default(),
+    )
 }
 
-#[inline(always)]
-/// Read all files once, then compress each buffer with parallel ZPAQ.
-pub fn try_get_parallel_compressed_sizes_from_sequential_paths(
+/// Compute compressed sizes for `paths` using `backend` with explicit
+/// operation-level parallelism controls.
+pub fn try_get_compressed_sizes_from_paths_backend_with_options(
     paths: &[&str],
-    method: &str,
-    threads: usize,
+    backend: &CompiledCompressionBackend,
+    options: CompressionPathBatchOptions,
 ) -> InfotheoryResult<Vec<u64>> {
-    let datas = try_get_bytes_from_paths(paths)?;
-    datas
-        .par_iter()
-        .map(|data| try_zpaq_compress_size_parallel_bytes(data, method, threads))
-        .collect()
-}
-
-#[inline(always)]
-/// Compress each file path independently with single-stream ZPAQ.
-///
-/// "Sequential" here refers to the codec mode per file, not to overall
-/// execution: the per-file compressions still run in parallel across inputs.
-pub fn try_get_sequential_compressed_sizes_from_parallel_paths(
-    paths: &[&str],
-    method: &str,
-) -> InfotheoryResult<Vec<u64>> {
-    Ok(paths
-        .par_iter()
-        .map(|path| try_get_compressed_size(path, method))
-        .collect::<InfotheoryResult<Vec<_>>>()?)
-}
-
-#[inline(always)]
-/// Compress each file path independently with parallel ZPAQ.
-pub fn try_get_parallel_compressed_sizes_from_parallel_paths(
-    paths: &[&str],
-    method: &str,
-    threads: usize,
-) -> InfotheoryResult<Vec<u64>> {
-    Ok(paths
-        .par_iter()
-        .map(|path| try_get_compressed_size_parallel(path, method, threads))
-        .collect::<InfotheoryResult<Vec<_>>>()?)
-}
-
-#[inline(always)]
-/// Compute compressed sizes for `paths` with an adaptive thread strategy.
-///
-/// For small batches (`len(paths) < NUM_THREADS`), this uses stronger per-file
-/// parallelism. Otherwise, it parallelizes across paths.
-pub fn try_get_compressed_sizes_from_paths(
-    paths: &[&str],
-    method: &str,
-) -> InfotheoryResult<Vec<u64>> {
-    let n = paths.len();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let num_threads = *NUM_THREADS.get_or_init(num_cpus::get);
-    if n < num_threads {
-        try_get_parallel_compressed_sizes_from_parallel_paths(
-            paths,
-            method,
-            num_threads.div_ceil(n),
-        )
-    } else {
-        try_get_sequential_compressed_sizes_from_parallel_paths(paths, method)
+    match options.parallelism {
+        OperationParallelism::Serial => paths
+            .iter()
+            .map(|path| try_get_compressed_size_path_backend(path, backend))
+            .collect(),
+        OperationParallelism::Auto => paths
+            .par_iter()
+            .map(|path| try_get_compressed_size_path_backend(path, backend))
+            .collect(),
+        OperationParallelism::Threads(threads) => {
+            if threads <= 1 {
+                return paths
+                    .iter()
+                    .map(|path| try_get_compressed_size_path_backend(path, backend))
+                    .collect();
+            }
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("failed to build rayon pool: {err}"))
+                })?;
+            pool.install(|| {
+                paths
+                    .par_iter()
+                    .map(|path| try_get_compressed_size_path_backend(path, backend))
+                    .collect()
+            })
+        }
     }
 }
 
-#[inline(always)]
-/// Compute NCD for two files using ZPAQ `method`.
-pub fn try_ncd_paths(x: &str, y: &str, method: &str, variant: NcdVariant) -> InfotheoryResult<f64> {
-    let (bx, by) = rayon::join(
-        || std::fs::read(x).map_err(InfotheoryError::from),
-        || std::fs::read(y).map_err(InfotheoryError::from),
-    );
-    try_ncd_bytes(&bx?, &by?, method, variant)
-}
-
-#[inline(always)]
 /// Compute NCD for two files with an explicit compression backend.
 pub fn try_ncd_paths_backend(
     x: &str,
@@ -159,7 +113,7 @@ pub fn try_ncd_paths_backend(
     let compiled = backend
         .compile()
         .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;
-    try_ncd_bytes_backend(&bx?, &by?, &compiled, variant)
+    try_ncd_bytes_backend_with_options(&bx?, &by?, &compiled, variant, NcdComputeOptions::default())
 }
 
 #[inline(always)]
@@ -170,21 +124,29 @@ pub fn try_ncd_paths_compiled_backend(
     backend: &CompiledCompressionBackend,
     variant: NcdVariant,
 ) -> InfotheoryResult<f64> {
+    try_ncd_paths_compiled_backend_with_options(
+        x,
+        y,
+        backend,
+        variant,
+        NcdComputeOptions::default(),
+    )
+}
+
+/// Compute NCD for two files with an explicit compiled compression backend and
+/// explicit operation-level parallelism controls.
+pub fn try_ncd_paths_compiled_backend_with_options(
+    x: &str,
+    y: &str,
+    backend: &CompiledCompressionBackend,
+    variant: NcdVariant,
+    options: NcdComputeOptions,
+) -> InfotheoryResult<f64> {
     let (bx, by) = rayon::join(
         || std::fs::read(x).map_err(InfotheoryError::from),
         || std::fs::read(y).map_err(InfotheoryError::from),
     );
-    try_ncd_bytes_backend(&bx?, &by?, backend, variant)
-}
-
-/// Compute an `n x n` pairwise NCD matrix (row-major) for file paths.
-pub fn try_ncd_matrix_paths(
-    paths: &[&str],
-    method: &str,
-    variant: NcdVariant,
-) -> InfotheoryResult<Vec<f64>> {
-    let datas = try_get_bytes_from_paths(paths)?;
-    try_ncd_matrix_bytes(&datas, method, variant)
+    try_ncd_bytes_backend_with_options(&bx?, &by?, backend, variant, options)
 }
 
 /// Compute an `n x n` pairwise NCD matrix (row-major) for file paths with an explicit compiled compression backend.
@@ -193,8 +155,20 @@ pub fn try_ncd_matrix_paths_backend(
     backend: &CompiledCompressionBackend,
     variant: NcdVariant,
 ) -> InfotheoryResult<Vec<f64>> {
+    try_ncd_matrix_paths_backend_with_options(paths, backend, variant, NcdComputeOptions::default())
+}
+
+/// Compute an `n x n` pairwise NCD matrix (row-major) for file paths with an
+/// explicit compiled compression backend and operation-level parallelism
+/// controls.
+pub fn try_ncd_matrix_paths_backend_with_options(
+    paths: &[&str],
+    backend: &CompiledCompressionBackend,
+    variant: NcdVariant,
+    options: NcdComputeOptions,
+) -> InfotheoryResult<Vec<f64>> {
     let datas = try_get_bytes_from_paths(paths)?;
-    try_ncd_matrix_bytes_backend(&datas, backend, variant)
+    try_ncd_matrix_bytes_backend_with_options(&datas, backend, variant, options)
 }
 
 /// Compute normalized entropy distance (NED) for two files using the default rate backend.

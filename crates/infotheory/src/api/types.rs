@@ -2,6 +2,7 @@
 
 use crate::coders::CoderType;
 use crate::error::{InfotheoryError, InfotheoryResult};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// Typed ZPAQ method specification.
@@ -232,6 +233,8 @@ pub enum CompressionBackend {
     Zpaq {
         /// Typed ZPAQ method specification.
         method: ZpaqMethodSpec,
+        /// Internal ZPAQ compression thread count (`1` => single-threaded).
+        threads: NonZeroUsize,
     },
     #[cfg(feature = "backend-rwkv")]
     /// RWKV7 compressor configured by typed method specification.
@@ -573,6 +576,22 @@ impl RateBackend {
 }
 
 impl CompressionBackend {
+    /// Construct a ZPAQ compression backend with default internal threading (`threads = 1`).
+    pub fn zpaq(method: impl Into<ZpaqMethodSpec>) -> Self {
+        Self::Zpaq {
+            method: method.into(),
+            threads: NonZeroUsize::MIN,
+        }
+    }
+
+    /// Construct a ZPAQ compression backend with explicit internal thread count.
+    pub fn zpaq_with_threads(method: impl Into<ZpaqMethodSpec>, threads: NonZeroUsize) -> Self {
+        Self::Zpaq {
+            method: method.into(),
+            threads,
+        }
+    }
+
     /// Returns the current build's implicit default compression backend.
     pub fn try_default() -> InfotheoryResult<Self> {
         if crate::runtime::COMPRESSION_BACKEND_REGISTRY
@@ -582,9 +601,7 @@ impl CompressionBackend {
                     && descriptor.kind == crate::runtime::CompressionBackendKind::Zpaq
             })
         {
-            return Ok(CompressionBackend::Zpaq {
-                method: ZpaqMethodSpec::literal("5"),
-            });
+            return Ok(Self::zpaq("5"));
         }
 
         Ok(CompressionBackend::Rate {

@@ -103,15 +103,16 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use infotheory::api::{empirical_mutual_information_bytes, try_ncd_paths, NcdVariant};
+//! use infotheory::api::{
+//!     empirical_mutual_information_bytes, try_ncd_paths_backend, CompressionBackend, NcdVariant,
+//! };
 //!
 //! let x = b"some data sequence";
 //! let y = b"another data sequence";
 //!
-//! // Compression-based distance using ZPAQ method "5". For other compression
-//! // backends (rate-coded AC/rANS, RWKV7, ...), use try_ncd_paths_backend or
-//! // try_ncd_bytes_backend with an explicit api::CompressionBackend.
-//! let ncd = try_ncd_paths("file1.txt", "file2.txt", "5", NcdVariant::Vitanyi)
+//! // Compression-based distance using an explicit compression backend.
+//! let backend = CompressionBackend::zpaq("5");
+//! let ncd = try_ncd_paths_backend("file1.txt", "file2.txt", &backend, NcdVariant::Vitanyi)
 //!     .expect("ncd");
 //!
 //! // Order-0 / IID Shannon mutual information (model-free plug-in baseline).
@@ -166,7 +167,7 @@ use crate::api::{
     RateBackendSession, d_kl_bytes, try_biased_entropy_rate_backend,
     try_conditional_entropy_rate_bytes, try_cross_entropy_rate_backend, try_entropy_rate_backend,
     try_entropy_rate_bytes, try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes,
-    try_mutual_information_bytes, try_ncd_bytes,
+    try_mutual_information_bytes,
 };
 #[cfg(all(test, feature = "all-backends"))]
 use crate::api::{
@@ -212,9 +213,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(all(test, feature = "all-backends"))]
 use std::sync::Arc;
-use std::sync::OnceLock;
-
-pub(crate) static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 
 thread_local! {
     #[cfg(feature = "backend-mamba")]
@@ -307,6 +305,29 @@ pub(crate) fn try_zpaq_compress_size_stream<R: std::io::Read + Send>(
 ) -> InfotheoryResult<u64> {
     zpaq_rs::compress_size_stream(reader, method, None, None)
         .map_err(|err| InfotheoryError::runtime(format!("zpaq stream compression failed: {err}")))
+}
+
+#[cfg(feature = "backend-zpaq")]
+#[inline(always)]
+pub(crate) fn try_zpaq_compress_size_stream_parallel<R: std::io::Read + Send>(
+    reader: R,
+    method: &str,
+    threads: usize,
+) -> InfotheoryResult<u64> {
+    zpaq_rs::compress_size_stream_parallel(reader, method, None, None, threads)
+        .map_err(|err| InfotheoryError::runtime(format!("zpaq stream compression failed: {err}")))
+}
+
+#[cfg(not(feature = "backend-zpaq"))]
+#[inline(always)]
+pub(crate) fn try_zpaq_compress_size_stream_parallel<R: std::io::Read + Send>(
+    _reader: R,
+    _method: &str,
+    _threads: usize,
+) -> InfotheoryResult<u64> {
+    Err(InfotheoryError::unsupported(
+        "CompressionBackend::Zpaq is unavailable: build with feature 'backend-zpaq'",
+    ))
 }
 
 #[cfg(not(feature = "backend-zpaq"))]
@@ -587,7 +608,10 @@ mod tests {
     }
 
     fn ncd_bytes(x: &[u8], y: &[u8], method: &str, variant: NcdVariant) -> f64 {
-        try_ncd_bytes(x, y, method, variant).expect("ncd_bytes")
+        let backend = CompressionBackend::zpaq(method)
+            .compile()
+            .expect("compile zpaq backend");
+        try_ncd_bytes_backend(x, y, &backend, variant).expect("ncd_bytes")
     }
 
     fn entropy_rate_bytes(data: &[u8]) -> f64 {
@@ -1389,9 +1413,7 @@ mod minimal_tests {
     #[cfg(not(feature = "backend-zpaq"))]
     #[test]
     fn explicit_zpaq_backend_fails_to_compile_without_feature() {
-        let backend = CompressionBackend::Zpaq {
-            method: crate::api::ZpaqMethodSpec::literal("5"),
-        };
+        let backend = CompressionBackend::zpaq("5");
         let err = backend
             .compile()
             .err()

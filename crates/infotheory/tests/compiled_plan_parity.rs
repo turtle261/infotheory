@@ -197,9 +197,7 @@ fn compiled_ctx_matches_wrapper_ctx_for_zpaq_rate_and_compression() {
     let rate = RateBackend::Zpaq {
         method: infotheory::api::ZpaqMethodSpec::literal("1"),
     };
-    let compression = CompressionBackend::Zpaq {
-        method: infotheory::api::ZpaqMethodSpec::literal("1"),
-    };
+    let compression = CompressionBackend::zpaq("1");
     assert_ctx_parity(rate, compression, false);
 }
 

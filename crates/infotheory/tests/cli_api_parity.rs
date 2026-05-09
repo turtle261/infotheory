@@ -4,8 +4,9 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use infotheory::api::{
-    NcdVariant, empirical_entropy_bytes, try_biased_entropy_rate_bytes,
-    try_cross_entropy_rate_bytes, try_entropy_rate_bytes, try_ncd_matrix_bytes, try_ncd_paths,
+    CompressionBackend, NcdVariant, empirical_entropy_bytes, try_biased_entropy_rate_bytes,
+    try_cross_entropy_rate_bytes, try_entropy_rate_bytes, try_ncd_matrix_bytes_backend,
+    try_ncd_paths_backend,
 };
 use serde_json::Value;
 
@@ -123,7 +124,8 @@ fn ncd_file_parity_with_library() {
         "method": "5",
         "variant": "vitanyi",
     }));
-    let rust_val = try_ncd_paths(a, b, "5", NcdVariant::Vitanyi).expect("ncd");
+    let backend = CompressionBackend::zpaq("5");
+    let rust_val = try_ncd_paths_backend(a, b, &backend, NcdVariant::Vitanyi).expect("ncd");
     assert_close(as_f64(&out, "ncd"), rust_val, 1e-6, "ncd");
 }
 
@@ -193,8 +195,11 @@ fn ncd_matrix_parity_with_library() {
         .and_then(Value::as_array)
         .expect("missing matrix");
     assert_eq!(matrix.len(), n);
-    let rust_flat =
-        try_ncd_matrix_bytes(&datas, "5", NcdVariant::SymVitanyi).expect("ncd matrix bytes");
+    let backend = CompressionBackend::zpaq("5")
+        .compile()
+        .expect("compile zpaq backend");
+    let rust_flat = try_ncd_matrix_bytes_backend(&datas, &backend, NcdVariant::SymVitanyi)
+        .expect("ncd matrix bytes");
     for i in 0..n {
         let row = matrix[i].as_array().expect("row must be array");
         for j in 0..n {

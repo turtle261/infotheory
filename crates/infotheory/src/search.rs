@@ -1154,9 +1154,7 @@ mod tests {
 
         let ctx = InfotheoryCtx::from_specs(
             RateBackend::RosaPlus { max_order: -1 },
-            CompressionBackend::Zpaq {
-                method: crate::api::ZpaqMethodSpec::literal("definitely-invalid-zpaq-method"),
-            },
+            CompressionBackend::zpaq("definitely-invalid-zpaq-method"),
         )
         .expect("context should compile");
 
@@ -1182,7 +1180,7 @@ mod tests {
         let opts = SearchOptions::try_default().expect("search defaults");
         match opts.ctx.compression_backend.canonical_spec() {
             #[cfg(feature = "backend-zpaq")]
-            crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method.value(), "5"),
+            crate::api::CompressionBackend::Zpaq { method, .. } => assert_eq!(method.value(), "5"),
             crate::api::CompressionBackend::Rate {
                 rate_backend,
                 coder,

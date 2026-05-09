@@ -862,9 +862,7 @@ fn standalone_rate_backend_documents_cover_all_binary_backend_tags() {
 #[test]
 fn standalone_compression_backend_documents_cover_binary_coder_variants() {
     let docs = vec![
-        SpecDocument::CompressionBackend(CompressionBackend::Zpaq {
-            method: crate::api::ZpaqMethodSpec::literal("5"),
-        }),
+        SpecDocument::CompressionBackend(CompressionBackend::zpaq("5")),
         SpecDocument::CompressionBackend(CompressionBackend::Rate {
             rate_backend: RateBackend::Ctw { depth: 8 },
             coder: crate::coders::CoderType::AC,

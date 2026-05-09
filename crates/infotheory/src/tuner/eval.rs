@@ -1650,9 +1650,7 @@ mod tests {
 
     #[test]
     fn candidate_backend_rejection_is_recoverable_status_error() {
-        let candidate = compile_candidate(CompressionBackend::Zpaq {
-            method: ZpaqMethodSpec::literal("3"),
-        });
+        let candidate = compile_candidate(CompressionBackend::zpaq("3"));
         let dataset = causal_dataset_without_profile();
 
         let err = evaluate_candidate_unbounded(

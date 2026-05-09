@@ -168,9 +168,7 @@ fn ncd_identity_is_zero() {
     let (x, y) = datagen::identical_pair(n, 42);
 
     // Using default ZPAQ method 1
-    let backend = CompressionBackend::Zpaq {
-        method: infotheory::api::ZpaqMethodSpec::literal("1"),
-    };
+    let backend = CompressionBackend::zpaq("1");
     let ncd = try_ncd_bytes_backend(&x, &y, &backend, NcdVariant::Vitanyi).expect("ncd");
 
     println!("NCD(X,X) = {:.4}", ncd);
@@ -187,9 +185,7 @@ fn ncd_independent_is_near_one() {
     let n = 2_000;
     let (x, y) = datagen::independent_pair(n, 12345, 67890);
 
-    let backend = CompressionBackend::Zpaq {
-        method: infotheory::api::ZpaqMethodSpec::literal("1"),
-    };
+    let backend = CompressionBackend::zpaq("1");
     let ncd = try_ncd_bytes_backend(&x, &y, &backend, NcdVariant::Vitanyi).expect("ncd");
 
     println!("NCD(X,Y) independent = {:.4}", ncd);
@@ -211,9 +207,7 @@ fn ncd_triangle_inequality() {
     let y = datagen::uniform_random(n, 222);
     let z = datagen::uniform_random(n, 333);
 
-    let backend = CompressionBackend::Zpaq {
-        method: infotheory::api::ZpaqMethodSpec::literal("1"),
-    };
+    let backend = CompressionBackend::zpaq("1");
     let metric = |a: &[u8], b: &[u8]| {
         try_ncd_bytes_backend(a, b, &backend, NcdVariant::Vitanyi).expect("ncd")
     };

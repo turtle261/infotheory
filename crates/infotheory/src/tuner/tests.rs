@@ -1759,9 +1759,7 @@ fn theorem_claims_continue_as_uncertified_when_requested_prereqs_are_missing() {
 
 #[test]
 fn candidate_external_asset_references_are_rejected() {
-    let candidate = CompressionBackend::Zpaq {
-        method: crate::api::ZpaqMethodSpec::literal("file:./candidate-model.zpaq"),
-    };
+    let candidate = CompressionBackend::zpaq("file:./candidate-model.zpaq");
     let err = reject_candidate_local_external_artifacts(&candidate)
         .expect_err("external file reference must fail");
     assert_eq!(
@@ -3043,9 +3041,7 @@ fn sample_roundtrip_compression_backends_for_canonical_tests() -> Vec<Compressio
             continue;
         }
         match descriptor.kind {
-            crate::runtime::CompressionBackendKind::Zpaq => out.push(CompressionBackend::Zpaq {
-                method: crate::api::ZpaqMethodSpec::literal("5"),
-            }),
+            crate::runtime::CompressionBackendKind::Zpaq => out.push(CompressionBackend::zpaq("5")),
             crate::runtime::CompressionBackendKind::RateAc => {
                 if let Some(rate_backend) = leaf.clone() {
                     out.push(CompressionBackend::Rate {

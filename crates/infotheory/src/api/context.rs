@@ -163,12 +163,10 @@ impl InfotheoryCtx {
     }
 
     /// Create a context with adaptive ROSA+ rate backend and ZPAQ compression backend.
-    pub fn try_with_zpaq(method: impl Into<String>) -> InfotheoryResult<Self> {
+    pub fn try_with_zpaq(method: impl Into<crate::api::ZpaqMethodSpec>) -> InfotheoryResult<Self> {
         Self::from_specs(
             RateBackend::RosaPlus { max_order: -1 },
-            CompressionBackend::Zpaq {
-                method: crate::api::ZpaqMethodSpec::literal(method.into()),
-            },
+            CompressionBackend::zpaq(method),
         )
     }
 

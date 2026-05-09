@@ -917,11 +917,7 @@ impl PyCompressionBackend {
         infotheory::spec::resolve_enabled_compression_backend_name("zpaq")
             .map_err(py_spec_value_error)?;
         Ok(Self {
-            inner: CompressionBackend::Zpaq {
-                method: infotheory::api::ZpaqMethodSpec::literal(
-                    method.unwrap_or_else(|| "5".to_string()),
-                ),
-            },
+            inner: CompressionBackend::zpaq(method.unwrap_or_else(|| "5".to_string())),
         })
     }
 
@@ -1347,50 +1343,35 @@ fn set_default_ctx(ctx: &PyInfotheoryCtx) {
     api::set_default_ctx(ctx.inner.clone());
 }
 
+fn ncd_default_zpaq_bytes(x: &[u8], y: &[u8]) -> f64 {
+    let Ok(cb) = compile_compression_backend(CompressionBackend::zpaq("5")) else {
+        return f64::NAN;
+    };
+    api::try_ncd_bytes_backend(x, y, &cb, NcdVariant::Vitanyi).unwrap_or(f64::NAN)
+}
+
 #[pyfunction]
 #[pyo3(signature = (x, y, tolerance=1e-9))]
 fn verify_identity(x: &[u8], y: &[u8], tolerance: f64) -> bool {
-    infotheory::axioms::verify_identity(
-        |a, b| api::try_ncd_bytes(a, b, "5", NcdVariant::Vitanyi).unwrap_or(f64::NAN),
-        x,
-        tolerance,
-    ) && infotheory::axioms::verify_identity(
-        |a, b| api::try_ncd_bytes(a, b, "5", NcdVariant::Vitanyi).unwrap_or(f64::NAN),
-        y,
-        tolerance,
-    )
+    infotheory::axioms::verify_identity(ncd_default_zpaq_bytes, x, tolerance)
+        && infotheory::axioms::verify_identity(ncd_default_zpaq_bytes, y, tolerance)
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, tolerance=1e-9))]
 fn verify_symmetry(x: &[u8], y: &[u8], tolerance: f64) -> bool {
-    infotheory::axioms::verify_symmetry(
-        |a, b| api::try_ncd_bytes(a, b, "5", NcdVariant::Vitanyi).unwrap_or(f64::NAN),
-        x,
-        y,
-        tolerance,
-    )
+    infotheory::axioms::verify_symmetry(ncd_default_zpaq_bytes, x, y, tolerance)
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, z, tolerance=1e-9))]
 fn verify_triangle_inequality(x: &[u8], y: &[u8], z: &[u8], tolerance: f64) -> bool {
-    infotheory::axioms::verify_triangle_inequality(
-        |a, b| api::try_ncd_bytes(a, b, "5", NcdVariant::Vitanyi).unwrap_or(f64::NAN),
-        x,
-        y,
-        z,
-        tolerance,
-    )
+    infotheory::axioms::verify_triangle_inequality(ncd_default_zpaq_bytes, x, y, z, tolerance)
 }
 
 #[pyfunction]
 fn verify_non_negativity(x: &[u8], y: &[u8]) -> bool {
-    infotheory::axioms::verify_non_negativity(
-        |a, b| api::try_ncd_bytes(a, b, "5", NcdVariant::Vitanyi).unwrap_or(f64::NAN),
-        x,
-        y,
-    )
+    infotheory::axioms::verify_non_negativity(ncd_default_zpaq_bytes, x, y)
 }
 
 #[pyfunction]
@@ -1437,11 +1418,7 @@ fn verify_chain_rule(x: &[u8], y: &[u8], tolerance: f64) -> bool {
 
 #[pyfunction]
 fn verify_ncd_bounds(x: &[u8], y: &[u8]) -> bool {
-    infotheory::axioms::verify_ncd_bounds(
-        |a, b| api::try_ncd_bytes(a, b, "5", NcdVariant::Vitanyi).unwrap_or(f64::NAN),
-        x,
-        y,
-    )
+    infotheory::axioms::verify_ncd_bounds(ncd_default_zpaq_bytes, x, y)
 }
 
 #[pyfunction]
@@ -1732,21 +1709,9 @@ fn validate_zpaq_rate_method(method: &str) -> PyResult<()> {
 
 #[pyfunction]
 fn get_compressed_size(py: Python<'_>, path: &str, method: &str) -> PyResult<u64> {
-    py.detach(|| py_try(|| api::try_get_compressed_size(path, method).map_err(py_infotheory_error)))
-}
-
-#[pyfunction]
-fn get_compressed_size_parallel(
-    py: Python<'_>,
-    path: &str,
-    method: &str,
-    threads: usize,
-) -> PyResult<u64> {
+    let cb = compile_compression_backend(CompressionBackend::zpaq(method))?;
     py.detach(|| {
-        py_try(|| {
-            api::try_get_compressed_size_parallel(path, method, threads)
-                .map_err(py_infotheory_error)
-        })
+        py_try(|| api::try_get_compressed_size_path_backend(path, &cb).map_err(py_infotheory_error))
     })
 }
 
@@ -1758,74 +1723,10 @@ fn get_compressed_sizes_from_paths(
     method: &str,
 ) -> PyResult<Vec<u64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let cb = compile_compression_backend(CompressionBackend::zpaq(method))?;
     py.detach(|| {
         py_try(|| {
-            api::try_get_compressed_sizes_from_paths(&refs, method).map_err(py_infotheory_error)
-        })
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (paths, method="5"))]
-fn get_sequential_compressed_sizes_from_sequential_paths(
-    py: Python<'_>,
-    paths: Vec<String>,
-    method: &str,
-) -> PyResult<Vec<u64>> {
-    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.detach(|| {
-        py_try(|| {
-            api::try_get_sequential_compressed_sizes_from_sequential_paths(&refs, method)
-                .map_err(py_infotheory_error)
-        })
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (paths, method="5", threads=1))]
-fn get_parallel_compressed_sizes_from_sequential_paths(
-    py: Python<'_>,
-    paths: Vec<String>,
-    method: &str,
-    threads: usize,
-) -> PyResult<Vec<u64>> {
-    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.detach(|| {
-        py_try(|| {
-            api::try_get_parallel_compressed_sizes_from_sequential_paths(&refs, method, threads)
-                .map_err(py_infotheory_error)
-        })
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (paths, method="5"))]
-fn get_sequential_compressed_sizes_from_parallel_paths(
-    py: Python<'_>,
-    paths: Vec<String>,
-    method: &str,
-) -> PyResult<Vec<u64>> {
-    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.detach(|| {
-        py_try(|| {
-            api::try_get_sequential_compressed_sizes_from_parallel_paths(&refs, method)
-                .map_err(py_infotheory_error)
-        })
-    })
-}
-
-#[pyfunction]
-#[pyo3(signature = (paths, method="5", threads=1))]
-fn get_parallel_compressed_sizes_from_parallel_paths(
-    py: Python<'_>,
-    paths: Vec<String>,
-    method: &str,
-    threads: usize,
-) -> PyResult<Vec<u64>> {
-    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    py.detach(|| {
-        py_try(|| {
-            api::try_get_parallel_compressed_sizes_from_parallel_paths(&refs, method, threads)
+            api::try_get_compressed_sizes_from_paths_backend(&refs, &cb)
                 .map_err(py_infotheory_error)
         })
     })
@@ -1840,9 +1741,10 @@ fn get_bytes_from_paths(py: Python<'_>, paths: Vec<String>) -> PyResult<Vec<Vec<
 #[pyfunction]
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_vitanyi(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
+    let cb = CompressionBackend::zpaq(method);
     py.detach(|| {
         py_try(|| {
-            api::try_ncd_paths(x, y, method, NcdVariant::Vitanyi).map_err(py_infotheory_error)
+            api::try_ncd_paths_backend(x, y, &cb, NcdVariant::Vitanyi).map_err(py_infotheory_error)
         })
     })
 }
@@ -1850,9 +1752,11 @@ fn ncd_vitanyi(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> 
 #[pyfunction]
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_sym_vitanyi(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
+    let cb = CompressionBackend::zpaq(method);
     py.detach(|| {
         py_try(|| {
-            api::try_ncd_paths(x, y, method, NcdVariant::SymVitanyi).map_err(py_infotheory_error)
+            api::try_ncd_paths_backend(x, y, &cb, NcdVariant::SymVitanyi)
+                .map_err(py_infotheory_error)
         })
     })
 }
@@ -1860,17 +1764,21 @@ fn ncd_sym_vitanyi(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f
 #[pyfunction]
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_cons(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
+    let cb = CompressionBackend::zpaq(method);
     py.detach(|| {
-        py_try(|| api::try_ncd_paths(x, y, method, NcdVariant::Cons).map_err(py_infotheory_error))
+        py_try(|| {
+            api::try_ncd_paths_backend(x, y, &cb, NcdVariant::Cons).map_err(py_infotheory_error)
+        })
     })
 }
 
 #[pyfunction]
 #[pyo3(signature = (x, y, method="5"))]
 fn ncd_sym_cons(py: Python<'_>, x: &str, y: &str, method: &str) -> PyResult<f64> {
+    let cb = CompressionBackend::zpaq(method);
     py.detach(|| {
         py_try(|| {
-            api::try_ncd_paths(x, y, method, NcdVariant::SymCons).map_err(py_infotheory_error)
+            api::try_ncd_paths_backend(x, y, &cb, NcdVariant::SymCons).map_err(py_infotheory_error)
         })
     })
 }
@@ -2200,8 +2108,9 @@ fn ncd_matrix_paths(
 ) -> PyResult<Vec<f64>> {
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
     let v = parse_ncd_variant(variant)?;
+    let cb = compile_compression_backend(CompressionBackend::zpaq(method))?;
     py.detach(|| {
-        py_try(|| api::try_ncd_matrix_paths(&refs, method, v).map_err(py_infotheory_error))
+        py_try(|| api::try_ncd_matrix_paths_backend(&refs, &cb, v).map_err(py_infotheory_error))
     })
 }
 
@@ -2214,8 +2123,9 @@ fn ncd_matrix_bytes(
     variant: &str,
 ) -> PyResult<Vec<f64>> {
     let v = parse_ncd_variant(variant)?;
+    let cb = compile_compression_backend(CompressionBackend::zpaq(method))?;
     py.detach(|| {
-        py_try(|| api::try_ncd_matrix_bytes(&datas, method, v).map_err(py_infotheory_error))
+        py_try(|| api::try_ncd_matrix_bytes_backend(&datas, &cb, v).map_err(py_infotheory_error))
     })
 }
 
@@ -4756,25 +4666,8 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rate_backend, m)?)?;
     m.add_function(wrap_pyfunction!(validate_zpaq_rate_method, m)?)?;
     m.add_function(wrap_pyfunction!(get_compressed_size, m)?)?;
-    m.add_function(wrap_pyfunction!(get_compressed_size_parallel, m)?)?;
     m.add_function(wrap_pyfunction!(get_bytes_from_paths, m)?)?;
     m.add_function(wrap_pyfunction!(get_compressed_sizes_from_paths, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        get_sequential_compressed_sizes_from_sequential_paths,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        get_parallel_compressed_sizes_from_sequential_paths,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        get_sequential_compressed_sizes_from_parallel_paths,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        get_parallel_compressed_sizes_from_parallel_paths,
-        m
-    )?)?;
     m.add_function(wrap_pyfunction!(compress_size_backend, m)?)?;
     m.add_function(wrap_pyfunction!(compress_size_chain_backend, m)?)?;
     m.add_function(wrap_pyfunction!(compress_bytes_backend, m)?)?;

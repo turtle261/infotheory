@@ -999,12 +999,12 @@ fn with_fac_ctw_backend_plan<T>(
 /// Execute `f` with the ZPAQ compression method from a compiled compression backend.
 fn with_zpaq_compression_plan<T>(
     backend: &CompiledCompressionBackend,
-    f: impl FnOnce(&str) -> Result<T, String>,
+    f: impl FnOnce(&str, usize) -> Result<T, String>,
 ) -> Result<T, String> {
-    let crate::spec::core::CompressionBackendPlan::Zpaq { method } = backend.plan() else {
+    let crate::spec::core::CompressionBackendPlan::Zpaq { method, threads } = backend.plan() else {
         unreachable!("zpaq compression kernel used with non-zpaq plan")
     };
-    f(method)
+    f(method, *threads)
 }
 
 /// Execute `f` with `(rate_backend, coder, framing)` from a rate-coded compression backend.
@@ -1535,9 +1535,10 @@ fn conditional_chain_fac_ctw(
 fn build_compression_runtime_zpaq(
     backend: &CompiledCompressionBackend,
 ) -> Result<CompressionRuntimeHandle, String> {
-    with_zpaq_compression_plan(backend, |method| {
+    with_zpaq_compression_plan(backend, |method, threads| {
         Ok(CompressionRuntimeHandle::Zpaq {
             method: method.to_string(),
+            threads,
         })
     })
 }
@@ -1669,6 +1670,7 @@ impl<'a> std::io::Read for SliceChainReader<'a> {
 pub enum CompressionRuntimeHandle {
     Zpaq {
         method: String,
+        threads: usize,
     },
     #[cfg(feature = "backend-rwkv")]
     Rwkv7 {
@@ -1686,8 +1688,12 @@ pub enum CompressionRuntimeHandle {
 impl CompressionRuntime for CompressionRuntimeHandle {
     fn compress_size(&mut self, data: &[u8]) -> InfotheoryResult<u64> {
         match self {
-            CompressionRuntimeHandle::Zpaq { method } => {
-                crate::try_zpaq_compress_size_bytes(data, method.as_str())
+            CompressionRuntimeHandle::Zpaq { method, threads } => {
+                if *threads <= 1 {
+                    crate::try_zpaq_compress_size_bytes(data, method.as_str())
+                } else {
+                    crate::try_zpaq_compress_size_parallel_bytes(data, method.as_str(), *threads)
+                }
             }
             #[cfg(feature = "backend-rwkv")]
             CompressionRuntimeHandle::Rwkv7 {
@@ -1712,9 +1718,13 @@ impl CompressionRuntime for CompressionRuntimeHandle {
 
     fn compress_size_chain(&mut self, parts: &[&[u8]]) -> InfotheoryResult<u64> {
         match self {
-            CompressionRuntimeHandle::Zpaq { method } => {
+            CompressionRuntimeHandle::Zpaq { method, threads } => {
                 let reader = SliceChainReader::new(parts);
-                crate::try_zpaq_compress_size_stream(reader, method.as_str())
+                if *threads <= 1 {
+                    crate::try_zpaq_compress_size_stream(reader, method.as_str())
+                } else {
+                    crate::try_zpaq_compress_size_stream_parallel(reader, method.as_str(), *threads)
+                }
             }
             #[cfg(feature = "backend-rwkv")]
             CompressionRuntimeHandle::Rwkv7 {
@@ -1743,10 +1753,11 @@ impl CompressionRuntime for CompressionRuntimeHandle {
 
     fn compress_bytes(&mut self, data: &[u8]) -> InfotheoryResult<Vec<u8>> {
         match self {
-            CompressionRuntimeHandle::Zpaq { method } => crate::zpaq_compress_to_vec(data, method)
-                .map_err(|err| {
+            CompressionRuntimeHandle::Zpaq { method, .. } => {
+                crate::zpaq_compress_to_vec(data, method).map_err(|err| {
                     InfotheoryError::runtime(format!("zpaq byte compression failed: {err:#}"))
-                }),
+                })
+            }
             #[cfg(feature = "backend-rwkv")]
             CompressionRuntimeHandle::Rwkv7 {
                 method,

@@ -707,9 +707,10 @@ fn decode_rate_backend(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<R
 
 fn encode_compression_backend(out: &mut Vec<u8>, backend: &CompressionBackend) {
     match backend {
-        CompressionBackend::Zpaq { method } => {
+        CompressionBackend::Zpaq { method, threads } => {
             out.push(0);
             encode_zpaq_method_spec(out, method);
+            push_u64(out, threads.get() as u64);
         }
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { method, coder } => {
@@ -737,6 +738,11 @@ fn decode_compression_backend(
     match cursor.read_u8()? {
         0 => Ok(CompressionBackend::Zpaq {
             method: decode_zpaq_method_spec(cursor)?,
+            threads: std::num::NonZeroUsize::new(
+                usize::try_from(cursor.read_u64()?)
+                    .map_err(|_| SpecError::new("zpaq compression threads exceeds usize::MAX"))?,
+            )
+            .ok_or_else(|| SpecError::new("zpaq compression threads must be >= 1"))?,
         }),
         #[cfg(feature = "backend-rwkv")]
         1 => Ok(CompressionBackend::Rwkv7 {

@@ -1016,9 +1016,10 @@ pub fn compression_backend_to_json_value(
 ) -> SpecResult<serde_json::Value> {
     let canonical = backend.descriptor().map_err(SpecError::new)?.canonical;
     match backend {
-        CompressionBackend::Zpaq { method } => Ok(serde_json::json!({
+        CompressionBackend::Zpaq { method, threads } => Ok(serde_json::json!({
             "kind": canonical,
             "method": zpaq_method_to_json_value(method),
+            "threads": threads.get(),
         })),
         #[cfg(feature = "backend-rwkv")]
         CompressionBackend::Rwkv7 { method, coder } => Ok(serde_json::json!({
@@ -1293,13 +1294,25 @@ pub fn parse_compression_backend_json(
     match kind {
         crate::runtime::CompressionBackendKind::Zpaq => {
             let method = parse_zpaq_method_json_value(&v["method"], "5")?;
+            let threads = if let Some(raw_value) = v.get("threads").filter(|value| !value.is_null())
+            {
+                let raw_u64 = raw_value
+                    .as_u64()
+                    .ok_or_else(|| SpecError::new("zpaq threads must be an integer >= 1"))?;
+                let raw = usize::try_from(raw_u64)
+                    .map_err(|_| SpecError::new("zpaq threads exceeds usize::MAX"))?;
+                std::num::NonZeroUsize::new(raw)
+                    .ok_or_else(|| SpecError::new("zpaq threads must be >= 1"))?
+            } else {
+                std::num::NonZeroUsize::MIN
+            };
             crate::zpaq_compress_to_vec(&[], method.value()).map_err(|err| {
                 SpecError::new(format!(
                     "invalid zpaq compression method '{}': {err}",
                     method.value()
                 ))
             })?;
-            Ok(CompressionBackend::Zpaq { method })
+            Ok(CompressionBackend::Zpaq { method, threads })
         }
         crate::runtime::CompressionBackendKind::RateAc
         | crate::runtime::CompressionBackendKind::RateRans => {
@@ -1748,9 +1761,7 @@ pub fn parse_compression_backend_name_method(
             crate::zpaq_compress_to_vec(&[], &method).map_err(|err| {
                 SpecError::new(format!("invalid zpaq compression method '{method}': {err}"))
             })?;
-            Ok(CompressionBackend::Zpaq {
-                method: crate::api::ZpaqMethodSpec::literal(method),
-            })
+            Ok(CompressionBackend::zpaq(method))
         }
         crate::runtime::CompressionBackendKind::RateAc => Ok(CompressionBackend::Rate {
             rate_backend: rate_backend
@@ -1959,9 +1970,7 @@ mod tests {
         let leaf = sample_enabled_leaf_rate_backend();
 
         if cfg!(feature = "backend-zpaq") {
-            backends.push(CompressionBackend::Zpaq {
-                method: crate::api::ZpaqMethodSpec::literal("5"),
-            });
+            backends.push(CompressionBackend::zpaq("5"));
         }
 
         if let Some(rate_backend) = leaf.clone() {
@@ -2197,7 +2206,7 @@ mod tests {
         }
 
         match zpaq {
-            CompressionBackend::Zpaq { method } => assert_eq!(method.value(), "5"),
+            CompressionBackend::Zpaq { method, .. } => assert_eq!(method.value(), "5"),
             _ => panic!("unexpected zpaq backend"),
         }
     }
@@ -2382,11 +2391,9 @@ mod tests {
         assert_eq!(rate["method"]["value"], "5");
 
         let compression = serde_json::from_str::<serde_json::Value>(
-            &CompressionBackend::Zpaq {
-                method: crate::api::ZpaqMethodSpec::literal("5"),
-            }
-            .to_canonical_json()
-            .expect("compression json"),
+            &CompressionBackend::zpaq("5")
+                .to_canonical_json()
+                .expect("compression json"),
         )
         .expect("valid compression json");
         assert_eq!(compression["kind"], "zpaq");
@@ -2459,7 +2466,7 @@ mod tests {
         )
         .expect("missing method should use default compression method");
         assert!(
-            matches!(compression, CompressionBackend::Zpaq { method } if method.value() == "5")
+            matches!(compression, CompressionBackend::Zpaq { method, .. } if method.value() == "5")
         );
     }
 

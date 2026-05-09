@@ -199,11 +199,13 @@ pub(crate) fn rate_plan_to_wrapper_calibrated(plan: &RateBackendPlan) -> RateBac
 pub(crate) fn compression_plan_to_wrapper_zpaq(
     plan: &CompressionBackendPlan,
 ) -> CompressionBackend {
-    let CompressionBackendPlan::Zpaq { method } = plan else {
+    let CompressionBackendPlan::Zpaq { method, threads } = plan else {
         unreachable!("zpaq compression wrapper kernel used with non-zpaq plan");
     };
     CompressionBackend::Zpaq {
         method: crate::api::ZpaqMethodSpec::literal(method),
+        threads: std::num::NonZeroUsize::new(*threads)
+            .expect("compiled zpaq compression plan must retain non-zero thread count"),
     }
 }
 
@@ -641,10 +643,10 @@ pub(crate) fn rate_plan_default_name_calibrated(plan: &RateBackendPlan) -> Strin
 }
 
 pub(crate) fn compression_plan_display_label_zpaq(plan: &CompressionBackendPlan) -> String {
-    let CompressionBackendPlan::Zpaq { method } = plan else {
+    let CompressionBackendPlan::Zpaq { method, threads } = plan else {
         unreachable!("zpaq compression label kernel used with non-zpaq plan");
     };
-    format!("zpaq(method={method})")
+    format!("zpaq(method={method},threads={threads})")
 }
 
 #[cfg(feature = "backend-rwkv")]
@@ -855,11 +857,12 @@ pub(crate) fn encode_rate_payload_calibrated(plan: &RateBackendPlan, out: &mut V
 }
 
 pub(crate) fn encode_compression_payload_zpaq(plan: &CompressionBackendPlan, out: &mut Vec<u8>) {
-    let CompressionBackendPlan::Zpaq { method } = plan else {
+    let CompressionBackendPlan::Zpaq { method, threads } = plan else {
         unreachable!("zpaq compression encoder kernel used with non-zpaq plan");
     };
     out.push(0);
     push_string(out, method);
+    push_usize(out, *threads);
 }
 
 #[cfg(feature = "backend-rwkv")]

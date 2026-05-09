@@ -441,11 +441,9 @@ mod tests {
             _ => panic!("expected normalized rate backend"),
         }
 
-        let zpaq = crate::api::CompressionBackend::Zpaq {
-            method: crate::api::ZpaqMethodSpec::literal("5"),
-        };
+        let zpaq = crate::api::CompressionBackend::zpaq("5");
         match normalize_file_roundtrip_backend(&zpaq) {
-            crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method.value(), "5"),
+            crate::api::CompressionBackend::Zpaq { method, .. } => assert_eq!(method.value(), "5"),
             _ => panic!("expected zpaq backend to remain unchanged"),
         }
     }
@@ -473,13 +471,13 @@ mod tests {
 
         #[cfg(feature = "backend-zpaq")]
         {
-            let zpaq = crate::api::CompressionBackend::Zpaq {
-                method: crate::api::ZpaqMethodSpec::literal("5"),
-            }
-            .compile()
-            .expect("compiled zpaq");
+            let zpaq = crate::api::CompressionBackend::zpaq("5")
+                .compile()
+                .expect("compiled zpaq");
             match normalize_file_roundtrip_compiled_backend(&zpaq).canonical_spec() {
-                crate::api::CompressionBackend::Zpaq { method } => assert_eq!(method.value(), "5"),
+                crate::api::CompressionBackend::Zpaq { method, .. } => {
+                    assert_eq!(method.value(), "5")
+                }
                 _ => panic!("expected compiled zpaq backend to remain unchanged"),
             }
         }

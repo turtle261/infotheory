@@ -255,6 +255,7 @@ impl RateBackendPlan {
 pub(crate) enum CompressionBackendPlan {
     Zpaq {
         method: String,
+        threads: usize,
     },
     #[cfg(feature = "backend-rwkv")]
     Rwkv7 {
@@ -871,9 +872,7 @@ mod tests {
             }
             match descriptor.kind {
                 crate::runtime::CompressionBackendKind::Zpaq => {
-                    out.push(CompressionBackend::Zpaq {
-                        method: crate::api::ZpaqMethodSpec::literal("5"),
-                    });
+                    out.push(CompressionBackend::zpaq("5"));
                 }
                 crate::runtime::CompressionBackendKind::RateAc => {
                     if let Some(rate_backend) = leaf.clone() {

@@ -2063,11 +2063,9 @@ mod tests {
 
     #[test]
     fn file_roundtrip_backend_keeps_zpaq_unchanged() {
-        let b = CompressionBackend::Zpaq {
-            method: infotheory::api::ZpaqMethodSpec::literal("5"),
-        };
+        let b = CompressionBackend::zpaq("5");
         let out = file_roundtrip_backend(&b);
-        assert!(matches!(out, CompressionBackend::Zpaq { method } if method.value() == "5"));
+        assert!(matches!(out, CompressionBackend::Zpaq { method, .. } if method.value() == "5"));
     }
 
     #[cfg(feature = "all-backends")]

@@ -8,6 +8,29 @@ use crate::spec::CompiledCompressionBackend;
 use crate::runtime::CompressionRuntime;
 use crate::with_default_ctx;
 
+/// Per-call control over operation-level parallelism.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationParallelism {
+    /// Execute operation-level work serially.
+    Serial,
+    /// Use adaptive/default parallel operation behavior.
+    Auto,
+    /// Execute operation-level work on a bounded Rayon pool with `threads`.
+    Threads(usize),
+}
+
+impl Default for OperationParallelism {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// NCD compute options (operation-level parallelism only).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NcdComputeOptions {
+    pub parallelism: OperationParallelism,
+}
+
 /// Compute compressed size (bytes) for a logical concatenation of `parts` using `backend`.
 pub fn try_compress_size_chain_backend(
     parts: &[&[u8]],
@@ -98,25 +121,6 @@ fn ncd_from_sizes(cx: u64, cy: u64, cxy: u64, cyx: Option<u64>, variant: NcdVari
 }
 
 #[inline(always)]
-/// Compute NCD for byte slices with a ZPAQ `method` string.
-///
-/// This is a convenience wrapper around [`try_ncd_bytes_backend`] with
-/// [`crate::api::CompressionBackend::Zpaq`].
-pub fn try_ncd_bytes(
-    x: &[u8],
-    y: &[u8],
-    method: &str,
-    variant: NcdVariant,
-) -> InfotheoryResult<f64> {
-    let backend = crate::api::CompressionBackend::Zpaq {
-        method: crate::api::ZpaqMethodSpec::literal(method),
-    }
-    .compile()
-    .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;
-    try_ncd_bytes_backend(x, y, &backend, variant)
-}
-
-#[inline(always)]
 /// Compute NCD for byte slices using the thread-local default context.
 pub fn try_ncd_bytes_default(x: &[u8], y: &[u8], variant: NcdVariant) -> InfotheoryResult<f64> {
     with_default_ctx(|ctx| ctx.try_ncd_bytes(x, y, variant))
@@ -129,39 +133,73 @@ pub fn try_ncd_bytes_backend(
     backend: &CompiledCompressionBackend,
     variant: NcdVariant,
 ) -> InfotheoryResult<f64> {
-    let (cx, cy) = rayon::join(
-        || try_compress_size_backend(x, backend),
-        || try_compress_size_backend(y, backend),
-    );
-    let cx = cx?;
-    let cy = cy?;
-
-    let cxy = try_compress_size_chain_backend(&[x, y], backend)?;
-
-    let cyx = match variant {
-        NcdVariant::SymVitanyi | NcdVariant::SymCons => {
-            Some(try_compress_size_chain_backend(&[y, x], backend)?)
-        }
-        _ => None,
-    };
-
-    Ok(ncd_from_sizes(cx, cy, cxy, cyx, variant))
+    try_ncd_bytes_backend_with_options(x, y, backend, variant, NcdComputeOptions::default())
 }
 
-/// Compute an `n x n` pairwise NCD matrix (row-major) for `datas`.
-///
-/// `out[i * n + j]` corresponds to `NCD(datas[i], datas[j])`.
-pub fn try_ncd_matrix_bytes(
-    datas: &[Vec<u8>],
-    method: &str,
+/// Compute NCD for byte slices with an explicit compression backend and
+/// explicit operation-level parallelism controls.
+pub fn try_ncd_bytes_backend_with_options(
+    x: &[u8],
+    y: &[u8],
+    backend: &CompiledCompressionBackend,
     variant: NcdVariant,
-) -> InfotheoryResult<Vec<f64>> {
-    let backend = crate::api::CompressionBackend::Zpaq {
-        method: crate::api::ZpaqMethodSpec::literal(method),
+    options: NcdComputeOptions,
+) -> InfotheoryResult<f64> {
+    let compute = || -> InfotheoryResult<f64> {
+        let (cx, cy) = rayon::join(
+            || try_compress_size_backend(x, backend),
+            || try_compress_size_backend(y, backend),
+        );
+        let cx = cx?;
+        let cy = cy?;
+
+        let cxy = try_compress_size_chain_backend(&[x, y], backend)?;
+
+        let cyx = match variant {
+            NcdVariant::SymVitanyi | NcdVariant::SymCons => {
+                Some(try_compress_size_chain_backend(&[y, x], backend)?)
+            }
+            _ => None,
+        };
+
+        Ok(ncd_from_sizes(cx, cy, cxy, cyx, variant))
+    };
+
+    match options.parallelism {
+        OperationParallelism::Serial => {
+            let cx = try_compress_size_backend(x, backend)?;
+            let cy = try_compress_size_backend(y, backend)?;
+            let cxy = try_compress_size_chain_backend(&[x, y], backend)?;
+            let cyx = match variant {
+                NcdVariant::SymVitanyi | NcdVariant::SymCons => {
+                    Some(try_compress_size_chain_backend(&[y, x], backend)?)
+                }
+                _ => None,
+            };
+            Ok(ncd_from_sizes(cx, cy, cxy, cyx, variant))
+        }
+        OperationParallelism::Auto => compute(),
+        OperationParallelism::Threads(threads) => {
+            if threads <= 1 {
+                return try_ncd_bytes_backend_with_options(
+                    x,
+                    y,
+                    backend,
+                    variant,
+                    NcdComputeOptions {
+                        parallelism: OperationParallelism::Serial,
+                    },
+                );
+            }
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("failed to build rayon pool: {err}"))
+                })?;
+            pool.install(compute)
+        }
     }
-    .compile()
-    .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;
-    try_ncd_matrix_bytes_backend(datas, &backend, variant)
 }
 
 /// Compute an `n x n` pairwise NCD matrix (row-major) using the thread-local default context.
@@ -178,6 +216,43 @@ pub fn try_ncd_matrix_bytes_default(
 ///
 /// `out[i * n + j]` corresponds to `NCD(datas[i], datas[j])`.
 pub fn try_ncd_matrix_bytes_backend(
+    datas: &[Vec<u8>],
+    backend: &CompiledCompressionBackend,
+    variant: NcdVariant,
+) -> InfotheoryResult<Vec<f64>> {
+    try_ncd_matrix_bytes_backend_with_options(datas, backend, variant, NcdComputeOptions::default())
+}
+
+/// Compute an `n x n` pairwise NCD matrix with explicit operation-level
+/// parallelism controls.
+pub fn try_ncd_matrix_bytes_backend_with_options(
+    datas: &[Vec<u8>],
+    backend: &CompiledCompressionBackend,
+    variant: NcdVariant,
+    options: NcdComputeOptions,
+) -> InfotheoryResult<Vec<f64>> {
+    let compute = || try_ncd_matrix_bytes_backend_impl(datas, backend, variant);
+    match options.parallelism {
+        OperationParallelism::Serial => {
+            try_ncd_matrix_bytes_backend_serial(datas, backend, variant)
+        }
+        OperationParallelism::Auto => compute(),
+        OperationParallelism::Threads(threads) => {
+            if threads <= 1 {
+                return try_ncd_matrix_bytes_backend_serial(datas, backend, variant);
+            }
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|err| {
+                    InfotheoryError::runtime(format!("failed to build rayon pool: {err}"))
+                })?;
+            pool.install(compute)
+        }
+    }
+}
+
+fn try_ncd_matrix_bytes_backend_impl(
     datas: &[Vec<u8>],
     backend: &CompiledCompressionBackend,
     variant: NcdVariant,
@@ -242,5 +317,41 @@ pub fn try_ncd_matrix_bytes_backend(
         }
     }
 
+    Ok(out)
+}
+
+fn try_ncd_matrix_bytes_backend_serial(
+    datas: &[Vec<u8>],
+    backend: &CompiledCompressionBackend,
+    variant: NcdVariant,
+) -> InfotheoryResult<Vec<f64>> {
+    let n = datas.len();
+    let mut cx = Vec::with_capacity(n);
+    for d in datas {
+        cx.push(try_compress_size_backend(d, backend)?);
+    }
+    let mut out = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                out[i * n + j] = 0.0;
+                continue;
+            }
+            let cxy = try_compress_size_chain_backend(
+                &[datas[i].as_slice(), datas[j].as_slice()],
+                backend,
+            )?;
+            let cyx = match variant {
+                NcdVariant::SymVitanyi | NcdVariant::SymCons => {
+                    Some(try_compress_size_chain_backend(
+                        &[datas[j].as_slice(), datas[i].as_slice()],
+                        backend,
+                    )?)
+                }
+                _ => None,
+            };
+            out[i * n + j] = ncd_from_sizes(cx[i], cx[j], cxy, cyx, variant);
+        }
+    }
     Ok(out)
 }
