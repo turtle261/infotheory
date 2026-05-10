@@ -26,7 +26,7 @@ def test_python_release_wheel_build_features_include_mamba():
 def test_python_ci_explicit_feature_builds_include_mamba():
     workflow = (_repo_root() / ".github/workflows/python.yml").read_text()
     feature_args = re.findall(
-        r"maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --features ([^\n]+)",
+        r"maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml(?:\s+--target-dir\s+\S+)? --features ([^\n]+)",
         workflow,
     )
     assert feature_args, "no explicit maturin develop feature commands found in python.yml"

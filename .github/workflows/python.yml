@@ -57,7 +57,8 @@ jobs:
           RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
         run: |
           export PATH="$(dirname "$VENV_PY"):$PATH"
-          "$VENV_PY" -m maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml
+          rm -rf target/maturin-pytest-linux
+          "$VENV_PY" -m maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --target-dir target/maturin-pytest-linux
 
       - name: Build extension (macOS/Windows)
         if: runner.os != 'Linux'
@@ -67,7 +68,8 @@ jobs:
           VENV_PY: ${{ runner.os == 'Windows' && '.venv/Scripts/python.exe' || '.venv/bin/python' }}
         run: |
           export PATH="$(dirname "$VENV_PY"):$PATH"
-          "$VENV_PY" -m maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml
+          rm -rf "target/maturin-pytest-${{ runner.os }}"
+          "$VENV_PY" -m maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --target-dir "target/maturin-pytest-${{ runner.os }}"
 
       - name: Run tests
         shell: bash
@@ -86,7 +88,8 @@ jobs:
           RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
         run: |
           export PATH=".venv/bin:$PATH"
-          .venv/bin/python -m maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --features python-extension,all-backends,aixi-gameengine
+          rm -rf target/maturin-gameengine-linux
+          .venv/bin/python -m maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --target-dir target/maturin-gameengine-linux --features python-extension,all-backends,aixi-gameengine
           .venv/bin/python -m pytest -q python/tests/test_aixi_gameengine.py
 
       - name: Upload Python coverage artifact
@@ -113,7 +116,8 @@ jobs:
           RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
         run: |
           export PATH="$(dirname "$VENV_PY"):$PATH"
-          "$VENV_PY" -m maturin build --profile python-release --manifest-path crates/infotheory_py/Cargo.toml
+          rm -rf target/maturin-wheel-linux
+          "$VENV_PY" -m maturin build --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --target-dir target/maturin-wheel-linux
 
       - name: Build wheel (macOS/Windows)
         if: runner.os != 'Linux'
@@ -122,7 +126,8 @@ jobs:
           VENV_PY: ${{ runner.os == 'Windows' && '.venv/Scripts/python.exe' || '.venv/bin/python' }}
         run: |
           export PATH="$(dirname "$VENV_PY"):$PATH"
-          "$VENV_PY" -m maturin build --profile python-release --manifest-path crates/infotheory_py/Cargo.toml
+          rm -rf "target/maturin-wheel-${{ runner.os }}"
+          "$VENV_PY" -m maturin build --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --target-dir "target/maturin-wheel-${{ runner.os }}"
 
       - name: Install built wheel and import
         shell: bash
@@ -172,7 +177,8 @@ jobs:
           RUSTFLAGS: -C link-arg=-fuse-ld=lld -C target-cpu=x86-64
         run: |
           export PATH=".venv/bin:$PATH"
-          .venv/bin/python -m maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --features python-extension,all-backends,vm
+          rm -rf target/maturin-vm-linux
+          .venv/bin/python -m maturin develop --profile python-release --manifest-path crates/infotheory_py/Cargo.toml --target-dir target/maturin-vm-linux --features python-extension,all-backends,vm
 
       - name: Run VM-featured Python smoke tests
         shell: bash
