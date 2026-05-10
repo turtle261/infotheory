@@ -3441,7 +3441,7 @@ fn planner_deployable_model_flag_reports_objective_target_and_diagnostics() {
     let _ = fs::remove_dir_all(dir);
 }
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", unix))]
 #[test]
 fn tune_cli_accepts_executor_flags_and_writes_report() {
     let dir = temp_dir("cli_smoke");
@@ -3519,5 +3519,68 @@ fn tune_cli_accepts_executor_flags_and_writes_report() {
         "operational_only_uncertified"
     );
     assert!(output_path.exists());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(all(feature = "cli", not(unix)))]
+#[test]
+fn tune_cli_reports_unix_only_runtime_contract_on_non_unix() {
+    let dir = temp_dir("cli_non_unix_runtime_contract");
+    let dataset_path = dir.join("dataset.bin");
+    let spec_path = dir.join("spec.json");
+    let output_path = dir.join("output.json");
+    let report_path = dir.join("report.json");
+    write_passive_dataset(&dataset_path);
+    let case = controller_cases()
+        .into_iter()
+        .find(|case| case.kind == "mc_aixi_fac_ctw")
+        .expect("mc-aixi case");
+    let spec_value = tune_spec(
+        &dataset_path,
+        &output_path,
+        &report_path,
+        case.controller,
+        None,
+    );
+    write_json(&spec_path, &spec_value);
+    let reward_cert_path = dir.join("reward.json");
+    write_exact_reward_certificate_with_runtime_profile_and_worker(
+        &reward_cert_path,
+        &dataset_path,
+        TimingCertificationTier::DeterministicTable,
+        "mc_aixi_fac_ctw",
+        65_535,
+        false,
+        Some(Path::new(env!("CARGO_BIN_EXE_infotheory"))),
+    );
+    let spec_arg = path_string(&spec_path);
+    let reward_cert_arg = path_string(&reward_cert_path);
+    let output = Command::new(env!("CARGO_BIN_EXE_infotheory"))
+        .args([
+            "tune",
+            spec_arg.as_str(),
+            "--max-evaluations",
+            "1",
+            "--timing-tier",
+            "deterministic_table",
+            "--scalar-representation-ref",
+            "scalar://finite-f64",
+            "--exact-reward-encoding-certificate",
+            reward_cert_arg.as_str(),
+            "--claim-exact-finite-mdp",
+        ])
+        .output()
+        .expect("run tune cli");
+    assert!(
+        !output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tuner requires a Unix target for process-isolated candidate evaluation"),
+        "stderr={stderr}"
+    );
     let _ = fs::remove_dir_all(dir);
 }
