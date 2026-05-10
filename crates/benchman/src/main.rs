@@ -70,7 +70,7 @@ impl BenchSuite {
 
     fn focus_subjects(self) -> &'static [&'static str] {
         match self {
-            Self::TwoJson => &["neural_mixture", "rwkv"],
+            Self::TwoJson => &["neural_mixture", "rwkv7"],
             Self::Extra => &["neural_mixture", "mamba"],
         }
     }
@@ -923,12 +923,16 @@ fn parse_subject_filter(raw: Option<&str>) -> Result<Option<BTreeSet<String>>> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        selected.insert(token.to_string());
+        selected.insert(canonicalize_subject(token).to_string());
     }
     if selected.is_empty() {
         bail!("subject filter was provided but contained no subjects");
     }
     Ok(Some(selected))
+}
+
+fn canonicalize_subject(subject: &str) -> &str {
+    if subject == "rwkv" { "rwkv7" } else { subject }
 }
 
 fn ensure_plot_artifacts(inputs: &ResolvedInputs) -> Result<()> {
@@ -1259,7 +1263,7 @@ fn load_summary_rows(
             )
         })?;
 
-        let subject = get_field(&row, idx_subject).trim().to_string();
+        let subject = canonicalize_subject(get_field(&row, idx_subject).trim()).to_string();
         if let Some(selected) = subject_filter
             && !selected.contains(&subject)
         {
@@ -1267,7 +1271,9 @@ fn load_summary_rows(
         }
 
         let operation = get_field(&row, idx_operation).trim().to_string();
-        let series = get_field(&row, idx_series).trim().to_string();
+        let series = get_field(&row, idx_series)
+            .trim()
+            .replace(":rwkv", ":rwkv7");
         let size_bytes = parse_size_bytes(get_field(&row, idx_size_bytes), row_idx + 2, path)?;
 
         let row = RenderRow {
@@ -1346,7 +1352,7 @@ fn load_raw_rows(
             )
         })?;
 
-        let subject = get_field(&row, idx_subject).trim().to_string();
+        let subject = canonicalize_subject(get_field(&row, idx_subject).trim()).to_string();
         if let Some(selected) = subject_filter
             && !selected.contains(&subject)
         {

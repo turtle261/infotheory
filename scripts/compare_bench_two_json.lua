@@ -14,11 +14,16 @@ local REQUIRED_COLUMNS = {
 	"subject",
 	"size_bytes",
 	"compression_backend",
+}
+
+local OPTIONAL_PROVENANCE_COLUMNS = {
 	"suite_spec_path",
 	"suite_spec_sha256",
 	"build_mode",
 	"build_features",
 }
+
+local LEGACY_UNKNOWN = "__legacy_unknown__"
 
 local baseline_path, candidate_path
 
@@ -47,6 +52,14 @@ do
 end
 
 local SEP = "\0"
+local EPS = 1e-12
+
+local function canonicalize_subject(subject)
+	if subject == "rwkv" then
+		return "rwkv7"
+	end
+	return subject
+end
 
 local function chomp_cr(s)
 	return (s:gsub("\r$", ""))
@@ -109,9 +122,15 @@ local function load_rows(path)
 			for j, h in ipairs(headers) do
 				row[h] = vals[j] or ""
 			end
+			for _, name in ipairs(OPTIONAL_PROVENANCE_COLUMNS) do
+				if not header_index[name] then
+					row[name] = LEGACY_UNKNOWN
+				end
+			end
 
 			local operation = row.operation or ""
-			local subject = row.subject or ""
+			local subject = canonicalize_subject(row.subject or "")
+			row.subject = subject
 			local size_bytes = row.size_bytes or ""
 			local compression_backend = row.compression_backend or ""
 
@@ -201,16 +220,16 @@ local function compare(base, cand)
 	local br, cr = num(base, "real_seconds_median"), num(cand, "real_seconds_median")
 	if br and cr then
 		local lim = math.max(br * 1.05, br + 0.02)
-		if cr > lim then
-			reasons[#reasons + 1] = ("real_seconds_median %.6g > %.6g"):format(cr, lim)
+		if cr > lim + EPS then
+			reasons[#reasons + 1] = ("real_seconds_median %.12g > %.12g"):format(cr, lim)
 		end
 	end
 
 	local bm, cm = num(base, "rss_kib_median"), num(cand, "rss_kib_median")
 	if bm and cm then
 		local lim = math.max(bm * 1.03, bm + 4096.0)
-		if cm > lim then
-			reasons[#reasons + 1] = ("rss_kib_median %.6g > %.6g"):format(cm, lim)
+		if cm > lim + EPS then
+			reasons[#reasons + 1] = ("rss_kib_median %.12g > %.12g"):format(cm, lim)
 		end
 	end
 
@@ -233,10 +252,13 @@ local baseline_provenance = collect_provenance(baseline_rows, baseline_path)
 local candidate_provenance = collect_provenance(candidate_rows, candidate_path)
 
 if baseline_provenance.suite_spec_sha256 ~= candidate_provenance.suite_spec_sha256 then
-	die("suite spec digest mismatch: baseline "
-		.. baseline_provenance.suite_spec_sha256
-		.. " != candidate "
-		.. candidate_provenance.suite_spec_sha256)
+	if baseline_provenance.suite_spec_sha256 ~= LEGACY_UNKNOWN
+		and candidate_provenance.suite_spec_sha256 ~= LEGACY_UNKNOWN then
+		die("suite spec digest mismatch: baseline "
+			.. baseline_provenance.suite_spec_sha256
+			.. " != candidate "
+			.. candidate_provenance.suite_spec_sha256)
+	end
 end
 
 local key_set, keys  = {}, {}

@@ -1414,8 +1414,9 @@ impl DiagnosticRatePredictor {
         &mut self,
         symbol: u8,
         encoder: &mut ArithmeticEncoder<W>,
+        cdf: &mut [u32; 257],
     ) -> Result<()> {
-        self.inner.encode_symbol_ac_step(symbol, encoder)
+        self.inner.encode_symbol_ac_step(symbol, encoder, cdf)
     }
 }
 
@@ -1781,6 +1782,7 @@ impl RatePdfPredictor {
         &mut self,
         symbol: u8,
         encoder: &mut ArithmeticEncoder<W>,
+        cdf: &mut [u32; 257],
     ) -> Result<()> {
         if self.can_fast_ac_bitwise() {
             self.ac_step_fast_bitwise(|bit_idx, p1_mix| {
@@ -1797,9 +1799,10 @@ impl RatePdfPredictor {
         }
 
         let pdf = self.pdf_next()?;
-        let mut cdf = vec![0u32; 257];
         crate::coders::quantize_pdf_to_integer_cdf_dense_positive_with_buffer(
-            pdf, CDF_TOTAL, &mut cdf,
+            pdf,
+            CDF_TOTAL,
+            cdf.as_mut_slice(),
         );
         let sym = symbol as usize;
         encoder.encode_counts(cdf[sym] as u64, cdf[sym + 1] as u64, CDF_TOTAL as u64)?;
@@ -1838,11 +1841,44 @@ fn binary_split_from_prob_one(p1: f64) -> u32 {
 
 fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Vec<u8>> {
     predictor.begin_stream(data.len())?;
+
+    if predictor.can_fast_ac_bitwise() {
+        let mut out = Vec::new();
+        {
+            let mut enc = ArithmeticEncoder::new(&mut out);
+            for &symbol in data {
+                predictor.ac_step_fast_bitwise(|bit_idx, p1_mix| {
+                    let bit = (symbol >> (7 - bit_idx)) & 1;
+                    let split = binary_split_from_prob_one(p1_mix);
+                    if bit == 0 {
+                        enc.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
+                    } else {
+                        enc.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
+                    }
+                    Ok(bit)
+                })?;
+            }
+            let _ = enc.finish()?;
+        }
+        predictor.finish_stream()?;
+        return Ok(out);
+    }
+
     let mut out = Vec::new();
     {
         let mut enc = ArithmeticEncoder::new(&mut out);
+        // Reuse one CDF scratch buffer for the full stream to avoid per-symbol allocation.
+        let mut cdf = [0u32; 257];
         for &symbol in data {
-            predictor.encode_symbol_ac_step(symbol, &mut enc)?;
+            let pdf = predictor.pdf_next()?;
+            crate::coders::quantize_pdf_to_integer_cdf_dense_positive_with_buffer(
+                pdf,
+                CDF_TOTAL,
+                cdf.as_mut_slice(),
+            );
+            let sym = symbol as usize;
+            enc.encode_counts(cdf[sym] as u64, cdf[sym + 1] as u64, CDF_TOTAL as u64)?;
+            predictor.update(symbol)?;
         }
         let _ = enc.finish()?;
     }

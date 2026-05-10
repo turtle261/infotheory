@@ -356,6 +356,7 @@ pub fn run_ac_log_loss_mixture_bytes(
     let mut counter = CountingWriter::default();
     {
         let mut encoder = crate::coders::ArithmeticEncoder::new(&mut counter);
+        let mut cdf = [0u32; 257];
         for (t, &byte) in data.iter().enumerate() {
             let root_snapshot =
                 predictor.diagnostic_root_snapshot(byte, pool.as_ref(), &mut row_values)?;
@@ -447,7 +448,7 @@ pub fn run_ac_log_loss_mixture_bytes(
             }
             writeln!(trace_writer, "{}", row.join("\t"))?;
 
-            predictor.encode_symbol_ac_step(byte, &mut encoder)?;
+            predictor.encode_symbol_ac_step(byte, &mut encoder, &mut cdf)?;
         }
         let _ = encoder.finish()?;
     }
