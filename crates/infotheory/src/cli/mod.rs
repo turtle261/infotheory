@@ -1998,10 +1998,11 @@ mod non_vm_tests {
         let file_path = unique_temp_path("metrics-file", "txt");
         fs::write(&file_path, b"structured metrics fixture").expect("write metrics file");
 
-        let metrics_file = parse_json_output(&process_json_line(&format!(
-            r#"{{ "op": "metrics_file", "path": "{}" }}"#,
-            file_path.display()
-        )));
+        let metrics_file_input = serde_json::json!({
+            "op": "metrics_file",
+            "path": file_path.display().to_string()
+        });
+        let metrics_file = parse_json_output(&process_json_line(&metrics_file_input.to_string()));
         if has_rate_backend {
             assert_eq!(metrics_file["len"], 26);
             assert!(metrics_file["id"].as_f64().expect("id") >= 0.0);
@@ -2081,11 +2082,14 @@ mod non_vm_tests {
         fs::write(&left_path, b"left fixture bytes").expect("write left fixture");
         fs::write(&right_path, b"right fixture bytes").expect("write right fixture");
 
-        let ncd_files = parse_json_output(&process_json_line(&format!(
-            r#"{{ "op": "ncd_files", "path1": "{}", "path2": "{}", "method": "5", "variant": "cons" }}"#,
-            left_path.display(),
-            right_path.display()
-        )));
+        let ncd_files_input = serde_json::json!({
+            "op": "ncd_files",
+            "path1": left_path.display().to_string(),
+            "path2": right_path.display().to_string(),
+            "method": "5",
+            "variant": "cons"
+        });
+        let ncd_files = parse_json_output(&process_json_line(&ncd_files_input.to_string()));
         if has_compression_backend {
             assert!(
                 ncd_files["ncd"]

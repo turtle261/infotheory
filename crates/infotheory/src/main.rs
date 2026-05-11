@@ -1848,6 +1848,10 @@ mod tests {
         ))
     }
 
+    fn canonical_test_path_string(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
     #[cfg(feature = "backend-ctw")]
     fn action_alphabet(n: usize) -> ActionAlphabet {
         ActionAlphabet::try_from_usize(n).expect("test action alphabet must be non-zero")
@@ -2643,7 +2647,7 @@ mod tests {
         let base_dir = unique_temp_path("infotheory-mamba-relpath", "");
         std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
         let rel_path = "weights/model;v1.safetensors";
-        let expected = base_dir.join(rel_path).to_string_lossy().to_string();
+        let expected = canonical_test_path_string(&base_dir.join(rel_path));
         let expert = json!({
             "name": "mamba-relative",
             "kind": "mamba",
@@ -2667,7 +2671,7 @@ mod tests {
         let base_dir = unique_temp_path("infotheory-rwkv-relpath", "");
         std::fs::create_dir_all(base_dir.join("weights")).expect("create temp dir");
         let rel_path = "weights/model;v1.safetensors";
-        let expected = base_dir.join(rel_path).to_string_lossy().to_string();
+        let expected = canonical_test_path_string(&base_dir.join(rel_path));
         let expert = json!({
             "name": "rwkv-relative",
             "kind": "rwkv7",
