@@ -1898,8 +1898,7 @@ fn decode_payload_ac(
         for _ in 0..out_len {
             let symbol = predictor.ac_step_fast_bitwise(|_, p1_mix| {
                 let split = binary_split_from_prob_one(p1_mix);
-                let cdf = [0u32, split, CDF_TOTAL];
-                Ok(dec.decode_symbol_counts(&cdf, CDF_TOTAL)? as u8)
+                dec.decode_binary_counts(split, CDF_TOTAL)
             })?;
             out.push(symbol);
         }

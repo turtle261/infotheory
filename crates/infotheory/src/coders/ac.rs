@@ -453,6 +453,62 @@ impl<'a> ArithmeticDecoder<'a> {
         Some(bit)
     }
 
+    #[inline]
+    fn advance_counts(&mut self, c_lo: u64, c_hi: u64, total: u32) {
+        let range = (self.high - self.low + 1) as u128;
+        let low_u = self.low as u128;
+        let total_u128 = total as u128;
+        let new_low = low_u + (range * (c_lo as u128)) / total_u128;
+        let new_high = low_u + (range * (c_hi as u128)) / total_u128 - 1;
+
+        self.low = new_low as u64;
+        self.high = new_high as u64;
+
+        loop {
+            if self.high < self.b_to_pm1 {
+                // Lower half; no offset adjustment is needed.
+            } else if self.low >= self.b_to_pm1 {
+                self.low -= self.b_to_pm1;
+                self.high -= self.b_to_pm1;
+                self.code -= self.b_to_pm1;
+            } else if self.low >= self.b_to_pm2 && self.high < self.b_to_pm2 * 3 {
+                self.low -= self.b_to_pm2;
+                self.high -= self.b_to_pm2;
+                self.code -= self.b_to_pm2;
+            } else {
+                break;
+            }
+            self.low = (self.low << 1) & self.mask;
+            self.high = ((self.high << 1) & self.mask) | 1;
+            self.code = ((self.code << 1) & self.mask) | (self.get_bit().unwrap_or(1) as u64);
+        }
+    }
+
+    /// Decode a binary symbol from the two intervals `[0, split)` and
+    /// `[split, total)`.
+    ///
+    /// This is equivalent to decoding with the CDF `[0, split, total]`, but it
+    /// avoids the generic CDF search in bitwise arithmetic-coding hot paths.
+    #[inline]
+    pub(crate) fn decode_binary_counts(&mut self, split: u32, total: u32) -> anyhow::Result<u8> {
+        debug_assert!(split > 0);
+        debug_assert!(split < total);
+
+        let total_u = total as u64;
+        let range = self.high - self.low + 1;
+        let value =
+            (((self.code - self.low + 1) as u128 * (total_u as u128)) - 1) / (range as u128);
+        let value_u = value as u32;
+
+        if value_u < split {
+            self.advance_counts(0, split as u64, total);
+            Ok(0)
+        } else {
+            self.advance_counts(split as u64, total as u64, total);
+            Ok(1)
+        }
+    }
+
     /// Decode a symbol using integer CDF.
     ///
     /// # Arguments
@@ -483,35 +539,7 @@ impl<'a> ArithmeticDecoder<'a> {
         let c_lo = cdf[s] as u64;
         let c_hi = cdf[s + 1] as u64;
 
-        // Update range
-        let range = (self.high - self.low + 1) as u128;
-        let low_u = self.low as u128;
-        let total_u128 = total as u128;
-        let new_low = low_u + (range * (c_lo as u128)) / total_u128;
-        let new_high = low_u + (range * (c_hi as u128)) / total_u128 - 1;
-
-        self.low = new_low as u64;
-        self.high = new_high as u64;
-
-        // Renormalize
-        loop {
-            if self.high < self.b_to_pm1 {
-                // nothing
-            } else if self.low >= self.b_to_pm1 {
-                self.low -= self.b_to_pm1;
-                self.high -= self.b_to_pm1;
-                self.code -= self.b_to_pm1;
-            } else if self.low >= self.b_to_pm2 && self.high < self.b_to_pm2 * 3 {
-                self.low -= self.b_to_pm2;
-                self.high -= self.b_to_pm2;
-                self.code -= self.b_to_pm2;
-            } else {
-                break;
-            }
-            self.low = (self.low << 1) & self.mask;
-            self.high = ((self.high << 1) & self.mask) | 1;
-            self.code = ((self.code << 1) & self.mask) | (self.get_bit().unwrap_or(1) as u64);
-        }
+        self.advance_counts(c_lo, c_hi, total);
 
         Ok(s)
     }
