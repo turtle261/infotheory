@@ -395,8 +395,6 @@ enum PreparedEnd {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PreparedStep {
     source: ExistingSource,
-    counts: [u32; 2],
-    kt_log_prob: f64,
     span: u32,
     sibling_weight: f64,
     has_sibling: u8,
@@ -522,6 +520,9 @@ fn predict_ratio_kt_one(counts: [u32; 2]) -> f64 {
 #[inline(always)]
 fn update_weighted_log_prob_non_leaf(kt_log_prob: f64, log_prob_w0: f64, log_prob_w1: f64) -> f64 {
     let child_log_prob = log_prob_w0 + log_prob_w1;
+    if child_log_prob.to_bits() == kt_log_prob.to_bits() {
+        return clamp_log_prob(kt_log_prob);
+    }
     let delta = child_log_prob - kt_log_prob;
     let log_prob_weighted = if delta >= 0.0 {
         child_log_prob + (-delta).exp().ln_1p() - std::f64::consts::LN_2
@@ -586,6 +587,9 @@ fn combined_weight_ratio_internal(
 ) -> (f64, f64) {
     let kt_ratio = predict_ratio_kt(counts, sym_idx);
     let child_log_prob = path_child_log_prob + sibling_log_prob;
+    if child_log_prob.to_bits() == kt_log_prob.to_bits() {
+        return (clamp_log_prob(kt_log_prob), 0.5 * (kt_ratio + child_ratio));
+    }
     let delta = child_log_prob - kt_log_prob;
     if delta >= 0.0 {
         let x = (-delta).exp();
@@ -612,6 +616,9 @@ fn combined_weight_ratio_internal_one(
 ) -> (f64, f64) {
     let kt_ratio = predict_ratio_kt_one(counts);
     let child_log_prob = path_child_log_prob + sibling_log_prob;
+    if child_log_prob.to_bits() == kt_log_prob.to_bits() {
+        return (clamp_log_prob(kt_log_prob), 0.5 * (kt_ratio + child_ratio));
+    }
     let delta = child_log_prob - kt_log_prob;
     if delta >= 0.0 {
         let x = (-delta).exp();
@@ -668,6 +675,12 @@ fn unary_chain_ratio_transform_precomputed(
     {
         return (clamp_log_prob(kt_log_prob), kt_ratio);
     }
+    if kt_log_prob.to_bits() == continuation_log_prob.to_bits() {
+        return (
+            clamp_log_prob(kt_log_prob),
+            (1.0 - alpha) * kt_ratio + alpha * continuation_ratio,
+        );
+    }
 
     let delta = continuation_log_prob - kt_log_prob;
     if delta >= 0.0 {
@@ -701,6 +714,12 @@ fn unary_chain_ratio_transform_precomputed_one(
     {
         return (clamp_log_prob(kt_log_prob), kt_ratio);
     }
+    if kt_log_prob.to_bits() == continuation_log_prob.to_bits() {
+        return (
+            clamp_log_prob(kt_log_prob),
+            (1.0 - alpha) * kt_ratio + alpha * continuation_ratio,
+        );
+    }
 
     let delta = continuation_log_prob - kt_log_prob;
     if delta >= 0.0 {
@@ -728,7 +747,11 @@ fn predict_ratio_internal(
     sym_idx: usize,
 ) -> f64 {
     let kt_ratio = predict_ratio_kt(counts, sym_idx);
-    let delta = path_child_log_prob + sibling_log_prob - kt_log_prob;
+    let child_log_prob = path_child_log_prob + sibling_log_prob;
+    if child_log_prob.to_bits() == kt_log_prob.to_bits() {
+        return 0.5 * (kt_ratio + child_ratio);
+    }
+    let delta = child_log_prob - kt_log_prob;
     if delta >= 0.0 {
         let inv_rho = (-delta).exp();
         (kt_ratio * inv_rho + child_ratio) / (1.0 + inv_rho)
@@ -747,7 +770,11 @@ fn predict_ratio_internal_one(
     child_ratio: f64,
 ) -> f64 {
     let kt_ratio = predict_ratio_kt_one(counts);
-    let delta = path_child_log_prob + sibling_log_prob - kt_log_prob;
+    let child_log_prob = path_child_log_prob + sibling_log_prob;
+    if child_log_prob.to_bits() == kt_log_prob.to_bits() {
+        return 0.5 * (kt_ratio + child_ratio);
+    }
+    let delta = child_log_prob - kt_log_prob;
     if delta >= 0.0 {
         let inv_rho = (-delta).exp();
         (kt_ratio * inv_rho + child_ratio) / (1.0 + inv_rho)
@@ -1441,6 +1468,23 @@ impl CtEngine {
         )
     }
 
+    #[inline(always)]
+    fn source_counts_and_kt_log_prob(&self, source: ExistingSource) -> ([u32; 2], f64) {
+        match source {
+            ExistingSource::Node(node_idx) => {
+                let slot = node_idx.get();
+                let node = unsafe { *self.arena.nodes.get_unchecked(slot) };
+                (node.symbol_count, node.log_prob_kt)
+            }
+            ExistingSource::Segment(segment_idx, _) => {
+                let slot = segment_idx.get();
+                let segment = unsafe { *self.arena.segments.get_unchecked(slot) };
+                (segment.symbol_count, segment.log_prob_kt)
+            }
+            ExistingSource::None => unreachable!("prepared step should never store None"),
+        }
+    }
+
     fn build_missing_segment_path(
         &mut self,
         depth: usize,
@@ -1894,8 +1938,8 @@ impl CtEngine {
             let step = self.prepared_steps[idx];
             match step.source {
                 ExistingSource::Node(node_idx) => {
-                    let mut counts = step.counts;
-                    let mut log_prob_kt = step.kt_log_prob;
+                    let (mut counts, mut log_prob_kt) =
+                        self.source_counts_and_kt_log_prob(step.source);
                     apply_update_to_state_raw(
                         log_int,
                         log_half,
@@ -1922,8 +1966,8 @@ impl CtEngine {
                     child_weight = weighted;
                 }
                 ExistingSource::Segment(segment_idx, offset) => {
-                    let mut counts = step.counts;
-                    let mut log_prob_kt = step.kt_log_prob;
+                    let (mut counts, mut log_prob_kt) =
+                        self.source_counts_and_kt_log_prob(step.source);
                     apply_update_to_state_raw(
                         log_int,
                         log_half,
@@ -2151,12 +2195,23 @@ impl CtEngine {
                     self.arena.set_child(node_idx, path_edge, updated);
                 }
             }
-            let mut counts = self.arena.nodes[node_idx.get()].symbol_count;
-            let mut log_prob_kt = self.arena.nodes[node_idx.get()].log_prob_kt;
+            let slot = node_idx.get();
+            let mut counts = self.arena.nodes[slot].symbol_count;
+            let mut log_prob_kt = self.arena.nodes[slot].log_prob_kt;
             apply_update_to_state_raw(log_int, log_half, &mut counts, &mut log_prob_kt, sym_idx);
-            self.arena.nodes[node_idx.get()].symbol_count = counts;
-            self.arena.nodes[node_idx.get()].log_prob_kt = log_prob_kt;
-            self.arena.recompute_node_weight(node_idx);
+            let [left, right] = self.arena.nodes[slot].children;
+            let weighted = if left.is_none() && right.is_none() {
+                clamp_log_prob(log_prob_kt)
+            } else {
+                // Safety: `left`/`right` come from this node's stored children, so any
+                // non-none child index is arena-owned and in-bounds for this arena.
+                let w0 = unsafe { self.arena.child_ref_weighted_unchecked(left) };
+                let w1 = unsafe { self.arena.child_ref_weighted_unchecked(right) };
+                update_weighted_log_prob_non_leaf(log_prob_kt, w0, w1)
+            };
+            self.arena.nodes[slot].symbol_count = counts;
+            self.arena.nodes[slot].log_prob_kt = log_prob_kt;
+            self.arena.nodes[slot].log_prob_weighted = weighted;
             return ChildRef::from_node(node_idx);
         }
 
@@ -2667,14 +2722,9 @@ impl CtEngine {
             match source {
                 ExistingSource::None => break,
                 ExistingSource::Node(node_idx) => {
-                    let slot = node_idx.get();
-                    let counts = self.arena.nodes[slot].symbol_count;
-                    let kt_log_prob = self.arena.nodes[slot].log_prob_kt;
                     if depth == self.max_depth {
                         self.prepared_steps.push(PreparedStep {
                             source: ExistingSource::Node(node_idx),
-                            counts,
-                            kt_log_prob,
                             span: 1,
                             sibling_weight: 0.0,
                             has_sibling: 0,
@@ -2686,8 +2736,6 @@ impl CtEngine {
                     let sibling = self.arena.child(node_idx, path_edge ^ 1);
                     self.prepared_steps.push(PreparedStep {
                         source: ExistingSource::Node(node_idx),
-                        counts,
-                        kt_log_prob,
                         span: 1,
                         sibling_weight: self.arena.child_ref_weighted(sibling),
                         has_sibling: sibling.is_some() as u8,
@@ -2704,8 +2752,6 @@ impl CtEngine {
                 ExistingSource::Segment(segment_idx, _) => {
                     let segment = self.arena.segments[segment_idx.get()];
                     let seg_len = segment.len() as usize;
-                    let counts = segment.symbol_count;
-                    let kt_log_prob = segment.log_prob_kt;
                     for offset in 0..seg_len {
                         let node_depth = depth + offset;
                         let span = (offset + 1) as u32;
@@ -2713,8 +2759,6 @@ impl CtEngine {
                         if node_depth == self.max_depth {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
-                                counts,
-                                kt_log_prob,
                                 span,
                                 sibling_weight: 0.0,
                                 has_sibling: 0,
@@ -2726,8 +2770,6 @@ impl CtEngine {
                         if offset + 1 >= seg_len && segment.tail.is_none() {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
-                                counts,
-                                kt_log_prob,
                                 span,
                                 sibling_weight: 0.0,
                                 has_sibling: 0,
@@ -2743,8 +2785,6 @@ impl CtEngine {
                         if path_edge != existing_edge {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
-                                counts,
-                                kt_log_prob,
                                 span,
                                 sibling_weight: self
                                     .arena
@@ -2762,8 +2802,6 @@ impl CtEngine {
 
                         self.prepared_steps.push(PreparedStep {
                             source: ExistingSource::Segment(segment_idx, offset as u32),
-                            counts,
-                            kt_log_prob,
                             span,
                             sibling_weight: 0.0,
                             has_sibling: 0,
@@ -2795,8 +2833,7 @@ impl CtEngine {
         }
 
         let last_step = *self.prepared_steps.last().unwrap();
-        let last_counts = last_step.counts;
-        let last_kt_log_prob = last_step.kt_log_prob;
+        let (last_counts, last_kt_log_prob) = self.source_counts_and_kt_log_prob(last_step.source);
         let (mut child_weight, mut ratio) = if self.prepared_end == PreparedEnd::MaxDepth
             && self.prepared_levels == self.max_depth
         {
@@ -2819,8 +2856,8 @@ impl CtEngine {
                 let (alpha, log_alpha, log_one_minus_alpha) =
                     self.segment_constants(last_step.span - 1);
                 (child_weight, ratio) = unary_chain_ratio_transform_precomputed(
-                    last_step.kt_log_prob,
-                    last_step.counts,
+                    last_kt_log_prob,
+                    last_counts,
                     child_weight,
                     ratio,
                     alpha,
@@ -2833,11 +2870,12 @@ impl CtEngine {
 
         for idx in (0..self.prepared_steps.len() - 1).rev() {
             let step = self.prepared_steps[idx];
+            let (step_counts, step_kt_log_prob) = self.source_counts_and_kt_log_prob(step.source);
             match step.source {
                 ExistingSource::Node(_) => {
                     (child_weight, ratio) = combined_weight_ratio_internal(
-                        step.kt_log_prob,
-                        step.counts,
+                        step_kt_log_prob,
+                        step_counts,
                         child_weight,
                         step.sibling_weight,
                         ratio,
@@ -2847,8 +2885,8 @@ impl CtEngine {
                 ExistingSource::Segment(_, _) => {
                     let (alpha, log_alpha, log_one_minus_alpha) = self.segment_constants(step.span);
                     (child_weight, ratio) = unary_chain_ratio_transform_precomputed(
-                        step.kt_log_prob,
-                        step.counts,
+                        step_kt_log_prob,
+                        step_counts,
                         child_weight,
                         ratio,
                         alpha,
@@ -2900,14 +2938,9 @@ impl CtEngine {
             match source {
                 ExistingSource::None => break,
                 ExistingSource::Node(node_idx) => {
-                    let slot = node_idx.get();
-                    let counts = self.arena.nodes[slot].symbol_count;
-                    let kt_log_prob = self.arena.nodes[slot].log_prob_kt;
                     if depth == self.max_depth {
                         self.prepared_steps.push(PreparedStep {
                             source: ExistingSource::Node(node_idx),
-                            counts,
-                            kt_log_prob,
                             span: 1,
                             sibling_weight: 0.0,
                             has_sibling: 0,
@@ -2919,8 +2952,6 @@ impl CtEngine {
                     let sibling = self.arena.child(node_idx, path_edge ^ 1);
                     self.prepared_steps.push(PreparedStep {
                         source: ExistingSource::Node(node_idx),
-                        counts,
-                        kt_log_prob,
                         span: 1,
                         sibling_weight: self.arena.child_ref_weighted(sibling),
                         has_sibling: sibling.is_some() as u8,
@@ -2937,8 +2968,6 @@ impl CtEngine {
                 ExistingSource::Segment(segment_idx, _) => {
                     let segment = self.arena.segments[segment_idx.get()];
                     let seg_len = segment.len() as usize;
-                    let counts = segment.symbol_count;
-                    let kt_log_prob = segment.log_prob_kt;
                     for offset in 0..seg_len {
                         let node_depth = depth + offset;
                         let span = (offset + 1) as u32;
@@ -2946,8 +2975,6 @@ impl CtEngine {
                         if node_depth == self.max_depth {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
-                                counts,
-                                kt_log_prob,
                                 span,
                                 sibling_weight: 0.0,
                                 has_sibling: 0,
@@ -2959,8 +2986,6 @@ impl CtEngine {
                         if offset + 1 >= seg_len && segment.tail.is_none() {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
-                                counts,
-                                kt_log_prob,
                                 span,
                                 sibling_weight: 0.0,
                                 has_sibling: 0,
@@ -2976,8 +3001,6 @@ impl CtEngine {
                         if path_edge != existing_edge {
                             self.prepared_steps.push(PreparedStep {
                                 source: ExistingSource::Segment(segment_idx, offset as u32),
-                                counts,
-                                kt_log_prob,
                                 span,
                                 sibling_weight: self
                                     .arena
@@ -2995,8 +3018,6 @@ impl CtEngine {
 
                         self.prepared_steps.push(PreparedStep {
                             source: ExistingSource::Segment(segment_idx, offset as u32),
-                            counts,
-                            kt_log_prob,
                             span,
                             sibling_weight: 0.0,
                             has_sibling: 0,
@@ -3027,8 +3048,7 @@ impl CtEngine {
         }
 
         let last_step = *self.prepared_steps.last().unwrap();
-        let last_counts = last_step.counts;
-        let last_kt_log_prob = last_step.kt_log_prob;
+        let (last_counts, last_kt_log_prob) = self.source_counts_and_kt_log_prob(last_step.source);
         let (mut child_weight, mut ratio) = if self.prepared_end == PreparedEnd::MaxDepth
             && self.prepared_levels == self.max_depth
         {
@@ -3051,8 +3071,8 @@ impl CtEngine {
             let (alpha, log_alpha, log_one_minus_alpha) =
                 self.segment_constants(last_step.span - 1);
             (child_weight, ratio) = unary_chain_ratio_transform_precomputed_one(
-                last_step.kt_log_prob,
-                last_step.counts,
+                last_kt_log_prob,
+                last_counts,
                 child_weight,
                 ratio,
                 alpha,
@@ -3063,11 +3083,12 @@ impl CtEngine {
 
         for idx in (0..self.prepared_steps.len() - 1).rev() {
             let step = self.prepared_steps[idx];
+            let (step_counts, step_kt_log_prob) = self.source_counts_and_kt_log_prob(step.source);
             match step.source {
                 ExistingSource::Node(_) => {
                     (child_weight, ratio) = combined_weight_ratio_internal_one(
-                        step.kt_log_prob,
-                        step.counts,
+                        step_kt_log_prob,
+                        step_counts,
                         child_weight,
                         step.sibling_weight,
                         ratio,
@@ -3076,8 +3097,8 @@ impl CtEngine {
                 ExistingSource::Segment(_, _) => {
                     let (alpha, log_alpha, log_one_minus_alpha) = self.segment_constants(step.span);
                     (child_weight, ratio) = unary_chain_ratio_transform_precomputed_one(
-                        step.kt_log_prob,
-                        step.counts,
+                        step_kt_log_prob,
+                        step_counts,
                         child_weight,
                         ratio,
                         alpha,
@@ -4391,6 +4412,67 @@ mod tests {
         assert_close(fac.get_log_block_probability(), log_before);
         assert_close(fac.predict(false, 3), p0_before);
         assert_close(fac.predict(true, 3), p1_before);
+    }
+
+    #[test]
+    fn ctw_inline_node_weight_recompute_matches_recompute_node_weight() {
+        fn inline_weight(arena: &CtArena, idx: NodeIndex) -> f64 {
+            let slot = idx.get();
+            let node = arena.nodes[slot];
+            let [left, right] = node.children;
+            if left.is_none() && right.is_none() {
+                clamp_log_prob(node.log_prob_kt)
+            } else {
+                let w0 = arena.child_ref_weighted(left);
+                let w1 = arena.child_ref_weighted(right);
+                update_weighted_log_prob_non_leaf(node.log_prob_kt, w0, w1)
+            }
+        }
+
+        let mut arena = CtArena::new();
+        let parent = arena.alloc_node_with_state([3, 5], -1.75);
+        let left_node = arena.alloc_node_with_state([2, 1], -0.25);
+        let right_node = arena.alloc_node_with_state([1, 2], -0.50);
+        arena.nodes[left_node.get()].log_prob_weighted = -0.333_333_333_f64;
+        arena.nodes[right_node.get()].log_prob_weighted = -0.777_777_777_f64;
+
+        let seg = arena.alloc_segment();
+        arena.segments[seg.get()].head_log_prob_weighted = -0.125_f64;
+
+        let cases = [
+            (ChildRef::NONE, ChildRef::NONE, -2.0_f64),
+            (
+                ChildRef::from_node(left_node),
+                ChildRef::from_node(right_node),
+                -1.0_f64,
+            ),
+            (
+                ChildRef::from_node(left_node),
+                ChildRef::from_segment(seg),
+                -0.625_f64,
+            ),
+            (
+                ChildRef::from_segment(seg),
+                ChildRef::from_node(right_node),
+                -0.3125_f64,
+            ),
+        ];
+
+        for (left, right, kt) in cases {
+            let slot = parent.get();
+            arena.nodes[slot].children = [left, right];
+            arena.nodes[slot].log_prob_kt = kt;
+            arena.nodes[slot].log_prob_weighted = f64::NAN;
+
+            let expected = inline_weight(&arena, parent);
+            arena.recompute_node_weight(parent);
+            let actual = arena.nodes[slot].log_prob_weighted;
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "node-weight recompute mismatch for children=({left:?},{right:?}) kt={kt}"
+            );
+        }
     }
 
     #[test]
