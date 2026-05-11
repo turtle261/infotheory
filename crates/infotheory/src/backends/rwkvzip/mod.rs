@@ -262,6 +262,12 @@ struct FullTbpttRuntime {
     settings: Option<FullTrainSettings>,
 }
 
+#[derive(Clone, Copy)]
+enum PdfSource<'a> {
+    External(&'a [f64]),
+    CurrentBuffer,
+}
+
 #[derive(Clone)]
 /// Snapshot of mutable runtime state used for reversible scoring.
 pub struct RuntimeSnapshot {
@@ -340,6 +346,27 @@ impl OnlineRuntime {
             self.prepare_policy_stream(None)?;
         }
         Ok(self.policy_runtime.as_mut().map(PolicyRuntime::next_action))
+    }
+
+    #[inline]
+    fn should_capture_full_trace_for_next_step(&self) -> bool {
+        if self.full_tbptt.is_none() {
+            return false;
+        }
+        let Some(runtime) = self.policy_runtime.as_ref() else {
+            // Preserve legacy behavior outside an explicitly prepared stream.
+            return true;
+        };
+        let PolicyAction::Train(train) = runtime.peek_action() else {
+            return false;
+        };
+        let scope = scope_from_train_action(&train);
+        if !scope.trains_non_head_params() || train.hyper.lr <= 0.0 {
+            return false;
+        }
+        let stride = train.hyper.stride.max(1) as u64;
+        let next_train_step = self.policy_train_steps.saturating_add(1);
+        stride <= 1 || (next_train_step % stride) == 0
     }
 }
 
@@ -1089,6 +1116,7 @@ impl Compressor {
 
     fn forward_with_online_record(&mut self, token: u32) {
         if let Some(online) = self.online.as_mut()
+            && online.should_capture_full_trace_for_next_step()
             && let Some(tbptt) = online.full_tbptt.as_mut()
         {
             tbptt.pending_input_token = Some(token);
@@ -1107,12 +1135,10 @@ impl Compressor {
                         let settings = tbptt.settings.ok_or_else(|| {
                             anyhow::anyhow!("rwkv full tbptt settings are missing")
                         })?;
-                        let start_state = tbptt.segment_start_state.clone().ok_or_else(|| {
+                        let start_state = tbptt.segment_start_state.take().ok_or_else(|| {
                             anyhow::anyhow!("rwkv full tbptt segment start is missing")
                         })?;
-                        let steps = tbptt.steps.clone();
-                        tbptt.steps.clear();
-                        tbptt.segment_start_state = None;
+                        let steps = std::mem::take(&mut tbptt.steps);
                         tbptt.settings = None;
                         let need_full_adam = matches!(settings.optimizer, OptimizerKind::Adam)
                             && settings.scope.trains_non_head_params()
@@ -1139,10 +1165,11 @@ impl Compressor {
         let Some(online) = self.online.as_mut() else {
             return Ok(());
         };
+        let mut reusable_steps = steps;
         model.online_train_segment_tbptt(
             &mut self.scratch,
             &start_state,
-            &steps,
+            &reusable_steps,
             settings.scope,
             settings.optimizer,
             settings.lr,
@@ -1167,6 +1194,10 @@ impl Compressor {
             },
             &mut self.state,
         )?;
+        reusable_steps.clear();
+        if let Some(tbptt) = online.full_tbptt.as_mut() {
+            tbptt.steps = reusable_steps;
+        }
         let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
         Self::logits_to_pdf(self.scratch.logits(), bias, &mut self.pdf_buffer);
         Ok(())
@@ -1461,18 +1492,18 @@ impl Compressor {
 
     /// Apply one online update using externally supplied predictive PDF.
     pub fn online_update_from_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
-        self.online_update_with_pdf(symbol, pdf)
+        self.online_update_with_pdf(symbol, PdfSource::External(pdf))
     }
 
     #[inline]
     /// Update online state from `pdf`, then advance model state with `symbol`.
     pub fn observe_symbol_from_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
-        self.online_update_with_pdf(symbol, pdf)?;
+        self.online_update_with_pdf(symbol, PdfSource::External(pdf))?;
         self.refresh_current_pdf(symbol as u32);
         Ok(())
     }
 
-    fn online_update_with_pdf(&mut self, symbol: u8, pdf: &[f64]) -> Result<()> {
+    fn online_update_with_pdf(&mut self, symbol: u8, pdf_source: PdfSource<'_>) -> Result<()> {
         let (optimizer, lr, stride_hit, scope, bptt, clip) = {
             let Some(online) = self.online.as_mut() else {
                 return Ok(());
@@ -1510,7 +1541,10 @@ impl Compressor {
 
         if !scope.trains_non_head_params() {
             let hidden = self.scratch.lm_head_input().to_vec();
-            let pdf_snapshot = pdf.to_vec();
+            let pdf_snapshot = match pdf_source {
+                PdfSource::External(pdf) => pdf.to_vec(),
+                PdfSource::CurrentBuffer => self.pdf_buffer.clone(),
+            };
             self.flush_full_tbptt_segment()?;
             let Some(online) = self.online.as_mut() else {
                 return Ok(());
@@ -1546,8 +1580,7 @@ impl Compressor {
     }
 
     fn online_update_from_current_pdf(&mut self, symbol: u8) -> Result<()> {
-        let pdf_snapshot = self.pdf_buffer.clone();
-        self.online_update_with_pdf(symbol, &pdf_snapshot)
+        self.online_update_with_pdf(symbol, PdfSource::CurrentBuffer)
     }
 
     #[inline]
