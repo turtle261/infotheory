@@ -1,7 +1,9 @@
 use ahash::AHashMap;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, hash_map::Entry};
 
 const PDF_MIN: f64 = crate::mixture::DEFAULT_MIN_PROB;
+const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+const FNV_PRIME: u64 = 0x1000_0000_01B3;
 
 #[derive(Clone, Debug, Default)]
 struct ContextStats {
@@ -40,6 +42,7 @@ pub struct PpmdModel {
     contexts: Vec<AHashMap<u64, ContextStats>>,
     queue: VecDeque<(usize, u64)>,
     history: Vec<u8>,
+    suffix_keys: Vec<u64>,
     pdf: [f64; 256],
     cdf: [f64; 257],
     valid: bool,
@@ -57,6 +60,7 @@ impl PpmdModel {
             contexts: (0..=order).map(|_| AHashMap::new()).collect(),
             queue: VecDeque::new(),
             history: Vec::new(),
+            suffix_keys: vec![0; order + 1],
             pdf: [1.0 / 256.0; 256],
             cdf: uniform_cdf(),
             valid: false,
@@ -94,16 +98,18 @@ impl PpmdModel {
         for ord in 0..=max_order {
             let key = self.context_key(ord);
             let map = &mut self.contexts[ord];
-            if !map.contains_key(&key) {
-                map.insert(key, ContextStats::default());
-                self.queue.push_back((ord, key));
-            }
-            if let Some(ctx) = map.get_mut(&key) {
-                ctx.observe(symbol);
+            match map.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().observe(symbol);
+                }
+                Entry::Vacant(entry) => {
+                    self.queue.push_back((ord, key));
+                    entry.insert(ContextStats::default()).observe(symbol);
+                }
             }
         }
         self.prune();
-        self.history.push(symbol);
+        self.append_history_symbol(symbol);
         self.valid = false;
         self.cdf_valid = false;
     }
@@ -111,6 +117,7 @@ impl PpmdModel {
     /// Reset only the conditioning history while preserving fitted contexts.
     pub fn reset_history(&mut self) {
         self.history.clear();
+        self.suffix_keys.fill(0);
         self.valid = false;
         self.cdf_valid = false;
         self.pdf.fill(1.0 / 256.0);
@@ -119,7 +126,7 @@ impl PpmdModel {
 
     /// Advance conditioning history without updating fitted context counts.
     pub fn update_history_only(&mut self, symbol: u8) {
-        self.history.push(symbol);
+        self.append_history_symbol(symbol);
         self.valid = false;
         self.cdf_valid = false;
     }
@@ -137,7 +144,7 @@ impl PpmdModel {
         for ord in 0..=max_order {
             let key = self.context_key(ord);
             if let Some(ctx) = self.contexts[ord].get(&key) {
-                lower = interpolate_context(ctx, &lower);
+                interpolate_context_in_place(ctx, &mut lower);
             }
         }
         self.pdf.copy_from_slice(&lower);
@@ -165,23 +172,36 @@ impl PpmdModel {
         if ord == 0 {
             return 0;
         }
-        let start = self.history.len() - ord;
-        hash_bytes(&self.history[start..])
+        debug_assert!(ord <= self.order);
+        debug_assert!(ord <= self.history.len());
+        self.suffix_keys[ord]
+    }
+
+    fn append_history_symbol(&mut self, symbol: u8) {
+        let new_max_order = self.order.min(self.history.len() + 1);
+        for ord in (1..=new_max_order).rev() {
+            let prev_hash = if ord == 1 {
+                FNV_OFFSET
+            } else {
+                self.suffix_keys[ord - 1]
+            };
+            self.suffix_keys[ord] = extend_hash(prev_hash, symbol);
+        }
+        self.suffix_keys[0] = 0;
+        self.history.push(symbol);
     }
 }
 
-fn interpolate_context(ctx: &ContextStats, lower: &[f64; 256]) -> [f64; 256] {
+fn interpolate_context_in_place(ctx: &ContextStats, lower: &mut [f64; 256]) {
     let distinct = ctx.counts.len() as f64;
     let denom = (ctx.total as f64) + distinct + 1.0;
     let escape = (distinct + 1.0) / denom;
-    let mut out = [0.0; 256];
-    for i in 0..256 {
-        out[i] = lower[i] * escape;
+    for p in lower.iter_mut() {
+        *p *= escape;
     }
     for &(symbol, count) in &ctx.counts {
-        out[symbol as usize] += (count as f64) / denom;
+        lower[symbol as usize] += (count as f64) / denom;
     }
-    out
 }
 
 fn normalize_pdf_and_maybe_cdf(pdf: &mut [f64; 256], mut cdf: Option<&mut [f64; 257]>) {
@@ -238,11 +258,100 @@ fn build_cdf_from_pdf(pdf: &[f64; 256], cdf: &mut [f64; 257]) {
     }
 }
 
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut h = 0xCBF2_9CE4_8422_2325u64;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x1000_0000_01B3);
+#[inline]
+fn extend_hash(hash: u64, byte: u8) -> u64 {
+    (hash ^ (byte as u64)).wrapping_mul(FNV_PRIME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash_bytes(bytes: &[u8]) -> u64 {
+        let mut h = FNV_OFFSET;
+        for &b in bytes {
+            h = extend_hash(h, b);
+        }
+        h
     }
-    h
+
+    fn reference_context_key(history: &[u8], ord: usize) -> u64 {
+        if ord == 0 {
+            0
+        } else {
+            hash_bytes(&history[history.len() - ord..])
+        }
+    }
+
+    fn assert_suffix_keys_match_reference(model: &PpmdModel) {
+        let max_order = model.order.min(model.history.len());
+        for ord in 0..=max_order {
+            assert_eq!(
+                model.context_key(ord),
+                reference_context_key(&model.history, ord)
+            );
+        }
+    }
+
+    fn reference_interpolate_context(ctx: &ContextStats, lower: &[f64; 256]) -> [f64; 256] {
+        let distinct = ctx.counts.len() as f64;
+        let denom = (ctx.total as f64) + distinct + 1.0;
+        let escape = (distinct + 1.0) / denom;
+        let mut out = [0.0; 256];
+        for i in 0..256 {
+            out[i] = lower[i] * escape;
+        }
+        for &(symbol, count) in &ctx.counts {
+            out[symbol as usize] += (count as f64) / denom;
+        }
+        out
+    }
+
+    #[test]
+    fn rolling_suffix_keys_match_recomputed_suffix_hashes() {
+        let mut model = PpmdModel::new(12, 1);
+        let bytes = [
+            0, 1, 2, 3, 255, 128, 64, 32, 16, 8, 4, 2, 1, 0, 251, 17, 99, 100,
+        ];
+        assert_suffix_keys_match_reference(&model);
+        for &byte in &bytes {
+            model.update(byte);
+            assert_suffix_keys_match_reference(&model);
+        }
+
+        let mut cloned = model.clone();
+        assert_suffix_keys_match_reference(&cloned);
+        for &byte in &[7, 6, 5, 4, 3, 2, 1] {
+            cloned.update_history_only(byte);
+            assert_suffix_keys_match_reference(&cloned);
+        }
+
+        cloned.reset_history();
+        assert_suffix_keys_match_reference(&cloned);
+        assert!(cloned.suffix_keys.iter().all(|&key| key == 0));
+
+        for &byte in &[42, 43, 44, 45] {
+            cloned.update_history_only(byte);
+            assert_suffix_keys_match_reference(&cloned);
+        }
+    }
+
+    #[test]
+    fn in_place_interpolation_matches_out_of_place_reference() {
+        let mut ctx = ContextStats::default();
+        for &symbol in &[0, 1, 1, 2, 3, 3, 3, 128, 255, 255] {
+            ctx.observe(symbol);
+        }
+
+        let mut lower = [0.0; 256];
+        for (i, p) in lower.iter_mut().enumerate() {
+            *p = ((i + 1) as f64) / 32896.0;
+        }
+
+        let expected = reference_interpolate_context(&ctx, &lower);
+        interpolate_context_in_place(&ctx, &mut lower);
+        for (expected, actual) in expected.iter().zip(lower.iter()) {
+            assert_eq!(expected.to_bits(), actual.to_bits());
+        }
+    }
 }

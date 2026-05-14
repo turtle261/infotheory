@@ -3986,6 +3986,17 @@ mod tests {
     }
 
     #[test]
+    fn ppmd_checkpoint_restores_mixed_learned_and_frozen_updates() {
+        assert_checkpoint_roundtrip_restores_predictor(
+            RateBackend::Ppmd {
+                order: 8,
+                memory_mb: 8,
+            },
+            b"ppmd checkpoint base history",
+        );
+    }
+
+    #[test]
     fn calibrated_checkpoint_restores_wrapped_predictor_and_calibration_state() {
         assert_checkpoint_roundtrip_restores_predictor(
             RateBackend::Calibrated {
