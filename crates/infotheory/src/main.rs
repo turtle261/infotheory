@@ -1053,6 +1053,350 @@ fn parse_compression_backend_flag_or_exit(value: &str, flag_name: &str) -> Strin
         })
 }
 
+#[cfg(feature = "backend-ctw")]
+fn parse_ctw_profile_size(raw: &str, field: &str) -> anyhow::Result<usize> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let (digits, multiplier): (&str, usize) = if let Some(prefix) = lower.strip_suffix("kib") {
+        (prefix, 1024)
+    } else if let Some(prefix) = lower.strip_suffix("mib") {
+        (prefix, 1024 * 1024)
+    } else if let Some(prefix) = lower.strip_suffix("gib") {
+        (prefix, 1024 * 1024 * 1024)
+    } else if let Some(prefix) = lower.strip_suffix('k') {
+        (prefix, 1_000)
+    } else if let Some(prefix) = lower.strip_suffix('m') {
+        (prefix, 1_000_000)
+    } else if let Some(prefix) = lower.strip_suffix('g') {
+        (prefix, 1_000_000_000)
+    } else {
+        (trimmed, 1)
+    };
+    let value = digits
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("{field} must be a non-negative integer size, got '{raw}'"))?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("{field} overflows usize: '{raw}'"))
+}
+
+#[cfg(feature = "backend-ctw")]
+fn parse_ctw_profile_cutpoints(raw: &str) -> anyhow::Result<Vec<usize>> {
+    let mut cutpoints = raw
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| parse_ctw_profile_size(part, "--cutpoints"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    cutpoints.sort_unstable();
+    cutpoints.dedup();
+    if cutpoints.is_empty() {
+        anyhow::bail!("--cutpoints must contain at least one byte count");
+    }
+    Ok(cutpoints)
+}
+
+#[cfg(feature = "backend-ctw")]
+fn default_ctw_profile_cutpoints(max_bytes: Option<usize>) -> Vec<usize> {
+    let mut cutpoints = Vec::new();
+    let mut next = 1_000_000usize;
+    while next < 1_000_000_000usize {
+        cutpoints.push(next);
+        next = next.saturating_mul(2);
+    }
+    cutpoints.push(1_000_000_000usize);
+    if let Some(max_bytes) = max_bytes {
+        cutpoints.retain(|cutpoint| *cutpoint <= max_bytes);
+        if cutpoints.last().copied() != Some(max_bytes) {
+            cutpoints.push(max_bytes);
+        }
+    }
+    cutpoints
+}
+
+#[cfg(all(feature = "backend-ctw", target_os = "linux"))]
+fn ctw_profile_proc_memory_bytes() -> serde_json::Value {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return serde_json::json!(null);
+    };
+    let mut vm_rss_bytes = None;
+    let mut vm_hwm_bytes = None;
+    for line in status.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next() else {
+            continue;
+        };
+        let Ok(kib) = value.parse::<u64>() else {
+            continue;
+        };
+        match key {
+            "VmRSS:" => vm_rss_bytes = kib.checked_mul(1024),
+            "VmHWM:" => vm_hwm_bytes = kib.checked_mul(1024),
+            _ => {}
+        }
+    }
+    serde_json::json!({
+        "vm_rss_bytes": vm_rss_bytes,
+        "vm_hwm_bytes": vm_hwm_bytes,
+    })
+}
+
+#[cfg(all(feature = "backend-ctw", not(target_os = "linux")))]
+fn ctw_profile_proc_memory_bytes() -> serde_json::Value {
+    serde_json::json!(null)
+}
+
+#[cfg(feature = "backend-ctw")]
+fn ctw_profile_tree_json(tree: &infotheory::ctw::FacContextTreeTreeTelemetry) -> serde_json::Value {
+    serde_json::json!({
+        "bit_index": tree.bit_index,
+        "max_depth": tree.max_depth,
+        "root_visits": tree.root_visits,
+        "nodes_len": tree.nodes_len,
+        "nodes_capacity": tree.nodes_capacity,
+        "segments_len": tree.segments_len,
+        "segments_capacity": tree.segments_capacity,
+        "free_nodes_len": tree.free_nodes_len,
+        "free_nodes_capacity": tree.free_nodes_capacity,
+        "free_segments_len": tree.free_segments_len,
+        "free_segments_capacity": tree.free_segments_capacity,
+        "node_bytes": tree.node_bytes,
+        "segment_bytes": tree.segment_bytes,
+        "free_list_bytes": tree.free_list_bytes,
+        "scratch_bytes": tree.scratch_bytes,
+        "total_bytes": tree.total_bytes,
+        "exact_segments": tree.exact_segments,
+        "history_segments": tree.history_segments,
+        "history_invert_segments": tree.history_invert_segments,
+        "const_segments": tree.const_segments,
+        "segment_bits": tree.segment_bits,
+        "max_segment_len": tree.max_segment_len,
+    })
+}
+
+#[cfg(feature = "backend-ctw")]
+fn ctw_profile_snapshot_json(
+    mode: &str,
+    depth: usize,
+    bytes_seen: usize,
+    log_prob: Option<f64>,
+    elapsed_seconds: f64,
+    telemetry: &infotheory::ctw::FacContextTreeTelemetry,
+) -> serde_json::Value {
+    let bits = log_prob.map(|value| -value / std::f64::consts::LN_2);
+    let bits_per_byte = bits.and_then(|value| {
+        if bytes_seen == 0 {
+            None
+        } else {
+            Some(value / bytes_seen as f64)
+        }
+    });
+    serde_json::json!({
+        "kind": "ctw_profile_snapshot",
+        "mode": mode,
+        "depth": depth,
+        "bytes_seen": bytes_seen,
+        "elapsed_seconds": elapsed_seconds,
+        "log_probability": log_prob,
+        "bits": bits,
+        "bits_per_byte": bits_per_byte,
+        "rss": ctw_profile_proc_memory_bytes(),
+        "telemetry": {
+            "base_depth": telemetry.base_depth,
+            "num_bits": telemetry.num_bits,
+            "shared_history_len_bits": telemetry.shared_history_len_bits,
+            "shared_history_capacity_bits": telemetry.shared_history_capacity_bits,
+            "shared_history_bytes": telemetry.shared_history_bytes,
+            "shared_log_cache_bytes": telemetry.shared_log_cache_bytes,
+            "tree_bytes": telemetry.tree_bytes,
+            "total_bytes": telemetry.total_bytes,
+            "nodes_len": telemetry.nodes_len,
+            "nodes_capacity": telemetry.nodes_capacity,
+            "segments_len": telemetry.segments_len,
+            "segments_capacity": telemetry.segments_capacity,
+            "free_nodes_len": telemetry.free_nodes_len,
+            "free_segments_len": telemetry.free_segments_len,
+            "exact_segments": telemetry.exact_segments,
+            "history_segments": telemetry.history_segments,
+            "history_invert_segments": telemetry.history_invert_segments,
+            "const_segments": telemetry.const_segments,
+            "segment_bits": telemetry.segment_bits,
+            "trees": telemetry.trees.iter().map(ctw_profile_tree_json).collect::<Vec<_>>(),
+        },
+    })
+}
+
+#[cfg(feature = "backend-ctw")]
+fn run_ctw_profile_mode(args: &[String]) {
+    let result = (|| -> anyhow::Result<()> {
+        let mut input_path: Option<String> = None;
+        let mut depth: usize = 32;
+        let mut max_bytes: Option<usize> = None;
+        let mut reserve_symbols: Option<usize> = None;
+        let mut cutpoints: Option<Vec<usize>> = None;
+        let mut update_only = false;
+        let mut i = 2usize;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--update-only" => {
+                    update_only = true;
+                }
+                "--depth" => {
+                    i += 1;
+                    let raw = args
+                        .get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--depth requires a value"))?;
+                    depth = raw
+                        .parse::<usize>()
+                        .map_err(|_| anyhow::anyhow!("--depth must be a non-negative integer"))?;
+                }
+                "--max-bytes" => {
+                    i += 1;
+                    let raw = args
+                        .get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--max-bytes requires a value"))?;
+                    max_bytes = Some(parse_ctw_profile_size(raw, "--max-bytes")?);
+                }
+                "--reserve-symbols" => {
+                    i += 1;
+                    let raw = args
+                        .get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--reserve-symbols requires a value"))?;
+                    reserve_symbols = Some(parse_ctw_profile_size(raw, "--reserve-symbols")?);
+                }
+                "--cutpoints" => {
+                    i += 1;
+                    let raw = args
+                        .get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--cutpoints requires a value"))?;
+                    cutpoints = Some(parse_ctw_profile_cutpoints(raw)?);
+                }
+                flag if flag.starts_with("--") => {
+                    anyhow::bail!("unknown ctw-profile option '{flag}'");
+                }
+                value => {
+                    if input_path.is_some() {
+                        anyhow::bail!("ctw-profile accepts exactly one input path or '-'");
+                    }
+                    input_path = Some(value.to_string());
+                }
+            }
+            i += 1;
+        }
+
+        let input_path = input_path
+            .ok_or_else(|| anyhow::anyhow!("ctw-profile requires an input path or '-'"))?;
+        let mut cutpoints = cutpoints.unwrap_or_else(|| default_ctw_profile_cutpoints(max_bytes));
+        cutpoints.sort_unstable();
+        cutpoints.dedup();
+
+        let mut tree = infotheory::ctw::FacContextTree::new(depth, 8);
+        if let Some(symbols) = reserve_symbols {
+            tree.reserve_for_symbols(symbols);
+        }
+
+        let stdin = io::stdin();
+        let mut source: Box<dyn Read + '_> = if input_path == "-" {
+            Box::new(stdin.lock())
+        } else {
+            Box::new(File::open(&input_path)?)
+        };
+        let mut reader = io::BufReader::with_capacity(1 << 20, &mut source);
+        let mut out = BufWriter::new(io::stdout().lock());
+        let started = Instant::now();
+        let mut buf = [0u8; 1 << 20];
+        let mut bytes_seen: usize = 0;
+        let mut log_prob = 0.0f64;
+        let mut cutpoint_index = 0usize;
+        let mode = if update_only {
+            "update_only"
+        } else {
+            "log_prob_update"
+        };
+
+        let initial = tree.telemetry();
+        writeln!(
+            out,
+            "{}",
+            ctw_profile_snapshot_json(
+                mode,
+                depth,
+                bytes_seen,
+                (!update_only).then_some(log_prob),
+                0.0,
+                &initial,
+            )
+        )?;
+
+        'outer: loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            for &byte in &buf[..n] {
+                if max_bytes.is_some_and(|limit| bytes_seen >= limit) {
+                    break 'outer;
+                }
+                if update_only {
+                    tree.update_byte_msb(byte);
+                } else {
+                    log_prob += tree.log_prob_update_byte_msb(byte);
+                }
+                bytes_seen = bytes_seen.saturating_add(1);
+                while cutpoint_index < cutpoints.len() && bytes_seen >= cutpoints[cutpoint_index] {
+                    let telemetry = tree.telemetry();
+                    writeln!(
+                        out,
+                        "{}",
+                        ctw_profile_snapshot_json(
+                            mode,
+                            depth,
+                            bytes_seen,
+                            (!update_only).then_some(log_prob),
+                            started.elapsed().as_secs_f64(),
+                            &telemetry,
+                        )
+                    )?;
+                    out.flush()?;
+                    cutpoint_index += 1;
+                }
+            }
+        }
+
+        if cutpoints.last().copied() != Some(bytes_seen) {
+            let telemetry = tree.telemetry();
+            writeln!(
+                out,
+                "{}",
+                ctw_profile_snapshot_json(
+                    mode,
+                    depth,
+                    bytes_seen,
+                    (!update_only).then_some(log_prob),
+                    started.elapsed().as_secs_f64(),
+                    &telemetry,
+                )
+            )?;
+        }
+        out.flush()?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        eprintln!("Error: ctw-profile failed: {err:#}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(feature = "backend-ctw"))]
+fn run_ctw_profile_mode(_args: &[String]) {
+    eprintln!("Error: 'ctw-profile' requires infotheory built with feature 'backend-ctw'");
+    std::process::exit(1);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -1078,6 +1422,10 @@ fn main() {
     }
     if primitive == "tune" {
         run_tune_mode(&args);
+        return;
+    }
+    if primitive == "ctw-profile" || primitive == "ctw_profile" {
+        run_ctw_profile_mode(&args);
         return;
     }
 
@@ -1716,6 +2064,7 @@ Primitives:
     generate [file]                         Generate continuation from file or piped stdin
     compress <in> <out>                     Compress file using selected compression backend
     decompress <in> <out>                   Decompress file using selected compression backend
+    ctw-profile <input|-> [--depth N]       Emit FAC-CTW arena telemetry as JSONL
     ac-log-loss <input> --mixture <spec.json> --out-prefix <prefix>
                                           Emit exact AC/log-loss TSV diagnostics for a mixture
     sequitur-debug <input>|--hex <hex> [--hex <hex> ...]
