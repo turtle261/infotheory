@@ -1839,27 +1839,64 @@ fn binary_split_from_prob_one(p1: f64) -> u32 {
     split
 }
 
+/// This function should be considered when fine-tuning Compression/decompression for a particular runtime case. In particular, my benchmarking has shown that inlining is non-obvious in how it affects performance
+/// Inlining both encode and decode seems to cause performance issues with Match+AC decompression specifically, hence the odd configuration here for balance.
+/// Encode default: inline
+/// Technical note: this fast-path preserves the same bit ordering and CDF split mapping as the generic AC path (MSB-first with `binary_split_from_prob_one`).
+#[cfg_attr(not(infotheory_ac_encode_deinline), inline(always))]
+#[cfg_attr(infotheory_ac_encode_deinline, inline(never))]
+fn encode_payload_ac_fast_bitwise(
+    data: &[u8],
+    predictor: &mut RatePdfPredictor,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut enc = ArithmeticEncoder::new(&mut out);
+        for &symbol in data {
+            predictor.ac_step_fast_bitwise(|bit_idx, p1_mix| {
+                let bit = (symbol >> (7 - bit_idx)) & 1;
+                let split = binary_split_from_prob_one(p1_mix);
+                if bit == 0 {
+                    enc.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
+                } else {
+                    enc.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
+                }
+                Ok(bit)
+            })?;
+        }
+        let _ = enc.finish()?;
+    }
+    Ok(out)
+}
+
+/// This function should be considered when fine-tuning Compression/decompression for a particular runtime case. In particular, my benchmarking has shown that inlining is non-obvious in how it affects performance
+/// Inlining both encode and decode seems to cause performance issues with Match+AC decompression specifically, hence the odd configuration here for balance.
+/// Decode default: deinline
+/// Technical note: this decodes exactly `out_len` symbols from the same binary CDF domain (`CDF_TOTAL`) used by the paired encode fast-path.
+#[cfg_attr(infotheory_ac_decode_inline, inline(always))]
+#[cfg_attr(not(infotheory_ac_decode_inline), inline(never))]
+fn decode_payload_ac_fast_bitwise(
+    payload: &[u8],
+    out_len: usize,
+    predictor: &mut RatePdfPredictor,
+) -> Result<Vec<u8>> {
+    let mut dec = ArithmeticDecoder::new(payload)?;
+    let mut out = Vec::with_capacity(out_len);
+    for _ in 0..out_len {
+        let symbol = predictor.ac_step_fast_bitwise(|_, p1_mix| {
+            let split = binary_split_from_prob_one(p1_mix);
+            dec.decode_binary_counts(split, CDF_TOTAL)
+        })?;
+        out.push(symbol);
+    }
+    Ok(out)
+}
+
 fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Vec<u8>> {
     predictor.begin_stream(data.len())?;
 
     if predictor.can_fast_ac_bitwise() {
-        let mut out = Vec::new();
-        {
-            let mut enc = ArithmeticEncoder::new(&mut out);
-            for &symbol in data {
-                predictor.ac_step_fast_bitwise(|bit_idx, p1_mix| {
-                    let bit = (symbol >> (7 - bit_idx)) & 1;
-                    let split = binary_split_from_prob_one(p1_mix);
-                    if bit == 0 {
-                        enc.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
-                    } else {
-                        enc.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
-                    }
-                    Ok(bit)
-                })?;
-            }
-            let _ = enc.finish()?;
-        }
+        let out = encode_payload_ac_fast_bitwise(data, predictor)?;
         predictor.finish_stream()?;
         return Ok(out);
     }
@@ -1893,15 +1930,7 @@ fn decode_payload_ac(
 ) -> Result<Vec<u8>> {
     predictor.begin_stream(out_len)?;
     if predictor.can_fast_ac_bitwise() {
-        let mut dec = ArithmeticDecoder::new(payload)?;
-        let mut out = Vec::with_capacity(out_len);
-        for _ in 0..out_len {
-            let symbol = predictor.ac_step_fast_bitwise(|_, p1_mix| {
-                let split = binary_split_from_prob_one(p1_mix);
-                dec.decode_binary_counts(split, CDF_TOTAL)
-            })?;
-            out.push(symbol);
-        }
+        let out = decode_payload_ac_fast_bitwise(payload, out_len, predictor)?;
         predictor.finish_stream()?;
         return Ok(out);
     }
