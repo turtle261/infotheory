@@ -1091,7 +1091,38 @@ ctw+ppmd mixture rough performance, 1 MiB h:
     instructions 58,971,036,540 -> 52,728,971,888
 ```
 
-Interpretation: this is not a final benchmark claim because the workstation was not isolated, but the agreement between parity, hyperfine, perf counters, and cachegrind instruction counts is strong evidence that the PPMD implementation work is a real strict improvement. Sampled `perf report` still shows `PpmdModel::ensure_pdf_inner` as dominant, so the next PPMD frontier remains exact symbol/interval query APIs rather than more suffix-key work.
+Interpretation: this is not a final benchmark claim because the workstation was not isolated, but the agreement between parity, hyperfine, perf counters, and cachegrind instruction counts is strong evidence that the PPMD implementation work is a real strict improvement.
+
+Exact query follow-up:
+
+```text
+implemented validation:
+  exact symbol query equals dense pdf()[symbol]
+  exact interval query equals dense cdf[hi] - cdf[lo]
+  flooring diagnostics cover min unfloored probability, floored count,
+    mass added by flooring, and post-flooring normalization factor
+
+production routing result:
+  always-sparse exact query prototype was rejected
+  conservative sparse/fallback prototype was also rejected
+  final production PPMD path remains the dense cached normalization path
+  final native release binary sizes match the committed baseline:
+    cli backend-ppmd: 1,427,008 B -> 1,427,008 B
+    cli backend-mixture/backend-ppmd/backend-ctw: 1,768,216 B -> 1,768,216 B
+
+isolated A/B against committed PPMD suffix-key baseline, noisy workstation:
+  parity:
+    PPMD-alone h identical, ctw+ppmd h identical
+    archives byte-identical, roundtrip verified
+  always-sparse prototype, 1 MiB h:
+    PPMD-alone baseline 1.723205 s, prototype 1.909546 s
+    ctw+ppmd   baseline 9.506916 s, prototype 9.871999 s
+  conservative sparse/fallback prototype, 1 MiB h:
+    PPMD-alone baseline 1.739279 s, prototype 1.919832 s
+    ctw+ppmd   baseline 9.447059 s, prototype 9.612215 s
+```
+
+Conclusion: exact dense-equivalence tests and flooring diagnostics are now in place, but the production sparse-query hypothesis is a measured non-improvement under the current PPMD representation. Do not route hot callers through a sparse PPMD query path unless the representation itself changes enough to make the query state cheaper than dense normalization. The PPMD work accepted for production in this tranche is therefore the rolling suffix-key, map-entry tightening, and in-place interpolation work; the next high-confidence implementation item should move to CTW bounded/exact log lookup.
 
 ### 4. RWKV TBPTT replay workspace reuse
 

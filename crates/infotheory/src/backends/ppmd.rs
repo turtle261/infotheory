@@ -86,10 +86,42 @@ impl PpmdModel {
         &self.cdf
     }
 
+    pub(crate) fn symbol_prob(&mut self, symbol: u8) -> f64 {
+        self.ensure_pdf_inner(false);
+        self.pdf[symbol as usize]
+    }
+
+    #[cfg(test)]
+    fn interval_mass(&mut self, lo: usize, hi: usize) -> f64 {
+        if lo >= hi {
+            return 0.0;
+        }
+        let lo = lo.min(256);
+        let hi = hi.min(256);
+        if lo >= hi {
+            return 0.0;
+        }
+        if self.cdf_valid {
+            return self.cdf[hi] - self.cdf[lo];
+        }
+        if self.valid {
+            let mut acc_lo = 0.0;
+            let mut acc_hi = 0.0;
+            for i in 0..hi {
+                acc_hi += self.pdf[i];
+                if i + 1 == lo {
+                    acc_lo = acc_hi;
+                }
+            }
+            return acc_hi - acc_lo;
+        }
+        self.ensure_pdf_inner(true);
+        self.cdf[hi] - self.cdf[lo]
+    }
+
     /// Return `ln(max(P(symbol), min_prob))`.
     pub fn log_prob(&mut self, symbol: u8, min_prob: f64) -> f64 {
-        self.ensure_pdf_inner(false);
-        self.pdf[symbol as usize].max(min_prob).ln()
+        self.symbol_prob(symbol).max(min_prob).ln()
     }
 
     /// Observe one symbol and update all active contexts up to model order.
@@ -177,6 +209,48 @@ impl PpmdModel {
         self.suffix_keys[ord]
     }
 
+    #[cfg(test)]
+    fn sparse_query_state(&self) -> SparseQueryState {
+        let mut state = SparseQueryState::new();
+        let max_order = self.order.min(self.history.len());
+        for ord in 0..=max_order {
+            let key = self.context_key(ord);
+            if let Some(ctx) = self.contexts[ord].get(&key) {
+                state.interpolate_context(ctx);
+            }
+        }
+        state
+    }
+
+    #[cfg(test)]
+    fn flooring_diagnostics(&self) -> FlooringDiagnostics {
+        let state = self.sparse_query_state();
+        let mut min_unfloored_probability = f64::INFINITY;
+        let mut floored_count = 0usize;
+        let mut mass_added_by_flooring = 0.0;
+        for symbol in 0..256usize {
+            let value = state.raw_value(symbol);
+            min_unfloored_probability = min_unfloored_probability.min(value);
+            if !value.is_finite() || value < PDF_MIN {
+                floored_count += 1;
+                mass_added_by_flooring += PDF_MIN - if value.is_finite() { value } else { 0.0 };
+            }
+        }
+        let normalization_sum = state.normalization_sum();
+        let normalization_factor_after_flooring =
+            if normalization_sum.is_finite() && normalization_sum > 0.0 {
+                1.0 / normalization_sum
+            } else {
+                1.0
+            };
+        FlooringDiagnostics {
+            min_unfloored_probability,
+            floored_count,
+            mass_added_by_flooring,
+            normalization_factor_after_flooring,
+        }
+    }
+
     fn append_history_symbol(&mut self, symbol: u8) {
         let new_max_order = self.order.min(self.history.len() + 1);
         for ord in (1..=new_max_order).rev() {
@@ -189,6 +263,82 @@ impl PpmdModel {
         }
         self.suffix_keys[0] = 0;
         self.history.push(symbol);
+    }
+}
+
+#[cfg(test)]
+struct SparseQueryState {
+    base: f64,
+    values: [f64; 256],
+    touched: [bool; 256],
+    touched_symbols: [u8; 256],
+    touched_len: usize,
+}
+
+#[cfg(test)]
+struct FlooringDiagnostics {
+    min_unfloored_probability: f64,
+    floored_count: usize,
+    mass_added_by_flooring: f64,
+    normalization_factor_after_flooring: f64,
+}
+
+#[cfg(test)]
+impl SparseQueryState {
+    fn new() -> Self {
+        Self {
+            base: 1.0 / 256.0,
+            values: [0.0; 256],
+            touched: [false; 256],
+            touched_symbols: [0; 256],
+            touched_len: 0,
+        }
+    }
+
+    fn interpolate_context(&mut self, ctx: &ContextStats) {
+        let distinct = ctx.counts.len() as f64;
+        let denom = (ctx.total as f64) + distinct + 1.0;
+        let escape = (distinct + 1.0) / denom;
+        self.base *= escape;
+        for idx in 0..self.touched_len {
+            let symbol = self.touched_symbols[idx] as usize;
+            self.values[symbol] *= escape;
+        }
+        for &(symbol, count) in &ctx.counts {
+            let idx = symbol as usize;
+            if !self.touched[idx] {
+                self.touched[idx] = true;
+                self.touched_symbols[self.touched_len] = symbol;
+                self.touched_len += 1;
+                self.values[idx] = self.base;
+            }
+            self.values[idx] += (count as f64) / denom;
+        }
+    }
+
+    fn raw_value(&self, symbol: usize) -> f64 {
+        if self.touched[symbol] {
+            self.values[symbol]
+        } else {
+            self.base
+        }
+    }
+
+    fn floored_value(&self, symbol: usize) -> f64 {
+        let value = self.raw_value(symbol);
+        if value.is_finite() {
+            value.max(PDF_MIN)
+        } else {
+            PDF_MIN
+        }
+    }
+
+    fn normalization_sum(&self) -> f64 {
+        let mut sum = 0.0;
+        for symbol in 0..256usize {
+            sum += self.floored_value(symbol);
+        }
+        sum
     }
 }
 
@@ -307,6 +457,19 @@ mod tests {
         out
     }
 
+    fn train_query_regression_model() -> PpmdModel {
+        let mut model = PpmdModel::new(12, 1);
+        let data = b"abracadabra abracadabra mississippi banana bandana ppmd query exactness";
+        for &byte in data {
+            model.update(byte);
+        }
+        model.reset_history();
+        for &byte in b"abracadabra mississippi" {
+            model.update_history_only(byte);
+        }
+        model
+    }
+
     #[test]
     fn rolling_suffix_keys_match_recomputed_suffix_hashes() {
         let mut model = PpmdModel::new(12, 1);
@@ -352,6 +515,83 @@ mod tests {
         interpolate_context_in_place(&ctx, &mut lower);
         for (expected, actual) in expected.iter().zip(lower.iter()) {
             assert_eq!(expected.to_bits(), actual.to_bits());
+        }
+    }
+
+    #[test]
+    fn exact_symbol_queries_match_dense_pdf() {
+        let query_model = train_query_regression_model();
+        let mut dense = query_model.clone();
+        let pdf = *dense.pdf();
+
+        for symbol in 0..=255u8 {
+            let mut queried = query_model.clone();
+            let got = queried.symbol_prob(symbol);
+            let expected = pdf[symbol as usize];
+            assert_eq!(
+                expected.to_bits(),
+                got.to_bits(),
+                "symbol={symbol} expected={expected:?} got={got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_interval_queries_match_dense_cdf_differences() {
+        let query_model = train_query_regression_model();
+        let mut dense = query_model.clone();
+        let cdf = *dense.cdf();
+        let ranges = [
+            (0usize, 1usize),
+            (0, 2),
+            (0, 128),
+            (0, 256),
+            (1, 2),
+            (3, 17),
+            (17, 42),
+            (42, 128),
+            (64, 192),
+            (127, 128),
+            (128, 256),
+            (255, 256),
+        ];
+
+        for &(lo, hi) in &ranges {
+            let mut queried = query_model.clone();
+            let expected = cdf[hi] - cdf[lo];
+            let got = queried.interval_mass(lo, hi);
+            assert_eq!(
+                expected.to_bits(),
+                got.to_bits(),
+                "range={lo}..{hi} expected={expected:?} got={got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_queries_match_dense_pdf_when_probability_flooring_is_active() {
+        let mut query_model = PpmdModel::new(12, 1);
+        for _ in 0..512usize {
+            query_model.update(b'a');
+        }
+
+        let diagnostics = query_model.flooring_diagnostics();
+        assert!(diagnostics.min_unfloored_probability < PDF_MIN);
+        assert!(diagnostics.floored_count > 0);
+        assert!(diagnostics.mass_added_by_flooring > 0.0);
+        assert!(diagnostics.normalization_factor_after_flooring.is_finite());
+
+        let mut dense = query_model.clone();
+        let pdf = *dense.pdf();
+        for symbol in [0u8, b'a', b'b', 127, 255] {
+            let mut queried = query_model.clone();
+            let got = queried.symbol_prob(symbol);
+            let expected = pdf[symbol as usize];
+            assert_eq!(
+                expected.to_bits(),
+                got.to_bits(),
+                "symbol={symbol} expected={expected:?} got={got:?}"
+            );
         }
     }
 }
