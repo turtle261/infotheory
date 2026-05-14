@@ -363,6 +363,57 @@ Do not insert an unpredictable branch at every hot arithmetic site if avoidable.
 - Runtime penalty quantified. A memory-first mode can be accepted even if slower; a default change requires a tolerable speed/RSS tradeoff.
 - CTW memory reports should separate arena memory from shared log-cache memory, otherwise the improvement can be hidden by other state.
 
+### Implementation status: bounded exact lookup accepted
+
+Implemented in `crates/infotheory/src/backends/ctw.rs`.
+
+design:
+  cached-prefix and bounded-fallback KT log access are now split again
+  `CachedLogs` keeps the under-threshold hot path on direct unchecked slice reads
+  `BoundedLogs` is used only once visits exceed the cap
+  shared CTW cache growth is capped by a private compile-time limit
+  accepted default cap is `2^24` entries, approximately 256 MiB for the two f64 caches
+  above-cap values compute the exact same expressions directly:
+    `ln(n as f64)`
+    `ln(n as f64 + 0.5)`
+  the first implementation remains private/test-configurable, as intended
+
+coverage:
+  all CTW/FAC-CTW update, prepared-update, revert, and FAC byte fast paths route
+  through the shared bounded cache machinery
+  the under-threshold fast path is still monomorphized on direct cached slices
+  test-only scoped limits force fallback at tiny thresholds
+  guardrails assert bounded logical cache length and separated log-cache memory reporting
+  `FacContextTree::memory_usage_breakdown()` now separates:
+    tree bytes
+    shared log-cache bytes
+    shared history bytes
+
+validation:
+  `cargo fmt --all -- --check`
+  `cargo test -p infotheory --no-default-features --features backend-ctw backends::ctw::tests:: --locked`
+  `cargo test -p infotheory --features all-backends compression::tests::roundtrip_rate_ac_ctw --locked`
+  `cargo test -p infotheory --features 'cli all-backends' --test cli_commands cli_compression_backend_json_roundtrips_rate_ac_ctw --locked`
+  `cargo test -p infotheory --no-default-features --features backend-ctw --test oracle_tests ctw_matches_theoretical_markov_entropy --locked`
+  `RUSTFLAGS='-D warnings' cargo check -p infotheory --no-default-features --features backend-ctw --locked`
+  `RUSTFLAGS='-D warnings' cargo check -p infotheory --no-default-features --features 'cli backend-ctw backend-mixture' --locked`
+  `RUSTFLAGS='-D warnings' cargo check -p infotheory --no-default-features --features 'tuner backend-ctw' --locked`
+  `git diff --check`
+
+current caveat:
+  lower defaults such as `2^20`, `2^21`, and `2^23` were measured and rejected for
+  the default mode because they introduced about 4-6% CTW `h` regressions on the
+  current 10 MB benchmark corpus when the accessor abstraction stayed on the hot path
+  or the threshold was crossed too early
+  with the accepted `2^24` cap plus the cached/bounded split:
+    10 MB CTW `h` baseline/current on CPU 11 was about `161.9s -> 163.8s` (`+1.14%`)
+    10 MB CTW `compress` was about `181.91s -> 182.41s` (`+0.28%`)
+    10 MB CTW `decompress` was about `182.28s -> 182.83s` (`+0.30%`)
+    20 MB CTW `h` was about `350.26s -> 356.20s` (`+1.70%`) while RSS fell
+    from about `1,027,124 KiB` to `976,484 KiB` (`-4.93%`)
+  this is the accepted default-mode compromise for now: bounded Hutter-feasible
+  log-cache memory without the earlier large current-suite slowdown
+
 ## P0 track: PPMD probability-query interface
 
 ### Files
