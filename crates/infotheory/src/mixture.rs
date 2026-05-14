@@ -316,17 +316,7 @@ fn ensure_rwkv_primed(compressor: &mut rwkvzip::Compressor, primed: &mut bool) {
 #[inline]
 #[cfg(feature = "backend-ctw")]
 fn ctw_log_prob_update_msb(tree: &mut FacContextTree, symbol: u8, min_prob: f64) -> f64 {
-    let mut logp = 0.0;
-    for bit_idx in 0..8 {
-        let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-        let p = tree.predict(bit, bit_idx);
-        if p.is_finite() && p > 0.0 {
-            logp += p.ln();
-        } else {
-            logp = f64::NEG_INFINITY;
-        }
-        tree.update_predicted(bit, bit_idx);
-    }
+    let logp = tree.log_prob_update_byte_msb(symbol);
     if logp.is_finite() {
         logp.max(min_prob.ln())
     } else {

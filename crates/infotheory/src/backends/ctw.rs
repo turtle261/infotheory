@@ -3476,6 +3476,22 @@ impl ContextTreeCore {
     }
 
     #[inline]
+    fn update_predicted_with_logs<L: CtLogAccess>(
+        &mut self,
+        logs: L,
+        sym: Symbol,
+        shared_history: &[Symbol],
+        history_version: u64,
+    ) {
+        let use_prepared = self.prepared_valid
+            && self.prepared_history_len == shared_history.len()
+            && self.prepared_history_version == history_version;
+        self.prepared_valid = false;
+        self.engine
+            .update_prepared_with_logs(logs, shared_history, sym as usize, use_prepared);
+    }
+
+    #[inline]
     fn revert(&mut self, last_sym: Symbol, shared_history: &[Symbol]) {
         self.prepared_valid = false;
         self.engine.revert(last_sym, shared_history);
@@ -3633,6 +3649,98 @@ impl FacContextTree {
             });
         }
         self.bump_shared_history_version();
+    }
+
+    #[inline]
+    fn predict_update_byte_msb_with_logs<L: CtLogAccess, E>(
+        &mut self,
+        logs: L,
+        choose_bit: &mut impl FnMut(usize, f64) -> Result<u8, E>,
+    ) -> Result<u8, E> {
+        let mut symbol = 0u8;
+        for bit_idx in 0..8usize {
+            let p_one =
+                self.trees[bit_idx].predict_one(&self.shared_history, self.shared_history_version);
+            let bit = choose_bit(bit_idx, p_one)? & 1;
+            symbol |= bit << (7 - bit_idx);
+            self.trees[bit_idx].update_predicted_with_logs(
+                logs,
+                bit == 1,
+                &self.shared_history,
+                self.shared_history_version,
+            );
+            self.shared_history.push(bit == 1);
+            self.bump_shared_history_version();
+        }
+        Ok(symbol)
+    }
+
+    #[inline]
+    fn log_prob_update_byte_msb_with_logs<L: CtLogAccess>(&mut self, logs: L, byte: u8) -> f64 {
+        let mut logp = 0.0;
+        for bit_idx in 0..8usize {
+            let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+            let p =
+                self.trees[bit_idx].predict(bit, &self.shared_history, self.shared_history_version);
+            if p.is_finite() && p > 0.0 {
+                logp += p.ln();
+            } else {
+                logp = f64::NEG_INFINITY;
+            }
+            self.trees[bit_idx].update_predicted_with_logs(
+                logs,
+                bit,
+                &self.shared_history,
+                self.shared_history_version,
+            );
+            self.shared_history.push(bit);
+            self.bump_shared_history_version();
+        }
+        logp
+    }
+
+    #[inline]
+    pub(crate) fn predict_update_byte_msb<E>(
+        &mut self,
+        mut choose_bit: impl FnMut(usize, f64) -> Result<u8, E>,
+    ) -> Result<u8, E> {
+        debug_assert_eq!(self.num_bits, 8);
+        let upto = self.trees[0].engine.root_visits() + 1;
+        debug_assert!(
+            self.trees
+                .iter()
+                .all(|tree| tree.engine.root_visits() + 1 == upto)
+        );
+
+        if upto <= ctw_log_cache_limit() {
+            with_shared_cached_logs(upto, |logs| {
+                self.predict_update_byte_msb_with_logs(logs, &mut choose_bit)
+            })
+        } else {
+            with_shared_bounded_logs(upto, |logs| {
+                self.predict_update_byte_msb_with_logs(logs, &mut choose_bit)
+            })
+        }
+    }
+
+    #[inline]
+    pub(crate) fn log_prob_update_byte_msb(&mut self, byte: u8) -> f64 {
+        debug_assert_eq!(self.num_bits, 8);
+        let upto = self.trees[0].engine.root_visits() + 1;
+        debug_assert!(
+            self.trees
+                .iter()
+                .all(|tree| tree.engine.root_visits() + 1 == upto)
+        );
+        if upto <= ctw_log_cache_limit() {
+            with_shared_cached_logs(upto, |logs| {
+                self.log_prob_update_byte_msb_with_logs(logs, byte)
+            })
+        } else {
+            with_shared_bounded_logs(upto, |logs| {
+                self.log_prob_update_byte_msb_with_logs(logs, byte)
+            })
+        }
     }
 
     #[inline]
@@ -4684,6 +4792,59 @@ mod tests {
                 by_bits.get_log_block_probability(),
             );
             assert_eq!(by_byte.shared_history, by_bits.shared_history);
+        }
+    }
+
+    #[test]
+    fn fac_ctw_predict_update_byte_msb_matches_manual_fast_path() {
+        let mut batched = FacContextTree::new(6, 8);
+        for &byte in b"predict update byte msb regression payload" {
+            let mut manual = batched.clone();
+            let mut predicted = [0.0f64; 8];
+            let observed = batched
+                .predict_update_byte_msb(|bit_idx, p_one| -> Result<u8, ()> {
+                    predicted[bit_idx] = p_one;
+                    let bit = (byte >> (7 - bit_idx)) & 1;
+                    Ok(bit)
+                })
+                .unwrap();
+            assert_eq!(observed, byte);
+            for bit_idx in 0..8usize {
+                assert_close(predicted[bit_idx], manual.predict_one(bit_idx));
+                let bit = (byte >> (7 - bit_idx)) & 1;
+                manual.update_predicted(bit == 1, bit_idx);
+            }
+            assert_eq!(batched.shared_history, manual.shared_history);
+            assert_close(
+                batched.get_log_block_probability(),
+                manual.get_log_block_probability(),
+            );
+        }
+    }
+
+    #[test]
+    fn fac_ctw_log_prob_update_byte_msb_matches_manual_fast_path() {
+        let mut batched = FacContextTree::new(6, 8);
+        for &byte in b"log prob update byte msb regression payload" {
+            let mut manual = batched.clone();
+            let observed = batched.log_prob_update_byte_msb(byte);
+            let mut expected = 0.0;
+            for bit_idx in 0..8usize {
+                let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+                let p = manual.predict(bit, bit_idx);
+                if p.is_finite() && p > 0.0 {
+                    expected += p.ln();
+                } else {
+                    expected = f64::NEG_INFINITY;
+                }
+                manual.update_predicted(bit, bit_idx);
+            }
+            assert_eq!(observed.to_bits(), expected.to_bits());
+            assert_eq!(batched.shared_history, manual.shared_history);
+            assert_eq!(
+                batched.get_log_block_probability().to_bits(),
+                manual.get_log_block_probability().to_bits(),
+            );
         }
     }
 

@@ -1816,13 +1816,10 @@ where
     F: FnMut(usize, f64) -> Result<u8>,
 {
     debug_assert!(ctw.can_fast_ac_bitwise());
-    let mut symbol = 0u8;
-    for bit_idx in 0..8usize {
-        let p1 = ctw.bit_prob_one_msb(bit_idx);
-        let bit = choose_bit(bit_idx, p1)? & 1;
-        symbol |= bit << (7 - bit_idx);
-        ctw.update_bit_msb(bit_idx, bit == 1);
-    }
+    let symbol = ctw.tree.predict_update_byte_msb(|bit_idx, p1| {
+        choose_bit(bit_idx, p1.clamp(PDF_MIN, 1.0 - PDF_MIN))
+    })?;
+    ctw.valid = false;
     Ok(symbol)
 }
 
