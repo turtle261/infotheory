@@ -1584,6 +1584,39 @@ pub struct RosaTx {
     seg_len: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "research-tooling"))]
+pub(crate) struct RosaMemoryUsage {
+    pub sam_state_bytes: usize,
+    pub sam_edge_bytes: usize,
+    pub sam_text_bytes: usize,
+    pub sam_state_trace_bytes: usize,
+    pub sam_boundary_bytes: usize,
+    pub sam_root_index_bytes: usize,
+    pub lm_core_bytes: usize,
+    pub lm_node_storage_bytes: usize,
+    pub lm_overflow_bytes: usize,
+    pub scratch_bytes: usize,
+    pub rng_bytes: usize,
+}
+
+#[cfg(any(test, feature = "research-tooling"))]
+impl RosaMemoryUsage {
+    pub(crate) fn total_bytes(self) -> usize {
+        self.sam_state_bytes
+            + self.sam_edge_bytes
+            + self.sam_text_bytes
+            + self.sam_state_trace_bytes
+            + self.sam_boundary_bytes
+            + self.sam_root_index_bytes
+            + self.lm_core_bytes
+            + self.lm_node_storage_bytes
+            + self.lm_overflow_bytes
+            + self.scratch_bytes
+            + self.rng_bytes
+    }
+}
+
 impl RosaPlus {
     /// Create a new ROSA+ model.
     ///
@@ -2088,6 +2121,62 @@ impl RosaPlus {
             0
         } else {
             self.lm.alpha_n as usize
+        }
+    }
+
+    #[cfg(any(test, feature = "research-tooling"))]
+    pub(crate) fn memory_usage_breakdown(&self) -> RosaMemoryUsage {
+        use std::mem::size_of;
+
+        RosaMemoryUsage {
+            sam_state_bytes: self.sam.st.len().saturating_mul(size_of::<SamState>()),
+            sam_edge_bytes: self.sam.ed.len().saturating_mul(size_of::<SamEdge>()),
+            sam_text_bytes: self.sam.text.len().saturating_mul(size_of::<u32>()),
+            sam_state_trace_bytes: self
+                .sam
+                .text_states
+                .len()
+                .saturating_mul(size_of::<SamStateIx>()),
+            sam_boundary_bytes: self
+                .sam
+                .boundary_after
+                .len()
+                .saturating_mul(size_of::<u8>()),
+            sam_root_index_bytes: size_of::<[SamStateIx; BYTE_ALPHA_N]>(),
+            lm_core_bytes: self.lm.alphabet.len().saturating_mul(size_of::<u32>())
+                + self.lm.unigram.len().saturating_mul(size_of::<u64>())
+                + self.lm.ls.len().saturating_mul(size_of::<LmState>()),
+            lm_node_storage_bytes: self.lm.nodes.sym_lo.len().saturating_mul(size_of::<u16>())
+                + self.lm.nodes.cnt_lo.len().saturating_mul(size_of::<u16>())
+                + self
+                    .lm
+                    .nodes
+                    .next
+                    .len()
+                    .saturating_mul(size_of::<LmNodeIx>())
+                + self
+                    .lm
+                    .nodes
+                    .cnt_overflow_mask
+                    .len()
+                    .saturating_mul(size_of::<u8>()),
+            lm_overflow_bytes: self
+                .lm
+                .nodes
+                .sym_overflow
+                .len()
+                .saturating_mul(size_of::<u32>() + size_of::<u32>())
+                + self
+                    .lm
+                    .nodes
+                    .cnt_overflow
+                    .len()
+                    .saturating_mul(size_of::<u32>() + size_of::<u64>()),
+            scratch_bytes: self.dist.len().saturating_mul(size_of::<f64>())
+                + self.scratch.idx.len().saturating_mul(size_of::<u32>())
+                + self.scratch.logits.len().saturating_mul(size_of::<f64>())
+                + self.scratch.exps.len().saturating_mul(size_of::<f64>()),
+            rng_bytes: self.rng.buf.len().saturating_mul(size_of::<u8>()),
         }
     }
 
@@ -3355,5 +3444,17 @@ mod tests {
         assert_eq!(loaded.lm.nodes.len(), before_nodes);
         assert_eq!(loaded.estimated_size_bytes(), before_size);
         assert!((loaded.prob_for_last(b'a' as u32) - before_prob).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rosa_memory_usage_breakdown_sums_to_estimated_total() {
+        let mut model = RosaPlus::new(8, true, b'\n', 1234);
+        model.train_example(b"abracadabra mississippi banana bandana rosa memory audit payload");
+        model.build_lm();
+
+        let usage = model.memory_usage_breakdown();
+        assert_eq!(usage.total_bytes(), model.estimated_size_bytes());
+        assert!(usage.sam_state_bytes > 0);
+        assert!(usage.lm_core_bytes > 0);
     }
 }

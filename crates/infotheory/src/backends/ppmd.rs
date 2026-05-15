@@ -4,19 +4,97 @@ use std::collections::{VecDeque, hash_map::Entry};
 const PDF_MIN: f64 = crate::mixture::DEFAULT_MIN_PROB;
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x1000_0000_01B3;
+const INLINE_CONTEXT_COUNTS: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CountEntry {
+    symbol: u8,
+    count: u16,
+}
 
 #[derive(Clone, Debug, Default)]
 struct ContextStats {
-    counts: Vec<(u8, u16)>,
+    inline_counts: [CountEntry; INLINE_CONTEXT_COUNTS],
+    inline_len: u8,
+    spill_counts: Option<Box<[CountEntry]>>,
     total: u32,
 }
 
 impl ContextStats {
+    fn distinct_len(&self) -> usize {
+        self.inline_len as usize
+            + self
+                .spill_counts
+                .as_ref()
+                .map(|entries| entries.len())
+                .unwrap_or(0)
+    }
+
+    #[cfg(any(test, feature = "research-tooling"))]
+    fn spill_bytes(&self) -> usize {
+        self.spill_counts
+            .as_ref()
+            .map(|entries| {
+                entries
+                    .len()
+                    .saturating_mul(std::mem::size_of::<CountEntry>())
+            })
+            .unwrap_or(0)
+    }
+
+    fn for_each(&self, mut f: impl FnMut(CountEntry)) {
+        for idx in 0..(self.inline_len as usize) {
+            f(self.inline_counts[idx]);
+        }
+        if let Some(spill_counts) = &self.spill_counts {
+            for &entry in spill_counts.iter() {
+                f(entry);
+            }
+        }
+    }
+
+    fn find_mut(&mut self, symbol: u8) -> Option<&mut u16> {
+        if let Some(entry) = self.inline_counts[..(self.inline_len as usize)]
+            .iter_mut()
+            .find(|entry| entry.symbol == symbol)
+        {
+            return Some(&mut entry.count);
+        }
+        if let Some(spill_counts) = self.spill_counts.as_mut() {
+            if let Some(entry) = spill_counts.iter_mut().find(|entry| entry.symbol == symbol) {
+                return Some(&mut entry.count);
+            }
+        }
+        None
+    }
+
+    fn push_new(&mut self, symbol: u8) {
+        let entry = CountEntry { symbol, count: 1 };
+        if (self.inline_len as usize) < INLINE_CONTEXT_COUNTS {
+            self.inline_counts[self.inline_len as usize] = entry;
+            self.inline_len += 1;
+            return;
+        }
+
+        let mut spill = Vec::with_capacity(
+            self.spill_counts
+                .as_ref()
+                .map(|entries| entries.len())
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        if let Some(existing) = self.spill_counts.take() {
+            spill.extend_from_slice(existing.as_ref());
+        }
+        spill.push(entry);
+        self.spill_counts = Some(spill.into_boxed_slice());
+    }
+
     fn observe(&mut self, symbol: u8) {
-        if let Some((_, count)) = self.counts.iter_mut().find(|(s, _)| *s == symbol) {
+        if let Some(count) = self.find_mut(symbol) {
             *count = count.saturating_add(1);
         } else {
-            self.counts.push((symbol, 1));
+            self.push_new(symbol);
         }
         self.total = self.total.saturating_add(1);
         if self.total > 4096 {
@@ -26,11 +104,40 @@ impl ContextStats {
 
     fn rescale(&mut self) {
         self.total = 0;
-        self.counts.retain_mut(|(_, count)| {
+        for idx in 0..(self.inline_len as usize) {
+            let count = &mut self.inline_counts[idx].count;
             *count = (*count).div_ceil(2).max(1);
             self.total += *count as u32;
-            true
-        });
+        }
+        if let Some(spill_counts) = self.spill_counts.as_mut() {
+            for entry in spill_counts.iter_mut() {
+                entry.count = entry.count.div_ceil(2).max(1);
+                self.total += entry.count as u32;
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "research-tooling"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PpmdMemoryUsage {
+    pub context_table_bytes: usize,
+    pub context_spill_bytes: usize,
+    pub queue_bytes: usize,
+    pub history_bytes: usize,
+    pub suffix_key_bytes: usize,
+    pub pdf_cache_bytes: usize,
+}
+
+#[cfg(any(test, feature = "research-tooling"))]
+impl PpmdMemoryUsage {
+    pub(crate) fn total_bytes(self) -> usize {
+        self.context_table_bytes
+            + self.context_spill_bytes
+            + self.queue_bytes
+            + self.history_bytes
+            + self.suffix_key_bytes
+            + self.pdf_cache_bytes
     }
 }
 
@@ -161,6 +268,47 @@ impl PpmdModel {
         self.append_history_symbol(symbol);
         self.valid = false;
         self.cdf_valid = false;
+    }
+
+    #[cfg(any(test, feature = "research-tooling"))]
+    pub(crate) fn memory_usage_breakdown(&self) -> PpmdMemoryUsage {
+        let context_table_bytes: usize = self
+            .contexts
+            .iter()
+            .map(|map| {
+                map.capacity().saturating_mul(
+                    std::mem::size_of::<(u64, ContextStats)>() + std::mem::size_of::<u8>(),
+                )
+            })
+            .sum();
+        let context_spill_bytes: usize = self
+            .contexts
+            .iter()
+            .flat_map(|map| map.values())
+            .map(ContextStats::spill_bytes)
+            .sum();
+        PpmdMemoryUsage {
+            context_table_bytes,
+            context_spill_bytes,
+            queue_bytes: self
+                .queue
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(usize, u64)>()),
+            history_bytes: self
+                .history
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u8>()),
+            suffix_key_bytes: self
+                .suffix_keys
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u64>()),
+            pdf_cache_bytes: std::mem::size_of::<[f64; 256]>() + std::mem::size_of::<[f64; 257]>(),
+        }
+    }
+
+    #[cfg(any(test, feature = "research-tooling"))]
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        self.memory_usage_breakdown().total_bytes()
     }
 
     fn ensure_pdf_inner(&mut self, want_cdf: bool) {
@@ -296,7 +444,7 @@ impl SparseQueryState {
     }
 
     fn interpolate_context(&mut self, ctx: &ContextStats) {
-        let distinct = ctx.counts.len() as f64;
+        let distinct = ctx.distinct_len() as f64;
         let denom = (ctx.total as f64) + distinct + 1.0;
         let escape = (distinct + 1.0) / denom;
         self.base *= escape;
@@ -304,16 +452,16 @@ impl SparseQueryState {
             let symbol = self.touched_symbols[idx] as usize;
             self.values[symbol] *= escape;
         }
-        for &(symbol, count) in &ctx.counts {
-            let idx = symbol as usize;
+        ctx.for_each(|entry| {
+            let idx = entry.symbol as usize;
             if !self.touched[idx] {
                 self.touched[idx] = true;
-                self.touched_symbols[self.touched_len] = symbol;
+                self.touched_symbols[self.touched_len] = entry.symbol;
                 self.touched_len += 1;
                 self.values[idx] = self.base;
             }
-            self.values[idx] += (count as f64) / denom;
-        }
+            self.values[idx] += (entry.count as f64) / denom;
+        });
     }
 
     fn raw_value(&self, symbol: usize) -> f64 {
@@ -343,15 +491,15 @@ impl SparseQueryState {
 }
 
 fn interpolate_context_in_place(ctx: &ContextStats, lower: &mut [f64; 256]) {
-    let distinct = ctx.counts.len() as f64;
+    let distinct = ctx.distinct_len() as f64;
     let denom = (ctx.total as f64) + distinct + 1.0;
     let escape = (distinct + 1.0) / denom;
     for p in lower.iter_mut() {
         *p *= escape;
     }
-    for &(symbol, count) in &ctx.counts {
-        lower[symbol as usize] += (count as f64) / denom;
-    }
+    ctx.for_each(|entry| {
+        lower[entry.symbol as usize] += (entry.count as f64) / denom;
+    });
 }
 
 fn normalize_pdf_and_maybe_cdf(pdf: &mut [f64; 256], mut cdf: Option<&mut [f64; 257]>) {
@@ -444,16 +592,16 @@ mod tests {
     }
 
     fn reference_interpolate_context(ctx: &ContextStats, lower: &[f64; 256]) -> [f64; 256] {
-        let distinct = ctx.counts.len() as f64;
+        let distinct = ctx.distinct_len() as f64;
         let denom = (ctx.total as f64) + distinct + 1.0;
         let escape = (distinct + 1.0) / denom;
         let mut out = [0.0; 256];
         for i in 0..256 {
             out[i] = lower[i] * escape;
         }
-        for &(symbol, count) in &ctx.counts {
-            out[symbol as usize] += (count as f64) / denom;
-        }
+        ctx.for_each(|entry| {
+            out[entry.symbol as usize] += (entry.count as f64) / denom;
+        });
         out
     }
 
@@ -593,5 +741,41 @@ mod tests {
                 "symbol={symbol} expected={expected:?} got={got:?}"
             );
         }
+    }
+
+    #[test]
+    fn context_stats_spills_after_inline_capacity_without_changing_counts() {
+        let mut ctx = ContextStats::default();
+        for &symbol in &[1u8, 2, 3, 4, 5, 5, 4, 3, 2, 1] {
+            ctx.observe(symbol);
+        }
+
+        assert_eq!(ctx.inline_len as usize, INLINE_CONTEXT_COUNTS);
+        assert!(ctx.spill_counts.is_some());
+        assert_eq!(ctx.distinct_len(), 5);
+
+        let mut seen = [0u16; 256];
+        ctx.for_each(|entry| {
+            seen[entry.symbol as usize] = entry.count;
+        });
+        assert_eq!(seen[1], 2);
+        assert_eq!(seen[2], 2);
+        assert_eq!(seen[3], 2);
+        assert_eq!(seen[4], 2);
+        assert_eq!(seen[5], 2);
+    }
+
+    #[test]
+    fn ppmd_memory_usage_breakdown_sums_to_estimated_total() {
+        let mut model = PpmdModel::new(12, 1);
+        for &byte in b"abracadabra abracadabra mississippi banana bandana ppmd memory audit payload"
+        {
+            model.update(byte);
+        }
+
+        let usage = model.memory_usage_breakdown();
+        assert_eq!(model.estimated_size_bytes(), usage.total_bytes());
+        assert!(usage.context_table_bytes > 0);
+        assert!(usage.pdf_cache_bytes > 0);
     }
 }
