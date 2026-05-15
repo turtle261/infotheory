@@ -113,6 +113,12 @@ impl LayerState {
             ffn_x_prev: Tensor1D::zeros(cfg.hidden_size),
         }
     }
+
+    fn copy_from(&mut self, other: &Self) {
+        self.att_x_prev.copy_from(&other.att_x_prev);
+        self.att_state.copy_from(&other.att_state);
+        self.ffn_x_prev.copy_from(&other.ffn_x_prev);
+    }
 }
 
 /// Full model state.
@@ -144,6 +150,15 @@ impl State {
             layer.att_x_prev.zero();
             layer.att_state.zero();
             layer.ffn_x_prev.zero();
+        }
+    }
+
+    pub(crate) fn copy_from(&mut self, other: &Self) {
+        debug_assert_eq!(self.layers.len(), other.layers.len());
+        self.v_first.clone_from(&other.v_first);
+        self.v_first_set = other.v_first_set;
+        for (dst, src) in self.layers.iter_mut().zip(other.layers.iter()) {
+            dst.copy_from(src);
         }
     }
 }
@@ -707,6 +722,8 @@ pub(crate) struct TbpttReplayWorkspace {
     grads: FullGradState,
     recurrent: RecurrentGradState,
     bias_grad: Vec<f32>,
+    checkpoint_state: State,
+    replay_state: State,
     checkpoints: Vec<State>,
     step_states: Vec<State>,
     step_traces: Vec<TokenTrainTrace>,
@@ -719,6 +736,8 @@ impl TbpttReplayWorkspace {
             grads: model.new_full_grad_state(),
             recurrent: model.new_recurrent_grad_state(),
             bias_grad: Vec::new(),
+            checkpoint_state: model.new_state(),
+            replay_state: model.new_state(),
             checkpoints: Vec::new(),
             step_states: Vec::new(),
             step_traces: Vec::new(),
@@ -3255,7 +3274,7 @@ impl Model {
         live_state_out: &mut State,
     ) -> Result<()> {
         if steps.is_empty() {
-            *live_state_out = start_state.clone();
+            live_state_out.copy_from(start_state);
             return Ok(());
         }
 
@@ -3265,6 +3284,8 @@ impl Model {
             grads,
             recurrent,
             bias_grad: workspace_bias_grad,
+            checkpoint_state,
+            replay_state,
             checkpoints,
             step_states,
             step_traces,
@@ -3285,16 +3306,16 @@ impl Model {
         };
 
         {
-            let mut checkpoint_state = start_state.clone();
+            checkpoint_state.copy_from(start_state);
             let checkpoint_count = steps.len().div_ceil(chunk);
             ensure_cloned_len(checkpoints, checkpoint_count, start_state);
             checkpoints.truncate(checkpoint_count);
             scratch.set_capture_train_trace(false);
             for (checkpoint_idx, chunk_start) in (0..steps.len()).step_by(chunk).enumerate() {
-                checkpoints[checkpoint_idx].clone_from(&checkpoint_state);
+                checkpoints[checkpoint_idx].copy_from(checkpoint_state);
                 let chunk_end = (chunk_start + chunk).min(steps.len());
                 for &(input_token, _) in &steps[chunk_start..chunk_end] {
-                    self.forward(scratch, input_token, &mut checkpoint_state);
+                    self.forward(scratch, input_token, checkpoint_state);
                 }
             }
 
@@ -3303,7 +3324,7 @@ impl Model {
                 let chunk_end = (chunk_start + chunk).min(steps.len());
                 let chunk_steps = chunk_end - chunk_start;
                 let checkpoint = &checkpoints[chunk_idx];
-                let mut state = checkpoint.clone();
+                replay_state.copy_from(checkpoint);
                 let state_count = chunk_steps + 1;
                 ensure_cloned_len(step_states, state_count, checkpoint);
                 step_states.truncate(state_count);
@@ -3313,13 +3334,13 @@ impl Model {
                 step_traces.truncate(chunk_steps);
                 let pdf_stride = self.cfg.vocab_size;
                 step_pdfs.resize(chunk_steps.saturating_mul(pdf_stride), 0.0);
-                step_states[0].clone_from(&state);
+                step_states[0].copy_from(replay_state);
 
                 for (local_idx, &(input_token, _)) in
                     steps[chunk_start..chunk_end].iter().enumerate()
                 {
                     scratch.set_capture_train_trace(true);
-                    let logits = self.forward(scratch, input_token, &mut state);
+                    let logits = self.forward(scratch, input_token, replay_state);
                     let pdf_lo = local_idx * pdf_stride;
                     let pdf_hi = pdf_lo + pdf_stride;
                     super::super::softmax_pdf_floor_with_bias(
@@ -3328,7 +3349,7 @@ impl Model {
                         &mut step_pdfs[pdf_lo..pdf_hi],
                     );
                     step_traces[local_idx].clone_from_scratch(scratch);
-                    step_states[local_idx + 1].clone_from(&state);
+                    step_states[local_idx + 1].copy_from(replay_state);
                 }
 
                 for local_idx in (0..chunk_steps).rev() {
@@ -3366,7 +3387,7 @@ impl Model {
         )?;
 
         scratch.set_capture_train_trace(false);
-        *live_state_out = start_state.clone();
+        live_state_out.copy_from(start_state);
         for &(input_token, _) in steps {
             self.forward(scratch, input_token, live_state_out);
         }

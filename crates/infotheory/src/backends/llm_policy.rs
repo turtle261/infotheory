@@ -293,6 +293,100 @@ impl CompiledPolicy {
         }
         PolicyAction::Infer
     }
+
+    /// Returns whether any position at or after `cursor` can emit a matching train action.
+    pub fn has_future_train_matching_from(
+        &self,
+        cursor: u64,
+        mut predicate: impl FnMut(&TrainAction) -> bool,
+    ) -> bool {
+        fn action_matches_train(
+            action: &PolicyAction,
+            predicate: &mut impl FnMut(&TrainAction) -> bool,
+        ) -> bool {
+            match action {
+                PolicyAction::Infer => false,
+                PolicyAction::Train(train) => predicate(train),
+            }
+        }
+
+        fn repeat_rule_has_future_matching_train(
+            start: u64,
+            end: u64,
+            period: u64,
+            pattern: &[CompiledPatternSegment],
+            cursor: u64,
+            predicate: &mut impl FnMut(&TrainAction) -> bool,
+        ) -> bool {
+            if period == 0 {
+                return false;
+            }
+            let active_start = cursor.max(start);
+            if active_start >= end {
+                return false;
+            }
+            let rel_start = active_start - start;
+            let cycle_idx = rel_start / period;
+            let phase = rel_start % period;
+            let cycle_base = start.saturating_add(cycle_idx.saturating_mul(period));
+            let next_cycle_base = cycle_base.saturating_add(period);
+            let mut seg_start = 0u64;
+            for seg in pattern {
+                let seg_end = seg.end.min(period);
+                if seg_start >= seg_end {
+                    seg_start = seg.end;
+                    continue;
+                }
+                if action_matches_train(&seg.action, predicate) {
+                    let same_cycle_phase = seg_start.max(phase);
+                    if same_cycle_phase < seg_end {
+                        let same_cycle_pos = cycle_base.saturating_add(same_cycle_phase);
+                        if same_cycle_pos < end {
+                            return true;
+                        }
+                    }
+                    let next_cycle_pos = next_cycle_base.saturating_add(seg_start);
+                    if next_cycle_pos < end {
+                        return true;
+                    }
+                }
+                seg_start = seg.end;
+            }
+            false
+        }
+
+        for rule in &self.rules {
+            match rule {
+                CompiledScheduleRule::Interval { start, end, action }
+                    if cursor < *end && cursor.max(*start) < *end =>
+                {
+                    if action_matches_train(action, &mut predicate) {
+                        return true;
+                    }
+                }
+                CompiledScheduleRule::Repeat {
+                    start,
+                    end,
+                    period,
+                    pattern_total: _,
+                    pattern,
+                } => {
+                    if repeat_rule_has_future_matching_train(
+                        *start,
+                        *end,
+                        *period,
+                        pattern,
+                        cursor,
+                        &mut predicate,
+                    ) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +429,13 @@ impl PolicyRuntime {
         let action = self.compiled.action_at(self.cursor);
         self.cursor = self.cursor.saturating_add(1);
         action
+    }
+
+    #[inline]
+    /// Returns whether any future cursor position can emit a matching train action.
+    pub fn has_future_train_matching(&self, predicate: impl FnMut(&TrainAction) -> bool) -> bool {
+        self.compiled
+            .has_future_train_matching_from(self.cursor, predicate)
     }
 }
 
@@ -994,6 +1095,35 @@ mod tests {
         assert!(matches!(c.action_at(0), PolicyAction::Train(_)));
         assert!(matches!(c.action_at(3), PolicyAction::Infer));
         assert!(matches!(c.action_at(10), PolicyAction::Train(_)));
+    }
+
+    #[test]
+    fn policy_runtime_future_train_matching_interval_respects_cursor() {
+        let p = parse_policy_segment(
+            "schedule=0..5:infer|5..10:train(scope=attn,opt=adam,lr=0.1,stride=1,bptt=2,clip=0,momentum=0.9)|10..20:infer",
+            RWKV_SCOPES,
+        )
+        .expect("policy");
+        let compiled = p.compile(Some(20)).expect("compile");
+        let mut runtime = PolicyRuntime::new(compiled);
+        assert!(runtime.has_future_train_matching(|train| train.scope.contains("attn")));
+        runtime.set_cursor(10);
+        assert!(!runtime.has_future_train_matching(|train| train.scope.contains("attn")));
+    }
+
+    #[test]
+    fn policy_runtime_future_train_matching_repeat_respects_remaining_cycles() {
+        let p = parse_policy_segment(
+            "schedule=repeat(0..30,period=10,pattern=2:train(scope=attn,opt=adam,lr=0.1,stride=1,bptt=2,clip=0,momentum=0.9)+8:infer)",
+            RWKV_SCOPES,
+        )
+        .expect("repeat policy");
+        let compiled = p.compile(Some(30)).expect("compile");
+        let mut runtime = PolicyRuntime::new(compiled);
+        runtime.set_cursor(9);
+        assert!(runtime.has_future_train_matching(|train| train.scope.contains("attn")));
+        runtime.set_cursor(29);
+        assert!(!runtime.has_future_train_matching(|train| train.scope.contains("attn")));
     }
 
     #[test]

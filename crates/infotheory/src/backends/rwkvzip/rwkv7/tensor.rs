@@ -143,6 +143,14 @@ impl Clone for Tensor1D {
         new.as_mut_slice().copy_from_slice(self.as_slice());
         new
     }
+
+    fn clone_from(&mut self, source: &Self) {
+        if self.len == source.len {
+            self.as_mut_slice().copy_from_slice(source.as_slice());
+        } else {
+            *self = source.clone();
+        }
+    }
 }
 
 impl Drop for Tensor1D {
@@ -308,6 +316,20 @@ impl Clone for Tensor2D {
             rows: self.rows,
             cols: self.cols,
             stride: self.stride,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        if self.rows == source.rows && self.cols == source.cols && self.stride == source.stride {
+            let total = self
+                .rows
+                .checked_mul(self.stride)
+                .expect("tensor allocation overflow");
+            unsafe {
+                std::ptr::copy_nonoverlapping(source.data.as_ptr(), self.data.as_ptr(), total);
+            }
+        } else {
+            *self = source.clone();
         }
     }
 }
@@ -499,5 +521,26 @@ mod tests {
             assert!(t.row_mut(row).is_empty());
         }
         t.zero();
+    }
+
+    #[test]
+    fn tensor1d_clone_from_reuses_allocation_for_equal_shape() {
+        let mut dst = Tensor1D::zeros(8);
+        let src = Tensor1D::from_vec(vec![1.0; 8]);
+        let before = dst.as_ptr();
+        dst.clone_from(&src);
+        assert_eq!(before, dst.as_ptr());
+        assert_eq!(dst.as_slice(), src.as_slice());
+    }
+
+    #[test]
+    fn tensor2d_clone_from_reuses_allocation_for_equal_shape() {
+        let mut dst = Tensor2D::zeros(2, 3);
+        let src = Tensor2D::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
+        let before = dst.as_ptr();
+        dst.clone_from(&src);
+        assert_eq!(before, dst.as_ptr());
+        assert_eq!(dst.row(0), src.row(0));
+        assert_eq!(dst.row(1), src.row(1));
     }
 }
