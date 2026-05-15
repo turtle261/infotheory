@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use crate::backends::fixed_gemv;
 use wide::f32x8;
 
 const LANES: usize = 8;
@@ -57,6 +58,9 @@ pub unsafe fn dot_avx(a: *const f32, b: *const f32, len: usize) -> f32 {
 /// Matrix-vector multiply: y = A @ x where A is (rows, cols), x is (cols,), y is (rows,).
 #[inline(always)]
 pub unsafe fn gemv_avx(a: *const f32, x: *const f32, y: *mut f32, rows: usize, cols: usize) {
+    if unsafe { fixed_gemv::try_gemv(a, x, y, rows, cols) } {
+        return;
+    }
     let mut r = 0;
 
     while r + 4 <= rows {
@@ -111,6 +115,9 @@ pub unsafe fn gemv_avx(a: *const f32, x: *const f32, y: *mut f32, rows: usize, c
 /// Matrix-vector multiply with transposed matrix: y = A^T @ x.
 #[inline(always)]
 pub unsafe fn gemv_t_avx(a: *const f32, x: *const f32, y: *mut f32, rows: usize, cols: usize) {
+    if unsafe { fixed_gemv::try_gemv_t(a, x, y, rows, cols) } {
+        return;
+    }
     let mut c = 0;
     while c + LANES <= cols {
         store8(y.add(c), f32x8::ZERO);
@@ -967,6 +974,41 @@ mod tests {
         unsafe { gemv_t_avx(a.as_ptr(), x_t.as_ptr(), yt.as_mut_ptr(), rows, cols) };
         let yt_ref = gemv_t_scalar(&a, &x_t, rows, cols);
         assert_close_slice(&yt, &yt_ref, 2.5e-5);
+
+        let rows_fixed = 64;
+        let cols_fixed = 64;
+        let mut a_fixed = vec![0.0; rows_fixed * cols_fixed];
+        let mut x_fixed = vec![0.0; cols_fixed];
+        let mut x_t_fixed = vec![0.0; rows_fixed];
+        fill_centered(&mut a_fixed, &mut rng, 0.75);
+        fill_centered(&mut x_fixed, &mut rng, 0.5);
+        fill_centered(&mut x_t_fixed, &mut rng, 0.5);
+
+        let mut y_fixed = vec![0.0; rows_fixed];
+        unsafe {
+            gemv_avx(
+                a_fixed.as_ptr(),
+                x_fixed.as_ptr(),
+                y_fixed.as_mut_ptr(),
+                rows_fixed,
+                cols_fixed,
+            )
+        };
+        let y_fixed_ref = gemv_scalar(&a_fixed, &x_fixed, rows_fixed, cols_fixed);
+        assert_close_slice(&y_fixed, &y_fixed_ref, 2.5e-5);
+
+        let mut yt_fixed = vec![0.0; cols_fixed];
+        unsafe {
+            gemv_t_avx(
+                a_fixed.as_ptr(),
+                x_t_fixed.as_ptr(),
+                yt_fixed.as_mut_ptr(),
+                rows_fixed,
+                cols_fixed,
+            )
+        };
+        let yt_fixed_ref = gemv_t_scalar(&a_fixed, &x_t_fixed, rows_fixed, cols_fixed);
+        assert_close_slice(&yt_fixed, &yt_fixed_ref, 2.5e-5);
 
         let ln_len = 137;
         let mut ln_x = vec![0.0; ln_len];

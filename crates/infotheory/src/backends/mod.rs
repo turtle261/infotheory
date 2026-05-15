@@ -10,6 +10,9 @@
 pub mod calibration;
 #[cfg(feature = "backend-ctw")]
 pub mod ctw;
+/// Shared internal fixed-shape GEMV specializations for neural backends.
+#[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
+pub(crate) mod fixed_gemv;
 /// Shared policy parser/compiler for online LLM backends.
 #[cfg(any(feature = "backend-rwkv", feature = "backend-mamba"))]
 pub mod llm_policy;

@@ -217,15 +217,16 @@ For this branch, the tranche ordering above is no longer future work; most of it
    - Rolling suffix keys landed.
    - Exact-entry update improvements landed.
    - Sparse/exact query routing was investigated and rejected under the current representation.
-3. **RWKV7 replay-workspace reuse is the active implementation target.**
-   - Remove per-flush allocation churn in `Model::online_train_segment_tbptt`.
-   - Reuse checkpoints, step states, traces, PDF storage, full gradient state, recurrent gradient state, and bias-gradient scratch.
-   - Preserve training semantics exactly.
-   - Prefer runtime-local caching rather than widening public API surface.
-4. **RWKV7 post-training lifecycle cleanup remains a later follow-up.**
-   - Releasing no-longer-needed full-training state is still useful, but it is secondary to removing replay allocation churn.
+3. **RWKV7 replay-workspace reuse and stream-local liveness cleanup are complete for this branch scope.**
+   - Replay workspace churn was removed from full-TBPTT training.
+   - Full-trace capture is now stream-local and demand-driven rather than sticky.
+   - Exactness was preserved and the whole `neural_mixture` improved against the pre-GEMV branch baseline.
+4. **Shared internal fixed-shape GEMV specialization is also accepted for the current tiny RWKV7 benchmark shapes.**
+   - Exact-shape `256x64`, `64x64`, `16x64`, and `64x16` GEMV/GEMV^T paths now exist behind crate-private dispatch.
+   - This pass improved both standalone RWKV and whole `neural_mixture` timing while preserving archive and entropy parity.
+   - Stripped `cli` binary size increased materially, so future fixed-kernel work should require the same explicit code-size gate.
 
-This tranche is deliberately centered on finishing the current exact optimization path, not on switching to ablation or another CTW round.
+The branch is now past the original RWKV exact-implementation tranche. Further optimization work should be chosen from new profile evidence rather than from the earlier stale ordering.
 
 ## Post-feasibility resource-MDL search
 
@@ -261,14 +262,13 @@ The point is MDL discipline: a larger or more complex model must pay for itself 
 
 | Priority | Track | Main term | Why it is high-signal |
 |---|---|---:|---|
-| P0 | RWKV7 TBPTT replay workspace reuse | `A(n), Q(n), S(n)` | Current TBPTT replay still allocates large fixed-shape scratch structures per flush; reuse is the clearest remaining exact optimization target on this branch. |
+| P0 | RWKV7 TBPTT replay workspace reuse | `A(n), Q(n), S(n)` | Completed on this branch; kept here as a recorded accepted feasibility/speed pass. |
 | P0 | PPMD probability-query interface | `W(n), Q(n)` | Avoids dense 256-way interpolation/CDF construction when only `P(symbol)` or binary interval masses are needed. |
 | P1 | PPMD rolling suffix keys + update lookup tightening | `W(n)` | Exact `Theta(k^2) -> Theta(k)` key maintenance at order `k`, localized and low semantic risk. |
-| P1 | RWKV7 TBPTT replay workspace reuse | `A(n), Q(n), S(n)` | Current full-training replay allocates per segment; profile shows training gradients are expensive. |
 | P1 | Expert marginal-utility audit | `L/W/S` | Prevents optimizing costly experts that do not pay their codelength/resource rent. |
 | P1 | CTW representation phase diagram | `W(n), S(n)` | Hot-prefix depth and segment representation are a core speed/memory frontier. |
 | P2 | PPMD compact continuation storage | `S(n), A(n)` | Likely strong after query/key fixes, but more invasive than rolling keys. |
-| P2 | RWKV7 fixed-shape GEMV specialization | `W(n), B` | Plausible for `64/16/256` shapes, but binary-size and floating-order risks must be measured. |
+| P2 | RWKV7 fixed-shape GEMV specialization | `W(n), B` | Accepted for the current tiny RWKV shapes; future extensions should require the same binary-size and mixture-level speed gate. |
 | P2 | ROSA+ probability/memory audit | `W(n), S(n)` | Relevant but more invasive; should follow direct measurement of ROSA's marginal utility. |
 | P3 | AC inlining/helper tuning | `W(n)` | Already improved; remaining deltas are likely backend-specific knobs. |
 
@@ -926,6 +926,7 @@ whole neural-mixture signal non-negative
 ### Files
 
 ```text
+crates/infotheory/src/backends/fixed_gemv.rs
 crates/infotheory/src/backends/rwkvzip/rwkv7/kernel.rs
 crates/infotheory/src/backends/rwkvzip/rwkv7/model.rs
 ```
@@ -973,6 +974,65 @@ It may improve `W(n)`, but it increases code size and may perturb floating behav
 - RWKV and neural-mixture archive bytes unchanged, or the change is explicitly treated as numerical/model-changing.
 - Binary size delta is reported.
 - Whole RWKV speed improves enough to justify added code.
+
+### Implementation status: accepted for current branch scope
+
+Implemented as a crate-private shared internal dispatch module in:
+
+```text
+crates/infotheory/src/backends/fixed_gemv.rs
+```
+
+Current shape coverage:
+
+```text
+gemv / gemv_t
+256 x 64
+64 x 64
+16 x 64
+64 x 16
+```
+
+Current consumer:
+
+```text
+RWKV7 only
+```
+
+Mamba was intentionally left untouched in this pass; the internal module shape is reusable later, but the performance acceptance signal here came solely from RWKV and the whole neural mixture.
+
+Validation:
+
+- `cargo test -p infotheory --no-default-features --features "backend-rwkv" --locked`
+- exact archive parity and entropy parity on the benchmark acceptance slice
+
+Measured acceptance slice, CPU `11`, warmups `0`, repeats `2`, sizes `262144 1048576 2097152`, comparing the pre-GEMV branch baseline versus the fixed-GEMV candidate:
+
+- `neural_mixture compress`
+  - `262144`: `10.615s -> 10.350s` (`-2.50%`)
+  - `1048576`: `47.605s -> 46.755s` (`-1.79%`)
+  - `2097152`: `101.145s -> 99.520s` (`-1.61%`)
+- `neural_mixture decompress`
+  - `262144`: `10.540s -> 10.350s` (`-1.80%`)
+  - `1048576`: `47.660s -> 46.870s` (`-1.66%`)
+  - `2097152`: `101.370s -> 99.650s` (`-1.70%`)
+- `neural_mixture h`
+  - `262144`: `9.740s -> 9.440s` (`-3.08%`)
+  - `1048576`: `43.475s -> 42.580s` (`-2.06%`)
+  - `2097152`: `91.785s -> 90.090s` (`-1.85%`)
+
+Stripped native `cli` binary size:
+
+```text
+3,448,272 B -> 3,515,264 B
++66,992 B (+1.94%)
+```
+
+This exceeded the ideal `0.5%` code-size gate, but the pass was still accepted because the stricter fallback rule held:
+
+- exactness remained intact;
+- `neural_mixture compress` and `decompress` both improved by more than `1.5%` at `1048576` and `2097152`;
+- `neural_mixture h` improved rather than regressed.
 
 ## P2 track: ROSA+ memory and probability audit
 
