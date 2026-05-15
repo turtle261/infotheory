@@ -9,6 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::f64;
 use std::mem::size_of;
+use std::sync::OnceLock;
 
 type Symbol = bool;
 const HISTORY_WORD_BITS: usize = u64::BITS as usize;
@@ -216,6 +217,7 @@ impl HistoryAccess for BitHistory {
 }
 
 const CTW_LOG_CACHE_LIMIT: usize = 1 << 24;
+const CTW_HOT_PREFIX_DEPTH_DEFAULT: usize = 12;
 const CTW_LOG_OVERFLOW_CACHE_SLOTS: usize = 1 << 14;
 
 #[cfg(not(test))]
@@ -228,6 +230,16 @@ fn ctw_log_cache_limit() -> usize {
 #[inline(always)]
 fn ctw_log_cache_limit() -> usize {
     CTW_TEST_LOG_CACHE_LIMIT.with(|limit| limit.borrow().unwrap_or(CTW_LOG_CACHE_LIMIT))
+}
+
+fn ctw_hot_prefix_depth_limit() -> usize {
+    static HOT_PREFIX_DEPTH: OnceLock<usize> = OnceLock::new();
+    *HOT_PREFIX_DEPTH.get_or_init(|| {
+        std::env::var("INFOTHEORY_CTW_HOT_PREFIX_DEPTH")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(CTW_HOT_PREFIX_DEPTH_DEFAULT)
+    })
 }
 
 #[cfg(not(test))]
@@ -1853,7 +1865,6 @@ struct CtEngine {
 impl CtEngine {
     const RESERVE_MIN_NODES: usize = 4 * 1024;
     const RESERVE_MAX_NODES: usize = 1 << 18;
-    const HOT_PREFIX_DEPTH: usize = 10;
 
     fn new(depth: usize) -> Self {
         let mut arena = CtArena::with_capacity(1024.min(1 << depth.min(16)));
@@ -1893,7 +1904,73 @@ impl CtEngine {
 
     #[inline(always)]
     fn hot_prefix_depth(&self) -> usize {
-        self.max_depth.min(Self::HOT_PREFIX_DEPTH)
+        self.max_depth.min(ctw_hot_prefix_depth_limit())
+    }
+
+    #[inline(always)]
+    fn push_prepared_segment_step(
+        &mut self,
+        segment_idx: SegmentIndex,
+        offset: usize,
+        sibling_weight: f64,
+        has_sibling: u8,
+    ) {
+        let span = (offset + 1) as u32;
+        self.prepared_steps.push(PreparedStep {
+            source: ExistingSource::Segment(segment_idx, offset as u32),
+            span,
+            sibling_weight,
+            has_sibling,
+        });
+        self.prepared_levels += span as usize;
+    }
+
+    #[inline(always)]
+    fn walk_prepared_exact_segment(
+        &mut self,
+        segment_idx: SegmentIndex,
+        segment: CtSegment,
+        depth: usize,
+        path_bits: u64,
+    ) -> Option<(usize, ExistingSource)> {
+        let seg_len = segment.len() as usize;
+        let depth_budget = self.max_depth.saturating_sub(depth);
+        let comparable_len = seg_len.min(depth_budget + 1);
+        if let Some((offset, _, _)) =
+            first_exact_segment_mismatch(segment.payload.exact_bits(), path_bits, comparable_len)
+        {
+            self.push_prepared_segment_step(
+                segment_idx,
+                offset,
+                self.arena
+                    .segment_continuation_weight(segment_idx, offset as u32),
+                1,
+            );
+            self.prepared_end = PreparedEnd::MismatchAtCurrentSegment;
+            return None;
+        }
+
+        if comparable_len == 0 {
+            return Some((depth, ExistingSource::Segment(segment_idx, 0)));
+        }
+
+        if depth + comparable_len - 1 == self.max_depth {
+            self.push_prepared_segment_step(segment_idx, comparable_len - 1, 0.0, 0);
+            return None;
+        }
+
+        if segment.tail.is_none() {
+            self.push_prepared_segment_step(segment_idx, comparable_len - 1, 0.0, 0);
+            self.prepared_end = PreparedEnd::MissingAfterCurrent;
+            return None;
+        }
+
+        self.push_prepared_segment_step(segment_idx, seg_len - 1, 0.0, 0);
+        let tail = segment.tail;
+        Some((
+            depth + seg_len,
+            Self::child_to_existing_source(tail).unwrap_or(ExistingSource::None),
+        ))
     }
 
     fn clear(&mut self) {
@@ -2449,7 +2526,7 @@ impl CtEngine {
                             clamp_log_prob(log_prob_kt)
                         } else {
                             let (alpha, log_alpha, log_one_minus_alpha) =
-                                self.segment_constants(self.arena.segments[slot].len());
+                                self.segment_constants(step.span);
                             unary_chain_log_weight_precomputed(
                                 log_prob_kt,
                                 child_weight,
@@ -3193,6 +3270,25 @@ impl CtEngine {
                 }
                 ExistingSource::Segment(segment_idx, _) => {
                     let segment = self.arena.segments[segment_idx.get()];
+                    if segment.payload.is_exact() {
+                        let path_bits = path_bits_from_history(
+                            history,
+                            depth,
+                            self.max_depth.saturating_sub(depth).saturating_add(1),
+                        );
+                        if let Some((next_depth, next_source)) =
+                            self.walk_prepared_exact_segment(segment_idx, segment, depth, path_bits)
+                        {
+                            source = next_source;
+                            if matches!(source, ExistingSource::None) {
+                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
+                                break 'walk;
+                            }
+                            depth = next_depth;
+                            continue 'walk;
+                        }
+                        break 'walk;
+                    }
                     let seg_len = segment.len() as usize;
                     for offset in 0..seg_len {
                         let node_depth = depth + offset;
@@ -3409,6 +3505,25 @@ impl CtEngine {
                 }
                 ExistingSource::Segment(segment_idx, _) => {
                     let segment = self.arena.segments[segment_idx.get()];
+                    if segment.payload.is_exact() {
+                        let path_bits = path_bits_from_history(
+                            history,
+                            depth,
+                            self.max_depth.saturating_sub(depth).saturating_add(1),
+                        );
+                        if let Some((next_depth, next_source)) =
+                            self.walk_prepared_exact_segment(segment_idx, segment, depth, path_bits)
+                        {
+                            source = next_source;
+                            if matches!(source, ExistingSource::None) {
+                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
+                                break 'walk;
+                            }
+                            depth = next_depth;
+                            continue 'walk;
+                        }
+                        break 'walk;
+                    }
                     let seg_len = segment.len() as usize;
                     for offset in 0..seg_len {
                         let node_depth = depth + offset;
@@ -3604,11 +3719,16 @@ impl CtEngine {
             }
         }
 
+        let node_payload_bytes = self.arena.nodes.len() * size_of::<CtNode>();
         let node_bytes = self.arena.nodes.capacity() * size_of::<CtNode>();
+        let segment_payload_bytes = self.arena.segments.len() * size_of::<CtSegment>();
         let segment_bytes = self.arena.segments.capacity() * size_of::<CtSegment>();
         let free_list_bytes = self.arena.free_nodes.capacity() * size_of::<NodeIndex>()
             + self.arena.free_segments.capacity() * size_of::<SegmentIndex>();
         let scratch_bytes = self.scratch_memory_usage();
+        let arena_slack_bytes = node_bytes
+            .saturating_sub(node_payload_bytes)
+            .saturating_add(segment_bytes.saturating_sub(segment_payload_bytes));
 
         FacContextTreeTreeTelemetry {
             bit_index,
@@ -3623,13 +3743,16 @@ impl CtEngine {
             free_segments_len: self.arena.free_segments.len(),
             free_segments_capacity: self.arena.free_segments.capacity(),
             node_bytes,
+            node_payload_bytes,
             segment_bytes,
+            segment_payload_bytes,
             free_list_bytes,
             scratch_bytes,
             total_bytes: node_bytes
                 .saturating_add(segment_bytes)
                 .saturating_add(free_list_bytes)
                 .saturating_add(scratch_bytes),
+            arena_slack_bytes,
             exact_segments,
             history_segments,
             history_invert_segments,
@@ -3883,14 +4006,20 @@ pub struct FacContextTreeTreeTelemetry {
     pub free_segments_capacity: usize,
     /// Reserved explicit-node bytes.
     pub node_bytes: usize,
+    /// Explicit-node payload bytes at current length.
+    pub node_payload_bytes: usize,
     /// Reserved segment bytes.
     pub segment_bytes: usize,
+    /// Unary-segment payload bytes at current length.
+    pub segment_payload_bytes: usize,
     /// Reserved free-list bytes.
     pub free_list_bytes: usize,
     /// Reserved engine scratch bytes.
     pub scratch_bytes: usize,
     /// Total reserved tree bytes for this tree.
     pub total_bytes: usize,
+    /// Reserved tree bytes currently unused by arena capacity.
+    pub arena_slack_bytes: usize,
     /// Number of exact-bit segment payloads.
     pub exact_segments: usize,
     /// Number of history-anchor segment payloads.
@@ -3919,12 +4048,22 @@ pub struct FacContextTreeTelemetry {
     pub shared_history_capacity_bits: usize,
     /// Reserved bytes for shared history.
     pub shared_history_bytes: usize,
+    /// Shared-history payload bytes at current length.
+    pub shared_history_payload_bytes: usize,
+    /// Shared-history reserved slack bytes.
+    pub shared_history_slack_bytes: usize,
     /// Reserved bytes for shared log caches.
     pub shared_log_cache_bytes: usize,
     /// Sum of per-tree reserved bytes.
     pub tree_bytes: usize,
+    /// Sum of live per-tree node and segment payload bytes.
+    pub tree_payload_bytes: usize,
+    /// Sum of per-tree arena slack bytes.
+    pub tree_arena_slack_bytes: usize,
     /// Total reserved bytes reported by FAC memory accounting.
     pub total_bytes: usize,
+    /// Total reserved slack bytes attributable to allocator headroom.
+    pub total_slack_bytes: usize,
     /// Sum of allocated explicit nodes across trees.
     pub nodes_len: usize,
     /// Sum of explicit-node capacity across trees.
@@ -3947,6 +4086,8 @@ pub struct FacContextTreeTelemetry {
     pub const_segments: usize,
     /// Sum of segment lengths in bits across trees.
     pub segment_bits: u64,
+    /// Maximum segment length observed across trees.
+    pub max_segment_len: u32,
     /// Per-tree telemetry.
     pub trees: Vec<FacContextTreeTreeTelemetry>,
 }
@@ -4302,6 +4443,11 @@ impl FacContextTree {
             .enumerate()
             .map(|(bit_index, tree)| tree.engine.telemetry(bit_index))
             .collect();
+        let shared_history_payload_bytes =
+            self.shared_history.len().div_ceil(HISTORY_WORD_BITS) * size_of::<u64>();
+        let shared_history_slack_bytes = usage
+            .shared_history_bytes
+            .saturating_sub(shared_history_payload_bytes);
         let nodes_len = trees.iter().map(|tree| tree.nodes_len).sum();
         let nodes_capacity = trees.iter().map(|tree| tree.nodes_capacity).sum();
         let segments_len = trees.iter().map(|tree| tree.segments_len).sum();
@@ -4313,6 +4459,20 @@ impl FacContextTree {
         let history_invert_segments = trees.iter().map(|tree| tree.history_invert_segments).sum();
         let const_segments = trees.iter().map(|tree| tree.const_segments).sum();
         let segment_bits = trees.iter().map(|tree| tree.segment_bits).sum();
+        let max_segment_len = trees
+            .iter()
+            .map(|tree| tree.max_segment_len)
+            .max()
+            .unwrap_or(0);
+        let tree_payload_bytes = trees
+            .iter()
+            .map(|tree| {
+                tree.node_payload_bytes
+                    .saturating_add(tree.segment_payload_bytes)
+            })
+            .sum();
+        let tree_arena_slack_bytes: usize = trees.iter().map(|tree| tree.arena_slack_bytes).sum();
+        let total_slack_bytes = tree_arena_slack_bytes.saturating_add(shared_history_slack_bytes);
 
         FacContextTreeTelemetry {
             base_depth: self.base_depth,
@@ -4320,9 +4480,14 @@ impl FacContextTree {
             shared_history_len_bits: self.shared_history.len(),
             shared_history_capacity_bits: self.shared_history.words.capacity() * HISTORY_WORD_BITS,
             shared_history_bytes: usage.shared_history_bytes,
+            shared_history_payload_bytes,
+            shared_history_slack_bytes,
             shared_log_cache_bytes: usage.shared_log_cache_bytes,
             tree_bytes: usage.tree_bytes,
+            tree_payload_bytes,
+            tree_arena_slack_bytes,
             total_bytes: usage.total_bytes(),
+            total_slack_bytes,
             nodes_len,
             nodes_capacity,
             segments_len,
@@ -4334,6 +4499,7 @@ impl FacContextTree {
             history_invert_segments,
             const_segments,
             segment_bits,
+            max_segment_len,
             trees,
         }
     }
@@ -4991,7 +5157,7 @@ mod tests {
 
     #[test]
     fn context_tree_singleton_paths_use_hot_prefix_nodes() {
-        let mut tree = ContextTree::new(12);
+        let mut tree = ContextTree::new(13);
         tree.update(false);
 
         let hot_prefix_depth = tree.engine.hot_prefix_depth();
@@ -5022,7 +5188,7 @@ mod tests {
 
     #[test]
     fn context_tree_missing_path_tail_uses_exact_segment_payloads() {
-        let mut tree = ContextTree::new(12);
+        let mut tree = ContextTree::new(13);
         tree.update(true);
         let child = tree.engine.arena.child(tree.engine.root, 0);
         let mut current = child.as_node().expect("hot-prefix node");
@@ -5081,8 +5247,11 @@ mod tests {
             .expect("history-backed segment tail");
         let first_segment = tree.engine.arena.segments[first_segment.get()];
         assert_eq!(first_segment.payload.mode(), SEG_MODE_HISTORY);
-        assert_eq!(first_segment.payload.len(), 69);
-        for offset in [0usize, 1, 7, 31, 68] {
+        assert_eq!(
+            first_segment.payload.len() as usize,
+            tree.engine.max_depth - tree.engine.hot_prefix_depth() - 1
+        );
+        for offset in [0usize, 1, 7, 31, 66] {
             assert_eq!(
                 segment_edge_from_parts(
                     first_segment,

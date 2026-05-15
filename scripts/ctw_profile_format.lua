@@ -146,6 +146,9 @@ local function print_snapshot_header()
 end
 
 local function arena_payload_bytes(telemetry)
+    if not is_null(telemetry.tree_payload_bytes) then
+        return telemetry.tree_payload_bytes
+    end
     local node_bytes = (telemetry.nodes_len or 0) * 32
     local segment_bytes = (telemetry.segments_len or 0) * 40
     return node_bytes + segment_bytes
@@ -167,8 +170,11 @@ local function print_summary(final, snapshots)
     local logical_nodes = (telemetry.nodes_len or 0) + (telemetry.segment_bits or 0)
     local payload_bytes = arena_payload_bytes(telemetry)
     local explicit_bytes = explicit_node_equivalent_bytes(telemetry)
-    local capacity_arena_bytes = (telemetry.nodes_capacity or 0) * 32 + (telemetry.segments_capacity or 0) * 40
-    local capacity_slack = capacity_arena_bytes - payload_bytes
+    local capacity_slack = telemetry.tree_arena_slack_bytes
+    if is_null(capacity_slack) then
+        local capacity_arena_bytes = (telemetry.nodes_capacity or 0) * 32 + (telemetry.segments_capacity or 0) * 40
+        capacity_slack = capacity_arena_bytes - payload_bytes
+    end
     local saved_vs_explicit = explicit_bytes - payload_bytes
     local history_payload_segments = (telemetry.history_segments or 0) + (telemetry.history_invert_segments or 0)
 
@@ -191,6 +197,8 @@ local function print_summary(final, snapshots)
     print_kv("telemetry reserved total", human_bytes(telemetry.total_bytes))
     print_kv("tree arena reserved", human_bytes(telemetry.tree_bytes))
     print_kv("shared history reserved", human_bytes(telemetry.shared_history_bytes))
+    print_kv("shared history payload", human_bytes(telemetry.shared_history_payload_bytes))
+    print_kv("shared history slack", human_bytes(telemetry.shared_history_slack_bytes))
     print_kv("shared log cache reserved", human_bytes(telemetry.shared_log_cache_bytes))
     print_kv("history length", comma_int(telemetry.shared_history_len_bits) .. " bits")
     print_kv("history capacity", comma_int(telemetry.shared_history_capacity_bits) .. " bits")
@@ -198,6 +206,7 @@ local function print_summary(final, snapshots)
     print_kv("segments", comma_int(telemetry.segments_len) .. " / cap " .. comma_int(telemetry.segments_capacity) .. " (" .. percent(telemetry.segments_len, telemetry.segments_capacity) .. " full)")
     print_kv("arena payload at len", human_bytes(payload_bytes))
     print_kv("arena capacity slack", human_bytes(capacity_slack))
+    print_kv("total allocator slack", human_bytes(telemetry.total_slack_bytes))
     print_kv("represented logical nodes", comma_int(logical_nodes))
     print_kv("explicit-node equivalent", human_bytes(explicit_bytes))
     print_kv("payload saved by segments", human_bytes(saved_vs_explicit))
@@ -205,6 +214,7 @@ local function print_summary(final, snapshots)
     print_kv("history-anchor segments", comma_int(history_payload_segments))
     print_kv("const segments", comma_int(telemetry.const_segments))
     print_kv("segment bits", comma_int(telemetry.segment_bits))
+    print_kv("max segment len", comma_int(telemetry.max_segment_len))
 
     if history_payload_segments == 0 then
         print_kv("history-anchor audit", "none observed")
