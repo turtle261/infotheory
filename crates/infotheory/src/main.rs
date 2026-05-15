@@ -1053,7 +1053,7 @@ fn parse_compression_backend_flag_or_exit(value: &str, flag_name: &str) -> Strin
         })
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "research-tooling"))]
 fn parse_ctw_profile_size(raw: &str, field: &str) -> anyhow::Result<usize> {
     let trimmed = raw.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -1081,7 +1081,7 @@ fn parse_ctw_profile_size(raw: &str, field: &str) -> anyhow::Result<usize> {
         .ok_or_else(|| anyhow::anyhow!("{field} overflows usize: '{raw}'"))
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "research-tooling"))]
 fn parse_ctw_profile_cutpoints(raw: &str) -> anyhow::Result<Vec<usize>> {
     let mut cutpoints = raw
         .split(',')
@@ -1096,7 +1096,7 @@ fn parse_ctw_profile_cutpoints(raw: &str) -> anyhow::Result<Vec<usize>> {
     Ok(cutpoints)
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "research-tooling"))]
 fn default_ctw_profile_cutpoints(max_bytes: Option<usize>) -> Vec<usize> {
     let mut cutpoints = Vec::new();
     let mut next = 1_000_000usize;
@@ -1114,7 +1114,11 @@ fn default_ctw_profile_cutpoints(max_bytes: Option<usize>) -> Vec<usize> {
     cutpoints
 }
 
-#[cfg(all(feature = "backend-ctw", target_os = "linux"))]
+#[cfg(all(
+    feature = "backend-ctw",
+    feature = "research-tooling",
+    target_os = "linux"
+))]
 fn ctw_profile_proc_memory_bytes() -> serde_json::Value {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return serde_json::json!(null);
@@ -1144,12 +1148,16 @@ fn ctw_profile_proc_memory_bytes() -> serde_json::Value {
     })
 }
 
-#[cfg(all(feature = "backend-ctw", not(target_os = "linux")))]
+#[cfg(all(
+    feature = "backend-ctw",
+    feature = "research-tooling",
+    not(target_os = "linux")
+))]
 fn ctw_profile_proc_memory_bytes() -> serde_json::Value {
     serde_json::json!(null)
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "research-tooling"))]
 fn ctw_profile_tree_json(tree: &infotheory::ctw::FacContextTreeTreeTelemetry) -> serde_json::Value {
     serde_json::json!({
         "bit_index": tree.bit_index,
@@ -1180,7 +1188,7 @@ fn ctw_profile_tree_json(tree: &infotheory::ctw::FacContextTreeTreeTelemetry) ->
     })
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "research-tooling"))]
 fn ctw_profile_snapshot_json(
     mode: &str,
     depth: usize,
@@ -1238,7 +1246,7 @@ fn ctw_profile_snapshot_json(
     })
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "research-tooling"))]
 fn run_ctw_profile_mode(args: &[String]) {
     let result = (|| -> anyhow::Result<()> {
         let mut input_path: Option<String> = None;
@@ -1400,9 +1408,11 @@ fn run_ctw_profile_mode(args: &[String]) {
     }
 }
 
-#[cfg(not(feature = "backend-ctw"))]
+#[cfg(not(all(feature = "backend-ctw", feature = "research-tooling")))]
 fn run_ctw_profile_mode(_args: &[String]) {
-    eprintln!("Error: 'ctw-profile' requires infotheory built with feature 'backend-ctw'");
+    eprintln!(
+        "Error: 'ctw-profile' requires infotheory built with features 'backend-ctw research-tooling'"
+    );
     std::process::exit(1);
 }
 
@@ -2039,6 +2049,11 @@ fn print_usage() {
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let ctw_profile_help = if cfg!(all(feature = "backend-ctw", feature = "research-tooling")) {
+        "    ctw-profile <input|-> [--depth N]       Emit FAC-CTW arena telemetry as JSONL\n"
+    } else {
+        ""
+    };
 
     eprintln!(
         r#"InfoTheory CLI
@@ -2073,8 +2088,7 @@ Primitives:
     generate [file]                         Generate continuation from file or piped stdin
     compress <in> <out>                     Compress file using selected compression backend
     decompress <in> <out>                   Decompress file using selected compression backend
-    ctw-profile <input|-> [--depth N]       Emit FAC-CTW arena telemetry as JSONL
-    ac-log-loss <input> --mixture <spec.json> --out-prefix <prefix>
+{ctw_profile_help}    ac-log-loss <input> --mixture <spec.json> --out-prefix <prefix>
                                           Emit exact AC/log-loss TSV diagnostics for a mixture
     sequitur-debug <input>|--hex <hex> [--hex <hex> ...]
                                           Emit canonical Sequitur grammar and bounded predictive traces
@@ -2175,7 +2189,8 @@ Examples:
   infotheory compress in.bin out.itc --compression-backend rate-ac --rate-backend mixture --method mixture.json
   infotheory decompress out.itc restored.bin --compression-backend rate-ac --rate-backend mixture --method mixture.json
   RAYON_NUM_THREADS=4 infotheory ac-log-loss corpus.bin --mixture configs/bench/mixture.json --out-prefix /tmp/mixture-diagnostic
-"#
+"#,
+        ctw_profile_help = ctw_profile_help
     );
 }
 

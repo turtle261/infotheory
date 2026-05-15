@@ -2,12 +2,12 @@
 
 This is a local, disposable working document for choosing the next performance and memory-efficiency experiments in Infotheory. It is deliberately not a permanent design spec. Its purpose is to keep optimization work scientifically grounded, Hutter-relevant, and resistant to seductive but low-yield micro-tuning.
 
-The second-pass audit materially changes the prioritization:
+The current branch state materially changes the prioritization:
 
-1. **CTW's shared log cache is a Hutter-scale asymptotic memory problem**. The thread-local cache stores `log_int` and `log_half` up to the maximum visit count. At enwik9 scale, two `f64` arrays of length `n` are already about 16 GB before CTW arena state. This must become bounded or optional before CTW/FAC-CTW is a credible Hutter component at full scale.
-2. **PPMD's largest exact implementation opportunity is not only suffix hashing**. Rolling suffix keys are valid, but `PpmdModel::ensure_pdf_inner` also rebuilds dense 256-entry arrays across all active orders whenever a caller often needs only one symbol probability or a binary interval mass. The stronger direction is a probability-query interface that avoids dense PDF/CDF materialization when the coder/loss does not require it.
-3. **RWKV7's next memory/time work should target TBPTT replay workspace churn before exotic kernels**. Fixed-shape GEMV specialization is plausible, but the current online TBPTT path still allocates replay-local vectors, per-step PDF vectors, traces, checkpoints, full gradient state, and recurrent gradient state per segment flush. Reusing this workspace and freeing it after the final full-train window is a more direct `A(n)/Q(n)/S(n)` target.
-4. **Expert marginal utility must be measured explicitly**. Hutter-relevant optimization is not “make every expert faster”; it is “maximize compressed bits saved per byte of memory, second of CPU, and byte of program/model description.” A costly expert that contributes little marginal code-length improvement should be pruned, scheduled sparsely, or made optional before being hand-optimized.
+1. **CTW's shared log cache asymptotic memory problem is addressed for this branch scope**. The bounded exact log-cache work landed, the hot-prefix sweep was completed, and depth `12` is the current chosen default. CTW should now be treated as done for this tranche unless later validation uncovers a new issue.
+2. **PPMD's rolling suffix key and exact-entry update work landed, while sparse/exact query routing was investigated and rejected under the current representation**. Further PPMD work is now a later representation question, not the active branch target.
+3. **RWKV7's next memory/time work should target TBPTT replay workspace churn before exotic kernels**. Fixed-shape GEMV specialization is plausible, but the current online TBPTT path still allocates replay-local vectors, per-step PDF vectors, traces, checkpoints, full gradient state, and recurrent gradient state per segment flush. Reusing this workspace and freeing it after the final full-train window is the active `A(n)/Q(n)/S(n)` target for this branch.
+4. **Expert marginal utility still matters, but it is not the immediate branch task**. Ablation remains important for later resource-MDL decision-making, yet it is intentionally out of scope until the current optimization tranche is satisfactorily implemented.
 5. **AC inlining and binary decode are now guardrail knobs, not the main research frontier**. They should remain in the benchmark matrix, but further AC work is lower priority unless a new profile contradicts the current evidence.
 
 ## Hutter-aware objective
@@ -109,7 +109,8 @@ Important current-code facts verified in the second pass:
 - `PpmdModel::context_key(ord)` hashes the suffix from scratch, and `PpmdModel::ensure_pdf_inner` rebuilds dense 256-entry distributions order by order.
 - `MixturePredictor::ac_step_bitwise` already uses CTW's bitwise prepared path, and for several non-CTW experts calls `prepare_cached_cdf_fast_bitwise`, which still materializes full CDFs.
 - `CtwPredictor::bit_prob_one_msb` already calls `FacContextTree::predict_one`, and `CtwPredictor::update_bit_msb` already calls `update_predicted`. A naive “reuse prediction path for update” idea is redundant.
-- `CtEngine::with_logs` uses a thread-local `SharedLogCache` with two `Vec<f64>` caches growing to `root_visits + 1`.
+- `CtEngine::with_logs` previously used a thread-local `SharedLogCache` with two `Vec<f64>` caches growing to `root_visits + 1`; this branch now bounds that exact cache path.
+- The CTW hot-prefix sweep for this branch was completed and selected `12` as the current default.
 - `Model::online_train_segment_tbptt` allocates replay-local gradient/checkpoint/trace/PDF structures inside each segment training call.
 - `OnlineRuntime` keeps `full_tbptt` and `full_adam` state after they become unnecessary unless explicit lifecycle logic is added.
 
@@ -203,25 +204,28 @@ Apply these before spending multiple implementation days on any path:
 
 Use “kill” literally: the best outcome of many experiments is an early, well-evidenced decision not to continue.
 
-## First-tranche success plan
+## Current tranche status and active next target
 
-The first tranche should answer feasibility and direction questions in this order:
+For this branch, the tranche ordering above is no longer future work; most of it is already resolved:
 
-1. **Can CTW be made Hutter-feasible in memory?**
-   - Implement thresholded exact log lookup.
-   - Measure cache memory, RSS, archive bytes, and speed.
-   - **Stop/go**: if bounded logs cause intolerable runtime, investigate hybrid thresholds; if archive differs unexpectedly, isolate floating/libm cause before proceeding.
-2. **Can PPMD avoid dense probability work exactly?**
-   - Add dense-reference tests for `symbol_prob` and interval masses before routing production calls.
-   - **Stop/go**: if exact floor/renormalization equivalence forces dense work anyway, classify unfloored queries as model-changing and benchmark them separately rather than hiding the semantic change.
-3. **Which experts pay rent?**
-   - Run ablations after CTW/PPMD feasibility prototypes, because their resource profile may shift.
-   - **Stop/go**: do not optimize ROSA/RWKV/Match deeply until their marginal contribution is shown on the same corpus prefixes.
-4. **Can RWKV training allocation churn be removed without changing learning?**
-   - Prototype replay workspace reuse only after current compression-effective RWKV schedules remain relevant under ablation.
-   - **Stop/go**: require archive parity and lower allocation/RSS or clear runtime improvement.
+1. **CTW feasibility work is complete for this branch scope.**
+   - Bounded exact log lookup landed.
+   - The hot-prefix sweep was completed.
+   - Depth `12` is the chosen branch default.
+   - Treat further CTW work as closed unless later testing reveals a new issue.
+2. **PPMD exact optimization work is complete for this branch scope.**
+   - Rolling suffix keys landed.
+   - Exact-entry update improvements landed.
+   - Sparse/exact query routing was investigated and rejected under the current representation.
+3. **RWKV7 replay-workspace reuse is the active implementation target.**
+   - Remove per-flush allocation churn in `Model::online_train_segment_tbptt`.
+   - Reuse checkpoints, step states, traces, PDF storage, full gradient state, recurrent gradient state, and bias-gradient scratch.
+   - Preserve training semantics exactly.
+   - Prefer runtime-local caching rather than widening public API surface.
+4. **RWKV7 post-training lifecycle cleanup remains a later follow-up.**
+   - Releasing no-longer-needed full-training state is still useful, but it is secondary to removing replay allocation churn.
 
-This tranche is deliberately not “finish all optimizations.” It should produce a resource-frontier table and decide which branches deserve implementation depth.
+This tranche is deliberately centered on finishing the current exact optimization path, not on switching to ablation or another CTW round.
 
 ## Post-feasibility resource-MDL search
 
@@ -257,7 +261,7 @@ The point is MDL discipline: a larger or more complex model must pay for itself 
 
 | Priority | Track | Main term | Why it is high-signal |
 |---|---|---:|---|
-| P0 | CTW bounded/exact log lookup | `S(n)` | Current shared cache is `Theta(n)` `f64` memory and can exceed Hutter RAM by itself at enwik9 scale. |
+| P0 | RWKV7 TBPTT replay workspace reuse | `A(n), Q(n), S(n)` | Current TBPTT replay still allocates large fixed-shape scratch structures per flush; reuse is the clearest remaining exact optimization target on this branch. |
 | P0 | PPMD probability-query interface | `W(n), Q(n)` | Avoids dense 256-way interpolation/CDF construction when only `P(symbol)` or binary interval masses are needed. |
 | P1 | PPMD rolling suffix keys + update lookup tightening | `W(n)` | Exact `Theta(k^2) -> Theta(k)` key maintenance at order `k`, localized and low semantic risk. |
 | P1 | RWKV7 TBPTT replay workspace reuse | `A(n), Q(n), S(n)` | Current full-training replay allocates per segment; profile shows training gradients are expensive. |

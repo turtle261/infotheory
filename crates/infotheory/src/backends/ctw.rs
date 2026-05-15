@@ -3688,6 +3688,7 @@ impl CtEngine {
             + self.prepared_steps.capacity() * size_of::<PreparedStep>()
     }
 
+    #[cfg(any(test, feature = "research-tooling"))]
     fn scratch_memory_usage(&self) -> usize {
         self.segment_alpha.capacity() * size_of::<f64>()
             + self.segment_log_alpha.capacity() * size_of::<f64>()
@@ -3697,6 +3698,7 @@ impl CtEngine {
             + self.prepared_steps.capacity() * size_of::<PreparedStep>()
     }
 
+    #[cfg(any(test, feature = "research-tooling"))]
     fn telemetry(&self, bit_index: usize) -> FacContextTreeTreeTelemetry {
         let mut exact_segments: usize = 0;
         let mut history_segments: usize = 0;
@@ -3968,6 +3970,7 @@ pub struct FacContextTree {
 }
 
 /// Approximate heap-memory breakdown for a [`FacContextTree`].
+#[cfg(any(test, feature = "research-tooling"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FacContextTreeMemoryUsage {
     /// Bytes owned by per-bit CTW tree engines, including arenas and scratch buffers.
@@ -3979,6 +3982,7 @@ pub struct FacContextTreeMemoryUsage {
 }
 
 /// Per-tree CTW arena and scratch telemetry.
+#[cfg(any(test, feature = "research-tooling"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FacContextTreeTreeTelemetry {
@@ -4035,6 +4039,7 @@ pub struct FacContextTreeTreeTelemetry {
 }
 
 /// Detailed FAC-CTW memory telemetry.
+#[cfg(any(test, feature = "research-tooling"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FacContextTreeTelemetry {
@@ -4092,6 +4097,7 @@ pub struct FacContextTreeTelemetry {
     pub trees: Vec<FacContextTreeTreeTelemetry>,
 }
 
+#[cfg(any(test, feature = "research-tooling"))]
 impl FacContextTreeMemoryUsage {
     /// Total approximate heap memory in bytes.
     #[inline]
@@ -4419,6 +4425,7 @@ impl FacContextTree {
     }
 
     /// Approximate heap-memory usage broken down by CTW component.
+    #[cfg(any(test, feature = "research-tooling"))]
     pub fn memory_usage_breakdown(&self) -> FacContextTreeMemoryUsage {
         let tree_mem: usize = self.trees.iter().map(|t| t.engine.memory_usage()).sum();
         let log_cache_mem = self
@@ -4435,6 +4442,7 @@ impl FacContextTree {
     }
 
     /// Detailed CTW arena, segment, scratch, history, and log-cache telemetry.
+    #[cfg(any(test, feature = "research-tooling"))]
     pub fn telemetry(&self) -> FacContextTreeTelemetry {
         let usage = self.memory_usage_breakdown();
         let trees: Vec<FacContextTreeTreeTelemetry> = self
@@ -4506,7 +4514,16 @@ impl FacContextTree {
 
     /// Approximate heap memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
-        self.memory_usage_breakdown().total_bytes()
+        let tree_mem: usize = self.trees.iter().map(|t| t.engine.memory_usage()).sum();
+        let log_cache_mem = self
+            .trees
+            .first()
+            .map(|t| t.engine.log_cache_memory_usage())
+            .unwrap_or(0);
+        let history_mem = self.shared_history.memory_usage();
+        tree_mem
+            .saturating_add(log_cache_mem)
+            .saturating_add(history_mem)
     }
 }
 

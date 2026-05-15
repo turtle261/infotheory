@@ -420,6 +420,62 @@ struct FullGradState {
     blocks: Vec<BlockGradState>,
 }
 
+impl FullGradState {
+    fn zero(&mut self) {
+        self.embeddings.zero();
+        self.ln_out_w.zero();
+        self.ln_out_b.zero();
+        self.lm_head.zero();
+        for block in &mut self.blocks {
+            if let Some(t) = block.pre_norm_w.as_mut() {
+                t.zero();
+            }
+            if let Some(t) = block.pre_norm_b.as_mut() {
+                t.zero();
+            }
+            block.attn_norm_w.zero();
+            block.attn_norm_b.zero();
+            block.ffn_norm_w.zero();
+            block.ffn_norm_b.zero();
+
+            block.attn.x_r.zero();
+            block.attn.x_w.zero();
+            block.attn.x_k.zero();
+            block.attn.x_v.zero();
+            block.attn.x_a.zero();
+            block.attn.x_g.zero();
+            block.attn.rkv_proj.zero();
+            block.attn.o_proj.zero();
+            block.attn.w1.zero();
+            block.attn.w2.zero();
+            block.attn.w0.zero();
+            block.attn.a1.zero();
+            block.attn.a2.zero();
+            block.attn.a0.zero();
+            if let Some(t) = block.attn.v1.as_mut() {
+                t.zero();
+            }
+            if let Some(t) = block.attn.v2.as_mut() {
+                t.zero();
+            }
+            if let Some(t) = block.attn.v0.as_mut() {
+                t.zero();
+            }
+            block.attn.g1.zero();
+            block.attn.g2.zero();
+            block.attn.k_k.zero();
+            block.attn.k_a.zero();
+            block.attn.r_k.zero();
+            block.attn.g_norm_w.zero();
+            block.attn.g_norm_b.zero();
+
+            block.ffn.x_k.zero();
+            block.ffn.key_w.zero();
+            block.ffn.value_w.zero();
+        }
+    }
+}
+
 struct AdamStep {
     lr: f32,
     clip: f32,
@@ -549,6 +605,14 @@ impl TokenTrainTrace {
             layers: scratch.train_trace_layers.clone(),
         }
     }
+
+    fn clone_from_scratch(&mut self, scratch: &ScratchBuffers) {
+        self.token = scratch.train_token;
+        self.x.clone_from(&scratch.x);
+        self.x_normed.clone_from(&scratch.x_normed);
+        self.v_first.clone_from(&scratch.train_v_first);
+        self.layers.clone_from(&scratch.train_trace_layers);
+    }
 }
 
 #[derive(Clone)]
@@ -637,6 +701,36 @@ pub struct ScratchBuffers {
     train_v_first: Tensor1D,
     train_trace_valid: bool,
     capture_train_trace: bool,
+}
+
+pub(crate) struct TbpttReplayWorkspace {
+    grads: FullGradState,
+    recurrent: RecurrentGradState,
+    bias_grad: Vec<f32>,
+    checkpoints: Vec<State>,
+    step_states: Vec<State>,
+    step_traces: Vec<TokenTrainTrace>,
+    step_pdfs: Vec<f64>,
+}
+
+impl TbpttReplayWorkspace {
+    pub(crate) fn new(model: &Model) -> Self {
+        Self {
+            grads: model.new_full_grad_state(),
+            recurrent: model.new_recurrent_grad_state(),
+            bias_grad: Vec::new(),
+            checkpoints: Vec::new(),
+            step_states: Vec::new(),
+            step_traces: Vec::new(),
+            step_pdfs: Vec::new(),
+        }
+    }
+}
+
+fn ensure_cloned_len<T: Clone>(buf: &mut Vec<T>, len: usize, template: &T) {
+    if buf.len() < len {
+        buf.resize_with(len, || template.clone());
+    }
 }
 
 impl ScratchBuffers {
@@ -3142,9 +3236,10 @@ impl Model {
 
     #[allow(clippy::too_many_arguments)]
     /// Run one TBPTT training segment and write the resulting live state.
-    pub fn online_train_segment_tbptt(
+    pub(crate) fn online_train_segment_tbptt(
         &mut self,
         scratch: &mut ScratchBuffers,
+        workspace: &mut TbpttReplayWorkspace,
         start_state: &State,
         steps: &[(u32, u8)],
         scope: TrainScopeMask,
@@ -3166,68 +3261,98 @@ impl Model {
 
         let grad_scale = 1.0f32 / (steps.len() as f32);
         let chunk = replay_chunk.max(1).min(steps.len().max(1));
-        let mut grads = self.new_full_grad_state();
-        let mut recurrent = self.new_recurrent_grad_state();
+        let TbpttReplayWorkspace {
+            grads,
+            recurrent,
+            bias_grad: workspace_bias_grad,
+            checkpoints,
+            step_states,
+            step_traces,
+            step_pdfs,
+        } = workspace;
+        grads.zero();
         recurrent.zero();
-        let mut bias_grad = out_bias.as_deref().map(|b| vec![0.0f32; b.len()]);
+        let mut bias_grad = match out_bias.as_deref().map(<[f32]>::len) {
+            Some(len) => {
+                if workspace_bias_grad.len() != len {
+                    workspace_bias_grad.resize(len, 0.0);
+                } else {
+                    workspace_bias_grad.fill(0.0);
+                }
+                Some(workspace_bias_grad.as_mut_slice())
+            }
+            None => None,
+        };
 
         {
-            let mut checkpoints = Vec::<State>::new();
             let mut checkpoint_state = start_state.clone();
+            let checkpoint_count = steps.len().div_ceil(chunk);
+            ensure_cloned_len(checkpoints, checkpoint_count, start_state);
+            checkpoints.truncate(checkpoint_count);
             scratch.set_capture_train_trace(false);
-            for chunk_start in (0..steps.len()).step_by(chunk) {
-                checkpoints.push(checkpoint_state.clone());
+            for (checkpoint_idx, chunk_start) in (0..steps.len()).step_by(chunk).enumerate() {
+                checkpoints[checkpoint_idx].clone_from(&checkpoint_state);
                 let chunk_end = (chunk_start + chunk).min(steps.len());
                 for &(input_token, _) in &steps[chunk_start..chunk_end] {
                     self.forward(scratch, input_token, &mut checkpoint_state);
                 }
             }
 
-            for chunk_idx in (0..checkpoints.len()).rev() {
+            for chunk_idx in (0..checkpoint_count).rev() {
                 let chunk_start = chunk_idx * chunk;
                 let chunk_end = (chunk_start + chunk).min(steps.len());
-                let mut state = checkpoints[chunk_idx].clone();
-                let mut step_states = Vec::<State>::with_capacity(chunk_end - chunk_start + 1);
-                let mut step_traces =
-                    Vec::<TokenTrainTrace>::with_capacity(chunk_end - chunk_start);
-                let mut step_pdfs =
-                    Vec::<Vec<f64>>::with_capacity(chunk_end.saturating_sub(chunk_start));
-                step_states.push(state.clone());
+                let chunk_steps = chunk_end - chunk_start;
+                let checkpoint = &checkpoints[chunk_idx];
+                let mut state = checkpoint.clone();
+                let state_count = chunk_steps + 1;
+                ensure_cloned_len(step_states, state_count, checkpoint);
+                step_states.truncate(state_count);
+                if step_traces.len() < chunk_steps {
+                    step_traces.resize_with(chunk_steps, || TokenTrainTrace::from_scratch(scratch));
+                }
+                step_traces.truncate(chunk_steps);
+                let pdf_stride = self.cfg.vocab_size;
+                step_pdfs.resize(chunk_steps.saturating_mul(pdf_stride), 0.0);
+                step_states[0].clone_from(&state);
 
-                for &(input_token, _) in &steps[chunk_start..chunk_end] {
+                for (local_idx, &(input_token, _)) in
+                    steps[chunk_start..chunk_end].iter().enumerate()
+                {
                     scratch.set_capture_train_trace(true);
                     let logits = self.forward(scratch, input_token, &mut state);
-                    let mut pdf = vec![0.0f64; self.cfg.vocab_size];
+                    let pdf_lo = local_idx * pdf_stride;
+                    let pdf_hi = pdf_lo + pdf_stride;
                     super::super::softmax_pdf_floor_with_bias(
                         logits,
                         out_bias.as_deref(),
-                        &mut pdf,
+                        &mut step_pdfs[pdf_lo..pdf_hi],
                     );
-                    step_pdfs.push(pdf);
-                    step_traces.push(TokenTrainTrace::from_scratch(scratch));
-                    step_states.push(state.clone());
+                    step_traces[local_idx].clone_from_scratch(scratch);
+                    step_states[local_idx + 1].clone_from(&state);
                 }
 
-                for local_idx in (0..step_traces.len()).rev() {
+                for local_idx in (0..chunk_steps).rev() {
                     let (_, target_symbol) = steps[chunk_start + local_idx];
+                    let pdf_lo = local_idx * pdf_stride;
+                    let pdf_hi = pdf_lo + pdf_stride;
                     self.accumulate_token_step_gradients(
                         scratch,
                         &step_traces[local_idx],
                         &step_states[local_idx + 1],
                         target_symbol,
-                        &step_pdfs[local_idx],
+                        &step_pdfs[pdf_lo..pdf_hi],
                         grad_scale,
                         scope,
-                        &mut grads,
+                        grads,
                         bias_grad.as_deref_mut(),
-                        &mut recurrent,
+                        recurrent,
                     )?;
                 }
             }
         }
 
         self.apply_full_gradients(
-            &grads,
+            grads,
             scope,
             optimizer,
             lr,
@@ -6599,6 +6724,7 @@ mod tests {
         let before = segment_loss(&model, &cfg, &steps);
 
         let mut scratch = ScratchBuffers::new(&cfg);
+        let mut workspace = TbpttReplayWorkspace::new(&model);
         let start_state = model.new_state();
         let mut live_state = model.new_state();
         let mut adam_t = 0usize;
@@ -6616,6 +6742,7 @@ mod tests {
         model
             .online_train_segment_tbptt(
                 &mut scratch,
+                &mut workspace,
                 &start_state,
                 &steps,
                 scope,

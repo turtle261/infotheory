@@ -253,13 +253,26 @@ impl FullTrainSettings {
     }
 }
 
-#[derive(Clone)]
 struct FullTbpttRuntime {
     pending_input_token: Option<u32>,
     pending_input_pre_state: Option<State>,
     segment_start_state: Option<State>,
     steps: Vec<(u32, u8)>,
     settings: Option<FullTrainSettings>,
+    replay_workspace: Option<rwkv7::TbpttReplayWorkspace>,
+}
+
+impl Clone for FullTbpttRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            pending_input_token: self.pending_input_token,
+            pending_input_pre_state: self.pending_input_pre_state.clone(),
+            segment_start_state: self.segment_start_state.clone(),
+            steps: self.steps.clone(),
+            settings: self.settings,
+            replay_workspace: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -316,6 +329,7 @@ impl OnlineRuntime {
                 segment_start_state: None,
                 steps: Vec::new(),
                 settings: None,
+                replay_workspace: None,
             }),
         }
     }
@@ -1166,8 +1180,23 @@ impl Compressor {
             return Ok(());
         };
         let mut reusable_steps = steps;
+        let OnlineRuntime {
+            adam_t,
+            full_adam,
+            out_bias,
+            adam_m,
+            adam_v,
+            full_tbptt,
+            ..
+        } = online;
+        let replay_workspace = full_tbptt
+            .as_mut()
+            .expect("rwkv full tbptt runtime exists for extracted segment")
+            .replay_workspace
+            .get_or_insert_with(|| rwkv7::TbpttReplayWorkspace::new(model));
         model.online_train_segment_tbptt(
             &mut self.scratch,
+            replay_workspace,
             &start_state,
             &reusable_steps,
             settings.scope,
@@ -1175,27 +1204,27 @@ impl Compressor {
             settings.lr,
             settings.clip,
             TBPTT_REPLAY_CHUNK,
-            &mut online.adam_t,
-            online.full_adam.as_mut(),
+            adam_t,
+            full_adam.as_mut(),
             if settings.scope.bias {
-                Some(online.out_bias.as_mut_slice())
+                Some(out_bias.as_mut_slice())
             } else {
                 None
             },
             if settings.scope.bias {
-                online.adam_m.as_deref_mut()
+                adam_m.as_deref_mut()
             } else {
                 None
             },
             if settings.scope.bias {
-                online.adam_v.as_deref_mut()
+                adam_v.as_deref_mut()
             } else {
                 None
             },
             &mut self.state,
         )?;
         reusable_steps.clear();
-        if let Some(tbptt) = online.full_tbptt.as_mut() {
+        if let Some(tbptt) = full_tbptt.as_mut() {
             tbptt.steps = reusable_steps;
         }
         let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
@@ -1774,6 +1803,7 @@ impl Compressor {
                     segment_start_state: None,
                     steps: Vec::new(),
                     settings: None,
+                    replay_workspace: None,
                 }),
             });
             let opt_sidecar = optimizer_sidecar_path(model_path);

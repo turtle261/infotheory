@@ -67,6 +67,7 @@ backend-calibrated = []
 backend-mamba = []
 backend-rwkv = []
 backend-zpaq = ["dep:zpaq_rs"]
+research-tooling = []
 cli = ["aixi"]
 vm = ["aixi", "dep:nyx-lite"]
 
