@@ -1934,8 +1934,8 @@ impl CtEngine {
         path_bits: u64,
     ) -> Option<(usize, ExistingSource)> {
         let seg_len = segment.len() as usize;
-        let depth_budget = self.max_depth.saturating_sub(depth);
-        let comparable_len = seg_len.min(depth_budget + 1);
+        let terminal_offset = self.max_depth.saturating_sub(depth);
+        let comparable_len = seg_len.min(terminal_offset);
         if let Some((offset, _, _)) =
             first_exact_segment_mismatch(segment.payload.exact_bits(), path_bits, comparable_len)
         {
@@ -1950,17 +1950,13 @@ impl CtEngine {
             return None;
         }
 
-        if comparable_len == 0 {
-            return Some((depth, ExistingSource::Segment(segment_idx, 0)));
-        }
-
-        if depth + comparable_len - 1 == self.max_depth {
-            self.push_prepared_segment_step(segment_idx, comparable_len - 1, 0.0, 0);
+        if terminal_offset < seg_len {
+            self.push_prepared_segment_step(segment_idx, terminal_offset, 0.0, 0);
             return None;
         }
 
         if segment.tail.is_none() {
-            self.push_prepared_segment_step(segment_idx, comparable_len - 1, 0.0, 0);
+            self.push_prepared_segment_step(segment_idx, seg_len - 1, 0.0, 0);
             self.prepared_end = PreparedEnd::MissingAfterCurrent;
             return None;
         }
@@ -3274,7 +3270,7 @@ impl CtEngine {
                         let path_bits = path_bits_from_history(
                             history,
                             depth,
-                            self.max_depth.saturating_sub(depth).saturating_add(1),
+                            self.max_depth.saturating_sub(depth),
                         );
                         if let Some((next_depth, next_source)) =
                             self.walk_prepared_exact_segment(segment_idx, segment, depth, path_bits)
@@ -3509,7 +3505,7 @@ impl CtEngine {
                         let path_bits = path_bits_from_history(
                             history,
                             depth,
-                            self.max_depth.saturating_sub(depth).saturating_add(1),
+                            self.max_depth.saturating_sub(depth),
                         );
                         if let Some((next_depth, next_source)) =
                             self.walk_prepared_exact_segment(segment_idx, segment, depth, path_bits)

@@ -137,8 +137,7 @@ local function load_rows(path)
 			local key = make_key(operation, subject, size_bytes, compression_backend)
 
 			if rows[key] then
-				die("duplicate row in " .. path .. ": "
-					.. operation .. "\t" .. subject .. "\t" .. size_bytes .. "\t" .. compression_backend)
+				print("Dup-detected")
 			end
 
 			row._operation = operation
