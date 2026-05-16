@@ -356,6 +356,84 @@ def test_compare_bench_two_json_rejects_mismatched_suite_spec_digest(
     assert "suite spec digest mismatch" in proc.stderr
 
 
+def test_compare_bench_two_json_explains_duplicate_summary_keys(
+    tmp_path: pathlib.Path,
+):
+    if shutil.which("luajit") is None:
+        pytest.skip("luajit not installed")
+
+    baseline = tmp_path / "baseline.tsv"
+    candidate = tmp_path / "candidate.tsv"
+    baseline.write_text(
+        "\n".join(
+            [
+                "\t".join(
+                    [
+                        "operation",
+                        "subject",
+                        "size_bytes",
+                        "cpu",
+                        "compression_backend",
+                        "suite_spec_path",
+                        "suite_spec_sha256",
+                        "build_mode",
+                        "build_features",
+                    ]
+                ),
+                "\t".join(
+                    [
+                        "h",
+                        "ctw",
+                        "4096",
+                        "0",
+                        "-",
+                        "configs/bench/two.json",
+                        "a" * 64,
+                        "native",
+                        "cli",
+                    ]
+                ),
+                "\t".join(
+                    [
+                        "h",
+                        "ctw",
+                        "4096",
+                        "11",
+                        "-",
+                        "configs/bench/two.json",
+                        "a" * 64,
+                        "native",
+                        "cli",
+                    ]
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_compare_summary(
+        candidate,
+        suite_spec_path="configs/bench/two.json",
+        suite_spec_sha256="a" * 64,
+    )
+
+    proc = _run(
+        [
+            "luajit",
+            "scripts/compare_bench_two_json.lua",
+            "--baseline",
+            str(baseline),
+            str(candidate),
+        ]
+    )
+    assert proc.returncode != 0
+    assert proc.stdout == ""
+    assert "duplicate comparison row" in proc.stderr
+    assert "operation=h, subject=ctw, size_bytes=4096, compression_backend=-" in proc.stderr
+    assert "differing columns: cpu: 0 != 11" in proc.stderr
+    assert "mix CPU affinities" in proc.stderr
+
+
 def test_bench_two_json_build_mode_namespace_is_bench_scoped():
     script_text = (_repo_root() / "scripts/bench_two_json.sh").read_text(encoding="utf-8")
 

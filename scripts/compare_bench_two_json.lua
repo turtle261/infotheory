@@ -96,6 +96,47 @@ local function make_key(operation, subject, size_bytes, compression_backend)
 	return operation .. SEP .. subject .. SEP .. size_bytes .. SEP .. compression_backend
 end
 
+local function format_compare_key(row)
+	return "operation=" .. (row._operation or "")
+		.. ", subject=" .. (row._subject or "")
+		.. ", size_bytes=" .. (row._size_bytes or "")
+		.. ", compression_backend=" .. (row._compression_backend or "")
+end
+
+local function duplicate_row_message(path, headers, existing, duplicate)
+	local parts = {
+		"duplicate comparison row in " .. path,
+		"key: " .. format_compare_key(duplicate),
+		"first line: " .. tostring(existing._line),
+		"duplicate line: " .. tostring(duplicate._line),
+	}
+
+	local diffs = {}
+	for _, h in ipairs(headers) do
+		if h ~= "" then
+			local a = existing[h] or ""
+			local b = duplicate[h] or ""
+			if a ~= b then
+				diffs[#diffs + 1] = h .. ": " .. a .. " != " .. b
+			end
+		end
+	end
+
+	if #diffs > 0 then
+		parts[#parts + 1] = "differing columns: " .. table.concat(diffs, "; ")
+	end
+
+	parts[#parts + 1] =
+		"comparison rows must be unique by operation, subject, size_bytes, and compression_backend"
+	if (existing.cpu or "") ~= (duplicate.cpu or "") then
+		parts[#parts + 1] =
+			"hint: this summary appears to mix CPU affinities; rerun with INFOTHEORY_BENCH_FRESH=1, "
+			.. "set one INFOTHEORY_BENCH_CPU, or compare a summary filtered to one CPU"
+	end
+
+	return table.concat(parts, "\n")
+end
+
 local function load_rows(path)
 	local f = io.open(path, "r")
 	if not f then
@@ -113,8 +154,10 @@ local function load_rows(path)
 	validate_required_columns(header_index, path)
 
 	local rows = {}
+	local line_number = 1
 
 	for line in f:lines() do
+		line_number = line_number + 1
 		if line ~= "" then
 			local vals = split_tsv(line)
 			local row = {}
@@ -136,14 +179,15 @@ local function load_rows(path)
 
 			local key = make_key(operation, subject, size_bytes, compression_backend)
 
-			if rows[key] then
-				print("Dup-detected")
-			end
-
 			row._operation = operation
 			row._subject = subject
 			row._size_bytes = size_bytes
 			row._compression_backend = compression_backend
+			row._line = line_number
+
+			if rows[key] then
+				die(duplicate_row_message(path, headers, rows[key], row))
+			end
 
 			rows[key] = row
 		end
