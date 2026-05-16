@@ -193,6 +193,10 @@ latest_existing_raw_tsv() {
   ls -1t "/tmp/${SUITE_PATH_PREFIX}-raw-"*.tsv 2>/dev/null | head -n 1 || true
 }
 
+current_two_json_baseline_tsv() {
+  ls -1t "${ROOT_DIR}/benchmarks/current/infotheory-two-json-summary"*.tsv 2>/dev/null | head -n 1 || true
+}
+
 resolve_output_paths() {
   latest_raw=
   if [ -n "${INFOTHEORY_BENCH_RAW_TSV:-}" ]; then
@@ -984,8 +988,13 @@ PY
 say "[bench] Raw TSV: ${RAW_TSV}"
 say "[bench] Summary TSV: ${SUMMARY_TSV}"
 if [ "${BENCH_SUITE}" = "two-json" ]; then
-  say "[bench] Compare against the checked-in baseline:"
-  say "  '${ROOT_DIR}/scripts/compare_bench_two_json.lua' --baseline '${ROOT_DIR}/benchmarks/current/infotheory-two-json-summary-20260322-120428.tsv' '${SUMMARY_TSV}'"
+  CURRENT_BASELINE_TSV=$(current_two_json_baseline_tsv)
+  if [ -n "${CURRENT_BASELINE_TSV}" ]; then
+    say "[bench] Compare against the checked-in baseline:"
+    say "  '${ROOT_DIR}/scripts/compare_bench_two_json.lua' --baseline '${CURRENT_BASELINE_TSV}' '${SUMMARY_TSV}'"
+  else
+    say "[bench] No checked-in two-json baseline summary found under benchmarks/current."
+  fi
 else
   say "[bench] No checked-in baseline comparator is configured for suite '${BENCH_SUITE}'."
 fi

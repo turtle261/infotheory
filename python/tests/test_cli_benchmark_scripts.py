@@ -440,3 +440,12 @@ def test_bench_two_json_build_mode_namespace_is_bench_scoped():
     assert "INFOTHEORY_CLI_BENCH_BUILD_MODE" not in script_text
     assert "INFOTHEORY_BENCH_BUILD_MODE" in script_text
     assert "CARGO_BUILD_RUSTFLAGS" in script_text
+
+
+def test_bench_two_json_compare_hint_uses_current_baseline_resolver():
+    script_text = (_repo_root() / "scripts/bench_two_json.sh").read_text(encoding="utf-8")
+
+    assert "current_two_json_baseline_tsv()" in script_text
+    assert 'benchmarks/current/infotheory-two-json-summary"*.tsv' in script_text
+    assert "--baseline '${CURRENT_BASELINE_TSV}'" in script_text
+    assert "infotheory-two-json-summary-20260322-120428.tsv" not in script_text
