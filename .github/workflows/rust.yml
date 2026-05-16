@@ -39,6 +39,8 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Rustfmt
         run: cargo fmt --all --check
@@ -192,6 +194,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: platform-hosted-${{ matrix.target }}
+          cache-bin: false
 
       - name: Feature checks
         env:
@@ -492,6 +495,8 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Cross-target compile checks (RWKV-only portable profile)
         env:
