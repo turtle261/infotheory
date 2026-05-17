@@ -15,6 +15,13 @@ local function is_null(value)
     return value == nil or value == cjson.null
 end
 
+local function table_or_empty(value)
+    if is_null(value) then
+        return {}
+    end
+    return value
+end
+
 local function strip_ansi(s)
     return (s:gsub("\27%[[%d;?]*[ -/]*[@-~]", ""))
 end
@@ -115,8 +122,8 @@ local function predicted_archive_bytes(snapshot)
 end
 
 local function snapshot_row(snapshot)
-    local telemetry = snapshot.telemetry or {}
-    local rss = snapshot.rss or {}
+    local telemetry = table_or_empty(snapshot.telemetry)
+    local rss = table_or_empty(snapshot.rss)
     local bpb = number_or_nil(snapshot.bits_per_byte)
     local archive = predicted_archive_bytes(snapshot)
     local hwm = number_or_nil(rss.vm_hwm_bytes) or number_or_nil(rss.vm_rss_bytes)
@@ -164,8 +171,8 @@ local function print_kv(label, value)
 end
 
 local function print_summary(final, snapshots)
-    local telemetry = final.telemetry or {}
-    local rss = final.rss or {}
+    local telemetry = table_or_empty(final.telemetry)
+    local rss = table_or_empty(final.rss)
     local archive = predicted_archive_bytes(final)
     local logical_nodes = (telemetry.nodes_len or 0) + (telemetry.segment_bits or 0)
     local payload_bytes = arena_payload_bytes(telemetry)
