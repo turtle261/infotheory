@@ -14,6 +14,7 @@ use crate::spec::{
     TunePlannerInterfaceSpec, TuneSpec, WarmStartExactJhTuneControllerSpec,
 };
 use crate::tuner::eval::ResolvedMemoryAccountingKind;
+use crate::tuner::planner_bridge::apply_planner_mutation_action;
 #[cfg(feature = "backend-ctw")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1659,6 +1660,7 @@ fn theorem_claims_reject_float_planner_mutation_domains() {
             pointer: "/rate_backend/temperature".to_string(),
             kind: NumericKind::Float,
             delta: 0.05,
+            range: None,
         },
         PlannerMutationAction::Noop,
     ];
@@ -1669,6 +1671,86 @@ fn theorem_claims_reject_float_planner_mutation_domains() {
     let err = validate_theorem_planner_mutation_domain(&actions, &theorem)
         .expect_err("exact theorem claim must reject float mutation leaves");
     assert!(err.contains("theorem_finite_state_unsafe"), "{err}");
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "backend-mixture"))]
+#[test]
+fn planner_float_mutation_uses_bounds_scale_for_small_positive_alpha() {
+    use std::sync::Arc;
+
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Mixture {
+            spec: Arc::new(
+                crate::api::MixtureSpec::new(
+                    crate::api::MixtureKind::Neural,
+                    vec![
+                        crate::api::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                            .with_name("ctw"),
+                    ],
+                )
+                .with_alpha(0.03),
+            ),
+        },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let action = PlannerMutationAction::NumericStep {
+        path: "rate_backend.spec.alpha".to_string(),
+        pointer: "/rate_backend/spec/alpha".to_string(),
+        kind: NumericKind::Float,
+        delta: -0.05,
+        range: Some((0.005, 0.2)),
+    };
+
+    let mutated = apply_planner_mutation_action(&candidate, &action)
+        .expect("planner mutation should decode")
+        .expect("bounded float action should remain applicable");
+    let json = crate::spec::compression_backend_to_json_value(&mutated)
+        .expect("mutated candidate should serialize");
+    let alpha = json
+        .pointer("/rate_backend/spec/alpha")
+        .and_then(Value::as_f64)
+        .expect("mutated mixture alpha");
+
+    assert!(alpha > 0.005, "alpha should remain within declared bounds");
+    assert!(alpha < 0.03, "negative planner step should decrease alpha");
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "backend-mixture"))]
+#[test]
+fn planner_unparsable_float_mutation_is_inapplicable_not_fatal() {
+    use std::sync::Arc;
+
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Mixture {
+            spec: Arc::new(
+                crate::api::MixtureSpec::new(
+                    crate::api::MixtureKind::Neural,
+                    vec![
+                        crate::api::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                            .with_name("ctw"),
+                    ],
+                )
+                .with_alpha(0.03),
+            ),
+        },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let action = PlannerMutationAction::NumericStep {
+        path: "rate_backend.spec.alpha".to_string(),
+        pointer: "/rate_backend/spec/alpha".to_string(),
+        kind: NumericKind::Float,
+        delta: -0.05,
+        range: None,
+    };
+
+    let mutated = apply_planner_mutation_action(&candidate, &action)
+        .expect("unparsable planner edit should not abort the run");
+    assert!(
+        mutated.is_none(),
+        "invalid float planner edit should be treated as inapplicable"
+    );
 }
 
 #[cfg(feature = "backend-ctw")]

@@ -788,6 +788,7 @@ enum PlannerMutationAction {
         pointer: String,
         kind: NumericKind,
         delta: f64,
+        range: Option<(f64, f64)>,
     },
     Noop,
 }

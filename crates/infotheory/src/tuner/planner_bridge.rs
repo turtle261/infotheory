@@ -662,6 +662,7 @@ fn compile_planner_mutation_actions(
                 pointer: leaf.pointer.clone(),
                 kind: leaf.kind,
                 delta,
+                range: range_map.get(&leaf.path).copied(),
             });
         }
     }
@@ -671,7 +672,7 @@ fn compile_planner_mutation_actions(
     Ok(actions)
 }
 
-fn apply_planner_mutation_action(
+pub(super) fn apply_planner_mutation_action(
     candidate: &crate::api::CompressionBackend,
     action: &PlannerMutationAction,
 ) -> Result<Option<crate::api::CompressionBackend>, String> {
@@ -680,6 +681,7 @@ fn apply_planner_mutation_action(
         pointer,
         kind,
         delta,
+        range,
     } = action
     else {
         return Ok(None);
@@ -689,29 +691,53 @@ fn apply_planner_mutation_action(
     let Some(slot) = json.pointer_mut(pointer) else {
         return Ok(None);
     };
-    if !apply_numeric_delta(slot, *kind, *delta) {
+    if !apply_numeric_delta(slot, *kind, *delta, *range) {
         return Ok(None);
     }
-    let mutated = crate::spec::parse_compression_backend_json(
+    let Ok(mutated) = crate::spec::parse_compression_backend_json(
         &json,
         Path::new("."),
         None,
         crate::compression::FramingMode::Framed,
-    )
-    .map_err(|err| format!("planner action produced unparsable candidate: {err}"))?;
+    ) else {
+        // Planner-family mutation decoding is totalized: a syntactically
+        // invalid edit is an inapplicable action rather than a fatal run
+        // abort.
+        return Ok(None);
+    };
     Ok(Some(mutated))
 }
 
-fn apply_numeric_delta(slot: &mut Value, kind: NumericKind, delta: f64) -> bool {
+fn apply_numeric_delta(
+    slot: &mut Value,
+    kind: NumericKind,
+    delta: f64,
+    range: Option<(f64, f64)>,
+) -> bool {
     match kind {
         NumericKind::Unsigned => {
             let Some(current) = slot.as_u64() else {
                 return false;
             };
+            let step = delta.abs().ceil() as u64;
             let next = if delta >= 0.0 {
-                current.saturating_add(delta.abs().ceil() as u64)
+                current.checked_add(step)
             } else {
-                current.saturating_sub(delta.abs().ceil() as u64)
+                Some(current.saturating_sub(step))
+            };
+            let Some(next) = next else {
+                return false;
+            };
+            if let Some((min, max)) = range {
+                let min = min.ceil();
+                let max = max.floor();
+                if !min.is_finite() || !max.is_finite() {
+                    return false;
+                }
+                let next_f64 = next as f64;
+                if next_f64 < min || next_f64 > max {
+                    return false;
+                }
             };
             if next == current {
                 return false;
@@ -725,9 +751,23 @@ fn apply_numeric_delta(slot: &mut Value, kind: NumericKind, delta: f64) -> bool 
             };
             let step = delta.abs().ceil() as i64;
             let next = if delta >= 0.0 {
-                current.saturating_add(step)
+                current.checked_add(step)
             } else {
-                current.saturating_sub(step)
+                current.checked_sub(step)
+            };
+            let Some(next) = next else {
+                return false;
+            };
+            if let Some((min, max)) = range {
+                let min = min.ceil();
+                let max = max.floor();
+                if !min.is_finite() || !max.is_finite() {
+                    return false;
+                }
+                let next_f64 = next as f64;
+                if next_f64 < min || next_f64 > max {
+                    return false;
+                }
             };
             if next == current {
                 return false;
@@ -739,8 +779,23 @@ fn apply_numeric_delta(slot: &mut Value, kind: NumericKind, delta: f64) -> bool 
             let Some(current) = slot.as_f64() else {
                 return false;
             };
-            let next = current + current.abs().max(1.0) * delta;
+            let scale = match range {
+                Some((min, max)) => {
+                    let span = max - min;
+                    if !span.is_finite() || span <= 0.0 {
+                        return false;
+                    }
+                    current.abs().max(span)
+                }
+                None => current.abs().max(1.0),
+            };
+            let next = current + scale * delta;
             if !next.is_finite() || (next - current).abs() <= f64::EPSILON {
+                return false;
+            }
+            if let Some((min, max)) = range
+                && (next < min || next > max)
+            {
                 return false;
             }
             if let Some(number) = serde_json::Number::from_f64(next) {
