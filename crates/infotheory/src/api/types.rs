@@ -273,7 +273,7 @@ pub enum MixtureKind {
     Convex,
     /// MDL-style best-expert selector.
     Mdl,
-    /// Bytewise neural logistic mixer (fx2-cmix style adaptation).
+    /// Bytewise neural logistic mixer (PAQ style adaptation).
     Neural,
 }
 

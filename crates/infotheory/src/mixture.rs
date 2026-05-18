@@ -2583,7 +2583,7 @@ pub struct MdlSelector {
     cache_valid: bool,
 }
 
-/// Bytewise neural mixer inspired by fx2-cmix online adaptation.
+/// Bytewise neural mixer  (Loosely PAQ inspired)
 ///
 /// This model is a context-conditioned two-stage gating network trained online
 /// from per-symbol expert likelihoods:
