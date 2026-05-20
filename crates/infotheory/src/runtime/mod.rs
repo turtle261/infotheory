@@ -778,9 +778,41 @@ pub(crate) fn rate_backend_capabilities_via_kernel(
         supports_frozen_conditioning: kernel.supports_frozen_conditioning,
         supports_rate_coded_compression: kernel.supports_rate_coded_compression,
         supports_bit_token_adaptation: (kernel.supports_bit_token_adaptation)(plan),
+        supports_native_bit_prediction: rate_plan_supports_native_bit_prediction(plan),
+        supports_byte_prefix_mass: rate_plan_supports_byte_prefix_mass(plan),
+        supports_reversible_bit_updates: false,
+        ac_prefers_bitwise: rate_plan_prefers_ac_bitwise(plan),
         contains_zpaq: (kernel.contains_zpaq)(plan),
         method_family: kernel.method_family,
     }
+}
+
+fn rate_plan_supports_native_bit_prediction(plan: &RateBackendPlan) -> bool {
+    match plan {
+        #[cfg(feature = "backend-ctw")]
+        RateBackendPlan::Ctw { .. } | RateBackendPlan::FacCtw { .. } => true,
+        RateBackendPlan::Mixture { experts, .. } => experts
+            .iter()
+            .all(|expert| rate_plan_supports_native_bit_prediction(expert.backend.as_ref())),
+        RateBackendPlan::Calibrated { base, .. } => {
+            rate_plan_supports_native_bit_prediction(base.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn rate_plan_supports_byte_prefix_mass(plan: &RateBackendPlan) -> bool {
+    match plan {
+        RateBackendPlan::Mixture { experts, .. } => experts
+            .iter()
+            .all(|expert| rate_plan_supports_byte_prefix_mass(expert.backend.as_ref())),
+        RateBackendPlan::Calibrated { base, .. } => rate_plan_supports_byte_prefix_mass(base),
+        _ => rate_backend_kernel(plan.kind()).supports_rate_coded_compression,
+    }
+}
+
+fn rate_plan_prefers_ac_bitwise(plan: &RateBackendPlan) -> bool {
+    rate_plan_supports_native_bit_prediction(plan)
 }
 
 pub(crate) fn compression_backend_capabilities_via_kernel(

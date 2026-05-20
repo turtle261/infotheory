@@ -42,6 +42,7 @@ use crate::mixture::{
     switching_alpha_for_update,
 };
 use crate::neural_mix::NeuralMixCore;
+use crate::prediction::{BitOrder, BytePrefixMass};
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
 use crate::spec::CompiledRateBackend;
@@ -75,13 +76,14 @@ impl FramedHeader {
     const SIZE: usize = 4 + 1 + 1 + 8 + 4;
 
     fn new(coder: CoderType, original_len: u64, crc32: u32) -> Self {
+        let coder = match coder {
+            CoderType::AC => 0,
+            CoderType::RANS => 1,
+        };
         Self {
             magic: FRAMED_MAGIC,
             version: FRAMED_VERSION,
-            coder: match coder {
-                CoderType::AC => 0,
-                CoderType::RANS => 1,
-            },
+            coder,
             original_len,
             crc32,
         }
@@ -1726,6 +1728,20 @@ impl RatePdfPredictor {
         }
     }
 
+    // Keep this separate from the live AC payload path so framed AC preserves
+    // the v1 wire contract while still allowing backend-agnostic bitwise
+    // stepping as an internal utility.
+    #[allow(dead_code)]
+    fn ac_step_bitwise<F>(&mut self, choose_bit: F) -> Result<u8>
+    where
+        F: FnMut(usize, f64) -> Result<u8>,
+    {
+        if self.can_fast_ac_bitwise() {
+            return self.ac_step_fast_bitwise(choose_bit);
+        }
+        self.ac_step_prefix_bitwise(choose_bit)
+    }
+
     fn ac_step_fast_bitwise<F>(&mut self, choose_bit: F) -> Result<u8>
     where
         F: FnMut(usize, f64) -> Result<u8>,
@@ -1737,6 +1753,23 @@ impl RatePdfPredictor {
             Self::Mixture(m) => m.ac_step_bitwise(choose_bit),
             _ => unreachable!("fast bitwise path requested for unsupported predictor"),
         }
+    }
+
+    #[allow(dead_code)]
+    fn ac_step_prefix_bitwise<F>(&mut self, mut choose_bit: F) -> Result<u8>
+    where
+        F: FnMut(usize, f64) -> Result<u8>,
+    {
+        let pdf = self.pdf_next()?;
+        let mut prefix = BytePrefixMass::from_pdf(pdf, BitOrder::MsbFirst);
+        for bit_idx in 0..8usize {
+            let prediction = prefix.prediction();
+            let bit = choose_bit(bit_idx, prediction.p1)? & 1;
+            prefix.observe(bit == 1);
+        }
+        let symbol = prefix.symbol();
+        self.update(symbol)?;
+        Ok(symbol)
     }
 
     fn diagnostic_snapshot_subtree(
@@ -1920,12 +1953,9 @@ fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Ve
     Ok(out)
 }
 
-fn decode_payload_ac(
-    payload: &[u8],
-    out_len: usize,
-    predictor: &mut RatePdfPredictor,
-) -> Result<Vec<u8>> {
+fn decode_payload_ac(payload: &[u8], out_len: usize, predictor: &mut RatePdfPredictor) -> Result<Vec<u8>> {
     predictor.begin_stream(out_len)?;
+
     if predictor.can_fast_ac_bitwise() {
         let out = decode_payload_ac_fast_bitwise(payload, out_len, predictor)?;
         predictor.finish_stream()?;
@@ -2608,6 +2638,52 @@ mod tests {
                 decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
             assert_eq!(dec, data);
         }
+    }
+
+    #[test]
+    fn framed_rate_ac_keeps_v1_coder_byte_for_ctw() {
+        let data = b"legacy framed ac header payload";
+        let backend = RateBackend::Ctw { depth: 8 };
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        let hdr = FramedHeader::read(&enc).expect("framed header");
+        assert_eq!(hdr.coder_type(), CoderType::AC);
+        assert_eq!(hdr.coder, 0);
+        let dec =
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn framed_rate_rans_keeps_v1_coder_byte() {
+        let data = b"legacy framed rans header payload";
+        let backend = RateBackend::Ctw { depth: 8 };
+        let enc =
+            compress_rate_bytes(data, &backend, CoderType::RANS, FramingMode::Framed).unwrap();
+        let hdr = FramedHeader::read(&enc).expect("framed header");
+        assert_eq!(hdr.coder_type(), CoderType::RANS);
+        assert_eq!(hdr.coder, 1);
+        let dec =
+            decompress_rate_bytes(&enc, &backend, CoderType::RANS, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn framed_rate_ac_keeps_byte_prefix_models_on_legacy_path() {
+        let data = b"byte prefix adapter exists but byte ac remains default";
+        let backend = RateBackend::Match {
+            hash_bits: 20,
+            min_len: 4,
+            max_len: 255,
+            base_mix: 0.02,
+            confidence_scale: 1.0,
+        };
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        let hdr = FramedHeader::read(&enc).expect("framed header");
+        assert_eq!(hdr.coder_type(), CoderType::AC);
+        assert_eq!(hdr.coder, 0);
+        let dec =
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
     }
 
     #[test]

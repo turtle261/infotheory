@@ -7,13 +7,19 @@ pub(crate) mod metrics;
 pub(crate) mod paths;
 pub(crate) mod types;
 
-pub use self::context::{InfotheoryCtx, RateBackendSession, get_default_ctx, set_default_ctx};
+pub use self::context::{
+    InfotheoryCtx, RateBackendBitSession, RateBackendSession, get_default_ctx, set_default_ctx,
+};
 pub use self::types::{
     CalibratedSpec, CalibrationContextKind, CompressionBackend, GenerationConfig,
     GenerationStrategy, GenerationUpdateMode, MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind,
     MixtureScheduleMode, MixtureSpec, ParticleSpec, RateBackend, ZpaqMethodSpec,
     parse_mixture_kind_name, parse_mixture_schedule_name, validate_compression_backend,
     validate_rate_backend,
+};
+pub use crate::prediction::{
+    BinaryPrediction, BitOrder, BitStreamSemantics, BytePrefixMass, OnlineBitPredictor,
+    OnlineBytePredictor,
 };
 pub use crate::spec::{
     AssetRef, CanonicalBytes, CanonicalJson, CompiledCompressionBackend, CompiledRateBackend,

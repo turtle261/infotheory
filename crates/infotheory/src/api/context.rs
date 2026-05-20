@@ -11,6 +11,10 @@ use super::types::{CompressionBackend, GenerationConfig, GenerationUpdateMode, R
 use crate::aligned_prefix;
 use crate::error::{InfotheoryError, InfotheoryResult};
 use crate::mixture::OnlineBytePredictor;
+use crate::prediction::{
+    BinaryPrediction, BitOrder, BitStreamSemantics, BytePrefixMass,
+    binary_prediction_from_log_probs,
+};
 use crate::spec::{CompiledCompressionBackend, CompiledRateBackend};
 
 /// Returns the current default information theory context for this thread.
@@ -35,6 +39,224 @@ pub struct InfotheoryCtx {
 /// Stateful rate-backend session for fitting, conditioning, and continuation.
 pub struct RateBackendSession {
     predictor: crate::mixture::RateBackendPredictor,
+}
+
+/// Stateful bit-level session over a rate backend.
+///
+/// Byte-packed sessions keep the underlying backend byte-native and expose it
+/// through a lazy prefix-mass view. They therefore require whole-byte stream
+/// boundaries: `total_bits`, when provided, must be a multiple of `8`, and
+/// `finish` must not leave a dangling partial byte. Binary-token sessions model
+/// each bit as the literal byte symbol `0` or `1`, so they support arbitrary
+/// bit lengths directly.
+pub struct RateBackendBitSession {
+    predictor: crate::mixture::RateBackendPredictor,
+    semantics: BitStreamSemantics,
+    prefix: Option<BytePrefixMass>,
+}
+
+fn byte_packed_total_symbols(total_bits: Option<u64>) -> Result<Option<u64>, String> {
+    let Some(total_bits) = total_bits else {
+        return Ok(None);
+    };
+    if total_bits % 8 != 0 {
+        return Err(format!(
+            "byte-packed bit streams require a whole number of bytes; got {total_bits} bits. Use BitStreamSemantics::BinaryTokens for arbitrary-length bit streams"
+        ));
+    }
+    Ok(Some(total_bits / 8))
+}
+
+fn total_symbols_for_bit_semantics(
+    total_bits: Option<u64>,
+    semantics: BitStreamSemantics,
+) -> Result<Option<u64>, String> {
+    match semantics {
+        BitStreamSemantics::BytePacked { .. } => byte_packed_total_symbols(total_bits),
+        BitStreamSemantics::BinaryTokens => Ok(total_bits),
+    }
+}
+
+impl RateBackendBitSession {
+    /// Create a bit session from an explicit compiled backend.
+    ///
+    /// For [`BitStreamSemantics::BytePacked`], `total_bits` must be `None` or a
+    /// multiple of `8`.
+    pub fn from_backend(
+        backend: CompiledRateBackend,
+        total_bits: Option<u64>,
+        semantics: BitStreamSemantics,
+    ) -> InfotheoryResult<Self> {
+        let backend = if matches!(semantics, BitStreamSemantics::BinaryTokens)
+            && backend.supports_bit_token_adaptation()
+        {
+            backend
+                .adapt_for_bit_tokens()
+                .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?
+        } else {
+            backend
+        };
+        let total_symbols = total_symbols_for_bit_semantics(total_bits, semantics)
+            .map_err(InfotheoryError::runtime)?;
+        let mut predictor = crate::runtime::build_rate_backend_predictor_default(&backend)
+            .map_err(InfotheoryError::invalid_backend_config)?;
+        predictor
+            .begin_stream(total_symbols)
+            .map_err(InfotheoryError::runtime)?;
+        Ok(Self {
+            predictor,
+            semantics,
+            prefix: None,
+        })
+    }
+
+    /// Create a bit session from a wrapper backend spec.
+    ///
+    /// For [`BitStreamSemantics::BytePacked`], `total_bits` must be `None` or a
+    /// multiple of `8`.
+    pub fn from_spec(
+        backend: RateBackend,
+        total_bits: Option<u64>,
+        semantics: BitStreamSemantics,
+    ) -> InfotheoryResult<Self> {
+        let compiled = backend
+            .compile()
+            .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?;
+        Self::from_backend(compiled, total_bits, semantics)
+    }
+
+    /// Predict the next bit without updating state.
+    pub fn predict_bit(&mut self) -> BinaryPrediction {
+        match self.semantics {
+            BitStreamSemantics::BinaryTokens => binary_prediction_from_log_probs(
+                self.predictor.log_prob(0),
+                self.predictor.log_prob(1),
+                crate::mixture::DEFAULT_MIN_PROB,
+            ),
+            BitStreamSemantics::BytePacked { order } => {
+                self.ensure_prefix(order);
+                self.prefix
+                    .as_ref()
+                    .expect("prefix initialized")
+                    .prediction()
+            }
+        }
+    }
+
+    /// Convenience prediction for `P(bit = 1)`.
+    pub fn predict_one(&mut self) -> f64 {
+        self.predict_bit().p1
+    }
+
+    /// Predict and then observe one adaptive/fitting bit.
+    pub fn step_bit(&mut self, bit: bool) -> BinaryPrediction {
+        let prediction = self.predict_bit();
+        self.observe_bit(bit);
+        prediction
+    }
+
+    /// Observe one adaptive/fitting bit.
+    pub fn observe_bit(&mut self, bit: bool) {
+        match self.semantics {
+            BitStreamSemantics::BinaryTokens => self.predictor.update(u8::from(bit)),
+            BitStreamSemantics::BytePacked { order } => {
+                self.ensure_prefix(order);
+                let prefix = self.prefix.as_mut().expect("prefix initialized");
+                prefix.observe(bit);
+                if prefix.is_complete() {
+                    let symbol = prefix.symbol();
+                    self.predictor.update(symbol);
+                    self.prefix = None;
+                }
+            }
+        }
+    }
+
+    /// Advance conditioning state with one bit without fitting/adapting.
+    pub fn condition_bit(&mut self, bit: bool) {
+        match self.semantics {
+            BitStreamSemantics::BinaryTokens => self.predictor.update_frozen(u8::from(bit)),
+            BitStreamSemantics::BytePacked { order } => {
+                self.ensure_prefix(order);
+                let prefix = self.prefix.as_mut().expect("prefix initialized");
+                prefix.observe(bit);
+                if prefix.is_complete() {
+                    let symbol = prefix.symbol();
+                    self.predictor.update_frozen(symbol);
+                    self.prefix = None;
+                }
+            }
+        }
+    }
+
+    /// Reset dynamic conditioning state while preserving fitted parameters/statistics.
+    pub fn reset_frozen(&mut self, total_bits: Option<u64>) -> InfotheoryResult<()> {
+        self.prefix = None;
+        let total_symbols = total_symbols_for_bit_semantics(total_bits, self.semantics)
+            .map_err(InfotheoryError::runtime)?;
+        self.predictor
+            .reset_frozen(total_symbols)
+            .map_err(InfotheoryError::runtime)
+    }
+
+    /// Finalize the underlying stream if the backend needs it.
+    pub fn finish(&mut self) -> InfotheoryResult<()> {
+        if matches!(self.semantics, BitStreamSemantics::BytePacked { .. })
+            && self.prefix.is_some()
+        {
+            return Err(InfotheoryError::runtime(
+                "byte-packed bit streams must finish on a whole-byte boundary; use BitStreamSemantics::BinaryTokens for arbitrary-length bit streams",
+            ));
+        }
+        self.predictor
+            .finish_stream()
+            .map_err(InfotheoryError::runtime)
+    }
+
+    fn ensure_prefix(&mut self, order: BitOrder) {
+        if self.prefix.is_some() {
+            return;
+        }
+        let mut logps = [0.0f64; 256];
+        self.predictor.fill_log_probs(&mut logps);
+        let mut pdf = [0.0f64; 256];
+        for (dst, &lp) in pdf.iter_mut().zip(logps.iter()) {
+            *dst = if lp.is_finite() { lp.exp() } else { 0.0 };
+        }
+        self.prefix = Some(BytePrefixMass::from_pdf(&pdf, order));
+    }
+}
+
+impl crate::prediction::OnlineBitPredictor for RateBackendBitSession {
+    fn begin_bit_stream(
+        &mut self,
+        total_bits: Option<u64>,
+        semantics: BitStreamSemantics,
+    ) -> Result<(), String> {
+        if semantics != self.semantics {
+            return Err(
+                "bit stream semantics are fixed for a RateBackendBitSession; create a new session"
+                    .to_string(),
+            );
+        }
+        self.reset_frozen(total_bits).map_err(|err| err.to_string())
+    }
+
+    fn finish_bit_stream(&mut self) -> Result<(), String> {
+        self.finish().map_err(|err| err.to_string())
+    }
+
+    fn bit_prediction(&mut self) -> BinaryPrediction {
+        self.predict_bit()
+    }
+
+    fn update_bit(&mut self, bit: bool) {
+        self.observe_bit(bit);
+    }
+
+    fn update_bit_frozen(&mut self, bit: bool) {
+        self.condition_bit(bit);
+    }
 }
 
 impl RateBackendSession {
@@ -186,6 +408,15 @@ impl InfotheoryCtx {
         total_symbols: Option<u64>,
     ) -> InfotheoryResult<RateBackendSession> {
         RateBackendSession::from_backend(self.rate_backend.clone(), total_symbols)
+    }
+
+    /// Create a stateful bit-level session for the active rate backend.
+    pub fn rate_backend_bit_session(
+        &self,
+        total_bits: Option<u64>,
+        semantics: BitStreamSemantics,
+    ) -> InfotheoryResult<RateBackendBitSession> {
+        RateBackendBitSession::from_backend(self.rate_backend.clone(), total_bits, semantics)
     }
 
     /// Fallible entropy-rate estimate for `data` under this context's rate backend.

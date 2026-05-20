@@ -1,5 +1,6 @@
 use infotheory::api::{
-    MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend, RateBackendSession,
+    BitOrder, BitStreamSemantics, MixtureExpertSpec, MixtureKind, MixtureSpec, OnlineBitPredictor,
+    ParticleSpec, RateBackend, RateBackendBitSession, RateBackendSession,
 };
 use infotheory::spec::CanonicalJson;
 use std::sync::Arc;
@@ -44,6 +45,187 @@ fn api_surface_spec_types_serialize_canonically() {
             .expect("particle json")
             .contains("\"num_particles\"")
     );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_byte_packed_bit_session_matches_byte_prediction_chain() {
+    let backend = RateBackend::Ctw { depth: 6 };
+    let mut byte_session =
+        RateBackendSession::from_spec(backend.clone(), Some(16)).expect("byte session");
+    let mut bit_session = RateBackendBitSession::from_spec(
+        backend,
+        Some(16 * 8),
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+
+    for &symbol in b"bit-session" {
+        let mut row = [0.0f64; 256];
+        byte_session.fill_log_probs(&mut row);
+        let expected = row[symbol as usize].exp();
+        let mut product = 1.0f64;
+        for bit_idx in 0..8u8 {
+            let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
+            product *= bit_session.step_bit(bit).prob(bit);
+        }
+        byte_session.observe(&[symbol]);
+        assert!(
+            (product - expected).abs() < 1e-9,
+            "symbol={symbol} product={product} expected={expected}"
+        );
+    }
+
+    byte_session.finish().expect("byte finish");
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_bit_session_semantics_are_fixed() {
+    let backend = RateBackend::Ctw { depth: 6 };
+    let mut bit_session = RateBackendBitSession::from_spec(
+        backend,
+        Some(8),
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+
+    bit_session
+        .begin_bit_stream(
+            Some(8),
+            BitStreamSemantics::BytePacked {
+                order: BitOrder::MsbFirst,
+            },
+        )
+        .expect("same semantics reset");
+    let err = bit_session
+        .begin_bit_stream(Some(8), BitStreamSemantics::BinaryTokens)
+        .expect_err("semantic switches need a freshly adapted session");
+    assert!(err.contains("semantics are fixed"));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_byte_packed_bit_session_rejects_non_byte_aligned_lengths() {
+    let semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    let err = match RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        Some(9),
+        semantics,
+    ) {
+        Ok(_) => panic!("byte-packed streams require whole bytes"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("whole number of bytes"));
+    assert!(err.to_string().contains("BinaryTokens"));
+
+    let mut bit_session =
+        RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(8), semantics)
+            .expect("bit session");
+    let reset_err = bit_session
+        .reset_frozen(Some(9))
+        .expect_err("reset should reject non-byte-aligned total_bits");
+    assert!(reset_err.to_string().contains("whole number of bytes"));
+
+    let begin_err = bit_session
+        .begin_bit_stream(Some(9), semantics)
+        .expect_err("begin should reject non-byte-aligned total_bits");
+    assert!(begin_err.contains("whole number of bytes"));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_byte_packed_finish_rejects_dangling_partial_byte() {
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        None,
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+
+    for bit in [true, false, true] {
+        bit_session.observe_bit(bit);
+    }
+
+    let err = bit_session
+        .finish()
+        .expect_err("dangling partial byte must not be discarded");
+    assert!(err.to_string().contains("whole-byte boundary"));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_binary_tokens_accept_arbitrary_length_streams() {
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        Some(9),
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("bit session");
+
+    for bit in [true, false, true, true, false, false, true, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_rate_backend_bit_capabilities_are_explicit() {
+    let ctw = RateBackend::Ctw { depth: 6 }
+        .compile()
+        .expect("compiled ctw");
+    assert!(ctw.capabilities().supports_native_bit_prediction);
+    assert!(ctw.capabilities().supports_byte_prefix_mass);
+    assert!(!ctw.capabilities().supports_reversible_bit_updates);
+    assert!(ctw.capabilities().ac_prefers_bitwise);
+
+    #[cfg(feature = "backend-match")]
+    {
+        let match_backend = RateBackend::Match {
+            hash_bits: 20,
+            min_len: 4,
+            max_len: 255,
+            base_mix: 0.02,
+            confidence_scale: 1.0,
+        }
+        .compile()
+        .expect("compiled match");
+        assert!(!match_backend.capabilities().supports_native_bit_prediction);
+        assert!(match_backend.capabilities().supports_byte_prefix_mass);
+        assert!(!match_backend.capabilities().ac_prefers_bitwise);
+    }
+
+    #[cfg(feature = "backend-zpaq")]
+    {
+        use infotheory::api::ZpaqMethodSpec;
+
+        let zpaq = RateBackend::Zpaq {
+            method: ZpaqMethodSpec::Literal {
+                value: "1".to_string(),
+            },
+        }
+        .compile()
+        .expect("compiled zpaq");
+        assert!(!zpaq.capabilities().supports_native_bit_prediction);
+        assert!(zpaq.capabilities().supports_byte_prefix_mass);
+        assert!(!zpaq.capabilities().ac_prefers_bitwise);
+    }
 }
 
 #[cfg(feature = "backend-ctw")]

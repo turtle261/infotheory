@@ -132,6 +132,15 @@ pub struct RateBackendCapabilities {
     pub supports_rate_coded_compression: bool,
     /// Whether this backend can be adapted losslessly to bit-token mode.
     pub supports_bit_token_adaptation: bool,
+    /// Whether this backend has a direct bit predictor rather than requiring a
+    /// byte-PDF prefix adapter.
+    pub supports_native_bit_prediction: bool,
+    /// Whether this backend can expose its byte PDF as a lazy binary prefix mass.
+    pub supports_byte_prefix_mass: bool,
+    /// Whether bit observations can be undone exactly after update.
+    pub supports_reversible_bit_updates: bool,
+    /// Whether AC should prefer bitwise stepping for this backend.
+    pub ac_prefers_bitwise: bool,
     /// Whether the backend graph contains any ZPAQ component.
     pub contains_zpaq: bool,
     /// Whether this is a method-backed neural family.
@@ -429,6 +438,27 @@ impl CompiledRateBackend {
     /// Whether this backend can be adapted losslessly to bit-token mode.
     pub fn supports_bit_token_adaptation(&self) -> bool {
         self.capabilities.supports_bit_token_adaptation
+    }
+
+    /// Whether this backend has a direct bit predictor rather than requiring a
+    /// byte-PDF prefix adapter.
+    pub fn supports_native_bit_prediction(&self) -> bool {
+        self.capabilities.supports_native_bit_prediction
+    }
+
+    /// Whether this backend can expose its byte PDF as a lazy binary prefix mass.
+    pub fn supports_byte_prefix_mass(&self) -> bool {
+        self.capabilities.supports_byte_prefix_mass
+    }
+
+    /// Whether bit observations can be undone exactly after update.
+    pub fn supports_reversible_bit_updates(&self) -> bool {
+        self.capabilities.supports_reversible_bit_updates
+    }
+
+    /// Whether AC should prefer bitwise stepping for this backend.
+    pub fn ac_prefers_bitwise(&self) -> bool {
+        self.capabilities.ac_prefers_bitwise
     }
 
     /// Return a bit-token-adapted compiled backend when the transformation is defined.

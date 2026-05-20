@@ -5,6 +5,7 @@
 //! provide different complexity vs performance trade-offs.
 
 use crate::api::{CompiledRateBackend, RateBackend};
+use crate::prediction::{binary_prediction_from_log_probs, binary_prediction_from_probs};
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{ContextTree, FacContextTree};
 #[cfg(feature = "backend-rosa")]
@@ -114,46 +115,6 @@ pub trait Predictor: Send {
     }
 }
 
-#[inline]
-fn binary_prob_floor(min_prob: f64) -> f64 {
-    if min_prob.is_finite() {
-        min_prob.clamp(1e-12, 0.499_999_999_999)
-    } else {
-        1e-12
-    }
-}
-
-#[inline]
-fn normalized_binary_prob_pair_from_probs(p0: f64, p1: f64, min_prob: f64) -> (f64, f64) {
-    let p0 = if p0.is_finite() && p0 > 0.0 { p0 } else { 0.0 };
-    let p1 = if p1.is_finite() && p1 > 0.0 { p1 } else { 0.0 };
-    let sum = p0 + p1;
-    if !sum.is_finite() || sum <= 0.0 {
-        return (0.5, 0.5);
-    }
-    let floor = binary_prob_floor(min_prob);
-    let q1 = (p1 / sum).clamp(floor, 1.0 - floor);
-    (1.0 - q1, q1)
-}
-
-#[inline]
-fn normalized_binary_prob_pair_from_log_probs(logp0: f64, logp1: f64, min_prob: f64) -> (f64, f64) {
-    let max_log = logp0.max(logp1);
-    if !max_log.is_finite() {
-        return (0.5, 0.5);
-    }
-    let p0 = if logp0.is_finite() {
-        (logp0 - max_log).exp()
-    } else {
-        0.0
-    };
-    let p1 = if logp1.is_finite() {
-        (logp1 - max_log).exp()
-    } else {
-        0.0
-    };
-    normalized_binary_prob_pair_from_probs(p0, p1, min_prob)
-}
 
 /// A predictor using the Action-Conditional CTW algorithm.
 ///
@@ -334,12 +295,12 @@ impl Predictor for RosaPredictor {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let (p0, p1) = normalized_binary_prob_pair_from_probs(
+        binary_prediction_from_probs(
             self.model.prob_for_last(0),
             self.model.prob_for_last(1),
             DEFAULT_MIN_PROB,
-        );
-        if sym { p1 } else { p0 }
+        )
+        .prob(sym)
     }
 
     fn model_name(&self) -> String {
@@ -455,8 +416,7 @@ impl Predictor for ZpaqPredictor {
     fn predict_prob(&mut self, sym: bool) -> f64 {
         let preferred_symbol = if sym { 1u8 } else { 0u8 };
         let (logp0, logp1) = self.binary_log_prob_pair(preferred_symbol);
-        let (p0, p1) = normalized_binary_prob_pair_from_log_probs(logp0, logp1, self.min_prob);
-        if sym { p1 } else { p0 }
+        binary_prediction_from_log_probs(logp0, logp1, self.min_prob).prob(sym)
     }
 
     fn model_name(&self) -> String {
@@ -729,12 +689,12 @@ impl Predictor for RateBackendBitPredictor {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let (p0, p1) = normalized_binary_prob_pair_from_log_probs(
+        binary_prediction_from_log_probs(
             self.predictor.log_prob(0),
             self.predictor.log_prob(1),
             self.min_prob,
-        );
-        if sym { p1 } else { p0 }
+        )
+        .prob(sym)
     }
 
     fn model_name(&self) -> String {
@@ -880,12 +840,12 @@ impl Predictor for RwkvPredictor {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let (p0, p1) = normalized_binary_prob_pair_from_probs(
+        binary_prediction_from_probs(
             self.compressor.pdf_buffer[0],
             self.compressor.pdf_buffer[1],
             DEFAULT_MIN_PROB,
-        );
-        if sym { p1 } else { p0 }
+        )
+        .prob(sym)
     }
 
     fn model_name(&self) -> String {
@@ -976,12 +936,12 @@ impl Predictor for MambaPredictor {
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        let (p0, p1) = normalized_binary_prob_pair_from_probs(
+        binary_prediction_from_probs(
             self.compressor.pdf_buffer[0],
             self.compressor.pdf_buffer[1],
             DEFAULT_MIN_PROB,
-        );
-        if sym { p1 } else { p0 }
+        )
+        .prob(sym)
     }
 
     fn model_name(&self) -> String {
