@@ -260,7 +260,9 @@ impl crate::prediction::OnlineBitPredictor for RateBackendBitSession {
                     .to_string(),
             );
         }
-        self.reset_frozen(total_bits).map_err(|err| err.to_string())
+        self.prefix = None;
+        let total_symbols = total_symbols_for_bit_semantics(total_bits, self.semantics)?;
+        self.predictor.begin_fresh_stream(total_symbols)
     }
 
     fn finish_bit_stream(&mut self) -> Result<(), String> {

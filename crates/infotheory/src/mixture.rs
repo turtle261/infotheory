@@ -216,6 +216,18 @@ fn normalized_prior_weights(configs: &[ExpertConfig]) -> Vec<f64> {
     weights
 }
 
+#[cfg(feature = "backend-calibrated")]
+#[inline]
+fn reset_calibrated_wrapper_state(
+    core: &mut CalibratorCore,
+    pdf: &mut [f64; 256],
+    valid: &mut bool,
+) {
+    core.reset_context();
+    pdf.fill(1.0 / 256.0);
+    *valid = false;
+}
+
 fn set_log_weights_from_linear(experts: &mut [ExpertState], weights: &[f64]) {
     for (expert, &weight) in experts.iter_mut().zip(weights.iter()) {
         expert.log_weight = if weight > 0.0 {
@@ -252,6 +264,15 @@ impl Clone for Box<dyn OnlineBytePredictor> {
 
 /// Trait for online byte-level predictors that expose per-symbol log-probabilities.
 pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
+    /// Whether this predictor supports frozen-conditioning resets.
+    ///
+    /// Predictors that return `false` may still support ordinary stream lifecycle
+    /// hooks (`begin_stream`/`finish_stream`), but cannot provide plugin-entropy
+    /// style frozen reset semantics.
+    fn supports_frozen_reset(&self) -> bool {
+        true
+    }
+
     /// Optional stream-start hook.
     ///
     /// Predictors that require total symbol count (for example percent-based
@@ -293,6 +314,18 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         self.finish_stream()?;
         self.begin_stream(total_symbols)
+    }
+
+    /// Start a new stream in a way that preserves each predictor's semantic contract.
+    ///
+    /// This uses frozen-reset semantics when supported, and falls back to ordinary
+    /// begin/finish stream hooks otherwise.
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        if self.supports_frozen_reset() {
+            self.reset_frozen(total_symbols)
+        } else {
+            self.begin_stream(total_symbols)
+        }
     }
 
     /// Advance conditioning state without fitting or adapting parameters.
@@ -830,6 +863,44 @@ impl RateBackendPredictor {
 }
 
 impl OnlineBytePredictor for RateBackendPredictor {
+    fn supports_frozen_reset(&self) -> bool {
+        match self {
+            #[cfg(feature = "backend-zpaq")]
+            RateBackendPredictor::Zpaq { .. } => false,
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.supports_frozen_reset(),
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated { base, .. } => base.supports_frozen_reset(),
+            _ => true,
+        }
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.begin_fresh_stream(total_symbols),
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+                ..
+            } => {
+                base.begin_fresh_stream(total_symbols)?;
+                reset_calibrated_wrapper_state(core, pdf, valid);
+                Ok(())
+            }
+            _ => {
+                if self.supports_frozen_reset() {
+                    self.reset_frozen(total_symbols)
+                } else {
+                    self.begin_stream(total_symbols)
+                }
+            }
+        }
+    }
+
     fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         self.finish_stream()?;
         match self {
@@ -1452,9 +1523,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 ..
             } => {
                 base.reset_frozen(total_symbols)?;
-                core.reset_context();
-                pdf.fill(1.0 / 256.0);
-                *valid = false;
+                reset_calibrated_wrapper_state(core, pdf, valid);
                 Ok(())
             }
             RateBackendPredictor::Disabled { reason } => Err(reason.clone()),
@@ -1863,6 +1932,11 @@ impl ExpertState {
     }
 
     #[inline]
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        self.predictor.begin_fresh_stream(total_symbols)
+    }
+
+    #[inline]
     fn update_frozen(&mut self, symbol: u8) {
         self.predictor.update_frozen(symbol);
     }
@@ -2014,12 +2088,21 @@ impl BayesMixture {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2177,12 +2260,21 @@ impl FadingBayesMixture {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2393,13 +2485,22 @@ impl SwitchingMixture {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
         self.update_count = 0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2521,13 +2622,22 @@ impl ConvexMixture {
         }
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
         self.update_count = 0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2802,15 +2912,24 @@ impl NeuralMixture {
         self.total_log_loss
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.analyzer = TextContextAnalyzer::new();
         self.neural.set_context_state(self.analyzer.state());
         self.invalidate_eval_cache();
         self.eval_cache_history = self.neural.history_state();
         self.total_log_loss = 0.0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2956,12 +3075,21 @@ impl MdlSelector {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2996,6 +3124,17 @@ pub enum MixtureRuntime {
 }
 
 impl MixtureRuntime {
+    pub(crate) fn supports_frozen_reset(&self) -> bool {
+        match self {
+            MixtureRuntime::Bayes(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Fading(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Switching(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Convex(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Mdl(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Neural(m) => experts_support_frozen_reset(&m.experts),
+        }
+    }
+
     pub(crate) fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         match self {
             MixtureRuntime::Bayes(m) => begin_expert_stream(&mut m.experts, total_symbols),
@@ -3004,6 +3143,17 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Mdl(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Neural(m) => begin_expert_stream(&mut m.experts, total_symbols),
+        }
+    }
+
+    pub(crate) fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Fading(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Switching(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Convex(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Mdl(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Neural(m) => m.begin_fresh_stream(total_symbols),
         }
     }
 
@@ -3084,6 +3234,32 @@ fn begin_expert_stream(
         expert.begin_stream(total_symbols)?;
     }
     Ok(())
+}
+
+fn begin_expert_fresh_stream(
+    experts: &mut [ExpertState],
+    total_symbols: Option<u64>,
+) -> Result<(), String> {
+    for expert in experts {
+        expert.begin_fresh_stream(total_symbols)?;
+    }
+    Ok(())
+}
+
+fn reset_expert_frozen_stream(
+    experts: &mut [ExpertState],
+    total_symbols: Option<u64>,
+) -> Result<(), String> {
+    for expert in experts {
+        expert.reset_frozen(total_symbols)?;
+    }
+    Ok(())
+}
+
+fn experts_support_frozen_reset(experts: &[ExpertState]) -> bool {
+    experts
+        .iter()
+        .all(|expert| expert.predictor.supports_frozen_reset())
 }
 
 fn finish_expert_stream(experts: &mut [ExpertState]) -> Result<(), String> {

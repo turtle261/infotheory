@@ -139,6 +139,83 @@ fn api_surface_byte_packed_bit_session_rejects_non_byte_aligned_lengths() {
     assert!(begin_err.contains("whole number of bytes"));
 }
 
+#[cfg(feature = "backend-zpaq")]
+#[test]
+fn api_surface_zpaq_bit_session_begin_stream_does_not_require_frozen_reset() {
+    let semantics = BitStreamSemantics::BinaryTokens;
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Zpaq {
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
+        },
+        Some(9),
+        semantics,
+    )
+    .expect("zpaq bit session");
+
+    let reset_err = bit_session
+        .reset_frozen(Some(9))
+        .expect_err("zpaq must continue to reject frozen-reset semantics");
+    assert!(reset_err.to_string().contains("plugin entropy"));
+
+    bit_session
+        .begin_bit_stream(Some(9), semantics)
+        .expect("zpaq stream restarts should use begin/finish lifecycle hooks");
+
+    for bit in [true, false, true, true, false, false, true, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "zpaq binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("zpaq bit finish");
+}
+
+#[cfg(all(
+    feature = "backend-mixture",
+    feature = "backend-zpaq",
+    feature = "backend-ctw"
+))]
+#[test]
+fn api_surface_mixture_with_zpaq_expert_can_restart_bit_streams() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 }),
+                MixtureExpertSpec::new(RateBackend::Zpaq {
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
+                }),
+            ],
+        )),
+    };
+    let mut bit_session =
+        RateBackendBitSession::from_spec(backend, Some(9), BitStreamSemantics::BinaryTokens)
+            .expect("mixture bit session");
+
+    let reset_err = bit_session
+        .reset_frozen(Some(9))
+        .expect_err("mixtures containing zpaq experts cannot satisfy frozen-reset semantics");
+    assert!(reset_err.to_string().contains("plugin entropy"));
+
+    bit_session
+        .begin_bit_stream(Some(9), BitStreamSemantics::BinaryTokens)
+        .expect("mixture stream restarts should fall back to lifecycle hooks");
+
+    for bit in [true, false, true, false, true, true, false, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "mixture-zpaq binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("mixture-zpaq bit finish");
+}
+
 #[cfg(feature = "backend-ctw")]
 #[test]
 fn api_surface_byte_packed_finish_rejects_dangling_partial_byte() {
