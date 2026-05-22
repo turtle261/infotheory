@@ -209,12 +209,17 @@ impl RateBackendBitSession {
 
     /// Finalize the underlying stream if the backend needs it.
     pub fn finish(&mut self) -> InfotheoryResult<()> {
-        if matches!(self.semantics, BitStreamSemantics::BytePacked { .. }) && self.prefix.is_some()
+        if matches!(self.semantics, BitStreamSemantics::BytePacked { .. })
+            && self
+                .prefix
+                .as_ref()
+                .is_some_and(BytePrefixMass::has_partial_bits)
         {
             return Err(InfotheoryError::runtime(
                 "byte-packed bit streams must finish on a whole-byte boundary; use BitStreamSemantics::BinaryTokens for arbitrary-length bit streams",
             ));
         }
+        self.prefix = None;
         self.predictor
             .finish_stream()
             .map_err(InfotheoryError::runtime)

@@ -163,6 +163,30 @@ fn api_surface_byte_packed_finish_rejects_dangling_partial_byte() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
+fn api_surface_byte_packed_finish_allows_prediction_without_observe() {
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        None,
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+
+    let prediction = bit_session.predict_bit();
+    let sum = prediction.p0 + prediction.p1;
+    assert!(
+        (sum - 1.0).abs() < 1e-12,
+        "byte-packed prediction must stay normalized, got {sum}"
+    );
+
+    bit_session
+        .finish()
+        .expect("prediction-only byte-packed sessions must finish cleanly");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
 fn api_surface_binary_tokens_accept_arbitrary_length_streams() {
     let mut bit_session = RateBackendBitSession::from_spec(
         RateBackend::Ctw { depth: 6 },

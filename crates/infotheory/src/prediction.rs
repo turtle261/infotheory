@@ -233,6 +233,13 @@ impl BytePrefixMass {
         self.bits_seen >= 8
     }
 
+    /// Whether the current byte prefix has consumed at least one bit but has
+    /// not completed a full byte yet.
+    #[inline]
+    pub fn has_partial_bits(&self) -> bool {
+        self.bits_seen > 0 && !self.is_complete()
+    }
+
     /// Current completed symbol. Meaningful once [`Self::is_complete`] is true.
     #[inline]
     pub fn symbol(&self) -> u8 {
@@ -561,5 +568,21 @@ mod tests {
 
         let degenerate = binary_prediction_from_probs(f64::NAN, -3.0, 1e-6);
         assert_eq!(degenerate, BinaryPrediction::from_prob_one(0.5, 1e-6));
+    }
+
+    #[test]
+    fn byte_prefix_partial_bits_reports_only_in_progress_prefixes() {
+        let pdf = [1.0 / 256.0; 256];
+        let mut prefix = BytePrefixMass::from_pdf(&pdf, BitOrder::MsbFirst);
+        assert!(!prefix.has_partial_bits());
+
+        prefix.observe(true);
+        assert!(prefix.has_partial_bits());
+
+        for _ in 1..8u8 {
+            prefix.observe(false);
+        }
+        assert!(prefix.is_complete());
+        assert!(!prefix.has_partial_bits());
     }
 }
