@@ -17,7 +17,7 @@ use crate::api::{MixtureSpec, RateBackend};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
-use crate::backends::ctw::FacContextTree;
+use crate::backends::ctw::{ContextTree, FacContextTree, ctw_symbol_bit_msb};
 #[cfg(feature = "backend-match")]
 use crate::backends::match_model::MatchModel;
 #[cfg(feature = "backend-ppmd")]
@@ -42,7 +42,6 @@ use crate::mixture::{
     switching_alpha_for_update,
 };
 use crate::neural_mix::NeuralMixCore;
-use crate::prediction::{BitOrder, BytePrefixMass};
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
 use crate::spec::CompiledRateBackend;
@@ -133,8 +132,15 @@ impl FramedHeader {
 
 #[cfg(feature = "backend-ctw")]
 #[derive(Clone)]
+enum CtwCompressionTree {
+    Ac(ContextTree),
+    Fac(FacContextTree),
+}
+
+#[cfg(feature = "backend-ctw")]
+#[derive(Clone)]
 pub(crate) struct CtwPredictor {
-    tree: FacContextTree,
+    tree: CtwCompressionTree,
     bits_per_symbol: usize,
     msb_first: bool,
     pdf: Vec<f64>,
@@ -146,7 +152,7 @@ pub(crate) struct CtwPredictor {
 impl CtwPredictor {
     pub(crate) fn new_ctw(depth: usize) -> Self {
         Self {
-            tree: FacContextTree::new(depth, 8),
+            tree: CtwCompressionTree::Ac(ContextTree::new(depth)),
             bits_per_symbol: 8,
             msb_first: true,
             pdf: vec![0.0; 256],
@@ -157,7 +163,7 @@ impl CtwPredictor {
 
     pub(crate) fn new_fac(base_depth: usize, bits_per_symbol: usize) -> Self {
         Self {
-            tree: FacContextTree::new(base_depth, bits_per_symbol),
+            tree: CtwCompressionTree::Fac(FacContextTree::new(base_depth, bits_per_symbol)),
             bits_per_symbol,
             msb_first: false,
             pdf: vec![0.0; 256],
@@ -167,79 +173,136 @@ impl CtwPredictor {
     }
 
     fn fill_pattern_log_probs(&mut self) -> usize {
-        fn rec(
-            tree: &mut FacContextTree,
-            bits: usize,
-            msb_first: bool,
-            depth: usize,
-            pattern: usize,
-            log_before: f64,
-            out: &mut [f64],
-        ) {
-            if depth == bits {
-                out[pattern] = tree.get_log_block_probability() - log_before;
-                return;
+        let bits = self.bits_per_symbol.clamp(1, 8);
+        let patterns = 1usize << bits;
+        self.pattern_logps[..patterns].fill(f64::NEG_INFINITY);
+        match &mut self.tree {
+            CtwCompressionTree::Ac(tree) => {
+                fn rec(
+                    tree: &mut ContextTree,
+                    depth: usize,
+                    bits: usize,
+                    pattern: usize,
+                    log_before: f64,
+                    out: &mut [f64],
+                ) {
+                    if depth == bits {
+                        out[pattern] = tree.get_log_block_probability() - log_before;
+                        return;
+                    }
+                    for bit in [false, true] {
+                        tree.update(bit);
+                        rec(
+                            tree,
+                            depth + 1,
+                            bits,
+                            (pattern << 1) | (bit as usize),
+                            log_before,
+                            out,
+                        );
+                        tree.revert();
+                    }
+                }
+
+                let log_before = tree.get_log_block_probability();
+                rec(
+                    tree,
+                    0,
+                    bits,
+                    0,
+                    log_before,
+                    &mut self.pattern_logps[..patterns],
+                );
             }
-            for bit in [false, true] {
-                tree.update(bit, depth);
-                let next_pattern = if msb_first {
-                    (pattern << 1) | (bit as usize)
-                } else {
-                    pattern | ((bit as usize) << depth)
-                };
+            CtwCompressionTree::Fac(tree) => {
+                fn rec(
+                    tree: &mut FacContextTree,
+                    bits: usize,
+                    msb_first: bool,
+                    depth: usize,
+                    pattern: usize,
+                    log_before: f64,
+                    out: &mut [f64],
+                ) {
+                    if depth == bits {
+                        out[pattern] = tree.get_log_block_probability() - log_before;
+                        return;
+                    }
+                    for bit in [false, true] {
+                        tree.update(bit, depth);
+                        let next_pattern = if msb_first {
+                            (pattern << 1) | (bit as usize)
+                        } else {
+                            pattern | ((bit as usize) << depth)
+                        };
+                        rec(
+                            tree,
+                            bits,
+                            msb_first,
+                            depth + 1,
+                            next_pattern,
+                            log_before,
+                            out,
+                        );
+                        tree.revert(depth);
+                    }
+                }
+
+                let log_before = tree.get_log_block_probability();
                 rec(
                     tree,
                     bits,
-                    msb_first,
-                    depth + 1,
-                    next_pattern,
+                    self.msb_first,
+                    0,
+                    0,
                     log_before,
-                    out,
+                    &mut self.pattern_logps[..patterns],
                 );
-                tree.revert(depth);
             }
         }
-
-        let bits = self.bits_per_symbol.clamp(1, 8);
-        let patterns = 1usize << bits;
-        let log_before = self.tree.get_log_block_probability();
-        self.pattern_logps[..patterns].fill(f64::NEG_INFINITY);
-        rec(
-            &mut self.tree,
-            bits,
-            self.msb_first,
-            0,
-            0,
-            log_before,
-            &mut self.pattern_logps[..patterns],
-        );
         patterns
     }
 
     #[cfg(test)]
     fn log_prob_symbol_bruteforce(&mut self, symbol: u8) -> f64 {
         let bits = self.bits_per_symbol.clamp(1, 8);
-        let before = self.tree.get_log_block_probability();
-        if self.msb_first {
-            for bit_idx in 0..bits {
-                let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-                self.tree.update(bit, bit_idx);
+        match &mut self.tree {
+            CtwCompressionTree::Ac(tree) => {
+                debug_assert!(self.msb_first);
+                let before = tree.get_log_block_probability();
+                for bit_idx in 0..bits {
+                    tree.update(ctw_symbol_bit_msb(symbol, bits, bit_idx));
+                }
+                let after = tree.get_log_block_probability();
+                for _ in 0..bits {
+                    tree.revert();
+                }
+                after - before
             }
-            let after = self.tree.get_log_block_probability();
-            for bit_idx in (0..bits).rev() {
-                self.tree.revert(bit_idx);
+            CtwCompressionTree::Fac(tree) => {
+                let before = tree.get_log_block_probability();
+                if self.msb_first {
+                    for bit_idx in 0..bits {
+                        let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
+                        tree.update(bit, bit_idx);
+                    }
+                    let after = tree.get_log_block_probability();
+                    for bit_idx in (0..bits).rev() {
+                        tree.revert(bit_idx);
+                    }
+                    after - before
+                } else {
+                    for bit_idx in 0..bits {
+                        let bit = ((symbol >> bit_idx) & 1) == 1;
+                        tree.update(bit, bit_idx);
+                    }
+                    let after = tree.get_log_block_probability();
+                    for bit_idx in (0..bits).rev() {
+                        tree.revert(bit_idx);
+                    }
+                    after - before
+                }
             }
-            after - before
-        } else {
-            for bit_idx in 0..bits {
-                let bit = ((symbol >> bit_idx) & 1) == 1;
-                self.tree.update(bit, bit_idx);
-            }
-            let after = self.tree.get_log_block_probability();
-            for bit_idx in (0..bits).rev() {
-                self.tree.revert(bit_idx);
-            }
-            after - before
         }
     }
 
@@ -289,35 +352,64 @@ impl CtwPredictor {
     }
 
     fn update(&mut self, symbol: u8) {
-        if self.msb_first {
-            for bit_idx in 0..self.bits_per_symbol {
-                let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-                self.tree.update(bit, bit_idx);
+        match &mut self.tree {
+            CtwCompressionTree::Ac(tree) => {
+                debug_assert!(self.msb_first);
+                for bit_idx in 0..self.bits_per_symbol {
+                    tree.update(ctw_symbol_bit_msb(symbol, self.bits_per_symbol, bit_idx));
+                }
             }
-        } else {
-            for bit_idx in 0..self.bits_per_symbol {
-                let bit = ((symbol >> bit_idx) & 1) == 1;
-                self.tree.update(bit, bit_idx);
+            CtwCompressionTree::Fac(tree) => {
+                if self.msb_first {
+                    for bit_idx in 0..self.bits_per_symbol {
+                        let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
+                        tree.update(bit, bit_idx);
+                    }
+                } else {
+                    for bit_idx in 0..self.bits_per_symbol {
+                        let bit = ((symbol >> bit_idx) & 1) == 1;
+                        tree.update(bit, bit_idx);
+                    }
+                }
             }
         }
         self.valid = false;
     }
 
+    fn reserve_for_symbols(&mut self, total_symbols: usize) {
+        match &mut self.tree {
+            CtwCompressionTree::Ac(tree) => tree.reserve_for_symbols(
+                total_symbols.saturating_mul(self.bits_per_symbol.clamp(1, 8)),
+            ),
+            CtwCompressionTree::Fac(tree) => tree.reserve_for_symbols(total_symbols),
+        }
+    }
+
     #[inline]
     fn can_fast_ac_bitwise(&self) -> bool {
-        self.bits_per_symbol == 8 && self.msb_first
+        self.bits_per_symbol == 8
+            && self.msb_first
+            && matches!(&self.tree, CtwCompressionTree::Ac(_))
     }
 
     #[inline]
     fn bit_prob_one_msb(&mut self, bit_idx: usize) -> f64 {
         debug_assert!(self.can_fast_ac_bitwise());
-        self.tree.predict_one(bit_idx).clamp(PDF_MIN, 1.0 - PDF_MIN)
+        match &mut self.tree {
+            CtwCompressionTree::Ac(tree) => tree.predict(true).clamp(PDF_MIN, 1.0 - PDF_MIN),
+            CtwCompressionTree::Fac(tree) => {
+                tree.predict_one(bit_idx).clamp(PDF_MIN, 1.0 - PDF_MIN)
+            }
+        }
     }
 
     #[inline]
     fn update_bit_msb(&mut self, bit_idx: usize, bit: bool) {
         debug_assert!(self.can_fast_ac_bitwise());
-        self.tree.update_predicted(bit, bit_idx);
+        match &mut self.tree {
+            CtwCompressionTree::Ac(tree) => tree.update(bit),
+            CtwCompressionTree::Fac(tree) => tree.update_predicted(bit, bit_idx),
+        }
         self.valid = false;
     }
 }
@@ -588,6 +680,84 @@ struct MixExpert {
     cum_log_loss: f64,
 }
 
+#[derive(Clone, Debug)]
+enum PredictorBitwiseStepState {
+    NativeRecursive,
+    CachedCdf { lo: usize, hi: usize },
+    PdfPrefix { cdf: Vec<f64>, lo: usize, hi: usize },
+}
+
+impl Default for PredictorBitwiseStepState {
+    fn default() -> Self {
+        Self::PdfPrefix {
+            cdf: Vec::new(),
+            lo: 0,
+            hi: 256,
+        }
+    }
+}
+
+impl PredictorBitwiseStepState {
+    fn prepare(&mut self, predictor: &mut RatePdfPredictor) -> Result<()> {
+        if predictor.begin_native_recursive_bitwise_byte_step()? {
+            *self = Self::NativeRecursive;
+            return Ok(());
+        }
+        if predictor.prepare_cached_cdf_fast_bitwise()? {
+            *self = Self::CachedCdf { lo: 0, hi: 256 };
+            return Ok(());
+        }
+
+        let mut cdf = match std::mem::take(self) {
+            Self::PdfPrefix { cdf, .. } => cdf,
+            _ => Vec::new(),
+        };
+        rebuild_bitwise_prefix_cdf_row(&mut cdf, predictor.pdf_next()?);
+        *self = Self::PdfPrefix {
+            cdf,
+            lo: 0,
+            hi: 256,
+        };
+        Ok(())
+    }
+
+    fn bit_prob_one_msb(
+        &mut self,
+        predictor: &mut RatePdfPredictor,
+        bit_idx: usize,
+    ) -> Result<f64> {
+        match self {
+            Self::NativeRecursive => predictor.native_recursive_bit_prob_one_msb(bit_idx),
+            Self::CachedCdf { lo, hi } => Ok(predictor
+                .cached_cdf_bit_prob_one_msb(*lo, *hi)
+                .unwrap_or(0.5)),
+            Self::PdfPrefix { cdf, lo, hi } => Ok(cdf_bit_prob_one_msb(cdf, *lo, *hi)),
+        }
+    }
+
+    fn observe_bit_msb(
+        &mut self,
+        predictor: &mut RatePdfPredictor,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<()> {
+        match self {
+            Self::NativeRecursive => predictor.native_recursive_observe_bit_msb(bit_idx, bit),
+            Self::CachedCdf { lo, hi } | Self::PdfPrefix { lo, hi, .. } => {
+                advance_msb_prefix_range(lo, hi, bit);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish_symbol(&mut self, predictor: &mut RatePdfPredictor, symbol: u8) -> Result<()> {
+        match self {
+            Self::NativeRecursive => predictor.finish_native_recursive_bitwise_byte_step(symbol),
+            Self::CachedCdf { .. } | Self::PdfPrefix { .. } => predictor.update(symbol),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct AcLogLossNodeValue {
     pub(crate) prob: f64,
@@ -621,11 +791,11 @@ pub(crate) struct MixturePredictor {
     prior_weights: Vec<f64>,
     neural: NeuralMixCore,
     analyzer: TextContextAnalyzer,
-    neural_logps: Vec<f64>,
-    neural_bit_modes: Vec<u8>,
-    neural_lo: Vec<usize>,
-    neural_hi: Vec<usize>,
-    neural_pdf_cdf_rows: Vec<Vec<f64>>,
+    bitwise_expert_states: Vec<PredictorBitwiseStepState>,
+    // Reused per-expert observation scratch: symbol paths store log p(symbol),
+    // while bitwise AC temporarily stages p(bit = 1) before collapsing back to
+    // the symbol log-probability at byte completion.
+    expert_observation_scratch: Vec<f64>,
     scratch: Vec<f64>,
     scratch2: Vec<f64>,
     projection_scratch: Vec<f64>,
@@ -692,11 +862,8 @@ impl MixturePredictor {
             prior_weights,
             neural,
             analyzer,
-            neural_logps: vec![0.0; plan_experts.len()],
-            neural_bit_modes: vec![0; plan_experts.len()],
-            neural_lo: vec![0; plan_experts.len()],
-            neural_hi: vec![256; plan_experts.len()],
-            neural_pdf_cdf_rows: vec![vec![0.0; 257]; plan_experts.len()],
+            bitwise_expert_states: Vec::new(),
+            expert_observation_scratch: vec![0.0; plan_experts.len()],
             scratch: Vec::new(),
             scratch2: Vec::new(),
             projection_scratch: Vec::new(),
@@ -1090,16 +1257,17 @@ impl MixturePredictor {
                 }
                 let n = self.experts.len();
                 self.neural.set_context_state(self.analyzer.state());
-                self.neural_logps.resize(n, 0.0);
+                self.expert_observation_scratch.resize(n, 0.0);
                 for i in 0..n {
                     let p = self.experts[i].predictor.pdf_next()?[y].max(PDF_MIN);
                     let lp = p.ln();
-                    self.neural_logps[i] = lp;
+                    self.expert_observation_scratch[i] = lp;
                     self.experts[i].cum_log_loss -= lp;
                 }
-                self.neural.evaluate_symbol(&self.neural_logps, PDF_MIN);
                 self.neural
-                    .update_weights_symbol(&self.neural_logps, PDF_MIN);
+                    .evaluate_symbol(&self.expert_observation_scratch, PDF_MIN);
+                self.neural
+                    .update_weights_symbol(&self.expert_observation_scratch, PDF_MIN);
                 for e in &mut self.experts {
                     e.predictor.update(symbol)?;
                 }
@@ -1120,26 +1288,17 @@ impl MixturePredictor {
     }
 
     #[inline]
-    fn can_fast_ac_bitwise(&self) -> bool {
-        self.experts.iter().any(|e| {
-            #[cfg(feature = "backend-ctw")]
-            if let RatePdfPredictor::Ctw(ctw) = &*e.predictor {
-                ctw.can_fast_ac_bitwise()
-            } else {
-                false
-            }
-            #[cfg(not(feature = "backend-ctw"))]
-            {
-                let _ = e;
-                false
-            }
-        })
+    fn has_recursive_native_bitwise_expert(&self) -> bool {
+        self.experts
+            .iter()
+            .any(|expert| expert.predictor.has_recursive_native_bitwise_path())
     }
 
-    fn ac_step_bitwise<F>(&mut self, mut choose_bit: F) -> Result<u8>
-    where
-        F: FnMut(usize, f64) -> Result<u8>,
-    {
+    fn begin_bitwise_byte_step(&mut self) -> Result<bool> {
+        if !self.has_recursive_native_bitwise_expert() {
+            return Ok(false);
+        }
+
         let n = self.experts.len();
         self.scratch.resize(n, 0.0);
         match self.kind {
@@ -1148,14 +1307,6 @@ impl MixturePredictor {
                 self.neural.evaluate_expert_weights();
                 self.scratch.copy_from_slice(self.neural.expert_weights());
             }
-            MixtureKind::FadingBayes => {
-                let weights = self.predictive_weights();
-                self.scratch.copy_from_slice(&weights);
-            }
-            MixtureKind::Mdl => {
-                let weights = self.predictive_weights();
-                self.scratch.copy_from_slice(&weights);
-            }
             _ => {
                 let weights = self.predictive_weights();
                 self.scratch.copy_from_slice(&weights);
@@ -1163,143 +1314,71 @@ impl MixturePredictor {
         }
         self.scratch2.resize(n, 1.0);
         self.scratch2.fill(1.0);
-        self.neural_logps.resize(n, 0.0);
-        self.neural_bit_modes.resize(n, 0);
-        self.neural_lo.resize(n, 0);
-        self.neural_hi.resize(n, 256);
-        if self.neural_pdf_cdf_rows.len() < n {
-            self.neural_pdf_cdf_rows.resize_with(n, || vec![0.0; 257]);
-        }
-
+        self.expert_observation_scratch.resize(n, 0.0);
+        self.bitwise_expert_states
+            .resize_with(n, PredictorBitwiseStepState::default);
         for i in 0..n {
-            self.neural_bit_modes[i] = 1;
-            self.neural_lo[i] = 0;
-            self.neural_hi[i] = 256;
-
-            let mut handled_ctw = false;
-            #[cfg(feature = "backend-ctw")]
-            if let RatePdfPredictor::Ctw(ctw) = &mut *self.experts[i].predictor
-                && ctw.can_fast_ac_bitwise()
-            {
-                self.neural_bit_modes[i] = 0;
-                handled_ctw = true;
-            }
-            if handled_ctw {
-                continue;
-            }
-
-            if self.experts[i]
-                .predictor
-                .prepare_cached_cdf_fast_bitwise()?
-            {
-                self.neural_bit_modes[i] = 2;
-                continue;
-            }
-
-            let pdf = self.experts[i].predictor.pdf_next()?;
-            let row = &mut self.neural_pdf_cdf_rows[i];
-            if row.len() != 257 {
-                row.resize(257, 0.0);
-            }
-            row[0] = 0.0;
-            for b in 0..256usize {
-                row[b + 1] = row[b] + pdf[b].max(PDF_MIN);
-            }
-            if !row[256].is_finite() || row[256] <= 0.0 {
-                for (j, v) in row.iter_mut().enumerate() {
-                    *v = (j as f64) / 256.0;
-                }
-            }
+            self.bitwise_expert_states[i].prepare(&mut self.experts[i].predictor)?;
         }
+        Ok(true)
+    }
 
-        let mut symbol = 0u8;
-        for bit_idx in 0..8usize {
-            let mut denom = 0.0;
-            let mut numer1 = 0.0;
-
-            for i in 0..n {
-                let p1 = if self.neural_bit_modes[i] == 0 {
-                    match &mut *self.experts[i].predictor {
-                        #[cfg(feature = "backend-ctw")]
-                        RatePdfPredictor::Ctw(ctw) => ctw.bit_prob_one_msb(bit_idx),
-                        _ => 0.5,
-                    }
-                } else if self.neural_bit_modes[i] == 2 {
-                    self.experts[i]
-                        .predictor
-                        .cached_cdf_bit_prob_one_msb(self.neural_lo[i], self.neural_hi[i])
-                        .unwrap_or(0.5)
-                } else {
-                    let lo = self.neural_lo[i];
-                    let hi = self.neural_hi[i];
-                    let mid = (lo + hi) >> 1;
-                    let row = &self.neural_pdf_cdf_rows[i];
-                    let total = (row[hi] - row[lo]).max(PDF_MIN);
-                    let one = (row[hi] - row[mid]).max(0.0);
-                    (one / total).clamp(PDF_MIN, 1.0 - PDF_MIN)
-                };
-                self.neural_logps[i] = p1;
-                let wp = self.scratch[i] * self.scratch2[i];
-                denom += wp;
-                numer1 += wp * p1;
-            }
-
-            let p1_mix = if denom.is_finite() && denom > 0.0 {
-                (numer1 / denom).clamp(PDF_MIN, 1.0 - PDF_MIN)
-            } else {
-                0.5
-            };
-            let bit = choose_bit(bit_idx, p1_mix)? & 1;
-            symbol |= bit << (7 - bit_idx);
-
-            for i in 0..n {
-                let p1 = self.neural_logps[i];
-                let pb = if bit == 1 { p1 } else { 1.0 - p1 };
-                self.scratch2[i] = (self.scratch2[i] * pb).max(PDF_MIN);
-
-                if self.neural_bit_modes[i] == 0 {
-                    #[cfg(feature = "backend-ctw")]
-                    if let RatePdfPredictor::Ctw(ctw) = &mut *self.experts[i].predictor {
-                        ctw.update_bit_msb(bit_idx, bit == 1);
-                    }
-                } else {
-                    let lo = self.neural_lo[i];
-                    let hi = self.neural_hi[i];
-                    let mid = (lo + hi) >> 1;
-                    if bit == 1 {
-                        self.neural_lo[i] = mid;
-                        self.neural_hi[i] = hi;
-                    } else {
-                        self.neural_lo[i] = lo;
-                        self.neural_hi[i] = mid;
-                    }
-                }
-            }
+    fn bit_prob_one_msb(&mut self, bit_idx: usize) -> Result<f64> {
+        let mut denom = 0.0;
+        let mut numer1 = 0.0;
+        for i in 0..self.experts.len() {
+            let p1 = self.bitwise_expert_states[i]
+                .bit_prob_one_msb(&mut self.experts[i].predictor, bit_idx)?;
+            self.expert_observation_scratch[i] = p1;
+            let wp = self.scratch[i] * self.scratch2[i];
+            denom += wp;
+            numer1 += wp * p1;
         }
+        Ok(if denom.is_finite() && denom > 0.0 {
+            (numer1 / denom).clamp(PDF_MIN, 1.0 - PDF_MIN)
+        } else {
+            0.5
+        })
+    }
 
+    fn observe_bit_msb(&mut self, bit_idx: usize, bit: bool) -> Result<()> {
+        for i in 0..self.experts.len() {
+            let p1 = self.expert_observation_scratch[i];
+            let pb = if bit { p1 } else { 1.0 - p1 };
+            self.scratch2[i] = (self.scratch2[i] * pb).max(PDF_MIN);
+            self.bitwise_expert_states[i].observe_bit_msb(
+                &mut self.experts[i].predictor,
+                bit_idx,
+                bit,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn finish_bitwise_symbol(&mut self, symbol: u8) -> Result<()> {
+        let n = self.experts.len();
         for i in 0..n {
             let lp = self.scratch2[i].max(PDF_MIN).ln();
-            self.neural_logps[i] = lp;
+            self.expert_observation_scratch[i] = lp;
             self.experts[i].cum_log_loss -= lp;
-            if self.neural_bit_modes[i] != 0 {
-                self.experts[i].predictor.update(symbol)?;
-            }
+            self.bitwise_expert_states[i].finish_symbol(&mut self.experts[i].predictor, symbol)?;
         }
 
         match self.kind {
             MixtureKind::Bayes => {
                 for i in 0..n {
-                    self.scratch[i] = self.experts[i].log_weight + self.neural_logps[i];
+                    self.scratch[i] =
+                        self.experts[i].log_weight + self.expert_observation_scratch[i];
                 }
                 let log_mix = logsumexp_slice(&self.scratch[..n]);
                 for i in 0..n {
-                    self.experts[i].log_weight += self.neural_logps[i] - log_mix;
+                    self.experts[i].log_weight += self.expert_observation_scratch[i] - log_mix;
                 }
             }
             MixtureKind::FadingBayes => {
                 for i in 0..n {
-                    self.scratch[i] =
-                        self.decay * self.experts[i].log_weight + self.neural_logps[i];
+                    self.scratch[i] = self.decay * self.experts[i].log_weight
+                        + self.expert_observation_scratch[i];
                 }
                 let log_mix = logsumexp_slice(&self.scratch[..n]);
                 for i in 0..n {
@@ -1308,7 +1387,8 @@ impl MixturePredictor {
             }
             MixtureKind::Switching => {
                 for i in 0..n {
-                    self.scratch[i] = self.experts[i].log_weight + self.neural_logps[i];
+                    self.scratch[i] =
+                        self.experts[i].log_weight + self.expert_observation_scratch[i];
                 }
                 let log_mix = logsumexp_slice(&self.scratch[..n]);
                 for weight in &mut self.scratch[..n] {
@@ -1332,7 +1412,7 @@ impl MixturePredictor {
                     self.scratch2[i] = self.experts[i].log_weight.exp();
                 }
                 let mix_prob = self
-                    .neural_logps
+                    .expert_observation_scratch
                     .iter()
                     .zip(self.scratch2.iter())
                     .map(|(&lp, &w)| w * lp.exp())
@@ -1343,7 +1423,7 @@ impl MixturePredictor {
                 let eta =
                     convex_step_size_for_update(self.schedule, self.alpha, self.convex_updates);
                 for i in 0..n {
-                    let grad = -(self.neural_logps[i] - log_mix).exp();
+                    let grad = -(self.expert_observation_scratch[i] - log_mix).exp();
                     self.scratch2[i] -= eta * grad;
                 }
                 project_simplex_with_scratch(&mut self.scratch2[..n], &mut self.projection_scratch);
@@ -1355,16 +1435,17 @@ impl MixturePredictor {
             MixtureKind::Neural => {
                 if n > 1 {
                     self.neural.set_context_state(self.analyzer.state());
-                    self.neural.evaluate_symbol(&self.neural_logps, PDF_MIN);
                     self.neural
-                        .update_weights_symbol(&self.neural_logps, PDF_MIN);
+                        .evaluate_symbol(&self.expert_observation_scratch, PDF_MIN);
+                    self.neural
+                        .update_weights_symbol(&self.expert_observation_scratch, PDF_MIN);
                 }
                 self.analyzer.update(symbol);
                 self.neural.set_context_state(self.analyzer.state());
             }
         }
         self.valid = false;
-        Ok(symbol)
+        Ok(())
     }
 }
 
@@ -1497,7 +1578,7 @@ impl RatePdfPredictor {
             }
             #[cfg(feature = "backend-ctw")]
             Self::Ctw(m) | Self::FacCtw(m) => {
-                m.tree.reserve_for_symbols(total_len);
+                m.reserve_for_symbols(total_len);
                 Ok(())
             }
             #[cfg(feature = "backend-mamba")]
@@ -1718,58 +1799,92 @@ impl RatePdfPredictor {
     }
 
     #[inline]
-    fn can_fast_ac_bitwise(&self) -> bool {
+    fn has_recursive_native_bitwise_path(&self) -> bool {
         match self {
             #[cfg(feature = "backend-ctw")]
             Self::Ctw(m) => m.can_fast_ac_bitwise(),
             #[cfg(feature = "backend-mixture")]
-            Self::Mixture(m) => m.can_fast_ac_bitwise(),
+            Self::Mixture(m) => m.has_recursive_native_bitwise_expert(),
             _ => false,
         }
+    }
+
+    fn begin_native_recursive_bitwise_byte_step(&mut self) -> Result<bool> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            Self::Ctw(m) => Ok(m.can_fast_ac_bitwise()),
+            #[cfg(feature = "backend-mixture")]
+            Self::Mixture(m) => m.begin_bitwise_byte_step(),
+            _ => Ok(false),
+        }
+    }
+
+    fn native_recursive_bit_prob_one_msb(&mut self, bit_idx: usize) -> Result<f64> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            Self::Ctw(m) => Ok(m.bit_prob_one_msb(bit_idx)),
+            #[cfg(feature = "backend-mixture")]
+            Self::Mixture(m) => m.bit_prob_one_msb(bit_idx),
+            _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
+        }
+    }
+
+    fn native_recursive_observe_bit_msb(&mut self, bit_idx: usize, bit: bool) -> Result<()> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            Self::Ctw(m) => {
+                m.update_bit_msb(bit_idx, bit);
+                Ok(())
+            }
+            #[cfg(feature = "backend-mixture")]
+            Self::Mixture(m) => m.observe_bit_msb(bit_idx, bit),
+            _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
+        }
+    }
+
+    fn finish_native_recursive_bitwise_byte_step(&mut self, symbol: u8) -> Result<()> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            Self::Ctw(_) => Ok(()),
+            #[cfg(feature = "backend-mixture")]
+            Self::Mixture(m) => m.finish_bitwise_symbol(symbol),
+            _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
+        }
+    }
+
+    #[inline]
+    fn can_fast_ac_bitwise(&self) -> bool {
+        self.has_recursive_native_bitwise_path()
     }
 
     // Keep this separate from the live AC payload path so framed AC preserves
     // the v1 wire contract while still allowing backend-agnostic bitwise
     // stepping as an internal utility.
-    #[allow(dead_code)]
-    fn ac_step_bitwise<F>(&mut self, choose_bit: F) -> Result<u8>
+    fn ac_step_bitwise<F>(&mut self, mut choose_bit: F) -> Result<u8>
     where
         F: FnMut(usize, f64) -> Result<u8>,
     {
-        if self.can_fast_ac_bitwise() {
-            return self.ac_step_fast_bitwise(choose_bit);
+        let mut state = PredictorBitwiseStepState::default();
+        state.prepare(self)?;
+        let mut symbol = 0u8;
+        for bit_idx in 0..8usize {
+            let p1 = state.bit_prob_one_msb(self, bit_idx)?;
+            let bit = choose_bit(bit_idx, p1)? & 1;
+            if bit == 1 {
+                symbol |= 1u8 << (7 - bit_idx);
+            }
+            state.observe_bit_msb(self, bit_idx, bit == 1)?;
         }
-        self.ac_step_prefix_bitwise(choose_bit)
+        state.finish_symbol(self, symbol)?;
+        Ok(symbol)
     }
 
     fn ac_step_fast_bitwise<F>(&mut self, choose_bit: F) -> Result<u8>
     where
         F: FnMut(usize, f64) -> Result<u8>,
     {
-        match self {
-            #[cfg(feature = "backend-ctw")]
-            Self::Ctw(m) => ctw_ac_step_bitwise(m, choose_bit),
-            #[cfg(feature = "backend-mixture")]
-            Self::Mixture(m) => m.ac_step_bitwise(choose_bit),
-            _ => unreachable!("fast bitwise path requested for unsupported predictor"),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn ac_step_prefix_bitwise<F>(&mut self, mut choose_bit: F) -> Result<u8>
-    where
-        F: FnMut(usize, f64) -> Result<u8>,
-    {
-        let pdf = self.pdf_next()?;
-        let mut prefix = BytePrefixMass::from_pdf(pdf, BitOrder::MsbFirst);
-        for bit_idx in 0..8usize {
-            let prediction = prefix.prediction();
-            let bit = choose_bit(bit_idx, prediction.p1)? & 1;
-            prefix.observe(bit == 1);
-        }
-        let symbol = prefix.symbol();
-        self.update(symbol)?;
-        Ok(symbol)
+        debug_assert!(self.can_fast_ac_bitwise());
+        self.ac_step_bitwise(choose_bit)
     }
 
     fn diagnostic_snapshot_subtree(
@@ -1841,19 +1956,6 @@ impl RatePdfPredictor {
         encoder.encode_counts(cdf[sym] as u64, cdf[sym + 1] as u64, CDF_TOTAL as u64)?;
         self.update(symbol)
     }
-}
-
-#[cfg(feature = "backend-ctw")]
-fn ctw_ac_step_bitwise<F>(ctw: &mut CtwPredictor, mut choose_bit: F) -> Result<u8>
-where
-    F: FnMut(usize, f64) -> Result<u8>,
-{
-    debug_assert!(ctw.can_fast_ac_bitwise());
-    let symbol = ctw.tree.predict_update_byte_msb(|bit_idx, p1| {
-        choose_bit(bit_idx, p1.clamp(PDF_MIN, 1.0 - PDF_MIN))
-    })?;
-    ctw.valid = false;
-    Ok(symbol)
 }
 
 #[inline]
@@ -1953,7 +2055,11 @@ fn encode_payload_ac(data: &[u8], predictor: &mut RatePdfPredictor) -> Result<Ve
     Ok(out)
 }
 
-fn decode_payload_ac(payload: &[u8], out_len: usize, predictor: &mut RatePdfPredictor) -> Result<Vec<u8>> {
+fn decode_payload_ac(
+    payload: &[u8],
+    out_len: usize,
+    predictor: &mut RatePdfPredictor,
+) -> Result<Vec<u8>> {
     predictor.begin_stream(out_len)?;
 
     if predictor.can_fast_ac_bitwise() {
@@ -2216,11 +2322,36 @@ fn normalize_pdf_vec_and_maybe_build_cdf(pdf: &mut [f64], mut cdf: Option<&mut [
 }
 
 #[inline]
-fn cdf_bit_prob_one_msb(cdf: &[f64; 257], lo: usize, hi: usize) -> f64 {
+fn rebuild_bitwise_prefix_cdf_row(cdf: &mut Vec<f64>, pdf: &[f64]) {
+    cdf.resize(257, 0.0);
+    cdf[0] = 0.0;
+    for idx in 0..256usize {
+        let p = pdf.get(idx).copied().unwrap_or(0.0).max(PDF_MIN);
+        cdf[idx + 1] = cdf[idx] + p;
+    }
+    if !cdf[256].is_finite() || cdf[256] <= 0.0 {
+        for (idx, slot) in cdf.iter_mut().enumerate() {
+            *slot = (idx as f64) / 256.0;
+        }
+    }
+}
+
+#[inline]
+fn cdf_bit_prob_one_msb(cdf: &[f64], lo: usize, hi: usize) -> f64 {
     let mid = (lo + hi) >> 1;
     let total = (cdf[hi] - cdf[lo]).max(PDF_MIN);
     let one = (cdf[hi] - cdf[mid]).max(0.0);
     (one / total).clamp(PDF_MIN, 1.0 - PDF_MIN)
+}
+
+#[inline]
+fn advance_msb_prefix_range(lo: &mut usize, hi: &mut usize, bit: bool) {
+    let mid = (*lo + *hi) >> 1;
+    if bit {
+        *lo = mid;
+    } else {
+        *hi = mid;
+    }
 }
 
 #[inline]
@@ -2494,33 +2625,16 @@ mod tests {
         for &b in b"ctw predictor state preservation payload" {
             predictor.update(b);
         }
-        let mut before_p0 = [0.0f64; 8];
-        let mut before_p1 = [0.0f64; 8];
-        for bit_idx in 0..8usize {
-            before_p0[bit_idx] = predictor.tree.predict(false, bit_idx);
-            before_p1[bit_idx] = predictor.tree.predict(true, bit_idx);
+        let mut baseline = [0.0f64; 256];
+        for (sym, slot) in baseline.iter_mut().enumerate() {
+            *slot = predictor.log_prob_symbol_bruteforce(sym as u8);
         }
-        let log_before = predictor.tree.get_log_block_probability();
         let _ = predictor.pdf_next();
-        let log_after = predictor.tree.get_log_block_probability();
-        assert!(
-            (log_before - log_after).abs() < 1e-12,
-            "log drift: before={log_before} after={log_after}"
-        );
-        for bit_idx in 0..8usize {
-            let after_p0 = predictor.tree.predict(false, bit_idx);
-            let after_p1 = predictor.tree.predict(true, bit_idx);
+        for (sym, &expected) in baseline.iter().enumerate() {
+            let after = predictor.log_prob_symbol_bruteforce(sym as u8);
             assert!(
-                (before_p0[bit_idx] - after_p0).abs() < 1e-12,
-                "bit {bit_idx} p0 drift: {} vs {}",
-                before_p0[bit_idx],
-                after_p0
-            );
-            assert!(
-                (before_p1[bit_idx] - after_p1).abs() < 1e-12,
-                "bit {bit_idx} p1 drift: {} vs {}",
-                before_p1[bit_idx],
-                after_p1
+                (expected - after).abs() < 1e-12,
+                "symbol {sym} drift: {expected} vs {after}"
             );
         }
     }
@@ -2871,6 +2985,19 @@ mod tests {
         assert_eq!(dec, data);
     }
 
+    #[test]
+    fn roundtrip_rate_ac_recursive_native_bitwise_mixture() {
+        let data = b"recursive native bitwise mixture payload";
+        let backend = recursive_native_bitwise_backend();
+        let predictor = RatePdfPredictor::from_rate_backend(backend.clone()).unwrap();
+        assert!(predictor.can_fast_ac_bitwise());
+
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+    }
+
     fn assert_runtime_and_compression_predictor_align(spec: MixtureSpec, data: &[u8], tol: f64) {
         let backend = RateBackend::Mixture {
             spec: Arc::new(spec.clone()),
@@ -3019,6 +3146,137 @@ mod tests {
             spec,
             b"nested mixture predictor alignment check sequence",
             1e-8,
+        );
+    }
+
+    fn recursive_native_bitwise_backend() -> RateBackend {
+        let nested = MixtureSpec::new(MixtureKind::Bayes, alignment_experts());
+        let root = MixtureSpec::new(
+            MixtureKind::Switching,
+            vec![
+                crate::MixtureExpertSpec {
+                    name: Some("nested".to_string()),
+                    log_prior: 0.0,
+                    backend: RateBackend::Mixture {
+                        spec: Arc::new(nested),
+                    },
+                },
+                crate::MixtureExpertSpec {
+                    name: Some("ppmd".to_string()),
+                    log_prior: -0.2,
+                    backend: RateBackend::Ppmd {
+                        order: 5,
+                        memory_mb: 8,
+                    },
+                },
+            ],
+        )
+        .with_alpha(0.13);
+        RateBackend::Mixture {
+            spec: Arc::new(root),
+        }
+    }
+
+    fn assert_bitwise_byte_step_matches_pdf_and_plain_update(
+        mut predictor: RatePdfPredictor,
+        data: &[u8],
+        tol_prob: f64,
+        tol_pdf: f64,
+    ) {
+        for &symbol in data {
+            let expected_pdf = predictor.pdf_next().unwrap().to_vec();
+            let expected_prob = expected_pdf[symbol as usize];
+
+            let mut stepped = predictor.clone();
+            let mut product = 1.0f64;
+            let produced = stepped
+                .ac_step_bitwise(|bit_idx, p1| {
+                    let bit = (symbol >> (7 - bit_idx)) & 1;
+                    let pb = if bit == 1 { p1 } else { 1.0 - p1 };
+                    product *= pb;
+                    Ok(bit)
+                })
+                .unwrap();
+            assert_eq!(produced, symbol);
+            assert!(
+                (product - expected_prob).abs() <= tol_prob,
+                "symbol={symbol} product={product} expected_prob={expected_prob}"
+            );
+
+            let mut plain = predictor.clone();
+            plain.update(symbol).unwrap();
+            let stepped_pdf = stepped.pdf_next().unwrap().to_vec();
+            let plain_pdf = plain.pdf_next().unwrap().to_vec();
+            assert_pdf_close(&stepped_pdf, &plain_pdf, tol_pdf);
+
+            predictor.update(symbol).unwrap();
+        }
+    }
+
+    #[test]
+    fn bitwise_byte_step_matches_pdf_and_plain_update_for_native_and_recursive_mixtures() {
+        assert_bitwise_byte_step_matches_pdf_and_plain_update(
+            RatePdfPredictor::from_rate_backend(RateBackend::Ctw { depth: 7 }).unwrap(),
+            b"direct ctw bitwise byte step parity",
+            1e-12,
+            1e-12,
+        );
+
+        let single_expert = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![crate::MixtureExpertSpec {
+                    name: Some("ctw".to_string()),
+                    log_prior: 0.0,
+                    backend: RateBackend::Ctw { depth: 7 },
+                }],
+            )),
+        };
+        assert_bitwise_byte_step_matches_pdf_and_plain_update(
+            RatePdfPredictor::from_rate_backend(single_expert).unwrap(),
+            b"single expert ctw mixture bitwise byte step parity",
+            1e-12,
+            1e-12,
+        );
+
+        let mixed_direct = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![
+                    crate::MixtureExpertSpec {
+                        name: Some("ctw".to_string()),
+                        log_prior: 0.0,
+                        backend: RateBackend::Ctw { depth: 7 },
+                    },
+                    crate::MixtureExpertSpec {
+                        name: Some("match".to_string()),
+                        log_prior: -0.3,
+                        backend: RateBackend::Match {
+                            hash_bits: 20,
+                            min_len: 4,
+                            max_len: 255,
+                            base_mix: 0.02,
+                            confidence_scale: 1.0,
+                        },
+                    },
+                ],
+            )),
+        };
+        assert_bitwise_byte_step_matches_pdf_and_plain_update(
+            RatePdfPredictor::from_rate_backend(mixed_direct).unwrap(),
+            b"mixed direct mixture bitwise byte step parity",
+            1e-11,
+            1e-11,
+        );
+
+        let recursive = recursive_native_bitwise_backend();
+        let predictor = RatePdfPredictor::from_rate_backend(recursive).unwrap();
+        assert!(predictor.can_fast_ac_bitwise());
+        assert_bitwise_byte_step_matches_pdf_and_plain_update(
+            predictor,
+            b"recursive nested mixture bitwise byte step parity",
+            1e-10,
+            1e-10,
         );
     }
 

@@ -79,7 +79,7 @@ pub(super) fn rate_backend_feature_error(kind: RateBackendKind) -> String {
         .unwrap_or_else(|err| err)
 }
 
-#[cfg(any(test, not(feature = "backend-rwkv")))]
+#[cfg(any(test, not(feature = "backend-zpaq"), not(feature = "backend-rwkv")))]
 pub(super) fn compression_backend_feature_error(kind: CompressionBackendKind) -> String {
     describe_compression_backend_kind(kind)
         .map(|descriptor| match descriptor.feature {

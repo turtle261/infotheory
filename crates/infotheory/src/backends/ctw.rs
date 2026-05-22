@@ -3784,6 +3784,15 @@ impl ContextTree {
     }
 
     #[inline]
+    pub(crate) fn reserve_for_symbols(&mut self, total_symbols: usize) {
+        if total_symbols == 0 {
+            return;
+        }
+        self.engine.reserve_for_symbols(total_symbols);
+        self.history.reserve_exact(total_symbols);
+    }
+
+    #[inline]
     /// Observe one binary symbol and update the model.
     pub fn update(&mut self, sym: Symbol) {
         self.engine.update(sym, &self.history);
@@ -4204,6 +4213,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn predict_update_byte_msb_with_logs<L: CtLogAccess, E>(
         &mut self,
         logs: L,
@@ -4252,6 +4262,7 @@ impl FacContextTree {
     }
 
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn predict_update_byte_msb<E>(
         &mut self,
         mut choose_bit: impl FnMut(usize, f64) -> Result<u8, E>,
@@ -5948,29 +5959,25 @@ mod tests {
         rec(tree, bits, 0);
     }
 
-    fn byte_log_prob(tree: &mut FacContextTree, symbol: u8, msb_first: bool, bits: usize) -> f64 {
-        let before = tree.get_log_block_probability();
+    fn fac_symbol_bit(symbol: u8, msb_first: bool, bits: usize, bit_idx: usize) -> bool {
         if msb_first {
-            for bit_idx in 0..bits {
-                let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-                tree.update(bit, bit_idx);
-            }
-            let after = tree.get_log_block_probability();
-            for bit_idx in (0..bits).rev() {
-                tree.revert(bit_idx);
-            }
-            after - before
+            ctw_symbol_bit_msb(symbol, bits, bit_idx)
         } else {
-            for bit_idx in 0..bits {
-                let bit = ((symbol >> bit_idx) & 1) == 1;
-                tree.update(bit, bit_idx);
-            }
-            let after = tree.get_log_block_probability();
-            for bit_idx in (0..bits).rev() {
-                tree.revert(bit_idx);
-            }
-            after - before
+            ((symbol >> bit_idx) & 1) == 1
         }
+    }
+
+    fn symbol_log_prob(tree: &mut FacContextTree, symbol: u8, msb_first: bool, bits: usize) -> f64 {
+        let before = tree.get_log_block_probability();
+        for bit_idx in 0..bits {
+            let bit = fac_symbol_bit(symbol, msb_first, bits, bit_idx);
+            tree.update(bit, bit_idx);
+        }
+        let after = tree.get_log_block_probability();
+        for bit_idx in (0..bits).rev() {
+            tree.revert(bit_idx);
+        }
+        after - before
     }
 
     fn assert_symbol_scan_then_update_matches_plain(msb_first: bool) {
@@ -5979,11 +5986,7 @@ mod tests {
         let mut plain = with_scan.clone();
         for &byte in b"pdf then update parity payload" {
             for bit_idx in 0..bits {
-                let bit = if msb_first {
-                    ((byte >> (7 - bit_idx)) & 1) == 1
-                } else {
-                    ((byte >> bit_idx) & 1) == 1
-                };
+                let bit = fac_symbol_bit(byte, msb_first, bits, bit_idx);
                 with_scan.update(bit, bit_idx);
                 plain.update(bit, bit_idx);
             }
@@ -5993,23 +5996,66 @@ mod tests {
 
         let observed = b'n';
         for bit_idx in 0..bits {
-            let bit = if msb_first {
-                ((observed >> (7 - bit_idx)) & 1) == 1
-            } else {
-                ((observed >> bit_idx) & 1) == 1
-            };
+            let bit = fac_symbol_bit(observed, msb_first, bits, bit_idx);
             with_scan.update(bit, bit_idx);
             plain.update(bit, bit_idx);
         }
 
         for sym in 0u8..=255u8 {
-            let lp_scan = byte_log_prob(&mut with_scan, sym, msb_first, bits);
-            let lp_plain = byte_log_prob(&mut plain, sym, msb_first, bits);
+            let lp_scan = symbol_log_prob(&mut with_scan, sym, msb_first, bits);
+            let lp_plain = symbol_log_prob(&mut plain, sym, msb_first, bits);
             let diff = (lp_scan - lp_plain).abs();
             assert!(
                 diff < 1e-12,
                 "symbol={sym} lp_scan={lp_scan} lp_plain={lp_plain} diff={diff}",
             );
+        }
+    }
+
+    fn assert_fill_fac_tree_log_probs_matches_direct_symbol_probs(msb_first: bool, bits: usize) {
+        let bits = bits.clamp(1, 8);
+        let min_logp = 1e-12f64.ln();
+        let patterns = 1usize << bits;
+        let alias_ln = if bits == 8 {
+            0.0
+        } else {
+            ((1usize << (8 - bits)) as f64).ln()
+        };
+        let training = [0x0u8, 0x3, 0x5, 0x6, 0x9, 0xA, 0xC, 0xF, 0x7, 0x1];
+        let mut tree = FacContextTree::new(7, bits);
+        for &symbol in &training {
+            for bit_idx in 0..bits {
+                tree.update(fac_symbol_bit(symbol, msb_first, bits, bit_idx), bit_idx);
+            }
+        }
+
+        let log_before = tree.get_log_block_probability();
+        let mut predict_zero_before = vec![0.0; bits];
+        let mut predict_one_before = vec![0.0; bits];
+        for bit_idx in 0..bits {
+            predict_zero_before[bit_idx] = tree.predict(false, bit_idx);
+            predict_one_before[bit_idx] = tree.predict(true, bit_idx);
+        }
+
+        let mut out = [0.0; 256];
+        fill_fac_tree_log_probs(&mut tree, bits, msb_first, min_logp, &mut out);
+
+        assert_close(tree.get_log_block_probability(), log_before);
+        for bit_idx in 0..bits {
+            assert_close(tree.predict(false, bit_idx), predict_zero_before[bit_idx]);
+            assert_close(tree.predict(true, bit_idx), predict_one_before[bit_idx]);
+        }
+
+        let mask = patterns - 1;
+        for byte in 0..256usize {
+            let symbol = if bits == 8 {
+                byte as u8
+            } else {
+                (byte & mask) as u8
+            };
+            let expected =
+                symbol_log_prob(&mut tree, symbol, msb_first, bits).max(min_logp) - alias_ln;
+            assert_close(out[byte], expected);
         }
     }
 
@@ -6021,5 +6067,239 @@ mod tests {
     #[test]
     fn fac_ctw_symbol_scan_then_update_matches_plain_lsb() {
         assert_symbol_scan_then_update_matches_plain(false);
+    }
+
+    #[test]
+    fn fill_fac_tree_log_probs_matches_direct_symbol_probs_for_subbyte_msb() {
+        assert_fill_fac_tree_log_probs_matches_direct_symbol_probs(true, 4);
+    }
+
+    #[test]
+    fn fill_fac_tree_log_probs_matches_direct_symbol_probs_for_subbyte_lsb() {
+        assert_fill_fac_tree_log_probs_matches_direct_symbol_probs(false, 4);
+    }
+}
+
+#[inline]
+fn compact_symbol_msb_shift(bits_per_symbol: usize, bit_idx: usize) -> usize {
+    bits_per_symbol.saturating_sub(1).saturating_sub(bit_idx)
+}
+
+#[inline]
+pub(crate) fn ctw_symbol_bit_msb(symbol: u8, bits_per_symbol: usize, bit_idx: usize) -> bool {
+    let bits = bits_per_symbol.clamp(1, 8);
+    let shift = compact_symbol_msb_shift(bits, bit_idx);
+    ((symbol >> shift) & 1) == 1
+}
+
+#[inline]
+pub(crate) fn ctw_log_prob_msb(
+    tree: &mut ContextTree,
+    symbol: u8,
+    bits_per_symbol: usize,
+    min_prob: f64,
+) -> f64 {
+    let bits = bits_per_symbol.clamp(1, 8);
+    let mut logp = 0.0;
+    for bit_idx in 0..bits {
+        let bit = ctw_symbol_bit_msb(symbol, bits, bit_idx);
+        let p = tree.predict(bit);
+        if p.is_finite() && p > 0.0 {
+            logp += p.ln();
+        } else {
+            logp = f64::NEG_INFINITY;
+        }
+        tree.update(bit);
+    }
+    for _ in 0..bits {
+        tree.revert();
+    }
+    if logp.is_finite() {
+        logp.max(min_prob.ln())
+    } else {
+        min_prob.ln()
+    }
+}
+
+#[inline]
+pub(crate) fn ctw_log_prob_update_msb(
+    tree: &mut ContextTree,
+    symbol: u8,
+    bits_per_symbol: usize,
+    min_prob: f64,
+) -> f64 {
+    let bits = bits_per_symbol.clamp(1, 8);
+    let mut logp = 0.0;
+    for bit_idx in 0..bits {
+        let bit = ctw_symbol_bit_msb(symbol, bits, bit_idx);
+        let p = tree.predict(bit);
+        if p.is_finite() && p > 0.0 {
+            logp += p.ln();
+        } else {
+            logp = f64::NEG_INFINITY;
+        }
+        tree.update(bit);
+    }
+    if logp.is_finite() {
+        logp.max(min_prob.ln())
+    } else {
+        min_prob.ln()
+    }
+}
+
+#[inline]
+pub(crate) fn ctw_log_prob_update_lsb(
+    tree: &mut FacContextTree,
+    symbol: u8,
+    bits_per_symbol: usize,
+    min_prob: f64,
+) -> f64 {
+    let mut logp = 0.0;
+    for bit_idx in 0..bits_per_symbol {
+        let bit = ((symbol >> bit_idx) & 1) == 1;
+        let p = tree.predict(bit, bit_idx);
+        if p.is_finite() && p > 0.0 {
+            logp += p.ln();
+        } else {
+            logp = f64::NEG_INFINITY;
+        }
+        tree.update_predicted(bit, bit_idx);
+    }
+    if logp.is_finite() {
+        logp.max(min_prob.ln())
+    } else {
+        min_prob.ln()
+    }
+}
+
+pub(crate) fn fill_ctw_tree_log_probs(
+    tree: &mut ContextTree,
+    bits_per_symbol: usize,
+    min_logp: f64,
+    out: &mut [f64; 256],
+) {
+    let bits = bits_per_symbol.clamp(1, 8);
+    let patterns = 1usize << bits;
+    let mut pattern_logps = [f64::NEG_INFINITY; 256];
+    let log_before = tree.get_log_block_probability();
+
+    fn rec(
+        tree: &mut ContextTree,
+        depth: usize,
+        bits: usize,
+        log_before: f64,
+        min_logp: f64,
+        symbol_acc: u8,
+        pattern_logps: &mut [f64; 256],
+    ) {
+        if depth == bits {
+            let pat = symbol_acc as usize;
+            let logp = (tree.get_log_block_probability() - log_before).max(min_logp);
+            pattern_logps[pat] = logp;
+            return;
+        }
+
+        for bit in [false, true] {
+            tree.update(bit);
+            let shift = compact_symbol_msb_shift(bits, depth);
+            let next_symbol = if bit {
+                symbol_acc | (1u8 << shift)
+            } else {
+                symbol_acc
+            };
+            rec(
+                tree,
+                depth + 1,
+                bits,
+                log_before,
+                min_logp,
+                next_symbol,
+                pattern_logps,
+            );
+            tree.revert();
+        }
+    }
+
+    rec(tree, 0, bits, log_before, min_logp, 0, &mut pattern_logps);
+
+    if bits == 8 {
+        out.copy_from_slice(&pattern_logps);
+    } else {
+        let aliases = 1usize << (8 - bits);
+        let alias_ln = (aliases as f64).ln();
+        let mask = patterns - 1;
+        for byte in 0..256usize {
+            out[byte] = pattern_logps[byte & mask] - alias_ln;
+        }
+    }
+}
+
+pub(crate) fn fill_fac_tree_log_probs(
+    tree: &mut FacContextTree,
+    bits_per_symbol: usize,
+    msb_first: bool,
+    min_logp: f64,
+    out: &mut [f64; 256],
+) {
+    struct RecParams {
+        bits: usize,
+        msb_first: bool,
+        log_before: f64,
+        min_logp: f64,
+    }
+
+    let bits = bits_per_symbol.clamp(1, 8);
+    let patterns = 1usize << bits;
+    let mut pattern_logps = [f64::NEG_INFINITY; 256];
+    let params = RecParams {
+        bits,
+        msb_first,
+        log_before: tree.get_log_block_probability(),
+        min_logp,
+    };
+
+    fn rec(
+        tree: &mut FacContextTree,
+        depth: usize,
+        params: &RecParams,
+        symbol_acc: u8,
+        pattern_logps: &mut [f64; 256],
+    ) {
+        if depth == params.bits {
+            let pat = symbol_acc as usize;
+            let logp = (tree.get_log_block_probability() - params.log_before).max(params.min_logp);
+            pattern_logps[pat] = logp;
+            return;
+        }
+
+        for bit in [false, true] {
+            tree.update(bit, depth);
+            let mut next_symbol = symbol_acc;
+            if params.msb_first {
+                // Keep sub-byte MSB symbols packed into the low pattern range so the
+                // alias expansion below can index them via `byte & mask`.
+                let shift = compact_symbol_msb_shift(params.bits, depth);
+                if bit {
+                    next_symbol |= 1u8 << shift;
+                }
+            } else if bit {
+                next_symbol |= 1u8 << depth;
+            }
+            rec(tree, depth + 1, params, next_symbol, pattern_logps);
+            tree.revert(depth);
+        }
+    }
+
+    rec(tree, 0, &params, 0, &mut pattern_logps);
+
+    if bits == 8 {
+        out.copy_from_slice(&pattern_logps);
+    } else {
+        let aliases = 1usize << (8 - bits);
+        let alias_ln = (aliases as f64).ln();
+        let mask = patterns - 1;
+        for byte in 0..256usize {
+            out[byte] = pattern_logps[byte & mask] - alias_ln;
+        }
     }
 }

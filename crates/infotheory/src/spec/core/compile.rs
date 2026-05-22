@@ -164,15 +164,6 @@ pub(crate) fn compile_rate_plan_mamba(
     }
 }
 
-#[cfg(not(feature = "backend-mamba"))]
-pub(crate) fn compile_rate_plan_mamba(
-    _backend: &RateBackend,
-    _env: &SpecEnvironment,
-    _depth: usize,
-) -> SpecResult<RateBackendPlan> {
-    unreachable!("mamba kernel should never compile without backend-mamba")
-}
-
 #[cfg(feature = "backend-rwkv")]
 pub(crate) fn compile_rate_plan_rwkv7(
     backend: &RateBackend,
@@ -193,15 +184,6 @@ pub(crate) fn compile_rate_plan_rwkv7(
         }
         _ => unreachable!("rwkv7 kernel used with non-rwkv7 backend"),
     }
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn compile_rate_plan_rwkv7(
-    _backend: &RateBackend,
-    _env: &SpecEnvironment,
-    _depth: usize,
-) -> SpecResult<RateBackendPlan> {
-    unreachable!("rwkv7 kernel should never compile without backend-rwkv")
 }
 
 pub(crate) fn compile_rate_plan_mixture(
@@ -322,14 +304,6 @@ pub(crate) fn compile_compression_plan_rwkv7(
         }
         _ => unreachable!("rwkv7 compression kernel used with non-rwkv7 backend"),
     }
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn compile_compression_plan_rwkv7(
-    _backend: &CompressionBackend,
-    _env: &SpecEnvironment,
-) -> SpecResult<CompressionBackendPlan> {
-    unreachable!("rwkv7 compression kernel should never compile without backend-rwkv")
 }
 
 pub(crate) fn compile_compression_plan_rate(

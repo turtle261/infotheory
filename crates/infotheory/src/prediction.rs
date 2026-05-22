@@ -39,8 +39,13 @@ pub enum BitStreamSemantics {
     },
     /// Bits are the actual modeled symbols, not a byte factorization.
     ///
-    /// Use this when the stream is genuinely bit-native, including arbitrary
-    /// non-multiple-of-8 lengths.
+    /// Native bit backends consume these symbols directly. Byte-native
+    /// backends instead adapt this view to the literal byte symbols `0` and
+    /// `1`, with probabilities renormalized over just those two outcomes.
+    ///
+    /// This therefore supports arbitrary non-multiple-of-8 lengths while
+    /// preserving truthful capability metadata: native bit support remains
+    /// distinguishable from byte-symbol adaptation.
     BinaryTokens,
 }
 
@@ -119,50 +124,68 @@ pub trait OnlineBitPredictor {
 /// Live byte-prefix state used to query a 256-way byte PDF as conditional bits.
 #[derive(Clone, Debug)]
 pub struct BytePrefixMass {
-    pdf: [f64; 256],
-    lo: usize,
-    hi: usize,
+    tree: [f64; 512],
+    node: usize,
     order: BitOrder,
     bits_seen: u8,
     symbol: u8,
 }
 
+const BYTE_PREFIX_TREE_ROOT: usize = 1;
+const BYTE_PREFIX_TREE_LEAF_BASE: usize = 256;
+
 impl BytePrefixMass {
     /// Build a prefix-mass state from a byte PDF.
     pub fn from_pdf(pdf: &[f64], order: BitOrder) -> Self {
-        let mut normalized = [0.0f64; 256];
-        let mut acc = 0.0f64;
-        for idx in 0..256usize {
-            let p = pdf.get(idx).copied().unwrap_or(0.0);
-            let p = if p.is_finite() && p > 0.0 { p } else { 0.0 };
-            acc += p;
-            normalized[idx] = p;
+        let mut weights = [0.0f64; 256];
+        for (idx, weight) in weights.iter_mut().enumerate() {
+            *weight = pdf.get(idx).copied().unwrap_or(0.0);
         }
-        if !acc.is_finite() || acc <= 0.0 {
-            normalized.fill(1.0 / 256.0);
-        } else {
-            let inv = 1.0 / acc;
-            for slot in &mut normalized {
-                *slot *= inv;
-            }
-        }
-        Self::from_normalized_pdf(normalized, order)
+        Self::from_raw_weights(weights, order)
     }
 
     /// Build a prefix-mass state from a normalized byte CDF row.
     pub fn from_cdf(cdf: [f64; 257], order: BitOrder) -> Self {
-        let mut pdf = [0.0f64; 256];
-        for idx in 0..256usize {
-            pdf[idx] = (cdf[idx + 1] - cdf[idx]).max(0.0);
+        let mut weights = [0.0f64; 256];
+        for (idx, weight) in weights.iter_mut().enumerate() {
+            *weight = cdf[idx + 1] - cdf[idx];
         }
-        Self::from_pdf(&pdf, order)
+        Self::from_raw_weights(weights, order)
+    }
+
+    fn from_raw_weights(mut weights: [f64; 256], order: BitOrder) -> Self {
+        let mut total = 0.0f64;
+        for weight in &mut weights {
+            *weight = if weight.is_finite() && *weight > 0.0 {
+                *weight
+            } else {
+                0.0
+            };
+            total += *weight;
+        }
+        if !total.is_finite() || total <= 0.0 {
+            weights.fill(1.0 / 256.0);
+        } else {
+            let inv = 1.0 / total;
+            for weight in &mut weights {
+                *weight *= inv;
+            }
+        }
+        Self::from_normalized_pdf(weights, order)
     }
 
     fn from_normalized_pdf(pdf: [f64; 256], order: BitOrder) -> Self {
+        let mut tree = [0.0f64; 512];
+        for (symbol, &mass) in pdf.iter().enumerate() {
+            let leaf = BYTE_PREFIX_TREE_LEAF_BASE + byte_prefix_leaf_offset(order, symbol as u8);
+            tree[leaf] = mass;
+        }
+        for node in (1..BYTE_PREFIX_TREE_LEAF_BASE).rev() {
+            tree[node] = tree[node * 2] + tree[node * 2 + 1];
+        }
         Self {
-            pdf,
-            lo: 0,
-            hi: 256,
+            tree,
+            node: BYTE_PREFIX_TREE_ROOT,
             order,
             bits_seen: 0,
             symbol: 0,
@@ -171,32 +194,28 @@ impl BytePrefixMass {
 
     /// Query the current conditional probability of the next bit.
     pub fn prediction(&self) -> BinaryPrediction {
-        if self.order == BitOrder::LsbFirst {
-            return self.prediction_lsb();
+        if self.is_complete() {
+            return BinaryPrediction::from_prob_one_exact(0.5);
         }
-        let (zero_lo, zero_hi, one_lo, one_hi) = self.child_ranges();
-        let zero = self.pdf[zero_lo..zero_hi].iter().copied().sum::<f64>();
-        let one = self.pdf[one_lo..one_hi].iter().copied().sum::<f64>();
-        let total = zero + one;
+        let total = self.tree[self.node];
         if !total.is_finite() || total <= 0.0 {
             return BinaryPrediction::from_prob_one_exact(0.5);
         }
+        let one = self.tree[self.node * 2 + 1];
         let p1 = one / total;
         BinaryPrediction::from_prob_one_exact(p1)
     }
 
     /// Observe a bit, discarding the impossible sibling branch.
     pub fn observe(&mut self, bit: bool) {
-        if self.order == BitOrder::MsbFirst {
-            let (zero_lo, zero_hi, one_lo, one_hi) = self.child_ranges();
-            if bit {
-                self.lo = one_lo;
-                self.hi = one_hi;
-            } else {
-                self.lo = zero_lo;
-                self.hi = zero_hi;
-            }
+        debug_assert!(
+            !self.is_complete(),
+            "BytePrefixMass::observe called after a full byte was already observed"
+        );
+        if self.is_complete() {
+            return;
         }
+        self.node = self.node * 2 + usize::from(bit);
         match self.order {
             BitOrder::MsbFirst => {
                 self.symbol |= u8::from(bit) << (7 - self.bits_seen);
@@ -219,41 +238,13 @@ impl BytePrefixMass {
     pub fn symbol(&self) -> u8 {
         self.symbol
     }
+}
 
-    #[inline]
-    fn child_ranges(&self) -> (usize, usize, usize, usize) {
-        debug_assert_eq!(self.order, BitOrder::MsbFirst);
-        let mid = (self.lo + self.hi) >> 1;
-        (self.lo, mid, mid, self.hi)
-    }
-
-    fn prediction_lsb(&self) -> BinaryPrediction {
-        let prefix_mask = if self.bits_seen == 0 {
-            0usize
-        } else {
-            (1usize << self.bits_seen) - 1
-        };
-        let prefix = (self.symbol as usize) & prefix_mask;
-        let next_mask = 1usize << self.bits_seen;
-        let mut p0 = 0.0f64;
-        let mut p1 = 0.0f64;
-        for value in 0..256usize {
-            if (value & prefix_mask) != prefix {
-                continue;
-            }
-            if (value & next_mask) == 0 {
-                p0 += self.pdf[value];
-            } else {
-                p1 += self.pdf[value];
-            }
-        }
-        let total = p0 + p1;
-        let p1 = if total.is_finite() && total > 0.0 {
-            p1 / total
-        } else {
-            0.5
-        };
-        BinaryPrediction::from_prob_one_exact(p1)
+#[inline]
+fn byte_prefix_leaf_offset(order: BitOrder, symbol: u8) -> usize {
+    match order {
+        BitOrder::MsbFirst => usize::from(symbol),
+        BitOrder::LsbFirst => usize::from(symbol.reverse_bits()),
     }
 }
 
@@ -303,8 +294,16 @@ pub(crate) fn binary_prediction_from_log_probs(
     if !max_log.is_finite() {
         return BinaryPrediction::from_prob_one(0.5, floor);
     }
-    let p0 = if logp0.is_finite() { (logp0 - max_log).exp() } else { 0.0 };
-    let p1 = if logp1.is_finite() { (logp1 - max_log).exp() } else { 0.0 };
+    let p0 = if logp0.is_finite() {
+        (logp0 - max_log).exp()
+    } else {
+        0.0
+    };
+    let p1 = if logp1.is_finite() {
+        (logp1 - max_log).exp()
+    } else {
+        0.0
+    };
     binary_prediction_from_probs(p0, p1, floor)
 }
 
@@ -312,16 +311,90 @@ pub(crate) fn binary_prediction_from_log_probs(
 mod tests {
     use super::*;
 
+    fn normalize_pdf_for_test(mut pdf: [f64; 256]) -> [f64; 256] {
+        let sum: f64 = pdf.iter().sum();
+        for p in &mut pdf {
+            *p /= sum;
+        }
+        pdf
+    }
+
+    fn assert_binary_prediction_close(actual: BinaryPrediction, expected: BinaryPrediction) {
+        assert!((actual.p0 - expected.p0).abs() < 1e-12);
+        assert!((actual.p1 - expected.p1).abs() < 1e-12);
+    }
+
+    fn bit_at(symbol: u8, order: BitOrder, bit_idx: u8) -> bool {
+        match order {
+            BitOrder::MsbFirst => ((symbol >> (7 - bit_idx)) & 1) == 1,
+            BitOrder::LsbFirst => ((symbol >> bit_idx) & 1) == 1,
+        }
+    }
+
+    fn extend_observed_prefix(observed: &mut u8, order: BitOrder, bit_idx: u8, bit: bool) {
+        match order {
+            BitOrder::MsbFirst => *observed |= u8::from(bit) << (7 - bit_idx),
+            BitOrder::LsbFirst => *observed |= u8::from(bit) << bit_idx,
+        }
+    }
+
+    fn prefix_matches(value: u8, observed: u8, order: BitOrder, bits_seen: u8) -> bool {
+        for bit_idx in 0..bits_seen {
+            if bit_at(value, order, bit_idx) != bit_at(observed, order, bit_idx) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn direct_prediction(
+        pdf: &[f64; 256],
+        order: BitOrder,
+        observed: u8,
+        bits_seen: u8,
+    ) -> BinaryPrediction {
+        if bits_seen >= 8 {
+            return BinaryPrediction::from_prob_one_exact(0.5);
+        }
+        let mut p0 = 0.0f64;
+        let mut p1 = 0.0f64;
+        for (value, &mass) in pdf.iter().enumerate() {
+            let value = value as u8;
+            if !prefix_matches(value, observed, order, bits_seen) {
+                continue;
+            }
+            if bit_at(value, order, bits_seen) {
+                p1 += mass;
+            } else {
+                p0 += mass;
+            }
+        }
+        let total = p0 + p1;
+        let p1 = if total.is_finite() && total > 0.0 {
+            p1 / total
+        } else {
+            0.5
+        };
+        BinaryPrediction::from_prob_one_exact(p1)
+    }
+
+    fn cdf_from_pdf(pdf: &[f64; 256]) -> [f64; 257] {
+        let mut cdf = [0.0f64; 257];
+        let mut acc = 0.0f64;
+        for idx in 0..256usize {
+            acc += pdf[idx];
+            cdf[idx + 1] = acc;
+        }
+        cdf
+    }
+
     #[test]
     fn byte_prefix_product_matches_symbol_probability_msb() {
         let mut pdf = [0.0f64; 256];
         for (idx, slot) in pdf.iter_mut().enumerate() {
             *slot = (idx + 1) as f64;
         }
-        let sum: f64 = pdf.iter().sum();
-        for p in &mut pdf {
-            *p /= sum;
-        }
+        let pdf = normalize_pdf_for_test(pdf);
 
         let symbol = 0b1010_0110u8;
         let mut prefix = BytePrefixMass::from_pdf(&pdf, BitOrder::MsbFirst);
@@ -343,10 +416,7 @@ mod tests {
         for (idx, slot) in pdf.iter_mut().enumerate() {
             *slot = (idx + 3) as f64;
         }
-        let sum: f64 = pdf.iter().sum();
-        for p in &mut pdf {
-            *p /= sum;
-        }
+        let pdf = normalize_pdf_for_test(pdf);
 
         let symbol = 0b1010_0110u8;
         let mut prefix = BytePrefixMass::from_pdf(&pdf, BitOrder::LsbFirst);
@@ -387,16 +457,100 @@ mod tests {
         let eps = 5e-17;
         let mut pdf = [eps; 256];
         pdf[0] = 1.0 - (255.0 * eps);
-        let total: f64 = pdf.iter().sum();
-        for p in &mut pdf {
-            *p /= total;
-        }
+        let pdf = normalize_pdf_for_test(pdf);
 
         let prediction = BytePrefixMass::from_pdf(&pdf, BitOrder::MsbFirst).prediction();
         let expected = pdf[128..256].iter().copied().sum::<f64>();
         assert!(expected > 0.0);
         assert!(prediction.p1 > 0.0);
         assert!((prediction.p1 - expected).abs() < 1e-18);
+    }
+
+    #[test]
+    fn byte_prefix_lsb_prediction_preserves_tiny_positive_tail_mass() {
+        let eps = 5e-17;
+        let mut pdf = [eps; 256];
+        pdf[0] = 1.0 - (255.0 * eps);
+        let pdf = normalize_pdf_for_test(pdf);
+
+        let prediction = BytePrefixMass::from_pdf(&pdf, BitOrder::LsbFirst).prediction();
+        let expected = pdf
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| (idx & 1) == 1)
+            .map(|(_, &p)| p)
+            .sum::<f64>();
+        assert!(expected > 0.0);
+        assert!(prediction.p1 > 0.0);
+        assert!((prediction.p1 - expected).abs() < 1e-18);
+    }
+
+    #[test]
+    fn byte_prefix_lsb_preserves_zero_mass_until_coder_boundary() {
+        let mut pdf = [0.0f64; 256];
+        pdf[0b0000_1010] = 0.25;
+        pdf[0b1000_1010] = 0.75;
+
+        let symbol = 0b0000_1010u8;
+        let mut prefix = BytePrefixMass::from_pdf(&pdf, BitOrder::LsbFirst);
+        for bit_idx in 0..7u8 {
+            let bit = ((symbol >> bit_idx) & 1) == 1;
+            let prediction = prefix.prediction();
+            assert_eq!(prediction.prob(bit), 1.0);
+            assert_eq!(prediction.prob(!bit), 0.0);
+            prefix.observe(bit);
+        }
+    }
+
+    #[test]
+    fn byte_prefix_prediction_matches_direct_reference_for_both_orders() {
+        let mut pdf = [0.0f64; 256];
+        for (idx, slot) in pdf.iter_mut().enumerate() {
+            *slot = ((idx * 37 + 11) % 257 + 1) as f64;
+        }
+        let pdf = normalize_pdf_for_test(pdf);
+
+        for order in [BitOrder::MsbFirst, BitOrder::LsbFirst] {
+            for symbol in 0u8..=255u8 {
+                let mut prefix = BytePrefixMass::from_pdf(&pdf, order);
+                let mut observed = 0u8;
+                for bit_idx in 0..8u8 {
+                    let expected = direct_prediction(&pdf, order, observed, bit_idx);
+                    let actual = prefix.prediction();
+                    assert_binary_prediction_close(actual, expected);
+
+                    let bit = bit_at(symbol, order, bit_idx);
+                    prefix.observe(bit);
+                    extend_observed_prefix(&mut observed, order, bit_idx, bit);
+                }
+                assert!(prefix.is_complete());
+                assert_eq!(prefix.symbol(), symbol);
+            }
+        }
+    }
+
+    #[test]
+    fn byte_prefix_from_cdf_matches_from_pdf_for_both_orders() {
+        let mut pdf = [0.0f64; 256];
+        for (idx, slot) in pdf.iter_mut().enumerate() {
+            *slot = ((idx * 19 + 7) % 193 + 1) as f64;
+        }
+        let pdf = normalize_pdf_for_test(pdf);
+        let cdf = cdf_from_pdf(&pdf);
+
+        for order in [BitOrder::MsbFirst, BitOrder::LsbFirst] {
+            let symbol = 0b1010_0110u8;
+            let mut from_pdf = BytePrefixMass::from_pdf(&pdf, order);
+            let mut from_cdf = BytePrefixMass::from_cdf(cdf, order);
+            for bit_idx in 0..8u8 {
+                assert_binary_prediction_close(from_pdf.prediction(), from_cdf.prediction());
+                let bit = bit_at(symbol, order, bit_idx);
+                from_pdf.observe(bit);
+                from_cdf.observe(bit);
+            }
+            assert_eq!(from_pdf.symbol(), symbol);
+            assert_eq!(from_cdf.symbol(), symbol);
+        }
     }
 
     #[test]

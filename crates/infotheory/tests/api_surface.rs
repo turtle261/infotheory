@@ -2,6 +2,8 @@ use infotheory::api::{
     BitOrder, BitStreamSemantics, MixtureExpertSpec, MixtureKind, MixtureSpec, OnlineBitPredictor,
     ParticleSpec, RateBackend, RateBackendBitSession, RateBackendSession,
 };
+#[cfg(feature = "backend-calibrated")]
+use infotheory::api::{CalibratedSpec, CalibrationContextKind};
 use infotheory::spec::CanonicalJson;
 use std::sync::Arc;
 
@@ -115,14 +117,11 @@ fn api_surface_byte_packed_bit_session_rejects_non_byte_aligned_lengths() {
     let semantics = BitStreamSemantics::BytePacked {
         order: BitOrder::MsbFirst,
     };
-    let err = match RateBackendBitSession::from_spec(
-        RateBackend::Ctw { depth: 6 },
-        Some(9),
-        semantics,
-    ) {
-        Ok(_) => panic!("byte-packed streams require whole bytes"),
-        Err(err) => err,
-    };
+    let err =
+        match RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(9), semantics) {
+            Ok(_) => panic!("byte-packed streams require whole bytes"),
+            Err(err) => err,
+        };
     assert!(err.to_string().contains("whole number of bytes"));
     assert!(err.to_string().contains("BinaryTokens"));
 
@@ -186,14 +185,136 @@ fn api_surface_binary_tokens_accept_arbitrary_length_streams() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
+fn api_surface_fac_ctw_binary_tokens_accept_arbitrary_length_streams() {
+    let compiled = RateBackend::FacCtw {
+        base_depth: 6,
+        num_percept_bits: 8,
+        encoding_bits: 8,
+    }
+    .compile()
+    .expect("compiled fac-ctw");
+    assert!(compiled.capabilities().supports_native_bit_prediction);
+    assert!(compiled.capabilities().supports_byte_prefix_mass);
+    assert!(compiled.capabilities().supports_reversible_bit_updates);
+
+    let mut bit_session =
+        RateBackendBitSession::from_backend(compiled, Some(9), BitStreamSemantics::BinaryTokens)
+            .expect("fac-ctw binary-token session");
+
+    for bit in [true, false, true, false, true, true, false, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
+#[test]
+fn api_surface_mixture_over_native_bit_backend_preserves_binary_tokens() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 })],
+        )),
+    };
+    let compiled = backend.clone().compile().expect("compiled mixture");
+    assert!(compiled.capabilities().supports_native_bit_prediction);
+    assert!(compiled.capabilities().supports_byte_prefix_mass);
+    assert!(compiled.capabilities().supports_reversible_bit_updates);
+
+    let mut bit_session =
+        RateBackendBitSession::from_spec(backend, Some(9), BitStreamSemantics::BinaryTokens)
+            .expect("mixture binary-token session");
+
+    for bit in [true, false, false, true, true, false, true, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(feature = "backend-match")]
+#[test]
+fn api_surface_binary_tokens_adapt_byte_native_backends() {
+    let backend = RateBackend::Match {
+        hash_bits: 20,
+        min_len: 4,
+        max_len: 255,
+        base_mix: 0.02,
+        confidence_scale: 1.0,
+    };
+    let compiled = backend.clone().compile().expect("compiled match");
+    assert!(!compiled.capabilities().supports_native_bit_prediction);
+
+    let mut byte_session =
+        RateBackendSession::from_spec(backend.clone(), Some(9)).expect("byte session");
+    let mut bit_session =
+        RateBackendBitSession::from_spec(backend, Some(9), BitStreamSemantics::BinaryTokens)
+            .expect("binary-token session");
+
+    for &bit in &[true, false, true, true, false, false, true, false, true] {
+        let mut row = [0.0f64; 256];
+        byte_session.fill_log_probs(&mut row);
+        let p0 = row[0].exp();
+        let p1 = row[1].exp();
+        let total = p0 + p1;
+        let expected_p0 = if total.is_finite() && total > 0.0 {
+            p0 / total
+        } else {
+            0.5
+        };
+        let expected_p1 = if total.is_finite() && total > 0.0 {
+            p1 / total
+        } else {
+            0.5
+        };
+
+        let prediction = bit_session.step_bit(bit);
+        assert!(
+            (prediction.p0 + prediction.p1 - 1.0).abs() < 1e-12,
+            "binary-token adaptation must stay normalized, got p0={} p1={}",
+            prediction.p0,
+            prediction.p1
+        );
+        assert!(
+            (prediction.p0 - expected_p0).abs() < 1e-12,
+            "adapted p0 drifted: got {} expected {}",
+            prediction.p0,
+            expected_p0
+        );
+        assert!(
+            (prediction.p1 - expected_p1).abs() < 1e-12,
+            "adapted p1 drifted: got {} expected {}",
+            prediction.p1,
+            expected_p1
+        );
+
+        byte_session.observe(&[u8::from(bit)]);
+    }
+
+    byte_session.finish().expect("byte finish");
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
 fn api_surface_rate_backend_bit_capabilities_are_explicit() {
     let ctw = RateBackend::Ctw { depth: 6 }
         .compile()
         .expect("compiled ctw");
     assert!(ctw.capabilities().supports_native_bit_prediction);
     assert!(ctw.capabilities().supports_byte_prefix_mass);
-    assert!(!ctw.capabilities().supports_reversible_bit_updates);
-    assert!(ctw.capabilities().ac_prefers_bitwise);
+    assert!(ctw.capabilities().supports_reversible_bit_updates);
 
     #[cfg(feature = "backend-match")]
     {
@@ -208,7 +329,7 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled match");
         assert!(!match_backend.capabilities().supports_native_bit_prediction);
         assert!(match_backend.capabilities().supports_byte_prefix_mass);
-        assert!(!match_backend.capabilities().ac_prefers_bitwise);
+        assert!(!match_backend.capabilities().supports_reversible_bit_updates);
     }
 
     #[cfg(feature = "backend-zpaq")]
@@ -224,7 +345,79 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled zpaq");
         assert!(!zpaq.capabilities().supports_native_bit_prediction);
         assert!(zpaq.capabilities().supports_byte_prefix_mass);
-        assert!(!zpaq.capabilities().ac_prefers_bitwise);
+        assert!(!zpaq.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(feature = "backend-mixture")]
+    {
+        let mixture = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 })],
+            )),
+        }
+        .compile()
+        .expect("compiled mixture");
+        assert!(mixture.capabilities().supports_native_bit_prediction);
+        assert!(mixture.capabilities().supports_byte_prefix_mass);
+        assert!(mixture.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(all(feature = "backend-mixture", feature = "backend-match"))]
+    {
+        let mixture = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![MixtureExpertSpec::new(RateBackend::Match {
+                    hash_bits: 20,
+                    min_len: 4,
+                    max_len: 255,
+                    base_mix: 0.02,
+                    confidence_scale: 1.0,
+                })],
+            )),
+        }
+        .compile()
+        .expect("compiled byte-native mixture");
+        assert!(!mixture.capabilities().supports_native_bit_prediction);
+        assert!(mixture.capabilities().supports_byte_prefix_mass);
+        assert!(!mixture.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(feature = "backend-calibrated")]
+    {
+        let calibrated = RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec::new(
+                RateBackend::Ctw { depth: 6 },
+                CalibrationContextKind::Global,
+            )),
+        }
+        .compile()
+        .expect("compiled calibrated");
+        assert!(calibrated.capabilities().supports_native_bit_prediction);
+        assert!(calibrated.capabilities().supports_byte_prefix_mass);
+        assert!(calibrated.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-match"))]
+    {
+        let calibrated = RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec::new(
+                RateBackend::Match {
+                    hash_bits: 20,
+                    min_len: 4,
+                    max_len: 255,
+                    base_mix: 0.02,
+                    confidence_scale: 1.0,
+                },
+                CalibrationContextKind::Global,
+            )),
+        }
+        .compile()
+        .expect("compiled byte-native calibrated");
+        assert!(!calibrated.capabilities().supports_native_bit_prediction);
+        assert!(calibrated.capabilities().supports_byte_prefix_mass);
+        assert!(!calibrated.capabilities().supports_reversible_bit_updates);
     }
 }
 

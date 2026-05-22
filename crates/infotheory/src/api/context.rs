@@ -47,8 +47,9 @@ pub struct RateBackendSession {
 /// through a lazy prefix-mass view. They therefore require whole-byte stream
 /// boundaries: `total_bits`, when provided, must be a multiple of `8`, and
 /// `finish` must not leave a dangling partial byte. Binary-token sessions model
-/// each bit as the literal byte symbol `0` or `1`, so they support arbitrary
-/// bit lengths directly.
+/// each bit either through the backend's native binary-token application or,
+/// for byte-native backends, by adapting the predictor to the literal byte
+/// symbols `0` and `1` and renormalizing those two choices.
 pub struct RateBackendBitSession {
     predictor: crate::mixture::RateBackendPredictor,
     semantics: BitStreamSemantics,
@@ -87,19 +88,26 @@ impl RateBackendBitSession {
         total_bits: Option<u64>,
         semantics: BitStreamSemantics,
     ) -> InfotheoryResult<Self> {
-        let backend = if matches!(semantics, BitStreamSemantics::BinaryTokens)
-            && backend.supports_bit_token_adaptation()
-        {
-            backend
-                .adapt_for_bit_tokens()
-                .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))?
-        } else {
-            backend
-        };
         let total_symbols = total_symbols_for_bit_semantics(total_bits, semantics)
             .map_err(InfotheoryError::runtime)?;
-        let mut predictor = crate::runtime::build_rate_backend_predictor_default(&backend)
-            .map_err(InfotheoryError::invalid_backend_config)?;
+        let mut predictor = match semantics {
+            BitStreamSemantics::BinaryTokens => {
+                crate::runtime::build_rate_backend_binary_token_predictor(
+                    &backend,
+                    crate::mixture::DEFAULT_MIN_PROB,
+                )
+            }
+            BitStreamSemantics::BytePacked { .. } => {
+                if !backend.supports_byte_prefix_mass() {
+                    return Err(InfotheoryError::invalid_backend_config(format!(
+                        "backend '{}' does not support BitStreamSemantics::BytePacked",
+                        backend.canonical_name()
+                    )));
+                }
+                crate::runtime::build_rate_backend_predictor_default(&backend)
+            }
+        }
+        .map_err(InfotheoryError::invalid_backend_config)?;
         predictor
             .begin_stream(total_symbols)
             .map_err(InfotheoryError::runtime)?;
@@ -201,8 +209,7 @@ impl RateBackendBitSession {
 
     /// Finalize the underlying stream if the backend needs it.
     pub fn finish(&mut self) -> InfotheoryResult<()> {
-        if matches!(self.semantics, BitStreamSemantics::BytePacked { .. })
-            && self.prefix.is_some()
+        if matches!(self.semantics, BitStreamSemantics::BytePacked { .. }) && self.prefix.is_some()
         {
             return Err(InfotheoryError::runtime(
                 "byte-packed bit streams must finish on a whole-byte boundary; use BitStreamSemantics::BinaryTokens for arbitrary-length bit streams",
@@ -219,9 +226,18 @@ impl RateBackendBitSession {
         }
         let mut logps = [0.0f64; 256];
         self.predictor.fill_log_probs(&mut logps);
+        let max_log = logps
+            .iter()
+            .copied()
+            .filter(|lp| lp.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
         let mut pdf = [0.0f64; 256];
         for (dst, &lp) in pdf.iter_mut().zip(logps.iter()) {
-            *dst = if lp.is_finite() { lp.exp() } else { 0.0 };
+            *dst = if max_log.is_finite() && lp.is_finite() {
+                (lp - max_log).exp()
+            } else {
+                0.0
+            };
         }
         self.prefix = Some(BytePrefixMass::from_pdf(&pdf, order));
     }

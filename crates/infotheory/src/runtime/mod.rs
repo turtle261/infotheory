@@ -8,7 +8,7 @@ use crate::api::{CompressionBackend, RateBackend};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
-use crate::backends::ctw::{ContextTree, FacContextTree};
+use crate::backends::ctw::{ContextTree, FacContextTree, ctw_symbol_bit_msb};
 #[cfg(feature = "backend-match")]
 use crate::backends::match_model::MatchModel;
 #[cfg(feature = "backend-particle")]
@@ -124,6 +124,53 @@ macro_rules! backend_feature_enabled {
     };
 }
 
+macro_rules! feature_gated_kernel_ptr_anchor {
+    ($feature:literal, $ptr_type:ident, $func:path, fn fallback $args:tt $(-> $ret:ty)? $body:block) => {
+        {
+            #[cfg(feature = $feature)]
+            { $func as $ptr_type }
+            #[cfg(not(feature = $feature))]
+            {
+                #[allow(dead_code)]
+                fn reachability_anchor() {
+                    let _ = $func as $ptr_type;
+                }
+                fn fallback $args $(-> $ret)? $body
+                fallback as $ptr_type
+            }
+        }
+    };
+    (none, $ptr_type:ident, $func:path, fn fallback $args:tt $(-> $ret:ty)? $body:block) => {
+        $func as $ptr_type
+    };
+}
+
+macro_rules! feature_gated_kernel_ptr_drop {
+    ($feature:literal, $ptr_type:ident, $func:path, fn fallback $args:tt $(-> $ret:ty)? $body:block) => {
+        {
+            #[cfg(feature = $feature)]
+            { $func as $ptr_type }
+            #[cfg(not(feature = $feature))]
+            {
+                fn fallback $args $(-> $ret)? $body
+                fallback as $ptr_type
+            }
+        }
+    };
+    (none, $ptr_type:ident, $func:path, fn fallback $args:tt $(-> $ret:ty)? $body:block) => {
+        $func as $ptr_type
+    };
+}
+
+macro_rules! feature_gated_kernel_ptr_mode {
+    (anchor, $feature:tt, $ptr_type:ident, $func:path, fn fallback $args:tt $(-> $ret:ty)? $body:block) => {
+        feature_gated_kernel_ptr_anchor!($feature, $ptr_type, $func, fn fallback $args $(-> $ret)? $body)
+    };
+    (drop, $feature:tt, $ptr_type:ident, $func:path, fn fallback $args:tt $(-> $ret:ty)? $body:block) => {
+        feature_gated_kernel_ptr_drop!($feature, $ptr_type, $func, fn fallback $args $(-> $ret)? $body)
+    };
+}
+
 /// Shared declarative catalog for rate-backend metadata and runtime wiring.
 ///
 /// Adding a new rate backend should require:
@@ -139,6 +186,8 @@ macro_rules! define_rate_backend_catalog {
             canonical: $canonical:literal,
             aliases: [$($alias:literal),* $(,)?],
             feature: $feature:tt,
+            spec_helper_refs: $spec_helper_refs:ident,
+            metric_helper_refs: $metric_helper_refs:ident,
             compile_plan: $compile_plan:path,
             to_wrapper: $to_wrapper:path,
             encode_payload: $encode_payload:path,
@@ -148,11 +197,13 @@ macro_rules! define_rate_backend_catalog {
             supports_biased_entropy: $supports_biased_entropy:expr,
             supports_frozen_conditioning: $supports_frozen_conditioning:expr,
             supports_rate_coded_compression: $supports_rate_coded_compression:expr,
+            supports_native_bit_prediction: $supports_native_bit_prediction:path,
+            supports_byte_prefix_mass: $supports_byte_prefix_mass:path,
+            supports_reversible_bit_updates: $supports_reversible_bit_updates:path,
             method_family: $method_family:expr,
             contains_zpaq: $contains_zpaq:path,
-            supports_bit_token_adaptation: $supports_bit_token_adaptation:path,
-            adapt_for_bit_tokens: $adapt_for_bit_tokens:path,
             build_predictor: $build_predictor:path,
+            build_binary_token_predictor: $build_binary_token_predictor:path,
             build_pdf_predictor: $build_pdf_predictor:path,
             entropy_rate: $entropy_rate:path,
             joint_entropy_rate: $joint_entropy_rate:path,
@@ -176,24 +227,104 @@ macro_rules! define_rate_backend_catalog {
             $(
                 RateBackendKernel {
                     kind: RateBackendKind::$kind,
-                    compile_plan: $compile_plan,
-                    to_wrapper: $to_wrapper,
-                    encode_payload: $encode_payload,
-                    display_label: $display_label,
-                    default_name: $default_name,
+                    compile_plan: feature_gated_kernel_ptr_mode!(
+                        $spec_helper_refs,
+                        $feature, RatePlanCompiler, $compile_plan,
+                        fn fallback(_b: &RateBackend, _e: &SpecEnvironment, _d: usize) -> SpecResult<RateBackendPlan> {
+                            unreachable!("kernel should never compile without its feature")
+                        }
+                    ),
+                    to_wrapper: feature_gated_kernel_ptr_mode!(
+                        $spec_helper_refs,
+                        $feature, RateWrapperBuilder, $to_wrapper,
+                        fn fallback(_p: &RateBackendPlan) -> RateBackend {
+                            unreachable!("kernel should never emit a wrapper without its feature")
+                        }
+                    ),
+                    encode_payload: feature_gated_kernel_ptr_mode!(
+                        $spec_helper_refs,
+                        $feature, RatePayloadEncoder, $encode_payload,
+                        fn fallback(_p: &RateBackendPlan, _o: &mut Vec<u8>) {
+                            unreachable!("kernel should never encode payload without its feature")
+                        }
+                    ),
+                    display_label: feature_gated_kernel_ptr_mode!(
+                        $spec_helper_refs,
+                        $feature, RateDisplayLabelFn, $display_label,
+                        fn fallback(_p: &RateBackendPlan) -> String {
+                            unreachable!("kernel should never format a label without its feature")
+                        }
+                    ),
+                    default_name: feature_gated_kernel_ptr_mode!(
+                        $spec_helper_refs,
+                        $feature, RateDefaultNameFn, $default_name,
+                        fn fallback(_p: &RateBackendPlan) -> String {
+                            unreachable!("kernel should never format a default name without its feature")
+                        }
+                    ),
                     trace_strategy: $trace_strategy,
                     supports_biased_entropy: $supports_biased_entropy,
                     supports_frozen_conditioning: $supports_frozen_conditioning,
                     supports_rate_coded_compression: $supports_rate_coded_compression,
+                    supports_native_bit_prediction: feature_gated_kernel_ptr_anchor!(
+                        $feature, RateCapabilityFn, $supports_native_bit_prediction,
+                        fn fallback(_p: &RateBackendPlan) -> bool {
+                            false
+                        }
+                    ),
+                    supports_byte_prefix_mass: feature_gated_kernel_ptr_anchor!(
+                        $feature, RateCapabilityFn, $supports_byte_prefix_mass,
+                        fn fallback(_p: &RateBackendPlan) -> bool {
+                            false
+                        }
+                    ),
+                    supports_reversible_bit_updates: feature_gated_kernel_ptr_anchor!(
+                        $feature, RateCapabilityFn, $supports_reversible_bit_updates,
+                        fn fallback(_p: &RateBackendPlan) -> bool {
+                            false
+                        }
+                    ),
                     method_family: $method_family,
                     contains_zpaq: $contains_zpaq,
-                    supports_bit_token_adaptation: $supports_bit_token_adaptation,
-                    adapt_for_bit_tokens: $adapt_for_bit_tokens,
-                    build_predictor: $build_predictor,
-                    build_pdf_predictor: $build_pdf_predictor,
-                    entropy_rate: $entropy_rate,
-                    joint_entropy_rate: $joint_entropy_rate,
-                    conditional_chain_rate: $conditional_chain_rate,
+                    build_predictor: feature_gated_kernel_ptr_drop!(
+                        $feature, RateBackendPredictorBuilder, $build_predictor,
+                        fn fallback(_b: &CompiledRateBackend, _p: f64) -> Result<crate::mixture::RateBackendPredictor, String> {
+                            Err(registry::rate_backend_feature_error(RateBackendKind::$kind))
+                        }
+                    ),
+                    build_binary_token_predictor: feature_gated_kernel_ptr_drop!(
+                        $feature, RateBackendBinaryTokenPredictorBuilder, $build_binary_token_predictor,
+                        fn fallback(_b: &CompiledRateBackend, _p: f64) -> Result<crate::mixture::RateBackendPredictor, String> {
+                            Err(registry::rate_backend_feature_error(RateBackendKind::$kind))
+                        }
+                    ),
+                    build_pdf_predictor: feature_gated_kernel_ptr_drop!(
+                        $feature, RatePdfPredictorBuilder, $build_pdf_predictor,
+                        fn fallback(_b: &CompiledRateBackend) -> anyhow::Result<crate::compression::RatePdfPredictor> {
+                            Err(anyhow::anyhow!(registry::rate_backend_feature_error(RateBackendKind::$kind)))
+                        }
+                    ),
+                    entropy_rate: feature_gated_kernel_ptr_mode!(
+                        $metric_helper_refs,
+                        $feature, RateEntropyFn, $entropy_rate,
+                        fn fallback(_d: &[u8], _b: &CompiledRateBackend) -> InfotheoryResult<f64> {
+                            Err(InfotheoryError::unsupported(registry::rate_backend_feature_error(RateBackendKind::$kind)))
+                        }
+                    ),
+                    joint_entropy_rate: feature_gated_kernel_ptr_mode!(
+                        $metric_helper_refs,
+                        $feature, RateJointEntropyFn, $joint_entropy_rate,
+                        fn fallback(_x: &[u8], _y: &[u8], _b: &CompiledRateBackend) -> InfotheoryResult<f64> {
+                            Err(InfotheoryError::unsupported(registry::rate_backend_feature_error(RateBackendKind::$kind)))
+                        }
+                    ),
+                    conditional_chain_rate: feature_gated_kernel_ptr_mode!(
+                        $metric_helper_refs,
+                        $feature, RateConditionalChainFn, $conditional_chain_rate,
+                        fn fallback(_p: &[&[u8]], _d: &[u8], _b: &CompiledRateBackend) -> InfotheoryResult<f64> {
+                            Err(InfotheoryError::unsupported(registry::rate_backend_feature_error(RateBackendKind::$kind)))
+                        }
+                    ),
                 },
             )*
         ];
@@ -208,6 +339,7 @@ macro_rules! define_compression_backend_catalog {
             canonical: $canonical:literal,
             aliases: [$($alias:literal),* $(,)?],
             feature: $feature:tt,
+            helper_refs: $helper_refs:ident,
             compile_plan: $compile_plan:path,
             to_wrapper: $to_wrapper:path,
             encode_payload: $encode_payload:path,
@@ -234,13 +366,43 @@ macro_rules! define_compression_backend_catalog {
             $(
                 CompressionBackendKernel {
                     kind: CompressionBackendKind::$kind,
-                    compile_plan: $compile_plan,
-                    to_wrapper: $to_wrapper,
-                    encode_payload: $encode_payload,
-                    display_label: $display_label,
+                    compile_plan: feature_gated_kernel_ptr_mode!(
+                        $helper_refs,
+                        $feature, CompressionPlanCompiler, $compile_plan,
+                        fn fallback(_b: &CompressionBackend, _e: &SpecEnvironment) -> SpecResult<CompressionBackendPlan> {
+                            unreachable!("compression kernel should never compile without its feature")
+                        }
+                    ),
+                    to_wrapper: feature_gated_kernel_ptr_mode!(
+                        $helper_refs,
+                        $feature, CompressionWrapperBuilder, $to_wrapper,
+                        fn fallback(_p: &CompressionBackendPlan) -> CompressionBackend {
+                            unreachable!("compression kernel should never emit a wrapper without its feature")
+                        }
+                    ),
+                    encode_payload: feature_gated_kernel_ptr_mode!(
+                        $helper_refs,
+                        $feature, CompressionPayloadEncoder, $encode_payload,
+                        fn fallback(_p: &CompressionBackendPlan, _o: &mut Vec<u8>) {
+                            unreachable!("compression kernel should never encode payload without its feature")
+                        }
+                    ),
+                    display_label: feature_gated_kernel_ptr_mode!(
+                        $helper_refs,
+                        $feature, CompressionDisplayLabelFn, $display_label,
+                        fn fallback(_p: &CompressionBackendPlan) -> String {
+                            unreachable!("compression kernel should never format a label without its feature")
+                        }
+                    ),
                     uses_rate_backend: $uses_rate_backend,
                     supports_decompression: $supports_decompression,
-                    build_runtime: $build_runtime,
+                    build_runtime: feature_gated_kernel_ptr_mode!(
+                        $helper_refs,
+                        $feature, CompressionRuntimeBuilder, $build_runtime,
+                        fn fallback(_b: &CompiledCompressionBackend) -> Result<CompressionRuntimeHandle, String> {
+                            Err(registry::compression_backend_feature_error(CompressionBackendKind::$kind))
+                        }
+                    ),
                 },
             )*
         ];
@@ -248,6 +410,8 @@ macro_rules! define_compression_backend_catalog {
 }
 
 type RateBackendPredictorBuilder =
+    fn(&CompiledRateBackend, f64) -> Result<crate::mixture::RateBackendPredictor, String>;
+type RateBackendBinaryTokenPredictorBuilder =
     fn(&CompiledRateBackend, f64) -> Result<crate::mixture::RateBackendPredictor, String>;
 type RatePdfPredictorBuilder =
     fn(&CompiledRateBackend) -> anyhow::Result<crate::compression::RatePdfPredictor>;
@@ -259,9 +423,8 @@ type RateWrapperBuilder = fn(&RateBackendPlan) -> RateBackend;
 type RatePayloadEncoder = fn(&RateBackendPlan, &mut Vec<u8>);
 type RateDisplayLabelFn = fn(&RateBackendPlan) -> String;
 type RateDefaultNameFn = fn(&RateBackendPlan) -> String;
+type RateCapabilityFn = fn(&RateBackendPlan) -> bool;
 type RateContainsZpaqFn = fn(&RateBackendPlan) -> bool;
-type RateSupportsBitTokenAdaptationFn = fn(&RateBackendPlan) -> bool;
-type RateBitTokenAdapter = fn(&RateBackendPlan) -> RateBackendPlan;
 type CompressionRuntimeBuilder =
     fn(&CompiledCompressionBackend) -> Result<CompressionRuntimeHandle, String>;
 type CompressionPlanCompiler =
@@ -282,11 +445,13 @@ pub(crate) struct RateBackendKernel {
     pub supports_biased_entropy: bool,
     pub supports_frozen_conditioning: bool,
     pub supports_rate_coded_compression: bool,
+    pub supports_native_bit_prediction: RateCapabilityFn,
+    pub supports_byte_prefix_mass: RateCapabilityFn,
+    pub supports_reversible_bit_updates: RateCapabilityFn,
     pub method_family: Option<MethodBackendFamily>,
     pub contains_zpaq: RateContainsZpaqFn,
-    pub supports_bit_token_adaptation: RateSupportsBitTokenAdaptationFn,
-    pub adapt_for_bit_tokens: RateBitTokenAdapter,
     pub build_predictor: RateBackendPredictorBuilder,
+    pub build_binary_token_predictor: RateBackendBinaryTokenPredictorBuilder,
     pub build_pdf_predictor: RatePdfPredictorBuilder,
     pub entropy_rate: RateEntropyFn,
     pub joint_entropy_rate: RateJointEntropyFn,
@@ -311,6 +476,8 @@ define_rate_backend_catalog! {
         canonical: "rosaplus",
         aliases: ["rosaplus", "rosa"],
         feature: "backend-rosa",
+        spec_helper_refs: anchor,
+        metric_helper_refs: drop,
         compile_plan: crate::spec::core::compile_rate_plan_rosa,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_rosa,
         encode_payload: crate::spec::core::encode_rate_payload_rosa,
@@ -320,11 +487,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
         build_predictor: predictor_builders::build_predictor_rosa,
+        build_binary_token_predictor: predictor_builders::build_predictor_rosa,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_rosa,
         entropy_rate: entropy_rosa,
         joint_entropy_rate: joint_entropy_rosa,
@@ -335,6 +504,8 @@ define_rate_backend_catalog! {
         canonical: "match",
         aliases: ["match"],
         feature: "backend-match",
+        spec_helper_refs: anchor,
+        metric_helper_refs: anchor,
         compile_plan: crate::spec::core::compile_rate_plan_match,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_match,
         encode_payload: crate::spec::core::encode_rate_payload_match,
@@ -344,11 +515,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
         build_predictor: predictor_builders::build_predictor_match,
+        build_binary_token_predictor: predictor_builders::build_predictor_match,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_match,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
@@ -359,6 +532,8 @@ define_rate_backend_catalog! {
         canonical: "sparse-match",
         aliases: ["sparse-match"],
         feature: "backend-match",
+        spec_helper_refs: anchor,
+        metric_helper_refs: anchor,
         compile_plan: crate::spec::core::compile_rate_plan_sparse_match,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_sparse_match,
         encode_payload: crate::spec::core::encode_rate_payload_sparse_match,
@@ -368,11 +543,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
         build_predictor: predictor_builders::build_predictor_sparse_match,
+        build_binary_token_predictor: predictor_builders::build_predictor_sparse_match,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_sparse_match,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
@@ -383,6 +560,8 @@ define_rate_backend_catalog! {
         canonical: "ppmd",
         aliases: ["ppmd"],
         feature: "backend-ppmd",
+        spec_helper_refs: anchor,
+        metric_helper_refs: anchor,
         compile_plan: crate::spec::core::compile_rate_plan_ppmd,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_ppmd,
         encode_payload: crate::spec::core::encode_rate_payload_ppmd,
@@ -392,11 +571,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
         build_predictor: predictor_builders::build_predictor_ppmd,
+        build_binary_token_predictor: predictor_builders::build_predictor_ppmd,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_ppmd,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
@@ -407,6 +588,8 @@ define_rate_backend_catalog! {
         canonical: "sequitur",
         aliases: ["sequitur"],
         feature: "backend-sequitur",
+        spec_helper_refs: anchor,
+        metric_helper_refs: anchor,
         compile_plan: crate::spec::core::compile_rate_plan_sequitur,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_sequitur,
         encode_payload: crate::spec::core::encode_rate_payload_sequitur,
@@ -416,11 +599,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
         build_predictor: predictor_builders::build_predictor_sequitur,
+        build_binary_token_predictor: predictor_builders::build_predictor_sequitur,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_sequitur,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
@@ -431,6 +616,8 @@ define_rate_backend_catalog! {
         canonical: "ctw",
         aliases: ["ctw", "ac-ctw"],
         feature: "backend-ctw",
+        spec_helper_refs: anchor,
+        metric_helper_refs: drop,
         compile_plan: crate::spec::core::compile_rate_plan_ctw,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_ctw,
         encode_payload: crate::spec::core::encode_rate_payload_ctw,
@@ -440,11 +627,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_true,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_true,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_ctw,
         build_predictor: predictor_builders::build_predictor_ctw,
+        build_binary_token_predictor: predictor_builders::build_predictor_binary_tokens_ctw,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_ctw,
         entropy_rate: entropy_ctw,
         joint_entropy_rate: joint_entropy_ctw,
@@ -455,6 +644,8 @@ define_rate_backend_catalog! {
         canonical: "fac-ctw",
         aliases: ["fac-ctw"],
         feature: "backend-ctw",
+        spec_helper_refs: anchor,
+        metric_helper_refs: drop,
         compile_plan: crate::spec::core::compile_rate_plan_fac_ctw,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_fac_ctw,
         encode_payload: crate::spec::core::encode_rate_payload_fac_ctw,
@@ -464,11 +655,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_true,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_true,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_fac_ctw,
         build_predictor: predictor_builders::build_predictor_fac_ctw,
+        build_binary_token_predictor: predictor_builders::build_predictor_binary_tokens_fac_ctw,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_fac_ctw,
         entropy_rate: entropy_fac_ctw,
         joint_entropy_rate: joint_entropy_fac_ctw,
@@ -479,6 +672,8 @@ define_rate_backend_catalog! {
         canonical: "zpaq",
         aliases: ["zpaq"],
         feature: "backend-zpaq",
+        spec_helper_refs: anchor,
+        metric_helper_refs: drop,
         compile_plan: crate::spec::core::compile_rate_plan_zpaq,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_zpaq,
         encode_payload: crate::spec::core::encode_rate_payload_zpaq,
@@ -488,11 +683,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: false,
         supports_frozen_conditioning: false,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_true,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_false,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
         build_predictor: predictor_builders::build_predictor_zpaq,
+        build_binary_token_predictor: predictor_builders::build_predictor_zpaq,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_zpaq,
         entropy_rate: entropy_zpaq,
         joint_entropy_rate: joint_entropy_zpaq,
@@ -503,6 +700,8 @@ define_rate_backend_catalog! {
         canonical: "mixture",
         aliases: ["mixture"],
         feature: "backend-mixture",
+        spec_helper_refs: anchor,
+        metric_helper_refs: drop,
         compile_plan: crate::spec::core::compile_rate_plan_mixture,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_mixture,
         encode_payload: crate::spec::core::encode_rate_payload_mixture,
@@ -512,11 +711,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::mixture_supports_native_bit_prediction,
+        supports_byte_prefix_mass: crate::runtime::mixture_supports_byte_prefix_mass,
+        supports_reversible_bit_updates: crate::runtime::mixture_supports_reversible_bit_updates,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_mixture,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_mixture,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_mixture,
         build_predictor: predictor_builders::build_predictor_mixture,
+        build_binary_token_predictor: predictor_builders::build_predictor_binary_tokens_mixture,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_mixture,
         entropy_rate: entropy_mixture,
         joint_entropy_rate: joint_entropy_mixture,
@@ -527,6 +728,8 @@ define_rate_backend_catalog! {
         canonical: "particle",
         aliases: ["particle"],
         feature: "backend-particle",
+        spec_helper_refs: anchor,
+        metric_helper_refs: drop,
         compile_plan: crate::spec::core::compile_rate_plan_particle,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_particle,
         encode_payload: crate::spec::core::encode_rate_payload_particle,
@@ -536,11 +739,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
         build_predictor: predictor_builders::build_predictor_particle,
+        build_binary_token_predictor: predictor_builders::build_predictor_particle,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_particle,
         entropy_rate: entropy_particle,
         joint_entropy_rate: joint_entropy_particle,
@@ -551,6 +756,8 @@ define_rate_backend_catalog! {
         canonical: "calibrated",
         aliases: ["calibrated"],
         feature: "backend-calibrated",
+        spec_helper_refs: anchor,
+        metric_helper_refs: anchor,
         compile_plan: crate::spec::core::compile_rate_plan_calibrated,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_calibrated,
         encode_payload: crate::spec::core::encode_rate_payload_calibrated,
@@ -560,11 +767,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::calibrated_supports_native_bit_prediction,
+        supports_byte_prefix_mass: crate::runtime::calibrated_supports_byte_prefix_mass,
+        supports_reversible_bit_updates: crate::runtime::calibrated_supports_reversible_bit_updates,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_calibrated,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_calibrated,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_calibrated,
         build_predictor: predictor_builders::build_predictor_calibrated,
+        build_binary_token_predictor: predictor_builders::build_predictor_binary_tokens_calibrated,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_calibrated,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
@@ -575,6 +784,8 @@ define_rate_backend_catalog! {
         canonical: "mamba",
         aliases: ["mamba"],
         feature: "backend-mamba",
+        spec_helper_refs: drop,
+        metric_helper_refs: drop,
         compile_plan: crate::spec::core::compile_rate_plan_mamba,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_mamba,
         encode_payload: crate::spec::core::encode_rate_payload_mamba,
@@ -584,11 +795,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: Some(MethodBackendFamily::Mamba),
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
         build_predictor: predictor_builders::build_predictor_mamba,
+        build_binary_token_predictor: predictor_builders::build_predictor_mamba,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_mamba,
         entropy_rate: entropy_mamba,
         joint_entropy_rate: joint_entropy_mamba,
@@ -599,6 +812,8 @@ define_rate_backend_catalog! {
         canonical: "rwkv7",
         aliases: ["rwkv7"],
         feature: "backend-rwkv",
+        spec_helper_refs: drop,
+        metric_helper_refs: drop,
         compile_plan: crate::spec::core::compile_rate_plan_rwkv7,
         to_wrapper: crate::spec::core::rate_plan_to_wrapper_rwkv7,
         encode_payload: crate::spec::core::encode_rate_payload_rwkv7,
@@ -608,11 +823,13 @@ define_rate_backend_catalog! {
         supports_biased_entropy: true,
         supports_frozen_conditioning: true,
         supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: Some(MethodBackendFamily::Rwkv7),
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
-        supports_bit_token_adaptation: crate::spec::core::rate_plan_supports_bit_token_adaptation_true,
-        adapt_for_bit_tokens: crate::spec::core::adapt_rate_plan_identity,
         build_predictor: predictor_builders::build_predictor_rwkv,
+        build_binary_token_predictor: predictor_builders::build_predictor_rwkv,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_rwkv,
         entropy_rate: entropy_rwkv,
         joint_entropy_rate: joint_entropy_rwkv,
@@ -626,6 +843,7 @@ define_compression_backend_catalog! {
         canonical: "zpaq",
         aliases: ["zpaq"],
         feature: "backend-zpaq",
+        helper_refs: anchor,
         compile_plan: crate::spec::core::compile_compression_plan_zpaq,
         to_wrapper: crate::spec::core::compression_plan_to_wrapper_zpaq,
         encode_payload: crate::spec::core::encode_compression_payload_zpaq,
@@ -639,6 +857,7 @@ define_compression_backend_catalog! {
         canonical: "rwkv7",
         aliases: ["rwkv7"],
         feature: "backend-rwkv",
+        helper_refs: drop,
         compile_plan: crate::spec::core::compile_compression_plan_rwkv7,
         to_wrapper: crate::spec::core::compression_plan_to_wrapper_rwkv7,
         encode_payload: crate::spec::core::encode_compression_payload_rwkv7,
@@ -652,6 +871,7 @@ define_compression_backend_catalog! {
         canonical: "rate-ac",
         aliases: ["rate-ac"],
         feature: none,
+        helper_refs: anchor,
         compile_plan: crate::spec::core::compile_compression_plan_rate,
         to_wrapper: crate::spec::core::compression_plan_to_wrapper_rate,
         encode_payload: crate::spec::core::encode_compression_payload_rate,
@@ -665,6 +885,7 @@ define_compression_backend_catalog! {
         canonical: "rate-rans",
         aliases: ["rate-rans"],
         feature: none,
+        helper_refs: anchor,
         compile_plan: crate::spec::core::compile_compression_plan_rate,
         to_wrapper: crate::spec::core::compression_plan_to_wrapper_rate,
         encode_payload: crate::spec::core::encode_compression_payload_rate,
@@ -777,42 +998,12 @@ pub(crate) fn rate_backend_capabilities_via_kernel(
         supports_biased_entropy: kernel.supports_biased_entropy,
         supports_frozen_conditioning: kernel.supports_frozen_conditioning,
         supports_rate_coded_compression: kernel.supports_rate_coded_compression,
-        supports_bit_token_adaptation: (kernel.supports_bit_token_adaptation)(plan),
-        supports_native_bit_prediction: rate_plan_supports_native_bit_prediction(plan),
-        supports_byte_prefix_mass: rate_plan_supports_byte_prefix_mass(plan),
-        supports_reversible_bit_updates: false,
-        ac_prefers_bitwise: rate_plan_prefers_ac_bitwise(plan),
+        supports_native_bit_prediction: (kernel.supports_native_bit_prediction)(plan),
+        supports_byte_prefix_mass: (kernel.supports_byte_prefix_mass)(plan),
+        supports_reversible_bit_updates: (kernel.supports_reversible_bit_updates)(plan),
         contains_zpaq: (kernel.contains_zpaq)(plan),
         method_family: kernel.method_family,
     }
-}
-
-fn rate_plan_supports_native_bit_prediction(plan: &RateBackendPlan) -> bool {
-    match plan {
-        #[cfg(feature = "backend-ctw")]
-        RateBackendPlan::Ctw { .. } | RateBackendPlan::FacCtw { .. } => true,
-        RateBackendPlan::Mixture { experts, .. } => experts
-            .iter()
-            .all(|expert| rate_plan_supports_native_bit_prediction(expert.backend.as_ref())),
-        RateBackendPlan::Calibrated { base, .. } => {
-            rate_plan_supports_native_bit_prediction(base.as_ref())
-        }
-        _ => false,
-    }
-}
-
-fn rate_plan_supports_byte_prefix_mass(plan: &RateBackendPlan) -> bool {
-    match plan {
-        RateBackendPlan::Mixture { experts, .. } => experts
-            .iter()
-            .all(|expert| rate_plan_supports_byte_prefix_mass(expert.backend.as_ref())),
-        RateBackendPlan::Calibrated { base, .. } => rate_plan_supports_byte_prefix_mass(base),
-        _ => rate_backend_kernel(plan.kind()).supports_rate_coded_compression,
-    }
-}
-
-fn rate_plan_prefers_ac_bitwise(plan: &RateBackendPlan) -> bool {
-    rate_plan_supports_native_bit_prediction(plan)
 }
 
 pub(crate) fn compression_backend_capabilities_via_kernel(
@@ -825,12 +1016,6 @@ pub(crate) fn compression_backend_capabilities_via_kernel(
         uses_rate_backend: kernel.uses_rate_backend,
         supports_decompression: kernel.supports_decompression,
     }
-}
-
-pub(crate) fn adapt_rate_backend_for_bit_tokens_via_kernel(
-    plan: &RateBackendPlan,
-) -> RateBackendPlan {
-    (rate_backend_kernel(plan.kind()).adapt_for_bit_tokens)(plan)
 }
 
 #[cfg(feature = "vm")]
@@ -1033,13 +1218,6 @@ fn entropy_rosa(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<
     Ok(model.predictive_entropy_rate(data))
 }
 
-#[cfg(not(feature = "backend-rosa"))]
-fn entropy_rosa(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::RosaPlus),
-    ))
-}
-
 #[cfg(feature = "backend-rosa")]
 fn joint_entropy_rosa(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     if x.is_empty() || y.is_empty() {
@@ -1055,17 +1233,7 @@ fn joint_entropy_rosa(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> Info
     Ok(model.entropy_rate_cps(&joint_symbols))
 }
 
-#[cfg(not(feature = "backend-rosa"))]
-fn joint_entropy_rosa(
-    _x: &[u8],
-    _y: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::RosaPlus),
-    ))
-}
-
+#[cfg(feature = "backend-rosa")]
 fn conditional_chain_rosa(
     prefix_parts: &[&[u8]],
     data: &[u8],
@@ -1085,13 +1253,6 @@ fn entropy_rwkv(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<
     })
 }
 
-#[cfg(not(feature = "backend-rwkv"))]
-fn entropy_rwkv(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Rwkv7),
-    ))
-}
-
 #[cfg(feature = "backend-rwkv")]
 fn joint_entropy_rwkv(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     with_rwkv_backend_plan(backend, |method, parsed_method| {
@@ -1103,17 +1264,6 @@ fn joint_entropy_rwkv(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> Info
             })
         })
     })
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-fn joint_entropy_rwkv(
-    _x: &[u8],
-    _y: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Rwkv7),
-    ))
 }
 
 #[cfg(feature = "backend-rwkv")]
@@ -1134,17 +1284,6 @@ fn conditional_chain_rwkv(
     })
 }
 
-#[cfg(not(feature = "backend-rwkv"))]
-fn conditional_chain_rwkv(
-    _prefix_parts: &[&[u8]],
-    _data: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Rwkv7),
-    ))
-}
-
 #[cfg(feature = "backend-mamba")]
 fn entropy_mamba(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     with_mamba_backend_plan(backend, |method, parsed_method| {
@@ -1154,13 +1293,6 @@ fn entropy_mamba(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult
             })
         })
     })
-}
-
-#[cfg(not(feature = "backend-mamba"))]
-fn entropy_mamba(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Mamba),
-    ))
 }
 
 #[cfg(feature = "backend-mamba")]
@@ -1174,17 +1306,6 @@ fn joint_entropy_mamba(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> Inf
             })
         })
     })
-}
-
-#[cfg(not(feature = "backend-mamba"))]
-fn joint_entropy_mamba(
-    _x: &[u8],
-    _y: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Mamba),
-    ))
 }
 
 #[cfg(feature = "backend-mamba")]
@@ -1205,17 +1326,6 @@ fn conditional_chain_mamba(
     })
 }
 
-#[cfg(not(feature = "backend-mamba"))]
-fn conditional_chain_mamba(
-    _prefix_parts: &[&[u8]],
-    _data: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Mamba),
-    ))
-}
-
 #[cfg(feature = "backend-zpaq")]
 fn entropy_zpaq(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     with_zpaq_backend_plan(backend, |method| {
@@ -1223,27 +1333,9 @@ fn entropy_zpaq(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<
     })
 }
 
-#[cfg(not(feature = "backend-zpaq"))]
-fn entropy_zpaq(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Zpaq),
-    ))
-}
-
 #[cfg(feature = "backend-zpaq")]
 fn joint_entropy_zpaq(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     with_zpaq_backend_plan(backend, |method| zpaq_joint_entropy_rate_bits(method, x, y))
-}
-
-#[cfg(not(feature = "backend-zpaq"))]
-fn joint_entropy_zpaq(
-    _x: &[u8],
-    _y: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Zpaq),
-    ))
 }
 
 #[cfg(feature = "backend-zpaq")]
@@ -1257,27 +1349,9 @@ fn conditional_chain_zpaq(
     })
 }
 
-#[cfg(not(feature = "backend-zpaq"))]
-fn conditional_chain_zpaq(
-    _prefix_parts: &[&[u8]],
-    _data: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Zpaq),
-    ))
-}
-
 #[cfg(feature = "backend-mixture")]
 fn entropy_mixture(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     mixture_entropy_rate_bits(data, backend)
-}
-
-#[cfg(not(feature = "backend-mixture"))]
-fn entropy_mixture(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Mixture),
-    ))
 }
 
 #[cfg(feature = "backend-mixture")]
@@ -1289,17 +1363,6 @@ fn joint_entropy_mixture(
     mixture_joint_entropy_rate_bits(x, y, backend)
 }
 
-#[cfg(not(feature = "backend-mixture"))]
-fn joint_entropy_mixture(
-    _x: &[u8],
-    _y: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Mixture),
-    ))
-}
-
 #[cfg(feature = "backend-mixture")]
 fn conditional_chain_mixture(
     prefix_parts: &[&[u8]],
@@ -1309,29 +1372,11 @@ fn conditional_chain_mixture(
     mixture_conditional_chain_rate_bits(prefix_parts, data, backend)
 }
 
-#[cfg(not(feature = "backend-mixture"))]
-fn conditional_chain_mixture(
-    _prefix_parts: &[&[u8]],
-    _data: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Mixture),
-    ))
-}
-
 #[cfg(feature = "backend-particle")]
 fn entropy_particle(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     with_particle_backend_plan(backend, |spec| {
         particle_stream_entropy_rate_bits(data, spec)
     })
-}
-
-#[cfg(not(feature = "backend-particle"))]
-fn entropy_particle(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Particle),
-    ))
 }
 
 #[cfg(feature = "backend-particle")]
@@ -1341,17 +1386,6 @@ fn joint_entropy_particle(
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
     with_particle_backend_plan(backend, |spec| particle_joint_entropy_rate_bits(x, y, spec))
-}
-
-#[cfg(not(feature = "backend-particle"))]
-fn joint_entropy_particle(
-    _x: &[u8],
-    _y: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Particle),
-    ))
 }
 
 #[cfg(feature = "backend-particle")]
@@ -1365,43 +1399,14 @@ fn conditional_chain_particle(
     })
 }
 
-#[cfg(not(feature = "backend-particle"))]
-fn conditional_chain_particle(
-    _prefix_parts: &[&[u8]],
-    _data: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Particle),
-    ))
-}
-
 #[cfg(feature = "backend-ctw")]
 fn entropy_ctw(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     with_ctw_backend_plan(backend, |depth| ctw_entropy_rate_bits(depth, data))
 }
 
-#[cfg(not(feature = "backend-ctw"))]
-fn entropy_ctw(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Ctw),
-    ))
-}
-
 #[cfg(feature = "backend-ctw")]
 fn joint_entropy_ctw(x: &[u8], y: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     with_ctw_backend_plan(backend, |depth| ctw_joint_entropy_rate_bits(depth, x, y))
-}
-
-#[cfg(not(feature = "backend-ctw"))]
-fn joint_entropy_ctw(
-    _x: &[u8],
-    _y: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Ctw),
-    ))
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -1415,29 +1420,11 @@ fn conditional_chain_ctw(
     })
 }
 
-#[cfg(not(feature = "backend-ctw"))]
-fn conditional_chain_ctw(
-    _prefix_parts: &[&[u8]],
-    _data: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::Ctw),
-    ))
-}
-
 #[cfg(feature = "backend-ctw")]
 fn entropy_fac_ctw(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
     with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits| {
         fac_ctw_entropy_rate_bits(base_depth, encoding_bits, data)
     })
-}
-
-#[cfg(not(feature = "backend-ctw"))]
-fn entropy_fac_ctw(_data: &[u8], _backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::FacCtw),
-    ))
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -1451,17 +1438,6 @@ fn joint_entropy_fac_ctw(
     })
 }
 
-#[cfg(not(feature = "backend-ctw"))]
-fn joint_entropy_fac_ctw(
-    _x: &[u8],
-    _y: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::FacCtw),
-    ))
-}
-
 #[cfg(feature = "backend-ctw")]
 fn conditional_chain_fac_ctw(
     prefix_parts: &[&[u8]],
@@ -1471,17 +1447,6 @@ fn conditional_chain_fac_ctw(
     with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits| {
         fac_ctw_conditional_chain_rate_bits(base_depth, encoding_bits, prefix_parts, data)
     })
-}
-
-#[cfg(not(feature = "backend-ctw"))]
-fn conditional_chain_fac_ctw(
-    _prefix_parts: &[&[u8]],
-    _data: &[u8],
-    _backend: &CompiledRateBackend,
-) -> InfotheoryResult<f64> {
-    Err(InfotheoryError::unsupported(
-        registry::rate_backend_feature_error(RateBackendKind::FacCtw),
-    ))
 }
 
 fn build_compression_runtime_zpaq(
@@ -1508,15 +1473,6 @@ fn build_compression_runtime_rwkv(
     })
 }
 
-#[cfg(not(feature = "backend-rwkv"))]
-fn build_compression_runtime_rwkv(
-    _backend: &CompiledCompressionBackend,
-) -> Result<CompressionRuntimeHandle, String> {
-    Err(registry::compression_backend_feature_error(
-        CompressionBackendKind::Rwkv7,
-    ))
-}
-
 fn build_compression_runtime_rate(
     backend: &CompiledCompressionBackend,
 ) -> Result<CompressionRuntimeHandle, String> {
@@ -1535,6 +1491,13 @@ fn build_rate_backend_predictor_via_kernel(
     min_prob: f64,
 ) -> Result<crate::mixture::RateBackendPredictor, String> {
     (rate_backend_kernel(backend.plan().kind()).build_predictor)(backend, min_prob)
+}
+
+fn build_rate_backend_binary_token_predictor_via_kernel(
+    backend: &CompiledRateBackend,
+    min_prob: f64,
+) -> Result<crate::mixture::RateBackendPredictor, String> {
+    (rate_backend_kernel(backend.plan().kind()).build_binary_token_predictor)(backend, min_prob)
 }
 
 fn build_rate_pdf_predictor_via_kernel(
@@ -1795,6 +1758,19 @@ pub(crate) fn build_rate_backend_predictor_default(
     build_rate_backend_predictor(backend, crate::mixture::DEFAULT_MIN_PROB)
 }
 
+/// Shared spec -> predictor runtime builder for binary-token applications.
+///
+/// Native bit backends expose their true bit-token predictors here. Byte-native
+/// backends are adapted by observing the literal byte symbols `0` and `1`,
+/// with downstream callers normalizing those two log-probabilities into a
+/// binary prediction.
+pub(crate) fn build_rate_backend_binary_token_predictor(
+    backend: &CompiledRateBackend,
+    min_prob: f64,
+) -> Result<crate::mixture::RateBackendPredictor, String> {
+    build_rate_backend_binary_token_predictor_via_kernel(backend, min_prob)
+}
+
 /// Shared spec -> compression predictor runtime builder.
 pub(crate) fn build_rate_pdf_predictor(
     backend: &CompiledRateBackend,
@@ -1983,16 +1959,29 @@ fn particle_joint_entropy_rate_bits(
 }
 
 #[cfg(feature = "backend-ctw")]
+#[inline]
+fn ctw_byte_bit_msb(byte: u8, bit_idx: usize) -> bool {
+    ctw_symbol_bit_msb(byte, 8, bit_idx)
+}
+
+#[cfg(feature = "backend-ctw")]
+#[inline]
+fn ctw_update_byte_msb(tree: &mut ContextTree, byte: u8) {
+    for bit_idx in 0..8usize {
+        tree.update(ctw_byte_bit_msb(byte, bit_idx));
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
 fn ctw_entropy_rate_bits(depth: usize, data: &[u8]) -> InfotheoryResult<f64> {
     if data.is_empty() {
         return Ok(0.0);
     }
-    let mut fac = FacContextTree::new(depth, 8);
-    fac.reserve_for_symbols(data.len());
+    let mut tree = ContextTree::new(depth);
     for &byte in data {
-        fac.update_byte_msb(byte);
+        ctw_update_byte_msb(&mut tree, byte);
     }
-    let ln_p = fac.get_log_block_probability();
+    let ln_p = tree.get_log_block_probability();
     Ok((-ln_p / std::f64::consts::LN_2) / (data.len() as f64))
 }
 
@@ -2017,14 +2006,12 @@ fn fac_ctw_entropy_rate_bits(
 
 #[cfg(feature = "backend-ctw")]
 fn ctw_joint_entropy_rate_bits(depth: usize, x: &[u8], y: &[u8]) -> InfotheoryResult<f64> {
-    let mut fac = FacContextTree::new(depth, 16);
+    let mut tree = ContextTree::new(depth);
     for (&xb, &yb) in x.iter().zip(y.iter()) {
-        for bit_idx in 0..8 {
-            fac.update(((xb >> (7 - bit_idx)) & 1) == 1, bit_idx);
-            fac.update(((yb >> (7 - bit_idx)) & 1) == 1, bit_idx + 8);
-        }
+        ctw_update_byte_msb(&mut tree, xb);
+        ctw_update_byte_msb(&mut tree, yb);
     }
-    let ln_p = fac.get_log_block_probability();
+    let ln_p = tree.get_log_block_probability();
     Ok((-ln_p / std::f64::consts::LN_2) / (x.len() as f64))
 }
 
@@ -2061,16 +2048,12 @@ fn ctw_conditional_chain_rate_bits(
     let mut tree = ContextTree::new(depth);
     for &part in prefix_parts {
         for &byte in part {
-            for idx in (0..8).rev() {
-                tree.update(((byte >> idx) & 1) == 1);
-            }
+            ctw_update_byte_msb(&mut tree, byte);
         }
     }
     let log_p_prefix = tree.get_log_block_probability();
     for &byte in data {
-        for idx in (0..8).rev() {
-            tree.update(((byte >> idx) & 1) == 1);
-        }
+        ctw_update_byte_msb(&mut tree, byte);
     }
     let log_p_joint = tree.get_log_block_probability();
     let bits = -(log_p_joint - log_p_prefix) / std::f64::consts::LN_2;
@@ -2159,16 +2142,91 @@ pub(crate) fn try_cross_entropy_conditional_chain_backend(
     (rate_backend_kernel(backend.plan().kind()).conditional_chain_rate)(prefix_parts, data, backend)
 }
 
+pub(crate) fn capability_always_true(_plan: &crate::spec::core::RateBackendPlan) -> bool {
+    true
+}
+
+pub(crate) fn capability_always_false(_plan: &crate::spec::core::RateBackendPlan) -> bool {
+    false
+}
+
+pub(crate) fn mixture_supports_native_bit_prediction(
+    plan: &crate::spec::core::RateBackendPlan,
+) -> bool {
+    let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = plan else {
+        unreachable!()
+    };
+    experts.iter().all(|e| {
+        (crate::runtime::rate_backend_kernel(e.backend.kind()).supports_native_bit_prediction)(
+            &e.backend,
+        )
+    })
+}
+
+pub(crate) fn mixture_supports_byte_prefix_mass(plan: &crate::spec::core::RateBackendPlan) -> bool {
+    let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = plan else {
+        unreachable!()
+    };
+    experts.iter().all(|e| {
+        (crate::runtime::rate_backend_kernel(e.backend.kind()).supports_byte_prefix_mass)(
+            &e.backend,
+        )
+    })
+}
+
+pub(crate) fn mixture_supports_reversible_bit_updates(
+    plan: &crate::spec::core::RateBackendPlan,
+) -> bool {
+    let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = plan else {
+        unreachable!()
+    };
+    experts.iter().all(|e| {
+        (crate::runtime::rate_backend_kernel(e.backend.kind()).supports_reversible_bit_updates)(
+            &e.backend,
+        )
+    })
+}
+
+pub(crate) fn calibrated_supports_native_bit_prediction(
+    plan: &crate::spec::core::RateBackendPlan,
+) -> bool {
+    let crate::spec::core::RateBackendPlan::Calibrated { base, .. } = plan else {
+        unreachable!()
+    };
+    (crate::runtime::rate_backend_kernel(base.kind()).supports_native_bit_prediction)(base)
+}
+
+pub(crate) fn calibrated_supports_byte_prefix_mass(
+    plan: &crate::spec::core::RateBackendPlan,
+) -> bool {
+    let crate::spec::core::RateBackendPlan::Calibrated { base, .. } = plan else {
+        unreachable!()
+    };
+    (crate::runtime::rate_backend_kernel(base.kind()).supports_byte_prefix_mass)(base)
+}
+
+pub(crate) fn calibrated_supports_reversible_bit_updates(
+    plan: &crate::spec::core::RateBackendPlan,
+) -> bool {
+    let crate::spec::core::RateBackendPlan::Calibrated { base, .. } = plan else {
+        unreachable!()
+    };
+    (crate::runtime::rate_backend_kernel(base.kind()).supports_reversible_bit_updates)(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::io::Read;
 
+    #[cfg(feature = "backend-calibrated")]
+    use crate::api::{CalibratedSpec, CalibrationContextKind};
     use crate::api::{CompressionBackend, RateBackend};
     #[cfg(feature = "backend-mixture")]
     use crate::api::{MixtureExpertSpec, MixtureKind, MixtureSpec};
-    #[cfg(feature = "backend-mixture")]
+    use crate::mixture::OnlineBytePredictor;
+    #[cfg(any(feature = "backend-mixture", feature = "backend-calibrated"))]
     use std::sync::Arc;
 
     #[cfg(any(
@@ -2186,6 +2244,41 @@ mod tests {
     #[cfg(feature = "backend-ctw")]
     fn compiled_compression_backend(backend: &CompressionBackend) -> CompiledCompressionBackend {
         backend.compile().expect("compiled compression backend")
+    }
+
+    fn sample_rate_backend_for_kind(kind: RateBackendKind) -> Option<RateBackend> {
+        match kind {
+            RateBackendKind::Mixture => {
+                #[cfg(feature = "backend-mixture")]
+                {
+                    let base = first_enabled_default_rate_backend_spec()?;
+                    Some(RateBackend::Mixture {
+                        spec: Arc::new(MixtureSpec::new(
+                            MixtureKind::Bayes,
+                            vec![MixtureExpertSpec::new(base)],
+                        )),
+                    })
+                }
+                #[cfg(not(feature = "backend-mixture"))]
+                {
+                    None
+                }
+            }
+            RateBackendKind::Calibrated => {
+                #[cfg(feature = "backend-calibrated")]
+                {
+                    let base = first_enabled_default_rate_backend_spec()?;
+                    Some(RateBackend::Calibrated {
+                        spec: Arc::new(CalibratedSpec::new(base, CalibrationContextKind::Global)),
+                    })
+                }
+                #[cfg(not(feature = "backend-calibrated"))]
+                {
+                    None
+                }
+            }
+            _ => default_rate_backend_spec(kind),
+        }
     }
 
     fn assert_registry_is_injective<K>(registry: &[BackendDescriptor<K>], label: &str)
@@ -2261,6 +2354,87 @@ mod tests {
                 "missing runtime kernel for rate backend kind {:?}",
                 descriptor.kind
             );
+        }
+    }
+
+    #[test]
+    fn enabled_rate_backend_catalog_entries_compile_and_build_consistently() {
+        for descriptor in RATE_BACKEND_REGISTRY
+            .iter()
+            .filter(|descriptor| descriptor.enabled)
+        {
+            let backend = sample_rate_backend_for_kind(descriptor.kind)
+                .unwrap_or_else(|| panic!("missing sample backend for {:?}", descriptor.kind));
+            let compiled = backend.compile().unwrap_or_else(|err| {
+                panic!(
+                    "sample backend {:?} failed to compile: {err}",
+                    descriptor.kind
+                )
+            });
+
+            assert_eq!(compiled.canonical_name(), descriptor.canonical);
+            assert_eq!(compiled.capabilities().canonical_name, descriptor.canonical);
+
+            let mut predictor =
+                build_rate_backend_predictor_default(&compiled).unwrap_or_else(|err| {
+                    panic!("failed to build predictor for {:?}: {err}", descriptor.kind)
+                });
+            predictor.begin_stream(Some(1)).unwrap_or_else(|err| {
+                panic!(
+                    "failed to begin predictor stream for {:?}: {err}",
+                    descriptor.kind
+                )
+            });
+            predictor.finish_stream().unwrap_or_else(|err| {
+                panic!(
+                    "failed to finish predictor stream for {:?}: {err}",
+                    descriptor.kind
+                )
+            });
+
+            if compiled.supports_rate_coded_compression() {
+                let _pdf = build_rate_pdf_predictor(&compiled).unwrap_or_else(|err| {
+                    panic!(
+                        "failed to build pdf predictor for {:?}: {err}",
+                        descriptor.kind
+                    )
+                });
+            }
+
+            let mut bit_predictor = build_rate_backend_binary_token_predictor(
+                &compiled,
+                crate::mixture::DEFAULT_MIN_PROB,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to build binary-token predictor for {:?}: {err}",
+                    descriptor.kind
+                )
+            });
+            let prediction = crate::prediction::binary_prediction_from_log_probs(
+                bit_predictor.log_prob(0),
+                bit_predictor.log_prob(1),
+                crate::mixture::DEFAULT_MIN_PROB,
+            );
+            assert!(
+                (prediction.p0 + prediction.p1 - 1.0).abs() < 1e-12,
+                "binary-token predictor for {:?} must normalize to 1.0, got p0={} p1={}",
+                descriptor.kind,
+                prediction.p0,
+                prediction.p1
+            );
+            bit_predictor.begin_stream(Some(1)).unwrap_or_else(|err| {
+                panic!(
+                    "failed to begin binary-token stream for {:?}: {err}",
+                    descriptor.kind
+                )
+            });
+            bit_predictor.finish_stream().unwrap_or_else(|err| {
+                panic!(
+                    "failed to finish binary-token stream for {:?}: {err}",
+                    descriptor.kind
+                )
+            });
         }
     }
 

@@ -25,7 +25,7 @@ use crate::api::{MixtureKind, MixtureScheduleMode, RateBackend};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
-use crate::backends::ctw::FacContextTree;
+use crate::backends::ctw::{ContextTree, FacContextTree};
 #[cfg(feature = "backend-match")]
 use crate::backends::match_model::MatchModel;
 #[cfg(feature = "backend-ppmd")]
@@ -313,112 +313,11 @@ fn ensure_rwkv_primed(compressor: &mut rwkvzip::Compressor, primed: &mut bool) {
     }
 }
 
-#[inline]
 #[cfg(feature = "backend-ctw")]
-fn ctw_log_prob_update_msb(tree: &mut FacContextTree, symbol: u8, min_prob: f64) -> f64 {
-    let logp = tree.log_prob_update_byte_msb(symbol);
-    if logp.is_finite() {
-        logp.max(min_prob.ln())
-    } else {
-        min_prob.ln()
-    }
-}
-
-#[inline]
-#[cfg(feature = "backend-ctw")]
-fn ctw_log_prob_update_lsb(
-    tree: &mut FacContextTree,
-    symbol: u8,
-    bits_per_symbol: usize,
-    min_prob: f64,
-) -> f64 {
-    let mut logp = 0.0;
-    for bit_idx in 0..bits_per_symbol {
-        let bit = ((symbol >> bit_idx) & 1) == 1;
-        let p = tree.predict(bit, bit_idx);
-        if p.is_finite() && p > 0.0 {
-            logp += p.ln();
-        } else {
-            logp = f64::NEG_INFINITY;
-        }
-        tree.update_predicted(bit, bit_idx);
-    }
-    if logp.is_finite() {
-        logp.max(min_prob.ln())
-    } else {
-        min_prob.ln()
-    }
-}
-
-#[cfg(feature = "backend-ctw")]
-fn fill_fac_tree_log_probs(
-    tree: &mut FacContextTree,
-    bits_per_symbol: usize,
-    msb_first: bool,
-    min_logp: f64,
-    out: &mut [f64; 256],
-) {
-    struct RecParams {
-        bits: usize,
-        msb_first: bool,
-        log_before: f64,
-        min_logp: f64,
-    }
-
-    let bits = bits_per_symbol.clamp(1, 8);
-    let patterns = 1usize << bits;
-    let mut pattern_logps = [f64::NEG_INFINITY; 256];
-    let params = RecParams {
-        bits,
-        msb_first,
-        log_before: tree.get_log_block_probability(),
-        min_logp,
-    };
-
-    fn rec(
-        tree: &mut FacContextTree,
-        depth: usize,
-        params: &RecParams,
-        symbol_acc: u8,
-        pattern_logps: &mut [f64; 256],
-    ) {
-        if depth == params.bits {
-            let pat = symbol_acc as usize;
-            let logp = (tree.get_log_block_probability() - params.log_before).max(params.min_logp);
-            pattern_logps[pat] = logp;
-            return;
-        }
-
-        for bit in [false, true] {
-            tree.update(bit, depth);
-            let mut next_symbol = symbol_acc;
-            if params.msb_first {
-                let shift = 7usize.saturating_sub(depth);
-                if bit {
-                    next_symbol |= 1u8 << shift;
-                }
-            } else if bit {
-                next_symbol |= 1u8 << depth;
-            }
-            rec(tree, depth + 1, params, next_symbol, pattern_logps);
-            tree.revert(depth);
-        }
-    }
-
-    rec(tree, 0, &params, 0, &mut pattern_logps);
-
-    if bits == 8 {
-        out.copy_from_slice(&pattern_logps);
-    } else {
-        let aliases = 1usize << (8 - bits);
-        let alias_ln = (aliases as f64).ln();
-        let mask = patterns - 1;
-        for byte in 0..256usize {
-            out[byte] = pattern_logps[byte & mask] - alias_ln;
-        }
-    }
-}
-
+use crate::backends::ctw::{
+    ctw_log_prob_msb, ctw_log_prob_update_lsb, ctw_log_prob_update_msb, ctw_symbol_bit_msb,
+    fill_ctw_tree_log_probs, fill_fac_tree_log_probs,
+};
 /// A concrete online predictor backed by a `RateBackend` configuration.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
@@ -467,15 +366,17 @@ pub enum RateBackendPredictor {
         /// Probability floor for numeric stability.
         min_prob: f64,
     },
-    /// Byte-wise CTW implemented as 8 factorized bit trees (MSB-first).
+    /// AC-CTW with consumer-chosen symbol width interpreted MSB-first.
     #[cfg(feature = "backend-ctw")]
     Ctw {
-        /// FAC-CTW tree stack (8 bits per byte).
-        tree: FacContextTree,
+        /// Single binary context tree.
+        tree: ContextTree,
+        /// Active bit-width per observed symbol.
+        bits_per_symbol: usize,
         /// Probability floor for numeric stability.
         min_prob: f64,
         /// Compact rollback journal used while checkpoint scopes are active.
-        checkpoint_journal: Vec<FacCtwUndoOp>,
+        checkpoint_journal: Vec<CtwUndoOp>,
         /// Number of active checkpoints that require journaling.
         checkpoint_depth: usize,
     },
@@ -593,6 +494,16 @@ pub enum RateBackendPredictorCheckpoint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal AC-CTW journal event used to restore predictor state from checkpoints.
+#[doc(hidden)]
+pub enum CtwUndoOp {
+    /// Symbol update applied in learning mode.
+    LearnedSymbol,
+    /// Symbol update applied in frozen/scoring mode.
+    FrozenSymbol,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Internal FAC-CTW journal event used to restore predictor state from checkpoints.
 #[doc(hidden)]
 pub enum FacCtwUndoOp {
@@ -623,6 +534,34 @@ pub struct CalibratedPredictorCheckpoint {
     core: CalibratorCore,
     pdf: [f64; 256],
     valid: bool,
+}
+
+#[cfg(feature = "backend-ctw")]
+#[cfg(any(feature = "aixi", test))]
+fn restore_ctw_checkpoint(
+    tree: &mut ContextTree,
+    bits_per_symbol: usize,
+    checkpoint_journal: &mut Vec<CtwUndoOp>,
+    target_len: usize,
+) {
+    let bits = bits_per_symbol.clamp(1, 8);
+    while checkpoint_journal.len() > target_len {
+        match checkpoint_journal
+            .pop()
+            .expect("ctw checkpoint journal underflow")
+        {
+            CtwUndoOp::LearnedSymbol => {
+                for _ in 0..bits {
+                    tree.revert();
+                }
+            }
+            CtwUndoOp::FrozenSymbol => {
+                for _ in 0..bits {
+                    tree.revert_history();
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -782,12 +721,13 @@ impl RateBackendPredictor {
             (
                 RateBackendPredictor::Ctw {
                     tree,
+                    bits_per_symbol,
                     checkpoint_journal,
                     ..
                 },
                 RateBackendPredictorCheckpoint::Ctw { journal_len },
             ) => {
-                restore_fac_ctw_checkpoint(tree, 8, checkpoint_journal, *journal_len);
+                restore_ctw_checkpoint(tree, *bits_per_symbol, checkpoint_journal, *journal_len);
             }
             #[cfg(feature = "backend-ctw")]
             (
@@ -993,23 +933,12 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-sequitur")]
             RateBackendPredictor::Sequitur { model, min_prob } => model.log_prob(symbol, *min_prob),
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { tree, min_prob, .. } => {
-                let log_before = tree.get_log_block_probability();
-                for bit_idx in 0..8 {
-                    let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-                    tree.update(bit, bit_idx);
-                }
-                let log_after = tree.get_log_block_probability();
-                for bit_idx in (0..8).rev() {
-                    tree.revert(bit_idx);
-                }
-                let logp = log_after - log_before;
-                if logp.is_finite() {
-                    logp.max(min_prob.ln())
-                } else {
-                    min_prob.ln()
-                }
-            }
+            RateBackendPredictor::Ctw {
+                tree,
+                bits_per_symbol,
+                min_prob,
+                ..
+            } => ctw_log_prob_msb(tree, symbol, *bits_per_symbol, *min_prob),
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw {
                 tree,
@@ -1141,9 +1070,12 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 }
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { tree, min_prob, .. } => {
-                fill_fac_tree_log_probs(tree, 8, true, min_prob.ln(), out);
-            }
+            RateBackendPredictor::Ctw {
+                tree,
+                bits_per_symbol,
+                min_prob,
+                ..
+            } => fill_ctw_tree_log_probs(tree, *bits_per_symbol, min_prob.ln(), out),
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw {
                 tree,
@@ -1273,16 +1205,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
                 tree,
+                bits_per_symbol,
                 checkpoint_journal,
                 checkpoint_depth,
                 ..
             } => {
-                for bit_idx in 0..8 {
-                    let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-                    tree.update(bit, bit_idx);
+                for bit_idx in 0..(*bits_per_symbol).clamp(1, 8) {
+                    tree.update(ctw_symbol_bit_msb(symbol, *bits_per_symbol, bit_idx));
                 }
                 if *checkpoint_depth > 0 {
-                    checkpoint_journal.push(FacCtwUndoOp::LearnedSymbol);
+                    checkpoint_journal.push(CtwUndoOp::LearnedSymbol);
                 }
             }
             #[cfg(feature = "backend-ctw")]
@@ -1408,13 +1340,14 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
                 tree,
+                bits_per_symbol,
                 min_prob,
                 checkpoint_journal,
                 checkpoint_depth,
             } => {
-                let logp = ctw_log_prob_update_msb(tree, symbol, *min_prob);
+                let logp = ctw_log_prob_update_msb(tree, symbol, *bits_per_symbol, *min_prob);
                 if *checkpoint_depth > 0 {
-                    checkpoint_journal.push(FacCtwUndoOp::LearnedSymbol);
+                    checkpoint_journal.push(CtwUndoOp::LearnedSymbol);
                 }
                 logp
             }
@@ -1475,7 +1408,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw { tree, .. } => {
-                tree.reset_history_only();
+                tree.truncate_history(0);
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
@@ -1563,17 +1496,19 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
                 tree,
+                bits_per_symbol,
                 checkpoint_journal,
                 checkpoint_depth,
                 ..
             } => {
-                let mut bits = [false; 8];
-                for (bit_idx, slot) in bits.iter_mut().enumerate() {
-                    *slot = ((symbol >> (7 - bit_idx)) & 1) == 1;
+                let bits = (*bits_per_symbol).clamp(1, 8);
+                let mut history_bits = [false; 8];
+                for (bit_idx, slot) in history_bits.iter_mut().enumerate().take(bits) {
+                    *slot = ctw_symbol_bit_msb(symbol, bits, bit_idx);
                 }
-                tree.update_history(&bits);
+                tree.update_history(&history_bits[..bits]);
                 if *checkpoint_depth > 0 {
-                    checkpoint_journal.push(FacCtwUndoOp::FrozenSymbol);
+                    checkpoint_journal.push(CtwUndoOp::FrozenSymbol);
                 }
             }
             #[cfg(feature = "backend-ctw")]
@@ -1851,6 +1786,40 @@ pub(crate) fn expert_configs_from_compiled_mixture(
             ))
         })
         .collect::<Result<Vec<_>, String>>()?)
+}
+
+#[cfg(feature = "backend-mixture")]
+pub(crate) fn expert_configs_from_compiled_mixture_with_builder(
+    backend: &CompiledRateBackend,
+    builder: fn(&CompiledRateBackend, f64) -> Result<RateBackendPredictor, String>,
+    min_prob: f64,
+) -> Result<Vec<ExpertConfig>, String> {
+    let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = backend.plan() else {
+        return Err("compiled backend is not a mixture backend".to_string());
+    };
+    experts
+        .iter()
+        .map(|expert| {
+            let compiled =
+                crate::spec::core::compiled_rate_backend_from_plan(expert.backend.clone())
+                    .map_err(|err| err.to_string())?;
+            // Validate once up front so mixture construction fails before we
+            // commit any `ExpertConfig` values. The stored builder still has to
+            // create a fresh predictor later because each runtime needs its own
+            // independent expert state.
+            builder(&compiled, min_prob).map(|_| ())?;
+            let name = expert
+                .name
+                .clone()
+                .unwrap_or_else(|| compiled.default_name());
+            Ok(ExpertConfig::new(name, expert.log_prior, move || {
+                Box::new(
+                    builder(&compiled, min_prob)
+                        .expect("compiled mixture expert builder should succeed"),
+                )
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()
 }
 
 #[derive(Clone)]
@@ -4254,5 +4223,46 @@ mod tests {
         runtime.fill_log_probs(&mut row);
         let mass: f64 = row.iter().map(|lp| lp.exp()).sum();
         assert!((mass - 1.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn binary_token_mixture_builder_preserves_ctw_family_identity() {
+        let ctw_backend = RateBackend::Ctw { depth: 4 }
+            .compile()
+            .expect("compiled ctw backend");
+        let mixture_backend = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })],
+            )),
+        }
+        .compile()
+        .expect("compiled mixture backend");
+
+        let mut direct = crate::runtime::build_rate_backend_binary_token_predictor(
+            &ctw_backend,
+            DEFAULT_MIN_PROB,
+        )
+        .expect("direct ctw bit predictor");
+        let mut mixture = crate::runtime::build_rate_backend_binary_token_predictor(
+            &mixture_backend,
+            DEFAULT_MIN_PROB,
+        )
+        .expect("mixture bit predictor");
+
+        direct.begin_stream(Some(9)).expect("begin direct stream");
+        mixture.begin_stream(Some(9)).expect("begin mixture stream");
+
+        for bit in [true, false, true, true, false, false, true, false, true] {
+            let direct_p0 = direct.log_prob(0);
+            let direct_p1 = direct.log_prob(1);
+            let mixture_p0 = mixture.log_prob(0);
+            let mixture_p1 = mixture.log_prob(1);
+            assert!((direct_p0 - mixture_p0).abs() < 1e-12);
+            assert!((direct_p1 - mixture_p1).abs() < 1e-12);
+
+            direct.update(u8::from(bit));
+            mixture.update(u8::from(bit));
+        }
     }
 }

@@ -130,17 +130,13 @@ pub struct RateBackendCapabilities {
     pub supports_frozen_conditioning: bool,
     /// Whether generic rate-coded compression wrapping is supported.
     pub supports_rate_coded_compression: bool,
-    /// Whether this backend can be adapted losslessly to bit-token mode.
-    pub supports_bit_token_adaptation: bool,
-    /// Whether this backend has a direct bit predictor rather than requiring a
-    /// byte-PDF prefix adapter.
+    /// Whether this backend has a direct native bit predictor rather than a
+    /// byte-symbol adaptation over `{0,1}`.
     pub supports_native_bit_prediction: bool,
     /// Whether this backend can expose its byte PDF as a lazy binary prefix mass.
     pub supports_byte_prefix_mass: bool,
     /// Whether bit observations can be undone exactly after update.
     pub supports_reversible_bit_updates: bool,
-    /// Whether AC should prefer bitwise stepping for this backend.
-    pub ac_prefers_bitwise: bool,
     /// Whether the backend graph contains any ZPAQ component.
     pub contains_zpaq: bool,
     /// Whether this is a method-backed neural family.
@@ -435,13 +431,8 @@ impl CompiledRateBackend {
         self.capabilities.supports_rate_coded_compression
     }
 
-    /// Whether this backend can be adapted losslessly to bit-token mode.
-    pub fn supports_bit_token_adaptation(&self) -> bool {
-        self.capabilities.supports_bit_token_adaptation
-    }
-
-    /// Whether this backend has a direct bit predictor rather than requiring a
-    /// byte-PDF prefix adapter.
+    /// Whether this backend has a direct native bit predictor rather than a
+    /// byte-symbol adaptation over `{0,1}`.
     pub fn supports_native_bit_prediction(&self) -> bool {
         self.capabilities.supports_native_bit_prediction
     }
@@ -454,24 +445,6 @@ impl CompiledRateBackend {
     /// Whether bit observations can be undone exactly after update.
     pub fn supports_reversible_bit_updates(&self) -> bool {
         self.capabilities.supports_reversible_bit_updates
-    }
-
-    /// Whether AC should prefer bitwise stepping for this backend.
-    pub fn ac_prefers_bitwise(&self) -> bool {
-        self.capabilities.ac_prefers_bitwise
-    }
-
-    /// Return a bit-token-adapted compiled backend when the transformation is defined.
-    pub fn adapt_for_bit_tokens(&self) -> SpecResult<Self> {
-        if !self.capabilities.supports_bit_token_adaptation {
-            return Err(SpecError::new(format!(
-                "backend '{}' cannot be adapted for bit-token mode",
-                self.capabilities.canonical_name
-            )));
-        }
-        compiled_rate_backend_from_plan(Arc::new(adapt_rate_plan_for_bit_tokens(
-            self.plan.as_ref(),
-        )))
     }
 
     pub(crate) fn plan(&self) -> &RateBackendPlan {
@@ -659,10 +632,6 @@ fn rate_backend_plan_display_label(plan: &RateBackendPlan) -> String {
 
 fn rate_backend_plan_default_name(plan: &RateBackendPlan) -> String {
     crate::runtime::rate_backend_default_name_via_kernel(plan)
-}
-
-fn adapt_rate_plan_for_bit_tokens(plan: &RateBackendPlan) -> RateBackendPlan {
-    crate::runtime::adapt_rate_backend_for_bit_tokens_via_kernel(plan)
 }
 
 #[cfg(feature = "backend-rwkv")]
@@ -1034,20 +1003,15 @@ mod tests {
 
     #[cfg(feature = "backend-ctw")]
     #[test]
-    fn bit_token_adaptation_rewrites_ctw_family_without_revalidation_failure() {
+    fn compiled_ctw_preserves_family_identity() {
         let compiled =
             validate_rate_backend_in(&RateBackend::Ctw { depth: 7 }, &SpecEnvironment::default())
                 .unwrap()
                 .compile()
                 .unwrap();
-        let adapted = compiled.adapt_for_bit_tokens().unwrap();
         assert!(matches!(
-            adapted.canonical_spec(),
-            RateBackend::FacCtw {
-                base_depth: 7,
-                num_percept_bits: 1,
-                encoding_bits: 1
-            }
+            compiled.canonical_spec(),
+            RateBackend::Ctw { depth: 7 }
         ));
     }
 
@@ -1079,6 +1043,5 @@ mod tests {
             .compile()
             .unwrap();
         assert!(compiled.contains_zpaq());
-        assert!(!compiled.supports_bit_token_adaptation());
     }
 }

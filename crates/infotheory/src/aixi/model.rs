@@ -5,7 +5,6 @@
 //! provide different complexity vs performance trade-offs.
 
 use crate::api::{CompiledRateBackend, RateBackend};
-use crate::prediction::{binary_prediction_from_log_probs, binary_prediction_from_probs};
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{ContextTree, FacContextTree};
 #[cfg(feature = "backend-rosa")]
@@ -19,6 +18,13 @@ use crate::mambazip::{Compressor as MambaCompressor, Model as MambaModel, State 
 use crate::mixture::{
     DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor, RateBackendPredictorCheckpoint,
 };
+use crate::prediction::binary_prediction_from_log_probs;
+#[cfg(any(
+    feature = "backend-rosa",
+    feature = "backend-mamba",
+    feature = "backend-rwkv"
+))]
+use crate::prediction::binary_prediction_from_probs;
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip::{Compressor as RwkvCompressor, Model as RwkvModel, State as RwkvState};
 use crate::spec::SpecError;
@@ -114,7 +120,6 @@ pub trait Predictor: Send {
         Ok(())
     }
 }
-
 
 /// A predictor using the Action-Conditional CTW algorithm.
 ///
@@ -436,9 +441,10 @@ impl Predictor for ZpaqPredictor {
 
 /// A generic bit-level predictor backed by any [`RateBackend`].
 ///
-/// This adapter maps boolean symbols to bytes `{0,1}` and forwards them to the
-/// workspace-wide rate backend abstraction. It prioritizes correctness and
-/// backend coverage over rollback efficiency.
+/// This adapter constructs the backend's binary-token application directly.
+/// Native bit backends provide true bit-token semantics; byte-native backends
+/// are adapted by feeding the predictor literal byte symbols `0` and `1` and
+/// renormalizing over those two choices.
 pub struct RateBackendBitPredictor {
     backend: CompiledRateBackend,
     min_prob: f64,
@@ -465,8 +471,6 @@ pub enum RateBackendBitPredictorError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PredictorBuildError {
-    /// Bit-token adaptation failed while preparing the backend for binary symbols.
-    BitAdaptation(SpecError),
     /// Generic bit-level predictor construction failed.
     BitPredictor(RateBackendBitPredictorError),
 }
@@ -474,7 +478,6 @@ pub enum PredictorBuildError {
 impl fmt::Display for PredictorBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BitAdaptation(err) => write!(f, "{err}"),
             Self::BitPredictor(err) => write!(f, "{err}"),
         }
     }
@@ -483,7 +486,6 @@ impl fmt::Display for PredictorBuildError {
 impl Error for PredictorBuildError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::BitAdaptation(err) => Some(err),
             Self::BitPredictor(err) => Some(err),
         }
     }
@@ -578,8 +580,9 @@ impl RateBackendBitPredictor {
         if backend.contains_zpaq() {
             return Err(RateBackendBitPredictorError::UnsupportedZpaq);
         }
-        let mut predictor = crate::runtime::build_rate_backend_predictor(&backend, min_prob)
-            .map_err(RateBackendBitPredictorError::Runtime)?;
+        let mut predictor =
+            crate::runtime::build_rate_backend_binary_token_predictor(&backend, min_prob)
+                .map_err(RateBackendBitPredictorError::Runtime)?;
         predictor
             .begin_stream(None)
             .map_err(RateBackendBitPredictorError::StreamStart)?;
@@ -749,15 +752,8 @@ pub(crate) fn build_aiqi_predictor(
 fn build_compiled_bit_predictor(
     backend: &CompiledRateBackend,
 ) -> Result<RateBackendBitPredictor, PredictorBuildError> {
-    let bit_backend = if backend.supports_bit_token_adaptation() {
-        backend
-            .adapt_for_bit_tokens()
-            .map_err(PredictorBuildError::BitAdaptation)?
-    } else {
-        backend.clone()
-    };
     RateBackendBitPredictor::new(RateBackendBitPredictorConfig {
-        backend: bit_backend,
+        backend: backend.clone(),
         min_prob: DEFAULT_MIN_PROB,
     })
     .map_err(PredictorBuildError::BitPredictor)
