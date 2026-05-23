@@ -144,6 +144,32 @@ impl BytePrefixMass {
         Self::from_raw_weights(weights, order)
     }
 
+    /// Build a prefix-mass state from byte log-probabilities or log-weights.
+    ///
+    /// Finite entries are exponentiated after subtracting the maximum finite
+    /// entry for numerical stability. Non-finite entries are treated as zero
+    /// mass, and an all-invalid row therefore falls back to the same uniform
+    /// distribution as [`Self::from_pdf`].
+    pub fn from_log_probs(log_probs: &[f64], order: BitOrder) -> Self {
+        let log_probs = &log_probs[..log_probs.len().min(256)];
+        let max_log = log_probs
+            .iter()
+            .copied()
+            .filter(|lp| lp.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut weights = [0.0f64; 256];
+        if max_log.is_finite() {
+            for (weight, &lp) in weights.iter_mut().zip(log_probs.iter()) {
+                *weight = if lp.is_finite() {
+                    (lp - max_log).exp()
+                } else {
+                    0.0
+                };
+            }
+        }
+        Self::from_raw_weights(weights, order)
+    }
+
     /// Build a prefix-mass state from a normalized byte CDF row.
     pub fn from_cdf(cdf: [f64; 257], order: BitOrder) -> Self {
         let mut weights = [0.0f64; 256];
@@ -557,6 +583,34 @@ mod tests {
             }
             assert_eq!(from_pdf.symbol(), symbol);
             assert_eq!(from_cdf.symbol(), symbol);
+        }
+    }
+
+    #[test]
+    fn byte_prefix_from_log_probs_matches_from_pdf_for_both_orders() {
+        let mut pdf = [0.0f64; 256];
+        for (idx, slot) in pdf.iter_mut().enumerate() {
+            *slot = ((idx * 23 + 5) % 211 + 1) as f64;
+        }
+        let pdf = normalize_pdf_for_test(pdf);
+
+        let mut log_probs = [f64::NEG_INFINITY; 256];
+        for (dst, &mass) in log_probs.iter_mut().zip(pdf.iter()) {
+            *dst = mass.ln() + 17.0;
+        }
+
+        for order in [BitOrder::MsbFirst, BitOrder::LsbFirst] {
+            let symbol = 0b1010_0110u8;
+            let mut from_pdf = BytePrefixMass::from_pdf(&pdf, order);
+            let mut from_log_probs = BytePrefixMass::from_log_probs(&log_probs, order);
+            for bit_idx in 0..8u8 {
+                assert_binary_prediction_close(from_pdf.prediction(), from_log_probs.prediction());
+                let bit = bit_at(symbol, order, bit_idx);
+                from_pdf.observe(bit);
+                from_log_probs.observe(bit);
+            }
+            assert_eq!(from_pdf.symbol(), symbol);
+            assert_eq!(from_log_probs.symbol(), symbol);
         }
     }
 

@@ -4,6 +4,17 @@ This module re-exports symbols from the native extension and provides:
 
 - ergonomic wrappers for common entry points (`ncd_paths`, `ncd_bytes`)
 - abstract base classes for Python-driven AIXI trait adapters
+- bit-level predictive primitives (`RateBackendBitSession`, `BytePrefixMass`, `BinaryPrediction`)
+- bit-stream semantics and ordering controls (`BitStreamSemantics`, `BitOrder`)
+- context entrypoint for bit sessions (`InfotheoryCtx.rate_backend_bit_session`)
+
+Accepted string aliases:
+
+- `BitOrder`: `"msb"`, `"msbfirst"`, `"msb_first"`, `"lsb"`, `"lsbfirst"`, `"lsb_first"`
+- `BitStreamSemantics`: `"bytepacked"`, `"byte_packed"`, `"byte"` map to
+  `BitStreamSemantics.byte_packed(order=BitOrder.MsbFirst)`; `"binarytokens"`,
+  `"binary_tokens"`, `"binary"`, `"bit"` map to
+  `BitStreamSemantics.binary_tokens()`
 
 Callback error policy:
 

@@ -231,20 +231,7 @@ impl RateBackendBitSession {
         }
         let mut logps = [0.0f64; 256];
         self.predictor.fill_log_probs(&mut logps);
-        let max_log = logps
-            .iter()
-            .copied()
-            .filter(|lp| lp.is_finite())
-            .fold(f64::NEG_INFINITY, f64::max);
-        let mut pdf = [0.0f64; 256];
-        for (dst, &lp) in pdf.iter_mut().zip(logps.iter()) {
-            *dst = if max_log.is_finite() && lp.is_finite() {
-                (lp - max_log).exp()
-            } else {
-                0.0
-            };
-        }
-        self.prefix = Some(BytePrefixMass::from_pdf(&pdf, order));
+        self.prefix = Some(BytePrefixMass::from_log_probs(&logps, order));
     }
 }
 

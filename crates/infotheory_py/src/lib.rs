@@ -1,10 +1,11 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use infotheory::api::{
-    self, CalibratedSpec, CalibrationContextKind, CompiledCompressionBackend, CompiledRateBackend,
-    CompressionBackend, GenerationConfig, GenerationStrategy, GenerationUpdateMode, InfotheoryCtx,
-    MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, NcdVariant, ParticleSpec,
-    RateBackend, RateBackendSession,
+    self, BinaryPrediction, BitOrder, BitStreamSemantics, BytePrefixMass, CalibratedSpec,
+    CalibrationContextKind, CompiledCompressionBackend, CompiledRateBackend, CompressionBackend,
+    GenerationConfig, GenerationStrategy, GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec,
+    MixtureKind, MixtureScheduleMode, MixtureSpec, NcdVariant, ParticleSpec, RateBackend,
+    RateBackendBitSession, RateBackendSession,
 };
 use infotheory::error::InfotheoryError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -1229,6 +1230,25 @@ impl PyInfotheoryCtx {
         })
     }
 
+    #[pyo3(signature = (total_bits=None, semantics=None))]
+    fn rate_backend_bit_session(
+        &self,
+        total_bits: Option<u64>,
+        semantics: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyRateBackendBitSession> {
+        let sem = match semantics {
+            Some(s) => parse_bit_stream_semantics_value(s)?,
+            None => BitStreamSemantics::default(),
+        };
+        let inner = self
+            .inner
+            .rate_backend_bit_session(total_bits, sem)
+            .map_err(py_infotheory_error)?;
+        Ok(PyRateBackendBitSession {
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+
     #[pyo3(signature = (x, y, variant=None))]
     fn ncd_bytes(
         &self,
@@ -1322,6 +1342,370 @@ impl PyRateBackendSession {
             guard.generate_bytes(bytes, cfg)
         };
         Ok(PyBytes::new(py, &out))
+    }
+
+    fn finish(&self) -> PyResult<()> {
+        lock_recover(&self.inner)
+            .finish()
+            .map_err(py_infotheory_error)
+    }
+}
+
+/// Ordering configuration for byte-to-bit factorizations.
+#[pyclass(name = "BitOrder", eq, from_py_object)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+struct PyBitOrder {
+    inner: BitOrder,
+}
+
+#[pymethods]
+impl PyBitOrder {
+    #[classattr]
+    #[pyo3(name = "MsbFirst")]
+    fn msb_first() -> Self {
+        Self {
+            inner: BitOrder::MsbFirst,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "LsbFirst")]
+    fn lsb_first() -> Self {
+        Self {
+            inner: BitOrder::LsbFirst,
+        }
+    }
+
+    fn __repr__(&self) -> &'static str {
+        match self.inner {
+            BitOrder::MsbFirst => "BitOrder.MsbFirst",
+            BitOrder::LsbFirst => "BitOrder.LsbFirst",
+            _ => "BitOrder.<unknown>",
+        }
+    }
+}
+
+/// Semantic interpretation of a bit stream (e.g. byte-packed or native binary tokens).
+#[pyclass(name = "BitStreamSemantics", eq, from_py_object)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+struct PyBitStreamSemantics {
+    inner: BitStreamSemantics,
+}
+
+#[pymethods]
+impl PyBitStreamSemantics {
+    #[staticmethod]
+    #[pyo3(signature = (order=None))]
+    fn byte_packed(order: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let order = parse_bit_order_arg(order)?;
+        Ok(Self {
+            inner: BitStreamSemantics::BytePacked { order },
+        })
+    }
+
+    #[staticmethod]
+    fn binary_tokens() -> Self {
+        Self {
+            inner: BitStreamSemantics::BinaryTokens,
+        }
+    }
+
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.inner {
+            BitStreamSemantics::BytePacked { .. } => "byte_packed",
+            BitStreamSemantics::BinaryTokens => "binary_tokens",
+            _ => "unknown",
+        }
+    }
+
+    #[getter]
+    fn order(&self) -> Option<PyBitOrder> {
+        match self.inner {
+            BitStreamSemantics::BytePacked { order } => Some(PyBitOrder { inner: order }),
+            BitStreamSemantics::BinaryTokens => None,
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        match self.inner {
+            BitStreamSemantics::BytePacked { order } => {
+                let order_repr = PyBitOrder { inner: order }.__repr__();
+                format!("BitStreamSemantics.byte_packed(order={})", order_repr)
+            }
+            BitStreamSemantics::BinaryTokens => "BitStreamSemantics.binary_tokens()".to_string(),
+            _ => "BitStreamSemantics.<unknown>".to_string(),
+        }
+    }
+}
+
+fn parse_bit_order_value(py_obj: &Bound<'_, PyAny>) -> PyResult<BitOrder> {
+    if let Ok(order) = py_obj.extract::<PyRef<'_, PyBitOrder>>() {
+        return Ok(order.inner);
+    }
+    if let Ok(s) = py_obj.extract::<String>() {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("msb")
+            || s.eq_ignore_ascii_case("msbfirst")
+            || s.eq_ignore_ascii_case("msb_first")
+        {
+            return Ok(BitOrder::MsbFirst);
+        } else if s.eq_ignore_ascii_case("lsb")
+            || s.eq_ignore_ascii_case("lsbfirst")
+            || s.eq_ignore_ascii_case("lsb_first")
+        {
+            return Ok(BitOrder::LsbFirst);
+        }
+        return Err(PyValueError::new_err(format!(
+            "unknown BitOrder '{s}' (expected 'msb_first' or 'lsb_first')"
+        )));
+    }
+    Err(PyValueError::new_err(
+        "BitOrder must be a BitOrder enum value or string alias",
+    ))
+}
+
+fn parse_bit_order_arg(order: Option<&Bound<'_, PyAny>>) -> PyResult<BitOrder> {
+    match order {
+        Some(value) => parse_bit_order_value(value),
+        None => Ok(BitOrder::MsbFirst),
+    }
+}
+
+fn parse_bit_stream_semantics_value(py_obj: &Bound<'_, PyAny>) -> PyResult<BitStreamSemantics> {
+    if let Ok(semantics) = py_obj.extract::<PyRef<'_, PyBitStreamSemantics>>() {
+        return Ok(semantics.inner);
+    }
+    if let Ok(s) = py_obj.extract::<String>() {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("bytepacked")
+            || s.eq_ignore_ascii_case("byte_packed")
+            || s.eq_ignore_ascii_case("byte")
+        {
+            return Ok(BitStreamSemantics::BytePacked {
+                order: BitOrder::MsbFirst,
+            });
+        } else if s.eq_ignore_ascii_case("binarytokens")
+            || s.eq_ignore_ascii_case("binary_tokens")
+            || s.eq_ignore_ascii_case("binary")
+            || s.eq_ignore_ascii_case("bit")
+        {
+            return Ok(BitStreamSemantics::BinaryTokens);
+        }
+        return Err(PyValueError::new_err(format!(
+            "unknown BitStreamSemantics '{s}' (expected 'byte_packed' or 'binary_tokens')"
+        )));
+    }
+    Err(PyValueError::new_err(
+        "BitStreamSemantics must be a BitStreamSemantics instance or string alias",
+    ))
+}
+
+/// Represents an exact, normalized binary probability distribution.
+/// Invariants: `p0` and `p1` are finite, >= 0.0, and sum exactly to 1.0.
+#[pyclass(name = "BinaryPrediction", eq, from_py_object)]
+#[derive(Clone, Copy, PartialEq)]
+struct PyBinaryPrediction {
+    #[pyo3(get)]
+    p0: f64,
+    #[pyo3(get)]
+    p1: f64,
+}
+
+const BINARY_PREDICTION_SUM_TOLERANCE: f64 = f64::EPSILON * 4.0;
+
+impl From<BinaryPrediction> for PyBinaryPrediction {
+    fn from(inner: BinaryPrediction) -> Self {
+        Self {
+            p0: inner.p0,
+            p1: inner.p1,
+        }
+    }
+}
+
+#[pymethods]
+impl PyBinaryPrediction {
+    #[new]
+    fn new(p0: f64, p1: f64) -> PyResult<Self> {
+        if !p0.is_finite() || !p1.is_finite() || p0 < 0.0 || p1 < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "Invalid binary prediction probabilities: p0={}, p1={} (must be finite and >= 0)",
+                p0, p1
+            )));
+        }
+        let sum = p0 + p1;
+        if (sum - 1.0).abs() > BINARY_PREDICTION_SUM_TOLERANCE {
+            return Err(PyValueError::new_err(format!(
+                "Invalid binary prediction probabilities: p0={}, p1={} (must sum to 1)",
+                p0, p1
+            )));
+        }
+        // Canonicalize every accepted pair through the core type. Even when
+        // `p0 + p1` rounds to exactly `1.0`, floating-point addition does not
+        // guarantee that `p0 == 1.0 - p1`.
+        Ok(BinaryPrediction::from_prob_one_exact(p1 / sum).into())
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (p1, floor=None))]
+    fn from_prob_one(p1: f64, floor: Option<f64>) -> Self {
+        let floor = floor.unwrap_or(0.0);
+        BinaryPrediction::from_prob_one(p1, floor).into()
+    }
+
+    #[staticmethod]
+    fn from_prob_one_exact(p1: f64) -> Self {
+        BinaryPrediction::from_prob_one_exact(p1).into()
+    }
+
+    fn prob(&self, bit: bool) -> f64 {
+        if bit { self.p1 } else { self.p0 }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("BinaryPrediction(p0={}, p1={})", self.p0, self.p1)
+    }
+}
+
+/// A live prefix-mass state used to factorize byte probabilities into bit probabilities.
+#[pyclass(name = "BytePrefixMass", from_py_object)]
+#[derive(Clone)]
+struct PyBytePrefixMass {
+    inner: BytePrefixMass,
+}
+
+const BYTE_PREFIX_MASS_WIDTH: usize = 256;
+
+impl From<BytePrefixMass> for PyBytePrefixMass {
+    fn from(inner: BytePrefixMass) -> Self {
+        Self { inner }
+    }
+}
+
+fn validate_byte_prefix_mass_len(values_len: usize, constructor: &'static str) -> PyResult<()> {
+    if values_len != BYTE_PREFIX_MASS_WIDTH {
+        return Err(PyValueError::new_err(format!(
+            "BytePrefixMass.{constructor} expects exactly {BYTE_PREFIX_MASS_WIDTH} entries, got {values_len}"
+        )));
+    }
+    Ok(())
+}
+
+#[pymethods]
+impl PyBytePrefixMass {
+    #[staticmethod]
+    #[pyo3(signature = (pdf, order=None))]
+    fn from_pdf(pdf: Vec<f64>, order: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        validate_byte_prefix_mass_len(pdf.len(), "from_pdf")?;
+        Ok(BytePrefixMass::from_pdf(&pdf, parse_bit_order_arg(order)?).into())
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (log_probs, order=None))]
+    fn from_log_probs(log_probs: Vec<f64>, order: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        validate_byte_prefix_mass_len(log_probs.len(), "from_log_probs")?;
+        Ok(BytePrefixMass::from_log_probs(&log_probs, parse_bit_order_arg(order)?).into())
+    }
+
+    fn prediction(&self) -> PyBinaryPrediction {
+        self.inner.prediction().into()
+    }
+
+    fn observe(&mut self, bit: bool) {
+        self.inner.observe(bit);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+
+    fn has_partial_bits(&self) -> bool {
+        self.inner.has_partial_bits()
+    }
+
+    fn symbol(&self) -> PyResult<u8> {
+        if !self.inner.is_complete() {
+            return Err(PyRuntimeError::new_err(
+                "BytePrefixMass.symbol() is only meaningful after a full byte has been observed",
+            ));
+        }
+        Ok(self.inner.symbol())
+    }
+
+    fn __repr__(&self) -> String {
+        if self.inner.is_complete() {
+            return format!(
+                "BytePrefixMass(complete=True, symbol={})",
+                self.inner.symbol()
+            );
+        }
+        format!(
+            "BytePrefixMass(complete=False, has_partial_bits={})",
+            self.inner.has_partial_bits()
+        )
+    }
+}
+
+/// A predictive session for bit streams.
+/// Supports both native binary tokens and byte-packed bit factorizations.
+#[pyclass(name = "RateBackendBitSession", from_py_object)]
+#[derive(Clone)]
+struct PyRateBackendBitSession {
+    inner: Arc<Mutex<RateBackendBitSession>>,
+}
+
+#[pymethods]
+impl PyRateBackendBitSession {
+    #[new]
+    #[pyo3(signature = (backend, total_bits=None, semantics=None))]
+    fn new(
+        backend: &PyRateBackend,
+        total_bits: Option<u64>,
+        semantics: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        py_try(|| {
+            let sem = match semantics {
+                Some(s) => parse_bit_stream_semantics_value(s)?,
+                None => BitStreamSemantics::default(),
+            };
+            let inner = RateBackendBitSession::from_backend(
+                compile_rate_backend(backend.inner.clone())?,
+                total_bits,
+                sem,
+            )
+            .map_err(py_infotheory_error)?;
+            Ok(Self {
+                inner: Arc::new(Mutex::new(inner)),
+            })
+        })
+    }
+
+    fn predict_bit(&self) -> PyBinaryPrediction {
+        lock_recover(&self.inner).predict_bit().into()
+    }
+
+    fn predict_one(&self) -> f64 {
+        lock_recover(&self.inner).predict_one()
+    }
+
+    fn step_bit(&self, bit: bool) -> PyBinaryPrediction {
+        lock_recover(&self.inner).step_bit(bit).into()
+    }
+
+    fn observe_bit(&self, bit: bool) {
+        lock_recover(&self.inner).observe_bit(bit);
+    }
+
+    fn condition_bit(&self, bit: bool) {
+        lock_recover(&self.inner).condition_bit(bit);
+    }
+
+    #[pyo3(signature = (total_bits=None))]
+    fn reset_frozen(&self, total_bits: Option<u64>) -> PyResult<()> {
+        lock_recover(&self.inner)
+            .reset_frozen(total_bits)
+            .map_err(py_infotheory_error)
     }
 
     fn finish(&self) -> PyResult<()> {
@@ -4611,6 +4995,11 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGenerationUpdateMode>()?;
     m.add_class::<PyGenerationConfig>()?;
     m.add_class::<PyRateBackendSession>()?;
+    m.add_class::<PyBitOrder>()?;
+    m.add_class::<PyBitStreamSemantics>()?;
+    m.add_class::<PyBinaryPrediction>()?;
+    m.add_class::<PyBytePrefixMass>()?;
+    m.add_class::<PyRateBackendBitSession>()?;
     m.add_class::<PyMixtureKind>()?;
     m.add_class::<PyMixtureScheduleMode>()?;
     m.add_class::<PyMixtureExpertSpec>()?;
