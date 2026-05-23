@@ -1,12 +1,55 @@
 {
-  "schema_version": 1,
   "kind": "tune",
+  "output_config_path": "strict-mcaixi-advanced-neural-mixture-tsv-output.json",
+  "eval_time_limit_seconds": 90,
+  "time_budget_seconds": 300,
+  "min_throughput_bytes_per_second": 1,
+  "bounds": {
+    "min_experts": 2,
+    "allow_duplicate_experts": false,
+    "required_experts": [],
+    "forbidden_expert_pairs": [],
+    "allowed_backends": [
+      "fac-ctw",
+      "mixture"
+    ],
+    "forbidden_backends": [],
+    "parameter_ranges": [
+      {
+        "min": 0.01,
+        "max": 0.2,
+        "parameter": "rate_backend.spec.alpha"
+      },
+      {
+        "min": 4,
+        "max": 32,
+        "parameter": "rate_backend.spec.experts[0].base_depth"
+      }
+    ],
+    "max_experts": 6,
+    "max_mixture_nesting_depth": 3
+  },
+  "schema_version": 1,
+  "seed": 31,
   "assets": [
     {
-      "id": "dataset",
-      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
+      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv",
+      "id": "dataset"
     }
   ],
+  "report_path": "strict-mcaixi-advanced-neural-mixture-tsv-report.json",
+  "max_memory_bytes": 1099511627776,
+  "controller": {
+    "kind": "mc_aixi_fac_ctw",
+    "planner_simulations_per_step": 6,
+    "interface": {
+      "observation_bits": 8,
+      "observation_stream_len": 1,
+      "observation_key_mode": "full_stream",
+      "reward_bits": 32,
+      "agent_actions": 4
+    }
+  },
   "input_asset": "dataset",
   "baseline_candidate": {
     "kind": "rate-ac",
@@ -14,74 +57,34 @@
       "kind": "mixture",
       "spec": {
         "kind": "neural",
-        "schedule": "default",
-        "alpha": 0.05,
-        "decay": null,
         "experts": [
           {
-            "kind": "ctw",
-            "depth": 12,
-            "log_prior": 0.0
+            "kind": "fac-ctw",
+            "num_percept_bits": 8,
+            "log_prior": 0,
+            "encoding_bits": 8,
+            "base_depth": 12
           },
           {
             "kind": "fac-ctw",
-            "base_depth": 10,
             "num_percept_bits": 8,
             "encoding_bits": 8,
-            "log_prior": 0.0
+            "log_prior": 0,
+            "base_depth": 10
           },
           {
-            "kind": "ctw",
-            "depth": 8,
-            "log_prior": 0.0
+            "kind": "fac-ctw",
+            "num_percept_bits": 8,
+            "log_prior": 0,
+            "encoding_bits": 8,
+            "base_depth": 8
           }
-        ]
+        ],
+        "schedule": "default",
+        "decay": null,
+        "alpha": 0.05
       }
     },
     "framing": "framed"
-  },
-  "controller": {
-    "kind": "mc_aixi_fac_ctw",
-    "interface": {
-      "observation_bits": 8,
-      "observation_stream_len": 1,
-      "observation_key_mode": "full_stream",
-      "reward_bits": 32,
-      "agent_actions": 4
-    },
-    "planner_simulations_per_step": 6
-  },
-  "bounds": {
-    "allowed_backends": [
-      "ctw",
-      "fac-ctw",
-      "mixture"
-    ],
-    "forbidden_backends": [],
-    "parameter_ranges": [
-      {
-        "parameter": "rate_backend.spec.alpha",
-        "min": 0.01,
-        "max": 0.20
-      },
-      {
-        "parameter": "rate_backend.spec.experts[0].depth",
-        "min": 4.0,
-        "max": 32.0
-      }
-    ],
-    "max_experts": 6,
-    "max_mixture_nesting_depth": 3,
-    "min_experts": 2,
-    "allow_duplicate_experts": false,
-    "required_experts": [],
-    "forbidden_expert_pairs": []
-  },
-  "eval_time_limit_seconds": 90.0,
-  "time_budget_seconds": 300.0,
-  "min_throughput_bytes_per_second": 1.0,
-  "max_memory_bytes": 1099511627776,
-  "output_config_path": "strict-mcaixi-advanced-neural-mixture-tsv-output.json",
-  "seed": 31,
-  "report_path": "strict-mcaixi-advanced-neural-mixture-tsv-report.json"
+  }
 }
