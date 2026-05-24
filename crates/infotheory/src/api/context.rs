@@ -46,14 +46,70 @@ pub struct RateBackendSession {
 /// Byte-packed sessions keep the underlying backend byte-native and expose it
 /// through a lazy prefix-mass view. They therefore require whole-byte stream
 /// boundaries: `total_bits`, when provided, must be a multiple of `8`, and
-/// `finish` must not leave a dangling partial byte. Binary-token sessions model
-/// each bit either through the backend's native binary-token application or,
-/// for byte-native backends, by adapting the predictor to the literal byte
-/// symbols `0` and `1` and renormalizing those two choices.
+/// `finish` must not leave a dangling partial byte. Within one buffered byte,
+/// callers must also stay within either adaptive updates or conditioning-only
+/// updates; switching modes mid-byte is rejected because the backend only
+/// commits whole-byte symbols. Binary-token sessions model each bit either
+/// through the backend's native binary-token application or, for byte-native
+/// backends, by adapting the predictor to the literal byte symbols `0` and `1`
+/// and renormalizing those two choices.
 pub struct RateBackendBitSession {
     predictor: crate::mixture::RateBackendPredictor,
     semantics: BitStreamSemantics,
-    prefix: Option<BytePrefixMass>,
+    prefix: Option<BufferedBytePrefix>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufferedByteUpdateMode {
+    Adaptive,
+    Frozen,
+}
+
+impl BufferedByteUpdateMode {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Adaptive => "adaptive",
+            Self::Frozen => "conditioning-only",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BufferedBytePrefix {
+    mass: BytePrefixMass,
+    update_mode: Option<BufferedByteUpdateMode>,
+}
+
+impl BufferedBytePrefix {
+    fn new(mass: BytePrefixMass) -> Self {
+        Self {
+            mass,
+            update_mode: None,
+        }
+    }
+
+    fn prediction(&self) -> BinaryPrediction {
+        self.mass.prediction()
+    }
+
+    fn has_partial_bits(&self) -> bool {
+        self.mass.has_partial_bits()
+    }
+
+    fn record_mode(&mut self, requested: BufferedByteUpdateMode) -> InfotheoryResult<()> {
+        if let Some(active) = self.update_mode
+            && self.mass.has_partial_bits()
+            && active != requested
+        {
+            return Err(InfotheoryError::runtime(format!(
+                "byte-packed bit sessions cannot mix {} and {} updates within the same buffered byte; finish the byte with one mode, use `try_observe_bit`/`try_condition_bit` to handle this error explicitly, or switch to BitStreamSemantics::BinaryTokens for mid-byte mode changes",
+                active.verb(),
+                requested.verb(),
+            )));
+        }
+        self.update_mode = Some(requested);
+        Ok(())
+    }
 }
 
 fn byte_packed_total_symbols(total_bits: Option<u64>) -> Result<Option<u64>, String> {
@@ -157,44 +213,56 @@ impl RateBackendBitSession {
     }
 
     /// Predict and then observe one adaptive/fitting bit.
-    pub fn step_bit(&mut self, bit: bool) -> BinaryPrediction {
+    pub fn try_step_bit(&mut self, bit: bool) -> InfotheoryResult<BinaryPrediction> {
         let prediction = self.predict_bit();
-        self.observe_bit(bit);
-        prediction
+        self.try_observe_bit(bit)?;
+        Ok(prediction)
+    }
+
+    /// Predict and then observe one adaptive/fitting bit.
+    pub fn step_bit(&mut self, bit: bool) -> BinaryPrediction {
+        self.try_step_bit(bit)
+            .unwrap_or_else(|err| panic!("step_bit rejected an invalid bit-session update: {err}"))
     }
 
     /// Observe one adaptive/fitting bit.
-    pub fn observe_bit(&mut self, bit: bool) {
+    pub fn try_observe_bit(&mut self, bit: bool) -> InfotheoryResult<()> {
         match self.semantics {
-            BitStreamSemantics::BinaryTokens => self.predictor.update(u8::from(bit)),
+            BitStreamSemantics::BinaryTokens => {
+                self.predictor.update(u8::from(bit));
+                Ok(())
+            }
             BitStreamSemantics::BytePacked { order } => {
-                self.ensure_prefix(order);
-                let prefix = self.prefix.as_mut().expect("prefix initialized");
-                prefix.observe(bit);
-                if prefix.is_complete() {
-                    let symbol = prefix.symbol();
-                    self.predictor.update(symbol);
-                    self.prefix = None;
-                }
+                self.update_byte_packed_bit(bit, order, BufferedByteUpdateMode::Adaptive)
+            }
+        }
+    }
+
+    /// Advance conditioning state with one bit without fitting/adapting.
+    pub fn observe_bit(&mut self, bit: bool) {
+        self.try_observe_bit(bit).unwrap_or_else(|err| {
+            panic!("observe_bit rejected an invalid bit-session update: {err}")
+        });
+    }
+
+    /// Advance conditioning state with one bit without fitting/adapting.
+    pub fn try_condition_bit(&mut self, bit: bool) -> InfotheoryResult<()> {
+        match self.semantics {
+            BitStreamSemantics::BinaryTokens => {
+                self.predictor.update_frozen(u8::from(bit));
+                Ok(())
+            }
+            BitStreamSemantics::BytePacked { order } => {
+                self.update_byte_packed_bit(bit, order, BufferedByteUpdateMode::Frozen)
             }
         }
     }
 
     /// Advance conditioning state with one bit without fitting/adapting.
     pub fn condition_bit(&mut self, bit: bool) {
-        match self.semantics {
-            BitStreamSemantics::BinaryTokens => self.predictor.update_frozen(u8::from(bit)),
-            BitStreamSemantics::BytePacked { order } => {
-                self.ensure_prefix(order);
-                let prefix = self.prefix.as_mut().expect("prefix initialized");
-                prefix.observe(bit);
-                if prefix.is_complete() {
-                    let symbol = prefix.symbol();
-                    self.predictor.update_frozen(symbol);
-                    self.prefix = None;
-                }
-            }
-        }
+        self.try_condition_bit(bit).unwrap_or_else(|err| {
+            panic!("condition_bit rejected an invalid bit-session update: {err}")
+        });
     }
 
     /// Reset dynamic conditioning state while preserving fitted parameters/statistics.
@@ -213,7 +281,7 @@ impl RateBackendBitSession {
             && self
                 .prefix
                 .as_ref()
-                .is_some_and(BytePrefixMass::has_partial_bits)
+                .is_some_and(BufferedBytePrefix::has_partial_bits)
         {
             return Err(InfotheoryError::runtime(
                 "byte-packed bit streams must finish on a whole-byte boundary; use BitStreamSemantics::BinaryTokens for arbitrary-length bit streams",
@@ -231,7 +299,30 @@ impl RateBackendBitSession {
         }
         let mut logps = [0.0f64; 256];
         self.predictor.fill_log_probs(&mut logps);
-        self.prefix = Some(BytePrefixMass::from_log_probs(&logps, order));
+        self.prefix = Some(BufferedBytePrefix::new(BytePrefixMass::from_log_probs(
+            &logps, order,
+        )));
+    }
+
+    fn update_byte_packed_bit(
+        &mut self,
+        bit: bool,
+        order: BitOrder,
+        update_mode: BufferedByteUpdateMode,
+    ) -> InfotheoryResult<()> {
+        self.ensure_prefix(order);
+        let prefix = self.prefix.as_mut().expect("prefix initialized");
+        prefix.record_mode(update_mode)?;
+        prefix.mass.observe(bit);
+        if prefix.mass.is_complete() {
+            let symbol = prefix.mass.symbol();
+            match update_mode {
+                BufferedByteUpdateMode::Adaptive => self.predictor.update(symbol),
+                BufferedByteUpdateMode::Frozen => self.predictor.update_frozen(symbol),
+            }
+            self.prefix = None;
+        }
+        Ok(())
     }
 }
 

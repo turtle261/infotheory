@@ -238,40 +238,6 @@ fn set_log_weights_from_linear(experts: &mut [ExpertState], weights: &[f64]) {
     }
 }
 
-fn normalized_expert_prior_weights(experts: &[ExpertState]) -> Vec<f64> {
-    if experts.is_empty() {
-        return Vec::new();
-    }
-    let max_log = experts
-        .iter()
-        .map(|expert| expert.log_prior)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let mut weights = experts
-        .iter()
-        .map(|expert| {
-            if max_log.is_finite() {
-                (expert.log_prior - max_log).exp()
-            } else {
-                0.0
-            }
-        })
-        .collect::<Vec<_>>();
-    normalize_simplex_weights(&mut weights);
-    weights
-}
-
-fn reset_expert_cumulative_log_losses(experts: &mut [ExpertState]) {
-    for expert in experts {
-        expert.cum_log_loss = 0.0;
-    }
-}
-
-fn reset_expert_weights_to_prior(experts: &mut [ExpertState]) {
-    let prior = normalized_expert_prior_weights(experts);
-    set_log_weights_from_linear(experts, &prior);
-    reset_expert_cumulative_log_losses(experts);
-}
-
 /// Trait for online byte-level predictors that expose per-symbol log-probabilities.
 pub trait OnlineBytePredictorClone {
     /// Clone this predictor as a trait object.
@@ -2159,7 +2125,6 @@ impl BayesMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
-        reset_expert_weights_to_prior(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2332,7 +2297,6 @@ impl FadingBayesMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
-        reset_expert_weights_to_prior(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2559,8 +2523,6 @@ impl SwitchingMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
-        set_log_weights_from_linear(&mut self.experts, &self.prior);
-        reset_expert_cumulative_log_losses(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2698,8 +2660,6 @@ impl ConvexMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
-        self.lambda = normalized_expert_prior_weights(&self.experts);
-        reset_expert_cumulative_log_losses(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2992,7 +2952,6 @@ impl NeuralMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
-        reset_expert_cumulative_log_losses(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -3153,8 +3112,6 @@ impl MdlSelector {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
-        reset_expert_cumulative_log_losses(&mut self.experts);
-        self.last_best = 0;
         self.clear_stream_state();
         Ok(())
     }

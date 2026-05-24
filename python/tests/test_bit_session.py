@@ -217,6 +217,16 @@ def test_bit_session_predict_and_condition():
     sess.finish()
 
 
+def test_byte_packed_bit_session_rejects_mixed_update_modes_without_panicking_python():
+    backend = ait.RateBackend.ctw(6)
+    sess = ait.RateBackendBitSession(backend, total_bits=8, semantics="byte")
+
+    sess.condition_bit(True)
+
+    with pytest.raises(RuntimeError, match="cannot mix conditioning-only and adaptive updates"):
+        sess.observe_bit(False)
+
+
 def test_zpaq_bit_session_begin_bit_stream_restarts_without_frozen_reset():
     sess = ait.RateBackendBitSession(ait.RateBackend.zpaq("1"), total_bits=9, semantics="binary")
 

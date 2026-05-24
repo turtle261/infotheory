@@ -75,7 +75,10 @@ fn api_surface_byte_packed_bit_session_matches_byte_prediction_chain() {
         let mut product = 1.0f64;
         for bit_idx in 0..8u8 {
             let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-            product *= bit_session.step_bit(bit).prob(bit);
+            product *= bit_session
+                .try_step_bit(bit)
+                .expect("byte-packed step should remain in one update mode")
+                .prob(bit);
         }
         byte_session.observe(&[symbol]);
         assert!(
@@ -86,6 +89,59 @@ fn api_surface_byte_packed_bit_session_matches_byte_prediction_chain() {
 
     byte_session.finish().expect("byte finish");
     bit_session.finish().expect("bit finish");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_byte_packed_try_methods_reject_mixed_update_modes() {
+    let semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    let mut frozen_then_adaptive =
+        RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(8), semantics)
+            .expect("bit session");
+    for &bit in &[true, false, true] {
+        frozen_then_adaptive
+            .try_condition_bit(bit)
+            .expect("conditioning prefix");
+    }
+    let err = frozen_then_adaptive
+        .try_observe_bit(false)
+        .expect_err("mixed-mode byte updates must be rejected");
+    let message = err.to_string();
+    assert!(message.contains("cannot mix"));
+    assert!(message.contains("BinaryTokens"));
+
+    let mut adaptive_then_frozen =
+        RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(8), semantics)
+            .expect("bit session");
+    for &bit in &[true, false, true] {
+        adaptive_then_frozen
+            .try_observe_bit(bit)
+            .expect("adaptive prefix");
+    }
+    let err = adaptive_then_frozen
+        .try_condition_bit(false)
+        .expect_err("mixed-mode byte updates must be rejected");
+    assert!(err.to_string().contains("cannot mix"));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+#[should_panic(expected = "cannot mix")]
+fn api_surface_byte_packed_strict_methods_panic_on_mixed_update_modes() {
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        Some(8),
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+    for &bit in &[true, false, true] {
+        bit_session.condition_bit(bit);
+    }
+    bit_session.observe_bit(false);
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -240,6 +296,56 @@ fn api_surface_zpaq_rate_backend_session_begin_stream_does_not_require_frozen_re
     );
     session.finish().expect("zpaq rate finish");
     fresh.finish().expect("fresh zpaq rate finish");
+}
+
+#[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
+#[test]
+fn api_surface_mixture_begin_stream_matches_reset_frozen_for_resettable_experts() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 0 }),
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 }),
+            ],
+        )),
+    };
+    let train = b"ABABABABABABABABABABABABABABABAB";
+
+    let mut reset_session =
+        RateBackendSession::from_spec(backend.clone(), None).expect("reset session");
+    let mut restarted_session =
+        RateBackendSession::from_spec(backend.clone(), None).expect("restarted session");
+    let mut fresh_session = RateBackendSession::from_spec(backend, None).expect("fresh session");
+
+    reset_session.observe(train);
+    restarted_session.observe(train);
+
+    reset_session.reset_frozen(None).expect("reset_frozen");
+    restarted_session.begin_stream(None).expect("begin_stream");
+
+    let mut reset_row = [0.0f64; 256];
+    let mut restarted_row = [0.0f64; 256];
+    let mut fresh_row = [0.0f64; 256];
+    reset_session.fill_log_probs(&mut reset_row);
+    restarted_session.fill_log_probs(&mut restarted_row);
+    fresh_session.fill_log_probs(&mut fresh_row);
+
+    for byte in 0..256usize {
+        assert!(
+            (reset_row[byte] - restarted_row[byte]).abs() < 1e-12,
+            "mixture begin_stream must match reset_frozen at byte {byte}: reset={} restarted={}",
+            reset_row[byte],
+            restarted_row[byte]
+        );
+    }
+
+    let diverged_from_fresh =
+        (0..256usize).any(|byte| (reset_row[byte] - fresh_row[byte]).abs() > 1e-12);
+    assert!(
+        diverged_from_fresh,
+        "trained mixture restart should preserve learned mixture state instead of reverting to fresh priors"
+    );
 }
 
 #[cfg(all(

@@ -1699,16 +1699,23 @@ impl PyRateBackendBitSession {
         lock_recover(&self.inner).predict_one()
     }
 
-    fn step_bit(&self, bit: bool) -> PyBinaryPrediction {
-        lock_recover(&self.inner).step_bit(bit).into()
+    fn step_bit(&self, bit: bool) -> PyResult<PyBinaryPrediction> {
+        lock_recover(&self.inner)
+            .try_step_bit(bit)
+            .map(Into::into)
+            .map_err(py_infotheory_error)
     }
 
-    fn observe_bit(&self, bit: bool) {
-        lock_recover(&self.inner).observe_bit(bit);
+    fn observe_bit(&self, bit: bool) -> PyResult<()> {
+        lock_recover(&self.inner)
+            .try_observe_bit(bit)
+            .map_err(py_infotheory_error)
     }
 
-    fn condition_bit(&self, bit: bool) {
-        lock_recover(&self.inner).condition_bit(bit);
+    fn condition_bit(&self, bit: bool) -> PyResult<()> {
+        lock_recover(&self.inner)
+            .try_condition_bit(bit)
+            .map_err(py_infotheory_error)
     }
 
     #[pyo3(signature = (total_bits=None))]
