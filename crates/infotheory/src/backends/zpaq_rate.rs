@@ -12,17 +12,44 @@ const DEFAULT_MIN_PROB: f64 = 5.960_464_477_539_063e-8;
 #[cfg(feature = "backend-zpaq")]
 mod imp {
     use super::{DEFAULT_MIN_PROB, LN_2};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
     use zpaq_rs::StreamingCompressor;
 
-    struct ZpaqStreaming {
-        compressor: Option<StreamingCompressor>,
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ZpaqRateModelId(u64);
+
+    struct ActiveZpaqStream {
+        owner: ZpaqRateModelId,
+        method: String,
+        compressor: StreamingCompressor,
         last_bits: f64,
+    }
+
+    static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+    static ACTIVE_STREAM: OnceLock<Mutex<Option<ActiveZpaqStream>>> = OnceLock::new();
+
+    fn next_model_id() -> ZpaqRateModelId {
+        ZpaqRateModelId(NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn active_stream() -> &'static Mutex<Option<ActiveZpaqStream>> {
+        ACTIVE_STREAM.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Drop Infotheory's active ZPAQ rate stream before running another ZPAQ operation.
+    pub(crate) fn release_active_zpaq_rate_stream() {
+        if let Some(lock) = ACTIVE_STREAM.get() {
+            let mut slot = lock.lock().expect("zpaq active stream mutex poisoned");
+            drop(slot.take());
+        }
     }
 
     /// Stateful ZPAQ-backed estimator of sequential symbol log-probabilities.
     pub struct ZpaqRateModel {
-        stream: ZpaqStreaming,
+        id: ZpaqRateModelId,
         history: Vec<u8>,
+        history_bits: f64,
         pending_symbol: Option<u8>,
         pending_bits: f64,
         min_prob: f64,
@@ -36,12 +63,69 @@ mod imp {
             })
         }
 
-        fn replace_stream_compressor(&mut self) {
-            // Drop the previous compressor before building a new one because
-            // the underlying implementation can hold process-global state.
-            drop(self.stream.compressor.take());
-            self.stream.compressor = Some(Self::new_streaming_compressor(self.method.as_str()));
-            self.stream.last_bits = 0.0;
+        fn rebuild_active_stream_locked(&self, slot: &mut Option<ActiveZpaqStream>) {
+            drop(slot.take());
+            let mut compressor = Self::new_streaming_compressor(self.method.as_str());
+            let mut last_bits = 0.0;
+            for &symbol in &self.history {
+                compressor
+                    .push(symbol)
+                    .expect("zpaq streaming compression failed");
+                last_bits = compressor.bits();
+            }
+            *slot = Some(ActiveZpaqStream {
+                owner: self.id,
+                method: self.method.clone(),
+                compressor,
+                last_bits,
+            });
+        }
+
+        fn with_active_stream<R>(&self, f: impl FnOnce(&mut ActiveZpaqStream) -> R) -> R {
+            let mut slot = active_stream()
+                .lock()
+                .expect("zpaq active stream mutex poisoned");
+            let needs_rebuild = match slot.as_ref() {
+                Some(stream) => stream.owner != self.id || stream.method != self.method,
+                None => true,
+            };
+            if needs_rebuild {
+                self.rebuild_active_stream_locked(&mut slot);
+            }
+            let stream = slot
+                .as_mut()
+                .expect("zpaq active stream must exist after rebuild");
+            f(stream)
+        }
+
+        fn evict_owned_stream(&self) {
+            if let Some(lock) = ACTIVE_STREAM.get() {
+                if let Ok(mut slot) = lock.lock()
+                    && slot.as_ref().is_some_and(|stream| stream.owner == self.id)
+                {
+                    drop(slot.take());
+                }
+            }
+        }
+
+        fn ensure_active_at_history(&self) {
+            let mut slot = active_stream()
+                .lock()
+                .expect("zpaq active stream mutex poisoned");
+            self.rebuild_active_stream_locked(&mut slot);
+        }
+
+        fn encode_bits(&self, symbol: u8) -> (f64, f64) {
+            self.with_active_stream(|stream| {
+                let before = stream.last_bits;
+                stream
+                    .compressor
+                    .push(symbol)
+                    .expect("zpaq streaming compression failed");
+                let after = stream.compressor.bits();
+                stream.last_bits = after;
+                (after, (after - before).max(0.0))
+            })
         }
 
         /// Create a new model with the provided streamable ZPAQ `method`.
@@ -54,13 +138,15 @@ mod imp {
             } else {
                 DEFAULT_MIN_PROB
             };
+            release_active_zpaq_rate_stream();
+            zpaq_rs::validate_streaming_method(method.as_str()).unwrap_or_else(|e| {
+                panic!("ZPAQ rate backend requires a streamable method; got '{method}': {e}")
+            });
 
             Self {
-                stream: ZpaqStreaming {
-                    compressor: Some(Self::new_streaming_compressor(method.as_str())),
-                    last_bits: 0.0,
-                },
+                id: next_model_id(),
                 history: Vec::new(),
+                history_bits: 0.0,
                 pending_symbol: None,
                 pending_bits: 0.0,
                 min_prob,
@@ -73,9 +159,7 @@ mod imp {
         /// Newly constructed models are already at fresh-state, so the first
         /// call avoids redundant compressor reconstruction.
         pub fn begin_stream(&mut self) {
-            if self.history.is_empty()
-                && self.pending_symbol.is_none()
-                && self.stream.last_bits == 0.0
+            if self.history.is_empty() && self.pending_symbol.is_none() && self.history_bits == 0.0
             {
                 return;
             }
@@ -84,52 +168,16 @@ mod imp {
 
         /// Reset model state and clear any pending prediction cache.
         pub fn reset(&mut self) {
-            self.replace_stream_compressor();
+            self.evict_owned_stream();
             self.history.clear();
+            self.history_bits = 0.0;
             self.pending_symbol = None;
             self.pending_bits = 0.0;
         }
 
-        fn rebuild_stream_from_history(&mut self) {
-            self.replace_stream_compressor();
-            let history_len: usize = self.history.len();
-            for idx in 0..history_len {
-                let symbol: u8 = self.history[idx];
-                let _ = self.encode_bits(symbol);
-            }
-            self.pending_symbol = None;
-            self.pending_bits = 0.0;
-        }
-
-        fn log_prob_from_history(&self, symbol: u8) -> f64 {
-            let mut compressor = Self::new_streaming_compressor(self.method.as_str());
-            for &b in &self.history {
-                compressor
-                    .push(b)
-                    .expect("zpaq streaming compression failed");
-            }
-            let before = compressor.bits();
-            compressor
-                .push(symbol)
-                .expect("zpaq streaming compression failed");
-            let bits = (compressor.bits() - before).max(0.0);
+        fn log_prob_from_bits(min_prob: f64, bits: f64) -> f64 {
             let logp = -(bits * LN_2);
-            logp.max(self.min_prob.ln())
-        }
-
-        fn encode_bits(&mut self, symbol: u8) -> f64 {
-            let before = self.stream.last_bits;
-            let compressor = self
-                .stream
-                .compressor
-                .as_mut()
-                .expect("zpaq stream compressor must be initialized");
-            compressor
-                .push(symbol)
-                .expect("zpaq streaming compression failed");
-            let after = compressor.bits();
-            self.stream.last_bits = after;
-            (after - before).max(0.0)
+            logp.max(min_prob.ln())
         }
 
         /// Return `ln p(symbol | history)` under the current model state.
@@ -138,27 +186,32 @@ mod imp {
         pub fn log_prob(&mut self, symbol: u8) -> f64 {
             if let Some(pending) = self.pending_symbol {
                 if pending == symbol {
-                    let logp = -(self.pending_bits * LN_2);
-                    return logp.max(self.min_prob.ln());
+                    return Self::log_prob_from_bits(self.min_prob, self.pending_bits);
                 }
                 // We cannot rollback `StreamingCompressor`; rebuild to committed history.
-                self.rebuild_stream_from_history();
+                self.evict_owned_stream();
+                self.pending_symbol = None;
+                self.pending_bits = 0.0;
             }
 
-            let bits = self.encode_bits(symbol);
+            let (_, bits) = self.encode_bits(symbol);
             self.pending_symbol = Some(symbol);
             self.pending_bits = bits;
-            let logp = -(bits * LN_2);
-            logp.max(self.min_prob.ln())
+            Self::log_prob_from_bits(self.min_prob, bits)
         }
 
         /// Fill 256-way log-probabilities for the current committed history without mutation.
         pub fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
             // Treat fill as a read-only query of committed history.
-            self.rebuild_stream_from_history();
+            self.pending_symbol = None;
+            self.pending_bits = 0.0;
+            self.evict_owned_stream();
             for (sym, slot) in out.iter_mut().enumerate() {
-                *slot = self.log_prob_from_history(sym as u8);
+                let (_, bits) = self.encode_bits(sym as u8);
+                *slot = Self::log_prob_from_bits(self.min_prob, bits);
+                self.evict_owned_stream();
             }
+            self.ensure_active_at_history();
         }
 
         /// Advance model state with one observed symbol.
@@ -166,14 +219,19 @@ mod imp {
             if let Some(pending) = self.pending_symbol
                 && pending == symbol
             {
+                self.history_bits += self.pending_bits;
                 self.pending_symbol = None;
+                self.pending_bits = 0.0;
                 self.history.push(symbol);
                 return;
             }
             if self.pending_symbol.is_some() {
-                self.rebuild_stream_from_history();
+                self.evict_owned_stream();
+                self.pending_symbol = None;
+                self.pending_bits = 0.0;
             }
-            let _ = self.encode_bits(symbol);
+            let (after, _) = self.encode_bits(symbol);
+            self.history_bits = after;
             self.pending_symbol = None;
             self.pending_bits = 0.0;
             self.history.push(symbol);
@@ -184,11 +242,16 @@ mod imp {
             if data.is_empty() {
                 return 0.0;
             }
-            self.pending_symbol = None;
-            self.pending_bits = 0.0;
+            if self.pending_symbol.is_some() {
+                self.evict_owned_stream();
+                self.pending_symbol = None;
+                self.pending_bits = 0.0;
+            }
             let mut bits = 0.0;
             for &b in data {
-                bits += self.encode_bits(b);
+                let (after, delta) = self.encode_bits(b);
+                self.history_bits = after;
+                bits += -Self::log_prob_from_bits(self.min_prob, delta) / LN_2;
                 self.history.push(b);
             }
             bits
@@ -197,29 +260,30 @@ mod imp {
 
     impl Clone for ZpaqRateModel {
         fn clone(&self) -> Self {
-            let mut cloned = Self::new(self.method.clone(), self.min_prob);
-            if !self.history.is_empty() {
-                let _ = cloned.update_and_score(&self.history);
+            // Defer compressor construction so clone() never creates an
+            // overlapping `StreamingCompressor` with the source model.
+            Self {
+                id: next_model_id(),
+                history: self.history.clone(),
+                history_bits: self.history_bits,
+                pending_symbol: self.pending_symbol,
+                pending_bits: self.pending_bits,
+                min_prob: self.min_prob,
+                method: self.method.clone(),
             }
-            // Preserve speculative pending state so clone() is state-equivalent
-            // even when called between log_prob() and update().
-            if let Some(symbol) = self.pending_symbol {
-                let bits = cloned.encode_bits(symbol);
-                cloned.pending_symbol = Some(symbol);
-                cloned.pending_bits = bits;
-            } else {
-                cloned.pending_symbol = None;
-                cloned.pending_bits = 0.0;
-            }
-            cloned
+        }
+    }
+
+    impl Drop for ZpaqRateModel {
+        fn drop(&mut self) {
+            self.evict_owned_stream();
         }
     }
 
     /// Validate that `method` is streamable and accepted by the ZPAQ backend.
     pub fn validate_zpaq_rate_method(method: &str) -> Result<(), String> {
-        StreamingCompressor::new(method)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        release_active_zpaq_rate_stream();
+        zpaq_rs::validate_streaming_method(method).map_err(|e| e.to_string())
     }
 
     #[cfg(test)]
@@ -291,6 +355,25 @@ mod imp {
             let lp_b2 = model_b.log_prob(next);
             assert!((lp_a2 - lp_b2).abs() < 1e-9, "lp_a2={lp_a2} lp_b2={lp_b2}");
         }
+
+        #[test]
+        fn zpaq_validate_method_is_non_intrusive_with_live_model() {
+            let mut baseline = ZpaqRateModel::new("1", 1e-9);
+            let mut probe = ZpaqRateModel::new("1", 1e-9);
+            for &b in b"validate zpaq method while model is live" {
+                baseline.update(b);
+                probe.update(b);
+            }
+
+            validate_zpaq_rate_method("1").expect("streaming method should validate");
+
+            let lp_baseline = baseline.log_prob(b'v');
+            let lp_probe = probe.log_prob(b'v');
+            assert!(
+                (lp_baseline - lp_probe).abs() < 1e-9,
+                "validation disturbed live model state: baseline={lp_baseline} probe={lp_probe}"
+            );
+        }
     }
 }
 
@@ -334,9 +417,13 @@ mod imp {
     pub fn validate_zpaq_rate_method(_method: &str) -> Result<(), String> {
         Err("zpaq backend disabled at compile time".to_string())
     }
+
+    pub(crate) fn release_active_zpaq_rate_stream() {}
 }
 
 /// Stateful ZPAQ-based rate estimator.
 pub use imp::ZpaqRateModel;
+#[cfg(feature = "backend-zpaq")]
+pub(crate) use imp::release_active_zpaq_rate_stream;
 /// Validate that a ZPAQ method string is streamable and usable for rate modeling.
 pub use imp::validate_zpaq_rate_method;

@@ -6,6 +6,8 @@ use infotheory::api::{
 };
 #[cfg(feature = "backend-calibrated")]
 use infotheory::api::{CalibratedSpec, CalibrationContextKind};
+#[cfg(feature = "backend-zpaq")]
+use infotheory::api::{CompressionBackend, try_compress_bytes_backend};
 use infotheory::spec::CanonicalJson;
 use std::sync::Arc;
 
@@ -201,6 +203,13 @@ fn api_surface_zpaq_rate_backend_session_begin_stream_does_not_require_frozen_re
     let first_row = row;
 
     session.observe(&[0, 1, 0, 1, 1, 0, 1, 0, 1]);
+    // Exercise ordinary ZPAQ compression in-process before stream restart;
+    // restarted session probabilities must still match a fresh session.
+    let zpaq_compression = CompressionBackend::zpaq("1")
+        .compile()
+        .expect("compile zpaq compression backend");
+    let _ = try_compress_bytes_backend(b"zpaq helper warmup", &zpaq_compression)
+        .expect("zpaq helper compression");
     session
         .begin_stream(Some(9))
         .expect("zpaq stream should be restartable repeatedly");
