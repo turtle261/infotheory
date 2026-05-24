@@ -238,6 +238,40 @@ fn set_log_weights_from_linear(experts: &mut [ExpertState], weights: &[f64]) {
     }
 }
 
+fn normalized_expert_prior_weights(experts: &[ExpertState]) -> Vec<f64> {
+    if experts.is_empty() {
+        return Vec::new();
+    }
+    let max_log = experts
+        .iter()
+        .map(|expert| expert.log_prior)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut weights = experts
+        .iter()
+        .map(|expert| {
+            if max_log.is_finite() {
+                (expert.log_prior - max_log).exp()
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    normalize_simplex_weights(&mut weights);
+    weights
+}
+
+fn reset_expert_cumulative_log_losses(experts: &mut [ExpertState]) {
+    for expert in experts {
+        expert.cum_log_loss = 0.0;
+    }
+}
+
+fn reset_expert_weights_to_prior(experts: &mut [ExpertState]) {
+    let prior = normalized_expert_prior_weights(experts);
+    set_log_weights_from_linear(experts, &prior);
+    reset_expert_cumulative_log_losses(experts);
+}
+
 /// Trait for online byte-level predictors that expose per-symbol log-probabilities.
 pub trait OnlineBytePredictorClone {
     /// Clone this predictor as a trait object.
@@ -928,7 +962,10 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw { .. } => Ok(()),
             #[cfg(feature = "backend-zpaq")]
-            RateBackendPredictor::Zpaq { .. } => Ok(()),
+            RateBackendPredictor::Zpaq { model } => {
+                model.begin_stream();
+                Ok(())
+            }
             #[cfg(feature = "backend-particle")]
             RateBackendPredictor::Particle { .. } => Ok(()),
             #[cfg(feature = "backend-rwkv")]
@@ -1445,6 +1482,26 @@ impl OnlineBytePredictor for RateBackendPredictor {
     }
 
     fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        #[cfg(feature = "backend-zpaq")]
+        if matches!(self, RateBackendPredictor::Zpaq { .. }) {
+            return Err("plugin entropy is not supported for zpaq rate backends".to_string());
+        }
+        #[cfg(feature = "backend-mixture")]
+        if let RateBackendPredictor::Mixture { runtime } = self
+            && !runtime.supports_frozen_reset()
+        {
+            return Err(
+                "plugin entropy is not supported for mixture rate backends with non-resettable experts"
+                    .to_string(),
+            );
+        }
+        #[cfg(feature = "backend-calibrated")]
+        if let RateBackendPredictor::Calibrated { base, .. } = self
+            && !base.supports_frozen_reset()
+        {
+            return base.reset_frozen(total_symbols);
+        }
+
         self.finish_stream()?;
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -2102,6 +2159,7 @@ impl BayesMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_expert_weights_to_prior(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2274,6 +2332,7 @@ impl FadingBayesMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_expert_weights_to_prior(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2500,6 +2559,8 @@ impl SwitchingMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        set_log_weights_from_linear(&mut self.experts, &self.prior);
+        reset_expert_cumulative_log_losses(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2637,6 +2698,8 @@ impl ConvexMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        self.lambda = normalized_expert_prior_weights(&self.experts);
+        reset_expert_cumulative_log_losses(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2929,6 +2992,7 @@ impl NeuralMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_expert_cumulative_log_losses(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -3089,6 +3153,8 @@ impl MdlSelector {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_expert_cumulative_log_losses(&mut self.experts);
+        self.last_best = 0;
         self.clear_stream_state();
         Ok(())
     }
@@ -3663,6 +3729,71 @@ mod tests {
         fn update(&mut self, _symbol: u8) {}
     }
 
+    #[derive(Clone)]
+    struct StatePreservingFreshPredict {
+        learned: usize,
+        began: bool,
+    }
+
+    impl OnlineBytePredictor for StatePreservingFreshPredict {
+        fn begin_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.began = true;
+            Ok(())
+        }
+
+        fn reset_frozen(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.began = true;
+            Ok(())
+        }
+
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            if self.began && self.learned > 0 && symbol == b'K' {
+                0.0
+            } else {
+                -12.0
+            }
+        }
+
+        fn update(&mut self, symbol: u8) {
+            if symbol == b'K' {
+                self.learned += 1;
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingNonResettableFreshPredict {
+        learned: usize,
+        begin_calls: Arc<AtomicUsize>,
+    }
+
+    impl OnlineBytePredictor for FailingNonResettableFreshPredict {
+        fn supports_frozen_reset(&self) -> bool {
+            false
+        }
+
+        fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+            self.begin_calls.fetch_add(1, Ordering::Relaxed);
+            total_symbols
+                .map(|_| ())
+                .ok_or_else(|| "missing total symbols".to_string())
+        }
+
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            if self.learned > 0 && symbol == b'Q' {
+                0.0
+            } else {
+                -15.0
+            }
+        }
+
+        fn update(&mut self, symbol: u8) {
+            if symbol == b'Q' {
+                self.learned += 1;
+            }
+        }
+    }
+
     fn assert_log_prob_update_matches_separate(label: &str, backend: RateBackend) {
         let mut separate = RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB);
         let mut combined = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
@@ -4009,6 +4140,94 @@ mod tests {
         runtime.begin_stream(Some(123)).expect("begin stream");
         let _ = runtime.step(0);
         assert_eq!(seen_total.load(Ordering::Relaxed), 123);
+    }
+
+    #[test]
+    fn runtime_begin_fresh_stream_preserves_resettable_expert_state() {
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let cfg = {
+            let build_calls = build_calls.clone();
+            ExpertConfig::uniform("state-preserving", move || {
+                build_calls.fetch_add(1, Ordering::Relaxed);
+                Box::new(StatePreservingFreshPredict {
+                    learned: 0,
+                    began: false,
+                })
+            })
+        };
+
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![crate::MixtureExpertSpec {
+                name: Some("state-preserving".to_string()),
+                log_prior: 0.0,
+                backend: RateBackend::Ctw { depth: 1 },
+            }],
+        );
+        let mut runtime = build_mixture_runtime(&spec, &[cfg]).expect("runtime");
+        runtime.begin_stream(Some(1)).expect("begin stream");
+        let _ = runtime.step(b'K');
+
+        runtime
+            .begin_fresh_stream(Some(1))
+            .expect("fresh stream restart");
+
+        assert_eq!(
+            build_calls.load(Ordering::Relaxed),
+            1,
+            "resettable experts must not be rebuilt for fresh stream restarts"
+        );
+        let logp = runtime.peek_log_prob(b'K');
+        assert!(
+            logp > -1.0,
+            "fresh stream restart should preserve fitted expert state; logp={logp}"
+        );
+    }
+
+    #[test]
+    fn runtime_begin_fresh_stream_failure_preserves_existing_expert() {
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let begin_calls = Arc::new(AtomicUsize::new(0));
+        let cfg = {
+            let build_calls = build_calls.clone();
+            let begin_calls = begin_calls.clone();
+            ExpertConfig::uniform("non-resettable", move || {
+                build_calls.fetch_add(1, Ordering::Relaxed);
+                Box::new(FailingNonResettableFreshPredict {
+                    learned: 0,
+                    begin_calls: begin_calls.clone(),
+                })
+            })
+        };
+
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![crate::MixtureExpertSpec {
+                name: Some("non-resettable".to_string()),
+                log_prior: 0.0,
+                backend: RateBackend::Ctw { depth: 1 },
+            }],
+        );
+        let mut runtime = build_mixture_runtime(&spec, &[cfg]).expect("runtime");
+        runtime.begin_stream(Some(1)).expect("begin stream");
+        let _ = runtime.step(b'Q');
+
+        let err = runtime
+            .begin_fresh_stream(None)
+            .expect_err("fresh stream restart should report the expert begin_stream failure");
+
+        assert!(err.contains("missing total symbols"));
+        assert_eq!(
+            build_calls.load(Ordering::Relaxed),
+            1,
+            "failed fresh stream restarts must not rebuild or discard the old expert"
+        );
+        assert_eq!(begin_calls.load(Ordering::Relaxed), 2);
+        let logp = runtime.peek_log_prob(b'Q');
+        assert!(
+            logp > -1.0,
+            "old expert should remain usable after failed fresh restart; logp={logp}"
+        );
     }
 
     #[test]

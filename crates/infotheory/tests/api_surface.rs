@@ -1,5 +1,7 @@
+#[allow(unused_imports)]
+use infotheory::api::BitOrder;
 use infotheory::api::{
-    BitOrder, BitStreamSemantics, MixtureExpertSpec, MixtureKind, MixtureSpec, OnlineBitPredictor,
+    BitStreamSemantics, MixtureExpertSpec, MixtureKind, MixtureSpec, OnlineBitPredictor,
     ParticleSpec, RateBackend, RateBackendBitSession, RateBackendSession,
 };
 #[cfg(feature = "backend-calibrated")]
@@ -173,6 +175,64 @@ fn api_surface_zpaq_bit_session_begin_stream_does_not_require_frozen_reset() {
     bit_session.finish().expect("zpaq bit finish");
 }
 
+#[cfg(feature = "backend-zpaq")]
+#[test]
+fn api_surface_zpaq_rate_backend_session_begin_stream_does_not_require_frozen_reset() {
+    let mut session = RateBackendSession::from_spec(
+        RateBackend::Zpaq {
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
+        },
+        Some(9),
+    )
+    .expect("zpaq rate session");
+
+    let reset_err = session
+        .reset_frozen(Some(9))
+        .expect_err("zpaq must continue to reject frozen-reset semantics");
+    assert!(reset_err.to_string().contains("plugin entropy"));
+
+    session
+        .begin_stream(Some(9))
+        .expect("zpaq stream restarts should use begin/finish lifecycle hooks");
+
+    let mut row = [0.0f64; 256];
+    session.fill_log_probs(&mut row);
+    assert!(row.iter().all(|lp| lp.is_finite()));
+    let first_row = row;
+
+    session.observe(&[0, 1, 0, 1, 1, 0, 1, 0, 1]);
+    session
+        .begin_stream(Some(9))
+        .expect("zpaq stream should be restartable repeatedly");
+    let mut restarted_row = [0.0f64; 256];
+    session.fill_log_probs(&mut restarted_row);
+    let mut fresh = RateBackendSession::from_spec(
+        RateBackend::Zpaq {
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
+        },
+        Some(9),
+    )
+    .expect("fresh zpaq rate session");
+    let mut fresh_row = [0.0f64; 256];
+    fresh.fill_log_probs(&mut fresh_row);
+    for idx in 0..256usize {
+        assert!(
+            (restarted_row[idx] - fresh_row[idx]).abs() < 1e-12,
+            "zpaq restart must match fresh-session state at symbol {idx}: restarted={} fresh={}",
+            restarted_row[idx],
+            fresh_row[idx]
+        );
+    }
+    // Sanity check: this test should fail if restart preserves post-observation history.
+    let changed = (0..256usize).any(|idx| (first_row[idx] - restarted_row[idx]).abs() > 1e-12);
+    assert!(
+        !changed,
+        "zpaq restart should return to the initial stream state"
+    );
+    session.finish().expect("zpaq rate finish");
+    fresh.finish().expect("fresh zpaq rate finish");
+}
+
 #[cfg(all(
     feature = "backend-mixture",
     feature = "backend-zpaq",
@@ -214,6 +274,55 @@ fn api_surface_mixture_with_zpaq_expert_can_restart_bit_streams() {
     }
 
     bit_session.finish().expect("mixture-zpaq bit finish");
+}
+
+#[cfg(all(
+    feature = "backend-mixture",
+    feature = "backend-zpaq",
+    feature = "backend-ctw"
+))]
+#[test]
+fn api_surface_mixture_with_zpaq_rate_backend_session_can_restart_streams() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 }),
+                MixtureExpertSpec::new(RateBackend::Zpaq {
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
+                }),
+            ],
+        )),
+    };
+    let mut session = RateBackendSession::from_spec(backend, Some(9)).expect("mixture session");
+
+    let reset_err = session
+        .reset_frozen(Some(9))
+        .expect_err("mixtures containing zpaq experts cannot satisfy frozen-reset semantics");
+    assert!(reset_err.to_string().contains("plugin entropy"));
+
+    session
+        .begin_stream(Some(9))
+        .expect("mixture stream restarts should use begin/finish lifecycle hooks");
+
+    let mut row = [0.0f64; 256];
+    session.fill_log_probs(&mut row);
+    assert!(row.iter().all(|lp| lp.is_finite()));
+    let first_row = row;
+
+    session.observe(&[1, 0, 1, 0, 1, 1, 0, 0, 1]);
+    session
+        .begin_stream(Some(9))
+        .expect("mixture stream should be restartable repeatedly");
+    let mut restarted_row = [0.0f64; 256];
+    session.fill_log_probs(&mut restarted_row);
+    assert!(restarted_row.iter().all(|lp| lp.is_finite()));
+    let changed = (0..256usize).any(|idx| (first_row[idx] - restarted_row[idx]).abs() > 1e-12);
+    assert!(
+        changed,
+        "mixture+zpaq restart should preserve fitted state from resettable experts"
+    );
+    session.finish().expect("mixture rate finish");
 }
 
 #[cfg(feature = "backend-ctw")]

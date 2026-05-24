@@ -315,6 +315,17 @@ impl RateBackendSession {
             .map_err(InfotheoryError::runtime)
     }
 
+    /// Start a new stream while preserving each backend's semantic contract.
+    ///
+    /// Backends that support frozen-reset semantics will restart via
+    /// `reset_frozen`. Backends that do not (for example ZPAQ) restart through
+    /// ordinary stream lifecycle hooks instead.
+    pub fn begin_stream(&mut self, total_symbols: Option<u64>) -> InfotheoryResult<()> {
+        self.predictor
+            .begin_fresh_stream(total_symbols)
+            .map_err(InfotheoryError::runtime)
+    }
+
     /// Fill the 256-way next-byte log-probabilities.
     pub fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         self.predictor.fill_log_probs(out);

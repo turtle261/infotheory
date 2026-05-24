@@ -15,7 +15,7 @@ mod imp {
     use zpaq_rs::StreamingCompressor;
 
     struct ZpaqStreaming {
-        compressor: StreamingCompressor,
+        compressor: Option<StreamingCompressor>,
         last_bits: f64,
     }
 
@@ -30,6 +30,20 @@ mod imp {
     }
 
     impl ZpaqRateModel {
+        fn new_streaming_compressor(method: &str) -> StreamingCompressor {
+            StreamingCompressor::new(method).unwrap_or_else(|e| {
+                panic!("ZPAQ rate backend requires a streamable method; got '{method}': {e}")
+            })
+        }
+
+        fn replace_stream_compressor(&mut self) {
+            // Drop the previous compressor before building a new one because
+            // the underlying implementation can hold process-global state.
+            drop(self.stream.compressor.take());
+            self.stream.compressor = Some(Self::new_streaming_compressor(self.method.as_str()));
+            self.stream.last_bits = 0.0;
+        }
+
         /// Create a new model with the provided streamable ZPAQ `method`.
         ///
         /// `min_prob` clamps very small probabilities for numerical stability.
@@ -41,13 +55,9 @@ mod imp {
                 DEFAULT_MIN_PROB
             };
 
-            let compressor = StreamingCompressor::new(method.as_str()).unwrap_or_else(|e| {
-                panic!("ZPAQ rate backend requires a streamable method; got '{method}': {e}")
-            });
-
             Self {
                 stream: ZpaqStreaming {
-                    compressor,
+                    compressor: Some(Self::new_streaming_compressor(method.as_str())),
                     last_bits: 0.0,
                 },
                 history: Vec::new(),
@@ -58,41 +68,41 @@ mod imp {
             }
         }
 
+        /// Begin a fresh stream lifecycle.
+        ///
+        /// Newly constructed models are already at fresh-state, so the first
+        /// call avoids redundant compressor reconstruction.
+        pub fn begin_stream(&mut self) {
+            if self.history.is_empty()
+                && self.pending_symbol.is_none()
+                && self.stream.last_bits == 0.0
+            {
+                return;
+            }
+            self.reset();
+        }
+
         /// Reset model state and clear any pending prediction cache.
         pub fn reset(&mut self) {
-            let method = self.method.clone();
-            let compressor = StreamingCompressor::new(method.as_str()).unwrap_or_else(|e| {
-                panic!("ZPAQ rate backend requires a streamable method; got '{method}': {e}")
-            });
-            self.stream = ZpaqStreaming {
-                compressor,
-                last_bits: 0.0,
-            };
+            self.replace_stream_compressor();
             self.history.clear();
             self.pending_symbol = None;
             self.pending_bits = 0.0;
         }
 
         fn rebuild_stream_from_history(&mut self) {
-            let method = self.method.clone();
-            let compressor = StreamingCompressor::new(method.as_str()).unwrap_or_else(|e| {
-                panic!("ZPAQ rate backend requires a streamable method; got '{method}': {e}")
-            });
-            self.stream = ZpaqStreaming {
-                compressor,
-                last_bits: 0.0,
-            };
-            let history = self.history.clone();
-            for b in history {
-                let _ = self.encode_bits(b);
+            self.replace_stream_compressor();
+            let history_len: usize = self.history.len();
+            for idx in 0..history_len {
+                let symbol: u8 = self.history[idx];
+                let _ = self.encode_bits(symbol);
             }
             self.pending_symbol = None;
             self.pending_bits = 0.0;
         }
 
         fn log_prob_from_history(&self, symbol: u8) -> f64 {
-            let mut compressor =
-                StreamingCompressor::new(self.method.as_str()).expect("zpaq streaming new failed");
+            let mut compressor = Self::new_streaming_compressor(self.method.as_str());
             for &b in &self.history {
                 compressor
                     .push(b)
@@ -109,11 +119,15 @@ mod imp {
 
         fn encode_bits(&mut self, symbol: u8) -> f64 {
             let before = self.stream.last_bits;
-            self.stream
+            let compressor = self
+                .stream
                 .compressor
+                .as_mut()
+                .expect("zpaq stream compressor must be initialized");
+            compressor
                 .push(symbol)
                 .expect("zpaq streaming compression failed");
-            let after = self.stream.compressor.bits();
+            let after = compressor.bits();
             self.stream.last_bits = after;
             (after - before).max(0.0)
         }

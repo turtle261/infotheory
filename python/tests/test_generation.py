@@ -1,6 +1,7 @@
 import math
 
 import infotheory_rs as ait
+import pytest
 
 
 PROMPT = (
@@ -82,6 +83,66 @@ def test_generation_session_fill_log_probs_and_reset_frozen():
 
     assert len(first) == 8
     assert first == second
+
+
+def test_generation_session_begin_stream_restarts_zpaq_without_frozen_reset():
+    session = ait.RateBackendSession(ait.RateBackend.zpaq("1"), total_symbols=9)
+
+    with pytest.raises(RuntimeError, match="plugin entropy"):
+        session.reset_frozen(9)
+
+    session.begin_stream(9)
+    initial = session.fill_log_probs()
+    assert _finite_log_probs(initial)
+
+    session.observe(bytes([0, 1, 0, 1, 1, 0, 1, 0, 1]))
+    session.begin_stream(9)
+    restarted = session.fill_log_probs()
+    assert _finite_log_probs(restarted)
+
+    fresh = ait.RateBackendSession(ait.RateBackend.zpaq("1"), total_symbols=9)
+    expected = fresh.fill_log_probs()
+    assert _finite_log_probs(expected)
+    for idx in range(256):
+        assert abs(restarted[idx] - expected[idx]) < 1e-12
+        assert abs(initial[idx] - restarted[idx]) < 1e-12
+
+    session.finish()
+    fresh.finish()
+
+
+def test_generation_session_begin_stream_restarts_mixture_with_zpaq_without_frozen_reset():
+    backend = ait.RateBackend.mixture(
+        ait.MixtureSpec(
+            ait.MixtureKind.Bayes,
+            [
+                ait.MixtureExpertSpec(ait.RateBackend.ctw(6)),
+                ait.MixtureExpertSpec(ait.RateBackend.zpaq("1")),
+            ],
+        )
+    )
+    session = ait.RateBackendSession(backend, total_symbols=9)
+
+    with pytest.raises(RuntimeError, match="plugin entropy"):
+        session.reset_frozen(9)
+
+    session.begin_stream(9)
+    initial = session.fill_log_probs()
+    assert _finite_log_probs(initial)
+
+    session.observe(bytes([1, 0, 1, 0, 1, 1, 0, 0, 1]))
+    session.begin_stream(9)
+    restarted = session.fill_log_probs()
+    assert _finite_log_probs(restarted)
+
+    fresh = ait.RateBackendSession(backend, total_symbols=9)
+    expected = fresh.fill_log_probs()
+    assert _finite_log_probs(expected)
+    any_changed = any(abs(restarted[idx] - expected[idx]) > 1e-12 for idx in range(256))
+    assert any_changed, "mixture+zpaq restart should preserve fitted state from resettable experts"
+
+    session.finish()
+    fresh.finish()
 
 
 def test_generation_is_deterministic_across_core_backends():

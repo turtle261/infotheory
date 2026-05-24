@@ -4,8 +4,8 @@ use infotheory::api::{
     self, BinaryPrediction, BitOrder, BitStreamSemantics, BytePrefixMass, CalibratedSpec,
     CalibrationContextKind, CompiledCompressionBackend, CompiledRateBackend, CompressionBackend,
     GenerationConfig, GenerationStrategy, GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec,
-    MixtureKind, MixtureScheduleMode, MixtureSpec, NcdVariant, ParticleSpec, RateBackend,
-    RateBackendBitSession, RateBackendSession,
+    MixtureKind, MixtureScheduleMode, MixtureSpec, NcdVariant, OnlineBitPredictor, ParticleSpec,
+    RateBackend, RateBackendBitSession, RateBackendSession,
 };
 use infotheory::error::InfotheoryError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -1246,6 +1246,7 @@ impl PyInfotheoryCtx {
             .map_err(py_infotheory_error)?;
         Ok(PyRateBackendBitSession {
             inner: Arc::new(Mutex::new(inner)),
+            semantics: sem,
         })
     }
 
@@ -1320,6 +1321,13 @@ impl PyRateBackendSession {
     fn reset_frozen(&self, total_symbols: Option<u64>) -> PyResult<()> {
         lock_recover(&self.inner)
             .reset_frozen(total_symbols)
+            .map_err(py_infotheory_error)
+    }
+
+    #[pyo3(signature = (total_symbols=None))]
+    fn begin_stream(&self, total_symbols: Option<u64>) -> PyResult<()> {
+        lock_recover(&self.inner)
+            .begin_stream(total_symbols)
             .map_err(py_infotheory_error)
     }
 
@@ -1653,6 +1661,7 @@ impl PyBytePrefixMass {
 #[derive(Clone)]
 struct PyRateBackendBitSession {
     inner: Arc<Mutex<RateBackendBitSession>>,
+    semantics: BitStreamSemantics,
 }
 
 #[pymethods]
@@ -1677,6 +1686,7 @@ impl PyRateBackendBitSession {
             .map_err(py_infotheory_error)?;
             Ok(Self {
                 inner: Arc::new(Mutex::new(inner)),
+                semantics: sem,
             })
         })
     }
@@ -1706,6 +1716,21 @@ impl PyRateBackendBitSession {
         lock_recover(&self.inner)
             .reset_frozen(total_bits)
             .map_err(py_infotheory_error)
+    }
+
+    #[pyo3(signature = (total_bits=None, semantics=None))]
+    fn begin_bit_stream(
+        &self,
+        total_bits: Option<u64>,
+        semantics: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let sem = match semantics {
+            Some(s) => parse_bit_stream_semantics_value(s)?,
+            None => self.semantics,
+        };
+        lock_recover(&self.inner)
+            .begin_bit_stream(total_bits, sem)
+            .map_err(|err| py_infotheory_error(InfotheoryError::runtime(err)))
     }
 
     fn finish(&self) -> PyResult<()> {

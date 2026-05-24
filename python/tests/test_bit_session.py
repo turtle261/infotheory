@@ -217,6 +217,47 @@ def test_bit_session_predict_and_condition():
     sess.finish()
 
 
+def test_zpaq_bit_session_begin_bit_stream_restarts_without_frozen_reset():
+    sess = ait.RateBackendBitSession(ait.RateBackend.zpaq("1"), total_bits=9, semantics="binary")
+
+    with pytest.raises(RuntimeError, match="plugin entropy"):
+        sess.reset_frozen(total_bits=9)
+
+    sess.begin_bit_stream(total_bits=9)
+
+    for bit in [True, False, True, True, False, False, True, False, True]:
+        pred = sess.step_bit(bit)
+        assert abs((pred.p0 + pred.p1) - 1.0) < 1e-12
+
+    with pytest.raises(RuntimeError, match="semantics are fixed"):
+        sess.begin_bit_stream(total_bits=9, semantics="byte")
+
+    sess.finish()
+
+
+def test_mixture_with_zpaq_bit_session_begin_bit_stream_restarts_without_frozen_reset():
+    mixture_spec = ait.MixtureSpec(
+        ait.MixtureKind.Bayes,
+        [
+            ait.MixtureExpertSpec(ait.RateBackend.ctw(6)),
+            ait.MixtureExpertSpec(ait.RateBackend.zpaq("1")),
+        ],
+    )
+    backend = ait.RateBackend.mixture(mixture_spec)
+    sess = ait.RateBackendBitSession(backend, total_bits=9, semantics="binary")
+
+    with pytest.raises(RuntimeError, match="plugin entropy"):
+        sess.reset_frozen(total_bits=9)
+
+    sess.begin_bit_stream(total_bits=9)
+
+    for bit in [True, False, True, False, True, True, False, False, True]:
+        pred = sess.step_bit(bit)
+        assert abs((pred.p0 + pred.p1) - 1.0) < 1e-12
+
+    sess.finish()
+
+
 def test_ctx_rate_backend_bit_session_delegates_to_default_backend():
     rb = ait.RateBackend.ctw(8)
     cb = ait.CompressionBackend.zpaq("5")
