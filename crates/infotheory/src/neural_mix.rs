@@ -67,6 +67,36 @@ impl NeuralMixCore {
         }
     }
 
+    pub(crate) fn reset_to_priors(&mut self, prior_weights: &[f64]) {
+        debug_assert_eq!(prior_weights.len(), self.expert_count);
+        for table in &mut self.stage1_tables {
+            table.fill(0.0);
+        }
+        if self.expert_count > 0
+            && let Some(global_table) = self.stage1_tables.first_mut()
+        {
+            for (dst, &p) in global_table[..self.expert_count]
+                .iter_mut()
+                .zip(prior_weights.iter())
+            {
+                let p = if p.is_finite() { p.max(1e-12) } else { 1e-12 };
+                *dst = p.ln();
+            }
+        }
+        for row in &mut self.stage2_table {
+            row.fill(0.0);
+        }
+        self.context = NeuralContextState::default();
+        self.expert_probs.fill(0.0);
+        self.stage1_mix.fill(0.0);
+        self.stage1_probs.fill(0.0);
+        self.stage2_mix.fill(0.0);
+        self.expert_weights.fill(0.0);
+        self.mix_prob = 1.0 / 256.0;
+        self.context_mixtures_valid = false;
+        self.evaluated = false;
+    }
+
     #[inline]
     pub(crate) fn history_state(&self) -> NeuralHistoryState {
         self.context

@@ -12,7 +12,8 @@ use infotheory::aixi::model::{
     CtwPredictor, Predictor, RateBackendBitPredictor, RateBackendBitPredictorConfig, RosaPredictor,
 };
 use infotheory::api::{
-    MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend,
+    BitStreamSemantics, MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind, MixtureSpec,
+    RateBackend,
 };
 use std::sync::Arc;
 use support::aixi_envs::{DeterministicBinaryEnv, SeededCoinFlipEnv};
@@ -99,6 +100,13 @@ fn rosa_update_revert_consistency() {
     test_predictor_revert(Box::new(RosaPredictor::new(8)), "ROSA");
 }
 
+#[test]
+fn default_agent_config_validates() {
+    AgentConfig::default()
+        .validate()
+        .expect("default MC-AIXI config should satisfy its own contract");
+}
+
 fn nested_generic_backend() -> RateBackend {
     let inner = MixtureSpec::new(
         MixtureKind::Bayes,
@@ -167,8 +175,12 @@ fn assert_snapshot_eq(actual: (f64, f64), expected: (f64, f64), label: &str) {
 
 #[test]
 fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
-    let config =
-        RateBackendBitPredictorConfig::compile(nested_generic_backend(), 1e-12).expect("config");
+    let config = RateBackendBitPredictorConfig::compile_with_semantics(
+        nested_generic_backend(),
+        1e-12,
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("config");
     let mut predictor = RateBackendBitPredictor::new(config).expect("valid predictor");
 
     let initial = predictor_snapshot(&mut predictor);
@@ -208,9 +220,12 @@ fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
 
 #[test]
 fn rate_backend_bit_predictor_roundtrips_sequitur_backend() {
-    let config =
-        RateBackendBitPredictorConfig::compile(RateBackend::Sequitur { context_bytes: 32 }, 1e-12)
-            .expect("config");
+    let config = RateBackendBitPredictorConfig::compile_with_semantics(
+        RateBackend::Sequitur { context_bytes: 32 },
+        1e-12,
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("config");
     let mut predictor = RateBackendBitPredictor::new(config).expect("valid sequitur predictor");
 
     let initial = predictor_snapshot(&mut predictor);
@@ -245,6 +260,32 @@ fn rate_backend_bit_predictor_roundtrips_sequitur_backend() {
         predictor_snapshot(&mut predictor),
         after_frozen,
         "sequitur redo after frozen update",
+    );
+}
+
+#[test]
+fn rate_backend_bit_predictor_respects_custom_min_prob_floor() {
+    let config = RateBackendBitPredictorConfig::compile_with_semantics(
+        RateBackend::Ctw { depth: 8 },
+        0.49,
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("config");
+    let mut predictor = RateBackendBitPredictor::new(config).expect("valid predictor");
+
+    for _ in 0..64 {
+        predictor.update(true);
+    }
+
+    let p1 = predictor.predict_prob(true);
+    let p0 = predictor.predict_prob(false);
+    assert!(
+        (0.49..=0.51).contains(&p1),
+        "custom min_prob floor must clamp P(1); got {p1}"
+    );
+    assert!(
+        (0.49..=0.51).contains(&p0),
+        "custom min_prob floor must clamp P(0); got {p0}"
     );
 }
 
@@ -336,6 +377,7 @@ fn agent_action_trace_on_deterministic_env(mut agent: Agent, steps: usize) -> Ve
 fn generic_agent_config(rate_backend: RateBackend) -> AgentConfig {
     let mut cfg = AgentConfig::default();
     cfg.rate_backend = rate_backend;
+    cfg.bit_stream_semantics = infotheory::api::BitStreamSemantics::BinaryTokens;
     cfg.agent_horizon = 5;
     cfg.observation_bits = 1;
     cfg.observation_stream_len = 1;
@@ -399,6 +441,7 @@ fn deeply_nested_bayes_backend(depth: usize) -> RateBackend {
 #[test]
 fn agent_solves_ctw_test_environment() {
     let mut config = AgentConfig::default();
+    config.bit_stream_semantics = infotheory::api::BitStreamSemantics::BinaryTokens;
     config.rate_backend = RateBackend::FacCtw {
         base_depth: 8,
         num_percept_bits: 2,
@@ -440,6 +483,7 @@ fn agent_solves_ctw_test_environment() {
 #[test]
 fn agent_regret_sublinear_coinflip() {
     let mut config = AgentConfig::default();
+    config.bit_stream_semantics = infotheory::api::BitStreamSemantics::BinaryTokens;
     config.rate_backend = RateBackend::FacCtw {
         base_depth: 4,
         num_percept_bits: 2,
@@ -481,6 +525,7 @@ fn agent_regret_sublinear_coinflip() {
 #[test]
 fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
     let mut config = AgentConfig::default();
+    config.bit_stream_semantics = infotheory::api::BitStreamSemantics::BinaryTokens;
     config.rate_backend = RateBackend::FacCtw {
         base_depth: 8,
         num_percept_bits: 2,

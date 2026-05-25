@@ -28,6 +28,10 @@ use std::num::NonZeroUsize;
 #[cfg(feature = "all-backends")]
 use std::sync::Arc;
 
+fn default_bit_stream_semantics() -> crate::api::BitStreamSemantics {
+    crate::api::BitStreamSemantics::BinaryTokens
+}
+
 #[cfg(feature = "backend-ctw")]
 fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("test fixture worker count must be non-zero")
@@ -96,6 +100,7 @@ fn sample_planner_run() -> PlannerRunSpec {
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_bit_stream_semantics(),
             discount_gamma: 0.99,
             return_horizon: 2,
             return_bins: 8,
@@ -122,6 +127,7 @@ fn sample_mc_aixi_planner_run(mcts_strategy: MctsStrategy) -> PlannerRunSpec {
     let mut spec = sample_planner_run();
     spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
         predictor: RateBackend::Ctw { depth: 8 },
+        bit_stream_semantics: default_bit_stream_semantics(),
         agent_horizon: 2,
         num_simulations: 4,
         mcts_strategy,
@@ -347,6 +353,36 @@ fn mc_aixi_missing_mcts_strategy_canonicalizes_to_explicit_rho_uct() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
+fn mc_aixi_missing_bit_stream_semantics_defaults_to_binary_tokens() {
+    let spec = sample_mc_aixi_planner_run(MctsStrategy::RhoUct);
+    let mut value = SpecDocument::PlannerRun(spec)
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    value["controller"]
+        .as_object_mut()
+        .expect("controller object")
+        .remove("bit_stream_semantics");
+
+    let parsed = SpecDocument::parse_json_value(&value, Path::new(".")).expect("parse");
+    let SpecDocument::PlannerRun(parsed_run) = parsed else {
+        panic!("expected planner run document");
+    };
+    let ControllerSpec::McAixi(inner) = &parsed_run.controller else {
+        panic!("expected MC-AIXI controller");
+    };
+    assert_eq!(inner.bit_stream_semantics, default_bit_stream_semantics());
+
+    let canonical = parsed_run
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    assert_eq!(
+        canonical["controller"]["bit_stream_semantics"],
+        serde_json::json!({ "kind": "binary_tokens" })
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
 fn mc_aixi_parallel_uct_binary_roundtrip_preserves_strategy() {
     let spec = sample_mc_aixi_planner_run(MctsStrategy::ParallelUct {
         workers: nz(16),
@@ -440,6 +476,7 @@ fn mc_aixi_parallel_uct_parser_rejects_zero_workers_in_canonical_json() {
     // routes through the spec-pipeline validation layer.
     spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
         predictor: RateBackend::Ctw { depth: 8 },
+        bit_stream_semantics: default_bit_stream_semantics(),
         agent_horizon: 2,
         num_simulations: 4,
         mcts_strategy: MctsStrategy::ParallelUct {
@@ -1044,6 +1081,7 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
                     num_percept_bits: 8,
                     encoding_bits: 1,
                 },
+                bit_stream_semantics: default_bit_stream_semantics(),
                 agent_horizon: 4,
                 num_simulations: 12,
                 mcts_strategy: MctsStrategy::ParallelUct {
@@ -1386,6 +1424,7 @@ fn planner_run_compile_rejects_mcaixi_predictors_with_zpaq_conditioning() {
         predictor: RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
         },
+        bit_stream_semantics: default_bit_stream_semantics(),
         agent_horizon: 1,
         num_simulations: 1,
         mcts_strategy: MctsStrategy::RhoUct,
@@ -1410,6 +1449,7 @@ fn planner_run_compile_rejects_aiqi_predictors_without_frozen_conditioning() {
         predictor: RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
         },
+        bit_stream_semantics: default_bit_stream_semantics(),
         discount_gamma: 0.99,
         return_horizon: 2,
         return_bins: 8,
@@ -1483,6 +1523,7 @@ fn sample_vm_planner_run() -> PlannerRunSpec {
         },
         controller: ControllerSpec::McAixi(McAixiControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_bit_stream_semantics(),
             agent_horizon: 1,
             num_simulations: 1,
             mcts_strategy: MctsStrategy::RhoUct,
@@ -1679,6 +1720,7 @@ fn planner_run_validation_reports_missing_backend_feature() {
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_bit_stream_semantics(),
             discount_gamma: 0.99,
             return_horizon: 2,
             return_bins: 8,

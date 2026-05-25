@@ -12,9 +12,11 @@ use crate::aixi::common::{
     bits_for_cardinality, nonnegative_reward_encoding_bounds, resolve_random_seed,
     validate_reward_encoding_bounds,
 };
-use crate::aixi::model::{Predictor, PredictorBuildError, build_aiqi_predictor};
+use crate::aixi::model::{
+    Predictor, PredictorBuildError, build_aiqi_predictor, default_aixi_bit_stream_semantics,
+};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
-use crate::api::{RateBackend, validate_rate_backend};
+use crate::api::{BitStreamSemantics, RateBackend, validate_rate_backend};
 use crate::spec::{
     AiqiDiscountedControllerSpec, CompiledPlannerController, CompiledPlannerRunSpec,
     ControllerSpec, PlannerRunSpec, SpecError,
@@ -253,6 +255,8 @@ impl From<SpecError> for AiqiError {
 pub struct AiqiConfig {
     /// Predictive backend.
     pub rate_backend: RateBackend,
+    /// Bit-stream semantics used to adapt generic rate backends to AIQI symbols.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Number of bits used to encode observations.
     pub observation_bits: usize,
     /// Number of observation symbols per environment step.
@@ -297,6 +301,7 @@ impl Default for AiqiConfig {
     fn default() -> Self {
         Self {
             rate_backend: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_aixi_bit_stream_semantics(),
             observation_bits: 1,
             observation_stream_len: 1,
             reward_bits: 1,
@@ -333,6 +338,7 @@ impl AiqiConfig {
             },
             ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
                 predictor,
+                bit_stream_semantics: self.bit_stream_semantics,
                 discount_gamma: self.discount_gamma,
                 return_horizon: self.return_horizon,
                 return_bins: self.return_bins,
@@ -384,6 +390,25 @@ impl AiqiConfig {
             self.reward_offset,
             self.reward_bits,
         )?;
+        if matches!(
+            self.bit_stream_semantics,
+            BitStreamSemantics::BytePacked { .. }
+        ) {
+            let action_bits = self.agent_actions.action_bits();
+            let observation_bits = self
+                .observation_bits
+                .saturating_mul(self.observation_stream_len.max(1));
+            let return_bits = bits_for_cardinality(self.return_bins);
+            if action_bits % 8 != 0
+                || observation_bits % 8 != 0
+                || self.reward_bits % 8 != 0
+                || return_bits % 8 != 0
+            {
+                return Err(AiqiError::UnsupportedRateBackend {
+                    reason: "BitStreamSemantics::BytePacked requires action, observation, reward, and return segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIQI interfaces",
+                });
+            }
+        }
 
         validate_rate_backend(&self.rate_backend).map_err(AiqiError::InvalidRateBackend)?;
         if !rate_backend_supports_aiqi_frozen_conditioning(&self.rate_backend) {
@@ -549,27 +574,35 @@ impl AiqiAgent {
         config: AiqiRuntimeConfig,
         compiled: &CompiledPlannerRunSpec,
     ) -> Result<Self, AiqiError> {
-        let (predictor, augmentation_period, return_bins) = match compiled.controller() {
-            CompiledPlannerController::AiqiDiscounted {
-                predictor,
-                augmentation_period,
-                return_bins,
-                ..
-            } => (predictor, *augmentation_period, *return_bins),
-            _ => return Err(AiqiError::ControllerKindMismatch),
-        };
+        let (predictor, augmentation_period, return_bins, bit_stream_semantics) =
+            match compiled.controller() {
+                CompiledPlannerController::AiqiDiscounted {
+                    predictor,
+                    augmentation_period,
+                    return_bins,
+                    bit_stream_semantics,
+                    ..
+                } => (
+                    predictor,
+                    *augmentation_period,
+                    *return_bins,
+                    *bit_stream_semantics,
+                ),
+                _ => return Err(AiqiError::ControllerKindMismatch),
+            };
         let action_bits = compiled.action_bits();
         let return_bits = bits_for_cardinality(return_bins);
-        let use_generic_planner = aiqi_requires_generic_planner_backend(predictor.canonical_spec());
-        let distribution_uses_training_updates = matches!(
-            predictor.canonical_spec(),
-            RateBackend::Ctw { .. } | RateBackend::FacCtw { .. }
-        );
+        let uses_native_reversible_binary_predictor = bit_stream_semantics
+            == BitStreamSemantics::BinaryTokens
+            && predictor.supports_native_bit_prediction()
+            && predictor.supports_reversible_bit_updates();
+        let use_generic_planner = !uses_native_reversible_binary_predictor;
+        let distribution_uses_training_updates = uses_native_reversible_binary_predictor;
 
         let mut phases = Vec::with_capacity(augmentation_period);
         for _ in 0..augmentation_period {
             phases.push(PhaseModel {
-                predictor: build_aiqi_predictor(predictor, return_bits)
+                predictor: build_aiqi_predictor(predictor, return_bits, bit_stream_semantics)
                     .map_err(AiqiError::Predictor)?,
                 last_augmented_step: 0,
             });
@@ -1168,13 +1201,6 @@ fn rate_backend_supports_aiqi_frozen_conditioning(backend: &RateBackend) -> bool
         .unwrap_or(false)
 }
 
-fn aiqi_requires_generic_planner_backend(backend: &RateBackend) -> bool {
-    !matches!(
-        backend,
-        RateBackend::Ctw { .. } | RateBackend::FacCtw { .. }
-    )
-}
-
 fn max_value_for_bits(bits: usize) -> u64 {
     if bits >= 64 {
         u64::MAX
@@ -1297,6 +1323,7 @@ mod tests {
     fn basic_config() -> AiqiConfig {
         AiqiConfig {
             rate_backend: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
             observation_bits: 1,
             observation_stream_len: 1,
             reward_bits: 1,
@@ -1344,6 +1371,38 @@ mod tests {
                 ),
             },
             random_seed: Some(11),
+            baseline_exploration: 0.01,
+            ..basic_config()
+        }
+    }
+
+    fn native_reversible_mixture_config() -> AiqiConfig {
+        AiqiConfig {
+            rate_backend: RateBackend::Mixture {
+                spec: Arc::new(
+                    MixtureSpec::new(
+                        MixtureKind::Bayes,
+                        vec![
+                            crate::api::MixtureExpertSpec {
+                                name: Some("ctw".to_string()),
+                                log_prior: 0.0,
+                                backend: RateBackend::Ctw { depth: 8 },
+                            },
+                            crate::api::MixtureExpertSpec {
+                                name: Some("fac-ctw".to_string()),
+                                log_prior: 0.0,
+                                backend: RateBackend::FacCtw {
+                                    base_depth: 8,
+                                    num_percept_bits: 1,
+                                    encoding_bits: 1,
+                                },
+                            },
+                        ],
+                    )
+                    .with_alpha(0.03),
+                ),
+            },
+            random_seed: Some(13),
             baseline_exploration: 0.01,
             ..basic_config()
         }
@@ -1813,6 +1872,20 @@ mod tests {
     }
 
     #[test]
+    fn native_reversible_mixture_uses_reversible_aiqi_planner() {
+        let config = native_reversible_mixture_config();
+        let agent = AiqiAgent::new(config).expect("native reversible mixture should build");
+        assert!(
+            !agent.use_generic_planner,
+            "mixtures composed of native reversible bit predictors should keep the reversible planner"
+        );
+        assert!(
+            agent.distribution_uses_training_updates,
+            "native reversible binary predictors should train return distributions on the fast path"
+        );
+    }
+
+    #[test]
     fn compiled_aiqi_runtime_matches_legacy_config_for_generic_mixture_backend() {
         let config = generic_mixture_config();
         let compiled = config
@@ -1840,6 +1913,7 @@ mod signed_reward_contract_tests {
     fn programmatic_aiqi_preserves_explicit_signed_reward_contract_under_ctw() {
         let config = AiqiConfig {
             rate_backend: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
             observation_bits: 1,
             observation_stream_len: 1,
             reward_bits: 3,

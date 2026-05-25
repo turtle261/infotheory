@@ -4,7 +4,10 @@
 //! for learning from history and predicting future symbols. Different implementations
 //! provide different complexity vs performance trade-offs.
 
-use crate::api::{CompiledRateBackend, RateBackend};
+use crate::api::{
+    BitStreamSemantics, CompiledRateBackend, RateBackend, RateBackendBitSession,
+    RateBackendBitSessionCheckpoint,
+};
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{ContextTree, FacContextTree};
 #[cfg(feature = "backend-rosa")]
@@ -15,9 +18,8 @@ use crate::backends::zpaq_rate::ZpaqRateModel;
 use crate::error::{InfotheoryError, InfotheoryResult};
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip::{Compressor as MambaCompressor, Model as MambaModel, State as MambaState};
-use crate::mixture::{
-    DEFAULT_MIN_PROB, OnlineBytePredictor, RateBackendPredictor, RateBackendPredictorCheckpoint,
-};
+use crate::mixture::DEFAULT_MIN_PROB;
+#[cfg(feature = "backend-zpaq")]
 use crate::prediction::binary_prediction_from_log_probs;
 #[cfg(any(
     feature = "backend-rosa",
@@ -439,16 +441,25 @@ impl Predictor for ZpaqPredictor {
     }
 }
 
-/// A generic bit-level predictor backed by any [`RateBackend`].
+/// Default AIXI bit-stream interpretation for generic rate backends.
 ///
-/// This adapter constructs the backend's binary-token application directly.
-/// Native bit backends provide true bit-token semantics; byte-native backends
-/// are adapted by feeding the predictor literal byte symbols `0` and `1` and
-/// renormalizing over those two choices.
+/// Planner interfaces usually expose one-bit actions, observations, rewards,
+/// and labels. Binary-token semantics is therefore the planner-safe default;
+/// byte-packed semantics remains available when every interface segment is
+/// explicitly byte-aligned.
+pub fn default_aixi_bit_stream_semantics() -> BitStreamSemantics {
+    BitStreamSemantics::BinaryTokens
+}
+
+/// A generic bit-level predictor backed by the shared [`RateBackendBitSession`].
+///
+/// This bridge owns only AIXI rollback bookkeeping. Bit prediction semantics,
+/// byte-prefix factorization, and backend-specific stream behavior stay in the
+/// library-wide session API.
 pub struct RateBackendBitPredictor {
     backend: CompiledRateBackend,
-    min_prob: f64,
-    predictor: RateBackendPredictor,
+    semantics: BitStreamSemantics,
+    session: RateBackendBitSession,
     journal: Vec<RateBackendJournalEntry>,
     rollback_scopes: Vec<RateBackendRollbackScope>,
 }
@@ -535,6 +546,8 @@ pub struct RateBackendBitPredictorConfig {
     pub backend: CompiledRateBackend,
     /// Probability floor used when normalizing binary probabilities.
     pub min_prob: f64,
+    /// Bit-stream semantics used by the shared bit session.
+    pub semantics: BitStreamSemantics,
 }
 
 impl RateBackendBitPredictorConfig {
@@ -549,6 +562,23 @@ impl RateBackendBitPredictorConfig {
         Ok(Self {
             backend: compiled,
             min_prob,
+            semantics: default_aixi_bit_stream_semantics(),
+        })
+    }
+
+    /// Compile a rate backend into a bit-predictor configuration with explicit semantics.
+    pub fn compile_with_semantics(
+        backend: RateBackend,
+        min_prob: f64,
+        semantics: BitStreamSemantics,
+    ) -> Result<Self, RateBackendBitPredictorError> {
+        let compiled = backend
+            .compile()
+            .map_err(RateBackendBitPredictorError::from)?;
+        Ok(Self {
+            backend: compiled,
+            min_prob,
+            semantics,
         })
     }
 }
@@ -562,12 +592,12 @@ enum RateBackendJournalKind {
 #[derive(Clone)]
 struct RateBackendJournalEntry {
     kind: RateBackendJournalKind,
-    checkpoint: RateBackendPredictorCheckpoint,
+    checkpoint: RateBackendBitSessionCheckpoint,
 }
 
 #[derive(Clone)]
 struct RateBackendRollbackScope {
-    checkpoint: RateBackendPredictorCheckpoint,
+    checkpoint: RateBackendBitSessionCheckpoint,
     journal_len: usize,
 }
 
@@ -576,35 +606,35 @@ impl RateBackendBitPredictor {
     pub fn new(
         config: RateBackendBitPredictorConfig,
     ) -> Result<Self, RateBackendBitPredictorError> {
-        let RateBackendBitPredictorConfig { backend, min_prob } = config;
+        let RateBackendBitPredictorConfig {
+            backend,
+            min_prob,
+            semantics,
+        } = config;
         if backend.contains_zpaq() {
             return Err(RateBackendBitPredictorError::UnsupportedZpaq);
         }
-        let mut predictor =
-            crate::runtime::build_rate_backend_binary_token_predictor(&backend, min_prob)
-                .map_err(RateBackendBitPredictorError::Runtime)?;
-        predictor
-            .begin_stream(None)
-            .map_err(RateBackendBitPredictorError::StreamStart)?;
+        let session = RateBackendBitSession::from_backend_with_min_prob(
+            backend.clone(),
+            None,
+            semantics,
+            min_prob,
+        )
+        .map_err(|err| RateBackendBitPredictorError::Runtime(err.to_string()))?;
         Ok(Self {
             backend,
-            min_prob,
-            predictor,
+            semantics,
+            session,
             journal: Vec::new(),
             rollback_scopes: Vec::new(),
         })
     }
 
-    #[inline(always)]
-    fn bit_to_byte(sym: bool) -> u8 {
-        if sym { 1u8 } else { 0u8 }
-    }
-
     fn clone_state(&self) -> Self {
         Self {
             backend: self.backend.clone(),
-            min_prob: self.min_prob,
-            predictor: self.predictor.clone(),
+            semantics: self.semantics,
+            session: self.session.clone(),
             journal: self.journal.clone(),
             rollback_scopes: self.rollback_scopes.clone(),
         }
@@ -613,7 +643,7 @@ impl RateBackendBitPredictor {
     fn checkpoint(&mut self, kind: RateBackendJournalKind) -> RateBackendJournalEntry {
         RateBackendJournalEntry {
             kind,
-            checkpoint: self.predictor.checkpoint(),
+            checkpoint: self.session.checkpoint(),
         }
     }
 
@@ -631,9 +661,11 @@ impl RateBackendBitPredictor {
             "RateBackendBitPredictor rollback kind mismatch: expected {expected_kind:?}, got {:?}",
             entry.kind
         );
-        self.predictor.restore_checkpoint(&entry.checkpoint);
+        self.session
+            .restore_checkpoint(&entry.checkpoint)
+            .expect("RateBackendBitPredictor checkpoint must match its session");
         if self.rollback_scopes.is_empty() && self.journal.is_empty() {
-            self.predictor.clear_checkpoints_if_supported();
+            self.session.clear_checkpoints_if_supported();
         }
     }
 }
@@ -644,11 +676,15 @@ impl Predictor for RateBackendBitPredictor {
             let checkpoint = self.checkpoint(RateBackendJournalKind::Update);
             self.journal.push(checkpoint);
         }
-        self.predictor.update(Self::bit_to_byte(sym));
+        self.session
+            .try_observe_bit(sym)
+            .expect("RateBackendBitPredictor update must satisfy configured bit semantics");
     }
 
     fn commit_update(&mut self, sym: bool) {
-        self.predictor.update(Self::bit_to_byte(sym));
+        self.session.try_observe_bit(sym).expect(
+            "RateBackendBitPredictor committed update must satisfy configured bit semantics",
+        );
     }
 
     fn update_history(&mut self, sym: bool) {
@@ -656,11 +692,15 @@ impl Predictor for RateBackendBitPredictor {
             let checkpoint = self.checkpoint(RateBackendJournalKind::FrozenUpdate);
             self.journal.push(checkpoint);
         }
-        self.predictor.update_frozen(Self::bit_to_byte(sym));
+        self.session.try_condition_bit(sym).expect(
+            "RateBackendBitPredictor conditioning update must satisfy configured bit semantics",
+        );
     }
 
     fn commit_update_history(&mut self, sym: bool) {
-        self.predictor.update_frozen(Self::bit_to_byte(sym));
+        self.session
+            .try_condition_bit(sym)
+            .expect("RateBackendBitPredictor committed conditioning update must satisfy configured bit semantics");
     }
 
     fn revert(&mut self) {
@@ -672,7 +712,7 @@ impl Predictor for RateBackendBitPredictor {
     }
 
     fn begin_rollback_scope(&mut self) {
-        let checkpoint = self.predictor.checkpoint();
+        let checkpoint = self.session.checkpoint();
         self.rollback_scopes.push(RateBackendRollbackScope {
             checkpoint,
             journal_len: self.journal.len(),
@@ -683,25 +723,26 @@ impl Predictor for RateBackendBitPredictor {
         let Some(scope) = self.rollback_scopes.pop() else {
             return false;
         };
-        self.predictor.restore_checkpoint(&scope.checkpoint);
+        self.session
+            .restore_checkpoint(&scope.checkpoint)
+            .expect("RateBackendBitPredictor scope checkpoint must match its session");
         self.journal.truncate(scope.journal_len);
         if self.rollback_scopes.is_empty() && self.journal.is_empty() {
-            self.predictor.clear_checkpoints_if_supported();
+            self.session.clear_checkpoints_if_supported();
         }
         true
     }
 
     fn predict_prob(&mut self, sym: bool) -> f64 {
-        binary_prediction_from_log_probs(
-            self.predictor.log_prob(0),
-            self.predictor.log_prob(1),
-            self.min_prob,
-        )
-        .prob(sym)
+        self.session.predict_bit().prob(sym)
     }
 
     fn model_name(&self) -> String {
-        format!("RateBackendBits({})", self.backend.default_name())
+        format!(
+            "RateBackendBits({}, {:?})",
+            self.backend.default_name(),
+            self.semantics
+        )
     }
 
     fn boxed_clone(&self) -> Box<dyn Predictor> {
@@ -711,7 +752,9 @@ impl Predictor for RateBackendBitPredictor {
     fn reset_conditioning_history(&mut self) -> Result<(), String> {
         self.journal.clear();
         self.rollback_scopes.clear();
-        self.predictor.reset_frozen(None)
+        self.session
+            .reset_frozen(None)
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -719,42 +762,62 @@ impl Predictor for RateBackendBitPredictor {
 pub(crate) fn build_mc_aixi_predictor(
     backend: &CompiledRateBackend,
     #[allow(unused_variables)] percept_bits: usize,
+    semantics: BitStreamSemantics,
 ) -> Result<Box<dyn Predictor>, PredictorBuildError> {
-    match backend.canonical_spec() {
-        #[cfg(feature = "backend-ctw")]
-        RateBackend::FacCtw { base_depth, .. } => {
-            Ok(Box::new(FacCtwPredictor::new(*base_depth, percept_bits)))
+    if semantics == BitStreamSemantics::BinaryTokens
+        && backend.supports_native_bit_prediction()
+        && backend.supports_reversible_bit_updates()
+    {
+        match backend.canonical_spec() {
+            #[cfg(feature = "backend-ctw")]
+            RateBackend::FacCtw { base_depth, .. } => {
+                return Ok(Box::new(FacCtwPredictor::new(*base_depth, percept_bits)));
+            }
+            #[cfg(feature = "backend-ctw")]
+            RateBackend::Ctw { depth } => {
+                return Ok(Box::new(CtwPredictor::new(*depth)));
+            }
+            #[cfg(feature = "backend-rosa")]
+            RateBackend::RosaPlus { max_order } => {
+                return Ok(Box::new(RosaPredictor::new(*max_order)));
+            }
+            _ => {}
         }
-        #[cfg(feature = "backend-ctw")]
-        RateBackend::Ctw { depth } => Ok(Box::new(CtwPredictor::new(*depth))),
-        #[cfg(feature = "backend-rosa")]
-        RateBackend::RosaPlus { max_order } => Ok(Box::new(RosaPredictor::new(*max_order))),
-        _ => Ok(Box::new(build_compiled_bit_predictor(backend)?)),
     }
+    Ok(Box::new(build_compiled_bit_predictor(backend, semantics)?))
 }
 
 /// Build the predictor used by the AIQI runtime from a compiled backend.
 pub(crate) fn build_aiqi_predictor(
     backend: &CompiledRateBackend,
     #[allow(unused_variables)] return_bits: usize,
+    semantics: BitStreamSemantics,
 ) -> Result<Box<dyn Predictor>, PredictorBuildError> {
-    match backend.canonical_spec() {
-        #[cfg(feature = "backend-ctw")]
-        RateBackend::Ctw { depth } => Ok(Box::new(CtwPredictor::new(*depth))),
-        #[cfg(feature = "backend-ctw")]
-        RateBackend::FacCtw { base_depth, .. } => {
-            Ok(Box::new(FacCtwPredictor::new(*base_depth, return_bits)))
+    if semantics == BitStreamSemantics::BinaryTokens
+        && backend.supports_native_bit_prediction()
+        && backend.supports_reversible_bit_updates()
+    {
+        match backend.canonical_spec() {
+            #[cfg(feature = "backend-ctw")]
+            RateBackend::Ctw { depth } => return Ok(Box::new(CtwPredictor::new(*depth))),
+            #[cfg(feature = "backend-ctw")]
+            RateBackend::FacCtw { base_depth, .. } => {
+                return Ok(Box::new(FacCtwPredictor::new(*base_depth, return_bits)));
+            }
+            _ => {}
         }
-        _ => Ok(Box::new(build_compiled_bit_predictor(backend)?)),
     }
+    Ok(Box::new(build_compiled_bit_predictor(backend, semantics)?))
 }
 
 fn build_compiled_bit_predictor(
     backend: &CompiledRateBackend,
+    semantics: BitStreamSemantics,
 ) -> Result<RateBackendBitPredictor, PredictorBuildError> {
     RateBackendBitPredictor::new(RateBackendBitPredictorConfig {
         backend: backend.clone(),
         min_prob: DEFAULT_MIN_PROB,
+        semantics,
     })
     .map_err(PredictorBuildError::BitPredictor)
 }
@@ -994,8 +1057,12 @@ mod tests {
     }
 
     fn bit_predictor(backend: RateBackend) -> RateBackendBitPredictor {
-        let config = RateBackendBitPredictorConfig::compile(backend, DEFAULT_MIN_PROB)
-            .expect("rate backend bit predictor config should compile");
+        let config = RateBackendBitPredictorConfig::compile_with_semantics(
+            backend,
+            DEFAULT_MIN_PROB,
+            BitStreamSemantics::BinaryTokens,
+        )
+        .expect("rate backend bit predictor config should compile");
         RateBackendBitPredictor::new(config).expect("rate backend predictor should initialize")
     }
 

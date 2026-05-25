@@ -1,7 +1,7 @@
 //! Canonical top-level specification document schema types.
 
 use crate::aixi::common::{ActionAlphabet, MctsStrategy, ObservationKeyMode};
-use crate::api::{CompressionBackend, RateBackend};
+use crate::api::{BitStreamSemantics, CompressionBackend, RateBackend};
 use crate::spec::core::{
     AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
     ValidatedCompressionBackend, ValidatedRateBackend,
@@ -354,6 +354,8 @@ pub struct TunePlannerInterfaceSpec {
 pub struct McAixiControllerSpec {
     /// Predictive backend used by the planner model.
     pub predictor: RateBackend,
+    /// Bit-stream semantics used to adapt the predictor to AIXI symbols.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Planning horizon.
     pub agent_horizon: usize,
     /// Number of simulations per planning step.
@@ -372,6 +374,8 @@ pub struct McAixiControllerSpec {
 pub struct AiqiDiscountedControllerSpec {
     /// Predictive backend used by the return model.
     pub predictor: RateBackend,
+    /// Bit-stream semantics used to adapt the predictor to AIQI symbols.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Discount factor used for return construction.
     pub discount_gamma: f64,
     /// Return horizon.
@@ -691,6 +695,8 @@ pub enum CompiledPlannerController {
     McAixi {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
+        /// Bit-stream semantics used to adapt the predictor to AIXI symbols.
+        bit_stream_semantics: BitStreamSemantics,
         /// Planning horizon.
         agent_horizon: usize,
         /// Number of simulations per planning step.
@@ -706,6 +712,8 @@ pub enum CompiledPlannerController {
     AiqiDiscounted {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
+        /// Bit-stream semantics used to adapt the predictor to AIQI symbols.
+        bit_stream_semantics: BitStreamSemantics,
         /// Discount factor used for return construction.
         discount_gamma: f64,
         /// Return horizon.

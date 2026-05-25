@@ -168,6 +168,58 @@ def test_aiqi_config_and_agent_smoke():
     assert agent.steps_observed() == 1
 
 
+def test_planner_configs_accept_explicit_bit_stream_semantics():
+    agent_cfg = ait.AgentConfig(
+        rate_backend=ait.RateBackend.ctw(8),
+        agent_horizon=2,
+        observation_bits=1,
+        observation_stream_len=1,
+        reward_bits=1,
+        agent_actions=2,
+        num_simulations=8,
+        min_reward=0,
+        max_reward=1,
+        reward_offset=0,
+        bit_stream_semantics=ait.BitStreamSemantics.binary_tokens(),
+    )
+    agent = ait.Agent(agent_cfg)
+    assert agent.get_planned_action([0], 0, 0) in (0, 1)
+
+    aiqi_cfg = ait.AiqiConfig(
+        rate_backend=ait.RateBackend.ctw(8),
+        observation_bits=1,
+        observation_stream_len=1,
+        reward_bits=1,
+        agent_actions=2,
+        min_reward=0,
+        max_reward=1,
+        reward_offset=0,
+        discount_gamma=0.99,
+        return_horizon=2,
+        return_bins=8,
+        augmentation_period=2,
+        baseline_exploration=0.01,
+        bit_stream_semantics="binary",
+    )
+    aiqi = ait.AiqiAgent(aiqi_cfg)
+    assert aiqi.get_planned_action() in (0, 1)
+
+    with pytest.raises(ValueError, match="BytePacked requires action and percept"):
+        ait.AgentConfig(
+            rate_backend=ait.RateBackend.ctw(8),
+            agent_horizon=2,
+            observation_bits=1,
+            observation_stream_len=1,
+            reward_bits=1,
+            agent_actions=2,
+            num_simulations=8,
+            min_reward=0,
+            max_reward=1,
+            reward_offset=0,
+            bit_stream_semantics="byte",
+        )
+
+
 def test_run_aiqi_with_environment_smoke():
     env = ToyCoinFlipEnv(0.7)
     cfg = ait.AiqiConfig(

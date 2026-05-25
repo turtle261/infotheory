@@ -875,6 +875,7 @@ pub(super) fn compile_tuner_planner_run_spec(
                     num_percept_bits: percept_bits,
                     encoding_bits: 1,
                 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
                 agent_horizon: TUNER_MCAIXI_HORIZON,
                 num_simulations: inner.planner_simulations_per_step,
                 mcts_strategy: MctsStrategy::RhoUct,
@@ -885,6 +886,7 @@ pub(super) fn compile_tuner_planner_run_spec(
         crate::spec::CompiledTuneController::AiqiDiscounted(inner) => {
             ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
                 predictor: RateBackend::Ctw { depth: 8 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
                 discount_gamma: inner.discount_factor,
                 return_horizon: inner.return_horizon,
                 return_bins: inner.return_bins,

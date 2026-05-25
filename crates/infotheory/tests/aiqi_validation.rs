@@ -16,6 +16,7 @@ use support::aixi_envs::{DeterministicBinaryEnv, SeededCoinFlipEnv};
 fn base_config() -> AiqiConfig {
     let mut cfg = AiqiConfig::default();
     cfg.rate_backend = RateBackend::Ctw { depth: 8 };
+    cfg.bit_stream_semantics = infotheory::api::BitStreamSemantics::BinaryTokens;
     cfg.observation_bits = 1;
     cfg.observation_stream_len = 1;
     cfg.reward_bits = 1;
@@ -32,6 +33,13 @@ fn base_config() -> AiqiConfig {
     cfg.baseline_exploration = 0.01;
     cfg.random_seed = Some(11);
     cfg
+}
+
+#[test]
+fn default_aiqi_config_validates() {
+    AiqiConfig::default()
+        .validate()
+        .expect("default AIQI config should satisfy its own contract");
 }
 
 fn aiqi_mixture_backend(kind: MixtureKind) -> RateBackend {

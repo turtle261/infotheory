@@ -8,7 +8,8 @@ pub(crate) mod paths;
 pub(crate) mod types;
 
 pub use self::context::{
-    InfotheoryCtx, RateBackendBitSession, RateBackendSession, get_default_ctx, set_default_ctx,
+    InfotheoryCtx, RateBackendBitSession, RateBackendBitSessionCheckpoint, RateBackendSession,
+    get_default_ctx, set_default_ctx,
 };
 pub use self::types::{
     CalibratedSpec, CalibrationContextKind, CompressionBackend, GenerationConfig,

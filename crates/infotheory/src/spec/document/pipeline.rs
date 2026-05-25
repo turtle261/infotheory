@@ -42,6 +42,7 @@ fn compile_planner_controller(
     match spec {
         ControllerSpec::McAixi(inner) => Ok(CompiledPlannerController::McAixi {
             predictor: inner.predictor.validate_in(env)?.compile()?,
+            bit_stream_semantics: inner.bit_stream_semantics,
             agent_horizon: inner.agent_horizon,
             num_simulations: inner.num_simulations,
             mcts_strategy: inner.mcts_strategy,
@@ -50,6 +51,7 @@ fn compile_planner_controller(
         }),
         ControllerSpec::AiqiDiscounted(inner) => Ok(CompiledPlannerController::AiqiDiscounted {
             predictor: inner.predictor.validate_in(env)?.compile()?,
+            bit_stream_semantics: inner.bit_stream_semantics,
             discount_gamma: inner.discount_gamma,
             return_horizon: inner.return_horizon,
             return_bins: inner.return_bins,
@@ -175,7 +177,7 @@ pub(super) fn canonicalize_planner_run(
     validate_asset_bindings(&spec.assets)?;
     let environment = canonicalize_environment_spec(&spec.environment, &spec.assets, env)?;
     let interface = canonicalize_interface_spec(&spec.interface)?;
-    let controller = canonicalize_controller_spec(&spec.controller, env)?;
+    let controller = canonicalize_controller_spec(&spec.controller, env, Some(&interface))?;
     let runtime = canonicalize_runtime_spec(&spec.runtime)?;
     Ok(PlannerRunSpec {
         assets: canonicalize_assets(&spec.assets),
@@ -356,6 +358,7 @@ fn canonicalize_interface_spec(spec: &PlannerInterfaceSpec) -> SpecResult<Planne
 fn canonicalize_controller_spec(
     spec: &ControllerSpec,
     env: &SpecEnvironment,
+    interface: Option<&PlannerInterfaceSpec>,
 ) -> SpecResult<ControllerSpec> {
     match spec {
         ControllerSpec::McAixi(inner) => {
@@ -372,6 +375,22 @@ fn canonicalize_controller_spec(
             if !(0.0..=1.0).contains(&inner.discount_gamma) {
                 return Err(SpecError::new("discount_gamma must be in [0, 1]"));
             }
+            if matches!(
+                inner.bit_stream_semantics,
+                crate::api::BitStreamSemantics::BytePacked { .. }
+            ) && let Some(interface) = interface
+            {
+                let action_bits = interface.agent_actions.action_bits();
+                let percept_bits = interface
+                    .observation_bits
+                    .saturating_mul(interface.observation_stream_len.max(1))
+                    .saturating_add(interface.reward_bits);
+                if action_bits % 8 != 0 || percept_bits % 8 != 0 {
+                    return Err(SpecError::new(
+                        "BitStreamSemantics::BytePacked requires action and percept segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIXI interfaces",
+                    ));
+                }
+            }
             let validated_predictor = inner.predictor.validate_in(env)?;
             let predictor = validated_predictor.canonical_spec().clone();
             if validated_predictor.capabilities().contains_zpaq {
@@ -381,6 +400,7 @@ fn canonicalize_controller_spec(
             }
             Ok(ControllerSpec::McAixi(super::McAixiControllerSpec {
                 predictor,
+                bit_stream_semantics: inner.bit_stream_semantics,
                 agent_horizon: inner.agent_horizon,
                 num_simulations: inner.num_simulations,
                 mcts_strategy: inner.mcts_strategy,
@@ -406,6 +426,26 @@ fn canonicalize_controller_spec(
             if !(0.0 < inner.baseline_exploration && inner.baseline_exploration <= 1.0) {
                 return Err(SpecError::new("baseline_exploration must be in (0, 1]"));
             }
+            if matches!(
+                inner.bit_stream_semantics,
+                crate::api::BitStreamSemantics::BytePacked { .. }
+            ) && let Some(interface) = interface
+            {
+                let action_bits = interface.agent_actions.action_bits();
+                let observation_bits = interface
+                    .observation_bits
+                    .saturating_mul(interface.observation_stream_len.max(1));
+                let return_bits = crate::aixi::common::bits_for_cardinality(inner.return_bins);
+                if action_bits % 8 != 0
+                    || observation_bits % 8 != 0
+                    || interface.reward_bits % 8 != 0
+                    || return_bits % 8 != 0
+                {
+                    return Err(SpecError::new(
+                        "BitStreamSemantics::BytePacked requires action, observation, reward, and return segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIQI interfaces",
+                    ));
+                }
+            }
             let validated_predictor = inner.predictor.validate_in(env)?;
             let predictor = validated_predictor.canonical_spec().clone();
             if !validated_predictor
@@ -419,6 +459,7 @@ fn canonicalize_controller_spec(
             Ok(ControllerSpec::AiqiDiscounted(
                 super::AiqiDiscountedControllerSpec {
                     predictor,
+                    bit_stream_semantics: inner.bit_stream_semantics,
                     discount_gamma: inner.discount_gamma,
                     return_horizon: inner.return_horizon,
                     return_bins: inner.return_bins,
@@ -883,6 +924,7 @@ mod tests {
         canonicalize_controller_spec(
             &ControllerSpec::McAixi(super::super::McAixiControllerSpec {
                 predictor: RateBackend::Ctw { depth: 4 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
                 agent_horizon: 2,
                 num_simulations: 8,
                 mcts_strategy: MctsStrategy::ParallelUct {
@@ -893,12 +935,14 @@ mod tests {
                 discount_gamma: 0.8,
             }),
             &env,
+            None,
         )
         .expect("valid MC-AIXI controller");
 
         let err = match canonicalize_controller_spec(
             &ControllerSpec::McAixi(super::super::McAixiControllerSpec {
                 predictor: RateBackend::Ctw { depth: 4 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
                 agent_horizon: 0,
                 num_simulations: 8,
                 mcts_strategy: MctsStrategy::RhoUct,
@@ -906,6 +950,7 @@ mod tests {
                 discount_gamma: 0.8,
             }),
             &env,
+            None,
         ) {
             Ok(_) => panic!("zero horizon must fail"),
             Err(err) => err,
@@ -915,6 +960,7 @@ mod tests {
         let err = match canonicalize_controller_spec(
             &ControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedControllerSpec {
                 predictor: RateBackend::Ctw { depth: 4 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
                 discount_gamma: 1.0,
                 return_horizon: 2,
                 return_bins: 8,
@@ -923,6 +969,7 @@ mod tests {
                 baseline_exploration: 0.1,
             }),
             &env,
+            None,
         ) {
             Ok(_) => panic!("discount_gamma=1 must fail"),
             Err(err) => err,
@@ -939,6 +986,7 @@ mod tests {
                 planner_simulations_per_step: 5,
             }),
             &env,
+            None,
         )
         .expect("valid warmstart controller");
         match warmstart {

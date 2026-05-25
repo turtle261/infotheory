@@ -13,9 +13,11 @@ use crate::aixi::common::{
 use crate::aixi::mcts::{
     AgentSimulator, ParallelUctPlanner, ParallelUctPlannerInitError, RhoUctPlanner,
 };
-use crate::aixi::model::{Predictor, PredictorBuildError, build_mc_aixi_predictor};
+use crate::aixi::model::{
+    Predictor, PredictorBuildError, build_mc_aixi_predictor, default_aixi_bit_stream_semantics,
+};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
-use crate::api::{RateBackend, validate_rate_backend};
+use crate::api::{BitStreamSemantics, RateBackend, validate_rate_backend};
 use crate::spec::{
     CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec, McAixiControllerSpec,
     PlannerRunSpec, SpecError,
@@ -126,6 +128,8 @@ impl From<ParallelUctPlannerInitError> for AgentError {
 pub struct AgentConfig {
     /// Predictive backend used by MC-AIXI.
     pub rate_backend: RateBackend,
+    /// Bit-stream semantics used to adapt generic rate backends to AIXI symbols.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Planning horizon for MCTS.
     pub agent_horizon: usize,
     /// Number of bits used to encode observations.
@@ -164,6 +168,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             rate_backend: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_aixi_bit_stream_semantics(),
             agent_horizon: 5,
             observation_bits: 1,
             observation_stream_len: 1,
@@ -200,6 +205,7 @@ impl AgentConfig {
             },
             ControllerSpec::McAixi(McAixiControllerSpec {
                 predictor,
+                bit_stream_semantics: self.bit_stream_semantics,
                 agent_horizon: self.agent_horizon,
                 num_simulations: self.num_simulations,
                 mcts_strategy: self.mcts_strategy,
@@ -259,6 +265,21 @@ impl AgentConfig {
             self.reward_offset,
             self.reward_bits,
         )?;
+        if matches!(
+            self.bit_stream_semantics,
+            BitStreamSemantics::BytePacked { .. }
+        ) {
+            let action_bits = self.agent_actions.action_bits();
+            let percept_bits = self
+                .observation_bits
+                .saturating_mul(self.observation_stream_len.max(1))
+                .saturating_add(self.reward_bits);
+            if action_bits % 8 != 0 || percept_bits % 8 != 0 {
+                return Err(AgentError::UnsupportedRateBackend {
+                    reason: "BitStreamSemantics::BytePacked requires action and percept segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIXI interfaces",
+                });
+            }
+        }
 
         validate_rate_backend(&self.rate_backend).map_err(AgentError::InvalidRateBackend)?;
         let compiled = self.rate_backend.compile().map_err(AgentError::from)?;
@@ -294,6 +315,7 @@ struct AgentRuntimeConfig {
     max_reward: Reward,
     reward_offset: Reward,
     random_seed: u64,
+    bit_stream_semantics: BitStreamSemantics,
 }
 
 impl AgentRuntimeConfig {
@@ -313,6 +335,7 @@ impl AgentRuntimeConfig {
             max_reward: config.max_reward,
             reward_offset: config.reward_offset,
             random_seed: resolve_random_seed(config.random_seed),
+            bit_stream_semantics: config.bit_stream_semantics,
         }
     }
 
@@ -325,6 +348,7 @@ impl AgentRuntimeConfig {
             mcts_strategy,
             exploration_exploitation_ratio,
             discount_gamma,
+            bit_stream_semantics,
         ) = match compiled.controller() {
             CompiledPlannerController::McAixi {
                 agent_horizon,
@@ -332,6 +356,7 @@ impl AgentRuntimeConfig {
                 mcts_strategy,
                 exploration_exploitation_ratio,
                 discount_gamma,
+                bit_stream_semantics,
                 ..
             } => (
                 *agent_horizon,
@@ -339,6 +364,7 @@ impl AgentRuntimeConfig {
                 *mcts_strategy,
                 *exploration_exploitation_ratio,
                 *discount_gamma,
+                *bit_stream_semantics,
             ),
             _ => return Err(AgentError::ControllerKindMismatch),
         };
@@ -360,6 +386,7 @@ impl AgentRuntimeConfig {
             max_reward,
             reward_offset,
             random_seed: resolve_random_seed(runtime.random_seed),
+            bit_stream_semantics,
         })
     }
 }
@@ -472,8 +499,8 @@ impl Agent {
         let percept_bits = (compiled.interface().observation_bits
             * compiled.interface().observation_stream_len.max(1))
             + compiled.interface().reward_bits;
-        let model =
-            build_mc_aixi_predictor(predictor, percept_bits).map_err(AgentError::Predictor)?;
+        let model = build_mc_aixi_predictor(predictor, percept_bits, config.bit_stream_semantics)
+            .map_err(AgentError::Predictor)?;
 
         let rng = RandomGenerator::from_seed(config.random_seed);
 
@@ -802,6 +829,7 @@ mod tests {
             max_reward: 3,
             reward_offset: 2,
             random_seed: 7,
+            bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
         }
     }
 
@@ -847,6 +875,7 @@ mod tests {
                     .with_alpha(1.25),
                 ),
             },
+            bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
             agent_horizon: 5,
             observation_bits: 1,
             observation_stream_len: 1,

@@ -984,6 +984,7 @@ fn aixi_cli_reports_missing_gameengine_feature_for_builtin_environments() {
   "controller": {
     "kind": "aiqi_discounted",
     "predictor": { "kind": "ctw", "depth": 8 },
+    "bit_stream_semantics": { "kind": "binary_tokens" },
     "discount_gamma": 0.99,
     "return_horizon": 2,
     "return_bins": 8,

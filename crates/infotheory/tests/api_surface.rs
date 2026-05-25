@@ -91,6 +91,150 @@ fn api_surface_byte_packed_bit_session_matches_byte_prediction_chain() {
     bit_session.finish().expect("bit finish");
 }
 
+#[cfg(all(feature = "backend-ctw", feature = "backend-mixture"))]
+#[test]
+fn api_surface_byte_packed_mixture_observe_only_matches_step_learning_outcome() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 }),
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 12 }),
+            ],
+        )),
+    };
+    let semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    let data = b"native-byte-prefix observe-only parity check";
+    let total_bits = Some((data.len() * 8) as u64);
+
+    let mut step_session =
+        RateBackendBitSession::from_spec(backend.clone(), total_bits, semantics).expect("step");
+    let mut observe_session =
+        RateBackendBitSession::from_spec(backend, total_bits, semantics).expect("observe");
+
+    for &symbol in data {
+        for bit_idx in 0..8u8 {
+            let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
+            let prediction = step_session.try_step_bit(bit).expect("step bit");
+            let sum = prediction.p0 + prediction.p1;
+            assert!(
+                (sum - 1.0).abs() < 1e-12,
+                "step-bit prediction must stay normalized, got {sum}"
+            );
+            observe_session
+                .try_observe_bit(bit)
+                .expect("observe-only bit");
+        }
+    }
+
+    let step_pred = step_session.predict_bit();
+    let observe_pred = observe_session.predict_bit();
+    assert!(
+        (step_pred.p1 - observe_pred.p1).abs() < 1e-12,
+        "observe-only training should match predict+observe training: step={} observe={}",
+        step_pred.p1,
+        observe_pred.p1
+    );
+    assert!(
+        (observe_pred.p0 + observe_pred.p1 - 1.0).abs() < 1e-12,
+        "observe-only prediction must remain normalized"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_bit_session_checkpoint_restores_byte_packed_prefix() {
+    let semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::LsbFirst,
+    };
+    let mut session =
+        RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(16), semantics)
+            .expect("bit session");
+
+    let initial = session.predict_bit();
+    let checkpoint = session.checkpoint();
+    session.try_observe_bit(true).expect("partial byte bit");
+    session.try_observe_bit(false).expect("partial byte bit");
+    let _partial = session.predict_bit();
+
+    session
+        .restore_checkpoint(&checkpoint)
+        .expect("checkpoint restore");
+    assert_eq!(
+        session.predict_bit(),
+        initial,
+        "restore must recover the pre-prefix prediction"
+    );
+
+    for bit in [true, false, true, false, true, false, true, false] {
+        session.try_observe_bit(bit).expect("complete byte");
+    }
+    let _after_byte = session.predict_bit();
+    session
+        .restore_checkpoint(&checkpoint)
+        .expect("restore after completed byte");
+    assert_eq!(session.predict_bit(), initial);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_bit_session_checkpoint_rejects_mismatched_session() {
+    let mut a = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        Some(8),
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("session a");
+    let mut b = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 7 },
+        Some(8),
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("session b");
+    let checkpoint = a.checkpoint();
+    let err = b
+        .restore_checkpoint(&checkpoint)
+        .expect_err("checkpoint must be tied to its backend");
+    assert!(err.to_string().contains("different backend"));
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "backend-mixture"))]
+#[test]
+fn api_surface_bit_session_checkpoint_restores_native_reversible_mixture() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 }),
+                MixtureExpertSpec::new(RateBackend::FacCtw {
+                    base_depth: 6,
+                    num_percept_bits: 1,
+                    encoding_bits: 1,
+                }),
+            ],
+        )),
+    };
+    let mut session =
+        RateBackendBitSession::from_spec(backend, Some(64), BitStreamSemantics::BinaryTokens)
+            .expect("native reversible mixture bit session");
+
+    for bit in [true, false, true, true, false] {
+        session.try_observe_bit(bit).expect("training bit");
+    }
+    let checkpoint = session.checkpoint();
+    let expected = session.predict_bit();
+
+    for bit in [false, false, true, false, true, true] {
+        session.try_observe_bit(bit).expect("speculative bit");
+    }
+    session
+        .restore_checkpoint(&checkpoint)
+        .expect("restore mixture checkpoint");
+    assert_eq!(session.predict_bit(), expected);
+}
+
 #[cfg(feature = "backend-ctw")]
 #[test]
 fn api_surface_byte_packed_try_methods_reject_mixed_update_modes() {
@@ -300,7 +444,7 @@ fn api_surface_zpaq_rate_backend_session_begin_stream_does_not_require_frozen_re
 
 #[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
 #[test]
-fn api_surface_mixture_begin_stream_matches_reset_frozen_for_resettable_experts() {
+fn api_surface_mixture_begin_stream_resets_wrapper_priors_after_expert_restart() {
     let backend = RateBackend::Mixture {
         spec: Arc::new(MixtureSpec::new(
             MixtureKind::Bayes,
@@ -331,20 +475,18 @@ fn api_surface_mixture_begin_stream_matches_reset_frozen_for_resettable_experts(
     restarted_session.fill_log_probs(&mut restarted_row);
     fresh_session.fill_log_probs(&mut fresh_row);
 
-    for byte in 0..256usize {
-        assert!(
-            (reset_row[byte] - restarted_row[byte]).abs() < 1e-12,
-            "mixture begin_stream must match reset_frozen at byte {byte}: reset={} restarted={}",
-            reset_row[byte],
-            restarted_row[byte]
-        );
-    }
+    let diverged_from_reset =
+        (0..256usize).any(|byte| (reset_row[byte] - restarted_row[byte]).abs() > 1e-12);
+    assert!(
+        diverged_from_reset,
+        "mixture begin_stream should reset sequence-local wrapper weights instead of preserving reset_frozen posterior state"
+    );
 
     let diverged_from_fresh =
-        (0..256usize).any(|byte| (reset_row[byte] - fresh_row[byte]).abs() > 1e-12);
+        (0..256usize).any(|byte| (restarted_row[byte] - fresh_row[byte]).abs() > 1e-12);
     assert!(
         diverged_from_fresh,
-        "trained mixture restart should preserve learned mixture state instead of reverting to fresh priors"
+        "mixture begin_stream should preserve restarted expert state instead of rebuilding fresh experts"
     );
 }
 

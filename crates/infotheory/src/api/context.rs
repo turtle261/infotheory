@@ -10,12 +10,12 @@ use super::metrics::{
 use super::types::{CompressionBackend, GenerationConfig, GenerationUpdateMode, RateBackend};
 use crate::aligned_prefix;
 use crate::error::{InfotheoryError, InfotheoryResult};
-use crate::mixture::OnlineBytePredictor;
+use crate::mixture::{OnlineBytePredictor, RateBackendPredictorCheckpoint};
 use crate::prediction::{
     BinaryPrediction, BitOrder, BitStreamSemantics, BytePrefixMass,
     binary_prediction_from_log_probs,
 };
-use crate::spec::{CompiledCompressionBackend, CompiledRateBackend};
+use crate::spec::{CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend};
 
 /// Returns the current default information theory context for this thread.
 pub fn get_default_ctx() -> InfotheoryResult<InfotheoryCtx> {
@@ -53,8 +53,24 @@ pub struct RateBackendSession {
 /// through the backend's native binary-token application or, for byte-native
 /// backends, by adapting the predictor to the literal byte symbols `0` and `1`
 /// and renormalizing those two choices.
+#[derive(Clone)]
 pub struct RateBackendBitSession {
+    backend_code: CanonicalBytes,
     predictor: crate::mixture::RateBackendPredictor,
+    semantics: BitStreamSemantics,
+    min_prob: f64,
+    prefix: Option<BufferedBytePrefix>,
+}
+
+/// Opaque checkpoint for restoring a [`RateBackendBitSession`] exactly.
+///
+/// Checkpoints capture the underlying rate predictor plus any in-flight
+/// byte-prefix state, so they are valid even between byte-packed bits before a
+/// full byte has been committed to the backend.
+#[derive(Clone)]
+pub struct RateBackendBitSessionCheckpoint {
+    backend_code: CanonicalBytes,
+    predictor: crate::mixture::RateBackendPredictorCheckpoint,
     semantics: BitStreamSemantics,
     prefix: Option<BufferedBytePrefix>,
 }
@@ -74,31 +90,51 @@ impl BufferedByteUpdateMode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct BufferedBytePrefix {
-    mass: BytePrefixMass,
+    kind: BufferedBytePrefixKind,
     update_mode: Option<BufferedByteUpdateMode>,
 }
 
+#[derive(Clone)]
+enum BufferedBytePrefixKind {
+    Mass(BytePrefixMass),
+    NativeMsb {
+        restore_for_frozen: Option<RateBackendPredictorCheckpoint>,
+        symbol: u8,
+        bits: usize,
+    },
+}
+
 impl BufferedBytePrefix {
-    fn new(mass: BytePrefixMass) -> Self {
+    fn new_mass(mass: BytePrefixMass) -> Self {
         Self {
-            mass,
+            kind: BufferedBytePrefixKind::Mass(mass),
             update_mode: None,
         }
     }
 
-    fn prediction(&self) -> BinaryPrediction {
-        self.mass.prediction()
+    fn new_native_msb(restore_for_frozen: Option<RateBackendPredictorCheckpoint>) -> Self {
+        Self {
+            kind: BufferedBytePrefixKind::NativeMsb {
+                restore_for_frozen,
+                symbol: 0,
+                bits: 0,
+            },
+            update_mode: None,
+        }
     }
 
     fn has_partial_bits(&self) -> bool {
-        self.mass.has_partial_bits()
+        match &self.kind {
+            BufferedBytePrefixKind::Mass(mass) => mass.has_partial_bits(),
+            BufferedBytePrefixKind::NativeMsb { bits, .. } => *bits > 0,
+        }
     }
 
     fn record_mode(&mut self, requested: BufferedByteUpdateMode) -> InfotheoryResult<()> {
         if let Some(active) = self.update_mode
-            && self.mass.has_partial_bits()
+            && self.has_partial_bits()
             && active != requested
         {
             return Err(InfotheoryError::runtime(format!(
@@ -144,14 +180,25 @@ impl RateBackendBitSession {
         total_bits: Option<u64>,
         semantics: BitStreamSemantics,
     ) -> InfotheoryResult<Self> {
+        Self::from_backend_with_min_prob(
+            backend,
+            total_bits,
+            semantics,
+            crate::mixture::DEFAULT_MIN_PROB,
+        )
+    }
+
+    pub(crate) fn from_backend_with_min_prob(
+        backend: CompiledRateBackend,
+        total_bits: Option<u64>,
+        semantics: BitStreamSemantics,
+        min_prob: f64,
+    ) -> InfotheoryResult<Self> {
         let total_symbols = total_symbols_for_bit_semantics(total_bits, semantics)
             .map_err(InfotheoryError::runtime)?;
         let mut predictor = match semantics {
             BitStreamSemantics::BinaryTokens => {
-                crate::runtime::build_rate_backend_binary_token_predictor(
-                    &backend,
-                    crate::mixture::DEFAULT_MIN_PROB,
-                )
+                crate::runtime::build_rate_backend_binary_token_predictor(&backend, min_prob)
             }
             BitStreamSemantics::BytePacked { .. } => {
                 if !backend.supports_byte_prefix_mass() {
@@ -160,16 +207,19 @@ impl RateBackendBitSession {
                         backend.canonical_name()
                     )));
                 }
-                crate::runtime::build_rate_backend_predictor_default(&backend)
+                crate::runtime::build_rate_backend_predictor(&backend, min_prob)
             }
         }
         .map_err(InfotheoryError::invalid_backend_config)?;
         predictor
             .begin_stream(total_symbols)
             .map_err(InfotheoryError::runtime)?;
+        let backend_code = backend.canonical_bytes().clone();
         Ok(Self {
+            backend_code,
             predictor,
             semantics,
+            min_prob,
             prefix: None,
         })
     }
@@ -195,14 +245,29 @@ impl RateBackendBitSession {
             BitStreamSemantics::BinaryTokens => binary_prediction_from_log_probs(
                 self.predictor.log_prob(0),
                 self.predictor.log_prob(1),
-                crate::mixture::DEFAULT_MIN_PROB,
+                self.min_prob,
             ),
             BitStreamSemantics::BytePacked { order } => {
-                self.ensure_prefix(order);
-                self.prefix
-                    .as_ref()
-                    .expect("prefix initialized")
-                    .prediction()
+                if self.prefix.is_none()
+                    && order == BitOrder::MsbFirst
+                    && self.predictor.has_native_msb_byte_prefix()
+                    && self
+                        .predictor
+                        .begin_native_msb_byte_prefix()
+                        .unwrap_or(false)
+                {
+                    self.prefix = Some(BufferedBytePrefix::new_native_msb(None));
+                }
+                self.ensure_mass_prefix(order);
+                let native_bits = match &self.prefix.as_ref().expect("prefix initialized").kind {
+                    BufferedBytePrefixKind::Mass(mass) => return mass.prediction(),
+                    BufferedBytePrefixKind::NativeMsb { bits, .. } => *bits,
+                };
+                let p1 = self
+                    .predictor
+                    .native_msb_prefix_prob_one(native_bits)
+                    .unwrap_or(0.5);
+                BinaryPrediction::from_prob_one(p1, self.min_prob)
             }
         }
     }
@@ -210,6 +275,44 @@ impl RateBackendBitSession {
     /// Convenience prediction for `P(bit = 1)`.
     pub fn predict_one(&mut self) -> f64 {
         self.predict_bit().p1
+    }
+
+    /// Capture a reversible checkpoint for later exact restoration.
+    pub fn checkpoint(&mut self) -> RateBackendBitSessionCheckpoint {
+        RateBackendBitSessionCheckpoint {
+            backend_code: self.backend_code.clone(),
+            predictor: self.predictor.checkpoint(),
+            semantics: self.semantics,
+            prefix: self.prefix.clone(),
+        }
+    }
+
+    /// Restore the session to a previously captured checkpoint.
+    ///
+    /// A checkpoint is tied to the backend and bit-stream semantics it was
+    /// created from. Restoring a checkpoint into a different bit session is a
+    /// programmer error and returns an explicit runtime error.
+    pub fn restore_checkpoint(
+        &mut self,
+        checkpoint: &RateBackendBitSessionCheckpoint,
+    ) -> InfotheoryResult<()> {
+        if self.backend_code != checkpoint.backend_code || self.semantics != checkpoint.semantics {
+            return Err(InfotheoryError::runtime(
+                "RateBackendBitSession checkpoint belongs to a different backend or bit semantics",
+            ));
+        }
+        self.predictor.restore_checkpoint(&checkpoint.predictor);
+        self.prefix = checkpoint.prefix.clone();
+        Ok(())
+    }
+
+    /// Clear compact checkpoint journals when no stored checkpoints remain.
+    ///
+    /// This is an optimization hint for backends with journaled checkpoints.
+    /// Calling it while a checkpoint may still be restored violates the
+    /// checkpoint contract.
+    pub fn clear_checkpoints_if_supported(&mut self) {
+        self.predictor.clear_checkpoints_if_supported();
     }
 
     /// Predict and then observe one adaptive/fitting bit.
@@ -293,15 +396,40 @@ impl RateBackendBitSession {
             .map_err(InfotheoryError::runtime)
     }
 
-    fn ensure_prefix(&mut self, order: BitOrder) {
+    fn ensure_prefix_for_update(&mut self, order: BitOrder, update_mode: BufferedByteUpdateMode) {
+        if self.prefix.is_some() {
+            return;
+        }
+        if order == BitOrder::MsbFirst && self.predictor.has_native_msb_byte_prefix() {
+            let restore_for_frozen = if update_mode == BufferedByteUpdateMode::Frozen {
+                Some(self.predictor.checkpoint())
+            } else {
+                None
+            };
+            if self
+                .predictor
+                .begin_native_msb_byte_prefix()
+                .unwrap_or(false)
+            {
+                self.prefix = Some(BufferedBytePrefix::new_native_msb(restore_for_frozen));
+                return;
+            }
+            if let Some(checkpoint) = restore_for_frozen {
+                self.predictor.restore_checkpoint(&checkpoint);
+            }
+        }
+        self.ensure_mass_prefix(order);
+    }
+
+    fn ensure_mass_prefix(&mut self, order: BitOrder) {
         if self.prefix.is_some() {
             return;
         }
         let mut logps = [0.0f64; 256];
         self.predictor.fill_log_probs(&mut logps);
-        self.prefix = Some(BufferedBytePrefix::new(BytePrefixMass::from_log_probs(
-            &logps, order,
-        )));
+        self.prefix = Some(BufferedBytePrefix::new_mass(
+            BytePrefixMass::from_log_probs(&logps, order),
+        ));
     }
 
     fn update_byte_packed_bit(
@@ -310,17 +438,57 @@ impl RateBackendBitSession {
         order: BitOrder,
         update_mode: BufferedByteUpdateMode,
     ) -> InfotheoryResult<()> {
-        self.ensure_prefix(order);
+        self.ensure_prefix_for_update(order, update_mode);
         let prefix = self.prefix.as_mut().expect("prefix initialized");
         prefix.record_mode(update_mode)?;
-        prefix.mass.observe(bit);
-        if prefix.mass.is_complete() {
-            let symbol = prefix.mass.symbol();
-            match update_mode {
-                BufferedByteUpdateMode::Adaptive => self.predictor.update(symbol),
-                BufferedByteUpdateMode::Frozen => self.predictor.update_frozen(symbol),
+        match &mut prefix.kind {
+            BufferedBytePrefixKind::Mass(mass) => {
+                mass.observe(bit);
+                if mass.is_complete() {
+                    let symbol = mass.symbol();
+                    match update_mode {
+                        BufferedByteUpdateMode::Adaptive => self.predictor.update(symbol),
+                        BufferedByteUpdateMode::Frozen => self.predictor.update_frozen(symbol),
+                    }
+                    self.prefix = None;
+                }
             }
-            self.prefix = None;
+            BufferedBytePrefixKind::NativeMsb {
+                restore_for_frozen,
+                symbol,
+                bits,
+            } => {
+                if update_mode == BufferedByteUpdateMode::Frozen
+                    && restore_for_frozen.is_none()
+                    && *bits == 0
+                {
+                    *restore_for_frozen = Some(self.predictor.checkpoint());
+                }
+                self.predictor
+                    .observe_native_msb_prefix_bit(*bits, bit)
+                    .map_err(InfotheoryError::runtime)?;
+                if bit {
+                    *symbol |= 1u8 << (7 - *bits);
+                }
+                *bits += 1;
+                if *bits == 8 {
+                    let completed_symbol = *symbol;
+                    if update_mode == BufferedByteUpdateMode::Frozen {
+                        let checkpoint = restore_for_frozen.as_ref().ok_or_else(|| {
+                            InfotheoryError::runtime(
+                                "native byte-prefix frozen update is missing its start checkpoint",
+                            )
+                        })?;
+                        self.predictor.restore_checkpoint(checkpoint);
+                        self.predictor.update_frozen(completed_symbol);
+                    } else {
+                        self.predictor
+                            .finish_native_msb_byte_prefix(completed_symbol)
+                            .map_err(InfotheoryError::runtime)?;
+                    }
+                    self.prefix = None;
+                }
+            }
         }
         Ok(())
     }

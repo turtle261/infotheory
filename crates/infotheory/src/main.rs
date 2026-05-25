@@ -2254,6 +2254,7 @@ mod tests {
                         "kind": "ctw",
                         "depth": 4
                     },
+                    "bit_stream_semantics": { "kind": "binary_tokens" },
                     "discount_gamma": 0.5,
                     "return_horizon": 2,
                     "return_bins": 8,
@@ -3561,6 +3562,7 @@ mod tests {
                     "kind": "ctw",
                     "depth": 8
                 },
+                "bit_stream_semantics": { "kind": "binary_tokens" },
                 "agent_horizon": 1,
                 "num_simulations": 1,
                 "mcts_strategy": {
@@ -3629,6 +3631,7 @@ mod tests {
                     "kind": "ctw",
                     "depth": 8
                 },
+                "bit_stream_semantics": { "kind": "binary_tokens" },
                 "agent_horizon": 1,
                 "num_simulations": 1,
                 "mcts_strategy": {

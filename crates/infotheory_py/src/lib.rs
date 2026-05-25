@@ -4098,7 +4098,8 @@ impl PyAgentConfig {
         min_reward=-128,
         max_reward=127,
         reward_offset=128,
-        random_seed=None
+        random_seed=None,
+        bit_stream_semantics=None
     ))]
     fn new(
         rate_backend: &PyRateBackend,
@@ -4116,9 +4117,13 @@ impl PyAgentConfig {
         max_reward: i64,
         reward_offset: i64,
         random_seed: Option<u64>,
+        bit_stream_semantics: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let mut inner = infotheory::aixi::agent::AgentConfig::default();
         inner.rate_backend = rate_backend.inner.clone();
+        if let Some(semantics) = bit_stream_semantics {
+            inner.bit_stream_semantics = parse_bit_stream_semantics_value(semantics)?;
+        }
         inner.agent_horizon = agent_horizon;
         inner.observation_bits = observation_bits;
         inner.observation_stream_len = observation_stream_len;
@@ -4160,7 +4165,8 @@ impl PyAiqiConfig {
         augmentation_period=None,
         history_prune_keep_steps=None,
         baseline_exploration=0.01,
-        random_seed=None
+        random_seed=None,
+        bit_stream_semantics=None
     ))]
     fn new(
         rate_backend: &PyRateBackend,
@@ -4178,9 +4184,13 @@ impl PyAiqiConfig {
         history_prune_keep_steps: Option<usize>,
         baseline_exploration: f64,
         random_seed: Option<u64>,
+        bit_stream_semantics: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let mut inner = infotheory::aixi::aiqi::AiqiConfig::default();
         inner.rate_backend = rate_backend.inner.clone();
+        if let Some(semantics) = bit_stream_semantics {
+            inner.bit_stream_semantics = parse_bit_stream_semantics_value(semantics)?;
+        }
         inner.observation_bits = observation_bits;
         inner.observation_stream_len = observation_stream_len;
         inner.reward_bits = reward_bits;

@@ -51,6 +51,9 @@ pub enum BitStreamSemantics {
 
 impl Default for BitStreamSemantics {
     fn default() -> Self {
+        // Generic bit sessions default to a byte-native view. Planner configs
+        // use their own binary-token default because AIXI/AIQI interfaces are
+        // commonly not byte-aligned.
         Self::BytePacked {
             order: BitOrder::MsbFirst,
         }

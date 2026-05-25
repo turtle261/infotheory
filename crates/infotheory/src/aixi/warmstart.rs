@@ -4,7 +4,9 @@ use crate::aixi::common::{
     Action, ActionAlphabet, PerceptVal, RandomGenerator, Reward, RewardEncodingError,
     bits_for_cardinality, resolve_random_seed, validate_reward_encoding_bounds,
 };
-use crate::aixi::model::{Predictor, PredictorBuildError, build_aiqi_predictor};
+use crate::aixi::model::{
+    Predictor, PredictorBuildError, build_aiqi_predictor, default_aixi_bit_stream_semantics,
+};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
 use crate::aixi::warmstart_contract::{
     WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF, WARMSTART_STANDALONE_SCALAR_REPRESENTATION,
@@ -688,8 +690,12 @@ impl WarmStartExactJhAgent {
         let mut phases = Vec::with_capacity(config.label_phase_period);
         for _ in 0..config.label_phase_period {
             phases.push(PhaseModel {
-                predictor: build_aiqi_predictor(predictor, return_bits)
-                    .map_err(WarmStartExactJhError::Predictor)?,
+                predictor: build_aiqi_predictor(
+                    predictor,
+                    return_bits,
+                    default_aixi_bit_stream_semantics(),
+                )
+                .map_err(WarmStartExactJhError::Predictor)?,
                 last_augmented_step: 0,
             });
         }

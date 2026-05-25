@@ -194,19 +194,20 @@ pub(crate) fn convex_step_size_for_update(
     }
 }
 
-fn normalized_prior_weights(configs: &[ExpertConfig]) -> Vec<f64> {
-    if configs.is_empty() {
+fn normalized_log_weights(log_weights: impl IntoIterator<Item = f64>) -> Vec<f64> {
+    let log_weights: Vec<f64> = log_weights.into_iter().collect();
+    if log_weights.is_empty() {
         return Vec::new();
     }
-    let max_log = configs
+    let max_log = log_weights
         .iter()
-        .map(|cfg| cfg.log_prior)
+        .copied()
         .fold(f64::NEG_INFINITY, f64::max);
-    let mut weights = configs
+    let mut weights = log_weights
         .iter()
-        .map(|cfg| {
+        .map(|&log_weight| {
             if max_log.is_finite() {
-                (cfg.log_prior - max_log).exp()
+                (log_weight - max_log).exp()
             } else {
                 0.0
             }
@@ -214,6 +215,14 @@ fn normalized_prior_weights(configs: &[ExpertConfig]) -> Vec<f64> {
         .collect::<Vec<_>>();
     normalize_simplex_weights(&mut weights);
     weights
+}
+
+fn normalized_prior_weights(configs: &[ExpertConfig]) -> Vec<f64> {
+    normalized_log_weights(configs.iter().map(|cfg| cfg.log_prior))
+}
+
+fn normalized_expert_prior_weights(experts: &[ExpertState]) -> Vec<f64> {
+    normalized_log_weights(experts.iter().map(|expert| expert.log_prior))
 }
 
 #[cfg(feature = "backend-calibrated")]
@@ -286,6 +295,22 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
         Ok(())
     }
 
+    /// Capture a structural checkpoint when the concrete predictor supports it.
+    fn checkpoint_if_supported(&mut self) -> Option<OnlineBytePredictorCheckpoint> {
+        None
+    }
+
+    /// Restore a structural checkpoint created by [`Self::checkpoint_if_supported`].
+    fn restore_checkpoint_if_supported(
+        &mut self,
+        _checkpoint: &OnlineBytePredictorCheckpoint,
+    ) -> bool {
+        false
+    }
+
+    /// Clear compact checkpoint journals after all structural checkpoints expire.
+    fn clear_checkpoints_if_supported(&mut self) {}
+
     /// Log-probability (natural log) of `symbol` given the current history.
     fn log_prob(&mut self, symbol: u8) -> f64;
 
@@ -294,6 +319,41 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
         for (sym, slot) in out.iter_mut().enumerate() {
             *slot = self.log_prob(sym as u8);
         }
+    }
+
+    /// Whether this predictor can expose an MSB-first byte prefix natively.
+    ///
+    /// Native prefix stepping lets bitwise consumers query and condition on the
+    /// bits of the next byte without first materializing all 256 byte
+    /// probabilities. Predictors that return `false` remain fully supported
+    /// through the generic byte-PDF prefix fallback.
+    fn has_native_msb_byte_prefix(&self) -> bool {
+        false
+    }
+
+    /// Prepare a native MSB-first byte-prefix step.
+    ///
+    /// Returns `true` when the predictor entered a native prefix state. Callers
+    /// must then query bits in order, call [`Self::observe_native_msb_prefix_bit`]
+    /// after each observed prefix bit, and finish with
+    /// [`Self::finish_native_msb_byte_prefix`].
+    fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Predict `P(bit = 1)` for the next MSB-first prefix bit.
+    fn native_msb_prefix_prob_one(&mut self, _bit_idx: usize) -> Result<f64, String> {
+        Err("native MSB-first byte-prefix prediction is unavailable".to_string())
+    }
+
+    /// Observe one MSB-first prefix bit inside an active native byte-prefix step.
+    fn observe_native_msb_prefix_bit(&mut self, _bit_idx: usize, _bit: bool) -> Result<(), String> {
+        Err("native MSB-first byte-prefix stepping is unavailable".to_string())
+    }
+
+    /// Finish an active native byte-prefix step after all eight bits are known.
+    fn finish_native_msb_byte_prefix(&mut self, _symbol: u8) -> Result<(), String> {
+        Err("native MSB-first byte-prefix stepping is unavailable".to_string())
     }
 
     /// Log-probability (natural log) of `symbol`, then update the predictor.
@@ -334,6 +394,226 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     /// filtering/posterior state needed for correct sequential predictions.
     fn update_frozen(&mut self, symbol: u8) {
         self.update(symbol);
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct OnlineBytePredictorCheckpoint(OnlineBytePredictorCheckpointKind);
+
+#[derive(Clone)]
+enum OnlineBytePredictorCheckpointKind {
+    RateBackend(RateBackendPredictorCheckpoint),
+}
+
+impl OnlineBytePredictorCheckpoint {
+    fn rate_backend(checkpoint: RateBackendPredictorCheckpoint) -> Self {
+        Self(OnlineBytePredictorCheckpointKind::RateBackend(checkpoint))
+    }
+}
+
+#[derive(Clone)]
+enum BytePrefixStepState {
+    Native,
+    PdfPrefix {
+        cdf: Box<[f64; 257]>,
+        lo: usize,
+        hi: usize,
+    },
+}
+
+impl Default for BytePrefixStepState {
+    fn default() -> Self {
+        Self::PdfPrefix {
+            cdf: Box::new([0.0; 257]),
+            lo: 0,
+            hi: 256,
+        }
+    }
+}
+
+impl BytePrefixStepState {
+    fn prepare(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
+        if predictor.begin_native_msb_byte_prefix()? {
+            *self = Self::Native;
+            return Ok(());
+        }
+
+        let mut cdf = match std::mem::take(self) {
+            Self::PdfPrefix { cdf, .. } => cdf,
+            Self::Native => Box::new([0.0; 257]),
+        };
+        let mut logps = [0.0f64; 256];
+        predictor.fill_log_probs(&mut logps);
+        cdf[0] = 0.0;
+        for (idx, &lp) in logps.iter().enumerate() {
+            cdf[idx + 1] = cdf[idx] + clamp_prob(lp.exp(), DEFAULT_MIN_PROB);
+        }
+        if !cdf[256].is_finite() || cdf[256] <= 0.0 {
+            for (idx, slot) in cdf.iter_mut().enumerate() {
+                *slot = (idx as f64) / 256.0;
+            }
+        }
+        *self = Self::PdfPrefix {
+            cdf,
+            lo: 0,
+            hi: 256,
+        };
+        Ok(())
+    }
+
+    fn prob_one(
+        &mut self,
+        predictor: &mut dyn OnlineBytePredictor,
+        bit_idx: usize,
+    ) -> Result<f64, String> {
+        match self {
+            Self::Native => predictor.native_msb_prefix_prob_one(bit_idx),
+            Self::PdfPrefix { cdf, lo, hi } => {
+                let mid: usize = (*lo + *hi) >> 1;
+                let total: f64 = (cdf[*hi] - cdf[*lo]).max(DEFAULT_MIN_PROB);
+                let one: f64 = (cdf[*hi] - cdf[mid]).max(0.0);
+                Ok((one / total).clamp(DEFAULT_MIN_PROB, 1.0 - DEFAULT_MIN_PROB))
+            }
+        }
+    }
+
+    fn observe(
+        &mut self,
+        predictor: &mut dyn OnlineBytePredictor,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<(), String> {
+        match self {
+            Self::Native => predictor.observe_native_msb_prefix_bit(bit_idx, bit),
+            Self::PdfPrefix { lo, hi, .. } => {
+                let mid: usize = (*lo + *hi) >> 1;
+                if bit {
+                    *lo = mid;
+                } else {
+                    *hi = mid;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(
+        &mut self,
+        predictor: &mut dyn OnlineBytePredictor,
+        symbol: u8,
+    ) -> Result<(), String> {
+        match self {
+            Self::Native => predictor.finish_native_msb_byte_prefix(symbol),
+            Self::PdfPrefix { .. } => {
+                predictor.update(symbol);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct MixtureBitPrefixState {
+    states: Vec<BytePrefixStepState>,
+    weights: Vec<f64>,
+    likelihoods: Vec<f64>,
+    bit_probs: Vec<f64>,
+    logps: Vec<f64>,
+    active: bool,
+    primed_bit_idx: Option<usize>,
+}
+
+impl MixtureBitPrefixState {
+    fn begin(&mut self, experts: &mut [ExpertState], weights: &[f64]) -> Result<bool, String> {
+        if !experts
+            .iter()
+            .any(|expert| expert.predictor.has_native_msb_byte_prefix())
+        {
+            self.active = false;
+            self.primed_bit_idx = None;
+            return Ok(false);
+        }
+
+        let n: usize = experts.len();
+        self.states.resize_with(n, BytePrefixStepState::default);
+        self.weights.clear();
+        self.weights.extend(weights.iter().copied());
+        normalize_simplex_weights(&mut self.weights);
+        self.likelihoods.resize(n, 1.0);
+        self.likelihoods.fill(1.0);
+        self.bit_probs.resize(n, 0.5);
+        self.logps.resize(n, 0.0);
+        self.primed_bit_idx = None;
+        for (state, expert) in self.states.iter_mut().zip(experts.iter_mut()) {
+            state.prepare(expert.predictor.as_mut())?;
+        }
+        self.active = true;
+        Ok(true)
+    }
+
+    fn prime_bit_probs_if_needed(
+        &mut self,
+        experts: &mut [ExpertState],
+        bit_idx: usize,
+    ) -> Result<(), String> {
+        if self.primed_bit_idx == Some(bit_idx) {
+            return Ok(());
+        }
+        for idx in 0..experts.len() {
+            let p1: f64 = self.states[idx].prob_one(experts[idx].predictor.as_mut(), bit_idx)?;
+            self.bit_probs[idx] = p1;
+        }
+        self.primed_bit_idx = Some(bit_idx);
+        Ok(())
+    }
+
+    fn prob_one(&mut self, experts: &mut [ExpertState], bit_idx: usize) -> Result<f64, String> {
+        debug_assert!(self.active);
+        self.prime_bit_probs_if_needed(experts, bit_idx)?;
+        let mut denom: f64 = 0.0;
+        let mut numer: f64 = 0.0;
+        for idx in 0..experts.len() {
+            let p1: f64 = self.bit_probs[idx];
+            let weighted_prefix: f64 = self.weights[idx] * self.likelihoods[idx];
+            denom += weighted_prefix;
+            numer += weighted_prefix * p1;
+        }
+        Ok(if denom.is_finite() && denom > 0.0 {
+            (numer / denom).clamp(DEFAULT_MIN_PROB, 1.0 - DEFAULT_MIN_PROB)
+        } else {
+            0.5
+        })
+    }
+
+    fn observe(
+        &mut self,
+        experts: &mut [ExpertState],
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<(), String> {
+        debug_assert!(self.active);
+        self.prime_bit_probs_if_needed(experts, bit_idx)?;
+        for idx in 0..experts.len() {
+            let p1: f64 = self.bit_probs[idx];
+            let pb: f64 = if bit { p1 } else { 1.0 - p1 };
+            self.likelihoods[idx] = (self.likelihoods[idx] * pb).max(DEFAULT_MIN_PROB);
+            self.states[idx].observe(experts[idx].predictor.as_mut(), bit_idx, bit)?;
+        }
+        self.primed_bit_idx = None;
+        Ok(())
+    }
+
+    fn finish_adaptive(&mut self, experts: &mut [ExpertState], symbol: u8) -> Result<(), String> {
+        debug_assert!(self.active);
+        for idx in 0..experts.len() {
+            let lp: f64 = self.likelihoods[idx].max(DEFAULT_MIN_PROB).ln();
+            self.logps[idx] = lp;
+            self.states[idx].finish(experts[idx].predictor.as_mut(), symbol)?;
+        }
+        self.active = false;
+        self.primed_bit_idx = None;
+        Ok(())
     }
 }
 
@@ -490,7 +770,6 @@ pub enum RateBackendPredictor {
     },
 }
 
-#[cfg(any(feature = "aixi", test))]
 #[derive(Clone)]
 /// Checkpoint snapshot used for temporary predictor rollback.
 ///
@@ -524,6 +803,9 @@ pub enum RateBackendPredictorCheckpoint {
     /// Composite checkpoint for calibrated predictors.
     #[cfg(feature = "backend-calibrated")]
     Calibrated(Box<CalibratedPredictorCheckpoint>),
+    /// Composite checkpoint for mixture predictors.
+    #[cfg(feature = "backend-mixture")]
+    Mixture(Box<MixtureRuntimeCheckpoint>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -532,6 +814,8 @@ pub enum RateBackendPredictorCheckpoint {
 pub enum CtwUndoOp {
     /// Symbol update applied in learning mode.
     LearnedSymbol,
+    /// One native prefix bit applied in learning mode.
+    LearnedBit,
     /// Symbol update applied in frozen/scoring mode.
     FrozenSymbol,
 }
@@ -556,7 +840,6 @@ pub enum RosaPredictorUndo {
 }
 
 #[derive(Clone)]
-#[cfg(any(feature = "aixi", test))]
 #[cfg(feature = "backend-calibrated")]
 /// Internal checkpoint payload for [`RateBackendPredictor::Calibrated`].
 ///
@@ -570,7 +853,6 @@ pub struct CalibratedPredictorCheckpoint {
 }
 
 #[cfg(feature = "backend-ctw")]
-#[cfg(any(feature = "aixi", test))]
 fn restore_ctw_checkpoint(
     tree: &mut ContextTree,
     bits_per_symbol: usize,
@@ -588,6 +870,9 @@ fn restore_ctw_checkpoint(
                     tree.revert();
                 }
             }
+            CtwUndoOp::LearnedBit => {
+                tree.revert();
+            }
             CtwUndoOp::FrozenSymbol => {
                 for _ in 0..bits {
                     tree.revert_history();
@@ -598,7 +883,6 @@ fn restore_ctw_checkpoint(
 }
 
 #[cfg(feature = "backend-ctw")]
-#[cfg(any(feature = "aixi", test))]
 fn restore_fac_ctw_checkpoint(
     tree: &mut FacContextTree,
     bits_per_symbol: usize,
@@ -660,7 +944,6 @@ impl RateBackendPredictor {
             })
     }
 
-    #[cfg(any(feature = "aixi", test))]
     pub(crate) fn checkpoint(&mut self) -> RateBackendPredictorCheckpoint {
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -715,11 +998,15 @@ impl RateBackendPredictor {
                     valid: *valid,
                 },
             )),
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime
+                .checkpoint()
+                .map(|checkpoint| RateBackendPredictorCheckpoint::Mixture(Box::new(checkpoint)))
+                .unwrap_or_else(|| RateBackendPredictorCheckpoint::Full(self.clone())),
             _ => RateBackendPredictorCheckpoint::Full(self.clone()),
         }
     }
 
-    #[cfg(any(feature = "aixi", test))]
     pub(crate) fn restore_checkpoint(&mut self, checkpoint: &RateBackendPredictorCheckpoint) {
         match (self, checkpoint) {
             #[cfg(feature = "backend-rosa")]
@@ -795,6 +1082,13 @@ impl RateBackendPredictor {
                 *pdf = ck.pdf;
                 *valid = ck.valid;
             }
+            #[cfg(feature = "backend-mixture")]
+            (
+                RateBackendPredictor::Mixture { runtime },
+                RateBackendPredictorCheckpoint::Mixture(ck),
+            ) => {
+                runtime.restore_checkpoint(ck);
+            }
             (slot, RateBackendPredictorCheckpoint::Full(state)) => {
                 *slot = state.clone();
             }
@@ -814,6 +1108,10 @@ impl RateBackendPredictor {
             (_, RateBackendPredictorCheckpoint::Calibrated(_)) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
             }
+            #[cfg(feature = "backend-mixture")]
+            (_, RateBackendPredictorCheckpoint::Mixture(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
             #[cfg(feature = "backend-sequitur")]
             (_, RateBackendPredictorCheckpoint::Sequitur(_)) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
@@ -821,7 +1119,6 @@ impl RateBackendPredictor {
         }
     }
 
-    #[cfg(any(feature = "aixi", test))]
     pub(crate) fn clear_checkpoints_if_supported(&mut self) {
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -856,6 +1153,10 @@ impl RateBackendPredictor {
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated { base, .. } => {
                 base.clear_checkpoints_if_supported();
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.clear_checkpoints_if_supported();
             }
             _ => {}
         }
@@ -985,6 +1286,28 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Calibrated { base, .. } => base.finish_stream(),
             RateBackendPredictor::Disabled { .. } => Ok(()),
         }
+    }
+
+    fn checkpoint_if_supported(&mut self) -> Option<OnlineBytePredictorCheckpoint> {
+        Some(OnlineBytePredictorCheckpoint::rate_backend(
+            self.checkpoint(),
+        ))
+    }
+
+    fn restore_checkpoint_if_supported(
+        &mut self,
+        checkpoint: &OnlineBytePredictorCheckpoint,
+    ) -> bool {
+        match &checkpoint.0 {
+            OnlineBytePredictorCheckpointKind::RateBackend(checkpoint) => {
+                self.restore_checkpoint(checkpoint);
+                true
+            }
+        }
+    }
+
+    fn clear_checkpoints_if_supported(&mut self) {
+        RateBackendPredictor::clear_checkpoints_if_supported(self);
     }
 
     fn log_prob(&mut self, symbol: u8) -> f64 {
@@ -1240,6 +1563,84 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 }
             }
             RateBackendPredictor::Disabled { .. } => out.fill(-(256.0f64).ln()),
+        }
+    }
+
+    fn has_native_msb_byte_prefix(&self) -> bool {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                bits_per_symbol, ..
+            } => *bits_per_symbol == 8,
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.has_native_msb_byte_prefix(),
+            _ => false,
+        }
+    }
+
+    fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                bits_per_symbol, ..
+            } => Ok(*bits_per_symbol == 8),
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.begin_native_msb_byte_prefix(),
+            _ => Ok(false),
+        }
+    }
+
+    fn native_msb_prefix_prob_one(&mut self, bit_idx: usize) -> Result<f64, String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw { tree, min_prob, .. } => {
+                let p: f64 = tree.predict(true);
+                Ok(p.clamp(*min_prob, 1.0 - *min_prob))
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.native_msb_prefix_prob_one(bit_idx)
+            }
+            _ => Err("native MSB-first byte-prefix prediction is unavailable".to_string()),
+        }
+    }
+
+    fn observe_native_msb_prefix_bit(&mut self, bit_idx: usize, bit: bool) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                tree,
+                checkpoint_journal,
+                checkpoint_depth,
+                ..
+            } => {
+                let _ = bit_idx;
+                tree.update(bit);
+                if *checkpoint_depth > 0 {
+                    checkpoint_journal.push(CtwUndoOp::LearnedBit);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.observe_native_msb_prefix_bit(bit_idx, bit)
+            }
+            _ => Err("native MSB-first byte-prefix stepping is unavailable".to_string()),
+        }
+    }
+
+    fn finish_native_msb_byte_prefix(&mut self, symbol: u8) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw { .. } => {
+                let _ = symbol;
+                Ok(())
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.finish_native_msb_byte_prefix(symbol)
+            }
+            _ => Err("native MSB-first byte-prefix stepping is unavailable".to_string()),
         }
     }
 
@@ -1965,12 +2366,201 @@ impl ExpertState {
     }
 }
 
+fn reset_expert_losses(experts: &mut [ExpertState]) {
+    for expert in experts {
+        expert.cum_log_loss = 0.0;
+    }
+}
+
+fn reset_experts_to_priors(experts: &mut [ExpertState]) -> Vec<f64> {
+    let prior = normalized_expert_prior_weights(experts);
+    set_log_weights_from_linear(experts, &prior);
+    reset_expert_losses(experts);
+    prior
+}
+
+fn apply_bayes_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    scratch_mix: &mut Vec<f64>,
+) -> f64 {
+    let n = experts.len();
+    scratch_mix.resize(n, 0.0);
+    for idx in 0..n {
+        scratch_mix[idx] = experts[idx].log_weight + expert_logps[idx];
+    }
+    let log_mix = logsumexp(&scratch_mix[..n]);
+    for idx in 0..n {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+        experts[idx].log_weight += expert_logps[idx] - log_mix;
+    }
+    log_mix
+}
+
+fn apply_fading_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    scratch_mix: &mut Vec<f64>,
+    decay: f64,
+) -> f64 {
+    let n = experts.len();
+    scratch_mix.resize(n, 0.0);
+    for idx in 0..n {
+        scratch_mix[idx] = decay * experts[idx].log_weight;
+    }
+    let log_prior_norm = logsumexp(&scratch_mix[..n]);
+    for idx in 0..n {
+        scratch_mix[idx] += expert_logps[idx];
+    }
+    let log_evidence = logsumexp(&scratch_mix[..n]);
+    for idx in 0..n {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+        experts[idx].log_weight =
+            decay * experts[idx].log_weight + expert_logps[idx] - log_evidence;
+    }
+    log_evidence - log_prior_norm
+}
+
+fn apply_switching_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    scratch_joint: &mut Vec<f64>,
+    scratch_weights: &mut Vec<f64>,
+    prior: &[f64],
+    schedule: MixtureScheduleMode,
+    alpha: f64,
+    update_count: &mut u64,
+) -> f64 {
+    let n = experts.len();
+    scratch_joint.resize(n, 0.0);
+    scratch_weights.resize(n, 0.0);
+    for idx in 0..n {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+        scratch_joint[idx] = experts[idx].log_weight + expert_logps[idx];
+    }
+    let log_mix = logsumexp(&scratch_joint[..n]);
+    for idx in 0..n {
+        scratch_weights[idx] = (scratch_joint[idx] - log_mix).exp();
+    }
+
+    let alpha = switching_alpha_for_update(schedule, alpha, *update_count);
+    *update_count = (*update_count).saturating_add(1);
+    if n == 1 || alpha <= 0.0 {
+        set_log_weights_from_linear(experts, scratch_weights);
+        return log_mix;
+    }
+
+    let mut switch_out_sum = 0.0;
+    let mut num_switch_targets = 0usize;
+    for &prior_weight in prior {
+        if prior_weight < 1.0 {
+            num_switch_targets += 1;
+        }
+    }
+    if num_switch_targets <= 1 {
+        set_log_weights_from_linear(experts, scratch_weights);
+        return log_mix;
+    }
+
+    for idx in 0..n {
+        let denom = 1.0 - prior[idx];
+        if denom > 0.0 {
+            switch_out_sum += scratch_weights[idx] / denom;
+        }
+    }
+    for idx in 0..n {
+        let stay = (1.0 - alpha) * scratch_weights[idx];
+        let switch_in = if prior[idx] > 0.0 {
+            let denom = 1.0 - prior[idx];
+            let switchable_mass = if denom > 0.0 {
+                switch_out_sum - scratch_weights[idx] / denom
+            } else {
+                0.0
+            };
+            alpha * prior[idx] * switchable_mass
+        } else {
+            0.0
+        };
+        scratch_joint[idx] = stay + switch_in;
+    }
+    normalize_simplex_weights(scratch_joint);
+    set_log_weights_from_linear(experts, scratch_joint);
+    log_mix
+}
+
+fn mix_log_prob_convex(lambda: &[f64], logps: &[f64]) -> f64 {
+    let mut mix = 0.0;
+    for (weight, &logp) in lambda.iter().zip(logps.iter()) {
+        if *weight > 0.0 {
+            mix += *weight * logp.exp();
+        }
+    }
+    clamp_prob(mix, DEFAULT_MIN_PROB).ln()
+}
+
+fn apply_convex_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    lambda: &mut Vec<f64>,
+    projection_scratch: &mut Vec<f64>,
+    schedule: MixtureScheduleMode,
+    alpha: f64,
+    update_count: &mut u64,
+) -> f64 {
+    let log_mix = mix_log_prob_convex(lambda, expert_logps);
+    for idx in 0..experts.len() {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+    }
+    *update_count = (*update_count).saturating_add(1);
+    let step_size = convex_step_size_for_update(schedule, alpha, *update_count);
+    for (weight, &logp) in lambda.iter_mut().zip(expert_logps.iter()) {
+        let grad = -(logp - log_mix).exp();
+        *weight -= step_size * grad;
+    }
+    project_simplex_with_scratch(lambda, projection_scratch);
+    log_mix
+}
+
+fn apply_mdl_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    best_idx: usize,
+    last_best: &mut usize,
+) -> f64 {
+    for idx in 0..experts.len() {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+    }
+    *last_best = best_idx;
+    expert_logps
+        .get(best_idx)
+        .copied()
+        .unwrap_or(f64::NEG_INFINITY)
+}
+
+fn finish_neural_update_from_logps(
+    mixture: &mut NeuralMixture,
+    symbol: u8,
+    logp: f64,
+    update_weights: bool,
+) {
+    if update_weights {
+        mixture
+            .neural
+            .update_weights_symbol(&mixture.scratch_expert_logps, mixture.min_prob);
+    }
+    mixture.total_log_loss -= logp;
+    mixture.analyzer.update(symbol);
+    mixture.neural.set_context_state(mixture.analyzer.state());
+    mixture.invalidate_eval_cache();
+}
+
 /// Exponential-weights Bayes mixture (log-loss Hedge).
 #[derive(Clone)]
 pub struct BayesMixture {
     experts: Vec<ExpertState>,
     scratch_logps: Vec<f64>,
     scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     cached_symbol: u8,
     cached_log_mix: f64,
     cache_valid: bool,
@@ -1990,6 +2580,7 @@ impl BayesMixture {
             experts,
             scratch_logps: vec![0.0; configs.len()],
             scratch_mix: vec![0.0; configs.len()],
+            bitwise: MixtureBitPrefixState::default(),
             cached_symbol: 0,
             cached_log_mix: f64::NEG_INFINITY,
             cache_valid: false,
@@ -2002,23 +2593,20 @@ impl BayesMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                expert.cum_log_loss -= self.scratch_logps[i];
+        if self.cache_valid && self.cached_symbol == symbol {
+            for expert in &mut self.experts {
                 expert.update(symbol);
             }
-            self.cached_log_mix
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
-                self.scratch_mix[i] = expert.log_weight + self.scratch_logps[i];
-                expert.cum_log_loss -= self.scratch_logps[i];
             }
-            logsumexp(&self.scratch_mix)
-        };
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            expert.log_weight = expert.log_weight + self.scratch_logps[i] - log_mix;
         }
+        let log_mix = apply_bayes_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            &mut self.scratch_mix,
+        );
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
         log_mix
@@ -2125,6 +2713,7 @@ impl BayesMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_experts_to_priors(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2146,6 +2735,7 @@ pub struct FadingBayesMixture {
     decay: f64,
     scratch_logps: Vec<f64>,
     scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     cached_symbol: u8,
     cached_log_predictive: f64,
     cached_log_evidence: f64,
@@ -2168,6 +2758,7 @@ impl FadingBayesMixture {
             decay,
             scratch_logps: vec![0.0; configs.len()],
             scratch_mix: vec![0.0; configs.len()],
+            bitwise: MixtureBitPrefixState::default(),
             cached_symbol: 0,
             cached_log_predictive: f64::NEG_INFINITY,
             cached_log_evidence: f64::NEG_INFINITY,
@@ -2181,29 +2772,21 @@ impl FadingBayesMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        let (log_predictive, log_evidence) = if self.cache_valid && self.cached_symbol == symbol {
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                expert.cum_log_loss -= self.scratch_logps[i];
+        if self.cache_valid && self.cached_symbol == symbol {
+            for expert in &mut self.experts {
                 expert.update(symbol);
             }
-            (self.cached_log_predictive, self.cached_log_evidence)
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
-                self.scratch_mix[i] = self.decay * expert.log_weight;
             }
-            let log_prior_norm = logsumexp(&self.scratch_mix);
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                self.scratch_mix[i] += self.scratch_logps[i];
-                expert.cum_log_loss -= self.scratch_logps[i];
-            }
-            let log_evidence = logsumexp(&self.scratch_mix);
-            (log_evidence - log_prior_norm, log_evidence)
-        };
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            let decayed = self.decay * expert.log_weight;
-            expert.log_weight = decayed + self.scratch_logps[i] - log_evidence;
         }
+        let log_predictive = apply_fading_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            &mut self.scratch_mix,
+            self.decay,
+        );
         self.cache_valid = false;
         self.total_log_loss -= log_predictive;
         log_predictive
@@ -2297,6 +2880,7 @@ impl FadingBayesMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_experts_to_priors(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2319,6 +2903,7 @@ pub struct SwitchingMixture {
     scratch_logps: Vec<f64>,
     scratch_joint: Vec<f64>,
     scratch_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     cached_symbol: u8,
     cached_log_mix: f64,
     cache_valid: bool,
@@ -2340,6 +2925,7 @@ impl SwitchingMixture {
             scratch_logps: vec![0.0; configs.len()],
             scratch_joint: vec![0.0; configs.len()],
             scratch_weights: vec![0.0; configs.len()],
+            bitwise: MixtureBitPrefixState::default(),
             cached_symbol: 0,
             cached_log_mix: f64::NEG_INFINITY,
             cache_valid: false,
@@ -2353,68 +2939,25 @@ impl SwitchingMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                expert.cum_log_loss -= self.scratch_logps[i];
+        if self.cache_valid && self.cached_symbol == symbol {
+            for expert in &mut self.experts {
                 expert.update(symbol);
             }
-            self.cached_log_mix
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
-                expert.cum_log_loss -= self.scratch_logps[i];
-                self.scratch_joint[i] = expert.log_weight + self.scratch_logps[i];
-            }
-            logsumexp(&self.scratch_joint)
-        };
-
-        for i in 0..self.experts.len() {
-            self.scratch_weights[i] = (self.scratch_joint[i] - log_mix).exp();
-        }
-
-        let alpha = switching_alpha_for_update(self.schedule, self.alpha, self.update_count);
-        self.update_count = self.update_count.saturating_add(1);
-
-        if self.experts.len() == 1 || alpha <= 0.0 {
-            set_log_weights_from_linear(&mut self.experts, &self.scratch_weights);
-        } else {
-            let mut switch_out_sum = 0.0;
-            let mut num_switch_targets = 0usize;
-            for &prior in &self.prior {
-                if prior < 1.0 {
-                    num_switch_targets += 1;
-                }
-            }
-
-            if num_switch_targets <= 1 {
-                set_log_weights_from_linear(&mut self.experts, &self.scratch_weights);
-            } else {
-                for i in 0..self.experts.len() {
-                    let denom = 1.0 - self.prior[i];
-                    if denom > 0.0 {
-                        switch_out_sum += self.scratch_weights[i] / denom;
-                    }
-                }
-
-                for i in 0..self.experts.len() {
-                    let stay = (1.0 - alpha) * self.scratch_weights[i];
-                    let switch_in = if self.prior[i] > 0.0 {
-                        let denom = 1.0 - self.prior[i];
-                        let switchable_mass = if denom > 0.0 {
-                            switch_out_sum - self.scratch_weights[i] / denom
-                        } else {
-                            0.0
-                        };
-                        alpha * self.prior[i] * switchable_mass
-                    } else {
-                        0.0
-                    };
-                    self.scratch_joint[i] = stay + switch_in;
-                }
-                normalize_simplex_weights(&mut self.scratch_joint);
-                set_log_weights_from_linear(&mut self.experts, &self.scratch_joint);
             }
         }
+        let log_mix = apply_switching_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            &mut self.scratch_joint,
+            &mut self.scratch_weights,
+            &self.prior,
+            self.schedule,
+            self.alpha,
+            &mut self.update_count,
+        );
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
         log_mix
@@ -2523,6 +3066,8 @@ impl SwitchingMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        set_log_weights_from_linear(&mut self.experts, &self.prior);
+        reset_expert_losses(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2544,6 +3089,7 @@ pub struct ConvexMixture {
     lambda: Vec<f64>,
     scratch_logps: Vec<f64>,
     projection_scratch: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     cached_symbol: u8,
     cached_log_mix: f64,
     cache_valid: bool,
@@ -2561,6 +3107,7 @@ impl ConvexMixture {
             lambda: normalized_prior_weights(configs),
             scratch_logps: vec![0.0; configs.len()],
             projection_scratch: Vec::with_capacity(configs.len()),
+            bitwise: MixtureBitPrefixState::default(),
             cached_symbol: 0,
             cached_log_mix: f64::NEG_INFINITY,
             cache_valid: false,
@@ -2570,13 +3117,7 @@ impl ConvexMixture {
     }
 
     fn mix_log_prob(&self, logps: &[f64]) -> f64 {
-        let mut mix = 0.0;
-        for (weight, &logp) in self.lambda.iter().zip(logps.iter()) {
-            if *weight > 0.0 {
-                mix += *weight * logp.exp();
-            }
-        }
-        clamp_prob(mix, DEFAULT_MIN_PROB).ln()
+        mix_log_prob_convex(&self.lambda, logps)
     }
 
     /// Log-probability (natural log) of the convex mixture for `symbol`, then update.
@@ -2585,27 +3126,24 @@ impl ConvexMixture {
             return f64::NEG_INFINITY;
         }
 
-        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                expert.cum_log_loss -= self.scratch_logps[i];
+        if self.cache_valid && self.cached_symbol == symbol {
+            for expert in &mut self.experts {
                 expert.update(symbol);
             }
-            self.cached_log_mix
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
-                expert.cum_log_loss -= self.scratch_logps[i];
             }
-            self.mix_log_prob(&self.scratch_logps)
-        };
-
-        self.update_count = self.update_count.saturating_add(1);
-        let step_size = convex_step_size_for_update(self.schedule, self.alpha, self.update_count);
-        for (weight, &logp) in self.lambda.iter_mut().zip(self.scratch_logps.iter()) {
-            let grad = -(logp - log_mix).exp();
-            *weight -= step_size * grad;
         }
-        project_simplex_with_scratch(&mut self.lambda, &mut self.projection_scratch);
+        let log_mix = apply_convex_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            &mut self.lambda,
+            &mut self.projection_scratch,
+            self.schedule,
+            self.alpha,
+            &mut self.update_count,
+        );
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
         log_mix
@@ -2660,6 +3198,7 @@ impl ConvexMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        self.lambda = reset_experts_to_priors(&mut self.experts);
         self.clear_stream_state();
         Ok(())
     }
@@ -2677,6 +3216,7 @@ impl ConvexMixture {
 pub struct MdlSelector {
     experts: Vec<ExpertState>,
     scratch_logps: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     total_log_loss: f64,
     last_best: usize,
     cached_symbol: u8,
@@ -2700,6 +3240,7 @@ pub struct NeuralMixture {
     min_prob: f64,
     scratch_expert_logps: Vec<f64>,
     scratch_mix_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     eval_cache_valid: bool,
     eval_cache_full_valid: bool,
     eval_cache_history: NeuralHistoryState,
@@ -2745,6 +3286,7 @@ impl NeuralMixture {
             min_prob: DEFAULT_MIN_PROB,
             scratch_expert_logps: vec![0.0; n],
             scratch_mix_weights: vec![0.0; n],
+            bitwise: MixtureBitPrefixState::default(),
             eval_cache_valid: false,
             eval_cache_full_valid: false,
             eval_cache_history,
@@ -2921,12 +3463,7 @@ impl NeuralMixture {
                 .evaluate_symbol(&self.scratch_expert_logps, self.min_prob);
             clamp_unit_prob(p, self.min_prob).ln()
         };
-        self.neural
-            .update_weights_symbol(&self.scratch_expert_logps, self.min_prob);
-        self.total_log_loss -= logp;
-        self.analyzer.update(symbol);
-        self.neural.set_context_state(self.analyzer.state());
-        self.invalidate_eval_cache();
+        finish_neural_update_from_logps(self, symbol, logp, true);
         logp
     }
 
@@ -2952,6 +3489,8 @@ impl NeuralMixture {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        let prior = reset_experts_to_priors(&mut self.experts);
+        self.neural.reset_to_priors(&prior);
         self.clear_stream_state();
         Ok(())
     }
@@ -2975,6 +3514,7 @@ impl MdlSelector {
         Self {
             experts,
             scratch_logps: vec![0.0; configs.len()],
+            bitwise: MixtureBitPrefixState::default(),
             total_log_loss: 0.0,
             last_best,
             cached_symbol: 0,
@@ -3013,16 +3553,19 @@ impl MdlSelector {
             }
             best_idx
         };
-        let logp = self.scratch_logps[best_idx];
         self.cache_valid = false;
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            expert.cum_log_loss -= self.scratch_logps[i];
+        for expert in &mut self.experts {
             if used_cache {
                 expert.update(symbol);
             }
         }
+        let logp = apply_mdl_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            best_idx,
+            &mut self.last_best,
+        );
         self.total_log_loss -= logp;
-        self.last_best = best_idx;
         logp
     }
 
@@ -3112,6 +3655,8 @@ impl MdlSelector {
 
     fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_experts_to_priors(&mut self.experts);
+        self.last_best = 0;
         self.clear_stream_state();
         Ok(())
     }
@@ -3122,6 +3667,157 @@ impl MdlSelector {
         }
         self.cache_valid = false;
     }
+}
+
+#[derive(Clone)]
+struct ExpertStateCheckpoint {
+    log_weight: f64,
+    log_prior: f64,
+    cum_log_loss: f64,
+    predictor: OnlineBytePredictorCheckpoint,
+}
+
+fn checkpoint_experts(experts: &mut [ExpertState]) -> Option<Vec<ExpertStateCheckpoint>> {
+    experts
+        .iter_mut()
+        .map(|expert| {
+            expert
+                .predictor
+                .checkpoint_if_supported()
+                .map(|predictor| ExpertStateCheckpoint {
+                    log_weight: expert.log_weight,
+                    log_prior: expert.log_prior,
+                    cum_log_loss: expert.cum_log_loss,
+                    predictor,
+                })
+        })
+        .collect()
+}
+
+fn restore_experts(experts: &mut [ExpertState], checkpoints: &[ExpertStateCheckpoint]) {
+    assert_eq!(
+        experts.len(),
+        checkpoints.len(),
+        "mixture checkpoint expert count mismatch"
+    );
+    for (expert, checkpoint) in experts.iter_mut().zip(checkpoints.iter()) {
+        expert.log_weight = checkpoint.log_weight;
+        expert.log_prior = checkpoint.log_prior;
+        expert.cum_log_loss = checkpoint.cum_log_loss;
+        assert!(
+            expert
+                .predictor
+                .restore_checkpoint_if_supported(&checkpoint.predictor),
+            "mixture expert rejected its structural checkpoint"
+        );
+    }
+}
+
+fn clear_expert_checkpoints(experts: &mut [ExpertState]) {
+    for expert in experts {
+        expert.predictor.clear_checkpoints_if_supported();
+    }
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct BayesMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct FadingBayesMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_predictive: f64,
+    cached_log_evidence: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct SwitchingMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_joint: Vec<f64>,
+    scratch_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+    update_count: u64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct ConvexMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    lambda: Vec<f64>,
+    scratch_logps: Vec<f64>,
+    projection_scratch: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+    update_count: u64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct MdlSelectorCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    scratch_logps: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    total_log_loss: f64,
+    last_best: usize,
+    cached_symbol: u8,
+    cached_best_idx: usize,
+    cached_best_logp: f64,
+    cache_valid: bool,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct NeuralMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    neural: NeuralMixCore,
+    analyzer: TextContextAnalyzer,
+    scratch_expert_logps: Vec<f64>,
+    scratch_mix_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    eval_cache_valid: bool,
+    eval_cache_full_valid: bool,
+    eval_cache_history: NeuralHistoryState,
+    eval_cache_symbol: u8,
+    eval_cache_logp: f64,
+    eval_cache_mix_logps: [f64; 256],
+    eval_cache_expert_logps: Vec<[f64; 256]>,
+    total_log_loss: f64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub enum MixtureRuntimeCheckpoint {
+    Bayes(BayesMixtureCheckpoint),
+    Fading(FadingBayesMixtureCheckpoint),
+    Switching(SwitchingMixtureCheckpoint),
+    Convex(ConvexMixtureCheckpoint),
+    Mdl(MdlSelectorCheckpoint),
+    Neural(NeuralMixtureCheckpoint),
 }
 
 // =============================================================================
@@ -3147,6 +3843,182 @@ pub enum MixtureRuntime {
 }
 
 impl MixtureRuntime {
+    pub(crate) fn checkpoint(&mut self) -> Option<MixtureRuntimeCheckpoint> {
+        match self {
+            MixtureRuntime::Bayes(m) => {
+                Some(MixtureRuntimeCheckpoint::Bayes(BayesMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_mix: m.scratch_mix.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                }))
+            }
+            MixtureRuntime::Fading(m) => Some(MixtureRuntimeCheckpoint::Fading(
+                FadingBayesMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_mix: m.scratch_mix.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_predictive: m.cached_log_predictive,
+                    cached_log_evidence: m.cached_log_evidence,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                },
+            )),
+            MixtureRuntime::Switching(m) => Some(MixtureRuntimeCheckpoint::Switching(
+                SwitchingMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_joint: m.scratch_joint.clone(),
+                    scratch_weights: m.scratch_weights.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                    update_count: m.update_count,
+                },
+            )),
+            MixtureRuntime::Convex(m) => {
+                Some(MixtureRuntimeCheckpoint::Convex(ConvexMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    lambda: m.lambda.clone(),
+                    scratch_logps: m.scratch_logps.clone(),
+                    projection_scratch: m.projection_scratch.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                    update_count: m.update_count,
+                }))
+            }
+            MixtureRuntime::Mdl(m) => Some(MixtureRuntimeCheckpoint::Mdl(MdlSelectorCheckpoint {
+                experts: checkpoint_experts(&mut m.experts)?,
+                scratch_logps: m.scratch_logps.clone(),
+                bitwise: m.bitwise.clone(),
+                total_log_loss: m.total_log_loss,
+                last_best: m.last_best,
+                cached_symbol: m.cached_symbol,
+                cached_best_idx: m.cached_best_idx,
+                cached_best_logp: m.cached_best_logp,
+                cache_valid: m.cache_valid,
+            })),
+            MixtureRuntime::Neural(m) => {
+                Some(MixtureRuntimeCheckpoint::Neural(NeuralMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    neural: m.neural.clone(),
+                    analyzer: m.analyzer.clone(),
+                    scratch_expert_logps: m.scratch_expert_logps.clone(),
+                    scratch_mix_weights: m.scratch_mix_weights.clone(),
+                    bitwise: m.bitwise.clone(),
+                    eval_cache_valid: m.eval_cache_valid,
+                    eval_cache_full_valid: m.eval_cache_full_valid,
+                    eval_cache_history: m.eval_cache_history,
+                    eval_cache_symbol: m.eval_cache_symbol,
+                    eval_cache_logp: m.eval_cache_logp,
+                    eval_cache_mix_logps: m.eval_cache_mix_logps,
+                    eval_cache_expert_logps: m.eval_cache_expert_logps.clone(),
+                    total_log_loss: m.total_log_loss,
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn restore_checkpoint(&mut self, checkpoint: &MixtureRuntimeCheckpoint) {
+        match (self, checkpoint) {
+            (MixtureRuntime::Bayes(m), MixtureRuntimeCheckpoint::Bayes(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.scratch_mix = ck.scratch_mix.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            (MixtureRuntime::Fading(m), MixtureRuntimeCheckpoint::Fading(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.scratch_mix = ck.scratch_mix.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_predictive = ck.cached_log_predictive;
+                m.cached_log_evidence = ck.cached_log_evidence;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            (MixtureRuntime::Switching(m), MixtureRuntimeCheckpoint::Switching(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.scratch_joint = ck.scratch_joint.clone();
+                m.scratch_weights = ck.scratch_weights.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+                m.update_count = ck.update_count;
+            }
+            (MixtureRuntime::Convex(m), MixtureRuntimeCheckpoint::Convex(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.lambda = ck.lambda.clone();
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.projection_scratch = ck.projection_scratch.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+                m.update_count = ck.update_count;
+            }
+            (MixtureRuntime::Mdl(m), MixtureRuntimeCheckpoint::Mdl(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.total_log_loss = ck.total_log_loss;
+                m.last_best = ck.last_best;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_best_idx = ck.cached_best_idx;
+                m.cached_best_logp = ck.cached_best_logp;
+                m.cache_valid = ck.cache_valid;
+            }
+            (MixtureRuntime::Neural(m), MixtureRuntimeCheckpoint::Neural(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.neural = ck.neural.clone();
+                m.analyzer = ck.analyzer.clone();
+                m.scratch_expert_logps = ck.scratch_expert_logps.clone();
+                m.scratch_mix_weights = ck.scratch_mix_weights.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.eval_cache_valid = ck.eval_cache_valid;
+                m.eval_cache_full_valid = ck.eval_cache_full_valid;
+                m.eval_cache_history = ck.eval_cache_history;
+                m.eval_cache_symbol = ck.eval_cache_symbol;
+                m.eval_cache_logp = ck.eval_cache_logp;
+                m.eval_cache_mix_logps = ck.eval_cache_mix_logps;
+                m.eval_cache_expert_logps = ck.eval_cache_expert_logps.clone();
+                m.total_log_loss = ck.total_log_loss;
+            }
+            _ => panic!("mismatched MixtureRuntime checkpoint variant"),
+        }
+    }
+
+    pub(crate) fn clear_checkpoints_if_supported(&mut self) {
+        match self {
+            MixtureRuntime::Bayes(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Fading(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Switching(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Convex(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Mdl(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Neural(m) => clear_expert_checkpoints(&mut m.experts),
+        }
+    }
+
     pub(crate) fn supports_frozen_reset(&self) -> bool {
         match self {
             MixtureRuntime::Bayes(m) => experts_support_frozen_reset(&m.experts),
@@ -3247,6 +4119,216 @@ impl MixtureRuntime {
             MixtureRuntime::Neural(m) => m.fill_log_probs(out),
         }
     }
+
+    pub(crate) fn has_native_msb_byte_prefix(&self) -> bool {
+        match self {
+            MixtureRuntime::Bayes(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Fading(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Switching(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Convex(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Mdl(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Neural(m) => experts_have_native_msb_byte_prefix(&m.experts),
+        }
+    }
+
+    pub(crate) fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        match self {
+            MixtureRuntime::Bayes(m) => {
+                let weights: Vec<f64> = normalized_expert_log_weights(&m.experts);
+                m.bitwise.begin(&mut m.experts, &weights)
+            }
+            MixtureRuntime::Fading(m) => {
+                let weights: Vec<f64> = normalized_scaled_expert_log_weights(&m.experts, m.decay);
+                m.bitwise.begin(&mut m.experts, &weights)
+            }
+            MixtureRuntime::Switching(m) => {
+                let weights: Vec<f64> = normalized_expert_log_weights(&m.experts);
+                m.bitwise.begin(&mut m.experts, &weights)
+            }
+            MixtureRuntime::Convex(m) => m.bitwise.begin(&mut m.experts, &m.lambda),
+            MixtureRuntime::Mdl(m) => {
+                let best_idx: usize = best_expert_index(&m.experts);
+                let mut weights: Vec<f64> = vec![0.0; m.experts.len()];
+                if let Some(slot) = weights.get_mut(best_idx) {
+                    *slot = 1.0;
+                }
+                m.bitwise.begin(&mut m.experts, &weights)
+            }
+            MixtureRuntime::Neural(m) => {
+                if m.experts.len() == 1 {
+                    m.scratch_mix_weights.resize(1, 1.0);
+                    m.scratch_mix_weights[0] = 1.0;
+                } else {
+                    m.sync_history_state();
+                    m.neural.evaluate_expert_weights();
+                    m.scratch_mix_weights
+                        .copy_from_slice(m.neural.expert_weights());
+                }
+                m.bitwise.begin(&mut m.experts, &m.scratch_mix_weights)
+            }
+        }
+    }
+
+    pub(crate) fn native_msb_prefix_prob_one(&mut self, bit_idx: usize) -> Result<f64, String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Fading(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Switching(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Convex(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Mdl(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Neural(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+        }
+    }
+
+    pub(crate) fn observe_native_msb_prefix_bit(
+        &mut self,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<(), String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Fading(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Switching(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Convex(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Mdl(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Neural(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+        }
+    }
+
+    pub(crate) fn finish_native_msb_byte_prefix(&mut self, symbol: u8) -> Result<(), String> {
+        match self {
+            MixtureRuntime::Bayes(m) => finish_bayes_native_prefix(m, symbol),
+            MixtureRuntime::Fading(m) => finish_fading_native_prefix(m, symbol),
+            MixtureRuntime::Switching(m) => finish_switching_native_prefix(m, symbol),
+            MixtureRuntime::Convex(m) => finish_convex_native_prefix(m, symbol),
+            MixtureRuntime::Mdl(m) => finish_mdl_native_prefix(m, symbol),
+            MixtureRuntime::Neural(m) => finish_neural_native_prefix(m, symbol),
+        }
+    }
+}
+
+fn experts_have_native_msb_byte_prefix(experts: &[ExpertState]) -> bool {
+    experts
+        .iter()
+        .any(|expert| expert.predictor.has_native_msb_byte_prefix())
+}
+
+fn normalized_expert_log_weights(experts: &[ExpertState]) -> Vec<f64> {
+    let norm: f64 = logsumexp_weights(experts);
+    experts
+        .iter()
+        .map(|expert| (expert.log_weight - norm).exp())
+        .collect()
+}
+
+fn normalized_scaled_expert_log_weights(experts: &[ExpertState], scale: f64) -> Vec<f64> {
+    let mut log_weights: Vec<f64> = experts
+        .iter()
+        .map(|expert| scale * expert.log_weight)
+        .collect();
+    let norm: f64 = logsumexp(&log_weights);
+    for weight in &mut log_weights {
+        *weight = (*weight - norm).exp();
+    }
+    log_weights
+}
+
+fn best_expert_index(experts: &[ExpertState]) -> usize {
+    let mut best_idx: usize = 0;
+    let mut best_loss: f64 = f64::INFINITY;
+    for (idx, expert) in experts.iter().enumerate() {
+        if expert.cum_log_loss < best_loss {
+            best_loss = expert.cum_log_loss;
+            best_idx = idx;
+        }
+    }
+    best_idx
+}
+
+fn finish_bayes_native_prefix(m: &mut BayesMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let log_mix =
+        apply_bayes_update_from_logps(&mut m.experts, &m.bitwise.logps, &mut m.scratch_mix);
+    m.cache_valid = false;
+    m.total_log_loss -= log_mix;
+    Ok(())
+}
+
+fn finish_fading_native_prefix(m: &mut FadingBayesMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let log_predictive = apply_fading_update_from_logps(
+        &mut m.experts,
+        &m.bitwise.logps,
+        &mut m.scratch_mix,
+        m.decay,
+    );
+    m.cache_valid = false;
+    m.total_log_loss -= log_predictive;
+    Ok(())
+}
+
+fn finish_switching_native_prefix(m: &mut SwitchingMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let log_mix = apply_switching_update_from_logps(
+        &mut m.experts,
+        &m.bitwise.logps,
+        &mut m.scratch_joint,
+        &mut m.scratch_weights,
+        &m.prior,
+        m.schedule,
+        m.alpha,
+        &mut m.update_count,
+    );
+    m.cache_valid = false;
+    m.total_log_loss -= log_mix;
+    Ok(())
+}
+
+fn finish_convex_native_prefix(m: &mut ConvexMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let log_mix = apply_convex_update_from_logps(
+        &mut m.experts,
+        &m.bitwise.logps,
+        &mut m.lambda,
+        &mut m.projection_scratch,
+        m.schedule,
+        m.alpha,
+        &mut m.update_count,
+    );
+    m.cache_valid = false;
+    m.total_log_loss -= log_mix;
+    Ok(())
+}
+
+fn finish_mdl_native_prefix(m: &mut MdlSelector, symbol: u8) -> Result<(), String> {
+    let best_idx: usize = best_expert_index(&m.experts);
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let logp =
+        apply_mdl_update_from_logps(&mut m.experts, &m.bitwise.logps, best_idx, &mut m.last_best);
+    m.cache_valid = false;
+    m.total_log_loss -= logp;
+    Ok(())
+}
+
+fn finish_neural_native_prefix(m: &mut NeuralMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    m.scratch_expert_logps
+        .copy_from_slice(&m.bitwise.logps[..m.experts.len()]);
+    for idx in 0..m.experts.len() {
+        m.experts[idx].cum_log_loss -= m.scratch_expert_logps[idx];
+    }
+    let logp: f64 = m
+        .bitwise
+        .weights
+        .iter()
+        .zip(m.bitwise.logps.iter())
+        .map(|(&w, &lp)| w * lp.exp())
+        .sum::<f64>()
+        .max(m.min_prob)
+        .ln();
+    finish_neural_update_from_logps(m, symbol, logp, m.experts.len() > 1);
+    m.eval_cache_history = m.neural.history_state();
+    Ok(())
 }
 
 fn begin_expert_stream(
@@ -3393,6 +4475,107 @@ mod tests {
         ExpertConfig::new(name, weight.ln(), move || {
             Box::new(FixedProbPredict { prob_zero })
         })
+    }
+
+    fn assert_weights_close(actual: &[f64], expected: &[f64], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label} length mismatch");
+        for (index, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() < 1e-12,
+                "{label}[{index}]: expected {e}, got {a}"
+            );
+        }
+    }
+
+    fn assert_expert_losses_reset(experts: &[ExpertState], label: &str) {
+        for expert in experts {
+            assert!(
+                expert.cum_log_loss.abs() < 1e-12,
+                "{label} expert '{}' loss should reset, got {}",
+                expert.name,
+                expert.cum_log_loss
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct NativeBitProbPredict {
+        prob_one: f64,
+    }
+
+    impl OnlineBytePredictor for NativeBitProbPredict {
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            let p = if symbol == 0 {
+                1.0 - self.prob_one
+            } else {
+                self.prob_one / 255.0
+            };
+            p.max(DEFAULT_MIN_PROB).ln()
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+
+        fn has_native_msb_byte_prefix(&self) -> bool {
+            true
+        }
+
+        fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn native_msb_prefix_prob_one(&mut self, _bit_idx: usize) -> Result<f64, String> {
+            Ok(self.prob_one)
+        }
+
+        fn observe_native_msb_prefix_bit(
+            &mut self,
+            _bit_idx: usize,
+            _bit: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn finish_native_msb_byte_prefix(&mut self, _symbol: u8) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mixture_bit_prefix_observe_without_prob_one_primes_current_bit() {
+        let configs = vec![
+            ExpertConfig::uniform("high", || Box::new(NativeBitProbPredict { prob_one: 0.9 })),
+            ExpertConfig::uniform("low", || Box::new(NativeBitProbPredict { prob_one: 0.1 })),
+        ];
+        let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
+        let mut bitwise = MixtureBitPrefixState::default();
+        assert!(
+            bitwise.begin(&mut experts, &[0.5, 0.5]).expect("begin"),
+            "native prefix should activate when experts support native bit stepping"
+        );
+
+        bitwise
+            .observe(&mut experts, 0, true)
+            .expect("observe without prior prob_one");
+        assert!(
+            (bitwise.likelihoods[0] - 0.9).abs() < 1e-12,
+            "high-prob expert likelihood should use freshly primed p1"
+        );
+        assert!(
+            (bitwise.likelihoods[1] - 0.1).abs() < 1e-12,
+            "low-prob expert likelihood should use freshly primed p1"
+        );
+        assert!(
+            bitwise.primed_bit_idx.is_none(),
+            "observe should clear priming for the next bit"
+        );
+
+        bitwise
+            .finish_adaptive(&mut experts, 0b1000_0000)
+            .expect("finish adaptive");
+        assert!(
+            bitwise.logps[0] > bitwise.logps[1],
+            "log-likelihoods should distinguish disagreeing experts after observe-only updates"
+        );
     }
 
     #[test]
@@ -3583,6 +4766,69 @@ mod tests {
         ];
         assert!((mix.lambda[0] - expected[0]).abs() < 1e-12);
         assert!((mix.lambda[1] - expected[1]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mixture_begin_fresh_stream_resets_wrapper_state_to_priors() {
+        let configs = vec![weighted_cfg("a", 0.7, 0.9), weighted_cfg("b", 0.3, 0.2)];
+        let prior = [0.7_f64, 0.3_f64];
+
+        let mut bayes = BayesMixture::new(&configs);
+        let _ = bayes.step(0);
+        assert!(bayes.posterior()[0] > prior[0]);
+        bayes.begin_fresh_stream(Some(1)).expect("bayes fresh");
+        assert_weights_close(&bayes.posterior(), &prior, "bayes posterior");
+        assert_expert_losses_reset(&bayes.experts, "bayes");
+        assert_eq!(bayes.total_log_loss(), 0.0);
+
+        let mut fading = FadingBayesMixture::new(&configs, 0.8);
+        let _ = fading.step(0);
+        assert!(fading.posterior()[0] > prior[0]);
+        fading.begin_fresh_stream(Some(1)).expect("fading fresh");
+        assert_weights_close(&fading.posterior(), &prior, "fading posterior");
+        assert_expert_losses_reset(&fading.experts, "fading");
+        assert_eq!(fading.total_log_loss(), 0.0);
+
+        let mut switching = SwitchingMixture::new(&configs, 0.15, MixtureScheduleMode::Default);
+        let _ = switching.step(0);
+        assert!(switching.posterior()[0] > prior[0]);
+        switching
+            .begin_fresh_stream(Some(1))
+            .expect("switching fresh");
+        assert_weights_close(&switching.posterior(), &prior, "switching posterior");
+        assert_expert_losses_reset(&switching.experts, "switching");
+        assert_eq!(switching.update_count, 0);
+        assert_eq!(switching.total_log_loss(), 0.0);
+
+        let mut convex = ConvexMixture::new(&configs, 0.2, MixtureScheduleMode::Default);
+        let _ = convex.step(0);
+        assert!(convex.lambda[0] > prior[0]);
+        convex.begin_fresh_stream(Some(1)).expect("convex fresh");
+        assert_weights_close(&convex.lambda, &prior, "convex lambda");
+        assert_expert_losses_reset(&convex.experts, "convex");
+        assert_eq!(convex.update_count, 0);
+        assert_eq!(convex.total_log_loss, 0.0);
+
+        let mut mdl = MdlSelector::new(&configs);
+        let _ = mdl.step(0);
+        assert!(mdl.experts.iter().any(|expert| expert.cum_log_loss > 0.0));
+        mdl.begin_fresh_stream(Some(1)).expect("mdl fresh");
+        assert_expert_losses_reset(&mdl.experts, "mdl");
+        assert_eq!(mdl.best_index(), 0);
+        assert_eq!(mdl.total_log_loss(), 0.0);
+
+        let mut neural = NeuralMixture::new(&configs, 0.05);
+        let mut fresh_neural = NeuralMixture::new(&configs, 0.05);
+        let _ = neural.step(0);
+        neural.begin_fresh_stream(Some(1)).expect("neural fresh");
+        let reset_logp = neural.predict_log_prob(0);
+        let fresh_logp = fresh_neural.predict_log_prob(0);
+        assert!(
+            (reset_logp - fresh_logp).abs() < 1e-12,
+            "neural wrapper state should match a fresh wrapper after restart"
+        );
+        assert_expert_losses_reset(&neural.experts, "neural");
+        assert_eq!(neural.total_log_loss(), 0.0);
     }
 
     #[test]
