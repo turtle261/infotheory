@@ -147,6 +147,7 @@ feature_gated_rate_predictor_builder! {
             min_prob,
             checkpoint_journal: Vec::new(),
             checkpoint_depth: 0,
+            native_prefix_progress: None,
         })
     }
 }
@@ -165,6 +166,7 @@ feature_gated_rate_predictor_builder! {
             min_prob,
             checkpoint_journal: Vec::new(),
             checkpoint_depth: 0,
+            native_prefix_progress: None,
         })
     }
 }

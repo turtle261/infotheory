@@ -308,6 +308,20 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
         false
     }
 
+    /// Release a structural checkpoint that will never be restored.
+    ///
+    /// Predictors with compact rollback journals can use this to retire
+    /// temporary checkpoints without clearing older checkpoints that may still
+    /// be live elsewhere. Plain drop-based checkpoints can accept the default
+    /// behavior: taking ownership of `_checkpoint` is already a successful
+    /// discard.
+    fn discard_checkpoint_if_supported(
+        &mut self,
+        _checkpoint: OnlineBytePredictorCheckpoint,
+    ) -> bool {
+        true
+    }
+
     /// Clear compact checkpoint journals after all structural checkpoints expire.
     fn clear_checkpoints_if_supported(&mut self) {}
 
@@ -336,17 +350,25 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     /// Returns `true` when the predictor entered a native prefix state. Callers
     /// must then query bits in order, call [`Self::observe_native_msb_prefix_bit`]
     /// after each observed prefix bit, and finish with
-    /// [`Self::finish_native_msb_byte_prefix`].
+    /// [`Self::finish_native_msb_byte_prefix`]. Implementations must leave the
+    /// predictor unchanged when they return `Ok(false)` or `Err(_)`.
     fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
         Ok(false)
     }
 
     /// Predict `P(bit = 1)` for the next MSB-first prefix bit.
+    ///
+    /// `bit_idx` must match the next unobserved bit in the active native
+    /// prefix, counted MSB-first in `0..8`. Re-querying the current bit index
+    /// before observing it is allowed.
     fn native_msb_prefix_prob_one(&mut self, _bit_idx: usize) -> Result<f64, String> {
         Err("native MSB-first byte-prefix prediction is unavailable".to_string())
     }
 
     /// Observe one MSB-first prefix bit inside an active native byte-prefix step.
+    ///
+    /// `bit_idx` must match the next unobserved bit in the active native
+    /// prefix, counted MSB-first in `0..8`.
     fn observe_native_msb_prefix_bit(&mut self, _bit_idx: usize, _bit: bool) -> Result<(), String> {
         Err("native MSB-first byte-prefix stepping is unavailable".to_string())
     }
@@ -410,6 +432,31 @@ impl OnlineBytePredictorCheckpoint {
     fn rate_backend(checkpoint: RateBackendPredictorCheckpoint) -> Self {
         Self(OnlineBytePredictorCheckpointKind::RateBackend(checkpoint))
     }
+}
+
+#[cfg(feature = "backend-ctw")]
+fn validate_native_msb_prefix_bit_idx(next_bit_idx: usize, bit_idx: usize) -> Result<(), String> {
+    if bit_idx >= 8 {
+        return Err(format!(
+            "native MSB-first byte-prefix bit index {bit_idx} is out of range; expected 0..8"
+        ));
+    }
+    if bit_idx != next_bit_idx {
+        return Err(format!(
+            "native MSB-first byte-prefix bit index {bit_idx} violated sequential stepping; expected {next_bit_idx}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "backend-ctw")]
+fn validate_native_msb_prefix_finish(next_bit_idx: usize) -> Result<(), String> {
+    if next_bit_idx != 8 {
+        return Err(format!(
+            "native MSB-first byte-prefix finish requires 8 observed bits, got {next_bit_idx}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -522,20 +569,64 @@ struct MixtureBitPrefixState {
     logps: Vec<f64>,
     active: bool,
     primed_bit_idx: Option<usize>,
+    expected_bit_idx: usize,
 }
 
 impl MixtureBitPrefixState {
+    fn reset_inactive(&mut self) {
+        self.active = false;
+        self.primed_bit_idx = None;
+        self.expected_bit_idx = 0;
+    }
+
+    fn validate_bit_idx(&self, bit_idx: usize) -> Result<(), String> {
+        if bit_idx >= 8 {
+            return Err(format!(
+                "native MSB-first byte-prefix bit index {bit_idx} is out of range; expected 0..8"
+            ));
+        }
+        if bit_idx != self.expected_bit_idx {
+            return Err(format!(
+                "native MSB-first byte-prefix bit index {bit_idx} violated sequential stepping; expected {}",
+                self.expected_bit_idx
+            ));
+        }
+        Ok(())
+    }
+
     fn begin(&mut self, experts: &mut [ExpertState], weights: &[f64]) -> Result<bool, String> {
         if !experts
             .iter()
             .any(|expert| expert.predictor.has_native_msb_byte_prefix())
         {
-            self.active = false;
-            self.primed_bit_idx = None;
+            self.reset_inactive();
             return Ok(false);
         }
 
         let n: usize = experts.len();
+        let mut native_checkpoints: Vec<ExpertTempCheckpoint> = Vec::new();
+        for (idx, expert) in experts.iter_mut().enumerate() {
+            if !expert.predictor.has_native_msb_byte_prefix() {
+                continue;
+            }
+            let Some(checkpoint) = expert.predictor.checkpoint_if_supported() else {
+                for checkpoint in native_checkpoints.drain(..) {
+                    assert!(
+                        experts[checkpoint.index]
+                            .predictor
+                            .discard_checkpoint_if_supported(checkpoint.checkpoint),
+                        "native-prefix expert checkpoint could not be discarded",
+                    );
+                }
+                self.reset_inactive();
+                return Ok(false);
+            };
+            native_checkpoints.push(ExpertTempCheckpoint {
+                index: idx,
+                checkpoint,
+            });
+        }
+
         self.states.resize_with(n, BytePrefixStepState::default);
         self.weights.clear();
         self.weights.extend(weights.iter().copied());
@@ -545,8 +636,34 @@ impl MixtureBitPrefixState {
         self.bit_probs.resize(n, 0.5);
         self.logps.resize(n, 0.0);
         self.primed_bit_idx = None;
+        self.expected_bit_idx = 0;
         for (state, expert) in self.states.iter_mut().zip(experts.iter_mut()) {
-            state.prepare(expert.predictor.as_mut())?;
+            if let Err(err) = state.prepare(expert.predictor.as_mut()) {
+                for checkpoint in native_checkpoints.drain(..) {
+                    assert!(
+                        experts[checkpoint.index]
+                            .predictor
+                            .restore_checkpoint_if_supported(&checkpoint.checkpoint),
+                        "native-prefix expert checkpoint could not be restored",
+                    );
+                    assert!(
+                        experts[checkpoint.index]
+                            .predictor
+                            .discard_checkpoint_if_supported(checkpoint.checkpoint),
+                        "native-prefix expert checkpoint could not be discarded",
+                    );
+                }
+                self.reset_inactive();
+                return Err(err);
+            }
+        }
+        for checkpoint in native_checkpoints.drain(..) {
+            assert!(
+                experts[checkpoint.index]
+                    .predictor
+                    .discard_checkpoint_if_supported(checkpoint.checkpoint),
+                "native-prefix expert checkpoint could not be discarded",
+            );
         }
         self.active = true;
         Ok(true)
@@ -557,6 +674,7 @@ impl MixtureBitPrefixState {
         experts: &mut [ExpertState],
         bit_idx: usize,
     ) -> Result<(), String> {
+        self.validate_bit_idx(bit_idx)?;
         if self.primed_bit_idx == Some(bit_idx) {
             return Ok(());
         }
@@ -600,21 +718,32 @@ impl MixtureBitPrefixState {
             self.likelihoods[idx] = (self.likelihoods[idx] * pb).max(DEFAULT_MIN_PROB);
             self.states[idx].observe(experts[idx].predictor.as_mut(), bit_idx, bit)?;
         }
+        self.expected_bit_idx += 1;
         self.primed_bit_idx = None;
         Ok(())
     }
 
     fn finish_adaptive(&mut self, experts: &mut [ExpertState], symbol: u8) -> Result<(), String> {
         debug_assert!(self.active);
+        if self.expected_bit_idx != 8 {
+            return Err(format!(
+                "native MSB-first byte-prefix finish requires 8 observed bits, got {}",
+                self.expected_bit_idx
+            ));
+        }
         for idx in 0..experts.len() {
             let lp: f64 = self.likelihoods[idx].max(DEFAULT_MIN_PROB).ln();
             self.logps[idx] = lp;
             self.states[idx].finish(experts[idx].predictor.as_mut(), symbol)?;
         }
-        self.active = false;
-        self.primed_bit_idx = None;
+        self.reset_inactive();
         Ok(())
     }
+}
+
+struct ExpertTempCheckpoint {
+    index: usize,
+    checkpoint: OnlineBytePredictorCheckpoint,
 }
 
 #[cfg(feature = "backend-rwkv")]
@@ -692,6 +821,8 @@ pub enum RateBackendPredictor {
         checkpoint_journal: Vec<CtwUndoOp>,
         /// Number of active checkpoints that require journaling.
         checkpoint_depth: usize,
+        /// In-flight native byte-prefix progress when stepping MSB-first bits.
+        native_prefix_progress: Option<usize>,
     },
     /// Factorized CTW with configurable bit-encoding (LSB-first).
     #[cfg(feature = "backend-ctw")]
@@ -793,6 +924,8 @@ pub enum RateBackendPredictorCheckpoint {
     Ctw {
         /// Length of the rollback journal to restore when unwinding the checkpoint.
         journal_len: usize,
+        /// In-flight native prefix progress captured with the checkpoint.
+        native_prefix_progress: Option<usize>,
     },
     /// Compact FAC-CTW journal marker for [`RateBackendPredictor::FacCtw`].
     #[cfg(feature = "backend-ctw")]
@@ -965,11 +1098,13 @@ impl RateBackendPredictor {
             RateBackendPredictor::Ctw {
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
                 *checkpoint_depth = checkpoint_depth.saturating_add(1);
                 RateBackendPredictorCheckpoint::Ctw {
                     journal_len: checkpoint_journal.len(),
+                    native_prefix_progress: *native_prefix_progress,
                 }
             }
             #[cfg(feature = "backend-ctw")]
@@ -1043,11 +1178,16 @@ impl RateBackendPredictor {
                     tree,
                     bits_per_symbol,
                     checkpoint_journal,
+                    native_prefix_progress,
                     ..
                 },
-                RateBackendPredictorCheckpoint::Ctw { journal_len },
+                RateBackendPredictorCheckpoint::Ctw {
+                    journal_len,
+                    native_prefix_progress: checkpoint_progress,
+                },
             ) => {
                 restore_ctw_checkpoint(tree, *bits_per_symbol, checkpoint_journal, *journal_len);
+                *native_prefix_progress = *checkpoint_progress;
             }
             #[cfg(feature = "backend-ctw")]
             (
@@ -1161,6 +1301,82 @@ impl RateBackendPredictor {
             _ => {}
         }
     }
+
+    pub(crate) fn discard_checkpoint(&mut self, checkpoint: RateBackendPredictorCheckpoint) {
+        match (self, checkpoint) {
+            #[cfg(feature = "backend-rosa")]
+            (
+                RateBackendPredictor::Rosa {
+                    checkpoint_depth, ..
+                },
+                RateBackendPredictorCheckpoint::Rosa { .. },
+            ) => {
+                *checkpoint_depth = checkpoint_depth.saturating_sub(1);
+            }
+            #[cfg(feature = "backend-sequitur")]
+            (
+                RateBackendPredictor::Sequitur { .. },
+                RateBackendPredictorCheckpoint::Sequitur(_),
+            ) => {}
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::Ctw {
+                    checkpoint_depth, ..
+                },
+                RateBackendPredictorCheckpoint::Ctw { .. },
+            ) => {
+                *checkpoint_depth = checkpoint_depth.saturating_sub(1);
+            }
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::FacCtw {
+                    checkpoint_depth, ..
+                },
+                RateBackendPredictorCheckpoint::FacCtw { .. },
+            ) => {
+                *checkpoint_depth = checkpoint_depth.saturating_sub(1);
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (
+                RateBackendPredictor::Calibrated { base, .. },
+                RateBackendPredictorCheckpoint::Calibrated(checkpoint),
+            ) => {
+                base.discard_checkpoint(*checkpoint.base);
+            }
+            #[cfg(feature = "backend-mixture")]
+            (
+                RateBackendPredictor::Mixture { runtime },
+                RateBackendPredictorCheckpoint::Mixture(checkpoint),
+            ) => {
+                runtime.discard_checkpoint(*checkpoint);
+            }
+            (_, RateBackendPredictorCheckpoint::Full(_)) => {}
+            #[cfg(feature = "backend-rosa")]
+            (_, RateBackendPredictorCheckpoint::Rosa { .. }) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorCheckpoint::Ctw { .. }) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorCheckpoint::FacCtw { .. }) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (_, RateBackendPredictorCheckpoint::Calibrated(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-mixture")]
+            (_, RateBackendPredictorCheckpoint::Mixture(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-sequitur")]
+            (_, RateBackendPredictorCheckpoint::Sequitur(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+        }
+    }
 }
 
 impl OnlineBytePredictor for RateBackendPredictor {
@@ -1225,7 +1441,13 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { .. } => Ok(()),
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw { .. } => Ok(()),
             #[cfg(feature = "backend-zpaq")]
@@ -1262,7 +1484,13 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ppmd")]
             RateBackendPredictor::Ppmd { .. } => Ok(()),
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { .. } => Ok(()),
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw { .. } => Ok(()),
             #[cfg(feature = "backend-zpaq")]
@@ -1301,6 +1529,18 @@ impl OnlineBytePredictor for RateBackendPredictor {
         match &checkpoint.0 {
             OnlineBytePredictorCheckpointKind::RateBackend(checkpoint) => {
                 self.restore_checkpoint(checkpoint);
+                true
+            }
+        }
+    }
+
+    fn discard_checkpoint_if_supported(
+        &mut self,
+        checkpoint: OnlineBytePredictorCheckpoint,
+    ) -> bool {
+        match checkpoint.0 {
+            OnlineBytePredictorCheckpointKind::RateBackend(checkpoint) => {
+                self.discard_checkpoint(checkpoint);
                 true
             }
         }
@@ -1583,7 +1823,21 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
                 bits_per_symbol, ..
-            } => Ok(*bits_per_symbol == 8),
+            } if *bits_per_symbol != 8 => Ok(false),
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                if native_prefix_progress.is_some() {
+                    return Err(
+                        "native MSB-first byte-prefix step is already active for this predictor"
+                            .to_string(),
+                    );
+                }
+                *native_prefix_progress = Some(0);
+                Ok(true)
+            }
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.begin_native_msb_byte_prefix(),
             _ => Ok(false),
@@ -1593,7 +1847,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
     fn native_msb_prefix_prob_one(&mut self, bit_idx: usize) -> Result<f64, String> {
         match self {
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { tree, min_prob, .. } => {
+            RateBackendPredictor::Ctw {
+                tree,
+                min_prob,
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
                 let p: f64 = tree.predict(true);
                 Ok(p.clamp(*min_prob, 1.0 - *min_prob))
             }
@@ -1612,9 +1875,14 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 tree,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
-                let _ = bit_idx;
+                let next_bit_idx = native_prefix_progress
+                    .as_mut()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                *next_bit_idx += 1;
                 tree.update(bit);
                 if *checkpoint_depth > 0 {
                     checkpoint_journal.push(CtwUndoOp::LearnedBit);
@@ -1632,7 +1900,15 @@ impl OnlineBytePredictor for RateBackendPredictor {
     fn finish_native_msb_byte_prefix(&mut self, symbol: u8) -> Result<(), String> {
         match self {
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { .. } => {
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_finish(*next_bit_idx)?;
+                *native_prefix_progress = None;
                 let _ = symbol;
                 Ok(())
             }
@@ -1683,8 +1959,14 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 bits_per_symbol,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "ctw symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
                 for bit_idx in 0..(*bits_per_symbol).clamp(1, 8) {
                     tree.update(ctw_symbol_bit_msb(symbol, *bits_per_symbol, bit_idx));
                 }
@@ -1819,7 +2101,13 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 min_prob,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
             } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "ctw symbol log_prob_update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
                 let logp = ctw_log_prob_update_msb(tree, symbol, *bits_per_symbol, *min_prob);
                 if *checkpoint_depth > 0 {
                     checkpoint_journal.push(CtwUndoOp::LearnedSymbol);
@@ -1902,7 +2190,12 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { tree, .. } => {
+            RateBackendPredictor::Ctw {
+                tree,
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
                 tree.truncate_history(0);
                 Ok(())
             }
@@ -1992,8 +2285,14 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 bits_per_symbol,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "ctw frozen symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
                 let bits = (*bits_per_symbol).clamp(1, 8);
                 let mut history_bits = [false; 8];
                 for (bit_idx, slot) in history_bits.iter_mut().enumerate().take(bits) {
@@ -3719,6 +4018,25 @@ fn clear_expert_checkpoints(experts: &mut [ExpertState]) {
     }
 }
 
+fn discard_expert_checkpoints(
+    experts: &mut [ExpertState],
+    checkpoints: Vec<ExpertStateCheckpoint>,
+) {
+    assert_eq!(
+        experts.len(),
+        checkpoints.len(),
+        "mixture checkpoint expert count mismatch"
+    );
+    for (expert, checkpoint) in experts.iter_mut().zip(checkpoints.into_iter()) {
+        assert!(
+            expert
+                .predictor
+                .discard_checkpoint_if_supported(checkpoint.predictor),
+            "mixture expert rejected checkpoint discard"
+        );
+    }
+}
+
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct BayesMixtureCheckpoint {
@@ -4003,6 +4321,30 @@ impl MixtureRuntime {
                 m.eval_cache_mix_logps = ck.eval_cache_mix_logps;
                 m.eval_cache_expert_logps = ck.eval_cache_expert_logps.clone();
                 m.total_log_loss = ck.total_log_loss;
+            }
+            _ => panic!("mismatched MixtureRuntime checkpoint variant"),
+        }
+    }
+
+    pub(crate) fn discard_checkpoint(&mut self, checkpoint: MixtureRuntimeCheckpoint) {
+        match (self, checkpoint) {
+            (MixtureRuntime::Bayes(m), MixtureRuntimeCheckpoint::Bayes(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Fading(m), MixtureRuntimeCheckpoint::Fading(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Switching(m), MixtureRuntimeCheckpoint::Switching(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Convex(m), MixtureRuntimeCheckpoint::Convex(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Mdl(m), MixtureRuntimeCheckpoint::Mdl(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Neural(m), MixtureRuntimeCheckpoint::Neural(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
             }
             _ => panic!("mismatched MixtureRuntime checkpoint variant"),
         }
@@ -4540,6 +4882,28 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct NativeWithoutCheckpointPredict {
+        begin_calls: Arc<AtomicUsize>,
+    }
+
+    impl OnlineBytePredictor for NativeWithoutCheckpointPredict {
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            if symbol == 0 { 0.0 } else { f64::NEG_INFINITY }
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+
+        fn has_native_msb_byte_prefix(&self) -> bool {
+            true
+        }
+
+        fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+            self.begin_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+    }
+
     #[test]
     fn mixture_bit_prefix_observe_without_prob_one_primes_current_bit() {
         let configs = vec![
@@ -4576,6 +4940,89 @@ mod tests {
             bitwise.logps[0] > bitwise.logps[1],
             "log-likelihoods should distinguish disagreeing experts after observe-only updates"
         );
+    }
+
+    #[test]
+    fn mixture_bit_prefix_requires_monotone_bit_indices() {
+        let configs = vec![ExpertConfig::ctw("left", 4), ExpertConfig::ctw("right", 5)];
+        let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
+        let mut bitwise = MixtureBitPrefixState::default();
+        assert!(bitwise.begin(&mut experts, &[0.5, 0.5]).expect("begin"));
+
+        let err = bitwise
+            .prob_one(&mut experts, 1)
+            .expect_err("bit 1 cannot be queried before bit 0 is observed");
+        assert!(err.contains("expected 0"));
+
+        bitwise
+            .observe(&mut experts, 0, true)
+            .expect("observe bit 0");
+        let err = bitwise
+            .observe(&mut experts, 0, false)
+            .expect_err("duplicate observe must be rejected");
+        assert!(err.contains("expected 1"));
+
+        let err = bitwise
+            .prob_one(&mut experts, 8)
+            .expect_err("bit index 8 must be rejected");
+        assert!(err.contains("out of range"));
+    }
+
+    #[test]
+    fn mixture_bit_prefix_skips_native_mode_without_checkpoint_support() {
+        let begin_calls = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::clone(&begin_calls);
+        let configs = vec![ExpertConfig::uniform("native", move || {
+            Box::new(NativeWithoutCheckpointPredict {
+                begin_calls: Arc::clone(&shared),
+            })
+        })];
+        let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
+        let mut bitwise = MixtureBitPrefixState::default();
+
+        assert!(
+            !bitwise.begin(&mut experts, &[1.0]).expect("begin"),
+            "native prefix should be disabled when rollback checkpoints are unavailable"
+        );
+        assert_eq!(
+            begin_calls.load(Ordering::Relaxed),
+            0,
+            "unsupported native experts must not be entered speculatively"
+        );
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn ctw_native_prefix_rejects_invalid_bit_indices() {
+        let mut predictor =
+            RateBackendPredictor::from_backend(RateBackend::Ctw { depth: 4 }, DEFAULT_MIN_PROB);
+        assert!(
+            predictor
+                .begin_native_msb_byte_prefix()
+                .expect("begin native prefix"),
+            "ctw byte predictor should support native prefix stepping"
+        );
+
+        let err = predictor
+            .native_msb_prefix_prob_one(8)
+            .expect_err("bit index 8 must be rejected");
+        assert!(err.contains("out of range"));
+
+        let err = predictor
+            .observe_native_msb_prefix_bit(1, true)
+            .expect_err("bit 1 cannot be observed before bit 0");
+        assert!(err.contains("expected 0"));
+
+        predictor
+            .native_msb_prefix_prob_one(0)
+            .expect("query bit 0");
+        predictor
+            .observe_native_msb_prefix_bit(0, true)
+            .expect("observe bit 0");
+        let err = predictor
+            .finish_native_msb_byte_prefix(0b1000_0000)
+            .expect_err("finish must require a complete byte");
+        assert!(err.contains("requires 8 observed bits"));
     }
 
     #[test]
