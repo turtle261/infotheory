@@ -206,7 +206,7 @@ mod imp {
             for &b in data {
                 let (after, delta) = self.encode_bits(b);
                 self.history_bits = after;
-                bits += -Self::log_prob_from_bits(self.min_prob, delta) / LN_2;
+                bits += delta;
                 self.history.push(b);
             }
             bits
@@ -256,6 +256,31 @@ mod imp {
 
             let diff = (bits_a - bits_b).abs();
             assert!(diff < 1e-6, "bits mismatch: {bits_a} vs {bits_b}");
+        }
+
+        #[test]
+        fn zpaq_update_and_score_keeps_raw_bit_deltas_when_floor_would_bind() {
+            let data: Vec<u8> = (0u8..=255).collect();
+            let mut raw_model = ZpaqRateModel::new("1", 0.5);
+            let mut raw_bits = 0.0;
+            for &symbol in &data {
+                let (after, delta) = raw_model.encode_bits(symbol);
+                raw_model.history_bits = after;
+                raw_model.history.push(symbol);
+                raw_bits += delta;
+            }
+            assert!(
+                raw_bits > data.len() as f64,
+                "test requires raw ZPAQ cost to exceed the 1-bit floor cap"
+            );
+
+            let mut scored_model = ZpaqRateModel::new("1", 0.5);
+            let scored_bits = scored_model.update_and_score(&data);
+
+            assert!(
+                (scored_bits - raw_bits).abs() < 1e-9,
+                "metric path must preserve raw ZPAQ bit growth: scored={scored_bits} raw={raw_bits}"
+            );
         }
 
         #[test]

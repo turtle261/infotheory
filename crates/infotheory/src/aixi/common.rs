@@ -187,6 +187,21 @@ pub(crate) fn bits_for_cardinality(cardinality: usize) -> usize {
     bits.max(1)
 }
 
+/// Return the total bit width of one percept segment in byte-packed planners.
+///
+/// Observation symbols and the reward token share one contiguous conditioning
+/// segment in the AIXI/AIQI token pipeline, so byte-packed validation must
+/// align their combined width rather than each field independently.
+pub(crate) fn byte_packed_percept_bits(
+    observation_bits: usize,
+    observation_stream_len: usize,
+    reward_bits: usize,
+) -> usize {
+    observation_bits
+        .saturating_mul(observation_stream_len.max(1))
+        .saturating_add(reward_bits)
+}
+
 #[cfg(feature = "aixi")]
 pub(crate) fn action_alphabet_from_action_bits(action_bits: usize) -> ActionAlphabet {
     let shift = u32::try_from(action_bits).expect("action bit width must fit within u32");

@@ -11,7 +11,8 @@ use super::{
     TuneBoundsSpec, TuneControllerSpec, TunePlannerInterfaceSpec, TuneSpec, ValidatedTuneSpec,
 };
 use crate::aixi::common::{
-    MctsStrategy, bits_for_cardinality, resolve_random_seed, warn_parallel_uct_workers_one_once,
+    MctsStrategy, bits_for_cardinality, byte_packed_percept_bits, resolve_random_seed,
+    warn_parallel_uct_workers_one_once,
 };
 use crate::spec::core::AssetRef;
 use std::collections::HashMap;
@@ -381,10 +382,11 @@ fn canonicalize_controller_spec(
             ) && let Some(interface) = interface
             {
                 let action_bits = interface.agent_actions.action_bits();
-                let percept_bits = interface
-                    .observation_bits
-                    .saturating_mul(interface.observation_stream_len.max(1))
-                    .saturating_add(interface.reward_bits);
+                let percept_bits = byte_packed_percept_bits(
+                    interface.observation_bits,
+                    interface.observation_stream_len,
+                    interface.reward_bits,
+                );
                 if action_bits % 8 != 0 || percept_bits % 8 != 0 {
                     return Err(SpecError::new(
                         "BitStreamSemantics::BytePacked requires action and percept segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIXI interfaces",
@@ -432,17 +434,15 @@ fn canonicalize_controller_spec(
             ) && let Some(interface) = interface
             {
                 let action_bits = interface.agent_actions.action_bits();
-                let observation_bits = interface
-                    .observation_bits
-                    .saturating_mul(interface.observation_stream_len.max(1));
+                let percept_bits = byte_packed_percept_bits(
+                    interface.observation_bits,
+                    interface.observation_stream_len,
+                    interface.reward_bits,
+                );
                 let return_bits = crate::aixi::common::bits_for_cardinality(inner.return_bins);
-                if action_bits % 8 != 0
-                    || observation_bits % 8 != 0
-                    || interface.reward_bits % 8 != 0
-                    || return_bits % 8 != 0
-                {
+                if action_bits % 8 != 0 || return_bits % 8 != 0 || percept_bits % 8 != 0 {
                     return Err(SpecError::new(
-                        "BitStreamSemantics::BytePacked requires action, observation, reward, and return segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIQI interfaces",
+                        "BitStreamSemantics::BytePacked requires action, return, and percept segments to end on byte boundaries; the percept segment combines observations and reward, so use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIQI interfaces",
                     ));
                 }
             }

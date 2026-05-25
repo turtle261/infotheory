@@ -9,8 +9,8 @@
 
 use crate::aixi::common::{
     Action, ActionAlphabet, PerceptVal, RandomGenerator, Reward, RewardEncodingError,
-    bits_for_cardinality, nonnegative_reward_encoding_bounds, resolve_random_seed,
-    validate_reward_encoding_bounds,
+    bits_for_cardinality, byte_packed_percept_bits, nonnegative_reward_encoding_bounds,
+    resolve_random_seed, validate_reward_encoding_bounds,
 };
 use crate::aixi::model::{
     Predictor, PredictorBuildError, build_aiqi_predictor, default_aixi_bit_stream_semantics,
@@ -395,17 +395,15 @@ impl AiqiConfig {
             BitStreamSemantics::BytePacked { .. }
         ) {
             let action_bits = self.agent_actions.action_bits();
-            let observation_bits = self
-                .observation_bits
-                .saturating_mul(self.observation_stream_len.max(1));
+            let percept_bits = byte_packed_percept_bits(
+                self.observation_bits,
+                self.observation_stream_len,
+                self.reward_bits,
+            );
             let return_bits = bits_for_cardinality(self.return_bins);
-            if action_bits % 8 != 0
-                || observation_bits % 8 != 0
-                || self.reward_bits % 8 != 0
-                || return_bits % 8 != 0
-            {
+            if action_bits % 8 != 0 || return_bits % 8 != 0 || percept_bits % 8 != 0 {
                 return Err(AiqiError::UnsupportedRateBackend {
-                    reason: "BitStreamSemantics::BytePacked requires action, observation, reward, and return segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIQI interfaces",
+                    reason: "BitStreamSemantics::BytePacked requires action, return, and percept segments to end on byte boundaries; the percept segment combines observations and reward, so use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIQI interfaces",
                 });
             }
         }
@@ -1650,6 +1648,23 @@ mod tests {
             err,
             AiqiError::InvalidBaselineExploration { value: 0.0 }
         ));
+    }
+
+    #[test]
+    fn byte_packed_config_allows_observation_and_reward_to_share_a_byte() {
+        let mut cfg = basic_config();
+        cfg.bit_stream_semantics = BitStreamSemantics::BytePacked {
+            order: crate::prediction::BitOrder::MsbFirst,
+        };
+        cfg.agent_actions = ActionAlphabet::try_from_usize(256)
+            .expect("test fixture action alphabet must be byte-aligned");
+        cfg.observation_bits = 3;
+        cfg.reward_bits = 5;
+        cfg.return_bins = 256;
+
+        cfg.validate().expect(
+            "byte-packed AIQI should allow observations and reward to share one percept byte",
+        );
     }
 
     #[test]

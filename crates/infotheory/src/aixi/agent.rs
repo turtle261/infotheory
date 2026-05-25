@@ -6,9 +6,9 @@
 
 use crate::aixi::common::{
     Action, ActionAlphabet, MctsStrategy, ObservationKeyMode, PerceptVal, RandomGenerator, Reward,
-    RewardEncodingError, decode, encode, nonnegative_reward_encoding_bounds,
-    observation_repr_from_stream, resolve_random_seed, validate_reward_encoding_bounds,
-    warn_parallel_uct_workers_one_once,
+    RewardEncodingError, byte_packed_percept_bits, decode, encode,
+    nonnegative_reward_encoding_bounds, observation_repr_from_stream, resolve_random_seed,
+    validate_reward_encoding_bounds, warn_parallel_uct_workers_one_once,
 };
 use crate::aixi::mcts::{
     AgentSimulator, ParallelUctPlanner, ParallelUctPlannerInitError, RhoUctPlanner,
@@ -270,10 +270,11 @@ impl AgentConfig {
             BitStreamSemantics::BytePacked { .. }
         ) {
             let action_bits = self.agent_actions.action_bits();
-            let percept_bits = self
-                .observation_bits
-                .saturating_mul(self.observation_stream_len.max(1))
-                .saturating_add(self.reward_bits);
+            let percept_bits = byte_packed_percept_bits(
+                self.observation_bits,
+                self.observation_stream_len,
+                self.reward_bits,
+            );
             if action_bits % 8 != 0 || percept_bits % 8 != 0 {
                 return Err(AgentError::UnsupportedRateBackend {
                     reason: "BitStreamSemantics::BytePacked requires action and percept segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIXI interfaces",
