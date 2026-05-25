@@ -135,6 +135,9 @@ pub struct RateBackendCapabilities {
     pub supports_native_bit_prediction: bool,
     /// Whether this backend can expose its byte PDF as a lazy binary prefix mass.
     pub supports_byte_prefix_mass: bool,
+    /// Whether repeated byte-packed bit-session prefix queries remain practical
+    /// without a replay-heavy fallback.
+    pub supports_efficient_byte_packed_bit_sessions: bool,
     /// Whether bit observations can be undone exactly after update.
     pub supports_reversible_bit_updates: bool,
     /// Whether the backend graph contains any ZPAQ component.
@@ -440,6 +443,13 @@ impl CompiledRateBackend {
     /// Whether this backend can expose its byte PDF as a lazy binary prefix mass.
     pub fn supports_byte_prefix_mass(&self) -> bool {
         self.capabilities.supports_byte_prefix_mass
+    }
+
+    /// Whether this backend can support repeated byte-packed bit-session prefix
+    /// queries without pathological replay-heavy fallback.
+    pub fn supports_efficient_byte_packed_bit_sessions(&self) -> bool {
+        self.capabilities
+            .supports_efficient_byte_packed_bit_sessions
     }
 
     /// Whether bit observations can be undone exactly after update.

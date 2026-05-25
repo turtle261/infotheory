@@ -199,6 +199,7 @@ macro_rules! define_rate_backend_catalog {
             supports_rate_coded_compression: $supports_rate_coded_compression:expr,
             supports_native_bit_prediction: $supports_native_bit_prediction:path,
             supports_byte_prefix_mass: $supports_byte_prefix_mass:path,
+            supports_efficient_byte_packed_bit_sessions: $supports_efficient_byte_packed_bit_sessions:path,
             supports_reversible_bit_updates: $supports_reversible_bit_updates:path,
             method_family: $method_family:expr,
             contains_zpaq: $contains_zpaq:path,
@@ -274,6 +275,12 @@ macro_rules! define_rate_backend_catalog {
                     ),
                     supports_byte_prefix_mass: feature_gated_kernel_ptr_anchor!(
                         $feature, RateCapabilityFn, $supports_byte_prefix_mass,
+                        fn fallback(_p: &RateBackendPlan) -> bool {
+                            false
+                        }
+                    ),
+                    supports_efficient_byte_packed_bit_sessions: feature_gated_kernel_ptr_anchor!(
+                        $feature, RateCapabilityFn, $supports_efficient_byte_packed_bit_sessions,
                         fn fallback(_p: &RateBackendPlan) -> bool {
                             false
                         }
@@ -447,6 +454,7 @@ pub(crate) struct RateBackendKernel {
     pub supports_rate_coded_compression: bool,
     pub supports_native_bit_prediction: RateCapabilityFn,
     pub supports_byte_prefix_mass: RateCapabilityFn,
+    pub supports_efficient_byte_packed_bit_sessions: RateCapabilityFn,
     pub supports_reversible_bit_updates: RateCapabilityFn,
     pub method_family: Option<MethodBackendFamily>,
     pub contains_zpaq: RateContainsZpaqFn,
@@ -489,6 +497,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_false,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -517,6 +526,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_false,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -545,6 +555,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_false,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -573,6 +584,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_false,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -601,6 +613,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_false,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -629,6 +642,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_true,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_true,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -657,6 +671,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_true,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_true,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -685,6 +700,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_false,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_false,
         supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_true,
@@ -713,6 +729,8 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::mixture_supports_native_bit_prediction,
         supports_byte_prefix_mass: crate::runtime::mixture_supports_byte_prefix_mass,
+        supports_efficient_byte_packed_bit_sessions:
+            crate::runtime::mixture_supports_efficient_byte_packed_bit_sessions,
         supports_reversible_bit_updates: crate::runtime::mixture_supports_reversible_bit_updates,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_mixture,
@@ -741,6 +759,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_false,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -769,6 +788,8 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::calibrated_supports_native_bit_prediction,
         supports_byte_prefix_mass: crate::runtime::calibrated_supports_byte_prefix_mass,
+        supports_efficient_byte_packed_bit_sessions:
+            crate::runtime::calibrated_supports_efficient_byte_packed_bit_sessions,
         supports_reversible_bit_updates: crate::runtime::calibrated_supports_reversible_bit_updates,
         method_family: None,
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_calibrated,
@@ -797,6 +818,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_false,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: Some(MethodBackendFamily::Mamba),
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -825,6 +847,7 @@ define_rate_backend_catalog! {
         supports_rate_coded_compression: true,
         supports_native_bit_prediction: crate::runtime::capability_always_false,
         supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
         supports_reversible_bit_updates: crate::runtime::capability_always_false,
         method_family: Some(MethodBackendFamily::Rwkv7),
         contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
@@ -1000,6 +1023,10 @@ pub(crate) fn rate_backend_capabilities_via_kernel(
         supports_rate_coded_compression: kernel.supports_rate_coded_compression,
         supports_native_bit_prediction: (kernel.supports_native_bit_prediction)(plan),
         supports_byte_prefix_mass: (kernel.supports_byte_prefix_mass)(plan),
+        supports_efficient_byte_packed_bit_sessions: (kernel
+            .supports_efficient_byte_packed_bit_sessions)(
+            plan
+        ),
         supports_reversible_bit_updates: (kernel.supports_reversible_bit_updates)(plan),
         contains_zpaq: (kernel.contains_zpaq)(plan),
         method_family: kernel.method_family,
@@ -2174,6 +2201,18 @@ pub(crate) fn mixture_supports_byte_prefix_mass(plan: &crate::spec::core::RateBa
     })
 }
 
+pub(crate) fn mixture_supports_efficient_byte_packed_bit_sessions(
+    plan: &crate::spec::core::RateBackendPlan,
+) -> bool {
+    let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = plan else {
+        unreachable!()
+    };
+    experts.iter().all(|e| {
+        (crate::runtime::rate_backend_kernel(e.backend.kind())
+            .supports_efficient_byte_packed_bit_sessions)(&e.backend)
+    })
+}
+
 pub(crate) fn mixture_supports_reversible_bit_updates(
     plan: &crate::spec::core::RateBackendPlan,
 ) -> bool {
@@ -2203,6 +2242,17 @@ pub(crate) fn calibrated_supports_byte_prefix_mass(
         unreachable!()
     };
     (crate::runtime::rate_backend_kernel(base.kind()).supports_byte_prefix_mass)(base)
+}
+
+pub(crate) fn calibrated_supports_efficient_byte_packed_bit_sessions(
+    plan: &crate::spec::core::RateBackendPlan,
+) -> bool {
+    let crate::spec::core::RateBackendPlan::Calibrated { base, .. } = plan else {
+        unreachable!()
+    };
+    (crate::runtime::rate_backend_kernel(base.kind()).supports_efficient_byte_packed_bit_sessions)(
+        base,
+    )
 }
 
 pub(crate) fn calibrated_supports_reversible_bit_updates(

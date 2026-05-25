@@ -379,6 +379,25 @@ fn api_surface_zpaq_bit_session_begin_stream_does_not_require_frozen_reset() {
 
 #[cfg(feature = "backend-zpaq")]
 #[test]
+fn api_surface_zpaq_byte_packed_bit_session_is_rejected() {
+    let err = match RateBackendBitSession::from_spec(
+        RateBackend::Zpaq {
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
+        },
+        Some(8),
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    ) {
+        Ok(_) => panic!("zpaq byte-packed session should be rejected"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(message.contains("does not support efficient BitStreamSemantics::BytePacked"));
+}
+
+#[cfg(feature = "backend-zpaq")]
+#[test]
 fn api_surface_zpaq_rate_backend_session_begin_stream_does_not_require_frozen_reset() {
     let mut session = RateBackendSession::from_spec(
         RateBackend::Zpaq {
@@ -662,6 +681,7 @@ fn api_surface_fac_ctw_binary_tokens_accept_arbitrary_length_streams() {
     .expect("compiled fac-ctw");
     assert!(compiled.capabilities().supports_native_bit_prediction);
     assert!(compiled.capabilities().supports_byte_prefix_mass);
+    assert!(compiled.supports_efficient_byte_packed_bit_sessions());
     assert!(compiled.capabilities().supports_reversible_bit_updates);
 
     let mut bit_session =
@@ -692,6 +712,7 @@ fn api_surface_mixture_over_native_bit_backend_preserves_binary_tokens() {
     let compiled = backend.clone().compile().expect("compiled mixture");
     assert!(compiled.capabilities().supports_native_bit_prediction);
     assert!(compiled.capabilities().supports_byte_prefix_mass);
+    assert!(compiled.supports_efficient_byte_packed_bit_sessions());
     assert!(compiled.capabilities().supports_reversible_bit_updates);
 
     let mut bit_session =
@@ -781,6 +802,7 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled ctw");
     assert!(ctw.capabilities().supports_native_bit_prediction);
     assert!(ctw.capabilities().supports_byte_prefix_mass);
+    assert!(ctw.supports_efficient_byte_packed_bit_sessions());
     assert!(ctw.capabilities().supports_reversible_bit_updates);
 
     #[cfg(feature = "backend-match")]
@@ -796,6 +818,7 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled match");
         assert!(!match_backend.capabilities().supports_native_bit_prediction);
         assert!(match_backend.capabilities().supports_byte_prefix_mass);
+        assert!(match_backend.supports_efficient_byte_packed_bit_sessions());
         assert!(!match_backend.capabilities().supports_reversible_bit_updates);
     }
 
@@ -812,6 +835,7 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled zpaq");
         assert!(!zpaq.capabilities().supports_native_bit_prediction);
         assert!(zpaq.capabilities().supports_byte_prefix_mass);
+        assert!(!zpaq.supports_efficient_byte_packed_bit_sessions());
         assert!(!zpaq.capabilities().supports_reversible_bit_updates);
     }
 
@@ -827,7 +851,26 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled mixture");
         assert!(mixture.capabilities().supports_native_bit_prediction);
         assert!(mixture.capabilities().supports_byte_prefix_mass);
+        assert!(mixture.supports_efficient_byte_packed_bit_sessions());
         assert!(mixture.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(all(feature = "backend-mixture", feature = "backend-zpaq"))]
+    {
+        let mixture = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![MixtureExpertSpec::new(RateBackend::Zpaq {
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
+                })],
+            )),
+        }
+        .compile()
+        .expect("compiled zpaq mixture");
+        assert!(!mixture.capabilities().supports_native_bit_prediction);
+        assert!(mixture.capabilities().supports_byte_prefix_mass);
+        assert!(!mixture.supports_efficient_byte_packed_bit_sessions());
+        assert!(!mixture.capabilities().supports_reversible_bit_updates);
     }
 
     #[cfg(all(feature = "backend-mixture", feature = "backend-match"))]
@@ -848,6 +891,7 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled byte-native mixture");
         assert!(!mixture.capabilities().supports_native_bit_prediction);
         assert!(mixture.capabilities().supports_byte_prefix_mass);
+        assert!(mixture.supports_efficient_byte_packed_bit_sessions());
         assert!(!mixture.capabilities().supports_reversible_bit_updates);
     }
 
@@ -863,7 +907,26 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled calibrated");
         assert!(calibrated.capabilities().supports_native_bit_prediction);
         assert!(calibrated.capabilities().supports_byte_prefix_mass);
+        assert!(calibrated.supports_efficient_byte_packed_bit_sessions());
         assert!(calibrated.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-zpaq"))]
+    {
+        let calibrated = RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec::new(
+                RateBackend::Zpaq {
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
+                },
+                CalibrationContextKind::Global,
+            )),
+        }
+        .compile()
+        .expect("compiled zpaq calibrated");
+        assert!(!calibrated.capabilities().supports_native_bit_prediction);
+        assert!(calibrated.capabilities().supports_byte_prefix_mass);
+        assert!(!calibrated.supports_efficient_byte_packed_bit_sessions());
+        assert!(!calibrated.capabilities().supports_reversible_bit_updates);
     }
 
     #[cfg(all(feature = "backend-calibrated", feature = "backend-match"))]
@@ -884,6 +947,7 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled byte-native calibrated");
         assert!(!calibrated.capabilities().supports_native_bit_prediction);
         assert!(calibrated.capabilities().supports_byte_prefix_mass);
+        assert!(calibrated.supports_efficient_byte_packed_bit_sessions());
         assert!(!calibrated.capabilities().supports_reversible_bit_updates);
     }
 }

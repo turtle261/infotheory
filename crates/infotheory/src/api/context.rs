@@ -220,6 +220,12 @@ impl RateBackendBitSession {
                         backend.canonical_name()
                     )));
                 }
+                if !backend.supports_efficient_byte_packed_bit_sessions() {
+                    return Err(InfotheoryError::invalid_backend_config(format!(
+                        "backend '{}' can expose byte probabilities but does not support efficient BitStreamSemantics::BytePacked sessions; use BitStreamSemantics::BinaryTokens or a backend with native or cached byte-prefix support",
+                        backend.canonical_name()
+                    )));
+                }
                 crate::runtime::build_rate_backend_predictor(&backend, min_prob)
             }
         }

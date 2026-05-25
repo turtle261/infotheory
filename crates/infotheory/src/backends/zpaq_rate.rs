@@ -166,8 +166,6 @@ mod imp {
 
         /// Fill 256-way log-probabilities for the current committed history without mutation.
         pub fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
-            // Treat fill as a read-only query of committed history.
-            self.rebuild_stream_from_history();
             for (sym, slot) in out.iter_mut().enumerate() {
                 *slot = self.log_prob_from_history(sym as u8);
             }
@@ -308,6 +306,39 @@ mod imp {
             let lp_a2 = model_a.log_prob(next_sym);
             let lp_b2 = model_b.log_prob(next_sym);
             assert!((lp_a2 - lp_b2).abs() < 1e-9, "lp_a2={lp_a2} lp_b2={lp_b2}");
+        }
+
+        #[test]
+        fn zpaq_fill_log_probs_preserves_pending_prediction_cache() {
+            let history = b"zpaq fill preserves pending";
+            let mut model_a = ZpaqRateModel::new("1", 1e-9);
+            let mut model_b = ZpaqRateModel::new("1", 1e-9);
+            for &b in history {
+                model_a.update(b);
+                model_b.update(b);
+            }
+
+            let probe = b'x';
+            let lp_before = model_a.log_prob(probe);
+            let mut row = [0.0f64; 256];
+            model_a.fill_log_probs(&mut row);
+            assert!(
+                (row[probe as usize] - model_b.log_prob_from_history(probe)).abs() < 1e-9,
+                "fill must score committed history, not speculative pending state"
+            );
+
+            let lp_after = model_a.log_prob(probe);
+            assert!(
+                (lp_before - lp_after).abs() < 1e-9,
+                "fill must preserve the pending speculative cache: before={lp_before} after={lp_after}"
+            );
+
+            model_a.update(probe);
+            model_b.update(probe);
+            let next = b'y';
+            let lp_a = model_a.log_prob(next);
+            let lp_b = model_b.log_prob(next);
+            assert!((lp_a - lp_b).abs() < 1e-9, "lp_a={lp_a} lp_b={lp_b}");
         }
 
         #[test]
