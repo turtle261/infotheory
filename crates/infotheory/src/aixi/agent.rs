@@ -8,7 +8,8 @@ use crate::aixi::common::{
     Action, ActionAlphabet, MctsStrategy, ObservationKeyMode, PerceptVal, RandomGenerator, Reward,
     RewardEncodingError, byte_packed_percept_bits, decode, encode,
     nonnegative_reward_encoding_bounds, observation_repr_from_stream, resolve_random_seed,
-    validate_reward_encoding_bounds, warn_parallel_uct_workers_one_once,
+    validate_mc_aixi_byte_packed_alignment, validate_reward_encoding_bounds,
+    warn_parallel_uct_workers_one_once,
 };
 use crate::aixi::mcts::{
     AgentSimulator, ParallelUctPlanner, ParallelUctPlannerInitError, RhoUctPlanner,
@@ -240,12 +241,10 @@ impl AgentConfig {
                 if workers.get() == 1 {
                     warn_parallel_uct_workers_one_once();
                 }
-                if let Some(m_max) = bu_uct_m_max {
-                    if !(0.0 < m_max && m_max < 1.0) {
-                        return Err(AgentError::Spec(SpecError::new(
-                            "controller.mcts_strategy.bu_uct_m_max must be in (0, 1)",
-                        )));
-                    }
+                if bu_uct_m_max.is_some_and(|m_max| !(0.0 < m_max && m_max < 1.0)) {
+                    return Err(AgentError::Spec(SpecError::new(
+                        "controller.mcts_strategy.bu_uct_m_max must be in (0, 1)",
+                    )));
                 }
             }
         }
@@ -275,11 +274,8 @@ impl AgentConfig {
                 self.observation_stream_len,
                 self.reward_bits,
             );
-            if action_bits % 8 != 0 || percept_bits % 8 != 0 {
-                return Err(AgentError::UnsupportedRateBackend {
-                    reason: "BitStreamSemantics::BytePacked requires action and percept segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIXI interfaces",
-                });
-            }
+            validate_mc_aixi_byte_packed_alignment(action_bits, percept_bits)
+                .map_err(|reason| AgentError::UnsupportedRateBackend { reason })?;
         }
 
         validate_rate_backend(&self.rate_backend).map_err(AgentError::InvalidRateBackend)?;
@@ -966,12 +962,16 @@ mod tests {
 
     #[test]
     fn explicit_rate_backend_semantics_are_symmetric_between_mc_aixi_and_aiqi() {
-        let mut agent_cfg = AgentConfig::default();
-        agent_cfg.rate_backend = crate::api::RateBackend::Ctw { depth: 8 };
+        let mut agent_cfg = AgentConfig {
+            rate_backend: crate::api::RateBackend::Ctw { depth: 8 },
+            ..AgentConfig::default()
+        };
         let agent_ctw = agent_cfg.canonical_predictor_backend();
 
-        let mut aiqi_cfg = crate::aixi::aiqi::AiqiConfig::default();
-        aiqi_cfg.rate_backend = crate::api::RateBackend::Ctw { depth: 8 };
+        let mut aiqi_cfg = crate::aixi::aiqi::AiqiConfig {
+            rate_backend: crate::api::RateBackend::Ctw { depth: 8 },
+            ..crate::aixi::aiqi::AiqiConfig::default()
+        };
         let aiqi_ctw = aiqi_cfg.canonical_predictor_backend_for_test();
 
         assert_eq!(
@@ -1004,12 +1004,14 @@ mod tests {
     #[cfg(feature = "backend-ctw")]
     #[test]
     fn programmatic_mcaixi_preserves_explicit_signed_reward_contract() {
-        let mut config = AgentConfig::default();
-        config.reward_bits = 3;
-        config.min_reward = -2;
-        config.max_reward = 3;
-        config.reward_offset = 2;
-        config.num_simulations = 1;
+        let config = AgentConfig {
+            reward_bits: 3,
+            min_reward: -2,
+            max_reward: 3,
+            reward_offset: 2,
+            num_simulations: 1,
+            ..AgentConfig::default()
+        };
 
         let mut agent = Agent::try_new(config).expect("signed reward config should be valid");
         assert_eq!(agent.config.min_reward, -2);

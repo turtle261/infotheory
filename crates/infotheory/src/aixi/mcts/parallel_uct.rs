@@ -208,40 +208,57 @@ impl ParallelUctPlanner {
             ParallelPlannerState::Wu(runtime) => search_runtime::<WuMode>(
                 runtime,
                 agent,
-                prev_obs_stream,
-                prev_rew,
-                prev_act,
-                samples,
-                horizon,
-                workers,
-                None,
+                SearchRuntimeParams {
+                    prev_obs_stream,
+                    prev_rew,
+                    prev_act,
+                    samples,
+                    horizon,
+                    workers,
+                    bu_uct_m_max: None,
+                },
             ),
             ParallelPlannerState::Bu(runtime) => search_runtime::<BuMode>(
                 runtime,
                 agent,
-                prev_obs_stream,
-                prev_rew,
-                prev_act,
-                samples,
-                horizon,
-                workers,
-                self.bu_uct_m_max,
+                SearchRuntimeParams {
+                    prev_obs_stream,
+                    prev_rew,
+                    prev_act,
+                    samples,
+                    horizon,
+                    workers,
+                    bu_uct_m_max: self.bu_uct_m_max,
+                },
             ),
         }
     }
 }
 
-fn search_runtime<M: ModeState>(
-    runtime: &mut ParallelRuntime<M>,
-    agent: &mut dyn AgentSimulator,
-    prev_obs_stream: &[PerceptVal],
+struct SearchRuntimeParams<'a> {
+    prev_obs_stream: &'a [PerceptVal],
     prev_rew: Reward,
     prev_act: Action,
     samples: usize,
     horizon: usize,
     workers: usize,
     bu_uct_m_max: Option<f64>,
+}
+
+fn search_runtime<M: ModeState>(
+    runtime: &mut ParallelRuntime<M>,
+    agent: &mut dyn AgentSimulator,
+    params: SearchRuntimeParams<'_>,
 ) -> Action {
+    let SearchRuntimeParams {
+        prev_obs_stream,
+        prev_rew,
+        prev_act,
+        samples,
+        horizon,
+        workers,
+        bu_uct_m_max,
+    } = params;
     prune_tree(runtime, agent, prev_obs_stream, prev_rew, prev_act);
 
     debug_assert!(workers > 0);
@@ -1317,7 +1334,7 @@ mod tests {
         fn gen_percept_and_update(&mut self, _bits: usize) -> u64 {
             if self.emit_reward {
                 self.emit_reward = false;
-                ((self.clone_seed ^ self.last_action) & 1) as u64
+                (self.clone_seed ^ self.last_action) & 1
             } else {
                 self.emit_reward = true;
                 0

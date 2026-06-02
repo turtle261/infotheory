@@ -41,10 +41,31 @@ mod imp {
             })
         }
 
+        /// Defensive global-state settlement for libzpaq C++ internals.
+        ///
+        /// Some C++ internals are process-global rather than fully represented
+        /// by each `Compressor` allocation. First construction through this API
+        /// settles those globals so subsequent fresh `ZpaqRateModel` instances
+        /// and temporary compressors used by `fill_log_probs` observe identical
+        /// initial state for empty-history first-symbol predictions.
+        ///
+        /// Architectural note:
+        /// This is a thin compatibility wrapper around `zpaq_rs::settle_globals`,
+        /// where the FFI lifecycle guarantee is implemented.
+        #[inline]
+        fn settle_zpaq_globals(_method: &str) {
+            // Delegate to the official API in the crate that owns the FFI.
+            // The method argument is kept only for source compatibility with
+            // existing call sites; the zpaq_rs implementation is process-global.
+            zpaq_rs::settle_globals();
+        }
+
         fn replace_stream_compressor(&mut self) {
             // Drop the previous compressor before constructing the replacement
             // so the transition remains strictly sequential.
             drop(self.stream.compressor.take());
+            // Ensure settlement on rebuild paths (delegates to zpaq_rs::settle_globals).
+            Self::settle_zpaq_globals(&self.method);
             self.stream.compressor = Some(Self::new_streaming_compressor(self.method.as_str()));
             self.stream.last_bits = 0.0;
         }
@@ -75,6 +96,9 @@ mod imp {
             zpaq_rs::validate_streaming_method(method.as_str()).unwrap_or_else(|e| {
                 panic!("ZPAQ rate backend requires a streamable method; got '{method}': {e}")
             });
+
+            // Defensive settlement (delegates to zpaq_rs::settle_globals).
+            Self::settle_zpaq_globals(&method);
 
             Self {
                 stream: ZpaqStreaming {
@@ -421,6 +445,38 @@ mod imp {
                 (lp_baseline - lp_probe).abs() < 1e-9,
                 "validation disturbed live model state: baseline={lp_baseline} probe={lp_probe}"
             );
+        }
+
+        #[test]
+        fn zpaq_rate_restart_first_symbol_parity_after_zpaq_preceding() {
+            // Thin unit test: ZPAQ settlement + restart parity only. Cross-FFI preceding
+            // activity lives in `tests/zpaq_rate_backend.rs` with per-feature cfg blocks.
+            let _preceding_zpaq = ZpaqRateModel::new("1", 1e-9);
+
+            let mut session = ZpaqRateModel::new("1", 1e-9);
+            session.begin_stream();
+            let mut warm = [0.0f64; 256];
+            session.fill_log_probs(&mut warm);
+            for &byte in b"zpaq history before restart" {
+                session.update(byte);
+            }
+
+            session.begin_stream();
+            let mut restarted = [0.0f64; 256];
+            session.fill_log_probs(&mut restarted);
+
+            let mut fresh = ZpaqRateModel::new("1", 1e-9);
+            let mut expected = [0.0f64; 256];
+            fresh.fill_log_probs(&mut expected);
+
+            for (symbol, (&actual, &expected)) in restarted.iter().zip(expected.iter()).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() < 1e-9,
+                    "first-symbol parity after preceding + restart failed for symbol {symbol}; diff={}",
+                    actual - expected
+                );
+            }
         }
     }
 }

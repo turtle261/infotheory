@@ -84,6 +84,7 @@ pub(crate) fn rate_plan_to_wrapper_fac_ctw(plan: &RateBackendPlan) -> RateBacken
         base_depth,
         num_percept_bits,
         encoding_bits,
+        msb_first,
     } = plan
     else {
         unreachable!("fac-ctw wrapper kernel used with non-fac-ctw plan");
@@ -92,6 +93,7 @@ pub(crate) fn rate_plan_to_wrapper_fac_ctw(plan: &RateBackendPlan) -> RateBacken
         base_depth: *base_depth,
         num_percept_bits: *num_percept_bits,
         encoding_bits: *encoding_bits,
+        msb_first: Some(*msb_first),
     }
 }
 
@@ -364,12 +366,13 @@ pub(crate) fn rate_plan_display_label_fac_ctw(plan: &RateBackendPlan) -> String 
         base_depth,
         num_percept_bits,
         encoding_bits,
+        msb_first,
     } = plan
     else {
         unreachable!("fac-ctw label kernel used with non-fac-ctw plan");
     };
     format!(
-        "fac-ctw(base_depth={base_depth},num_percept_bits={num_percept_bits},encoding_bits={encoding_bits})"
+        "fac-ctw(base_depth={base_depth},num_percept_bits={num_percept_bits},encoding_bits={encoding_bits},msb_first={msb_first})"
     )
 }
 
@@ -377,12 +380,14 @@ pub(crate) fn rate_plan_default_name_fac_ctw(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::FacCtw {
         base_depth,
         encoding_bits,
+        msb_first,
         ..
     } = plan
     else {
         unreachable!("fac-ctw default-name kernel used with non-fac-ctw plan");
     };
-    format!("fac-ctw(d={base_depth},b={encoding_bits})")
+    let order = if *msb_first { "msb" } else { "lsb" };
+    format!("fac-ctw(d={base_depth},b={encoding_bits},{order})")
 }
 
 pub(crate) fn rate_plan_display_label_zpaq(plan: &RateBackendPlan) -> String {
@@ -613,6 +618,7 @@ pub(crate) fn encode_rate_payload_fac_ctw(plan: &RateBackendPlan, out: &mut Vec<
         base_depth,
         num_percept_bits,
         encoding_bits,
+        msb_first,
     } = plan
     else {
         unreachable!("fac-ctw encoder kernel used with non-fac-ctw plan");
@@ -621,6 +627,7 @@ pub(crate) fn encode_rate_payload_fac_ctw(plan: &RateBackendPlan, out: &mut Vec<
     push_usize(out, *base_depth);
     push_usize(out, *num_percept_bits);
     push_usize(out, *encoding_bits);
+    out.push(u8::from(*msb_first));
 }
 
 pub(crate) fn encode_rate_payload_zpaq(plan: &RateBackendPlan, out: &mut Vec<u8>) {

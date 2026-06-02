@@ -874,6 +874,7 @@ pub(super) fn compile_tuner_planner_run_spec(
                     base_depth: TUNER_MCAIXI_FAC_CTW_BASE_DEPTH,
                     num_percept_bits: percept_bits,
                     encoding_bits: 1,
+                    msb_first: None,
                 },
                 bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
                 agent_horizon: TUNER_MCAIXI_HORIZON,
@@ -900,6 +901,7 @@ pub(super) fn compile_tuner_planner_run_spec(
                 warmstart_return_bins(reward_encoder.max_reward(), inner.return_horizon)?;
             ControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhControllerSpec {
                 predictor: RateBackend::Ctw { depth: 8 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
                 return_horizon: inner.return_horizon,
                 return_bins,
                 label_phase_period: inner.label_phase_period,

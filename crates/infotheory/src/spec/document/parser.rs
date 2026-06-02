@@ -580,6 +580,10 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     base_dir,
                     crate::api::MAX_MIXTURE_NESTING,
                 )?,
+                bit_stream_semantics: parse_bit_stream_semantics(
+                    value.get("bit_stream_semantics"),
+                    "controller.bit_stream_semantics",
+                )?,
                 return_horizon: required_usize(
                     &value["return_horizon"],
                     "controller.return_horizon",
@@ -608,7 +612,10 @@ fn parse_bit_stream_semantics(
     label: &str,
 ) -> SpecResult<BitStreamSemantics> {
     let Some(value) = value else {
-        return Ok(crate::aixi::model::default_aixi_bit_stream_semantics());
+        // Default for absent bit_stream_semantics is BinaryTokens (AIXI planner
+        // paths explicitly set their own default via aixi::model when needed).
+        // This reference must remain feature-agnostic for parser hygiene.
+        return Ok(BitStreamSemantics::BinaryTokens);
     };
     let Some(object) = value.as_object() else {
         return Err(SpecError::new(format!(

@@ -89,7 +89,7 @@ fn mi_independent_is_zero() {
 
     // Check non-negativity axiom
     assert!(axioms::verify_mi_nonnegative(
-        |a, b| infotheory::api::empirical_mutual_information_bytes(a, b),
+        infotheory::api::empirical_mutual_information_bytes,
         &x,
         &y
     ));

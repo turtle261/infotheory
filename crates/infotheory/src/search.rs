@@ -1181,12 +1181,16 @@ mod tests {
         match opts.ctx.compression_backend.canonical_spec() {
             #[cfg(feature = "backend-zpaq")]
             crate::api::CompressionBackend::Zpaq { method, .. } => assert_eq!(method.value(), "5"),
+            #[cfg(feature = "backend-zpaq")]
+            crate::api::CompressionBackend::Rate { .. } => {
+                panic!("zpaq-enabled default search context should use zpaq compression");
+            }
+            #[cfg(not(feature = "backend-zpaq"))]
             crate::api::CompressionBackend::Rate {
                 rate_backend,
                 coder,
                 framing,
             } => {
-                assert!(cfg!(not(feature = "backend-zpaq")));
                 assert!(matches!(
                     rate_backend,
                     &crate::api::RateBackend::RosaPlus { .. }

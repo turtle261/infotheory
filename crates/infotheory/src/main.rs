@@ -502,7 +502,7 @@ impl PlannerControllerRuntime {
                 explore_rng,
             } => {
                 let obs_repr = agent.observation_repr_from_stream(&ctx.obs_stream);
-                if schedule.log_every > 0 && step % schedule.log_every == 0 {
+                if schedule.log_every > 0 && step.is_multiple_of(schedule.log_every) {
                     println!("Cycle {}: Obs={:?}, Rew={}", step, obs_repr, ctx.rew);
                 }
                 if let Some(logger) = ctx.trace_logger.as_mut() {
@@ -529,7 +529,7 @@ impl PlannerControllerRuntime {
                         agent.get_planned_action(&ctx.obs_stream, ctx.rew, *prev_action)
                     }
                 };
-                if schedule.log_every > 0 && step % schedule.log_every == 0 {
+                if schedule.log_every > 0 && step.is_multiple_of(schedule.log_every) {
                     println!("Cycle {}: Planned Action={}", step, action);
                 }
                 if let Some(logger) = ctx.trace_logger.as_mut() {
@@ -550,7 +550,7 @@ impl PlannerControllerRuntime {
                     ),
                     PlannerPhase::Eval => agent.get_planned_action(),
                 };
-                if schedule.log_every > 0 && step % schedule.log_every == 0 {
+                if schedule.log_every > 0 && step.is_multiple_of(schedule.log_every) {
                     println!(
                         "Cycle {}: Action={} Obs={:?} Rew={}",
                         step, action, ctx.obs_stream, ctx.rew
@@ -582,7 +582,7 @@ impl PlannerControllerRuntime {
                     ),
                     PlannerPhase::Eval => agent.get_planned_action(),
                 };
-                if schedule.log_every > 0 && step % schedule.log_every == 0 {
+                if schedule.log_every > 0 && step.is_multiple_of(schedule.log_every) {
                     println!(
                         "Cycle {}: Action={} Obs={:?} Rew={}",
                         step, action, ctx.obs_stream, ctx.rew
@@ -829,10 +829,10 @@ fn run_compiled_planner_run(
 fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
     let raw = std::fs::read(config_path)?;
     let json_overlay = serde_json::from_slice::<serde_json::Value>(&raw).ok();
-    if let Some(value) = json_overlay.as_ref() {
-        if !is_canonical_spec_document(value) {
-            return Err(legacy_planner_config_error(config_path));
-        }
+    if let Some(value) = json_overlay.as_ref()
+        && !is_canonical_spec_document(value)
+    {
+        return Err(legacy_planner_config_error(config_path));
     }
 
     let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
@@ -918,6 +918,8 @@ fn search_command(args: &[String]) {
     let explicit_compression_backend_flag: bool = false;
     let mut explicit_method_flag: bool = false;
     let mut stage2_prior_mode: Option<search::Stage2PriorMode> = None;
+    let mut msb_first_flag: bool = false;
+    let mut lsb_first_flag: bool = false;
 
     let mut i = 4usize;
     while i < args.len() {
@@ -984,6 +986,12 @@ fn search_command(args: &[String]) {
                     };
                 }
             }
+            "--msb-first" => {
+                msb_first_flag = true;
+            }
+            "--lsb-first" => {
+                lsb_first_flag = true;
+            }
             _ => {
                 i += 1;
             }
@@ -1000,6 +1008,7 @@ fn search_command(args: &[String]) {
         expert_spec_path: expert_spec_path.as_deref(),
         rate_backend_json_path: rate_backend_json_path.as_deref(),
         compression_backend_json_path: compression_backend_json_path.as_deref(),
+        fac_ctw_msb_first: parse_fac_ctw_bit_order_flags(msb_first_flag, lsb_first_flag),
         flags: CliBackendSourceFlags {
             explicit_rate_backend: explicit_rate_backend_flag,
             explicit_compression_backend: explicit_compression_backend_flag,
@@ -1040,6 +1049,20 @@ fn parse_rate_backend_flag_or_exit(value: &str, flag_name: &str) -> String {
             );
             std::process::exit(1);
         })
+}
+
+fn parse_fac_ctw_bit_order_flags(msb_first_flag: bool, lsb_first_flag: bool) -> Option<bool> {
+    if msb_first_flag && lsb_first_flag {
+        eprintln!("Error: --msb-first and --lsb-first are mutually exclusive");
+        std::process::exit(1);
+    }
+    if msb_first_flag {
+        Some(true)
+    } else if lsb_first_flag {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn parse_compression_backend_flag_or_exit(value: &str, flag_name: &str) -> String {
@@ -1496,6 +1519,8 @@ fn main() {
     let mut generate_len_bytes: usize = 8;
     let mut generate_config = GenerationConfig::default();
     let mut rate_backend_specified = false;
+    let mut msb_first_flag: bool = false;
+    let mut lsb_first_flag: bool = false;
 
     let mut i = flags_start;
     while i < args.len() {
@@ -1543,6 +1568,12 @@ fn main() {
                 expert_spec_path = args.get(i).cloned();
                 rate_backend_specified = true;
                 explicit_rate_backend_flag = true;
+            }
+            "--msb-first" => {
+                msb_first_flag = true;
+            }
+            "--lsb-first" => {
+                lsb_first_flag = true;
             }
             "--model-export" => {
                 i += 1;
@@ -1803,6 +1834,7 @@ fn main() {
         expert_spec_path: expert_spec_path.as_deref(),
         rate_backend_json_path: rate_backend_json_path.as_deref(),
         compression_backend_json_path: compression_backend_json_path.as_deref(),
+        fac_ctw_msb_first: parse_fac_ctw_bit_order_flags(msb_first_flag, lsb_first_flag),
         flags: CliBackendSourceFlags {
             explicit_rate_backend: explicit_rate_backend_flag,
             explicit_compression_backend: explicit_compression_backend_flag,
@@ -2099,6 +2131,8 @@ Options:
                           Backend for NCD/compression: {compression_backends}
   --method <val>          Method/config (e.g. '5' for zpaq, '16' for ctw, mixture spec path,
                           model method: file:/path/model.safetensors[;policy:...] or cfg:key=value,...[;policy:...])
+  --msb-first             FAC-CTW only: encode symbols MSB-first (requires --rate-backend fac-ctw)
+  --lsb-first             FAC-CTW only: encode symbols LSB-first (requires --rate-backend fac-ctw)
   --rate-backend-json <path>
                           Load canonical RateBackend JSON (relative paths resolve against this file's directory).
                           Incompatible with --rate-backend and --expert-spec. When used with --method, the method applies to the compression backend shorthand.
@@ -2181,6 +2215,7 @@ Examples:
   infotheory h file.txt --expert-spec ./expert.json
   infotheory h file.txt --rate-backend mamba --method "cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4,train=adam,lr=0.001;policy:schedule=0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)" --model-export ./mamba_online.safetensors
   infotheory h file.txt --rate-backend ctw --method 32
+  infotheory h file.txt --rate-backend fac-ctw --method 32 --msb-first
   infotheory h file.txt --rate-backend mixture --method mixture.json
   infotheory sequitur-debug --hex 616263616263 --alphabet-prefix 8
   infotheory search "encryption" ./src --prior "codebase context"
@@ -3383,10 +3418,12 @@ mod tests {
                 base_depth,
                 num_percept_bits,
                 encoding_bits,
+                msb_first,
             } => {
                 assert_eq!(base_depth, 32);
                 assert_eq!(encoding_bits, 8);
                 assert_eq!(num_percept_bits, 18);
+                assert_eq!(msb_first, None);
             }
             _ => panic!("expected fac-ctw backend"),
         }

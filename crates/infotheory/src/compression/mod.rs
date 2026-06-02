@@ -133,7 +133,7 @@ impl FramedHeader {
 #[cfg(feature = "backend-ctw")]
 #[derive(Clone)]
 enum CtwCompressionTree {
-    Ac(ContextTree),
+    Ac(Box<ContextTree>),
     Fac(FacContextTree),
 }
 
@@ -152,7 +152,7 @@ pub(crate) struct CtwPredictor {
 impl CtwPredictor {
     pub(crate) fn new_ctw(depth: usize) -> Self {
         Self {
-            tree: CtwCompressionTree::Ac(ContextTree::new(depth)),
+            tree: CtwCompressionTree::Ac(Box::new(ContextTree::new(depth))),
             bits_per_symbol: 8,
             msb_first: true,
             pdf: vec![0.0; 256],
@@ -161,11 +161,16 @@ impl CtwPredictor {
         }
     }
 
-    pub(crate) fn new_fac(base_depth: usize, bits_per_symbol: usize) -> Self {
+    pub(crate) fn new_fac(
+        base_depth: usize,
+        bits_per_symbol: usize,
+        msb_first: Option<bool>,
+    ) -> Self {
+        let effective_msb_first: bool = msb_first.unwrap_or(bits_per_symbol == 8);
         Self {
             tree: CtwCompressionTree::Fac(FacContextTree::new(base_depth, bits_per_symbol)),
             bits_per_symbol,
-            msb_first: false,
+            msb_first: effective_msb_first,
             pdf: vec![0.0; 256],
             pattern_logps: vec![f64::NEG_INFINITY; 256],
             valid: false,
@@ -387,9 +392,7 @@ impl CtwPredictor {
 
     #[inline]
     fn can_fast_ac_bitwise(&self) -> bool {
-        self.bits_per_symbol == 8
-            && self.msb_first
-            && matches!(&self.tree, CtwCompressionTree::Ac(_))
+        self.bits_per_symbol == 8 && self.msb_first
     }
 
     #[inline]
@@ -730,7 +733,7 @@ impl PredictorBitwiseStepState {
             Self::NativeRecursive => predictor.native_recursive_bit_prob_one_msb(bit_idx),
             Self::CachedCdf { lo, hi } => Ok(predictor
                 .cached_cdf_bit_prob_one_msb(*lo, *hi)
-                .unwrap_or(0.5)),
+                .expect("CachedCdf state invariant violated: missing cached CDF entry")),
             Self::PdfPrefix { cdf, lo, hi } => Ok(cdf_bit_prob_one_msb(cdf, *lo, *hi)),
         }
     }
@@ -966,11 +969,7 @@ impl MixturePredictor {
             return Ok(&self.pdf);
         }
         let weights = self.predictive_weights();
-        if weights.len() == 1 && matches!(self.kind, MixtureKind::Mdl | MixtureKind::Neural) {
-            self.pdf.fill(0.0);
-        } else {
-            self.pdf.fill(0.0);
-        }
+        self.pdf.fill(0.0);
         for (index, expert) in self.experts.iter_mut().enumerate() {
             let weight = weights.get(index).copied().unwrap_or(0.0);
             if weight <= 0.0 {
@@ -1337,7 +1336,10 @@ impl MixturePredictor {
         Ok(if denom.is_finite() && denom > 0.0 {
             (numer1 / denom).clamp(PDF_MIN, 1.0 - PDF_MIN)
         } else {
-            0.5
+            panic!(
+                "MixturePredictor bit_prob_one_msb: invalid denom (finite>0 violated); \
+                 this is an internal invariant failure in the bitwise mixture state machine"
+            )
         })
     }
 
@@ -1614,7 +1616,7 @@ impl RatePdfPredictor {
             #[cfg(feature = "backend-sequitur")]
             Self::Sequitur { .. } => Ok(()),
             #[cfg(feature = "backend-mamba")]
-            Self::Mamba(_) => Ok(()),
+            Self::Mamba(m) => m.compressor.finish_online_policy_stream(),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => m.finish_stream(),
             #[cfg(feature = "backend-mixture")]
@@ -1802,7 +1804,7 @@ impl RatePdfPredictor {
     fn has_recursive_native_bitwise_path(&self) -> bool {
         match self {
             #[cfg(feature = "backend-ctw")]
-            Self::Ctw(m) => m.can_fast_ac_bitwise(),
+            Self::Ctw(m) | Self::FacCtw(m) => m.can_fast_ac_bitwise(),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.has_recursive_native_bitwise_expert(),
             _ => false,
@@ -1812,7 +1814,7 @@ impl RatePdfPredictor {
     fn begin_native_recursive_bitwise_byte_step(&mut self) -> Result<bool> {
         match self {
             #[cfg(feature = "backend-ctw")]
-            Self::Ctw(m) => Ok(m.can_fast_ac_bitwise()),
+            Self::Ctw(m) | Self::FacCtw(m) => Ok(m.can_fast_ac_bitwise()),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.begin_bitwise_byte_step(),
             _ => Ok(false),
@@ -1822,7 +1824,7 @@ impl RatePdfPredictor {
     fn native_recursive_bit_prob_one_msb(&mut self, bit_idx: usize) -> Result<f64> {
         match self {
             #[cfg(feature = "backend-ctw")]
-            Self::Ctw(m) => Ok(m.bit_prob_one_msb(bit_idx)),
+            Self::Ctw(m) | Self::FacCtw(m) => Ok(m.bit_prob_one_msb(bit_idx)),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.bit_prob_one_msb(bit_idx),
             _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
@@ -1832,7 +1834,7 @@ impl RatePdfPredictor {
     fn native_recursive_observe_bit_msb(&mut self, bit_idx: usize, bit: bool) -> Result<()> {
         match self {
             #[cfg(feature = "backend-ctw")]
-            Self::Ctw(m) => {
+            Self::Ctw(m) | Self::FacCtw(m) => {
                 m.update_bit_msb(bit_idx, bit);
                 Ok(())
             }
@@ -1845,7 +1847,7 @@ impl RatePdfPredictor {
     fn finish_native_recursive_bitwise_byte_step(&mut self, symbol: u8) -> Result<()> {
         match self {
             #[cfg(feature = "backend-ctw")]
-            Self::Ctw(_) => Ok(()),
+            Self::Ctw(_) | Self::FacCtw(_) => Ok(()),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.finish_bitwise_symbol(symbol),
             _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
@@ -2287,7 +2289,7 @@ fn build_cdf_row_from_pdf_slice(pdf: &[f64], cdf: &mut [f64; 257]) {
     }
 }
 
-fn normalize_pdf_vec_and_maybe_build_cdf(pdf: &mut [f64], mut cdf: Option<&mut [f64; 257]>) {
+fn normalize_pdf_vec_and_maybe_build_cdf(pdf: &mut [f64], cdf: Option<&mut [f64; 257]>) {
     let mut sum = 0.0;
     for p in pdf.iter_mut() {
         *p = if p.is_finite() {
@@ -2300,13 +2302,13 @@ fn normalize_pdf_vec_and_maybe_build_cdf(pdf: &mut [f64], mut cdf: Option<&mut [
     if !(sum.is_finite()) || sum <= 0.0 {
         let u = 1.0 / (pdf.len() as f64);
         pdf.fill(u);
-        if let Some(cdf) = cdf.as_deref_mut() {
+        if let Some(cdf) = cdf {
             *cdf = uniform_cdf_row();
         }
         return;
     }
     let inv = 1.0 / sum;
-    if let Some(cdf) = cdf.as_deref_mut() {
+    if let Some(cdf) = cdf {
         cdf[0] = 0.0;
         let mut acc = 0.0;
         for i in 0..256 {
@@ -2321,19 +2323,32 @@ fn normalize_pdf_vec_and_maybe_build_cdf(pdf: &mut [f64], mut cdf: Option<&mut [
     }
 }
 
+/// Build a 257-slot MSB-prefix CDF row from a 256-symbol PDF.
+///
+/// Predictors must emit valid PDFs; this wrapper does not repair invalid totals in
+/// release builds. Invalid rows are caught via `debug_assert` in debug builds only.
 #[inline]
 fn rebuild_bitwise_prefix_cdf_row(cdf: &mut Vec<f64>, pdf: &[f64]) {
+    debug_assert_eq!(
+        pdf.len(),
+        256,
+        "rebuild_bitwise_prefix_cdf_row requires a full 256-element PDF (caller invariant)"
+    );
+    debug_assert!(
+        pdf.iter().all(|&p| p.is_finite() && p >= 0.0),
+        "Predictor contract violation: predictor emitted non-finite or negative PDF mass"
+    );
     cdf.resize(257, 0.0);
     cdf[0] = 0.0;
     for idx in 0..256usize {
-        let p = pdf.get(idx).copied().unwrap_or(0.0).max(PDF_MIN);
+        let p: f64 = pdf[idx].max(PDF_MIN); // direct index per invariant
         cdf[idx + 1] = cdf[idx] + p;
     }
-    if !cdf[256].is_finite() || cdf[256] <= 0.0 {
-        for (idx, slot) in cdf.iter_mut().enumerate() {
-            *slot = (idx as f64) / 256.0;
-        }
-    }
+    debug_assert!(
+        cdf[256].is_finite() && cdf[256] > 0.0,
+        "Predictor contract violation: invalid prefix-CDF total ({})",
+        cdf[256]
+    );
 }
 
 #[inline]
@@ -2494,6 +2509,39 @@ fn apply_switching_weights(
 #[cfg(feature = "backend-zpaq")]
 fn _zpaq_marker(_: &ZpaqRateModel) {}
 
+#[cfg(test)]
+mod rebuild_bitwise_prefix_cdf_row_contract_tests {
+    use super::rebuild_bitwise_prefix_cdf_row;
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn rebuild_bitwise_prefix_cdf_row_rejects_nan_pdf_in_debug() {
+        let mut pdf = [1.0 / 256.0; 256];
+        pdf[17] = f64::NAN;
+
+        let result = std::panic::catch_unwind(|| {
+            let mut cdf: Vec<f64> = Vec::new();
+            rebuild_bitwise_prefix_cdf_row(&mut cdf, &pdf);
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn rebuild_bitwise_prefix_cdf_row_rejects_negative_pdf_in_debug() {
+        let mut pdf = [1.0 / 256.0; 256];
+        pdf[17] = -0.1;
+
+        let result = std::panic::catch_unwind(|| {
+            let mut cdf: Vec<f64> = Vec::new();
+            rebuild_bitwise_prefix_cdf_row(&mut cdf, &pdf);
+        });
+
+        assert!(result.is_err());
+    }
+}
+
 #[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
@@ -2601,7 +2649,7 @@ mod tests {
 
     #[test]
     fn fac_pdf_fast_matches_bruteforce_subbyte() {
-        let mut predictor = CtwPredictor::new_fac(5, 5);
+        let mut predictor = CtwPredictor::new_fac(5, 5, None);
         for &b in b"fac ctw subbyte regression corpus abcdefghijklmnopqrstuvwxyz" {
             predictor.update(b);
         }
@@ -2619,6 +2667,33 @@ mod tests {
                 brute[i]
             );
         }
+    }
+
+    #[test]
+    fn fac_ctw_default_bit_order_is_byte_msb_and_subbyte_lsb() {
+        let byte_default = CtwPredictor::new_fac(5, 8, None);
+        assert!(
+            byte_default.can_fast_ac_bitwise(),
+            "8-bit FacCtw without explicit order should use MSB-first native bitwise path"
+        );
+
+        let subbyte_default = CtwPredictor::new_fac(5, 5, None);
+        assert!(
+            !subbyte_default.can_fast_ac_bitwise(),
+            "non-byte FacCtw without explicit order keeps legacy LSB-first behavior"
+        );
+
+        let explicit_lsb = CtwPredictor::new_fac(5, 8, Some(false));
+        assert!(
+            !explicit_lsb.can_fast_ac_bitwise(),
+            "explicit msb_first=false must preserve legacy LSB-first behavior"
+        );
+
+        let explicit_subbyte_msb = CtwPredictor::new_fac(5, 5, Some(true));
+        assert!(
+            !explicit_subbyte_msb.can_fast_ac_bitwise(),
+            "subbyte widths do not use byte-packed native fast path even when MSB-first"
+        );
     }
 
     fn assert_ctw_pdf_next_preserves_state(mut predictor: CtwPredictor) {
@@ -2646,7 +2721,7 @@ mod tests {
 
     #[test]
     fn fac_pdf_next_preserves_state() {
-        assert_ctw_pdf_next_preserves_state(CtwPredictor::new_fac(7, 8));
+        assert_ctw_pdf_next_preserves_state(CtwPredictor::new_fac(7, 8, None));
     }
 
     fn assert_fill_pattern_preserves_symbol_log_probs(mut predictor: CtwPredictor) {
@@ -2675,7 +2750,7 @@ mod tests {
 
     #[test]
     fn fac_fill_pattern_preserves_symbol_log_probs() {
-        assert_fill_pattern_preserves_symbol_log_probs(CtwPredictor::new_fac(7, 8));
+        assert_fill_pattern_preserves_symbol_log_probs(CtwPredictor::new_fac(7, 8, None));
     }
 
     fn assert_pdf_then_update_matches_plain_update(mut base: CtwPredictor) {
@@ -2708,7 +2783,7 @@ mod tests {
 
     #[test]
     fn fac_pdf_then_update_matches_plain_update() {
-        assert_pdf_then_update_matches_plain_update(CtwPredictor::new_fac(7, 8));
+        assert_pdf_then_update_matches_plain_update(CtwPredictor::new_fac(7, 8, None));
     }
 
     #[test]
@@ -2898,6 +2973,7 @@ mod tests {
                         base_depth: 6,
                         num_percept_bits: 8,
                         encoding_bits: 8,
+                        msb_first: None,
                     },
                 },
             ],
@@ -2951,6 +3027,7 @@ mod tests {
                         base_depth: 6,
                         num_percept_bits: 8,
                         encoding_bits: 8,
+                        msb_first: None,
                     },
                 },
             ],
@@ -3033,6 +3110,7 @@ mod tests {
                     base_depth: 7,
                     num_percept_bits: 8,
                     encoding_bits: 8,
+                    msb_first: None,
                 },
             },
         ]
@@ -3222,6 +3300,24 @@ mod tests {
             1e-12,
         );
 
+        let direct_fac = RateBackend::FacCtw {
+            base_depth: 7,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+            msb_first: None,
+        };
+        let direct_fac_predictor = RatePdfPredictor::from_rate_backend(direct_fac).unwrap();
+        assert!(
+            direct_fac_predictor.can_fast_ac_bitwise(),
+            "byte-wide MSB fac-ctw must expose its native recursive AC path"
+        );
+        assert_bitwise_byte_step_matches_pdf_and_plain_update(
+            direct_fac_predictor,
+            b"direct fac ctw bitwise byte step parity",
+            1e-12,
+            1e-12,
+        );
+
         let single_expert = RateBackend::Mixture {
             spec: Arc::new(MixtureSpec::new(
                 MixtureKind::Bayes,
@@ -3235,6 +3331,34 @@ mod tests {
         assert_bitwise_byte_step_matches_pdf_and_plain_update(
             RatePdfPredictor::from_rate_backend(single_expert).unwrap(),
             b"single expert ctw mixture bitwise byte step parity",
+            1e-12,
+            1e-12,
+        );
+
+        let single_fac_neural = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Neural,
+                vec![crate::MixtureExpertSpec {
+                    name: Some("fac-ctw".to_string()),
+                    log_prior: 0.0,
+                    backend: RateBackend::FacCtw {
+                        base_depth: 7,
+                        num_percept_bits: 8,
+                        encoding_bits: 8,
+                        msb_first: None,
+                    },
+                }],
+            )),
+        };
+        let single_fac_neural_predictor =
+            RatePdfPredictor::from_rate_backend(single_fac_neural).unwrap();
+        assert!(
+            single_fac_neural_predictor.can_fast_ac_bitwise(),
+            "neural mixtures containing only byte-wide MSB fac-ctw must not fall back to PDF-prefix AC"
+        );
+        assert_bitwise_byte_step_matches_pdf_and_plain_update(
+            single_fac_neural_predictor,
+            b"single expert fac neural mixture bitwise byte step parity",
             1e-12,
             1e-12,
         );

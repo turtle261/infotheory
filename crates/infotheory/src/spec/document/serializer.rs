@@ -167,6 +167,7 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
         ControllerSpec::AiqiWarmstartExactJh(inner) => Ok(serde_json::json!({
             "kind": "aiqi_warmstart_exact_jh",
             "predictor": rate_backend_to_json_value(&inner.predictor)?,
+            "bit_stream_semantics": bit_stream_semantics_to_json_value(inner.bit_stream_semantics),
             "return_horizon": inner.return_horizon,
             "return_bins": inner.return_bins,
             "label_phase_period": inner.label_phase_period,

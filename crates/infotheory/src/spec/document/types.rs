@@ -396,6 +396,8 @@ pub struct AiqiDiscountedControllerSpec {
 pub struct WarmStartExactJhControllerSpec {
     /// Predictive backend used by the return model.
     pub predictor: RateBackend,
+    /// Bit-stream semantics used to adapt the predictor to warm-start symbols.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Return horizon in planner steps.
     pub return_horizon: usize,
     /// Exact return-label alphabet size.
@@ -731,6 +733,8 @@ pub enum CompiledPlannerController {
     AiqiWarmstartExactJh {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
+        /// Bit-stream semantics used to adapt the predictor to warm-start symbols.
+        bit_stream_semantics: BitStreamSemantics,
         /// Return horizon.
         return_horizon: usize,
         /// Number of return bins.
@@ -789,6 +793,7 @@ pub struct CompiledTuneSpec {
 /// Universal top-level spec document.
 #[derive(Clone)]
 #[non_exhaustive]
+#[allow(clippy::large_enum_variant)]
 pub enum SpecDocument {
     /// Planner-run configuration document.
     PlannerRun(PlannerRunSpec),
@@ -856,6 +861,7 @@ pub enum ValidatedSpecDocument {
 /// runtime adapters.
 #[derive(Clone)]
 #[non_exhaustive]
+#[allow(clippy::large_enum_variant)]
 pub enum CompiledSpecDocument {
     /// Compiled planner-run document.
     PlannerRun(CompiledPlannerRunSpec),

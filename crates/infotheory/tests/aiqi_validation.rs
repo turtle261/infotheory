@@ -9,7 +9,7 @@ mod support;
 use infotheory::aixi::model::{
     RateBackendBitPredictor, RateBackendBitPredictorConfig, RateBackendBitPredictorError,
 };
-use infotheory::api::{MixtureKind, MixtureSpec, RateBackend};
+use infotheory::api::{BitOrder, BitStreamSemantics, MixtureKind, MixtureSpec, RateBackend};
 use std::sync::Arc;
 use support::aixi_envs::{DeterministicBinaryEnv, SeededCoinFlipEnv};
 
@@ -55,6 +55,7 @@ fn aiqi_mixture_backend(kind: MixtureKind) -> RateBackend {
                 base_depth: 8,
                 num_percept_bits: 8,
                 encoding_bits: 1,
+                msb_first: None,
             });
             expert.name = Some("fac-ctw".to_string());
             expert.log_prior = 0.0;
@@ -237,6 +238,196 @@ fn aiqi_with_rosa_generic_planner_smoke_runs() {
 }
 
 #[test]
+fn aiqi_bytepacked_ctw_planner_handles_shared_percept_byte() {
+    let mut cfg = base_config();
+    cfg.bit_stream_semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    cfg.rate_backend = RateBackend::Ctw { depth: 8 };
+    cfg.agent_actions =
+        ActionAlphabet::try_from_usize(129).expect("129 actions require one byte of action bits");
+    cfg.observation_bits = 3;
+    cfg.observation_stream_len = 1;
+    cfg.reward_bits = 5;
+    cfg.min_reward = 0;
+    cfg.max_reward = 31;
+    cfg.reward_offset = 0;
+    cfg.return_bins = 256;
+    cfg.return_horizon = 2;
+    cfg.augmentation_period = 2;
+    cfg.baseline_exploration = 1e-12;
+    cfg.random_seed = Some(0x0A10_1B17);
+
+    let mut left = AiqiAgent::new(cfg.clone()).expect("valid byte-packed AIQI CTW config");
+    let mut right = AiqiAgent::new(cfg).expect("valid replay byte-packed AIQI CTW config");
+
+    let mut planned_actions = Vec::new();
+    for step in 0..8usize {
+        let planned_left = left.get_planned_action();
+        let planned_right = right.get_planned_action();
+        assert_eq!(
+            planned_left, planned_right,
+            "byte-packed AIQI planning must be deterministic at step {step}"
+        );
+        planned_actions.push(planned_left);
+
+        let action = (planned_left ^ ((step as u64).wrapping_mul(37))) % 129;
+        let observation = [((0b101usize ^ (step * 3) ^ action as usize) & 0b111) as u64];
+        let reward = ((0b10001usize ^ (step * 5) ^ action as usize) & 0b1_1111) as i64;
+
+        left.observe_transition(action, &observation, reward)
+            .expect("left byte-packed transition should be accepted");
+        right
+            .observe_transition(action, &observation, reward)
+            .expect("right byte-packed transition should be accepted");
+    }
+
+    assert_eq!(left.steps_observed(), 8);
+    assert_eq!(right.steps_observed(), 8);
+    assert!(
+        planned_actions.iter().all(|&action| action < 129),
+        "all byte-packed AIQI actions must stay inside the configured alphabet: {planned_actions:?}"
+    );
+}
+
+/// Exercises `BitStreamSemantics::BytePacked` combined with `RateBackend::FacCtw`
+/// inside an AIQI planner loop — covering the FacCtw + BytePacked planner path
+/// that is distinct from both the native-CTW BytePacked path and the
+/// BinaryTokens FacCtw path already exercised elsewhere.
+///
+/// Two independently-constructed agents with identical configuration and seed
+/// must produce identical action sequences across multiple plan/observe cycles,
+/// and every planned action must lie within the configured alphabet.
+#[test]
+fn aiqi_bytepacked_fac_ctw_planner_handles_shared_percept_byte() {
+    let mut cfg = base_config();
+    cfg.bit_stream_semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    cfg.rate_backend = RateBackend::FacCtw {
+        base_depth: 8,
+        // 3-bit observation + 5-bit reward share one percept byte.
+        num_percept_bits: 8,
+        encoding_bits: 1,
+        msb_first: Some(true),
+    };
+    cfg.agent_actions =
+        ActionAlphabet::try_from_usize(129).expect("129 actions require one byte of action bits");
+    cfg.observation_bits = 3;
+    cfg.observation_stream_len = 1;
+    cfg.reward_bits = 5;
+    cfg.min_reward = 0;
+    cfg.max_reward = 31;
+    cfg.reward_offset = 0;
+    cfg.return_bins = 256;
+    cfg.return_horizon = 2;
+    cfg.augmentation_period = 2;
+    cfg.baseline_exploration = 1e-12;
+    cfg.random_seed = Some(0xA17F_AC17);
+
+    let mut left = AiqiAgent::new(cfg.clone()).expect("valid byte-packed AIQI FAC-CTW config");
+    let mut right = AiqiAgent::new(cfg).expect("valid replay byte-packed AIQI FAC-CTW config");
+
+    let mut planned_actions = Vec::new();
+    for step in 0..8usize {
+        let planned_left = left.get_planned_action();
+        let planned_right = right.get_planned_action();
+        assert_eq!(
+            planned_left, planned_right,
+            "byte-packed AIQI FAC-CTW planning must be deterministic at step {step}"
+        );
+        planned_actions.push(planned_left);
+
+        let action = (planned_left ^ ((step as u64).wrapping_mul(19))) % 129;
+        let observation = [((0b110usize ^ (step * 7) ^ action as usize) & 0b111) as u64];
+        let reward = ((0b01101usize ^ (step * 9) ^ action as usize) & 0b1_1111) as i64;
+
+        left.observe_transition(action, &observation, reward)
+            .expect("left byte-packed FAC-CTW transition should be accepted");
+        right
+            .observe_transition(action, &observation, reward)
+            .expect("right byte-packed FAC-CTW transition should be accepted");
+    }
+
+    assert_eq!(left.steps_observed(), 8);
+    assert_eq!(right.steps_observed(), 8);
+    assert!(
+        planned_actions.iter().all(|&action| action < 129),
+        "all byte-packed AIQI FAC-CTW actions must stay inside configured alphabet: {planned_actions:?}"
+    );
+}
+
+/// `BitStreamSemantics::BinaryTokens` with 8-bit MSB FacCtw in a full AIQI planner loop.
+/// Native path is [`FacCtwPredictor`] (per `percept_bits` lanes), not byte-prefix MSB hooks.
+#[test]
+fn aiqi_binarytokens_fac_ctw_native_planner_integration() {
+    let compiled = RateBackend::FacCtw {
+        base_depth: 8,
+        num_percept_bits: 8,
+        encoding_bits: 8,
+        msb_first: Some(true),
+    }
+    .compile()
+    .expect("compile fac-ctw backend");
+    let caps = compiled.capabilities();
+    assert!(caps.supports_native_bit_prediction);
+    assert!(caps.supports_reversible_bit_updates);
+
+    let mut cfg = base_config();
+    cfg.bit_stream_semantics = BitStreamSemantics::BinaryTokens;
+    cfg.rate_backend = RateBackend::FacCtw {
+        base_depth: 8,
+        num_percept_bits: 8,
+        encoding_bits: 8,
+        msb_first: Some(true),
+    };
+    cfg.agent_actions =
+        ActionAlphabet::try_from_usize(129).expect("129 actions require one byte of action bits");
+    cfg.observation_bits = 3;
+    cfg.observation_stream_len = 1;
+    cfg.reward_bits = 5;
+    cfg.min_reward = 0;
+    cfg.max_reward = 31;
+    cfg.reward_offset = 0;
+    cfg.return_bins = 256;
+    cfg.return_horizon = 2;
+    cfg.augmentation_period = 2;
+    cfg.baseline_exploration = 1e-12;
+    cfg.random_seed = Some(0xB17A_1701);
+
+    let mut left = AiqiAgent::new(cfg.clone()).expect("valid BinaryTokens AIQI FAC-CTW config");
+    let mut right = AiqiAgent::new(cfg).expect("valid replay BinaryTokens AIQI FAC-CTW config");
+
+    let mut planned_actions = Vec::new();
+    for step in 0..8usize {
+        let planned_left = left.get_planned_action();
+        let planned_right = right.get_planned_action();
+        assert_eq!(
+            planned_left, planned_right,
+            "BinaryTokens AIQI FAC-CTW planning must be deterministic at step {step}"
+        );
+        planned_actions.push(planned_left);
+
+        let action = (planned_left ^ ((step as u64).wrapping_mul(23))) % 129;
+        let observation = [((0b101usize ^ (step * 3) ^ action as usize) & 0b111) as u64];
+        let reward = ((0b10001usize ^ (step * 5) ^ action as usize) & 0b1_1111) as i64;
+
+        left.observe_transition(action, &observation, reward)
+            .expect("left BinaryTokens FAC-CTW transition should be accepted");
+        right
+            .observe_transition(action, &observation, reward)
+            .expect("right BinaryTokens FAC-CTW transition should be accepted");
+    }
+
+    assert_eq!(left.steps_observed(), 8);
+    assert_eq!(right.steps_observed(), 8);
+    assert!(
+        planned_actions.iter().all(|&action| action < 129),
+        "all BinaryTokens AIQI FAC-CTW actions must stay inside configured alphabet: {planned_actions:?}"
+    );
+}
+
+#[test]
 fn aiqi_optional_history_pruning_smoke_runs() {
     let mut cfg = base_config();
     cfg.return_horizon = 3;
@@ -370,6 +561,7 @@ fn aiqi_learns_ctw_pattern_with_fac_ctw_world_model() {
         base_depth: 10,
         num_percept_bits: 8,
         encoding_bits: 1,
+        msb_first: None,
     };
 
     let mut agent = AiqiAgent::new(cfg).expect("valid AIQI FAC-CTW config");

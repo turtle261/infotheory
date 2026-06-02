@@ -146,11 +146,16 @@ feature_gated_rate_pdf_predictor_builder! {
                 base_depth,
                 num_percept_bits: _,
                 encoding_bits,
+                msb_first,
             },
             "fac-ctw kernel used with non-fac-ctw plan"
         );
         Ok(crate::compression::RatePdfPredictor::FacCtw(
-            crate::compression::CtwPredictor::new_fac(*base_depth, (*encoding_bits).clamp(1, 8)),
+            crate::compression::CtwPredictor::new_fac(
+                *base_depth,
+                *encoding_bits,
+                Some(*msb_first),
+            ),
         ))
     }
 }

@@ -10,7 +10,7 @@
 use crate::aixi::common::{
     Action, ActionAlphabet, PerceptVal, RandomGenerator, Reward, RewardEncodingError,
     bits_for_cardinality, byte_packed_percept_bits, nonnegative_reward_encoding_bounds,
-    resolve_random_seed, validate_reward_encoding_bounds,
+    resolve_random_seed, validate_aiqi_byte_packed_alignment, validate_reward_encoding_bounds,
 };
 use crate::aixi::model::{
     Predictor, PredictorBuildError, build_aiqi_predictor, default_aixi_bit_stream_semantics,
@@ -401,11 +401,8 @@ impl AiqiConfig {
                 self.reward_bits,
             );
             let return_bits = bits_for_cardinality(self.return_bins);
-            if action_bits % 8 != 0 || return_bits % 8 != 0 || percept_bits % 8 != 0 {
-                return Err(AiqiError::UnsupportedRateBackend {
-                    reason: "BitStreamSemantics::BytePacked requires action, return, and percept segments to end on byte boundaries; the percept segment combines observations and reward, so use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIQI interfaces",
-                });
-            }
+            validate_aiqi_byte_packed_alignment(action_bits, percept_bits, return_bits)
+                .map_err(|reason| AiqiError::UnsupportedRateBackend { reason })?;
         }
 
         validate_rate_backend(&self.rate_backend).map_err(AiqiError::InvalidRateBackend)?;
@@ -776,6 +773,15 @@ impl AiqiAgent {
         let history_base_step = self.history_base_step;
         let action_bits = self.action_bits;
         let return_bits = self.return_bits;
+        let token_ctx = AiqiAugmentedTokenContext {
+            config,
+            history_base_step,
+            steps,
+            return_bins_by_step,
+            action_bits,
+            return_bits,
+            phase,
+        };
 
         let mut q_values = vec![0.0; self.config.agent_actions.get()];
         let mut pushed_fast_forward = 0usize;
@@ -786,21 +792,16 @@ impl AiqiAgent {
             let end = step.saturating_sub(1);
             if start <= end {
                 for idx in start..=end {
-                    pushed_fast_forward += push_step_tokens_history(
-                        config,
-                        history_base_step,
-                        steps,
-                        return_bins_by_step,
-                        action_bits,
-                        return_bits,
-                        model.predictor.as_mut(),
-                        phase,
-                        idx,
-                    );
+                    pushed_fast_forward +=
+                        push_step_tokens_history(&token_ctx, model.predictor.as_mut(), idx);
                 }
             }
 
-            for action in 0..self.config.agent_actions.get() {
+            for (action, q_value) in q_values
+                .iter_mut()
+                .enumerate()
+                .take(self.config.agent_actions.get())
+            {
                 let pushed_action = push_encoded_bits_history(
                     model.predictor.as_mut(),
                     action as u64,
@@ -812,7 +813,7 @@ impl AiqiAgent {
                     model.predictor.as_mut(),
                     self.distribution_uses_training_updates,
                 );
-                q_values[action] = expectation_from_distribution(&dist);
+                *q_value = expectation_from_distribution(&dist);
                 pop_history_bits(model.predictor.as_mut(), pushed_action);
             }
 
@@ -828,28 +829,33 @@ impl AiqiAgent {
 
         let model = &self.phases[phase];
         let mut context_predictor = model.predictor.boxed_clone();
+        let token_ctx = AiqiAugmentedTokenContext {
+            config: &self.config,
+            history_base_step: self.history_base_step,
+            steps: &self.steps,
+            return_bins_by_step: &self.return_bins_by_step,
+            action_bits: self.action_bits,
+            return_bits: self.return_bits,
+            phase,
+        };
 
         let start = (model.last_augmented_step + 1).max(self.history_base_step);
         let end = step.saturating_sub(1);
         if start <= end {
             for idx in start..=end {
-                push_augmented_step_tokens_commit(
-                    &self.config,
-                    self.history_base_step,
-                    &self.steps,
-                    &self.return_bins_by_step,
-                    self.action_bits,
-                    self.return_bits,
-                    context_predictor.as_mut(),
-                    phase,
-                    idx,
-                )
-                .expect("generic planner retained history must contain required augmented return");
+                push_augmented_step_tokens_commit(&token_ctx, context_predictor.as_mut(), idx)
+                    .expect(
+                        "generic planner retained history must contain required augmented return",
+                    );
             }
         }
 
         let mut q_values = vec![0.0; self.config.agent_actions.get()];
-        for action in 0..self.config.agent_actions.get() {
+        for (action, q_value) in q_values
+            .iter_mut()
+            .enumerate()
+            .take(self.config.agent_actions.get())
+        {
             let mut action_predictor = context_predictor.boxed_clone();
             let _ = push_encoded_bits_commit_history(
                 action_predictor.as_mut(),
@@ -861,7 +867,7 @@ impl AiqiAgent {
                 self.return_bits,
                 action_predictor.as_ref(),
             );
-            q_values[action] = expectation_from_distribution(&dist);
+            *q_value = expectation_from_distribution(&dist);
         }
 
         q_values
@@ -957,30 +963,23 @@ impl AiqiAgent {
         phase: usize,
         target_step: usize,
     ) -> Result<(), AiqiError> {
-        let config = &self.config;
-        let steps = &self.steps;
-        let return_bins_by_step = &self.return_bins_by_step;
-        let history_base_step = self.history_base_step;
-        let action_bits = self.action_bits;
-        let return_bits = self.return_bits;
+        let token_ctx = AiqiAugmentedTokenContext {
+            config: &self.config,
+            history_base_step: self.history_base_step,
+            steps: &self.steps,
+            return_bins_by_step: &self.return_bins_by_step,
+            action_bits: self.action_bits,
+            return_bits: self.return_bits,
+            phase,
+        };
         let model = &mut self.phases[phase];
         if target_step <= model.last_augmented_step {
             return Ok(());
         }
 
-        let start = (model.last_augmented_step + 1).max(history_base_step);
+        let start = (model.last_augmented_step + 1).max(token_ctx.history_base_step);
         for idx in start..=target_step {
-            push_augmented_step_tokens_commit(
-                config,
-                history_base_step,
-                steps,
-                return_bins_by_step,
-                action_bits,
-                return_bits,
-                model.predictor.as_mut(),
-                phase,
-                idx,
-            )?;
+            push_augmented_step_tokens_commit(&token_ctx, model.predictor.as_mut(), idx)?;
         }
 
         model.last_augmented_step = target_step;
@@ -1078,54 +1077,72 @@ impl AiqiAgent {
     }
 }
 
-fn push_step_tokens_history(
-    config: &AiqiRuntimeConfig,
+struct AiqiAugmentedTokenContext<'a> {
+    config: &'a AiqiRuntimeConfig,
     history_base_step: usize,
-    steps: &[StepRecord],
-    return_bins_by_step: &[Option<u64>],
+    steps: &'a [StepRecord],
+    return_bins_by_step: &'a [Option<u64>],
     action_bits: usize,
     return_bits: usize,
-    predictor: &mut dyn Predictor,
     phase: usize,
+}
+
+fn push_step_tokens_history(
+    ctx: &AiqiAugmentedTokenContext<'_>,
+    predictor: &mut dyn Predictor,
     idx: usize,
 ) -> usize {
     let mut pushed = 0usize;
-    pushed += push_action_tokens_history(history_base_step, steps, action_bits, predictor, idx);
+    pushed += push_action_tokens_history(
+        ctx.history_base_step,
+        ctx.steps,
+        ctx.action_bits,
+        predictor,
+        idx,
+    );
 
-    if idx % config.augmentation_period == phase {
-        let local_idx = idx - history_base_step;
-        if let Some(bin) = return_bins_by_step[local_idx] {
-            pushed += push_encoded_bits_history(predictor, bin, return_bits);
+    if idx % ctx.config.augmentation_period == ctx.phase {
+        let local_idx = idx - ctx.history_base_step;
+        if let Some(bin) = ctx.return_bins_by_step[local_idx] {
+            pushed += push_encoded_bits_history(predictor, bin, ctx.return_bits);
         }
     }
 
-    pushed + push_percept_tokens_history(config, history_base_step, steps, predictor, idx)
+    pushed
+        + push_percept_tokens_history(ctx.config, ctx.history_base_step, ctx.steps, predictor, idx)
 }
 
 fn push_augmented_step_tokens_commit(
-    config: &AiqiRuntimeConfig,
-    history_base_step: usize,
-    steps: &[StepRecord],
-    return_bins_by_step: &[Option<u64>],
-    action_bits: usize,
-    return_bits: usize,
+    ctx: &AiqiAugmentedTokenContext<'_>,
     predictor: &mut dyn Predictor,
-    phase: usize,
     idx: usize,
 ) -> Result<usize, AiqiError> {
     let mut pushed = 0usize;
-    pushed +=
-        push_action_tokens_commit_history(history_base_step, steps, action_bits, predictor, idx);
+    pushed += push_action_tokens_commit_history(
+        ctx.history_base_step,
+        ctx.steps,
+        ctx.action_bits,
+        predictor,
+        idx,
+    );
 
-    if idx % config.augmentation_period == phase {
-        let local_idx = idx - history_base_step;
-        let bin = return_bins_by_step[local_idx]
-            .ok_or(AiqiError::MissingReturnBin { step: idx, phase })?;
-        pushed += push_encoded_bits_commit(predictor, bin, return_bits);
+    if idx % ctx.config.augmentation_period == ctx.phase {
+        let local_idx = idx - ctx.history_base_step;
+        let bin = ctx.return_bins_by_step[local_idx].ok_or(AiqiError::MissingReturnBin {
+            step: idx,
+            phase: ctx.phase,
+        })?;
+        pushed += push_encoded_bits_commit(predictor, bin, ctx.return_bits);
     }
 
     Ok(pushed
-        + push_percept_tokens_commit_history(config, history_base_step, steps, predictor, idx))
+        + push_percept_tokens_commit_history(
+            ctx.config,
+            ctx.history_base_step,
+            ctx.steps,
+            predictor,
+            idx,
+        ))
 }
 
 fn push_action_tokens_history(
@@ -1393,6 +1410,7 @@ mod tests {
                                     base_depth: 8,
                                     num_percept_bits: 1,
                                     encoding_bits: 1,
+                                    msb_first: None,
                                 },
                             },
                         ],
@@ -1688,6 +1706,7 @@ mod tests {
             base_depth: 8,
             num_percept_bits: bits_for_cardinality(cfg.return_bins),
             encoding_bits: 1,
+            msb_first: None,
         };
 
         let agent = AiqiAgent::new(cfg).expect("valid aiqi config");

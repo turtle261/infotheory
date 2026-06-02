@@ -518,6 +518,52 @@ pub(super) fn load_expert_spec(path: &str) -> anyhow::Result<MixtureExpertSpec> 
 }
 
 #[cfg(all(test, feature = "vm"))]
+const VM_DEFAULT_CTW_DEPTH: usize = 32;
+#[cfg(all(test, feature = "vm"))]
+const VM_DEFAULT_FAC_CTW_ENCODING_BITS: usize = 8;
+#[cfg(all(test, feature = "vm"))]
+const VM_DEFAULT_OBSERVATION_BITS: u64 = 16;
+#[cfg(all(test, feature = "vm"))]
+const VM_DEFAULT_REWARD_BITS: u64 = 8;
+
+#[cfg(all(test, feature = "vm"))]
+fn vm_default_fac_ctw_num_percept_bits(root: &serde_json::Value) -> u64 {
+    let observation_bits = root["observation_bits"]
+        .as_u64()
+        .unwrap_or(VM_DEFAULT_OBSERVATION_BITS);
+    let reward_bits = root["reward_bits"]
+        .as_u64()
+        .unwrap_or(VM_DEFAULT_REWARD_BITS);
+    observation_bits + reward_bits
+}
+
+#[cfg(all(test, feature = "vm"))]
+fn apply_vm_fac_ctw_defaults(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    root: &serde_json::Value,
+    default_base_depth: usize,
+) {
+    if !object.contains_key("base_depth") {
+        object.insert(
+            "base_depth".to_string(),
+            serde_json::json!(default_base_depth),
+        );
+    }
+    if !object.contains_key("encoding_bits") {
+        object.insert(
+            "encoding_bits".to_string(),
+            serde_json::json!(VM_DEFAULT_FAC_CTW_ENCODING_BITS),
+        );
+    }
+    if !object.contains_key("num_percept_bits") {
+        object.insert(
+            "num_percept_bits".to_string(),
+            serde_json::json!(vm_default_fac_ctw_num_percept_bits(root)),
+        );
+    }
+}
+
+#[cfg(all(test, feature = "vm"))]
 pub(super) fn vm_stats_backend_spec_value(
     root: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
@@ -541,12 +587,12 @@ pub(super) fn vm_stats_backend_spec_value(
             "kind": "ctw",
             "depth": ct_depth,
         }),
-        "fac-ctw" => serde_json::json!({
-            "kind": "fac-ctw",
-            "base_depth": ct_depth,
-            "num_percept_bits": 8,
-            "encoding_bits": 8,
-        }),
+        "fac-ctw" => {
+            let mut spec = serde_json::Map::new();
+            spec.insert("kind".to_string(), serde_json::json!("fac-ctw"));
+            apply_vm_fac_ctw_defaults(&mut spec, root, ct_depth);
+            serde_json::Value::Object(spec)
+        }
         "sequitur" => serde_json::json!({
             "kind": "sequitur",
             "context_bytes": root["context_bytes"].as_u64().unwrap_or(64) as usize,
@@ -651,24 +697,11 @@ pub(super) fn normalize_vm_stats_backend_spec(
     match resolved {
         "ctw" => {
             if !obj.contains_key("depth") {
-                obj.insert("depth".to_string(), serde_json::json!(32usize));
+                obj.insert("depth".to_string(), serde_json::json!(VM_DEFAULT_CTW_DEPTH));
             }
         }
         "fac-ctw" => {
-            if !obj.contains_key("base_depth") {
-                obj.insert("base_depth".to_string(), serde_json::json!(32usize));
-            }
-            if !obj.contains_key("encoding_bits") {
-                obj.insert("encoding_bits".to_string(), serde_json::json!(8usize));
-            }
-            if !obj.contains_key("num_percept_bits") {
-                let obs_bits = root["observation_bits"].as_u64().unwrap_or(16);
-                let rew_bits = root["reward_bits"].as_u64().unwrap_or(8);
-                obj.insert(
-                    "num_percept_bits".to_string(),
-                    serde_json::json!(obs_bits + rew_bits),
-                );
-            }
+            apply_vm_fac_ctw_defaults(obj, root, VM_DEFAULT_CTW_DEPTH);
         }
         "mamba" =>
         {
@@ -951,6 +984,8 @@ pub(super) struct CliBackendInvocation<'a> {
     pub expert_spec_path: Option<&'a str>,
     pub rate_backend_json_path: Option<&'a str>,
     pub compression_backend_json_path: Option<&'a str>,
+    /// Optional FAC-CTW MSB-first override from `--msb-first` / `--lsb-first`.
+    pub fac_ctw_msb_first: Option<bool>,
     pub flags: CliBackendSourceFlags,
 }
 
@@ -960,6 +995,28 @@ pub(super) fn load_backend_spec_json(
 ) -> Result<(serde_json::Value, std::path::PathBuf), String> {
     infotheory::spec::load_json_value_from_path(std::path::Path::new("."), path, label)
         .map_err(|err| err.to_string())
+}
+
+fn validate_fac_ctw_bit_order_flags(inv: &CliBackendInvocation<'_>) -> Result<(), String> {
+    if inv.fac_ctw_msb_first.is_none() {
+        return Ok(());
+    }
+    if inv.rate_backend_json_path.is_some() || inv.compression_backend_json_path.is_some() {
+        return Err(
+            "--msb-first/--lsb-first cannot be combined with --rate-backend-json or --compression-backend-json"
+                .to_string(),
+        );
+    }
+    if inv.expert_spec_path.is_some() {
+        return Err("--msb-first/--lsb-first cannot be combined with --expert-spec".to_string());
+    }
+    if inv.rate_backend != "fac-ctw" {
+        return Err(format!(
+            "--msb-first/--lsb-first apply only to --rate-backend fac-ctw, got '{}'",
+            inv.rate_backend
+        ));
+    }
+    Ok(())
 }
 
 fn validate_cli_backend_sources(inv: &CliBackendInvocation<'_>) -> Result<(), String> {
@@ -1018,6 +1075,7 @@ fn rate_backend_from_cli_shorthand(
     rate_backend: &str,
     method: Option<&str>,
     expert_spec_path: Option<&str>,
+    fac_ctw_msb_first: Option<bool>,
 ) -> infotheory::api::RateBackend {
     if let Some(path) = expert_spec_path {
         let spec = load_expert_spec(path).unwrap_or_else(|e| {
@@ -1029,6 +1087,7 @@ fn rate_backend_from_cli_shorthand(
     let mut shorthand = infotheory::spec::RateBackendShorthandOptions::default();
     shorthand.base_dir = std::path::PathBuf::from(".");
     shorthand.particle_default_if_missing_method = false;
+    shorthand.fac_ctw_msb_first = fac_ctw_msb_first;
     #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
     let shorthand = {
         let mut shorthand = shorthand;
@@ -1081,6 +1140,10 @@ fn compression_backend_from_cli_shorthand(
 
 pub(super) fn build_ctx_invocation(inv: CliBackendInvocation<'_>) -> BuiltCtx {
     if let Err(err) = validate_cli_backend_sources(&inv) {
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    }
+    if let Err(err) = validate_fac_ctw_bit_order_flags(&inv) {
         eprintln!("Error: {err}");
         std::process::exit(1);
     }
@@ -1175,6 +1238,7 @@ pub(super) fn build_ctx_invocation(inv: CliBackendInvocation<'_>) -> BuiltCtx {
                         inv.rate_backend,
                         inv.method,
                         inv.expert_spec_path,
+                        inv.fac_ctw_msb_first,
                     )
                 }
             }
@@ -1225,8 +1289,12 @@ pub(super) fn build_ctx_invocation(inv: CliBackendInvocation<'_>) -> BuiltCtx {
         };
     }
 
-    let rate_backend_ast =
-        rate_backend_from_cli_shorthand(inv.rate_backend, inv.method, inv.expert_spec_path);
+    let rate_backend_ast = rate_backend_from_cli_shorthand(
+        inv.rate_backend,
+        inv.method,
+        inv.expert_spec_path,
+        inv.fac_ctw_msb_first,
+    );
     let compression_backend_ast = compression_backend_from_cli_shorthand(
         &rate_backend_ast,
         inv.compression_backend,
@@ -1257,6 +1325,7 @@ pub(super) fn build_ctx(
         expert_spec_path,
         rate_backend_json_path: None,
         compression_backend_json_path: None,
+        fac_ctw_msb_first: None,
         flags: CliBackendSourceFlags::default(),
     })
 }

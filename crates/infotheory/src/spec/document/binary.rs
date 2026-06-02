@@ -562,11 +562,13 @@ fn encode_rate_backend(out: &mut Vec<u8>, backend: &RateBackend) {
             base_depth,
             num_percept_bits,
             encoding_bits,
+            msb_first,
         } => {
             out.push(6);
             push_u64(out, *base_depth as u64);
             push_u64(out, *num_percept_bits as u64);
             push_u64(out, *encoding_bits as u64);
+            push_option_bool(out, *msb_first);
         }
         RateBackend::Zpaq { method } => {
             out.push(7);
@@ -646,6 +648,7 @@ fn decode_rate_backend(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<R
             base_depth: cursor.read_u64()? as usize,
             num_percept_bits: cursor.read_u64()? as usize,
             encoding_bits: cursor.read_u64()? as usize,
+            msb_first: cursor.read_option_bool()?,
         }),
         7 => Ok(RateBackend::Zpaq {
             method: decode_zpaq_method_spec(cursor)?,
@@ -1072,6 +1075,7 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             out.push(2);
             encode_rate_backend(out, &inner.predictor);
+            encode_bit_stream_semantics(out, inner.bit_stream_semantics);
             push_u64(out, inner.return_horizon as u64);
             push_u64(out, inner.return_bins as u64);
             push_u64(out, inner.label_phase_period as u64);
@@ -1107,6 +1111,7 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
         2 => Ok(ControllerSpec::AiqiWarmstartExactJh(
             WarmStartExactJhControllerSpec {
                 predictor: decode_rate_backend(cursor, base_dir)?,
+                bit_stream_semantics: decode_bit_stream_semantics(cursor)?,
                 return_horizon: cursor.read_u64()? as usize,
                 return_bins: cursor.read_u64()? as usize,
                 label_phase_period: cursor.read_u64()? as usize,
@@ -1939,6 +1944,16 @@ fn push_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
     }
 }
 
+fn push_option_bool(out: &mut Vec<u8>, value: Option<bool>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            push_bool(out, value);
+        }
+        None => out.push(0),
+    }
+}
+
 #[cfg(feature = "vm")]
 fn push_option_i64(out: &mut Vec<u8>, value: Option<i64>) {
     match value {
@@ -2044,6 +2059,14 @@ impl<'a> Cursor<'a> {
     fn read_option_u64(&mut self) -> SpecResult<Option<u64>> {
         if self.read_u8()? == 1 {
             Ok(Some(self.read_u64()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn read_option_bool(&mut self) -> SpecResult<Option<bool>> {
+        if self.read_u8()? == 1 {
+            Ok(Some(self.read_bool()?))
         } else {
             Ok(None)
         }

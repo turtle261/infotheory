@@ -4,24 +4,40 @@
 //! layer for consumers whose natural symbol is a bit.  A byte model can be
 //! queried as a bit model through a live prefix-mass view: the model remains a
 //! byte model, but each bit query renormalizes over the surviving byte prefix.
+//!
+//! # Predictor Contract
+//!
+//! All `RateBackendPredictor` (and wrapper) implementations **must emit only
+//! finite, non-negative** probabilities and log-probabilities. Callers (including
+//! `BinaryPrediction` constructors, `BytePrefixMass`, mixture bit paths, and
+//! entropy coders) may rely on this. Non-finite or negative outputs from a
+//! predictor indicate an internal bug and are treated as contract violations
+//! (surfaced via `panic!` with rich context in both debug and release builds for
+//! `BinaryPrediction` constructors and the `binary_prediction_from_*` helpers).
+//! Legitimate 0.5 / uniform policies remain only in the documented mathematical
+//! cases below (measure-zero conditioning limits, not arithmetic corruption).
+//!
+//! Legitimate 0.5 / uniform policies (distinct from error masking):
+//! - `BytePrefixMass::prediction` returns exact 0.5 when the current subtree
+//!   mass is zero (conditioning on a measure-zero event under the byte model;
+//!   the joint sequence prob is already zero; prevents NaN in coders).
+//! - `from_raw_weights` (and thus public `from_pdf`/`from_log_probs`/`from_cdf`)
+//!   falls back to uniform 1/256 when the *input row* has zero or non-finite
+//!   total mass after sanitizing (construction-time robustness for invalid
+//!   caller-provided PDFs; `from_log_probs` documents the all-invalid case).
 
 /// Online byte-level predictor trait re-exported for prediction-oriented APIs.
 pub use crate::mixture::OnlineBytePredictor;
 
 /// Bit ordering used when factorizing byte symbols.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum BitOrder {
     /// Most-significant bit first, matching Infotheory's AC bitwise fast path.
+    #[default]
     MsbFirst,
     /// Least-significant bit first.
     LsbFirst,
-}
-
-impl Default for BitOrder {
-    fn default() -> Self {
-        Self::MsbFirst
-    }
 }
 
 /// Semantic interpretation of a bit stream.
@@ -73,7 +89,24 @@ impl BinaryPrediction {
     /// Construct a normalized binary prediction from `P(1)` with a numerical floor.
     pub fn from_prob_one(p1: f64, floor: f64) -> Self {
         let floor = binary_floor(floor);
-        let p1 = if p1.is_finite() { p1 } else { 0.5 };
+        // Debug assertion plus runtime panic gives a clear contract failure
+        // instead of silently converting invalid predictor output to 0.5.
+        // Legitimate 0.5 (e.g. BytePrefixMass zero-mass) remains via direct
+        // call with finite 0.5; non-finite reaching here is always upstream bug.
+        debug_assert!(
+            p1.is_finite(),
+            "RateBackendPredictor emitted non-finite p1 to BinaryPrediction::from_prob_one; \
+             contract violation (must emit only finite non-negative values)"
+        );
+        let p1 = if p1.is_finite() {
+            p1
+        } else {
+            panic!(
+                "RateBackendPredictor emitted non-finite p1 to BinaryPrediction::from_prob_one; \
+                 this is now a hard contract violation (predictors must emit only finite \
+                 non-negative values). See prediction.rs module docs and BinaryPrediction ctors."
+            )
+        };
         let p1 = p1.clamp(floor, 1.0 - floor);
         Self { p0: 1.0 - p1, p1 }
     }
@@ -84,7 +117,21 @@ impl BinaryPrediction {
     /// remain exact. Entropy coders should apply their own finite-count floor at
     /// the coding boundary rather than here.
     pub fn from_prob_one_exact(p1: f64) -> Self {
-        let p1 = if p1.is_finite() { p1 } else { 0.5 };
+        // Hardened contract enforcement (see from_prob_one).
+        debug_assert!(
+            p1.is_finite(),
+            "RateBackendPredictor emitted non-finite p1 to BinaryPrediction::from_prob_one_exact; \
+             contract violation (must emit only finite non-negative values)"
+        );
+        let p1 = if p1.is_finite() {
+            p1
+        } else {
+            panic!(
+                "RateBackendPredictor emitted non-finite p1 to BinaryPrediction::from_prob_one_exact; \
+                 this is now a hard contract violation (predictors must emit only finite \
+                 non-negative values). See prediction.rs module docs and BinaryPrediction ctors."
+            )
+        };
         let p1 = p1.clamp(0.0, 1.0);
         Self { p0: 1.0 - p1, p1 }
     }
@@ -139,6 +186,12 @@ const BYTE_PREFIX_TREE_LEAF_BASE: usize = 256;
 
 impl BytePrefixMass {
     /// Build a prefix-mass state from a byte PDF.
+    ///
+    /// Slices shorter than 256 are treated as zero-padded on the right
+    /// (i.e. missing entries contribute 0 mass). This is an explicit
+    /// construction-time contract for the public API (graceful handling of
+    /// partial rows); see also the private `from_raw_weights` and module-level
+    /// docs on legitimate uniform fallbacks.
     pub fn from_pdf(pdf: &[f64], order: BitOrder) -> Self {
         let mut weights = [0.0f64; 256];
         for (idx, weight) in weights.iter_mut().enumerate() {
@@ -153,6 +206,9 @@ impl BytePrefixMass {
     /// entry for numerical stability. Non-finite entries are treated as zero
     /// mass, and an all-invalid row therefore falls back to the same uniform
     /// distribution as [`Self::from_pdf`].
+    ///
+    /// The input slice is truncated to at most 256 entries (excess ignored);
+    /// shorter slices are zero-padded (explicit contract, see [`Self::from_pdf`]).
     pub fn from_log_probs(log_probs: &[f64], order: BitOrder) -> Self {
         let log_probs = &log_probs[..log_probs.len().min(256)];
         let max_log = log_probs
@@ -228,6 +284,11 @@ impl BytePrefixMass {
         }
         let total = self.tree[self.node];
         if !total.is_finite() || total <= 0.0 {
+            // Legitimate policy: zero mass under the byte model means we are
+            // conditioning on a measure-zero event for the prefix. The joint
+            // probability of the observed sequence is already 0; returning the
+            // max-entropy distribution (0.5) prevents NaN propagation into
+            // arithmetic coders.
             return BinaryPrediction::from_prob_one_exact(0.5);
         }
         let one = self.tree[self.node * 2 + 1];
@@ -295,19 +356,23 @@ fn binary_floor(floor: f64) -> f64 {
 
 /// Convert a pair of raw probabilities into a normalized [`BinaryPrediction`].
 ///
-/// Non-finite and negative inputs are treated as zero mass. If both sides are
-/// degenerate, the result falls back to `0.5 / 0.5`.
+/// Inputs must be finite and non-negative (predictor contract). When both masses
+/// are exactly zero the conditioning event has measure zero under the model; the
+/// maximum-entropy extension `P(1)=0.5` is returned via [`BinaryPrediction::from_prob_one_exact`].
 #[inline]
 pub(crate) fn binary_prediction_from_probs(p0: f64, p1: f64, floor: f64) -> BinaryPrediction {
-    let p0 = if p0.is_finite() && p0 > 0.0 { p0 } else { 0.0 };
-    let p1 = if p1.is_finite() && p1 > 0.0 { p1 } else { 0.0 };
-    let sum = p0 + p1;
-    let p1_norm = if sum.is_finite() && sum > 0.0 {
-        p1 / sum
+    assert!(
+        p0.is_finite() && p0 >= 0.0 && p1.is_finite() && p1 >= 0.0,
+        "RateBackendPredictor emitted invalid probability to binary_prediction_from_probs: p0={p0}, p1={p1}; \
+         Predictor contract violation (must emit only finite non-negative values)"
+    );
+    let sum: f64 = p0 + p1;
+    if sum > 0.0 {
+        BinaryPrediction::from_prob_one(p1 / sum, floor)
     } else {
-        0.5
-    };
-    BinaryPrediction::from_prob_one(p1_norm, floor)
+        // Measure-zero conditioning limit: both symbol masses are exactly zero.
+        BinaryPrediction::from_prob_one_exact(0.5)
+    }
 }
 
 /// Convert a pair of natural-log probabilities into a normalized [`BinaryPrediction`].
@@ -326,20 +391,27 @@ pub(crate) fn binary_prediction_from_log_probs(
     logp1: f64,
     floor: f64,
 ) -> BinaryPrediction {
-    let max_log = if logp0 > logp1 { logp0 } else { logp1 };
-    if !max_log.is_finite() {
-        return BinaryPrediction::from_prob_one(0.5, floor);
+    if logp0.is_nan() || logp1.is_nan() {
+        panic!(
+            "RateBackendPredictor emitted NaN log probability to binary_prediction_from_log_probs: \
+             logp0={logp0}, logp1={logp1}; contract violation"
+        );
     }
-    let p0 = if logp0.is_finite() {
-        (logp0 - max_log).exp()
-    } else {
-        0.0
-    };
-    let p1 = if logp1.is_finite() {
-        (logp1 - max_log).exp()
-    } else {
-        0.0
-    };
+    let max_log: f64 = logp0.max(logp1);
+    if max_log.is_infinite() {
+        if max_log == f64::NEG_INFINITY {
+            // Both log-probs are exactly -inf: measure-zero conditioning limit.
+            return BinaryPrediction::from_prob_one_exact(0.5);
+        }
+        panic!(
+            "RateBackendPredictor emitted +Inf log probability to binary_prediction_from_log_probs: \
+             logp0={logp0}, logp1={logp1}; contract violation"
+        );
+    }
+    // After the guards above, each logp is finite or exactly -inf; max_log is finite.
+    // IEEE 754: (-inf) - finite = -inf, and exp(-inf) = 0.0 — no explicit branch needed.
+    let p0: f64 = (logp0 - max_log).exp();
+    let p1: f64 = (logp1 - max_log).exp();
     binary_prediction_from_probs(p0, p1, floor)
 }
 
@@ -622,9 +694,43 @@ mod tests {
         let pred = binary_prediction_from_probs(2.0, 6.0, 1e-6);
         assert!((pred.p0 - 0.25).abs() < 1e-12);
         assert!((pred.p1 - 0.75).abs() < 1e-12);
+    }
 
-        let degenerate = binary_prediction_from_probs(f64::NAN, -3.0, 1e-6);
-        assert_eq!(degenerate, BinaryPrediction::from_prob_one(0.5, 1e-6));
+    #[test]
+    fn binary_prediction_from_probs_both_zero_returns_exact_half() {
+        let pred = binary_prediction_from_probs(0.0, 0.0, 1e-6);
+        assert!((pred.p1 - 0.5).abs() < 1e-12);
+        assert!((pred.p0 - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn binary_prediction_from_log_probs_both_neg_inf_returns_exact_half() {
+        let pred = binary_prediction_from_log_probs(f64::NEG_INFINITY, f64::NEG_INFINITY, 1e-6);
+        assert!((pred.p1 - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid probability")]
+    fn binary_prediction_from_probs_panics_on_nan() {
+        let _ = binary_prediction_from_probs(f64::NAN, 0.5, 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid probability")]
+    fn binary_prediction_from_probs_panics_on_negative() {
+        let _ = binary_prediction_from_probs(-1.0, 0.5, 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "NaN log probability")]
+    fn binary_prediction_from_log_probs_panics_on_nan() {
+        let _ = binary_prediction_from_log_probs(f64::NAN, -1.0, 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "+Inf log probability")]
+    fn binary_prediction_from_log_probs_panics_on_pos_inf() {
+        let _ = binary_prediction_from_log_probs(0.0, f64::INFINITY, 1e-6);
     }
 
     #[test]

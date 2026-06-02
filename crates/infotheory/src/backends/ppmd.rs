@@ -60,10 +60,10 @@ impl ContextStats {
         {
             return Some(&mut entry.count);
         }
-        if let Some(spill_counts) = self.spill_counts.as_mut() {
-            if let Some(entry) = spill_counts.iter_mut().find(|entry| entry.symbol == symbol) {
-                return Some(&mut entry.count);
-            }
+        if let Some(spill_counts) = self.spill_counts.as_mut()
+            && let Some(entry) = spill_counts.iter_mut().find(|entry| entry.symbol == symbol)
+        {
+            return Some(&mut entry.count);
         }
         None
     }
@@ -502,7 +502,7 @@ fn interpolate_context_in_place(ctx: &ContextStats, lower: &mut [f64; 256]) {
     });
 }
 
-fn normalize_pdf_and_maybe_cdf(pdf: &mut [f64; 256], mut cdf: Option<&mut [f64; 257]>) {
+fn normalize_pdf_and_maybe_cdf(pdf: &mut [f64; 256], cdf: Option<&mut [f64; 257]>) {
     let mut sum = 0.0;
     for p in pdf.iter_mut() {
         *p = if p.is_finite() {
@@ -515,13 +515,13 @@ fn normalize_pdf_and_maybe_cdf(pdf: &mut [f64; 256], mut cdf: Option<&mut [f64; 
     if !(sum.is_finite()) || sum <= 0.0 {
         let u = 1.0 / 256.0;
         pdf.fill(u);
-        if let Some(cdf) = cdf.as_deref_mut() {
+        if let Some(cdf) = cdf {
             *cdf = uniform_cdf();
         }
         return;
     }
     let inv = 1.0 / sum;
-    if let Some(cdf) = cdf.as_deref_mut() {
+    if let Some(cdf) = cdf {
         cdf[0] = 0.0;
         let mut acc = 0.0;
         for i in 0..256 {
@@ -768,7 +768,8 @@ mod tests {
     #[test]
     fn ppmd_memory_usage_breakdown_sums_to_estimated_total() {
         let mut model = PpmdModel::new(12, 1);
-        for &byte in b"abracadabra abracadabra mississippi banana bandana ppmd memory audit payload"
+        for &byte in
+            b"abracadabra abracadabra mississippi banana bandana ppmd memory validation payload"
         {
             model.update(byte);
         }

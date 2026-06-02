@@ -2161,8 +2161,10 @@ impl RosaPlus {
         self.sam.last
     }
 
-    #[cfg(any(feature = "aixi", test))]
     /// Restore a previously recorded predictive cursor state.
+    ///
+    /// Available whenever the ROSA backend is compiled (used by general
+    /// checkpoint/restore paths including public bit-session frozen rewinds).
     pub(crate) fn restore_conditioning_cursor(&mut self, cursor: i32) {
         self.sam.last = cursor;
     }
@@ -3781,7 +3783,9 @@ mod tests {
     #[test]
     fn rosa_memory_usage_breakdown_sums_to_estimated_total() {
         let mut model = RosaPlus::new(8, true, b'\n', 1234);
-        model.train_example(b"abracadabra mississippi banana bandana rosa memory audit payload");
+        model.train_example(
+            b"abracadabra mississippi banana bandana rosa memory validation payload",
+        );
         model.build_lm();
 
         let usage = model.memory_usage_breakdown();

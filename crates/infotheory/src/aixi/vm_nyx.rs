@@ -27,7 +27,7 @@ use crate::api::{
     try_entropy_rate_backend,
 };
 #[cfg(feature = "backend-ctw")]
-use crate::backends::ctw::{ContextTree, FacContextTree};
+use crate::backends::ctw::{ContextTree, FacContextTree, ctw_symbol_bit_msb};
 #[cfg(feature = "backend-rosa")]
 use crate::backends::rosaplus::RosaPlus;
 #[cfg(feature = "backend-zpaq")]
@@ -1184,6 +1184,7 @@ enum TraceModel {
     FacCtw {
         tree: FacContextTree,
         bits_per_symbol: usize,
+        msb_first: bool,
     },
     #[cfg(feature = "backend-mamba")]
     Mamba {
@@ -1247,14 +1248,16 @@ impl TraceModel {
                     base_depth,
                     num_percept_bits: _,
                     encoding_bits,
+                    msb_first,
                 } = backend.plan()
                 else {
                     unreachable!("trace-model strategy mismatch for fac-ctw");
                 };
-                let bits_per_symbol = (*encoding_bits).clamp(1, 8);
+                let bits_per_symbol = *encoding_bits;
                 Ok(TraceModel::FacCtw {
                     tree: FacContextTree::new(*base_depth, bits_per_symbol),
                     bits_per_symbol,
+                    msb_first: *msb_first,
                 })
             }
             #[cfg(feature = "backend-zpaq")]
@@ -1367,11 +1370,17 @@ impl TraceModel {
             TraceModel::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
             } => {
                 let log_before = tree.get_log_block_probability();
                 for &b in data {
                     for i in 0..*bits_per_symbol {
-                        tree.update(((b >> i) & 1) == 1, i);
+                        let bit = if *msb_first {
+                            ctw_symbol_bit_msb(b, *bits_per_symbol, i)
+                        } else {
+                            ((b >> i) & 1) == 1
+                        };
+                        tree.update(bit, i);
                     }
                 }
                 let log_after = tree.get_log_block_probability();

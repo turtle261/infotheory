@@ -116,11 +116,20 @@ pub(crate) fn compile_rate_plan_fac_ctw(
             base_depth,
             num_percept_bits,
             encoding_bits,
-        } => Ok(RateBackendPlan::FacCtw {
-            base_depth: *base_depth,
-            num_percept_bits: *num_percept_bits,
-            encoding_bits: *encoding_bits,
-        }),
+            msb_first,
+        } => {
+            if !(1..=8).contains(encoding_bits) {
+                return Err(SpecError::new(format!(
+                    "fac-ctw encoding_bits must be in 1..=8, got {encoding_bits}"
+                )));
+            }
+            Ok(RateBackendPlan::FacCtw {
+                base_depth: *base_depth,
+                num_percept_bits: *num_percept_bits,
+                encoding_bits: *encoding_bits,
+                msb_first: msb_first.unwrap_or(*encoding_bits == 8),
+            })
+        }
         _ => unreachable!("fac-ctw kernel used with non-fac-ctw backend"),
     }
 }

@@ -6,6 +6,7 @@
       "name": "fac-ctw",
       "kind": "fac-ctw",
       "num_percept_bits": 8,
+      "msb_first": true,
       "log_prior": 0,
       "base_depth": 32
     },

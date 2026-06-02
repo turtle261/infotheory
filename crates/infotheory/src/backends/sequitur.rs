@@ -54,6 +54,7 @@ impl ContextFollowers {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::enum_variant_names)]
 enum UndoOp {
     SetPrev {
         node: NodeIx,
@@ -381,10 +382,10 @@ impl SequiturModel {
         let guard = self.rules[rule_id as usize].guard;
         let mut node = self.nodes[guard as usize].next;
         while node != guard {
-            if let NodeData::Sym(Symbol::NonTerminal(child)) = self.nodes[node as usize].data {
-                if self.rules[child as usize].active {
-                    self.collect_rule_preorder(child, order, seen);
-                }
+            if let NodeData::Sym(Symbol::NonTerminal(child)) = self.nodes[node as usize].data
+                && self.rules[child as usize].active
+            {
+                self.collect_rule_preorder(child, order, seen);
             }
             node = self.nodes[node as usize].next;
         }
@@ -565,8 +566,8 @@ impl SequiturModel {
             let total = stats.total as f64;
             let types = distinct as f64;
             let escape = types / (total + types);
-            for i in 0..256 {
-                next[i] = self.pdf[i] * escape;
+            for (i, slot) in next.iter_mut().enumerate() {
+                *slot = self.pdf[i] * escape;
             }
             for &(symbol, count) in &stats.counts {
                 next[symbol as usize] += (count as f64) / (total + types);
@@ -856,10 +857,10 @@ impl SequiturModel {
         };
 
         let first = self.first_node_of_rule(rule);
-        if let Symbol::NonTerminal(child) = self.symbol_of(first) {
-            if self.rules[child as usize].ref_count == 1 {
-                self.expand(first, child);
-            }
+        if let Symbol::NonTerminal(child) = self.symbol_of(first)
+            && self.rules[child as usize].ref_count == 1
+        {
+            self.expand(first, child);
         }
     }
 

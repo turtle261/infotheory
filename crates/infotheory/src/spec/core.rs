@@ -202,6 +202,7 @@ pub(crate) enum RateBackendPlan {
         base_depth: usize,
         num_percept_bits: usize,
         encoding_bits: usize,
+        msb_first: bool,
     },
     Zpaq {
         method: String,

@@ -280,3 +280,62 @@ def test_ctx_rate_backend_bit_session_delegates_to_default_backend():
 
     sess.observe_bit(True)
     sess.finish()
+
+
+def test_bit_session_checkpoint_restore_binary_tokens_roundtrip():
+    backend = ait.RateBackend.ctw(6)
+    sess = ait.RateBackendBitSession(backend, total_bits=12, semantics="binary")
+
+    for bit in [True, False, True]:
+        sess.observe_bit(bit)
+
+    pred_before = sess.predict_bit()
+    checkpoint = sess.checkpoint()
+
+    for bit in [False, False, True, True]:
+        sess.observe_bit(bit)
+
+    sess.restore_checkpoint(checkpoint)
+    pred_after = sess.predict_bit()
+    assert abs(pred_before.p1 - pred_after.p1) < 1e-12
+
+    for bit in [True, False, False, True, True, False, True, False, False]:
+        sess.observe_bit(bit)
+    sess.finish()
+
+
+def test_bit_session_checkpoint_restore_mid_prefix_byte_packed():
+    backend = ait.RateBackend.ctw(6)
+    sess = ait.RateBackendBitSession(
+        backend,
+        total_bits=8,
+        semantics=ait.BitStreamSemantics.byte_packed(ait.BitOrder.MsbFirst),
+    )
+
+    sess.condition_bit(True)
+    sess.condition_bit(False)
+    pred_before = sess.predict_one()
+    checkpoint = sess.checkpoint()
+
+    sess.condition_bit(True)
+    sess.condition_bit(True)
+    sess.condition_bit(False)
+
+    sess.restore_checkpoint(checkpoint)
+    pred_after = sess.predict_one()
+    assert abs(pred_before - pred_after) < 1e-12
+
+    sess.clear_checkpoints_if_supported()
+    for bit in [True, False, True, False, True, False]:
+        sess.condition_bit(bit)
+    sess.finish()
+
+
+def test_bit_session_checkpoint_rejects_mismatched_semantics():
+    backend = ait.RateBackend.ctw(6)
+    binary = ait.RateBackendBitSession(backend, total_bits=8, semantics="binary")
+    byte = ait.RateBackendBitSession(backend, total_bits=8, semantics="byte")
+
+    checkpoint = binary.checkpoint()
+    with pytest.raises(RuntimeError, match="different backend or bit semantics"):
+        byte.restore_checkpoint(checkpoint)

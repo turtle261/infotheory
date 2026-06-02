@@ -212,6 +212,7 @@ fn api_surface_bit_session_checkpoint_restores_native_reversible_mixture() {
                     base_depth: 6,
                     num_percept_bits: 1,
                     encoding_bits: 1,
+                    msb_first: None,
                 }),
             ],
         )),
@@ -676,6 +677,7 @@ fn api_surface_fac_ctw_binary_tokens_accept_arbitrary_length_streams() {
         base_depth: 6,
         num_percept_bits: 8,
         encoding_bits: 8,
+        msb_first: None,
     }
     .compile()
     .expect("compiled fac-ctw");

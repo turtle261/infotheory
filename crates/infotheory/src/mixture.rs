@@ -32,7 +32,7 @@ use crate::backends::match_model::MatchModel;
 use crate::backends::ppmd::PpmdModel;
 #[cfg(feature = "backend-rosa")]
 use crate::backends::rosaplus::{RosaPlus, RosaTx};
-#[cfg(all(feature = "backend-sequitur", any(feature = "aixi", test)))]
+#[cfg(feature = "backend-sequitur")]
 use crate::backends::sequitur::SequiturCheckpoint;
 #[cfg(feature = "backend-sequitur")]
 use crate::backends::sequitur::SequiturModel;
@@ -195,24 +195,18 @@ pub(crate) fn convex_step_size_for_update(
 }
 
 fn normalized_log_weights(log_weights: impl IntoIterator<Item = f64>) -> Vec<f64> {
-    let log_weights: Vec<f64> = log_weights.into_iter().collect();
-    if log_weights.is_empty() {
+    let mut weights: Vec<f64> = log_weights.into_iter().collect();
+    if weights.is_empty() {
         return Vec::new();
     }
-    let max_log = log_weights
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let mut weights = log_weights
-        .iter()
-        .map(|&log_weight| {
-            if max_log.is_finite() {
-                (log_weight - max_log).exp()
-            } else {
-                0.0
-            }
-        })
-        .collect::<Vec<_>>();
+    let max_log = weights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    for w in &mut weights {
+        *w = if max_log.is_finite() {
+            (*w - max_log).exp()
+        } else {
+            0.0
+        };
+    }
     normalize_simplex_weights(&mut weights);
     weights
 }
@@ -353,6 +347,16 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     /// [`Self::finish_native_msb_byte_prefix`]. Implementations must leave the
     /// predictor unchanged when they return `Ok(false)` or `Err(_)`.
     fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Abort an active native MSB-first byte-prefix step before any bits have
+    /// been observed.
+    ///
+    /// This is used only when a caller restores to a checkpoint that was taken
+    /// immediately after `begin_native_msb_byte_prefix`. Implementations must
+    /// return an error rather than dropping observed prefix bits.
+    fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
         Ok(false)
     }
 
@@ -545,6 +549,20 @@ impl BytePrefixStepState {
         }
     }
 
+    fn abort_empty(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
+        match self {
+            Self::Native => {
+                predictor.abort_empty_native_msb_byte_prefix()?;
+                *self = Self::default();
+                Ok(())
+            }
+            Self::PdfPrefix { .. } => {
+                *self = Self::default();
+                Ok(())
+            }
+        }
+    }
+
     fn finish(
         &mut self,
         predictor: &mut dyn OnlineBytePredictor,
@@ -669,6 +687,23 @@ impl MixtureBitPrefixState {
         Ok(true)
     }
 
+    fn abort_empty(&mut self, experts: &mut [ExpertState]) -> Result<bool, String> {
+        if !self.active {
+            return Ok(false);
+        }
+        if self.expected_bit_idx != 0 {
+            return Err(format!(
+                "native MSB-first byte-prefix abort requires zero observed bits, got {}",
+                self.expected_bit_idx
+            ));
+        }
+        for (state, expert) in self.states.iter_mut().zip(experts.iter_mut()) {
+            state.abort_empty(expert.predictor.as_mut())?;
+        }
+        self.reset_inactive();
+        Ok(true)
+    }
+
     fn prime_bit_probs_if_needed(
         &mut self,
         experts: &mut [ExpertState],
@@ -678,6 +713,9 @@ impl MixtureBitPrefixState {
         if self.primed_bit_idx == Some(bit_idx) {
             return Ok(());
         }
+        // Index form required for coordinated access to per-expert state + scratch buffers
+        // (same rationale as the allows in prob_one/observe below).
+        #[allow(clippy::needless_range_loop)]
         for idx in 0..experts.len() {
             let p1: f64 = self.states[idx].prob_one(experts[idx].predictor.as_mut(), bit_idx)?;
             self.bit_probs[idx] = p1;
@@ -691,6 +729,9 @@ impl MixtureBitPrefixState {
         self.prime_bit_probs_if_needed(experts, bit_idx)?;
         let mut denom: f64 = 0.0;
         let mut numer: f64 = 0.0;
+        // Index form required for parallel mutable access to multiple scratch buffers
+        // alongside experts; iterators would require zip + tuple mutation which is less clear here.
+        #[allow(clippy::needless_range_loop)]
         for idx in 0..experts.len() {
             let p1: f64 = self.bit_probs[idx];
             let weighted_prefix: f64 = self.weights[idx] * self.likelihoods[idx];
@@ -700,7 +741,13 @@ impl MixtureBitPrefixState {
         Ok(if denom.is_finite() && denom > 0.0 {
             (numer / denom).clamp(DEFAULT_MIN_PROB, 1.0 - DEFAULT_MIN_PROB)
         } else {
-            0.5
+            // Invariant failure (introduced in bitwiseness bit-prefix state; tightened):
+            // non-positive/NaN denom means internal expert weighting or priming
+            // produced invalid state. Panic with context per AGENTS (contract violation).
+            panic!(
+                "MixtureBitPrefixState::prob_one: invalid weighted denom (must be finite > 0); \
+                 this indicates a bug in prime_bit_probs_if_needed or expert likelihoods"
+            )
         })
     }
 
@@ -712,6 +759,8 @@ impl MixtureBitPrefixState {
     ) -> Result<(), String> {
         debug_assert!(self.active);
         self.prime_bit_probs_if_needed(experts, bit_idx)?;
+        // Index form clearest for coordinated mutation of likelihoods/states + experts[idx].
+        #[allow(clippy::needless_range_loop)]
         for idx in 0..experts.len() {
             let p1: f64 = self.bit_probs[idx];
             let pb: f64 = if bit { p1 } else { 1.0 - p1 };
@@ -731,6 +780,8 @@ impl MixtureBitPrefixState {
                 self.expected_bit_idx
             ));
         }
+        // Index form clearest for coordinated mutation of likelihoods/logps/states + experts[idx].
+        #[allow(clippy::needless_range_loop)]
         for idx in 0..experts.len() {
             let lp: f64 = self.likelihoods[idx].max(DEFAULT_MIN_PROB).ln();
             self.logps[idx] = lp;
@@ -824,19 +875,27 @@ pub enum RateBackendPredictor {
         /// In-flight native byte-prefix progress when stepping MSB-first bits.
         native_prefix_progress: Option<usize>,
     },
-    /// Factorized CTW with configurable bit-encoding (LSB-first).
+    /// Factorized CTW with width-dependent bit order.
     #[cfg(feature = "backend-ctw")]
     FacCtw {
         /// FAC-CTW tree stack for configured bit width.
         tree: FacContextTree,
         /// Active bit-width per symbol.
         bits_per_symbol: usize,
+        /// Effective symbol bit order (`true` => MSB-first).
+        ///
+        /// FAC-CTW keeps legacy LSB-first behavior for non-byte symbol widths,
+        /// but 8-bit symbols run MSB-first so byte-packed sessions can use the
+        /// native prefix path consistently.
+        msb_first: bool,
         /// Probability floor for numeric stability.
         min_prob: f64,
         /// Compact rollback journal used while checkpoint scopes are active.
         checkpoint_journal: Vec<FacCtwUndoOp>,
         /// Number of active checkpoints that require journaling.
         checkpoint_depth: usize,
+        /// In-flight native byte-prefix progress when stepping MSB-first bits.
+        native_prefix_progress: Option<usize>,
     },
     /// RWKV-7 neural predictor.
     #[cfg(feature = "backend-rwkv")]
@@ -909,7 +968,13 @@ pub enum RateBackendPredictor {
 /// state.
 pub enum RateBackendPredictorCheckpoint {
     /// Full predictor clone for backends without specialized checkpointing.
-    Full(RateBackendPredictor),
+    ///
+    /// Boxed so the enum stays pointer-sized: compact variants (`Ctw`, `Rosa`,
+    /// `Sequitur`, etc.) are not forced to move ~4 KiB on the stack when passed
+    /// through this type. The clone+heap cost is negligible versus `self.clone()`.
+    /// Byte-prefix session buffering still boxes checkpoints out-of-line when
+    /// stored in long-lived session state.
+    Full(Box<RateBackendPredictor>),
     /// Compact ROSA journal marker for [`RateBackendPredictor::Rosa`].
     #[cfg(feature = "backend-rosa")]
     Rosa {
@@ -932,6 +997,8 @@ pub enum RateBackendPredictorCheckpoint {
     FacCtw {
         /// Length of the rollback journal to restore when unwinding the checkpoint.
         journal_len: usize,
+        /// In-flight native prefix progress captured with the checkpoint.
+        native_prefix_progress: Option<usize>,
     },
     /// Composite checkpoint for calibrated predictors.
     #[cfg(feature = "backend-calibrated")]
@@ -959,6 +1026,8 @@ pub enum CtwUndoOp {
 pub enum FacCtwUndoOp {
     /// Symbol update applied in learning mode.
     LearnedSymbol,
+    /// One native prefix bit applied in learning mode.
+    LearnedBit { bit_idx: usize },
     /// Symbol update applied in frozen/scoring mode.
     FrozenSymbol,
 }
@@ -968,7 +1037,7 @@ pub enum FacCtwUndoOp {
 /// Internal ROSA journal event used to restore predictor state from checkpoints.
 #[doc(hidden)]
 pub enum RosaPredictorUndo {
-    Learned(RosaTx),
+    Learned(Box<RosaTx>),
     FrozenCursor { previous_last: i32 },
 }
 
@@ -1032,6 +1101,9 @@ fn restore_fac_ctw_checkpoint(
                 for bit_idx in (0..bits).rev() {
                     tree.revert(bit_idx);
                 }
+            }
+            FacCtwUndoOp::LearnedBit { bit_idx } => {
+                tree.revert(bit_idx);
             }
             FacCtwUndoOp::FrozenSymbol => {
                 tree.revert_history(bits);
@@ -1111,11 +1183,13 @@ impl RateBackendPredictor {
             RateBackendPredictor::FacCtw {
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
                 *checkpoint_depth = checkpoint_depth.saturating_add(1);
                 RateBackendPredictorCheckpoint::FacCtw {
                     journal_len: checkpoint_journal.len(),
+                    native_prefix_progress: *native_prefix_progress,
                 }
             }
             #[cfg(feature = "backend-calibrated")]
@@ -1137,8 +1211,46 @@ impl RateBackendPredictor {
             RateBackendPredictor::Mixture { runtime } => runtime
                 .checkpoint()
                 .map(|checkpoint| RateBackendPredictorCheckpoint::Mixture(Box::new(checkpoint)))
-                .unwrap_or_else(|| RateBackendPredictorCheckpoint::Full(self.clone())),
-            _ => RateBackendPredictorCheckpoint::Full(self.clone()),
+                .unwrap_or_else(|| RateBackendPredictorCheckpoint::Full(Box::new(self.clone()))),
+            _ => RateBackendPredictorCheckpoint::Full(Box::new(self.clone())),
+        }
+    }
+
+    pub(crate) fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => match *native_prefix_progress {
+                Some(0) => {
+                    *native_prefix_progress = None;
+                    Ok(true)
+                }
+                Some(bits) => Err(format!(
+                    "native MSB-first byte-prefix abort requires zero observed bits, got {bits}"
+                )),
+                None => Ok(false),
+            },
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => match *native_prefix_progress {
+                Some(0) => {
+                    *native_prefix_progress = None;
+                    Ok(true)
+                }
+                Some(bits) => Err(format!(
+                    "native MSB-first byte-prefix abort requires zero observed bits, got {bits}"
+                )),
+                None => Ok(false),
+            },
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.abort_empty_native_msb_byte_prefix()
+            }
+            _ => Ok(false),
         }
     }
 
@@ -1158,7 +1270,7 @@ impl RateBackendPredictor {
                         .pop()
                         .expect("rosa checkpoint journal underflow")
                     {
-                        RosaPredictorUndo::Learned(tx) => model.rollback_tx(tx),
+                        RosaPredictorUndo::Learned(tx) => model.rollback_tx(*tx),
                         RosaPredictorUndo::FrozenCursor { previous_last } => {
                             model.restore_conditioning_cursor(previous_last)
                         }
@@ -1195,9 +1307,13 @@ impl RateBackendPredictor {
                     tree,
                     bits_per_symbol,
                     checkpoint_journal,
+                    native_prefix_progress,
                     ..
                 },
-                RateBackendPredictorCheckpoint::FacCtw { journal_len },
+                RateBackendPredictorCheckpoint::FacCtw {
+                    journal_len,
+                    native_prefix_progress: checkpoint_progress,
+                },
             ) => {
                 restore_fac_ctw_checkpoint(
                     tree,
@@ -1205,6 +1321,7 @@ impl RateBackendPredictor {
                     checkpoint_journal,
                     *journal_len,
                 );
+                *native_prefix_progress = *checkpoint_progress;
             }
             #[cfg(feature = "backend-calibrated")]
             (
@@ -1230,7 +1347,7 @@ impl RateBackendPredictor {
                 runtime.restore_checkpoint(ck);
             }
             (slot, RateBackendPredictorCheckpoint::Full(state)) => {
-                *slot = state.clone();
+                *slot = state.as_ref().clone();
             }
             #[cfg(feature = "backend-rosa")]
             (_, RateBackendPredictorCheckpoint::Rosa { .. }) => {
@@ -1276,19 +1393,23 @@ impl RateBackendPredictor {
             RateBackendPredictor::Ctw {
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
                 checkpoint_journal.clear();
                 *checkpoint_depth = 0;
+                *native_prefix_progress = None;
             }
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw {
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
                 checkpoint_journal.clear();
                 *checkpoint_depth = 0;
+                *native_prefix_progress = None;
             }
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated { base, .. } => {
@@ -1449,7 +1570,13 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::FacCtw { .. } => Ok(()),
+            RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-zpaq")]
             RateBackendPredictor::Zpaq { model } => {
                 model.begin_stream();
@@ -1492,7 +1619,13 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::FacCtw { .. } => Ok(()),
+            RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-zpaq")]
             RateBackendPredictor::Zpaq { .. } => Ok(()),
             #[cfg(feature = "backend-particle")]
@@ -1507,7 +1640,9 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 .finish_online_policy_stream()
                 .map_err(|e| e.to_string()),
             #[cfg(feature = "backend-mamba")]
-            RateBackendPredictor::Mamba { .. } => Ok(()),
+            RateBackendPredictor::Mamba { compressor, .. } => compressor
+                .finish_online_policy_stream()
+                .map_err(|e| e.to_string()),
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.finish_stream(),
             #[cfg(feature = "backend-calibrated")]
@@ -1580,12 +1715,17 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
                 min_prob,
                 ..
             } => {
                 let log_before = tree.get_log_block_probability();
                 for i in 0..*bits_per_symbol {
-                    let bit = ((symbol >> i) & 1) == 1;
+                    let bit = if *msb_first {
+                        ctw_symbol_bit_msb(symbol, *bits_per_symbol, i)
+                    } else {
+                        ((symbol >> i) & 1) == 1
+                    };
                     tree.update(bit, i);
                 }
                 let log_after = tree.get_log_block_probability();
@@ -1717,10 +1857,11 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
                 min_prob,
                 ..
             } => {
-                fill_fac_tree_log_probs(tree, *bits_per_symbol, false, min_prob.ln(), out);
+                fill_fac_tree_log_probs(tree, *bits_per_symbol, *msb_first, min_prob.ln(), out);
             }
             #[cfg(feature = "backend-rwkv")]
             RateBackendPredictor::Rwkv7 {
@@ -1812,6 +1953,12 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Ctw {
                 bits_per_symbol, ..
             } => *bits_per_symbol == 8,
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                bits_per_symbol,
+                msb_first,
+                ..
+            } => *bits_per_symbol == 8 && *msb_first,
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.has_native_msb_byte_prefix(),
             _ => false,
@@ -1825,7 +1972,27 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 bits_per_symbol, ..
             } if *bits_per_symbol != 8 => Ok(false),
             #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                bits_per_symbol,
+                msb_first,
+                ..
+            } if *bits_per_symbol != 8 || !*msb_first => Ok(false),
+            #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                if native_prefix_progress.is_some() {
+                    return Err(
+                        "native MSB-first byte-prefix step is already active for this predictor"
+                            .to_string(),
+                    );
+                }
+                *native_prefix_progress = Some(0);
+                Ok(true)
+            }
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
                 native_prefix_progress,
                 ..
             } => {
@@ -1844,6 +2011,10 @@ impl OnlineBytePredictor for RateBackendPredictor {
         }
     }
 
+    fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        RateBackendPredictor::abort_empty_native_msb_byte_prefix(self)
+    }
+
     fn native_msb_prefix_prob_one(&mut self, bit_idx: usize) -> Result<f64, String> {
         match self {
             #[cfg(feature = "backend-ctw")]
@@ -1858,6 +2029,20 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
                 validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
                 let p: f64 = tree.predict(true);
+                Ok(p.clamp(*min_prob, 1.0 - *min_prob))
+            }
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                tree,
+                min_prob,
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                let p: f64 = tree.predict_one(bit_idx);
                 Ok(p.clamp(*min_prob, 1.0 - *min_prob))
             }
             #[cfg(feature = "backend-mixture")]
@@ -1889,6 +2074,25 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 }
                 Ok(())
             }
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                tree,
+                checkpoint_journal,
+                checkpoint_depth,
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_mut()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                *next_bit_idx += 1;
+                tree.update_predicted(bit, bit_idx);
+                if *checkpoint_depth > 0 {
+                    checkpoint_journal.push(FacCtwUndoOp::LearnedBit { bit_idx });
+                }
+                Ok(())
+            }
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => {
                 runtime.observe_native_msb_prefix_bit(bit_idx, bit)
@@ -1901,6 +2105,19 @@ impl OnlineBytePredictor for RateBackendPredictor {
         match self {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_finish(*next_bit_idx)?;
+                *native_prefix_progress = None;
+                let _ = symbol;
+                Ok(())
+            }
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
                 native_prefix_progress,
                 ..
             } => {
@@ -1932,7 +2149,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 if *checkpoint_depth > 0 {
                     let mut tx = model.begin_tx();
                     model.train_sequence_tx(&mut tx, &[symbol]);
-                    checkpoint_journal.push(RosaPredictorUndo::Learned(tx));
+                    checkpoint_journal.push(RosaPredictorUndo::Learned(Box::new(tx)));
                 } else {
                     model.train_byte(symbol);
                 }
@@ -1978,12 +2195,23 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "fac-ctw symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
                 for i in 0..*bits_per_symbol {
-                    let bit = ((symbol >> i) & 1) == 1;
+                    let bit = if *msb_first {
+                        ctw_symbol_bit_msb(symbol, *bits_per_symbol, i)
+                    } else {
+                        ((symbol >> i) & 1) == 1
+                    };
                     tree.update(bit, i);
                 }
                 if *checkpoint_depth > 0 {
@@ -2088,7 +2316,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 if *checkpoint_depth > 0 {
                     let mut tx = model.begin_tx();
                     model.train_sequence_tx(&mut tx, &[symbol]);
-                    checkpoint_journal.push(RosaPredictorUndo::Learned(tx));
+                    checkpoint_journal.push(RosaPredictorUndo::Learned(Box::new(tx)));
                 } else {
                     model.train_byte(symbol);
                 }
@@ -2118,11 +2346,30 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
                 min_prob,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
             } => {
-                let logp = ctw_log_prob_update_lsb(tree, symbol, *bits_per_symbol, *min_prob);
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "fac-ctw symbol log_prob_update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
+                let logp = if *msb_first {
+                    let bits = (*bits_per_symbol).clamp(1, 8);
+                    let mut acc = 0.0f64;
+                    for bit_idx in 0..bits {
+                        let bit = ctw_symbol_bit_msb(symbol, bits, bit_idx);
+                        let p = tree.predict(bit, bit_idx).clamp(*min_prob, 1.0 - *min_prob);
+                        acc += p.ln();
+                        tree.update_predicted(bit, bit_idx);
+                    }
+                    acc
+                } else {
+                    ctw_log_prob_update_lsb(tree, symbol, *bits_per_symbol, *min_prob)
+                };
                 if *checkpoint_depth > 0 {
                     checkpoint_journal.push(FacCtwUndoOp::LearnedSymbol);
                 }
@@ -2200,7 +2447,12 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::FacCtw { tree, .. } => {
+            RateBackendPredictor::FacCtw {
+                tree,
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
                 tree.reset_history_only();
                 Ok(())
             }
@@ -2307,14 +2559,25 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "fac-ctw frozen symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
                 let bits = (*bits_per_symbol).clamp(1, 8);
                 let mut history_bits = [false; 8];
                 for (idx, slot) in history_bits.iter_mut().enumerate().take(bits) {
-                    *slot = ((symbol >> idx) & 1) == 1;
+                    *slot = if *msb_first {
+                        ctw_symbol_bit_msb(symbol, bits, idx)
+                    } else {
+                        ((symbol >> idx) & 1) == 1
+                    };
                 }
                 tree.update_history(&history_bits[..bits]);
                 if *checkpoint_depth > 0 {
@@ -2480,6 +2743,7 @@ impl ExpertConfig {
                     base_depth,
                     num_percept_bits: encoding_bits,
                     encoding_bits,
+                    msb_first: None,
                 },
                 DEFAULT_MIN_PROB,
             ))
@@ -2565,7 +2829,7 @@ pub(crate) fn expert_configs_from_compiled_mixture(
     let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = backend.plan() else {
         return Err("compiled backend is not a mixture backend".to_string());
     };
-    Ok(experts
+    experts
         .iter()
         .map(|expert| {
             let compiled =
@@ -2577,7 +2841,7 @@ pub(crate) fn expert_configs_from_compiled_mixture(
                 compiled,
             ))
         })
-        .collect::<Result<Vec<_>, String>>()?)
+        .collect::<Result<Vec<_>, String>>()
 }
 
 #[cfg(feature = "backend-mixture")]
@@ -2720,6 +2984,7 @@ fn apply_fading_update_from_logps(
     log_evidence - log_prior_norm
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_switching_update_from_logps(
     experts: &mut [ExpertState],
     expert_logps: &[f64],
@@ -2733,11 +2998,14 @@ fn apply_switching_update_from_logps(
     let n = experts.len();
     scratch_joint.resize(n, 0.0);
     scratch_weights.resize(n, 0.0);
+    // Index form required for coordinated writes to two scratch vecs + experts.
+    #[allow(clippy::needless_range_loop)]
     for idx in 0..n {
         experts[idx].cum_log_loss -= expert_logps[idx];
         scratch_joint[idx] = experts[idx].log_weight + expert_logps[idx];
     }
     let log_mix = logsumexp(&scratch_joint[..n]);
+    #[allow(clippy::needless_range_loop)]
     for idx in 0..n {
         scratch_weights[idx] = (scratch_joint[idx] - log_mix).exp();
     }
@@ -2800,7 +3068,7 @@ fn mix_log_prob_convex(lambda: &[f64], logps: &[f64]) -> f64 {
 fn apply_convex_update_from_logps(
     experts: &mut [ExpertState],
     expert_logps: &[f64],
-    lambda: &mut Vec<f64>,
+    lambda: &mut [f64],
     projection_scratch: &mut Vec<f64>,
     schedule: MixtureScheduleMode,
     alpha: f64,
@@ -4129,6 +4397,10 @@ pub struct NeuralMixtureCheckpoint {
 
 #[derive(Clone)]
 #[doc(hidden)]
+// Mirrors `MixtureRuntime`: the neural checkpoint owns inline 256-way
+// probability caches, and boxing it would add allocation to normal checkpoint
+// capture/restore without reducing resident runtime state.
+#[allow(clippy::large_enum_variant)]
 pub enum MixtureRuntimeCheckpoint {
     Bayes(BayesMixtureCheckpoint),
     Fading(FadingBayesMixtureCheckpoint),
@@ -4511,6 +4783,17 @@ impl MixtureRuntime {
         }
     }
 
+    pub(crate) fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Fading(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Switching(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Convex(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Mdl(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Neural(m) => m.bitwise.abort_empty(&mut m.experts),
+        }
+    }
+
     pub(crate) fn native_msb_prefix_prob_one(&mut self, bit_idx: usize) -> Result<f64, String> {
         match self {
             MixtureRuntime::Bayes(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
@@ -4880,6 +5163,32 @@ mod tests {
         fn finish_native_msb_byte_prefix(&mut self, _symbol: u8) -> Result<(), String> {
             Ok(())
         }
+
+        // Dummy checkpoint methods so that MixtureBitPrefixState::begin succeeds
+        // for this mock (which advertises native MSB support). These are safe
+        // no-ops: the test mock performs no real mutation, and begin discards
+        // the captured checkpoints on the happy path after all experts prepare.
+        fn checkpoint_if_supported(&mut self) -> Option<OnlineBytePredictorCheckpoint> {
+            Some(OnlineBytePredictorCheckpoint::rate_backend(
+                RateBackendPredictorCheckpoint::Full(Box::new(RateBackendPredictor::Disabled {
+                    reason: "dummy_test_checkpoint".to_string(),
+                })),
+            ))
+        }
+
+        fn restore_checkpoint_if_supported(
+            &mut self,
+            _checkpoint: &OnlineBytePredictorCheckpoint,
+        ) -> bool {
+            true
+        }
+
+        fn discard_checkpoint_if_supported(
+            &mut self,
+            _checkpoint: OnlineBytePredictorCheckpoint,
+        ) -> bool {
+            true
+        }
     }
 
     #[derive(Clone)]
@@ -4906,7 +5215,7 @@ mod tests {
 
     #[test]
     fn mixture_bit_prefix_observe_without_prob_one_primes_current_bit() {
-        let configs = vec![
+        let configs = [
             ExpertConfig::uniform("high", || Box::new(NativeBitProbPredict { prob_one: 0.9 })),
             ExpertConfig::uniform("low", || Box::new(NativeBitProbPredict { prob_one: 0.1 })),
         ];
@@ -4917,24 +5226,36 @@ mod tests {
             "native prefix should activate when experts support native bit stepping"
         );
 
-        bitwise
-            .observe(&mut experts, 0, true)
-            .expect("observe without prior prob_one");
-        assert!(
-            (bitwise.likelihoods[0] - 0.9).abs() < 1e-12,
-            "high-prob expert likelihood should use freshly primed p1"
-        );
-        assert!(
-            (bitwise.likelihoods[1] - 0.1).abs() < 1e-12,
-            "low-prob expert likelihood should use freshly primed p1"
-        );
-        assert!(
-            bitwise.primed_bit_idx.is_none(),
-            "observe should clear priming for the next bit"
-        );
+        // Drive full 8-bit sequence (per MixtureBitPrefixState expected_bit_idx contract
+        // and finish_adaptive validation at 733) to exercise the "observe without prior
+        // prob_one" priming path on every step, then finish. This satisfies the state
+        // machine while preserving the original test intent (priming on observe-only
+        // updates + final log-likelihood distinction). Single-observe + immediate finish
+        // violated the sequential contract (now enforced post-mock fix).
+        let symbol: u8 = 0xFF; // all-1s so high-p1 (0.9) expert has higher final likelihood than low-p1 (0.1) after 8 steps (preserves original distinction intent)
+        for bit_idx in 0..8 {
+            let bit = (symbol & (1u8 << (7 - bit_idx))) != 0;
+            bitwise
+                .observe(&mut experts, bit_idx, bit)
+                .expect("observe without prior prob_one");
+            if bit_idx == 0 {
+                assert!(
+                    (bitwise.likelihoods[0] - 0.9).abs() < 1e-12,
+                    "high-prob expert likelihood should use freshly primed p1"
+                );
+                assert!(
+                    (bitwise.likelihoods[1] - 0.1).abs() < 1e-12,
+                    "low-prob expert likelihood should use freshly primed p1"
+                );
+                assert!(
+                    bitwise.primed_bit_idx.is_none(),
+                    "observe should clear priming for the next bit"
+                );
+            }
+        }
 
         bitwise
-            .finish_adaptive(&mut experts, 0b1000_0000)
+            .finish_adaptive(&mut experts, symbol)
             .expect("finish adaptive");
         assert!(
             bitwise.logps[0] > bitwise.logps[1],
@@ -4944,7 +5265,7 @@ mod tests {
 
     #[test]
     fn mixture_bit_prefix_requires_monotone_bit_indices() {
-        let configs = vec![ExpertConfig::ctw("left", 4), ExpertConfig::ctw("right", 5)];
+        let configs = [ExpertConfig::ctw("left", 4), ExpertConfig::ctw("right", 5)];
         let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
         let mut bitwise = MixtureBitPrefixState::default();
         assert!(bitwise.begin(&mut experts, &[0.5, 0.5]).expect("begin"));
@@ -4972,7 +5293,7 @@ mod tests {
     fn mixture_bit_prefix_skips_native_mode_without_checkpoint_support() {
         let begin_calls = Arc::new(AtomicUsize::new(0));
         let shared = Arc::clone(&begin_calls);
-        let configs = vec![ExpertConfig::uniform("native", move || {
+        let configs = [ExpertConfig::uniform("native", move || {
             Box::new(NativeWithoutCheckpointPredict {
                 begin_calls: Arc::clone(&shared),
             })
@@ -5559,6 +5880,7 @@ mod tests {
                 base_depth: 6,
                 num_percept_bits: 8,
                 encoding_bits: 8,
+                msb_first: None,
             },
         );
     }
@@ -5984,6 +6306,7 @@ mod tests {
                 base_depth: 7,
                 num_percept_bits: 6,
                 encoding_bits: 6,
+                msb_first: None,
             },
             b"fac-ctw checkpoint base history",
         );
@@ -6042,6 +6365,7 @@ mod tests {
             base_depth: 7,
             num_percept_bits: 8,
             encoding_bits: 8,
+            msb_first: None,
         });
     }
 
@@ -6309,5 +6633,14 @@ mod tests {
             direct.update(u8::from(bit));
             mixture.update(u8::from(bit));
         }
+    }
+
+    #[test]
+    fn rate_backend_predictor_checkpoint_enum_stays_compact() {
+        let checkpoint_size: usize = std::mem::size_of::<RateBackendPredictorCheckpoint>();
+        assert!(
+            checkpoint_size < 128,
+            "RateBackendPredictorCheckpoint must stay pointer-sized after boxing Full; got {checkpoint_size}B"
+        );
     }
 }

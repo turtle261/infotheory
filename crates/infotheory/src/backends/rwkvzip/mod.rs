@@ -438,7 +438,7 @@ impl OnlineRuntime {
         }
         let stride = train.hyper.stride.max(1) as u64;
         let next_train_step = self.policy_train_steps.saturating_add(1);
-        stride <= 1 || (next_train_step % stride) == 0
+        stride <= 1 || next_train_step.is_multiple_of(stride)
     }
 }
 

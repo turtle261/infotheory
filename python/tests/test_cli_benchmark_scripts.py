@@ -429,7 +429,7 @@ def test_compare_bench_two_json_explains_duplicate_summary_keys(
     assert proc.returncode != 0
     assert proc.stdout == ""
     assert "duplicate comparison row" in proc.stderr
-    assert "operation=h, subject=ctw, size_bytes=4096, compression_backend=-" in proc.stderr
+    assert "operation=h, subject=fac-ctw, size_bytes=4096, compression_backend=-" in proc.stderr
     assert "differing columns: cpu: 0 != 11" in proc.stderr
     assert "mix CPU affinities" in proc.stderr
 

@@ -12,6 +12,7 @@ use super::{
 };
 use crate::aixi::common::{
     MctsStrategy, bits_for_cardinality, byte_packed_percept_bits, resolve_random_seed,
+    validate_aiqi_byte_packed_alignment, validate_mc_aixi_byte_packed_alignment,
     warn_parallel_uct_workers_one_once,
 };
 use crate::spec::core::AssetRef;
@@ -63,6 +64,7 @@ fn compile_planner_controller(
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             Ok(CompiledPlannerController::AiqiWarmstartExactJh {
                 predictor: inner.predictor.validate_in(env)?.compile()?,
+                bit_stream_semantics: inner.bit_stream_semantics,
                 return_horizon: inner.return_horizon,
                 return_bins: inner.return_bins,
                 label_phase_period: inner.label_phase_period,
@@ -86,12 +88,10 @@ fn validate_mc_aixi_mcts_strategy(strategy: MctsStrategy) -> SpecResult<()> {
             if workers.get() == 1 {
                 warn_parallel_uct_workers_one_once();
             }
-            if let Some(m_max) = bu_uct_m_max {
-                if !(0.0 < m_max && m_max < 1.0) {
-                    return Err(SpecError::new(
-                        "controller.mcts_strategy.bu_uct_m_max must be in (0, 1)",
-                    ));
-                }
+            if bu_uct_m_max.is_some_and(|m_max| !(0.0 < m_max && m_max < 1.0)) {
+                return Err(SpecError::new(
+                    "controller.mcts_strategy.bu_uct_m_max must be in (0, 1)",
+                ));
             }
             Ok(())
         }
@@ -387,11 +387,8 @@ fn canonicalize_controller_spec(
                     interface.observation_stream_len,
                     interface.reward_bits,
                 );
-                if action_bits % 8 != 0 || percept_bits % 8 != 0 {
-                    return Err(SpecError::new(
-                        "BitStreamSemantics::BytePacked requires action and percept segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIXI interfaces",
-                    ));
-                }
+                validate_mc_aixi_byte_packed_alignment(action_bits, percept_bits)
+                    .map_err(SpecError::new)?;
             }
             let validated_predictor = inner.predictor.validate_in(env)?;
             let predictor = validated_predictor.canonical_spec().clone();
@@ -440,11 +437,8 @@ fn canonicalize_controller_spec(
                     interface.reward_bits,
                 );
                 let return_bits = crate::aixi::common::bits_for_cardinality(inner.return_bins);
-                if action_bits % 8 != 0 || return_bits % 8 != 0 || percept_bits % 8 != 0 {
-                    return Err(SpecError::new(
-                        "BitStreamSemantics::BytePacked requires action, return, and percept segments to end on byte boundaries; the percept segment combines observations and reward, so use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIQI interfaces",
-                    ));
-                }
+                validate_aiqi_byte_packed_alignment(action_bits, percept_bits, return_bits)
+                    .map_err(SpecError::new)?;
             }
             let validated_predictor = inner.predictor.validate_in(env)?;
             let predictor = validated_predictor.canonical_spec().clone();
@@ -481,11 +475,27 @@ fn canonicalize_controller_spec(
                     "label_phase_period must be >= return_horizon",
                 ));
             }
+            if matches!(
+                inner.bit_stream_semantics,
+                crate::api::BitStreamSemantics::BytePacked { .. }
+            ) && let Some(interface) = interface
+            {
+                let action_bits = interface.agent_actions.action_bits();
+                let percept_bits = byte_packed_percept_bits(
+                    interface.observation_bits,
+                    interface.observation_stream_len,
+                    interface.reward_bits,
+                );
+                let return_bits = crate::aixi::common::bits_for_cardinality(inner.return_bins);
+                validate_aiqi_byte_packed_alignment(action_bits, percept_bits, return_bits)
+                    .map_err(SpecError::new)?;
+            }
             let validated_predictor = inner.predictor.validate_in(env)?;
             let predictor = validated_predictor.canonical_spec().clone();
             Ok(ControllerSpec::AiqiWarmstartExactJh(
                 super::WarmStartExactJhControllerSpec {
                     predictor,
+                    bit_stream_semantics: inner.bit_stream_semantics,
                     return_horizon: inner.return_horizon,
                     return_bins: inner.return_bins,
                     label_phase_period: inner.label_phase_period,
@@ -979,6 +989,7 @@ mod tests {
         let warmstart = canonicalize_controller_spec(
             &ControllerSpec::AiqiWarmstartExactJh(super::super::WarmStartExactJhControllerSpec {
                 predictor: RateBackend::Ctw { depth: 4 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
                 return_horizon: 2,
                 return_bins: 8,
                 label_phase_period: 3,

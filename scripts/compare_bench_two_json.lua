@@ -6,7 +6,7 @@ local function die(msg)
 end
 
 local CORE_OPERATIONS  = { h = true, compress = true, decompress = true }
-local CORE_SUBJECTS    = { ppmd = true, ctw = true, rosa = true, rwkv7 = true, neural_mixture = true }
+local CORE_SUBJECTS    = { ppmd = true, ["fac-ctw"] = true, rosa = true, rwkv7 = true, neural_mixture = true }
 local CORE_SIZES       = { ["1048576"] = true, ["4194304"] = true, ["10000000"] = true }
 
 local REQUIRED_COLUMNS = {
@@ -57,6 +57,9 @@ local EPS = 1e-12
 local function canonicalize_subject(subject)
 	if subject == "rwkv" then
 		return "rwkv7"
+	end
+	if subject == "ctw" then
+		return "fac-ctw"
 	end
 	return subject
 end

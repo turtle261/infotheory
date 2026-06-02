@@ -53,6 +53,10 @@ pub struct RateBackendSession {
 /// through the backend's native binary-token application or, for byte-native
 /// backends, by adapting the predictor to the literal byte symbols `0` and `1`
 /// and renormalizing those two choices.
+///
+/// The complete checkpoint/restore contract is available in both Rust and
+/// Python (`infotheory_rs.RateBackendBitSession` with
+/// `RateBackendBitSessionCheckpoint`).
 #[derive(Clone)]
 pub struct RateBackendBitSession {
     backend_code: CanonicalBytes,
@@ -67,6 +71,8 @@ pub struct RateBackendBitSession {
 /// Checkpoints capture the underlying rate predictor plus any in-flight
 /// byte-prefix state, so they are valid even between byte-packed bits before a
 /// full byte has been committed to the backend.
+///
+/// (Python exposes this as `infotheory_rs.RateBackendBitSessionCheckpoint`.)
 #[derive(Clone)]
 pub struct RateBackendBitSessionCheckpoint {
     backend_code: CanonicalBytes,
@@ -97,10 +103,18 @@ struct BufferedBytePrefix {
 }
 
 #[derive(Clone)]
+// `BytePrefixMass` is the resident prefix tree for the byte-packed path and is
+// intentionally inline. Native-MSB start checkpoints are boxed below so the
+// small native state does not inline a full predictor checkpoint.
+#[allow(clippy::large_enum_variant)]
 enum BufferedBytePrefixKind {
     Mass(BytePrefixMass),
     NativeMsb {
-        restore_for_frozen: Option<RateBackendPredictorCheckpoint>,
+        // Boxed so partial-byte abort/replay stores a checkpoint out-of-line;
+        // the checkpoint enum itself is pointer-sized (Full holds
+        // Box<RateBackendPredictor>). Allocation is paid only when a native-MSB
+        // prefix needs rollback across lifecycle reset or frozen byte replay.
+        start_checkpoint: Option<Box<RateBackendPredictorCheckpoint>>,
         symbol: u8,
         bits: usize,
     },
@@ -114,10 +128,10 @@ impl BufferedBytePrefix {
         }
     }
 
-    fn new_native_msb(restore_for_frozen: Option<RateBackendPredictorCheckpoint>) -> Self {
+    fn new_native_msb(start_checkpoint: Option<RateBackendPredictorCheckpoint>) -> Self {
         Self {
             kind: BufferedBytePrefixKind::NativeMsb {
-                restore_for_frozen,
+                start_checkpoint: start_checkpoint.map(Box::new),
                 symbol: 0,
                 bits: 0,
             },
@@ -171,16 +185,136 @@ fn total_symbols_for_bit_semantics(
 }
 
 impl RateBackendBitSession {
-    fn discard_inflight_prefix_checkpoint(&mut self) {
+    fn observed_native_prefix_bit(symbol: u8, bit_idx: usize) -> bool {
+        (symbol & (1u8 << (7 - bit_idx))) != 0
+    }
+
+    /// Restore to `start`, abort empty native MSB prefix, then unconditionally discard `start`.
+    ///
+    /// Discard only adjusts journal depth; predictor state is already at `start` after restore.
+    fn restore_start_checkpoint_abort_and_discard(
+        &mut self,
+        start: RateBackendPredictorCheckpoint,
+    ) -> Result<bool, String> {
+        self.predictor.restore_checkpoint(&start);
+        let abort_res = self.predictor.abort_empty_native_msb_byte_prefix();
+        self.predictor.discard_checkpoint(start);
+        abort_res
+    }
+
+    fn release_inflight_prefix_checkpoint_for_restore(&mut self) {
         let Some(prefix) = self.prefix.take() else {
             return;
         };
         if let BufferedBytePrefixKind::NativeMsb {
-            restore_for_frozen: Some(checkpoint),
+            start_checkpoint: Some(checkpoint),
             ..
         } = prefix.kind
         {
-            self.predictor.discard_checkpoint(checkpoint);
+            self.predictor.discard_checkpoint(*checkpoint);
+        }
+    }
+
+    fn discard_inflight_prefix_checkpoint(&mut self) {
+        let Some(prefix) = self.prefix.take() else {
+            return;
+        };
+        match prefix.kind {
+            BufferedBytePrefixKind::Mass(_) => {}
+            BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: Some(checkpoint),
+                ..
+            } => {
+                self.restore_start_checkpoint_abort_and_discard(*checkpoint)
+                    .expect("native MSB prefix start checkpoint must be empty");
+            }
+            BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: None,
+                bits,
+                ..
+            } => {
+                if bits == 0 {
+                    self.predictor
+                        .abort_empty_native_msb_byte_prefix()
+                        .expect("empty native MSB prefix abort must succeed");
+                } else {
+                    panic!(
+                        "discarding an adaptive native MSB byte-prefix with observed bits; \
+                         missing prefix start checkpoint"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Make clearing checkpoint journals preserve the byte-prefix invariant:
+    /// `NativeMsb` session state exists only while the predictor has an active
+    /// native MSB prefix. Partial native prefixes are downgraded to the generic
+    /// mass prefix before clearing so their rollback checkpoint can be released.
+    fn normalize_prefix_for_checkpoint_clear(&mut self) -> InfotheoryResult<bool> {
+        let Some(prefix) = self.prefix.take() else {
+            return Ok(true);
+        };
+        let update_mode = prefix.update_mode;
+        match prefix.kind {
+            BufferedBytePrefixKind::Mass(mass) => {
+                self.prefix = Some(BufferedBytePrefix {
+                    kind: BufferedBytePrefixKind::Mass(mass),
+                    update_mode,
+                });
+                Ok(true)
+            }
+            BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: None,
+                bits: 0,
+                ..
+            } => {
+                self.predictor
+                    .abort_empty_native_msb_byte_prefix()
+                    .map_err(InfotheoryError::runtime)?;
+                Ok(true)
+            }
+            BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: Some(checkpoint),
+                symbol,
+                bits,
+            } => {
+                let checkpoint = *checkpoint;
+                self.restore_start_checkpoint_abort_and_discard(checkpoint)
+                    .map_err(InfotheoryError::runtime)?;
+
+                if bits == 0 {
+                    return Ok(true);
+                }
+
+                let mut logps = [0.0f64; 256];
+                self.predictor.fill_log_probs(&mut logps);
+
+                let mut mass = BytePrefixMass::from_log_probs(&logps, BitOrder::MsbFirst);
+                for bit_idx in 0..bits {
+                    mass.observe(Self::observed_native_prefix_bit(symbol, bit_idx));
+                }
+                self.prefix = Some(BufferedBytePrefix {
+                    kind: BufferedBytePrefixKind::Mass(mass),
+                    update_mode,
+                });
+                Ok(true)
+            }
+            BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: None,
+                symbol,
+                bits,
+            } => {
+                self.prefix = Some(BufferedBytePrefix {
+                    kind: BufferedBytePrefixKind::NativeMsb {
+                        start_checkpoint: None,
+                        symbol,
+                        bits,
+                    },
+                    update_mode,
+                });
+                Ok(false)
+            }
         }
     }
 
@@ -271,12 +405,12 @@ impl RateBackendBitSession {
                     && order == BitOrder::MsbFirst
                     && self.predictor.has_native_msb_byte_prefix()
                 {
-                    match self.predictor.begin_native_msb_byte_prefix() {
-                        Ok(true) => {
-                            self.prefix = Some(BufferedBytePrefix::new_native_msb(None));
-                        }
-                        Ok(false) | Err(_) => {}
-                    }
+                    self.try_begin_native_msb_prefix(None).unwrap_or_else(|err| {
+                        panic!(
+                            "RateBackendPredictor failed to begin native MSB byte-prefix: {err} \
+                             (contract violation; BytePrefixMass fallback is not safe on Err)"
+                        )
+                    });
                 }
                 self.ensure_mass_prefix(order);
                 let native_bits = match &self.prefix.as_ref().expect("prefix initialized").kind {
@@ -286,7 +420,11 @@ impl RateBackendBitSession {
                 let p1 = self
                     .predictor
                     .native_msb_prefix_prob_one(native_bits)
-                    .unwrap_or(0.5);
+                    .expect(
+                        "native_msb_prefix_prob_one failed or returned error for active NativeMsb \
+                         prefix (RateBackendBitSession invariant; predictors must uphold finite \
+                         contract or report via Result consistently)",
+                    );
                 BinaryPrediction::from_prob_one(p1, self.min_prob)
             }
         }
@@ -321,52 +459,65 @@ impl RateBackendBitSession {
                 "RateBackendBitSession checkpoint belongs to a different backend or bit semantics",
             ));
         }
-        self.discard_inflight_prefix_checkpoint();
+        self.release_inflight_prefix_checkpoint_for_restore();
+        self.predictor.restore_checkpoint(&checkpoint.predictor);
         let mut restored_prefix = checkpoint.prefix.clone();
         if let Some(BufferedBytePrefix {
             kind:
                 BufferedBytePrefixKind::NativeMsb {
-                    restore_for_frozen: Some(start_checkpoint),
+                    start_checkpoint: Some(start_checkpoint),
                     symbol,
                     bits,
                 },
             ..
         }) = checkpoint.prefix.as_ref()
         {
-            self.predictor.restore_checkpoint(start_checkpoint);
+            let restored_state = self.predictor.checkpoint();
+            self.predictor.restore_checkpoint(start_checkpoint.as_ref());
+            let abort_res = self.predictor.abort_empty_native_msb_byte_prefix();
+            if let Err(err) = abort_res {
+                self.predictor.restore_checkpoint(&restored_state);
+                self.predictor.discard_checkpoint(restored_state);
+                return Err(InfotheoryError::runtime(err));
+            }
             let fresh_start = self.predictor.checkpoint();
             match self.predictor.begin_native_msb_byte_prefix() {
                 Ok(true) => {}
                 Ok(false) => {
                     self.predictor.discard_checkpoint(fresh_start);
+                    self.predictor.restore_checkpoint(&restored_state);
+                    self.predictor.discard_checkpoint(restored_state);
                     return Err(InfotheoryError::runtime(
                         "stored checkpoint requires native MSB-first byte-prefix support during restore",
                     ));
                 }
                 Err(err) => {
                     self.predictor.discard_checkpoint(fresh_start);
+                    self.predictor.restore_checkpoint(&restored_state);
+                    self.predictor.discard_checkpoint(restored_state);
                     return Err(InfotheoryError::runtime(err));
                 }
             }
             for bit_idx in 0..*bits {
-                let bit = (*symbol & (1u8 << (7 - bit_idx))) != 0;
+                let bit = Self::observed_native_prefix_bit(*symbol, bit_idx);
                 if let Err(err) = self.predictor.observe_native_msb_prefix_bit(bit_idx, bit) {
-                    self.predictor.restore_checkpoint(&fresh_start);
+                    self.predictor.restore_checkpoint(&restored_state);
                     self.predictor.discard_checkpoint(fresh_start);
+                    self.predictor.discard_checkpoint(restored_state);
                     return Err(InfotheoryError::runtime(err));
                 }
             }
+            self.predictor.discard_checkpoint(restored_state);
             if let Some(prefix) = restored_prefix.as_mut()
                 && let BufferedBytePrefixKind::NativeMsb {
-                    restore_for_frozen, ..
+                    start_checkpoint, ..
                 } = &mut prefix.kind
             {
-                *restore_for_frozen = Some(fresh_start);
+                *start_checkpoint = Some(Box::new(fresh_start));
             }
             self.prefix = restored_prefix;
             return Ok(());
         }
-        self.predictor.restore_checkpoint(&checkpoint.predictor);
         self.prefix = restored_prefix;
         Ok(())
     }
@@ -375,9 +526,16 @@ impl RateBackendBitSession {
     ///
     /// This is an optimization hint for backends with journaled checkpoints.
     /// Calling it while a checkpoint may still be restored violates the
-    /// checkpoint contract.
+    /// checkpoint contract. Byte-packed sessions preserve the invariant between
+    /// buffered prefix state and predictor-native prefix state before clearing.
     pub fn clear_checkpoints_if_supported(&mut self) {
-        self.predictor.clear_checkpoints_if_supported();
+        match self.normalize_prefix_for_checkpoint_clear() {
+            Ok(true) => self.predictor.clear_checkpoints_if_supported(),
+            Ok(false) => {}
+            Err(err) => {
+                panic!("failed to normalize native byte-prefix before checkpoint clear: {err}")
+            }
+        }
     }
 
     /// Predict and then observe one adaptive/fitting bit.
@@ -475,26 +633,43 @@ impl RateBackendBitSession {
             } else {
                 None
             };
-            match self.predictor.begin_native_msb_byte_prefix() {
-                Ok(true) => {
-                    self.prefix = Some(BufferedBytePrefix::new_native_msb(checkpoint));
-                    return Ok(());
-                }
-                Ok(false) => {
-                    if let Some(checkpoint) = checkpoint {
-                        self.predictor.discard_checkpoint(checkpoint);
-                    }
-                }
-                Err(err) => {
-                    if let Some(checkpoint) = checkpoint {
-                        self.predictor.discard_checkpoint(checkpoint);
-                    }
-                    return Err(InfotheoryError::runtime(err));
-                }
+            match self.try_begin_native_msb_prefix(checkpoint) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(err) => return Err(InfotheoryError::runtime(err)),
             }
         }
         self.ensure_mass_prefix(order);
         Ok(())
+    }
+
+    /// Try to enter native MSB byte-prefix mode for byte-packed sessions.
+    ///
+    /// - `Ok(true)`: native prefix active (`self.prefix` set)
+    /// - `Ok(false)`: caller should use [`Self::ensure_mass_prefix`] (predictor unchanged)
+    /// - `Err`: predictor state-machine failure; caller must not silently fall back
+    fn try_begin_native_msb_prefix(
+        &mut self,
+        start_checkpoint: Option<RateBackendPredictorCheckpoint>,
+    ) -> Result<bool, String> {
+        match self.predictor.begin_native_msb_byte_prefix() {
+            Ok(true) => {
+                self.prefix = Some(BufferedBytePrefix::new_native_msb(start_checkpoint));
+                Ok(true)
+            }
+            Ok(false) => {
+                if let Some(checkpoint) = start_checkpoint {
+                    self.predictor.discard_checkpoint(checkpoint);
+                }
+                Ok(false)
+            }
+            Err(err) => {
+                if let Some(checkpoint) = start_checkpoint {
+                    self.predictor.discard_checkpoint(checkpoint);
+                }
+                Err(err)
+            }
+        }
     }
 
     fn ensure_mass_prefix(&mut self, order: BitOrder) {
@@ -530,15 +705,12 @@ impl RateBackendBitSession {
                 }
             }
             BufferedBytePrefixKind::NativeMsb {
-                restore_for_frozen,
+                start_checkpoint,
                 symbol,
                 bits,
             } => {
-                if update_mode == BufferedByteUpdateMode::Frozen
-                    && restore_for_frozen.is_none()
-                    && *bits == 0
-                {
-                    *restore_for_frozen = Some(self.predictor.checkpoint());
+                if start_checkpoint.is_none() && *bits == 0 {
+                    *start_checkpoint = Some(Box::new(self.predictor.checkpoint()));
                 }
                 self.predictor
                     .observe_native_msb_prefix_bit(*bits, bit)
@@ -550,18 +722,22 @@ impl RateBackendBitSession {
                 if *bits == 8 {
                     let completed_symbol = *symbol;
                     if update_mode == BufferedByteUpdateMode::Frozen {
-                        let checkpoint = restore_for_frozen.take().ok_or_else(|| {
+                        let checkpoint_box = start_checkpoint.take().ok_or_else(|| {
                             InfotheoryError::runtime(
                                 "native byte-prefix frozen update is missing its start checkpoint",
                             )
                         })?;
-                        self.predictor.restore_checkpoint(&checkpoint);
-                        self.predictor.discard_checkpoint(checkpoint);
+                        let checkpoint = *checkpoint_box;
+                        self.restore_start_checkpoint_abort_and_discard(checkpoint)
+                            .map_err(InfotheoryError::runtime)?;
                         self.predictor.update_frozen(completed_symbol);
                     } else {
                         self.predictor
                             .finish_native_msb_byte_prefix(completed_symbol)
                             .map_err(InfotheoryError::runtime)?;
+                        if let Some(checkpoint) = start_checkpoint.take() {
+                            self.predictor.discard_checkpoint(*checkpoint);
+                        }
                     }
                     self.prefix = None;
                 }
@@ -954,6 +1130,10 @@ impl InfotheoryCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Re-exported for trait methods (begin_bit_stream etc.) exercised in
+    // feature-specific tests. Some narrow backend slices do not use the trait
+    // directly, but broader bit-session test slices do.
+    #[allow(unused_imports)]
     use crate::prediction::OnlineBitPredictor;
 
     #[cfg(feature = "backend-ctw")]
@@ -962,7 +1142,33 @@ mod tests {
             crate::mixture::RateBackendPredictor::Ctw {
                 checkpoint_depth, ..
             } => *checkpoint_depth,
+            crate::mixture::RateBackendPredictor::FacCtw {
+                checkpoint_depth, ..
+            } => *checkpoint_depth,
             _ => panic!("expected ctw predictor"),
+        }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    fn ctw_native_prefix_progress(session: &RateBackendBitSession) -> Option<usize> {
+        match &session.predictor {
+            crate::mixture::RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            }
+            | crate::mixture::RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => *native_prefix_progress,
+            _ => panic!("expected ctw predictor"),
+        }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    fn buffered_native_prefix_bits(session: &RateBackendBitSession) -> Option<usize> {
+        match session.prefix.as_ref().map(|prefix| &prefix.kind) {
+            Some(BufferedBytePrefixKind::NativeMsb { bits, .. }) => Some(*bits),
+            _ => None,
         }
     }
 
@@ -976,6 +1182,46 @@ mod tests {
             },
         )
         .expect("ctw byte-packed session")
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    fn new_fac_ctw_byte_packed_session() -> RateBackendBitSession {
+        RateBackendBitSession::from_spec(
+            RateBackend::FacCtw {
+                base_depth: 4,
+                num_percept_bits: 8,
+                encoding_bits: 8,
+                msb_first: None,
+            },
+            Some(8),
+            BitStreamSemantics::BytePacked {
+                order: BitOrder::MsbFirst,
+            },
+        )
+        .expect("fac-ctw byte-packed session")
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn frozen_native_byte_completion_releases_start_checkpoint() {
+        for mut session in [
+            new_ctw_byte_packed_session(),
+            new_fac_ctw_byte_packed_session(),
+        ] {
+            for bit in [true, false, true, false, false, true, true, false] {
+                session
+                    .try_condition_bit(bit)
+                    .expect("condition full frozen native byte");
+            }
+            assert!(session.prefix.is_none());
+            assert_eq!(ctw_checkpoint_depth(&session), 0);
+            assert_eq!(ctw_native_prefix_progress(&session), None);
+
+            let pred = session.predict_bit();
+            assert!(pred.p0.is_finite() && pred.p1.is_finite());
+            assert_eq!(buffered_native_prefix_bits(&session), Some(0));
+            assert_eq!(ctw_native_prefix_progress(&session), Some(0));
+        }
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -1005,6 +1251,135 @@ mod tests {
             )
             .expect("begin bit stream");
         assert_eq!(ctw_checkpoint_depth(&session), 0);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn clear_checkpoints_after_empty_native_restore_drops_prefix_cleanly() {
+        for mut session in [
+            new_ctw_byte_packed_session(),
+            new_fac_ctw_byte_packed_session(),
+        ] {
+            let _ = session.predict_bit();
+            let checkpoint = session.checkpoint();
+            session
+                .try_condition_bit(true)
+                .expect("conditioning bit after checkpoint");
+
+            session
+                .restore_checkpoint(&checkpoint)
+                .expect("restore empty native prefix checkpoint");
+            assert_eq!(buffered_native_prefix_bits(&session), Some(0));
+            assert_eq!(ctw_native_prefix_progress(&session), Some(0));
+
+            session.clear_checkpoints_if_supported();
+            assert!(session.prefix.is_none());
+            assert_eq!(ctw_checkpoint_depth(&session), 0);
+            assert_eq!(ctw_native_prefix_progress(&session), None);
+
+            let pred = session.predict_bit();
+            assert!(pred.p0.is_finite() && pred.p1.is_finite());
+            assert_eq!(buffered_native_prefix_bits(&session), Some(0));
+            assert_eq!(ctw_native_prefix_progress(&session), Some(0));
+        }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn clear_checkpoints_converts_partial_native_prefix_to_mass() {
+        for mut session in [
+            new_ctw_byte_packed_session(),
+            new_fac_ctw_byte_packed_session(),
+        ] {
+            session.try_condition_bit(true).expect("first prefix bit");
+            session.try_condition_bit(false).expect("second prefix bit");
+            assert_eq!(buffered_native_prefix_bits(&session), Some(2));
+            assert_eq!(ctw_native_prefix_progress(&session), Some(2));
+
+            let before_clear = session.predict_bit();
+            session.clear_checkpoints_if_supported();
+
+            assert!(matches!(
+                session.prefix.as_ref().map(|prefix| &prefix.kind),
+                Some(BufferedBytePrefixKind::Mass(_))
+            ));
+            assert_eq!(ctw_checkpoint_depth(&session), 0);
+            assert_eq!(ctw_native_prefix_progress(&session), None);
+
+            let after_clear = session.predict_bit();
+            assert!(
+                (before_clear.p1 - after_clear.p1).abs() <= 1e-12,
+                "native-to-mass conversion changed prefix prediction: before={} after={}",
+                before_clear.p1,
+                after_clear.p1
+            );
+
+            for bit in [true, false, true, false, true, false] {
+                session
+                    .try_condition_bit(bit)
+                    .expect("finish converted mass prefix");
+            }
+            session
+                .finish()
+                .expect("finish whole byte after conversion");
+        }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn reset_frozen_rolls_back_adaptive_partial_native_prefix() {
+        for mut session in [
+            new_ctw_byte_packed_session(),
+            new_fac_ctw_byte_packed_session(),
+        ] {
+            session.try_observe_bit(true).expect("adaptive prefix bit");
+            assert_eq!(ctw_checkpoint_depth(&session), 1);
+            assert_eq!(ctw_native_prefix_progress(&session), Some(1));
+
+            session.reset_frozen(Some(8)).expect("reset frozen");
+
+            assert_eq!(ctw_checkpoint_depth(&session), 0);
+            assert_eq!(ctw_native_prefix_progress(&session), None);
+            let mut fresh = match &session.predictor {
+                crate::mixture::RateBackendPredictor::Ctw { .. } => new_ctw_byte_packed_session(),
+                crate::mixture::RateBackendPredictor::FacCtw { .. } => {
+                    new_fac_ctw_byte_packed_session()
+                }
+                _ => unreachable!("test only constructs CTW-family sessions"),
+            };
+            let reset_prediction = session.predict_bit();
+            let fresh_prediction = fresh.predict_bit();
+            assert!(
+                (reset_prediction.p1 - fresh_prediction.p1).abs() <= 1e-12,
+                "partial adaptive native prefix leaked into reset state: reset={} fresh={}",
+                reset_prediction.p1,
+                fresh_prediction.p1
+            );
+        }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn begin_bit_stream_rolls_back_adaptive_partial_native_prefix() {
+        let mut session = new_fac_ctw_byte_packed_session();
+        session.try_observe_bit(true).expect("adaptive prefix bit");
+        assert_eq!(ctw_checkpoint_depth(&session), 1);
+        assert_eq!(ctw_native_prefix_progress(&session), Some(1));
+
+        session
+            .begin_bit_stream(
+                Some(8),
+                BitStreamSemantics::BytePacked {
+                    order: BitOrder::MsbFirst,
+                },
+            )
+            .expect("begin bit stream");
+
+        assert_eq!(ctw_checkpoint_depth(&session), 0);
+        assert_eq!(ctw_native_prefix_progress(&session), None);
+        session
+            .try_observe_bit(false)
+            .expect("native prefix re-entry after adaptive abort");
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -1045,5 +1420,86 @@ mod tests {
                 .expect("finish restored byte");
         }
         assert_eq!(ctw_checkpoint_depth(&session), 1);
+    }
+
+    /// When static native MSB support is advertised but dynamic begin negotiation
+    /// returns `Ok(false)` (e.g. mixture expert lacks checkpoint rollback), `predict_bit`
+    /// must fall back to the BytePrefixMass path without debug-only false positives.
+    #[cfg(feature = "backend-mixture")]
+    #[test]
+    fn predict_bit_mass_fallback_when_native_begin_returns_false() {
+        use crate::mixture::{
+            BayesMixture, DEFAULT_MIN_PROB, ExpertConfig, MixtureRuntime, RateBackendPredictor,
+        };
+
+        #[derive(Clone)]
+        struct MockNativeNoCheckpoint;
+
+        impl OnlineBytePredictor for MockNativeNoCheckpoint {
+            fn log_prob(&mut self, _symbol: u8) -> f64 {
+                -(256.0f64).ln()
+            }
+
+            fn update(&mut self, _symbol: u8) {}
+
+            fn has_native_msb_byte_prefix(&self) -> bool {
+                true
+            }
+        }
+
+        let configs = [ExpertConfig::uniform("native", || {
+            Box::new(MockNativeNoCheckpoint) as Box<dyn OnlineBytePredictor>
+        })];
+        let runtime = MixtureRuntime::Bayes(BayesMixture::new(&configs));
+        let mut predictor = RateBackendPredictor::Mixture { runtime };
+        predictor.begin_stream(Some(1)).expect("begin_stream");
+
+        let mut session = RateBackendBitSession {
+            backend_code: CanonicalBytes::from(b"test-native-fallback".to_vec()),
+            predictor,
+            semantics: BitStreamSemantics::BytePacked {
+                order: BitOrder::MsbFirst,
+            },
+            min_prob: DEFAULT_MIN_PROB,
+            prefix: None,
+        };
+        let pred = session.predict_bit();
+        assert!(
+            (pred.p0 + pred.p1 - 1.0).abs() < 1e-9,
+            "mass fallback prediction must normalize: p0={} p1={}",
+            pred.p0,
+            pred.p1
+        );
+        assert!(pred.p1.is_finite());
+        assert!(matches!(
+            session.prefix.as_ref().map(|p| &p.kind),
+            Some(BufferedBytePrefixKind::Mass(_))
+        ));
+    }
+
+    /// Guards the byte-prefix buffering enum against accidentally embedding a
+    /// full predictor checkpoint inline in the native-MSB variant.
+    #[test]
+    fn record_buffered_byte_prefix_kind_and_related_sizes() {
+        let byte_prefix_mass = std::mem::size_of::<BytePrefixMass>();
+        let buffered_kind = std::mem::size_of::<BufferedBytePrefixKind>();
+        let rate_ckpt = std::mem::size_of::<RateBackendPredictorCheckpoint>();
+        let opt_rate_ckpt = std::mem::size_of::<Option<RateBackendPredictorCheckpoint>>();
+        eprintln!(
+            "BufferedBytePrefixKind sizes: \
+             BufferedBytePrefixKind={}B (Mass~{}B inline; NativeMsb Option<RateCheckpoint>~{}B; \
+             RateBackendPredictorCheckpoint enum={}B). start_checkpoint is boxed; Full variant \
+             is Box<RateBackendPredictor> so compact checkpoint variants stay small.",
+            buffered_kind, byte_prefix_mass, opt_rate_ckpt, rate_ckpt
+        );
+        // Native-MSB frozen rewinds need a predictor checkpoint, but that
+        // checkpoint may contain full model state. Keeping it boxed prevents the
+        // cheaper byte-packed mass path from inheriting that storage cost.
+        assert_eq!(
+            buffered_kind, byte_prefix_mass,
+            "post-box BufferedBytePrefixKind (NativeMsb) must not exceed Mass variant size ({} vs {}); \
+             native-MSB rewind checkpoints must stay out-of-line",
+            buffered_kind, byte_prefix_mass
+        );
     }
 }

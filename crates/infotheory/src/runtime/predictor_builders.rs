@@ -180,16 +180,19 @@ feature_gated_rate_predictor_builder! {
                 base_depth,
                 num_percept_bits: _,
                 encoding_bits,
+                msb_first,
             },
             "fac-ctw kernel used with non-fac-ctw plan"
         );
-        let bits_per_symbol = (*encoding_bits).clamp(1, 8);
+        let bits_per_symbol = *encoding_bits;
         Ok(crate::mixture::RateBackendPredictor::FacCtw {
             tree: FacContextTree::new(*base_depth, bits_per_symbol),
             bits_per_symbol,
+            msb_first: *msb_first,
             min_prob,
             checkpoint_journal: Vec::new(),
             checkpoint_depth: 0,
+            native_prefix_progress: None,
         })
     }
 }
@@ -205,9 +208,11 @@ feature_gated_rate_predictor_builder! {
         Ok(crate::mixture::RateBackendPredictor::FacCtw {
             tree: FacContextTree::new(*base_depth, 1),
             bits_per_symbol: 1,
+            msb_first: false,
             min_prob,
             checkpoint_journal: Vec::new(),
             checkpoint_depth: 0,
+            native_prefix_progress: None,
         })
     }
 }

@@ -38,6 +38,7 @@ fn make_experts() -> Vec<MixtureExpertSpec> {
             base_depth: 16,
             encoding_bits: 8,
             num_percept_bits: 8,
+            msb_first: None,
         })
         .with_name("fac"),
         MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: -1 }).with_name("rosa"),

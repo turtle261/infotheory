@@ -5,7 +5,7 @@ use infotheory::api::{
     CalibrationContextKind, CompiledCompressionBackend, CompiledRateBackend, CompressionBackend,
     GenerationConfig, GenerationStrategy, GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec,
     MixtureKind, MixtureScheduleMode, MixtureSpec, NcdVariant, OnlineBitPredictor, ParticleSpec,
-    RateBackend, RateBackendBitSession, RateBackendSession,
+    RateBackend, RateBackendBitSession, RateBackendBitSessionCheckpoint, RateBackendSession,
 };
 use infotheory::error::InfotheoryError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -757,13 +757,19 @@ impl PyRateBackend {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (base_depth=16, num_percept_bits=8, encoding_bits=8))]
-    fn fac_ctw(base_depth: usize, num_percept_bits: usize, encoding_bits: usize) -> Self {
+    #[pyo3(signature = (base_depth=16, num_percept_bits=8, encoding_bits=8, msb_first=None))]
+    fn fac_ctw(
+        base_depth: usize,
+        num_percept_bits: usize,
+        encoding_bits: usize,
+        msb_first: Option<bool>,
+    ) -> Self {
         Self {
             inner: RateBackend::FacCtw {
                 base_depth,
                 num_percept_bits,
                 encoding_bits,
+                msb_first,
             },
         }
     }
@@ -1664,6 +1670,13 @@ struct PyRateBackendBitSession {
     semantics: BitStreamSemantics,
 }
 
+/// Opaque checkpoint for exact `RateBackendBitSession` restoration.
+#[pyclass(name = "RateBackendBitSessionCheckpoint", from_py_object)]
+#[derive(Clone)]
+struct PyRateBackendBitSessionCheckpoint {
+    inner: Arc<Mutex<RateBackendBitSessionCheckpoint>>,
+}
+
 #[pymethods]
 impl PyRateBackendBitSession {
     #[new]
@@ -1697,6 +1710,23 @@ impl PyRateBackendBitSession {
 
     fn predict_one(&self) -> f64 {
         lock_recover(&self.inner).predict_one()
+    }
+
+    fn checkpoint(&self) -> PyRateBackendBitSessionCheckpoint {
+        PyRateBackendBitSessionCheckpoint {
+            inner: Arc::new(Mutex::new(lock_recover(&self.inner).checkpoint())),
+        }
+    }
+
+    fn restore_checkpoint(&self, checkpoint: &PyRateBackendBitSessionCheckpoint) -> PyResult<()> {
+        let checkpoint = lock_recover(&checkpoint.inner);
+        lock_recover(&self.inner)
+            .restore_checkpoint(&checkpoint)
+            .map_err(py_infotheory_error)
+    }
+
+    fn clear_checkpoints_if_supported(&self) {
+        lock_recover(&self.inner).clear_checkpoints_if_supported();
     }
 
     fn step_bit(&self, bit: bool) -> PyResult<PyBinaryPrediction> {
@@ -1744,6 +1774,13 @@ impl PyRateBackendBitSession {
         lock_recover(&self.inner)
             .finish()
             .map_err(py_infotheory_error)
+    }
+}
+
+#[pymethods]
+impl PyRateBackendBitSessionCheckpoint {
+    fn __repr__(&self) -> String {
+        "RateBackendBitSessionCheckpoint(...)".to_owned()
     }
 }
 
@@ -5042,6 +5079,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBinaryPrediction>()?;
     m.add_class::<PyBytePrefixMass>()?;
     m.add_class::<PyRateBackendBitSession>()?;
+    m.add_class::<PyRateBackendBitSessionCheckpoint>()?;
     m.add_class::<PyMixtureKind>()?;
     m.add_class::<PyMixtureScheduleMode>()?;
     m.add_class::<PyMixtureExpertSpec>()?;

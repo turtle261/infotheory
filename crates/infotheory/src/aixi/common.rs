@@ -117,10 +117,11 @@ pub enum ObservationKeyMode {
 /// The `#[non_exhaustive]` attribute reserves room for additional strategy
 /// variants (e.g. the supplementary BU-UCT scheduler) without breaking
 /// downstream `match` arms.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub enum MctsStrategy {
     /// Sequential \rhoUCT / UCT planning.
+    #[default]
     RhoUct,
     /// Explicit parallel UCT planning.
     ParallelUct {
@@ -141,12 +142,6 @@ impl MctsStrategy {
             Self::RhoUct => "rho_uct",
             Self::ParallelUct { .. } => "parallel_uct",
         }
-    }
-}
-
-impl Default for MctsStrategy {
-    fn default() -> Self {
-        Self::RhoUct
     }
 }
 
@@ -200,6 +195,42 @@ pub(crate) fn byte_packed_percept_bits(
     observation_bits
         .saturating_mul(observation_stream_len.max(1))
         .saturating_add(reward_bits)
+}
+
+/// User-facing error when [`crate::api::BitStreamSemantics::BytePacked`] segments are
+/// not byte-aligned for MC-AIXI planners.
+pub(crate) const MC_AIXI_BYTE_PACKED_ALIGNMENT_MSG: &str = "BitStreamSemantics::BytePacked requires action and percept segments to end on byte boundaries; use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIXI interfaces";
+
+/// User-facing error when [`crate::api::BitStreamSemantics::BytePacked`] segments are
+/// not byte-aligned for AIQI planners.
+pub(crate) const AIQI_BYTE_PACKED_ALIGNMENT_MSG: &str = "BitStreamSemantics::BytePacked requires action, return, and percept segments to end on byte boundaries; the percept segment combines observations and reward, so use BitStreamSemantics::BinaryTokens for arbitrary bit-width AIQI interfaces";
+
+/// Validate byte alignment required under `BitStreamSemantics::BytePacked` for MC-AIXI.
+pub(crate) fn validate_mc_aixi_byte_packed_alignment(
+    action_bits: usize,
+    percept_bits: usize,
+) -> Result<(), &'static str> {
+    if action_bits.is_multiple_of(8) && percept_bits.is_multiple_of(8) {
+        Ok(())
+    } else {
+        Err(MC_AIXI_BYTE_PACKED_ALIGNMENT_MSG)
+    }
+}
+
+/// Validate byte alignment required under `BitStreamSemantics::BytePacked` for AIQI.
+pub(crate) fn validate_aiqi_byte_packed_alignment(
+    action_bits: usize,
+    percept_bits: usize,
+    return_bits: usize,
+) -> Result<(), &'static str> {
+    if action_bits.is_multiple_of(8)
+        && return_bits.is_multiple_of(8)
+        && percept_bits.is_multiple_of(8)
+    {
+        Ok(())
+    } else {
+        Err(AIQI_BYTE_PACKED_ALIGNMENT_MSG)
+    }
 }
 
 #[cfg(feature = "aixi")]

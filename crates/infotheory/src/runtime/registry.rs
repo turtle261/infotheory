@@ -22,14 +22,11 @@ fn backend_descriptor_by_kind<K: Copy + Eq>(
     registry.iter().find(|descriptor| descriptor.kind == kind)
 }
 
-pub(crate) fn backend_descriptor_by_kind_checked<K: Copy + Eq>(
+pub(crate) fn backend_descriptor_by_kind_checked<K: Copy + Eq + std::fmt::Debug>(
     registry: &'static [BackendDescriptor<K>],
     kind: K,
     registry_name: &'static str,
-) -> Result<&'static BackendDescriptor<K>, String>
-where
-    K: std::fmt::Debug,
-{
+) -> Result<&'static BackendDescriptor<K>, String> {
     backend_descriptor_by_kind(registry, kind).ok_or_else(|| {
         format!(
             "internal backend registry mismatch: backend '{kind:?}' is missing from {registry_name}"

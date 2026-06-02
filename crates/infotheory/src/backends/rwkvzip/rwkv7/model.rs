@@ -2415,7 +2415,7 @@ impl Model {
         Ok(())
     }
 
-    #[allow(clippy::needless_range_loop)]
+    #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
     fn accumulate_token_step_gradients(
         &self,
         scratch: &mut ScratchBuffers,

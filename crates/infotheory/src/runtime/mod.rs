@@ -1142,7 +1142,7 @@ fn with_ctw_backend_plan<T>(
 /// Execute `f` with FAC-CTW `(base_depth, encoding_bits)` from a compiled backend.
 fn with_fac_ctw_backend_plan<T>(
     backend: &CompiledRateBackend,
-    f: impl FnOnce(usize, usize) -> InfotheoryResult<T>,
+    f: impl FnOnce(usize, usize, bool) -> InfotheoryResult<T>,
 ) -> InfotheoryResult<T> {
     expect_plan_ref!(
         backend.plan(),
@@ -1150,10 +1150,11 @@ fn with_fac_ctw_backend_plan<T>(
             base_depth,
             num_percept_bits: _,
             encoding_bits,
+            msb_first,
         },
         "fac-ctw kernel used with non-fac-ctw plan"
     );
-    f(*base_depth, *encoding_bits)
+    f(*base_depth, *encoding_bits, *msb_first)
 }
 
 /// Execute `f` with the ZPAQ compression method from a compiled compression backend.
@@ -1449,8 +1450,8 @@ fn conditional_chain_ctw(
 
 #[cfg(feature = "backend-ctw")]
 fn entropy_fac_ctw(data: &[u8], backend: &CompiledRateBackend) -> InfotheoryResult<f64> {
-    with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits| {
-        fac_ctw_entropy_rate_bits(base_depth, encoding_bits, data)
+    with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits, msb_first| {
+        fac_ctw_entropy_rate_bits(base_depth, encoding_bits, msb_first, data)
     })
 }
 
@@ -1460,8 +1461,8 @@ fn joint_entropy_fac_ctw(
     y: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits| {
-        fac_ctw_joint_entropy_rate_bits(base_depth, encoding_bits, x, y)
+    with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits, msb_first| {
+        fac_ctw_joint_entropy_rate_bits(base_depth, encoding_bits, msb_first, x, y)
     })
 }
 
@@ -1471,8 +1472,14 @@ fn conditional_chain_fac_ctw(
     data: &[u8],
     backend: &CompiledRateBackend,
 ) -> InfotheoryResult<f64> {
-    with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits| {
-        fac_ctw_conditional_chain_rate_bits(base_depth, encoding_bits, prefix_parts, data)
+    with_fac_ctw_backend_plan(backend, |base_depth, encoding_bits, msb_first| {
+        fac_ctw_conditional_chain_rate_bits(
+            base_depth,
+            encoding_bits,
+            msb_first,
+            prefix_parts,
+            data,
+        )
     })
 }
 
@@ -2016,16 +2023,21 @@ fn ctw_entropy_rate_bits(depth: usize, data: &[u8]) -> InfotheoryResult<f64> {
 fn fac_ctw_entropy_rate_bits(
     base_depth: usize,
     encoding_bits: usize,
+    msb_first: bool,
     data: &[u8],
 ) -> InfotheoryResult<f64> {
     if data.is_empty() {
         return Ok(0.0);
     }
-    let bits_per_byte = encoding_bits.clamp(1, 8);
+    let bits_per_byte = encoding_bits;
     let mut fac = FacContextTree::new(base_depth, bits_per_byte);
     fac.reserve_for_symbols(data.len());
     for &byte in data {
-        fac.update_byte_lsb(byte);
+        if msb_first {
+            fac.update_byte_msb(byte);
+        } else {
+            fac.update_byte_lsb(byte);
+        }
     }
     let ln_p = fac.get_log_block_probability();
     Ok((-ln_p / std::f64::consts::LN_2) / (data.len() as f64))
@@ -2046,17 +2058,28 @@ fn ctw_joint_entropy_rate_bits(depth: usize, x: &[u8], y: &[u8]) -> InfotheoryRe
 fn fac_ctw_joint_entropy_rate_bits(
     base_depth: usize,
     encoding_bits: usize,
+    msb_first: bool,
     x: &[u8],
     y: &[u8],
 ) -> InfotheoryResult<f64> {
-    let bits_per_byte = encoding_bits.clamp(1, 8);
+    let bits_per_byte = encoding_bits;
     let mut fac = FacContextTree::new(base_depth, bits_per_byte * 2);
     for (&xb, &yb) in x.iter().zip(y.iter()) {
         for idx in 0..bits_per_byte {
             let bit_idx_x = idx * 2;
             let bit_idx_y = bit_idx_x + 1;
-            fac.update(((xb >> idx) & 1) == 1, bit_idx_x);
-            fac.update(((yb >> idx) & 1) == 1, bit_idx_y);
+            let x_bit = if msb_first {
+                ctw_symbol_bit_msb(xb, bits_per_byte, idx)
+            } else {
+                ((xb >> idx) & 1) == 1
+            };
+            let y_bit = if msb_first {
+                ctw_symbol_bit_msb(yb, bits_per_byte, idx)
+            } else {
+                ((yb >> idx) & 1) == 1
+            };
+            fac.update(x_bit, bit_idx_x);
+            fac.update(y_bit, bit_idx_y);
         }
     }
     let ln_p = fac.get_log_block_probability();
@@ -2091,25 +2114,36 @@ fn ctw_conditional_chain_rate_bits(
 fn fac_ctw_conditional_chain_rate_bits(
     base_depth: usize,
     encoding_bits: usize,
+    msb_first: bool,
     prefix_parts: &[&[u8]],
     data: &[u8],
 ) -> InfotheoryResult<f64> {
     if data.is_empty() {
         return Ok(0.0);
     }
-    let bits_per_byte = encoding_bits.clamp(1, 8);
+    let bits_per_byte = encoding_bits;
     let mut fac = FacContextTree::new(base_depth, bits_per_byte);
     for &part in prefix_parts {
         for &byte in part {
             for idx in 0..bits_per_byte {
-                fac.update(((byte >> idx) & 1) == 1, idx);
+                let bit = if msb_first {
+                    ctw_symbol_bit_msb(byte, bits_per_byte, idx)
+                } else {
+                    ((byte >> idx) & 1) == 1
+                };
+                fac.update(bit, idx);
             }
         }
     }
     let log_p_prefix = fac.get_log_block_probability();
     for &byte in data {
         for idx in 0..bits_per_byte {
-            fac.update(((byte >> idx) & 1) == 1, idx);
+            let bit = if msb_first {
+                ctw_symbol_bit_msb(byte, bits_per_byte, idx)
+            } else {
+                ((byte >> idx) & 1) == 1
+            };
+            fac.update(bit, idx);
         }
     }
     let log_p_joint = fac.get_log_block_probability();
@@ -2661,6 +2695,7 @@ mod tests {
             base_depth: 5,
             num_percept_bits: 8,
             encoding_bits: 8,
+            msb_first: None,
         });
 
         let ctw_entropy = entropy_ctw(b"abracadabra", &ctw).expect("ctw entropy");

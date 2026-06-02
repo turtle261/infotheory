@@ -120,6 +120,7 @@ mod bench_impl {
                     base_depth: 32,
                     num_percept_bits: 258,
                     encoding_bits: 1,
+                    msb_first: None,
                 }),
             ),
             (

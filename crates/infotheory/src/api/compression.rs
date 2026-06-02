@@ -9,20 +9,15 @@ use crate::runtime::CompressionRuntime;
 use crate::with_default_ctx;
 
 /// Per-call control over operation-level parallelism.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OperationParallelism {
     /// Execute operation-level work serially.
     Serial,
     /// Use adaptive/default parallel operation behavior.
+    #[default]
     Auto,
     /// Execute operation-level work on a bounded Rayon pool with `threads`.
     Threads(usize),
-}
-
-impl Default for OperationParallelism {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// NCD compute options (operation-level parallelism only).

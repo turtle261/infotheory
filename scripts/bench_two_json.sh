@@ -380,6 +380,16 @@ def slug(text: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip())
     return text.strip("-").lower() or "expert"
 
+def canonical_subject_name(expert):
+    kind = str(expert.get("kind") or "")
+    name = str(expert.get("name") or kind or "expert")
+    # The canonical two-json CTW slot is now the factorized byte/MSB model.
+    # Preserve old suite files that still named this subject "ctw" while keeping
+    # deliberately custom names untouched.
+    if kind == "fac-ctw" and slug(name) == "ctw":
+        return "fac-ctw"
+    return name
+
 print("subject\tsubject_kind\texpert_kind\tspec_path\th_order")
 print(
     "\t".join(
@@ -394,7 +404,7 @@ print(
 )
 for expert in experts:
     expert_resolved = canonicalize_relative_paths(expert)
-    name = str(expert_resolved.get("name") or expert_resolved.get("kind") or "expert")
+    name = canonical_subject_name(expert_resolved)
     subject = slug(name)
     out_path = subject_dir / f"{subject}.json"
     out_path.write_text(json.dumps(expert_resolved, indent=2, sort_keys=True) + "\n")

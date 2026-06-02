@@ -1277,3 +1277,38 @@ mod tests {
         assert_binary_predictor_normalizes(Box::new(predictor), "mamba");
     }
 }
+
+#[cfg(all(test, feature = "aixi", feature = "backend-ctw"))]
+mod build_mc_aixi_predictor_tests {
+    use super::{Predictor, build_mc_aixi_predictor};
+    use crate::api::{BitStreamSemantics, RateBackend};
+
+    /// `encoding_bits` / `msb_first` on the rate spec describe byte-level behavior;
+    /// BinaryTokens planner native path uses [`FacCtwPredictor`] + `percept_bits` lanes.
+    #[test]
+    fn build_mc_aixi_predictor_selects_fac_ctw_native_predictor() {
+        let backend = RateBackend::FacCtw {
+            base_depth: 8,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+            msb_first: Some(true),
+        }
+        .compile()
+        .expect("compile fac-ctw backend");
+
+        let caps = backend.capabilities();
+        assert!(caps.supports_native_bit_prediction);
+        assert!(caps.supports_reversible_bit_updates);
+
+        let percept_bits: usize = 8;
+        let predictor =
+            build_mc_aixi_predictor(&backend, percept_bits, BitStreamSemantics::BinaryTokens)
+                .expect("build mc-aixi predictor");
+
+        let name = Predictor::model_name(predictor.as_ref());
+        assert!(
+            name.starts_with("FAC-CTW"),
+            "BinaryTokens + native FacCtw must use FacCtwPredictor fast path, got {name}"
+        );
+    }
+}

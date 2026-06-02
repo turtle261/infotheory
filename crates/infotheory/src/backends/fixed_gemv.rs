@@ -222,11 +222,11 @@ mod tests {
 
     #[test]
     fn unsupported_shapes_fall_back() {
-        let a = vec![0.0; 11 * 37];
-        let x = vec![0.0; 37];
-        let xt = vec![0.0; 11];
-        let mut y = vec![0.0; 11];
-        let mut yt = vec![0.0; 37];
+        let a = [0.0; 11 * 37];
+        let x = [0.0; 37];
+        let xt = [0.0; 11];
+        let mut y = [0.0; 11];
+        let mut yt = [0.0; 37];
         assert!(!unsafe { try_gemv(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 11, 37) });
         assert!(!unsafe { try_gemv_t(a.as_ptr(), xt.as_ptr(), yt.as_mut_ptr(), 11, 37) });
     }
