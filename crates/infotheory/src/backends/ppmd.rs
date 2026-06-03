@@ -156,6 +156,16 @@ pub struct PpmdModel {
     cdf_valid: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PpmdLifecycleSnapshot {
+    history: Vec<u8>,
+    suffix_keys: Vec<u64>,
+    pdf: [f64; 256],
+    cdf: [f64; 257],
+    valid: bool,
+    cdf_valid: bool,
+}
+
 impl PpmdModel {
     /// Create a model with maximum `order` and approximate memory budget in MiB.
     pub fn new(order: usize, memory_mb: usize) -> Self {
@@ -261,6 +271,26 @@ impl PpmdModel {
         self.cdf_valid = false;
         self.pdf.fill(1.0 / 256.0);
         self.cdf = uniform_cdf();
+    }
+
+    pub(crate) fn lifecycle_snapshot(&self) -> PpmdLifecycleSnapshot {
+        PpmdLifecycleSnapshot {
+            history: self.history.clone(),
+            suffix_keys: self.suffix_keys.clone(),
+            pdf: self.pdf,
+            cdf: self.cdf,
+            valid: self.valid,
+            cdf_valid: self.cdf_valid,
+        }
+    }
+
+    pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: PpmdLifecycleSnapshot) {
+        self.history = snapshot.history;
+        self.suffix_keys = snapshot.suffix_keys;
+        self.pdf = snapshot.pdf;
+        self.cdf = snapshot.cdf;
+        self.valid = snapshot.valid;
+        self.cdf_valid = snapshot.cdf_valid;
     }
 
     /// Advance conditioning history without updating fitted context counts.

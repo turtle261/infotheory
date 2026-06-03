@@ -65,7 +65,7 @@ pub fn fac_ctw_rate_backend(
 ///
 /// This is intentionally test-only; production code should construct
 /// `RateBackend::FacCtw` via typed APIs and parse paths.
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-ctw"))]
 pub fn fac_ctw_spec_json(
     base_depth: usize,
     num_percept_bits: usize,

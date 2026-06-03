@@ -987,13 +987,18 @@ fn rate_backend_to_json_leaf_value(
             num_percept_bits,
             encoding_bits,
             msb_first,
-        } => Some(Ok(serde_json::json!({
-            "kind": canonical,
-            "base_depth": base_depth,
-            "num_percept_bits": num_percept_bits,
-            "encoding_bits": encoding_bits,
-            "msb_first": msb_first,
-        }))),
+        } => {
+            let mut value = serde_json::json!({
+                "kind": canonical,
+                "base_depth": base_depth,
+                "num_percept_bits": num_percept_bits,
+                "encoding_bits": encoding_bits,
+            });
+            if let Some(msb_first) = msb_first {
+                value["msb_first"] = serde_json::Value::Bool(*msb_first);
+            }
+            Some(Ok(value))
+        }
         _ => None,
     }
 }
@@ -3069,6 +3074,12 @@ mod tests {
             }
             _ => panic!("expected runtime fac-ctw default backend"),
         }
+        let fac_ctw_default_json = rate_backend_to_json_value(&runtime_default)
+            .expect("serialize runtime fac-ctw default backend");
+        assert!(
+            fac_ctw_default_json.get("msb_first").is_none(),
+            "canonical fac-ctw json must omit msb_first when unset"
+        );
 
         #[cfg(feature = "backend-ctw")]
         {

@@ -25,17 +25,17 @@ use crate::api::{MixtureKind, MixtureScheduleMode, RateBackend};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
-use crate::backends::ctw::{ContextTree, FacContextTree};
+use crate::backends::ctw::{
+    ContextTree, ContextTreeLifecycleSnapshot, FacContextTree, FacContextTreeLifecycleSnapshot,
+};
 #[cfg(feature = "backend-match")]
-use crate::backends::match_model::MatchModel;
+use crate::backends::match_model::{MatchModel, MatchModelLifecycleSnapshot};
 #[cfg(feature = "backend-ppmd")]
-use crate::backends::ppmd::PpmdModel;
+use crate::backends::ppmd::{PpmdLifecycleSnapshot, PpmdModel};
 #[cfg(feature = "backend-rosa")]
 use crate::backends::rosaplus::{RosaPlus, RosaTx};
 #[cfg(feature = "backend-sequitur")]
-use crate::backends::sequitur::SequiturCheckpoint;
-#[cfg(feature = "backend-sequitur")]
-use crate::backends::sequitur::SequiturModel;
+use crate::backends::sequitur::{SequiturCheckpoint, SequiturLifecycleSnapshot, SequiturModel};
 #[cfg(feature = "backend-match")]
 use crate::backends::sparse_match::SparseMatchModel;
 use crate::backends::text_context::TextContextAnalyzer;
@@ -319,6 +319,32 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     /// Clear compact checkpoint journals after all structural checkpoints expire.
     fn clear_checkpoints_if_supported(&mut self) {}
 
+    #[doc(hidden)]
+    fn lifecycle_checkpoint_if_supported(
+        &mut self,
+        _op: OnlineBytePredictorLifecycleOp,
+    ) -> Option<OnlineBytePredictorLifecycleCheckpoint> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn restore_lifecycle_checkpoint_if_supported(
+        &mut self,
+        _op: OnlineBytePredictorLifecycleOp,
+        _checkpoint: OnlineBytePredictorLifecycleCheckpoint,
+    ) -> bool {
+        false
+    }
+
+    #[doc(hidden)]
+    fn discard_lifecycle_checkpoint_if_supported(
+        &mut self,
+        _op: OnlineBytePredictorLifecycleOp,
+        _checkpoint: OnlineBytePredictorLifecycleCheckpoint,
+    ) -> bool {
+        true
+    }
+
     /// Log-probability (natural log) of `symbol` given the current history.
     fn log_prob(&mut self, symbol: u8) -> f64;
 
@@ -435,6 +461,34 @@ enum OnlineBytePredictorCheckpointKind {
 impl OnlineBytePredictorCheckpoint {
     fn rate_backend(checkpoint: RateBackendPredictorCheckpoint) -> Self {
         Self(OnlineBytePredictorCheckpointKind::RateBackend(checkpoint))
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OnlineBytePredictorLifecycleOp {
+    /// Start a possibly continuing stream.
+    BeginStream,
+    /// Start a fresh stream, preserving fitted predictor state where supported.
+    BeginFreshStream,
+    /// Reset transient conditioning state while preserving fitted state.
+    ResetFrozen,
+    /// Finish the current stream.
+    FinishStream,
+}
+
+#[doc(hidden)]
+pub struct OnlineBytePredictorLifecycleCheckpoint(OnlineBytePredictorLifecycleCheckpointKind);
+
+enum OnlineBytePredictorLifecycleCheckpointKind {
+    RateBackend(RateBackendPredictorLifecycleCheckpoint),
+}
+
+impl OnlineBytePredictorLifecycleCheckpoint {
+    fn rate_backend(checkpoint: RateBackendPredictorLifecycleCheckpoint) -> Self {
+        Self(OnlineBytePredictorLifecycleCheckpointKind::RateBackend(
+            checkpoint,
+        ))
     }
 }
 
@@ -1054,6 +1108,41 @@ pub struct CalibratedPredictorCheckpoint {
     valid: bool,
 }
 
+enum RateBackendPredictorLifecycleCheckpoint {
+    NotNeeded,
+    Full(Box<RateBackendPredictor>),
+    #[cfg(feature = "backend-ctw")]
+    Ctw {
+        tree: Option<ContextTreeLifecycleSnapshot>,
+        native_prefix_progress: Option<usize>,
+    },
+    #[cfg(feature = "backend-ctw")]
+    FacCtw {
+        tree: Option<FacContextTreeLifecycleSnapshot>,
+        native_prefix_progress: Option<usize>,
+    },
+    #[cfg(feature = "backend-ppmd")]
+    Ppmd(PpmdLifecycleSnapshot),
+    #[cfg(feature = "backend-match")]
+    Match(MatchModelLifecycleSnapshot),
+    #[cfg(feature = "backend-match")]
+    SparseMatch(MatchModelLifecycleSnapshot),
+    #[cfg(feature = "backend-sequitur")]
+    Sequitur(SequiturLifecycleSnapshot),
+    #[cfg(feature = "backend-calibrated")]
+    Calibrated(Box<CalibratedPredictorLifecycleCheckpoint>),
+    #[cfg(feature = "backend-mixture")]
+    Mixture(Box<MixtureRuntimeLifecycleCheckpoint>),
+}
+
+#[cfg(feature = "backend-calibrated")]
+struct CalibratedPredictorLifecycleCheckpoint {
+    base: Box<RateBackendPredictorLifecycleCheckpoint>,
+    core: CalibratorCore,
+    pdf: [f64; 256],
+    valid: bool,
+}
+
 #[cfg(feature = "backend-ctw")]
 fn restore_ctw_checkpoint(
     tree: &mut ContextTree,
@@ -1147,6 +1236,382 @@ impl RateBackendPredictor {
                     .map(|descriptor| format!("{}(invalid)", descriptor.canonical))
                     .unwrap_or_else(|_| "backend(invalid)".to_string())
             })
+    }
+
+    fn lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+    ) -> RateBackendPredictorLifecycleCheckpoint {
+        #[cfg(feature = "backend-ctw")]
+        if matches!(
+            self,
+            RateBackendPredictor::Ctw {
+                native_prefix_progress: Some(bits),
+                ..
+            } | RateBackendPredictor::FacCtw {
+                native_prefix_progress: Some(bits),
+                ..
+            } if *bits > 0
+        ) {
+            return RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()));
+        }
+
+        match self {
+            #[cfg(feature = "backend-rosa")]
+            RateBackendPredictor::Rosa { .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+                }
+            },
+            #[cfg(feature = "backend-match")]
+            RateBackendPredictor::Match { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Match(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-match")]
+            RateBackendPredictor::SparseMatch { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::SparseMatch(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-ppmd")]
+            RateBackendPredictor::Ppmd { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Ppmd(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-sequitur")]
+            RateBackendPredictor::Sequitur { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::BeginStream
+                | OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Sequitur(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                tree,
+                native_prefix_progress,
+                ..
+            } => match op {
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Ctw {
+                        tree: Some(tree.lifecycle_snapshot()),
+                        native_prefix_progress: *native_prefix_progress,
+                    }
+                }
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    if native_prefix_progress.is_some() {
+                        RateBackendPredictorLifecycleCheckpoint::Ctw {
+                            tree: None,
+                            native_prefix_progress: *native_prefix_progress,
+                        }
+                    } else {
+                        RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                    }
+                }
+            },
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                tree,
+                native_prefix_progress,
+                ..
+            } => match op {
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::FacCtw {
+                        tree: Some(tree.lifecycle_snapshot()),
+                        native_prefix_progress: *native_prefix_progress,
+                    }
+                }
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    if native_prefix_progress.is_some() {
+                        RateBackendPredictorLifecycleCheckpoint::FacCtw {
+                            tree: None,
+                            native_prefix_progress: *native_prefix_progress,
+                        }
+                    } else {
+                        RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                    }
+                }
+            },
+            #[cfg(feature = "backend-zpaq")]
+            RateBackendPredictor::Zpaq { .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::ResetFrozen => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::BeginStream
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+                }
+            },
+            #[cfg(feature = "backend-particle")]
+            RateBackendPredictor::Particle { .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+                }
+            },
+            #[cfg(feature = "backend-rwkv")]
+            RateBackendPredictor::Rwkv7 { .. } => {
+                RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackendPredictor::Mamba { .. } => {
+                RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+            }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+                ..
+            } => RateBackendPredictorLifecycleCheckpoint::Calibrated(Box::new(
+                CalibratedPredictorLifecycleCheckpoint {
+                    base: Box::new(base.lifecycle_checkpoint(op)),
+                    core: core.clone(),
+                    pdf: *pdf,
+                    valid: *valid,
+                },
+            )),
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                RateBackendPredictorLifecycleCheckpoint::Mixture(Box::new(
+                    runtime.lifecycle_checkpoint(op),
+                ))
+            }
+            RateBackendPredictor::Disabled { .. } => {
+                RateBackendPredictorLifecycleCheckpoint::NotNeeded
+            }
+        }
+    }
+
+    fn restore_lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: RateBackendPredictorLifecycleCheckpoint,
+    ) {
+        match (self, checkpoint) {
+            (_, RateBackendPredictorLifecycleCheckpoint::NotNeeded) => {}
+            (slot, RateBackendPredictorLifecycleCheckpoint::Full(state)) => {
+                *slot = *state;
+            }
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::Ctw {
+                    tree,
+                    native_prefix_progress,
+                    ..
+                },
+                RateBackendPredictorLifecycleCheckpoint::Ctw {
+                    tree: tree_snapshot,
+                    native_prefix_progress: prefix,
+                },
+            ) => {
+                if let Some(snapshot) = tree_snapshot {
+                    tree.restore_lifecycle_snapshot(snapshot);
+                }
+                *native_prefix_progress = prefix;
+            }
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::FacCtw {
+                    tree,
+                    native_prefix_progress,
+                    ..
+                },
+                RateBackendPredictorLifecycleCheckpoint::FacCtw {
+                    tree: tree_snapshot,
+                    native_prefix_progress: prefix,
+                },
+            ) => {
+                if let Some(snapshot) = tree_snapshot {
+                    tree.restore_lifecycle_snapshot(snapshot);
+                }
+                *native_prefix_progress = prefix;
+            }
+            #[cfg(feature = "backend-ppmd")]
+            (
+                RateBackendPredictor::Ppmd { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::Ppmd(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-match")]
+            (
+                RateBackendPredictor::Match { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::Match(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-match")]
+            (
+                RateBackendPredictor::SparseMatch { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::SparseMatch(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-sequitur")]
+            (
+                RateBackendPredictor::Sequitur { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::Sequitur(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-calibrated")]
+            (
+                RateBackendPredictor::Calibrated {
+                    base,
+                    core,
+                    pdf,
+                    valid,
+                    ..
+                },
+                RateBackendPredictorLifecycleCheckpoint::Calibrated(checkpoint),
+            ) => {
+                base.restore_lifecycle_checkpoint(op, *checkpoint.base);
+                *core = checkpoint.core;
+                *pdf = checkpoint.pdf;
+                *valid = checkpoint.valid;
+            }
+            #[cfg(feature = "backend-mixture")]
+            (
+                RateBackendPredictor::Mixture { runtime },
+                RateBackendPredictorLifecycleCheckpoint::Mixture(checkpoint),
+            ) => runtime.restore_lifecycle_checkpoint(op, *checkpoint),
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Ctw { .. }) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorLifecycleCheckpoint::FacCtw { .. }) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-ppmd")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Ppmd(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-match")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Match(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-match")]
+            (_, RateBackendPredictorLifecycleCheckpoint::SparseMatch(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-sequitur")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Sequitur(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Calibrated(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-mixture")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Mixture(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+        }
+    }
+
+    fn discard_lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: RateBackendPredictorLifecycleCheckpoint,
+    ) {
+        match (self, checkpoint) {
+            (_, RateBackendPredictorLifecycleCheckpoint::NotNeeded)
+            | (_, RateBackendPredictorLifecycleCheckpoint::Full(_)) => {}
+            #[cfg(feature = "backend-calibrated")]
+            (
+                RateBackendPredictor::Calibrated { base, .. },
+                RateBackendPredictorLifecycleCheckpoint::Calibrated(checkpoint),
+            ) => base.discard_lifecycle_checkpoint(op, *checkpoint.base),
+            #[cfg(feature = "backend-mixture")]
+            (
+                RateBackendPredictor::Mixture { runtime },
+                RateBackendPredictorLifecycleCheckpoint::Mixture(checkpoint),
+            ) => runtime.discard_lifecycle_checkpoint(op, *checkpoint),
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::Ctw { .. },
+                RateBackendPredictorLifecycleCheckpoint::Ctw { .. },
+            )
+            | (
+                RateBackendPredictor::FacCtw { .. },
+                RateBackendPredictorLifecycleCheckpoint::FacCtw { .. },
+            ) => {}
+            #[cfg(feature = "backend-ppmd")]
+            (
+                RateBackendPredictor::Ppmd { .. },
+                RateBackendPredictorLifecycleCheckpoint::Ppmd(_),
+            ) => {}
+            #[cfg(feature = "backend-match")]
+            (
+                RateBackendPredictor::Match { .. },
+                RateBackendPredictorLifecycleCheckpoint::Match(_),
+            )
+            | (
+                RateBackendPredictor::SparseMatch { .. },
+                RateBackendPredictorLifecycleCheckpoint::SparseMatch(_),
+            ) => {}
+            #[cfg(feature = "backend-sequitur")]
+            (
+                RateBackendPredictor::Sequitur { .. },
+                RateBackendPredictorLifecycleCheckpoint::Sequitur(_),
+            ) => {}
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Ctw { .. })
+            | (_, RateBackendPredictorLifecycleCheckpoint::FacCtw { .. }) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-ppmd")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Ppmd(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-match")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Match(_))
+            | (_, RateBackendPredictorLifecycleCheckpoint::SparseMatch(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-sequitur")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Sequitur(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Calibrated(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-mixture")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Mixture(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+        }
     }
 
     pub(crate) fn checkpoint(&mut self) -> RateBackendPredictorCheckpoint {
@@ -1543,7 +2008,17 @@ impl OnlineBytePredictor for RateBackendPredictor {
         self.finish_stream()?;
         match self {
             #[cfg(feature = "backend-rosa")]
-            RateBackendPredictor::Rosa { model, .. } => {
+            RateBackendPredictor::Rosa {
+                model,
+                checkpoint_depth,
+                ..
+            } => {
+                if *checkpoint_depth > 0 {
+                    return Err(
+                        "rosa lifecycle reset cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
                 if let Some(total) = total_symbols {
                     let reserve = usize::try_from(total).unwrap_or(usize::MAX / 4);
                     model.reserve_for_stream(reserve);
@@ -1558,6 +2033,12 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Ppmd { .. } => Ok(()),
             #[cfg(feature = "backend-sequitur")]
             RateBackendPredictor::Sequitur { model, .. } => {
+                if model.checkpoints_active() {
+                    return Err(
+                        "sequitur lifecycle begin_stream cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
                 model.begin_stream(total_symbols);
                 Ok(())
             }
@@ -1683,6 +2164,41 @@ impl OnlineBytePredictor for RateBackendPredictor {
 
     fn clear_checkpoints_if_supported(&mut self) {
         RateBackendPredictor::clear_checkpoints_if_supported(self);
+    }
+
+    fn lifecycle_checkpoint_if_supported(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+    ) -> Option<OnlineBytePredictorLifecycleCheckpoint> {
+        Some(OnlineBytePredictorLifecycleCheckpoint::rate_backend(
+            self.lifecycle_checkpoint(op),
+        ))
+    }
+
+    fn restore_lifecycle_checkpoint_if_supported(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: OnlineBytePredictorLifecycleCheckpoint,
+    ) -> bool {
+        match checkpoint.0 {
+            OnlineBytePredictorLifecycleCheckpointKind::RateBackend(checkpoint) => {
+                self.restore_lifecycle_checkpoint(op, checkpoint);
+                true
+            }
+        }
+    }
+
+    fn discard_lifecycle_checkpoint_if_supported(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: OnlineBytePredictorLifecycleCheckpoint,
+    ) -> bool {
+        match checkpoint.0 {
+            OnlineBytePredictorLifecycleCheckpointKind::RateBackend(checkpoint) => {
+                self.discard_lifecycle_checkpoint(op, checkpoint);
+                true
+            }
+        }
     }
 
     fn log_prob(&mut self, symbol: u8) -> f64 {
@@ -2433,15 +2949,28 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             #[cfg(feature = "backend-sequitur")]
             RateBackendPredictor::Sequitur { model, .. } => {
+                if model.checkpoints_active() {
+                    return Err(
+                        "sequitur lifecycle reset cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
                 model.reset_frozen();
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
                 tree,
+                checkpoint_depth,
                 native_prefix_progress,
                 ..
             } => {
+                if *checkpoint_depth > 0 {
+                    return Err(
+                        "ctw lifecycle reset cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
                 *native_prefix_progress = None;
                 tree.truncate_history(0);
                 Ok(())
@@ -2449,9 +2978,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw {
                 tree,
+                checkpoint_depth,
                 native_prefix_progress,
                 ..
             } => {
+                if *checkpoint_depth > 0 {
+                    return Err(
+                        "fac-ctw lifecycle reset cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
                 *native_prefix_progress = None;
                 tree.reset_history_only();
                 Ok(())
@@ -2878,6 +3414,18 @@ pub(crate) fn expert_configs_from_compiled_mixture_with_builder(
         .collect::<Result<Vec<_>, String>>()
 }
 
+enum ExpertLifecycleToken {
+    Full(Box<dyn OnlineBytePredictor>),
+    Compact(OnlineBytePredictorLifecycleCheckpoint),
+}
+
+struct ExpertStateLifecycleCheckpoint {
+    log_weight: f64,
+    log_prior: f64,
+    cum_log_loss: f64,
+    predictor: ExpertLifecycleToken,
+}
+
 #[derive(Clone)]
 struct ExpertState {
     name: String,
@@ -2926,6 +3474,77 @@ impl ExpertState {
     #[inline]
     fn update_frozen(&mut self, symbol: u8) {
         self.predictor.update_frozen(symbol);
+    }
+
+    fn snapshot_lifecycle(&mut self, op: ExpertLifecycleOp) -> ExpertLifecycleToken {
+        let predictor_op = op.to_predictor_op();
+        self.predictor
+            .lifecycle_checkpoint_if_supported(predictor_op)
+            .map(ExpertLifecycleToken::Compact)
+            .unwrap_or_else(|| ExpertLifecycleToken::Full(self.predictor.clone()))
+    }
+
+    fn restore_lifecycle(&mut self, op: ExpertLifecycleOp, token: ExpertLifecycleToken) {
+        match token {
+            ExpertLifecycleToken::Full(predictor) => {
+                self.predictor = predictor;
+            }
+            ExpertLifecycleToken::Compact(checkpoint) => {
+                let restored = self
+                    .predictor
+                    .restore_lifecycle_checkpoint_if_supported(op.to_predictor_op(), checkpoint);
+                assert!(
+                    restored,
+                    "predictor returned an unsupported lifecycle checkpoint for restore"
+                );
+            }
+        }
+    }
+
+    fn discard_lifecycle(&mut self, op: ExpertLifecycleOp, token: ExpertLifecycleToken) {
+        match token {
+            ExpertLifecycleToken::Full(_) => {}
+            ExpertLifecycleToken::Compact(checkpoint) => {
+                let discarded = self
+                    .predictor
+                    .discard_lifecycle_checkpoint_if_supported(op.to_predictor_op(), checkpoint);
+                assert!(
+                    discarded,
+                    "predictor returned an unsupported lifecycle checkpoint for discard"
+                );
+            }
+        }
+    }
+
+    fn snapshot_state_lifecycle(
+        &mut self,
+        op: ExpertLifecycleOp,
+    ) -> ExpertStateLifecycleCheckpoint {
+        ExpertStateLifecycleCheckpoint {
+            log_weight: self.log_weight,
+            log_prior: self.log_prior,
+            cum_log_loss: self.cum_log_loss,
+            predictor: self.snapshot_lifecycle(op),
+        }
+    }
+
+    fn restore_state_lifecycle(
+        &mut self,
+        op: ExpertLifecycleOp,
+        checkpoint: ExpertStateLifecycleCheckpoint,
+    ) {
+        self.log_weight = checkpoint.log_weight;
+        self.log_prior = checkpoint.log_prior;
+        self.cum_log_loss = checkpoint.cum_log_loss;
+        self.restore_lifecycle(op, checkpoint.predictor);
+    }
+
+    fn discard_state_lifecycle(
+        &mut self,
+        op: ExpertLifecycleOp,
+        checkpoint: ExpertStateLifecycleCheckpoint,
+    ) {
+        self.discard_lifecycle(op, checkpoint.predictor);
     }
 }
 
@@ -4305,6 +4924,46 @@ fn discard_expert_checkpoints(
     }
 }
 
+fn lifecycle_checkpoint_experts(
+    experts: &mut [ExpertState],
+    op: ExpertLifecycleOp,
+) -> Vec<ExpertStateLifecycleCheckpoint> {
+    experts
+        .iter_mut()
+        .map(|expert| expert.snapshot_state_lifecycle(op))
+        .collect()
+}
+
+fn restore_lifecycle_experts(
+    experts: &mut [ExpertState],
+    checkpoints: Vec<ExpertStateLifecycleCheckpoint>,
+    op: ExpertLifecycleOp,
+) {
+    assert_eq!(
+        experts.len(),
+        checkpoints.len(),
+        "mixture lifecycle checkpoint expert count mismatch"
+    );
+    for (expert, checkpoint) in experts.iter_mut().zip(checkpoints.into_iter()) {
+        expert.restore_state_lifecycle(op, checkpoint);
+    }
+}
+
+fn discard_lifecycle_experts(
+    experts: &mut [ExpertState],
+    checkpoints: Vec<ExpertStateLifecycleCheckpoint>,
+    op: ExpertLifecycleOp,
+) {
+    assert_eq!(
+        experts.len(),
+        checkpoints.len(),
+        "mixture lifecycle checkpoint expert count mismatch"
+    );
+    for (expert, checkpoint) in experts.iter_mut().zip(checkpoints.into_iter()) {
+        expert.discard_state_lifecycle(op, checkpoint);
+    }
+}
+
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct BayesMixtureCheckpoint {
@@ -4408,6 +5067,94 @@ pub enum MixtureRuntimeCheckpoint {
     Convex(ConvexMixtureCheckpoint),
     Mdl(MdlSelectorCheckpoint),
     Neural(NeuralMixtureCheckpoint),
+}
+
+struct BayesMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+}
+
+struct FadingBayesMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_predictive: f64,
+    cached_log_evidence: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+}
+
+struct SwitchingMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_joint: Vec<f64>,
+    scratch_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+    update_count: u64,
+}
+
+struct ConvexMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    lambda: Vec<f64>,
+    scratch_logps: Vec<f64>,
+    projection_scratch: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+    update_count: u64,
+}
+
+struct MdlSelectorLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    scratch_logps: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    total_log_loss: f64,
+    last_best: usize,
+    cached_symbol: u8,
+    cached_best_idx: usize,
+    cached_best_logp: f64,
+    cache_valid: bool,
+}
+
+struct NeuralMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    neural: NeuralMixCore,
+    analyzer: TextContextAnalyzer,
+    scratch_expert_logps: Vec<f64>,
+    scratch_mix_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    eval_cache_valid: bool,
+    eval_cache_full_valid: bool,
+    eval_cache_history: NeuralHistoryState,
+    eval_cache_symbol: u8,
+    eval_cache_logp: f64,
+    eval_cache_mix_logps: [f64; 256],
+    eval_cache_expert_logps: Vec<[f64; 256]>,
+    total_log_loss: f64,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum MixtureRuntimeLifecycleCheckpoint {
+    Bayes(BayesMixtureLifecycleCheckpoint),
+    Fading(FadingBayesMixtureLifecycleCheckpoint),
+    Switching(SwitchingMixtureLifecycleCheckpoint),
+    Convex(ConvexMixtureLifecycleCheckpoint),
+    Mdl(MdlSelectorLifecycleCheckpoint),
+    Neural(NeuralMixtureLifecycleCheckpoint),
 }
 
 // =============================================================================
@@ -4619,6 +5366,211 @@ impl MixtureRuntime {
                 discard_expert_checkpoints(&mut m.experts, ck.experts);
             }
             _ => panic!("mismatched MixtureRuntime checkpoint variant"),
+        }
+    }
+
+    fn lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+    ) -> MixtureRuntimeLifecycleCheckpoint {
+        let expert_op = ExpertLifecycleOp::from_predictor_op(op);
+        match self {
+            MixtureRuntime::Bayes(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Bayes(BayesMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_mix: m.scratch_mix.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                })
+            }
+            MixtureRuntime::Fading(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Fading(FadingBayesMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_mix: m.scratch_mix.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_predictive: m.cached_log_predictive,
+                    cached_log_evidence: m.cached_log_evidence,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                })
+            }
+            MixtureRuntime::Switching(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Switching(SwitchingMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_joint: m.scratch_joint.clone(),
+                    scratch_weights: m.scratch_weights.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                    update_count: m.update_count,
+                })
+            }
+            MixtureRuntime::Convex(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Convex(ConvexMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    lambda: m.lambda.clone(),
+                    scratch_logps: m.scratch_logps.clone(),
+                    projection_scratch: m.projection_scratch.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                    update_count: m.update_count,
+                })
+            }
+            MixtureRuntime::Mdl(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Mdl(MdlSelectorLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    scratch_logps: m.scratch_logps.clone(),
+                    bitwise: m.bitwise.clone(),
+                    total_log_loss: m.total_log_loss,
+                    last_best: m.last_best,
+                    cached_symbol: m.cached_symbol,
+                    cached_best_idx: m.cached_best_idx,
+                    cached_best_logp: m.cached_best_logp,
+                    cache_valid: m.cache_valid,
+                })
+            }
+            MixtureRuntime::Neural(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Neural(NeuralMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    neural: m.neural.clone(),
+                    analyzer: m.analyzer.clone(),
+                    scratch_expert_logps: m.scratch_expert_logps.clone(),
+                    scratch_mix_weights: m.scratch_mix_weights.clone(),
+                    bitwise: m.bitwise.clone(),
+                    eval_cache_valid: m.eval_cache_valid,
+                    eval_cache_full_valid: m.eval_cache_full_valid,
+                    eval_cache_history: m.eval_cache_history,
+                    eval_cache_symbol: m.eval_cache_symbol,
+                    eval_cache_logp: m.eval_cache_logp,
+                    eval_cache_mix_logps: m.eval_cache_mix_logps,
+                    eval_cache_expert_logps: m.eval_cache_expert_logps.clone(),
+                    total_log_loss: m.total_log_loss,
+                })
+            }
+        }
+    }
+
+    fn restore_lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: MixtureRuntimeLifecycleCheckpoint,
+    ) {
+        let expert_op = ExpertLifecycleOp::from_predictor_op(op);
+        match (self, checkpoint) {
+            (MixtureRuntime::Bayes(m), MixtureRuntimeLifecycleCheckpoint::Bayes(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.scratch_logps = ck.scratch_logps;
+                m.scratch_mix = ck.scratch_mix;
+                m.bitwise = ck.bitwise;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            (MixtureRuntime::Fading(m), MixtureRuntimeLifecycleCheckpoint::Fading(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.scratch_logps = ck.scratch_logps;
+                m.scratch_mix = ck.scratch_mix;
+                m.bitwise = ck.bitwise;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_predictive = ck.cached_log_predictive;
+                m.cached_log_evidence = ck.cached_log_evidence;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            (MixtureRuntime::Switching(m), MixtureRuntimeLifecycleCheckpoint::Switching(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.scratch_logps = ck.scratch_logps;
+                m.scratch_joint = ck.scratch_joint;
+                m.scratch_weights = ck.scratch_weights;
+                m.bitwise = ck.bitwise;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+                m.update_count = ck.update_count;
+            }
+            (MixtureRuntime::Convex(m), MixtureRuntimeLifecycleCheckpoint::Convex(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.lambda = ck.lambda;
+                m.scratch_logps = ck.scratch_logps;
+                m.projection_scratch = ck.projection_scratch;
+                m.bitwise = ck.bitwise;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+                m.update_count = ck.update_count;
+            }
+            (MixtureRuntime::Mdl(m), MixtureRuntimeLifecycleCheckpoint::Mdl(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.scratch_logps = ck.scratch_logps;
+                m.bitwise = ck.bitwise;
+                m.total_log_loss = ck.total_log_loss;
+                m.last_best = ck.last_best;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_best_idx = ck.cached_best_idx;
+                m.cached_best_logp = ck.cached_best_logp;
+                m.cache_valid = ck.cache_valid;
+            }
+            (MixtureRuntime::Neural(m), MixtureRuntimeLifecycleCheckpoint::Neural(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.neural = ck.neural;
+                m.analyzer = ck.analyzer;
+                m.scratch_expert_logps = ck.scratch_expert_logps;
+                m.scratch_mix_weights = ck.scratch_mix_weights;
+                m.bitwise = ck.bitwise;
+                m.eval_cache_valid = ck.eval_cache_valid;
+                m.eval_cache_full_valid = ck.eval_cache_full_valid;
+                m.eval_cache_history = ck.eval_cache_history;
+                m.eval_cache_symbol = ck.eval_cache_symbol;
+                m.eval_cache_logp = ck.eval_cache_logp;
+                m.eval_cache_mix_logps = ck.eval_cache_mix_logps;
+                m.eval_cache_expert_logps = ck.eval_cache_expert_logps;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            _ => panic!("mismatched MixtureRuntime lifecycle checkpoint variant"),
+        }
+    }
+
+    fn discard_lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: MixtureRuntimeLifecycleCheckpoint,
+    ) {
+        let expert_op = ExpertLifecycleOp::from_predictor_op(op);
+        match (self, checkpoint) {
+            (MixtureRuntime::Bayes(m), MixtureRuntimeLifecycleCheckpoint::Bayes(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Fading(m), MixtureRuntimeLifecycleCheckpoint::Fading(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Switching(m), MixtureRuntimeLifecycleCheckpoint::Switching(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Convex(m), MixtureRuntimeLifecycleCheckpoint::Convex(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Mdl(m), MixtureRuntimeLifecycleCheckpoint::Mdl(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Neural(m), MixtureRuntimeLifecycleCheckpoint::Neural(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            _ => panic!("mismatched MixtureRuntime lifecycle checkpoint variant"),
         }
     }
 
@@ -4956,34 +5908,106 @@ fn finish_neural_native_prefix(m: &mut NeuralMixture, symbol: u8) -> Result<(), 
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpertLifecycleOp {
+    BeginStream,
+    BeginFreshStream,
+    ResetFrozen,
+    FinishStream,
+}
+
+impl ExpertLifecycleOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BeginStream => "begin_stream",
+            Self::BeginFreshStream => "begin_fresh_stream",
+            Self::ResetFrozen => "reset_frozen",
+            Self::FinishStream => "finish_stream",
+        }
+    }
+
+    fn to_predictor_op(self) -> OnlineBytePredictorLifecycleOp {
+        match self {
+            Self::BeginStream => OnlineBytePredictorLifecycleOp::BeginStream,
+            Self::BeginFreshStream => OnlineBytePredictorLifecycleOp::BeginFreshStream,
+            Self::ResetFrozen => OnlineBytePredictorLifecycleOp::ResetFrozen,
+            Self::FinishStream => OnlineBytePredictorLifecycleOp::FinishStream,
+        }
+    }
+
+    fn from_predictor_op(op: OnlineBytePredictorLifecycleOp) -> Self {
+        match op {
+            OnlineBytePredictorLifecycleOp::BeginStream => Self::BeginStream,
+            OnlineBytePredictorLifecycleOp::BeginFreshStream => Self::BeginFreshStream,
+            OnlineBytePredictorLifecycleOp::ResetFrozen => Self::ResetFrozen,
+            OnlineBytePredictorLifecycleOp::FinishStream => Self::FinishStream,
+        }
+    }
+}
+
+/// Apply a fallible lifecycle operation to every expert all-or-nothing.
+///
+/// Lifecycle hooks may mutate non-journaled state such as CTW history, neural
+/// online-policy buffers, or wrapper caches before reporting an error. The
+/// update checkpoints used for speculative byte/bit prediction are therefore not
+/// sufficient here: rollback must restore the whole expert state that existed
+/// before the lifecycle operation began. A full expert snapshot is faithful by
+/// construction, and neural model weights are already `Arc`-shared by their
+/// backends, so this does not deep-copy those parameters.
+fn transact_expert_lifecycle(
+    experts: &mut [ExpertState],
+    op: ExpertLifecycleOp,
+    mut apply: impl FnMut(&mut ExpertState) -> Result<(), String>,
+) -> Result<(), String> {
+    if experts.is_empty() {
+        return Ok(());
+    }
+    let mut backups: Vec<(usize, ExpertLifecycleToken)> = Vec::with_capacity(experts.len());
+    for idx in 0..experts.len() {
+        let name = experts[idx].name.clone();
+        let token = experts[idx].snapshot_lifecycle(op);
+        backups.push((idx, token));
+        if let Err(err) = apply(&mut experts[idx]) {
+            for (restore_idx, token) in backups.into_iter().rev() {
+                experts[restore_idx].restore_lifecycle(op, token);
+            }
+            return Err(format!(
+                "mixture expert lifecycle {} failed for expert #{idx} '{name}': {err}",
+                op.as_str()
+            ));
+        }
+    }
+    for (idx, token) in backups {
+        experts[idx].discard_lifecycle(op, token);
+    }
+    Ok(())
+}
+
 fn begin_expert_stream(
     experts: &mut [ExpertState],
     total_symbols: Option<u64>,
 ) -> Result<(), String> {
-    for expert in experts {
-        expert.begin_stream(total_symbols)?;
-    }
-    Ok(())
+    transact_expert_lifecycle(experts, ExpertLifecycleOp::BeginStream, |expert| {
+        expert.begin_stream(total_symbols)
+    })
 }
 
 fn begin_expert_fresh_stream(
     experts: &mut [ExpertState],
     total_symbols: Option<u64>,
 ) -> Result<(), String> {
-    for expert in experts {
-        expert.begin_fresh_stream(total_symbols)?;
-    }
-    Ok(())
+    transact_expert_lifecycle(experts, ExpertLifecycleOp::BeginFreshStream, |expert| {
+        expert.begin_fresh_stream(total_symbols)
+    })
 }
 
 fn reset_expert_frozen_stream(
     experts: &mut [ExpertState],
     total_symbols: Option<u64>,
 ) -> Result<(), String> {
-    for expert in experts {
-        expert.reset_frozen(total_symbols)?;
-    }
-    Ok(())
+    transact_expert_lifecycle(experts, ExpertLifecycleOp::ResetFrozen, |expert| {
+        expert.reset_frozen(total_symbols)
+    })
 }
 
 fn experts_support_frozen_reset(experts: &[ExpertState]) -> bool {
@@ -4993,10 +6017,9 @@ fn experts_support_frozen_reset(experts: &[ExpertState]) -> bool {
 }
 
 fn finish_expert_stream(experts: &mut [ExpertState]) -> Result<(), String> {
-    for expert in experts {
-        expert.finish_stream()?;
-    }
-    Ok(())
+    transact_expert_lifecycle(experts, ExpertLifecycleOp::FinishStream, |expert| {
+        expert.finish_stream()
+    })
 }
 
 #[cfg(test)]
@@ -5049,6 +6072,201 @@ fn build_mixture_runtime_from_fields(
         ))),
         MixtureKind::Mdl => Ok(MixtureRuntime::Mdl(MdlSelector::new(experts))),
         MixtureKind::Neural => Ok(MixtureRuntime::Neural(NeuralMixture::new(experts, alpha))),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Clone)]
+    struct LifecycleMockPredict {
+        state: usize,
+        fail: Option<ExpertLifecycleOp>,
+    }
+
+    impl LifecycleMockPredict {
+        fn apply(&mut self, op: ExpertLifecycleOp, next_state: usize) -> Result<(), String> {
+            self.state = next_state;
+            if self.fail == Some(op) {
+                Err(format!("{} failed after mutation", op.as_str()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl OnlineBytePredictor for LifecycleMockPredict {
+        fn begin_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.apply(ExpertLifecycleOp::BeginStream, 11)
+        }
+
+        fn begin_fresh_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.apply(ExpertLifecycleOp::BeginFreshStream, 22)
+        }
+
+        fn reset_frozen(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.apply(ExpertLifecycleOp::ResetFrozen, 33)
+        }
+
+        fn finish_stream(&mut self) -> Result<(), String> {
+            self.apply(ExpertLifecycleOp::FinishStream, 44)
+        }
+
+        fn log_prob(&mut self, _symbol: u8) -> f64 {
+            self.state as f64
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+    }
+
+    fn lifecycle_expert(name: &str, state: usize, fail: Option<ExpertLifecycleOp>) -> ExpertState {
+        ExpertState {
+            name: name.to_string(),
+            log_weight: 0.0,
+            log_prior: 0.0,
+            predictor: Box::new(LifecycleMockPredict { state, fail }),
+            cum_log_loss: 0.0,
+        }
+    }
+
+    fn lifecycle_state(expert: &mut ExpertState) -> usize {
+        expert.log_prob(0) as usize
+    }
+
+    fn assert_lifecycle_failure_rolls_back(op: ExpertLifecycleOp) {
+        let mut experts: Vec<ExpertState> = vec![
+            lifecycle_expert("mutated", 1, None),
+            lifecycle_expert("failing", 2, Some(op)),
+        ];
+
+        let err = match op {
+            ExpertLifecycleOp::BeginStream => begin_expert_stream(&mut experts, Some(8)),
+            ExpertLifecycleOp::BeginFreshStream => begin_expert_fresh_stream(&mut experts, Some(8)),
+            ExpertLifecycleOp::ResetFrozen => reset_expert_frozen_stream(&mut experts, Some(8)),
+            ExpertLifecycleOp::FinishStream => finish_expert_stream(&mut experts),
+        }
+        .expect_err("second expert should fail after mutating");
+
+        assert!(
+            err.contains(op.as_str()),
+            "error should name lifecycle operation: {err}"
+        );
+        assert!(
+            err.contains("expert #1 'failing'"),
+            "error should identify failing expert: {err}"
+        );
+        assert!(
+            err.contains("failed after mutation"),
+            "error should preserve source context: {err}"
+        );
+        assert_eq!(
+            lifecycle_state(&mut experts[0]),
+            1,
+            "earlier successful expert mutation must be rolled back"
+        );
+        assert_eq!(
+            lifecycle_state(&mut experts[1]),
+            2,
+            "failing expert mutation must be rolled back"
+        );
+    }
+
+    #[test]
+    fn lifecycle_begin_stream_failure_rolls_back_all_experts() {
+        assert_lifecycle_failure_rolls_back(ExpertLifecycleOp::BeginStream);
+    }
+
+    #[test]
+    fn lifecycle_begin_fresh_stream_failure_rolls_back_all_experts() {
+        assert_lifecycle_failure_rolls_back(ExpertLifecycleOp::BeginFreshStream);
+    }
+
+    #[test]
+    fn lifecycle_reset_frozen_failure_rolls_back_all_experts() {
+        assert_lifecycle_failure_rolls_back(ExpertLifecycleOp::ResetFrozen);
+    }
+
+    #[test]
+    fn lifecycle_finish_stream_failure_rolls_back_all_experts() {
+        assert_lifecycle_failure_rolls_back(ExpertLifecycleOp::FinishStream);
+    }
+
+    struct CloneCountingLifecyclePredict {
+        state: usize,
+        fail: Option<ExpertLifecycleOp>,
+        clones: Arc<AtomicUsize>,
+    }
+
+    impl Clone for CloneCountingLifecyclePredict {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::Relaxed);
+            Self {
+                state: self.state,
+                fail: self.fail,
+                clones: self.clones.clone(),
+            }
+        }
+    }
+
+    impl OnlineBytePredictor for CloneCountingLifecyclePredict {
+        fn begin_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.state = 99;
+            if self.fail == Some(ExpertLifecycleOp::BeginStream) {
+                Err("failed after mutation".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn log_prob(&mut self, _symbol: u8) -> f64 {
+            self.state as f64
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+    }
+
+    #[test]
+    fn lifecycle_failure_snapshots_only_attempted_experts() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let mut experts = vec![
+            ExpertState {
+                name: "failing".to_string(),
+                log_weight: 0.0,
+                log_prior: 0.0,
+                predictor: Box::new(CloneCountingLifecyclePredict {
+                    state: 1,
+                    fail: Some(ExpertLifecycleOp::BeginStream),
+                    clones: clones.clone(),
+                }),
+                cum_log_loss: 0.0,
+            },
+            ExpertState {
+                name: "unreached".to_string(),
+                log_weight: 0.0,
+                log_prior: 0.0,
+                predictor: Box::new(CloneCountingLifecyclePredict {
+                    state: 2,
+                    fail: None,
+                    clones: clones.clone(),
+                }),
+                cum_log_loss: 0.0,
+            },
+        ];
+
+        begin_expert_stream(&mut experts, Some(1)).expect_err("first expert should fail");
+
+        assert_eq!(
+            clones.load(Ordering::Relaxed),
+            1,
+            "transaction must not snapshot experts after the first failure"
+        );
+        assert_eq!(lifecycle_state(&mut experts[0]), 1);
+        assert_eq!(lifecycle_state(&mut experts[1]), 2);
     }
 }
 
@@ -5765,6 +6983,36 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ResettingNonResettableFreshPredict {
+        learned: usize,
+    }
+
+    impl OnlineBytePredictor for ResettingNonResettableFreshPredict {
+        fn supports_frozen_reset(&self) -> bool {
+            false
+        }
+
+        fn begin_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.learned = 0;
+            Ok(())
+        }
+
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            if self.learned > 0 && symbol == b'R' {
+                0.0
+            } else {
+                -15.0
+            }
+        }
+
+        fn update(&mut self, symbol: u8) {
+            if symbol == b'R' {
+                self.learned += 1;
+            }
+        }
+    }
+
     fn assert_log_prob_update_matches_separate(label: &str, backend: RateBackend) {
         let mut separate = RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB);
         let mut combined = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
@@ -6199,6 +7447,176 @@ mod tests {
         assert!(
             logp > -1.0,
             "old expert should remain usable after failed fresh restart; logp={logp}"
+        );
+    }
+
+    #[test]
+    fn runtime_begin_fresh_stream_failure_is_transactional_across_experts() {
+        let failing_begin_calls = Arc::new(AtomicUsize::new(0));
+        let resettable_cfg = ExpertConfig::uniform("resetting", || {
+            Box::new(ResettingNonResettableFreshPredict { learned: 0 })
+        });
+        let failing_cfg = {
+            let failing_begin_calls = failing_begin_calls.clone();
+            ExpertConfig::uniform("failing", move || {
+                Box::new(FailingNonResettableFreshPredict {
+                    learned: 0,
+                    begin_calls: failing_begin_calls.clone(),
+                })
+            })
+        };
+
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                crate::MixtureExpertSpec {
+                    name: Some("resetting".to_string()),
+                    log_prior: 0.0,
+                    backend: RateBackend::Ctw { depth: 1 },
+                },
+                crate::MixtureExpertSpec {
+                    name: Some("failing".to_string()),
+                    log_prior: 0.0,
+                    backend: RateBackend::Ctw { depth: 1 },
+                },
+            ],
+        );
+        let mut runtime =
+            build_mixture_runtime(&spec, &[resettable_cfg, failing_cfg]).expect("runtime");
+        runtime.begin_stream(Some(1)).expect("begin stream");
+        let _ = runtime.step(b'R');
+        let logp_before = runtime.peek_log_prob(b'R');
+        assert!(
+            logp_before > -1.0,
+            "resetting expert should have learned prior to restart; logp={logp_before}"
+        );
+
+        let err = runtime
+            .begin_fresh_stream(None)
+            .expect_err("second expert should fail begin_fresh_stream");
+        assert!(err.contains("missing total symbols"));
+        assert_eq!(
+            failing_begin_calls.load(Ordering::Relaxed),
+            2,
+            "failing expert begin should run once at initial begin and once at failed restart"
+        );
+
+        let logp_after = runtime.peek_log_prob(b'R');
+        assert!(
+            logp_after > -1.0,
+            "failed fresh restart must restore earlier experts instead of leaving partial mutation; logp={logp_after}"
+        );
+    }
+
+    fn ctw_checkpoint_depth(predictor: &RateBackendPredictor) -> usize {
+        match predictor {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                checkpoint_depth, ..
+            } => *checkpoint_depth,
+            _ => panic!("expected ctw predictor"),
+        }
+    }
+
+    fn predictor_log_probs(predictor: &mut RateBackendPredictor) -> [f64; 256] {
+        let mut row = [0.0f64; 256];
+        predictor.fill_log_probs(&mut row);
+        row
+    }
+
+    fn assert_log_prob_rows_close(actual: &[f64; 256], expected: &[f64; 256], label: &str) {
+        for (symbol, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "{label}[{symbol}]: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_reset_rejects_active_ctw_prediction_checkpoint() {
+        let mut predictor =
+            RateBackendPredictor::from_backend(RateBackend::Ctw { depth: 4 }, DEFAULT_MIN_PROB);
+        for &symbol in b"abracadabra ctw checkpoint guard" {
+            predictor.update(symbol);
+        }
+        let mut baseline = predictor.clone();
+        let checkpoint = predictor.checkpoint();
+
+        let err = predictor
+            .begin_fresh_stream(Some(0))
+            .expect_err("ctw lifecycle reset must reject active compact prediction checkpoints");
+
+        assert!(err.contains("prediction checkpoints"));
+        assert_eq!(ctw_checkpoint_depth(&predictor), 1);
+        let expected = predictor_log_probs(&mut baseline);
+        let actual = predictor_log_probs(&mut predictor);
+        assert_log_prob_rows_close(&actual, &expected, "ctw active-checkpoint lifecycle reject");
+        predictor.discard_checkpoint(checkpoint);
+    }
+
+    #[test]
+    fn ctw_lifecycle_with_active_prefix_uses_full_clone() {
+        let mut predictor =
+            RateBackendPredictor::from_backend(RateBackend::Ctw { depth: 4 }, DEFAULT_MIN_PROB);
+        assert!(
+            predictor
+                .begin_native_msb_byte_prefix()
+                .expect("begin native prefix")
+        );
+        predictor
+            .observe_native_msb_prefix_bit(0, true)
+            .expect("observe one prefix bit");
+
+        let checkpoint =
+            predictor.lifecycle_checkpoint(OnlineBytePredictorLifecycleOp::FinishStream);
+
+        assert!(
+            matches!(checkpoint, RateBackendPredictorLifecycleCheckpoint::Full(_)),
+            "active native prefix with observed bits must not use compact lifecycle rollback"
+        );
+    }
+
+    #[test]
+    fn nested_mixture_lifecycle_failure_restores_wrapper_state() {
+        let inner_cfgs = vec![
+            weighted_cfg("zero-heavy", 1.0, 0.90),
+            weighted_cfg("zero-light", 1.0, 0.10),
+        ];
+        let mut inner = MixtureRuntime::Bayes(BayesMixture::new(&inner_cfgs));
+        inner.begin_stream(Some(1)).expect("inner begin");
+        let _ = inner.step(0);
+        let before = inner.peek_log_prob(0);
+
+        let failing_begin_calls = Arc::new(AtomicUsize::new(0));
+        let mut experts = vec![
+            ExpertState {
+                name: "nested".to_string(),
+                log_weight: 0.0,
+                log_prior: 0.0,
+                predictor: Box::new(RateBackendPredictor::Mixture { runtime: inner }),
+                cum_log_loss: 0.0,
+            },
+            ExpertState {
+                name: "failing".to_string(),
+                log_weight: 0.0,
+                log_prior: 0.0,
+                predictor: Box::new(FailingNonResettableFreshPredict {
+                    learned: 0,
+                    begin_calls: failing_begin_calls.clone(),
+                }),
+                cum_log_loss: 0.0,
+            },
+        ];
+
+        let err = begin_expert_fresh_stream(&mut experts, None)
+            .expect_err("outer lifecycle should fail on second expert");
+
+        assert!(err.contains("missing total symbols"));
+        let after = experts[0].log_prob(0);
+        assert!(
+            (after - before).abs() < 1e-12,
+            "nested mixture wrapper state should be restored: before={before}, after={after}"
         );
     }
 

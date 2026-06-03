@@ -939,7 +939,12 @@ sorted_keys = sorted(
 )
 
 with open(summary_path, "w", newline="") as fh:
-    writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
+    writer = csv.DictWriter(
+        fh,
+        fieldnames=fieldnames,
+        delimiter="\t",
+        lineterminator="\n",
+    )
     writer.writeheader()
     for key in sorted_keys:
         rows = groups[key]

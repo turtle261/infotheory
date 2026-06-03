@@ -151,6 +151,13 @@ pub struct SequiturModel {
     undo_enabled: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct SequiturLifecycleSnapshot {
+    frozen_raw_tail: Vec<u8>,
+    pdf: [f64; 256],
+    pdf_valid: bool,
+}
+
 impl SequiturModel {
     /// Create a new Sequitur model.
     ///
@@ -251,10 +258,28 @@ impl SequiturModel {
         self.undo_enabled = false;
     }
 
+    pub(crate) fn checkpoints_active(&self) -> bool {
+        self.undo_enabled
+    }
+
     /// Clear speculative frozen updates without touching committed state.
     pub fn reset_frozen(&mut self) {
         self.frozen_raw_tail.clear();
         self.pdf_valid = false;
+    }
+
+    pub(crate) fn lifecycle_snapshot(&self) -> SequiturLifecycleSnapshot {
+        SequiturLifecycleSnapshot {
+            frozen_raw_tail: self.frozen_raw_tail.clone(),
+            pdf: self.pdf,
+            pdf_valid: self.pdf_valid,
+        }
+    }
+
+    pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: SequiturLifecycleSnapshot) {
+        self.frozen_raw_tail = snapshot.frozen_raw_tail;
+        self.pdf = snapshot.pdf;
+        self.pdf_valid = snapshot.pdf_valid;
     }
 
     /// Fill `out` with the current normalized next-byte probability mass.

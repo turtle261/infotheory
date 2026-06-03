@@ -3767,6 +3767,11 @@ pub struct ContextTree {
     history: BitHistory,
 }
 
+#[derive(Clone)]
+pub(crate) struct ContextTreeLifecycleSnapshot {
+    history: BitHistory,
+}
+
 impl ContextTree {
     /// Construct a binary CTW predictor with maximum context depth `depth`.
     pub fn new(depth: usize) -> Self {
@@ -3826,6 +3831,16 @@ impl ContextTree {
         }
     }
 
+    pub(crate) fn lifecycle_snapshot(&self) -> ContextTreeLifecycleSnapshot {
+        ContextTreeLifecycleSnapshot {
+            history: self.history.clone(),
+        }
+    }
+
+    pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: ContextTreeLifecycleSnapshot) {
+        self.history = snapshot.history;
+    }
+
     #[inline]
     /// Predict `P(sym | history)` under current weighted CTW model.
     pub fn predict(&mut self, sym: Symbol) -> f64 {
@@ -3860,6 +3875,13 @@ impl ContextTree {
 #[derive(Clone)]
 struct ContextTreeCore {
     engine: CtEngine,
+    prepared_valid: bool,
+    prepared_history_len: usize,
+    prepared_history_version: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ContextTreeCorePreparedSnapshot {
     prepared_valid: bool,
     prepared_history_len: usize,
     prepared_history_version: u64,
@@ -3961,6 +3983,22 @@ impl ContextTreeCore {
     fn get_log_block_probability(&self) -> f64 {
         self.engine.get_log_block_probability()
     }
+
+    #[inline]
+    fn prepared_snapshot(&self) -> ContextTreeCorePreparedSnapshot {
+        ContextTreeCorePreparedSnapshot {
+            prepared_valid: self.prepared_valid,
+            prepared_history_len: self.prepared_history_len,
+            prepared_history_version: self.prepared_history_version,
+        }
+    }
+
+    #[inline]
+    fn restore_prepared_snapshot(&mut self, snapshot: ContextTreeCorePreparedSnapshot) {
+        self.prepared_valid = snapshot.prepared_valid;
+        self.prepared_history_len = snapshot.prepared_history_len;
+        self.prepared_history_version = snapshot.prepared_history_version;
+    }
 }
 
 /// Factorized Action-Conditional Context Tree Weighting.
@@ -3971,6 +4009,13 @@ pub struct FacContextTree {
     base_depth: usize,
     num_bits: usize,
     shared_history_version: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct FacContextTreeLifecycleSnapshot {
+    shared_history: BitHistory,
+    shared_history_version: u64,
+    prepared: Vec<ContextTreeCorePreparedSnapshot>,
 }
 
 /// Approximate heap-memory breakdown for a [`FacContextTree`].
@@ -4410,6 +4455,27 @@ impl FacContextTree {
         }
         self.shared_history.clear();
         self.bump_shared_history_version();
+    }
+
+    pub(crate) fn lifecycle_snapshot(&self) -> FacContextTreeLifecycleSnapshot {
+        FacContextTreeLifecycleSnapshot {
+            shared_history: self.shared_history.clone(),
+            shared_history_version: self.shared_history_version,
+            prepared: self
+                .trees
+                .iter()
+                .map(ContextTreeCore::prepared_snapshot)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: FacContextTreeLifecycleSnapshot) {
+        debug_assert_eq!(self.trees.len(), snapshot.prepared.len());
+        self.shared_history = snapshot.shared_history;
+        self.shared_history_version = snapshot.shared_history_version;
+        for (tree, prepared) in self.trees.iter_mut().zip(snapshot.prepared) {
+            tree.restore_prepared_snapshot(prepared);
+        }
     }
 
     #[inline]

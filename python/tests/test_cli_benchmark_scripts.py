@@ -449,3 +449,27 @@ def test_bench_two_json_compare_hint_uses_current_baseline_resolver():
     assert 'benchmarks/current/infotheory-two-json-summary"*.tsv' in script_text
     assert "--baseline '${CURRENT_BASELINE_TSV}'" in script_text
     assert "infotheory-two-json-summary-20260322-120428.tsv" not in script_text
+
+
+def test_checked_in_benchmark_summary_tsv_uses_lf_line_endings():
+    repo = _repo_root()
+    crlf = [
+        path.relative_to(repo)
+        for path in (repo / "benchmarks").rglob("*summary*.tsv")
+        if b"\r" in path.read_bytes()
+    ]
+    assert crlf == [], (
+        "benchmark summary TSV files must use LF line endings only; "
+        f"found CR in: {', '.join(str(p) for p in crlf)}"
+    )
+
+
+def test_bench_two_json_summary_writer_uses_lf_line_terminator():
+    script_text = (_repo_root() / "scripts/bench_two_json.sh").read_text(encoding="utf-8")
+    marker = 'with open(summary_path, "w", newline="") as fh:'
+    start = script_text.find(marker)
+    assert start != -1, "summary TSV writer block not found in bench_two_json.sh"
+    block = script_text[start : start + 400]
+    assert 'lineterminator="\\n"' in block, (
+        "bench_two_json summary csv.DictWriter must set lineterminator='\\n'"
+    )

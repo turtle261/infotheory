@@ -655,7 +655,12 @@ def main() -> None:
         "cycles_per_sec",
     ]
     with raw_tsv.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=raw_fields, delimiter="\t")
+        writer = csv.DictWriter(
+            f,
+            fieldnames=raw_fields,
+            delimiter="\t",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -728,7 +733,12 @@ def main() -> None:
         "cycles_per_sec_std",
     ]
     with summary_tsv.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=summary_fields, delimiter="\t")
+        writer = csv.DictWriter(
+            f,
+            fieldnames=summary_fields,
+            delimiter="\t",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(summary_rows)
 

@@ -1,4 +1,4 @@
-use crate::backends::match_model::MatchModel;
+use crate::backends::match_model::{MatchModel, MatchModelLifecycleSnapshot};
 
 #[derive(Clone, Debug)]
 /// Gapped/sparse match predictor wrapper over [`MatchModel`].
@@ -58,6 +58,14 @@ impl SparseMatchModel {
     /// Reset only conditioning history, preserving learned tables.
     pub fn reset_history(&mut self) {
         self.inner.reset_history();
+    }
+
+    pub(crate) fn lifecycle_snapshot(&self) -> MatchModelLifecycleSnapshot {
+        self.inner.lifecycle_snapshot()
+    }
+
+    pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: MatchModelLifecycleSnapshot) {
+        self.inner.restore_lifecycle_snapshot(snapshot);
     }
 
     /// Advance history without updating learned sparse-match tables.

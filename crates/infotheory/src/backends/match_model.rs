@@ -21,6 +21,18 @@ pub struct MatchModel {
     match_len: usize,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct MatchModelLifecycleSnapshot {
+    history: Vec<u8>,
+    frozen_anchor: usize,
+    pdf: [f64; 256],
+    cdf: [f64; 257],
+    valid: bool,
+    cdf_valid: bool,
+    predicted: Option<u8>,
+    match_len: usize,
+}
+
 impl MatchModel {
     /// Create a match model with an inclusive stride range `[gap_min+1, gap_max+1]`.
     pub fn new(
@@ -136,6 +148,30 @@ impl MatchModel {
         self.match_len = 0;
         self.pdf.fill(1.0 / 256.0);
         self.cdf = uniform_cdf();
+    }
+
+    pub(crate) fn lifecycle_snapshot(&self) -> MatchModelLifecycleSnapshot {
+        MatchModelLifecycleSnapshot {
+            history: self.history.clone(),
+            frozen_anchor: self.frozen_anchor,
+            pdf: self.pdf,
+            cdf: self.cdf,
+            valid: self.valid,
+            cdf_valid: self.cdf_valid,
+            predicted: self.predicted,
+            match_len: self.match_len,
+        }
+    }
+
+    pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: MatchModelLifecycleSnapshot) {
+        self.history = snapshot.history;
+        self.frozen_anchor = snapshot.frozen_anchor;
+        self.pdf = snapshot.pdf;
+        self.cdf = snapshot.cdf;
+        self.valid = snapshot.valid;
+        self.cdf_valid = snapshot.cdf_valid;
+        self.predicted = snapshot.predicted;
+        self.match_len = snapshot.match_len;
     }
 
     /// Advance conditioning history without updating learned match tables.
