@@ -59,7 +59,7 @@ local function canonicalize_subject(subject)
 		return "rwkv7"
 	end
 	if subject == "ctw" then
-		return "fac-ctw"
+		return "fac-ctw" -- this script is specific to the semantics of two.json, so this maintains support for comparison with old results. Because AC-CTW won't be used in the future for two.json, this is safe.
 	end
 	return subject
 end
