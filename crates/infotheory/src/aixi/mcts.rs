@@ -133,11 +133,19 @@ pub trait AgentSimulator: Send {
     /// [`Self::begin_simulation`] so external simulator implementations keep the
     /// older reversible-rollout behavior unless they opt into a cheaper
     /// discardable path.
+    ///
+    /// # Safety & Invariants
+    /// Calling [`Self::model_revert`] within a discardable simulation scope is
+    /// unsupported and will result in a panic, as rollback checkpoints are not retained.
     fn begin_discardable_simulation(&mut self) {
         self.begin_simulation();
     }
 
     /// Reverts the model state to a previous point in the simulation.
+    ///
+    /// # Panics
+    /// Panics if called within an active discardable simulation scope opened by
+    /// [`Self::begin_discardable_simulation`].
     fn model_revert(&mut self, steps: usize);
 
     /// Generates a random value in `[0, end)`.

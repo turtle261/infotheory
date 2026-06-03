@@ -451,10 +451,12 @@ impl RateBackendBitSession {
         }
     }
 
+    #[cfg(any(feature = "aixi", test))]
     pub(crate) fn begin_discardable_scope(&mut self) {
         self.discardable_scopes = self.discardable_scopes.saturating_add(1);
     }
 
+    #[cfg(feature = "aixi")]
     pub(crate) fn clear_discardable_scopes(&mut self) {
         self.discardable_scopes = 0;
     }

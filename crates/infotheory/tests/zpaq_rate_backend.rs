@@ -7,10 +7,9 @@
 
 #![cfg(feature = "backend-zpaq")]
 
-use infotheory::api::RateBackend;
+use infotheory::api::{OnlineBytePredictor, RateBackend};
 use infotheory::backends::zpaq_rate::ZpaqRateModel;
 use infotheory::mixture::{DEFAULT_MIN_PROB, RateBackendPredictor};
-use infotheory::prediction::OnlineBytePredictor;
 
 #[test]
 #[cfg(feature = "backend-zpaq")]

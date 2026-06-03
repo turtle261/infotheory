@@ -124,6 +124,18 @@ macro_rules! backend_feature_enabled {
     };
 }
 
+// Feature-gated kernel pointers deliberately distinguish "anchor" from "drop".
+//
+// The runtime catalog contains one row per known backend even when a backend's
+// implementation feature is disabled, so disabled builds still report stable
+// names, aliases, canonical errors, and capability metadata without retaining
+// heavyweight model code. Use `drop` for kernels whose real implementation may
+// be compiled out completely; the catalog stores only the fallback pointer in
+// disabled builds. Use `anchor` only for helpers that must remain available and
+// type-checked when the backend feature is off, such as canonical spec helpers
+// and cheap capability predicates. An anchored function must therefore be
+// feature-independent and must not pull backend runtime state into disabled
+// binaries.
 macro_rules! feature_gated_kernel_ptr_anchor {
     ($feature:literal, $ptr_type:ident, $func:path, fn fallback $args:tt $(-> $ret:ty)? $body:block) => {
         {
