@@ -674,6 +674,10 @@ impl AgentSimulator for Agent {
         self.model.begin_rollback_scope();
     }
 
+    fn begin_discardable_simulation(&mut self) {
+        self.model.begin_discardable_scope();
+    }
+
     fn gen_percepts_and_update(&mut self) -> (Vec<PerceptVal>, Reward) {
         let obs_bits = self.config.observation_bits;
         let obs_len = self.config.observation_stream_len.max(1);
@@ -746,6 +750,7 @@ mod tests {
         update_history: usize,
         commit_update_history: usize,
         begin_scope: usize,
+        begin_discardable_scope: usize,
         rollback_scope: usize,
         revert: usize,
         pop_history: usize,
@@ -789,6 +794,10 @@ mod tests {
 
         fn begin_rollback_scope(&mut self) {
             self.counts.lock().unwrap().begin_scope += 1;
+        }
+
+        fn begin_discardable_scope(&mut self) {
+            self.counts.lock().unwrap().begin_discardable_scope += 1;
         }
 
         fn rollback_scope(&mut self) -> bool {
@@ -946,6 +955,19 @@ mod tests {
         assert_eq!(snapshot.rollback_scope, 1);
         assert_eq!(snapshot.revert, 0);
         assert_eq!(snapshot.pop_history, 0);
+    }
+
+    #[test]
+    fn discardable_simulation_uses_predictor_discardable_scope() {
+        let counts = Arc::new(Mutex::new(CallCounts::default()));
+        let mut agent = test_agent(Box::new(InstrumentedPredictor::new(counts.clone())));
+
+        AgentSimulator::begin_discardable_simulation(&mut agent);
+
+        let snapshot = counts.lock().unwrap().clone();
+        assert_eq!(snapshot.begin_discardable_scope, 1);
+        assert_eq!(snapshot.begin_scope, 0);
+        assert_eq!(snapshot.rollback_scope, 0);
     }
 
     /// Stable shape-only descriptor for a `RateBackend` variant, used for

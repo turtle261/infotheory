@@ -64,6 +64,7 @@ pub struct RateBackendBitSession {
     semantics: BitStreamSemantics,
     min_prob: f64,
     prefix: Option<BufferedBytePrefix>,
+    discardable_scopes: usize,
 }
 
 /// Opaque checkpoint for restoring a [`RateBackendBitSession`] exactly.
@@ -374,6 +375,7 @@ impl RateBackendBitSession {
             semantics,
             min_prob,
             prefix: None,
+            discardable_scopes: 0,
         })
     }
 
@@ -437,12 +439,24 @@ impl RateBackendBitSession {
 
     /// Capture a reversible checkpoint for later exact restoration.
     pub fn checkpoint(&mut self) -> RateBackendBitSessionCheckpoint {
+        debug_assert_eq!(
+            self.discardable_scopes, 0,
+            "RateBackendBitSession checkpoints are invalid inside discardable simulation scopes"
+        );
         RateBackendBitSessionCheckpoint {
             backend_code: self.backend_code.clone(),
             predictor: self.predictor.checkpoint(),
             semantics: self.semantics,
             prefix: self.prefix.clone(),
         }
+    }
+
+    pub(crate) fn begin_discardable_scope(&mut self) {
+        self.discardable_scopes = self.discardable_scopes.saturating_add(1);
+    }
+
+    pub(crate) fn clear_discardable_scopes(&mut self) {
+        self.discardable_scopes = 0;
     }
 
     /// Restore the session to a previously captured checkpoint.
@@ -690,6 +704,8 @@ impl RateBackendBitSession {
         update_mode: BufferedByteUpdateMode,
     ) -> InfotheoryResult<()> {
         self.ensure_prefix_for_update(order, update_mode)?;
+        let needs_adaptive_prefix_checkpoint =
+            update_mode != BufferedByteUpdateMode::Adaptive || self.discardable_scopes == 0;
         let prefix = self.prefix.as_mut().expect("prefix initialized");
         prefix.record_mode(update_mode)?;
         match &mut prefix.kind {
@@ -709,7 +725,7 @@ impl RateBackendBitSession {
                 symbol,
                 bits,
             } => {
-                if start_checkpoint.is_none() && *bits == 0 {
+                if start_checkpoint.is_none() && *bits == 0 && needs_adaptive_prefix_checkpoint {
                     *start_checkpoint = Some(Box::new(self.predictor.checkpoint()));
                 }
                 self.predictor
@@ -1173,6 +1189,18 @@ mod tests {
     }
 
     #[cfg(feature = "backend-ctw")]
+    fn buffered_native_prefix_has_start_checkpoint(
+        session: &RateBackendBitSession,
+    ) -> Option<bool> {
+        match session.prefix.as_ref().map(|prefix| &prefix.kind) {
+            Some(BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint, ..
+            }) => Some(start_checkpoint.is_some()),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "backend-ctw")]
     fn new_ctw_byte_packed_session() -> RateBackendBitSession {
         RateBackendBitSession::from_spec(
             RateBackend::Ctw { depth: 4 },
@@ -1360,6 +1388,56 @@ mod tests {
 
     #[cfg(feature = "backend-ctw")]
     #[test]
+    fn discardable_scope_avoids_adaptive_native_prefix_checkpoint() {
+        for mut session in [
+            new_ctw_byte_packed_session(),
+            new_fac_ctw_byte_packed_session(),
+        ] {
+            session.begin_discardable_scope();
+            let _ = session.predict_bit();
+            session
+                .try_observe_bit(true)
+                .expect("discardable adaptive prefix bit");
+
+            assert_eq!(buffered_native_prefix_bits(&session), Some(1));
+            assert_eq!(
+                buffered_native_prefix_has_start_checkpoint(&session),
+                Some(false),
+                "discardable adaptive prefixes must not retain restore-only checkpoints",
+            );
+            assert_eq!(ctw_checkpoint_depth(&session), 0);
+
+            for bit in [false, true, false, true, false, true, false] {
+                session
+                    .try_observe_bit(bit)
+                    .expect("finish discardable adaptive byte");
+            }
+            assert!(session.prefix.is_none());
+            assert_eq!(ctw_checkpoint_depth(&session), 0);
+            assert_eq!(ctw_native_prefix_progress(&session), None);
+        }
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn discardable_scope_keeps_frozen_native_prefix_checkpoint() {
+        let mut session = new_ctw_byte_packed_session();
+        session.begin_discardable_scope();
+        session
+            .try_condition_bit(true)
+            .expect("discardable frozen prefix bit");
+
+        assert_eq!(buffered_native_prefix_bits(&session), Some(1));
+        assert_eq!(
+            buffered_native_prefix_has_start_checkpoint(&session),
+            Some(true),
+            "frozen native prefixes still need a start checkpoint to avoid learning action bytes",
+        );
+        assert_eq!(ctw_checkpoint_depth(&session), 1);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
     fn begin_bit_stream_rolls_back_adaptive_partial_native_prefix() {
         let mut session = new_fac_ctw_byte_packed_session();
         session.try_observe_bit(true).expect("adaptive prefix bit");
@@ -1462,6 +1540,7 @@ mod tests {
             },
             min_prob: DEFAULT_MIN_PROB,
             prefix: None,
+            discardable_scopes: 0,
         };
         let pred = session.predict_bit();
         assert!(

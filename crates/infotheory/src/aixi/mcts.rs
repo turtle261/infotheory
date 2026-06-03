@@ -124,6 +124,19 @@ pub trait AgentSimulator: Send {
     /// Marks the start of a new simulation rollout.
     fn begin_simulation(&mut self) {}
 
+    /// Marks the start of a rollout whose simulator state will be discarded.
+    ///
+    /// Parallel planners run rollouts on cloned simulators and drop each clone
+    /// after its sampled tail reward has been computed. Implementations may use
+    /// this hook to suppress rollback bookkeeping that would only be useful if
+    /// the same simulator were restored and reused. The default delegates to
+    /// [`Self::begin_simulation`] so external simulator implementations keep the
+    /// older reversible-rollout behavior unless they opt into a cheaper
+    /// discardable path.
+    fn begin_discardable_simulation(&mut self) {
+        self.begin_simulation();
+    }
+
     /// Reverts the model state to a previous point in the simulation.
     fn model_revert(&mut self, steps: usize);
 

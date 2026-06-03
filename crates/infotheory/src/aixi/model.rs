@@ -76,6 +76,17 @@ pub trait Predictor: Send {
     /// until the matching `rollback_scope` call.
     fn begin_rollback_scope(&mut self) {}
 
+    /// Begins a simulation scope whose mutated predictor state will be discarded.
+    ///
+    /// This is useful for cloned MCTS workers: they need speculative updates to
+    /// avoid per-symbol rollback journals, but they do not need a checkpoint that
+    /// can restore the clone because the clone is dropped after the rollout.
+    /// Implementations that do not provide a specialized discardable mode fall
+    /// back to a normal reversible rollback scope.
+    fn begin_discardable_scope(&mut self) {
+        self.begin_rollback_scope();
+    }
+
     /// Rolls back to the last scope opened with `begin_rollback_scope`.
     ///
     /// Returns `true` when a scope rollback was performed, allowing callers to skip
@@ -462,6 +473,7 @@ pub struct RateBackendBitPredictor {
     session: RateBackendBitSession,
     journal: Vec<RateBackendJournalEntry>,
     rollback_scopes: Vec<RateBackendRollbackScope>,
+    discardable_scopes: usize,
 }
 
 /// Error returned while constructing or initializing a rate-backend bit predictor.
@@ -627,6 +639,7 @@ impl RateBackendBitPredictor {
             session,
             journal: Vec::new(),
             rollback_scopes: Vec::new(),
+            discardable_scopes: 0,
         })
     }
 
@@ -637,7 +650,12 @@ impl RateBackendBitPredictor {
             session: self.session.clone(),
             journal: self.journal.clone(),
             rollback_scopes: self.rollback_scopes.clone(),
+            discardable_scopes: self.discardable_scopes,
         }
+    }
+
+    fn should_capture_symbol_checkpoint(&self) -> bool {
+        self.rollback_scopes.is_empty() && self.discardable_scopes == 0
     }
 
     fn checkpoint(&mut self, kind: RateBackendJournalKind) -> RateBackendJournalEntry {
@@ -648,6 +666,10 @@ impl RateBackendBitPredictor {
     }
 
     fn restore_last(&mut self, expected_kind: RateBackendJournalKind) {
+        assert_eq!(
+            self.discardable_scopes, 0,
+            "RateBackendBitPredictor per-symbol rollback after a discardable simulation scope is unsupported"
+        );
         assert!(
             self.rollback_scopes.is_empty(),
             "RateBackendBitPredictor per-symbol rollback inside active scope is unsupported"
@@ -672,7 +694,7 @@ impl RateBackendBitPredictor {
 
 impl Predictor for RateBackendBitPredictor {
     fn update(&mut self, sym: bool) {
-        if self.rollback_scopes.is_empty() {
+        if self.should_capture_symbol_checkpoint() {
             let checkpoint = self.checkpoint(RateBackendJournalKind::Update);
             self.journal.push(checkpoint);
         }
@@ -688,7 +710,7 @@ impl Predictor for RateBackendBitPredictor {
     }
 
     fn update_history(&mut self, sym: bool) {
-        if self.rollback_scopes.is_empty() {
+        if self.should_capture_symbol_checkpoint() {
             let checkpoint = self.checkpoint(RateBackendJournalKind::FrozenUpdate);
             self.journal.push(checkpoint);
         }
@@ -712,6 +734,10 @@ impl Predictor for RateBackendBitPredictor {
     }
 
     fn begin_rollback_scope(&mut self) {
+        assert_eq!(
+            self.discardable_scopes, 0,
+            "RateBackendBitPredictor cannot open a reversible rollback scope inside a discardable simulation scope"
+        );
         let checkpoint = self.session.checkpoint();
         self.rollback_scopes.push(RateBackendRollbackScope {
             checkpoint,
@@ -719,7 +745,16 @@ impl Predictor for RateBackendBitPredictor {
         });
     }
 
+    fn begin_discardable_scope(&mut self) {
+        self.discardable_scopes = self.discardable_scopes.saturating_add(1);
+        self.session.begin_discardable_scope();
+    }
+
     fn rollback_scope(&mut self) -> bool {
+        assert_eq!(
+            self.discardable_scopes, 0,
+            "RateBackendBitPredictor rollback after a discardable simulation scope is unsupported"
+        );
         let Some(scope) = self.rollback_scopes.pop() else {
             return false;
         };
@@ -752,6 +787,8 @@ impl Predictor for RateBackendBitPredictor {
     fn reset_conditioning_history(&mut self) -> Result<(), String> {
         self.journal.clear();
         self.rollback_scopes.clear();
+        self.discardable_scopes = 0;
+        self.session.clear_discardable_scopes();
         self.session
             .reset_frozen(None)
             .map_err(|err| err.to_string())
@@ -1206,6 +1243,27 @@ mod tests {
             approx_eq(got0, want0);
             approx_eq(got1, want1);
         }
+    }
+
+    #[test]
+    fn discardable_scope_suppresses_rate_backend_rollback_bookkeeping() {
+        let mut predictor = bit_predictor(RateBackend::RosaPlus { max_order: 8 });
+        predictor.begin_discardable_scope();
+
+        for idx in 0..512usize {
+            predictor.update((idx & 1) == 0);
+            predictor.update_history((idx % 3) == 0);
+        }
+
+        assert!(
+            predictor.journal.is_empty(),
+            "discardable cloned rollouts must not retain per-symbol checkpoints"
+        );
+        assert!(
+            predictor.rollback_scopes.is_empty(),
+            "discardable cloned rollouts must not retain reversible scope checkpoints"
+        );
+        assert_eq!(predictor.discardable_scopes, 1);
     }
 
     #[test]
