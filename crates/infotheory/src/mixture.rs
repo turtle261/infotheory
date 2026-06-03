@@ -319,32 +319,6 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     /// Clear compact checkpoint journals after all structural checkpoints expire.
     fn clear_checkpoints_if_supported(&mut self) {}
 
-    #[doc(hidden)]
-    fn lifecycle_checkpoint_if_supported(
-        &mut self,
-        _op: OnlineBytePredictorLifecycleOp,
-    ) -> Option<OnlineBytePredictorLifecycleCheckpoint> {
-        None
-    }
-
-    #[doc(hidden)]
-    fn restore_lifecycle_checkpoint_if_supported(
-        &mut self,
-        _op: OnlineBytePredictorLifecycleOp,
-        _checkpoint: OnlineBytePredictorLifecycleCheckpoint,
-    ) -> bool {
-        false
-    }
-
-    #[doc(hidden)]
-    fn discard_lifecycle_checkpoint_if_supported(
-        &mut self,
-        _op: OnlineBytePredictorLifecycleOp,
-        _checkpoint: OnlineBytePredictorLifecycleCheckpoint,
-    ) -> bool {
-        true
-    }
-
     /// Log-probability (natural log) of `symbol` given the current history.
     fn log_prob(&mut self, symbol: u8) -> f64;
 
@@ -464,9 +438,8 @@ impl OnlineBytePredictorCheckpoint {
     }
 }
 
-#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OnlineBytePredictorLifecycleOp {
+enum OnlineBytePredictorLifecycleOp {
     /// Start a possibly continuing stream.
     BeginStream,
     /// Start a fresh stream, preserving fitted predictor state where supported.
@@ -475,21 +448,6 @@ pub enum OnlineBytePredictorLifecycleOp {
     ResetFrozen,
     /// Finish the current stream.
     FinishStream,
-}
-
-#[doc(hidden)]
-pub struct OnlineBytePredictorLifecycleCheckpoint(OnlineBytePredictorLifecycleCheckpointKind);
-
-enum OnlineBytePredictorLifecycleCheckpointKind {
-    RateBackend(RateBackendPredictorLifecycleCheckpoint),
-}
-
-impl OnlineBytePredictorLifecycleCheckpoint {
-    fn rate_backend(checkpoint: RateBackendPredictorLifecycleCheckpoint) -> Self {
-        Self(OnlineBytePredictorLifecycleCheckpointKind::RateBackend(
-            checkpoint,
-        ))
-    }
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -2166,41 +2124,6 @@ impl OnlineBytePredictor for RateBackendPredictor {
         RateBackendPredictor::clear_checkpoints_if_supported(self);
     }
 
-    fn lifecycle_checkpoint_if_supported(
-        &mut self,
-        op: OnlineBytePredictorLifecycleOp,
-    ) -> Option<OnlineBytePredictorLifecycleCheckpoint> {
-        Some(OnlineBytePredictorLifecycleCheckpoint::rate_backend(
-            self.lifecycle_checkpoint(op),
-        ))
-    }
-
-    fn restore_lifecycle_checkpoint_if_supported(
-        &mut self,
-        op: OnlineBytePredictorLifecycleOp,
-        checkpoint: OnlineBytePredictorLifecycleCheckpoint,
-    ) -> bool {
-        match checkpoint.0 {
-            OnlineBytePredictorLifecycleCheckpointKind::RateBackend(checkpoint) => {
-                self.restore_lifecycle_checkpoint(op, checkpoint);
-                true
-            }
-        }
-    }
-
-    fn discard_lifecycle_checkpoint_if_supported(
-        &mut self,
-        op: OnlineBytePredictorLifecycleOp,
-        checkpoint: OnlineBytePredictorLifecycleCheckpoint,
-    ) -> bool {
-        match checkpoint.0 {
-            OnlineBytePredictorLifecycleCheckpointKind::RateBackend(checkpoint) => {
-                self.discard_lifecycle_checkpoint(op, checkpoint);
-                true
-            }
-        }
-    }
-
     fn log_prob(&mut self, symbol: u8) -> f64 {
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -3189,6 +3112,96 @@ impl OnlineBytePredictor for RateBackendPredictor {
     }
 }
 
+#[derive(Clone)]
+enum ExpertPredictor {
+    Generic(Box<dyn OnlineBytePredictor>),
+    RateBackend(Box<RateBackendPredictor>),
+}
+
+impl ExpertPredictor {
+    fn generic(predictor: Box<dyn OnlineBytePredictor>) -> Self {
+        Self::Generic(predictor)
+    }
+
+    fn rate_backend(predictor: RateBackendPredictor) -> Self {
+        Self::RateBackend(Box::new(predictor))
+    }
+
+    fn as_mut(&mut self) -> &mut (dyn OnlineBytePredictor + 'static) {
+        match self {
+            Self::Generic(predictor) => predictor.as_mut(),
+            Self::RateBackend(predictor) => predictor.as_mut(),
+        }
+    }
+
+    fn into_box(self) -> Box<dyn OnlineBytePredictor> {
+        match self {
+            Self::Generic(predictor) => predictor,
+            Self::RateBackend(predictor) => predictor,
+        }
+    }
+
+    fn lifecycle_checkpoint(&mut self, op: OnlineBytePredictorLifecycleOp) -> ExpertLifecycleToken {
+        match self {
+            Self::Generic(_) => ExpertLifecycleToken::Full(self.clone()),
+            Self::RateBackend(predictor) => {
+                ExpertLifecycleToken::Compact(Box::new(predictor.lifecycle_checkpoint(op)))
+            }
+        }
+    }
+
+    fn restore_lifecycle(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        token: ExpertLifecycleToken,
+    ) {
+        match (self, token) {
+            (slot, ExpertLifecycleToken::Full(predictor)) => {
+                *slot = predictor;
+            }
+            (Self::RateBackend(predictor), ExpertLifecycleToken::Compact(checkpoint)) => {
+                predictor.restore_lifecycle_checkpoint(op, *checkpoint);
+            }
+            (Self::Generic(_), ExpertLifecycleToken::Compact(_)) => {
+                panic!("generic expert received a compact rate-backend lifecycle checkpoint")
+            }
+        }
+    }
+
+    fn discard_lifecycle(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        token: ExpertLifecycleToken,
+    ) {
+        match (self, token) {
+            (_, ExpertLifecycleToken::Full(_)) => {}
+            (Self::RateBackend(predictor), ExpertLifecycleToken::Compact(checkpoint)) => {
+                predictor.discard_lifecycle_checkpoint(op, *checkpoint);
+            }
+            (Self::Generic(_), ExpertLifecycleToken::Compact(_)) => {
+                panic!("generic expert received a compact rate-backend lifecycle checkpoint")
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for ExpertPredictor {
+    type Target = dyn OnlineBytePredictor + 'static;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Generic(predictor) => predictor.as_ref(),
+            Self::RateBackend(predictor) => predictor.as_ref(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for ExpertPredictor {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut()
+    }
+}
+
 /// Configuration for a mixture expert.
 #[derive(Clone)]
 pub struct ExpertConfig {
@@ -3196,7 +3209,7 @@ pub struct ExpertConfig {
     pub name: String,
     /// Log prior weight (natural log). Uniform priors can be `0.0`.
     pub log_prior: f64,
-    builder: Arc<dyn Fn() -> Box<dyn OnlineBytePredictor> + Send + Sync>,
+    builder: Arc<dyn Fn() -> ExpertPredictor + Send + Sync>,
 }
 
 impl ExpertConfig {
@@ -3206,11 +3219,29 @@ impl ExpertConfig {
         log_prior: f64,
         builder: impl Fn() -> Box<dyn OnlineBytePredictor> + Send + Sync + 'static,
     ) -> Self {
+        Self::new_with_predictor(name, log_prior, move || ExpertPredictor::generic(builder()))
+    }
+
+    fn new_with_predictor(
+        name: impl Into<String>,
+        log_prior: f64,
+        builder: impl Fn() -> ExpertPredictor + Send + Sync + 'static,
+    ) -> Self {
         Self {
             name: name.into(),
             log_prior,
             builder: Arc::new(builder),
         }
+    }
+
+    fn new_rate_backend(
+        name: impl Into<String>,
+        log_prior: f64,
+        builder: impl Fn() -> RateBackendPredictor + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_with_predictor(name, log_prior, move || {
+            ExpertPredictor::rate_backend(builder())
+        })
     }
 
     /// Uniform prior helper.
@@ -3225,11 +3256,8 @@ impl ExpertConfig {
     /// the [`RateBackend::RosaPlus`] variant.
     pub fn from_rate_backend(name: Option<String>, log_prior: f64, backend: RateBackend) -> Self {
         let name = name.unwrap_or_else(|| RateBackendPredictor::default_name(&backend));
-        Self::new(name, log_prior, move || {
-            Box::new(RateBackendPredictor::from_backend(
-                backend.clone(),
-                DEFAULT_MIN_PROB,
-            ))
+        Self::new_rate_backend(name, log_prior, move || {
+            RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB)
         })
     }
 
@@ -3240,41 +3268,35 @@ impl ExpertConfig {
         backend: CompiledRateBackend,
     ) -> Self {
         let name = name.unwrap_or_else(|| backend.display_label());
-        Self::new(name, log_prior, move || {
-            Box::new(RateBackendPredictor::from_compiled(
-                &backend,
-                DEFAULT_MIN_PROB,
-            ))
+        Self::new_rate_backend(name, log_prior, move || {
+            RateBackendPredictor::from_compiled(&backend, DEFAULT_MIN_PROB)
         })
     }
 
     /// ROSA expert (uniform prior) with explicit `max_order`.
     pub fn rosa(name: impl Into<String>, max_order: i64) -> Self {
         let name = name.into();
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::RosaPlus { max_order },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
     /// CTW expert (uniform prior).
     pub fn ctw(name: impl Into<String>, depth: usize) -> Self {
         let name = name.into();
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
-                RateBackend::Ctw { depth },
-                DEFAULT_MIN_PROB,
-            ))
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(RateBackend::Ctw { depth }, DEFAULT_MIN_PROB)
         })
     }
 
     /// FAC-CTW expert (uniform prior).
     pub fn fac_ctw(name: impl Into<String>, base_depth: usize, encoding_bits: usize) -> Self {
         let name = name.into();
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::FacCtw {
                     base_depth,
                     num_percept_bits: encoding_bits,
@@ -3282,7 +3304,7 @@ impl ExpertConfig {
                     msb_first: None,
                 },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
@@ -3292,13 +3314,13 @@ impl ExpertConfig {
         let name = name.into();
         let method = crate::rwkvzip::parse_method_spec(&method.into())
             .expect("rwkv expert method must be a valid RWKV method spec");
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::Rwkv7Method {
                     method: method.clone(),
                 },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
@@ -3308,13 +3330,13 @@ impl ExpertConfig {
         let name = name.into();
         let method = crate::mambazip::parse_method_spec(&method.into())
             .expect("mamba expert method must be a valid Mamba method spec");
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::MambaMethod {
                     method: method.clone(),
                 },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
@@ -3322,13 +3344,13 @@ impl ExpertConfig {
     pub fn zpaq(name: impl Into<String>, method: impl Into<String>) -> Self {
         let name = name.into();
         let method = crate::api::ZpaqMethodSpec::literal(method.into());
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::Zpaq {
                     method: method.clone(),
                 },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
@@ -3344,7 +3366,7 @@ impl ExpertConfig {
 
     /// Build a fresh predictor instance for evaluation or analysis.
     pub fn build_predictor(&self) -> Box<dyn OnlineBytePredictor> {
-        (self.builder)()
+        (self.builder)().into_box()
     }
 
     fn build(&self) -> ExpertState {
@@ -3404,19 +3426,21 @@ pub(crate) fn expert_configs_from_compiled_mixture_with_builder(
                 .name
                 .clone()
                 .unwrap_or_else(|| compiled.default_name());
-            Ok(ExpertConfig::new(name, expert.log_prior, move || {
-                Box::new(
+            Ok(ExpertConfig::new_rate_backend(
+                name,
+                expert.log_prior,
+                move || {
                     builder(&compiled, min_prob)
-                        .expect("compiled mixture expert builder should succeed"),
-                )
-            }))
+                        .expect("compiled mixture expert builder should succeed")
+                },
+            ))
         })
         .collect::<Result<Vec<_>, String>>()
 }
 
 enum ExpertLifecycleToken {
-    Full(Box<dyn OnlineBytePredictor>),
-    Compact(OnlineBytePredictorLifecycleCheckpoint),
+    Full(ExpertPredictor),
+    Compact(Box<RateBackendPredictorLifecycleCheckpoint>),
 }
 
 struct ExpertStateLifecycleCheckpoint {
@@ -3431,7 +3455,7 @@ struct ExpertState {
     name: String,
     log_weight: f64,
     log_prior: f64,
-    predictor: Box<dyn OnlineBytePredictor>,
+    predictor: ExpertPredictor,
     cum_log_loss: f64,
 }
 
@@ -3477,43 +3501,17 @@ impl ExpertState {
     }
 
     fn snapshot_lifecycle(&mut self, op: ExpertLifecycleOp) -> ExpertLifecycleToken {
-        let predictor_op = op.to_predictor_op();
-        self.predictor
-            .lifecycle_checkpoint_if_supported(predictor_op)
-            .map(ExpertLifecycleToken::Compact)
-            .unwrap_or_else(|| ExpertLifecycleToken::Full(self.predictor.clone()))
+        self.predictor.lifecycle_checkpoint(op.to_predictor_op())
     }
 
     fn restore_lifecycle(&mut self, op: ExpertLifecycleOp, token: ExpertLifecycleToken) {
-        match token {
-            ExpertLifecycleToken::Full(predictor) => {
-                self.predictor = predictor;
-            }
-            ExpertLifecycleToken::Compact(checkpoint) => {
-                let restored = self
-                    .predictor
-                    .restore_lifecycle_checkpoint_if_supported(op.to_predictor_op(), checkpoint);
-                assert!(
-                    restored,
-                    "predictor returned an unsupported lifecycle checkpoint for restore"
-                );
-            }
-        }
+        self.predictor
+            .restore_lifecycle(op.to_predictor_op(), token);
     }
 
     fn discard_lifecycle(&mut self, op: ExpertLifecycleOp, token: ExpertLifecycleToken) {
-        match token {
-            ExpertLifecycleToken::Full(_) => {}
-            ExpertLifecycleToken::Compact(checkpoint) => {
-                let discarded = self
-                    .predictor
-                    .discard_lifecycle_checkpoint_if_supported(op.to_predictor_op(), checkpoint);
-                assert!(
-                    discarded,
-                    "predictor returned an unsupported lifecycle checkpoint for discard"
-                );
-            }
-        }
+        self.predictor
+            .discard_lifecycle(op.to_predictor_op(), token);
     }
 
     fn snapshot_state_lifecycle(
@@ -3603,6 +3601,9 @@ fn apply_fading_update_from_logps(
     log_evidence - log_prior_norm
 }
 
+// The switching update coordinates expert weights, scratch buffers, schedule
+// parameters, and the mutation counter in one hot-path pass; a config wrapper
+// would obscure which state is read-only versus updated in place.
 #[allow(clippy::too_many_arguments)]
 fn apply_switching_update_from_logps(
     experts: &mut [ExpertState],
@@ -6129,7 +6130,7 @@ mod lifecycle_tests {
             name: name.to_string(),
             log_weight: 0.0,
             log_prior: 0.0,
-            predictor: Box::new(LifecycleMockPredict { state, fail }),
+            predictor: ExpertPredictor::generic(Box::new(LifecycleMockPredict { state, fail })),
             cum_log_loss: 0.0,
         }
     }
@@ -6238,22 +6239,22 @@ mod lifecycle_tests {
                 name: "failing".to_string(),
                 log_weight: 0.0,
                 log_prior: 0.0,
-                predictor: Box::new(CloneCountingLifecyclePredict {
+                predictor: ExpertPredictor::generic(Box::new(CloneCountingLifecyclePredict {
                     state: 1,
                     fail: Some(ExpertLifecycleOp::BeginStream),
                     clones: clones.clone(),
-                }),
+                })),
                 cum_log_loss: 0.0,
             },
             ExpertState {
                 name: "unreached".to_string(),
                 log_weight: 0.0,
                 log_prior: 0.0,
-                predictor: Box::new(CloneCountingLifecyclePredict {
+                predictor: ExpertPredictor::generic(Box::new(CloneCountingLifecyclePredict {
                     state: 2,
                     fail: None,
                     clones: clones.clone(),
-                }),
+                })),
                 cum_log_loss: 0.0,
             },
         ];
@@ -7594,17 +7595,19 @@ mod tests {
                 name: "nested".to_string(),
                 log_weight: 0.0,
                 log_prior: 0.0,
-                predictor: Box::new(RateBackendPredictor::Mixture { runtime: inner }),
+                predictor: ExpertPredictor::rate_backend(RateBackendPredictor::Mixture {
+                    runtime: inner,
+                }),
                 cum_log_loss: 0.0,
             },
             ExpertState {
                 name: "failing".to_string(),
                 log_weight: 0.0,
                 log_prior: 0.0,
-                predictor: Box::new(FailingNonResettableFreshPredict {
+                predictor: ExpertPredictor::generic(Box::new(FailingNonResettableFreshPredict {
                     learned: 0,
                     begin_calls: failing_begin_calls.clone(),
-                }),
+                })),
                 cum_log_loss: 0.0,
             },
         ];

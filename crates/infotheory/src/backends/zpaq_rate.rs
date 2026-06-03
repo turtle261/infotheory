@@ -19,10 +19,6 @@ mod imp {
         last_bits: f64,
     }
 
-    /// Compatibility no-op retained for callers that historically released a
-    /// process-global active stream before running other ZPAQ operations.
-    pub(crate) fn release_active_zpaq_rate_stream() {}
-
     /// Stateful ZPAQ-backed estimator of sequential symbol log-probabilities.
     pub struct ZpaqRateModel {
         stream: ZpaqStreaming,
@@ -521,13 +517,9 @@ mod imp {
     pub fn validate_zpaq_rate_method(_method: &str) -> Result<(), String> {
         Err("zpaq backend disabled at compile time".to_string())
     }
-
-    pub(crate) fn release_active_zpaq_rate_stream() {}
 }
 
 /// Stateful ZPAQ-based rate estimator.
 pub use imp::ZpaqRateModel;
-#[cfg(feature = "backend-zpaq")]
-pub(crate) use imp::release_active_zpaq_rate_stream;
 /// Validate that a ZPAQ method string is streamable and usable for rate modeling.
 pub use imp::validate_zpaq_rate_method;

@@ -1590,7 +1590,6 @@ fn read_mixture_value_with_zpaq_fallback(path: &Path) -> SpecResult<serde_json::
         Err(json_err) => {
             #[cfg(feature = "backend-zpaq")]
             {
-                crate::backends::zpaq_rate::release_active_zpaq_rate_stream();
                 let decompressed = zpaq_rs::decompress_to_vec(&raw).map_err(|_| {
                     SpecError::new(format!(
                         "failed to parse mixture JSON '{}': {json_err}",

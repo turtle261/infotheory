@@ -1544,8 +1544,8 @@ pub(crate) enum RatePdfPredictor {
 }
 
 impl RatePdfPredictor {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_compiled(backend: &CompiledRateBackend) -> Result<Self> {
+    #[cfg(test)]
+    fn from_compiled(backend: &CompiledRateBackend) -> Result<Self> {
         crate::runtime::build_rate_pdf_predictor(backend)
     }
 

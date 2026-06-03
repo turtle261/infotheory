@@ -445,7 +445,6 @@ impl RandomGenerator {
     fn initial_seed() -> u64 {
         #[cfg(feature = "backend-zpaq")]
         {
-            crate::backends::zpaq_rate::release_active_zpaq_rate_stream();
             if let Ok(bytes) = zpaq_rs::random_bytes(8) {
                 let mut seed_arr = [0u8; 8];
                 seed_arr.copy_from_slice(&bytes);

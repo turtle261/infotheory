@@ -1159,6 +1159,9 @@ fn unary_chain_log_weight_precomputed(
 }
 
 #[inline(always)]
+// The CTW ratio transform is a hot scalar kernel; grouping these independent
+// numeric inputs into a temporary struct would add ceremony without clarifying
+// ownership, invariants, or call-site meaning.
 #[allow(clippy::too_many_arguments)]
 fn unary_chain_ratio_transform_precomputed(
     kt_log_prob: f64,
@@ -1754,6 +1757,9 @@ impl CtArena {
         }
     }
 
+    // These fields are the exact segment state plus insertion context. Keeping
+    // them as scalar arguments avoids building a transient descriptor on this
+    // path-compression hot path.
     #[allow(clippy::too_many_arguments)]
     fn prepend_or_alloc_segment(
         &mut self,
@@ -2685,6 +2691,9 @@ impl CtEngine {
         ChildRef::from_segment(segment_idx)
     }
 
+    // Exact-mode updates thread together the log table, path state, and KT
+    // singleton value; a wrapper would only hide the data dependencies in this
+    // inner CTW update kernel.
     #[allow(clippy::too_many_arguments)]
     fn update_child_fast_exact<L: CtLogAccess>(
         &mut self,
@@ -3831,6 +3840,11 @@ impl ContextTree {
         }
     }
 
+    /// Capture rollback state for stream lifecycle transactions.
+    ///
+    /// This clones the full conditioning history, so the allocation and copy are
+    /// O(history length). It is intended for stream lifecycle boundaries rather
+    /// than per-symbol speculative prediction.
     pub(crate) fn lifecycle_snapshot(&self) -> ContextTreeLifecycleSnapshot {
         ContextTreeLifecycleSnapshot {
             history: self.history.clone(),
@@ -4257,31 +4271,6 @@ impl FacContextTree {
     }
 
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn predict_update_byte_msb_with_logs<L: CtLogAccess, E>(
-        &mut self,
-        logs: L,
-        choose_bit: &mut impl FnMut(usize, f64) -> Result<u8, E>,
-    ) -> Result<u8, E> {
-        let mut symbol = 0u8;
-        for bit_idx in 0..8usize {
-            let p_one =
-                self.trees[bit_idx].predict_one(&self.shared_history, self.shared_history_version);
-            let bit = choose_bit(bit_idx, p_one)? & 1;
-            symbol |= bit << (7 - bit_idx);
-            self.trees[bit_idx].update_predicted_with_logs(
-                logs,
-                bit == 1,
-                &self.shared_history,
-                self.shared_history_version,
-            );
-            self.shared_history.push(bit == 1);
-            self.bump_shared_history_version();
-        }
-        Ok(symbol)
-    }
-
-    #[inline]
     fn log_prob_update_byte_msb_with_logs<L: CtLogAccess>(&mut self, logs: L, byte: u8) -> f64 {
         let mut logp = 0.0;
         for bit_idx in 0..8usize {
@@ -4303,31 +4292,6 @@ impl FacContextTree {
             self.bump_shared_history_version();
         }
         logp
-    }
-
-    #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn predict_update_byte_msb<E>(
-        &mut self,
-        mut choose_bit: impl FnMut(usize, f64) -> Result<u8, E>,
-    ) -> Result<u8, E> {
-        debug_assert_eq!(self.num_bits, 8);
-        let upto = self.trees[0].engine.root_visits() + 1;
-        debug_assert!(
-            self.trees
-                .iter()
-                .all(|tree| tree.engine.root_visits() + 1 == upto)
-        );
-
-        if upto <= ctw_log_cache_limit() {
-            with_shared_cached_logs(upto, |logs| {
-                self.predict_update_byte_msb_with_logs(logs, &mut choose_bit)
-            })
-        } else {
-            with_shared_bounded_logs(upto, |logs| {
-                self.predict_update_byte_msb_with_logs(logs, &mut choose_bit)
-            })
-        }
     }
 
     #[inline]
@@ -4457,6 +4421,12 @@ impl FacContextTree {
         self.bump_shared_history_version();
     }
 
+    /// Capture rollback state for stream lifecycle transactions.
+    ///
+    /// This clones the shared conditioning history and per-tree prepared-prefix
+    /// state, so the allocation and copy are O(shared history length + number of
+    /// FAC component trees). It is intended for stream lifecycle boundaries
+    /// rather than per-symbol speculative prediction.
     pub(crate) fn lifecycle_snapshot(&self) -> FacContextTreeLifecycleSnapshot {
         FacContextTreeLifecycleSnapshot {
             shared_history: self.shared_history.clone(),
@@ -5813,33 +5783,6 @@ mod tests {
                 by_bits.get_log_block_probability(),
             );
             assert_eq!(by_byte.shared_history, by_bits.shared_history);
-        }
-    }
-
-    #[test]
-    fn fac_ctw_predict_update_byte_msb_matches_manual_fast_path() {
-        let mut batched = FacContextTree::new(6, 8);
-        for &byte in b"predict update byte msb regression payload" {
-            let mut manual = batched.clone();
-            let mut predicted = [0.0f64; 8];
-            let observed = batched
-                .predict_update_byte_msb(|bit_idx, p_one| -> Result<u8, ()> {
-                    predicted[bit_idx] = p_one;
-                    let bit = (byte >> (7 - bit_idx)) & 1;
-                    Ok(bit)
-                })
-                .unwrap();
-            assert_eq!(observed, byte);
-            for (bit_idx, &predicted_p) in predicted.iter().enumerate() {
-                assert_close(predicted_p, manual.predict_one(bit_idx));
-                let bit = (byte >> (7 - bit_idx)) & 1;
-                manual.update_predicted(bit == 1, bit_idx);
-            }
-            assert_eq!(batched.shared_history, manual.shared_history);
-            assert_close(
-                batched.get_log_block_probability(),
-                manual.get_log_block_probability(),
-            );
         }
     }
 

@@ -263,7 +263,6 @@ pub(crate) fn aligned_prefix<'a>(x: &'a [u8], y: &'a [u8]) -> (&'a [u8], &'a [u8
 #[cfg(feature = "backend-zpaq")]
 #[inline(always)]
 pub(crate) fn try_zpaq_compress_size_bytes(data: &[u8], method: &str) -> InfotheoryResult<u64> {
-    crate::backends::zpaq_rate::release_active_zpaq_rate_stream();
     zpaq_rs::compress_size(data, method)
         .map_err(|err| InfotheoryError::runtime(format!("zpaq size compression failed: {err}")))
 }
@@ -283,7 +282,6 @@ pub(crate) fn try_zpaq_compress_size_parallel_bytes(
     method: &str,
     threads: usize,
 ) -> InfotheoryResult<u64> {
-    crate::backends::zpaq_rate::release_active_zpaq_rate_stream();
     zpaq_rs::compress_size_parallel(data, method, threads).map_err(|err| {
         InfotheoryError::runtime(format!("zpaq parallel size compression failed: {err}"))
     })
@@ -307,7 +305,6 @@ pub(crate) fn try_zpaq_compress_size_stream<R: std::io::Read + Send>(
     reader: R,
     method: &str,
 ) -> InfotheoryResult<u64> {
-    crate::backends::zpaq_rate::release_active_zpaq_rate_stream();
     zpaq_rs::compress_size_stream(reader, method, None, None)
         .map_err(|err| InfotheoryError::runtime(format!("zpaq stream compression failed: {err}")))
 }
@@ -319,7 +316,6 @@ pub(crate) fn try_zpaq_compress_size_stream_parallel<R: std::io::Read + Send>(
     method: &str,
     threads: usize,
 ) -> InfotheoryResult<u64> {
-    crate::backends::zpaq_rate::release_active_zpaq_rate_stream();
     zpaq_rs::compress_size_stream_parallel(reader, method, None, None, threads)
         .map_err(|err| InfotheoryError::runtime(format!("zpaq stream compression failed: {err}")))
 }
@@ -350,7 +346,6 @@ pub(crate) fn try_zpaq_compress_size_stream<R: std::io::Read + Send>(
 #[cfg(feature = "backend-zpaq")]
 #[inline(always)]
 pub(crate) fn zpaq_compress_to_vec(data: &[u8], method: &str) -> anyhow::Result<Vec<u8>> {
-    crate::backends::zpaq_rate::release_active_zpaq_rate_stream();
     Ok(zpaq_rs::compress_to_vec(data, method)?)
 }
 
@@ -363,7 +358,6 @@ pub(crate) fn zpaq_compress_to_vec(_data: &[u8], _method: &str) -> anyhow::Resul
 #[cfg(feature = "backend-zpaq")]
 #[inline(always)]
 pub(crate) fn zpaq_decompress_to_vec(data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    crate::backends::zpaq_rate::release_active_zpaq_rate_stream();
     Ok(zpaq_rs::decompress_to_vec(data)?)
 }
 

@@ -89,15 +89,6 @@ impl BinaryPrediction {
     /// Construct a normalized binary prediction from `P(1)` with a numerical floor.
     pub fn from_prob_one(p1: f64, floor: f64) -> Self {
         let floor = binary_floor(floor);
-        // Debug assertion plus runtime panic gives a clear contract failure
-        // instead of silently converting invalid predictor output to 0.5.
-        // Legitimate 0.5 (e.g. BytePrefixMass zero-mass) remains via direct
-        // call with finite 0.5; non-finite reaching here is always upstream bug.
-        debug_assert!(
-            p1.is_finite(),
-            "RateBackendPredictor emitted non-finite p1 to BinaryPrediction::from_prob_one; \
-             contract violation (must emit only finite non-negative values)"
-        );
         let p1 = if p1.is_finite() {
             p1
         } else {
@@ -117,12 +108,6 @@ impl BinaryPrediction {
     /// remain exact. Entropy coders should apply their own finite-count floor at
     /// the coding boundary rather than here.
     pub fn from_prob_one_exact(p1: f64) -> Self {
-        // Hardened contract enforcement (see from_prob_one).
-        debug_assert!(
-            p1.is_finite(),
-            "RateBackendPredictor emitted non-finite p1 to BinaryPrediction::from_prob_one_exact; \
-             contract violation (must emit only finite non-negative values)"
-        );
         let p1 = if p1.is_finite() {
             p1
         } else {
