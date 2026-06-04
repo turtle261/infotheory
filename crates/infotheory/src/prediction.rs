@@ -13,7 +13,8 @@
 //! entropy coders) may rely on this. Non-finite or negative outputs from a
 //! predictor indicate an internal bug and are treated as contract violations
 //! (surfaced via `panic!` with rich context in both debug and release builds for
-//! `BinaryPrediction` constructors and the `binary_prediction_from_*` helpers).
+//! infallible `BinaryPrediction` constructors and the `binary_prediction_from_*`
+//! helpers).
 //! Legitimate 0.5 / uniform policies remain only in the documented mathematical
 //! cases below (measure-zero conditioning limits, not arithmetic corruption).
 //!
@@ -87,19 +88,36 @@ pub struct BinaryPrediction {
 
 impl BinaryPrediction {
     /// Construct a normalized binary prediction from `P(1)` with a numerical floor.
+    ///
+    /// Finite values outside `[0, 1]` are clamped after applying the numerical
+    /// floor. Non-finite `floor` values are treated as the default floor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `p1` is not finite. This constructor is intended for
+    /// predictor outputs that have already satisfied the predictor contract; use
+    /// [`Self::checked_from_prob_one`] for caller-controlled input.
     pub fn from_prob_one(p1: f64, floor: f64) -> Self {
-        let floor = binary_floor(floor);
-        let p1 = if p1.is_finite() {
-            p1
-        } else {
+        Self::checked_from_prob_one(p1, floor).unwrap_or_else(|| {
             panic!(
                 "RateBackendPredictor emitted non-finite p1 to BinaryPrediction::from_prob_one; \
                  this is now a hard contract violation (predictors must emit only finite \
                  non-negative values). See prediction.rs module docs and BinaryPrediction ctors."
             )
-        };
+        })
+    }
+
+    /// Checked variant of [`Self::from_prob_one`].
+    ///
+    /// Returns `None` when `p1` is not finite. Finite values outside `[0, 1]`
+    /// are clamped using the same floor semantics as [`Self::from_prob_one`].
+    pub fn checked_from_prob_one(p1: f64, floor: f64) -> Option<Self> {
+        if !p1.is_finite() {
+            return None;
+        }
+        let floor = binary_floor(floor);
         let p1 = p1.clamp(floor, 1.0 - floor);
-        Self { p0: 1.0 - p1, p1 }
+        Some(Self { p0: 1.0 - p1, p1 })
     }
 
     /// Construct an exact normalized binary prediction from `P(1)`.
@@ -107,18 +125,32 @@ impl BinaryPrediction {
     /// This preserves hard support semantics: exact `0` and `1` probabilities
     /// remain exact. Entropy coders should apply their own finite-count floor at
     /// the coding boundary rather than here.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `p1` is not finite. This constructor is intended for
+    /// predictor outputs that have already satisfied the predictor contract; use
+    /// [`Self::checked_from_prob_one_exact`] for caller-controlled input.
     pub fn from_prob_one_exact(p1: f64) -> Self {
-        let p1 = if p1.is_finite() {
-            p1
-        } else {
+        Self::checked_from_prob_one_exact(p1).unwrap_or_else(|| {
             panic!(
                 "RateBackendPredictor emitted non-finite p1 to BinaryPrediction::from_prob_one_exact; \
                  this is now a hard contract violation (predictors must emit only finite \
                  non-negative values). See prediction.rs module docs and BinaryPrediction ctors."
             )
-        };
+        })
+    }
+
+    /// Checked variant of [`Self::from_prob_one_exact`].
+    ///
+    /// Returns `None` when `p1` is not finite. Finite values outside `[0, 1]`
+    /// are clamped exactly as in [`Self::from_prob_one_exact`].
+    pub fn checked_from_prob_one_exact(p1: f64) -> Option<Self> {
+        if !p1.is_finite() {
+            return None;
+        }
         let p1 = p1.clamp(0.0, 1.0);
-        Self { p0: 1.0 - p1, p1 }
+        Some(Self { p0: 1.0 - p1, p1 })
     }
 
     /// Probability of `bit`.
@@ -415,6 +447,26 @@ mod tests {
     fn assert_binary_prediction_close(actual: BinaryPrediction, expected: BinaryPrediction) {
         assert!((actual.p0 - expected.p0).abs() < 1e-12);
         assert!((actual.p1 - expected.p1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn checked_binary_prediction_constructors_reject_non_finite_prob_one() {
+        for p1 in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(BinaryPrediction::checked_from_prob_one(p1, 0.0).is_none());
+            assert!(BinaryPrediction::checked_from_prob_one_exact(p1).is_none());
+        }
+
+        assert_binary_prediction_close(
+            BinaryPrediction::checked_from_prob_one(1.2, 0.01).expect("finite p1 should construct"),
+            BinaryPrediction {
+                p0: 1.0 - 0.99,
+                p1: 0.99,
+            },
+        );
+        assert_eq!(
+            BinaryPrediction::checked_from_prob_one_exact(-0.5),
+            Some(BinaryPrediction { p0: 1.0, p1: 0.0 })
+        );
     }
 
     fn bit_at(symbol: u8, order: BitOrder, bit_idx: u8) -> bool {

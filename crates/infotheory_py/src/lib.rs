@@ -1538,6 +1538,12 @@ impl From<BinaryPrediction> for PyBinaryPrediction {
     }
 }
 
+fn invalid_binary_prediction_prob_one(p1: f64) -> PyErr {
+    PyValueError::new_err(format!(
+        "Invalid binary prediction probability: p1={p1} (must be finite)"
+    ))
+}
+
 #[pymethods]
 impl PyBinaryPrediction {
     #[new]
@@ -1558,19 +1564,25 @@ impl PyBinaryPrediction {
         // Canonicalize every accepted pair through the core type. Even when
         // `p0 + p1` rounds to exactly `1.0`, floating-point addition does not
         // guarantee that `p0 == 1.0 - p1`.
-        Ok(BinaryPrediction::from_prob_one_exact(p1 / sum).into())
+        BinaryPrediction::checked_from_prob_one_exact(p1 / sum)
+            .map(Into::into)
+            .ok_or_else(|| invalid_binary_prediction_prob_one(p1))
     }
 
     #[staticmethod]
     #[pyo3(signature = (p1, floor=None))]
-    fn from_prob_one(p1: f64, floor: Option<f64>) -> Self {
+    fn from_prob_one(p1: f64, floor: Option<f64>) -> PyResult<Self> {
         let floor = floor.unwrap_or(0.0);
-        BinaryPrediction::from_prob_one(p1, floor).into()
+        BinaryPrediction::checked_from_prob_one(p1, floor)
+            .map(Into::into)
+            .ok_or_else(|| invalid_binary_prediction_prob_one(p1))
     }
 
     #[staticmethod]
-    fn from_prob_one_exact(p1: f64) -> Self {
-        BinaryPrediction::from_prob_one_exact(p1).into()
+    fn from_prob_one_exact(p1: f64) -> PyResult<Self> {
+        BinaryPrediction::checked_from_prob_one_exact(p1)
+            .map(Into::into)
+            .ok_or_else(|| invalid_binary_prediction_prob_one(p1))
     }
 
     fn prob(&self, bit: bool) -> f64 {

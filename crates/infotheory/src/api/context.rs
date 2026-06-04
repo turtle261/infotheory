@@ -580,7 +580,7 @@ impl RateBackendBitSession {
         }
     }
 
-    /// Advance conditioning state with one bit without fitting/adapting.
+    /// Observe one adaptive/fitting bit.
     pub fn observe_bit(&mut self, bit: bool) {
         self.try_observe_bit(bit).unwrap_or_else(|err| {
             panic!("observe_bit rejected an invalid bit-session update: {err}")

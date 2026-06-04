@@ -62,6 +62,12 @@ def test_binary_prediction():
     assert floored.p1 == 0.99
     assert abs(floored.p0 - 0.01) < 1e-12
 
+    for invalid in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError, match="must be finite"):
+            ait.BinaryPrediction.from_prob_one(invalid)
+        with pytest.raises(ValueError, match="must be finite"):
+            ait.BinaryPrediction.from_prob_one_exact(invalid)
+
     # Accept tiny floating-point drift, but canonicalize back to an exact complement.
     pred_near_one = ait.BinaryPrediction(math.nextafter(1.0, 0.0), 0.0)
     assert pred_near_one.p0 == 1.0
