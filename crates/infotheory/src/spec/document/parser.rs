@@ -14,6 +14,7 @@ use super::{
     compression_backend_to_json_value,
 };
 use crate::aixi::common::{ActionAlphabet, MctsStrategy};
+use crate::api::{BitOrder, BitStreamSemantics};
 use std::num::NonZeroUsize;
 
 #[cfg(feature = "vm")]
@@ -519,6 +520,10 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                 base_dir,
                 crate::api::MAX_MIXTURE_NESTING,
             )?,
+            bit_stream_semantics: parse_bit_stream_semantics(
+                value.get("bit_stream_semantics"),
+                "controller.bit_stream_semantics",
+            )?,
             agent_horizon: required_usize(&value["agent_horizon"], "controller.agent_horizon")?,
             num_simulations: required_usize(
                 &value["num_simulations"],
@@ -540,6 +545,10 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     &value["predictor"],
                     base_dir,
                     crate::api::MAX_MIXTURE_NESTING,
+                )?,
+                bit_stream_semantics: parse_bit_stream_semantics(
+                    value.get("bit_stream_semantics"),
+                    "controller.bit_stream_semantics",
                 )?,
                 discount_gamma: required_f64(
                     &value["discount_gamma"],
@@ -571,6 +580,10 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     base_dir,
                     crate::api::MAX_MIXTURE_NESTING,
                 )?,
+                bit_stream_semantics: parse_bit_stream_semantics(
+                    value.get("bit_stream_semantics"),
+                    "controller.bit_stream_semantics",
+                )?,
                 return_horizon: required_usize(
                     &value["return_horizon"],
                     "controller.return_horizon",
@@ -591,6 +604,43 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
             },
         )),
         other => Err(SpecError::new(format!("unknown controller kind '{other}'"))),
+    }
+}
+
+fn parse_bit_stream_semantics(
+    value: Option<&serde_json::Value>,
+    label: &str,
+) -> SpecResult<BitStreamSemantics> {
+    let Some(value) = value else {
+        // Default for absent bit_stream_semantics is BinaryTokens (AIXI planner
+        // paths explicitly set their own default via aixi::model when needed).
+        // This reference must remain feature-agnostic for parser hygiene.
+        return Ok(BitStreamSemantics::BinaryTokens);
+    };
+    let Some(object) = value.as_object() else {
+        return Err(SpecError::new(format!(
+            "{label} must be an object with a 'kind' field"
+        )));
+    };
+    let kind = object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| SpecError::new(format!("{label}.kind is required")))?;
+    match kind {
+        "byte_packed" => {
+            let order = match object.get("order").and_then(serde_json::Value::as_str) {
+                Some("msb_first") | None => BitOrder::MsbFirst,
+                Some("lsb_first") => BitOrder::LsbFirst,
+                Some(other) => {
+                    return Err(SpecError::new(format!("unknown {label}.order '{other}'")));
+                }
+            };
+            Ok(BitStreamSemantics::BytePacked { order })
+        }
+        "binary_tokens" => Ok(BitStreamSemantics::BinaryTokens),
+        other => Err(SpecError::new(format!(
+            "unknown bit stream semantics kind '{other}'"
+        ))),
     }
 }
 

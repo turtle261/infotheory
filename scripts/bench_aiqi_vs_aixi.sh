@@ -164,8 +164,7 @@ def run_mcaixi(args):
     min_reward = 0
     max_reward = 1
     cfg = ait.AgentConfig(
-      algorithm="ac-ctw",
-      ct_depth=4,
+      rate_backend=ait.RateBackend.ctw(4),
       agent_horizon=6,
       observation_bits=observation_bits,
       observation_stream_len=1,
@@ -185,8 +184,7 @@ def run_mcaixi(args):
     min_reward = -2
     max_reward = 4
     cfg = ait.AgentConfig(
-      algorithm="ac-ctw",
-      ct_depth=42,
+      rate_backend=ait.RateBackend.ctw(42),
       agent_horizon=2,
       observation_bits=observation_bits,
       observation_stream_len=1,

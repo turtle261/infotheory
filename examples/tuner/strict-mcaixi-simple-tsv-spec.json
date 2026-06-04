@@ -1,21 +1,50 @@
 {
-  "schema_version": 1,
   "kind": "tune",
   "assets": [
     {
-      "id": "dataset",
-      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
+      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv",
+      "id": "dataset"
     }
   ],
   "input_asset": "dataset",
   "baseline_candidate": {
     "kind": "rate-ac",
+    "framing": "framed",
     "rate_backend": {
-      "kind": "ctw",
-      "depth": 10
-    },
-    "framing": "framed"
+      "kind": "fac-ctw",
+      "num_percept_bits": 8,
+      "encoding_bits": 8,
+      "base_depth": 10
+    }
   },
+  "eval_time_limit_seconds": 2,
+  "time_budget_seconds": 180,
+  "bounds": {
+    "max_experts": 4,
+    "max_mixture_nesting_depth": 2,
+    "min_experts": 1,
+    "allow_duplicate_experts": false,
+    "required_experts": [],
+    "forbidden_expert_pairs": [],
+    "allowed_backends": [
+      "fac-ctw",
+      "mixture",
+      "calibrated"
+    ],
+    "forbidden_backends": [],
+    "parameter_ranges": [
+      {
+        "min": 4,
+        "parameter": "rate_backend.base_depth",
+        "max": 24
+      }
+    ]
+  },
+  "max_memory_bytes": 1099511627776,
+  "output_config_path": "strict-mcaixi-simple-tsv-output.json",
+  "min_throughput_bytes_per_second": 1,
+  "seed": 29,
+  "report_path": "strict-mcaixi-simple-tsv-report.json",
   "controller": {
     "kind": "mc_aixi_fac_ctw",
     "interface": {
@@ -27,33 +56,5 @@
     },
     "planner_simulations_per_step": 4
   },
-  "bounds": {
-    "allowed_backends": [
-      "ctw",
-      "fac-ctw",
-      "mixture",
-      "calibrated"
-    ],
-    "forbidden_backends": [],
-    "parameter_ranges": [
-      {
-        "parameter": "rate_backend.depth",
-        "min": 4.0,
-        "max": 24.0
-      }
-    ],
-    "max_experts": 4,
-    "max_mixture_nesting_depth": 2,
-    "min_experts": 1,
-    "allow_duplicate_experts": false,
-    "required_experts": [],
-    "forbidden_expert_pairs": []
-  },
-  "eval_time_limit_seconds": 2.0,
-  "time_budget_seconds": 180.0,
-  "min_throughput_bytes_per_second": 1.0,
-  "max_memory_bytes": 1099511627776,
-  "output_config_path": "strict-mcaixi-simple-tsv-output.json",
-  "seed": 29,
-  "report_path": "strict-mcaixi-simple-tsv-report.json"
+  "schema_version": 1
 }

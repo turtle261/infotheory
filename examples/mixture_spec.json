@@ -1,40 +1,42 @@
 {
-  "kind": "switching",
-  "alpha": 0.02,
   "experts": [
     {
       "name": "rosa-6",
+      "log_prior": 0,
       "kind": "rosaplus",
-      "max_order": 6,
-      "log_prior": 0.0
+      "max_order": 6
     },
     {
+      "encoding_bits": 8,
+      "log_prior": 0,
+      "base_depth": 16,
       "name": "ctw-16",
-      "kind": "ctw",
-      "depth": 16,
-      "log_prior": 0.0
+      "kind": "fac-ctw",
+      "num_percept_bits": 8
     },
     {
       "name": "nested-bayes",
-      "kind": "mixture",
-      "log_prior": -0.2,
       "spec": {
         "kind": "bayes",
         "experts": [
           {
-            "name": "fac-ctw-12",
-            "kind": "fac-ctw",
-            "base_depth": 12,
             "encoding_bits": 8,
+            "name": "fac-ctw-12",
+            "base_depth": 12,
+            "kind": "fac-ctw",
             "num_percept_bits": 8
           },
           {
             "name": "zpaq-2",
-            "kind": "zpaq",
-            "method": "2"
+            "method": "2",
+            "kind": "zpaq"
           }
         ]
-      }
+      },
+      "kind": "mixture",
+      "log_prior": -0.2
     }
-  ]
+  ],
+  "kind": "switching",
+  "alpha": 0.02
 }

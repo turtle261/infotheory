@@ -42,6 +42,59 @@ pub(crate) const SHORTHAND_DEFAULT_SEQUITUR_CONTEXT_BYTES: usize =
     JSON_DEFAULT_SEQUITUR_CONTEXT_BYTES;
 pub(crate) const SHORTHAND_DEFAULT_ZPAQ_RATE_METHOD: &str = JSON_DEFAULT_ZPAQ_RATE_METHOD;
 
+/// Construct a [`RateBackend::FacCtw`] from explicit field values.
+///
+/// `msb_first: None` defers to compile-time default (`encoding_bits == 8` → MSB-first).
+pub fn fac_ctw_rate_backend(
+    base_depth: usize,
+    num_percept_bits: usize,
+    encoding_bits: usize,
+    msb_first: Option<bool>,
+) -> RateBackend {
+    RateBackend::FacCtw {
+        base_depth,
+        num_percept_bits,
+        encoding_bits,
+        msb_first,
+    }
+}
+
+/// JSON leaf object for a factorized CTW rate backend.
+///
+/// Omits `msb_first` when `None` so compile-time defaults apply consistently.
+///
+/// This is intentionally test-only; production code should construct
+/// `RateBackend::FacCtw` via typed APIs and parse paths.
+#[cfg(all(test, feature = "backend-ctw"))]
+pub fn fac_ctw_spec_json(
+    base_depth: usize,
+    num_percept_bits: usize,
+    encoding_bits: usize,
+    msb_first: Option<bool>,
+) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "kind".to_string(),
+        serde_json::Value::String("fac-ctw".to_string()),
+    );
+    object.insert(
+        "base_depth".to_string(),
+        serde_json::Value::Number(base_depth.into()),
+    );
+    object.insert(
+        "num_percept_bits".to_string(),
+        serde_json::Value::Number(num_percept_bits.into()),
+    );
+    object.insert(
+        "encoding_bits".to_string(),
+        serde_json::Value::Number(encoding_bits.into()),
+    );
+    if let Some(msb_first) = msb_first {
+        object.insert("msb_first".to_string(), serde_json::Value::Bool(msb_first));
+    }
+    serde_json::Value::Object(object)
+}
+
 pub(crate) fn runtime_default_rate_backend_spec(kind: RateBackendKind) -> Option<RateBackend> {
     match kind {
         RateBackendKind::RosaPlus => Some(RateBackend::RosaPlus { max_order: -1 }),
@@ -67,11 +120,12 @@ pub(crate) fn runtime_default_rate_backend_spec(kind: RateBackendKind) -> Option
         }),
         RateBackendKind::Sequitur => Some(RateBackend::Sequitur { context_bytes: 32 }),
         RateBackendKind::Ctw => Some(RateBackend::Ctw { depth: 8 }),
-        RateBackendKind::FacCtw => Some(RateBackend::FacCtw {
-            base_depth: 8,
-            num_percept_bits: FAC_CTW_DEFAULT_NUM_PERCEPT_BITS,
-            encoding_bits: JSON_DEFAULT_FAC_CTW_ENCODING_BITS,
-        }),
+        RateBackendKind::FacCtw => Some(fac_ctw_rate_backend(
+            8,
+            FAC_CTW_DEFAULT_NUM_PERCEPT_BITS,
+            JSON_DEFAULT_FAC_CTW_ENCODING_BITS,
+            None,
+        )),
         RateBackendKind::Zpaq => Some(RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("2"),
         }),

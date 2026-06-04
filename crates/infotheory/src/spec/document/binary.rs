@@ -1,6 +1,7 @@
 //! Binary envelope codec for canonical top-level spec documents.
 
 use super::*;
+use crate::api::{BitOrder, BitStreamSemantics};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -561,11 +562,13 @@ fn encode_rate_backend(out: &mut Vec<u8>, backend: &RateBackend) {
             base_depth,
             num_percept_bits,
             encoding_bits,
+            msb_first,
         } => {
             out.push(6);
             push_u64(out, *base_depth as u64);
             push_u64(out, *num_percept_bits as u64);
             push_u64(out, *encoding_bits as u64);
+            push_option_bool(out, *msb_first);
         }
         RateBackend::Zpaq { method } => {
             out.push(7);
@@ -645,6 +648,7 @@ fn decode_rate_backend(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<R
             base_depth: cursor.read_u64()? as usize,
             num_percept_bits: cursor.read_u64()? as usize,
             encoding_bits: cursor.read_u64()? as usize,
+            msb_first: cursor.read_option_bool()?,
         }),
         7 => Ok(RateBackend::Zpaq {
             method: decode_zpaq_method_spec(cursor)?,
@@ -1050,6 +1054,7 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
         ControllerSpec::McAixi(inner) => {
             out.push(0);
             encode_rate_backend(out, &inner.predictor);
+            encode_bit_stream_semantics(out, inner.bit_stream_semantics);
             push_u64(out, inner.agent_horizon as u64);
             push_u64(out, inner.num_simulations as u64);
             encode_mcts_strategy(out, inner.mcts_strategy);
@@ -1059,6 +1064,7 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
         ControllerSpec::AiqiDiscounted(inner) => {
             out.push(1);
             encode_rate_backend(out, &inner.predictor);
+            encode_bit_stream_semantics(out, inner.bit_stream_semantics);
             push_f64(out, inner.discount_gamma);
             push_u64(out, inner.return_horizon as u64);
             push_u64(out, inner.return_bins as u64);
@@ -1069,6 +1075,7 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             out.push(2);
             encode_rate_backend(out, &inner.predictor);
+            encode_bit_stream_semantics(out, inner.bit_stream_semantics);
             push_u64(out, inner.return_horizon as u64);
             push_u64(out, inner.return_bins as u64);
             push_u64(out, inner.label_phase_period as u64);
@@ -1082,6 +1089,7 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
     match cursor.read_u8()? {
         0 => Ok(ControllerSpec::McAixi(McAixiControllerSpec {
             predictor: decode_rate_backend(cursor, base_dir)?,
+            bit_stream_semantics: decode_bit_stream_semantics(cursor)?,
             agent_horizon: cursor.read_u64()? as usize,
             num_simulations: cursor.read_u64()? as usize,
             mcts_strategy: decode_mcts_strategy(cursor)?,
@@ -1091,6 +1099,7 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
         1 => Ok(ControllerSpec::AiqiDiscounted(
             AiqiDiscountedControllerSpec {
                 predictor: decode_rate_backend(cursor, base_dir)?,
+                bit_stream_semantics: decode_bit_stream_semantics(cursor)?,
                 discount_gamma: cursor.read_f64()?,
                 return_horizon: cursor.read_u64()? as usize,
                 return_bins: cursor.read_u64()? as usize,
@@ -1102,6 +1111,7 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
         2 => Ok(ControllerSpec::AiqiWarmstartExactJh(
             WarmStartExactJhControllerSpec {
                 predictor: decode_rate_backend(cursor, base_dir)?,
+                bit_stream_semantics: decode_bit_stream_semantics(cursor)?,
                 return_horizon: cursor.read_u64()? as usize,
                 return_bins: cursor.read_u64()? as usize,
                 label_phase_period: cursor.read_u64()? as usize,
@@ -1110,6 +1120,36 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
             },
         )),
         tag => Err(SpecError::new(format!("unknown controller tag '{tag}'"))),
+    }
+}
+
+fn encode_bit_stream_semantics(out: &mut Vec<u8>, semantics: BitStreamSemantics) {
+    match semantics {
+        BitStreamSemantics::BytePacked { order } => {
+            out.push(0);
+            match order {
+                BitOrder::MsbFirst => out.push(0),
+                BitOrder::LsbFirst => out.push(1),
+            }
+        }
+        BitStreamSemantics::BinaryTokens => out.push(1),
+    }
+}
+
+fn decode_bit_stream_semantics(cursor: &mut Cursor<'_>) -> SpecResult<BitStreamSemantics> {
+    match cursor.read_u8()? {
+        0 => {
+            let order = match cursor.read_u8()? {
+                0 => BitOrder::MsbFirst,
+                1 => BitOrder::LsbFirst,
+                tag => return Err(SpecError::new(format!("unknown bit order tag '{tag}'"))),
+            };
+            Ok(BitStreamSemantics::BytePacked { order })
+        }
+        1 => Ok(BitStreamSemantics::BinaryTokens),
+        tag => Err(SpecError::new(format!(
+            "unknown bit stream semantics tag '{tag}'"
+        ))),
     }
 }
 
@@ -1904,6 +1944,16 @@ fn push_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
     }
 }
 
+fn push_option_bool(out: &mut Vec<u8>, value: Option<bool>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            push_bool(out, value);
+        }
+        None => out.push(0),
+    }
+}
+
 #[cfg(feature = "vm")]
 fn push_option_i64(out: &mut Vec<u8>, value: Option<i64>) {
     match value {
@@ -2009,6 +2059,14 @@ impl<'a> Cursor<'a> {
     fn read_option_u64(&mut self) -> SpecResult<Option<u64>> {
         if self.read_u8()? == 1 {
             Ok(Some(self.read_u64()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn read_option_bool(&mut self) -> SpecResult<Option<bool>> {
+        if self.read_u8()? == 1 {
+            Ok(Some(self.read_bool()?))
         } else {
             Ok(None)
         }

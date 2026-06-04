@@ -12,7 +12,7 @@ use crate::aixi::warmstart_contract::{
     standalone_exact_reward_encoding_certificate_hash,
     standalone_observation_adapter_content_crc32, warmstart_exact_jh_planner_task_fingerprint,
 };
-use crate::api::{RateBackend, validate_rate_backend};
+use crate::api::{BitStreamSemantics, RateBackend, validate_rate_backend};
 use crate::spec::{
     BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec,
     EnvironmentSpec, PlannerRunSpec, SpecError, WarmStartExactJhControllerSpec,
@@ -43,8 +43,8 @@ pub struct WarmStartExactJhTeacherTrace {
 
 /// Validates standalone planner-run provenance hashes against canonical standalone declarations.
 ///
-/// Used by [`WarmStartExactJhRuntimeConfig::validate_teacher_contract`] and by
-/// [`validate_warmstart_teacher_against_compiled_planner_run`].
+/// Used by the corresponding method on the private WarmStartExactJhRuntimeConfig
+/// and by `validate_warmstart_teacher_against_compiled_planner_run`.
 pub fn validate_standalone_warmstart_provenance(
     contract: &WarmStartExactJhTeacherContract,
     observation_bits: usize,
@@ -319,6 +319,8 @@ pub struct WarmStartExactJhConfig {
     pub label_phase_period: usize,
     /// Planner-side budget associated with a deployment decision.
     pub planner_simulations_per_step: usize,
+    /// Bit-stream semantics used to adapt the return-label predictor.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Optional deterministic RNG seed.
     pub random_seed: Option<u64>,
 }
@@ -336,6 +338,7 @@ impl Default for WarmStartExactJhConfig {
             return_bins: 2,
             label_phase_period: 1,
             planner_simulations_per_step: 1,
+            bit_stream_semantics: BitStreamSemantics::BinaryTokens,
             random_seed: None,
         }
     }
@@ -353,6 +356,7 @@ impl WarmStartExactJhConfig {
             },
             ControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhControllerSpec {
                 predictor: self.rate_backend.clone(),
+                bit_stream_semantics: self.bit_stream_semantics,
                 return_horizon: self.return_horizon,
                 return_bins: self.return_bins,
                 label_phase_period: self.label_phase_period,
@@ -674,8 +678,12 @@ impl WarmStartExactJhAgent {
         // predictor allocation and before trace replay.
         let config = WarmStartExactJhRuntimeConfig::from_compiled(compiled)?;
         config.validate_teacher_contract(&teacher.contract)?;
-        let predictor = match compiled.controller() {
-            CompiledPlannerController::AiqiWarmstartExactJh { predictor, .. } => predictor,
+        let (predictor, bit_stream_semantics) = match compiled.controller() {
+            CompiledPlannerController::AiqiWarmstartExactJh {
+                predictor,
+                bit_stream_semantics,
+                ..
+            } => (predictor, *bit_stream_semantics),
             _ => return Err(WarmStartExactJhError::ControllerKindMismatch),
         };
         if !predictor.supports_frozen_conditioning() {
@@ -688,7 +696,7 @@ impl WarmStartExactJhAgent {
         let mut phases = Vec::with_capacity(config.label_phase_period);
         for _ in 0..config.label_phase_period {
             phases.push(PhaseModel {
-                predictor: build_aiqi_predictor(predictor, return_bits)
+                predictor: build_aiqi_predictor(predictor, return_bits, bit_stream_semantics)
                     .map_err(WarmStartExactJhError::Predictor)?,
                 last_augmented_step: 0,
             });
@@ -920,6 +928,14 @@ impl WarmStartExactJhAgent {
         let return_labels_by_step = &self.return_labels_by_step;
         let action_bits = self.action_bits;
         let return_bits = self.return_bits;
+        let token_ctx = WarmStartAugmentedTokenContext {
+            config,
+            steps,
+            return_labels_by_step,
+            action_bits,
+            return_bits,
+            phase,
+        };
         let mut q_values = vec![0.0; self.config.agent_actions.get()];
         let mut pushed_history = 0usize;
         {
@@ -928,20 +944,16 @@ impl WarmStartExactJhAgent {
             let end = step.saturating_sub(1);
             if start <= end {
                 for idx in start..=end {
-                    pushed_history += push_step_tokens_history(
-                        config,
-                        steps,
-                        return_labels_by_step,
-                        action_bits,
-                        return_bits,
-                        model.predictor.as_mut(),
-                        phase,
-                        idx,
-                    )
-                    .expect("warm-start history encoding invariant");
+                    pushed_history +=
+                        push_step_tokens_history(&token_ctx, model.predictor.as_mut(), idx)
+                            .expect("warm-start history encoding invariant");
                 }
             }
-            for action in 0..self.config.agent_actions.get() {
+            for (action, q_value) in q_values
+                .iter_mut()
+                .enumerate()
+                .take(self.config.agent_actions.get())
+            {
                 let pushed_action =
                     push_encoded_bits_history(model.predictor.as_mut(), action as u64, action_bits);
                 let distribution = predict_return_distribution(
@@ -949,7 +961,7 @@ impl WarmStartExactJhAgent {
                     return_bits,
                     model.predictor.as_mut(),
                 );
-                q_values[action] = expected_exact_return(&self.config, &distribution);
+                *q_value = expected_exact_return(&self.config, &distribution);
                 pop_history_bits(model.predictor.as_mut(), pushed_action);
             }
             pop_history_bits(model.predictor.as_mut(), pushed_history);
@@ -962,22 +974,21 @@ impl WarmStartExactJhAgent {
         phase: usize,
         target_step: usize,
     ) -> Result<(), WarmStartExactJhError> {
+        let token_ctx = WarmStartAugmentedTokenContext {
+            config: &self.config,
+            steps: &self.steps,
+            return_labels_by_step: &self.return_labels_by_step,
+            action_bits: self.action_bits,
+            return_bits: self.return_bits,
+            phase,
+        };
         let model = &mut self.phases[phase];
         if target_step <= model.last_augmented_step {
             return Ok(());
         }
         let start = model.last_augmented_step + 1;
         for idx in start..=target_step {
-            push_augmented_step_tokens_commit(
-                &self.config,
-                &self.steps,
-                &self.return_labels_by_step,
-                self.action_bits,
-                self.return_bits,
-                model.predictor.as_mut(),
-                phase,
-                idx,
-            )?;
+            push_augmented_step_tokens_commit(&token_ctx, model.predictor.as_mut(), idx)?;
         }
         model.last_augmented_step = target_step;
         Ok(())
@@ -1447,48 +1458,51 @@ fn exact_return_from_label(config: &WarmStartExactJhRuntimeConfig, label: u64) -
     (min_return + label as i128) as f64
 }
 
-fn push_augmented_step_tokens_commit(
-    config: &WarmStartExactJhRuntimeConfig,
-    steps: &[StepRecord],
-    return_labels_by_step: &[Option<u64>],
+struct WarmStartAugmentedTokenContext<'a> {
+    config: &'a WarmStartExactJhRuntimeConfig,
+    steps: &'a [StepRecord],
+    return_labels_by_step: &'a [Option<u64>],
     action_bits: usize,
     return_bits: usize,
-    predictor: &mut dyn Predictor,
     phase: usize,
+}
+
+fn push_augmented_step_tokens_commit(
+    ctx: &WarmStartAugmentedTokenContext<'_>,
+    predictor: &mut dyn Predictor,
     idx: usize,
 ) -> Result<usize, WarmStartExactJhError> {
-    let step = &steps[idx - 1];
+    let step = &ctx.steps[idx - 1];
     let mut pushed = 0usize;
-    pushed += push_action_tokens_commit_history(predictor, step.action, action_bits);
-    if idx % config.label_phase_period == phase {
-        let label = return_labels_by_step[idx - 1]
-            .ok_or(WarmStartExactJhError::MissingReturnLabel { step: idx, phase })?;
-        pushed += push_encoded_bits_commit(predictor, label, return_bits);
+    pushed += push_action_tokens_commit_history(predictor, step.action, ctx.action_bits);
+    if idx % ctx.config.label_phase_period == ctx.phase {
+        let label = ctx.return_labels_by_step[idx - 1].ok_or(
+            WarmStartExactJhError::MissingReturnLabel {
+                step: idx,
+                phase: ctx.phase,
+            },
+        )?;
+        pushed += push_encoded_bits_commit(predictor, label, ctx.return_bits);
     }
     pushed +=
-        push_percept_tokens_commit_history(config, predictor, &step.observations, step.reward)?;
+        push_percept_tokens_commit_history(ctx.config, predictor, &step.observations, step.reward)?;
     Ok(pushed)
 }
 
 fn push_step_tokens_history(
-    config: &WarmStartExactJhRuntimeConfig,
-    steps: &[StepRecord],
-    return_labels_by_step: &[Option<u64>],
-    action_bits: usize,
-    return_bits: usize,
+    ctx: &WarmStartAugmentedTokenContext<'_>,
     predictor: &mut dyn Predictor,
-    phase: usize,
     idx: usize,
 ) -> Result<usize, WarmStartExactJhError> {
-    let step = &steps[idx - 1];
+    let step = &ctx.steps[idx - 1];
     let mut pushed = 0usize;
-    pushed += push_encoded_bits_history(predictor, step.action, action_bits);
-    if idx % config.label_phase_period == phase
-        && let Some(label) = return_labels_by_step[idx - 1]
+    pushed += push_encoded_bits_history(predictor, step.action, ctx.action_bits);
+    if idx % ctx.config.label_phase_period == ctx.phase
+        && let Some(label) = ctx.return_labels_by_step[idx - 1]
     {
-        pushed += push_encoded_bits_history(predictor, label, return_bits);
+        pushed += push_encoded_bits_history(predictor, label, ctx.return_bits);
     }
-    pushed += push_percept_tokens_history(config, predictor, &step.observations, step.reward)?;
+    pushed += push_percept_tokens_history(ctx.config, predictor, &step.observations, step.reward)?;
     Ok(pushed)
 }
 
@@ -1687,6 +1701,7 @@ mod tests {
             return_bins: 4,
             label_phase_period: 1,
             planner_simulations_per_step: 3,
+            bit_stream_semantics: BitStreamSemantics::BinaryTokens,
             random_seed: Some(9),
         }
     }
@@ -2132,6 +2147,93 @@ mod tests {
             "test seed must make forced exploration distinguishable from a fixed action"
         );
         assert!(first_exploratory != greedy || second_exploratory != greedy);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_bytepacked_ctw_teacher_replay_and_live_step() {
+        use crate::api::BitOrder;
+
+        let cfg = WarmStartExactJhConfig {
+            rate_backend: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: BitStreamSemantics::BytePacked {
+                order: BitOrder::MsbFirst,
+            },
+            observation_bits: 8,
+            observation_stream_len: 1,
+            reward_bits: 8,
+            agent_actions: action_alphabet(256),
+            return_horizon: 1,
+            return_bins: 256,
+            label_phase_period: 1,
+            planner_simulations_per_step: 3,
+            random_seed: Some(42),
+        };
+        let teacher = WarmStartExactJhTeacherDataset {
+            contract: teacher_for_config(&cfg).contract,
+            traces: vec![WarmStartExactJhTeacherTrace {
+                transitions: vec![WarmStartExactJhTransition {
+                    action: 0,
+                    observations: vec![5],
+                    reward: 17,
+                }],
+            }],
+        };
+        let mut agent_a = WarmStartExactJhAgent::new(cfg.clone(), teacher.clone())
+            .expect("byte-packed warmstart agent");
+        let mut agent_b =
+            WarmStartExactJhAgent::new(cfg, teacher).expect("byte-packed warmstart replay agent");
+        assert_eq!(agent_a.teacher_label_count(), 1);
+        let planned_a = agent_a.get_planned_action();
+        let planned_b = agent_b.get_planned_action();
+        assert_eq!(
+            planned_a, planned_b,
+            "byte-packed warmstart planning must be deterministic under identical seed"
+        );
+        assert!(planned_a < 256);
+        agent_a
+            .observe_transition(planned_a, &[3], 10)
+            .expect("byte-packed live transition");
+        assert_eq!(agent_a.steps_observed(), 1);
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn warmstart_binarytokens_fac_ctw_teacher_replay_and_live_step() {
+        let cfg = WarmStartExactJhConfig {
+            rate_backend: RateBackend::FacCtw {
+                base_depth: 8,
+                num_percept_bits: 8,
+                encoding_bits: 8,
+                msb_first: Some(true),
+            },
+            bit_stream_semantics: BitStreamSemantics::BinaryTokens,
+            observation_bits: 2,
+            observation_stream_len: 1,
+            reward_bits: 2,
+            agent_actions: action_alphabet(2),
+            return_horizon: 1,
+            return_bins: 4,
+            label_phase_period: 1,
+            planner_simulations_per_step: 3,
+            random_seed: Some(7),
+        };
+        let teacher = teacher_for_config(&cfg);
+        let mut agent_a = WarmStartExactJhAgent::new(cfg.clone(), teacher.clone())
+            .expect("BinaryTokens FAC-CTW warmstart agent");
+        let mut agent_b = WarmStartExactJhAgent::new(cfg, teacher)
+            .expect("BinaryTokens FAC-CTW warmstart replay agent");
+        assert_eq!(agent_a.teacher_label_count(), 3);
+        let planned_a = agent_a.get_planned_action();
+        let planned_b = agent_b.get_planned_action();
+        assert_eq!(
+            planned_a, planned_b,
+            "BinaryTokens FAC-CTW warmstart planning must be deterministic under identical seed"
+        );
+        agent_a
+            .observe_transition(planned_a, &[1], 1)
+            .expect("BinaryTokens FAC-CTW live transition");
+        assert_eq!(agent_a.steps_observed(), 1);
     }
 
     #[cfg(feature = "backend-ctw")]

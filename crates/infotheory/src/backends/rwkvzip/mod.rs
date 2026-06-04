@@ -392,6 +392,10 @@ impl OnlineRuntime {
         model_cfg: &rwkv7::Config,
         total_symbols: Option<u64>,
     ) -> Result<()> {
+        let policy_runtime = match &self.policy {
+            Some(p) => Some(PolicyRuntime::new(p.compile(total_symbols)?)),
+            None => None,
+        };
         self.policy_stream_total = total_symbols;
         self.policy_train_steps = 0;
         self.ensure_full_tbptt_runtime(model_cfg);
@@ -402,10 +406,7 @@ impl OnlineRuntime {
             tbptt.steps.clear();
             tbptt.settings = None;
         }
-        self.policy_runtime = match &self.policy {
-            Some(p) => Some(PolicyRuntime::new(p.compile(total_symbols)?)),
-            None => None,
-        };
+        self.policy_runtime = policy_runtime;
         Ok(())
     }
 
@@ -438,7 +439,7 @@ impl OnlineRuntime {
         }
         let stride = train.hyper.stride.max(1) as u64;
         let next_train_step = self.policy_train_steps.saturating_add(1);
-        stride <= 1 || (next_train_step % stride) == 0
+        stride <= 1 || next_train_step.is_multiple_of(stride)
     }
 }
 

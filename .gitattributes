@@ -1,0 +1,8 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Enforce LF line endings for TSV files to ensure cross-platform test parity (especially on Windows)
+*.tsv text eol=lf
+
+# Shell scripts must have LF to execute on Unix environments
+*.sh text eol=lf

@@ -269,6 +269,10 @@ impl OnlineRuntime {
     }
 
     fn prepare_policy_stream(&mut self, total_symbols: Option<u64>) -> Result<()> {
+        let policy_runtime = match &self.policy {
+            Some(p) => Some(PolicyRuntime::new(p.compile(total_symbols)?)),
+            None => None,
+        };
         self.policy_stream_total = total_symbols;
         self.policy_train_steps = 0;
         if let Some(tbptt) = self.full_tbptt.as_mut() {
@@ -277,10 +281,7 @@ impl OnlineRuntime {
             tbptt.steps.clear();
             tbptt.settings = None;
         }
-        self.policy_runtime = match &self.policy {
-            Some(p) => Some(PolicyRuntime::new(p.compile(total_symbols)?)),
-            None => None,
-        };
+        self.policy_runtime = policy_runtime;
         Ok(())
     }
 

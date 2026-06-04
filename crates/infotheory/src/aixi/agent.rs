@@ -6,16 +6,19 @@
 
 use crate::aixi::common::{
     Action, ActionAlphabet, MctsStrategy, ObservationKeyMode, PerceptVal, RandomGenerator, Reward,
-    RewardEncodingError, decode, encode, nonnegative_reward_encoding_bounds,
-    observation_repr_from_stream, resolve_random_seed, validate_reward_encoding_bounds,
+    RewardEncodingError, byte_packed_percept_bits, decode, encode,
+    nonnegative_reward_encoding_bounds, observation_repr_from_stream, resolve_random_seed,
+    validate_mc_aixi_byte_packed_alignment, validate_reward_encoding_bounds,
     warn_parallel_uct_workers_one_once,
 };
 use crate::aixi::mcts::{
     AgentSimulator, ParallelUctPlanner, ParallelUctPlannerInitError, RhoUctPlanner,
 };
-use crate::aixi::model::{Predictor, PredictorBuildError, build_mc_aixi_predictor};
+use crate::aixi::model::{
+    Predictor, PredictorBuildError, build_mc_aixi_predictor, default_aixi_bit_stream_semantics,
+};
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
-use crate::api::{RateBackend, validate_rate_backend};
+use crate::api::{BitStreamSemantics, RateBackend, validate_rate_backend};
 use crate::spec::{
     CompiledPlannerController, CompiledPlannerRunSpec, ControllerSpec, McAixiControllerSpec,
     PlannerRunSpec, SpecError,
@@ -126,6 +129,8 @@ impl From<ParallelUctPlannerInitError> for AgentError {
 pub struct AgentConfig {
     /// Predictive backend used by MC-AIXI.
     pub rate_backend: RateBackend,
+    /// Bit-stream semantics used to adapt generic rate backends to AIXI symbols.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Planning horizon for MCTS.
     pub agent_horizon: usize,
     /// Number of bits used to encode observations.
@@ -164,6 +169,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             rate_backend: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_aixi_bit_stream_semantics(),
             agent_horizon: 5,
             observation_bits: 1,
             observation_stream_len: 1,
@@ -200,6 +206,7 @@ impl AgentConfig {
             },
             ControllerSpec::McAixi(McAixiControllerSpec {
                 predictor,
+                bit_stream_semantics: self.bit_stream_semantics,
                 agent_horizon: self.agent_horizon,
                 num_simulations: self.num_simulations,
                 mcts_strategy: self.mcts_strategy,
@@ -234,12 +241,10 @@ impl AgentConfig {
                 if workers.get() == 1 {
                     warn_parallel_uct_workers_one_once();
                 }
-                if let Some(m_max) = bu_uct_m_max {
-                    if !(0.0 < m_max && m_max < 1.0) {
-                        return Err(AgentError::Spec(SpecError::new(
-                            "controller.mcts_strategy.bu_uct_m_max must be in (0, 1)",
-                        )));
-                    }
+                if bu_uct_m_max.is_some_and(|m_max| !(0.0 < m_max && m_max < 1.0)) {
+                    return Err(AgentError::Spec(SpecError::new(
+                        "controller.mcts_strategy.bu_uct_m_max must be in (0, 1)",
+                    )));
                 }
             }
         }
@@ -259,6 +264,19 @@ impl AgentConfig {
             self.reward_offset,
             self.reward_bits,
         )?;
+        if matches!(
+            self.bit_stream_semantics,
+            BitStreamSemantics::BytePacked { .. }
+        ) {
+            let action_bits = self.agent_actions.action_bits();
+            let percept_bits = byte_packed_percept_bits(
+                self.observation_bits,
+                self.observation_stream_len,
+                self.reward_bits,
+            );
+            validate_mc_aixi_byte_packed_alignment(action_bits, percept_bits)
+                .map_err(|reason| AgentError::UnsupportedRateBackend { reason })?;
+        }
 
         validate_rate_backend(&self.rate_backend).map_err(AgentError::InvalidRateBackend)?;
         let compiled = self.rate_backend.compile().map_err(AgentError::from)?;
@@ -294,6 +312,7 @@ struct AgentRuntimeConfig {
     max_reward: Reward,
     reward_offset: Reward,
     random_seed: u64,
+    bit_stream_semantics: BitStreamSemantics,
 }
 
 impl AgentRuntimeConfig {
@@ -313,6 +332,7 @@ impl AgentRuntimeConfig {
             max_reward: config.max_reward,
             reward_offset: config.reward_offset,
             random_seed: resolve_random_seed(config.random_seed),
+            bit_stream_semantics: config.bit_stream_semantics,
         }
     }
 
@@ -325,6 +345,7 @@ impl AgentRuntimeConfig {
             mcts_strategy,
             exploration_exploitation_ratio,
             discount_gamma,
+            bit_stream_semantics,
         ) = match compiled.controller() {
             CompiledPlannerController::McAixi {
                 agent_horizon,
@@ -332,6 +353,7 @@ impl AgentRuntimeConfig {
                 mcts_strategy,
                 exploration_exploitation_ratio,
                 discount_gamma,
+                bit_stream_semantics,
                 ..
             } => (
                 *agent_horizon,
@@ -339,6 +361,7 @@ impl AgentRuntimeConfig {
                 *mcts_strategy,
                 *exploration_exploitation_ratio,
                 *discount_gamma,
+                *bit_stream_semantics,
             ),
             _ => return Err(AgentError::ControllerKindMismatch),
         };
@@ -360,6 +383,7 @@ impl AgentRuntimeConfig {
             max_reward,
             reward_offset,
             random_seed: resolve_random_seed(runtime.random_seed),
+            bit_stream_semantics,
         })
     }
 }
@@ -472,8 +496,8 @@ impl Agent {
         let percept_bits = (compiled.interface().observation_bits
             * compiled.interface().observation_stream_len.max(1))
             + compiled.interface().reward_bits;
-        let model =
-            build_mc_aixi_predictor(predictor, percept_bits).map_err(AgentError::Predictor)?;
+        let model = build_mc_aixi_predictor(predictor, percept_bits, config.bit_stream_semantics)
+            .map_err(AgentError::Predictor)?;
 
         let rng = RandomGenerator::from_seed(config.random_seed);
 
@@ -650,6 +674,10 @@ impl AgentSimulator for Agent {
         self.model.begin_rollback_scope();
     }
 
+    fn begin_discardable_simulation(&mut self) {
+        self.model.begin_discardable_scope();
+    }
+
     fn gen_percepts_and_update(&mut self) -> (Vec<PerceptVal>, Reward) {
         let obs_bits = self.config.observation_bits;
         let obs_len = self.config.observation_stream_len.max(1);
@@ -722,6 +750,7 @@ mod tests {
         update_history: usize,
         commit_update_history: usize,
         begin_scope: usize,
+        begin_discardable_scope: usize,
         rollback_scope: usize,
         revert: usize,
         pop_history: usize,
@@ -767,6 +796,10 @@ mod tests {
             self.counts.lock().unwrap().begin_scope += 1;
         }
 
+        fn begin_discardable_scope(&mut self) {
+            self.counts.lock().unwrap().begin_discardable_scope += 1;
+        }
+
         fn rollback_scope(&mut self) -> bool {
             self.counts.lock().unwrap().rollback_scope += 1;
             true
@@ -802,6 +835,7 @@ mod tests {
             max_reward: 3,
             reward_offset: 2,
             random_seed: 7,
+            bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
         }
     }
 
@@ -847,6 +881,7 @@ mod tests {
                     .with_alpha(1.25),
                 ),
             },
+            bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
             agent_horizon: 5,
             observation_bits: 1,
             observation_stream_len: 1,
@@ -922,6 +957,19 @@ mod tests {
         assert_eq!(snapshot.pop_history, 0);
     }
 
+    #[test]
+    fn discardable_simulation_uses_predictor_discardable_scope() {
+        let counts = Arc::new(Mutex::new(CallCounts::default()));
+        let mut agent = test_agent(Box::new(InstrumentedPredictor::new(counts.clone())));
+
+        AgentSimulator::begin_discardable_simulation(&mut agent);
+
+        let snapshot = counts.lock().unwrap().clone();
+        assert_eq!(snapshot.begin_discardable_scope, 1);
+        assert_eq!(snapshot.begin_scope, 0);
+        assert_eq!(snapshot.rollback_scope, 0);
+    }
+
     /// Stable shape-only descriptor for a `RateBackend` variant, used for
     /// alias-equivalence assertions without requiring `Debug` on the enum.
     fn backend_shape(backend: &crate::api::RateBackend) -> &'static str {
@@ -936,12 +984,16 @@ mod tests {
 
     #[test]
     fn explicit_rate_backend_semantics_are_symmetric_between_mc_aixi_and_aiqi() {
-        let mut agent_cfg = AgentConfig::default();
-        agent_cfg.rate_backend = crate::api::RateBackend::Ctw { depth: 8 };
+        let mut agent_cfg = AgentConfig {
+            rate_backend: crate::api::RateBackend::Ctw { depth: 8 },
+            ..AgentConfig::default()
+        };
         let agent_ctw = agent_cfg.canonical_predictor_backend();
 
-        let mut aiqi_cfg = crate::aixi::aiqi::AiqiConfig::default();
-        aiqi_cfg.rate_backend = crate::api::RateBackend::Ctw { depth: 8 };
+        let mut aiqi_cfg = crate::aixi::aiqi::AiqiConfig {
+            rate_backend: crate::api::RateBackend::Ctw { depth: 8 },
+            ..crate::aixi::aiqi::AiqiConfig::default()
+        };
         let aiqi_ctw = aiqi_cfg.canonical_predictor_backend_for_test();
 
         assert_eq!(
@@ -974,12 +1026,14 @@ mod tests {
     #[cfg(feature = "backend-ctw")]
     #[test]
     fn programmatic_mcaixi_preserves_explicit_signed_reward_contract() {
-        let mut config = AgentConfig::default();
-        config.reward_bits = 3;
-        config.min_reward = -2;
-        config.max_reward = 3;
-        config.reward_offset = 2;
-        config.num_simulations = 1;
+        let config = AgentConfig {
+            reward_bits: 3,
+            min_reward: -2,
+            max_reward: 3,
+            reward_offset: 2,
+            num_simulations: 1,
+            ..AgentConfig::default()
+        };
 
         let mut agent = Agent::try_new(config).expect("signed reward config should be valid");
         assert_eq!(agent.config.min_reward, -2);

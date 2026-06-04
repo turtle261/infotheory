@@ -54,6 +54,7 @@ impl ContextFollowers {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::enum_variant_names)]
 enum UndoOp {
     SetPrev {
         node: NodeIx,
@@ -148,6 +149,13 @@ pub struct SequiturModel {
     pdf_valid: bool,
     undo: Vec<UndoOp>,
     undo_enabled: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SequiturLifecycleSnapshot {
+    frozen_raw_tail: Vec<u8>,
+    pdf: [f64; 256],
+    pdf_valid: bool,
 }
 
 impl SequiturModel {
@@ -250,10 +258,28 @@ impl SequiturModel {
         self.undo_enabled = false;
     }
 
+    pub(crate) fn checkpoints_active(&self) -> bool {
+        self.undo_enabled
+    }
+
     /// Clear speculative frozen updates without touching committed state.
     pub fn reset_frozen(&mut self) {
         self.frozen_raw_tail.clear();
         self.pdf_valid = false;
+    }
+
+    pub(crate) fn lifecycle_snapshot(&self) -> SequiturLifecycleSnapshot {
+        SequiturLifecycleSnapshot {
+            frozen_raw_tail: self.frozen_raw_tail.clone(),
+            pdf: self.pdf,
+            pdf_valid: self.pdf_valid,
+        }
+    }
+
+    pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: SequiturLifecycleSnapshot) {
+        self.frozen_raw_tail = snapshot.frozen_raw_tail;
+        self.pdf = snapshot.pdf;
+        self.pdf_valid = snapshot.pdf_valid;
     }
 
     /// Fill `out` with the current normalized next-byte probability mass.
@@ -381,10 +407,10 @@ impl SequiturModel {
         let guard = self.rules[rule_id as usize].guard;
         let mut node = self.nodes[guard as usize].next;
         while node != guard {
-            if let NodeData::Sym(Symbol::NonTerminal(child)) = self.nodes[node as usize].data {
-                if self.rules[child as usize].active {
-                    self.collect_rule_preorder(child, order, seen);
-                }
+            if let NodeData::Sym(Symbol::NonTerminal(child)) = self.nodes[node as usize].data
+                && self.rules[child as usize].active
+            {
+                self.collect_rule_preorder(child, order, seen);
             }
             node = self.nodes[node as usize].next;
         }
@@ -565,8 +591,8 @@ impl SequiturModel {
             let total = stats.total as f64;
             let types = distinct as f64;
             let escape = types / (total + types);
-            for i in 0..256 {
-                next[i] = self.pdf[i] * escape;
+            for (i, slot) in next.iter_mut().enumerate() {
+                *slot = self.pdf[i] * escape;
             }
             for &(symbol, count) in &stats.counts {
                 next[symbol as usize] += (count as f64) / (total + types);
@@ -856,10 +882,10 @@ impl SequiturModel {
         };
 
         let first = self.first_node_of_rule(rule);
-        if let Symbol::NonTerminal(child) = self.symbol_of(first) {
-            if self.rules[child as usize].ref_count == 1 {
-                self.expand(first, child);
-            }
+        if let Symbol::NonTerminal(child) = self.symbol_of(first)
+            && self.rules[child as usize].ref_count == 1
+        {
+            self.expand(first, child);
         }
     }
 

@@ -114,6 +114,10 @@ pub struct RateBackendShorthandOptions {
     pub fac_ctw_num_percept_bits: usize,
     /// Default FAC-CTW symbol encoding width.
     pub fac_ctw_encoding_bits: usize,
+    /// Optional FAC-CTW MSB-first override for shorthand CLI parsing.
+    ///
+    /// `None` defers to compile-time default (`encoding_bits == 8` → MSB-first).
+    pub fac_ctw_msb_first: Option<bool>,
     /// Default PPMD order.
     pub ppmd_order: usize,
     /// Default PPMD memory budget in MiB.
@@ -139,6 +143,7 @@ impl Default for RateBackendShorthandOptions {
             fac_ctw_num_percept_bits:
                 crate::rate_defaults::SHORTHAND_DEFAULT_FAC_CTW_NUM_PERCEPT_BITS,
             fac_ctw_encoding_bits: crate::rate_defaults::SHORTHAND_DEFAULT_FAC_CTW_ENCODING_BITS,
+            fac_ctw_msb_first: None,
             ppmd_order: crate::rate_defaults::SHORTHAND_DEFAULT_PPMD_ORDER,
             ppmd_memory_mb: crate::rate_defaults::SHORTHAND_DEFAULT_PPMD_MEMORY_MB,
             sequitur_context_bytes: crate::rate_defaults::SHORTHAND_DEFAULT_SEQUITUR_CONTEXT_BYTES,
@@ -610,7 +615,7 @@ fn rwkv_method_to_json_value(method: &crate::rwkvzip::MethodSpec) -> SpecResult<
         }),
         crate::rwkvzip::MethodSpec::Online { cfg, policy } => serde_json::json!({
             "kind": "online",
-            "cfg": rwkv_online_config_to_json_value(&cfg),
+            "cfg": rwkv_online_config_to_json_value(cfg),
             "policy": policy.as_ref().map(crate::backends::llm_policy::LlmPolicy::canonical),
         }),
     })
@@ -727,7 +732,7 @@ fn mamba_method_to_json_value(
         }),
         crate::mambazip::MethodSpec::Online { cfg, policy } => serde_json::json!({
             "kind": "online",
-            "cfg": mamba_online_config_to_json_value(&cfg),
+            "cfg": mamba_online_config_to_json_value(cfg),
             "policy": policy.as_ref().map(crate::backends::llm_policy::LlmPolicy::canonical),
         }),
     })
@@ -981,12 +986,19 @@ fn rate_backend_to_json_leaf_value(
             base_depth,
             num_percept_bits,
             encoding_bits,
-        } => Some(Ok(serde_json::json!({
-            "kind": canonical,
-            "base_depth": base_depth,
-            "num_percept_bits": num_percept_bits,
-            "encoding_bits": encoding_bits,
-        }))),
+            msb_first,
+        } => {
+            let mut value = serde_json::json!({
+                "kind": canonical,
+                "base_depth": base_depth,
+                "num_percept_bits": num_percept_bits,
+                "encoding_bits": encoding_bits,
+            });
+            if let Some(msb_first) = msb_first {
+                value["msb_first"] = serde_json::Value::Bool(*msb_first);
+            }
+            Some(Ok(value))
+        }
         _ => None,
     }
 }
@@ -1275,10 +1287,12 @@ fn parse_rate_backend_json_leaf(
             let num_percept_bits = v["num_percept_bits"]
                 .as_u64()
                 .unwrap_or(encoding_bits as u64) as usize;
+            let msb_first = v.get("msb_first").and_then(serde_json::Value::as_bool);
             RateBackend::FacCtw {
                 base_depth,
                 num_percept_bits,
                 encoding_bits,
+                msb_first,
             }
         }
         crate::runtime::RateBackendKind::Match => RateBackend::Match {
@@ -1818,6 +1832,7 @@ fn parse_rate_backend_name_method_leaf(
                 base_depth,
                 num_percept_bits: options.fac_ctw_num_percept_bits,
                 encoding_bits: options.fac_ctw_encoding_bits,
+                msb_first: options.fac_ctw_msb_first,
             }
         }
         crate::runtime::RateBackendKind::Zpaq => {
@@ -2934,11 +2949,13 @@ mod tests {
                 MAX_MIXTURE_NESTING,
             )
             .expect("fac-ctw json parse");
+            let parsed_for_compile = parsed.clone();
             match parsed {
                 RateBackend::FacCtw {
                     base_depth,
                     num_percept_bits,
                     encoding_bits,
+                    msb_first,
                 } => {
                     assert_eq!(
                         base_depth,
@@ -2949,9 +2966,71 @@ mod tests {
                         crate::rate_defaults::JSON_DEFAULT_FAC_CTW_ENCODING_BITS
                     );
                     assert_eq!(num_percept_bits, encoding_bits);
+                    assert_eq!(msb_first, None);
                 }
                 _ => panic!("expected fac-ctw backend"),
             }
+
+            let explicit_lsb = parse_rate_backend_json(
+                &serde_json::json!({
+                    "kind": "fac-ctw",
+                    "base_depth": 9,
+                    "encoding_bits": 8,
+                    "num_percept_bits": 8,
+                    "msb_first": false,
+                }),
+                Path::new("."),
+                MAX_MIXTURE_NESTING,
+            )
+            .expect("fac-ctw explicit LSB json parse");
+            let compiled_lsb = explicit_lsb
+                .compile()
+                .expect("fac-ctw explicit LSB compiles");
+            match compiled_lsb.plan() {
+                crate::spec::core::RateBackendPlan::FacCtw { msb_first, .. } => {
+                    assert!(!*msb_first, "explicit msb_first=false must survive compile");
+                }
+                _ => panic!("expected fac-ctw compiled plan"),
+            }
+
+            let compiled_default = parsed_for_compile
+                .compile()
+                .expect("fac-ctw default compiles");
+            match compiled_default.plan() {
+                crate::spec::core::RateBackendPlan::FacCtw {
+                    encoding_bits,
+                    msb_first,
+                    ..
+                } => {
+                    assert_eq!(*encoding_bits, 8);
+                    assert!(
+                        *msb_first,
+                        "omitted msb_first defaults to MSB-first for byte-width FacCtw"
+                    );
+                }
+                _ => panic!("expected fac-ctw compiled plan"),
+            }
+
+            let invalid_width = parse_rate_backend_json(
+                &serde_json::json!({
+                    "kind": "fac-ctw",
+                    "base_depth": 9,
+                    "encoding_bits": 9,
+                    "num_percept_bits": 9,
+                }),
+                Path::new("."),
+                MAX_MIXTURE_NESTING,
+            )
+            .expect("fac-ctw invalid-width json parses before semantic compile validation");
+            let err = match invalid_width.compile() {
+                Ok(_) => panic!("fac-ctw encoding_bits outside 1..=8 must be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("fac-ctw encoding_bits must be in 1..=8, got 9"),
+                "unexpected fac-ctw encoding_bits error: {err}"
+            );
         }
 
         #[cfg(not(feature = "backend-ctw"))]
@@ -2979,6 +3058,7 @@ mod tests {
                 base_depth,
                 num_percept_bits,
                 encoding_bits,
+                msb_first,
             } => {
                 assert_eq!(base_depth, 8);
                 assert_eq!(
@@ -2989,8 +3069,62 @@ mod tests {
                     num_percept_bits,
                     crate::rate_defaults::FAC_CTW_DEFAULT_NUM_PERCEPT_BITS
                 );
+                assert_eq!(msb_first, None);
             }
             _ => panic!("expected runtime fac-ctw default backend"),
+        }
+        let fac_ctw_default_json = rate_backend_to_json_value(&runtime_default)
+            .expect("serialize runtime fac-ctw default backend");
+        assert!(
+            fac_ctw_default_json.get("msb_first").is_none(),
+            "canonical fac-ctw json must omit msb_first when unset"
+        );
+
+        #[cfg(feature = "backend-ctw")]
+        {
+            let msb_shorthand = RateBackendShorthandOptions {
+                fac_ctw_msb_first: Some(true),
+                ..RateBackendShorthandOptions::default()
+            };
+            let parsed_msb = parse_rate_backend_name_method("fac-ctw", Some("9"), &msb_shorthand)
+                .expect("fac-ctw shorthand with msb_first");
+            match parsed_msb {
+                RateBackend::FacCtw { msb_first, .. } => {
+                    assert_eq!(msb_first, Some(true));
+                }
+                _ => panic!("expected fac-ctw backend"),
+            }
+            let compiled_msb = parsed_msb.compile().expect("fac-ctw msb compiles");
+            match compiled_msb.plan() {
+                crate::spec::core::RateBackendPlan::FacCtw { msb_first, .. } => {
+                    assert!(*msb_first, "shorthand msb_first=true must survive compile");
+                }
+                _ => panic!("expected fac-ctw compiled plan"),
+            }
+
+            let lsb_shorthand = RateBackendShorthandOptions {
+                fac_ctw_msb_first: Some(false),
+                ..RateBackendShorthandOptions::default()
+            };
+            let parsed_lsb = parse_rate_backend_name_method("fac-ctw", Some("9"), &lsb_shorthand)
+                .expect("fac-ctw shorthand with lsb_first");
+            match parsed_lsb.compile().expect("fac-ctw lsb compiles").plan() {
+                crate::spec::core::RateBackendPlan::FacCtw { msb_first, .. } => {
+                    assert!(
+                        !*msb_first,
+                        "shorthand msb_first=false must survive compile"
+                    );
+                }
+                _ => panic!("expected fac-ctw compiled plan"),
+            }
+
+            let factory_json = crate::rate_defaults::fac_ctw_spec_json(9, 8, 8, Some(false));
+            assert_eq!(factory_json["msb_first"], serde_json::json!(false));
+            let factory_default = crate::rate_defaults::fac_ctw_spec_json(9, 8, 8, None);
+            assert!(
+                factory_default.get("msb_first").is_none(),
+                "factory omits msb_first when None"
+            );
         }
     }
 
@@ -3105,10 +3239,12 @@ mod tests {
                 base_depth,
                 num_percept_bits,
                 encoding_bits,
+                msb_first,
             } => {
                 assert_eq!(base_depth, 11);
                 assert_eq!(num_percept_bits, options.fac_ctw_num_percept_bits);
                 assert_eq!(encoding_bits, options.fac_ctw_encoding_bits);
+                assert_eq!(msb_first, None);
             }
             _ => panic!("expected fac-ctw backend"),
         }

@@ -88,6 +88,7 @@ harness = false
 [[bench]]
 name = "aiqi"
 harness = false
+required-features = ["aixi"]
 
 [[bench]]
 name = "mixture_backends"
@@ -133,6 +134,7 @@ harness = false
 [[bench]]
 name = "mcts_planners"
 harness = false
+required-features = ["aixi"]
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }

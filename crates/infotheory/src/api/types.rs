@@ -218,10 +218,23 @@ pub enum RateBackend {
     FacCtw {
         /// Base context depth.
         base_depth: usize,
-        /// Number of percept bits.
+        /// Planner/percept bit cardinality for AIXI-style consumers.
+        ///
+        /// Rate-backend byte execution uses `encoding_bits` as the symbol
+        /// decomposition width. `num_percept_bits` is retained for controller
+        /// specs whose percept cardinality can differ from byte encoding width.
         num_percept_bits: usize,
-        /// Encoding width in bits.
+        /// Encoding width in bits for rate execution.
+        ///
+        /// Valid compiled FAC-CTW specs require `1..=8`.
         encoding_bits: usize,
+        /// Optional bit order for decomposing symbols.
+        ///
+        /// `None` keeps the compatibility default: 8-bit byte symbols use
+        /// MSB-first ordering, while non-byte widths retain the legacy
+        /// LSB-first FAC-CTW convention. `Some(true)` selects MSB-first
+        /// explicitly; `Some(false)` selects legacy LSB-first explicitly.
+        msb_first: Option<bool>,
     },
 }
 
@@ -278,13 +291,14 @@ pub enum MixtureKind {
 }
 
 /// Adaptive schedule family for switching and convex mixtures.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MixtureScheduleMode {
     /// Use the implementation's default exposed parameterization.
     ///
     /// - `Switching`: constant switch rate `alpha`
     /// - `Convex`: step size `alpha / sqrt(t)`
+    #[default]
     Default,
     /// Use the theorem schedule from
     /// "On Ensemble Techniques for AIXI Approximation".
@@ -298,12 +312,6 @@ pub enum MixtureScheduleMode {
     /// This preserves configured expert priors; exact theorem hypotheses for
     /// switching still additionally require uniform priors.
     Theorem,
-}
-
-impl Default for MixtureScheduleMode {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 /// Fixed context families for calibrated PDF wrappers.
@@ -761,10 +769,10 @@ fn validate_mixture_spec_shallow(spec: &MixtureSpec) -> Result<(), String> {
     {
         return Err("mixture expert log_prior must be finite".to_string());
     }
-    if let Some(decay) = spec.decay {
-        if !decay.is_finite() || !(decay > 0.0 && decay < 1.0) {
-            return Err("mixture decay must be in (0, 1)".to_string());
-        }
+    if let Some(decay) = spec.decay
+        && !(decay.is_finite() && decay > 0.0 && decay < 1.0)
+    {
+        return Err("mixture decay must be in (0, 1)".to_string());
     }
     if matches!(spec.kind, MixtureKind::FadingBayes) && spec.decay.is_none() {
         return Err("fading Bayes mixture requires decay".to_string());

@@ -208,40 +208,57 @@ impl ParallelUctPlanner {
             ParallelPlannerState::Wu(runtime) => search_runtime::<WuMode>(
                 runtime,
                 agent,
-                prev_obs_stream,
-                prev_rew,
-                prev_act,
-                samples,
-                horizon,
-                workers,
-                None,
+                SearchRuntimeParams {
+                    prev_obs_stream,
+                    prev_rew,
+                    prev_act,
+                    samples,
+                    horizon,
+                    workers,
+                    bu_uct_m_max: None,
+                },
             ),
             ParallelPlannerState::Bu(runtime) => search_runtime::<BuMode>(
                 runtime,
                 agent,
-                prev_obs_stream,
-                prev_rew,
-                prev_act,
-                samples,
-                horizon,
-                workers,
-                self.bu_uct_m_max,
+                SearchRuntimeParams {
+                    prev_obs_stream,
+                    prev_rew,
+                    prev_act,
+                    samples,
+                    horizon,
+                    workers,
+                    bu_uct_m_max: self.bu_uct_m_max,
+                },
             ),
         }
     }
 }
 
-fn search_runtime<M: ModeState>(
-    runtime: &mut ParallelRuntime<M>,
-    agent: &mut dyn AgentSimulator,
-    prev_obs_stream: &[PerceptVal],
+struct SearchRuntimeParams<'a> {
+    prev_obs_stream: &'a [PerceptVal],
     prev_rew: Reward,
     prev_act: Action,
     samples: usize,
     horizon: usize,
     workers: usize,
     bu_uct_m_max: Option<f64>,
+}
+
+fn search_runtime<M: ModeState>(
+    runtime: &mut ParallelRuntime<M>,
+    agent: &mut dyn AgentSimulator,
+    params: SearchRuntimeParams<'_>,
 ) -> Action {
+    let SearchRuntimeParams {
+        prev_obs_stream,
+        prev_rew,
+        prev_act,
+        samples,
+        horizon,
+        workers,
+        bu_uct_m_max,
+    } = params;
     prune_tree(runtime, agent, prev_obs_stream, prev_rew, prev_act);
 
     debug_assert!(workers > 0);
@@ -256,7 +273,7 @@ fn search_runtime<M: ModeState>(
             let task_index = 0usize;
             let mut local_agent =
                 agent.boxed_clone_with_seed(planner_task_seed(planner_seed, task_index));
-            local_agent.begin_simulation();
+            local_agent.begin_discardable_simulation();
             let bootstrap = bootstrap_root(runtime, local_agent.as_mut(), horizon, task_index);
             complete_update_batch(runtime, std::slice::from_ref(&bootstrap), gamma);
             dispatched = 1;
@@ -271,7 +288,7 @@ fn search_runtime<M: ModeState>(
             let task_index = dispatched + batch_index;
             let mut local_agent =
                 agent.boxed_clone_with_seed(planner_task_seed(planner_seed, task_index));
-            local_agent.begin_simulation();
+            local_agent.begin_discardable_simulation();
 
             let dispatch = {
                 let root = runtime.root.as_mut().expect("parallel_uct root missing");
@@ -1175,6 +1192,7 @@ mod tests {
     struct CounterAgent {
         clone_count: Arc<AtomicUsize>,
         begin_count: Arc<AtomicUsize>,
+        discardable_begin_count: Arc<AtomicUsize>,
         model_updates: Arc<AtomicUsize>,
         planning_horizon: usize,
         last_action: Action,
@@ -1186,6 +1204,7 @@ mod tests {
             Self {
                 clone_count: Arc::new(AtomicUsize::new(0)),
                 begin_count: Arc::new(AtomicUsize::new(0)),
+                discardable_begin_count: Arc::new(AtomicUsize::new(0)),
                 model_updates: Arc::new(AtomicUsize::new(0)),
                 planning_horizon,
                 last_action: 0,
@@ -1225,6 +1244,10 @@ mod tests {
 
         fn begin_simulation(&mut self) {
             self.begin_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn begin_discardable_simulation(&mut self) {
+            self.discardable_begin_count.fetch_add(1, Ordering::SeqCst);
         }
 
         fn model_update_action(&mut self, action: Action) {
@@ -1317,7 +1340,7 @@ mod tests {
         fn gen_percept_and_update(&mut self, _bits: usize) -> u64 {
             if self.emit_reward {
                 self.emit_reward = false;
-                ((self.clone_seed ^ self.last_action) & 1) as u64
+                (self.clone_seed ^ self.last_action) & 1
             } else {
                 self.emit_reward = true;
                 0
@@ -1502,6 +1525,7 @@ mod tests {
         assert_eq!(action, 0);
         assert_eq!(agent.clone_count.load(Ordering::SeqCst), 0);
         assert_eq!(agent.begin_count.load(Ordering::SeqCst), 0);
+        assert_eq!(agent.discardable_begin_count.load(Ordering::SeqCst), 0);
         assert_eq!(agent.model_updates.load(Ordering::SeqCst), 0);
         let root = planner.wu_root();
         assert_eq!(root.visits, 0);
@@ -1526,6 +1550,7 @@ mod tests {
         );
         assert_eq!(agent.clone_count.load(Ordering::SeqCst), 0);
         assert_eq!(agent.begin_count.load(Ordering::SeqCst), 0);
+        assert_eq!(agent.discardable_begin_count.load(Ordering::SeqCst), 0);
         assert_eq!(agent.model_updates.load(Ordering::SeqCst), 0);
         let root = planner.wu_root();
         assert_eq!(root.visits, 0);
@@ -1553,6 +1578,25 @@ mod tests {
         assert!(
             root_has_completed_edge(root),
             "single-sample retained-root bootstrap must leave one completed root edge"
+        );
+    }
+
+    #[test]
+    fn positive_budget_uses_discardable_simulation_hook_for_clones() {
+        let mut agent = CounterAgent::new_with_horizon(2);
+        let mut planner =
+            ParallelUctPlanner::new(workers(2), None).expect("valid parallel_uct planner");
+
+        let _action = planner
+            .search(&mut agent, &[0], 0, 0, 5)
+            .expect("positive-horizon parallel_uct search");
+
+        assert_eq!(agent.clone_count.load(Ordering::SeqCst), 5);
+        assert_eq!(agent.discardable_begin_count.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            agent.begin_count.load(Ordering::SeqCst),
+            0,
+            "parallel_uct cloned rollouts must not open reversible simulation scopes",
         );
     }
 

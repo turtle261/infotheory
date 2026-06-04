@@ -28,7 +28,7 @@ fn bench_data() -> Vec<u8> {
     let mut out = Vec::with_capacity(DATA_LEN);
     while out.len() < DATA_LEN {
         for path in &seeds {
-            let chunk = std::fs::read(&path).expect("failed to read bench seed file");
+            let chunk = std::fs::read(path).expect("failed to read bench seed file");
             out.extend_from_slice(&chunk);
             if out.len() >= DATA_LEN {
                 break;
