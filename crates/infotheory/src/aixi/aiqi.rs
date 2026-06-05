@@ -862,10 +862,10 @@ impl AiqiAgent {
                 action as u64,
                 self.action_bits,
             );
-            let dist = Self::predict_return_distribution_from_base_predictor(
+            let dist = Self::predict_return_distribution_from_planner_predictor(
                 self.config.return_bins,
                 self.return_bits,
-                action_predictor.as_ref(),
+                action_predictor.as_mut(),
             );
             *q_value = expectation_from_distribution(&dist);
         }
@@ -956,6 +956,64 @@ impl AiqiAgent {
             *p /= sum;
         }
         probs
+    }
+
+    fn predict_return_distribution_scoped(
+        return_bins: usize,
+        return_bits: usize,
+        predictor: &mut dyn Predictor,
+    ) -> Vec<f64> {
+        debug_assert!(return_bins.is_power_of_two());
+        if return_bins == 1 {
+            return vec![1.0];
+        }
+
+        let mut probs = vec![0.0; return_bins];
+        for (bin, slot) in probs.iter_mut().enumerate() {
+            predictor.begin_rollback_scope();
+            let mut p = 1.0f64;
+            let mut v = bin as u64;
+            for _ in 0..return_bits {
+                let bit = (v & 1) == 1;
+                v >>= 1;
+                let q = predictor.predict_prob(bit).clamp(1e-12, 1.0 - 1e-12);
+                p *= q;
+                predictor.commit_update(bit);
+            }
+            assert!(
+                predictor.rollback_scope(),
+                "predictor advertised rollback scopes but failed to roll back"
+            );
+            *slot = p;
+        }
+
+        let sum: f64 = probs.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 {
+            let u = 1.0 / (return_bins as f64);
+            probs.fill(u);
+            return probs;
+        }
+
+        for p in &mut probs {
+            *p /= sum;
+        }
+        probs
+    }
+
+    fn predict_return_distribution_from_planner_predictor(
+        return_bins: usize,
+        return_bits: usize,
+        predictor: &mut dyn Predictor,
+    ) -> Vec<f64> {
+        if predictor.supports_rollback_scope() {
+            Self::predict_return_distribution_scoped(return_bins, return_bits, predictor)
+        } else {
+            Self::predict_return_distribution_from_base_predictor(
+                return_bins,
+                return_bits,
+                predictor,
+            )
+        }
     }
 
     fn advance_phase_model_to_step(
@@ -1603,6 +1661,69 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ScopedReturnLearningPredictor {
+        saw_training_one: bool,
+        scopes: Vec<bool>,
+        clone_count: Arc<Mutex<usize>>,
+    }
+
+    impl ScopedReturnLearningPredictor {
+        fn new(clone_count: Arc<Mutex<usize>>) -> Self {
+            Self {
+                saw_training_one: false,
+                scopes: Vec::new(),
+                clone_count,
+            }
+        }
+    }
+
+    impl Predictor for ScopedReturnLearningPredictor {
+        fn update(&mut self, sym: bool) {
+            self.commit_update(sym);
+        }
+
+        fn commit_update(&mut self, sym: bool) {
+            if sym {
+                self.saw_training_one = true;
+            }
+        }
+
+        fn revert(&mut self) {
+            let _ = self.rollback_scope();
+        }
+
+        fn begin_rollback_scope(&mut self) {
+            self.scopes.push(self.saw_training_one);
+        }
+
+        fn supports_rollback_scope(&self) -> bool {
+            true
+        }
+
+        fn rollback_scope(&mut self) -> bool {
+            let Some(previous) = self.scopes.pop() else {
+                return false;
+            };
+            self.saw_training_one = previous;
+            true
+        }
+
+        fn predict_prob(&mut self, sym: bool) -> f64 {
+            let p1 = if self.saw_training_one { 0.75 } else { 0.25 };
+            if sym { p1 } else { 1.0 - p1 }
+        }
+
+        fn model_name(&self) -> String {
+            "ScopedReturnLearningPredictor".to_string()
+        }
+
+        fn boxed_clone(&self) -> Box<dyn Predictor> {
+            *self.clone_count.lock().unwrap() += 1;
+            Box::new(self.clone())
+        }
+    }
+
     #[test]
     fn config_rejects_invalid_period() {
         let mut cfg = basic_config();
@@ -1767,6 +1888,33 @@ mod tests {
             (probs[0] - 0.5625).abs() < 1e-12,
             "expected exact normalized mass for 00, got {:?}",
             probs
+        );
+    }
+
+    #[test]
+    fn generic_distribution_rollout_uses_scoped_rollback_when_available() {
+        let clone_count = Arc::new(Mutex::new(0usize));
+        let mut predictor = ScopedReturnLearningPredictor::new(clone_count.clone());
+        let probs =
+            AiqiAgent::predict_return_distribution_from_planner_predictor(4, 2, &mut predictor);
+
+        assert_eq!(probs.len(), 4);
+        assert!(
+            probs[3] > probs[1],
+            "scoped training on return bits should match clone-per-bin semantics"
+        );
+        assert_eq!(
+            *clone_count.lock().unwrap(),
+            0,
+            "rollback-scoped predictors should not clone once per return bin"
+        );
+        assert!(
+            !predictor.saw_training_one,
+            "scoped rollout must restore the caller's predictor state"
+        );
+        assert!(
+            predictor.scopes.is_empty(),
+            "scoped rollout must close every rollback scope"
         );
     }
 

@@ -107,6 +107,10 @@ impl AgentSimulator for BenchAgent {
         self.emit_reward = false;
     }
 
+    fn begin_discardable_simulation(&mut self) {
+        self.emit_reward = false;
+    }
+
     fn model_revert(&mut self, _steps: usize) {
         self.emit_reward = false;
     }

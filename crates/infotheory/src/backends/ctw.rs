@@ -127,13 +127,24 @@ impl BitHistory {
             return None;
         }
         let next_len = self.len - 1;
-        let bit = self.bit(next_len);
         let word_idx = next_len / HISTORY_WORD_BITS;
         let bit_idx = next_len % HISTORY_WORD_BITS;
-        self.words[word_idx] &= !(1u64 << bit_idx);
+        let mask = 1u64 << bit_idx;
+        let bit = (self.words[word_idx] & mask) != 0;
+        if bit {
+            self.words[word_idx] &= !mask;
+        }
         self.len = next_len;
-        self.words.truncate(history_word_len(self.len));
-        self.rebuild_recent();
+        if bit_idx == 0 {
+            self.words.truncate(word_idx);
+        }
+        self.recent >>= 1;
+        if self.len >= HISTORY_WORD_BITS {
+            let exposed_idx = self.len - HISTORY_WORD_BITS;
+            if self.bit(exposed_idx) {
+                self.recent |= 1u64 << (HISTORY_WORD_BITS - 1);
+            }
+        }
         Some(bit)
     }
 
@@ -3774,11 +3785,16 @@ impl CtEngine {
 pub struct ContextTree {
     engine: CtEngine,
     history: BitHistory,
+    history_version: u64,
+    prepared_valid: bool,
+    prepared_history_len: usize,
+    prepared_history_version: u64,
 }
 
 #[derive(Clone)]
 pub(crate) struct ContextTreeLifecycleSnapshot {
     history: BitHistory,
+    history_version: u64,
 }
 
 impl ContextTree {
@@ -3787,13 +3803,38 @@ impl ContextTree {
         Self {
             engine: CtEngine::new(depth),
             history: BitHistory::default(),
+            history_version: 0,
+            prepared_valid: false,
+            prepared_history_len: 0,
+            prepared_history_version: 0,
         }
+    }
+
+    #[inline]
+    fn bump_history_version(&mut self) {
+        self.history_version = self.history_version.wrapping_add(1);
+    }
+
+    #[inline]
+    fn clear_prepared_prediction(&mut self) {
+        self.prepared_valid = false;
+    }
+
+    #[inline]
+    fn prepared_prediction_matches_history(&self) -> bool {
+        self.prepared_valid
+            && self.prepared_history_len == self.history.len()
+            && self.prepared_history_version == self.history_version
     }
 
     /// Reset tree parameters and clear conditioning history.
     pub fn clear(&mut self) {
         self.history.clear();
         self.engine.clear();
+        self.history_version = 0;
+        self.clear_prepared_prediction();
+        self.prepared_history_len = 0;
+        self.prepared_history_version = 0;
     }
 
     #[inline]
@@ -3808,8 +3849,15 @@ impl ContextTree {
     #[inline]
     /// Observe one binary symbol and update the model.
     pub fn update(&mut self, sym: Symbol) {
-        self.engine.update(sym, &self.history);
+        let use_prepared = self.prepared_prediction_matches_history();
+        self.clear_prepared_prediction();
+        if use_prepared {
+            self.engine.update_prepared(sym, &self.history, true);
+        } else {
+            self.engine.update(sym, &self.history);
+        }
         self.history.push(sym);
+        self.bump_history_version();
     }
 
     #[inline]
@@ -3818,25 +3866,37 @@ impl ContextTree {
         let Some(last_sym) = self.history.pop() else {
             return;
         };
+        self.clear_prepared_prediction();
         self.engine.revert(last_sym, &self.history);
+        self.bump_history_version();
     }
 
     #[inline]
     /// Append external symbols to history without touching model state.
     pub fn update_history(&mut self, symbols: &[Symbol]) {
+        if symbols.is_empty() {
+            return;
+        }
+        self.clear_prepared_prediction();
         self.history.extend_from_slice(symbols);
+        self.bump_history_version();
     }
 
     #[inline]
     /// Remove one history symbol without reverting model statistics.
     pub fn revert_history(&mut self) {
-        self.history.pop();
+        if self.history.pop().is_some() {
+            self.clear_prepared_prediction();
+            self.bump_history_version();
+        }
     }
 
     /// Truncate the stored history to `new_size` symbols.
     pub fn truncate_history(&mut self, new_size: usize) {
         if new_size < self.history.len() {
+            self.clear_prepared_prediction();
             self.history.truncate(new_size);
+            self.bump_history_version();
         }
     }
 
@@ -3848,23 +3908,39 @@ impl ContextTree {
     pub(crate) fn lifecycle_snapshot(&self) -> ContextTreeLifecycleSnapshot {
         ContextTreeLifecycleSnapshot {
             history: self.history.clone(),
+            history_version: self.history_version,
         }
     }
 
     pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: ContextTreeLifecycleSnapshot) {
         self.history = snapshot.history;
+        self.history_version = snapshot.history_version;
+        self.clear_prepared_prediction();
     }
 
     #[inline]
     /// Predict `P(sym | history)` under current weighted CTW model.
     pub fn predict(&mut self, sym: Symbol) -> f64 {
-        self.engine.predict(sym, &self.history)
+        let prob = self.engine.predict(sym, &self.history);
+        self.prepared_valid = true;
+        self.prepared_history_len = self.history.len();
+        self.prepared_history_version = self.history_version;
+        prob
+    }
+
+    #[inline]
+    pub(crate) fn predict_one(&mut self) -> f64 {
+        let prob = self.engine.predict_one(&self.history);
+        self.prepared_valid = true;
+        self.prepared_history_len = self.history.len();
+        self.prepared_history_version = self.history_version;
+        prob
     }
 
     #[inline]
     /// Predict probability of symbol `true`.
     pub fn predict_sym_prob(&mut self) -> f64 {
-        self.predict(true)
+        self.predict_one()
     }
 
     #[inline]
@@ -3921,12 +3997,6 @@ impl ContextTreeCore {
     #[inline]
     fn reserve_for_symbols(&mut self, total_symbols: usize) {
         self.engine.reserve_for_symbols(total_symbols);
-    }
-
-    #[inline]
-    fn update(&mut self, sym: Symbol, shared_history: &(impl HistoryAccess + ?Sized)) {
-        self.prepared_valid = false;
-        self.engine.update(sym, shared_history);
     }
 
     #[inline]
@@ -4222,7 +4292,11 @@ impl FacContextTree {
     /// Update one bit position with a binary symbol.
     pub fn update(&mut self, sym: Symbol, bit_index: usize) {
         debug_assert!(bit_index < self.num_bits);
-        self.trees[bit_index].update(sym, &self.shared_history);
+        self.trees[bit_index].update_predicted(
+            sym,
+            &self.shared_history,
+            self.shared_history_version,
+        );
         self.shared_history.push(sym);
         self.bump_shared_history_version();
     }
@@ -5288,6 +5362,20 @@ mod tests {
         let last = history.pop();
         assert_eq!(last, bits.last().copied());
         assert_eq!(history.len(), bits.len() - 1);
+        let popped_bits = &bits[..bits.len() - 1];
+        for depth in 0..160usize {
+            assert_eq!(
+                history_symbol(&history, depth),
+                history_symbol(popped_bits, depth)
+            );
+            for len in [0usize, 1, 2, 7, 31, 32, 33, 63, 64] {
+                assert_eq!(
+                    path_bits_from_history(&history, depth, len),
+                    path_bits_from_history(popped_bits, depth, len),
+                    "after pop depth={depth} len={len}",
+                );
+            }
+        }
 
         history.truncate(65);
         assert_eq!(history.to_vec(), bits[..65].to_vec());

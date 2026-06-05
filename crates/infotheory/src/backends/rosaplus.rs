@@ -1716,9 +1716,26 @@ struct LmTx {
     old_nodes_len: usize,
     ls_changes: Vec<(usize, LmState)>,
     node_changes: Vec<(usize, CountNode)>,
-    // unigram delta for bytes
-    uni_delta: [u64; BYTE_ALPHA_N],
+    // Sparse unigram deltas for byte-alphabet transactions. AIQI and other
+    // bit-token callers usually touch only symbols 0/1, so dense 256-way
+    // transaction state is disproportionate in reversible hot paths.
+    uni_delta: Vec<(u8, u64)>,
     total_uni_add: u64,
+}
+
+impl LmTx {
+    fn record_unigram_byte(&mut self, byte: u8) {
+        if let Some((_, delta)) = self
+            .uni_delta
+            .iter_mut()
+            .find(|(symbol, _)| *symbol == byte)
+        {
+            *delta += 1;
+        } else {
+            self.uni_delta.push((byte, 1));
+        }
+        self.total_uni_add += 1;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1994,7 +2011,7 @@ impl RosaPlus {
             old_nodes_len: self.lm.nodes.len(),
             ls_changes: Vec::new(),
             node_changes: Vec::new(),
-            uni_delta: [0u64; BYTE_ALPHA_N],
+            uni_delta: Vec::new(),
             total_uni_add: 0,
         };
         RosaTx {
@@ -2194,8 +2211,9 @@ impl RosaPlus {
         // Feed all bytes (SAM structure changes are logged).
         for &b in s {
             self.sam.feed_tx(&mut tx.sam, b as u32);
-            tx.lm.uni_delta[b as usize] += 1;
-            tx.lm.total_uni_add += 1;
+            tx.lm.record_unigram_byte(b);
+            self.lm.unigram[b as usize] += 1;
+            self.lm.total_uni += 1;
         }
         if mark_boundary {
             self.sam.mark_boundary_tx(&mut tx.sam);
@@ -2213,14 +2231,6 @@ impl RosaPlus {
                 },
             );
         }
-
-        // Update unigram counts (fixed 256 alphabet assumed).
-        for i in 0..256 {
-            if tx.lm.uni_delta[i] != 0 {
-                self.lm.unigram[i] += tx.lm.uni_delta[i];
-            }
-        }
-        self.lm.total_uni += tx.lm.total_uni_add;
 
         // Update conditional counts for the new segment only.
         let seg_start = tx.seg_start;
@@ -2271,11 +2281,9 @@ impl RosaPlus {
         // Restore LM changes
         // Unigram rollback
         if self.lm.unigram.len() >= BYTE_ALPHA_N {
-            for i in 0..BYTE_ALPHA_N {
-                let d = tx.lm.uni_delta[i];
-                if d != 0 {
-                    self.lm.unigram[i] = self.lm.unigram[i].saturating_sub(d);
-                }
+            for (symbol, delta) in tx.lm.uni_delta {
+                let idx = usize::from(symbol);
+                self.lm.unigram[idx] = self.lm.unigram[idx].saturating_sub(delta);
             }
             self.lm.total_uni = self.lm.total_uni.saturating_sub(tx.lm.total_uni_add);
         }
@@ -3625,6 +3633,22 @@ mod tests {
         assert_eq!(direct.lm.unigram, tx_model.lm.unigram);
         assert_eq!(direct.lm.nodes, tx_model.lm.nodes);
         assert_eq!(direct.lm.ls, tx_model.lm.ls);
+    }
+
+    #[test]
+    fn repeated_updates_in_one_transaction_count_unigrams_once_per_byte() {
+        let mut direct = RosaPlus::new(4, false, 0, 123);
+        direct.build_lm_full_bytes_no_finalize_endpos();
+        direct.train_sequence(b"abracadabra");
+
+        let mut tx_model = RosaPlus::new(4, false, 0, 123);
+        tx_model.build_lm_full_bytes_no_finalize_endpos();
+        let mut tx = tx_model.begin_tx();
+        tx_model.train_sequence_tx(&mut tx, b"abra");
+        tx_model.train_sequence_tx(&mut tx, b"cadabra");
+
+        assert_eq!(direct.lm.total_uni, tx_model.lm.total_uni);
+        assert_eq!(direct.lm.unigram, tx_model.lm.unigram);
     }
 
     #[test]
