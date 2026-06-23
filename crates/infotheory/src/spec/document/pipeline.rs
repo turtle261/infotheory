@@ -13,7 +13,7 @@ use super::{
 use crate::aixi::common::{
     MctsStrategy, bits_for_cardinality, byte_packed_percept_bits, resolve_random_seed,
     validate_aiqi_byte_packed_alignment, validate_mc_aixi_byte_packed_alignment,
-    warn_parallel_uct_workers_one_once,
+    validate_reward_encoding_bounds, warn_parallel_uct_workers_one_once,
 };
 use crate::spec::core::AssetRef;
 use std::collections::HashMap;
@@ -98,6 +98,48 @@ fn validate_mc_aixi_mcts_strategy(strategy: MctsStrategy) -> SpecResult<()> {
     }
 }
 
+fn validate_warmstart_direct_evaluator_marker(
+    planner_simulations_per_step: usize,
+) -> SpecResult<()> {
+    if planner_simulations_per_step != 1 {
+        return Err(SpecError::new(
+            "planner_simulations_per_step must be exactly 1 for warm-start exact-J_H direct evaluation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_warmstart_exact_return_bins(
+    return_horizon: usize,
+    return_bins: usize,
+) -> SpecResult<()> {
+    if (return_bins - 1) % return_horizon != 0 {
+        return Err(SpecError::new(
+            "return_bins must be exactly H * max_reward + 1 for warm-start exact-J_H",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_warmstart_exact_reward_channel(
+    return_horizon: usize,
+    return_bins: usize,
+    reward_bits: usize,
+) -> SpecResult<()> {
+    let span = return_bins
+        .checked_sub(1)
+        .ok_or_else(|| SpecError::new("return_bins must be >= 1"))?;
+    let max_reward = i64::try_from(span / return_horizon).map_err(|_| {
+        SpecError::new("return_bins imply an instantaneous reward bound that does not fit i64")
+    })?;
+    validate_reward_encoding_bounds(0, max_reward, 0, reward_bits).map_err(|err| {
+        SpecError::new(format!(
+            "return_bins imply max_reward={max_reward} for return_horizon={return_horizon}, \
+             but that reward range is not representable by reward_bits={reward_bits}: {err}"
+        ))
+    })
+}
+
 #[cfg(feature = "tuner")]
 fn compile_tune_controller(spec: &TuneControllerSpec) -> CompiledTuneController {
     match spec {
@@ -178,7 +220,8 @@ pub(super) fn canonicalize_planner_run(
     validate_asset_bindings(&spec.assets)?;
     let environment = canonicalize_environment_spec(&spec.environment, &spec.assets, env)?;
     let interface = canonicalize_interface_spec(&spec.interface)?;
-    let controller = canonicalize_controller_spec(&spec.controller, env, Some(&interface))?;
+    let controller =
+        canonicalize_controller_spec(&spec.controller, &spec.assets, env, Some(&interface))?;
     let runtime = canonicalize_runtime_spec(&spec.runtime)?;
     Ok(PlannerRunSpec {
         assets: canonicalize_assets(&spec.assets),
@@ -277,6 +320,7 @@ fn canonicalize_tune_controller(
             if inner.planner_simulations_per_step == 0 {
                 return Err(SpecError::new("planner_simulations_per_step must be >= 1"));
             }
+            validate_warmstart_direct_evaluator_marker(inner.planner_simulations_per_step)?;
             if inner.return_horizon == 0 {
                 return Err(SpecError::new("return_horizon must be >= 1"));
             }
@@ -337,7 +381,6 @@ fn validate_asset_bindings(bindings: &[AssetBinding]) -> SpecResult<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "tuner", feature = "vm", test))]
 fn ensure_asset_exists(bindings: &[AssetBinding], id: &str) -> SpecResult<()> {
     if bindings.iter().any(|binding| binding.id == id) {
         Ok(())
@@ -358,6 +401,7 @@ fn canonicalize_interface_spec(spec: &PlannerInterfaceSpec) -> SpecResult<Planne
 
 fn canonicalize_controller_spec(
     spec: &ControllerSpec,
+    assets: &[AssetBinding],
     env: &SpecEnvironment,
     interface: Option<&PlannerInterfaceSpec>,
 ) -> SpecResult<ControllerSpec> {
@@ -464,11 +508,23 @@ fn canonicalize_controller_spec(
             ))
         }
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
+            if inner.planner_simulations_per_step == 0 {
+                return Err(SpecError::new("planner_simulations_per_step must be >= 1"));
+            }
+            validate_warmstart_direct_evaluator_marker(inner.planner_simulations_per_step)?;
             if inner.return_horizon == 0 {
                 return Err(SpecError::new("return_horizon must be >= 1"));
             }
             if inner.return_bins == 0 {
                 return Err(SpecError::new("return_bins must be >= 1"));
+            }
+            validate_warmstart_exact_return_bins(inner.return_horizon, inner.return_bins)?;
+            if let Some(interface) = interface {
+                validate_warmstart_exact_reward_channel(
+                    inner.return_horizon,
+                    inner.return_bins,
+                    interface.reward_bits,
+                )?;
             }
             if inner.label_phase_period < inner.return_horizon {
                 return Err(SpecError::new(
@@ -492,6 +548,11 @@ fn canonicalize_controller_spec(
             }
             let validated_predictor = inner.predictor.validate_in(env)?;
             let predictor = validated_predictor.canonical_spec().clone();
+            let teacher_dataset_asset = inner.teacher_dataset_asset.trim();
+            if teacher_dataset_asset.is_empty() {
+                return Err(SpecError::new("teacher_dataset_asset cannot be empty"));
+            }
+            ensure_asset_exists(assets, teacher_dataset_asset)?;
             Ok(ControllerSpec::AiqiWarmstartExactJh(
                 super::WarmStartExactJhControllerSpec {
                     predictor,
@@ -499,7 +560,7 @@ fn canonicalize_controller_spec(
                     return_horizon: inner.return_horizon,
                     return_bins: inner.return_bins,
                     label_phase_period: inner.label_phase_period,
-                    teacher_dataset_asset: inner.teacher_dataset_asset.trim().to_string(),
+                    teacher_dataset_asset: teacher_dataset_asset.to_string(),
                     planner_simulations_per_step: inner.planner_simulations_per_step,
                 },
             ))
@@ -929,6 +990,10 @@ mod tests {
     #[test]
     fn planner_controller_validation_covers_mc_aixi_and_aiqi_contracts() {
         let env = SpecEnvironment::default();
+        let warmstart_assets = vec![AssetBinding {
+            id: "teacher-ds".to_string(),
+            path: "teacher.json".to_string(),
+        }];
         let workers = NonZeroUsize::new(2).expect("non-zero workers");
 
         canonicalize_controller_spec(
@@ -944,6 +1009,7 @@ mod tests {
                 exploration_exploitation_ratio: 1.0,
                 discount_gamma: 0.8,
             }),
+            &[],
             &env,
             None,
         )
@@ -959,6 +1025,7 @@ mod tests {
                 exploration_exploitation_ratio: 1.0,
                 discount_gamma: 0.8,
             }),
+            &[],
             &env,
             None,
         ) {
@@ -978,6 +1045,7 @@ mod tests {
                 history_prune_keep_steps: None,
                 baseline_exploration: 0.1,
             }),
+            &[],
             &env,
             None,
         ) {
@@ -991,13 +1059,14 @@ mod tests {
                 predictor: RateBackend::Ctw { depth: 4 },
                 bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
                 return_horizon: 2,
-                return_bins: 8,
+                return_bins: 5,
                 label_phase_period: 3,
                 teacher_dataset_asset: "  teacher-ds  ".to_string(),
-                planner_simulations_per_step: 5,
+                planner_simulations_per_step: 1,
             }),
+            &warmstart_assets,
             &env,
-            None,
+            Some(&sample_interface()),
         )
         .expect("valid warmstart controller");
         match warmstart {
@@ -1006,6 +1075,124 @@ mod tests {
             }
             _ => panic!("expected warmstart controller"),
         }
+
+        let err = match canonicalize_controller_spec(
+            &ControllerSpec::AiqiWarmstartExactJh(super::super::WarmStartExactJhControllerSpec {
+                predictor: RateBackend::Ctw { depth: 4 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
+                return_horizon: 4,
+                return_bins: 8,
+                label_phase_period: 4,
+                teacher_dataset_asset: "teacher-ds".to_string(),
+                planner_simulations_per_step: 1,
+            }),
+            &warmstart_assets,
+            &env,
+            Some(&sample_interface()),
+        ) {
+            Ok(_) => panic!("warmstart slack return bins must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("return_bins must be exactly H * max_reward + 1"),
+            "{err}"
+        );
+
+        let err = match canonicalize_controller_spec(
+            &ControllerSpec::AiqiWarmstartExactJh(super::super::WarmStartExactJhControllerSpec {
+                predictor: RateBackend::Ctw { depth: 4 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
+                return_horizon: 2,
+                return_bins: 513,
+                label_phase_period: 3,
+                teacher_dataset_asset: "teacher-ds".to_string(),
+                planner_simulations_per_step: 1,
+            }),
+            &warmstart_assets,
+            &env,
+            Some(&PlannerInterfaceSpec {
+                reward_bits: 8,
+                ..sample_interface()
+            }),
+        ) {
+            Ok(_) => panic!("warmstart reward_bits too narrow must fail at spec time"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("not representable by reward_bits=8"),
+            "{err}"
+        );
+
+        let err = match canonicalize_controller_spec(
+            &ControllerSpec::AiqiWarmstartExactJh(super::super::WarmStartExactJhControllerSpec {
+                predictor: RateBackend::Ctw { depth: 4 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
+                return_horizon: 2,
+                return_bins: 5,
+                label_phase_period: 3,
+                teacher_dataset_asset: "missing-teacher".to_string(),
+                planner_simulations_per_step: 1,
+            }),
+            &warmstart_assets,
+            &env,
+            Some(&sample_interface()),
+        ) {
+            Ok(_) => panic!("warmstart missing teacher asset must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("unknown asset id 'missing-teacher'"),
+            "{err}"
+        );
+
+        let err = match canonicalize_controller_spec(
+            &ControllerSpec::AiqiWarmstartExactJh(super::super::WarmStartExactJhControllerSpec {
+                predictor: RateBackend::Ctw { depth: 4 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
+                return_horizon: 2,
+                return_bins: 5,
+                label_phase_period: 3,
+                teacher_dataset_asset: "  ".to_string(),
+                planner_simulations_per_step: 1,
+            }),
+            &warmstart_assets,
+            &env,
+            Some(&sample_interface()),
+        ) {
+            Ok(_) => panic!("warmstart blank teacher asset must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("teacher_dataset_asset cannot be empty"),
+            "{err}"
+        );
+
+        let err = match canonicalize_controller_spec(
+            &ControllerSpec::AiqiWarmstartExactJh(super::super::WarmStartExactJhControllerSpec {
+                predictor: RateBackend::Ctw { depth: 4 },
+                bit_stream_semantics: crate::api::BitStreamSemantics::BinaryTokens,
+                return_horizon: 2,
+                return_bins: 5,
+                label_phase_period: 3,
+                teacher_dataset_asset: "teacher-ds".to_string(),
+                planner_simulations_per_step: 2,
+            }),
+            &warmstart_assets,
+            &env,
+            Some(&sample_interface()),
+        ) {
+            Ok(_) => panic!("warmstart non-direct planner marker must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("planner_simulations_per_step must be exactly 1"),
+            "{err}"
+        );
     }
 
     #[cfg(all(feature = "backend-ctw", feature = "tuner"))]
@@ -1119,7 +1306,7 @@ mod tests {
             &TuneControllerSpec::AiqiWarmstartExactJh(
                 super::super::WarmStartExactJhTuneControllerSpec {
                     interface: sample_tune_interface(),
-                    planner_simulations_per_step: 2,
+                    planner_simulations_per_step: 1,
                     return_horizon: 2,
                     warmstart_teacher_dataset_asset: "missing".to_string(),
                     label_phase_period: 3,
@@ -1130,6 +1317,26 @@ mod tests {
         )
         .expect_err("missing teacher asset must fail");
         assert!(err.to_string().contains("unknown asset id 'missing'"));
+
+        let err = canonicalize_tune_controller(
+            &TuneControllerSpec::AiqiWarmstartExactJh(
+                super::super::WarmStartExactJhTuneControllerSpec {
+                    interface: sample_tune_interface(),
+                    planner_simulations_per_step: 2,
+                    return_horizon: 2,
+                    warmstart_teacher_dataset_asset: "teacher".to_string(),
+                    label_phase_period: 3,
+                },
+            ),
+            &assets,
+            &env,
+        )
+        .expect_err("warmstart tune non-direct planner marker must fail");
+        assert!(
+            err.to_string()
+                .contains("planner_simulations_per_step must be exactly 1"),
+            "{err}"
+        );
 
         validate_tune_bounds(&TuneBoundsSpec {
             allowed_backends: vec!["ctw".to_string()],

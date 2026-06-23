@@ -39,9 +39,9 @@ pub(super) fn run_planner_family_controller(
         &SpecEnvironment::new(compiled.base_dir()),
     )?;
     if let Some(teacher) = &contract.teacher {
-        crate::aixi::warmstart::validate_warmstart_teacher_planner_task_fingerprint(
+        crate::aixi::warmstart::validate_warmstart_teacher_dataset_for_compiled_planner_run(
             &planner_run,
-            &teacher.traces.contract,
+            &teacher.traces,
         )
         .map_err(|err| err.to_string())?;
     }
@@ -112,12 +112,20 @@ pub(super) fn run_planner_family_controller(
             realized_trace_counts_by_round[previous_round] = live_trace.transitions.len();
             if trace_refresh_enabled && let Some(teacher) = refresh_teacher.as_mut() {
                 let records_before = teacher_trace_record_count(teacher);
-                merge_warmstart_trace_deterministic(teacher, live_trace)?;
+                let inserted = merge_warmstart_trace_deterministic(teacher, live_trace)?;
                 let records_after = teacher_trace_record_count(teacher);
                 trace_refresh_merges_by_round[previous_round] =
                     records_after.saturating_sub(records_before);
-                agent_runtime.rebuild_warmstart_agent(&planner_run, teacher.clone())?;
-                warmstart_trace_refresh_merges = warmstart_trace_refresh_merges.saturating_add(1);
+                if inserted {
+                    crate::aixi::warmstart::validate_warmstart_teacher_dataset_for_compiled_planner_run(
+                        &planner_run,
+                        teacher,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    agent_runtime.rebuild_warmstart_agent(&planner_run, teacher.clone())?;
+                    warmstart_trace_refresh_merges =
+                        warmstart_trace_refresh_merges.saturating_add(1);
+                }
             }
         }
         let round_deadline_seconds = if contract.warmstart_self_improvement && total_rounds > 1 {
@@ -442,7 +450,11 @@ pub(super) fn run_planner_family_controller(
                 "records": value.records,
             })),
             "warmstart_self_improvement_update": if contract.warmstart_self_improvement {
-                Some("online_exact_h_step_delayed_label_update")
+                if trace_refresh_enabled {
+                    Some("same_task_trace_refresh_rebuild")
+                } else {
+                    Some("online_exact_h_step_delayed_label_update")
+                }
             } else {
                 None::<&str>
             },
@@ -597,29 +609,64 @@ pub(super) fn validate_warmstart_teacher_contract(
     if contract.schema_version != 1 {
         return Err("warmstart teacher schema_version must be 1".to_string());
     }
-    if contract.action_alphabet_size != interface.agent_actions.get()
-        || contract.observation_bits != interface.observation_bits
-        || contract.observation_stream_len != interface.observation_stream_len.max(1)
-        || contract.observation_key_mode
-            != observation_key_mode_name(interface.observation_key_mode)
-        || contract.reward_bits != interface.reward_bits
-        || contract.return_horizon != return_horizon
-        || contract.label_phase_period != label_phase_period
-    {
-        return Err(
-            "warmstart teacher planner interface fingerprint does not match current controller"
-                .to_string(),
-        );
+    if contract.action_alphabet_size != interface.agent_actions.get() {
+        return Err(format!(
+            "warmstart teacher action_alphabet_size {} does not match configured {}",
+            contract.action_alphabet_size,
+            interface.agent_actions.get()
+        ));
+    }
+    if contract.observation_bits != interface.observation_bits {
+        return Err(format!(
+            "warmstart teacher observation_bits {} does not match configured {}",
+            contract.observation_bits, interface.observation_bits
+        ));
+    }
+    if contract.observation_stream_len != interface.observation_stream_len.max(1) {
+        return Err(format!(
+            "warmstart teacher observation_stream_len {} does not match configured {}",
+            contract.observation_stream_len,
+            interface.observation_stream_len.max(1)
+        ));
+    }
+    if contract.observation_key_mode != observation_key_mode_name(interface.observation_key_mode) {
+        return Err(format!(
+            "warmstart teacher observation_key_mode '{}' does not match configured '{}'",
+            contract.observation_key_mode,
+            observation_key_mode_name(interface.observation_key_mode)
+        ));
+    }
+    if contract.reward_bits != interface.reward_bits {
+        return Err(format!(
+            "warmstart teacher reward_bits {} does not match configured {}",
+            contract.reward_bits, interface.reward_bits
+        ));
+    }
+    if contract.return_horizon != return_horizon {
+        return Err(format!(
+            "warmstart teacher return_horizon {} does not match configured {}",
+            contract.return_horizon, return_horizon
+        ));
+    }
+    if contract.label_phase_period != label_phase_period {
+        return Err(format!(
+            "warmstart teacher label_phase_period {} does not match configured {}",
+            contract.label_phase_period, label_phase_period
+        ));
     }
     let expected_adapter_ref = OBSERVATION_ADAPTER_DECLARATION;
     let expected_adapter_hash = observation_adapter_content_hash()?;
-    if contract.observation_adapter_spec_ref != expected_adapter_ref
-        || contract.observation_adapter_content_crc32 != expected_adapter_hash
-    {
-        return Err(
-            "warmstart teacher observation adapter fingerprint does not match current tuner observation adapter"
-                .to_string(),
-        );
+    if contract.observation_adapter_spec_ref != expected_adapter_ref {
+        return Err(format!(
+            "warmstart teacher observation adapter fingerprint does not match current tuner observation adapter: observation_adapter_spec_ref '{}' does not match expected '{}'",
+            contract.observation_adapter_spec_ref, expected_adapter_ref
+        ));
+    }
+    if contract.observation_adapter_content_crc32 != expected_adapter_hash {
+        return Err(format!(
+            "warmstart teacher observation adapter fingerprint does not match current tuner observation adapter: observation_adapter_content_crc32 '{}' does not match expected '{}'",
+            contract.observation_adapter_content_crc32, expected_adapter_hash
+        ));
     }
     let reward_cert = verified_theorem
         .exact_reward_encoding
@@ -627,10 +674,17 @@ pub(super) fn validate_warmstart_teacher_contract(
         .ok_or_else(|| {
             "warmstart exact-J_H requires a verified exact_reward_encoding_certificate".to_string()
         })?;
-    if contract.scalar_representation != reward_cert.scalar_representation
-        || contract.exact_reward_encoding_certificate != reward_cert.base.content_hash
-    {
-        return Err("warmstart teacher reward/scalar fingerprint does not match verified exact reward encoder".to_string());
+    if contract.scalar_representation != reward_cert.scalar_representation {
+        return Err(format!(
+            "warmstart teacher scalar_representation '{}' does not match verified encoder '{}'",
+            contract.scalar_representation, reward_cert.scalar_representation
+        ));
+    }
+    if contract.exact_reward_encoding_certificate != reward_cert.base.content_hash {
+        return Err(format!(
+            "warmstart teacher exact_reward_encoding_certificate '{}' does not match verified encoder '{}'",
+            contract.exact_reward_encoding_certificate, reward_cert.base.content_hash
+        ));
     }
     Ok(())
 }
@@ -979,7 +1033,7 @@ fn build_tuner_planner_agent_runtime(
 pub(super) fn merge_warmstart_trace_deterministic(
     teacher: &mut WarmStartExactJhTeacherDataset,
     trace: WarmStartExactJhTeacherTrace,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let key = warmstart_trace_key(&trace)?;
     let already_present = teacher
         .traces
@@ -987,13 +1041,14 @@ pub(super) fn merge_warmstart_trace_deterministic(
         .map(warmstart_trace_key)
         .collect::<Result<BTreeSet<String>, String>>()?
         .contains(&key);
-    if !already_present {
-        teacher.traces.push(trace);
-        teacher
-            .traces
-            .sort_by_key(|trace| warmstart_trace_key(trace).unwrap_or_default());
+    if already_present {
+        return Ok(false);
     }
-    Ok(())
+    teacher.traces.push(trace);
+    teacher
+        .traces
+        .sort_by_key(|trace| warmstart_trace_key(trace).unwrap_or_default());
+    Ok(true)
 }
 
 pub(super) fn warmstart_trace_key(trace: &WarmStartExactJhTeacherTrace) -> Result<String, String> {

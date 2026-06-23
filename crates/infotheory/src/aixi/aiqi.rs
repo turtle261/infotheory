@@ -16,6 +16,10 @@ use crate::aixi::model::{
     Predictor, PredictorBuildError, build_aiqi_predictor, default_aixi_bit_stream_semantics,
 };
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
+use crate::aixi::return_law::{
+    ReturnLabelCodec, ReturnLawEvaluator, ReturnPrefixUpdate, expected_decoded_return,
+    predict_return_law,
+};
 use crate::api::{BitStreamSemantics, RateBackend, validate_rate_backend};
 use crate::spec::{
     AiqiDiscountedControllerSpec, CompiledPlannerController, CompiledPlannerRunSpec,
@@ -544,9 +548,8 @@ pub struct AiqiAgent {
     // Total number of transitions observed so far (global 1-based max step index).
     total_steps_observed: usize,
     action_bits: usize,
-    return_bits: usize,
+    return_label_codec: ReturnLabelCodec,
     use_generic_planner: bool,
-    distribution_uses_training_updates: bool,
     rng: RandomGenerator,
 }
 
@@ -586,13 +589,13 @@ impl AiqiAgent {
                 _ => return Err(AiqiError::ControllerKindMismatch),
             };
         let action_bits = compiled.action_bits();
-        let return_bits = bits_for_cardinality(return_bins);
+        let return_label_codec = ReturnLabelCodec::value_monotone(return_bins);
+        let return_bits = return_label_codec.bits();
         let uses_native_reversible_binary_predictor = bit_stream_semantics
             == BitStreamSemantics::BinaryTokens
             && predictor.supports_native_bit_prediction()
             && predictor.supports_reversible_bit_updates();
         let use_generic_planner = !uses_native_reversible_binary_predictor;
-        let distribution_uses_training_updates = uses_native_reversible_binary_predictor;
 
         let mut phases = Vec::with_capacity(augmentation_period);
         for _ in 0..augmentation_period {
@@ -607,9 +610,8 @@ impl AiqiAgent {
 
         Ok(Self {
             action_bits,
-            return_bits,
+            return_label_codec,
             use_generic_planner,
-            distribution_uses_training_updates,
             config,
             phases,
             steps: Vec::new(),
@@ -635,18 +637,33 @@ impl AiqiAgent {
         self.config.random_seed
     }
 
+    pub(crate) fn reseed_random(&mut self, seed: u64) {
+        self.config.random_seed = seed;
+        self.rng = RandomGenerator::from_seed(seed);
+    }
+
     /// Select the next action from the current history.
     pub fn get_planned_action(&mut self) -> Action {
+        self.get_planned_action_with_extra_exploration_flag(0.0).0
+    }
+
+    /// Select the next action and report whether it was sampled for exploration.
+    pub fn get_planned_action_with_extra_exploration_flag(
+        &mut self,
+        extra_exploration: f64,
+    ) -> (Action, bool) {
+        let extra = extra_exploration.clamp(0.0, 1.0);
+        let tau = self.config.baseline_exploration.clamp(0.0, 1.0);
+        let effective = 1.0 - (1.0 - tau) * (1.0 - extra);
         let q_values = self.estimate_q_values();
         let greedy_action = argmax_with_fixed_tie_break(&q_values) as u64;
-        if self.config.baseline_exploration > 0.0
-            && self
-                .rng
-                .gen_bool(self.config.baseline_exploration.clamp(0.0, 1.0))
-        {
-            self.rng.gen_range(self.config.agent_actions.get()) as u64
+        if effective > 0.0 && self.rng.gen_bool(effective) {
+            (
+                self.rng.gen_range(self.config.agent_actions.get()) as u64,
+                true,
+            )
         } else {
-            greedy_action
+            (greedy_action, false)
         }
     }
 
@@ -656,16 +673,8 @@ impl AiqiAgent {
     /// `p = 1 - (1 - tau) * (1 - extra)`, where `tau` is the baseline
     /// exploration in [`AiqiConfig`].
     pub fn get_planned_action_with_extra_exploration(&mut self, extra_exploration: f64) -> Action {
-        let extra = extra_exploration.clamp(0.0, 1.0);
-        let tau = self.config.baseline_exploration.clamp(0.0, 1.0);
-        let effective = 1.0 - (1.0 - tau) * (1.0 - extra);
-        let q_values = self.estimate_q_values();
-        let greedy_action = argmax_with_fixed_tie_break(&q_values) as u64;
-        if effective > 0.0 && self.rng.gen_bool(effective) {
-            self.rng.gen_range(self.config.agent_actions.get()) as u64
-        } else {
-            greedy_action
-        }
+        self.get_planned_action_with_extra_exploration_flag(extra_exploration)
+            .0
     }
 
     /// Record one environment transition `(action, observations, reward)`.
@@ -772,14 +781,14 @@ impl AiqiAgent {
         let return_bins_by_step = &self.return_bins_by_step;
         let history_base_step = self.history_base_step;
         let action_bits = self.action_bits;
-        let return_bits = self.return_bits;
+        let return_label_codec = self.return_label_codec;
         let token_ctx = AiqiAugmentedTokenContext {
             config,
             history_base_step,
             steps,
             return_bins_by_step,
             action_bits,
-            return_bits,
+            return_label_codec,
             phase,
         };
 
@@ -807,13 +816,13 @@ impl AiqiAgent {
                     action as u64,
                     self.action_bits,
                 );
-                let dist = Self::predict_return_distribution(
-                    self.config.return_bins,
-                    self.return_bits,
+                let law = predict_return_law(
                     model.predictor.as_mut(),
-                    self.distribution_uses_training_updates,
+                    self.return_label_codec,
+                    ReturnPrefixUpdate::Training,
+                    ReturnLawEvaluator::SharedPrefix,
                 );
-                *q_value = expectation_from_distribution(&dist);
+                *q_value = expected_aiqi_return(&law.probabilities, self.config.return_bins);
                 pop_history_bits(model.predictor.as_mut(), pushed_action);
             }
 
@@ -835,7 +844,7 @@ impl AiqiAgent {
             steps: &self.steps,
             return_bins_by_step: &self.return_bins_by_step,
             action_bits: self.action_bits,
-            return_bits: self.return_bits,
+            return_label_codec: self.return_label_codec,
             phase,
         };
 
@@ -862,158 +871,16 @@ impl AiqiAgent {
                 action as u64,
                 self.action_bits,
             );
-            let dist = Self::predict_return_distribution_from_planner_predictor(
-                self.config.return_bins,
-                self.return_bits,
+            let law = predict_return_law(
                 action_predictor.as_mut(),
+                self.return_label_codec,
+                ReturnPrefixUpdate::Training,
+                ReturnLawEvaluator::SharedPrefix,
             );
-            *q_value = expectation_from_distribution(&dist);
+            *q_value = expected_aiqi_return(&law.probabilities, self.config.return_bins);
         }
 
         q_values
-    }
-
-    fn predict_return_distribution(
-        return_bins: usize,
-        return_bits: usize,
-        predictor: &mut dyn Predictor,
-        use_training_updates: bool,
-    ) -> Vec<f64> {
-        debug_assert!(return_bins.is_power_of_two());
-        if return_bins == 1 {
-            return vec![1.0];
-        }
-
-        let mut probs = vec![0.0; return_bins];
-        for (bin, slot) in probs.iter_mut().enumerate() {
-            let mut p = 1.0f64;
-            let mut v = bin as u64;
-            for _ in 0..return_bits {
-                let bit = (v & 1) == 1;
-                v >>= 1;
-                let q = predictor.predict_prob(bit).clamp(1e-12, 1.0 - 1e-12);
-                p *= q;
-                if use_training_updates {
-                    predictor.update(bit);
-                } else {
-                    predictor.update_history(bit);
-                }
-            }
-            if use_training_updates {
-                revert_bits(predictor, return_bits);
-            } else {
-                pop_history_bits(predictor, return_bits);
-            }
-            *slot = p;
-        }
-
-        let sum: f64 = probs.iter().sum();
-        if !sum.is_finite() || sum <= 0.0 {
-            let u = 1.0 / (return_bins as f64);
-            probs.fill(u);
-            return probs;
-        }
-
-        for p in &mut probs {
-            *p /= sum;
-        }
-        probs
-    }
-
-    fn predict_return_distribution_from_base_predictor(
-        return_bins: usize,
-        return_bits: usize,
-        base_predictor: &dyn Predictor,
-    ) -> Vec<f64> {
-        debug_assert!(return_bins.is_power_of_two());
-        if return_bins == 1 {
-            return vec![1.0];
-        }
-
-        let mut probs = vec![0.0; return_bins];
-        for (bin, slot) in probs.iter_mut().enumerate() {
-            let mut predictor = base_predictor.boxed_clone();
-            let mut p = 1.0f64;
-            let mut v = bin as u64;
-            for _ in 0..return_bits {
-                let bit = (v & 1) == 1;
-                v >>= 1;
-                let q = predictor.predict_prob(bit).clamp(1e-12, 1.0 - 1e-12);
-                p *= q;
-                predictor.commit_update(bit);
-            }
-            *slot = p;
-        }
-
-        let sum: f64 = probs.iter().sum();
-        if !sum.is_finite() || sum <= 0.0 {
-            let u = 1.0 / (return_bins as f64);
-            probs.fill(u);
-            return probs;
-        }
-
-        for p in &mut probs {
-            *p /= sum;
-        }
-        probs
-    }
-
-    fn predict_return_distribution_scoped(
-        return_bins: usize,
-        return_bits: usize,
-        predictor: &mut dyn Predictor,
-    ) -> Vec<f64> {
-        debug_assert!(return_bins.is_power_of_two());
-        if return_bins == 1 {
-            return vec![1.0];
-        }
-
-        let mut probs = vec![0.0; return_bins];
-        for (bin, slot) in probs.iter_mut().enumerate() {
-            predictor.begin_rollback_scope();
-            let mut p = 1.0f64;
-            let mut v = bin as u64;
-            for _ in 0..return_bits {
-                let bit = (v & 1) == 1;
-                v >>= 1;
-                let q = predictor.predict_prob(bit).clamp(1e-12, 1.0 - 1e-12);
-                p *= q;
-                predictor.commit_update(bit);
-            }
-            assert!(
-                predictor.rollback_scope(),
-                "predictor advertised rollback scopes but failed to roll back"
-            );
-            *slot = p;
-        }
-
-        let sum: f64 = probs.iter().sum();
-        if !sum.is_finite() || sum <= 0.0 {
-            let u = 1.0 / (return_bins as f64);
-            probs.fill(u);
-            return probs;
-        }
-
-        for p in &mut probs {
-            *p /= sum;
-        }
-        probs
-    }
-
-    fn predict_return_distribution_from_planner_predictor(
-        return_bins: usize,
-        return_bits: usize,
-        predictor: &mut dyn Predictor,
-    ) -> Vec<f64> {
-        if predictor.supports_rollback_scope() {
-            Self::predict_return_distribution_scoped(return_bins, return_bits, predictor)
-        } else {
-            Self::predict_return_distribution_from_base_predictor(
-                return_bins,
-                return_bits,
-                predictor,
-            )
-        }
     }
 
     fn advance_phase_model_to_step(
@@ -1027,7 +894,7 @@ impl AiqiAgent {
             steps: &self.steps,
             return_bins_by_step: &self.return_bins_by_step,
             action_bits: self.action_bits,
-            return_bits: self.return_bits,
+            return_label_codec: self.return_label_codec,
             phase,
         };
         let model = &mut self.phases[phase];
@@ -1141,7 +1008,7 @@ struct AiqiAugmentedTokenContext<'a> {
     steps: &'a [StepRecord],
     return_bins_by_step: &'a [Option<u64>],
     action_bits: usize,
-    return_bits: usize,
+    return_label_codec: ReturnLabelCodec,
     phase: usize,
 }
 
@@ -1162,7 +1029,7 @@ fn push_step_tokens_history(
     if idx % ctx.config.augmentation_period == ctx.phase {
         let local_idx = idx - ctx.history_base_step;
         if let Some(bin) = ctx.return_bins_by_step[local_idx] {
-            pushed += push_encoded_bits_history(predictor, bin, ctx.return_bits);
+            pushed += ctx.return_label_codec.push_label_history(predictor, bin);
         }
     }
 
@@ -1190,7 +1057,7 @@ fn push_augmented_step_tokens_commit(
             step: idx,
             phase: ctx.phase,
         })?;
-        pushed += push_encoded_bits_commit(predictor, bin, ctx.return_bits);
+        pushed += ctx.return_label_codec.push_label_commit(predictor, bin);
     }
 
     Ok(pushed
@@ -1284,15 +1151,6 @@ fn max_value_for_bits(bits: usize) -> u64 {
     }
 }
 
-fn push_encoded_bits_commit(predictor: &mut dyn Predictor, value: u64, bits: usize) -> usize {
-    let mut v = value;
-    for _ in 0..bits {
-        predictor.commit_update((v & 1) == 1);
-        v >>= 1;
-    }
-    bits
-}
-
 fn push_encoded_bits_history(predictor: &mut dyn Predictor, value: u64, bits: usize) -> usize {
     let mut v = value;
     for _ in 0..bits {
@@ -1355,22 +1213,11 @@ fn pop_history_bits(predictor: &mut dyn Predictor, bits: usize) {
     }
 }
 
-fn revert_bits(predictor: &mut dyn Predictor, bits: usize) {
-    for _ in 0..bits {
-        predictor.revert();
-    }
-}
-
-fn expectation_from_distribution(probs: &[f64]) -> f64 {
+fn expected_aiqi_return(probs: &[f64], return_bins: usize) -> f64 {
     if probs.is_empty() {
         return 0.0;
     }
-    let m = probs.len() as f64;
-    probs
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (i as f64 / m) * p)
-        .sum::<f64>()
+    expected_decoded_return(probs, |label| label as f64 / return_bins as f64)
 }
 
 fn argmax_with_fixed_tie_break(values: &[f64]) -> usize {
@@ -1389,6 +1236,10 @@ fn argmax_with_fixed_tie_break(values: &[f64]) -> usize {
 mod tests {
     use super::*;
     use crate::aixi::environment::Environment;
+    use crate::aixi::return_law::{
+        ReturnLabelBitOrder, ReturnLabelCodec, ReturnLawEvaluator, ReturnPrefixUpdate,
+        predict_return_law,
+    };
     use crate::aixi::test_envs::DeterministicBinaryEnv;
     use crate::api::{MixtureKind, MixtureSpec};
     use std::sync::{Arc, Mutex};
@@ -1624,10 +1475,12 @@ mod tests {
     #[derive(Clone, Default)]
     struct ReturnLearningPredictor {
         saw_training_one: bool,
+        rollback: Vec<bool>,
     }
 
     impl Predictor for ReturnLearningPredictor {
         fn update(&mut self, sym: bool) {
+            self.rollback.push(self.saw_training_one);
             if sym {
                 self.saw_training_one = true;
             }
@@ -1643,7 +1496,12 @@ mod tests {
 
         fn commit_update_history(&mut self, _sym: bool) {}
 
-        fn revert(&mut self) {}
+        fn revert(&mut self) {
+            self.saw_training_one = self
+                .rollback
+                .pop()
+                .expect("test predictor rollback underflow");
+        }
 
         fn pop_history(&mut self) {}
 
@@ -1664,7 +1522,7 @@ mod tests {
     #[derive(Clone)]
     struct ScopedReturnLearningPredictor {
         saw_training_one: bool,
-        scopes: Vec<bool>,
+        rollback: Vec<bool>,
         clone_count: Arc<Mutex<usize>>,
     }
 
@@ -1672,7 +1530,7 @@ mod tests {
         fn new(clone_count: Arc<Mutex<usize>>) -> Self {
             Self {
                 saw_training_one: false,
-                scopes: Vec::new(),
+                rollback: Vec::new(),
                 clone_count,
             }
         }
@@ -1680,7 +1538,10 @@ mod tests {
 
     impl Predictor for ScopedReturnLearningPredictor {
         fn update(&mut self, sym: bool) {
-            self.commit_update(sym);
+            self.rollback.push(self.saw_training_one);
+            if sym {
+                self.saw_training_one = true;
+            }
         }
 
         fn commit_update(&mut self, sym: bool) {
@@ -1690,23 +1551,10 @@ mod tests {
         }
 
         fn revert(&mut self) {
-            let _ = self.rollback_scope();
-        }
-
-        fn begin_rollback_scope(&mut self) {
-            self.scopes.push(self.saw_training_one);
-        }
-
-        fn supports_rollback_scope(&self) -> bool {
-            true
-        }
-
-        fn rollback_scope(&mut self) -> bool {
-            let Some(previous) = self.scopes.pop() else {
-                return false;
-            };
-            self.saw_training_one = previous;
-            true
+            self.saw_training_one = self
+                .rollback
+                .pop()
+                .expect("test predictor rollback underflow");
         }
 
         fn predict_prob(&mut self, sym: bool) -> f64 {
@@ -1851,11 +1699,17 @@ mod tests {
     #[test]
     fn distribution_rollout_uses_update_and_revert_when_requested() {
         let mut predictor = CountingPredictor::default();
-        let probs = AiqiAgent::predict_return_distribution(4, 2, &mut predictor, true);
+        let law = predict_return_law(
+            &mut predictor,
+            ReturnLabelCodec::value_monotone(4),
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+        );
 
-        assert_eq!(probs.len(), 4);
-        assert_eq!(predictor.update_calls, 8);
-        assert_eq!(predictor.revert_calls, 8);
+        assert_eq!(law.probabilities.len(), 4);
+        assert_eq!(law.stats.logical_queries, 3);
+        assert_eq!(predictor.update_calls, 6);
+        assert_eq!(predictor.revert_calls, 6);
         assert_eq!(predictor.update_history_calls, 0);
         assert_eq!(predictor.pop_history_calls, 0);
     }
@@ -1863,25 +1717,37 @@ mod tests {
     #[test]
     fn distribution_rollout_uses_history_path_when_not_requested() {
         let mut predictor = CountingPredictor::default();
-        let probs = AiqiAgent::predict_return_distribution(4, 2, &mut predictor, false);
+        let law = predict_return_law(
+            &mut predictor,
+            ReturnLabelCodec::value_monotone(4),
+            ReturnPrefixUpdate::FrozenHistory,
+            ReturnLawEvaluator::SharedPrefix,
+        );
 
-        assert_eq!(probs.len(), 4);
+        assert_eq!(law.probabilities.len(), 4);
+        assert_eq!(law.stats.logical_queries, 3);
         assert_eq!(predictor.update_calls, 0);
         assert_eq!(predictor.revert_calls, 0);
-        assert_eq!(predictor.update_history_calls, 8);
-        assert_eq!(predictor.pop_history_calls, 8);
+        assert_eq!(predictor.update_history_calls, 6);
+        assert_eq!(predictor.pop_history_calls, 6);
     }
 
     #[test]
     fn generic_distribution_rollout_trains_on_return_symbols() {
-        let predictor = ReturnLearningPredictor::default();
-        let probs = AiqiAgent::predict_return_distribution_from_base_predictor(4, 2, &predictor);
+        let mut predictor = ReturnLearningPredictor::default();
+        let law = predict_return_law(
+            &mut predictor,
+            ReturnLabelCodec::value_monotone(4),
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+        );
+        let probs = law.probabilities;
 
         assert_eq!(probs.len(), 4);
         assert!((probs.iter().sum::<f64>() - 1.0).abs() < 1e-12);
         assert!(
-            probs[3] > probs[1],
-            "training on the first return bit should make bin 11 likelier than 01; got {:?}",
+            probs[3] > probs[2],
+            "training on the first return bit should make bin 11 likelier than 10; got {:?}",
             probs
         );
         assert!(
@@ -1889,41 +1755,54 @@ mod tests {
             "expected exact normalized mass for 00, got {:?}",
             probs
         );
+        assert!(
+            !predictor.saw_training_one,
+            "shared-prefix rollout must restore the caller's predictor state"
+        );
     }
 
     #[test]
-    fn generic_distribution_rollout_uses_scoped_rollback_when_available() {
+    fn generic_distribution_rollout_does_not_clone_per_label() {
         let clone_count = Arc::new(Mutex::new(0usize));
         let mut predictor = ScopedReturnLearningPredictor::new(clone_count.clone());
-        let probs =
-            AiqiAgent::predict_return_distribution_from_planner_predictor(4, 2, &mut predictor);
+        let law = predict_return_law(
+            &mut predictor,
+            ReturnLabelCodec::value_monotone(4),
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+        );
+        let probs = law.probabilities;
 
         assert_eq!(probs.len(), 4);
         assert!(
-            probs[3] > probs[1],
-            "scoped training on return bits should match clone-per-bin semantics"
+            probs[3] > probs[2],
+            "shared-prefix training on return bits should preserve autoregressive semantics"
         );
         assert_eq!(
             *clone_count.lock().unwrap(),
             0,
-            "rollback-scoped predictors should not clone once per return bin"
+            "shared-prefix evaluation should not clone once per return bin"
         );
         assert!(
             !predictor.saw_training_one,
-            "scoped rollout must restore the caller's predictor state"
-        );
-        assert!(
-            predictor.scopes.is_empty(),
-            "scoped rollout must close every rollback scope"
+            "shared-prefix rollout must restore the caller's predictor state"
         );
     }
 
     #[test]
-    fn ac_ctw_rollout_uses_training_updates() {
+    fn aiqi_return_label_codec_is_value_monotone() {
         let agent = AiqiAgent::new(basic_config()).expect("valid aiqi config");
-        assert!(
-            agent.distribution_uses_training_updates,
-            "ac-ctw should use update/revert during return distribution rollout"
+        assert_eq!(
+            agent.return_label_codec.order(),
+            ReturnLabelBitOrder::MsbFirst
+        );
+        assert_eq!(
+            agent.return_label_codec.label_range_for_prefix(0, 1),
+            Some((0, 3))
+        );
+        assert_eq!(
+            agent.return_label_codec.label_range_for_prefix(1, 1),
+            Some((4, 7))
         );
     }
 
@@ -2041,11 +1920,14 @@ mod tests {
 
         assert_eq!(q_values.len(), agent.config.agent_actions.get());
         let snapshot = counts.lock().unwrap().clone();
-        assert_eq!(snapshot.update, 0);
+        assert!(
+            snapshot.update > 0,
+            "generic planner should train on hypothetical return-prefix symbols"
+        );
         assert_eq!(snapshot.update_history, 0);
         assert!(
             snapshot.commit_update > 0,
-            "generic planner should train on augmented return symbols"
+            "generic planner should train on committed augmented return symbols"
         );
         assert!(
             snapshot.commit_update_history > 0,
@@ -2061,9 +1943,9 @@ mod tests {
             !agent.use_generic_planner,
             "mixtures composed of native reversible bit predictors should keep the reversible planner"
         );
-        assert!(
-            agent.distribution_uses_training_updates,
-            "native reversible binary predictors should train return distributions on the fast path"
+        assert_eq!(
+            agent.return_label_codec.order(),
+            ReturnLabelBitOrder::MsbFirst
         );
     }
 

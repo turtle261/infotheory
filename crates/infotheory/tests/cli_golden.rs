@@ -106,3 +106,20 @@ fn cli_batch_golden_outputs_match() {
         assert_json_close(&case.expected, &actual, tolerance, &case.name);
     }
 }
+
+#[test]
+fn cli_warmstart_usage_error_is_stable() {
+    let bin = env!("CARGO_BIN_EXE_infotheory");
+    let output = Command::new(bin)
+        .args(["warmstart", "teacher", "merge"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn warmstart merge without options");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("Error: warmstart failed: missing required --teacher"),
+        "stderr={stderr}"
+    );
+}

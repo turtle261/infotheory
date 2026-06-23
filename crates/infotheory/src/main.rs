@@ -31,25 +31,22 @@
 
 mod cli;
 
-use infotheory::aixi::agent::Agent;
-use infotheory::aixi::aiqi::AiqiAgent;
 #[cfg(test)]
-use infotheory::aixi::common::ObservationKeyMode;
-use infotheory::aixi::common::{
-    ActionAlphabet, EXPLORE_RANDOM_SALT, RandomGenerator, resolve_random_seed,
-};
+use infotheory::aixi::common::{ActionAlphabet, ObservationKeyMode};
+#[cfg(test)]
 use infotheory::aixi::environment::Environment;
-#[cfg(feature = "aixi-gameengine")]
-use infotheory::aixi::gameengine::build_builtin_environment as build_gameengine_builtin_environment;
+#[cfg(all(test, feature = "backend-ctw"))]
+use infotheory::aixi::planner_agent::{PlannerEnvironment, PlannerSchedule};
+#[cfg(test)]
+use infotheory::aixi::planner_agent::{
+    load_warmstart_exact_jh_teacher_dataset, validate_action_alphabet,
+};
 #[cfg(all(test, feature = "vm"))]
 use infotheory::aixi::vm_nyx::{
     FuzzMutator as NyxFuzzMutator, NyxActionFilter, NyxActionSource, NyxActionSpec, NyxFuzzConfig,
     NyxObservationPolicy, NyxObservationStreamMode, NyxProtocolConfig, NyxRewardPolicy,
     NyxRewardShaping, NyxTraceConfig, PayloadEncoding as NyxPayloadEncoding,
 };
-#[cfg(feature = "vm")]
-use infotheory::aixi::vm_nyx::{NyxVmConfig, NyxVmEnvironment};
-use infotheory::aixi::warmstart::{WarmStartExactJhAgent, WarmStartExactJhTeacherDataset};
 use infotheory::api::*;
 #[cfg(feature = "backend-mamba")]
 use infotheory::mambazip;
@@ -57,20 +54,18 @@ use infotheory::mambazip;
 use infotheory::rwkvzip;
 #[cfg(feature = "backend-sequitur")]
 use infotheory::sequitur::{CanonicalSymbol, SequiturModel};
-use infotheory::spec::{
-    self, AssetRef, BuiltinEnvironmentSpec, CompiledPlannerController, CompiledPlannerRunSpec,
-    PlannerRuntimeSpec, SpecDocument,
-};
+#[cfg(all(test, feature = "backend-ctw"))]
+use infotheory::spec::{CompiledPlannerRunSpec, SpecDocument};
 #[cfg(all(test, feature = "vm"))]
 use nyx_lite::SharedMemoryPolicy;
 use std::env;
+#[cfg(all(feature = "backend-ctw", feature = "research-tooling"))]
 use std::fs::File;
-use std::io::{self, BufRead, BufWriter, IsTerminal, Read, Write};
+#[cfg(all(feature = "backend-ctw", feature = "research-tooling"))]
+use std::io::BufWriter;
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
-#[cfg(feature = "vm")]
-use std::time::Instant;
-
-#[cfg(not(feature = "vm"))]
+#[cfg(all(feature = "backend-ctw", feature = "research-tooling"))]
 use std::time::Instant;
 
 #[cfg(all(test, feature = "all-backends"))]
@@ -81,7 +76,7 @@ use crate::cli::{
     CliBackendInvocation, CliBackendSourceFlags, build_ctx_invocation,
     file_roundtrip_compiled_backend, load_mixture_spec, maybe_export_online_model,
     parse_compression_backend, parse_rate_backend, read_file, read_stdin_all_for_generate,
-    run_batch_mode, validate_obs_stream_len,
+    run_batch_mode,
 };
 #[cfg(feature = "backend-sequitur")]
 use crate::cli::{bytes_to_hex, parse_hex_bytes};
@@ -184,118 +179,6 @@ fn js_divergence_paths(x: &str, y: &str) -> f64 {
     cli_unwrap(try_js_divergence_paths(x, y), "js_divergence_paths")
 }
 
-struct AixiRunLogger {
-    bits01: Option<BufWriter<File>>,
-    jsonl: Option<BufWriter<File>>,
-    flush_every: usize,
-    step: usize,
-}
-
-impl AixiRunLogger {
-    fn new(v: Option<&serde_json::Value>) -> anyhow::Result<Option<Self>> {
-        let bits01_path = v.and_then(|value| value["trace_bits01_path"].as_str());
-        let jsonl_path = v.and_then(|value| value["trace_jsonl_path"].as_str());
-        if bits01_path.is_none() && jsonl_path.is_none() {
-            return Ok(None);
-        }
-
-        let bits01 = if let Some(p) = bits01_path {
-            let f = File::create(p)?;
-            Some(BufWriter::new(f))
-        } else {
-            None
-        };
-        let jsonl = if let Some(p) = jsonl_path {
-            let f = File::create(p)?;
-            Some(BufWriter::new(f))
-        } else {
-            None
-        };
-        let flush_every = v
-            .and_then(|value| value["trace_flush_every"].as_u64())
-            .unwrap_or(1024) as usize;
-
-        Ok(Some(Self {
-            bits01,
-            jsonl,
-            flush_every,
-            step: 0,
-        }))
-    }
-
-    fn write_bits01(&mut self, bits: &[bool]) -> anyhow::Result<()> {
-        if let Some(w) = self.bits01.as_mut() {
-            for &b in bits {
-                w.write_all(&[if b { 1u8 } else { 0u8 }])?;
-            }
-        }
-        Ok(())
-    }
-
-    fn log_percept(
-        &mut self,
-        observations: &[u64],
-        reward: i64,
-        observation_bits: usize,
-        reward_bits: usize,
-        reward_offset: i64,
-    ) -> anyhow::Result<()> {
-        // Exact same bit encoding the agent uses internally.
-        let mut bits = Vec::new();
-        for &obs in observations {
-            infotheory::aixi::common::encode(&mut bits, obs, observation_bits);
-        }
-        infotheory::aixi::common::encode_reward_offset(
-            &mut bits,
-            reward,
-            reward_bits,
-            reward_offset,
-        );
-
-        self.write_bits01(&bits)?;
-
-        if let Some(w) = self.jsonl.as_mut() {
-            let rec = serde_json::json!({
-                "t": self.step,
-                "kind": "percept",
-                "observations": observations,
-                "reward": reward,
-            });
-            writeln!(w, "{rec}")?;
-        }
-        Ok(())
-    }
-
-    fn log_action(&mut self, action: u64, action_bits: usize) -> anyhow::Result<()> {
-        let mut bits = Vec::new();
-        infotheory::aixi::common::encode(&mut bits, action, action_bits);
-        self.write_bits01(&bits)?;
-
-        if let Some(w) = self.jsonl.as_mut() {
-            let rec = serde_json::json!({
-                "t": self.step,
-                "kind": "action",
-                "action": action,
-            });
-            writeln!(w, "{rec}")?;
-        }
-        Ok(())
-    }
-
-    fn next_step(&mut self) -> anyhow::Result<()> {
-        self.step = self.step.saturating_add(1);
-        if self.flush_every > 0 && self.step.is_multiple_of(self.flush_every) {
-            if let Some(w) = self.bits01.as_mut() {
-                w.flush()?;
-            }
-            if let Some(w) = self.jsonl.as_mut() {
-                w.flush()?;
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(all(test, feature = "all-backends"))]
 fn parse_mixture_kind(kind: &str) -> anyhow::Result<MixtureKind> {
     infotheory::api::parse_mixture_kind_name(kind).map_err(anyhow::Error::msg)
@@ -329,526 +212,6 @@ fn parse_mixture_expert_value(
     depth: usize,
 ) -> anyhow::Result<MixtureExpertSpec> {
     infotheory::spec::parse_mixture_expert_value(v, base_dir, depth).map_err(anyhow::Error::msg)
-}
-
-fn is_canonical_spec_document(value: &serde_json::Value) -> bool {
-    value["schema_version"].as_u64().is_some() && value["kind"].as_str().is_some()
-}
-
-fn builtin_environment_name(spec: BuiltinEnvironmentSpec) -> &'static str {
-    spec.canonical_name()
-}
-
-fn legacy_planner_config_error(path: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "legacy aixi JSON configs are no longer executable; convert '{}' to a canonical planner_run document with top-level 'schema_version' and 'kind'",
-        path
-    )
-}
-
-#[derive(Clone, Copy)]
-enum PlannerPhase {
-    Learn,
-    Eval,
-}
-
-struct PlannerRunSchedule {
-    learn_cycles: usize,
-    eval_cycles: usize,
-    log_every: usize,
-    perf: bool,
-    vm_perf_only: bool,
-    explore_epsilon: f64,
-    explore_gamma: f64,
-}
-
-impl PlannerRunSchedule {
-    fn from_runtime(runtime: &PlannerRuntimeSpec) -> Self {
-        let terminate_lifetime = runtime.terminate_lifetime;
-        let (learn_cycles, eval_cycles) = match (runtime.learn_cycles, runtime.eval_cycles) {
-            (Some(learn), Some(eval)) => (learn, eval),
-            (Some(learn), None) => (learn, 0usize),
-            (None, Some(eval)) => (terminate_lifetime, eval),
-            (None, None) => (terminate_lifetime, 0usize),
-        };
-        Self {
-            learn_cycles,
-            eval_cycles,
-            log_every: runtime.log_every,
-            perf: runtime.perf,
-            vm_perf_only: runtime.vm_perf_only,
-            explore_epsilon: runtime.explore_epsilon,
-            explore_gamma: runtime.explore_gamma,
-        }
-    }
-
-    fn extra_exploration(&self, step: usize) -> f64 {
-        if self.explore_epsilon > 0.0 {
-            (self.explore_epsilon * self.explore_gamma.powi(step as i32)).min(1.0)
-        } else {
-            0.0
-        }
-    }
-}
-
-struct PlannerExecutionContext {
-    env: Box<dyn Environment>,
-    observation_bits: usize,
-    observation_stream_len: usize,
-    reward_bits: usize,
-    reward_offset: i64,
-    agent_actions: ActionAlphabet,
-    obs_stream: Vec<u64>,
-    rew: i64,
-    trace_logger: Option<AixiRunLogger>,
-}
-
-impl PlannerExecutionContext {
-    fn new(
-        compiled: &CompiledPlannerRunSpec,
-        mut env: Box<dyn Environment>,
-        cli_overlay: Option<&serde_json::Value>,
-    ) -> anyhow::Result<Self> {
-        let obs_stream = env.drain_observations();
-        validate_obs_stream_len(
-            compiled.interface().observation_stream_len,
-            obs_stream.len(),
-        )?;
-        let rew = env.get_reward();
-        Ok(Self {
-            observation_bits: compiled.interface().observation_bits,
-            observation_stream_len: compiled.interface().observation_stream_len,
-            reward_bits: compiled.interface().reward_bits,
-            reward_offset: 0,
-            agent_actions: compiled.interface().agent_actions,
-            trace_logger: AixiRunLogger::new(cli_overlay)?,
-            env,
-            obs_stream,
-            rew,
-        })
-    }
-
-    fn perform_action(&mut self, action: u64) -> anyhow::Result<i64> {
-        self.env.perform_action(action);
-        self.obs_stream = self.env.drain_observations();
-        validate_obs_stream_len(self.observation_stream_len, self.obs_stream.len())?;
-        self.rew = self.env.get_reward();
-        Ok(self.rew)
-    }
-}
-
-enum PlannerControllerRuntime {
-    McAixi {
-        agent: Agent,
-        prev_action: u64,
-        explore_rng: RandomGenerator,
-    },
-    AiqiDiscounted {
-        agent: AiqiAgent,
-    },
-    WarmStartExactJh {
-        agent: WarmStartExactJhAgent,
-    },
-}
-
-impl PlannerControllerRuntime {
-    fn from_compiled(compiled: &CompiledPlannerRunSpec) -> anyhow::Result<Self> {
-        match compiled.controller() {
-            CompiledPlannerController::McAixi { .. } => {
-                let agent =
-                    Agent::from_compiled_planner_run(compiled).map_err(anyhow::Error::msg)?;
-                let explore_rng =
-                    RandomGenerator::from_seed(resolve_random_seed(compiled.runtime().random_seed))
-                        .fork_with(EXPLORE_RANDOM_SALT);
-                Ok(Self::McAixi {
-                    agent,
-                    prev_action: 0,
-                    explore_rng,
-                })
-            }
-            CompiledPlannerController::AiqiDiscounted { .. } => Ok(Self::AiqiDiscounted {
-                agent: AiqiAgent::from_compiled_planner_run(compiled)
-                    .map_err(anyhow::Error::msg)?,
-            }),
-            CompiledPlannerController::AiqiWarmstartExactJh {
-                teacher_dataset_asset,
-                ..
-            } => {
-                let teacher =
-                    load_warmstart_exact_jh_teacher_dataset(compiled, teacher_dataset_asset)?;
-                Ok(Self::WarmStartExactJh {
-                    agent: WarmStartExactJhAgent::from_compiled_planner_run(compiled, teacher)
-                        .map_err(anyhow::Error::msg)?,
-                })
-            }
-            other => Err(anyhow::anyhow!(
-                "planner_run controller kind '{}' is not executable from the CLI",
-                other.kind_str()
-            )),
-        }
-    }
-
-    fn run_cycle(
-        &mut self,
-        phase: PlannerPhase,
-        step: usize,
-        schedule: &PlannerRunSchedule,
-        ctx: &mut PlannerExecutionContext,
-    ) -> anyhow::Result<i64> {
-        match self {
-            Self::McAixi {
-                agent,
-                prev_action,
-                explore_rng,
-            } => {
-                let obs_repr = agent.observation_repr_from_stream(&ctx.obs_stream);
-                if schedule.log_every > 0 && step.is_multiple_of(schedule.log_every) {
-                    println!("Cycle {}: Obs={:?}, Rew={}", step, obs_repr, ctx.rew);
-                }
-                if let Some(logger) = ctx.trace_logger.as_mut() {
-                    logger.log_percept(
-                        &ctx.obs_stream,
-                        ctx.rew,
-                        ctx.observation_bits,
-                        ctx.reward_bits,
-                        ctx.reward_offset,
-                    )?;
-                }
-                agent.model_update_percept_stream(&ctx.obs_stream, ctx.rew);
-
-                let action = match phase {
-                    PlannerPhase::Learn => {
-                        let explore_p = schedule.extra_exploration(step);
-                        if explore_p > 0.0 && explore_rng.gen_bool(explore_p) {
-                            explore_rng.gen_range(ctx.agent_actions.get()) as u64
-                        } else {
-                            agent.get_planned_action(&ctx.obs_stream, ctx.rew, *prev_action)
-                        }
-                    }
-                    PlannerPhase::Eval => {
-                        agent.get_planned_action(&ctx.obs_stream, ctx.rew, *prev_action)
-                    }
-                };
-                if schedule.log_every > 0 && step.is_multiple_of(schedule.log_every) {
-                    println!("Cycle {}: Planned Action={}", step, action);
-                }
-                if let Some(logger) = ctx.trace_logger.as_mut() {
-                    logger.log_action(action, ctx.env.get_action_bits())?;
-                }
-                agent.model_update_action_external(action);
-                let reward = ctx.perform_action(action)?;
-                *prev_action = action;
-                if let Some(logger) = ctx.trace_logger.as_mut() {
-                    logger.next_step()?;
-                }
-                Ok(reward)
-            }
-            Self::AiqiDiscounted { agent } => {
-                let action = match phase {
-                    PlannerPhase::Learn => agent.get_planned_action_with_extra_exploration(
-                        schedule.extra_exploration(step),
-                    ),
-                    PlannerPhase::Eval => agent.get_planned_action(),
-                };
-                if schedule.log_every > 0 && step.is_multiple_of(schedule.log_every) {
-                    println!(
-                        "Cycle {}: Action={} Obs={:?} Rew={}",
-                        step, action, ctx.obs_stream, ctx.rew
-                    );
-                }
-                if let Some(logger) = ctx.trace_logger.as_mut() {
-                    logger.log_action(action, ctx.env.get_action_bits())?;
-                }
-                let reward = ctx.perform_action(action)?;
-                if let Some(logger) = ctx.trace_logger.as_mut() {
-                    logger.log_percept(
-                        &ctx.obs_stream,
-                        ctx.rew,
-                        ctx.observation_bits,
-                        ctx.reward_bits,
-                        ctx.reward_offset,
-                    )?;
-                    logger.next_step()?;
-                }
-                agent
-                    .observe_transition(action, &ctx.obs_stream, ctx.rew)
-                    .map_err(anyhow::Error::msg)?;
-                Ok(reward)
-            }
-            Self::WarmStartExactJh { agent } => {
-                let action = match phase {
-                    PlannerPhase::Learn => agent.get_planned_action_with_extra_exploration(
-                        schedule.extra_exploration(step),
-                    ),
-                    PlannerPhase::Eval => agent.get_planned_action(),
-                };
-                if schedule.log_every > 0 && step.is_multiple_of(schedule.log_every) {
-                    println!(
-                        "Cycle {}: Action={} Obs={:?} Rew={}",
-                        step, action, ctx.obs_stream, ctx.rew
-                    );
-                }
-                if let Some(logger) = ctx.trace_logger.as_mut() {
-                    logger.log_action(action, ctx.env.get_action_bits())?;
-                }
-                let reward = ctx.perform_action(action)?;
-                if let Some(logger) = ctx.trace_logger.as_mut() {
-                    logger.log_percept(
-                        &ctx.obs_stream,
-                        ctx.rew,
-                        ctx.observation_bits,
-                        ctx.reward_bits,
-                        ctx.reward_offset,
-                    )?;
-                    logger.next_step()?;
-                }
-                agent
-                    .observe_transition(action, &ctx.obs_stream, ctx.rew)
-                    .map_err(anyhow::Error::msg)?;
-                Ok(reward)
-            }
-        }
-    }
-}
-
-/// Load a warm-start exact-J_H teacher dataset and validate its planner contract.
-///
-/// This enforces a stable planner-task boundary (fingerprint and schema) before
-/// the data is used by runtime construction.
-fn load_warmstart_exact_jh_teacher_dataset(
-    compiled: &CompiledPlannerRunSpec,
-    asset_id: &str,
-) -> anyhow::Result<WarmStartExactJhTeacherDataset> {
-    let binding = compiled
-        .resolved_assets()
-        .iter()
-        .find(|entry| entry.id == asset_id)
-        .ok_or_else(|| anyhow::anyhow!("unknown warm-start teacher_dataset_asset '{asset_id}'"))?;
-    let path = match &binding.asset {
-        AssetRef::Filesystem(path) => path,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "unsupported warm-start teacher_dataset_asset reference kind"
-            ));
-        }
-    };
-    let bytes = std::fs::read(path).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to read warm-start teacher_dataset_asset '{}': {err}",
-            path.display()
-        )
-    })?;
-    let teacher =
-        WarmStartExactJhTeacherDataset::from_json_slice(&bytes).map_err(anyhow::Error::msg)?;
-    validate_warmstart_exact_jh_teacher_contract(compiled, &teacher)?;
-    Ok(teacher)
-}
-
-/// Validate the parser-level contract fields against a concrete compiled planner run.
-///
-/// The contract comparison intentionally checks task identity, planner interface
-/// dimensions, and planner execution invariants that affect trace encoding.
-fn validate_warmstart_exact_jh_teacher_contract(
-    compiled: &CompiledPlannerRunSpec,
-    teacher: &WarmStartExactJhTeacherDataset,
-) -> anyhow::Result<()> {
-    infotheory::aixi::warmstart::validate_warmstart_teacher_against_compiled_planner_run(
-        compiled,
-        &teacher.contract,
-    )
-    .map_err(|err| anyhow::anyhow!("{err}"))
-}
-
-fn controller_backend_label(controller: &CompiledPlannerController) -> String {
-    controller.backend_label()
-}
-
-fn build_builtin_environment(spec: BuiltinEnvironmentSpec) -> anyhow::Result<Box<dyn Environment>> {
-    #[cfg(feature = "aixi-gameengine")]
-    {
-        return build_gameengine_builtin_environment(spec).map_err(anyhow::Error::new);
-    }
-    #[cfg(not(feature = "aixi-gameengine"))]
-    {
-        Err(anyhow::anyhow!(
-            "builtin environment '{}' requires feature 'aixi-gameengine'",
-            builtin_environment_name(spec)
-        ))
-    }
-}
-
-#[cfg(feature = "vm")]
-fn build_planner_environment(
-    compiled: &CompiledPlannerRunSpec,
-) -> anyhow::Result<(Box<dyn Environment>, &'static str)> {
-    let environment = &compiled.canonical_spec().environment;
-    match environment {
-        spec::EnvironmentSpec::Builtin { builtin } => Ok((
-            build_builtin_environment(*builtin)?,
-            builtin_environment_name(*builtin),
-        )),
-        spec::EnvironmentSpec::NyxVm(vm) => {
-            let config = NyxVmConfig::from_environment_spec(vm, compiled.resolved_assets())
-                .map_err(anyhow::Error::msg)?;
-            Ok((Box::new(NyxVmEnvironment::new(config)?), "vm"))
-        }
-        other => Err(anyhow::anyhow!(
-            "unsupported environment variant '{}' in this build",
-            other.kind_str()
-        )),
-    }
-}
-
-#[cfg(not(feature = "vm"))]
-fn build_planner_environment(
-    compiled: &CompiledPlannerRunSpec,
-) -> anyhow::Result<(Box<dyn Environment>, &'static str)> {
-    let environment = &compiled.canonical_spec().environment;
-    match environment {
-        spec::EnvironmentSpec::Builtin { builtin } => Ok((
-            build_builtin_environment(*builtin)?,
-            builtin_environment_name(*builtin),
-        )),
-        other => Err(anyhow::anyhow!(
-            "unsupported environment variant '{}' in this build",
-            other.kind_str()
-        )),
-    }
-}
-
-fn validate_action_alphabet(
-    compiled: &CompiledPlannerRunSpec,
-    env: &dyn Environment,
-) -> anyhow::Result<()> {
-    let actual = env.get_num_actions();
-    let expected = compiled.interface().agent_actions;
-    if actual != expected {
-        return Err(anyhow::anyhow!(
-            "action_alphabet_mismatch: planner interface declares {} actions but environment exposes {}",
-            expected,
-            actual
-        ));
-    }
-    Ok(())
-}
-
-fn run_vm_perf_only(
-    schedule: &PlannerRunSchedule,
-    ctx: &mut PlannerExecutionContext,
-) -> anyhow::Result<()> {
-    let mut obs = ctx.obs_stream.first().copied().unwrap_or(0);
-    let mut rew = ctx.rew;
-    let start = Instant::now();
-    for step in 0..schedule.learn_cycles {
-        if schedule.log_every > 0 && step % schedule.log_every == 0 {
-            println!("Cycle {}: Obs={}, Rew={}", step, obs, rew);
-        }
-        ctx.perform_action(0)?;
-        obs = ctx.obs_stream.first().copied().unwrap_or(0);
-        rew = ctx.rew;
-    }
-    if schedule.perf && schedule.learn_cycles > 0 {
-        let elapsed = start.elapsed().as_secs_f64().max(1e-9);
-        let cps = schedule.learn_cycles as f64 / elapsed;
-        println!("Perf cycles/s: {:.2}", cps);
-    }
-    Ok(())
-}
-
-fn run_compiled_planner_run(
-    compiled: &CompiledPlannerRunSpec,
-    cli_overlay: Option<&serde_json::Value>,
-) -> anyhow::Result<()> {
-    let schedule = PlannerRunSchedule::from_runtime(compiled.runtime());
-    let mut controller = PlannerControllerRuntime::from_compiled(compiled)?;
-    let (mut env, env_name) = build_planner_environment(compiled)?;
-    env.set_random_seed(resolve_random_seed(compiled.runtime().random_seed));
-    validate_action_alphabet(compiled, env.as_ref())?;
-    let mut ctx = PlannerExecutionContext::new(compiled, env, cli_overlay)?;
-
-    match compiled.controller() {
-        CompiledPlannerController::McAixi { .. } => println!(
-            "Agent initialized with {} algorithm for {} environment.",
-            controller_backend_label(compiled.controller()),
-            env_name
-        ),
-        CompiledPlannerController::AiqiDiscounted { .. } => println!(
-            "AIQI initialized ({}) for {} environment.",
-            controller_backend_label(compiled.controller()),
-            env_name
-        ),
-        // Other controller kinds are filtered out by
-        // `PlannerControllerRuntime::from_compiled` returning Err before reaching
-        // this point. We use `unreachable!` (with a helpful message via
-        // `kind_str`) so any future bug that lets such a variant slip through
-        // panics with a clear diagnostic rather than silently misbehaving.
-        other => unreachable!(
-            "PlannerControllerRuntime::from_compiled should reject controller kind '{}'",
-            other.kind_str()
-        ),
-    }
-
-    if schedule.vm_perf_only {
-        return run_vm_perf_only(&schedule, &mut ctx);
-    }
-
-    let learn_start = Instant::now();
-    let mut learn_total_reward = 0i64;
-    for step in 0..schedule.learn_cycles {
-        learn_total_reward +=
-            controller.run_cycle(PlannerPhase::Learn, step, &schedule, &mut ctx)?;
-    }
-    if schedule.perf && schedule.learn_cycles > 0 {
-        let elapsed = learn_start.elapsed().as_secs_f64().max(1e-9);
-        let cps = schedule.learn_cycles as f64 / elapsed;
-        println!("Learn cycles/s: {:.2}", cps);
-    }
-
-    if schedule.eval_cycles > 0 {
-        let eval_start = Instant::now();
-        let mut eval_total_reward = 0i64;
-        for offset in 0..schedule.eval_cycles {
-            let step = schedule.learn_cycles + offset;
-            eval_total_reward +=
-                controller.run_cycle(PlannerPhase::Eval, step, &schedule, &mut ctx)?;
-        }
-        if schedule.perf {
-            let elapsed = eval_start.elapsed().as_secs_f64().max(1e-9);
-            let cps = schedule.eval_cycles as f64 / elapsed;
-            println!("Eval cycles/s: {:.2}", cps);
-        }
-        let avg = (eval_total_reward as f64) / (schedule.eval_cycles as f64);
-        println!("Eval Total Reward: {}", eval_total_reward);
-        println!("Eval Average Reward per Cycle: {:.6}", avg);
-    }
-
-    println!("Total Reward: {}", learn_total_reward);
-    Ok(())
-}
-
-fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
-    let raw = std::fs::read(config_path)?;
-    let json_overlay = serde_json::from_slice::<serde_json::Value>(&raw).ok();
-    if let Some(value) = json_overlay.as_ref()
-        && !is_canonical_spec_document(value)
-    {
-        return Err(legacy_planner_config_error(config_path));
-    }
-
-    let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
-    let document = infotheory::spec::load_spec_document(config_path).map_err(anyhow::Error::msg)?;
-    match document {
-        SpecDocument::PlannerRun(spec) => {
-            let compiled = spec
-                .compile_in(&spec::SpecEnvironment::new(config_dir))
-                .map_err(anyhow::Error::msg)?;
-            run_compiled_planner_run(&compiled, json_overlay.as_ref())
-        }
-        other => Err(anyhow::anyhow!(
-            "aixi expects a planner_run document, found kind '{}'",
-            other.kind_str()
-        )),
-    }
 }
 
 #[cfg(feature = "tuner")]
@@ -1478,7 +841,7 @@ fn main() {
     let mut pos_arg3: Option<String> = None;
     let mut flags_start = 2usize;
 
-    if primitive != "search" && primitive != "aixi" {
+    if primitive != "search" && primitive != "aixi" && primitive != "warmstart" {
         let mut positionals: Vec<String> = Vec::new();
         let mut i = 2usize;
         while i < args.len() {
@@ -1847,7 +1210,7 @@ fn main() {
     match primitive.as_str() {
         "aixi" => {
             if let Some(p) = args.get(2) {
-                if let Err(e) = run_aixi_mode(p) {
+                if let Err(e) = crate::cli::planner_run::run_aixi_mode(p) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
@@ -1856,6 +1219,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "warmstart" => match crate::cli::warmstart::parse_warmstart_command(&args)
+            .and_then(crate::cli::warmstart::run_warmstart_command)
+        {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("Error: warmstart failed: {e}");
+                std::process::exit(1);
+            }
+        },
         "search" => search_command(&args),
         "compress" => {
             let in_path = file1.unwrap_or_exit("Error: 'compress' requires <input> <output>");
@@ -2115,6 +1487,12 @@ Primitives:
   Tools:
     search <query> <target> [options]       Search target using info-theoretic ranking
     aixi <config.json>                      Run AIXI agent
+    warmstart teacher planner-run --target <warmstart-planner-run> --teacher <teacher-planner-run> --out <teacher.json>
+                                          Export a same-task warm-start teacher dataset
+    warmstart teacher from-jsonl --target <warmstart-planner-run> --jsonl <run.jsonl> --out <teacher.json>
+                                          Convert normalized planner JSONL to a teacher dataset
+    warmstart teacher merge --target <warmstart-planner-run> --out <teacher.json> --teacher <teacher-a.json> [...]
+                                          Merge same-task warm-start teacher datasets
     tune <spec.json|spec.itsd> [options]    Run tuner with executor-side controls
     batch                                   Run in JSON-L batch mode
     generate [file]                         Generate continuation from file or piped stdin
@@ -2232,8 +1610,10 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "backend-ctw")]
+    use crate::cli::planner_run::run_vm_perf_only;
     use infotheory::aixi::warmstart_contract::{
-        WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF,
+        TaskFingerprint, WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF,
         WARMSTART_STANDALONE_SCALAR_REPRESENTATION, standalone_teacher_provenance_crc32_pair,
         warmstart_exact_jh_planner_task_fingerprint,
     };
@@ -2256,6 +1636,7 @@ mod tests {
         ))
     }
 
+    #[cfg(any(feature = "backend-mamba", feature = "backend-rwkv"))]
     fn canonical_test_path_string(path: &std::path::Path) -> String {
         path.to_string_lossy().replace('\\', "/")
     }
@@ -2375,7 +1756,7 @@ mod tests {
     #[cfg(feature = "backend-ctw")]
     fn write_warmstart_teacher(
         path: &Path,
-        task_fingerprint: &str,
+        task_fingerprint: &TaskFingerprint,
         action_alphabet_size: usize,
         observation_bits: usize,
     ) {
@@ -2392,7 +1773,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "schema_version": 1,
                 "contract": {
-                    "task_fingerprint": task_fingerprint,
+                    "task_fingerprint": task_fingerprint.to_string(),
                     "action_alphabet_size": action_alphabet_size,
                     "observation_bits": observation_bits,
                     "observation_stream_len": observation_stream_len,
@@ -2511,27 +1892,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn canonical_spec_detection_and_legacy_error_messages_are_stable() {
-        assert!(is_canonical_spec_document(&json!({
-            "schema_version": 1,
-            "kind": "planner_run"
-        })));
-        assert!(!is_canonical_spec_document(&json!({
-            "schema_version": 1
-        })));
-        assert_eq!(
-            builtin_environment_name(BuiltinEnvironmentSpec::CoinFlip),
-            "coin_flip"
-        );
-
-        let err = legacy_planner_config_error("/tmp/legacy.json");
-        let msg = err.to_string();
-        assert!(msg.contains("legacy aixi JSON configs are no longer executable"));
-        assert!(msg.contains("/tmp/legacy.json"));
-        assert!(msg.contains("planner_run"));
-    }
-
     #[cfg(feature = "backend-ctw")]
     #[test]
     fn warmstart_teacher_loader_accepts_matching_compiled_planner_contract() {
@@ -2554,7 +1914,15 @@ mod tests {
     fn warmstart_teacher_loader_rejects_mismatched_task_fingerprint() {
         let teacher_path = unique_temp_path("warmstart-teacher-task-mismatch", ".json");
         let compiled = sample_warmstart_compiled_planner_run(&teacher_path);
-        write_warmstart_teacher(&teacher_path, "different-task", 2, 2);
+        write_warmstart_teacher(
+            &teacher_path,
+            &TaskFingerprint::parse_hex(
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            )
+            .expect("valid mismatch fingerprint"),
+            2,
+            2,
+        );
 
         let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
             .expect_err("mismatched teacher task must fail");
@@ -2574,10 +1942,7 @@ mod tests {
 
         let err = load_warmstart_exact_jh_teacher_dataset(&compiled, "teacher")
             .expect_err("mismatched action alphabet must fail");
-        assert!(
-            err.to_string().contains("planner interface fingerprint"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("action_alphabet_size"), "{err}");
 
         let _ = std::fs::remove_file(teacher_path);
     }
@@ -2761,48 +2126,6 @@ mod tests {
         let _ = std::fs::remove_file(different);
     }
 
-    #[test]
-    fn aixi_run_logger_handles_disabled_and_single_sink_modes() {
-        assert!(
-            AixiRunLogger::new(None)
-                .expect("logger creation should succeed")
-                .is_none()
-        );
-
-        let bits_path = unique_temp_path("aixi-trace-only-bits", ".bin");
-        let jsonl_path = unique_temp_path("aixi-trace-only-jsonl", ".jsonl");
-
-        let bits_overlay = json!({
-            "trace_bits01_path": bits_path,
-        });
-        let mut bits_logger = AixiRunLogger::new(Some(&bits_overlay))
-            .expect("bits logger")
-            .expect("bits logger should be enabled");
-        bits_logger.log_action(1, 1).expect("log action to bits");
-        bits_logger.next_step().expect("advance bits step");
-        drop(bits_logger);
-        let bits = std::fs::read(&bits_path).expect("read bits trace");
-        assert!(!bits.is_empty());
-
-        let jsonl_overlay = json!({
-            "trace_jsonl_path": jsonl_path,
-            "trace_flush_every": 2
-        });
-        let mut jsonl_logger = AixiRunLogger::new(Some(&jsonl_overlay))
-            .expect("jsonl logger")
-            .expect("jsonl logger should be enabled");
-        jsonl_logger
-            .log_percept(&[3], 1, 2, 4, 1)
-            .expect("log percept to jsonl");
-        jsonl_logger.next_step().expect("advance jsonl step");
-        drop(jsonl_logger);
-        let jsonl = std::fs::read_to_string(&jsonl_path).expect("read jsonl trace");
-        assert!(jsonl.contains("\"kind\":\"percept\""));
-
-        let _ = std::fs::remove_file(bits_path);
-        let _ = std::fs::remove_file(jsonl_path);
-    }
-
     #[cfg(feature = "backend-ctw")]
     #[test]
     fn planner_run_schedule_derives_cycles_and_extra_exploration() {
@@ -2815,11 +2138,11 @@ mod tests {
         runtime.perf = true;
         runtime.explore_epsilon = 0.4;
         runtime.explore_gamma = 0.5;
-        let schedule = PlannerRunSchedule::from_runtime(&runtime);
+        let schedule = PlannerSchedule::from_runtime(&runtime);
         assert_eq!(schedule.learn_cycles, 5);
         assert_eq!(schedule.eval_cycles, 3);
-        assert_eq!(schedule.log_every, 2);
-        assert!(schedule.perf);
+        assert_eq!(runtime.log_every, 2);
+        assert!(runtime.perf);
         assert!((schedule.extra_exploration(0) - 0.4).abs() < 1e-12);
         assert!((schedule.extra_exploration(2) - 0.1).abs() < 1e-12);
 
@@ -2829,13 +2152,13 @@ mod tests {
         no_explore_runtime.terminate_lifetime = 1;
         no_explore_runtime.explore_epsilon = 0.0;
         no_explore_runtime.explore_gamma = 0.25;
-        let no_explore = PlannerRunSchedule::from_runtime(&no_explore_runtime);
+        let no_explore = PlannerSchedule::from_runtime(&no_explore_runtime);
         assert_eq!(no_explore.extra_exploration(99), 0.0);
     }
 
     #[cfg(feature = "backend-ctw")]
     #[test]
-    fn planner_execution_context_and_vm_perf_only_update_environment_state() {
+    fn planner_environment_and_vm_perf_only_update_environment_state() {
         let compiled = sample_compiled_planner_run();
         let env = Box::new(CountingEnv {
             observation: 1,
@@ -2846,27 +2169,19 @@ mod tests {
         });
         validate_action_alphabet(&compiled, env.as_ref()).expect("matching action alphabet");
 
-        let mut ctx = PlannerExecutionContext::new(&compiled, env, None).expect("context");
-        assert_eq!(ctx.obs_stream, vec![1]);
-        assert_eq!(ctx.rew, -1);
+        let mut planner_env = PlannerEnvironment::new(&compiled, env).expect("planner env");
+        assert_eq!(planner_env.observations(), &[1]);
+        assert_eq!(planner_env.reward(), -1);
 
-        let reward = ctx.perform_action(0).expect("perform action");
+        let reward = planner_env.perform_action(0).expect("perform action");
         assert_eq!(reward, 0);
-        assert_eq!(ctx.obs_stream, vec![2]);
-        assert_eq!(ctx.rew, 0);
+        assert_eq!(planner_env.observations(), &[2]);
+        assert_eq!(planner_env.reward(), 0);
 
-        let schedule = PlannerRunSchedule {
-            learn_cycles: 2,
-            eval_cycles: 0,
-            log_every: 0,
-            perf: false,
-            vm_perf_only: true,
-            explore_epsilon: 0.0,
-            explore_gamma: 1.0,
-        };
-        run_vm_perf_only(&schedule, &mut ctx).expect("vm perf only run");
-        assert_eq!(ctx.obs_stream, vec![4]);
-        assert_eq!(ctx.rew, 2);
+        let schedule = PlannerSchedule::new(2, 0);
+        run_vm_perf_only(&schedule, 0, false, &mut planner_env).expect("vm perf only run");
+        assert_eq!(planner_env.observations(), &[4]);
+        assert_eq!(planner_env.reward(), 2);
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -2885,37 +2200,6 @@ mod tests {
         assert!(err.to_string().contains("action_alphabet_mismatch"));
         assert!(err.to_string().contains("2 actions"));
         assert!(err.to_string().contains("4"));
-    }
-
-    #[cfg(feature = "backend-ctw")]
-    #[test]
-    fn aixi_run_logger_writes_bits_and_jsonl_records() {
-        let bits_path = unique_temp_path("aixi-trace-bits", ".bin");
-        let jsonl_path = unique_temp_path("aixi-trace-jsonl", ".jsonl");
-        let overlay = json!({
-            "trace_bits01_path": bits_path,
-            "trace_jsonl_path": jsonl_path,
-            "trace_flush_every": 1
-        });
-
-        let mut logger = AixiRunLogger::new(Some(&overlay))
-            .expect("logger setup")
-            .expect("logger should be enabled");
-        logger.log_action(1, 2).expect("log action");
-        logger.log_percept(&[2], 1, 2, 4, 0).expect("log percept");
-        logger.next_step().expect("advance step");
-        drop(logger);
-
-        let bits = std::fs::read(&bits_path).expect("read bits trace");
-        assert!(!bits.is_empty());
-        assert!(bits.iter().all(|byte| *byte == 0 || *byte == 1));
-
-        let jsonl = std::fs::read_to_string(&jsonl_path).expect("read jsonl trace");
-        assert!(jsonl.contains("\"kind\":\"action\""));
-        assert!(jsonl.contains("\"kind\":\"percept\""));
-
-        let _ = std::fs::remove_file(bits_path);
-        let _ = std::fs::remove_file(jsonl_path);
     }
 
     #[test]
@@ -3427,325 +2711,5 @@ mod tests {
             }
             _ => panic!("expected fac-ctw backend"),
         }
-    }
-
-    #[cfg(all(feature = "backend-ctw", feature = "tuner"))]
-    #[test]
-    fn run_aixi_mode_rejects_non_planner_spec_documents() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "infotheory-spec-kind-{}-{nanos}.json",
-            std::process::id()
-        ));
-        let doc_value = json!({
-            "schema_version": 1,
-            "kind": "tune",
-            "assets": [
-                {
-                    "id": "dataset",
-                    "path": "input.bin"
-                }
-            ],
-            "input_asset": "dataset",
-            "baseline_candidate": {
-                "kind": "rate-ac",
-                "rate_backend": {
-                    "kind": "ctw",
-                    "depth": 8
-                },
-                "framing": "framed"
-            },
-            "controller": {
-                "kind": "annealed_hill_climbing",
-                "max_mutation_radius": 1
-            },
-            "bounds": {
-                "allowed_backends": ["ctw"],
-                "forbidden_backends": [],
-                "parameter_ranges": [],
-                "max_experts": 2,
-                "max_mixture_nesting_depth": 1,
-                "min_experts": 1,
-                "allow_duplicate_experts": false,
-                "required_experts": [],
-                "forbidden_expert_pairs": []
-            },
-            "eval_time_limit_seconds": 1.0,
-            "time_budget_seconds": 2.0,
-            "min_throughput_bytes_per_second": 1.0,
-            "max_memory_bytes": 1024,
-            "output_config_path": "best.json",
-            "seed": 7,
-            "report_path": null
-        });
-        let doc = infotheory::spec::SpecDocument::parse_json_value(&doc_value, Path::new("."))
-            .expect("canonical tune document");
-        std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
-            .expect("write temp spec");
-
-        let err = run_aixi_mode(path.to_str().expect("utf8 path"))
-            .expect_err("non planner spec should be rejected");
-        assert!(err.to_string().contains("planner_run document"));
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(all(not(feature = "backend-ctw"), feature = "tuner"))]
-    #[test]
-    fn run_aixi_mode_surfaces_backend_validation_for_non_planner_documents() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "infotheory-canonical-non-planner-no-ctw-{nanos}.json"
-        ));
-        let doc_value = json!({
-            "schema_version": 1,
-            "kind": "tune",
-            "assets": [
-                {
-                    "id": "dataset",
-                    "path": "input.bin"
-                }
-            ],
-            "input_asset": "dataset",
-            "baseline_candidate": {
-                "kind": "rate-ac",
-                "rate_backend": {
-                    "kind": "ctw",
-                    "depth": 8
-                },
-                "framing": "framed"
-            },
-            "controller": {
-                "kind": "annealed_hill_climbing",
-                "max_mutation_radius": 1
-            },
-            "bounds": {
-                "allowed_backends": ["ctw"],
-                "forbidden_backends": [],
-                "parameter_ranges": [],
-                "max_experts": 2,
-                "max_mixture_nesting_depth": 1,
-                "min_experts": 1,
-                "allow_duplicate_experts": false,
-                "required_experts": [],
-                "forbidden_expert_pairs": []
-            },
-            "eval_time_limit_seconds": 1.0,
-            "time_budget_seconds": 2.0,
-            "min_throughput_bytes_per_second": 1.0,
-            "max_memory_bytes": 1024,
-            "output_config_path": "best.json",
-            "seed": 7,
-            "report_path": null
-        });
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&doc_value).expect("serialize canonical json"),
-        )
-        .expect("write temp spec");
-
-        let err = run_aixi_mode(path.to_str().expect("utf8 path"))
-            .expect_err("missing backend feature should be surfaced");
-        assert!(
-            err.to_string()
-                .contains("requires infotheory feature 'backend-ctw'"),
-            "{err}"
-        );
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(all(feature = "backend-ctw", feature = "aixi-gameengine"))]
-    #[test]
-    fn run_aixi_mode_accepts_canonical_planner_run_documents() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "infotheory-planner-run-{}-{nanos}.json",
-            std::process::id()
-        ));
-        let doc_value = json!({
-            "schema_version": 1,
-            "kind": "planner_run",
-            "assets": [],
-            "environment": {
-                "kind": "builtin",
-                "name": "coin_flip"
-            },
-            "interface": {
-                "observation_bits": 1,
-                "observation_stream_len": 1,
-                "observation_key_mode": "full_stream",
-                "reward_bits": 1,
-                "agent_actions": 2
-            },
-            "controller": {
-                "kind": "mc_aixi",
-                "predictor": {
-                    "kind": "ctw",
-                    "depth": 8
-                },
-                "bit_stream_semantics": { "kind": "binary_tokens" },
-                "agent_horizon": 1,
-                "num_simulations": 1,
-                "mcts_strategy": {
-                    "kind": "rho_uct"
-                },
-                "exploration_exploitation_ratio": 1.0,
-                "discount_gamma": 1.0
-            },
-            "runtime": {
-                "random_seed": 7,
-                "learn_cycles": 1,
-                "eval_cycles": 0,
-                "terminate_lifetime": 1,
-                "log_every": 1,
-                "perf": false,
-                "vm_perf_only": false,
-                "explore_epsilon": 0.0,
-                "explore_gamma": 1.0
-            }
-        });
-        let doc = infotheory::spec::SpecDocument::parse_json_value(&doc_value, Path::new("."))
-            .expect("canonical planner document");
-        std::fs::write(&path, doc.to_canonical_json().expect("canonical json"))
-            .expect("write temp planner spec");
-
-        run_aixi_mode(path.to_str().expect("utf8 path"))
-            .expect("canonical planner_run document should execute");
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(all(feature = "backend-ctw", feature = "aixi-gameengine"))]
-    #[test]
-    fn run_aixi_mode_rejects_legacy_interface_reward_range_fields() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "infotheory-planner-run-invalid-reward-{}-{nanos}.json",
-            std::process::id()
-        ));
-        let legacy_doc = json!({
-            "schema_version": 1,
-            "kind": "planner_run",
-            "assets": [],
-            "environment": {
-                "kind": "builtin",
-                "name": "coin_flip"
-            },
-            "interface": {
-                "observation_bits": 1,
-                "observation_stream_len": 1,
-                "observation_key_mode": "full_stream",
-                "reward_bits": 1,
-                "agent_actions": 2,
-                "min_reward": 0,
-                "max_reward": 100,
-                "reward_offset": 0
-            },
-            "controller": {
-                "kind": "mc_aixi",
-                "predictor": {
-                    "kind": "ctw",
-                    "depth": 8
-                },
-                "bit_stream_semantics": { "kind": "binary_tokens" },
-                "agent_horizon": 1,
-                "num_simulations": 1,
-                "mcts_strategy": {
-                    "kind": "rho_uct"
-                },
-                "exploration_exploitation_ratio": 1.0,
-                "discount_gamma": 1.0
-            },
-            "runtime": {
-                "random_seed": 7,
-                "learn_cycles": 1,
-                "eval_cycles": 0,
-                "terminate_lifetime": 1,
-                "log_every": 1,
-                "perf": false,
-                "vm_perf_only": false,
-                "explore_epsilon": 0.0,
-                "explore_gamma": 1.0
-            }
-        });
-        std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&legacy_doc).expect("legacy planner json"),
-        )
-        .expect("write temp planner spec");
-
-        let err = run_aixi_mode(path.to_str().expect("utf8 path"))
-            .expect_err("legacy interface reward range fields should be rejected");
-        assert!(
-            err.to_string()
-                .contains("unknown interface field 'min_reward'"),
-            "{err}"
-        );
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn run_aixi_mode_rejects_legacy_planner_json_documents() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "infotheory-legacy-planner-{}-{nanos}.json",
-            std::process::id()
-        ));
-        let legacy = serde_json::json!({
-            "environment": "coin-flip",
-            "planner": "mc-aixi",
-            "algorithm": "ctw",
-            "ct_depth": 8,
-            "agent_horizon": 1,
-            "observation_bits": 1,
-            "observation_stream_len": 1,
-            "observation_key_mode": "full_stream",
-            "reward_bits": 1,
-            "agent_actions": 2,
-            "num_simulations": 1,
-            "discount_gamma": 1.0,
-        });
-        std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&legacy).expect("legacy planner json"),
-        )
-        .expect("write temp legacy planner config");
-
-        let err = run_aixi_mode(path.to_str().expect("utf8 path"))
-            .expect_err("legacy planner json should be rejected");
-        let message = err.to_string();
-        assert!(message.contains("legacy aixi JSON configs are no longer executable"));
-        assert!(message.contains("planner_run"));
-        assert!(message.contains("schema_version"));
-        assert!(message.contains("kind"));
-
-        let _ = std::fs::remove_file(path);
     }
 }

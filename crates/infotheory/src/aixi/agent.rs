@@ -540,6 +540,18 @@ impl Agent {
         self.config.random_seed
     }
 
+    pub(crate) fn reseed_random(&mut self, seed: u64) {
+        self.config.random_seed = seed;
+        self.rng = RandomGenerator::from_seed(seed);
+    }
+
+    pub(crate) fn reset_planner_state(&mut self) {
+        self.planner = Some(
+            PlannerState::new(self.config.mcts_strategy)
+                .expect("validated MC-AIXI strategy must rebuild planner state"),
+        );
+    }
+
     /// Primary interface for decision making.
     ///
     /// Uses MCTS to find the action that maximizes expected future reward.

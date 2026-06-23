@@ -1,7 +1,11 @@
 use super::*;
 #[cfg(feature = "backend-ctw")]
 use crate::aixi::common::{ActionAlphabet, ObservationKeyMode};
-use crate::aixi::warmstart::WarmStartExactJhTransition;
+use crate::aixi::warmstart::{
+    WarmStartExactJhTeacherContract, WarmStartExactJhTeacherDataset, WarmStartExactJhTeacherTrace,
+    WarmStartExactJhTransition,
+};
+use crate::aixi::warmstart_contract::TaskFingerprint;
 use crate::api::CompressionBackend;
 #[cfg(feature = "backend-ctw")]
 use crate::api::RateBackend;
@@ -14,6 +18,7 @@ use crate::spec::{
     TunePlannerInterfaceSpec, TuneSpec, WarmStartExactJhTuneControllerSpec,
 };
 use crate::tuner::eval::ResolvedMemoryAccountingKind;
+#[cfg(all(feature = "backend-ctw", feature = "backend-mixture"))]
 use crate::tuner::planner_bridge::apply_planner_mutation_action;
 #[cfg(feature = "backend-ctw")]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -280,8 +285,10 @@ fn tuner_warmstart_task_fingerprint_binds_input_dataset_content_not_teacher_byte
     std::fs::create_dir_all(&base_dir).expect("create base dir");
     let dataset_path = base_dir.join("dataset.bin");
     let teacher_path = base_dir.join("teacher.json");
+    let teacher_alt_path = base_dir.join("teacher-alt.json");
     std::fs::write(&dataset_path, b"dataset-v1").expect("write dataset v1");
     std::fs::write(&teacher_path, b"teacher-v1").expect("write teacher v1");
+    std::fs::write(&teacher_alt_path, b"teacher-v1-alt-path").expect("write alternate teacher");
 
     let output_path = base_dir.join("best.json");
     let report_path = base_dir.join("report.json");
@@ -346,6 +353,35 @@ fn tuner_warmstart_task_fingerprint_binds_input_dataset_content_not_teacher_byte
     assert_eq!(
         fingerprint_v1, fingerprint_after_teacher_change,
         "teacher dataset bytes are intentionally excluded to avoid a circular task fingerprint"
+    );
+
+    let mut moved_teacher_spec = spec.clone();
+    if let Some(binding) = moved_teacher_spec
+        .assets
+        .iter_mut()
+        .find(|binding| binding.id == "teacher")
+    {
+        binding.path = "teacher-alt.json".to_string();
+    }
+    let moved_teacher_compiled = moved_teacher_spec
+        .compile_in(&env)
+        .expect("compile moved-teacher tune spec");
+    let moved_teacher_planner_run = compile_tuner_planner_run_spec(
+        moved_teacher_compiled.controller(),
+        &contract,
+        &reward_encoder,
+        &moved_teacher_compiled,
+        &env,
+    )
+    .expect("compile moved-teacher warmstart bridge");
+    let fingerprint_after_teacher_path_change =
+        crate::aixi::warmstart_contract::warmstart_exact_jh_planner_task_fingerprint(
+            &moved_teacher_planner_run,
+        )
+        .expect("fingerprint after teacher path change");
+    assert_eq!(
+        fingerprint_v1, fingerprint_after_teacher_path_change,
+        "teacher dataset asset path is intentionally excluded from same-task identity"
     );
 
     std::fs::write(&dataset_path, b"dataset-v2").expect("write dataset v2");
@@ -2752,7 +2788,27 @@ fn discounted_aiqi_exact_theorem_claims_remain_uncertified_by_family() {
 
 #[test]
 fn warmstart_trace_merge_is_content_deduplicated_and_deterministically_ordered() {
-    let mut teacher = WarmStartExactJhTeacherDataset::default();
+    let mut teacher = WarmStartExactJhTeacherDataset::new(
+        WarmStartExactJhTeacherContract {
+            schema_version: 1,
+            task_fingerprint: TaskFingerprint::parse_hex(
+                "0102030401020304010203040102030401020304010203040102030401020304",
+            )
+            .expect("test fingerprint"),
+            action_alphabet_size: 2,
+            observation_bits: 1,
+            observation_stream_len: 1,
+            observation_key_mode: "first".to_string(),
+            observation_adapter_spec_ref: String::new(),
+            observation_adapter_content_crc32: String::new(),
+            reward_bits: 1,
+            return_horizon: 1,
+            label_phase_period: 1,
+            scalar_representation: String::new(),
+            exact_reward_encoding_certificate: String::new(),
+        },
+        Vec::new(),
+    );
     let high_key_trace = WarmStartExactJhTeacherTrace {
         transitions: vec![WarmStartExactJhTransition {
             action: 1_u64,
@@ -2769,8 +2825,10 @@ fn warmstart_trace_merge_is_content_deduplicated_and_deterministically_ordered()
     };
     teacher.traces.push(high_key_trace.clone());
 
-    merge_warmstart_trace_deterministic(&mut teacher, low_key_trace.clone())
-        .expect("merge distinct trace");
+    assert!(
+        merge_warmstart_trace_deterministic(&mut teacher, low_key_trace.clone())
+            .expect("merge distinct trace")
+    );
     let ordered_keys = teacher
         .traces
         .iter()
@@ -2782,9 +2840,53 @@ fn warmstart_trace_merge_is_content_deduplicated_and_deterministically_ordered()
     assert_eq!(ordered_keys, sorted_keys);
     assert_eq!(teacher.traces.len(), 2);
 
-    merge_warmstart_trace_deterministic(&mut teacher, low_key_trace)
-        .expect("duplicate merge remains idempotent");
+    assert!(
+        !merge_warmstart_trace_deterministic(&mut teacher, low_key_trace)
+            .expect("duplicate merge remains idempotent")
+    );
     assert_eq!(teacher.traces.len(), 2);
+}
+
+#[test]
+fn warmstart_trace_refresh_merge_counter_counts_structural_inserts_only() {
+    let mut teacher = WarmStartExactJhTeacherDataset::new(
+        WarmStartExactJhTeacherContract {
+            schema_version: 1,
+            task_fingerprint: TaskFingerprint::parse_hex(
+                "0102030401020304010203040102030401020304010203040102030401020304",
+            )
+            .expect("test fingerprint"),
+            action_alphabet_size: 2,
+            observation_bits: 1,
+            observation_stream_len: 1,
+            observation_key_mode: "first".to_string(),
+            observation_adapter_spec_ref: String::new(),
+            observation_adapter_content_crc32: String::new(),
+            reward_bits: 1,
+            return_horizon: 1,
+            label_phase_period: 1,
+            scalar_representation: String::new(),
+            exact_reward_encoding_certificate: String::new(),
+        },
+        Vec::new(),
+    );
+    let live_trace = WarmStartExactJhTeacherTrace {
+        transitions: vec![WarmStartExactJhTransition {
+            action: 0_u64,
+            observations: vec![1],
+            reward: 0,
+        }],
+    };
+    let mut warmstart_trace_refresh_merges: usize = 0;
+    for _ in 0..2 {
+        if merge_warmstart_trace_deterministic(&mut teacher, live_trace.clone())
+            .expect("merge live trace")
+        {
+            warmstart_trace_refresh_merges = warmstart_trace_refresh_merges.saturating_add(1);
+        }
+    }
+    assert_eq!(warmstart_trace_refresh_merges, 1);
+    assert_eq!(teacher.traces.len(), 1);
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -2988,7 +3090,7 @@ fn executor_controls_are_excluded_from_canonical_tune_but_included_in_evaluator_
             }),
             TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
                 interface: interface.clone(),
-                planner_simulations_per_step: 2,
+                planner_simulations_per_step: 1,
                 return_horizon: 1,
                 warmstart_teacher_dataset_asset: "teacher".to_string(),
                 label_phase_period: 1,
@@ -3294,7 +3396,7 @@ fn syntactic_aliases_canonicalize_to_same_model_code_length() {
     );
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "backend-mixture"))]
 #[test]
 fn canonicalization_preserves_order_sensitivity_for_mixture_experts() {
     use std::sync::Arc;

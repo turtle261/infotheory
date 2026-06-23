@@ -1652,6 +1652,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "backend-zpaq")]
     #[test]
     fn candidate_backend_rejection_is_recoverable_status_error() {
         let candidate = compile_candidate(CompressionBackend::zpaq("3"));

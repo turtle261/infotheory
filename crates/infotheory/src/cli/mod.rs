@@ -3,6 +3,9 @@ use infotheory::error::InfotheoryResult;
 #[cfg(all(test, feature = "vm"))]
 use std::time::Duration;
 
+pub(crate) mod planner_run;
+pub(crate) mod warmstart;
+
 #[cfg(feature = "vm")]
 #[cfg(test)]
 #[allow(dead_code)]
@@ -945,22 +948,6 @@ pub(super) fn validate_observation_config(
             "Warning: observation_key_mode {:?} reduces multi-symbol observation streams and deviates from paper-accurate expectimax.",
             observation_key_mode
         );
-    }
-    Ok(())
-}
-
-/// Validates that the actual observation stream length matches the configured value.
-///
-/// This is a hard error to prevent FAC-CTW bit cycling desynchronization.
-pub(super) fn validate_obs_stream_len(expected: usize, actual: usize) -> anyhow::Result<()> {
-    if actual != expected {
-        return Err(anyhow::anyhow!(
-            "Observation stream length mismatch: config expects {} symbols, but environment returned {}. \
-            This causes FAC-CTW bit cycling desynchronization. \
-            Fix your `observation_stream_len` config or environment implementation.",
-            expected,
-            actual
-        ));
     }
     Ok(())
 }

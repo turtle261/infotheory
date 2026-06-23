@@ -31,7 +31,13 @@ pub mod mcts;
 #[cfg(feature = "aixi")]
 pub mod model;
 #[cfg(feature = "aixi")]
+pub mod planner_agent;
+#[cfg(feature = "aixi")]
+pub(crate) mod planner_runtime;
+#[cfg(feature = "aixi")]
 pub(crate) mod planner_spec;
+#[cfg(feature = "aixi")]
+pub(crate) mod return_law;
 #[cfg(all(test, feature = "aixi"))]
 pub(crate) mod test_envs;
 #[cfg(all(feature = "aixi", feature = "vm"))]

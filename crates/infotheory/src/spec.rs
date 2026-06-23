@@ -42,6 +42,54 @@ use std::sync::Arc;
 /// Result type used by the shared spec/parsing layer.
 pub type SpecResult<T> = Result<T, SpecError>;
 
+/// Serialize JSON hash payloads with recursive lexicographic object-key order.
+///
+/// This is the crate-local byte contract for CRC/SHA commitments over ad-hoc
+/// JSON payloads. It deliberately avoids relying on `serde_json::Map`'s backing
+/// type or feature-unified insertion-order behavior.
+pub(crate) fn canonical_json_bytes(
+    value: &serde_json::Value,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut bytes = Vec::<u8>::new();
+    write_canonical_json_value(value, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_canonical_json_value(
+    value: &serde_json::Value,
+    out: &mut Vec<u8>,
+) -> Result<(), serde_json::Error> {
+    match value {
+        serde_json::Value::Array(items) => {
+            out.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_canonical_json_value(item, out)?;
+            }
+            out.push(b']');
+            Ok(())
+        }
+        serde_json::Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            out.push(b'{');
+            for (index, (key, item)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                serde_json::to_writer(&mut *out, key)?;
+                out.push(b':');
+                write_canonical_json_value(item, out)?;
+            }
+            out.push(b'}');
+            Ok(())
+        }
+        scalar => serde_json::to_writer(out, scalar),
+    }
+}
+
 /// Trait for deterministic canonical JSON serialization.
 pub trait CanonicalJson {
     /// Serialize this value into canonical JSON value form.
@@ -1979,6 +2027,29 @@ mod tests {
         kind: crate::runtime::RateBackendKind,
     ) -> Option<RateBackend> {
         crate::runtime::default_rate_backend_spec(kind)
+    }
+
+    #[test]
+    fn canonical_json_bytes_sort_object_keys_recursively_and_preserve_array_order() {
+        let value = serde_json::json!({
+            "b": 1,
+            "a": {
+                "z": [2, 1],
+                "a": false
+            },
+            "c": [
+                {
+                    "b": 2,
+                    "a": 1
+                },
+                null
+            ]
+        });
+        let bytes = canonical_json_bytes(&value).expect("canonical JSON bytes");
+        assert_eq!(
+            std::str::from_utf8(&bytes).expect("canonical JSON is UTF-8"),
+            r#"{"a":{"a":false,"z":[2,1]},"b":1,"c":[{"a":1,"b":2},null]}"#
+        );
     }
 
     #[cfg(feature = "backend-rosa")]

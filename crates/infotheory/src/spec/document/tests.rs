@@ -1139,10 +1139,10 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
                 },
                 bit_stream_semantics: default_bit_stream_semantics(),
                 return_horizon: 4,
-                return_bins: 16,
+                return_bins: 17,
                 label_phase_period: 6,
                 teacher_dataset_asset: "teacher".to_string(),
-                planner_simulations_per_step: 9,
+                planner_simulations_per_step: 1,
             }),
             runtime: PlannerRuntimeSpec {
                 random_seed: Some(19),
@@ -1253,7 +1253,7 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
             controller: TuneControllerSpec::AiqiWarmstartExactJh(
                 WarmStartExactJhTuneControllerSpec {
                     interface: tune_interface,
-                    planner_simulations_per_step: 7,
+                    planner_simulations_per_step: 1,
                     return_horizon: 4,
                     warmstart_teacher_dataset_asset: "teacher".to_string(),
                     label_phase_period: 5,

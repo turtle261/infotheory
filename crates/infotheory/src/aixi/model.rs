@@ -496,10 +496,10 @@ pub struct RateBackendBitPredictor {
 #[derive(Clone)]
 enum RateBackendBitPredictorState {
     BinaryTokens {
-        predictor: RateBackendPredictor,
+        predictor: Box<RateBackendPredictor>,
         min_prob: f64,
     },
-    Session(RateBackendBitSession),
+    Session(Box<RateBackendBitSession>),
 }
 
 /// Error returned while constructing or initializing a rate-backend bit predictor.
@@ -642,7 +642,7 @@ struct RateBackendRollbackScope {
 #[derive(Clone)]
 enum RateBackendBitPredictorCheckpoint {
     BinaryTokens(RateBackendPredictorCheckpoint),
-    Session(RateBackendBitSessionCheckpoint),
+    Session(Box<RateBackendBitSessionCheckpoint>),
 }
 
 impl RateBackendBitPredictorState {
@@ -657,7 +657,7 @@ impl RateBackendBitPredictorState {
             .begin_stream(None)
             .map_err(RateBackendBitPredictorError::StreamStart)?;
         Ok(Self::BinaryTokens {
-            predictor,
+            predictor: Box::new(predictor),
             min_prob,
         })
     }
@@ -668,6 +668,7 @@ impl RateBackendBitPredictorState {
         min_prob: f64,
     ) -> Result<Self, RateBackendBitPredictorError> {
         RateBackendBitSession::from_backend_with_min_prob(backend, None, semantics, min_prob)
+            .map(Box::new)
             .map(Self::Session)
             .map_err(|err| RateBackendBitPredictorError::Runtime(err.to_string()))
     }
@@ -678,7 +679,7 @@ impl RateBackendBitPredictorState {
                 RateBackendBitPredictorCheckpoint::BinaryTokens(predictor.checkpoint())
             }
             Self::Session(session) => {
-                RateBackendBitPredictorCheckpoint::Session(session.checkpoint())
+                RateBackendBitPredictorCheckpoint::Session(Box::new(session.checkpoint()))
             }
         }
     }

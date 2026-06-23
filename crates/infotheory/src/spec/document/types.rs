@@ -401,12 +401,19 @@ pub struct WarmStartExactJhControllerSpec {
     /// Return horizon in planner steps.
     pub return_horizon: usize,
     /// Exact return-label alphabet size.
+    ///
+    /// Valid canonical warm-start specs use `return_horizon * max_reward + 1`;
+    /// slack labels are rejected because they do not represent reachable exact
+    /// returns.
     pub return_bins: usize,
     /// Delayed-label phase period.
     pub label_phase_period: usize,
     /// Asset identifier for the warm-start teacher dataset.
     pub teacher_dataset_asset: AssetId,
-    /// Simulation budget per planner step.
+    /// Canonical direct-evaluator budget marker.
+    ///
+    /// Warm-start exact-\(J_H\) performs deterministic full return-law
+    /// evaluation, not MCTS-style simulation. Valid canonical specs use `1`.
     pub planner_simulations_per_step: usize,
 }
 
@@ -527,7 +534,10 @@ pub struct AiqiDiscountedTuneControllerSpec {
 pub struct WarmStartExactJhTuneControllerSpec {
     /// Planner/environment observation/reward/action contract.
     pub interface: TunePlannerInterfaceSpec,
-    /// Simulation budget per planner step.
+    /// Canonical direct-evaluator budget marker.
+    ///
+    /// Warm-start exact-\(J_H\) performs deterministic full return-law
+    /// evaluation, not MCTS-style simulation. Valid canonical specs use `1`.
     pub planner_simulations_per_step: usize,
     /// Return horizon.
     pub return_horizon: usize,
@@ -611,7 +621,7 @@ mod tests {
         let warmstart =
             TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
                 interface: sample_tune_interface(),
-                planner_simulations_per_step: 8,
+                planner_simulations_per_step: 1,
                 return_horizon: 2,
                 warmstart_teacher_dataset_asset: "teacher".to_string(),
                 label_phase_period: 3,
@@ -743,7 +753,7 @@ pub enum CompiledPlannerController {
         label_phase_period: usize,
         /// Teacher dataset asset id.
         teacher_dataset_asset: AssetId,
-        /// Simulation budget per planner step.
+        /// Canonical direct-evaluator budget marker.
         planner_simulations_per_step: usize,
     },
 }

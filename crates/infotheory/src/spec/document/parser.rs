@@ -1444,7 +1444,7 @@ mod tests {
         let warmstart = parse_tune_controller_spec(&serde_json::json!({
             "kind": "aiqi_warmstart_exact_jh",
             "interface": interface,
-            "planner_simulations_per_step": 48,
+            "planner_simulations_per_step": 1,
             "return_horizon": 3,
             "warmstart_teacher_dataset_asset": "teacher",
             "label_phase_period": 2,
