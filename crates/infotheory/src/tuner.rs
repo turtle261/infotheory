@@ -11,6 +11,7 @@ use crate::aixi::common::{
 };
 use crate::aixi::warmstart::{
     WarmStartExactJhAgent, WarmStartExactJhTeacherDataset, WarmStartExactJhTeacherTrace,
+    merge_warmstart_teacher_trace_deterministic,
 };
 use crate::api::RateBackend;
 use crate::runtime::CompressionRuntime;
@@ -65,7 +66,7 @@ use eval::{
 use planner_bridge::{
     TunerRawObservation, compile_tuner_planner_run_spec, encode_tuner_planner_percept,
     merge_warmstart_trace_deterministic, planner_controller_contract,
-    validate_theorem_planner_mutation_domain, warmstart_trace_key,
+    validate_theorem_planner_mutation_domain,
 };
 use planner_bridge::{
     exact_nonnegative_i64_from_f64, key_less, normalized_clipped_improvement,

@@ -4,17 +4,8 @@
 //! task identity and observation-key encoding names do not drift between runtime
 //! and CLI validation paths.
 //!
-//! ## Standalone planner-run provenance (normative)
-//!
-//! For environments outside the tuner bridge, §3.2 of `docs/infotheory-tuner-v1.tex`
-//! still requires observation adapter metadata and exact reward semantics to be
-//! **hash-committed**: a versioned adapter declaration plus a CRC32 of a canonical
-//! JSON spec object, a declared scalar representation string, and a CRC32 of a
-//! small certificate object for the injective reward encoder on the channel.
-//!
-//! The legacy four identical `"standalone-planner-run"` sentinels are replaced here
-//! by structured JSON → CRC32, matching the operational pattern used on the tuner
-//! path (`observation_adapter_spec_value` + `observation_adapter_content_hash`).
+//! Normative semantics for standalone teacher artifacts, task fingerprints, and
+//! provenance declarations are specified in `docs/warmstart-exact-jh.tex`.
 
 use crate::aixi::common::{ObservationKeyMode, nonnegative_reward_encoding_bounds};
 use crate::spec::{AssetRef, CanonicalJson, CompiledPlannerRunSpec, canonical_json_bytes};

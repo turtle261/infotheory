@@ -78,6 +78,11 @@ strings or partially interpreted JSON.
 
 ## Warm-Start Exact-J_H Invariants
 
+Normative semantics for `aiqi_warmstart_exact_jh`, standalone teacher artifacts,
+JSONL conversion, deterministic teacher-trace merge, and task fingerprint binding
+live in `docs/warmstart-exact-jh.tex`. The checklist below records implementation
+anchors that must stay aligned with that document.
+
 ### Task Fingerprint Binding
 
 The warm-start task fingerprint

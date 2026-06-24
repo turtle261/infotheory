@@ -1,0 +1,758 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.7\baselineskip}
+
+\newtheorem{definition}{Definition}
+\newtheorem{assumption}{Assumption}
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+
+\newcommand{\Warm}{\textnormal{\textsc{WarmStartExactJh}}}
+\newcommand{\Act}{\mathcal{A}}
+\newcommand{\Ospace}{\mathcal{O}}
+\newcommand{\Rspace}{\mathcal{R}}
+\newcommand{\Hist}{\mathcal{H}}
+\newcommand{\Teach}{\mathcal{D}_{\mathrm{teach}}}
+\newcommand{\TV}{\mathrm{TV}}
+\newcommand{\Jh}{\mathcal{J}_H}
+\newcommand{\Bridge}{\mathfrak{B}}
+\newcommand{\Lab}{\mathcal{L}_H}
+\newcommand{\Vlab}{V_{\Lab}}
+\newcommand{\PT}{P_T}
+\newcommand{\QT}{Q_T}
+\newcommand{\Qxi}{Q_{\xi,H}}
+
+\title{\Warm:\\Standalone Exact Finite-Horizon Warm-Start Agent Specification}
+\author{Noah Cashin}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Status and Scope}
+\label{sec:status}
+
+This document is the normative standalone specification for the
+\Warm{} controller family implemented by
+\[
+\texttt{controller.kind = "aiqi\_warmstart\_exact\_jh"}.
+\]
+It specifies the mathematical model, canonical teacher artifact, offline
+teacher export, online trace refresh, and implementation contract. It is
+intentionally independent of \texttt{docs/infotheory-tuner-v1.tex}; the tuner
+use case is an instantiation of the model, not the definition of the model.
+
+The core object is a finite-action, finite-observation, finite-label
+controller over a certified same-task bridge. The bridge defines admissible
+actions, observations, one-step rewards, finite-horizon labels, label decoding,
+and task identity. \Warm{} learns a conditional return-label law
+\[
+\widehat p(\ell\mid h,a),
+\]
+not an action-cloning policy \(\pi_T(a\mid h)\). This is the structural sense
+in which it is AIQI-like: it performs direct induction over action-conditional
+return distributions rather than imitating the teacher's realized action
+sequence.
+
+A teacher is any controller or policy that can produce realized transitions
+under the same compiled bridge contract. Its family name is not part of
+admissibility: MC-AIXI, discounted AIQI, \Warm{} itself, a hand-coded policy,
+a random policy, or a future Infotheory controller are all valid teachers if
+their traces satisfy the contract below.
+
+The Rust/controller name \Warm{} is historical for the tuner exact-\(\Jh\)
+instantiation. Mathematically, the core is bridge-parametric exact return-law
+warmstart. In the direct integer-reward bridge, labels decode to \(H\)-step
+reward sums. In the tuner bridge, labels decode to exact \(\Jh\) incumbent
+improvement. This document preserves the tuner theorem boundary by treating
+that bridge as a separately certified instantiation.
+
+\section{Compiled Task Contract}
+\label{sec:task}
+
+\begin{definition}[Certified same-task bridge]
+A certified same-task bridge is a tuple
+\[
+\Bridge=(\Act,\Ospace,\Rspace,\Lab,\Vlab,\Omega_R,\Omega_{\Lab},
+\operatorname{Label}_H,\sigma)
+\]
+where \(\Act\), \(\Ospace\), and \(\Rspace\) are finite action,
+observation, and one-step reward domains; \(\Lab\) is a finite label
+alphabet; \(\Vlab:\Lab\to\mathbb{R}\) is the exact semantic value decoder;
+\(\Omega_R\) and \(\Omega_{\Lab}\) are injective finite encoders for rewards
+and labels; \(\operatorname{Label}_H\) deterministically maps every realized
+same-task \(H\)-window to a label in \(\Lab\); and \(\sigma\) is the bridge
+task fingerprint.
+\end{definition}
+
+\Warm{} only requires the bridge to provide finite, same-task, exactly
+decodable labels. The direct standalone bridge uses
+\[
+\operatorname{Label}_H((a_j,o_j,r_j)_{j=i}^{i+H-1})
+=
+\sum_{j=i}^{i+H-1}r_j
+\]
+and \(\Vlab(\ell)=\ell\). Other certified bridges may use different exact
+label semantics without changing the warmstart predictor or policy.
+
+\begin{definition}[Compiled warm-start task]
+A compiled warm-start task is a tuple
+\[
+M=(\Bridge,H,B,N,P,\rho)
+\]
+with the following components:
+\begin{itemize}
+    \item a certified same-task bridge \(\Bridge\);
+    \item a finite return horizon \(H\ge1\);
+    \item an exact return-label alphabet size
+    \(B=|\Lab|\ge1\);
+    \item a label phase period \(N\ge H\);
+    \item a finite-alphabet predictive backend \(P\) supporting strict frozen
+    history conditioning;
+    \item a deterministic seed \(\rho\).
+\end{itemize}
+\end{definition}
+
+For the direct integer-reward standalone bridge, the return-label alphabet must
+be exact for a dense nonnegative reward interval. Thus \(B-1\) must be
+divisible by \(H\), and the reward domain is derived from \(H\), \(B\), and
+\(b_R\) by
+\[
+r_{\min}=0,
+\qquad
+r_{\max}=\frac{B-1}{H},
+\qquad
+\Rspace=\{0,\dots,r_{\max}\}.
+\]
+The channel bit width must represent every reward in \(\Rspace\). This
+choice makes the \(H\)-step return set exactly
+\(\{0,\dots,B-1\}\). Slack return bins are non-conforming: they would create
+labels with no exact direct-bridge return preimage and are rejected by the
+compiled warm-start contract. Signed or non-identity reward channels require
+an explicit future contract or an externally certified bridge such as the
+tuner bridge in Section~\ref{sec:tuner-bridge}.
+
+At step \(t\ge1\), the controller emits \(a_t\in\Act\), then receives
+\((o_t,r_t)\in\Ospace\times\Rspace\). The realized history before choosing
+\(a_t\) is
+\[
+h_{<t}=(a_1,o_1,r_1,\dots,a_{t-1},o_{t-1},r_{t-1})\in\Hist.
+\]
+For any start step \(i\), once the next \(H\) rewards are known, define the
+exact delayed label
+\[
+\ell_i=\operatorname{Label}_H((a_j,o_j,r_j)_{j=i}^{i+H-1}).
+\]
+For the direct integer-reward bridge this is
+\[
+G_i^{(H)}=\sum_{j=i}^{i+H-1}r_j,
+\qquad
+\ell_i=G_i^{(H)}.
+\]
+The implementation stores direct-bridge labels as unsigned integers; the semantic value
+used for action selection is always \(\Vlab(\ell_i)\).
+
+Throughout this document, total variation uses the standard probability
+metric convention
+\[
+\|p-q\|_{\TV}
+=
+\sup_A |p(A)-q(A)|
+=
+\frac12\sum_x |p(x)-q(x)|.
+\]
+
+The phase of a one-based step index is
+\[
+\phi(i)=i\bmod N\in\{0,\dots,N-1\}.
+\]
+Phase partitioning prevents unresolved delayed labels from being required in
+the same predictor stream that is being conditioned for a current decision.
+
+\section{Canonical Teacher Artifact}
+\label{sec:teacher-artifact}
+
+\subsection{JSON object}
+
+The canonical teacher artifact is a versioned JSON object
+\[
+(\texttt{schema\_version},\texttt{contract},\texttt{traces})
+\]
+with schema version \(1\). Its shape is:
+\begin{verbatim}
+{
+  "schema_version": 1,
+  "contract": {
+    "task_fingerprint": "...",
+    "action_alphabet_size": K,
+    "observation_bits": b_O,
+    "observation_stream_len": L,
+    "observation_key_mode": "first|last|stream_hash|full_stream",
+    "observation_adapter_spec_ref": "...",
+    "observation_adapter_content_crc32": "........",
+    "reward_bits": b_R,
+    "return_horizon": H,
+    "label_phase_period": N,
+    "scalar_representation": "...",
+    "exact_reward_encoding_certificate": "..."
+  },
+  "traces": [
+    {
+      "transitions": [
+        { "action": a, "observations": [o_0, ...], "reward": r }
+      ]
+    }
+  ]
+}
+\end{verbatim}
+Legacy trace arrays and field aliases such as \texttt{obs} are not part of
+the schema.
+
+The field \texttt{return\_bins} is not duplicated in the teacher artifact.
+It is part of the target planner-run controller spec, and the teacher contract
+is validated against that target. Thus \(B=|\Lab|\) is recovered from the
+compiled target, while the artifact records the horizon and phase-period
+fields needed to interpret transition windows.
+
+For standalone planner runs, the observation adapter declaration is
+\[
+\texttt{direct-planner-percept-lsb-first-v1},
+\]
+and the scalar representation is
+\[
+\texttt{nonnegative-integer-i64-instantaneous-reward-v1}.
+\]
+The adapter CRC and reward certificate are CRC32 hex strings of the canonical
+JSON declaration objects implemented in
+\texttt{aixi/warmstart\_contract.rs}. They commit to the observation stream
+length, observation bit width, reward bit width, LSB-first field encoding, and
+identity reward encoder over the representable nonnegative reward interval.
+
+\subsection{Admissibility}
+
+\begin{definition}[Admissible same-task teacher artifact]
+\label{def:admissible-teacher}
+A teacher artifact \(\Teach\) is admissible for a compiled target task \(M\)
+when:
+\begin{itemize}
+    \item \texttt{schema\_version} is \(1\);
+    \item the contract task fingerprint equals the target fingerprint
+    \(\sigma\);
+    \item the contract action-alphabet size, observation bit width,
+    observation stream length, observation key mode, reward bit width, return
+    horizon, and label phase period equal the compiled target contract;
+    \item when the target environment is not the externally validated tuner
+    bridge, the standalone observation-adapter, scalar-representation, and
+    exact-reward-encoding provenance fields match the canonical declarations
+    for the compiled target;
+    \item every transition action lies in \(\Act\), every observation cell lies
+    in its declared bit range, and every reward lies in \(\Rspace\);
+    \item every trace has length at least \(H\), so each trace contributes at
+    least one complete delayed-label window;
+    \item every complete \(H\)-window in every trace yields a label in
+    \(\Lab\);
+    \item the artifact contains at least one complete delayed label in total.
+\end{itemize}
+\end{definition}
+
+\subsection{Task fingerprint}
+\label{sec:task-fingerprint}
+
+The standalone task fingerprint is a SHA-256 hex digest of a deterministic JSON
+payload containing:
+\begin{itemize}
+    \item the SHA-256 of the canonical planner-run document bytes with the
+    teacher dataset asset removed from both \texttt{assets} and the controller
+    binding;
+    \item the compiled controller kind;
+    \item the compiled controller backend label;
+    \item the teacher contract schema version;
+    \item SHA-256 content commitments for every resolved task asset except the
+    teacher dataset asset itself.
+\end{itemize}
+Excluding the teacher dataset asset is essential: it permits a target \Warm{}
+planner-run document to name an output teacher asset that does not exist yet,
+and it prevents the artifact bytes from changing the task identity they are
+meant to satisfy.
+
+\subsection{Telemetry versus teacher data}
+\label{sec:telemetry}
+
+JSONL action/percept logs are raw telemetry. They are not canonical teacher
+data. The telemetry grammar consists of one JSON object per line:
+\[
+\{\texttt{"t"}:n,\texttt{"kind"}:\texttt{"action"},\texttt{"action"}:a,
+\texttt{"provenance"}:s\}
+\]
+or
+\[
+\{\texttt{"t"}:n,\texttt{"kind"}:\texttt{"percept"},
+\texttt{"observations"}:[o_0,\dots,o_{L-1}],\texttt{"reward"}:r\}.
+\]
+For action records, \texttt{provenance} is optional for legacy telemetry and
+required for conforming warmstart experiment logs. Its allowed values are:
+\[
+\texttt{"greedy"},\quad
+\texttt{"exploratory"}.
+\]
+The converter ignores provenance when constructing teacher data; provenance is
+decision accounting, not trace content. If \texttt{provenance} is present, a
+conforming converter must validate that it is one of the allowed labels above;
+omitted provenance is accepted only for legacy telemetry.
+
+A deterministic converter from telemetry to a teacher artifact must:
+\begin{enumerate}
+    \item reject malformed JSON, unknown fields needed for conversion,
+    duplicate action records at the same step, and duplicate percept records
+    at the same step;
+    \item pair an action at step \(n\) with a percept at the same step only
+    when the percept record occurs after the action record;
+    \item otherwise pair the action at step \(n\) with the percept at
+    step \(n+1\), supporting pre-action percept logs;
+    \item reject any action for which no such post-action percept exists;
+    \item validate every reconstructed transition against the target bridge
+    contract;
+    \item attach the target contract and reject traces shorter than \(H\);
+    \item emit the canonical JSON teacher dataset above.
+\end{enumerate}
+This converter never reorders records to repair a broken log and never fills
+missing percepts. A single JSONL trace must use one pairing convention
+throughout. Mixed pre-action and post-action telemetry is non-conforming and
+must be rejected rather than heuristically repaired.
+
+Multiple teacher artifacts for the same contract are merged by deterministic
+deduplicating union over exact trace content. A trace is identified for merge
+purposes by its transition list itself, not by a hash, CRC, or serialized JSON
+digest. Transition lists are compared structurally and lexicographically: each
+transition is ordered by action, then by the observation stream, then by reward;
+if one transition list is a prefix of another, the shorter trace sorts first.
+Identical transition lists are deduplicated, and newly inserted traces are
+placed according to this structural order. Source-controller metadata is
+provenance, not part of trace identity or ordering. Hashes of trace content may
+be reported as diagnostics, but they are not normative merge keys.
+
+\section{Predictor Construction and Encoding}
+\label{sec:predictor}
+
+Let
+\[
+b_A=\lceil\log_2 K\rceil,\qquad b_G=\lceil\log_2 B\rceil.
+\]
+Action, observation, and reward integer fields are encoded LSB-first with
+fixed width:
+\[
+\operatorname{enc}_A(a)\in\{0,1\}^{b_A},
+\operatorname{enc}_O(o_j)\in\{0,1\}^{b_O},
+\quad
+\operatorname{enc}_R(r)\in\{0,1\}^{b_R}.
+\]
+Return labels use the value-monotone fixed-width code
+\[
+\operatorname{enc}_G(\ell)\in\{0,1\}^{b_G}
+\]
+given by the MSB-first natural binary representation of the ordered label
+index. Thus, for power-of-two label alphabets, every depth-\(d\) label-prefix
+node denotes a contiguous block of decoded return values with width at most
+approximately \(2^{-d}\) of the full return range. This is intentionally
+different from the LSB-first field encoding used for actions, observations,
+and rewards. The separation is semantically important: changing label bit
+order changes the return-predictor training stream, while changing action or
+percept field order would change the bridge stream itself.
+
+\Warm{} maintains one predictive model \(P_n\) for each phase
+\(n\in\{0,\dots,N-1\}\). For a trace
+\[
+\tau=((a_1,o_1,r_1),\dots,(a_T,o_T,r_T)),
+\]
+compute labels \(\ell_i\) for \(1\le i\le T-H+1\). The phase-\(n\)
+training stream for this trace is the concatenation, for \(i=1,\dots,T\), of
+\[
+\operatorname{enc}_A(a_i),
+\quad
+\begin{cases}
+\operatorname{enc}_G(\ell_i), & \phi(i)=n \text{ and } i\le T-H+1,\\
+\epsilon, & \text{otherwise},
+\end{cases}
+\quad
+\operatorname{enc}_O(o_i),
+\quad
+\operatorname{enc}_R(r_i).
+\]
+The implementation commits this stream into every phase model. After each
+teacher trace, the predictor's transient conditioning history is reset while
+its learned state remains.
+
+During live interaction, when the label for start step \(i\) becomes known,
+only phase \(P_{\phi(i)}\) is advanced through the corresponding augmented
+live stream. This keeps each phase model chronologically consistent with the
+labels it is allowed to see.
+
+\section{Action Values and Policy}
+\label{sec:policy}
+
+At the next step \(t\), the active phase is \(n=\phi(t)\). For a candidate
+action \(a\), \Warm{} conditions \(P_n\) on any uncommitted live history,
+pushes \(\operatorname{enc}_A(a)\) as temporary history, and queries the
+bit-chain probabilities of the return-label law. The implementation uses a
+memoized shared-prefix trie evaluator as the complete authoritative baseline:
+one logical next-bit query is made per reached internal label-prefix node, and
+the resulting prefix masses are reused for all descendant labels. In the clean
+power-of-two case this is at most \(B-1\) logical label-bit probability
+queries per action, instead of \(B b_G\) leaf-by-leaf bit queries. The
+resulting nonnegative masses are normalized to a distribution
+\[
+\widehat p_t(\ell\mid h_{<t},a).
+\]
+If the mass sum is zero or non-finite, the implementation falls back to the
+uniform distribution over labels. The estimated value is
+\[
+\widehat Q_H(h_{<t},a)=
+\sum_{\ell\in\Lab}\Vlab(\ell)\,
+\widehat p_t(\ell\mid h_{<t},a).
+\]
+
+The greedy action is
+\[
+\hat a_t=\min\arg\max_{a\in\Act}\widehat Q_H(h_{<t},a).
+\]
+An implementation may expose additional epsilon exploration during learning:
+with probability \(\varepsilon_t\) it samples uniformly from \(\Act\), otherwise
+it executes \(\hat a_t\). Exact greedy claims apply only when the executed
+decision is greedy.
+
+After executing \(a_t\), the controller records \((a_t,o_t,r_t)\). If this
+creates a new delayed label \(\ell_{t-H+1}\), the active phase for that label
+is updated before future predictions require it.
+
+\subsection{Online learning modes}
+\label{sec:online-modes}
+
+\Warm{} has three distinct online data modes:
+\begin{enumerate}
+    \item within-run delayed-label update: the current agent updates a phase
+    predictor as soon as a realized \(H\)-window closes;
+    \item exploration-supported correction: the run deliberately executes
+    non-greedy actions to improve action-conditional coverage, and exact
+    greedy-action claims are disabled at those exploratory decisions;
+    \item across-run refresh: a completed live trace is merged into the teacher
+    artifact and a new student is rebuilt from the merged dataset.
+\end{enumerate}
+Within-run updates and across-run rebuilds may both be supported by an
+implementation, but a single reported training event must be classified as
+one or the other. The tuner executor currently reports either online delayed
+label update or trace-refresh rebuild for the same self-improvement round, so
+the theorem/provenance accounting is not double-counted. In the current tuner
+bridge, trace refresh disables the same round's online delayed-label update
+flag; standalone warmstart runtimes may still update within a run, then later
+perform an explicit across-run refresh as a separate event.
+
+Online updates improve the model only on histories and actions that are
+actually covered. They do not by themselves create counterfactual labels for
+untried actions. Exploration-supported correction is therefore a coverage
+mechanism, not a theorem of monotone improvement.
+
+\section{Offline Teacher Export}
+\label{sec:offline-export}
+
+The canonical CLI export form is:
+\begin{verbatim}
+infotheory warmstart teacher planner-run \
+  --target <warmstart-planner-run> \
+  --teacher <teacher-planner-run> \
+  --out <teacher.json>
+\end{verbatim}
+The target planner run must use \texttt{aiqi\_warmstart\_exact\_jh}. The
+teacher planner run may use any CLI-executable planner controller. The export
+command:
+\begin{enumerate}
+    \item compiles both planner-run documents through the canonical spec
+    pipeline;
+    \item verifies that target and teacher have identical planner interface
+    values and identical canonical environment JSON;
+    \item executes the teacher controller for its configured learning and
+    evaluation cycles;
+    \item records realized transitions after each action;
+    \item rejects the run if fewer than \(H\) transitions were produced;
+    \item builds the target standalone teacher contract;
+    \item validates the resulting artifact by constructing the target
+    \Warm{} agent from it;
+    \item writes pretty canonical teacher JSON to \texttt{--out}.
+\end{enumerate}
+This realizes the offline-to-online path: any controller can act as teacher,
+and the resulting artifact initializes a \Warm{} student for the target task.
+
+The reproducibility CLI also exposes:
+\begin{verbatim}
+infotheory warmstart teacher from-jsonl \
+  --target <warmstart-planner-run> --jsonl <run.jsonl> --out <teacher.json>
+
+infotheory warmstart teacher merge \
+  --target <warmstart-planner-run> --out <teacher.json> \
+  --teacher <teacher-a.json> --teacher <teacher-b.json> ...
+\end{verbatim}
+The first command implements the deterministic telemetry converter from
+Section~\ref{sec:telemetry}. The second performs the deterministic
+same-contract trace union defined there and validates the merged result by
+constructing the target student.
+
+\section{Online Trace Refresh}
+\label{sec:refresh}
+
+During online deployment, \Warm{} can export its own live same-task trace after
+at least \(H\) transitions. The live trace is not itself a teacher artifact; it
+becomes teacher data only when it is wrapped under the unchanged target
+contract, merged into the teacher dataset, and validated by the same full
+dataset gate used for ordinary teacher artifacts. A refresh wrapper may then
+reinitialize the student from the merged dataset.
+
+A bounded refresh loop is specified by an initial teacher dataset
+\(\Teach^{(0)}\), a maximum number of refresh rounds \(R\), and a finite run
+budget per round. Round \(r\) builds \(W^{(r)}\) from \(\Teach^{(r)}\), executes
+it on the same compiled bridge, extracts a live trace \(\tau^{(r)}\) if one has
+at least \(H\) transitions, and sets
+\[
+\Teach^{(r+1)}
+=
+\operatorname{Merge}(\Teach^{(r)},\tau^{(r)}).
+\]
+\(\operatorname{Merge}\) is the deterministic trace-content union of
+Section~\ref{sec:teacher-artifact}. The loop stops after \(R\) rounds, or
+earlier if no admissible live trace is produced.
+
+\begin{proposition}[Refresh trace payload admissibility]
+If a live \Warm{} trace of length at least \(H\) is produced by a target
+runtime that validates every emitted action, observation, and reward against
+the compiled target bridge, then wrapping that trace under the unchanged target
+contract yields transition payloads whose complete horizon windows are
+admissible teacher labels for that same target contract.
+\end{proposition}
+
+\begin{proof}
+Every recorded action, observation, and reward has already passed the target
+runtime's transition validator. Each label is the deterministic \(H\)-step sum
+of rewards in that same trace. The trace length premise gives at least one
+complete delayed-label window, and the unchanged wrapper contract supplies the
+same fingerprint, interface fields, horizon, phase period, and provenance
+fields required by Definition~\ref{def:admissible-teacher}. Therefore the
+wrapped live trace can pass the teacher-artifact validator as part of the
+merged dataset.
+\end{proof}
+
+Refresh is a data mechanism, not a monotonic-improvement theorem. It improves
+the theorem-facing local bound only to the extent that the refreshed predictor
+is closer to the target conditional label law on visited histories.
+
+\begin{theorem}[Conditional local refresh improvement]
+Fix a history \(h\) and suppose two same-bridge students differ only in their
+teacher artifact: an initial student \(W_0\) and a refreshed student \(W_1\).
+If, for every action,
+\[
+\|\widehat p_{W_1}(\cdot\mid h,a)-p(\cdot\mid h,a)\|_{\TV}
+<
+\|\widehat p_{W_0}(\cdot\mid h,a)-p(\cdot\mid h,a)\|_{\TV},
+\]
+then the local finite-horizon value-error bound of
+Theorem~\ref{thm:tv-robustness} is strictly smaller for \(W_1\) than for
+\(W_0\) at \(h\).
+\end{theorem}
+
+\begin{proof}
+The bound in Theorem~\ref{thm:tv-robustness} is monotone in the uniform
+total-variation radius. A strict decrease for every action gives a strict
+decrease of the supremum radius at \(h\), and therefore a strict decrease of
+the displayed value-error bound.
+\end{proof}
+
+For bridges with monotone incumbent semantics, such as the tuner exact-\(\Jh\)
+bridge, the bridge may prove additional best-so-far or objective-monotonicity
+claims. Those claims belong to the bridge specification; they are not implied
+by refresh alone for arbitrary environments.
+
+\section{Core Theorems}
+\label{sec:theorems}
+
+Let \(p_t(\ell\mid h,a)\) be the true conditional law of the exact
+\(H\)-step return label at history \(h\) under action \(a\). Define
+\[
+Q^\star_H(h,a)=\sum_{\ell\in\Lab}\Vlab(\ell)p_t(\ell\mid h,a).
+\]
+Let
+\[
+D_G=\max_{\ell\in\Lab}\Vlab(\ell)-\min_{\ell\in\Lab}\Vlab(\ell).
+\]
+For the direct integer-reward bridge, \(D_G=Hr_{\max}-Hr_{\min}=Hr_{\max}\).
+
+\begin{theorem}[Exact greedy alignment]
+If, at a greedy decision history \(h\),
+\[
+\widehat p_t(\cdot\mid h,a)=p_t(\cdot\mid h,a)
+\quad\text{for every }a\in\Act,
+\]
+then \Warm{} selects an action maximizing the true expected exact
+\(H\)-step return \(Q^\star_H(h,a)\), with deterministic lowest-index
+tie-breaking.
+\end{theorem}
+
+\begin{proof}
+Under the premise, \(\widehat Q_H(h,a)=Q^\star_H(h,a)\) for every action.
+The implemented rule chooses the lowest-index maximizer of these same values.
+\end{proof}
+
+\begin{theorem}[Total-variation robustness]
+\label{thm:tv-robustness}
+If
+\[
+\sup_{a\in\Act}
+\|\widehat p_t(\cdot\mid h,a)-p_t(\cdot\mid h,a)\|_{\TV}
+\le \delta,
+\]
+then the greedy \Warm{} action \(\hat a\) satisfies
+\[
+Q^\star_H(h,a^\star)-Q^\star_H(h,\hat a)\le 2D_G\delta,
+\]
+where \(a^\star\) is any true optimal action.
+\end{theorem}
+
+\begin{proof}
+For any bounded function with range diameter \(D_G\), expectation changes by
+at most \(D_G\) times total variation. Thus
+\[
+|\widehat Q_H(h,a)-Q^\star_H(h,a)|\le D_G\delta
+\]
+for every action. Since \(\hat a\) maximizes \(\widehat Q_H\),
+\[
+Q^\star_H(h,a^\star)
+\le \widehat Q_H(h,a^\star)+D_G\delta
+\le \widehat Q_H(h,\hat a)+D_G\delta
+\le Q^\star_H(h,\hat a)+2D_G\delta.
+\]
+\end{proof}
+
+\begin{corollary}[Teacher action-gap preservation]
+If the teacher value \(\QT\) has a unique greedy action \(a_T\) at \(h\) and
+\[
+\sup_{a\in\Act}|\widehat Q_W(h,a)-\QT(h,a)|<\Delta_T(h)/2,
+\]
+then the greedy warmstart action equals \(a_T\). In particular, the condition
+holds whenever
+\[
+\sup_{a\in\Act}\|\widehat p_W(\cdot\mid h,a)-\PT(\cdot\mid h,a)\|_{\TV}
+\le\delta
+\quad\text{and}\quad
+D_G\delta<\Delta_T(h)/2.
+\]
+\end{corollary}
+
+\section{Tuner Bridge Instantiation}
+\label{sec:tuner-bridge}
+
+The tuner bridge instantiates the generic reward \(r_t\) as exact improvement
+in the deployable two-part objective:
+\[
+\Jh(z;d)=8L_B(z)+\ell_H(z).
+\]
+For incumbent sequence \(b_t\), the exact reward is
+\[
+r_t=\Jh(b_{t-1};d)-\Jh(b_t;d)
+\]
+after the bridge's finite reward encoder has certified representability and
+injectivity. Therefore the \(H\)-step label telescopes:
+\[
+G_i^{(H)}
+=\sum_{j=i}^{i+H-1}r_j
+=\Jh(b_{i-1};d)-\Jh(b_{i+H-1};d).
+\]
+This is the tuner theorem use case. Its dataset lowering, deployability,
+timing, exact reward certificate, and observation adapter are governed by the
+tuner specification. \Warm{} consumes the resulting externally validated
+teacher artifact through the same contract fields, but this standalone
+document does not weaken or replace the tuner theorem assumptions.
+
+\section{Implementation Conformance}
+\label{sec:implementation}
+
+A conforming implementation must:
+\begin{itemize}
+    \item route planner-run documents through the canonical spec
+    validate/compile pipeline;
+    \item reject zero return horizon, zero return bins, phase period below
+    horizon, planner simulation budgets other than the direct-evaluator marker
+    \(1\), unsupported predictor conditioning, and malformed teacher contracts;
+    \item validate every teacher and live transition against action,
+    observation, and reward bounds before learning from it;
+    \item use deterministic LSB-first fixed-width field encodings for actions,
+    observations, and rewards, and MSB-first value-monotone label codewords;
+    \item reset transient predictor conditioning history between independent
+    teacher traces;
+    \item expose canonical teacher JSON serialization and parsing as inverse
+    operations on valid artifacts;
+    \item keep JSONL telemetry separate from canonical teacher artifacts;
+    \item merge same-contract traces by deterministic content deduplication;
+    \item record whether actions were greedy or exploratory in planner JSONL
+    telemetry when provenance is present.
+\end{itemize}
+
+\section{Traceability Obligations}
+\label{sec:traceability}
+
+The implementation and tests should maintain the following traceability map:
+\begin{itemize}
+    \item compiled bridge contract: parser, canonical JSON, binary round-trip,
+    compile, and fingerprint tests for \texttt{aiqi\_warmstart\_exact\_jh};
+    \item admissible teacher artifacts: schema parse/serialize inverse tests,
+    contract mismatch rejection tests, standalone planner-run export tests, and
+    tuner-bridge validation tests owned by the tuner specification;
+    \item JSONL conversion: same-step action/percept pairing tests,
+    pre-action percept next-step pairing tests, mixed-convention rejection
+    tests, malformed/duplicate rejection tests, and final target-agent
+    construction from converted data;
+    \item deterministic merge and refresh: structural trace-content deduplication
+    tests, same-contract validation tests, and rebuilt-agent construction from
+    merged data;
+    \item online delayed labels: within-run transition observation tests showing
+    a newly closed \(H\)-window updates exactly one phase model;
+    \item implementation anchors:
+\begin{verbatim}
+PlannerActionProvenance
+warmstart_teacher_trace_from_jsonl_reader
+warmstart_teacher_trace_from_jsonl_path
+merge_warmstart_teacher_traces_deterministic
+standalone_warmstart_teacher_contract_for_compiled_planner_run
+warmstart_exact_jh_planner_task_fingerprint
+WarmStartExactJhAgent::from_compiled_planner_run
+validate_warmstart_exact_jh_teacher_contract
+load_warmstart_exact_jh_teacher_dataset
+PlannerControllerAgent::from_compiled
+PlannerEnvironment
+PlannerRunSession
+run_warmstart_teacher_planner_run_export
+run_warmstart_teacher_from_jsonl_export
+run_warmstart_teacher_merge
+run_compiled_planner_run
+\end{verbatim}
+    \item theorem claims: total-variation/action-gap claims are mathematical
+    obligations; implementation tests must verify their preconditions are
+    exposed and not silently inferred from unvalidated data.
+\end{itemize}
+
+\section{Claim Boundary}
+\label{sec:claims}
+
+\Warm{} does not claim universal optimality, discounted-return optimality,
+wall-clock dominance over its teacher, or automatic repair of missing
+counterfactual action coverage. The exact theorem is local and finite-horizon:
+if the conditional label law is exact at the current history, greedy
+\Warm{} is exact for the current \(H\)-step return objective. Offline teacher
+data, online refresh, and exploration are mechanisms for making that local
+model useful and reproducible; their stronger empirical claims must be
+measured and reported as experimental results.
+
+\end{document}

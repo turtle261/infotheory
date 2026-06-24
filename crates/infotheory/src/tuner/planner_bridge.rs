@@ -1034,36 +1034,10 @@ pub(super) fn merge_warmstart_trace_deterministic(
     teacher: &mut WarmStartExactJhTeacherDataset,
     trace: WarmStartExactJhTeacherTrace,
 ) -> Result<bool, String> {
-    let key = warmstart_trace_key(&trace)?;
-    let already_present = teacher
-        .traces
-        .iter()
-        .map(warmstart_trace_key)
-        .collect::<Result<BTreeSet<String>, String>>()?
-        .contains(&key);
-    if already_present {
-        return Ok(false);
-    }
-    teacher.traces.push(trace);
-    teacher
-        .traces
-        .sort_by_key(|trace| warmstart_trace_key(trace).unwrap_or_default());
-    Ok(true)
-}
-
-pub(super) fn warmstart_trace_key(trace: &WarmStartExactJhTeacherTrace) -> Result<String, String> {
-    let value = serde_json::json!({
-        "transitions": trace.transitions.iter().map(|transition| {
-            serde_json::json!({
-                "action": transition.action,
-                "observations": transition.observations,
-                "reward": transition.reward,
-            })
-        }).collect::<Vec<Value>>(),
-    });
-    serde_json::to_vec(&value)
-        .map(|bytes| crc32_hex(&bytes))
-        .map_err(|err| format!("failed to encode warm-start trace key: {err}"))
+    Ok(merge_warmstart_teacher_trace_deterministic(
+        &mut teacher.traces,
+        trace,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

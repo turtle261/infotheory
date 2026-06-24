@@ -136,18 +136,32 @@ This checklist maps the normative Tuner V1 implementation obligations in
 
 ## Warm-Start Exact J_H
 
+- Standalone warm-start teacher artifacts, JSONL conversion, deterministic
+  structural merge, and task fingerprint binding are normative in
+  `docs/warmstart-exact-jh.tex`; tuner trace refresh remains a consumer of
+  those teacher-artifact semantics rather than a second specification.
 - Warm-start teacher datasets are versioned and same-task fingerprinted,
   including action/observation/reward interface fields, observation key mode,
   observation adapter ref/hash, scalar representation, and exact reward
   certificate hash. Implemented by `WarmStartExactJhTeacherDataset`,
-  `WarmStartExactJhTeacherContract`, and
-  `validate_warmstart_teacher_contract`.
+  `WarmStartExactJhTeacherContract`, `warmstart_exact_jh_planner_task_fingerprint`,
+  `validate_warmstart_exact_jh_teacher_contract`, and
+  `load_warmstart_exact_jh_teacher_dataset`.
+- JSONL telemetry is converted to canonical teacher traces by
+  `warmstart_teacher_trace_from_jsonl_path`; CLI merge uses
+  `merge_warmstart_teacher_traces_deterministic`. Covered by
+  `jsonl_trace_converter_rejects_malformed_and_inconsistent_records` and
+  CLI warmstart teacher tests.
 - Bounded same-task trace refresh rebuilds the warm-start agent from a
   deterministic merge of teacher traces and realized admissible live traces.
   Implemented by `WarmStartExactJhAgent::same_task_live_trace`,
   `merge_warmstart_trace_deterministic`, and
   `TunerPlannerAgentRuntime::rebuild_warmstart_agent`; covered by
   `warmstart_trace_refresh_merges_same_task_live_trace`.
+- Planner-run documents for `aiqi_warmstart_exact_jh` round-trip through JSON,
+  binary ITSD, and compile. Covered by
+  `warmstart_exact_jh_json_binary_and_compile_roundtrip` and related rejection
+  tests in `spec/document/tests.rs`.
 
 ## Executor Controls
 

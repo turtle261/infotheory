@@ -2787,7 +2787,7 @@ fn discounted_aiqi_exact_theorem_claims_remain_uncertified_by_family() {
 }
 
 #[test]
-fn warmstart_trace_merge_is_content_deduplicated_and_deterministically_ordered() {
+fn warmstart_trace_merge_is_content_deduplicated_and_structurally_ordered() {
     let mut teacher = WarmStartExactJhTeacherDataset::new(
         WarmStartExactJhTeacherContract {
             schema_version: 1,
@@ -2809,39 +2809,34 @@ fn warmstart_trace_merge_is_content_deduplicated_and_deterministically_ordered()
         },
         Vec::new(),
     );
-    let high_key_trace = WarmStartExactJhTeacherTrace {
+    let high_structural_trace = WarmStartExactJhTeacherTrace {
         transitions: vec![WarmStartExactJhTransition {
             action: 1_u64,
             observations: vec![2],
             reward: 3,
         }],
     };
-    let low_key_trace = WarmStartExactJhTeacherTrace {
+    let low_structural_trace = WarmStartExactJhTeacherTrace {
         transitions: vec![WarmStartExactJhTransition {
             action: 0_u64,
             observations: vec![1],
             reward: 1,
         }],
     };
-    teacher.traces.push(high_key_trace.clone());
+    teacher.traces.push(high_structural_trace.clone());
 
     assert!(
-        merge_warmstart_trace_deterministic(&mut teacher, low_key_trace.clone())
+        merge_warmstart_trace_deterministic(&mut teacher, low_structural_trace.clone())
             .expect("merge distinct trace")
     );
-    let ordered_keys = teacher
-        .traces
-        .iter()
-        .map(warmstart_trace_key)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("trace keys");
-    let mut sorted_keys = ordered_keys.clone();
-    sorted_keys.sort();
-    assert_eq!(ordered_keys, sorted_keys);
+    assert_eq!(
+        teacher.traces,
+        vec![low_structural_trace.clone(), high_structural_trace]
+    );
     assert_eq!(teacher.traces.len(), 2);
 
     assert!(
-        !merge_warmstart_trace_deterministic(&mut teacher, low_key_trace)
+        !merge_warmstart_trace_deterministic(&mut teacher, low_structural_trace)
             .expect("duplicate merge remains idempotent")
     );
     assert_eq!(teacher.traces.len(), 2);
