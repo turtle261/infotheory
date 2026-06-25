@@ -229,7 +229,30 @@ pub(crate) struct ReturnLawDistribution {
     pub stats: ReturnLawEvalStats,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HypotheticalRollback {
+    PerSymbol,
+    Scoped,
+}
+
 /// Predict and normalize the return-label distribution under `predictor`.
+///
+/// With `ReturnPrefixUpdate::Training`, predictors that advertise
+/// [`Predictor::supports_rollback_scope`] are descended through scoped branch
+/// rollbacks instead of per-symbol journals; otherwise per-symbol `revert` is
+/// used. Both keep identical exact trie semantics.
+///
+/// Cost model: this is a depth-first descent that mutates and rolls back the
+/// predictor once per reached trie edge, i.e. `hypothetical_advances` undo
+/// operations total. The scoped path opens exactly one rollback scope per edge,
+/// so for a backend whose `begin_rollback_scope` simply takes a full-state
+/// checkpoint (as `RateBackendBitPredictor` does today) it performs the *same*
+/// number of state checkpoints as the per-symbol path: it is cost-neutral, not
+/// a speedup. The scoped path only wins for backends that can open and unwind a
+/// scope more cheaply than per-symbol journaling (e.g. copy-on-write or
+/// marker-based session state). It is never a regression versus per-symbol, and
+/// it routes through the predictor's intended simulation API so such backends
+/// benefit automatically.
 pub(crate) fn predict_return_law(
     predictor: &mut dyn Predictor,
     codec: ReturnLabelCodec,
@@ -249,16 +272,25 @@ pub(crate) fn predict_return_law(
 
     let mut masses = vec![0.0; codec.bins()];
     let mut stats = ReturnLawEvalStats::default();
+    let rollback = hypothetical_rollback(predictor, prefix_update);
     match evaluator {
         #[cfg(test)]
         ReturnLawEvaluator::LeafByLeaf => {
-            predict_leaf_by_leaf(predictor, codec, prefix_update, &mut masses, &mut stats);
+            predict_leaf_by_leaf(
+                predictor,
+                codec,
+                prefix_update,
+                rollback,
+                &mut masses,
+                &mut stats,
+            );
         }
         ReturnLawEvaluator::SharedPrefix => {
             predict_shared_prefix(
                 predictor,
                 codec,
                 prefix_update,
+                rollback,
                 0,
                 0,
                 1.0,
@@ -272,6 +304,20 @@ pub(crate) fn predict_return_law(
         probabilities: masses,
         used_uniform_fallback,
         stats,
+    }
+}
+
+fn hypothetical_rollback(
+    predictor: &dyn Predictor,
+    prefix_update: ReturnPrefixUpdate,
+) -> HypotheticalRollback {
+    match prefix_update {
+        ReturnPrefixUpdate::Training if predictor.supports_rollback_scope() => {
+            HypotheticalRollback::Scoped
+        }
+        ReturnPrefixUpdate::Training => HypotheticalRollback::PerSymbol,
+        #[cfg(test)]
+        ReturnPrefixUpdate::FrozenHistory => HypotheticalRollback::PerSymbol,
     }
 }
 
@@ -303,6 +349,7 @@ fn predict_leaf_by_leaf(
     predictor: &mut dyn Predictor,
     codec: ReturnLabelCodec,
     prefix_update: ReturnPrefixUpdate,
+    rollback: HypotheticalRollback,
     masses: &mut [f64],
     stats: &mut ReturnLawEvalStats,
 ) {
@@ -315,10 +362,10 @@ fn predict_leaf_by_leaf(
                 .clamp(PROBABILITY_FLOOR, 1.0 - PROBABILITY_FLOOR);
             stats.logical_queries = stats.logical_queries.saturating_add(1);
             mass *= q;
-            apply_hypothetical_bit(predictor, bit, prefix_update, stats);
+            apply_hypothetical_bit(predictor, bit, prefix_update, rollback, stats);
         }
         for _ in 0..codec.bits() {
-            revert_hypothetical_bit(predictor, prefix_update, stats);
+            revert_hypothetical_bit(predictor, prefix_update, rollback, stats);
         }
         stats.valid_leaves = stats.valid_leaves.saturating_add(1);
         *slot = mass;
@@ -330,6 +377,7 @@ fn predict_shared_prefix(
     predictor: &mut dyn Predictor,
     codec: ReturnLabelCodec,
     prefix_update: ReturnPrefixUpdate,
+    rollback: HypotheticalRollback,
     depth: usize,
     partial_value: u64,
     prefix_mass: f64,
@@ -356,18 +404,19 @@ fn predict_shared_prefix(
         (true, prefix_mass * p_one),
     ] {
         let child_value = codec.append_to_partial_value(partial_value, depth, bit);
-        apply_hypothetical_bit(predictor, bit, prefix_update, stats);
+        apply_hypothetical_bit(predictor, bit, prefix_update, rollback, stats);
         predict_shared_prefix(
             predictor,
             codec,
             prefix_update,
+            rollback,
             depth + 1,
             child_value,
             child_mass,
             masses,
             stats,
         );
-        revert_hypothetical_bit(predictor, prefix_update, stats);
+        revert_hypothetical_bit(predictor, prefix_update, rollback, stats);
     }
 }
 
@@ -375,8 +424,12 @@ fn apply_hypothetical_bit(
     predictor: &mut dyn Predictor,
     bit: bool,
     prefix_update: ReturnPrefixUpdate,
+    rollback: HypotheticalRollback,
     stats: &mut ReturnLawEvalStats,
 ) {
+    if rollback == HypotheticalRollback::Scoped {
+        predictor.begin_rollback_scope();
+    }
     match prefix_update {
         ReturnPrefixUpdate::Training => predictor.update(bit),
         #[cfg(test)]
@@ -388,12 +441,21 @@ fn apply_hypothetical_bit(
 fn revert_hypothetical_bit(
     predictor: &mut dyn Predictor,
     prefix_update: ReturnPrefixUpdate,
+    rollback: HypotheticalRollback,
     stats: &mut ReturnLawEvalStats,
 ) {
-    match prefix_update {
-        ReturnPrefixUpdate::Training => predictor.revert(),
-        #[cfg(test)]
-        ReturnPrefixUpdate::FrozenHistory => predictor.pop_history(),
+    match rollback {
+        HypotheticalRollback::Scoped => {
+            assert!(
+                predictor.rollback_scope(),
+                "predictor advertised rollback-scope support but no scope was active"
+            );
+        }
+        HypotheticalRollback::PerSymbol => match prefix_update {
+            ReturnPrefixUpdate::Training => predictor.revert(),
+            #[cfg(test)]
+            ReturnPrefixUpdate::FrozenHistory => predictor.pop_history(),
+        },
     }
     stats.rollbacks = stats.rollbacks.saturating_add(1);
 }
@@ -450,6 +512,58 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct ScopedCountingPredictor {
+        history: Vec<bool>,
+        scopes: Vec<Vec<bool>>,
+        begin_scope_calls: usize,
+        rollback_scope_calls: usize,
+        update_calls: usize,
+        revert_calls: usize,
+    }
+
+    impl Predictor for ScopedCountingPredictor {
+        fn update(&mut self, sym: bool) {
+            self.update_calls = self.update_calls.saturating_add(1);
+            self.history.push(sym);
+        }
+
+        fn revert(&mut self) {
+            self.revert_calls = self.revert_calls.saturating_add(1);
+            self.history.pop();
+        }
+
+        fn begin_rollback_scope(&mut self) {
+            self.begin_scope_calls = self.begin_scope_calls.saturating_add(1);
+            self.scopes.push(self.history.clone());
+        }
+
+        fn supports_rollback_scope(&self) -> bool {
+            true
+        }
+
+        fn rollback_scope(&mut self) -> bool {
+            self.rollback_scope_calls = self.rollback_scope_calls.saturating_add(1);
+            let Some(history) = self.scopes.pop() else {
+                return false;
+            };
+            self.history = history;
+            true
+        }
+
+        fn predict_prob(&mut self, _sym: bool) -> f64 {
+            0.5
+        }
+
+        fn model_name(&self) -> String {
+            "scoped-counting-test".to_string()
+        }
+
+        fn boxed_clone(&self) -> Box<dyn Predictor> {
+            Box::new(self.clone())
+        }
+    }
+
     #[test]
     fn value_monotone_prefixes_are_contiguous_for_power_of_two_labels() {
         let codec = ReturnLabelCodec::value_monotone(8);
@@ -497,5 +611,29 @@ mod tests {
         assert_eq!(leaf.stats.logical_queries, 24);
         assert_eq!(shared.stats.logical_queries, 7);
         assert_eq!(shared.stats.valid_leaves, 8);
+    }
+
+    #[test]
+    fn shared_prefix_uses_scoped_rollbacks_when_supported() {
+        let codec = ReturnLabelCodec::value_monotone(4);
+        let mut predictor = ScopedCountingPredictor::default();
+        let law = predict_return_law(
+            &mut predictor,
+            codec,
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+        );
+
+        assert_eq!(law.probabilities, vec![0.25; 4]);
+        assert_eq!(law.stats.logical_queries, 3);
+        assert_eq!(law.stats.hypothetical_advances, 6);
+        assert_eq!(law.stats.rollbacks, 6);
+        assert_eq!(law.stats.valid_leaves, 4);
+        assert_eq!(predictor.update_calls, 6);
+        assert_eq!(predictor.revert_calls, 0);
+        assert_eq!(predictor.begin_scope_calls, 6);
+        assert_eq!(predictor.rollback_scope_calls, 6);
+        assert!(predictor.history.is_empty());
+        assert!(predictor.scopes.is_empty());
     }
 }

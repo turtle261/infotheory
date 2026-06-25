@@ -1706,6 +1706,13 @@ impl WarmStartExactJhAgent {
     ///
     /// The trace is admissible under the same runtime validator used for
     /// teacher datasets because it was produced through `observe_transition`.
+    ///
+    /// Cost: despite the `&self` receiver this is a full materialization, not a
+    /// cheap accessor. It allocates a fresh transition vector and clones every
+    /// stored observation stream, so a call is `O(steps * observation_stream_len)`
+    /// in both time and allocated memory. It is intended for occasional
+    /// refresh/export points; callers in a hot loop should cache the result
+    /// rather than re-deriving it per step.
     pub fn same_task_live_trace(&self) -> Option<WarmStartExactJhTeacherTrace> {
         if self.steps.len() < self.config.return_horizon {
             return None;
