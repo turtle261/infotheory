@@ -245,6 +245,18 @@ fn run_tuner_eval_worker_mode() {
     std::process::exit(1);
 }
 
+fn run_warmstart_mode(args: &[String]) {
+    match crate::cli::warmstart::parse_warmstart_command(args)
+        .and_then(crate::cli::warmstart::run_warmstart_command)
+    {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!("Error: warmstart failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(feature = "backend-rosa")]
 fn search_command(args: &[String]) {
     if args.len() < 4 {
@@ -833,6 +845,10 @@ fn main() {
         run_ctw_profile_mode(&args);
         return;
     }
+    if primitive == "warmstart" {
+        run_warmstart_mode(&args);
+        return;
+    }
 
     // Common positional and flag parsing.
     // Collect positionals only up to the first flag token, then parse flags separately.
@@ -841,7 +857,7 @@ fn main() {
     let mut pos_arg3: Option<String> = None;
     let mut flags_start = 2usize;
 
-    if primitive != "search" && primitive != "aixi" && primitive != "warmstart" {
+    if primitive != "search" && primitive != "aixi" {
         let mut positionals: Vec<String> = Vec::new();
         let mut i = 2usize;
         while i < args.len() {
@@ -1219,15 +1235,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        "warmstart" => match crate::cli::warmstart::parse_warmstart_command(&args)
-            .and_then(crate::cli::warmstart::run_warmstart_command)
-        {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("Error: warmstart failed: {e}");
-                std::process::exit(1);
-            }
-        },
         "search" => search_command(&args),
         "compress" => {
             let in_path = file1.unwrap_or_exit("Error: 'compress' requires <input> <output>");
