@@ -1,13 +1,27 @@
-#[allow(unused_imports)]
+#[cfg(any(feature = "backend-ctw", feature = "backend-zpaq"))]
 use infotheory::api::BitOrder;
-use infotheory::api::{
-    BitStreamSemantics, MixtureExpertSpec, MixtureKind, MixtureSpec, OnlineBitPredictor,
-    ParticleSpec, RateBackend, RateBackendBitSession, RateBackendSession,
-};
+#[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
+use infotheory::api::MixtureExpertSpec;
+#[cfg(any(feature = "backend-ctw", feature = "backend-zpaq"))]
+use infotheory::api::OnlineBitPredictor;
+#[cfg(feature = "backend-particle")]
+use infotheory::api::ParticleSpec;
+#[cfg(any(
+    feature = "backend-ctw",
+    feature = "backend-zpaq",
+    feature = "backend-match"
+))]
+use infotheory::api::{BitStreamSemantics, RateBackendBitSession};
 #[cfg(feature = "backend-calibrated")]
 use infotheory::api::{CalibratedSpec, CalibrationContextKind};
 #[cfg(feature = "backend-zpaq")]
 use infotheory::api::{CompressionBackend, try_compress_bytes_backend};
+use infotheory::api::{MixtureKind, MixtureSpec, RateBackend, RateBackendSession};
+#[cfg(any(
+    feature = "backend-ctw",
+    feature = "backend-particle",
+    all(feature = "backend-mixture", feature = "backend-ctw")
+))]
 use infotheory::spec::CanonicalJson;
 use std::sync::Arc;
 
@@ -28,12 +42,18 @@ fn api_surface_rate_backend_session_rejects_invalid_programmatic_mixture() {
     }
 }
 
+#[cfg(feature = "backend-ctw")]
 #[test]
-fn api_surface_spec_types_serialize_canonically() {
+fn api_surface_rate_backend_serializes_canonically() {
     let backend = RateBackend::Ctw { depth: 9 };
     let backend_json = backend.to_canonical_json().expect("backend json");
     assert!(backend_json.contains("\"kind\": \"ctw\""));
+}
 
+#[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
+#[test]
+fn api_surface_mixture_spec_serializes_canonically() {
+    let backend = RateBackend::Ctw { depth: 9 };
     let mixture = MixtureSpec::new(
         MixtureKind::Bayes,
         vec![{
@@ -44,7 +64,11 @@ fn api_surface_spec_types_serialize_canonically() {
     );
     let mix_json = mixture.to_canonical_json().expect("mixture json");
     assert!(mix_json.contains("\"kind\": \"bayes\""));
+}
 
+#[cfg(feature = "backend-particle")]
+#[test]
+fn api_surface_particle_spec_serializes_canonically() {
     let particle_json = ParticleSpec::default().to_canonical_json();
     assert!(
         particle_json

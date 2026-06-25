@@ -1,10 +1,12 @@
 //! JSON parsing for canonical top-level specification documents.
 
+#[cfg(feature = "aixi")]
+use super::WarmStartExactJhControllerSpec;
 use super::{
     AiqiDiscountedControllerSpec, AssetBinding, ControllerSpec, EnvironmentSpec,
     McAixiControllerSpec, PlannerInterfaceSpec, PlannerRunSpec, PlannerRuntimeSpec,
     SPEC_DOCUMENT_SCHEMA_VERSION, SpecDocument, SpecError, SpecResult,
-    WarmStartExactJhControllerSpec, parse_compression_backend_json, parse_rate_backend_json,
+    parse_compression_backend_json, parse_rate_backend_json,
 };
 #[cfg(feature = "tuner")]
 use super::{
@@ -573,6 +575,7 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                 )?,
             },
         )),
+        #[cfg(feature = "aixi")]
         "aiqi_warmstart_exact_jh" => Ok(ControllerSpec::AiqiWarmstartExactJh(
             WarmStartExactJhControllerSpec {
                 predictor: parse_rate_backend_json(
@@ -602,6 +605,10 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     "controller.planner_simulations_per_step",
                 )?,
             },
+        )),
+        #[cfg(not(feature = "aixi"))]
+        "aiqi_warmstart_exact_jh" => Err(SpecError::new(
+            "aiqi_warmstart_exact_jh controller requires infotheory built with feature 'aixi'",
         )),
         other => Err(SpecError::new(format!("unknown controller kind '{other}'"))),
     }
@@ -854,6 +861,7 @@ fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneContr
                 },
             ))
         }
+        #[cfg(feature = "aixi")]
         "aiqi_warmstart_exact_jh" => {
             ensure_known_fields(
                 value,
@@ -889,6 +897,10 @@ fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneContr
                 },
             ))
         }
+        #[cfg(not(feature = "aixi"))]
+        "aiqi_warmstart_exact_jh" => Err(SpecError::new(
+            "aiqi_warmstart_exact_jh controller requires infotheory built with feature 'aixi'",
+        )),
         other => Err(SpecError::new(format!(
             "unknown tune controller kind '{other}'"
         ))),
@@ -1441,19 +1453,22 @@ mod tests {
         .expect("aiqi_discounted controller should parse");
         assert!(matches!(discounted, TuneControllerSpec::AiqiDiscounted(_)));
 
-        let warmstart = parse_tune_controller_spec(&serde_json::json!({
-            "kind": "aiqi_warmstart_exact_jh",
-            "interface": interface,
-            "planner_simulations_per_step": 1,
-            "return_horizon": 3,
-            "warmstart_teacher_dataset_asset": "teacher",
-            "label_phase_period": 2,
-        }))
-        .expect("aiqi_warmstart_exact_jh controller should parse");
-        assert!(matches!(
-            warmstart,
-            TuneControllerSpec::AiqiWarmstartExactJh(_)
-        ));
+        #[cfg(feature = "aixi")]
+        {
+            let warmstart = parse_tune_controller_spec(&serde_json::json!({
+                "kind": "aiqi_warmstart_exact_jh",
+                "interface": interface,
+                "planner_simulations_per_step": 1,
+                "return_horizon": 3,
+                "warmstart_teacher_dataset_asset": "teacher",
+                "label_phase_period": 2,
+            }))
+            .expect("aiqi_warmstart_exact_jh controller should parse");
+            assert!(matches!(
+                warmstart,
+                TuneControllerSpec::AiqiWarmstartExactJh(_)
+            ));
+        }
 
         let err = parse_tune_controller_spec(&serde_json::json!({
             "kind": "definitely_unknown_tune_controller"

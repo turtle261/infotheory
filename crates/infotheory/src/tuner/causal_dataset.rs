@@ -553,7 +553,7 @@ fn causal_header_profile_hash(
                 .collect::<Vec<_>>(),
         }
     });
-    let bytes = serde_json::to_vec(&value)
+    let bytes = canonical_json_bytes(&value)
         .map_err(|err| format!("failed to encode causal header profile hash: {err}"))?;
     Ok(crc32_hex(&bytes))
 }
@@ -658,7 +658,7 @@ fn lowered_dataset_from_events(
     events: Vec<LoweredCausalEvent>,
     target_size_function: &'static str,
 ) -> Result<LoadedDataset, String> {
-    let canonical_bytes = serde_json::to_vec(source_value)
+    let canonical_bytes = canonical_json_bytes(source_value)
         .map_err(|err| format!("failed to canonicalize causal dataset JSON: {err}"))?;
     let canonical_content_hash = crc32_hex(&canonical_bytes);
     let normalized_events = expand_byte_alphabet_events(events, &domain_supports)?;
@@ -872,7 +872,7 @@ fn lowered_event_skeleton_bytes(events: &[LoweredCausalEvent]) -> Result<Vec<u8>
             }),
         })
         .collect::<Vec<_>>();
-    serde_json::to_vec(&skeleton)
+    canonical_json_bytes(&serde_json::Value::Array(skeleton))
         .map_err(|err| format!("failed to serialize lowered event skeleton: {err}"))
 }
 
@@ -895,7 +895,7 @@ fn causal_domain_support_bytes(
             }),
         })
         .collect::<Vec<_>>();
-    serde_json::to_vec(&value)
+    canonical_json_bytes(&serde_json::Value::Array(value))
         .map_err(|err| format!("failed to serialize causal target-domain supports: {err}"))
 }
 

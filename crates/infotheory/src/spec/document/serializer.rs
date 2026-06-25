@@ -164,6 +164,7 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
             "history_prune_keep_steps": inner.history_prune_keep_steps,
             "baseline_exploration": inner.baseline_exploration,
         })),
+        #[cfg(feature = "aixi")]
         ControllerSpec::AiqiWarmstartExactJh(inner) => Ok(serde_json::json!({
             "kind": "aiqi_warmstart_exact_jh",
             "predictor": rate_backend_to_json_value(&inner.predictor)?,
@@ -259,6 +260,7 @@ fn tune_controller_to_json_value(spec: &TuneControllerSpec) -> serde_json::Value
             "min_improvement": inner.min_improvement,
             "max_improvement": inner.max_improvement,
         }),
+        #[cfg(feature = "aixi")]
         TuneControllerSpec::AiqiWarmstartExactJh(inner) => serde_json::json!({
             "kind": "aiqi_warmstart_exact_jh",
             "interface": tune_interface_spec_to_json_value(&inner.interface),

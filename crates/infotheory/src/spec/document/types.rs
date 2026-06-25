@@ -391,6 +391,7 @@ pub struct AiqiDiscountedControllerSpec {
 }
 
 /// Warm-start exact-\u{1d4a5}_H controller configuration.
+#[cfg(feature = "aixi")]
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct WarmStartExactJhControllerSpec {
@@ -426,6 +427,7 @@ pub enum ControllerSpec {
     /// Discounted AIQI.
     AiqiDiscounted(AiqiDiscountedControllerSpec),
     /// Warm-start exact-\u{1d4a5}_H AIQI-style controller.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh(WarmStartExactJhControllerSpec),
 }
 
@@ -483,6 +485,7 @@ pub enum TuneControllerKind {
     /// Discounted AIQI.
     AiqiDiscounted,
     /// Warm-start exact-\u{1d4a5}_H controller.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh,
 }
 
@@ -559,6 +562,7 @@ pub enum TuneControllerSpec {
     /// Discounted AIQI.
     AiqiDiscounted(AiqiDiscountedTuneControllerSpec),
     /// Warm-start exact-J_H.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec),
 }
 
@@ -570,6 +574,7 @@ impl TuneControllerSpec {
             Self::AnnealedHillClimbing(_) => TuneControllerKind::AnnealedHillClimbing,
             Self::McAixiFacCtw(_) => TuneControllerKind::McAixiFacCtw,
             Self::AiqiDiscounted(_) => TuneControllerKind::AiqiDiscounted,
+            #[cfg(feature = "aixi")]
             Self::AiqiWarmstartExactJh(_) => TuneControllerKind::AiqiWarmstartExactJh,
         }
     }
@@ -618,15 +623,18 @@ mod tests {
         });
         assert_eq!(aiqi.kind(), TuneControllerKind::AiqiDiscounted);
 
-        let warmstart =
-            TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
-                interface: sample_tune_interface(),
-                planner_simulations_per_step: 1,
-                return_horizon: 2,
-                warmstart_teacher_dataset_asset: "teacher".to_string(),
-                label_phase_period: 3,
-            });
-        assert_eq!(warmstart.kind(), TuneControllerKind::AiqiWarmstartExactJh);
+        #[cfg(feature = "aixi")]
+        {
+            let warmstart =
+                TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
+                    interface: sample_tune_interface(),
+                    planner_simulations_per_step: 1,
+                    return_horizon: 2,
+                    warmstart_teacher_dataset_asset: "teacher".to_string(),
+                    label_phase_period: 3,
+                });
+            assert_eq!(warmstart.kind(), TuneControllerKind::AiqiWarmstartExactJh);
+        }
     }
 }
 
@@ -740,6 +748,7 @@ pub enum CompiledPlannerController {
         baseline_exploration: f64,
     },
     /// Warm-start exact-J_H controller.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
@@ -783,6 +792,7 @@ pub enum CompiledTuneController {
     /// Discounted AIQI.
     AiqiDiscounted(AiqiDiscountedTuneControllerSpec),
     /// Warm-start exact-J_H.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec),
 }
 

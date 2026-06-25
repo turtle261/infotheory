@@ -10,6 +10,8 @@ pub use self::core::{
 };
 #[cfg(feature = "tuner")]
 pub(crate) use self::document::TuneInvalidReason;
+#[cfg(feature = "aixi")]
+pub use self::document::WarmStartExactJhControllerSpec;
 pub use self::document::{
     AiqiDiscountedControllerSpec, AssetBinding, AssetId, BuiltinEnvironmentSpec,
     CompiledPlannerController, CompiledPlannerRunSpec, CompiledSpecDocument, ControllerSpec,
@@ -18,7 +20,7 @@ pub use self::document::{
     ValidatedPlannerRunSpec, ValidatedSpecDocument, VmActionFilterSpec, VmEnvironmentSpec,
     VmFuzzMutatorSpec, VmObservationPolicySpec, VmObservationStreamModeSpec, VmPayloadEncodingSpec,
     VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec,
-    WarmStartExactJhControllerSpec, load_spec_document,
+    load_spec_document,
 };
 #[cfg(feature = "tuner")]
 pub use self::document::{
@@ -47,6 +49,7 @@ pub type SpecResult<T> = Result<T, SpecError>;
 /// This is the crate-local byte contract for CRC/SHA commitments over ad-hoc
 /// JSON payloads. It deliberately avoids relying on `serde_json::Map`'s backing
 /// type or feature-unified insertion-order behavior.
+#[cfg(feature = "aixi")]
 pub(crate) fn canonical_json_bytes(
     value: &serde_json::Value,
 ) -> Result<Vec<u8>, serde_json::Error> {
@@ -55,6 +58,7 @@ pub(crate) fn canonical_json_bytes(
     Ok(bytes)
 }
 
+#[cfg(feature = "aixi")]
 fn write_canonical_json_value(
     value: &serde_json::Value,
     out: &mut Vec<u8>,
@@ -2029,6 +2033,7 @@ mod tests {
         crate::runtime::default_rate_backend_spec(kind)
     }
 
+    #[cfg(feature = "aixi")]
     #[test]
     fn canonical_json_bytes_sort_object_keys_recursively_and_preserve_array_order() {
         let value = serde_json::json!({

@@ -1072,6 +1072,7 @@ fn encode_controller_spec(spec: &ControllerSpec, out: &mut Vec<u8>) {
             push_option_u64(out, inner.history_prune_keep_steps.map(|n| n as u64));
             push_f64(out, inner.baseline_exploration);
         }
+        #[cfg(feature = "aixi")]
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             out.push(2);
             encode_rate_backend(out, &inner.predictor);
@@ -1108,6 +1109,7 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
                 baseline_exploration: cursor.read_f64()?,
             },
         )),
+        #[cfg(feature = "aixi")]
         2 => Ok(ControllerSpec::AiqiWarmstartExactJh(
             WarmStartExactJhControllerSpec {
                 predictor: decode_rate_backend(cursor, base_dir)?,
@@ -1118,6 +1120,10 @@ fn decode_controller_spec(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResul
                 teacher_dataset_asset: cursor.read_string()?,
                 planner_simulations_per_step: cursor.read_u64()? as usize,
             },
+        )),
+        #[cfg(not(feature = "aixi"))]
+        2 => Err(SpecError::new(
+            "binary controller tag 2 (aiqi_warmstart_exact_jh) requires the 'aixi' feature",
         )),
         tag => Err(SpecError::new(format!("unknown controller tag '{tag}'"))),
     }
@@ -1305,6 +1311,7 @@ fn encode_tune_controller(spec: &TuneControllerSpec, out: &mut Vec<u8>) {
             push_f64(out, inner.min_improvement);
             push_f64(out, inner.max_improvement);
         }
+        #[cfg(feature = "aixi")]
         TuneControllerSpec::AiqiWarmstartExactJh(inner) => {
             out.push(tune_controller_kind_tag(
                 TuneControllerKind::AiqiWarmstartExactJh,
@@ -1343,6 +1350,7 @@ fn decode_tune_controller(cursor: &mut Cursor<'_>) -> SpecResult<TuneControllerS
                 max_improvement: cursor.read_f64()?,
             },
         )),
+        #[cfg(feature = "aixi")]
         TuneControllerKind::AiqiWarmstartExactJh => Ok(TuneControllerSpec::AiqiWarmstartExactJh(
             WarmStartExactJhTuneControllerSpec {
                 interface: decode_tune_interface_spec(cursor)?,
@@ -1882,6 +1890,7 @@ fn tune_controller_kind_tag(kind: TuneControllerKind) -> u8 {
         TuneControllerKind::AnnealedHillClimbing => 0,
         TuneControllerKind::McAixiFacCtw => 1,
         TuneControllerKind::AiqiDiscounted => 2,
+        #[cfg(feature = "aixi")]
         TuneControllerKind::AiqiWarmstartExactJh => 3,
     }
 }
@@ -1892,7 +1901,12 @@ fn decode_tune_controller_kind(tag: u8) -> SpecResult<TuneControllerKind> {
         0 => Ok(TuneControllerKind::AnnealedHillClimbing),
         1 => Ok(TuneControllerKind::McAixiFacCtw),
         2 => Ok(TuneControllerKind::AiqiDiscounted),
+        #[cfg(feature = "aixi")]
         3 => Ok(TuneControllerKind::AiqiWarmstartExactJh),
+        #[cfg(not(feature = "aixi"))]
+        3 => Err(SpecError::new(
+            "binary tune controller tag 3 (aiqi_warmstart_exact_jh) requires the 'aixi' feature",
+        )),
         _ => Err(SpecError::new(format!(
             "unknown tune controller tag '{tag}'"
         ))),

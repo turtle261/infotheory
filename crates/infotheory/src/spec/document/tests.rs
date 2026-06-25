@@ -447,7 +447,7 @@ fn mc_aixi_parallel_uct_json_roundtrip_preserves_strategy() {
     );
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
 fn sample_warmstart_exact_jh_planner_run() -> PlannerRunSpec {
     PlannerRunSpec {
         assets: vec![AssetBinding {
@@ -487,7 +487,7 @@ fn sample_warmstart_exact_jh_planner_run() -> PlannerRunSpec {
     }
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
 #[test]
 fn warmstart_exact_jh_json_binary_and_compile_roundtrip() {
     let spec = sample_warmstart_exact_jh_planner_run();
@@ -517,7 +517,7 @@ fn warmstart_exact_jh_json_binary_and_compile_roundtrip() {
     assert_eq!(compiled.controller().kind_str(), "aiqi_warmstart_exact_jh");
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
 #[test]
 fn warmstart_exact_jh_parser_rejects_zero_return_horizon_and_bins() {
     for (field, message) in [
@@ -541,7 +541,7 @@ fn warmstart_exact_jh_parser_rejects_zero_return_horizon_and_bins() {
     }
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
 #[test]
 fn warmstart_exact_jh_rejects_non_direct_planner_simulations() {
     let mut spec = sample_warmstart_exact_jh_planner_run();
@@ -560,7 +560,7 @@ fn warmstart_exact_jh_rejects_non_direct_planner_simulations() {
     );
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
 #[test]
 fn warmstart_exact_jh_rejects_slack_return_bins() {
     let mut spec = sample_warmstart_exact_jh_planner_run();
@@ -579,7 +579,7 @@ fn warmstart_exact_jh_rejects_slack_return_bins() {
     );
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
 #[test]
 fn warmstart_exact_jh_rejects_narrow_reward_bits() {
     let mut spec = sample_warmstart_exact_jh_planner_run();
@@ -591,7 +591,7 @@ fn warmstart_exact_jh_rejects_narrow_reward_bits() {
     assert!(err.to_string().contains("max_reward=2"), "{err}");
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
 #[test]
 fn warmstart_exact_jh_rejects_missing_teacher_asset() {
     let mut spec = sample_warmstart_exact_jh_planner_run();
@@ -1875,6 +1875,61 @@ fn tune_compile_model_bytes_ignore_outer_request_controls() {
     assert_eq!(
         compiled_a.baseline_candidate_model_bytes(),
         compiled_b.baseline_candidate_model_bytes()
+    );
+}
+
+#[cfg(all(feature = "backend-ctw", not(feature = "aixi")))]
+#[test]
+fn planner_run_rejects_warmstart_controller_without_aixi_feature() {
+    let json = serde_json::json!({
+        "schema_version": SPEC_DOCUMENT_SCHEMA_VERSION,
+        "kind": "planner_run",
+        "assets": [{
+            "id": "teacher",
+            "path": "teacher.json",
+        }],
+        "environment": {
+            "kind": "builtin",
+            "name": "coin_flip",
+        },
+        "interface": {
+            "observation_bits": 2,
+            "observation_stream_len": 1,
+            "observation_key_mode": "full_stream",
+            "reward_bits": 2,
+            "agent_actions": 2,
+        },
+        "controller": {
+            "kind": "aiqi_warmstart_exact_jh",
+            "predictor": { "kind": "ctw", "depth": 8 },
+            "bit_stream_semantics": { "kind": "binary_tokens" },
+            "return_horizon": 2,
+            "return_bins": 5,
+            "label_phase_period": 2,
+            "teacher_dataset_asset": "teacher",
+            "planner_simulations_per_step": 1,
+        },
+        "runtime": {
+            "random_seed": 11,
+            "learn_cycles": 4,
+            "eval_cycles": 2,
+            "terminate_lifetime": 6,
+            "log_every": 1,
+            "perf": false,
+            "vm_perf_only": false,
+            "explore_epsilon": 0.0,
+            "explore_gamma": 1.0,
+        },
+    });
+    let err = match SpecDocument::parse_json_value(&json, Path::new(".")) {
+        Ok(_) => panic!("warmstart controller must require aixi feature"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains(
+            "aiqi_warmstart_exact_jh controller requires infotheory built with feature 'aixi'"
+        ),
+        "{err}"
     );
 }
 

@@ -381,6 +381,7 @@ impl CompiledPlannerController {
         match self {
             Self::McAixi { predictor, .. } => predictor,
             Self::AiqiDiscounted { predictor, .. } => predictor,
+            #[cfg(feature = "aixi")]
             Self::AiqiWarmstartExactJh { predictor, .. } => predictor,
         }
     }
@@ -390,6 +391,7 @@ impl CompiledPlannerController {
         match self {
             Self::McAixi { .. } => "mc_aixi",
             Self::AiqiDiscounted { .. } => "aiqi_discounted",
+            #[cfg(feature = "aixi")]
             Self::AiqiWarmstartExactJh { .. } => "aiqi_warmstart_exact_jh",
         }
     }

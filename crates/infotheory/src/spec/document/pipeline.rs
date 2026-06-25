@@ -10,10 +10,12 @@ use super::{
     CompiledTuneController, CompiledTuneSpec, TUNE_CANONICALIZATION_CLASSIFICATION_VERSION,
     TuneBoundsSpec, TuneControllerSpec, TunePlannerInterfaceSpec, TuneSpec, ValidatedTuneSpec,
 };
+#[cfg(feature = "aixi")]
+use crate::aixi::common::validate_reward_encoding_bounds;
 use crate::aixi::common::{
     MctsStrategy, bits_for_cardinality, byte_packed_percept_bits, resolve_random_seed,
     validate_aiqi_byte_packed_alignment, validate_mc_aixi_byte_packed_alignment,
-    validate_reward_encoding_bounds, warn_parallel_uct_workers_one_once,
+    warn_parallel_uct_workers_one_once,
 };
 use crate::spec::core::AssetRef;
 use std::collections::HashMap;
@@ -61,6 +63,7 @@ fn compile_planner_controller(
             history_prune_keep_steps: inner.history_prune_keep_steps,
             baseline_exploration: inner.baseline_exploration,
         }),
+        #[cfg(feature = "aixi")]
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             Ok(CompiledPlannerController::AiqiWarmstartExactJh {
                 predictor: inner.predictor.validate_in(env)?.compile()?,
@@ -98,6 +101,7 @@ fn validate_mc_aixi_mcts_strategy(strategy: MctsStrategy) -> SpecResult<()> {
     }
 }
 
+#[cfg(feature = "aixi")]
 fn validate_warmstart_direct_evaluator_marker(
     planner_simulations_per_step: usize,
 ) -> SpecResult<()> {
@@ -109,11 +113,12 @@ fn validate_warmstart_direct_evaluator_marker(
     Ok(())
 }
 
+#[cfg(feature = "aixi")]
 fn validate_warmstart_exact_return_bins(
     return_horizon: usize,
     return_bins: usize,
 ) -> SpecResult<()> {
-    if (return_bins - 1) % return_horizon != 0 {
+    if !(return_bins - 1).is_multiple_of(return_horizon) {
         return Err(SpecError::new(
             "return_bins must be exactly H * max_reward + 1 for warm-start exact-J_H",
         ));
@@ -121,6 +126,7 @@ fn validate_warmstart_exact_return_bins(
     Ok(())
 }
 
+#[cfg(feature = "aixi")]
 fn validate_warmstart_exact_reward_channel(
     return_horizon: usize,
     return_bins: usize,
@@ -152,6 +158,7 @@ fn compile_tune_controller(spec: &TuneControllerSpec) -> CompiledTuneController 
         TuneControllerSpec::AiqiDiscounted(inner) => {
             CompiledTuneController::AiqiDiscounted(inner.clone())
         }
+        #[cfg(feature = "aixi")]
         TuneControllerSpec::AiqiWarmstartExactJh(inner) => {
             CompiledTuneController::AiqiWarmstartExactJh(inner.clone())
         }
@@ -272,7 +279,7 @@ pub(super) fn canonicalize_tune_spec(
 fn canonicalize_tune_controller(
     controller: &TuneControllerSpec,
     assets: &[AssetBinding],
-    env: &SpecEnvironment,
+    _env: &SpecEnvironment,
 ) -> SpecResult<TuneControllerSpec> {
     match controller {
         TuneControllerSpec::AnnealedHillClimbing(inner) => {
@@ -315,6 +322,7 @@ fn canonicalize_tune_controller(
             }
             Ok(TuneControllerSpec::AiqiDiscounted(inner.clone()))
         }
+        #[cfg(feature = "aixi")]
         TuneControllerSpec::AiqiWarmstartExactJh(inner) => {
             canonicalize_tune_interface_spec(&inner.interface)?;
             if inner.planner_simulations_per_step == 0 {
@@ -330,7 +338,6 @@ fn canonicalize_tune_controller(
                 ));
             }
             ensure_asset_exists(assets, &inner.warmstart_teacher_dataset_asset)?;
-            let _ = env;
             Ok(TuneControllerSpec::AiqiWarmstartExactJh(inner.clone()))
         }
     }
@@ -381,6 +388,7 @@ fn validate_asset_bindings(bindings: &[AssetBinding]) -> SpecResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "aixi")]
 fn ensure_asset_exists(bindings: &[AssetBinding], id: &str) -> SpecResult<()> {
     if bindings.iter().any(|binding| binding.id == id) {
         Ok(())
@@ -401,7 +409,7 @@ fn canonicalize_interface_spec(spec: &PlannerInterfaceSpec) -> SpecResult<Planne
 
 fn canonicalize_controller_spec(
     spec: &ControllerSpec,
-    assets: &[AssetBinding],
+    #[cfg_attr(not(feature = "aixi"), allow(unused_variables))] assets: &[AssetBinding],
     env: &SpecEnvironment,
     interface: Option<&PlannerInterfaceSpec>,
 ) -> SpecResult<ControllerSpec> {
@@ -507,6 +515,7 @@ fn canonicalize_controller_spec(
                 },
             ))
         }
+        #[cfg(feature = "aixi")]
         ControllerSpec::AiqiWarmstartExactJh(inner) => {
             if inner.planner_simulations_per_step == 0 {
                 return Err(SpecError::new("planner_simulations_per_step must be >= 1"));
@@ -898,16 +907,19 @@ mod tests {
                 .contains("asset 'dataset' is bound to more than one path")
         );
 
-        ensure_asset_exists(
-            &[AssetBinding {
-                id: "dataset".to_string(),
-                path: "one.bin".to_string(),
-            }],
-            "dataset",
-        )
-        .expect("known asset id");
-        let err = ensure_asset_exists(&[], "missing").expect_err("missing asset must fail");
-        assert!(err.to_string().contains("unknown asset id 'missing'"));
+        #[cfg(feature = "aixi")]
+        {
+            ensure_asset_exists(
+                &[AssetBinding {
+                    id: "dataset".to_string(),
+                    path: "one.bin".to_string(),
+                }],
+                "dataset",
+            )
+            .expect("known asset id");
+            let err = ensure_asset_exists(&[], "missing").expect_err("missing asset must fail");
+            assert!(err.to_string().contains("unknown asset id 'missing'"));
+        }
     }
 
     #[test]
@@ -990,10 +1002,6 @@ mod tests {
     #[test]
     fn planner_controller_validation_covers_mc_aixi_and_aiqi_contracts() {
         let env = SpecEnvironment::default();
-        let warmstart_assets = vec![AssetBinding {
-            id: "teacher-ds".to_string(),
-            path: "teacher.json".to_string(),
-        }];
         let workers = NonZeroUsize::new(2).expect("non-zero workers");
 
         canonicalize_controller_spec(
@@ -1053,6 +1061,16 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("discount_gamma must be in (0, 1)"));
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "aixi"))]
+    #[test]
+    fn planner_controller_validation_covers_warmstart_contract() {
+        let env = SpecEnvironment::default();
+        let warmstart_assets = vec![AssetBinding {
+            id: "teacher-ds".to_string(),
+            path: "teacher.json".to_string(),
+        }];
 
         let warmstart = canonicalize_controller_spec(
             &ControllerSpec::AiqiWarmstartExactJh(super::super::WarmStartExactJhControllerSpec {
@@ -1302,42 +1320,6 @@ mod tests {
         .expect_err("infinite max_improvement must fail");
         assert!(err.to_string().contains("max_improvement must be finite"));
 
-        let err = canonicalize_tune_controller(
-            &TuneControllerSpec::AiqiWarmstartExactJh(
-                super::super::WarmStartExactJhTuneControllerSpec {
-                    interface: sample_tune_interface(),
-                    planner_simulations_per_step: 1,
-                    return_horizon: 2,
-                    warmstart_teacher_dataset_asset: "missing".to_string(),
-                    label_phase_period: 3,
-                },
-            ),
-            &assets,
-            &env,
-        )
-        .expect_err("missing teacher asset must fail");
-        assert!(err.to_string().contains("unknown asset id 'missing'"));
-
-        let err = canonicalize_tune_controller(
-            &TuneControllerSpec::AiqiWarmstartExactJh(
-                super::super::WarmStartExactJhTuneControllerSpec {
-                    interface: sample_tune_interface(),
-                    planner_simulations_per_step: 2,
-                    return_horizon: 2,
-                    warmstart_teacher_dataset_asset: "teacher".to_string(),
-                    label_phase_period: 3,
-                },
-            ),
-            &assets,
-            &env,
-        )
-        .expect_err("warmstart tune non-direct planner marker must fail");
-        assert!(
-            err.to_string()
-                .contains("planner_simulations_per_step must be exactly 1"),
-            "{err}"
-        );
-
         validate_tune_bounds(&TuneBoundsSpec {
             allowed_backends: vec!["ctw".to_string()],
             forbidden_backends: vec!["zpaq".to_string()],
@@ -1450,5 +1432,51 @@ mod tests {
         };
         let compiled = compile_tune_spec(&tune, Path::new(".")).expect("compile tune spec");
         assert_eq!(compiled.canonical_spec().output_config_path, "out.json");
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "tuner"))]
+    #[test]
+    fn tune_controller_validation_covers_warmstart_contract() {
+        let assets = vec![AssetBinding {
+            id: "teacher".to_string(),
+            path: "teacher.bin".to_string(),
+        }];
+        let env = SpecEnvironment::default();
+
+        let err = canonicalize_tune_controller(
+            &TuneControllerSpec::AiqiWarmstartExactJh(
+                super::super::WarmStartExactJhTuneControllerSpec {
+                    interface: sample_tune_interface(),
+                    planner_simulations_per_step: 1,
+                    return_horizon: 2,
+                    warmstart_teacher_dataset_asset: "missing".to_string(),
+                    label_phase_period: 3,
+                },
+            ),
+            &assets,
+            &env,
+        )
+        .expect_err("missing teacher asset must fail");
+        assert!(err.to_string().contains("unknown asset id 'missing'"));
+
+        let err = canonicalize_tune_controller(
+            &TuneControllerSpec::AiqiWarmstartExactJh(
+                super::super::WarmStartExactJhTuneControllerSpec {
+                    interface: sample_tune_interface(),
+                    planner_simulations_per_step: 2,
+                    return_horizon: 2,
+                    warmstart_teacher_dataset_asset: "teacher".to_string(),
+                    label_phase_period: 3,
+                },
+            ),
+            &assets,
+            &env,
+        )
+        .expect_err("warmstart tune non-direct planner marker must fail");
+        assert!(
+            err.to_string()
+                .contains("planner_simulations_per_step must be exactly 1"),
+            "{err}"
+        );
     }
 }

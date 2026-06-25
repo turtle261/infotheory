@@ -1915,6 +1915,9 @@ impl RatePdfPredictor {
         }
     }
 
+    // The mixture implementation mutates the Vec allocation; no-mixture builds
+    // only see this forwarding signature and would otherwise flag it as `ptr_arg`.
+    #[allow(clippy::ptr_arg)]
     fn diagnostic_root_snapshot(
         &mut self,
         symbol: u8,

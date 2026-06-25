@@ -1,10 +1,21 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use infotheory::api::{
-    CompressionBackend, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend,
-    RateBackendSession, try_compress_size_backend, try_entropy_rate_backend,
+    CompressionBackend, RateBackend, RateBackendSession, try_compress_size_backend,
+    try_entropy_rate_backend,
 };
+#[cfg(all(
+    feature = "backend-mixture",
+    feature = "backend-ctw",
+    feature = "backend-match"
+))]
+use infotheory::api::{MixtureExpertSpec, MixtureKind, MixtureSpec};
 use infotheory::coders::CoderType;
 use infotheory::compression::FramingMode;
+#[cfg(all(
+    feature = "backend-mixture",
+    feature = "backend-ctw",
+    feature = "backend-match"
+))]
 use std::sync::Arc;
 
 fn short_bench_data() -> Vec<u8> {
