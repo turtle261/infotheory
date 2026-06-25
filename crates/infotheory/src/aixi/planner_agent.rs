@@ -135,8 +135,22 @@ pub struct PlannerCycleOutcome {
 }
 
 /// Observer strategy for ordered planner-cycle telemetry.
+///
+/// Implementations receive a controller's native event ordering, which is one of:
+/// - *decision-percept*: the percept for step `t`, then action `t`; after the
+///   final scheduled action, one terminal successor percept at step
+///   `N = learn_cycles + eval_cycles`.
+/// - *action-then-post-percept*: action `t`, then the reached percept, both at
+///   step `t`, with no separate terminal percept.
+///
+/// Observers must tolerate either ordering and a percept reported at `step == N`.
+/// Each concrete controller documents which ordering it produces.
 pub trait PlannerCycleObserver {
     /// Observe a percept event for `step`.
+    ///
+    /// Under the decision-percept ordering, `step` may equal the total number of
+    /// scheduled cycles `N` for the terminal successor percept; observers must
+    /// accept this one-past-the-last-cycle index.
     fn observe_percept(
         &mut self,
         step: usize,
@@ -320,6 +334,8 @@ pub trait PlannerAgent {
 }
 
 /// MC-AIXI planner adapter.
+///
+/// Produces the decision-percept ordering (see [`PlannerCycleObserver`]).
 pub struct McAixiPlannerAgent {
     agent: Agent,
     prev_action: Action,
@@ -389,6 +405,11 @@ impl PlannerAgent for McAixiPlannerAgent {
         let reward: Reward = env.perform_action(action)?;
         self.prev_action = action;
         observer.end_cycle(step)?;
+        // The last post-action percept has no following decision cycle to emit it.
+        let total_cycles: usize = schedule.learn_cycles.saturating_add(schedule.eval_cycles);
+        if step.checked_add(1) == Some(total_cycles) {
+            observer.observe_percept(total_cycles, env.observations(), reward)?;
+        }
         Ok(PlannerCycleOutcome {
             pre_observations,
             pre_reward,
@@ -401,6 +422,8 @@ impl PlannerAgent for McAixiPlannerAgent {
 }
 
 /// Discounted AIQI planner adapter.
+///
+/// Produces the action-then-post-percept ordering (see [`PlannerCycleObserver`]).
 pub struct AiqiDiscountedPlannerAgent {
     agent: AiqiAgent,
 }
@@ -460,6 +483,8 @@ impl PlannerAgent for AiqiDiscountedPlannerAgent {
 }
 
 /// Exact-\(J_H\) warm-start planner adapter.
+///
+/// Produces the action-then-post-percept ordering (see [`PlannerCycleObserver`]).
 pub struct WarmStartExactJhPlannerAgent {
     agent: WarmStartExactJhAgent,
 }

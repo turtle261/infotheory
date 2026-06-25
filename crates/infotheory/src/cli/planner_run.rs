@@ -4,6 +4,7 @@ use infotheory::aixi::planner_agent::{
     PlannerEnvironment, PlannerPhase, PlannerRunSession, PlannerSchedule,
     build_planner_environment,
 };
+use infotheory::aixi::warmstart::{warmstart_jsonl_action_record, warmstart_jsonl_percept_record};
 #[cfg(test)]
 use infotheory::spec::BuiltinEnvironmentSpec;
 use infotheory::spec::{self, CompiledPlannerController, CompiledPlannerRunSpec, SpecDocument};
@@ -52,11 +53,18 @@ fn legacy_interface_reward_range_error(path: &str, field: &str) -> anyhow::Error
     )
 }
 
+/// Planner telemetry logger for complete observable interaction traces.
+///
+/// The JSONL sink records normalized action and percept events. The `bits01`
+/// sink records the same telemetry stream in the planner's bit encoding: each
+/// action contributes `action_bits` bytes, and each percept contributes all
+/// observations plus reward bytes. It is a trace representation, not a
+/// codelength accounting surface for the predictor's actual online updates.
 pub(crate) struct AixiRunLogger {
     bits01: Option<BufWriter<File>>,
     jsonl: Option<BufWriter<File>>,
     flush_every: usize,
-    step: usize,
+    completed_steps: usize,
 }
 
 impl AixiRunLogger {
@@ -87,7 +95,7 @@ impl AixiRunLogger {
             bits01,
             jsonl,
             flush_every,
-            step: 0,
+            completed_steps: 0,
         }))
     }
 
@@ -100,15 +108,26 @@ impl AixiRunLogger {
         Ok(())
     }
 
+    pub(crate) fn flush(&mut self) -> anyhow::Result<()> {
+        if let Some(w) = self.bits01.as_mut() {
+            w.flush()?;
+        }
+        if let Some(w) = self.jsonl.as_mut() {
+            w.flush()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn log_percept(
         &mut self,
+        step: usize,
         observations: &[u64],
         reward: i64,
         observation_bits: usize,
         reward_bits: usize,
         reward_offset: i64,
     ) -> anyhow::Result<()> {
-        // Exact same bit encoding the agent uses internally.
+        // Same symbol encoding as the controller, applied to the telemetry event.
         let mut bits = Vec::new();
         for &obs in observations {
             infotheory::aixi::common::encode(&mut bits, obs, observation_bits);
@@ -123,12 +142,7 @@ impl AixiRunLogger {
         self.write_bits01(&bits)?;
 
         if let Some(w) = self.jsonl.as_mut() {
-            let rec = serde_json::json!({
-                "t": self.step,
-                "kind": "percept",
-                "observations": observations,
-                "reward": reward,
-            });
+            let rec = warmstart_jsonl_percept_record(step, observations, reward);
             writeln!(w, "{rec}")?;
         }
         Ok(())
@@ -136,6 +150,7 @@ impl AixiRunLogger {
 
     pub(crate) fn log_action(
         &mut self,
+        step: usize,
         action: Action,
         action_bits: usize,
         provenance: PlannerActionProvenance,
@@ -145,26 +160,16 @@ impl AixiRunLogger {
         self.write_bits01(&bits)?;
 
         if let Some(w) = self.jsonl.as_mut() {
-            let rec = serde_json::json!({
-                "t": self.step,
-                "kind": "action",
-                "action": action,
-                "provenance": provenance.as_str(),
-            });
+            let rec = warmstart_jsonl_action_record(step, action, provenance);
             writeln!(w, "{rec}")?;
         }
         Ok(())
     }
 
     pub(crate) fn next_step(&mut self) -> anyhow::Result<()> {
-        self.step = self.step.saturating_add(1);
-        if self.flush_every > 0 && self.step.is_multiple_of(self.flush_every) {
-            if let Some(w) = self.bits01.as_mut() {
-                w.flush()?;
-            }
-            if let Some(w) = self.jsonl.as_mut() {
-                w.flush()?;
-            }
+        self.completed_steps = self.completed_steps.saturating_add(1);
+        if self.flush_every > 0 && self.completed_steps.is_multiple_of(self.flush_every) {
+            self.flush()?;
         }
         Ok(())
     }
@@ -195,6 +200,13 @@ impl PlannerCliObserver {
             trace_logger: AixiRunLogger::new(cli_overlay)?,
         })
     }
+
+    fn flush(&mut self) -> Result<(), PlannerAgentError> {
+        if let Some(logger) = self.trace_logger.as_mut() {
+            logger.flush().map_err(planner_observer_error)?;
+        }
+        Ok(())
+    }
 }
 
 fn planner_observer_error(err: anyhow::Error) -> PlannerAgentError {
@@ -206,13 +218,14 @@ fn planner_observer_error(err: anyhow::Error) -> PlannerAgentError {
 impl PlannerCycleObserver for PlannerCliObserver {
     fn observe_percept(
         &mut self,
-        _step: usize,
+        step: usize,
         observations: &[u64],
         reward: Reward,
     ) -> Result<(), PlannerAgentError> {
         if let Some(logger) = self.trace_logger.as_mut() {
             logger
                 .log_percept(
+                    step,
                     observations,
                     reward,
                     self.observation_bits,
@@ -226,13 +239,13 @@ impl PlannerCycleObserver for PlannerCliObserver {
 
     fn observe_action(
         &mut self,
-        _step: usize,
+        step: usize,
         action: Action,
         provenance: PlannerActionProvenance,
     ) -> Result<(), PlannerAgentError> {
         if let Some(logger) = self.trace_logger.as_mut() {
             logger
-                .log_action(action, self.action_bits, provenance)
+                .log_action(step, action, self.action_bits, provenance)
                 .map_err(planner_observer_error)?;
         }
         Ok(())
@@ -393,6 +406,8 @@ pub(crate) fn run_compiled_planner_run(
         }
     }
 
+    observer.flush().map_err(|err| anyhow::anyhow!("{err}"))?;
+
     if !learn_perf_reported && runtime.perf && schedule.learn_cycles > 0 {
         let elapsed = learn_start.elapsed().as_secs_f64().max(1e-9);
         let cps = schedule.learn_cycles as f64 / elapsed;
@@ -450,6 +465,8 @@ pub(crate) fn run_aixi_mode(config_path: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "backend-ctw", feature = "aixi-gameengine"))]
+    use super::run_compiled_planner_run;
     use super::{
         AixiRunLogger, builtin_environment_name, is_canonical_spec_document,
         legacy_planner_config_error, run_aixi_mode,
@@ -473,6 +490,19 @@ mod tests {
             "{prefix}-{}-{nanos}-{counter}{suffix}",
             std::process::id()
         ))
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "aixi-gameengine"))]
+    fn compile_planner_run_value(
+        value: &serde_json::Value,
+    ) -> infotheory::spec::CompiledPlannerRunSpec {
+        let doc =
+            infotheory::spec::SpecDocument::parse_json_value(value, std::path::Path::new("."))
+                .expect("parse planner_run JSON");
+        let infotheory::spec::SpecDocument::PlannerRun(spec) = doc else {
+            panic!("expected planner_run document");
+        };
+        spec.compile().expect("compile planner_run")
     }
 
     #[test]
@@ -514,7 +544,7 @@ mod tests {
             .expect("bits logger")
             .expect("bits logger should be enabled");
         bits_logger
-            .log_action(1, 1, PlannerActionProvenance::Greedy)
+            .log_action(0, 1, 1, PlannerActionProvenance::Greedy)
             .expect("log action to bits");
         bits_logger.next_step().expect("advance bits step");
         drop(bits_logger);
@@ -529,7 +559,7 @@ mod tests {
             .expect("jsonl logger")
             .expect("jsonl logger should be enabled");
         jsonl_logger
-            .log_percept(&[3], 1, 2, 4, 1)
+            .log_percept(0, &[3], 1, 2, 4, 1)
             .expect("log percept to jsonl");
         jsonl_logger.next_step().expect("advance jsonl step");
         drop(jsonl_logger);
@@ -554,9 +584,11 @@ mod tests {
             .expect("logger setup")
             .expect("logger should be enabled");
         logger
-            .log_action(1, 2, PlannerActionProvenance::Exploratory)
+            .log_action(0, 1, 2, PlannerActionProvenance::Exploratory)
             .expect("log action");
-        logger.log_percept(&[2], 1, 2, 4, 0).expect("log percept");
+        logger
+            .log_percept(0, &[2], 1, 2, 4, 0)
+            .expect("log percept");
         logger.next_step().expect("advance step");
         drop(logger);
 
@@ -571,6 +603,139 @@ mod tests {
 
         let _ = std::fs::remove_file(bits_path);
         let _ = std::fs::remove_file(jsonl_path);
+    }
+
+    #[cfg(all(feature = "backend-ctw", feature = "aixi-gameengine"))]
+    #[test]
+    fn mc_aixi_jsonl_trace_can_be_converted_to_warmstart_teacher_trace() {
+        use infotheory::aixi::warmstart::{
+            standalone_warmstart_teacher_contract_for_compiled_planner_run,
+            warmstart_teacher_trace_from_jsonl_path,
+        };
+
+        let bits_path = unique_temp_path("mc-aixi-warmstart-trace", ".bits01");
+        let jsonl_path = unique_temp_path("mc-aixi-warmstart-trace", ".jsonl");
+        let teacher_path = unique_temp_path("mc-aixi-warmstart-teacher", ".json");
+        let mc_aixi = compile_planner_run_value(&json!({
+            "schema_version": 1,
+            "kind": "planner_run",
+            "assets": [],
+            "environment": {
+                "kind": "builtin",
+                "name": "coin_flip"
+            },
+            "interface": {
+                "observation_bits": 1,
+                "observation_stream_len": 1,
+                "observation_key_mode": "full_stream",
+                "reward_bits": 1,
+                "agent_actions": 2
+            },
+            "controller": {
+                "kind": "mc_aixi",
+                "predictor": {
+                    "kind": "ctw",
+                    "depth": 4
+                },
+                "bit_stream_semantics": { "kind": "binary_tokens" },
+                "agent_horizon": 1,
+                "num_simulations": 1,
+                "mcts_strategy": {
+                    "kind": "rho_uct"
+                },
+                "exploration_exploitation_ratio": 1.0,
+                "discount_gamma": 1.0
+            },
+            "runtime": {
+                "random_seed": 7,
+                "learn_cycles": 2,
+                "eval_cycles": 0,
+                "terminate_lifetime": 2,
+                "log_every": 1,
+                "perf": false,
+                "vm_perf_only": false,
+                "explore_epsilon": 0.0,
+                "explore_gamma": 1.0
+            }
+        }));
+        let overlay = json!({
+            "trace_bits01_path": bits_path,
+            "trace_jsonl_path": jsonl_path,
+            "trace_flush_every": 1
+        });
+        run_compiled_planner_run(&mc_aixi, Some(&overlay))
+            .expect("MC-AIXI planner run should produce JSONL");
+
+        let warmstart_target = compile_planner_run_value(&json!({
+            "schema_version": 1,
+            "kind": "planner_run",
+            "assets": [{
+                "id": "teacher",
+                "path": teacher_path.to_string_lossy()
+            }],
+            "environment": {
+                "kind": "builtin",
+                "name": "coin_flip"
+            },
+            "interface": {
+                "observation_bits": 1,
+                "observation_stream_len": 1,
+                "observation_key_mode": "full_stream",
+                "reward_bits": 1,
+                "agent_actions": 2
+            },
+            "controller": {
+                "kind": "aiqi_warmstart_exact_jh",
+                "predictor": {
+                    "kind": "ctw",
+                    "depth": 4
+                },
+                "return_horizon": 2,
+                "return_bins": 3,
+                "label_phase_period": 2,
+                "teacher_dataset_asset": "teacher",
+                "planner_simulations_per_step": 1
+            },
+            "runtime": {
+                "random_seed": 7,
+                "learn_cycles": 1,
+                "eval_cycles": 0,
+                "terminate_lifetime": 1,
+                "log_every": 1,
+                "perf": false,
+                "vm_perf_only": false,
+                "explore_epsilon": 0.0,
+                "explore_gamma": 1.0
+            }
+        }));
+        let contract =
+            standalone_warmstart_teacher_contract_for_compiled_planner_run(&warmstart_target)
+                .expect("build standalone teacher contract");
+        let trace = warmstart_teacher_trace_from_jsonl_path(&jsonl_path, &contract, 2)
+            .expect("MC-AIXI JSONL should convert to a warm-start teacher trace");
+        assert_eq!(trace.transitions.len(), 2);
+
+        let jsonl = std::fs::read_to_string(&jsonl_path).expect("read JSONL trace");
+        let records = jsonl
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse JSONL records");
+        assert_eq!(records.len(), 5);
+        let final_record = records.last().expect("terminal percept record");
+        assert_eq!(final_record["kind"].as_str(), Some("percept"));
+        assert_eq!(final_record["t"].as_u64(), Some(2));
+
+        let bits = std::fs::read(&bits_path).expect("read bits01 trace");
+        assert_eq!(
+            bits.len(),
+            8,
+            "two MC-AIXI cycles should record p0,a0,p1,a1,p2 with 1-bit actions and 2-bit percepts"
+        );
+
+        let _ = std::fs::remove_file(bits_path);
+        let _ = std::fs::remove_file(jsonl_path);
+        let _ = std::fs::remove_file(teacher_path);
     }
 
     #[cfg(all(feature = "backend-ctw", feature = "tuner"))]
