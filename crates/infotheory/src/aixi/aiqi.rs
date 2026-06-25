@@ -36,11 +36,6 @@ pub enum AiqiError {
     ReturnHorizonZero,
     /// `return_bins` was zero.
     ReturnBinsZero,
-    /// `return_bins` was not a power of two.
-    ReturnBinsNotPowerOfTwo {
-        /// The configured return bin count.
-        return_bins: usize,
-    },
     /// The augmentation period was smaller than the return horizon.
     AugmentationPeriodTooShort {
         /// The configured augmentation period.
@@ -144,10 +139,6 @@ impl fmt::Display for AiqiError {
         match self {
             Self::ReturnHorizonZero => f.write_str("return_horizon must be >= 1"),
             Self::ReturnBinsZero => f.write_str("return_bins must be >= 1"),
-            Self::ReturnBinsNotPowerOfTwo { return_bins } => write!(
-                f,
-                "return_bins must be a power of two for exact binary return encoding, got {return_bins}"
-            ),
             Self::AugmentationPeriodTooShort {
                 augmentation_period,
                 return_horizon,
@@ -281,8 +272,8 @@ pub struct AiqiConfig {
     pub return_horizon: usize,
     /// Number of discretization bins `M` for returns.
     ///
-    /// This implementation uses exact fixed-width binary encoding of return bins,
-    /// so `return_bins` must be a power of two.
+    /// Non-power-of-two alphabets are represented by fixed-width binary labels
+    /// with invalid leaves excluded from the exact return law.
     pub return_bins: usize,
     /// Augmentation period `N` (must satisfy `N >= H`).
     pub augmentation_period: usize,
@@ -366,11 +357,6 @@ impl AiqiConfig {
         }
         if self.return_bins == 0 {
             return Err(AiqiError::ReturnBinsZero);
-        }
-        if !self.return_bins.is_power_of_two() {
-            return Err(AiqiError::ReturnBinsNotPowerOfTwo {
-                return_bins: self.return_bins,
-            });
         }
         if self.augmentation_period < self.return_horizon {
             return Err(AiqiError::AugmentationPeriodTooShort {
@@ -1519,6 +1505,64 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct ActionConditionedBernoulliPredictor {
+        history: Vec<bool>,
+    }
+
+    impl ActionConditionedBernoulliPredictor {
+        fn p_one_after_action(&self) -> f64 {
+            if self.history.first().copied().unwrap_or(false) {
+                0.75
+            } else {
+                0.25
+            }
+        }
+    }
+
+    impl Predictor for ActionConditionedBernoulliPredictor {
+        fn update(&mut self, sym: bool) {
+            self.history.push(sym);
+        }
+
+        fn commit_update(&mut self, sym: bool) {
+            self.history.push(sym);
+        }
+
+        fn update_history(&mut self, sym: bool) {
+            self.history.push(sym);
+        }
+
+        fn commit_update_history(&mut self, sym: bool) {
+            self.history.push(sym);
+        }
+
+        fn revert(&mut self) {
+            self.history
+                .pop()
+                .expect("test predictor rollback underflow");
+        }
+
+        fn pop_history(&mut self) {
+            self.history
+                .pop()
+                .expect("test predictor history underflow");
+        }
+
+        fn predict_prob(&mut self, sym: bool) -> f64 {
+            let p_one = self.p_one_after_action();
+            if sym { p_one } else { 1.0 - p_one }
+        }
+
+        fn model_name(&self) -> String {
+            "ActionConditionedBernoulliPredictor".to_string()
+        }
+
+        fn boxed_clone(&self) -> Box<dyn Predictor> {
+            Box::new(self.clone())
+        }
+    }
+
     #[derive(Clone)]
     struct ScopedReturnLearningPredictor {
         saw_training_one: bool,
@@ -1590,16 +1634,65 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_non_power_of_two_return_bins() {
+    fn config_accepts_non_power_of_two_return_bins() {
         let mut cfg = basic_config();
         cfg.return_bins = 3;
-        let err = cfg
-            .validate()
-            .expect_err("non-power-of-two return_bins should be rejected");
-        assert!(matches!(
-            err,
-            AiqiError::ReturnBinsNotPowerOfTwo { return_bins: 3 }
-        ));
+        cfg.validate()
+            .expect("non-power-of-two return_bins are valid AIQI discretization levels");
+    }
+
+    #[test]
+    fn non_power_of_two_aiqi_runtime_normalizes_invalid_return_leaf_and_plans() {
+        let mut cfg = basic_config();
+        cfg.return_bins = 3;
+        cfg.return_horizon = 1;
+        cfg.augmentation_period = 1;
+        cfg.baseline_exploration = f64::MIN_POSITIVE;
+        cfg.random_seed = Some(3);
+
+        let mut agent = AiqiAgent::new(cfg).expect("non-power-of-two AIQI config should build");
+        agent.phases[0].predictor = Box::new(ActionConditionedBernoulliPredictor::default());
+
+        let mut action_one_predictor = ActionConditionedBernoulliPredictor::default();
+        action_one_predictor.update_history(true);
+        let law = predict_return_law(
+            &mut action_one_predictor,
+            agent.return_label_codec,
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+        );
+        assert_eq!(law.probabilities.len(), 3);
+        assert_eq!(law.stats.invalid_leaves, 1);
+        assert!(
+            (law.probabilities.iter().sum::<f64>() - 1.0).abs() < 1e-12,
+            "non-power-of-two AIQI law must normalize only valid labels: {:?}",
+            law.probabilities
+        );
+        let expected_action_one_law = [1.0 / 7.0, 3.0 / 7.0, 3.0 / 7.0];
+        for (actual, expected) in law.probabilities.iter().zip(expected_action_one_law.iter()) {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "expected action-1 law {:?}, got {:?}",
+                expected_action_one_law,
+                law.probabilities
+            );
+        }
+
+        let q_values = agent.estimate_q_values();
+        assert_eq!(q_values.len(), 2);
+        assert!(
+            (q_values[0] - 0.2).abs() < 1e-12,
+            "action 0 should decode the normalized [0.6, 0.2, 0.2] law, got {q_values:?}"
+        );
+        assert!(
+            (q_values[1] - (3.0 / 7.0)).abs() < 1e-12,
+            "action 1 should decode the normalized [1/7, 3/7, 3/7] law, got {q_values:?}"
+        );
+
+        agent.reseed_random(3);
+        let (action, explored) = agent.get_planned_action_with_extra_exploration_flag(0.0);
+        assert_eq!(action, 1);
+        assert!(!explored);
     }
 
     #[test]

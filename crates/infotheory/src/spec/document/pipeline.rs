@@ -10,15 +10,19 @@ use super::{
     CompiledTuneController, CompiledTuneSpec, TUNE_CANONICALIZATION_CLASSIFICATION_VERSION,
     TuneBoundsSpec, TuneControllerSpec, TunePlannerInterfaceSpec, TuneSpec, ValidatedTuneSpec,
 };
-#[cfg(feature = "aixi")]
-use crate::aixi::common::validate_reward_encoding_bounds;
 use crate::aixi::common::{
     MctsStrategy, bits_for_cardinality, byte_packed_percept_bits, resolve_random_seed,
     validate_aiqi_byte_packed_alignment, validate_mc_aixi_byte_packed_alignment,
     warn_parallel_uct_workers_one_once,
 };
+#[cfg(feature = "aixi")]
+use crate::aixi::warmstart::{
+    WarmStartExactJhError, max_reward_from_exact_return_bins, reward_bounds_from_exact_return_bins,
+};
 use crate::spec::core::AssetRef;
 use std::collections::HashMap;
+#[cfg(feature = "aixi")]
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -114,36 +118,53 @@ fn validate_warmstart_direct_evaluator_marker(
 }
 
 #[cfg(feature = "aixi")]
-fn validate_warmstart_exact_return_bins(
-    return_horizon: usize,
-    return_bins: usize,
-) -> SpecResult<()> {
-    if !(return_bins - 1).is_multiple_of(return_horizon) {
-        return Err(SpecError::new(
-            "return_bins must be exactly H * max_reward + 1 for warm-start exact-J_H",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "aixi")]
 fn validate_warmstart_exact_reward_channel(
     return_horizon: usize,
     return_bins: usize,
     reward_bits: usize,
 ) -> SpecResult<()> {
-    let span = return_bins
-        .checked_sub(1)
-        .ok_or_else(|| SpecError::new("return_bins must be >= 1"))?;
-    let max_reward = i64::try_from(span / return_horizon).map_err(|_| {
-        SpecError::new("return_bins imply an instantaneous reward bound that does not fit i64")
-    })?;
-    validate_reward_encoding_bounds(0, max_reward, 0, reward_bits).map_err(|err| {
-        SpecError::new(format!(
-            "return_bins imply max_reward={max_reward} for return_horizon={return_horizon}, \
-             but that reward range is not representable by reward_bits={reward_bits}: {err}"
-        ))
-    })
+    let (return_horizon, return_bins) =
+        nonzero_warmstart_exact_return_shape(return_horizon, return_bins)?;
+    if let Err(err) = reward_bounds_from_exact_return_bins(return_horizon, return_bins, reward_bits)
+    {
+        return match err {
+            WarmStartExactJhError::RewardEncoding(err) => {
+                let max_reward = max_reward_from_exact_return_bins(return_horizon, return_bins)
+                    .map_err(|err| SpecError::new(err.to_string()))?;
+                Err(SpecError::new(format!(
+                    "return_bins imply max_reward={max_reward} for return_horizon={}, \
+                     but that reward range is not representable by reward_bits={reward_bits}: {err}",
+                    return_horizon.get()
+                )))
+            }
+            err => Err(SpecError::new(err.to_string())),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(feature = "aixi")]
+fn validate_warmstart_exact_return_bins(
+    return_horizon: usize,
+    return_bins: usize,
+) -> SpecResult<()> {
+    let (return_horizon, return_bins) =
+        nonzero_warmstart_exact_return_shape(return_horizon, return_bins)?;
+    max_reward_from_exact_return_bins(return_horizon, return_bins)
+        .map(|_| ())
+        .map_err(|err| SpecError::new(err.to_string()))
+}
+
+#[cfg(feature = "aixi")]
+fn nonzero_warmstart_exact_return_shape(
+    return_horizon: usize,
+    return_bins: usize,
+) -> SpecResult<(NonZeroUsize, NonZeroUsize)> {
+    let return_horizon = NonZeroUsize::new(return_horizon)
+        .ok_or_else(|| SpecError::new("return_horizon must be >= 1"))?;
+    let return_bins =
+        NonZeroUsize::new(return_bins).ok_or_else(|| SpecError::new("return_bins must be >= 1"))?;
+    Ok((return_horizon, return_bins))
 }
 
 #[cfg(feature = "tuner")]
@@ -303,8 +324,8 @@ fn canonicalize_tune_controller(
             if inner.return_horizon == 0 {
                 return Err(SpecError::new("return_horizon must be >= 1"));
             }
-            if inner.return_bins == 0 || !inner.return_bins.is_power_of_two() {
-                return Err(SpecError::new("return_bins must be a power of two"));
+            if inner.return_bins == 0 {
+                return Err(SpecError::new("return_bins must be >= 1"));
             }
             if !(0.0..1.0).contains(&inner.discount_factor) {
                 return Err(SpecError::new("discount_factor must be in [0, 1)"));
@@ -463,8 +484,8 @@ fn canonicalize_controller_spec(
             if inner.return_horizon == 0 {
                 return Err(SpecError::new("return_horizon must be >= 1"));
             }
-            if inner.return_bins == 0 || !inner.return_bins.is_power_of_two() {
-                return Err(SpecError::new("return_bins must be a power of two"));
+            if inner.return_bins == 0 {
+                return Err(SpecError::new("return_bins must be >= 1"));
             }
             if inner.augmentation_period < inner.return_horizon {
                 return Err(SpecError::new(
@@ -1237,7 +1258,7 @@ mod tests {
             TuneControllerSpec::AnnealedHillClimbing(_)
         ));
 
-        let err = canonicalize_tune_controller(
+        canonicalize_tune_controller(
             &TuneControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedTuneControllerSpec {
                 interface: sample_tune_interface(),
                 planner_simulations_per_step: 2,
@@ -1250,11 +1271,7 @@ mod tests {
             &assets,
             &env,
         )
-        .expect_err("non-power-of-two bins must fail");
-        assert!(
-            err.to_string()
-                .contains("return_bins must be a power of two")
-        );
+        .expect("non-power-of-two bins are valid for discounted AIQI");
 
         let err = canonicalize_tune_controller(
             &TuneControllerSpec::AiqiDiscounted(super::super::AiqiDiscountedTuneControllerSpec {

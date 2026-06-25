@@ -103,16 +103,11 @@ fn aiqi_config_rejects_period_shorter_than_horizon() {
 }
 
 #[test]
-fn aiqi_config_rejects_non_power_of_two_return_bins() {
+fn aiqi_config_accepts_non_power_of_two_return_bins() {
     let mut cfg = base_config();
     cfg.return_bins = 3;
-    let err = cfg
-        .validate()
-        .expect_err("non-power-of-two return_bins must be rejected");
-    assert!(matches!(
-        err,
-        AiqiError::ReturnBinsNotPowerOfTwo { return_bins: 3 }
-    ));
+    cfg.validate()
+        .expect("non-power-of-two return_bins are valid AIQI discretization levels");
 }
 
 #[test]

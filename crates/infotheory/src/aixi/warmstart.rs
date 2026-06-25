@@ -29,6 +29,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 /// One observed environment transition in a same-task warm-start trace.
@@ -1416,11 +1417,12 @@ impl WarmStartExactJhConfig {
                 configured: self.planner_simulations_per_step,
             });
         }
-        let (min_reward, max_reward, _reward_offset) = reward_bounds_from_exact_return_bins(
-            self.return_horizon,
-            self.return_bins,
-            self.reward_bits,
-        )?;
+        let return_horizon = NonZeroUsize::new(self.return_horizon)
+            .ok_or(WarmStartExactJhError::ReturnHorizonZero)?;
+        let return_bins =
+            NonZeroUsize::new(self.return_bins).ok_or(WarmStartExactJhError::ReturnBinsZero)?;
+        let (min_reward, max_reward, _reward_offset) =
+            reward_bounds_from_exact_return_bins(return_horizon, return_bins, self.reward_bits)?;
         validate_exact_return_alphabet(
             min_reward,
             max_reward,
@@ -1520,9 +1522,13 @@ impl WarmStartExactJhRuntimeConfig {
                 configured: planner_simulations_per_step,
             });
         }
+        let nonzero_return_horizon =
+            NonZeroUsize::new(return_horizon).ok_or(WarmStartExactJhError::ReturnHorizonZero)?;
+        let nonzero_return_bins =
+            NonZeroUsize::new(return_bins).ok_or(WarmStartExactJhError::ReturnBinsZero)?;
         let (min_reward, max_reward, reward_offset) = reward_bounds_from_exact_return_bins(
-            return_horizon,
-            return_bins,
+            nonzero_return_horizon,
+            nonzero_return_bins,
             interface.reward_bits,
         )?;
         validate_exact_return_alphabet(min_reward, max_reward, return_horizon, return_bins)?;
@@ -1587,14 +1593,23 @@ impl WarmStartExactJhRuntimeConfig {
     }
 }
 
-fn reward_bounds_from_exact_return_bins(
-    return_horizon: usize,
-    return_bins: usize,
+pub(crate) fn reward_bounds_from_exact_return_bins(
+    return_horizon: NonZeroUsize,
+    return_bins: NonZeroUsize,
     reward_bits: usize,
 ) -> Result<(Reward, Reward, Reward), WarmStartExactJhError> {
-    let span = return_bins
-        .checked_sub(1)
-        .ok_or(WarmStartExactJhError::ExactReturnRangeOverflow)?;
+    let max_reward = max_reward_from_exact_return_bins(return_horizon, return_bins)?;
+    validate_reward_encoding_bounds(0, max_reward, 0, reward_bits)?;
+    Ok((0, max_reward, 0))
+}
+
+pub(crate) fn max_reward_from_exact_return_bins(
+    return_horizon: NonZeroUsize,
+    return_bins: NonZeroUsize,
+) -> Result<Reward, WarmStartExactJhError> {
+    let return_horizon = return_horizon.get();
+    let return_bins = return_bins.get();
+    let span = return_bins - 1;
     if span % return_horizon != 0 {
         return Err(WarmStartExactJhError::ReturnBinsNotExactHorizon {
             return_bins,
@@ -1603,8 +1618,7 @@ fn reward_bounds_from_exact_return_bins(
     }
     let max_reward = i64::try_from(span / return_horizon)
         .map_err(|_| WarmStartExactJhError::ExactReturnRangeOverflow)?;
-    validate_reward_encoding_bounds(0, max_reward, 0, reward_bits)?;
-    Ok((0, max_reward, 0))
+    Ok(max_reward)
 }
 
 #[derive(Clone, Debug)]
@@ -2774,8 +2788,8 @@ mod tests {
         let cfg = config();
         assert_eq!(
             reward_bounds_from_exact_return_bins(
-                cfg.return_horizon,
-                cfg.return_bins,
+                NonZeroUsize::new(cfg.return_horizon).expect("non-zero return horizon"),
+                NonZeroUsize::new(cfg.return_bins).expect("non-zero return bins"),
                 cfg.reward_bits
             )
             .expect("bounds"),
