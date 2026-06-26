@@ -1,6 +1,27 @@
-use infotheory::api::{
-    MixtureExpertSpec, MixtureKind, MixtureSpec, ParticleSpec, RateBackend, RateBackendSession,
-};
+#[cfg(any(feature = "backend-ctw", feature = "backend-zpaq"))]
+use infotheory::api::BitOrder;
+#[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
+use infotheory::api::MixtureExpertSpec;
+#[cfg(any(feature = "backend-ctw", feature = "backend-zpaq"))]
+use infotheory::api::OnlineBitPredictor;
+#[cfg(feature = "backend-particle")]
+use infotheory::api::ParticleSpec;
+#[cfg(any(
+    feature = "backend-ctw",
+    feature = "backend-zpaq",
+    feature = "backend-match"
+))]
+use infotheory::api::{BitStreamSemantics, RateBackendBitSession};
+#[cfg(feature = "backend-calibrated")]
+use infotheory::api::{CalibratedSpec, CalibrationContextKind};
+#[cfg(feature = "backend-zpaq")]
+use infotheory::api::{CompressionBackend, try_compress_bytes_backend};
+use infotheory::api::{MixtureKind, MixtureSpec, RateBackend, RateBackendSession};
+#[cfg(any(
+    feature = "backend-ctw",
+    feature = "backend-particle",
+    all(feature = "backend-mixture", feature = "backend-ctw")
+))]
 use infotheory::spec::CanonicalJson;
 use std::sync::Arc;
 
@@ -21,12 +42,18 @@ fn api_surface_rate_backend_session_rejects_invalid_programmatic_mixture() {
     }
 }
 
+#[cfg(feature = "backend-ctw")]
 #[test]
-fn api_surface_spec_types_serialize_canonically() {
+fn api_surface_rate_backend_serializes_canonically() {
     let backend = RateBackend::Ctw { depth: 9 };
     let backend_json = backend.to_canonical_json().expect("backend json");
     assert!(backend_json.contains("\"kind\": \"ctw\""));
+}
 
+#[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
+#[test]
+fn api_surface_mixture_spec_serializes_canonically() {
+    let backend = RateBackend::Ctw { depth: 9 };
     let mixture = MixtureSpec::new(
         MixtureKind::Bayes,
         vec![{
@@ -37,13 +64,918 @@ fn api_surface_spec_types_serialize_canonically() {
     );
     let mix_json = mixture.to_canonical_json().expect("mixture json");
     assert!(mix_json.contains("\"kind\": \"bayes\""));
+}
 
+#[cfg(feature = "backend-particle")]
+#[test]
+fn api_surface_particle_spec_serializes_canonically() {
     let particle_json = ParticleSpec::default().to_canonical_json();
     assert!(
         particle_json
             .expect("particle json")
             .contains("\"num_particles\"")
     );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_byte_packed_bit_session_matches_byte_prediction_chain() {
+    let backend = RateBackend::Ctw { depth: 6 };
+    let mut byte_session =
+        RateBackendSession::from_spec(backend.clone(), Some(16)).expect("byte session");
+    let mut bit_session = RateBackendBitSession::from_spec(
+        backend,
+        Some(16 * 8),
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+
+    for &symbol in b"bit-session" {
+        let mut row = [0.0f64; 256];
+        byte_session.fill_log_probs(&mut row);
+        let expected = row[symbol as usize].exp();
+        let mut product = 1.0f64;
+        for bit_idx in 0..8u8 {
+            let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
+            product *= bit_session
+                .try_step_bit(bit)
+                .expect("byte-packed step should remain in one update mode")
+                .prob(bit);
+        }
+        byte_session.observe(&[symbol]);
+        assert!(
+            (product - expected).abs() < 1e-9,
+            "symbol={symbol} product={product} expected={expected}"
+        );
+    }
+
+    byte_session.finish().expect("byte finish");
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "backend-mixture"))]
+#[test]
+fn api_surface_byte_packed_mixture_observe_only_matches_step_learning_outcome() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 }),
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 12 }),
+            ],
+        )),
+    };
+    let semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    let data = b"native-byte-prefix observe-only parity check";
+    let total_bits = Some((data.len() * 8) as u64);
+
+    let mut step_session =
+        RateBackendBitSession::from_spec(backend.clone(), total_bits, semantics).expect("step");
+    let mut observe_session =
+        RateBackendBitSession::from_spec(backend, total_bits, semantics).expect("observe");
+
+    for &symbol in data {
+        for bit_idx in 0..8u8 {
+            let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
+            let prediction = step_session.try_step_bit(bit).expect("step bit");
+            let sum = prediction.p0 + prediction.p1;
+            assert!(
+                (sum - 1.0).abs() < 1e-12,
+                "step-bit prediction must stay normalized, got {sum}"
+            );
+            observe_session
+                .try_observe_bit(bit)
+                .expect("observe-only bit");
+        }
+    }
+
+    let step_pred = step_session.predict_bit();
+    let observe_pred = observe_session.predict_bit();
+    assert!(
+        (step_pred.p1 - observe_pred.p1).abs() < 1e-12,
+        "observe-only training should match predict+observe training: step={} observe={}",
+        step_pred.p1,
+        observe_pred.p1
+    );
+    assert!(
+        (observe_pred.p0 + observe_pred.p1 - 1.0).abs() < 1e-12,
+        "observe-only prediction must remain normalized"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_bit_session_checkpoint_restores_byte_packed_prefix() {
+    let semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::LsbFirst,
+    };
+    let mut session =
+        RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(16), semantics)
+            .expect("bit session");
+
+    let initial = session.predict_bit();
+    let checkpoint = session.checkpoint();
+    session.try_observe_bit(true).expect("partial byte bit");
+    session.try_observe_bit(false).expect("partial byte bit");
+    let _partial = session.predict_bit();
+
+    session
+        .restore_checkpoint(&checkpoint)
+        .expect("checkpoint restore");
+    assert_eq!(
+        session.predict_bit(),
+        initial,
+        "restore must recover the pre-prefix prediction"
+    );
+
+    for bit in [true, false, true, false, true, false, true, false] {
+        session.try_observe_bit(bit).expect("complete byte");
+    }
+    let _after_byte = session.predict_bit();
+    session
+        .restore_checkpoint(&checkpoint)
+        .expect("restore after completed byte");
+    assert_eq!(session.predict_bit(), initial);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_bit_session_checkpoint_rejects_mismatched_session() {
+    let mut a = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        Some(8),
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("session a");
+    let mut b = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 7 },
+        Some(8),
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("session b");
+    let checkpoint = a.checkpoint();
+    let err = b
+        .restore_checkpoint(&checkpoint)
+        .expect_err("checkpoint must be tied to its backend");
+    assert!(err.to_string().contains("different backend"));
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "backend-mixture"))]
+#[test]
+fn api_surface_bit_session_checkpoint_restores_native_reversible_mixture() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 }),
+                MixtureExpertSpec::new(RateBackend::FacCtw {
+                    base_depth: 6,
+                    num_percept_bits: 1,
+                    encoding_bits: 1,
+                    msb_first: None,
+                }),
+            ],
+        )),
+    };
+    let mut session =
+        RateBackendBitSession::from_spec(backend, Some(64), BitStreamSemantics::BinaryTokens)
+            .expect("native reversible mixture bit session");
+
+    for bit in [true, false, true, true, false] {
+        session.try_observe_bit(bit).expect("training bit");
+    }
+    let checkpoint = session.checkpoint();
+    let expected = session.predict_bit();
+
+    for bit in [false, false, true, false, true, true] {
+        session.try_observe_bit(bit).expect("speculative bit");
+    }
+    session
+        .restore_checkpoint(&checkpoint)
+        .expect("restore mixture checkpoint");
+    assert_eq!(session.predict_bit(), expected);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_byte_packed_try_methods_reject_mixed_update_modes() {
+    let semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    let mut frozen_then_adaptive =
+        RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(8), semantics)
+            .expect("bit session");
+    for &bit in &[true, false, true] {
+        frozen_then_adaptive
+            .try_condition_bit(bit)
+            .expect("conditioning prefix");
+    }
+    let err = frozen_then_adaptive
+        .try_observe_bit(false)
+        .expect_err("mixed-mode byte updates must be rejected");
+    let message = err.to_string();
+    assert!(message.contains("cannot mix"));
+    assert!(message.contains("BinaryTokens"));
+
+    let mut adaptive_then_frozen =
+        RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(8), semantics)
+            .expect("bit session");
+    for &bit in &[true, false, true] {
+        adaptive_then_frozen
+            .try_observe_bit(bit)
+            .expect("adaptive prefix");
+    }
+    let err = adaptive_then_frozen
+        .try_condition_bit(false)
+        .expect_err("mixed-mode byte updates must be rejected");
+    assert!(err.to_string().contains("cannot mix"));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+#[should_panic(expected = "cannot mix")]
+fn api_surface_byte_packed_strict_methods_panic_on_mixed_update_modes() {
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        Some(8),
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+    for &bit in &[true, false, true] {
+        bit_session.condition_bit(bit);
+    }
+    bit_session.observe_bit(false);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_bit_session_semantics_are_fixed() {
+    let backend = RateBackend::Ctw { depth: 6 };
+    let mut bit_session = RateBackendBitSession::from_spec(
+        backend,
+        Some(8),
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+
+    bit_session
+        .begin_bit_stream(
+            Some(8),
+            BitStreamSemantics::BytePacked {
+                order: BitOrder::MsbFirst,
+            },
+        )
+        .expect("same semantics reset");
+    let err = bit_session
+        .begin_bit_stream(Some(8), BitStreamSemantics::BinaryTokens)
+        .expect_err("semantic switches need a freshly adapted session");
+    assert!(err.contains("semantics are fixed"));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_byte_packed_bit_session_rejects_non_byte_aligned_lengths() {
+    let semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    let err =
+        match RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(9), semantics) {
+            Ok(_) => panic!("byte-packed streams require whole bytes"),
+            Err(err) => err,
+        };
+    assert!(err.to_string().contains("whole number of bytes"));
+    assert!(err.to_string().contains("BinaryTokens"));
+
+    let mut bit_session =
+        RateBackendBitSession::from_spec(RateBackend::Ctw { depth: 6 }, Some(8), semantics)
+            .expect("bit session");
+    let reset_err = bit_session
+        .reset_frozen(Some(9))
+        .expect_err("reset should reject non-byte-aligned total_bits");
+    assert!(reset_err.to_string().contains("whole number of bytes"));
+
+    let begin_err = bit_session
+        .begin_bit_stream(Some(9), semantics)
+        .expect_err("begin should reject non-byte-aligned total_bits");
+    assert!(begin_err.contains("whole number of bytes"));
+}
+
+#[cfg(feature = "backend-zpaq")]
+#[test]
+fn api_surface_zpaq_bit_session_begin_stream_does_not_require_frozen_reset() {
+    let semantics = BitStreamSemantics::BinaryTokens;
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Zpaq {
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
+        },
+        Some(9),
+        semantics,
+    )
+    .expect("zpaq bit session");
+
+    let reset_err = bit_session
+        .reset_frozen(Some(9))
+        .expect_err("zpaq must continue to reject frozen-reset semantics");
+    assert!(reset_err.to_string().contains("plugin entropy"));
+
+    bit_session
+        .begin_bit_stream(Some(9), semantics)
+        .expect("zpaq stream restarts should use begin/finish lifecycle hooks");
+
+    for bit in [true, false, true, true, false, false, true, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "zpaq binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("zpaq bit finish");
+}
+
+#[cfg(feature = "backend-zpaq")]
+#[test]
+fn api_surface_zpaq_byte_packed_bit_session_is_rejected() {
+    let err = match RateBackendBitSession::from_spec(
+        RateBackend::Zpaq {
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
+        },
+        Some(8),
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    ) {
+        Ok(_) => panic!("zpaq byte-packed session should be rejected"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(message.contains("does not support efficient BitStreamSemantics::BytePacked"));
+}
+
+#[cfg(feature = "backend-zpaq")]
+#[test]
+fn api_surface_zpaq_rate_backend_session_begin_stream_does_not_require_frozen_reset() {
+    let mut session = RateBackendSession::from_spec(
+        RateBackend::Zpaq {
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
+        },
+        Some(9),
+    )
+    .expect("zpaq rate session");
+
+    let reset_err = session
+        .reset_frozen(Some(9))
+        .expect_err("zpaq must continue to reject frozen-reset semantics");
+    assert!(reset_err.to_string().contains("plugin entropy"));
+
+    session
+        .begin_stream(Some(9))
+        .expect("zpaq stream restarts should use begin/finish lifecycle hooks");
+
+    let mut row = [0.0f64; 256];
+    session.fill_log_probs(&mut row);
+    assert!(row.iter().all(|lp| lp.is_finite()));
+    let first_row = row;
+
+    session.observe(&[0, 1, 0, 1, 1, 0, 1, 0, 1]);
+    // Exercise ordinary ZPAQ compression in-process before stream restart;
+    // restarted session probabilities must still match a fresh session.
+    let zpaq_compression = CompressionBackend::zpaq("1")
+        .compile()
+        .expect("compile zpaq compression backend");
+    let _ = try_compress_bytes_backend(b"zpaq helper warmup", &zpaq_compression)
+        .expect("zpaq helper compression");
+    session
+        .begin_stream(Some(9))
+        .expect("zpaq stream should be restartable repeatedly");
+    let mut restarted_row = [0.0f64; 256];
+    session.fill_log_probs(&mut restarted_row);
+    let mut fresh = RateBackendSession::from_spec(
+        RateBackend::Zpaq {
+            method: infotheory::api::ZpaqMethodSpec::literal("1"),
+        },
+        Some(9),
+    )
+    .expect("fresh zpaq rate session");
+    let mut fresh_row = [0.0f64; 256];
+    fresh.fill_log_probs(&mut fresh_row);
+    for idx in 0..256usize {
+        assert!(
+            (restarted_row[idx] - fresh_row[idx]).abs() < 1e-12,
+            "zpaq restart must match fresh-session state at symbol {idx}: restarted={} fresh={}",
+            restarted_row[idx],
+            fresh_row[idx]
+        );
+    }
+    // Sanity check: this test should fail if restart preserves post-observation history.
+    let changed = (0..256usize).any(|idx| (first_row[idx] - restarted_row[idx]).abs() > 1e-12);
+    assert!(
+        !changed,
+        "zpaq restart should return to the initial stream state"
+    );
+    session.finish().expect("zpaq rate finish");
+    fresh.finish().expect("fresh zpaq rate finish");
+}
+
+#[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
+#[test]
+fn api_surface_mixture_begin_stream_resets_wrapper_priors_after_expert_restart() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 0 }),
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 }),
+            ],
+        )),
+    };
+    let train = b"ABABABABABABABABABABABABABABABAB";
+
+    let mut reset_session =
+        RateBackendSession::from_spec(backend.clone(), None).expect("reset session");
+    let mut restarted_session =
+        RateBackendSession::from_spec(backend.clone(), None).expect("restarted session");
+    let mut fresh_session = RateBackendSession::from_spec(backend, None).expect("fresh session");
+
+    reset_session.observe(train);
+    restarted_session.observe(train);
+
+    reset_session.reset_frozen(None).expect("reset_frozen");
+    restarted_session.begin_stream(None).expect("begin_stream");
+
+    let mut reset_row = [0.0f64; 256];
+    let mut restarted_row = [0.0f64; 256];
+    let mut fresh_row = [0.0f64; 256];
+    reset_session.fill_log_probs(&mut reset_row);
+    restarted_session.fill_log_probs(&mut restarted_row);
+    fresh_session.fill_log_probs(&mut fresh_row);
+
+    let diverged_from_reset =
+        (0..256usize).any(|byte| (reset_row[byte] - restarted_row[byte]).abs() > 1e-12);
+    assert!(
+        diverged_from_reset,
+        "mixture begin_stream should reset sequence-local wrapper weights instead of preserving reset_frozen posterior state"
+    );
+
+    let diverged_from_fresh =
+        (0..256usize).any(|byte| (restarted_row[byte] - fresh_row[byte]).abs() > 1e-12);
+    assert!(
+        diverged_from_fresh,
+        "mixture begin_stream should preserve restarted expert state instead of rebuilding fresh experts"
+    );
+}
+
+#[cfg(all(
+    feature = "backend-mixture",
+    feature = "backend-zpaq",
+    feature = "backend-ctw"
+))]
+#[test]
+fn api_surface_mixture_with_zpaq_expert_can_restart_bit_streams() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 }),
+                MixtureExpertSpec::new(RateBackend::Zpaq {
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
+                }),
+            ],
+        )),
+    };
+    let mut bit_session =
+        RateBackendBitSession::from_spec(backend, Some(9), BitStreamSemantics::BinaryTokens)
+            .expect("mixture bit session");
+
+    let reset_err = bit_session
+        .reset_frozen(Some(9))
+        .expect_err("mixtures containing zpaq experts cannot satisfy frozen-reset semantics");
+    assert!(reset_err.to_string().contains("plugin entropy"));
+
+    bit_session
+        .begin_bit_stream(Some(9), BitStreamSemantics::BinaryTokens)
+        .expect("mixture stream restarts should fall back to lifecycle hooks");
+
+    for bit in [true, false, true, false, true, true, false, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "mixture-zpaq binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("mixture-zpaq bit finish");
+}
+
+#[cfg(all(
+    feature = "backend-mixture",
+    feature = "backend-zpaq",
+    feature = "backend-ctw"
+))]
+#[test]
+fn api_surface_mixture_with_zpaq_rate_backend_session_can_restart_streams() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 }),
+                MixtureExpertSpec::new(RateBackend::Zpaq {
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
+                }),
+            ],
+        )),
+    };
+    let mut session = RateBackendSession::from_spec(backend, Some(9)).expect("mixture session");
+
+    let reset_err = session
+        .reset_frozen(Some(9))
+        .expect_err("mixtures containing zpaq experts cannot satisfy frozen-reset semantics");
+    assert!(reset_err.to_string().contains("plugin entropy"));
+
+    session
+        .begin_stream(Some(9))
+        .expect("mixture stream restarts should use begin/finish lifecycle hooks");
+
+    let mut row = [0.0f64; 256];
+    session.fill_log_probs(&mut row);
+    assert!(row.iter().all(|lp| lp.is_finite()));
+    let first_row = row;
+
+    session.observe(&[1, 0, 1, 0, 1, 1, 0, 0, 1]);
+    session
+        .begin_stream(Some(9))
+        .expect("mixture stream should be restartable repeatedly");
+    let mut restarted_row = [0.0f64; 256];
+    session.fill_log_probs(&mut restarted_row);
+    assert!(restarted_row.iter().all(|lp| lp.is_finite()));
+    let changed = (0..256usize).any(|idx| (first_row[idx] - restarted_row[idx]).abs() > 1e-12);
+    assert!(
+        changed,
+        "mixture+zpaq restart should preserve fitted state from resettable experts"
+    );
+    session.finish().expect("mixture rate finish");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_byte_packed_finish_rejects_dangling_partial_byte() {
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        None,
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+
+    for bit in [true, false, true] {
+        bit_session.observe_bit(bit);
+    }
+
+    let err = bit_session
+        .finish()
+        .expect_err("dangling partial byte must not be discarded");
+    assert!(err.to_string().contains("whole-byte boundary"));
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_byte_packed_finish_allows_prediction_without_observe() {
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        None,
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("bit session");
+
+    let prediction = bit_session.predict_bit();
+    let sum = prediction.p0 + prediction.p1;
+    assert!(
+        (sum - 1.0).abs() < 1e-12,
+        "byte-packed prediction must stay normalized, got {sum}"
+    );
+
+    bit_session
+        .finish()
+        .expect("prediction-only byte-packed sessions must finish cleanly");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_binary_tokens_accept_arbitrary_length_streams() {
+    let mut bit_session = RateBackendBitSession::from_spec(
+        RateBackend::Ctw { depth: 6 },
+        Some(9),
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("bit session");
+
+    for bit in [true, false, true, true, false, false, true, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_fac_ctw_binary_tokens_accept_arbitrary_length_streams() {
+    let compiled = RateBackend::FacCtw {
+        base_depth: 6,
+        num_percept_bits: 8,
+        encoding_bits: 8,
+        msb_first: None,
+    }
+    .compile()
+    .expect("compiled fac-ctw");
+    assert!(compiled.capabilities().supports_native_bit_prediction);
+    assert!(compiled.capabilities().supports_byte_prefix_mass);
+    assert!(compiled.supports_efficient_byte_packed_bit_sessions());
+    assert!(compiled.capabilities().supports_reversible_bit_updates);
+
+    let mut bit_session =
+        RateBackendBitSession::from_backend(compiled, Some(9), BitStreamSemantics::BinaryTokens)
+            .expect("fac-ctw binary-token session");
+
+    for bit in [true, false, true, false, true, true, false, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
+#[test]
+fn api_surface_mixture_over_native_bit_backend_preserves_binary_tokens() {
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 })],
+        )),
+    };
+    let compiled = backend.clone().compile().expect("compiled mixture");
+    assert!(compiled.capabilities().supports_native_bit_prediction);
+    assert!(compiled.capabilities().supports_byte_prefix_mass);
+    assert!(compiled.supports_efficient_byte_packed_bit_sessions());
+    assert!(compiled.capabilities().supports_reversible_bit_updates);
+
+    let mut bit_session =
+        RateBackendBitSession::from_spec(backend, Some(9), BitStreamSemantics::BinaryTokens)
+            .expect("mixture binary-token session");
+
+    for bit in [true, false, false, true, true, false, true, false, true] {
+        let prediction = bit_session.step_bit(bit);
+        let sum = prediction.p0 + prediction.p1;
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "binary-token prediction must stay normalized, got {sum}"
+        );
+    }
+
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(feature = "backend-match")]
+#[test]
+fn api_surface_binary_tokens_adapt_byte_native_backends() {
+    let backend = RateBackend::Match {
+        hash_bits: 20,
+        min_len: 4,
+        max_len: 255,
+        base_mix: 0.02,
+        confidence_scale: 1.0,
+    };
+    let compiled = backend.clone().compile().expect("compiled match");
+    assert!(!compiled.capabilities().supports_native_bit_prediction);
+
+    let mut byte_session =
+        RateBackendSession::from_spec(backend.clone(), Some(9)).expect("byte session");
+    let mut bit_session =
+        RateBackendBitSession::from_spec(backend, Some(9), BitStreamSemantics::BinaryTokens)
+            .expect("binary-token session");
+
+    for &bit in &[true, false, true, true, false, false, true, false, true] {
+        let mut row = [0.0f64; 256];
+        byte_session.fill_log_probs(&mut row);
+        let p0 = row[0].exp();
+        let p1 = row[1].exp();
+        let total = p0 + p1;
+        let expected_p0 = if total.is_finite() && total > 0.0 {
+            p0 / total
+        } else {
+            0.5
+        };
+        let expected_p1 = if total.is_finite() && total > 0.0 {
+            p1 / total
+        } else {
+            0.5
+        };
+
+        let prediction = bit_session.step_bit(bit);
+        assert!(
+            (prediction.p0 + prediction.p1 - 1.0).abs() < 1e-12,
+            "binary-token adaptation must stay normalized, got p0={} p1={}",
+            prediction.p0,
+            prediction.p1
+        );
+        assert!(
+            (prediction.p0 - expected_p0).abs() < 1e-12,
+            "adapted p0 drifted: got {} expected {}",
+            prediction.p0,
+            expected_p0
+        );
+        assert!(
+            (prediction.p1 - expected_p1).abs() < 1e-12,
+            "adapted p1 drifted: got {} expected {}",
+            prediction.p1,
+            expected_p1
+        );
+
+        byte_session.observe(&[u8::from(bit)]);
+    }
+
+    byte_session.finish().expect("byte finish");
+    bit_session.finish().expect("bit finish");
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn api_surface_rate_backend_bit_capabilities_are_explicit() {
+    let ctw = RateBackend::Ctw { depth: 6 }
+        .compile()
+        .expect("compiled ctw");
+    assert!(ctw.capabilities().supports_native_bit_prediction);
+    assert!(ctw.capabilities().supports_byte_prefix_mass);
+    assert!(ctw.supports_efficient_byte_packed_bit_sessions());
+    assert!(ctw.capabilities().supports_reversible_bit_updates);
+
+    #[cfg(feature = "backend-match")]
+    {
+        let match_backend = RateBackend::Match {
+            hash_bits: 20,
+            min_len: 4,
+            max_len: 255,
+            base_mix: 0.02,
+            confidence_scale: 1.0,
+        }
+        .compile()
+        .expect("compiled match");
+        assert!(!match_backend.capabilities().supports_native_bit_prediction);
+        assert!(match_backend.capabilities().supports_byte_prefix_mass);
+        assert!(match_backend.supports_efficient_byte_packed_bit_sessions());
+        assert!(!match_backend.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(feature = "backend-zpaq")]
+    {
+        use infotheory::api::ZpaqMethodSpec;
+
+        let zpaq = RateBackend::Zpaq {
+            method: ZpaqMethodSpec::Literal {
+                value: "1".to_string(),
+            },
+        }
+        .compile()
+        .expect("compiled zpaq");
+        assert!(!zpaq.capabilities().supports_native_bit_prediction);
+        assert!(zpaq.capabilities().supports_byte_prefix_mass);
+        assert!(!zpaq.supports_efficient_byte_packed_bit_sessions());
+        assert!(!zpaq.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(feature = "backend-mixture")]
+    {
+        let mixture = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![MixtureExpertSpec::new(RateBackend::Ctw { depth: 6 })],
+            )),
+        }
+        .compile()
+        .expect("compiled mixture");
+        assert!(mixture.capabilities().supports_native_bit_prediction);
+        assert!(mixture.capabilities().supports_byte_prefix_mass);
+        assert!(mixture.supports_efficient_byte_packed_bit_sessions());
+        assert!(mixture.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(all(feature = "backend-mixture", feature = "backend-zpaq"))]
+    {
+        let mixture = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![MixtureExpertSpec::new(RateBackend::Zpaq {
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
+                })],
+            )),
+        }
+        .compile()
+        .expect("compiled zpaq mixture");
+        assert!(!mixture.capabilities().supports_native_bit_prediction);
+        assert!(mixture.capabilities().supports_byte_prefix_mass);
+        assert!(!mixture.supports_efficient_byte_packed_bit_sessions());
+        assert!(!mixture.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(all(feature = "backend-mixture", feature = "backend-match"))]
+    {
+        let mixture = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![MixtureExpertSpec::new(RateBackend::Match {
+                    hash_bits: 20,
+                    min_len: 4,
+                    max_len: 255,
+                    base_mix: 0.02,
+                    confidence_scale: 1.0,
+                })],
+            )),
+        }
+        .compile()
+        .expect("compiled byte-native mixture");
+        assert!(!mixture.capabilities().supports_native_bit_prediction);
+        assert!(mixture.capabilities().supports_byte_prefix_mass);
+        assert!(mixture.supports_efficient_byte_packed_bit_sessions());
+        assert!(!mixture.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(feature = "backend-calibrated")]
+    {
+        let calibrated = RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec::new(
+                RateBackend::Ctw { depth: 6 },
+                CalibrationContextKind::Global,
+            )),
+        }
+        .compile()
+        .expect("compiled calibrated");
+        assert!(calibrated.capabilities().supports_native_bit_prediction);
+        assert!(calibrated.capabilities().supports_byte_prefix_mass);
+        assert!(calibrated.supports_efficient_byte_packed_bit_sessions());
+        assert!(calibrated.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-zpaq"))]
+    {
+        let calibrated = RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec::new(
+                RateBackend::Zpaq {
+                    method: infotheory::api::ZpaqMethodSpec::literal("1"),
+                },
+                CalibrationContextKind::Global,
+            )),
+        }
+        .compile()
+        .expect("compiled zpaq calibrated");
+        assert!(!calibrated.capabilities().supports_native_bit_prediction);
+        assert!(calibrated.capabilities().supports_byte_prefix_mass);
+        assert!(!calibrated.supports_efficient_byte_packed_bit_sessions());
+        assert!(!calibrated.capabilities().supports_reversible_bit_updates);
+    }
+
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-match"))]
+    {
+        let calibrated = RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec::new(
+                RateBackend::Match {
+                    hash_bits: 20,
+                    min_len: 4,
+                    max_len: 255,
+                    base_mix: 0.02,
+                    confidence_scale: 1.0,
+                },
+                CalibrationContextKind::Global,
+            )),
+        }
+        .compile()
+        .expect("compiled byte-native calibrated");
+        assert!(!calibrated.capabilities().supports_native_bit_prediction);
+        assert!(calibrated.capabilities().supports_byte_prefix_mass);
+        assert!(calibrated.supports_efficient_byte_packed_bit_sessions());
+        assert!(!calibrated.capabilities().supports_reversible_bit_updates);
+    }
 }
 
 #[cfg(feature = "backend-ctw")]

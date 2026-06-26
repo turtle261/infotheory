@@ -1,7 +1,7 @@
 //! Canonical top-level specification document schema types.
 
 use crate::aixi::common::{ActionAlphabet, MctsStrategy, ObservationKeyMode};
-use crate::api::{CompressionBackend, RateBackend};
+use crate::api::{BitStreamSemantics, CompressionBackend, RateBackend};
 use crate::spec::core::{
     AssetRef, CanonicalBytes, CompiledCompressionBackend, CompiledRateBackend,
     ValidatedCompressionBackend, ValidatedRateBackend,
@@ -354,6 +354,8 @@ pub struct TunePlannerInterfaceSpec {
 pub struct McAixiControllerSpec {
     /// Predictive backend used by the planner model.
     pub predictor: RateBackend,
+    /// Bit-stream semantics used to adapt the predictor to AIXI symbols.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Planning horizon.
     pub agent_horizon: usize,
     /// Number of simulations per planning step.
@@ -372,6 +374,8 @@ pub struct McAixiControllerSpec {
 pub struct AiqiDiscountedControllerSpec {
     /// Predictive backend used by the return model.
     pub predictor: RateBackend,
+    /// Bit-stream semantics used to adapt the predictor to AIQI symbols.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Discount factor used for return construction.
     pub discount_gamma: f64,
     /// Return horizon.
@@ -387,20 +391,30 @@ pub struct AiqiDiscountedControllerSpec {
 }
 
 /// Warm-start exact-\u{1d4a5}_H controller configuration.
+#[cfg(feature = "aixi")]
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct WarmStartExactJhControllerSpec {
     /// Predictive backend used by the return model.
     pub predictor: RateBackend,
+    /// Bit-stream semantics used to adapt the predictor to warm-start symbols.
+    pub bit_stream_semantics: BitStreamSemantics,
     /// Return horizon in planner steps.
     pub return_horizon: usize,
     /// Exact return-label alphabet size.
+    ///
+    /// Valid canonical warm-start specs use `return_horizon * max_reward + 1`;
+    /// slack labels are rejected because they do not represent reachable exact
+    /// returns.
     pub return_bins: usize,
     /// Delayed-label phase period.
     pub label_phase_period: usize,
     /// Asset identifier for the warm-start teacher dataset.
     pub teacher_dataset_asset: AssetId,
-    /// Simulation budget per planner step.
+    /// Canonical direct-evaluator budget marker.
+    ///
+    /// Warm-start exact-\(J_H\) performs deterministic full return-law
+    /// evaluation, not MCTS-style simulation. Valid canonical specs use `1`.
     pub planner_simulations_per_step: usize,
 }
 
@@ -413,6 +427,7 @@ pub enum ControllerSpec {
     /// Discounted AIQI.
     AiqiDiscounted(AiqiDiscountedControllerSpec),
     /// Warm-start exact-\u{1d4a5}_H AIQI-style controller.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh(WarmStartExactJhControllerSpec),
 }
 
@@ -470,6 +485,7 @@ pub enum TuneControllerKind {
     /// Discounted AIQI.
     AiqiDiscounted,
     /// Warm-start exact-\u{1d4a5}_H controller.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh,
 }
 
@@ -521,7 +537,10 @@ pub struct AiqiDiscountedTuneControllerSpec {
 pub struct WarmStartExactJhTuneControllerSpec {
     /// Planner/environment observation/reward/action contract.
     pub interface: TunePlannerInterfaceSpec,
-    /// Simulation budget per planner step.
+    /// Canonical direct-evaluator budget marker.
+    ///
+    /// Warm-start exact-\(J_H\) performs deterministic full return-law
+    /// evaluation, not MCTS-style simulation. Valid canonical specs use `1`.
     pub planner_simulations_per_step: usize,
     /// Return horizon.
     pub return_horizon: usize,
@@ -543,6 +562,7 @@ pub enum TuneControllerSpec {
     /// Discounted AIQI.
     AiqiDiscounted(AiqiDiscountedTuneControllerSpec),
     /// Warm-start exact-J_H.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec),
 }
 
@@ -554,6 +574,7 @@ impl TuneControllerSpec {
             Self::AnnealedHillClimbing(_) => TuneControllerKind::AnnealedHillClimbing,
             Self::McAixiFacCtw(_) => TuneControllerKind::McAixiFacCtw,
             Self::AiqiDiscounted(_) => TuneControllerKind::AiqiDiscounted,
+            #[cfg(feature = "aixi")]
             Self::AiqiWarmstartExactJh(_) => TuneControllerKind::AiqiWarmstartExactJh,
         }
     }
@@ -602,15 +623,18 @@ mod tests {
         });
         assert_eq!(aiqi.kind(), TuneControllerKind::AiqiDiscounted);
 
-        let warmstart =
-            TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
-                interface: sample_tune_interface(),
-                planner_simulations_per_step: 8,
-                return_horizon: 2,
-                warmstart_teacher_dataset_asset: "teacher".to_string(),
-                label_phase_period: 3,
-            });
-        assert_eq!(warmstart.kind(), TuneControllerKind::AiqiWarmstartExactJh);
+        #[cfg(feature = "aixi")]
+        {
+            let warmstart =
+                TuneControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec {
+                    interface: sample_tune_interface(),
+                    planner_simulations_per_step: 1,
+                    return_horizon: 2,
+                    warmstart_teacher_dataset_asset: "teacher".to_string(),
+                    label_phase_period: 3,
+                });
+            assert_eq!(warmstart.kind(), TuneControllerKind::AiqiWarmstartExactJh);
+        }
     }
 }
 
@@ -691,6 +715,8 @@ pub enum CompiledPlannerController {
     McAixi {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
+        /// Bit-stream semantics used to adapt the predictor to AIXI symbols.
+        bit_stream_semantics: BitStreamSemantics,
         /// Planning horizon.
         agent_horizon: usize,
         /// Number of simulations per planning step.
@@ -706,6 +732,8 @@ pub enum CompiledPlannerController {
     AiqiDiscounted {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
+        /// Bit-stream semantics used to adapt the predictor to AIQI symbols.
+        bit_stream_semantics: BitStreamSemantics,
         /// Discount factor used for return construction.
         discount_gamma: f64,
         /// Return horizon.
@@ -720,9 +748,12 @@ pub enum CompiledPlannerController {
         baseline_exploration: f64,
     },
     /// Warm-start exact-J_H controller.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh {
         /// Compiled predictor backend.
         predictor: CompiledRateBackend,
+        /// Bit-stream semantics used to adapt the predictor to warm-start symbols.
+        bit_stream_semantics: BitStreamSemantics,
         /// Return horizon.
         return_horizon: usize,
         /// Number of return bins.
@@ -731,7 +762,7 @@ pub enum CompiledPlannerController {
         label_phase_period: usize,
         /// Teacher dataset asset id.
         teacher_dataset_asset: AssetId,
-        /// Simulation budget per planner step.
+        /// Canonical direct-evaluator budget marker.
         planner_simulations_per_step: usize,
     },
 }
@@ -761,6 +792,7 @@ pub enum CompiledTuneController {
     /// Discounted AIQI.
     AiqiDiscounted(AiqiDiscountedTuneControllerSpec),
     /// Warm-start exact-J_H.
+    #[cfg(feature = "aixi")]
     AiqiWarmstartExactJh(WarmStartExactJhTuneControllerSpec),
 }
 
@@ -781,6 +813,7 @@ pub struct CompiledTuneSpec {
 /// Universal top-level spec document.
 #[derive(Clone)]
 #[non_exhaustive]
+#[allow(clippy::large_enum_variant)]
 pub enum SpecDocument {
     /// Planner-run configuration document.
     PlannerRun(PlannerRunSpec),
@@ -848,6 +881,7 @@ pub enum ValidatedSpecDocument {
 /// runtime adapters.
 #[derive(Clone)]
 #[non_exhaustive]
+#[allow(clippy::large_enum_variant)]
 pub enum CompiledSpecDocument {
     /// Compiled planner-run document.
     PlannerRun(CompiledPlannerRunSpec),

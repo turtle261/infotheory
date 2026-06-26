@@ -193,6 +193,10 @@ latest_existing_raw_tsv() {
   ls -1t "/tmp/${SUITE_PATH_PREFIX}-raw-"*.tsv 2>/dev/null | head -n 1 || true
 }
 
+current_two_json_baseline_tsv() {
+  ls -1t "${ROOT_DIR}/benchmarks/current/infotheory-two-json-summary"*.tsv 2>/dev/null | head -n 1 || true
+}
+
 resolve_output_paths() {
   latest_raw=
   if [ -n "${INFOTHEORY_BENCH_RAW_TSV:-}" ]; then
@@ -376,6 +380,16 @@ def slug(text: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip())
     return text.strip("-").lower() or "expert"
 
+def canonical_subject_name(expert):
+    kind = str(expert.get("kind") or "")
+    name = str(expert.get("name") or kind or "expert")
+    # The canonical two-json CTW slot is now the factorized byte/MSB model.
+    # Preserve old suite files that still named this subject "ctw" while keeping
+    # deliberately custom names untouched.
+    if kind == "fac-ctw" and slug(name) == "ctw":
+        return "fac-ctw"
+    return name
+
 print("subject\tsubject_kind\texpert_kind\tspec_path\th_order")
 print(
     "\t".join(
@@ -390,7 +404,7 @@ print(
 )
 for expert in experts:
     expert_resolved = canonicalize_relative_paths(expert)
-    name = str(expert_resolved.get("name") or expert_resolved.get("kind") or "expert")
+    name = canonical_subject_name(expert_resolved)
     subject = slug(name)
     out_path = subject_dir / f"{subject}.json"
     out_path.write_text(json.dumps(expert_resolved, indent=2, sort_keys=True) + "\n")
@@ -925,7 +939,12 @@ sorted_keys = sorted(
 )
 
 with open(summary_path, "w", newline="") as fh:
-    writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
+    writer = csv.DictWriter(
+        fh,
+        fieldnames=fieldnames,
+        delimiter="\t",
+        lineterminator="\n",
+    )
     writer.writeheader()
     for key in sorted_keys:
         rows = groups[key]
@@ -984,8 +1003,13 @@ PY
 say "[bench] Raw TSV: ${RAW_TSV}"
 say "[bench] Summary TSV: ${SUMMARY_TSV}"
 if [ "${BENCH_SUITE}" = "two-json" ]; then
-  say "[bench] Compare against the checked-in baseline:"
-  say "  '${ROOT_DIR}/scripts/compare_bench_two_json.lua' --baseline '${ROOT_DIR}/benchmarks/current/infotheory-two-json-summary-20260322-120428.tsv' '${SUMMARY_TSV}'"
+  CURRENT_BASELINE_TSV=$(current_two_json_baseline_tsv)
+  if [ -n "${CURRENT_BASELINE_TSV}" ]; then
+    say "[bench] Compare against the checked-in baseline:"
+    say "  '${ROOT_DIR}/scripts/compare_bench_two_json.lua' --baseline '${CURRENT_BASELINE_TSV}' '${SUMMARY_TSV}'"
+  else
+    say "[bench] No checked-in two-json baseline summary found under benchmarks/current."
+  fi
 else
   say "[bench] No checked-in baseline comparator is configured for suite '${BENCH_SUITE}'."
 fi

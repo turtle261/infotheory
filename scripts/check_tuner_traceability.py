@@ -38,6 +38,10 @@ TUNER_SOURCES = (
     TUNER_MODULE_DIR / "tests.rs",
 )
 WARMSTART = ROOT / "crates" / "infotheory" / "src" / "aixi" / "warmstart.rs"
+WARMSTART_CONTRACT = (
+    ROOT / "crates" / "infotheory" / "src" / "aixi" / "warmstart_contract.rs"
+)
+PLANNER_RUNTIME = ROOT / "crates" / "infotheory" / "src" / "aixi" / "planner_runtime.rs"
 TUNER_TESTS = ROOT / "crates" / "infotheory" / "tests" / "tuner_integration.rs"
 SPEC_TESTS = ROOT / "crates" / "infotheory" / "src" / "spec" / "document" / "tests.rs"
 SPEC_PARSER = ROOT / "crates" / "infotheory" / "src" / "spec" / "document" / "parser.rs"
@@ -74,9 +78,13 @@ REQUIRED_REFS: tuple[tuple[str, Path], ...] = (
     ("project_observation_output", TUNER),
     ("compile_tuner_planner_run_spec", TUNER),
     ("validate_theorem_planner_mutation_domain", TUNER),
+    ("warmstart_exact_jh_planner_task_fingerprint", WARMSTART_CONTRACT),
     ("WarmStartExactJhTeacherDataset", WARMSTART),
     ("WarmStartExactJhTeacherContract", WARMSTART),
-    ("validate_warmstart_teacher_contract", TUNER),
+    ("warmstart_teacher_trace_from_jsonl_path", WARMSTART),
+    ("merge_warmstart_teacher_traces_deterministic", WARMSTART),
+    ("validate_warmstart_exact_jh_teacher_contract", PLANNER_RUNTIME),
+    ("load_warmstart_exact_jh_teacher_dataset", PLANNER_RUNTIME),
     ("WarmStartExactJhAgent::same_task_live_trace", WARMSTART),
     ("merge_warmstart_trace_deterministic", TUNER),
     ("TunerPlannerAgentRuntime::rebuild_warmstart_agent", TUNER),
@@ -104,6 +112,8 @@ REQUIRED_REFS: tuple[tuple[str, Path], ...] = (
     ("exact_state_observation_projection_supports_stream_hash", TUNER),
     ("exact_state_observation_certificate_rejects_duplicate_state_ids", TUNER_TESTS),
     ("warmstart_trace_refresh_merges_same_task_live_trace", TUNER_TESTS),
+    ("warmstart_exact_jh_json_binary_and_compile_roundtrip", SPEC_TESTS),
+    ("jsonl_trace_converter_rejects_malformed_and_inconsistent_records", WARMSTART),
     ("planner_deployable_model_flag_reports_objective_target_and_diagnostics", TUNER_TESTS),
     ("deterministic_table_peak_memory_can_make_baseline_nondeployable", TUNER_TESTS),
     ("real_time_timing_certificate_sets_verified_timing_basis", TUNER_TESTS),
@@ -371,6 +381,12 @@ def main() -> int:
     for path in TUNER_SOURCES:
         indices[path] = build_ast_index(path.read_bytes(), str(path.relative_to(ROOT)))
     indices[WARMSTART] = build_ast_index(WARMSTART.read_bytes(), str(WARMSTART.relative_to(ROOT)))
+    indices[WARMSTART_CONTRACT] = build_ast_index(
+        WARMSTART_CONTRACT.read_bytes(), str(WARMSTART_CONTRACT.relative_to(ROOT))
+    )
+    indices[PLANNER_RUNTIME] = build_ast_index(
+        PLANNER_RUNTIME.read_bytes(), str(PLANNER_RUNTIME.relative_to(ROOT))
+    )
     indices[TUNER_TESTS] = build_ast_index(TUNER_TESTS.read_bytes(), str(TUNER_TESTS.relative_to(ROOT)))
     indices[SPEC_TESTS] = build_ast_index(SPEC_TESTS.read_bytes(), str(SPEC_TESTS.relative_to(ROOT)))
     indices[SPEC_PARSER] = build_ast_index(SPEC_PARSER.read_bytes(), str(SPEC_PARSER.relative_to(ROOT)))
@@ -385,8 +401,11 @@ def main() -> int:
             missing.append(f"{TRACEABILITY.relative_to(ROOT)} does not cite `{ref}`")
 
         idx = tuner_aggregate if path == TUNER else indices[path]
+        if path == TUNER:
+            target = "tuner implementation sources"
+        else:
+            target = str(path.relative_to(ROOT))
         if not ref_exists_as_definition(ref, path, idx):
-            target = "tuner implementation sources" if path == TUNER else str(path.relative_to(ROOT))
             missing.append(f"{target} do not define `{ref}`")
 
     if missing:

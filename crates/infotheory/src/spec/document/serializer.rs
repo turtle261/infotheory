@@ -10,6 +10,7 @@ use super::{
     TuneBoundsSpec, TuneControllerSpec, TuneParameterRangeSpec, TunePlannerInterfaceSpec, TuneSpec,
 };
 use crate::aixi::common::MctsStrategy;
+use crate::api::{BitOrder, BitStreamSemantics};
 
 #[cfg(feature = "vm")]
 use super::{
@@ -145,6 +146,7 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
         ControllerSpec::McAixi(inner) => Ok(serde_json::json!({
             "kind": "mc_aixi",
             "predictor": rate_backend_to_json_value(&inner.predictor)?,
+            "bit_stream_semantics": bit_stream_semantics_to_json_value(inner.bit_stream_semantics),
             "agent_horizon": inner.agent_horizon,
             "num_simulations": inner.num_simulations,
             "mcts_strategy": mcts_strategy_to_json_value(inner.mcts_strategy),
@@ -154,6 +156,7 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
         ControllerSpec::AiqiDiscounted(inner) => Ok(serde_json::json!({
             "kind": "aiqi_discounted",
             "predictor": rate_backend_to_json_value(&inner.predictor)?,
+            "bit_stream_semantics": bit_stream_semantics_to_json_value(inner.bit_stream_semantics),
             "discount_gamma": inner.discount_gamma,
             "return_horizon": inner.return_horizon,
             "return_bins": inner.return_bins,
@@ -161,15 +164,32 @@ fn controller_spec_to_json_value(spec: &ControllerSpec) -> SpecResult<serde_json
             "history_prune_keep_steps": inner.history_prune_keep_steps,
             "baseline_exploration": inner.baseline_exploration,
         })),
+        #[cfg(feature = "aixi")]
         ControllerSpec::AiqiWarmstartExactJh(inner) => Ok(serde_json::json!({
             "kind": "aiqi_warmstart_exact_jh",
             "predictor": rate_backend_to_json_value(&inner.predictor)?,
+            "bit_stream_semantics": bit_stream_semantics_to_json_value(inner.bit_stream_semantics),
             "return_horizon": inner.return_horizon,
             "return_bins": inner.return_bins,
             "label_phase_period": inner.label_phase_period,
             "teacher_dataset_asset": inner.teacher_dataset_asset,
             "planner_simulations_per_step": inner.planner_simulations_per_step,
         })),
+    }
+}
+
+fn bit_stream_semantics_to_json_value(semantics: BitStreamSemantics) -> serde_json::Value {
+    match semantics {
+        BitStreamSemantics::BytePacked { order } => serde_json::json!({
+            "kind": "byte_packed",
+            "order": match order {
+                BitOrder::MsbFirst => "msb_first",
+                BitOrder::LsbFirst => "lsb_first",
+            },
+        }),
+        BitStreamSemantics::BinaryTokens => serde_json::json!({
+            "kind": "binary_tokens",
+        }),
     }
 }
 
@@ -240,6 +260,7 @@ fn tune_controller_to_json_value(spec: &TuneControllerSpec) -> serde_json::Value
             "min_improvement": inner.min_improvement,
             "max_improvement": inner.max_improvement,
         }),
+        #[cfg(feature = "aixi")]
         TuneControllerSpec::AiqiWarmstartExactJh(inner) => serde_json::json!({
             "kind": "aiqi_warmstart_exact_jh",
             "interface": tune_interface_spec_to_json_value(&inner.interface),

@@ -11,6 +11,7 @@ use crate::aixi::common::{
 };
 use crate::aixi::warmstart::{
     WarmStartExactJhAgent, WarmStartExactJhTeacherDataset, WarmStartExactJhTeacherTrace,
+    merge_warmstart_teacher_trace_deterministic,
 };
 use crate::api::RateBackend;
 use crate::runtime::CompressionRuntime;
@@ -18,7 +19,7 @@ use crate::spec::{
     AiqiDiscountedControllerSpec, AssetRef, BuiltinEnvironmentSpec, CanonicalJson,
     CompiledPlannerRunSpec, ControllerSpec, EnvironmentSpec, McAixiControllerSpec,
     PlannerInterfaceSpec, PlannerRunSpec, PlannerRuntimeSpec, SpecDocument, SpecEnvironment,
-    TuneInvalidReason, WarmStartExactJhControllerSpec, load_spec_document,
+    TuneInvalidReason, WarmStartExactJhControllerSpec, canonical_json_bytes, load_spec_document,
 };
 use crc32fast::Hasher;
 use serde_json::Value;
@@ -65,7 +66,7 @@ use eval::{
 use planner_bridge::{
     TunerRawObservation, compile_tuner_planner_run_spec, encode_tuner_planner_percept,
     merge_warmstart_trace_deterministic, planner_controller_contract,
-    validate_theorem_planner_mutation_domain, warmstart_trace_key,
+    validate_theorem_planner_mutation_domain,
 };
 use planner_bridge::{
     exact_nonnegative_i64_from_f64, key_less, normalized_clipped_improvement,
@@ -143,7 +144,7 @@ fn observation_adapter_spec_value() -> Value {
 }
 
 fn observation_adapter_content_hash() -> Result<String, String> {
-    serde_json::to_vec(&observation_adapter_spec_value())
+    canonical_json_bytes(&observation_adapter_spec_value())
         .map(|bytes| crc32_hex(&bytes))
         .map_err(|err| format!("failed to encode observation adapter spec: {err}"))
 }
@@ -438,7 +439,7 @@ impl EvaluatorProfile {
     }
 
     fn cache_identity_bytes(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(&serde_json::json!({
+        let value = serde_json::json!({
             "dataset_kind": dataset_kind_name(self.dataset_kind),
             "objective_target": objective_target_name(self.objective_target),
             "dataset_lowering_version": self.dataset_lowering_version,
@@ -464,8 +465,9 @@ impl EvaluatorProfile {
             "timing_certification_tier": timing_tier_name(self.timing_certification_tier),
             "build_profile": self.build_profile,
             "feature_set": self.feature_set,
-        }))
-        .map_err(|err| format!("failed to encode evaluator profile JSON: {err}"))
+        });
+        canonical_json_bytes(&value)
+            .map_err(|err| format!("failed to encode evaluator profile JSON: {err}"))
     }
 }
 
@@ -788,6 +790,7 @@ enum PlannerMutationAction {
         pointer: String,
         kind: NumericKind,
         delta: f64,
+        range: Option<(f64, f64)>,
     },
     Noop,
 }
@@ -2269,7 +2272,7 @@ fn bounds_hash(bounds: &crate::spec::TuneBoundsSpec) -> Result<String, String> {
         "required_experts": bounds.required_experts,
         "forbidden_expert_pairs": bounds.forbidden_expert_pairs,
     });
-    serde_json::to_vec(&value)
+    canonical_json_bytes(&value)
         .map(|bytes| crc32_hex(&bytes))
         .map_err(|err| format!("failed to serialize bounds for hash: {err}"))
 }

@@ -38,6 +38,8 @@ const LM_PACKED_CNT_MAX: u16 = u16::MAX;
 // This crate is used byte-wise by infotheory; for fast incremental conditional updates we
 // support an optional fixed 256-byte alphabet LM build/update path.
 const BYTE_ALPHA_N: usize = 256;
+const ROSA_STREAM_HINT_CAP_SYMBOLS: usize = 1 << 16;
+const ROSA_GROWTH_MIN_CHUNK_SYMBOLS: usize = 4096;
 
 #[inline(always)]
 fn state_ix(idx: usize) -> SamStateIx {
@@ -198,6 +200,215 @@ struct SamEdge {
     next: SamEdgeIx,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SamText {
+    Byte(Vec<u8>),
+    Codepoint(Vec<u32>),
+}
+
+impl Default for SamText {
+    fn default() -> Self {
+        Self::with_expected(0)
+    }
+}
+
+impl SamText {
+    fn with_expected(expected_symbols: usize) -> Self {
+        let cap = if expected_symbols > 0 {
+            expected_symbols + 16
+        } else {
+            1024
+        };
+        Self::Byte(Vec::with_capacity(cap))
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        match self {
+            Self::Byte(bytes) => bytes.len(),
+            Self::Codepoint(cps) => cps.len(),
+        }
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Byte(bytes) => bytes.capacity(),
+            Self::Codepoint(cps) => cps.capacity(),
+        }
+    }
+
+    #[inline(always)]
+    fn reserve_exact(&mut self, additional: usize) {
+        match self {
+            Self::Byte(bytes) => bytes.reserve_exact(additional),
+            Self::Codepoint(cps) => cps.reserve_exact(additional),
+        }
+    }
+
+    #[inline(always)]
+    fn truncate(&mut self, new_len: usize) {
+        match self {
+            Self::Byte(bytes) => bytes.truncate(new_len),
+            Self::Codepoint(cps) => cps.truncate(new_len),
+        }
+    }
+
+    #[inline(always)]
+    fn get_u32(&self, idx: usize) -> u32 {
+        match self {
+            Self::Byte(bytes) => bytes[idx] as u32,
+            Self::Codepoint(cps) => cps[idx],
+        }
+    }
+
+    #[inline(always)]
+    fn push_u32(&mut self, ch: u32) {
+        match self {
+            Self::Byte(bytes) if ch < BYTE_ALPHA_N as u32 => {
+                bytes.push(ch as u8);
+            }
+            Self::Byte(bytes) => {
+                let mut promoted =
+                    Vec::with_capacity(bytes.capacity().max(bytes.len().saturating_add(1)));
+                promoted.extend(bytes.iter().copied().map(u32::from));
+                promoted.push(ch);
+                *self = Self::Codepoint(promoted);
+            }
+            Self::Codepoint(cps) => {
+                cps.push(ch);
+            }
+        }
+    }
+
+    fn extend_from_u32_slice(&mut self, xs: &[u32]) {
+        for &x in xs {
+            self.push_u32(x);
+        }
+    }
+
+    fn clone_as_u32_vec(&self) -> Vec<u32> {
+        match self {
+            Self::Byte(bytes) => bytes.iter().copied().map(u32::from).collect(),
+            Self::Codepoint(cps) => cps.clone(),
+        }
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        match self {
+            Self::Byte(bytes) => bytes.capacity().saturating_mul(std::mem::size_of::<u8>()),
+            Self::Codepoint(cps) => cps.capacity().saturating_mul(std::mem::size_of::<u32>()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BoundaryBits {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl BoundaryBits {
+    fn with_expected(expected_symbols: usize) -> Self {
+        let mut out = Self::default();
+        if expected_symbols > 0 {
+            out.reserve_exact(expected_symbols + 16);
+        } else {
+            out.reserve_exact(1024);
+        }
+        out
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn reserve_exact(&mut self, additional: usize) {
+        let needed_bits = self.len.saturating_add(additional);
+        let needed_words = needed_bits.div_ceil(64);
+        let current_words = self.words.len();
+        if needed_words > current_words {
+            self.words.reserve_exact(needed_words - current_words);
+        }
+    }
+
+    #[inline(always)]
+    fn push_clear(&mut self) {
+        let bit = self.len;
+        let word = bit / 64;
+        if word == self.words.len() {
+            self.words.push(0);
+        }
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    fn get(&self, idx: usize) -> bool {
+        if idx >= self.len {
+            return false;
+        }
+        let word = idx / 64;
+        let bit = idx % 64;
+        ((self.words[word] >> bit) & 1) != 0
+    }
+
+    #[inline(always)]
+    fn set(&mut self, idx: usize) {
+        debug_assert!(idx < self.len);
+        let word = idx / 64;
+        let bit = idx % 64;
+        self.words[word] |= 1u64 << bit;
+    }
+
+    fn truncate(&mut self, new_len: usize) {
+        if new_len >= self.len {
+            return;
+        }
+        self.len = new_len;
+        let keep_words = new_len.div_ceil(64);
+        self.words.truncate(keep_words);
+        if let Some(last) = self.words.last_mut() {
+            let bits = new_len % 64;
+            if bits != 0 {
+                *last &= (1u64 << bits) - 1;
+            }
+        }
+    }
+
+    fn to_byte_vec(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.len];
+        for (idx, slot) in out.iter_mut().enumerate() {
+            *slot = u8::from(self.get(idx));
+        }
+        out
+    }
+
+    fn load_from_bytes(&mut self, xs: &[u8]) {
+        self.words.clear();
+        self.len = 0;
+        self.reserve_exact(xs.len());
+        for &x in xs {
+            self.push_clear();
+            if x != 0 {
+                self.set(self.len - 1);
+            }
+        }
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.words
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>())
+    }
+}
+
 #[derive(Clone)]
 struct Sam {
     st: Vec<SamState>,
@@ -205,9 +416,9 @@ struct Sam {
     last: SamStateIx,
     root_to: [SamStateIx; BYTE_ALPHA_N],
 
-    text: Vec<u32>,
+    text: SamText,
     text_states: Vec<SamStateIx>,
-    boundary_after: Vec<u8>,
+    boundary_after: BoundaryBits,
 }
 
 impl Default for Sam {
@@ -223,9 +434,9 @@ impl Sam {
             ed: Vec::new(),
             last: 0,
             root_to: [SAM_STATE_NONE; BYTE_ALPHA_N],
-            text: Vec::new(),
+            text: SamText::with_expected(expected_chars),
             text_states: Vec::new(),
-            boundary_after: Vec::new(),
+            boundary_after: BoundaryBits::with_expected(expected_chars),
         };
 
         let st_cap = if expected_chars > 0 {
@@ -238,16 +449,9 @@ impl Sam {
         } else {
             2048
         };
-        let text_cap = if expected_chars > 0 {
-            expected_chars + 16
-        } else {
-            1024
-        };
         s.st.reserve(st_cap);
         s.ed.reserve(ed_cap);
-        s.text.reserve(text_cap);
-        s.text_states.reserve(text_cap);
-        s.boundary_after.reserve(text_cap);
+        s.text_states.reserve(s.text.capacity().max(1));
 
         let root = SamState {
             link: SAM_STATE_NONE,
@@ -267,11 +471,54 @@ impl Sam {
         if additional == 0 {
             return;
         }
+        self.ensure_append_capacity(additional.min(ROSA_STREAM_HINT_CAP_SYMBOLS));
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.text.len()
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    #[inline(always)]
+    fn text_at(&self, idx: usize) -> u32 {
+        self.text.get_u32(idx)
+    }
+
+    fn text_u32_vec(&self) -> Vec<u32> {
+        self.text.clone_as_u32_vec()
+    }
+
+    fn set_text_from_u32_slice(&mut self, xs: &[u32]) {
+        self.text = SamText::with_expected(xs.len());
+        self.text.extend_from_u32_slice(xs);
+    }
+
+    fn boundary_bytes_vec(&self) -> Vec<u8> {
+        self.boundary_after.to_byte_vec()
+    }
+
+    #[inline(always)]
+    fn ensure_append_capacity(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        let current = self.text.capacity();
+        let needed = self.len().saturating_add(additional);
+        if needed <= current {
+            return;
+        }
+        let missing = needed - current;
+        let chunk = missing.max((current / 2).max(ROSA_GROWTH_MIN_CHUNK_SYMBOLS));
         self.st
-            .reserve_exact(additional.saturating_mul(2).saturating_add(16));
+            .reserve_exact(chunk.saturating_mul(2).saturating_add(16));
         self.ed
-            .reserve_exact(additional.saturating_mul(3).saturating_add(16));
-        let text_extra = additional.saturating_add(16);
+            .reserve_exact(chunk.saturating_mul(3).saturating_add(16));
+        let text_extra = chunk.saturating_add(16);
         self.text.reserve_exact(text_extra);
         self.text_states.reserve_exact(text_extra);
         self.boundary_after.reserve_exact(text_extra);
@@ -391,9 +638,10 @@ impl Sam {
     }
 
     fn feed(&mut self, ch: u32) {
-        let i = self.text.len() as i32;
-        self.text.push(ch);
-        self.boundary_after.push(0);
+        self.ensure_append_capacity(1);
+        let i = self.len() as i32;
+        self.text.push_u32(ch);
+        self.boundary_after.push_clear();
 
         let g = self.last;
         let r = state_ix(self.st.len());
@@ -450,9 +698,9 @@ impl Sam {
     }
 
     fn mark_boundary(&mut self) {
-        if !self.text.is_empty() {
-            let i = self.text.len() - 1;
-            self.boundary_after[i] = 1;
+        if !self.is_empty() {
+            let i = self.len() - 1;
+            self.boundary_after.set(i);
         }
         self.last = 0;
     }
@@ -520,15 +768,12 @@ impl Sam {
             let st = unsafe { self.st.get_unchecked(state_usize(u)) };
             let i = st.endpos;
             let j = i + 1;
-            if st.len > 0 && j >= 0 && (j as usize) < self.text.len() {
-                if i >= 0
-                    && (i as usize) < self.boundary_after.len()
-                    && self.boundary_after[i as usize] != 0
-                {
+            if st.len > 0 && j >= 0 && (j as usize) < self.len() {
+                if i >= 0 && self.boundary_after.get(i as usize) {
                     u = st.link;
                     continue;
                 }
-                return Some(self.text[j as usize]);
+                return Some(self.text_at(j as usize));
             }
             u = st.link;
         }
@@ -539,7 +784,7 @@ impl Sam {
     fn begin_tx(&self) -> SamTx {
         SamTx {
             old_last: self.last,
-            old_text_len: self.text.len(),
+            old_text_len: self.len(),
             old_text_states_len: self.text_states.len(),
             old_boundary_len: self.boundary_after.len(),
             old_st_len: self.st.len(),
@@ -666,9 +911,10 @@ impl Sam {
     }
 
     fn feed_tx(&mut self, tx: &mut SamTx, ch: u32) {
-        let i = self.text.len() as i32;
-        self.text.push(ch);
-        self.boundary_after.push(0);
+        self.ensure_append_capacity(1);
+        let i = self.len() as i32;
+        self.text.push_u32(ch);
+        self.boundary_after.push_clear();
 
         let g = self.last;
         let r = state_ix(self.st.len());
@@ -729,10 +975,10 @@ impl Sam {
     }
 
     fn mark_boundary_tx(&mut self, tx: &mut SamTx) {
-        if !self.text.is_empty() {
+        if !self.is_empty() {
             // boundary_after is truncated on rollback, so no need to log.
-            let i = self.text.len() - 1;
-            self.boundary_after[i] = 1;
+            let i = self.len() - 1;
+            self.boundary_after.set(i);
         }
         // last is restored on rollback.
         self.last = 0;
@@ -990,7 +1236,8 @@ impl LM {
         self.byte_map = [-1; 256];
 
         let mut max_cp = 0u32;
-        for &v in &sam.text {
+        for idx in 0..sam.len() {
+            let v = sam.text_at(idx);
             if v > max_cp {
                 max_cp = v;
             }
@@ -998,7 +1245,8 @@ impl LM {
 
         if max_cp < 256 {
             let mut counts = [0u64; 256];
-            for &v in &sam.text {
+            for idx in 0..sam.len() {
+                let v = sam.text_at(idx);
                 counts[v as usize] += 1;
             }
             let mut uniq = 0usize;
@@ -1038,7 +1286,7 @@ impl LM {
             return;
         }
 
-        let mut tmp = sam.text.clone();
+        let mut tmp = sam.text_u32_vec();
         tmp.sort_unstable();
         tmp.dedup();
         if tmp.is_empty() {
@@ -1048,7 +1296,8 @@ impl LM {
         self.alpha_n = self.alphabet.len() as u32;
         self.unigram = vec![0u64; self.alphabet.len()];
         self.total_uni = 0;
-        for &ch in &sam.text {
+        for idx in 0..sam.len() {
+            let ch = sam.text_at(idx);
             if let Ok(i) = self.alphabet.binary_search(&ch) {
                 self.unigram[i] += 1;
                 self.total_uni += 1;
@@ -1149,6 +1398,7 @@ impl LM {
         if additional == 0 {
             return;
         }
+        let additional = additional.min(ROSA_STREAM_HINT_CAP_SYMBOLS);
         self.ls
             .reserve_exact(additional.saturating_mul(2).saturating_add(16));
         self.nodes
@@ -1167,19 +1417,19 @@ impl LM {
         self.nodes.clear();
 
         let mut seg_start = 0usize;
-        while seg_start < sam.text.len() {
+        while seg_start < sam.len() {
             let mut seg_end = seg_start;
-            while seg_end < sam.text.len() {
-                let b = sam.boundary_after[seg_end];
+            while seg_end < sam.len() {
+                let b = sam.boundary_after.get(seg_end);
                 seg_end += 1;
-                if b != 0 {
+                if b {
                     break;
                 }
             }
             if seg_end - seg_start >= 2 {
                 let mut v = 0;
                 for i in seg_start..(seg_end - 1) {
-                    let ch = sam.text[i];
+                    let ch = sam.text_at(i);
                     v = sam.advance(v, ch);
                     let mut ctx = v;
                     if max_order >= 0 {
@@ -1192,7 +1442,7 @@ impl LM {
                             ctx = 0;
                         }
                     }
-                    let nxt = sam.text[i + 1];
+                    let nxt = sam.text_at(i + 1);
                     let si = self.find_sym(nxt);
                     if si >= 0 {
                         self.inc(state_usize(ctx) as u32, si as u32, 1);
@@ -1466,9 +1716,26 @@ struct LmTx {
     old_nodes_len: usize,
     ls_changes: Vec<(usize, LmState)>,
     node_changes: Vec<(usize, CountNode)>,
-    // unigram delta for bytes
-    uni_delta: [u64; BYTE_ALPHA_N],
+    // Sparse unigram deltas for byte-alphabet transactions. AIQI and other
+    // bit-token callers usually touch only symbols 0/1, so dense 256-way
+    // transaction state is disproportionate in reversible hot paths.
+    uni_delta: Vec<(u8, u64)>,
     total_uni_add: u64,
+}
+
+impl LmTx {
+    fn record_unigram_byte(&mut self, byte: u8) {
+        if let Some((_, delta)) = self
+            .uni_delta
+            .iter_mut()
+            .find(|(symbol, _)| *symbol == byte)
+        {
+            *delta += 1;
+        } else {
+            self.uni_delta.push((byte, 1));
+        }
+        self.total_uni_add += 1;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1584,6 +1851,45 @@ pub struct RosaTx {
     seg_len: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "research-tooling"))]
+pub(crate) struct RosaMemoryUsage {
+    pub sam_state_count: usize,
+    pub sam_edge_count: usize,
+    pub lm_state_count: usize,
+    pub lm_node_count: usize,
+    pub lm_sym_overflow_count: usize,
+    pub lm_count_overflow_count: usize,
+    pub sam_state_bytes: usize,
+    pub sam_edge_bytes: usize,
+    pub sam_text_bytes: usize,
+    pub sam_state_trace_bytes: usize,
+    pub sam_boundary_bytes: usize,
+    pub sam_root_index_bytes: usize,
+    pub lm_core_bytes: usize,
+    pub lm_node_storage_bytes: usize,
+    pub lm_overflow_bytes: usize,
+    pub scratch_bytes: usize,
+    pub rng_bytes: usize,
+}
+
+#[cfg(any(test, feature = "research-tooling"))]
+impl RosaMemoryUsage {
+    pub(crate) fn total_bytes(self) -> usize {
+        self.sam_state_bytes
+            + self.sam_edge_bytes
+            + self.sam_text_bytes
+            + self.sam_state_trace_bytes
+            + self.sam_boundary_bytes
+            + self.sam_root_index_bytes
+            + self.lm_core_bytes
+            + self.lm_node_storage_bytes
+            + self.lm_overflow_bytes
+            + self.scratch_bytes
+            + self.rng_bytes
+    }
+}
+
 impl RosaPlus {
     /// Create a new ROSA+ model.
     ///
@@ -1610,9 +1916,10 @@ impl RosaPlus {
             return;
         }
 
-        if self.sam.text.is_empty() {
+        if self.sam.is_empty() {
             self.sam = Sam::new(s.len());
         }
+        self.reserve_for_stream(s.len());
 
         for &b in s {
             self.sam.feed(b as u32);
@@ -1675,7 +1982,8 @@ impl RosaPlus {
 
         // Unigram counts
         let mut counts = [0u64; 256];
-        for &v in &self.sam.text {
+        for idx in 0..self.sam.len() {
+            let v = self.sam.text_at(idx);
             if v < 256 {
                 counts[v as usize] += 1;
             }
@@ -1703,13 +2011,13 @@ impl RosaPlus {
             old_nodes_len: self.lm.nodes.len(),
             ls_changes: Vec::new(),
             node_changes: Vec::new(),
-            uni_delta: [0u64; BYTE_ALPHA_N],
+            uni_delta: Vec::new(),
             total_uni_add: 0,
         };
         RosaTx {
             sam: sam_tx,
             lm: lm_tx,
-            seg_start: self.sam.text.len(),
+            seg_start: self.sam.len(),
             seg_len: 0,
         }
     }
@@ -1735,7 +2043,7 @@ impl RosaPlus {
             return;
         }
 
-        if self.sam.text.is_empty() {
+        if self.sam.is_empty() {
             self.sam = Sam::new(s.len());
         }
         self.reserve_for_stream(s.len());
@@ -1754,7 +2062,7 @@ impl RosaPlus {
             );
         }
 
-        let seg_start = self.sam.text.len();
+        let seg_start = self.sam.len();
         for &b in s {
             self.sam.feed(b as u32);
             self.lm.unigram[b as usize] += 1;
@@ -1772,7 +2080,7 @@ impl RosaPlus {
             );
         }
 
-        let seg_end = self.sam.text.len();
+        let seg_end = self.sam.len();
         if seg_end.saturating_sub(seg_start) >= 1 {
             let mo = if self.max_order < 0 {
                 -1
@@ -1780,15 +2088,7 @@ impl RosaPlus {
                 self.max_order
             };
             let mut start_i = seg_start;
-            if seg_start > 0
-                && self
-                    .sam
-                    .boundary_after
-                    .get(seg_start - 1)
-                    .copied()
-                    .unwrap_or(0)
-                    == 0
-            {
+            if seg_start > 0 && !self.sam.boundary_after.get(seg_start - 1) {
                 start_i = seg_start - 1;
             }
             for i in start_i..(seg_end - 1) {
@@ -1801,7 +2101,7 @@ impl RosaPlus {
                         ctx = 0;
                     }
                 }
-                let nxt = self.sam.text[i + 1];
+                let nxt = self.sam.text_at(i + 1);
                 let si = self.lm.find_sym(nxt);
                 if si >= 0 {
                     let mut u = ctx;
@@ -1819,7 +2119,7 @@ impl RosaPlus {
     /// Apply a single byte sequential update without rollback bookkeeping.
     #[inline]
     pub fn train_byte(&mut self, b: u8) {
-        if self.sam.text.is_empty() {
+        if self.sam.is_empty() {
             self.sam = Sam::new(1);
         }
         if !self.lm_built || !self.lm.has_byte_map || (self.lm.alpha_n as usize) != BYTE_ALPHA_N {
@@ -1841,16 +2141,8 @@ impl RosaPlus {
             );
         }
 
-        let seg_end = self.sam.text.len();
-        if seg_end > 1
-            && self
-                .sam
-                .boundary_after
-                .get(seg_end - 2)
-                .copied()
-                .unwrap_or(0)
-                == 0
-        {
+        let seg_end = self.sam.len();
+        if seg_end > 1 && !self.sam.boundary_after.get(seg_end - 2) {
             let mo = if self.max_order < 0 {
                 -1
             } else {
@@ -1886,8 +2178,10 @@ impl RosaPlus {
         self.sam.last
     }
 
-    #[cfg(any(feature = "aixi", test))]
     /// Restore a previously recorded predictive cursor state.
+    ///
+    /// Available whenever the ROSA backend is compiled (used by general
+    /// checkpoint/restore paths including public bit-session frozen rewinds).
     pub(crate) fn restore_conditioning_cursor(&mut self, cursor: i32) {
         self.sam.last = cursor;
     }
@@ -1917,8 +2211,9 @@ impl RosaPlus {
         // Feed all bytes (SAM structure changes are logged).
         for &b in s {
             self.sam.feed_tx(&mut tx.sam, b as u32);
-            tx.lm.uni_delta[b as usize] += 1;
-            tx.lm.total_uni_add += 1;
+            tx.lm.record_unigram_byte(b);
+            self.lm.unigram[b as usize] += 1;
+            self.lm.total_uni += 1;
         }
         if mark_boundary {
             self.sam.mark_boundary_tx(&mut tx.sam);
@@ -1937,17 +2232,9 @@ impl RosaPlus {
             );
         }
 
-        // Update unigram counts (fixed 256 alphabet assumed).
-        for i in 0..256 {
-            if tx.lm.uni_delta[i] != 0 {
-                self.lm.unigram[i] += tx.lm.uni_delta[i];
-            }
-        }
-        self.lm.total_uni += tx.lm.total_uni_add;
-
         // Update conditional counts for the new segment only.
         let seg_start = tx.seg_start;
-        let seg_end = self.sam.text.len();
+        let seg_end = self.sam.len();
         tx.seg_len = seg_end - seg_start;
         if tx.seg_len >= 1 {
             let mo = if self.max_order < 0 {
@@ -1959,16 +2246,7 @@ impl RosaPlus {
             // previous symbol into the first new symbol. For segmented examples,
             // respect boundary markers and skip that transition.
             let mut start_i = seg_start;
-            if !mark_boundary
-                && seg_start > 0
-                && self
-                    .sam
-                    .boundary_after
-                    .get(seg_start - 1)
-                    .copied()
-                    .unwrap_or(0)
-                    == 0
-            {
+            if !mark_boundary && seg_start > 0 && !self.sam.boundary_after.get(seg_start - 1) {
                 start_i = seg_start - 1;
             }
             for i in start_i..(seg_end - 1) {
@@ -1982,7 +2260,7 @@ impl RosaPlus {
                         ctx = 0;
                     }
                 }
-                let nxt = self.sam.text[i + 1];
+                let nxt = self.sam.text_at(i + 1);
                 let si = self.lm.find_sym(nxt);
                 if si >= 0 {
                     let mut u = ctx;
@@ -2003,11 +2281,9 @@ impl RosaPlus {
         // Restore LM changes
         // Unigram rollback
         if self.lm.unigram.len() >= BYTE_ALPHA_N {
-            for i in 0..BYTE_ALPHA_N {
-                let d = tx.lm.uni_delta[i];
-                if d != 0 {
-                    self.lm.unigram[i] = self.lm.unigram[i].saturating_sub(d);
-                }
+            for (symbol, delta) in tx.lm.uni_delta {
+                let idx = usize::from(symbol);
+                self.lm.unigram[idx] = self.lm.unigram[idx].saturating_sub(delta);
             }
             self.lm.total_uni = self.lm.total_uni.saturating_sub(tx.lm.total_uni_add);
         }
@@ -2091,6 +2367,82 @@ impl RosaPlus {
         }
     }
 
+    #[cfg(any(test, feature = "research-tooling"))]
+    pub(crate) fn memory_usage_breakdown(&self) -> RosaMemoryUsage {
+        use std::mem::size_of;
+
+        RosaMemoryUsage {
+            sam_state_count: self.sam.st.len(),
+            sam_edge_count: self.sam.ed.len(),
+            lm_state_count: self.lm.ls.len(),
+            lm_node_count: self.lm.nodes.len(),
+            lm_sym_overflow_count: self.lm.nodes.sym_overflow.len(),
+            lm_count_overflow_count: self.lm.nodes.cnt_overflow.len(),
+            sam_state_bytes: self.sam.st.len().saturating_mul(size_of::<SamState>()),
+            sam_edge_bytes: self.sam.ed.len().saturating_mul(size_of::<SamEdge>()),
+            sam_text_bytes: self.sam.text.allocated_bytes(),
+            sam_state_trace_bytes: self
+                .sam
+                .text_states
+                .capacity()
+                .saturating_mul(size_of::<SamStateIx>()),
+            sam_boundary_bytes: self.sam.boundary_after.allocated_bytes(),
+            sam_root_index_bytes: size_of::<[SamStateIx; BYTE_ALPHA_N]>(),
+            lm_core_bytes: self.lm.alphabet.capacity().saturating_mul(size_of::<u32>())
+                + self.lm.unigram.capacity().saturating_mul(size_of::<u64>())
+                + self.lm.ls.capacity().saturating_mul(size_of::<LmState>()),
+            lm_node_storage_bytes: self
+                .lm
+                .nodes
+                .sym_lo
+                .capacity()
+                .saturating_mul(size_of::<u16>())
+                + self
+                    .lm
+                    .nodes
+                    .cnt_lo
+                    .capacity()
+                    .saturating_mul(size_of::<u16>())
+                + self
+                    .lm
+                    .nodes
+                    .next
+                    .capacity()
+                    .saturating_mul(size_of::<LmNodeIx>())
+                + self
+                    .lm
+                    .nodes
+                    .cnt_overflow_mask
+                    .capacity()
+                    .saturating_mul(size_of::<u8>()),
+            lm_overflow_bytes: self
+                .lm
+                .nodes
+                .sym_overflow
+                .capacity()
+                .saturating_mul(size_of::<u32>() + size_of::<u32>())
+                + self
+                    .lm
+                    .nodes
+                    .cnt_overflow
+                    .capacity()
+                    .saturating_mul(size_of::<u32>() + size_of::<u64>()),
+            scratch_bytes: self.dist.capacity().saturating_mul(size_of::<f64>())
+                + self.scratch.idx.capacity().saturating_mul(size_of::<u32>())
+                + self
+                    .scratch
+                    .logits
+                    .capacity()
+                    .saturating_mul(size_of::<f64>())
+                + self
+                    .scratch
+                    .exps
+                    .capacity()
+                    .saturating_mul(size_of::<f64>()),
+            rng_bytes: self.rng.buf.capacity().saturating_mul(size_of::<u8>()),
+        }
+    }
+
     /// Approximate in-memory footprint of major model buffers.
     pub fn estimated_size_bytes(&self) -> usize {
         use std::mem::size_of;
@@ -2099,60 +2451,77 @@ impl RosaPlus {
 
         n = n.saturating_add(self.sam.st.len().saturating_mul(size_of::<SamState>()));
         n = n.saturating_add(self.sam.ed.len().saturating_mul(size_of::<SamEdge>()));
-        n = n.saturating_add(self.sam.text.len().saturating_mul(size_of::<u32>()));
+        n = n.saturating_add(self.sam.text.allocated_bytes());
         n = n.saturating_add(
             self.sam
                 .text_states
-                .len()
+                .capacity()
                 .saturating_mul(size_of::<SamStateIx>()),
         );
         n = n.saturating_add(size_of::<[SamStateIx; BYTE_ALPHA_N]>());
-        n = n.saturating_add(
-            self.sam
-                .boundary_after
-                .len()
-                .saturating_mul(size_of::<u8>()),
-        );
+        n = n.saturating_add(self.sam.boundary_after.allocated_bytes());
 
-        n = n.saturating_add(self.lm.alphabet.len().saturating_mul(size_of::<u32>()));
-        n = n.saturating_add(self.lm.unigram.len().saturating_mul(size_of::<u64>()));
-        n = n.saturating_add(self.lm.ls.len().saturating_mul(size_of::<LmState>()));
-        n = n.saturating_add(self.lm.nodes.sym_lo.len().saturating_mul(size_of::<u16>()));
-        n = n.saturating_add(self.lm.nodes.cnt_lo.len().saturating_mul(size_of::<u16>()));
+        n = n.saturating_add(self.lm.alphabet.capacity().saturating_mul(size_of::<u32>()));
+        n = n.saturating_add(self.lm.unigram.capacity().saturating_mul(size_of::<u64>()));
+        n = n.saturating_add(self.lm.ls.capacity().saturating_mul(size_of::<LmState>()));
+        n = n.saturating_add(
+            self.lm
+                .nodes
+                .sym_lo
+                .capacity()
+                .saturating_mul(size_of::<u16>()),
+        );
+        n = n.saturating_add(
+            self.lm
+                .nodes
+                .cnt_lo
+                .capacity()
+                .saturating_mul(size_of::<u16>()),
+        );
         n = n.saturating_add(
             self.lm
                 .nodes
                 .next
-                .len()
+                .capacity()
                 .saturating_mul(size_of::<LmNodeIx>()),
         );
         n = n.saturating_add(
             self.lm
                 .nodes
                 .cnt_overflow_mask
-                .len()
+                .capacity()
                 .saturating_mul(size_of::<u8>()),
         );
         n = n.saturating_add(
             self.lm
                 .nodes
                 .sym_overflow
-                .len()
+                .capacity()
                 .saturating_mul(size_of::<u32>() + size_of::<u32>()),
         );
         n = n.saturating_add(
             self.lm
                 .nodes
                 .cnt_overflow
-                .len()
+                .capacity()
                 .saturating_mul(size_of::<u32>() + size_of::<u64>()),
         );
 
-        n = n.saturating_add(self.dist.len().saturating_mul(size_of::<f64>()));
-        n = n.saturating_add(self.scratch.idx.len().saturating_mul(size_of::<u32>()));
-        n = n.saturating_add(self.scratch.logits.len().saturating_mul(size_of::<f64>()));
-        n = n.saturating_add(self.scratch.exps.len().saturating_mul(size_of::<f64>()));
-        n = n.saturating_add(self.rng.buf.len().saturating_mul(size_of::<u8>()));
+        n = n.saturating_add(self.dist.capacity().saturating_mul(size_of::<f64>()));
+        n = n.saturating_add(self.scratch.idx.capacity().saturating_mul(size_of::<u32>()));
+        n = n.saturating_add(
+            self.scratch
+                .logits
+                .capacity()
+                .saturating_mul(size_of::<f64>()),
+        );
+        n = n.saturating_add(
+            self.scratch
+                .exps
+                .capacity()
+                .saturating_mul(size_of::<f64>()),
+        );
+        n = n.saturating_add(self.rng.buf.capacity().saturating_mul(size_of::<u8>()));
 
         n
     }
@@ -2553,7 +2922,7 @@ impl RosaPlus {
 
         // Transactional conditional updates require a valid prefix-state trace.
         // If this invariant is violated, the loaded model would be unusable.
-        if self.sam.text_states.len() != self.sam.text.len() + 1 {
+        if self.sam.text_states.len() != self.sam.len() + 1 {
             return Err(std::io::Error::other(
                 "SAM text_states mismatch (expected text.len()+1)",
             ));
@@ -2568,7 +2937,7 @@ impl RosaPlus {
         // SAM
         write_len64(&mut f, self.sam.st.len())?;
         write_len64(&mut f, self.sam.ed.len())?;
-        write_len64(&mut f, self.sam.text.len())?;
+        write_len64(&mut f, self.sam.len())?;
         for st in &self.sam.st {
             f.write_all(&st.link.to_le_bytes())?;
             f.write_all(&st.len.to_le_bytes())?;
@@ -2585,8 +2954,10 @@ impl RosaPlus {
             f.write_all(&e.to.to_le_bytes())?;
             f.write_all(&e.next.to_le_bytes())?;
         }
-        write_u32_slice_le(&mut f, &self.sam.text)?;
-        f.write_all(&self.sam.boundary_after)?;
+        let text_u32 = self.sam.text_u32_vec();
+        let boundary_bytes = self.sam.boundary_bytes_vec();
+        write_u32_slice_le(&mut f, &text_u32)?;
+        f.write_all(&boundary_bytes)?;
 
         // Persist SAM cursor + prefix trace.
         f.write_all(&self.sam.last.to_le_bytes())?;
@@ -2649,8 +3020,8 @@ impl RosaPlus {
         m.sam = Sam::new(text_n);
         m.sam.st.resize(st_n, SamState::default());
         m.sam.ed.resize(ed_n, SamEdge::default());
-        m.sam.text.resize(text_n, 0u32);
-        m.sam.boundary_after.resize(text_n, 0u8);
+        let mut text = vec![0u32; text_n];
+        let mut boundary = vec![0u8; text_n];
 
         for i in 0..st_n {
             f.read_exact(&mut b4)?;
@@ -2685,8 +3056,10 @@ impl RosaPlus {
             f.read_exact(&mut b4)?;
             m.sam.ed[i].next = u32::from_le_bytes(b4);
         }
-        read_u32_slice_le(&mut f, &mut m.sam.text)?;
-        f.read_exact(&mut m.sam.boundary_after)?;
+        read_u32_slice_le(&mut f, &mut text)?;
+        f.read_exact(&mut boundary)?;
+        m.sam.set_text_from_u32_slice(&text);
+        m.sam.boundary_after.load_from_bytes(&boundary);
 
         // SAM cursor + prefix trace.
         f.read_exact(&mut b4)?;
@@ -2872,6 +3245,7 @@ impl RosaPlus {
         } else {
             self.max_order
         };
+
         self.dist.resize(self.lm.alpha_n as usize, 0.0);
         self.lm
             .probs_for_state_raw(&self.sam, mo, v, &mut self.dist);
@@ -3033,8 +3407,9 @@ mod tests {
 
         while u != SAM_STATE_NONE {
             if !(max_order >= 0 && (sam.st[state_usize(u)].len as i64) > max_order) {
-                let n = lm.ls[state_usize(u)].total_n;
-                let t = lm.ls[state_usize(u)].types_t;
+                let ls = &lm.ls[state_usize(u)];
+                let n = ls.total_n;
+                let t = ls.types_t;
                 if n > 0 {
                     let lam = if t > 0 {
                         (n as f64) / ((n + (t as u64)) as f64)
@@ -3043,7 +3418,6 @@ mod tests {
                     };
                     let scale = residual * lam;
                     let mut count_for_sym = 0u64;
-                    let ls = &lm.ls[state_usize(u)];
                     if LM::ls_is_implicit_single(ls) {
                         if ls.last_sym == sym_idx {
                             count_for_sym = n;
@@ -3084,8 +3458,9 @@ mod tests {
         let mut u = v;
         while u != SAM_STATE_NONE {
             if !(max_order >= 0 && (sam.st[state_usize(u)].len as i64) > max_order) {
-                let n = lm.ls[state_usize(u)].total_n;
-                let t = lm.ls[state_usize(u)].types_t;
+                let ls = &lm.ls[state_usize(u)];
+                let n = ls.total_n;
+                let t = ls.types_t;
                 if n > 0 {
                     let lam = if t > 0 {
                         (n as f64) / ((n + (t as u64)) as f64)
@@ -3094,7 +3469,6 @@ mod tests {
                     };
                     let scale = residual * lam;
                     let inv_n = 1.0 / (n as f64);
-                    let ls = &lm.ls[state_usize(u)];
                     if LM::ls_is_implicit_single(ls) {
                         out[ls.last_sym as usize] += scale;
                     } else {
@@ -3148,19 +3522,56 @@ mod tests {
         m.train_example(b"hello");
         m.build_lm_full_bytes_no_finalize_endpos();
 
-        let base_text = m.sam.text.clone();
-        let base_text_len = m.sam.text.len();
+        let base_text = m.sam.text_u32_vec();
+        let base_text_len = m.sam.len();
         let base_total_uni = m.lm.total_uni;
         assert!(base_text_len > 0);
 
         let mut tx = m.begin_tx();
         m.train_example_tx(&mut tx, b"abc");
         assert_eq!(m.lm.total_uni, base_total_uni + 3);
-        assert_eq!(m.sam.text.len(), base_text_len + 3);
+        assert_eq!(m.sam.len(), base_text_len + 3);
 
         m.rollback_tx(tx);
-        assert_eq!(m.sam.text, base_text);
+        assert_eq!(m.sam.text_u32_vec(), base_text);
         assert_eq!(m.lm.total_uni, base_total_uni);
+    }
+
+    #[test]
+    fn byte_stream_storage_stays_compact_for_byte_only_training() {
+        let mut m = RosaPlus::new(4, false, 0, 123);
+        m.train_example(b"abracadabra mississippi");
+        m.build_lm_full_bytes_no_finalize_endpos();
+
+        assert!(matches!(m.sam.text, SamText::Byte(_)));
+        assert_eq!(m.sam.text_u32_vec().len(), m.sam.len());
+    }
+
+    #[test]
+    fn reserve_for_stream_caps_initial_roaming_capacity() {
+        let requested = ROSA_STREAM_HINT_CAP_SYMBOLS.saturating_mul(8);
+        let mut m = RosaPlus::new(4, false, 0, 123);
+        m.reserve_for_stream(requested);
+
+        let half_requested = requested / 2;
+        assert!(m.sam.text.capacity() < half_requested);
+        assert!(m.sam.text_states.capacity() < half_requested);
+        assert!(m.lm.ls.capacity() < half_requested);
+        assert!(m.lm.nodes.sym_lo.capacity() < half_requested);
+        assert!(m.lm.nodes.next.capacity() < half_requested);
+    }
+
+    #[test]
+    fn cps_training_promotes_internal_text_storage_exactly() {
+        let cps = [0u32, 7, 300, 42, 511, 42];
+        let mut m = RosaPlus::new(-1, false, 0, 7);
+        for &cp in &cps {
+            m.sam.feed(cp);
+        }
+        m.build_lm_no_finalize_endpos();
+
+        assert!(matches!(m.sam.text, SamText::Codepoint(_)));
+        assert_eq!(m.sam.text_u32_vec(), cps);
     }
 
     #[test]
@@ -3179,7 +3590,7 @@ mod tests {
         let mut tx = tx_model.begin_tx();
         tx_model.train_sequence_tx(&mut tx, b" mississippi");
 
-        assert_eq!(direct.sam.text, tx_model.sam.text);
+        assert_eq!(direct.sam.text_u32_vec(), tx_model.sam.text_u32_vec());
         assert_eq!(direct.sam.text_states, tx_model.sam.text_states);
         assert_eq!(direct.sam.boundary_after, tx_model.sam.boundary_after);
         assert_eq!(direct.sam.last, tx_model.sam.last);
@@ -3214,7 +3625,7 @@ mod tests {
             tx_model.train_sequence_tx(&mut tx, &[b]);
         }
 
-        assert_eq!(direct.sam.text, tx_model.sam.text);
+        assert_eq!(direct.sam.text_u32_vec(), tx_model.sam.text_u32_vec());
         assert_eq!(direct.sam.text_states, tx_model.sam.text_states);
         assert_eq!(direct.sam.boundary_after, tx_model.sam.boundary_after);
         assert_eq!(direct.sam.last, tx_model.sam.last);
@@ -3222,6 +3633,22 @@ mod tests {
         assert_eq!(direct.lm.unigram, tx_model.lm.unigram);
         assert_eq!(direct.lm.nodes, tx_model.lm.nodes);
         assert_eq!(direct.lm.ls, tx_model.lm.ls);
+    }
+
+    #[test]
+    fn repeated_updates_in_one_transaction_count_unigrams_once_per_byte() {
+        let mut direct = RosaPlus::new(4, false, 0, 123);
+        direct.build_lm_full_bytes_no_finalize_endpos();
+        direct.train_sequence(b"abracadabra");
+
+        let mut tx_model = RosaPlus::new(4, false, 0, 123);
+        tx_model.build_lm_full_bytes_no_finalize_endpos();
+        let mut tx = tx_model.begin_tx();
+        tx_model.train_sequence_tx(&mut tx, b"abra");
+        tx_model.train_sequence_tx(&mut tx, b"cadabra");
+
+        assert_eq!(direct.lm.total_uni, tx_model.lm.total_uni);
+        assert_eq!(direct.lm.unigram, tx_model.lm.unigram);
     }
 
     #[test]
@@ -3262,16 +3689,16 @@ mod tests {
         let before_prob = m.prob_for_last(b'a' as u32);
 
         let ck = m.checkpoint();
-        let base_text = m.sam.text.clone();
+        let base_text = m.sam.text_u32_vec();
         let base_states = m.sam.text_states.clone();
         let base_boundary = m.sam.boundary_after.clone();
         let base_last = m.sam.last;
 
         m.train_example(b"bbbb");
-        assert_ne!(m.sam.text, base_text);
+        assert_ne!(m.sam.text_u32_vec(), base_text);
 
         m.restore(&ck);
-        assert_eq!(m.sam.text, base_text);
+        assert_eq!(m.sam.text_u32_vec(), base_text);
         assert_eq!(m.sam.text_states, base_states);
         assert_eq!(m.sam.boundary_after, base_boundary);
         assert_eq!(m.sam.last, base_last);
@@ -3334,8 +3761,7 @@ mod tests {
         m.train_example(b"abracadabra");
         m.build_lm();
         let before_prob = m.prob_for_last(b'a' as u32);
-        let before_size = m.estimated_size_bytes();
-        let before_text = m.sam.text.clone();
+        let before_text = m.sam.text_u32_vec();
         let before_states = m.sam.text_states.clone();
         let before_last = m.sam.last;
         let before_nodes = m.lm.nodes.len();
@@ -3349,11 +3775,46 @@ mod tests {
         assert_eq!(loaded.use_eot, m.use_eot);
         assert_eq!(loaded.eot, m.eot);
         assert_eq!(loaded.seed, m.seed);
-        assert_eq!(loaded.sam.text, before_text);
+        assert_eq!(loaded.sam.text_u32_vec(), before_text);
         assert_eq!(loaded.sam.text_states, before_states);
         assert_eq!(loaded.sam.last, before_last);
         assert_eq!(loaded.lm.nodes.len(), before_nodes);
-        assert_eq!(loaded.estimated_size_bytes(), before_size);
+        assert!(loaded.estimated_size_bytes() > 0);
         assert!((loaded.prob_for_last(b'a' as u32) - before_prob).abs() < 1e-12);
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_promoted_codepoint_storage() {
+        let path = temp_model_path("roundtrip_cps");
+        let mut m = RosaPlus::new(8, false, 0, 1234);
+        for &cp in &[0u32, 7, 300, 42, 511, 42, 300] {
+            m.sam.feed(cp);
+        }
+        m.build_lm_no_finalize_endpos();
+        let before_text = m.sam.text_u32_vec();
+        let before_prob = m.prob_for_last(300);
+        let path_str = path.to_string_lossy().into_owned();
+
+        m.save(&path_str).expect("save failed");
+        let mut loaded = RosaPlus::load(&path_str).expect("load failed");
+        fs::remove_file(&path).expect("cleanup failed");
+
+        assert_eq!(loaded.sam.text_u32_vec(), before_text);
+        assert!(matches!(loaded.sam.text, SamText::Codepoint(_)));
+        assert!((loaded.prob_for_last(300) - before_prob).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rosa_memory_usage_breakdown_sums_to_estimated_total() {
+        let mut model = RosaPlus::new(8, true, b'\n', 1234);
+        model.train_example(
+            b"abracadabra mississippi banana bandana rosa memory validation payload",
+        );
+        model.build_lm();
+
+        let usage = model.memory_usage_breakdown();
+        assert_eq!(usage.total_bytes(), model.estimated_size_bytes());
+        assert!(usage.sam_state_bytes > 0);
+        assert!(usage.lm_core_bytes > 0);
     }
 }

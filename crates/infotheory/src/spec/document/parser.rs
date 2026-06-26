@@ -1,10 +1,12 @@
 //! JSON parsing for canonical top-level specification documents.
 
+#[cfg(feature = "aixi")]
+use super::WarmStartExactJhControllerSpec;
 use super::{
     AiqiDiscountedControllerSpec, AssetBinding, ControllerSpec, EnvironmentSpec,
     McAixiControllerSpec, PlannerInterfaceSpec, PlannerRunSpec, PlannerRuntimeSpec,
     SPEC_DOCUMENT_SCHEMA_VERSION, SpecDocument, SpecError, SpecResult,
-    WarmStartExactJhControllerSpec, parse_compression_backend_json, parse_rate_backend_json,
+    parse_compression_backend_json, parse_rate_backend_json,
 };
 #[cfg(feature = "tuner")]
 use super::{
@@ -14,6 +16,7 @@ use super::{
     compression_backend_to_json_value,
 };
 use crate::aixi::common::{ActionAlphabet, MctsStrategy};
+use crate::api::{BitOrder, BitStreamSemantics};
 use std::num::NonZeroUsize;
 
 #[cfg(feature = "vm")]
@@ -519,6 +522,10 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                 base_dir,
                 crate::api::MAX_MIXTURE_NESTING,
             )?,
+            bit_stream_semantics: parse_bit_stream_semantics(
+                value.get("bit_stream_semantics"),
+                "controller.bit_stream_semantics",
+            )?,
             agent_horizon: required_usize(&value["agent_horizon"], "controller.agent_horizon")?,
             num_simulations: required_usize(
                 &value["num_simulations"],
@@ -540,6 +547,10 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                     &value["predictor"],
                     base_dir,
                     crate::api::MAX_MIXTURE_NESTING,
+                )?,
+                bit_stream_semantics: parse_bit_stream_semantics(
+                    value.get("bit_stream_semantics"),
+                    "controller.bit_stream_semantics",
                 )?,
                 discount_gamma: required_f64(
                     &value["discount_gamma"],
@@ -564,12 +575,17 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                 )?,
             },
         )),
+        #[cfg(feature = "aixi")]
         "aiqi_warmstart_exact_jh" => Ok(ControllerSpec::AiqiWarmstartExactJh(
             WarmStartExactJhControllerSpec {
                 predictor: parse_rate_backend_json(
                     &value["predictor"],
                     base_dir,
                     crate::api::MAX_MIXTURE_NESTING,
+                )?,
+                bit_stream_semantics: parse_bit_stream_semantics(
+                    value.get("bit_stream_semantics"),
+                    "controller.bit_stream_semantics",
                 )?,
                 return_horizon: required_usize(
                     &value["return_horizon"],
@@ -590,7 +606,48 @@ fn parse_controller_spec(value: &serde_json::Value, base_dir: &Path) -> SpecResu
                 )?,
             },
         )),
+        #[cfg(not(feature = "aixi"))]
+        "aiqi_warmstart_exact_jh" => Err(SpecError::new(
+            "aiqi_warmstart_exact_jh controller requires infotheory built with feature 'aixi'",
+        )),
         other => Err(SpecError::new(format!("unknown controller kind '{other}'"))),
+    }
+}
+
+fn parse_bit_stream_semantics(
+    value: Option<&serde_json::Value>,
+    label: &str,
+) -> SpecResult<BitStreamSemantics> {
+    let Some(value) = value else {
+        // Default for absent bit_stream_semantics is BinaryTokens (AIXI planner
+        // paths explicitly set their own default via aixi::model when needed).
+        // This reference must remain feature-agnostic for parser hygiene.
+        return Ok(BitStreamSemantics::BinaryTokens);
+    };
+    let Some(object) = value.as_object() else {
+        return Err(SpecError::new(format!(
+            "{label} must be an object with a 'kind' field"
+        )));
+    };
+    let kind = object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| SpecError::new(format!("{label}.kind is required")))?;
+    match kind {
+        "byte_packed" => {
+            let order = match object.get("order").and_then(serde_json::Value::as_str) {
+                Some("msb_first") | None => BitOrder::MsbFirst,
+                Some("lsb_first") => BitOrder::LsbFirst,
+                Some(other) => {
+                    return Err(SpecError::new(format!("unknown {label}.order '{other}'")));
+                }
+            };
+            Ok(BitStreamSemantics::BytePacked { order })
+        }
+        "binary_tokens" => Ok(BitStreamSemantics::BinaryTokens),
+        other => Err(SpecError::new(format!(
+            "unknown bit stream semantics kind '{other}'"
+        ))),
     }
 }
 
@@ -804,6 +861,7 @@ fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneContr
                 },
             ))
         }
+        #[cfg(feature = "aixi")]
         "aiqi_warmstart_exact_jh" => {
             ensure_known_fields(
                 value,
@@ -839,6 +897,10 @@ fn parse_tune_controller_spec(value: &serde_json::Value) -> SpecResult<TuneContr
                 },
             ))
         }
+        #[cfg(not(feature = "aixi"))]
+        "aiqi_warmstart_exact_jh" => Err(SpecError::new(
+            "aiqi_warmstart_exact_jh controller requires infotheory built with feature 'aixi'",
+        )),
         other => Err(SpecError::new(format!(
             "unknown tune controller kind '{other}'"
         ))),
@@ -1391,19 +1453,22 @@ mod tests {
         .expect("aiqi_discounted controller should parse");
         assert!(matches!(discounted, TuneControllerSpec::AiqiDiscounted(_)));
 
-        let warmstart = parse_tune_controller_spec(&serde_json::json!({
-            "kind": "aiqi_warmstart_exact_jh",
-            "interface": interface,
-            "planner_simulations_per_step": 48,
-            "return_horizon": 3,
-            "warmstart_teacher_dataset_asset": "teacher",
-            "label_phase_period": 2,
-        }))
-        .expect("aiqi_warmstart_exact_jh controller should parse");
-        assert!(matches!(
-            warmstart,
-            TuneControllerSpec::AiqiWarmstartExactJh(_)
-        ));
+        #[cfg(feature = "aixi")]
+        {
+            let warmstart = parse_tune_controller_spec(&serde_json::json!({
+                "kind": "aiqi_warmstart_exact_jh",
+                "interface": interface,
+                "planner_simulations_per_step": 1,
+                "return_horizon": 3,
+                "warmstart_teacher_dataset_asset": "teacher",
+                "label_phase_period": 2,
+            }))
+            .expect("aiqi_warmstart_exact_jh controller should parse");
+            assert!(matches!(
+                warmstart,
+                TuneControllerSpec::AiqiWarmstartExactJh(_)
+            ));
+        }
 
         let err = parse_tune_controller_spec(&serde_json::json!({
             "kind": "definitely_unknown_tune_controller"

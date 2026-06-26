@@ -233,6 +233,10 @@ for expert in experts:
 
     if kind == "ctw":
         out["depth"] = int(expert.get("depth", 16))
+    elif kind == "fac-ctw":
+        out["base_depth"] = int(expert.get("base_depth", expert.get("depth", 16)))
+        out["num_percept_bits"] = int(expert.get("num_percept_bits", 8))
+        out["encoding_bits"] = int(expert.get("encoding_bits", 8))
     elif kind == "ppmd":
         out["order"] = int(expert.get("order", 10))
         out["memory_mb"] = int(expert.get("memory_mb", 64))
@@ -300,11 +304,11 @@ baseline_candidate = {
 }
 
 bounds = {
-    "allowed_backends": ["ctw", "ppmd", "rosaplus", "match", "rwkv7", "mixture"],
+    "allowed_backends": ["fac-ctw", "ppmd", "rosaplus", "match", "rwkv7", "mixture"],
     "forbidden_backends": [],
     "parameter_ranges": [
         {"parameter": "rate_backend.spec.alpha", "min": 0.005, "max": 0.20},
-        {"parameter": "rate_backend.spec.experts[0].depth", "min": 8.0, "max": 96.0},
+        {"parameter": "rate_backend.spec.experts[0].base_depth", "min": 8.0, "max": 96.0},
         {"parameter": "rate_backend.spec.experts[1].order", "min": 4.0, "max": 16.0},
         {"parameter": "rate_backend.spec.experts[1].memory_mb", "min": 64.0, "max": 768.0},
         {"parameter": "rate_backend.spec.experts[2].max_order", "min": -1.0, "max": 128.0},
@@ -318,7 +322,7 @@ bounds = {
     "max_mixture_nesting_depth": 3,
     "min_experts": 3,
     "allow_duplicate_experts": False,
-    "required_experts": ["ctw", "ppmd"],
+    "required_experts": ["fac-ctw", "ppmd"],
     "forbidden_expert_pairs": [],
 }
 

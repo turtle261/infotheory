@@ -188,6 +188,7 @@ fn convex_theorem_schedule_backend_executes() {
                 base_depth: 8,
                 num_percept_bits: 8,
                 encoding_bits: 8,
+                msb_first: None,
             })
             .with_name("fac"),
         ],
@@ -212,6 +213,7 @@ fn neural_mixture_supports_nested_mixture_expert() {
                 base_depth: 8,
                 num_percept_bits: 8,
                 encoding_bits: 8,
+                msb_first: None,
             })
             .with_name("fac"),
         ],
@@ -250,6 +252,7 @@ fn convex_mixture_supports_nested_mixture_expert() {
                 base_depth: 8,
                 num_percept_bits: 8,
                 encoding_bits: 8,
+                msb_first: None,
             })
             .with_name("fac"),
         ],

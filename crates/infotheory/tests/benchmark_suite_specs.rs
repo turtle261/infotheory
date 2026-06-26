@@ -57,6 +57,30 @@ fn two_json_benchmark_specs_are_pinned_and_canonical() {
         experts.iter().all(|expert| expert["name"] != "rwkv"),
         "two.json must not retain stale rwkv expert labels"
     );
+
+    let fac_ctw = experts
+        .iter()
+        .find(|expert| expert["kind"] == "fac-ctw")
+        .expect("two.json must include the canonical factorized CTW subject");
+    assert_eq!(
+        fac_ctw["name"], "fac-ctw",
+        "the canonical CTW benchmark slot must be named fac-ctw, not stale ctw"
+    );
+    assert_eq!(
+        fac_ctw["encoding_bits"].as_u64(),
+        Some(8),
+        "canonical fac-ctw benchmark subject must be byte-width"
+    );
+    assert_eq!(
+        fac_ctw["num_percept_bits"].as_u64(),
+        Some(8),
+        "canonical fac-ctw benchmark subject must expose the 8-bit percept width"
+    );
+    assert_eq!(
+        fac_ctw["msb_first"].as_bool(),
+        Some(true),
+        "canonical fac-ctw benchmark subject must explicitly select MSB-first byte order"
+    );
 }
 
 #[test]

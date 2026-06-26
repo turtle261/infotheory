@@ -25,17 +25,17 @@ use crate::api::{MixtureKind, MixtureScheduleMode, RateBackend};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
-use crate::backends::ctw::FacContextTree;
+use crate::backends::ctw::{
+    ContextTree, ContextTreeLifecycleSnapshot, FacContextTree, FacContextTreeLifecycleSnapshot,
+};
 #[cfg(feature = "backend-match")]
-use crate::backends::match_model::MatchModel;
+use crate::backends::match_model::{MatchModel, MatchModelLifecycleSnapshot};
 #[cfg(feature = "backend-ppmd")]
-use crate::backends::ppmd::PpmdModel;
+use crate::backends::ppmd::{PpmdLifecycleSnapshot, PpmdModel};
 #[cfg(feature = "backend-rosa")]
 use crate::backends::rosaplus::{RosaPlus, RosaTx};
-#[cfg(all(feature = "backend-sequitur", any(feature = "aixi", test)))]
-use crate::backends::sequitur::SequiturCheckpoint;
 #[cfg(feature = "backend-sequitur")]
-use crate::backends::sequitur::SequiturModel;
+use crate::backends::sequitur::{SequiturCheckpoint, SequiturLifecycleSnapshot, SequiturModel};
 #[cfg(feature = "backend-match")]
 use crate::backends::sparse_match::SparseMatchModel;
 use crate::backends::text_context::TextContextAnalyzer;
@@ -194,26 +194,41 @@ pub(crate) fn convex_step_size_for_update(
     }
 }
 
-fn normalized_prior_weights(configs: &[ExpertConfig]) -> Vec<f64> {
-    if configs.is_empty() {
+fn normalized_log_weights(log_weights: impl IntoIterator<Item = f64>) -> Vec<f64> {
+    let mut weights: Vec<f64> = log_weights.into_iter().collect();
+    if weights.is_empty() {
         return Vec::new();
     }
-    let max_log = configs
-        .iter()
-        .map(|cfg| cfg.log_prior)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let mut weights = configs
-        .iter()
-        .map(|cfg| {
-            if max_log.is_finite() {
-                (cfg.log_prior - max_log).exp()
-            } else {
-                0.0
-            }
-        })
-        .collect::<Vec<_>>();
+    let max_log = weights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    for w in &mut weights {
+        *w = if max_log.is_finite() {
+            (*w - max_log).exp()
+        } else {
+            0.0
+        };
+    }
     normalize_simplex_weights(&mut weights);
     weights
+}
+
+fn normalized_prior_weights(configs: &[ExpertConfig]) -> Vec<f64> {
+    normalized_log_weights(configs.iter().map(|cfg| cfg.log_prior))
+}
+
+fn normalized_expert_prior_weights(experts: &[ExpertState]) -> Vec<f64> {
+    normalized_log_weights(experts.iter().map(|expert| expert.log_prior))
+}
+
+#[cfg(feature = "backend-calibrated")]
+#[inline]
+fn reset_calibrated_wrapper_state(
+    core: &mut CalibratorCore,
+    pdf: &mut [f64; 256],
+    valid: &mut bool,
+) {
+    core.reset_context();
+    pdf.fill(1.0 / 256.0);
+    *valid = false;
 }
 
 fn set_log_weights_from_linear(experts: &mut [ExpertState], weights: &[f64]) {
@@ -252,6 +267,15 @@ impl Clone for Box<dyn OnlineBytePredictor> {
 
 /// Trait for online byte-level predictors that expose per-symbol log-probabilities.
 pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
+    /// Whether this predictor supports frozen-conditioning resets.
+    ///
+    /// Predictors that return `false` may still support ordinary stream lifecycle
+    /// hooks (`begin_stream`/`finish_stream`), but cannot provide plugin-entropy
+    /// style frozen reset semantics.
+    fn supports_frozen_reset(&self) -> bool {
+        true
+    }
+
     /// Optional stream-start hook.
     ///
     /// Predictors that require total symbol count (for example percent-based
@@ -265,6 +289,36 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
         Ok(())
     }
 
+    /// Capture a structural checkpoint when the concrete predictor supports it.
+    fn checkpoint_if_supported(&mut self) -> Option<OnlineBytePredictorCheckpoint> {
+        None
+    }
+
+    /// Restore a structural checkpoint created by [`Self::checkpoint_if_supported`].
+    fn restore_checkpoint_if_supported(
+        &mut self,
+        _checkpoint: &OnlineBytePredictorCheckpoint,
+    ) -> bool {
+        false
+    }
+
+    /// Release a structural checkpoint that will never be restored.
+    ///
+    /// Predictors with compact rollback journals can use this to retire
+    /// temporary checkpoints without clearing older checkpoints that may still
+    /// be live elsewhere. Plain drop-based checkpoints can accept the default
+    /// behavior: taking ownership of `_checkpoint` is already a successful
+    /// discard.
+    fn discard_checkpoint_if_supported(
+        &mut self,
+        _checkpoint: OnlineBytePredictorCheckpoint,
+    ) -> bool {
+        true
+    }
+
+    /// Clear compact checkpoint journals after all structural checkpoints expire.
+    fn clear_checkpoints_if_supported(&mut self) {}
+
     /// Log-probability (natural log) of `symbol` given the current history.
     fn log_prob(&mut self, symbol: u8) -> f64;
 
@@ -273,6 +327,59 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
         for (sym, slot) in out.iter_mut().enumerate() {
             *slot = self.log_prob(sym as u8);
         }
+    }
+
+    /// Whether this predictor can expose an MSB-first byte prefix natively.
+    ///
+    /// Native prefix stepping lets bitwise consumers query and condition on the
+    /// bits of the next byte without first materializing all 256 byte
+    /// probabilities. Predictors that return `false` remain fully supported
+    /// through the generic byte-PDF prefix fallback.
+    fn has_native_msb_byte_prefix(&self) -> bool {
+        false
+    }
+
+    /// Prepare a native MSB-first byte-prefix step.
+    ///
+    /// Returns `true` when the predictor entered a native prefix state. Callers
+    /// must then query bits in order, call [`Self::observe_native_msb_prefix_bit`]
+    /// after each observed prefix bit, and finish with
+    /// [`Self::finish_native_msb_byte_prefix`]. Implementations must leave the
+    /// predictor unchanged when they return `Ok(false)` or `Err(_)`.
+    fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Abort an active native MSB-first byte-prefix step before any bits have
+    /// been observed.
+    ///
+    /// This is used only when a caller restores to a checkpoint that was taken
+    /// immediately after `begin_native_msb_byte_prefix`. Implementations must
+    /// return an error rather than dropping observed prefix bits.
+    fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Predict `P(bit = 1)` for the next MSB-first prefix bit.
+    ///
+    /// `bit_idx` must match the next unobserved bit in the active native
+    /// prefix, counted MSB-first in `0..8`. Re-querying the current bit index
+    /// before observing it is allowed.
+    fn native_msb_prefix_prob_one(&mut self, _bit_idx: usize) -> Result<f64, String> {
+        Err("native MSB-first byte-prefix prediction is unavailable".to_string())
+    }
+
+    /// Observe one MSB-first prefix bit inside an active native byte-prefix step.
+    ///
+    /// `bit_idx` must match the next unobserved bit in the active native
+    /// prefix, counted MSB-first in `0..8`.
+    fn observe_native_msb_prefix_bit(&mut self, _bit_idx: usize, _bit: bool) -> Result<(), String> {
+        Err("native MSB-first byte-prefix stepping is unavailable".to_string())
+    }
+
+    /// Finish an active native byte-prefix step after all eight bits are known.
+    fn finish_native_msb_byte_prefix(&mut self, _symbol: u8) -> Result<(), String> {
+        Err("native MSB-first byte-prefix stepping is unavailable".to_string())
     }
 
     /// Log-probability (natural log) of `symbol`, then update the predictor.
@@ -295,6 +402,18 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
         self.begin_stream(total_symbols)
     }
 
+    /// Start a new stream in a way that preserves each predictor's semantic contract.
+    ///
+    /// This uses frozen-reset semantics when supported, and falls back to ordinary
+    /// begin/finish stream hooks otherwise.
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        if self.supports_frozen_reset() {
+            self.reset_frozen(total_symbols)
+        } else {
+            self.begin_stream(total_symbols)
+        }
+    }
+
     /// Advance conditioning state without fitting or adapting parameters.
     ///
     /// For state-space or latent-variable models this may still update internal
@@ -302,6 +421,392 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     fn update_frozen(&mut self, symbol: u8) {
         self.update(symbol);
     }
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct OnlineBytePredictorCheckpoint(OnlineBytePredictorCheckpointKind);
+
+#[derive(Clone)]
+enum OnlineBytePredictorCheckpointKind {
+    RateBackend(RateBackendPredictorCheckpoint),
+}
+
+impl OnlineBytePredictorCheckpoint {
+    fn rate_backend(checkpoint: RateBackendPredictorCheckpoint) -> Self {
+        Self(OnlineBytePredictorCheckpointKind::RateBackend(checkpoint))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OnlineBytePredictorLifecycleOp {
+    /// Start a possibly continuing stream.
+    BeginStream,
+    /// Start a fresh stream, preserving fitted predictor state where supported.
+    BeginFreshStream,
+    /// Reset transient conditioning state while preserving fitted state.
+    ResetFrozen,
+    /// Finish the current stream.
+    FinishStream,
+}
+
+#[cfg(feature = "backend-ctw")]
+fn validate_native_msb_prefix_bit_idx(next_bit_idx: usize, bit_idx: usize) -> Result<(), String> {
+    if bit_idx >= 8 {
+        return Err(format!(
+            "native MSB-first byte-prefix bit index {bit_idx} is out of range; expected 0..8"
+        ));
+    }
+    if bit_idx != next_bit_idx {
+        return Err(format!(
+            "native MSB-first byte-prefix bit index {bit_idx} violated sequential stepping; expected {next_bit_idx}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "backend-ctw")]
+fn validate_native_msb_prefix_finish(next_bit_idx: usize) -> Result<(), String> {
+    if next_bit_idx != 8 {
+        return Err(format!(
+            "native MSB-first byte-prefix finish requires 8 observed bits, got {next_bit_idx}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+enum BytePrefixStepState {
+    Native,
+    PdfPrefix {
+        cdf: Box<[f64; 257]>,
+        lo: usize,
+        hi: usize,
+    },
+}
+
+impl Default for BytePrefixStepState {
+    fn default() -> Self {
+        Self::PdfPrefix {
+            cdf: Box::new([0.0; 257]),
+            lo: 0,
+            hi: 256,
+        }
+    }
+}
+
+impl BytePrefixStepState {
+    fn prepare(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
+        if predictor.begin_native_msb_byte_prefix()? {
+            *self = Self::Native;
+            return Ok(());
+        }
+
+        let mut cdf = match std::mem::take(self) {
+            Self::PdfPrefix { cdf, .. } => cdf,
+            Self::Native => Box::new([0.0; 257]),
+        };
+        let mut logps = [0.0f64; 256];
+        predictor.fill_log_probs(&mut logps);
+        cdf[0] = 0.0;
+        for (idx, &lp) in logps.iter().enumerate() {
+            cdf[idx + 1] = cdf[idx] + clamp_prob(lp.exp(), DEFAULT_MIN_PROB);
+        }
+        if !cdf[256].is_finite() || cdf[256] <= 0.0 {
+            for (idx, slot) in cdf.iter_mut().enumerate() {
+                *slot = (idx as f64) / 256.0;
+            }
+        }
+        *self = Self::PdfPrefix {
+            cdf,
+            lo: 0,
+            hi: 256,
+        };
+        Ok(())
+    }
+
+    fn prob_one(
+        &mut self,
+        predictor: &mut dyn OnlineBytePredictor,
+        bit_idx: usize,
+    ) -> Result<f64, String> {
+        match self {
+            Self::Native => predictor.native_msb_prefix_prob_one(bit_idx),
+            Self::PdfPrefix { cdf, lo, hi } => {
+                let mid: usize = (*lo + *hi) >> 1;
+                let total: f64 = (cdf[*hi] - cdf[*lo]).max(DEFAULT_MIN_PROB);
+                let one: f64 = (cdf[*hi] - cdf[mid]).max(0.0);
+                Ok((one / total).clamp(DEFAULT_MIN_PROB, 1.0 - DEFAULT_MIN_PROB))
+            }
+        }
+    }
+
+    fn observe(
+        &mut self,
+        predictor: &mut dyn OnlineBytePredictor,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<(), String> {
+        match self {
+            Self::Native => predictor.observe_native_msb_prefix_bit(bit_idx, bit),
+            Self::PdfPrefix { lo, hi, .. } => {
+                let mid: usize = (*lo + *hi) >> 1;
+                if bit {
+                    *lo = mid;
+                } else {
+                    *hi = mid;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn abort_empty(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
+        match self {
+            Self::Native => {
+                predictor.abort_empty_native_msb_byte_prefix()?;
+                *self = Self::default();
+                Ok(())
+            }
+            Self::PdfPrefix { .. } => {
+                *self = Self::default();
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(
+        &mut self,
+        predictor: &mut dyn OnlineBytePredictor,
+        symbol: u8,
+    ) -> Result<(), String> {
+        match self {
+            Self::Native => predictor.finish_native_msb_byte_prefix(symbol),
+            Self::PdfPrefix { .. } => {
+                predictor.update(symbol);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct MixtureBitPrefixState {
+    states: Vec<BytePrefixStepState>,
+    weights: Vec<f64>,
+    likelihoods: Vec<f64>,
+    bit_probs: Vec<f64>,
+    logps: Vec<f64>,
+    active: bool,
+    primed_bit_idx: Option<usize>,
+    expected_bit_idx: usize,
+}
+
+impl MixtureBitPrefixState {
+    fn reset_inactive(&mut self) {
+        self.active = false;
+        self.primed_bit_idx = None;
+        self.expected_bit_idx = 0;
+    }
+
+    fn validate_bit_idx(&self, bit_idx: usize) -> Result<(), String> {
+        if bit_idx >= 8 {
+            return Err(format!(
+                "native MSB-first byte-prefix bit index {bit_idx} is out of range; expected 0..8"
+            ));
+        }
+        if bit_idx != self.expected_bit_idx {
+            return Err(format!(
+                "native MSB-first byte-prefix bit index {bit_idx} violated sequential stepping; expected {}",
+                self.expected_bit_idx
+            ));
+        }
+        Ok(())
+    }
+
+    fn begin(&mut self, experts: &mut [ExpertState], weights: &[f64]) -> Result<bool, String> {
+        if !experts
+            .iter()
+            .any(|expert| expert.predictor.has_native_msb_byte_prefix())
+        {
+            self.reset_inactive();
+            return Ok(false);
+        }
+
+        let n: usize = experts.len();
+        let mut native_checkpoints: Vec<ExpertTempCheckpoint> = Vec::new();
+        for (idx, expert) in experts.iter_mut().enumerate() {
+            if !expert.predictor.has_native_msb_byte_prefix() {
+                continue;
+            }
+            let Some(checkpoint) = expert.predictor.checkpoint_if_supported() else {
+                for checkpoint in native_checkpoints.drain(..) {
+                    assert!(
+                        experts[checkpoint.index]
+                            .predictor
+                            .discard_checkpoint_if_supported(checkpoint.checkpoint),
+                        "native-prefix expert checkpoint could not be discarded",
+                    );
+                }
+                self.reset_inactive();
+                return Ok(false);
+            };
+            native_checkpoints.push(ExpertTempCheckpoint {
+                index: idx,
+                checkpoint,
+            });
+        }
+
+        self.states.resize_with(n, BytePrefixStepState::default);
+        self.weights.clear();
+        self.weights.extend(weights.iter().copied());
+        normalize_simplex_weights(&mut self.weights);
+        self.likelihoods.resize(n, 1.0);
+        self.likelihoods.fill(1.0);
+        self.bit_probs.resize(n, 0.5);
+        self.logps.resize(n, 0.0);
+        self.primed_bit_idx = None;
+        self.expected_bit_idx = 0;
+        for (state, expert) in self.states.iter_mut().zip(experts.iter_mut()) {
+            if let Err(err) = state.prepare(expert.predictor.as_mut()) {
+                for checkpoint in native_checkpoints.drain(..) {
+                    assert!(
+                        experts[checkpoint.index]
+                            .predictor
+                            .restore_checkpoint_if_supported(&checkpoint.checkpoint),
+                        "native-prefix expert checkpoint could not be restored",
+                    );
+                    assert!(
+                        experts[checkpoint.index]
+                            .predictor
+                            .discard_checkpoint_if_supported(checkpoint.checkpoint),
+                        "native-prefix expert checkpoint could not be discarded",
+                    );
+                }
+                self.reset_inactive();
+                return Err(err);
+            }
+        }
+        for checkpoint in native_checkpoints.drain(..) {
+            assert!(
+                experts[checkpoint.index]
+                    .predictor
+                    .discard_checkpoint_if_supported(checkpoint.checkpoint),
+                "native-prefix expert checkpoint could not be discarded",
+            );
+        }
+        self.active = true;
+        Ok(true)
+    }
+
+    fn abort_empty(&mut self, experts: &mut [ExpertState]) -> Result<bool, String> {
+        if !self.active {
+            return Ok(false);
+        }
+        if self.expected_bit_idx != 0 {
+            return Err(format!(
+                "native MSB-first byte-prefix abort requires zero observed bits, got {}",
+                self.expected_bit_idx
+            ));
+        }
+        for (state, expert) in self.states.iter_mut().zip(experts.iter_mut()) {
+            state.abort_empty(expert.predictor.as_mut())?;
+        }
+        self.reset_inactive();
+        Ok(true)
+    }
+
+    fn prime_bit_probs_if_needed(
+        &mut self,
+        experts: &mut [ExpertState],
+        bit_idx: usize,
+    ) -> Result<(), String> {
+        self.validate_bit_idx(bit_idx)?;
+        if self.primed_bit_idx == Some(bit_idx) {
+            return Ok(());
+        }
+        // Index form required for coordinated access to per-expert state + scratch buffers
+        // (same rationale as the allows in prob_one/observe below).
+        #[allow(clippy::needless_range_loop)]
+        for idx in 0..experts.len() {
+            let p1: f64 = self.states[idx].prob_one(experts[idx].predictor.as_mut(), bit_idx)?;
+            self.bit_probs[idx] = p1;
+        }
+        self.primed_bit_idx = Some(bit_idx);
+        Ok(())
+    }
+
+    fn prob_one(&mut self, experts: &mut [ExpertState], bit_idx: usize) -> Result<f64, String> {
+        debug_assert!(self.active);
+        self.prime_bit_probs_if_needed(experts, bit_idx)?;
+        let mut denom: f64 = 0.0;
+        let mut numer: f64 = 0.0;
+        // Index form required for parallel mutable access to multiple scratch buffers
+        // alongside experts; iterators would require zip + tuple mutation which is less clear here.
+        #[allow(clippy::needless_range_loop)]
+        for idx in 0..experts.len() {
+            let p1: f64 = self.bit_probs[idx];
+            let weighted_prefix: f64 = self.weights[idx] * self.likelihoods[idx];
+            denom += weighted_prefix;
+            numer += weighted_prefix * p1;
+        }
+        Ok(if denom.is_finite() && denom > 0.0 {
+            (numer / denom).clamp(DEFAULT_MIN_PROB, 1.0 - DEFAULT_MIN_PROB)
+        } else {
+            // Invariant failure (introduced in bitwiseness bit-prefix state; tightened):
+            // non-positive/NaN denom means internal expert weighting or priming
+            // produced invalid state. Panic with context per AGENTS (contract violation).
+            panic!(
+                "MixtureBitPrefixState::prob_one: invalid weighted denom (must be finite > 0); \
+                 this indicates a bug in prime_bit_probs_if_needed or expert likelihoods"
+            )
+        })
+    }
+
+    fn observe(
+        &mut self,
+        experts: &mut [ExpertState],
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<(), String> {
+        debug_assert!(self.active);
+        self.prime_bit_probs_if_needed(experts, bit_idx)?;
+        // Index form clearest for coordinated mutation of likelihoods/states + experts[idx].
+        #[allow(clippy::needless_range_loop)]
+        for idx in 0..experts.len() {
+            let p1: f64 = self.bit_probs[idx];
+            let pb: f64 = if bit { p1 } else { 1.0 - p1 };
+            self.likelihoods[idx] = (self.likelihoods[idx] * pb).max(DEFAULT_MIN_PROB);
+            self.states[idx].observe(experts[idx].predictor.as_mut(), bit_idx, bit)?;
+        }
+        self.expected_bit_idx += 1;
+        self.primed_bit_idx = None;
+        Ok(())
+    }
+
+    fn finish_adaptive(&mut self, experts: &mut [ExpertState], symbol: u8) -> Result<(), String> {
+        debug_assert!(self.active);
+        if self.expected_bit_idx != 8 {
+            return Err(format!(
+                "native MSB-first byte-prefix finish requires 8 observed bits, got {}",
+                self.expected_bit_idx
+            ));
+        }
+        // Index form clearest for coordinated mutation of likelihoods/logps/states + experts[idx].
+        #[allow(clippy::needless_range_loop)]
+        for idx in 0..experts.len() {
+            let lp: f64 = self.likelihoods[idx].max(DEFAULT_MIN_PROB).ln();
+            self.logps[idx] = lp;
+            self.states[idx].finish(experts[idx].predictor.as_mut(), symbol)?;
+        }
+        self.reset_inactive();
+        Ok(())
+    }
+}
+
+struct ExpertTempCheckpoint {
+    index: usize,
+    checkpoint: OnlineBytePredictorCheckpoint,
 }
 
 #[cfg(feature = "backend-rwkv")]
@@ -313,122 +818,11 @@ fn ensure_rwkv_primed(compressor: &mut rwkvzip::Compressor, primed: &mut bool) {
     }
 }
 
-#[inline]
 #[cfg(feature = "backend-ctw")]
-fn ctw_log_prob_update_msb(tree: &mut FacContextTree, symbol: u8, min_prob: f64) -> f64 {
-    let mut logp = 0.0;
-    for bit_idx in 0..8 {
-        let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-        let p = tree.predict(bit, bit_idx);
-        if p.is_finite() && p > 0.0 {
-            logp += p.ln();
-        } else {
-            logp = f64::NEG_INFINITY;
-        }
-        tree.update_predicted(bit, bit_idx);
-    }
-    if logp.is_finite() {
-        logp.max(min_prob.ln())
-    } else {
-        min_prob.ln()
-    }
-}
-
-#[inline]
-#[cfg(feature = "backend-ctw")]
-fn ctw_log_prob_update_lsb(
-    tree: &mut FacContextTree,
-    symbol: u8,
-    bits_per_symbol: usize,
-    min_prob: f64,
-) -> f64 {
-    let mut logp = 0.0;
-    for bit_idx in 0..bits_per_symbol {
-        let bit = ((symbol >> bit_idx) & 1) == 1;
-        let p = tree.predict(bit, bit_idx);
-        if p.is_finite() && p > 0.0 {
-            logp += p.ln();
-        } else {
-            logp = f64::NEG_INFINITY;
-        }
-        tree.update_predicted(bit, bit_idx);
-    }
-    if logp.is_finite() {
-        logp.max(min_prob.ln())
-    } else {
-        min_prob.ln()
-    }
-}
-
-#[cfg(feature = "backend-ctw")]
-fn fill_fac_tree_log_probs(
-    tree: &mut FacContextTree,
-    bits_per_symbol: usize,
-    msb_first: bool,
-    min_logp: f64,
-    out: &mut [f64; 256],
-) {
-    struct RecParams {
-        bits: usize,
-        msb_first: bool,
-        log_before: f64,
-        min_logp: f64,
-    }
-
-    let bits = bits_per_symbol.clamp(1, 8);
-    let patterns = 1usize << bits;
-    let mut pattern_logps = [f64::NEG_INFINITY; 256];
-    let params = RecParams {
-        bits,
-        msb_first,
-        log_before: tree.get_log_block_probability(),
-        min_logp,
-    };
-
-    fn rec(
-        tree: &mut FacContextTree,
-        depth: usize,
-        params: &RecParams,
-        symbol_acc: u8,
-        pattern_logps: &mut [f64; 256],
-    ) {
-        if depth == params.bits {
-            let pat = symbol_acc as usize;
-            let logp = (tree.get_log_block_probability() - params.log_before).max(params.min_logp);
-            pattern_logps[pat] = logp;
-            return;
-        }
-
-        for bit in [false, true] {
-            tree.update(bit, depth);
-            let mut next_symbol = symbol_acc;
-            if params.msb_first {
-                let shift = 7usize.saturating_sub(depth);
-                if bit {
-                    next_symbol |= 1u8 << shift;
-                }
-            } else if bit {
-                next_symbol |= 1u8 << depth;
-            }
-            rec(tree, depth + 1, params, next_symbol, pattern_logps);
-            tree.revert(depth);
-        }
-    }
-
-    rec(tree, 0, &params, 0, &mut pattern_logps);
-
-    if bits == 8 {
-        out.copy_from_slice(&pattern_logps);
-    } else {
-        let aliases = 1usize << (8 - bits);
-        let alias_ln = (aliases as f64).ln();
-        let mask = patterns - 1;
-        for byte in 0..256usize {
-            out[byte] = pattern_logps[byte & mask] - alias_ln;
-        }
-    }
-}
-
+use crate::backends::ctw::{
+    ctw_log_prob_msb, ctw_log_prob_update_lsb, ctw_log_prob_update_msb, ctw_symbol_bit_msb,
+    fill_ctw_tree_log_probs, fill_fac_tree_log_probs,
+};
 /// A concrete online predictor backed by a `RateBackend` configuration.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
@@ -477,31 +871,43 @@ pub enum RateBackendPredictor {
         /// Probability floor for numeric stability.
         min_prob: f64,
     },
-    /// Byte-wise CTW implemented as 8 factorized bit trees (MSB-first).
+    /// AC-CTW with consumer-chosen symbol width interpreted MSB-first.
     #[cfg(feature = "backend-ctw")]
     Ctw {
-        /// FAC-CTW tree stack (8 bits per byte).
-        tree: FacContextTree,
+        /// Single binary context tree.
+        tree: ContextTree,
+        /// Active bit-width per observed symbol.
+        bits_per_symbol: usize,
         /// Probability floor for numeric stability.
         min_prob: f64,
         /// Compact rollback journal used while checkpoint scopes are active.
-        checkpoint_journal: Vec<FacCtwUndoOp>,
+        checkpoint_journal: Vec<CtwUndoOp>,
         /// Number of active checkpoints that require journaling.
         checkpoint_depth: usize,
+        /// In-flight native byte-prefix progress when stepping MSB-first bits.
+        native_prefix_progress: Option<usize>,
     },
-    /// Factorized CTW with configurable bit-encoding (LSB-first).
+    /// Factorized CTW with width-dependent bit order.
     #[cfg(feature = "backend-ctw")]
     FacCtw {
         /// FAC-CTW tree stack for configured bit width.
         tree: FacContextTree,
         /// Active bit-width per symbol.
         bits_per_symbol: usize,
+        /// Effective symbol bit order (`true` => MSB-first).
+        ///
+        /// FAC-CTW keeps legacy LSB-first behavior for non-byte symbol widths,
+        /// but 8-bit symbols run MSB-first so byte-packed sessions can use the
+        /// native prefix path consistently.
+        msb_first: bool,
         /// Probability floor for numeric stability.
         min_prob: f64,
         /// Compact rollback journal used while checkpoint scopes are active.
         checkpoint_journal: Vec<FacCtwUndoOp>,
         /// Number of active checkpoints that require journaling.
         checkpoint_depth: usize,
+        /// In-flight native byte-prefix progress when stepping MSB-first bits.
+        native_prefix_progress: Option<usize>,
     },
     /// RWKV-7 neural predictor.
     #[cfg(feature = "backend-rwkv")]
@@ -566,7 +972,6 @@ pub enum RateBackendPredictor {
     },
 }
 
-#[cfg(any(feature = "aixi", test))]
 #[derive(Clone)]
 /// Checkpoint snapshot used for temporary predictor rollback.
 ///
@@ -575,7 +980,13 @@ pub enum RateBackendPredictor {
 /// state.
 pub enum RateBackendPredictorCheckpoint {
     /// Full predictor clone for backends without specialized checkpointing.
-    Full(RateBackendPredictor),
+    ///
+    /// Boxed so the enum stays pointer-sized: compact variants (`Ctw`, `Rosa`,
+    /// `Sequitur`, etc.) are not forced to move ~4 KiB on the stack when passed
+    /// through this type. The clone+heap cost is negligible versus `self.clone()`.
+    /// Byte-prefix session buffering still boxes checkpoints out-of-line when
+    /// stored in long-lived session state.
+    Full(Box<RateBackendPredictor>),
     /// Compact ROSA journal marker for [`RateBackendPredictor::Rosa`].
     #[cfg(feature = "backend-rosa")]
     Rosa {
@@ -590,16 +1001,35 @@ pub enum RateBackendPredictorCheckpoint {
     Ctw {
         /// Length of the rollback journal to restore when unwinding the checkpoint.
         journal_len: usize,
+        /// In-flight native prefix progress captured with the checkpoint.
+        native_prefix_progress: Option<usize>,
     },
     /// Compact FAC-CTW journal marker for [`RateBackendPredictor::FacCtw`].
     #[cfg(feature = "backend-ctw")]
     FacCtw {
         /// Length of the rollback journal to restore when unwinding the checkpoint.
         journal_len: usize,
+        /// In-flight native prefix progress captured with the checkpoint.
+        native_prefix_progress: Option<usize>,
     },
     /// Composite checkpoint for calibrated predictors.
     #[cfg(feature = "backend-calibrated")]
     Calibrated(Box<CalibratedPredictorCheckpoint>),
+    /// Composite checkpoint for mixture predictors.
+    #[cfg(feature = "backend-mixture")]
+    Mixture(Box<MixtureRuntimeCheckpoint>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Internal AC-CTW journal event used to restore predictor state from checkpoints.
+#[doc(hidden)]
+pub enum CtwUndoOp {
+    /// Symbol update applied in learning mode.
+    LearnedSymbol,
+    /// One native prefix bit applied in learning mode.
+    LearnedBit,
+    /// Symbol update applied in frozen/scoring mode.
+    FrozenSymbol,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -608,6 +1038,8 @@ pub enum RateBackendPredictorCheckpoint {
 pub enum FacCtwUndoOp {
     /// Symbol update applied in learning mode.
     LearnedSymbol,
+    /// One native prefix bit applied in learning mode.
+    LearnedBit { bit_idx: usize },
     /// Symbol update applied in frozen/scoring mode.
     FrozenSymbol,
 }
@@ -617,12 +1049,11 @@ pub enum FacCtwUndoOp {
 /// Internal ROSA journal event used to restore predictor state from checkpoints.
 #[doc(hidden)]
 pub enum RosaPredictorUndo {
-    Learned(RosaTx),
+    Learned(Box<RosaTx>),
     FrozenCursor { previous_last: i32 },
 }
 
 #[derive(Clone)]
-#[cfg(any(feature = "aixi", test))]
 #[cfg(feature = "backend-calibrated")]
 /// Internal checkpoint payload for [`RateBackendPredictor::Calibrated`].
 ///
@@ -635,8 +1066,72 @@ pub struct CalibratedPredictorCheckpoint {
     valid: bool,
 }
 
+enum RateBackendPredictorLifecycleCheckpoint {
+    NotNeeded,
+    Full(Box<RateBackendPredictor>),
+    #[cfg(feature = "backend-ctw")]
+    Ctw {
+        tree: Option<ContextTreeLifecycleSnapshot>,
+        native_prefix_progress: Option<usize>,
+    },
+    #[cfg(feature = "backend-ctw")]
+    FacCtw {
+        tree: Option<FacContextTreeLifecycleSnapshot>,
+        native_prefix_progress: Option<usize>,
+    },
+    #[cfg(feature = "backend-ppmd")]
+    Ppmd(PpmdLifecycleSnapshot),
+    #[cfg(feature = "backend-match")]
+    Match(MatchModelLifecycleSnapshot),
+    #[cfg(feature = "backend-match")]
+    SparseMatch(MatchModelLifecycleSnapshot),
+    #[cfg(feature = "backend-sequitur")]
+    Sequitur(SequiturLifecycleSnapshot),
+    #[cfg(feature = "backend-calibrated")]
+    Calibrated(Box<CalibratedPredictorLifecycleCheckpoint>),
+    #[cfg(feature = "backend-mixture")]
+    Mixture(Box<MixtureRuntimeLifecycleCheckpoint>),
+}
+
+#[cfg(feature = "backend-calibrated")]
+struct CalibratedPredictorLifecycleCheckpoint {
+    base: Box<RateBackendPredictorLifecycleCheckpoint>,
+    core: CalibratorCore,
+    pdf: [f64; 256],
+    valid: bool,
+}
+
 #[cfg(feature = "backend-ctw")]
-#[cfg(any(feature = "aixi", test))]
+fn restore_ctw_checkpoint(
+    tree: &mut ContextTree,
+    bits_per_symbol: usize,
+    checkpoint_journal: &mut Vec<CtwUndoOp>,
+    target_len: usize,
+) {
+    let bits = bits_per_symbol.clamp(1, 8);
+    while checkpoint_journal.len() > target_len {
+        match checkpoint_journal
+            .pop()
+            .expect("ctw checkpoint journal underflow")
+        {
+            CtwUndoOp::LearnedSymbol => {
+                for _ in 0..bits {
+                    tree.revert();
+                }
+            }
+            CtwUndoOp::LearnedBit => {
+                tree.revert();
+            }
+            CtwUndoOp::FrozenSymbol => {
+                for _ in 0..bits {
+                    tree.revert_history();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
 fn restore_fac_ctw_checkpoint(
     tree: &mut FacContextTree,
     bits_per_symbol: usize,
@@ -653,6 +1148,9 @@ fn restore_fac_ctw_checkpoint(
                 for bit_idx in (0..bits).rev() {
                     tree.revert(bit_idx);
                 }
+            }
+            FacCtwUndoOp::LearnedBit { bit_idx } => {
+                tree.revert(bit_idx);
             }
             FacCtwUndoOp::FrozenSymbol => {
                 tree.revert_history(bits);
@@ -698,7 +1196,382 @@ impl RateBackendPredictor {
             })
     }
 
-    #[cfg(any(feature = "aixi", test))]
+    fn lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+    ) -> RateBackendPredictorLifecycleCheckpoint {
+        #[cfg(feature = "backend-ctw")]
+        if matches!(
+            self,
+            RateBackendPredictor::Ctw {
+                native_prefix_progress: Some(bits),
+                ..
+            } | RateBackendPredictor::FacCtw {
+                native_prefix_progress: Some(bits),
+                ..
+            } if *bits > 0
+        ) {
+            return RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()));
+        }
+
+        match self {
+            #[cfg(feature = "backend-rosa")]
+            RateBackendPredictor::Rosa { .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+                }
+            },
+            #[cfg(feature = "backend-match")]
+            RateBackendPredictor::Match { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Match(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-match")]
+            RateBackendPredictor::SparseMatch { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::SparseMatch(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-ppmd")]
+            RateBackendPredictor::Ppmd { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Ppmd(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-sequitur")]
+            RateBackendPredictor::Sequitur { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::BeginStream
+                | OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Sequitur(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                tree,
+                native_prefix_progress,
+                ..
+            } => match op {
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Ctw {
+                        tree: Some(tree.lifecycle_snapshot()),
+                        native_prefix_progress: *native_prefix_progress,
+                    }
+                }
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    if native_prefix_progress.is_some() {
+                        RateBackendPredictorLifecycleCheckpoint::Ctw {
+                            tree: None,
+                            native_prefix_progress: *native_prefix_progress,
+                        }
+                    } else {
+                        RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                    }
+                }
+            },
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                tree,
+                native_prefix_progress,
+                ..
+            } => match op {
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::FacCtw {
+                        tree: Some(tree.lifecycle_snapshot()),
+                        native_prefix_progress: *native_prefix_progress,
+                    }
+                }
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    if native_prefix_progress.is_some() {
+                        RateBackendPredictorLifecycleCheckpoint::FacCtw {
+                            tree: None,
+                            native_prefix_progress: *native_prefix_progress,
+                        }
+                    } else {
+                        RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                    }
+                }
+            },
+            #[cfg(feature = "backend-zpaq")]
+            RateBackendPredictor::Zpaq { .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::ResetFrozen => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::BeginStream
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+                }
+            },
+            #[cfg(feature = "backend-particle")]
+            RateBackendPredictor::Particle { .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+                }
+            },
+            #[cfg(feature = "backend-rwkv")]
+            RateBackendPredictor::Rwkv7 { .. } => {
+                RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+            }
+            #[cfg(feature = "backend-mamba")]
+            RateBackendPredictor::Mamba { .. } => {
+                RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+            }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+                ..
+            } => RateBackendPredictorLifecycleCheckpoint::Calibrated(Box::new(
+                CalibratedPredictorLifecycleCheckpoint {
+                    base: Box::new(base.lifecycle_checkpoint(op)),
+                    core: core.clone(),
+                    pdf: *pdf,
+                    valid: *valid,
+                },
+            )),
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                RateBackendPredictorLifecycleCheckpoint::Mixture(Box::new(
+                    runtime.lifecycle_checkpoint(op),
+                ))
+            }
+            RateBackendPredictor::Disabled { .. } => {
+                RateBackendPredictorLifecycleCheckpoint::NotNeeded
+            }
+        }
+    }
+
+    fn restore_lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: RateBackendPredictorLifecycleCheckpoint,
+    ) {
+        match (self, checkpoint) {
+            (_, RateBackendPredictorLifecycleCheckpoint::NotNeeded) => {}
+            (slot, RateBackendPredictorLifecycleCheckpoint::Full(state)) => {
+                *slot = *state;
+            }
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::Ctw {
+                    tree,
+                    native_prefix_progress,
+                    ..
+                },
+                RateBackendPredictorLifecycleCheckpoint::Ctw {
+                    tree: tree_snapshot,
+                    native_prefix_progress: prefix,
+                },
+            ) => {
+                if let Some(snapshot) = tree_snapshot {
+                    tree.restore_lifecycle_snapshot(snapshot);
+                }
+                *native_prefix_progress = prefix;
+            }
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::FacCtw {
+                    tree,
+                    native_prefix_progress,
+                    ..
+                },
+                RateBackendPredictorLifecycleCheckpoint::FacCtw {
+                    tree: tree_snapshot,
+                    native_prefix_progress: prefix,
+                },
+            ) => {
+                if let Some(snapshot) = tree_snapshot {
+                    tree.restore_lifecycle_snapshot(snapshot);
+                }
+                *native_prefix_progress = prefix;
+            }
+            #[cfg(feature = "backend-ppmd")]
+            (
+                RateBackendPredictor::Ppmd { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::Ppmd(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-match")]
+            (
+                RateBackendPredictor::Match { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::Match(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-match")]
+            (
+                RateBackendPredictor::SparseMatch { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::SparseMatch(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-sequitur")]
+            (
+                RateBackendPredictor::Sequitur { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::Sequitur(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-calibrated")]
+            (
+                RateBackendPredictor::Calibrated {
+                    base,
+                    core,
+                    pdf,
+                    valid,
+                    ..
+                },
+                RateBackendPredictorLifecycleCheckpoint::Calibrated(checkpoint),
+            ) => {
+                base.restore_lifecycle_checkpoint(op, *checkpoint.base);
+                *core = checkpoint.core;
+                *pdf = checkpoint.pdf;
+                *valid = checkpoint.valid;
+            }
+            #[cfg(feature = "backend-mixture")]
+            (
+                RateBackendPredictor::Mixture { runtime },
+                RateBackendPredictorLifecycleCheckpoint::Mixture(checkpoint),
+            ) => runtime.restore_lifecycle_checkpoint(op, *checkpoint),
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Ctw { .. }) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorLifecycleCheckpoint::FacCtw { .. }) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-ppmd")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Ppmd(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-match")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Match(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-match")]
+            (_, RateBackendPredictorLifecycleCheckpoint::SparseMatch(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-sequitur")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Sequitur(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Calibrated(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-mixture")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Mixture(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+        }
+    }
+
+    fn discard_lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: RateBackendPredictorLifecycleCheckpoint,
+    ) {
+        match (self, checkpoint) {
+            (_, RateBackendPredictorLifecycleCheckpoint::NotNeeded)
+            | (_, RateBackendPredictorLifecycleCheckpoint::Full(_)) => {}
+            #[cfg(feature = "backend-calibrated")]
+            (
+                RateBackendPredictor::Calibrated { base, .. },
+                RateBackendPredictorLifecycleCheckpoint::Calibrated(checkpoint),
+            ) => base.discard_lifecycle_checkpoint(op, *checkpoint.base),
+            #[cfg(feature = "backend-mixture")]
+            (
+                RateBackendPredictor::Mixture { runtime },
+                RateBackendPredictorLifecycleCheckpoint::Mixture(checkpoint),
+            ) => runtime.discard_lifecycle_checkpoint(op, *checkpoint),
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::Ctw { .. },
+                RateBackendPredictorLifecycleCheckpoint::Ctw { .. },
+            )
+            | (
+                RateBackendPredictor::FacCtw { .. },
+                RateBackendPredictorLifecycleCheckpoint::FacCtw { .. },
+            ) => {}
+            #[cfg(feature = "backend-ppmd")]
+            (
+                RateBackendPredictor::Ppmd { .. },
+                RateBackendPredictorLifecycleCheckpoint::Ppmd(_),
+            ) => {}
+            #[cfg(feature = "backend-match")]
+            (
+                RateBackendPredictor::Match { .. },
+                RateBackendPredictorLifecycleCheckpoint::Match(_),
+            )
+            | (
+                RateBackendPredictor::SparseMatch { .. },
+                RateBackendPredictorLifecycleCheckpoint::SparseMatch(_),
+            ) => {}
+            #[cfg(feature = "backend-sequitur")]
+            (
+                RateBackendPredictor::Sequitur { .. },
+                RateBackendPredictorLifecycleCheckpoint::Sequitur(_),
+            ) => {}
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Ctw { .. })
+            | (_, RateBackendPredictorLifecycleCheckpoint::FacCtw { .. }) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-ppmd")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Ppmd(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-match")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Match(_))
+            | (_, RateBackendPredictorLifecycleCheckpoint::SparseMatch(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-sequitur")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Sequitur(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Calibrated(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-mixture")]
+            (_, RateBackendPredictorLifecycleCheckpoint::Mixture(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+        }
+    }
+
     pub(crate) fn checkpoint(&mut self) -> RateBackendPredictorCheckpoint {
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -720,22 +1593,26 @@ impl RateBackendPredictor {
             RateBackendPredictor::Ctw {
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
                 *checkpoint_depth = checkpoint_depth.saturating_add(1);
                 RateBackendPredictorCheckpoint::Ctw {
                     journal_len: checkpoint_journal.len(),
+                    native_prefix_progress: *native_prefix_progress,
                 }
             }
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw {
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
                 *checkpoint_depth = checkpoint_depth.saturating_add(1);
                 RateBackendPredictorCheckpoint::FacCtw {
                     journal_len: checkpoint_journal.len(),
+                    native_prefix_progress: *native_prefix_progress,
                 }
             }
             #[cfg(feature = "backend-calibrated")]
@@ -753,11 +1630,53 @@ impl RateBackendPredictor {
                     valid: *valid,
                 },
             )),
-            _ => RateBackendPredictorCheckpoint::Full(self.clone()),
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime
+                .checkpoint()
+                .map(|checkpoint| RateBackendPredictorCheckpoint::Mixture(Box::new(checkpoint)))
+                .unwrap_or_else(|| RateBackendPredictorCheckpoint::Full(Box::new(self.clone()))),
+            _ => RateBackendPredictorCheckpoint::Full(Box::new(self.clone())),
         }
     }
 
-    #[cfg(any(feature = "aixi", test))]
+    pub(crate) fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => match *native_prefix_progress {
+                Some(0) => {
+                    *native_prefix_progress = None;
+                    Ok(true)
+                }
+                Some(bits) => Err(format!(
+                    "native MSB-first byte-prefix abort requires zero observed bits, got {bits}"
+                )),
+                None => Ok(false),
+            },
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => match *native_prefix_progress {
+                Some(0) => {
+                    *native_prefix_progress = None;
+                    Ok(true)
+                }
+                Some(bits) => Err(format!(
+                    "native MSB-first byte-prefix abort requires zero observed bits, got {bits}"
+                )),
+                None => Ok(false),
+            },
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.abort_empty_native_msb_byte_prefix()
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) fn restore_checkpoint(&mut self, checkpoint: &RateBackendPredictorCheckpoint) {
         match (self, checkpoint) {
             #[cfg(feature = "backend-rosa")]
@@ -774,7 +1693,7 @@ impl RateBackendPredictor {
                         .pop()
                         .expect("rosa checkpoint journal underflow")
                     {
-                        RosaPredictorUndo::Learned(tx) => model.rollback_tx(tx),
+                        RosaPredictorUndo::Learned(tx) => model.rollback_tx(*tx),
                         RosaPredictorUndo::FrozenCursor { previous_last } => {
                             model.restore_conditioning_cursor(previous_last)
                         }
@@ -792,12 +1711,18 @@ impl RateBackendPredictor {
             (
                 RateBackendPredictor::Ctw {
                     tree,
+                    bits_per_symbol,
                     checkpoint_journal,
+                    native_prefix_progress,
                     ..
                 },
-                RateBackendPredictorCheckpoint::Ctw { journal_len },
+                RateBackendPredictorCheckpoint::Ctw {
+                    journal_len,
+                    native_prefix_progress: checkpoint_progress,
+                },
             ) => {
-                restore_fac_ctw_checkpoint(tree, 8, checkpoint_journal, *journal_len);
+                restore_ctw_checkpoint(tree, *bits_per_symbol, checkpoint_journal, *journal_len);
+                *native_prefix_progress = *checkpoint_progress;
             }
             #[cfg(feature = "backend-ctw")]
             (
@@ -805,9 +1730,13 @@ impl RateBackendPredictor {
                     tree,
                     bits_per_symbol,
                     checkpoint_journal,
+                    native_prefix_progress,
                     ..
                 },
-                RateBackendPredictorCheckpoint::FacCtw { journal_len },
+                RateBackendPredictorCheckpoint::FacCtw {
+                    journal_len,
+                    native_prefix_progress: checkpoint_progress,
+                },
             ) => {
                 restore_fac_ctw_checkpoint(
                     tree,
@@ -815,6 +1744,7 @@ impl RateBackendPredictor {
                     checkpoint_journal,
                     *journal_len,
                 );
+                *native_prefix_progress = *checkpoint_progress;
             }
             #[cfg(feature = "backend-calibrated")]
             (
@@ -832,8 +1762,15 @@ impl RateBackendPredictor {
                 *pdf = ck.pdf;
                 *valid = ck.valid;
             }
+            #[cfg(feature = "backend-mixture")]
+            (
+                RateBackendPredictor::Mixture { runtime },
+                RateBackendPredictorCheckpoint::Mixture(ck),
+            ) => {
+                runtime.restore_checkpoint(ck);
+            }
             (slot, RateBackendPredictorCheckpoint::Full(state)) => {
-                *slot = state.clone();
+                *slot = state.as_ref().clone();
             }
             #[cfg(feature = "backend-rosa")]
             (_, RateBackendPredictorCheckpoint::Rosa { .. }) => {
@@ -851,6 +1788,10 @@ impl RateBackendPredictor {
             (_, RateBackendPredictorCheckpoint::Calibrated(_)) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
             }
+            #[cfg(feature = "backend-mixture")]
+            (_, RateBackendPredictorCheckpoint::Mixture(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
             #[cfg(feature = "backend-sequitur")]
             (_, RateBackendPredictorCheckpoint::Sequitur(_)) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
@@ -858,7 +1799,6 @@ impl RateBackendPredictor {
         }
     }
 
-    #[cfg(any(feature = "aixi", test))]
     pub(crate) fn clear_checkpoints_if_supported(&mut self) {
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -876,35 +1816,167 @@ impl RateBackendPredictor {
             RateBackendPredictor::Ctw {
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
                 checkpoint_journal.clear();
                 *checkpoint_depth = 0;
+                *native_prefix_progress = None;
             }
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw {
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
                 checkpoint_journal.clear();
                 *checkpoint_depth = 0;
+                *native_prefix_progress = None;
             }
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated { base, .. } => {
                 base.clear_checkpoints_if_supported();
             }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.clear_checkpoints_if_supported();
+            }
             _ => {}
+        }
+    }
+
+    pub(crate) fn discard_checkpoint(&mut self, checkpoint: RateBackendPredictorCheckpoint) {
+        match (self, checkpoint) {
+            #[cfg(feature = "backend-rosa")]
+            (
+                RateBackendPredictor::Rosa {
+                    checkpoint_depth, ..
+                },
+                RateBackendPredictorCheckpoint::Rosa { .. },
+            ) => {
+                *checkpoint_depth = checkpoint_depth.saturating_sub(1);
+            }
+            #[cfg(feature = "backend-sequitur")]
+            (
+                RateBackendPredictor::Sequitur { .. },
+                RateBackendPredictorCheckpoint::Sequitur(_),
+            ) => {}
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::Ctw {
+                    checkpoint_depth, ..
+                },
+                RateBackendPredictorCheckpoint::Ctw { .. },
+            ) => {
+                *checkpoint_depth = checkpoint_depth.saturating_sub(1);
+            }
+            #[cfg(feature = "backend-ctw")]
+            (
+                RateBackendPredictor::FacCtw {
+                    checkpoint_depth, ..
+                },
+                RateBackendPredictorCheckpoint::FacCtw { .. },
+            ) => {
+                *checkpoint_depth = checkpoint_depth.saturating_sub(1);
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (
+                RateBackendPredictor::Calibrated { base, .. },
+                RateBackendPredictorCheckpoint::Calibrated(checkpoint),
+            ) => {
+                base.discard_checkpoint(*checkpoint.base);
+            }
+            #[cfg(feature = "backend-mixture")]
+            (
+                RateBackendPredictor::Mixture { runtime },
+                RateBackendPredictorCheckpoint::Mixture(checkpoint),
+            ) => {
+                runtime.discard_checkpoint(*checkpoint);
+            }
+            (_, RateBackendPredictorCheckpoint::Full(_)) => {}
+            #[cfg(feature = "backend-rosa")]
+            (_, RateBackendPredictorCheckpoint::Rosa { .. }) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorCheckpoint::Ctw { .. }) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-ctw")]
+            (_, RateBackendPredictorCheckpoint::FacCtw { .. }) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (_, RateBackendPredictorCheckpoint::Calibrated(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-mixture")]
+            (_, RateBackendPredictorCheckpoint::Mixture(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-sequitur")]
+            (_, RateBackendPredictorCheckpoint::Sequitur(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
         }
     }
 }
 
 impl OnlineBytePredictor for RateBackendPredictor {
+    fn supports_frozen_reset(&self) -> bool {
+        match self {
+            #[cfg(feature = "backend-zpaq")]
+            RateBackendPredictor::Zpaq { .. } => false,
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.supports_frozen_reset(),
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated { base, .. } => base.supports_frozen_reset(),
+            _ => true,
+        }
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.begin_fresh_stream(total_symbols),
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                pdf,
+                valid,
+                ..
+            } => {
+                base.begin_fresh_stream(total_symbols)?;
+                reset_calibrated_wrapper_state(core, pdf, valid);
+                Ok(())
+            }
+            _ => {
+                if self.supports_frozen_reset() {
+                    self.reset_frozen(total_symbols)
+                } else {
+                    self.begin_stream(total_symbols)
+                }
+            }
+        }
+    }
+
     fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         self.finish_stream()?;
         match self {
             #[cfg(feature = "backend-rosa")]
-            RateBackendPredictor::Rosa { model, .. } => {
+            RateBackendPredictor::Rosa {
+                model,
+                checkpoint_depth,
+                ..
+            } => {
+                if *checkpoint_depth > 0 {
+                    return Err(
+                        "rosa lifecycle reset cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
                 if let Some(total) = total_symbols {
                     let reserve = usize::try_from(total).unwrap_or(usize::MAX / 4);
                     model.reserve_for_stream(reserve);
@@ -919,15 +1991,36 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Ppmd { .. } => Ok(()),
             #[cfg(feature = "backend-sequitur")]
             RateBackendPredictor::Sequitur { model, .. } => {
+                if model.checkpoints_active() {
+                    return Err(
+                        "sequitur lifecycle begin_stream cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
                 model.begin_stream(total_symbols);
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { .. } => Ok(()),
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::FacCtw { .. } => Ok(()),
+            RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-zpaq")]
-            RateBackendPredictor::Zpaq { .. } => Ok(()),
+            RateBackendPredictor::Zpaq { model } => {
+                model.begin_stream();
+                Ok(())
+            }
             #[cfg(feature = "backend-particle")]
             RateBackendPredictor::Particle { .. } => Ok(()),
             #[cfg(feature = "backend-rwkv")]
@@ -957,9 +2050,21 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ppmd")]
             RateBackendPredictor::Ppmd { .. } => Ok(()),
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { .. } => Ok(()),
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::FacCtw { .. } => Ok(()),
+            RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-zpaq")]
             RateBackendPredictor::Zpaq { .. } => Ok(()),
             #[cfg(feature = "backend-particle")]
@@ -974,13 +2079,49 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 .finish_online_policy_stream()
                 .map_err(|e| e.to_string()),
             #[cfg(feature = "backend-mamba")]
-            RateBackendPredictor::Mamba { .. } => Ok(()),
+            RateBackendPredictor::Mamba { compressor, .. } => compressor
+                .finish_online_policy_stream()
+                .map_err(|e| e.to_string()),
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.finish_stream(),
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated { base, .. } => base.finish_stream(),
             RateBackendPredictor::Disabled { .. } => Ok(()),
         }
+    }
+
+    fn checkpoint_if_supported(&mut self) -> Option<OnlineBytePredictorCheckpoint> {
+        Some(OnlineBytePredictorCheckpoint::rate_backend(
+            self.checkpoint(),
+        ))
+    }
+
+    fn restore_checkpoint_if_supported(
+        &mut self,
+        checkpoint: &OnlineBytePredictorCheckpoint,
+    ) -> bool {
+        match &checkpoint.0 {
+            OnlineBytePredictorCheckpointKind::RateBackend(checkpoint) => {
+                self.restore_checkpoint(checkpoint);
+                true
+            }
+        }
+    }
+
+    fn discard_checkpoint_if_supported(
+        &mut self,
+        checkpoint: OnlineBytePredictorCheckpoint,
+    ) -> bool {
+        match checkpoint.0 {
+            OnlineBytePredictorCheckpointKind::RateBackend(checkpoint) => {
+                self.discard_checkpoint(checkpoint);
+                true
+            }
+        }
+    }
+
+    fn clear_checkpoints_if_supported(&mut self) {
+        RateBackendPredictor::clear_checkpoints_if_supported(self);
     }
 
     fn log_prob(&mut self, symbol: u8) -> f64 {
@@ -1003,33 +2144,27 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-sequitur")]
             RateBackendPredictor::Sequitur { model, min_prob } => model.log_prob(symbol, *min_prob),
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { tree, min_prob, .. } => {
-                let log_before = tree.get_log_block_probability();
-                for bit_idx in 0..8 {
-                    let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-                    tree.update(bit, bit_idx);
-                }
-                let log_after = tree.get_log_block_probability();
-                for bit_idx in (0..8).rev() {
-                    tree.revert(bit_idx);
-                }
-                let logp = log_after - log_before;
-                if logp.is_finite() {
-                    logp.max(min_prob.ln())
-                } else {
-                    min_prob.ln()
-                }
-            }
+            RateBackendPredictor::Ctw {
+                tree,
+                bits_per_symbol,
+                min_prob,
+                ..
+            } => ctw_log_prob_msb(tree, symbol, *bits_per_symbol, *min_prob),
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
                 min_prob,
                 ..
             } => {
                 let log_before = tree.get_log_block_probability();
                 for i in 0..*bits_per_symbol {
-                    let bit = ((symbol >> i) & 1) == 1;
+                    let bit = if *msb_first {
+                        ctw_symbol_bit_msb(symbol, *bits_per_symbol, i)
+                    } else {
+                        ((symbol >> i) & 1) == 1
+                    };
                     tree.update(bit, i);
                 }
                 let log_after = tree.get_log_block_probability();
@@ -1151,17 +2286,21 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 }
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { tree, min_prob, .. } => {
-                fill_fac_tree_log_probs(tree, 8, true, min_prob.ln(), out);
-            }
-            #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::FacCtw {
+            RateBackendPredictor::Ctw {
                 tree,
                 bits_per_symbol,
                 min_prob,
                 ..
+            } => fill_ctw_tree_log_probs(tree, *bits_per_symbol, min_prob.ln(), out),
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                tree,
+                bits_per_symbol,
+                msb_first,
+                min_prob,
+                ..
             } => {
-                fill_fac_tree_log_probs(tree, *bits_per_symbol, false, min_prob.ln(), out);
+                fill_fac_tree_log_probs(tree, *bits_per_symbol, *msb_first, min_prob.ln(), out);
             }
             #[cfg(feature = "backend-rwkv")]
             RateBackendPredictor::Rwkv7 {
@@ -1247,6 +2386,196 @@ impl OnlineBytePredictor for RateBackendPredictor {
         }
     }
 
+    fn has_native_msb_byte_prefix(&self) -> bool {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                bits_per_symbol, ..
+            } => *bits_per_symbol == 8,
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                bits_per_symbol,
+                msb_first,
+                ..
+            } => *bits_per_symbol == 8 && *msb_first,
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.has_native_msb_byte_prefix(),
+            _ => false,
+        }
+    }
+
+    fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                bits_per_symbol, ..
+            } if *bits_per_symbol != 8 => Ok(false),
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                bits_per_symbol,
+                msb_first,
+                ..
+            } if *bits_per_symbol != 8 || !*msb_first => Ok(false),
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                if native_prefix_progress.is_some() {
+                    return Err(
+                        "native MSB-first byte-prefix step is already active for this predictor"
+                            .to_string(),
+                    );
+                }
+                *native_prefix_progress = Some(0);
+                Ok(true)
+            }
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => {
+                if native_prefix_progress.is_some() {
+                    return Err(
+                        "native MSB-first byte-prefix step is already active for this predictor"
+                            .to_string(),
+                    );
+                }
+                *native_prefix_progress = Some(0);
+                Ok(true)
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.begin_native_msb_byte_prefix(),
+            _ => Ok(false),
+        }
+    }
+
+    fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        RateBackendPredictor::abort_empty_native_msb_byte_prefix(self)
+    }
+
+    fn native_msb_prefix_prob_one(&mut self, bit_idx: usize) -> Result<f64, String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                tree,
+                min_prob,
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                let p: f64 = tree.predict(true);
+                Ok(p.clamp(*min_prob, 1.0 - *min_prob))
+            }
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                tree,
+                min_prob,
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                let p: f64 = tree.predict_one(bit_idx);
+                Ok(p.clamp(*min_prob, 1.0 - *min_prob))
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.native_msb_prefix_prob_one(bit_idx)
+            }
+            _ => Err("native MSB-first byte-prefix prediction is unavailable".to_string()),
+        }
+    }
+
+    fn observe_native_msb_prefix_bit(&mut self, bit_idx: usize, bit: bool) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                tree,
+                checkpoint_journal,
+                checkpoint_depth,
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_mut()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                *next_bit_idx += 1;
+                tree.update(bit);
+                if *checkpoint_depth > 0 {
+                    checkpoint_journal.push(CtwUndoOp::LearnedBit);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                tree,
+                checkpoint_journal,
+                checkpoint_depth,
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_mut()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                *next_bit_idx += 1;
+                tree.update_predicted(bit, bit_idx);
+                if *checkpoint_depth > 0 {
+                    checkpoint_journal.push(FacCtwUndoOp::LearnedBit { bit_idx });
+                }
+                Ok(())
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.observe_native_msb_prefix_bit(bit_idx, bit)
+            }
+            _ => Err("native MSB-first byte-prefix stepping is unavailable".to_string()),
+        }
+    }
+
+    fn finish_native_msb_byte_prefix(&mut self, symbol: u8) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_finish(*next_bit_idx)?;
+                *native_prefix_progress = None;
+                let _ = symbol;
+                Ok(())
+            }
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_finish(*next_bit_idx)?;
+                *native_prefix_progress = None;
+                let _ = symbol;
+                Ok(())
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.finish_native_msb_byte_prefix(symbol)
+            }
+            _ => Err("native MSB-first byte-prefix stepping is unavailable".to_string()),
+        }
+    }
+
     fn update(&mut self, symbol: u8) {
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -1259,7 +2588,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 if *checkpoint_depth > 0 {
                     let mut tx = model.begin_tx();
                     model.train_sequence_tx(&mut tx, &[symbol]);
-                    checkpoint_journal.push(RosaPredictorUndo::Learned(tx));
+                    checkpoint_journal.push(RosaPredictorUndo::Learned(Box::new(tx)));
                 } else {
                     model.train_byte(symbol);
                 }
@@ -1283,28 +2612,45 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
                 tree,
+                bits_per_symbol,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
-                for bit_idx in 0..8 {
-                    let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-                    tree.update(bit, bit_idx);
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "ctw symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
+                for bit_idx in 0..(*bits_per_symbol).clamp(1, 8) {
+                    tree.update(ctw_symbol_bit_msb(symbol, *bits_per_symbol, bit_idx));
                 }
                 if *checkpoint_depth > 0 {
-                    checkpoint_journal.push(FacCtwUndoOp::LearnedSymbol);
+                    checkpoint_journal.push(CtwUndoOp::LearnedSymbol);
                 }
             }
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "fac-ctw symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
                 for i in 0..*bits_per_symbol {
-                    let bit = ((symbol >> i) & 1) == 1;
+                    let bit = if *msb_first {
+                        ctw_symbol_bit_msb(symbol, *bits_per_symbol, i)
+                    } else {
+                        ((symbol >> i) & 1) == 1
+                    };
                     tree.update(bit, i);
                 }
                 if *checkpoint_depth > 0 {
@@ -1409,7 +2755,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 if *checkpoint_depth > 0 {
                     let mut tx = model.begin_tx();
                     model.train_sequence_tx(&mut tx, &[symbol]);
-                    checkpoint_journal.push(RosaPredictorUndo::Learned(tx));
+                    checkpoint_journal.push(RosaPredictorUndo::Learned(Box::new(tx)));
                 } else {
                     model.train_byte(symbol);
                 }
@@ -1418,13 +2764,20 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
                 tree,
+                bits_per_symbol,
                 min_prob,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
             } => {
-                let logp = ctw_log_prob_update_msb(tree, symbol, *min_prob);
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "ctw symbol log_prob_update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
+                let logp = ctw_log_prob_update_msb(tree, symbol, *bits_per_symbol, *min_prob);
                 if *checkpoint_depth > 0 {
-                    checkpoint_journal.push(FacCtwUndoOp::LearnedSymbol);
+                    checkpoint_journal.push(CtwUndoOp::LearnedSymbol);
                 }
                 logp
             }
@@ -1432,11 +2785,30 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
                 min_prob,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
             } => {
-                let logp = ctw_log_prob_update_lsb(tree, symbol, *bits_per_symbol, *min_prob);
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "fac-ctw symbol log_prob_update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
+                let logp = if *msb_first {
+                    let bits = (*bits_per_symbol).clamp(1, 8);
+                    let mut acc = 0.0f64;
+                    for bit_idx in 0..bits {
+                        let bit = ctw_symbol_bit_msb(symbol, bits, bit_idx);
+                        let p = tree.predict(bit, bit_idx).clamp(*min_prob, 1.0 - *min_prob);
+                        acc += p.ln();
+                        tree.update_predicted(bit, bit_idx);
+                    }
+                    acc
+                } else {
+                    ctw_log_prob_update_lsb(tree, symbol, *bits_per_symbol, *min_prob)
+                };
                 if *checkpoint_depth > 0 {
                     checkpoint_journal.push(FacCtwUndoOp::LearnedSymbol);
                 }
@@ -1451,6 +2823,26 @@ impl OnlineBytePredictor for RateBackendPredictor {
     }
 
     fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        #[cfg(feature = "backend-zpaq")]
+        if matches!(self, RateBackendPredictor::Zpaq { .. }) {
+            return Err("plugin entropy is not supported for zpaq rate backends".to_string());
+        }
+        #[cfg(feature = "backend-mixture")]
+        if let RateBackendPredictor::Mixture { runtime } = self
+            && !runtime.supports_frozen_reset()
+        {
+            return Err(
+                "plugin entropy is not supported for mixture rate backends with non-resettable experts"
+                    .to_string(),
+            );
+        }
+        #[cfg(feature = "backend-calibrated")]
+        if let RateBackendPredictor::Calibrated { base, .. } = self
+            && !base.supports_frozen_reset()
+        {
+            return base.reset_frozen(total_symbols);
+        }
+
         self.finish_stream()?;
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -1480,16 +2872,46 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             #[cfg(feature = "backend-sequitur")]
             RateBackendPredictor::Sequitur { model, .. } => {
+                if model.checkpoints_active() {
+                    return Err(
+                        "sequitur lifecycle reset cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
                 model.reset_frozen();
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::Ctw { tree, .. } => {
-                tree.reset_history_only();
+            RateBackendPredictor::Ctw {
+                tree,
+                checkpoint_depth,
+                native_prefix_progress,
+                ..
+            } => {
+                if *checkpoint_depth > 0 {
+                    return Err(
+                        "ctw lifecycle reset cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
+                *native_prefix_progress = None;
+                tree.truncate_history(0);
                 Ok(())
             }
             #[cfg(feature = "backend-ctw")]
-            RateBackendPredictor::FacCtw { tree, .. } => {
+            RateBackendPredictor::FacCtw {
+                tree,
+                checkpoint_depth,
+                native_prefix_progress,
+                ..
+            } => {
+                if *checkpoint_depth > 0 {
+                    return Err(
+                        "fac-ctw lifecycle reset cannot run while prediction checkpoints are active"
+                            .to_string(),
+                    );
+                }
+                *native_prefix_progress = None;
                 tree.reset_history_only();
                 Ok(())
             }
@@ -1529,9 +2951,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 ..
             } => {
                 base.reset_frozen(total_symbols)?;
-                core.reset_context();
-                pdf.fill(1.0 / 256.0);
-                *valid = false;
+                reset_calibrated_wrapper_state(core, pdf, valid);
                 Ok(())
             }
             RateBackendPredictor::Disabled { reason } => Err(reason.clone()),
@@ -1573,31 +2993,50 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::Ctw {
                 tree,
+                bits_per_symbol,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
-                let mut bits = [false; 8];
-                for (bit_idx, slot) in bits.iter_mut().enumerate() {
-                    *slot = ((symbol >> (7 - bit_idx)) & 1) == 1;
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "ctw frozen symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
+                let bits = (*bits_per_symbol).clamp(1, 8);
+                let mut history_bits = [false; 8];
+                for (bit_idx, slot) in history_bits.iter_mut().enumerate().take(bits) {
+                    *slot = ctw_symbol_bit_msb(symbol, bits, bit_idx);
                 }
-                tree.update_history(&bits);
+                tree.update_history(&history_bits[..bits]);
                 if *checkpoint_depth > 0 {
-                    checkpoint_journal.push(FacCtwUndoOp::FrozenSymbol);
+                    checkpoint_journal.push(CtwUndoOp::FrozenSymbol);
                 }
             }
             #[cfg(feature = "backend-ctw")]
             RateBackendPredictor::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
                 checkpoint_journal,
                 checkpoint_depth,
+                native_prefix_progress,
                 ..
             } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "fac-ctw frozen symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
                 let bits = (*bits_per_symbol).clamp(1, 8);
                 let mut history_bits = [false; 8];
                 for (idx, slot) in history_bits.iter_mut().enumerate().take(bits) {
-                    *slot = ((symbol >> idx) & 1) == 1;
+                    *slot = if *msb_first {
+                        ctw_symbol_bit_msb(symbol, bits, idx)
+                    } else {
+                        ((symbol >> idx) & 1) == 1
+                    };
                 }
                 tree.update_history(&history_bits[..bits]);
                 if *checkpoint_depth > 0 {
@@ -1673,6 +3112,96 @@ impl OnlineBytePredictor for RateBackendPredictor {
     }
 }
 
+#[derive(Clone)]
+enum ExpertPredictor {
+    Generic(Box<dyn OnlineBytePredictor>),
+    RateBackend(Box<RateBackendPredictor>),
+}
+
+impl ExpertPredictor {
+    fn generic(predictor: Box<dyn OnlineBytePredictor>) -> Self {
+        Self::Generic(predictor)
+    }
+
+    fn rate_backend(predictor: RateBackendPredictor) -> Self {
+        Self::RateBackend(Box::new(predictor))
+    }
+
+    fn as_mut(&mut self) -> &mut (dyn OnlineBytePredictor + 'static) {
+        match self {
+            Self::Generic(predictor) => predictor.as_mut(),
+            Self::RateBackend(predictor) => predictor.as_mut(),
+        }
+    }
+
+    fn into_box(self) -> Box<dyn OnlineBytePredictor> {
+        match self {
+            Self::Generic(predictor) => predictor,
+            Self::RateBackend(predictor) => predictor,
+        }
+    }
+
+    fn lifecycle_checkpoint(&mut self, op: OnlineBytePredictorLifecycleOp) -> ExpertLifecycleToken {
+        match self {
+            Self::Generic(_) => ExpertLifecycleToken::Full(self.clone()),
+            Self::RateBackend(predictor) => {
+                ExpertLifecycleToken::Compact(Box::new(predictor.lifecycle_checkpoint(op)))
+            }
+        }
+    }
+
+    fn restore_lifecycle(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        token: ExpertLifecycleToken,
+    ) {
+        match (self, token) {
+            (slot, ExpertLifecycleToken::Full(predictor)) => {
+                *slot = predictor;
+            }
+            (Self::RateBackend(predictor), ExpertLifecycleToken::Compact(checkpoint)) => {
+                predictor.restore_lifecycle_checkpoint(op, *checkpoint);
+            }
+            (Self::Generic(_), ExpertLifecycleToken::Compact(_)) => {
+                panic!("generic expert received a compact rate-backend lifecycle checkpoint")
+            }
+        }
+    }
+
+    fn discard_lifecycle(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        token: ExpertLifecycleToken,
+    ) {
+        match (self, token) {
+            (_, ExpertLifecycleToken::Full(_)) => {}
+            (Self::RateBackend(predictor), ExpertLifecycleToken::Compact(checkpoint)) => {
+                predictor.discard_lifecycle_checkpoint(op, *checkpoint);
+            }
+            (Self::Generic(_), ExpertLifecycleToken::Compact(_)) => {
+                panic!("generic expert received a compact rate-backend lifecycle checkpoint")
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for ExpertPredictor {
+    type Target = dyn OnlineBytePredictor + 'static;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Generic(predictor) => predictor.as_ref(),
+            Self::RateBackend(predictor) => predictor.as_ref(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for ExpertPredictor {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut()
+    }
+}
+
 /// Configuration for a mixture expert.
 #[derive(Clone)]
 pub struct ExpertConfig {
@@ -1680,7 +3209,7 @@ pub struct ExpertConfig {
     pub name: String,
     /// Log prior weight (natural log). Uniform priors can be `0.0`.
     pub log_prior: f64,
-    builder: Arc<dyn Fn() -> Box<dyn OnlineBytePredictor> + Send + Sync>,
+    builder: Arc<dyn Fn() -> ExpertPredictor + Send + Sync>,
 }
 
 impl ExpertConfig {
@@ -1690,11 +3219,29 @@ impl ExpertConfig {
         log_prior: f64,
         builder: impl Fn() -> Box<dyn OnlineBytePredictor> + Send + Sync + 'static,
     ) -> Self {
+        Self::new_with_predictor(name, log_prior, move || ExpertPredictor::generic(builder()))
+    }
+
+    fn new_with_predictor(
+        name: impl Into<String>,
+        log_prior: f64,
+        builder: impl Fn() -> ExpertPredictor + Send + Sync + 'static,
+    ) -> Self {
         Self {
             name: name.into(),
             log_prior,
             builder: Arc::new(builder),
         }
+    }
+
+    fn new_rate_backend(
+        name: impl Into<String>,
+        log_prior: f64,
+        builder: impl Fn() -> RateBackendPredictor + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_with_predictor(name, log_prior, move || {
+            ExpertPredictor::rate_backend(builder())
+        })
     }
 
     /// Uniform prior helper.
@@ -1709,11 +3256,8 @@ impl ExpertConfig {
     /// the [`RateBackend::RosaPlus`] variant.
     pub fn from_rate_backend(name: Option<String>, log_prior: f64, backend: RateBackend) -> Self {
         let name = name.unwrap_or_else(|| RateBackendPredictor::default_name(&backend));
-        Self::new(name, log_prior, move || {
-            Box::new(RateBackendPredictor::from_backend(
-                backend.clone(),
-                DEFAULT_MIN_PROB,
-            ))
+        Self::new_rate_backend(name, log_prior, move || {
+            RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB)
         })
     }
 
@@ -1724,48 +3268,43 @@ impl ExpertConfig {
         backend: CompiledRateBackend,
     ) -> Self {
         let name = name.unwrap_or_else(|| backend.display_label());
-        Self::new(name, log_prior, move || {
-            Box::new(RateBackendPredictor::from_compiled(
-                &backend,
-                DEFAULT_MIN_PROB,
-            ))
+        Self::new_rate_backend(name, log_prior, move || {
+            RateBackendPredictor::from_compiled(&backend, DEFAULT_MIN_PROB)
         })
     }
 
     /// ROSA expert (uniform prior) with explicit `max_order`.
     pub fn rosa(name: impl Into<String>, max_order: i64) -> Self {
         let name = name.into();
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::RosaPlus { max_order },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
     /// CTW expert (uniform prior).
     pub fn ctw(name: impl Into<String>, depth: usize) -> Self {
         let name = name.into();
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
-                RateBackend::Ctw { depth },
-                DEFAULT_MIN_PROB,
-            ))
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(RateBackend::Ctw { depth }, DEFAULT_MIN_PROB)
         })
     }
 
     /// FAC-CTW expert (uniform prior).
     pub fn fac_ctw(name: impl Into<String>, base_depth: usize, encoding_bits: usize) -> Self {
         let name = name.into();
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::FacCtw {
                     base_depth,
                     num_percept_bits: encoding_bits,
                     encoding_bits,
+                    msb_first: None,
                 },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
@@ -1775,13 +3314,13 @@ impl ExpertConfig {
         let name = name.into();
         let method = crate::rwkvzip::parse_method_spec(&method.into())
             .expect("rwkv expert method must be a valid RWKV method spec");
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::Rwkv7Method {
                     method: method.clone(),
                 },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
@@ -1791,13 +3330,13 @@ impl ExpertConfig {
         let name = name.into();
         let method = crate::mambazip::parse_method_spec(&method.into())
             .expect("mamba expert method must be a valid Mamba method spec");
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::MambaMethod {
                     method: method.clone(),
                 },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
@@ -1805,13 +3344,13 @@ impl ExpertConfig {
     pub fn zpaq(name: impl Into<String>, method: impl Into<String>) -> Self {
         let name = name.into();
         let method = crate::api::ZpaqMethodSpec::literal(method.into());
-        Self::uniform(name, move || {
-            Box::new(RateBackendPredictor::from_backend(
+        Self::new_rate_backend(name, 0.0, move || {
+            RateBackendPredictor::from_backend(
                 RateBackend::Zpaq {
                     method: method.clone(),
                 },
                 DEFAULT_MIN_PROB,
-            ))
+            )
         })
     }
 
@@ -1827,7 +3366,7 @@ impl ExpertConfig {
 
     /// Build a fresh predictor instance for evaluation or analysis.
     pub fn build_predictor(&self) -> Box<dyn OnlineBytePredictor> {
-        (self.builder)()
+        (self.builder)().into_box()
     }
 
     fn build(&self) -> ExpertState {
@@ -1848,7 +3387,7 @@ pub(crate) fn expert_configs_from_compiled_mixture(
     let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = backend.plan() else {
         return Err("compiled backend is not a mixture backend".to_string());
     };
-    Ok(experts
+    experts
         .iter()
         .map(|expert| {
             let compiled =
@@ -1860,7 +3399,55 @@ pub(crate) fn expert_configs_from_compiled_mixture(
                 compiled,
             ))
         })
-        .collect::<Result<Vec<_>, String>>()?)
+        .collect::<Result<Vec<_>, String>>()
+}
+
+#[cfg(feature = "backend-mixture")]
+pub(crate) fn expert_configs_from_compiled_mixture_with_builder(
+    backend: &CompiledRateBackend,
+    builder: fn(&CompiledRateBackend, f64) -> Result<RateBackendPredictor, String>,
+    min_prob: f64,
+) -> Result<Vec<ExpertConfig>, String> {
+    let crate::spec::core::RateBackendPlan::Mixture { experts, .. } = backend.plan() else {
+        return Err("compiled backend is not a mixture backend".to_string());
+    };
+    experts
+        .iter()
+        .map(|expert| {
+            let compiled =
+                crate::spec::core::compiled_rate_backend_from_plan(expert.backend.clone())
+                    .map_err(|err| err.to_string())?;
+            // Validate once up front so mixture construction fails before we
+            // commit any `ExpertConfig` values. The stored builder still has to
+            // create a fresh predictor later because each runtime needs its own
+            // independent expert state.
+            builder(&compiled, min_prob).map(|_| ())?;
+            let name = expert
+                .name
+                .clone()
+                .unwrap_or_else(|| compiled.default_name());
+            Ok(ExpertConfig::new_rate_backend(
+                name,
+                expert.log_prior,
+                move || {
+                    builder(&compiled, min_prob)
+                        .expect("compiled mixture expert builder should succeed")
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()
+}
+
+enum ExpertLifecycleToken {
+    Full(ExpertPredictor),
+    Compact(Box<RateBackendPredictorLifecycleCheckpoint>),
+}
+
+struct ExpertStateLifecycleCheckpoint {
+    log_weight: f64,
+    log_prior: f64,
+    cum_log_loss: f64,
+    predictor: ExpertLifecycleToken,
 }
 
 #[derive(Clone)]
@@ -1868,7 +3455,7 @@ struct ExpertState {
     name: String,
     log_weight: f64,
     log_prior: f64,
-    predictor: Box<dyn OnlineBytePredictor>,
+    predictor: ExpertPredictor,
     cum_log_loss: f64,
 }
 
@@ -1904,9 +3491,254 @@ impl ExpertState {
     }
 
     #[inline]
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        self.predictor.begin_fresh_stream(total_symbols)
+    }
+
+    #[inline]
     fn update_frozen(&mut self, symbol: u8) {
         self.predictor.update_frozen(symbol);
     }
+
+    fn snapshot_lifecycle(&mut self, op: ExpertLifecycleOp) -> ExpertLifecycleToken {
+        self.predictor.lifecycle_checkpoint(op.to_predictor_op())
+    }
+
+    fn restore_lifecycle(&mut self, op: ExpertLifecycleOp, token: ExpertLifecycleToken) {
+        self.predictor
+            .restore_lifecycle(op.to_predictor_op(), token);
+    }
+
+    fn discard_lifecycle(&mut self, op: ExpertLifecycleOp, token: ExpertLifecycleToken) {
+        self.predictor
+            .discard_lifecycle(op.to_predictor_op(), token);
+    }
+
+    fn snapshot_state_lifecycle(
+        &mut self,
+        op: ExpertLifecycleOp,
+    ) -> ExpertStateLifecycleCheckpoint {
+        ExpertStateLifecycleCheckpoint {
+            log_weight: self.log_weight,
+            log_prior: self.log_prior,
+            cum_log_loss: self.cum_log_loss,
+            predictor: self.snapshot_lifecycle(op),
+        }
+    }
+
+    fn restore_state_lifecycle(
+        &mut self,
+        op: ExpertLifecycleOp,
+        checkpoint: ExpertStateLifecycleCheckpoint,
+    ) {
+        self.log_weight = checkpoint.log_weight;
+        self.log_prior = checkpoint.log_prior;
+        self.cum_log_loss = checkpoint.cum_log_loss;
+        self.restore_lifecycle(op, checkpoint.predictor);
+    }
+
+    fn discard_state_lifecycle(
+        &mut self,
+        op: ExpertLifecycleOp,
+        checkpoint: ExpertStateLifecycleCheckpoint,
+    ) {
+        self.discard_lifecycle(op, checkpoint.predictor);
+    }
+}
+
+fn reset_expert_losses(experts: &mut [ExpertState]) {
+    for expert in experts {
+        expert.cum_log_loss = 0.0;
+    }
+}
+
+fn reset_experts_to_priors(experts: &mut [ExpertState]) -> Vec<f64> {
+    let prior = normalized_expert_prior_weights(experts);
+    set_log_weights_from_linear(experts, &prior);
+    reset_expert_losses(experts);
+    prior
+}
+
+fn apply_bayes_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    scratch_mix: &mut Vec<f64>,
+) -> f64 {
+    let n = experts.len();
+    scratch_mix.resize(n, 0.0);
+    for idx in 0..n {
+        scratch_mix[idx] = experts[idx].log_weight + expert_logps[idx];
+    }
+    let log_mix = logsumexp(&scratch_mix[..n]);
+    for idx in 0..n {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+        experts[idx].log_weight += expert_logps[idx] - log_mix;
+    }
+    log_mix
+}
+
+fn apply_fading_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    scratch_mix: &mut Vec<f64>,
+    decay: f64,
+) -> f64 {
+    let n = experts.len();
+    scratch_mix.resize(n, 0.0);
+    for idx in 0..n {
+        scratch_mix[idx] = decay * experts[idx].log_weight;
+    }
+    let log_prior_norm = logsumexp(&scratch_mix[..n]);
+    for idx in 0..n {
+        scratch_mix[idx] += expert_logps[idx];
+    }
+    let log_evidence = logsumexp(&scratch_mix[..n]);
+    for idx in 0..n {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+        experts[idx].log_weight =
+            decay * experts[idx].log_weight + expert_logps[idx] - log_evidence;
+    }
+    log_evidence - log_prior_norm
+}
+
+// The switching update coordinates expert weights, scratch buffers, schedule
+// parameters, and the mutation counter in one hot-path pass; a config wrapper
+// would obscure which state is read-only versus updated in place.
+#[allow(clippy::too_many_arguments)]
+fn apply_switching_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    scratch_joint: &mut Vec<f64>,
+    scratch_weights: &mut Vec<f64>,
+    prior: &[f64],
+    schedule: MixtureScheduleMode,
+    alpha: f64,
+    update_count: &mut u64,
+) -> f64 {
+    let n = experts.len();
+    scratch_joint.resize(n, 0.0);
+    scratch_weights.resize(n, 0.0);
+    // Index form required for coordinated writes to two scratch vecs + experts.
+    #[allow(clippy::needless_range_loop)]
+    for idx in 0..n {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+        scratch_joint[idx] = experts[idx].log_weight + expert_logps[idx];
+    }
+    let log_mix = logsumexp(&scratch_joint[..n]);
+    #[allow(clippy::needless_range_loop)]
+    for idx in 0..n {
+        scratch_weights[idx] = (scratch_joint[idx] - log_mix).exp();
+    }
+
+    let alpha = switching_alpha_for_update(schedule, alpha, *update_count);
+    *update_count = (*update_count).saturating_add(1);
+    if n == 1 || alpha <= 0.0 {
+        set_log_weights_from_linear(experts, scratch_weights);
+        return log_mix;
+    }
+
+    let mut switch_out_sum = 0.0;
+    let mut num_switch_targets = 0usize;
+    for &prior_weight in prior {
+        if prior_weight < 1.0 {
+            num_switch_targets += 1;
+        }
+    }
+    if num_switch_targets <= 1 {
+        set_log_weights_from_linear(experts, scratch_weights);
+        return log_mix;
+    }
+
+    for idx in 0..n {
+        let denom = 1.0 - prior[idx];
+        if denom > 0.0 {
+            switch_out_sum += scratch_weights[idx] / denom;
+        }
+    }
+    for idx in 0..n {
+        let stay = (1.0 - alpha) * scratch_weights[idx];
+        let switch_in = if prior[idx] > 0.0 {
+            let denom = 1.0 - prior[idx];
+            let switchable_mass = if denom > 0.0 {
+                switch_out_sum - scratch_weights[idx] / denom
+            } else {
+                0.0
+            };
+            alpha * prior[idx] * switchable_mass
+        } else {
+            0.0
+        };
+        scratch_joint[idx] = stay + switch_in;
+    }
+    normalize_simplex_weights(scratch_joint);
+    set_log_weights_from_linear(experts, scratch_joint);
+    log_mix
+}
+
+fn mix_log_prob_convex(lambda: &[f64], logps: &[f64]) -> f64 {
+    let mut mix = 0.0;
+    for (weight, &logp) in lambda.iter().zip(logps.iter()) {
+        if *weight > 0.0 {
+            mix += *weight * logp.exp();
+        }
+    }
+    clamp_prob(mix, DEFAULT_MIN_PROB).ln()
+}
+
+fn apply_convex_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    lambda: &mut [f64],
+    projection_scratch: &mut Vec<f64>,
+    schedule: MixtureScheduleMode,
+    alpha: f64,
+    update_count: &mut u64,
+) -> f64 {
+    let log_mix = mix_log_prob_convex(lambda, expert_logps);
+    for idx in 0..experts.len() {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+    }
+    *update_count = (*update_count).saturating_add(1);
+    let step_size = convex_step_size_for_update(schedule, alpha, *update_count);
+    for (weight, &logp) in lambda.iter_mut().zip(expert_logps.iter()) {
+        let grad = -(logp - log_mix).exp();
+        *weight -= step_size * grad;
+    }
+    project_simplex_with_scratch(lambda, projection_scratch);
+    log_mix
+}
+
+fn apply_mdl_update_from_logps(
+    experts: &mut [ExpertState],
+    expert_logps: &[f64],
+    best_idx: usize,
+    last_best: &mut usize,
+) -> f64 {
+    for idx in 0..experts.len() {
+        experts[idx].cum_log_loss -= expert_logps[idx];
+    }
+    *last_best = best_idx;
+    expert_logps
+        .get(best_idx)
+        .copied()
+        .unwrap_or(f64::NEG_INFINITY)
+}
+
+fn finish_neural_update_from_logps(
+    mixture: &mut NeuralMixture,
+    symbol: u8,
+    logp: f64,
+    update_weights: bool,
+) {
+    if update_weights {
+        mixture
+            .neural
+            .update_weights_symbol(&mixture.scratch_expert_logps, mixture.min_prob);
+    }
+    mixture.total_log_loss -= logp;
+    mixture.analyzer.update(symbol);
+    mixture.neural.set_context_state(mixture.analyzer.state());
+    mixture.invalidate_eval_cache();
 }
 
 /// Exponential-weights Bayes mixture (log-loss Hedge).
@@ -1915,6 +3747,7 @@ pub struct BayesMixture {
     experts: Vec<ExpertState>,
     scratch_logps: Vec<f64>,
     scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     cached_symbol: u8,
     cached_log_mix: f64,
     cache_valid: bool,
@@ -1934,6 +3767,7 @@ impl BayesMixture {
             experts,
             scratch_logps: vec![0.0; configs.len()],
             scratch_mix: vec![0.0; configs.len()],
+            bitwise: MixtureBitPrefixState::default(),
             cached_symbol: 0,
             cached_log_mix: f64::NEG_INFINITY,
             cache_valid: false,
@@ -1946,23 +3780,20 @@ impl BayesMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                expert.cum_log_loss -= self.scratch_logps[i];
+        if self.cache_valid && self.cached_symbol == symbol {
+            for expert in &mut self.experts {
                 expert.update(symbol);
             }
-            self.cached_log_mix
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
-                self.scratch_mix[i] = expert.log_weight + self.scratch_logps[i];
-                expert.cum_log_loss -= self.scratch_logps[i];
             }
-            logsumexp(&self.scratch_mix)
-        };
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            expert.log_weight = expert.log_weight + self.scratch_logps[i] - log_mix;
         }
+        let log_mix = apply_bayes_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            &mut self.scratch_mix,
+        );
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
         log_mix
@@ -2055,12 +3886,22 @@ impl BayesMixture {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_experts_to_priors(&mut self.experts);
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2081,6 +3922,7 @@ pub struct FadingBayesMixture {
     decay: f64,
     scratch_logps: Vec<f64>,
     scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     cached_symbol: u8,
     cached_log_predictive: f64,
     cached_log_evidence: f64,
@@ -2103,6 +3945,7 @@ impl FadingBayesMixture {
             decay,
             scratch_logps: vec![0.0; configs.len()],
             scratch_mix: vec![0.0; configs.len()],
+            bitwise: MixtureBitPrefixState::default(),
             cached_symbol: 0,
             cached_log_predictive: f64::NEG_INFINITY,
             cached_log_evidence: f64::NEG_INFINITY,
@@ -2116,29 +3959,21 @@ impl FadingBayesMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        let (log_predictive, log_evidence) = if self.cache_valid && self.cached_symbol == symbol {
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                expert.cum_log_loss -= self.scratch_logps[i];
+        if self.cache_valid && self.cached_symbol == symbol {
+            for expert in &mut self.experts {
                 expert.update(symbol);
             }
-            (self.cached_log_predictive, self.cached_log_evidence)
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
-                self.scratch_mix[i] = self.decay * expert.log_weight;
             }
-            let log_prior_norm = logsumexp(&self.scratch_mix);
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                self.scratch_mix[i] += self.scratch_logps[i];
-                expert.cum_log_loss -= self.scratch_logps[i];
-            }
-            let log_evidence = logsumexp(&self.scratch_mix);
-            (log_evidence - log_prior_norm, log_evidence)
-        };
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            let decayed = self.decay * expert.log_weight;
-            expert.log_weight = decayed + self.scratch_logps[i] - log_evidence;
         }
+        let log_predictive = apply_fading_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            &mut self.scratch_mix,
+            self.decay,
+        );
         self.cache_valid = false;
         self.total_log_loss -= log_predictive;
         log_predictive
@@ -2218,12 +4053,22 @@ impl FadingBayesMixture {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_experts_to_priors(&mut self.experts);
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2245,6 +4090,7 @@ pub struct SwitchingMixture {
     scratch_logps: Vec<f64>,
     scratch_joint: Vec<f64>,
     scratch_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     cached_symbol: u8,
     cached_log_mix: f64,
     cache_valid: bool,
@@ -2266,6 +4112,7 @@ impl SwitchingMixture {
             scratch_logps: vec![0.0; configs.len()],
             scratch_joint: vec![0.0; configs.len()],
             scratch_weights: vec![0.0; configs.len()],
+            bitwise: MixtureBitPrefixState::default(),
             cached_symbol: 0,
             cached_log_mix: f64::NEG_INFINITY,
             cache_valid: false,
@@ -2279,68 +4126,25 @@ impl SwitchingMixture {
         if self.experts.is_empty() {
             return f64::NEG_INFINITY;
         }
-        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                expert.cum_log_loss -= self.scratch_logps[i];
+        if self.cache_valid && self.cached_symbol == symbol {
+            for expert in &mut self.experts {
                 expert.update(symbol);
             }
-            self.cached_log_mix
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
-                expert.cum_log_loss -= self.scratch_logps[i];
-                self.scratch_joint[i] = expert.log_weight + self.scratch_logps[i];
-            }
-            logsumexp(&self.scratch_joint)
-        };
-
-        for i in 0..self.experts.len() {
-            self.scratch_weights[i] = (self.scratch_joint[i] - log_mix).exp();
-        }
-
-        let alpha = switching_alpha_for_update(self.schedule, self.alpha, self.update_count);
-        self.update_count = self.update_count.saturating_add(1);
-
-        if self.experts.len() == 1 || alpha <= 0.0 {
-            set_log_weights_from_linear(&mut self.experts, &self.scratch_weights);
-        } else {
-            let mut switch_out_sum = 0.0;
-            let mut num_switch_targets = 0usize;
-            for &prior in &self.prior {
-                if prior < 1.0 {
-                    num_switch_targets += 1;
-                }
-            }
-
-            if num_switch_targets <= 1 {
-                set_log_weights_from_linear(&mut self.experts, &self.scratch_weights);
-            } else {
-                for i in 0..self.experts.len() {
-                    let denom = 1.0 - self.prior[i];
-                    if denom > 0.0 {
-                        switch_out_sum += self.scratch_weights[i] / denom;
-                    }
-                }
-
-                for i in 0..self.experts.len() {
-                    let stay = (1.0 - alpha) * self.scratch_weights[i];
-                    let switch_in = if self.prior[i] > 0.0 {
-                        let denom = 1.0 - self.prior[i];
-                        let switchable_mass = if denom > 0.0 {
-                            switch_out_sum - self.scratch_weights[i] / denom
-                        } else {
-                            0.0
-                        };
-                        alpha * self.prior[i] * switchable_mass
-                    } else {
-                        0.0
-                    };
-                    self.scratch_joint[i] = stay + switch_in;
-                }
-                normalize_simplex_weights(&mut self.scratch_joint);
-                set_log_weights_from_linear(&mut self.experts, &self.scratch_joint);
             }
         }
+        let log_mix = apply_switching_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            &mut self.scratch_joint,
+            &mut self.scratch_weights,
+            &self.prior,
+            self.schedule,
+            self.alpha,
+            &mut self.update_count,
+        );
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
         log_mix
@@ -2434,13 +4238,24 @@ impl SwitchingMixture {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
         self.update_count = 0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        set_log_weights_from_linear(&mut self.experts, &self.prior);
+        reset_expert_losses(&mut self.experts);
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2461,6 +4276,7 @@ pub struct ConvexMixture {
     lambda: Vec<f64>,
     scratch_logps: Vec<f64>,
     projection_scratch: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     cached_symbol: u8,
     cached_log_mix: f64,
     cache_valid: bool,
@@ -2478,6 +4294,7 @@ impl ConvexMixture {
             lambda: normalized_prior_weights(configs),
             scratch_logps: vec![0.0; configs.len()],
             projection_scratch: Vec::with_capacity(configs.len()),
+            bitwise: MixtureBitPrefixState::default(),
             cached_symbol: 0,
             cached_log_mix: f64::NEG_INFINITY,
             cache_valid: false,
@@ -2487,13 +4304,7 @@ impl ConvexMixture {
     }
 
     fn mix_log_prob(&self, logps: &[f64]) -> f64 {
-        let mut mix = 0.0;
-        for (weight, &logp) in self.lambda.iter().zip(logps.iter()) {
-            if *weight > 0.0 {
-                mix += *weight * logp.exp();
-            }
-        }
-        clamp_prob(mix, DEFAULT_MIN_PROB).ln()
+        mix_log_prob_convex(&self.lambda, logps)
     }
 
     /// Log-probability (natural log) of the convex mixture for `symbol`, then update.
@@ -2502,27 +4313,24 @@ impl ConvexMixture {
             return f64::NEG_INFINITY;
         }
 
-        let log_mix = if self.cache_valid && self.cached_symbol == symbol {
-            for (i, expert) in self.experts.iter_mut().enumerate() {
-                expert.cum_log_loss -= self.scratch_logps[i];
+        if self.cache_valid && self.cached_symbol == symbol {
+            for expert in &mut self.experts {
                 expert.update(symbol);
             }
-            self.cached_log_mix
         } else {
             for (i, expert) in self.experts.iter_mut().enumerate() {
                 self.scratch_logps[i] = expert.log_prob_update(symbol);
-                expert.cum_log_loss -= self.scratch_logps[i];
             }
-            self.mix_log_prob(&self.scratch_logps)
-        };
-
-        self.update_count = self.update_count.saturating_add(1);
-        let step_size = convex_step_size_for_update(self.schedule, self.alpha, self.update_count);
-        for (weight, &logp) in self.lambda.iter_mut().zip(self.scratch_logps.iter()) {
-            let grad = -(logp - log_mix).exp();
-            *weight -= step_size * grad;
         }
-        project_simplex_with_scratch(&mut self.lambda, &mut self.projection_scratch);
+        let log_mix = apply_convex_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            &mut self.lambda,
+            &mut self.projection_scratch,
+            self.schedule,
+            self.alpha,
+            &mut self.update_count,
+        );
         self.cache_valid = false;
         self.total_log_loss -= log_mix;
         log_mix
@@ -2562,13 +4370,23 @@ impl ConvexMixture {
         }
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
         self.update_count = 0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        self.lambda = reset_experts_to_priors(&mut self.experts);
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2585,6 +4403,7 @@ impl ConvexMixture {
 pub struct MdlSelector {
     experts: Vec<ExpertState>,
     scratch_logps: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     total_log_loss: f64,
     last_best: usize,
     cached_symbol: u8,
@@ -2593,7 +4412,7 @@ pub struct MdlSelector {
     cache_valid: bool,
 }
 
-/// Bytewise neural mixer inspired by fx2-cmix online adaptation.
+/// Bytewise neural mixer  (Loosely PAQ inspired)
 ///
 /// This model is a context-conditioned two-stage gating network trained online
 /// from per-symbol expert likelihoods:
@@ -2608,6 +4427,7 @@ pub struct NeuralMixture {
     min_prob: f64,
     scratch_expert_logps: Vec<f64>,
     scratch_mix_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
     eval_cache_valid: bool,
     eval_cache_full_valid: bool,
     eval_cache_history: NeuralHistoryState,
@@ -2653,6 +4473,7 @@ impl NeuralMixture {
             min_prob: DEFAULT_MIN_PROB,
             scratch_expert_logps: vec![0.0; n],
             scratch_mix_weights: vec![0.0; n],
+            bitwise: MixtureBitPrefixState::default(),
             eval_cache_valid: false,
             eval_cache_full_valid: false,
             eval_cache_history,
@@ -2829,12 +4650,7 @@ impl NeuralMixture {
                 .evaluate_symbol(&self.scratch_expert_logps, self.min_prob);
             clamp_unit_prob(p, self.min_prob).ln()
         };
-        self.neural
-            .update_weights_symbol(&self.scratch_expert_logps, self.min_prob);
-        self.total_log_loss -= logp;
-        self.analyzer.update(symbol);
-        self.neural.set_context_state(self.analyzer.state());
-        self.invalidate_eval_cache();
+        finish_neural_update_from_logps(self, symbol, logp, true);
         logp
     }
 
@@ -2843,15 +4659,26 @@ impl NeuralMixture {
         self.total_log_loss
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.analyzer = TextContextAnalyzer::new();
         self.neural.set_context_state(self.analyzer.state());
         self.invalidate_eval_cache();
         self.eval_cache_history = self.neural.history_state();
         self.total_log_loss = 0.0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        let prior = reset_experts_to_priors(&mut self.experts);
+        self.neural.reset_to_priors(&prior);
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -2874,6 +4701,7 @@ impl MdlSelector {
         Self {
             experts,
             scratch_logps: vec![0.0; configs.len()],
+            bitwise: MixtureBitPrefixState::default(),
             total_log_loss: 0.0,
             last_best,
             cached_symbol: 0,
@@ -2912,16 +4740,19 @@ impl MdlSelector {
             }
             best_idx
         };
-        let logp = self.scratch_logps[best_idx];
         self.cache_valid = false;
-        for (i, expert) in self.experts.iter_mut().enumerate() {
-            expert.cum_log_loss -= self.scratch_logps[i];
+        for expert in &mut self.experts {
             if used_cache {
                 expert.update(symbol);
             }
         }
+        let logp = apply_mdl_update_from_logps(
+            &mut self.experts,
+            &self.scratch_logps,
+            best_idx,
+            &mut self.last_best,
+        );
         self.total_log_loss -= logp;
-        self.last_best = best_idx;
         logp
     }
 
@@ -2997,12 +4828,23 @@ impl MdlSelector {
         self.experts.iter().map(|e| e.name.clone()).collect()
     }
 
-    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
-        for expert in &mut self.experts {
-            expert.reset_frozen(total_symbols)?;
-        }
+    #[inline]
+    fn clear_stream_state(&mut self) {
         self.cache_valid = false;
         self.total_log_loss = 0.0;
+    }
+
+    fn reset_frozen(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        reset_expert_frozen_stream(&mut self.experts, total_symbols)?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        begin_expert_fresh_stream(&mut self.experts, total_symbols)?;
+        reset_experts_to_priors(&mut self.experts);
+        self.last_best = 0;
+        self.clear_stream_state();
         Ok(())
     }
 
@@ -3012,6 +4854,308 @@ impl MdlSelector {
         }
         self.cache_valid = false;
     }
+}
+
+#[derive(Clone)]
+struct ExpertStateCheckpoint {
+    log_weight: f64,
+    log_prior: f64,
+    cum_log_loss: f64,
+    predictor: OnlineBytePredictorCheckpoint,
+}
+
+fn checkpoint_experts(experts: &mut [ExpertState]) -> Option<Vec<ExpertStateCheckpoint>> {
+    experts
+        .iter_mut()
+        .map(|expert| {
+            expert
+                .predictor
+                .checkpoint_if_supported()
+                .map(|predictor| ExpertStateCheckpoint {
+                    log_weight: expert.log_weight,
+                    log_prior: expert.log_prior,
+                    cum_log_loss: expert.cum_log_loss,
+                    predictor,
+                })
+        })
+        .collect()
+}
+
+fn restore_experts(experts: &mut [ExpertState], checkpoints: &[ExpertStateCheckpoint]) {
+    assert_eq!(
+        experts.len(),
+        checkpoints.len(),
+        "mixture checkpoint expert count mismatch"
+    );
+    for (expert, checkpoint) in experts.iter_mut().zip(checkpoints.iter()) {
+        expert.log_weight = checkpoint.log_weight;
+        expert.log_prior = checkpoint.log_prior;
+        expert.cum_log_loss = checkpoint.cum_log_loss;
+        assert!(
+            expert
+                .predictor
+                .restore_checkpoint_if_supported(&checkpoint.predictor),
+            "mixture expert rejected its structural checkpoint"
+        );
+    }
+}
+
+fn clear_expert_checkpoints(experts: &mut [ExpertState]) {
+    for expert in experts {
+        expert.predictor.clear_checkpoints_if_supported();
+    }
+}
+
+fn discard_expert_checkpoints(
+    experts: &mut [ExpertState],
+    checkpoints: Vec<ExpertStateCheckpoint>,
+) {
+    assert_eq!(
+        experts.len(),
+        checkpoints.len(),
+        "mixture checkpoint expert count mismatch"
+    );
+    for (expert, checkpoint) in experts.iter_mut().zip(checkpoints.into_iter()) {
+        assert!(
+            expert
+                .predictor
+                .discard_checkpoint_if_supported(checkpoint.predictor),
+            "mixture expert rejected checkpoint discard"
+        );
+    }
+}
+
+fn lifecycle_checkpoint_experts(
+    experts: &mut [ExpertState],
+    op: ExpertLifecycleOp,
+) -> Vec<ExpertStateLifecycleCheckpoint> {
+    experts
+        .iter_mut()
+        .map(|expert| expert.snapshot_state_lifecycle(op))
+        .collect()
+}
+
+fn restore_lifecycle_experts(
+    experts: &mut [ExpertState],
+    checkpoints: Vec<ExpertStateLifecycleCheckpoint>,
+    op: ExpertLifecycleOp,
+) {
+    assert_eq!(
+        experts.len(),
+        checkpoints.len(),
+        "mixture lifecycle checkpoint expert count mismatch"
+    );
+    for (expert, checkpoint) in experts.iter_mut().zip(checkpoints.into_iter()) {
+        expert.restore_state_lifecycle(op, checkpoint);
+    }
+}
+
+fn discard_lifecycle_experts(
+    experts: &mut [ExpertState],
+    checkpoints: Vec<ExpertStateLifecycleCheckpoint>,
+    op: ExpertLifecycleOp,
+) {
+    assert_eq!(
+        experts.len(),
+        checkpoints.len(),
+        "mixture lifecycle checkpoint expert count mismatch"
+    );
+    for (expert, checkpoint) in experts.iter_mut().zip(checkpoints.into_iter()) {
+        expert.discard_state_lifecycle(op, checkpoint);
+    }
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct BayesMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct FadingBayesMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_predictive: f64,
+    cached_log_evidence: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct SwitchingMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_joint: Vec<f64>,
+    scratch_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+    update_count: u64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct ConvexMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    lambda: Vec<f64>,
+    scratch_logps: Vec<f64>,
+    projection_scratch: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+    update_count: u64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct MdlSelectorCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    scratch_logps: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    total_log_loss: f64,
+    last_best: usize,
+    cached_symbol: u8,
+    cached_best_idx: usize,
+    cached_best_logp: f64,
+    cache_valid: bool,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct NeuralMixtureCheckpoint {
+    experts: Vec<ExpertStateCheckpoint>,
+    neural: NeuralMixCore,
+    analyzer: TextContextAnalyzer,
+    scratch_expert_logps: Vec<f64>,
+    scratch_mix_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    eval_cache_valid: bool,
+    eval_cache_full_valid: bool,
+    eval_cache_history: NeuralHistoryState,
+    eval_cache_symbol: u8,
+    eval_cache_logp: f64,
+    eval_cache_mix_logps: [f64; 256],
+    eval_cache_expert_logps: Vec<[f64; 256]>,
+    total_log_loss: f64,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+// Mirrors `MixtureRuntime`: the neural checkpoint owns inline 256-way
+// probability caches, and boxing it would add allocation to normal checkpoint
+// capture/restore without reducing resident runtime state.
+#[allow(clippy::large_enum_variant)]
+pub enum MixtureRuntimeCheckpoint {
+    Bayes(BayesMixtureCheckpoint),
+    Fading(FadingBayesMixtureCheckpoint),
+    Switching(SwitchingMixtureCheckpoint),
+    Convex(ConvexMixtureCheckpoint),
+    Mdl(MdlSelectorCheckpoint),
+    Neural(NeuralMixtureCheckpoint),
+}
+
+struct BayesMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+}
+
+struct FadingBayesMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_mix: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_predictive: f64,
+    cached_log_evidence: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+}
+
+struct SwitchingMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    scratch_logps: Vec<f64>,
+    scratch_joint: Vec<f64>,
+    scratch_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+    update_count: u64,
+}
+
+struct ConvexMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    lambda: Vec<f64>,
+    scratch_logps: Vec<f64>,
+    projection_scratch: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    cached_symbol: u8,
+    cached_log_mix: f64,
+    cache_valid: bool,
+    total_log_loss: f64,
+    update_count: u64,
+}
+
+struct MdlSelectorLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    scratch_logps: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    total_log_loss: f64,
+    last_best: usize,
+    cached_symbol: u8,
+    cached_best_idx: usize,
+    cached_best_logp: f64,
+    cache_valid: bool,
+}
+
+struct NeuralMixtureLifecycleCheckpoint {
+    experts: Vec<ExpertStateLifecycleCheckpoint>,
+    neural: NeuralMixCore,
+    analyzer: TextContextAnalyzer,
+    scratch_expert_logps: Vec<f64>,
+    scratch_mix_weights: Vec<f64>,
+    bitwise: MixtureBitPrefixState,
+    eval_cache_valid: bool,
+    eval_cache_full_valid: bool,
+    eval_cache_history: NeuralHistoryState,
+    eval_cache_symbol: u8,
+    eval_cache_logp: f64,
+    eval_cache_mix_logps: [f64; 256],
+    eval_cache_expert_logps: Vec<[f64; 256]>,
+    total_log_loss: f64,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum MixtureRuntimeLifecycleCheckpoint {
+    Bayes(BayesMixtureLifecycleCheckpoint),
+    Fading(FadingBayesMixtureLifecycleCheckpoint),
+    Switching(SwitchingMixtureLifecycleCheckpoint),
+    Convex(ConvexMixtureLifecycleCheckpoint),
+    Mdl(MdlSelectorLifecycleCheckpoint),
+    Neural(NeuralMixtureLifecycleCheckpoint),
 }
 
 // =============================================================================
@@ -3037,6 +5181,422 @@ pub enum MixtureRuntime {
 }
 
 impl MixtureRuntime {
+    pub(crate) fn checkpoint(&mut self) -> Option<MixtureRuntimeCheckpoint> {
+        match self {
+            MixtureRuntime::Bayes(m) => {
+                Some(MixtureRuntimeCheckpoint::Bayes(BayesMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_mix: m.scratch_mix.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                }))
+            }
+            MixtureRuntime::Fading(m) => Some(MixtureRuntimeCheckpoint::Fading(
+                FadingBayesMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_mix: m.scratch_mix.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_predictive: m.cached_log_predictive,
+                    cached_log_evidence: m.cached_log_evidence,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                },
+            )),
+            MixtureRuntime::Switching(m) => Some(MixtureRuntimeCheckpoint::Switching(
+                SwitchingMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_joint: m.scratch_joint.clone(),
+                    scratch_weights: m.scratch_weights.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                    update_count: m.update_count,
+                },
+            )),
+            MixtureRuntime::Convex(m) => {
+                Some(MixtureRuntimeCheckpoint::Convex(ConvexMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    lambda: m.lambda.clone(),
+                    scratch_logps: m.scratch_logps.clone(),
+                    projection_scratch: m.projection_scratch.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                    update_count: m.update_count,
+                }))
+            }
+            MixtureRuntime::Mdl(m) => Some(MixtureRuntimeCheckpoint::Mdl(MdlSelectorCheckpoint {
+                experts: checkpoint_experts(&mut m.experts)?,
+                scratch_logps: m.scratch_logps.clone(),
+                bitwise: m.bitwise.clone(),
+                total_log_loss: m.total_log_loss,
+                last_best: m.last_best,
+                cached_symbol: m.cached_symbol,
+                cached_best_idx: m.cached_best_idx,
+                cached_best_logp: m.cached_best_logp,
+                cache_valid: m.cache_valid,
+            })),
+            MixtureRuntime::Neural(m) => {
+                Some(MixtureRuntimeCheckpoint::Neural(NeuralMixtureCheckpoint {
+                    experts: checkpoint_experts(&mut m.experts)?,
+                    neural: m.neural.clone(),
+                    analyzer: m.analyzer.clone(),
+                    scratch_expert_logps: m.scratch_expert_logps.clone(),
+                    scratch_mix_weights: m.scratch_mix_weights.clone(),
+                    bitwise: m.bitwise.clone(),
+                    eval_cache_valid: m.eval_cache_valid,
+                    eval_cache_full_valid: m.eval_cache_full_valid,
+                    eval_cache_history: m.eval_cache_history,
+                    eval_cache_symbol: m.eval_cache_symbol,
+                    eval_cache_logp: m.eval_cache_logp,
+                    eval_cache_mix_logps: m.eval_cache_mix_logps,
+                    eval_cache_expert_logps: m.eval_cache_expert_logps.clone(),
+                    total_log_loss: m.total_log_loss,
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn restore_checkpoint(&mut self, checkpoint: &MixtureRuntimeCheckpoint) {
+        match (self, checkpoint) {
+            (MixtureRuntime::Bayes(m), MixtureRuntimeCheckpoint::Bayes(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.scratch_mix = ck.scratch_mix.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            (MixtureRuntime::Fading(m), MixtureRuntimeCheckpoint::Fading(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.scratch_mix = ck.scratch_mix.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_predictive = ck.cached_log_predictive;
+                m.cached_log_evidence = ck.cached_log_evidence;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            (MixtureRuntime::Switching(m), MixtureRuntimeCheckpoint::Switching(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.scratch_joint = ck.scratch_joint.clone();
+                m.scratch_weights = ck.scratch_weights.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+                m.update_count = ck.update_count;
+            }
+            (MixtureRuntime::Convex(m), MixtureRuntimeCheckpoint::Convex(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.lambda = ck.lambda.clone();
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.projection_scratch = ck.projection_scratch.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+                m.update_count = ck.update_count;
+            }
+            (MixtureRuntime::Mdl(m), MixtureRuntimeCheckpoint::Mdl(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.scratch_logps = ck.scratch_logps.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.total_log_loss = ck.total_log_loss;
+                m.last_best = ck.last_best;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_best_idx = ck.cached_best_idx;
+                m.cached_best_logp = ck.cached_best_logp;
+                m.cache_valid = ck.cache_valid;
+            }
+            (MixtureRuntime::Neural(m), MixtureRuntimeCheckpoint::Neural(ck)) => {
+                restore_experts(&mut m.experts, &ck.experts);
+                m.neural = ck.neural.clone();
+                m.analyzer = ck.analyzer.clone();
+                m.scratch_expert_logps = ck.scratch_expert_logps.clone();
+                m.scratch_mix_weights = ck.scratch_mix_weights.clone();
+                m.bitwise = ck.bitwise.clone();
+                m.eval_cache_valid = ck.eval_cache_valid;
+                m.eval_cache_full_valid = ck.eval_cache_full_valid;
+                m.eval_cache_history = ck.eval_cache_history;
+                m.eval_cache_symbol = ck.eval_cache_symbol;
+                m.eval_cache_logp = ck.eval_cache_logp;
+                m.eval_cache_mix_logps = ck.eval_cache_mix_logps;
+                m.eval_cache_expert_logps = ck.eval_cache_expert_logps.clone();
+                m.total_log_loss = ck.total_log_loss;
+            }
+            _ => panic!("mismatched MixtureRuntime checkpoint variant"),
+        }
+    }
+
+    pub(crate) fn discard_checkpoint(&mut self, checkpoint: MixtureRuntimeCheckpoint) {
+        match (self, checkpoint) {
+            (MixtureRuntime::Bayes(m), MixtureRuntimeCheckpoint::Bayes(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Fading(m), MixtureRuntimeCheckpoint::Fading(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Switching(m), MixtureRuntimeCheckpoint::Switching(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Convex(m), MixtureRuntimeCheckpoint::Convex(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Mdl(m), MixtureRuntimeCheckpoint::Mdl(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Neural(m), MixtureRuntimeCheckpoint::Neural(ck)) => {
+                discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            _ => panic!("mismatched MixtureRuntime checkpoint variant"),
+        }
+    }
+
+    fn lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+    ) -> MixtureRuntimeLifecycleCheckpoint {
+        let expert_op = ExpertLifecycleOp::from_predictor_op(op);
+        match self {
+            MixtureRuntime::Bayes(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Bayes(BayesMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_mix: m.scratch_mix.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                })
+            }
+            MixtureRuntime::Fading(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Fading(FadingBayesMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_mix: m.scratch_mix.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_predictive: m.cached_log_predictive,
+                    cached_log_evidence: m.cached_log_evidence,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                })
+            }
+            MixtureRuntime::Switching(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Switching(SwitchingMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    scratch_logps: m.scratch_logps.clone(),
+                    scratch_joint: m.scratch_joint.clone(),
+                    scratch_weights: m.scratch_weights.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                    update_count: m.update_count,
+                })
+            }
+            MixtureRuntime::Convex(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Convex(ConvexMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    lambda: m.lambda.clone(),
+                    scratch_logps: m.scratch_logps.clone(),
+                    projection_scratch: m.projection_scratch.clone(),
+                    bitwise: m.bitwise.clone(),
+                    cached_symbol: m.cached_symbol,
+                    cached_log_mix: m.cached_log_mix,
+                    cache_valid: m.cache_valid,
+                    total_log_loss: m.total_log_loss,
+                    update_count: m.update_count,
+                })
+            }
+            MixtureRuntime::Mdl(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Mdl(MdlSelectorLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    scratch_logps: m.scratch_logps.clone(),
+                    bitwise: m.bitwise.clone(),
+                    total_log_loss: m.total_log_loss,
+                    last_best: m.last_best,
+                    cached_symbol: m.cached_symbol,
+                    cached_best_idx: m.cached_best_idx,
+                    cached_best_logp: m.cached_best_logp,
+                    cache_valid: m.cache_valid,
+                })
+            }
+            MixtureRuntime::Neural(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Neural(NeuralMixtureLifecycleCheckpoint {
+                    experts: lifecycle_checkpoint_experts(&mut m.experts, expert_op),
+                    neural: m.neural.clone(),
+                    analyzer: m.analyzer.clone(),
+                    scratch_expert_logps: m.scratch_expert_logps.clone(),
+                    scratch_mix_weights: m.scratch_mix_weights.clone(),
+                    bitwise: m.bitwise.clone(),
+                    eval_cache_valid: m.eval_cache_valid,
+                    eval_cache_full_valid: m.eval_cache_full_valid,
+                    eval_cache_history: m.eval_cache_history,
+                    eval_cache_symbol: m.eval_cache_symbol,
+                    eval_cache_logp: m.eval_cache_logp,
+                    eval_cache_mix_logps: m.eval_cache_mix_logps,
+                    eval_cache_expert_logps: m.eval_cache_expert_logps.clone(),
+                    total_log_loss: m.total_log_loss,
+                })
+            }
+        }
+    }
+
+    fn restore_lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: MixtureRuntimeLifecycleCheckpoint,
+    ) {
+        let expert_op = ExpertLifecycleOp::from_predictor_op(op);
+        match (self, checkpoint) {
+            (MixtureRuntime::Bayes(m), MixtureRuntimeLifecycleCheckpoint::Bayes(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.scratch_logps = ck.scratch_logps;
+                m.scratch_mix = ck.scratch_mix;
+                m.bitwise = ck.bitwise;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            (MixtureRuntime::Fading(m), MixtureRuntimeLifecycleCheckpoint::Fading(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.scratch_logps = ck.scratch_logps;
+                m.scratch_mix = ck.scratch_mix;
+                m.bitwise = ck.bitwise;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_predictive = ck.cached_log_predictive;
+                m.cached_log_evidence = ck.cached_log_evidence;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            (MixtureRuntime::Switching(m), MixtureRuntimeLifecycleCheckpoint::Switching(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.scratch_logps = ck.scratch_logps;
+                m.scratch_joint = ck.scratch_joint;
+                m.scratch_weights = ck.scratch_weights;
+                m.bitwise = ck.bitwise;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+                m.update_count = ck.update_count;
+            }
+            (MixtureRuntime::Convex(m), MixtureRuntimeLifecycleCheckpoint::Convex(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.lambda = ck.lambda;
+                m.scratch_logps = ck.scratch_logps;
+                m.projection_scratch = ck.projection_scratch;
+                m.bitwise = ck.bitwise;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_log_mix = ck.cached_log_mix;
+                m.cache_valid = ck.cache_valid;
+                m.total_log_loss = ck.total_log_loss;
+                m.update_count = ck.update_count;
+            }
+            (MixtureRuntime::Mdl(m), MixtureRuntimeLifecycleCheckpoint::Mdl(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.scratch_logps = ck.scratch_logps;
+                m.bitwise = ck.bitwise;
+                m.total_log_loss = ck.total_log_loss;
+                m.last_best = ck.last_best;
+                m.cached_symbol = ck.cached_symbol;
+                m.cached_best_idx = ck.cached_best_idx;
+                m.cached_best_logp = ck.cached_best_logp;
+                m.cache_valid = ck.cache_valid;
+            }
+            (MixtureRuntime::Neural(m), MixtureRuntimeLifecycleCheckpoint::Neural(ck)) => {
+                restore_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+                m.neural = ck.neural;
+                m.analyzer = ck.analyzer;
+                m.scratch_expert_logps = ck.scratch_expert_logps;
+                m.scratch_mix_weights = ck.scratch_mix_weights;
+                m.bitwise = ck.bitwise;
+                m.eval_cache_valid = ck.eval_cache_valid;
+                m.eval_cache_full_valid = ck.eval_cache_full_valid;
+                m.eval_cache_history = ck.eval_cache_history;
+                m.eval_cache_symbol = ck.eval_cache_symbol;
+                m.eval_cache_logp = ck.eval_cache_logp;
+                m.eval_cache_mix_logps = ck.eval_cache_mix_logps;
+                m.eval_cache_expert_logps = ck.eval_cache_expert_logps;
+                m.total_log_loss = ck.total_log_loss;
+            }
+            _ => panic!("mismatched MixtureRuntime lifecycle checkpoint variant"),
+        }
+    }
+
+    fn discard_lifecycle_checkpoint(
+        &mut self,
+        op: OnlineBytePredictorLifecycleOp,
+        checkpoint: MixtureRuntimeLifecycleCheckpoint,
+    ) {
+        let expert_op = ExpertLifecycleOp::from_predictor_op(op);
+        match (self, checkpoint) {
+            (MixtureRuntime::Bayes(m), MixtureRuntimeLifecycleCheckpoint::Bayes(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Fading(m), MixtureRuntimeLifecycleCheckpoint::Fading(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Switching(m), MixtureRuntimeLifecycleCheckpoint::Switching(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Convex(m), MixtureRuntimeLifecycleCheckpoint::Convex(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Mdl(m), MixtureRuntimeLifecycleCheckpoint::Mdl(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            (MixtureRuntime::Neural(m), MixtureRuntimeLifecycleCheckpoint::Neural(ck)) => {
+                discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
+            }
+            _ => panic!("mismatched MixtureRuntime lifecycle checkpoint variant"),
+        }
+    }
+
+    pub(crate) fn clear_checkpoints_if_supported(&mut self) {
+        match self {
+            MixtureRuntime::Bayes(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Fading(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Switching(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Convex(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Mdl(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Neural(m) => clear_expert_checkpoints(&mut m.experts),
+        }
+    }
+
+    pub(crate) fn supports_frozen_reset(&self) -> bool {
+        match self {
+            MixtureRuntime::Bayes(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Fading(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Switching(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Convex(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Mdl(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Neural(m) => experts_support_frozen_reset(&m.experts),
+        }
+    }
+
     pub(crate) fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
         match self {
             MixtureRuntime::Bayes(m) => begin_expert_stream(&mut m.experts, total_symbols),
@@ -3045,6 +5605,17 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Mdl(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Neural(m) => begin_expert_stream(&mut m.experts, total_symbols),
+        }
+    }
+
+    pub(crate) fn begin_fresh_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Fading(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Switching(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Convex(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Mdl(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Neural(m) => m.begin_fresh_stream(total_symbols),
         }
     }
 
@@ -3115,23 +5686,341 @@ impl MixtureRuntime {
             MixtureRuntime::Neural(m) => m.fill_log_probs(out),
         }
     }
+
+    pub(crate) fn has_native_msb_byte_prefix(&self) -> bool {
+        match self {
+            MixtureRuntime::Bayes(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Fading(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Switching(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Convex(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Mdl(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Neural(m) => experts_have_native_msb_byte_prefix(&m.experts),
+        }
+    }
+
+    pub(crate) fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        match self {
+            MixtureRuntime::Bayes(m) => {
+                let weights: Vec<f64> = normalized_expert_log_weights(&m.experts);
+                m.bitwise.begin(&mut m.experts, &weights)
+            }
+            MixtureRuntime::Fading(m) => {
+                let weights: Vec<f64> = normalized_scaled_expert_log_weights(&m.experts, m.decay);
+                m.bitwise.begin(&mut m.experts, &weights)
+            }
+            MixtureRuntime::Switching(m) => {
+                let weights: Vec<f64> = normalized_expert_log_weights(&m.experts);
+                m.bitwise.begin(&mut m.experts, &weights)
+            }
+            MixtureRuntime::Convex(m) => m.bitwise.begin(&mut m.experts, &m.lambda),
+            MixtureRuntime::Mdl(m) => {
+                let best_idx: usize = best_expert_index(&m.experts);
+                let mut weights: Vec<f64> = vec![0.0; m.experts.len()];
+                if let Some(slot) = weights.get_mut(best_idx) {
+                    *slot = 1.0;
+                }
+                m.bitwise.begin(&mut m.experts, &weights)
+            }
+            MixtureRuntime::Neural(m) => {
+                if m.experts.len() == 1 {
+                    m.scratch_mix_weights.resize(1, 1.0);
+                    m.scratch_mix_weights[0] = 1.0;
+                } else {
+                    m.sync_history_state();
+                    m.neural.evaluate_expert_weights();
+                    m.scratch_mix_weights
+                        .copy_from_slice(m.neural.expert_weights());
+                }
+                m.bitwise.begin(&mut m.experts, &m.scratch_mix_weights)
+            }
+        }
+    }
+
+    pub(crate) fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Fading(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Switching(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Convex(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Mdl(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Neural(m) => m.bitwise.abort_empty(&mut m.experts),
+        }
+    }
+
+    pub(crate) fn native_msb_prefix_prob_one(&mut self, bit_idx: usize) -> Result<f64, String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Fading(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Switching(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Convex(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Mdl(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Neural(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+        }
+    }
+
+    pub(crate) fn observe_native_msb_prefix_bit(
+        &mut self,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<(), String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Fading(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Switching(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Convex(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Mdl(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Neural(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+        }
+    }
+
+    pub(crate) fn finish_native_msb_byte_prefix(&mut self, symbol: u8) -> Result<(), String> {
+        match self {
+            MixtureRuntime::Bayes(m) => finish_bayes_native_prefix(m, symbol),
+            MixtureRuntime::Fading(m) => finish_fading_native_prefix(m, symbol),
+            MixtureRuntime::Switching(m) => finish_switching_native_prefix(m, symbol),
+            MixtureRuntime::Convex(m) => finish_convex_native_prefix(m, symbol),
+            MixtureRuntime::Mdl(m) => finish_mdl_native_prefix(m, symbol),
+            MixtureRuntime::Neural(m) => finish_neural_native_prefix(m, symbol),
+        }
+    }
+}
+
+fn experts_have_native_msb_byte_prefix(experts: &[ExpertState]) -> bool {
+    experts
+        .iter()
+        .any(|expert| expert.predictor.has_native_msb_byte_prefix())
+}
+
+fn normalized_expert_log_weights(experts: &[ExpertState]) -> Vec<f64> {
+    let norm: f64 = logsumexp_weights(experts);
+    experts
+        .iter()
+        .map(|expert| (expert.log_weight - norm).exp())
+        .collect()
+}
+
+fn normalized_scaled_expert_log_weights(experts: &[ExpertState], scale: f64) -> Vec<f64> {
+    let mut log_weights: Vec<f64> = experts
+        .iter()
+        .map(|expert| scale * expert.log_weight)
+        .collect();
+    let norm: f64 = logsumexp(&log_weights);
+    for weight in &mut log_weights {
+        *weight = (*weight - norm).exp();
+    }
+    log_weights
+}
+
+fn best_expert_index(experts: &[ExpertState]) -> usize {
+    let mut best_idx: usize = 0;
+    let mut best_loss: f64 = f64::INFINITY;
+    for (idx, expert) in experts.iter().enumerate() {
+        if expert.cum_log_loss < best_loss {
+            best_loss = expert.cum_log_loss;
+            best_idx = idx;
+        }
+    }
+    best_idx
+}
+
+fn finish_bayes_native_prefix(m: &mut BayesMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let log_mix =
+        apply_bayes_update_from_logps(&mut m.experts, &m.bitwise.logps, &mut m.scratch_mix);
+    m.cache_valid = false;
+    m.total_log_loss -= log_mix;
+    Ok(())
+}
+
+fn finish_fading_native_prefix(m: &mut FadingBayesMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let log_predictive = apply_fading_update_from_logps(
+        &mut m.experts,
+        &m.bitwise.logps,
+        &mut m.scratch_mix,
+        m.decay,
+    );
+    m.cache_valid = false;
+    m.total_log_loss -= log_predictive;
+    Ok(())
+}
+
+fn finish_switching_native_prefix(m: &mut SwitchingMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let log_mix = apply_switching_update_from_logps(
+        &mut m.experts,
+        &m.bitwise.logps,
+        &mut m.scratch_joint,
+        &mut m.scratch_weights,
+        &m.prior,
+        m.schedule,
+        m.alpha,
+        &mut m.update_count,
+    );
+    m.cache_valid = false;
+    m.total_log_loss -= log_mix;
+    Ok(())
+}
+
+fn finish_convex_native_prefix(m: &mut ConvexMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let log_mix = apply_convex_update_from_logps(
+        &mut m.experts,
+        &m.bitwise.logps,
+        &mut m.lambda,
+        &mut m.projection_scratch,
+        m.schedule,
+        m.alpha,
+        &mut m.update_count,
+    );
+    m.cache_valid = false;
+    m.total_log_loss -= log_mix;
+    Ok(())
+}
+
+fn finish_mdl_native_prefix(m: &mut MdlSelector, symbol: u8) -> Result<(), String> {
+    let best_idx: usize = best_expert_index(&m.experts);
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    let logp =
+        apply_mdl_update_from_logps(&mut m.experts, &m.bitwise.logps, best_idx, &mut m.last_best);
+    m.cache_valid = false;
+    m.total_log_loss -= logp;
+    Ok(())
+}
+
+fn finish_neural_native_prefix(m: &mut NeuralMixture, symbol: u8) -> Result<(), String> {
+    m.bitwise.finish_adaptive(&mut m.experts, symbol)?;
+    m.scratch_expert_logps
+        .copy_from_slice(&m.bitwise.logps[..m.experts.len()]);
+    for idx in 0..m.experts.len() {
+        m.experts[idx].cum_log_loss -= m.scratch_expert_logps[idx];
+    }
+    let logp: f64 = m
+        .bitwise
+        .weights
+        .iter()
+        .zip(m.bitwise.logps.iter())
+        .map(|(&w, &lp)| w * lp.exp())
+        .sum::<f64>()
+        .max(m.min_prob)
+        .ln();
+    finish_neural_update_from_logps(m, symbol, logp, m.experts.len() > 1);
+    m.eval_cache_history = m.neural.history_state();
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpertLifecycleOp {
+    BeginStream,
+    BeginFreshStream,
+    ResetFrozen,
+    FinishStream,
+}
+
+impl ExpertLifecycleOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BeginStream => "begin_stream",
+            Self::BeginFreshStream => "begin_fresh_stream",
+            Self::ResetFrozen => "reset_frozen",
+            Self::FinishStream => "finish_stream",
+        }
+    }
+
+    fn to_predictor_op(self) -> OnlineBytePredictorLifecycleOp {
+        match self {
+            Self::BeginStream => OnlineBytePredictorLifecycleOp::BeginStream,
+            Self::BeginFreshStream => OnlineBytePredictorLifecycleOp::BeginFreshStream,
+            Self::ResetFrozen => OnlineBytePredictorLifecycleOp::ResetFrozen,
+            Self::FinishStream => OnlineBytePredictorLifecycleOp::FinishStream,
+        }
+    }
+
+    fn from_predictor_op(op: OnlineBytePredictorLifecycleOp) -> Self {
+        match op {
+            OnlineBytePredictorLifecycleOp::BeginStream => Self::BeginStream,
+            OnlineBytePredictorLifecycleOp::BeginFreshStream => Self::BeginFreshStream,
+            OnlineBytePredictorLifecycleOp::ResetFrozen => Self::ResetFrozen,
+            OnlineBytePredictorLifecycleOp::FinishStream => Self::FinishStream,
+        }
+    }
+}
+
+/// Apply a fallible lifecycle operation to every expert all-or-nothing.
+///
+/// Lifecycle hooks may mutate non-journaled state such as CTW history, neural
+/// online-policy buffers, or wrapper caches before reporting an error. The
+/// update checkpoints used for speculative byte/bit prediction are therefore not
+/// sufficient here: rollback must restore the whole expert state that existed
+/// before the lifecycle operation began. A full expert snapshot is faithful by
+/// construction, and neural model weights are already `Arc`-shared by their
+/// backends, so this does not deep-copy those parameters.
+fn transact_expert_lifecycle(
+    experts: &mut [ExpertState],
+    op: ExpertLifecycleOp,
+    mut apply: impl FnMut(&mut ExpertState) -> Result<(), String>,
+) -> Result<(), String> {
+    if experts.is_empty() {
+        return Ok(());
+    }
+    let mut backups: Vec<(usize, ExpertLifecycleToken)> = Vec::with_capacity(experts.len());
+    for idx in 0..experts.len() {
+        let name = experts[idx].name.clone();
+        let token = experts[idx].snapshot_lifecycle(op);
+        backups.push((idx, token));
+        if let Err(err) = apply(&mut experts[idx]) {
+            for (restore_idx, token) in backups.into_iter().rev() {
+                experts[restore_idx].restore_lifecycle(op, token);
+            }
+            return Err(format!(
+                "mixture expert lifecycle {} failed for expert #{idx} '{name}': {err}",
+                op.as_str()
+            ));
+        }
+    }
+    for (idx, token) in backups {
+        experts[idx].discard_lifecycle(op, token);
+    }
+    Ok(())
 }
 
 fn begin_expert_stream(
     experts: &mut [ExpertState],
     total_symbols: Option<u64>,
 ) -> Result<(), String> {
-    for expert in experts {
-        expert.begin_stream(total_symbols)?;
-    }
-    Ok(())
+    transact_expert_lifecycle(experts, ExpertLifecycleOp::BeginStream, |expert| {
+        expert.begin_stream(total_symbols)
+    })
+}
+
+fn begin_expert_fresh_stream(
+    experts: &mut [ExpertState],
+    total_symbols: Option<u64>,
+) -> Result<(), String> {
+    transact_expert_lifecycle(experts, ExpertLifecycleOp::BeginFreshStream, |expert| {
+        expert.begin_fresh_stream(total_symbols)
+    })
+}
+
+fn reset_expert_frozen_stream(
+    experts: &mut [ExpertState],
+    total_symbols: Option<u64>,
+) -> Result<(), String> {
+    transact_expert_lifecycle(experts, ExpertLifecycleOp::ResetFrozen, |expert| {
+        expert.reset_frozen(total_symbols)
+    })
+}
+
+fn experts_support_frozen_reset(experts: &[ExpertState]) -> bool {
+    experts
+        .iter()
+        .all(|expert| expert.predictor.supports_frozen_reset())
 }
 
 fn finish_expert_stream(experts: &mut [ExpertState]) -> Result<(), String> {
-    for expert in experts {
-        expert.finish_stream()?;
-    }
-    Ok(())
+    transact_expert_lifecycle(experts, ExpertLifecycleOp::FinishStream, |expert| {
+        expert.finish_stream()
+    })
 }
 
 #[cfg(test)]
@@ -3187,6 +6076,201 @@ fn build_mixture_runtime_from_fields(
     }
 }
 
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Clone)]
+    struct LifecycleMockPredict {
+        state: usize,
+        fail: Option<ExpertLifecycleOp>,
+    }
+
+    impl LifecycleMockPredict {
+        fn apply(&mut self, op: ExpertLifecycleOp, next_state: usize) -> Result<(), String> {
+            self.state = next_state;
+            if self.fail == Some(op) {
+                Err(format!("{} failed after mutation", op.as_str()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl OnlineBytePredictor for LifecycleMockPredict {
+        fn begin_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.apply(ExpertLifecycleOp::BeginStream, 11)
+        }
+
+        fn begin_fresh_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.apply(ExpertLifecycleOp::BeginFreshStream, 22)
+        }
+
+        fn reset_frozen(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.apply(ExpertLifecycleOp::ResetFrozen, 33)
+        }
+
+        fn finish_stream(&mut self) -> Result<(), String> {
+            self.apply(ExpertLifecycleOp::FinishStream, 44)
+        }
+
+        fn log_prob(&mut self, _symbol: u8) -> f64 {
+            self.state as f64
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+    }
+
+    fn lifecycle_expert(name: &str, state: usize, fail: Option<ExpertLifecycleOp>) -> ExpertState {
+        ExpertState {
+            name: name.to_string(),
+            log_weight: 0.0,
+            log_prior: 0.0,
+            predictor: ExpertPredictor::generic(Box::new(LifecycleMockPredict { state, fail })),
+            cum_log_loss: 0.0,
+        }
+    }
+
+    fn lifecycle_state(expert: &mut ExpertState) -> usize {
+        expert.log_prob(0) as usize
+    }
+
+    fn assert_lifecycle_failure_rolls_back(op: ExpertLifecycleOp) {
+        let mut experts: Vec<ExpertState> = vec![
+            lifecycle_expert("mutated", 1, None),
+            lifecycle_expert("failing", 2, Some(op)),
+        ];
+
+        let err = match op {
+            ExpertLifecycleOp::BeginStream => begin_expert_stream(&mut experts, Some(8)),
+            ExpertLifecycleOp::BeginFreshStream => begin_expert_fresh_stream(&mut experts, Some(8)),
+            ExpertLifecycleOp::ResetFrozen => reset_expert_frozen_stream(&mut experts, Some(8)),
+            ExpertLifecycleOp::FinishStream => finish_expert_stream(&mut experts),
+        }
+        .expect_err("second expert should fail after mutating");
+
+        assert!(
+            err.contains(op.as_str()),
+            "error should name lifecycle operation: {err}"
+        );
+        assert!(
+            err.contains("expert #1 'failing'"),
+            "error should identify failing expert: {err}"
+        );
+        assert!(
+            err.contains("failed after mutation"),
+            "error should preserve source context: {err}"
+        );
+        assert_eq!(
+            lifecycle_state(&mut experts[0]),
+            1,
+            "earlier successful expert mutation must be rolled back"
+        );
+        assert_eq!(
+            lifecycle_state(&mut experts[1]),
+            2,
+            "failing expert mutation must be rolled back"
+        );
+    }
+
+    #[test]
+    fn lifecycle_begin_stream_failure_rolls_back_all_experts() {
+        assert_lifecycle_failure_rolls_back(ExpertLifecycleOp::BeginStream);
+    }
+
+    #[test]
+    fn lifecycle_begin_fresh_stream_failure_rolls_back_all_experts() {
+        assert_lifecycle_failure_rolls_back(ExpertLifecycleOp::BeginFreshStream);
+    }
+
+    #[test]
+    fn lifecycle_reset_frozen_failure_rolls_back_all_experts() {
+        assert_lifecycle_failure_rolls_back(ExpertLifecycleOp::ResetFrozen);
+    }
+
+    #[test]
+    fn lifecycle_finish_stream_failure_rolls_back_all_experts() {
+        assert_lifecycle_failure_rolls_back(ExpertLifecycleOp::FinishStream);
+    }
+
+    struct CloneCountingLifecyclePredict {
+        state: usize,
+        fail: Option<ExpertLifecycleOp>,
+        clones: Arc<AtomicUsize>,
+    }
+
+    impl Clone for CloneCountingLifecyclePredict {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::Relaxed);
+            Self {
+                state: self.state,
+                fail: self.fail,
+                clones: self.clones.clone(),
+            }
+        }
+    }
+
+    impl OnlineBytePredictor for CloneCountingLifecyclePredict {
+        fn begin_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.state = 99;
+            if self.fail == Some(ExpertLifecycleOp::BeginStream) {
+                Err("failed after mutation".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn log_prob(&mut self, _symbol: u8) -> f64 {
+            self.state as f64
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+    }
+
+    #[test]
+    fn lifecycle_failure_snapshots_only_attempted_experts() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let mut experts = vec![
+            ExpertState {
+                name: "failing".to_string(),
+                log_weight: 0.0,
+                log_prior: 0.0,
+                predictor: ExpertPredictor::generic(Box::new(CloneCountingLifecyclePredict {
+                    state: 1,
+                    fail: Some(ExpertLifecycleOp::BeginStream),
+                    clones: clones.clone(),
+                })),
+                cum_log_loss: 0.0,
+            },
+            ExpertState {
+                name: "unreached".to_string(),
+                log_weight: 0.0,
+                log_prior: 0.0,
+                predictor: ExpertPredictor::generic(Box::new(CloneCountingLifecyclePredict {
+                    state: 2,
+                    fail: None,
+                    clones: clones.clone(),
+                })),
+                cum_log_loss: 0.0,
+            },
+        ];
+
+        begin_expert_stream(&mut experts, Some(1)).expect_err("first expert should fail");
+
+        assert_eq!(
+            clones.load(Ordering::Relaxed),
+            1,
+            "transaction must not snapshot experts after the first failure"
+        );
+        assert_eq!(lifecycle_state(&mut experts[0]), 1);
+        assert_eq!(lifecycle_state(&mut experts[1]), 2);
+    }
+}
+
 #[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
@@ -3235,6 +6319,250 @@ mod tests {
         ExpertConfig::new(name, weight.ln(), move || {
             Box::new(FixedProbPredict { prob_zero })
         })
+    }
+
+    fn assert_weights_close(actual: &[f64], expected: &[f64], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label} length mismatch");
+        for (index, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() < 1e-12,
+                "{label}[{index}]: expected {e}, got {a}"
+            );
+        }
+    }
+
+    fn assert_expert_losses_reset(experts: &[ExpertState], label: &str) {
+        for expert in experts {
+            assert!(
+                expert.cum_log_loss.abs() < 1e-12,
+                "{label} expert '{}' loss should reset, got {}",
+                expert.name,
+                expert.cum_log_loss
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct NativeBitProbPredict {
+        prob_one: f64,
+    }
+
+    impl OnlineBytePredictor for NativeBitProbPredict {
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            let p = if symbol == 0 {
+                1.0 - self.prob_one
+            } else {
+                self.prob_one / 255.0
+            };
+            p.max(DEFAULT_MIN_PROB).ln()
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+
+        fn has_native_msb_byte_prefix(&self) -> bool {
+            true
+        }
+
+        fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn native_msb_prefix_prob_one(&mut self, _bit_idx: usize) -> Result<f64, String> {
+            Ok(self.prob_one)
+        }
+
+        fn observe_native_msb_prefix_bit(
+            &mut self,
+            _bit_idx: usize,
+            _bit: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn finish_native_msb_byte_prefix(&mut self, _symbol: u8) -> Result<(), String> {
+            Ok(())
+        }
+
+        // Dummy checkpoint methods so that MixtureBitPrefixState::begin succeeds
+        // for this mock (which advertises native MSB support). These are safe
+        // no-ops: the test mock performs no real mutation, and begin discards
+        // the captured checkpoints on the happy path after all experts prepare.
+        fn checkpoint_if_supported(&mut self) -> Option<OnlineBytePredictorCheckpoint> {
+            Some(OnlineBytePredictorCheckpoint::rate_backend(
+                RateBackendPredictorCheckpoint::Full(Box::new(RateBackendPredictor::Disabled {
+                    reason: "dummy_test_checkpoint".to_string(),
+                })),
+            ))
+        }
+
+        fn restore_checkpoint_if_supported(
+            &mut self,
+            _checkpoint: &OnlineBytePredictorCheckpoint,
+        ) -> bool {
+            true
+        }
+
+        fn discard_checkpoint_if_supported(
+            &mut self,
+            _checkpoint: OnlineBytePredictorCheckpoint,
+        ) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone)]
+    struct NativeWithoutCheckpointPredict {
+        begin_calls: Arc<AtomicUsize>,
+    }
+
+    impl OnlineBytePredictor for NativeWithoutCheckpointPredict {
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            if symbol == 0 { 0.0 } else { f64::NEG_INFINITY }
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+
+        fn has_native_msb_byte_prefix(&self) -> bool {
+            true
+        }
+
+        fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+            self.begin_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn mixture_bit_prefix_observe_without_prob_one_primes_current_bit() {
+        let configs = [
+            ExpertConfig::uniform("high", || Box::new(NativeBitProbPredict { prob_one: 0.9 })),
+            ExpertConfig::uniform("low", || Box::new(NativeBitProbPredict { prob_one: 0.1 })),
+        ];
+        let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
+        let mut bitwise = MixtureBitPrefixState::default();
+        assert!(
+            bitwise.begin(&mut experts, &[0.5, 0.5]).expect("begin"),
+            "native prefix should activate when experts support native bit stepping"
+        );
+
+        // Drive full 8-bit sequence (per MixtureBitPrefixState expected_bit_idx contract
+        // and finish_adaptive validation at 733) to exercise the "observe without prior
+        // prob_one" priming path on every step, then finish. This satisfies the state
+        // machine while preserving the original test intent (priming on observe-only
+        // updates + final log-likelihood distinction). Single-observe + immediate finish
+        // violated the sequential contract (now enforced post-mock fix).
+        let symbol: u8 = 0xFF; // all-1s so high-p1 (0.9) expert has higher final likelihood than low-p1 (0.1) after 8 steps (preserves original distinction intent)
+        for bit_idx in 0..8 {
+            let bit = (symbol & (1u8 << (7 - bit_idx))) != 0;
+            bitwise
+                .observe(&mut experts, bit_idx, bit)
+                .expect("observe without prior prob_one");
+            if bit_idx == 0 {
+                assert!(
+                    (bitwise.likelihoods[0] - 0.9).abs() < 1e-12,
+                    "high-prob expert likelihood should use freshly primed p1"
+                );
+                assert!(
+                    (bitwise.likelihoods[1] - 0.1).abs() < 1e-12,
+                    "low-prob expert likelihood should use freshly primed p1"
+                );
+                assert!(
+                    bitwise.primed_bit_idx.is_none(),
+                    "observe should clear priming for the next bit"
+                );
+            }
+        }
+
+        bitwise
+            .finish_adaptive(&mut experts, symbol)
+            .expect("finish adaptive");
+        assert!(
+            bitwise.logps[0] > bitwise.logps[1],
+            "log-likelihoods should distinguish disagreeing experts after observe-only updates"
+        );
+    }
+
+    #[test]
+    fn mixture_bit_prefix_requires_monotone_bit_indices() {
+        let configs = [ExpertConfig::ctw("left", 4), ExpertConfig::ctw("right", 5)];
+        let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
+        let mut bitwise = MixtureBitPrefixState::default();
+        assert!(bitwise.begin(&mut experts, &[0.5, 0.5]).expect("begin"));
+
+        let err = bitwise
+            .prob_one(&mut experts, 1)
+            .expect_err("bit 1 cannot be queried before bit 0 is observed");
+        assert!(err.contains("expected 0"));
+
+        bitwise
+            .observe(&mut experts, 0, true)
+            .expect("observe bit 0");
+        let err = bitwise
+            .observe(&mut experts, 0, false)
+            .expect_err("duplicate observe must be rejected");
+        assert!(err.contains("expected 1"));
+
+        let err = bitwise
+            .prob_one(&mut experts, 8)
+            .expect_err("bit index 8 must be rejected");
+        assert!(err.contains("out of range"));
+    }
+
+    #[test]
+    fn mixture_bit_prefix_skips_native_mode_without_checkpoint_support() {
+        let begin_calls = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::clone(&begin_calls);
+        let configs = [ExpertConfig::uniform("native", move || {
+            Box::new(NativeWithoutCheckpointPredict {
+                begin_calls: Arc::clone(&shared),
+            })
+        })];
+        let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
+        let mut bitwise = MixtureBitPrefixState::default();
+
+        assert!(
+            !bitwise.begin(&mut experts, &[1.0]).expect("begin"),
+            "native prefix should be disabled when rollback checkpoints are unavailable"
+        );
+        assert_eq!(
+            begin_calls.load(Ordering::Relaxed),
+            0,
+            "unsupported native experts must not be entered speculatively"
+        );
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn ctw_native_prefix_rejects_invalid_bit_indices() {
+        let mut predictor =
+            RateBackendPredictor::from_backend(RateBackend::Ctw { depth: 4 }, DEFAULT_MIN_PROB);
+        assert!(
+            predictor
+                .begin_native_msb_byte_prefix()
+                .expect("begin native prefix"),
+            "ctw byte predictor should support native prefix stepping"
+        );
+
+        let err = predictor
+            .native_msb_prefix_prob_one(8)
+            .expect_err("bit index 8 must be rejected");
+        assert!(err.contains("out of range"));
+
+        let err = predictor
+            .observe_native_msb_prefix_bit(1, true)
+            .expect_err("bit 1 cannot be observed before bit 0");
+        assert!(err.contains("expected 0"));
+
+        predictor
+            .native_msb_prefix_prob_one(0)
+            .expect("query bit 0");
+        predictor
+            .observe_native_msb_prefix_bit(0, true)
+            .expect("observe bit 0");
+        let err = predictor
+            .finish_native_msb_byte_prefix(0b1000_0000)
+            .expect_err("finish must require a complete byte");
+        assert!(err.contains("requires 8 observed bits"));
     }
 
     #[test]
@@ -3428,6 +6756,69 @@ mod tests {
     }
 
     #[test]
+    fn mixture_begin_fresh_stream_resets_wrapper_state_to_priors() {
+        let configs = vec![weighted_cfg("a", 0.7, 0.9), weighted_cfg("b", 0.3, 0.2)];
+        let prior = [0.7_f64, 0.3_f64];
+
+        let mut bayes = BayesMixture::new(&configs);
+        let _ = bayes.step(0);
+        assert!(bayes.posterior()[0] > prior[0]);
+        bayes.begin_fresh_stream(Some(1)).expect("bayes fresh");
+        assert_weights_close(&bayes.posterior(), &prior, "bayes posterior");
+        assert_expert_losses_reset(&bayes.experts, "bayes");
+        assert_eq!(bayes.total_log_loss(), 0.0);
+
+        let mut fading = FadingBayesMixture::new(&configs, 0.8);
+        let _ = fading.step(0);
+        assert!(fading.posterior()[0] > prior[0]);
+        fading.begin_fresh_stream(Some(1)).expect("fading fresh");
+        assert_weights_close(&fading.posterior(), &prior, "fading posterior");
+        assert_expert_losses_reset(&fading.experts, "fading");
+        assert_eq!(fading.total_log_loss(), 0.0);
+
+        let mut switching = SwitchingMixture::new(&configs, 0.15, MixtureScheduleMode::Default);
+        let _ = switching.step(0);
+        assert!(switching.posterior()[0] > prior[0]);
+        switching
+            .begin_fresh_stream(Some(1))
+            .expect("switching fresh");
+        assert_weights_close(&switching.posterior(), &prior, "switching posterior");
+        assert_expert_losses_reset(&switching.experts, "switching");
+        assert_eq!(switching.update_count, 0);
+        assert_eq!(switching.total_log_loss(), 0.0);
+
+        let mut convex = ConvexMixture::new(&configs, 0.2, MixtureScheduleMode::Default);
+        let _ = convex.step(0);
+        assert!(convex.lambda[0] > prior[0]);
+        convex.begin_fresh_stream(Some(1)).expect("convex fresh");
+        assert_weights_close(&convex.lambda, &prior, "convex lambda");
+        assert_expert_losses_reset(&convex.experts, "convex");
+        assert_eq!(convex.update_count, 0);
+        assert_eq!(convex.total_log_loss, 0.0);
+
+        let mut mdl = MdlSelector::new(&configs);
+        let _ = mdl.step(0);
+        assert!(mdl.experts.iter().any(|expert| expert.cum_log_loss > 0.0));
+        mdl.begin_fresh_stream(Some(1)).expect("mdl fresh");
+        assert_expert_losses_reset(&mdl.experts, "mdl");
+        assert_eq!(mdl.best_index(), 0);
+        assert_eq!(mdl.total_log_loss(), 0.0);
+
+        let mut neural = NeuralMixture::new(&configs, 0.05);
+        let mut fresh_neural = NeuralMixture::new(&configs, 0.05);
+        let _ = neural.step(0);
+        neural.begin_fresh_stream(Some(1)).expect("neural fresh");
+        let reset_logp = neural.predict_log_prob(0);
+        let fresh_logp = fresh_neural.predict_log_prob(0);
+        assert!(
+            (reset_logp - fresh_logp).abs() < 1e-12,
+            "neural wrapper state should match a fresh wrapper after restart"
+        );
+        assert_expert_losses_reset(&neural.experts, "neural");
+        assert_eq!(neural.total_log_loss(), 0.0);
+    }
+
+    #[test]
     fn mdl_predict_then_step_reuses_best_expert_log_prob() {
         let c0 = Arc::new(AtomicUsize::new(0));
         let c1 = Arc::new(AtomicUsize::new(0));
@@ -3526,6 +6917,101 @@ mod tests {
         }
 
         fn update(&mut self, _symbol: u8) {}
+    }
+
+    #[derive(Clone)]
+    struct StatePreservingFreshPredict {
+        learned: usize,
+        began: bool,
+    }
+
+    impl OnlineBytePredictor for StatePreservingFreshPredict {
+        fn begin_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.began = true;
+            Ok(())
+        }
+
+        fn reset_frozen(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.began = true;
+            Ok(())
+        }
+
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            if self.began && self.learned > 0 && symbol == b'K' {
+                0.0
+            } else {
+                -12.0
+            }
+        }
+
+        fn update(&mut self, symbol: u8) {
+            if symbol == b'K' {
+                self.learned += 1;
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingNonResettableFreshPredict {
+        learned: usize,
+        begin_calls: Arc<AtomicUsize>,
+    }
+
+    impl OnlineBytePredictor for FailingNonResettableFreshPredict {
+        fn supports_frozen_reset(&self) -> bool {
+            false
+        }
+
+        fn begin_stream(&mut self, total_symbols: Option<u64>) -> Result<(), String> {
+            self.begin_calls.fetch_add(1, Ordering::Relaxed);
+            total_symbols
+                .map(|_| ())
+                .ok_or_else(|| "missing total symbols".to_string())
+        }
+
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            if self.learned > 0 && symbol == b'Q' {
+                0.0
+            } else {
+                -15.0
+            }
+        }
+
+        fn update(&mut self, symbol: u8) {
+            if symbol == b'Q' {
+                self.learned += 1;
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ResettingNonResettableFreshPredict {
+        learned: usize,
+    }
+
+    impl OnlineBytePredictor for ResettingNonResettableFreshPredict {
+        fn supports_frozen_reset(&self) -> bool {
+            false
+        }
+
+        fn begin_stream(&mut self, _total_symbols: Option<u64>) -> Result<(), String> {
+            self.learned = 0;
+            Ok(())
+        }
+
+        fn log_prob(&mut self, symbol: u8) -> f64 {
+            if self.learned > 0 && symbol == b'R' {
+                0.0
+            } else {
+                -15.0
+            }
+        }
+
+        fn update(&mut self, symbol: u8) {
+            if symbol == b'R' {
+                self.learned += 1;
+            }
+        }
     }
 
     fn assert_log_prob_update_matches_separate(label: &str, backend: RateBackend) {
@@ -3643,6 +7129,7 @@ mod tests {
                 base_depth: 6,
                 num_percept_bits: 8,
                 encoding_bits: 8,
+                msb_first: None,
             },
         );
     }
@@ -3877,6 +7364,266 @@ mod tests {
     }
 
     #[test]
+    fn runtime_begin_fresh_stream_preserves_resettable_expert_state() {
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let cfg = {
+            let build_calls = build_calls.clone();
+            ExpertConfig::uniform("state-preserving", move || {
+                build_calls.fetch_add(1, Ordering::Relaxed);
+                Box::new(StatePreservingFreshPredict {
+                    learned: 0,
+                    began: false,
+                })
+            })
+        };
+
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![crate::MixtureExpertSpec {
+                name: Some("state-preserving".to_string()),
+                log_prior: 0.0,
+                backend: RateBackend::Ctw { depth: 1 },
+            }],
+        );
+        let mut runtime = build_mixture_runtime(&spec, &[cfg]).expect("runtime");
+        runtime.begin_stream(Some(1)).expect("begin stream");
+        let _ = runtime.step(b'K');
+
+        runtime
+            .begin_fresh_stream(Some(1))
+            .expect("fresh stream restart");
+
+        assert_eq!(
+            build_calls.load(Ordering::Relaxed),
+            1,
+            "resettable experts must not be rebuilt for fresh stream restarts"
+        );
+        let logp = runtime.peek_log_prob(b'K');
+        assert!(
+            logp > -1.0,
+            "fresh stream restart should preserve fitted expert state; logp={logp}"
+        );
+    }
+
+    #[test]
+    fn runtime_begin_fresh_stream_failure_preserves_existing_expert() {
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let begin_calls = Arc::new(AtomicUsize::new(0));
+        let cfg = {
+            let build_calls = build_calls.clone();
+            let begin_calls = begin_calls.clone();
+            ExpertConfig::uniform("non-resettable", move || {
+                build_calls.fetch_add(1, Ordering::Relaxed);
+                Box::new(FailingNonResettableFreshPredict {
+                    learned: 0,
+                    begin_calls: begin_calls.clone(),
+                })
+            })
+        };
+
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![crate::MixtureExpertSpec {
+                name: Some("non-resettable".to_string()),
+                log_prior: 0.0,
+                backend: RateBackend::Ctw { depth: 1 },
+            }],
+        );
+        let mut runtime = build_mixture_runtime(&spec, &[cfg]).expect("runtime");
+        runtime.begin_stream(Some(1)).expect("begin stream");
+        let _ = runtime.step(b'Q');
+
+        let err = runtime
+            .begin_fresh_stream(None)
+            .expect_err("fresh stream restart should report the expert begin_stream failure");
+
+        assert!(err.contains("missing total symbols"));
+        assert_eq!(
+            build_calls.load(Ordering::Relaxed),
+            1,
+            "failed fresh stream restarts must not rebuild or discard the old expert"
+        );
+        assert_eq!(begin_calls.load(Ordering::Relaxed), 2);
+        let logp = runtime.peek_log_prob(b'Q');
+        assert!(
+            logp > -1.0,
+            "old expert should remain usable after failed fresh restart; logp={logp}"
+        );
+    }
+
+    #[test]
+    fn runtime_begin_fresh_stream_failure_is_transactional_across_experts() {
+        let failing_begin_calls = Arc::new(AtomicUsize::new(0));
+        let resettable_cfg = ExpertConfig::uniform("resetting", || {
+            Box::new(ResettingNonResettableFreshPredict { learned: 0 })
+        });
+        let failing_cfg = {
+            let failing_begin_calls = failing_begin_calls.clone();
+            ExpertConfig::uniform("failing", move || {
+                Box::new(FailingNonResettableFreshPredict {
+                    learned: 0,
+                    begin_calls: failing_begin_calls.clone(),
+                })
+            })
+        };
+
+        let spec = MixtureSpec::new(
+            MixtureKind::Bayes,
+            vec![
+                crate::MixtureExpertSpec {
+                    name: Some("resetting".to_string()),
+                    log_prior: 0.0,
+                    backend: RateBackend::Ctw { depth: 1 },
+                },
+                crate::MixtureExpertSpec {
+                    name: Some("failing".to_string()),
+                    log_prior: 0.0,
+                    backend: RateBackend::Ctw { depth: 1 },
+                },
+            ],
+        );
+        let mut runtime =
+            build_mixture_runtime(&spec, &[resettable_cfg, failing_cfg]).expect("runtime");
+        runtime.begin_stream(Some(1)).expect("begin stream");
+        let _ = runtime.step(b'R');
+        let logp_before = runtime.peek_log_prob(b'R');
+        assert!(
+            logp_before > -1.0,
+            "resetting expert should have learned prior to restart; logp={logp_before}"
+        );
+
+        let err = runtime
+            .begin_fresh_stream(None)
+            .expect_err("second expert should fail begin_fresh_stream");
+        assert!(err.contains("missing total symbols"));
+        assert_eq!(
+            failing_begin_calls.load(Ordering::Relaxed),
+            2,
+            "failing expert begin should run once at initial begin and once at failed restart"
+        );
+
+        let logp_after = runtime.peek_log_prob(b'R');
+        assert!(
+            logp_after > -1.0,
+            "failed fresh restart must restore earlier experts instead of leaving partial mutation; logp={logp_after}"
+        );
+    }
+
+    fn ctw_checkpoint_depth(predictor: &RateBackendPredictor) -> usize {
+        match predictor {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                checkpoint_depth, ..
+            } => *checkpoint_depth,
+            _ => panic!("expected ctw predictor"),
+        }
+    }
+
+    fn predictor_log_probs(predictor: &mut RateBackendPredictor) -> [f64; 256] {
+        let mut row = [0.0f64; 256];
+        predictor.fill_log_probs(&mut row);
+        row
+    }
+
+    fn assert_log_prob_rows_close(actual: &[f64; 256], expected: &[f64; 256], label: &str) {
+        for (symbol, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "{label}[{symbol}]: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_reset_rejects_active_ctw_prediction_checkpoint() {
+        let mut predictor =
+            RateBackendPredictor::from_backend(RateBackend::Ctw { depth: 4 }, DEFAULT_MIN_PROB);
+        for &symbol in b"abracadabra ctw checkpoint guard" {
+            predictor.update(symbol);
+        }
+        let mut baseline = predictor.clone();
+        let checkpoint = predictor.checkpoint();
+
+        let err = predictor
+            .begin_fresh_stream(Some(0))
+            .expect_err("ctw lifecycle reset must reject active compact prediction checkpoints");
+
+        assert!(err.contains("prediction checkpoints"));
+        assert_eq!(ctw_checkpoint_depth(&predictor), 1);
+        let expected = predictor_log_probs(&mut baseline);
+        let actual = predictor_log_probs(&mut predictor);
+        assert_log_prob_rows_close(&actual, &expected, "ctw active-checkpoint lifecycle reject");
+        predictor.discard_checkpoint(checkpoint);
+    }
+
+    #[test]
+    fn ctw_lifecycle_with_active_prefix_uses_full_clone() {
+        let mut predictor =
+            RateBackendPredictor::from_backend(RateBackend::Ctw { depth: 4 }, DEFAULT_MIN_PROB);
+        assert!(
+            predictor
+                .begin_native_msb_byte_prefix()
+                .expect("begin native prefix")
+        );
+        predictor
+            .observe_native_msb_prefix_bit(0, true)
+            .expect("observe one prefix bit");
+
+        let checkpoint =
+            predictor.lifecycle_checkpoint(OnlineBytePredictorLifecycleOp::FinishStream);
+
+        assert!(
+            matches!(checkpoint, RateBackendPredictorLifecycleCheckpoint::Full(_)),
+            "active native prefix with observed bits must not use compact lifecycle rollback"
+        );
+    }
+
+    #[test]
+    fn nested_mixture_lifecycle_failure_restores_wrapper_state() {
+        let inner_cfgs = vec![
+            weighted_cfg("zero-heavy", 1.0, 0.90),
+            weighted_cfg("zero-light", 1.0, 0.10),
+        ];
+        let mut inner = MixtureRuntime::Bayes(BayesMixture::new(&inner_cfgs));
+        inner.begin_stream(Some(1)).expect("inner begin");
+        let _ = inner.step(0);
+        let before = inner.peek_log_prob(0);
+
+        let failing_begin_calls = Arc::new(AtomicUsize::new(0));
+        let mut experts = vec![
+            ExpertState {
+                name: "nested".to_string(),
+                log_weight: 0.0,
+                log_prior: 0.0,
+                predictor: ExpertPredictor::rate_backend(RateBackendPredictor::Mixture {
+                    runtime: inner,
+                }),
+                cum_log_loss: 0.0,
+            },
+            ExpertState {
+                name: "failing".to_string(),
+                log_weight: 0.0,
+                log_prior: 0.0,
+                predictor: ExpertPredictor::generic(Box::new(FailingNonResettableFreshPredict {
+                    learned: 0,
+                    begin_calls: failing_begin_calls.clone(),
+                })),
+                cum_log_loss: 0.0,
+            },
+        ];
+
+        let err = begin_expert_fresh_stream(&mut experts, None)
+            .expect_err("outer lifecycle should fail on second expert");
+
+        assert!(err.contains("missing total symbols"));
+        let after = experts[0].log_prob(0);
+        assert!(
+            (after - before).abs() < 1e-12,
+            "nested mixture wrapper state should be restored: before={before}, after={after}"
+        );
+    }
+
+    #[test]
     fn zpaq_fill_log_probs_does_not_drift_history() {
         let backend = RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
@@ -3980,8 +7727,20 @@ mod tests {
                 base_depth: 7,
                 num_percept_bits: 6,
                 encoding_bits: 6,
+                msb_first: None,
             },
             b"fac-ctw checkpoint base history",
+        );
+    }
+
+    #[test]
+    fn ppmd_checkpoint_restores_mixed_learned_and_frozen_updates() {
+        assert_checkpoint_roundtrip_restores_predictor(
+            RateBackend::Ppmd {
+                order: 8,
+                memory_mb: 8,
+            },
+            b"ppmd checkpoint base history",
         );
     }
 
@@ -4027,6 +7786,7 @@ mod tests {
             base_depth: 7,
             num_percept_bits: 8,
             encoding_bits: 8,
+            msb_first: None,
         });
     }
 
@@ -4253,5 +8013,55 @@ mod tests {
         runtime.fill_log_probs(&mut row);
         let mass: f64 = row.iter().map(|lp| lp.exp()).sum();
         assert!((mass - 1.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn binary_token_mixture_builder_preserves_ctw_family_identity() {
+        let ctw_backend = RateBackend::Ctw { depth: 4 }
+            .compile()
+            .expect("compiled ctw backend");
+        let mixture_backend = RateBackend::Mixture {
+            spec: Arc::new(MixtureSpec::new(
+                MixtureKind::Bayes,
+                vec![crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })],
+            )),
+        }
+        .compile()
+        .expect("compiled mixture backend");
+
+        let mut direct = crate::runtime::build_rate_backend_binary_token_predictor(
+            &ctw_backend,
+            DEFAULT_MIN_PROB,
+        )
+        .expect("direct ctw bit predictor");
+        let mut mixture = crate::runtime::build_rate_backend_binary_token_predictor(
+            &mixture_backend,
+            DEFAULT_MIN_PROB,
+        )
+        .expect("mixture bit predictor");
+
+        direct.begin_stream(Some(9)).expect("begin direct stream");
+        mixture.begin_stream(Some(9)).expect("begin mixture stream");
+
+        for bit in [true, false, true, true, false, false, true, false, true] {
+            let direct_p0 = direct.log_prob(0);
+            let direct_p1 = direct.log_prob(1);
+            let mixture_p0 = mixture.log_prob(0);
+            let mixture_p1 = mixture.log_prob(1);
+            assert!((direct_p0 - mixture_p0).abs() < 1e-12);
+            assert!((direct_p1 - mixture_p1).abs() < 1e-12);
+
+            direct.update(u8::from(bit));
+            mixture.update(u8::from(bit));
+        }
+    }
+
+    #[test]
+    fn rate_backend_predictor_checkpoint_enum_stays_compact() {
+        let checkpoint_size: usize = std::mem::size_of::<RateBackendPredictorCheckpoint>();
+        assert!(
+            checkpoint_size < 128,
+            "RateBackendPredictorCheckpoint must stay pointer-sized after boxing Full; got {checkpoint_size}B"
+        );
     }
 }

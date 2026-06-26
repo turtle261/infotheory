@@ -253,13 +253,61 @@ impl FullTrainSettings {
     }
 }
 
-#[derive(Clone)]
 struct FullTbpttRuntime {
     pending_input_token: Option<u32>,
-    pending_input_pre_state: Option<State>,
-    segment_start_state: Option<State>,
+    pending_input_pre_state: State,
+    pending_input_pre_state_valid: bool,
+    segment_start_state: State,
+    segment_start_state_valid: bool,
     steps: Vec<(u32, u8)>,
     settings: Option<FullTrainSettings>,
+    replay_workspace: Option<rwkv7::TbpttReplayWorkspace>,
+}
+
+impl Clone for FullTbpttRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            pending_input_token: self.pending_input_token,
+            pending_input_pre_state: self.pending_input_pre_state.clone(),
+            pending_input_pre_state_valid: self.pending_input_pre_state_valid,
+            segment_start_state: self.segment_start_state.clone(),
+            segment_start_state_valid: self.segment_start_state_valid,
+            steps: self.steps.clone(),
+            settings: self.settings,
+            replay_workspace: None,
+        }
+    }
+}
+
+impl FullTbpttRuntime {
+    fn new(model_cfg: &rwkv7::Config) -> Self {
+        Self {
+            pending_input_token: None,
+            pending_input_pre_state: State::new(model_cfg),
+            pending_input_pre_state_valid: false,
+            segment_start_state: State::new(model_cfg),
+            segment_start_state_valid: false,
+            steps: Vec::new(),
+            settings: None,
+            replay_workspace: None,
+        }
+    }
+
+    fn clear_segment_buffers(&mut self) {
+        self.pending_input_token = None;
+        self.pending_input_pre_state_valid = false;
+        self.segment_start_state_valid = false;
+        self.steps.clear();
+        self.settings = None;
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending_input_token.is_none()
+            && !self.pending_input_pre_state_valid
+            && !self.segment_start_state_valid
+            && self.steps.is_empty()
+            && self.settings.is_none()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -283,9 +331,10 @@ impl OnlineRuntime {
         cfg: OnlineConfig,
         canonical_method: String,
         policy: Option<LlmPolicy>,
-        vocab_size: usize,
-        hidden_size: usize,
+        model_cfg: &rwkv7::Config,
     ) -> Self {
+        let vocab_size = model_cfg.vocab_size;
+        let hidden_size = model_cfg.hidden_size;
         let mut use_adam = matches!(cfg.train_mode, OnlineTrainMode::Adam);
         if let Some(pol) = &policy {
             use_adam = policy_uses_adam(pol) || use_adam;
@@ -310,40 +359,64 @@ impl OnlineRuntime {
             lm_head_adam_m: use_adam.then(|| vec![0.0; vocab_size * hidden_size]),
             lm_head_adam_v: use_adam.then(|| vec![0.0; vocab_size * hidden_size]),
             adam_t: 0,
-            full_tbptt: needs_full_trace.then(|| FullTbpttRuntime {
-                pending_input_token: None,
-                pending_input_pre_state: None,
-                segment_start_state: None,
-                steps: Vec::new(),
-                settings: None,
-            }),
+            full_tbptt: needs_full_trace.then(|| FullTbpttRuntime::new(model_cfg)),
         }
     }
 
-    fn prepare_policy_stream(&mut self, total_symbols: Option<u64>) -> Result<()> {
-        self.policy_stream_total = total_symbols;
-        self.policy_train_steps = 0;
-        if let Some(tbptt) = self.full_tbptt.as_mut() {
-            // Preserve the current predictive edge so the first symbol of the
-            // new stream still trains against the already-primed distribution.
-            tbptt.segment_start_state = None;
-            tbptt.steps.clear();
-            tbptt.settings = None;
+    fn ensure_full_tbptt_runtime(&mut self, model_cfg: &rwkv7::Config) {
+        if self.needs_full_trace && self.full_tbptt.is_none() {
+            self.full_tbptt = Some(FullTbpttRuntime::new(model_cfg));
         }
-        self.policy_runtime = match &self.policy {
+    }
+
+    fn has_future_non_head_train_in_current_stream(&self) -> bool {
+        let Some(runtime) = self.policy_runtime.as_ref() else {
+            return self.needs_full_trace;
+        };
+        runtime.has_future_train_matching(|train| {
+            train.hyper.lr > 0.0 && scope_needs_full_trace(&train.scope)
+        })
+    }
+
+    fn maybe_release_dead_full_tbptt(&mut self) {
+        let should_release = self.full_tbptt.as_ref().is_some_and(|tbptt| {
+            tbptt.is_idle() && !self.has_future_non_head_train_in_current_stream()
+        });
+        if should_release {
+            self.full_tbptt = None;
+        }
+    }
+
+    fn prepare_policy_stream(
+        &mut self,
+        model_cfg: &rwkv7::Config,
+        total_symbols: Option<u64>,
+    ) -> Result<()> {
+        let policy_runtime = match &self.policy {
             Some(p) => Some(PolicyRuntime::new(p.compile(total_symbols)?)),
             None => None,
         };
+        self.policy_stream_total = total_symbols;
+        self.policy_train_steps = 0;
+        self.ensure_full_tbptt_runtime(model_cfg);
+        if let Some(tbptt) = self.full_tbptt.as_mut() {
+            // Preserve the current predictive edge so the first symbol of the
+            // new stream still trains against the already-primed distribution.
+            tbptt.segment_start_state_valid = false;
+            tbptt.steps.clear();
+            tbptt.settings = None;
+        }
+        self.policy_runtime = policy_runtime;
         Ok(())
     }
 
     #[inline]
-    fn next_policy_action(&mut self) -> Result<Option<PolicyAction>> {
+    fn next_policy_action(&mut self, model_cfg: &rwkv7::Config) -> Result<Option<PolicyAction>> {
         if self.policy.is_none() {
             return Ok(None);
         }
         if self.policy_runtime.is_none() {
-            self.prepare_policy_stream(None)?;
+            self.prepare_policy_stream(model_cfg, None)?;
         }
         Ok(self.policy_runtime.as_mut().map(PolicyRuntime::next_action))
     }
@@ -366,7 +439,7 @@ impl OnlineRuntime {
         }
         let stride = train.hyper.stride.max(1) as u64;
         let next_train_step = self.policy_train_steps.saturating_add(1);
-        stride <= 1 || (next_train_step % stride) == 0
+        stride <= 1 || next_train_step.is_multiple_of(stride)
     }
 }
 
@@ -1011,14 +1084,12 @@ impl Compressor {
                 let mut c = Self::new(path)?;
                 if let Some(policy) = policy.as_ref() {
                     let canonical_method = canonical_method_string(spec)?;
-                    let hidden = c.model.config().hidden_size;
                     let mut online = c.online.take().unwrap_or_else(|| {
                         OnlineRuntime::new(
                             OnlineConfig::default(),
                             canonical_method.clone(),
                             Some(policy.clone()),
-                            VOCAB_SIZE,
-                            hidden,
+                            c.model.config(),
                         )
                     });
                     online.canonical_method = canonical_method;
@@ -1030,7 +1101,9 @@ impl Compressor {
                         .unwrap_or(false);
                     c.online = Some(online);
                     c.scratch.set_capture_train_trace(
-                        c.online.as_ref().is_some_and(|o| o.needs_full_trace),
+                        c.online
+                            .as_ref()
+                            .is_some_and(OnlineRuntime::should_capture_full_trace_for_next_step),
                     );
                 }
                 Ok(c)
@@ -1067,11 +1140,13 @@ impl Compressor {
                     cfg.clone(),
                     canonical_method,
                     policy.clone(),
-                    VOCAB_SIZE,
-                    c.model.config().hidden_size,
+                    c.model.config(),
                 ));
-                c.scratch
-                    .set_capture_train_trace(c.online.as_ref().is_some_and(|o| o.needs_full_trace));
+                c.scratch.set_capture_train_trace(
+                    c.online
+                        .as_ref()
+                        .is_some_and(OnlineRuntime::should_capture_full_trace_for_next_step),
+                );
                 Ok(c)
             }
         }
@@ -1088,7 +1163,7 @@ impl Compressor {
 
     fn prepare_policy_stream(&mut self, total_symbols: Option<u64>) -> Result<()> {
         if let Some(online) = self.online.as_mut() {
-            online.prepare_policy_stream(total_symbols)?;
+            online.prepare_policy_stream(self.model.config(), total_symbols)?;
         }
         Ok(())
     }
@@ -1106,52 +1181,57 @@ impl Compressor {
         if let Some(online) = self.online.as_mut()
             && let Some(tbptt) = online.full_tbptt.as_mut()
         {
-            tbptt.pending_input_token = None;
-            tbptt.pending_input_pre_state = None;
-            tbptt.segment_start_state = None;
-            tbptt.steps.clear();
-            tbptt.settings = None;
+            tbptt.clear_segment_buffers();
         }
     }
 
     fn forward_with_online_record(&mut self, token: u32) {
-        if let Some(online) = self.online.as_mut()
-            && online.should_capture_full_trace_for_next_step()
-            && let Some(tbptt) = online.full_tbptt.as_mut()
-        {
-            tbptt.pending_input_token = Some(token);
-            tbptt.pending_input_pre_state = Some(self.state.clone());
+        let mut capture_full_trace = false;
+        if let Some(online) = self.online.as_mut() {
+            capture_full_trace = online.should_capture_full_trace_for_next_step();
+            if capture_full_trace && let Some(tbptt) = online.full_tbptt.as_mut() {
+                tbptt.pending_input_token = Some(token);
+                tbptt.pending_input_pre_state.copy_from(&self.state);
+                tbptt.pending_input_pre_state_valid = true;
+            }
         }
+        self.scratch.set_capture_train_trace(capture_full_trace);
         let _ = self
             .model
             .forward(&mut self.scratch, token, &mut self.state);
     }
 
     fn flush_full_tbptt_segment(&mut self) -> Result<()> {
-        let extracted = {
-            match self.online.as_mut() {
-                Some(online) => match online.full_tbptt.as_mut() {
-                    Some(tbptt) if !tbptt.steps.is_empty() => {
-                        let settings = tbptt.settings.ok_or_else(|| {
-                            anyhow::anyhow!("rwkv full tbptt settings are missing")
-                        })?;
-                        let start_state = tbptt.segment_start_state.take().ok_or_else(|| {
-                            anyhow::anyhow!("rwkv full tbptt segment start is missing")
-                        })?;
-                        let steps = std::mem::take(&mut tbptt.steps);
-                        tbptt.settings = None;
-                        let need_full_adam = matches!(settings.optimizer, OptimizerKind::Adam)
-                            && settings.scope.trains_non_head_params()
-                            && online.full_adam.is_none();
-                        Some((settings, start_state, steps, need_full_adam))
-                    }
-                    _ => None,
-                },
-                None => None,
+        {
+            let Some(online) = self.online.as_mut() else {
+                return Ok(());
+            };
+            let has_steps = online
+                .full_tbptt
+                .as_ref()
+                .is_some_and(|tbptt| !tbptt.steps.is_empty());
+            if !has_steps {
+                online.maybe_release_dead_full_tbptt();
+                return Ok(());
             }
-        };
-        let Some((settings, start_state, steps, need_full_adam)) = extracted else {
-            return Ok(());
+        }
+
+        let need_full_adam = {
+            let Some(online) = self.online.as_ref() else {
+                return Ok(());
+            };
+            let Some(tbptt) = online.full_tbptt.as_ref() else {
+                return Ok(());
+            };
+            let settings = tbptt
+                .settings
+                .ok_or_else(|| anyhow::anyhow!("rwkv full tbptt settings are missing"))?;
+            if !tbptt.segment_start_state_valid {
+                bail!("rwkv full tbptt segment start is missing");
+            }
+            matches!(settings.optimizer, OptimizerKind::Adam)
+                && settings.scope.trains_non_head_params()
+                && online.full_adam.is_none()
         };
 
         if need_full_adam {
@@ -1165,41 +1245,63 @@ impl Compressor {
         let Some(online) = self.online.as_mut() else {
             return Ok(());
         };
-        let mut reusable_steps = steps;
+        let Some(tbptt) = online.full_tbptt.as_mut() else {
+            return Ok(());
+        };
+        let settings = tbptt
+            .settings
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("rwkv full tbptt settings are missing"))?;
+        if !tbptt.segment_start_state_valid {
+            bail!("rwkv full tbptt segment start is missing");
+        }
+        let OnlineRuntime {
+            adam_t,
+            full_adam,
+            out_bias,
+            adam_m,
+            adam_v,
+            ..
+        } = online;
+        let replay_workspace = tbptt
+            .replay_workspace
+            .get_or_insert_with(|| rwkv7::TbpttReplayWorkspace::new(model));
         model.online_train_segment_tbptt(
             &mut self.scratch,
-            &start_state,
-            &reusable_steps,
+            replay_workspace,
+            &tbptt.segment_start_state,
+            &tbptt.steps,
             settings.scope,
             settings.optimizer,
             settings.lr,
             settings.clip,
             TBPTT_REPLAY_CHUNK,
-            &mut online.adam_t,
-            online.full_adam.as_mut(),
+            adam_t,
+            full_adam.as_mut(),
             if settings.scope.bias {
-                Some(online.out_bias.as_mut_slice())
+                Some(out_bias.as_mut_slice())
             } else {
                 None
             },
             if settings.scope.bias {
-                online.adam_m.as_deref_mut()
+                adam_m.as_deref_mut()
             } else {
                 None
             },
             if settings.scope.bias {
-                online.adam_v.as_deref_mut()
+                adam_v.as_deref_mut()
             } else {
                 None
             },
             &mut self.state,
         )?;
-        reusable_steps.clear();
-        if let Some(tbptt) = online.full_tbptt.as_mut() {
-            tbptt.steps = reusable_steps;
-        }
+        tbptt.steps.clear();
+        tbptt.segment_start_state_valid = false;
         let bias = self.online.as_ref().map(|o| o.out_bias.as_slice());
         Self::logits_to_pdf(self.scratch.logits(), bias, &mut self.pdf_buffer);
+        if let Some(online) = self.online.as_mut() {
+            online.maybe_release_dead_full_tbptt();
+        }
         Ok(())
     }
 
@@ -1239,13 +1341,16 @@ impl Compressor {
             let Some(input_token) = tbptt.pending_input_token.take() else {
                 return Ok(());
             };
-            let input_pre_state = tbptt
-                .pending_input_pre_state
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("rwkv full tbptt pending pre-state is missing"))?;
-            if tbptt.steps.is_empty() {
-                tbptt.segment_start_state = Some(input_pre_state);
+            if !tbptt.pending_input_pre_state_valid {
+                bail!("rwkv full tbptt pending pre-state is missing");
             }
+            if tbptt.steps.is_empty() {
+                tbptt
+                    .segment_start_state
+                    .copy_from(&tbptt.pending_input_pre_state);
+                tbptt.segment_start_state_valid = true;
+            }
+            tbptt.pending_input_pre_state_valid = false;
             tbptt.settings = Some(settings);
             tbptt.steps.push((input_token, target_symbol));
             tbptt.steps.len() >= settings.bptt.max(1)
@@ -1455,6 +1560,7 @@ impl Compressor {
     }
 
     fn resolve_online_train_action(
+        model_cfg: &rwkv7::Config,
         online: &mut OnlineRuntime,
     ) -> Result<(OptimizerKind, f32, u64, rwkv7::TrainScopeMask, usize, f32)> {
         let mut optimizer = match online.cfg.train_mode {
@@ -1471,7 +1577,7 @@ impl Compressor {
         let mut bptt = 1usize;
         let mut clip = 0.0f32;
 
-        if let Some(action) = online.next_policy_action()? {
+        if let Some(action) = online.next_policy_action(model_cfg)? {
             match action {
                 PolicyAction::Infer => {
                     scope = rwkv7::TrainScopeMask::default();
@@ -1483,6 +1589,9 @@ impl Compressor {
                     bptt = train.hyper.bptt.max(1);
                     clip = train.hyper.clip.max(0.0);
                     scope = scope_from_train_action(&train);
+                    if scope.trains_non_head_params() {
+                        online.ensure_full_tbptt_runtime(model_cfg);
+                    }
                 }
             }
         }
@@ -1510,7 +1619,7 @@ impl Compressor {
             };
             online.tokens_processed = online.tokens_processed.saturating_add(1);
             let (optimizer, lr, stride, scope, bptt, clip) =
-                Self::resolve_online_train_action(online)?;
+                Self::resolve_online_train_action(self.model.config(), online)?;
             let mut stride_hit = false;
             if scope.trains_any_params() {
                 online.policy_train_steps = online.policy_train_steps.saturating_add(1);
@@ -1525,7 +1634,10 @@ impl Compressor {
                 && let Some(tbptt) = online.full_tbptt.as_mut()
             {
                 tbptt.pending_input_token = None;
-                tbptt.pending_input_pre_state = None;
+                tbptt.pending_input_pre_state_valid = false;
+            }
+            if let Some(online) = self.online.as_mut() {
+                online.maybe_release_dead_full_tbptt();
             }
             return Ok(());
         }
@@ -1551,7 +1663,7 @@ impl Compressor {
             };
             if let Some(tbptt) = online.full_tbptt.as_mut() {
                 tbptt.pending_input_token = None;
-                tbptt.pending_input_pre_state = None;
+                tbptt.pending_input_pre_state_valid = false;
             }
             let model = Arc::make_mut(&mut self.model);
             apply_online_lm_head_update(
@@ -1566,6 +1678,9 @@ impl Compressor {
                 scope.bias,
                 clip,
             );
+            if let Some(online) = self.online.as_mut() {
+                online.maybe_release_dead_full_tbptt();
+            }
             return Ok(());
         }
 
@@ -1768,13 +1883,7 @@ impl Compressor {
                 lm_head_adam_m: parse_vec_f32("lm_head_adam_m"),
                 lm_head_adam_v: parse_vec_f32("lm_head_adam_v"),
                 adam_t: v.get("adam_t").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-                full_tbptt: needs_full_trace.then(|| FullTbpttRuntime {
-                    pending_input_token: None,
-                    pending_input_pre_state: None,
-                    segment_start_state: None,
-                    steps: Vec::new(),
-                    settings: None,
-                }),
+                full_tbptt: needs_full_trace.then(|| FullTbpttRuntime::new(self.model.config())),
             });
             let opt_sidecar = optimizer_sidecar_path(model_path);
             if opt_sidecar.exists() {
@@ -1792,14 +1901,17 @@ impl Compressor {
                 && online.policy.is_some()
             {
                 let train_steps = online.policy_train_steps;
-                online.prepare_policy_stream(online.policy_stream_total)?;
+                online.prepare_policy_stream(self.model.config(), online.policy_stream_total)?;
                 online.policy_train_steps = train_steps;
                 if let Some(rt) = online.policy_runtime.as_mut() {
                     rt.set_cursor(cursor);
                 }
             }
-            self.scratch
-                .set_capture_train_trace(self.online.as_ref().is_some_and(|o| o.needs_full_trace));
+            self.scratch.set_capture_train_trace(
+                self.online
+                    .as_ref()
+                    .is_some_and(OnlineRuntime::should_capture_full_trace_for_next_step),
+            );
         }
         Ok(())
     }
@@ -2639,6 +2751,63 @@ mod tests {
         );
         std::fs::remove_file(&before_path).ok();
         std::fs::remove_file(&after_path).ok();
+    }
+
+    #[test]
+    fn test_online_infer_tail_releases_full_tbptt_runtime() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=37,train=adam,lr=0.0008,stride=1;policy:schedule=0..2:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=2,clip=0,momentum=0.9)|2..100:infer";
+        let mut c = Compressor::new_from_method(method).unwrap();
+        c.reset_and_prime();
+        let score = c.cross_entropy_from_current(b"abcdef").unwrap();
+        assert!(score.is_finite());
+        assert!(
+            c.online
+                .as_ref()
+                .and_then(|online| online.full_tbptt.as_ref())
+                .is_none(),
+            "expected full tbptt runtime to be released once the stream tail is pure inference"
+        );
+    }
+
+    #[test]
+    fn test_online_policy_restart_recreates_full_tbptt_after_release() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=39,train=adam,lr=0.0008,stride=1;policy:schedule=0..2:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=2,clip=0,momentum=0.9)|2..100:infer";
+        let mut c = Compressor::new_from_method(method).unwrap();
+        c.reset_and_prime();
+        let score = c.cross_entropy_from_current(b"abcdef").unwrap();
+        assert!(score.is_finite());
+        assert!(
+            c.online
+                .as_ref()
+                .and_then(|online| online.full_tbptt.as_ref())
+                .is_none()
+        );
+
+        c.restart_online_policy_stream(Some(6)).unwrap();
+
+        assert!(
+            c.online
+                .as_ref()
+                .and_then(|online| online.full_tbptt.as_ref())
+                .is_some(),
+            "expected a fresh policy stream to recreate the full tbptt runtime"
+        );
+    }
+
+    #[test]
+    fn test_head_only_tail_releases_full_tbptt_runtime() {
+        let method = "cfg:hidden=64,layers=1,intermediate=64,decay_rank=8,a_rank=8,v_rank=8,g_rank=8,seed=41,train=adam,lr=0.0008,stride=1;policy:schedule=0..2:train(scope=all,opt=adam,lr=0.0008,stride=1,bptt=2,clip=0,momentum=0.9)|2..100:train(scope=head+bias,opt=adam,lr=0.0008,stride=1,bptt=1,clip=0,momentum=0.9)";
+        let mut c = Compressor::new_from_method(method).unwrap();
+        c.reset_and_prime();
+        let score = c.cross_entropy_from_current(b"abcdef").unwrap();
+        assert!(score.is_finite());
+        assert!(
+            c.online
+                .as_ref()
+                .and_then(|online| online.full_tbptt.as_ref())
+                .is_none(),
+            "expected full tbptt runtime to be released once only head-only updates remain"
+        );
     }
 
     #[test]

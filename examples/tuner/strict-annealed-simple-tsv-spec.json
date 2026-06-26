@@ -1,28 +1,17 @@
 {
-  "schema_version": 1,
   "kind": "tune",
-  "assets": [
-    {
-      "id": "dataset",
-      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
-    }
-  ],
-  "input_asset": "dataset",
-  "baseline_candidate": {
-    "kind": "rate-ac",
-    "rate_backend": {
-      "kind": "ctw",
-      "depth": 12
-    },
-    "framing": "framed"
-  },
   "controller": {
-    "kind": "annealed_hill_climbing",
-    "max_mutation_radius": 2
+    "max_mutation_radius": 2,
+    "kind": "annealed_hill_climbing"
   },
+  "eval_time_limit_seconds": 2,
+  "time_budget_seconds": 180,
   "bounds": {
+    "min_experts": 1,
+    "allow_duplicate_experts": false,
+    "required_experts": [],
+    "forbidden_expert_pairs": [],
     "allowed_backends": [
-      "ctw",
       "fac-ctw",
       "mixture",
       "calibrated"
@@ -30,23 +19,35 @@
     "forbidden_backends": [],
     "parameter_ranges": [
       {
-        "parameter": "rate_backend.depth",
-        "min": 4.0,
-        "max": 28.0
+        "parameter": "rate_backend.base_depth",
+        "max": 28,
+        "min": 4
       }
     ],
     "max_experts": 4,
-    "max_mixture_nesting_depth": 2,
-    "min_experts": 1,
-    "allow_duplicate_experts": false,
-    "required_experts": [],
-    "forbidden_expert_pairs": []
+    "max_mixture_nesting_depth": 2
   },
-  "eval_time_limit_seconds": 2.0,
-  "time_budget_seconds": 180.0,
-  "min_throughput_bytes_per_second": 1.0,
-  "max_memory_bytes": 1099511627776,
+  "schema_version": 1,
   "output_config_path": "strict-annealed-simple-tsv-output.json",
+  "assets": [
+    {
+      "id": "dataset",
+      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
+    }
+  ],
   "seed": 17,
-  "report_path": "strict-annealed-simple-tsv-report.json"
+  "report_path": "strict-annealed-simple-tsv-report.json",
+  "max_memory_bytes": 1099511627776,
+  "input_asset": "dataset",
+  "baseline_candidate": {
+    "rate_backend": {
+      "base_depth": 12,
+      "kind": "fac-ctw",
+      "num_percept_bits": 8,
+      "encoding_bits": 8
+    },
+    "kind": "rate-ac",
+    "framing": "framed"
+  },
+  "min_throughput_bytes_per_second": 1
 }

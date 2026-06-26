@@ -293,6 +293,184 @@ impl CompiledPolicy {
         }
         PolicyAction::Infer
     }
+
+    /// Returns whether any position at or after `cursor` can emit a matching train action.
+    pub fn has_future_train_matching_from(
+        &self,
+        cursor: u64,
+        mut predicate: impl FnMut(&TrainAction) -> bool,
+    ) -> bool {
+        fn active_range(rule: &CompiledScheduleRule) -> (u64, u64) {
+            match rule {
+                CompiledScheduleRule::Interval { start, end, .. }
+                | CompiledScheduleRule::Repeat { start, end, .. } => (*start, *end),
+            }
+        }
+
+        fn action_matches_train(
+            action: &PolicyAction,
+            predicate: &mut impl FnMut(&TrainAction) -> bool,
+        ) -> bool {
+            match action {
+                PolicyAction::Infer => false,
+                PolicyAction::Train(train) => predicate(train),
+            }
+        }
+
+        fn interval_uncovered_or_next(
+            start: u64,
+            end: u64,
+            prior_rules: &[CompiledScheduleRule],
+        ) -> Result<(), u64> {
+            if start >= end {
+                return Err(end);
+            }
+            let mut probe = start;
+            while probe < end {
+                let mut next_probe = probe;
+                for rule in prior_rules {
+                    let (rule_start, rule_end) = active_range(rule);
+                    if rule_start <= probe && probe < rule_end {
+                        next_probe = next_probe.max(rule_end.min(end));
+                    }
+                }
+                if next_probe == probe {
+                    return Ok(());
+                }
+                probe = next_probe;
+            }
+            Err(probe)
+        }
+
+        fn interval_has_uncovered_position(
+            start: u64,
+            end: u64,
+            prior_rules: &[CompiledScheduleRule],
+        ) -> bool {
+            interval_uncovered_or_next(start, end, prior_rules).is_ok()
+        }
+
+        fn next_repeat_segment_interval(
+            start: u64,
+            end: u64,
+            period: u64,
+            seg_start: u64,
+            seg_end: u64,
+            from: u64,
+        ) -> Option<(u64, u64)> {
+            if period == 0 {
+                return None;
+            }
+            let seg_end = seg_end.min(period);
+            if seg_start >= seg_end {
+                return None;
+            }
+            let from = from.max(start);
+            if from >= end {
+                return None;
+            }
+            let rel = from - start;
+            let mut cycle_idx = rel / period;
+            loop {
+                let cycle_base = start.saturating_add(cycle_idx.saturating_mul(period));
+                if cycle_base >= end {
+                    return None;
+                }
+                let interval_start = cycle_base.saturating_add(seg_start).max(from);
+                let interval_end = cycle_base.saturating_add(seg_end).min(end);
+                if interval_start < interval_end {
+                    return Some((interval_start, interval_end));
+                }
+                cycle_idx = cycle_idx.saturating_add(1);
+            }
+        }
+
+        fn repeat_rule_has_future_matching_train(
+            start: u64,
+            end: u64,
+            period: u64,
+            pattern: &[CompiledPatternSegment],
+            cursor: u64,
+            prior_rules: &[CompiledScheduleRule],
+            predicate: &mut impl FnMut(&TrainAction) -> bool,
+        ) -> bool {
+            if period == 0 {
+                return false;
+            }
+            let active_start = cursor.max(start);
+            if active_start >= end {
+                return false;
+            }
+            let mut seg_start = 0u64;
+            for seg in pattern {
+                let seg_end = seg.end.min(period);
+                if seg_start >= seg_end {
+                    seg_start = seg.end;
+                    continue;
+                }
+                if action_matches_train(&seg.action, predicate) {
+                    let mut search_from = active_start;
+                    while let Some((candidate_start, candidate_end)) = next_repeat_segment_interval(
+                        start,
+                        end,
+                        period,
+                        seg_start,
+                        seg_end,
+                        search_from,
+                    ) {
+                        match interval_uncovered_or_next(
+                            candidate_start,
+                            candidate_end,
+                            prior_rules,
+                        ) {
+                            Ok(()) => return true,
+                            Err(next) if next > search_from => search_from = next,
+                            Err(_) => search_from = candidate_end,
+                        }
+                    }
+                }
+                seg_start = seg.end;
+            }
+            false
+        }
+
+        for (idx, rule) in self.rules.iter().enumerate() {
+            let prior_rules = &self.rules[..idx];
+            match rule {
+                CompiledScheduleRule::Interval { start, end, action }
+                    if cursor < *end && cursor.max(*start) < *end =>
+                {
+                    let candidate_start = cursor.max(*start);
+                    if action_matches_train(action, &mut predicate)
+                        && interval_has_uncovered_position(candidate_start, *end, prior_rules)
+                    {
+                        return true;
+                    }
+                }
+                CompiledScheduleRule::Repeat {
+                    start,
+                    end,
+                    period,
+                    pattern_total: _,
+                    pattern,
+                } => {
+                    if repeat_rule_has_future_matching_train(
+                        *start,
+                        *end,
+                        *period,
+                        pattern,
+                        cursor,
+                        prior_rules,
+                        &mut predicate,
+                    ) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +513,13 @@ impl PolicyRuntime {
         let action = self.compiled.action_at(self.cursor);
         self.cursor = self.cursor.saturating_add(1);
         action
+    }
+
+    #[inline]
+    /// Returns whether any future cursor position can emit a matching train action.
+    pub fn has_future_train_matching(&self, predicate: impl FnMut(&TrainAction) -> bool) -> bool {
+        self.compiled
+            .has_future_train_matching_from(self.cursor, predicate)
     }
 }
 
@@ -994,6 +1179,61 @@ mod tests {
         assert!(matches!(c.action_at(0), PolicyAction::Train(_)));
         assert!(matches!(c.action_at(3), PolicyAction::Infer));
         assert!(matches!(c.action_at(10), PolicyAction::Train(_)));
+    }
+
+    #[test]
+    fn policy_runtime_future_train_matching_interval_respects_cursor() {
+        let p = parse_policy_segment(
+            "schedule=0..5:infer|5..10:train(scope=attn,opt=adam,lr=0.1,stride=1,bptt=2,clip=0,momentum=0.9)|10..20:infer",
+            RWKV_SCOPES,
+        )
+        .expect("policy");
+        let compiled = p.compile(Some(20)).expect("compile");
+        let mut runtime = PolicyRuntime::new(compiled);
+        assert!(runtime.has_future_train_matching(|train| train.scope.contains("attn")));
+        runtime.set_cursor(10);
+        assert!(!runtime.has_future_train_matching(|train| train.scope.contains("attn")));
+    }
+
+    #[test]
+    fn policy_runtime_future_train_matching_repeat_respects_remaining_cycles() {
+        let p = parse_policy_segment(
+            "schedule=repeat(0..30,period=10,pattern=2:train(scope=attn,opt=adam,lr=0.1,stride=1,bptt=2,clip=0,momentum=0.9)+8:infer)",
+            RWKV_SCOPES,
+        )
+        .expect("repeat policy");
+        let compiled = p.compile(Some(30)).expect("compile");
+        let mut runtime = PolicyRuntime::new(compiled);
+        runtime.set_cursor(9);
+        assert!(runtime.has_future_train_matching(|train| train.scope.contains("attn")));
+        runtime.set_cursor(29);
+        assert!(!runtime.has_future_train_matching(|train| train.scope.contains("attn")));
+    }
+
+    #[test]
+    fn policy_runtime_future_train_matching_respects_shadowed_interval_precedence() {
+        let p = parse_policy_segment(
+            "schedule=0..100:infer|10..20:train(scope=attn,opt=adam,lr=0.1,stride=1,bptt=2,clip=0,momentum=0.9)",
+            RWKV_SCOPES,
+        )
+        .expect("policy");
+        let compiled = p.compile(Some(100)).expect("compile");
+        let runtime = PolicyRuntime::new(compiled);
+        assert!(matches!(runtime.peek_action(), PolicyAction::Infer));
+        assert!(!runtime.has_future_train_matching(|train| train.scope.contains("attn")));
+    }
+
+    #[test]
+    fn policy_runtime_future_train_matching_respects_shadowed_repeat_precedence() {
+        let p = parse_policy_segment(
+            "schedule=repeat(0..100,period=10,pattern=10:infer)|10..20:train(scope=attn,opt=adam,lr=0.1,stride=1,bptt=2,clip=0,momentum=0.9)",
+            RWKV_SCOPES,
+        )
+        .expect("policy");
+        let compiled = p.compile(Some(100)).expect("compile");
+        let runtime = PolicyRuntime::new(compiled);
+        assert!(matches!(runtime.peek_action(), PolicyAction::Infer));
+        assert!(!runtime.has_future_train_matching(|train| train.scope.contains("attn")));
     }
 
     #[test]

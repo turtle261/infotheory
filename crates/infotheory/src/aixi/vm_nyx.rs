@@ -27,7 +27,7 @@ use crate::api::{
     try_entropy_rate_backend,
 };
 #[cfg(feature = "backend-ctw")]
-use crate::backends::ctw::{ContextTree, FacContextTree};
+use crate::backends::ctw::{ContextTree, FacContextTree, ctw_symbol_bit_msb};
 #[cfg(feature = "backend-rosa")]
 use crate::backends::rosaplus::RosaPlus;
 #[cfg(feature = "backend-zpaq")]
@@ -1184,6 +1184,7 @@ enum TraceModel {
     FacCtw {
         tree: FacContextTree,
         bits_per_symbol: usize,
+        msb_first: bool,
     },
     #[cfg(feature = "backend-mamba")]
     Mamba {
@@ -1247,14 +1248,16 @@ impl TraceModel {
                     base_depth,
                     num_percept_bits: _,
                     encoding_bits,
+                    msb_first,
                 } = backend.plan()
                 else {
                     unreachable!("trace-model strategy mismatch for fac-ctw");
                 };
-                let bits_per_symbol = (*encoding_bits).clamp(1, 8);
+                let bits_per_symbol = *encoding_bits;
                 Ok(TraceModel::FacCtw {
                     tree: FacContextTree::new(*base_depth, bits_per_symbol),
                     bits_per_symbol,
+                    msb_first: *msb_first,
                 })
             }
             #[cfg(feature = "backend-zpaq")]
@@ -1367,11 +1370,17 @@ impl TraceModel {
             TraceModel::FacCtw {
                 tree,
                 bits_per_symbol,
+                msb_first,
             } => {
                 let log_before = tree.get_log_block_probability();
                 for &b in data {
                     for i in 0..*bits_per_symbol {
-                        tree.update(((b >> i) & 1) == 1, i);
+                        let bit = if *msb_first {
+                            ctw_symbol_bit_msb(b, *bits_per_symbol, i)
+                        } else {
+                            ((b >> i) & 1) == 1
+                        };
+                        tree.update(bit, i);
                     }
                 }
                 let log_after = tree.get_log_block_probability();
@@ -3016,5 +3025,416 @@ mod tests {
                 "bits_after_reset={bits_after_reset}"
             );
         }
+    }
+
+    /// Scores `data` against an existing [`FacContextTree`] using the same
+    /// bit-extraction logic as `TraceModel::FacCtw::update_and_score`, then
+    /// returns the surprise in bits (negative log-prob delta / ln 2).
+    ///
+    /// The tree is mutated (updated) exactly as `update_and_score` would do,
+    /// so callers can chain multiple calls on the same tree to simulate
+    /// the VM's incremental scoring pattern.
+    #[cfg(feature = "backend-ctw")]
+    fn fac_ctw_oracle_score_on_tree(
+        tree: &mut crate::backends::ctw::FacContextTree,
+        bits_per_symbol: usize,
+        msb_first: bool,
+        data: &[u8],
+    ) -> f64 {
+        use crate::backends::ctw::ctw_symbol_bit_msb;
+        let log_before = tree.get_log_block_probability();
+        for &b in data {
+            for i in 0..bits_per_symbol {
+                let bit = if msb_first {
+                    ctw_symbol_bit_msb(b, bits_per_symbol, i)
+                } else {
+                    ((b >> i) & 1) == 1
+                };
+                tree.update(bit, i);
+            }
+        }
+        let log_after = tree.get_log_block_probability();
+        -(log_after - log_before) / std::f64::consts::LN_2
+    }
+
+    /// Computes the expected `update_and_score` result by driving a *fresh*
+    /// [`FacContextTree`] directly with the same bit-extraction logic used
+    /// inside `TraceModel::FacCtw::update_and_score`.
+    ///
+    /// This is the single-shot reference oracle used by parity tests.
+    /// For incremental (multi-chunk) scenarios use [`fac_ctw_oracle_score_on_tree`]
+    /// with a persistent tree.
+    #[cfg(feature = "backend-ctw")]
+    fn fac_ctw_oracle_score(
+        base_depth: usize,
+        bits_per_symbol: usize,
+        msb_first: bool,
+        data: &[u8],
+    ) -> f64 {
+        use crate::backends::ctw::FacContextTree;
+        let mut tree = FacContextTree::new(base_depth, bits_per_symbol);
+        fac_ctw_oracle_score_on_tree(&mut tree, bits_per_symbol, msb_first, data)
+    }
+
+    /// Asserts that `TraceModel::FacCtw` with the given parameters scores
+    /// `data` identically (bit-exact `f64`) to the reference oracle, and that
+    /// `reset()` restores the model so a second pass yields the same score.
+    #[cfg(feature = "backend-ctw")]
+    fn assert_fac_ctw_trace_parity(
+        base_depth: usize,
+        encoding_bits: usize,
+        msb_first: Option<bool>,
+        data: &[u8],
+    ) {
+        // The plan resolves msb_first via `unwrap_or(encoding_bits == 8)`.
+        let resolved_msb_first = msb_first.unwrap_or(encoding_bits == 8);
+
+        let backend = RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits: encoding_bits,
+            encoding_bits,
+            msb_first,
+        };
+        let compiled = backend
+            .compile()
+            .expect("FacCtw backend should compile cleanly");
+
+        let mut model =
+            TraceModel::new(&compiled).expect("TraceModel::FacCtw should initialize without error");
+
+        // ── First pass: trace model vs. oracle ─────────────────────────────
+        let trace_bits = model.update_and_score(data);
+        let oracle_bits = fac_ctw_oracle_score(base_depth, encoding_bits, resolved_msb_first, data);
+
+        assert!(
+            trace_bits.is_finite() && trace_bits >= 0.0,
+            "trace model bits must be finite and non-negative; got {trace_bits} \
+             (base_depth={base_depth}, encoding_bits={encoding_bits}, msb_first={msb_first:?})"
+        );
+        assert_eq!(
+            trace_bits.to_bits(),
+            oracle_bits.to_bits(),
+            "TraceModel::FacCtw score must match FacContextTree oracle exactly \
+             (base_depth={base_depth}, encoding_bits={encoding_bits}, msb_first={msb_first:?}); \
+             trace={trace_bits}, oracle={oracle_bits}"
+        );
+
+        // ── Reset then second pass: scores must be identical to first pass ──
+        // This catches msb_first / bits_per_symbol state not being properly
+        // preserved across reset(), or the tree not being fully cleared.
+        model
+            .reset()
+            .expect("TraceModel::FacCtw reset should succeed");
+        let trace_bits_after_reset = model.update_and_score(data);
+
+        assert_eq!(
+            trace_bits_after_reset.to_bits(),
+            oracle_bits.to_bits(),
+            "TraceModel::FacCtw score after reset must equal the fresh-model score \
+             (base_depth={base_depth}, encoding_bits={encoding_bits}, msb_first={msb_first:?}); \
+             after_reset={trace_bits_after_reset}, expected={oracle_bits}"
+        );
+    }
+
+    /// Regression test: `TraceModel::FacCtw` with 8-bit symbols and MSB-first
+    /// ordering must use `ctw_symbol_bit_msb` to decompose each byte, not
+    /// the legacy LSB path.  This is the primary regression target for the
+    /// branch that wired `msb_first=true` and `raw encoding_bits` into the
+    /// trace model.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_msb_first_8bit_parity() {
+        // Use a non-trivial payload with varied bit patterns to exercise the
+        // full 8-bit MSB decomposition path.
+        let data = b"trace-model regression: fac-ctw msb path";
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 6,
+            /*encoding_bits=*/ 8,
+            /*msb_first=*/ Some(true),
+            data,
+        );
+    }
+
+    /// Regression test: `TraceModel::FacCtw` with 8-bit symbols and explicit
+    /// LSB-first ordering must use `(b >> i) & 1`.  Verifies the `msb_first`
+    /// flag is correctly threaded through from the compiled plan into the
+    /// update loop and is distinct from the MSB path above (the scores for the
+    /// same data must differ, proving the two paths are not identical).
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_lsb_first_8bit_parity() {
+        let data = b"trace-model regression: fac-ctw lsb path";
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 6,
+            /*encoding_bits=*/ 8,
+            /*msb_first=*/ Some(false),
+            data,
+        );
+
+        // Sanity: the two orderings must produce distinct scores for non-palindromic
+        // bit patterns, confirming the flag actually controls bit extraction.
+        let oracle_msb = fac_ctw_oracle_score(6, 8, true, data);
+        let oracle_lsb = fac_ctw_oracle_score(6, 8, false, data);
+        assert_ne!(
+            oracle_msb.to_bits(),
+            oracle_lsb.to_bits(),
+            "MSB-first and LSB-first FacCtw must differ on non-palindromic data"
+        );
+    }
+
+    /// Regression test: `TraceModel::FacCtw` with a sub-byte `encoding_bits`
+    /// (4 bits per symbol) and MSB-first ordering, verifying that
+    /// `ctw_symbol_bit_msb` correctly addresses the low-4 bits of each byte.
+    ///
+    /// `num_percept_bits` is kept equal to `encoding_bits` here; see
+    /// [`trace_model_fac_ctw_encoding_bits_drives_width_not_num_percept_bits`]
+    /// for the dedicated guard that `TraceModel` uses `encoding_bits` (not
+    /// `num_percept_bits`) as the per-symbol bit width.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_sub_byte_4bit_msb_parity() {
+        // Bytes whose lower nibble and upper nibble differ, so that LSB vs MSB
+        // ordering produces different bit sequences.
+        let data = &[0xA3u8, 0x5C, 0xF1, 0x7E, 0x29, 0xB4];
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 4,
+            /*encoding_bits=*/ 4,
+            /*msb_first=*/ Some(true),
+            data,
+        );
+    }
+
+    /// Regression test: default `msb_first=None` with 8-bit symbols must
+    /// resolve to MSB-first.  The rule `unwrap_or(encoding_bits == 8)` evaluates
+    /// to `true` for 8-bit symbols; this verifies that the `Option<bool>` →
+    /// `bool` resolution in `compile_rate_plan_fac_ctw` propagates end-to-end
+    /// through `TraceModel::new` into the update loop.
+    ///
+    /// The `assert_fac_ctw_trace_parity` call already exercises the full
+    /// compile → `TraceModel::new` → `update_and_score` path against the oracle
+    /// with the resolved `bool`.  The additional assertion below confirms that
+    /// `None` and `Some(true)` produce bit-identical `TraceModel` scores on the
+    /// same data, ruling out any partial or inverted propagation.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_default_msb_resolution_8bit() {
+        let data = b"default-msb resolution smoke test";
+
+        // None + encoding_bits=8 → resolved msb_first = true.
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 5, /*encoding_bits=*/ 8, /*msb_first=*/ None, data,
+        );
+
+        // Confirm: two TraceModels — one with None, one with Some(true) — must
+        // score the same data identically.  This catches inversions or partial
+        // propagation that assert_fac_ctw_trace_parity (oracle-based) would miss
+        // if the oracle itself used the wrong convention.
+        let backend_none = RateBackend::FacCtw {
+            base_depth: 5,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+            msb_first: None,
+        };
+        let backend_explicit = RateBackend::FacCtw {
+            base_depth: 5,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+            msb_first: Some(true),
+        };
+        let mut model_none =
+            TraceModel::new(&backend_none.compile().expect("fac-ctw None compile"))
+                .expect("TraceModel::new (None)");
+        let mut model_explicit = TraceModel::new(
+            &backend_explicit
+                .compile()
+                .expect("fac-ctw Some(true) compile"),
+        )
+        .expect("TraceModel::new (Some(true))");
+        assert_eq!(
+            model_none.update_and_score(data).to_bits(),
+            model_explicit.update_and_score(data).to_bits(),
+            "msb_first=None with encoding_bits=8 must produce the same score as Some(true)"
+        );
+    }
+
+    /// Regression test: default `msb_first=None` with a sub-byte `encoding_bits`
+    /// (4 bits) must resolve to LSB-first.  The rule `unwrap_or(encoding_bits == 8)`
+    /// evaluates to `false` for any width other than 8; this verifies end-to-end
+    /// propagation for the sub-byte default case.
+    ///
+    /// An additional assertion confirms that `None` and `Some(false)` produce
+    /// bit-identical `TraceModel` scores, ruling out any inversion.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_default_lsb_resolution_4bit() {
+        let data = &[0xA3u8, 0x5C, 0xF1, 0x7E, 0x29, 0xB4];
+
+        // None + encoding_bits=4 → resolved msb_first = false (LSB).
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 4, /*encoding_bits=*/ 4, /*msb_first=*/ None, data,
+        );
+
+        // Confirm: None score == Some(false) score via two TraceModel instances.
+        let backend_none = RateBackend::FacCtw {
+            base_depth: 4,
+            num_percept_bits: 4,
+            encoding_bits: 4,
+            msb_first: None,
+        };
+        let backend_explicit = RateBackend::FacCtw {
+            base_depth: 4,
+            num_percept_bits: 4,
+            encoding_bits: 4,
+            msb_first: Some(false),
+        };
+        let mut model_none =
+            TraceModel::new(&backend_none.compile().expect("fac-ctw None/4-bit compile"))
+                .expect("TraceModel::new (None/4-bit)");
+        let mut model_explicit = TraceModel::new(
+            &backend_explicit
+                .compile()
+                .expect("fac-ctw Some(false)/4-bit compile"),
+        )
+        .expect("TraceModel::new (Some(false)/4-bit)");
+        assert_eq!(
+            model_none.update_and_score(data).to_bits(),
+            model_explicit.update_and_score(data).to_bits(),
+            "msb_first=None with encoding_bits=4 must produce the same score as Some(false)"
+        );
+    }
+
+    /// Regression guard: `TraceModel::FacCtw` must use `encoding_bits` as the
+    /// per-symbol bit width, not `num_percept_bits`.
+    ///
+    /// `TraceModel::new` explicitly patterns `num_percept_bits: _` and assigns
+    /// `bits_per_symbol = *encoding_bits`.  A regression back to `num_percept_bits`
+    /// would cause 4-bit vs 8-bit symbol decomposition, producing a different bit
+    /// count and failing the oracle assertion (oracle is wired to `encoding_bits`).
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_encoding_bits_drives_width_not_num_percept_bits() {
+        // num_percept_bits=8 (AIXI percept cardinality) diverges from
+        // encoding_bits=4 (VM trace / rate-byte symbol width).
+        let data = &[0xA3u8, 0x5C, 0xF1, 0x7E, 0x29, 0xB4];
+        let base_depth: usize = 4;
+        let encoding_bits: usize = 4;
+
+        let backend = RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits: 8, // intentionally differs from encoding_bits
+            encoding_bits,
+            msb_first: Some(true),
+        };
+        let compiled = backend.compile().expect("fac-ctw compile");
+        let mut model = TraceModel::new(&compiled).expect("TraceModel::new");
+
+        let trace_bits = model.update_and_score(data);
+
+        // Oracle uses encoding_bits=4 (as the trace model must).
+        let oracle_4bit = fac_ctw_oracle_score(base_depth, encoding_bits, true, data);
+        assert_eq!(
+            trace_bits.to_bits(),
+            oracle_4bit.to_bits(),
+            "TraceModel must use encoding_bits={encoding_bits} as symbol width, not num_percept_bits=8; \
+             trace={trace_bits}, oracle_4bit={oracle_4bit}"
+        );
+
+        // Confirm the test is meaningful: an oracle with 8-bit width produces a
+        // *different* score, so the assert above would catch a num_percept_bits regression.
+        let oracle_8bit = fac_ctw_oracle_score(base_depth, 8, true, data);
+        assert_ne!(
+            oracle_4bit.to_bits(),
+            oracle_8bit.to_bits(),
+            "4-bit and 8-bit FacCtw oracles must differ on this data (test is non-trivial)"
+        );
+    }
+
+    /// Regression test: `TraceModel::FacCtw` must produce the correct incremental
+    /// surprise when `update_and_score` is called multiple times on the same
+    /// persistent model — the normal VM usage pattern for trace-entropy shaping.
+    ///
+    /// Each call must score only the *new* bytes against the model already updated
+    /// by all prior calls; the oracle maintains a matching persistent
+    /// [`FacContextTree`] using [`fac_ctw_oracle_score_on_tree`].
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_incremental_scoring_parity() {
+        use crate::backends::ctw::FacContextTree;
+
+        let base_depth: usize = 5;
+        let encoding_bits: usize = 8;
+        let msb_first = true;
+
+        let backend = RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits: encoding_bits,
+            encoding_bits,
+            msb_first: Some(msb_first),
+        };
+        let compiled = backend.compile().expect("fac-ctw compile");
+        let mut model = TraceModel::new(&compiled).expect("TraceModel::new");
+
+        // Two distinct chunks sharing context (realistic VM trace pattern).
+        let chunk_a: &[u8] = b"incremental trace chunk A";
+        let chunk_b: &[u8] = b"incremental trace chunk B -- different continuation";
+
+        // ── Trace model: two sequential updates ────────────────────────────
+        let trace_bits_a = model.update_and_score(chunk_a);
+        let trace_bits_b = model.update_and_score(chunk_b);
+
+        // ── Oracle: persistent tree updated through A then B ───────────────
+        let mut oracle_tree = FacContextTree::new(base_depth, encoding_bits);
+        let oracle_bits_a =
+            fac_ctw_oracle_score_on_tree(&mut oracle_tree, encoding_bits, msb_first, chunk_a);
+        let oracle_bits_b =
+            fac_ctw_oracle_score_on_tree(&mut oracle_tree, encoding_bits, msb_first, chunk_b);
+
+        assert_eq!(
+            trace_bits_a.to_bits(),
+            oracle_bits_a.to_bits(),
+            "incremental: first chunk score must match oracle; \
+             trace={trace_bits_a}, oracle={oracle_bits_a}"
+        );
+        assert_eq!(
+            trace_bits_b.to_bits(),
+            oracle_bits_b.to_bits(),
+            "incremental: second chunk score must match oracle after first chunk is consumed; \
+             trace={trace_bits_b}, oracle={oracle_bits_b}"
+        );
+    }
+
+    /// Edge case: `update_and_score` on empty data must return exactly `0.0`
+    /// without mutating the model.  The production guard is the top-level
+    /// `if data.is_empty() { return 0.0; }` in `update_and_score`.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_empty_input_returns_zero() {
+        let backend = RateBackend::FacCtw {
+            base_depth: 4,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+            msb_first: Some(true),
+        };
+        let compiled = backend.compile().expect("fac-ctw compile");
+        let mut model = TraceModel::new(&compiled).expect("TraceModel::new");
+
+        let bits_empty = model.update_and_score(b"");
+        assert_eq!(
+            bits_empty.to_bits(),
+            0.0f64.to_bits(),
+            "empty input must return exactly 0.0"
+        );
+
+        // Confirm the model is unmodified: scoring non-empty data after an empty
+        // call must match a fresh oracle (no phantom state from the empty update).
+        let data = b"post-empty data";
+        let bits_after = model.update_and_score(data);
+        let oracle_bits = fac_ctw_oracle_score(4, 8, true, data);
+        assert_eq!(
+            bits_after.to_bits(),
+            oracle_bits.to_bits(),
+            "model must be unmodified after empty update; \
+             bits_after={bits_after}, oracle={oracle_bits}"
+        );
     }
 }

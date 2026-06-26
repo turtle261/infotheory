@@ -12,7 +12,8 @@ use infotheory::aixi::model::{
     CtwPredictor, Predictor, RateBackendBitPredictor, RateBackendBitPredictorConfig, RosaPredictor,
 };
 use infotheory::api::{
-    MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind, MixtureSpec, RateBackend,
+    BitOrder, BitStreamSemantics, MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind, MixtureSpec,
+    RateBackend,
 };
 use std::sync::Arc;
 use support::aixi_envs::{DeterministicBinaryEnv, SeededCoinFlipEnv};
@@ -99,6 +100,13 @@ fn rosa_update_revert_consistency() {
     test_predictor_revert(Box::new(RosaPredictor::new(8)), "ROSA");
 }
 
+#[test]
+fn default_agent_config_validates() {
+    AgentConfig::default()
+        .validate()
+        .expect("default MC-AIXI config should satisfy its own contract");
+}
+
 fn nested_generic_backend() -> RateBackend {
     let inner = MixtureSpec::new(
         MixtureKind::Bayes,
@@ -167,8 +175,12 @@ fn assert_snapshot_eq(actual: (f64, f64), expected: (f64, f64), label: &str) {
 
 #[test]
 fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
-    let config =
-        RateBackendBitPredictorConfig::compile(nested_generic_backend(), 1e-12).expect("config");
+    let config = RateBackendBitPredictorConfig::compile_with_semantics(
+        nested_generic_backend(),
+        1e-12,
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("config");
     let mut predictor = RateBackendBitPredictor::new(config).expect("valid predictor");
 
     let initial = predictor_snapshot(&mut predictor);
@@ -208,9 +220,12 @@ fn rate_backend_bit_predictor_roundtrips_nested_mixtures() {
 
 #[test]
 fn rate_backend_bit_predictor_roundtrips_sequitur_backend() {
-    let config =
-        RateBackendBitPredictorConfig::compile(RateBackend::Sequitur { context_bytes: 32 }, 1e-12)
-            .expect("config");
+    let config = RateBackendBitPredictorConfig::compile_with_semantics(
+        RateBackend::Sequitur { context_bytes: 32 },
+        1e-12,
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("config");
     let mut predictor = RateBackendBitPredictor::new(config).expect("valid sequitur predictor");
 
     let initial = predictor_snapshot(&mut predictor);
@@ -245,6 +260,108 @@ fn rate_backend_bit_predictor_roundtrips_sequitur_backend() {
         predictor_snapshot(&mut predictor),
         after_frozen,
         "sequitur redo after frozen update",
+    );
+}
+
+#[test]
+fn rate_backend_bit_predictor_respects_custom_min_prob_floor() {
+    let config = RateBackendBitPredictorConfig::compile_with_semantics(
+        RateBackend::Ctw { depth: 8 },
+        0.49,
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("config");
+    let mut predictor = RateBackendBitPredictor::new(config).expect("valid predictor");
+
+    for _ in 0..64 {
+        predictor.update(true);
+    }
+
+    let p1 = predictor.predict_prob(true);
+    let p0 = predictor.predict_prob(false);
+    assert!(
+        (0.49..=0.51).contains(&p1),
+        "custom min_prob floor must clamp P(1); got {p1}"
+    );
+    assert!(
+        (0.49..=0.51).contains(&p0),
+        "custom min_prob floor must clamp P(0); got {p0}"
+    );
+}
+
+#[test]
+fn rate_backend_bit_predictor_bytepacked_ctw_rewinds_adversarial_prefixes() {
+    let config = RateBackendBitPredictorConfig::compile_with_semantics(
+        RateBackend::Ctw { depth: 8 },
+        1e-12,
+        BitStreamSemantics::BytePacked {
+            order: BitOrder::MsbFirst,
+        },
+    )
+    .expect("byte-packed CTW config");
+    let mut predictor = RateBackendBitPredictor::new(config).expect("byte-packed CTW predictor");
+
+    for &bit in &[
+        true, false, true, false, false, true, true, false, false, true, false, true, true, false,
+        false, true,
+    ] {
+        predictor.commit_update(bit);
+    }
+
+    let baseline = predictor_snapshot(&mut predictor);
+
+    for &bit in &[true, false, true, true, false, false, true] {
+        predictor.update_history(bit);
+    }
+    let after_partial_frozen_prefix = predictor_snapshot(&mut predictor);
+    for _ in 0..7 {
+        predictor.pop_history();
+    }
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        baseline,
+        "byte-packed frozen partial-byte rewind",
+    );
+
+    for &bit in &[false, true, false, false, true] {
+        predictor.update(bit);
+    }
+    let after_partial_adaptive_prefix = predictor_snapshot(&mut predictor);
+    for _ in 0..5 {
+        predictor.revert();
+    }
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        baseline,
+        "byte-packed adaptive partial-byte rewind",
+    );
+
+    assert!(
+        (after_partial_frozen_prefix.0 - baseline.0).abs() > 1e-15
+            || (after_partial_frozen_prefix.1 - baseline.1).abs() > 1e-15,
+        "adversarial frozen prefix should affect the prediction before rewind"
+    );
+    assert!(
+        (after_partial_adaptive_prefix.0 - baseline.0).abs() > 1e-15
+            || (after_partial_adaptive_prefix.1 - baseline.1).abs() > 1e-15,
+        "adversarial adaptive prefix should affect the prediction before rewind"
+    );
+
+    predictor.begin_rollback_scope();
+    for &bit in &[true, false, false, true, true, false, true, false] {
+        predictor.update_history(bit);
+    }
+    for &bit in &[false, true, true, false, false, true, false, true] {
+        predictor.update(bit);
+    }
+    assert!(
+        predictor.rollback_scope(),
+        "byte-packed simulation scope should restore through one frozen action byte and one adaptive percept byte",
+    );
+    assert_snapshot_eq(
+        predictor_snapshot(&mut predictor),
+        baseline,
+        "byte-packed scoped planner rollback",
     );
 }
 
@@ -336,6 +453,7 @@ fn agent_action_trace_on_deterministic_env(mut agent: Agent, steps: usize) -> Ve
 fn generic_agent_config(rate_backend: RateBackend) -> AgentConfig {
     let mut cfg = AgentConfig::default();
     cfg.rate_backend = rate_backend;
+    cfg.bit_stream_semantics = infotheory::api::BitStreamSemantics::BinaryTokens;
     cfg.agent_horizon = 5;
     cfg.observation_bits = 1;
     cfg.observation_stream_len = 1;
@@ -399,10 +517,12 @@ fn deeply_nested_bayes_backend(depth: usize) -> RateBackend {
 #[test]
 fn agent_solves_ctw_test_environment() {
     let mut config = AgentConfig::default();
+    config.bit_stream_semantics = infotheory::api::BitStreamSemantics::BinaryTokens;
     config.rate_backend = RateBackend::FacCtw {
         base_depth: 8,
         num_percept_bits: 2,
         encoding_bits: 1,
+        msb_first: None,
     };
     config.agent_horizon = 8;
     config.observation_bits = 1;
@@ -440,10 +560,12 @@ fn agent_solves_ctw_test_environment() {
 #[test]
 fn agent_regret_sublinear_coinflip() {
     let mut config = AgentConfig::default();
+    config.bit_stream_semantics = infotheory::api::BitStreamSemantics::BinaryTokens;
     config.rate_backend = RateBackend::FacCtw {
         base_depth: 4,
         num_percept_bits: 2,
         encoding_bits: 1,
+        msb_first: None,
     };
     config.agent_horizon = 4;
     config.observation_bits = 1;
@@ -481,10 +603,12 @@ fn agent_regret_sublinear_coinflip() {
 #[test]
 fn agent_seeded_policy_is_reproducible_on_deterministic_env() {
     let mut config = AgentConfig::default();
+    config.bit_stream_semantics = infotheory::api::BitStreamSemantics::BinaryTokens;
     config.rate_backend = RateBackend::FacCtw {
         base_depth: 8,
         num_percept_bits: 2,
         encoding_bits: 1,
+        msb_first: None,
     };
     config.agent_horizon = 6;
     config.observation_bits = 1;
@@ -700,6 +824,7 @@ fn agent_solves_deterministic_env_with_generic_fac_ctw_backend() {
         base_depth: 10,
         num_percept_bits: 2,
         encoding_bits: 1,
+        msb_first: None,
     });
     cfg.agent_horizon = 8;
     cfg.num_simulations = 140;
@@ -738,4 +863,195 @@ fn generic_mixture_world_models_are_seed_deterministic() {
             "{label} mixture world model should be deterministic under identical seed and history"
         );
     }
+}
+
+/// Exercises `BitStreamSemantics::BytePacked` with native-capable CTW inside a
+/// real planner/percept loop, proving that byte-packed bit sessions work beyond
+/// the public API surface tests.
+#[test]
+fn agent_bytepacked_ctw_native_planner_integration() {
+    let mut config = AgentConfig::default();
+    // BytePacked (the key new surface under test) with byte-aligned action and
+    // percept segments. The 3-bit observation plus 5-bit reward intentionally
+    // share a single byte, matching the validator's actual segment contract.
+    config.bit_stream_semantics = infotheory::api::BitStreamSemantics::BytePacked {
+        order: infotheory::api::BitOrder::MsbFirst,
+    };
+    // Native-capable Ctw (full MSB byte-prefix support + reversible) — the "native-capable
+    // backend" required by the criteria.
+    config.rate_backend = RateBackend::Ctw { depth: 8 };
+    config.agent_horizon = 4;
+    config.observation_bits = 3;
+    config.observation_stream_len = 1;
+    config.observation_key_mode = infotheory::aixi::common::ObservationKeyMode::FullStream;
+    config.reward_bits = 5;
+    config.agent_actions =
+        ActionAlphabet::try_from_usize(129).expect("test fixture action alphabet must be valid");
+    config.num_simulations = 50; // modest budget that still exercises the planner loop many times; byte-aligned 129-action exploration makes consistent positive reward noisy (see assertion comment)
+    config.exploration_exploitation_ratio = 1.0;
+    config.discount_gamma = 0.95;
+    config.min_reward = 0;
+    config.max_reward = 31;
+    config.reward_offset = 0;
+    config.random_seed = Some(42);
+
+    let cycles = 20; // enough steps to drive multiple percept updates + planner decisions
+    let total_reward = run_agent_env(
+        &mut Agent::new(config.clone()),
+        DeterministicBinaryEnv::new(),
+        cycles,
+    );
+    let total_reward_replay = run_agent_env(
+        &mut Agent::new(config.clone()),
+        DeterministicBinaryEnv::new(),
+        cycles,
+    );
+    let trace_a = agent_action_trace_on_deterministic_env(Agent::new(config.clone()), cycles);
+    let trace_b = agent_action_trace_on_deterministic_env(Agent::new(config), cycles);
+
+    println!(
+        "Agent Total Reward on DeterministicBinaryEnv (BytePacked + native Ctw, {} cycles): {}",
+        cycles, total_reward
+    );
+
+    // Strong contract check: fixed seed + deterministic environment must produce
+    // identical reward and action traces across repeated full planner runs.
+    assert_eq!(
+        total_reward, total_reward_replay,
+        "BytePacked + native Ctw planner reward must be deterministic under identical seed"
+    );
+    assert_eq!(
+        trace_a, trace_b,
+        "BytePacked + native Ctw planner action trace must be deterministic under identical seed"
+    );
+    assert!(
+        total_reward.is_finite(),
+        "BytePacked + native Ctw planner reward must remain finite. Reward: {total_reward}"
+    );
+}
+
+/// Mirrors the native CTW byte-packed planner integration test but with
+/// generic FAC-CTW to cover the byte-packed + FAC-CTW planner path directly.
+#[test]
+fn agent_bytepacked_fac_ctw_planner_integration() {
+    let mut config = AgentConfig::default();
+    config.bit_stream_semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    config.rate_backend = RateBackend::FacCtw {
+        base_depth: 8,
+        // 3-bit observation + 5-bit reward share one percept byte in this setup.
+        num_percept_bits: 8,
+        encoding_bits: 1,
+        msb_first: Some(true),
+    };
+    config.agent_horizon = 4;
+    config.observation_bits = 3;
+    config.observation_stream_len = 1;
+    config.observation_key_mode = ObservationKeyMode::FullStream;
+    config.reward_bits = 5;
+    config.agent_actions =
+        ActionAlphabet::try_from_usize(129).expect("test fixture action alphabet must be valid");
+    config.num_simulations = 60;
+    config.exploration_exploitation_ratio = 1.0;
+    config.discount_gamma = 0.95;
+    config.min_reward = 0;
+    config.max_reward = 31;
+    config.reward_offset = 0;
+    config.random_seed = Some(1337);
+
+    let cycles = 20;
+    let total_reward = run_agent_env(
+        &mut Agent::new(config.clone()),
+        DeterministicBinaryEnv::new(),
+        cycles,
+    );
+    let total_reward_replay = run_agent_env(
+        &mut Agent::new(config.clone()),
+        DeterministicBinaryEnv::new(),
+        cycles,
+    );
+    let trace_a = agent_action_trace_on_deterministic_env(Agent::new(config.clone()), cycles);
+    let trace_b = agent_action_trace_on_deterministic_env(Agent::new(config), cycles);
+
+    assert_eq!(
+        total_reward, total_reward_replay,
+        "BytePacked + FAC-CTW planner reward must be deterministic under identical seed"
+    );
+    assert_eq!(
+        trace_a, trace_b,
+        "BytePacked + FAC-CTW planner action trace must be deterministic under identical seed"
+    );
+    assert!(
+        total_reward.is_finite(),
+        "BytePacked + FAC-CTW planner reward must remain finite. Reward: {total_reward}"
+    );
+}
+
+/// `BitStreamSemantics::BinaryTokens` with canonical 8-bit MSB FacCtw exercises the
+/// planner [`FacCtwPredictor`] fast path (per-bit lanes via `percept_bits`), not the
+/// byte-level `RateBackendPredictor` MSB byte-prefix machinery.
+#[test]
+fn agent_binarytokens_fac_ctw_native_planner_integration() {
+    let compiled = RateBackend::FacCtw {
+        base_depth: 8,
+        num_percept_bits: 8,
+        encoding_bits: 8,
+        msb_first: Some(true),
+    }
+    .compile()
+    .expect("compile fac-ctw backend");
+    let caps = compiled.capabilities();
+    assert!(caps.supports_native_bit_prediction);
+    assert!(caps.supports_reversible_bit_updates);
+
+    let mut config = AgentConfig::default();
+    config.bit_stream_semantics = BitStreamSemantics::BinaryTokens;
+    config.rate_backend = RateBackend::FacCtw {
+        base_depth: 8,
+        num_percept_bits: 8,
+        encoding_bits: 8,
+        msb_first: Some(true),
+    };
+    config.agent_horizon = 4;
+    config.observation_bits = 3;
+    config.observation_stream_len = 1;
+    config.observation_key_mode = ObservationKeyMode::FullStream;
+    config.reward_bits = 5;
+    config.agent_actions =
+        ActionAlphabet::try_from_usize(129).expect("129 actions require one byte of action bits");
+    config.num_simulations = 50;
+    config.exploration_exploitation_ratio = 1.0;
+    config.discount_gamma = 0.95;
+    config.min_reward = 0;
+    config.max_reward = 31;
+    config.reward_offset = 0;
+    config.random_seed = Some(4242);
+
+    let cycles = 20;
+    let total_reward = run_agent_env(
+        &mut Agent::new(config.clone()),
+        DeterministicBinaryEnv::new(),
+        cycles,
+    );
+    let total_reward_replay = run_agent_env(
+        &mut Agent::new(config.clone()),
+        DeterministicBinaryEnv::new(),
+        cycles,
+    );
+    let trace_a = agent_action_trace_on_deterministic_env(Agent::new(config.clone()), cycles);
+    let trace_b = agent_action_trace_on_deterministic_env(Agent::new(config), cycles);
+
+    assert_eq!(
+        total_reward, total_reward_replay,
+        "BinaryTokens + FAC-CTW planner reward must be deterministic under identical seed"
+    );
+    assert_eq!(
+        trace_a, trace_b,
+        "BinaryTokens + FAC-CTW planner action trace must be deterministic under identical seed"
+    );
+    assert!(
+        total_reward.is_finite(),
+        "BinaryTokens + FAC-CTW planner reward must remain finite. Reward: {total_reward}"
+    );
 }

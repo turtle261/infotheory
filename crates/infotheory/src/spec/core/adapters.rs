@@ -84,6 +84,7 @@ pub(crate) fn rate_plan_to_wrapper_fac_ctw(plan: &RateBackendPlan) -> RateBacken
         base_depth,
         num_percept_bits,
         encoding_bits,
+        msb_first,
     } = plan
     else {
         unreachable!("fac-ctw wrapper kernel used with non-fac-ctw plan");
@@ -92,6 +93,7 @@ pub(crate) fn rate_plan_to_wrapper_fac_ctw(plan: &RateBackendPlan) -> RateBacken
         base_depth: *base_depth,
         num_percept_bits: *num_percept_bits,
         encoding_bits: *encoding_bits,
+        msb_first: Some(*msb_first),
     }
 }
 
@@ -115,11 +117,6 @@ pub(crate) fn rate_plan_to_wrapper_mamba(plan: &RateBackendPlan) -> RateBackend 
     }
 }
 
-#[cfg(not(feature = "backend-mamba"))]
-pub(crate) fn rate_plan_to_wrapper_mamba(_plan: &RateBackendPlan) -> RateBackend {
-    unreachable!("mamba wrapper kernel should never be used without backend-mamba")
-}
-
 #[cfg(feature = "backend-rwkv")]
 pub(crate) fn rate_plan_to_wrapper_rwkv7(plan: &RateBackendPlan) -> RateBackend {
     let RateBackendPlan::Rwkv7 { method, .. } = plan else {
@@ -129,11 +126,6 @@ pub(crate) fn rate_plan_to_wrapper_rwkv7(plan: &RateBackendPlan) -> RateBackend 
         method: crate::rwkvzip::parse_method_spec(method)
             .expect("compiled rwkv plan must retain a valid canonical method"),
     }
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn rate_plan_to_wrapper_rwkv7(_plan: &RateBackendPlan) -> RateBackend {
-    unreachable!("rwkv7 wrapper kernel should never be used without backend-rwkv")
 }
 
 pub(crate) fn rate_plan_to_wrapper_mixture(plan: &RateBackendPlan) -> RateBackend {
@@ -223,13 +215,6 @@ pub(crate) fn compression_plan_to_wrapper_rwkv7(
     }
 }
 
-#[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn compression_plan_to_wrapper_rwkv7(
-    _plan: &CompressionBackendPlan,
-) -> CompressionBackend {
-    unreachable!("rwkv7 compression wrapper kernel should never be used without backend-rwkv")
-}
-
 pub(crate) fn compression_plan_to_wrapper_rate(
     plan: &CompressionBackendPlan,
 ) -> CompressionBackend {
@@ -270,108 +255,6 @@ pub(crate) fn rate_plan_contains_zpaq_calibrated(plan: &RateBackendPlan) -> bool
         unreachable!("calibrated zpaq kernel used with non-calibrated plan");
     };
     rate_plan_contains_zpaq(base.as_ref())
-}
-
-pub(crate) fn rate_plan_supports_bit_token_adaptation_true(_plan: &RateBackendPlan) -> bool {
-    true
-}
-
-pub(crate) fn rate_plan_supports_bit_token_adaptation_false(_plan: &RateBackendPlan) -> bool {
-    false
-}
-
-pub(crate) fn rate_plan_supports_bit_token_adaptation_mixture(plan: &RateBackendPlan) -> bool {
-    let RateBackendPlan::Mixture { experts, .. } = plan else {
-        unreachable!("mixture bit-token kernel used with non-mixture plan");
-    };
-    experts
-        .iter()
-        .all(|expert| rate_plan_supports_bit_token_adaptation(expert.backend.as_ref()))
-}
-
-pub(crate) fn rate_plan_supports_bit_token_adaptation_calibrated(plan: &RateBackendPlan) -> bool {
-    let RateBackendPlan::Calibrated { base, .. } = plan else {
-        unreachable!("calibrated bit-token kernel used with non-calibrated plan");
-    };
-    rate_plan_supports_bit_token_adaptation(base.as_ref())
-}
-
-fn rate_plan_supports_bit_token_adaptation(plan: &RateBackendPlan) -> bool {
-    (crate::runtime::rate_backend_kernel(plan.kind()).supports_bit_token_adaptation)(plan)
-}
-
-pub(crate) fn adapt_rate_plan_identity(plan: &RateBackendPlan) -> RateBackendPlan {
-    plan.clone()
-}
-
-pub(crate) fn adapt_rate_plan_ctw(plan: &RateBackendPlan) -> RateBackendPlan {
-    let RateBackendPlan::Ctw { depth } = plan else {
-        unreachable!("ctw bit-token adapter used with non-ctw plan");
-    };
-    RateBackendPlan::FacCtw {
-        base_depth: *depth,
-        num_percept_bits: 1,
-        encoding_bits: 1,
-    }
-}
-
-pub(crate) fn adapt_rate_plan_fac_ctw(plan: &RateBackendPlan) -> RateBackendPlan {
-    let RateBackendPlan::FacCtw { base_depth, .. } = plan else {
-        unreachable!("fac-ctw bit-token adapter used with non-fac-ctw plan");
-    };
-    RateBackendPlan::FacCtw {
-        base_depth: *base_depth,
-        num_percept_bits: 1,
-        encoding_bits: 1,
-    }
-}
-
-pub(crate) fn adapt_rate_plan_mixture(plan: &RateBackendPlan) -> RateBackendPlan {
-    let RateBackendPlan::Mixture {
-        kind,
-        schedule,
-        alpha,
-        decay,
-        experts,
-    } = plan
-    else {
-        unreachable!("mixture bit-token adapter used with non-mixture plan");
-    };
-    RateBackendPlan::Mixture {
-        kind: *kind,
-        schedule: *schedule,
-        alpha: *alpha,
-        decay: *decay,
-        experts: experts
-            .iter()
-            .map(|expert| RateBackendPlanExpert {
-                name: expert.name.clone(),
-                log_prior: expert.log_prior,
-                backend: Arc::new(adapt_rate_plan_for_bit_tokens(expert.backend.as_ref())),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-    }
-}
-
-pub(crate) fn adapt_rate_plan_calibrated(plan: &RateBackendPlan) -> RateBackendPlan {
-    let RateBackendPlan::Calibrated {
-        context,
-        bins,
-        learning_rate,
-        bias_clip,
-        base,
-    } = plan
-    else {
-        unreachable!("calibrated bit-token adapter used with non-calibrated plan");
-    };
-    RateBackendPlan::Calibrated {
-        context: *context,
-        bins: *bins,
-        learning_rate: *learning_rate,
-        bias_clip: *bias_clip,
-        base: Arc::new(adapt_rate_plan_for_bit_tokens(base.as_ref())),
-    }
 }
 
 pub(crate) fn rate_plan_display_label_rosa(plan: &RateBackendPlan) -> String {
@@ -483,12 +366,13 @@ pub(crate) fn rate_plan_display_label_fac_ctw(plan: &RateBackendPlan) -> String 
         base_depth,
         num_percept_bits,
         encoding_bits,
+        msb_first,
     } = plan
     else {
         unreachable!("fac-ctw label kernel used with non-fac-ctw plan");
     };
     format!(
-        "fac-ctw(base_depth={base_depth},num_percept_bits={num_percept_bits},encoding_bits={encoding_bits})"
+        "fac-ctw(base_depth={base_depth},num_percept_bits={num_percept_bits},encoding_bits={encoding_bits},msb_first={msb_first})"
     )
 }
 
@@ -496,12 +380,14 @@ pub(crate) fn rate_plan_default_name_fac_ctw(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::FacCtw {
         base_depth,
         encoding_bits,
+        msb_first,
         ..
     } = plan
     else {
         unreachable!("fac-ctw default-name kernel used with non-fac-ctw plan");
     };
-    format!("fac-ctw(d={base_depth},b={encoding_bits})")
+    let order = if *msb_first { "msb" } else { "lsb" };
+    format!("fac-ctw(d={base_depth},b={encoding_bits},{order})")
 }
 
 pub(crate) fn rate_plan_display_label_zpaq(plan: &RateBackendPlan) -> String {
@@ -526,22 +412,12 @@ pub(crate) fn rate_plan_display_label_mamba(plan: &RateBackendPlan) -> String {
     format!("mamba(method={method})")
 }
 
-#[cfg(not(feature = "backend-mamba"))]
-pub(crate) fn rate_plan_display_label_mamba(_plan: &RateBackendPlan) -> String {
-    unreachable!("mamba label kernel should never be used without backend-mamba")
-}
-
 #[cfg(feature = "backend-mamba")]
 pub(crate) fn rate_plan_default_name_mamba(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Mamba { method, .. } = plan else {
         unreachable!("mamba default-name kernel used with non-mamba plan");
     };
     format!("mamba({method})")
-}
-
-#[cfg(not(feature = "backend-mamba"))]
-pub(crate) fn rate_plan_default_name_mamba(_plan: &RateBackendPlan) -> String {
-    unreachable!("mamba default-name kernel should never be used without backend-mamba")
 }
 
 #[cfg(feature = "backend-rwkv")]
@@ -552,22 +428,12 @@ pub(crate) fn rate_plan_display_label_rwkv7(plan: &RateBackendPlan) -> String {
     format!("rwkv7(method={method})")
 }
 
-#[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn rate_plan_display_label_rwkv7(_plan: &RateBackendPlan) -> String {
-    unreachable!("rwkv7 label kernel should never be used without backend-rwkv")
-}
-
 #[cfg(feature = "backend-rwkv")]
 pub(crate) fn rate_plan_default_name_rwkv7(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Rwkv7 { method, .. } = plan else {
         unreachable!("rwkv7 default-name kernel used with non-rwkv7 plan");
     };
     format!("rwkv7({method})")
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn rate_plan_default_name_rwkv7(_plan: &RateBackendPlan) -> String {
-    unreachable!("rwkv7 default-name kernel should never be used without backend-rwkv")
 }
 
 pub(crate) fn rate_plan_display_label_mixture(plan: &RateBackendPlan) -> String {
@@ -655,11 +521,6 @@ pub(crate) fn compression_plan_display_label_rwkv7(plan: &CompressionBackendPlan
         unreachable!("rwkv7 compression label kernel used with non-rwkv7 plan");
     };
     format!("rwkv7(coder={coder:?},method={method})")
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn compression_plan_display_label_rwkv7(_plan: &CompressionBackendPlan) -> String {
-    unreachable!("rwkv7 compression label kernel should never be used without backend-rwkv")
 }
 
 pub(crate) fn compression_plan_display_label_rate(plan: &CompressionBackendPlan) -> String {
@@ -757,6 +618,7 @@ pub(crate) fn encode_rate_payload_fac_ctw(plan: &RateBackendPlan, out: &mut Vec<
         base_depth,
         num_percept_bits,
         encoding_bits,
+        msb_first,
     } = plan
     else {
         unreachable!("fac-ctw encoder kernel used with non-fac-ctw plan");
@@ -765,6 +627,7 @@ pub(crate) fn encode_rate_payload_fac_ctw(plan: &RateBackendPlan, out: &mut Vec<
     push_usize(out, *base_depth);
     push_usize(out, *num_percept_bits);
     push_usize(out, *encoding_bits);
+    out.push(u8::from(*msb_first));
 }
 
 pub(crate) fn encode_rate_payload_zpaq(plan: &RateBackendPlan, out: &mut Vec<u8>) {
@@ -785,11 +648,6 @@ pub(crate) fn encode_rate_payload_mamba(plan: &RateBackendPlan, out: &mut Vec<u8
     push_asset_ref(out, asset.as_ref());
 }
 
-#[cfg(not(feature = "backend-mamba"))]
-pub(crate) fn encode_rate_payload_mamba(_plan: &RateBackendPlan, _out: &mut Vec<u8>) {
-    unreachable!("mamba encoder kernel should never be used without backend-mamba")
-}
-
 #[cfg(feature = "backend-rwkv")]
 pub(crate) fn encode_rate_payload_rwkv7(plan: &RateBackendPlan, out: &mut Vec<u8>) {
     let RateBackendPlan::Rwkv7 { method, asset, .. } = plan else {
@@ -798,11 +656,6 @@ pub(crate) fn encode_rate_payload_rwkv7(plan: &RateBackendPlan, out: &mut Vec<u8
     out.push(9);
     push_string(out, method);
     push_asset_ref(out, asset.as_ref());
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn encode_rate_payload_rwkv7(_plan: &RateBackendPlan, _out: &mut Vec<u8>) {
-    unreachable!("rwkv7 encoder kernel should never be used without backend-rwkv")
 }
 
 pub(crate) fn encode_rate_payload_mixture(plan: &RateBackendPlan, out: &mut Vec<u8>) {
@@ -880,11 +733,6 @@ pub(crate) fn encode_compression_payload_rwkv7(plan: &CompressionBackendPlan, ou
     push_string(out, method);
     push_asset_ref(out, asset.as_ref());
     out.push(coder_tag(*coder));
-}
-
-#[cfg(not(feature = "backend-rwkv"))]
-pub(crate) fn encode_compression_payload_rwkv7(_plan: &CompressionBackendPlan, _out: &mut Vec<u8>) {
-    unreachable!("rwkv7 compression encoder kernel should never be used without backend-rwkv")
 }
 
 pub(crate) fn encode_compression_payload_rate(plan: &CompressionBackendPlan, out: &mut Vec<u8>) {

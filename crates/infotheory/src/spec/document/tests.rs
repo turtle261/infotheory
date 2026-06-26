@@ -28,6 +28,10 @@ use std::num::NonZeroUsize;
 #[cfg(feature = "all-backends")]
 use std::sync::Arc;
 
+fn default_bit_stream_semantics() -> crate::api::BitStreamSemantics {
+    crate::api::BitStreamSemantics::BinaryTokens
+}
+
 #[cfg(feature = "backend-ctw")]
 fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).expect("test fixture worker count must be non-zero")
@@ -96,6 +100,7 @@ fn sample_planner_run() -> PlannerRunSpec {
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_bit_stream_semantics(),
             discount_gamma: 0.99,
             return_horizon: 2,
             return_bins: 8,
@@ -122,6 +127,7 @@ fn sample_mc_aixi_planner_run(mcts_strategy: MctsStrategy) -> PlannerRunSpec {
     let mut spec = sample_planner_run();
     spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
         predictor: RateBackend::Ctw { depth: 8 },
+        bit_stream_semantics: default_bit_stream_semantics(),
         agent_horizon: 2,
         num_simulations: 4,
         mcts_strategy,
@@ -347,6 +353,36 @@ fn mc_aixi_missing_mcts_strategy_canonicalizes_to_explicit_rho_uct() {
 
 #[cfg(feature = "backend-ctw")]
 #[test]
+fn mc_aixi_missing_bit_stream_semantics_defaults_to_binary_tokens() {
+    let spec = sample_mc_aixi_planner_run(MctsStrategy::RhoUct);
+    let mut value = SpecDocument::PlannerRun(spec)
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    value["controller"]
+        .as_object_mut()
+        .expect("controller object")
+        .remove("bit_stream_semantics");
+
+    let parsed = SpecDocument::parse_json_value(&value, Path::new(".")).expect("parse");
+    let SpecDocument::PlannerRun(parsed_run) = parsed else {
+        panic!("expected planner run document");
+    };
+    let ControllerSpec::McAixi(inner) = &parsed_run.controller else {
+        panic!("expected MC-AIXI controller");
+    };
+    assert_eq!(inner.bit_stream_semantics, default_bit_stream_semantics());
+
+    let canonical = parsed_run
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    assert_eq!(
+        canonical["controller"]["bit_stream_semantics"],
+        serde_json::json!({ "kind": "binary_tokens" })
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
 fn mc_aixi_parallel_uct_binary_roundtrip_preserves_strategy() {
     let spec = sample_mc_aixi_planner_run(MctsStrategy::ParallelUct {
         workers: nz(16),
@@ -411,6 +447,168 @@ fn mc_aixi_parallel_uct_json_roundtrip_preserves_strategy() {
     );
 }
 
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
+fn sample_warmstart_exact_jh_planner_run() -> PlannerRunSpec {
+    PlannerRunSpec {
+        assets: vec![AssetBinding {
+            id: "teacher".to_string(),
+            path: "teacher.json".to_string(),
+        }],
+        environment: EnvironmentSpec::Builtin {
+            builtin: BuiltinEnvironmentSpec::CoinFlip,
+        },
+        interface: PlannerInterfaceSpec {
+            observation_bits: 2,
+            observation_stream_len: 1,
+            observation_key_mode: ObservationKeyMode::FullStream,
+            reward_bits: 2,
+            agent_actions: action_alphabet(2),
+        },
+        controller: ControllerSpec::AiqiWarmstartExactJh(WarmStartExactJhControllerSpec {
+            predictor: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_bit_stream_semantics(),
+            return_horizon: 2,
+            return_bins: 5,
+            label_phase_period: 2,
+            teacher_dataset_asset: "teacher".to_string(),
+            planner_simulations_per_step: 1,
+        }),
+        runtime: PlannerRuntimeSpec {
+            random_seed: Some(11),
+            learn_cycles: Some(4),
+            eval_cycles: Some(2),
+            terminate_lifetime: 6,
+            log_every: 1,
+            perf: false,
+            vm_perf_only: false,
+            explore_epsilon: 0.0,
+            explore_gamma: 1.0,
+        },
+    }
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
+#[test]
+fn warmstart_exact_jh_json_binary_and_compile_roundtrip() {
+    let spec = sample_warmstart_exact_jh_planner_run();
+    let document = SpecDocument::PlannerRun(spec.clone());
+    let expected_value = document
+        .to_canonical_json_value()
+        .expect("canonical json value");
+    let reparsed =
+        SpecDocument::from_binary(&document.to_binary(), Path::new(".")).expect("binary");
+    assert_eq!(
+        reparsed
+            .to_canonical_json_value()
+            .expect("parsed json value"),
+        expected_value
+    );
+
+    let SpecDocument::PlannerRun(parsed_run) =
+        SpecDocument::parse_json_value(&expected_value, Path::new(".")).expect("json parse")
+    else {
+        panic!("expected planner run document");
+    };
+    assert!(matches!(
+        parsed_run.controller,
+        ControllerSpec::AiqiWarmstartExactJh(_)
+    ));
+    let compiled = parsed_run.compile().expect("warmstart compile");
+    assert_eq!(compiled.controller().kind_str(), "aiqi_warmstart_exact_jh");
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
+#[test]
+fn warmstart_exact_jh_parser_rejects_zero_return_horizon_and_bins() {
+    for (field, message) in [
+        ("return_horizon", "return_horizon must be >= 1"),
+        ("return_bins", "return_bins must be >= 1"),
+    ] {
+        let mut spec = sample_warmstart_exact_jh_planner_run();
+        let ControllerSpec::AiqiWarmstartExactJh(inner) = &mut spec.controller else {
+            panic!("expected warmstart controller fixture");
+        };
+        if field == "return_horizon" {
+            inner.return_horizon = 0;
+        } else {
+            inner.return_bins = 0;
+        }
+        let err = match spec.compile() {
+            Ok(_) => panic!("zero {field} must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains(message), "{err}");
+    }
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
+#[test]
+fn warmstart_exact_jh_rejects_non_direct_planner_simulations() {
+    let mut spec = sample_warmstart_exact_jh_planner_run();
+    let ControllerSpec::AiqiWarmstartExactJh(inner) = &mut spec.controller else {
+        panic!("expected warmstart controller fixture");
+    };
+    inner.planner_simulations_per_step = 2;
+    let err = match spec.compile() {
+        Ok(_) => panic!("non-direct planner simulation budget must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("planner_simulations_per_step must be exactly 1"),
+        "{err}"
+    );
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
+#[test]
+fn warmstart_exact_jh_rejects_slack_return_bins() {
+    let mut spec = sample_warmstart_exact_jh_planner_run();
+    let ControllerSpec::AiqiWarmstartExactJh(inner) = &mut spec.controller else {
+        panic!("expected warmstart controller fixture");
+    };
+    inner.return_bins = 6;
+    let err = match spec.compile() {
+        Ok(_) => panic!("slack return bins must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("return_bins must be exactly H * max_reward + 1"),
+        "{err}"
+    );
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
+#[test]
+fn warmstart_exact_jh_rejects_narrow_reward_bits() {
+    let mut spec = sample_warmstart_exact_jh_planner_run();
+    spec.interface.reward_bits = 1;
+    let err = match spec.compile() {
+        Ok(_) => panic!("narrow reward_bits must fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("max_reward=2"), "{err}");
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "aixi"))]
+#[test]
+fn warmstart_exact_jh_rejects_missing_teacher_asset() {
+    let mut spec = sample_warmstart_exact_jh_planner_run();
+    let ControllerSpec::AiqiWarmstartExactJh(inner) = &mut spec.controller else {
+        panic!("expected warmstart controller fixture");
+    };
+    inner.teacher_dataset_asset = "missing".to_string();
+    let err = match spec.compile() {
+        Ok(_) => panic!("missing teacher asset must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("unknown asset id 'missing'"),
+        "{err}"
+    );
+}
+
 #[cfg(feature = "backend-ctw")]
 #[test]
 fn mc_aixi_parallel_uct_parser_rejects_zero_workers_in_canonical_json() {
@@ -440,6 +638,7 @@ fn mc_aixi_parallel_uct_parser_rejects_zero_workers_in_canonical_json() {
     // routes through the spec-pipeline validation layer.
     spec.controller = ControllerSpec::McAixi(McAixiControllerSpec {
         predictor: RateBackend::Ctw { depth: 8 },
+        bit_stream_semantics: default_bit_stream_semantics(),
         agent_horizon: 2,
         num_simulations: 4,
         mcts_strategy: MctsStrategy::ParallelUct {
@@ -772,6 +971,13 @@ fn standalone_rate_backend_documents_cover_all_binary_backend_tags() {
             base_depth: 10,
             num_percept_bits: 8,
             encoding_bits: 1,
+            msb_first: None,
+        }),
+        SpecDocument::RateBackend(RateBackend::FacCtw {
+            base_depth: 10,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+            msb_first: Some(false),
         }),
         SpecDocument::RateBackend(RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
@@ -834,6 +1040,7 @@ fn standalone_rate_backend_documents_cover_all_binary_backend_tags() {
                     base_depth: 8,
                     num_percept_bits: 8,
                     encoding_bits: 1,
+                    msb_first: None,
                 })],
             )),
         }),
@@ -876,6 +1083,7 @@ fn standalone_compression_backend_documents_cover_binary_coder_variants() {
                         base_depth: 8,
                         num_percept_bits: 8,
                         encoding_bits: 1,
+                        msb_first: None,
                     })],
                 )),
             },
@@ -1043,7 +1251,9 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
                     base_depth: 8,
                     num_percept_bits: 8,
                     encoding_bits: 1,
+                    msb_first: None,
                 },
+                bit_stream_semantics: default_bit_stream_semantics(),
                 agent_horizon: 4,
                 num_simulations: 12,
                 mcts_strategy: MctsStrategy::ParallelUct {
@@ -1082,17 +1292,19 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
                                     base_depth: 6,
                                     num_percept_bits: 8,
                                     encoding_bits: 1,
+                                    msb_first: None,
                                 }),
                             ],
                         )
                         .with_schedule(MixtureScheduleMode::Theorem),
                     ),
                 },
+                bit_stream_semantics: default_bit_stream_semantics(),
                 return_horizon: 4,
-                return_bins: 16,
+                return_bins: 17,
                 label_phase_period: 6,
                 teacher_dataset_asset: "teacher".to_string(),
-                planner_simulations_per_step: 9,
+                planner_simulations_per_step: 1,
             }),
             runtime: PlannerRuntimeSpec {
                 random_seed: Some(19),
@@ -1160,6 +1372,7 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
                     base_depth: 8,
                     num_percept_bits: 8,
                     encoding_bits: 1,
+                    msb_first: None,
                 },
                 coder: crate::coders::CoderType::RANS,
                 framing: crate::compression::FramingMode::Raw,
@@ -1202,7 +1415,7 @@ fn planner_and_tune_documents_roundtrip_all_controller_variants() {
             controller: TuneControllerSpec::AiqiWarmstartExactJh(
                 WarmStartExactJhTuneControllerSpec {
                     interface: tune_interface,
-                    planner_simulations_per_step: 7,
+                    planner_simulations_per_step: 1,
                     return_horizon: 4,
                     warmstart_teacher_dataset_asset: "teacher".to_string(),
                     label_phase_period: 5,
@@ -1386,6 +1599,7 @@ fn planner_run_compile_rejects_mcaixi_predictors_with_zpaq_conditioning() {
         predictor: RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
         },
+        bit_stream_semantics: default_bit_stream_semantics(),
         agent_horizon: 1,
         num_simulations: 1,
         mcts_strategy: MctsStrategy::RhoUct,
@@ -1410,6 +1624,7 @@ fn planner_run_compile_rejects_aiqi_predictors_without_frozen_conditioning() {
         predictor: RateBackend::Zpaq {
             method: crate::api::ZpaqMethodSpec::literal("1"),
         },
+        bit_stream_semantics: default_bit_stream_semantics(),
         discount_gamma: 0.99,
         return_horizon: 2,
         return_bins: 8,
@@ -1483,6 +1698,7 @@ fn sample_vm_planner_run() -> PlannerRunSpec {
         },
         controller: ControllerSpec::McAixi(McAixiControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_bit_stream_semantics(),
             agent_horizon: 1,
             num_simulations: 1,
             mcts_strategy: MctsStrategy::RhoUct,
@@ -1662,6 +1878,61 @@ fn tune_compile_model_bytes_ignore_outer_request_controls() {
     );
 }
 
+#[cfg(all(feature = "backend-ctw", not(feature = "aixi")))]
+#[test]
+fn planner_run_rejects_warmstart_controller_without_aixi_feature() {
+    let json = serde_json::json!({
+        "schema_version": SPEC_DOCUMENT_SCHEMA_VERSION,
+        "kind": "planner_run",
+        "assets": [{
+            "id": "teacher",
+            "path": "teacher.json",
+        }],
+        "environment": {
+            "kind": "builtin",
+            "name": "coin_flip",
+        },
+        "interface": {
+            "observation_bits": 2,
+            "observation_stream_len": 1,
+            "observation_key_mode": "full_stream",
+            "reward_bits": 2,
+            "agent_actions": 2,
+        },
+        "controller": {
+            "kind": "aiqi_warmstart_exact_jh",
+            "predictor": { "kind": "ctw", "depth": 8 },
+            "bit_stream_semantics": { "kind": "binary_tokens" },
+            "return_horizon": 2,
+            "return_bins": 5,
+            "label_phase_period": 2,
+            "teacher_dataset_asset": "teacher",
+            "planner_simulations_per_step": 1,
+        },
+        "runtime": {
+            "random_seed": 11,
+            "learn_cycles": 4,
+            "eval_cycles": 2,
+            "terminate_lifetime": 6,
+            "log_every": 1,
+            "perf": false,
+            "vm_perf_only": false,
+            "explore_epsilon": 0.0,
+            "explore_gamma": 1.0,
+        },
+    });
+    let err = match SpecDocument::parse_json_value(&json, Path::new(".")) {
+        Ok(_) => panic!("warmstart controller must require aixi feature"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains(
+            "aiqi_warmstart_exact_jh controller requires infotheory built with feature 'aixi'"
+        ),
+        "{err}"
+    );
+}
+
 #[cfg(not(feature = "backend-ctw"))]
 #[test]
 fn planner_run_validation_reports_missing_backend_feature() {
@@ -1679,6 +1950,7 @@ fn planner_run_validation_reports_missing_backend_feature() {
         },
         controller: ControllerSpec::AiqiDiscounted(AiqiDiscountedControllerSpec {
             predictor: RateBackend::Ctw { depth: 8 },
+            bit_stream_semantics: default_bit_stream_semantics(),
             discount_gamma: 0.99,
             return_horizon: 2,
             return_bins: 8,

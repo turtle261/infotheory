@@ -79,3 +79,24 @@ Chosen default:
 | decode fast-bitwise AC helper | `inline(never)` |
 
 This corresponds to the `comp-inlined` variant.
+
+## CTW research knobs
+
+The FAC-CTW work on this branch selected hot-prefix depth `12` as the current default after a completed sweep. That tuning knob is still available for research builds through `INFOTHEORY_CTW_HOT_PREFIX_DEPTH`.
+
+```bash
+# default branch choice: hot-prefix depth 12
+cargo build -p infotheory --release --features "cli backend-ctw" --bin infotheory --locked
+
+# research override example
+INFOTHEORY_CTW_HOT_PREFIX_DEPTH=10 \
+cargo build -p infotheory --release --features "cli backend-ctw" --bin infotheory --locked
+```
+
+The `ctw-profile` CLI mode and the detailed FAC telemetry surface are treated as research-only tooling. They are intentionally excluded from more minimal CLI builds and require the `research-tooling` feature.
+
+```bash
+cargo build -p infotheory --release --features "cli backend-ctw research-tooling" --bin infotheory --locked
+```
+
+That split keeps the profiling path available for branch research while preserving a straightforward way to produce a leaner runtime binary when the extra tooling surface is not wanted.

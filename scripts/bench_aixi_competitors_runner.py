@@ -242,11 +242,18 @@ def main() -> None:
     p.add_argument("--exploration-exploitation-ratio", type=float, required=True)
     args = p.parse_args()
 
+    if args.algorithm == "ac-ctw":
+        rate_backend = ait.RateBackend.ctw(args.ct_depth)
+    elif args.algorithm == "fac-ctw":
+        num_percept_bits = 2 if args.workload == "coinflip" else 6
+        rate_backend = ait.RateBackend.fac_ctw(args.ct_depth, num_percept_bits, 8)
+    else:
+        raise ValueError(f"unsupported algorithm {args.algorithm}")
+
     if args.workload == "coinflip":
         env = ait.CoinFlipEnv(args.coin_flip_p, args.seed)
         cfg = ait.AgentConfig(
-            algorithm=args.algorithm,
-            ct_depth=args.ct_depth,
+            rate_backend=rate_backend,
             agent_horizon=args.horizon,
             observation_bits=1,
             observation_stream_len=1,
@@ -263,8 +270,7 @@ def main() -> None:
     else:
         env = ait.KuhnPokerEnv(args.seed)
         cfg = ait.AgentConfig(
-            algorithm=args.algorithm,
-            ct_depth=args.ct_depth,
+            rate_backend=rate_backend,
             agent_horizon=args.horizon,
             observation_bits=3,
             observation_stream_len=1,
@@ -649,7 +655,12 @@ def main() -> None:
         "cycles_per_sec",
     ]
     with raw_tsv.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=raw_fields, delimiter="\t")
+        writer = csv.DictWriter(
+            f,
+            fieldnames=raw_fields,
+            delimiter="\t",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -722,7 +733,12 @@ def main() -> None:
         "cycles_per_sec_std",
     ]
     with summary_tsv.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=summary_fields, delimiter="\t")
+        writer = csv.DictWriter(
+            f,
+            fieldnames=summary_fields,
+            delimiter="\t",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(summary_rows)
 

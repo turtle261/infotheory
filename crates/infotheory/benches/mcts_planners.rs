@@ -96,14 +96,18 @@ impl AgentSimulator for BenchAgent {
         let mix = self.burn(self.step_work.max(1));
         if self.emit_reward {
             self.emit_reward = false;
-            ((self.last_action ^ mix) & 1) as u64
+            (self.last_action ^ mix) & 1
         } else {
             self.emit_reward = true;
-            ((mix >> 5) & 1) as u64
+            (mix >> 5) & 1
         }
     }
 
     fn begin_simulation(&mut self) {
+        self.emit_reward = false;
+    }
+
+    fn begin_discardable_simulation(&mut self) {
         self.emit_reward = false;
     }
 

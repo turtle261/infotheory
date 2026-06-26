@@ -356,9 +356,120 @@ def test_compare_bench_two_json_rejects_mismatched_suite_spec_digest(
     assert "suite spec digest mismatch" in proc.stderr
 
 
+def test_compare_bench_two_json_explains_duplicate_summary_keys(
+    tmp_path: pathlib.Path,
+):
+    if shutil.which("luajit") is None:
+        pytest.skip("luajit not installed")
+
+    baseline = tmp_path / "baseline.tsv"
+    candidate = tmp_path / "candidate.tsv"
+    baseline.write_text(
+        "\n".join(
+            [
+                "\t".join(
+                    [
+                        "operation",
+                        "subject",
+                        "size_bytes",
+                        "cpu",
+                        "compression_backend",
+                        "suite_spec_path",
+                        "suite_spec_sha256",
+                        "build_mode",
+                        "build_features",
+                    ]
+                ),
+                "\t".join(
+                    [
+                        "h",
+                        "ctw",
+                        "4096",
+                        "0",
+                        "-",
+                        "configs/bench/two.json",
+                        "a" * 64,
+                        "native",
+                        "cli",
+                    ]
+                ),
+                "\t".join(
+                    [
+                        "h",
+                        "ctw",
+                        "4096",
+                        "11",
+                        "-",
+                        "configs/bench/two.json",
+                        "a" * 64,
+                        "native",
+                        "cli",
+                    ]
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_compare_summary(
+        candidate,
+        suite_spec_path="configs/bench/two.json",
+        suite_spec_sha256="a" * 64,
+    )
+
+    proc = _run(
+        [
+            "luajit",
+            "scripts/compare_bench_two_json.lua",
+            "--baseline",
+            str(baseline),
+            str(candidate),
+        ]
+    )
+    assert proc.returncode != 0
+    assert proc.stdout == ""
+    assert "duplicate comparison row" in proc.stderr
+    assert "operation=h, subject=fac-ctw, size_bytes=4096, compression_backend=-" in proc.stderr
+    assert "differing columns: cpu: 0 != 11" in proc.stderr
+    assert "mix CPU affinities" in proc.stderr
+
+
 def test_bench_two_json_build_mode_namespace_is_bench_scoped():
     script_text = (_repo_root() / "scripts/bench_two_json.sh").read_text(encoding="utf-8")
 
     assert "INFOTHEORY_CLI_BENCH_BUILD_MODE" not in script_text
     assert "INFOTHEORY_BENCH_BUILD_MODE" in script_text
     assert "CARGO_BUILD_RUSTFLAGS" in script_text
+
+
+def test_bench_two_json_compare_hint_uses_current_baseline_resolver():
+    script_text = (_repo_root() / "scripts/bench_two_json.sh").read_text(encoding="utf-8")
+
+    assert "current_two_json_baseline_tsv()" in script_text
+    assert 'benchmarks/current/infotheory-two-json-summary"*.tsv' in script_text
+    assert "--baseline '${CURRENT_BASELINE_TSV}'" in script_text
+    assert "infotheory-two-json-summary-20260322-120428.tsv" not in script_text
+
+
+def test_checked_in_benchmark_summary_tsv_uses_lf_line_endings():
+    repo = _repo_root()
+    crlf = [
+        path.relative_to(repo)
+        for path in (repo / "benchmarks").rglob("*summary*.tsv")
+        if b"\r" in path.read_bytes()
+    ]
+    assert crlf == [], (
+        "benchmark summary TSV files must use LF line endings only; "
+        f"found CR in: {', '.join(str(p) for p in crlf)}"
+    )
+
+
+def test_bench_two_json_summary_writer_uses_lf_line_terminator():
+    script_text = (_repo_root() / "scripts/bench_two_json.sh").read_text(encoding="utf-8")
+    marker = 'with open(summary_path, "w", newline="") as fh:'
+    start = script_text.find(marker)
+    assert start != -1, "summary TSV writer block not found in bench_two_json.sh"
+    block = script_text[start : start + 400]
+    assert 'lineterminator="\\n"' in block, (
+        "bench_two_json summary csv.DictWriter must set lineterminator='\\n'"
+    )

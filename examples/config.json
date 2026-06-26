@@ -3,18 +3,18 @@
   "alpha": 0.03,
   "experts": [
     {
-      "name": "ctw",
-      "kind": "ctw",
+      "log_prior": 0,
+      "name": "fac-ctw",
       "base_depth": 32,
-      "encoding_bits": 8,
+      "kind": "fac-ctw",
       "num_percept_bits": 8,
-      "log_prior": 0.0
+      "encoding_bits": 8
     },
     {
-      "name": "rosa",
+      "log_prior": 0,
       "kind": "rosaplus",
       "max_order": -1,
-      "log_prior": 0.0
+      "name": "rosa"
     }
   ]
 }

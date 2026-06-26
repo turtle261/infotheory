@@ -11,6 +11,11 @@ use infotheory::api::{
     RateBackendSession, try_compress_bytes_backend, try_decompress_bytes_backend,
 };
 
+#[cfg(feature = "backend-ctw")]
+use infotheory::api::{
+    BinaryPrediction, BitOrder, BitStreamSemantics, OnlineBitPredictor, RateBackendBitSession,
+};
+
 #[cfg(any(
     feature = "backend-ctw",
     feature = "backend-mixture",
@@ -24,6 +29,77 @@ fn assert_close(label: &str, left: f64, right: f64) {
     assert!(
         diff <= 1e-12,
         "{label} mismatch: left={left}, right={right}, diff={diff}"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+fn assert_bit_prediction_close(label: &str, left: BinaryPrediction, right: BinaryPrediction) {
+    assert_close(&format!("{label} p0"), left.p0, right.p0);
+    assert_close(&format!("{label} p1"), left.p1, right.p1);
+}
+
+#[cfg(feature = "backend-ctw")]
+fn assert_bit_sessions_predict_same(
+    label: &str,
+    compat_session: &mut RateBackendBitSession,
+    compiled_session: &mut RateBackendBitSession,
+) {
+    let compat_prediction = compat_session.predict_bit();
+    let compiled_prediction = compiled_session.predict_bit();
+    assert_bit_prediction_close(label, compat_prediction, compiled_prediction);
+}
+
+#[cfg(feature = "backend-ctw")]
+#[derive(Clone, Copy)]
+enum BitSessionOp {
+    Observe(bool),
+    Condition(bool),
+    Step(bool),
+}
+
+#[cfg(feature = "backend-ctw")]
+fn apply_bit_session_op(
+    label: &str,
+    op: BitSessionOp,
+    compat_session: &mut RateBackendBitSession,
+    compiled_session: &mut RateBackendBitSession,
+) {
+    assert_bit_sessions_predict_same(
+        &format!("{label} pre-update"),
+        compat_session,
+        compiled_session,
+    );
+    match op {
+        BitSessionOp::Observe(bit) => {
+            compat_session
+                .try_observe_bit(bit)
+                .unwrap_or_else(|err| panic!("{label} compat observe failed: {err}"));
+            compiled_session
+                .try_observe_bit(bit)
+                .unwrap_or_else(|err| panic!("{label} compiled observe failed: {err}"));
+        }
+        BitSessionOp::Condition(bit) => {
+            compat_session
+                .try_condition_bit(bit)
+                .unwrap_or_else(|err| panic!("{label} compat condition failed: {err}"));
+            compiled_session
+                .try_condition_bit(bit)
+                .unwrap_or_else(|err| panic!("{label} compiled condition failed: {err}"));
+        }
+        BitSessionOp::Step(bit) => {
+            let compat_prediction = compat_session
+                .try_step_bit(bit)
+                .unwrap_or_else(|err| panic!("{label} compat step failed: {err}"));
+            let compiled_prediction = compiled_session
+                .try_step_bit(bit)
+                .unwrap_or_else(|err| panic!("{label} compiled step failed: {err}"));
+            assert_bit_prediction_close(label, compat_prediction, compiled_prediction);
+        }
+    }
+    assert_bit_sessions_predict_same(
+        &format!("{label} post-update"),
+        compat_session,
+        compiled_session,
     );
 }
 
@@ -120,6 +196,188 @@ fn assert_ctx_parity(
             .unwrap();
         assert_eq!(compat, compiled, "generation drift");
     }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn compiled_bit_session_matches_wrapper_for_binary_tokens_and_checkpoints() {
+    let rate = RateBackend::Ctw { depth: 6 };
+    let compiled_rate = rate
+        .clone()
+        .compile()
+        .unwrap_or_else(|err| panic!("compile ctw rate backend: {err}"));
+    let mut compat_session =
+        RateBackendBitSession::from_spec(rate, Some(13), BitStreamSemantics::BinaryTokens)
+            .expect("compat binary-token bit session");
+    let mut compiled_session = RateBackendBitSession::from_backend(
+        compiled_rate,
+        Some(13),
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("compiled binary-token bit session");
+
+    for (idx, op) in [
+        BitSessionOp::Observe(true),
+        BitSessionOp::Condition(false),
+        BitSessionOp::Step(true),
+        BitSessionOp::Observe(true),
+        BitSessionOp::Condition(true),
+        BitSessionOp::Step(false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        apply_bit_session_op(
+            &format!("binary-token prefix op {idx}"),
+            op,
+            &mut compat_session,
+            &mut compiled_session,
+        );
+    }
+
+    let compat_checkpoint = compat_session.checkpoint();
+    let compiled_checkpoint = compiled_session.checkpoint();
+
+    for (idx, op) in [
+        BitSessionOp::Step(true),
+        BitSessionOp::Observe(false),
+        BitSessionOp::Condition(false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        apply_bit_session_op(
+            &format!("binary-token divergent op {idx}"),
+            op,
+            &mut compat_session,
+            &mut compiled_session,
+        );
+    }
+
+    compat_session
+        .restore_checkpoint(&compat_checkpoint)
+        .expect("restore compat binary-token checkpoint");
+    compiled_session
+        .restore_checkpoint(&compiled_checkpoint)
+        .expect("restore compiled binary-token checkpoint");
+    assert_bit_sessions_predict_same(
+        "binary-token restored checkpoint",
+        &mut compat_session,
+        &mut compiled_session,
+    );
+    compat_session.clear_checkpoints_if_supported();
+    compiled_session.clear_checkpoints_if_supported();
+
+    OnlineBitPredictor::begin_bit_stream(
+        &mut compat_session,
+        Some(5),
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("compat binary-token stream restart");
+    OnlineBitPredictor::begin_bit_stream(
+        &mut compiled_session,
+        Some(5),
+        BitStreamSemantics::BinaryTokens,
+    )
+    .expect("compiled binary-token stream restart");
+
+    for (idx, bit) in [true, false, true, true, false].into_iter().enumerate() {
+        apply_bit_session_op(
+            &format!("binary-token restarted op {idx}"),
+            BitSessionOp::Step(bit),
+            &mut compat_session,
+            &mut compiled_session,
+        );
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn compiled_bit_session_matches_wrapper_for_byte_packed_checkpoint_restore() {
+    let rate = RateBackend::Ctw { depth: 6 };
+    let compiled_rate = rate
+        .clone()
+        .compile()
+        .unwrap_or_else(|err| panic!("compile ctw rate backend: {err}"));
+    let semantics = BitStreamSemantics::BytePacked {
+        order: BitOrder::MsbFirst,
+    };
+    let mut compat_session =
+        RateBackendBitSession::from_spec(rate, Some(24), semantics).expect("compat bit session");
+    let mut compiled_session =
+        RateBackendBitSession::from_backend(compiled_rate, Some(24), semantics)
+            .expect("compiled bit session");
+
+    for (idx, bit) in [true, false, true, false, true, false, false, true]
+        .into_iter()
+        .enumerate()
+    {
+        apply_bit_session_op(
+            &format!("byte-packed first byte bit {idx}"),
+            BitSessionOp::Observe(bit),
+            &mut compat_session,
+            &mut compiled_session,
+        );
+    }
+
+    for (idx, bit) in [false, true, true].into_iter().enumerate() {
+        apply_bit_session_op(
+            &format!("byte-packed checkpoint prefix bit {idx}"),
+            BitSessionOp::Observe(bit),
+            &mut compat_session,
+            &mut compiled_session,
+        );
+    }
+
+    let compat_checkpoint = compat_session.checkpoint();
+    let compiled_checkpoint = compiled_session.checkpoint();
+
+    for (idx, bit) in [true, true, false, false, false].into_iter().enumerate() {
+        apply_bit_session_op(
+            &format!("byte-packed divergent suffix bit {idx}"),
+            BitSessionOp::Observe(bit),
+            &mut compat_session,
+            &mut compiled_session,
+        );
+    }
+
+    compat_session
+        .restore_checkpoint(&compat_checkpoint)
+        .expect("restore compat byte-packed checkpoint");
+    compiled_session
+        .restore_checkpoint(&compiled_checkpoint)
+        .expect("restore compiled byte-packed checkpoint");
+    assert_bit_sessions_predict_same(
+        "byte-packed restored mid-byte checkpoint",
+        &mut compat_session,
+        &mut compiled_session,
+    );
+
+    for (idx, bit) in [false, false, true, true, true].into_iter().enumerate() {
+        apply_bit_session_op(
+            &format!("byte-packed restored suffix bit {idx}"),
+            BitSessionOp::Observe(bit),
+            &mut compat_session,
+            &mut compiled_session,
+        );
+    }
+
+    for (idx, bit) in [true, true, false, false, true, false, true, false]
+        .into_iter()
+        .enumerate()
+    {
+        apply_bit_session_op(
+            &format!("byte-packed frozen byte bit {idx}"),
+            BitSessionOp::Condition(bit),
+            &mut compat_session,
+            &mut compiled_session,
+        );
+    }
+
+    compat_session.finish().expect("compat byte-packed finish");
+    compiled_session
+        .finish()
+        .expect("compiled byte-packed finish");
 }
 
 #[cfg(feature = "backend-ctw")]

@@ -143,6 +143,7 @@ pub mod error;
 /// Online Bayesian/switching/MDL mixture predictors.
 pub mod mixture;
 pub(crate) mod neural_mix;
+pub(crate) mod prediction;
 pub(crate) mod rate_defaults;
 /// Shared spec -> runtime builders and backend registry metadata.
 pub(crate) mod runtime;
@@ -493,40 +494,36 @@ pub(crate) fn try_frozen_plugin_rate_backend(
         return Ok(model.cross_entropy(score_data));
     }
     #[cfg(feature = "backend-rwkv")]
-    match backend.plan() {
-        crate::spec::core::RateBackendPlan::Rwkv7 {
-            method,
-            parsed_method,
-            ..
-        } => {
-            return with_rwkv_method_spec_tls(method, parsed_method, |c| {
-                c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
-                    .map_err(|e| {
-                        InfotheoryError::runtime(format!(
-                            "rwkv method frozen-plugin scoring failed: {e:#}"
-                        ))
-                    })
-            });
-        }
-        _ => {}
+    if let crate::spec::core::RateBackendPlan::Rwkv7 {
+        method,
+        parsed_method,
+        ..
+    } = backend.plan()
+    {
+        return with_rwkv_method_spec_tls(method, parsed_method, |c| {
+            c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
+                .map_err(|e| {
+                    InfotheoryError::runtime(format!(
+                        "rwkv method frozen-plugin scoring failed: {e:#}"
+                    ))
+                })
+        });
     }
     #[cfg(feature = "backend-mamba")]
-    match backend.plan() {
-        crate::spec::core::RateBackendPlan::Mamba {
-            method,
-            parsed_method,
-            ..
-        } => {
-            return with_mamba_method_spec_tls(method, parsed_method, |c| {
-                c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
-                    .map_err(|e| {
-                        InfotheoryError::runtime(format!(
-                            "mamba method frozen-plugin scoring failed: {e:#}"
-                        ))
-                    })
-            });
-        }
-        _ => {}
+    if let crate::spec::core::RateBackendPlan::Mamba {
+        method,
+        parsed_method,
+        ..
+    } = backend.plan()
+    {
+        return with_mamba_method_spec_tls(method, parsed_method, |c| {
+            c.cross_entropy_frozen_plugin_chain(fit_parts, score_data)
+                .map_err(|e| {
+                    InfotheoryError::runtime(format!(
+                        "mamba method frozen-plugin scoring failed: {e:#}"
+                    ))
+                })
+        });
     }
 
     let fit_total = fit_parts.iter().map(|part| part.len() as u64).sum::<u64>();
@@ -975,6 +972,7 @@ mod tests {
                     base_depth: 8,
                     num_percept_bits: 8,
                     encoding_bits: 8,
+                    msb_first: None,
                 },
             ),
             ("match", test_match_backend()),
@@ -1426,6 +1424,7 @@ mod minimal_tests {
         );
     }
 
+    #[cfg(not(feature = "backend-zpaq"))]
     #[test]
     fn default_rate_backend_selection_fails_when_no_rate_backends_are_enabled() {
         let err = match RateBackend::try_default() {
@@ -1436,6 +1435,17 @@ mod minimal_tests {
             err.to_string()
                 .contains("no default rate backend is available in this build"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "backend-zpaq")]
+    #[test]
+    fn default_rate_backend_is_zpaq_when_zpaq_is_enabled() {
+        let backend = RateBackend::try_default()
+            .expect("zpaq-enabled minimal build should expose a default rate backend");
+        assert!(
+            matches!(backend, RateBackend::Zpaq { .. }),
+            "expected zpaq default backend variant"
         );
     }
 

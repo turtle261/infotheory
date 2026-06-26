@@ -18,6 +18,9 @@ serde_json = "1.0.149"
 anyhow = "1.0.100"
 ahash = { version = "0.8.12", default-features = false, features = ["std", "no-rng"] }
 crc32fast = "1.5.0"
+# Only used by the `aixi` warm-start task fingerprint; gated to keep skinny
+# (non-`aixi`) builds free of a digest dependency they cannot use.
+sha2 = { version = "0.10", optional = true }
 wide = "1.1.1"
 libc = { version = "0.2.177", optional = true }
 
@@ -48,7 +51,7 @@ capability-archive = [
     "backend-zpaq",
 ]
 capability-vm = ["aixi-vm"]
-aixi = []
+aixi = ["dep:sha2"]
 tuner = ["aixi", "dep:libc"]
 aixi-gameengine = ["aixi", "dep:gameengine", "gameengine/builtin"]
 aixi-gameengine-physics = ["aixi-gameengine", "gameengine/physics"]
@@ -67,6 +70,7 @@ backend-calibrated = []
 backend-mamba = []
 backend-rwkv = []
 backend-zpaq = ["dep:zpaq_rs"]
+research-tooling = []
 cli = ["aixi"]
 vm = ["aixi", "dep:nyx-lite"]
 
@@ -87,6 +91,7 @@ harness = false
 [[bench]]
 name = "aiqi"
 harness = false
+required-features = ["aixi"]
 
 [[bench]]
 name = "mixture_backends"
@@ -132,9 +137,17 @@ harness = false
 [[bench]]
 name = "mcts_planners"
 harness = false
+required-features = ["aixi"]
+
+[[bench]]
+name = "warmstart"
+harness = false
+required-features = ["aixi", "backend-ctw"]
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
+# Available to feature-light test/bench builds (e.g. `backend-zpaq` without
+# `aixi`) where the optional main-crate `sha2` dependency is not enabled.
 sha2 = "0.10"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 

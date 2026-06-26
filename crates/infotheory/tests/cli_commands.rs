@@ -1,7 +1,7 @@
 #![cfg(all(feature = "cli", feature = "all-backends"))]
 
 use infotheory::api::{empirical_entropy_bytes, try_entropy_rate_bytes};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -984,6 +984,7 @@ fn aixi_cli_reports_missing_gameengine_feature_for_builtin_environments() {
   "controller": {
     "kind": "aiqi_discounted",
     "predictor": { "kind": "ctw", "depth": 8 },
+    "bit_stream_semantics": { "kind": "binary_tokens" },
     "discount_gamma": 0.99,
     "return_horizon": 2,
     "return_bins": 8,
@@ -1338,5 +1339,120 @@ fn cli_rejects_unknown_compression_backend_name_in_flag() {
     );
 
     let _ = fs::remove_file(input_path);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn cli_help_documents_warmstart_teacher_paths() {
+    let help = run_cli(&["--help"], None);
+    assert!(help.status.success());
+    let help_text = stderr_string(&help);
+    assert!(help_text.contains("warmstart teacher planner-run"));
+    assert!(help_text.contains("warmstart teacher from-jsonl"));
+    assert!(help_text.contains("warmstart teacher merge"));
+}
+
+#[test]
+fn cli_warmstart_subcommands_reject_missing_required_options() {
+    let missing_merge_teacher = run_cli(
+        &[
+            "warmstart",
+            "teacher",
+            "merge",
+            "--target",
+            "target.json",
+            "--out",
+            "out.json",
+        ],
+        None,
+    );
+    assert!(!missing_merge_teacher.status.success());
+    let merge_err = stderr_string(&missing_merge_teacher);
+    assert!(
+        merge_err.contains("missing required --teacher"),
+        "stderr={merge_err}"
+    );
+}
+
+#[test]
+fn cli_warmstart_from_jsonl_failure_message_is_stable() {
+    let target_path = temp_path("warmstart_from_jsonl_target", "json");
+    let teacher_path = temp_path("warmstart_from_jsonl_teacher", "json");
+    let jsonl_path = temp_path("warmstart_from_jsonl_trace", "jsonl");
+    let out_path = temp_path("warmstart_from_jsonl_out", "json");
+    let target = json!({
+        "schema_version": 1,
+        "kind": "planner_run",
+        "assets": [{
+            "id": "teacher",
+            "path": teacher_path.to_string_lossy(),
+        }],
+        "environment": {
+            "kind": "builtin",
+            "name": "coin_flip",
+        },
+        "interface": {
+            "observation_bits": 2,
+            "observation_stream_len": 1,
+            "observation_key_mode": "full_stream",
+            "reward_bits": 2,
+            "agent_actions": 2,
+        },
+        "controller": {
+            "kind": "aiqi_warmstart_exact_jh",
+            "predictor": {
+                "kind": "ctw",
+                "depth": 4,
+            },
+            "return_horizon": 1,
+            "return_bins": 4,
+            "label_phase_period": 1,
+            "teacher_dataset_asset": "teacher",
+            "planner_simulations_per_step": 1,
+        },
+        "runtime": {
+            "random_seed": 7,
+            "learn_cycles": 1,
+            "eval_cycles": 0,
+            "terminate_lifetime": 1,
+            "log_every": 1,
+            "perf": false,
+            "vm_perf_only": false,
+            "explore_epsilon": 0.0,
+            "explore_gamma": 1.0,
+        }
+    });
+    write_temp_file(
+        &target_path,
+        &serde_json::to_vec(&target).expect("serialize planner_run target"),
+    );
+    write_temp_file(&jsonl_path, br#"{"kind":"action","t":0,"action":0}"#);
+
+    let output = run_cli(
+        &[
+            "warmstart",
+            "teacher",
+            "from-jsonl",
+            "--target",
+            target_path.to_string_lossy().as_ref(),
+            "--jsonl",
+            jsonl_path.to_string_lossy().as_ref(),
+            "--out",
+            out_path.to_string_lossy().as_ref(),
+        ],
+        None,
+    );
+
+    assert!(!output.status.success());
+    let err = stderr_string(&output);
+    assert!(
+        err.contains("Error: warmstart failed: invalid telemetry: cannot infer JSONL action/percept convention"),
+        "stderr={err}"
+    );
+    assert!(!out_path.exists());
+
+    let _ = fs::remove_file(target_path);
+    let _ = fs::remove_file(teacher_path);
+    let _ = fs::remove_file(jsonl_path);
     let _ = fs::remove_file(out_path);
 }

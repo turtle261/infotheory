@@ -6,20 +6,312 @@
 //! semantics while avoiding the `O(depth)` explicit-node blow-up for singleton
 //! paths.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::f64;
 use std::mem::size_of;
+use std::sync::OnceLock;
 
 type Symbol = bool;
+const HISTORY_WORD_BITS: usize = u64::BITS as usize;
 
+#[inline(always)]
+fn history_word_len(bits: usize) -> usize {
+    bits.div_ceil(HISTORY_WORD_BITS)
+}
+
+trait HistoryAccess {
+    fn len(&self) -> usize;
+    fn bit(&self, index: usize) -> Symbol;
+
+    #[inline(always)]
+    fn recent_bit(&self, _depth: usize) -> Option<Symbol> {
+        None
+    }
+
+    #[inline(always)]
+    fn recent_path_bits(&self, _depth: usize, _len: usize) -> Option<u64> {
+        None
+    }
+}
+
+impl HistoryAccess for [Symbol] {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        <[Symbol]>::len(self)
+    }
+
+    #[inline(always)]
+    fn bit(&self, index: usize) -> Symbol {
+        debug_assert!(index < self.len());
+        unsafe { *self.get_unchecked(index) }
+    }
+}
+
+impl HistoryAccess for Vec<Symbol> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    #[inline(always)]
+    fn bit(&self, index: usize) -> Symbol {
+        self.as_slice().bit(index)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BitHistory {
+    words: Vec<u64>,
+    len: usize,
+    recent: u64,
+}
+
+impl BitHistory {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    fn memory_usage(&self) -> usize {
+        self.words.capacity() * size_of::<u64>()
+    }
+
+    #[inline]
+    fn rebuild_recent(&mut self) {
+        self.recent = 0;
+        let tail_len = self.len.min(HISTORY_WORD_BITS);
+        for depth in 0..tail_len {
+            let idx = self.len - depth - 1;
+            if self.bit(idx) {
+                self.recent |= 1u64 << depth;
+            }
+        }
+    }
+
+    #[inline]
+    fn reserve_exact(&mut self, additional_bits: usize) {
+        let required_bits = self.len.saturating_add(additional_bits);
+        let required_words = history_word_len(required_bits);
+        if required_words > self.words.capacity() {
+            self.words
+                .reserve_exact(required_words.saturating_sub(self.words.len()));
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, bit: Symbol) {
+        let word_idx = self.len / HISTORY_WORD_BITS;
+        let bit_idx = self.len % HISTORY_WORD_BITS;
+        if word_idx == self.words.len() {
+            self.words.push(0);
+        }
+        let mask = 1u64 << bit_idx;
+        if bit {
+            self.words[word_idx] |= mask;
+        } else {
+            self.words[word_idx] &= !mask;
+        }
+        self.recent = (self.recent << 1) | (bit as u64);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<Symbol> {
+        if self.len == 0 {
+            return None;
+        }
+        let next_len = self.len - 1;
+        let word_idx = next_len / HISTORY_WORD_BITS;
+        let bit_idx = next_len % HISTORY_WORD_BITS;
+        let mask = 1u64 << bit_idx;
+        let bit = (self.words[word_idx] & mask) != 0;
+        if bit {
+            self.words[word_idx] &= !mask;
+        }
+        self.len = next_len;
+        if bit_idx == 0 {
+            self.words.truncate(word_idx);
+        }
+        self.recent >>= 1;
+        if self.len >= HISTORY_WORD_BITS {
+            let exposed_idx = self.len - HISTORY_WORD_BITS;
+            if self.bit(exposed_idx) {
+                self.recent |= 1u64 << (HISTORY_WORD_BITS - 1);
+            }
+        }
+        Some(bit)
+    }
+
+    #[inline]
+    fn extend_from_slice(&mut self, symbols: &[Symbol]) {
+        self.reserve_exact(symbols.len());
+        for &symbol in symbols {
+            self.push(symbol);
+        }
+    }
+
+    #[inline]
+    fn truncate(&mut self, new_len: usize) {
+        if new_len >= self.len {
+            return;
+        }
+        self.len = new_len;
+        self.words.truncate(history_word_len(new_len));
+        let rem = new_len % HISTORY_WORD_BITS;
+        if rem != 0 {
+            let mask = (1u64 << rem) - 1;
+            if let Some(last) = self.words.last_mut() {
+                *last &= mask;
+            }
+        }
+        self.rebuild_recent();
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.words.clear();
+        self.len = 0;
+        self.recent = 0;
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<Symbol> {
+        (0..self.len).map(|idx| self.bit(idx)).collect()
+    }
+}
+
+impl HistoryAccess for BitHistory {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn bit(&self, index: usize) -> Symbol {
+        debug_assert!(index < self.len);
+        let word = unsafe { *self.words.get_unchecked(index / HISTORY_WORD_BITS) };
+        ((word >> (index % HISTORY_WORD_BITS)) & 1) != 0
+    }
+
+    #[inline(always)]
+    fn recent_bit(&self, depth: usize) -> Option<Symbol> {
+        if depth < self.len.min(HISTORY_WORD_BITS) {
+            Some(((self.recent >> depth) & 1) != 0)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn recent_path_bits(&self, depth: usize, len: usize) -> Option<u64> {
+        let available = self.len.saturating_sub(depth).min(len);
+        if available == 0 {
+            return Some(0);
+        }
+        if depth + available <= self.len.min(HISTORY_WORD_BITS) {
+            let mask = if available >= HISTORY_WORD_BITS {
+                u64::MAX
+            } else {
+                (1u64 << available) - 1
+            };
+            Some((self.recent >> depth) & mask)
+        } else {
+            None
+        }
+    }
+}
+
+const CTW_LOG_CACHE_LIMIT: usize = 1 << 24;
+const CTW_HOT_PREFIX_DEPTH_DEFAULT: usize = 12;
+const CTW_LOG_OVERFLOW_CACHE_SLOTS: usize = 1 << 14;
+
+#[cfg(not(test))]
+#[inline(always)]
+fn ctw_log_cache_limit() -> usize {
+    CTW_LOG_CACHE_LIMIT
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn ctw_log_cache_limit() -> usize {
+    CTW_TEST_LOG_CACHE_LIMIT.with(|limit| limit.borrow().unwrap_or(CTW_LOG_CACHE_LIMIT))
+}
+
+fn ctw_hot_prefix_depth_limit() -> usize {
+    static HOT_PREFIX_DEPTH: OnceLock<usize> = OnceLock::new();
+    *HOT_PREFIX_DEPTH.get_or_init(|| {
+        std::env::var("INFOTHEORY_CTW_HOT_PREFIX_DEPTH")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(CTW_HOT_PREFIX_DEPTH_DEFAULT)
+    })
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn ctw_log_overflow_cache_slots() -> usize {
+    CTW_LOG_OVERFLOW_CACHE_SLOTS
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn ctw_log_overflow_cache_slots() -> usize {
+    CTW_TEST_LOG_OVERFLOW_CACHE_SLOTS
+        .with(|slots| slots.borrow().unwrap_or(CTW_LOG_OVERFLOW_CACHE_SLOTS))
+}
+
+#[cfg(test)]
 #[inline(always)]
 fn ensure_log_caches(log_int: &mut Vec<f64>, log_half: &mut Vec<f64>, upto: usize) {
     if upto < log_int.len() {
         return;
     }
+    let required_len = upto + 1;
+    log_int.reserve(required_len - log_int.len());
+    log_half.reserve(required_len - log_half.len());
+    push_log_cache_entries(log_int, log_half, upto);
+}
+
+#[inline(always)]
+fn reserve_bounded_log_cache(cache: &mut Vec<f64>, required_len: usize, max_len: usize) {
+    if cache.capacity() >= required_len {
+        return;
+    }
+    let target_capacity = cache
+        .capacity()
+        .saturating_mul(2)
+        .max(required_len)
+        .min(max_len);
+    cache.reserve_exact(target_capacity - cache.len());
+}
+
+#[inline(always)]
+fn ensure_bounded_log_caches(
+    log_int: &mut Vec<f64>,
+    log_half: &mut Vec<f64>,
+    upto: usize,
+    limit: usize,
+) {
+    let target = upto.min(limit);
+    if target < log_int.len() {
+        return;
+    }
+    let required_len = target + 1;
+    let max_len = limit + 1;
+    reserve_bounded_log_cache(log_int, required_len, max_len);
+    reserve_bounded_log_cache(log_half, required_len, max_len);
+    push_log_cache_entries(log_int, log_half, target);
+}
+
+#[inline(always)]
+fn push_log_cache_entries(log_int: &mut Vec<f64>, log_half: &mut Vec<f64>, upto: usize) {
     let start = log_int.len();
-    log_int.reserve(upto + 1 - start);
-    log_half.reserve(upto + 1 - start);
     for n in start..=upto {
         if n == 0 {
             log_int.push(f64::NEG_INFINITY);
@@ -30,10 +322,164 @@ fn ensure_log_caches(log_int: &mut Vec<f64>, log_half: &mut Vec<f64>, upto: usiz
     }
 }
 
+struct LogCacheSlot {
+    key: Cell<usize>,
+    value: Cell<f64>,
+}
+
+impl LogCacheSlot {
+    #[inline(always)]
+    fn empty() -> Self {
+        Self {
+            key: Cell::new(usize::MAX),
+            value: Cell::new(0.0),
+        }
+    }
+}
+
+#[inline(always)]
+fn ensure_overflow_log_cache(cache: &mut Vec<LogCacheSlot>, slots: usize) {
+    if slots == 0 {
+        cache.clear();
+        cache.shrink_to(0);
+        return;
+    }
+    if cache.len() == slots {
+        return;
+    }
+    cache.clear();
+    if cache.capacity() < slots {
+        cache.reserve_exact(slots);
+    }
+    cache.resize_with(slots, LogCacheSlot::empty);
+    if cache.capacity() > slots {
+        cache.shrink_to(slots);
+    }
+}
+
+trait CtLogAccess: Copy {
+    fn log_int(self, n: usize) -> f64;
+    fn log_half(self, n: usize) -> f64;
+}
+
+#[derive(Clone, Copy)]
+struct CachedLogs<'a> {
+    log_int: &'a [f64],
+    log_half: &'a [f64],
+}
+
+impl<'a> CachedLogs<'a> {
+    #[cfg(test)]
+    #[inline(always)]
+    fn new(log_int: &'a [f64], log_half: &'a [f64]) -> Self {
+        Self { log_int, log_half }
+    }
+}
+
+impl CtLogAccess for CachedLogs<'_> {
+    #[inline(always)]
+    fn log_int(self, n: usize) -> f64 {
+        debug_assert!(n < self.log_int.len());
+        // SAFETY: `CachedLogs` is used only when the shared prefix cache already
+        // contains every value through the current visit bound.
+        unsafe { *self.log_int.get_unchecked(n) }
+    }
+
+    #[inline(always)]
+    fn log_half(self, n: usize) -> f64 {
+        debug_assert!(n < self.log_half.len());
+        // SAFETY: `CachedLogs` is used only when the shared prefix cache already
+        // contains every value through the current visit bound.
+        unsafe { *self.log_half.get_unchecked(n) }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BoundedLogs<'a> {
+    log_int: &'a [f64],
+    log_half: &'a [f64],
+    overflow_log_int: &'a [LogCacheSlot],
+    overflow_log_half: &'a [LogCacheSlot],
+}
+
+impl<'a> BoundedLogs<'a> {
+    #[cfg(test)]
+    #[inline(always)]
+    fn new(log_int: &'a [f64], log_half: &'a [f64]) -> Self {
+        Self {
+            log_int,
+            log_half,
+            overflow_log_int: &[],
+            overflow_log_half: &[],
+        }
+    }
+
+    #[inline(always)]
+    fn with_overflow(
+        log_int: &'a [f64],
+        log_half: &'a [f64],
+        overflow_log_int: &'a [LogCacheSlot],
+        overflow_log_half: &'a [LogCacheSlot],
+    ) -> Self {
+        Self {
+            log_int,
+            log_half,
+            overflow_log_int,
+            overflow_log_half,
+        }
+    }
+
+    #[inline(always)]
+    fn lookup_overflow(slots: &'a [LogCacheSlot], n: usize, compute: impl FnOnce() -> f64) -> f64 {
+        if slots.is_empty() {
+            return compute();
+        }
+        let len = slots.len();
+        let slot_idx = if len.is_power_of_two() {
+            n & (len - 1)
+        } else {
+            n % len
+        };
+        let slot = &slots[slot_idx];
+        if slot.key.get() == n {
+            slot.value.get()
+        } else {
+            let value = compute();
+            slot.key.set(n);
+            slot.value.set(value);
+            value
+        }
+    }
+}
+
+impl CtLogAccess for BoundedLogs<'_> {
+    #[inline(always)]
+    fn log_int(self, n: usize) -> f64 {
+        if n < self.log_int.len() {
+            self.log_int[n]
+        } else if n == 0 {
+            f64::NEG_INFINITY
+        } else {
+            Self::lookup_overflow(self.overflow_log_int, n, || (n as f64).ln())
+        }
+    }
+
+    #[inline(always)]
+    fn log_half(self, n: usize) -> f64 {
+        if n < self.log_half.len() {
+            self.log_half[n]
+        } else {
+            Self::lookup_overflow(self.overflow_log_half, n, || (n as f64 + 0.5).ln())
+        }
+    }
+}
+
 #[derive(Default)]
 struct SharedLogCache {
     log_int: Vec<f64>,
     log_half: Vec<f64>,
+    overflow_log_int: Vec<LogCacheSlot>,
+    overflow_log_half: Vec<LogCacheSlot>,
 }
 
 impl SharedLogCache {
@@ -41,17 +487,28 @@ impl SharedLogCache {
         Self {
             log_int: vec![f64::NEG_INFINITY],
             log_half: vec![(0.5f64).ln()],
+            overflow_log_int: Vec::new(),
+            overflow_log_half: Vec::new(),
         }
     }
 
     #[inline(always)]
     fn ensure(&mut self, upto: usize) {
-        ensure_log_caches(&mut self.log_int, &mut self.log_half, upto);
+        let limit = ctw_log_cache_limit();
+        ensure_bounded_log_caches(&mut self.log_int, &mut self.log_half, upto, limit);
+        if upto > limit {
+            let slots = ctw_log_overflow_cache_slots();
+            ensure_overflow_log_cache(&mut self.overflow_log_int, slots);
+            ensure_overflow_log_cache(&mut self.overflow_log_half, slots);
+        }
     }
 
     #[inline(always)]
     fn memory_usage(&self) -> usize {
-        self.log_int.capacity() * size_of::<f64>() + self.log_half.capacity() * size_of::<f64>()
+        self.log_int.capacity() * size_of::<f64>()
+            + self.log_half.capacity() * size_of::<f64>()
+            + self.overflow_log_int.capacity() * size_of::<LogCacheSlot>()
+            + self.overflow_log_half.capacity() * size_of::<LogCacheSlot>()
     }
 }
 
@@ -60,12 +517,40 @@ thread_local! {
         RefCell::new(SharedLogCache::new());
 }
 
+#[cfg(test)]
+thread_local! {
+    static CTW_TEST_LOG_CACHE_LIMIT: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static CTW_TEST_LOG_OVERFLOW_CACHE_SLOTS: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
+
 #[inline]
-fn with_shared_log_cache<R>(upto: usize, f: impl FnOnce(&[f64], &[f64]) -> R) -> R {
+fn with_shared_cached_logs<R>(upto: usize, f: impl FnOnce(CachedLogs<'_>) -> R) -> R {
+    debug_assert!(upto <= ctw_log_cache_limit());
     CTW_SHARED_LOG_CACHE.with(|cache_cell| {
         let mut cache = cache_cell.borrow_mut();
         cache.ensure(upto);
-        f(&cache.log_int, &cache.log_half)
+        f(CachedLogs {
+            log_int: &cache.log_int,
+            log_half: &cache.log_half,
+        })
+    })
+}
+
+#[inline]
+fn with_shared_bounded_logs<R>(upto: usize, f: impl FnOnce(BoundedLogs<'_>) -> R) -> R {
+    CTW_SHARED_LOG_CACHE.with(|cache_cell| {
+        let mut cache = cache_cell.borrow_mut();
+        cache.ensure(upto);
+        f(BoundedLogs::with_overflow(
+            &cache.log_int,
+            &cache.log_half,
+            &cache.overflow_log_int,
+            &cache.overflow_log_half,
+        ))
     })
 }
 
@@ -83,20 +568,43 @@ fn shared_log_cache_lens() -> (usize, usize) {
     })
 }
 
+#[cfg(test)]
+#[inline]
+fn shared_log_overflow_cache_lens() -> (usize, usize) {
+    CTW_SHARED_LOG_CACHE.with(|cache_cell| {
+        let cache = cache_cell.borrow();
+        (cache.overflow_log_int.len(), cache.overflow_log_half.len())
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn reset_shared_log_cache_for_test() {
+    CTW_SHARED_LOG_CACHE.with(|cache_cell| {
+        *cache_cell.borrow_mut() = SharedLogCache::new();
+    });
+}
+
 #[inline(always)]
-fn history_symbol(history: &[Symbol], depth: usize) -> Symbol {
+fn history_symbol<H: HistoryAccess + ?Sized>(history: &H, depth: usize) -> Symbol {
+    if let Some(bit) = history.recent_bit(depth) {
+        return bit;
+    }
     let idx = history.len().wrapping_sub(depth + 1);
     if depth < history.len() {
-        unsafe { *history.get_unchecked(idx) }
+        history.bit(idx)
     } else {
         false
     }
 }
 
 #[inline(always)]
-unsafe fn history_at_or_zero(history_ptr: *const Symbol, history_len: isize, idx: isize) -> Symbol {
+fn history_at_or_zero<H: HistoryAccess + ?Sized>(
+    history: &H,
+    history_len: isize,
+    idx: isize,
+) -> Symbol {
     if idx >= 0 && idx < history_len {
-        *history_ptr.add(idx as usize)
+        history.bit(idx as usize)
     } else {
         false
     }
@@ -342,7 +850,7 @@ impl SegmentPayload {
     }
 
     #[inline(always)]
-    fn from_path(history: &[Symbol], depth: usize, len: u32) -> Option<Self> {
+    fn from_path<H: HistoryAccess + ?Sized>(history: &H, depth: usize, len: u32) -> Option<Self> {
         if len > SEG_EXACT_MAX_LEN {
             return None;
         }
@@ -452,7 +960,10 @@ fn low_bits_mask_u64(len: u32) -> u64 {
 }
 
 #[inline(always)]
-fn path_bits_from_history(history: &[Symbol], depth: usize, len: usize) -> u64 {
+fn path_bits_from_history<H: HistoryAccess + ?Sized>(history: &H, depth: usize, len: usize) -> u64 {
+    if let Some(bits) = history.recent_path_bits(depth, len) {
+        return bits;
+    }
     let history_len = history.len();
     let available = history_len.saturating_sub(depth).min(len);
     if available == 0 {
@@ -462,7 +973,7 @@ fn path_bits_from_history(history: &[Symbol], depth: usize, len: usize) -> u64 {
     let mut bits = 0u64;
     let mut hist_idx = history_len - depth - 1;
     for offset in 0..available {
-        bits |= (unsafe { *history.get_unchecked(hist_idx) } as u64) << offset;
+        bits |= (history.bit(hist_idx) as u64) << offset;
         if hist_idx == 0 {
             break;
         }
@@ -659,6 +1170,10 @@ fn unary_chain_log_weight_precomputed(
 }
 
 #[inline(always)]
+// The CTW ratio transform is a hot scalar kernel; grouping these independent
+// numeric inputs into a temporary struct would add ceremony without clarifying
+// ownership, invariants, or call-site meaning.
+#[allow(clippy::too_many_arguments)]
 fn unary_chain_ratio_transform_precomputed(
     kt_log_prob: f64,
     counts: [u32; 2],
@@ -785,19 +1300,23 @@ fn predict_ratio_internal_one(
 }
 
 #[inline(always)]
-fn path_edge_at_depth(history: &[Symbol], history_len: usize, depth: usize) -> bool {
+fn path_edge_at_depth<H: HistoryAccess + ?Sized>(
+    history: &H,
+    history_len: usize,
+    depth: usize,
+) -> bool {
     if depth < history_len {
-        history[history_len - depth - 1]
+        history.bit(history_len - depth - 1)
     } else {
         false
     }
 }
 
 #[inline(always)]
-fn segment_edge_from_parts(
+fn segment_edge_from_parts<H: HistoryAccess + ?Sized>(
     segment: CtSegment,
     offset: usize,
-    history: &[Symbol],
+    history: &H,
     history_len: usize,
 ) -> bool {
     match segment.payload.mode() {
@@ -806,7 +1325,7 @@ fn segment_edge_from_parts(
             if segment.payload.anchor_or_const() as usize >= offset {
                 let hist_idx = segment.payload.anchor_or_const() as usize - offset;
                 if hist_idx < history_len {
-                    let raw = history[hist_idx];
+                    let raw = history.bit(hist_idx);
                     if segment.payload.mode() == SEG_MODE_HISTORY_INVERT {
                         !raw
                     } else {
@@ -825,10 +1344,10 @@ fn segment_edge_from_parts(
 }
 
 #[inline(always)]
-fn first_segment_mismatch(
+fn first_segment_mismatch<H: HistoryAccess + ?Sized>(
     segment: CtSegment,
     depth: usize,
-    history: &[Symbol],
+    history: &H,
     comparable_len: usize,
 ) -> Option<(usize, bool, bool)> {
     if comparable_len == 0 {
@@ -842,16 +1361,13 @@ fn first_segment_mismatch(
             comparable_len,
         ),
         SEG_MODE_HISTORY | SEG_MODE_HISTORY_INVERT => {
-            let history_ptr = history.as_ptr();
             let history_len = history.len() as isize;
             let mut path_hist_idx = history_len - depth as isize - 1;
             let mut seg_hist_idx = segment.payload.anchor_or_const() as isize;
             let invert = segment.payload.mode() == SEG_MODE_HISTORY_INVERT;
             for offset in 0..comparable_len {
-                let path_edge =
-                    unsafe { history_at_or_zero(history_ptr, history_len, path_hist_idx) };
-                let existing_raw =
-                    unsafe { history_at_or_zero(history_ptr, history_len, seg_hist_idx) };
+                let path_edge = history_at_or_zero(history, history_len, path_hist_idx);
+                let existing_raw = history_at_or_zero(history, history_len, seg_hist_idx);
                 let existing_edge = if invert { !existing_raw } else { existing_raw };
                 if existing_edge != path_edge {
                     return Some((offset, path_edge, existing_edge));
@@ -862,13 +1378,11 @@ fn first_segment_mismatch(
             None
         }
         SEG_MODE_CONST => {
-            let history_ptr = history.as_ptr();
             let history_len = history.len() as isize;
             let mut path_hist_idx = history_len - depth as isize - 1;
             let existing_edge = segment.payload.const_bit();
             for offset in 0..comparable_len {
-                let path_edge =
-                    unsafe { history_at_or_zero(history_ptr, history_len, path_hist_idx) };
+                let path_edge = history_at_or_zero(history, history_len, path_hist_idx);
                 if existing_edge != path_edge {
                     return Some((offset, path_edge, existing_edge));
                 }
@@ -881,9 +1395,8 @@ fn first_segment_mismatch(
 }
 
 #[inline]
-fn apply_update_to_state_raw(
-    log_int: &[f64],
-    log_half: &[f64],
+fn apply_update_to_state_raw<L: CtLogAccess>(
+    logs: L,
     symbol_count: &mut [u32; 2],
     log_prob_kt: &mut f64,
     sym_idx: usize,
@@ -891,10 +1404,8 @@ fn apply_update_to_state_raw(
     let total_before = (symbol_count[0] + symbol_count[1]) as usize;
     let sym_before = symbol_count[sym_idx] as usize;
     debug_assert!(sym_before <= total_before);
-    debug_assert!(sym_before < log_half.len());
-    debug_assert!(total_before + 1 < log_int.len());
-    let log_half_before = unsafe { *log_half.get_unchecked(sym_before) };
-    let log_total_after = unsafe { *log_int.get_unchecked(total_before + 1) };
+    let log_half_before = logs.log_half(sym_before);
+    let log_total_after = logs.log_int(total_before + 1);
     *log_prob_kt += log_half_before - log_total_after;
     if *log_prob_kt > 1.0e-10 {
         *log_prob_kt = 0.0;
@@ -905,9 +1416,8 @@ fn apply_update_to_state_raw(
 }
 
 #[inline]
-fn apply_revert_to_state_raw(
-    log_int: &[f64],
-    log_half: &[f64],
+fn apply_revert_to_state_raw<L: CtLogAccess>(
+    logs: L,
     symbol_count: &mut [u32; 2],
     log_prob_kt: &mut f64,
     sym_idx: usize,
@@ -915,10 +1425,8 @@ fn apply_revert_to_state_raw(
     let total = (symbol_count[0] + symbol_count[1]) as usize;
     let sym_count = symbol_count[sym_idx] as usize;
     if sym_count > 0 && total > 0 {
-        debug_assert!(sym_count - 1 < log_half.len());
-        debug_assert!(total < log_int.len());
-        let log_half_before = unsafe { *log_half.get_unchecked(sym_count - 1) };
-        let log_total = unsafe { *log_int.get_unchecked(total) };
+        let log_half_before = logs.log_half(sym_count - 1);
+        let log_total = logs.log_int(total);
         *log_prob_kt -= log_half_before - log_total;
         symbol_count[sym_idx] -= 1;
     }
@@ -1139,7 +1647,12 @@ impl CtArena {
     }
 
     #[inline(always)]
-    fn segment_edge(&self, segment_idx: SegmentIndex, offset: u32, history: &[Symbol]) -> usize {
+    fn segment_edge(
+        &self,
+        segment_idx: SegmentIndex,
+        offset: u32,
+        history: &(impl HistoryAccess + ?Sized),
+    ) -> usize {
         let segment = self.segments[segment_idx.get()];
         segment_edge_from_parts(segment, offset as usize, history, history.len()) as usize
     }
@@ -1255,9 +1768,13 @@ impl CtArena {
         }
     }
 
+    // These fields are the exact segment state plus insertion context. Keeping
+    // them as scalar arguments avoids building a transient descriptor on this
+    // path-compression hot path.
+    #[allow(clippy::too_many_arguments)]
     fn prepend_or_alloc_segment(
         &mut self,
-        history: &[Symbol],
+        history: &(impl HistoryAccess + ?Sized),
         depth: usize,
         symbol_count: [u32; 2],
         log_prob_kt: f64,
@@ -1367,7 +1884,6 @@ struct CtEngine {
 impl CtEngine {
     const RESERVE_MIN_NODES: usize = 4 * 1024;
     const RESERVE_MAX_NODES: usize = 1 << 18;
-    const HOT_PREFIX_DEPTH: usize = 10;
 
     fn new(depth: usize) -> Self {
         let mut arena = CtArena::with_capacity(1024.min(1 << depth.min(16)));
@@ -1407,7 +1923,69 @@ impl CtEngine {
 
     #[inline(always)]
     fn hot_prefix_depth(&self) -> usize {
-        self.max_depth.min(Self::HOT_PREFIX_DEPTH)
+        self.max_depth.min(ctw_hot_prefix_depth_limit())
+    }
+
+    #[inline(always)]
+    fn push_prepared_segment_step(
+        &mut self,
+        segment_idx: SegmentIndex,
+        offset: usize,
+        sibling_weight: f64,
+        has_sibling: u8,
+    ) {
+        let span = (offset + 1) as u32;
+        self.prepared_steps.push(PreparedStep {
+            source: ExistingSource::Segment(segment_idx, offset as u32),
+            span,
+            sibling_weight,
+            has_sibling,
+        });
+        self.prepared_levels += span as usize;
+    }
+
+    #[inline(always)]
+    fn walk_prepared_exact_segment(
+        &mut self,
+        segment_idx: SegmentIndex,
+        segment: CtSegment,
+        depth: usize,
+        path_bits: u64,
+    ) -> Option<(usize, ExistingSource)> {
+        let seg_len = segment.len() as usize;
+        let terminal_offset = self.max_depth.saturating_sub(depth);
+        let comparable_len = seg_len.min(terminal_offset);
+        if let Some((offset, _, _)) =
+            first_exact_segment_mismatch(segment.payload.exact_bits(), path_bits, comparable_len)
+        {
+            self.push_prepared_segment_step(
+                segment_idx,
+                offset,
+                self.arena
+                    .segment_continuation_weight(segment_idx, offset as u32),
+                1,
+            );
+            self.prepared_end = PreparedEnd::MismatchAtCurrentSegment;
+            return None;
+        }
+
+        if terminal_offset < seg_len {
+            self.push_prepared_segment_step(segment_idx, terminal_offset, 0.0, 0);
+            return None;
+        }
+
+        if segment.tail.is_none() {
+            self.push_prepared_segment_step(segment_idx, seg_len - 1, 0.0, 0);
+            self.prepared_end = PreparedEnd::MissingAfterCurrent;
+            return None;
+        }
+
+        self.push_prepared_segment_step(segment_idx, seg_len - 1, 0.0, 0);
+        let tail = segment.tail;
+        Some((
+            depth + seg_len,
+            Self::child_to_existing_source(tail).unwrap_or(ExistingSource::None),
+        ))
     }
 
     fn clear(&mut self) {
@@ -1446,8 +2024,21 @@ impl CtEngine {
     }
 
     #[inline]
-    fn with_logs<R>(&mut self, upto: usize, f: impl FnOnce(&mut Self, &[f64], &[f64]) -> R) -> R {
-        with_shared_log_cache(upto, |log_int, log_half| f(self, log_int, log_half))
+    fn with_cached_logs<R>(
+        &mut self,
+        upto: usize,
+        f: impl FnOnce(&mut Self, CachedLogs<'_>) -> R,
+    ) -> R {
+        with_shared_cached_logs(upto, |logs| f(self, logs))
+    }
+
+    #[inline]
+    fn with_bounded_logs<R>(
+        &mut self,
+        upto: usize,
+        f: impl FnOnce(&mut Self, BoundedLogs<'_>) -> R,
+    ) -> R {
+        with_shared_bounded_logs(upto, |logs| f(self, logs))
     }
 
     #[inline]
@@ -1488,7 +2079,7 @@ impl CtEngine {
     fn build_missing_segment_path(
         &mut self,
         depth: usize,
-        history: &[Symbol],
+        history: &(impl HistoryAccess + ?Sized),
         sym_idx: usize,
         singleton_log_prob_kt: f64,
     ) -> ChildRef {
@@ -1544,7 +2135,7 @@ impl CtEngine {
     fn build_missing_path(
         &mut self,
         depth: usize,
-        history: &[Symbol],
+        history: &(impl HistoryAccess + ?Sized),
         sym_idx: usize,
         singleton_log_prob_kt: f64,
     ) -> ChildRef {
@@ -1667,18 +2258,17 @@ impl CtEngine {
     fn child_to_existing_source(child: ChildRef) -> Option<ExistingSource> {
         if let Some(node) = child.as_node() {
             Some(ExistingSource::Node(node))
-        } else if let Some(segment) = child.as_segment() {
-            Some(ExistingSource::Segment(segment, 0))
         } else {
-            None
+            child
+                .as_segment()
+                .map(|segment| ExistingSource::Segment(segment, 0))
         }
     }
 
     #[inline(always)]
-    fn update_source_state(
+    fn update_source_state<L: CtLogAccess>(
         &mut self,
-        log_int: &[f64],
-        log_half: &[f64],
+        logs: L,
         source: ExistingSource,
         sym_idx: usize,
     ) {
@@ -1687,13 +2277,7 @@ impl CtEngine {
                 let slot = node_idx.get();
                 let mut counts = self.arena.nodes[slot].symbol_count;
                 let mut log_prob_kt = self.arena.nodes[slot].log_prob_kt;
-                apply_update_to_state_raw(
-                    log_int,
-                    log_half,
-                    &mut counts,
-                    &mut log_prob_kt,
-                    sym_idx,
-                );
+                apply_update_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
                 self.arena.nodes[slot].symbol_count = counts;
                 self.arena.nodes[slot].log_prob_kt = log_prob_kt;
             }
@@ -1701,13 +2285,7 @@ impl CtEngine {
                 let slot = segment_idx.get();
                 let mut counts = self.arena.segments[slot].symbol_count;
                 let mut log_prob_kt = self.arena.segments[slot].log_prob_kt;
-                apply_update_to_state_raw(
-                    log_int,
-                    log_half,
-                    &mut counts,
-                    &mut log_prob_kt,
-                    sym_idx,
-                );
+                apply_update_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
                 self.arena.segments[slot].symbol_count = counts;
                 self.arena.segments[slot].log_prob_kt = log_prob_kt;
             }
@@ -1744,7 +2322,7 @@ impl CtEngine {
 
     fn attach_missing_after_prepared_path(
         &mut self,
-        history: &[Symbol],
+        history: &(impl HistoryAccess + ?Sized),
         sym_idx: usize,
         singleton_log_prob_kt: f64,
     ) {
@@ -1775,7 +2353,7 @@ impl CtEngine {
 
     fn replace_prepared_child(
         &mut self,
-        history: &[Symbol],
+        history: &(impl HistoryAccess + ?Sized),
         step_index: usize,
         current_start_depth: usize,
         new_child: ChildRef,
@@ -1799,17 +2377,16 @@ impl CtEngine {
         }
     }
 
-    fn update_prepared_mismatch(
+    fn update_prepared_mismatch<L: CtLogAccess>(
         &mut self,
-        log_int: &[f64],
-        log_half: &[f64],
-        history: &[Symbol],
+        logs: L,
+        history: &(impl HistoryAccess + ?Sized),
         sym_idx: usize,
         singleton_log_prob_kt: f64,
     ) -> ChildRef {
         let last_index = self.prepared_steps.len() - 1;
         for idx in 0..last_index {
-            self.update_source_state(log_int, log_half, self.prepared_steps[idx].source, sym_idx);
+            self.update_source_state(logs, self.prepared_steps[idx].source, sym_idx);
         }
 
         let last_step = self.prepared_steps[last_index];
@@ -1852,13 +2429,7 @@ impl CtEngine {
             self.build_missing_path(node_depth + 1, history, sym_idx, singleton_log_prob_kt);
         let mut updated_counts = original.symbol_count;
         let mut updated_log_prob_kt = original.log_prob_kt;
-        apply_update_to_state_raw(
-            log_int,
-            log_half,
-            &mut updated_counts,
-            &mut updated_log_prob_kt,
-            sym_idx,
-        );
+        apply_update_to_state_raw(logs, &mut updated_counts, &mut updated_log_prob_kt, sym_idx);
 
         let branch = self
             .arena
@@ -1895,11 +2466,10 @@ impl CtEngine {
         self.arena.child(self.root, root_edge)
     }
 
-    fn update_prepared_cached_path(
+    fn update_prepared_cached_path<L: CtLogAccess>(
         &mut self,
-        log_int: &[f64],
-        log_half: &[f64],
-        history: &[Symbol],
+        logs: L,
+        history: &(impl HistoryAccess + ?Sized),
         sym_idx: usize,
         singleton_log_prob_kt: f64,
     ) {
@@ -1940,13 +2510,7 @@ impl CtEngine {
                 ExistingSource::Node(node_idx) => {
                     let (mut counts, mut log_prob_kt) =
                         self.source_counts_and_kt_log_prob(step.source);
-                    apply_update_to_state_raw(
-                        log_int,
-                        log_half,
-                        &mut counts,
-                        &mut log_prob_kt,
-                        sym_idx,
-                    );
+                    apply_update_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
                     let weighted =
                         if idx == last_index && self.prepared_end == PreparedEnd::MaxDepth {
                             debug_assert_eq!(step.has_sibling, 0);
@@ -1968,13 +2532,7 @@ impl CtEngine {
                 ExistingSource::Segment(segment_idx, offset) => {
                     let (mut counts, mut log_prob_kt) =
                         self.source_counts_and_kt_log_prob(step.source);
-                    apply_update_to_state_raw(
-                        log_int,
-                        log_half,
-                        &mut counts,
-                        &mut log_prob_kt,
-                        sym_idx,
-                    );
+                    apply_update_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
                     let slot = segment_idx.get();
                     let weighted =
                         if idx == last_index && self.prepared_end == PreparedEnd::MaxDepth {
@@ -1983,7 +2541,7 @@ impl CtEngine {
                             clamp_log_prob(log_prob_kt)
                         } else {
                             let (alpha, log_alpha, log_one_minus_alpha) =
-                                self.segment_constants(self.arena.segments[slot].len());
+                                self.segment_constants(step.span);
                             unary_chain_log_weight_precomputed(
                                 log_prob_kt,
                                 child_weight,
@@ -2002,13 +2560,12 @@ impl CtEngine {
         }
     }
 
-    fn update_child_fast(
+    fn update_child_fast<L: CtLogAccess>(
         &mut self,
-        log_int: &[f64],
-        log_half: &[f64],
+        logs: L,
         child: ChildRef,
         depth: usize,
-        history: &[Symbol],
+        history: &(impl HistoryAccess + ?Sized),
         sym_idx: usize,
         singleton_log_prob_kt: f64,
     ) -> ChildRef {
@@ -2024,8 +2581,7 @@ impl CtEngine {
                 let path_edge = history_symbol(history, depth) as usize;
                 let next = self.arena.child(node_idx, path_edge);
                 let updated = self.update_child_fast(
-                    log_int,
-                    log_half,
+                    logs,
                     next,
                     depth + 1,
                     history,
@@ -2038,7 +2594,7 @@ impl CtEngine {
             }
             let mut counts = self.arena.nodes[node_idx.get()].symbol_count;
             let mut log_prob_kt = self.arena.nodes[node_idx.get()].log_prob_kt;
-            apply_update_to_state_raw(log_int, log_half, &mut counts, &mut log_prob_kt, sym_idx);
+            apply_update_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
             self.arena.nodes[node_idx.get()].symbol_count = counts;
             self.arena.nodes[node_idx.get()].log_prob_kt = log_prob_kt;
             self.arena.recompute_node_weight(node_idx);
@@ -2050,13 +2606,7 @@ impl CtEngine {
         let seg_len = original.len() as usize;
         let mut updated_counts = original.symbol_count;
         let mut updated_log_prob_kt = original.log_prob_kt;
-        apply_update_to_state_raw(
-            log_int,
-            log_half,
-            &mut updated_counts,
-            &mut updated_log_prob_kt,
-            sym_idx,
-        );
+        apply_update_to_state_raw(logs, &mut updated_counts, &mut updated_log_prob_kt, sym_idx);
 
         let depth_budget = self.max_depth.saturating_sub(depth);
         let comparable_len = if original.tail.is_none() {
@@ -2136,8 +2686,7 @@ impl CtEngine {
 
         let tail = original.tail;
         let updated_tail = self.update_child_fast(
-            log_int,
-            log_half,
+            logs,
             tail,
             depth + seg_len,
             history,
@@ -2153,13 +2702,16 @@ impl CtEngine {
         ChildRef::from_segment(segment_idx)
     }
 
-    fn update_child_fast_exact(
+    // Exact-mode updates thread together the log table, path state, and KT
+    // singleton value; a wrapper would only hide the data dependencies in this
+    // inner CTW update kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn update_child_fast_exact<L: CtLogAccess>(
         &mut self,
-        log_int: &[f64],
-        log_half: &[f64],
+        logs: L,
         child: ChildRef,
         depth: usize,
-        history: &[Symbol],
+        history: &(impl HistoryAccess + ?Sized),
         path_bits: u64,
         sym_idx: usize,
         singleton_log_prob_kt: f64,
@@ -2182,8 +2734,7 @@ impl CtEngine {
                 let path_edge = (path_bits & 1) as usize;
                 let next = self.arena.child(node_idx, path_edge);
                 let updated = self.update_child_fast_exact(
-                    log_int,
-                    log_half,
+                    logs,
                     next,
                     depth + 1,
                     history,
@@ -2198,7 +2749,7 @@ impl CtEngine {
             let slot = node_idx.get();
             let mut counts = self.arena.nodes[slot].symbol_count;
             let mut log_prob_kt = self.arena.nodes[slot].log_prob_kt;
-            apply_update_to_state_raw(log_int, log_half, &mut counts, &mut log_prob_kt, sym_idx);
+            apply_update_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
             let [left, right] = self.arena.nodes[slot].children;
             let weighted = if left.is_none() && right.is_none() {
                 clamp_log_prob(log_prob_kt)
@@ -2219,8 +2770,7 @@ impl CtEngine {
         let original = self.arena.segments[segment_idx.get()];
         if !original.payload.is_exact() {
             return self.update_child_fast(
-                log_int,
-                log_half,
+                logs,
                 child,
                 depth,
                 history,
@@ -2232,13 +2782,7 @@ impl CtEngine {
         let seg_len = original.len() as usize;
         let mut updated_counts = original.symbol_count;
         let mut updated_log_prob_kt = original.log_prob_kt;
-        apply_update_to_state_raw(
-            log_int,
-            log_half,
-            &mut updated_counts,
-            &mut updated_log_prob_kt,
-            sym_idx,
-        );
+        apply_update_to_state_raw(logs, &mut updated_counts, &mut updated_log_prob_kt, sym_idx);
 
         let depth_budget = self.max_depth.saturating_sub(depth);
         let comparable_len = if original.tail.is_none() {
@@ -2328,8 +2872,7 @@ impl CtEngine {
 
         let tail = original.tail;
         let updated_tail = self.update_child_fast_exact(
-            log_int,
-            log_half,
+            logs,
             tail,
             depth + seg_len,
             history,
@@ -2347,20 +2890,18 @@ impl CtEngine {
     }
 
     #[inline(always)]
-    fn update_root_child(
+    fn update_root_child<L: CtLogAccess>(
         &mut self,
-        log_int: &[f64],
-        log_half: &[f64],
+        logs: L,
         child: ChildRef,
-        history: &[Symbol],
+        history: &(impl HistoryAccess + ?Sized),
         sym_idx: usize,
         singleton_log_prob_kt: f64,
     ) -> ChildRef {
         if self.max_depth <= SEG_EXACT_MAX_LEN as usize {
             let path_bits = path_bits_from_history(history, 1, self.max_depth);
             self.update_child_fast_exact(
-                log_int,
-                log_half,
+                logs,
                 child,
                 1,
                 history,
@@ -2369,19 +2910,11 @@ impl CtEngine {
                 singleton_log_prob_kt,
             )
         } else {
-            self.update_child_fast(
-                log_int,
-                log_half,
-                child,
-                1,
-                history,
-                sym_idx,
-                singleton_log_prob_kt,
-            )
+            self.update_child_fast(logs, child, 1, history, sym_idx, singleton_log_prob_kt)
         }
     }
 
-    fn collect_existing_levels(&mut self, history: &[Symbol]) -> ChildRef {
+    fn collect_existing_levels(&mut self, history: &(impl HistoryAccess + ?Sized)) -> ChildRef {
         if self.max_depth == 0 {
             self.detaches.clear();
             return ChildRef::NONE;
@@ -2472,7 +3005,7 @@ impl CtEngine {
         old_child
     }
 
-    fn rebuild_path_subtree(&mut self, history: &[Symbol]) -> ChildRef {
+    fn rebuild_path_subtree(&mut self, history: &(impl HistoryAccess + ?Sized)) -> ChildRef {
         let mut built = ChildRef::NONE;
 
         for depth in (1..=self.max_depth).rev() {
@@ -2541,20 +3074,19 @@ impl CtEngine {
         }
     }
 
-    fn update_with_logs(
+    fn update_with_logs<L: CtLogAccess>(
         &mut self,
-        log_int: &[f64],
-        log_half: &[f64],
+        logs: L,
         sym: Symbol,
-        history: &[Symbol],
+        history: &(impl HistoryAccess + ?Sized),
     ) {
         let sym_idx = sym as usize;
-        let singleton_log_prob_kt = log_half[0] - log_int[1];
+        let singleton_log_prob_kt = logs.log_half(0) - logs.log_int(1);
         {
             let slot = self.root.get();
             let mut counts = self.arena.nodes[slot].symbol_count;
             let mut log_prob_kt = self.arena.nodes[slot].log_prob_kt;
-            apply_update_to_state_raw(log_int, log_half, &mut counts, &mut log_prob_kt, sym_idx);
+            apply_update_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
             self.arena.nodes[slot].symbol_count = counts;
             self.arena.nodes[slot].log_prob_kt = log_prob_kt;
         }
@@ -2562,140 +3094,146 @@ impl CtEngine {
         if self.max_depth > 0 {
             let root_edge = history_symbol(history, 0) as usize;
             let old_child = self.arena.child(self.root, root_edge);
-            let new_child = self.update_root_child(
-                log_int,
-                log_half,
-                old_child,
-                history,
-                sym_idx,
-                singleton_log_prob_kt,
-            );
+            let new_child =
+                self.update_root_child(logs, old_child, history, sym_idx, singleton_log_prob_kt);
             self.arena.set_child(self.root, root_edge, new_child);
         }
 
         self.arena.recompute_node_weight(self.root);
     }
 
-    fn update(&mut self, sym: Symbol, history: &[Symbol]) {
+    fn update(&mut self, sym: Symbol, history: &(impl HistoryAccess + ?Sized)) {
         let upto = self.root_visits() + 1;
-        self.with_logs(upto, |this, log_int, log_half| {
-            this.update_with_logs(log_int, log_half, sym, history);
-        });
+        if upto <= ctw_log_cache_limit() {
+            self.with_cached_logs(upto, |this, logs| {
+                this.update_with_logs(logs, sym, history);
+            });
+        } else {
+            self.with_bounded_logs(upto, |this, logs| {
+                this.update_with_logs(logs, sym, history);
+            });
+        }
     }
 
-    fn update_prepared(&mut self, sym: Symbol, history: &[Symbol], use_prepared: bool) {
+    fn update_prepared_with_logs<L: CtLogAccess>(
+        &mut self,
+        logs: L,
+        history: &(impl HistoryAccess + ?Sized),
+        sym_idx: usize,
+        use_prepared: bool,
+    ) {
+        let singleton_log_prob_kt = logs.log_half(0) - logs.log_int(1);
+        {
+            let slot = self.root.get();
+            let mut counts = self.arena.nodes[slot].symbol_count;
+            let mut log_prob_kt = self.arena.nodes[slot].log_prob_kt;
+            apply_update_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
+            self.arena.nodes[slot].symbol_count = counts;
+            self.arena.nodes[slot].log_prob_kt = log_prob_kt;
+        }
+
+        if self.max_depth > 0 {
+            let root_edge = history_symbol(history, 0) as usize;
+            let old_child = self.arena.child(self.root, root_edge);
+            let new_child = if use_prepared {
+                match self.prepared_end {
+                    PreparedEnd::MissingAtRoot => {
+                        self.build_missing_path(1, history, sym_idx, singleton_log_prob_kt)
+                    }
+                    PreparedEnd::MaxDepth | PreparedEnd::MissingAfterCurrent => {
+                        if !self.prepared_steps.is_empty() {
+                            self.update_prepared_cached_path(
+                                logs,
+                                history,
+                                sym_idx,
+                                singleton_log_prob_kt,
+                            );
+                        }
+                        old_child
+                    }
+                    PreparedEnd::MismatchAtCurrentSegment => {
+                        self.update_prepared_mismatch(logs, history, sym_idx, singleton_log_prob_kt)
+                    }
+                }
+            } else {
+                self.update_root_child(logs, old_child, history, sym_idx, singleton_log_prob_kt)
+            };
+            self.arena.set_child(self.root, root_edge, new_child);
+        }
+
+        self.arena.recompute_node_weight(self.root);
+    }
+
+    fn update_prepared(
+        &mut self,
+        sym: Symbol,
+        history: &(impl HistoryAccess + ?Sized),
+        use_prepared: bool,
+    ) {
         let upto = self.root_visits() + 1;
         let sym_idx = sym as usize;
-        self.with_logs(upto, |this, log_int, log_half| {
-            let singleton_log_prob_kt = log_half[0] - log_int[1];
-            {
-                let slot = this.root.get();
-                let mut counts = this.arena.nodes[slot].symbol_count;
-                let mut log_prob_kt = this.arena.nodes[slot].log_prob_kt;
-                apply_update_to_state_raw(
-                    log_int,
-                    log_half,
-                    &mut counts,
-                    &mut log_prob_kt,
-                    sym_idx,
-                );
-                this.arena.nodes[slot].symbol_count = counts;
-                this.arena.nodes[slot].log_prob_kt = log_prob_kt;
-            }
-
-            if this.max_depth > 0 {
-                let root_edge = history_symbol(history, 0) as usize;
-                let old_child = this.arena.child(this.root, root_edge);
-                let new_child = if use_prepared {
-                    match this.prepared_end {
-                        PreparedEnd::MissingAtRoot => {
-                            this.build_missing_path(1, history, sym_idx, singleton_log_prob_kt)
-                        }
-                        PreparedEnd::MaxDepth | PreparedEnd::MissingAfterCurrent => {
-                            if !this.prepared_steps.is_empty() {
-                                this.update_prepared_cached_path(
-                                    log_int,
-                                    log_half,
-                                    history,
-                                    sym_idx,
-                                    singleton_log_prob_kt,
-                                );
-                            }
-                            old_child
-                        }
-                        PreparedEnd::MismatchAtCurrentSegment => this.update_prepared_mismatch(
-                            log_int,
-                            log_half,
-                            history,
-                            sym_idx,
-                            singleton_log_prob_kt,
-                        ),
-                    }
-                } else {
-                    this.update_root_child(
-                        log_int,
-                        log_half,
-                        old_child,
-                        history,
-                        sym_idx,
-                        singleton_log_prob_kt,
-                    )
-                };
-                this.arena.set_child(this.root, root_edge, new_child);
-            }
-
-            this.arena.recompute_node_weight(this.root);
-        });
+        if upto <= ctw_log_cache_limit() {
+            self.with_cached_logs(upto, |this, logs| {
+                this.update_prepared_with_logs(logs, history, sym_idx, use_prepared);
+            });
+        } else {
+            self.with_bounded_logs(upto, |this, logs| {
+                this.update_prepared_with_logs(logs, history, sym_idx, use_prepared);
+            });
+        }
     }
 
-    fn revert(&mut self, sym: Symbol, history: &[Symbol]) {
+    fn revert_with_logs<L: CtLogAccess>(
+        &mut self,
+        logs: L,
+        history: &(impl HistoryAccess + ?Sized),
+        sym_idx: usize,
+    ) {
+        let old_child = self.collect_existing_levels(history);
+
+        {
+            let slot = self.root.get();
+            let mut counts = self.arena.nodes[slot].symbol_count;
+            let mut log_prob_kt = self.arena.nodes[slot].log_prob_kt;
+            apply_revert_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
+            self.arena.nodes[slot].symbol_count = counts;
+            self.arena.nodes[slot].log_prob_kt = log_prob_kt;
+        }
+
+        for level in &mut self.levels {
+            let mut counts = level.symbol_count;
+            let mut log_prob_kt = level.log_prob_kt;
+            apply_revert_to_state_raw(logs, &mut counts, &mut log_prob_kt, sym_idx);
+            level.symbol_count = counts;
+            level.log_prob_kt = log_prob_kt;
+        }
+
+        if self.max_depth > 0 {
+            let new_child = self.rebuild_path_subtree(history);
+            let root_edge = history_symbol(history, 0) as usize;
+            self.apply_detaches();
+            self.arena.free_child_ref(old_child);
+            self.arena.set_child(self.root, root_edge, new_child);
+        }
+
+        self.arena.recompute_node_weight(self.root);
+    }
+
+    fn revert(&mut self, sym: Symbol, history: &(impl HistoryAccess + ?Sized)) {
         let upto = self.root_visits();
         let sym_idx = sym as usize;
-        self.with_logs(upto, |this, log_int, log_half| {
-            let old_child = this.collect_existing_levels(history);
-
-            {
-                let slot = this.root.get();
-                let mut counts = this.arena.nodes[slot].symbol_count;
-                let mut log_prob_kt = this.arena.nodes[slot].log_prob_kt;
-                apply_revert_to_state_raw(
-                    log_int,
-                    log_half,
-                    &mut counts,
-                    &mut log_prob_kt,
-                    sym_idx,
-                );
-                this.arena.nodes[slot].symbol_count = counts;
-                this.arena.nodes[slot].log_prob_kt = log_prob_kt;
-            }
-
-            for level in &mut this.levels {
-                let mut counts = level.symbol_count;
-                let mut log_prob_kt = level.log_prob_kt;
-                apply_revert_to_state_raw(
-                    log_int,
-                    log_half,
-                    &mut counts,
-                    &mut log_prob_kt,
-                    sym_idx,
-                );
-                level.symbol_count = counts;
-                level.log_prob_kt = log_prob_kt;
-            }
-
-            if this.max_depth > 0 {
-                let new_child = this.rebuild_path_subtree(history);
-                let root_edge = history_symbol(history, 0) as usize;
-                this.apply_detaches();
-                this.arena.free_child_ref(old_child);
-                this.arena.set_child(this.root, root_edge, new_child);
-            }
-
-            this.arena.recompute_node_weight(this.root);
-        });
+        if upto <= ctw_log_cache_limit() {
+            self.with_cached_logs(upto, |this, logs| {
+                this.revert_with_logs(logs, history, sym_idx);
+            });
+        } else {
+            self.with_bounded_logs(upto, |this, logs| {
+                this.revert_with_logs(logs, history, sym_idx);
+            });
+        }
     }
 
-    fn predict(&mut self, sym: Symbol, history: &[Symbol]) -> f64 {
+    fn predict(&mut self, sym: Symbol, history: &(impl HistoryAccess + ?Sized)) -> f64 {
         self.prepared_steps.clear();
         self.prepared_levels = 0;
         self.prepared_end = PreparedEnd::MaxDepth;
@@ -2751,6 +3289,25 @@ impl CtEngine {
                 }
                 ExistingSource::Segment(segment_idx, _) => {
                     let segment = self.arena.segments[segment_idx.get()];
+                    if segment.payload.is_exact() {
+                        let path_bits = path_bits_from_history(
+                            history,
+                            depth,
+                            self.max_depth.saturating_sub(depth),
+                        );
+                        if let Some((next_depth, next_source)) =
+                            self.walk_prepared_exact_segment(segment_idx, segment, depth, path_bits)
+                        {
+                            source = next_source;
+                            if matches!(source, ExistingSource::None) {
+                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
+                                break 'walk;
+                            }
+                            depth = next_depth;
+                            continue 'walk;
+                        }
+                        break 'walk;
+                    }
                     let seg_len = segment.len() as usize;
                     for offset in 0..seg_len {
                         let node_depth = depth + offset;
@@ -2834,11 +3391,10 @@ impl CtEngine {
 
         let last_step = *self.prepared_steps.last().unwrap();
         let (last_counts, last_kt_log_prob) = self.source_counts_and_kt_log_prob(last_step.source);
-        let (mut child_weight, mut ratio) = if self.prepared_end == PreparedEnd::MaxDepth
-            && self.prepared_levels == self.max_depth
+        let (mut child_weight, mut ratio) = if (self.prepared_end == PreparedEnd::MaxDepth
+            && self.prepared_levels == self.max_depth)
+            || last_step.has_sibling == 0
         {
-            (last_kt_log_prob, predict_ratio_kt(last_counts, sym_idx))
-        } else if last_step.has_sibling == 0 {
             (last_kt_log_prob, predict_ratio_kt(last_counts, sym_idx))
         } else {
             combined_weight_ratio_internal(
@@ -2851,21 +3407,19 @@ impl CtEngine {
             )
         };
 
-        if let ExistingSource::Segment(_, _) = last_step.source {
-            if last_step.span > 1 {
-                let (alpha, log_alpha, log_one_minus_alpha) =
-                    self.segment_constants(last_step.span - 1);
-                (child_weight, ratio) = unary_chain_ratio_transform_precomputed(
-                    last_kt_log_prob,
-                    last_counts,
-                    child_weight,
-                    ratio,
-                    alpha,
-                    log_alpha,
-                    log_one_minus_alpha,
-                    sym_idx,
-                );
-            }
+        if matches!(last_step.source, ExistingSource::Segment(_, _)) && last_step.span > 1 {
+            let (alpha, log_alpha, log_one_minus_alpha) =
+                self.segment_constants(last_step.span - 1);
+            (child_weight, ratio) = unary_chain_ratio_transform_precomputed(
+                last_kt_log_prob,
+                last_counts,
+                child_weight,
+                ratio,
+                alpha,
+                log_alpha,
+                log_one_minus_alpha,
+                sym_idx,
+            );
         }
 
         for idx in (0..self.prepared_steps.len() - 1).rev() {
@@ -2911,7 +3465,7 @@ impl CtEngine {
         )
     }
 
-    fn predict_one(&mut self, history: &[Symbol]) -> f64 {
+    fn predict_one(&mut self, history: &(impl HistoryAccess + ?Sized)) -> f64 {
         self.prepared_steps.clear();
         self.prepared_levels = 0;
         self.prepared_end = PreparedEnd::MaxDepth;
@@ -2967,6 +3521,25 @@ impl CtEngine {
                 }
                 ExistingSource::Segment(segment_idx, _) => {
                     let segment = self.arena.segments[segment_idx.get()];
+                    if segment.payload.is_exact() {
+                        let path_bits = path_bits_from_history(
+                            history,
+                            depth,
+                            self.max_depth.saturating_sub(depth),
+                        );
+                        if let Some((next_depth, next_source)) =
+                            self.walk_prepared_exact_segment(segment_idx, segment, depth, path_bits)
+                        {
+                            source = next_source;
+                            if matches!(source, ExistingSource::None) {
+                                self.prepared_end = PreparedEnd::MissingAfterCurrent;
+                                break 'walk;
+                            }
+                            depth = next_depth;
+                            continue 'walk;
+                        }
+                        break 'walk;
+                    }
                     let seg_len = segment.len() as usize;
                     for offset in 0..seg_len {
                         let node_depth = depth + offset;
@@ -3049,11 +3622,10 @@ impl CtEngine {
 
         let last_step = *self.prepared_steps.last().unwrap();
         let (last_counts, last_kt_log_prob) = self.source_counts_and_kt_log_prob(last_step.source);
-        let (mut child_weight, mut ratio) = if self.prepared_end == PreparedEnd::MaxDepth
-            && self.prepared_levels == self.max_depth
+        let (mut child_weight, mut ratio) = if (self.prepared_end == PreparedEnd::MaxDepth
+            && self.prepared_levels == self.max_depth)
+            || last_step.has_sibling == 0
         {
-            (last_kt_log_prob, predict_ratio_kt_one(last_counts))
-        } else if last_step.has_sibling == 0 {
             (last_kt_log_prob, predict_ratio_kt_one(last_counts))
         } else {
             combined_weight_ratio_internal_one(
@@ -3130,13 +3702,99 @@ impl CtEngine {
             + self.detaches.capacity() * size_of::<Detach>()
             + self.prepared_steps.capacity() * size_of::<PreparedStep>()
     }
+
+    #[cfg(any(test, feature = "research-tooling"))]
+    fn scratch_memory_usage(&self) -> usize {
+        self.segment_alpha.capacity() * size_of::<f64>()
+            + self.segment_log_alpha.capacity() * size_of::<f64>()
+            + self.segment_log_one_minus_alpha.capacity() * size_of::<f64>()
+            + self.levels.capacity() * size_of::<LevelState>()
+            + self.detaches.capacity() * size_of::<Detach>()
+            + self.prepared_steps.capacity() * size_of::<PreparedStep>()
+    }
+
+    #[cfg(any(test, feature = "research-tooling"))]
+    fn telemetry(&self, bit_index: usize) -> FacContextTreeTreeTelemetry {
+        let mut exact_segments: usize = 0;
+        let mut history_segments: usize = 0;
+        let mut history_invert_segments: usize = 0;
+        let mut const_segments: usize = 0;
+        let mut segment_bits: u64 = 0;
+        let mut max_segment_len: u32 = 0;
+        for segment in &self.arena.segments {
+            let len = segment.len();
+            segment_bits = segment_bits.saturating_add(len as u64);
+            max_segment_len = max_segment_len.max(len);
+            match segment.payload.mode() {
+                SEG_MODE_EXACT => exact_segments = exact_segments.saturating_add(1),
+                SEG_MODE_HISTORY => history_segments = history_segments.saturating_add(1),
+                SEG_MODE_HISTORY_INVERT => {
+                    history_invert_segments = history_invert_segments.saturating_add(1);
+                }
+                SEG_MODE_CONST => const_segments = const_segments.saturating_add(1),
+                _ => unreachable!("invalid ctw segment payload mode"),
+            }
+        }
+
+        let node_payload_bytes = self.arena.nodes.len() * size_of::<CtNode>();
+        let node_bytes = self.arena.nodes.capacity() * size_of::<CtNode>();
+        let segment_payload_bytes = self.arena.segments.len() * size_of::<CtSegment>();
+        let segment_bytes = self.arena.segments.capacity() * size_of::<CtSegment>();
+        let free_list_bytes = self.arena.free_nodes.capacity() * size_of::<NodeIndex>()
+            + self.arena.free_segments.capacity() * size_of::<SegmentIndex>();
+        let scratch_bytes = self.scratch_memory_usage();
+        let arena_slack_bytes = node_bytes
+            .saturating_sub(node_payload_bytes)
+            .saturating_add(segment_bytes.saturating_sub(segment_payload_bytes));
+
+        FacContextTreeTreeTelemetry {
+            bit_index,
+            max_depth: self.max_depth,
+            root_visits: self.root_visits(),
+            nodes_len: self.arena.nodes.len(),
+            nodes_capacity: self.arena.nodes.capacity(),
+            segments_len: self.arena.segments.len(),
+            segments_capacity: self.arena.segments.capacity(),
+            free_nodes_len: self.arena.free_nodes.len(),
+            free_nodes_capacity: self.arena.free_nodes.capacity(),
+            free_segments_len: self.arena.free_segments.len(),
+            free_segments_capacity: self.arena.free_segments.capacity(),
+            node_bytes,
+            node_payload_bytes,
+            segment_bytes,
+            segment_payload_bytes,
+            free_list_bytes,
+            scratch_bytes,
+            total_bytes: node_bytes
+                .saturating_add(segment_bytes)
+                .saturating_add(free_list_bytes)
+                .saturating_add(scratch_bytes),
+            arena_slack_bytes,
+            exact_segments,
+            history_segments,
+            history_invert_segments,
+            const_segments,
+            segment_bits,
+            max_segment_len,
+        }
+    }
 }
 
 /// A Context Tree for binary sequence prediction.
 #[derive(Clone)]
 pub struct ContextTree {
     engine: CtEngine,
-    history: Vec<Symbol>,
+    history: BitHistory,
+    history_version: u64,
+    prepared_valid: bool,
+    prepared_history_len: usize,
+    prepared_history_version: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct ContextTreeLifecycleSnapshot {
+    history: BitHistory,
+    history_version: u64,
 }
 
 impl ContextTree {
@@ -3144,21 +3802,62 @@ impl ContextTree {
     pub fn new(depth: usize) -> Self {
         Self {
             engine: CtEngine::new(depth),
-            history: Vec::new(),
+            history: BitHistory::default(),
+            history_version: 0,
+            prepared_valid: false,
+            prepared_history_len: 0,
+            prepared_history_version: 0,
         }
+    }
+
+    #[inline]
+    fn bump_history_version(&mut self) {
+        self.history_version = self.history_version.wrapping_add(1);
+    }
+
+    #[inline]
+    fn clear_prepared_prediction(&mut self) {
+        self.prepared_valid = false;
+    }
+
+    #[inline]
+    fn prepared_prediction_matches_history(&self) -> bool {
+        self.prepared_valid
+            && self.prepared_history_len == self.history.len()
+            && self.prepared_history_version == self.history_version
     }
 
     /// Reset tree parameters and clear conditioning history.
     pub fn clear(&mut self) {
         self.history.clear();
         self.engine.clear();
+        self.history_version = 0;
+        self.clear_prepared_prediction();
+        self.prepared_history_len = 0;
+        self.prepared_history_version = 0;
+    }
+
+    #[inline]
+    pub(crate) fn reserve_for_symbols(&mut self, total_symbols: usize) {
+        if total_symbols == 0 {
+            return;
+        }
+        self.engine.reserve_for_symbols(total_symbols);
+        self.history.reserve_exact(total_symbols);
     }
 
     #[inline]
     /// Observe one binary symbol and update the model.
     pub fn update(&mut self, sym: Symbol) {
-        self.engine.update(sym, &self.history);
+        let use_prepared = self.prepared_prediction_matches_history();
+        self.clear_prepared_prediction();
+        if use_prepared {
+            self.engine.update_prepared(sym, &self.history, true);
+        } else {
+            self.engine.update(sym, &self.history);
+        }
         self.history.push(sym);
+        self.bump_history_version();
     }
 
     #[inline]
@@ -3167,38 +3866,81 @@ impl ContextTree {
         let Some(last_sym) = self.history.pop() else {
             return;
         };
+        self.clear_prepared_prediction();
         self.engine.revert(last_sym, &self.history);
+        self.bump_history_version();
     }
 
     #[inline]
     /// Append external symbols to history without touching model state.
     pub fn update_history(&mut self, symbols: &[Symbol]) {
+        if symbols.is_empty() {
+            return;
+        }
+        self.clear_prepared_prediction();
         self.history.extend_from_slice(symbols);
+        self.bump_history_version();
     }
 
     #[inline]
     /// Remove one history symbol without reverting model statistics.
     pub fn revert_history(&mut self) {
-        self.history.pop();
+        if self.history.pop().is_some() {
+            self.clear_prepared_prediction();
+            self.bump_history_version();
+        }
     }
 
     /// Truncate the stored history to `new_size` symbols.
     pub fn truncate_history(&mut self, new_size: usize) {
         if new_size < self.history.len() {
+            self.clear_prepared_prediction();
             self.history.truncate(new_size);
+            self.bump_history_version();
         }
+    }
+
+    /// Capture rollback state for stream lifecycle transactions.
+    ///
+    /// This clones the full conditioning history, so the allocation and copy are
+    /// O(history length). It is intended for stream lifecycle boundaries rather
+    /// than per-symbol speculative prediction.
+    pub(crate) fn lifecycle_snapshot(&self) -> ContextTreeLifecycleSnapshot {
+        ContextTreeLifecycleSnapshot {
+            history: self.history.clone(),
+            history_version: self.history_version,
+        }
+    }
+
+    pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: ContextTreeLifecycleSnapshot) {
+        self.history = snapshot.history;
+        self.history_version = snapshot.history_version;
+        self.clear_prepared_prediction();
     }
 
     #[inline]
     /// Predict `P(sym | history)` under current weighted CTW model.
     pub fn predict(&mut self, sym: Symbol) -> f64 {
-        self.engine.predict(sym, &self.history)
+        let prob = self.engine.predict(sym, &self.history);
+        self.prepared_valid = true;
+        self.prepared_history_len = self.history.len();
+        self.prepared_history_version = self.history_version;
+        prob
+    }
+
+    #[inline]
+    pub(crate) fn predict_one(&mut self) -> f64 {
+        let prob = self.engine.predict_one(&self.history);
+        self.prepared_valid = true;
+        self.prepared_history_len = self.history.len();
+        self.prepared_history_version = self.history_version;
+        prob
     }
 
     #[inline]
     /// Predict probability of symbol `true`.
     pub fn predict_sym_prob(&mut self) -> f64 {
-        self.predict(true)
+        self.predict_one()
     }
 
     #[inline]
@@ -3228,6 +3970,13 @@ struct ContextTreeCore {
     prepared_history_version: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ContextTreeCorePreparedSnapshot {
+    prepared_valid: bool,
+    prepared_history_len: usize,
+    prepared_history_version: u64,
+}
+
 impl ContextTreeCore {
     fn new(depth: usize) -> Self {
         Self {
@@ -3251,13 +4000,12 @@ impl ContextTreeCore {
     }
 
     #[inline]
-    fn update(&mut self, sym: Symbol, shared_history: &[Symbol]) {
-        self.prepared_valid = false;
-        self.engine.update(sym, shared_history);
-    }
-
-    #[inline]
-    fn update_predicted(&mut self, sym: Symbol, shared_history: &[Symbol], history_version: u64) {
+    fn update_predicted(
+        &mut self,
+        sym: Symbol,
+        shared_history: &(impl HistoryAccess + ?Sized),
+        history_version: u64,
+    ) {
         let use_prepared = self.prepared_valid
             && self.prepared_history_len == shared_history.len()
             && self.prepared_history_version == history_version;
@@ -3267,13 +4015,34 @@ impl ContextTreeCore {
     }
 
     #[inline]
-    fn revert(&mut self, last_sym: Symbol, shared_history: &[Symbol]) {
+    fn update_predicted_with_logs<L: CtLogAccess>(
+        &mut self,
+        logs: L,
+        sym: Symbol,
+        shared_history: &(impl HistoryAccess + ?Sized),
+        history_version: u64,
+    ) {
+        let use_prepared = self.prepared_valid
+            && self.prepared_history_len == shared_history.len()
+            && self.prepared_history_version == history_version;
+        self.prepared_valid = false;
+        self.engine
+            .update_prepared_with_logs(logs, shared_history, sym as usize, use_prepared);
+    }
+
+    #[inline]
+    fn revert(&mut self, last_sym: Symbol, shared_history: &(impl HistoryAccess + ?Sized)) {
         self.prepared_valid = false;
         self.engine.revert(last_sym, shared_history);
     }
 
     #[inline]
-    fn predict(&mut self, sym: Symbol, shared_history: &[Symbol], history_version: u64) -> f64 {
+    fn predict(
+        &mut self,
+        sym: Symbol,
+        shared_history: &(impl HistoryAccess + ?Sized),
+        history_version: u64,
+    ) -> f64 {
         let prob = self.engine.predict(sym, shared_history);
         self.prepared_valid = true;
         self.prepared_history_len = shared_history.len();
@@ -3282,7 +4051,11 @@ impl ContextTreeCore {
     }
 
     #[inline]
-    fn predict_one(&mut self, shared_history: &[Symbol], history_version: u64) -> f64 {
+    fn predict_one(
+        &mut self,
+        shared_history: &(impl HistoryAccess + ?Sized),
+        history_version: u64,
+    ) -> f64 {
         let prob = self.engine.predict_one(shared_history);
         self.prepared_valid = true;
         self.prepared_history_len = shared_history.len();
@@ -3294,16 +4067,178 @@ impl ContextTreeCore {
     fn get_log_block_probability(&self) -> f64 {
         self.engine.get_log_block_probability()
     }
+
+    #[inline]
+    fn prepared_snapshot(&self) -> ContextTreeCorePreparedSnapshot {
+        ContextTreeCorePreparedSnapshot {
+            prepared_valid: self.prepared_valid,
+            prepared_history_len: self.prepared_history_len,
+            prepared_history_version: self.prepared_history_version,
+        }
+    }
+
+    #[inline]
+    fn restore_prepared_snapshot(&mut self, snapshot: ContextTreeCorePreparedSnapshot) {
+        self.prepared_valid = snapshot.prepared_valid;
+        self.prepared_history_len = snapshot.prepared_history_len;
+        self.prepared_history_version = snapshot.prepared_history_version;
+    }
 }
 
 /// Factorized Action-Conditional Context Tree Weighting.
 #[derive(Clone)]
 pub struct FacContextTree {
     trees: Vec<ContextTreeCore>,
-    shared_history: Vec<Symbol>,
+    shared_history: BitHistory,
     base_depth: usize,
     num_bits: usize,
     shared_history_version: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct FacContextTreeLifecycleSnapshot {
+    shared_history: BitHistory,
+    shared_history_version: u64,
+    prepared: Vec<ContextTreeCorePreparedSnapshot>,
+}
+
+/// Approximate heap-memory breakdown for a [`FacContextTree`].
+#[cfg(any(test, feature = "research-tooling"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FacContextTreeMemoryUsage {
+    /// Bytes owned by per-bit CTW tree engines, including arenas and scratch buffers.
+    pub tree_bytes: usize,
+    /// Bytes held by the thread-local shared CTW logarithm cache.
+    pub shared_log_cache_bytes: usize,
+    /// Bytes reserved for the factorized shared history buffer.
+    pub shared_history_bytes: usize,
+}
+
+/// Per-tree CTW arena and scratch telemetry.
+#[cfg(any(test, feature = "research-tooling"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FacContextTreeTreeTelemetry {
+    /// Factorized bit position for this tree.
+    pub bit_index: usize,
+    /// Maximum context depth for this tree.
+    pub max_depth: usize,
+    /// Number of symbols observed by this tree root.
+    pub root_visits: usize,
+    /// Number of allocated explicit nodes.
+    pub nodes_len: usize,
+    /// Reserved explicit-node capacity.
+    pub nodes_capacity: usize,
+    /// Number of allocated unary path segments.
+    pub segments_len: usize,
+    /// Reserved unary-segment capacity.
+    pub segments_capacity: usize,
+    /// Number of node slots currently on the free list.
+    pub free_nodes_len: usize,
+    /// Reserved free-node list capacity.
+    pub free_nodes_capacity: usize,
+    /// Number of segment slots currently on the free list.
+    pub free_segments_len: usize,
+    /// Reserved free-segment list capacity.
+    pub free_segments_capacity: usize,
+    /// Reserved explicit-node bytes.
+    pub node_bytes: usize,
+    /// Explicit-node payload bytes at current length.
+    pub node_payload_bytes: usize,
+    /// Reserved segment bytes.
+    pub segment_bytes: usize,
+    /// Unary-segment payload bytes at current length.
+    pub segment_payload_bytes: usize,
+    /// Reserved free-list bytes.
+    pub free_list_bytes: usize,
+    /// Reserved engine scratch bytes.
+    pub scratch_bytes: usize,
+    /// Total reserved tree bytes for this tree.
+    pub total_bytes: usize,
+    /// Reserved tree bytes currently unused by arena capacity.
+    pub arena_slack_bytes: usize,
+    /// Number of exact-bit segment payloads.
+    pub exact_segments: usize,
+    /// Number of history-anchor segment payloads.
+    pub history_segments: usize,
+    /// Number of inverted history-anchor segment payloads.
+    pub history_invert_segments: usize,
+    /// Number of constant-bit segment payloads.
+    pub const_segments: usize,
+    /// Sum of segment lengths in bits.
+    pub segment_bits: u64,
+    /// Maximum segment length in bits.
+    pub max_segment_len: u32,
+}
+
+/// Detailed FAC-CTW memory telemetry.
+#[cfg(any(test, feature = "research-tooling"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FacContextTreeTelemetry {
+    /// Base depth used to construct tree 0.
+    pub base_depth: usize,
+    /// Number of factorized bit trees.
+    pub num_bits: usize,
+    /// Shared history length in bits.
+    pub shared_history_len_bits: usize,
+    /// Shared history reserved capacity in bits.
+    pub shared_history_capacity_bits: usize,
+    /// Reserved bytes for shared history.
+    pub shared_history_bytes: usize,
+    /// Shared-history payload bytes at current length.
+    pub shared_history_payload_bytes: usize,
+    /// Shared-history reserved slack bytes.
+    pub shared_history_slack_bytes: usize,
+    /// Reserved bytes for shared log caches.
+    pub shared_log_cache_bytes: usize,
+    /// Sum of per-tree reserved bytes.
+    pub tree_bytes: usize,
+    /// Sum of live per-tree node and segment payload bytes.
+    pub tree_payload_bytes: usize,
+    /// Sum of per-tree arena slack bytes.
+    pub tree_arena_slack_bytes: usize,
+    /// Total reserved bytes reported by FAC memory accounting.
+    pub total_bytes: usize,
+    /// Total reserved slack bytes attributable to allocator headroom.
+    pub total_slack_bytes: usize,
+    /// Sum of allocated explicit nodes across trees.
+    pub nodes_len: usize,
+    /// Sum of explicit-node capacity across trees.
+    pub nodes_capacity: usize,
+    /// Sum of allocated unary path segments across trees.
+    pub segments_len: usize,
+    /// Sum of unary-segment capacity across trees.
+    pub segments_capacity: usize,
+    /// Sum of node slots currently on free lists.
+    pub free_nodes_len: usize,
+    /// Sum of segment slots currently on free lists.
+    pub free_segments_len: usize,
+    /// Sum of exact-bit segment payloads across trees.
+    pub exact_segments: usize,
+    /// Sum of history-anchor segment payloads across trees.
+    pub history_segments: usize,
+    /// Sum of inverted history-anchor segment payloads across trees.
+    pub history_invert_segments: usize,
+    /// Sum of constant-bit segment payloads across trees.
+    pub const_segments: usize,
+    /// Sum of segment lengths in bits across trees.
+    pub segment_bits: u64,
+    /// Maximum segment length observed across trees.
+    pub max_segment_len: u32,
+    /// Per-tree telemetry.
+    pub trees: Vec<FacContextTreeTreeTelemetry>,
+}
+
+#[cfg(any(test, feature = "research-tooling"))]
+impl FacContextTreeMemoryUsage {
+    /// Total approximate heap memory in bytes.
+    #[inline]
+    pub fn total_bytes(self) -> usize {
+        self.tree_bytes
+            .saturating_add(self.shared_log_cache_bytes)
+            .saturating_add(self.shared_history_bytes)
+    }
 }
 
 impl FacContextTree {
@@ -3316,7 +4251,7 @@ impl FacContextTree {
             .collect();
         Self {
             trees,
-            shared_history: Vec::new(),
+            shared_history: BitHistory::default(),
             base_depth,
             num_bits: num_percept_bits,
             shared_history_version: 0,
@@ -3357,7 +4292,11 @@ impl FacContextTree {
     /// Update one bit position with a binary symbol.
     pub fn update(&mut self, sym: Symbol, bit_index: usize) {
         debug_assert!(bit_index < self.num_bits);
-        self.trees[bit_index].update(sym, &self.shared_history);
+        self.trees[bit_index].update_predicted(
+            sym,
+            &self.shared_history,
+            self.shared_history_version,
+        );
         self.shared_history.push(sym);
         self.bump_shared_history_version();
     }
@@ -3379,17 +4318,75 @@ impl FacContextTree {
                 .iter()
                 .all(|tree| tree.engine.root_visits() + 1 == upto)
         );
-        with_shared_log_cache(upto, |log_int, log_half| {
-            for bit_idx in 0..8usize {
-                let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
-                let tree = &mut self.trees[bit_idx];
-                tree.prepared_valid = false;
-                tree.engine
-                    .update_with_logs(log_int, log_half, bit, &self.shared_history);
-                self.shared_history.push(bit);
-            }
-        });
+        if upto <= ctw_log_cache_limit() {
+            with_shared_cached_logs(upto, |logs| {
+                for bit_idx in 0..8usize {
+                    let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+                    let tree = &mut self.trees[bit_idx];
+                    tree.prepared_valid = false;
+                    tree.engine
+                        .update_with_logs(logs, bit, &self.shared_history);
+                    self.shared_history.push(bit);
+                }
+            });
+        } else {
+            with_shared_bounded_logs(upto, |logs| {
+                for bit_idx in 0..8usize {
+                    let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+                    let tree = &mut self.trees[bit_idx];
+                    tree.prepared_valid = false;
+                    tree.engine
+                        .update_with_logs(logs, bit, &self.shared_history);
+                    self.shared_history.push(bit);
+                }
+            });
+        }
         self.bump_shared_history_version();
+    }
+
+    #[inline]
+    fn log_prob_update_byte_msb_with_logs<L: CtLogAccess>(&mut self, logs: L, byte: u8) -> f64 {
+        let mut logp = 0.0;
+        for bit_idx in 0..8usize {
+            let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+            let p =
+                self.trees[bit_idx].predict(bit, &self.shared_history, self.shared_history_version);
+            if p.is_finite() && p > 0.0 {
+                logp += p.ln();
+            } else {
+                logp = f64::NEG_INFINITY;
+            }
+            self.trees[bit_idx].update_predicted_with_logs(
+                logs,
+                bit,
+                &self.shared_history,
+                self.shared_history_version,
+            );
+            self.shared_history.push(bit);
+            self.bump_shared_history_version();
+        }
+        logp
+    }
+
+    #[inline]
+    /// Return the MSB-first log probability of `byte` and then update the model.
+    pub fn log_prob_update_byte_msb(&mut self, byte: u8) -> f64 {
+        debug_assert_eq!(self.num_bits, 8);
+        let upto = self.trees[0].engine.root_visits() + 1;
+        debug_assert!(
+            self.trees
+                .iter()
+                .all(|tree| tree.engine.root_visits() + 1 == upto)
+        );
+        if upto <= ctw_log_cache_limit() {
+            with_shared_cached_logs(upto, |logs| {
+                self.log_prob_update_byte_msb_with_logs(logs, byte)
+            })
+        } else {
+            with_shared_bounded_logs(upto, |logs| {
+                self.log_prob_update_byte_msb_with_logs(logs, byte)
+            })
+        }
     }
 
     #[inline]
@@ -3403,16 +4400,29 @@ impl FacContextTree {
                 .take(bits)
                 .all(|tree| tree.engine.root_visits() + 1 == upto)
         );
-        with_shared_log_cache(upto, |log_int, log_half| {
-            for bit_idx in 0..bits {
-                let bit = ((byte >> bit_idx) & 1) == 1;
-                let tree = &mut self.trees[bit_idx];
-                tree.prepared_valid = false;
-                tree.engine
-                    .update_with_logs(log_int, log_half, bit, &self.shared_history);
-                self.shared_history.push(bit);
-            }
-        });
+        if upto <= ctw_log_cache_limit() {
+            with_shared_cached_logs(upto, |logs| {
+                for bit_idx in 0..bits {
+                    let bit = ((byte >> bit_idx) & 1) == 1;
+                    let tree = &mut self.trees[bit_idx];
+                    tree.prepared_valid = false;
+                    tree.engine
+                        .update_with_logs(logs, bit, &self.shared_history);
+                    self.shared_history.push(bit);
+                }
+            });
+        } else {
+            with_shared_bounded_logs(upto, |logs| {
+                for bit_idx in 0..bits {
+                    let bit = ((byte >> bit_idx) & 1) == 1;
+                    let tree = &mut self.trees[bit_idx];
+                    tree.prepared_valid = false;
+                    tree.engine
+                        .update_with_logs(logs, bit, &self.shared_history);
+                    self.shared_history.push(bit);
+                }
+            });
+        }
         self.bump_shared_history_version();
     }
 
@@ -3485,6 +4495,33 @@ impl FacContextTree {
         self.bump_shared_history_version();
     }
 
+    /// Capture rollback state for stream lifecycle transactions.
+    ///
+    /// This clones the shared conditioning history and per-tree prepared-prefix
+    /// state, so the allocation and copy are O(shared history length + number of
+    /// FAC component trees). It is intended for stream lifecycle boundaries
+    /// rather than per-symbol speculative prediction.
+    pub(crate) fn lifecycle_snapshot(&self) -> FacContextTreeLifecycleSnapshot {
+        FacContextTreeLifecycleSnapshot {
+            shared_history: self.shared_history.clone(),
+            shared_history_version: self.shared_history_version,
+            prepared: self
+                .trees
+                .iter()
+                .map(ContextTreeCore::prepared_snapshot)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn restore_lifecycle_snapshot(&mut self, snapshot: FacContextTreeLifecycleSnapshot) {
+        debug_assert_eq!(self.trees.len(), snapshot.prepared.len());
+        self.shared_history = snapshot.shared_history;
+        self.shared_history_version = snapshot.shared_history_version;
+        for (tree, prepared) in self.trees.iter_mut().zip(snapshot.prepared) {
+            tree.restore_prepared_snapshot(prepared);
+        }
+    }
+
     #[inline]
     /// Sum of per-tree log block probabilities.
     pub fn get_log_block_probability(&self) -> f64 {
@@ -3503,6 +4540,94 @@ impl FacContextTree {
         self.shared_history_version = 0;
     }
 
+    /// Approximate heap-memory usage broken down by CTW component.
+    #[cfg(any(test, feature = "research-tooling"))]
+    pub fn memory_usage_breakdown(&self) -> FacContextTreeMemoryUsage {
+        let tree_mem: usize = self.trees.iter().map(|t| t.engine.memory_usage()).sum();
+        let log_cache_mem = self
+            .trees
+            .first()
+            .map(|t| t.engine.log_cache_memory_usage())
+            .unwrap_or(0);
+        let history_mem = self.shared_history.memory_usage();
+        FacContextTreeMemoryUsage {
+            tree_bytes: tree_mem,
+            shared_log_cache_bytes: log_cache_mem,
+            shared_history_bytes: history_mem,
+        }
+    }
+
+    /// Detailed CTW arena, segment, scratch, history, and log-cache telemetry.
+    #[cfg(any(test, feature = "research-tooling"))]
+    pub fn telemetry(&self) -> FacContextTreeTelemetry {
+        let usage = self.memory_usage_breakdown();
+        let trees: Vec<FacContextTreeTreeTelemetry> = self
+            .trees
+            .iter()
+            .enumerate()
+            .map(|(bit_index, tree)| tree.engine.telemetry(bit_index))
+            .collect();
+        let shared_history_payload_bytes =
+            self.shared_history.len().div_ceil(HISTORY_WORD_BITS) * size_of::<u64>();
+        let shared_history_slack_bytes = usage
+            .shared_history_bytes
+            .saturating_sub(shared_history_payload_bytes);
+        let nodes_len = trees.iter().map(|tree| tree.nodes_len).sum();
+        let nodes_capacity = trees.iter().map(|tree| tree.nodes_capacity).sum();
+        let segments_len = trees.iter().map(|tree| tree.segments_len).sum();
+        let segments_capacity = trees.iter().map(|tree| tree.segments_capacity).sum();
+        let free_nodes_len = trees.iter().map(|tree| tree.free_nodes_len).sum();
+        let free_segments_len = trees.iter().map(|tree| tree.free_segments_len).sum();
+        let exact_segments = trees.iter().map(|tree| tree.exact_segments).sum();
+        let history_segments = trees.iter().map(|tree| tree.history_segments).sum();
+        let history_invert_segments = trees.iter().map(|tree| tree.history_invert_segments).sum();
+        let const_segments = trees.iter().map(|tree| tree.const_segments).sum();
+        let segment_bits = trees.iter().map(|tree| tree.segment_bits).sum();
+        let max_segment_len = trees
+            .iter()
+            .map(|tree| tree.max_segment_len)
+            .max()
+            .unwrap_or(0);
+        let tree_payload_bytes = trees
+            .iter()
+            .map(|tree| {
+                tree.node_payload_bytes
+                    .saturating_add(tree.segment_payload_bytes)
+            })
+            .sum();
+        let tree_arena_slack_bytes: usize = trees.iter().map(|tree| tree.arena_slack_bytes).sum();
+        let total_slack_bytes = tree_arena_slack_bytes.saturating_add(shared_history_slack_bytes);
+
+        FacContextTreeTelemetry {
+            base_depth: self.base_depth,
+            num_bits: self.num_bits,
+            shared_history_len_bits: self.shared_history.len(),
+            shared_history_capacity_bits: self.shared_history.words.capacity() * HISTORY_WORD_BITS,
+            shared_history_bytes: usage.shared_history_bytes,
+            shared_history_payload_bytes,
+            shared_history_slack_bytes,
+            shared_log_cache_bytes: usage.shared_log_cache_bytes,
+            tree_bytes: usage.tree_bytes,
+            tree_payload_bytes,
+            tree_arena_slack_bytes,
+            total_bytes: usage.total_bytes(),
+            total_slack_bytes,
+            nodes_len,
+            nodes_capacity,
+            segments_len,
+            segments_capacity,
+            free_nodes_len,
+            free_segments_len,
+            exact_segments,
+            history_segments,
+            history_invert_segments,
+            const_segments,
+            segment_bits,
+            max_segment_len,
+            trees,
+        }
+    }
+
     /// Approximate heap memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
         let tree_mem: usize = self.trees.iter().map(|t| t.engine.memory_usage()).sum();
@@ -3511,14 +4636,282 @@ impl FacContextTree {
             .first()
             .map(|t| t.engine.log_cache_memory_usage())
             .unwrap_or(0);
-        let history_mem = self.shared_history.capacity() * size_of::<Symbol>();
-        tree_mem + log_cache_mem + history_mem
+        let history_mem = self.shared_history.memory_usage();
+        tree_mem
+            .saturating_add(log_cache_mem)
+            .saturating_add(history_mem)
+    }
+}
+
+#[inline]
+fn compact_symbol_msb_shift(bits_per_symbol: usize, bit_idx: usize) -> usize {
+    bits_per_symbol.saturating_sub(1).saturating_sub(bit_idx)
+}
+
+#[inline]
+pub(crate) fn ctw_symbol_bit_msb(symbol: u8, bits_per_symbol: usize, bit_idx: usize) -> bool {
+    let bits = bits_per_symbol.clamp(1, 8);
+    let shift = compact_symbol_msb_shift(bits, bit_idx);
+    ((symbol >> shift) & 1) == 1
+}
+
+#[inline]
+pub(crate) fn ctw_log_prob_msb(
+    tree: &mut ContextTree,
+    symbol: u8,
+    bits_per_symbol: usize,
+    min_prob: f64,
+) -> f64 {
+    let bits = bits_per_symbol.clamp(1, 8);
+    let mut logp = 0.0;
+    for bit_idx in 0..bits {
+        let bit = ctw_symbol_bit_msb(symbol, bits, bit_idx);
+        let p = tree.predict(bit);
+        if p.is_finite() && p > 0.0 {
+            logp += p.ln();
+        } else {
+            logp = f64::NEG_INFINITY;
+        }
+        tree.update(bit);
+    }
+    for _ in 0..bits {
+        tree.revert();
+    }
+    if logp.is_finite() {
+        logp.max(min_prob.ln())
+    } else {
+        min_prob.ln()
+    }
+}
+
+#[inline]
+pub(crate) fn ctw_log_prob_update_msb(
+    tree: &mut ContextTree,
+    symbol: u8,
+    bits_per_symbol: usize,
+    min_prob: f64,
+) -> f64 {
+    let bits = bits_per_symbol.clamp(1, 8);
+    let mut logp = 0.0;
+    for bit_idx in 0..bits {
+        let bit = ctw_symbol_bit_msb(symbol, bits, bit_idx);
+        let p = tree.predict(bit);
+        if p.is_finite() && p > 0.0 {
+            logp += p.ln();
+        } else {
+            logp = f64::NEG_INFINITY;
+        }
+        tree.update(bit);
+    }
+    if logp.is_finite() {
+        logp.max(min_prob.ln())
+    } else {
+        min_prob.ln()
+    }
+}
+
+#[inline]
+pub(crate) fn ctw_log_prob_update_lsb(
+    tree: &mut FacContextTree,
+    symbol: u8,
+    bits_per_symbol: usize,
+    min_prob: f64,
+) -> f64 {
+    let mut logp = 0.0;
+    for bit_idx in 0..bits_per_symbol {
+        let bit = ((symbol >> bit_idx) & 1) == 1;
+        let p = tree.predict(bit, bit_idx);
+        if p.is_finite() && p > 0.0 {
+            logp += p.ln();
+        } else {
+            logp = f64::NEG_INFINITY;
+        }
+        tree.update_predicted(bit, bit_idx);
+    }
+    if logp.is_finite() {
+        logp.max(min_prob.ln())
+    } else {
+        min_prob.ln()
+    }
+}
+
+pub(crate) fn fill_ctw_tree_log_probs(
+    tree: &mut ContextTree,
+    bits_per_symbol: usize,
+    min_logp: f64,
+    out: &mut [f64; 256],
+) {
+    let bits = bits_per_symbol.clamp(1, 8);
+    let patterns = 1usize << bits;
+    let mut pattern_logps = [f64::NEG_INFINITY; 256];
+    let log_before = tree.get_log_block_probability();
+
+    fn rec(
+        tree: &mut ContextTree,
+        depth: usize,
+        bits: usize,
+        log_before: f64,
+        min_logp: f64,
+        symbol_acc: u8,
+        pattern_logps: &mut [f64; 256],
+    ) {
+        if depth == bits {
+            let pat = symbol_acc as usize;
+            let logp = (tree.get_log_block_probability() - log_before).max(min_logp);
+            pattern_logps[pat] = logp;
+            return;
+        }
+
+        for bit in [false, true] {
+            tree.update(bit);
+            let shift = compact_symbol_msb_shift(bits, depth);
+            let next_symbol = if bit {
+                symbol_acc | (1u8 << shift)
+            } else {
+                symbol_acc
+            };
+            rec(
+                tree,
+                depth + 1,
+                bits,
+                log_before,
+                min_logp,
+                next_symbol,
+                pattern_logps,
+            );
+            tree.revert();
+        }
+    }
+
+    rec(tree, 0, bits, log_before, min_logp, 0, &mut pattern_logps);
+
+    if bits == 8 {
+        out.copy_from_slice(&pattern_logps);
+    } else {
+        let aliases = 1usize << (8 - bits);
+        let alias_ln = (aliases as f64).ln();
+        let mask = patterns - 1;
+        for byte in 0..256usize {
+            out[byte] = pattern_logps[byte & mask] - alias_ln;
+        }
+    }
+}
+
+pub(crate) fn fill_fac_tree_log_probs(
+    tree: &mut FacContextTree,
+    bits_per_symbol: usize,
+    msb_first: bool,
+    min_logp: f64,
+    out: &mut [f64; 256],
+) {
+    struct RecParams {
+        bits: usize,
+        msb_first: bool,
+        log_before: f64,
+        min_logp: f64,
+    }
+
+    let bits = bits_per_symbol.clamp(1, 8);
+    let patterns = 1usize << bits;
+    let mut pattern_logps = [f64::NEG_INFINITY; 256];
+    let params = RecParams {
+        bits,
+        msb_first,
+        log_before: tree.get_log_block_probability(),
+        min_logp,
+    };
+
+    fn rec(
+        tree: &mut FacContextTree,
+        depth: usize,
+        params: &RecParams,
+        symbol_acc: u8,
+        pattern_logps: &mut [f64; 256],
+    ) {
+        if depth == params.bits {
+            let pat = symbol_acc as usize;
+            let logp = (tree.get_log_block_probability() - params.log_before).max(params.min_logp);
+            pattern_logps[pat] = logp;
+            return;
+        }
+
+        for bit in [false, true] {
+            tree.update(bit, depth);
+            let mut next_symbol = symbol_acc;
+            if params.msb_first {
+                // Keep sub-byte MSB symbols packed into the low pattern range so the
+                // alias expansion below can index them via `byte & mask`.
+                let shift = compact_symbol_msb_shift(params.bits, depth);
+                if bit {
+                    next_symbol |= 1u8 << shift;
+                }
+            } else if bit {
+                next_symbol |= 1u8 << depth;
+            }
+            rec(tree, depth + 1, params, next_symbol, pattern_logps);
+            tree.revert(depth);
+        }
+    }
+
+    rec(tree, 0, &params, 0, &mut pattern_logps);
+
+    if bits == 8 {
+        out.copy_from_slice(&pattern_logps);
+    } else {
+        let aliases = 1usize << (8 - bits);
+        let alias_ln = (aliases as f64).ln();
+        let mask = patterns - 1;
+        for byte in 0..256usize {
+            out[byte] = pattern_logps[byte & mask] - alias_ln;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ScopedLogCacheLimit {
+        previous: Option<usize>,
+    }
+
+    struct ScopedLogOverflowCacheSlots {
+        previous: Option<usize>,
+    }
+
+    impl ScopedLogCacheLimit {
+        fn set(limit: usize) -> Self {
+            CTW_TEST_LOG_CACHE_LIMIT.with(|cell| {
+                let previous = cell.replace(Some(limit));
+                Self { previous }
+            })
+        }
+    }
+
+    impl ScopedLogOverflowCacheSlots {
+        fn set(slots: usize) -> Self {
+            CTW_TEST_LOG_OVERFLOW_CACHE_SLOTS.with(|cell| {
+                let previous = cell.replace(Some(slots));
+                Self { previous }
+            })
+        }
+    }
+
+    impl Drop for ScopedLogCacheLimit {
+        fn drop(&mut self) {
+            CTW_TEST_LOG_CACHE_LIMIT.with(|cell| {
+                cell.replace(self.previous);
+            });
+        }
+    }
+
+    impl Drop for ScopedLogOverflowCacheSlots {
+        fn drop(&mut self) {
+            CTW_TEST_LOG_OVERFLOW_CACHE_SLOTS.with(|cell| {
+                cell.replace(self.previous);
+            });
+        }
+    }
 
     #[derive(Clone)]
     struct RefNode {
@@ -3586,8 +4979,7 @@ mod tests {
                 self.max_depth,
                 &self.history,
                 sym_idx,
-                &self.log_int,
-                &self.log_half,
+                CachedLogs::new(&self.log_int, &self.log_half),
             );
             self.history.push(sym);
         }
@@ -3605,8 +4997,7 @@ mod tests {
                 self.max_depth,
                 &self.history,
                 sym_idx,
-                &self.log_int,
-                &self.log_half,
+                CachedLogs::new(&self.log_int, &self.log_half),
             );
         }
 
@@ -3631,7 +5022,7 @@ mod tests {
                 if reached_max_depth && idx == deepest {
                     continue;
                 }
-                let child_weight = if idx + 1 <= deepest {
+                let child_weight = if idx < deepest {
                     entries[idx + 1].log_prob_weighted
                 } else {
                     0.0
@@ -3652,14 +5043,13 @@ mod tests {
             self.root.log_prob_weighted
         }
 
-        fn update_node(
+        fn update_node<L: CtLogAccess>(
             node: &mut RefNode,
             depth: usize,
             max_depth: usize,
-            history: &[Symbol],
+            history: &(impl HistoryAccess + ?Sized),
             sym_idx: usize,
-            log_int: &[f64],
-            log_half: &[f64],
+            logs: L,
         ) {
             if depth < max_depth {
                 let edge = history_symbol(history, depth) as usize;
@@ -3672,41 +5062,25 @@ mod tests {
                     max_depth,
                     history,
                     sym_idx,
-                    log_int,
-                    log_half,
+                    logs,
                 );
             }
-            apply_update_to_state_raw(
-                log_int,
-                log_half,
-                &mut node.symbol_count,
-                &mut node.log_prob_kt,
-                sym_idx,
-            );
+            apply_update_to_state_raw(logs, &mut node.symbol_count, &mut node.log_prob_kt, sym_idx);
             Self::recompute(node);
         }
 
-        fn revert_node(
+        fn revert_node<L: CtLogAccess>(
             node: &mut RefNode,
             depth: usize,
             max_depth: usize,
-            history: &[Symbol],
+            history: &(impl HistoryAccess + ?Sized),
             sym_idx: usize,
-            log_int: &[f64],
-            log_half: &[f64],
+            logs: L,
         ) -> bool {
             if depth < max_depth {
                 let edge = history_symbol(history, depth) as usize;
                 let remove_child = if let Some(child) = node.children[edge].as_deref_mut() {
-                    Self::revert_node(
-                        child,
-                        depth + 1,
-                        max_depth,
-                        history,
-                        sym_idx,
-                        log_int,
-                        log_half,
-                    )
+                    Self::revert_node(child, depth + 1, max_depth, history, sym_idx, logs)
                 } else {
                     false
                 };
@@ -3714,13 +5088,7 @@ mod tests {
                     node.children[edge] = None;
                 }
             }
-            apply_revert_to_state_raw(
-                log_int,
-                log_half,
-                &mut node.symbol_count,
-                &mut node.log_prob_kt,
-                sym_idx,
-            );
+            apply_revert_to_state_raw(logs, &mut node.symbol_count, &mut node.log_prob_kt, sym_idx);
             Self::recompute(node);
             node.symbol_count[0] + node.symbol_count[1] == 0
         }
@@ -3729,7 +5097,7 @@ mod tests {
             node: &RefNode,
             depth: usize,
             max_depth: usize,
-            history: &[Symbol],
+            history: &(impl HistoryAccess + ?Sized),
             entries: &mut Vec<PredictEntry>,
         ) -> bool {
             let sibling_weight = if depth < max_depth {
@@ -3813,7 +5181,10 @@ mod tests {
         assert!(diff <= 1e-12 * scale, "a={a} b={b} diff={diff}");
     }
 
-    fn child_after_hot_prefix(tree: &ContextTree, history_before_update: &[Symbol]) -> ChildRef {
+    fn child_after_hot_prefix(
+        tree: &ContextTree,
+        history_before_update: &(impl HistoryAccess + ?Sized),
+    ) -> ChildRef {
         let hot_prefix_depth = tree.engine.hot_prefix_depth();
         if hot_prefix_depth == 0 {
             return ChildRef::NONE;
@@ -3862,8 +5233,302 @@ mod tests {
     }
 
     #[test]
+    fn log_lookup_matches_direct_log_formulas_past_cache_limit() {
+        let log_int = vec![f64::NEG_INFINITY, 0.0, (2.0f64).ln()];
+        let log_half = vec![(0.5f64).ln(), (1.5f64).ln(), (2.5f64).ln()];
+        let lookup = BoundedLogs::new(&log_int, &log_half);
+
+        for n in 0..16usize {
+            let expected_int = if n == 0 {
+                f64::NEG_INFINITY
+            } else {
+                (n as f64).ln()
+            };
+            assert_eq!(lookup.log_int(n).to_bits(), expected_int.to_bits());
+            assert_eq!(
+                lookup.log_half(n).to_bits(),
+                (n as f64 + 0.5).ln().to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn log_lookup_overflow_cache_reuses_hot_exact_values() {
+        let slots = [LogCacheSlot::empty(), LogCacheSlot::empty()];
+        let misses = Cell::new(0usize);
+        let first = BoundedLogs::lookup_overflow(&slots, 17, || {
+            misses.set(misses.get() + 1);
+            (17.0f64).ln()
+        });
+        let second = BoundedLogs::lookup_overflow(&slots, 17, || {
+            misses.set(misses.get() + 1);
+            f64::NAN
+        });
+
+        assert_eq!(first.to_bits(), (17.0f64).ln().to_bits());
+        assert_eq!(second.to_bits(), first.to_bits());
+        assert_eq!(misses.get(), 1);
+    }
+
+    #[test]
+    fn shared_log_cache_respects_test_limit() {
+        reset_shared_log_cache_for_test();
+        let _limit = ScopedLogCacheLimit::set(3);
+        let _overflow_slots = ScopedLogOverflowCacheSlots::set(4);
+        with_shared_bounded_logs(32, |lookup| {
+            assert_eq!(lookup.log_int(32).to_bits(), (32.0f64).ln().to_bits());
+            assert_eq!(lookup.log_half(32).to_bits(), (32.5f64).ln().to_bits());
+        });
+
+        let (log_int_len, log_half_len) = shared_log_cache_lens();
+        let (overflow_log_int_len, overflow_log_half_len) = shared_log_overflow_cache_lens();
+        assert!(log_int_len <= 4, "log_int_len={log_int_len}");
+        assert!(log_half_len <= 4, "log_half_len={log_half_len}");
+        assert_eq!(overflow_log_int_len, 4);
+        assert_eq!(overflow_log_half_len, 4);
+    }
+
+    #[test]
+    fn fac_ctw_memory_usage_breakdown_sums_to_existing_total() {
+        let mut fac = FacContextTree::new(7, 8);
+        let payload = b"ctw memory usage breakdown payload";
+        for &byte in payload {
+            fac.update_byte_msb(byte);
+        }
+
+        let usage = fac.memory_usage_breakdown();
+        assert_eq!(fac.memory_usage(), usage.total_bytes());
+        assert!(usage.tree_bytes > 0);
+        assert!(usage.shared_log_cache_bytes > 0);
+        assert!(usage.shared_history_bytes > 0);
+
+        let telemetry = fac.telemetry();
+        assert_eq!(telemetry.total_bytes, usage.total_bytes());
+        assert_eq!(telemetry.tree_bytes, usage.tree_bytes);
+        assert_eq!(
+            telemetry.shared_log_cache_bytes,
+            usage.shared_log_cache_bytes
+        );
+        assert_eq!(telemetry.shared_history_bytes, usage.shared_history_bytes);
+        assert_eq!(telemetry.shared_history_len_bits, payload.len() * 8);
+        assert_eq!(telemetry.trees.len(), 8);
+        assert_eq!(
+            telemetry.nodes_len,
+            telemetry
+                .trees
+                .iter()
+                .map(|tree| tree.nodes_len)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            telemetry.segments_len,
+            telemetry
+                .trees
+                .iter()
+                .map(|tree| tree.segments_len)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            telemetry.segments_len,
+            telemetry.exact_segments
+                + telemetry.history_segments
+                + telemetry.history_invert_segments
+                + telemetry.const_segments
+        );
+    }
+
+    #[test]
+    fn bit_history_preserves_logical_bits_and_packs_memory() {
+        let mut history = BitHistory::default();
+        let bits: Vec<Symbol> = (0..130usize).map(|idx| (idx * 17 + 5) % 7 < 3).collect();
+        history.extend_from_slice(&bits);
+        assert_eq!(history.len(), bits.len());
+        assert_eq!(history.to_vec(), bits);
+        assert_eq!(history.memory_usage(), 3 * size_of::<u64>());
+        for depth in 0..160usize {
+            assert_eq!(
+                history_symbol(&history, depth),
+                history_symbol(&bits, depth)
+            );
+            for len in [0usize, 1, 2, 7, 31, 32, 33, 63, 64] {
+                assert_eq!(
+                    path_bits_from_history(&history, depth, len),
+                    path_bits_from_history(&bits, depth, len),
+                    "depth={depth} len={len}",
+                );
+            }
+        }
+
+        let last = history.pop();
+        assert_eq!(last, bits.last().copied());
+        assert_eq!(history.len(), bits.len() - 1);
+        let popped_bits = &bits[..bits.len() - 1];
+        for depth in 0..160usize {
+            assert_eq!(
+                history_symbol(&history, depth),
+                history_symbol(popped_bits, depth)
+            );
+            for len in [0usize, 1, 2, 7, 31, 32, 33, 63, 64] {
+                assert_eq!(
+                    path_bits_from_history(&history, depth, len),
+                    path_bits_from_history(popped_bits, depth, len),
+                    "after pop depth={depth} len={len}",
+                );
+            }
+        }
+
+        history.truncate(65);
+        assert_eq!(history.to_vec(), bits[..65].to_vec());
+        assert_eq!(history.memory_usage(), 3 * size_of::<u64>());
+
+        history.clear();
+        assert!(history.is_empty());
+        assert_eq!(history.memory_usage(), 3 * size_of::<u64>());
+    }
+
+    #[test]
+    fn fac_ctw_history_memory_is_bit_packed() {
+        let mut fac = FacContextTree::new(4, 8);
+        fac.reserve_for_symbols(1_000);
+        let usage = fac.memory_usage_breakdown();
+        assert_eq!(
+            usage.shared_history_bytes,
+            history_word_len(8_000) * size_of::<u64>()
+        );
+    }
+
+    #[test]
+    fn fac_ctw_memory_usage_breakdown_reports_bounded_log_cache_component() {
+        reset_shared_log_cache_for_test();
+        let _limit = ScopedLogCacheLimit::set(2);
+        let _overflow_slots = ScopedLogOverflowCacheSlots::set(4);
+        let mut fac = FacContextTree::new(7, 8);
+        for &byte in b"bounded log cache memory component payload" {
+            fac.update_byte_msb(byte);
+        }
+
+        let usage = fac.memory_usage_breakdown();
+        let (log_int_len, log_half_len) = shared_log_cache_lens();
+        let (overflow_log_int_len, overflow_log_half_len) = shared_log_overflow_cache_lens();
+        assert!(log_int_len <= 3, "log_int_len={log_int_len}");
+        assert!(log_half_len <= 3, "log_half_len={log_half_len}");
+        assert_eq!(overflow_log_int_len, 4);
+        assert_eq!(overflow_log_half_len, 4);
+        assert!(
+            usage.shared_log_cache_bytes <= 16 * size_of::<f64>() + 32 * size_of::<LogCacheSlot>()
+        );
+        assert_eq!(fac.memory_usage(), usage.total_bytes());
+    }
+
+    #[test]
+    fn bounded_log_lookup_preserves_context_tree_updates_and_reverts() {
+        let mut bounded = ContextTree::new(9);
+        let mut unbounded = bounded.clone();
+        let stream = b"bounded exact log lookup context-tree parity payload";
+
+        {
+            let _limit = ScopedLogCacheLimit::set(3);
+            for &byte in stream {
+                for bit_idx in 0..8usize {
+                    let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+                    bounded.update(bit);
+                }
+            }
+        }
+
+        for &byte in stream {
+            for bit_idx in 0..8usize {
+                let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+                unbounded.update(bit);
+            }
+        }
+
+        assert_eq!(
+            bounded.get_log_block_probability().to_bits(),
+            unbounded.get_log_block_probability().to_bits()
+        );
+        for &sym in &[false, true] {
+            assert_eq!(
+                bounded.predict(sym).to_bits(),
+                unbounded.predict(sym).to_bits()
+            );
+        }
+
+        {
+            let _limit = ScopedLogCacheLimit::set(3);
+            for _ in 0..16usize {
+                bounded.revert();
+            }
+        }
+        for _ in 0..16usize {
+            unbounded.revert();
+        }
+
+        assert_eq!(
+            bounded.get_log_block_probability().to_bits(),
+            unbounded.get_log_block_probability().to_bits()
+        );
+        for &sym in &[false, true] {
+            assert_eq!(
+                bounded.predict(sym).to_bits(),
+                unbounded.predict(sym).to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_log_lookup_preserves_fac_byte_fast_paths() {
+        let mut bounded_msb = FacContextTree::new(7, 8);
+        let mut unbounded_msb = bounded_msb.clone();
+        let mut bounded_lsb = FacContextTree::new(7, 5);
+        let mut unbounded_lsb = bounded_lsb.clone();
+        let stream = b"bounded exact log lookup fac byte parity payload";
+
+        {
+            let _limit = ScopedLogCacheLimit::set(2);
+            for &byte in stream {
+                bounded_msb.update_byte_msb(byte);
+                bounded_lsb.update_byte_lsb(byte);
+            }
+        }
+        for &byte in stream {
+            unbounded_msb.update_byte_msb(byte);
+            unbounded_lsb.update_byte_lsb(byte);
+        }
+
+        assert_eq!(
+            bounded_msb.get_log_block_probability().to_bits(),
+            unbounded_msb.get_log_block_probability().to_bits()
+        );
+        assert_eq!(
+            bounded_lsb.get_log_block_probability().to_bits(),
+            unbounded_lsb.get_log_block_probability().to_bits()
+        );
+        for bit_idx in 0..bounded_msb.num_bits() {
+            assert_eq!(
+                bounded_msb.predict(false, bit_idx).to_bits(),
+                unbounded_msb.predict(false, bit_idx).to_bits()
+            );
+            assert_eq!(
+                bounded_msb.predict_one(bit_idx).to_bits(),
+                unbounded_msb.predict_one(bit_idx).to_bits()
+            );
+        }
+        for bit_idx in 0..bounded_lsb.num_bits() {
+            assert_eq!(
+                bounded_lsb.predict(false, bit_idx).to_bits(),
+                unbounded_lsb.predict(false, bit_idx).to_bits()
+            );
+            assert_eq!(
+                bounded_lsb.predict_one(bit_idx).to_bits(),
+                unbounded_lsb.predict_one(bit_idx).to_bits()
+            );
+        }
+    }
+
+    #[test]
     fn context_tree_singleton_paths_use_hot_prefix_nodes() {
-        let mut tree = ContextTree::new(12);
+        let mut tree = ContextTree::new(13);
         tree.update(false);
 
         let hot_prefix_depth = tree.engine.hot_prefix_depth();
@@ -3894,7 +5559,7 @@ mod tests {
 
     #[test]
     fn context_tree_missing_path_tail_uses_exact_segment_payloads() {
-        let mut tree = ContextTree::new(12);
+        let mut tree = ContextTree::new(13);
         tree.update(true);
         let child = tree.engine.arena.child(tree.engine.root, 0);
         let mut current = child.as_node().expect("hot-prefix node");
@@ -3953,8 +5618,11 @@ mod tests {
             .expect("history-backed segment tail");
         let first_segment = tree.engine.arena.segments[first_segment.get()];
         assert_eq!(first_segment.payload.mode(), SEG_MODE_HISTORY);
-        assert_eq!(first_segment.payload.len(), 69);
-        for offset in [0usize, 1, 7, 31, 68] {
+        assert_eq!(
+            first_segment.payload.len() as usize,
+            tree.engine.max_depth - tree.engine.hot_prefix_depth() - 1
+        );
+        for offset in [0usize, 1, 7, 31, 66] {
             assert_eq!(
                 segment_edge_from_parts(
                     first_segment,
@@ -4207,6 +5875,32 @@ mod tests {
     }
 
     #[test]
+    fn fac_ctw_log_prob_update_byte_msb_matches_manual_fast_path() {
+        let mut batched = FacContextTree::new(6, 8);
+        for &byte in b"log prob update byte msb regression payload" {
+            let mut manual = batched.clone();
+            let observed = batched.log_prob_update_byte_msb(byte);
+            let mut expected = 0.0;
+            for bit_idx in 0..8usize {
+                let bit = ((byte >> (7 - bit_idx)) & 1) == 1;
+                let p = manual.predict(bit, bit_idx);
+                if p.is_finite() && p > 0.0 {
+                    expected += p.ln();
+                } else {
+                    expected = f64::NEG_INFINITY;
+                }
+                manual.update_predicted(bit, bit_idx);
+            }
+            assert_eq!(observed.to_bits(), expected.to_bits());
+            assert_eq!(batched.shared_history, manual.shared_history);
+            assert_eq!(
+                batched.get_log_block_probability().to_bits(),
+                manual.get_log_block_probability().to_bits(),
+            );
+        }
+    }
+
+    #[test]
     fn fac_ctw_update_byte_lsb_matches_bit_updates() {
         let mut by_byte = FacContextTree::new(6, 5);
         let mut by_bits = FacContextTree::new(6, 5);
@@ -4305,7 +5999,7 @@ mod tests {
     #[test]
     fn fac_ctw_update_predicted_ignores_stale_cache_after_reset_and_rewrite() {
         assert_update_predicted_matches_fresh_after_history_rewrite(|fac| {
-            let mut rewritten = fac.shared_history.clone();
+            let mut rewritten = fac.shared_history.to_vec();
             for bit in &mut rewritten {
                 *bit = !*bit;
             }
@@ -4317,7 +6011,7 @@ mod tests {
     #[test]
     fn fac_ctw_update_predicted_ignores_stale_cache_after_revert_and_rewrite() {
         assert_update_predicted_matches_fresh_after_history_rewrite(|fac| {
-            let original = fac.shared_history.clone();
+            let original = fac.shared_history.to_vec();
             let keep = original.len() / 3;
             let remove = original.len() - keep;
             let mut rewritten_suffix = original[keep..].to_vec();
@@ -4585,29 +6279,25 @@ mod tests {
         rec(tree, bits, 0);
     }
 
-    fn byte_log_prob(tree: &mut FacContextTree, symbol: u8, msb_first: bool, bits: usize) -> f64 {
-        let before = tree.get_log_block_probability();
+    fn fac_symbol_bit(symbol: u8, msb_first: bool, bits: usize, bit_idx: usize) -> bool {
         if msb_first {
-            for bit_idx in 0..bits {
-                let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
-                tree.update(bit, bit_idx);
-            }
-            let after = tree.get_log_block_probability();
-            for bit_idx in (0..bits).rev() {
-                tree.revert(bit_idx);
-            }
-            after - before
+            ctw_symbol_bit_msb(symbol, bits, bit_idx)
         } else {
-            for bit_idx in 0..bits {
-                let bit = ((symbol >> bit_idx) & 1) == 1;
-                tree.update(bit, bit_idx);
-            }
-            let after = tree.get_log_block_probability();
-            for bit_idx in (0..bits).rev() {
-                tree.revert(bit_idx);
-            }
-            after - before
+            ((symbol >> bit_idx) & 1) == 1
         }
+    }
+
+    fn symbol_log_prob(tree: &mut FacContextTree, symbol: u8, msb_first: bool, bits: usize) -> f64 {
+        let before = tree.get_log_block_probability();
+        for bit_idx in 0..bits {
+            let bit = fac_symbol_bit(symbol, msb_first, bits, bit_idx);
+            tree.update(bit, bit_idx);
+        }
+        let after = tree.get_log_block_probability();
+        for bit_idx in (0..bits).rev() {
+            tree.revert(bit_idx);
+        }
+        after - before
     }
 
     fn assert_symbol_scan_then_update_matches_plain(msb_first: bool) {
@@ -4616,11 +6306,7 @@ mod tests {
         let mut plain = with_scan.clone();
         for &byte in b"pdf then update parity payload" {
             for bit_idx in 0..bits {
-                let bit = if msb_first {
-                    ((byte >> (7 - bit_idx)) & 1) == 1
-                } else {
-                    ((byte >> bit_idx) & 1) == 1
-                };
+                let bit = fac_symbol_bit(byte, msb_first, bits, bit_idx);
                 with_scan.update(bit, bit_idx);
                 plain.update(bit, bit_idx);
             }
@@ -4630,23 +6316,66 @@ mod tests {
 
         let observed = b'n';
         for bit_idx in 0..bits {
-            let bit = if msb_first {
-                ((observed >> (7 - bit_idx)) & 1) == 1
-            } else {
-                ((observed >> bit_idx) & 1) == 1
-            };
+            let bit = fac_symbol_bit(observed, msb_first, bits, bit_idx);
             with_scan.update(bit, bit_idx);
             plain.update(bit, bit_idx);
         }
 
         for sym in 0u8..=255u8 {
-            let lp_scan = byte_log_prob(&mut with_scan, sym, msb_first, bits);
-            let lp_plain = byte_log_prob(&mut plain, sym, msb_first, bits);
+            let lp_scan = symbol_log_prob(&mut with_scan, sym, msb_first, bits);
+            let lp_plain = symbol_log_prob(&mut plain, sym, msb_first, bits);
             let diff = (lp_scan - lp_plain).abs();
             assert!(
                 diff < 1e-12,
                 "symbol={sym} lp_scan={lp_scan} lp_plain={lp_plain} diff={diff}",
             );
+        }
+    }
+
+    fn assert_fill_fac_tree_log_probs_matches_direct_symbol_probs(msb_first: bool, bits: usize) {
+        let bits = bits.clamp(1, 8);
+        let min_logp = 1e-12f64.ln();
+        let patterns = 1usize << bits;
+        let alias_ln = if bits == 8 {
+            0.0
+        } else {
+            ((1usize << (8 - bits)) as f64).ln()
+        };
+        let training = [0x0u8, 0x3, 0x5, 0x6, 0x9, 0xA, 0xC, 0xF, 0x7, 0x1];
+        let mut tree = FacContextTree::new(7, bits);
+        for &symbol in &training {
+            for bit_idx in 0..bits {
+                tree.update(fac_symbol_bit(symbol, msb_first, bits, bit_idx), bit_idx);
+            }
+        }
+
+        let log_before = tree.get_log_block_probability();
+        let mut predict_zero_before = vec![0.0; bits];
+        let mut predict_one_before = vec![0.0; bits];
+        for bit_idx in 0..bits {
+            predict_zero_before[bit_idx] = tree.predict(false, bit_idx);
+            predict_one_before[bit_idx] = tree.predict(true, bit_idx);
+        }
+
+        let mut out = [0.0; 256];
+        fill_fac_tree_log_probs(&mut tree, bits, msb_first, min_logp, &mut out);
+
+        assert_close(tree.get_log_block_probability(), log_before);
+        for bit_idx in 0..bits {
+            assert_close(tree.predict(false, bit_idx), predict_zero_before[bit_idx]);
+            assert_close(tree.predict(true, bit_idx), predict_one_before[bit_idx]);
+        }
+
+        let mask = patterns - 1;
+        for (byte, &actual) in out.iter().enumerate() {
+            let symbol = if bits == 8 {
+                byte as u8
+            } else {
+                (byte & mask) as u8
+            };
+            let expected =
+                symbol_log_prob(&mut tree, symbol, msb_first, bits).max(min_logp) - alias_ln;
+            assert_close(actual, expected);
         }
     }
 
@@ -4658,5 +6387,15 @@ mod tests {
     #[test]
     fn fac_ctw_symbol_scan_then_update_matches_plain_lsb() {
         assert_symbol_scan_then_update_matches_plain(false);
+    }
+
+    #[test]
+    fn fill_fac_tree_log_probs_matches_direct_symbol_probs_for_subbyte_msb() {
+        assert_fill_fac_tree_log_probs_matches_direct_symbol_probs(true, 4);
+    }
+
+    #[test]
+    fn fill_fac_tree_log_probs_matches_direct_symbol_probs_for_subbyte_lsb() {
+        assert_fill_fac_tree_log_probs_matches_direct_symbol_probs(false, 4);
     }
 }

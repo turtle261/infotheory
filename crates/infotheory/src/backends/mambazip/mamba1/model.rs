@@ -1339,8 +1339,11 @@ impl Model {
                             cfg,
                         );
                         let mut grad_log = vec![0.0f32; grad.a.len().min(layer.a.len())];
-                        for idx in 0..grad_log.len() {
-                            grad_log[idx] = grad.a[idx] * layer.a[idx];
+                        for (slot, (grad_a, layer_a)) in grad_log
+                            .iter_mut()
+                            .zip(grad.a.as_slice().iter().zip(layer.a.as_slice().iter()))
+                        {
+                            *slot = *grad_a * *layer_a;
                         }
                         apply_adam_vec_update_and_sync_neg_exp(
                             layer.a_log.as_mut_slice(),

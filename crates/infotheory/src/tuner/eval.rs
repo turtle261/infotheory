@@ -1509,7 +1509,7 @@ pub(super) fn cache_key_for_candidate(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::api::{CompressionBackend, RateBackend, ZpaqMethodSpec};
+    use crate::api::{CompressionBackend, RateBackend};
     use crate::coders::CoderType;
     use crate::compression::FramingMode;
     use crate::spec::SpecEnvironment;
@@ -1652,6 +1652,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "backend-zpaq")]
     #[test]
     fn candidate_backend_rejection_is_recoverable_status_error() {
         let candidate = compile_candidate(CompressionBackend::zpaq("3"));
