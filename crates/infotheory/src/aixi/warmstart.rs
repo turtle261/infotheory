@@ -8,8 +8,7 @@ use crate::aixi::model::{Predictor, PredictorBuildError, build_aiqi_predictor};
 use crate::aixi::planner_agent::PlannerActionProvenance;
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
 use crate::aixi::return_law::{
-    ReturnLabelCodec, ReturnLawEvaluator, ReturnPrefixUpdate, expected_decoded_return,
-    predict_return_law,
+    ReturnLabelCodec, ReturnLawEvaluator, ReturnPrefixUpdate, predict_expected_label,
 };
 use crate::aixi::warmstart_contract::{
     TaskFingerprint, WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF,
@@ -1919,45 +1918,24 @@ impl WarmStartExactJhAgent {
     }
 
     fn estimate_q_values(&mut self) -> Vec<f64> {
-        let predictors = self
-            .action_conditioned_predictors()
-            .expect("warm-start history encoding invariant");
-        let config = self.config.clone();
+        let min_return =
+            (self.config.min_reward as i128 * self.config.return_horizon as i128) as f64;
         let codec = self.return_label_codec;
-        predictors
-            .into_iter()
-            .map(|mut predictor| {
-                let distribution = predict_return_law(
-                    predictor.as_mut(),
-                    codec,
-                    ReturnPrefixUpdate::Training,
-                    ReturnLawEvaluator::SharedPrefix,
-                );
-                expected_decoded_return(&distribution.probabilities, |label| {
-                    exact_return_from_label(&config, label)
-                })
-            })
-            .collect()
-    }
-
-    fn action_conditioned_predictors(
-        &mut self,
-    ) -> Result<Vec<Box<dyn Predictor>>, WarmStartExactJhError> {
         let step = self.total_steps_observed + 1;
         let phase = step % self.config.label_phase_period;
-        let config = &self.config;
+        let live_config = &self.config;
         let steps = &self.steps;
         let return_labels_by_step = &self.return_labels_by_step;
         let action_bits = self.action_bits;
         let token_ctx = WarmStartAugmentedTokenContext {
-            config,
+            config: live_config,
             steps,
             return_labels_by_step,
             action_bits,
             return_label_codec: self.return_label_codec,
             phase,
         };
-        let mut predictors = Vec::with_capacity(self.config.agent_actions.get());
+        let mut q_values = Vec::with_capacity(self.config.agent_actions.get());
         let mut pushed_history = 0usize;
         {
             let model = &mut self.phases[phase];
@@ -1966,18 +1944,25 @@ impl WarmStartExactJhAgent {
             if start <= end {
                 for idx in start..=end {
                     pushed_history +=
-                        push_step_tokens_history(&token_ctx, model.predictor.as_mut(), idx)?;
+                        push_step_tokens_history(&token_ctx, model.predictor.as_mut(), idx)
+                            .expect("warm-start history encoding invariant");
                 }
             }
             for action in 0..self.config.agent_actions.get() {
                 let pushed_action =
                     push_encoded_bits_history(model.predictor.as_mut(), action as u64, action_bits);
-                predictors.push(model.predictor.boxed_clone());
+                let expected_label = predict_expected_label(
+                    model.predictor.as_mut(),
+                    codec,
+                    ReturnPrefixUpdate::Training,
+                    ReturnLawEvaluator::SharedPrefix,
+                );
                 pop_history_bits(model.predictor.as_mut(), pushed_action);
+                q_values.push(min_return + expected_label);
             }
             pop_history_bits(model.predictor.as_mut(), pushed_history);
         }
-        Ok(predictors)
+        q_values
     }
 
     fn advance_phase_model_to_step(
@@ -2531,11 +2516,6 @@ fn label_for_exact_return(
         });
     }
     u64::try_from(label).map_err(|_| WarmStartExactJhError::ExactReturnRangeOverflow)
-}
-
-fn exact_return_from_label(config: &WarmStartExactJhRuntimeConfig, label: u64) -> f64 {
-    let min_return = (config.min_reward as i128) * (config.return_horizon as i128);
-    (min_return + label as i128) as f64
 }
 
 fn validate_runtime_transition(

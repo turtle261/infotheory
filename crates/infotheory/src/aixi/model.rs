@@ -79,8 +79,12 @@ pub trait Predictor: Send {
 
     /// Whether [`Self::begin_rollback_scope`] and [`Self::rollback_scope`] are supported.
     ///
-    /// Callers use this as an optimization guard before replacing clone-per-branch
-    /// rollouts with scoped reversible updates.
+    /// This is a capability advertisement for external or future planner
+    /// strategies that need to choose between scoped and per-symbol rollback
+    /// before mutating the predictor. The built-in planners do not currently
+    /// need the probe: MCTS attempts the scope and falls back based on
+    /// [`Self::rollback_scope`]'s return value, while return-law evaluation
+    /// deliberately uses balanced per-symbol rollback.
     fn supports_rollback_scope(&self) -> bool {
         false
     }

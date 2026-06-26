@@ -219,6 +219,7 @@ pub(crate) struct ReturnLawEvalStats {
 }
 
 /// Normalized return-label law plus evaluation counters.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReturnLawDistribution {
     /// Probabilities in semantic label-index order.
@@ -229,30 +230,38 @@ pub(crate) struct ReturnLawDistribution {
     pub stats: ReturnLawEvalStats,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HypotheticalRollback {
-    PerSymbol,
-    Scoped,
+/// Exact expected decoded return plus evaluation counters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReturnLawExpectation {
+    /// Expected value under the normalized valid-label law.
+    pub value: f64,
+    /// Whether zero or non-finite mass forced the uniform fallback.
+    pub used_uniform_fallback: bool,
+    /// Evaluation counters.
+    pub stats: ReturnLawEvalStats,
 }
 
 /// Predict and normalize the return-label distribution under `predictor`.
 ///
-/// With `ReturnPrefixUpdate::Training`, predictors that advertise
-/// [`Predictor::supports_rollback_scope`] are descended through scoped branch
-/// rollbacks instead of per-symbol journals; otherwise per-symbol `revert` is
-/// used. Both keep identical exact trie semantics.
+/// With `ReturnPrefixUpdate::Training`, return-law descent deliberately uses
+/// per-symbol rollback (`update`/`revert`) rather than
+/// [`Predictor::begin_rollback_scope`]. Both policies preserve the same exact
+/// trie semantics, but this evaluator opens one speculative branch per trie
+/// edge, so scoped rollback would open one scope per edge rather than amortizing
+/// a scope over a rollout. The built-in rate predictor's scopes are marker
+/// based and measured cost-neutral here; per-symbol rollback remains the
+/// clearer local contract for the return-law descent and matches the live
+/// no-clone planning path.
 ///
 /// Cost model: this is a depth-first descent that mutates and rolls back the
 /// predictor once per reached trie edge, i.e. `hypothetical_advances` undo
-/// operations total. The scoped path opens exactly one rollback scope per edge,
-/// so for a backend whose `begin_rollback_scope` simply takes a full-state
-/// checkpoint (as `RateBackendBitPredictor` does today) it performs the *same*
-/// number of state checkpoints as the per-symbol path: it is cost-neutral, not
-/// a speedup. The scoped path only wins for backends that can open and unwind a
-/// scope more cheaply than per-symbol journaling (e.g. copy-on-write or
-/// marker-based session state). It is never a regression versus per-symbol, and
-/// it routes through the predictor's intended simulation API so such backends
-/// benefit automatically.
+/// operations total. Distribution and scalar-expectation callers share the
+/// same descent engine and differ only in how valid leaves are accumulated.
+///
+/// This intentionally differs from MCTS rollout simulation, which can use
+/// scoped predictor rollback because it opens one scope per rollout rather than
+/// one scope per return-label trie edge.
+#[cfg(test)]
 pub(crate) fn predict_return_law(
     predictor: &mut dyn Predictor,
     codec: ReturnLabelCodec,
@@ -271,34 +280,14 @@ pub(crate) fn predict_return_law(
     }
 
     let mut masses = vec![0.0; codec.bins()];
-    let mut stats = ReturnLawEvalStats::default();
-    let rollback = hypothetical_rollback(predictor, prefix_update);
-    match evaluator {
-        #[cfg(test)]
-        ReturnLawEvaluator::LeafByLeaf => {
-            predict_leaf_by_leaf(
-                predictor,
-                codec,
-                prefix_update,
-                rollback,
-                &mut masses,
-                &mut stats,
-            );
-        }
-        ReturnLawEvaluator::SharedPrefix => {
-            predict_shared_prefix(
-                predictor,
-                codec,
-                prefix_update,
-                rollback,
-                0,
-                0,
-                1.0,
-                &mut masses,
-                &mut stats,
-            );
-        }
-    }
+    let stats = {
+        let mut descent = ReturnLawDescent::new(predictor, codec, prefix_update);
+        let mut sink = DistributionSink {
+            masses: &mut masses,
+        };
+        descent.evaluate(evaluator, &mut sink);
+        descent.stats
+    };
     let used_uniform_fallback = normalize_masses(&mut masses);
     ReturnLawDistribution {
         probabilities: masses,
@@ -307,18 +296,86 @@ pub(crate) fn predict_return_law(
     }
 }
 
-fn hypothetical_rollback(
-    predictor: &dyn Predictor,
+/// Predict the normalized expected decoded return without materializing a law vector.
+///
+/// This is mathematically equivalent to materializing the normalized label law
+/// and then taking its dot product with `decode_label`, modulo floating-point
+/// reassociation: this path accumulates
+/// `sum(decode(label) * mass) / sum(mass)`, while the distribution path first
+/// normalizes each mass and then performs the dot product. If the decoder
+/// produces a non-finite weighted sum, this scalar path uses the same
+/// uniform-label fallback shape as zero or non-finite total mass.
+///
+/// Return-law descent deliberately uses balanced per-symbol rollback rather
+/// than the scoped-simulation strategy used by MCTS rollouts: this evaluator
+/// opens one speculative branch per return-label trie edge, so scoped rollback
+/// would add per-edge scope management without reducing the number of
+/// speculative updates.
+pub(crate) fn predict_expected_return(
+    predictor: &mut dyn Predictor,
+    codec: ReturnLabelCodec,
     prefix_update: ReturnPrefixUpdate,
-) -> HypotheticalRollback {
-    match prefix_update {
-        ReturnPrefixUpdate::Training if predictor.supports_rollback_scope() => {
-            HypotheticalRollback::Scoped
-        }
-        ReturnPrefixUpdate::Training => HypotheticalRollback::PerSymbol,
-        #[cfg(test)]
-        ReturnPrefixUpdate::FrozenHistory => HypotheticalRollback::PerSymbol,
+    evaluator: ReturnLawEvaluator,
+    mut decode_label: impl FnMut(u64) -> f64,
+) -> ReturnLawExpectation {
+    if codec.bins() == 1 {
+        return ReturnLawExpectation {
+            value: decode_label(0),
+            used_uniform_fallback: false,
+            stats: ReturnLawEvalStats {
+                valid_leaves: 1,
+                ..ReturnLawEvalStats::default()
+            },
+        };
     }
+
+    let mut sink = ExpectedReturnSink {
+        decode_label: &mut decode_label,
+        weighted_sum: 0.0,
+        valid_mass: 0.0,
+    };
+    let stats = {
+        let mut descent = ReturnLawDescent::new(predictor, codec, prefix_update);
+        descent.evaluate(evaluator, &mut sink);
+        descent.stats
+    };
+
+    if !sink.valid_mass.is_finite() || sink.valid_mass <= 0.0 || !sink.weighted_sum.is_finite() {
+        let uniform_sum: f64 = (0..codec.bins())
+            .map(|label| decode_label(label as u64))
+            .sum();
+        return ReturnLawExpectation {
+            value: uniform_sum / codec.bins() as f64,
+            used_uniform_fallback: true,
+            stats,
+        };
+    }
+
+    ReturnLawExpectation {
+        value: sink.weighted_sum / sink.valid_mass,
+        used_uniform_fallback: false,
+        stats,
+    }
+}
+
+/// Predict the normalized expected semantic label without materializing a law vector.
+///
+/// This is the same trie evaluation as [`predict_expected_return`], specialized
+/// for affine decoders of the form `offset + label * scale`. It avoids a
+/// per-leaf affine evaluation by accumulating raw labels and letting callers
+/// apply `offset + label * scale` once per action; the descent still pays the
+/// trivial identity cast at each valid leaf.
+pub(crate) fn predict_expected_label(
+    predictor: &mut dyn Predictor,
+    codec: ReturnLabelCodec,
+    prefix_update: ReturnPrefixUpdate,
+    evaluator: ReturnLawEvaluator,
+) -> f64 {
+    let expectation =
+        predict_expected_return(predictor, codec, prefix_update, evaluator, |label| {
+            label as f64
+        });
+    expectation.value
 }
 
 #[cfg(test)]
@@ -333,6 +390,7 @@ fn low_bits_mask(bits: usize) -> u64 {
 }
 
 /// Compute an expectation from a normalized label law and semantic decoder.
+#[cfg(test)]
 pub(crate) fn expected_decoded_return(
     distribution: &[f64],
     mut decode_label: impl FnMut(u64) -> f64,
@@ -344,122 +402,161 @@ pub(crate) fn expected_decoded_return(
         .sum()
 }
 
-#[cfg(test)]
-fn predict_leaf_by_leaf(
-    predictor: &mut dyn Predictor,
+struct ReturnLawDescent<'a> {
+    predictor: &'a mut dyn Predictor,
     codec: ReturnLabelCodec,
     prefix_update: ReturnPrefixUpdate,
-    rollback: HypotheticalRollback,
-    masses: &mut [f64],
-    stats: &mut ReturnLawEvalStats,
-) {
-    for (label, slot) in masses.iter_mut().enumerate() {
-        let mut mass = 1.0f64;
-        for depth in 0..codec.bits() {
-            let bit = codec.bit_at(label as u64, depth);
-            let q = predictor
-                .predict_prob(bit)
-                .clamp(PROBABILITY_FLOOR, 1.0 - PROBABILITY_FLOOR);
-            stats.logical_queries = stats.logical_queries.saturating_add(1);
-            mass *= q;
-            apply_hypothetical_bit(predictor, bit, prefix_update, rollback, stats);
-        }
-        for _ in 0..codec.bits() {
-            revert_hypothetical_bit(predictor, prefix_update, rollback, stats);
-        }
-        stats.valid_leaves = stats.valid_leaves.saturating_add(1);
-        *slot = mass;
-    }
+    stats: ReturnLawEvalStats,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn predict_shared_prefix(
-    predictor: &mut dyn Predictor,
-    codec: ReturnLabelCodec,
-    prefix_update: ReturnPrefixUpdate,
-    rollback: HypotheticalRollback,
-    depth: usize,
-    partial_value: u64,
-    prefix_mass: f64,
-    masses: &mut [f64],
-    stats: &mut ReturnLawEvalStats,
-) {
-    if depth == codec.bits() {
-        if let Some(slot) = masses.get_mut(partial_value as usize) {
-            *slot = prefix_mass;
-            stats.valid_leaves = stats.valid_leaves.saturating_add(1);
-        } else {
-            stats.invalid_leaves = stats.invalid_leaves.saturating_add(1);
-        }
-        return;
-    }
-
-    let p_one = predictor
-        .predict_one()
-        .clamp(PROBABILITY_FLOOR, 1.0 - PROBABILITY_FLOOR);
-    stats.logical_queries = stats.logical_queries.saturating_add(1);
-
-    for (bit, child_mass) in [
-        (false, prefix_mass * (1.0 - p_one)),
-        (true, prefix_mass * p_one),
-    ] {
-        let child_value = codec.append_to_partial_value(partial_value, depth, bit);
-        apply_hypothetical_bit(predictor, bit, prefix_update, rollback, stats);
-        predict_shared_prefix(
+impl<'a> ReturnLawDescent<'a> {
+    fn new(
+        predictor: &'a mut dyn Predictor,
+        codec: ReturnLabelCodec,
+        prefix_update: ReturnPrefixUpdate,
+    ) -> Self {
+        Self {
             predictor,
             codec,
             prefix_update,
-            rollback,
-            depth + 1,
-            child_value,
-            child_mass,
-            masses,
-            stats,
-        );
-        revert_hypothetical_bit(predictor, prefix_update, rollback, stats);
-    }
-}
-
-fn apply_hypothetical_bit(
-    predictor: &mut dyn Predictor,
-    bit: bool,
-    prefix_update: ReturnPrefixUpdate,
-    rollback: HypotheticalRollback,
-    stats: &mut ReturnLawEvalStats,
-) {
-    if rollback == HypotheticalRollback::Scoped {
-        predictor.begin_rollback_scope();
-    }
-    match prefix_update {
-        ReturnPrefixUpdate::Training => predictor.update(bit),
-        #[cfg(test)]
-        ReturnPrefixUpdate::FrozenHistory => predictor.update_history(bit),
-    }
-    stats.hypothetical_advances = stats.hypothetical_advances.saturating_add(1);
-}
-
-fn revert_hypothetical_bit(
-    predictor: &mut dyn Predictor,
-    prefix_update: ReturnPrefixUpdate,
-    rollback: HypotheticalRollback,
-    stats: &mut ReturnLawEvalStats,
-) {
-    match rollback {
-        HypotheticalRollback::Scoped => {
-            assert!(
-                predictor.rollback_scope(),
-                "predictor advertised rollback-scope support but no scope was active"
-            );
+            stats: ReturnLawEvalStats::default(),
         }
-        HypotheticalRollback::PerSymbol => match prefix_update {
-            ReturnPrefixUpdate::Training => predictor.revert(),
-            #[cfg(test)]
-            ReturnPrefixUpdate::FrozenHistory => predictor.pop_history(),
-        },
     }
-    stats.rollbacks = stats.rollbacks.saturating_add(1);
+
+    fn evaluate(&mut self, evaluator: ReturnLawEvaluator, sink: &mut impl ReturnLawLeafSink) {
+        match evaluator {
+            #[cfg(test)]
+            ReturnLawEvaluator::LeafByLeaf => self.descend_leaf_by_leaf(sink),
+            ReturnLawEvaluator::SharedPrefix => self.descend_shared_prefix(0, 0, 1.0, sink),
+        }
+    }
+
+    #[cfg(test)]
+    fn descend_leaf_by_leaf(&mut self, sink: &mut impl ReturnLawLeafSink) {
+        for label in 0..self.codec.bins() {
+            let mut mass = 1.0f64;
+            for depth in 0..self.codec.bits() {
+                let bit = self.codec.bit_at(label as u64, depth);
+                let q = self
+                    .predictor
+                    .predict_prob(bit)
+                    .clamp(PROBABILITY_FLOOR, 1.0 - PROBABILITY_FLOOR);
+                self.stats.logical_queries = self.stats.logical_queries.saturating_add(1);
+                mass *= q;
+                self.apply_hypothetical_bit(bit);
+            }
+            for _ in 0..self.codec.bits() {
+                self.revert_hypothetical_bit();
+            }
+            sink.valid_leaf(label as u64, mass, &mut self.stats);
+        }
+    }
+
+    fn descend_shared_prefix(
+        &mut self,
+        depth: usize,
+        partial_value: u64,
+        prefix_mass: f64,
+        sink: &mut impl ReturnLawLeafSink,
+    ) {
+        if depth == self.codec.bits() {
+            if partial_value < self.codec.bins() as u64 {
+                sink.valid_leaf(partial_value, prefix_mass, &mut self.stats);
+            } else {
+                sink.invalid_leaf(&mut self.stats);
+            }
+            return;
+        }
+
+        let p_one = self
+            .predictor
+            .predict_one()
+            .clamp(PROBABILITY_FLOOR, 1.0 - PROBABILITY_FLOOR);
+        self.stats.logical_queries = self.stats.logical_queries.saturating_add(1);
+
+        let zero_value = self
+            .codec
+            .append_to_partial_value(partial_value, depth, false);
+        self.apply_hypothetical_bit(false);
+        self.descend_shared_prefix(depth + 1, zero_value, prefix_mass * (1.0 - p_one), sink);
+        self.revert_hypothetical_bit();
+
+        let one_value = self
+            .codec
+            .append_to_partial_value(partial_value, depth, true);
+        self.apply_hypothetical_bit(true);
+        self.descend_shared_prefix(depth + 1, one_value, prefix_mass * p_one, sink);
+        self.revert_hypothetical_bit();
+    }
+
+    fn apply_hypothetical_bit(&mut self, bit: bool) {
+        match self.prefix_update {
+            ReturnPrefixUpdate::Training => self.predictor.update(bit),
+            #[cfg(test)]
+            ReturnPrefixUpdate::FrozenHistory => self.predictor.update_history(bit),
+        }
+        self.stats.hypothetical_advances = self.stats.hypothetical_advances.saturating_add(1);
+    }
+
+    fn revert_hypothetical_bit(&mut self) {
+        match self.prefix_update {
+            ReturnPrefixUpdate::Training => self.predictor.revert(),
+            #[cfg(test)]
+            ReturnPrefixUpdate::FrozenHistory => self.predictor.pop_history(),
+        }
+        self.stats.rollbacks = self.stats.rollbacks.saturating_add(1);
+    }
 }
 
+trait ReturnLawLeafSink {
+    fn valid_leaf(&mut self, label: u64, mass: f64, stats: &mut ReturnLawEvalStats);
+
+    fn invalid_leaf(&mut self, stats: &mut ReturnLawEvalStats) {
+        stats.invalid_leaves = stats.invalid_leaves.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+struct DistributionSink<'a> {
+    masses: &'a mut [f64],
+}
+
+#[cfg(test)]
+impl ReturnLawLeafSink for DistributionSink<'_> {
+    fn valid_leaf(&mut self, label: u64, mass: f64, stats: &mut ReturnLawEvalStats) {
+        // Defensive for test comparators: shared-prefix descent filters invalid
+        // codeword tails before calling `valid_leaf`, while leaf-by-leaf always
+        // iterates valid labels directly.
+        if let Some(slot) = self.masses.get_mut(label as usize) {
+            *slot = mass;
+            stats.valid_leaves = stats.valid_leaves.saturating_add(1);
+        } else {
+            self.invalid_leaf(stats);
+        }
+    }
+}
+
+struct ExpectedReturnSink<'a, F>
+where
+    F: FnMut(u64) -> f64,
+{
+    decode_label: &'a mut F,
+    weighted_sum: f64,
+    valid_mass: f64,
+}
+
+impl<F> ReturnLawLeafSink for ExpectedReturnSink<'_, F>
+where
+    F: FnMut(u64) -> f64,
+{
+    fn valid_leaf(&mut self, label: u64, mass: f64, stats: &mut ReturnLawEvalStats) {
+        self.valid_mass += mass;
+        self.weighted_sum += (self.decode_label)(label) * mass;
+        stats.valid_leaves = stats.valid_leaves.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
 fn normalize_masses(masses: &mut [f64]) -> bool {
     let sum: f64 = masses.iter().sum();
     if !sum.is_finite() || sum <= 0.0 {
@@ -614,7 +711,84 @@ mod tests {
     }
 
     #[test]
-    fn shared_prefix_uses_scoped_rollbacks_when_supported() {
+    fn expected_return_matches_distribution_expectation_for_power_of_two_labels() {
+        let codec = ReturnLabelCodec::value_monotone(16);
+        let mut distribution_predictor = UniformPredictor::default();
+        let mut expectation_predictor = UniformPredictor::default();
+        let distribution = predict_return_law(
+            &mut distribution_predictor,
+            codec,
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+        );
+        let expected_from_distribution =
+            expected_decoded_return(&distribution.probabilities, |label| (label * label) as f64);
+        let direct = predict_expected_return(
+            &mut expectation_predictor,
+            codec,
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+            |label| (label * label) as f64,
+        );
+
+        assert_eq!(direct.value, expected_from_distribution);
+        assert!(!direct.used_uniform_fallback);
+        assert_eq!(direct.stats, distribution.stats);
+    }
+
+    #[test]
+    fn expected_return_matches_distribution_expectation_for_sparse_code_tail() {
+        let codec = ReturnLabelCodec::value_monotone(6);
+        let mut distribution_predictor = UniformPredictor::default();
+        let mut expectation_predictor = UniformPredictor::default();
+        let distribution = predict_return_law(
+            &mut distribution_predictor,
+            codec,
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+        );
+        let expected_from_distribution =
+            expected_decoded_return(&distribution.probabilities, |label| label as f64 + 0.25);
+        let direct = predict_expected_return(
+            &mut expectation_predictor,
+            codec,
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+            |label| label as f64 + 0.25,
+        );
+
+        assert_eq!(direct.value, expected_from_distribution);
+        assert!(!direct.used_uniform_fallback);
+        assert_eq!(direct.stats, distribution.stats);
+        assert_eq!(direct.stats.invalid_leaves, 2);
+    }
+
+    #[test]
+    fn expected_return_uses_uniform_fallback_for_non_finite_decoder_sum() {
+        let codec = ReturnLabelCodec::value_monotone(4);
+        let mut predictor = UniformPredictor::default();
+        let direct = predict_expected_return(
+            &mut predictor,
+            codec,
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+            |label| {
+                if label == 0 {
+                    f64::INFINITY
+                } else {
+                    label as f64
+                }
+            },
+        );
+
+        assert!(direct.used_uniform_fallback);
+        assert!(direct.value.is_infinite());
+        assert!(direct.value.is_sign_positive());
+        assert_eq!(direct.stats.valid_leaves, 4);
+    }
+
+    #[test]
+    fn shared_prefix_uses_per_symbol_rollbacks_for_return_law_training() {
         let codec = ReturnLabelCodec::value_monotone(4);
         let mut predictor = ScopedCountingPredictor::default();
         let law = predict_return_law(
@@ -630,9 +804,9 @@ mod tests {
         assert_eq!(law.stats.rollbacks, 6);
         assert_eq!(law.stats.valid_leaves, 4);
         assert_eq!(predictor.update_calls, 6);
-        assert_eq!(predictor.revert_calls, 0);
-        assert_eq!(predictor.begin_scope_calls, 6);
-        assert_eq!(predictor.rollback_scope_calls, 6);
+        assert_eq!(predictor.revert_calls, 6);
+        assert_eq!(predictor.begin_scope_calls, 0);
+        assert_eq!(predictor.rollback_scope_calls, 0);
         assert!(predictor.history.is_empty());
         assert!(predictor.scopes.is_empty());
     }

@@ -17,8 +17,7 @@ use crate::aixi::model::{
 };
 use crate::aixi::planner_spec::{PlannerInterfaceConfig, build_default_planner_run_spec};
 use crate::aixi::return_law::{
-    ReturnLabelCodec, ReturnLawEvaluator, ReturnPrefixUpdate, expected_decoded_return,
-    predict_return_law,
+    ReturnLabelCodec, ReturnLawEvaluator, ReturnPrefixUpdate, predict_expected_label,
 };
 use crate::api::{BitStreamSemantics, RateBackend, validate_rate_backend};
 use crate::spec::{
@@ -802,13 +801,13 @@ impl AiqiAgent {
                     action as u64,
                     self.action_bits,
                 );
-                let law = predict_return_law(
+                let expected_label = predict_expected_label(
                     model.predictor.as_mut(),
                     self.return_label_codec,
                     ReturnPrefixUpdate::Training,
                     ReturnLawEvaluator::SharedPrefix,
                 );
-                *q_value = expected_aiqi_return(&law.probabilities, self.config.return_bins);
+                *q_value = expected_label / self.config.return_bins as f64;
                 pop_history_bits(model.predictor.as_mut(), pushed_action);
             }
 
@@ -857,13 +856,13 @@ impl AiqiAgent {
                 action as u64,
                 self.action_bits,
             );
-            let law = predict_return_law(
+            let expected_label = predict_expected_label(
                 action_predictor.as_mut(),
                 self.return_label_codec,
                 ReturnPrefixUpdate::Training,
                 ReturnLawEvaluator::SharedPrefix,
             );
-            *q_value = expected_aiqi_return(&law.probabilities, self.config.return_bins);
+            *q_value = expected_label / self.config.return_bins as f64;
         }
 
         q_values
@@ -1197,13 +1196,6 @@ fn pop_history_bits(predictor: &mut dyn Predictor, bits: usize) {
     for _ in 0..bits {
         predictor.pop_history();
     }
-}
-
-fn expected_aiqi_return(probs: &[f64], return_bins: usize) -> f64 {
-    if probs.is_empty() {
-        return 0.0;
-    }
-    expected_decoded_return(probs, |label| label as f64 / return_bins as f64)
 }
 
 fn argmax_with_fixed_tie_break(values: &[f64]) -> usize {
