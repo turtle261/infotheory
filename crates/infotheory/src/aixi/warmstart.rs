@@ -2738,8 +2738,10 @@ mod tests {
 
     const TEST_TASK_FINGERPRINT_HEX: &str =
         "0102030401020304010203040102030401020304010203040102030401020304";
+    #[cfg(feature = "backend-ctw")]
     const ZERO_TASK_FINGERPRINT_HEX: &str =
         "0000000000000000000000000000000000000000000000000000000000000000";
+    #[cfg(feature = "backend-ctw")]
     const MISMATCH_TASK_FINGERPRINT_HEX: &str =
         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 
@@ -2905,6 +2907,57 @@ mod tests {
         assert!(msg.contains("current planner_run '"), "{msg}");
     }
 
+    /// Single source of truth for the test teacher-contract field wiring.
+    ///
+    /// This builder performs no backend compilation: the `task_fingerprint` and
+    /// `observation_key_mode` are supplied by the caller. The CTW-dependent path
+    /// derives them from a real compiled planner run; the backend-independent
+    /// path supplies synthetic-but-faithful values so the contract-consuming
+    /// tests stay runnable under the feature-light `aixi` slice.
+    fn teacher_contract_for(
+        cfg: &WarmStartExactJhConfig,
+        task_fingerprint: TaskFingerprint,
+        observation_key_mode: &str,
+    ) -> WarmStartExactJhTeacherContract {
+        let observation_stream_len = cfg.observation_stream_len.max(1);
+        let (adapter_crc, reward_cert) = standalone_teacher_provenance_crc32_pair(
+            cfg.observation_bits,
+            observation_stream_len,
+            cfg.reward_bits,
+        )
+        .expect("standalone teacher provenance crc pair");
+        WarmStartExactJhTeacherContract {
+            schema_version: WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION,
+            task_fingerprint,
+            action_alphabet_size: cfg.agent_actions.get(),
+            observation_bits: cfg.observation_bits,
+            observation_stream_len,
+            observation_key_mode: observation_key_mode.to_string(),
+            observation_adapter_spec_ref: WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF
+                .to_string(),
+            observation_adapter_content_crc32: adapter_crc,
+            reward_bits: cfg.reward_bits,
+            return_horizon: cfg.return_horizon,
+            label_phase_period: cfg.label_phase_period,
+            scalar_representation: WARMSTART_STANDALONE_SCALAR_REPRESENTATION.to_string(),
+            exact_reward_encoding_certificate: reward_cert,
+        }
+    }
+
+    /// Backend-independent teacher contract for tests that only validate
+    /// contract-shaped data (JSONL conversion, trace recording, dataset
+    /// canonicalization) and never compile a planner run. The fingerprint and
+    /// key mode are fixed: `full_stream` matches the canonical planner
+    /// interface's hardcoded `ObservationKeyMode::FullStream`.
+    fn teacher_contract() -> WarmStartExactJhTeacherContract {
+        teacher_contract_for(
+            &config(),
+            TaskFingerprint::parse_hex(TEST_TASK_FINGERPRINT_HEX).expect("test task fingerprint"),
+            "full_stream",
+        )
+    }
+
+    #[cfg(feature = "backend-ctw")]
     fn teacher_for_config(cfg: &WarmStartExactJhConfig) -> WarmStartExactJhTeacherDataset {
         let compiled = cfg
             .compile_planner_run_spec()
@@ -2913,30 +2966,8 @@ mod tests {
             .expect("test planner fingerprint");
         let observation_key_mode =
             observation_key_mode_name(compiled.interface().observation_key_mode);
-        let observation_stream_len = cfg.observation_stream_len.max(1);
-        let (adapter_crc, reward_cert) = standalone_teacher_provenance_crc32_pair(
-            cfg.observation_bits,
-            observation_stream_len,
-            cfg.reward_bits,
-        )
-        .expect("standalone teacher provenance crc pair");
         WarmStartExactJhTeacherDataset {
-            contract: WarmStartExactJhTeacherContract {
-                schema_version: WARMSTART_TEACHER_CONTRACT_SCHEMA_VERSION,
-                task_fingerprint,
-                action_alphabet_size: cfg.agent_actions.get(),
-                observation_bits: cfg.observation_bits,
-                observation_stream_len,
-                observation_key_mode: observation_key_mode.to_string(),
-                observation_adapter_spec_ref: WARMSTART_STANDALONE_OBSERVATION_ADAPTER_SPEC_REF
-                    .to_string(),
-                observation_adapter_content_crc32: adapter_crc,
-                reward_bits: cfg.reward_bits,
-                return_horizon: cfg.return_horizon,
-                label_phase_period: cfg.label_phase_period,
-                scalar_representation: WARMSTART_STANDALONE_SCALAR_REPRESENTATION.to_string(),
-                exact_reward_encoding_certificate: reward_cert,
-            },
+            contract: teacher_contract_for(cfg, task_fingerprint, observation_key_mode),
             traces: vec![WarmStartExactJhTeacherTrace {
                 transitions: vec![
                     WarmStartExactJhTransition {
@@ -2959,13 +2990,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "backend-ctw")]
     fn teacher() -> WarmStartExactJhTeacherDataset {
         teacher_for_config(&config())
     }
 
     #[test]
     fn jsonl_trace_converter_round_trips_action_percept_pairs() {
-        let teacher = teacher();
+        let contract = teacher_contract();
         let jsonl = [
             warmstart_jsonl_action_record(0, 0, PlannerActionProvenance::Greedy).to_string(),
             warmstart_jsonl_percept_record(0, &[1], 0).to_string(),
@@ -2975,8 +3007,8 @@ mod tests {
         .join("\n");
         let trace = warmstart_teacher_trace_from_jsonl_slice(
             jsonl.as_bytes(),
-            &teacher.contract,
-            teacher.contract.return_horizon,
+            &contract,
+            contract.return_horizon,
         )
         .expect("jsonl trace should parse");
         assert_eq!(
@@ -2998,7 +3030,7 @@ mod tests {
 
     #[test]
     fn jsonl_trace_converter_converts_mcaixi_decision_percept_order() {
-        let teacher = teacher();
+        let contract = teacher_contract();
         let jsonl = [
             warmstart_jsonl_percept_record(0, &[0], 0).to_string(),
             warmstart_jsonl_action_record(0, 0, PlannerActionProvenance::Greedy).to_string(),
@@ -3009,8 +3041,8 @@ mod tests {
         .join("\n");
         let trace = warmstart_teacher_trace_from_jsonl_slice(
             jsonl.as_bytes(),
-            &teacher.contract,
-            teacher.contract.return_horizon,
+            &contract,
+            contract.return_horizon,
         )
         .expect("MC-AIXI-order jsonl trace should parse");
         assert_eq!(
@@ -3032,7 +3064,7 @@ mod tests {
 
     #[test]
     fn jsonl_trace_converter_rejects_sparse_action_then_percept_steps() {
-        let teacher = teacher();
+        let contract = teacher_contract();
         let jsonl = [
             warmstart_jsonl_action_record(0, 0, PlannerActionProvenance::Greedy).to_string(),
             warmstart_jsonl_percept_record(0, &[1], 0).to_string(),
@@ -3043,8 +3075,8 @@ mod tests {
 
         let err = warmstart_teacher_trace_from_jsonl_slice(
             jsonl.as_bytes(),
-            &teacher.contract,
-            teacher.contract.return_horizon,
+            &contract,
+            contract.return_horizon,
         )
         .expect_err("sparse action/percept JSONL trace must fail");
 
@@ -3054,7 +3086,7 @@ mod tests {
 
     #[test]
     fn jsonl_trace_converter_rejects_sparse_decision_percept_steps() {
-        let teacher = teacher();
+        let contract = teacher_contract();
         let jsonl = [
             warmstart_jsonl_percept_record(0, &[0], 0).to_string(),
             warmstart_jsonl_action_record(0, 0, PlannerActionProvenance::Greedy).to_string(),
@@ -3067,8 +3099,8 @@ mod tests {
 
         let err = warmstart_teacher_trace_from_jsonl_slice(
             jsonl.as_bytes(),
-            &teacher.contract,
-            teacher.contract.return_horizon,
+            &contract,
+            contract.return_horizon,
         )
         .expect_err("sparse decision-percept JSONL trace must fail");
 
@@ -3078,9 +3110,8 @@ mod tests {
 
     #[test]
     fn jsonl_trace_converter_rejects_malformed_and_inconsistent_records() {
-        let teacher = teacher();
-        let contract = &teacher.contract;
-        let return_horizon = teacher.contract.return_horizon;
+        let contract = teacher_contract();
+        let return_horizon = contract.return_horizon;
         for (jsonl, expected) in [
             ("{", "invalid JSON"),
             (
@@ -3127,7 +3158,7 @@ mod tests {
         ] {
             let err = warmstart_teacher_trace_from_jsonl_slice(
                 jsonl.as_bytes(),
-                contract,
+                &contract,
                 return_horizon,
             )
             .expect_err("invalid JSONL trace should fail");
@@ -3140,7 +3171,7 @@ mod tests {
 
     #[test]
     fn jsonl_trace_converter_accepts_absent_provenance() {
-        let contract = teacher().contract;
+        let contract = teacher_contract();
         let absent = concat!(
             r#"{"kind":"action","t":0,"action":1}"#,
             "\n",
@@ -3159,7 +3190,7 @@ mod tests {
 
     #[test]
     fn jsonl_trace_converter_rejects_duplicate_action_and_percept_records() {
-        let contract = teacher().contract;
+        let contract = teacher_contract();
         let duplicate_action = concat!(
             r#"{"kind":"action","t":0,"action":0}"#,
             "\n",
@@ -3190,7 +3221,7 @@ mod tests {
 
     #[test]
     fn trace_recorder_requires_a_complete_return_horizon_window() {
-        let contract = teacher().contract;
+        let contract = teacher_contract();
         let mut recorder = WarmStartExactJhTraceRecorder::new();
         recorder
             .record_action(0, 1)
@@ -3221,7 +3252,7 @@ mod tests {
 
     #[test]
     fn trace_recorder_rejects_sparse_step_sets() {
-        let contract = teacher().contract;
+        let contract = teacher_contract();
         let mut recorder = WarmStartExactJhTraceRecorder::new();
         recorder
             .record_action(0, 0)
@@ -3471,7 +3502,7 @@ mod tests {
             }],
         };
         let dataset = WarmStartExactJhTeacherDataset::new(
-            teacher().contract,
+            teacher_contract(),
             vec![high.clone(), low.clone(), high.clone()],
         );
         assert_eq!(dataset.traces, vec![low, high]);
