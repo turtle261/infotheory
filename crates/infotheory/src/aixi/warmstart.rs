@@ -1609,7 +1609,7 @@ pub(crate) fn max_reward_from_exact_return_bins(
     let return_horizon = return_horizon.get();
     let return_bins = return_bins.get();
     let span = return_bins - 1;
-    if span % return_horizon != 0 {
+    if !span.is_multiple_of(return_horizon) {
         return Err(WarmStartExactJhError::ReturnBinsNotExactHorizon {
             return_bins,
             return_horizon,
