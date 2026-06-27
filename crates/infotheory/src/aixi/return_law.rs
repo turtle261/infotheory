@@ -305,9 +305,11 @@ pub(crate) fn predict_return_law(
 /// mathematically equivalent to materializing the normalized label law and then
 /// taking its dot product with `decode_label`, modulo floating-point
 /// reassociation. The normal scalar path uses direct linear accumulation, which
-/// is the intended regime for current finite-return alphabets. If linear valid
-/// mass underflows to zero, the evaluator reruns the same balanced descent with
-/// log-space accumulation so extremely unlikely valid leaves do not collapse
+/// is the intended regime for current finite-return alphabets. If any valid
+/// leaf's linear mass underflows to exactly zero (only reachable for
+/// pathologically deep return-label alphabets, and subsuming the degenerate
+/// total-mass-zero case), the evaluator reruns the same balanced descent with
+/// log-space accumulation so those negligible-but-nonzero leaves do not collapse
 /// into a uniform midpoint fallback.
 ///
 /// If the decoder itself produces a non-finite value, this scalar path uses the
@@ -363,10 +365,9 @@ pub(crate) fn predict_expected_return(
         };
     }
 
-    if (sink.valid_mass == 0.0 || sink.saw_zero_mass)
-        && !sink.saw_non_finite_decode
-        && sink.weighted_sum.is_finite()
-    {
+    // `valid_mass == 0.0` (every leaf underflowed) implies `saw_zero_mass`, so
+    // the per-leaf flag alone gates the log-space rerun.
+    if sink.saw_zero_mass && !sink.saw_non_finite_decode && sink.weighted_sum.is_finite() {
         return predict_expected_return_log_fallback(
             predictor,
             codec,
