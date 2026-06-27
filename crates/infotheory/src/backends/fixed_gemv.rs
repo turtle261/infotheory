@@ -8,28 +8,64 @@ use wide::f32x8;
 const LANES: usize = 8;
 
 #[inline(always)]
+/// Load one SIMD lane group from `ptr`.
+///
+/// # Safety
+///
+/// `ptr..ptr.add(LANES)` must be valid for reading initialized `f32` values.
+/// The pointer need not be aligned for `f32x8`; this helper performs an
+/// unaligned SIMD load.
 unsafe fn load8(ptr: *const f32) -> f32x8 {
+    // SAFETY: the caller supplies a readable lane group; `read_unaligned`
+    // removes any extra SIMD alignment requirement.
     unsafe { ptr.cast::<f32x8>().read_unaligned() }
 }
 
 #[inline(always)]
+/// Store one SIMD lane group to `ptr`.
+///
+/// # Safety
+///
+/// `ptr..ptr.add(LANES)` must be valid for writing `f32` values. The pointer
+/// need not be aligned for `f32x8`; this helper performs an unaligned SIMD
+/// store.
 unsafe fn store8(ptr: *mut f32, v: f32x8) {
+    // SAFETY: the caller supplies a writable lane group; `write_unaligned`
+    // removes any extra SIMD alignment requirement.
     unsafe { ptr.cast::<f32x8>().write_unaligned(v) }
 }
 
 #[inline(always)]
+/// Specialized matrix-vector multiply for a compile-time matrix shape.
+///
+/// Computes `y = A @ x` for an `A` matrix with shape
+/// `ROWS x (CHUNKS * LANES)`.
+///
+/// # Safety
+///
+/// `a` must be valid for reading `ROWS * CHUNKS * LANES` initialized `f32`
+/// values, `x` must be valid for reading `CHUNKS * LANES` initialized `f32`
+/// values, and `y` must be valid for writing `ROWS` `f32` values. `y` must not
+/// overlap `a` or `x` for the duration of the call. `ROWS` must be divisible
+/// by the fixed row batch; this is asserted when the specialization is
+/// monomorphized.
 unsafe fn gemv_fixed<const ROWS: usize, const CHUNKS: usize>(
     a: *const f32,
     x: *const f32,
     y: *mut f32,
 ) {
     const ROW_BATCH: usize = 4;
+    const {
+        assert!(ROWS.is_multiple_of(ROW_BATCH));
+    }
     const fn cols_for<const CHUNKS: usize>() -> usize {
         CHUNKS * LANES
     }
     let cols = cols_for::<CHUNKS>();
     let mut r = 0usize;
     while r < ROWS {
+        // SAFETY: `ROWS` is asserted divisible by `ROW_BATCH`, so each loop
+        // entry starts a complete row batch within the backing matrix.
         let row0 = unsafe { a.add(r * cols) };
         let row1 = unsafe { a.add((r + 1) * cols) };
         let row2 = unsafe { a.add((r + 2) * cols) };
@@ -42,6 +78,8 @@ unsafe fn gemv_fixed<const ROWS: usize, const CHUNKS: usize>(
 
         let mut c = 0usize;
         while c < cols {
+            // SAFETY: `cols == CHUNKS * LANES`, so every `c` visited here
+            // starts a complete lane group within `x` and each row.
             let xv = unsafe { load8(x.add(c)) };
             sum0 += unsafe { load8(row0.add(c)) } * xv;
             sum1 += unsafe { load8(row1.add(c)) } * xv;
@@ -50,6 +88,8 @@ unsafe fn gemv_fixed<const ROWS: usize, const CHUNKS: usize>(
             c += LANES;
         }
 
+        // SAFETY: the loop guard proves the four output rows are in bounds,
+        // and the caller guarantees `y` is writable for `ROWS` values.
         unsafe {
             *y.add(r) = sum0.reduce_add();
             *y.add(r + 1) = sum1.reduce_add();
@@ -61,6 +101,17 @@ unsafe fn gemv_fixed<const ROWS: usize, const CHUNKS: usize>(
 }
 
 #[inline(always)]
+/// Specialized transposed matrix-vector multiply for a compile-time shape.
+///
+/// Computes `y = A^T @ x` for an `A` matrix with shape
+/// `ROWS x (CHUNKS * LANES)`.
+///
+/// # Safety
+///
+/// `a` must be valid for reading `ROWS * CHUNKS * LANES` initialized `f32`
+/// values, `x` must be valid for reading `ROWS` initialized `f32` values, and
+/// `y` must be valid for writing `CHUNKS * LANES` `f32` values. `y` must not
+/// overlap `a` or `x` for the duration of the call.
 unsafe fn gemv_t_fixed<const ROWS: usize, const CHUNKS: usize>(
     a: *const f32,
     x: *const f32,
@@ -72,16 +123,23 @@ unsafe fn gemv_t_fixed<const ROWS: usize, const CHUNKS: usize>(
     let cols = cols_for::<CHUNKS>();
     let mut c = 0usize;
     while c < cols {
+        // SAFETY: `cols == CHUNKS * LANES`, so each `c` starts a complete
+        // output lane group within `y`.
         unsafe { store8(y.add(c), f32x8::ZERO) };
         c += LANES;
     }
 
     let mut r = 0usize;
     while r < ROWS {
+        // SAFETY: `r < ROWS`, and the caller guarantees `x` is readable for
+        // every row coordinate.
         let x_r = f32x8::splat(unsafe { *x.add(r) });
+        // SAFETY: `r < ROWS`, and the matrix contract covers the full row.
         let row = unsafe { a.add(r * cols) };
         let mut c = 0usize;
         while c < cols {
+            // SAFETY: `cols == CHUNKS * LANES`, so every `c` starts a complete
+            // lane group within the row and output vector.
             let yv = unsafe { load8(y.add(c)) };
             let av = unsafe { load8(row.add(c)) };
             unsafe { store8(y.add(c), yv + av * x_r) };
@@ -92,6 +150,17 @@ unsafe fn gemv_t_fixed<const ROWS: usize, const CHUNKS: usize>(
 }
 
 #[inline(always)]
+/// Try a fixed-shape `y = A @ x` specialization.
+///
+/// Returns `false` without touching memory when `(rows, cols)` is not one of
+/// the curated hot shapes.
+///
+/// # Safety
+///
+/// For supported shapes, `a` must be valid for reading `rows * cols`
+/// initialized `f32` values, `x` must be valid for reading `cols` initialized
+/// `f32` values, and `y` must be valid for writing `rows` `f32` values. `y`
+/// must not overlap `a` or `x` for the duration of the call.
 pub(crate) unsafe fn try_gemv(
     a: *const f32,
     x: *const f32,
@@ -100,6 +169,8 @@ pub(crate) unsafe fn try_gemv(
     cols: usize,
 ) -> bool {
     match (rows, cols) {
+        // SAFETY: the matched runtime shape exactly equals the const-generic
+        // shape, and this function's caller supplies the backing buffers.
         (256, 64) => unsafe { gemv_fixed::<256, 8>(a, x, y) },
         (64, 64) => unsafe { gemv_fixed::<64, 8>(a, x, y) },
         (16, 64) => unsafe { gemv_fixed::<16, 8>(a, x, y) },
@@ -110,6 +181,17 @@ pub(crate) unsafe fn try_gemv(
 }
 
 #[inline(always)]
+/// Try a fixed-shape `y = A^T @ x` specialization.
+///
+/// Returns `false` without touching memory when `(rows, cols)` is not one of
+/// the curated hot shapes.
+///
+/// # Safety
+///
+/// For supported shapes, `a` must be valid for reading `rows * cols`
+/// initialized `f32` values, `x` must be valid for reading `rows` initialized
+/// `f32` values, and `y` must be valid for writing `cols` `f32` values. `y`
+/// must not overlap `a` or `x` for the duration of the call.
 pub(crate) unsafe fn try_gemv_t(
     a: *const f32,
     x: *const f32,
@@ -118,6 +200,8 @@ pub(crate) unsafe fn try_gemv_t(
     cols: usize,
 ) -> bool {
     match (rows, cols) {
+        // SAFETY: the matched runtime shape exactly equals the const-generic
+        // shape, and this function's caller supplies the backing buffers.
         (256, 64) => unsafe { gemv_t_fixed::<256, 8>(a, x, y) },
         (64, 64) => unsafe { gemv_t_fixed::<64, 8>(a, x, y) },
         (16, 64) => unsafe { gemv_t_fixed::<16, 8>(a, x, y) },

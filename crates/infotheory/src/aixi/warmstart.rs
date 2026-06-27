@@ -1766,20 +1766,39 @@ impl WarmStartExactJhAgent {
     }
 
     /// Select the next greedy action from the current exact-return model.
+    ///
+    /// # Panics
+    ///
+    /// Panics if retained live history violates the validated warm-start
+    /// runtime contract. Use [`Self::try_get_planned_action`] to receive that
+    /// condition as [`WarmStartExactJhError`].
     pub fn get_planned_action(&mut self) -> Action {
-        let q_values = self.estimate_q_values();
-        argmax_with_fixed_tie_break(&q_values) as u64
+        self.try_get_planned_action()
+            .expect("warm-start planning state must satisfy validated history invariants")
+    }
+
+    /// Fallibly select the next greedy action from the current exact-return model.
+    pub fn try_get_planned_action(&mut self) -> Result<Action, WarmStartExactJhError> {
+        let q_values = self.estimate_q_values()?;
+        Ok(argmax_with_fixed_tie_break(&q_values) as u64)
     }
 
     /// Estimate exact finite-horizon action values at the current decision state.
     pub fn estimate_action_values(&mut self) -> Result<Vec<f64>, WarmStartExactJhError> {
-        Ok(self.estimate_q_values())
+        self.estimate_q_values()
     }
 
     /// Select the next action with optional epsilon exploration.
     ///
     /// Warm-start exact-\(J_H\) has no baseline exploration parameter; this
     /// method's argument is the entire exploration probability.
+    ///
+    /// # Panics
+    ///
+    /// Panics if greedy planning is reached and retained live history violates
+    /// the validated warm-start runtime contract. Use
+    /// [`Self::try_get_planned_action_with_extra_exploration_flag`] to receive
+    /// that condition as [`WarmStartExactJhError`].
     pub fn get_planned_action_with_extra_exploration(&mut self, extra_exploration: f64) -> Action {
         self.get_planned_action_with_extra_exploration_flag(extra_exploration)
             .0
@@ -1789,18 +1808,37 @@ impl WarmStartExactJhAgent {
     ///
     /// Warm-start exact-\(J_H\) has no baseline exploration parameter; this
     /// method's argument is the entire exploration probability.
+    ///
+    /// # Panics
+    ///
+    /// Panics if greedy planning is reached and retained live history violates
+    /// the validated warm-start runtime contract. Use
+    /// [`Self::try_get_planned_action_with_extra_exploration_flag`] to receive
+    /// that condition as [`WarmStartExactJhError`].
     pub fn get_planned_action_with_extra_exploration_flag(
         &mut self,
         extra_exploration: f64,
     ) -> (Action, bool) {
+        self.try_get_planned_action_with_extra_exploration_flag(extra_exploration)
+            .expect("warm-start planning state must satisfy validated history invariants")
+    }
+
+    /// Fallibly select the next action with optional epsilon exploration and return whether exploration fired.
+    ///
+    /// Warm-start exact-\(J_H\) has no baseline exploration parameter; this
+    /// method's argument is the entire exploration probability.
+    pub fn try_get_planned_action_with_extra_exploration_flag(
+        &mut self,
+        extra_exploration: f64,
+    ) -> Result<(Action, bool), WarmStartExactJhError> {
         let extra = extra_exploration.clamp(0.0, 1.0);
         if extra > 0.0 && self.rng.gen_bool(extra) {
-            (
+            Ok((
                 self.rng.gen_range(self.config.agent_actions.get()) as u64,
                 true,
-            )
+            ))
         } else {
-            (self.get_planned_action(), false)
+            Ok((self.try_get_planned_action()?, false))
         }
     }
 
@@ -1917,9 +1955,11 @@ impl WarmStartExactJhAgent {
         self.advance_phase_model_to_step(phase, start_step)
     }
 
-    fn estimate_q_values(&mut self) -> Vec<f64> {
-        let min_return =
-            (self.config.min_reward as i128 * self.config.return_horizon as i128) as f64;
+    fn estimate_q_values(&mut self) -> Result<Vec<f64>, WarmStartExactJhError> {
+        let min_return = (self.config.min_reward as i128)
+            .checked_mul(self.config.return_horizon as i128)
+            .ok_or(WarmStartExactJhError::ExactReturnRangeOverflow)?
+            as f64;
         let codec = self.return_label_codec;
         let step = self.total_steps_observed + 1;
         let phase = step % self.config.label_phase_period;
@@ -1943,9 +1983,15 @@ impl WarmStartExactJhAgent {
             let end = step.saturating_sub(1);
             if start <= end {
                 for idx in start..=end {
-                    pushed_history +=
-                        push_step_tokens_history(&token_ctx, model.predictor.as_mut(), idx)
-                            .expect("warm-start history encoding invariant");
+                    match push_step_tokens_history(&token_ctx, model.predictor.as_mut(), idx) {
+                        Ok(pushed) => {
+                            pushed_history += pushed;
+                        }
+                        Err(err) => {
+                            pop_history_bits(model.predictor.as_mut(), pushed_history);
+                            return Err(err);
+                        }
+                    }
                 }
             }
             for action in 0..self.config.agent_actions.get() {
@@ -1962,7 +2008,7 @@ impl WarmStartExactJhAgent {
             }
             pop_history_bits(model.predictor.as_mut(), pushed_history);
         }
-        q_values
+        Ok(q_values)
     }
 
     fn advance_phase_model_to_step(
@@ -2571,19 +2617,33 @@ fn push_augmented_step_tokens_commit(
     idx: usize,
 ) -> Result<usize, WarmStartExactJhError> {
     let step = &ctx.steps[idx - 1];
-    let mut pushed = 0usize;
-    pushed += push_action_tokens_commit_history(predictor, step.action, ctx.action_bits);
-    if idx % ctx.config.label_phase_period == ctx.phase {
-        let label = ctx.return_labels_by_step[idx - 1].ok_or(
+    let return_label = if idx % ctx.config.label_phase_period == ctx.phase {
+        Some(ctx.return_labels_by_step[idx - 1].ok_or(
             WarmStartExactJhError::MissingReturnLabel {
                 step: idx,
                 phase: ctx.phase,
             },
-        )?;
+        )?)
+    } else {
+        None
+    };
+    let reward_value = encoded_reward_value(
+        step.reward,
+        ctx.config.reward_bits,
+        ctx.config.reward_offset,
+    )?;
+
+    let mut pushed = 0usize;
+    pushed += push_action_tokens_commit_history(predictor, step.action, ctx.action_bits);
+    if let Some(label) = return_label {
         pushed += ctx.return_label_codec.push_label_commit(predictor, label);
     }
-    pushed +=
-        push_percept_tokens_commit_history(ctx.config, predictor, &step.observations, step.reward)?;
+    pushed += push_percept_tokens_commit_history_encoded(
+        ctx.config,
+        predictor,
+        &step.observations,
+        reward_value,
+    );
     Ok(pushed)
 }
 
@@ -2593,6 +2653,12 @@ fn push_step_tokens_history(
     idx: usize,
 ) -> Result<usize, WarmStartExactJhError> {
     let step = &ctx.steps[idx - 1];
+    let reward_value = encoded_reward_value(
+        step.reward,
+        ctx.config.reward_bits,
+        ctx.config.reward_offset,
+    )?;
+
     let mut pushed = 0usize;
     pushed += push_encoded_bits_history(predictor, step.action, ctx.action_bits);
     if idx % ctx.config.label_phase_period == ctx.phase
@@ -2600,7 +2666,12 @@ fn push_step_tokens_history(
     {
         pushed += ctx.return_label_codec.push_label_history(predictor, label);
     }
-    pushed += push_percept_tokens_history(ctx.config, predictor, &step.observations, step.reward)?;
+    pushed += push_percept_tokens_history_encoded(
+        ctx.config,
+        predictor,
+        &step.observations,
+        reward_value,
+    );
     Ok(pushed)
 }
 
@@ -2610,32 +2681,41 @@ fn push_percept_tokens_commit_history(
     observations: &[PerceptVal],
     reward: Reward,
 ) -> Result<usize, WarmStartExactJhError> {
+    let reward_value = encoded_reward_value(reward, config.reward_bits, config.reward_offset)?;
+    Ok(push_percept_tokens_commit_history_encoded(
+        config,
+        predictor,
+        observations,
+        reward_value,
+    ))
+}
+
+fn push_percept_tokens_commit_history_encoded(
+    config: &WarmStartExactJhRuntimeConfig,
+    predictor: &mut dyn Predictor,
+    observations: &[PerceptVal],
+    reward_value: u64,
+) -> usize {
     let mut pushed = 0usize;
     for &observation in observations {
         pushed += push_encoded_bits_commit_history(predictor, observation, config.observation_bits);
     }
-    pushed += push_encoded_reward_commit_history(
-        predictor,
-        reward,
-        config.reward_bits,
-        config.reward_offset,
-    )?;
-    Ok(pushed)
+    pushed += push_encoded_bits_commit_history(predictor, reward_value, config.reward_bits);
+    pushed
 }
 
-fn push_percept_tokens_history(
+fn push_percept_tokens_history_encoded(
     config: &WarmStartExactJhRuntimeConfig,
     predictor: &mut dyn Predictor,
     observations: &[PerceptVal],
-    reward: Reward,
-) -> Result<usize, WarmStartExactJhError> {
+    reward_value: u64,
+) -> usize {
     let mut pushed = 0usize;
     for &observation in observations {
         pushed += push_encoded_bits_history(predictor, observation, config.observation_bits);
     }
-    pushed +=
-        push_encoded_reward_history(predictor, reward, config.reward_bits, config.reward_offset)?;
-    Ok(pushed)
+    pushed += push_encoded_bits_history(predictor, reward_value, config.reward_bits);
+    pushed
 }
 
 fn push_action_tokens_commit_history(
@@ -2668,12 +2748,11 @@ fn push_encoded_bits_commit_history(
     bits
 }
 
-fn push_encoded_reward_history(
-    predictor: &mut dyn Predictor,
+fn encoded_reward_value(
     reward: Reward,
     bits: usize,
     offset: Reward,
-) -> Result<usize, WarmStartExactJhError> {
+) -> Result<u64, WarmStartExactJhError> {
     validate_reward_encoding_bounds(reward, reward, offset, bits)
         .map_err(WarmStartExactJhError::from)?;
     let shifted = (reward as i128) + (offset as i128);
@@ -2681,25 +2760,7 @@ fn push_encoded_reward_history(
         shifted >= 0,
         "validate_reward_encoding_bounds implies shifted minimum >= 0"
     );
-    let value = shifted as u64;
-    Ok(push_encoded_bits_history(predictor, value, bits))
-}
-
-fn push_encoded_reward_commit_history(
-    predictor: &mut dyn Predictor,
-    reward: Reward,
-    bits: usize,
-    offset: Reward,
-) -> Result<usize, WarmStartExactJhError> {
-    validate_reward_encoding_bounds(reward, reward, offset, bits)
-        .map_err(WarmStartExactJhError::from)?;
-    let shifted = (reward as i128) + (offset as i128);
-    debug_assert!(
-        shifted >= 0,
-        "validate_reward_encoding_bounds implies shifted minimum >= 0"
-    );
-    let value = shifted as u64;
-    Ok(push_encoded_bits_commit_history(predictor, value, bits))
+    Ok(shifted as u64)
 }
 
 fn pop_history_bits(predictor: &mut dyn Predictor, bits: usize) {
@@ -3279,6 +3340,7 @@ mod tests {
     struct PhaseUpdateCounts {
         commit_label_bits: usize,
         commit_history_bits: usize,
+        history_bits: usize,
     }
 
     #[derive(Clone)]
@@ -3296,7 +3358,12 @@ mod tests {
                 .commit_label_bits += 1;
         }
 
-        fn update_history(&mut self, _sym: bool) {}
+        fn update_history(&mut self, _sym: bool) {
+            self.counts
+                .lock()
+                .expect("counts mutex poisoned")
+                .history_bits += 1;
+        }
 
         fn commit_update_history(&mut self, _sym: bool) {
             self.counts
@@ -3419,16 +3486,72 @@ mod tests {
                 PhaseUpdateCounts {
                     commit_label_bits: 0,
                     commit_history_bits: 15,
+                    history_bits: 0,
                 },
                 PhaseUpdateCounts {
                     commit_label_bits: 3,
                     commit_history_bits: 15,
+                    history_bits: 0,
                 },
                 PhaseUpdateCounts {
                     commit_label_bits: 3,
                     commit_history_bits: 15,
+                    history_bits: 0,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn warmstart_action_values_propagate_history_encoding_errors_without_mutation() {
+        let counts = Arc::new(Mutex::new(PhaseUpdateCounts::default()));
+        let cfg = WarmStartExactJhRuntimeConfig {
+            task_fingerprint: TaskFingerprint::parse_hex(TEST_TASK_FINGERPRINT_HEX)
+                .expect("test fingerprint"),
+            observation_bits: 2,
+            observation_stream_len: 1,
+            observation_key_mode: "full_stream",
+            reward_bits: 1,
+            agent_actions: action_alphabet(2),
+            min_reward: 0,
+            max_reward: 1,
+            reward_offset: 0,
+            return_horizon: 1,
+            return_bins: 2,
+            label_phase_period: 1,
+            planner_simulations_per_step: 1,
+            random_seed: 11,
+            provenance_policy: TeacherProvenancePolicy::StandalonePlannerRun,
+        };
+        let mut agent = WarmStartExactJhAgent {
+            config: cfg,
+            phases: vec![PhaseModel {
+                predictor: Box::new(PhaseUpdateCountingPredictor {
+                    counts: counts.clone(),
+                }),
+                last_augmented_step: 0,
+            }],
+            steps: vec![StepRecord {
+                action: 0,
+                observations: vec![0],
+                reward: 2,
+            }],
+            return_labels_by_step: vec![Some(0)],
+            total_steps_observed: 1,
+            action_bits: 1,
+            return_label_codec: ReturnLabelCodec::value_monotone(2),
+            teacher_label_count: 0,
+            rng: RandomGenerator::from_seed(11),
+        };
+
+        let err = agent
+            .estimate_action_values()
+            .expect_err("retained invalid reward must be reported");
+
+        assert!(matches!(err, WarmStartExactJhError::RewardEncoding(_)));
+        assert_eq!(
+            *counts.lock().expect("counts mutex poisoned"),
+            PhaseUpdateCounts::default()
         );
     }
 

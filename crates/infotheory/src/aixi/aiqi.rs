@@ -640,14 +640,14 @@ impl AiqiAgent {
         let extra = extra_exploration.clamp(0.0, 1.0);
         let tau = self.config.baseline_exploration.clamp(0.0, 1.0);
         let effective = 1.0 - (1.0 - tau) * (1.0 - extra);
-        let q_values = self.estimate_q_values();
-        let greedy_action = argmax_with_fixed_tie_break(&q_values) as u64;
         if effective > 0.0 && self.rng.gen_bool(effective) {
             (
                 self.rng.gen_range(self.config.agent_actions.get()) as u64,
                 true,
             )
         } else {
+            let q_values = self.estimate_q_values();
+            let greedy_action = argmax_with_fixed_tie_break(&q_values) as u64;
             (greedy_action, false)
         }
     }
@@ -1685,6 +1685,24 @@ mod tests {
         let (action, explored) = agent.get_planned_action_with_extra_exploration_flag(0.0);
         assert_eq!(action, 1);
         assert!(!explored);
+    }
+
+    #[test]
+    fn forced_aiqi_exploration_skips_value_descent() {
+        let mut agent = AiqiAgent::new(basic_config()).expect("valid aiqi config");
+        let counts = Arc::new(Mutex::new(SharedCallCounts::default()));
+        let decision_phase = (agent.total_steps_observed + 1) % agent.config.augmentation_period;
+        agent.phases[decision_phase].predictor =
+            Box::new(SharedCountingPredictor::new(counts.clone()));
+
+        let (_action, explored) = agent.get_planned_action_with_extra_exploration_flag(1.0);
+
+        assert!(explored);
+        let snapshot = counts.lock().unwrap().clone();
+        assert_eq!(snapshot.update, 0);
+        assert_eq!(snapshot.update_history, 0);
+        assert_eq!(snapshot.commit_update, 0);
+        assert_eq!(snapshot.commit_update_history, 0);
     }
 
     #[test]

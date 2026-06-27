@@ -224,7 +224,7 @@ pub(crate) struct ReturnLawEvalStats {
 pub(crate) struct ReturnLawDistribution {
     /// Probabilities in semantic label-index order.
     pub probabilities: Vec<f64>,
-    /// Whether zero or non-finite mass forced the uniform fallback.
+    /// Whether evaluation used the uniform-label fallback.
     pub used_uniform_fallback: bool,
     /// Evaluation counters.
     pub stats: ReturnLawEvalStats,
@@ -257,6 +257,9 @@ pub(crate) struct ReturnLawExpectation {
 /// predictor once per reached trie edge, i.e. `hypothetical_advances` undo
 /// operations total. Distribution and scalar-expectation callers share the
 /// same descent engine and differ only in how valid leaves are accumulated.
+/// Leaf masses are accumulated directly in `f64`; current callers keep return
+/// label widths small enough that valid mass does not exhaust linear floating
+/// point range before the explicit zero/non-finite-mass fallback applies.
 ///
 /// This intentionally differs from MCTS rollout simulation, which can use
 /// scoped predictor rollback because it opens one scope per rollout rather than
@@ -285,7 +288,7 @@ pub(crate) fn predict_return_law(
         let mut sink = DistributionSink {
             masses: &mut masses,
         };
-        descent.evaluate(evaluator, &mut sink);
+        descent.evaluate::<false>(evaluator, &mut sink);
         descent.stats
     };
     let used_uniform_fallback = normalize_masses(&mut masses);
@@ -298,13 +301,18 @@ pub(crate) fn predict_return_law(
 
 /// Predict the normalized expected decoded return without materializing a law vector.
 ///
-/// This is mathematically equivalent to materializing the normalized label law
-/// and then taking its dot product with `decode_label`, modulo floating-point
-/// reassociation: this path accumulates
-/// `sum(decode(label) * mass) / sum(mass)`, while the distribution path first
-/// normalizes each mass and then performs the dot product. If the decoder
-/// produces a non-finite weighted sum, this scalar path uses the same
-/// uniform-label fallback shape as zero or non-finite total mass.
+/// For finite decoder values and finite nonzero valid mass, this is
+/// mathematically equivalent to materializing the normalized label law and then
+/// taking its dot product with `decode_label`, modulo floating-point
+/// reassociation. The normal scalar path uses direct linear accumulation, which
+/// is the intended regime for current finite-return alphabets. If linear valid
+/// mass underflows to zero, the evaluator reruns the same balanced descent with
+/// log-space accumulation so extremely unlikely valid leaves do not collapse
+/// into a uniform midpoint fallback.
+///
+/// If the decoder itself produces a non-finite value, this scalar path uses the
+/// uniform-label fallback shape, because a non-finite decoded expectation
+/// cannot be repaired by label-law normalization alone.
 ///
 /// Return-law descent deliberately uses balanced per-symbol rollback rather
 /// than the scoped-simulation strategy used by MCTS rollouts: this evaluator
@@ -329,31 +337,104 @@ pub(crate) fn predict_expected_return(
         };
     }
 
-    let mut sink = ExpectedReturnSink {
+    let mut sink = LinearExpectedReturnSink {
         decode_label: &mut decode_label,
         weighted_sum: 0.0,
         valid_mass: 0.0,
+        saw_zero_mass: false,
+        saw_non_finite_decode: false,
     };
     let stats = {
         let mut descent = ReturnLawDescent::new(predictor, codec, prefix_update);
-        descent.evaluate(evaluator, &mut sink);
+        descent.evaluate::<false>(evaluator, &mut sink);
         descent.stats
     };
 
-    if !sink.valid_mass.is_finite() || sink.valid_mass <= 0.0 || !sink.weighted_sum.is_finite() {
-        let uniform_sum: f64 = (0..codec.bins())
-            .map(|label| decode_label(label as u64))
-            .sum();
+    if sink.valid_mass.is_finite()
+        && sink.valid_mass > 0.0
+        && sink.weighted_sum.is_finite()
+        && !sink.saw_zero_mass
+        && !sink.saw_non_finite_decode
+    {
         return ReturnLawExpectation {
-            value: uniform_sum / codec.bins() as f64,
-            used_uniform_fallback: true,
+            value: sink.weighted_sum / sink.valid_mass,
+            used_uniform_fallback: false,
             stats,
         };
     }
 
+    if (sink.valid_mass == 0.0 || sink.saw_zero_mass)
+        && !sink.saw_non_finite_decode
+        && sink.weighted_sum.is_finite()
+    {
+        return predict_expected_return_log_fallback(
+            predictor,
+            codec,
+            prefix_update,
+            evaluator,
+            &mut decode_label,
+        );
+    }
+
+    uniform_expectation(codec, stats, &mut decode_label)
+}
+
+fn predict_expected_return_log_fallback<F>(
+    predictor: &mut dyn Predictor,
+    codec: ReturnLabelCodec,
+    prefix_update: ReturnPrefixUpdate,
+    evaluator: ReturnLawEvaluator,
+    decode_label: &mut F,
+) -> ReturnLawExpectation
+where
+    F: FnMut(u64) -> f64,
+{
+    let mut sink = LogExpectedReturnSink {
+        decode_label,
+        log_valid_mass: None,
+        log_positive_weighted_mass: None,
+        log_negative_weighted_mass: None,
+        saw_non_finite_decode: false,
+    };
+    let stats = {
+        let mut descent = ReturnLawDescent::new(predictor, codec, prefix_update);
+        descent.evaluate::<true>(evaluator, &mut sink);
+        descent.stats
+    };
+
+    let Some(log_valid_mass) = sink.log_valid_mass else {
+        return uniform_expectation(codec, stats, sink.decode_label);
+    };
+
+    if !log_valid_mass.is_finite() || sink.saw_non_finite_decode {
+        return uniform_expectation(codec, stats, sink.decode_label);
+    }
+
+    let positive = sink
+        .log_positive_weighted_mass
+        .map_or(0.0, |log_sum| (log_sum - log_valid_mass).exp());
+    let negative = sink
+        .log_negative_weighted_mass
+        .map_or(0.0, |log_sum| (log_sum - log_valid_mass).exp());
+
     ReturnLawExpectation {
-        value: sink.weighted_sum / sink.valid_mass,
+        value: positive - negative,
         used_uniform_fallback: false,
+        stats,
+    }
+}
+
+fn uniform_expectation(
+    codec: ReturnLabelCodec,
+    stats: ReturnLawEvalStats,
+    decode_label: &mut impl FnMut(u64) -> f64,
+) -> ReturnLawExpectation {
+    let uniform_sum: f64 = (0..codec.bins())
+        .map(|label| decode_label(label as u64))
+        .sum();
+    ReturnLawExpectation {
+        value: uniform_sum / codec.bins() as f64,
+        used_uniform_fallback: true,
         stats,
     }
 }
@@ -423,18 +504,25 @@ impl<'a> ReturnLawDescent<'a> {
         }
     }
 
-    fn evaluate(&mut self, evaluator: ReturnLawEvaluator, sink: &mut impl ReturnLawLeafSink) {
+    fn evaluate<const TRACK_LOG: bool>(
+        &mut self,
+        evaluator: ReturnLawEvaluator,
+        sink: &mut impl ReturnLawLeafSink,
+    ) {
         match evaluator {
             #[cfg(test)]
-            ReturnLawEvaluator::LeafByLeaf => self.descend_leaf_by_leaf(sink),
-            ReturnLawEvaluator::SharedPrefix => self.descend_shared_prefix(0, 0, 1.0, sink),
+            ReturnLawEvaluator::LeafByLeaf => self.descend_leaf_by_leaf::<TRACK_LOG>(sink),
+            ReturnLawEvaluator::SharedPrefix => {
+                self.descend_shared_prefix::<TRACK_LOG>(0, 0, 1.0, 0.0, sink);
+            }
         }
     }
 
     #[cfg(test)]
-    fn descend_leaf_by_leaf(&mut self, sink: &mut impl ReturnLawLeafSink) {
+    fn descend_leaf_by_leaf<const TRACK_LOG: bool>(&mut self, sink: &mut impl ReturnLawLeafSink) {
         for label in 0..self.codec.bins() {
             let mut mass = 1.0f64;
+            let mut log_mass = 0.0f64;
             for depth in 0..self.codec.bits() {
                 let bit = self.codec.bit_at(label as u64, depth);
                 let q = self
@@ -443,25 +531,29 @@ impl<'a> ReturnLawDescent<'a> {
                     .clamp(PROBABILITY_FLOOR, 1.0 - PROBABILITY_FLOOR);
                 self.stats.logical_queries = self.stats.logical_queries.saturating_add(1);
                 mass *= q;
+                if TRACK_LOG {
+                    log_mass += q.ln();
+                }
                 self.apply_hypothetical_bit(bit);
             }
             for _ in 0..self.codec.bits() {
                 self.revert_hypothetical_bit();
             }
-            sink.valid_leaf(label as u64, mass, &mut self.stats);
+            sink.valid_leaf(label as u64, mass, log_mass, &mut self.stats);
         }
     }
 
-    fn descend_shared_prefix(
+    fn descend_shared_prefix<const TRACK_LOG: bool>(
         &mut self,
         depth: usize,
         partial_value: u64,
         prefix_mass: f64,
+        prefix_log_mass: f64,
         sink: &mut impl ReturnLawLeafSink,
     ) {
         if depth == self.codec.bits() {
             if partial_value < self.codec.bins() as u64 {
-                sink.valid_leaf(partial_value, prefix_mass, &mut self.stats);
+                sink.valid_leaf(partial_value, prefix_mass, prefix_log_mass, &mut self.stats);
             } else {
                 sink.invalid_leaf(&mut self.stats);
             }
@@ -478,14 +570,37 @@ impl<'a> ReturnLawDescent<'a> {
             .codec
             .append_to_partial_value(partial_value, depth, false);
         self.apply_hypothetical_bit(false);
-        self.descend_shared_prefix(depth + 1, zero_value, prefix_mass * (1.0 - p_one), sink);
+        let p_zero = 1.0 - p_one;
+        let zero_log_mass = if TRACK_LOG {
+            prefix_log_mass + p_zero.ln()
+        } else {
+            0.0
+        };
+        self.descend_shared_prefix::<TRACK_LOG>(
+            depth + 1,
+            zero_value,
+            prefix_mass * p_zero,
+            zero_log_mass,
+            sink,
+        );
         self.revert_hypothetical_bit();
 
         let one_value = self
             .codec
             .append_to_partial_value(partial_value, depth, true);
         self.apply_hypothetical_bit(true);
-        self.descend_shared_prefix(depth + 1, one_value, prefix_mass * p_one, sink);
+        let one_log_mass = if TRACK_LOG {
+            prefix_log_mass + p_one.ln()
+        } else {
+            0.0
+        };
+        self.descend_shared_prefix::<TRACK_LOG>(
+            depth + 1,
+            one_value,
+            prefix_mass * p_one,
+            one_log_mass,
+            sink,
+        );
         self.revert_hypothetical_bit();
     }
 
@@ -509,7 +624,7 @@ impl<'a> ReturnLawDescent<'a> {
 }
 
 trait ReturnLawLeafSink {
-    fn valid_leaf(&mut self, label: u64, mass: f64, stats: &mut ReturnLawEvalStats);
+    fn valid_leaf(&mut self, label: u64, mass: f64, log_mass: f64, stats: &mut ReturnLawEvalStats);
 
     fn invalid_leaf(&mut self, stats: &mut ReturnLawEvalStats) {
         stats.invalid_leaves = stats.invalid_leaves.saturating_add(1);
@@ -523,7 +638,13 @@ struct DistributionSink<'a> {
 
 #[cfg(test)]
 impl ReturnLawLeafSink for DistributionSink<'_> {
-    fn valid_leaf(&mut self, label: u64, mass: f64, stats: &mut ReturnLawEvalStats) {
+    fn valid_leaf(
+        &mut self,
+        label: u64,
+        mass: f64,
+        _log_mass: f64,
+        stats: &mut ReturnLawEvalStats,
+    ) {
         // Defensive for test comparators: shared-prefix descent filters invalid
         // codeword tails before calling `valid_leaf`, while leaf-by-leaf always
         // iterates valid labels directly.
@@ -536,23 +657,91 @@ impl ReturnLawLeafSink for DistributionSink<'_> {
     }
 }
 
-struct ExpectedReturnSink<'a, F>
+struct LinearExpectedReturnSink<'a, F>
 where
     F: FnMut(u64) -> f64,
 {
     decode_label: &'a mut F,
     weighted_sum: f64,
     valid_mass: f64,
+    saw_zero_mass: bool,
+    saw_non_finite_decode: bool,
 }
 
-impl<F> ReturnLawLeafSink for ExpectedReturnSink<'_, F>
+impl<F> ReturnLawLeafSink for LinearExpectedReturnSink<'_, F>
 where
     F: FnMut(u64) -> f64,
 {
-    fn valid_leaf(&mut self, label: u64, mass: f64, stats: &mut ReturnLawEvalStats) {
+    fn valid_leaf(
+        &mut self,
+        label: u64,
+        mass: f64,
+        _log_mass: f64,
+        stats: &mut ReturnLawEvalStats,
+    ) {
+        if mass == 0.0 {
+            self.saw_zero_mass = true;
+        }
         self.valid_mass += mass;
-        self.weighted_sum += (self.decode_label)(label) * mass;
+        let decoded = (self.decode_label)(label);
+        if decoded.is_finite() {
+            self.weighted_sum += decoded * mass;
+        } else {
+            self.saw_non_finite_decode = true;
+        }
         stats.valid_leaves = stats.valid_leaves.saturating_add(1);
+    }
+}
+
+struct LogExpectedReturnSink<'a, F>
+where
+    F: FnMut(u64) -> f64,
+{
+    decode_label: &'a mut F,
+    log_valid_mass: Option<f64>,
+    log_positive_weighted_mass: Option<f64>,
+    log_negative_weighted_mass: Option<f64>,
+    saw_non_finite_decode: bool,
+}
+
+impl<F> ReturnLawLeafSink for LogExpectedReturnSink<'_, F>
+where
+    F: FnMut(u64) -> f64,
+{
+    fn valid_leaf(
+        &mut self,
+        label: u64,
+        _mass: f64,
+        log_mass: f64,
+        stats: &mut ReturnLawEvalStats,
+    ) {
+        self.log_valid_mass = Some(log_add_exp(self.log_valid_mass, log_mass));
+        let decoded = (self.decode_label)(label);
+        if !decoded.is_finite() {
+            self.saw_non_finite_decode = true;
+        } else if decoded > 0.0 {
+            self.log_positive_weighted_mass = Some(log_add_exp(
+                self.log_positive_weighted_mass,
+                log_mass + decoded.ln(),
+            ));
+        } else if decoded < 0.0 {
+            self.log_negative_weighted_mass = Some(log_add_exp(
+                self.log_negative_weighted_mass,
+                log_mass + (-decoded).ln(),
+            ));
+        }
+        stats.valid_leaves = stats.valid_leaves.saturating_add(1);
+    }
+}
+
+fn log_add_exp(current: Option<f64>, next: f64) -> f64 {
+    let Some(current) = current else {
+        return next;
+    };
+    if current >= next {
+        current + (next - current).exp().ln_1p()
+    } else {
+        next + (current - next).exp().ln_1p()
     }
 }
 
@@ -731,7 +920,7 @@ mod tests {
             |label| (label * label) as f64,
         );
 
-        assert_eq!(direct.value, expected_from_distribution);
+        assert!((direct.value - expected_from_distribution).abs() < 1e-14);
         assert!(!direct.used_uniform_fallback);
         assert_eq!(direct.stats, distribution.stats);
     }
@@ -757,10 +946,42 @@ mod tests {
             |label| label as f64 + 0.25,
         );
 
-        assert_eq!(direct.value, expected_from_distribution);
+        assert!((direct.value - expected_from_distribution).abs() < 1e-14);
         assert!(!direct.used_uniform_fallback);
         assert_eq!(direct.stats, distribution.stats);
         assert_eq!(direct.stats.invalid_leaves, 2);
+    }
+
+    #[test]
+    fn expected_return_matches_distribution_expectation_for_signed_decoder() {
+        let codec = ReturnLabelCodec::value_monotone(8);
+        let mut distribution_predictor = UniformPredictor::default();
+        let mut expectation_predictor = UniformPredictor::default();
+        let distribution = predict_return_law(
+            &mut distribution_predictor,
+            codec,
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+        );
+        let expected_from_distribution =
+            expected_decoded_return(&distribution.probabilities, |label| label as f64 - 3.5);
+        let direct = predict_expected_return(
+            &mut expectation_predictor,
+            codec,
+            ReturnPrefixUpdate::Training,
+            ReturnLawEvaluator::SharedPrefix,
+            |label| label as f64 - 3.5,
+        );
+
+        assert!((direct.value - expected_from_distribution).abs() < 1e-14);
+        assert!(!direct.used_uniform_fallback);
+        assert_eq!(direct.stats, distribution.stats);
+    }
+
+    #[test]
+    fn log_add_exp_retains_tiny_terms_without_linear_underflow() {
+        let combined = log_add_exp(Some(-1000.0), -1000.0);
+        assert!((combined - (-1000.0 + std::f64::consts::LN_2)).abs() < 1e-12);
     }
 
     #[test]

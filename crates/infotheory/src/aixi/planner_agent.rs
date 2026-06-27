@@ -79,7 +79,8 @@ impl PlannerSchedule {
     /// Extra exploration probability at the given global planner step.
     pub fn extra_exploration(&self, step: usize) -> f64 {
         if self.explore_epsilon > 0.0 {
-            (self.explore_epsilon * self.explore_gamma.powi(step as i32)).min(1.0)
+            let exponent = i32::try_from(step).unwrap_or(i32::MAX);
+            (self.explore_epsilon * self.explore_gamma.powi(exponent)).min(1.0)
         } else {
             0.0
         }
@@ -520,8 +521,16 @@ impl PlannerAgent for WarmStartExactJhPlannerAgent {
         let (action, explored) = match phase {
             PlannerPhase::Learn => self
                 .agent
-                .get_planned_action_with_extra_exploration_flag(schedule.extra_exploration(step)),
-            PlannerPhase::Eval => (self.agent.get_planned_action(), false),
+                .try_get_planned_action_with_extra_exploration_flag(
+                    schedule.extra_exploration(step),
+                )
+                .map_err(PlannerAgentError::WarmStart)?,
+            PlannerPhase::Eval => (
+                self.agent
+                    .try_get_planned_action()
+                    .map_err(PlannerAgentError::WarmStart)?,
+                false,
+            ),
         };
         let provenance = if explored {
             PlannerActionProvenance::Exploratory
@@ -862,6 +871,18 @@ mod tests {
 
     fn action_alphabet(n: usize) -> ActionAlphabet {
         ActionAlphabet::try_from_usize(n).expect("test action alphabet must be non-zero")
+    }
+
+    #[test]
+    fn extra_exploration_decay_does_not_wrap_after_i32_limit() {
+        let schedule = PlannerSchedule {
+            learn_cycles: 0,
+            eval_cycles: 0,
+            explore_epsilon: 0.5,
+            explore_gamma: 0.5,
+        };
+
+        assert_eq!(schedule.extra_exploration(i32::MAX as usize + 1), 0.0);
     }
 
     fn sample_warmstart_compiled_planner_run(teacher_path: &Path) -> CompiledPlannerRunSpec {
