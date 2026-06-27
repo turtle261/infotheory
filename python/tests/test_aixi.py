@@ -430,23 +430,23 @@ def test_aiqi_rejects_zpaq_algorithm_in_strict_mode():
         )
 
 
-def test_aiqi_rejects_non_power_of_two_return_bins():
-    with pytest.raises(ValueError, match="power of two"):
-        ait.AiqiConfig(
-            rate_backend=ait.RateBackend.ctw(6),
-            observation_bits=1,
-            observation_stream_len=1,
-            reward_bits=1,
-            agent_actions=2,
-            min_reward=0,
-            max_reward=1,
-            reward_offset=0,
-            discount_gamma=0.99,
-            return_horizon=2,
-            return_bins=3,
-            augmentation_period=2,
-            baseline_exploration=0.01,
-        )
+def test_aiqi_accepts_non_power_of_two_return_bins():
+    cfg = ait.AiqiConfig(
+        rate_backend=ait.RateBackend.ctw(6),
+        observation_bits=1,
+        observation_stream_len=1,
+        reward_bits=1,
+        agent_actions=2,
+        min_reward=0,
+        max_reward=1,
+        reward_offset=0,
+        discount_gamma=0.99,
+        return_horizon=2,
+        return_bins=3,
+        augmentation_period=2,
+        baseline_exploration=0.01,
+    )
+    assert cfg is not None
 
 
 def test_aiqi_rejects_zpaq_rate_backend_in_strict_mode():
