@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  PYTHON_RELEASE_FEATURES: python-extension,all-backends,aixi-gameengine
 
 permissions:
   contents: read
@@ -59,7 +60,7 @@ jobs:
           RUSTFLAGS: -C target-cpu=x86-64
         run: >-
           cargo check --release --manifest-path crates/infotheory_py/Cargo.toml
-          --features python-extension,all-backends
+          --features $PYTHON_RELEASE_FEATURES
 
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
@@ -80,7 +81,7 @@ jobs:
             --manifest-path crates/infotheory_py/Cargo.toml \
             --target-dir target/maturin-linux \
             --interpreter python3 \
-            --features python-extension,all-backends \
+            --features "$PYTHON_RELEASE_FEATURES" \
             --out target/wheels \
             --compatibility manylinux2014 \
             --zig
@@ -94,7 +95,7 @@ jobs:
         run: |
           export PATH="$(dirname "$VENV_PY"):$PATH"
           rm -rf "target/maturin-${{ runner.os }}"
-          "$VENV_PY" -m maturin build --release --manifest-path crates/infotheory_py/Cargo.toml --target-dir "target/maturin-${{ runner.os }}" --features python-extension,all-backends --out target/wheels
+          "$VENV_PY" -m maturin build --release --manifest-path crates/infotheory_py/Cargo.toml --target-dir "target/maturin-${{ runner.os }}" --features "$PYTHON_RELEASE_FEATURES" --out target/wheels
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4

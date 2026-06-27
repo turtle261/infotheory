@@ -8,7 +8,7 @@ description = "The algorithmic information theory library."
 autobins = false
 
 [dependencies]
-zpaq_rs = { version = "1.0.4", path = "../../vendor/zpaq_rs", optional = true }
+zpaq_rs = { version = "1.0.5", path = "../../vendor/zpaq_rs", optional = true }
 nyx-lite = { path = "../../vendor/nyx-lite", optional = true }
 gameengine = { version = "0.3.1", path = "../../vendor/gameengine", optional = true, default-features = false }
 rayon = "1.11.0"
