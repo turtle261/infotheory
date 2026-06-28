@@ -7,13 +7,13 @@ coverage workflows.
 
 ```bash
 # Rust tests (default features)
-cargo test --locked
+cargo test -p infotheory --locked
 
-# Rust tests with CLI/API parity + search tests
-cargo test -p infotheory --features "cli all-backends" --locked
+# Rust CLI + broad backend parity pass
+cargo test -p infotheory --no-default-features --features "cli all-backends" --locked
 
 # VM-focused Rust tests
-cargo test --features vm --test nyx_vm_tests --locked
+cargo test -p infotheory --no-default-features --features "vm backend-ctw" --locked
 ```
 
 ```bash
@@ -71,6 +71,26 @@ The suite includes:
 
 These tests are designed to catch semantic drift and output regressions across
 interfaces.
+
+## Local CI Preflight
+
+For a local CI-like pass, prefer the project wrapper:
+
+```bash
+./projman.sh test_ci
+```
+
+Useful controls:
+
+- `INFOTHEORY_BUILD_MODE=native|portable`
+- `INFOTHEORY_CI_INCLUDE_VM=1`
+- `INFOTHEORY_CI_SKIP_RUST_LINE_COVERAGE=1`
+- `INFOTHEORY_CI_SKIP_RUSTDOC_COVERAGE=1`
+- `INFOTHEORY_CI_SKIP_FEATURE_GATES=1`
+- `INFOTHEORY_CI_SKIP_PYTHON=1`
+
+Avoid indiscriminate workspace all-features sweeps; they pull in heavyweight
+optional surfaces that are intentionally tested through curated CI slices.
 
 ## Benchmark Provenance Checks
 

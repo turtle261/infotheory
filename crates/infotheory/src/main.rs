@@ -817,7 +817,6 @@ fn run_ctw_profile_mode(_args: &[String]) {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Check for help flag early
     if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
         print_usage();
         return;
@@ -829,6 +828,22 @@ fn main() {
     }
 
     let primitive = &args[1];
+    if primitive == "help" {
+        if let Some(topic) = args.get(2) {
+            print_topic_usage(topic);
+        } else {
+            print_usage();
+        }
+        return;
+    }
+    if args
+        .iter()
+        .skip(2)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        print_topic_usage(primitive);
+        return;
+    }
     if primitive == "__infotheory-tuner-eval-worker" {
         run_tuner_eval_worker_mode();
         return;
@@ -1436,182 +1451,11 @@ fn main() {
 }
 
 fn print_usage() {
-    let rate_backends = infotheory::backends::available_rate_backends()
-        .iter()
-        .enumerate()
-        .map(|(idx, name)| {
-            if idx == 0 {
-                format!("'{name}' (default)")
-            } else {
-                format!("'{name}'")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let compression_backends = infotheory::backends::available_compression_backends()
-        .iter()
-        .enumerate()
-        .map(|(idx, name)| {
-            if idx == 0 {
-                format!("'{name}' (default)")
-            } else {
-                format!("'{name}'")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let ctw_profile_help = if cfg!(all(feature = "backend-ctw", feature = "research-tooling")) {
-        "    ctw-profile <input|-> [--depth N]       Emit FAC-CTW arena telemetry as JSONL\n"
-    } else {
-        ""
-    };
+    crate::cli::help::print_global_help();
+}
 
-    eprintln!(
-        r#"InfoTheory CLI
-Usage: infotheory <primitive> [args...] [options]
-
-Primitives:
-  Entropy & Information:
-    h, entropy <file>                       Empirical (order-0/IID) Shannon entropy; with --rate-backend uses the rate backend
-    h_rate, entropy_rate <file>             Algorithmic entropy rate via the active rate backend
-    mi, mutual_info <f1> <f2>               Mutual information I(X;Y) (empirical; rate-backend if --rate-backend)
-    xe, cross_entropy <f1> <f2>             Cross entropy (empirical; rate-backend if --rate-backend)
-    ce, conditional_entropy <f1> <f2>       Conditional entropy H(X|Y) (empirical; rate-backend if --rate-backend)
-    joint_entropy, h_xy <f1> <f2>           Joint entropy H(X,Y) (empirical; rate-backend if --rate-backend)
-    id <file>                               Intrinsic dependence ID(X) using the active rate backend
-
-  Distance & Divergence:
-    ncd <f1> <f2> [method]                  Normalized Compression Distance (Vitanyi)
-    ncd_sym, ncd_cons, ncd_sym_cons         NCD variants (Symmetric, Conservative, etc.)
-    ned <f1> <f2>                           Normalized entropy distance (empirical; rate-backend if --rate-backend)
-    nte <f1> <f2>                           Normalized transform effort (empirical; rate-backend if --rate-backend)
-    kl, kl_divergence <f1> <f2>             Kullback-Leibler divergence (empirical histograms)
-    js, js_divergence <f1> <f2>             Jensen-Shannon divergence (empirical histograms)
-    tvd <f1> <f2>                           Total variation distance (empirical histograms)
-    nhd <f1> <f2>                           Normalized Hellinger distance (empirical histograms)
-    rt, resistance <f1> <f2>                Resistance to transformation
-
-  Tools:
-    search <query> <target> [options]       Search target using info-theoretic ranking
-    aixi <config.json>                      Run AIXI agent
-    warmstart teacher planner-run --target <warmstart-planner-run> --teacher <teacher-planner-run> --out <teacher.json>
-                                          Export a same-task warm-start teacher dataset
-    warmstart teacher from-jsonl --target <warmstart-planner-run> --jsonl <run.jsonl> --out <teacher.json>
-                                          Convert normalized planner JSONL to a teacher dataset
-    warmstart teacher merge --target <warmstart-planner-run> --out <teacher.json> --teacher <teacher-a.json> [...]
-                                          Merge same-task warm-start teacher datasets
-    tune <spec.json|spec.itsd> [options]    Run tuner with executor-side controls
-    batch                                   Run in JSON-L batch mode
-    generate [file]                         Generate continuation from file or piped stdin
-    compress <in> <out>                     Compress file using selected compression backend
-    decompress <in> <out>                   Decompress file using selected compression backend
-{ctw_profile_help}    ac-log-loss <input> --mixture <spec.json> --out-prefix <prefix>
-                                          Emit exact AC/log-loss TSV diagnostics for a mixture
-    sequitur-debug <input>|--hex <hex> [--hex <hex> ...]
-                                          Emit canonical Sequitur grammar and bounded predictive traces
-
-Options:
-    --rate-backend <name>   Backend for rate estimation: {rate_backends}
-  --compression-backend <name>
-                          Backend for NCD/compression: {compression_backends}
-  --method <val>          Method/config (e.g. '5' for zpaq, '16' for ctw, mixture spec path,
-                          model method: file:/path/model.safetensors[;policy:...] or cfg:key=value,...[;policy:...])
-  --msb-first             FAC-CTW only: encode symbols MSB-first (requires --rate-backend fac-ctw)
-  --lsb-first             FAC-CTW only: encode symbols LSB-first (requires --rate-backend fac-ctw)
-  --rate-backend-json <path>
-                          Load canonical RateBackend JSON (relative paths resolve against this file's directory).
-                          Incompatible with --rate-backend and --expert-spec. When used with --method, the method applies to the compression backend shorthand.
-  --compression-backend-json <path>
-                          Load canonical CompressionBackend JSON (e.g. tuner output). Incompatible with
-                          --compression-backend, --expert-spec, and --method. Optional --rate-backend-json must match the embedded rate model when the compression object includes one.
-  --expert-spec <path>    Load one exact standalone expert JSON (same schema as a mixture 'experts' entry)
-  --model-export <path>   Optional online model export path (.safetensors + .json sidecar)
-  --mixture <path>        Mixture spec for 'ac-log-loss'
-  --out-prefix <prefix>   Output prefix for 'ac-log-loss' TSVs
-  --hex <hex>             Hex-encoded byte string for 'sequitur-debug' (repeatable)
-  --context-bytes <n>     Sequitur context width (default: 64)
-  --alphabet-prefix <n>   Prefix of predictive PDF to emit for 'sequitur-debug'
-  --bytes <n>             Bytes to generate for 'generate' (default: 8)
-  --sample                Use seeded sampling for generation
-  --greedy                Force deterministic greedy generation
-  --adaptive              Keep fitting on generated bytes instead of frozen continuation
-  --seed <u64>            RNG seed for sampled generation
-  --temperature <x>       Sampling temperature (default: 1.0)
-  --top-k <n>             Sample only from the top-k bytes (0 disables)
-  --top-p <p>             Nucleus sampling threshold in (0, 1]
-  --exec-config <path>    Tune executor profile JSON (for `tune`)
-  --max-evaluations <n>   Optional tuning evaluation cap (for `tune`)
-  --annealer-kernel-profile <name>
-                          Tune annealer profile: reversible_elementary_metropolis|compiled_uniform_metropolis_hastings
-  --cpu-affinity <csv>    CPU affinity (comma-separated core ids, for `tune`)
-  --threads <n>           Executor thread hint for tuning runs (for `tune`)
-  --evaluator-worker-executable <path>
-                          Explicit tuner evaluator worker executable path (for `tune`)
-  --evaluator-cgroup-parent <path>
-                          Delegated cgroup-v2 eval-parent (typically .../infotheory-tuner/evals)
-  --warmup-baseline-runs <n>
-                          Baseline warmup runs before normative baseline eval (for `tune`)
-  --self-improvement-rounds <n>
-                          Optional bounded online delayed-label update rounds (for `tune`)
-  --stagnation-reset-evals <n>
-                          Optional stagnation reset threshold (for `tune`)
-  --log-path <path>       Optional JSONL executor event log output (for `tune`)
-  --diagnostic-chunk-bytes <n>
-                          Diagnostic report chunk size over charged target bytes (for `tune`)
-  --rss-mode <mode>       Memory accounting mode:
-                          process_rss_peak (explicit Unix RSS fallback) |
-                          backend_reported (diagnostic backend component, RSS deployability) |
-                          hybrid_strict_max (strict Linux cgroup-v2 + RSS max) (for `tune`)
-  --planner-deployable-model
-                          Use executor-side planner deployability diagnostics in the evaluator profile (for `tune`)
-  --warmstart-trace-refresh
-                          Rebuild warm-start exact-J_H from merged same-task live traces between rounds (for `tune`)
-  --timing-tier <tier>    Theorem timing tier: best_effort|isolated|real_time|deterministic_table (for `tune`)
-  --determinism-deadline-certificate <ref>
-                          Determinism/deadline certification reference (for `tune`)
-  --deterministic-evaluator-table <ref>
-                          Verified deterministic evaluator table JSON path (for `tune`)
-  --finite-planner-state-certificate <ref>
-                          Verified finite planner-state certificate JSON path (for `tune`)
-  --no-hidden-state-certificate <ref>
-                          Verified no-hidden/inert-state certificate JSON path (for `tune`)
-  --exact-reward-encoding-certificate <ref>
-                          Verified exact reward encoding certificate JSON path (for `tune`)
-  --emit-exact-reward-encoding-certificate <path>
-                          Emit an exact reward encoding certificate JSON bound to resolved dataset/bounds/evaluator profile and exit (for `tune`)
-  --exact-state-observation-certificate <ref>
-                          Verified exact-state observation certificate JSON path (for `tune`)
-  --observation-adapter-spec-ref <ref>
-                          Observation adapter spec reference (for `tune`)
-  --exact-state-encoder-spec-ref <ref>
-                          Exact-state encoder specification reference (for `tune`)
-  --scalar-representation-ref <ref>
-                          Scalar representation specification reference (for `tune`)
-  --claim-exact-finite-mdp
-                          Request theorem-facing exact finite-MDP claim path (for `tune`)
-  --claim-exact-observed-markov
-                          Request theorem-facing exact observed-Markov claim path (for `tune`)
-  --claim-planner-convergence
-                          Request theorem-facing planner convergence claim path (for `tune`)
-
-Examples:
-  infotheory ncd file1.txt file2.txt --compression-backend zpaq --method 5
-  infotheory ncd file1.txt file2.txt --compression-backend rate-ac --rate-backend ctw
-  infotheory h file.txt --expert-spec ./expert.json
-  infotheory h file.txt --rate-backend mamba --method "cfg:hidden=128,layers=2,intermediate=256,state=16,conv=4,train=adam,lr=0.001;policy:schedule=0..100:train(scope=head+bias,opt=adam,lr=0.001,stride=1,bptt=1,clip=0,momentum=0.9)" --model-export ./mamba_online.safetensors
-  infotheory h file.txt --rate-backend ctw --method 32
-  infotheory h file.txt --rate-backend fac-ctw --method 32 --msb-first
-  infotheory h file.txt --rate-backend mixture --method mixture.json
-  infotheory sequitur-debug --hex 616263616263 --alphabet-prefix 8
-  infotheory search "encryption" ./src --prior "codebase context"
-  cat prompt.txt | infotheory generate --rate-backend ctw --method 32 --bytes 8
-  infotheory generate prompt.txt --rate-backend match --bytes 16 --sample --seed 7
-  infotheory compress in.bin out.itc --compression-backend rate-ac --rate-backend mixture --method mixture.json
-  infotheory decompress out.itc restored.bin --compression-backend rate-ac --rate-backend mixture --method mixture.json
-  RAYON_NUM_THREADS=4 infotheory ac-log-loss corpus.bin --mixture configs/bench/mixture.json --out-prefix /tmp/mixture-diagnostic
-"#,
-        ctw_profile_help = ctw_profile_help
-    );
+fn print_topic_usage(topic: &str) {
+    crate::cli::help::print_topic_help(topic);
 }
 
 #[cfg(test)]

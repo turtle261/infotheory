@@ -3,6 +3,7 @@ use infotheory::error::InfotheoryResult;
 #[cfg(all(test, feature = "vm"))]
 use std::time::Duration;
 
+pub(crate) mod help;
 pub(crate) mod planner_run;
 pub(crate) mod warmstart;
 

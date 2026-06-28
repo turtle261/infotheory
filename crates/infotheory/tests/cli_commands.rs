@@ -85,12 +85,35 @@ fn cli_usage_and_unknown_primitive_paths_are_stable() {
     let help = run_cli(&["--help"], None);
     assert!(help.status.success());
     let help_text = stderr_string(&help);
-    assert!(help_text.contains("Usage: infotheory"));
-    assert!(help_text.contains("--exec-config"));
-    assert!(help_text.contains("--cpu-affinity"));
-    assert!(help_text.contains("--rss-mode"));
-    assert!(help_text.contains("--determinism-deadline-certificate"));
+    assert!(help_text.contains("Usage:"));
+    assert!(help_text.contains("infotheory <command> [args...] [options]"));
+    assert!(help_text.contains("infotheory help [topic]"));
+    assert!(help_text.contains("Common backend options"));
+    assert!(help_text.contains("Topics:"));
+    assert!(!help_text.contains("--exec-config"));
+    assert!(!help_text.contains("--cpu-affinity"));
+    assert!(!help_text.contains("--rss-mode"));
+    assert!(!help_text.contains("--determinism-deadline-certificate"));
     assert!(!help_text.contains("--rwkv-export"));
+
+    let tune_help = run_cli(&["help", "tune"], None);
+    assert!(tune_help.status.success());
+    let tune_help_text = stderr_string(&tune_help);
+    assert!(tune_help_text.contains("InfoTheory tuner"));
+    assert!(tune_help_text.contains("--exec-config"));
+    assert!(tune_help_text.contains("--cpu-affinity"));
+    assert!(tune_help_text.contains("--rss-mode"));
+    assert!(tune_help_text.contains("--determinism-deadline-certificate"));
+
+    let ncd_help = run_cli(&["ncd", "--help"], None);
+    assert!(ncd_help.status.success());
+    let ncd_help_text = stderr_string(&ncd_help);
+    assert!(ncd_help_text.contains("InfoTheory compression and NCD"));
+    assert!(ncd_help_text.contains("rate-ac"));
+
+    let nested_help = run_cli(&["warmstart", "teacher", "--help"], None);
+    assert!(nested_help.status.success());
+    assert!(stderr_string(&nested_help).contains("InfoTheory warm-start teacher tools"));
 
     let a_path = temp_path("unknown_a", "txt");
     let b_path = temp_path("unknown_b", "txt");
@@ -1344,7 +1367,7 @@ fn cli_rejects_unknown_compression_backend_name_in_flag() {
 
 #[test]
 fn cli_help_documents_warmstart_teacher_paths() {
-    let help = run_cli(&["--help"], None);
+    let help = run_cli(&["help", "warmstart"], None);
     assert!(help.status.success());
     let help_text = stderr_string(&help);
     assert!(help_text.contains("warmstart teacher planner-run"));
