@@ -2,7 +2,9 @@
 
 InfoTheory is a Rust library, CLI, and Python extension for algorithmic
 information theory and related information-theoretic functions. It's focused on
-predictive modelling, compression-derived complexity estimates, AIXI approximate (and other universal-ish) agents, and tooling.
+predictive modelling, compression and its derived complexity estimates, AIXI approximate (and other universal-ish) agents, and tooling.
+
+**We provide a prediction library, including applications of predictors, and tooling to evaluate and select better predictors for specific tasks.**
 
 ## What Is Included
 
