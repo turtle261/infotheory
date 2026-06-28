@@ -1,0 +1,75 @@
+[package]
+name = "infotheory_py"
+version = "1.2.0"
+edition = "2024"
+license = "ISC OR Apache-2.0"
+description = "PyO3 bindings for infotheory."
+homepage = "https://infotheory.tech"
+repository = "https://github.com/turtle261/infotheory"
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.100"
+infotheory = { path = "../infotheory", default-features = false }
+pyo3 = { version = "0.29.0", features = ["abi3-py310"] }
+rayon = "1.11.0"
+serde_json = "1.0.149"
+
+[features]
+default = ["default-backends", "aixi"]
+# Grouped capability topology.
+default-backends = ["capability-default"]
+capability-default = [
+    "capability-statistical",
+    "capability-neural",
+    "capability-archive",
+]
+capability-statistical = [
+    "infotheory/capability-statistical",
+    "backend-rosa",
+    "backend-ctw",
+    "backend-match",
+    "backend-ppmd",
+    "backend-sequitur",
+    "backend-mixture",
+    "backend-particle",
+    "backend-calibrated",
+]
+capability-neural = [
+    "infotheory/capability-neural",
+    "backend-mamba",
+    "backend-rwkv",
+]
+capability-archive = [
+    "infotheory/capability-archive",
+    "backend-zpaq",
+]
+capability-vm = ["infotheory/capability-vm"]
+aixi = ["infotheory/aixi"]
+tuner = ["infotheory/tuner"]
+aixi-gameengine = ["aixi", "infotheory/aixi-gameengine"]
+aixi-gameengine-physics = ["aixi-gameengine", "infotheory/aixi-gameengine-physics"]
+aixi-vm = ["vm"]
+
+# Legacy compatibility aliases.
+all-backends = ["capability-default"]
+python-extension = ["pyo3/extension-module", "aixi"]
+backend-rosa = ["infotheory/backend-rosa"]
+backend-ctw = ["infotheory/backend-ctw"]
+backend-match = ["infotheory/backend-match"]
+backend-ppmd = ["infotheory/backend-ppmd"]
+backend-sequitur = ["infotheory/backend-sequitur"]
+backend-mixture = ["infotheory/backend-mixture"]
+backend-particle = ["infotheory/backend-particle"]
+backend-calibrated = ["infotheory/backend-calibrated"]
+backend-mamba = ["infotheory/backend-mamba"]
+backend-rwkv = ["infotheory/backend-rwkv"]
+backend-zpaq = ["infotheory/backend-zpaq"]
+vm = ["aixi", "infotheory/aixi-vm"]
+
+[lints]
+workspace = true

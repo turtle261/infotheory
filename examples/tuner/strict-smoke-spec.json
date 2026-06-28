@@ -1,0 +1,51 @@
+{
+  "eval_time_limit_seconds": 1,
+  "controller": {
+    "max_mutation_radius": 1,
+    "kind": "annealed_hill_climbing"
+  },
+  "min_throughput_bytes_per_second": 1,
+  "max_memory_bytes": 1099511627776,
+  "bounds": {
+    "required_experts": [],
+    "forbidden_expert_pairs": [],
+    "allowed_backends": [
+      "fac-ctw"
+    ],
+    "forbidden_backends": [],
+    "parameter_ranges": [
+      {
+        "max": 16,
+        "parameter": "rate_backend.base_depth",
+        "min": 1
+      }
+    ],
+    "max_experts": 2,
+    "max_mixture_nesting_depth": 1,
+    "min_experts": 1,
+    "allow_duplicate_experts": false
+  },
+  "schema_version": 1,
+  "seed": 7,
+  "assets": [
+    {
+      "id": "dataset",
+      "path": "strict-smoke-dataset.bin"
+    }
+  ],
+  "report_path": "strict-smoke-report.json",
+  "output_config_path": "strict-smoke-output.json",
+  "time_budget_seconds": 5,
+  "input_asset": "dataset",
+  "baseline_candidate": {
+    "rate_backend": {
+      "num_percept_bits": 8,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "base_depth": 8
+    },
+    "framing": "framed",
+    "kind": "rate-ac"
+  },
+  "kind": "tune"
+}

@@ -6,6 +6,36 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+build_mode() {
+  printf '%s' "${INFOTHEORY_BUILD_MODE:-native}"
+}
+
+validate_build_mode() {
+  case "$(build_mode)" in
+    native|portable) ;;
+    *) fail "INFOTHEORY_BUILD_MODE must be one of: native, portable" ;;
+  esac
+}
+
+portable_rustflags() {
+  case "$(uname -s)" in
+    Linux|FreeBSD|OpenBSD) printf '%s' "-C target-cpu=generic -C link-arg=-fuse-ld=lld" ;;
+    *) printf '%s' "-C target-cpu=generic" ;;
+  esac
+}
+
+run_cargo_mode() {
+  validate_build_mode
+  mode=$(build_mode)
+  if [ "$mode" = "portable" ]; then
+    CARGO_BUILD_RUSTFLAGS="$(portable_rustflags)" \
+    RUSTDOCFLAGS="${RUSTDOCFLAGS:-$(portable_rustflags)}" \
+    cargo "$@"
+  else
+    cargo "$@"
+  fi
+}
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
 }
@@ -15,7 +45,15 @@ has_kvm() {
 }
 
 vm_artifacts_present() {
-  [ -f "$ROOT_DIR/vmlinux-6.1.58" ] && [ -f "$ROOT_DIR/nyx-lite/vm_image/dockerimage/rootfs.ext4" ] && [ -f "$ROOT_DIR/nyx-lite/guest/aixi_initramfs.cpio" ]
+  [ -f "$ROOT_DIR/vmlinux-6.1.58" ] && [ -f "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage/rootfs.ext4" ] && [ -f "$ROOT_DIR/vendor/nyx-lite/guest/aixi_initramfs.cpio" ]
+}
+
+cmd_check_nyx_lite_standalone() {
+  say "[check-vm-builder] Checking standalone nyx-lite build_rootfs compile..."
+  need_cmd cargo
+  (cd "$ROOT_DIR" && \
+    cargo check -q --manifest-path "$ROOT_DIR/vendor/nyx-lite/Cargo.toml" --bin build_rootfs)
+  say "[check-vm-builder] Done"
 }
 
 cmd_init_vm() {
@@ -25,7 +63,7 @@ cmd_init_vm() {
   # Kernel (cached)
   if [ ! -f "$ROOT_DIR/vmlinux-6.1.58" ]; then
     if command -v wget >/dev/null 2>&1; then
-      (cd "$ROOT_DIR" && sh "$ROOT_DIR/nyx-lite/vm_image/download_kernel.sh")
+      (cd "$ROOT_DIR" && sh "$ROOT_DIR/vendor/nyx-lite/vm_image/download_kernel.sh")
     elif command -v curl >/dev/null 2>&1; then
       (cd "$ROOT_DIR" && curl -L -o vmlinux-6.1.58 'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.6/x86_64/vmlinux-6.1.58')
     else
@@ -38,12 +76,12 @@ cmd_init_vm() {
   # Minimal initramfs (cpio) for nyx-lite guest
   need_cmd cc
   need_cmd cpio
-  say "[init-vm] Building nyx-lite/guest/aixi_initramfs.cpio"
+  say "[init-vm] Building vendor/nyx-lite/guest/aixi_initramfs.cpio"
   (cd "$ROOT_DIR" && \
-    cc -O2 -static -s nyx-lite/guest/aixi_guest.c -o nyx-lite/guest/aixi_guest && \
-    mkdir -p nyx-lite/guest/initramfs && \
-    cp -f nyx-lite/guest/aixi_guest nyx-lite/guest/initramfs/init && \
-    (cd nyx-lite/guest/initramfs && find . -print | cpio -o -H newc > ../aixi_initramfs.cpio))
+    cc -O2 -static -s vendor/nyx-lite/guest/aixi_guest.c -o vendor/nyx-lite/guest/aixi_guest && \
+    mkdir -p vendor/nyx-lite/guest/initramfs && \
+    cp -f vendor/nyx-lite/guest/aixi_guest vendor/nyx-lite/guest/initramfs/init && \
+    (cd vendor/nyx-lite/guest/initramfs && find . -print | cpio -o -H newc > ../aixi_initramfs.cpio))
 
   # Docker rootfs build (ext4)
   if [ "${SKIP_DOCKER:-}" = "1" ]; then
@@ -56,12 +94,12 @@ cmd_init_vm() {
   need_cmd docker
   need_cmd tar
   need_cmd mke2fs
-  say "[init-vm] Building nyx-lite/vm_image/dockerimage/rootfs.ext4 via RootfsBuilder (no sudo)"
+  say "[init-vm] Building vendor/nyx-lite/vm_image/dockerimage/rootfs.ext4 via RootfsBuilder (no sudo)"
   (cd "$ROOT_DIR" && \
-    cargo run -q -p nyx-lite --bin build_rootfs -- \
-      "$ROOT_DIR/nyx-lite/vm_image/dockerimage/Dockerfile" \
-      "$ROOT_DIR/nyx-lite/vm_image/dockerimage" \
-      "$ROOT_DIR/nyx-lite/vm_image/dockerimage/rootfs.ext4" \
+    cargo run -q --manifest-path "$ROOT_DIR/vendor/nyx-lite/Cargo.toml" --bin build_rootfs -- \
+      "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage/Dockerfile" \
+      "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage" \
+      "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage/rootfs.ext4" \
       --size-mib 512 \
       --work-dir "$ROOT_DIR/target/tmp/rootfs_work")
 
@@ -71,11 +109,13 @@ cmd_init_vm() {
 cmd_code_test() {
   say "[code_test] Building + testing Rust (release)..."
   need_cmd cargo
+  validate_build_mode
+  say "[code_test] Build mode: $(build_mode)"
 
-  (cd "$ROOT_DIR" && cargo build --release)
+  (cd "$ROOT_DIR" && run_cargo_mode build --release)
   if [ "${BUILD_CLI:-0}" = "1" ]; then
     say "[code_test] BUILD_CLI=1 set; checking optional CLI binary"
-    (cd "$ROOT_DIR" && cargo build --release --features cli)
+    (cd "$ROOT_DIR" && run_cargo_mode build --release --features cli)
   fi
 
   # If docker is available, enable the nyx-lite rootfs builder test.
@@ -87,9 +127,9 @@ cmd_code_test() {
   if vm_artifacts_present && has_kvm; then
     say "[code_test] VM artifacts present and /dev/kvm accessible; running with --features vm"
     if [ "$DOCKER_TEST" -eq 1 ]; then
-      (cd "$ROOT_DIR" && NYX_TEST_DOCKER=1 cargo test --release --features vm)
+      (cd "$ROOT_DIR" && NYX_TEST_DOCKER=1 run_cargo_mode test --release --features vm)
     else
-      (cd "$ROOT_DIR" && cargo test --release --features vm)
+      (cd "$ROOT_DIR" && run_cargo_mode test --release --features vm)
     fi
   else
     if vm_artifacts_present; then
@@ -98,9 +138,9 @@ cmd_code_test() {
       say "[code_test] VM artifacts not initialized; running without vm feature"
     fi
     if [ "$DOCKER_TEST" -eq 1 ]; then
-      (cd "$ROOT_DIR" && NYX_TEST_DOCKER=1 cargo test --release)
+      (cd "$ROOT_DIR" && NYX_TEST_DOCKER=1 run_cargo_mode test --release)
     else
-      (cd "$ROOT_DIR" && cargo test --release)
+      (cd "$ROOT_DIR" && run_cargo_mode test --release)
     fi
   fi
 
@@ -118,16 +158,36 @@ cmd_lean_test() {
 }
 
 cmd_test_full() {
+  cmd_check_nyx_lite_standalone
   cmd_init_vm
-  cmd_code_test
+  BUILD_CLI=1 cmd_code_test
   cmd_lean_test
 }
 
+cmd_test_ci() {
+  say "[test_ci] Running local CI preflight script..."
+  need_cmd sh
+  (cd "$ROOT_DIR" && sh "$ROOT_DIR/scripts/test_ci_local.sh" "$@")
+  say "[test_ci] Done"
+}
+
 cmd_test_all() {
+  cmd_test_ci
   cmd_test_full
 }
 
 cmd_bench() {
+  if [ "${1:-}" = "cli" ]; then
+    shift
+    cmd_bench_cli "$@"
+    return 0
+  fi
+  if [ "${1:-}" = "mcts" ]; then
+    shift
+    cmd_bench_mcts "$@"
+    return 0
+  fi
+
   suite=${INFOTHEORY_BENCH_SUITE:-two-json}
   case "${1:-}" in
     two-json|two_json|two|core|full)
@@ -140,8 +200,8 @@ cmd_bench() {
       ;;
   esac
   case "${suite}" in
-    extra) suite_display="examples/extra.json" ;;
-    *) suite=two-json; suite_display="examples/two.json" ;;
+    extra) suite_display="configs/bench/extra.json" ;;
+    *) suite=two-json; suite_display="configs/bench/two.json" ;;
   esac
   say "[bench] Running ${suite_display} benchmark suite..."
   need_cmd sh
@@ -149,12 +209,56 @@ cmd_bench() {
   say "[bench] Done"
 }
 
-cmd_bench__aixi_competitors() {
-  say "[bench__aixi_competitors] Running reproducible Guix benchmark (Infotheory Rust/Python vs PyAIXI vs C++ MC-AIXI)..."
+cmd_bench_cli() {
+  [ $# -ge 1 ] || fail "Usage: ./projman.sh bench cli <baseline-commit> [preset]"
+  need_cmd bash
+  validate_build_mode
+  cli_build_mode=$(build_mode)
+  case "${1:-}" in
+    -h|--help)
+      (cd "$ROOT_DIR" && INFOTHEORY_CLI_BENCH_BUILD_MODE="$cli_build_mode" bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@")
+      return 0
+      ;;
+    --plan)
+      say "[bench_cli] Rendering hyperfine CLI plan (build mode: ${cli_build_mode})..."
+      (cd "$ROOT_DIR" && INFOTHEORY_CLI_BENCH_BUILD_MODE="$cli_build_mode" bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@")
+      say "[bench_cli] Done"
+      return 0
+      ;;
+  esac
+  say "[bench_cli] Running hyperfine CLI comparison against baseline '$1' (build mode: ${cli_build_mode})..."
+  (cd "$ROOT_DIR" && INFOTHEORY_CLI_BENCH_BUILD_MODE="$cli_build_mode" bash "$ROOT_DIR/scripts/bench_cli_hyperfine.sh" "$@" && "$ROOT_DIR/scripts/summarize_interpret.sh")
+  say "[bench_cli] Done"
+}
+
+cmd_bench_mcts() {
+  [ $# -ge 1 ] || fail "Usage: ./projman.sh bench mcts <baseline-commit> [--root <artifacts-dir>]"
+  baseline_commit="$1"
+  shift
+  need_cmd cargo
+  need_cmd git
+  need_cmd python3
+  validate_build_mode
+  mcts_build_mode=$(build_mode)
+  say "[bench_mcts] Running MCTS planner regression benchmark against baseline '${baseline_commit}' (build mode: ${mcts_build_mode})..."
+  if [ "$mcts_build_mode" = "portable" ]; then
+    pf=$(portable_rustflags)
+    (cd "$ROOT_DIR" && \
+      CARGO_BUILD_RUSTFLAGS="$pf" \
+      RUSTDOCFLAGS="${RUSTDOCFLAGS:-$pf}" \
+      python3 "$ROOT_DIR/scripts/bench_mcts_regression.py" --baseline "$baseline_commit" "$@")
+  else
+    (cd "$ROOT_DIR" && python3 "$ROOT_DIR/scripts/bench_mcts_regression.py" --baseline "$baseline_commit" "$@")
+  fi
+  say "[bench_mcts] Done"
+}
+
+cmd_bench_aixi_competitors() {
+  say "[bench_aixi_competitors] Running reproducible Guix benchmark (Infotheory Rust/Python vs PyAIXI vs C++ MC-AIXI)..."
   need_cmd guix
   need_cmd bash
   (cd "$ROOT_DIR" && bash "$ROOT_DIR/scripts/bench_aixi_competitors_guix.sh" "$@")
-  say "[bench__aixi_competitors] Done"
+  say "[bench_aixi_competitors] Done"
 }
 
 cmd_plot() {
@@ -170,8 +274,8 @@ cmd_plot() {
       ;;
   esac
   case "${suite}" in
-    extra) suite_display="examples/extra.json" ;;
-    *) suite=two-json; suite_display="examples/two.json" ;;
+    extra) suite_display="configs/bench/extra.json" ;;
+    *) suite=two-json; suite_display="configs/bench/two.json" ;;
   esac
   say "[plot] Legacy plot generation is superseded by the benchman TUI."
   say "[plot] Use './projman.sh tui ${suite}' to inspect ${suite_display} benchmarks."
@@ -242,15 +346,30 @@ cmd_clean() {
   rm -rf "$ROOT_DIR/ite-bench/.lake/build" || true
 
   # nyx-lite guest artifacts
-  rm -f "$ROOT_DIR/nyx-lite/guest/aixi_guest" || true
-  rm -rf "$ROOT_DIR/nyx-lite/guest/initramfs" || true
-  rm -f "$ROOT_DIR/nyx-lite/guest/aixi_initramfs.cpio" || true
+  rm -f "$ROOT_DIR/vendor/nyx-lite/guest/aixi_guest" || true
+  rm -rf "$ROOT_DIR/vendor/nyx-lite/guest/initramfs" || true
+  rm -f "$ROOT_DIR/vendor/nyx-lite/guest/aixi_initramfs.cpio" || true
 
   # docker rootfs artifact (rebuildable)
-  rm -f "$ROOT_DIR/nyx-lite/vm_image/dockerimage/rootfs.ext4" || true
-  rm -rf "$ROOT_DIR/nyx-lite/vm_image/dockerimage/mnt" || true
+  rm -f "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage/rootfs.ext4" || true
+  rm -rf "$ROOT_DIR/vendor/nyx-lite/vm_image/dockerimage/mnt" || true
 
   say "[clean] Done"
+}
+
+cmd_legacy_aixi_convert() {
+  [ $# -eq 1 ] || fail "Usage: ./projman.sh legacy_aixi_convert <input_file>"
+
+  lua_cmd=""
+  if command -v luajit >/dev/null 2>&1; then
+    lua_cmd="luajit"
+  elif command -v lua >/dev/null 2>&1; then
+    lua_cmd="lua"
+  else
+    fail "Missing required command: luajit or lua"
+  fi
+
+  (cd "$ROOT_DIR" && "$lua_cmd" "$ROOT_DIR/scripts/legacy_aixi_convert.lua" "$1")
 }
 
 usage() {
@@ -259,39 +378,52 @@ Usage: ./projman.sh <command>
 
 Commands:
   bench [suite]  Run benchmark suite (`two-json` default, or `extra`). Requires /tmp/enwik7 to exist and be exactly 10000000 bytes. Resumes the newest raw TSV for the selected suite by default; set INFOTHEORY_BENCH_FRESH=1 for a new run. Not included in test_all.
-  bench__aixi_competitors  Run reproducible Guix time-machine benchmark for Infotheory MC-AIXI (Rust+Python) vs PyAIXI and C++ MC-AIXI. Fails fast if Guix is unavailable.
+  bench cli <baseline-commit> [preset]  Build baseline vs dirty current trees and compare CLI workloads with hyperfine. Presets: `default` (signal-focused defaults) and `quick` (same matrix with lighter defaults). Writes artifacts under /var/tmp/infotheory_bench/.
+  bench mcts <baseline-commit> [--root <dir>]  Run Criterion planner benchmarks (`mcts_planners`) on a baseline worktree and current tree, then enforce Tranche 3.5 Part 1 regression gates (rho_uct >=5%, parallel >=10% fail).
+  bench_aixi_competitors  Run reproducible Guix time-machine benchmark for Infotheory MC-AIXI (Rust+Python) vs PyAIXI and C++ MC-AIXI. Fails fast if Guix is unavailable.
   plot [suite]   Open benchmark results in the benchman TUI for the selected suite (`two-json` default, or `extra`). Not included in test_all.
   tui [suite]    Build and launch the interactive benchmark TUI (`benchman`) for the selected suite (`two-json` default, or `extra`). Supports --summary-tsv/--baseline-summary-tsv/--raw-tsv/--subjects and manages /tmp/plotimgs.
   tui log-loss <prefix>  Build and launch the log-loss diagnostic TUI for <prefix>.trace.tsv / .nodes.tsv / .summary.tsv.
   tui man     Open the local benchman manual via nvim man pager (MANPAGER='nvim +Man!').
   code_test   Build (release) and run Rust tests (release). Uses --features vm iff VM artifacts exist and /dev/kvm is accessible.
+  test_ci     Run fast local CI preflight gates (Rust line coverage, rustdoc coverage, curated feature-gate checks, Python coverage/smoke). Set INFOTHEORY_CI_INCLUDE_VM=1 to include VM slices.
   init-vm     Download/build VM artifacts needed for VM tests (kernel, initramfs, docker rootfs).
   lean_test   Run Lean validation suite (ite-bench). Requires lake.
   test_full   Run init-vm, code_test, and lean_test.
-  test_all    Alias for test_full.
+  test_all    Run test_ci then test_full.
   clean       Clean build artifacts (cargo clean, lake clean, VM images/initramfs). Keeps vmlinux-6.1.58.
+  legacy_aixi_convert <input_file>  Convert legacy AIXI JSON config to canonical planner_run JSON and write to stdout. External configs print: External configs were deprecated.
 
 Environment variables:
-  INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv and INFOTHEORY_BENCH_SUITE=extra.
-  INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv, INFOTHEORY_PLOT_SUMMARY_TSV=..., and INFOTHEORY_PLOT_SUITE=extra.
+  INFOTHEORY_BUILD_MODE=native|portable  Controls local cargo invocations in projman. `native` uses the repository's default target-cpu=native configuration; `portable` overrides local builds/tests to use generic CPU codegen like CI/release builds.
+  INFOTHEORY_BENCH_*  Passed through to scripts/bench_two_json.sh for benchmark tuning/output paths, including INFOTHEORY_BENCH_SUBJECTS=rwkv7, INFOTHEORY_BENCH_SUITE=extra, and INFOTHEORY_BENCH_BUILD_MODE=native|portable.
+  INFOTHEORY_CLI_BENCH_*  Passed through to scripts/bench_cli_hyperfine.sh for baseline/current CLI benchmark tuning and input selection. For `projman.sh bench cli`, INFOTHEORY_BUILD_MODE is canonical and is forwarded as INFOTHEORY_CLI_BENCH_BUILD_MODE.
+  INFOTHEORY_PLOT_*   Passed through to scripts/plot_two_json.sh, including INFOTHEORY_PLOT_SUBJECTS=rwkv7, INFOTHEORY_PLOT_SUMMARY_TSV=..., and INFOTHEORY_PLOT_SUITE=extra.
   INFOTHEORY_BASELINE_SUMMARY_TSV / INFOTHEORY_BENCH_RAW_TSV  Also read by benchman for baseline overlays and raw inspector detail.
   SKIP_DOCKER=1   Skip docker rootfs.ext4 build during init-vm.
   BUILD_CLI=1     Also build optional infotheory CLI binary (feature: cli) during code_test.
+  INFOTHEORY_CI_INCLUDE_VM=1  Include VM feature compile/Python VM smoke slices in test_ci.
+  INFOTHEORY_CI_SKIP_RUST_LINE_COVERAGE=1  Skip only the Rust line coverage gate in test_ci.
+  INFOTHEORY_CI_SKIP_RUSTDOC_COVERAGE=1  Skip only the rustdoc coverage gate in test_ci.
+  INFOTHEORY_CI_SKIP_FEATURE_GATES=1  Skip only curated Rust feature-gate checks in test_ci.
+  INFOTHEORY_CI_SKIP_PYTHON=1  Skip only Python coverage/smoke gates in test_ci.
 EOF
 }
 
 cmd=${1:-}
 case "$cmd" in
   bench) shift; cmd_bench "$@" ;;
-  bench__aixi_competitors) shift; cmd_bench__aixi_competitors "$@" ;;
+  bench_aixi_competitors) shift; cmd_bench_aixi_competitors "$@" ;;
   plot) shift; cmd_plot "$@" ;;
   tui) shift; cmd_tui "$@" ;;
   code_test) shift; cmd_code_test "$@" ;;
+  test_ci) shift; cmd_test_ci "$@" ;;
   init-vm) shift; cmd_init_vm "$@" ;;
   lean_test) shift; cmd_lean_test "$@" ;;
   test_full) shift; cmd_test_full "$@" ;;
   test_all) shift; cmd_test_all "$@" ;;
   clean) shift; cmd_clean "$@" ;;
+  legacy_aixi_convert) shift; cmd_legacy_aixi_convert "$@" ;;
   -h|--help|help|'') usage ;;
   *) usage; fail "Unknown command: $cmd" ;;
 esac

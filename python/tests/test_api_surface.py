@@ -30,10 +30,16 @@ def test_expected_public_surface_symbols_present():
         "RateBackend",
         "CompressionBackend",
         "InfotheoryCtx",
+        "MctsStrategy",
         "GenerationStrategy",
         "GenerationUpdateMode",
         "GenerationConfig",
         "RateBackendSession",
+        "BitOrder",
+        "BitStreamSemantics",
+        "BinaryPrediction",
+        "BytePrefixMass",
+        "RateBackendBitSession",
         "MixtureKind",
         "MixtureScheduleMode",
         "MixtureExpertSpec",
@@ -70,33 +76,33 @@ def test_expected_public_surface_symbols_present():
 def test_functional_metrics_surface_bytes_and_matrix():
     x = b"abracadabra"
     y = b"alakazam"
-    assert _is_finite_nonnegative(ait.marginal_entropy_bytes(x))
-    assert _is_finite_nonnegative(ait.entropy_rate_bytes(x, 4))
-    assert _is_finite_nonnegative(ait.biased_entropy_rate_bytes(x, 4))
-    assert _is_finite_nonnegative(ait.joint_marginal_entropy_bytes(x, y))
-    assert _is_finite_nonnegative(ait.joint_entropy_rate_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.conditional_entropy_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.conditional_entropy_rate_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.mutual_information_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.mutual_information_marg_bytes(x, y))
-    assert _is_finite_nonnegative(ait.mutual_information_rate_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.ned_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.ned_marg_bytes(x, y))
-    assert _is_finite_nonnegative(ait.ned_rate_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.ned_cons_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.ned_cons_marg_bytes(x, y))
-    assert _is_finite_nonnegative(ait.ned_cons_rate_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.nte_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.nte_marg_bytes(x, y))
-    assert _is_finite_nonnegative(ait.nte_rate_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.tvd_bytes(x, y, 0))
-    assert _is_finite_nonnegative(ait.nhd_bytes(x, y, 0))
-    assert _is_finite_nonnegative(ait.cross_entropy_bytes(x, y, 4))
-    assert _is_finite_nonnegative(ait.cross_entropy_rate_bytes(x, y, 4))
+    assert _is_finite_nonnegative(ait.empirical_entropy_bytes(x))
+    assert _is_finite_nonnegative(ait.entropy_rate_bytes(x))
+    assert _is_finite_nonnegative(ait.biased_entropy_rate_bytes(x))
+    assert _is_finite_nonnegative(ait.empirical_joint_entropy_bytes(x, y))
+    assert _is_finite_nonnegative(ait.joint_entropy_rate_bytes(x, y))
+    assert _is_finite_nonnegative(ait.conditional_entropy_bytes(x, y))
+    assert _is_finite_nonnegative(ait.conditional_entropy_rate_bytes(x, y))
+    assert _is_finite_nonnegative(ait.mutual_information_bytes(x, y))
+    assert _is_finite_nonnegative(ait.empirical_mutual_information_bytes(x, y))
+    assert _is_finite_nonnegative(ait.mutual_information_rate_bytes(x, y))
+    assert _is_finite_nonnegative(ait.ned_bytes(x, y))
+    assert _is_finite_nonnegative(ait.empirical_ned_bytes(x, y))
+    assert _is_finite_nonnegative(ait.ned_rate_bytes(x, y))
+    assert _is_finite_nonnegative(ait.ned_cons_bytes(x, y))
+    assert _is_finite_nonnegative(ait.empirical_ned_cons_bytes(x, y))
+    assert _is_finite_nonnegative(ait.ned_cons_rate_bytes(x, y))
+    assert _is_finite_nonnegative(ait.nte_bytes(x, y))
+    assert _is_finite_nonnegative(ait.empirical_nte_bytes(x, y))
+    assert _is_finite_nonnegative(ait.nte_rate_bytes(x, y))
+    assert _is_finite_nonnegative(ait.tvd_bytes(x, y))
+    assert _is_finite_nonnegative(ait.nhd_bytes(x, y))
+    assert _is_finite_nonnegative(ait.cross_entropy_bytes(x, y))
+    assert _is_finite_nonnegative(ait.cross_entropy_rate_bytes(x, y))
     assert _is_finite_nonnegative(ait.d_kl_bytes(x, y))
     assert _is_finite_nonnegative(ait.js_div_bytes(x, y))
-    assert _is_finite_nonnegative(ait.intrinsic_dependence_bytes(x, 4))
-    assert _is_finite_nonnegative(ait.resistance_to_transformation_bytes(x, x, 4))
+    assert _is_finite_nonnegative(ait.intrinsic_dependence_bytes(x))
+    assert _is_finite_nonnegative(ait.resistance_to_transformation_bytes(x, x))
     matrix = ait.ncd_matrix_bytes([x, y, b"xyzxyz"], method="5", variant="sym")
     assert len(matrix) == 9
 
@@ -114,31 +120,25 @@ def test_backend_objects_context_and_helpers(tmp_path):
     try:
         ait.set_default_ctx(ctx)
         assert isinstance(ait.get_default_ctx(), ait.InfotheoryCtx)
-        assert _is_finite_nonnegative(ctx.entropy_rate_bytes(b"abcabcabc", 4))
-        assert _is_finite_nonnegative(ctx.biased_entropy_rate_bytes(b"abcabcabc", 4))
+        assert _is_finite_nonnegative(ctx.entropy_rate_bytes(b"abcabcabc"))
+        assert _is_finite_nonnegative(ctx.biased_entropy_rate_bytes(b"abcabcabc"))
         assert _is_finite_nonnegative(ctx.compress_size(b"payload"))
         assert _is_finite_nonnegative(ctx.compress_size_chain([b"pay", b"load"]))
-        assert _is_finite_nonnegative(
-            ctx.cross_entropy_rate_bytes(b"abcabc", b"abcabd", 4)
-        )
-        assert _is_finite_nonnegative(ctx.cross_entropy_bytes(b"abcabc", b"abcabd", 4))
-        assert _is_finite_nonnegative(ctx.joint_entropy_rate_bytes(b"abc", b"abd", 4))
-        assert _is_finite_nonnegative(
-            ctx.conditional_entropy_rate_bytes(b"abc", b"abd", 4)
-        )
+        assert _is_finite_nonnegative(ctx.cross_entropy_rate_bytes(b"abcabc", b"abcabd"))
+        assert _is_finite_nonnegative(ctx.cross_entropy_bytes(b"abcabc", b"abcabd"))
+        assert _is_finite_nonnegative(ctx.joint_entropy_rate_bytes(b"abc", b"abd"))
+        assert _is_finite_nonnegative(ctx.conditional_entropy_rate_bytes(b"abc", b"abd"))
         assert _is_finite_nonnegative(
             ctx.cross_entropy_conditional_chain([b"ab", b"ca"], b"bc")
         )
-        assert _is_finite_nonnegative(ctx.mutual_information_rate_bytes(b"abc", b"abd", 4))
-        assert _is_finite_nonnegative(ctx.mutual_information_bytes(b"abc", b"abd", 4))
-        assert _is_finite_nonnegative(ctx.conditional_entropy_bytes(b"abc", b"abd", 4))
-        assert _is_finite_nonnegative(ctx.ned_bytes(b"abc", b"abd", 4))
-        assert _is_finite_nonnegative(ctx.ned_cons_bytes(b"abc", b"abd", 4))
-        assert _is_finite_nonnegative(ctx.nte_bytes(b"abc", b"abd", 4))
-        assert _is_finite_nonnegative(ctx.intrinsic_dependence_bytes(b"abcabc", 4))
-        assert _is_finite_nonnegative(
-            ctx.resistance_to_transformation_bytes(b"abc", b"abc", 4)
-        )
+        assert _is_finite_nonnegative(ctx.mutual_information_rate_bytes(b"abc", b"abd"))
+        assert _is_finite_nonnegative(ctx.mutual_information_bytes(b"abc", b"abd"))
+        assert _is_finite_nonnegative(ctx.conditional_entropy_bytes(b"abc", b"abd"))
+        assert _is_finite_nonnegative(ctx.ned_bytes(b"abc", b"abd"))
+        assert _is_finite_nonnegative(ctx.ned_cons_bytes(b"abc", b"abd"))
+        assert _is_finite_nonnegative(ctx.nte_bytes(b"abc", b"abd"))
+        assert _is_finite_nonnegative(ctx.intrinsic_dependence_bytes(b"abcabc"))
+        assert _is_finite_nonnegative(ctx.resistance_to_transformation_bytes(b"abc", b"abc"))
         assert _is_finite_nonnegative(ctx.ncd_bytes(b"abc", b"abd", "vitanyi"))
         assert _is_finite_nonnegative(
             ait.ncd_paths(str(a), str(b), backend="zpaq", method="5", variant="vitanyi")
@@ -167,19 +167,15 @@ def test_backend_objects_context_and_helpers(tmp_path):
         compressed = ait.compress_bytes_backend(b"payload", "zpaq", "5")
         assert ait.decompress_bytes_backend(compressed, "zpaq", "5") == b"payload"
         assert ait.validate_zpaq_rate_method("1") is None
-        assert _is_finite_nonnegative(ait.entropy_rate_backend(b"abc", 4, backend=rb))
-        assert _is_finite_nonnegative(ait.biased_entropy_rate_backend(b"abc", 4, backend=rb))
+        assert _is_finite_nonnegative(ait.entropy_rate_backend(b"abc", backend=rb))
+        assert _is_finite_nonnegative(ait.biased_entropy_rate_backend(b"abc", backend=rb))
+        assert _is_finite_nonnegative(ait.joint_entropy_rate_backend(b"abc", b"abd", backend=rb))
         assert _is_finite_nonnegative(
-            ait.joint_entropy_rate_backend(b"abc", b"abd", 4, backend=rb)
+            ait.mutual_information_rate_backend(b"abc", b"abd", backend=rb)
         )
-        assert _is_finite_nonnegative(
-            ait.mutual_information_rate_backend(b"abc", b"abd", 4, backend=rb)
-        )
-        assert _is_finite_nonnegative(ait.ned_rate_backend(b"abc", b"abd", 4, backend=rb))
-        assert _is_finite_nonnegative(ait.nte_rate_backend(b"abc", b"abd", 4, backend=rb))
-        assert _is_finite_nonnegative(
-            ait.cross_entropy_rate_backend(b"abc", b"abd", 4, backend=rb)
-        )
+        assert _is_finite_nonnegative(ait.ned_rate_backend(b"abc", b"abd", backend=rb))
+        assert _is_finite_nonnegative(ait.nte_rate_backend(b"abc", b"abd", backend=rb))
+        assert _is_finite_nonnegative(ait.cross_entropy_rate_backend(b"abc", b"abd", backend=rb))
         generated = ctx.generate_bytes(
             b"abcabcabc",
             4,
@@ -206,10 +202,12 @@ def test_bit_and_observation_helpers():
     assert isinstance(
         ait.observation_key_from_stream(ait.ObservationKeyMode.StreamHash, stream, 8), int
     )
-    assert isinstance(ait.observation_key_from_stream("stream-hash", stream, 8), int)
-    assert isinstance(ait.observation_key_from_stream("hash", stream, 8), int)
-    assert isinstance(ait.observation_repr_from_stream("full", stream, 8), list)
-    assert isinstance(ait.observation_repr_from_stream("full-stream", stream, 8), list)
+    assert isinstance(ait.observation_key_from_stream("stream_hash", stream, 8), int)
+    with pytest.raises(ValueError):
+        ait.observation_key_from_stream("stream-hash", stream, 8)
+    assert isinstance(ait.observation_repr_from_stream("full_stream", stream, 8), list)
+    with pytest.raises(ValueError):
+        ait.observation_repr_from_stream("full-stream", stream, 8)
     assert isinstance(ait.observation_repr_from_stream("last", stream, 8), list)
 
 
@@ -261,11 +259,7 @@ def test_new_rate_backends_parse_and_execute(tmp_path):
     particle_spec = ait.ParticleSpec(num_particles=4, num_cells=4, cell_dim=8)
     mixture_spec = ait.MixtureSpec(
         ait.MixtureKind.Convex,
-        [
-            ait.MixtureExpertSpec(
-                ait.RateBackend.match(), max_order=-1, log_prior=0.0, name="match"
-            )
-        ],
+        [ait.MixtureExpertSpec(ait.RateBackend.match(), log_prior=0.0, name="match")],
         alpha=0.02,
         schedule=ait.MixtureScheduleMode.Theorem,
     )
@@ -288,10 +282,8 @@ def test_new_rate_backends_parse_and_execute(tmp_path):
     payload = b"abracadabra abracadabra"
     peer = b"alakazam alakazam"
     for backend in parsed_backends + constructed_backends:
-        assert _is_finite_nonnegative(ait.entropy_rate_backend(payload, 4, backend=backend))
-        assert _is_finite_nonnegative(
-            ait.cross_entropy_rate_backend(payload, peer, 4, backend=backend)
-        )
+        assert _is_finite_nonnegative(ait.entropy_rate_backend(payload, backend=backend))
+        assert _is_finite_nonnegative(ait.cross_entropy_rate_backend(payload, peer, backend=backend))
 
     with pytest.raises(ValueError):
         ait.rate_backend("unknown-backend")
@@ -354,9 +346,9 @@ def test_mamba_rate_backend_parse_construct_metrics_and_roundtrip_parity():
     object_backend = ait.RateBackend.mamba(method)
 
     for backend in (parsed_backend, object_backend):
-        assert _is_finite_nonnegative(ait.entropy_rate_backend(payload, 4, backend=backend))
+        assert _is_finite_nonnegative(ait.entropy_rate_backend(payload, backend=backend))
         assert _is_finite_nonnegative(
-            ait.cross_entropy_rate_backend(payload, peer, 4, backend=backend)
+            ait.cross_entropy_rate_backend(payload, peer, backend=backend)
         )
 
     framed_from_parsed = ait.CompressionBackend.rate_ac(parsed_backend, "framed")

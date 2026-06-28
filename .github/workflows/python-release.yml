@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  PYTHON_RELEASE_FEATURES: python-extension,all-backends,aixi-gameengine
 
 permissions:
   contents: read
@@ -58,8 +59,8 @@ jobs:
         env:
           RUSTFLAGS: -C target-cpu=x86-64
         run: >-
-          cargo check --release --manifest-path infotheory_py/Cargo.toml
-          --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq
+          cargo check --release --manifest-path crates/infotheory_py/Cargo.toml
+          --features $PYTHON_RELEASE_FEATURES
 
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
@@ -71,14 +72,16 @@ jobs:
           RUSTFLAGS: -C target-cpu=x86-64
         run: |
           export PATH=".venv/bin:$PATH"
+          rm -rf target/maturin-linux
           ln -sf python-zig .venv/bin/zig
           export ZIG_COMMAND="$(command -v zig)"
           export AR_x86_64_unknown_linux_gnu="$(command -v llvm-ar)"
           export RANLIB_x86_64_unknown_linux_gnu="$(command -v llvm-ranlib)"
           .venv/bin/python -m maturin build --release \
-            --manifest-path infotheory_py/Cargo.toml \
+            --manifest-path crates/infotheory_py/Cargo.toml \
+            --target-dir target/maturin-linux \
             --interpreter python3 \
-            --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq \
+            --features "$PYTHON_RELEASE_FEATURES" \
             --out target/wheels \
             --compatibility manylinux2014 \
             --zig
@@ -91,7 +94,8 @@ jobs:
           RUSTFLAGS: -C target-cpu=generic
         run: |
           export PATH="$(dirname "$VENV_PY"):$PATH"
-          "$VENV_PY" -m maturin build --release --manifest-path infotheory_py/Cargo.toml --features python-extension,backend-rosa,backend-mamba,backend-rwkv,backend-zpaq --out target/wheels
+          rm -rf "target/maturin-${{ runner.os }}"
+          "$VENV_PY" -m maturin build --release --manifest-path crates/infotheory_py/Cargo.toml --target-dir "target/maturin-${{ runner.os }}" --features "$PYTHON_RELEASE_FEATURES" --out target/wheels
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
@@ -105,7 +109,7 @@ jobs:
         shell: bash
         run: |
           export PATH=".venv/bin:$PATH"
-          .venv/bin/python -m maturin sdist --manifest-path infotheory_py/Cargo.toml
+          .venv/bin/python -m maturin sdist --manifest-path crates/infotheory_py/Cargo.toml
 
       - name: Upload sdist artifact
         if: runner.os == 'Linux'

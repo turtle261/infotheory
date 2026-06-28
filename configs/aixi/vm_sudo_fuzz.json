@@ -1,0 +1,123 @@
+{
+  "assets": [
+    {
+      "id": "firecracker",
+      "path": "..\/..\/vendor\/nyx-lite\/vm_image\/vmconfig.json"
+    }
+  ],
+  "controller": {
+    "agent_horizon": 4,
+    "discount_gamma": 0.95,
+    "exploration_exploitation_ratio": 2,
+    "kind": "mc_aixi",
+    "num_simulations": 1,
+    "predictor": {
+      "base_depth": 32,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "num_percept_bits": 528
+    }
+  },
+  "environment": {
+    "action_source": {
+      "dictionary": [],
+      "encoding": "hex",
+      "kind": "fuzz",
+      "max_len": 512,
+      "min_len": 1,
+      "mutators": [
+        "flip_bit",
+        "insert_byte",
+        "delete_byte",
+        "havoc",
+        "splice_seed"
+      ],
+      "rng_seed": 12345,
+      "seeds": [
+        "7375646f202d6c0a",
+        "7375646f202d7520726f6f742069640a",
+        "7375646f202d7523302069640a",
+        "7375646f202d75232d312069640a",
+        "7375646f2077686f616d690a",
+        "7375646f202d730a",
+        "7375646f202d690a",
+        "7375646f202d6b0a",
+        "7375646f202d760a",
+        "7375646f20656e760a",
+        "7375646f202d452077686f616d690a",
+        "7375646f202d482077686f616d690a",
+        "7375646f202d7520726f6f74202d6720726f6f742069640a",
+        "7375646f202d2d2069640a",
+        "7375646f202d6e2077686f616d690a",
+        "7375646f202d70202750617373776f72643a272077686f616d690a",
+        "7375646f202d532077686f616d690a",
+        "7375646f202d412077686f616d690a",
+        "7375646f202d622077686f616d690a",
+        "7375646f202d4320352077686f616d690a",
+        "7375646f202d2d0a",
+        "7375646f202d75200a",
+        "7375646f202d752027272069640a",
+        "7375646f202d7520726f6f742069640a",
+        "414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141410a",
+        "7375646f20",
+        "0a0a0a0a0a",
+        "00000000",
+        "7375646f202d752024286964202d75292069640a",
+        "7375646f202d75206077686f616d69602069640a"
+      ]
+    },
+    "boot_timeout_ms": 30000,
+    "crash_log": "sudo_crashes.jsonl",
+    "debug_mode": false,
+    "episode_steps": 1,
+    "firecracker_config_asset": "firecracker",
+    "instance_id": "aixi-nyx",
+    "kind": "nyx_vm",
+    "observation_bits": 8,
+    "observation_pad_byte": 0,
+    "observation_policy": "shared_memory",
+    "observation_stream_len": 64,
+    "observation_stream_mode": "pad_truncate",
+    "protocol": {
+      "action_prefix": "ACT ",
+      "action_suffix": "\n",
+      "data_prefix": "DATA ",
+      "done_prefix": "DONE ",
+      "obs_prefix": "OBS ",
+      "rew_prefix": "REW ",
+      "wire_encoding": "hex"
+    },
+    "reward_bits": 16,
+    "reward_policy": {
+      "kind": "from_guest"
+    },
+    "shared_memory_policy": "snapshot",
+    "shared_region_name": "shared",
+    "shared_region_size": 4096,
+    "stats_backend": {
+      "kind": "rosaplus"
+    },
+    "step_cost": 0,
+    "step_timeout_ms": 3000
+  },
+  "interface": {
+    "agent_actions": 5,
+    "max_reward": 32767,
+    "min_reward": -32768,
+    "observation_bits": 8,
+    "observation_key_mode": "full_stream",
+    "observation_stream_len": 64,
+    "reward_bits": 16,
+    "reward_offset": 32768
+  },
+  "kind": "planner_run",
+  "runtime": {
+    "explore_epsilon": 0,
+    "explore_gamma": 1,
+    "log_every": 500,
+    "perf": true,
+    "terminate_lifetime": 10000,
+    "vm_perf_only": false
+  },
+  "schema_version": 1
+}

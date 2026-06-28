@@ -38,7 +38,7 @@ workload_portable_input() {
       "${repo_root}/README.md" \
       "${repo_root}/LICENSE-APACHE" \
       "${repo_root}/Cargo.toml" \
-      "${repo_root}/examples/two.json" >> "${out_path}"
+      "${repo_root}/configs/bench/two.json" >> "${out_path}"
   done
   truncate -s "${bytes}" "${out_path}"
   printf '%s\n' "${out_path}"
@@ -66,7 +66,7 @@ configure_workload_preset() {
     two-json)
       WORKLOAD_LABELS=("two_json_rate_ac")
       WORKLOAD_COMMANDS=(
-        "\"${bin_path}\" compress \"${WORKLOAD_INPUT}\" \"${out_dir}/two_json_rate_ac.itc\" --compression-backend rate-ac --rate-backend mixture --method \"${repo_root}/examples/two.json\""
+        "\"${bin_path}\" compress \"${WORKLOAD_INPUT}\" \"${out_dir}/two_json_rate_ac.itc\" --compression-backend rate-ac --rate-backend mixture --method \"${repo_root}/configs/bench/two.json\""
       )
       ;;
     rwkv-all)

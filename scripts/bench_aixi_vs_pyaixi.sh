@@ -249,9 +249,16 @@ def main():
   max_reward = max(raw_rewards)
   reward_offset = max(0, -min_reward)
 
+  if args.algorithm == "ac-ctw":
+      rate_backend = ait.RateBackend.ctw(args.ct_depth)
+  elif args.algorithm == "fac-ctw":
+      percept_bits = adapter.get_observation_bits() + adapter.get_reward_bits()
+      rate_backend = ait.RateBackend.fac_ctw(args.ct_depth, percept_bits, 8)
+  else:
+      raise ValueError(f"unsupported algorithm {args.algorithm}")
+
   cfg = ait.AgentConfig(
-    algorithm=args.algorithm,
-    ct_depth=args.ct_depth,
+    rate_backend=rate_backend,
     agent_horizon=args.horizon,
     observation_bits=adapter.get_observation_bits(),
     observation_stream_len=1,

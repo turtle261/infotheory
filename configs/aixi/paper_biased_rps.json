@@ -1,0 +1,42 @@
+{
+  "assets": [],
+  "controller": {
+    "agent_horizon": 4,
+    "discount_gamma": 1,
+    "exploration_exploitation_ratio": 0.5,
+    "kind": "mc_aixi",
+    "num_simulations": 100,
+    "predictor": {
+      "base_depth": 32,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "num_percept_bits": 4
+    }
+  },
+  "environment": {
+    "kind": "builtin",
+    "name": "biased_rock_paper_scissor"
+  },
+  "interface": {
+    "agent_actions": 3,
+    "max_reward": 1,
+    "min_reward": -1,
+    "observation_bits": 2,
+    "observation_key_mode": "full_stream",
+    "observation_stream_len": 1,
+    "reward_bits": 2,
+    "reward_offset": 1
+  },
+  "kind": "planner_run",
+  "runtime": {
+    "eval_cycles": 200,
+    "explore_epsilon": 0.999,
+    "explore_gamma": 0.99999,
+    "learn_cycles": 15000,
+    "log_every": 1,
+    "perf": false,
+    "terminate_lifetime": 20,
+    "vm_perf_only": false
+  },
+  "schema_version": 1
+}

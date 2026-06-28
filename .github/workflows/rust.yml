@@ -39,28 +39,50 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Rustfmt
         run: cargo fmt --all --check
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Tuner traceability anchors
+        run: |
+          uv run --no-project --with tree-sitter==0.25.2 --with tree-sitter-rust==0.24.2 python scripts/check_tuner_traceability.py
+
+      - name: Dependency integrity
+        run: |
+          cargo update --workspace --locked --dry-run
+          cargo tree --workspace --all-features --locked --duplicates
+
       - name: Clippy (default + CLI)
         run: |
           cargo clippy -p zpaq_rs --locked
+          cargo clippy --manifest-path vendor/gameengine/Cargo.toml --features builtin --locked
           cargo clippy -p infotheory --lib --bins --features cli --locked
+          cargo clippy -p infotheory --lib --no-default-features --features aixi-gameengine --locked
           cargo clippy -p infotheory --lib --bins --no-default-features --features cli --locked
+          cargo clippy -p infotheory --lib --bins --no-default-features --features "cli tuner backend-ctw" --locked
 
       - name: Warnings gate (default + no-default CLI)
         run: |
           RUSTFLAGS="-D warnings" cargo check -p zpaq_rs --locked
+          RUSTFLAGS="-D warnings" cargo check --manifest-path vendor/gameengine/Cargo.toml --features builtin --locked
           RUSTFLAGS="-D warnings" cargo check -p infotheory --features cli --locked
+          RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features aixi-gameengine --locked
           RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features cli --locked
+          RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features "tuner backend-ctw" --locked
+          RUSTFLAGS="-D warnings" cargo check -p infotheory --no-default-features --features "cli tuner backend-ctw" --locked
+          PYO3_BUILD_EXTENSION_MODULE=1 RUSTFLAGS="-D warnings" cargo check -p infotheory_py --no-default-features --features "tuner backend-ctw" --locked
 
       - name: Install coverage tooling
         run: cargo install cargo-llvm-cov --locked
 
       - name: Rust line coverage gate (CLI + library parity suite)
         run: |
-          cargo llvm-cov -p infotheory --tests --features cli --locked --summary-only --fail-under-lines 50
+          cargo llvm-cov -p infotheory --tests --features "cli all-backends" --locked --summary-only --fail-under-lines 85
 
       - name: Rustdoc coverage gate
         run: |
@@ -83,18 +105,13 @@ jobs:
           cargo install cargo-audit --locked
           cargo audit
 
-      - name: Dependency integrity
-        run: |
-          cargo update --workspace --locked --dry-run
-          cargo tree --workspace --all-features --locked --duplicates
-
       - name: Install Lean (elan)
         run: |
           curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
       - name: Build infotheory CLI for Lean validation
-        run: cargo build --release --features cli --bin infotheory --locked
+        run: cargo build -p infotheory --release --features cli --bin infotheory --locked
 
       - name: Run Lean validation (ite-bench)
         run: ./projman.sh lean_test
@@ -177,38 +194,109 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: platform-hosted-${{ matrix.target }}
+          cache-bin: false
 
       - name: Feature checks
         env:
           RUSTFLAGS: -D warnings
+          PYO3_BUILD_EXTENSION_MODULE: "1"
         run: |
-          cargo check --locked
-          cargo check --no-default-features --locked
-          cargo check --no-default-features --features cli --locked
-          cargo check --features cli --locked
+          cargo check -p infotheory --locked
+          cargo check -p infotheory --no-default-features --locked
+          cargo check -p infotheory --no-default-features --features backend-rosa --locked
+          cargo check -p infotheory --no-default-features --features backend-ctw --locked
+          cargo check -p infotheory --no-default-features --features backend-match --locked
+          cargo check -p infotheory --no-default-features --features backend-ppmd --locked
+          cargo check -p infotheory --no-default-features --features backend-sequitur --locked
+          cargo check -p infotheory --no-default-features --features backend-mixture --locked
+          cargo check -p infotheory --no-default-features --features backend-particle --locked
+          cargo check -p infotheory --no-default-features --features backend-calibrated --locked
+          cargo check -p infotheory --no-default-features --features backend-zpaq --locked
+          cargo check -p infotheory --no-default-features --features backend-rwkv --locked
+          cargo check -p infotheory --no-default-features --features backend-mamba --locked
+          cargo check -p infotheory --no-default-features --features all-backends --locked
+          cargo check -p infotheory --no-default-features --features aixi-gameengine --locked
+          cargo check -p infotheory --no-default-features --features "aixi-gameengine all-backends" --locked
+          cargo check -p infotheory --no-default-features --features tuner --locked
+          cargo check -p infotheory --no-default-features --features "tuner backend-ctw" --locked
+          cargo check -p infotheory --no-default-features --features "cli tuner backend-ctw" --locked
+          cargo check -p infotheory_py --no-default-features --features "tuner backend-ctw" --locked
+          cargo check -p infotheory --no-default-features --features cli --locked
+          cargo check -p infotheory --features cli --locked
+          cargo check --manifest-path vendor/gameengine/Cargo.toml --features builtin --locked
+          cargo check -p zpaq_rs --locked
+          cargo check -p benchman --locked
 
-      - name: VM feature check
+      - name: Feature-slice test compile checks
+        run: |
+          cargo test -p infotheory --no-run --locked
+          cargo test -p infotheory --no-default-features --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-rosa --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-ctw --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-match --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-ppmd --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-sequitur --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-mixture --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-particle --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-calibrated --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-zpaq --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-rwkv --no-run --locked
+          cargo test -p infotheory --no-default-features --features backend-mamba --no-run --locked
+          cargo test -p infotheory --no-default-features --features all-backends --no-run --locked
+          cargo test -p infotheory --no-default-features --features aixi-gameengine --no-run --locked
+          cargo test -p infotheory --no-default-features --features "aixi-gameengine all-backends" --no-run --locked
+          cargo test -p infotheory --no-default-features --features tuner --no-run --locked
+          cargo test -p infotheory --no-default-features --features "tuner backend-ctw" --no-run --locked
+          cargo test -p infotheory --no-default-features --features "cli tuner backend-ctw" --no-run --locked
+          cargo test -p infotheory --no-default-features --features cli --no-run --locked
+          cargo test -p infotheory --features cli --no-run --locked
+          cargo test -p infotheory --no-default-features --features "cli all-backends" --no-run --locked
+          cargo test --manifest-path vendor/gameengine/Cargo.toml --features builtin --no-run --locked
+
+      - name: VM feature slices
         if: ${{ matrix.run_vm }}
-        run: cargo check --features vm --locked
+        run: |
+          cargo test -p infotheory --no-default-features --features vm --no-run --locked
+          cargo test -p infotheory --no-default-features --features "vm backend-ctw" --no-run --locked
 
       - name: Test matrix
         env:
           RUSTDOCFLAGS: ${{ matrix.rustdocflags }}
+        shell: bash
         run: |
-          cargo test --release --locked
-          cargo test --release --no-default-features --locked
-          cargo test --release --features cli --locked
-          cargo test --release --no-default-features --features cli --locked
+          if [[ "${{ startsWith(matrix.target, 'aarch64-') }}" == "true" ]]; then
+            export ZPAQ_NOJIT=1
+          fi
+          cargo test -p infotheory --release --locked
+          cargo test -p infotheory --release --no-default-features --features all-backends --locked
+          cargo test -p infotheory --release --no-default-features rate_backend_aliases_share_registry_resolution_and_feature_errors --locked
+          cargo test -p infotheory --release --no-default-features compression_backend_aliases_share_registry_resolution_and_feature_errors --locked
+          cargo test -p infotheory --release --no-default-features --features backend-ctw --test api_surface --locked
+          cargo test -p infotheory --release --no-default-features --features backend-rosa --test compression_validation --locked
+          cargo test -p infotheory --release --no-default-features --features backend-rosa --test api_surface --locked
+          cargo test -p infotheory --release --no-default-features --features backend-zpaq --test api_surface --locked
+          cargo test -p infotheory --release --no-default-features --features backend-rwkv parse_compression_backend_name_method_wraps_rwkv_cfg_methods_as_rate_backend --locked
+          cargo test -p infotheory --release --no-default-features --features backend-rwkv parse_compression_backend_json_wraps_rwkv_cfg_methods_as_rate_backend --locked
+          cargo test -p infotheory --release --no-default-features --features backend-mamba parse_compression_backend_json_wraps_mamba_cfg_rate_backend --locked
+          cargo test -p infotheory --release --no-default-features --features "tuner backend-ctw" --test tuner_integration --locked
+          cargo test -p infotheory --release --no-default-features --features "cli tuner backend-ctw" --test tuner_integration tune_cli_accepts_executor_flags_and_writes_report --locked
+          cargo test -p infotheory --release --features cli --locked
+          cargo test -p infotheory --release --no-default-features --features cli --bin infotheory --locked
+          cargo test -p infotheory --release --no-default-features --features "cli all-backends" --locked
+          cargo test -p infotheory --release --no-default-features --features aixi-gameengine --locked
+          cargo test --manifest-path vendor/gameengine/Cargo.toml --release --features builtin --locked
+          cargo test -p zpaq_rs --release --locked
+          cargo test -p benchman --release --locked
 
       - name: VM tests
         if: ${{ matrix.run_vm }}
         env:
           RUSTDOCFLAGS: ${{ matrix.rustdocflags }}
-        run: cargo test --release --features vm --locked
+        run: cargo test -p infotheory --release --no-default-features --features "vm backend-ctw" --locked
 
       - name: Build release CLI binary
         run: |
-          cargo rustc --release --features cli --bin infotheory --target ${{ matrix.target }} --locked -- ${{ matrix.release_rustc_flags }}
+          cargo rustc -p infotheory --release --features cli --bin infotheory --target ${{ matrix.target }} --locked -- ${{ matrix.release_rustc_flags }}
 
       - name: Package binary artifact
         shell: bash
@@ -318,6 +406,7 @@ jobs:
             case "$OS" in
               NetBSD)
                 export CARGO_FEATURE_NOJIT=1
+                export ZPAQ_NOJIT=1
                 export CARGO_PROFILE_RELEASE_LTO=off
                 if ! command -v clang >/dev/null 2>&1 && command -v cc >/dev/null 2>&1; then
                   export CARGO_TARGET_X86_64_UNKNOWN_NETBSD_LINKER=cc
@@ -325,6 +414,7 @@ jobs:
                 ;;
               OpenBSD)
                 export CARGO_FEATURE_NOJIT=1
+                export ZPAQ_NOJIT=1
                 ;;
               FreeBSD)
                 :
@@ -332,18 +422,44 @@ jobs:
             esac
 
             export RUSTDOCFLAGS="${{ matrix.rustdocflags }}"
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-rosa
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-ctw
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-match
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-ppmd
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-sequitur
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-mixture
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-particle
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-calibrated
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-zpaq
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-rwkv
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features backend-mamba
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features all-backends
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --features cli
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features cli
+            RUSTFLAGS="-D warnings" cargo check -p infotheory --locked --no-default-features --features "cli all-backends"
+            PYO3_BUILD_EXTENSION_MODULE=1 RUSTFLAGS="-D warnings" cargo check -p infotheory_py --locked --no-default-features --features "tuner backend-ctw"
+            RUSTFLAGS="-D warnings" cargo check -p zpaq_rs --locked
+            RUSTFLAGS="-D warnings" cargo check -p benchman --locked
 
-            RUSTFLAGS="-D warnings" cargo check --locked
-            RUSTFLAGS="-D warnings" cargo check --locked --no-default-features
-            RUSTFLAGS="-D warnings" cargo check --locked --features cli
-            RUSTFLAGS="-D warnings" cargo check --locked --no-default-features --features cli
+            cargo test -p infotheory --release --locked
+            cargo test -p infotheory --release --no-default-features --features all-backends --locked
+            cargo test -p infotheory --release --no-default-features rate_backend_aliases_share_registry_resolution_and_feature_errors --locked
+            cargo test -p infotheory --release --no-default-features compression_backend_aliases_share_registry_resolution_and_feature_errors --locked
+            cargo test -p infotheory --release --no-default-features --features backend-ctw --test api_surface --locked
+            cargo test -p infotheory --release --no-default-features --features backend-rosa --test compression_validation --locked
+            cargo test -p infotheory --release --no-default-features --features backend-rosa --test api_surface --locked
+            cargo test -p infotheory --release --no-default-features --features backend-zpaq --test api_surface --locked
+            cargo test -p infotheory --release --no-default-features --features backend-rwkv parse_compression_backend_name_method_wraps_rwkv_cfg_methods_as_rate_backend --locked
+            cargo test -p infotheory --release --no-default-features --features backend-rwkv parse_compression_backend_json_wraps_rwkv_cfg_methods_as_rate_backend --locked
+            cargo test -p infotheory --release --no-default-features --features backend-mamba parse_compression_backend_json_wraps_mamba_cfg_rate_backend --locked
+            cargo test -p infotheory --release --features cli --locked
+            cargo test -p infotheory --release --no-default-features --features "cli all-backends" --locked
+            cargo test -p zpaq_rs --release --locked
+            cargo test -p benchman --release --locked
 
-            cargo test --release --locked
-            cargo test --release --no-default-features --locked
-            cargo test --release --features cli --locked
-            cargo test --release --no-default-features --features cli --locked
-
-            cargo rustc --release --features cli --bin infotheory --locked -- -C target-cpu=x86-64
+            cargo rustc -p infotheory --release --features cli --bin infotheory --locked -- -C target-cpu=x86-64
 
             mkdir -p dist
             cp target/release/infotheory dist/infotheory
@@ -379,6 +495,8 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Cross-target compile checks (RWKV-only portable profile)
         env:
@@ -463,18 +581,47 @@ jobs:
               eval "export CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=clang"
               export MUSL_LD_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
               export MUSL_RUSTDOCFLAGS="-C target-cpu=generic -C link-arg=-fuse-ld=lld"
+              if [ "$TARGET" = "aarch64-unknown-linux-musl" ]; then
+                export ZPAQ_NOJIT=1
+              fi
 
-              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target "$TARGET" --locked
-              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target "$TARGET" --no-default-features --locked
-              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target "$TARGET" --features cli --locked
-              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target "$TARGET" --no-default-features --features cli --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-rosa --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-ctw --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-match --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-ppmd --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-sequitur --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-mixture --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-particle --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-calibrated --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-zpaq --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-rwkv --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features backend-mamba --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features all-backends --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --features cli --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features cli --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p infotheory --target "$TARGET" --no-default-features --features "cli all-backends" --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p zpaq_rs --target "$TARGET" --locked
+              RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check -p benchman --target "$TARGET" --locked
 
-              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test --release --target "$TARGET" --locked
-              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test --release --target "$TARGET" --no-default-features --locked
-              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test --release --target "$TARGET" --features cli --locked
-              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test --release --target "$TARGET" --no-default-features --features cli --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features all-backends --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features rate_backend_aliases_share_registry_resolution_and_feature_errors --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features compression_backend_aliases_share_registry_resolution_and_feature_errors --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-ctw --test api_surface --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-rosa --test compression_validation --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-rosa --test api_surface --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-zpaq --test api_surface --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-rwkv parse_compression_backend_name_method_wraps_rwkv_cfg_methods_as_rate_backend --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-rwkv parse_compression_backend_json_wraps_rwkv_cfg_methods_as_rate_backend --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features backend-mamba parse_compression_backend_json_wraps_mamba_cfg_rate_backend --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --features cli --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p infotheory --release --target "$TARGET" --no-default-features --features "cli all-backends" --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p zpaq_rs --release --target "$TARGET" --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test -p benchman --release --target "$TARGET" --locked
 
-              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" cargo rustc --release --features cli --bin infotheory --target "$TARGET" --locked -- ${RELEASE_RUSTC_FLAGS}
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" cargo rustc -p infotheory --release --features cli --bin infotheory --target "$TARGET" --locked -- ${RELEASE_RUSTC_FLAGS}
             '
 
       - name: Package binary artifact

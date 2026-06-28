@@ -1,0 +1,58 @@
+{
+  "seed": 7,
+  "report_path": "strict-smoke-mc-aixi-report.json",
+  "controller": {
+    "planner_simulations_per_step": 2,
+    "interface": {
+      "observation_stream_len": 1,
+      "observation_key_mode": "full_stream",
+      "reward_bits": 16,
+      "agent_actions": 2,
+      "observation_bits": 8
+    },
+    "kind": "mc_aixi_fac_ctw"
+  },
+  "output_config_path": "strict-smoke-mc-aixi-output.json",
+  "assets": [
+    {
+      "path": "strict-smoke-dataset.bin",
+      "id": "dataset"
+    }
+  ],
+  "kind": "tune",
+  "schema_version": 1,
+  "input_asset": "dataset",
+  "eval_time_limit_seconds": 1,
+  "time_budget_seconds": 5,
+  "min_throughput_bytes_per_second": 1,
+  "max_memory_bytes": 1099511627776,
+  "bounds": {
+    "forbidden_backends": [],
+    "parameter_ranges": [
+      {
+        "min": 1,
+        "parameter": "rate_backend.base_depth",
+        "max": 16
+      }
+    ],
+    "max_experts": 2,
+    "max_mixture_nesting_depth": 1,
+    "min_experts": 1,
+    "allow_duplicate_experts": false,
+    "required_experts": [],
+    "forbidden_expert_pairs": [],
+    "allowed_backends": [
+      "fac-ctw"
+    ]
+  },
+  "baseline_candidate": {
+    "rate_backend": {
+      "num_percept_bits": 8,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "base_depth": 8
+    },
+    "framing": "framed",
+    "kind": "rate-ac"
+  }
+}

@@ -6,7 +6,7 @@ local function die(msg)
 end
 
 local CORE_OPERATIONS  = { h = true, compress = true, decompress = true }
-local CORE_SUBJECTS    = { ppmd = true, ctw = true, rosa = true, rwkv = true, neural_mixture = true }
+local CORE_SUBJECTS    = { ppmd = true, ["fac-ctw"] = true, rosa = true, rwkv7 = true, neural_mixture = true }
 local CORE_SIZES       = { ["1048576"] = true, ["4194304"] = true, ["10000000"] = true }
 
 local REQUIRED_COLUMNS = {
@@ -15,6 +15,15 @@ local REQUIRED_COLUMNS = {
 	"size_bytes",
 	"compression_backend",
 }
+
+local OPTIONAL_PROVENANCE_COLUMNS = {
+	"suite_spec_path",
+	"suite_spec_sha256",
+	"build_mode",
+	"build_features",
+}
+
+local LEGACY_UNKNOWN = "__legacy_unknown__"
 
 local baseline_path, candidate_path
 
@@ -43,6 +52,17 @@ do
 end
 
 local SEP = "\0"
+local EPS = 1e-12
+
+local function canonicalize_subject(subject)
+	if subject == "rwkv" then
+		return "rwkv7"
+	end
+	if subject == "ctw" then
+		return "fac-ctw" -- this script is specific to the semantics of two.json, so this maintains support for comparison with old results. Because AC-CTW won't be used in the future for two.json, this is safe.
+	end
+	return subject
+end
 
 local function chomp_cr(s)
 	return (s:gsub("\r$", ""))
@@ -79,6 +99,47 @@ local function make_key(operation, subject, size_bytes, compression_backend)
 	return operation .. SEP .. subject .. SEP .. size_bytes .. SEP .. compression_backend
 end
 
+local function format_compare_key(row)
+	return "operation=" .. (row._operation or "")
+		.. ", subject=" .. (row._subject or "")
+		.. ", size_bytes=" .. (row._size_bytes or "")
+		.. ", compression_backend=" .. (row._compression_backend or "")
+end
+
+local function duplicate_row_message(path, headers, existing, duplicate)
+	local parts = {
+		"duplicate comparison row in " .. path,
+		"key: " .. format_compare_key(duplicate),
+		"first line: " .. tostring(existing._line),
+		"duplicate line: " .. tostring(duplicate._line),
+	}
+
+	local diffs = {}
+	for _, h in ipairs(headers) do
+		if h ~= "" then
+			local a = existing[h] or ""
+			local b = duplicate[h] or ""
+			if a ~= b then
+				diffs[#diffs + 1] = h .. ": " .. a .. " != " .. b
+			end
+		end
+	end
+
+	if #diffs > 0 then
+		parts[#parts + 1] = "differing columns: " .. table.concat(diffs, "; ")
+	end
+
+	parts[#parts + 1] =
+		"comparison rows must be unique by operation, subject, size_bytes, and compression_backend"
+	if (existing.cpu or "") ~= (duplicate.cpu or "") then
+		parts[#parts + 1] =
+			"hint: this summary appears to mix CPU affinities; rerun with INFOTHEORY_BENCH_FRESH=1, "
+			.. "set one INFOTHEORY_BENCH_CPU, or compare a summary filtered to one CPU"
+	end
+
+	return table.concat(parts, "\n")
+end
+
 local function load_rows(path)
 	local f = io.open(path, "r")
 	if not f then
@@ -96,8 +157,10 @@ local function load_rows(path)
 	validate_required_columns(header_index, path)
 
 	local rows = {}
+	local line_number = 1
 
 	for line in f:lines() do
+		line_number = line_number + 1
 		if line ~= "" then
 			local vals = split_tsv(line)
 			local row = {}
@@ -105,23 +168,29 @@ local function load_rows(path)
 			for j, h in ipairs(headers) do
 				row[h] = vals[j] or ""
 			end
+			for _, name in ipairs(OPTIONAL_PROVENANCE_COLUMNS) do
+				if not header_index[name] then
+					row[name] = LEGACY_UNKNOWN
+				end
+			end
 
 			local operation = row.operation or ""
-			local subject = row.subject or ""
+			local subject = canonicalize_subject(row.subject or "")
+			row.subject = subject
 			local size_bytes = row.size_bytes or ""
 			local compression_backend = row.compression_backend or ""
 
 			local key = make_key(operation, subject, size_bytes, compression_backend)
 
-			if rows[key] then
-				die("duplicate row in " .. path .. ": "
-					.. operation .. "\t" .. subject .. "\t" .. size_bytes .. "\t" .. compression_backend)
-			end
-
 			row._operation = operation
 			row._subject = subject
 			row._size_bytes = size_bytes
 			row._compression_backend = compression_backend
+			row._line = line_number
+
+			if rows[key] then
+				die(duplicate_row_message(path, headers, rows[key], row))
+			end
 
 			rows[key] = row
 		end
@@ -129,6 +198,39 @@ local function load_rows(path)
 
 	f:close()
 	return rows
+end
+
+local function collect_single_value(rows, path, field)
+	local seen = {}
+	for _, row in pairs(rows) do
+		local value = chomp_cr(row[field] or "")
+		if value ~= "" then
+			seen[value] = true
+		end
+	end
+
+	local count, only = 0, nil
+	for value in pairs(seen) do
+		count = count + 1
+		only = value
+	end
+
+	if count == 0 then
+		die("missing required provenance value in " .. path .. ": " .. field)
+	end
+	if count > 1 then
+		die("multiple distinct provenance values in " .. path .. ": " .. field)
+	end
+	return only
+end
+
+local function collect_provenance(rows, path)
+	return {
+		suite_spec_path = collect_single_value(rows, path, "suite_spec_path"),
+		suite_spec_sha256 = collect_single_value(rows, path, "suite_spec_sha256"),
+		build_mode = collect_single_value(rows, path, "build_mode"),
+		build_features = collect_single_value(rows, path, "build_features"),
+	}
 end
 
 local function num(row, field)
@@ -164,16 +266,16 @@ local function compare(base, cand)
 	local br, cr = num(base, "real_seconds_median"), num(cand, "real_seconds_median")
 	if br and cr then
 		local lim = math.max(br * 1.05, br + 0.02)
-		if cr > lim then
-			reasons[#reasons + 1] = ("real_seconds_median %.6g > %.6g"):format(cr, lim)
+		if cr > lim + EPS then
+			reasons[#reasons + 1] = ("real_seconds_median %.12g > %.12g"):format(cr, lim)
 		end
 	end
 
 	local bm, cm = num(base, "rss_kib_median"), num(cand, "rss_kib_median")
 	if bm and cm then
 		local lim = math.max(bm * 1.03, bm + 4096.0)
-		if cm > lim then
-			reasons[#reasons + 1] = ("rss_kib_median %.6g > %.6g"):format(cm, lim)
+		if cm > lim + EPS then
+			reasons[#reasons + 1] = ("rss_kib_median %.12g > %.12g"):format(cm, lim)
 		end
 	end
 
@@ -192,6 +294,18 @@ end
 
 local baseline_rows  = load_rows(baseline_path)
 local candidate_rows = load_rows(candidate_path)
+local baseline_provenance = collect_provenance(baseline_rows, baseline_path)
+local candidate_provenance = collect_provenance(candidate_rows, candidate_path)
+
+if baseline_provenance.suite_spec_sha256 ~= candidate_provenance.suite_spec_sha256 then
+	if baseline_provenance.suite_spec_sha256 ~= LEGACY_UNKNOWN
+		and candidate_provenance.suite_spec_sha256 ~= LEGACY_UNKNOWN then
+		die("suite spec digest mismatch: baseline "
+			.. baseline_provenance.suite_spec_sha256
+			.. " != candidate "
+			.. candidate_provenance.suite_spec_sha256)
+	end
+end
 
 local key_set, keys  = {}, {}
 for k in pairs(baseline_rows) do
@@ -232,6 +346,14 @@ local full_warnings, core_failures = 0, 0
 
 print("baseline\t" .. baseline_path)
 print("candidate\t" .. candidate_path)
+print("baseline_suite_spec_path\t" .. baseline_provenance.suite_spec_path)
+print("baseline_suite_spec_sha256\t" .. baseline_provenance.suite_spec_sha256)
+print("baseline_build_mode\t" .. baseline_provenance.build_mode)
+print("baseline_build_features\t" .. baseline_provenance.build_features)
+print("candidate_suite_spec_path\t" .. candidate_provenance.suite_spec_path)
+print("candidate_suite_spec_sha256\t" .. candidate_provenance.suite_spec_sha256)
+print("candidate_build_mode\t" .. candidate_provenance.build_mode)
+print("candidate_build_features\t" .. candidate_provenance.build_features)
 print("scope\tstatus\toperation\tsubject\tsize_bytes\tcompression_backend\treasons")
 
 for _, key in ipairs(keys) do

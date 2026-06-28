@@ -1,0 +1,3440 @@
+//! High-performance VM-backed AIXI environment using nyx-lite (Firecracker).
+//!
+//! This module provides a VM environment implementation built on top of nyx-lite,
+//! enabling high-frequency snapshot-based resets for fast experimentation (hardware and
+//! guest behavior dependent).
+//!
+//! ## Architecture
+//!
+//! The environment uses Firecracker's KVM-based microVM with nyx-lite's incremental
+//! snapshot and reset capabilities. Communication with the guest occurs via:
+//!
+//! 1. **Shared Memory**: Zero-copy data transfer between host and guest
+//! 2. **Hypercalls**: Control plane communication (snapshot, done, etc.)
+//! 3. **Serial PTY**: Optional console I/O for simpler protocols
+//!
+//! ## Design Principles
+//!
+//! - **Universal**: Not biased towards any specific use case (fuzzing, etc.)
+//! - **High Performance**: Leverages incremental snapshots and dirty page tracking
+//! - **Configurable**: Pluggable reward policies, action sources, observation modes
+//! - **Information-Theoretic**: Built-in support for entropy-based metrics
+
+use crate::aixi::common::{Action, ActionAlphabet, PerceptVal, RandomGenerator, Reward};
+use crate::aixi::environment::Environment;
+use crate::api::{
+    CompiledRateBackend, RateBackend, empirical_entropy_bytes, try_cross_entropy_rate_backend,
+    try_entropy_rate_backend,
+};
+#[cfg(feature = "backend-ctw")]
+use crate::backends::ctw::{ContextTree, FacContextTree, ctw_symbol_bit_msb};
+#[cfg(feature = "backend-rosa")]
+use crate::backends::rosaplus::RosaPlus;
+#[cfg(feature = "backend-zpaq")]
+use crate::backends::zpaq_rate::ZpaqRateModel;
+#[cfg(feature = "backend-rwkv")]
+use crate::coders::softmax_pdf_inplace;
+use crate::error::{InfotheoryError, InfotheoryResult};
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip;
+#[cfg(feature = "backend-mamba")]
+use crate::mambazip::Compressor as MambaCompressor;
+use crate::mixture::OnlineBytePredictor;
+#[cfg(feature = "backend-rwkv")]
+use crate::rwkvzip::Compressor;
+use crate::spec::{
+    AssetBinding, AssetRef, EnvironmentSpec, ResolvedAssetBinding, SharedMemoryPolicySpec,
+    SpecEnvironment, VmActionFilterSpec, VmEnvironmentSpec, VmFuzzMutatorSpec,
+    VmObservationPolicySpec, VmObservationStreamModeSpec, VmPayloadEncodingSpec,
+    VmRewardPolicySpec, VmRewardShapingSpec, VmRuntimeActionSourceSpec, VmTraceSpec,
+};
+use serde_json::Value;
+use std::borrow::Cow;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+// Re-export nyx-lite types for external use
+pub use nyx_lite::mem::SharedMemoryRegion;
+pub use nyx_lite::snapshot::NyxSnapshot;
+pub use nyx_lite::{ExitReason, NyxVM, SharedMemoryPolicy};
+
+// ============================================================================
+// Encoding Types
+// ============================================================================
+
+/// Payload encoding for wire protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PayloadEncoding {
+    /// Treat payloads as UTF-8/text bytes.
+    Utf8,
+    /// Treat payloads as hexadecimal text.
+    Hex,
+}
+
+impl PayloadEncoding {
+    /// Decode a wire payload string into raw bytes using this encoding.
+    pub fn decode(self, s: &str) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::Utf8 => Ok(s.as_bytes().to_vec()),
+            Self::Hex => hex_decode(s),
+        }
+    }
+
+    /// Encode raw bytes for transport over the configured wire protocol.
+    pub fn encode(self, bytes: &[u8]) -> String {
+        match self {
+            Self::Utf8 => String::from_utf8_lossy(bytes).to_string(),
+            Self::Hex => hex_encode(bytes),
+        }
+    }
+}
+
+impl std::str::FromStr for PayloadEncoding {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "utf8" => Ok(Self::Utf8),
+            "hex" => Ok(Self::Hex),
+            _ => Err("unknown payload encoding"),
+        }
+    }
+}
+
+fn hex_decode(s: &str) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut buf = 0u8;
+    let mut high = true;
+    for c in s.bytes() {
+        let v = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return Err(anyhow::anyhow!("invalid hex byte: {}", c as char)),
+        };
+        if high {
+            buf = v << 4;
+            high = false;
+        } else {
+            buf |= v;
+            out.push(buf);
+            high = true;
+        }
+    }
+    if !high {
+        return Err(anyhow::anyhow!("hex string has odd length"));
+    }
+    Ok(out)
+}
+
+fn resolve_relative_path(base: &Path, path: &str) -> String {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        base.join(p).to_string_lossy().to_string()
+    }
+}
+
+fn rewrite_firecracker_config_paths(config_path: &str, raw_json: &str) -> anyhow::Result<String> {
+    let base_dir = Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let mut v: Value = serde_json::from_str(raw_json)?;
+
+    if let Some(boot) = v.get_mut("boot-source") {
+        if let Some(path_val) = boot.get_mut("kernel_image_path")
+            && let Some(path_str) = path_val.as_str()
+        {
+            let resolved = resolve_relative_path(base_dir, path_str);
+            *path_val = Value::String(resolved);
+        }
+        if let Some(path_val) = boot.get_mut("initrd_path")
+            && let Some(path_str) = path_val.as_str()
+        {
+            let resolved = resolve_relative_path(base_dir, path_str);
+            *path_val = Value::String(resolved);
+        }
+    }
+
+    if let Some(drives) = v.get_mut("drives").and_then(|d| d.as_array_mut()) {
+        for drive in drives {
+            if let Some(path_val) = drive.get_mut("path_on_host")
+                && let Some(path_str) = path_val.as_str()
+            {
+                let resolved = resolve_relative_path(base_dir, path_str);
+                *path_val = Value::String(resolved);
+            }
+        }
+    }
+
+    Ok(serde_json::to_string(&v)?)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(hex_digit(b >> 4));
+        s.push(hex_digit(b & 0x0F));
+    }
+    s
+}
+
+fn hex_digit(v: u8) -> char {
+    match v {
+        0..=9 => (b'0' + v) as char,
+        _ => (b'a' + (v - 10)) as char,
+    }
+}
+
+// ============================================================================
+// Guest Communication Protocol
+// ============================================================================
+
+/// Hypercall identifiers (must match guest implementation).
+/// These are exported for use by custom guest programs.
+#[allow(dead_code)]
+pub const HYPERCALL_EXECDONE: u64 = 0x656e6f6463657865; // "execdone"
+/// Guest requested host-side snapshot operation.
+#[allow(dead_code)]
+pub const HYPERCALL_SNAPSHOT: u64 = 0x746f687370616e73; // "snapshot"
+/// Guest announced nyx-lite protocol/version handshake.
+#[allow(dead_code)]
+pub const HYPERCALL_NYX_LITE: u64 = 0x6574696c2d78796e; // "nyx-lite"
+/// Guest requested shared memory initialization/refresh.
+#[allow(dead_code)]
+pub const HYPERCALL_SHAREMEM: u64 = 0x6d656d6572616873; // "sharemem"
+/// Guest emitted a debug-print hypercall payload.
+#[allow(dead_code)]
+pub const HYPERCALL_DBGPRINT: u64 = 0x746e697270676264; // "dbgprint"
+
+const SHARED_ACTION_LEN_OFFSET: u64 = 0;
+const SHARED_RESP_LEN_OFFSET: u64 = 8;
+const SHARED_PAYLOAD_OFFSET: u64 = 16;
+
+/// Protocol configuration for structured communication.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct NyxProtocolConfig {
+    /// Prefix for action messages.
+    pub action_prefix: String,
+    /// Suffix for action messages.
+    pub action_suffix: String,
+    /// Prefix for observation responses.
+    pub obs_prefix: String,
+    /// Prefix for reward responses.
+    pub rew_prefix: String,
+    /// Prefix for done indicator.
+    pub done_prefix: String,
+    /// Prefix for data payloads.
+    pub data_prefix: String,
+    /// Wire encoding for payloads.
+    pub wire_encoding: PayloadEncoding,
+}
+
+impl Default for NyxProtocolConfig {
+    fn default() -> Self {
+        Self {
+            action_prefix: "ACT ".to_string(),
+            action_suffix: "\n".to_string(),
+            obs_prefix: "OBS ".to_string(),
+            rew_prefix: "REW ".to_string(),
+            done_prefix: "DONE ".to_string(),
+            data_prefix: "DATA ".to_string(),
+            wire_encoding: PayloadEncoding::Hex,
+        }
+    }
+}
+
+// ============================================================================
+// Action Configuration
+// ============================================================================
+
+/// A single action specification.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct NyxActionSpec {
+    /// Optional human-readable name.
+    pub name: Option<String>,
+    /// Raw payload bytes to send.
+    pub payload: Vec<u8>,
+}
+
+impl NyxActionSpec {
+    /// Create an action specification with no explicit name.
+    pub fn new(payload: Vec<u8>) -> Self {
+        Self {
+            name: None,
+            payload,
+        }
+    }
+
+    /// Create an action specification with a human-readable name.
+    pub fn named(name: impl Into<String>, payload: Vec<u8>) -> Self {
+        Self {
+            name: Some(name.into()),
+            payload,
+        }
+    }
+}
+
+impl Default for NyxActionSpec {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+/// Fuzzing mutator types.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum FuzzMutator {
+    /// Flip one random bit.
+    FlipBit,
+    /// Flip one full byte.
+    FlipByte,
+    /// Insert a random byte at a random position.
+    InsertByte,
+    /// Delete one random byte.
+    DeleteByte,
+    /// Splice bytes from an existing seed input.
+    SpliceSeed,
+    /// Replace the working input with a seed input.
+    ResetSeed,
+    /// Apply a short sequence of random mutations.
+    Havoc,
+}
+
+/// Fuzzing configuration for action generation.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct NyxFuzzConfig {
+    /// Corpus used for seed/reset/splice operations.
+    pub seeds: Vec<Vec<u8>>,
+    /// Mutator set available for action generation.
+    pub mutators: Vec<FuzzMutator>,
+    /// Minimum generated action length.
+    pub min_len: usize,
+    /// Maximum generated action length.
+    pub max_len: usize,
+    /// Optional dictionary tokens for insertion/splicing.
+    pub dictionary: Vec<Vec<u8>>,
+    /// Deterministic RNG seed for mutation sampling.
+    pub rng_seed: u64,
+}
+
+impl NyxFuzzConfig {
+    /// Create fuzzing configuration with sensible defaults.
+    pub fn new(seeds: Vec<Vec<u8>>) -> Self {
+        Self {
+            seeds,
+            mutators: vec![FuzzMutator::Havoc],
+            min_len: 1,
+            max_len: 4096,
+            dictionary: Vec::new(),
+            rng_seed: 0,
+        }
+    }
+}
+
+impl Default for NyxFuzzConfig {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+/// Source of actions for the environment.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum NyxActionSource {
+    /// Fixed set of action payloads.
+    Literal(Vec<NyxActionSpec>),
+    /// Mutation-based action generation.
+    Fuzz(NyxFuzzConfig),
+}
+
+// ============================================================================
+// Observation Configuration
+// ============================================================================
+
+/// How observations are derived from guest output.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum NyxObservationPolicy {
+    /// Parse structured OBS/REW/DONE messages from guest.
+    FromGuest,
+    /// Hash raw output to derive observation.
+    OutputHash,
+    /// Use raw output bytes as observation stream.
+    RawOutput,
+    /// Use shared memory contents as observation.
+    SharedMemory,
+}
+
+/// Stream normalization mode.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum NyxObservationStreamMode {
+    /// Pad short streams, truncate long ones.
+    PadTruncate,
+    /// Only pad short streams.
+    Pad,
+    /// Only truncate long streams.
+    Truncate,
+}
+
+// ============================================================================
+// Reward Configuration
+// ============================================================================
+
+/// How rewards are computed.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum NyxRewardPolicy {
+    /// Parse reward from guest response.
+    FromGuest,
+    /// Pattern matching on output.
+    Pattern {
+        /// Substring/pattern tested against guest output.
+        pattern: String,
+        /// Reward returned when the pattern does not match.
+        base_reward: i64,
+        /// Additional reward added when the pattern matches.
+        bonus_reward: i64,
+    },
+    /// Custom reward function (callback-based).
+    Custom(Arc<dyn Fn(&NyxStepResult) -> Reward + Send + Sync>),
+}
+
+/// Optional reward shaping (additive to base reward).
+///
+/// Algorithmic configuration for the entropy estimator (such as ROSA's
+/// `max_order`) lives inside the active `stats_backend`'s
+/// [`crate::api::RateBackend`] variant.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum NyxRewardShaping {
+    /// Entropy reduction vs baseline.
+    EntropyReduction {
+        /// Reference bytes used as baseline data distribution.
+        baseline_bytes: Vec<u8>,
+        /// Scaling factor applied to the shaping term.
+        scale: f64,
+        /// Optional additive bonus when guest crashes.
+        crash_bonus: Option<i64>,
+        /// Optional additive bonus when guest times out.
+        timeout_bonus: Option<i64>,
+    },
+    /// Entropy of trace data (online learning).
+    TraceEntropy {
+        /// Scaling factor applied to the shaping term.
+        scale: f64,
+        /// If true, normalize by trace length.
+        normalize: bool,
+    },
+}
+
+impl std::fmt::Debug for NyxRewardPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FromGuest => write!(f, "FromGuest"),
+            Self::Pattern {
+                pattern,
+                base_reward,
+                bonus_reward,
+            } => f
+                .debug_struct("Pattern")
+                .field("pattern", pattern)
+                .field("base_reward", base_reward)
+                .field("bonus_reward", bonus_reward)
+                .finish(),
+            Self::Custom(_) => write!(f, "Custom(<fn>)"),
+        }
+    }
+}
+
+// ============================================================================
+// Action Filtering
+// ============================================================================
+
+/// Information-theoretic action filtering.
+///
+/// Algorithmic configuration for the entropy estimator (such as ROSA's
+/// `max_order`) lives inside the active `stats_backend`'s
+/// [`crate::api::RateBackend`] variant.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct NyxActionFilter {
+    /// Minimum entropy threshold.
+    pub min_entropy: Option<f64>,
+    /// Maximum entropy threshold.
+    pub max_entropy: Option<f64>,
+    /// Minimum intrinsic dependence.
+    pub min_intrinsic_dependence: Option<f64>,
+    /// Minimum novelty (cross-entropy vs prior).
+    pub min_novelty: Option<f64>,
+    /// Prior corpus for novelty computation.
+    pub novelty_prior: Option<Vec<u8>>,
+    /// Reward to assign when action is rejected.
+    pub reject_reward: Option<i64>,
+}
+
+impl NyxActionFilter {
+    /// Create an action filter with no active constraints.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for NyxActionFilter {
+    fn default() -> Self {
+        Self {
+            min_entropy: None,
+            max_entropy: None,
+            min_intrinsic_dependence: None,
+            min_novelty: None,
+            novelty_prior: None,
+            reject_reward: None,
+        }
+    }
+}
+
+// ============================================================================
+// Trace Configuration
+// ============================================================================
+
+/// Configuration for trace collection and analysis.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct NyxTraceConfig {
+    /// Shared memory region name for trace data.
+    pub shared_region_name: Option<String>,
+    /// Maximum bytes to collect per step.
+    pub max_bytes: usize,
+    /// Reset trace model on episode boundary.
+    pub reset_on_episode: bool,
+}
+
+impl NyxTraceConfig {
+    /// Create trace configuration with defaults used by the CLI parser.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for NyxTraceConfig {
+    fn default() -> Self {
+        Self {
+            shared_region_name: Some("trace".to_string()),
+            max_bytes: 1_000_000,
+            reset_on_episode: false,
+        }
+    }
+}
+
+// ============================================================================
+// Main Configuration
+// ============================================================================
+
+/// Complete configuration for the nyx-lite VM environment.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct NyxVmConfig {
+    /// Path to Firecracker JSON config.
+    pub firecracker_config: String,
+    /// Instance ID for the VM.
+    pub instance_id: String,
+
+    // Shared memory configuration
+    /// Name of the shared memory region for communication.
+    pub shared_region_name: String,
+    /// Size of the shared memory region.
+    pub shared_region_size: usize,
+    /// Shared memory policy (snapshot vs preserve).
+    pub shared_memory_policy: SharedMemoryPolicy,
+
+    // Timing configuration
+    /// Timeout for each step.
+    pub step_timeout: Duration,
+    /// Timeout for initial boot.
+    pub boot_timeout: Duration,
+
+    // Episode configuration
+    /// Number of steps per episode.
+    pub episode_steps: usize,
+    /// Cost subtracted from reward each step.
+    pub step_cost: i64,
+
+    // Observation configuration
+    /// Observation derivation policy.
+    pub observation_policy: NyxObservationPolicy,
+    /// Bits per observation symbol.
+    pub observation_bits: usize,
+    /// Number of observation symbols per action.
+    pub observation_stream_len: usize,
+    /// Stream normalization mode.
+    pub observation_stream_mode: NyxObservationStreamMode,
+    /// Padding byte for short streams.
+    pub observation_pad_byte: u8,
+
+    // Reward configuration
+    /// Bits for reward encoding.
+    pub reward_bits: usize,
+    /// Reward computation policy.
+    pub reward_policy: NyxRewardPolicy,
+    /// Optional reward shaping (additive; non-canonical).
+    pub reward_shaping: Option<NyxRewardShaping>,
+
+    // Action configuration
+    /// Source of actions.
+    pub action_source: NyxActionSource,
+    /// Optional action filter.
+    pub action_filter: Option<NyxActionFilter>,
+
+    // Protocol configuration
+    /// Wire protocol for structured communication.
+    pub protocol: NyxProtocolConfig,
+
+    // Statistics backend
+    /// Backend for entropy estimation.
+    pub stats_backend: RateBackend,
+
+    // Trace configuration
+    /// Optional trace collection.
+    pub trace: Option<NyxTraceConfig>,
+
+    // Debug mode
+    /// Enable verbose VM/protocol diagnostics.
+    pub debug_mode: bool,
+
+    // Crash logging
+    /// Path to log crashes/interesting behaviors (JSONL format).
+    pub crash_log: Option<String>,
+}
+
+fn default_vm_stats_backend() -> RateBackend {
+    // Keep the VM default explicit so `vm` can be combined with a narrow
+    // backend slice instead of inheriting the crate-wide implicit default.
+    RateBackend::Ctw { depth: 20 }
+}
+
+impl Default for NyxVmConfig {
+    fn default() -> Self {
+        Self {
+            firecracker_config: String::new(),
+            instance_id: "aixi-nyx".to_string(),
+            shared_region_name: "shared".to_string(),
+            shared_region_size: 4096,
+            shared_memory_policy: SharedMemoryPolicy::Snapshot,
+            step_timeout: Duration::from_millis(100),
+            boot_timeout: Duration::from_secs(30),
+            episode_steps: 100,
+            step_cost: 0,
+            observation_policy: NyxObservationPolicy::SharedMemory,
+            observation_bits: 8,
+            observation_stream_len: 64,
+            observation_stream_mode: NyxObservationStreamMode::PadTruncate,
+            observation_pad_byte: 0,
+            reward_bits: 8,
+            reward_policy: NyxRewardPolicy::FromGuest,
+            reward_shaping: None,
+            action_source: NyxActionSource::Literal(vec![]),
+            action_filter: None,
+            protocol: NyxProtocolConfig::default(),
+            stats_backend: default_vm_stats_backend(),
+            trace: None,
+            debug_mode: false,
+            crash_log: None,
+        }
+    }
+}
+
+impl NyxVmConfig {
+    fn validate_runtime_invariants(&self) -> InfotheoryResult<()> {
+        if self.firecracker_config.trim().is_empty() {
+            return Err(InfotheoryError::invalid_backend_config(
+                "firecracker_config path must be set",
+            ));
+        }
+        if self.episode_steps == 0 {
+            return Err(InfotheoryError::invalid_backend_config(
+                "episode_steps must be > 0",
+            ));
+        }
+        if matches!(self.observation_policy, NyxObservationPolicy::RawOutput)
+            && self.observation_stream_len == 0
+        {
+            return Err(InfotheoryError::invalid_backend_config(
+                "observation_stream_len must be > 0 for RawOutput policy",
+            ));
+        }
+        if matches!(
+            self.reward_shaping,
+            Some(NyxRewardShaping::TraceEntropy { .. })
+        ) && self.trace.is_none()
+        {
+            return Err(InfotheoryError::invalid_backend_config(
+                "vm_trace must be configured for vm_reward_shaping.mode=trace-entropy",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validate this VM configuration for direct runtime construction.
+    pub fn validate(&self) -> InfotheoryResult<()> {
+        self.validate_runtime_invariants()
+    }
+
+    /// Validate that this VM configuration is representable by canonical spec documents.
+    pub fn validate_canonical_spec_compatibility(&self) -> InfotheoryResult<()> {
+        self.validate_runtime_invariants()?;
+
+        let encoding = self.protocol.wire_encoding;
+        let firecracker_asset = "firecracker_config".to_string();
+        let mut assets = vec![AssetBinding {
+            id: firecracker_asset.clone(),
+            path: self.firecracker_config.clone(),
+        }];
+        let reward_shaping = match &self.reward_shaping {
+            Some(NyxRewardShaping::EntropyReduction {
+                baseline_bytes: _,
+                scale,
+                crash_bonus,
+                timeout_bonus,
+            }) => {
+                let asset_id = "reward_shaping_baseline".to_string();
+                assets.push(AssetBinding {
+                    id: asset_id.clone(),
+                    path: "inline://reward_shaping_baseline".to_string(),
+                });
+                Some(VmRewardShapingSpec::EntropyReduction {
+                    baseline_asset: asset_id,
+                    scale: *scale,
+                    crash_bonus: *crash_bonus,
+                    timeout_bonus: *timeout_bonus,
+                })
+            }
+            Some(NyxRewardShaping::TraceEntropy { scale, normalize }) => {
+                Some(VmRewardShapingSpec::TraceEntropy {
+                    scale: *scale,
+                    normalize: *normalize,
+                })
+            }
+            None => None,
+        };
+        let action_filter = self.action_filter.as_ref().map(|filter| {
+            let novelty_prior_asset = filter.novelty_prior.as_ref().map(|_| {
+                let asset_id = "action_filter_novelty_prior".to_string();
+                assets.push(AssetBinding {
+                    id: asset_id.clone(),
+                    path: "inline://action_filter_novelty_prior".to_string(),
+                });
+                asset_id
+            });
+            VmActionFilterSpec {
+                min_entropy: filter.min_entropy,
+                max_entropy: filter.max_entropy,
+                min_intrinsic_dependence: filter.min_intrinsic_dependence,
+                min_novelty: filter.min_novelty,
+                novelty_prior_asset,
+                reject_reward: filter.reject_reward,
+            }
+        });
+        let action_source = match &self.action_source {
+            NyxActionSource::Literal(actions) => VmRuntimeActionSourceSpec::Literal {
+                names: actions.iter().map(|action| action.name.clone()).collect(),
+                payloads: actions
+                    .iter()
+                    .map(|action| encoding.encode(&action.payload))
+                    .collect(),
+                encoding: match encoding {
+                    PayloadEncoding::Utf8 => VmPayloadEncodingSpec::Utf8,
+                    PayloadEncoding::Hex => VmPayloadEncodingSpec::Hex,
+                },
+            },
+            NyxActionSource::Fuzz(fuzz) => VmRuntimeActionSourceSpec::Fuzz {
+                seeds: fuzz
+                    .seeds
+                    .iter()
+                    .map(|seed| encoding.encode(seed))
+                    .collect(),
+                encoding: match encoding {
+                    PayloadEncoding::Utf8 => VmPayloadEncodingSpec::Utf8,
+                    PayloadEncoding::Hex => VmPayloadEncodingSpec::Hex,
+                },
+                mutators: fuzz
+                    .mutators
+                    .iter()
+                    .map(|mutator| match mutator {
+                        FuzzMutator::FlipBit => VmFuzzMutatorSpec::FlipBit,
+                        FuzzMutator::FlipByte => VmFuzzMutatorSpec::FlipByte,
+                        FuzzMutator::InsertByte => VmFuzzMutatorSpec::InsertByte,
+                        FuzzMutator::DeleteByte => VmFuzzMutatorSpec::DeleteByte,
+                        FuzzMutator::SpliceSeed => VmFuzzMutatorSpec::SpliceSeed,
+                        FuzzMutator::ResetSeed => VmFuzzMutatorSpec::ResetSeed,
+                        FuzzMutator::Havoc => VmFuzzMutatorSpec::Havoc,
+                    })
+                    .collect(),
+                min_len: fuzz.min_len,
+                max_len: fuzz.max_len,
+                dictionary: fuzz
+                    .dictionary
+                    .iter()
+                    .map(|entry| encoding.encode(entry))
+                    .collect(),
+                rng_seed: fuzz.rng_seed,
+            },
+        };
+        let reward_policy = match &self.reward_policy {
+            NyxRewardPolicy::FromGuest => VmRewardPolicySpec::FromGuest,
+            NyxRewardPolicy::Pattern {
+                pattern,
+                base_reward,
+                bonus_reward,
+            } => VmRewardPolicySpec::Pattern {
+                pattern: pattern.clone(),
+                base_reward: *base_reward,
+                bonus_reward: *bonus_reward,
+            },
+            NyxRewardPolicy::Custom(_) => {
+                return Err(InfotheoryError::invalid_backend_config(
+                    "custom Nyx reward callbacks are not representable in canonical specs",
+                ));
+            }
+        };
+        let environment = EnvironmentSpec::NyxVm(VmEnvironmentSpec {
+            firecracker_config_asset: firecracker_asset,
+            instance_id: self.instance_id.clone(),
+            shared_region_name: self.shared_region_name.clone(),
+            shared_region_size: self.shared_region_size,
+            shared_memory_policy: match self.shared_memory_policy {
+                SharedMemoryPolicy::Preserve => SharedMemoryPolicySpec::Preserve,
+                SharedMemoryPolicy::Snapshot => SharedMemoryPolicySpec::Snapshot,
+            },
+            step_timeout_ms: self.step_timeout.as_millis() as u64,
+            boot_timeout_ms: self.boot_timeout.as_millis() as u64,
+            episode_steps: self.episode_steps,
+            step_cost: self.step_cost,
+            observation_policy: match self.observation_policy {
+                NyxObservationPolicy::FromGuest => VmObservationPolicySpec::FromGuest,
+                NyxObservationPolicy::OutputHash => VmObservationPolicySpec::OutputHash,
+                NyxObservationPolicy::RawOutput => VmObservationPolicySpec::RawOutput,
+                NyxObservationPolicy::SharedMemory => VmObservationPolicySpec::SharedMemory,
+            },
+            observation_bits: self.observation_bits,
+            observation_stream_len: self.observation_stream_len,
+            observation_stream_mode: match self.observation_stream_mode {
+                NyxObservationStreamMode::PadTruncate => VmObservationStreamModeSpec::PadTruncate,
+                NyxObservationStreamMode::Pad => VmObservationStreamModeSpec::Pad,
+                NyxObservationStreamMode::Truncate => VmObservationStreamModeSpec::Truncate,
+            },
+            observation_pad_byte: self.observation_pad_byte,
+            reward_bits: self.reward_bits,
+            reward_policy,
+            reward_shaping,
+            action_source,
+            action_filter,
+            action_prefix: self.protocol.action_prefix.clone(),
+            action_suffix: self.protocol.action_suffix.clone(),
+            obs_prefix: self.protocol.obs_prefix.clone(),
+            rew_prefix: self.protocol.rew_prefix.clone(),
+            done_prefix: self.protocol.done_prefix.clone(),
+            data_prefix: self.protocol.data_prefix.clone(),
+            wire_encoding: match self.protocol.wire_encoding {
+                PayloadEncoding::Utf8 => VmPayloadEncodingSpec::Utf8,
+                PayloadEncoding::Hex => VmPayloadEncodingSpec::Hex,
+            },
+            stats_backend: self.stats_backend.clone(),
+            trace: self.trace.as_ref().map(|trace| VmTraceSpec {
+                shared_region_name: trace.shared_region_name.clone(),
+                max_bytes: trace.max_bytes,
+                reset_on_episode: trace.reset_on_episode,
+            }),
+            debug_mode: self.debug_mode,
+            crash_log: self.crash_log.clone(),
+        });
+        environment
+            .validate_in(&assets, &SpecEnvironment::default())
+            .map(|_| ())
+            .map_err(|err| InfotheoryError::invalid_backend_config(err.to_string()))
+    }
+
+    /// Build a runtime VM configuration from a canonical planner environment spec.
+    pub fn from_environment_spec(
+        spec: &VmEnvironmentSpec,
+        resolved_assets: &[ResolvedAssetBinding],
+    ) -> InfotheoryResult<Self> {
+        let wire_encoding = match spec.wire_encoding {
+            VmPayloadEncodingSpec::Utf8 => PayloadEncoding::Utf8,
+            VmPayloadEncodingSpec::Hex => PayloadEncoding::Hex,
+        };
+        let reward_policy = match &spec.reward_policy {
+            VmRewardPolicySpec::FromGuest => NyxRewardPolicy::FromGuest,
+            VmRewardPolicySpec::Pattern {
+                pattern,
+                base_reward,
+                bonus_reward,
+            } => NyxRewardPolicy::Pattern {
+                pattern: pattern.clone(),
+                base_reward: *base_reward,
+                bonus_reward: *bonus_reward,
+            },
+        };
+        let reward_shaping = match &spec.reward_shaping {
+            Some(VmRewardShapingSpec::EntropyReduction {
+                baseline_asset,
+                scale,
+                crash_bonus,
+                timeout_bonus,
+            }) => Some(NyxRewardShaping::EntropyReduction {
+                baseline_bytes: read_resolved_asset_bytes(resolved_assets, baseline_asset)?,
+                scale: *scale,
+                crash_bonus: *crash_bonus,
+                timeout_bonus: *timeout_bonus,
+            }),
+            Some(VmRewardShapingSpec::TraceEntropy { scale, normalize }) => {
+                Some(NyxRewardShaping::TraceEntropy {
+                    scale: *scale,
+                    normalize: *normalize,
+                })
+            }
+            None => None,
+        };
+        let action_source = match &spec.action_source {
+            VmRuntimeActionSourceSpec::Literal {
+                names,
+                payloads,
+                encoding,
+            } => {
+                let encoding = match encoding {
+                    VmPayloadEncodingSpec::Utf8 => PayloadEncoding::Utf8,
+                    VmPayloadEncodingSpec::Hex => PayloadEncoding::Hex,
+                };
+                let mut actions = Vec::with_capacity(payloads.len());
+                for (index, payload) in payloads.iter().enumerate() {
+                    actions.push(NyxActionSpec {
+                        name: names.get(index).cloned().flatten(),
+                        payload: encoding.decode(payload).map_err(|err| {
+                            InfotheoryError::invalid_backend_config(format!(
+                                "invalid literal action payload: {err}"
+                            ))
+                        })?,
+                    });
+                }
+                NyxActionSource::Literal(actions)
+            }
+            VmRuntimeActionSourceSpec::Fuzz {
+                seeds,
+                encoding,
+                mutators,
+                min_len,
+                max_len,
+                dictionary,
+                rng_seed,
+            } => {
+                let encoding = match encoding {
+                    VmPayloadEncodingSpec::Utf8 => PayloadEncoding::Utf8,
+                    VmPayloadEncodingSpec::Hex => PayloadEncoding::Hex,
+                };
+                NyxActionSource::Fuzz(NyxFuzzConfig {
+                    seeds: seeds
+                        .iter()
+                        .map(|seed| {
+                            encoding.decode(seed).map_err(|err| {
+                                InfotheoryError::invalid_backend_config(format!(
+                                    "invalid VM fuzz seed: {err}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    mutators: mutators
+                        .iter()
+                        .map(|mutator| match mutator {
+                            VmFuzzMutatorSpec::FlipBit => Ok(FuzzMutator::FlipBit),
+                            VmFuzzMutatorSpec::FlipByte => Ok(FuzzMutator::FlipByte),
+                            VmFuzzMutatorSpec::InsertByte => Ok(FuzzMutator::InsertByte),
+                            VmFuzzMutatorSpec::DeleteByte => Ok(FuzzMutator::DeleteByte),
+                            VmFuzzMutatorSpec::SpliceSeed => Ok(FuzzMutator::SpliceSeed),
+                            VmFuzzMutatorSpec::ResetSeed => Ok(FuzzMutator::ResetSeed),
+                            VmFuzzMutatorSpec::Havoc => Ok(FuzzMutator::Havoc),
+                        })
+                        .collect::<Result<Vec<_>, InfotheoryError>>()?,
+                    min_len: *min_len,
+                    max_len: *max_len,
+                    dictionary: dictionary
+                        .iter()
+                        .map(|entry| {
+                            encoding.decode(entry).map_err(|err| {
+                                InfotheoryError::invalid_backend_config(format!(
+                                    "invalid VM fuzz dictionary entry: {err}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    rng_seed: *rng_seed,
+                })
+            }
+        };
+        let action_filter = spec
+            .action_filter
+            .as_ref()
+            .map(|filter| -> InfotheoryResult<NyxActionFilter> {
+                Ok(NyxActionFilter {
+                    min_entropy: filter.min_entropy,
+                    max_entropy: filter.max_entropy,
+                    min_intrinsic_dependence: filter.min_intrinsic_dependence,
+                    min_novelty: filter.min_novelty,
+                    novelty_prior: filter
+                        .novelty_prior_asset
+                        .as_ref()
+                        .map(|id| read_resolved_asset_bytes(resolved_assets, id))
+                        .transpose()?,
+                    reject_reward: filter.reject_reward,
+                })
+            })
+            .transpose()?;
+
+        let config = Self {
+            firecracker_config: resolved_asset_path(
+                resolved_assets,
+                &spec.firecracker_config_asset,
+            )?
+            .to_string_lossy()
+            .into_owned(),
+            instance_id: spec.instance_id.clone(),
+            shared_region_name: spec.shared_region_name.clone(),
+            shared_region_size: spec.shared_region_size,
+            shared_memory_policy: match spec.shared_memory_policy {
+                SharedMemoryPolicySpec::Preserve => SharedMemoryPolicy::Preserve,
+                SharedMemoryPolicySpec::Snapshot => SharedMemoryPolicy::Snapshot,
+            },
+            step_timeout: Duration::from_millis(spec.step_timeout_ms),
+            boot_timeout: Duration::from_millis(spec.boot_timeout_ms),
+            episode_steps: spec.episode_steps,
+            step_cost: spec.step_cost,
+            observation_policy: match spec.observation_policy {
+                VmObservationPolicySpec::FromGuest => NyxObservationPolicy::FromGuest,
+                VmObservationPolicySpec::OutputHash => NyxObservationPolicy::OutputHash,
+                VmObservationPolicySpec::RawOutput => NyxObservationPolicy::RawOutput,
+                VmObservationPolicySpec::SharedMemory => NyxObservationPolicy::SharedMemory,
+            },
+            observation_bits: spec.observation_bits,
+            observation_stream_len: spec.observation_stream_len,
+            observation_stream_mode: match spec.observation_stream_mode {
+                VmObservationStreamModeSpec::PadTruncate => NyxObservationStreamMode::PadTruncate,
+                VmObservationStreamModeSpec::Pad => NyxObservationStreamMode::Pad,
+                VmObservationStreamModeSpec::Truncate => NyxObservationStreamMode::Truncate,
+            },
+            observation_pad_byte: spec.observation_pad_byte,
+            reward_bits: spec.reward_bits,
+            reward_policy,
+            reward_shaping,
+            action_source,
+            action_filter,
+            protocol: NyxProtocolConfig {
+                action_prefix: spec.action_prefix.clone(),
+                action_suffix: spec.action_suffix.clone(),
+                obs_prefix: spec.obs_prefix.clone(),
+                rew_prefix: spec.rew_prefix.clone(),
+                done_prefix: spec.done_prefix.clone(),
+                data_prefix: spec.data_prefix.clone(),
+                wire_encoding,
+            },
+            stats_backend: spec.stats_backend.clone(),
+            trace: spec.trace.as_ref().map(|trace| NyxTraceConfig {
+                shared_region_name: trace.shared_region_name.clone(),
+                max_bytes: trace.max_bytes,
+                reset_on_episode: trace.reset_on_episode,
+            }),
+            debug_mode: spec.debug_mode,
+            crash_log: spec.crash_log.clone(),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn resolved_asset_path<'a>(
+    resolved_assets: &'a [ResolvedAssetBinding],
+    id: &str,
+) -> InfotheoryResult<&'a Path> {
+    let binding = resolved_assets
+        .iter()
+        .find(|binding| binding.id == id)
+        .ok_or_else(|| {
+            InfotheoryError::invalid_backend_config(format!(
+                "planner_run references unknown asset id '{id}'"
+            ))
+        })?;
+    match &binding.asset {
+        AssetRef::Filesystem(path) => Ok(path.as_path()),
+    }
+}
+
+fn read_resolved_asset_bytes(
+    resolved_assets: &[ResolvedAssetBinding],
+    id: &str,
+) -> InfotheoryResult<Vec<u8>> {
+    let path = resolved_asset_path(resolved_assets, id)?;
+    std::fs::read(path).map_err(|err| {
+        InfotheoryError::invalid_backend_config(format!(
+            "failed to read asset '{}': {err}",
+            path.display()
+        ))
+    })
+}
+
+// ============================================================================
+// Step Result
+// ============================================================================
+
+/// Result of a single environment step.
+#[derive(Clone, Debug)]
+pub struct NyxStepResult {
+    /// Exit reason from the VM.
+    pub exit_reason: NyxExitKind,
+    /// Raw output data from guest.
+    pub output: Vec<u8>,
+    /// Parsed observation (if any).
+    pub parsed_obs: Option<u64>,
+    /// Parsed reward (if any).
+    pub parsed_rew: Option<i64>,
+    /// Done flag.
+    pub done: bool,
+    /// Trace data (if collected).
+    pub trace_data: Vec<u8>,
+    /// Shared memory contents snapshot.
+    pub shared_memory: Vec<u8>,
+}
+
+/// Simplified exit reason categories.
+#[derive(Clone, Debug)]
+pub enum NyxExitKind {
+    /// Guest terminated normally with an application-defined code.
+    ExecDone(u64),
+    /// Step timed out before a terminal signal/response.
+    Timeout,
+    /// VM reported a shutdown event.
+    Shutdown,
+    /// Raw hypercall event with integer arguments.
+    Hypercall {
+        /// Hypercall identifier/magic value.
+        code: u64,
+        /// Hypercall argument 1.
+        arg1: u64,
+        /// Hypercall argument 2.
+        arg2: u64,
+        /// Hypercall argument 3.
+        arg3: u64,
+        /// Hypercall argument 4.
+        arg4: u64,
+    },
+    /// Debug string emitted by guest/host bridge.
+    DebugPrint(String),
+    /// Breakpoint/trap-like stop event.
+    Breakpoint,
+    /// Uncategorized exit event represented as text.
+    Other(String),
+}
+
+impl From<ExitReason> for NyxExitKind {
+    fn from(reason: ExitReason) -> Self {
+        match reason {
+            ExitReason::ExecDone(code) => Self::ExecDone(code),
+            ExitReason::Timeout => Self::Timeout,
+            ExitReason::Shutdown => Self::Shutdown,
+            ExitReason::Hypercall(r8, r9, r10, r11, r12) => Self::Hypercall {
+                code: r8,
+                arg1: r9,
+                arg2: r10,
+                arg3: r11,
+                arg4: r12,
+            },
+            ExitReason::DebugPrint(s) => Self::DebugPrint(s),
+            ExitReason::Breakpoint => Self::Breakpoint,
+            ExitReason::RequestSnapshot => Self::Other("RequestSnapshot".to_string()),
+            ExitReason::SharedMem(name, _, _) => Self::Other(format!("SharedMem({})", name)),
+            ExitReason::SingleStep => Self::Other("SingleStep".to_string()),
+            ExitReason::Interrupted => Self::Other("Interrupted".to_string()),
+            ExitReason::HWBreakpoint(n) => Self::Other(format!("HWBreakpoint({})", n)),
+            ExitReason::BadMemoryAccess(_) => Self::Other("BadMemoryAccess".to_string()),
+        }
+    }
+}
+
+// ============================================================================
+// Trace Model
+// ============================================================================
+
+/// Predictive model for trace-based reward computation.
+enum TraceModel {
+    #[cfg(feature = "backend-rosa")]
+    Rosa { model: RosaPlus, max_order: i64 },
+    // `max_order` is preserved here so that `reset()` can rebuild a fresh
+    // `RosaPlus` with the same `max_order` configured by the active backend
+    // variant; it is read once at construction from `RateBackendPlan::RosaPlus`.
+    #[cfg(feature = "backend-ctw")]
+    Ctw { tree: ContextTree },
+    #[cfg(feature = "backend-ctw")]
+    FacCtw {
+        tree: FacContextTree,
+        bits_per_symbol: usize,
+        msb_first: bool,
+    },
+    #[cfg(feature = "backend-mamba")]
+    Mamba {
+        compressor: MambaCompressor,
+        primed: bool,
+    },
+    #[cfg(feature = "backend-rwkv")]
+    Rwkv7 {
+        compressor: Compressor,
+        primed: bool,
+    },
+    #[cfg(feature = "backend-zpaq")]
+    Zpaq { model: ZpaqRateModel },
+    Mixture {
+        backend: CompiledRateBackend,
+        model: crate::mixture::RateBackendPredictor,
+    },
+}
+
+impl TraceModel {
+    fn predictor_backed(backend: CompiledRateBackend) -> anyhow::Result<Self> {
+        let mut model = crate::runtime::build_rate_backend_predictor(&backend, 2f64.powi(-24))
+            .map_err(|e| anyhow::anyhow!("predictor-backed init failed: {e}"))?;
+        model
+            .begin_stream(None)
+            .map_err(|e| anyhow::anyhow!("predictor-backed stream init failed: {e}"))?;
+        Ok(TraceModel::Mixture { backend, model })
+    }
+
+    fn new(backend: &CompiledRateBackend) -> anyhow::Result<Self> {
+        #[allow(unreachable_patterns)]
+        match crate::runtime::rate_backend_trace_model_strategy(backend) {
+            #[cfg(feature = "backend-rosa")]
+            crate::runtime::TraceModelStrategy::Rosa => {
+                let crate::spec::core::RateBackendPlan::RosaPlus { max_order } = backend.plan()
+                else {
+                    unreachable!("rosa trace strategy used with non-rosa backend")
+                };
+                let mut model = RosaPlus::new(*max_order, false, 0, 42);
+                model.build_lm_full_bytes_no_finalize_endpos();
+                Ok(TraceModel::Rosa {
+                    model,
+                    max_order: *max_order,
+                })
+            }
+            crate::runtime::TraceModelStrategy::PredictorBacked => {
+                TraceModel::predictor_backed(backend.clone())
+            }
+            #[cfg(feature = "backend-ctw")]
+            crate::runtime::TraceModelStrategy::Ctw => {
+                let crate::spec::core::RateBackendPlan::Ctw { depth } = backend.plan() else {
+                    unreachable!("trace-model strategy mismatch for ctw");
+                };
+                Ok(TraceModel::Ctw {
+                    tree: ContextTree::new(*depth),
+                })
+            }
+            #[cfg(feature = "backend-ctw")]
+            crate::runtime::TraceModelStrategy::FacCtw => {
+                let crate::spec::core::RateBackendPlan::FacCtw {
+                    base_depth,
+                    num_percept_bits: _,
+                    encoding_bits,
+                    msb_first,
+                } = backend.plan()
+                else {
+                    unreachable!("trace-model strategy mismatch for fac-ctw");
+                };
+                let bits_per_symbol = *encoding_bits;
+                Ok(TraceModel::FacCtw {
+                    tree: FacContextTree::new(*base_depth, bits_per_symbol),
+                    bits_per_symbol,
+                    msb_first: *msb_first,
+                })
+            }
+            #[cfg(feature = "backend-zpaq")]
+            crate::runtime::TraceModelStrategy::Zpaq => {
+                let crate::spec::core::RateBackendPlan::Zpaq { method } = backend.plan() else {
+                    unreachable!("trace-model strategy mismatch for zpaq");
+                };
+                Ok(TraceModel::Zpaq {
+                    model: ZpaqRateModel::new(method.clone(), 2f64.powi(-24)),
+                })
+            }
+            #[cfg(feature = "backend-mamba")]
+            crate::runtime::TraceModelStrategy::Mamba => {
+                let crate::spec::core::RateBackendPlan::Mamba { parsed_method, .. } =
+                    backend.plan()
+                else {
+                    unreachable!("trace-model strategy mismatch for mamba");
+                };
+                let compressor = MambaCompressor::new_from_method_spec(parsed_method)
+                    .map_err(|e| anyhow::anyhow!("invalid mamba method for vm trace model: {e}"))?;
+                Ok(TraceModel::Mamba {
+                    compressor,
+                    primed: false,
+                })
+            }
+            #[cfg(feature = "backend-rwkv")]
+            crate::runtime::TraceModelStrategy::Rwkv7 => {
+                let crate::spec::core::RateBackendPlan::Rwkv7 { parsed_method, .. } =
+                    backend.plan()
+                else {
+                    unreachable!("trace-model strategy mismatch for rwkv7");
+                };
+                let compressor = Compressor::new_from_method_spec(parsed_method)
+                    .map_err(|e| anyhow::anyhow!("invalid rwkv7 method for vm trace model: {e}"))?;
+                Ok(TraceModel::Rwkv7 {
+                    compressor,
+                    primed: false,
+                })
+            }
+            _ => unreachable!("trace-model strategy requires an unavailable backend feature"),
+        }
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "backend-rosa")]
+            TraceModel::Rosa { model, max_order } => {
+                let mut fresh = RosaPlus::new(*max_order, false, 0, 42);
+                fresh.build_lm_full_bytes_no_finalize_endpos();
+                *model = fresh;
+            }
+            #[cfg(feature = "backend-ctw")]
+            TraceModel::Ctw { tree } => tree.clear(),
+            #[cfg(feature = "backend-ctw")]
+            TraceModel::FacCtw { tree, .. } => tree.clear(),
+            #[cfg(feature = "backend-mamba")]
+            TraceModel::Mamba { compressor, primed } => {
+                compressor.state.reset();
+                *primed = false;
+            }
+            #[cfg(feature = "backend-rwkv")]
+            TraceModel::Rwkv7 { compressor, primed } => {
+                compressor.state.reset();
+                *primed = false;
+            }
+            #[cfg(feature = "backend-zpaq")]
+            TraceModel::Zpaq { model } => {
+                model.reset();
+            }
+            TraceModel::Mixture { backend, model } => {
+                *model = crate::runtime::build_rate_backend_predictor(backend, 2f64.powi(-24))
+                    .map_err(|e| anyhow::anyhow!("mixture model reset failed: {e}"))?;
+                model
+                    .begin_stream(None)
+                    .map_err(|e| anyhow::anyhow!("mixture stream init failed: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Update the model with new data and return the surprise (bits).
+    fn update_and_score(&mut self, data: &[u8]) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
+        match self {
+            #[cfg(feature = "backend-rosa")]
+            TraceModel::Rosa { model, .. } => {
+                let mut bits = 0.0;
+                for &b in data {
+                    let p = model.prob_for_last(b as u32).max(1e-12);
+                    bits -= p.log2();
+                    model.train_byte(b);
+                }
+                bits
+            }
+            #[cfg(feature = "backend-ctw")]
+            TraceModel::Ctw { tree } => {
+                let log_before = tree.get_log_block_probability();
+                for &b in data {
+                    for i in (0..8).rev() {
+                        tree.update(((b >> i) & 1) == 1);
+                    }
+                }
+                let log_after = tree.get_log_block_probability();
+                let log_delta = log_after - log_before;
+                -log_delta / std::f64::consts::LN_2
+            }
+            #[cfg(feature = "backend-ctw")]
+            TraceModel::FacCtw {
+                tree,
+                bits_per_symbol,
+                msb_first,
+            } => {
+                let log_before = tree.get_log_block_probability();
+                for &b in data {
+                    for i in 0..*bits_per_symbol {
+                        let bit = if *msb_first {
+                            ctw_symbol_bit_msb(b, *bits_per_symbol, i)
+                        } else {
+                            ((b >> i) & 1) == 1
+                        };
+                        tree.update(bit, i);
+                    }
+                }
+                let log_after = tree.get_log_block_probability();
+                let log_delta = log_after - log_before;
+                -log_delta / std::f64::consts::LN_2
+            }
+            #[cfg(feature = "backend-mamba")]
+            TraceModel::Mamba { compressor, primed } => {
+                if !*primed {
+                    let bias = compressor.online_bias_snapshot();
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    mambazip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                    *primed = true;
+                }
+                let mut bits = 0.0;
+                for &b in data {
+                    let p = compressor.pdf_buffer[b as usize].max(1e-12);
+                    bits -= p.log2();
+                    let bias = compressor.online_bias_snapshot();
+                    let logits = compressor.model.forward(
+                        &mut compressor.scratch,
+                        b as u32,
+                        &mut compressor.state,
+                    );
+                    mambazip::Compressor::logits_to_pdf(
+                        logits,
+                        bias.as_deref(),
+                        &mut compressor.pdf_buffer,
+                    );
+                }
+                bits
+            }
+            #[cfg(feature = "backend-rwkv")]
+            TraceModel::Rwkv7 { compressor, primed } => {
+                if !*primed {
+                    let vocab_size = compressor.vocab_size();
+                    let logits =
+                        compressor
+                            .model
+                            .forward(&mut compressor.scratch, 0, &mut compressor.state);
+                    softmax_pdf_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
+                    *primed = true;
+                }
+                let mut bits = 0.0;
+                let vocab_size = compressor.vocab_size();
+                for &b in data {
+                    let p = compressor.pdf_buffer[b as usize].max(1e-12);
+                    bits -= p.log2();
+                    let logits = compressor.model.forward(
+                        &mut compressor.scratch,
+                        b as u32,
+                        &mut compressor.state,
+                    );
+                    softmax_pdf_inplace(logits, vocab_size, &mut compressor.pdf_buffer);
+                }
+                bits
+            }
+            #[cfg(feature = "backend-zpaq")]
+            TraceModel::Zpaq { model } => model.update_and_score(data),
+            TraceModel::Mixture { model, .. } => {
+                let mut bits = 0.0;
+                for &b in data {
+                    let logp = model.log_prob(b);
+                    bits -= logp / std::f64::consts::LN_2;
+                    model.update(b);
+                }
+                bits
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Fuzz State
+// ============================================================================
+
+struct FuzzState {
+    current: Vec<u8>,
+    rng: RandomGenerator,
+}
+
+// ============================================================================
+// NyxVmEnvironment
+// ============================================================================
+
+/// High-performance VM environment using nyx-lite.
+pub struct NyxVmEnvironment {
+    /// Configuration.
+    config: NyxVmConfig,
+    /// Compiled entropy/scoring backend used by VM reward logic.
+    compiled_stats_backend: CompiledRateBackend,
+    /// The nyx-lite VM instance.
+    vm: NyxVM,
+    /// Base snapshot for episode resets.
+    base_snapshot: Option<Arc<NyxSnapshot>>,
+    /// Shared memory virtual address in guest.
+    shared_vaddr: Option<u64>,
+    /// CR3 used when shared memory was registered.
+    shared_cr3: Option<u64>,
+    /// Trace model for entropy-based rewards.
+    trace_model: Option<TraceModel>,
+    /// Baseline entropy for entropy reduction rewards.
+    baseline_entropy: Option<f64>,
+    /// Effective reward shaping policy (additive).
+    reward_shaping: Option<NyxRewardShaping>,
+    /// Fuzzing state.
+    fuzz_state: Option<FuzzState>,
+
+    // Current step state
+    /// Current observation.
+    obs: PerceptVal,
+    /// Current reward.
+    rew: Reward,
+    /// Current observation stream.
+    obs_stream: Vec<PerceptVal>,
+    /// Step within current episode.
+    step_in_episode: usize,
+    /// Whether the environment needs reset.
+    needs_reset: bool,
+    /// Whether the VM has been initialized.
+    initialized: bool,
+}
+
+impl NyxVmEnvironment {
+    /// Creates a new NyxVmEnvironment with the given configuration.
+    pub fn new(config: NyxVmConfig) -> anyhow::Result<Self> {
+        config.validate().map_err(anyhow::Error::msg)?;
+
+        // Load Firecracker config and resolve relative paths
+        let fc_config_raw = std::fs::read_to_string(&config.firecracker_config)
+            .map_err(|e| anyhow::anyhow!("Failed to read firecracker config: {}", e))?;
+        let fc_config =
+            rewrite_firecracker_config_paths(&config.firecracker_config, &fc_config_raw)
+                .map_err(|e| anyhow::anyhow!("Failed to parse firecracker config: {}", e))?;
+
+        // Create the VM
+        let vm = NyxVM::new(config.instance_id.clone(), &fc_config);
+
+        // Initialize reward shaping
+        let reward_shaping = config.reward_shaping.clone();
+
+        let compiled_stats_backend = config
+            .stats_backend
+            .compile()
+            .map_err(|err| anyhow::anyhow!("invalid vm stats_backend: {err}"))?;
+
+        // Initialize trace model if needed
+        let trace_model = match &reward_shaping {
+            Some(NyxRewardShaping::TraceEntropy { .. }) => Some(
+                TraceModel::new(&compiled_stats_backend)
+                    .map_err(|err| anyhow::anyhow!("failed to initialize trace model: {err}"))?,
+            ),
+            _ => None,
+        };
+
+        // Compute baseline entropy if needed
+        let baseline_entropy = match &reward_shaping {
+            Some(NyxRewardShaping::EntropyReduction { baseline_bytes, .. }) => {
+                let h = try_entropy_rate_backend(baseline_bytes, &compiled_stats_backend).map_err(
+                    |err| {
+                        anyhow::anyhow!(
+                            "validated vm stats_backend failed to score baseline entropy: {err}"
+                        )
+                    },
+                )?;
+                Some(h)
+            }
+            _ => None,
+        };
+
+        // Initialize fuzz state if needed
+        let fuzz_state = match &config.action_source {
+            NyxActionSource::Fuzz(fuzz) => {
+                if fuzz.seeds.is_empty() {
+                    return Err(anyhow::anyhow!("Fuzz mode requires at least one seed"));
+                }
+                if fuzz.mutators.is_empty() {
+                    return Err(anyhow::anyhow!("Fuzz mode requires at least one mutator"));
+                }
+                let seed = fuzz.seeds[0].clone();
+                Some(FuzzState {
+                    current: seed,
+                    rng: RandomGenerator::from_seed(fuzz.rng_seed),
+                })
+            }
+            NyxActionSource::Literal(actions) => {
+                if actions.is_empty() {
+                    return Err(anyhow::anyhow!("Literal mode requires at least one action"));
+                }
+                None
+            }
+        };
+
+        let mut env = Self {
+            config,
+            compiled_stats_backend,
+            vm,
+            base_snapshot: None,
+            shared_vaddr: None,
+            shared_cr3: None,
+            trace_model,
+            baseline_entropy,
+            reward_shaping,
+            fuzz_state,
+            obs: 0,
+            rew: 0,
+            obs_stream: Vec::new(),
+            step_in_episode: 0,
+            needs_reset: true,
+            initialized: false,
+        };
+
+        // Boot and initialize
+        env.initialize()?;
+
+        Ok(env)
+    }
+
+    /// Initializes the VM by booting to the snapshot point.
+    fn initialize(&mut self) -> anyhow::Result<()> {
+        if self.initialized {
+            return Ok(());
+        }
+
+        if self.config.debug_mode {
+            eprintln!("[NyxVm] Booting VM...");
+        }
+
+        // Run until we get the shared memory registration
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > self.config.boot_timeout {
+                return Err(anyhow::anyhow!("Boot timeout waiting for shared memory"));
+            }
+
+            let exit = self.vm.run(Duration::from_secs(1));
+            match exit {
+                ExitReason::SharedMem(name, vaddr, size) => {
+                    if self.config.debug_mode {
+                        eprintln!(
+                            "[NyxVm] Shared memory registered: {} @ {:#x} ({} bytes)",
+                            name, vaddr, size
+                        );
+                    }
+                    if name.trim_end_matches('\0') == self.config.shared_region_name {
+                        self.shared_vaddr = Some(vaddr);
+                        self.shared_cr3 = Some(self.vm.sregs().cr3);
+                        // Register the shared region with the configured policy
+                        let _ = self.vm.register_shared_region_current(
+                            vaddr,
+                            size,
+                            self.config.shared_memory_policy,
+                        );
+                        break;
+                    }
+                }
+                ExitReason::DebugPrint(msg) => {
+                    if self.config.debug_mode {
+                        eprintln!("[NyxVm] Guest: {}", msg);
+                    }
+                }
+                ExitReason::Shutdown => {
+                    return Err(anyhow::anyhow!("VM shut down during boot"));
+                }
+                _ => {
+                    if self.config.debug_mode {
+                        eprintln!("[NyxVm] Boot exit: {:?}", exit);
+                    }
+                    // Continue waiting
+                }
+            }
+        }
+
+        // Continue running until snapshot request
+        loop {
+            if start.elapsed() > self.config.boot_timeout {
+                return Err(anyhow::anyhow!("Boot timeout waiting for snapshot request"));
+            }
+
+            let exit = self.vm.run(Duration::from_secs(1));
+            match exit {
+                ExitReason::RequestSnapshot => {
+                    if self.config.debug_mode {
+                        eprintln!("[NyxVm] Taking base snapshot...");
+                    }
+                    self.base_snapshot = Some(self.vm.take_base_snapshot());
+                    break;
+                }
+                ExitReason::DebugPrint(msg) => {
+                    if self.config.debug_mode {
+                        eprintln!("[NyxVm] Guest: {}", msg);
+                    }
+                }
+                ExitReason::Shutdown => {
+                    return Err(anyhow::anyhow!("VM shut down before snapshot"));
+                }
+                _ => {
+                    if self.config.debug_mode {
+                        eprintln!("[NyxVm] Snapshot wait exit: {:?}", exit);
+                    }
+                    // Continue waiting
+                }
+            }
+        }
+
+        if self.config.debug_mode {
+            eprintln!("[NyxVm] Initialization complete");
+        }
+
+        self.initialized = true;
+        self.needs_reset = false;
+        Ok(())
+    }
+
+    /// Resets to the base snapshot.
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        let snapshot = self
+            .base_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No base snapshot available"))?
+            .clone();
+
+        self.vm.apply_snapshot(&snapshot);
+
+        // Reset trace model if configured
+        if let Some(trace_cfg) = &self.config.trace
+            && trace_cfg.reset_on_episode
+            && let Some(model) = &mut self.trace_model
+        {
+            model
+                .reset()
+                .map_err(|err| anyhow::anyhow!("failed to reset trace model: {err}"))?;
+        }
+
+        self.step_in_episode = 0;
+        self.needs_reset = false;
+
+        Ok(())
+    }
+
+    /// Writes action data to shared memory.
+    fn write_action_to_shared_memory(&mut self, payload: &[u8]) -> anyhow::Result<()> {
+        let vaddr = self
+            .shared_vaddr
+            .ok_or_else(|| anyhow::anyhow!("Shared memory not initialized"))?;
+        let cr3 = self
+            .shared_cr3
+            .ok_or_else(|| anyhow::anyhow!("Shared memory CR3 not initialized"))?;
+        let process = self.vm.process_memory(cr3);
+
+        // Ensure guest has cleared the previous message length to avoid races.
+        let wait_start = Instant::now();
+        loop {
+            let cur_len = process
+                .read_u64(vaddr + SHARED_ACTION_LEN_OFFSET)
+                .unwrap_or(0);
+            if cur_len == 0 {
+                break;
+            }
+            if wait_start.elapsed() > self.config.step_timeout {
+                return Err(anyhow::anyhow!("shared buffer busy (len={cur_len})"));
+            }
+            std::thread::yield_now();
+        }
+
+        // Write length as first 8 bytes (u64 LE)
+        let len = payload.len() as u64;
+        process
+            .write_u64(vaddr + SHARED_ACTION_LEN_OFFSET, len)
+            .map_err(|e| anyhow::anyhow!("write len failed: {e}"))?;
+        let _ = process.write_u64(vaddr + SHARED_RESP_LEN_OFFSET, 0);
+
+        // Write payload starting at offset 8
+        let max_len = self
+            .config
+            .shared_region_size
+            .saturating_sub(SHARED_PAYLOAD_OFFSET as usize);
+        let write_len = payload.len().min(max_len);
+        if write_len > 0 {
+            let _ = process
+                .write_bytes(vaddr + SHARED_PAYLOAD_OFFSET, &payload[..write_len])
+                .map_err(|e| anyhow::anyhow!("write payload failed: {e}"))?;
+        }
+
+        if self.config.debug_mode {
+            let verify = process
+                .read_u64(vaddr + SHARED_ACTION_LEN_OFFSET)
+                .unwrap_or(0) as usize;
+            eprintln!(
+                "[NyxVm] Wrote action len={}, verified len={}",
+                write_len, verify
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Reads response from shared memory.
+    fn read_shared_memory(&self) -> Vec<u8> {
+        let Some(vaddr) = self.shared_vaddr else {
+            return Vec::new();
+        };
+        let Some(cr3) = self.shared_cr3 else {
+            return Vec::new();
+        };
+        let process = self.vm.process_memory(cr3);
+
+        // Read length from first 8 bytes
+        let len = process
+            .read_u64(vaddr + SHARED_RESP_LEN_OFFSET)
+            .unwrap_or(0) as usize;
+        let max_len = self
+            .config
+            .shared_region_size
+            .saturating_sub(SHARED_PAYLOAD_OFFSET as usize);
+        let read_len = len.min(max_len);
+
+        if read_len == 0 {
+            return Vec::new();
+        }
+
+        let mut buf = vec![0u8; read_len];
+        let _ = process.read_bytes(vaddr + SHARED_PAYLOAD_OFFSET, &mut buf);
+        buf
+    }
+
+    fn clear_shared_length(&self) {
+        let (Some(vaddr), Some(cr3)) = (self.shared_vaddr, self.shared_cr3) else {
+            return;
+        };
+        let process = self.vm.process_memory(cr3);
+        let _ = process.write_u64(vaddr + SHARED_ACTION_LEN_OFFSET, 0);
+        let _ = process.write_u64(vaddr + SHARED_RESP_LEN_OFFSET, 0);
+    }
+
+    /// Runs a single step, returning detailed results.
+    pub fn run_step(&mut self, payload: &[u8]) -> anyhow::Result<NyxStepResult> {
+        // Write action to shared memory
+        self.write_action_to_shared_memory(payload)?;
+
+        // Run the VM until we get a meaningful exit
+        let start = Instant::now();
+        let mut output = Vec::new();
+        let mut trace_data = Vec::new();
+        let mut parsed_obs = None;
+        let mut parsed_rew = None;
+        let mut done = false;
+        let exit_kind;
+        let collect_output =
+            matches!(
+                self.config.observation_policy,
+                NyxObservationPolicy::OutputHash | NyxObservationPolicy::RawOutput
+            ) || matches!(self.config.reward_policy, NyxRewardPolicy::Pattern { .. })
+                || matches!(
+                    self.reward_shaping,
+                    Some(NyxRewardShaping::EntropyReduction { .. })
+                );
+
+        loop {
+            let remaining = self
+                .config
+                .step_timeout
+                .checked_sub(start.elapsed())
+                .unwrap_or(Duration::ZERO);
+
+            if remaining.is_zero() {
+                exit_kind = NyxExitKind::Timeout;
+                break;
+            }
+
+            let exit = self.vm.run(remaining);
+            match exit {
+                ExitReason::ExecDone(code) => {
+                    exit_kind = NyxExitKind::ExecDone(code);
+                    done = true;
+                    break;
+                }
+                ExitReason::Timeout => {
+                    if self.config.debug_mode {
+                        eprintln!("[NyxVm] Step timeout");
+                    }
+                    exit_kind = NyxExitKind::Timeout;
+                    break;
+                }
+                ExitReason::Shutdown => {
+                    if self.config.debug_mode {
+                        eprintln!("[NyxVm] VM shutdown during step");
+                    }
+                    exit_kind = NyxExitKind::Shutdown;
+                    done = true;
+                    break;
+                }
+                ExitReason::DebugPrint(msg) => {
+                    if self.config.debug_mode {
+                        eprintln!("[NyxVm] Guest: {}", msg);
+                    }
+                    // Accumulate debug output
+                    if collect_output {
+                        output.extend_from_slice(msg.as_bytes());
+                    }
+                    // Continue running
+                }
+                ExitReason::Hypercall(r8, r9, r10, r11, r12) => {
+                    exit_kind = NyxExitKind::Hypercall {
+                        code: r8,
+                        arg1: r9,
+                        arg2: r10,
+                        arg3: r11,
+                        arg4: r12,
+                    };
+                    // Attempt to parse structured response
+                    if let Some(obs) = Self::try_parse_u64(r9) {
+                        parsed_obs = Some(obs);
+                    }
+                    if let Some(rew) = Self::try_parse_i64(r10) {
+                        parsed_rew = Some(rew);
+                    }
+                    break;
+                }
+                ExitReason::Breakpoint => {
+                    if self.config.debug_mode {
+                        eprintln!("[NyxVm] Breakpoint exit during step");
+                    }
+                    exit_kind = NyxExitKind::Breakpoint;
+                    break;
+                }
+                _ => {
+                    // Continue for other exits
+                }
+            }
+        }
+
+        // Read shared memory contents (only if needed)
+        let need_shared_memory = matches!(
+            self.config.observation_policy,
+            NyxObservationPolicy::SharedMemory
+        ) || matches!(
+            self.config.reward_policy,
+            NyxRewardPolicy::Pattern { .. }
+        ) || matches!(
+            self.reward_shaping,
+            Some(NyxRewardShaping::EntropyReduction { .. })
+        ) || self.config.trace.is_some();
+        let shared_memory = if need_shared_memory {
+            self.read_shared_memory()
+        } else {
+            Vec::new()
+        };
+
+        // Clear shared length to avoid host/guest races on the next step.
+        self.clear_shared_length();
+
+        // Collect trace data if configured
+        if let Some(trace_cfg) = &self.config.trace
+            && trace_cfg.shared_region_name.is_some()
+        {
+            // Read from trace shared memory region (implementation-specific)
+            // For now, use main shared memory as fallback
+            trace_data = shared_memory.clone();
+            if trace_data.len() > trace_cfg.max_bytes {
+                trace_data.truncate(trace_cfg.max_bytes);
+            }
+        }
+
+        Ok(NyxStepResult {
+            exit_reason: exit_kind,
+            output,
+            parsed_obs,
+            parsed_rew,
+            done,
+            trace_data,
+            shared_memory,
+        })
+    }
+
+    fn try_parse_u64(val: u64) -> Option<u64> {
+        // Hypercall args are already u64
+        Some(val)
+    }
+
+    fn try_parse_i64(val: u64) -> Option<i64> {
+        Some(val as i64)
+    }
+
+    /// Gets the action payload for the given action index.
+    fn get_action_payload(&mut self, action: Action) -> anyhow::Result<Cow<'_, [u8]>> {
+        match &self.config.action_source {
+            NyxActionSource::Literal(actions) => {
+                let idx = action as usize;
+                if idx >= actions.len() {
+                    return Err(anyhow::anyhow!("Action index out of range"));
+                }
+                Ok(Cow::Borrowed(actions[idx].payload.as_slice()))
+            }
+            NyxActionSource::Fuzz(fuzz) => {
+                let state = self
+                    .fuzz_state
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Fuzz state missing"))?;
+                let idx = action as usize % fuzz.mutators.len();
+                let mut input = state.current.clone();
+                let mutator = &fuzz.mutators[idx];
+                apply_mutator(mutator, &mut input, fuzz, &mut state.rng);
+                if input.len() < fuzz.min_len {
+                    input.resize(fuzz.min_len, 0);
+                }
+                if input.len() > fuzz.max_len {
+                    input.truncate(fuzz.max_len);
+                }
+                state.current = input.clone();
+                Ok(Cow::Owned(input))
+            }
+        }
+    }
+
+    /// Applies action filtering, returning reject reward if filtered.
+    fn filter_action(&self, payload: &[u8]) -> anyhow::Result<Option<i64>> {
+        let Some(filter) = self.config.action_filter.as_ref() else {
+            return Ok(None);
+        };
+        if payload.is_empty() {
+            return Ok(filter.reject_reward);
+        }
+
+        let (entropy, intrinsic, novelty) = self.compute_filter_metrics(payload, filter)?;
+
+        if let Some(min_entropy) = filter.min_entropy
+            && entropy < min_entropy
+        {
+            return Ok(filter.reject_reward);
+        }
+        if let Some(max_entropy) = filter.max_entropy
+            && entropy > max_entropy
+        {
+            return Ok(filter.reject_reward);
+        }
+        if let Some(min_intrinsic) = filter.min_intrinsic_dependence
+            && intrinsic < min_intrinsic
+        {
+            return Ok(filter.reject_reward);
+        }
+        if let Some(min_novelty) = filter.min_novelty
+            && filter.novelty_prior.is_some()
+            && novelty < min_novelty
+        {
+            return Ok(filter.reject_reward);
+        }
+        Ok(None)
+    }
+
+    fn wrap_action_payload(&self, payload: &[u8]) -> Vec<u8> {
+        let p = &self.config.protocol;
+        let mut wrapped = p.action_prefix.clone().into_bytes();
+        wrapped.extend_from_slice(p.wire_encoding.encode(payload).as_bytes());
+        wrapped.extend_from_slice(p.action_suffix.as_bytes());
+        wrapped
+    }
+
+    fn compute_filter_metrics(
+        &self,
+        payload: &[u8],
+        filter: &NyxActionFilter,
+    ) -> anyhow::Result<(f64, f64, f64)> {
+        let h_marg = empirical_entropy_bytes(payload);
+        let h_rate =
+            try_entropy_rate_backend(payload, &self.compiled_stats_backend).map_err(|err| {
+                anyhow::anyhow!("vm stats backend failed to score payload entropy: {err}")
+            })?;
+
+        let intrinsic = if h_marg < 1e-9 {
+            0.0
+        } else {
+            ((h_marg - h_rate) / h_marg).clamp(0.0, 1.0)
+        };
+
+        let novelty = if let Some(ref prior) = filter.novelty_prior {
+            try_cross_entropy_rate_backend(payload, prior, &self.compiled_stats_backend)
+                .map_err(|err| anyhow::anyhow!("vm stats backend failed to score novelty: {err}"))?
+        } else {
+            0.0
+        };
+
+        Ok((h_rate, intrinsic, novelty))
+    }
+
+    /// Computes reward from step result.
+    fn compute_reward(&mut self, result: &NyxStepResult) -> anyhow::Result<Reward> {
+        let base_reward = match &self.config.reward_policy {
+            NyxRewardPolicy::FromGuest => result.parsed_rew.unwrap_or(0),
+            NyxRewardPolicy::Pattern {
+                pattern,
+                base_reward,
+                bonus_reward,
+            } => {
+                let text = String::from_utf8_lossy(&result.output);
+                let shared_text = String::from_utf8_lossy(&result.shared_memory);
+                if text.contains(pattern) || shared_text.contains(pattern) {
+                    base_reward + bonus_reward
+                } else {
+                    *base_reward
+                }
+            }
+            NyxRewardPolicy::Custom(f) => f(result),
+        };
+
+        let shaping_reward = if let Some(shaping) = self.reward_shaping.clone() {
+            self.compute_reward_shaping(&shaping, result)?
+        } else {
+            0
+        };
+
+        let mut reward = base_reward.saturating_add(shaping_reward);
+
+        reward = reward.saturating_sub(self.config.step_cost);
+        let min_reward = self.min_reward();
+        let max_reward = self.max_reward();
+        Ok(reward.clamp(min_reward, max_reward))
+    }
+
+    fn compute_reward_shaping(
+        &mut self,
+        shaping: &NyxRewardShaping,
+        result: &NyxStepResult,
+    ) -> anyhow::Result<Reward> {
+        Ok(match shaping {
+            NyxRewardShaping::EntropyReduction {
+                scale,
+                crash_bonus,
+                timeout_bonus,
+                ..
+            } => {
+                let mut base_reward = {
+                    let data = if result.shared_memory.is_empty() {
+                        &result.output
+                    } else {
+                        &result.shared_memory
+                    };
+                    let h_obs = try_entropy_rate_backend(data, &self.compiled_stats_backend)
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "vm stats backend failed to score observation entropy: {err}"
+                            )
+                        })?;
+                    let h_base = self.baseline_entropy.unwrap_or(0.0);
+                    let er = (h_base - h_obs) * scale;
+                    er.round() as i64
+                };
+
+                // Add bonuses for interesting behaviors (bugs/crashes)
+                match &result.exit_reason {
+                    NyxExitKind::Shutdown | NyxExitKind::Breakpoint => {
+                        if let Some(bonus) = crash_bonus {
+                            base_reward = base_reward.saturating_add(*bonus);
+                        }
+                    }
+                    NyxExitKind::Timeout => {
+                        if let Some(bonus) = timeout_bonus {
+                            base_reward = base_reward.saturating_add(*bonus);
+                        }
+                    }
+                    _ => {}
+                }
+
+                base_reward
+            }
+            NyxRewardShaping::TraceEntropy {
+                scale, normalize, ..
+            } => {
+                let data = &result.trace_data;
+                let bits = match self.trace_model.as_mut() {
+                    Some(model) => model.update_and_score(data),
+                    None => 0.0,
+                };
+                let bits = if *normalize && !data.is_empty() {
+                    bits / data.len() as f64
+                } else {
+                    bits
+                };
+                (bits * scale).round() as i64
+            }
+        })
+    }
+
+    fn mask_observation(&self, value: u64) -> u64 {
+        let bits = self.config.observation_bits;
+        if bits >= 64 {
+            value
+        } else if bits == 0 {
+            0
+        } else {
+            value & ((1u64 << bits) - 1)
+        }
+    }
+
+    fn build_observation_stream(&self, result: &NyxStepResult) -> Vec<PerceptVal> {
+        let mut observations = match self.config.observation_policy {
+            NyxObservationPolicy::FromGuest => {
+                if let Some(obs) = result.parsed_obs {
+                    vec![self.mask_observation(obs)]
+                } else {
+                    vec![self.hash_observation(&result.shared_memory)]
+                }
+            }
+            NyxObservationPolicy::OutputHash => {
+                vec![self.hash_observation(&result.output)]
+            }
+            NyxObservationPolicy::RawOutput => {
+                result.output.iter().map(|b| *b as PerceptVal).collect()
+            }
+            NyxObservationPolicy::SharedMemory => result
+                .shared_memory
+                .iter()
+                .map(|b| *b as PerceptVal)
+                .collect(),
+        };
+
+        if observations.is_empty() {
+            observations.push(0);
+        }
+
+        self.normalize_observation_stream(&mut observations);
+        observations
+    }
+
+    fn hash_observation(&self, data: &[u8]) -> PerceptVal {
+        let h = robust_hash_bytes(data);
+        self.mask_observation(h)
+    }
+
+    fn normalize_observation_stream(&self, observations: &mut Vec<PerceptVal>) {
+        let mask = if self.config.observation_bits >= 64 {
+            u64::MAX
+        } else if self.config.observation_bits == 0 {
+            0
+        } else {
+            (1u64 << self.config.observation_bits) - 1
+        };
+
+        for obs in observations.iter_mut() {
+            *obs &= mask;
+        }
+
+        let target = self.config.observation_stream_len;
+        if target == 0 {
+            return;
+        }
+
+        if observations.len() > target {
+            match self.config.observation_stream_mode {
+                NyxObservationStreamMode::Truncate | NyxObservationStreamMode::PadTruncate => {
+                    observations.truncate(target);
+                }
+                NyxObservationStreamMode::Pad => {}
+            }
+        } else if observations.len() < target {
+            match self.config.observation_stream_mode {
+                NyxObservationStreamMode::Pad | NyxObservationStreamMode::PadTruncate => {
+                    let pad = self.config.observation_pad_byte as PerceptVal;
+                    observations.resize(target, pad);
+                }
+                NyxObservationStreamMode::Truncate => {}
+            }
+        }
+    }
+
+    fn action_count(&self) -> usize {
+        match &self.config.action_source {
+            NyxActionSource::Literal(actions) => actions.len(),
+            NyxActionSource::Fuzz(fuzz) => fuzz.mutators.len(),
+        }
+    }
+
+    /// Direct access to the underlying NyxVM for advanced use cases.
+    pub fn vm(&self) -> &NyxVM {
+        &self.vm
+    }
+
+    /// Mutable access to the underlying NyxVM.
+    pub fn vm_mut(&mut self) -> &mut NyxVM {
+        &mut self.vm
+    }
+
+    /// Takes a new snapshot at the current state.
+    pub fn take_snapshot(&mut self) -> Arc<NyxSnapshot> {
+        self.vm.take_snapshot()
+    }
+
+    /// Applies a specific snapshot.
+    pub fn apply_snapshot(&mut self, snapshot: &Arc<NyxSnapshot>) {
+        self.vm.apply_snapshot(snapshot);
+    }
+
+    /// Resets trace model.
+    pub fn reset_trace_model(&mut self) -> anyhow::Result<()> {
+        if let Some(model) = &mut self.trace_model {
+            model
+                .reset()
+                .map_err(|err| anyhow::anyhow!("failed to reset trace model: {err}"))?;
+        }
+        Ok(())
+    }
+
+    /// Logs crashes and interesting behaviors to file.
+    fn log_crash(&self, action_payload: &[u8], result: &NyxStepResult, reward: i64) {
+        let Some(log_path) = &self.config.crash_log else {
+            return;
+        };
+
+        // Only log interesting exits
+        let is_interesting = matches!(
+            result.exit_reason,
+            NyxExitKind::Shutdown | NyxExitKind::Breakpoint | NyxExitKind::Timeout
+        );
+
+        if !is_interesting {
+            return;
+        }
+
+        let log_entry = serde_json::json!({
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            "exit_reason": format!("{:?}", result.exit_reason),
+            "action_payload": hex_encode(action_payload),
+            "action_payload_str": String::from_utf8_lossy(action_payload),
+            "output": String::from_utf8_lossy(&result.output),
+            "shared_memory": hex_encode(&result.shared_memory),
+            "reward": reward,
+            "parsed_obs": result.parsed_obs,
+            "parsed_rew": result.parsed_rew,
+        });
+
+        // Append to JSONL file
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path)
+            && let Ok(json_str) = serde_json::to_string(&log_entry)
+        {
+            let _ = writeln!(file, "{}", json_str);
+        }
+    }
+}
+
+// ============================================================================
+// Environment Trait Implementation
+// ============================================================================
+
+impl Environment for NyxVmEnvironment {
+    fn perform_action(&mut self, action: Action) {
+        if self.needs_reset
+            && let Err(e) = self.reset()
+            && self.config.debug_mode
+        {
+            eprintln!("[NyxVm] Reset failed: {}", e);
+        }
+
+        let payload = match self.get_action_payload(action) {
+            Ok(payload) => payload.into_owned(),
+            Err(e) => {
+                if self.config.debug_mode {
+                    eprintln!("[NyxVm] Invalid action: {}", e);
+                }
+                self.obs = 0;
+                self.rew = self.min_reward();
+                self.obs_stream.clear();
+                self.obs_stream.push(0);
+                self.step_in_episode = (self.step_in_episode + 1) % self.config.episode_steps;
+                if self.step_in_episode == 0 {
+                    self.needs_reset = true;
+                }
+                return;
+            }
+        };
+
+        // Check action filter
+        match self.filter_action(&payload) {
+            Ok(Some(reject_reward)) => {
+                self.obs = 0;
+                self.rew = reject_reward.clamp(self.min_reward(), self.max_reward());
+                self.obs_stream.clear();
+                self.obs_stream.push(0);
+                self.step_in_episode = (self.step_in_episode + 1) % self.config.episode_steps;
+                if self.step_in_episode == 0 {
+                    self.needs_reset = true;
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                if self.config.debug_mode {
+                    eprintln!("[NyxVm] Action filter scoring failed: {}", e);
+                }
+                self.obs = 0;
+                self.rew = self.min_reward();
+                self.obs_stream.clear();
+                self.obs_stream.push(0);
+                self.step_in_episode = (self.step_in_episode + 1) % self.config.episode_steps;
+                if self.step_in_episode == 0 {
+                    self.needs_reset = true;
+                }
+                return;
+            }
+        }
+
+        // Run the step
+        let wrapped_payload = self.wrap_action_payload(&payload);
+        let result = match self.run_step(&wrapped_payload) {
+            Ok(result) => result,
+            Err(e) => {
+                if self.config.debug_mode {
+                    eprintln!("[NyxVm] Step failed: {}", e);
+                }
+                self.obs = 0;
+                self.rew = self.min_reward();
+                self.obs_stream.clear();
+                self.obs_stream.push(0);
+                self.step_in_episode = (self.step_in_episode + 1) % self.config.episode_steps;
+                if self.step_in_episode == 0 {
+                    self.needs_reset = true;
+                }
+                return;
+            }
+        };
+
+        // Process results
+        self.obs_stream = self.build_observation_stream(&result);
+        self.obs = self.obs_stream.first().copied().unwrap_or(0);
+        self.rew = match self.compute_reward(&result) {
+            Ok(reward) => reward,
+            Err(e) => {
+                if self.config.debug_mode {
+                    eprintln!("[NyxVm] Reward computation failed: {}", e);
+                }
+                self.min_reward()
+            }
+        };
+
+        // Log crashes and interesting behaviors
+        self.log_crash(&payload, &result, self.rew);
+
+        if self.config.debug_mode {
+            eprintln!(
+                "[NyxVm] Action={} Obs={} Rew={} Done={:?} Exit={:?}",
+                action, self.obs, self.rew, result.done, result.exit_reason
+            );
+        }
+
+        self.step_in_episode = (self.step_in_episode + 1) % self.config.episode_steps;
+        if self.step_in_episode == 0 || result.done {
+            self.needs_reset = true;
+        }
+    }
+
+    fn get_observation(&self) -> PerceptVal {
+        self.obs
+    }
+
+    fn drain_observations(&mut self) -> Vec<PerceptVal> {
+        if self.obs_stream.is_empty() {
+            vec![self.obs]
+        } else {
+            std::mem::take(&mut self.obs_stream)
+        }
+    }
+
+    fn get_reward(&self) -> Reward {
+        self.rew
+    }
+
+    fn is_finished(&self) -> bool {
+        false
+    }
+
+    fn get_observation_bits(&self) -> usize {
+        self.config.observation_bits
+    }
+
+    fn get_reward_bits(&self) -> usize {
+        self.config.reward_bits
+    }
+
+    fn get_action_bits(&self) -> usize {
+        let n = self.action_count();
+        if n <= 1 {
+            return 1;
+        }
+        (n as f64).log2().ceil() as usize
+    }
+
+    fn get_num_actions(&self) -> ActionAlphabet {
+        ActionAlphabet::try_from_usize(self.action_count())
+            .expect("vm environment must expose a non-empty action alphabet")
+    }
+
+    fn max_reward(&self) -> Reward {
+        let bits = self.config.reward_bits;
+        if bits >= 64 {
+            i64::MAX
+        } else if bits == 0 {
+            0
+        } else {
+            (1i64 << (bits - 1)) - 1
+        }
+    }
+
+    fn min_reward(&self) -> Reward {
+        let bits = self.config.reward_bits;
+        if bits >= 64 {
+            i64::MIN
+        } else if bits == 0 {
+            0
+        } else {
+            -(1i64 << (bits - 1))
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn robust_hash_bytes(data: &[u8]) -> u64 {
+    let mut h = 0u64;
+    for &b in data {
+        h = h.rotate_left(7) ^ (b as u64);
+    }
+    h
+}
+
+fn apply_mutator(
+    mutator: &FuzzMutator,
+    input: &mut Vec<u8>,
+    fuzz: &NyxFuzzConfig,
+    rng: &mut RandomGenerator,
+) {
+    match mutator {
+        FuzzMutator::FlipBit => {
+            if input.is_empty() {
+                input.push(0);
+            }
+            let idx = rng.gen_range(input.len());
+            let bit = rng.gen_range(8);
+            input[idx] ^= 1u8 << bit;
+        }
+        FuzzMutator::FlipByte => {
+            if input.is_empty() {
+                input.push(0);
+            }
+            let idx = rng.gen_range(input.len());
+            input[idx] ^= rng.next_u64() as u8;
+        }
+        FuzzMutator::InsertByte => {
+            let idx = if input.is_empty() {
+                0
+            } else {
+                rng.gen_range(input.len() + 1)
+            };
+            let byte = if !fuzz.dictionary.is_empty() {
+                let d = rng.gen_range(fuzz.dictionary.len());
+                let entry = &fuzz.dictionary[d];
+                if entry.is_empty() {
+                    0
+                } else {
+                    entry[rng.gen_range(entry.len())]
+                }
+            } else {
+                rng.next_u64() as u8
+            };
+            input.insert(idx, byte);
+        }
+        FuzzMutator::DeleteByte => {
+            if input.len() > 1 {
+                let idx = rng.gen_range(input.len());
+                input.remove(idx);
+            }
+        }
+        FuzzMutator::SpliceSeed => {
+            if fuzz.seeds.is_empty() {
+                return;
+            }
+            let seed = &fuzz.seeds[rng.gen_range(fuzz.seeds.len())];
+            if input.is_empty() {
+                input.extend_from_slice(seed);
+            } else if !seed.is_empty() {
+                let cut = rng.gen_range(input.len());
+                let seed_cut = rng.gen_range(seed.len());
+                let mut out = Vec::new();
+                out.extend_from_slice(&input[..cut]);
+                out.extend_from_slice(&seed[seed_cut..]);
+                *input = out;
+            }
+        }
+        FuzzMutator::ResetSeed => {
+            if fuzz.seeds.is_empty() {
+                return;
+            }
+            *input = fuzz.seeds[rng.gen_range(fuzz.seeds.len())].clone();
+        }
+        FuzzMutator::Havoc => {
+            let flips = 1 + rng.gen_range(8);
+            for _ in 0..flips {
+                if input.is_empty() {
+                    input.push(0);
+                }
+                let idx = rng.gen_range(input.len());
+                input[idx] ^= rng.next_u64() as u8;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hex_encoding() {
+        let data = b"hello";
+        let encoded = hex_encode(data);
+        assert_eq!(encoded, "68656c6c6f");
+        let decoded = hex_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_robust_hash() {
+        let data1 = b"test data";
+        let data2 = b"test data";
+        let data3 = b"different";
+
+        assert_eq!(robust_hash_bytes(data1), robust_hash_bytes(data2));
+        assert_ne!(robust_hash_bytes(data1), robust_hash_bytes(data3));
+    }
+
+    #[test]
+    fn test_payload_encoding() {
+        let utf8 = PayloadEncoding::Utf8;
+        let hex = PayloadEncoding::Hex;
+
+        let data = b"test";
+        assert_eq!(utf8.encode(data), "test");
+        assert_eq!(hex.encode(data), "74657374");
+
+        assert_eq!(utf8.decode("test").unwrap(), data);
+        assert_eq!(hex.decode("74657374").unwrap(), data);
+    }
+
+    fn fuzz_cfg_with_seed(rng_seed: u64) -> NyxFuzzConfig {
+        NyxFuzzConfig {
+            seeds: vec![b"seed-alpha".to_vec(), b"seed-beta".to_vec()],
+            mutators: vec![
+                FuzzMutator::FlipBit,
+                FuzzMutator::FlipByte,
+                FuzzMutator::InsertByte,
+                FuzzMutator::DeleteByte,
+                FuzzMutator::SpliceSeed,
+                FuzzMutator::ResetSeed,
+                FuzzMutator::Havoc,
+            ],
+            min_len: 1,
+            max_len: 32,
+            dictionary: vec![b"DICT".to_vec(), b"TOK".to_vec()],
+            rng_seed,
+        }
+    }
+
+    fn fuzz_payload_sequence(config: &NyxFuzzConfig, steps: usize) -> Vec<Vec<u8>> {
+        let mut current = config.seeds[0].clone();
+        let mut rng = RandomGenerator::from_seed(config.rng_seed);
+        let mut out = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let mut input = current.clone();
+            let idx = rng.gen_range(config.mutators.len());
+            let mutator = &config.mutators[idx];
+            apply_mutator(mutator, &mut input, config, &mut rng);
+            current = input.clone();
+            out.push(input);
+        }
+        out
+    }
+
+    #[test]
+    fn fuzz_mutation_sequence_is_reproducible_for_identical_rng_seed() {
+        let a = fuzz_payload_sequence(&fuzz_cfg_with_seed(77), 64);
+        let b = fuzz_payload_sequence(&fuzz_cfg_with_seed(77), 64);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fuzz_mutation_sequence_changes_for_different_rng_seed() {
+        let a = fuzz_payload_sequence(&fuzz_cfg_with_seed(77), 64);
+        let b = fuzz_payload_sequence(&fuzz_cfg_with_seed(78), 64);
+        assert_ne!(a, b);
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn validate_allows_custom_reward_callbacks_for_runtime_configs() {
+        let mut config = NyxVmConfig::default();
+        config.firecracker_config = "dummy-firecracker.json".to_string();
+        config.reward_policy = NyxRewardPolicy::Custom(Arc::new(|_| 0));
+        config
+            .validate()
+            .expect("custom reward callbacks should remain valid for direct runtime configs");
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn validate_canonical_spec_compatibility_rejects_custom_reward_callbacks() {
+        let mut config = NyxVmConfig::default();
+        config.firecracker_config = "dummy-firecracker.json".to_string();
+        config.reward_policy = NyxRewardPolicy::Custom(Arc::new(|_| 0));
+        let err = config
+            .validate_canonical_spec_compatibility()
+            .expect_err("custom reward callbacks are not canonical");
+        assert!(matches!(
+            err,
+            InfotheoryError::InvalidBackendConfig(message)
+                if message.contains("not representable in canonical specs")
+        ));
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn from_environment_spec_builds_runtime_vm_config_without_legacy_json() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "infotheory-vm-spec-runtime-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+
+        let firecracker_path = root.join("firecracker.json");
+        let baseline_path = root.join("baseline.bin");
+        let novelty_path = root.join("novelty.bin");
+        std::fs::write(&firecracker_path, b"{\"boot-source\":{}}").expect("firecracker config");
+        std::fs::write(&baseline_path, b"baseline-bytes").expect("baseline asset");
+        std::fs::write(&novelty_path, b"novelty-bytes").expect("novelty asset");
+
+        let spec = VmEnvironmentSpec {
+            firecracker_config_asset: "firecracker".to_string(),
+            instance_id: "vm-test".to_string(),
+            shared_region_name: "shared".to_string(),
+            shared_region_size: 4096,
+            shared_memory_policy: SharedMemoryPolicySpec::Snapshot,
+            step_timeout_ms: 125,
+            boot_timeout_ms: 1_250,
+            episode_steps: 8,
+            step_cost: -1,
+            observation_policy: VmObservationPolicySpec::OutputHash,
+            observation_bits: 8,
+            observation_stream_len: 16,
+            observation_stream_mode: VmObservationStreamModeSpec::PadTruncate,
+            observation_pad_byte: 0x7f,
+            reward_bits: 8,
+            reward_policy: VmRewardPolicySpec::Pattern {
+                pattern: "win".to_string(),
+                base_reward: 1,
+                bonus_reward: 4,
+            },
+            reward_shaping: Some(VmRewardShapingSpec::EntropyReduction {
+                baseline_asset: "baseline".to_string(),
+                scale: 0.25,
+                crash_bonus: Some(5),
+                timeout_bonus: Some(6),
+            }),
+            action_source: VmRuntimeActionSourceSpec::Literal {
+                names: vec![Some("hi".to_string())],
+                payloads: vec!["6869".to_string()],
+                encoding: VmPayloadEncodingSpec::Hex,
+            },
+            action_filter: Some(VmActionFilterSpec {
+                min_entropy: Some(0.1),
+                max_entropy: Some(2.0),
+                min_intrinsic_dependence: Some(0.05),
+                min_novelty: Some(0.2),
+                novelty_prior_asset: Some("novelty".to_string()),
+                reject_reward: Some(-3),
+            }),
+            action_prefix: "ACT ".to_string(),
+            action_suffix: "\n".to_string(),
+            obs_prefix: "OBS ".to_string(),
+            rew_prefix: "REW ".to_string(),
+            done_prefix: "DONE ".to_string(),
+            data_prefix: "DATA ".to_string(),
+            wire_encoding: VmPayloadEncodingSpec::Utf8,
+            stats_backend: RateBackend::Ctw { depth: 8 },
+            trace: Some(VmTraceSpec {
+                shared_region_name: Some("trace".to_string()),
+                max_bytes: 256,
+                reset_on_episode: true,
+            }),
+            debug_mode: true,
+            crash_log: Some("/tmp/vm-crash.jsonl".to_string()),
+        };
+        let assets = vec![
+            ResolvedAssetBinding {
+                id: "firecracker".to_string(),
+                asset: AssetRef::Filesystem(firecracker_path.clone()),
+            },
+            ResolvedAssetBinding {
+                id: "baseline".to_string(),
+                asset: AssetRef::Filesystem(baseline_path.clone()),
+            },
+            ResolvedAssetBinding {
+                id: "novelty".to_string(),
+                asset: AssetRef::Filesystem(novelty_path.clone()),
+            },
+        ];
+
+        let config = NyxVmConfig::from_environment_spec(&spec, &assets)
+            .expect("canonical VM spec should build runtime config");
+
+        assert_eq!(
+            config.firecracker_config,
+            firecracker_path.display().to_string()
+        );
+        assert_eq!(config.crash_log.as_deref(), Some("/tmp/vm-crash.jsonl"));
+        assert!(matches!(
+            config.observation_policy,
+            NyxObservationPolicy::OutputHash
+        ));
+        assert!(matches!(
+            config.observation_stream_mode,
+            NyxObservationStreamMode::PadTruncate
+        ));
+        assert!(matches!(
+            config.reward_policy,
+            NyxRewardPolicy::Pattern {
+                ref pattern,
+                base_reward: 1,
+                bonus_reward: 4,
+            } if pattern == "win"
+        ));
+        assert!(matches!(
+            config.protocol.wire_encoding,
+            PayloadEncoding::Utf8
+        ));
+        assert!(matches!(
+            config.stats_backend,
+            RateBackend::Ctw { depth: 8 }
+        ));
+        match &config.action_source {
+            NyxActionSource::Literal(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].name.as_deref(), Some("hi"));
+                assert_eq!(actions[0].payload, b"hi");
+            }
+            other => panic!("expected literal actions, got {other:?}"),
+        }
+        match &config.reward_shaping {
+            Some(NyxRewardShaping::EntropyReduction { baseline_bytes, .. }) => {
+                assert_eq!(baseline_bytes, b"baseline-bytes");
+            }
+            other => panic!("expected entropy-reduction shaping, got {other:?}"),
+        }
+        match &config.action_filter {
+            Some(filter) => {
+                assert_eq!(filter.novelty_prior.as_deref(), Some(&b"novelty-bytes"[..]));
+            }
+            None => panic!("expected action filter"),
+        }
+
+        let _ = std::fs::remove_file(firecracker_path);
+        let _ = std::fs::remove_file(baseline_path);
+        let _ = std::fs::remove_file(novelty_path);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[cfg(feature = "vm")]
+    #[test]
+    fn from_environment_spec_accepts_vm_alias_names() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "infotheory-vm-spec-aliases-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+
+        let firecracker_path = root.join("firecracker.json");
+        std::fs::write(&firecracker_path, b"{\"boot-source\":{}}").expect("firecracker config");
+
+        let spec = VmEnvironmentSpec {
+            firecracker_config_asset: "firecracker".to_string(),
+            instance_id: "vm-test".to_string(),
+            shared_region_name: "shared".to_string(),
+            shared_region_size: 4096,
+            shared_memory_policy: SharedMemoryPolicySpec::Snapshot,
+            step_timeout_ms: 125,
+            boot_timeout_ms: 1_250,
+            episode_steps: 8,
+            step_cost: -1,
+            observation_policy: VmObservationPolicySpec::OutputHash,
+            observation_bits: 8,
+            observation_stream_len: 16,
+            observation_stream_mode: VmObservationStreamModeSpec::PadTruncate,
+            observation_pad_byte: 0x00,
+            reward_bits: 8,
+            reward_policy: VmRewardPolicySpec::FromGuest,
+            reward_shaping: None,
+            action_source: VmRuntimeActionSourceSpec::Fuzz {
+                seeds: vec!["seed".to_string()],
+                encoding: VmPayloadEncodingSpec::Utf8,
+                mutators: vec![VmFuzzMutatorSpec::FlipBit, VmFuzzMutatorSpec::SpliceSeed],
+                min_len: 1,
+                max_len: 8,
+                dictionary: vec!["dict".to_string()],
+                rng_seed: 7,
+            },
+            action_filter: None,
+            action_prefix: "ACT ".to_string(),
+            action_suffix: "\n".to_string(),
+            obs_prefix: "OBS ".to_string(),
+            rew_prefix: "REW ".to_string(),
+            done_prefix: "DONE ".to_string(),
+            data_prefix: "DATA ".to_string(),
+            wire_encoding: VmPayloadEncodingSpec::Utf8,
+            stats_backend: RateBackend::Ctw { depth: 8 },
+            trace: None,
+            debug_mode: false,
+            crash_log: None,
+        };
+        let assets = vec![ResolvedAssetBinding {
+            id: "firecracker".to_string(),
+            asset: AssetRef::Filesystem(firecracker_path.clone()),
+        }];
+
+        let config =
+            NyxVmConfig::from_environment_spec(&spec, &assets).expect("aliases should parse");
+        assert!(matches!(
+            config.observation_policy,
+            NyxObservationPolicy::OutputHash
+        ));
+        assert!(matches!(
+            config.observation_stream_mode,
+            NyxObservationStreamMode::PadTruncate
+        ));
+        assert!(matches!(
+            config.protocol.wire_encoding,
+            PayloadEncoding::Utf8
+        ));
+        match &config.action_source {
+            NyxActionSource::Fuzz(fuzz) => {
+                assert_eq!(fuzz.seeds, vec![b"seed".to_vec()]);
+                assert!(matches!(fuzz.mutators[0], FuzzMutator::FlipBit));
+                assert!(matches!(fuzz.mutators[1], FuzzMutator::SpliceSeed));
+            }
+            other => panic!("expected fuzz action source, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(firecracker_path);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[cfg(feature = "all-backends")]
+    #[test]
+    fn trace_model_supports_predictor_backed_backends() {
+        use crate::api::{
+            CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureSpec,
+            ParticleSpec,
+        };
+
+        let backends = vec![
+            RateBackend::Match {
+                hash_bits: 20,
+                min_len: 4,
+                max_len: 255,
+                base_mix: 0.02,
+                confidence_scale: 1.0,
+            },
+            RateBackend::SparseMatch {
+                hash_bits: 19,
+                min_len: 3,
+                max_len: 64,
+                gap_min: 1,
+                gap_max: 2,
+                base_mix: 0.05,
+                confidence_scale: 1.0,
+            },
+            RateBackend::Ppmd {
+                order: 8,
+                memory_mb: 8,
+            },
+            RateBackend::Calibrated {
+                spec: Arc::new(CalibratedSpec {
+                    base: RateBackend::Ctw { depth: 8 },
+                    context: CalibrationContextKind::Text,
+                    bins: 33,
+                    learning_rate: 0.02,
+                    bias_clip: 4.0,
+                }),
+            },
+            RateBackend::Particle {
+                spec: Arc::new(ParticleSpec {
+                    num_particles: 4,
+                    num_cells: 4,
+                    cell_dim: 8,
+                    ..ParticleSpec::default()
+                }),
+            },
+            RateBackend::Mixture {
+                spec: Arc::new(MixtureSpec::new(
+                    MixtureKind::Bayes,
+                    vec![MixtureExpertSpec {
+                        name: Some("ctw".to_string()),
+                        log_prior: 0.0,
+                        backend: RateBackend::Ctw { depth: 8 },
+                    }],
+                )),
+            },
+        ];
+
+        for backend in backends {
+            let compiled = backend.compile().expect("compiled trace backend");
+            let mut model = TraceModel::new(&compiled).expect("trace model should initialize");
+            let bits = model.update_and_score(b"trace payload");
+            assert!(bits.is_finite() && bits >= 0.0, "bits={bits}");
+            model.reset().expect("trace model should reset");
+            let bits_after_reset = model.update_and_score(b"trace payload");
+            assert!(
+                bits_after_reset.is_finite() && bits_after_reset >= 0.0,
+                "bits_after_reset={bits_after_reset}"
+            );
+        }
+    }
+
+    /// Scores `data` against an existing [`FacContextTree`] using the same
+    /// bit-extraction logic as `TraceModel::FacCtw::update_and_score`, then
+    /// returns the surprise in bits (negative log-prob delta / ln 2).
+    ///
+    /// The tree is mutated (updated) exactly as `update_and_score` would do,
+    /// so callers can chain multiple calls on the same tree to simulate
+    /// the VM's incremental scoring pattern.
+    #[cfg(feature = "backend-ctw")]
+    fn fac_ctw_oracle_score_on_tree(
+        tree: &mut crate::backends::ctw::FacContextTree,
+        bits_per_symbol: usize,
+        msb_first: bool,
+        data: &[u8],
+    ) -> f64 {
+        use crate::backends::ctw::ctw_symbol_bit_msb;
+        let log_before = tree.get_log_block_probability();
+        for &b in data {
+            for i in 0..bits_per_symbol {
+                let bit = if msb_first {
+                    ctw_symbol_bit_msb(b, bits_per_symbol, i)
+                } else {
+                    ((b >> i) & 1) == 1
+                };
+                tree.update(bit, i);
+            }
+        }
+        let log_after = tree.get_log_block_probability();
+        -(log_after - log_before) / std::f64::consts::LN_2
+    }
+
+    /// Computes the expected `update_and_score` result by driving a *fresh*
+    /// [`FacContextTree`] directly with the same bit-extraction logic used
+    /// inside `TraceModel::FacCtw::update_and_score`.
+    ///
+    /// This is the single-shot reference oracle used by parity tests.
+    /// For incremental (multi-chunk) scenarios use [`fac_ctw_oracle_score_on_tree`]
+    /// with a persistent tree.
+    #[cfg(feature = "backend-ctw")]
+    fn fac_ctw_oracle_score(
+        base_depth: usize,
+        bits_per_symbol: usize,
+        msb_first: bool,
+        data: &[u8],
+    ) -> f64 {
+        use crate::backends::ctw::FacContextTree;
+        let mut tree = FacContextTree::new(base_depth, bits_per_symbol);
+        fac_ctw_oracle_score_on_tree(&mut tree, bits_per_symbol, msb_first, data)
+    }
+
+    /// Asserts that `TraceModel::FacCtw` with the given parameters scores
+    /// `data` identically (bit-exact `f64`) to the reference oracle, and that
+    /// `reset()` restores the model so a second pass yields the same score.
+    #[cfg(feature = "backend-ctw")]
+    fn assert_fac_ctw_trace_parity(
+        base_depth: usize,
+        encoding_bits: usize,
+        msb_first: Option<bool>,
+        data: &[u8],
+    ) {
+        // The plan resolves msb_first via `unwrap_or(encoding_bits == 8)`.
+        let resolved_msb_first = msb_first.unwrap_or(encoding_bits == 8);
+
+        let backend = RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits: encoding_bits,
+            encoding_bits,
+            msb_first,
+        };
+        let compiled = backend
+            .compile()
+            .expect("FacCtw backend should compile cleanly");
+
+        let mut model =
+            TraceModel::new(&compiled).expect("TraceModel::FacCtw should initialize without error");
+
+        // ── First pass: trace model vs. oracle ─────────────────────────────
+        let trace_bits = model.update_and_score(data);
+        let oracle_bits = fac_ctw_oracle_score(base_depth, encoding_bits, resolved_msb_first, data);
+
+        assert!(
+            trace_bits.is_finite() && trace_bits >= 0.0,
+            "trace model bits must be finite and non-negative; got {trace_bits} \
+             (base_depth={base_depth}, encoding_bits={encoding_bits}, msb_first={msb_first:?})"
+        );
+        assert_eq!(
+            trace_bits.to_bits(),
+            oracle_bits.to_bits(),
+            "TraceModel::FacCtw score must match FacContextTree oracle exactly \
+             (base_depth={base_depth}, encoding_bits={encoding_bits}, msb_first={msb_first:?}); \
+             trace={trace_bits}, oracle={oracle_bits}"
+        );
+
+        // ── Reset then second pass: scores must be identical to first pass ──
+        // This catches msb_first / bits_per_symbol state not being properly
+        // preserved across reset(), or the tree not being fully cleared.
+        model
+            .reset()
+            .expect("TraceModel::FacCtw reset should succeed");
+        let trace_bits_after_reset = model.update_and_score(data);
+
+        assert_eq!(
+            trace_bits_after_reset.to_bits(),
+            oracle_bits.to_bits(),
+            "TraceModel::FacCtw score after reset must equal the fresh-model score \
+             (base_depth={base_depth}, encoding_bits={encoding_bits}, msb_first={msb_first:?}); \
+             after_reset={trace_bits_after_reset}, expected={oracle_bits}"
+        );
+    }
+
+    /// Regression test: `TraceModel::FacCtw` with 8-bit symbols and MSB-first
+    /// ordering must use `ctw_symbol_bit_msb` to decompose each byte, not
+    /// the legacy LSB path.  This is the primary regression target for the
+    /// branch that wired `msb_first=true` and `raw encoding_bits` into the
+    /// trace model.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_msb_first_8bit_parity() {
+        // Use a non-trivial payload with varied bit patterns to exercise the
+        // full 8-bit MSB decomposition path.
+        let data = b"trace-model regression: fac-ctw msb path";
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 6,
+            /*encoding_bits=*/ 8,
+            /*msb_first=*/ Some(true),
+            data,
+        );
+    }
+
+    /// Regression test: `TraceModel::FacCtw` with 8-bit symbols and explicit
+    /// LSB-first ordering must use `(b >> i) & 1`.  Verifies the `msb_first`
+    /// flag is correctly threaded through from the compiled plan into the
+    /// update loop and is distinct from the MSB path above (the scores for the
+    /// same data must differ, proving the two paths are not identical).
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_lsb_first_8bit_parity() {
+        let data = b"trace-model regression: fac-ctw lsb path";
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 6,
+            /*encoding_bits=*/ 8,
+            /*msb_first=*/ Some(false),
+            data,
+        );
+
+        // Sanity: the two orderings must produce distinct scores for non-palindromic
+        // bit patterns, confirming the flag actually controls bit extraction.
+        let oracle_msb = fac_ctw_oracle_score(6, 8, true, data);
+        let oracle_lsb = fac_ctw_oracle_score(6, 8, false, data);
+        assert_ne!(
+            oracle_msb.to_bits(),
+            oracle_lsb.to_bits(),
+            "MSB-first and LSB-first FacCtw must differ on non-palindromic data"
+        );
+    }
+
+    /// Regression test: `TraceModel::FacCtw` with a sub-byte `encoding_bits`
+    /// (4 bits per symbol) and MSB-first ordering, verifying that
+    /// `ctw_symbol_bit_msb` correctly addresses the low-4 bits of each byte.
+    ///
+    /// `num_percept_bits` is kept equal to `encoding_bits` here; see
+    /// [`trace_model_fac_ctw_encoding_bits_drives_width_not_num_percept_bits`]
+    /// for the dedicated guard that `TraceModel` uses `encoding_bits` (not
+    /// `num_percept_bits`) as the per-symbol bit width.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_sub_byte_4bit_msb_parity() {
+        // Bytes whose lower nibble and upper nibble differ, so that LSB vs MSB
+        // ordering produces different bit sequences.
+        let data = &[0xA3u8, 0x5C, 0xF1, 0x7E, 0x29, 0xB4];
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 4,
+            /*encoding_bits=*/ 4,
+            /*msb_first=*/ Some(true),
+            data,
+        );
+    }
+
+    /// Regression test: default `msb_first=None` with 8-bit symbols must
+    /// resolve to MSB-first.  The rule `unwrap_or(encoding_bits == 8)` evaluates
+    /// to `true` for 8-bit symbols; this verifies that the `Option<bool>` →
+    /// `bool` resolution in `compile_rate_plan_fac_ctw` propagates end-to-end
+    /// through `TraceModel::new` into the update loop.
+    ///
+    /// The `assert_fac_ctw_trace_parity` call already exercises the full
+    /// compile → `TraceModel::new` → `update_and_score` path against the oracle
+    /// with the resolved `bool`.  The additional assertion below confirms that
+    /// `None` and `Some(true)` produce bit-identical `TraceModel` scores on the
+    /// same data, ruling out any partial or inverted propagation.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_default_msb_resolution_8bit() {
+        let data = b"default-msb resolution smoke test";
+
+        // None + encoding_bits=8 → resolved msb_first = true.
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 5, /*encoding_bits=*/ 8, /*msb_first=*/ None, data,
+        );
+
+        // Confirm: two TraceModels — one with None, one with Some(true) — must
+        // score the same data identically.  This catches inversions or partial
+        // propagation that assert_fac_ctw_trace_parity (oracle-based) would miss
+        // if the oracle itself used the wrong convention.
+        let backend_none = RateBackend::FacCtw {
+            base_depth: 5,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+            msb_first: None,
+        };
+        let backend_explicit = RateBackend::FacCtw {
+            base_depth: 5,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+            msb_first: Some(true),
+        };
+        let mut model_none =
+            TraceModel::new(&backend_none.compile().expect("fac-ctw None compile"))
+                .expect("TraceModel::new (None)");
+        let mut model_explicit = TraceModel::new(
+            &backend_explicit
+                .compile()
+                .expect("fac-ctw Some(true) compile"),
+        )
+        .expect("TraceModel::new (Some(true))");
+        assert_eq!(
+            model_none.update_and_score(data).to_bits(),
+            model_explicit.update_and_score(data).to_bits(),
+            "msb_first=None with encoding_bits=8 must produce the same score as Some(true)"
+        );
+    }
+
+    /// Regression test: default `msb_first=None` with a sub-byte `encoding_bits`
+    /// (4 bits) must resolve to LSB-first.  The rule `unwrap_or(encoding_bits == 8)`
+    /// evaluates to `false` for any width other than 8; this verifies end-to-end
+    /// propagation for the sub-byte default case.
+    ///
+    /// An additional assertion confirms that `None` and `Some(false)` produce
+    /// bit-identical `TraceModel` scores, ruling out any inversion.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_default_lsb_resolution_4bit() {
+        let data = &[0xA3u8, 0x5C, 0xF1, 0x7E, 0x29, 0xB4];
+
+        // None + encoding_bits=4 → resolved msb_first = false (LSB).
+        assert_fac_ctw_trace_parity(
+            /*base_depth=*/ 4, /*encoding_bits=*/ 4, /*msb_first=*/ None, data,
+        );
+
+        // Confirm: None score == Some(false) score via two TraceModel instances.
+        let backend_none = RateBackend::FacCtw {
+            base_depth: 4,
+            num_percept_bits: 4,
+            encoding_bits: 4,
+            msb_first: None,
+        };
+        let backend_explicit = RateBackend::FacCtw {
+            base_depth: 4,
+            num_percept_bits: 4,
+            encoding_bits: 4,
+            msb_first: Some(false),
+        };
+        let mut model_none =
+            TraceModel::new(&backend_none.compile().expect("fac-ctw None/4-bit compile"))
+                .expect("TraceModel::new (None/4-bit)");
+        let mut model_explicit = TraceModel::new(
+            &backend_explicit
+                .compile()
+                .expect("fac-ctw Some(false)/4-bit compile"),
+        )
+        .expect("TraceModel::new (Some(false)/4-bit)");
+        assert_eq!(
+            model_none.update_and_score(data).to_bits(),
+            model_explicit.update_and_score(data).to_bits(),
+            "msb_first=None with encoding_bits=4 must produce the same score as Some(false)"
+        );
+    }
+
+    /// Regression guard: `TraceModel::FacCtw` must use `encoding_bits` as the
+    /// per-symbol bit width, not `num_percept_bits`.
+    ///
+    /// `TraceModel::new` explicitly patterns `num_percept_bits: _` and assigns
+    /// `bits_per_symbol = *encoding_bits`.  A regression back to `num_percept_bits`
+    /// would cause 4-bit vs 8-bit symbol decomposition, producing a different bit
+    /// count and failing the oracle assertion (oracle is wired to `encoding_bits`).
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_encoding_bits_drives_width_not_num_percept_bits() {
+        // num_percept_bits=8 (AIXI percept cardinality) diverges from
+        // encoding_bits=4 (VM trace / rate-byte symbol width).
+        let data = &[0xA3u8, 0x5C, 0xF1, 0x7E, 0x29, 0xB4];
+        let base_depth: usize = 4;
+        let encoding_bits: usize = 4;
+
+        let backend = RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits: 8, // intentionally differs from encoding_bits
+            encoding_bits,
+            msb_first: Some(true),
+        };
+        let compiled = backend.compile().expect("fac-ctw compile");
+        let mut model = TraceModel::new(&compiled).expect("TraceModel::new");
+
+        let trace_bits = model.update_and_score(data);
+
+        // Oracle uses encoding_bits=4 (as the trace model must).
+        let oracle_4bit = fac_ctw_oracle_score(base_depth, encoding_bits, true, data);
+        assert_eq!(
+            trace_bits.to_bits(),
+            oracle_4bit.to_bits(),
+            "TraceModel must use encoding_bits={encoding_bits} as symbol width, not num_percept_bits=8; \
+             trace={trace_bits}, oracle_4bit={oracle_4bit}"
+        );
+
+        // Confirm the test is meaningful: an oracle with 8-bit width produces a
+        // *different* score, so the assert above would catch a num_percept_bits regression.
+        let oracle_8bit = fac_ctw_oracle_score(base_depth, 8, true, data);
+        assert_ne!(
+            oracle_4bit.to_bits(),
+            oracle_8bit.to_bits(),
+            "4-bit and 8-bit FacCtw oracles must differ on this data (test is non-trivial)"
+        );
+    }
+
+    /// Regression test: `TraceModel::FacCtw` must produce the correct incremental
+    /// surprise when `update_and_score` is called multiple times on the same
+    /// persistent model — the normal VM usage pattern for trace-entropy shaping.
+    ///
+    /// Each call must score only the *new* bytes against the model already updated
+    /// by all prior calls; the oracle maintains a matching persistent
+    /// [`FacContextTree`] using [`fac_ctw_oracle_score_on_tree`].
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_incremental_scoring_parity() {
+        use crate::backends::ctw::FacContextTree;
+
+        let base_depth: usize = 5;
+        let encoding_bits: usize = 8;
+        let msb_first = true;
+
+        let backend = RateBackend::FacCtw {
+            base_depth,
+            num_percept_bits: encoding_bits,
+            encoding_bits,
+            msb_first: Some(msb_first),
+        };
+        let compiled = backend.compile().expect("fac-ctw compile");
+        let mut model = TraceModel::new(&compiled).expect("TraceModel::new");
+
+        // Two distinct chunks sharing context (realistic VM trace pattern).
+        let chunk_a: &[u8] = b"incremental trace chunk A";
+        let chunk_b: &[u8] = b"incremental trace chunk B -- different continuation";
+
+        // ── Trace model: two sequential updates ────────────────────────────
+        let trace_bits_a = model.update_and_score(chunk_a);
+        let trace_bits_b = model.update_and_score(chunk_b);
+
+        // ── Oracle: persistent tree updated through A then B ───────────────
+        let mut oracle_tree = FacContextTree::new(base_depth, encoding_bits);
+        let oracle_bits_a =
+            fac_ctw_oracle_score_on_tree(&mut oracle_tree, encoding_bits, msb_first, chunk_a);
+        let oracle_bits_b =
+            fac_ctw_oracle_score_on_tree(&mut oracle_tree, encoding_bits, msb_first, chunk_b);
+
+        assert_eq!(
+            trace_bits_a.to_bits(),
+            oracle_bits_a.to_bits(),
+            "incremental: first chunk score must match oracle; \
+             trace={trace_bits_a}, oracle={oracle_bits_a}"
+        );
+        assert_eq!(
+            trace_bits_b.to_bits(),
+            oracle_bits_b.to_bits(),
+            "incremental: second chunk score must match oracle after first chunk is consumed; \
+             trace={trace_bits_b}, oracle={oracle_bits_b}"
+        );
+    }
+
+    /// Edge case: `update_and_score` on empty data must return exactly `0.0`
+    /// without mutating the model.  The production guard is the top-level
+    /// `if data.is_empty() { return 0.0; }` in `update_and_score`.
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn trace_model_fac_ctw_empty_input_returns_zero() {
+        let backend = RateBackend::FacCtw {
+            base_depth: 4,
+            num_percept_bits: 8,
+            encoding_bits: 8,
+            msb_first: Some(true),
+        };
+        let compiled = backend.compile().expect("fac-ctw compile");
+        let mut model = TraceModel::new(&compiled).expect("TraceModel::new");
+
+        let bits_empty = model.update_and_score(b"");
+        assert_eq!(
+            bits_empty.to_bits(),
+            0.0f64.to_bits(),
+            "empty input must return exactly 0.0"
+        );
+
+        // Confirm the model is unmodified: scoring non-empty data after an empty
+        // call must match a fresh oracle (no phantom state from the empty update).
+        let data = b"post-empty data";
+        let bits_after = model.update_and_score(data);
+        let oracle_bits = fac_ctw_oracle_score(4, 8, true, data);
+        assert_eq!(
+            bits_after.to_bits(),
+            oracle_bits.to_bits(),
+            "model must be unmodified after empty update; \
+             bits_after={bits_after}, oracle={oracle_bits}"
+        );
+    }
+}

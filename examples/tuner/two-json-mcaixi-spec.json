@@ -1,0 +1,169 @@
+{
+  "assets": [
+    {
+      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv",
+      "id": "dataset"
+    }
+  ],
+  "kind": "tune",
+  "output_config_path": "/tmp/infotheory-tuner-two-json/mcaixi-output.json",
+  "input_asset": "dataset",
+  "eval_time_limit_seconds": 2,
+  "time_budget_seconds": 1800,
+  "min_throughput_bytes_per_second": 1,
+  "max_memory_bytes": 1073741824,
+  "controller": {
+    "kind": "mc_aixi_fac_ctw",
+    "planner_simulations_per_step": 24,
+    "interface": {
+      "reward_bits": 32,
+      "agent_actions": 20,
+      "observation_bits": 8,
+      "observation_stream_len": 1,
+      "observation_key_mode": "full_stream"
+    }
+  },
+  "report_path": "/tmp/infotheory-tuner-two-json/mcaixi-report.json",
+  "seed": 1337,
+  "bounds": {
+    "max_mixture_nesting_depth": 3,
+    "allowed_backends": [
+      "fac-ctw",
+      "ppmd",
+      "rosaplus",
+      "match",
+      "rwkv7",
+      "mixture"
+    ],
+    "forbidden_backends": [],
+    "parameter_ranges": [
+      {
+        "parameter": "rate_backend.spec.alpha",
+        "max": 0.2,
+        "min": 0.005
+      },
+      {
+        "parameter": "rate_backend.spec.experts[0].base_depth",
+        "max": 96,
+        "min": 8
+      },
+      {
+        "parameter": "rate_backend.spec.experts[1].order",
+        "max": 16,
+        "min": 4
+      },
+      {
+        "parameter": "rate_backend.spec.experts[1].memory_mb",
+        "max": 768,
+        "min": 64
+      },
+      {
+        "parameter": "rate_backend.spec.experts[2].max_order",
+        "max": 128,
+        "min": -1
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].hash_bits",
+        "max": 22,
+        "min": 16
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].min_len",
+        "max": 16,
+        "min": 2
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].max_len",
+        "max": 255,
+        "min": 32
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].base_mix",
+        "max": 0.1,
+        "min": 0.005
+      },
+      {
+        "parameter": "rate_backend.spec.experts[3].confidence_scale",
+        "max": 2,
+        "min": 0.5
+      }
+    ],
+    "forbidden_expert_pairs": [],
+    "required_experts": [
+      "fac-ctw",
+      "ppmd"
+    ],
+    "min_experts": 3,
+    "allow_duplicate_experts": false,
+    "max_experts": 8
+  },
+  "schema_version": 1,
+  "baseline_candidate": {
+    "kind": "rate-ac",
+    "framing": "framed",
+    "rate_backend": {
+      "spec": {
+        "kind": "neural",
+        "schedule": "default",
+        "alpha": 0.03,
+        "decay": null,
+        "experts": [
+          {
+            "log_prior": 0,
+            "kind": "fac-ctw",
+            "num_percept_bits": 8,
+            "encoding_bits": 8,
+            "base_depth": 32,
+            "name": "fac-ctw"
+          },
+          {
+            "log_prior": 0,
+            "kind": "ppmd",
+            "order": 12,
+            "memory_mb": 256,
+            "name": "ppmd"
+          },
+          {
+            "log_prior": 0,
+            "kind": "rosaplus",
+            "max_order": -1,
+            "name": "rosa"
+          },
+          {
+            "log_prior": 0,
+            "kind": "match",
+            "base_mix": 0.02,
+            "confidence_scale": 1,
+            "max_len": 255,
+            "min_len": 4,
+            "name": "match",
+            "hash_bits": 20
+          },
+          {
+            "log_prior": 0,
+            "kind": "rwkv7",
+            "method": {
+              "policy": "schedule=0..0.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|0.5%..1%:infer|1%..1.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|1.5%..2%:infer|2%..2.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|2.5%..3%:infer|3%..3.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|3.5%..4%:infer|4%..4.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|4.5%..5%:infer|5%..5.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|5.5%..6%:infer|6%..6.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|6.5%..7%:infer|7%..7.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|7.5%..8%:infer|8%..8.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|8.5%..9%:infer|9%..9.5%:train(scope=all,opt=adam,lr=0.001,stride=1,bptt=8,clip=0,momentum=0.9)|9.5%..12%:train(scope=all,opt=adam,lr=0.0001,stride=1,bptt=8,clip=0,momentum=0.9)|12%..17%:infer|17%..18%:train(scope=all,opt=adam,lr=0.0001,stride=1,bptt=8,clip=0,momentum=0.9)|18%..100%:infer",
+              "kind": "online",
+              "cfg": {
+                "hidden": 64,
+                "layers": 1,
+                "intermediate": 64,
+                "decay_rank": 16,
+                "a_rank": 16,
+                "v_rank": 16,
+                "g_rank": 16,
+                "seed": 22,
+                "train_mode": "adam",
+                "lr": 0.00089999998454005,
+                "stride": 1
+              }
+            },
+            "name": "rwkv7"
+          }
+        ]
+      },
+      "kind": "mixture"
+    }
+  }
+}

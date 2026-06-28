@@ -22,13 +22,13 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: 
 case "${PLOT_SUITE}" in
   two-json|two_json|two|core|full)
     PLOT_SUITE=two-json
-    SUITE_DISPLAY="examples/two.json"
+    SUITE_DISPLAY="configs/bench/two.json"
     SUITE_PATH_PREFIX="infotheory-two-json"
-    SUITE_FOCUS_SUBJECTS="neural_mixture rwkv"
+    SUITE_FOCUS_SUBJECTS="neural_mixture rwkv7"
     ;;
   extra)
     PLOT_SUITE=extra
-    SUITE_DISPLAY="examples/extra.json"
+    SUITE_DISPLAY="configs/bench/extra.json"
     SUITE_PATH_PREFIX="infotheory-extra"
     SUITE_FOCUS_SUBJECTS="neural_mixture mamba"
     ;;
@@ -58,7 +58,7 @@ Environment:
   INFOTHEORY_PLOT_SUITE=two-json|extra
   INFOTHEORY_PLOT_SUMMARY_TSV=/tmp/${SUITE_PATH_PREFIX}-summary-<stamp>.tsv
   INFOTHEORY_BASELINE_SUMMARY_TSV=benchmarks/baselines/${SUITE_PATH_PREFIX}-summary-<stamp>.tsv
-  INFOTHEORY_PLOT_SUBJECTS=rwkv
+  INFOTHEORY_PLOT_SUBJECTS=rwkv7
   INFOTHEORY_PLOT_OUTPUT_DIR=/tmp/plotimgs
   INFOTHEORY_PLOT_WIDTH=2400
   INFOTHEORY_PLOT_HEIGHT=1400
@@ -120,9 +120,19 @@ selected = {token for token in re.split(r"[\s,]+", raw_filter.strip()) if token}
 if not selected:
     raise SystemExit("INFOTHEORY_PLOT_SUBJECTS must contain at least one subject")
 
+def canonicalize_subject(subject: str) -> str:
+    return "rwkv7" if subject == "rwkv" else subject
+
+selected = {canonicalize_subject(token) for token in selected}
+
 with open(input_path, newline="") as fh:
     reader = csv.DictReader(fh, delimiter="\t")
     rows = list(reader)
+
+for row in rows:
+    row["subject"] = canonicalize_subject(row["subject"])
+    if "series" in row:
+        row["series"] = row["series"].replace(":rwkv", ":rwkv7")
 
 known = {row["subject"] for row in rows}
 unknown = sorted(selected - known)
@@ -155,9 +165,21 @@ import sys
 
 input_path, field_name, field_value, output_path = sys.argv[1:5]
 
+def canonicalize_subject(subject: str) -> str:
+    return "rwkv7" if subject == "rwkv" else subject
+
+if field_name == "subject":
+    field_value = canonicalize_subject(field_value)
+
 with open(input_path, newline="") as fh:
     reader = csv.DictReader(fh, delimiter="\t")
     rows = list(reader)
+
+if field_name == "subject":
+    for row in rows:
+        row["subject"] = canonicalize_subject(row.get("subject", ""))
+        if "series" in row:
+            row["series"] = row["series"].replace(":rwkv", ":rwkv7")
 
 if not rows:
     raise SystemExit(f"{input_path}: no rows to filter")
@@ -200,18 +222,62 @@ import sys
 
 current_path, baseline_path, output_path = sys.argv[1:4]
 
+OPTIONAL_LEGACY_COLUMNS = (
+    "suite_spec_path",
+    "suite_spec_sha256",
+    "build_mode",
+    "build_features",
+)
+
+LEGACY_UNKNOWN = "__legacy_unknown__"
+
 def load_rows(path):
     with open(path, newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         rows = list(reader)
         return reader.fieldnames, rows
 
-current_fields, current_rows = load_rows(current_path)
-baseline_fields, baseline_rows = load_rows(baseline_path)
-if current_fields != baseline_fields:
-    raise SystemExit(
-        "summary TSV columns do not match between current and baseline inputs"
-    )
+def normalize_rows(path):
+    fieldnames, rows = load_rows(path)
+    if fieldnames is None:
+        raise SystemExit(f"{path}: missing header")
+
+    normalized_fieldnames = list(fieldnames)
+    for name in OPTIONAL_LEGACY_COLUMNS:
+        if name not in normalized_fieldnames:
+            normalized_fieldnames.append(name)
+
+    normalized_rows = []
+    for row in rows:
+        normalized = {name: row.get(name, "") for name in normalized_fieldnames}
+        subject = normalized.get("subject", "")
+        if subject == "rwkv":
+            normalized["subject"] = "rwkv7"
+            if "series" in normalized and normalized["series"]:
+                normalized["series"] = normalized["series"].replace(":rwkv", ":rwkv7")
+        for name in OPTIONAL_LEGACY_COLUMNS:
+            if name not in row:
+                normalized[name] = LEGACY_UNKNOWN
+            elif normalized[name] == "":
+                normalized[name] = LEGACY_UNKNOWN
+        normalized_rows.append(normalized)
+    return normalized_fieldnames, normalized_rows
+
+current_fields, current_rows = normalize_rows(current_path)
+baseline_fields, baseline_rows = normalize_rows(baseline_path)
+
+all_fields = []
+seen_fields = set()
+for field_list in (current_fields, baseline_fields):
+    for name in field_list:
+        if name not in seen_fields:
+            seen_fields.add(name)
+            all_fields.append(name)
+
+for rows in (current_rows, baseline_rows):
+    for row in rows:
+        for name in all_fields:
+            row.setdefault(name, "")
 
 key_fields = ("operation", "subject", "size_bytes", "compression_backend")
 current_keys = {
@@ -230,7 +296,7 @@ if current_only or baseline_only:
         file=sys.stderr,
     )
 
-fieldnames = current_fields + [
+fieldnames = all_fields + [
     "summary_source",
     "subject_overlay",
     "series_overlay",

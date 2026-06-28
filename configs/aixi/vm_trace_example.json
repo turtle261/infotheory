@@ -1,0 +1,95 @@
+{
+  "assets": [
+    {
+      "id": "firecracker",
+      "path": "..\/..\/vendor\/nyx-lite\/vm_image\/vmconfig.json"
+    }
+  ],
+  "controller": {
+    "agent_horizon": 8,
+    "discount_gamma": 1,
+    "exploration_exploitation_ratio": 1.4,
+    "kind": "mc_aixi",
+    "num_simulations": 100,
+    "predictor": {
+      "base_depth": 32,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "num_percept_bits": 528
+    }
+  },
+  "environment": {
+    "action_source": {
+      "actions": [
+        {
+          "name": "ping",
+          "payload": "50494e47"
+        },
+        {
+          "name": "status",
+          "payload": "535441545553"
+        }
+      ],
+      "encoding": "hex",
+      "kind": "literal"
+    },
+    "boot_timeout_ms": 30000,
+    "debug_mode": false,
+    "episode_steps": 8,
+    "firecracker_config_asset": "firecracker",
+    "instance_id": "aixi-nyx",
+    "kind": "nyx_vm",
+    "observation_bits": 8,
+    "observation_pad_byte": 0,
+    "observation_policy": "shared_memory",
+    "observation_stream_len": 64,
+    "observation_stream_mode": "pad_truncate",
+    "protocol": {
+      "action_prefix": "ACT ",
+      "action_suffix": "\n",
+      "data_prefix": "DATA ",
+      "done_prefix": "DONE ",
+      "obs_prefix": "OBS ",
+      "rew_prefix": "REW ",
+      "wire_encoding": "hex"
+    },
+    "reward_bits": 16,
+    "reward_policy": {
+      "kind": "from_guest"
+    },
+    "shared_memory_policy": "snapshot",
+    "shared_region_name": "shared",
+    "shared_region_size": 4096,
+    "stats_backend": {
+      "depth": 32,
+      "kind": "ctw"
+    },
+    "step_cost": 1,
+    "step_timeout_ms": 5000,
+    "trace": {
+      "max_bytes": 1048576,
+      "reset_on_episode": false,
+      "shared_region_name": "trace"
+    }
+  },
+  "interface": {
+    "agent_actions": 2,
+    "max_reward": 32767,
+    "min_reward": -32768,
+    "observation_bits": 8,
+    "observation_key_mode": "full_stream",
+    "observation_stream_len": 64,
+    "reward_bits": 16,
+    "reward_offset": 32768
+  },
+  "kind": "planner_run",
+  "runtime": {
+    "explore_epsilon": 0,
+    "explore_gamma": 1,
+    "log_every": 1,
+    "perf": false,
+    "terminate_lifetime": 50,
+    "vm_perf_only": false
+  },
+  "schema_version": 1
+}

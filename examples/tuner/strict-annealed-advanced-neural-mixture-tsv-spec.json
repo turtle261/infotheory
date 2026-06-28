@@ -1,0 +1,83 @@
+{
+  "controller": {
+    "kind": "annealed_hill_climbing",
+    "max_mutation_radius": 3
+  },
+  "input_asset": "dataset",
+  "baseline_candidate": {
+    "rate_backend": {
+      "kind": "mixture",
+      "spec": {
+        "schedule": "default",
+        "alpha": 0.04,
+        "decay": null,
+        "experts": [
+          {
+            "encoding_bits": 8,
+            "base_depth": 12,
+            "log_prior": 0,
+            "kind": "fac-ctw",
+            "num_percept_bits": 8
+          },
+          {
+            "encoding_bits": 8,
+            "kind": "fac-ctw",
+            "log_prior": 0,
+            "base_depth": 10,
+            "num_percept_bits": 8
+          },
+          {
+            "encoding_bits": 8,
+            "base_depth": 8,
+            "log_prior": 0,
+            "kind": "fac-ctw",
+            "num_percept_bits": 8
+          }
+        ],
+        "kind": "neural"
+      }
+    },
+    "kind": "rate-ac",
+    "framing": "framed"
+  },
+  "bounds": {
+    "allowed_backends": [
+      "fac-ctw",
+      "mixture"
+    ],
+    "forbidden_backends": [],
+    "parameter_ranges": [
+      {
+        "max": 0.2,
+        "min": 0.01,
+        "parameter": "rate_backend.spec.alpha"
+      },
+      {
+        "max": 32,
+        "min": 4,
+        "parameter": "rate_backend.spec.experts[0].base_depth"
+      }
+    ],
+    "max_experts": 6,
+    "max_mixture_nesting_depth": 3,
+    "min_experts": 2,
+    "allow_duplicate_experts": false,
+    "required_experts": [],
+    "forbidden_expert_pairs": []
+  },
+  "output_config_path": "strict-annealed-advanced-neural-mixture-tsv-output.json",
+  "seed": 23,
+  "report_path": "strict-annealed-advanced-neural-mixture-tsv-report.json",
+  "max_memory_bytes": 1099511627776,
+  "min_throughput_bytes_per_second": 1,
+  "schema_version": 1,
+  "time_budget_seconds": 300,
+  "assets": [
+    {
+      "id": "dataset",
+      "path": "../../benchmarks/6f464811/infotheory-two-json-summary-full.tsv"
+    }
+  ],
+  "kind": "tune",
+  "eval_time_limit_seconds": 90
+}

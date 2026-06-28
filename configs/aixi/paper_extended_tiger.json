@@ -1,0 +1,42 @@
+{
+  "assets": [],
+  "controller": {
+    "agent_horizon": 4,
+    "discount_gamma": 1,
+    "exploration_exploitation_ratio": 1.4,
+    "kind": "mc_aixi",
+    "num_simulations": 500,
+    "predictor": {
+      "base_depth": 96,
+      "encoding_bits": 8,
+      "kind": "fac-ctw",
+      "num_percept_bits": 11
+    }
+  },
+  "environment": {
+    "kind": "builtin",
+    "name": "extended_tiger"
+  },
+  "interface": {
+    "agent_actions": 4,
+    "max_reward": 30,
+    "min_reward": -100,
+    "observation_bits": 3,
+    "observation_key_mode": "full_stream",
+    "observation_stream_len": 1,
+    "reward_bits": 8,
+    "reward_offset": 100
+  },
+  "kind": "planner_run",
+  "runtime": {
+    "eval_cycles": 5000,
+    "explore_epsilon": 0.99,
+    "explore_gamma": 0.99999,
+    "learn_cycles": 50000,
+    "log_every": 1,
+    "perf": false,
+    "terminate_lifetime": 20,
+    "vm_perf_only": false
+  },
+  "schema_version": 1
+}

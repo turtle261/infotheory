@@ -1,6 +1,9 @@
 [submodule "nyx-lite"]
-	path = nyx-lite
+	path = vendor/nyx-lite
 	url = https://github.com/turtle261/nyx-lite.git
 [submodule "zpaq_rs"]
-	path = zpaq_rs
+	path = vendor/zpaq_rs
 	url = https://github.com/turtle261/zpaq-rs
+[submodule "gameengine"]
+	path = vendor/gameengine
+	url = https://github.com/turtle261/gameengine.git

@@ -268,7 +268,7 @@ def test_environment_default_drain_observations():
 def test_agent_simulator_default_methods():
     sim = _Sim()
     assert sim.observation_stream_len() == 1
-    assert sim.observation_key_mode() == "fullstream"
+    assert sim.observation_key_mode() == "full_stream"
     assert sim.reward_offset() == 0
     assert sim.get_explore_exploit_ratio() == 1.0
     assert sim.discount_gamma() == 1.0
