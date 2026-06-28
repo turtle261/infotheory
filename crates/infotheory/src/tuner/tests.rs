@@ -28,10 +28,14 @@ fn strict_mode_test_accounting_kind() -> ResolvedMemoryAccountingKind {
     {
         ResolvedMemoryAccountingKind::StrictLinuxCgroupV2PeakMaxProcessRss
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         // Non-Linux targets cannot resolve strict cgroup-v2 accounting.
         ResolvedMemoryAccountingKind::UnixProcessRssFallbackExplicit
+    }
+    #[cfg(not(unix))]
+    {
+        ResolvedMemoryAccountingKind::DeterministicEvaluatorTable
     }
 }
 
@@ -991,8 +995,10 @@ fn executor_controls_report_reflects_requested_rss_mode() {
         .expect("effective measurement");
     #[cfg(target_os = "linux")]
     assert_eq!(effective, "strict_linux_max_process_rss_cgroup_v2_peak");
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     assert_eq!(effective, "unix_process_rss_fallback_explicit");
+    #[cfg(not(unix))]
+    assert_eq!(effective, "deterministic_evaluator_table_row_peak_memory");
 }
 
 #[test]

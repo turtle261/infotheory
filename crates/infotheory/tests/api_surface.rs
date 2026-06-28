@@ -1,3 +1,5 @@
+#[cfg(feature = "backend-ctw")]
+use infotheory::api::BinaryPrediction;
 #[cfg(any(feature = "backend-ctw", feature = "backend-zpaq"))]
 use infotheory::api::BitOrder;
 #[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
@@ -24,6 +26,74 @@ use infotheory::api::{MixtureKind, MixtureSpec, RateBackend, RateBackendSession}
 ))]
 use infotheory::spec::CanonicalJson;
 use std::sync::Arc;
+
+#[cfg(feature = "backend-ctw")]
+const CHECKPOINT_RESTORE_PREDICTION_ULPS: u64 = 4;
+
+#[cfg(feature = "backend-ctw")]
+fn ordered_f64_bits(value: f64) -> u64 {
+    let bits: u64 = value.to_bits();
+    if bits & (1u64 << 63) == 0 {
+        bits | (1u64 << 63)
+    } else {
+        !bits
+    }
+}
+
+#[cfg(feature = "backend-ctw")]
+fn assert_f64_within_ulps(label: &str, actual: f64, expected: f64, max_ulps: u64) {
+    assert!(
+        actual.is_finite() && expected.is_finite(),
+        "{label} must be finite: actual={actual}, expected={expected}"
+    );
+    let ulps: u64 = ordered_f64_bits(actual).abs_diff(ordered_f64_bits(expected));
+    assert!(
+        ulps <= max_ulps,
+        "{label} differs by {ulps} ULPs, expected at most {max_ulps}: actual={actual}, expected={expected}"
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+fn assert_valid_binary_prediction(label: &str, prediction: BinaryPrediction) {
+    assert!(
+        prediction.p0.is_finite() && prediction.p1.is_finite(),
+        "{label} probabilities must be finite: prediction={prediction:?}"
+    );
+    assert!(
+        (0.0..=1.0).contains(&prediction.p0) && (0.0..=1.0).contains(&prediction.p1),
+        "{label} probabilities must stay in [0, 1]: prediction={prediction:?}"
+    );
+    assert_f64_within_ulps(
+        &format!("{label} normalization"),
+        prediction.p0 + prediction.p1,
+        1.0,
+        CHECKPOINT_RESTORE_PREDICTION_ULPS,
+    );
+}
+
+#[cfg(feature = "backend-ctw")]
+fn assert_checkpoint_prediction_within_roundoff(
+    label: &str,
+    actual: BinaryPrediction,
+    expected: BinaryPrediction,
+) {
+    // Checkpoint restore reuses the same prediction code after replaying a short
+    // reversible journal; this bound admits only tiny inverse-update round-off.
+    assert_valid_binary_prediction(&format!("{label} actual"), actual);
+    assert_valid_binary_prediction(&format!("{label} expected"), expected);
+    assert_f64_within_ulps(
+        &format!("{label} p0"),
+        actual.p0,
+        expected.p0,
+        CHECKPOINT_RESTORE_PREDICTION_ULPS,
+    );
+    assert_f64_within_ulps(
+        &format!("{label} p1"),
+        actual.p1,
+        expected.p1,
+        CHECKPOINT_RESTORE_PREDICTION_ULPS,
+    );
+}
 
 #[test]
 fn api_surface_rate_backend_session_rejects_invalid_programmatic_mixture() {
@@ -186,10 +256,10 @@ fn api_surface_bit_session_checkpoint_restores_byte_packed_prefix() {
     session
         .restore_checkpoint(&checkpoint)
         .expect("checkpoint restore");
-    assert_eq!(
+    assert_checkpoint_prediction_within_roundoff(
+        "restore must recover the pre-prefix prediction",
         session.predict_bit(),
         initial,
-        "restore must recover the pre-prefix prediction"
     );
 
     for bit in [true, false, true, false, true, false, true, false] {
@@ -199,7 +269,11 @@ fn api_surface_bit_session_checkpoint_restores_byte_packed_prefix() {
     session
         .restore_checkpoint(&checkpoint)
         .expect("restore after completed byte");
-    assert_eq!(session.predict_bit(), initial);
+    assert_checkpoint_prediction_within_roundoff(
+        "restore after completed byte",
+        session.predict_bit(),
+        initial,
+    );
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -257,7 +331,11 @@ fn api_surface_bit_session_checkpoint_restores_native_reversible_mixture() {
     session
         .restore_checkpoint(&checkpoint)
         .expect("restore mixture checkpoint");
-    assert_eq!(session.predict_bit(), expected);
+    assert_checkpoint_prediction_within_roundoff(
+        "restore native reversible mixture checkpoint",
+        session.predict_bit(),
+        expected,
+    );
 }
 
 #[cfg(feature = "backend-ctw")]

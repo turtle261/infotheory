@@ -67,11 +67,16 @@ pub struct RateBackendBitSession {
     discardable_scopes: usize,
 }
 
-/// Opaque checkpoint for restoring a [`RateBackendBitSession`] exactly.
+/// Opaque checkpoint for restoring a [`RateBackendBitSession`].
 ///
 /// Checkpoints capture the underlying rate predictor plus any in-flight
 /// byte-prefix state, so they are valid even between byte-packed bits before a
 /// full byte has been committed to the backend.
+///
+/// Snapshot-backed predictors restore their predictive state exactly. Compact
+/// journaled predictors may replay reversible markers during restore, so their
+/// floating-point probabilities are restored up to normal round-off while the
+/// discrete model state and stream position are restored to the checkpoint.
 ///
 /// (Python exposes this as `infotheory_rs.RateBackendBitSessionCheckpoint`.)
 #[derive(Clone)]
@@ -437,7 +442,12 @@ impl RateBackendBitSession {
         self.predict_bit().p1
     }
 
-    /// Capture a reversible checkpoint for later exact restoration.
+    /// Capture a reversible checkpoint for later restoration.
+    ///
+    /// Backends that store full snapshots restore bit-identical floating-point
+    /// predictions. Backends that use compact reversible journals may differ by
+    /// a few ULP after restore because floating-point accumulators are replayed
+    /// instead of cloned byte-for-byte.
     pub fn checkpoint(&mut self) -> RateBackendBitSessionCheckpoint {
         debug_assert_eq!(
             self.discardable_scopes, 0,
@@ -462,6 +472,10 @@ impl RateBackendBitSession {
     }
 
     /// Restore the session to a previously captured checkpoint.
+    ///
+    /// Snapshot-backed predictors restore bit-identical predictions. Compact
+    /// journaled predictors restore the same discrete predictor state and stream
+    /// position, with predictions equal up to floating-point round-off.
     ///
     /// A checkpoint is tied to the backend and bit-stream semantics it was
     /// created from. Restoring a checkpoint into a different bit session is a
