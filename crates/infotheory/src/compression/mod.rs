@@ -31,6 +31,11 @@ use crate::backends::sparse_match::SparseMatchModel;
 use crate::backends::text_context::TextContextAnalyzer;
 #[cfg(feature = "backend-zpaq")]
 use crate::backends::zpaq_rate::ZpaqRateModel;
+#[cfg(all(test, feature = "all-backends"))]
+use crate::byte_prefix::zeroed_prefix_cdf;
+use crate::byte_prefix::{
+    BytePrefixCdf, MsbPrefixRange, fill_prefix_cdf_from_pdf, normalize_pdf, zeroed_prefix_cdf_box,
+};
 use crate::coders::{
     ANS_TOTAL, ArithmeticDecoder, ArithmeticEncoder, BlockedRansDecoder, BlockedRansEncoder,
     CDF_TOTAL, Cdf, CoderType, crc32, quantize_pdf_to_rans_cdf_with_buffer,
@@ -311,26 +316,6 @@ impl CtwPredictor {
         }
     }
 
-    fn normalize_pdf(pdf: &mut [f64]) {
-        let mut sum = 0.0f64;
-        for p in pdf.iter_mut() {
-            let v = if p.is_finite() { *p } else { 0.0 };
-            *p = v.max(PDF_MIN);
-            sum += *p;
-        }
-        if sum <= 0.0 || !sum.is_finite() {
-            let u = 1.0 / (pdf.len() as f64);
-            for p in pdf.iter_mut() {
-                *p = u;
-            }
-            return;
-        }
-        let inv = 1.0 / sum;
-        for p in pdf.iter_mut() {
-            *p *= inv;
-        }
-    }
-
     fn pdf_next(&mut self) -> &[f64] {
         if !self.valid {
             let bits = self.bits_per_symbol.clamp(1, 8);
@@ -350,7 +335,7 @@ impl CtwPredictor {
                     self.pdf[byte] = self.pattern_logps[pat].exp() / (aliases as f64);
                 }
             }
-            Self::normalize_pdf(&mut self.pdf);
+            normalize_pdf(&mut self.pdf, PDF_MIN);
             self.valid = true;
         }
         &self.pdf
@@ -529,7 +514,7 @@ impl ZpaqPredictor {
                 let logp = model.log_prob(sym as u8);
                 self.pdf[sym] = logp.exp().max(PDF_MIN);
             }
-            normalize_pdf(&mut self.pdf);
+            normalize_pdf(&mut self.pdf, PDF_MIN);
             self.valid = true;
         }
         &self.pdf
@@ -684,18 +669,22 @@ struct MixExpert {
 }
 
 #[derive(Clone, Debug)]
-enum PredictorBitwiseStepState {
+pub(crate) enum PredictorBitwiseStepState {
     NativeRecursive,
-    CachedCdf { lo: usize, hi: usize },
-    PdfPrefix { cdf: Vec<f64>, lo: usize, hi: usize },
+    CachedCdf {
+        range: MsbPrefixRange,
+    },
+    PdfPrefix {
+        cdf: Box<BytePrefixCdf>,
+        range: MsbPrefixRange,
+    },
 }
 
 impl Default for PredictorBitwiseStepState {
     fn default() -> Self {
         Self::PdfPrefix {
-            cdf: Vec::new(),
-            lo: 0,
-            hi: 256,
+            cdf: zeroed_prefix_cdf_box(),
+            range: MsbPrefixRange::FULL,
         }
     }
 }
@@ -707,19 +696,20 @@ impl PredictorBitwiseStepState {
             return Ok(());
         }
         if predictor.prepare_cached_cdf_fast_bitwise()? {
-            *self = Self::CachedCdf { lo: 0, hi: 256 };
+            *self = Self::CachedCdf {
+                range: MsbPrefixRange::FULL,
+            };
             return Ok(());
         }
 
         let mut cdf = match std::mem::take(self) {
             Self::PdfPrefix { cdf, .. } => cdf,
-            _ => Vec::new(),
+            _ => zeroed_prefix_cdf_box(),
         };
-        rebuild_bitwise_prefix_cdf_row(&mut cdf, predictor.pdf_next()?);
+        fill_prefix_cdf_from_pdf(&mut cdf, predictor.pdf_next()?, PDF_MIN);
         *self = Self::PdfPrefix {
             cdf,
-            lo: 0,
-            hi: 256,
+            range: MsbPrefixRange::FULL,
         };
         Ok(())
     }
@@ -731,10 +721,10 @@ impl PredictorBitwiseStepState {
     ) -> Result<f64> {
         match self {
             Self::NativeRecursive => predictor.native_recursive_bit_prob_one_msb(bit_idx),
-            Self::CachedCdf { lo, hi } => Ok(predictor
-                .cached_cdf_bit_prob_one_msb(*lo, *hi)
+            Self::CachedCdf { range } => Ok(predictor
+                .cached_cdf_bit_prob_one_msb(*range)
                 .expect("CachedCdf state invariant violated: missing cached CDF entry")),
-            Self::PdfPrefix { cdf, lo, hi } => Ok(cdf_bit_prob_one_msb(cdf, *lo, *hi)),
+            Self::PdfPrefix { cdf, range } => Ok(range.prob_one(cdf.as_ref(), PDF_MIN)),
         }
     }
 
@@ -746,8 +736,8 @@ impl PredictorBitwiseStepState {
     ) -> Result<()> {
         match self {
             Self::NativeRecursive => predictor.native_recursive_observe_bit_msb(bit_idx, bit),
-            Self::CachedCdf { lo, hi } | Self::PdfPrefix { lo, hi, .. } => {
-                advance_msb_prefix_range(lo, hi, bit);
+            Self::CachedCdf { range } | Self::PdfPrefix { range, .. } => {
+                range.observe(bit);
                 Ok(())
             }
         }
@@ -981,7 +971,7 @@ impl MixturePredictor {
             }
         }
 
-        normalize_pdf(&mut self.pdf);
+        normalize_pdf(&mut self.pdf, PDF_MIN);
         self.valid = true;
         Ok(&self.pdf)
     }
@@ -1536,6 +1526,7 @@ pub(crate) enum RatePdfPredictor {
     Calibrated {
         base: Box<RatePdfPredictor>,
         core: CalibratorCore,
+        bitwise: PredictorBitwiseStepState,
         pdf: Vec<f64>,
         valid: bool,
     },
@@ -1590,7 +1581,16 @@ impl RatePdfPredictor {
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.begin_stream(total_len),
             #[cfg(feature = "backend-calibrated")]
-            Self::Calibrated { base, .. } => base.begin_stream(total_len),
+            Self::Calibrated {
+                base,
+                bitwise,
+                valid,
+                ..
+            } => {
+                *bitwise = PredictorBitwiseStepState::default();
+                *valid = false;
+                base.begin_stream(total_len)
+            }
             Self::Disabled { reason } => bail!("{reason}"),
         }
     }
@@ -1622,7 +1622,16 @@ impl RatePdfPredictor {
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.finish_stream(),
             #[cfg(feature = "backend-calibrated")]
-            Self::Calibrated { base, .. } => base.finish_stream(),
+            Self::Calibrated {
+                base,
+                bitwise,
+                valid,
+                ..
+            } => {
+                *bitwise = PredictorBitwiseStepState::default();
+                *valid = false;
+                base.finish_stream()
+            }
             Self::Disabled { .. } => Ok(()),
         }
     }
@@ -1657,13 +1666,14 @@ impl RatePdfPredictor {
             Self::Calibrated {
                 base,
                 core,
+                bitwise: _,
                 pdf,
                 valid,
             } => {
                 if !*valid {
                     let base_pdf = base.pdf_next()?;
                     core.apply_pdf(base_pdf, pdf);
-                    normalize_pdf(pdf);
+                    normalize_pdf(pdf, PDF_MIN);
                     *valid = true;
                 }
                 Ok(pdf)
@@ -1729,15 +1739,13 @@ impl RatePdfPredictor {
             Self::Calibrated {
                 base,
                 core,
-                pdf,
+                bitwise: _,
                 valid,
+                ..
             } => {
-                if !*valid {
-                    let base_pdf = base.pdf_next()?;
-                    core.apply_pdf(base_pdf, pdf);
-                    normalize_pdf(pdf);
-                }
-                core.update(symbol, pdf);
+                let base_pdf = base.pdf_next()?;
+                core.observe_symbol_from_base_pdf(symbol, base_pdf)
+                    .map_err(anyhow::Error::msg)?;
                 base.update(symbol)?;
                 *valid = false;
                 Ok(())
@@ -1782,20 +1790,20 @@ impl RatePdfPredictor {
         }
     }
 
-    fn cached_cdf_bit_prob_one_msb(&mut self, lo: usize, hi: usize) -> Option<f64> {
+    fn cached_cdf_bit_prob_one_msb(&mut self, range: MsbPrefixRange) -> Option<f64> {
         match self {
             #[cfg(feature = "backend-rosa")]
-            Self::Rosa(m) => Some(cdf_bit_prob_one_msb(&m.cdf, lo, hi)),
+            Self::Rosa(m) => Some(range.prob_one(&m.cdf, PDF_MIN)),
             #[cfg(feature = "backend-match")]
-            Self::Match { model } => Some(cdf_bit_prob_one_msb(model.cdf(), lo, hi)),
+            Self::Match { model } => Some(range.prob_one(model.cdf(), PDF_MIN)),
             #[cfg(feature = "backend-match")]
-            Self::SparseMatch { model } => Some(cdf_bit_prob_one_msb(model.cdf(), lo, hi)),
+            Self::SparseMatch { model } => Some(range.prob_one(model.cdf(), PDF_MIN)),
             #[cfg(feature = "backend-ppmd")]
-            Self::Ppmd { model } => Some(cdf_bit_prob_one_msb(model.cdf(), lo, hi)),
+            Self::Ppmd { model } => Some(range.prob_one(model.cdf(), PDF_MIN)),
             #[cfg(feature = "backend-mamba")]
-            Self::Mamba(m) => Some(cdf_bit_prob_one_msb(m.cdf_next(), lo, hi)),
+            Self::Mamba(m) => Some(range.prob_one(m.cdf_next(), PDF_MIN)),
             #[cfg(feature = "backend-rwkv")]
-            Self::Rwkv(m) => Some(cdf_bit_prob_one_msb(m.cdf_next(), lo, hi)),
+            Self::Rwkv(m) => Some(range.prob_one(m.cdf_next(), PDF_MIN)),
             _ => None,
         }
     }
@@ -1807,6 +1815,8 @@ impl RatePdfPredictor {
             Self::Ctw(m) | Self::FacCtw(m) => m.can_fast_ac_bitwise(),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.has_recursive_native_bitwise_expert(),
+            #[cfg(feature = "backend-calibrated")]
+            Self::Calibrated { .. } => true,
             _ => false,
         }
     }
@@ -1817,6 +1827,22 @@ impl RatePdfPredictor {
             Self::Ctw(m) | Self::FacCtw(m) => Ok(m.can_fast_ac_bitwise()),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.begin_bitwise_byte_step(),
+            #[cfg(feature = "backend-calibrated")]
+            Self::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                core.begin_byte().map_err(anyhow::Error::msg)?;
+                if let Err(err) = bitwise.prepare(base) {
+                    let _ = core.abort_empty_byte();
+                    return Err(err);
+                }
+                *valid = false;
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -1827,6 +1853,17 @@ impl RatePdfPredictor {
             Self::Ctw(m) | Self::FacCtw(m) => Ok(m.bit_prob_one_msb(bit_idx)),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.bit_prob_one_msb(bit_idx),
+            #[cfg(feature = "backend-calibrated")]
+            Self::Calibrated {
+                base,
+                core,
+                bitwise,
+                ..
+            } => {
+                let base_p1: f64 = bitwise.bit_prob_one_msb(base, bit_idx)?;
+                debug_assert!(core.byte_is_active());
+                Ok(core.predict_bit_unchecked(base_p1))
+            }
             _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
         }
     }
@@ -1840,6 +1877,20 @@ impl RatePdfPredictor {
             }
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.observe_bit_msb(bit_idx, bit),
+            #[cfg(feature = "backend-calibrated")]
+            Self::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                debug_assert!(core.byte_is_active());
+                core.observe_bit_unchecked(bit);
+                bitwise.observe_bit_msb(base, bit_idx, bit)?;
+                *valid = false;
+                Ok(())
+            }
             _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
         }
     }
@@ -1850,6 +1901,20 @@ impl RatePdfPredictor {
             Self::Ctw(_) | Self::FacCtw(_) => Ok(()),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.finish_bitwise_symbol(symbol),
+            #[cfg(feature = "backend-calibrated")]
+            Self::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                core.validate_complete_byte().map_err(anyhow::Error::msg)?;
+                bitwise.finish_symbol(base, symbol)?;
+                core.finish_byte().map_err(anyhow::Error::msg)?;
+                *valid = false;
+                Ok(())
+            }
             _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
         }
     }
@@ -2249,29 +2314,6 @@ pub fn decompress_rate_bytes(
     Ok(decoded)
 }
 
-fn normalize_pdf(pdf: &mut [f64]) {
-    let mut sum = 0.0;
-    for p in pdf.iter_mut() {
-        *p = if p.is_finite() {
-            (*p).max(PDF_MIN)
-        } else {
-            PDF_MIN
-        };
-        sum += *p;
-    }
-    if !(sum.is_finite()) || sum <= 0.0 {
-        let u = 1.0 / (pdf.len() as f64);
-        for p in pdf.iter_mut() {
-            *p = u;
-        }
-        return;
-    }
-    let inv = 1.0 / sum;
-    for p in pdf.iter_mut() {
-        *p *= inv;
-    }
-}
-
 #[inline]
 fn uniform_cdf_row() -> [f64; 257] {
     let mut cdf = [0.0; 257];
@@ -2323,52 +2365,6 @@ fn normalize_pdf_vec_and_maybe_build_cdf(pdf: &mut [f64], cdf: Option<&mut [f64;
         for p in pdf.iter_mut() {
             *p *= inv;
         }
-    }
-}
-
-/// Build a 257-slot MSB-prefix CDF row from a 256-symbol PDF.
-///
-/// Predictors must emit valid PDFs; this wrapper does not repair invalid totals in
-/// release builds. Invalid rows are caught via `debug_assert` in debug builds only.
-#[inline]
-fn rebuild_bitwise_prefix_cdf_row(cdf: &mut Vec<f64>, pdf: &[f64]) {
-    debug_assert_eq!(
-        pdf.len(),
-        256,
-        "rebuild_bitwise_prefix_cdf_row requires a full 256-element PDF (caller invariant)"
-    );
-    debug_assert!(
-        pdf.iter().all(|&p| p.is_finite() && p >= 0.0),
-        "Predictor contract violation: predictor emitted non-finite or negative PDF mass"
-    );
-    cdf.resize(257, 0.0);
-    cdf[0] = 0.0;
-    for idx in 0..256usize {
-        let p: f64 = pdf[idx].max(PDF_MIN); // direct index per invariant
-        cdf[idx + 1] = cdf[idx] + p;
-    }
-    debug_assert!(
-        cdf[256].is_finite() && cdf[256] > 0.0,
-        "Predictor contract violation: invalid prefix-CDF total ({})",
-        cdf[256]
-    );
-}
-
-#[inline]
-fn cdf_bit_prob_one_msb(cdf: &[f64], lo: usize, hi: usize) -> f64 {
-    let mid = (lo + hi) >> 1;
-    let total = (cdf[hi] - cdf[lo]).max(PDF_MIN);
-    let one = (cdf[hi] - cdf[mid]).max(0.0);
-    (one / total).clamp(PDF_MIN, 1.0 - PDF_MIN)
-}
-
-#[inline]
-fn advance_msb_prefix_range(lo: &mut usize, hi: &mut usize, bit: bool) {
-    let mid = (*lo + *hi) >> 1;
-    if bit {
-        *lo = mid;
-    } else {
-        *hi = mid;
     }
 }
 
@@ -2512,39 +2508,6 @@ fn apply_switching_weights(
 #[cfg(feature = "backend-zpaq")]
 fn _zpaq_marker(_: &ZpaqRateModel) {}
 
-#[cfg(test)]
-mod rebuild_bitwise_prefix_cdf_row_contract_tests {
-    use super::rebuild_bitwise_prefix_cdf_row;
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn rebuild_bitwise_prefix_cdf_row_rejects_nan_pdf_in_debug() {
-        let mut pdf = [1.0 / 256.0; 256];
-        pdf[17] = f64::NAN;
-
-        let result = std::panic::catch_unwind(|| {
-            let mut cdf: Vec<f64> = Vec::new();
-            rebuild_bitwise_prefix_cdf_row(&mut cdf, &pdf);
-        });
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn rebuild_bitwise_prefix_cdf_row_rejects_negative_pdf_in_debug() {
-        let mut pdf = [1.0 / 256.0; 256];
-        pdf[17] = -0.1;
-
-        let result = std::panic::catch_unwind(|| {
-            let mut cdf: Vec<f64> = Vec::new();
-            rebuild_bitwise_prefix_cdf_row(&mut cdf, &pdf);
-        });
-
-        assert!(result.is_err());
-    }
-}
-
 #[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
@@ -2624,7 +2587,7 @@ mod tests {
             }
         }
 
-        CtwPredictor::normalize_pdf(&mut out);
+        normalize_pdf(&mut out, PDF_MIN);
         out
     }
 
@@ -2902,14 +2865,42 @@ mod tests {
     fn roundtrip_rate_ac_calibrated_backend() {
         let data = b"calibration wrapper payload calibration wrapper payload";
         let backend = RateBackend::Calibrated {
-            spec: Arc::new(crate::CalibratedSpec {
-                base: RateBackend::Ctw { depth: 8 },
-                context: crate::CalibrationContextKind::Text,
-                bins: 33,
-                learning_rate: 0.02,
-                bias_clip: 4.0,
-            }),
+            spec: Arc::new(crate::CalibratedSpec::new(
+                RateBackend::Ctw { depth: 8 },
+                crate::CalibrationContextKind::Text,
+            )),
         };
+        let predictor = RatePdfPredictor::from_rate_backend(backend.clone()).unwrap();
+        assert!(
+            predictor.can_fast_ac_bitwise(),
+            "calibrated CTW should expose the SSE bitwise AC path"
+        );
+        let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        let dec =
+            decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_rate_ac_calibrated_byte_pdf_base_backend() {
+        let data = b"calibrated byte pdf base payload calibrated byte pdf base payload";
+        let backend = RateBackend::Calibrated {
+            spec: Arc::new(crate::CalibratedSpec::new(
+                RateBackend::Match {
+                    hash_bits: 18,
+                    min_len: 3,
+                    max_len: 64,
+                    base_mix: 0.08,
+                    confidence_scale: 1.0,
+                },
+                crate::CalibrationContextKind::ByteClass,
+            )),
+        };
+        let predictor = RatePdfPredictor::from_rate_backend(backend.clone()).unwrap();
+        assert!(
+            predictor.can_fast_ac_bitwise(),
+            "calibrated byte-PDF bases should use the generic SSE bitwise adapter"
+        );
         let enc = compress_rate_bytes(data, &backend, CoderType::AC, FramingMode::Framed).unwrap();
         let dec =
             decompress_rate_bytes(&enc, &backend, CoderType::AC, FramingMode::Framed).unwrap();
@@ -3413,29 +3404,27 @@ mod tests {
             let pdf = predictor.pdf_next().unwrap().to_vec();
             assert!(predictor.prepare_cached_cdf_fast_bitwise().unwrap());
 
-            let mut row = [0.0; 257];
-            row[0] = 0.0;
-            for i in 0..256 {
-                row[i + 1] = row[i] + pdf[i].max(PDF_MIN);
-            }
+            let mut row = zeroed_prefix_cdf();
+            fill_prefix_cdf_from_pdf(&mut row, &pdf, PDF_MIN);
 
-            let mut stack = vec![(0usize, 256usize)];
-            while let Some((lo, hi)) = stack.pop() {
-                if hi - lo <= 1 {
+            let mut stack = vec![MsbPrefixRange::FULL];
+            while let Some(range) = stack.pop() {
+                if range.hi() - range.lo() <= 1 {
                     continue;
                 }
-                let expected = cdf_bit_prob_one_msb(&row, lo, hi);
+                let expected = range.prob_one(&row, PDF_MIN);
                 let got = predictor
-                    .cached_cdf_bit_prob_one_msb(lo, hi)
+                    .cached_cdf_bit_prob_one_msb(range)
                     .expect("cached cdf branch probability");
                 let diff = (expected - got).abs();
                 assert!(
                     diff <= 1e-12,
-                    "lo={lo} hi={hi} expected={expected} got={got} diff={diff}"
+                    "lo={} hi={} expected={expected} got={got} diff={diff}",
+                    range.lo(),
+                    range.hi()
                 );
-                let mid = (lo + hi) >> 1;
-                stack.push((lo, mid));
-                stack.push((mid, hi));
+                stack.push(range.observed(false));
+                stack.push(range.observed(true));
             }
 
             predictor.update(symbol).unwrap();

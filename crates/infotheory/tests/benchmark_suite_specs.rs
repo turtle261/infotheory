@@ -84,6 +84,87 @@ fn two_json_benchmark_specs_are_pinned_and_canonical() {
 }
 
 #[test]
+fn two_sse_profile_wraps_canonical_two_json() {
+    let v = load_example("two_sse.json");
+    assert_eq!(v["base"]["kind"], "mixture");
+    assert_eq!(v["base"]["spec_path"], "two.json");
+    assert_eq!(v["context"], "textrepeat");
+    assert_eq!(v["bins"].as_u64(), Some(32));
+    assert_eq!(v["learning_rate"].as_f64(), Some(0.03125));
+    assert_eq!(v["bias_clip"].as_f64(), Some(16.0));
+
+    #[cfg(all(
+        feature = "backend-calibrated",
+        feature = "backend-mixture",
+        feature = "backend-ctw",
+        feature = "backend-ppmd",
+        feature = "backend-rosa",
+        feature = "backend-match",
+        feature = "backend-rwkv"
+    ))]
+    {
+        let root = repo_root();
+        let path = root.join("configs").join("bench").join("two_sse.json");
+        let spec = infotheory::spec::load_calibrated_spec(
+            path.to_str().expect("two_sse path should be UTF-8"),
+        )
+        .expect("two_sse.json should load as a calibrated spec");
+        let backend = infotheory::api::RateBackend::Calibrated {
+            spec: std::sync::Arc::new(spec),
+        };
+        backend
+            .compile()
+            .expect("two_sse calibrated backend should compile");
+    }
+}
+
+#[test]
+fn two_all_sse_profile_calibrates_root_and_each_expert() {
+    let v = load_example("two_all_sse.json");
+    assert_eq!(v["base"]["kind"], "mixture");
+    assert_eq!(v["base"]["spec"]["kind"], "neural");
+    assert_eq!(v["context"], "textrepeat");
+
+    let experts = v["base"]["spec"]["experts"]
+        .as_array()
+        .expect("two_all_sse.json must contain mixture experts");
+    assert_eq!(experts.len(), 5);
+    assert!(
+        experts.iter().all(|expert| expert["kind"] == "calibrated"),
+        "every two_all_sse expert should be individually calibrated"
+    );
+    assert!(
+        experts
+            .iter()
+            .all(|expert| expert["spec"]["context"] == "textrepeat")
+    );
+
+    #[cfg(all(
+        feature = "backend-calibrated",
+        feature = "backend-mixture",
+        feature = "backend-ctw",
+        feature = "backend-ppmd",
+        feature = "backend-rosa",
+        feature = "backend-match",
+        feature = "backend-rwkv"
+    ))]
+    {
+        let root = repo_root();
+        let path = root.join("configs").join("bench").join("two_all_sse.json");
+        let spec = infotheory::spec::load_calibrated_spec(
+            path.to_str().expect("two_all_sse path should be UTF-8"),
+        )
+        .expect("two_all_sse.json should load as a calibrated spec");
+        let backend = infotheory::api::RateBackend::Calibrated {
+            spec: std::sync::Arc::new(spec),
+        };
+        backend
+            .compile()
+            .expect("two_all_sse calibrated backend should compile");
+    }
+}
+
+#[test]
 fn extra_suite_includes_expected_uncovered_backends() {
     let v = load_example("extra.json");
     assert_eq!(v["kind"], "neural");

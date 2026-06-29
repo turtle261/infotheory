@@ -244,6 +244,7 @@ feature_gated_rate_pdf_predictor_builder! {
         Ok(crate::compression::RatePdfPredictor::Calibrated {
             base: Box::new(build_rate_pdf_predictor_via_kernel(&base_backend)?),
             core: CalibratorCore::new(*context, *bins, *learning_rate, *bias_clip),
+            bitwise: Default::default(),
             pdf: vec![1.0 / 256.0; 256],
             valid: false,
         })

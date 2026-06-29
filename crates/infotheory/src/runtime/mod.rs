@@ -2275,39 +2275,37 @@ pub(crate) fn mixture_supports_reversible_bit_updates(
 pub(crate) fn calibrated_supports_native_bit_prediction(
     plan: &crate::spec::core::RateBackendPlan,
 ) -> bool {
-    let crate::spec::core::RateBackendPlan::Calibrated { base, .. } = plan else {
+    let crate::spec::core::RateBackendPlan::Calibrated { .. } = plan else {
         unreachable!()
     };
-    (crate::runtime::rate_backend_kernel(base.kind()).supports_native_bit_prediction)(base)
+    false
 }
 
 pub(crate) fn calibrated_supports_byte_prefix_mass(
     plan: &crate::spec::core::RateBackendPlan,
 ) -> bool {
-    let crate::spec::core::RateBackendPlan::Calibrated { base, .. } = plan else {
+    let crate::spec::core::RateBackendPlan::Calibrated { .. } = plan else {
         unreachable!()
     };
-    (crate::runtime::rate_backend_kernel(base.kind()).supports_byte_prefix_mass)(base)
+    true
 }
 
 pub(crate) fn calibrated_supports_efficient_byte_packed_bit_sessions(
     plan: &crate::spec::core::RateBackendPlan,
 ) -> bool {
-    let crate::spec::core::RateBackendPlan::Calibrated { base, .. } = plan else {
+    let crate::spec::core::RateBackendPlan::Calibrated { .. } = plan else {
         unreachable!()
     };
-    (crate::runtime::rate_backend_kernel(base.kind()).supports_efficient_byte_packed_bit_sessions)(
-        base,
-    )
+    true
 }
 
 pub(crate) fn calibrated_supports_reversible_bit_updates(
     plan: &crate::spec::core::RateBackendPlan,
 ) -> bool {
-    let crate::spec::core::RateBackendPlan::Calibrated { base, .. } = plan else {
+    let crate::spec::core::RateBackendPlan::Calibrated { .. } = plan else {
         unreachable!()
     };
-    (crate::runtime::rate_backend_kernel(base.kind()).supports_reversible_bit_updates)(base)
+    false
 }
 
 #[cfg(test)]

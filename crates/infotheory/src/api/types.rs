@@ -330,49 +330,49 @@ pub enum CalibrationContextKind {
     TextRepeat,
 }
 
-/// Configuration for a calibrated wrapper rate backend.
+/// Configuration for an SSE-calibrated wrapper rate backend.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct CalibratedSpec {
-    /// Base backend whose PDF is calibrated.
+    /// Base backend whose bit probabilities are calibrated.
     pub base: RateBackend,
-    /// Context family controlling table row selection.
+    /// Context family controlling SSE table row selection.
     pub context: CalibrationContextKind,
-    /// Number of probability bins per row.
+    /// Stretched-probability bins per row.
     pub bins: usize,
-    /// Online learning rate for observed-symbol updates.
+    /// Initial online learning fraction for observed-bit updates.
     pub learning_rate: f64,
-    /// Symmetric clip applied to calibration weights.
+    /// Symmetric stretched-logit clip used by SSE quantization.
     pub bias_clip: f64,
 }
 
 impl CalibratedSpec {
-    /// Create a new calibrated spec with default parameters.
+    /// Create a new SSE-calibrated spec with PAQ/ZPAQ-style defaults.
     pub fn new(base: RateBackend, context: CalibrationContextKind) -> Self {
         Self {
             base,
             context,
-            bins: 33,
-            learning_rate: 0.02,
-            bias_clip: 4.0,
+            bins: 32,
+            learning_rate: 1.0 / 32.0,
+            bias_clip: 16.0,
         }
     }
 
-    /// Override the per-row bin count.
+    /// Override the per-row SSE bin count.
     #[must_use]
     pub fn with_bins(mut self, bins: usize) -> Self {
         self.bins = bins;
         self
     }
 
-    /// Override the online learning rate.
+    /// Override the initial online learning fraction.
     #[must_use]
     pub fn with_learning_rate(mut self, learning_rate: f64) -> Self {
         self.learning_rate = learning_rate;
         self
     }
 
-    /// Override the symmetric bias clip.
+    /// Override the symmetric stretched-logit clip.
     #[must_use]
     pub fn with_bias_clip(mut self, bias_clip: f64) -> Self {
         self.bias_clip = bias_clip;

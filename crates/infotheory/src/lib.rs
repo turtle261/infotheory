@@ -130,6 +130,7 @@ pub mod api;
 pub mod axioms;
 /// Entropy/compression backend implementations and backend discovery.
 pub mod backends;
+pub(crate) mod byte_prefix;
 /// Entropy coder implementations (AC and rANS).
 pub mod coders;
 /// Rate-coded compression helpers built on generic rate backends.

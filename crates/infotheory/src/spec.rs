@@ -1553,9 +1553,9 @@ pub fn parse_calibrated_spec_value(
     Ok(CalibratedSpec {
         base: base_backend,
         context: parse_calibration_context_kind(v["context"].as_str())?,
-        bins: v["bins"].as_u64().unwrap_or(33) as usize,
-        learning_rate: v["learning_rate"].as_f64().unwrap_or(0.02),
-        bias_clip: v["bias_clip"].as_f64().unwrap_or(4.0),
+        bins: v["bins"].as_u64().unwrap_or(32) as usize,
+        learning_rate: v["learning_rate"].as_f64().unwrap_or(1.0 / 32.0),
+        bias_clip: v["bias_clip"].as_f64().unwrap_or(16.0),
     })
 }
 
@@ -1713,7 +1713,7 @@ pub fn load_calibrated_spec(path: &str) -> SpecResult<CalibratedSpec> {
         ))
     })?;
     let base_dir = full.parent().unwrap_or_else(|| Path::new("."));
-    parse_calibrated_spec_value(&value, base_dir, 4)
+    parse_calibrated_spec_value(&value, base_dir, MAX_MIXTURE_NESTING)
 }
 
 /// Load a single expert spec from disk.

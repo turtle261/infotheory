@@ -41,6 +41,9 @@ use crate::backends::sparse_match::SparseMatchModel;
 use crate::backends::text_context::TextContextAnalyzer;
 #[cfg(feature = "backend-zpaq")]
 use crate::backends::zpaq_rate::ZpaqRateModel;
+use crate::byte_prefix::{
+    BytePrefixCdf, MsbPrefixRange, fill_prefix_cdf_from_log_probs, zeroed_prefix_cdf_box,
+};
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip;
 use crate::neural_mix::{NeuralHistoryState, NeuralMixCore};
@@ -223,10 +226,12 @@ fn normalized_expert_prior_weights(experts: &[ExpertState]) -> Vec<f64> {
 #[inline]
 fn reset_calibrated_wrapper_state(
     core: &mut CalibratorCore,
+    bitwise: &mut BytePrefixStepState,
     pdf: &mut [f64; 256],
     valid: &mut bool,
 ) {
     core.reset_context();
+    *bitwise = BytePrefixStepState::new();
     pdf.fill(1.0 / 256.0);
     *valid = false;
 }
@@ -241,7 +246,7 @@ fn set_log_weights_from_linear(experts: &mut [ExpertState], weights: &[f64]) {
     }
 }
 
-/// Trait for online byte-level predictors that expose per-symbol log-probabilities.
+/// Trait-object cloning companion for [`OnlineBytePredictor`].
 pub trait OnlineBytePredictorClone {
     /// Clone this predictor as a trait object.
     ///
@@ -476,51 +481,62 @@ fn validate_native_msb_prefix_finish(next_bit_idx: usize) -> Result<(), String> 
 }
 
 #[derive(Clone)]
-enum BytePrefixStepState {
+#[doc(hidden)]
+pub struct BytePrefixStepState {
+    kind: BytePrefixStepStateKind,
+}
+
+#[derive(Clone)]
+enum BytePrefixStepStateKind {
     Native,
     PdfPrefix {
-        cdf: Box<[f64; 257]>,
-        lo: usize,
-        hi: usize,
+        cdf: Box<BytePrefixCdf>,
+        range: MsbPrefixRange,
     },
+}
+
+impl Default for BytePrefixStepStateKind {
+    fn default() -> Self {
+        Self::PdfPrefix {
+            cdf: zeroed_prefix_cdf_box(),
+            range: MsbPrefixRange::FULL,
+        }
+    }
 }
 
 impl Default for BytePrefixStepState {
     fn default() -> Self {
-        Self::PdfPrefix {
-            cdf: Box::new([0.0; 257]),
-            lo: 0,
-            hi: 256,
+        Self {
+            kind: BytePrefixStepStateKind::default(),
         }
     }
 }
 
 impl BytePrefixStepState {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn is_native(&self) -> bool {
+        matches!(self.kind, BytePrefixStepStateKind::Native)
+    }
+
     fn prepare(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
         if predictor.begin_native_msb_byte_prefix()? {
-            *self = Self::Native;
+            self.kind = BytePrefixStepStateKind::Native;
             return Ok(());
         }
 
-        let mut cdf = match std::mem::take(self) {
-            Self::PdfPrefix { cdf, .. } => cdf,
-            Self::Native => Box::new([0.0; 257]),
+        let mut cdf = match std::mem::take(&mut self.kind) {
+            BytePrefixStepStateKind::PdfPrefix { cdf, .. } => cdf,
+            BytePrefixStepStateKind::Native => zeroed_prefix_cdf_box(),
         };
         let mut logps = [0.0f64; 256];
         predictor.fill_log_probs(&mut logps);
-        cdf[0] = 0.0;
-        for (idx, &lp) in logps.iter().enumerate() {
-            cdf[idx + 1] = cdf[idx] + clamp_prob(lp.exp(), DEFAULT_MIN_PROB);
-        }
-        if !cdf[256].is_finite() || cdf[256] <= 0.0 {
-            for (idx, slot) in cdf.iter_mut().enumerate() {
-                *slot = (idx as f64) / 256.0;
-            }
-        }
-        *self = Self::PdfPrefix {
+        fill_prefix_cdf_from_log_probs(&mut cdf, &logps, DEFAULT_MIN_PROB);
+        self.kind = BytePrefixStepStateKind::PdfPrefix {
             cdf,
-            lo: 0,
-            hi: 256,
+            range: MsbPrefixRange::FULL,
         };
         Ok(())
     }
@@ -530,13 +546,10 @@ impl BytePrefixStepState {
         predictor: &mut dyn OnlineBytePredictor,
         bit_idx: usize,
     ) -> Result<f64, String> {
-        match self {
-            Self::Native => predictor.native_msb_prefix_prob_one(bit_idx),
-            Self::PdfPrefix { cdf, lo, hi } => {
-                let mid: usize = (*lo + *hi) >> 1;
-                let total: f64 = (cdf[*hi] - cdf[*lo]).max(DEFAULT_MIN_PROB);
-                let one: f64 = (cdf[*hi] - cdf[mid]).max(0.0);
-                Ok((one / total).clamp(DEFAULT_MIN_PROB, 1.0 - DEFAULT_MIN_PROB))
+        match &mut self.kind {
+            BytePrefixStepStateKind::Native => predictor.native_msb_prefix_prob_one(bit_idx),
+            BytePrefixStepStateKind::PdfPrefix { cdf, range } => {
+                Ok(range.prob_one(cdf.as_ref(), DEFAULT_MIN_PROB))
             }
         }
     }
@@ -547,29 +560,26 @@ impl BytePrefixStepState {
         bit_idx: usize,
         bit: bool,
     ) -> Result<(), String> {
-        match self {
-            Self::Native => predictor.observe_native_msb_prefix_bit(bit_idx, bit),
-            Self::PdfPrefix { lo, hi, .. } => {
-                let mid: usize = (*lo + *hi) >> 1;
-                if bit {
-                    *lo = mid;
-                } else {
-                    *hi = mid;
-                }
+        match &mut self.kind {
+            BytePrefixStepStateKind::Native => {
+                predictor.observe_native_msb_prefix_bit(bit_idx, bit)
+            }
+            BytePrefixStepStateKind::PdfPrefix { range, .. } => {
+                range.observe(bit);
                 Ok(())
             }
         }
     }
 
     fn abort_empty(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
-        match self {
-            Self::Native => {
+        match &mut self.kind {
+            BytePrefixStepStateKind::Native => {
                 predictor.abort_empty_native_msb_byte_prefix()?;
-                *self = Self::default();
+                *self = Self::new();
                 Ok(())
             }
-            Self::PdfPrefix { .. } => {
-                *self = Self::default();
+            BytePrefixStepStateKind::PdfPrefix { .. } => {
+                *self = Self::new();
                 Ok(())
             }
         }
@@ -580,9 +590,9 @@ impl BytePrefixStepState {
         predictor: &mut dyn OnlineBytePredictor,
         symbol: u8,
     ) -> Result<(), String> {
-        match self {
-            Self::Native => predictor.finish_native_msb_byte_prefix(symbol),
-            Self::PdfPrefix { .. } => {
+        match &mut self.kind {
+            BytePrefixStepStateKind::Native => predictor.finish_native_msb_byte_prefix(symbol),
+            BytePrefixStepStateKind::PdfPrefix { .. } => {
                 predictor.update(symbol);
                 Ok(())
             }
@@ -657,7 +667,7 @@ impl MixtureBitPrefixState {
             });
         }
 
-        self.states.resize_with(n, BytePrefixStepState::default);
+        self.states.resize_with(n, BytePrefixStepState::new);
         self.weights.clear();
         self.weights.extend(weights.iter().copied());
         normalize_simplex_weights(&mut self.weights);
@@ -958,6 +968,8 @@ pub enum RateBackendPredictor {
         base: Box<RateBackendPredictor>,
         /// Online calibrator state and context features.
         core: CalibratorCore,
+        /// Reused byte-prefix state for the wrapped predictor.
+        bitwise: BytePrefixStepState,
         /// Cached calibrated PDF.
         pdf: [f64; 256],
         /// Whether `pdf` currently matches wrapped state.
@@ -1015,6 +1027,16 @@ pub enum RateBackendPredictorCheckpoint {
     /// Composite checkpoint for calibrated predictors.
     #[cfg(feature = "backend-calibrated")]
     Calibrated(Box<CalibratedPredictorCheckpoint>),
+    /// Lightweight calibrated byte-prefix start checkpoint.
+    #[cfg(feature = "backend-calibrated")]
+    CalibratedNativePrefixStart {
+        /// Wrapped predictor checkpoint only; the SSE core uses its bounded
+        /// active-byte undo log instead of cloning the full calibrated table.
+        base: Box<RateBackendPredictorCheckpoint>,
+        /// Whether the wrapped predictor itself had entered a native prefix
+        /// session when the checkpoint was taken.
+        base_prefix_active: bool,
+    },
     /// Composite checkpoint for mixture predictors.
     #[cfg(feature = "backend-mixture")]
     Mixture(Box<MixtureRuntimeCheckpoint>),
@@ -1058,10 +1080,14 @@ pub enum RosaPredictorUndo {
 /// Internal checkpoint payload for [`RateBackendPredictor::Calibrated`].
 ///
 /// This stores wrapped predictor state plus calibrator caches so temporary
-/// lookahead scoring can rollback without rebuilding runtime objects.
+/// lookahead scoring can rollback without rebuilding runtime objects. The
+/// learned SSE table is shared copy-on-write, so read-only lookahead and
+/// checkpoint capture avoid multi-megabyte table copies while exact rollback is
+/// preserved if later training mutates the table.
 pub struct CalibratedPredictorCheckpoint {
     base: Box<RateBackendPredictorCheckpoint>,
     core: CalibratorCore,
+    bitwise: BytePrefixStepState,
     pdf: [f64; 256],
     valid: bool,
 }
@@ -1097,6 +1123,7 @@ enum RateBackendPredictorLifecycleCheckpoint {
 struct CalibratedPredictorLifecycleCheckpoint {
     base: Box<RateBackendPredictorLifecycleCheckpoint>,
     core: CalibratorCore,
+    bitwise: BytePrefixStepState,
     pdf: [f64; 256],
     valid: bool,
 }
@@ -1354,6 +1381,7 @@ impl RateBackendPredictor {
             RateBackendPredictor::Calibrated {
                 base,
                 core,
+                bitwise,
                 pdf,
                 valid,
                 ..
@@ -1361,6 +1389,7 @@ impl RateBackendPredictor {
                 CalibratedPredictorLifecycleCheckpoint {
                     base: Box::new(base.lifecycle_checkpoint(op)),
                     core: core.clone(),
+                    bitwise: bitwise.clone(),
                     pdf: *pdf,
                     valid: *valid,
                 },
@@ -1446,6 +1475,7 @@ impl RateBackendPredictor {
                 RateBackendPredictor::Calibrated {
                     base,
                     core,
+                    bitwise,
                     pdf,
                     valid,
                     ..
@@ -1454,6 +1484,7 @@ impl RateBackendPredictor {
             ) => {
                 base.restore_lifecycle_checkpoint(op, *checkpoint.base);
                 *core = checkpoint.core;
+                *bitwise = checkpoint.bitwise;
                 *pdf = checkpoint.pdf;
                 *valid = checkpoint.valid;
             }
@@ -1619,6 +1650,7 @@ impl RateBackendPredictor {
             RateBackendPredictor::Calibrated {
                 base,
                 core,
+                bitwise,
                 pdf,
                 valid,
                 ..
@@ -1626,6 +1658,7 @@ impl RateBackendPredictor {
                 CalibratedPredictorCheckpoint {
                     base: Box::new(base.checkpoint()),
                     core: core.clone(),
+                    bitwise: bitwise.clone(),
                     pdf: *pdf,
                     valid: *valid,
                 },
@@ -1637,6 +1670,24 @@ impl RateBackendPredictor {
                 .unwrap_or_else(|| RateBackendPredictorCheckpoint::Full(Box::new(self.clone()))),
             _ => RateBackendPredictorCheckpoint::Full(Box::new(self.clone())),
         }
+    }
+
+    pub(crate) fn native_prefix_start_checkpoint(&mut self) -> RateBackendPredictorCheckpoint {
+        #[cfg(feature = "backend-calibrated")]
+        if let RateBackendPredictor::Calibrated {
+            base,
+            core,
+            bitwise,
+            ..
+        } = self
+        {
+            return RateBackendPredictorCheckpoint::CalibratedNativePrefixStart {
+                base: Box::new(base.checkpoint()),
+                base_prefix_active: core.byte_is_active() && bitwise.is_native(),
+            };
+        }
+
+        self.checkpoint()
     }
 
     pub(crate) fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
@@ -1673,7 +1724,82 @@ impl RateBackendPredictor {
             RateBackendPredictor::Mixture { runtime } => {
                 runtime.abort_empty_native_msb_byte_prefix()
             }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                bitwise,
+                ..
+            } => {
+                if !core.byte_is_active() {
+                    return Ok(false);
+                }
+                core.validate_empty_byte()?;
+                bitwise.abort_empty(base.as_mut())?;
+                core.abort_empty_byte()?;
+                Ok(true)
+            }
             _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn abandon_incomplete_native_msb_byte_prefix_for_lifecycle(
+        &mut self,
+    ) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                native_prefix_progress,
+                ..
+            }
+            | RateBackendPredictor::FacCtw {
+                native_prefix_progress,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                Ok(())
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                let _ = runtime.abort_empty_native_msb_byte_prefix();
+                Ok(())
+            }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                core.rollback_incomplete_byte()?;
+                *bitwise = BytePrefixStepState::new();
+                *valid = false;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn condition_native_msb_prefix_bit_for_rollback(
+        &mut self,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                core.condition_prefix_bit_for_rollback(bit_idx, bit)?;
+                bitwise.observe(base.as_mut(), bit_idx, bit)?;
+                *valid = false;
+                Ok(())
+            }
+            _ => <Self as OnlineBytePredictor>::observe_native_msb_prefix_bit(self, bit_idx, bit),
         }
     }
 
@@ -1751,6 +1877,7 @@ impl RateBackendPredictor {
                 RateBackendPredictor::Calibrated {
                     base,
                     core,
+                    bitwise,
                     pdf,
                     valid,
                     ..
@@ -1759,8 +1886,36 @@ impl RateBackendPredictor {
             ) => {
                 base.restore_checkpoint(&ck.base);
                 *core = ck.core.clone();
+                *bitwise = ck.bitwise.clone();
                 *pdf = ck.pdf;
                 *valid = ck.valid;
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (
+                RateBackendPredictor::Calibrated {
+                    base,
+                    core,
+                    bitwise,
+                    valid,
+                    ..
+                },
+                RateBackendPredictorCheckpoint::CalibratedNativePrefixStart {
+                    base: checkpoint_base,
+                    base_prefix_active,
+                },
+            ) => {
+                core.rollback_incomplete_byte().unwrap_or_else(|err| {
+                    panic!("calibrated native-prefix start restore failed: {err}")
+                });
+                *bitwise = BytePrefixStepState::new();
+                *valid = false;
+                base.restore_checkpoint(checkpoint_base);
+                if *base_prefix_active {
+                    base.abort_empty_native_msb_byte_prefix()
+                        .unwrap_or_else(|err| {
+                            panic!("calibrated base native-prefix abort failed: {err}")
+                        });
+                }
             }
             #[cfg(feature = "backend-mixture")]
             (
@@ -1786,6 +1941,10 @@ impl RateBackendPredictor {
             }
             #[cfg(feature = "backend-calibrated")]
             (_, RateBackendPredictorCheckpoint::Calibrated(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (_, RateBackendPredictorCheckpoint::CalibratedNativePrefixStart { .. }) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
             }
             #[cfg(feature = "backend-mixture")]
@@ -1887,6 +2046,16 @@ impl RateBackendPredictor {
             ) => {
                 base.discard_checkpoint(*checkpoint.base);
             }
+            #[cfg(feature = "backend-calibrated")]
+            (
+                RateBackendPredictor::Calibrated { base, .. },
+                RateBackendPredictorCheckpoint::CalibratedNativePrefixStart {
+                    base: checkpoint_base,
+                    ..
+                },
+            ) => {
+                base.discard_checkpoint(*checkpoint_base);
+            }
             #[cfg(feature = "backend-mixture")]
             (
                 RateBackendPredictor::Mixture { runtime },
@@ -1909,6 +2078,10 @@ impl RateBackendPredictor {
             }
             #[cfg(feature = "backend-calibrated")]
             (_, RateBackendPredictorCheckpoint::Calibrated(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-calibrated")]
+            (_, RateBackendPredictorCheckpoint::CalibratedNativePrefixStart { .. }) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
             }
             #[cfg(feature = "backend-mixture")]
@@ -1944,12 +2117,13 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Calibrated {
                 base,
                 core,
+                bitwise,
                 pdf,
                 valid,
                 ..
             } => {
                 base.begin_fresh_stream(total_symbols)?;
-                reset_calibrated_wrapper_state(core, pdf, valid);
+                reset_calibrated_wrapper_state(core, bitwise, pdf, valid);
                 Ok(())
             }
             _ => {
@@ -2034,7 +2208,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.begin_stream(total_symbols),
             #[cfg(feature = "backend-calibrated")]
-            RateBackendPredictor::Calibrated { base, .. } => base.begin_stream(total_symbols),
+            RateBackendPredictor::Calibrated {
+                base,
+                bitwise,
+                valid,
+                ..
+            } => {
+                *bitwise = BytePrefixStepState::new();
+                *valid = false;
+                base.begin_stream(total_symbols)
+            }
             RateBackendPredictor::Disabled { reason } => Err(reason.clone()),
         }
     }
@@ -2085,7 +2268,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.finish_stream(),
             #[cfg(feature = "backend-calibrated")]
-            RateBackendPredictor::Calibrated { base, .. } => base.finish_stream(),
+            RateBackendPredictor::Calibrated {
+                base,
+                bitwise,
+                valid,
+                ..
+            } => {
+                *bitwise = BytePrefixStepState::new();
+                *valid = false;
+                base.finish_stream()
+            }
             RateBackendPredictor::Disabled { .. } => Ok(()),
         }
     }
@@ -2222,6 +2414,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Calibrated {
                 base,
                 core,
+                bitwise: _,
                 pdf,
                 valid,
                 min_prob,
@@ -2364,6 +2557,7 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Calibrated {
                 base,
                 core,
+                bitwise: _,
                 pdf,
                 valid,
                 min_prob,
@@ -2400,6 +2594,8 @@ impl OnlineBytePredictor for RateBackendPredictor {
             } => *bits_per_symbol == 8 && *msb_first,
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.has_native_msb_byte_prefix(),
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated { .. } => true,
             _ => false,
         }
     }
@@ -2446,6 +2642,22 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.begin_native_msb_byte_prefix(),
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                core.begin_byte()?;
+                if let Err(err) = bitwise.prepare(base.as_mut()) {
+                    let _ = core.abort_empty_byte();
+                    return Err(err);
+                }
+                *valid = false;
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -2487,6 +2699,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => {
                 runtime.native_msb_prefix_prob_one(bit_idx)
+            }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                bitwise,
+                ..
+            } => {
+                let base_p1: f64 = bitwise.prob_one(base.as_mut(), bit_idx)?;
+                core.predict_bit(bit_idx, base_p1)
             }
             _ => Err("native MSB-first byte-prefix prediction is unavailable".to_string()),
         }
@@ -2536,6 +2758,20 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Mixture { runtime } => {
                 runtime.observe_native_msb_prefix_bit(bit_idx, bit)
             }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                let base_p1: f64 = bitwise.prob_one(base.as_mut(), bit_idx)?;
+                core.observe_bit_from_base(bit_idx, base_p1, bit)?;
+                bitwise.observe(base.as_mut(), bit_idx, bit)?;
+                *valid = false;
+                Ok(())
+            }
             _ => Err("native MSB-first byte-prefix stepping is unavailable".to_string()),
         }
     }
@@ -2571,6 +2807,20 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => {
                 runtime.finish_native_msb_byte_prefix(symbol)
+            }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                core.validate_complete_byte()?;
+                bitwise.finish(base.as_mut(), symbol)?;
+                core.finish_byte()?;
+                *valid = false;
+                Ok(())
             }
             _ => Err("native MSB-first byte-prefix stepping is unavailable".to_string()),
         }
@@ -2721,20 +2971,20 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Calibrated {
                 base,
                 core,
-                pdf,
                 valid,
+                min_prob,
                 ..
             } => {
-                if !*valid {
-                    let mut base_logps = [0.0; 256];
-                    base.fill_log_probs(&mut base_logps);
-                    let mut base_pdf = [0.0; 256];
-                    for (dst, &lp) in base_pdf.iter_mut().zip(base_logps.iter()) {
-                        *dst = clamp_prob(lp.exp(), DEFAULT_MIN_PROB);
-                    }
-                    core.apply_pdf(&base_pdf, pdf);
+                let mut base_logps = [0.0; 256];
+                base.fill_log_probs(&mut base_logps);
+                let mut base_pdf = [0.0; 256];
+                for (dst, &lp) in base_pdf.iter_mut().zip(base_logps.iter()) {
+                    *dst = clamp_prob(lp.exp(), *min_prob);
                 }
-                core.update(symbol, pdf);
+                core.observe_symbol_from_base_pdf(symbol, &base_pdf)
+                    .unwrap_or_else(|err| {
+                        panic!("calibrated SSE byte update violated prefix protocol: {err}")
+                    });
                 base.update(symbol);
                 *valid = false;
             }
@@ -2946,12 +3196,13 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Calibrated {
                 base,
                 core,
+                bitwise,
                 pdf,
                 valid,
                 ..
             } => {
                 base.reset_frozen(total_symbols)?;
-                reset_calibrated_wrapper_state(core, pdf, valid);
+                reset_calibrated_wrapper_state(core, bitwise, pdf, valid);
                 Ok(())
             }
             RateBackendPredictor::Disabled { reason } => Err(reason.clone()),
@@ -3089,22 +3340,13 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Calibrated {
                 base,
                 core,
-                pdf,
+                bitwise,
                 valid,
                 ..
             } => {
-                if !*valid {
-                    let mut base_logps = [0.0; 256];
-                    base.fill_log_probs(&mut base_logps);
-                    let mut base_pdf = [0.0; 256];
-                    for (dst, &lp) in base_pdf.iter_mut().zip(base_logps.iter()) {
-                        *dst = clamp_prob(lp.exp(), DEFAULT_MIN_PROB);
-                    }
-                    core.apply_pdf(&base_pdf, pdf);
-                    *valid = true;
-                }
                 base.update_frozen(symbol);
                 core.update_context_only(symbol);
+                *bitwise = BytePrefixStepState::new();
                 *valid = false;
             }
             RateBackendPredictor::Disabled { .. } => {}
@@ -6274,7 +6516,7 @@ mod lifecycle_tests {
 #[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
-    use crate::api::CalibratedSpec;
+    use crate::api::{CalibratedSpec, CalibrationContextKind};
     use std::sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -6563,6 +6805,118 @@ mod tests {
             .finish_native_msb_byte_prefix(0b1000_0000)
             .expect_err("finish must require a complete byte");
         assert!(err.contains("requires 8 observed bits"));
+    }
+
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-ctw"))]
+    #[test]
+    fn calibrated_predictor_exposes_native_prefix_sse_updates() {
+        let backend = RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec::new(
+                RateBackend::Ctw { depth: 6 },
+                CalibrationContextKind::TextRepeat,
+            )),
+        };
+        let mut predictor = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
+        for &byte in b"calibrated predictor prefix history" {
+            predictor.update(byte);
+        }
+
+        assert!(predictor.has_native_msb_byte_prefix());
+        assert!(predictor.begin_native_msb_byte_prefix().expect("begin"));
+
+        let symbol = b'Z';
+        let mut logp = 0.0f64;
+        for bit_idx in 0..8usize {
+            let p1 = predictor
+                .native_msb_prefix_prob_one(bit_idx)
+                .expect("calibrated bit probability");
+            assert!(p1 > 0.0 && p1 < 1.0 && p1.is_finite(), "p1={p1}");
+            let bit = (symbol & (1u8 << (7 - bit_idx))) != 0;
+            let p_bit = if bit { p1 } else { 1.0 - p1 };
+            logp += p_bit.ln();
+            predictor
+                .observe_native_msb_prefix_bit(bit_idx, bit)
+                .expect("observe calibrated bit");
+        }
+        predictor
+            .finish_native_msb_byte_prefix(symbol)
+            .expect("finish calibrated prefix");
+        assert!(logp.is_finite());
+
+        let mut row = [0.0f64; 256];
+        predictor.fill_log_probs(&mut row);
+        let mass: f64 = row.iter().map(|lp| lp.exp()).sum();
+        assert!(
+            (mass - 1.0).abs() < 1e-9,
+            "calibrated byte distribution should normalize after bitwise update: {mass}"
+        );
+    }
+
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-match"))]
+    #[test]
+    fn calibrated_pdf_fallback_prefix_rejects_bad_lifecycle_without_resetting_adapter() {
+        let backend = RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec::new(
+                RateBackend::Match {
+                    hash_bits: 18,
+                    min_len: 3,
+                    max_len: 64,
+                    base_mix: 0.08,
+                    confidence_scale: 1.0,
+                },
+                CalibrationContextKind::ByteClass,
+            )),
+        };
+        let mut predictor = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
+
+        assert!(predictor.begin_native_msb_byte_prefix().expect("begin"));
+        let finish_err = predictor
+            .finish_native_msb_byte_prefix(0)
+            .expect_err("prefix finish before 8 bits must be rejected");
+        assert!(finish_err.contains("requires 8 observed bits, got 0"));
+        assert!(
+            predictor
+                .abort_empty_native_msb_byte_prefix()
+                .expect("empty abort after rejected finish"),
+            "empty abort should close the still-active session"
+        );
+
+        assert!(predictor.begin_native_msb_byte_prefix().expect("begin"));
+        predictor
+            .native_msb_prefix_prob_one(0)
+            .expect("predict first bit");
+        predictor
+            .observe_native_msb_prefix_bit(0, true)
+            .expect("observe first bit");
+        let abort_err = predictor
+            .abort_empty_native_msb_byte_prefix()
+            .expect_err("non-empty abort must be rejected before adapter reset");
+        assert!(abort_err.contains("got 1"));
+
+        match &predictor {
+            RateBackendPredictor::Calibrated { bitwise, .. } => match &bitwise.kind {
+                BytePrefixStepStateKind::PdfPrefix { range, .. } => {
+                    assert_eq!(range.lo(), 128);
+                    assert_eq!(range.hi(), 256);
+                }
+                BytePrefixStepStateKind::Native => {
+                    panic!("match-backed calibrated predictor should use PDF prefix fallback")
+                }
+            },
+            _ => panic!("expected calibrated predictor"),
+        }
+
+        for bit_idx in 1..8usize {
+            predictor
+                .native_msb_prefix_prob_one(bit_idx)
+                .expect("predict remaining bit");
+            predictor
+                .observe_native_msb_prefix_bit(bit_idx, false)
+                .expect("observe remaining bit");
+        }
+        predictor
+            .finish_native_msb_byte_prefix(0x80)
+            .expect("complete prefix should finish after rejected abort");
     }
 
     #[test]

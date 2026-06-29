@@ -1009,10 +1009,10 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         }
         .compile()
         .expect("compiled calibrated");
-        assert!(calibrated.capabilities().supports_native_bit_prediction);
+        assert!(!calibrated.capabilities().supports_native_bit_prediction);
         assert!(calibrated.capabilities().supports_byte_prefix_mass);
         assert!(calibrated.supports_efficient_byte_packed_bit_sessions());
-        assert!(calibrated.capabilities().supports_reversible_bit_updates);
+        assert!(!calibrated.capabilities().supports_reversible_bit_updates);
     }
 
     #[cfg(all(feature = "backend-calibrated", feature = "backend-zpaq"))]
@@ -1029,7 +1029,7 @@ fn api_surface_rate_backend_bit_capabilities_are_explicit() {
         .expect("compiled zpaq calibrated");
         assert!(!calibrated.capabilities().supports_native_bit_prediction);
         assert!(calibrated.capabilities().supports_byte_prefix_mass);
-        assert!(!calibrated.supports_efficient_byte_packed_bit_sessions());
+        assert!(calibrated.supports_efficient_byte_packed_bit_sessions());
         assert!(!calibrated.capabilities().supports_reversible_bit_updates);
     }
 

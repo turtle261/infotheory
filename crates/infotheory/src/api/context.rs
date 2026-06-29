@@ -253,6 +253,40 @@ impl RateBackendBitSession {
         }
     }
 
+    fn abandon_inflight_prefix_for_lifecycle_reset(&mut self) {
+        let Some(prefix) = self.prefix.take() else {
+            return;
+        };
+        match prefix.kind {
+            BufferedBytePrefixKind::Mass(_) => {}
+            BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: Some(checkpoint),
+                ..
+            } => {
+                self.restore_start_checkpoint_abort_and_discard(*checkpoint)
+                    .expect("native MSB prefix start checkpoint must be empty");
+            }
+            BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: None,
+                bits: 0,
+                ..
+            } => {
+                self.predictor
+                    .abort_empty_native_msb_byte_prefix()
+                    .expect("empty native MSB prefix abort must succeed");
+            }
+            BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: None,
+                bits: _,
+                ..
+            } => {
+                self.predictor
+                    .abandon_incomplete_native_msb_byte_prefix_for_lifecycle()
+                    .expect("native MSB prefix lifecycle abandonment must succeed");
+            }
+        }
+    }
+
     /// Make clearing checkpoint journals preserve the byte-prefix invariant:
     /// `NativeMsb` session state exists only while the predictor has an active
     /// native MSB prefix. Partial native prefixes are downgraded to the generic
@@ -510,7 +544,7 @@ impl RateBackendBitSession {
                 self.predictor.discard_checkpoint(restored_state);
                 return Err(InfotheoryError::runtime(err));
             }
-            let fresh_start = self.predictor.checkpoint();
+            let fresh_start = self.predictor.native_prefix_start_checkpoint();
             match self.predictor.begin_native_msb_byte_prefix() {
                 Ok(true) => {}
                 Ok(false) => {
@@ -625,7 +659,7 @@ impl RateBackendBitSession {
     pub fn reset_frozen(&mut self, total_bits: Option<u64>) -> InfotheoryResult<()> {
         let total_symbols = total_symbols_for_bit_semantics(total_bits, self.semantics)
             .map_err(InfotheoryError::runtime)?;
-        self.discard_inflight_prefix_checkpoint();
+        self.abandon_inflight_prefix_for_lifecycle_reset();
         self.predictor
             .reset_frozen(total_symbols)
             .map_err(InfotheoryError::runtime)
@@ -659,7 +693,7 @@ impl RateBackendBitSession {
         }
         if order == BitOrder::MsbFirst && self.predictor.has_native_msb_byte_prefix() {
             let checkpoint = if update_mode == BufferedByteUpdateMode::Frozen {
-                Some(self.predictor.checkpoint())
+                Some(self.predictor.native_prefix_start_checkpoint())
             } else {
                 None
             };
@@ -720,7 +754,7 @@ impl RateBackendBitSession {
         update_mode: BufferedByteUpdateMode,
     ) -> InfotheoryResult<()> {
         self.ensure_prefix_for_update(order, update_mode)?;
-        let needs_adaptive_prefix_checkpoint =
+        let needs_prefix_checkpoint =
             update_mode != BufferedByteUpdateMode::Adaptive || self.discardable_scopes == 0;
         let prefix = self.prefix.as_mut().expect("prefix initialized");
         prefix.record_mode(update_mode)?;
@@ -741,12 +775,20 @@ impl RateBackendBitSession {
                 symbol,
                 bits,
             } => {
-                if start_checkpoint.is_none() && *bits == 0 && needs_adaptive_prefix_checkpoint {
-                    *start_checkpoint = Some(Box::new(self.predictor.checkpoint()));
+                if start_checkpoint.is_none() && *bits == 0 && needs_prefix_checkpoint {
+                    *start_checkpoint =
+                        Some(Box::new(self.predictor.native_prefix_start_checkpoint()));
                 }
-                self.predictor
-                    .observe_native_msb_prefix_bit(*bits, bit)
-                    .map_err(InfotheoryError::runtime)?;
+                match update_mode {
+                    BufferedByteUpdateMode::Adaptive => self
+                        .predictor
+                        .observe_native_msb_prefix_bit(*bits, bit)
+                        .map_err(InfotheoryError::runtime)?,
+                    BufferedByteUpdateMode::Frozen => self
+                        .predictor
+                        .condition_native_msb_prefix_bit_for_rollback(*bits, bit)
+                        .map_err(InfotheoryError::runtime)?,
+                }
                 if bit {
                     *symbol |= 1u8 << (7 - *bits);
                 }
@@ -792,7 +834,7 @@ impl crate::prediction::OnlineBitPredictor for RateBackendBitSession {
             );
         }
         let total_symbols = total_symbols_for_bit_semantics(total_bits, self.semantics)?;
-        self.discard_inflight_prefix_checkpoint();
+        self.abandon_inflight_prefix_for_lifecycle_reset();
         self.predictor.begin_fresh_stream(total_symbols)
     }
 
@@ -1216,6 +1258,26 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-ctw"))]
+    fn buffered_native_prefix_has_calibrated_start_checkpoint(
+        session: &RateBackendBitSession,
+    ) -> Option<bool> {
+        match session.prefix.as_ref().map(|prefix| &prefix.kind) {
+            Some(BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: Some(checkpoint),
+                ..
+            }) => Some(matches!(
+                checkpoint.as_ref(),
+                crate::mixture::RateBackendPredictorCheckpoint::CalibratedNativePrefixStart { .. }
+            )),
+            Some(BufferedBytePrefixKind::NativeMsb {
+                start_checkpoint: None,
+                ..
+            }) => Some(false),
+            _ => None,
+        }
+    }
+
     #[cfg(feature = "backend-ctw")]
     fn new_ctw_byte_packed_session() -> RateBackendBitSession {
         RateBackendBitSession::from_spec(
@@ -1243,6 +1305,23 @@ mod tests {
             },
         )
         .expect("fac-ctw byte-packed session")
+    }
+
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-ctw"))]
+    fn new_calibrated_ctw_byte_packed_session() -> RateBackendBitSession {
+        RateBackendBitSession::from_spec(
+            RateBackend::Calibrated {
+                spec: std::sync::Arc::new(crate::api::CalibratedSpec::new(
+                    RateBackend::Ctw { depth: 4 },
+                    crate::api::CalibrationContextKind::TextRepeat,
+                )),
+            },
+            Some(8),
+            BitStreamSemantics::BytePacked {
+                order: BitOrder::MsbFirst,
+            },
+        )
+        .expect("calibrated ctw byte-packed session")
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -1450,6 +1529,56 @@ mod tests {
             "frozen native prefixes still need a start checkpoint to avoid learning action bytes",
         );
         assert_eq!(ctw_checkpoint_depth(&session), 1);
+    }
+
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-ctw"))]
+    #[test]
+    fn calibrated_native_prefix_supports_update_only_bits() {
+        let bits = [true, false, true, false, false, true, true, false];
+
+        let mut adaptive = new_calibrated_ctw_byte_packed_session();
+        for bit in bits {
+            adaptive
+                .try_observe_bit(bit)
+                .expect("adaptive calibrated update-only bit");
+        }
+        assert!(adaptive.prefix.is_none());
+        adaptive.finish().expect("finish adaptive calibrated byte");
+
+        let mut frozen = new_calibrated_ctw_byte_packed_session();
+        for bit in bits {
+            frozen
+                .try_condition_bit(bit)
+                .expect("frozen calibrated update-only bit");
+        }
+        assert!(frozen.prefix.is_none());
+        frozen.finish().expect("finish frozen calibrated byte");
+    }
+
+    #[cfg(all(feature = "backend-calibrated", feature = "backend-ctw"))]
+    #[test]
+    fn calibrated_adaptive_prefix_uses_lightweight_start_checkpoint() {
+        let mut session = new_calibrated_ctw_byte_packed_session();
+        session
+            .try_observe_bit(true)
+            .expect("adaptive calibrated prefix bit");
+        assert_eq!(buffered_native_prefix_bits(&session), Some(1));
+        assert_eq!(
+            buffered_native_prefix_has_calibrated_start_checkpoint(&session),
+            Some(true),
+            "calibrated adaptive prefixes must store only the wrapped predictor checkpoint"
+        );
+
+        session.reset_frozen(Some(8)).expect("reset frozen");
+        let mut fresh = new_calibrated_ctw_byte_packed_session();
+        let reset_prediction = session.predict_bit();
+        let fresh_prediction = fresh.predict_bit();
+        assert!(
+            (reset_prediction.p1 - fresh_prediction.p1).abs() <= 1e-12,
+            "abandoned calibrated prefix leaked into reset state: reset={} fresh={}",
+            reset_prediction.p1,
+            fresh_prediction.p1
+        );
     }
 
     #[cfg(feature = "backend-ctw")]
