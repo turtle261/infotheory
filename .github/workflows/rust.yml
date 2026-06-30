@@ -41,6 +41,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+          cache-targets: false
 
       - name: Rustfmt
         run: cargo fmt --all --check
