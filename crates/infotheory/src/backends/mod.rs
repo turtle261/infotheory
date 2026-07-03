@@ -5,6 +5,9 @@
 //! - feature-aware availability reporting,
 //! - exported lists of enabled backend families.
 
+/// Bit-native reservoir rate backend.
+#[cfg(feature = "backend-bit-reservoir")]
+pub mod bit_reservoir;
 /// Online probability calibration wrapper for rate predictors.
 #[cfg(feature = "backend-calibrated")]
 pub mod calibration;

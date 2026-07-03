@@ -609,6 +609,22 @@ fn encode_rate_backend(out: &mut Vec<u8>, backend: &RateBackend) {
             push_f64(out, spec.bias_clip);
             encode_rate_backend(out, &spec.base);
         }
+        #[cfg(feature = "backend-bit-reservoir")]
+        RateBackend::BitReservoir { config } => {
+            out.push(13);
+            push_u64(out, config.hidden as u64);
+            push_u64(out, config.delay_bits as u64);
+            push_u64(out, config.embedding_bits as u64);
+            push_f64(out, config.learning_rate);
+            push_f64(out, config.learning_rate_decay);
+            push_f64(out, config.weight_decay);
+            push_f64(out, config.state_decay);
+            push_f64(out, config.recurrent_scale);
+            push_f64(out, config.input_scale);
+            push_f64(out, config.phase_scale);
+            push_f64(out, config.grad_clip);
+            push_u64(out, config.seed);
+        }
     }
 }
 
@@ -705,6 +721,27 @@ fn decode_rate_backend(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<R
                 base: decode_rate_backend(cursor, base_dir)?,
             }),
         }),
+        #[cfg(feature = "backend-bit-reservoir")]
+        13 => Ok(RateBackend::BitReservoir {
+            config: crate::api::BitReservoirConfig {
+                hidden: cursor.read_u64()? as usize,
+                delay_bits: cursor.read_u64()? as usize,
+                embedding_bits: cursor.read_u64()? as usize,
+                learning_rate: cursor.read_f64()?,
+                learning_rate_decay: cursor.read_f64()?,
+                weight_decay: cursor.read_f64()?,
+                state_decay: cursor.read_f64()?,
+                recurrent_scale: cursor.read_f64()?,
+                input_scale: cursor.read_f64()?,
+                phase_scale: cursor.read_f64()?,
+                grad_clip: cursor.read_f64()?,
+                seed: cursor.read_u64()?,
+            },
+        }),
+        #[cfg(not(feature = "backend-bit-reservoir"))]
+        13 => Err(SpecError::new(
+            "binary bit-reservoir backend requires the 'backend-bit-reservoir' feature",
+        )),
         tag => Err(SpecError::new(format!("unknown rate backend tag '{tag}'"))),
     }
 }

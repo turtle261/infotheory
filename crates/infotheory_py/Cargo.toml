@@ -41,6 +41,7 @@ capability-statistical = [
 ]
 capability-neural = [
     "infotheory/capability-neural",
+    "backend-bit-reservoir",
     "backend-mamba",
     "backend-rwkv",
 ]
@@ -66,6 +67,7 @@ backend-sequitur = ["infotheory/backend-sequitur"]
 backend-mixture = ["infotheory/backend-mixture"]
 backend-particle = ["infotheory/backend-particle"]
 backend-calibrated = ["infotheory/backend-calibrated"]
+backend-bit-reservoir = ["infotheory/backend-bit-reservoir"]
 backend-mamba = ["infotheory/backend-mamba"]
 backend-rwkv = ["infotheory/backend-rwkv"]
 backend-zpaq = ["infotheory/backend-zpaq"]

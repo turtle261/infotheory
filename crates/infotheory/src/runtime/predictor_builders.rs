@@ -8,6 +8,7 @@
     feature = "backend-mixture",
     feature = "backend-particle",
     feature = "backend-calibrated",
+    feature = "backend-bit-reservoir",
     feature = "backend-mamba",
     feature = "backend-rwkv"
 ))]
@@ -213,6 +214,42 @@ feature_gated_rate_predictor_builder! {
             checkpoint_journal: Vec::new(),
             checkpoint_depth: 0,
             native_prefix_progress: None,
+        })
+    }
+}
+
+feature_gated_rate_predictor_builder! {
+    feature: "backend-bit-reservoir",
+    fn build_predictor_bit_reservoir(backend, min_prob) {
+        expect_plan_ref!(
+            backend.plan(),
+            crate::spec::core::RateBackendPlan::BitReservoir { config },
+            "bit-reservoir kernel used with non-bit-reservoir plan"
+        );
+        Ok(crate::mixture::RateBackendPredictor::BitReservoir {
+            model: BitReservoirModel::new(config.clone())?,
+            symbol_mode: crate::mixture::BitReservoirSymbolMode::Byte,
+            min_prob,
+            native_prefix_progress: None,
+            native_prediction: None,
+        })
+    }
+}
+
+feature_gated_rate_predictor_builder! {
+    feature: "backend-bit-reservoir",
+    fn build_predictor_binary_tokens_bit_reservoir(backend, min_prob) {
+        expect_plan_ref!(
+            backend.plan(),
+            crate::spec::core::RateBackendPlan::BitReservoir { config },
+            "bit-reservoir binary-token kernel used with non-bit-reservoir plan"
+        );
+        Ok(crate::mixture::RateBackendPredictor::BitReservoir {
+            model: BitReservoirModel::new(config.clone())?,
+            symbol_mode: crate::mixture::BitReservoirSymbolMode::BitToken,
+            min_prob,
+            native_prefix_progress: None,
+            native_prediction: None,
         })
     }
 }

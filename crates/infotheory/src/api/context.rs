@@ -328,7 +328,12 @@ impl RateBackendBitSession {
                 }
 
                 let mut logps = [0.0f64; 256];
-                self.predictor.fill_log_probs(&mut logps);
+                match update_mode.unwrap_or(BufferedByteUpdateMode::Adaptive) {
+                    BufferedByteUpdateMode::Adaptive => self.predictor.fill_log_probs(&mut logps),
+                    BufferedByteUpdateMode::Frozen => {
+                        self.predictor.fill_log_probs_frozen(&mut logps);
+                    }
+                }
 
                 let mut mass = BytePrefixMass::from_log_probs(&logps, BitOrder::MsbFirst);
                 for bit_idx in 0..bits {
@@ -453,7 +458,7 @@ impl RateBackendBitSession {
                         )
                     });
                 }
-                self.ensure_mass_prefix(order);
+                self.ensure_mass_prefix(order, BufferedByteUpdateMode::Adaptive);
                 let native_bits = match &self.prefix.as_ref().expect("prefix initialized").kind {
                     BufferedBytePrefixKind::Mass(mass) => return mass.prediction(),
                     BufferedBytePrefixKind::NativeMsb { bits, .. } => *bits,
@@ -495,7 +500,7 @@ impl RateBackendBitSession {
         }
     }
 
-    #[cfg(any(feature = "aixi", test))]
+    #[cfg(any(feature = "aixi", all(test, feature = "backend-ctw")))]
     pub(crate) fn begin_discardable_scope(&mut self) {
         self.discardable_scopes = self.discardable_scopes.saturating_add(1);
     }
@@ -703,7 +708,7 @@ impl RateBackendBitSession {
                 Err(err) => return Err(InfotheoryError::runtime(err)),
             }
         }
-        self.ensure_mass_prefix(order);
+        self.ensure_mass_prefix(order, update_mode);
         Ok(())
     }
 
@@ -736,12 +741,15 @@ impl RateBackendBitSession {
         }
     }
 
-    fn ensure_mass_prefix(&mut self, order: BitOrder) {
+    fn ensure_mass_prefix(&mut self, order: BitOrder, update_mode: BufferedByteUpdateMode) {
         if self.prefix.is_some() {
             return;
         }
         let mut logps = [0.0f64; 256];
-        self.predictor.fill_log_probs(&mut logps);
+        match update_mode {
+            BufferedByteUpdateMode::Adaptive => self.predictor.fill_log_probs(&mut logps),
+            BufferedByteUpdateMode::Frozen => self.predictor.fill_log_probs_frozen(&mut logps),
+        }
         self.prefix = Some(BufferedBytePrefix::new_mass(
             BytePrefixMass::from_log_probs(&logps, order),
         ));
@@ -932,10 +940,20 @@ impl RateBackendSession {
                 #[cfg(feature = "backend-rosa")]
                 crate::mixture::RateBackendPredictor::Rosa { .. } => {
                     for (sym, slot) in logps.iter_mut().enumerate() {
-                        *slot = self.predictor.log_prob(sym as u8);
+                        *slot = match config.update_mode {
+                            GenerationUpdateMode::Adaptive => self.predictor.log_prob(sym as u8),
+                            GenerationUpdateMode::Frozen => {
+                                self.predictor.log_prob_frozen(sym as u8)
+                            }
+                        };
                     }
                 }
-                _ => self.predictor.fill_log_probs(&mut logps),
+                _ => match config.update_mode {
+                    GenerationUpdateMode::Adaptive => self.predictor.fill_log_probs(&mut logps),
+                    GenerationUpdateMode::Frozen => {
+                        self.predictor.fill_log_probs_frozen(&mut logps);
+                    }
+                },
             }
             let byte = pick_generated_byte(&logps, config, &mut rng);
             match config.update_mode {

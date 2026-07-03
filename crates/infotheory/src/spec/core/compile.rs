@@ -151,6 +151,25 @@ pub(crate) fn compile_rate_plan_zpaq(
     }
 }
 
+#[cfg(feature = "backend-bit-reservoir")]
+pub(crate) fn compile_rate_plan_bit_reservoir(
+    backend: &RateBackend,
+    _env: &SpecEnvironment,
+    _depth: usize,
+) -> SpecResult<RateBackendPlan> {
+    match backend {
+        RateBackend::BitReservoir { config } => {
+            config
+                .validate()
+                .map_err(|err| SpecError::new(err.to_string()))?;
+            Ok(RateBackendPlan::BitReservoir {
+                config: config.clone(),
+            })
+        }
+        _ => unreachable!("bit-reservoir kernel used with non-bit-reservoir backend"),
+    }
+}
+
 #[cfg(feature = "backend-mamba")]
 pub(crate) fn compile_rate_plan_mamba(
     backend: &RateBackend,

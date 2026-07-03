@@ -27,8 +27,9 @@
 //!     optional RWKV7 compressor, and the rate-coded compressor wrapping
 //!     any rate backend). Rate backends are pluggable through
 //!     [`crate::api::RateBackend`] — CTW, FAC-CTW, ROSA+, PPMD, Sequitur,
-//!     contiguous and sparse local-match models, online RWKV7 and Mamba
-//!     neural backends, calibrated wrappers, particle-filter backends,
+//!     contiguous and sparse local-match models, a bit-native reservoir
+//!     backend, online RWKV7 and Mamba neural backends,
+//!     calibrated wrappers, particle-filter backends,
 //!     ZPAQ-as-rate, and arbitrary mixture / ensemble compositions
 //!     thereof — and are interchangeable wherever a `RateBackend` is
 //!     consumed.
@@ -177,6 +178,9 @@ use crate::api::{
     empirical_entropy_bytes, empirical_joint_entropy_bytes, js_div_bytes, nhd_bytes, tvd_bytes,
 };
 use crate::error::{InfotheoryError, InfotheoryResult};
+#[cfg(feature = "backend-bit-reservoir")]
+/// Bit-native reservoir rate backend.
+pub use backends::bit_reservoir;
 /// CTW and FAC-CTW backend types.
 #[cfg(feature = "backend-ctw")]
 pub use backends::ctw;
@@ -455,8 +459,7 @@ pub(crate) fn try_prequential_rate_backend(
     }
     let mut bits = 0.0;
     for &b in data {
-        bits -= predictor.log_prob(b) / std::f64::consts::LN_2;
-        predictor.update(b);
+        bits -= predictor.log_prob_update(b) / std::f64::consts::LN_2;
     }
     predictor.finish_stream().map_err(|e| {
         InfotheoryError::runtime(format!("rate backend stream finalize failed: {e}"))
@@ -550,7 +553,7 @@ pub(crate) fn try_frozen_plugin_rate_backend(
         })?;
     let mut bits = 0.0;
     for &byte in score_data {
-        bits -= predictor.log_prob(byte) / std::f64::consts::LN_2;
+        bits -= predictor.log_prob_frozen(byte) / std::f64::consts::LN_2;
         predictor.update_frozen(byte);
     }
     predictor.finish_stream().map_err(|e| {
@@ -1401,6 +1404,7 @@ mod tests {
         feature = "backend-mixture",
         feature = "backend-particle",
         feature = "backend-calibrated",
+        feature = "backend-bit-reservoir",
         feature = "backend-rwkv",
         feature = "backend-mamba"
     ))

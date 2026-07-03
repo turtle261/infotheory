@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "../src/tuner/feature_set.rs"]
+mod tuner_feature_set;
+
 const PLACEHOLDER_TASK_FINGERPRINT_HEX: &str =
     "1111111111111111111111111111111111111111111111111111111111111111";
 const PROBE_TASK_FINGERPRINT_HEX: &str =
@@ -112,7 +115,7 @@ fn interface() -> Value {
         "observation_stream_len": 1,
         "observation_key_mode": "full_stream",
         "reward_bits": 16,
-        "agent_actions": 2,
+        "agent_actions": 8,
     })
 }
 
@@ -302,7 +305,7 @@ fn write_teacher(path: &Path, task_fingerprint: TaskFingerprint, reward_cert_crc
             "schema_version": 1,
             "contract": {
                 "task_fingerprint": task_fingerprint.to_string(),
-                "action_alphabet_size": 2,
+                "action_alphabet_size": 8,
                 "observation_bits": 8,
                 "observation_stream_len": 1,
                 "observation_key_mode": "full_stream",
@@ -355,83 +358,7 @@ fn timing_certifies(timing: TimingCertificationTier) -> bool {
 }
 
 fn feature_set() -> Vec<&'static str> {
-    let mut features = Vec::new();
-    if cfg!(feature = "default-backends") {
-        features.push("default-backends");
-    }
-    if cfg!(feature = "capability-default") {
-        features.push("capability-default");
-    }
-    if cfg!(feature = "capability-statistical") {
-        features.push("capability-statistical");
-    }
-    if cfg!(feature = "capability-neural") {
-        features.push("capability-neural");
-    }
-    if cfg!(feature = "capability-archive") {
-        features.push("capability-archive");
-    }
-    if cfg!(feature = "capability-vm") {
-        features.push("capability-vm");
-    }
-    if cfg!(feature = "aixi") {
-        features.push("aixi");
-    }
-    if cfg!(feature = "tuner") {
-        features.push("tuner");
-    }
-    if cfg!(feature = "aixi-gameengine") {
-        features.push("aixi-gameengine");
-    }
-    if cfg!(feature = "aixi-gameengine-physics") {
-        features.push("aixi-gameengine-physics");
-    }
-    if cfg!(feature = "aixi-vm") {
-        features.push("aixi-vm");
-    }
-    if cfg!(feature = "all-backends") {
-        features.push("all-backends");
-    }
-    if cfg!(feature = "backend-rosa") {
-        features.push("backend-rosa");
-    }
-    if cfg!(feature = "backend-ctw") {
-        features.push("backend-ctw");
-    }
-    if cfg!(feature = "backend-match") {
-        features.push("backend-match");
-    }
-    if cfg!(feature = "backend-ppmd") {
-        features.push("backend-ppmd");
-    }
-    if cfg!(feature = "backend-sequitur") {
-        features.push("backend-sequitur");
-    }
-    if cfg!(feature = "backend-mixture") {
-        features.push("backend-mixture");
-    }
-    if cfg!(feature = "backend-particle") {
-        features.push("backend-particle");
-    }
-    if cfg!(feature = "backend-calibrated") {
-        features.push("backend-calibrated");
-    }
-    if cfg!(feature = "backend-mamba") {
-        features.push("backend-mamba");
-    }
-    if cfg!(feature = "backend-rwkv") {
-        features.push("backend-rwkv");
-    }
-    if cfg!(feature = "backend-zpaq") {
-        features.push("backend-zpaq");
-    }
-    if cfg!(feature = "cli") {
-        features.push("cli");
-    }
-    if cfg!(feature = "vm") {
-        features.push("vm");
-    }
-    features
+    tuner_feature_set::compiled_feature_set()
 }
 
 fn bounds_crc32() -> String {
@@ -636,7 +563,7 @@ fn common_certificate_with_runtime_profile_and_worker(
             worker_executable_override,
         ),
         "controller_kind": controller_kind,
-        "action_alphabet_size": 2,
+        "action_alphabet_size": 8,
     })
 }
 
@@ -3239,11 +3166,11 @@ fn run_tune_planner_controller_timing_matrix_reports_dispatch_and_claim_gating()
             );
             assert_eq!(
                 u64_at(&report, "/search/controller/compiled_action_count"),
-                2
+                8
             );
             assert_eq!(
                 u64_at(&report, "/search/controller/declared_agent_actions"),
-                2
+                8
             );
             assert_eq!(
                 str_at(&report, "/input_asset/dataset_kind"),

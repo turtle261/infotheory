@@ -22,6 +22,8 @@
 #[cfg(test)]
 use crate::api::MixtureSpec;
 use crate::api::{MixtureKind, MixtureScheduleMode, RateBackend};
+#[cfg(feature = "backend-bit-reservoir")]
+use crate::backends::bit_reservoir::{BitReservoirModel, BitReservoirPrediction};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
@@ -67,6 +69,58 @@ fn clamp_prob(p: f64, min_prob: f64) -> f64 {
 #[inline]
 fn clamp_unit_prob(p: f64, min_prob: f64) -> f64 {
     clamp_prob(p, min_prob).min(1.0 - min_prob)
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+/// Symbol interpretation used by the `bit-reservoir` predictor front-end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BitReservoirSymbolMode {
+    /// Public byte-symbol methods consume ordinary bytes through MSB bit steps.
+    Byte,
+    /// Public symbol methods consume literal binary tokens `0` and `1`.
+    BitToken,
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+#[inline]
+fn bit_reservoir_symbol_bit(symbol: u8) -> Option<bool> {
+    debug_assert!(
+        symbol <= 1,
+        "bit-reservoir binary-token predictor received non-binary symbol {symbol}"
+    );
+    match symbol {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+#[inline]
+fn bit_reservoir_log_prob_bit(model: &BitReservoirModel, bit: bool, min_prob: f64) -> f64 {
+    let p1 = model.predict_prob_one();
+    if bit {
+        clamp_unit_prob(p1, min_prob).ln()
+    } else {
+        clamp_unit_prob(1.0 - p1, min_prob).ln()
+    }
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+#[inline]
+fn bit_reservoir_log_prob_symbol(model: &BitReservoirModel, symbol: u8, min_prob: f64) -> f64 {
+    match bit_reservoir_symbol_bit(symbol) {
+        Some(bit) => bit_reservoir_log_prob_bit(model, bit, min_prob),
+        None => min_prob.ln(),
+    }
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+#[inline]
+fn bit_reservoir_observe_symbol(model: &mut BitReservoirModel, symbol: u8, learn: bool) {
+    if let Some(bit) = bit_reservoir_symbol_bit(symbol) {
+        model.observe_bit(bit, learn);
+    }
 }
 
 #[inline]
@@ -327,10 +381,27 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     /// Log-probability (natural log) of `symbol` given the current history.
     fn log_prob(&mut self, symbol: u8) -> f64;
 
+    /// Frozen log-probability (natural log) of `symbol` given the current history.
+    ///
+    /// Frozen prediction must match a subsequent [`Self::update_frozen`]:
+    /// fitted parameters/statistics are not changed while scoring candidate
+    /// symbols, though ordinary dynamic conditioning state may advance during
+    /// the paired frozen update.
+    fn log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        self.log_prob(symbol)
+    }
+
     /// Bulk 256-way log-probabilities for the next byte.
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         for (sym, slot) in out.iter_mut().enumerate() {
             *slot = self.log_prob(sym as u8);
+        }
+    }
+
+    /// Bulk frozen 256-way log-probabilities for the next byte.
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        for (sym, slot) in out.iter_mut().enumerate() {
+            *slot = self.log_prob_frozen(sym as u8);
         }
     }
 
@@ -455,7 +526,7 @@ enum OnlineBytePredictorLifecycleOp {
     FinishStream,
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(any(feature = "backend-ctw", feature = "backend-bit-reservoir"))]
 fn validate_native_msb_prefix_bit_idx(next_bit_idx: usize, bit_idx: usize) -> Result<(), String> {
     if bit_idx >= 8 {
         return Err(format!(
@@ -470,7 +541,7 @@ fn validate_native_msb_prefix_bit_idx(next_bit_idx: usize, bit_idx: usize) -> Re
     Ok(())
 }
 
-#[cfg(feature = "backend-ctw")]
+#[cfg(any(feature = "backend-ctw", feature = "backend-bit-reservoir"))]
 fn validate_native_msb_prefix_finish(next_bit_idx: usize) -> Result<(), String> {
     if next_bit_idx != 8 {
         return Err(format!(
@@ -480,7 +551,7 @@ fn validate_native_msb_prefix_finish(next_bit_idx: usize) -> Result<(), String> 
     Ok(())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 #[doc(hidden)]
 pub struct BytePrefixStepState {
     kind: BytePrefixStepStateKind,
@@ -500,14 +571,6 @@ impl Default for BytePrefixStepStateKind {
         Self::PdfPrefix {
             cdf: zeroed_prefix_cdf_box(),
             range: MsbPrefixRange::FULL,
-        }
-    }
-}
-
-impl Default for BytePrefixStepState {
-    fn default() -> Self {
-        Self {
-            kind: BytePrefixStepStateKind::default(),
         }
     }
 }
@@ -943,6 +1006,20 @@ pub enum RateBackendPredictor {
         /// Probability floor for numeric stability.
         min_prob: f64,
     },
+    /// Bit-native reservoir predictor.
+    #[cfg(feature = "backend-bit-reservoir")]
+    BitReservoir {
+        /// Bitwise reservoir model state.
+        model: BitReservoirModel,
+        /// Whether public symbol methods consume bytes or literal bit tokens.
+        symbol_mode: BitReservoirSymbolMode,
+        /// Probability floor for numeric stability.
+        min_prob: f64,
+        /// In-flight native byte-prefix progress when stepping MSB-first bits.
+        native_prefix_progress: Option<usize>,
+        /// Raw pre-update prediction cached between native prefix query/observe calls.
+        native_prediction: Option<(usize, BitReservoirPrediction)>,
+    },
     /// ZPAQ streaming rate model.
     #[cfg(feature = "backend-zpaq")]
     Zpaq {
@@ -1240,6 +1317,16 @@ impl RateBackendPredictor {
         ) {
             return RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()));
         }
+        #[cfg(feature = "backend-bit-reservoir")]
+        if matches!(
+            self,
+            RateBackendPredictor::BitReservoir {
+                native_prefix_progress: Some(bits),
+                ..
+            } if *bits > 0
+        ) {
+            return RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()));
+        }
 
         match self {
             #[cfg(feature = "backend-rosa")]
@@ -1375,6 +1462,10 @@ impl RateBackendPredictor {
             }
             #[cfg(feature = "backend-mamba")]
             RateBackendPredictor::Mamba { .. } => {
+                RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
+            }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir { .. } => {
                 RateBackendPredictorLifecycleCheckpoint::Full(Box::new(self.clone()))
             }
             #[cfg(feature = "backend-calibrated")]
@@ -1720,6 +1811,22 @@ impl RateBackendPredictor {
                 )),
                 None => Ok(false),
             },
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => match *native_prefix_progress {
+                Some(0) => {
+                    *native_prefix_progress = None;
+                    *native_prediction = None;
+                    Ok(true)
+                }
+                Some(bits) => Err(format!(
+                    "native MSB-first byte-prefix abort requires zero observed bits, got {bits}"
+                )),
+                None => Ok(false),
+            },
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => {
                 runtime.abort_empty_native_msb_byte_prefix()
@@ -1759,6 +1866,16 @@ impl RateBackendPredictor {
                 *native_prefix_progress = None;
                 Ok(())
             }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => {
                 let _ = runtime.abort_empty_native_msb_byte_prefix();
@@ -1786,6 +1903,22 @@ impl RateBackendPredictor {
         bit: bool,
     ) -> Result<(), String> {
         match self {
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_mut()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                *next_bit_idx += 1;
+                *native_prediction = None;
+                model.observe_bit(bit, false);
+                Ok(())
+            }
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated {
                 base,
@@ -1993,6 +2126,15 @@ impl RateBackendPredictor {
                 *checkpoint_depth = 0;
                 *native_prefix_progress = None;
             }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                *native_prediction = None;
+            }
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated { base, .. } => {
                 base.clear_checkpoints_if_supported();
@@ -2093,6 +2235,29 @@ impl RateBackendPredictor {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
             }
         }
+    }
+
+    #[cfg(feature = "backend-calibrated")]
+    fn log_prob_update_native_msb_byte_prefix(
+        &mut self,
+        symbol: u8,
+        min_prob: f64,
+    ) -> Result<f64, String> {
+        if !<Self as OnlineBytePredictor>::begin_native_msb_byte_prefix(self)? {
+            return Err("native MSB-first byte-prefix stepping is unavailable".to_string());
+        }
+
+        let min_prob: f64 = min_prob.clamp(f64::MIN_POSITIVE, 0.5);
+        let mut logp: f64 = 0.0;
+        for bit_idx in 0..8usize {
+            let p1: f64 = <Self as OnlineBytePredictor>::native_msb_prefix_prob_one(self, bit_idx)?;
+            let bit: bool = (symbol & (1u8 << (7 - bit_idx))) != 0;
+            let p_bit: f64 = if bit { p1 } else { 1.0 - p1 };
+            logp += p_bit.clamp(min_prob, 1.0 - min_prob).ln();
+            <Self as OnlineBytePredictor>::observe_native_msb_prefix_bit(self, bit_idx, bit)?;
+        }
+        <Self as OnlineBytePredictor>::finish_native_msb_byte_prefix(self, symbol)?;
+        Ok(logp)
     }
 }
 
@@ -2205,6 +2370,18 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Mamba { compressor, .. } => compressor
                 .begin_online_policy_stream(total_symbols)
                 .map_err(|e| e.to_string()),
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                model.reset_all();
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.begin_stream(total_symbols),
             #[cfg(feature = "backend-calibrated")]
@@ -2265,6 +2442,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Mamba { compressor, .. } => compressor
                 .finish_online_policy_stream()
                 .map_err(|e| e.to_string()),
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => runtime.finish_stream(),
             #[cfg(feature = "backend-calibrated")]
@@ -2404,6 +2591,25 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 let p = clamp_prob(compressor.pdf_buffer[symbol as usize], *min_prob);
                 p.ln()
             }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                symbol_mode,
+                min_prob,
+                ..
+            } => match symbol_mode {
+                BitReservoirSymbolMode::Byte => {
+                    let logp = model.log_prob_byte_with_min_prob(symbol, *min_prob);
+                    if logp.is_finite() {
+                        logp.max(min_prob.ln() * 8.0)
+                    } else {
+                        min_prob.ln() * 8.0
+                    }
+                }
+                BitReservoirSymbolMode::BitToken => {
+                    bit_reservoir_log_prob_symbol(model, symbol, *min_prob)
+                }
+            },
             #[cfg(feature = "backend-zpaq")]
             RateBackendPredictor::Zpaq { model } => model.log_prob(symbol),
             #[cfg(feature = "backend-mixture")]
@@ -2432,6 +2638,50 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 pdf[symbol as usize].max(*min_prob).ln()
             }
             RateBackendPredictor::Disabled { .. } => f64::NEG_INFINITY,
+        }
+    }
+
+    fn log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        match self {
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                symbol_mode,
+                min_prob,
+                ..
+            } => match symbol_mode {
+                BitReservoirSymbolMode::Byte => {
+                    let logp = model.log_prob_byte_frozen_with_min_prob(symbol, *min_prob);
+                    if logp.is_finite() {
+                        logp.max(min_prob.ln() * 8.0)
+                    } else {
+                        min_prob.ln() * 8.0
+                    }
+                }
+                BitReservoirSymbolMode::BitToken => {
+                    bit_reservoir_log_prob_symbol(model, symbol, *min_prob)
+                }
+            },
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.peek_log_prob_frozen(symbol),
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                min_prob,
+                ..
+            } => {
+                let mut base_logps = [0.0; 256];
+                base.fill_log_probs_frozen(&mut base_logps);
+                let mut base_pdf = [0.0; 256];
+                for (dst, &lp) in base_pdf.iter_mut().zip(base_logps.iter()) {
+                    *dst = clamp_prob(lp.exp(), *min_prob);
+                }
+                let mut calibrated_pdf = [0.0; 256];
+                core.apply_pdf(&base_pdf, &mut calibrated_pdf);
+                calibrated_pdf[symbol as usize].max(*min_prob).ln()
+            }
+            _ => self.log_prob(symbol),
         }
     }
 
@@ -2541,6 +2791,22 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     *slot = p.ln();
                 }
             }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                symbol_mode,
+                min_prob,
+                ..
+            } => match symbol_mode {
+                BitReservoirSymbolMode::Byte => {
+                    model.fill_byte_log_probs(out, *min_prob);
+                }
+                BitReservoirSymbolMode::BitToken => {
+                    out.fill(min_prob.ln());
+                    out[0] = bit_reservoir_log_prob_bit(model, false, *min_prob);
+                    out[1] = bit_reservoir_log_prob_bit(model, true, *min_prob);
+                }
+            },
             #[cfg(feature = "backend-zpaq")]
             RateBackendPredictor::Zpaq { model } => {
                 model.fill_log_probs(out);
@@ -2580,6 +2846,51 @@ impl OnlineBytePredictor for RateBackendPredictor {
         }
     }
 
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        match self {
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                symbol_mode,
+                min_prob,
+                ..
+            } => match symbol_mode {
+                BitReservoirSymbolMode::Byte => {
+                    model.fill_byte_log_probs_frozen(out, *min_prob);
+                }
+                BitReservoirSymbolMode::BitToken => {
+                    out.fill(min_prob.ln());
+                    out[0] = bit_reservoir_log_prob_bit(model, false, *min_prob);
+                    out[1] = bit_reservoir_log_prob_bit(model, true, *min_prob);
+                }
+            },
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.fill_log_probs_frozen(out);
+            }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                min_prob,
+                ..
+            } => {
+                let mut base_logps = [0.0; 256];
+                base.fill_log_probs_frozen(&mut base_logps);
+                let mut base_pdf = [0.0; 256];
+                for (dst, &lp) in base_pdf.iter_mut().zip(base_logps.iter()) {
+                    *dst = clamp_prob(lp.exp(), *min_prob);
+                }
+                let mut calibrated_pdf = [0.0; 256];
+                core.apply_pdf(&base_pdf, &mut calibrated_pdf);
+                for (slot, &p) in out.iter_mut().zip(calibrated_pdf.iter()) {
+                    *slot = clamp_prob(p, *min_prob).ln();
+                }
+            }
+            _ => self.fill_log_probs(out),
+        }
+    }
+
     fn has_native_msb_byte_prefix(&self) -> bool {
         match self {
             #[cfg(feature = "backend-ctw")]
@@ -2596,6 +2907,8 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Mixture { runtime } => runtime.has_native_msb_byte_prefix(),
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated { .. } => true,
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir { .. } => true,
             _ => false,
         }
     }
@@ -2638,6 +2951,22 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     );
                 }
                 *native_prefix_progress = Some(0);
+                Ok(true)
+            }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                if native_prefix_progress.is_some() {
+                    return Err(
+                        "native MSB-first byte-prefix step is already active for this predictor"
+                            .to_string(),
+                    );
+                }
+                *native_prefix_progress = Some(0);
+                *native_prediction = None;
                 Ok(true)
             }
             #[cfg(feature = "backend-mixture")]
@@ -2700,6 +3029,23 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Mixture { runtime } => {
                 runtime.native_msb_prefix_prob_one(bit_idx)
             }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                min_prob,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                let prediction = model.predict_for_training();
+                let p1 = prediction.prob_one().clamp(*min_prob, 1.0 - *min_prob);
+                *native_prediction = Some((bit_idx, prediction));
+                Ok(p1)
+            }
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated {
                 base,
@@ -2758,6 +3104,26 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Mixture { runtime } => {
                 runtime.observe_native_msb_prefix_bit(bit_idx, bit)
             }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_mut()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                *next_bit_idx += 1;
+                match native_prediction.take() {
+                    Some((cached_bit_idx, prediction)) if cached_bit_idx == bit_idx => {
+                        model.observe_bit_with_prediction(bit, &prediction);
+                    }
+                    _ => model.observe_bit(bit, true),
+                }
+                Ok(())
+            }
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated {
                 base,
@@ -2807,6 +3173,21 @@ impl OnlineBytePredictor for RateBackendPredictor {
             #[cfg(feature = "backend-mixture")]
             RateBackendPredictor::Mixture { runtime } => {
                 runtime.finish_native_msb_byte_prefix(symbol)
+            }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_ref()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_finish(*next_bit_idx)?;
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                let _ = symbol;
+                Ok(())
             }
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated {
@@ -2955,6 +3336,27 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     &mut compressor.pdf_buffer,
                 );
             }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                symbol_mode,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "bit-reservoir symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                match symbol_mode {
+                    BitReservoirSymbolMode::Byte => model.update_byte(symbol, true),
+                    BitReservoirSymbolMode::BitToken => {
+                        bit_reservoir_observe_symbol(model, symbol, true)
+                    }
+                }
+            }
             #[cfg(feature = "backend-zpaq")]
             RateBackendPredictor::Zpaq { model } => {
                 model.update(symbol);
@@ -2993,6 +3395,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
     }
 
     fn log_prob_update(&mut self, symbol: u8) -> f64 {
+        #[cfg(feature = "backend-calibrated")]
+        if let RateBackendPredictor::Calibrated { min_prob, .. } = self {
+            let min_prob: f64 = *min_prob;
+            return self
+                .log_prob_update_native_msb_byte_prefix(symbol, min_prob)
+                .unwrap_or_else(|err| {
+                    panic!("calibrated SSE byte update violated prefix protocol: {err}")
+                });
+        }
+
         match self {
             #[cfg(feature = "backend-rosa")]
             RateBackendPredictor::Rosa {
@@ -3063,6 +3475,32 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     checkpoint_journal.push(FacCtwUndoOp::LearnedSymbol);
                 }
                 logp
+            }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                symbol_mode,
+                native_prefix_progress,
+                min_prob,
+                native_prediction,
+                ..
+            } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "bit-reservoir symbol log_prob_update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                match symbol_mode {
+                    BitReservoirSymbolMode::Byte => {
+                        model.log_prob_update_byte_with_min_prob(symbol, true, *min_prob)
+                    }
+                    BitReservoirSymbolMode::BitToken => {
+                        let logp = bit_reservoir_log_prob_symbol(model, symbol, *min_prob);
+                        bit_reservoir_observe_symbol(model, symbol, true);
+                        logp
+                    }
+                }
             }
             _ => {
                 let logp = self.log_prob(symbol);
@@ -3179,6 +3617,18 @@ impl OnlineBytePredictor for RateBackendPredictor {
             } => {
                 compressor.reset_and_prime();
                 *primed = true;
+                Ok(())
+            }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                model.reset_state_only();
+                *native_prefix_progress = None;
+                *native_prediction = None;
                 Ok(())
             }
             #[cfg(feature = "backend-zpaq")]
@@ -3324,6 +3774,27 @@ impl OnlineBytePredictor for RateBackendPredictor {
                     &mut compressor.pdf_buffer,
                 );
             }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                symbol_mode,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "bit-reservoir frozen symbol update while native byte-prefix step is active"
+                );
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                match symbol_mode {
+                    BitReservoirSymbolMode::Byte => model.update_byte(symbol, false),
+                    BitReservoirSymbolMode::BitToken => {
+                        bit_reservoir_observe_symbol(model, symbol, false)
+                    }
+                }
+            }
             #[cfg(feature = "backend-zpaq")]
             RateBackendPredictor::Zpaq { model } => {
                 model.update(symbol);
@@ -3381,6 +3852,16 @@ impl ExpertPredictor {
             Self::Generic(predictor) => predictor,
             Self::RateBackend(predictor) => predictor,
         }
+    }
+
+    #[inline]
+    fn log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        self.as_mut().log_prob_frozen(symbol)
+    }
+
+    #[inline]
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        self.as_mut().fill_log_probs_frozen(out);
     }
 
     fn lifecycle_checkpoint(&mut self, op: OnlineBytePredictorLifecycleOp) -> ExpertLifecycleToken {
@@ -3718,8 +4199,18 @@ impl ExpertState {
     }
 
     #[inline]
+    fn log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        self.predictor.log_prob_frozen(symbol)
+    }
+
+    #[inline]
     fn log_prob_update(&mut self, symbol: u8) -> f64 {
         self.predictor.log_prob_update(symbol)
+    }
+
+    #[inline]
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        self.predictor.fill_log_probs_frozen(out);
     }
 
     #[inline]
@@ -4056,6 +4547,17 @@ impl BayesMixture {
         log_mix
     }
 
+    fn predict_log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        if self.experts.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+        for (i, expert) in self.experts.iter_mut().enumerate() {
+            self.scratch_logps[i] = expert.log_prob_frozen(symbol);
+            self.scratch_mix[i] = expert.log_weight + self.scratch_logps[i];
+        }
+        logsumexp(&self.scratch_mix)
+    }
+
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         if self.experts.is_empty() {
             out.fill(f64::NEG_INFINITY);
@@ -4066,6 +4568,23 @@ impl BayesMixture {
         let mut row = [0.0f64; 256];
         for expert in &mut self.experts {
             expert.predictor.fill_log_probs(&mut row);
+            let lw = expert.log_weight - norm;
+            for b in 0..256 {
+                out[b] = logsumexp2(out[b], lw + row[b]);
+            }
+        }
+    }
+
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        out.fill(f64::NEG_INFINITY);
+        let norm = logsumexp_weights(&self.experts);
+        let mut row = [0.0f64; 256];
+        for expert in &mut self.experts {
+            expert.fill_log_probs_frozen(&mut row);
             let lw = expert.log_weight - norm;
             for b in 0..256 {
                 out[b] = logsumexp2(out[b], lw + row[b]);
@@ -4242,6 +4761,21 @@ impl FadingBayesMixture {
         log_predictive
     }
 
+    fn predict_log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        if self.experts.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+        for (i, expert) in self.experts.iter_mut().enumerate() {
+            self.scratch_logps[i] = expert.log_prob_frozen(symbol);
+            self.scratch_mix[i] = self.decay * expert.log_weight;
+        }
+        let log_prior_norm = logsumexp(&self.scratch_mix);
+        for i in 0..self.experts.len() {
+            self.scratch_mix[i] += self.scratch_logps[i];
+        }
+        logsumexp(&self.scratch_mix) - log_prior_norm
+    }
+
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         if self.experts.is_empty() {
             out.fill(f64::NEG_INFINITY);
@@ -4256,6 +4790,27 @@ impl FadingBayesMixture {
         let mut row = [0.0f64; 256];
         for (i, expert) in self.experts.iter_mut().enumerate() {
             expert.predictor.fill_log_probs(&mut row);
+            let lw = decayed[i] - norm;
+            for b in 0..256 {
+                out[b] = logsumexp2(out[b], lw + row[b]);
+            }
+        }
+    }
+
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        out.fill(f64::NEG_INFINITY);
+        let mut decayed = Vec::with_capacity(self.experts.len());
+        for expert in &self.experts {
+            decayed.push(self.decay * expert.log_weight);
+        }
+        let norm = logsumexp(&decayed);
+        let mut row = [0.0f64; 256];
+        for (i, expert) in self.experts.iter_mut().enumerate() {
+            expert.fill_log_probs_frozen(&mut row);
             let lw = decayed[i] - norm;
             for b in 0..256 {
                 out[b] = logsumexp2(out[b], lw + row[b]);
@@ -4408,6 +4963,18 @@ impl SwitchingMixture {
         log_mix
     }
 
+    fn predict_log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        if self.experts.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+        for i in 0..self.experts.len() {
+            let lp = self.experts[i].log_prob_frozen(symbol);
+            self.scratch_logps[i] = lp;
+            self.scratch_joint[i] = self.experts[i].log_weight + lp;
+        }
+        logsumexp(&self.scratch_joint)
+    }
+
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         if self.experts.is_empty() {
             out.fill(f64::NEG_INFINITY);
@@ -4418,6 +4985,23 @@ impl SwitchingMixture {
         let mut row = [0.0f64; 256];
         for expert in &mut self.experts {
             expert.predictor.fill_log_probs(&mut row);
+            let lw = expert.log_weight - norm;
+            for b in 0..256 {
+                out[b] = logsumexp2(out[b], lw + row[b]);
+            }
+        }
+    }
+
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        out.fill(f64::NEG_INFINITY);
+        let norm = logsumexp_weights(&self.experts);
+        let mut row = [0.0f64; 256];
+        for expert in &mut self.experts {
+            expert.fill_log_probs_frozen(&mut row);
             let lw = expert.log_weight - norm;
             for b in 0..256 {
                 out[b] = logsumexp2(out[b], lw + row[b]);
@@ -4592,6 +5176,16 @@ impl ConvexMixture {
         log_mix
     }
 
+    fn predict_log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        if self.experts.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+        for (i, expert) in self.experts.iter_mut().enumerate() {
+            self.scratch_logps[i] = expert.log_prob_frozen(symbol);
+        }
+        self.mix_log_prob(&self.scratch_logps)
+    }
+
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         if self.experts.is_empty() {
             out.fill(f64::NEG_INFINITY);
@@ -4601,6 +5195,26 @@ impl ConvexMixture {
         let mut row = [0.0f64; 256];
         for (index, expert) in self.experts.iter_mut().enumerate() {
             expert.predictor.fill_log_probs(&mut row);
+            let weight = self.lambda.get(index).copied().unwrap_or(0.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            let log_weight = weight.ln();
+            for byte in 0..256 {
+                out[byte] = logsumexp2(out[byte], log_weight + row[byte]);
+            }
+        }
+    }
+
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        out.fill(f64::NEG_INFINITY);
+        let mut row = [0.0f64; 256];
+        for (index, expert) in self.experts.iter_mut().enumerate() {
+            expert.fill_log_probs_frozen(&mut row);
             let weight = self.lambda.get(index).copied().unwrap_or(0.0);
             if weight <= 0.0 {
                 continue;
@@ -4828,6 +5442,18 @@ impl NeuralMixture {
         self.evaluate_symbol(symbol)
     }
 
+    fn predict_log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        if self.experts.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+        if self.experts.len() == 1 {
+            return self.experts[0].log_prob_frozen(symbol);
+        }
+        let mut row = [0.0f64; 256];
+        self.fill_log_probs_frozen(&mut row);
+        row[symbol as usize]
+    }
+
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         if self.experts.is_empty() {
             out.fill(f64::NEG_INFINITY);
@@ -4839,6 +5465,42 @@ impl NeuralMixture {
         }
         self.ensure_full_evaluation();
         out.copy_from_slice(&self.eval_cache_mix_logps);
+    }
+
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        if self.experts.len() == 1 {
+            self.experts[0].fill_log_probs_frozen(out);
+            return;
+        }
+        self.sync_history_state();
+        self.neural.evaluate_expert_weights();
+        self.scratch_mix_weights
+            .copy_from_slice(self.neural.expert_weights());
+        let mut mix_pdf = [0.0f64; 256];
+        let mut row = [0.0f64; 256];
+        for i in 0..self.experts.len() {
+            self.experts[i].fill_log_probs_frozen(&mut row);
+            let w = self.scratch_mix_weights[i];
+            for (dst, &lp) in mix_pdf.iter_mut().zip(row.iter()) {
+                *dst += w * clamp_prob(lp.exp(), self.min_prob);
+            }
+        }
+
+        let sum: f64 = mix_pdf.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 {
+            let uniform = (1.0f64 / 256.0).ln();
+            out.fill(uniform);
+        } else {
+            let inv = 1.0 / sum;
+            for (dst, &p_raw) in out.iter_mut().zip(mix_pdf.iter()) {
+                let p = clamp_unit_prob(p_raw * inv, self.min_prob);
+                *dst = p.ln();
+            }
+        }
     }
 
     /// Log-probability (natural log) of the neural mixture for `symbol`, then update.
@@ -5018,6 +5680,21 @@ impl MdlSelector {
         logp
     }
 
+    fn predict_log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        if self.experts.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+        let mut best_idx = 0usize;
+        let mut best_loss = f64::INFINITY;
+        for (i, expert) in self.experts.iter().enumerate() {
+            if expert.cum_log_loss < best_loss {
+                best_loss = expert.cum_log_loss;
+                best_idx = i;
+            }
+        }
+        self.experts[best_idx].log_prob_frozen(symbol)
+    }
+
     fn fill_log_probs(&mut self, out: &mut [f64; 256]) {
         if self.experts.is_empty() {
             out.fill(f64::NEG_INFINITY);
@@ -5032,6 +5709,22 @@ impl MdlSelector {
             }
         }
         self.experts[best_idx].predictor.fill_log_probs(out);
+    }
+
+    fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        if self.experts.is_empty() {
+            out.fill(f64::NEG_INFINITY);
+            return;
+        }
+        let mut best_idx = 0usize;
+        let mut best_loss = f64::INFINITY;
+        for (i, expert) in self.experts.iter().enumerate() {
+            if expert.cum_log_loss < best_loss {
+                best_loss = expert.cum_log_loss;
+                best_idx = i;
+            }
+        }
+        self.experts[best_idx].fill_log_probs_frozen(out);
     }
 
     /// Index of the current best expert.
@@ -5895,6 +6588,18 @@ impl MixtureRuntime {
         }
     }
 
+    /// Non-mutating frozen log-probability (nats) for `symbol` at current state.
+    pub(crate) fn peek_log_prob_frozen(&mut self, symbol: u8) -> f64 {
+        match self {
+            MixtureRuntime::Bayes(m) => m.predict_log_prob_frozen(symbol),
+            MixtureRuntime::Fading(m) => m.predict_log_prob_frozen(symbol),
+            MixtureRuntime::Switching(m) => m.predict_log_prob_frozen(symbol),
+            MixtureRuntime::Convex(m) => m.predict_log_prob_frozen(symbol),
+            MixtureRuntime::Mdl(m) => m.predict_log_prob_frozen(symbol),
+            MixtureRuntime::Neural(m) => m.predict_log_prob_frozen(symbol),
+        }
+    }
+
     /// Step the mixture and return log-probability (nats).
     pub(crate) fn step(&mut self, symbol: u8) -> f64 {
         match self {
@@ -5926,6 +6631,17 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.fill_log_probs(out),
             MixtureRuntime::Mdl(m) => m.fill_log_probs(out),
             MixtureRuntime::Neural(m) => m.fill_log_probs(out),
+        }
+    }
+
+    pub(crate) fn fill_log_probs_frozen(&mut self, out: &mut [f64; 256]) {
+        match self {
+            MixtureRuntime::Bayes(m) => m.fill_log_probs_frozen(out),
+            MixtureRuntime::Fading(m) => m.fill_log_probs_frozen(out),
+            MixtureRuntime::Switching(m) => m.fill_log_probs_frozen(out),
+            MixtureRuntime::Convex(m) => m.fill_log_probs_frozen(out),
+            MixtureRuntime::Mdl(m) => m.fill_log_probs_frozen(out),
+            MixtureRuntime::Neural(m) => m.fill_log_probs_frozen(out),
         }
     }
 
@@ -7399,6 +8115,25 @@ mod tests {
         }
     }
 
+    fn small_bit_reservoir_backend() -> RateBackend {
+        RateBackend::BitReservoir {
+            config: crate::api::BitReservoirConfig {
+                hidden: 8,
+                delay_bits: 12,
+                embedding_bits: 10,
+                learning_rate: 0.02,
+                learning_rate_decay: 0.0,
+                weight_decay: 0.0,
+                state_decay: 0.75,
+                recurrent_scale: 0.35,
+                input_scale: 0.8,
+                phase_scale: 0.2,
+                grad_clip: 1.0,
+                seed: 7,
+            },
+        }
+    }
+
     fn assert_fill_matches_symbol_queries(label: &str, backend: RateBackend) {
         let mut bulk = RateBackendPredictor::from_backend(backend.clone(), DEFAULT_MIN_PROB);
         let mut queried = RateBackendPredictor::from_backend(backend, DEFAULT_MIN_PROB);
@@ -7489,6 +8224,43 @@ mod tests {
     }
 
     #[test]
+    fn predictor_log_prob_update_matches_separate_update_for_bit_reservoir_backend() {
+        assert_log_prob_update_matches_separate("bit-reservoir", small_bit_reservoir_backend());
+    }
+
+    #[test]
+    fn predictor_log_prob_update_matches_separate_update_for_calibrated_native_backend() {
+        assert_log_prob_update_matches_separate(
+            "calibrated-ctw",
+            RateBackend::Calibrated {
+                spec: Arc::new(CalibratedSpec::new(
+                    RateBackend::Ctw { depth: 5 },
+                    CalibrationContextKind::TextRepeat,
+                )),
+            },
+        );
+    }
+
+    #[test]
+    fn predictor_log_prob_update_matches_separate_update_for_calibrated_pdf_fallback_backend() {
+        assert_log_prob_update_matches_separate(
+            "calibrated-match",
+            RateBackend::Calibrated {
+                spec: Arc::new(CalibratedSpec::new(
+                    RateBackend::Match {
+                        hash_bits: 18,
+                        min_len: 4,
+                        max_len: 64,
+                        base_mix: 0.02,
+                        confidence_scale: 1.0,
+                    },
+                    CalibrationContextKind::ByteClass,
+                )),
+            },
+        );
+    }
+
+    #[test]
     fn predictor_fill_matches_symbol_queries_for_rosa_backend() {
         assert_fill_matches_symbol_queries("rosa", RateBackend::RosaPlus { max_order: -1 });
     }
@@ -7496,6 +8268,11 @@ mod tests {
     #[test]
     fn predictor_fill_matches_symbol_queries_for_ctw_backend() {
         assert_fill_matches_symbol_queries("ctw", RateBackend::Ctw { depth: 6 });
+    }
+
+    #[test]
+    fn predictor_fill_matches_symbol_queries_for_bit_reservoir_backend() {
+        assert_fill_matches_symbol_queries("bit-reservoir", small_bit_reservoir_backend());
     }
 
     #[test]

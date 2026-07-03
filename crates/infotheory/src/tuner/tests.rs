@@ -176,10 +176,13 @@ fn causal_dataset_value(codec_hash: &str, payload_key: &str, payload: Value) -> 
 }
 
 #[cfg(feature = "backend-ctw")]
-fn planner_interface_for_baseline(candidate: &CompressionBackend) -> TunePlannerInterfaceSpec {
-    let json = crate::spec::compression_backend_to_json_value(candidate)
-        .expect("baseline candidate must serialize");
-    let actions = (collect_numeric_leaves(&json).len() * 2).max(1);
+fn planner_interface_for_baseline(
+    candidate: &CompressionBackend,
+    bounds: &TuneBoundsSpec,
+) -> TunePlannerInterfaceSpec {
+    let actions = compile_planner_mutation_actions(candidate.clone(), bounds)
+        .expect("baseline planner actions must compile")
+        .len();
     TunePlannerInterfaceSpec {
         observation_bits: 8,
         observation_stream_len: 1,
@@ -187,6 +190,92 @@ fn planner_interface_for_baseline(candidate: &CompressionBackend) -> TunePlanner
         reward_bits: 16,
         agent_actions: action_alphabet(actions),
     }
+}
+
+#[cfg(feature = "backend-ctw")]
+#[test]
+fn planner_integer_mutation_actions_use_power_of_two_bounded_radii() {
+    let mut spec = sample_tune_spec("dataset.bin", "best.json", "report.json");
+    spec.bounds.parameter_ranges = vec![crate::spec::TuneParameterRangeSpec {
+        parameter: "rate_backend.depth".to_string(),
+        min: 1.0,
+        max: 64.0,
+    }];
+
+    let actions = compile_planner_mutation_actions(spec.baseline_candidate, &spec.bounds)
+        .expect("bounded integer planner actions compile");
+    let deltas = actions
+        .iter()
+        .filter_map(|action| match action {
+            PlannerMutationAction::NumericStep { path, delta, .. }
+                if path == "rate_backend.depth" =>
+            {
+                Some(delta.to_owned())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        deltas,
+        vec![
+            -1.0, 1.0, -2.0, 2.0, -4.0, 4.0, -8.0, 8.0, -16.0, 16.0, -32.0, 32.0
+        ]
+    );
+}
+
+#[cfg(all(feature = "backend-ctw", feature = "backend-mixture"))]
+#[test]
+fn planner_float_mutation_actions_expose_multiple_local_scales() {
+    use std::sync::Arc;
+
+    let candidate = CompressionBackend::Rate {
+        rate_backend: RateBackend::Mixture {
+            spec: Arc::new(
+                crate::api::MixtureSpec::new(
+                    crate::api::MixtureKind::Neural,
+                    vec![
+                        crate::api::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                            .with_name("ctw"),
+                    ],
+                )
+                .with_alpha(0.03),
+            ),
+        },
+        coder: crate::coders::CoderType::AC,
+        framing: FramingMode::Framed,
+    };
+    let bounds = TuneBoundsSpec {
+        allowed_backends: vec!["mixture".to_string()],
+        forbidden_backends: Vec::new(),
+        parameter_ranges: vec![crate::spec::TuneParameterRangeSpec {
+            parameter: "rate_backend.spec.alpha".to_string(),
+            min: 0.005,
+            max: 0.2,
+        }],
+        max_experts: 2,
+        max_mixture_nesting_depth: 1,
+        min_experts: Some(1),
+        allow_duplicate_experts: Some(false),
+        required_experts: Vec::new(),
+        forbidden_expert_pairs: Vec::new(),
+    };
+
+    let actions = compile_planner_mutation_actions(candidate, &bounds)
+        .expect("bounded float planner actions compile");
+    let deltas = actions
+        .iter()
+        .filter_map(|action| match action {
+            PlannerMutationAction::NumericStep { path, delta, .. }
+                if path == "rate_backend.spec.alpha" =>
+            {
+                Some(delta.to_owned())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(deltas, vec![-0.025, 0.025, -0.05, 0.05, -0.10, 0.10]);
 }
 
 #[cfg(feature = "backend-ctw")]
@@ -1807,7 +1896,7 @@ fn theorem_claims_continue_as_uncertified_when_requested_prereqs_are_missing() {
         output_path.to_str().expect("output path"),
         report_path.to_str().expect("report path"),
     );
-    let interface = planner_interface_for_baseline(&spec.baseline_candidate);
+    let interface = planner_interface_for_baseline(&spec.baseline_candidate, &spec.bounds);
     spec.controller = TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
         interface,
         planner_simulations_per_step: 2,
@@ -2003,7 +2092,7 @@ fn run_tune_can_emit_exact_reward_certificate_and_exit() {
         report_path.to_str().expect("report path"),
     );
     spec.controller = TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
-        interface: planner_interface_for_baseline(&spec.baseline_candidate),
+        interface: planner_interface_for_baseline(&spec.baseline_candidate, &spec.bounds),
         planner_simulations_per_step: 4,
     });
     let spec_json = SpecDocument::Tune(spec)
@@ -2976,7 +3065,7 @@ fn planner_family_controller_executes_runtime_path() {
         report_path.to_str().expect("report path"),
     );
     spec.controller = TuneControllerSpec::McAixiFacCtw(McAixiFacCtwTuneControllerSpec {
-        interface: planner_interface_for_baseline(&spec.baseline_candidate),
+        interface: planner_interface_for_baseline(&spec.baseline_candidate, &spec.bounds),
         planner_simulations_per_step: 8,
     });
     let bounds = spec.bounds.clone();
@@ -3071,7 +3160,7 @@ fn executor_controls_are_excluded_from_canonical_tune_but_included_in_evaluator_
             output_path.to_str().expect("output path"),
             report_path.to_str().expect("report path"),
         );
-        let interface = planner_interface_for_baseline(&base.baseline_candidate);
+        let interface = planner_interface_for_baseline(&base.baseline_candidate, &base.bounds);
         let controllers = vec![
             TuneControllerSpec::AnnealedHillClimbing(AnnealedHillClimbingTuneControllerSpec {
                 max_mutation_radius: 1,

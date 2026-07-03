@@ -30,6 +30,8 @@ pub use self::document::{
     TuneSpec, ValidatedTuneSpec, WarmStartExactJhTuneControllerSpec,
 };
 
+#[cfg(feature = "backend-bit-reservoir")]
+use crate::api::BitReservoirConfig;
 use crate::api::{
     CalibratedSpec, CalibrationContextKind, CompressionBackend, MAX_MIXTURE_NESTING,
     MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, ParticleSpec, RateBackend,
@@ -1030,6 +1032,10 @@ fn rate_backend_to_json_leaf_value(
             "kind": canonical,
             "method": zpaq_method_to_json_value(method),
         }))),
+        #[cfg(feature = "backend-bit-reservoir")]
+        RateBackend::BitReservoir { config } => {
+            Some(Ok(bit_reservoir_config_to_json_value(canonical, config)))
+        }
         RateBackend::Ctw { depth } => Some(Ok(serde_json::json!({
             "kind": canonical,
             "depth": depth,
@@ -1200,6 +1206,186 @@ pub fn parse_particle_spec_value(v: &serde_json::Value) -> SpecResult<ParticleSp
         min_prob: v["min_prob"].as_f64().unwrap_or(d.min_prob),
         seed: v["seed"].as_u64().unwrap_or(d.seed),
     })
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn bit_reservoir_config_to_json_value(
+    canonical: &str,
+    config: &BitReservoirConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": canonical,
+        "hidden": config.hidden,
+        "delay_bits": config.delay_bits,
+        "embedding_bits": config.embedding_bits,
+        "learning_rate": config.learning_rate,
+        "learning_rate_decay": config.learning_rate_decay,
+        "weight_decay": config.weight_decay,
+        "state_decay": config.state_decay,
+        "recurrent_scale": config.recurrent_scale,
+        "input_scale": config.input_scale,
+        "phase_scale": config.phase_scale,
+        "grad_clip": config.grad_clip,
+        "seed": config.seed,
+    })
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn json_usize_field(object: &serde_json::Value, field: &str, default: usize) -> SpecResult<usize> {
+    match object.get(field).filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_u64()
+            .and_then(|raw| usize::try_from(raw).ok())
+            .ok_or_else(|| SpecError::new(format!("bit-reservoir {field} must be an integer"))),
+        None => Ok(default),
+    }
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn json_f64_field(object: &serde_json::Value, field: &str, default: f64) -> SpecResult<f64> {
+    match object.get(field).filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| SpecError::new(format!("bit-reservoir {field} must be numeric"))),
+        None => Ok(default),
+    }
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn json_u64_field(object: &serde_json::Value, field: &str, default: u64) -> SpecResult<u64> {
+    match object.get(field).filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| SpecError::new(format!("bit-reservoir {field} must be an integer"))),
+        None => Ok(default),
+    }
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn parse_bit_reservoir_config_value(v: &serde_json::Value) -> SpecResult<BitReservoirConfig> {
+    let defaults = BitReservoirConfig::default();
+    let config = BitReservoirConfig {
+        hidden: json_usize_field(v, "hidden", defaults.hidden)?,
+        delay_bits: json_usize_field(v, "delay_bits", defaults.delay_bits)?,
+        embedding_bits: json_usize_field(v, "embedding_bits", defaults.embedding_bits)?,
+        learning_rate: json_f64_field(v, "learning_rate", defaults.learning_rate)?,
+        learning_rate_decay: json_f64_field(
+            v,
+            "learning_rate_decay",
+            defaults.learning_rate_decay,
+        )?,
+        weight_decay: json_f64_field(v, "weight_decay", defaults.weight_decay)?,
+        state_decay: json_f64_field(v, "state_decay", defaults.state_decay)?,
+        recurrent_scale: json_f64_field(v, "recurrent_scale", defaults.recurrent_scale)?,
+        input_scale: json_f64_field(v, "input_scale", defaults.input_scale)?,
+        phase_scale: json_f64_field(v, "phase_scale", defaults.phase_scale)?,
+        grad_clip: json_f64_field(v, "grad_clip", defaults.grad_clip)?,
+        seed: json_u64_field(v, "seed", defaults.seed)?,
+    };
+    config
+        .validate()
+        .map_err(|err| SpecError::new(err.to_string()))?;
+    Ok(config)
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn parse_bit_reservoir_shorthand_method(method: Option<&str>) -> SpecResult<RateBackend> {
+    let mut config = BitReservoirConfig::default();
+    let Some(method) = method else {
+        return Ok(RateBackend::BitReservoir { config });
+    };
+    if let Ok(hidden) = method.parse::<usize>() {
+        config.hidden = hidden;
+        config
+            .validate()
+            .map_err(|err| SpecError::new(err.to_string()))?;
+        return Ok(RateBackend::BitReservoir { config });
+    }
+
+    for raw_pair in method.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((key, value)) = raw_pair.split_once('=') else {
+            return Err(SpecError::new(format!(
+                "bit-reservoir shorthand option '{raw_pair}' must be key=value"
+            )));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "hidden" | "h" => {
+                config.hidden = value.parse::<usize>().map_err(|_| {
+                    SpecError::new("bit-reservoir hidden shorthand value must be an integer")
+                })?;
+            }
+            "delay_bits" | "delay" | "d" => {
+                config.delay_bits = value.parse::<usize>().map_err(|_| {
+                    SpecError::new("bit-reservoir delay_bits shorthand value must be an integer")
+                })?;
+            }
+            "embedding_bits" | "embed_bits" | "eb" => {
+                config.embedding_bits = value.parse::<usize>().map_err(|_| {
+                    SpecError::new(
+                        "bit-reservoir embedding_bits shorthand value must be an integer",
+                    )
+                })?;
+            }
+            "learning_rate" | "lr" => {
+                config.learning_rate = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir learning_rate shorthand value must be numeric")
+                })?;
+            }
+            "learning_rate_decay" | "lr_decay" => {
+                config.learning_rate_decay = value.parse::<f64>().map_err(|_| {
+                    SpecError::new(
+                        "bit-reservoir learning_rate_decay shorthand value must be numeric",
+                    )
+                })?;
+            }
+            "weight_decay" | "wd" => {
+                config.weight_decay = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir weight_decay shorthand value must be numeric")
+                })?;
+            }
+            "state_decay" => {
+                config.state_decay = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir state_decay shorthand value must be numeric")
+                })?;
+            }
+            "recurrent_scale" | "rec" => {
+                config.recurrent_scale = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir recurrent_scale shorthand value must be numeric")
+                })?;
+            }
+            "input_scale" | "input" => {
+                config.input_scale = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir input_scale shorthand value must be numeric")
+                })?;
+            }
+            "phase_scale" | "phase" => {
+                config.phase_scale = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir phase_scale shorthand value must be numeric")
+                })?;
+            }
+            "grad_clip" | "clip" => {
+                config.grad_clip = value.parse::<f64>().map_err(|_| {
+                    SpecError::new("bit-reservoir grad_clip shorthand value must be numeric")
+                })?;
+            }
+            "seed" => {
+                config.seed = value.parse::<u64>().map_err(|_| {
+                    SpecError::new("bit-reservoir seed shorthand value must be an integer")
+                })?;
+            }
+            other => {
+                return Err(SpecError::new(format!(
+                    "unknown bit-reservoir shorthand option '{other}'"
+                )));
+            }
+        }
+    }
+    config
+        .validate()
+        .map_err(|err| SpecError::new(err.to_string()))?;
+    Ok(RateBackend::BitReservoir { config })
 }
 
 /// Parse a canonical rate-backend JSON object.
@@ -1419,6 +1605,20 @@ fn parse_rate_backend_json_leaf(
             validate_zpaq_rate_method(method.value())
                 .map_err(|err| SpecError::new(err.to_string()))?;
             RateBackend::Zpaq { method }
+        }
+        crate::runtime::RateBackendKind::BitReservoir => {
+            #[cfg(feature = "backend-bit-reservoir")]
+            {
+                RateBackend::BitReservoir {
+                    config: parse_bit_reservoir_config_value(v)?,
+                }
+            }
+            #[cfg(not(feature = "backend-bit-reservoir"))]
+            {
+                return Err(SpecError::new(
+                    "bit-reservoir backend disabled at compile time",
+                ));
+            }
         }
         _ => return Ok(None),
     };
@@ -1894,6 +2094,18 @@ fn parse_rate_backend_name_method_leaf(
             validate_zpaq_rate_method(&method).map_err(|err| SpecError::new(err.to_string()))?;
             RateBackend::Zpaq {
                 method: crate::api::ZpaqMethodSpec::literal(method),
+            }
+        }
+        crate::runtime::RateBackendKind::BitReservoir => {
+            #[cfg(feature = "backend-bit-reservoir")]
+            {
+                parse_bit_reservoir_shorthand_method(method)?
+            }
+            #[cfg(not(feature = "backend-bit-reservoir"))]
+            {
+                return Err(SpecError::new(
+                    "bit-reservoir backend disabled at compile time",
+                ));
             }
         }
         _ => return Ok(None),

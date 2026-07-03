@@ -14,6 +14,8 @@ use anyhow::{Result, bail};
 use crate::api::{MixtureKind, MixtureScheduleMode};
 #[cfg(test)]
 use crate::api::{MixtureSpec, RateBackend};
+#[cfg(feature = "backend-bit-reservoir")]
+use crate::backends::bit_reservoir::{BitReservoirModel, BitReservoirPrediction};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
 #[cfg(feature = "backend-ctw")]
@@ -1516,6 +1518,14 @@ pub(crate) enum RatePdfPredictor {
     Mamba(MambaPredictor),
     #[cfg(feature = "backend-rwkv")]
     Rwkv(RwkvPredictor),
+    #[cfg(feature = "backend-bit-reservoir")]
+    BitReservoir {
+        model: BitReservoirModel,
+        pdf: Vec<f64>,
+        valid: bool,
+        native_prefix_progress: Option<usize>,
+        native_prediction: Option<(usize, BitReservoirPrediction)>,
+    },
     #[cfg(feature = "backend-zpaq")]
     Zpaq(ZpaqPredictor),
     #[cfg(feature = "backend-mixture")]
@@ -1578,6 +1588,20 @@ impl RatePdfPredictor {
             Self::Mamba(m) => m.begin_stream(total_len),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => m.begin_stream(total_len),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                valid,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                model.reset_all();
+                *valid = false;
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.begin_stream(total_len),
             #[cfg(feature = "backend-calibrated")]
@@ -1619,6 +1643,18 @@ impl RatePdfPredictor {
             Self::Mamba(m) => m.compressor.finish_online_policy_stream(),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => m.finish_stream(),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                valid,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                *valid = false;
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                Ok(())
+            }
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.finish_stream(),
             #[cfg(feature = "backend-calibrated")]
@@ -1650,6 +1686,18 @@ impl RatePdfPredictor {
             Self::Mamba(m) => Ok(m.pdf_next()),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => Ok(m.pdf_next()),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model, pdf, valid, ..
+            } => {
+                if !*valid {
+                    let mut row = [0.0f64; 256];
+                    model.fill_byte_pdf(&mut row, PDF_MIN);
+                    pdf.copy_from_slice(&row);
+                    *valid = true;
+                }
+                Ok(pdf)
+            }
             #[cfg(feature = "backend-zpaq")]
             Self::Zpaq(m) => Ok(m.pdf_next()),
             #[cfg(feature = "backend-mixture")]
@@ -1723,6 +1771,24 @@ impl RatePdfPredictor {
             Self::Mamba(m) => m.update(symbol),
             #[cfg(feature = "backend-rwkv")]
             Self::Rwkv(m) => m.update(symbol),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                valid,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                debug_assert!(
+                    native_prefix_progress.is_none(),
+                    "bit-reservoir symbol update while native bitwise byte step is active"
+                );
+                *native_prefix_progress = None;
+                *native_prediction = None;
+                model.update_byte(symbol, true);
+                *valid = false;
+                Ok(())
+            }
             #[cfg(feature = "backend-zpaq")]
             Self::Zpaq(m) => {
                 m.update(symbol);
@@ -1817,6 +1883,8 @@ impl RatePdfPredictor {
             Self::Mixture(m) => m.has_recursive_native_bitwise_expert(),
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated { .. } => true,
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir { .. } => true,
             _ => false,
         }
     }
@@ -1827,6 +1895,21 @@ impl RatePdfPredictor {
             Self::Ctw(m) | Self::FacCtw(m) => Ok(m.can_fast_ac_bitwise()),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.begin_bitwise_byte_step(),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                valid,
+                ..
+            } => {
+                if native_prefix_progress.is_some() {
+                    bail!("native recursive bitwise byte step is already active");
+                }
+                *native_prefix_progress = Some(0);
+                *native_prediction = None;
+                *valid = false;
+                Ok(true)
+            }
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated {
                 base,
@@ -1853,6 +1936,19 @@ impl RatePdfPredictor {
             Self::Ctw(m) | Self::FacCtw(m) => Ok(m.bit_prob_one_msb(bit_idx)),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.bit_prob_one_msb(bit_idx),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                validate_bit_reservoir_prefix_index(*native_prefix_progress, bit_idx)?;
+                let prediction = model.predict_for_training();
+                let p1 = prediction.prob_one().clamp(PDF_MIN, 1.0 - PDF_MIN);
+                *native_prediction = Some((bit_idx, prediction));
+                Ok(p1)
+            }
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated {
                 base,
@@ -1877,6 +1973,27 @@ impl RatePdfPredictor {
             }
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.observe_bit_msb(bit_idx, bit),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                native_prefix_progress,
+                valid,
+                native_prediction,
+                ..
+            } => {
+                validate_bit_reservoir_prefix_index(*native_prefix_progress, bit_idx)?;
+                if let Some(next_bit_idx) = native_prefix_progress {
+                    *next_bit_idx += 1;
+                }
+                match native_prediction.take() {
+                    Some((cached_bit_idx, prediction)) if cached_bit_idx == bit_idx => {
+                        model.observe_bit_with_prediction(bit, &prediction);
+                    }
+                    _ => model.observe_bit(bit, true),
+                }
+                *valid = false;
+                Ok(())
+            }
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated {
                 base,
@@ -1901,6 +2018,23 @@ impl RatePdfPredictor {
             Self::Ctw(_) | Self::FacCtw(_) => Ok(()),
             #[cfg(feature = "backend-mixture")]
             Self::Mixture(m) => m.finish_bitwise_symbol(symbol),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => match native_prefix_progress {
+                Some(8) => {
+                    *native_prefix_progress = None;
+                    *native_prediction = None;
+                    let _ = symbol;
+                    Ok(())
+                }
+                Some(bits) => {
+                    bail!("native recursive bitwise finish requires 8 observed bits, got {bits}")
+                }
+                None => bail!("native recursive bitwise byte step is not active"),
+            },
             #[cfg(feature = "backend-calibrated")]
             Self::Calibrated {
                 base,
@@ -2039,6 +2173,22 @@ fn binary_split_from_prob_one(p1: f64) -> u32 {
         split = CDF_TOTAL - 1;
     }
     split
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+fn validate_bit_reservoir_prefix_index(next_bit_idx: Option<usize>, bit_idx: usize) -> Result<()> {
+    let Some(expected) = next_bit_idx else {
+        bail!("native recursive bitwise byte step is not active");
+    };
+    if bit_idx >= 8 {
+        bail!("native recursive bitwise bit index {bit_idx} is out of range; expected 0..8");
+    }
+    if bit_idx != expected {
+        bail!(
+            "native recursive bitwise bit index {bit_idx} violated sequential stepping; expected {expected}"
+        );
+    }
+    Ok(())
 }
 
 /// This function should be considered when fine-tuning Compression/decompression for a particular runtime case. In particular, my benchmarking has shown that inlining is non-obvious in how it affects performance

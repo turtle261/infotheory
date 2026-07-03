@@ -33,6 +33,12 @@ case "${BENCH_SUITE}" in
     SUITE_DISPLAY="configs/bench/two.json"
     SUITE_PATH_PREFIX="infotheory-two-json"
     ;;
+  one-sse|one_sse|one)
+    BENCH_SUITE=one-sse
+    SUITE_SPEC_PATH="${ROOT_DIR}/configs/bench/one_sse.json"
+    SUITE_DISPLAY="configs/bench/one_sse.json"
+    SUITE_PATH_PREFIX="infotheory-one-sse"
+    ;;
   extra)
     BENCH_SUITE=extra
     SUITE_SPEC_PATH="${ROOT_DIR}/configs/bench/extra.json"
@@ -40,7 +46,7 @@ case "${BENCH_SUITE}" in
     SUITE_PATH_PREFIX="infotheory-extra"
     ;;
   *)
-    fail "INFOTHEORY_BENCH_SUITE must be 'two-json' or 'extra' (found '${BENCH_SUITE}')"
+    fail "INFOTHEORY_BENCH_SUITE must be 'two-json', 'one-sse', or 'extra' (found '${BENCH_SUITE}')"
     ;;
 esac
 
@@ -71,8 +77,8 @@ usage() {
   cat <<EOF
 Usage: sh ./scripts/bench_two_json.sh
 
-Runs a sequential benchmark suite for every standalone expert in ${SUITE_DISPLAY}
-plus the full neural mixture, using only /tmp/enwik7 as the source corpus.
+Runs a sequential benchmark suite for subjects derived from ${SUITE_DISPLAY},
+using only /tmp/enwik7 as the source corpus.
 
 Resume behavior:
   By default, resumes the newest /tmp/${SUITE_PATH_PREFIX}-raw-*.tsv if one exists.
@@ -81,7 +87,7 @@ Resume behavior:
   or append to a specific run file.
 
 Environment:
-  INFOTHEORY_BENCH_SUITE=two-json|extra
+  INFOTHEORY_BENCH_SUITE=two-json|one-sse|extra
   INFOTHEORY_BENCH_REPEATS=3
   INFOTHEORY_BENCH_WARMUPS=1
   INFOTHEORY_BENCH_SIZES="4096 16384 ... 10000000"
@@ -336,11 +342,6 @@ subject_dir = work_dir / "subjects"
 subject_dir.mkdir(parents=True, exist_ok=True)
 
 data = json.loads(spec_path.read_text())
-if data.get("kind") != "neural":
-    raise SystemExit(f"expected {suite_label} kind=neural, found {data.get('kind')!r}")
-experts = data.get("experts")
-if not isinstance(experts, list) or not experts:
-    raise SystemExit(f"{suite_label} must contain a non-empty experts array")
 spec_dir = spec_path.parent
 
 PATH_KEYS = {
@@ -357,25 +358,6 @@ def looks_like_uri(value: str) -> bool:
     return bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value))
 
 
-def canonicalize_relative_paths(node):
-    if isinstance(node, dict):
-        out = {}
-        for key, value in node.items():
-            if (
-                isinstance(value, str)
-                and value
-                and (key in PATH_KEYS or key.endswith("_path"))
-                and not Path(value).is_absolute()
-                and not looks_like_uri(value)
-            ):
-                out[key] = str((spec_dir / value).resolve())
-            else:
-                out[key] = canonicalize_relative_paths(value)
-        return out
-    if isinstance(node, list):
-        return [canonicalize_relative_paths(item) for item in node]
-    return node
-
 def slug(text: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip())
     return text.strip("-").lower() or "expert"
@@ -390,36 +372,101 @@ def canonical_subject_name(expert):
         return "fac-ctw"
     return name
 
+def resolve_path_like(value: str, base_dir: Path) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    if looks_like_uri(value):
+        raise SystemExit(f"{suite_label}: URI paths are not supported in benchmark suite files")
+    return (base_dir / candidate).resolve()
+
+def load_neural_mixture(path: Path, label: str):
+    value = json.loads(path.read_text())
+    if value.get("kind") != "neural":
+        raise SystemExit(f"expected {label} kind=neural, found {value.get('kind')!r}")
+    experts_value = value.get("experts")
+    if not isinstance(experts_value, list) or not experts_value:
+        raise SystemExit(f"{label} must contain a non-empty experts array")
+    return value, experts_value, path.parent
+
+def emit_experts(experts_value, expert_base_dir):
+    for expert in experts_value:
+        expert_resolved = canonicalize_relative_paths_with_base(expert, expert_base_dir)
+        name = canonical_subject_name(expert_resolved)
+        subject = slug(name)
+        out_path = subject_dir / f"{subject}.json"
+        out_path.write_text(json.dumps(expert_resolved, indent=2, sort_keys=True) + "\n")
+        h_order = expert_resolved.get("max_order", "")
+        print(
+            "\t".join(
+                [
+                    subject,
+                    "expert",
+                    str(expert_resolved.get("kind", "")),
+                    str(out_path),
+                    "" if h_order == "" else str(h_order),
+                ]
+            )
+        )
+
+def canonicalize_relative_paths_with_base(node, base_dir):
+    if isinstance(node, dict):
+        out = {}
+        for key, value in node.items():
+            if (
+                isinstance(value, str)
+                and value
+                and (key in PATH_KEYS or key.endswith("_path"))
+                and not Path(value).is_absolute()
+                and not looks_like_uri(value)
+            ):
+                out[key] = str((base_dir / value).resolve())
+            else:
+                out[key] = canonicalize_relative_paths_with_base(value, base_dir)
+        return out
+    if isinstance(node, list):
+        return [canonicalize_relative_paths_with_base(item, base_dir) for item in node]
+    return node
+
 print("subject\tsubject_kind\texpert_kind\tspec_path\th_order")
-print(
-    "\t".join(
-        [
-            "neural_mixture",
-            "mixture",
-            "neural-mixture",
-            str(spec_path),
-            "",
-        ]
-    )
-)
-for expert in experts:
-    expert_resolved = canonicalize_relative_paths(expert)
-    name = canonical_subject_name(expert_resolved)
-    subject = slug(name)
-    out_path = subject_dir / f"{subject}.json"
-    out_path.write_text(json.dumps(expert_resolved, indent=2, sort_keys=True) + "\n")
-    h_order = expert_resolved.get("max_order", "")
+
+if data.get("kind") == "neural":
+    _, experts, expert_dir = load_neural_mixture(spec_path, suite_label)
     print(
         "\t".join(
             [
-                subject,
-                "expert",
-                str(expert_resolved.get("kind", "")),
-                str(out_path),
-                "" if h_order == "" else str(h_order),
+                "neural_mixture",
+                "mixture",
+                "neural-mixture",
+                str(spec_path),
+                "",
             ]
         )
     )
+    emit_experts(experts, expert_dir)
+else:
+    base = data.get("base")
+    if not isinstance(base, dict) or base.get("kind") != "mixture":
+        raise SystemExit(
+            f"expected {suite_label} to be kind=neural or a calibrated spec with base.kind=mixture"
+        )
+    spec_ref = base.get("spec_path")
+    if not isinstance(spec_ref, str) or not spec_ref:
+        raise SystemExit(f"{suite_label} calibrated base must use a non-empty spec_path")
+    base_path = resolve_path_like(spec_ref, spec_dir)
+    _, experts, expert_dir = load_neural_mixture(base_path, f"{suite_label} base {spec_ref}")
+    print(
+        "\t".join(
+            [
+                "calibrated_mixture",
+                "calibrated",
+                "calibrated-mixture",
+                str(spec_path),
+                "",
+            ]
+        )
+    )
+    emit_experts(experts, expert_dir)
 PY
 
 if [ -n "${SUBJECT_FILTER}" ]; then
@@ -495,6 +542,9 @@ run_plain() {
     mixture)
       set -- "$@" --rate-backend mixture --method "${cmd_spec_path}"
       ;;
+    calibrated)
+      set -- "$@" --rate-backend calibrated --method "${cmd_spec_path}"
+      ;;
     expert)
       set -- "$@" --expert-spec "${cmd_spec_path}"
       ;;
@@ -546,6 +596,9 @@ run_timed() {
   case "${cmd_subject_kind}" in
     mixture)
       set -- "$@" --rate-backend mixture --method "${cmd_spec_path}"
+      ;;
+    calibrated)
+      set -- "$@" --rate-backend calibrated --method "${cmd_spec_path}"
       ;;
     expert)
       set -- "$@" --expert-spec "${cmd_spec_path}"

@@ -8,6 +8,7 @@
     feature = "backend-mixture",
     feature = "backend-particle",
     feature = "backend-calibrated",
+    feature = "backend-bit-reservoir",
     feature = "backend-mamba",
     feature = "backend-rwkv"
 ))]
@@ -157,6 +158,24 @@ feature_gated_rate_pdf_predictor_builder! {
                 Some(*msb_first),
             ),
         ))
+    }
+}
+
+feature_gated_rate_pdf_predictor_builder! {
+    feature: "backend-bit-reservoir",
+    fn build_pdf_predictor_bit_reservoir(backend) {
+        expect_plan_ref!(
+            backend.plan(),
+            crate::spec::core::RateBackendPlan::BitReservoir { config },
+            "bit-reservoir kernel used with non-bit-reservoir plan"
+        );
+        Ok(crate::compression::RatePdfPredictor::BitReservoir {
+            model: BitReservoirModel::new(config.clone()).map_err(anyhow::Error::msg)?,
+            pdf: vec![1.0 / 256.0; 256],
+            valid: false,
+            native_prefix_progress: None,
+            native_prediction: None,
+        })
     }
 }
 

@@ -1,5 +1,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
+#[cfg(feature = "backend-bit-reservoir")]
+use infotheory::api::BitReservoirConfig;
 use infotheory::api::{
     self, BinaryPrediction, BitOrder, BitStreamSemantics, BytePrefixMass, CalibratedSpec,
     CalibrationContextKind, CompiledCompressionBackend, CompiledRateBackend, CompressionBackend,
@@ -833,6 +835,82 @@ impl PyRateBackend {
         Self {
             inner: RateBackend::Ppmd { order, memory_mb },
         }
+    }
+
+    #[staticmethod]
+    #[cfg(feature = "backend-bit-reservoir")]
+    #[pyo3(signature = (
+        hidden=None,
+        delay_bits=None,
+        embedding_bits=None,
+        learning_rate=None,
+        learning_rate_decay=None,
+        weight_decay=None,
+        state_decay=None,
+        recurrent_scale=None,
+        input_scale=None,
+        phase_scale=None,
+        grad_clip=None,
+        seed=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn bit_reservoir(
+        hidden: Option<usize>,
+        delay_bits: Option<usize>,
+        embedding_bits: Option<usize>,
+        learning_rate: Option<f64>,
+        learning_rate_decay: Option<f64>,
+        weight_decay: Option<f64>,
+        state_decay: Option<f64>,
+        recurrent_scale: Option<f64>,
+        input_scale: Option<f64>,
+        phase_scale: Option<f64>,
+        grad_clip: Option<f64>,
+        seed: Option<u64>,
+    ) -> PyResult<Self> {
+        let mut config = BitReservoirConfig::default();
+        if let Some(hidden) = hidden {
+            config.hidden = hidden;
+        }
+        if let Some(delay_bits) = delay_bits {
+            config.delay_bits = delay_bits;
+        }
+        if let Some(embedding_bits) = embedding_bits {
+            config.embedding_bits = embedding_bits;
+        }
+        if let Some(learning_rate) = learning_rate {
+            config.learning_rate = learning_rate;
+        }
+        if let Some(learning_rate_decay) = learning_rate_decay {
+            config.learning_rate_decay = learning_rate_decay;
+        }
+        if let Some(weight_decay) = weight_decay {
+            config.weight_decay = weight_decay;
+        }
+        if let Some(state_decay) = state_decay {
+            config.state_decay = state_decay;
+        }
+        if let Some(recurrent_scale) = recurrent_scale {
+            config.recurrent_scale = recurrent_scale;
+        }
+        if let Some(input_scale) = input_scale {
+            config.input_scale = input_scale;
+        }
+        if let Some(phase_scale) = phase_scale {
+            config.phase_scale = phase_scale;
+        }
+        if let Some(grad_clip) = grad_clip {
+            config.grad_clip = grad_clip;
+        }
+        if let Some(seed) = seed {
+            config.seed = seed;
+        }
+        config
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid BitReservoirConfig: {e}")))?;
+        Ok(Self {
+            inner: RateBackend::BitReservoir { config },
+        })
     }
 
     #[staticmethod]

@@ -113,6 +113,155 @@ impl GenerationConfig {
     }
 }
 
+/// Configuration for the bit-native reservoir rate backend.
+///
+/// The model is an online reservoir predictor over individual bits. Its fixed
+/// deterministic recurrent reservoir is a small nonlinear feature source; the
+/// learned part is a phase-specific logistic readout over reservoir state,
+/// short delay bits, and sparse hashed history features. It predicts
+/// `P(next_bit = 1 | previous_bits)` directly and treats byte-level APIs as
+/// MSB-first stepping through the same bit process.
+///
+/// Floating-point parameters are deliberately bounded to the stable numerical
+/// domain used by the internal `f32` recurrent state and online SGD update.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct BitReservoirConfig {
+    /// Number of recurrent reservoir cells.
+    pub hidden: usize,
+    /// Number of previous raw bits exposed as a trainable delay line.
+    pub delay_bits: usize,
+    /// Base-2 size of each learned sparse history-embedding table.
+    ///
+    /// Memory for the sparse embedding weights is proportional to
+    /// `21 * 2^embedding_bits * sizeof(f32)` and is independent of input
+    /// length.
+    pub embedding_bits: usize,
+    /// Initial online SGD learning rate for the Bernoulli readout, in `[0, 1]`.
+    pub learning_rate: f64,
+    /// Per-phase learning-rate decay applied as `1 / sqrt(1 + decay * t)`.
+    pub learning_rate_decay: f64,
+    /// L2 shrinkage applied to readout weights on each online update, in `[0, 1]`.
+    pub weight_decay: f64,
+    /// Base recurrent-state retention in `[0, 1)`.
+    pub state_decay: f64,
+    /// Scale of fixed sparse recurrent couplings, in `[0, 16]`.
+    pub recurrent_scale: f64,
+    /// Scale of fixed bit-input couplings, in `[0, 16]`.
+    pub input_scale: f64,
+    /// Scale of fixed byte-phase couplings, in `[0, 16]`.
+    pub phase_scale: f64,
+    /// Absolute gradient clip for the readout update, in `(0, 16]`.
+    pub grad_clip: f64,
+    /// Deterministic seed for fixed recurrent parameters.
+    pub seed: u64,
+}
+
+impl Default for BitReservoirConfig {
+    fn default() -> Self {
+        Self {
+            hidden: 9,
+            delay_bits: 14,
+            embedding_bits: 18,
+            learning_rate: 0.06225,
+            learning_rate_decay: 1.0e-6,
+            weight_decay: 1.0e-7,
+            state_decay: 0.8778,
+            recurrent_scale: 0.62,
+            input_scale: 0.61,
+            phase_scale: 0.14,
+            grad_clip: 1.0,
+            seed: 0x4249_5452_4E4E_0001,
+        }
+    }
+}
+
+impl BitReservoirConfig {
+    /// Validate dimensions and finite numeric parameters.
+    pub fn validate(&self) -> InfotheoryResult<()> {
+        const MAX_LEARNING_RATE: f64 = 1.0;
+        const MAX_LEARNING_RATE_DECAY: f64 = 1.0e6;
+        const MAX_WEIGHT_DECAY: f64 = 1.0;
+        const MAX_COUPLING_SCALE: f64 = 16.0;
+        const MAX_GRAD_CLIP: f64 = 16.0;
+
+        if self.hidden == 0 || self.hidden > 4096 {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir hidden must be in 1..=4096",
+            ));
+        }
+        if self.delay_bits == 0 || self.delay_bits > 4096 {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir delay_bits must be in 1..=4096",
+            ));
+        }
+        if self.embedding_bits < 8 || self.embedding_bits > 22 {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir embedding_bits must be in 8..=22",
+            ));
+        }
+        if !self.learning_rate.is_finite()
+            || self.learning_rate < 0.0
+            || self.learning_rate > MAX_LEARNING_RATE
+        {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir learning_rate must be finite and in [0, 1]",
+            ));
+        }
+        if !self.learning_rate_decay.is_finite()
+            || self.learning_rate_decay < 0.0
+            || self.learning_rate_decay > MAX_LEARNING_RATE_DECAY
+        {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir learning_rate_decay must be finite and in [0, 1e6]",
+            ));
+        }
+        if !self.weight_decay.is_finite()
+            || self.weight_decay < 0.0
+            || self.weight_decay > MAX_WEIGHT_DECAY
+        {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir weight_decay must be finite and in [0, 1]",
+            ));
+        }
+        if !(self.state_decay.is_finite() && self.state_decay >= 0.0 && self.state_decay < 1.0) {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir state_decay must be finite and in [0, 1)",
+            ));
+        }
+        if !self.recurrent_scale.is_finite()
+            || self.recurrent_scale < 0.0
+            || self.recurrent_scale > MAX_COUPLING_SCALE
+        {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir recurrent_scale must be finite and in [0, 16]",
+            ));
+        }
+        if !self.input_scale.is_finite()
+            || self.input_scale < 0.0
+            || self.input_scale > MAX_COUPLING_SCALE
+        {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir input_scale must be finite and in [0, 16]",
+            ));
+        }
+        if !self.phase_scale.is_finite()
+            || self.phase_scale < 0.0
+            || self.phase_scale > MAX_COUPLING_SCALE
+        {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir phase_scale must be finite and in [0, 16]",
+            ));
+        }
+        if !self.grad_clip.is_finite() || self.grad_clip <= 0.0 || self.grad_clip > MAX_GRAD_CLIP {
+            return Err(InfotheoryError::invalid_backend_config(
+                "bit-reservoir grad_clip must be finite and in (0, 16]",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Core predictive model class used by the library.
 ///
 /// `RateBackend` is the shared model class behind entropy-rate estimation,
@@ -184,6 +333,12 @@ pub enum RateBackend {
     Rwkv7Method {
         /// RWKV7 method specification.
         method: crate::rwkvzip::MethodSpec,
+    },
+    #[cfg(feature = "backend-bit-reservoir")]
+    /// Bit-native reservoir predictor.
+    BitReservoir {
+        /// Reservoir model configuration.
+        config: BitReservoirConfig,
     },
     /// ZPAQ compression-based rate model (streamable methods only).
     Zpaq {
@@ -541,6 +696,8 @@ impl RateBackend {
             RateBackend::MambaMethod { .. } => crate::runtime::RateBackendKind::Mamba,
             #[cfg(feature = "backend-rwkv")]
             RateBackend::Rwkv7Method { .. } => crate::runtime::RateBackendKind::Rwkv7,
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackend::BitReservoir { .. } => crate::runtime::RateBackendKind::BitReservoir,
             RateBackend::Zpaq { .. } => crate::runtime::RateBackendKind::Zpaq,
             RateBackend::Mixture { .. } => crate::runtime::RateBackendKind::Mixture,
             RateBackend::Particle { .. } => crate::runtime::RateBackendKind::Particle,
@@ -827,6 +984,8 @@ fn validate_rate_backend_with_depth(backend: &RateBackend, depth: usize) -> Resu
         }
         RateBackend::Mixture { spec } => validate_mixture_spec_with_depth(spec.as_ref(), depth),
         RateBackend::Particle { spec } => spec.validate().map_err(|err| err.to_string()),
+        #[cfg(feature = "backend-bit-reservoir")]
+        RateBackend::BitReservoir { config } => config.validate().map_err(|err| err.to_string()),
         RateBackend::Calibrated { spec } => {
             if depth == 0 {
                 return Err("calibrated spec nesting too deep".to_string());
@@ -1054,5 +1213,118 @@ mod tests {
 
         let valid = MixtureSpec::new(MixtureKind::FadingBayes, vec![expert]).with_decay(0.5);
         validate_mixture_spec_shallow(&valid).expect("strictly interior decay should validate");
+    }
+
+    #[test]
+    fn validation_error_paths_preserve_public_contracts() {
+        let expert = MixtureExpertSpec::new(RateBackend::RosaPlus { max_order: -1 });
+
+        let switching =
+            MixtureSpec::new(MixtureKind::Switching, vec![expert.clone()]).with_alpha(1.1);
+        let err = validate_mixture_spec_shallow(&switching)
+            .expect_err("switching alpha outside [0, 1] should fail");
+        assert!(
+            err.contains("[0, 1]"),
+            "unexpected switching alpha error: {err}"
+        );
+
+        let convex = MixtureSpec::new(MixtureKind::Convex, vec![expert]).with_alpha(0.0);
+        let err = validate_mixture_spec_shallow(&convex)
+            .expect_err("convex alpha must be strictly positive");
+        assert!(err.contains("> 0"), "unexpected convex alpha error: {err}");
+
+        let sequitur = RateBackend::Sequitur { context_bytes: 1 };
+        let err = validate_rate_backend(&sequitur).expect_err("sequitur context should fail");
+        assert!(
+            err.to_string().contains("context_bytes"),
+            "unexpected sequitur validation error: {err}"
+        );
+
+        let compression = CompressionBackend::Rate {
+            rate_backend: sequitur,
+            coder: crate::coders::CoderType::AC,
+            framing: crate::compression::FramingMode::Raw,
+        };
+        let err = validate_compression_backend(&compression)
+            .expect_err("rate-coded compression should report nested rate backend errors");
+        assert!(
+            err.to_string()
+                .contains("rate-coded compression backend invalid"),
+            "unexpected compression validation error: {err}"
+        );
+    }
+
+    #[test]
+    fn bit_reservoir_config_validation_covers_public_contract() {
+        BitReservoirConfig::default()
+            .validate()
+            .expect("default bit-reservoir config should validate");
+
+        macro_rules! assert_invalid_bit_reservoir {
+            ($field:ident = $value:expr, $needle:literal) => {{
+                let mut config = BitReservoirConfig::default();
+                config.$field = $value;
+                let err = config
+                    .validate()
+                    .expect_err(concat!(stringify!($field), " should be invalid"));
+                assert!(
+                    err.to_string().contains($needle),
+                    "unexpected error for {}: {err}",
+                    stringify!($field)
+                );
+            }};
+        }
+
+        assert_invalid_bit_reservoir!(hidden = 0, "hidden");
+        assert_invalid_bit_reservoir!(delay_bits = 0, "delay_bits");
+        assert_invalid_bit_reservoir!(embedding_bits = 7, "embedding_bits");
+        assert_invalid_bit_reservoir!(learning_rate = f64::NAN, "learning_rate");
+        assert_invalid_bit_reservoir!(learning_rate_decay = -1.0, "learning_rate_decay");
+        assert_invalid_bit_reservoir!(weight_decay = 1.1, "weight_decay");
+        assert_invalid_bit_reservoir!(state_decay = 1.0, "state_decay");
+        assert_invalid_bit_reservoir!(recurrent_scale = 16.1, "recurrent_scale");
+        assert_invalid_bit_reservoir!(input_scale = -0.1, "input_scale");
+        assert_invalid_bit_reservoir!(phase_scale = f64::INFINITY, "phase_scale");
+        assert_invalid_bit_reservoir!(grad_clip = 0.0, "grad_clip");
+    }
+
+    #[test]
+    fn particle_spec_validation_covers_public_contract() {
+        ParticleSpec::default()
+            .validate()
+            .expect("default particle spec should validate");
+
+        macro_rules! assert_invalid_particle {
+            ($field:ident = $value:expr, $needle:literal) => {{
+                let mut spec = ParticleSpec::default();
+                spec.$field = $value;
+                let err = spec
+                    .validate()
+                    .expect_err(concat!(stringify!($field), " should be invalid"));
+                assert!(
+                    err.to_string().contains($needle),
+                    "unexpected error for {}: {err}",
+                    stringify!($field)
+                );
+            }};
+        }
+
+        assert_invalid_particle!(num_particles = 0, "num_particles");
+        assert_invalid_particle!(context_window = 0, "context_window");
+        assert_invalid_particle!(unroll_steps = 0, "unroll_steps");
+        assert_invalid_particle!(num_cells = 0, "num_cells");
+        assert_invalid_particle!(cell_dim = 0, "cell_dim");
+        assert_invalid_particle!(num_rules = 0, "num_rules");
+        assert_invalid_particle!(selector_hidden = 0, "selector_hidden");
+        assert_invalid_particle!(rule_hidden = 0, "rule_hidden");
+        assert_invalid_particle!(learning_rate_readout = -1.0, "learning_rate_readout");
+        assert_invalid_particle!(learning_rate_selector = f64::NAN, "learning_rate_selector");
+        assert_invalid_particle!(learning_rate_rule = -1.0, "learning_rate_rule");
+        assert_invalid_particle!(noise_scale = f64::NEG_INFINITY, "noise_scale");
+        assert_invalid_particle!(optimizer_momentum = 1.0, "optimizer_momentum");
+        assert_invalid_particle!(bptt_depth = 0, "bptt_depth");
+        assert_invalid_particle!(resample_threshold = 0.0, "resample_threshold");
+        assert_invalid_particle!(mutate_fraction = 1.1, "mutate_fraction");
+        assert_invalid_particle!(min_prob = 0.5, "min_prob");
     }
 }

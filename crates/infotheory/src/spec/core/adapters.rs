@@ -128,6 +128,16 @@ pub(crate) fn rate_plan_to_wrapper_rwkv7(plan: &RateBackendPlan) -> RateBackend 
     }
 }
 
+#[cfg(feature = "backend-bit-reservoir")]
+pub(crate) fn rate_plan_to_wrapper_bit_reservoir(plan: &RateBackendPlan) -> RateBackend {
+    let RateBackendPlan::BitReservoir { config } = plan else {
+        unreachable!("bit-reservoir wrapper kernel used with non-bit-reservoir plan");
+    };
+    RateBackend::BitReservoir {
+        config: config.clone(),
+    }
+}
+
 pub(crate) fn rate_plan_to_wrapper_mixture(plan: &RateBackendPlan) -> RateBackend {
     let RateBackendPlan::Mixture {
         kind,
@@ -436,6 +446,33 @@ pub(crate) fn rate_plan_default_name_rwkv7(plan: &RateBackendPlan) -> String {
     format!("rwkv7({method})")
 }
 
+#[cfg(feature = "backend-bit-reservoir")]
+pub(crate) fn rate_plan_display_label_bit_reservoir(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::BitReservoir { config } = plan else {
+        unreachable!("bit-reservoir label kernel used with non-bit-reservoir plan");
+    };
+    format!(
+        "bit-reservoir(hidden={},delay_bits={},embedding_bits={},lr={},decay={},seed={})",
+        config.hidden,
+        config.delay_bits,
+        config.embedding_bits,
+        config.learning_rate,
+        config.learning_rate_decay,
+        config.seed
+    )
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+pub(crate) fn rate_plan_default_name_bit_reservoir(plan: &RateBackendPlan) -> String {
+    let RateBackendPlan::BitReservoir { config } = plan else {
+        unreachable!("bit-reservoir default-name kernel used with non-bit-reservoir plan");
+    };
+    format!(
+        "bit-reservoir(h={},d={},eb={})",
+        config.hidden, config.delay_bits, config.embedding_bits
+    )
+}
+
 pub(crate) fn rate_plan_display_label_mixture(plan: &RateBackendPlan) -> String {
     let RateBackendPlan::Mixture { kind, .. } = plan else {
         unreachable!("mixture label kernel used with non-mixture plan");
@@ -656,6 +693,26 @@ pub(crate) fn encode_rate_payload_rwkv7(plan: &RateBackendPlan, out: &mut Vec<u8
     out.push(9);
     push_string(out, method);
     push_asset_ref(out, asset.as_ref());
+}
+
+#[cfg(feature = "backend-bit-reservoir")]
+pub(crate) fn encode_rate_payload_bit_reservoir(plan: &RateBackendPlan, out: &mut Vec<u8>) {
+    let RateBackendPlan::BitReservoir { config } = plan else {
+        unreachable!("bit-reservoir encoder kernel used with non-bit-reservoir plan");
+    };
+    out.push(13);
+    push_usize(out, config.hidden);
+    push_usize(out, config.delay_bits);
+    push_usize(out, config.embedding_bits);
+    push_f64(out, config.learning_rate);
+    push_f64(out, config.learning_rate_decay);
+    push_f64(out, config.weight_decay);
+    push_f64(out, config.state_decay);
+    push_f64(out, config.recurrent_scale);
+    push_f64(out, config.input_scale);
+    push_f64(out, config.phase_scale);
+    push_f64(out, config.grad_clip);
+    push_varint(out, config.seed);
 }
 
 pub(crate) fn encode_rate_payload_mixture(plan: &RateBackendPlan, out: &mut Vec<u8>) {

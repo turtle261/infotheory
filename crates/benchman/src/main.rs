@@ -34,6 +34,7 @@ const LEGACY_PLOT_SVG_SUFFIX: &str = ".svg";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BenchSuite {
     TwoJson,
+    OneSse,
     Extra,
 }
 
@@ -42,14 +43,18 @@ impl BenchSuite {
         let normalized = raw.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "two-json" | "two_json" | "two" | "core" | "full" => Ok(Self::TwoJson),
+            "one-sse" | "one_sse" | "one" => Ok(Self::OneSse),
             "extra" => Ok(Self::Extra),
-            _ => bail!("unknown benchmark suite '{raw}' (expected 'two-json' or 'extra')"),
+            _ => bail!(
+                "unknown benchmark suite '{raw}' (expected 'two-json', 'one-sse', or 'extra')"
+            ),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::TwoJson => "two-json",
+            Self::OneSse => "one-sse",
             Self::Extra => "extra",
         }
     }
@@ -57,6 +62,7 @@ impl BenchSuite {
     fn summary_prefix(self) -> &'static str {
         match self {
             Self::TwoJson => "infotheory-two-json",
+            Self::OneSse => "infotheory-one-sse",
             Self::Extra => "infotheory-extra",
         }
     }
@@ -64,6 +70,7 @@ impl BenchSuite {
     fn spec_label(self) -> &'static str {
         match self {
             Self::TwoJson => "configs/bench/two.json",
+            Self::OneSse => "configs/bench/one_sse.json",
             Self::Extra => "configs/bench/extra.json",
         }
     }
@@ -71,6 +78,7 @@ impl BenchSuite {
     fn focus_subjects(self) -> &'static [&'static str] {
         match self {
             Self::TwoJson => &["neural_mixture", "rwkv7"],
+            Self::OneSse => &["calibrated_mixture", "bit-reservoir"],
             Self::Extra => &["neural_mixture", "mamba"],
         }
     }
@@ -124,7 +132,7 @@ struct BenchCli {
         long,
         env = "INFOTHEORY_PLOT_SUITE",
         default_value = DEFAULT_BENCH_SUITE,
-        help = "Benchmark suite (`two-json` or `extra`) used for latest-summary discovery and plot regeneration"
+        help = "Benchmark suite (`two-json`, `one-sse`, or `extra`) used for latest-summary discovery and plot regeneration"
     )]
     suite: String,
 
@@ -1030,7 +1038,7 @@ fn plot_dir_deletion_policy(plot_dir: &Path) -> Result<PlotDirDeletionPolicy> {
 
 fn is_legacy_plot_svg_name(file_name: &str) -> bool {
     file_name.ends_with(LEGACY_PLOT_SVG_SUFFIX)
-        && [BenchSuite::TwoJson, BenchSuite::Extra]
+        && [BenchSuite::TwoJson, BenchSuite::OneSse, BenchSuite::Extra]
             .into_iter()
             .any(|suite| {
                 let expected_prefix = format!("{}-", suite.summary_prefix());
@@ -2439,6 +2447,21 @@ mod tests {
         let dir = TestDir::new("legacy-extra");
         fs::write(dir.path().join("infotheory-extra-h-rss-run.svg"), "<svg/>")
             .expect("failed to write legacy artifact");
+
+        assert_eq!(
+            plot_dir_deletion_policy(dir.path()).expect("policy should evaluate"),
+            PlotDirDeletionPolicy::LegacyArtifacts
+        );
+    }
+
+    #[test]
+    fn plot_dir_deletion_policy_accepts_one_sse_suite_artifacts() {
+        let dir = TestDir::new("legacy-one-sse");
+        fs::write(
+            dir.path().join("infotheory-one-sse-h-rss-run.svg"),
+            "<svg/>",
+        )
+        .expect("failed to write legacy artifact");
 
         assert_eq!(
             plot_dir_deletion_policy(dir.path()).expect("policy should evaluate"),

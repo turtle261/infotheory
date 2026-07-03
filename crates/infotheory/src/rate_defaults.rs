@@ -133,6 +133,12 @@ pub(crate) fn runtime_default_rate_backend_spec(kind: RateBackendKind) -> Option
             spec: Arc::new(crate::api::ParticleSpec::default()),
         }),
         RateBackendKind::Mixture | RateBackendKind::Calibrated => None,
+        #[cfg(feature = "backend-bit-reservoir")]
+        RateBackendKind::BitReservoir => Some(RateBackend::BitReservoir {
+            config: crate::api::BitReservoirConfig::default(),
+        }),
+        #[cfg(not(feature = "backend-bit-reservoir"))]
+        RateBackendKind::BitReservoir => None,
         #[cfg(feature = "backend-mamba")]
         RateBackendKind::Mamba => Some(RateBackend::MambaMethod {
             method: crate::mambazip::MethodSpec::Online {

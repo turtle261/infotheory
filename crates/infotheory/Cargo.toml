@@ -44,6 +44,7 @@ capability-statistical = [
     "backend-calibrated",
 ]
 capability-neural = [
+    "backend-bit-reservoir",
     "backend-mamba",
     "backend-rwkv",
 ]
@@ -67,6 +68,7 @@ backend-sequitur = []
 backend-mixture = []
 backend-particle = []
 backend-calibrated = []
+backend-bit-reservoir = []
 backend-mamba = []
 backend-rwkv = []
 backend-zpaq = ["dep:zpaq_rs"]

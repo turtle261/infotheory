@@ -69,6 +69,12 @@ configure_workload_preset() {
         "\"${bin_path}\" compress \"${WORKLOAD_INPUT}\" \"${out_dir}/two_json_rate_ac.itc\" --compression-backend rate-ac --rate-backend mixture --method \"${repo_root}/configs/bench/two.json\""
       )
       ;;
+    one-sse)
+      WORKLOAD_LABELS=("one_sse_rate_ac")
+      WORKLOAD_COMMANDS=(
+        "\"${bin_path}\" compress \"${WORKLOAD_INPUT}\" \"${out_dir}/one_sse_rate_ac.itc\" --compression-backend rate-ac --rate-backend calibrated --method \"${repo_root}/configs/bench/one_sse.json\""
+      )
+      ;;
     rwkv-all)
       WORKLOAD_LABELS=("rwkv_scope_all")
       WORKLOAD_COMMANDS=(

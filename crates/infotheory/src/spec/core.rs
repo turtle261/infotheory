@@ -4,6 +4,8 @@
 //! (`RateBackend`, `CompressionBackend`) and the compiled runtime plans used by
 //! the generic Rust API.
 
+#[cfg(feature = "backend-bit-reservoir")]
+use crate::api::BitReservoirConfig;
 use crate::api::{
     CalibratedSpec, CalibrationContextKind, CompressionBackend, MAX_MIXTURE_NESTING,
     MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, ParticleSpec, RateBackend,
@@ -219,6 +221,10 @@ pub(crate) enum RateBackendPlan {
         parsed_method: crate::rwkvzip::MethodSpec,
         asset: Option<AssetRef>,
     },
+    #[cfg(feature = "backend-bit-reservoir")]
+    BitReservoir {
+        config: BitReservoirConfig,
+    },
     Mixture {
         kind: MixtureKind,
         schedule: MixtureScheduleMode,
@@ -253,6 +259,8 @@ impl RateBackendPlan {
             RateBackendPlan::Mamba { .. } => crate::runtime::RateBackendKind::Mamba,
             #[cfg(feature = "backend-rwkv")]
             RateBackendPlan::Rwkv7 { .. } => crate::runtime::RateBackendKind::Rwkv7,
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPlan::BitReservoir { .. } => crate::runtime::RateBackendKind::BitReservoir,
             RateBackendPlan::Mixture { .. } => crate::runtime::RateBackendKind::Mixture,
             RateBackendPlan::Particle { .. } => crate::runtime::RateBackendKind::Particle,
             RateBackendPlan::Calibrated { .. } => crate::runtime::RateBackendKind::Calibrated,
