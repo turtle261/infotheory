@@ -10,6 +10,7 @@ BENCH_SUITE=${INFOTHEORY_BENCH_SUITE:-two-json}
 COMP_BACKEND=${INFOTHEORY_BENCH_COMPRESSION_BACKEND:-rate-ac}
 BENCH_FEATURES=${INFOTHEORY_BENCH_FEATURES:-cli}
 BENCH_BUILD_MODE=${INFOTHEORY_BENCH_BUILD_MODE:-${INFOTHEORY_BUILD_MODE:-native}}
+BENCH_OPERATIONS=${INFOTHEORY_BENCH_OPERATIONS:-"h compress decompress"}
 REPEATS=${INFOTHEORY_BENCH_REPEATS:-3}
 WARMUPS=${INFOTHEORY_BENCH_WARMUPS:-1}
 SIZES=${INFOTHEORY_BENCH_SIZES:-"4096 16384 65536 262144 1048576 2097152 4194304 10000000"}
@@ -94,6 +95,7 @@ Environment:
   INFOTHEORY_BENCH_SUBJECTS=rwkv7
   INFOTHEORY_BENCH_FEATURES="cli backend-rwkv"
   INFOTHEORY_BENCH_BUILD_MODE=native|portable
+  INFOTHEORY_BENCH_OPERATIONS="h compress decompress"
   INFOTHEORY_BENCH_CPU=11
   INFOTHEORY_BENCH_COMPRESSION_BACKEND=rate-ac
   INFOTHEORY_BENCH_WORKDIR_ROOT=/var/tmp
@@ -137,6 +139,24 @@ case " ${BENCH_FEATURES} " in
   *" cli "*) ;;
   *) BENCH_FEATURES="cli ${BENCH_FEATURES}" ;;
 esac
+
+BENCH_OPERATIONS=$(printf '%s' "${BENCH_OPERATIONS}" | tr ',' ' ' | xargs)
+[ -n "${BENCH_OPERATIONS}" ] || BENCH_OPERATIONS="h compress decompress"
+for op in ${BENCH_OPERATIONS}; do
+  case "${op}" in
+    h|compress|decompress) ;;
+    *)
+      fail "INFOTHEORY_BENCH_OPERATIONS may only contain h, compress, and decompress (found '${op}')"
+      ;;
+  esac
+done
+
+op_enabled() {
+  case " ${BENCH_OPERATIONS} " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 case "${BENCH_BUILD_MODE}" in
   native|portable) ;;
@@ -699,6 +719,7 @@ say "[bench] CPU affinity: ${CPU}"
 say "[bench] Compression backend: ${COMP_BACKEND}"
 say "[bench] Build mode: ${BENCH_BUILD_MODE}"
 say "[bench] Build features: ${BENCH_FEATURES}"
+say "[bench] Operations: ${BENCH_OPERATIONS}"
 say "[bench] Repeats: ${REPEATS}"
 say "[bench] Warmups: ${WARMUPS}"
 say "[bench] Sizes: ${SIZES}"
@@ -740,15 +761,15 @@ for size_bytes in ${SIZES}; do
     need_subject_work=0
     rep=1
     while [ "${rep}" -le "${REPEATS}" ]; do
-      if ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled h && ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_subject_work=1
         break
       fi
-      if ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled compress && ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_subject_work=1
         break
       fi
-      if ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled decompress && ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_subject_work=1
         break
       fi
@@ -766,10 +787,16 @@ for size_bytes in ${SIZES}; do
     while [ "${warmup_idx}" -le "${WARMUPS}" ]; do
       archive_path="${WORK_DIR}/warmup-${subject}-${size_bytes}.itc"
       restored_path="${WORK_DIR}/warmup-${subject}-${size_bytes}.out"
-      run_plain h "${input_path}" "${WORK_DIR}/unused" "${subject_kind}" "${spec_path}" "${h_order}"
-      run_plain compress "${input_path}" "${archive_path}" "${subject_kind}" "${spec_path}" "${h_order}"
-      run_plain decompress "${archive_path}" "${restored_path}" "${subject_kind}" "${spec_path}" "${h_order}"
-      cmp -s "${input_path}" "${restored_path}" || fail "Warmup round-trip failed for ${subject} at ${size_bytes} bytes"
+      if op_enabled h; then
+        run_plain h "${input_path}" "${WORK_DIR}/unused" "${subject_kind}" "${spec_path}" "${h_order}"
+      fi
+      if op_enabled compress || op_enabled decompress; then
+        run_plain compress "${input_path}" "${archive_path}" "${subject_kind}" "${spec_path}" "${h_order}"
+      fi
+      if op_enabled decompress; then
+        run_plain decompress "${archive_path}" "${restored_path}" "${subject_kind}" "${spec_path}" "${h_order}"
+        cmp -s "${input_path}" "${restored_path}" || fail "Warmup round-trip failed for ${subject} at ${size_bytes} bytes"
+      fi
       rm -f "${archive_path}" "${restored_path}"
       warmup_idx=$((warmup_idx + 1))
     done
@@ -787,13 +814,13 @@ for size_bytes in ${SIZES}; do
       need_decompress=0
       archive_ready=0
 
-      if ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled h && ! row_exists "h" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "-" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_h=1
       fi
-      if ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled compress && ! row_exists "compress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_compress=1
       fi
-      if ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
+      if op_enabled decompress && ! row_exists "decompress" "${subject}" "${size_bytes}" "${rep}" "${CPU}" "${COMP_BACKEND}" "${input_sha256}" "${SUITE_SPEC_SHA256}" "${BENCH_BUILD_MODE}" "${BENCH_FEATURES}"; then
         need_decompress=1
       fi
 
