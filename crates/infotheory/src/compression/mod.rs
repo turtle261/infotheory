@@ -745,6 +745,29 @@ impl PredictorBitwiseStepState {
         }
     }
 
+    fn observe_known_bit_msb(
+        &mut self,
+        predictor: &mut RatePdfPredictor,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<f64> {
+        match self {
+            Self::NativeRecursive => predictor.native_recursive_observe_known_bit_msb(bit_idx, bit),
+            Self::CachedCdf { range } => {
+                let p1 = predictor
+                    .cached_cdf_bit_prob_one_msb(*range)
+                    .expect("CachedCdf state invariant violated: missing cached CDF entry");
+                range.observe(bit);
+                Ok(p1)
+            }
+            Self::PdfPrefix { cdf, range } => {
+                let p1 = range.prob_one(cdf.as_ref(), PDF_MIN);
+                range.observe(bit);
+                Ok(p1)
+            }
+        }
+    }
+
     fn finish_symbol(&mut self, predictor: &mut RatePdfPredictor, symbol: u8) -> Result<()> {
         match self {
             Self::NativeRecursive => predictor.finish_native_recursive_bitwise_byte_step(symbol),
@@ -1347,6 +1370,34 @@ impl MixturePredictor {
             )?;
         }
         Ok(())
+    }
+
+    fn observe_known_bit_msb(&mut self, bit_idx: usize, bit: bool) -> Result<f64> {
+        let mut denom = 0.0;
+        let mut numer1 = 0.0;
+        for i in 0..self.experts.len() {
+            let p1 = self.bitwise_expert_states[i]
+                .bit_prob_one_msb(&mut self.experts[i].predictor, bit_idx)?;
+            let wp = self.scratch[i] * self.scratch2[i];
+            denom += wp;
+            numer1 += wp * p1;
+            let pb = if bit { p1 } else { 1.0 - p1 };
+            self.scratch2[i] = (self.scratch2[i] * pb).max(PDF_MIN);
+            self.bitwise_expert_states[i].observe_bit_msb(
+                &mut self.experts[i].predictor,
+                bit_idx,
+                bit,
+            )?;
+        }
+
+        Ok(if denom.is_finite() && denom > 0.0 {
+            (numer1 / denom).clamp(PDF_MIN, 1.0 - PDF_MIN)
+        } else {
+            panic!(
+                "MixturePredictor observe_known_bit_msb: invalid denom (finite>0 violated); \
+                 this is an internal invariant failure in the bitwise mixture state machine"
+            )
+        })
     }
 
     fn finish_bitwise_symbol(&mut self, symbol: u8) -> Result<()> {
@@ -2012,6 +2063,54 @@ impl RatePdfPredictor {
         }
     }
 
+    fn native_recursive_observe_known_bit_msb(&mut self, bit_idx: usize, bit: bool) -> Result<f64> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            Self::Ctw(m) | Self::FacCtw(m) => {
+                let p1 = m.bit_prob_one_msb(bit_idx);
+                m.update_bit_msb(bit_idx, bit);
+                Ok(p1)
+            }
+            #[cfg(feature = "backend-mixture")]
+            Self::Mixture(m) => m.observe_known_bit_msb(bit_idx, bit),
+            #[cfg(feature = "backend-bit-reservoir")]
+            Self::BitReservoir {
+                model,
+                native_prefix_progress,
+                valid,
+                native_prediction,
+                ..
+            } => {
+                validate_bit_reservoir_prefix_index(*native_prefix_progress, bit_idx)?;
+                if let Some(next_bit_idx) = native_prefix_progress {
+                    *next_bit_idx += 1;
+                }
+                let prediction = model.predict_for_training();
+                let p1 = prediction.prob_one().clamp(PDF_MIN, 1.0 - PDF_MIN);
+                model.observe_bit_with_prediction(bit, &prediction);
+                *native_prediction = None;
+                *valid = false;
+                Ok(p1)
+            }
+            #[cfg(feature = "backend-calibrated")]
+            Self::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                debug_assert!(core.byte_is_active());
+                let base_p1: f64 = bitwise.observe_known_bit_msb(base, bit_idx, bit)?;
+                let p1 = core.predict_bit_unchecked(base_p1);
+                core.observe_bit_unchecked(bit);
+                *valid = false;
+                Ok(p1)
+            }
+            _ => bail!("native recursive bitwise stepping is unavailable for this predictor"),
+        }
+    }
+
     fn finish_native_recursive_bitwise_byte_step(&mut self, symbol: u8) -> Result<()> {
         match self {
             #[cfg(feature = "backend-ctw")]
@@ -2086,6 +2185,27 @@ impl RatePdfPredictor {
     {
         debug_assert!(self.can_fast_ac_bitwise());
         self.ac_step_bitwise(choose_bit)
+    }
+
+    fn encode_known_symbol_ac_fast_bitwise(
+        &mut self,
+        symbol: u8,
+        encoder: &mut ArithmeticEncoder<&mut Vec<u8>>,
+    ) -> Result<()> {
+        debug_assert!(self.can_fast_ac_bitwise());
+        let mut state = PredictorBitwiseStepState::default();
+        state.prepare(self)?;
+        for bit_idx in 0..8usize {
+            let bit = ((symbol >> (7 - bit_idx)) & 1) == 1;
+            let p1_mix = state.observe_known_bit_msb(self, bit_idx, bit)?;
+            let split = binary_split_from_prob_one(p1_mix);
+            if bit {
+                encoder.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
+            } else {
+                encoder.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
+            }
+        }
+        state.finish_symbol(self, symbol)
     }
 
     fn diagnostic_snapshot_subtree(
@@ -2205,16 +2325,7 @@ fn encode_payload_ac_fast_bitwise(
     {
         let mut enc = ArithmeticEncoder::new(&mut out);
         for &symbol in data {
-            predictor.ac_step_fast_bitwise(|bit_idx, p1_mix| {
-                let bit = (symbol >> (7 - bit_idx)) & 1;
-                let split = binary_split_from_prob_one(p1_mix);
-                if bit == 0 {
-                    enc.encode_counts(0, split as u64, CDF_TOTAL as u64)?;
-                } else {
-                    enc.encode_counts(split as u64, CDF_TOTAL as u64, CDF_TOTAL as u64)?;
-                }
-                Ok(bit)
-            })?;
+            predictor.encode_known_symbol_ac_fast_bitwise(symbol, &mut enc)?;
         }
         let _ = enc.finish()?;
     }

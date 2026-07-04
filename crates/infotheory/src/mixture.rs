@@ -426,6 +426,38 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
         Ok(false)
     }
 
+    /// Whether an empty native MSB-first byte-prefix step can be aborted exactly.
+    ///
+    /// Returning `true` is a strict refinement of
+    /// [`Self::has_native_msb_byte_prefix`]: every implementation that returns
+    /// `true` here must also return `true` from
+    /// [`Self::has_native_msb_byte_prefix`]. Callers may rely on that
+    /// implication and use this predicate as the complete "abortable native
+    /// prefix" capability check.
+    ///
+    /// Returning `true` promises that after
+    /// [`Self::begin_native_msb_byte_prefix`] returns `Ok(true)`, calling
+    /// [`Self::abort_empty_native_msb_byte_prefix`] before any observed bits
+    /// returns `Ok(true)` and restores the predictor to its pre-prefix state.
+    /// Mixtures rely on this capability to preserve their setup rollback
+    /// contract without taking structural checkpoints for every expert.
+    fn supports_empty_native_msb_prefix_abort(&self) -> bool {
+        false
+    }
+
+    /// Whether this predictor supports native prefix stepping with exact empty abort.
+    fn has_abortable_native_msb_byte_prefix(&self) -> bool {
+        let supports_abort: bool = self.supports_empty_native_msb_prefix_abort();
+        #[cfg(debug_assertions)]
+        if supports_abort {
+            assert!(
+                self.has_native_msb_byte_prefix(),
+                "supports_empty_native_msb_prefix_abort() must imply has_native_msb_byte_prefix()"
+            );
+        }
+        supports_abort
+    }
+
     /// Abort an active native MSB-first byte-prefix step before any bits have
     /// been observed.
     ///
@@ -451,6 +483,21 @@ pub trait OnlineBytePredictor: Send + OnlineBytePredictorClone {
     /// prefix, counted MSB-first in `0..8`.
     fn observe_native_msb_prefix_bit(&mut self, _bit_idx: usize, _bit: bool) -> Result<(), String> {
         Err("native MSB-first byte-prefix stepping is unavailable".to_string())
+    }
+
+    /// Return `P(bit = 1)` and observe a known MSB-first prefix bit.
+    ///
+    /// The default preserves the ordinary predict-then-observe contract.
+    /// Predictors with native bitwise mixtures can override it to avoid a
+    /// second expert pass when the caller already knows the observed bit.
+    fn observe_known_native_msb_prefix_bit(
+        &mut self,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<f64, String> {
+        let p1: f64 = self.native_msb_prefix_prob_one(bit_idx)?;
+        self.observe_native_msb_prefix_bit(bit_idx, bit)?;
+        Ok(p1)
     }
 
     /// Finish an active native byte-prefix step after all eight bits are known.
@@ -585,7 +632,9 @@ impl BytePrefixStepState {
     }
 
     fn prepare(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
-        if predictor.begin_native_msb_byte_prefix()? {
+        if predictor.has_abortable_native_msb_byte_prefix()
+            && predictor.begin_native_msb_byte_prefix()?
+        {
             self.kind = BytePrefixStepStateKind::Native;
             return Ok(());
         }
@@ -634,10 +683,34 @@ impl BytePrefixStepState {
         }
     }
 
+    fn observe_known(
+        &mut self,
+        predictor: &mut dyn OnlineBytePredictor,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<f64, String> {
+        match &mut self.kind {
+            BytePrefixStepStateKind::Native => {
+                predictor.observe_known_native_msb_prefix_bit(bit_idx, bit)
+            }
+            BytePrefixStepStateKind::PdfPrefix { cdf, range } => {
+                let p1: f64 = range.prob_one(cdf.as_ref(), DEFAULT_MIN_PROB);
+                range.observe(bit);
+                Ok(p1)
+            }
+        }
+    }
+
     fn abort_empty(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
         match &mut self.kind {
             BytePrefixStepStateKind::Native => {
-                predictor.abort_empty_native_msb_byte_prefix()?;
+                let aborted: bool = predictor.abort_empty_native_msb_byte_prefix()?;
+                if !aborted {
+                    return Err(
+                        "native MSB-first byte-prefix abort reported no active empty prefix"
+                            .to_string(),
+                    );
+                }
                 *self = Self::new();
                 Ok(())
             }
@@ -700,36 +773,13 @@ impl MixtureBitPrefixState {
     fn begin(&mut self, experts: &mut [ExpertState], weights: &[f64]) -> Result<bool, String> {
         if !experts
             .iter()
-            .any(|expert| expert.predictor.has_native_msb_byte_prefix())
+            .any(|expert| expert.predictor.has_abortable_native_msb_byte_prefix())
         {
             self.reset_inactive();
             return Ok(false);
         }
 
         let n: usize = experts.len();
-        let mut native_checkpoints: Vec<ExpertTempCheckpoint> = Vec::new();
-        for (idx, expert) in experts.iter_mut().enumerate() {
-            if !expert.predictor.has_native_msb_byte_prefix() {
-                continue;
-            }
-            let Some(checkpoint) = expert.predictor.checkpoint_if_supported() else {
-                for checkpoint in native_checkpoints.drain(..) {
-                    assert!(
-                        experts[checkpoint.index]
-                            .predictor
-                            .discard_checkpoint_if_supported(checkpoint.checkpoint),
-                        "native-prefix expert checkpoint could not be discarded",
-                    );
-                }
-                self.reset_inactive();
-                return Ok(false);
-            };
-            native_checkpoints.push(ExpertTempCheckpoint {
-                index: idx,
-                checkpoint,
-            });
-        }
-
         self.states.resize_with(n, BytePrefixStepState::new);
         self.weights.clear();
         self.weights.extend(weights.iter().copied());
@@ -740,33 +790,24 @@ impl MixtureBitPrefixState {
         self.logps.resize(n, 0.0);
         self.primed_bit_idx = None;
         self.expected_bit_idx = 0;
-        for (state, expert) in self.states.iter_mut().zip(experts.iter_mut()) {
+        let mut native_started: bool = false;
+        for idx in 0..n {
+            let state = &mut self.states[idx];
+            let expert = &mut experts[idx];
             if let Err(err) = state.prepare(expert.predictor.as_mut()) {
-                for checkpoint in native_checkpoints.drain(..) {
-                    assert!(
-                        experts[checkpoint.index]
-                            .predictor
-                            .restore_checkpoint_if_supported(&checkpoint.checkpoint),
-                        "native-prefix expert checkpoint could not be restored",
-                    );
-                    assert!(
-                        experts[checkpoint.index]
-                            .predictor
-                            .discard_checkpoint_if_supported(checkpoint.checkpoint),
-                        "native-prefix expert checkpoint could not be discarded",
-                    );
+                for rollback_idx in (0..idx).rev() {
+                    self.states[rollback_idx]
+                        .abort_empty(experts[rollback_idx].predictor.as_mut())
+                        .expect("prepared native-prefix expert could not be aborted after setup failure");
                 }
                 self.reset_inactive();
                 return Err(err);
             }
+            native_started |= state.is_native();
         }
-        for checkpoint in native_checkpoints.drain(..) {
-            assert!(
-                experts[checkpoint.index]
-                    .predictor
-                    .discard_checkpoint_if_supported(checkpoint.checkpoint),
-                "native-prefix expert checkpoint could not be discarded",
-            );
+        if !native_started {
+            self.reset_inactive();
+            return Ok(false);
         }
         self.active = true;
         Ok(true)
@@ -857,6 +898,48 @@ impl MixtureBitPrefixState {
         Ok(())
     }
 
+    fn observe_known(
+        &mut self,
+        experts: &mut [ExpertState],
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<f64, String> {
+        debug_assert!(self.active);
+        self.validate_bit_idx(bit_idx)?;
+        let use_primed: bool = self.primed_bit_idx == Some(bit_idx);
+        let mut denom: f64 = 0.0;
+        let mut numer: f64 = 0.0;
+
+        // Index form is clearest for coordinated mutation of likelihoods,
+        // cached bit probabilities, per-expert prefix state, and experts[idx].
+        #[allow(clippy::needless_range_loop)]
+        for idx in 0..experts.len() {
+            let p1: f64 = if use_primed {
+                let p1: f64 = self.bit_probs[idx];
+                self.states[idx].observe(experts[idx].predictor.as_mut(), bit_idx, bit)?;
+                p1
+            } else {
+                self.states[idx].observe_known(experts[idx].predictor.as_mut(), bit_idx, bit)?
+            };
+            let weighted_prefix: f64 = self.weights[idx] * self.likelihoods[idx];
+            denom += weighted_prefix;
+            numer += weighted_prefix * p1;
+            let pb: f64 = if bit { p1 } else { 1.0 - p1 };
+            self.likelihoods[idx] = (self.likelihoods[idx] * pb).max(DEFAULT_MIN_PROB);
+        }
+        self.expected_bit_idx += 1;
+        self.primed_bit_idx = None;
+
+        Ok(if denom.is_finite() && denom > 0.0 {
+            (numer / denom).clamp(DEFAULT_MIN_PROB, 1.0 - DEFAULT_MIN_PROB)
+        } else {
+            panic!(
+                "MixtureBitPrefixState::observe_known: invalid weighted denom (must be finite > 0); \
+                 this indicates a bug in known-bit prefix scoring or expert likelihoods"
+            )
+        })
+    }
+
     fn finish_adaptive(&mut self, experts: &mut [ExpertState], symbol: u8) -> Result<(), String> {
         debug_assert!(self.active);
         if self.expected_bit_idx != 8 {
@@ -875,11 +958,6 @@ impl MixtureBitPrefixState {
         self.reset_inactive();
         Ok(())
     }
-}
-
-struct ExpertTempCheckpoint {
-    index: usize,
-    checkpoint: OnlineBytePredictorCheckpoint,
 }
 
 #[cfg(feature = "backend-rwkv")]
@@ -2250,11 +2328,12 @@ impl RateBackendPredictor {
         let min_prob: f64 = min_prob.clamp(f64::MIN_POSITIVE, 0.5);
         let mut logp: f64 = 0.0;
         for bit_idx in 0..8usize {
-            let p1: f64 = <Self as OnlineBytePredictor>::native_msb_prefix_prob_one(self, bit_idx)?;
             let bit: bool = (symbol & (1u8 << (7 - bit_idx))) != 0;
+            let p1: f64 = <Self as OnlineBytePredictor>::observe_known_native_msb_prefix_bit(
+                self, bit_idx, bit,
+            )?;
             let p_bit: f64 = if bit { p1 } else { 1.0 - p1 };
             logp += p_bit.clamp(min_prob, 1.0 - min_prob).ln();
-            <Self as OnlineBytePredictor>::observe_native_msb_prefix_bit(self, bit_idx, bit)?;
         }
         <Self as OnlineBytePredictor>::finish_native_msb_byte_prefix(self, symbol)?;
         Ok(logp)
@@ -2991,6 +3070,30 @@ impl OnlineBytePredictor for RateBackendPredictor {
         }
     }
 
+    fn supports_empty_native_msb_prefix_abort(&self) -> bool {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                bits_per_symbol, ..
+            } => *bits_per_symbol == 8,
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                bits_per_symbol,
+                msb_first,
+                ..
+            } => *bits_per_symbol == 8 && *msb_first,
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.supports_empty_native_msb_prefix_abort()
+            }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated { .. } => true,
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir { .. } => true,
+            _ => false,
+        }
+    }
+
     fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
         RateBackendPredictor::abort_empty_native_msb_byte_prefix(self)
     }
@@ -3137,6 +3240,95 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 bitwise.observe(base.as_mut(), bit_idx, bit)?;
                 *valid = false;
                 Ok(())
+            }
+            _ => Err("native MSB-first byte-prefix stepping is unavailable".to_string()),
+        }
+    }
+
+    fn observe_known_native_msb_prefix_bit(
+        &mut self,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<f64, String> {
+        match self {
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::Ctw {
+                tree,
+                min_prob,
+                checkpoint_journal,
+                checkpoint_depth,
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_mut()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                let p: f64 = tree.predict(true).clamp(*min_prob, 1.0 - *min_prob);
+                *next_bit_idx += 1;
+                tree.update(bit);
+                if *checkpoint_depth > 0 {
+                    checkpoint_journal.push(CtwUndoOp::LearnedBit);
+                }
+                Ok(p)
+            }
+            #[cfg(feature = "backend-ctw")]
+            RateBackendPredictor::FacCtw {
+                tree,
+                min_prob,
+                checkpoint_journal,
+                checkpoint_depth,
+                native_prefix_progress,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_mut()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                let p: f64 = tree.predict_one(bit_idx).clamp(*min_prob, 1.0 - *min_prob);
+                *next_bit_idx += 1;
+                tree.update_predicted(bit, bit_idx);
+                if *checkpoint_depth > 0 {
+                    checkpoint_journal.push(FacCtwUndoOp::LearnedBit { bit_idx });
+                }
+                Ok(p)
+            }
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => {
+                runtime.observe_known_native_msb_prefix_bit(bit_idx, bit)
+            }
+            #[cfg(feature = "backend-bit-reservoir")]
+            RateBackendPredictor::BitReservoir {
+                model,
+                min_prob,
+                native_prefix_progress,
+                native_prediction,
+                ..
+            } => {
+                let next_bit_idx = native_prefix_progress
+                    .as_mut()
+                    .ok_or_else(|| "native MSB-first byte-prefix step is not active".to_string())?;
+                validate_native_msb_prefix_bit_idx(*next_bit_idx, bit_idx)?;
+                *next_bit_idx += 1;
+                let prediction = model.predict_for_training();
+                let p1 = prediction.prob_one().clamp(*min_prob, 1.0 - *min_prob);
+                model.observe_bit_with_prediction(bit, &prediction);
+                *native_prediction = None;
+                Ok(p1)
+            }
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated {
+                base,
+                core,
+                bitwise,
+                valid,
+                ..
+            } => {
+                let base_p1: f64 = bitwise.observe_known(base.as_mut(), bit_idx, bit)?;
+                let p1: f64 = core.predict_bit(bit_idx, base_p1)?;
+                core.observe_bit(bit_idx, bit)?;
+                *valid = false;
+                Ok(p1)
             }
             _ => Err("native MSB-first byte-prefix stepping is unavailable".to_string()),
         }
@@ -6656,6 +6848,19 @@ impl MixtureRuntime {
         }
     }
 
+    pub(crate) fn supports_empty_native_msb_prefix_abort(&self) -> bool {
+        match self {
+            MixtureRuntime::Bayes(m) => experts_have_abortable_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Fading(m) => experts_have_abortable_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Switching(m) => {
+                experts_have_abortable_native_msb_byte_prefix(&m.experts)
+            }
+            MixtureRuntime::Convex(m) => experts_have_abortable_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Mdl(m) => experts_have_abortable_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Neural(m) => experts_have_abortable_native_msb_byte_prefix(&m.experts),
+        }
+    }
+
     pub(crate) fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
         match self {
             MixtureRuntime::Bayes(m) => {
@@ -6731,6 +6936,21 @@ impl MixtureRuntime {
         }
     }
 
+    pub(crate) fn observe_known_native_msb_prefix_bit(
+        &mut self,
+        bit_idx: usize,
+        bit: bool,
+    ) -> Result<f64, String> {
+        match self {
+            MixtureRuntime::Bayes(m) => m.bitwise.observe_known(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Fading(m) => m.bitwise.observe_known(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Switching(m) => m.bitwise.observe_known(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Convex(m) => m.bitwise.observe_known(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Mdl(m) => m.bitwise.observe_known(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Neural(m) => m.bitwise.observe_known(&mut m.experts, bit_idx, bit),
+        }
+    }
+
     pub(crate) fn finish_native_msb_byte_prefix(&mut self, symbol: u8) -> Result<(), String> {
         match self {
             MixtureRuntime::Bayes(m) => finish_bayes_native_prefix(m, symbol),
@@ -6747,6 +6967,12 @@ fn experts_have_native_msb_byte_prefix(experts: &[ExpertState]) -> bool {
     experts
         .iter()
         .any(|expert| expert.predictor.has_native_msb_byte_prefix())
+}
+
+fn experts_have_abortable_native_msb_byte_prefix(experts: &[ExpertState]) -> bool {
+    experts
+        .iter()
+        .any(|expert| expert.predictor.has_abortable_native_msb_byte_prefix())
 }
 
 fn normalized_expert_log_weights(experts: &[ExpertState]) -> Vec<f64> {
@@ -7229,6 +7455,36 @@ mod lifecycle_tests {
     }
 }
 
+#[cfg(all(test, debug_assertions))]
+mod native_prefix_contract_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct InconsistentAbortablePrefixPredict;
+
+    impl OnlineBytePredictor for InconsistentAbortablePrefixPredict {
+        fn log_prob(&mut self, _symbol: u8) -> f64 {
+            0.0
+        }
+
+        fn update(&mut self, _symbol: u8) {}
+
+        fn supports_empty_native_msb_prefix_abort(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "supports_empty_native_msb_prefix_abort() must imply has_native_msb_byte_prefix()"
+    )]
+    fn abortable_native_prefix_requires_native_prefix_support() {
+        let predictor = InconsistentAbortablePrefixPredict;
+
+        let _ = predictor.has_abortable_native_msb_byte_prefix();
+    }
+}
+
 #[cfg(all(test, feature = "all-backends"))]
 mod tests {
     use super::*;
@@ -7325,6 +7581,14 @@ mod tests {
             Ok(true)
         }
 
+        fn supports_empty_native_msb_prefix_abort(&self) -> bool {
+            true
+        }
+
+        fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+            Ok(true)
+        }
+
         fn native_msb_prefix_prob_one(&mut self, _bit_idx: usize) -> Result<f64, String> {
             Ok(self.prob_one)
         }
@@ -7340,37 +7604,14 @@ mod tests {
         fn finish_native_msb_byte_prefix(&mut self, _symbol: u8) -> Result<(), String> {
             Ok(())
         }
-
-        // Dummy checkpoint methods so that MixtureBitPrefixState::begin succeeds
-        // for this mock (which advertises native MSB support). These are safe
-        // no-ops: the test mock performs no real mutation, and begin discards
-        // the captured checkpoints on the happy path after all experts prepare.
-        fn checkpoint_if_supported(&mut self) -> Option<OnlineBytePredictorCheckpoint> {
-            Some(OnlineBytePredictorCheckpoint::rate_backend(
-                RateBackendPredictorCheckpoint::Full(Box::new(RateBackendPredictor::Disabled {
-                    reason: "dummy_test_checkpoint".to_string(),
-                })),
-            ))
-        }
-
-        fn restore_checkpoint_if_supported(
-            &mut self,
-            _checkpoint: &OnlineBytePredictorCheckpoint,
-        ) -> bool {
-            true
-        }
-
-        fn discard_checkpoint_if_supported(
-            &mut self,
-            _checkpoint: OnlineBytePredictorCheckpoint,
-        ) -> bool {
-            true
-        }
     }
 
     #[derive(Clone)]
     struct NativeWithoutCheckpointPredict {
         begin_calls: Arc<AtomicUsize>,
+        abort_calls: Arc<AtomicUsize>,
+        fail_begin: bool,
+        supports_empty_abort: bool,
     }
 
     impl OnlineBytePredictor for NativeWithoutCheckpointPredict {
@@ -7386,7 +7627,36 @@ mod tests {
 
         fn begin_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
             self.begin_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_begin {
+                Err("intentional native-prefix begin failure".to_string())
+            } else {
+                Ok(true)
+            }
+        }
+
+        fn supports_empty_native_msb_prefix_abort(&self) -> bool {
+            self.supports_empty_abort
+        }
+
+        fn abort_empty_native_msb_byte_prefix(&mut self) -> Result<bool, String> {
+            self.abort_calls.fetch_add(1, Ordering::Relaxed);
             Ok(true)
+        }
+
+        fn native_msb_prefix_prob_one(&mut self, _bit_idx: usize) -> Result<f64, String> {
+            Ok(0.5)
+        }
+
+        fn observe_native_msb_prefix_bit(
+            &mut self,
+            _bit_idx: usize,
+            _bit: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn finish_native_msb_byte_prefix(&mut self, _symbol: u8) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -7467,12 +7737,50 @@ mod tests {
     }
 
     #[test]
-    fn mixture_bit_prefix_skips_native_mode_without_checkpoint_support() {
+    fn mixture_bit_prefix_enters_native_mode_without_checkpoint_support() {
         let begin_calls = Arc::new(AtomicUsize::new(0));
+        let abort_calls = Arc::new(AtomicUsize::new(0));
         let shared = Arc::clone(&begin_calls);
+        let shared_aborts = Arc::clone(&abort_calls);
         let configs = [ExpertConfig::uniform("native", move || {
             Box::new(NativeWithoutCheckpointPredict {
                 begin_calls: Arc::clone(&shared),
+                abort_calls: Arc::clone(&shared_aborts),
+                fail_begin: false,
+                supports_empty_abort: true,
+            })
+        })];
+        let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
+        let mut bitwise = MixtureBitPrefixState::default();
+
+        assert!(
+            bitwise.begin(&mut experts, &[1.0]).expect("begin"),
+            "native prefix setup should not require structural checkpoints on the happy path"
+        );
+        assert_eq!(
+            begin_calls.load(Ordering::Relaxed),
+            1,
+            "native expert should be entered exactly once"
+        );
+        assert_eq!(
+            abort_calls.load(Ordering::Relaxed),
+            0,
+            "successful setup must not abort the native expert"
+        );
+    }
+
+    #[test]
+    fn mixture_bit_prefix_declines_native_mode_without_empty_abort_support() {
+        let begin_calls = Arc::new(AtomicUsize::new(0));
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::clone(&begin_calls);
+        let shared_aborts = Arc::clone(&abort_calls);
+        let configs = [ExpertConfig::uniform("native-no-abort", move || {
+            Box::new(NativeWithoutCheckpointPredict {
+                begin_calls: Arc::clone(&shared),
+                abort_calls: Arc::clone(&shared_aborts),
+                fail_begin: false,
+                supports_empty_abort: false,
             })
         })];
         let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
@@ -7480,12 +7788,67 @@ mod tests {
 
         assert!(
             !bitwise.begin(&mut experts, &[1.0]).expect("begin"),
-            "native prefix should be disabled when rollback checkpoints are unavailable"
+            "native prefix setup must fall back unless empty-prefix abort is advertised"
         );
         assert_eq!(
             begin_calls.load(Ordering::Relaxed),
             0,
-            "unsupported native experts must not be entered speculatively"
+            "non-abortable native experts must not be entered speculatively"
+        );
+        assert_eq!(
+            abort_calls.load(Ordering::Relaxed),
+            0,
+            "nothing should be aborted when native setup is declined before entry"
+        );
+    }
+
+    #[test]
+    fn mixture_bit_prefix_aborts_prepared_native_experts_after_setup_failure() {
+        let first_begin_calls = Arc::new(AtomicUsize::new(0));
+        let first_abort_calls = Arc::new(AtomicUsize::new(0));
+        let second_begin_calls = Arc::new(AtomicUsize::new(0));
+        let second_abort_calls = Arc::new(AtomicUsize::new(0));
+        let first_begin = Arc::clone(&first_begin_calls);
+        let first_abort = Arc::clone(&first_abort_calls);
+        let second_begin = Arc::clone(&second_begin_calls);
+        let second_abort = Arc::clone(&second_abort_calls);
+
+        let configs = [
+            ExpertConfig::uniform("prepared", move || {
+                Box::new(NativeWithoutCheckpointPredict {
+                    begin_calls: Arc::clone(&first_begin),
+                    abort_calls: Arc::clone(&first_abort),
+                    fail_begin: false,
+                    supports_empty_abort: true,
+                })
+            }),
+            ExpertConfig::uniform("failing", move || {
+                Box::new(NativeWithoutCheckpointPredict {
+                    begin_calls: Arc::clone(&second_begin),
+                    abort_calls: Arc::clone(&second_abort),
+                    fail_begin: true,
+                    supports_empty_abort: true,
+                })
+            }),
+        ];
+        let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
+        let mut bitwise = MixtureBitPrefixState::default();
+
+        let err = bitwise
+            .begin(&mut experts, &[0.5, 0.5])
+            .expect_err("second native expert should fail during setup");
+        assert!(err.contains("intentional native-prefix begin failure"));
+        assert_eq!(first_begin_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first_abort_calls.load(Ordering::Relaxed),
+            1,
+            "prepared native expert must be returned to its pre-prefix state"
+        );
+        assert_eq!(second_begin_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            second_abort_calls.load(Ordering::Relaxed),
+            0,
+            "the failing expert must not be aborted after an unsuccessful begin"
         );
     }
 

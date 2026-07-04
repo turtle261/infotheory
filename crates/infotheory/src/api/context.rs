@@ -1663,12 +1663,12 @@ mod tests {
         assert_eq!(ctw_checkpoint_depth(&session), 1);
     }
 
-    /// When static native MSB support is advertised but dynamic begin negotiation
-    /// returns `Ok(false)` (e.g. mixture expert lacks checkpoint rollback), `predict_bit`
-    /// must fall back to the BytePrefixMass path without debug-only false positives.
+    /// When static native MSB support is advertised without the empty-abort
+    /// capability needed by mixture setup rollback, `predict_bit` must fall back
+    /// to the BytePrefixMass path without debug-only false positives.
     #[cfg(feature = "backend-mixture")]
     #[test]
-    fn predict_bit_mass_fallback_when_native_begin_returns_false() {
+    fn predict_bit_mass_fallback_when_native_setup_is_not_abortable() {
         use crate::mixture::{
             BayesMixture, DEFAULT_MIN_PROB, ExpertConfig, MixtureRuntime, RateBackendPredictor,
         };
