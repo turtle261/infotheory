@@ -3,9 +3,9 @@
 use super::compression::{NcdVariant, try_ncd_bytes_backend};
 use super::generation::{GenerationRng, pick_generated_byte, try_generate_rate_backend_chain};
 use super::metrics::{
-    empirical_entropy_bytes, try_biased_entropy_rate_backend, try_cross_entropy_rate_backend,
-    try_entropy_rate_backend, try_joint_entropy_rate_backend, try_mutual_information_rate_backend,
-    try_ned_rate_backend, try_nte_rate_backend,
+    empirical_entropy_bits, empirical_entropy_bytes, try_biased_entropy_rate_backend,
+    try_cross_entropy_rate_backend, try_entropy_rate_backend, try_joint_entropy_rate_backend,
+    try_mutual_information_rate_backend, try_ned_rate_backend, try_nte_rate_backend,
 };
 use super::types::{CompressionBackend, GenerationConfig, GenerationUpdateMode, RateBackend};
 use crate::aligned_prefix;
@@ -1201,6 +1201,23 @@ impl InfotheoryCtx {
         }
         let h_rate = self.try_entropy_rate_bytes(data)?;
         Ok(((h_empirical - h_rate) / h_empirical).clamp(0.0, 1.0))
+    }
+
+    /// Bitwise intrinsic dependence in `[0,1]`:
+    /// `(H₀,bits(X) - Ĥ_per_bit(X)) / H₀,bits(X)`.
+    ///
+    /// Uses the pooled binary-alphabet empirical entropy as the IID baseline and
+    /// the context rate backend expressed in bits-per-bit (`Ĥ_bytes / 8`). This
+    /// is **not** `try_intrinsic_dependence_bytes / 8`: the baseline alphabet
+    /// changes, so values differ (and can attribute intra-byte framing as
+    /// "dependence" relative to a memoryless bit model).
+    pub fn try_intrinsic_dependence_bits(&self, data: &[u8]) -> InfotheoryResult<f64> {
+        let h_empirical = empirical_entropy_bits(data);
+        if h_empirical < 1e-9 {
+            return Ok(0.0);
+        }
+        let h_rate_per_bit = self.try_entropy_rate_bytes(data)? / 8.0;
+        Ok(((h_empirical - h_rate_per_bit) / h_empirical).clamp(0.0, 1.0))
     }
 
     /// Resistance-to-transformation ratio `I(X;T(X))/H(X)` in `[0,1]` under this context's rate backend.

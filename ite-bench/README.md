@@ -16,16 +16,21 @@ This project validates the `infotheory` Rust crate against mathematically-define
 
 To run the full validation suite:
 
-```bash
-lake build
+lake build runner
 lake exe runner
+
+Or via the project manager (builds the CLI first when used through `test_full`):
+
+```bash
+./projman.sh lean_test
 ```
 
 This will:
-1.  Compile the Rust `infotheory` binary.
+1.  Compile the Rust `infotheory` binary (required for CLI-backed checks).
 2.  Generate synthetic data (Uniform, Independent, etc.) using Lean oracles.
 3.  Run the Rust estimator on this data.
 4.  Verify results against Oracle Truth (theoretical value) and structural identities.
+5.  Cross-check Rust `_bits` / `_per_bit` primitives against Lean reference definitions in `ITE/Bitwise.lean`.
 
 ## Validation Results
 

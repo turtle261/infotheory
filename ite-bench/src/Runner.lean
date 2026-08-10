@@ -3,6 +3,7 @@ import ITE.Oracles
 import ITE.Verification
 import ITE.Estimators
 import ITE.Sequitur
+import ITE.Bitwise
 
 open ITE
 open Std
@@ -423,6 +424,10 @@ private def runSuite : IO Bool := do
 
   let okSequitur ← runSequiturSuite rustBin
   if !okSequitur then
+    ok := false
+
+  let okBitwise ← runBitwiseSuite rustBin
+  if !okBitwise then
     ok := false
 
   return ok

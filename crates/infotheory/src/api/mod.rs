@@ -39,19 +39,43 @@ pub use self::generation::{
     try_generate_bytes, try_generate_bytes_conditional_chain,
     try_generate_bytes_conditional_chain_with_config, try_generate_bytes_with_config,
 };
+// Empirical bitwise (binary alphabet; not a rescaling of bytewise)
+pub use self::metrics::{
+    d_kl_bits, empirical_cross_entropy_bits, empirical_entropy_bits, empirical_joint_entropy_bits,
+    empirical_mutual_information_bits, empirical_ned_bits, empirical_ned_cons_bits,
+    empirical_nte_bits, empirical_resistance_to_transformation_bits, js_div_bits, nhd_bits,
+    tvd_bits,
+};
+
+// Empirical bytewise
 pub use self::metrics::{
     d_kl_bytes, empirical_cross_entropy_bytes, empirical_entropy_bytes,
     empirical_joint_entropy_bytes, empirical_mutual_information_bytes, empirical_ned_bytes,
     empirical_ned_cons_bytes, empirical_nte_bytes, empirical_resistance_to_transformation_bytes,
-    js_div_bytes, nhd_bytes, try_biased_entropy_rate_backend, try_biased_entropy_rate_bytes,
-    try_conditional_entropy_bytes, try_conditional_entropy_rate_bytes, try_cross_entropy_bytes,
-    try_cross_entropy_rate_backend, try_cross_entropy_rate_bytes, try_entropy_rate_backend,
-    try_entropy_rate_bytes, try_intrinsic_dependence_bytes, try_joint_entropy_rate_backend,
-    try_joint_entropy_rate_bytes, try_mutual_information_bytes,
-    try_mutual_information_rate_backend, try_mutual_information_rate_bytes, try_ned_bytes,
-    try_ned_cons_bytes, try_ned_cons_rate_bytes, try_ned_rate_backend, try_ned_rate_bytes,
-    try_nte_bytes, try_nte_rate_backend, try_nte_rate_bytes,
-    try_resistance_to_transformation_bytes, tvd_bytes,
+    js_div_bytes, nhd_bytes, tvd_bytes,
+};
+
+// Algorithmic bytewise / backend-explicit
+pub use self::metrics::{
+    try_biased_entropy_rate_backend, try_biased_entropy_rate_bytes, try_conditional_entropy_bytes,
+    try_conditional_entropy_rate_bytes, try_cross_entropy_bytes, try_cross_entropy_rate_backend,
+    try_cross_entropy_rate_bytes, try_entropy_rate_backend, try_entropy_rate_bytes,
+    try_intrinsic_dependence_bytes, try_joint_entropy_rate_backend, try_joint_entropy_rate_bytes,
+    try_mutual_information_bytes, try_mutual_information_rate_backend,
+    try_mutual_information_rate_bytes, try_ned_bytes, try_ned_cons_bytes, try_ned_cons_rate_bytes,
+    try_ned_rate_backend, try_ned_rate_bytes, try_nte_bytes, try_nte_rate_backend,
+    try_nte_rate_bytes, try_resistance_to_transformation_bytes,
+};
+
+// Binary-alphabet framing of derived algorithmic metrics (not a `/8` rescaling)
+pub use self::metrics::try_intrinsic_dependence_bits;
+
+// Algorithmic per-bit (unit conversion `/8`, or scale-invariant aliases)
+pub use self::metrics::{
+    try_biased_entropy_rate_per_bit, try_conditional_entropy_rate_per_bit,
+    try_cross_entropy_rate_per_bit, try_entropy_rate_per_bit, try_joint_entropy_rate_per_bit,
+    try_mutual_information_rate_per_bit, try_ned_cons_rate_per_bit, try_ned_rate_per_bit,
+    try_nte_rate_per_bit, try_resistance_to_transformation_per_bit,
 };
 pub use self::paths::{
     CompressionPathBatchOptions, try_conditional_entropy_paths, try_cross_entropy_paths,

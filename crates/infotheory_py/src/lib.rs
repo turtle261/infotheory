@@ -1347,6 +1347,16 @@ impl PyInfotheoryCtx {
         })
     }
 
+    fn intrinsic_dependence_bits(&self, py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+        py.detach(|| {
+            py_try(|| {
+                self.inner
+                    .try_intrinsic_dependence_bits(data)
+                    .map_err(py_infotheory_error)
+            })
+        })
+    }
+
     fn resistance_to_transformation_bytes(
         &self,
         py: Python<'_>,
@@ -2210,6 +2220,76 @@ fn empirical_joint_entropy_bytes(x: &[u8], y: &[u8]) -> f64 {
     api::empirical_joint_entropy_bytes(x, y)
 }
 
+#[pyfunction]
+fn empirical_entropy_bits(data: &[u8]) -> f64 {
+    api::empirical_entropy_bits(data)
+}
+
+#[pyfunction]
+fn empirical_joint_entropy_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_joint_entropy_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_mutual_information_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_mutual_information_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_cross_entropy_bits(test_data: &[u8], train_data: &[u8]) -> f64 {
+    api::empirical_cross_entropy_bits(test_data, train_data)
+}
+
+#[pyfunction]
+fn tvd_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::tvd_bits(x, y)
+}
+
+#[pyfunction]
+fn nhd_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::nhd_bits(x, y)
+}
+
+#[pyfunction]
+fn d_kl_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::d_kl_bits(x, y)
+}
+
+#[pyfunction]
+fn js_div_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::js_div_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_ned_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_ned_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_ned_cons_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_ned_cons_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_nte_bits(x: &[u8], y: &[u8]) -> f64 {
+    api::empirical_nte_bits(x, y)
+}
+
+#[pyfunction]
+fn empirical_resistance_to_transformation_bits(x: &[u8], tx: &[u8]) -> f64 {
+    api::empirical_resistance_to_transformation_bits(x, tx)
+}
+
+#[pyfunction]
+fn entropy_rate_per_bit(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_entropy_rate_per_bit(data).map_err(py_infotheory_error)))
+}
+
+#[pyfunction]
+fn biased_entropy_rate_per_bit(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_biased_entropy_rate_per_bit(data).map_err(py_infotheory_error)))
+}
+
 macro_rules! py_metric_bytes_2 {
     ($fn_name:ident, $target:path) => {
         #[pyfunction]
@@ -2260,6 +2340,32 @@ py_metric_bytes_2!(nhd_bytes, api::nhd_bytes);
 py_metric_bytes_2_try!(cross_entropy_bytes, api::try_cross_entropy_bytes);
 py_metric_bytes_2_try!(cross_entropy_rate_bytes, api::try_cross_entropy_rate_bytes);
 
+// Algorithmic per-bit wrappers (binary arity). Unary per-bit wrappers are
+// hand-written above to match entropy_rate_bytes / biased_entropy_rate_bytes.
+py_metric_bytes_2_try!(
+    joint_entropy_rate_per_bit,
+    api::try_joint_entropy_rate_per_bit
+);
+py_metric_bytes_2_try!(
+    cross_entropy_rate_per_bit,
+    api::try_cross_entropy_rate_per_bit
+);
+py_metric_bytes_2_try!(
+    mutual_information_rate_per_bit,
+    api::try_mutual_information_rate_per_bit
+);
+py_metric_bytes_2_try!(
+    conditional_entropy_rate_per_bit,
+    api::try_conditional_entropy_rate_per_bit
+);
+py_metric_bytes_2_try!(ned_rate_per_bit, api::try_ned_rate_per_bit);
+py_metric_bytes_2_try!(ned_cons_rate_per_bit, api::try_ned_cons_rate_per_bit);
+py_metric_bytes_2_try!(nte_rate_per_bit, api::try_nte_rate_per_bit);
+py_metric_bytes_2_try!(
+    resistance_to_transformation_per_bit,
+    api::try_resistance_to_transformation_per_bit
+);
+
 py_metric_paths_2_try!(ned_paths, api::try_ned_paths);
 py_metric_paths_2_try!(nte_paths, api::try_nte_paths);
 py_metric_paths_2_try!(tvd_paths, api::try_tvd_paths);
@@ -2294,6 +2400,11 @@ fn js_divergence_paths(py: Python<'_>, x: &str, y: &str) -> PyResult<f64> {
 #[pyfunction]
 fn intrinsic_dependence_bytes(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
     py.detach(|| py_try(|| api::try_intrinsic_dependence_bytes(data).map_err(py_infotheory_error)))
+}
+
+#[pyfunction]
+fn intrinsic_dependence_bits(py: Python<'_>, data: &[u8]) -> PyResult<f64> {
+    py.detach(|| py_try(|| api::try_intrinsic_dependence_bits(data).map_err(py_infotheory_error)))
 }
 
 #[pyfunction]
@@ -5357,6 +5468,32 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ncd_matrix_paths_with_backend, m)?)?;
     m.add_function(wrap_pyfunction!(ncd_matrix_bytes_with_backend, m)?)?;
     m.add_function(wrap_pyfunction!(empirical_entropy_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_entropy_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_joint_entropy_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_mutual_information_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_cross_entropy_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(tvd_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(nhd_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(d_kl_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(js_div_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_ned_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_ned_cons_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(empirical_nte_bits, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        empirical_resistance_to_transformation_bits,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(biased_entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(joint_entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(cross_entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(mutual_information_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(conditional_entropy_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(ned_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(ned_cons_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(nte_rate_per_bit, m)?)?;
+    m.add_function(wrap_pyfunction!(resistance_to_transformation_per_bit, m)?)?;
+
     m.add_function(wrap_pyfunction!(entropy_rate_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(entropy_rate_backend, m)?)?;
     m.add_function(wrap_pyfunction!(biased_entropy_rate_bytes, m)?)?;
@@ -5398,6 +5535,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kl_divergence_paths, m)?)?;
     m.add_function(wrap_pyfunction!(js_divergence_paths, m)?)?;
     m.add_function(wrap_pyfunction!(intrinsic_dependence_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(intrinsic_dependence_bits, m)?)?;
     m.add_function(wrap_pyfunction!(resistance_to_transformation_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(verify_identity, m)?)?;
     m.add_function(wrap_pyfunction!(verify_symmetry, m)?)?;

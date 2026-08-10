@@ -35,13 +35,14 @@
 //!     consumed.
 //! 2.  **Shannon information theory (empirical / IID plug-in)**:
 //!     estimates classical Shannon quantities directly from observed
-//!     byte frequencies, with no learned model. The class is model-free:
+//!     symbol frequencies (bytewise alphabet `{0,…,255}` or pooled bitwise
+//!     alphabet `{0,1}`), with no learned model. The class is model-free:
 //!     it plugs the empirical distribution into Shannon's formulae and
 //!     returns an order-0 / IID estimator. It supplies the order-0
 //!     entropy `H₀(X)`, joint and conditional `H₀`, `I₀(X;Y)`, and the
 //!     `empirical_*` analogues of NED, NTE, cross-entropy, and
 //!     resistance, plus the classical divergences and distances over
-//!     byte distributions: total variation distance (TVD), normalized
+//!     those distributions: total variation distance (TVD), normalized
 //!     Hellinger distance (NHD), Kullback–Leibler divergence (KL), and
 //!     Jensen–Shannon divergence (JSD). These are useful as model-free
 //!     baselines, axiom test fixtures, and as the appropriate estimator
@@ -55,13 +56,36 @@
 //! compressor ecosystem and the metrics (NCD, compressed-size, the
 //! entropy *rate*) that have no order-0 plug-in counterpart.
 //!
+//! ## Alphabet Framing: `_bytes`, `_bits`, and `_per_bit`
+//!
+//! Empirical and algorithmic metrics are framed over two alphabets.
+//! The suffix encodes that framing explicitly so callers never confuse a
+//! rescaling with a distinct estimator:
+//!
+//! * **`_bytes` (alphabet `{0,…,255}`).** Empirical plug-ins histogram whole
+//!   bytes; algorithmic rates divide total base-2 log-loss `L` by the byte
+//!   count `N`, yielding **bits per byte**. Maximum empirical entropy is 8 bits.
+//! * **`_bits` (alphabet `{0,1}`).** Empirical plug-ins treat the input as
+//!   `8N` pooled bits (not position-stratified) and form a binary histogram.
+//!   Because bits within a byte are correlated, these quantities are
+//!   **not** a rescaling of their `_bytes` counterparts. Maximum empirical
+//!   entropy is 1 bit.
+//! * **`_per_bit` (algorithmic unit conversion).** Predictive estimators
+//!   measure the same total information content `L` over the same sequence;
+//!   the `_per_bit` wrappers return `L / (8N)` (**bits per bit**), i.e.
+//!   exactly the corresponding `_bytes` rate divided by 8. This conversion
+//!   is valid because all algorithmic estimators in this crate report
+//!   log-loss in base-2 bits (not nats). Normalized ratios such as NED and
+//!   NTE are scale-invariant (`NED_bits ≡ NED_bytes`); the `_per_bit`
+//!   aliases exist only for naming uniformity on the bitwise surface.
+//!
 //! ## Mathematical Primitives
 //!
 //! The library implements the following core measures. For sequential data,
 //! `*_rate_*` and explicit-backend variants use the configured
 //! [`crate::api::RateBackend`] to estimate the entropy rate `Ĥ(X)`, while
-//! `empirical_*` variants compute the order-0 plug-in `H₀(X)` from byte
-//! histograms.
+//! `empirical_*_bytes` / `empirical_*_bits` compute the order-0 plug-in
+//! `H₀(X)` from byte or pooled-bit histograms.
 //!
 //! ### 1. Normalized Compression Distance (NCD)
 //! Approximates the Normalized Information Distance (NID) using a compressor `C`.
@@ -95,6 +119,11 @@
 //! configured rate backend.
 //!
 //! `ID(X) = (H₀(X) - Ĥ(X)) / H₀(X)`
+//!
+//! The bitwise framing `try_intrinsic_dependence_bits` uses the pooled binary
+//! baseline `H₀,bits` and `Ĥ_per_bit = Ĥ_bytes / 8`. It is **not** a rescaling
+//! of `ID_bytes`; on byte-aligned data it can attribute intra-byte structure
+//! (e.g. ASCII MSB framing) as dependence relative to a memoryless bit model.
 //!
 //! ### 7. Resistance to Transformation
 //! Quantifies how much information is preserved after a transformation `T` is applied.

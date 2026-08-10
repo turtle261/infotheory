@@ -151,7 +151,9 @@ cmd_lean_test() {
   say "[lean_test] Building + running Lean validation (ite-bench)..."
   need_cmd lake
 
-  (cd "$ROOT_DIR/ite-bench" && lake build)
+  # Full runner: reuse existing native artifact when up to date; do not force
+  # a clean rebuild here (Runner.c.o alone can exceed 20GB RSS).
+  (cd "$ROOT_DIR/ite-bench" && LEAN_NUM_THREADS=1 lake build runner)
   (cd "$ROOT_DIR/ite-bench" && lake exe runner)
 
   say "[lean_test] Done"

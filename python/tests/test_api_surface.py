@@ -423,3 +423,75 @@ def test_search_pipeline_returns_results(tmp_path):
     assert isinstance(end, int)
     assert isinstance(score, float)
     assert "algorithm" in path, f"top result should be algorithm.txt, got {path}"
+
+def test_bitwise_empirical_invariants():
+    # Degenerate distributions
+    zeros = bytes([0] * 64)
+    ones = bytes([255] * 64)
+    mixed = b"the quick brown fox"
+
+    assert ait.empirical_entropy_bits(zeros) == 0.0
+    assert ait.empirical_entropy_bits(ones) == 0.0
+    assert ait.empirical_entropy_bits(mixed) > 0.0
+
+    assert ait.empirical_cross_entropy_bits(zeros, mixed) >= 0.0
+    assert ait.empirical_cross_entropy_bits(ones, mixed) >= 0.0
+
+    assert math.isclose(ait.tvd_bits(zeros, ones), 1.0)
+    assert math.isclose(ait.nhd_bits(zeros, ones), 1.0)
+    assert math.isclose(ait.js_div_bits(zeros, ones), 1.0)
+    assert ait.d_kl_bits(zeros, ones) > 0.0
+
+    x = b"abcdef"
+    y = b"ghijkl"
+
+    h_x = ait.empirical_entropy_bits(x)
+    h_y = ait.empirical_entropy_bits(y)
+    h_xy = ait.empirical_joint_entropy_bits(x, y)
+    mi = ait.empirical_mutual_information_bits(x, y)
+
+    assert h_xy <= 2.0 + 1e-12
+    assert mi >= 0.0
+    assert mi <= min(h_x, h_y) + 1e-12
+
+
+def test_bitwise_algorithmic_unit_conversion():
+    data = b"hello world, this is some data to test the algorithmic scaling"
+
+    # Using default CTW rate backend
+    h_bytes = ait.entropy_rate_bytes(data)
+    h_bits = ait.entropy_rate_per_bit(data)
+
+    assert h_bytes > 0.0
+    assert math.isclose(h_bits, h_bytes / 8.0, rel_tol=1e-9)
+
+    x = b"abcabcabc"
+    y = b"xyzxyzxyz"
+    assert math.isclose(
+        ait.mutual_information_rate_per_bit(x, y),
+        ait.mutual_information_rate_bytes(x, y) / 8.0,
+        rel_tol=1e-9,
+    )
+    assert math.isclose(
+        ait.conditional_entropy_rate_per_bit(x, y),
+        ait.conditional_entropy_rate_bytes(x, y) / 8.0,
+        rel_tol=1e-9,
+    )
+    assert math.isclose(ait.ned_rate_per_bit(x, y), ait.ned_bytes(x, y), rel_tol=1e-9)
+    assert math.isclose(
+        ait.ned_cons_rate_per_bit(x, y), ait.ned_cons_bytes(x, y), rel_tol=1e-9
+    )
+    assert math.isclose(ait.nte_rate_per_bit(x, y), ait.nte_bytes(x, y), rel_tol=1e-9)
+    assert math.isclose(
+        ait.resistance_to_transformation_per_bit(x, x),
+        ait.resistance_to_transformation_bytes(x, x),
+        rel_tol=1e-9,
+    )
+
+    id_bytes = ait.intrinsic_dependence_bytes(data)
+    id_bits = ait.intrinsic_dependence_bits(data)
+    assert 0.0 <= id_bytes <= 1.0
+    assert 0.0 <= id_bits <= 1.0
+    # Distinct framing: not a unit conversion of ID_bytes.
+    assert not math.isclose(id_bits, id_bytes / 8.0, rel_tol=1e-6, abs_tol=1e-6)
+
