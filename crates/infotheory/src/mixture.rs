@@ -26,6 +26,11 @@ use crate::api::{MixtureKind, MixtureScheduleMode, RateBackend};
 use crate::backends::bit_reservoir::{BitReservoirModel, BitReservoirPrediction};
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
+#[cfg(feature = "backend-context")]
+use crate::backends::context_counter::{
+    OrderNGramCheckpoint, OrderNGramLifecycleSnapshot, OrderNGramModel, WordContextCheckpoint,
+    WordContextLifecycleSnapshot, WordContextModel,
+};
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{
     ContextTree, ContextTreeLifecycleSnapshot, FacContextTree, FacContextTreeLifecycleSnapshot,
@@ -40,19 +45,32 @@ use crate::backends::rosaplus::{RosaPlus, RosaTx};
 use crate::backends::sequitur::{SequiturCheckpoint, SequiturLifecycleSnapshot, SequiturModel};
 #[cfg(feature = "backend-match")]
 use crate::backends::sparse_match::SparseMatchModel;
-use crate::backends::text_context::TextContextAnalyzer;
+use crate::backends::text_context::{TextContextAnalyzer, bucket_repeat_len, classify_byte};
 #[cfg(feature = "backend-zpaq")]
 use crate::backends::zpaq_rate::ZpaqRateModel;
 use crate::byte_prefix::{
-    BytePrefixCdf, MsbPrefixRange, fill_prefix_cdf_from_log_probs, zeroed_prefix_cdf_box,
+    BytePrefixCdf, MsbPrefixRange, advanced_prefix_code, fill_prefix_cdf_from_log_probs,
+    zeroed_prefix_cdf_box,
 };
 #[cfg(feature = "backend-mamba")]
 use crate::mambazip;
-use crate::neural_mix::{NeuralHistoryState, NeuralMixCore};
+use crate::neural_mix::{
+    LogisticMatchState, NeuralHistoryState, NeuralMixCore, fold_logistic_match_states,
+};
 #[cfg(feature = "backend-rwkv")]
 use crate::rwkvzip;
 use crate::spec::CompiledRateBackend;
 use std::sync::Arc;
+
+mod logistic;
+mod prefix;
+
+use logistic::LogisticMixtureLifecycleCheckpoint;
+pub use logistic::{LogisticMixture, LogisticMixtureCheckpoint};
+pub use prefix::BytePrefixStepState;
+#[cfg(test)]
+use prefix::BytePrefixStepStateKind;
+use prefix::{MixtureBitPrefixState, MixturePrefixPreparation};
 
 /// Default minimum probability floor to avoid log(0).
 pub const DEFAULT_MIN_PROB: f64 = 5.960_464_477_539_063e-8;
@@ -598,368 +616,6 @@ fn validate_native_msb_prefix_finish(next_bit_idx: usize) -> Result<(), String> 
     Ok(())
 }
 
-#[derive(Clone, Default)]
-#[doc(hidden)]
-pub struct BytePrefixStepState {
-    kind: BytePrefixStepStateKind,
-}
-
-#[derive(Clone)]
-enum BytePrefixStepStateKind {
-    Native,
-    PdfPrefix {
-        cdf: Box<BytePrefixCdf>,
-        range: MsbPrefixRange,
-    },
-}
-
-impl Default for BytePrefixStepStateKind {
-    fn default() -> Self {
-        Self::PdfPrefix {
-            cdf: zeroed_prefix_cdf_box(),
-            range: MsbPrefixRange::FULL,
-        }
-    }
-}
-
-impl BytePrefixStepState {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    fn is_native(&self) -> bool {
-        matches!(self.kind, BytePrefixStepStateKind::Native)
-    }
-
-    fn prepare(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
-        if predictor.has_abortable_native_msb_byte_prefix()
-            && predictor.begin_native_msb_byte_prefix()?
-        {
-            self.kind = BytePrefixStepStateKind::Native;
-            return Ok(());
-        }
-
-        let mut cdf = match std::mem::take(&mut self.kind) {
-            BytePrefixStepStateKind::PdfPrefix { cdf, .. } => cdf,
-            BytePrefixStepStateKind::Native => zeroed_prefix_cdf_box(),
-        };
-        let mut logps = [0.0f64; 256];
-        predictor.fill_log_probs(&mut logps);
-        fill_prefix_cdf_from_log_probs(&mut cdf, &logps, DEFAULT_MIN_PROB);
-        self.kind = BytePrefixStepStateKind::PdfPrefix {
-            cdf,
-            range: MsbPrefixRange::FULL,
-        };
-        Ok(())
-    }
-
-    fn prob_one(
-        &mut self,
-        predictor: &mut dyn OnlineBytePredictor,
-        bit_idx: usize,
-    ) -> Result<f64, String> {
-        match &mut self.kind {
-            BytePrefixStepStateKind::Native => predictor.native_msb_prefix_prob_one(bit_idx),
-            BytePrefixStepStateKind::PdfPrefix { cdf, range } => {
-                Ok(range.prob_one(cdf.as_ref(), DEFAULT_MIN_PROB))
-            }
-        }
-    }
-
-    fn observe(
-        &mut self,
-        predictor: &mut dyn OnlineBytePredictor,
-        bit_idx: usize,
-        bit: bool,
-    ) -> Result<(), String> {
-        match &mut self.kind {
-            BytePrefixStepStateKind::Native => {
-                predictor.observe_native_msb_prefix_bit(bit_idx, bit)
-            }
-            BytePrefixStepStateKind::PdfPrefix { range, .. } => {
-                range.observe(bit);
-                Ok(())
-            }
-        }
-    }
-
-    fn observe_known(
-        &mut self,
-        predictor: &mut dyn OnlineBytePredictor,
-        bit_idx: usize,
-        bit: bool,
-    ) -> Result<f64, String> {
-        match &mut self.kind {
-            BytePrefixStepStateKind::Native => {
-                predictor.observe_known_native_msb_prefix_bit(bit_idx, bit)
-            }
-            BytePrefixStepStateKind::PdfPrefix { cdf, range } => {
-                let p1: f64 = range.prob_one(cdf.as_ref(), DEFAULT_MIN_PROB);
-                range.observe(bit);
-                Ok(p1)
-            }
-        }
-    }
-
-    fn abort_empty(&mut self, predictor: &mut dyn OnlineBytePredictor) -> Result<(), String> {
-        match &mut self.kind {
-            BytePrefixStepStateKind::Native => {
-                let aborted: bool = predictor.abort_empty_native_msb_byte_prefix()?;
-                if !aborted {
-                    return Err(
-                        "native MSB-first byte-prefix abort reported no active empty prefix"
-                            .to_string(),
-                    );
-                }
-                *self = Self::new();
-                Ok(())
-            }
-            BytePrefixStepStateKind::PdfPrefix { .. } => {
-                *self = Self::new();
-                Ok(())
-            }
-        }
-    }
-
-    fn finish(
-        &mut self,
-        predictor: &mut dyn OnlineBytePredictor,
-        symbol: u8,
-    ) -> Result<(), String> {
-        match &mut self.kind {
-            BytePrefixStepStateKind::Native => predictor.finish_native_msb_byte_prefix(symbol),
-            BytePrefixStepStateKind::PdfPrefix { .. } => {
-                predictor.update(symbol);
-                Ok(())
-            }
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct MixtureBitPrefixState {
-    states: Vec<BytePrefixStepState>,
-    weights: Vec<f64>,
-    likelihoods: Vec<f64>,
-    bit_probs: Vec<f64>,
-    logps: Vec<f64>,
-    active: bool,
-    primed_bit_idx: Option<usize>,
-    expected_bit_idx: usize,
-}
-
-impl MixtureBitPrefixState {
-    fn reset_inactive(&mut self) {
-        self.active = false;
-        self.primed_bit_idx = None;
-        self.expected_bit_idx = 0;
-    }
-
-    fn validate_bit_idx(&self, bit_idx: usize) -> Result<(), String> {
-        if bit_idx >= 8 {
-            return Err(format!(
-                "native MSB-first byte-prefix bit index {bit_idx} is out of range; expected 0..8"
-            ));
-        }
-        if bit_idx != self.expected_bit_idx {
-            return Err(format!(
-                "native MSB-first byte-prefix bit index {bit_idx} violated sequential stepping; expected {}",
-                self.expected_bit_idx
-            ));
-        }
-        Ok(())
-    }
-
-    fn begin(&mut self, experts: &mut [ExpertState], weights: &[f64]) -> Result<bool, String> {
-        if !experts
-            .iter()
-            .any(|expert| expert.predictor.has_abortable_native_msb_byte_prefix())
-        {
-            self.reset_inactive();
-            return Ok(false);
-        }
-
-        let n: usize = experts.len();
-        self.states.resize_with(n, BytePrefixStepState::new);
-        self.weights.clear();
-        self.weights.extend(weights.iter().copied());
-        normalize_simplex_weights(&mut self.weights);
-        self.likelihoods.resize(n, 1.0);
-        self.likelihoods.fill(1.0);
-        self.bit_probs.resize(n, 0.5);
-        self.logps.resize(n, 0.0);
-        self.primed_bit_idx = None;
-        self.expected_bit_idx = 0;
-        let mut native_started: bool = false;
-        for idx in 0..n {
-            let state = &mut self.states[idx];
-            let expert = &mut experts[idx];
-            if let Err(err) = state.prepare(expert.predictor.as_mut()) {
-                for rollback_idx in (0..idx).rev() {
-                    self.states[rollback_idx]
-                        .abort_empty(experts[rollback_idx].predictor.as_mut())
-                        .expect("prepared native-prefix expert could not be aborted after setup failure");
-                }
-                self.reset_inactive();
-                return Err(err);
-            }
-            native_started |= state.is_native();
-        }
-        if !native_started {
-            self.reset_inactive();
-            return Ok(false);
-        }
-        self.active = true;
-        Ok(true)
-    }
-
-    fn abort_empty(&mut self, experts: &mut [ExpertState]) -> Result<bool, String> {
-        if !self.active {
-            return Ok(false);
-        }
-        if self.expected_bit_idx != 0 {
-            return Err(format!(
-                "native MSB-first byte-prefix abort requires zero observed bits, got {}",
-                self.expected_bit_idx
-            ));
-        }
-        for (state, expert) in self.states.iter_mut().zip(experts.iter_mut()) {
-            state.abort_empty(expert.predictor.as_mut())?;
-        }
-        self.reset_inactive();
-        Ok(true)
-    }
-
-    fn prime_bit_probs_if_needed(
-        &mut self,
-        experts: &mut [ExpertState],
-        bit_idx: usize,
-    ) -> Result<(), String> {
-        self.validate_bit_idx(bit_idx)?;
-        if self.primed_bit_idx == Some(bit_idx) {
-            return Ok(());
-        }
-        // Index form required for coordinated access to per-expert state + scratch buffers
-        // (same rationale as the allows in prob_one/observe below).
-        #[allow(clippy::needless_range_loop)]
-        for idx in 0..experts.len() {
-            let p1: f64 = self.states[idx].prob_one(experts[idx].predictor.as_mut(), bit_idx)?;
-            self.bit_probs[idx] = p1;
-        }
-        self.primed_bit_idx = Some(bit_idx);
-        Ok(())
-    }
-
-    fn prob_one(&mut self, experts: &mut [ExpertState], bit_idx: usize) -> Result<f64, String> {
-        debug_assert!(self.active);
-        self.prime_bit_probs_if_needed(experts, bit_idx)?;
-        let mut denom: f64 = 0.0;
-        let mut numer: f64 = 0.0;
-        // Index form required for parallel mutable access to multiple scratch buffers
-        // alongside experts; iterators would require zip + tuple mutation which is less clear here.
-        #[allow(clippy::needless_range_loop)]
-        for idx in 0..experts.len() {
-            let p1: f64 = self.bit_probs[idx];
-            let weighted_prefix: f64 = self.weights[idx] * self.likelihoods[idx];
-            denom += weighted_prefix;
-            numer += weighted_prefix * p1;
-        }
-        Ok(if denom.is_finite() && denom > 0.0 {
-            (numer / denom).clamp(DEFAULT_MIN_PROB, 1.0 - DEFAULT_MIN_PROB)
-        } else {
-            // Invariant failure (introduced in bitwiseness bit-prefix state; tightened):
-            // non-positive/NaN denom means internal expert weighting or priming
-            // produced invalid state. Panic with context per AGENTS (contract violation).
-            panic!(
-                "MixtureBitPrefixState::prob_one: invalid weighted denom (must be finite > 0); \
-                 this indicates a bug in prime_bit_probs_if_needed or expert likelihoods"
-            )
-        })
-    }
-
-    fn observe(
-        &mut self,
-        experts: &mut [ExpertState],
-        bit_idx: usize,
-        bit: bool,
-    ) -> Result<(), String> {
-        debug_assert!(self.active);
-        self.prime_bit_probs_if_needed(experts, bit_idx)?;
-        // Index form clearest for coordinated mutation of likelihoods/states + experts[idx].
-        #[allow(clippy::needless_range_loop)]
-        for idx in 0..experts.len() {
-            let p1: f64 = self.bit_probs[idx];
-            let pb: f64 = if bit { p1 } else { 1.0 - p1 };
-            self.likelihoods[idx] = (self.likelihoods[idx] * pb).max(DEFAULT_MIN_PROB);
-            self.states[idx].observe(experts[idx].predictor.as_mut(), bit_idx, bit)?;
-        }
-        self.expected_bit_idx += 1;
-        self.primed_bit_idx = None;
-        Ok(())
-    }
-
-    fn observe_known(
-        &mut self,
-        experts: &mut [ExpertState],
-        bit_idx: usize,
-        bit: bool,
-    ) -> Result<f64, String> {
-        debug_assert!(self.active);
-        self.validate_bit_idx(bit_idx)?;
-        let use_primed: bool = self.primed_bit_idx == Some(bit_idx);
-        let mut denom: f64 = 0.0;
-        let mut numer: f64 = 0.0;
-
-        // Index form is clearest for coordinated mutation of likelihoods,
-        // cached bit probabilities, per-expert prefix state, and experts[idx].
-        #[allow(clippy::needless_range_loop)]
-        for idx in 0..experts.len() {
-            let p1: f64 = if use_primed {
-                let p1: f64 = self.bit_probs[idx];
-                self.states[idx].observe(experts[idx].predictor.as_mut(), bit_idx, bit)?;
-                p1
-            } else {
-                self.states[idx].observe_known(experts[idx].predictor.as_mut(), bit_idx, bit)?
-            };
-            let weighted_prefix: f64 = self.weights[idx] * self.likelihoods[idx];
-            denom += weighted_prefix;
-            numer += weighted_prefix * p1;
-            let pb: f64 = if bit { p1 } else { 1.0 - p1 };
-            self.likelihoods[idx] = (self.likelihoods[idx] * pb).max(DEFAULT_MIN_PROB);
-        }
-        self.expected_bit_idx += 1;
-        self.primed_bit_idx = None;
-
-        Ok(if denom.is_finite() && denom > 0.0 {
-            (numer / denom).clamp(DEFAULT_MIN_PROB, 1.0 - DEFAULT_MIN_PROB)
-        } else {
-            panic!(
-                "MixtureBitPrefixState::observe_known: invalid weighted denom (must be finite > 0); \
-                 this indicates a bug in known-bit prefix scoring or expert likelihoods"
-            )
-        })
-    }
-
-    fn finish_adaptive(&mut self, experts: &mut [ExpertState], symbol: u8) -> Result<(), String> {
-        debug_assert!(self.active);
-        if self.expected_bit_idx != 8 {
-            return Err(format!(
-                "native MSB-first byte-prefix finish requires 8 observed bits, got {}",
-                self.expected_bit_idx
-            ));
-        }
-        // Index form clearest for coordinated mutation of likelihoods/logps/states + experts[idx].
-        #[allow(clippy::needless_range_loop)]
-        for idx in 0..experts.len() {
-            let lp: f64 = self.likelihoods[idx].max(DEFAULT_MIN_PROB).ln();
-            self.logps[idx] = lp;
-            self.states[idx].finish(experts[idx].predictor.as_mut(), symbol)?;
-        }
-        self.reset_inactive();
-        Ok(())
-    }
-}
-
 #[cfg(feature = "backend-rwkv")]
 #[inline]
 fn ensure_rwkv_primed(compressor: &mut rwkvzip::Compressor, primed: &mut bool) {
@@ -1003,6 +659,22 @@ pub enum RateBackendPredictor {
     SparseMatch {
         /// Sparse-match model state.
         model: SparseMatchModel,
+        /// Probability floor for numeric stability.
+        min_prob: f64,
+    },
+    /// Bounded-memory hashed order-N byte counter.
+    #[cfg(feature = "backend-context")]
+    OrderNGram {
+        /// Counter model state.
+        model: OrderNGramModel,
+        /// Probability floor for numeric stability.
+        min_prob: f64,
+    },
+    /// Bounded-memory word-context byte counter.
+    #[cfg(feature = "backend-context")]
+    WordContext {
+        /// Counter model state.
+        model: WordContextModel,
         /// Probability floor for numeric stability.
         min_prob: f64,
     },
@@ -1179,6 +851,12 @@ pub enum RateBackendPredictorCheckpoint {
         /// In-flight native prefix progress captured with the checkpoint.
         native_prefix_progress: Option<usize>,
     },
+    /// Compact rollback checkpoint for an order-N context counter.
+    #[cfg(feature = "backend-context")]
+    OrderNGram(Box<OrderNGramCheckpoint>),
+    /// Compact rollback checkpoint for a word-context counter.
+    #[cfg(feature = "backend-context")]
+    WordContext(Box<WordContextCheckpoint>),
     /// Composite checkpoint for calibrated predictors.
     #[cfg(feature = "backend-calibrated")]
     Calibrated(Box<CalibratedPredictorCheckpoint>),
@@ -1266,6 +944,10 @@ enum RateBackendPredictorLifecycleCheckpoint {
     Match(MatchModelLifecycleSnapshot),
     #[cfg(feature = "backend-match")]
     SparseMatch(MatchModelLifecycleSnapshot),
+    #[cfg(feature = "backend-context")]
+    OrderNGram(OrderNGramLifecycleSnapshot),
+    #[cfg(feature = "backend-context")]
+    WordContext(WordContextLifecycleSnapshot),
     #[cfg(feature = "backend-sequitur")]
     Sequitur(SequiturLifecycleSnapshot),
     #[cfg(feature = "backend-calibrated")]
@@ -1378,6 +1060,26 @@ impl RateBackendPredictor {
             })
     }
 
+    fn logistic_match_state(&mut self) -> LogisticMatchState {
+        match self {
+            #[cfg(feature = "backend-match")]
+            RateBackendPredictor::Match { model, .. } => LogisticMatchState {
+                len_bucket: bucket_repeat_len(model.match_len()),
+                predicted_class: model.predicted_byte().map(classify_byte).unwrap_or(0),
+            },
+            #[cfg(feature = "backend-match")]
+            RateBackendPredictor::SparseMatch { model, .. } => LogisticMatchState {
+                len_bucket: bucket_repeat_len(model.match_len()),
+                predicted_class: model.predicted_byte().map(classify_byte).unwrap_or(0),
+            },
+            #[cfg(feature = "backend-mixture")]
+            RateBackendPredictor::Mixture { runtime } => runtime.logistic_match_state(),
+            #[cfg(feature = "backend-calibrated")]
+            RateBackendPredictor::Calibrated { base, .. } => base.logistic_match_state(),
+            _ => LogisticMatchState::default(),
+        }
+    }
+
     fn lifecycle_checkpoint(
         &mut self,
         op: OnlineBytePredictorLifecycleOp,
@@ -1438,6 +1140,28 @@ impl RateBackendPredictor {
                 OnlineBytePredictorLifecycleOp::ResetFrozen
                 | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
                     RateBackendPredictorLifecycleCheckpoint::SparseMatch(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::OrderNGram(model.lifecycle_snapshot())
+                }
+            },
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::WordContext { model, .. } => match op {
+                OnlineBytePredictorLifecycleOp::FinishStream
+                | OnlineBytePredictorLifecycleOp::BeginStream => {
+                    RateBackendPredictorLifecycleCheckpoint::NotNeeded
+                }
+                OnlineBytePredictorLifecycleOp::ResetFrozen
+                | OnlineBytePredictorLifecycleOp::BeginFreshStream => {
+                    RateBackendPredictorLifecycleCheckpoint::WordContext(model.lifecycle_snapshot())
                 }
             },
             #[cfg(feature = "backend-ppmd")]
@@ -1634,6 +1358,16 @@ impl RateBackendPredictor {
                 RateBackendPredictor::SparseMatch { model, .. },
                 RateBackendPredictorLifecycleCheckpoint::SparseMatch(snapshot),
             ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-context")]
+            (
+                RateBackendPredictor::OrderNGram { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::OrderNGram(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
+            #[cfg(feature = "backend-context")]
+            (
+                RateBackendPredictor::WordContext { model, .. },
+                RateBackendPredictorLifecycleCheckpoint::WordContext(snapshot),
+            ) => model.restore_lifecycle_snapshot(snapshot),
             #[cfg(feature = "backend-sequitur")]
             (
                 RateBackendPredictor::Sequitur { model, .. },
@@ -1680,6 +1414,11 @@ impl RateBackendPredictor {
             }
             #[cfg(feature = "backend-match")]
             (_, RateBackendPredictorLifecycleCheckpoint::SparseMatch(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-context")]
+            (_, RateBackendPredictorLifecycleCheckpoint::OrderNGram(_))
+            | (_, RateBackendPredictorLifecycleCheckpoint::WordContext(_)) => {
                 panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
             }
             #[cfg(feature = "backend-sequitur")]
@@ -1738,6 +1477,15 @@ impl RateBackendPredictor {
                 RateBackendPredictor::SparseMatch { .. },
                 RateBackendPredictorLifecycleCheckpoint::SparseMatch(_),
             ) => {}
+            #[cfg(feature = "backend-context")]
+            (
+                RateBackendPredictor::OrderNGram { .. },
+                RateBackendPredictorLifecycleCheckpoint::OrderNGram(_),
+            )
+            | (
+                RateBackendPredictor::WordContext { .. },
+                RateBackendPredictorLifecycleCheckpoint::WordContext(_),
+            ) => {}
             #[cfg(feature = "backend-sequitur")]
             (
                 RateBackendPredictor::Sequitur { .. },
@@ -1755,6 +1503,11 @@ impl RateBackendPredictor {
             #[cfg(feature = "backend-match")]
             (_, RateBackendPredictorLifecycleCheckpoint::Match(_))
             | (_, RateBackendPredictorLifecycleCheckpoint::SparseMatch(_)) => {
+                panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
+            }
+            #[cfg(feature = "backend-context")]
+            (_, RateBackendPredictorLifecycleCheckpoint::OrderNGram(_))
+            | (_, RateBackendPredictorLifecycleCheckpoint::WordContext(_)) => {
                 panic!("mismatched RateBackendPredictor lifecycle checkpoint variant")
             }
             #[cfg(feature = "backend-sequitur")]
@@ -1814,6 +1567,14 @@ impl RateBackendPredictor {
                     journal_len: checkpoint_journal.len(),
                     native_prefix_progress: *native_prefix_progress,
                 }
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { model, .. } => {
+                RateBackendPredictorCheckpoint::OrderNGram(Box::new(model.checkpoint()))
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::WordContext { model, .. } => {
+                RateBackendPredictorCheckpoint::WordContext(Box::new(model.checkpoint()))
             }
             #[cfg(feature = "backend-calibrated")]
             RateBackendPredictor::Calibrated {
@@ -2061,6 +1822,16 @@ impl RateBackendPredictor {
                 restore_ctw_checkpoint(tree, *bits_per_symbol, checkpoint_journal, *journal_len);
                 *native_prefix_progress = *checkpoint_progress;
             }
+            #[cfg(feature = "backend-context")]
+            (
+                RateBackendPredictor::OrderNGram { model, .. },
+                RateBackendPredictorCheckpoint::OrderNGram(checkpoint),
+            ) => model.restore_checkpoint(checkpoint.as_ref()),
+            #[cfg(feature = "backend-context")]
+            (
+                RateBackendPredictor::WordContext { model, .. },
+                RateBackendPredictorCheckpoint::WordContext(checkpoint),
+            ) => model.restore_checkpoint(checkpoint.as_ref()),
             #[cfg(feature = "backend-ctw")]
             (
                 RateBackendPredictor::FacCtw {
@@ -2150,6 +1921,11 @@ impl RateBackendPredictor {
             (_, RateBackendPredictorCheckpoint::FacCtw { .. }) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
             }
+            #[cfg(feature = "backend-context")]
+            (_, RateBackendPredictorCheckpoint::OrderNGram(_))
+            | (_, RateBackendPredictorCheckpoint::WordContext(_)) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
             #[cfg(feature = "backend-calibrated")]
             (_, RateBackendPredictorCheckpoint::Calibrated(_)) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
@@ -2204,6 +1980,10 @@ impl RateBackendPredictor {
                 *checkpoint_depth = 0;
                 *native_prefix_progress = None;
             }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { model, .. } => model.clear_checkpoints(),
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::WordContext { model, .. } => model.clear_checkpoints(),
             #[cfg(feature = "backend-bit-reservoir")]
             RateBackendPredictor::BitReservoir {
                 native_prefix_progress,
@@ -2236,6 +2016,16 @@ impl RateBackendPredictor {
             ) => {
                 *checkpoint_depth = checkpoint_depth.saturating_sub(1);
             }
+            #[cfg(feature = "backend-context")]
+            (
+                RateBackendPredictor::OrderNGram { model, .. },
+                RateBackendPredictorCheckpoint::OrderNGram(checkpoint),
+            ) => model.discard_checkpoint(*checkpoint),
+            #[cfg(feature = "backend-context")]
+            (
+                RateBackendPredictor::WordContext { model, .. },
+                RateBackendPredictorCheckpoint::WordContext(checkpoint),
+            ) => model.discard_checkpoint(*checkpoint),
             #[cfg(feature = "backend-sequitur")]
             (
                 RateBackendPredictor::Sequitur { .. },
@@ -2294,6 +2084,11 @@ impl RateBackendPredictor {
             }
             #[cfg(feature = "backend-ctw")]
             (_, RateBackendPredictorCheckpoint::FacCtw { .. }) => {
+                panic!("mismatched RateBackendPredictor checkpoint variant")
+            }
+            #[cfg(feature = "backend-context")]
+            (_, RateBackendPredictorCheckpoint::OrderNGram(_))
+            | (_, RateBackendPredictorCheckpoint::WordContext(_)) => {
                 panic!("mismatched RateBackendPredictor checkpoint variant")
             }
             #[cfg(feature = "backend-calibrated")]
@@ -2405,6 +2200,10 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Match { .. } => Ok(()),
             #[cfg(feature = "backend-match")]
             RateBackendPredictor::SparseMatch { .. } => Ok(()),
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { .. } | RateBackendPredictor::WordContext { .. } => {
+                Ok(())
+            }
             #[cfg(feature = "backend-ppmd")]
             RateBackendPredictor::Ppmd { .. } => Ok(()),
             #[cfg(feature = "backend-sequitur")]
@@ -2486,6 +2285,10 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Match { .. } => Ok(()),
             #[cfg(feature = "backend-match")]
             RateBackendPredictor::SparseMatch { .. } => Ok(()),
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { .. } | RateBackendPredictor::WordContext { .. } => {
+                Ok(())
+            }
             #[cfg(feature = "backend-ppmd")]
             RateBackendPredictor::Ppmd { .. } => Ok(()),
             #[cfg(feature = "backend-ctw")]
@@ -2595,6 +2398,14 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::Match { model, min_prob } => model.log_prob(symbol, *min_prob),
             #[cfg(feature = "backend-match")]
             RateBackendPredictor::SparseMatch { model, min_prob } => {
+                model.log_prob(symbol, *min_prob)
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { model, min_prob } => {
+                model.log_prob(symbol, *min_prob)
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::WordContext { model, min_prob } => {
                 model.log_prob(symbol, *min_prob)
             }
             #[cfg(feature = "backend-ppmd")]
@@ -2789,6 +2600,22 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 model.fill_pdf(&mut pdf);
                 for (slot, &p) in out.iter_mut().zip(pdf.iter()) {
                     *slot = clamp_prob(p, *min_prob).ln();
+                }
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { model, min_prob } => {
+                let mut pdf = [0.0; 256];
+                model.fill_pdf(&mut pdf, *min_prob);
+                for (slot, &p) in out.iter_mut().zip(pdf.iter()) {
+                    *slot = p.ln();
+                }
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::WordContext { model, min_prob } => {
+                let mut pdf = [0.0; 256];
+                model.fill_pdf(&mut pdf, *min_prob);
+                for (slot, &p) in out.iter_mut().zip(pdf.iter()) {
+                    *slot = p.ln();
                 }
             }
             #[cfg(feature = "backend-ppmd")]
@@ -3424,6 +3251,14 @@ impl OnlineBytePredictor for RateBackendPredictor {
             RateBackendPredictor::SparseMatch { model, .. } => {
                 model.update(symbol);
             }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { model, .. } => {
+                model.update(symbol);
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::WordContext { model, .. } => {
+                model.update(symbol);
+            }
             #[cfg(feature = "backend-ppmd")]
             RateBackendPredictor::Ppmd { model, .. } => {
                 model.update(symbol);
@@ -3745,6 +3580,16 @@ impl OnlineBytePredictor for RateBackendPredictor {
                 model.reset_history();
                 Ok(())
             }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { model, .. } => {
+                model.reset_history();
+                Ok(())
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::WordContext { model, .. } => {
+                model.reset_history();
+                Ok(())
+            }
             #[cfg(feature = "backend-ppmd")]
             RateBackendPredictor::Ppmd { model, .. } => {
                 model.reset_history();
@@ -3873,6 +3718,14 @@ impl OnlineBytePredictor for RateBackendPredictor {
             }
             #[cfg(feature = "backend-match")]
             RateBackendPredictor::SparseMatch { model, .. } => {
+                model.update_history_only(symbol);
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::OrderNGram { model, .. } => {
+                model.update_history_only(symbol);
+            }
+            #[cfg(feature = "backend-context")]
+            RateBackendPredictor::WordContext { model, .. } => {
                 model.update_history_only(symbol);
             }
             #[cfg(feature = "backend-ppmd")]
@@ -4043,6 +3896,13 @@ impl ExpertPredictor {
         match self {
             Self::Generic(predictor) => predictor,
             Self::RateBackend(predictor) => predictor,
+        }
+    }
+
+    fn logistic_match_state(&mut self) -> LogisticMatchState {
+        match self {
+            Self::Generic(_) => LogisticMatchState::default(),
+            Self::RateBackend(predictor) => predictor.logistic_match_state(),
         }
     }
 
@@ -6195,6 +6055,7 @@ pub enum MixtureRuntimeCheckpoint {
     Convex(ConvexMixtureCheckpoint),
     Mdl(MdlSelectorCheckpoint),
     Neural(NeuralMixtureCheckpoint),
+    Logistic(LogisticMixtureCheckpoint),
 }
 
 struct BayesMixtureLifecycleCheckpoint {
@@ -6283,6 +6144,7 @@ enum MixtureRuntimeLifecycleCheckpoint {
     Convex(ConvexMixtureLifecycleCheckpoint),
     Mdl(MdlSelectorLifecycleCheckpoint),
     Neural(NeuralMixtureLifecycleCheckpoint),
+    Logistic(LogisticMixtureLifecycleCheckpoint),
 }
 
 // =============================================================================
@@ -6305,6 +6167,8 @@ pub enum MixtureRuntime {
     Mdl(MdlSelector),
     /// Bytewise neural logistic mixer.
     Neural(NeuralMixture),
+    /// Bitwise stretch-domain logistic mixer.
+    Logistic(LogisticMixture),
 }
 
 impl MixtureRuntime {
@@ -6392,6 +6256,7 @@ impl MixtureRuntime {
                     total_log_loss: m.total_log_loss,
                 }))
             }
+            MixtureRuntime::Logistic(m) => m.checkpoint().map(MixtureRuntimeCheckpoint::Logistic),
         }
     }
 
@@ -6469,6 +6334,9 @@ impl MixtureRuntime {
                 m.eval_cache_expert_logps = ck.eval_cache_expert_logps.clone();
                 m.total_log_loss = ck.total_log_loss;
             }
+            (MixtureRuntime::Logistic(m), MixtureRuntimeCheckpoint::Logistic(ck)) => {
+                m.restore_checkpoint(ck);
+            }
             _ => panic!("mismatched MixtureRuntime checkpoint variant"),
         }
     }
@@ -6492,6 +6360,9 @@ impl MixtureRuntime {
             }
             (MixtureRuntime::Neural(m), MixtureRuntimeCheckpoint::Neural(ck)) => {
                 discard_expert_checkpoints(&mut m.experts, ck.experts);
+            }
+            (MixtureRuntime::Logistic(m), MixtureRuntimeCheckpoint::Logistic(ck)) => {
+                m.discard_checkpoint(ck);
             }
             _ => panic!("mismatched MixtureRuntime checkpoint variant"),
         }
@@ -6587,6 +6458,9 @@ impl MixtureRuntime {
                     total_log_loss: m.total_log_loss,
                 })
             }
+            MixtureRuntime::Logistic(m) => {
+                MixtureRuntimeLifecycleCheckpoint::Logistic(m.lifecycle_checkpoint(expert_op))
+            }
         }
     }
 
@@ -6669,6 +6543,9 @@ impl MixtureRuntime {
                 m.eval_cache_expert_logps = ck.eval_cache_expert_logps;
                 m.total_log_loss = ck.total_log_loss;
             }
+            (MixtureRuntime::Logistic(m), MixtureRuntimeLifecycleCheckpoint::Logistic(ck)) => {
+                m.restore_lifecycle_checkpoint(expert_op, ck);
+            }
             _ => panic!("mismatched MixtureRuntime lifecycle checkpoint variant"),
         }
     }
@@ -6698,6 +6575,9 @@ impl MixtureRuntime {
             (MixtureRuntime::Neural(m), MixtureRuntimeLifecycleCheckpoint::Neural(ck)) => {
                 discard_lifecycle_experts(&mut m.experts, ck.experts, expert_op);
             }
+            (MixtureRuntime::Logistic(m), MixtureRuntimeLifecycleCheckpoint::Logistic(ck)) => {
+                m.discard_lifecycle_checkpoint(expert_op, ck);
+            }
             _ => panic!("mismatched MixtureRuntime lifecycle checkpoint variant"),
         }
     }
@@ -6710,6 +6590,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => clear_expert_checkpoints(&mut m.experts),
             MixtureRuntime::Mdl(m) => clear_expert_checkpoints(&mut m.experts),
             MixtureRuntime::Neural(m) => clear_expert_checkpoints(&mut m.experts),
+            MixtureRuntime::Logistic(m) => m.clear_checkpoints_if_supported(),
         }
     }
 
@@ -6721,6 +6602,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => experts_support_frozen_reset(&m.experts),
             MixtureRuntime::Mdl(m) => experts_support_frozen_reset(&m.experts),
             MixtureRuntime::Neural(m) => experts_support_frozen_reset(&m.experts),
+            MixtureRuntime::Logistic(m) => m.supports_frozen_reset(),
         }
     }
 
@@ -6732,6 +6614,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Mdl(m) => begin_expert_stream(&mut m.experts, total_symbols),
             MixtureRuntime::Neural(m) => begin_expert_stream(&mut m.experts, total_symbols),
+            MixtureRuntime::Logistic(m) => m.begin_stream(total_symbols),
         }
     }
 
@@ -6743,6 +6626,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.begin_fresh_stream(total_symbols),
             MixtureRuntime::Mdl(m) => m.begin_fresh_stream(total_symbols),
             MixtureRuntime::Neural(m) => m.begin_fresh_stream(total_symbols),
+            MixtureRuntime::Logistic(m) => m.begin_fresh_stream(total_symbols),
         }
     }
 
@@ -6754,6 +6638,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => finish_expert_stream(&mut m.experts),
             MixtureRuntime::Mdl(m) => finish_expert_stream(&mut m.experts),
             MixtureRuntime::Neural(m) => finish_expert_stream(&mut m.experts),
+            MixtureRuntime::Logistic(m) => m.finish_stream(),
         }
     }
 
@@ -6765,6 +6650,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.reset_frozen(total_symbols),
             MixtureRuntime::Mdl(m) => m.reset_frozen(total_symbols),
             MixtureRuntime::Neural(m) => m.reset_frozen(total_symbols),
+            MixtureRuntime::Logistic(m) => m.reset_frozen(total_symbols),
         }
     }
 
@@ -6777,6 +6663,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.predict_log_prob(symbol),
             MixtureRuntime::Mdl(m) => m.predict_log_prob(symbol),
             MixtureRuntime::Neural(m) => m.predict_log_prob(symbol),
+            MixtureRuntime::Logistic(m) => m.predict_log_prob(symbol),
         }
     }
 
@@ -6789,6 +6676,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.predict_log_prob_frozen(symbol),
             MixtureRuntime::Mdl(m) => m.predict_log_prob_frozen(symbol),
             MixtureRuntime::Neural(m) => m.predict_log_prob_frozen(symbol),
+            MixtureRuntime::Logistic(m) => m.predict_log_prob_frozen(symbol),
         }
     }
 
@@ -6801,6 +6689,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.step(symbol),
             MixtureRuntime::Mdl(m) => m.step(symbol),
             MixtureRuntime::Neural(m) => m.step(symbol),
+            MixtureRuntime::Logistic(m) => m.step_rate_backend(symbol),
         }
     }
 
@@ -6812,6 +6701,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.update_frozen(symbol),
             MixtureRuntime::Mdl(m) => m.update_frozen(symbol),
             MixtureRuntime::Neural(m) => m.update_frozen(symbol),
+            MixtureRuntime::Logistic(m) => m.update_frozen(symbol),
         }
     }
 
@@ -6823,6 +6713,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.fill_log_probs(out),
             MixtureRuntime::Mdl(m) => m.fill_log_probs(out),
             MixtureRuntime::Neural(m) => m.fill_log_probs(out),
+            MixtureRuntime::Logistic(m) => m.fill_log_probs(out),
         }
     }
 
@@ -6834,6 +6725,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.fill_log_probs_frozen(out),
             MixtureRuntime::Mdl(m) => m.fill_log_probs_frozen(out),
             MixtureRuntime::Neural(m) => m.fill_log_probs_frozen(out),
+            MixtureRuntime::Logistic(m) => m.fill_log_probs_frozen(out),
         }
     }
 
@@ -6845,6 +6737,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => experts_have_native_msb_byte_prefix(&m.experts),
             MixtureRuntime::Mdl(m) => experts_have_native_msb_byte_prefix(&m.experts),
             MixtureRuntime::Neural(m) => experts_have_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Logistic(m) => m.has_native_msb_byte_prefix(),
         }
     }
 
@@ -6858,6 +6751,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => experts_have_abortable_native_msb_byte_prefix(&m.experts),
             MixtureRuntime::Mdl(m) => experts_have_abortable_native_msb_byte_prefix(&m.experts),
             MixtureRuntime::Neural(m) => experts_have_abortable_native_msb_byte_prefix(&m.experts),
+            MixtureRuntime::Logistic(m) => m.supports_empty_native_msb_prefix_abort(),
         }
     }
 
@@ -6865,24 +6759,39 @@ impl MixtureRuntime {
         match self {
             MixtureRuntime::Bayes(m) => {
                 let weights: Vec<f64> = normalized_expert_log_weights(&m.experts);
-                m.bitwise.begin(&mut m.experts, &weights)
+                m.bitwise.begin(
+                    &mut m.experts,
+                    MixturePrefixPreparation::NativeIfAvailable { weights: &weights },
+                )
             }
             MixtureRuntime::Fading(m) => {
                 let weights: Vec<f64> = normalized_scaled_expert_log_weights(&m.experts, m.decay);
-                m.bitwise.begin(&mut m.experts, &weights)
+                m.bitwise.begin(
+                    &mut m.experts,
+                    MixturePrefixPreparation::NativeIfAvailable { weights: &weights },
+                )
             }
             MixtureRuntime::Switching(m) => {
                 let weights: Vec<f64> = normalized_expert_log_weights(&m.experts);
-                m.bitwise.begin(&mut m.experts, &weights)
+                m.bitwise.begin(
+                    &mut m.experts,
+                    MixturePrefixPreparation::NativeIfAvailable { weights: &weights },
+                )
             }
-            MixtureRuntime::Convex(m) => m.bitwise.begin(&mut m.experts, &m.lambda),
+            MixtureRuntime::Convex(m) => m.bitwise.begin(
+                &mut m.experts,
+                MixturePrefixPreparation::NativeIfAvailable { weights: &m.lambda },
+            ),
             MixtureRuntime::Mdl(m) => {
                 let best_idx: usize = best_expert_index(&m.experts);
                 let mut weights: Vec<f64> = vec![0.0; m.experts.len()];
                 if let Some(slot) = weights.get_mut(best_idx) {
                     *slot = 1.0;
                 }
-                m.bitwise.begin(&mut m.experts, &weights)
+                m.bitwise.begin(
+                    &mut m.experts,
+                    MixturePrefixPreparation::NativeIfAvailable { weights: &weights },
+                )
             }
             MixtureRuntime::Neural(m) => {
                 if m.experts.len() == 1 {
@@ -6894,8 +6803,14 @@ impl MixtureRuntime {
                     m.scratch_mix_weights
                         .copy_from_slice(m.neural.expert_weights());
                 }
-                m.bitwise.begin(&mut m.experts, &m.scratch_mix_weights)
+                m.bitwise.begin(
+                    &mut m.experts,
+                    MixturePrefixPreparation::NativeIfAvailable {
+                        weights: &m.scratch_mix_weights,
+                    },
+                )
             }
+            MixtureRuntime::Logistic(m) => m.begin_prefix_step(),
         }
     }
 
@@ -6907,6 +6822,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.bitwise.abort_empty(&mut m.experts),
             MixtureRuntime::Mdl(m) => m.bitwise.abort_empty(&mut m.experts),
             MixtureRuntime::Neural(m) => m.bitwise.abort_empty(&mut m.experts),
+            MixtureRuntime::Logistic(m) => m.abort_empty_prefix(),
         }
     }
 
@@ -6918,6 +6834,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
             MixtureRuntime::Mdl(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
             MixtureRuntime::Neural(m) => m.bitwise.prob_one(&mut m.experts, bit_idx),
+            MixtureRuntime::Logistic(m) => m.prefix_prob_one(bit_idx),
         }
     }
 
@@ -6933,6 +6850,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
             MixtureRuntime::Mdl(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
             MixtureRuntime::Neural(m) => m.bitwise.observe(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Logistic(m) => m.observe_prefix_bit(bit_idx, bit),
         }
     }
 
@@ -6948,6 +6866,7 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => m.bitwise.observe_known(&mut m.experts, bit_idx, bit),
             MixtureRuntime::Mdl(m) => m.bitwise.observe_known(&mut m.experts, bit_idx, bit),
             MixtureRuntime::Neural(m) => m.bitwise.observe_known(&mut m.experts, bit_idx, bit),
+            MixtureRuntime::Logistic(m) => m.observe_known_prefix_bit(bit_idx, bit),
         }
     }
 
@@ -6959,6 +6878,19 @@ impl MixtureRuntime {
             MixtureRuntime::Convex(m) => finish_convex_native_prefix(m, symbol),
             MixtureRuntime::Mdl(m) => finish_mdl_native_prefix(m, symbol),
             MixtureRuntime::Neural(m) => finish_neural_native_prefix(m, symbol),
+            MixtureRuntime::Logistic(m) => m.finish_prefix_step(symbol),
+        }
+    }
+
+    pub(crate) fn logistic_match_state(&mut self) -> LogisticMatchState {
+        match self {
+            MixtureRuntime::Bayes(m) => aggregate_logistic_match_state(&mut m.experts),
+            MixtureRuntime::Fading(m) => aggregate_logistic_match_state(&mut m.experts),
+            MixtureRuntime::Switching(m) => aggregate_logistic_match_state(&mut m.experts),
+            MixtureRuntime::Convex(m) => aggregate_logistic_match_state(&mut m.experts),
+            MixtureRuntime::Mdl(m) => aggregate_logistic_match_state(&mut m.experts),
+            MixtureRuntime::Neural(m) => aggregate_logistic_match_state(&mut m.experts),
+            MixtureRuntime::Logistic(m) => m.logistic_match_state(),
         }
     }
 }
@@ -7005,6 +6937,14 @@ fn best_expert_index(experts: &[ExpertState]) -> usize {
         }
     }
     best_idx
+}
+
+fn aggregate_logistic_match_state(experts: &mut [ExpertState]) -> LogisticMatchState {
+    fold_logistic_match_states(
+        experts
+            .iter_mut()
+            .map(|e| e.predictor.logistic_match_state()),
+    )
 }
 
 fn finish_bayes_native_prefix(m: &mut BayesMixture, symbol: u8) -> Result<(), String> {
@@ -7257,6 +7197,9 @@ fn build_mixture_runtime_from_fields(
         ))),
         MixtureKind::Mdl => Ok(MixtureRuntime::Mdl(MdlSelector::new(experts))),
         MixtureKind::Neural => Ok(MixtureRuntime::Neural(NeuralMixture::new(experts, alpha))),
+        MixtureKind::Logistic => Ok(MixtureRuntime::Logistic(LogisticMixture::new(
+            experts, alpha,
+        )?)),
     }
 }
 
@@ -7669,7 +7612,14 @@ mod tests {
         let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
         let mut bitwise = MixtureBitPrefixState::default();
         assert!(
-            bitwise.begin(&mut experts, &[0.5, 0.5]).expect("begin"),
+            bitwise
+                .begin(
+                    &mut experts,
+                    MixturePrefixPreparation::NativeIfAvailable {
+                        weights: &[0.5, 0.5],
+                    },
+                )
+                .expect("begin"),
             "native prefix should activate when experts support native bit stepping"
         );
 
@@ -7715,7 +7665,16 @@ mod tests {
         let configs = [ExpertConfig::ctw("left", 4), ExpertConfig::ctw("right", 5)];
         let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
         let mut bitwise = MixtureBitPrefixState::default();
-        assert!(bitwise.begin(&mut experts, &[0.5, 0.5]).expect("begin"));
+        assert!(
+            bitwise
+                .begin(
+                    &mut experts,
+                    MixturePrefixPreparation::NativeIfAvailable {
+                        weights: &[0.5, 0.5],
+                    },
+                )
+                .expect("begin")
+        );
 
         let err = bitwise
             .prob_one(&mut experts, 1)
@@ -7754,7 +7713,12 @@ mod tests {
         let mut bitwise = MixtureBitPrefixState::default();
 
         assert!(
-            bitwise.begin(&mut experts, &[1.0]).expect("begin"),
+            bitwise
+                .begin(
+                    &mut experts,
+                    MixturePrefixPreparation::NativeIfAvailable { weights: &[1.0] },
+                )
+                .expect("begin"),
             "native prefix setup should not require structural checkpoints on the happy path"
         );
         assert_eq!(
@@ -7787,7 +7751,12 @@ mod tests {
         let mut bitwise = MixtureBitPrefixState::default();
 
         assert!(
-            !bitwise.begin(&mut experts, &[1.0]).expect("begin"),
+            !bitwise
+                .begin(
+                    &mut experts,
+                    MixturePrefixPreparation::NativeIfAvailable { weights: &[1.0] },
+                )
+                .expect("begin"),
             "native prefix setup must fall back unless empty-prefix abort is advertised"
         );
         assert_eq!(
@@ -7835,7 +7804,12 @@ mod tests {
         let mut bitwise = MixtureBitPrefixState::default();
 
         let err = bitwise
-            .begin(&mut experts, &[0.5, 0.5])
+            .begin(
+                &mut experts,
+                MixturePrefixPreparation::NativeIfAvailable {
+                    weights: &[0.5, 0.5],
+                },
+            )
             .expect_err("second native expert should fail during setup");
         assert!(err.contains("intentional native-prefix begin failure"));
         assert_eq!(first_begin_calls.load(Ordering::Relaxed), 1);
@@ -7850,6 +7824,155 @@ mod tests {
             0,
             "the failing expert must not be aborted after an unsuccessful begin"
         );
+    }
+
+    #[test]
+    fn logistic_bit_prefix_uses_native_expert_prefix_when_available() {
+        let begin_calls = Arc::new(AtomicUsize::new(0));
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let shared_begin = Arc::clone(&begin_calls);
+        let shared_abort = Arc::clone(&abort_calls);
+        // Multi-expert logistic always prepares expert prefixes; one-expert
+        // uses the convex identity path, so this exercise uses two experts.
+        let configs = [
+            ExpertConfig::uniform("native-a", {
+                let shared_begin = Arc::clone(&shared_begin);
+                let shared_abort = Arc::clone(&shared_abort);
+                move || {
+                    Box::new(NativeWithoutCheckpointPredict {
+                        begin_calls: Arc::clone(&shared_begin),
+                        abort_calls: Arc::clone(&shared_abort),
+                        fail_begin: false,
+                        supports_empty_abort: true,
+                    })
+                }
+            }),
+            ExpertConfig::uniform("native-b", {
+                let shared_begin = Arc::clone(&shared_begin);
+                let shared_abort = Arc::clone(&shared_abort);
+                move || {
+                    Box::new(NativeWithoutCheckpointPredict {
+                        begin_calls: Arc::clone(&shared_begin),
+                        abort_calls: Arc::clone(&shared_abort),
+                        fail_begin: false,
+                        supports_empty_abort: true,
+                    })
+                }
+            }),
+        ];
+        let mut experts: Vec<ExpertState> = configs.iter().map(ExpertConfig::build).collect();
+        let mut bitwise = MixtureBitPrefixState::default();
+
+        assert!(
+            bitwise
+                .begin(&mut experts, MixturePrefixPreparation::AlwaysPrepare)
+                .expect("begin"),
+            "multi-expert logistic mixtures always need byte-prefix state for their experts"
+        );
+        assert_eq!(
+            begin_calls.load(Ordering::Relaxed),
+            2,
+            "logistic prefix setup must use the native expert path instead of forcing a PDF prefix"
+        );
+        assert_eq!(
+            abort_calls.load(Ordering::Relaxed),
+            0,
+            "successful logistic setup must not abort the native expert"
+        );
+    }
+
+    #[test]
+    fn direct_logistic_mixture_reports_invalid_configuration_and_prefix_errors() {
+        assert!(
+            LogisticMixture::new(&[], f64::NAN).is_err(),
+            "direct construction must reject a non-finite learning rate"
+        );
+
+        let first_begin_calls = Arc::new(AtomicUsize::new(0));
+        let first_abort_calls = Arc::new(AtomicUsize::new(0));
+        let second_begin_calls = Arc::new(AtomicUsize::new(0));
+        let first_begin = Arc::clone(&first_begin_calls);
+        let first_abort = Arc::clone(&first_abort_calls);
+        let second_begin = Arc::clone(&second_begin_calls);
+        let configs = [
+            ExpertConfig::uniform("prepared", move || {
+                Box::new(NativeWithoutCheckpointPredict {
+                    begin_calls: Arc::clone(&first_begin),
+                    abort_calls: Arc::clone(&first_abort),
+                    fail_begin: false,
+                    supports_empty_abort: true,
+                })
+            }),
+            ExpertConfig::uniform("failing", move || {
+                Box::new(NativeWithoutCheckpointPredict {
+                    begin_calls: Arc::clone(&second_begin),
+                    abort_calls: Arc::new(AtomicUsize::new(0)),
+                    fail_begin: true,
+                    supports_empty_abort: true,
+                })
+            }),
+        ];
+        let mut mixture = LogisticMixture::new(&configs, 0.03).expect("valid construction");
+        let err = mixture
+            .step(0xA5)
+            .expect_err("recoverable native-prefix setup failure must not panic");
+        assert!(err.contains("intentional native-prefix begin failure"));
+        assert_eq!(first_begin_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(second_begin_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first_abort_calls.load(Ordering::Relaxed),
+            1,
+            "the successfully prepared custom expert must be rolled back"
+        );
+    }
+
+    #[cfg(feature = "backend-ctw")]
+    #[test]
+    fn single_expert_logistic_native_bit_prefix_matches_expert_byte_step() {
+        let data = b"single expert logistic bit-prefix must stay expert-identical";
+        let base = RateBackend::Ctw { depth: 8 };
+        let mix = RateBackend::Mixture {
+            spec: Arc::new(
+                MixtureSpec::new(
+                    MixtureKind::Logistic,
+                    vec![crate::MixtureExpertSpec::new(base.clone()).with_name("ctw")],
+                )
+                .with_alpha(0.03),
+            ),
+        };
+
+        let mut expert = RateBackendPredictor::from_backend(base, DEFAULT_MIN_PROB);
+        let mut logistic = RateBackendPredictor::from_backend(mix, DEFAULT_MIN_PROB);
+        assert!(
+            logistic.has_native_msb_byte_prefix(),
+            "one-expert logistic over CTW should expose the expert native prefix path"
+        );
+
+        for &symbol in data {
+            let expert_logp = expert.log_prob_update(symbol);
+
+            assert!(logistic.begin_native_msb_byte_prefix().expect("begin"));
+            let mut bit_logp = 0.0f64;
+            for bit_idx in 0..8usize {
+                let bit = (symbol & (1u8 << (7 - bit_idx))) != 0;
+                let p1 = logistic
+                    .native_msb_prefix_prob_one(bit_idx)
+                    .expect("bit prob");
+                let pb = if bit { p1 } else { 1.0 - p1 };
+                bit_logp += pb.max(DEFAULT_MIN_PROB).ln();
+                logistic
+                    .observe_native_msb_prefix_bit(bit_idx, bit)
+                    .expect("observe");
+            }
+            logistic
+                .finish_native_msb_byte_prefix(symbol)
+                .expect("finish");
+
+            assert!(
+                (bit_logp - expert_logp).abs() < 1e-9,
+                "symbol={symbol:#04x} bit_logp={bit_logp} expert_logp={expert_logp}"
+            );
+        }
     }
 
     #[cfg(feature = "backend-ctw")]
@@ -9239,6 +9362,47 @@ mod tests {
     }
 
     #[test]
+    fn context_counter_checkpoints_restore_mixed_learned_and_frozen_updates() {
+        assert_checkpoint_roundtrip_restores_predictor(
+            RateBackend::OrderNGram {
+                order: 2,
+                hash_bits: 16,
+            },
+            b"order ngram checkpoint base history",
+        );
+        assert_checkpoint_roundtrip_restores_predictor(
+            RateBackend::WordContext { hash_bits: 16 },
+            b"word context checkpoint base history",
+        );
+    }
+
+    #[test]
+    fn context_counter_checkpoints_use_compact_journal_markers() {
+        let mut order = RateBackendPredictor::from_backend(
+            RateBackend::OrderNGram {
+                order: 2,
+                hash_bits: 24,
+            },
+            DEFAULT_MIN_PROB,
+        );
+        assert!(matches!(
+            order.checkpoint(),
+            RateBackendPredictorCheckpoint::OrderNGram(_)
+        ));
+        order.clear_checkpoints_if_supported();
+
+        let mut word = RateBackendPredictor::from_backend(
+            RateBackend::WordContext { hash_bits: 24 },
+            DEFAULT_MIN_PROB,
+        );
+        assert!(matches!(
+            word.checkpoint(),
+            RateBackendPredictorCheckpoint::WordContext(_)
+        ));
+        word.clear_checkpoints_if_supported();
+    }
+
+    #[test]
     fn calibrated_checkpoint_restores_wrapped_predictor_and_calibration_state() {
         assert_checkpoint_roundtrip_restores_predictor(
             RateBackend::Calibrated {
@@ -9248,6 +9412,8 @@ mod tests {
                     bins: 33,
                     learning_rate: 0.02,
                     bias_clip: 4.0,
+                    blend: 1.0,
+                    training_mode: crate::CalibrationTrainingMode::Nearest,
                 }),
             },
             b"calibrated checkpoint base history",
@@ -9375,6 +9541,9 @@ mod tests {
             MixtureRuntime::Neural(m) => {
                 assert_eq!(m.total_log_loss(), 0.0);
             }
+            MixtureRuntime::Logistic(m) => {
+                assert_eq!(m.total_log_loss(), 0.0);
+            }
         }
     }
 
@@ -9462,6 +9631,21 @@ mod tests {
             )
             .with_alpha(0.04),
             &["neural-a", "neural-b"],
+            0,
+        );
+
+        assert_runtime_variant_contracts(
+            MixtureSpec::new(
+                MixtureKind::Logistic,
+                vec![
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 4 })
+                        .with_name("logistic-a"),
+                    crate::MixtureExpertSpec::new(RateBackend::Ctw { depth: 5 })
+                        .with_name("logistic-b"),
+                ],
+            )
+            .with_alpha(0.03),
+            &["logistic-a", "logistic-b"],
             0,
         );
     }

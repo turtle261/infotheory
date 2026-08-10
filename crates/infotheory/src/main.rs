@@ -2378,6 +2378,10 @@ mod tests {
             parse_mixture_kind("neural").expect("neural kind"),
             MixtureKind::Neural
         );
+        assert_eq!(
+            parse_mixture_kind("logistic").expect("logistic kind"),
+            MixtureKind::Logistic
+        );
         assert!(parse_mixture_kind("bayes-mix").is_err());
         assert!(parse_mixture_kind("switch").is_err());
         assert!(parse_mixture_kind("nonsense").is_err());

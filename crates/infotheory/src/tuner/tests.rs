@@ -4210,6 +4210,79 @@ fn normalized_clipped_improvement_stays_in_unit_interval_and_rejects_degenerate_
 
 // --- Group 6: Reversible elementary kernel properties ---
 
+#[test]
+fn numeric_leaf_collection_covers_three_profile_knobs() {
+    use crate::tuner::annealer::collect_numeric_leaves;
+
+    let json = serde_json::json!({
+        "rate_backend": {
+            "kind": "calibrated",
+            "spec": {
+                "base": {
+                    "kind": "calibrated",
+                    "spec": {
+                        "base": {
+                            "kind": "mixture",
+                            "spec": {
+                                "kind": "logistic",
+                                "alpha": 0.02,
+                                "experts": [
+                                    {
+                                        "kind": "ppmd",
+                                        "order": 12,
+                                        "memory_mb": 256
+                                    },
+                                    {
+                                        "kind": "order-ngram",
+                                        "order": 2,
+                                        "hash_bits": 16
+                                    },
+                                    {
+                                        "kind": "word-context",
+                                        "hash_bits": 16
+                                    }
+                                ]
+                            }
+                        },
+                        "context": "order1",
+                        "bins": 33,
+                        "learning_rate": 0.03125,
+                        "bias_clip": 16.0,
+                        "blend": 0.5
+                    }
+                },
+                "context": "textrepeat",
+                "bins": 33,
+                "learning_rate": 0.02,
+                "bias_clip": 16.0,
+                "blend": 0.5
+            }
+        }
+    });
+
+    let leaves = collect_numeric_leaves(&json);
+    let paths = leaves
+        .iter()
+        .map(|leaf| leaf.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for expected in [
+        "rate_backend.spec.blend",
+        "rate_backend.spec.bins",
+        "rate_backend.spec.learning_rate",
+        "rate_backend.spec.bias_clip",
+        "rate_backend.spec.base.spec.blend",
+        "rate_backend.spec.base.spec.base.spec.alpha",
+        "rate_backend.spec.base.spec.base.spec.experts[0].order",
+        "rate_backend.spec.base.spec.base.spec.experts[0].memory_mb",
+        "rate_backend.spec.base.spec.base.spec.experts[1].order",
+        "rate_backend.spec.base.spec.base.spec.experts[1].hash_bits",
+        "rate_backend.spec.base.spec.base.spec.experts[2].hash_bits",
+    ] {
+        assert!(paths.contains(expected), "missing numeric leaf {expected}");
+    }
+}
+
 #[cfg(feature = "backend-ctw")]
 #[test]
 fn inactive_radius_moves_become_self_loops() {

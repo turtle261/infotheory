@@ -130,6 +130,28 @@ fn neural_mixture_single_expert_matches_backend() {
 }
 
 #[test]
+fn logistic_mixture_single_expert_matches_backend() {
+    let data = b"abababababababababababababababab";
+    let base = RateBackend::Ctw { depth: 8 };
+    let base_rate = try_entropy_rate_backend(data, &base).expect("base rate");
+
+    let spec = MixtureSpec::new(
+        MixtureKind::Logistic,
+        vec![MixtureExpertSpec::new(base.clone())],
+    )
+    .with_alpha(0.03);
+    let mix_backend = RateBackend::Mixture {
+        spec: Arc::new(spec),
+    };
+    let mix_rate = try_entropy_rate_backend(data, &mix_backend).expect("mix rate");
+
+    assert!(
+        (mix_rate - base_rate).abs() < 1e-6,
+        "mix={mix_rate} base={base_rate}"
+    );
+}
+
+#[test]
 fn convex_mixture_single_expert_matches_backend() {
     let data = b"abababababababababababababababab";
     let base = RateBackend::Ctw { depth: 8 };
@@ -242,6 +264,52 @@ fn neural_mixture_supports_nested_mixture_expert() {
 }
 
 #[test]
+fn logistic_mixture_supports_nested_mixture_expert() {
+    let data = b"abracadabra abracadabra abracadabra";
+    let inner = MixtureSpec::new(
+        MixtureKind::Bayes,
+        vec![
+            MixtureExpertSpec::new(RateBackend::Ctw { depth: 8 }).with_name("ctw"),
+            MixtureExpertSpec::new(RateBackend::Match {
+                hash_bits: 18,
+                min_len: 3,
+                max_len: 64,
+                base_mix: 0.03,
+                confidence_scale: 1.0,
+            })
+            .with_name("match"),
+        ],
+    );
+
+    let outer = MixtureSpec::new(
+        MixtureKind::Logistic,
+        vec![
+            MixtureExpertSpec::new(RateBackend::Mixture {
+                spec: Arc::new(inner),
+            })
+            .with_name("nested"),
+            MixtureExpertSpec::new(RateBackend::SparseMatch {
+                hash_bits: 18,
+                min_len: 3,
+                max_len: 64,
+                gap_min: 1,
+                gap_max: 3,
+                base_mix: 0.04,
+                confidence_scale: 1.0,
+            })
+            .with_name("sparse"),
+        ],
+    )
+    .with_alpha(0.02);
+
+    let backend = RateBackend::Mixture {
+        spec: Arc::new(outer),
+    };
+    let rate = try_entropy_rate_backend(data, &backend).expect("rate");
+    assert!(rate.is_finite() && rate >= 0.0, "rate={rate}");
+}
+
+#[test]
 fn convex_mixture_supports_nested_mixture_expert() {
     let data = b"abracadabra abracadabra abracadabra";
     let inner = MixtureSpec::new(
@@ -301,6 +369,11 @@ fn new_backends_have_finite_entropy_rates() {
             base_mix: 0.05,
             confidence_scale: 1.0,
         },
+        RateBackend::OrderNGram {
+            order: 2,
+            hash_bits: 12,
+        },
+        RateBackend::WordContext { hash_bits: 12 },
         RateBackend::Ppmd {
             order: 8,
             memory_mb: 8,

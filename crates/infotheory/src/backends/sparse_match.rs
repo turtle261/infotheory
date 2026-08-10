@@ -72,4 +72,14 @@ impl SparseMatchModel {
     pub fn update_history_only(&mut self, symbol: u8) {
         self.inner.update_history_only(symbol);
     }
+
+    /// Length of the best sparse/gapped match used for the current distribution.
+    pub fn match_len(&mut self) -> usize {
+        self.inner.match_len()
+    }
+
+    /// Predicted next byte from the best sparse/gapped match, if any.
+    pub fn predicted_byte(&mut self) -> Option<u8> {
+        self.inner.predicted_byte()
+    }
 }

@@ -961,6 +961,11 @@ fn standalone_rate_backend_documents_cover_all_binary_backend_tags() {
             base_mix: 0.05,
             confidence_scale: 1.0,
         }),
+        SpecDocument::RateBackend(RateBackend::OrderNGram {
+            order: 3,
+            hash_bits: 12,
+        }),
+        SpecDocument::RateBackend(RateBackend::WordContext { hash_bits: 12 }),
         SpecDocument::RateBackend(RateBackend::Ppmd {
             order: 6,
             memory_mb: 8,
@@ -1044,6 +1049,21 @@ fn standalone_rate_backend_documents_cover_all_binary_backend_tags() {
                 })],
             )),
         }),
+        SpecDocument::RateBackend(RateBackend::Mixture {
+            spec: Arc::new(
+                MixtureSpec::new(
+                    MixtureKind::Logistic,
+                    vec![MixtureExpertSpec::new(RateBackend::Match {
+                        hash_bits: 16,
+                        min_len: 3,
+                        max_len: 32,
+                        base_mix: 0.03,
+                        confidence_scale: 1.0,
+                    })],
+                )
+                .with_alpha(0.02),
+            ),
+        }),
         SpecDocument::RateBackend(RateBackend::Particle {
             spec: Arc::new(ParticleSpec::default()),
         }),
@@ -1053,7 +1073,23 @@ fn standalone_rate_backend_documents_cover_all_binary_backend_tags() {
                 bins: 17,
                 learning_rate: 0.05,
                 bias_clip: 3.0,
+                blend: 1.0,
+                training_mode: crate::api::CalibrationTrainingMode::Nearest,
                 base: RateBackend::Ctw { depth: 8 },
+            }),
+        }),
+        SpecDocument::RateBackend(RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec {
+                context: CalibrationContextKind::Order1,
+                bins: 19,
+                learning_rate: 0.04,
+                bias_clip: 4.0,
+                blend: 0.5,
+                training_mode: crate::api::CalibrationTrainingMode::Interpolated,
+                base: RateBackend::OrderNGram {
+                    order: 2,
+                    hash_bits: 12,
+                },
             }),
         }),
     ];

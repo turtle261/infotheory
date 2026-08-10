@@ -63,6 +63,55 @@ pub(crate) fn compile_rate_plan_sparse_match(
     }
 }
 
+pub(crate) fn compile_rate_plan_order_ngram(
+    backend: &RateBackend,
+    _env: &SpecEnvironment,
+    _depth: usize,
+) -> SpecResult<RateBackendPlan> {
+    match backend {
+        RateBackend::OrderNGram { order, hash_bits } => {
+            let max_order = crate::rate_defaults::ORDER_NGRAM_MAX_ORDER;
+            let max_hash_bits = crate::rate_defaults::CONTEXT_COUNTER_MAX_HASH_BITS;
+            if !(1..=max_order).contains(order) {
+                return Err(SpecError::new(format!(
+                    "order-ngram order must be in 1..={max_order}"
+                )));
+            }
+            if !(1..=max_hash_bits).contains(hash_bits) {
+                return Err(SpecError::new(format!(
+                    "order-ngram hash_bits must be in 1..={max_hash_bits}"
+                )));
+            }
+            Ok(RateBackendPlan::OrderNGram {
+                order: *order,
+                hash_bits: *hash_bits,
+            })
+        }
+        _ => unreachable!("order-ngram kernel used with non-order-ngram backend"),
+    }
+}
+
+pub(crate) fn compile_rate_plan_word_context(
+    backend: &RateBackend,
+    _env: &SpecEnvironment,
+    _depth: usize,
+) -> SpecResult<RateBackendPlan> {
+    match backend {
+        RateBackend::WordContext { hash_bits } => {
+            let max_hash_bits = crate::rate_defaults::CONTEXT_COUNTER_MAX_HASH_BITS;
+            if !(1..=max_hash_bits).contains(hash_bits) {
+                return Err(SpecError::new(format!(
+                    "word-context hash_bits must be in 1..={max_hash_bits}"
+                )));
+            }
+            Ok(RateBackendPlan::WordContext {
+                hash_bits: *hash_bits,
+            })
+        }
+        _ => unreachable!("word-context kernel used with non-word-context backend"),
+    }
+}
+
 pub(crate) fn compile_rate_plan_ppmd(
     backend: &RateBackend,
     _env: &SpecEnvironment,
@@ -284,9 +333,11 @@ pub(crate) fn compile_rate_plan_calibrated(
     };
     Ok(RateBackendPlan::Calibrated {
         context: spec.context,
+        training_mode: spec.training_mode,
         bins: spec.bins,
         learning_rate: spec.learning_rate,
         bias_clip: spec.bias_clip,
+        blend: spec.blend,
         base: Arc::new(build_rate_plan(&spec.base, env, depth - 1)?),
     })
 }

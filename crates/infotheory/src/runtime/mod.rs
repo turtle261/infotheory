@@ -9,6 +9,8 @@ use crate::api::{CompressionBackend, RateBackend};
 use crate::backends::bit_reservoir::BitReservoirModel;
 #[cfg(feature = "backend-calibrated")]
 use crate::backends::calibration::CalibratorCore;
+#[cfg(feature = "backend-context")]
+use crate::backends::context_counter::{OrderNGramModel, WordContextModel};
 #[cfg(feature = "backend-ctw")]
 use crate::backends::ctw::{ContextTree, FacContextTree, ctw_symbol_bit_msb};
 #[cfg(feature = "backend-match")]
@@ -56,6 +58,8 @@ pub enum RateBackendKind {
     FacCtw,
     Match,
     SparseMatch,
+    OrderNGram,
+    WordContext,
     Ppmd,
     Sequitur,
     Calibrated,
@@ -577,6 +581,64 @@ define_rate_backend_catalog! {
         build_predictor: predictor_builders::build_predictor_sparse_match,
         build_binary_token_predictor: predictor_builders::build_predictor_sparse_match,
         build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_sparse_match,
+        entropy_rate: entropy_prequential,
+        joint_entropy_rate: joint_entropy_prequential,
+        conditional_chain_rate: conditional_chain_prequential,
+    },
+    backend {
+        kind: OrderNGram,
+        canonical: "order-ngram",
+        aliases: ["order-ngram", "ngram"],
+        feature: "backend-context",
+        spec_helper_refs: anchor,
+        metric_helper_refs: anchor,
+        compile_plan: crate::spec::core::compile_rate_plan_order_ngram,
+        to_wrapper: crate::spec::core::rate_plan_to_wrapper_order_ngram,
+        encode_payload: crate::spec::core::encode_rate_payload_order_ngram,
+        display_label: crate::spec::core::rate_plan_display_label_order_ngram,
+        default_name: crate::spec::core::rate_plan_default_name_order_ngram,
+        trace_strategy: PublicTraceStrategy::PredictorBacked,
+        supports_biased_entropy: true,
+        supports_frozen_conditioning: true,
+        supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
+        method_family: None,
+        contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
+        build_predictor: predictor_builders::build_predictor_order_ngram,
+        build_binary_token_predictor: predictor_builders::build_predictor_order_ngram,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_order_ngram,
+        entropy_rate: entropy_prequential,
+        joint_entropy_rate: joint_entropy_prequential,
+        conditional_chain_rate: conditional_chain_prequential,
+    },
+    backend {
+        kind: WordContext,
+        canonical: "word-context",
+        aliases: ["word-context", "word"],
+        feature: "backend-context",
+        spec_helper_refs: anchor,
+        metric_helper_refs: anchor,
+        compile_plan: crate::spec::core::compile_rate_plan_word_context,
+        to_wrapper: crate::spec::core::rate_plan_to_wrapper_word_context,
+        encode_payload: crate::spec::core::encode_rate_payload_word_context,
+        display_label: crate::spec::core::rate_plan_display_label_word_context,
+        default_name: crate::spec::core::rate_plan_default_name_word_context,
+        trace_strategy: PublicTraceStrategy::PredictorBacked,
+        supports_biased_entropy: true,
+        supports_frozen_conditioning: true,
+        supports_rate_coded_compression: true,
+        supports_native_bit_prediction: crate::runtime::capability_always_false,
+        supports_byte_prefix_mass: crate::runtime::capability_always_true,
+        supports_efficient_byte_packed_bit_sessions: crate::runtime::capability_always_true,
+        supports_reversible_bit_updates: crate::runtime::capability_always_false,
+        method_family: None,
+        contains_zpaq: crate::spec::core::rate_plan_contains_zpaq_false,
+        build_predictor: predictor_builders::build_predictor_word_context,
+        build_binary_token_predictor: predictor_builders::build_predictor_word_context,
+        build_pdf_predictor: pdf_predictor_builders::build_pdf_predictor_word_context,
         entropy_rate: entropy_prequential,
         joint_entropy_rate: joint_entropy_prequential,
         conditional_chain_rate: conditional_chain_prequential,
@@ -2452,7 +2514,6 @@ mod tests {
     #[cfg(any(
         feature = "backend-ctw",
         feature = "backend-zpaq",
-        feature = "backend-mixture",
         feature = "backend-rwkv",
         feature = "backend-mamba",
         feature = "backend-bit-reservoir"
@@ -2583,8 +2644,17 @@ mod tests {
             .iter()
             .filter(|descriptor| descriptor.enabled)
         {
-            let backend = sample_rate_backend_for_kind(descriptor.kind)
-                .unwrap_or_else(|| panic!("missing sample backend for {:?}", descriptor.kind));
+            let Some(backend) = sample_rate_backend_for_kind(descriptor.kind) else {
+                // Composite-only feature slices can enable a construction
+                // kernel without enabling any primitive expert/base backend.
+                // There is no finite sample graph to build in that topology.
+                assert!(matches!(
+                    descriptor.kind,
+                    RateBackendKind::Mixture | RateBackendKind::Calibrated
+                ));
+                assert!(first_enabled_default_rate_backend_spec().is_none());
+                continue;
+            };
             let compiled = backend.compile().unwrap_or_else(|err| {
                 panic!(
                     "sample backend {:?} failed to compile: {err}",
@@ -2900,7 +2970,7 @@ mod tests {
         assert!(cond.is_finite() && cond >= 0.0);
     }
 
-    #[cfg(feature = "backend-mixture")]
+    #[cfg(all(feature = "backend-mixture", feature = "backend-ctw"))]
     #[test]
     fn mixture_runtime_entropy_helpers_are_finite() {
         let mixture = RateBackend::Mixture {

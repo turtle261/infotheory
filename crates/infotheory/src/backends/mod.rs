@@ -11,6 +11,9 @@ pub mod bit_reservoir;
 /// Online probability calibration wrapper for rate predictors.
 #[cfg(feature = "backend-calibrated")]
 pub mod calibration;
+/// Hashed byte-context and word-context counter predictors.
+#[cfg(feature = "backend-context")]
+pub mod context_counter;
 #[cfg(feature = "backend-ctw")]
 pub mod ctw;
 /// Shared internal fixed-shape GEMV specializations for neural backends.

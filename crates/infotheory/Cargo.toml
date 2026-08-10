@@ -37,6 +37,7 @@ capability-statistical = [
     "backend-rosa",
     "backend-ctw",
     "backend-match",
+    "backend-context",
     "backend-ppmd",
     "backend-sequitur",
     "backend-mixture",
@@ -63,6 +64,7 @@ all-backends = ["capability-default"]
 backend-rosa = []
 backend-ctw = []
 backend-match = []
+backend-context = []
 backend-ppmd = []
 backend-sequitur = []
 backend-mixture = []

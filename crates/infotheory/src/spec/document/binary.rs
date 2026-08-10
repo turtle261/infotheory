@@ -545,6 +545,15 @@ fn encode_rate_backend(out: &mut Vec<u8>, backend: &RateBackend) {
             push_f64(out, *base_mix);
             push_f64(out, *confidence_scale);
         }
+        RateBackend::OrderNGram { order, hash_bits } => {
+            out.push(14);
+            push_u64(out, *order as u64);
+            push_u64(out, *hash_bits as u64);
+        }
+        RateBackend::WordContext { hash_bits } => {
+            out.push(15);
+            push_u64(out, *hash_bits as u64);
+        }
         RateBackend::Ppmd { order, memory_mb } => {
             out.push(3);
             push_u64(out, *order as u64);
@@ -602,11 +611,16 @@ fn encode_rate_backend(out: &mut Vec<u8>, backend: &RateBackend) {
             encode_particle_spec(out, spec.as_ref());
         }
         RateBackend::Calibrated { spec } => {
-            out.push(12);
+            // Tag 12 is the legacy nearest-bin form whose omitted blend means
+            // exactly 1.0. New encodings carry both the explicit blend and
+            // training mode under tag 16.
+            out.push(16);
             out.push(calibration_context_tag(spec.context));
+            out.push(calibration_training_mode_tag(spec.training_mode));
             push_u64(out, spec.bins as u64);
             push_f64(out, spec.learning_rate);
             push_f64(out, spec.bias_clip);
+            push_f64(out, spec.blend);
             encode_rate_backend(out, &spec.base);
         }
         #[cfg(feature = "backend-bit-reservoir")]
@@ -649,6 +663,13 @@ fn decode_rate_backend(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<R
             gap_max: cursor.read_u64()? as usize,
             base_mix: cursor.read_f64()?,
             confidence_scale: cursor.read_f64()?,
+        }),
+        14 => Ok(RateBackend::OrderNGram {
+            order: cursor.read_u64()? as usize,
+            hash_bits: cursor.read_u64()? as usize,
+        }),
+        15 => Ok(RateBackend::WordContext {
+            hash_bits: cursor.read_u64()? as usize,
         }),
         3 => Ok(RateBackend::Ppmd {
             order: cursor.read_u64()? as usize,
@@ -715,9 +736,22 @@ fn decode_rate_backend(cursor: &mut Cursor<'_>, base_dir: &Path) -> SpecResult<R
         12 => Ok(RateBackend::Calibrated {
             spec: Arc::new(crate::api::CalibratedSpec {
                 context: decode_calibration_context(cursor.read_u8()?)?,
+                training_mode: crate::api::CalibrationTrainingMode::Nearest,
                 bins: cursor.read_u64()? as usize,
                 learning_rate: cursor.read_f64()?,
                 bias_clip: cursor.read_f64()?,
+                blend: 1.0,
+                base: decode_rate_backend(cursor, base_dir)?,
+            }),
+        }),
+        16 => Ok(RateBackend::Calibrated {
+            spec: Arc::new(crate::api::CalibratedSpec {
+                context: decode_calibration_context(cursor.read_u8()?)?,
+                training_mode: decode_calibration_training_mode(cursor.read_u8()?)?,
+                bins: cursor.read_u64()? as usize,
+                learning_rate: cursor.read_f64()?,
+                bias_clip: cursor.read_f64()?,
+                blend: cursor.read_f64()?,
                 base: decode_rate_backend(cursor, base_dir)?,
             }),
         }),
@@ -1645,6 +1679,7 @@ fn mixture_kind_tag(kind: crate::api::MixtureKind) -> u8 {
         crate::api::MixtureKind::Convex => 3,
         crate::api::MixtureKind::Mdl => 4,
         crate::api::MixtureKind::Neural => 5,
+        crate::api::MixtureKind::Logistic => 6,
     }
 }
 
@@ -1656,6 +1691,7 @@ fn decode_mixture_kind(tag: u8) -> SpecResult<crate::api::MixtureKind> {
         3 => Ok(crate::api::MixtureKind::Convex),
         4 => Ok(crate::api::MixtureKind::Mdl),
         5 => Ok(crate::api::MixtureKind::Neural),
+        6 => Ok(crate::api::MixtureKind::Logistic),
         _ => Err(SpecError::new(format!("unknown mixture kind tag '{tag}'"))),
     }
 }
@@ -1684,6 +1720,7 @@ fn calibration_context_tag(context: crate::api::CalibrationContextKind) -> u8 {
         crate::api::CalibrationContextKind::Text => 2,
         crate::api::CalibrationContextKind::Repeat => 3,
         crate::api::CalibrationContextKind::TextRepeat => 4,
+        crate::api::CalibrationContextKind::Order1 => 5,
     }
 }
 
@@ -1694,8 +1731,26 @@ fn decode_calibration_context(tag: u8) -> SpecResult<crate::api::CalibrationCont
         2 => Ok(crate::api::CalibrationContextKind::Text),
         3 => Ok(crate::api::CalibrationContextKind::Repeat),
         4 => Ok(crate::api::CalibrationContextKind::TextRepeat),
+        5 => Ok(crate::api::CalibrationContextKind::Order1),
         _ => Err(SpecError::new(format!(
             "unknown calibration context tag '{tag}'"
+        ))),
+    }
+}
+
+fn calibration_training_mode_tag(mode: crate::api::CalibrationTrainingMode) -> u8 {
+    match mode {
+        crate::api::CalibrationTrainingMode::Nearest => 0,
+        crate::api::CalibrationTrainingMode::Interpolated => 1,
+    }
+}
+
+fn decode_calibration_training_mode(tag: u8) -> SpecResult<crate::api::CalibrationTrainingMode> {
+    match tag {
+        0 => Ok(crate::api::CalibrationTrainingMode::Nearest),
+        1 => Ok(crate::api::CalibrationTrainingMode::Interpolated),
+        _ => Err(SpecError::new(format!(
+            "unknown calibration training mode tag '{tag}'"
         ))),
     }
 }
@@ -2225,5 +2280,55 @@ mod tests {
                 .contains("interface.reward_bits exceeds usize::MAX"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod calibrated_binary_tests {
+    use super::*;
+    use crate::api::{
+        CalibratedSpec, CalibrationContextKind, CalibrationTrainingMode, RateBackend,
+    };
+
+    #[test]
+    fn calibrated_binary_encoding_carries_explicit_blend_and_training_mode() {
+        let backend = RateBackend::Calibrated {
+            spec: Arc::new(CalibratedSpec {
+                base: RateBackend::Ctw { depth: 5 },
+                context: CalibrationContextKind::Global,
+                bins: 17,
+                learning_rate: 0.05,
+                bias_clip: 3.0,
+                blend: 1.0,
+                training_mode: CalibrationTrainingMode::Interpolated,
+            }),
+        };
+        let mut encoded = Vec::new();
+        encode_rate_backend(&mut encoded, &backend);
+        assert_eq!(encoded.first(), Some(&16));
+        let decoded = decode_rate_backend(&mut Cursor::new(&encoded), Path::new("."))
+            .expect("explicit calibrated payload");
+        let RateBackend::Calibrated { spec } = decoded else {
+            panic!("expected calibrated backend");
+        };
+        assert_eq!(spec.blend, 1.0);
+        assert_eq!(spec.training_mode, CalibrationTrainingMode::Interpolated);
+
+        // Tag 12 remains a decoder-only legacy spelling for the historical
+        // implicit full-calibration blend.
+        let mut legacy = Vec::new();
+        legacy.push(12);
+        legacy.push(calibration_context_tag(CalibrationContextKind::Global));
+        push_u64(&mut legacy, 17);
+        push_f64(&mut legacy, 0.05);
+        push_f64(&mut legacy, 3.0);
+        encode_rate_backend(&mut legacy, &RateBackend::Ctw { depth: 5 });
+        let decoded = decode_rate_backend(&mut Cursor::new(&legacy), Path::new("."))
+            .expect("legacy calibrated payload");
+        let RateBackend::Calibrated { spec } = decoded else {
+            panic!("expected calibrated backend");
+        };
+        assert_eq!(spec.blend, 1.0);
+        assert_eq!(spec.training_mode, CalibrationTrainingMode::Nearest);
     }
 }

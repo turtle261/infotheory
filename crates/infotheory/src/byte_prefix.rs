@@ -8,6 +8,14 @@ pub(crate) const BYTE_CDF_LEN: usize = BYTE_SYMBOLS + 1;
 /// Fixed-size CDF row over byte symbols.
 pub(crate) type BytePrefixCdf = [f64; BYTE_CDF_LEN];
 
+/// Reusable heap-stable CDF rows for a collection of experts.
+///
+/// A CDF row is 257 `f64`s (just over 2 KiB). Boxing each row keeps resizing
+/// and reordering the expert scratch collection from copying that payload and
+/// avoids placing it on transient stack frames.
+#[allow(clippy::vec_box)]
+pub(crate) type BytePrefixCdfScratch = Vec<Box<BytePrefixCdf>>;
+
 /// Create a zeroed CDF row.
 #[inline]
 pub(crate) fn zeroed_prefix_cdf() -> BytePrefixCdf {
@@ -99,7 +107,6 @@ impl Default for MsbPrefixRange {
 }
 
 /// Advance the ZPAQ/PAQ-style prefix code where root is `1`.
-#[cfg(feature = "backend-calibrated")]
 #[inline]
 pub(crate) fn advanced_prefix_code(prefix: u16, bit: bool) -> u16 {
     (prefix << 1) | u16::from(bit)
@@ -201,6 +208,38 @@ pub(crate) fn normalize_pdf(pdf: &mut [f64], min_prob: f64) {
         let v: f64 = if p.is_finite() { *p } else { 0.0 };
         *p = v.max(min_prob);
         sum += *p;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        let u: f64 = 1.0 / (pdf.len() as f64);
+        pdf.fill(u);
+        return;
+    }
+    let inv: f64 = 1.0 / sum;
+    for p in pdf.iter_mut() {
+        *p *= inv;
+    }
+}
+
+/// Normalize a non-negative PDF slice without applying a per-entry floor.
+///
+/// This is appropriate for materializing probabilities that already come from
+/// a coherent binary decision tree with floor-clamped conditional branches.
+/// Applying a second symbol-level floor would change the tree semantics and
+/// make the byte PDF disagree with the product of the same per-bit branches.
+#[inline]
+pub(crate) fn normalize_pdf_mass_only(pdf: &mut [f64]) {
+    debug_assert!(
+        !pdf.is_empty(),
+        "normalize_pdf_mass_only requires a non-empty distribution"
+    );
+    if pdf.is_empty() {
+        return;
+    }
+    let mut sum: f64 = 0.0;
+    for p in pdf.iter_mut() {
+        let v: f64 = if p.is_finite() { (*p).max(0.0) } else { 0.0 };
+        *p = v;
+        sum += v;
     }
     if !sum.is_finite() || sum <= 0.0 {
         let u: f64 = 1.0 / (pdf.len() as f64);

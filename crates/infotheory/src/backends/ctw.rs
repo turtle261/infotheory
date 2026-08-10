@@ -227,6 +227,36 @@ impl HistoryAccess for BitHistory {
     }
 }
 
+// `CTW_LOG_CACHE_LIMIT` bounds the direct-indexed `ln(n)`/`ln(n+0.5)` prefix
+// cache shared by every tree on this thread (`SharedLogCache`), keyed by raw
+// visit count `n`. Above the limit, lookups fall back to `BoundedLogs`'
+// fixed-size modular `overflow_log_*` slots (see `LogCacheSlot`), which only
+// pay off when the *same* `n` recurs across distinct nodes.
+//
+// This already bounds worst-case cache memory to a fixed
+// `2 * (limit + 1) * size_of::<f64>()` ceiling (~268 MiB at the current
+// value) for *any* corpus size, including Hutter-Prize-scale inputs
+// (enwik8/enwik9) that exceed `limit` symbols: growth stops at the cap
+// rather than continuing to scale with `n`. Root-adjacent nodes are visited
+// on (close to) every symbol, so their per-node count `n` increases by
+// exactly 1 on every visit and is therefore *never* repeated -- no fixed-size
+// keyed cache (of any size) can produce a hit for such a node once its count
+// exceeds the direct-indexed range, so every visit beyond the cap pays a real
+// `ln()`/`ln1p` call instead of an O(1) load.
+//
+// Measured on 10 MB of enwik7 (fac-ctw standalone, `h_rate`, CPU-pinned,
+// `RAYON_NUM_THREADS=1`): lowering this limit to `1 << 16` so the cap
+// actually engages within the current benchmark's 10^7-symbol range dropped
+// peak RSS by ~150 MiB (539 MB -> 384 MB) but *increased* wall/user time by
+// ~8.4% (160.4 s -> 173.9 s) at bit-identical output (2.19747398... bpb in
+// both cases -- the cache only changes where a value is computed from, never
+// its value). That trade is the wrong way round for this project's stated
+// priority order (speed first; memory "not regressed, ideally improved"),
+// and it does not even buy new scalability: at the *current* limit the cache
+// is already capped at a fixed ~268 MiB regardless of corpus size, so
+// enwik8/enwik9-scale runs do not see unbounded log-cache growth either way.
+// Conclusion: keep the limit as-is. Do not lower it to chase memory alone
+// without re-measuring speed on the then-current benchmark corpus size.
 const CTW_LOG_CACHE_LIMIT: usize = 1 << 24;
 const CTW_HOT_PREFIX_DEPTH_DEFAULT: usize = 12;
 const CTW_LOG_OVERFLOW_CACHE_SLOTS: usize = 1 << 14;
@@ -2466,6 +2496,31 @@ impl CtEngine {
         self.arena.child(self.root, root_edge)
     }
 
+    /// Recomputes and stores each visited node/segment's `log_prob_weighted`
+    /// (or `head_log_prob_weighted`) for the prepared path, using the
+    /// *post*-update KT log-probabilities.
+    ///
+    /// # Why this cannot be fused with `predict`'s combine
+    ///
+    /// `predict` walks the same prepared path and evaluates the identical
+    /// combine shape (`combined_weight_ratio_internal` /
+    /// `unary_chain_ratio_transform_precomputed`), which reads like duplicated
+    /// work at a glance. It is not: `predict` combines using each node's
+    /// *pre*-update `log_prob_kt` (the model must be queried before the
+    /// symbol is known), while this function combines using each node's
+    /// *post*-update `log_prob_kt` (after `apply_update_to_state_raw` has
+    /// applied the just-observed symbol). Writing `kt_new = kt_old + d` for
+    /// the (cheap, cache-backed) KT increment `d`, the two combines'
+    /// `exp(delta)` arguments differ by `d` minus the child's own (equally
+    /// data-dependent) delta -- there is no cheaper closed form than
+    /// evaluating the second `exp`/`ln_1p` pair directly. The two phases are
+    /// therefore mathematically distinct evaluations, not a redundant repeat,
+    /// and both are load-bearing: `predict`'s result is the coder's P(sym),
+    /// this function's result is the cached weight future sibling lookups
+    /// depend on. What *is* shared, and already exploited below, is
+    /// `step.sibling_weight`: siblings are untouched by this symbol's path,
+    /// so their cached weight from the `predict` walk remains valid here
+    /// without recomputation.
     fn update_prepared_cached_path<L: CtLogAccess>(
         &mut self,
         logs: L,

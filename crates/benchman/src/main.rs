@@ -36,6 +36,7 @@ enum BenchSuite {
     TwoJson,
     OneSse,
     Extra,
+    ThreeJson,
 }
 
 impl BenchSuite {
@@ -45,8 +46,9 @@ impl BenchSuite {
             "two-json" | "two_json" | "two" | "core" | "full" => Ok(Self::TwoJson),
             "one-sse" | "one_sse" | "one" => Ok(Self::OneSse),
             "extra" => Ok(Self::Extra),
+            "three-json" | "three_json" | "three" => Ok(Self::ThreeJson),
             _ => bail!(
-                "unknown benchmark suite '{raw}' (expected 'two-json', 'one-sse', or 'extra')"
+                "unknown benchmark suite '{raw}' (expected 'two-json', 'one-sse', 'extra', or 'three-json')"
             ),
         }
     }
@@ -56,6 +58,7 @@ impl BenchSuite {
             Self::TwoJson => "two-json",
             Self::OneSse => "one-sse",
             Self::Extra => "extra",
+            Self::ThreeJson => "three-json",
         }
     }
 
@@ -64,6 +67,7 @@ impl BenchSuite {
             Self::TwoJson => "infotheory-two-json",
             Self::OneSse => "infotheory-one-sse",
             Self::Extra => "infotheory-extra",
+            Self::ThreeJson => "infotheory-three-json",
         }
     }
 
@@ -72,6 +76,7 @@ impl BenchSuite {
             Self::TwoJson => "configs/bench/two.json",
             Self::OneSse => "configs/bench/one_sse.json",
             Self::Extra => "configs/bench/extra.json",
+            Self::ThreeJson => "configs/bench/three.json",
         }
     }
 
@@ -80,6 +85,7 @@ impl BenchSuite {
             Self::TwoJson => &["neural_mixture", "rwkv7"],
             Self::OneSse => &["calibrated_mixture", "bit-reservoir"],
             Self::Extra => &["neural_mixture", "mamba"],
+            Self::ThreeJson => &["calibrated_mixture", "order2"],
         }
     }
 }
@@ -132,7 +138,7 @@ struct BenchCli {
         long,
         env = "INFOTHEORY_PLOT_SUITE",
         default_value = DEFAULT_BENCH_SUITE,
-        help = "Benchmark suite (`two-json`, `one-sse`, or `extra`) used for latest-summary discovery and plot regeneration"
+        help = "Benchmark suite (`two-json`, `one-sse`, `extra`, or `three-json`) used for latest-summary discovery and plot regeneration"
     )]
     suite: String,
 
@@ -1038,12 +1044,17 @@ fn plot_dir_deletion_policy(plot_dir: &Path) -> Result<PlotDirDeletionPolicy> {
 
 fn is_legacy_plot_svg_name(file_name: &str) -> bool {
     file_name.ends_with(LEGACY_PLOT_SVG_SUFFIX)
-        && [BenchSuite::TwoJson, BenchSuite::OneSse, BenchSuite::Extra]
-            .into_iter()
-            .any(|suite| {
-                let expected_prefix = format!("{}-", suite.summary_prefix());
-                file_name.starts_with(&expected_prefix)
-            })
+        && [
+            BenchSuite::TwoJson,
+            BenchSuite::OneSse,
+            BenchSuite::Extra,
+            BenchSuite::ThreeJson,
+        ]
+        .into_iter()
+        .any(|suite| {
+            let expected_prefix = format!("{}-", suite.summary_prefix());
+            file_name.starts_with(&expected_prefix)
+        })
 }
 
 fn confirm_unmanaged_plot_dir_deletion(plot_dir: &Path) -> Result<()> {
@@ -2459,6 +2470,21 @@ mod tests {
         let dir = TestDir::new("legacy-one-sse");
         fs::write(
             dir.path().join("infotheory-one-sse-h-rss-run.svg"),
+            "<svg/>",
+        )
+        .expect("failed to write legacy artifact");
+
+        assert_eq!(
+            plot_dir_deletion_policy(dir.path()).expect("policy should evaluate"),
+            PlotDirDeletionPolicy::LegacyArtifacts
+        );
+    }
+
+    #[test]
+    fn plot_dir_deletion_policy_accepts_three_json_suite_artifacts() {
+        let dir = TestDir::new("legacy-three-json");
+        fs::write(
+            dir.path().join("infotheory-three-json-h-rss-run.svg"),
             "<svg/>",
         )
         .expect("failed to write legacy artifact");

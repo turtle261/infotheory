@@ -310,6 +310,38 @@ pub enum RateBackend {
         /// Confidence multiplier applied to short-match tapering.
         confidence_scale: f64,
     },
+    /// Bounded-memory hashed order-N byte counter.
+    ///
+    /// The predictor uses the previous `order` bytes as a context key and
+    /// stores byte counts in a lazily populated map with at most
+    /// `2^hash_bits` logical slots. Hash collisions evict the old slot, so
+    /// memory is bounded by configuration rather than by corpus length. Each
+    /// occupied slot holds 256 `u16` counters (512
+    /// bytes before allocator metadata); with `hash_bits = 24`, those count
+    /// tables alone can reach 8 GiB. When `backend-context` is enabled, query
+    /// `backends::context_counter::maximum_resident_bytes` before accepting an
+    /// untrusted configuration.
+    OrderNGram {
+        /// Byte context order. Intended compression profiles use 1-3.
+        order: usize,
+        /// Number of hash-address bits in the bounded context table.
+        hash_bits: usize,
+    },
+    /// Bounded-memory text word-context byte counter.
+    ///
+    /// The predictor hashes current/previous word state plus shared
+    /// text-structure features into a lazily populated map bounded to
+    /// `2^hash_bits` logical slots and
+    /// stores 256 next-byte `u16` counters per occupied slot. The table is
+    /// bounded but can still be large: `hash_bits = 24` permits 8 GiB of count
+    /// tables alone, before sparse-map and allocator metadata. When
+    /// `backend-context` is enabled, use
+    /// `backends::context_counter::maximum_resident_bytes` to inspect the
+    /// conservative target-dependent payload bound.
+    WordContext {
+        /// Number of hash-address bits in the bounded context table.
+        hash_bits: usize,
+    },
     /// Pure-Rust bounded-memory PPMD-style model.
     Ppmd {
         /// Maximum context order.
@@ -441,8 +473,28 @@ pub enum MixtureKind {
     Convex,
     /// MDL-style best-expert selector.
     Mdl,
-    /// Bytewise neural logistic mixer (PAQ style adaptation).
+    /// Bytewise, two-stage convex mixer with context-gated softmax-simplex
+    /// weights (`p = sum(w_i * p_i)` in probability space at each stage;
+    /// see `NeuralMixCore`). Despite the name, this is a convex/linear
+    /// mixture, not a PAQ-style logistic mixer: because every weight lies on
+    /// a probability simplex and blending happens in probability space
+    /// (never in the logit/stretch domain), the mixed probability can never
+    /// exceed the most confident expert's probability for the observed
+    /// symbol. See [`MixtureKind::Logistic`] for a true stretch-domain,
+    /// per-bit logistic mixer with unconstrained weights.
     Neural,
+    /// Bitwise, stretch-domain (logit) logistic mixer (PAQ style). Each bit
+    /// is predicted as `squash(sum_i w_i * stretch(p_i))` where `stretch(p)
+    /// = ln(p / (1 - p))` and `squash` is its inverse (the logistic
+    /// sigmoid); weights are unconstrained (not a probability simplex) and
+    /// are updated after every bit via online logistic-regression gradient
+    /// ascent on log-likelihood, `w_i += lr * stretch(p_i) * (bit - p_mix)`.
+    /// Because mixing happens in logit space with unconstrained weights,
+    /// the result can be more confident than any single expert (a true
+    /// geometric-mixture-like effect), unlike [`MixtureKind::Neural`]'s
+    /// convex combination. See `LogisticMixCore` for the implementation and
+    /// its context-selection scheme.
+    Logistic,
 }
 
 /// Adaptive schedule family for switching and convex mixtures.
@@ -477,12 +529,31 @@ pub enum CalibrationContextKind {
     Global,
     /// Previous-byte class only.
     ByteClass,
+    /// Direct previous-byte context, with one row family per byte value.
+    Order1,
     /// Text-structure-aware context hash.
     Text,
     /// Repeat-aware context hash.
     Repeat,
     /// Joint text/repeat-aware context hash.
     TextRepeat,
+}
+
+/// Online update law used by an SSE-calibrated wrapper.
+///
+/// Prediction always interpolates the two adjacent stretched-probability
+/// bins. This setting controls which entries learn from the observed bit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CalibrationTrainingMode {
+    /// Update only the nearest quantized entry.
+    ///
+    /// This is the historical Infotheory/ZPAQ-style behavior and therefore
+    /// remains the default for configurations that omit an explicit mode.
+    #[default]
+    Nearest,
+    /// Update both adjacent entries in proportion to their interpolation mass.
+    Interpolated,
 }
 
 /// Configuration for an SSE-calibrated wrapper rate backend.
@@ -499,6 +570,20 @@ pub struct CalibratedSpec {
     pub learning_rate: f64,
     /// Symmetric stretched-logit clip used by SSE quantization.
     pub bias_clip: f64,
+    /// Weight assigned to the calibrated stage output before returning it.
+    ///
+    /// `1.0` returns the calibrated probability directly, preserving the
+    /// historical SSE wrapper behavior. Values in `[0, 1)` blend the stage
+    /// input with the calibrated output, which lets nested calibrated specs form
+    /// a PAQ-style APM chain instead of replacing each stage's input outright.
+    /// Values must be finite and in `[0, 1]`; validation rejects invalid
+    /// configurations before compilation or canonical serialization.
+    pub blend: f64,
+    /// Update law for the stretched-probability table.
+    ///
+    /// The default is [`CalibrationTrainingMode::Nearest`] so pre-existing
+    /// calibrated configurations retain their exact adaptive semantics.
+    pub training_mode: CalibrationTrainingMode,
 }
 
 impl CalibratedSpec {
@@ -510,6 +595,8 @@ impl CalibratedSpec {
             bins: 32,
             learning_rate: 1.0 / 32.0,
             bias_clip: 16.0,
+            blend: 1.0,
+            training_mode: CalibrationTrainingMode::Nearest,
         }
     }
 
@@ -531,6 +618,23 @@ impl CalibratedSpec {
     #[must_use]
     pub fn with_bias_clip(mut self, bias_clip: f64) -> Self {
         self.bias_clip = bias_clip;
+        self
+    }
+
+    /// Override the stage-output blend weight.
+    ///
+    /// The value is validated as finite and in `[0, 1]` when this spec is
+    /// compiled or canonically serialized.
+    #[must_use]
+    pub fn with_blend(mut self, blend: f64) -> Self {
+        self.blend = blend;
+        self
+    }
+
+    /// Override the SSE table update law.
+    #[must_use]
+    pub fn with_training_mode(mut self, training_mode: CalibrationTrainingMode) -> Self {
+        self.training_mode = training_mode;
         self
     }
 }
@@ -592,7 +696,8 @@ pub struct MixtureSpec {
     /// Adaptive schedule family for supported mixture kinds.
     pub schedule: MixtureScheduleMode,
     /// Shared scalar parameter: switch rate for `Switching`, step-size scale for `Convex`,
-    /// learning rate for `Neural`, and generic alpha for the remaining families.
+    /// learning rate for `Neural` and `Logistic`, and generic alpha for the remaining
+    /// families.
     ///
     /// In theorem mode for `Switching` and `Convex`, this field is retained for API
     /// compatibility but is not used by the update schedule.
@@ -690,6 +795,8 @@ impl RateBackend {
             RateBackend::RosaPlus { .. } => crate::runtime::RateBackendKind::RosaPlus,
             RateBackend::Match { .. } => crate::runtime::RateBackendKind::Match,
             RateBackend::SparseMatch { .. } => crate::runtime::RateBackendKind::SparseMatch,
+            RateBackend::OrderNGram { .. } => crate::runtime::RateBackendKind::OrderNGram,
+            RateBackend::WordContext { .. } => crate::runtime::RateBackendKind::WordContext,
             RateBackend::Ppmd { .. } => crate::runtime::RateBackendKind::Ppmd,
             RateBackend::Sequitur { .. } => crate::runtime::RateBackendKind::Sequitur,
             #[cfg(feature = "backend-mamba")]
@@ -831,6 +938,7 @@ pub fn parse_mixture_kind_name(kind: &str) -> Result<MixtureKind, String> {
         "convex" => Ok(MixtureKind::Convex),
         "mdl" => Ok(MixtureKind::Mdl),
         "neural" => Ok(MixtureKind::Neural),
+        "logistic" => Ok(MixtureKind::Logistic),
         other => Err(format!("unknown mixture kind '{other}'")),
     }
 }
@@ -953,10 +1061,27 @@ fn validate_mixture_spec_shallow(spec: &MixtureSpec) -> Result<(), String> {
                 return Err("mixture alpha must be > 0".to_string());
             }
         }
-        (MixtureKind::Neural, MixtureScheduleMode::Theorem) => unreachable!(),
+        (MixtureKind::Logistic, MixtureScheduleMode::Default) => {
+            // Logistic alpha is the stretch-mixer learning rate. The core owns
+            // this domain predicate so accepted specs execute with that exact
+            // labeled value on every construction path.
+            crate::neural_mix::validate_logistic_learning_rate(spec.alpha)?;
+        }
+        (MixtureKind::Neural, MixtureScheduleMode::Theorem)
+        | (MixtureKind::Logistic, MixtureScheduleMode::Theorem) => unreachable!(),
         _ => {}
     }
     Ok(())
+}
+
+/// Validate the interpolation weight shared by typed, parsed, and serialized
+/// calibrated specifications.
+pub(crate) fn validate_calibrated_blend(blend: f64) -> Result<(), String> {
+    if blend.is_finite() && (0.0..=1.0).contains(&blend) {
+        Ok(())
+    } else {
+        Err("calibrated blend must be finite and in [0, 1]".to_string())
+    }
 }
 
 fn validate_rate_backend_with_depth(backend: &RateBackend, depth: usize) -> Result<(), String> {
@@ -982,6 +1107,28 @@ fn validate_rate_backend_with_depth(backend: &RateBackend, depth: usize) -> Resu
                 Ok(())
             }
         }
+        RateBackend::OrderNGram { order, hash_bits } => {
+            let max_order = crate::rate_defaults::ORDER_NGRAM_MAX_ORDER;
+            let max_hash_bits = crate::rate_defaults::CONTEXT_COUNTER_MAX_HASH_BITS;
+            if !(1..=max_order).contains(order) {
+                return Err(format!("order-ngram order must be in 1..={max_order}"));
+            }
+            if !(1..=max_hash_bits).contains(hash_bits) {
+                return Err(format!(
+                    "order-ngram hash_bits must be in 1..={max_hash_bits}"
+                ));
+            }
+            Ok(())
+        }
+        RateBackend::WordContext { hash_bits } => {
+            let max_hash_bits = crate::rate_defaults::CONTEXT_COUNTER_MAX_HASH_BITS;
+            if !(1..=max_hash_bits).contains(hash_bits) {
+                return Err(format!(
+                    "word-context hash_bits must be in 1..={max_hash_bits}"
+                ));
+            }
+            Ok(())
+        }
         RateBackend::Mixture { spec } => validate_mixture_spec_with_depth(spec.as_ref(), depth),
         RateBackend::Particle { spec } => spec.validate().map_err(|err| err.to_string()),
         #[cfg(feature = "backend-bit-reservoir")]
@@ -990,6 +1137,7 @@ fn validate_rate_backend_with_depth(backend: &RateBackend, depth: usize) -> Resu
             if depth == 0 {
                 return Err("calibrated spec nesting too deep".to_string());
             }
+            validate_calibrated_blend(spec.blend)?;
             validate_rate_backend_with_depth(&spec.base, depth - 1)
                 .map_err(|err| format!("calibrated base invalid: {err}"))
         }
@@ -1228,30 +1376,80 @@ mod tests {
             "unexpected switching alpha error: {err}"
         );
 
-        let convex = MixtureSpec::new(MixtureKind::Convex, vec![expert]).with_alpha(0.0);
+        let convex = MixtureSpec::new(MixtureKind::Convex, vec![expert.clone()]).with_alpha(0.0);
         let err = validate_mixture_spec_shallow(&convex)
             .expect_err("convex alpha must be strictly positive");
         assert!(err.contains("> 0"), "unexpected convex alpha error: {err}");
 
-        let sequitur = RateBackend::Sequitur { context_bytes: 1 };
-        let err = validate_rate_backend(&sequitur).expect_err("sequitur context should fail");
+        let logistic_hi =
+            MixtureSpec::new(MixtureKind::Logistic, vec![expert.clone()]).with_alpha(2.0);
+        let err = validate_mixture_spec_shallow(&logistic_hi)
+            .expect_err("logistic alpha above 1.0 should fail");
         assert!(
-            err.to_string().contains("context_bytes"),
-            "unexpected sequitur validation error: {err}"
+            err.contains("logistic") && err.contains("[1e-6, 1.0]"),
+            "unexpected logistic alpha error: {err}"
         );
 
-        let compression = CompressionBackend::Rate {
-            rate_backend: sequitur,
-            coder: crate::coders::CoderType::AC,
-            framing: crate::compression::FramingMode::Raw,
-        };
-        let err = validate_compression_backend(&compression)
-            .expect_err("rate-coded compression should report nested rate backend errors");
-        assert!(
-            err.to_string()
-                .contains("rate-coded compression backend invalid"),
-            "unexpected compression validation error: {err}"
-        );
+        let logistic_ok = MixtureSpec::new(MixtureKind::Logistic, vec![expert]).with_alpha(0.02);
+        validate_mixture_spec_shallow(&logistic_ok)
+            .expect("logistic alpha in [1e-6, 1.0] should validate");
+
+        #[cfg(feature = "backend-sequitur")]
+        {
+            let sequitur = RateBackend::Sequitur { context_bytes: 1 };
+            let err = validate_rate_backend(&sequitur).expect_err("sequitur context should fail");
+            assert!(
+                err.to_string().contains("context_bytes"),
+                "unexpected sequitur validation error: {err}"
+            );
+
+            let compression = CompressionBackend::Rate {
+                rate_backend: sequitur,
+                coder: crate::coders::CoderType::AC,
+                framing: crate::compression::FramingMode::Raw,
+            };
+            let err = validate_compression_backend(&compression)
+                .expect_err("rate-coded compression should report nested rate backend errors");
+            assert!(
+                err.to_string()
+                    .contains("rate-coded compression backend invalid"),
+                "unexpected compression validation error: {err}"
+            );
+        }
+
+        let err = validate_calibrated_blend(2.0).expect_err("blend > 1 should fail");
+        assert!(err.contains("blend"), "unexpected blend error: {err}");
+
+        #[cfg(feature = "backend-context")]
+        {
+            let bad_ngram = RateBackend::OrderNGram {
+                order: 0,
+                hash_bits: 8,
+            };
+            let err = validate_rate_backend(&bad_ngram).expect_err("order 0 should fail");
+            assert!(
+                err.to_string().contains("order-ngram order"),
+                "unexpected order-ngram validation error: {err}"
+            );
+
+            #[cfg(feature = "backend-mixture")]
+            {
+                let mix_with_bad = MixtureSpec::new(
+                    MixtureKind::Bayes,
+                    vec![MixtureExpertSpec::new(RateBackend::OrderNGram {
+                        order: 0,
+                        hash_bits: 8,
+                    })],
+                );
+                let err = mix_with_bad
+                    .validate()
+                    .expect_err("mixture expert order-ngram bounds should fail at API validate");
+                assert!(
+                    err.to_string().contains("order-ngram"),
+                    "unexpected nested order-ngram validation error: {err}"
+                );
+            }
+        }
     }
 
     #[test]

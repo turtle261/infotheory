@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use crate::api::CalibrationContextKind;
+use crate::api::{CalibrationContextKind, CalibrationTrainingMode};
 use crate::backends::text_context::{NeuralContextState, TextContextAnalyzer};
 use crate::byte_prefix::{
     BytePrefixCdf, MsbPrefixRange, advanced_prefix_code, fill_normalized_prefix_cdf_from_pdf,
@@ -8,9 +8,16 @@ use crate::byte_prefix::{
 };
 
 const PROB_SCALE: u32 = 32_767;
-const COUNT_BITS: u32 = 10;
+// Counts use Q10.6 fixed point. Six fractional bits are enough to distribute
+// one observation continuously across adjacent interpolation bins, while the
+// ten integer bits preserve the historical 0..=1023 adaptation horizon.
+const COUNT_BITS: u32 = 16;
 const COUNT_MASK: u32 = (1 << COUNT_BITS) - 1;
-const COUNT_RECIP_LEN: usize = COUNT_MASK as usize + 3;
+const COUNT_FRACTION_BITS: u32 = 6;
+const COUNT_SCALE: u16 = 1 << COUNT_FRACTION_BITS;
+const COUNT_EFFECTIVE_MAX: u16 = 1023;
+const COUNT_MAX_UNITS: u16 = COUNT_EFFECTIVE_MAX * COUNT_SCALE;
+const COUNT_RECIP_LEN: usize = COUNT_MAX_UNITS as usize + 2 * COUNT_SCALE as usize + 1;
 const CORRECTION_BITS: u32 = 32 - COUNT_BITS;
 const CORRECTION_MASK: u32 = (1 << CORRECTION_BITS) - 1;
 const CORRECTION_UNITS_PER_NAT: f64 = 512.0;
@@ -34,14 +41,14 @@ type SseTableRows = Vec<Option<Arc<[u32]>>>;
 struct SseQuantization {
     lower_bin: usize,
     weight_hi: i32,
-    nearest_bin: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct SseMappedBit {
     prob_one: f64,
-    nearest_row: usize,
-    nearest_bin: usize,
+    row: usize,
+    lower_bin: usize,
+    weight_hi: i32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -63,8 +70,9 @@ const EMPTY_SSE_UNDO: SseUndo = SseUndo {
 /// The table is indexed by a byte-level context family, the current in-byte
 /// MSB prefix, and a stretched-logit quantization of the wrapped predictor's
 /// bit probability. Each entry stores a signed log-odds correction plus a
-/// saturating count. Entries are initialized to zero correction, so wrapping a
-/// predictor is conservative before online evidence accumulates.
+/// saturating Q10.6 effective-sample count. Entries are initialized to zero
+/// correction, so wrapping a predictor is conservative before online evidence
+/// accumulates.
 pub struct CalibratorCore {
     analyzer: TextContextAnalyzer,
     context: CalibrationContextKind,
@@ -73,36 +81,65 @@ pub struct CalibratorCore {
     last_stretch: i32,
     stretch_scale: f64,
     max_quantized_pos: i64,
+    blend: f64,
+    training_mode: CalibrationTrainingMode,
     initial_entry: u32,
     table: Arc<SseTableRows>,
     prefix: u16,
     active_bits: Option<u8>,
     active_context: usize,
-    last_nearest_row: usize,
-    last_nearest_bin: usize,
+    last_row: usize,
+    last_lower_bin: usize,
+    last_weight_hi: i32,
     last_prob_one: f64,
     last_valid: bool,
-    active_undo: [SseUndo; 8],
+    active_undo: [SseUndo; 16],
     active_undo_len: u8,
 }
 
 impl CalibratorCore {
-    /// Create an SSE calibrator with bounded table dimensions and adaptation.
+    /// Create a historical nearest-bin SSE calibrator.
+    ///
+    /// This constructor retains the pre-existing public API and exact adaptive
+    /// semantics. Spec-backed construction uses an internal configured entry
+    /// point to opt into blending or interpolated training explicitly.
     pub fn new(
         context: CalibrationContextKind,
         bins: usize,
         learning_rate: f64,
         bias_clip: f64,
     ) -> Self {
+        Self::new_configured(
+            context,
+            bins,
+            learning_rate,
+            bias_clip,
+            1.0,
+            CalibrationTrainingMode::Nearest,
+        )
+    }
+
+    pub(crate) fn new_configured(
+        context: CalibrationContextKind,
+        bins: usize,
+        learning_rate: f64,
+        bias_clip: f64,
+        blend: f64,
+        training_mode: CalibrationTrainingMode,
+    ) -> Self {
         let bins: usize = bins.clamp(MIN_BINS, MAX_BINS);
         let learning_rate: f64 = sanitize_learning_rate(learning_rate);
+        assert!(
+            blend.is_finite() && (0.0..=1.0).contains(&blend),
+            "configured calibrated blend must be finite and in [0, 1]"
+        );
         let initial_count: u16 = initial_count_from_learning_rate(learning_rate);
         let (first_stretch, last_stretch) = stretch_range_from_clip(bias_clip);
         let stretch_span: i32 = (last_stretch - first_stretch).max(1);
         let max_quantized_pos: i64 = ((bins - 1) * (INTERP_SCALE as usize)) as i64;
         let stretch_scale: f64 = (max_quantized_pos as f64) / f64::from(stretch_span);
         let rows: usize = context_cardinality(context) * BYTE_PREFIX_STATES;
-        let initial_entry: u32 = pack_entry(0, initial_count);
+        let initial_entry: u32 = pack_entry(0, initial_count.saturating_mul(COUNT_SCALE));
         let mut table: SseTableRows = Vec::with_capacity(rows);
         table.resize_with(rows, || None);
 
@@ -114,16 +151,19 @@ impl CalibratorCore {
             last_stretch,
             stretch_scale,
             max_quantized_pos,
+            blend,
+            training_mode,
             initial_entry,
             table: Arc::new(table),
             prefix: 1,
             active_bits: None,
             active_context: 0,
-            last_nearest_row: 0,
-            last_nearest_bin: 0,
+            last_row: 0,
+            last_lower_bin: 0,
+            last_weight_hi: 0,
             last_prob_one: 0.5,
             last_valid: false,
-            active_undo: [EMPTY_SSE_UNDO; 8],
+            active_undo: [EMPTY_SSE_UNDO; 16],
             active_undo_len: 0,
         }
     }
@@ -245,8 +285,9 @@ impl CalibratorCore {
             "unchecked calibrated SSE prediction requires an active byte"
         );
         let mapped: SseMappedBit = self.map_bit(self.active_context, self.prefix, base_prob_one);
-        self.last_nearest_row = mapped.nearest_row;
-        self.last_nearest_bin = mapped.nearest_bin;
+        self.last_row = mapped.row;
+        self.last_lower_bin = mapped.lower_bin;
+        self.last_weight_hi = mapped.weight_hi;
         self.last_prob_one = mapped.prob_one;
         self.last_valid = true;
         mapped.prob_one
@@ -313,7 +354,7 @@ impl CalibratorCore {
             self.active_bits.is_some(),
             "unchecked calibrated SSE observation requires an active byte"
         );
-        self.train_nearest(bit);
+        self.train(bit);
         self.last_valid = false;
         self.advance_prefix(bit);
         if let Some(active_bits) = self.active_bits.as_mut() {
@@ -420,10 +461,12 @@ impl CalibratorCore {
             ),
             None => 0,
         };
+        let corrected: f64 = apply_logit_correction(base_prob_one, mixed_delta);
         SseMappedBit {
-            prob_one: apply_logit_correction(base_prob_one, mixed_delta),
-            nearest_row: row,
-            nearest_bin: quantized.nearest_bin,
+            prob_one: blend_probabilities(base_prob_one, corrected, self.blend),
+            row,
+            lower_bin: quantized.lower_bin,
+            weight_hi: quantized.weight_hi,
         }
     }
 
@@ -443,21 +486,56 @@ impl CalibratorCore {
         } else {
             (pos % i64::from(INTERP_SCALE)) as i32
         };
-        let nearest_bin: usize = if weight_hi * 2 >= INTERP_SCALE {
-            lower_bin + 1
-        } else {
-            lower_bin
-        };
         SseQuantization {
             lower_bin,
             weight_hi,
-            nearest_bin,
         }
     }
 
-    fn train_nearest(&mut self, bit: bool) {
-        let row_idx: usize = self.last_nearest_row;
-        let bin: usize = self.last_nearest_bin;
+    fn train(&mut self, bit: bool) {
+        if self.blend <= 0.0 {
+            return;
+        }
+        match self.training_mode {
+            CalibrationTrainingMode::Nearest => {
+                let bin: usize = if self.last_weight_hi * 2 >= INTERP_SCALE {
+                    self.last_lower_bin + 1
+                } else {
+                    self.last_lower_bin
+                };
+                self.train_weighted_bin(self.last_row, bin, INTERP_SCALE, COUNT_SCALE, bit);
+            }
+            CalibrationTrainingMode::Interpolated => self.train_interpolated(bit),
+        }
+    }
+
+    fn train_interpolated(&mut self, bit: bool) {
+        let row_idx: usize = self.last_row;
+        let lower_bin: usize = self.last_lower_bin;
+        let weight_hi: i32 = self.last_weight_hi;
+        let weight_lo: i32 = INTERP_SCALE - weight_hi;
+        let count_lo_units: u16 =
+            ((weight_lo * i32::from(COUNT_SCALE) + INTERP_SCALE / 2) / INTERP_SCALE) as u16;
+        let count_hi_units: u16 = COUNT_SCALE - count_lo_units;
+
+        if weight_lo > 0 {
+            self.train_weighted_bin(row_idx, lower_bin, weight_lo, count_lo_units, bit);
+        }
+        if weight_hi > 0 {
+            self.train_weighted_bin(row_idx, lower_bin + 1, weight_hi, count_hi_units, bit);
+        }
+    }
+
+    fn train_weighted_bin(
+        &mut self,
+        row_idx: usize,
+        bin: usize,
+        weight: i32,
+        count_increment_units: u16,
+        bit: bool,
+    ) {
+        debug_assert!((1..=INTERP_SCALE).contains(&weight));
+        debug_assert!(count_increment_units <= COUNT_SCALE);
         let bins: usize = self.bins;
         let initial_entry: u32 = self.initial_entry;
         let table: &mut SseTableRows = Arc::make_mut(&mut self.table);
@@ -479,19 +557,24 @@ impl CalibratorCore {
         let entries: &mut [u32] = Arc::make_mut(row);
         let entry: u32 = entries[bin];
         let delta: i32 = unpack_delta(entry);
-        let count: u16 = unpack_count(entry);
+        let count_units: u16 = unpack_count_units(entry);
         let target: f64 = if bit { 1.0 } else { 0.0 };
         let prob: f64 = sanitize_unit_probability(self.last_prob_one);
         let error: f64 = target - prob;
         let variance: f64 = (prob * (1.0 - prob)).max(MIN_TRAIN_VARIANCE);
-        let denom: usize = usize::from(count) + 2;
+        let denom: usize = usize::from(count_units) + 2 * usize::from(COUNT_SCALE);
         let inv_denom: f64 = count_reciprocal_table()[denom];
-        let step: i32 = (CORRECTION_UNITS_PER_NAT * error * inv_denom / variance)
-            .round()
-            .clamp(-MAX_CORRECTION_STEP, MAX_CORRECTION_STEP) as i32;
+        let interpolation_gain: f64 = f64::from(weight) / f64::from(INTERP_SCALE);
+        let step: i32 =
+            (CORRECTION_UNITS_PER_NAT * error * inv_denom * interpolation_gain * self.blend
+                / variance)
+                .round()
+                .clamp(-MAX_CORRECTION_STEP, MAX_CORRECTION_STEP) as i32;
         let updated: i32 = (delta + step).clamp(-CORRECTION_CLIP, CORRECTION_CLIP);
-        let next_count: u16 = count.saturating_add(1).min(COUNT_MASK as u16);
-        entries[bin] = pack_entry(updated, next_count);
+        let next_count_units: u16 = count_units
+            .saturating_add(count_increment_units)
+            .min(COUNT_MAX_UNITS);
+        entries[bin] = pack_entry(updated, next_count_units);
     }
 
     fn advance_prefix(&mut self, bit: bool) {
@@ -515,7 +598,7 @@ fn sanitize_learning_rate(learning_rate: f64) -> f64 {
 
 fn initial_count_from_learning_rate(learning_rate: f64) -> u16 {
     let count: f64 = (1.0 / learning_rate) - 1.5;
-    count.round().clamp(0.0, COUNT_MASK as f64) as u16
+    count.round().clamp(0.0, f64::from(COUNT_EFFECTIVE_MAX)) as u16
 }
 
 fn stretch_range_from_clip(bias_clip: f64) -> (i32, i32) {
@@ -535,17 +618,17 @@ fn stretch_range_from_clip(bias_clip: f64) -> (i32, i32) {
     }
 }
 
-fn pack_entry(delta: i32, count: u16) -> u32 {
+fn pack_entry(delta: i32, count_units: u16) -> u32 {
     let encoded_delta: u32 =
         (delta.clamp(-CORRECTION_CLIP, CORRECTION_CLIP) as u32) & CORRECTION_MASK;
-    (encoded_delta << COUNT_BITS) | (u32::from(count) & COUNT_MASK)
+    (encoded_delta << COUNT_BITS) | (u32::from(count_units) & COUNT_MASK)
 }
 
 fn initial_sse_row(bins: usize, initial_entry: u32) -> Arc<[u32]> {
     Arc::from(vec![initial_entry; bins].into_boxed_slice())
 }
 
-fn unpack_count(entry: u32) -> u16 {
+fn unpack_count_units(entry: u32) -> u16 {
     (entry & COUNT_MASK) as u16
 }
 
@@ -588,6 +671,12 @@ fn apply_logit_correction(base_prob_one: f64, delta: i32) -> f64 {
     } else {
         f64::MIN_POSITIVE
     }
+}
+
+fn blend_probabilities(base_prob_one: f64, corrected_prob_one: f64, blend: f64) -> f64 {
+    let base: f64 = sanitize_unit_probability(base_prob_one);
+    let corrected: f64 = sanitize_unit_probability(corrected_prob_one);
+    ((1.0 - blend) * base + blend * corrected).clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON)
 }
 
 fn stretch_probability(prob: f64) -> i32 {
@@ -634,7 +723,7 @@ fn count_reciprocal_table() -> &'static [f64; COUNT_RECIP_LEN] {
     TABLE.get_or_init(|| {
         let mut table: [f64; COUNT_RECIP_LEN] = [0.0; COUNT_RECIP_LEN];
         for (idx, slot) in table.iter_mut().enumerate().skip(1) {
-            *slot = 1.0 / (idx as f64);
+            *slot = f64::from(COUNT_SCALE) / (idx as f64);
         }
         table
     })
@@ -644,6 +733,7 @@ fn context_cardinality(kind: CalibrationContextKind) -> usize {
     match kind {
         CalibrationContextKind::Global => 1,
         CalibrationContextKind::ByteClass => 8,
+        CalibrationContextKind::Order1 => 256,
         CalibrationContextKind::Text => 256,
         CalibrationContextKind::Repeat => 64,
         CalibrationContextKind::TextRepeat => 512,
@@ -654,6 +744,13 @@ fn context_index(kind: CalibrationContextKind, state: NeuralContextState) -> usi
     match kind {
         CalibrationContextKind::Global => 0,
         CalibrationContextKind::ByteClass => state.prev1_class as usize,
+        CalibrationContextKind::Order1 => {
+            if state.has_history {
+                state.prev1 as usize
+            } else {
+                0
+            }
+        }
         CalibrationContextKind::Text => hash_state(
             &[
                 state.prev1_class,
@@ -704,7 +801,7 @@ fn hash_state(values: &[u8], modulo: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::CalibratorCore;
-    use crate::api::CalibrationContextKind;
+    use crate::api::{CalibrationContextKind, CalibrationTrainingMode};
     use crate::mixture::DEFAULT_MIN_PROB;
     use std::sync::Arc;
 
@@ -755,6 +852,126 @@ mod tests {
         assert_eq!(
             materialized_rows, 1,
             "first trained bit should materialize exactly one SSE row"
+        );
+    }
+
+    #[test]
+    fn interpolated_training_updates_both_neighbor_bins() {
+        let mut core = CalibratorCore::new_configured(
+            CalibrationContextKind::Global,
+            4,
+            1.0,
+            16.0,
+            1.0,
+            CalibrationTrainingMode::Interpolated,
+        );
+
+        core.begin_byte().expect("begin prefix");
+        let quantized = core.quantize(0.5);
+        assert!(
+            quantized.weight_hi > 0 && quantized.weight_hi < super::INTERP_SCALE,
+            "probe probability should land between adjacent SSE bins"
+        );
+
+        core.predict_bit(0, 0.5).expect("predict bit");
+        core.observe_bit(0, true).expect("observe bit");
+
+        let row = core.table[0].as_ref().expect("trained row");
+        assert!(
+            super::unpack_count_units(row[quantized.lower_bin]) > 0,
+            "lower interpolated bin should be trained"
+        );
+        assert!(
+            super::unpack_count_units(row[quantized.lower_bin + 1]) > 0,
+            "upper interpolated bin should be trained"
+        );
+        let trained_count_units: u16 = super::unpack_count_units(row[quantized.lower_bin])
+            + super::unpack_count_units(row[quantized.lower_bin + 1]);
+        assert_eq!(
+            trained_count_units,
+            super::COUNT_SCALE,
+            "one interpolated observation must contribute exactly one fixed-point count"
+        );
+    }
+
+    #[test]
+    fn historical_nearest_training_updates_only_the_nearest_bin() {
+        let mut core = CalibratorCore::new(CalibrationContextKind::Global, 4, 1.0, 16.0);
+        let quantized = core.quantize(0.5);
+        assert!(
+            quantized.weight_hi > 0 && quantized.weight_hi < super::INTERP_SCALE,
+            "probe probability should land between adjacent SSE bins"
+        );
+
+        core.begin_byte().expect("begin prefix");
+        core.predict_bit(0, 0.5).expect("predict bit");
+        core.observe_bit(0, true).expect("observe bit");
+
+        let row = core.table[0].as_ref().expect("trained row");
+        let nearest: usize = if quantized.weight_hi * 2 >= super::INTERP_SCALE {
+            quantized.lower_bin + 1
+        } else {
+            quantized.lower_bin
+        };
+        let other: usize = if nearest == quantized.lower_bin {
+            quantized.lower_bin + 1
+        } else {
+            quantized.lower_bin
+        };
+        assert_eq!(super::unpack_count_units(row[nearest]), super::COUNT_SCALE);
+        assert_eq!(super::unpack_count_units(row[other]), 0);
+    }
+
+    #[test]
+    fn order1_context_uses_previous_byte_directly() {
+        let mut core = CalibratorCore::new(CalibrationContextKind::Order1, 32, 1.0 / 32.0, 16.0);
+
+        core.update_context_only(b'A');
+        core.begin_byte().expect("begin prefix");
+        core.predict_bit(0, 0.5).expect("predict bit");
+        core.observe_bit(0, true).expect("observe bit");
+
+        let row_a = core.row_index(b'A' as usize, 1);
+        let row_b = core.row_index(b'B' as usize, 1);
+        assert!(
+            core.table[row_a].is_some(),
+            "previous byte A should select its own SSE row"
+        );
+        assert!(
+            core.table[row_b].is_none(),
+            "unseen previous byte B should not share A's direct order-1 row"
+        );
+    }
+
+    #[test]
+    fn blend_controls_stage_output_weight() {
+        let mut core = CalibratorCore::new(CalibrationContextKind::Global, 32, 1.0, 16.0);
+        let base = [1.0 / 256.0; 256];
+        core.observe_symbol_from_base_pdf(0xff, &base)
+            .expect("train positive first bit");
+
+        core.blend = 1.0;
+        core.begin_byte().expect("begin full blend probe");
+        let full = core.predict_bit(0, 0.5).expect("full blend prediction");
+        core.abort_empty_byte().expect("abort full blend probe");
+        assert!(
+            full > 0.5,
+            "trained positive correction should raise the full calibrated probability"
+        );
+
+        core.blend = 0.0;
+        core.begin_byte().expect("begin zero blend probe");
+        let input = core.predict_bit(0, 0.5).expect("zero blend prediction");
+        core.abort_empty_byte().expect("abort zero blend probe");
+        assert_eq!(input, 0.5);
+
+        core.blend = 0.5;
+        core.begin_byte().expect("begin half blend probe");
+        let half = core.predict_bit(0, 0.5).expect("half blend prediction");
+        core.abort_empty_byte().expect("abort half blend probe");
+        assert!(
+            0.5 < half && half < full,
+            "partial blend should interpolate stage input and calibrated output"
         );
     }
 

@@ -7,8 +7,9 @@
 #[cfg(feature = "backend-bit-reservoir")]
 use crate::api::BitReservoirConfig;
 use crate::api::{
-    CalibratedSpec, CalibrationContextKind, CompressionBackend, MAX_MIXTURE_NESTING,
-    MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec, ParticleSpec, RateBackend,
+    CalibratedSpec, CalibrationContextKind, CalibrationTrainingMode, CompressionBackend,
+    MAX_MIXTURE_NESTING, MixtureExpertSpec, MixtureKind, MixtureScheduleMode, MixtureSpec,
+    ParticleSpec, RateBackend,
 };
 use crate::coders::CoderType;
 use crate::compression::FramingMode;
@@ -190,6 +191,13 @@ pub(crate) enum RateBackendPlan {
         base_mix: f64,
         confidence_scale: f64,
     },
+    OrderNGram {
+        order: usize,
+        hash_bits: usize,
+    },
+    WordContext {
+        hash_bits: usize,
+    },
     Ppmd {
         order: usize,
         memory_mb: usize,
@@ -237,9 +245,11 @@ pub(crate) enum RateBackendPlan {
     },
     Calibrated {
         context: CalibrationContextKind,
+        training_mode: CalibrationTrainingMode,
         bins: usize,
         learning_rate: f64,
         bias_clip: f64,
+        blend: f64,
         base: Arc<RateBackendPlan>,
     },
 }
@@ -250,6 +260,8 @@ impl RateBackendPlan {
             RateBackendPlan::RosaPlus { .. } => crate::runtime::RateBackendKind::RosaPlus,
             RateBackendPlan::Match { .. } => crate::runtime::RateBackendKind::Match,
             RateBackendPlan::SparseMatch { .. } => crate::runtime::RateBackendKind::SparseMatch,
+            RateBackendPlan::OrderNGram { .. } => crate::runtime::RateBackendKind::OrderNGram,
+            RateBackendPlan::WordContext { .. } => crate::runtime::RateBackendKind::WordContext,
             RateBackendPlan::Ppmd { .. } => crate::runtime::RateBackendKind::Ppmd,
             RateBackendPlan::Sequitur { .. } => crate::runtime::RateBackendKind::Sequitur,
             RateBackendPlan::Ctw { .. } => crate::runtime::RateBackendKind::Ctw,
@@ -814,6 +826,7 @@ fn mixture_kind_tag(kind: MixtureKind) -> u8 {
         MixtureKind::Convex => 3,
         MixtureKind::Mdl => 4,
         MixtureKind::Neural => 5,
+        MixtureKind::Logistic => 6,
     }
 }
 
@@ -831,6 +844,14 @@ fn calibration_context_tag(context: CalibrationContextKind) -> u8 {
         CalibrationContextKind::Text => 2,
         CalibrationContextKind::Repeat => 3,
         CalibrationContextKind::TextRepeat => 4,
+        CalibrationContextKind::Order1 => 5,
+    }
+}
+
+fn calibration_training_mode_tag(training_mode: CalibrationTrainingMode) -> u8 {
+    match training_mode {
+        CalibrationTrainingMode::Nearest => 0,
+        CalibrationTrainingMode::Interpolated => 1,
     }
 }
 

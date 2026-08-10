@@ -1,6 +1,7 @@
 #[cfg(any(
     feature = "backend-rosa",
     feature = "backend-match",
+    feature = "backend-context",
     feature = "backend-ppmd",
     feature = "backend-sequitur",
     feature = "backend-ctw",
@@ -99,6 +100,36 @@ feature_gated_rate_predictor_builder! {
                 *base_mix,
                 *confidence_scale,
             ),
+            min_prob,
+        })
+    }
+}
+
+feature_gated_rate_predictor_builder! {
+    feature: "backend-context",
+    fn build_predictor_order_ngram(backend, min_prob) {
+        expect_plan_ref!(
+            backend.plan(),
+            crate::spec::core::RateBackendPlan::OrderNGram { order, hash_bits },
+            "order-ngram kernel used with non-order-ngram plan"
+        );
+        Ok(crate::mixture::RateBackendPredictor::OrderNGram {
+            model: OrderNGramModel::new(*order, *hash_bits)?,
+            min_prob,
+        })
+    }
+}
+
+feature_gated_rate_predictor_builder! {
+    feature: "backend-context",
+    fn build_predictor_word_context(backend, min_prob) {
+        expect_plan_ref!(
+            backend.plan(),
+            crate::spec::core::RateBackendPlan::WordContext { hash_bits },
+            "word-context kernel used with non-word-context plan"
+        );
+        Ok(crate::mixture::RateBackendPredictor::WordContext {
+            model: WordContextModel::new(*hash_bits)?,
             min_prob,
         })
     }
@@ -357,9 +388,11 @@ feature_gated_rate_predictor_builder! {
             backend.plan(),
             crate::spec::core::RateBackendPlan::Calibrated {
                 context,
+                training_mode,
                 bins,
                 learning_rate,
                 bias_clip,
+                blend,
                 base,
             },
             "calibrated kernel used with non-calibrated plan"
@@ -370,7 +403,14 @@ feature_gated_rate_predictor_builder! {
                 &base_backend,
                 min_prob,
             )?),
-            core: CalibratorCore::new(*context, *bins, *learning_rate, *bias_clip),
+            core: CalibratorCore::new_configured(
+                *context,
+                *bins,
+                *learning_rate,
+                *bias_clip,
+                *blend,
+                *training_mode,
+            ),
             bitwise: crate::mixture::BytePrefixStepState::new(),
             pdf: [1.0 / 256.0; 256],
             valid: false,
@@ -386,9 +426,11 @@ feature_gated_rate_predictor_builder! {
             backend.plan(),
             crate::spec::core::RateBackendPlan::Calibrated {
                 context,
+                training_mode,
                 bins,
                 learning_rate,
                 bias_clip,
+                blend,
                 base,
             },
             "calibrated binary-token kernel used with non-calibrated plan"
@@ -399,7 +441,14 @@ feature_gated_rate_predictor_builder! {
                 &base_backend,
                 min_prob,
             )?),
-            core: CalibratorCore::new(*context, *bins, *learning_rate, *bias_clip),
+            core: CalibratorCore::new_configured(
+                *context,
+                *bins,
+                *learning_rate,
+                *bias_clip,
+                *blend,
+                *training_mode,
+            ),
             bitwise: crate::mixture::BytePrefixStepState::new(),
             pdf: [1.0 / 256.0; 256],
             valid: false,

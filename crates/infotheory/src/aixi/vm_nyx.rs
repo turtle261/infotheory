@@ -2991,6 +2991,8 @@ mod tests {
                     bins: 33,
                     learning_rate: 0.02,
                     bias_clip: 4.0,
+                    blend: 1.0,
+                    training_mode: crate::api::CalibrationTrainingMode::Nearest,
                 }),
             },
             RateBackend::Particle {

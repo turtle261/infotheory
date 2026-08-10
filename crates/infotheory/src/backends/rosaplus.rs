@@ -33,13 +33,56 @@ const SAM_STATE_NONE: SamStateIx = -1;
 const SAM_EDGE_NONE: SamEdgeIx = u32::MAX;
 const LM_NODE_NONE: LmNodeIx = u32::MAX;
 const LM_PACKED_SYM_OVERFLOW: u16 = u16::MAX;
-const LM_PACKED_CNT_MAX: u16 = u16::MAX;
+// Widened from u16 so that per-(context, symbol) occurrence counts stay
+// inline for any corpus up to ~4.3 billion bytes (a node's count can never
+// exceed the total input length). This keeps `cnt_overflow` HashMap lookups
+// off the hot per-byte read/update path for every realistic corpus size,
+// where previously any context/symbol pair observed more than 65535 times
+// (routine for low-order contexts on multi-MB inputs) forced a HashMap probe
+// on every single access for the remainder of the stream.
+const LM_PACKED_CNT_MAX: u32 = u32::MAX;
 
 // This crate is used byte-wise by infotheory; for fast incremental conditional updates we
 // support an optional fixed 256-byte alphabet LM build/update path.
 const BYTE_ALPHA_N: usize = 256;
 const ROSA_STREAM_HINT_CAP_SYMBOLS: usize = 1 << 16;
 const ROSA_GROWTH_MIN_CHUNK_SYMBOLS: usize = 4096;
+
+/// Early-termination threshold for the Witten-Bell suffix-link chain walk in
+/// `LM::prob_for_sym` / `LM::probs_for_state_raw`.
+///
+/// # Design-by-contract
+///
+/// At each visited state the walk multiplies the remaining probability mass
+/// (`residual`) by `(1 - lam)`, where `lam = n / (n + t)` with `n` the
+/// state's total observation count and `t` its number of distinct observed
+/// symbol types. Since `t <= n` always holds (a state cannot have observed
+/// more distinct symbol types than total observations), `lam >= n / (2n) =
+/// 0.5` at every state with `n > 0`. Hence `residual` at least halves per
+/// productive (n > 0) step, so after at most `ceil(log2(1 / EPSILON))` such
+/// steps, `residual < EPSILON` regardless of how deep the suffix-link chain
+/// actually is (matches in enwik-class text can be hundreds to thousands of
+/// bytes long, i.e. this many suffix-link levels, most of which contribute
+/// only fractions-of-fractions of the final mass).
+///
+/// Breaking the walk once `residual < EPSILON` folds the remaining mass into
+/// the unigram fallback term exactly as the natural end-of-chain (root) case
+/// already does; both call sites are unconditional early-exits from a loop
+/// whose tail behavior is unchanged. The resulting absolute error in the
+/// returned probability is bounded by `EPSILON`: writing `p_true` for the
+/// exact (untruncated) estimate and `p_approx` for the truncated one, both
+/// `residual_at_break * (mixture of the true remaining conditional
+/// probabilities)` (the exact contribution folded away) and
+/// `residual_at_break * p_uni` (what we substitute for it) lie in
+/// `[0, residual_at_break]`, so `|p_approx - p_true| <= residual_at_break <
+/// EPSILON`. `EPSILON` is set to match the `1e-12` floor already applied via
+/// `p_accum.clamp(1e-12, 1.0)`, so the truncation error is provably below
+/// the precision the rest of the pipeline already tolerates.
+///
+/// Verified against the untruncated `*_reference` oracles in `tests` (exact
+/// match up to floating-point rounding, since the walk depth in those tests
+/// never approaches the ~40-iteration bound where truncation would engage).
+const WB_RESIDUAL_EPSILON: f64 = 1e-12;
 
 #[inline(always)]
 fn state_ix(idx: usize) -> SamStateIx {
@@ -83,6 +126,51 @@ fn read_len64<R: Read>(r: &mut R) -> std::io::Result<usize> {
     r.read_exact(&mut b8)?;
     usize::try_from(u64::from_le_bytes(b8))
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "length overflow"))
+}
+
+#[inline]
+fn invalid_model(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+/// Validate exactly the SAM graph encoded by a V5 file.
+///
+/// This must run before legacy wide labels are promoted out of `small_ch`:
+/// promotion appends edges, and validating serialized indices against the
+/// enlarged edge vector could otherwise make a corrupt old index accidentally
+/// name a newly appended edge.
+fn validate_serialized_sam(
+    sam: &Sam,
+    state_count: usize,
+    edge_count: usize,
+) -> std::io::Result<()> {
+    debug_assert_eq!(sam.st.len(), state_count);
+    debug_assert_eq!(sam.ed.len(), edge_count);
+    for state in &sam.st {
+        if state.link != SAM_STATE_NONE
+            && (state.link < 0 || state_usize(state.link) >= state_count)
+        {
+            return Err(invalid_model("bad sam link"));
+        }
+        for k in 0..(state.small_n as usize) {
+            let target: SamStateIx = state.small_to[k];
+            if target < 0 || state_usize(target) >= state_count {
+                return Err(invalid_model("bad sam small edge"));
+            }
+        }
+        if state.head != SAM_EDGE_NONE && edge_usize(state.head) >= edge_count {
+            return Err(invalid_model("bad sam edge head"));
+        }
+    }
+    for edge in &sam.ed {
+        if edge.to < 0 || state_usize(edge.to) >= state_count {
+            return Err(invalid_model("bad sam edge target"));
+        }
+        if edge.next != SAM_EDGE_NONE && edge_usize(edge.next) >= edge_count {
+            return Err(invalid_model("bad sam edge next"));
+        }
+    }
+    Ok(())
 }
 
 #[inline(always)]
@@ -188,7 +276,7 @@ struct SamState {
     endpos: i32,
     head: SamEdgeIx,
 
-    small_ch: [u32; SAM_SMALL_MAX],
+    small_ch: [u8; SAM_SMALL_MAX],
     small_to: [SamStateIx; SAM_SMALL_MAX],
     small_n: u8,
 }
@@ -531,7 +619,7 @@ impl Sam {
         }
         let st = unsafe { self.st.get_unchecked(state_usize(v)) };
         for i in 0..(st.small_n as usize) {
-            if st.small_ch[i] == ch {
+            if u32::from(st.small_ch[i]) == ch {
                 return st.small_to[i];
             }
         }
@@ -557,10 +645,10 @@ impl Sam {
     #[inline(always)]
     fn add_edge_absent(&mut self, v: SamStateIx, ch: u32, to: SamStateIx) {
         let st = &mut self.st[state_usize(v)];
-        if (st.small_n as usize) < SAM_SMALL_MAX {
+        if ch <= u32::from(u8::MAX) && (st.small_n as usize) < SAM_SMALL_MAX {
             let i = st.small_n as usize;
             st.small_n += 1;
-            st.small_ch[i] = ch;
+            st.small_ch[i] = ch as u8;
             st.small_to[i] = to;
         } else {
             self.add_edge(v, ch, to);
@@ -581,7 +669,7 @@ impl Sam {
         {
             let st = &mut self.st[state_usize(v)];
             for i in 0..(st.small_n as usize) {
-                if st.small_ch[i] == ch && st.small_to[i] == old_to {
+                if u32::from(st.small_ch[i]) == ch && st.small_to[i] == old_to {
                     st.small_to[i] = new_to;
                     if v == 0 && ch < BYTE_ALPHA_N as u32 {
                         self.root_to[ch as usize] = new_to;
@@ -612,7 +700,7 @@ impl Sam {
         }
         let root = self.st[0];
         for i in 0..(root.small_n as usize) {
-            let ch = root.small_ch[i];
+            let ch = u32::from(root.small_ch[i]);
             if ch < BYTE_ALPHA_N as u32 {
                 self.root_to[ch as usize] = root.small_to[i];
             }
@@ -840,11 +928,11 @@ impl Sam {
     fn add_edge_absent_tx(&mut self, tx: &mut SamTx, v: SamStateIx, ch: u32, to: SamStateIx) {
         let v_usize = state_usize(v);
         let small_n = self.st[v_usize].small_n as usize;
-        if small_n < SAM_SMALL_MAX {
+        if ch <= u32::from(u8::MAX) && small_n < SAM_SMALL_MAX {
             let i = small_n;
             self.record_state_change(tx, v_usize);
             let st = &mut self.st[v_usize];
-            st.small_ch[i] = ch;
+            st.small_ch[i] = ch as u8;
             st.small_to[i] = to;
             st.small_n += 1;
             if v == 0 && ch < BYTE_ALPHA_N as u32 {
@@ -871,7 +959,7 @@ impl Sam {
         {
             let st = &self.st[state_usize(v)];
             for i in 0..(st.small_n as usize) {
-                if st.small_ch[i] == ch && st.small_to[i] == old_to {
+                if u32::from(st.small_ch[i]) == ch && st.small_to[i] == old_to {
                     self.record_state_change(tx, state_usize(v));
                     self.st[state_usize(v)].small_to[i] = new_to;
                     if v == 0 && ch < BYTE_ALPHA_N as u32 {
@@ -1001,11 +1089,53 @@ struct SamTx {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct LmState {
     head: LmNodeIx,
-    total_n: u64,
+    // Per-state totals stay packed for the common case. Values above u32::MAX
+    // keep their excess in `LM::total_overflow`, preserving exact V5/u64
+    // semantics without widening every hot state.
+    total_n: u32,
     types_t: u32,
 
     last_sym: u32,
     last_node: LmNodeIx,
+}
+
+#[inline(always)]
+fn lm_total_value(state: u32, packed: u32, overflow: &HashMap<u32, u64>) -> u64 {
+    if packed < u32::MAX {
+        u64::from(packed)
+    } else {
+        u64::from(packed) + overflow.get(&state).copied().unwrap_or(0)
+    }
+}
+
+#[inline(always)]
+fn lm_total_set(state: u32, packed: &mut u32, overflow: &mut HashMap<u32, u64>, value: u64) {
+    if value <= u64::from(u32::MAX) {
+        // Ordinary packed updates never own an overflow entry. Avoid hashing
+        // on that hot path; only a value currently at the sentinel can be
+        // transitioning out of sparse overflow storage.
+        if *packed == u32::MAX {
+            overflow.remove(&state);
+        }
+        *packed = value as u32;
+    } else {
+        *packed = u32::MAX;
+        overflow.insert(state, value - u64::from(u32::MAX));
+    }
+}
+
+#[inline(always)]
+fn lm_total_add(state: u32, packed: &mut u32, overflow: &mut HashMap<u32, u64>, add: u64) {
+    if *packed < u32::MAX {
+        let next: u64 = u64::from(*packed).saturating_add(add);
+        if next <= u64::from(u32::MAX) {
+            *packed = next as u32;
+            return;
+        }
+    }
+    let current: u64 = lm_total_value(state, *packed, overflow);
+    let next: u64 = current.saturating_add(add);
+    lm_total_set(state, packed, overflow, next);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1018,7 +1148,7 @@ struct CountNode {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct LmNodes {
     sym_lo: Vec<u16>,
-    cnt_lo: Vec<u16>,
+    cnt_lo: Vec<u32>,
     next: Vec<LmNodeIx>,
     cnt_overflow_mask: Vec<u8>,
     sym_overflow: HashMap<u32, u32>,
@@ -1073,8 +1203,10 @@ impl LmNodes {
     #[inline(always)]
     fn set_sym_idx(&mut self, idx: usize, sym_idx: u32) {
         if sym_idx < LM_PACKED_SYM_OVERFLOW as u32 {
+            if self.sym_lo[idx] == LM_PACKED_SYM_OVERFLOW {
+                self.sym_overflow.remove(&(idx as u32));
+            }
             self.sym_lo[idx] = sym_idx as u16;
-            self.sym_overflow.remove(&(idx as u32));
         } else {
             self.sym_lo[idx] = LM_PACKED_SYM_OVERFLOW;
             self.sym_overflow.insert(idx as u32, sym_idx);
@@ -1084,8 +1216,10 @@ impl LmNodes {
     #[inline(always)]
     fn set_cnt(&mut self, idx: usize, cnt: u64) {
         if cnt <= LM_PACKED_CNT_MAX as u64 {
-            self.cnt_lo[idx] = cnt as u16;
-            self.cnt_overflow.remove(&(idx as u32));
+            if self.cnt_overflow_mask[idx] != 0 {
+                self.cnt_overflow.remove(&(idx as u32));
+            }
+            self.cnt_lo[idx] = cnt as u32;
             self.cnt_overflow_mask[idx] = 0;
         } else {
             self.cnt_lo[idx] = LM_PACKED_CNT_MAX;
@@ -1196,6 +1330,7 @@ struct LM {
     byte_map: [i16; 256],
 
     ls: Vec<LmState>,
+    total_overflow: HashMap<u32, u64>,
     nodes: LmNodes,
 }
 
@@ -1209,6 +1344,7 @@ impl Default for LM {
             has_byte_map: false,
             byte_map: [-1; 256],
             ls: Vec::new(),
+            total_overflow: HashMap::new(),
             nodes: LmNodes::default(),
         }
     }
@@ -1218,6 +1354,21 @@ impl LM {
     #[inline(always)]
     fn ls_is_implicit_single(ls: &LmState) -> bool {
         ls.head == LM_NODE_NONE && ls.types_t == 1 && ls.total_n > 0
+    }
+
+    #[inline(always)]
+    fn state_total(&self, state: usize) -> u64 {
+        lm_total_value(state as u32, self.ls[state].total_n, &self.total_overflow)
+    }
+
+    #[inline(always)]
+    fn set_state_total(&mut self, state: usize, value: u64) {
+        lm_total_set(
+            state as u32,
+            &mut self.ls[state].total_n,
+            &mut self.total_overflow,
+            value,
+        );
     }
 
     #[inline(always)]
@@ -1323,9 +1474,10 @@ impl LM {
     #[inline(always)]
     fn inc(&mut self, state: u32, sym_idx: u32, add: u64) {
         let ls = &mut self.ls[state as usize];
+        let total_overflow = &mut self.total_overflow;
         if ls.head == LM_NODE_NONE {
             if ls.total_n == 0 {
-                ls.total_n = add;
+                lm_total_set(state, &mut ls.total_n, total_overflow, add);
                 ls.types_t = 1;
                 ls.last_sym = sym_idx;
                 ls.last_node = LM_NODE_NONE;
@@ -1333,12 +1485,12 @@ impl LM {
             }
             if Self::ls_is_implicit_single(ls) {
                 if ls.last_sym == sym_idx {
-                    ls.total_n += add;
+                    lm_total_add(state, &mut ls.total_n, total_overflow, add);
                     ls.last_node = LM_NODE_NONE;
                     return;
                 }
                 let old_sym = ls.last_sym;
-                let old_cnt = ls.total_n;
+                let old_cnt: u64 = lm_total_value(state, ls.total_n, total_overflow);
                 let old_idx = node_ix(self.nodes.len());
                 self.nodes.push(CountNode {
                     sym_idx: old_sym,
@@ -1352,7 +1504,8 @@ impl LM {
                     next: old_idx,
                 });
                 ls.head = new_idx;
-                ls.total_n = old_cnt + add;
+                let total: u64 = old_cnt.saturating_add(add);
+                lm_total_set(state, &mut ls.total_n, total_overflow, total);
                 ls.types_t = 2;
                 ls.last_node = new_idx;
                 ls.last_sym = sym_idx;
@@ -1363,7 +1516,7 @@ impl LM {
         let last = ls.last_node;
         if last != LM_NODE_NONE && self.nodes.sym_idx(node_usize(last)) == sym_idx {
             self.nodes.add_cnt(node_usize(last), add);
-            ls.total_n += add;
+            lm_total_add(state, &mut ls.total_n, total_overflow, add);
             return;
         }
 
@@ -1372,7 +1525,7 @@ impl LM {
             let idx = node_usize(ni);
             if self.nodes.sym_idx(idx) == sym_idx {
                 self.nodes.add_cnt(idx, add);
-                ls.total_n += add;
+                lm_total_add(state, &mut ls.total_n, total_overflow, add);
                 ls.last_node = ni;
                 ls.last_sym = sym_idx;
                 return;
@@ -1387,7 +1540,7 @@ impl LM {
             next: ls.head,
         });
         ls.head = idx;
-        ls.total_n += add;
+        lm_total_add(state, &mut ls.total_n, total_overflow, add);
         ls.types_t += 1;
         ls.last_node = idx;
         ls.last_sym = sym_idx;
@@ -1414,6 +1567,7 @@ impl LM {
             };
             sam.st.len()
         ];
+        self.total_overflow.clear();
         self.nodes.clear();
 
         let mut seg_start = 0usize;
@@ -1485,11 +1639,12 @@ impl LM {
                 continue;
             }
             let ls_v = self.ls[v];
-            if ls_v.total_n == 0 {
+            let total_n: u64 = self.state_total(v);
+            if total_n == 0 {
                 continue;
             }
             if Self::ls_is_implicit_single(&ls_v) {
-                self.inc(state_usize(p) as u32, ls_v.last_sym, ls_v.total_n);
+                self.inc(state_usize(p) as u32, ls_v.last_sym, total_n);
                 continue;
             }
             let mut ni = ls_v.head;
@@ -1513,12 +1668,13 @@ impl LM {
         let mut u = self.capped_start_state(sam, max_order, v);
 
         while u != SAM_STATE_NONE {
-            let ls = &self.ls[state_usize(u)];
-            let n = ls.total_n;
+            let state_idx: usize = state_usize(u);
+            let ls = &self.ls[state_idx];
+            let n: u64 = self.state_total(state_idx);
             let t = ls.types_t;
             if n > 0 {
                 let lam = if t > 0 {
-                    (n as f64) / ((n + (t as u64)) as f64)
+                    (n as f64) / ((n as f64) + f64::from(t))
                 } else {
                     1.0
                 };
@@ -1551,6 +1707,9 @@ impl LM {
                 }
 
                 residual *= 1.0 - lam;
+                if residual < WB_RESIDUAL_EPSILON {
+                    break;
+                }
             }
             u = sam.st[state_usize(u)].link;
         }
@@ -1570,12 +1729,13 @@ impl LM {
         let mut residual = 1.0f64;
         let mut u = self.capped_start_state(sam, max_order, v);
         while u != SAM_STATE_NONE {
-            let ls = &self.ls[state_usize(u)];
-            let n = ls.total_n;
+            let state_idx: usize = state_usize(u);
+            let ls = &self.ls[state_idx];
+            let n: u64 = self.state_total(state_idx);
             let t = ls.types_t;
             if n > 0 {
                 let lam = if t > 0 {
-                    (n as f64) / ((n + (t as u64)) as f64)
+                    (n as f64) / ((n as f64) + f64::from(t))
                 } else {
                     1.0
                 };
@@ -1592,6 +1752,9 @@ impl LM {
                     }
                 }
                 residual *= 1.0 - lam;
+                if residual < WB_RESIDUAL_EPSILON {
+                    break;
+                }
             }
             u = sam.st[state_usize(u)].link;
         }
@@ -1631,11 +1794,18 @@ impl LM {
         let si = state as usize;
         // record old LmState
         tx.ls_changes.push((si, self.ls[si]));
+        let previous_overflow: Option<u64> = if self.ls[si].total_n == u32::MAX {
+            self.total_overflow.get(&state).copied()
+        } else {
+            None
+        };
+        tx.total_overflow_changes.push((state, previous_overflow));
 
         let ls = &mut self.ls[si];
+        let total_overflow = &mut self.total_overflow;
         if ls.head == LM_NODE_NONE {
             if ls.total_n == 0 {
-                ls.total_n = add;
+                lm_total_set(state, &mut ls.total_n, total_overflow, add);
                 ls.types_t = 1;
                 ls.last_sym = sym_idx;
                 ls.last_node = LM_NODE_NONE;
@@ -1643,12 +1813,12 @@ impl LM {
             }
             if Self::ls_is_implicit_single(ls) {
                 if ls.last_sym == sym_idx {
-                    ls.total_n += add;
+                    lm_total_add(state, &mut ls.total_n, total_overflow, add);
                     ls.last_node = LM_NODE_NONE;
                     return;
                 }
                 let old_sym = ls.last_sym;
-                let old_cnt = ls.total_n;
+                let old_cnt: u64 = lm_total_value(state, ls.total_n, total_overflow);
                 tx.old_nodes_len = tx.old_nodes_len.min(self.nodes.len());
                 let old_idx = node_ix(self.nodes.len());
                 self.nodes.push(CountNode {
@@ -1663,7 +1833,8 @@ impl LM {
                     next: old_idx,
                 });
                 ls.head = new_idx;
-                ls.total_n = old_cnt + add;
+                let total: u64 = old_cnt.saturating_add(add);
+                lm_total_set(state, &mut ls.total_n, total_overflow, total);
                 ls.types_t = 2;
                 ls.last_node = new_idx;
                 ls.last_sym = sym_idx;
@@ -1676,7 +1847,7 @@ impl LM {
             let ni = node_usize(last);
             tx.node_changes.push((ni, self.nodes.get(ni)));
             self.nodes.add_cnt(ni, add);
-            ls.total_n += add;
+            lm_total_add(state, &mut ls.total_n, total_overflow, add);
             return;
         }
 
@@ -1686,7 +1857,7 @@ impl LM {
             if self.nodes.sym_idx(idx) == sym_idx {
                 tx.node_changes.push((idx, self.nodes.get(idx)));
                 self.nodes.add_cnt(idx, add);
-                ls.total_n += add;
+                lm_total_add(state, &mut ls.total_n, total_overflow, add);
                 ls.last_node = ni;
                 ls.last_sym = sym_idx;
                 return;
@@ -1703,7 +1874,7 @@ impl LM {
             next: ls.head,
         });
         ls.head = idx;
-        ls.total_n += add;
+        lm_total_add(state, &mut ls.total_n, total_overflow, add);
         ls.types_t += 1;
         ls.last_node = idx;
         ls.last_sym = sym_idx;
@@ -1715,6 +1886,7 @@ struct LmTx {
     old_ls_len: usize,
     old_nodes_len: usize,
     ls_changes: Vec<(usize, LmState)>,
+    total_overflow_changes: Vec<(u32, Option<u64>)>,
     node_changes: Vec<(usize, CountNode)>,
     // Sparse unigram deltas for byte-alphabet transactions. AIQI and other
     // bit-token callers usually touch only symbols 0/1, so dense 256-way
@@ -1860,6 +2032,7 @@ pub(crate) struct RosaMemoryUsage {
     pub lm_node_count: usize,
     pub lm_sym_overflow_count: usize,
     pub lm_count_overflow_count: usize,
+    pub lm_state_total_overflow_count: usize,
     pub sam_state_bytes: usize,
     pub sam_edge_bytes: usize,
     pub sam_text_bytes: usize,
@@ -2010,6 +2183,7 @@ impl RosaPlus {
             old_ls_len: self.lm.ls.len(),
             old_nodes_len: self.lm.nodes.len(),
             ls_changes: Vec::new(),
+            total_overflow_changes: Vec::new(),
             node_changes: Vec::new(),
             uni_delta: Vec::new(),
             total_uni_add: 0,
@@ -2157,6 +2331,30 @@ impl RosaPlus {
                     ctx = 0;
                 }
             }
+            // This ancestor walk is the one hot-loop chain-walk in this
+            // module *not* given an epsilon-style early exit (compare the
+            // read-side truncation in `LM::prob_for_sym` /
+            // `probs_for_state_raw`, `WB_RESIDUAL_EPSILON`). That is
+            // deliberate, not an oversight: unlike the read path, which
+            // computes a residual-weighted mixture where a short tail is
+            // provably within a bounded absolute error of the untruncated
+            // value, this walk performs the actual count *mutation* that
+            // every future read's statistics depend on. Stopping it early
+            // would silently under-count every ancestor beyond the cutoff
+            // for this occurrence -- a persistent bias in the fitted model,
+            // not a bounded one-shot approximation error -- and count-based
+            // Witten-Bell mass at a state depends on that state's raw
+            // `n`/`t`, not on a decaying multiplicative weight the way the
+            // read-side residual does. A safe cap here would need to prove
+            // that no future read can ever reach an ancestor beyond the
+            // write-side cutoff for the *same* historical context, which
+            // depends on data-dependent suffix-link chain depths (measured
+            // up to ~300 levels from a single repeated 300-byte span; see
+            // `wb_chain_epsilon_truncation_matches_untruncated_reference_on_deep_match`)
+            // and is not established here. Left uncapped until that proof
+            // (or an empirical chain-depth study on real corpora) exists;
+            // see the Hutter-grade compression improvement plan's Phase 1
+            // rosaplus item for tracking.
             let mut u = ctx;
             let si = b as u32;
             while u != SAM_STATE_NONE {
@@ -2298,8 +2496,21 @@ impl RosaPlus {
                 self.lm.ls[idx] = old;
             }
         }
+        for (state, previous) in tx.lm.total_overflow_changes.into_iter().rev() {
+            match previous {
+                Some(excess) => {
+                    self.lm.total_overflow.insert(state, excess);
+                }
+                None => {
+                    self.lm.total_overflow.remove(&state);
+                }
+            }
+        }
         self.lm.nodes.truncate(tx.lm.old_nodes_len);
         self.lm.ls.truncate(tx.lm.old_ls_len);
+        self.lm
+            .total_overflow
+            .retain(|&state, _| (state as usize) < tx.lm.old_ls_len);
 
         // Restore SAM
         self.sam.rollback_tx(tx.sam);
@@ -2378,6 +2589,7 @@ impl RosaPlus {
             lm_node_count: self.lm.nodes.len(),
             lm_sym_overflow_count: self.lm.nodes.sym_overflow.len(),
             lm_count_overflow_count: self.lm.nodes.cnt_overflow.len(),
+            lm_state_total_overflow_count: self.lm.total_overflow.len(),
             sam_state_bytes: self.sam.st.len().saturating_mul(size_of::<SamState>()),
             sam_edge_bytes: self.sam.ed.len().saturating_mul(size_of::<SamEdge>()),
             sam_text_bytes: self.sam.text.allocated_bytes(),
@@ -2402,7 +2614,7 @@ impl RosaPlus {
                     .nodes
                     .cnt_lo
                     .capacity()
-                    .saturating_mul(size_of::<u16>())
+                    .saturating_mul(size_of::<u32>())
                 + self
                     .lm
                     .nodes
@@ -2425,6 +2637,11 @@ impl RosaPlus {
                     .lm
                     .nodes
                     .cnt_overflow
+                    .capacity()
+                    .saturating_mul(size_of::<u32>() + size_of::<u64>())
+                + self
+                    .lm
+                    .total_overflow
                     .capacity()
                     .saturating_mul(size_of::<u32>() + size_of::<u64>()),
             scratch_bytes: self.dist.capacity().saturating_mul(size_of::<f64>())
@@ -2476,7 +2693,7 @@ impl RosaPlus {
                 .nodes
                 .cnt_lo
                 .capacity()
-                .saturating_mul(size_of::<u16>()),
+                .saturating_mul(size_of::<u32>()),
         );
         n = n.saturating_add(
             self.lm
@@ -2503,6 +2720,12 @@ impl RosaPlus {
             self.lm
                 .nodes
                 .cnt_overflow
+                .capacity()
+                .saturating_mul(size_of::<u32>() + size_of::<u64>()),
+        );
+        n = n.saturating_add(
+            self.lm
+                .total_overflow
                 .capacity()
                 .saturating_mul(size_of::<u32>() + size_of::<u64>()),
         );
@@ -2944,7 +3167,7 @@ impl RosaPlus {
             f.write_all(&st.endpos.to_le_bytes())?;
             f.write_all(&(st.small_n as u32).to_le_bytes())?;
             for k in 0..(st.small_n as usize) {
-                f.write_all(&st.small_ch[k].to_le_bytes())?;
+                f.write_all(&u32::from(st.small_ch[k]).to_le_bytes())?;
                 f.write_all(&st.small_to[k].to_le_bytes())?;
             }
             f.write_all(&st.head.to_le_bytes())?;
@@ -2970,9 +3193,9 @@ impl RosaPlus {
         write_len64(&mut f, self.lm.nodes.len())?;
         write_u32_slice_le(&mut f, &self.lm.alphabet)?;
         write_u64_slice_le(&mut f, &self.lm.unigram)?;
-        for ls in &self.lm.ls {
+        for (state_idx, ls) in self.lm.ls.iter().enumerate() {
             f.write_all(&ls.head.to_le_bytes())?;
-            f.write_all(&ls.total_n.to_le_bytes())?;
+            f.write_all(&self.lm.state_total(state_idx).to_le_bytes())?;
             f.write_all(&ls.types_t.to_le_bytes())?;
             f.write_all(&ls.last_sym.to_le_bytes())?;
             f.write_all(&ls.last_node.to_le_bytes())?;
@@ -3022,6 +3245,7 @@ impl RosaPlus {
         m.sam.ed.resize(ed_n, SamEdge::default());
         let mut text = vec![0u32; text_n];
         let mut boundary = vec![0u8; text_n];
+        let mut overflow_small_edges: Vec<(usize, u32, SamStateIx)> = Vec::new();
 
         for i in 0..st_n {
             f.read_exact(&mut b4)?;
@@ -3038,12 +3262,20 @@ impl RosaPlus {
                     "bad small_n",
                 ));
             }
-            m.sam.st[i].small_n = sn as u8;
-            for k in 0..sn {
+            m.sam.st[i].small_n = 0;
+            for _ in 0..sn {
                 f.read_exact(&mut b4)?;
-                m.sam.st[i].small_ch[k] = u32::from_le_bytes(b4);
+                let ch = u32::from_le_bytes(b4);
                 f.read_exact(&mut b4)?;
-                m.sam.st[i].small_to[k] = i32::from_le_bytes(b4);
+                let to = i32::from_le_bytes(b4);
+                if ch <= u32::from(u8::MAX) {
+                    let dst = m.sam.st[i].small_n as usize;
+                    m.sam.st[i].small_ch[dst] = ch as u8;
+                    m.sam.st[i].small_to[dst] = to;
+                    m.sam.st[i].small_n += 1;
+                } else {
+                    overflow_small_edges.push((i, ch, to));
+                }
             }
             f.read_exact(&mut b4)?;
             m.sam.st[i].head = u32::from_le_bytes(b4);
@@ -3055,6 +3287,13 @@ impl RosaPlus {
             m.sam.ed[i].to = i32::from_le_bytes(b4);
             f.read_exact(&mut b4)?;
             m.sam.ed[i].next = u32::from_le_bytes(b4);
+        }
+        validate_serialized_sam(&m.sam, st_n, ed_n)?;
+        for (state_idx, ch, to) in overflow_small_edges {
+            if to < 0 || state_usize(to) >= st_n {
+                return Err(invalid_model("bad sam small edge"));
+            }
+            m.sam.add_edge(state_ix(state_idx), ch, to);
         }
         read_u32_slice_le(&mut f, &mut text)?;
         f.read_exact(&mut boundary)?;
@@ -3087,43 +3326,6 @@ impl RosaPlus {
                 "bad sam.last",
             ));
         }
-        for st in &m.sam.st {
-            if st.link != SAM_STATE_NONE && state_usize(st.link) >= st_n {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad sam link",
-                ));
-            }
-            for k in 0..(st.small_n as usize) {
-                let to = st.small_to[k];
-                if to < 0 || state_usize(to) >= st_n {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "bad sam small edge",
-                    ));
-                }
-            }
-            if st.head != SAM_EDGE_NONE && edge_usize(st.head) >= ed_n {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad sam edge head",
-                ));
-            }
-        }
-        for edge in &m.sam.ed {
-            if edge.to < 0 || state_usize(edge.to) >= st_n {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad sam edge target",
-                ));
-            }
-            if edge.next != SAM_EDGE_NONE && edge_usize(edge.next) >= ed_n {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad sam edge next",
-                ));
-            }
-        }
         m.sam.rebuild_root_cache();
 
         // LM
@@ -3154,7 +3356,7 @@ impl RosaPlus {
             f.read_exact(&mut b4)?;
             m.lm.ls[i].head = u32::from_le_bytes(b4);
             f.read_exact(&mut b8)?;
-            m.lm.ls[i].total_n = u64::from_le_bytes(b8);
+            m.lm.set_state_total(i, u64::from_le_bytes(b8));
             f.read_exact(&mut b4)?;
             m.lm.ls[i].types_t = u32::from_le_bytes(b4);
             f.read_exact(&mut b4)?;
@@ -3303,6 +3505,69 @@ mod tests {
         ))
     }
 
+    /// Rewrite one serialized byte-sized small edge as a legacy wide label.
+    ///
+    /// Early V5 writers stored `small_ch` as `u32`, so codepoint labels could
+    /// appear in these slots. The current packed representation must migrate
+    /// such a record into the large-edge list while loading.
+    fn inject_legacy_wide_small_edge(
+        path: &std::path::Path,
+        wide_label: u32,
+    ) -> (usize, SamStateIx) {
+        assert!(wide_label > u32::from(u8::MAX));
+        let mut bytes = fs::read(path).expect("read serialized ROSA model");
+        let mut cursor: usize = MAGIC_V5.len() + 8 + 4 + 4 + 8;
+
+        let read_u64 = |bytes: &[u8], offset: &mut usize| -> u64 {
+            let end: usize = *offset + 8;
+            let value = u64::from_le_bytes(
+                bytes[*offset..end]
+                    .try_into()
+                    .expect("complete serialized u64"),
+            );
+            *offset = end;
+            value
+        };
+        let state_count: usize = usize::try_from(read_u64(&bytes, &mut cursor))
+            .expect("serialized state count fits usize");
+        let _edge_count: u64 = read_u64(&bytes, &mut cursor);
+        let _text_count: u64 = read_u64(&bytes, &mut cursor);
+
+        for state_idx in 0..state_count {
+            cursor += 4 + 4 + 4;
+            let small_count_end: usize = cursor + 4;
+            let small_count = u32::from_le_bytes(
+                bytes[cursor..small_count_end]
+                    .try_into()
+                    .expect("complete serialized small-edge count"),
+            ) as usize;
+            cursor = small_count_end;
+            for _ in 0..small_count {
+                let label_offset: usize = cursor;
+                let target_offset: usize = cursor + 4;
+                let target_end: usize = target_offset + 4;
+                let label = u32::from_le_bytes(
+                    bytes[label_offset..target_offset]
+                        .try_into()
+                        .expect("complete serialized small-edge label"),
+                );
+                let target = i32::from_le_bytes(
+                    bytes[target_offset..target_end]
+                        .try_into()
+                        .expect("complete serialized small-edge target"),
+                );
+                cursor = target_end;
+                if label <= u32::from(u8::MAX) {
+                    bytes[label_offset..target_offset].copy_from_slice(&wide_label.to_le_bytes());
+                    fs::write(path, bytes).expect("write legacy-style ROSA model");
+                    return (state_idx, target);
+                }
+            }
+            cursor += 4;
+        }
+        panic!("test model had no packed small edge to rewrite");
+    }
+
     fn manual_chunked_entropy_rate_bytes(data: &[u8], max_order: i64, seed: u64) -> f64 {
         if data.len() < 2 {
             return 0.0;
@@ -3407,12 +3672,13 @@ mod tests {
 
         while u != SAM_STATE_NONE {
             if !(max_order >= 0 && (sam.st[state_usize(u)].len as i64) > max_order) {
-                let ls = &lm.ls[state_usize(u)];
-                let n = ls.total_n;
+                let state_idx: usize = state_usize(u);
+                let ls = &lm.ls[state_idx];
+                let n: u64 = lm.state_total(state_idx);
                 let t = ls.types_t;
                 if n > 0 {
                     let lam = if t > 0 {
-                        (n as f64) / ((n + (t as u64)) as f64)
+                        (n as f64) / ((n as f64) + f64::from(t))
                     } else {
                         1.0
                     };
@@ -3458,12 +3724,13 @@ mod tests {
         let mut u = v;
         while u != SAM_STATE_NONE {
             if !(max_order >= 0 && (sam.st[state_usize(u)].len as i64) > max_order) {
-                let ls = &lm.ls[state_usize(u)];
-                let n = ls.total_n;
+                let state_idx: usize = state_usize(u);
+                let ls = &lm.ls[state_idx];
+                let n: u64 = lm.state_total(state_idx);
                 let t = ls.types_t;
                 if n > 0 {
                     let lam = if t > 0 {
-                        (n as f64) / ((n + (t as u64)) as f64)
+                        (n as f64) / ((n as f64) + f64::from(t))
                     } else {
                         1.0
                     };
@@ -3681,6 +3948,64 @@ mod tests {
         }
     }
 
+    /// Exercises the `WB_RESIDUAL_EPSILON` early-exit in `prob_for_sym` /
+    /// `probs_for_state_raw` against the untruncated `*_reference` oracles.
+    ///
+    /// Trains on a long non-repeating-internally pattern repeated twice back
+    /// to back (unbounded `max_order`), so the final SAM state's suffix-link
+    /// chain is far deeper (~300 levels) than the ~40-level bound at which
+    /// `residual` (which at least halves per productive step, see
+    /// `WB_RESIDUAL_EPSILON`'s doc comment) drops below the epsilon floor.
+    /// This asserts the fast, truncated path still matches the exact,
+    /// untruncated reference within the proven `1e-12` error bound, i.e. that
+    /// the early exit is a correctness-preserving approximation and not a
+    /// speed/correctness trade-off.
+    #[test]
+    fn wb_chain_epsilon_truncation_matches_untruncated_reference_on_deep_match() {
+        let mut base = Vec::with_capacity(300);
+        let mut state: u32 = 12345;
+        for _ in 0..300 {
+            // Simple LCG keeps the pattern internally non-repeating (so the
+            // chain is genuinely long) while staying deterministic.
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            base.push((state >> 16) as u8);
+        }
+        let mut data = base.clone();
+        data.extend_from_slice(&base);
+
+        let mut m = RosaPlus::new(-1, false, 0, 777);
+        m.build_lm_full_bytes_no_finalize_endpos();
+        m.train_sequence(&data);
+
+        let v = m.sam.last;
+        let deepest_len = m.sam.st[state_usize(v)].len as usize;
+        assert!(
+            deepest_len >= 200,
+            "test construction failed to produce a deep suffix-link chain: len={deepest_len}"
+        );
+
+        for sym_idx in 0..(m.lm.alpha_n as i32) {
+            let expected = prob_for_sym_reference(&m.lm, &m.sam, m.max_order, v, sym_idx);
+            let got = m.lm.prob_for_sym(&m.sam, m.max_order, v, sym_idx);
+            assert!(
+                (got - expected).abs() < WB_RESIDUAL_EPSILON,
+                "sym_idx={sym_idx} got={got} expected={expected}"
+            );
+        }
+
+        let expected = probs_for_state_reference(&m.lm, &m.sam, m.max_order, v);
+        let mut got = vec![0.0; m.lm.alpha_n as usize];
+        m.lm.probs_for_state_raw(&m.sam, m.max_order, v, &mut got);
+        for idx in 0..got.len() {
+            assert!(
+                (got[idx] - expected[idx]).abs() < WB_RESIDUAL_EPSILON,
+                "idx={idx} got={} expected={}",
+                got[idx],
+                expected[idx]
+            );
+        }
+    }
+
     #[test]
     fn checkpoint_restore_reverts_exact_state() {
         let mut m = RosaPlus::new(3, true, b'\n', 7);
@@ -3805,6 +4130,41 @@ mod tests {
     }
 
     #[test]
+    fn load_migrates_legacy_v5_wide_small_edges_before_using_new_bounds() {
+        let path = temp_model_path("legacy_wide_small_edge");
+        let mut model = RosaPlus::new(8, false, 0, 1234);
+        model.train_example(b"abracadabra");
+        model.build_lm();
+        let path_str = path.to_string_lossy().into_owned();
+        model.save(&path_str).expect("save model");
+
+        let migrated = [
+            (0x100, inject_legacy_wide_small_edge(&path, 0x100)),
+            (0x101, inject_legacy_wide_small_edge(&path, 0x101)),
+        ];
+        let loaded = RosaPlus::load(&path_str).expect("load and migrate legacy V5 edge");
+        fs::remove_file(&path).expect("cleanup model");
+
+        for (wide_label, (state_idx, expected_target)) in migrated {
+            assert_eq!(
+                loaded.sam.get_edge(state_ix(state_idx), wide_label),
+                expected_target,
+                "migrated wide label must remain reachable through the appended edge"
+            );
+        }
+    }
+
+    #[test]
+    fn serialized_sam_validation_rejects_negative_non_sentinel_links() {
+        let mut sam = Sam::new(0);
+        sam.st[0].link = -2;
+        let err = validate_serialized_sam(&sam, sam.st.len(), sam.ed.len())
+            .expect_err("negative non-sentinel links are malformed");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "bad sam link");
+    }
+
+    #[test]
     fn rosa_memory_usage_breakdown_sums_to_estimated_total() {
         let mut model = RosaPlus::new(8, true, b'\n', 1234);
         model.train_example(
@@ -3816,5 +4176,42 @@ mod tests {
         assert_eq!(usage.total_bytes(), model.estimated_size_bytes());
         assert!(usage.sam_state_bytes > 0);
         assert!(usage.lm_core_bytes > 0);
+    }
+
+    #[test]
+    fn rosa_hot_state_payloads_stay_packed() {
+        use std::mem::size_of;
+
+        assert!(
+            size_of::<SamState>() <= 40,
+            "SAM state should keep byte labels packed"
+        );
+        assert!(
+            size_of::<LmState>() <= 20,
+            "LM state should keep per-state totals narrow"
+        );
+    }
+
+    #[test]
+    fn packed_lm_state_preserves_totals_above_u32_with_sparse_overflow() {
+        let mut lm = LM::default();
+        lm.ls.push(LmState {
+            head: LM_NODE_NONE,
+            last_node: LM_NODE_NONE,
+            ..LmState::default()
+        });
+        let initial: u64 = u64::from(u32::MAX) + 17;
+        lm.inc(0, 3, initial);
+        assert_eq!(lm.state_total(0), initial);
+        assert_eq!(lm.ls[0].total_n, u32::MAX);
+        assert_eq!(lm.total_overflow.get(&0), Some(&17));
+
+        lm.inc(0, 3, 5);
+        assert_eq!(lm.state_total(0), initial + 5);
+        assert_eq!(lm.total_overflow.get(&0), Some(&22));
+
+        lm.set_state_total(0, u64::MAX);
+        lm.inc(0, 3, 1);
+        assert_eq!(lm.state_total(0), u64::MAX);
     }
 }

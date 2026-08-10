@@ -4,10 +4,11 @@
 use infotheory::api::BitReservoirConfig;
 use infotheory::api::{
     self, BinaryPrediction, BitOrder, BitStreamSemantics, BytePrefixMass, CalibratedSpec,
-    CalibrationContextKind, CompiledCompressionBackend, CompiledRateBackend, CompressionBackend,
-    GenerationConfig, GenerationStrategy, GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec,
-    MixtureKind, MixtureScheduleMode, MixtureSpec, NcdVariant, OnlineBitPredictor, ParticleSpec,
-    RateBackend, RateBackendBitSession, RateBackendBitSessionCheckpoint, RateBackendSession,
+    CalibrationContextKind, CalibrationTrainingMode, CompiledCompressionBackend,
+    CompiledRateBackend, CompressionBackend, GenerationConfig, GenerationStrategy,
+    GenerationUpdateMode, InfotheoryCtx, MixtureExpertSpec, MixtureKind, MixtureScheduleMode,
+    MixtureSpec, NcdVariant, OnlineBitPredictor, ParticleSpec, RateBackend, RateBackendBitSession,
+    RateBackendBitSessionCheckpoint, RateBackendSession,
 };
 use infotheory::error::InfotheoryError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -389,6 +390,7 @@ fn parse_calibration_context_kind_alias(s: &str) -> Option<CalibrationContextKin
     match s.trim().to_ascii_lowercase().as_str() {
         "global" => Some(CalibrationContextKind::Global),
         "byteclass" => Some(CalibrationContextKind::ByteClass),
+        "order1" | "order-1" | "byte" => Some(CalibrationContextKind::Order1),
         "text" => Some(CalibrationContextKind::Text),
         "repeat" => Some(CalibrationContextKind::Repeat),
         "textrepeat" => Some(CalibrationContextKind::TextRepeat),
@@ -413,6 +415,30 @@ fn parse_calibration_context_kind_value(
     ))
 }
 
+fn parse_calibration_training_mode_alias(s: &str) -> Option<CalibrationTrainingMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "nearest" => Some(CalibrationTrainingMode::Nearest),
+        "interpolated" => Some(CalibrationTrainingMode::Interpolated),
+        _ => None,
+    }
+}
+
+fn parse_calibration_training_mode_value(
+    py_obj: &Bound<'_, PyAny>,
+) -> PyResult<CalibrationTrainingMode> {
+    if let Ok(mode) = py_obj.extract::<PyRef<'_, PyCalibrationTrainingMode>>() {
+        return Ok(mode.inner);
+    }
+    if let Ok(s) = py_obj.extract::<String>() {
+        return parse_calibration_training_mode_alias(&s).ok_or_else(|| {
+            PyValueError::new_err(format!("unknown calibration training mode '{s}'"))
+        });
+    }
+    Err(PyValueError::new_err(
+        "CalibrationTrainingMode must be a CalibrationTrainingMode enum value or string",
+    ))
+}
+
 fn parse_rate_backend(name: &str, method: Option<&str>) -> PyResult<RateBackend> {
     let opts = infotheory::spec::RateBackendShorthandOptions::default();
     infotheory::spec::parse_rate_backend_name_method(name, method, &opts)
@@ -429,10 +455,10 @@ fn parse_compression_backend(
     opts.default_framing = infotheory::compression::FramingMode::Framed;
 
     #[cfg(feature = "backend-rwkv")]
-    if name.trim().eq_ignore_ascii_case("rwkv7") {
-        if let Ok(path) = std::env::var("RWKV7_MODEL_PATH") {
-            opts.default_rwkv_model_path = Some(path);
-        }
+    if name.trim().eq_ignore_ascii_case("rwkv7")
+        && let Ok(path) = std::env::var("RWKV7_MODEL_PATH")
+    {
+        opts.default_rwkv_model_path = Some(path);
     }
     infotheory::spec::parse_compression_backend_name_method(name, method, None, &opts)
         .map_err(py_spec_value_error)
@@ -486,6 +512,13 @@ impl PyMixtureKind {
     fn neural() -> Self {
         Self {
             inner: MixtureKind::Neural,
+        }
+    }
+    #[classattr]
+    #[pyo3(name = "Logistic")]
+    fn logistic() -> Self {
+        Self {
+            inner: MixtureKind::Logistic,
         }
     }
 }
@@ -699,6 +732,14 @@ impl PyCalibrationContextKind {
     }
 
     #[classattr]
+    #[pyo3(name = "Order1")]
+    fn order1() -> Self {
+        Self {
+            inner: CalibrationContextKind::Order1,
+        }
+    }
+
+    #[classattr]
     #[pyo3(name = "Text")]
     fn text() -> Self {
         Self {
@@ -726,10 +767,44 @@ impl PyCalibrationContextKind {
         match self.inner {
             CalibrationContextKind::Global => "CalibrationContextKind.Global",
             CalibrationContextKind::ByteClass => "CalibrationContextKind.ByteClass",
+            CalibrationContextKind::Order1 => "CalibrationContextKind.Order1",
             CalibrationContextKind::Text => "CalibrationContextKind.Text",
             CalibrationContextKind::Repeat => "CalibrationContextKind.Repeat",
             CalibrationContextKind::TextRepeat => "CalibrationContextKind.TextRepeat",
             _ => "CalibrationContextKind.<unknown>",
+        }
+    }
+}
+
+#[pyclass(name = "CalibrationTrainingMode", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyCalibrationTrainingMode {
+    inner: CalibrationTrainingMode,
+}
+
+#[pymethods]
+impl PyCalibrationTrainingMode {
+    #[classattr]
+    #[pyo3(name = "Nearest")]
+    fn nearest() -> Self {
+        Self {
+            inner: CalibrationTrainingMode::Nearest,
+        }
+    }
+
+    #[classattr]
+    #[pyo3(name = "Interpolated")]
+    fn interpolated() -> Self {
+        Self {
+            inner: CalibrationTrainingMode::Interpolated,
+        }
+    }
+
+    fn __repr__(&self) -> &'static str {
+        match self.inner {
+            CalibrationTrainingMode::Nearest => "CalibrationTrainingMode.Nearest",
+            CalibrationTrainingMode::Interpolated => "CalibrationTrainingMode.Interpolated",
+            _ => "CalibrationTrainingMode.<unknown>",
         }
     }
 }
@@ -826,6 +901,22 @@ impl PyRateBackend {
                 base_mix,
                 confidence_scale,
             },
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (order=2, hash_bits=16))]
+    fn order_ngram(order: usize, hash_bits: usize) -> Self {
+        Self {
+            inner: RateBackend::OrderNGram { order, hash_bits },
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (hash_bits=16))]
+    fn word_context(hash_bits: usize) -> Self {
+        Self {
+            inner: RateBackend::WordContext { hash_bits },
         }
     }
 
@@ -960,13 +1051,15 @@ impl PyRateBackend {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (base_backend, context=None, bins=33, learning_rate=0.02, bias_clip=4.0))]
+    #[pyo3(signature = (base_backend, context=None, bins=33, learning_rate=0.02, bias_clip=4.0, blend=1.0, training_mode=None))]
     fn calibrated(
         base_backend: &PyRateBackend,
         context: Option<&Bound<'_, PyAny>>,
         bins: usize,
         learning_rate: f64,
         bias_clip: f64,
+        blend: f64,
+        training_mode: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let context_kind = context
             .map(parse_calibration_context_kind_value)
@@ -976,6 +1069,11 @@ impl PyRateBackend {
         cal_spec.bins = bins;
         cal_spec.learning_rate = learning_rate;
         cal_spec.bias_clip = bias_clip;
+        cal_spec.blend = blend;
+        cal_spec.training_mode = training_mode
+            .map(parse_calibration_training_mode_value)
+            .transpose()?
+            .unwrap_or(CalibrationTrainingMode::Nearest);
         Ok(Self {
             inner: RateBackend::Calibrated {
                 spec: Arc::new(cal_spec),
@@ -3237,10 +3335,10 @@ impl infotheory::aixi::environment::Environment for PyEnvironmentShim {
         Python::attach(|py| {
             let guard = lock_recover(&self.obj);
             let obj = guard.bind(py);
-            if py_hasattr_or_fatal(obj, "set_random_seed", "Environment.set_random_seed") {
-                if let Err(e) = obj.call_method1("set_random_seed", (seed,)) {
-                    fatal_python_callback_error(py, "Environment.set_random_seed", e);
-                }
+            if py_hasattr_or_fatal(obj, "set_random_seed", "Environment.set_random_seed")
+                && let Err(e) = obj.call_method1("set_random_seed", (seed,))
+            {
+                fatal_python_callback_error(py, "Environment.set_random_seed", e);
             }
         });
     }
@@ -3677,6 +3775,9 @@ struct AixiRunSummary {
     prev_action=0,
     check_finished=false
 ))]
+// The explicit keyword surface is a stable Python API; grouping it into a
+// Rust-only options object would make the binding less truthful and ergonomic.
+#[allow(clippy::too_many_arguments)]
 fn run_agent_with_environment<'py>(
     py: Python<'py>,
     environment: Py<PyAny>,
@@ -3853,6 +3954,9 @@ fn run_agent_with_environment<'py>(
     explore_gamma=1.0,
     check_finished=false
 ))]
+// The explicit keyword surface is a stable Python API; grouping it into a
+// Rust-only options object would make the binding less truthful and ergonomic.
+#[allow(clippy::too_many_arguments)]
 fn run_aiqi_with_environment<'py>(
     py: Python<'py>,
     environment: Py<PyAny>,
@@ -5103,6 +5207,9 @@ impl PyStage2PriorMode {
     compression_backend=None,
     method=None
 ))]
+// These keyword controls form the public Python search API and intentionally
+// remain explicit instead of being hidden behind an opaque binding-only type.
+#[allow(clippy::too_many_arguments)]
 fn search(
     py: Python<'_>,
     query: &str,
@@ -5176,6 +5283,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMixtureSpec>()?;
     m.add_class::<PyParticleSpec>()?;
     m.add_class::<PyCalibrationContextKind>()?;
+    m.add_class::<PyCalibrationTrainingMode>()?;
     m.add_class::<PyNcdVariant>()?;
     m.add_class::<PyObservationKeyMode>()?;
     m.add_class::<PyMctsStrategy>()?;
@@ -5377,6 +5485,44 @@ mod tests {
         assert_eq!(framed, infotheory::compression::FramingMode::Framed);
         assert!(parse_framing_mode("frame").is_err());
         assert!(parse_framing_mode("nope").is_err());
+    }
+
+    #[test]
+    fn rate_backend_context_constructors_map_to_typed_variants() {
+        let ngram = PyRateBackend::order_ngram(3, 12);
+        match ngram.inner {
+            RateBackend::OrderNGram { order, hash_bits } => {
+                assert_eq!(order, 3);
+                assert_eq!(hash_bits, 12);
+            }
+            _ => panic!("expected order-ngram backend"),
+        }
+
+        let word = PyRateBackend::word_context(13);
+        match word.inner {
+            RateBackend::WordContext { hash_bits } => assert_eq!(hash_bits, 13),
+            _ => panic!("expected word-context backend"),
+        }
+    }
+
+    #[test]
+    fn calibration_context_order1_aliases_map_to_typed_variant() {
+        assert_eq!(
+            parse_calibration_context_kind_alias("order-1"),
+            Some(CalibrationContextKind::Order1)
+        );
+        assert_eq!(
+            PyCalibrationContextKind::order1().inner,
+            CalibrationContextKind::Order1
+        );
+        assert_eq!(
+            parse_calibration_training_mode_alias("interpolated"),
+            Some(CalibrationTrainingMode::Interpolated)
+        );
+        assert_eq!(
+            PyCalibrationTrainingMode::nearest().inner,
+            CalibrationTrainingMode::Nearest
+        );
     }
 
     #[test]

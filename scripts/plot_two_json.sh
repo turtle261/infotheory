@@ -38,8 +38,14 @@ case "${PLOT_SUITE}" in
     SUITE_PATH_PREFIX="infotheory-extra"
     SUITE_FOCUS_SUBJECTS="neural_mixture mamba"
     ;;
+  three-json|three_json|three)
+    PLOT_SUITE=three-json
+    SUITE_DISPLAY="configs/bench/three.json"
+    SUITE_PATH_PREFIX="infotheory-three-json"
+    SUITE_FOCUS_SUBJECTS="calibrated_mixture order2"
+    ;;
   *)
-    fail "INFOTHEORY_PLOT_SUITE must be 'two-json', 'one-sse', or 'extra' (found '${PLOT_SUITE}')"
+    fail "INFOTHEORY_PLOT_SUITE must be 'two-json', 'one-sse', 'extra', or 'three-json' (found '${PLOT_SUITE}')"
     ;;
 esac
 
@@ -61,7 +67,7 @@ Outputs:
   ${PLOT_DIR}/*.svg
 
 Environment:
-  INFOTHEORY_PLOT_SUITE=two-json|one-sse|extra
+  INFOTHEORY_PLOT_SUITE=two-json|one-sse|extra|three-json
   INFOTHEORY_PLOT_SUMMARY_TSV=/tmp/${SUITE_PATH_PREFIX}-summary-<stamp>.tsv
   INFOTHEORY_BASELINE_SUMMARY_TSV=benchmarks/baselines/${SUITE_PATH_PREFIX}-summary-<stamp>.tsv
   INFOTHEORY_PLOT_SUBJECTS=rwkv7

@@ -18,6 +18,25 @@ use wide::f64x4;
 /// Total count for CDF quantization (2^30 for high precision)
 pub const CDF_TOTAL: u32 = 1 << 30;
 
+/// Divide `numerator` by `total`, using a bit shift whenever `total` is a
+/// power of two.
+///
+/// `encode_counts`/`advance_counts` divide by the CDF `total`, which every
+/// call site in this crate passes as [`CDF_TOTAL`] (`1 << 30`); a full u128
+/// division there costs tens of cycles per call (there is no native 128-bit
+/// divider), against a handful of cycles for `trailing_zeros` + shift. The
+/// power-of-two check keeps the function correct for the fully general
+/// `total` the public API contract allows, at the cost of one cheap branch
+/// that is trivially predicted once `total` settles on `CDF_TOTAL`.
+#[inline(always)]
+fn div_by_total_u128(numerator: u128, total: u128) -> u128 {
+    if total.is_power_of_two() {
+        numerator >> total.trailing_zeros()
+    } else {
+        numerator / total
+    }
+}
+
 /// Arithmetic coder precision in bits
 const PRECISION: u32 = 32;
 
@@ -335,8 +354,8 @@ impl<W: Write> ArithmeticEncoder<W> {
         let c_hi_u = c_hi as u128;
         let low_u = self.low as u128;
 
-        let new_low = low_u + (range * c_lo_u) / total_u;
-        let new_high = low_u + (range * c_hi_u) / total_u - 1;
+        let new_low = low_u + div_by_total_u128(range * c_lo_u, total_u);
+        let new_high = low_u + div_by_total_u128(range * c_hi_u, total_u) - 1;
 
         self.low = (new_low & (self.mask as u128)) as u64;
         self.high = (new_high & (self.mask as u128)) as u64;
@@ -458,8 +477,8 @@ impl<'a> ArithmeticDecoder<'a> {
         let range = (self.high - self.low + 1) as u128;
         let low_u = self.low as u128;
         let total_u128 = total as u128;
-        let new_low = low_u + (range * (c_lo as u128)) / total_u128;
-        let new_high = low_u + (range * (c_hi as u128)) / total_u128 - 1;
+        let new_low = low_u + div_by_total_u128(range * (c_lo as u128), total_u128);
+        let new_high = low_u + div_by_total_u128(range * (c_hi as u128), total_u128) - 1;
 
         self.low = new_low as u64;
         self.high = new_high as u64;

@@ -25,6 +25,13 @@ pub(crate) const JSON_DEFAULT_SPARSE_MATCH_GAP_MIN: usize = 1;
 pub(crate) const JSON_DEFAULT_SPARSE_MATCH_GAP_MAX: usize = 2;
 pub(crate) const JSON_DEFAULT_SPARSE_MATCH_BASE_MIX: f64 = 0.05;
 pub(crate) const JSON_DEFAULT_SPARSE_MATCH_CONFIDENCE_SCALE: f64 = 1.0;
+pub(crate) const JSON_DEFAULT_ORDER_NGRAM_ORDER: usize = 2;
+pub(crate) const JSON_DEFAULT_ORDER_NGRAM_HASH_BITS: usize = 16;
+pub(crate) const JSON_DEFAULT_WORD_CONTEXT_HASH_BITS: usize = 16;
+/// Maximum accepted order for order-N-gram context counters (API/spec/model).
+pub(crate) const ORDER_NGRAM_MAX_ORDER: usize = 8;
+/// Maximum accepted hash-address width for bounded context-counter tables.
+pub(crate) const CONTEXT_COUNTER_MAX_HASH_BITS: usize = 24;
 pub(crate) const JSON_DEFAULT_PPMD_ORDER: usize = 10;
 pub(crate) const JSON_DEFAULT_PPMD_MEMORY_MB: usize = 64;
 pub(crate) const JSON_DEFAULT_SEQUITUR_CONTEXT_BYTES: usize = 64;
@@ -114,6 +121,13 @@ pub(crate) fn runtime_default_rate_backend_spec(kind: RateBackendKind) -> Option
             base_mix: 0.05,
             confidence_scale: 1.0,
         }),
+        RateBackendKind::OrderNGram => Some(RateBackend::OrderNGram {
+            order: JSON_DEFAULT_ORDER_NGRAM_ORDER,
+            hash_bits: JSON_DEFAULT_ORDER_NGRAM_HASH_BITS,
+        }),
+        RateBackendKind::WordContext => Some(RateBackend::WordContext {
+            hash_bits: JSON_DEFAULT_WORD_CONTEXT_HASH_BITS,
+        }),
         RateBackendKind::Ppmd => Some(RateBackend::Ppmd {
             order: 6,
             memory_mb: 16,
@@ -198,5 +212,27 @@ pub(crate) fn runtime_default_rate_backend_spec(kind: RateBackendKind) -> Option
         }),
         #[cfg(not(feature = "backend-rwkv"))]
         RateBackendKind::Rwkv7 => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_counter_runtime_defaults_match_json_and_shorthand_defaults() {
+        assert!(matches!(
+            runtime_default_rate_backend_spec(RateBackendKind::OrderNGram),
+            Some(RateBackend::OrderNGram {
+                order: JSON_DEFAULT_ORDER_NGRAM_ORDER,
+                hash_bits: JSON_DEFAULT_ORDER_NGRAM_HASH_BITS,
+            })
+        ));
+        assert!(matches!(
+            runtime_default_rate_backend_spec(RateBackendKind::WordContext),
+            Some(RateBackend::WordContext {
+                hash_bits: JSON_DEFAULT_WORD_CONTEXT_HASH_BITS,
+            })
+        ));
     }
 }

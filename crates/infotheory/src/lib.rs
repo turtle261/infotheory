@@ -162,8 +162,8 @@ pub mod tuner;
 use crate::api::CompiledRateBackend;
 #[cfg(all(test, feature = "all-backends"))]
 pub(crate) use crate::api::{
-    CalibratedSpec, CalibrationContextKind, MixtureExpertSpec, MixtureKind, MixtureSpec,
-    ParticleSpec,
+    CalibratedSpec, CalibrationContextKind, CalibrationTrainingMode, MixtureExpertSpec,
+    MixtureKind, MixtureSpec, ParticleSpec,
 };
 #[cfg(all(test, feature = "all-backends"))]
 use crate::api::{
@@ -695,6 +695,8 @@ mod tests {
                 bins: 16,
                 learning_rate: 0.05,
                 bias_clip: 4.0,
+                blend: 1.0,
+                training_mode: CalibrationTrainingMode::Nearest,
             }),
         }
     }
@@ -1399,6 +1401,7 @@ mod tests {
         feature = "backend-rosa",
         feature = "backend-ctw",
         feature = "backend-match",
+        feature = "backend-context",
         feature = "backend-ppmd",
         feature = "backend-sequitur",
         feature = "backend-mixture",

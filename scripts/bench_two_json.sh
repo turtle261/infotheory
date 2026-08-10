@@ -46,8 +46,14 @@ case "${BENCH_SUITE}" in
     SUITE_DISPLAY="configs/bench/extra.json"
     SUITE_PATH_PREFIX="infotheory-extra"
     ;;
+  three-json|three_json|three)
+    BENCH_SUITE=three-json
+    SUITE_SPEC_PATH="${ROOT_DIR}/configs/bench/three.json"
+    SUITE_DISPLAY="configs/bench/three.json"
+    SUITE_PATH_PREFIX="infotheory-three-json"
+    ;;
   *)
-    fail "INFOTHEORY_BENCH_SUITE must be 'two-json', 'one-sse', or 'extra' (found '${BENCH_SUITE}')"
+    fail "INFOTHEORY_BENCH_SUITE must be 'two-json', 'one-sse', 'extra', or 'three-json' (found '${BENCH_SUITE}')"
     ;;
 esac
 
@@ -59,7 +65,86 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )
-SUITE_SPEC_SHA256=$(sha256sum "${SUITE_SPEC_PATH}" | awk 'NR==1 { print $1 }')
+SUITE_SPEC_SHA256=$(python3 - "${SUITE_SPEC_PATH}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+root_dir = root.parent
+files = {}
+active = []
+active_set = set()
+
+
+def referenced_specs(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "spec_path" and isinstance(child, str):
+                yield child
+            yield from referenced_specs(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from referenced_specs(child)
+
+
+def visit(path):
+    path = path.resolve(strict=True)
+    if path in active_set:
+        cycle_start = active.index(path)
+        chain = " -> ".join(str(item) for item in (*active[cycle_start:], path))
+        raise ValueError(f"cyclic benchmark spec_path reference: {chain}")
+    if path in files:
+        return
+
+    raw = path.read_bytes()
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"failed to parse referenced benchmark spec {path}: {error}") from error
+
+    active.append(path)
+    active_set.add(path)
+    files[path] = raw
+    references = set()
+    for reference in referenced_specs(document):
+        reference_path = Path(reference)
+        if not reference_path.is_absolute():
+            reference_path = path.parent / reference_path
+        references.add(reference_path.resolve())
+    for reference in sorted(references, key=lambda item: str(item)):
+        visit(reference)
+    active.pop()
+    active_set.remove(path)
+
+
+visit(root)
+
+# Preserve historical resume keys for self-contained suites. Referencing suites
+# use a framed closure digest so changing any transitively loaded definition,
+# including three_base.json, necessarily changes the key without ambiguous byte
+# concatenation or dependence on the repository's absolute location.
+if len(files) == 1:
+    digest = hashlib.sha256(files[root])
+else:
+    digest = hashlib.sha256(b"infotheory-benchmark-spec-closure-v1\0")
+    records = []
+    for path, raw in files.items():
+        try:
+            label = path.relative_to(root_dir).as_posix()
+        except ValueError:
+            label = str(path)
+        records.append((label.encode("utf-8"), raw))
+    for label, raw in sorted(records):
+        digest.update(len(label).to_bytes(8, "big"))
+        digest.update(label)
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+
+print(digest.hexdigest())
+PY
+)
 
 cleanup() {
   if [ "${INFOTHEORY_BENCH_KEEP_WORKDIR:-0}" = "1" ]; then
@@ -88,7 +173,7 @@ Resume behavior:
   or append to a specific run file.
 
 Environment:
-  INFOTHEORY_BENCH_SUITE=two-json|one-sse|extra
+  INFOTHEORY_BENCH_SUITE=two-json|one-sse|extra|three-json
   INFOTHEORY_BENCH_REPEATS=3
   INFOTHEORY_BENCH_WARMUPS=1
   INFOTHEORY_BENCH_SIZES="4096 16384 ... 10000000"
@@ -373,6 +458,16 @@ PATH_KEYS = {
     "mamba_model_path",
 }
 
+MIXTURE_KINDS = {
+    "bayes",
+    "fading-bayes",
+    "switching",
+    "convex",
+    "mdl",
+    "neural",
+    "logistic",
+}
+
 
 def looks_like_uri(value: str) -> bool:
     return bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value))
@@ -400,14 +495,39 @@ def resolve_path_like(value: str, base_dir: Path) -> Path:
         raise SystemExit(f"{suite_label}: URI paths are not supported in benchmark suite files")
     return (base_dir / candidate).resolve()
 
-def load_neural_mixture(path: Path, label: str):
+def load_mixture(path: Path, label: str):
     value = json.loads(path.read_text())
-    if value.get("kind") != "neural":
-        raise SystemExit(f"expected {label} kind=neural, found {value.get('kind')!r}")
+    if value.get("kind") not in MIXTURE_KINDS:
+        raise SystemExit(
+            f"expected {label} kind to be a mixture kind, found {value.get('kind')!r}"
+        )
     experts_value = value.get("experts")
     if not isinstance(experts_value, list) or not experts_value:
         raise SystemExit(f"{label} must contain a non-empty experts array")
     return value, experts_value, path.parent
+
+def find_mixture_spec_path(node, base_dir: Path):
+    if not isinstance(node, dict):
+        return None
+    kind = node.get("kind")
+    if kind == "mixture":
+        spec_ref = node.get("spec_path")
+        if isinstance(spec_ref, str) and spec_ref:
+            return resolve_path_like(spec_ref, base_dir)
+        return None
+    if kind == "calibrated":
+        spec = node.get("spec")
+        if isinstance(spec, dict):
+            found = find_mixture_spec_path(spec.get("base"), base_dir)
+            if found is not None:
+                return found
+    found = find_mixture_spec_path(node.get("base"), base_dir)
+    if found is not None:
+        return found
+    spec = node.get("spec")
+    if isinstance(spec, dict):
+        return find_mixture_spec_path(spec.get("base"), base_dir)
+    return None
 
 def emit_experts(experts_value, expert_base_dir):
     for expert in experts_value:
@@ -450,14 +570,15 @@ def canonicalize_relative_paths_with_base(node, base_dir):
 
 print("subject\tsubject_kind\texpert_kind\tspec_path\th_order")
 
-if data.get("kind") == "neural":
-    _, experts, expert_dir = load_neural_mixture(spec_path, suite_label)
+if data.get("kind") in MIXTURE_KINDS:
+    mixture, experts, expert_dir = load_mixture(spec_path, suite_label)
+    mixture_kind = str(mixture.get("kind"))
     print(
         "\t".join(
             [
-                "neural_mixture",
+                f"{slug(mixture_kind)}_mixture",
                 "mixture",
-                "neural-mixture",
+                f"{mixture_kind}-mixture",
                 str(spec_path),
                 "",
             ]
@@ -465,16 +586,12 @@ if data.get("kind") == "neural":
     )
     emit_experts(experts, expert_dir)
 else:
-    base = data.get("base")
-    if not isinstance(base, dict) or base.get("kind") != "mixture":
+    base_path = find_mixture_spec_path(data, spec_dir)
+    if base_path is None:
         raise SystemExit(
-            f"expected {suite_label} to be kind=neural or a calibrated spec with base.kind=mixture"
+            f"expected {suite_label} to be a mixture spec or a calibrated chain over base.kind=mixture"
         )
-    spec_ref = base.get("spec_path")
-    if not isinstance(spec_ref, str) or not spec_ref:
-        raise SystemExit(f"{suite_label} calibrated base must use a non-empty spec_path")
-    base_path = resolve_path_like(spec_ref, spec_dir)
-    _, experts, expert_dir = load_neural_mixture(base_path, f"{suite_label} base {spec_ref}")
+    _, experts, expert_dir = load_mixture(base_path, f"{suite_label} base {base_path.name}")
     print(
         "\t".join(
             [
